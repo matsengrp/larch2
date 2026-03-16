@@ -13,6 +13,7 @@
 #include <larch/rf_distance.hpp>
 #include <larch/overlay_spr.hpp>
 #include <larch/thread_pool.hpp>
+#include <larch/version.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -374,6 +375,9 @@ Post-processing:
 
 Debugging:
   --validate              Validate DAG invariants at key pipeline points
+
+Other:
+  --version               Print version (git commit) and exit
 )";
 }
 
@@ -466,7 +470,10 @@ static args parse_args(int argc, char** argv) {
       a.move_coeff_nodes = std::stoi(std::string{next()});
     else if (arg == "--move-score-threshold")
       a.move_score_threshold = std::stoi(std::string{next()});
-    else if (arg == "-h" || arg == "--help") {
+    else if (arg == "--version") {
+      std::cerr << "larch2 " << larch::version << " (" << larch::git_commit << ")\n";
+      std::exit(0);
+    } else if (arg == "-h" || arg == "--help") {
       usage();
       std::exit(0);
     } else {

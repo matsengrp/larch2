@@ -1,6 +1,24 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(larch2 LANGUAGES C CXX)
+project(larch2 VERSION 2.0.0 LANGUAGES C CXX)
+
+# --- Version info from git ---------------------------------------------------
+set(LARCH_VERSION ${PROJECT_VERSION})
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE LARCH_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT LARCH_GIT_COMMIT)
+    set(LARCH_GIT_COMMIT "unknown")
+endif()
+configure_file(
+    ${CMAKE_SOURCE_DIR}/cmake/version.hpp.in
+    ${CMAKE_BINARY_DIR}/generated/larch/version.hpp
+    @ONLY
+)
 
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,8 +31,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     add_link_options("-B${CMAKE_SOURCE_DIR}/tools/mold-ld")
 endif()
 
-# Statically link libstdc++ and libgcc
-add_link_options(-static-libstdc++ -static-libgcc)
+# Fully static link
+add_link_options(-static)
 
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
@@ -53,6 +71,7 @@ target_link_libraries(larch PUBLIC ZLIB::ZLIB Threads::Threads)
 # --- Executable ---------------------------------------------------------------
 
 add_executable(larch2 tools/larch2.cpp)
+target_include_directories(larch2 PRIVATE ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(larch2 PRIVATE larch)
 
 # --- Tests --------------------------------------------------------------------

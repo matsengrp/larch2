@@ -1,0 +1,6 @@
+#pragma once
+
+namespace larch {
+inline constexpr const char* version = "@LARCH_VERSION@";
+inline constexpr const char* git_commit = "@LARCH_GIT_COMMIT@";
+}  // namespace larch
