@@ -1,6 +1,45 @@
 cmake_minimum_required(VERSION 3.25)
 
+# --- GCC toolchain discovery --------------------------------------------------
+# Pass -DGCC_TOOLCHAIN=/path/to/gcc to resolve all toolchain binaries from one
+# prefix (compilers, ar, ranlib).  This must happen before project() so that
+# CMake's compiler-detection uses the right tools from the start.
+# Handles both standard names (gcc, g++) and suffixed names (gcc-trunk, g++-trunk).
+set(GCC_TOOLCHAIN "" CACHE PATH "GCC installation prefix (e.g. /opt/gcc-latest)")
+if(GCC_TOOLCHAIN)
+    # Find the gcc binary — may be 'gcc' or 'gcc-<suffix>'
+    file(GLOB _gcc_bins "${GCC_TOOLCHAIN}/bin/gcc" "${GCC_TOOLCHAIN}/bin/gcc-*")
+    list(FILTER _gcc_bins EXCLUDE REGEX "(gcc-ar|gcc-nm|gcc-ranlib)")
+    if(NOT _gcc_bins)
+        message(FATAL_ERROR "GCC_TOOLCHAIN: no gcc compiler found in ${GCC_TOOLCHAIN}/bin/")
+    endif()
+    list(SORT _gcc_bins)
+    list(GET _gcc_bins 0 _GCC_CC)
+    # Derive the suffix (e.g. "" or "-trunk") and apply to all tools
+    get_filename_component(_gcc_name "${_GCC_CC}" NAME)
+    string(REGEX REPLACE "^gcc" "" _suffix "${_gcc_name}")
+    set(CMAKE_C_COMPILER   "${GCC_TOOLCHAIN}/bin/gcc${_suffix}"   CACHE FILEPATH "" FORCE)
+    set(CMAKE_CXX_COMPILER "${GCC_TOOLCHAIN}/bin/g++${_suffix}"   CACHE FILEPATH "" FORCE)
+endif()
+
 project(larch2 VERSION 2.0.0 LANGUAGES C CXX)
+
+# On FreeBSD the system ranlib is LLVM's, which rejects the --plugin flag that
+# gcc-ranlib passes.  CMake's IPO uses CMAKE_<LANG>_COMPILER_RANLIB for static
+# libs; reset those to the plain system ranlib so LTO archives build correctly.
+# (LTO still works: the linker reads GIMPLE bytecode from archive members at
+# link time regardless of the ranlib used.)
+if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+    # GCC's gcc-ranlib wraps the system ranlib with --plugin, but FreeBSD's
+    # LLVM ranlib rejects --plugin.  LTO still works: the GCC linker reads
+    # GIMPLE bytecode from archive members at link time regardless.  Override
+    # the IPO archive-finish rules to use the system ranlib directly.
+    find_program(_SYS_RANLIB ranlib PATHS /usr/bin NO_DEFAULT_PATH)
+    if(_SYS_RANLIB)
+        set(CMAKE_C_ARCHIVE_FINISH_IPO   "\"${_SYS_RANLIB}\" <TARGET>")
+        set(CMAKE_CXX_ARCHIVE_FINISH_IPO "\"${_SYS_RANLIB}\" <TARGET>")
+    endif()
+endif()
 
 # --- Version info from git ---------------------------------------------------
 set(LARCH_VERSION ${PROJECT_VERSION})

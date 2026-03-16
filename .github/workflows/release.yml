@@ -24,8 +24,7 @@ jobs:
       - name: Configure
         run: |
           cmake -B build \
-            -DCMAKE_C_COMPILER=/opt/gcc-latest/bin/gcc \
-            -DCMAKE_CXX_COMPILER=/opt/gcc-latest/bin/g++ \
+            -DGCC_TOOLCHAIN=/opt/gcc-latest \
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
