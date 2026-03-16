@@ -1,0 +1,11 @@
+#!/bin/sh
+# Wrapper for mold on FreeBSD: GCC's specs pass -m elf_x86_64_fbsd which mold
+# doesn't recognise.  Rewrite it to plain elf_x86_64.
+args=""
+for arg in "$@"; do
+    case "$arg" in
+        elf_x86_64_fbsd) args="$args elf_x86_64" ;;
+        *)               args="$args $arg" ;;
+    esac
+done
+exec /usr/local/bin/mold $args
