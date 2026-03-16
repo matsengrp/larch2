@@ -70,9 +70,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     add_link_options("-B${CMAKE_SOURCE_DIR}/tools/mold-ld")
 endif()
 
-# Fully static link
-add_link_options(-static)
-set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+# Statically link libstdc++ and libgcc so the binary is portable across
+# distros without needing the exact GCC runtime version at runtime.
+add_link_options(-static-libstdc++ -static-libgcc)
 
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
