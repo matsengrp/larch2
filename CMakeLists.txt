@@ -33,6 +33,7 @@ endif()
 
 # Fully static link
 add_link_options(-static)
+set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
 
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
