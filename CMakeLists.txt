@@ -76,7 +76,7 @@ foreach(test_name rf_distance_test thread_pool_test validate_dag_test)
 endforeach()
 
 # Tests that need liblarch (protobuf + zlib + threads) and run from source dir
-foreach(test_name phylo_test subtree_weight_test weight_accum_test
+foreach(test_name merge_test subtree_weight_test weight_accum_test
                   optimize_test native_optimize_test spr_pipeline_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)

@@ -26,7 +26,7 @@ static void test_protobuf(std::string name,
   for (auto& path : paths) {
     trees.emplace_back(larch::load_proto_dag(path));
     larch::recompute_compact_genomes(trees.back());
-    larch::set_sample_ids_from_cg(trees.back());
+    larch::set_sample_ids_from_cg(trees.back(), /*coerce=*/true);
   }
 
   auto ref = larch::get_reference_sequence(trees[0]);
@@ -82,12 +82,12 @@ static void test_add_trees() {
   for (auto& path : paths1) {
     trees1.emplace_back(larch::load_proto_dag(path));
     larch::recompute_compact_genomes(trees1.back());
-    larch::set_sample_ids_from_cg(trees1.back());
+    larch::set_sample_ids_from_cg(trees1.back(), /*coerce=*/true);
   }
   for (auto& path : paths2) {
     trees2.emplace_back(larch::load_proto_dag(path));
     larch::recompute_compact_genomes(trees2.back());
-    larch::set_sample_ids_from_cg(trees2.back());
+    larch::set_sample_ids_from_cg(trees2.back(), /*coerce=*/true);
   }
 
   auto ref = larch::get_reference_sequence(trees1[0]);
@@ -119,7 +119,7 @@ static void test_subtree() {
 
   auto first = larch::load_proto_dag(paths[0]);
   larch::recompute_compact_genomes(first);
-  larch::set_sample_ids_from_cg(first);
+  larch::set_sample_ids_from_cg(first, /*coerce=*/true);
   auto ref = larch::get_reference_sequence(first);
 
   larch::merge m{ref};
@@ -127,7 +127,7 @@ static void test_subtree() {
   for (std::size_t i = 1; i < paths.size(); ++i) {
     auto tree = larch::load_proto_dag(paths[i]);
     larch::recompute_compact_genomes(tree);
-    larch::set_sample_ids_from_cg(tree);
+    larch::set_sample_ids_from_cg(tree, /*coerce=*/true);
     m.add_dag(std::move(tree));
   }
 

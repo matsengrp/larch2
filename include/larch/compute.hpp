@@ -182,31 +182,52 @@ inline auto get_clades(phylo_dag& d, std::size_t node_idx,
   return clades;
 }
 
-inline void set_sample_ids_from_cg(phylo_dag& d) {
-  // Assign unique sample_ids based on CG for leaves that don't already
-  // have one, disambiguating leaves that share the same compact genome.
-  // Leaves with existing sample_ids (e.g., from protobuf node_names)
-  // are left unchanged so that merge can correctly match them.
-  std::unordered_map<std::string, std::size_t> cg_str_count;
-  for (auto nv : d.get_all_nodes()) {
-    std::visit(
-        [&](auto node) {
-          if constexpr (requires {
-                          node.sample_id();
-                          node.cg();
-                        }) {
-            if (node.sample_id().empty()) {
-              auto cg_str = node.cg().to_string();
-              auto count = cg_str_count[cg_str]++;
-              if (count > 0) {
-                node.sample_id() = cg_str + "#" + std::to_string(count);
-              } else {
-                node.sample_id() = cg_str;
+inline void set_sample_ids_from_cg(phylo_dag& d, bool coerce = false) {
+  // Set leaf sample_ids from compact genome strings.
+  //
+  // When coerce=false (default): only assigns to leaves with empty sample_ids,
+  // disambiguating duplicates with "#N" suffix.
+  //
+  // When coerce=true: overwrites ALL leaf sample_ids with the CG string.
+  // Two leaves with the same CG get the same sample_id (no disambiguation).
+  // This matches the original larch's SampleIdsFromCG(true) behavior,
+  // which the merge algorithm relies on: leaves with identical compact
+  // genomes are treated as the same leaf for deduplication purposes.
+  if (coerce) {
+    for (auto nv : d.get_all_nodes()) {
+      std::visit(
+          [](auto node) {
+            if constexpr (requires {
+                            node.sample_id();
+                            node.cg();
+                          }) {
+              node.sample_id() = node.cg().to_string();
+            }
+          },
+          nv);
+    }
+  } else {
+    std::unordered_map<std::string, std::size_t> cg_str_count;
+    for (auto nv : d.get_all_nodes()) {
+      std::visit(
+          [&](auto node) {
+            if constexpr (requires {
+                            node.sample_id();
+                            node.cg();
+                          }) {
+              if (node.sample_id().empty()) {
+                auto cg_str = node.cg().to_string();
+                auto count = cg_str_count[cg_str]++;
+                if (count > 0) {
+                  node.sample_id() = cg_str + "#" + std::to_string(count);
+                } else {
+                  node.sample_id() = cg_str;
+                }
               }
             }
-          }
-        },
-        nv);
+          },
+          nv);
+    }
   }
 }
 
