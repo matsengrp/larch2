@@ -10,11 +10,13 @@ larch2 requires a C++ compiler with C++26 and `-freflection` support (GCC
 trunk), plus CMake 3.25+, zlib, and pthreads.
 
 ```sh
-cmake -B build \
-    -DCMAKE_CXX_COMPILER=/path/to/g++-trunk \
-    -DCMAKE_C_COMPILER=/path/to/gcc-trunk
+cmake -B build -DGCC_TOOLCHAIN=/path/to/gcc-install
 cmake --build build
 ```
+
+`GCC_TOOLCHAIN` should point to the GCC installation prefix (the directory
+containing `bin/gcc`, `bin/g++`, etc.). CMake will auto-discover the compiler
+and supporting tools (ar, ranlib) from that prefix.
 
 Optional CMake options:
 
