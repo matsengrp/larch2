@@ -105,13 +105,12 @@ endif()
 # --- Library ------------------------------------------------------------------
 
 add_library(larch src/protobuf.cpp src/protobuf_encode.cpp)
-target_include_directories(larch PUBLIC include)
+target_include_directories(larch PUBLIC include ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(larch PUBLIC ZLIB::ZLIB Threads::Threads)
 
 # --- Executable ---------------------------------------------------------------
 
 add_executable(larch2 tools/larch2.cpp)
-target_include_directories(larch2 PRIVATE ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(larch2 PRIVATE larch)
 
 # --- Tests --------------------------------------------------------------------
