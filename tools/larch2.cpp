@@ -471,7 +471,8 @@ static args parse_args(int argc, char** argv) {
     else if (arg == "--move-score-threshold")
       a.move_score_threshold = std::stoi(std::string{next()});
     else if (arg == "--version") {
-      std::cerr << "larch2 " << larch::version << " (" << larch::git_commit << ")\n";
+      std::cerr << "larch2 " << larch::version << " (" << larch::git_commit
+                << ")\n";
       std::exit(0);
     } else if (arg == "-h" || arg == "--help") {
       usage();
