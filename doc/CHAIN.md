@@ -468,5 +468,5 @@ but scattered single-element removes will accumulate holes.
 
 | File | Role |
 |------|------|
-| `include/ogi/chain.hpp` | Header-only template implementation |
+| `include/larch/chain.hpp` | Header-only template implementation |
 | `test/chain_test.cpp` | 40 assert-based tests |

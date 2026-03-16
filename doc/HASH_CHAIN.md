@@ -268,6 +268,6 @@ hole reuse. It is not hash-ordered or sorted.
 
 | File | Role |
 |------|------|
-| `include/ogi/hash_chain.hpp` | Header-only template: `node<T>` + `hash_chain` |
-| `include/ogi/chain.hpp` | Underlying storage (`chain<node<T>>`) |
+| `include/larch/hash_chain.hpp` | Header-only template: `node<T>` + `hash_chain` |
+| `include/larch/chain.hpp` | Underlying storage (`chain<node<T>>`) |
 | `test/hash_chain_test.cpp` | 29 assert-based tests (set, map, rehash, erase, move, insert_or_assign, stress) |

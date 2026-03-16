@@ -449,7 +449,7 @@ node.
 
 | File | Role |
 |------|------|
-| `include/ogi/dag.hpp` | Header-only template implementation |
-| `include/ogi/common.hpp` | Reflection-based enum utilities, `no_idx`/`no_idx_v` |
-| `include/ogi/chain.hpp` | Backing storage container |
+| `include/larch/dag.hpp` | Header-only template implementation |
+| `include/larch/common.hpp` | Reflection-based enum utilities, `no_idx`/`no_idx_v` |
+| `include/larch/chain.hpp` | Backing storage container |
 | `test/dag_test.cpp` | 12 assert-based tests |
