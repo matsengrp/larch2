@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -301,9 +302,8 @@ static args parse_args(int argc, char** argv) {
 
   auto total_inputs = a.dag_pbs.size() + a.tree_pbs.size() + a.fastas.size();
   if (total_inputs == 0) {
-    std::cerr
-        << "error: at least one input required (--dag-pb, --tree-pb, or "
-           "--fasta)\n";
+    std::cerr << "error: at least one input required (--dag-pb, --tree-pb, or "
+                 "--fasta)\n";
     usage();
     std::exit(1);
   }
@@ -336,36 +336,45 @@ static args parse_args(int argc, char** argv) {
 int main(int argc, char** argv) try {
   auto a = parse_args(argc, argv);
 
-  // ---- Load all inputs ----
-  std::vector<phylo_dag> dags;
-
-  for (auto& path : a.dag_pbs) {
-    std::cerr << "Loading DAG from " << path << "...\n";
-    dags.push_back(load_proto_dag(path));
-  }
-
+  // ---- Load all inputs (in parallel) ----
   std::string refseq;
   if (!a.refseq.empty()) refseq = read_refseq(a.refseq);
 
-  for (auto& path : a.tree_pbs) {
-    std::cerr << "Loading parsimony tree from " << path << "...\n";
-    dags.push_back(load_parsimony_tree(path, refseq));
+  auto total_inputs = a.dag_pbs.size() + a.tree_pbs.size() + a.fastas.size();
+  std::vector<phylo_dag> dags(total_inputs);
+  {
+    auto& pool = thread_pool::get_default();
+    std::vector<std::size_t> indices(total_inputs);
+    std::iota(indices.begin(), indices.end(), std::size_t{0});
+
+    std::cerr << "Loading " << total_inputs << " input(s)...\n";
+    parallel_for_each(pool, indices, [&](std::size_t idx) {
+      auto dag_pb_count = a.dag_pbs.size();
+      auto tree_pb_count = a.tree_pbs.size();
+      if (idx < dag_pb_count) {
+        dags[idx] = load_proto_dag(a.dag_pbs[idx]);
+      } else if (idx < dag_pb_count + tree_pb_count) {
+        auto ti = idx - dag_pb_count;
+        dags[idx] = load_parsimony_tree(a.tree_pbs[ti], refseq);
+      } else {
+        auto fi = idx - dag_pb_count - tree_pb_count;
+        dags[idx] =
+            build_from_fasta_newick(a.fastas[fi], a.newicks[fi], a.refseq);
+      }
+    });
+    std::cerr << "Loading done.\n";
   }
 
-  for (std::size_t i = 0; i < a.fastas.size(); ++i) {
-    std::cerr << "Building DAG from FASTA + Newick (" << a.fastas[i]
-              << ")...\n";
-    dags.push_back(
-        build_from_fasta_newick(a.fastas[i], a.newicks[i], a.refseq));
-  }
-
-  // ---- Apply VCF ----
+  // ---- Apply VCF (in parallel) ----
   if (!a.vcf.empty()) {
-    for (auto& dag : dags) {
-      auto const& ref = get_reference_sequence(dag);
+    auto& pool = thread_pool::get_default();
+    std::vector<std::size_t> indices(dags.size());
+    std::iota(indices.begin(), indices.end(), std::size_t{0});
+    parallel_for_each(pool, indices, [&](std::size_t idx) {
+      auto const& ref = get_reference_sequence(dags[idx]);
       auto vcf = read_vcf(a.vcf, ref);
-      apply_vcf_to_dag(dag, vcf);
-    }
+      apply_vcf_to_dag(dags[idx], vcf);
+    });
   }
 
   // ---- Merge ----
