@@ -34,7 +34,10 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
       - name: Prepare release artifact
-        run: cp build/larch2 larch2-linux-x86_64
+        run: |
+          mkdir larch2-linux-x86_64
+          cp build/larch2 build/dagutil larch2-linux-x86_64/
+          zip -j larch2-linux-x86_64.zip larch2-linux-x86_64/*
 
       - name: Get version info
         id: version
@@ -53,4 +56,4 @@ jobs:
           body: |
             Automated release from main branch.
             Commit: ${{ github.sha }}
-          files: larch2-linux-x86_64
+          files: larch2-linux-x86_64.zip

@@ -122,6 +122,81 @@ larch2 --tree-pb tree.pb.gz --refseq ref.txt -o output.pb.gz \
     --sample-method rf-minsum -n 50
 ```
 
+## dagutil
+
+`dagutil` is a companion utility for merging, pruning, and inspecting
+phylogenetic DAGs and trees. It accepts multiple inputs, merges them into a
+single DAG, and can report statistics, trim, or sample from the result.
+
+```
+dagutil [options]
+```
+
+### Input (repeatable, at least one required)
+
+| Option | Description |
+|--------|-------------|
+| `--dag-pb <path>` | Protobuf DAG (`.pb` or `.pb.gz`) |
+| `--tree-pb <path>` | Parsimony protobuf tree (requires `--refseq`) |
+| `--fasta <path>` | Leaf sequences in FASTA format (requires `--newick` and `--refseq`) |
+| `--newick <path>` | Tree topology (paired with `--fasta`) |
+| `--refseq <path>` | Reference sequence file |
+| `--vcf <path>` | VCF file (required unless `--force-no-vcf`) |
+| `--force-no-vcf` | Skip VCF requirement |
+
+Each `--dag-pb`, `--tree-pb`, or `--fasta`/`--newick` pair can appear multiple
+times. All loaded inputs are merged into a single DAG.
+
+### Output
+
+| Option | Description |
+|--------|-------------|
+| `-o, --output <path>` | Output DAG in protobuf format (optional -- omit to skip output) |
+
+### Pruning and sampling
+
+| Option | Description |
+|--------|-------------|
+| `-t, --trim` | Trim to best parsimony score |
+| `--rf <path>` | Trim to minimize RF distance to this DAG file |
+| `-s, --sample` | Sample a single tree from the DAG |
+| `--seed <N>` | Random seed for sampling |
+
+### Analysis
+
+| Option | Description |
+|--------|-------------|
+| `--dag-info` | Print all DAG statistics (tree count, parsimony, RF) |
+| `--parsimony` | Print parsimony score distribution |
+| `--sum-rf-distance` | Print sum RF distance distribution |
+| `--validate` | Validate DAG invariants |
+
+### Examples
+
+Inspect a single DAG:
+
+```sh
+dagutil --dag-pb input.pb.gz --force-no-vcf --dag-info
+```
+
+Merge two DAGs and save the result:
+
+```sh
+dagutil --dag-pb a.pb.gz --dag-pb b.pb.gz --force-no-vcf -o merged.pb.gz
+```
+
+Trim to minimum parsimony and sample a single tree:
+
+```sh
+dagutil --dag-pb input.pb.gz --force-no-vcf -o best.pb -t -s --seed 42
+```
+
+Trim to minimize RF distance to a reference DAG:
+
+```sh
+dagutil --dag-pb input.pb.gz --force-no-vcf -o closest.pb -t --rf ref.pb.gz
+```
+
 ## License
 
 See [LICENSE](LICENSE).

@@ -113,6 +113,9 @@ target_link_libraries(larch PUBLIC ZLIB::ZLIB Threads::Threads)
 add_executable(larch2 tools/larch2.cpp)
 target_link_libraries(larch2 PRIVATE larch)
 
+add_executable(dagutil tools/dagutil.cpp)
+target_link_libraries(dagutil PRIVATE larch)
+
 # --- Tests --------------------------------------------------------------------
 
 enable_testing()
