@@ -107,11 +107,11 @@ static phylo_dag make_suboptimal_tree() {
   // Suboptimal topology: mix the two groups
   //       root
   //      /    \
-    //    i1      i2
+  //    i1      i2
   //   / \     / \
-    //  i3  L4  L3  i4
+  //  i3  L4  L3  i4
   //  /\         /\
-    // L1 L2     L5  L6
+  // L1 L2     L5  L6
   auto root = d.append_node<node_kind::inner>();
   root.cg() = cg_from_sequence("AAAA", ref);
   auto i1 = d.append_node<node_kind::inner>();

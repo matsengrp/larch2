@@ -138,7 +138,8 @@ endforeach()
 
 # Tests that need liblarch (protobuf + zlib + threads) and run from source dir
 foreach(test_name merge_test subtree_weight_test weight_accum_test
-                  optimize_test native_optimize_test spr_pipeline_test)
+                  optimize_test native_optimize_test spr_pipeline_test
+                  trim_clade_edges_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
     add_test(NAME ${test_name} COMMAND ${test_name}

@@ -7,10 +7,12 @@
 #include <larch/subtree_weight.hpp>
 #include <larch/weight_ops.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace larch {
@@ -182,5 +184,130 @@ struct max_rf_distance : max_sum_rf_distance {
     assert(is_tree(reference.get_result()));
   }
 };
+
+// Bitset clade representation for efficient RF distance computation.
+// Each clade is a bitvector over a shared leaf-id mapping, enabling O(n/64)
+// comparison via word-level operations.
+
+// Build a mapping from sample_id -> integer index for all leaves in the DAG.
+inline std::unordered_map<std::string, uint32_t> build_leaf_id_map(
+    phylo_dag& dag) {
+  std::unordered_map<std::string, uint32_t> leaf_map;
+  uint32_t next_id = 0;
+  for (auto nv : dag.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.sample_id(); }) {
+            auto const& sid = node.sample_id();
+            if (!sid.empty() && !leaf_map.count(sid)) {
+              leaf_map[sid] = next_id++;
+            }
+          }
+        },
+        nv);
+  }
+  return leaf_map;
+}
+
+// A compact bitvector representing a set of leaf indices.
+using clade_bitset = std::vector<uint64_t>;
+
+inline clade_bitset make_clade_bitset(uint32_t num_leaves) {
+  return clade_bitset((num_leaves + 63) / 64, 0);
+}
+
+inline void bitset_set(clade_bitset& bs, uint32_t idx) {
+  bs[idx / 64] |= uint64_t{1} << (idx % 64);
+}
+
+inline void bitset_or(clade_bitset& dst, clade_bitset const& src) {
+  for (std::size_t i = 0; i < dst.size(); ++i) dst[i] |= src[i];
+}
+
+// Collect clade bitsets for a tree using a pre-built leaf-id mapping.
+// Returns a sorted vector of clade bitsets (one per internal non-root node).
+inline std::vector<clade_bitset> collect_clade_bitsets(
+    phylo_dag& tree, std::unordered_map<std::string, uint32_t> const& leaf_map,
+    uint32_t num_leaves) {
+  assert(is_tree(tree));
+
+  auto real_root_idx = get_non_ua_root_idx(tree);
+  std::unordered_map<std::size_t, clade_bitset> descendants;
+  std::vector<clade_bitset> clades;
+
+  struct frame {
+    std::size_t node_idx;
+    std::vector<std::size_t> children;
+    std::size_t next = 0;
+  };
+
+  auto make_frame = [&](std::size_t idx) -> frame {
+    return {idx, get_child_indices(tree, idx), 0};
+  };
+
+  std::vector<frame> stack;
+  stack.push_back(make_frame(real_root_idx));
+
+  while (!stack.empty()) {
+    auto& top = stack.back();
+    if (top.next < top.children.size()) {
+      auto child_idx = top.children[top.next++];
+      stack.push_back(make_frame(child_idx));
+    } else {
+      auto idx = top.node_idx;
+      if (top.children.empty()) {
+        // Leaf: set the single bit for this leaf's integer id.
+        auto bs = make_clade_bitset(num_leaves);
+        auto nv = tree.get_node(idx);
+        std::visit(
+            [&](auto node) {
+              if constexpr (requires { node.sample_id(); }) {
+                auto it = leaf_map.find(node.sample_id());
+                if (it != leaf_map.end()) bitset_set(bs, it->second);
+              }
+            },
+            nv);
+        descendants[idx] = std::move(bs);
+      } else {
+        // Internal node: OR children's bitsets.
+        auto bs = make_clade_bitset(num_leaves);
+        for (auto child_idx : top.children) {
+          bitset_or(bs, descendants[child_idx]);
+        }
+        descendants[idx] = bs;
+        // Record clade for non-root internal nodes.
+        if (idx != real_root_idx) {
+          clades.push_back(std::move(bs));
+        }
+      }
+      stack.pop_back();
+    }
+  }
+
+  std::sort(clades.begin(), clades.end());
+  return clades;
+}
+
+// Compute RF distance between two trees using bitset clade representations.
+// Both trees must satisfy is_tree(). The leaf_map must cover all leaves.
+inline std::size_t pairwise_rf_distance(
+    std::vector<clade_bitset> const& clades1,
+    std::vector<clade_bitset> const& clades2) {
+  // Merge-style count of shared clades (both vectors are sorted).
+  std::size_t shared = 0;
+  std::size_t i = 0, j = 0;
+  while (i < clades1.size() && j < clades2.size()) {
+    if (clades1[i] == clades2[j]) {
+      ++shared;
+      ++i;
+      ++j;
+    } else if (clades1[i] < clades2[j]) {
+      ++i;
+    } else {
+      ++j;
+    }
+  }
+  return clades1.size() + clades2.size() - 2 * shared;
+}
 
 }  // namespace larch

@@ -11,6 +11,7 @@
 #include <larch/subtree_weight.hpp>
 #include <larch/weight_ops.hpp>
 #include <larch/rf_distance.hpp>
+#include <larch/newick.hpp>
 #include <larch/overlay_spr.hpp>
 #include <larch/thread_pool.hpp>
 #include <larch/version.hpp>
@@ -20,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <map>
@@ -370,6 +372,11 @@ Subtree optimization:
   --min-subtree-clade-size <N>  Min leaves in subtree (default: 100)
   --max-subtree-clade-size <N>  Max leaves in subtree (default: 1000)
 
+Diverse tree extraction:
+  --diverse-sample <K>    Extract K maximally diverse parsimony-optimal trees
+  --diverse-pool <N>      Override pool size (default: max(10K, 100))
+  --diverse-newick <path> Write selected trees as Newick strings (one per line)
+
 Post-processing:
   --trim                  Trim result to minimum-parsimony trees
 
@@ -404,6 +411,9 @@ struct args {
   std::size_t min_subtree_clade_size = 100;
   std::size_t max_subtree_clade_size = 1000;
   bool validate = false;
+  std::optional<std::size_t> diverse_sample;
+  std::optional<std::size_t> diverse_pool;
+  std::string diverse_newick;
   int move_coeff_pscore = 1;
   int move_coeff_nodes = 0;
   std::optional<int> move_score_threshold;
@@ -464,6 +474,12 @@ static args parse_args(int argc, char** argv) {
       a.trim = true;
     else if (arg == "--validate")
       a.validate = true;
+    else if (arg == "--diverse-sample")
+      a.diverse_sample = std::stoull(std::string{next()});
+    else if (arg == "--diverse-pool")
+      a.diverse_pool = std::stoull(std::string{next()});
+    else if (arg == "--diverse-newick")
+      a.diverse_newick = next();
     else if (arg == "--move-coeff-pscore")
       a.move_coeff_pscore = std::stoi(std::string{next()});
     else if (arg == "--move-coeff-nodes")
@@ -744,6 +760,168 @@ static std::optional<std::size_t> select_subtree_root(
   for (auto& c : candidates) weights.push_back(c.weight);
   std::discrete_distribution<std::size_t> dist(weights.begin(), weights.end());
   return candidates[dist(rng)].node_idx;
+}
+
+// ---------------------------------------------------------------------------
+// Pool-based diverse tree sampling (farthest-point-first with true min-RF)
+// ---------------------------------------------------------------------------
+
+static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
+                                                  std::size_t pool_size,
+                                                  std::uint32_t seed) {
+  assert(k >= 1 && pool_size >= k);
+  auto root_idx = get_root_idx(dag);
+
+  // 1. Sample pool of parsimony-optimal trees.
+  std::vector<phylo_dag> pool;
+  pool.reserve(pool_size);
+  std::cerr << "  Sampling pool of " << pool_size
+            << " parsimony-optimal trees...\n";
+  for (std::size_t i = 0; i < pool_size; ++i) {
+    auto seed_i = [](std::uint32_t x) -> std::uint32_t {
+      x ^= x >> 16;
+      x *= 0x45d9f3bU;
+      x ^= x >> 16;
+      return x;
+    }(seed + static_cast<std::uint32_t>(i));
+    parsimony_score_ops pops;
+    scoped_arena<4096> arena;
+    subtree_weight<parsimony_score_ops> sw(dag, seed_i, arena.get());
+    sw.compute_weight_below(root_idx, pops);
+    auto tree = sw.min_weight_sample_tree(pops);
+    recompute_compact_genomes(tree);
+    set_sample_ids_from_cg(tree);
+    pool.push_back(std::move(tree));
+  }
+
+  // 2. Deduplicate: remove topologically identical trees (same clade set).
+  //    Build leaf-id map from the DAG for integer-based clade representation.
+  auto leaf_map = build_leaf_id_map(dag);
+  auto num_leaves = static_cast<uint32_t>(leaf_map.size());
+
+  std::vector<std::vector<clade_bitset>> pool_clades;
+  pool_clades.reserve(pool.size());
+  for (auto& t : pool)
+    pool_clades.push_back(collect_clade_bitsets(t, leaf_map, num_leaves));
+
+  // Sort indices by clade set, then walk to find unique representatives.
+  std::vector<std::size_t> order(pool.size());
+  std::iota(order.begin(), order.end(), std::size_t{0});
+  std::sort(order.begin(), order.end(),
+            [&](auto a, auto b) { return pool_clades[a] < pool_clades[b]; });
+
+  std::vector<std::size_t> unique_indices;
+  for (std::size_t i = 0; i < order.size(); ++i) {
+    if (i == 0 || pool_clades[order[i]] != pool_clades[order[i - 1]])
+      unique_indices.push_back(order[i]);
+  }
+  // Re-sort by original pool index so first-occurrence ordering is preserved.
+  std::sort(unique_indices.begin(), unique_indices.end());
+
+  std::vector<phylo_dag> unique_pool;
+  std::vector<std::vector<clade_bitset>> unique_clades;
+  unique_pool.reserve(unique_indices.size());
+  unique_clades.reserve(unique_indices.size());
+  for (auto idx : unique_indices) {
+    unique_pool.push_back(std::move(pool[idx]));
+    unique_clades.push_back(std::move(pool_clades[idx]));
+  }
+  pool.clear();
+  pool_clades.clear();
+
+  std::cerr << "  Pool: " << pool_size << " sampled, " << unique_pool.size()
+            << " unique after deduplication\n";
+
+  // 3. Cap K at deduplicated pool size.
+  if (k > unique_pool.size()) {
+    std::cerr << "  Warning: requested " << k << " diverse trees but only "
+              << unique_pool.size()
+              << " unique trees in pool; capping K=" << unique_pool.size()
+              << "\n";
+    k = unique_pool.size();
+  }
+
+  std::size_t n = unique_pool.size();
+
+  // 4. Compute pairwise RF distance matrix.
+  std::cerr << "  Computing pairwise RF distances (" << n * (n - 1) / 2
+            << " pairs)...\n";
+  std::vector<std::vector<std::size_t>> rf(n, std::vector<std::size_t>(n, 0));
+  for (std::size_t i = 0; i < n; ++i) {
+    for (std::size_t j = i + 1; j < n; ++j) {
+      rf[i][j] = pairwise_rf_distance(unique_clades[i], unique_clades[j]);
+      rf[j][i] = rf[i][j];
+    }
+  }
+
+  // 5. Greedy farthest-point-first selection.
+  std::vector<std::size_t> selected;
+  selected.reserve(k);
+  std::vector<bool> is_selected(n, false);
+
+  // First tree: maximize total RF to all others.
+  {
+    std::size_t best = 0;
+    std::size_t best_sum = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      std::size_t total = 0;
+      for (std::size_t j = 0; j < n; ++j) total += rf[i][j];
+      if (total > best_sum) {
+        best_sum = total;
+        best = i;
+      }
+    }
+    selected.push_back(best);
+    is_selected[best] = true;
+    std::cerr << "  Selected tree 1: pool index " << best << " (total RF "
+              << best_sum << ")\n";
+  }
+
+  // Maintain min-RF from each candidate to the selected set.
+  std::vector<std::size_t> min_dist(n);
+  for (std::size_t i = 0; i < n; ++i) min_dist[i] = rf[i][selected[0]];
+
+  // Select remaining trees.
+  for (std::size_t s = 1; s < k; ++s) {
+    std::size_t best = 0;
+    std::size_t best_min_rf = 0;
+    std::size_t best_sum_rf = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      if (is_selected[i]) continue;
+      std::size_t sum_rf = 0;
+      for (auto si : selected) sum_rf += rf[i][si];
+      if (min_dist[i] > best_min_rf ||
+          (min_dist[i] == best_min_rf && sum_rf > best_sum_rf)) {
+        best = i;
+        best_min_rf = min_dist[i];
+        best_sum_rf = sum_rf;
+      }
+    }
+    selected.push_back(best);
+    is_selected[best] = true;
+    // Update min_dist.
+    for (std::size_t i = 0; i < n; ++i) {
+      min_dist[i] = std::min(min_dist[i], rf[i][best]);
+    }
+    std::cerr << "  Selected tree " << (s + 1) << ": pool index " << best
+              << " (min-RF " << best_min_rf << ")\n";
+  }
+
+  // Print pairwise RF submatrix for selected trees.
+  std::cerr << "  Pairwise RF among selected trees:\n";
+  for (std::size_t i = 0; i < selected.size(); ++i) {
+    std::cerr << "   ";
+    for (std::size_t j = 0; j < selected.size(); ++j) {
+      std::cerr << " " << rf[selected[i]][selected[j]];
+    }
+    std::cerr << "\n";
+  }
+
+  // Collect selected trees.
+  std::vector<phylo_dag> result;
+  result.reserve(k);
+  for (auto idx : selected) result.push_back(std::move(unique_pool[idx]));
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,6 +1468,67 @@ int main(int argc, char** argv) {
         std::cerr << " resample_score=" << rd.parsimony_score;
       std::cerr << "\n";
     }
+  }
+
+  // ---- Trim inconsistent clade edges ----
+  // SPR optimization can produce DAGs where some clade alternatives lead to
+  // subtrees missing leaves.  Trim them before any sampling or output.
+  {
+    auto& result_dag = m.get_result();
+    auto tr = trim_inconsistent_clade_edges(result_dag);
+    if (tr.unresolvable_clades > 0) {
+      std::cerr << "warning: " << tr.unresolvable_clades
+                << " clade(s) have ALL alternatives with incomplete leaf "
+                   "sets; sampled trees may be missing leaves\n";
+    }
+  }
+
+  // ---- Diverse tree extraction ----
+  if (a.diverse_sample.has_value()) {
+    std::size_t k = *a.diverse_sample;
+    if (k == 0) {
+      std::cerr << "error: --diverse-sample must be >= 1\n";
+      return 1;
+    }
+    std::size_t pool_n = a.diverse_pool.value_or(
+        std::max(std::size_t{10} * k, std::size_t{100}));
+    std::uint32_t div_seed = a.seed.value_or(std::random_device{}());
+
+    auto& result_dag = m.get_result();
+    std::cerr << "Extracting " << k << " diverse trees (pool=" << pool_n
+              << ")...\n";
+    auto diverse_trees = pool_diverse_sample(result_dag, k, pool_n, div_seed);
+
+    // Merge selected trees into output protobuf.
+    merge m_out{ref};
+    for (auto& t : diverse_trees) m_out.add_dag(t);
+    auto& out_dag = m_out.get_result();
+
+    std::cerr << "Diverse output: " << node_count(out_dag) << " nodes, "
+              << edge_count(out_dag) << " edges\n";
+    if (a.validate)
+      validate_dag(out_dag, "diverse output", thread_pool::get_default());
+    save_proto_dag(out_dag, a.output);
+
+    // Optionally write Newick.
+    if (!a.diverse_newick.empty()) {
+      std::ofstream nwk(a.diverse_newick);
+      if (!nwk) {
+        std::cerr << "error: cannot open " << a.diverse_newick
+                  << " for writing\n";
+        return 1;
+      }
+      for (auto& t : diverse_trees) nwk << to_newick(t) << "\n";
+      if (!nwk) {
+        std::cerr << "error: write failed to " << a.diverse_newick << "\n";
+        return 1;
+      }
+      std::cerr << "Wrote " << diverse_trees.size() << " Newick trees to "
+                << a.diverse_newick << "\n";
+    }
+
+    std::cerr << "Wrote " << a.output << "\n";
+    return 0;
   }
 
   // ---- Output ----
