@@ -224,20 +224,6 @@ inline void bitset_or(clade_bitset& dst, clade_bitset const& src) {
   for (std::size_t i = 0; i < dst.size(); ++i) dst[i] |= src[i];
 }
 
-inline std::size_t bitset_popcount(clade_bitset const& bs) {
-  std::size_t count = 0;
-  for (auto w : bs) count += static_cast<std::size_t>(__builtin_popcountll(w));
-  return count;
-}
-
-inline std::size_t bitset_and_popcount(clade_bitset const& a,
-                                       clade_bitset const& b) {
-  std::size_t count = 0;
-  for (std::size_t i = 0; i < a.size(); ++i)
-    count += static_cast<std::size_t>(__builtin_popcountll(a[i] & b[i]));
-  return count;
-}
-
 // Collect clade bitsets for a tree using a pre-built leaf-id mapping.
 // Returns a sorted vector of clade bitsets (one per internal non-root node).
 inline std::vector<clade_bitset> collect_clade_bitsets(
@@ -246,7 +232,7 @@ inline std::vector<clade_bitset> collect_clade_bitsets(
     uint32_t num_leaves) {
   assert(is_tree(tree));
 
-  auto root_idx = get_root_idx(tree);
+  auto real_root_idx = get_non_ua_root_idx(tree);
   std::unordered_map<std::size_t, clade_bitset> descendants;
   std::vector<clade_bitset> clades;
 
@@ -257,45 +243,8 @@ inline std::vector<clade_bitset> collect_clade_bitsets(
   };
 
   auto make_frame = [&](std::size_t idx) -> frame {
-    frame f;
-    f.node_idx = idx;
-    auto nv = tree.get_node(idx);
-    std::visit(
-        [&](auto node) {
-          for (auto ev : node.get_children()) {
-            std::visit(
-                [&](auto edge) {
-                  auto cv = edge.get_child();
-                  std::visit(
-                      [&](auto child) { f.children.push_back(child.index()); },
-                      cv);
-                },
-                ev);
-          }
-        },
-        nv);
-    return f;
+    return {idx, get_child_indices(tree, idx), 0};
   };
-
-  // Skip UA: start from its single child.
-  std::size_t real_root_idx = root_idx;
-  {
-    auto nv = tree.get_node(root_idx);
-    std::visit(
-        [&](auto node) {
-          for (auto ev : node.get_children()) {
-            std::visit(
-                [&](auto edge) {
-                  auto cv = edge.get_child();
-                  std::visit(
-                      [&](auto child) { real_root_idx = child.index(); }, cv);
-                },
-                ev);
-            break;
-          }
-        },
-        nv);
-  }
 
   std::vector<frame> stack;
   stack.push_back(make_frame(real_root_idx));

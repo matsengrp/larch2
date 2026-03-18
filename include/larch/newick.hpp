@@ -81,51 +81,21 @@ void parse_newick(std::string_view source, N&& on_node, E&& on_edge) {
 inline std::string to_newick(phylo_dag& tree) {
   assert(is_tree(tree));
 
-  auto ua = tree.get_root_as<node_kind::ua>();
-  // Find the single child of the UA node (the real root).
-  std::size_t real_root_idx = 0;
-  for (auto edge_var : ua.get_children()) {
-    std::visit(
-        [&](auto edge) {
-          auto cv = edge.get_child();
-          std::visit([&](auto child) { real_root_idx = child.index(); }, cv);
-        },
-        edge_var);
-    break;
-  }
+  auto real_root_idx = get_non_ua_root_idx(tree);
 
-  // Recursive DFS via explicit stack.
-  // Each entry: (node_idx, phase). phase=0 means "entering", phase=1 means
-  // "done with children".
+  // Explicit-stack DFS to build Newick string.
   std::string result;
 
   struct frame {
     std::size_t node_idx;
-    std::vector<std::size_t> children;  // child node indices
+    std::vector<std::size_t> children;
     std::size_t next_child = 0;
   };
 
   std::vector<frame> stack;
 
   auto make_frame = [&](std::size_t idx) -> frame {
-    frame f;
-    f.node_idx = idx;
-    auto nv = tree.get_node(idx);
-    std::visit(
-        [&](auto node) {
-          for (auto ev : node.get_children()) {
-            std::visit(
-                [&](auto edge) {
-                  auto cv = edge.get_child();
-                  std::visit(
-                      [&](auto child) { f.children.push_back(child.index()); },
-                      cv);
-                },
-                ev);
-          }
-        },
-        nv);
-    return f;
+    return {idx, get_child_indices(tree, idx), 0};
   };
 
   auto get_label = [&](std::size_t idx) -> std::string {

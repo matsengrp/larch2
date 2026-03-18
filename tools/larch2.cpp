@@ -770,6 +770,7 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag,
                                                    std::size_t k,
                                                    std::size_t pool_size,
                                                    std::uint32_t seed) {
+  assert(k >= 1 && pool_size >= k);
   auto root_idx = get_root_idx(dag);
 
   // 1. Sample pool of parsimony-optimal trees.
@@ -778,8 +779,12 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag,
   std::cerr << "  Sampling pool of " << pool_size
             << " parsimony-optimal trees...\n";
   for (std::size_t i = 0; i < pool_size; ++i) {
-    auto seed_i =
-        static_cast<std::uint32_t>((seed + i) * std::uint32_t{0x9E3779B9u});
+    auto seed_i = [](std::uint32_t x) -> std::uint32_t {
+      x ^= x >> 16;
+      x *= 0x45d9f3bU;
+      x ^= x >> 16;
+      return x;
+    }(seed + static_cast<std::uint32_t>(i));
     parsimony_score_ops pops;
     scoped_arena<4096> arena;
     subtree_weight<parsimony_score_ops> sw(dag, seed_i, arena.get());
@@ -800,22 +805,30 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag,
   for (auto& t : pool)
     pool_clades.push_back(collect_clade_bitsets(t, leaf_map, num_leaves));
 
+  // Sort indices by clade set, then walk to find unique representatives.
+  std::vector<std::size_t> order(pool.size());
+  std::iota(order.begin(), order.end(), std::size_t{0});
+  std::sort(order.begin(), order.end(),
+            [&](auto a, auto b) { return pool_clades[a] < pool_clades[b]; });
+
   std::vector<std::size_t> unique_indices;
-  for (std::size_t i = 0; i < pool.size(); ++i) {
-    bool duplicate = false;
-    for (auto j : unique_indices) {
-      if (pool_clades[i] == pool_clades[j]) {
-        duplicate = true;
-        break;
-      }
-    }
-    if (!duplicate) unique_indices.push_back(i);
+  for (std::size_t i = 0; i < order.size(); ++i) {
+    if (i == 0 || pool_clades[order[i]] != pool_clades[order[i - 1]])
+      unique_indices.push_back(order[i]);
   }
+  // Re-sort by original pool index so first-occurrence ordering is preserved.
+  std::sort(unique_indices.begin(), unique_indices.end());
 
   std::vector<phylo_dag> unique_pool;
+  std::vector<std::vector<clade_bitset>> unique_clades;
   unique_pool.reserve(unique_indices.size());
-  for (auto idx : unique_indices)
+  unique_clades.reserve(unique_indices.size());
+  for (auto idx : unique_indices) {
     unique_pool.push_back(std::move(pool[idx]));
+    unique_clades.push_back(std::move(pool_clades[idx]));
+  }
+  pool.clear();
+  pool_clades.clear();
 
   std::cerr << "  Pool: " << pool_size << " sampled, " << unique_pool.size()
             << " unique after deduplication\n";
@@ -830,13 +843,6 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag,
   }
 
   std::size_t n = unique_pool.size();
-
-  // Collect clade bitsets for unique trees only.
-  std::vector<std::vector<clade_bitset>> unique_clades;
-  unique_clades.reserve(n);
-  for (std::size_t i = 0; i < unique_indices.size(); ++i)
-    unique_clades.push_back(std::move(pool_clades[unique_indices[i]]));
-  pool_clades.clear();
 
   // 4. Compute pairwise RF distance matrix.
   std::cerr << "  Computing pairwise RF distances (" << n * (n - 1) / 2
@@ -1496,7 +1502,16 @@ int main(int argc, char** argv) {
     // Optionally write Newick.
     if (!a.diverse_newick.empty()) {
       std::ofstream nwk(a.diverse_newick);
+      if (!nwk) {
+        std::cerr << "error: cannot open " << a.diverse_newick
+                  << " for writing\n";
+        return 1;
+      }
       for (auto& t : diverse_trees) nwk << to_newick(t) << "\n";
+      if (!nwk) {
+        std::cerr << "error: write failed to " << a.diverse_newick << "\n";
+        return 1;
+      }
       std::cerr << "Wrote " << diverse_trees.size() << " Newick trees to "
                 << a.diverse_newick << "\n";
     }

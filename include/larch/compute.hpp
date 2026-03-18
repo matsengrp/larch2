@@ -3,6 +3,7 @@
 #include <larch/pmr_arena.hpp>
 #include <larch/phylo_dag.hpp>
 
+#include <cassert>
 #include <cstdlib>
 #include <deque>
 #include <iostream>
@@ -254,6 +255,36 @@ inline std::size_t get_parent_idx(phylo_dag& d, std::size_t edge_idx) {
 inline std::size_t get_root_idx(phylo_dag& d) {
   auto rv = d.get_root();
   return std::visit([](auto n) { return n.index(); }, rv);
+}
+
+// Get child node indices for a given node.
+inline std::vector<std::size_t> get_child_indices(phylo_dag& d,
+                                                   std::size_t node_idx) {
+  std::vector<std::size_t> children;
+  auto nv = d.get_node(node_idx);
+  std::visit(
+      [&](auto node) {
+        for (auto ev : node.get_children()) {
+          std::visit(
+              [&](auto edge) {
+                auto cv = edge.get_child();
+                std::visit(
+                    [&](auto child) { children.push_back(child.index()); }, cv);
+              },
+              ev);
+        }
+      },
+      nv);
+  return children;
+}
+
+// Get the non-UA root of a tree (the single child of the UA node).
+// Precondition: the root is a UA node with at least one child.
+inline std::size_t get_non_ua_root_idx(phylo_dag& tree) {
+  auto root_idx = get_root_idx(tree);
+  auto children = get_child_indices(tree, root_idx);
+  assert(!children.empty() && "UA node has no children");
+  return children[0];
 }
 
 inline std::vector<std::size_t> get_parent_edges(phylo_dag& d,
