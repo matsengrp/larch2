@@ -336,6 +336,201 @@ inline std::size_t get_clade_idx(phylo_dag& d, std::size_t edge_idx) {
   return std::visit([](auto edge) { return edge.clade_index(); }, ev);
 }
 
+// Compute the set of leaf node indices reachable from each node.
+// Uses bottom-up processing: seed from nodes with no children and propagate
+// leaf sets upward to parents.  Returns a vector indexed by node index
+// (sparse — only entries for reachable nodes are populated).
+inline std::vector<std::set<std::size_t>> compute_subtree_leaves(phylo_dag& d) {
+  std::vector<std::set<std::size_t>> result(d.node_high_mark());
+
+  // Count child edges per node ("remaining children" that must report their
+  // leaf sets before this node's set is complete).
+  auto root_idx = get_root_idx(d);
+  std::vector<std::size_t> remaining_children(d.node_high_mark(), 0);
+  std::vector<bool> reachable(d.node_high_mark(), false);
+
+  // BFS from root to find reachable nodes and count child edges.
+  std::queue<std::size_t> bfs;
+  bfs.push(root_idx);
+  reachable[root_idx] = true;
+  while (!bfs.empty()) {
+    auto idx = bfs.front();
+    bfs.pop();
+    auto nv = d.get_node(idx);
+    std::visit(
+        [&](auto node) {
+          for (auto ev : node.get_children()) {
+            std::visit(
+                [&](auto edge) {
+                  auto cv = edge.get_child();
+                  auto cidx = std::visit([](auto c) { return c.index(); }, cv);
+                  ++remaining_children[idx];
+                  if (!reachable[cidx]) {
+                    reachable[cidx] = true;
+                    bfs.push(cidx);
+                  }
+                },
+                ev);
+          }
+        },
+        nv);
+  }
+
+  // Seed with nodes that have no children (remaining_children == 0).
+  // Only actual leaf nodes contribute themselves to the leaf set.
+  std::queue<std::size_t> q;
+  for (auto nv : d.get_all_nodes()) {
+    auto idx = std::visit([](auto n) { return n.index(); }, nv);
+    if (!reachable[idx]) continue;
+    if (remaining_children[idx] == 0) {
+      if (is_leaf(d, idx)) result[idx].insert(idx);
+      q.push(idx);
+    }
+  }
+
+  // Process bottom-up: propagate leaf sets to parents.
+  while (!q.empty()) {
+    auto idx = q.front();
+    q.pop();
+
+    auto parent_edges = get_parent_edges(d, idx);
+    for (auto eidx : parent_edges) {
+      auto pidx = get_parent_idx(d, eidx);
+      if (!reachable[pidx]) continue;
+      result[pidx].insert(result[idx].begin(), result[idx].end());
+      if (--remaining_children[pidx] == 0) q.push(pidx);
+    }
+  }
+
+  return result;
+}
+
+struct trim_result {
+  std::size_t edges_removed = 0;
+  std::size_t unresolvable_clades = 0;
+};
+
+// Remove edges whose subtrees are missing leaves compared to other
+// alternatives in the same clade.
+//
+// For each internal node, for each clade group, compute the union of
+// reachable leaf sets across all alternatives.  Any alternative whose
+// child subtree has fewer leaves than this union is removed.  An
+// alternative is only removed if at least one other alternative in the
+// same clade survives.
+//
+// Returns the number of edges removed and the number of unresolvable
+// clades (where ALL alternatives are incomplete).
+inline trim_result trim_inconsistent_clade_edges(phylo_dag& d) {
+  trim_result result{};
+  std::size_t total_nodes_removed = 0;
+
+  // Iterate until no more inconsistent edges are found, because removing
+  // edges at one level can expose inconsistencies deeper in the DAG.
+  for (;;) {
+    auto subtree_leaves = compute_subtree_leaves(d);
+
+    // Collect edges to remove (can't remove while iterating).
+    std::vector<std::size_t> edges_to_remove;
+
+    for (auto nv : d.get_all_nodes()) {
+      auto idx = std::visit([](auto n) { return n.index(); }, nv);
+      if (is_leaf(d, idx)) continue;
+
+      auto clades = get_clades(d, idx);
+      for (auto const& edges : clades) {
+        if (edges.size() <= 1) continue;
+
+        // Compute the union of all alternatives' leaf sets for this clade.
+        std::set<std::size_t> clade_expected;
+        for (auto eidx : edges) {
+          auto child_idx = get_child_idx(d, eidx);
+          clade_expected.insert(subtree_leaves[child_idx].begin(),
+                                subtree_leaves[child_idx].end());
+        }
+
+        // Find alternatives whose subtrees are incomplete.
+        std::vector<std::size_t> bad;
+        std::size_t good_count = 0;
+        for (auto eidx : edges) {
+          auto child_idx = get_child_idx(d, eidx);
+          if (subtree_leaves[child_idx] != clade_expected)
+            bad.push_back(eidx);
+          else
+            ++good_count;
+        }
+
+        // Only remove if at least one good alternative remains.
+        if (good_count > 0) {
+          for (auto eidx : bad) edges_to_remove.push_back(eidx);
+        } else if (!bad.empty()) {
+          ++result.unresolvable_clades;
+          std::cerr << "warning: node " << idx << " has a clade where all "
+                    << bad.size()
+                    << " alternatives are missing leaves (cannot trim)\n";
+        }
+      }
+    }
+
+    if (edges_to_remove.empty()) break;
+
+    // Remove flagged edges.
+    for (auto eidx : edges_to_remove) {
+      auto ev = d.get_edge(eidx);
+      std::visit([](auto edge) { edge.remove(); }, ev);
+    }
+    result.edges_removed += edges_to_remove.size();
+
+    // Remove nodes that became unreachable after edge removal.
+    auto root_idx = get_root_idx(d);
+    std::vector<bool> reachable(d.node_high_mark(), false);
+    std::queue<std::size_t> q;
+    q.push(root_idx);
+    reachable[root_idx] = true;
+    while (!q.empty()) {
+      auto idx = q.front();
+      q.pop();
+      auto nv = d.get_node(idx);
+      std::visit(
+          [&](auto node) {
+            for (auto ev : node.get_children()) {
+              std::visit(
+                  [&](auto edge) {
+                    auto cv = edge.get_child();
+                    auto cidx =
+                        std::visit([](auto c) { return c.index(); }, cv);
+                    if (!reachable[cidx]) {
+                      reachable[cidx] = true;
+                      q.push(cidx);
+                    }
+                  },
+                  ev);
+            }
+          },
+          nv);
+    }
+
+    std::vector<std::size_t> orphan_nodes;
+    for (auto nv : d.get_all_nodes()) {
+      auto idx = std::visit([](auto n) { return n.index(); }, nv);
+      if (!reachable[idx]) orphan_nodes.push_back(idx);
+    }
+    for (auto idx : orphan_nodes) {
+      auto nv = d.get_node(idx);
+      std::visit([](auto node) { node.remove(); }, nv);
+    }
+    total_nodes_removed += orphan_nodes.size();
+  }
+
+  if (result.edges_removed > 0) {
+    std::cerr << "trim_inconsistent_clade_edges: removed "
+              << result.edges_removed << " edges, " << total_nodes_removed
+              << " orphan nodes\n";
+  }
+
+  return result;
+}
+
 inline void validate_dag(phylo_dag& d, std::string_view label) {
   auto fail = [&](std::string const& msg) {
     throw std::runtime_error("validate_dag [" + std::string{label} +
@@ -481,6 +676,34 @@ inline void validate_dag(phylo_dag& d, std::string_view label) {
       if (clades[ci].empty())
         fail("node " + std::to_string(idx) + ": clade index " +
              std::to_string(ci) + " is empty (gap in indices)");
+    }
+  }
+
+  // 8. Clade leaf set consistency — all alternatives within a clade must
+  //    lead to subtrees with the same set of reachable leaves.
+  {
+    auto subtree_leaves = compute_subtree_leaves(d);
+    for (auto nv : d.get_all_nodes()) {
+      auto idx = std::visit([](auto n) { return n.index(); }, nv);
+      if (is_leaf(d, idx)) continue;
+
+      auto clades = get_clades(d, idx, mr);
+      for (std::size_t ci = 0; ci < clades.size(); ++ci) {
+        if (clades[ci].size() <= 1) continue;
+
+        // Use first alternative as reference.
+        auto ref_child = get_child_idx(d, clades[ci][0]);
+        auto const& ref_leaves = subtree_leaves[ref_child];
+
+        for (std::size_t ai = 1; ai < clades[ci].size(); ++ai) {
+          auto alt_child = get_child_idx(d, clades[ci][ai]);
+          if (subtree_leaves[alt_child] != ref_leaves)
+            fail("node " + std::to_string(idx) + " clade " +
+                 std::to_string(ci) + ": alternatives have different leaf " +
+                 "sets (" + std::to_string(ref_leaves.size()) + " vs " +
+                 std::to_string(subtree_leaves[alt_child].size()) + " leaves)");
+        }
+      }
     }
   }
 
@@ -685,6 +908,38 @@ inline void validate_dag(phylo_dag& d, std::string_view label,
                                    "]: node " + std::to_string(idx) +
                                    ": clade index " + std::to_string(ci) +
                                    " is empty (gap in indices)");
+      }
+    });
+  }
+
+  // 8. Clade leaf set consistency — all alternatives within a clade must
+  //    lead to subtrees with the same set of reachable leaves.
+  {
+    auto subtree_leaves = compute_subtree_leaves(d);
+    std::vector<std::size_t> non_leaf_nodes;
+    for (auto nv : d.get_all_nodes()) {
+      auto idx = std::visit([](auto n) { return n.index(); }, nv);
+      if (!is_leaf(d, idx)) non_leaf_nodes.push_back(idx);
+    }
+
+    parallel_for_each(pool, non_leaf_nodes, [&](std::size_t idx) {
+      scoped_arena<4096> arena;
+      auto* local_mr = arena.get();
+      auto clades = get_clades(d, idx, local_mr);
+      for (std::size_t ci = 0; ci < clades.size(); ++ci) {
+        if (clades[ci].size() <= 1) continue;
+        auto ref_child = get_child_idx(d, clades[ci][0]);
+        auto const& ref_leaves = subtree_leaves[ref_child];
+        for (std::size_t ai = 1; ai < clades[ci].size(); ++ai) {
+          auto alt_child = get_child_idx(d, clades[ci][ai]);
+          if (subtree_leaves[alt_child] != ref_leaves)
+            throw std::runtime_error(
+                "validate_dag [" + std::string{label} + "]: node " +
+                std::to_string(idx) + " clade " + std::to_string(ci) +
+                ": alternatives have different leaf sets (" +
+                std::to_string(ref_leaves.size()) + " vs " +
+                std::to_string(subtree_leaves[alt_child].size()) + " leaves)");
+        }
       }
     });
   }
