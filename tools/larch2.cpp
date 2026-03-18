@@ -770,6 +770,10 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
                                                   std::size_t pool_size,
                                                   std::uint32_t seed) {
   assert(k >= 1 && pool_size >= k);
+
+  // 0. Trim edges whose subtrees are missing leaves (invalid DAG structure).
+  trim_inconsistent_clade_edges(dag);
+
   auto root_idx = get_root_idx(dag);
 
   // 1. Sample pool of parsimony-optimal trees.
