@@ -337,16 +337,16 @@ inline std::size_t get_clade_idx(phylo_dag& d, std::size_t edge_idx) {
 }
 
 // Compute the set of leaf node indices reachable from each node.
-// Uses bottom-up traversal (reverse BFS order) so children are computed
-// before parents.  Returns a vector indexed by node index (sparse — only
-// entries for reachable nodes are populated).
+// Uses bottom-up processing: seed from nodes with no children and propagate
+// leaf sets upward to parents.  Returns a vector indexed by node index
+// (sparse — only entries for reachable nodes are populated).
 inline std::vector<std::set<std::size_t>> compute_subtree_leaves(phylo_dag& d) {
   std::vector<std::set<std::size_t>> result(d.node_high_mark());
 
-  // Bottom-up Kahn's: start from leaves, propagate upward.
-  // "out_degree" = number of child edges remaining to be resolved.
+  // Count child edges per node ("remaining children" that must report their
+  // leaf sets before this node's set is complete).
   auto root_idx = get_root_idx(d);
-  std::vector<std::size_t> out_degree(d.node_high_mark(), 0);
+  std::vector<std::size_t> remaining_children(d.node_high_mark(), 0);
   std::vector<bool> reachable(d.node_high_mark(), false);
 
   // BFS from root to find reachable nodes and count child edges.
@@ -365,7 +365,7 @@ inline std::vector<std::set<std::size_t>> compute_subtree_leaves(phylo_dag& d) {
                   auto cv = edge.get_child();
                   auto cidx =
                       std::visit([](auto c) { return c.index(); }, cv);
-                  ++out_degree[idx];
+                  ++remaining_children[idx];
                   if (!reachable[cidx]) {
                     reachable[cidx] = true;
                     bfs.push(cidx);
@@ -377,12 +377,13 @@ inline std::vector<std::set<std::size_t>> compute_subtree_leaves(phylo_dag& d) {
         nv);
   }
 
-  // Seed with leaf nodes (out_degree == 0).
+  // Seed with nodes that have no children (remaining_children == 0).
+  // Only actual leaf nodes contribute themselves to the leaf set.
   std::queue<std::size_t> q;
   for (auto nv : d.get_all_nodes()) {
     auto idx = std::visit([](auto n) { return n.index(); }, nv);
     if (!reachable[idx]) continue;
-    if (out_degree[idx] == 0) {
+    if (remaining_children[idx] == 0) {
       if (is_leaf(d, idx)) result[idx].insert(idx);
       q.push(idx);
     }
@@ -398,23 +399,31 @@ inline std::vector<std::set<std::size_t>> compute_subtree_leaves(phylo_dag& d) {
       auto pidx = get_parent_idx(d, eidx);
       if (!reachable[pidx]) continue;
       result[pidx].insert(result[idx].begin(), result[idx].end());
-      if (--out_degree[pidx] == 0) q.push(pidx);
+      if (--remaining_children[pidx] == 0) q.push(pidx);
     }
   }
 
   return result;
 }
 
+struct trim_result {
+  std::size_t edges_removed = 0;
+  std::size_t unresolvable_clades = 0;
+};
+
 // Remove edges whose subtrees are missing leaves compared to other
-// alternatives in the same clade.  Returns the number of edges removed.
+// alternatives in the same clade.
 //
 // For each internal node, for each clade group, compute the union of
 // reachable leaf sets across all alternatives.  Any alternative whose
 // child subtree has fewer leaves than this union is removed.  An
 // alternative is only removed if at least one other alternative in the
 // same clade survives.
-inline std::size_t trim_inconsistent_clade_edges(phylo_dag& d) {
-  std::size_t total_edges_removed = 0;
+//
+// Returns the number of edges removed and the number of unresolvable
+// clades (where ALL alternatives are incomplete).
+inline trim_result trim_inconsistent_clade_edges(phylo_dag& d) {
+  trim_result result{};
   std::size_t total_nodes_removed = 0;
 
   // Iterate until no more inconsistent edges are found, because removing
@@ -456,6 +465,7 @@ inline std::size_t trim_inconsistent_clade_edges(phylo_dag& d) {
         if (good_count > 0) {
           for (auto eidx : bad) edges_to_remove.push_back(eidx);
         } else if (!bad.empty()) {
+          ++result.unresolvable_clades;
           std::cerr << "warning: node " << idx
                     << " has a clade where all " << bad.size()
                     << " alternatives are missing leaves (cannot trim)\n";
@@ -470,7 +480,7 @@ inline std::size_t trim_inconsistent_clade_edges(phylo_dag& d) {
       auto ev = d.get_edge(eidx);
       std::visit([](auto edge) { edge.remove(); }, ev);
     }
-    total_edges_removed += edges_to_remove.size();
+    result.edges_removed += edges_to_remove.size();
 
     // Remove nodes that became unreachable after edge removal.
     auto root_idx = get_root_idx(d);
@@ -513,13 +523,13 @@ inline std::size_t trim_inconsistent_clade_edges(phylo_dag& d) {
     total_nodes_removed += orphan_nodes.size();
   }
 
-  if (total_edges_removed > 0) {
+  if (result.edges_removed > 0) {
     std::cerr << "trim_inconsistent_clade_edges: removed "
-              << total_edges_removed << " edges, " << total_nodes_removed
+              << result.edges_removed << " edges, " << total_nodes_removed
               << " orphan nodes\n";
   }
 
-  return total_edges_removed;
+  return result;
 }
 
 inline void validate_dag(phylo_dag& d, std::string_view label) {

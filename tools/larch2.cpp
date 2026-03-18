@@ -1475,7 +1475,12 @@ int main(int argc, char** argv) {
   // subtrees missing leaves.  Trim them before any sampling or output.
   {
     auto& result_dag = m.get_result();
-    trim_inconsistent_clade_edges(result_dag);
+    auto tr = trim_inconsistent_clade_edges(result_dag);
+    if (tr.unresolvable_clades > 0) {
+      std::cerr << "warning: " << tr.unresolvable_clades
+                << " clade(s) have ALL alternatives with incomplete leaf "
+                   "sets; sampled trees may be missing leaves\n";
+    }
   }
 
   // ---- Diverse tree extraction ----

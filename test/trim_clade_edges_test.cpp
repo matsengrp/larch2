@@ -3,6 +3,7 @@
 #include <larch/subtree_weight.hpp>
 
 #include <cassert>
+#include <cstring>
 #include <map>
 #include <print>
 #include <set>
@@ -44,12 +45,18 @@ static std::set<std::string> get_leaf_ids(phylo_dag& d) {
   return ids;
 }
 
+struct inconsistent_dag {
+  phylo_dag d;
+  std::size_t inner1_idx;
+  std::size_t inner2_idx;
+};
+
 // Build a small DAG where one UA alternative is missing a leaf.
 //
 //   UA ─── clade 0 ──→ inner1 ──→ {leaf1, leaf2, leaf3}   (good)
-//   UA ─── clade 0 ──→ inner2 ──→ {leaf1, leaf2}          (bad: missing leaf3)
+//   UA ─── clade 0 ──→ inner2 ──→ {leaf1, leaf2}          (bad)
 //
-static phylo_dag make_inconsistent_dag() {
+static inconsistent_dag make_inconsistent_dag() {
   constexpr std::string_view ref = "GAA";
   phylo_dag d;
 
@@ -75,19 +82,60 @@ static phylo_dag make_inconsistent_dag() {
   leaf3.cg() = cg_from_sequence("AAA", ref);
   leaf3.sample_id() = "leaf3";
 
-  // UA -> inner1 (clade 0, alternative 1)
   add_edge(d, ua.index(), inner1.index(), 0);
-  // UA -> inner2 (clade 0, alternative 2) — bad subtree
   add_edge(d, ua.index(), inner2.index(), 0);
 
-  // inner1 -> leaf1, leaf2, leaf3 (complete)
   add_edge(d, inner1.index(), leaf1.index(), 0);
   add_edge(d, inner1.index(), leaf2.index(), 1);
   add_edge(d, inner1.index(), leaf3.index(), 2);
 
-  // inner2 -> leaf1, leaf2 only (missing leaf3)
   add_edge(d, inner2.index(), leaf1.index(), 0);
   add_edge(d, inner2.index(), leaf2.index(), 1);
+
+  recompute_edge_mutations(d);
+  return {std::move(d), inner1.index(), inner2.index()};
+}
+
+// Build a DAG where ALL alternatives in a clade are incomplete (neither
+// has the full leaf set).
+//
+//   UA ─── clade 0 ──→ inner1 ──→ {leaf1, leaf2}   (missing leaf3)
+//   UA ─── clade 0 ──→ inner2 ──→ {leaf1, leaf3}   (missing leaf2)
+//
+static phylo_dag make_all_bad_dag() {
+  constexpr std::string_view ref = "GAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto inner1 = d.append_node<node_kind::inner>();
+  inner1.cg() = cg_from_sequence("GAA", ref);
+
+  auto inner2 = d.append_node<node_kind::inner>();
+  inner2.cg() = cg_from_sequence("GAA", ref);
+
+  auto leaf1 = d.append_node<node_kind::leaf>();
+  leaf1.cg() = cg_from_sequence("ACC", ref);
+  leaf1.sample_id() = "leaf1";
+
+  auto leaf2 = d.append_node<node_kind::leaf>();
+  leaf2.cg() = cg_from_sequence("GTT", ref);
+  leaf2.sample_id() = "leaf2";
+
+  auto leaf3 = d.append_node<node_kind::leaf>();
+  leaf3.cg() = cg_from_sequence("AAA", ref);
+  leaf3.sample_id() = "leaf3";
+
+  add_edge(d, ua.index(), inner1.index(), 0);
+  add_edge(d, ua.index(), inner2.index(), 0);
+
+  add_edge(d, inner1.index(), leaf1.index(), 0);
+  add_edge(d, inner1.index(), leaf2.index(), 1);
+
+  add_edge(d, inner2.index(), leaf1.index(), 0);
+  add_edge(d, inner2.index(), leaf3.index(), 1);
 
   recompute_edge_mutations(d);
   return d;
@@ -96,30 +144,11 @@ static phylo_dag make_inconsistent_dag() {
 static void test_compute_subtree_leaves() {
   std::println("test_compute_subtree_leaves");
 
-  auto d = make_inconsistent_dag();
+  auto [d, inner1_idx, inner2_idx] = make_inconsistent_dag();
   auto subtree_leaves = compute_subtree_leaves(d);
 
-  // UA should reach all 3 leaves.
   auto root_idx = get_root_idx(d);
   assert(subtree_leaves[root_idx].size() == 3);
-
-  // inner1 should reach 3 leaves, inner2 should reach 2.
-  std::size_t inner1_idx = 0, inner2_idx = 0;
-  for (auto nv : d.get_all_nodes()) {
-    std::visit(
-        [&](auto node) {
-          if constexpr (requires { node.cg(); }) {
-            if constexpr (!requires { node.sample_id(); }) {
-              if (subtree_leaves[node.index()].size() == 3)
-                inner1_idx = node.index();
-              else if (subtree_leaves[node.index()].size() == 2)
-                inner2_idx = node.index();
-            }
-          }
-        },
-        nv);
-  }
-
   assert(subtree_leaves[inner1_idx].size() == 3);
   assert(subtree_leaves[inner2_idx].size() == 2);
 
@@ -129,12 +158,38 @@ static void test_compute_subtree_leaves() {
 static void test_trim_removes_bad_edge() {
   std::println("test_trim_removes_bad_edge");
 
-  auto d = make_inconsistent_dag();
-  auto removed = trim_inconsistent_clade_edges(d);
-  assert(removed == 1);  // The UA->inner2 edge should be removed.
+  auto [d, inner1_idx, inner2_idx] = make_inconsistent_dag();
+  auto tr = trim_inconsistent_clade_edges(d);
+  assert(tr.edges_removed == 1);
+  assert(tr.unresolvable_clades == 0);
 
-  // All remaining nodes should be reachable and valid.
-  assert(leaf_count(d) == 3);
+  auto remaining = get_leaf_ids(d);
+  assert(remaining == (std::set<std::string>{"leaf1", "leaf2", "leaf3"}));
+
+  std::println("  PASS");
+}
+
+static void test_trim_idempotent() {
+  std::println("test_trim_idempotent");
+
+  auto [d, inner1_idx, inner2_idx] = make_inconsistent_dag();
+  auto tr1 = trim_inconsistent_clade_edges(d);
+  assert(tr1.edges_removed == 1);
+
+  auto tr2 = trim_inconsistent_clade_edges(d);
+  assert(tr2.edges_removed == 0);
+  assert(tr2.unresolvable_clades == 0);
+
+  std::println("  PASS");
+}
+
+static void test_trim_all_bad_reports_unresolvable() {
+  std::println("test_trim_all_bad_reports_unresolvable");
+
+  auto d = make_all_bad_dag();
+  auto tr = trim_inconsistent_clade_edges(d);
+  assert(tr.edges_removed == 0);
+  assert(tr.unresolvable_clades == 1);
 
   std::println("  PASS");
 }
@@ -142,13 +197,13 @@ static void test_trim_removes_bad_edge() {
 static void test_validate_catches_inconsistency() {
   std::println("test_validate_catches_inconsistency");
 
-  auto d = make_inconsistent_dag();
+  auto [d, inner1_idx, inner2_idx] = make_inconsistent_dag();
   bool caught = false;
   try {
     validate_dag(d, "inconsistent");
   } catch (std::runtime_error const& e) {
     caught = true;
-    std::println("  caught: {}", e.what());
+    assert(std::strstr(e.what(), "different leaf sets") != nullptr);
   }
   assert(caught);
 
@@ -158,9 +213,9 @@ static void test_validate_catches_inconsistency() {
 static void test_trim_then_validate() {
   std::println("test_trim_then_validate");
 
-  auto d = make_inconsistent_dag();
+  auto [d, inner1_idx, inner2_idx] = make_inconsistent_dag();
   trim_inconsistent_clade_edges(d);
-  validate_dag(d, "after trim");  // Should not throw.
+  validate_dag(d, "after trim");
 
   std::println("  PASS");
 }
@@ -168,31 +223,30 @@ static void test_trim_then_validate() {
 static void test_trim_then_sample() {
   std::println("test_trim_then_sample");
 
-  auto d = make_inconsistent_dag();
+  auto [d, inner1_idx, inner2_idx] = make_inconsistent_dag();
   trim_inconsistent_clade_edges(d);
   auto expected_leaves = get_leaf_ids(d);
 
-  parsimony_score_ops pops;
-  subtree_weight<parsimony_score_ops> sw(d, 42u);
-
-  for (int i = 0; i < 20; ++i) {
+  for (std::uint32_t seed = 0; seed < 20; ++seed) {
+    parsimony_score_ops pops;
+    subtree_weight<parsimony_score_ops> sw(d, seed);
     auto tree = sw.sample_tree(pops);
-    auto tree_leaves = get_leaf_ids(tree);
-    assert(tree_leaves == expected_leaves);
+    assert(is_tree(tree));
+    assert(get_leaf_ids(tree) == expected_leaves);
   }
 
   std::println("  PASS");
 }
 
-static void test_fluC_PB2_7taxa() {
-  std::println("test_fluC_PB2_7taxa (reproducer DAG)");
-
-  auto d = load_proto_dag("data/madag/fluC_PB2_7taxa.pb");
+// Shared test logic for real-world reproducer DAGs.
+static void run_real_dag_trim_test(std::string_view path,
+                                   std::size_t expected_leaves) {
+  auto d = load_proto_dag(path);
 
   auto num_leaves = leaf_count(d);
   std::println("  DAG: {} nodes, {} edges, {} leaves", node_count(d),
                edge_count(d), num_leaves);
-  assert(num_leaves == 7);
+  assert(num_leaves == expected_leaves);
 
   // Before trim: some min-weight samples should be incomplete.
   {
@@ -211,70 +265,42 @@ static void test_fluC_PB2_7taxa() {
   }
 
   // Trim and verify.
-  auto removed = trim_inconsistent_clade_edges(d);
-  std::println("  trimmed {} edges", removed);
-  assert(removed > 0);
+  auto tr = trim_inconsistent_clade_edges(d);
+  std::println("  trimmed {} edges ({} unresolvable clades)",
+               tr.edges_removed, tr.unresolvable_clades);
+  assert(tr.edges_removed > 0);
+  assert(tr.unresolvable_clades == 0);
 
   // After trim: all min-weight samples should be complete.
+  auto expected_ids = get_leaf_ids(d);
   for (std::uint32_t seed = 0; seed < 100; ++seed) {
     parsimony_score_ops pops;
     subtree_weight<parsimony_score_ops> sw(d, seed);
     auto tree = sw.min_weight_sample_tree(pops);
-    assert(leaf_count(tree) == num_leaves);
+    assert(is_tree(tree));
+    assert(get_leaf_ids(tree) == expected_ids);
   }
   std::println("  100 min-weight samples after trim: all have {} leaves",
                num_leaves);
+}
 
+static void test_fluC_PB2_7taxa() {
+  std::println("test_fluC_PB2_7taxa (reproducer DAG)");
+  run_real_dag_trim_test("data/madag/fluC_PB2_7taxa.pb", 7);
   std::println("  PASS");
 }
 
 static void test_fluC_PB2_10taxa() {
   std::println("test_fluC_PB2_10taxa (10-taxa reproducer DAG)");
-
-  auto d = load_proto_dag("data/madag/fluC_PB2_10taxa.pb");
-
-  auto num_leaves = leaf_count(d);
-  std::println("  DAG: {} nodes, {} edges, {} leaves", node_count(d),
-               edge_count(d), num_leaves);
-  assert(num_leaves == 10);
-
-  // Before trim: some min-weight samples should be incomplete.
-  {
-    bool found_incomplete = false;
-    for (std::uint32_t seed = 0; seed < 50; ++seed) {
-      parsimony_score_ops pops;
-      subtree_weight<parsimony_score_ops> sw(d, seed);
-      auto tree = sw.min_weight_sample_tree(pops);
-      if (leaf_count(tree) < num_leaves) {
-        found_incomplete = true;
-        break;
-      }
-    }
-    assert(found_incomplete);
-    std::println("  confirmed: untrimmed DAG produces incomplete trees");
-  }
-
-  // Trim and verify.
-  auto removed = trim_inconsistent_clade_edges(d);
-  std::println("  trimmed {} edges", removed);
-  assert(removed > 0);
-
-  // After trim: all min-weight samples should be complete.
-  for (std::uint32_t seed = 0; seed < 100; ++seed) {
-    parsimony_score_ops pops;
-    subtree_weight<parsimony_score_ops> sw(d, seed);
-    auto tree = sw.min_weight_sample_tree(pops);
-    assert(leaf_count(tree) == num_leaves);
-  }
-  std::println("  100 min-weight samples after trim: all have {} leaves",
-               num_leaves);
-
+  run_real_dag_trim_test("data/madag/fluC_PB2_10taxa.pb", 10);
   std::println("  PASS");
 }
 
 int main() {
   test_compute_subtree_leaves();
   test_trim_removes_bad_edge();
+  test_trim_idempotent();
+  test_trim_all_bad_reports_unresolvable();
   test_validate_catches_inconsistency();
   test_trim_then_validate();
   test_trim_then_sample();
