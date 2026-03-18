@@ -22,7 +22,7 @@ if(GCC_TOOLCHAIN)
     set(CMAKE_CXX_COMPILER "${GCC_TOOLCHAIN}/bin/g++${_suffix}"   CACHE FILEPATH "" FORCE)
 endif()
 
-project(larch2 VERSION 2.0.0 LANGUAGES C CXX)
+project(larch2 VERSION 2.0.1 LANGUAGES C CXX)
 
 # On FreeBSD the system ranlib is LLVM's, which rejects the --plugin flag that
 # gcc-ranlib passes.  CMake's IPO uses CMAKE_<LANG>_COMPILER_RANLIB for static
@@ -112,6 +112,9 @@ target_link_libraries(larch PUBLIC ZLIB::ZLIB Threads::Threads)
 
 add_executable(larch2 tools/larch2.cpp)
 target_link_libraries(larch2 PRIVATE larch)
+
+add_executable(dagutil tools/dagutil.cpp)
+target_link_libraries(dagutil PRIVATE larch)
 
 # --- Tests --------------------------------------------------------------------
 
