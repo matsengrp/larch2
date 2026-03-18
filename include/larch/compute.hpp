@@ -363,8 +363,7 @@ inline std::vector<std::set<std::size_t>> compute_subtree_leaves(phylo_dag& d) {
             std::visit(
                 [&](auto edge) {
                   auto cv = edge.get_child();
-                  auto cidx =
-                      std::visit([](auto c) { return c.index(); }, cv);
+                  auto cidx = std::visit([](auto c) { return c.index(); }, cv);
                   ++remaining_children[idx];
                   if (!reachable[cidx]) {
                     reachable[cidx] = true;
@@ -466,8 +465,8 @@ inline trim_result trim_inconsistent_clade_edges(phylo_dag& d) {
           for (auto eidx : bad) edges_to_remove.push_back(eidx);
         } else if (!bad.empty()) {
           ++result.unresolvable_clades;
-          std::cerr << "warning: node " << idx
-                    << " has a clade where all " << bad.size()
+          std::cerr << "warning: node " << idx << " has a clade where all "
+                    << bad.size()
                     << " alternatives are missing leaves (cannot trim)\n";
         }
       }

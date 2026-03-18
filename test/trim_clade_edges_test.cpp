@@ -266,8 +266,8 @@ static void run_real_dag_trim_test(std::string_view path,
 
   // Trim and verify.
   auto tr = trim_inconsistent_clade_edges(d);
-  std::println("  trimmed {} edges ({} unresolvable clades)",
-               tr.edges_removed, tr.unresolvable_clades);
+  std::println("  trimmed {} edges ({} unresolvable clades)", tr.edges_removed,
+               tr.unresolvable_clades);
   assert(tr.edges_removed > 0);
   assert(tr.unresolvable_clades == 0);
 
