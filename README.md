@@ -93,6 +93,14 @@ larch2 [options] -o <output.pb.gz>
 | `--min-subtree-clade-size <N>` | 100 | Minimum leaves in selected subtree |
 | `--max-subtree-clade-size <N>` | 1000 | Maximum leaves in selected subtree |
 
+### Diverse tree extraction
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--diverse-sample <K>` | off | Extract K maximally diverse parsimony-optimal trees |
+| `--diverse-pool <N>` | max(10K, 100) | Override the candidate pool size |
+| `--diverse-newick <path>` | | Write selected trees as Newick strings (one per line) |
+
 ### Other
 
 | Option | Description |
@@ -120,6 +128,13 @@ Optimize a parsimony protobuf tree with RF-distance sampling:
 ```sh
 larch2 --tree-pb tree.pb.gz --refseq ref.txt -o output.pb.gz \
     --sample-method rf-minsum -n 50
+```
+
+Extract 5 diverse optimal trees as Newick:
+
+```sh
+larch2 --dag-pb input.pb.gz -o output.pb.gz \
+    --diverse-sample 5 --diverse-newick trees.nwk
 ```
 
 ## dagutil
