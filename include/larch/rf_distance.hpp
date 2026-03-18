@@ -227,8 +227,7 @@ inline void bitset_or(clade_bitset& dst, clade_bitset const& src) {
 // Collect clade bitsets for a tree using a pre-built leaf-id mapping.
 // Returns a sorted vector of clade bitsets (one per internal non-root node).
 inline std::vector<clade_bitset> collect_clade_bitsets(
-    phylo_dag& tree,
-    std::unordered_map<std::string, uint32_t> const& leaf_map,
+    phylo_dag& tree, std::unordered_map<std::string, uint32_t> const& leaf_map,
     uint32_t num_leaves) {
   assert(is_tree(tree));
 

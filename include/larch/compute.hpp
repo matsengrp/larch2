@@ -259,7 +259,7 @@ inline std::size_t get_root_idx(phylo_dag& d) {
 
 // Get child node indices for a given node.
 inline std::vector<std::size_t> get_child_indices(phylo_dag& d,
-                                                   std::size_t node_idx) {
+                                                  std::size_t node_idx) {
   std::vector<std::size_t> children;
   auto nv = d.get_node(node_idx);
   std::visit(

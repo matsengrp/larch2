@@ -766,10 +766,9 @@ static std::optional<std::size_t> select_subtree_root(
 // Pool-based diverse tree sampling (farthest-point-first with true min-RF)
 // ---------------------------------------------------------------------------
 
-static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag,
-                                                   std::size_t k,
-                                                   std::size_t pool_size,
-                                                   std::uint32_t seed) {
+static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
+                                                  std::size_t pool_size,
+                                                  std::uint32_t seed) {
   assert(k >= 1 && pool_size >= k);
   auto root_idx = get_root_idx(dag);
 
@@ -835,8 +834,8 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag,
 
   // 3. Cap K at deduplicated pool size.
   if (k > unique_pool.size()) {
-    std::cerr << "  Warning: requested " << k
-              << " diverse trees but only " << unique_pool.size()
+    std::cerr << "  Warning: requested " << k << " diverse trees but only "
+              << unique_pool.size()
               << " unique trees in pool; capping K=" << unique_pool.size()
               << "\n";
     k = unique_pool.size();
@@ -1478,15 +1477,14 @@ int main(int argc, char** argv) {
       std::cerr << "error: --diverse-sample must be >= 1\n";
       return 1;
     }
-    std::size_t pool_n =
-        a.diverse_pool.value_or(std::max(std::size_t{10} * k, std::size_t{100}));
+    std::size_t pool_n = a.diverse_pool.value_or(
+        std::max(std::size_t{10} * k, std::size_t{100}));
     std::uint32_t div_seed = a.seed.value_or(std::random_device{}());
 
     auto& result_dag = m.get_result();
     std::cerr << "Extracting " << k << " diverse trees (pool=" << pool_n
               << ")...\n";
-    auto diverse_trees =
-        pool_diverse_sample(result_dag, k, pool_n, div_seed);
+    auto diverse_trees = pool_diverse_sample(result_dag, k, pool_n, div_seed);
 
     // Merge selected trees into output protobuf.
     merge m_out{ref};
