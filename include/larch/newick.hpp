@@ -1,5 +1,8 @@
 #pragma once
 
+#include <larch/compute.hpp>
+
+#include <cassert>
 #include <optional>
 #include <stack>
 #include <string>
@@ -70,6 +73,100 @@ void parse_newick(std::string_view source, N&& on_node, E&& on_edge) {
         break;
     }
   }
+}
+
+// Write a tree to Newick format.
+// Precondition: is_tree(tree).
+// Skips the UA node, starts from its single child.
+inline std::string to_newick(phylo_dag& tree) {
+  assert(is_tree(tree));
+
+  auto ua = tree.get_root_as<node_kind::ua>();
+  // Find the single child of the UA node (the real root).
+  std::size_t real_root_idx = 0;
+  for (auto edge_var : ua.get_children()) {
+    std::visit(
+        [&](auto edge) {
+          auto cv = edge.get_child();
+          std::visit([&](auto child) { real_root_idx = child.index(); }, cv);
+        },
+        edge_var);
+    break;
+  }
+
+  // Recursive DFS via explicit stack.
+  // Each entry: (node_idx, phase). phase=0 means "entering", phase=1 means
+  // "done with children".
+  std::string result;
+
+  struct frame {
+    std::size_t node_idx;
+    std::vector<std::size_t> children;  // child node indices
+    std::size_t next_child = 0;
+  };
+
+  std::vector<frame> stack;
+
+  auto make_frame = [&](std::size_t idx) -> frame {
+    frame f;
+    f.node_idx = idx;
+    auto nv = tree.get_node(idx);
+    std::visit(
+        [&](auto node) {
+          for (auto ev : node.get_children()) {
+            std::visit(
+                [&](auto edge) {
+                  auto cv = edge.get_child();
+                  std::visit(
+                      [&](auto child) { f.children.push_back(child.index()); },
+                      cv);
+                },
+                ev);
+          }
+        },
+        nv);
+    return f;
+  };
+
+  auto get_label = [&](std::size_t idx) -> std::string {
+    auto nv = tree.get_node(idx);
+    return std::visit(
+        [](auto node) -> std::string {
+          if constexpr (requires { node.sample_id(); }) {
+            if (!node.sample_id().empty()) return node.sample_id();
+            if constexpr (requires { node.cg(); }) {
+              return node.cg().to_string();
+            }
+          }
+          return {};
+        },
+        nv);
+  };
+
+  stack.push_back(make_frame(real_root_idx));
+
+  while (!stack.empty()) {
+    auto& top = stack.back();
+    if (top.children.empty() || top.next_child == top.children.size()) {
+      // Leaf or done with all children: emit label, close paren if internal.
+      if (!top.children.empty()) result += ')';
+      result += get_label(top.node_idx);
+      stack.pop_back();
+      // If there's a parent frame, add comma before next sibling.
+      if (!stack.empty()) {
+        auto& parent = stack.back();
+        if (parent.next_child < parent.children.size()) result += ',';
+      }
+    } else {
+      // First time or still have children to process.
+      if (top.next_child == 0) result += '(';
+      auto child_idx = top.children[top.next_child++];
+      stack.push_back(make_frame(child_idx));
+    }
+  }
+
+  result += ';';
+  return result;
 }
 
 }  // namespace larch
