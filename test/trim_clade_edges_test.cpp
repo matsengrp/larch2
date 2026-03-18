@@ -228,6 +228,50 @@ static void test_fluC_PB2_7taxa() {
   std::println("  PASS");
 }
 
+static void test_fluC_PB2_10taxa() {
+  std::println("test_fluC_PB2_10taxa (10-taxa reproducer DAG)");
+
+  auto d = load_proto_dag("data/madag/fluC_PB2_10taxa.pb");
+
+  auto num_leaves = leaf_count(d);
+  std::println("  DAG: {} nodes, {} edges, {} leaves", node_count(d),
+               edge_count(d), num_leaves);
+  assert(num_leaves == 10);
+
+  // Before trim: some min-weight samples should be incomplete.
+  {
+    bool found_incomplete = false;
+    for (std::uint32_t seed = 0; seed < 50; ++seed) {
+      parsimony_score_ops pops;
+      subtree_weight<parsimony_score_ops> sw(d, seed);
+      auto tree = sw.min_weight_sample_tree(pops);
+      if (leaf_count(tree) < num_leaves) {
+        found_incomplete = true;
+        break;
+      }
+    }
+    assert(found_incomplete);
+    std::println("  confirmed: untrimmed DAG produces incomplete trees");
+  }
+
+  // Trim and verify.
+  auto removed = trim_inconsistent_clade_edges(d);
+  std::println("  trimmed {} edges", removed);
+  assert(removed > 0);
+
+  // After trim: all min-weight samples should be complete.
+  for (std::uint32_t seed = 0; seed < 100; ++seed) {
+    parsimony_score_ops pops;
+    subtree_weight<parsimony_score_ops> sw(d, seed);
+    auto tree = sw.min_weight_sample_tree(pops);
+    assert(leaf_count(tree) == num_leaves);
+  }
+  std::println("  100 min-weight samples after trim: all have {} leaves",
+               num_leaves);
+
+  std::println("  PASS");
+}
+
 int main() {
   test_compute_subtree_leaves();
   test_trim_removes_bad_edge();
@@ -235,6 +279,7 @@ int main() {
   test_trim_then_validate();
   test_trim_then_sample();
   test_fluC_PB2_7taxa();
+  test_fluC_PB2_10taxa();
 
   std::println("All trim_clade_edges tests passed!");
   return 0;
