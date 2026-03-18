@@ -455,6 +455,10 @@ inline std::size_t trim_inconsistent_clade_edges(phylo_dag& d) {
         // Only remove if at least one good alternative remains.
         if (good_count > 0) {
           for (auto eidx : bad) edges_to_remove.push_back(eidx);
+        } else if (!bad.empty()) {
+          std::cerr << "warning: node " << idx
+                    << " has a clade where all " << bad.size()
+                    << " alternatives are missing leaves (cannot trim)\n";
         }
       }
     }
