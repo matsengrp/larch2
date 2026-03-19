@@ -139,6 +139,31 @@ class subtree_weight {
     });
   }
 
+  // Sample a tree and return the set of DAG edge indices chosen.
+  // Requires compute_weight_below to have been called first.
+  std::vector<std::size_t> sample_tree_edges(Ops const& ops) {
+    auto root_idx = get_root_idx();
+    compute_weight_below(root_idx, ops);
+    std::vector<std::size_t> chosen_edges;
+    std::vector<std::size_t> stack;
+    stack.push_back(root_idx);
+    while (!stack.empty()) {
+      auto nidx = stack.back();
+      stack.pop_back();
+      if (is_leaf(dag_, nidx)) continue;
+      auto clades = get_clades(dag_, nidx, mr_);
+      for (auto const& edges : clades) {
+        if (edges.empty()) continue;
+        std::uniform_int_distribution<std::size_t> dist(0, edges.size() - 1);
+        auto chosen = dist(rng_);
+        auto edge_idx = edges[chosen];
+        chosen_edges.push_back(edge_idx);
+        stack.push_back(get_child_idx(edge_idx));
+      }
+    }
+    return chosen_edges;
+  }
+
   // Sample a tree proportional to subtree tree-counts
   phylo_dag uniform_sample_tree(Ops const& ops) {
     auto root_idx = get_root_idx();
