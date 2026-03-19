@@ -156,6 +156,7 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
         nv);
   }
 
+  fitch_assign_compact_genomes(d);
   recompute_edge_mutations(d);
   return d;
 }
@@ -463,11 +464,13 @@ int main(int argc, char** argv) try {
         sw.compute_weight_below(root_idx, pops);
         if (a.sample) {
           std::cerr << "Sampling a tree from min-parsimony options...\n";
+          auto tree = sw.min_weight_sample_tree(pops);
+          save_proto_dag(tree, a.output);
         } else {
-          std::cerr << "Trimming to min parsimony...\n";
+          std::cerr << "Trimming DAG to min parsimony...\n";
+          auto trimmed = sw.trim_to_min_weight(pops);
+          save_proto_dag(trimmed, a.output);
         }
-        auto tree = sw.min_weight_sample_tree(pops);
-        save_proto_dag(tree, a.output);
       } else {
         // Trim to minimize RF distance to provided DAG
         auto rf_dag = load_proto_dag(a.rf);
@@ -480,11 +483,13 @@ int main(int argc, char** argv) try {
         sw.compute_weight_below(root_idx, srf);
         if (a.sample) {
           std::cerr << "Sampling a tree from min-RF options...\n";
+          auto tree = sw.min_weight_sample_tree(srf);
+          save_proto_dag(tree, a.output);
         } else {
-          std::cerr << "Trimming to min RF distance...\n";
+          std::cerr << "Trimming DAG to min RF distance...\n";
+          auto trimmed = sw.trim_to_min_weight(srf);
+          save_proto_dag(trimmed, a.output);
         }
-        auto tree = sw.min_weight_sample_tree(srf);
-        save_proto_dag(tree, a.output);
       }
     } else if (a.sample) {
       std::cerr << "Sampling a tree from the DAG...\n";

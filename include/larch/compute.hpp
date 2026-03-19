@@ -3,9 +3,12 @@
 #include <larch/pmr_arena.hpp>
 #include <larch/phylo_dag.hpp>
 
+#include <array>
 #include <cassert>
+#include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <memory_resource>
 #include <queue>
@@ -709,6 +712,197 @@ inline void validate_dag(phylo_dag& d, std::string_view label) {
 
   std::cerr << "validate_dag [" << label << "]: OK (" << node_count(d)
             << " nodes, " << edge_count(d) << " edges)\n";
+}
+
+// ============================================================================
+// Fitch parsimony helpers
+// ============================================================================
+
+inline uint8_t base_to_one_hot(nuc_base b) {
+  return static_cast<uint8_t>(1 << b.raw());
+}
+
+inline uint8_t fitch_set_from_counts(std::array<uint8_t, 4> const& counts,
+                                     uint8_t num_children) {
+  if (num_children == 0) return 0;
+  uint8_t intersection = 0;
+  for (int i = 0; i < 4; i++) {
+    if (counts[i] == num_children) intersection |= static_cast<uint8_t>(1 << i);
+  }
+  if (intersection) return intersection;
+  uint8_t union_set = 0;
+  for (int i = 0; i < 4; i++) {
+    if (counts[i] > 0) union_set |= static_cast<uint8_t>(1 << i);
+  }
+  return union_set;
+}
+
+// Bottom-up + top-down Fitch pass to assign optimal inner node CGs.
+// Precondition: d is a tree (single path from root to each node).
+// Leaf CGs must already be set. After this call, inner node CGs reflect
+// the Fitch-optimal ancestral reconstruction, and recompute_edge_mutations
+// should be called to update edge annotations.
+//
+// If root_parent_cg is provided, the tree root's top-down assignment
+// prefers the parent CG's state (instead of the reference).  This is
+// used for fragments where the root has a real parent in a larger tree.
+inline void fitch_assign_compact_genomes(
+    phylo_dag& d,
+    compact_genome const* root_parent_cg = nullptr) {
+  auto const& ref = get_reference_sequence(d);
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  if (ua_clades.empty() || ua_clades[0].empty()) return;
+  auto tree_root = get_child_idx(d, ua_clades[0][0]);
+
+  // Collect variable sites
+  scoped_arena<4096> fitch_arena;
+  auto* fitch_mr = fitch_arena.get();
+  std::pmr::set<std::size_t> var_sites_set(fitch_mr);
+  for (auto ev : d.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          for (auto& [pos, mut] : edge.mutations()) var_sites_set.insert(pos);
+        },
+        ev);
+  }
+  // Also include sites from leaf CGs
+  for (auto nv : d.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.cg(); }) {
+            for (auto& [pos, base] : node.cg()) var_sites_set.insert(pos);
+          }
+        },
+        nv);
+  }
+  // Include sites from the parent CG (fragment case): the parent may have
+  // mutations at sites that are invariant within the fragment.
+  if (root_parent_cg) {
+    for (auto& [pos, base] : *root_parent_cg) var_sites_set.insert(pos);
+  }
+  std::pmr::vector<std::size_t> var_sites(var_sites_set.begin(),
+                                          var_sites_set.end(), fitch_mr);
+
+  // Build topology for traversal
+  std::size_t num_nodes = d.node_high_mark();
+  std::vector<std::vector<std::size_t>> children(num_nodes);
+  std::vector<std::size_t> parent(num_nodes, 0);
+
+  for (auto nv : d.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          auto nid = node.index();
+          if (is_ua(d, nid)) return;
+          auto cls = get_clades(d, nid);
+          for (auto& clade : cls)
+            for (auto eidx : clade)
+              children[nid].push_back(get_child_idx(d, eidx));
+          auto pes = get_parent_edges(d, nid);
+          if (!pes.empty()) parent[nid] = get_parent_idx(d, pes[0]);
+        },
+        nv);
+  }
+
+  // Pass 1: bottom-up Fitch sets
+  std::size_t n_sites = var_sites.size();
+  std::vector<uint8_t> fitch(num_nodes * n_sites, 0);
+
+  std::function<void(std::size_t)> bottom_up = [&](std::size_t nid) {
+    if (is_leaf(d, nid)) {
+      auto nv = d.get_node(nid);
+      std::visit(
+          [&](auto node) {
+            if constexpr (requires { node.cg(); }) {
+              for (std::size_t i = 0; i < n_sites; i++)
+                fitch[nid * n_sites + i] =
+                    base_to_one_hot(node.cg().get_base(var_sites[i], ref));
+            }
+          },
+          nv);
+    } else {
+      for (auto child : children[nid]) bottom_up(child);
+
+      auto nc = static_cast<uint8_t>(children[nid].size());
+      for (std::size_t i = 0; i < n_sites; i++) {
+        std::array<uint8_t, 4> counts = {0, 0, 0, 0};
+        for (auto child : children[nid]) {
+          uint8_t cf = fitch[child * n_sites + i];
+          for (int j = 0; j < 4; j++) {
+            if (cf & (1 << j)) counts[j]++;
+          }
+        }
+        fitch[nid * n_sites + i] = fitch_set_from_counts(counts, nc);
+      }
+    }
+  };
+  bottom_up(tree_root);
+
+  // Pass 2: top-down assignment
+  // For inner nodes, pick base from Fitch set (prefer parent's base)
+  std::vector<nuc_base> assigned(num_nodes * n_sites);
+
+  // Assign tree root: pick base from Fitch set, preferring the parent's
+  // state.  When root_parent_cg is provided (fragment case), use the parent
+  // CG's base; otherwise fall back to the reference base.
+  for (std::size_t i = 0; i < n_sites; i++) {
+    uint8_t fs = fitch[tree_root * n_sites + i];
+    nuc_base prefer_base = root_parent_cg
+        ? root_parent_cg->get_base(var_sites[i], ref)
+        : nuc_base::from_char(ref.at(var_sites[i] - 1));
+    if (fs & base_to_one_hot(prefer_base)) {
+      assigned[tree_root * n_sites + i] = prefer_base;
+    } else {
+      for (int j = 0; j < 4; j++) {
+        if (fs & (1 << j)) {
+          assigned[tree_root * n_sites + i] = nuc_base{static_cast<uint8_t>(j)};
+          break;
+        }
+      }
+    }
+  }
+
+  std::function<void(std::size_t)> top_down = [&](std::size_t nid) {
+    for (auto child : children[nid]) {
+      if (is_leaf(d, child)) continue;
+      for (std::size_t i = 0; i < n_sites; i++) {
+        uint8_t fs = fitch[child * n_sites + i];
+        nuc_base parent_base = assigned[nid * n_sites + i];
+        if (fs & base_to_one_hot(parent_base)) {
+          assigned[child * n_sites + i] = parent_base;
+        } else {
+          for (int j = 0; j < 4; j++) {
+            if (fs & (1 << j)) {
+              assigned[child * n_sites + i] = nuc_base{static_cast<uint8_t>(j)};
+              break;
+            }
+          }
+        }
+      }
+      top_down(child);
+    }
+  };
+  top_down(tree_root);
+
+  // Update inner node CGs
+  for (auto nv : d.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (std::is_same_v<
+                            std::remove_cvref_t<decltype(node)>,
+                            node_view<phylo_dag, node_kind::inner>>) {
+            auto nid = node.index();
+            std::map<mutation_position, nuc_base> muts;
+            for (std::size_t i = 0; i < n_sites; i++) {
+              nuc_base b = assigned[nid * n_sites + i];
+              nuc_base ref_base = nuc_base::from_char(ref.at(var_sites[i] - 1));
+              if (!(b == ref_base)) muts[var_sites[i]] = b;
+            }
+            node.cg() = compact_genome{std::move(muts)};
+          }
+        },
+        nv);
+  }
 }
 
 }  // namespace larch

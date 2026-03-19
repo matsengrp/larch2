@@ -157,6 +157,15 @@ class subtree_weight {
     });
   }
 
+  // Trim DAG to contain only min-weight edges at each clade.
+  // Unlike min_weight_sample_tree (which extracts ONE tree), this keeps
+  // ALL equally-optimal edges, producing a pruned DAG.
+  phylo_dag trim_to_min_weight(Ops const& ops) {
+    auto root_idx = get_root_idx();
+    compute_weight_below(root_idx, ops);
+    return extract_dag_min_weight();
+  }
+
   // Sample a tree selecting only among min-weight edges at each clade
   phylo_dag min_weight_sample_tree(Ops const& ops) {
     auto root_idx = get_root_idx();
@@ -385,6 +394,77 @@ class subtree_weight {
     }
 
     return tree;
+  }
+
+  // Extract a pruned DAG containing ALL min-weight edges at each clade.
+  // Nodes reachable through multiple edges are shared (not duplicated).
+  phylo_dag extract_dag_min_weight() {
+    phylo_dag result;
+    auto root_idx = get_root_idx();
+    auto src_root = dag_.get_root();
+    auto src_kind = get_node_kind(src_root);
+    auto dst_root_v = result.append_node(src_kind);
+    copy_node_annotations(src_root, dst_root_v);
+    std::visit([&](auto n) { result.set_root(n); }, dst_root_v);
+    auto dst_root_idx =
+        std::visit([](auto n) { return n.index(); }, dst_root_v);
+
+    // Map src node index -> dst node index (for dedup)
+    std::unordered_map<std::size_t, std::size_t> node_map;
+    node_map[root_idx] = dst_root_idx;
+
+    // BFS: process each node's min-weight edges
+    std::queue<std::size_t> queue;
+    queue.push(root_idx);
+
+    while (!queue.empty()) {
+      auto src_nidx = queue.front();
+      queue.pop();
+
+      if (is_leaf(dag_, src_nidx)) continue;
+
+      auto dst_nidx = node_map.at(src_nidx);
+      auto const& clade_edges = cached_min_weight_edges_[src_nidx];
+
+      for (auto const& edges : clade_edges) {
+        for (auto edge_idx : edges) {
+          auto child_idx = get_child_idx(edge_idx);
+
+          // Add child node if not yet mapped
+          if (!node_map.contains(child_idx)) {
+            auto src_child = dag_.get_node(child_idx);
+            auto child_kind = get_node_kind(src_child);
+            auto dst_child_v = result.append_node(child_kind);
+            copy_node_annotations(src_child, dst_child_v);
+            auto dst_child_idx =
+                std::visit([](auto n) { return n.index(); }, dst_child_v);
+            node_map[child_idx] = dst_child_idx;
+            queue.push(child_idx);
+          }
+
+          auto dst_child_idx = node_map[child_idx];
+
+          // Add the edge
+          auto dst_edge = result.template append_edge<edge_kind::clade>();
+          auto dst_parent_nv = result.get_node(dst_nidx);
+          std::visit([&](auto parent) { dst_edge.set_parent(parent); },
+                     dst_parent_nv);
+          auto dst_child_nv = result.get_node(dst_child_idx);
+          std::visit([&](auto child) { dst_edge.set_child(child); },
+                     dst_child_nv);
+
+          auto src_edge = dag_.get_edge(edge_idx);
+          std::visit(
+              [&](auto se) {
+                dst_edge.mutations() = se.mutations();
+                dst_edge.clade_index() = se.clade_index();
+              },
+              src_edge);
+        }
+      }
+    }
+
+    return result;
   }
 };
 

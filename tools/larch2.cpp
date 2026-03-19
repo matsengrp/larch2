@@ -322,6 +322,7 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
         nv);
   }
 
+  fitch_assign_compact_genomes(d);
   recompute_edge_mutations(d);
   return d;
 }
@@ -789,7 +790,8 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
     subtree_weight<parsimony_score_ops> sw(dag, seed_i, arena.get());
     sw.compute_weight_below(root_idx, pops);
     auto tree = sw.min_weight_sample_tree(pops);
-    recompute_compact_genomes(tree);
+    fitch_assign_compact_genomes(tree);
+    recompute_edge_mutations(tree);
     set_sample_ids_from_cg(tree);
     pool.push_back(std::move(tree));
   }
@@ -831,6 +833,64 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
 
   std::cerr << "  Pool: " << pool_size << " sampled, " << unique_pool.size()
             << " unique after deduplication\n";
+
+  // 2b. Re-rank by Fitch parsimony: each tree was Fitch-assigned above, so
+  //     its edge mutations reflect true Fitch parsimony.  The DAG's stored
+  //     edge mutations (used by min_weight_sample_tree) can diverge from
+  //     per-tree Fitch parsimony when the DAG has shared nodes with compact
+  //     genomes that are suboptimal for some topologies.  Sort the pool by
+  //     actual Fitch score and keep the best trees.
+  if (!unique_pool.empty()) {
+    auto compute_fitch_parsimony = [](phylo_dag& tree) -> std::size_t {
+      std::size_t score = 0;
+      for (auto ev : tree.get_all_edges()) {
+        std::visit(
+            [&](auto edge) { score += edge.mutations().size(); }, ev);
+      }
+      return score;
+    };
+
+    std::vector<std::size_t> fitch_scores;
+    fitch_scores.reserve(unique_pool.size());
+    for (auto& t : unique_pool)
+      fitch_scores.push_back(compute_fitch_parsimony(t));
+
+    // Sort pool indices by Fitch score (ascending = best first).
+    std::vector<std::size_t> order(unique_pool.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::sort(order.begin(), order.end(),
+              [&](auto a, auto b) { return fitch_scores[a] < fitch_scores[b]; });
+
+    std::size_t min_fitch = fitch_scores[order[0]];
+    std::size_t max_fitch = fitch_scores[order.back()];
+
+    // Keep at least max(2*k, 20) trees, but include all trees tied at the
+    // cutoff score to avoid arbitrary exclusion.
+    std::size_t keep_target = std::max(2 * k, std::size_t{20});
+    keep_target = std::min(keep_target, unique_pool.size());
+
+    // Find the Fitch cutoff: the score of the keep_target-th tree.
+    std::size_t cutoff_fitch = fitch_scores[order[keep_target - 1]];
+
+    // Include all trees at or below the cutoff.
+    std::vector<phylo_dag> filtered_pool;
+    std::vector<std::vector<clade_bitset>> filtered_clades;
+    for (auto idx : order) {
+      if (fitch_scores[idx] <= cutoff_fitch) {
+        filtered_pool.push_back(std::move(unique_pool[idx]));
+        filtered_clades.push_back(std::move(unique_clades[idx]));
+      }
+    }
+
+    if (min_fitch < max_fitch) {
+      std::cerr << "  Fitch re-rank: keeping " << filtered_pool.size() << "/"
+                << unique_pool.size() << " trees (Fitch " << min_fitch << "-"
+                << cutoff_fitch << ", pool max " << max_fitch << ")\n";
+    }
+
+    unique_pool = std::move(filtered_pool);
+    unique_clades = std::move(filtered_clades);
+  }
 
   // 3. Cap K at deduplicated pool size.
   if (k > unique_pool.size()) {
@@ -1009,7 +1069,8 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
     auto sampled = sample_tree_from_dag(
         dag, m, a.sample_method, a.sample_uniformly,
         a.ignore_root_edge_mutations, iter_seed, min_score);
-    recompute_compact_genomes(sampled);
+    fitch_assign_compact_genomes(sampled);
+    recompute_edge_mutations(sampled);
     set_sample_ids_from_cg(sampled);
     prog.done("score " + std::to_string(min_score));
 
@@ -1278,7 +1339,8 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         sampled = sample_tree_from_dag(
             new_dag, m, a.sample_method, a.sample_uniformly,
             a.ignore_root_edge_mutations, resample_seed, resample_score);
-        recompute_compact_genomes(sampled);
+        fitch_assign_compact_genomes(sampled);
+        recompute_edge_mutations(sampled);
         set_sample_ids_from_cg(sampled);
         prog.done("score " + std::to_string(resample_score));
 
@@ -1345,7 +1407,8 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
     auto sampled = sample_tree_from_dag(
         dag, m, a.sample_method, a.sample_uniformly,
         a.ignore_root_edge_mutations, iter_seed, min_score);
-    recompute_compact_genomes(sampled);
+    fitch_assign_compact_genomes(sampled);
+    recompute_edge_mutations(sampled);
     set_sample_ids_from_cg(sampled);
     prog.done("score " + std::to_string(min_score));
 
@@ -1533,28 +1596,21 @@ int main(int argc, char** argv) {
 
   // ---- Output ----
   if (a.trim) {
-    std::cerr << "Trimming to minimum-parsimony tree...\n";
+    std::cerr << "Trimming DAG to minimum-parsimony edges...\n";
     auto& result_dag = m.get_result();
     parsimony_score_ops pops;
     std::uint32_t trim_seed = a.seed.value_or(42);
     scoped_arena<4096> trim_arena;
     subtree_weight<parsimony_score_ops> sw(result_dag, trim_seed,
                                            trim_arena.get());
-    auto trimmed = sw.min_weight_sample_tree(pops);
-    recompute_compact_genomes(trimmed);
-    recompute_edge_mutations(trimmed);
-    set_sample_ids_from_cg(trimmed);
+    auto trimmed = sw.trim_to_min_weight(pops);
 
-    merge m2{ref};
-    m2.add_dag(trimmed);
-    auto& trimmed_result = m2.get_result();
-
-    std::cerr << "Trimmed: " << node_count(trimmed_result) << " nodes, "
-              << edge_count(trimmed_result) << " edges\n";
+    std::cerr << "Trimmed: " << node_count(trimmed) << " nodes, "
+              << edge_count(trimmed) << " edges\n";
     if (a.validate)
-      validate_dag(trimmed_result, "before output (trimmed)",
-                   thread_pool::get_default());
-    save_proto_dag(trimmed_result, a.output);
+      validate_dag(trimmed, "before output (trimmed)",
+                    thread_pool::get_default());
+    save_proto_dag(trimmed, a.output);
   } else {
     auto& result_dag = m.get_result();
     std::cerr << "Final: " << node_count(result_dag) << " nodes, "
