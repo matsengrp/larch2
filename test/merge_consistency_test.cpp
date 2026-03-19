@@ -9,6 +9,7 @@
 #include <larch/thread_pool.hpp>
 
 #include <cassert>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <print>
@@ -18,7 +19,7 @@
 
 using namespace larch;
 
-// Build a tree from FASTA+Newick (same logic as dagutil)
+// Build a tree from FASTA+Newick (same logic as dagutil's build_from_fasta_newick).
 static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
                                          std::string_view newick_path,
                                          std::string_view refseq_path) {
@@ -92,14 +93,8 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
     edge.clade_index() = ne.clade;
     auto pi = nw_to_dag[ne.parent];
     auto ci = nw_to_dag[ne.child];
-    for (auto nv : d.get_all_nodes()) {
-      std::visit(
-          [&](auto n) {
-            if (n.index() == pi) edge.set_parent(n);
-            if (n.index() == ci) edge.set_child(n);
-          },
-          nv);
-    }
+    std::visit([&](auto n) { edge.set_parent(n); }, d.get_node(pi));
+    std::visit([&](auto n) { edge.set_child(n); }, d.get_node(ci));
   }
 
   auto ua = d.append_node<node_kind::ua>();
@@ -107,14 +102,8 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
   d.set_root(ua);
   {
     auto edge = ua.append_child<edge_kind::clade>();
-    auto root_dag_idx = nw_to_dag[newick_root];
-    for (auto nv : d.get_all_nodes()) {
-      std::visit(
-          [&](auto n) {
-            if (n.index() == root_dag_idx) edge.set_child(n);
-          },
-          nv);
-    }
+    std::visit([&](auto n) { edge.set_child(n); },
+               d.get_node(nw_to_dag[newick_root]));
     edge.clade_index() = 0;
   }
 
@@ -146,8 +135,9 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
   return d;
 }
 
-// Check that edge mutations match CG Hamming distances for all edges.
-// Returns (total_mutations, inconsistent_count).
+// Verify that every edge's stored mutations exactly match the Hamming
+// distance between adjacent node CGs (full content comparison, not just
+// count).  Returns (total_mutations, inconsistent_count).
 static std::pair<std::size_t, std::size_t> check_consistency(
     phylo_dag& d, std::string_view label) {
   auto const& ref = get_reference_sequence(d);
@@ -177,7 +167,7 @@ static std::pair<std::size_t, std::size_t> check_consistency(
 
           auto expected =
               compact_genome::to_edge_mutations(ref, parent_cg, child_cg);
-          if (expected.size() != edge.mutations().size()) inconsistent++;
+          if (expected != edge.mutations()) inconsistent++;
           total_muts += edge.mutations().size();
         },
         ev);
@@ -188,22 +178,19 @@ static std::pair<std::size_t, std::size_t> check_consistency(
   return {total_muts, inconsistent};
 }
 
-int main() {
-  std::string repro =
-      "/home/matsen/re/pz/maple/experiments/"
-      "2026-03-18-madag-sampling-factorial/runs/dagmerge_debug_rota";
+static void test_merge_roundtrip(std::string const& repro) {
   std::string fasta = repro + "/input.fa";
   std::string refseq = repro + "/root.fa";
 
-  // Load and check input trees
   auto tree0 = build_from_fasta_newick(fasta, repro + "/tree0.nwk", refseq);
   auto tree1 = build_from_fasta_newick(fasta, repro + "/tree1.nwk", refseq);
+
   auto [t0_muts, t0_bad] = check_consistency(tree0, "tree0");
-  auto [t1_muts, t1_bad] = check_consistency(tree1, "tree1");
   assert(t0_bad == 0 && "tree0 edge mutations inconsistent with CGs");
+  auto [t1_muts, t1_bad] = check_consistency(tree1, "tree1");
   assert(t1_bad == 0 && "tree1 edge mutations inconsistent with CGs");
 
-  // Merge 2 trees
+  // Merge 2 trees and check consistency
   auto const& ref = get_reference_sequence(tree0);
   merge m{ref};
   m.add_dag(tree0);
@@ -217,12 +204,15 @@ int main() {
   auto [recomp_muts, recomp_bad] =
       check_consistency(result, "recomputed-fresh");
   assert(recomp_bad == 0 && "recompute_compact_genomes broke CG consistency");
-  assert(recomp_muts == fresh_muts &&
-         "recompute_compact_genomes changed total mutations");
+  assert(recomp_muts == fresh_muts);
 
   // Save/load roundtrip should preserve mutations and CG consistency
-  save_proto_dag(result, "/tmp/iris_merge_consistency_test.pb.gz");
-  auto loaded = load_proto_dag("/tmp/iris_merge_consistency_test.pb.gz");
+  auto tmp = std::filesystem::temp_directory_path() /
+             ("iris_merge_consistency_" + std::to_string(::getpid()) + ".pb");
+  save_proto_dag(result, tmp.string());
+  auto loaded = load_proto_dag(tmp.string());
+  std::filesystem::remove(tmp);
+
   auto [loaded_muts, loaded_bad] = check_consistency(loaded, "loaded");
   assert(loaded_bad == 0 && "save/load broke CG consistency");
   assert(loaded_muts == fresh_muts && "save/load changed total mutations");
@@ -235,6 +225,23 @@ int main() {
   auto [rem_muts, rem_bad] = check_consistency(result2, "re-merged");
   assert(rem_bad == 0 && "re-merge broke CG consistency");
   assert(rem_muts == fresh_muts && "re-merge changed total mutations");
+
+  std::println("  PASS");
+}
+
+int main() {
+  std::string repro =
+      "/home/matsen/re/pz/maple/experiments/"
+      "2026-03-18-madag-sampling-factorial/runs/dagmerge_debug_rota";
+
+  if (!std::filesystem::exists(repro + "/input.fa")) {
+    std::println("(skipping merge_consistency_test: repro data not found at {})",
+                 repro);
+    return 0;
+  }
+
+  std::println("test_merge_roundtrip");
+  test_merge_roundtrip(repro);
 
   std::println("All merge consistency checks passed!");
   return 0;

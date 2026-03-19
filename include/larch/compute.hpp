@@ -66,6 +66,8 @@ inline void recompute_compact_genomes(phylo_dag& d) {
     std::visit(
         [&](auto node) {
           // Find a parent whose CG has already been computed (processed).
+          // The cg_set flag is needed because break cannot cross the
+          // lambda boundary inside std::visit.
           bool cg_set = false;
           for (auto pe_var : node.get_parents()) {
             if (cg_set) break;
@@ -94,7 +96,10 @@ inline void recompute_compact_genomes(phylo_dag& d) {
                 },
                 pe_var);
           }
-          processed.insert(node_idx);
+          // Only mark as processed once CG is actually computed.
+          // BFS guarantees at least one parent is processed (the one
+          // that discovered this node), so cg_set should always be true.
+          if (cg_set) processed.insert(node_idx);
 
           // Enqueue children
           for (auto ce_var : node.get_children()) {
