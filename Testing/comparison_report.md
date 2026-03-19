@@ -4,6 +4,23 @@ Date: 2026-03-19
 Old larch commit: 6a7b9e0
 larch2 commit: da1edaf
 
+## Key Takeaways
+
+**No bugs found in larch2.** All 10 self-consistency checks pass, confirming that
+the correctness fixes from #8, #9, #13, #14, #16, #17, and #18 are holding.
+
+The only old-vs-new differences (A3 parsimony max, A4 trim tree count) are caused
+by old larch's non-deterministic Fitch CG assignment — the known bug fixed in
+larch2 via #17/#18. DAG structure (leaves, nodes, edges, tree count) and minimum
+parsimony match between old and new on every dataset where comparison is possible.
+
+**Performance note:** Old larch-usher could not complete even 1 optimization
+iteration on the seedtree dataset (597 leaves) within 15 minutes. larch2's
+optimizer completes 5 iterations on the same dataset in seconds. The partial old
+larch run reached parsimony 1611; larch2 reached 1626 after 5 full iterations
+(optimization is stochastic, so direct score comparison is not meaningful, but the
+speed difference is dramatic).
+
 ## Build Status
 - Old larch: PASS
 - larch2: PASS
