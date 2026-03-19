@@ -8,7 +8,9 @@
 
 namespace larch {
 
-inline void save_proto_dag(phylo_dag& dag, std::string_view path) {
+inline void save_proto_dag(phylo_dag& dag, std::string_view path,
+                           std::vector<float> const& edge_scores) {
+  assert(edge_scores.empty() || edge_scores.size() >= dag.edge_high_mark());
   dag_data data;
   data.reference_seq = get_reference_sequence(dag);
 
@@ -40,6 +42,10 @@ inline void save_proto_dag(phylo_dag& dag, std::string_view path) {
           de.child_node = node_to_proto[child_idx];
           de.parent_clade = static_cast<int64_t>(edge.clade_index());
 
+          auto eidx = edge.index();
+          if (eidx < edge_scores.size())
+            de.edge_weight = edge_scores[eidx];
+
           for (auto& [pos, nucs] : edge.mutations()) {
             dag_mut dm;
             dm.position = static_cast<int32_t>(pos);
@@ -69,6 +75,10 @@ inline void save_proto_dag(phylo_dag& dag, std::string_view path) {
   }
 
   pb::encode_file(path, data);
+}
+
+inline void save_proto_dag(phylo_dag& dag, std::string_view path) {
+  save_proto_dag(dag, path, {});
 }
 
 }  // namespace larch
