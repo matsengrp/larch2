@@ -295,9 +295,30 @@ inline phylo_dag apply_spr_as_fragment(phylo_dag& tree, spr_move const& move) {
 
   overlay_dag<phylo_dag> ov{tree};
   auto fragment_root = apply_spr_topology(ov, tree, move, mr);
+
+  // Get the fragment root's parent CG from the overlay.  The parent's CG
+  // is unchanged by the SPR (it's above the affected region), so we can
+  // read it from the base tree.  This lets fitch_assign_compact_genomes
+  // use the correct parent state instead of the reference.
+  compact_genome const* parent_cg = nullptr;
+  compact_genome parent_cg_storage;
+  auto frag_parents = overlay_detail::get_parent_edges_of(ov, fragment_root, mr);
+  if (!frag_parents.empty()) {
+    auto parent_idx = overlay_detail::get_parent_idx_of(ov, frag_parents[0]);
+    auto pv = ov.get_node(parent_idx);
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.cg(); }) {
+            parent_cg_storage = node.cg();
+            parent_cg = &parent_cg_storage;
+          }
+        },
+        pv);
+  }
+
   auto fragment = copy_subtree_from_overlay(ov, tree, fragment_root, mr);
 
-  fitch_assign_compact_genomes(fragment);
+  fitch_assign_compact_genomes(fragment, parent_cg);
   recompute_edge_mutations(fragment);
   set_sample_ids_from_cg(fragment);
 

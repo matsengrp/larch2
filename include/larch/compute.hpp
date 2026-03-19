@@ -742,7 +742,13 @@ inline uint8_t fitch_set_from_counts(std::array<uint8_t, 4> const& counts,
 // Leaf CGs must already be set. After this call, inner node CGs reflect
 // the Fitch-optimal ancestral reconstruction, and recompute_edge_mutations
 // should be called to update edge annotations.
-inline void fitch_assign_compact_genomes(phylo_dag& d) {
+//
+// If root_parent_cg is provided, the tree root's top-down assignment
+// prefers the parent CG's state (instead of the reference).  This is
+// used for fragments where the root has a real parent in a larger tree.
+inline void fitch_assign_compact_genomes(
+    phylo_dag& d,
+    compact_genome const* root_parent_cg = nullptr) {
   auto const& ref = get_reference_sequence(d);
   auto ua_idx = get_root_idx(d);
   auto ua_clades = get_clades(d, ua_idx);
@@ -831,12 +837,16 @@ inline void fitch_assign_compact_genomes(phylo_dag& d) {
   // For inner nodes, pick base from Fitch set (prefer parent's base)
   std::vector<nuc_base> assigned(num_nodes * n_sites);
 
-  // Assign tree root: pick any base from Fitch set (prefer reference)
+  // Assign tree root: pick base from Fitch set, preferring the parent's
+  // state.  When root_parent_cg is provided (fragment case), use the parent
+  // CG's base; otherwise fall back to the reference base.
   for (std::size_t i = 0; i < n_sites; i++) {
     uint8_t fs = fitch[tree_root * n_sites + i];
-    nuc_base ref_base = nuc_base::from_char(ref.at(var_sites[i] - 1));
-    if (fs & base_to_one_hot(ref_base)) {
-      assigned[tree_root * n_sites + i] = ref_base;
+    nuc_base prefer_base = root_parent_cg
+        ? root_parent_cg->get_base(var_sites[i], ref)
+        : nuc_base::from_char(ref.at(var_sites[i] - 1));
+    if (fs & base_to_one_hot(prefer_base)) {
+      assigned[tree_root * n_sites + i] = prefer_base;
     } else {
       for (int j = 0; j < 4; j++) {
         if (fs & (1 << j)) {
