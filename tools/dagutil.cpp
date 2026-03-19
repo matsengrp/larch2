@@ -156,6 +156,7 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
         nv);
   }
 
+  fitch_assign_compact_genomes(d);
   recompute_edge_mutations(d);
   return d;
 }
