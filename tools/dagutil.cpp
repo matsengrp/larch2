@@ -457,6 +457,9 @@ int main(int argc, char** argv) try {
 
   // ---- Edge parsimony ----
   std::vector<float> edge_penalties;
+  if (a.edge_parsimony && (a.trim || a.sample))
+    std::cerr << "warning: --edge-parsimony scores are not written when "
+                 "combined with --trim or --sample\n";
   if (a.edge_parsimony) {
     scoped_arena<4096> arena;
     auto* mr = arena.get();

@@ -177,6 +177,8 @@ class subtree_weight {
   // Requires compute_weight_below to have been called first.
   // Returns vector indexed by node index.
   std::vector<weight_type> compute_weight_above(Ops const& ops) {
+    assert(!cached_clade_weights_.empty() &&
+           "compute_weight_below must be called before compute_weight_above");
     auto constexpr max_w = std::numeric_limits<weight_type>::max() / 2;
     auto node_hm = dag_.node_high_mark();
     std::vector<weight_type> above(node_hm, max_w);
@@ -184,13 +186,13 @@ class subtree_weight {
     auto root_idx = get_root_idx();
     above[root_idx] = weight_type{0};
 
-    // Kahn's algorithm: compute in-degree for topological ordering
+    // Kahn's algorithm: single BFS pass to compute in-degrees and
+    // propagate above-weights in topological order.
     std::vector<std::size_t> in_degree(node_hm, 0);
-    // BFS from root to find reachable nodes and count in-degrees
-    std::vector<bool> reachable(node_hm, false);
+    std::vector<bool> seen(node_hm, false);
     std::queue<std::size_t> init_q;
     init_q.push(root_idx);
-    reachable[root_idx] = true;
+    seen[root_idx] = true;
     while (!init_q.empty()) {
       auto nidx = init_q.front();
       init_q.pop();
@@ -200,15 +202,15 @@ class subtree_weight {
         for (auto edge_idx : edges) {
           auto child_idx = get_child_idx(edge_idx);
           ++in_degree[child_idx];
-          if (!reachable[child_idx]) {
-            reachable[child_idx] = true;
+          if (!seen[child_idx]) {
+            seen[child_idx] = true;
             init_q.push(child_idx);
           }
         }
       }
     }
 
-    // Kahn's: start with nodes that have in-degree 0 (the root)
+    // Start with root (in-degree 0)
     std::queue<std::size_t> q;
     q.push(root_idx);
 
@@ -219,32 +221,19 @@ class subtree_weight {
       if (is_leaf(dag_, nidx)) continue;
 
       auto clades = get_clades(dag_, nidx, mr_);
+      auto total = total_clade_min_for(nidx);
 
-      // Compute total clade min sum for this node
-      weight_type total_clade_min = weight_type{0};
       for (std::size_t ci = 0; ci < clades.size(); ++ci) {
-        if (nidx < cached_clade_weights_.size() &&
-            ci < cached_clade_weights_[nidx].size()) {
-          total_clade_min += cached_clade_weights_[nidx][ci];
-        }
-      }
-
-      // Process each clade and edge
-      for (std::size_t ci = 0; ci < clades.size(); ++ci) {
-        weight_type clade_min_j = weight_type{0};
-        if (nidx < cached_clade_weights_.size() &&
-            ci < cached_clade_weights_[nidx].size()) {
-          clade_min_j = cached_clade_weights_[nidx][ci];
-        }
+        auto clade_min_j = clade_weight_for(nidx, ci);
 
         for (auto edge_idx : clades[ci]) {
           auto child_idx = get_child_idx(edge_idx);
           auto edge_w = ops.compute_edge(dag_, edge_idx);
+          assert(above[nidx] < max_w);
           auto above_via_e =
-              above[nidx] + (total_clade_min - clade_min_j) + edge_w;
+              above[nidx] + (total - clade_min_j) + edge_w;
           above[child_idx] = std::min(above[child_idx], above_via_e);
 
-          // Decrement in-degree; enqueue when all parents processed
           if (--in_degree[child_idx] == 0) {
             q.push(child_idx);
           }
@@ -256,11 +245,13 @@ class subtree_weight {
   }
 
   // Compute per-edge minimum global parsimony score.
+  // Requires compute_weight_below to have been called first.
   // Returns vector indexed by edge index: min parsimony score of any
   // tree containing that edge.
   std::vector<weight_type> compute_edge_min_global_scores(Ops const& ops) {
-    auto root_idx = get_root_idx();
-    compute_weight_below(root_idx, ops);
+    assert(!cached_clade_weights_.empty() &&
+           "compute_weight_below must be called before "
+           "compute_edge_min_global_scores");
     auto above = compute_weight_above(ops);
 
     auto edge_hm = dag_.edge_high_mark();
@@ -276,21 +267,8 @@ class subtree_weight {
                 [](auto c) { return c.index(); }, edge.get_child());
 
             auto edge_w = ops.compute_edge(dag_, eidx);
-
-            // Sum of all clade minimums at parent
-            weight_type total_clade_min = weight_type{0};
-            if (parent_idx < cached_clade_weights_.size()) {
-              for (auto const& cw : cached_clade_weights_[parent_idx])
-                total_clade_min += cw;
-            }
-
-            // This edge's clade minimum
-            auto clade_j = edge.clade_index();
-            weight_type clade_min_j = weight_type{0};
-            if (parent_idx < cached_clade_weights_.size() &&
-                clade_j < cached_clade_weights_[parent_idx].size()) {
-              clade_min_j = cached_clade_weights_[parent_idx][clade_j];
-            }
+            auto total = total_clade_min_for(parent_idx);
+            auto clade_min_j = clade_weight_for(parent_idx, edge.clade_index());
 
             weight_type child_below = weight_type{0};
             if (child_idx < cached_weights_.size() &&
@@ -299,7 +277,7 @@ class subtree_weight {
             }
 
             scores[eidx] = above[parent_idx] +
-                            (total_clade_min - clade_min_j) + edge_w +
+                            (total - clade_min_j) + edge_w +
                             child_below;
           },
           ev);
@@ -352,6 +330,21 @@ class subtree_weight {
   // Per-clade minimum weights: cached_clade_weights_[node][clade] = min weight
   std::vector<std::vector<weight_type>> cached_clade_weights_;
   std::vector<bool> in_progress_;  // cycle detection
+
+  weight_type total_clade_min_for(std::size_t node_idx) const {
+    weight_type total{0};
+    if (node_idx < cached_clade_weights_.size())
+      for (auto const& w : cached_clade_weights_[node_idx]) total += w;
+    return total;
+  }
+
+  weight_type clade_weight_for(std::size_t node_idx,
+                               std::size_t clade_idx) const {
+    if (node_idx < cached_clade_weights_.size() &&
+        clade_idx < cached_clade_weights_[node_idx].size())
+      return cached_clade_weights_[node_idx][clade_idx];
+    return weight_type{0};
+  }
   std::mt19937 rng_;
   std::pmr::memory_resource* mr_;
 

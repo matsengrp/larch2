@@ -10,6 +10,7 @@ namespace larch {
 
 inline void save_proto_dag(phylo_dag& dag, std::string_view path,
                            std::vector<float> const& edge_scores) {
+  assert(edge_scores.empty() || edge_scores.size() >= dag.edge_high_mark());
   dag_data data;
   data.reference_seq = get_reference_sequence(dag);
 
