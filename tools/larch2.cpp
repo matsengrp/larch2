@@ -834,6 +834,64 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
   std::cerr << "  Pool: " << pool_size << " sampled, " << unique_pool.size()
             << " unique after deduplication\n";
 
+  // 2b. Re-rank by Fitch parsimony: each tree was Fitch-assigned above, so
+  //     its edge mutations reflect true Fitch parsimony.  The DAG's stored
+  //     edge mutations (used by min_weight_sample_tree) can diverge from
+  //     per-tree Fitch parsimony when the DAG has shared nodes with compact
+  //     genomes that are suboptimal for some topologies.  Sort the pool by
+  //     actual Fitch score and keep the best trees.
+  {
+    auto compute_fitch_parsimony = [](phylo_dag& tree) -> std::size_t {
+      std::size_t score = 0;
+      for (auto ev : tree.get_all_edges()) {
+        std::visit(
+            [&](auto edge) { score += edge.mutations().size(); }, ev);
+      }
+      return score;
+    };
+
+    std::vector<std::size_t> fitch_scores;
+    fitch_scores.reserve(unique_pool.size());
+    for (auto& t : unique_pool)
+      fitch_scores.push_back(compute_fitch_parsimony(t));
+
+    // Sort pool indices by Fitch score (ascending = best first).
+    std::vector<std::size_t> order(unique_pool.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::sort(order.begin(), order.end(),
+              [&](auto a, auto b) { return fitch_scores[a] < fitch_scores[b]; });
+
+    std::size_t min_fitch = fitch_scores[order[0]];
+    std::size_t max_fitch = fitch_scores[order.back()];
+
+    // Keep at least max(2*k, 20) trees, but include all trees tied at the
+    // cutoff score to avoid arbitrary exclusion.
+    std::size_t keep_target = std::max(2 * k, std::size_t{20});
+    keep_target = std::min(keep_target, unique_pool.size());
+
+    // Find the Fitch cutoff: the score of the keep_target-th tree.
+    std::size_t cutoff_fitch = fitch_scores[order[keep_target - 1]];
+
+    // Include all trees at or below the cutoff.
+    std::vector<phylo_dag> filtered_pool;
+    std::vector<std::vector<clade_bitset>> filtered_clades;
+    for (auto idx : order) {
+      if (fitch_scores[idx] <= cutoff_fitch) {
+        filtered_pool.push_back(std::move(unique_pool[idx]));
+        filtered_clades.push_back(std::move(unique_clades[idx]));
+      }
+    }
+
+    if (min_fitch < max_fitch) {
+      std::cerr << "  Fitch re-rank: keeping " << filtered_pool.size() << "/"
+                << unique_pool.size() << " trees (Fitch " << min_fitch << "-"
+                << cutoff_fitch << ", pool max " << max_fitch << ")\n";
+    }
+
+    unique_pool = std::move(filtered_pool);
+    unique_clades = std::move(filtered_clades);
+  }
+
   // 3. Cap K at deduplicated pool size.
   if (k > unique_pool.size()) {
     std::cerr << "  Warning: requested " << k << " diverse trees but only "
