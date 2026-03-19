@@ -32,12 +32,20 @@ inline void recompute_compact_genomes(phylo_dag& d) {
   auto const& ref = get_reference_sequence(d);
   auto ua = d.get_root_as<node_kind::ua>();
 
-  // BFS from UA's children (with visited set to handle DAGs)
+  // BFS from UA's children.
+  // For DAGs, a node may have parents at different BFS depths.  We must
+  // use a parent whose CG has already been computed.  The "processed"
+  // set tracks nodes whose CGs are finalized (distinct from "visited"
+  // which merely means enqueued).  UA is pre-marked as processed since
+  // its CG is the reference (empty compact genome) by definition.
   scoped_arena<4096> arena;
   auto* mr = arena.get();
   std::queue<std::size_t, std::pmr::deque<std::size_t>> q{
       std::pmr::deque<std::size_t>(mr)};
   std::pmr::unordered_set<std::size_t> visited(mr);
+  std::pmr::unordered_set<std::size_t> processed(mr);
+  visited.insert(ua.index());
+  processed.insert(ua.index());
   for (auto edge_var : ua.get_children()) {
     std::visit(
         [&](auto edge) {
@@ -57,10 +65,19 @@ inline void recompute_compact_genomes(phylo_dag& d) {
     auto nv = d.get_node(node_idx);
     std::visit(
         [&](auto node) {
-          // Get parent edge mutations and parent CG
+          // Find a parent whose CG has already been computed (processed).
+          // The cg_set flag is needed because break cannot cross the
+          // lambda boundary inside std::visit.
+          bool cg_set = false;
           for (auto pe_var : node.get_parents()) {
+            if (cg_set) break;
             std::visit(
                 [&](auto pe) {
+                  auto parent_idx = std::visit(
+                      [](auto parent) { return parent.index(); },
+                      pe.get_parent());
+                  if (!processed.contains(parent_idx)) return;
+
                   auto& edge_muts = pe.mutations();
                   compact_genome parent_cg;
                   std::visit(
@@ -75,10 +92,14 @@ inline void recompute_compact_genomes(phylo_dag& d) {
                     node.cg() = compact_genome{};
                     node.cg().add_parent_edge(edge_muts, parent_cg, ref);
                   }
+                  cg_set = true;
                 },
                 pe_var);
-            break;  // Only use first parent (tree case)
           }
+          // Only mark as processed once CG is actually computed.
+          // BFS guarantees at least one parent is processed (the one
+          // that discovered this node), so cg_set should always be true.
+          if (cg_set) processed.insert(node_idx);
 
           // Enqueue children
           for (auto ce_var : node.get_children()) {
