@@ -269,7 +269,7 @@ static void test_edge_parsimony_consistency() {
 static void test_edge_parsimony_single_tree() {
   std::println("test_edge_parsimony_single_tree");
 
-  // Single tree: every edge should have penalty == 0
+  // Single tree: every edge's min global score equals the tree's parsimony
   test_fixture f({"data/test_5_trees/tree_0.pb.gz"});
 
   auto& dag = f.merger.get_result();
@@ -331,8 +331,8 @@ static void test_edge_parsimony_ua_root_edge() {
   std::println("  PASS");
 }
 
-static void test_edge_parsimony_exhaustive() {
-  std::println("test_edge_parsimony_exhaustive");
+static void test_edge_parsimony_rerooting_identity() {
+  std::println("test_edge_parsimony_rerooting_identity");
 
   test_fixture f(
       {"data/test_5_trees/tree_0.pb.gz", "data/test_5_trees/tree_1.pb.gz",
@@ -344,50 +344,58 @@ static void test_edge_parsimony_exhaustive() {
   larch::subtree_weight<larch::parsimony_score_ops> sw(dag, 42u);
 
   auto root_idx = std::visit([](auto n) { return n.index(); }, dag.get_root());
-  sw.compute_weight_below(root_idx, pops);
+  auto global_min = sw.compute_weight_below(root_idx, pops);
+  auto above = sw.compute_weight_above(pops);
   auto scores = sw.compute_edge_min_global_scores(pops);
 
-  // Sample many trees and track min parsimony per edge
-  auto edge_hm = dag.edge_high_mark();
-  std::vector<std::size_t> min_seen(edge_hm,
-                                     std::numeric_limits<std::size_t>::max());
+  // For every leaf node: above[leaf] + below[leaf] == global_min.
+  // Every tree contains every leaf, so the min global score of any tree
+  // containing a leaf is just the global minimum. Since below[leaf] = 0,
+  // above[leaf] must equal global_min.
+  std::size_t leaf_count = 0;
+  for (auto nv : dag.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.sample_id(); }) {
+            auto idx = node.index();
+            auto below = sw.compute_weight_below(idx, pops);
+            assert(below == 0);
+            assert(above[idx] == global_min);
+            ++leaf_count;
+          }
+        },
+        nv);
+  }
+  std::println("  verified above[leaf] == global_min for {} leaves",
+               leaf_count);
+  assert(leaf_count > 0);
 
-  // Collect edge indices that exist
-  std::set<std::size_t> all_edge_indices;
+  // For every edge: min_global_score(e) == above[parent] + (total_clade -
+  // clade_j) + edge_w + below[child]. Verify this decomposition by checking
+  // that for edges in the min-weight tree, scores[e] == global_min.
+  std::size_t optimal_edges = 0;
+  std::size_t total_edges = 0;
   for (auto ev : dag.get_all_edges()) {
-    std::visit([&](auto e) { all_edge_indices.insert(e.index()); }, ev);
+    std::visit(
+        [&](auto edge) {
+          ++total_edges;
+          assert(scores[edge.index()] >= global_min);
+          if (scores[edge.index()] == global_min) ++optimal_edges;
+        },
+        ev);
+  }
+  std::println("  {}/{} edges are optimal (penalty=0)", optimal_edges,
+               total_edges);
+  assert(optimal_edges > 0);
+
+  // For every node: above[node] + below[node] >= global_min
+  for (auto nv : dag.get_all_nodes()) {
+    auto idx = std::visit([](auto n) { return n.index(); }, nv);
+    auto below = sw.compute_weight_below(idx, pops);
+    assert(above[idx] + below >= global_min);
   }
 
-  int const num_samples = 200;
-  larch::subtree_weight<larch::parsimony_score_ops> sampler(dag, 123u);
-  for (int i = 0; i < num_samples; ++i) {
-    auto tree = sampler.sample_tree(pops);
-
-    // Compute this tree's parsimony score
-    std::size_t tree_score = 0;
-    for (auto ev : tree.get_all_edges()) {
-      std::visit([&](auto edge) { tree_score += edge.mutations().size(); }, ev);
-    }
-
-    // For each edge in the original DAG that appears in this tree,
-    // update min_seen. We match by parent sample_id + child sample_id +
-    // clade_index + mutations to identify edges.
-    // Actually, easier: sample from the DAG directly and track which
-    // edges were chosen. But sample_tree extracts a new DAG...
-    // Instead, we just verify the global invariant: the computed score
-    // for any edge must be <= min parsimony of any tree containing it.
-    // Since sample_tree doesn't tell us which DAG edges were used,
-    // we verify a weaker property: all computed scores are >= global min.
-    (void)tree_score;
-  }
-
-  // Verify all scores >= global min (already tested above, but do it here too)
-  auto global_min = sw.compute_weight_below(root_idx, pops);
-  for (auto eidx : all_edge_indices) {
-    assert(scores[eidx] >= global_min);
-  }
-
-  std::println("  PASS (sampled {} trees, all invariants hold)", num_samples);
+  std::println("  PASS");
 }
 
 static void test_weight_above() {
@@ -403,7 +411,7 @@ static void test_weight_above() {
   larch::subtree_weight<larch::parsimony_score_ops> sw(dag, 42u);
 
   auto root_idx = std::visit([](auto n) { return n.index(); }, dag.get_root());
-  sw.compute_weight_below(root_idx, pops);
+  auto global_min = sw.compute_weight_below(root_idx, pops);
   auto above = sw.compute_weight_above(pops);
 
   // Root should have weight_above = 0
@@ -411,15 +419,31 @@ static void test_weight_above() {
 
   // All reachable nodes should have finite weight_above
   auto constexpr max_w = std::numeric_limits<std::size_t>::max() / 2;
-  std::size_t reachable_count = 0;
   for (auto nv : dag.get_all_nodes()) {
     auto idx = std::visit([](auto n) { return n.index(); }, nv);
     assert(above[idx] < max_w);
-    ++reachable_count;
   }
-  std::println("  root above: {}, reachable nodes: {}", above[root_idx],
-               reachable_count);
 
+  // Re-rooting identity: for every leaf, above[leaf] == global_min
+  // (since below[leaf] = 0 and every tree contains every leaf)
+  for (auto nv : dag.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.sample_id(); }) {
+            assert(above[node.index()] == global_min);
+          }
+        },
+        nv);
+  }
+
+  // For all nodes: above[node] + below[node] >= global_min
+  for (auto nv : dag.get_all_nodes()) {
+    auto idx = std::visit([](auto n) { return n.index(); }, nv);
+    auto below = sw.compute_weight_below(idx, pops);
+    assert(above[idx] + below >= global_min);
+  }
+
+  std::println("  root above: {}, global_min: {}", above[root_idx], global_min);
   std::println("  PASS");
 }
 
@@ -434,7 +458,7 @@ int main() {
   test_edge_parsimony_consistency();
   test_edge_parsimony_single_tree();
   test_edge_parsimony_ua_root_edge();
-  test_edge_parsimony_exhaustive();
+  test_edge_parsimony_rerooting_identity();
 
   std::println("All subtree_weight tests passed!");
   return 0;
