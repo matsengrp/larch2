@@ -1534,28 +1534,21 @@ int main(int argc, char** argv) {
 
   // ---- Output ----
   if (a.trim) {
-    std::cerr << "Trimming to minimum-parsimony tree...\n";
+    std::cerr << "Trimming DAG to minimum-parsimony edges...\n";
     auto& result_dag = m.get_result();
     parsimony_score_ops pops;
     std::uint32_t trim_seed = a.seed.value_or(42);
     scoped_arena<4096> trim_arena;
     subtree_weight<parsimony_score_ops> sw(result_dag, trim_seed,
                                            trim_arena.get());
-    auto trimmed = sw.min_weight_sample_tree(pops);
-    recompute_compact_genomes(trimmed);
-    recompute_edge_mutations(trimmed);
-    set_sample_ids_from_cg(trimmed);
+    auto trimmed = sw.trim_to_min_weight(pops);
 
-    merge m2{ref};
-    m2.add_dag(trimmed);
-    auto& trimmed_result = m2.get_result();
-
-    std::cerr << "Trimmed: " << node_count(trimmed_result) << " nodes, "
-              << edge_count(trimmed_result) << " edges\n";
+    std::cerr << "Trimmed: " << node_count(trimmed) << " nodes, "
+              << edge_count(trimmed) << " edges\n";
     if (a.validate)
-      validate_dag(trimmed_result, "before output (trimmed)",
-                   thread_pool::get_default());
-    save_proto_dag(trimmed_result, a.output);
+      validate_dag(trimmed, "before output (trimmed)",
+                    thread_pool::get_default());
+    save_proto_dag(trimmed, a.output);
   } else {
     auto& result_dag = m.get_result();
     std::cerr << "Final: " << node_count(result_dag) << " nodes, "
