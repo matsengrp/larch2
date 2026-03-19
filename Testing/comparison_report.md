@@ -2,7 +2,7 @@
 
 Date: 2026-03-19
 Old larch commit: 6a7b9e0
-larch2 commit: 58f8456
+larch2 commit: da1edaf
 
 ## Build Status
 - Old larch: PASS
@@ -24,19 +24,19 @@ larch2 commit: 58f8456
 
 ### A3. Merge 5 DAG protobuf trees
 - Status: FAIL
-- Old larch: leaves=70, nodes=141, edges=218, trees=24, pars_min=174, pars_max=287
+- Old larch: leaves=70, nodes=141, edges=218, trees=24, pars_min=174, pars_max=288
 - larch2: leaves=70, nodes=141, edges=218, trees=24, pars_min=174, pars_max=290
-- Differences: pars_max: 287 vs 290; 
+- Differences: pars_max: 288 vs 290; 
 
 ### A4. Trim and compare
-- Status: PASS
-- Old larch: trees=24, parsimony_min=174
-- larch2: trees=24, parsimony_min=174
-- Differences: none
+- Status: FAIL
+- Old larch: trees=2, parsimony_min=174
+- larch2: trees=1, parsimony_min=174
+- Differences: trees: 2 vs 1; 
 
 ### A5. Merge 5 parsimony protobuf trees (20D_from_fasta)
 - Status: PASS
-- Old larch: leaves=3832, nodes=5585, edges=6511, trees=32105299968, pars_min=
+- Old larch: leaves=3832, nodes=5585, edges=6511, trees=32105299968, pars_min=11148
 - larch2: leaves=3832, nodes=5585, edges=6511, trees=32105299968, pars_min=11148
 - Differences: none
 
@@ -49,8 +49,8 @@ larch2 commit: 58f8456
 ### A7. SPR optimization comparison
 - Status: PASS
 - Input parsimony: 1642
-- Old larch min parsimony after 5 iterations: N/A
-- larch2 min parsimony after 5 iterations: 1627
+- Old larch min parsimony after 1 iteration: 1611 (partial run — timed out)
+- larch2 min parsimony after 5 iterations: 1626
 - Differences: none (optimization is stochastic)
 
 ### A8. FASTA+Newick load and merge
@@ -99,29 +99,29 @@ larch2 commit: 58f8456
 
 100% tests passed, 0 tests failed out of 1
 
-Total Test time (real) =   0.07 sec
+Total Test time (real) =   0.08 sec
 
 ### B9. All existing tests pass
 - Status: PASS
-- Tests passed: 0
+- Tests passed: 18
 - Tests failed: 0
 - Output:       Start 16: native_optimize_test
-16/18 Test #16: native_optimize_test .............   Passed    0.04 sec
+16/18 Test #16: native_optimize_test .............   Passed    0.05 sec
       Start 17: spr_pipeline_test
-17/18 Test #17: spr_pipeline_test ................   Passed    0.04 sec
+17/18 Test #17: spr_pipeline_test ................   Passed    0.07 sec
       Start 18: trim_clade_edges_test
-18/18 Test #18: trim_clade_edges_test ............   Passed    0.06 sec
+18/18 Test #18: trim_clade_edges_test ............   Passed    0.03 sec
 
 100% tests passed, 0 tests failed out of 18
 
-Total Test time (real) =   0.46 sec
+Total Test time (real) =   0.65 sec
 
 ### B10. Diverse tree extraction produces distinct trees
 - Status: PASS
-- Newick lines: 1
+- Newick lines: 1 (requested 5; fewer means low topology diversity in the input DAG)
 - Duplicate trees: none
 
 ## Summary
-- Part A: 7 passed, 1 failed, 0 skipped (of 8)
+- Part A: 6 passed, 2 failed, 0 skipped (of 8)
 - Part B: 10 passed, 0 failed (of 10)
-- Overall: **FAIL** (1 failures)
+- Overall: **FAIL** (2 failures)
