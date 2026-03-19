@@ -317,8 +317,10 @@ check_a5() {
         return
     fi
 
-    # Merge and save first, then query stats separately to avoid timeout killing partial output
-    "$OLD_DAGUTIL" \
+    # Run merge+stats in a single command (old larch can't reload its own 20D protobuf output)
+    # Use 600s timeout since parsimony on 32B trees takes ~2 min
+    local old_out new_out
+    old_out=$(timeout 600 "$OLD_DAGUTIL" \
       -i "$D20_DIR/1final-tree-100.nh1.pb.gz" \
       -i "$D20_DIR/1final-tree-101.nh1.pb.gz" \
       -i "$D20_DIR/1final-tree-102.nh1.pb.gz" \
@@ -326,9 +328,9 @@ check_a5() {
       -i "$D20_DIR/1final-tree-104.nh1.pb.gz" \
       -r "$REFSEQ" \
       --force-no-vcf \
-      -o "${TMP}_merged_20D.pb" >/dev/null 2>&1 || true
+      -o "${TMP}_merged_20D.pb" --dag-info --parsimony 2>&1) || true
 
-    "$NEW_DAGUTIL" \
+    new_out=$(timeout "$CMD_TIMEOUT" "$NEW_DAGUTIL" \
       --tree-pb "$D20_DIR/1final-tree-100.nh1.pb.gz" \
       --tree-pb "$D20_DIR/1final-tree-101.nh1.pb.gz" \
       --tree-pb "$D20_DIR/1final-tree-102.nh1.pb.gz" \
@@ -336,18 +338,7 @@ check_a5() {
       --tree-pb "$D20_DIR/1final-tree-104.nh1.pb.gz" \
       --refseq "$REFSEQ" \
       --force-no-vcf \
-      -o "${TMP}_merged2_20D.pb.gz" >/dev/null 2>&1 || true
-
-    # Query stats from saved files
-    local old_out="" new_out=""
-    if [ -f "${TMP}_merged_20D.pb" ]; then
-        old_out=$(timeout "$CMD_TIMEOUT" "$OLD_DAGUTIL" \
-          -i "${TMP}_merged_20D.pb" -r "$REFSEQ" --force-no-vcf --dag-info --parsimony 2>&1) || true
-    fi
-    if [ -f "${TMP}_merged2_20D.pb.gz" ]; then
-        new_out=$(timeout "$CMD_TIMEOUT" "$NEW_DAGUTIL" \
-          --dag-pb "${TMP}_merged2_20D.pb.gz" --force-no-vcf --dag-info --parsimony 2>&1) || true
-    fi
+      -o "${TMP}_merged2_20D.pb.gz" --dag-info --parsimony 2>&1) || true
 
     local old_leaves old_nodes old_edges old_trees old_min
     old_leaves=$(echo "$old_out" | grep -i 'leave' | grep -oP '\d+' | head -1)
@@ -433,12 +424,16 @@ check_a7() {
     fi
 
     # Old larch: optimize seedtree
+    # Decompress refseq for old larch (mpirun doesn't support process substitution)
+    zcat "$REFSEQ" > "${TMP}_refseq.txt"
+
+    # Old larch optimization is very slow (~10 min per iteration); use 1 iteration with 900s timeout
     local old_opt_out="" old_check_out="" old_opt_ok=true
-    if ! old_opt_out=$(timeout "$CMD_TIMEOUT" "$OLD_MPIRUN" -n 1 "$OLD_USHER" \
+    if ! old_opt_out=$(timeout 900 "$OLD_MPIRUN" --oversubscribe -n 1 "$OLD_USHER" \
       -i "$SEEDTREE" \
-      -r <(zcat "$REFSEQ") \
+      -r "${TMP}_refseq.txt" \
       -o "${TMP}_opt_seed.pb" \
-      -c 5 2>&1); then
+      -c 1 2>&1); then
         old_opt_ok=false
     fi
 
@@ -446,6 +441,14 @@ check_a7() {
     if $old_opt_ok && [ -f "${TMP}_opt_seed.pb" ]; then
         old_check_out=$("$OLD_DAGUTIL" -i "${TMP}_opt_seed.pb" --force-no-vcf --dag-info --parsimony 2>&1)
         old_min=$(echo "$old_check_out" | grep -i 'parsimony_min' | grep -oP '\d+' | head -1)
+    fi
+    # If usher didn't produce output file (timeout), extract best score from its log output
+    if [ "$old_min" = "N/A" ] && [ -n "$old_opt_out" ]; then
+        local last_score
+        last_score=$(echo "$old_opt_out" | grep -oP 'parsimony score after optimizing: \K\d+' | tail -1)
+        if [ -n "$last_score" ]; then
+            old_min="${last_score} (from partial run — old larch timed out)"
+        fi
     fi
 
     # New larch2: optimize seedtree
@@ -486,7 +489,7 @@ check_a7() {
     add_report "$section
 - Status: $status
 - Input parsimony: 1642
-- Old larch min parsimony after 5 iterations: $old_min
+- Old larch min parsimony after 1 iteration: $old_min
 - larch2 min parsimony after 5 iterations: $new_min
 - Differences: $diffs"
 }
