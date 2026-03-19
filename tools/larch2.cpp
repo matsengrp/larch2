@@ -790,7 +790,8 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
     subtree_weight<parsimony_score_ops> sw(dag, seed_i, arena.get());
     sw.compute_weight_below(root_idx, pops);
     auto tree = sw.min_weight_sample_tree(pops);
-    recompute_compact_genomes(tree);
+    fitch_assign_compact_genomes(tree);
+    recompute_edge_mutations(tree);
     set_sample_ids_from_cg(tree);
     pool.push_back(std::move(tree));
   }
@@ -1010,7 +1011,8 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
     auto sampled = sample_tree_from_dag(
         dag, m, a.sample_method, a.sample_uniformly,
         a.ignore_root_edge_mutations, iter_seed, min_score);
-    recompute_compact_genomes(sampled);
+    fitch_assign_compact_genomes(sampled);
+    recompute_edge_mutations(sampled);
     set_sample_ids_from_cg(sampled);
     prog.done("score " + std::to_string(min_score));
 
@@ -1279,7 +1281,8 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         sampled = sample_tree_from_dag(
             new_dag, m, a.sample_method, a.sample_uniformly,
             a.ignore_root_edge_mutations, resample_seed, resample_score);
-        recompute_compact_genomes(sampled);
+        fitch_assign_compact_genomes(sampled);
+        recompute_edge_mutations(sampled);
         set_sample_ids_from_cg(sampled);
         prog.done("score " + std::to_string(resample_score));
 
@@ -1346,7 +1349,8 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
     auto sampled = sample_tree_from_dag(
         dag, m, a.sample_method, a.sample_uniformly,
         a.ignore_root_edge_mutations, iter_seed, min_score);
-    recompute_compact_genomes(sampled);
+    fitch_assign_compact_genomes(sampled);
+    recompute_edge_mutations(sampled);
     set_sample_ids_from_cg(sampled);
     prog.done("score " + std::to_string(min_score));
 
