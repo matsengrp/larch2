@@ -211,6 +211,7 @@ Analysis:
   --dag-info              Print all DAG statistics (tree count, parsimony, RF)
   --parsimony             Print parsimony score distribution
   --sum-rf-distance       Print sum RF distance distribution
+  --edge-parsimony        Compute per-edge parsimony penalties (store in output)
 
 Debugging:
   --validate              Validate DAG invariants
@@ -237,6 +238,7 @@ struct args {
   bool dag_info = false;
   bool print_parsimony = false;
   bool print_rf_distance = false;
+  bool edge_parsimony = false;
   bool validate = false;
 };
 
@@ -285,7 +287,9 @@ static args parse_args(int argc, char** argv) {
     } else if (arg == "--sum-rf-distance") {
       a.dag_info = true;
       a.print_rf_distance = true;
-    } else if (arg == "--validate")
+    } else if (arg == "--edge-parsimony")
+      a.edge_parsimony = true;
+    else if (arg == "--validate")
       a.validate = true;
     else if (arg == "--version") {
       std::cerr << "dagutil " << larch::version << " (" << larch::git_commit
@@ -451,12 +455,47 @@ int main(int argc, char** argv) try {
     }
   }
 
+  // ---- Edge parsimony ----
+  std::vector<float> edge_penalties;
+  if (a.edge_parsimony) {
+    scoped_arena<4096> arena;
+    auto* mr = arena.get();
+    parsimony_score_ops pops;
+    subtree_weight<parsimony_score_ops> sw(result, a.seed, mr);
+    auto scores = sw.compute_edge_min_global_scores(pops);
+
+    // Find global minimum
+    auto global_min = sw.compute_weight_below(root_idx, pops);
+
+    // Convert to penalties (float)
+    edge_penalties.resize(scores.size());
+    std::size_t zero_penalty = 0;
+    std::size_t nonzero_penalty = 0;
+    std::size_t max_penalty = 0;
+    for (std::size_t i = 0; i < scores.size(); ++i) {
+      auto penalty = scores[i] - global_min;
+      edge_penalties[i] = static_cast<float>(penalty);
+      if (penalty == 0)
+        ++zero_penalty;
+      else
+        ++nonzero_penalty;
+      if (penalty > max_penalty) max_penalty = penalty;
+    }
+
+    std::cerr << "edge_parsimony: global_min=" << global_min
+              << " edges=" << scores.size() << " zero_penalty=" << zero_penalty
+              << " nonzero_penalty=" << nonzero_penalty
+              << " max_penalty=" << max_penalty << "\n";
+  }
+
   // ---- Output ----
   if (!a.output.empty()) {
     scoped_arena<4096> arena;
     auto* mr = arena.get();
 
-    if (a.trim) {
+    if (a.edge_parsimony && !a.trim && !a.sample) {
+      save_proto_dag(result, a.output, edge_penalties);
+    } else if (a.trim) {
       if (a.rf.empty()) {
         // Trim to best parsimony
         parsimony_score_ops pops;
