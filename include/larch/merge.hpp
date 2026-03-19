@@ -559,6 +559,19 @@ class merge {
         std::visit([&](auto n) { edge.set_child(n); },
                    result_dag_.get_node(dag_idx));
         edge.clade_index() = 0;
+
+        // Compute edge mutations from reference (UA CG = empty) to child CG
+        compact_genome child_cg;
+        if (!label.sample_id.empty()) {
+          auto cg_it = sample_id_to_cg_idx_.find(label.sample_id);
+          if (cg_it != sample_id_to_cg_idx_.end()) {
+            child_cg = all_cgs_[cg_it->second];
+          }
+        } else if (label.cg_idx != no_idx) {
+          child_cg = all_cgs_[label.cg_idx];
+        }
+        edge.mutations() = compact_genome::to_edge_mutations(
+            reference_sequence_, compact_genome{}, child_cg);
       }
     }
 
