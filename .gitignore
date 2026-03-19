@@ -1,2 +1,6 @@
 build*/
 *.core
+.epic-config.json
+.epic-status.json
+.epic-worklog.md
+ISSUE-*.md
