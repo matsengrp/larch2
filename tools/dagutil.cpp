@@ -462,10 +462,8 @@ int main(int argc, char** argv) try {
     auto* mr = arena.get();
     parsimony_score_ops pops;
     subtree_weight<parsimony_score_ops> sw(result, a.seed, mr);
-    auto scores = sw.compute_edge_min_global_scores(pops);
-
-    // Find global minimum
     auto global_min = sw.compute_weight_below(root_idx, pops);
+    auto scores = sw.compute_edge_min_global_scores(pops);
 
     // Convert to penalties (float)
     edge_penalties.resize(scores.size());
@@ -473,6 +471,7 @@ int main(int argc, char** argv) try {
     std::size_t nonzero_penalty = 0;
     std::size_t max_penalty = 0;
     for (std::size_t i = 0; i < scores.size(); ++i) {
+      assert(scores[i] >= global_min);
       auto penalty = scores[i] - global_min;
       edge_penalties[i] = static_cast<float>(penalty);
       if (penalty == 0)
