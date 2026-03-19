@@ -840,7 +840,7 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
   //     per-tree Fitch parsimony when the DAG has shared nodes with compact
   //     genomes that are suboptimal for some topologies.  Sort the pool by
   //     actual Fitch score and keep the best trees.
-  {
+  if (!unique_pool.empty()) {
     auto compute_fitch_parsimony = [](phylo_dag& tree) -> std::size_t {
       std::size_t score = 0;
       for (auto ev : tree.get_all_edges()) {

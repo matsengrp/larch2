@@ -56,7 +56,8 @@ std::vector<optimize_result> optimize_dag_v2(merge& m,
     auto min_score = sw.compute_weight_below(root_idx, pops);
 
     auto sampled = sw.min_weight_sample_tree(pops);
-    recompute_compact_genomes(sampled);
+    fitch_assign_compact_genomes(sampled);
+    recompute_edge_mutations(sampled);
     set_sample_ids_from_cg(sampled);
 
     // 3. Collect moves from each producer

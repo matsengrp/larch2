@@ -776,6 +776,11 @@ inline void fitch_assign_compact_genomes(
         },
         nv);
   }
+  // Include sites from the parent CG (fragment case): the parent may have
+  // mutations at sites that are invariant within the fragment.
+  if (root_parent_cg) {
+    for (auto& [pos, base] : *root_parent_cg) var_sites_set.insert(pos);
+  }
   std::pmr::vector<std::size_t> var_sites(var_sites_set.begin(),
                                           var_sites_set.end(), fitch_mr);
 
