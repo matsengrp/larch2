@@ -443,12 +443,16 @@ check_a7() {
         old_min=$(echo "$old_check_out" | grep -i 'parsimony_min' | grep -oP '\d+' | head -1)
     fi
     # If usher didn't produce output file (timeout), extract best score from its log output
+    local old_min_numeric=""
     if [ "$old_min" = "N/A" ] && [ -n "$old_opt_out" ]; then
         local last_score
         last_score=$(echo "$old_opt_out" | grep -oP 'parsimony score after optimizing: \K\d+' | tail -1)
         if [ -n "$last_score" ]; then
-            old_min="${last_score} (from partial run — old larch timed out)"
+            old_min_numeric="$last_score"
+            old_min="${last_score} (partial run — timed out)"
         fi
+    else
+        old_min_numeric="$old_min"
     fi
 
     # New larch2: optimize seedtree
@@ -470,11 +474,11 @@ check_a7() {
         diffs+="larch2 min ($new_min) > input parsimony (1642); "
         status="FAIL"
     fi
-    # Check if larch2 is >5% worse than old larch
-    if [ "$old_min" != "N/A" ] && [ -n "$old_min" ] && [ -n "$new_min" ]; then
-        local threshold=$((old_min * 105 / 100))
+    # Check if larch2 is >5% worse than old larch (use numeric value for comparison)
+    if [ -n "$old_min_numeric" ] && [ -n "$new_min" ]; then
+        local threshold=$((old_min_numeric * 105 / 100))
         if [ "$new_min" -gt "$threshold" ] 2>/dev/null; then
-            diffs+="larch2 ($new_min) >5% worse than old larch ($old_min); "
+            diffs+="larch2 ($new_min) >5% worse than old larch ($old_min_numeric); "
             status="FAIL"
         fi
     fi
