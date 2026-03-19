@@ -76,29 +76,6 @@ write_report() {
     echo "Report written to $REPORT"
 }
 
-# Extract a numeric value from output by key (handles both old/new formats)
-extract_val() {
-    local output="$1" key="$2"
-    echo "$output" | grep -i "$key" | head -1 | grep -oP '\d+' | tail -1
-}
-
-# Extract parsimony lines
-extract_parsimony_lines() {
-    echo "$1" | grep -E '(parsimony_|score_)' || true
-}
-
-run_check() {
-    local name="$1"
-    local func="$2"
-    echo "=== Running $name ==="
-    local output
-    if output=$($func 2>&1); then
-        echo "  $name: PASS"
-    else
-        echo "  $name: FAIL"
-        echo "$output" | tail -5
-    fi
-}
 
 ##############################################################################
 # BUILD STATUS
@@ -375,6 +352,9 @@ check_a5() {
     if [ "$old_nodes" != "$new_nodes" ]; then diffs+="nodes: $old_nodes vs $new_nodes; "; status="FAIL"; fi
     if [ "$old_edges" != "$new_edges" ]; then diffs+="edges: $old_edges vs $new_edges; "; status="FAIL"; fi
     if [ "$old_trees" != "$new_trees" ]; then diffs+="trees: $old_trees vs $new_trees; "; status="FAIL"; fi
+    if [ -n "$old_min" ] && [ -n "$new_min" ] && [ "$old_min" != "$new_min" ]; then
+        diffs+="pars_min: $old_min vs $new_min; "; status="FAIL"
+    fi
 
     if [ "$status" = "PASS" ]; then
         PART_A_PASS=$((PART_A_PASS + 1))
@@ -571,7 +551,7 @@ check_a8() {
 
     add_report "$section
 - Status: $status
-- Old larch (bcr-larch): leaves=$old_leaves, parsimony_min=$old_min$(if ! $old_ok; then echo " (bcr-larch failed: $(echo "$old_err" | tail -1))"; fi)
+- Old larch (bcr-larch): leaves=$old_leaves, parsimony_min=$old_min
 - larch2: leaves=$new_leaves, parsimony_min=$new_min
 - Differences: $diffs"
 }
@@ -592,20 +572,25 @@ check_b1() {
       --fasta "$FLUC_DIR/input.fa" --newick "$FLUC_DIR/tree4.nwk" \
       --refseq "$FLUC_DIR/root.fa" \
       --force-no-vcf \
-      -o "${TMP}_b1_fluC_merged.pb.gz" 2>&1 >/dev/null
+      -o "${TMP}_b1_fluC_merged.pb.gz" >/dev/null 2>&1
 
     # Trim and save
     "$NEW_DAGUTIL" --dag-pb "${TMP}_b1_fluC_merged.pb.gz" --force-no-vcf \
-      -t -o "${TMP}_b1_fluC_trimmed.pb.gz" 2>&1 >/dev/null
+      -t -o "${TMP}_b1_fluC_trimmed.pb.gz" >/dev/null 2>&1
 
     # Read parsimony from the saved trimmed file (not from trim command which shows pre-trim stats)
     local fluC_out
     fluC_out=$("$NEW_DAGUTIL" --dag-pb "${TMP}_b1_fluC_trimmed.pb.gz" --force-no-vcf --parsimony 2>&1)
 
-    local fluC_min fluC_max fluC_status="PASS"
-    fluC_min=$(echo "$fluC_out" | grep -i 'parsimony_min' | grep -oP '\d+' | head -1)
-    fluC_max=$(echo "$fluC_out" | grep -i 'parsimony_max' | grep -oP '\d+' | head -1)
-    if [ "$fluC_min" != "$fluC_max" ]; then fluC_status="FAIL"; fi
+    local fluC_min="" fluC_max="" fluC_status="PASS"
+    if [ ! -f "${TMP}_b1_fluC_trimmed.pb.gz" ]; then
+        fluC_status="FAIL"; fluC_min="ERROR"; fluC_max="ERROR"
+    else
+        fluC_min=$(echo "$fluC_out" | grep -i 'parsimony_min' | grep -oP '\d+' | head -1)
+        fluC_max=$(echo "$fluC_out" | grep -i 'parsimony_max' | grep -oP '\d+' | head -1)
+        if [ -z "$fluC_min" ] || [ -z "$fluC_max" ]; then fluC_status="FAIL"; fi
+        if [ "$fluC_min" != "$fluC_max" ]; then fluC_status="FAIL"; fi
+    fi
 
     # rotavirusA
     "$NEW_DAGUTIL" \
@@ -616,20 +601,25 @@ check_b1() {
       --fasta "$ROTA_DIR/input.fa" --newick "$ROTA_DIR/tree4.nwk" \
       --refseq "$ROTA_DIR/root.fa" \
       --force-no-vcf \
-      -o "${TMP}_b1_rota_merged.pb.gz" 2>&1 >/dev/null
+      -o "${TMP}_b1_rota_merged.pb.gz" >/dev/null 2>&1
 
     # Trim and save
     "$NEW_DAGUTIL" --dag-pb "${TMP}_b1_rota_merged.pb.gz" --force-no-vcf \
-      -t -o "${TMP}_b1_rota_trimmed.pb.gz" 2>&1 >/dev/null
+      -t -o "${TMP}_b1_rota_trimmed.pb.gz" >/dev/null 2>&1
 
     # Read parsimony from the saved trimmed file
     local rota_out
     rota_out=$("$NEW_DAGUTIL" --dag-pb "${TMP}_b1_rota_trimmed.pb.gz" --force-no-vcf --parsimony 2>&1)
 
-    local rota_min rota_max rota_status="PASS"
-    rota_min=$(echo "$rota_out" | grep -i 'parsimony_min' | grep -oP '\d+' | head -1)
-    rota_max=$(echo "$rota_out" | grep -i 'parsimony_max' | grep -oP '\d+' | head -1)
-    if [ "$rota_min" != "$rota_max" ]; then rota_status="FAIL"; fi
+    local rota_min="" rota_max="" rota_status="PASS"
+    if [ ! -f "${TMP}_b1_rota_trimmed.pb.gz" ]; then
+        rota_status="FAIL"; rota_min="ERROR"; rota_max="ERROR"
+    else
+        rota_min=$(echo "$rota_out" | grep -i 'parsimony_min' | grep -oP '\d+' | head -1)
+        rota_max=$(echo "$rota_out" | grep -i 'parsimony_max' | grep -oP '\d+' | head -1)
+        if [ -z "$rota_min" ] || [ -z "$rota_max" ]; then rota_status="FAIL"; fi
+        if [ "$rota_min" != "$rota_max" ]; then rota_status="FAIL"; fi
+    fi
 
     if [ "$fluC_status" = "PASS" ] && [ "$rota_status" = "PASS" ]; then
         PART_B_PASS=$((PART_B_PASS + 1))
@@ -716,7 +706,7 @@ check_b4() {
     "$NEW_LARCH2" \
       --fasta "$FLUC_DIR/input.fa" --newick "$FLUC_DIR/tree0.nwk" \
       --refseq "$FLUC_DIR/root.fa" \
-      -o "${TMP}_b4_baseline.pb.gz" -n 0 2>&1 >/dev/null
+      -o "${TMP}_b4_baseline.pb.gz" -n 0 >/dev/null 2>&1
 
     local base_out base_min
     base_out=$("$NEW_DAGUTIL" --dag-pb "${TMP}_b4_baseline.pb.gz" --force-no-vcf --parsimony 2>&1)
@@ -725,7 +715,7 @@ check_b4() {
     "$NEW_LARCH2" \
       --fasta "$FLUC_DIR/input.fa" --newick "$FLUC_DIR/tree0.nwk" \
       --refseq "$FLUC_DIR/root.fa" \
-      -o "${TMP}_b4_optimized.pb.gz" -n 10 2>&1 >/dev/null
+      -o "${TMP}_b4_optimized.pb.gz" -n 10 >/dev/null 2>&1
 
     local opt_out opt_min
     opt_out=$("$NEW_DAGUTIL" --dag-pb "${TMP}_b4_optimized.pb.gz" --force-no-vcf --parsimony 2>&1)
@@ -738,7 +728,7 @@ check_b4() {
     "$NEW_LARCH2" \
       --fasta "$ROTA_DIR/input.fa" --newick "$ROTA_DIR/tree0.nwk" \
       --refseq "$ROTA_DIR/root.fa" \
-      -o "${TMP}_b4_rota_baseline.pb.gz" -n 0 2>&1 >/dev/null
+      -o "${TMP}_b4_rota_baseline.pb.gz" -n 0 >/dev/null 2>&1
 
     local rbase_out rbase_min
     rbase_out=$("$NEW_DAGUTIL" --dag-pb "${TMP}_b4_rota_baseline.pb.gz" --force-no-vcf --parsimony 2>&1)
@@ -747,7 +737,7 @@ check_b4() {
     "$NEW_LARCH2" \
       --fasta "$ROTA_DIR/input.fa" --newick "$ROTA_DIR/tree0.nwk" \
       --refseq "$ROTA_DIR/root.fa" \
-      -o "${TMP}_b4_rota_optimized.pb.gz" -n 10 2>&1 >/dev/null
+      -o "${TMP}_b4_rota_optimized.pb.gz" -n 10 >/dev/null 2>&1
 
     local ropt_out ropt_min
     ropt_out=$("$NEW_DAGUTIL" --dag-pb "${TMP}_b4_rota_optimized.pb.gz" --force-no-vcf --parsimony 2>&1)
@@ -799,7 +789,7 @@ check_b6() {
 
     # Trim and save
     "$NEW_DAGUTIL" --dag-pb "$TESTCASE_DAG" --force-no-vcf \
-      -t -o "${TMP}_b6_trimmed.pb.gz" 2>&1 >/dev/null
+      -t -o "${TMP}_b6_trimmed.pb.gz" >/dev/null 2>&1
 
     # Read stats from the saved trimmed file (not from trim command output which shows pre-trim stats)
     local trimmed_out
@@ -830,10 +820,10 @@ check_b7() {
     local section="### B7. Protobuf roundtrip (save -> load -> save)"
 
     "$NEW_DAGUTIL" --dag-pb "$TESTCASE_DAG" --force-no-vcf \
-      -o "${TMP}_b7_pass1.pb.gz" 2>&1 >/dev/null
+      -o "${TMP}_b7_pass1.pb.gz" >/dev/null 2>&1
 
     "$NEW_DAGUTIL" --dag-pb "${TMP}_b7_pass1.pb.gz" --force-no-vcf \
-      -o "${TMP}_b7_pass2.pb.gz" 2>&1 >/dev/null
+      -o "${TMP}_b7_pass2.pb.gz" >/dev/null 2>&1
 
     "$NEW_DAGUTIL" --dag-pb "${TMP}_b7_pass1.pb.gz" --force-no-vcf --parsimony \
       2>&1 | grep 'parsimony' > "${TMP}_b7_pars1.txt"
@@ -915,19 +905,24 @@ check_b10() {
       --dag-pb "$TEST5_DIR/tree_3.pb.gz" \
       --dag-pb "$TEST5_DIR/tree_4.pb.gz" \
       --force-no-vcf \
-      -o "${TMP}_b10_merged.pb.gz" 2>&1 >/dev/null
+      -o "${TMP}_b10_merged.pb.gz" >/dev/null 2>&1
 
     "$NEW_LARCH2" \
       --dag-pb "${TMP}_b10_merged.pb.gz" \
       -o "${TMP}_b10_diverse.pb.gz" \
-      --diverse-sample 5 --diverse-newick "${TMP}_b10_diverse.nwk" -n 0 2>&1 >/dev/null
+      --diverse-sample 5 --diverse-newick "${TMP}_b10_diverse.nwk" -n 0 >/dev/null 2>&1
 
-    local duplicates status="PASS"
-    duplicates=$(sort "${TMP}_b10_diverse.nwk" | uniq -d)
-    if [ -n "$duplicates" ]; then status="FAIL"; fi
+    local duplicates status="PASS" line_count="0"
 
-    local line_count
-    line_count=$(wc -l < "${TMP}_b10_diverse.nwk" 2>/dev/null || echo "0")
+    if [ ! -f "${TMP}_b10_diverse.nwk" ]; then
+        status="FAIL"
+        duplicates=""
+    else
+        duplicates=$(sort "${TMP}_b10_diverse.nwk" | uniq -d)
+        if [ -n "$duplicates" ]; then status="FAIL"; fi
+        line_count=$(wc -l < "${TMP}_b10_diverse.nwk")
+        if [ "$line_count" -lt 1 ]; then status="FAIL"; fi
+    fi
 
     if [ "$status" = "PASS" ]; then
         PART_B_PASS=$((PART_B_PASS + 1))

@@ -2,7 +2,7 @@
 
 Date: 2026-03-19
 Old larch commit: 6a7b9e0
-larch2 commit: cb9c60a
+larch2 commit: 58f8456
 
 ## Build Status
 - Old larch: PASS
@@ -24,15 +24,15 @@ larch2 commit: cb9c60a
 
 ### A3. Merge 5 DAG protobuf trees
 - Status: FAIL
-- Old larch: leaves=70, nodes=141, edges=218, trees=24, pars_min=200, pars_max=277
+- Old larch: leaves=70, nodes=141, edges=218, trees=24, pars_min=174, pars_max=287
 - larch2: leaves=70, nodes=141, edges=218, trees=24, pars_min=174, pars_max=290
-- Differences: pars_min: 200 vs 174; pars_max: 277 vs 290; 
+- Differences: pars_max: 287 vs 290; 
 
 ### A4. Trim and compare
-- Status: FAIL
-- Old larch: trees=24, parsimony_min=200
+- Status: PASS
+- Old larch: trees=24, parsimony_min=174
 - larch2: trees=24, parsimony_min=174
-- Differences: pars_min: 200 vs 174; 
+- Differences: none
 
 ### A5. Merge 5 parsimony protobuf trees (20D_from_fasta)
 - Status: PASS
@@ -50,7 +50,7 @@ larch2 commit: cb9c60a
 - Status: PASS
 - Input parsimony: 1642
 - Old larch min parsimony after 5 iterations: N/A
-- larch2 min parsimony after 5 iterations: 1628
+- larch2 min parsimony after 5 iterations: 1627
 - Differences: none (optimization is stochastic)
 
 ### A8. FASTA+Newick load and merge
@@ -106,15 +106,15 @@ Total Test time (real) =   0.07 sec
 - Tests passed: 0
 - Tests failed: 0
 - Output:       Start 16: native_optimize_test
-16/18 Test #16: native_optimize_test .............   Passed    0.03 sec
+16/18 Test #16: native_optimize_test .............   Passed    0.04 sec
       Start 17: spr_pipeline_test
 17/18 Test #17: spr_pipeline_test ................   Passed    0.04 sec
       Start 18: trim_clade_edges_test
-18/18 Test #18: trim_clade_edges_test ............   Passed    0.03 sec
+18/18 Test #18: trim_clade_edges_test ............   Passed    0.06 sec
 
 100% tests passed, 0 tests failed out of 18
 
-Total Test time (real) =   0.49 sec
+Total Test time (real) =   0.46 sec
 
 ### B10. Diverse tree extraction produces distinct trees
 - Status: PASS
@@ -122,6 +122,6 @@ Total Test time (real) =   0.49 sec
 - Duplicate trees: none
 
 ## Summary
-- Part A: 6 passed, 2 failed, 0 skipped (of 8)
+- Part A: 7 passed, 1 failed, 0 skipped (of 8)
 - Part B: 10 passed, 0 failed (of 10)
-- Overall: **FAIL** (2 failures)
+- Overall: **FAIL** (1 failures)
