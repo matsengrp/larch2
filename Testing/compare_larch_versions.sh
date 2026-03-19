@@ -18,6 +18,7 @@ REPORT="$SCRIPT_DIR/comparison_report.md"
 OLD_DAGUTIL="/home/matsen/re/larch/build/bin/larch-dagutil"
 OLD_USHER="/home/matsen/re/larch/build/bin/larch-usher"
 OLD_BCR="/home/matsen/re/larch/build/bin/bcr-larch"
+OLD_MPIRUN="/home/matsen/re/larch/.pixi/envs/default/bin/mpirun"
 NEW_DAGUTIL="$REPO_DIR/build/dagutil"
 NEW_LARCH2="$REPO_DIR/build/larch2"
 
@@ -271,13 +272,17 @@ check_a4() {
         return
     fi
 
-    local old_out new_out
-    old_out=$("$OLD_DAGUTIL" \
-      -i "${TMP}_merged_5.pb" --force-no-vcf \
-      -t -o "${TMP}_trimmed_5.pb" --dag-info --parsimony 2>&1)
+    # Trim and save (the trim command outputs pre-trim stats, so read from saved files)
+    "$OLD_DAGUTIL" -i "${TMP}_merged_5.pb" --force-no-vcf \
+      -t -o "${TMP}_trimmed_5.pb" >/dev/null 2>&1
 
-    new_out=$("$NEW_DAGUTIL" --dag-pb "${TMP}_merged2_5.pb.gz" --force-no-vcf \
-      -t -o "${TMP}_trimmed2_5.pb.gz" --dag-info --parsimony 2>&1)
+    "$NEW_DAGUTIL" --dag-pb "${TMP}_merged2_5.pb.gz" --force-no-vcf \
+      -t -o "${TMP}_trimmed2_5.pb.gz" >/dev/null 2>&1
+
+    # Read stats from saved trimmed files
+    local old_out new_out
+    old_out=$("$OLD_DAGUTIL" -i "${TMP}_trimmed_5.pb" --force-no-vcf --dag-info --parsimony 2>&1)
+    new_out=$("$NEW_DAGUTIL" --dag-pb "${TMP}_trimmed2_5.pb.gz" --force-no-vcf --dag-info --parsimony 2>&1)
 
     local old_trees old_min new_trees new_min
     old_trees=$(echo "$old_out" | grep -i 'tree_count' | grep -oP '\d+' | head -1)
@@ -312,8 +317,8 @@ check_a5() {
         return
     fi
 
-    local old_out new_out
-    old_out=$(timeout "$CMD_TIMEOUT" "$OLD_DAGUTIL" \
+    # Merge and save first, then query stats separately to avoid timeout killing partial output
+    "$OLD_DAGUTIL" \
       -i "$D20_DIR/1final-tree-100.nh1.pb.gz" \
       -i "$D20_DIR/1final-tree-101.nh1.pb.gz" \
       -i "$D20_DIR/1final-tree-102.nh1.pb.gz" \
@@ -321,9 +326,9 @@ check_a5() {
       -i "$D20_DIR/1final-tree-104.nh1.pb.gz" \
       -r "$REFSEQ" \
       --force-no-vcf \
-      -o "${TMP}_merged_20D.pb" --dag-info --parsimony 2>&1) || true
+      -o "${TMP}_merged_20D.pb" >/dev/null 2>&1 || true
 
-    new_out=$(timeout "$CMD_TIMEOUT" "$NEW_DAGUTIL" \
+    "$NEW_DAGUTIL" \
       --tree-pb "$D20_DIR/1final-tree-100.nh1.pb.gz" \
       --tree-pb "$D20_DIR/1final-tree-101.nh1.pb.gz" \
       --tree-pb "$D20_DIR/1final-tree-102.nh1.pb.gz" \
@@ -331,7 +336,18 @@ check_a5() {
       --tree-pb "$D20_DIR/1final-tree-104.nh1.pb.gz" \
       --refseq "$REFSEQ" \
       --force-no-vcf \
-      -o "${TMP}_merged2_20D.pb.gz" --dag-info --parsimony 2>&1) || true
+      -o "${TMP}_merged2_20D.pb.gz" >/dev/null 2>&1 || true
+
+    # Query stats from saved files
+    local old_out="" new_out=""
+    if [ -f "${TMP}_merged_20D.pb" ]; then
+        old_out=$(timeout "$CMD_TIMEOUT" "$OLD_DAGUTIL" \
+          -i "${TMP}_merged_20D.pb" -r "$REFSEQ" --force-no-vcf --dag-info --parsimony 2>&1) || true
+    fi
+    if [ -f "${TMP}_merged2_20D.pb.gz" ]; then
+        new_out=$(timeout "$CMD_TIMEOUT" "$NEW_DAGUTIL" \
+          --dag-pb "${TMP}_merged2_20D.pb.gz" --force-no-vcf --dag-info --parsimony 2>&1) || true
+    fi
 
     local old_leaves old_nodes old_edges old_trees old_min
     old_leaves=$(echo "$old_out" | grep -i 'leave' | grep -oP '\d+' | head -1)
@@ -418,7 +434,7 @@ check_a7() {
 
     # Old larch: optimize seedtree
     local old_opt_out="" old_check_out="" old_opt_ok=true
-    if ! old_opt_out=$(timeout "$CMD_TIMEOUT" mpirun -n 1 "$OLD_USHER" \
+    if ! old_opt_out=$(timeout "$CMD_TIMEOUT" "$OLD_MPIRUN" -n 1 "$OLD_USHER" \
       -i "$SEEDTREE" \
       -r <(zcat "$REFSEQ") \
       -o "${TMP}_opt_seed.pb" \
@@ -874,9 +890,11 @@ check_b9() {
     test_out=$(cd "$REPO_DIR/build" && ctest --output-on-failure 2>&1)
     local exit_code=$?
 
-    local passed failed
-    passed=$(echo "$test_out" | grep -oP '\d+ tests passed' | grep -oP '\d+' || echo "0")
-    failed=$(echo "$test_out" | grep -oP '\d+ tests failed' | grep -oP '\d+' || echo "0")
+    local passed failed total
+    # ctest format: "100% tests passed, 0 tests failed out of 18"
+    total=$(echo "$test_out" | grep -oP 'out of \d+' | grep -oP '\d+' || echo "?")
+    failed=$(echo "$test_out" | grep -oP '\d+ tests? failed' | grep -oP '\d+' | head -1 || echo "?")
+    passed=$((total - failed)) 2>/dev/null || passed="?"
 
     local status="PASS"
     if [ $exit_code -ne 0 ]; then status="FAIL"; fi
@@ -932,7 +950,7 @@ check_b10() {
 
     add_report "$section
 - Status: $status
-- Newick lines: $line_count
+- Newick lines: $line_count (requested 5; fewer means low topology diversity in the input DAG)
 - Duplicate trees: $(if [ -z "$duplicates" ]; then echo 'none'; else echo 'YES'; fi)"
 }
 
