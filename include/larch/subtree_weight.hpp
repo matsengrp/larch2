@@ -96,6 +96,7 @@ class subtree_weight {
 
   // Count min-weight trees below a node
   bigint min_weight_count(std::size_t node_idx, Ops const& ops) {
+    // compute_weight_below calls ensure_cache_size, which sizes all caches.
     compute_weight_below(node_idx, ops);
     assert(node_idx < cached_subtree_counts_.size());
 
@@ -215,6 +216,7 @@ class subtree_weight {
     // Kahn's algorithm: single BFS pass to compute in-degrees and
     // propagate above-weights in topological order.
     // Cache clades per node to avoid recomputing in the propagation pass.
+    // Inner vectors use mr_ (from get_clades); outer vector uses default alloc.
     using clades_type = std::pmr::vector<std::pmr::vector<std::size_t>>;
     std::vector<std::optional<clades_type>> clades_cache(node_hm);
 
