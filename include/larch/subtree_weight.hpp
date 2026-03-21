@@ -57,12 +57,8 @@ class subtree_weight {
     weight_type result;
     if (is_leaf(dag_, node_idx)) {
       result = ops.compute_leaf(dag_, node_idx);
-      if (node_idx >= cached_min_weight_edges_.size())
-        cached_min_weight_edges_.resize(node_idx + 1);
     } else {
       auto clades = get_clades(dag_, node_idx, mr_);
-      if (node_idx >= cached_min_weight_edges_.size())
-        cached_min_weight_edges_.resize(node_idx + 1);
       cached_min_weight_edges_[node_idx].resize(clades.size());
 
       std::vector<weight_type> clade_weights;
@@ -88,8 +84,6 @@ class subtree_weight {
       }
 
       // Cache per-clade minimum weights for the upward pass
-      if (node_idx >= cached_clade_weights_.size())
-        cached_clade_weights_.resize(node_idx + 1);
       cached_clade_weights_[node_idx] = std::move(clade_weights);
 
       result = ops.between_clades(cached_clade_weights_[node_idx]);
@@ -104,7 +98,6 @@ class subtree_weight {
   bigint min_weight_count(std::size_t node_idx, Ops const& ops) {
     compute_weight_below(node_idx, ops);
 
-    ensure_count_cache_size();
     if (cached_subtree_counts_[node_idx].has_value())
       return *cached_subtree_counts_[node_idx];
 
@@ -202,6 +195,12 @@ class subtree_weight {
   // Requires compute_weight_below to have been called first.
   // Returns vector indexed by node index.
   std::vector<weight_type> compute_weight_above(Ops const& ops) {
+    // The upward pass uses raw +/- instead of ops.above_node(), so it only
+    // works for additive weight types. A proper generalization would need a
+    // new WeightOps primitive like exclude_clade(total, one_clade).
+    static_assert(std::is_same_v<weight_type, std::size_t>,
+                  "compute_weight_above currently only supports additive "
+                  "weight types (e.g. parsimony_score_ops)");
     assert(!cached_clade_weights_.empty() &&
            "compute_weight_below must be called before compute_weight_above");
     auto constexpr max_w = std::numeric_limits<weight_type>::max() / 2;
@@ -213,6 +212,10 @@ class subtree_weight {
 
     // Kahn's algorithm: single BFS pass to compute in-degrees and
     // propagate above-weights in topological order.
+    // Cache clades per node to avoid recomputing in the propagation pass.
+    using clades_type = std::pmr::vector<std::pmr::vector<std::size_t>>;
+    std::unordered_map<std::size_t, clades_type> clades_cache;
+
     std::vector<std::size_t> in_degree(node_hm, 0);
     std::vector<bool> seen(node_hm, false);
     std::queue<std::size_t> init_q;
@@ -233,6 +236,7 @@ class subtree_weight {
           }
         }
       }
+      clades_cache.emplace(nidx, std::move(clades));
     }
 
     // Start with root (in-degree 0)
@@ -245,7 +249,7 @@ class subtree_weight {
 
       if (is_leaf(dag_, nidx)) continue;
 
-      auto clades = get_clades(dag_, nidx, mr_);
+      auto const& clades = clades_cache.at(nidx);
       auto total = total_clade_min_for(nidx);
 
       for (std::size_t ci = 0; ci < clades.size(); ++ci) {
@@ -274,6 +278,10 @@ class subtree_weight {
   // Returns vector indexed by edge index: min parsimony score of any
   // tree containing that edge.
   std::vector<weight_type> compute_edge_min_global_scores(Ops const& ops) {
+    // Same additive-only restriction as compute_weight_above.
+    static_assert(std::is_same_v<weight_type, std::size_t>,
+                  "compute_edge_min_global_scores currently only supports "
+                  "additive weight types (e.g. parsimony_score_ops)");
     assert(!cached_clade_weights_.empty() &&
            "compute_weight_below must be called before "
            "compute_edge_min_global_scores");
@@ -354,6 +362,7 @@ class subtree_weight {
   std::vector<std::vector<std::vector<std::size_t>>> cached_min_weight_edges_;
   // Per-clade minimum weights: cached_clade_weights_[node][clade] = min weight
   std::vector<std::vector<weight_type>> cached_clade_weights_;
+  std::vector<std::optional<bigint>> cached_all_tree_counts_;
   std::vector<bool> in_progress_;  // cycle detection
 
   weight_type total_clade_min_for(std::size_t node_idx) const {
@@ -373,19 +382,33 @@ class subtree_weight {
   std::mt19937 rng_;
   std::pmr::memory_resource* mr_;
 
+  // Count ALL trees below a node (over all edges, not just min-weight).
+  // Memoized into cached_all_tree_counts_ (separate from cached_subtree_counts_
+  // which counts only min-weight trees).
+  // Requires compute_weight_below to have been called first (for topology).
   bigint count_trees_below(std::size_t node_idx) {
-    if (is_leaf(dag_, node_idx)) return bigint{1};
-    auto clades = get_clades(dag_, node_idx, mr_);
-    bigint product{1};
-    for (auto const& edges : clades) {
-      bigint clade_sum{0};
-      for (auto edge_idx : edges) {
-        auto child_idx = get_child_idx(edge_idx);
-        clade_sum += count_trees_below(child_idx);
+    if (cached_all_tree_counts_[node_idx].has_value())
+      return *cached_all_tree_counts_[node_idx];
+
+    bigint result;
+    if (is_leaf(dag_, node_idx)) {
+      result = bigint{1};
+    } else {
+      auto clades = get_clades(dag_, node_idx, mr_);
+      bigint product{1};
+      for (auto const& edges : clades) {
+        bigint clade_sum{0};
+        for (auto edge_idx : edges) {
+          auto child_idx = get_child_idx(edge_idx);
+          clade_sum += count_trees_below(child_idx);
+        }
+        product *= clade_sum;
       }
-      product *= clade_sum;
+      result = product;
     }
-    return product;
+
+    cached_all_tree_counts_[node_idx] = result;
+    return result;
   }
 
   void ensure_cache_size() {
@@ -393,12 +416,11 @@ class subtree_weight {
     if (cached_weights_.size() < hm) {
       cached_weights_.resize(hm);
       in_progress_.resize(hm, false);
+      cached_min_weight_edges_.resize(hm);
+      cached_clade_weights_.resize(hm);
+      cached_subtree_counts_.resize(hm);
+      cached_all_tree_counts_.resize(hm);
     }
-  }
-
-  void ensure_count_cache_size() {
-    auto hm = dag_.node_high_mark();
-    if (cached_subtree_counts_.size() < hm) cached_subtree_counts_.resize(hm);
   }
 
   std::size_t get_root_idx() {
