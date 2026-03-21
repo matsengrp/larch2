@@ -97,6 +97,7 @@ class subtree_weight {
   // Count min-weight trees below a node
   bigint min_weight_count(std::size_t node_idx, Ops const& ops) {
     compute_weight_below(node_idx, ops);
+    assert(node_idx < cached_subtree_counts_.size());
 
     if (cached_subtree_counts_[node_idx].has_value())
       return *cached_subtree_counts_[node_idx];
@@ -196,11 +197,12 @@ class subtree_weight {
   // Returns vector indexed by node index.
   std::vector<weight_type> compute_weight_above(Ops const& ops) {
     // The upward pass uses raw +/- instead of ops.above_node(), so it only
-    // works for additive weight types. A proper generalization would need a
-    // new WeightOps primitive like exclude_clade(total, one_clade).
+    // works for additive weight types where weight_type is std::size_t.
+    // A proper generalization would need a new WeightOps primitive like
+    // exclude_clade(total, one_clade).
     static_assert(std::is_same_v<weight_type, std::size_t>,
-                  "compute_weight_above currently only supports additive "
-                  "weight types (e.g. parsimony_score_ops)");
+                  "compute_weight_above requires weight_type == std::size_t "
+                  "(additive ops only; raw +/- is used instead of ops methods)");
     assert(!cached_clade_weights_.empty() &&
            "compute_weight_below must be called before compute_weight_above");
     auto constexpr max_w = std::numeric_limits<weight_type>::max() / 2;
@@ -214,7 +216,7 @@ class subtree_weight {
     // propagate above-weights in topological order.
     // Cache clades per node to avoid recomputing in the propagation pass.
     using clades_type = std::pmr::vector<std::pmr::vector<std::size_t>>;
-    std::unordered_map<std::size_t, clades_type> clades_cache;
+    std::vector<std::optional<clades_type>> clades_cache(node_hm);
 
     std::vector<std::size_t> in_degree(node_hm, 0);
     std::vector<bool> seen(node_hm, false);
@@ -236,7 +238,7 @@ class subtree_weight {
           }
         }
       }
-      clades_cache.emplace(nidx, std::move(clades));
+      clades_cache[nidx].emplace(std::move(clades));
     }
 
     // Start with root (in-degree 0)
@@ -249,7 +251,8 @@ class subtree_weight {
 
       if (is_leaf(dag_, nidx)) continue;
 
-      auto const& clades = clades_cache.at(nidx);
+      assert(clades_cache[nidx].has_value());
+      auto const& clades = *clades_cache[nidx];
       auto total = total_clade_min_for(nidx);
 
       for (std::size_t ci = 0; ci < clades.size(); ++ci) {
@@ -280,8 +283,8 @@ class subtree_weight {
   std::vector<weight_type> compute_edge_min_global_scores(Ops const& ops) {
     // Same additive-only restriction as compute_weight_above.
     static_assert(std::is_same_v<weight_type, std::size_t>,
-                  "compute_edge_min_global_scores currently only supports "
-                  "additive weight types (e.g. parsimony_score_ops)");
+                  "compute_edge_min_global_scores requires weight_type == "
+                  "std::size_t (additive ops only)");
     assert(!cached_clade_weights_.empty() &&
            "compute_weight_below must be called before "
            "compute_edge_min_global_scores");
@@ -387,6 +390,9 @@ class subtree_weight {
   // which counts only min-weight trees).
   // Requires compute_weight_below to have been called first (for topology).
   bigint count_trees_below(std::size_t node_idx) {
+    assert(node_idx < cached_all_tree_counts_.size() &&
+           "count_trees_below requires compute_weight_below to have been "
+           "called first (to size caches)");
     if (cached_all_tree_counts_[node_idx].has_value())
       return *cached_all_tree_counts_[node_idx];
 
@@ -411,6 +417,9 @@ class subtree_weight {
     return result;
   }
 
+  // All node-indexed cache vectors are resized together here and nowhere
+  // else. The cached_weights_ size serves as the sentinel: if it is already
+  // >= hm, all other vectors are too (they are always resized in lockstep).
   void ensure_cache_size() {
     auto hm = dag_.node_high_mark();
     if (cached_weights_.size() < hm) {
