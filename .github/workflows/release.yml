@@ -25,7 +25,8 @@ jobs:
         run: |
           cmake -B build \
             -DGCC_TOOLCHAIN=/opt/gcc-latest \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLARCH_STATIC=ON
 
       - name: Build
         run: cmake --build build --parallel $(nproc)
@@ -36,7 +37,7 @@ jobs:
       - name: Prepare release artifact
         run: |
           mkdir larch2-linux-x86_64
-          cp build/larch2 build/dagutil larch2-linux-x86_64/
+          cp build/larch2 build/dagutil build/larch2-static build/dagutil-static larch2-linux-x86_64/
           zip -j larch2-linux-x86_64.zip larch2-linux-x86_64/*
 
       - name: Get version info

@@ -22,7 +22,8 @@ jobs:
         run: |
           cmake -B build \
             -DGCC_TOOLCHAIN=/opt/gcc-latest \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLARCH_STATIC=ON
 
       - name: Build
         run: cmake --build build --parallel $(nproc)
@@ -37,3 +38,5 @@ jobs:
           path: |
             build/larch2
             build/dagutil
+            build/larch2-static
+            build/dagutil-static

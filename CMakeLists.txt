@@ -81,6 +81,7 @@ find_package(ZLIB REQUIRED)
 
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+option(LARCH_STATIC "Also build fully-static executables (*-static)" OFF)
 
 if(ENABLE_ASAN AND ENABLE_TSAN)
     message(FATAL_ERROR "ENABLE_ASAN and ENABLE_TSAN are mutually exclusive")
@@ -115,6 +116,21 @@ target_link_libraries(larch2 PRIVATE larch)
 
 add_executable(dagutil tools/dagutil.cpp)
 target_link_libraries(dagutil PRIVATE larch)
+
+# --- Fully-static executables (opt-in) ----------------------------------------
+# Build additional executables linked with -static so every dependency (libc,
+# libpthread, libz, libstdc++, libgcc) is embedded.  These run on any Linux
+# x86_64 kernel without shared library requirements.
+
+if(LARCH_STATIC)
+    add_executable(larch2-static tools/larch2.cpp)
+    target_link_libraries(larch2-static PRIVATE larch)
+    target_link_options(larch2-static PRIVATE -static)
+
+    add_executable(dagutil-static tools/dagutil.cpp)
+    target_link_libraries(dagutil-static PRIVATE larch)
+    target_link_options(dagutil-static PRIVATE -static)
+endif()
 
 # --- Tests --------------------------------------------------------------------
 
