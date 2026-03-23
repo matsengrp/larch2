@@ -75,6 +75,14 @@ endif()
 add_link_options(-static-libstdc++ -static-libgcc)
 
 find_package(Threads REQUIRED)
+
+# When building fully-static executables, force find_package to locate the
+# static archive (libz.a) instead of the shared object.  A .a linked into the
+# normal (non-static) executables simply embeds the code — the same thing
+# -static-libstdc++ already does for the C++ runtime.
+if(LARCH_STATIC)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+endif()
 find_package(ZLIB REQUIRED)
 
 # --- Sanitizers ---------------------------------------------------------------
