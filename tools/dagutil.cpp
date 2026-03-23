@@ -29,25 +29,31 @@
 using namespace larch;
 
 // ---------------------------------------------------------------------------
+// Read reference sequence from file (FASTA or raw text)
+// ---------------------------------------------------------------------------
+
+static std::string read_refseq(std::string_view path) {
+  auto bytes = read_file(path);
+  std::string_view content{bytes.data(), bytes.size()};
+  if (!content.empty() && content[0] == '>') {
+    auto entries = read_fasta(path);
+    if (!entries.empty()) return std::move(entries[0].sequence);
+  }
+  std::string ref;
+  for (char c : content) {
+    if (c != '\n' && c != '\r' && c != ' ' && c != '\t')
+      ref += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return ref;
+}
+
+// ---------------------------------------------------------------------------
 // FASTA+Newick DAG builder (same logic as larch2.cpp)
 // ---------------------------------------------------------------------------
 
 static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
                                          std::string_view newick_path,
-                                         std::string_view refseq_path) {
-  auto ref_bytes = read_file(refseq_path);
-  std::string_view ref_content{ref_bytes.data(), ref_bytes.size()};
-  std::string reference;
-  if (!ref_content.empty() && ref_content[0] == '>') {
-    auto entries = read_fasta(refseq_path);
-    if (!entries.empty()) reference = std::move(entries[0].sequence);
-  } else {
-    for (char c : ref_content) {
-      if (c != '\n' && c != '\r' && c != ' ' && c != '\t')
-        reference +=
-            static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    }
-  }
+                                         std::string const& reference) {
 
   auto entries = read_fasta(fasta_path);
   std::unordered_map<std::string, std::string> fasta_map;
@@ -107,14 +113,8 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
     edge.clade_index() = ne.clade;
     auto pi = nw_to_dag[ne.parent];
     auto ci = nw_to_dag[ne.child];
-    for (auto nv : d.get_all_nodes()) {
-      std::visit(
-          [&](auto n) {
-            if (n.index() == pi) edge.set_parent(n);
-            if (n.index() == ci) edge.set_child(n);
-          },
-          nv);
-    }
+    std::visit([&](auto n) { edge.set_parent(n); }, d.get_node(pi));
+    std::visit([&](auto n) { edge.set_child(n); }, d.get_node(ci));
   }
 
   auto ua = d.append_node<node_kind::ua>();
@@ -123,13 +123,7 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
   {
     auto edge = ua.append_child<edge_kind::clade>();
     auto root_dag_idx = nw_to_dag[newick_root];
-    for (auto nv : d.get_all_nodes()) {
-      std::visit(
-          [&](auto n) {
-            if (n.index() == root_dag_idx) edge.set_child(n);
-          },
-          nv);
-    }
+    std::visit([&](auto n) { edge.set_child(n); }, d.get_node(root_dag_idx));
     edge.clade_index() = 0;
   }
 
@@ -159,25 +153,6 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
   fitch_assign_compact_genomes(d);
   recompute_edge_mutations(d);
   return d;
-}
-
-// ---------------------------------------------------------------------------
-// Read reference sequence from file (FASTA or raw text)
-// ---------------------------------------------------------------------------
-
-static std::string read_refseq(std::string_view path) {
-  auto bytes = read_file(path);
-  std::string_view content{bytes.data(), bytes.size()};
-  if (!content.empty() && content[0] == '>') {
-    auto entries = read_fasta(path);
-    if (!entries.empty()) return std::move(entries[0].sequence);
-  }
-  std::string ref;
-  for (char c : content) {
-    if (c != '\n' && c != '\r' && c != ' ' && c != '\t')
-      ref += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  }
-  return ref;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +339,7 @@ int main(int argc, char** argv) try {
       } else {
         auto fi = idx - dag_pb_count - tree_pb_count;
         dags[idx] =
-            build_from_fasta_newick(a.fastas[fi], a.newicks[fi], a.refseq);
+            build_from_fasta_newick(a.fastas[fi], a.newicks[fi], refseq);
       }
     });
     std::cerr << "Loading done.\n";
