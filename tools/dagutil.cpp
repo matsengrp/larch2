@@ -54,7 +54,6 @@ static std::string read_refseq(std::string_view path) {
 static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
                                          std::string_view newick_path,
                                          std::string const& reference) {
-
   auto entries = read_fasta(fasta_path);
   std::unordered_map<std::string, std::string> fasta_map;
   for (auto& e : entries) fasta_map[e.name] = std::move(e.sequence);

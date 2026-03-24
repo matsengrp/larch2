@@ -857,8 +857,7 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
     auto compute_fitch_parsimony = [](phylo_dag& tree) -> std::size_t {
       std::size_t score = 0;
       for (auto ev : tree.get_all_edges()) {
-        std::visit(
-            [&](auto edge) { score += edge.mutations().size(); }, ev);
+        std::visit([&](auto edge) { score += edge.mutations().size(); }, ev);
       }
       return score;
     };
@@ -871,8 +870,9 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
     // Sort pool indices by Fitch score (ascending = best first).
     std::vector<std::size_t> order(unique_pool.size());
     std::iota(order.begin(), order.end(), std::size_t{0});
-    std::sort(order.begin(), order.end(),
-              [&](auto a, auto b) { return fitch_scores[a] < fitch_scores[b]; });
+    std::sort(order.begin(), order.end(), [&](auto a, auto b) {
+      return fitch_scores[a] < fitch_scores[b];
+    });
 
     std::size_t min_fitch = fitch_scores[order[0]];
     std::size_t max_fitch = fitch_scores[order.back()];
@@ -1819,7 +1819,7 @@ int main(int argc, char** argv) {
               << edge_count(trimmed) << " edges\n";
     if (a.validate)
       validate_dag(trimmed, "before output (trimmed)",
-                    thread_pool::get_default());
+                   thread_pool::get_default());
     save_proto_dag(trimmed, a.output);
   } else {
     auto& result_dag = m.get_result();

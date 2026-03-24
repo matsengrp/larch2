@@ -19,7 +19,8 @@
 
 using namespace larch;
 
-// Build a tree from FASTA+Newick (same logic as dagutil's build_from_fasta_newick).
+// Build a tree from FASTA+Newick (same logic as dagutil's
+// build_from_fasta_newick).
 static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
                                          std::string_view newick_path,
                                          std::string_view refseq_path) {
@@ -235,8 +236,8 @@ int main() {
       "2026-03-18-madag-sampling-factorial/runs/dagmerge_debug_rota";
 
   if (!std::filesystem::exists(repro + "/input.fa")) {
-    std::println("(skipping merge_consistency_test: repro data not found at {})",
-                 repro);
+    std::println(
+        "(skipping merge_consistency_test: repro data not found at {})", repro);
     return 0;
   }
 

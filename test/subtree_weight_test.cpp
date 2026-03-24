@@ -483,13 +483,11 @@ static void test_edge_parsimony_exhaustive_ground_truth() {
 
     // Compute this tree's total parsimony score
     std::size_t tree_score = 0;
-    for (auto eidx : chosen_edges)
-      tree_score += pops.compute_edge(dag, eidx);
+    for (auto eidx : chosen_edges) tree_score += pops.compute_edge(dag, eidx);
 
     // Update min score seen for each edge in this tree
     for (auto eidx : chosen_edges) {
-      if (tree_score < min_score_seen[eidx])
-        min_score_seen[eidx] = tree_score;
+      if (tree_score < min_score_seen[eidx]) min_score_seen[eidx] = tree_score;
     }
   }
 

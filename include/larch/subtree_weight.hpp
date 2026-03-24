@@ -201,9 +201,10 @@ class subtree_weight {
     // works for additive weight types where weight_type is std::size_t.
     // A proper generalization would need a new WeightOps primitive like
     // exclude_clade(total, one_clade).
-    static_assert(std::is_same_v<weight_type, std::size_t>,
-                  "compute_weight_above requires weight_type == std::size_t "
-                  "(additive ops only; raw +/- is used instead of ops methods)");
+    static_assert(
+        std::is_same_v<weight_type, std::size_t>,
+        "compute_weight_above requires weight_type == std::size_t "
+        "(additive ops only; raw +/- is used instead of ops methods)");
     assert(!cached_clade_weights_.empty() &&
            "compute_weight_below must be called before compute_weight_above");
     auto constexpr max_w = std::numeric_limits<weight_type>::max() / 2;
@@ -264,8 +265,7 @@ class subtree_weight {
           auto child_idx = get_child_idx(edge_idx);
           auto edge_w = ops.compute_edge(dag_, edge_idx);
           assert(above[nidx] < max_w);
-          auto above_via_e =
-              above[nidx] + (total - clade_min_j) + edge_w;
+          auto above_via_e = above[nidx] + (total - clade_min_j) + edge_w;
           above[child_idx] = std::min(above[child_idx], above_via_e);
 
           if (--in_degree[child_idx] == 0) {
@@ -299,10 +299,10 @@ class subtree_weight {
       std::visit(
           [&](auto edge) {
             auto eidx = edge.index();
-            auto parent_idx = std::visit(
-                [](auto p) { return p.index(); }, edge.get_parent());
-            auto child_idx = std::visit(
-                [](auto c) { return c.index(); }, edge.get_child());
+            auto parent_idx =
+                std::visit([](auto p) { return p.index(); }, edge.get_parent());
+            auto child_idx =
+                std::visit([](auto c) { return c.index(); }, edge.get_child());
 
             auto edge_w = ops.compute_edge(dag_, eidx);
             auto total = total_clade_min_for(parent_idx);
@@ -314,9 +314,8 @@ class subtree_weight {
               child_below = *cached_weights_[child_idx];
             }
 
-            scores[eidx] = above[parent_idx] +
-                            (total - clade_min_j) + edge_w +
-                            child_below;
+            scores[eidx] = above[parent_idx] + (total - clade_min_j) + edge_w +
+                           child_below;
           },
           ev);
     }

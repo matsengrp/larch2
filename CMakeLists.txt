@@ -104,9 +104,29 @@ endif()
 
 # --- Library ------------------------------------------------------------------
 
-add_library(larch src/protobuf.cpp src/protobuf_encode.cpp)
+add_library(larch src/protobuf.cpp src/protobuf_encode.cpp src/pickle_reader.cpp)
 target_include_directories(larch PUBLIC include ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(larch PUBLIC ZLIB::ZLIB Threads::Threads)
+
+# --- Optional Vulkan compute --------------------------------------------------
+
+option(ENABLE_VULKAN "Enable Vulkan compute for neural network inference" OFF)
+
+if(ENABLE_VULKAN)
+    find_package(Vulkan REQUIRED)
+    include(cmake/CompileShaders.cmake)
+
+    compile_shaders(
+        SHADERS shaders/double_it.comp
+        OUTPUT_DIR ${CMAKE_BINARY_DIR}/generated/larch
+        TARGET larch_shaders
+    )
+
+    add_library(larch_vulkan src/vulkan_compute.cpp)
+    target_include_directories(larch_vulkan PUBLIC include ${CMAKE_BINARY_DIR}/generated)
+    target_link_libraries(larch_vulkan PUBLIC Vulkan::Vulkan)
+    add_dependencies(larch_vulkan larch_shaders)
+endif()
 
 # --- Executable ---------------------------------------------------------------
 
@@ -122,7 +142,8 @@ enable_testing()
 
 # Header-only tests (no library link needed beyond include path)
 foreach(test_name chain_test dag_test hash_chain_test extend_dag_test
-                  overlay_dag_test bigint_test weight_counter_test)
+                  overlay_dag_test bigint_test weight_counter_test
+                  kmer_encoder_test likelihood_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_include_directories(${test_name} PRIVATE include)
     add_test(NAME ${test_name} COMMAND ${test_name})
@@ -140,9 +161,19 @@ endforeach()
 foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   weight_accum_test optimize_test native_optimize_test
                   spr_pipeline_test trim_clade_edges_test
-                  rotaA_diagnostic_test)
+                  rotaA_diagnostic_test
+                  pth_loader_test rs_fivemer_model_test
+                  nn_cnn_test nn_s5f_test nn_ml_spr_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
     add_test(NAME ${test_name} COMMAND ${test_name}
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()
+
+# Vulkan compute tests
+if(ENABLE_VULKAN)
+    add_executable(vulkan_compute_test test/vulkan_compute_test.cpp)
+    target_link_libraries(vulkan_compute_test PRIVATE larch_vulkan)
+    add_dependencies(vulkan_compute_test larch_shaders)
+    add_test(NAME vulkan_compute_test COMMAND vulkan_compute_test)
+endif()
