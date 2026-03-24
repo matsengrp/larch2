@@ -138,6 +138,16 @@ if(LARCH_STATIC)
     add_executable(dagutil-static tools/dagutil.cpp)
     target_link_libraries(dagutil-static PRIVATE larch)
     target_link_options(dagutil-static PRIVATE -static)
+
+    # Force the entire pthread archive into the static executables.
+    # GCC's libstdc++ detects thread support via a weak ref to pthread_cancel;
+    # without --whole-archive the linker won't pull that symbol from the
+    # archive (nothing calls it directly), so __gthread_active_p() returns
+    # false and std::thread throws "Operation not permitted".
+    foreach(_target larch2-static dagutil-static)
+        target_link_libraries(${_target} PRIVATE
+            -Wl,--whole-archive -lpthread -Wl,--no-whole-archive)
+    endforeach()
 endif()
 
 # --- Tests --------------------------------------------------------------------
