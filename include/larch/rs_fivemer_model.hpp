@@ -20,8 +20,9 @@ namespace larch {
 class rs_fivemer_model {
   pth_file pth_;
   kmer_encoder encoder_;
-  float const* r_weights_;  // [kmer_count] log-rates (column vector, col 0)
-  float const* s_weights_;  // [kmer_count * 4] substitution logits
+  float const* r_weights_;      // [kmer_count] log-rates (column vector, col 0)
+  float const* s_weights_;      // [kmer_count * 4] substitution logits
+  double rate_bias_log_ = 0.0;  // additive log-bias applied to all rates
 
  public:
   struct forward_result {
@@ -80,7 +81,7 @@ class rs_fivemer_model {
 
     for (std::size_t i = 0; i < sc; ++i) {
       auto idx = static_cast<std::size_t>(encoded.kmer_indices[i]);
-      rates[i] = std::exp(r_weights_[idx]);
+      rates[i] = std::exp(r_weights_[idx] + static_cast<float>(rate_bias_log_));
       for (std::size_t j = 0; j < 4; ++j) {
         csp[i * 4 + j] =
             s_weights_[idx * 4 + j] + encoded.wt_modifier[i * 4 + j];
@@ -104,6 +105,12 @@ class rs_fivemer_model {
   std::size_t kmer_length() const { return encoder_.kmer_length(); }
   std::size_t site_count() const { return encoder_.site_count(); }
   std::size_t kmer_count() const { return encoder_.kmer_count(); }
+
+  // Adjust all output rates by exp(log_adjustment_factor).
+  void adjust_rate_bias_by(double log_adjustment_factor) {
+    rate_bias_log_ += log_adjustment_factor;
+  }
+  double rate_bias_log() const { return rate_bias_log_; }
 
   // Accessors for GPU inference (weight data pointers).
   float const* r_weights_data() const { return r_weights_; }

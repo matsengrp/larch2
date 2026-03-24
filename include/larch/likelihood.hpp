@@ -55,7 +55,7 @@ inline double poisson_context_log_likelihood(std::span<const float> rates,
 
   if (n_mutations == 0) return 0.0;
 
-  // Sum rates over the sequence length (not the full model site_count).
+  // Sum rates over the sequence length.
   double sum_rates = 0.0;
   for (std::size_t i = 0; i < seq_len; ++i) {
     sum_rates += static_cast<double>(rates[i]);
@@ -70,6 +70,8 @@ inline double poisson_context_log_likelihood(std::span<const float> rates,
       auto child_base = static_cast<std::size_t>(child[i]);
       double rate = static_cast<double>(rates[i]);
       double sub_prob = static_cast<double>(csp[i * 4 + child_base]);
+      // Clamp to avoid log(0) when float32 softmax underflows to exactly 0.
+      if (sub_prob < 1e-30) sub_prob = 1e-30;
       log_lambda_sum += std::log(rate * sub_prob);
     }
   }

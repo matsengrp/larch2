@@ -139,6 +139,9 @@ target_link_libraries(larch2 PRIVATE larch)
 add_executable(dagutil tools/dagutil.cpp)
 target_link_libraries(dagutil PRIVATE larch)
 
+add_executable(larch2-bcr tools/larch2-bcr.cpp)
+target_link_libraries(larch2-bcr PRIVATE larch)
+
 # --- Tests --------------------------------------------------------------------
 
 enable_testing()
@@ -166,7 +169,8 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   spr_pipeline_test trim_clade_edges_test
                   rotaA_diagnostic_test
                   pth_loader_test rs_fivemer_model_test
-                  nn_cnn_test nn_s5f_test nn_ml_spr_test)
+                  nn_cnn_test nn_s5f_test nn_ml_spr_test
+                  nn_blended_spr_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
     add_test(NAME ${test_name} COMMAND ${test_name}

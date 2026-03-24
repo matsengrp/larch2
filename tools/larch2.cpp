@@ -1,4 +1,6 @@
+#include <larch/build_fasta_newick.hpp>
 #include <larch/load_proto_dag.hpp>
+#include <larch/model_variant.hpp>
 #include <larch/load_parsimony.hpp>
 #include <larch/save_proto_dag.hpp>
 #include <larch/fasta.hpp>
@@ -185,149 +187,6 @@ struct random_spr_strategy {
 };
 
 // ---------------------------------------------------------------------------
-// FASTA+Newick DAG builder
-// ---------------------------------------------------------------------------
-
-static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
-                                         std::string_view newick_path,
-                                         std::string_view refseq_path) {
-  // Read reference sequence (may be FASTA or raw text)
-  auto ref_bytes = read_file(refseq_path);
-  std::string_view ref_content{ref_bytes.data(), ref_bytes.size()};
-  std::string reference;
-  if (!ref_content.empty() && ref_content[0] == '>') {
-    auto entries = read_fasta(refseq_path);
-    if (!entries.empty()) reference = std::move(entries[0].sequence);
-  } else {
-    for (char c : ref_content) {
-      if (c != '\n' && c != '\r' && c != ' ' && c != '\t')
-        reference +=
-            static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    }
-  }
-
-  // Read FASTA leaf sequences
-  auto entries = read_fasta(fasta_path);
-  std::unordered_map<std::string, std::string> fasta_map;
-  for (auto& e : entries) fasta_map[e.name] = std::move(e.sequence);
-
-  // Read newick string
-  auto nw_bytes = read_file(newick_path);
-  std::string newick_str{nw_bytes.data(), nw_bytes.size()};
-
-  // Build tree from newick (same pattern as load_parsimony_tree)
-  phylo_dag d;
-
-  std::unordered_map<std::size_t, std::size_t> num_children;
-  std::map<std::size_t, std::string> seq_ids;
-  struct nw_edge_t {
-    std::size_t parent, child, clade;
-  };
-  std::vector<nw_edge_t> nw_edges;
-
-  parse_newick(
-      newick_str,
-      [&](std::size_t id, std::string_view label, std::optional<double>) {
-        seq_ids[id] = std::string{label};
-      },
-      [&](std::size_t parent, std::size_t child) {
-        nw_edges.push_back({parent, child, num_children[parent]++});
-      });
-
-  // Determine leaf vs inner
-  std::unordered_map<std::size_t, bool> has_children;
-  std::unordered_map<std::size_t, bool> is_child;
-  for (auto& e : nw_edges) {
-    has_children[e.parent] = true;
-    is_child[e.child] = true;
-  }
-
-  // Find newick root
-  std::size_t newick_root = 0;
-  for (auto& [id, _] : seq_ids) {
-    if (!is_child.contains(id)) {
-      newick_root = id;
-      break;
-    }
-  }
-
-  // Create nodes
-  std::unordered_map<std::size_t, std::size_t> nw_to_dag;
-  for (auto& [nw_id, label] : seq_ids) {
-    bool is_leaf_node = !has_children.contains(nw_id);
-    if (is_leaf_node) {
-      auto leaf = d.append_node<node_kind::leaf>();
-      if (!label.empty()) leaf.sample_id() = label;
-      nw_to_dag[nw_id] = leaf.index();
-    } else {
-      auto inner = d.append_node<node_kind::inner>();
-      nw_to_dag[nw_id] = inner.index();
-    }
-  }
-
-  // Create edges
-  for (auto& ne : nw_edges) {
-    auto edge = d.append_edge<edge_kind::clade>();
-    edge.clade_index() = ne.clade;
-    auto pi = nw_to_dag[ne.parent];
-    auto ci = nw_to_dag[ne.child];
-    for (auto nv : d.get_all_nodes()) {
-      std::visit(
-          [&](auto n) {
-            if (n.index() == pi) edge.set_parent(n);
-            if (n.index() == ci) edge.set_child(n);
-          },
-          nv);
-    }
-  }
-
-  // Add UA node
-  auto ua = d.append_node<node_kind::ua>();
-  ua.reference_sequence() = reference;
-  d.set_root(ua);
-  {
-    auto edge = ua.append_child<edge_kind::clade>();
-    auto root_dag_idx = nw_to_dag[newick_root];
-    for (auto nv : d.get_all_nodes()) {
-      std::visit(
-          [&](auto n) {
-            if (n.index() == root_dag_idx) edge.set_child(n);
-          },
-          nv);
-    }
-    edge.clade_index() = 0;
-  }
-
-  // Assign leaf CGs from FASTA by diffing against reference
-  for (auto nv : d.get_all_nodes()) {
-    std::visit(
-        [&](auto node) {
-          if constexpr (requires {
-                          node.sample_id();
-                          node.cg();
-                        }) {
-            auto it = fasta_map.find(node.sample_id());
-            if (it == fasta_map.end()) return;
-            auto& seq = it->second;
-            std::map<mutation_position, nuc_base> muts;
-            for (std::size_t i = 0; i < seq.size() && i < reference.size();
-                 ++i) {
-              auto ref_base = nuc_base::from_char(reference[i]);
-              auto seq_base = nuc_base::from_char(seq[i]);
-              if (!(ref_base == seq_base)) muts[i + 1] = seq_base;
-            }
-            node.cg() = compact_genome{std::move(muts)};
-          }
-        },
-        nv);
-  }
-
-  fitch_assign_compact_genomes(d);
-  recompute_edge_mutations(d);
-  return d;
-}
-
-// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -365,7 +224,12 @@ Move strategy:
   --callback-option <O>   best-moves (default) or all-moves
   --move-coeff-pscore <N>  Parsimony score coefficient for scoring moves (default: 1)
   --move-coeff-nodes <N>   New node coefficient for scoring moves (default: 0)
+  --move-coeff-ml <F>      ML log-likelihood coefficient (default: 0.0, disabled)
   --move-score-threshold <N>  Max parsimony score for enumerated moves (default: -1, or 0 with --move-coeff-nodes)
+
+ML scoring:
+  --model-dir <path>      Directory containing model files (e.g. data/bcr)
+  --model-name <name>     Model name (e.g. s5f, ThriftyHumV0.2-45)
 
 Metrics:
   --log-metrics           Print extended per-iteration metrics to stderr
@@ -419,6 +283,9 @@ struct args {
   std::string diverse_newick;
   int move_coeff_pscore = 1;
   int move_coeff_nodes = 0;
+  double move_coeff_ml = 0.0;
+  std::string model_dir;
+  std::string model_name;
   std::optional<int> move_score_threshold;
   std::optional<std::size_t> patience;
   std::optional<std::size_t> drift;
@@ -489,6 +356,12 @@ static args parse_args(int argc, char** argv) {
       a.move_coeff_pscore = std::stoi(std::string{next()});
     else if (arg == "--move-coeff-nodes")
       a.move_coeff_nodes = std::stoi(std::string{next()});
+    else if (arg == "--move-coeff-ml")
+      a.move_coeff_ml = std::stod(std::string{next()});
+    else if (arg == "--model-dir")
+      a.model_dir = next();
+    else if (arg == "--model-name")
+      a.model_name = next();
     else if (arg == "--move-score-threshold")
       a.move_score_threshold = std::stoi(std::string{next()});
     else if (arg == "--patience") {
@@ -1212,6 +1085,19 @@ static bool drift_escape(merge& m, args const& a, std::mt19937& rng,
 static std::vector<optimize_result> run_native(merge& m, args const& a) {
   auto& pool = thread_pool::get_default();
   std::mt19937 rng(a.seed.value_or(std::random_device{}()));
+
+  // Load ML model if ML scoring is enabled.
+  std::optional<ml_model> ml_model_opt;
+  if (a.move_coeff_ml > 0.0) {
+    if (a.model_dir.empty() || a.model_name.empty()) {
+      std::cerr << "error: --model-dir and --model-name required with "
+                   "--move-coeff-ml\n";
+      std::exit(1);
+    }
+    std::cerr << "Loading ML model " << a.model_name << "...\n";
+    ml_model_opt = load_ml_model(a.model_dir, a.model_name);
+    std::cerr << "  ML model loaded\n";
+  }
   std::vector<optimize_result> results;
   results.reserve(a.iterations);
   progress prog;
@@ -1344,7 +1230,28 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
           std::size_t moves_applied = 0;
           prog.phase("  Merging subtree fragments");
-          if (coeffs.has_node_penalty()) {
+          if (ml_model_opt.has_value()) {
+            struct scored_frag {
+              std::size_t idx;
+              double final_score;
+            };
+            std::vector<scored_frag> scored(fragments.size());
+            for (std::size_t i = 0; i < fragments.size(); ++i) {
+              double frag_nll =
+                  compute_fragment_ml_score(*ml_model_opt, fragments[i]);
+              double blended = static_cast<double>(a.move_coeff_pscore) *
+                                   spr_moves[i].score_change.value_or(0) -
+                               a.move_coeff_ml * frag_nll;
+              scored[i] = {i, blended};
+            }
+            std::sort(scored.begin(), scored.end(), [](auto& x, auto& y) {
+              return x.final_score < y.final_score;
+            });
+            std::erase_if(scored, [](auto& s) { return s.final_score >= 0.0; });
+            if (scored.size() > a.max_moves) scored.resize(a.max_moves);
+            for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
+            moves_applied = scored.size();
+          } else if (coeffs.has_node_penalty()) {
             struct scored_frag {
               std::size_t idx;
               int final_score;
@@ -1478,10 +1385,32 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
       prog.done();
 
-      // 7. Merge fragments
+      // 7. Merge fragments (with optional ML or node-penalty re-scoring)
       std::size_t moves_applied = 0;
       prog.phase("  Merging");
-      if (coeffs.has_node_penalty()) {
+      if (ml_model_opt.has_value()) {
+        // ML re-scoring: blended = pscore_coeff * parsimony - ml_coeff * nll
+        struct scored_frag {
+          std::size_t idx;
+          double final_score;
+        };
+        std::vector<scored_frag> scored(fragments.size());
+        for (std::size_t i = 0; i < fragments.size(); ++i) {
+          double frag_nll =
+              compute_fragment_ml_score(*ml_model_opt, fragments[i]);
+          double blended = static_cast<double>(a.move_coeff_pscore) *
+                               spr_moves[i].score_change.value_or(0) -
+                           a.move_coeff_ml * frag_nll;
+          scored[i] = {i, blended};
+        }
+        std::sort(scored.begin(), scored.end(), [](auto& x, auto& y) {
+          return x.final_score < y.final_score;
+        });
+        std::erase_if(scored, [](auto& s) { return s.final_score >= 0.0; });
+        if (scored.size() > a.max_moves) scored.resize(a.max_moves);
+        for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
+        moves_applied = scored.size();
+      } else if (coeffs.has_node_penalty()) {
         struct scored_frag {
           std::size_t idx;
           int final_score;

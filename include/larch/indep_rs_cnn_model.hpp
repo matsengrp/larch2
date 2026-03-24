@@ -27,6 +27,7 @@ class indep_rs_cnn_model {
   std::size_t embedding_dim_;
   std::size_t filter_count_;
   std::size_t kernel_size_;
+  double rate_bias_log_ = 0.0;  // additive log-bias applied to all rates
 
   // Shared weights.
   float const* embed_w_;   // [kmer_count, E]
@@ -204,7 +205,8 @@ class indep_rs_cnn_model {
     linear_fwd(r_rate.data(), r_feat.data(), L, r_linear_w_, r_linear_b_, F, 1);
     std::vector<float> rates(L);
     for (std::size_t i = 0; i < L; ++i)
-      rates[i] = std::exp(base_rate[i] + r_rate[i]);
+      rates[i] = std::exp(base_rate[i] + r_rate[i] +
+                          static_cast<float>(rate_bias_log_));
 
     // S-branch: embed → conv → ReLU.
     std::vector<float> s_emb(L * E);
@@ -238,6 +240,12 @@ class indep_rs_cnn_model {
   std::size_t embedding_dim() const { return embedding_dim_; }
   std::size_t filter_count() const { return filter_count_; }
   std::size_t kernel_size() const { return kernel_size_; }
+
+  // Adjust all output rates by exp(log_adjustment_factor).
+  void adjust_rate_bias_by(double log_adjustment_factor) {
+    rate_bias_log_ += log_adjustment_factor;
+  }
+  double rate_bias_log() const { return rate_bias_log_; }
 
   // Accessors for GPU inference (weight data pointers).
   kmer_encoder const& encoder() const { return encoder_; }
