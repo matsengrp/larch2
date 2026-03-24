@@ -238,6 +238,24 @@ class indep_rs_cnn_model {
   std::size_t embedding_dim() const { return embedding_dim_; }
   std::size_t filter_count() const { return filter_count_; }
   std::size_t kernel_size() const { return kernel_size_; }
+
+  // Accessors for GPU inference (weight data pointers).
+  kmer_encoder const& encoder() const { return encoder_; }
+  float const* embed_w_data() const { return embed_w_; }
+  float const* conv_w_data() const { return conv_w_; }
+  float const* conv_b_data() const { return conv_b_; }
+  float const* linear_w_data() const { return linear_w_; }
+  float const* linear_b_data() const { return linear_b_; }
+  float const* r_embed_w_data() const { return r_embed_w_; }
+  float const* r_conv_w_data() const { return r_conv_w_; }
+  float const* r_conv_b_data() const { return r_conv_b_; }
+  float const* r_linear_w_data() const { return r_linear_w_; }
+  float const* r_linear_b_data() const { return r_linear_b_; }
+  float const* s_embed_w_data() const { return s_embed_w_; }
+  float const* s_conv_w_data() const { return s_conv_w_; }
+  float const* s_conv_b_data() const { return s_conv_b_; }
+  float const* s_linear_w_data() const { return s_linear_w_; }
+  float const* s_linear_b_data() const { return s_linear_b_; }
 };
 
 }  // namespace larch

@@ -104,6 +104,11 @@ class rs_fivemer_model {
   std::size_t kmer_length() const { return encoder_.kmer_length(); }
   std::size_t site_count() const { return encoder_.site_count(); }
   std::size_t kmer_count() const { return encoder_.kmer_count(); }
+
+  // Accessors for GPU inference (weight data pointers).
+  float const* r_weights_data() const { return r_weights_; }
+  float const* s_weights_data() const { return s_weights_; }
+  kmer_encoder const& encoder() const { return encoder_; }
 };
 
 }  // namespace larch

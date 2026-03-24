@@ -118,13 +118,16 @@ if(ENABLE_VULKAN)
 
     compile_shaders(
         SHADERS shaders/double_it.comp
+                shaders/fivemer_forward.comp
+                shaders/cnn_r_branch.comp
+                shaders/cnn_s_branch.comp
         OUTPUT_DIR ${CMAKE_BINARY_DIR}/generated/larch
         TARGET larch_shaders
     )
 
-    add_library(larch_vulkan src/vulkan_compute.cpp)
+    add_library(larch_vulkan src/vulkan_compute.cpp src/nn_inference.cpp)
     target_include_directories(larch_vulkan PUBLIC include ${CMAKE_BINARY_DIR}/generated)
-    target_link_libraries(larch_vulkan PUBLIC Vulkan::Vulkan)
+    target_link_libraries(larch_vulkan PUBLIC Vulkan::Vulkan larch)
     add_dependencies(larch_vulkan larch_shaders)
 endif()
 
@@ -176,4 +179,10 @@ if(ENABLE_VULKAN)
     target_link_libraries(vulkan_compute_test PRIVATE larch_vulkan)
     add_dependencies(vulkan_compute_test larch_shaders)
     add_test(NAME vulkan_compute_test COMMAND vulkan_compute_test)
+
+    add_executable(nn_inference_test test/nn_inference_test.cpp)
+    target_link_libraries(nn_inference_test PRIVATE larch_vulkan)
+    add_dependencies(nn_inference_test larch_shaders)
+    add_test(NAME nn_inference_test COMMAND nn_inference_test
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()

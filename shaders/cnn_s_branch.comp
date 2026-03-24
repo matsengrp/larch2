@@ -1,0 +1,77 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Shared branch weights.
+layout(set = 0, binding = 0)  readonly buffer KmerIndices  { int kmer_indices[]; };
+layout(set = 0, binding = 1)  readonly buffer EmbedW       { float embed_w[]; };
+layout(set = 0, binding = 2)  readonly buffer ConvW        { float conv_w[]; };
+layout(set = 0, binding = 3)  readonly buffer ConvB        { float conv_b[]; };
+
+// S-branch weights.
+layout(set = 0, binding = 4)  readonly buffer SEmbedW      { float s_embed_w[]; };
+layout(set = 0, binding = 5)  readonly buffer SConvW       { float s_conv_w[]; };
+layout(set = 0, binding = 6)  readonly buffer SConvB       { float s_conv_b[]; };
+layout(set = 0, binding = 7)  readonly buffer SLinearW     { float s_linear_w[]; };
+layout(set = 0, binding = 8)  readonly buffer SLinearB     { float s_linear_b[]; };
+
+// Per-inference inputs/outputs.
+layout(set = 0, binding = 9)  readonly buffer WtModifier   { float wt_modifier[]; };
+layout(set = 0, binding = 10) writeonly buffer CspLogitsOut { float csp_logits[]; };
+
+layout(push_constant) uniform Params {
+    uint L;  // site_count
+    uint E;  // embedding_dim
+    uint F;  // filter_count
+    uint K;  // kernel_size
+};
+
+void main() {
+    uint l = gl_GlobalInvocationID.x;
+    if (l >= L) return;
+
+    int half_k = int(K / 2u);
+
+    float logits[4];
+    for (uint fo = 0; fo < 4; ++fo)
+        logits[fo] = s_linear_b[fo];
+
+    for (uint co = 0; co < F; ++co) {
+        // Shared branch: fused embed + conv1d at position l, filter co.
+        float shared_val = conv_b[co];
+        for (uint k = 0; k < K; ++k) {
+            int src = int(l) + int(k) - half_k;
+            if (src >= 0 && src < int(L)) {
+                int src_idx = kmer_indices[src];
+                for (uint e = 0; e < E; ++e) {
+                    shared_val += embed_w[src_idx * E + e]
+                                * conv_w[co * E * K + e * K + k];
+                }
+            }
+        }
+        shared_val = max(shared_val, 0.0);  // ReLU
+
+        // S-branch: fused s_embed + s_conv1d at position l, filter co.
+        float s_val = s_conv_b[co];
+        for (uint k = 0; k < K; ++k) {
+            int src = int(l) + int(k) - half_k;
+            if (src >= 0 && src < int(L)) {
+                int src_idx = kmer_indices[src];
+                for (uint e = 0; e < E; ++e) {
+                    s_val += s_embed_w[src_idx * E + e]
+                           * s_conv_w[co * E * K + e * K + k];
+                }
+            }
+        }
+        s_val = max(s_val, 0.0);  // ReLU
+
+        // Accumulate linear: s_linear_w[4, F] * (shared + s).
+        float feat = shared_val + s_val;
+        for (uint fo = 0; fo < 4; ++fo)
+            logits[fo] += s_linear_w[fo * F + co] * feat;
+    }
+
+    // Add wild-type modifier.
+    for (uint fo = 0; fo < 4; ++fo)
+        csp_logits[l * 4 + fo] = logits[fo] + wt_modifier[l * 4 + fo];
+}
