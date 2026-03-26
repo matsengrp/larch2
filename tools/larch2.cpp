@@ -1231,17 +1231,19 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
           std::size_t moves_applied = 0;
           prog.phase("  Merging subtree fragments");
           if (ml_model_opt.has_value()) {
+            // Delta LL scoring: old_NLL - new_NLL (positive = move improved ML).
+            // blended = pscore_coeff * parsimony_change - ml_coeff * delta_LL
             struct scored_frag {
               std::size_t idx;
               double final_score;
             };
             std::vector<scored_frag> scored(fragments.size());
             for (std::size_t i = 0; i < fragments.size(); ++i) {
-              double frag_nll =
-                  compute_fragment_ml_score(*ml_model_opt, fragments[i]);
+              double delta_ll = compute_delta_ml_score(
+                  *ml_model_opt, subtree_dag, fragments[i], spr_moves[i]);
               double blended = static_cast<double>(a.move_coeff_pscore) *
                                    spr_moves[i].score_change.value_or(0) -
-                               a.move_coeff_ml * frag_nll;
+                               a.move_coeff_ml * delta_ll;
               scored[i] = {i, blended};
             }
             std::sort(scored.begin(), scored.end(), [](auto& x, auto& y) {
@@ -1389,18 +1391,19 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
       std::size_t moves_applied = 0;
       prog.phase("  Merging");
       if (ml_model_opt.has_value()) {
-        // ML re-scoring: blended = pscore_coeff * parsimony - ml_coeff * nll
+        // Delta LL scoring: old_NLL - new_NLL (positive = move improved ML).
+        // blended = pscore_coeff * parsimony_change - ml_coeff * delta_LL
         struct scored_frag {
           std::size_t idx;
           double final_score;
         };
         std::vector<scored_frag> scored(fragments.size());
         for (std::size_t i = 0; i < fragments.size(); ++i) {
-          double frag_nll =
-              compute_fragment_ml_score(*ml_model_opt, fragments[i]);
+          double delta_ll = compute_delta_ml_score(
+              *ml_model_opt, sampled, fragments[i], spr_moves[i]);
           double blended = static_cast<double>(a.move_coeff_pscore) *
                                spr_moves[i].score_change.value_or(0) -
-                           a.move_coeff_ml * frag_nll;
+                           a.move_coeff_ml * delta_ll;
           scored[i] = {i, blended};
         }
         std::sort(scored.begin(), scored.end(), [](auto& x, auto& y) {

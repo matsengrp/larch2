@@ -102,7 +102,7 @@ void test_ml_log_likelihood_via_variant() {
   std::println("  ml_log_likelihood via variant: OK");
 }
 
-void test_fragment_ml_score() {
+void test_delta_ml_score() {
   auto model = load_ml_model("data/bcr", "s5f");
   auto tree = make_test_tree();
 
@@ -118,21 +118,29 @@ void test_fragment_ml_score() {
   }
 
   if (moves.empty()) {
-    std::println("  fragment_ml_score: SKIP (no profitable moves)");
+    std::println("  delta_ml_score: SKIP (no profitable moves)");
     return;
   }
 
-  // Generate a fragment and score it.
+  // Generate a fragment and compute delta LL.
   auto& mv = moves[0];
   spr_move sm{.src = mv.src,
               .dst = mv.dst,
               .lca = mv.lca,
               .score_change = mv.score_change};
   auto frag = apply_spr_as_fragment(tree, sm);
-  double nll = compute_fragment_ml_score(model, frag);
-  assert(std::isfinite(nll));
-  assert(nll >= 0.0);  // neg-log-likelihood is non-negative
-  std::println("  fragment_ml_score: OK (nll={:.6f})", nll);
+
+  // Fragment NLL should be finite and non-negative.
+  double frag_nll = compute_dag_ml_nll(model, frag);
+  assert(std::isfinite(frag_nll));
+  assert(frag_nll >= 0.0);
+
+  // Delta should be finite (old_NLL - new_NLL).
+  double delta = compute_delta_ml_score(model, tree, frag, sm);
+  assert(std::isfinite(delta));
+
+  std::println("  delta_ml_score: OK (delta={:.6f}, frag_nll={:.6f})", delta,
+               frag_nll);
 }
 
 void test_blended_scoring_zero_ml_matches_parsimony() {
@@ -156,8 +164,8 @@ void test_blended_scoring_zero_ml_matches_parsimony() {
                 .lca = mv.lca,
                 .score_change = mv.score_change};
     auto frag = apply_spr_as_fragment(tree, sm);
-    double nll = compute_fragment_ml_score(model, frag);
-    double blended = 1.0 * mv.score_change - 0.0 * nll;
+    double delta = compute_delta_ml_score(model, tree, frag, sm);
+    double blended = 1.0 * mv.score_change - 0.0 * delta;
     assert(blended == static_cast<double>(mv.score_change));
   }
   std::println("  blended zero-ml matches parsimony: OK");
@@ -179,7 +187,7 @@ int main() {
   test_load_ml_model_s5f();
   test_load_ml_model_cnn();
   test_ml_log_likelihood_via_variant();
-  test_fragment_ml_score();
+  test_delta_ml_score();
   test_blended_scoring_zero_ml_matches_parsimony();
   test_adjust_rate_bias_via_variant();
   std::println("All nn_blended_spr tests passed");
