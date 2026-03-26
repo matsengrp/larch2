@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -64,52 +65,80 @@ inline double compute_dag_ml_nll(ml_model const& model, phylo_dag& dag) {
   return total_nll;
 }
 
-// Compute total NLL for all edges in a subtree of a tree, starting from
-// subtree_root_idx downward.  Skips the UA→root edge.
-inline double compute_subtree_ml_nll(ml_model const& model, phylo_dag& tree,
-                                     std::size_t subtree_root_idx) {
-  auto const& ref = get_reference_sequence(tree);
-  double total_nll = 0.0;
+// ============================================================================
+// Changed-edges-only delta LL scoring
+// ============================================================================
 
-  // DFS walk from subtree_root_idx.
-  std::vector<std::size_t> stack = {subtree_root_idx};
-  while (!stack.empty()) {
-    auto nidx = stack.back();
-    stack.pop_back();
-    if (is_leaf(tree, nidx)) continue;
+// Collect the set of nodes whose parent edges are affected by an SPR move.
+// These are nodes on the path from src to lca and from dst to lca,
+// plus src itself and dst itself (whose parent edges change).
+inline std::unordered_set<std::size_t> collect_affected_nodes(
+    phylo_dag& tree, spr_move const& move) {
+  std::unordered_set<std::size_t> affected;
 
-    auto clades = get_clades(tree, nidx);
-    for (auto const& edges : clades) {
-      for (auto edge_idx : edges) {
-        auto child_idx = get_child_idx(tree, edge_idx);
-        // Score this edge.
-        auto ev = tree.get_edge(edge_idx);
-        std::visit(
-            [&](auto edge) {
-              if (!edge.mutations().empty()) {
-                auto parent_seq = reconstruct_sequence(tree, nidx, ref);
-                auto child_seq = reconstruct_sequence(tree, child_idx, ref);
-                total_nll +=
-                    -ml_log_likelihood(model, parent_seq, child_seq);
-              }
-            },
-            ev);
-        stack.push_back(child_idx);
-      }
-    }
+  // Walk src → lca: every node on this path has its parent edge changed.
+  auto cur = move.src;
+  while (cur != move.lca) {
+    affected.insert(cur);
+    auto pe = get_parent_edges(tree, cur);
+    if (pe.empty()) break;
+    cur = get_parent_idx(tree, pe[0]);
   }
-  return total_nll;
+
+  // Walk dst → lca: same.
+  cur = move.dst;
+  while (cur != move.lca) {
+    affected.insert(cur);
+    auto pe = get_parent_edges(tree, cur);
+    if (pe.empty()) break;
+    cur = get_parent_idx(tree, pe[0]);
+  }
+
+  return affected;
 }
 
-// Compute delta ML score for an SPR move: old_NLL - new_NLL.
-// Positive means the move improved the likelihood (new tree has lower NLL).
-// The fragment contains the new topology; the original tree provides old edges.
+// Compute NLL for a single edge given parent/child node indices in a tree.
+inline double compute_edge_nll(ml_model const& model, phylo_dag& tree,
+                               std::size_t parent_idx,
+                               std::size_t child_idx) {
+  auto const& ref = get_reference_sequence(tree);
+  auto parent_seq = reconstruct_sequence(tree, parent_idx, ref);
+  auto child_seq = reconstruct_sequence(tree, child_idx, ref);
+  return -ml_log_likelihood(model, parent_seq, child_seq);
+}
+
+// Compute delta ML score for an SPR move by scoring only the changed edges.
+//
+// Identifies nodes on the src→lca and dst→lca paths in the original tree.
+// For each such node, scores the parent edge before and after the move.
+// Returns old_NLL - new_NLL (positive = move improved likelihood).
+//
+// The fragment contains the new topology with Fitch-assigned CGs.
+// The original_tree provides the old edge topology.
 inline double compute_delta_ml_score(ml_model const& model,
                                      phylo_dag& original_tree,
                                      phylo_dag& fragment,
                                      spr_move const& move) {
+  auto affected = collect_affected_nodes(original_tree, move);
+  if (affected.empty()) return 0.0;
+
+  auto const& ref = get_reference_sequence(original_tree);
+
+  // Old NLL: score parent edges of affected nodes in original tree.
+  double old_nll = 0.0;
+  for (auto nidx : affected) {
+    auto pe = get_parent_edges(original_tree, nidx);
+    if (pe.empty()) continue;
+    auto parent_idx = get_parent_idx(original_tree, pe[0]);
+    if (is_ua(original_tree, parent_idx)) continue;
+    old_nll += compute_edge_nll(model, original_tree, parent_idx, nidx);
+  }
+
+  // New NLL: score all non-UA edges in the fragment.
+  // The fragment is the full affected subtree with new topology, so this
+  // captures all new edges including the new inner node created by the SPR.
   double new_nll = compute_dag_ml_nll(model, fragment);
-  double old_nll = compute_subtree_ml_nll(model, original_tree, move.lca);
+
   return old_nll - new_nll;
 }
 
@@ -118,5 +147,32 @@ inline double compute_fragment_ml_score(ml_model const& model,
                                         phylo_dag& fragment) {
   return compute_dag_ml_nll(model, fragment);
 }
+
+// ============================================================================
+// MLScoringConfig: encapsulates ML model + coefficient for move scoring.
+// ============================================================================
+
+struct ml_scoring_config {
+  ml_model* model = nullptr;
+  double coeff = 0.0;
+
+  // Adjust a parsimony-based score with ML delta LL.
+  // base_score: parsimony score (lower = better).
+  // original_tree: the tree before the SPR move.
+  // fragment: the post-move subtree DAG.
+  // move: the SPR move that produced the fragment.
+  //
+  // Returns: base_score - coeff * delta_LL
+  // When delta_LL > 0 (move improved ML), effective score decreases.
+  double adjust_score(double base_score, phylo_dag& original_tree,
+                      phylo_dag& fragment, spr_move const& move) const {
+    if (model != nullptr && coeff != 0.0) {
+      double delta_ll =
+          compute_delta_ml_score(*model, original_tree, fragment, move);
+      return base_score - coeff * delta_ll;
+    }
+    return base_score;
+  }
+};
 
 }  // namespace larch

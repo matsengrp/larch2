@@ -143,6 +143,47 @@ void test_delta_ml_score() {
                frag_nll);
 }
 
+void test_ml_scoring_config_adjust_score() {
+  auto model = load_ml_model("data/bcr", "s5f");
+  auto tree = make_test_tree();
+
+  auto& pool = thread_pool::get_default();
+  tree_index idx{tree, pool};
+  move_enumerator enumerator{idx, -1};
+
+  std::vector<profitable_move> moves;
+  for (auto src : idx.get_searchable_nodes()) {
+    enumerator.find_moves_for_source(
+        src, 10, [&](profitable_move const& mv) { moves.push_back(mv); });
+  }
+  if (moves.empty()) {
+    std::println("  ml_scoring_config adjust_score: SKIP");
+    return;
+  }
+
+  auto& mv = moves[0];
+  spr_move sm{.src = mv.src,
+              .dst = mv.dst,
+              .lca = mv.lca,
+              .score_change = mv.score_change};
+  auto frag = apply_spr_as_fragment(tree, sm);
+
+  // With coeff=0: adjust_score returns base_score unchanged.
+  ml_scoring_config cfg_off{.model = nullptr, .coeff = 0.0};
+  double base = static_cast<double>(mv.score_change);
+  assert(cfg_off.adjust_score(base, tree, frag, sm) == base);
+
+  // With coeff>0: adjust_score modifies the score.
+  ml_scoring_config cfg_on{.model = &model, .coeff = 1.0};
+  double adjusted = cfg_on.adjust_score(base, tree, frag, sm);
+  assert(std::isfinite(adjusted));
+  // The ML adjustment should change the score (delta_LL != 0 for a real move).
+  // (May coincidentally equal base if delta_LL is exactly 0, but very unlikely.)
+
+  std::println("  ml_scoring_config adjust_score: OK (base={:.4f} adj={:.4f})",
+               base, adjusted);
+}
+
 void test_blended_scoring_zero_ml_matches_parsimony() {
   auto model = load_ml_model("data/bcr", "s5f");
   auto tree = make_test_tree();
@@ -157,16 +198,16 @@ void test_blended_scoring_zero_ml_matches_parsimony() {
         src, 10, [&](profitable_move const& mv) { moves.push_back(mv); });
   }
 
-  // With ml_coeff=0, blended score == pscore_coeff * parsimony_change
+  // With coeff=0, adjust_score is identity → matches pure parsimony.
+  ml_scoring_config cfg{.model = &model, .coeff = 0.0};
   for (auto& mv : moves) {
     spr_move sm{.src = mv.src,
                 .dst = mv.dst,
                 .lca = mv.lca,
                 .score_change = mv.score_change};
     auto frag = apply_spr_as_fragment(tree, sm);
-    double delta = compute_delta_ml_score(model, tree, frag, sm);
-    double blended = 1.0 * mv.score_change - 0.0 * delta;
-    assert(blended == static_cast<double>(mv.score_change));
+    double base = static_cast<double>(mv.score_change);
+    assert(cfg.adjust_score(base, tree, frag, sm) == base);
   }
   std::println("  blended zero-ml matches parsimony: OK");
 }
@@ -188,6 +229,7 @@ int main() {
   test_load_ml_model_cnn();
   test_ml_log_likelihood_via_variant();
   test_delta_ml_score();
+  test_ml_scoring_config_adjust_score();
   test_blended_scoring_zero_ml_matches_parsimony();
   test_adjust_rate_bias_via_variant();
   std::println("All nn_blended_spr tests passed");

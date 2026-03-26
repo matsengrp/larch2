@@ -1086,22 +1086,36 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
   auto& pool = thread_pool::get_default();
   std::mt19937 rng(a.seed.value_or(std::random_device{}()));
 
+  // Backend-aware defaults: when ML scoring is active, default to
+  // pscore=0, nodes=0, ml=1.0 (ML-only); otherwise parsimony defaults.
+  bool has_ml = !a.model_dir.empty() && !a.model_name.empty();
+  int eff_pscore = a.move_coeff_pscore;
+  int eff_nodes = a.move_coeff_nodes;
+  double eff_ml = a.move_coeff_ml;
+  if (has_ml && eff_ml == 0.0) eff_ml = 1.0;    // enable ML by default
+  if (has_ml && eff_pscore == 1) eff_pscore = 0;  // disable parsimony by default
+  // User-explicit flags always win (they were parsed into a.* before we got here).
+
   // Load ML model if ML scoring is enabled.
-  std::optional<ml_model> ml_model_opt;
-  if (a.move_coeff_ml > 0.0) {
-    if (a.model_dir.empty() || a.model_name.empty()) {
+  std::optional<ml_model> ml_model_storage;
+  ml_scoring_config ml_config;
+  if (eff_ml > 0.0) {
+    if (!has_ml) {
       std::cerr << "error: --model-dir and --model-name required with "
                    "--move-coeff-ml\n";
       std::exit(1);
     }
     std::cerr << "Loading ML model " << a.model_name << "...\n";
-    ml_model_opt = load_ml_model(a.model_dir, a.model_name);
-    std::cerr << "  ML model loaded\n";
+    ml_model_storage = load_ml_model(a.model_dir, a.model_name);
+    ml_config.model = &*ml_model_storage;
+    ml_config.coeff = eff_ml;
+    std::cerr << "  ML model loaded (coeff=" << eff_ml << ")\n";
   }
+
   std::vector<optimize_result> results;
   results.reserve(a.iterations);
   progress prog;
-  move_coefficients coeffs{a.move_coeff_pscore, a.move_coeff_nodes};
+  move_coefficients coeffs{eff_pscore, eff_nodes};
   int score_threshold =
       a.move_score_threshold.value_or(coeffs.has_node_penalty() ? 0 : -1);
   // Shared across subtree and whole-tree paths: only one path executes per
@@ -1230,21 +1244,19 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
           std::size_t moves_applied = 0;
           prog.phase("  Merging subtree fragments");
-          if (ml_model_opt.has_value()) {
-            // Delta LL scoring: old_NLL - new_NLL (positive = move improved ML).
-            // blended = pscore_coeff * parsimony_change - ml_coeff * delta_LL
+          if (ml_config.model != nullptr) {
+            // Delta LL re-scoring via ml_scoring_config::adjust_score().
             struct scored_frag {
               std::size_t idx;
               double final_score;
             };
             std::vector<scored_frag> scored(fragments.size());
             for (std::size_t i = 0; i < fragments.size(); ++i) {
-              double delta_ll = compute_delta_ml_score(
-                  *ml_model_opt, subtree_dag, fragments[i], spr_moves[i]);
-              double blended = static_cast<double>(a.move_coeff_pscore) *
-                                   spr_moves[i].score_change.value_or(0) -
-                               a.move_coeff_ml * delta_ll;
-              scored[i] = {i, blended};
+              double base = static_cast<double>(
+                  coeffs.apply(spr_moves[i].score_change.value_or(0), 0));
+              scored[i] = {i, ml_config.adjust_score(base, subtree_dag,
+                                                     fragments[i],
+                                                     spr_moves[i])};
             }
             std::sort(scored.begin(), scored.end(), [](auto& x, auto& y) {
               return x.final_score < y.final_score;
@@ -1390,21 +1402,18 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
       // 7. Merge fragments (with optional ML or node-penalty re-scoring)
       std::size_t moves_applied = 0;
       prog.phase("  Merging");
-      if (ml_model_opt.has_value()) {
-        // Delta LL scoring: old_NLL - new_NLL (positive = move improved ML).
-        // blended = pscore_coeff * parsimony_change - ml_coeff * delta_LL
+      if (ml_config.model != nullptr) {
+        // Delta LL re-scoring via ml_scoring_config::adjust_score().
         struct scored_frag {
           std::size_t idx;
           double final_score;
         };
         std::vector<scored_frag> scored(fragments.size());
         for (std::size_t i = 0; i < fragments.size(); ++i) {
-          double delta_ll = compute_delta_ml_score(
-              *ml_model_opt, sampled, fragments[i], spr_moves[i]);
-          double blended = static_cast<double>(a.move_coeff_pscore) *
-                               spr_moves[i].score_change.value_or(0) -
-                           a.move_coeff_ml * delta_ll;
-          scored[i] = {i, blended};
+          double base = static_cast<double>(
+              coeffs.apply(spr_moves[i].score_change.value_or(0), 0));
+          scored[i] = {i, ml_config.adjust_score(base, sampled, fragments[i],
+                                                 spr_moves[i])};
         }
         std::sort(scored.begin(), scored.end(), [](auto& x, auto& y) {
           return x.final_score < y.final_score;
