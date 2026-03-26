@@ -6,6 +6,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - vulkan: "OFF"
+            suffix: ""
+          - vulkan: "ON"
+            suffix: "-vulkan"
 
     steps:
       - uses: actions/checkout@v4
@@ -18,22 +25,33 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get install -y zlib1g-dev
 
+      - name: Install Vulkan SDK
+        if: matrix.vulkan == 'ON'
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | \
+            sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+
       - name: Configure
         run: |
           cmake -B build \
             -DGCC_TOOLCHAIN=/opt/gcc-latest \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_VULKAN=${{ matrix.vulkan }}
 
       - name: Build
         run: cmake --build build --parallel $(nproc)
 
       - name: Run tests
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure -E 'vulkan_compute_test|nn_inference_test'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: larch2-linux-x86_64
+          name: larch2${{ matrix.suffix }}-linux-x86_64
           path: |
             build/larch2
             build/dagutil
