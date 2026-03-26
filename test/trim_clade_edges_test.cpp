@@ -1,5 +1,6 @@
 #include <larch/compute.hpp>
 #include <larch/load_proto_dag.hpp>
+#include <larch/merge.hpp>
 #include <larch/subtree_weight.hpp>
 
 #include <cassert>
@@ -296,6 +297,41 @@ static void test_fluC_PB2_10taxa() {
   std::println("  PASS");
 }
 
+// Verify that merge::get_result() returns a DAG where min-weight sampling
+// always produces trees with the correct leaf count (i.e., inconsistent
+// clade edges were already trimmed inside get_result()).
+static void test_merge_get_result_trims_inconsistent() {
+  std::println("test_merge_get_result_trims_inconsistent");
+
+  // Load a DAG known to produce inconsistent edges after merge+SPR.
+  // We use one of the reproducer DAGs which was specifically crafted to
+  // have incomplete-leaf-set alternatives.
+  auto d = load_proto_dag("data/madag/fluC_PB2_7taxa.pb");
+  auto num_leaves = leaf_count(d);
+  auto ref = get_reference_sequence(d);
+
+  // Merge the DAG through the merge object (same path as larch2 optimizer).
+  merge m{ref};
+  m.add_dag(d);
+  auto& result = m.get_result();
+
+  // All min-weight sampled trees should have the full leaf count.
+  for (std::uint32_t seed = 0; seed < 50; ++seed) {
+    parsimony_score_ops pops;
+    subtree_weight<parsimony_score_ops> sw(result, seed);
+    auto tree = sw.min_weight_sample_tree(pops);
+    assert(is_tree(tree));
+    auto tree_leaves = leaf_count(tree);
+    if (tree_leaves != num_leaves) {
+      std::println("  FAIL: seed {} produced tree with {} leaves (expected {})",
+                   seed, tree_leaves, num_leaves);
+      assert(false);
+    }
+  }
+  std::println("  50 samples from merge result: all have {} leaves", num_leaves);
+  std::println("  PASS");
+}
+
 int main() {
   test_compute_subtree_leaves();
   test_trim_removes_bad_edge();
@@ -306,6 +342,7 @@ int main() {
   test_trim_then_sample();
   test_fluC_PB2_7taxa();
   test_fluC_PB2_10taxa();
+  test_merge_get_result_trims_inconsistent();
 
   std::println("All trim_clade_edges tests passed!");
   return 0;

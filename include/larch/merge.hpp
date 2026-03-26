@@ -666,6 +666,14 @@ class merge {
     if (!result_built_) {
       result_dag_ = phylo_dag{};
       build_result();
+      // SPR fragment merging can create clade alternatives whose subtrees are
+      // missing leaves (orphan reconnection may attach a fragment covering
+      // only a subset of a clade's leaves).  These incomplete alternatives
+      // produce artificially low edge-mutation counts that mislead
+      // compute_weight_below and min_weight_sample_tree — the sampled "tree"
+      // may have fewer leaves than the DAG.  Trim them immediately so every
+      // caller sees a structurally valid DAG.
+      trim_inconsistent_clade_edges(result_dag_);
     }
     return result_dag_;
   }
