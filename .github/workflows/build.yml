@@ -54,4 +54,5 @@ jobs:
           name: larch2${{ matrix.suffix }}-linux-x86_64
           path: |
             build/larch2
+            build/larch2-bcr
             build/dagutil
