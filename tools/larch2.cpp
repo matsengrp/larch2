@@ -349,7 +349,7 @@ Output (required):
 
 Optimization:
   -n, --iterations <N>    Number of optimization iterations (default: 10)
-  --patience <P>          Stop after P consecutive zero-merge iterations (P >= 1)
+  --patience <P>          Stop after P consecutive iterations with no DAG growth (P >= 1)
   --optimizer <name>      "native" (default) or "random"
   --max-moves <N>         Max moves per iteration for native (default: 50)
   --seed <N>              Random seed
