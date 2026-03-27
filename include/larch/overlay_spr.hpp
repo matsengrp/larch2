@@ -5,6 +5,7 @@
 #include <larch/native_optimize.hpp>
 #include <larch/spr_move.hpp>
 
+#include <cassert>
 #include <functional>
 #include <memory_resource>
 #include <unordered_map>
@@ -74,6 +75,21 @@ std::size_t child_count_of(Dag& d, std::size_t node_idx) {
       },
       nv);
   return count;
+}
+
+template <typename Dag>
+std::pmr::vector<std::size_t> get_child_edges_of(
+    Dag& d, std::size_t node_idx, std::pmr::memory_resource* mr) {
+  std::pmr::vector<std::size_t> result(mr);
+  auto nv = d.get_node(node_idx);
+  std::visit(
+      [&](auto node) {
+        for (auto ev : node.get_children()) {
+          std::visit([&](auto edge) { result.push_back(edge.index()); }, ev);
+        }
+      },
+      nv);
+  return result;
 }
 
 }  // namespace overlay_detail
@@ -192,10 +208,15 @@ inline std::size_t apply_spr_topology(
 
   // Determine fragment root:
   // If LCA was collapsed (src_parent == lca and was binary), use grandparent.
-  // But if grandparent is UA, use the remaining child (it's the new tree root).
+  // But if grandparent is UA, find UA's actual child in the overlay — the SPR
+  // may have created a new inner node that is now the tree root.  Returning
+  // remaining_child_after_collapse would miss the new inner node and the
+  // moved source, producing an incomplete fragment.
   if (src_parent_collapsed && src_parent == lca) {
     if (is_ua(base, grandparent)) {
-      return remaining_child_after_collapse;
+      auto ua_children = overlay_detail::get_child_edges_of(ov, grandparent, mr);
+      assert(!ua_children.empty());
+      return overlay_detail::get_child_idx_of(ov, ua_children[0]);
     }
     return grandparent;
   }

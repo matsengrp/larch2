@@ -470,6 +470,113 @@ static void test_optimize_dag_v2_on_proto_data() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9: UA-grandparent fragment root captures full tree
+// ---------------------------------------------------------------------------
+//
+// Regression test for the fragment_root determination bug.  When the LCA
+// equals the tree root (binary, child of UA) and collapses during the SPR,
+// the old code returned remaining_child_after_collapse, producing a fragment
+// that missed the new inner node and the moved source.  The fix returns
+// UA's actual child after the full SPR topology change.
+//
+// Tree:
+//     UA
+//      |
+//    root
+//    /   \
+//  leafA  P
+//        / \
+//     leafB leafC
+//
+// SPR: src=leafA, dst=P  →  root collapses, new inner X between UA and P.
+//
+//     UA
+//      |
+//      X (new)
+//     / \
+//    P   leafA
+//   / \
+// leafB leafC
+//
+// Old fragment root = P (missed X and leafA).
+// Fixed fragment root = X (captures the whole tree).
+
+static void test_ua_grandparent_fragment_root() {
+  std::println("test_ua_grandparent_fragment_root");
+
+  constexpr std::string_view ref = "AAAA";
+  phylo_dag tree;
+
+  auto ua = tree.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  tree.set_root(ua);
+
+  auto root = tree.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAAA", ref);
+
+  auto leafA = tree.append_node<node_kind::leaf>();
+  leafA.cg() = cg_from_sequence("TAAA", ref);
+  leafA.sample_id() = "leafA";
+
+  auto P = tree.append_node<node_kind::inner>();
+  P.cg() = cg_from_sequence("ACAA", ref);
+
+  auto leafB = tree.append_node<node_kind::leaf>();
+  leafB.cg() = cg_from_sequence("ACGA", ref);
+  leafB.sample_id() = "leafB";
+
+  auto leafC = tree.append_node<node_kind::leaf>();
+  leafC.cg() = cg_from_sequence("ACAG", ref);
+  leafC.sample_id() = "leafC";
+
+  add_edge(tree, ua.index(), root.index(), 0);
+  add_edge(tree, root.index(), leafA.index(), 0);
+  add_edge(tree, root.index(), P.index(), 1);
+  add_edge(tree, P.index(), leafB.index(), 0);
+  add_edge(tree, P.index(), leafC.index(), 1);
+
+  recompute_edge_mutations(tree);
+  auto original_leaves = get_leaf_ids(tree);
+  assert(original_leaves.size() == 3);
+
+  // SPR: move leafA to be sibling of P  (LCA = root, root collapses)
+  auto lca = compute_lca(tree, leafA.index(), P.index());
+  assert(lca == root.index());
+
+  auto fragment = apply_spr_as_fragment(
+      tree, spr_move{.src = leafA.index(), .dst = P.index(), .lca = lca});
+
+  verify_is_tree(fragment);
+  auto frag_leaves = get_leaf_ids(fragment);
+
+  std::println("  fragment: {} nodes, {} edges, {} leaves",
+               node_count(fragment), edge_count(fragment), frag_leaves.size());
+
+  // The fragment must contain ALL leaves of the original tree.
+  assert(frag_leaves == original_leaves);
+
+  // Merge and verify no trim is needed.
+  merge m(std::string{ref});
+  m.add_dag(tree);
+  m.add_dag(std::move(fragment));
+  auto& result = m.get_result();
+
+  auto result_leaves = get_leaf_ids(result);
+  assert(result_leaves == original_leaves);
+
+  // Verify all sampled trees have the correct leaf count.
+  for (std::uint32_t seed = 0; seed < 20; ++seed) {
+    parsimony_score_ops pops;
+    subtree_weight<parsimony_score_ops> sw(result, seed);
+    auto sampled = sw.min_weight_sample_tree(pops);
+    assert(is_tree(sampled));
+    assert(get_leaf_ids(sampled) == original_leaves);
+  }
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -484,6 +591,7 @@ int main() {
   test_optimize_dag_v2_equivalent();
   test_optimize_dag_v2_deterministic();
   test_optimize_dag_v2_on_proto_data();
+  test_ua_grandparent_fragment_root();
 
   std::println("All SPR pipeline tests passed!");
   return 0;
