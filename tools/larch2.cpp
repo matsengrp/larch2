@@ -349,7 +349,7 @@ Output (required):
 
 Optimization:
   -n, --iterations <N>    Number of optimization iterations (default: 10)
-  --patience <P>          Stop early after P consecutive zero-merge iterations
+  --patience <P>          Stop after P consecutive zero-merge iterations (P >= 1)
   --optimizer <name>      "native" (default) or "random"
   --max-moves <N>         Max moves per iteration for native (default: 50)
   --seed <N>              Random seed
@@ -489,8 +489,14 @@ static args parse_args(int argc, char** argv) {
       a.move_coeff_nodes = std::stoi(std::string{next()});
     else if (arg == "--move-score-threshold")
       a.move_score_threshold = std::stoi(std::string{next()});
-    else if (arg == "--patience")
-      a.patience = std::stoull(std::string{next()});
+    else if (arg == "--patience") {
+      auto p = std::stoull(std::string{next()});
+      if (p == 0) {
+        std::cerr << "error: --patience must be >= 1\n";
+        std::exit(1);
+      }
+      a.patience = p;
+    }
     else if (arg == "--version") {
       std::cerr << "larch2 " << larch::version << " (" << larch::git_commit
                 << ")\n";
@@ -1050,6 +1056,16 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
   int score_threshold =
       a.move_score_threshold.value_or(coeffs.has_node_penalty() ? 0 : -1);
   std::size_t consecutive_zero_merges = 0;
+  auto check_patience = [&](std::size_t merges) -> bool {
+    if (!a.patience) return false;
+    consecutive_zero_merges = (merges == 0) ? consecutive_zero_merges + 1 : 0;
+    if (consecutive_zero_merges >= *a.patience) {
+      std::cerr << "Early stopping: no new merges for " << *a.patience
+                << " consecutive iterations\n";
+      return true;
+    }
+    return false;
+  };
 
   for (std::size_t iter = 0; iter < a.iterations; ++iter) {
     std::cerr << "Iteration " << (iter + 1) << "/" << a.iterations << ":\n";
@@ -1218,15 +1234,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             .parsimony_score = min_score,
             .radii = std::move(radii_results),
         });
-        if (a.patience.has_value()) {
-          consecutive_zero_merges =
-              (total_trees_merged == 0) ? consecutive_zero_merges + 1 : 0;
-          if (consecutive_zero_merges >= a.patience.value()) {
-            std::cerr << "Early stopping: no new merges for "
-                      << a.patience.value() << " consecutive iterations\n";
-            return results;
-          }
-        }
+        if (check_patience(total_trees_merged)) return results;
         continue;  // skip whole-tree path below
       }
     }
@@ -1387,15 +1395,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         .parsimony_score = min_score,
         .radii = std::move(radii_results),
     });
-    if (a.patience.has_value()) {
-      consecutive_zero_merges =
-          (total_trees_merged == 0) ? consecutive_zero_merges + 1 : 0;
-      if (consecutive_zero_merges >= a.patience.value()) {
-        std::cerr << "Early stopping: no new merges for "
-                  << a.patience.value() << " consecutive iterations\n";
-        return results;
-      }
-    }
+    if (check_patience(total_trees_merged)) return results;
   }
 
   return results;
@@ -1412,13 +1412,25 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
   results.reserve(a.iterations);
   progress prog;
   std::size_t consecutive_zero_merges = 0;
+  auto check_patience = [&](std::size_t merges) -> bool {
+    if (!a.patience) return false;
+    consecutive_zero_merges = (merges == 0) ? consecutive_zero_merges + 1 : 0;
+    if (consecutive_zero_merges >= *a.patience) {
+      std::cerr << "Early stopping: no new merges for " << *a.patience
+                << " consecutive iterations\n";
+      return true;
+    }
+    return false;
+  };
 
   for (std::size_t iter = 0; iter < a.iterations; ++iter) {
     std::cerr << "Iteration " << (iter + 1) << "/" << a.iterations << ":\n";
 
     prog.phase("Building merged DAG");
     auto& dag = m.get_result();
-    prog.done(std::to_string(m.result_node_count()) + " nodes");
+    auto nodes_before = m.result_node_count();
+    auto edges_before = m.result_edge_count();
+    prog.done(std::to_string(nodes_before) + " nodes");
 
     if (a.log_metrics) {
       std::uint32_t metrics_seed = rng();
@@ -1443,30 +1455,26 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
     prog.phase("Merging");
     for (auto& t : new_trees) m.add_dag(t);
     m.add_dag(sampled);
-    prog.done(std::to_string(m.result_node_count()) + " nodes, " +
-              std::to_string(m.result_edge_count()) + " edges");
+    auto nodes_after = m.result_node_count();
+    auto edges_after = m.result_edge_count();
+    prog.done(std::to_string(nodes_after) + " nodes, " +
+              std::to_string(edges_after) + " edges");
     if (a.validate)
       validate_dag(m.get_result(),
                    "random iteration " + std::to_string(iter + 1) + " merge",
                    thread_pool::get_default());
 
-    std::size_t trees_merged = new_trees.size();
+    // Use DAG growth as convergence signal: random SPR always generates
+    // candidates, but only novel topologies grow the DAG.
+    bool dag_grew = (nodes_after != nodes_before || edges_after != edges_before);
     results.push_back(optimize_result{
         .iteration = iter,
-        .dag_node_count = m.result_node_count(),
-        .dag_edge_count = m.result_edge_count(),
-        .trees_merged = trees_merged,
+        .dag_node_count = nodes_after,
+        .dag_edge_count = edges_after,
+        .trees_merged = new_trees.size(),
         .parsimony_score = min_score,
     });
-    if (a.patience.has_value()) {
-      consecutive_zero_merges =
-          (trees_merged == 0) ? consecutive_zero_merges + 1 : 0;
-      if (consecutive_zero_merges >= a.patience.value()) {
-        std::cerr << "Early stopping: no new merges for "
-                  << a.patience.value() << " consecutive iterations\n";
-        return results;
-      }
-    }
+    if (check_patience(dag_grew ? 1 : 0)) return results;
   }
 
   return results;
