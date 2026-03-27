@@ -1047,7 +1047,7 @@ static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed) {
 // ---------------------------------------------------------------------------
 
 struct patience_checker {
-  std::optional<std::size_t> const& limit;
+  std::optional<std::size_t> limit;
   std::size_t count = 0;
 
   bool operator()(std::size_t activity) {
