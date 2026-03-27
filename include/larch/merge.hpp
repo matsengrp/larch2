@@ -674,6 +674,7 @@ class merge {
       // may have fewer leaves than the DAG.  Trim them immediately so every
       // caller sees a structurally valid DAG.
       trim_inconsistent_clade_edges(result_dag_);
+      build_clade_offsets(result_dag_);
     }
     return result_dag_;
   }

@@ -164,10 +164,33 @@ inline bool is_leaf(phylo_dag& d, std::size_t node_idx) {
       nv);
 }
 
+// Build CSR-style clade offsets for all nodes.
+// Must be called after all edges have their clade_index set and before
+// get_clades() is used in performance-critical paths.
+inline void build_clade_offsets(phylo_dag& d) {
+  d.build_all_clade_offsets([&d](std::size_t edge_idx) -> std::size_t {
+    return d.get_edge_as<edge_kind::clade>(edge_idx).clade_index();
+  });
+}
+
 // Groups a node's child edges by clade_index.
 // Returns vector where result[i] = edge indices for clade i.
+// When clade offsets have been built via build_clade_offsets(), this reads
+// directly from the pre-sorted children section (no annotation lookups).
 inline auto get_clades(phylo_dag& d, std::size_t node_idx)
     -> std::vector<std::vector<std::size_t>> {
+  auto nc = d.clade_count(node_idx);
+  if (nc > 0) {
+    // Fast path: read from CSR clade offsets
+    std::vector<std::vector<std::size_t>> clades(nc);
+    for (std::size_t ci = 0; ci < nc; ++ci) {
+      auto sec = d.clade_section(node_idx, ci);
+      clades[ci].reserve(sec.size());
+      for (auto edge_idx : sec) clades[ci].push_back(edge_idx);
+    }
+    return clades;
+  }
+  // Slow path: scan edge annotations
   std::vector<std::vector<std::size_t>> clades;
   auto nv = d.get_node(node_idx);
   std::visit(
@@ -189,6 +212,19 @@ inline auto get_clades(phylo_dag& d, std::size_t node_idx)
 inline auto get_clades(phylo_dag& d, std::size_t node_idx,
                        std::pmr::memory_resource* mr)
     -> std::pmr::vector<std::pmr::vector<std::size_t>> {
+  auto nc = d.clade_count(node_idx);
+  if (nc > 0) {
+    // Fast path: read from CSR clade offsets
+    std::pmr::vector<std::pmr::vector<std::size_t>> clades(mr);
+    clades.resize(nc, std::pmr::vector<std::size_t>(mr));
+    for (std::size_t ci = 0; ci < nc; ++ci) {
+      auto sec = d.clade_section(node_idx, ci);
+      clades[ci].reserve(sec.size());
+      for (auto edge_idx : sec) clades[ci].push_back(edge_idx);
+    }
+    return clades;
+  }
+  // Slow path: scan edge annotations
   std::pmr::vector<std::pmr::vector<std::size_t>> clades(mr);
   auto nv = d.get_node(node_idx);
   std::visit(
