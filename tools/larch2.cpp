@@ -1043,6 +1043,26 @@ static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed) {
 }
 
 // ---------------------------------------------------------------------------
+// Patience-based early stopping
+// ---------------------------------------------------------------------------
+
+struct patience_checker {
+  std::optional<std::size_t> const& limit;
+  std::size_t count = 0;
+
+  bool operator()(std::size_t activity) {
+    if (!limit) return false;
+    count = (activity == 0) ? count + 1 : 0;
+    if (count >= *limit) {
+      std::cerr << "Early stopping: no DAG growth for " << *limit
+                << " consecutive iterations\n";
+      return true;
+    }
+    return false;
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Native optimizer loop with progress
 // ---------------------------------------------------------------------------
 
@@ -1055,17 +1075,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
   move_coefficients coeffs{a.move_coeff_pscore, a.move_coeff_nodes};
   int score_threshold =
       a.move_score_threshold.value_or(coeffs.has_node_penalty() ? 0 : -1);
-  std::size_t consecutive_zero_merges = 0;
-  auto check_patience = [&](std::size_t merges) -> bool {
-    if (!a.patience) return false;
-    consecutive_zero_merges = (merges == 0) ? consecutive_zero_merges + 1 : 0;
-    if (consecutive_zero_merges >= *a.patience) {
-      std::cerr << "Early stopping: no new merges for " << *a.patience
-                << " consecutive iterations\n";
-      return true;
-    }
-    return false;
-  };
+  // Shared across subtree and whole-tree paths: only one path executes per
+  // iteration (the subtree path ends with `continue`), so the counter
+  // reflects whichever path ran.
+  patience_checker patience{a.patience};
 
   for (std::size_t iter = 0; iter < a.iterations; ++iter) {
     std::cerr << "Iteration " << (iter + 1) << "/" << a.iterations << ":\n";
@@ -1234,7 +1247,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             .parsimony_score = min_score,
             .radii = std::move(radii_results),
         });
-        if (check_patience(total_trees_merged)) return results;
+        if (patience(total_trees_merged)) return results;
         continue;  // skip whole-tree path below
       }
     }
@@ -1395,7 +1408,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         .parsimony_score = min_score,
         .radii = std::move(radii_results),
     });
-    if (check_patience(total_trees_merged)) return results;
+    if (patience(total_trees_merged)) return results;
   }
 
   return results;
@@ -1411,17 +1424,7 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
   std::vector<optimize_result> results;
   results.reserve(a.iterations);
   progress prog;
-  std::size_t consecutive_zero_merges = 0;
-  auto check_patience = [&](std::size_t merges) -> bool {
-    if (!a.patience) return false;
-    consecutive_zero_merges = (merges == 0) ? consecutive_zero_merges + 1 : 0;
-    if (consecutive_zero_merges >= *a.patience) {
-      std::cerr << "Early stopping: no new merges for " << *a.patience
-                << " consecutive iterations\n";
-      return true;
-    }
-    return false;
-  };
+  patience_checker patience{a.patience};
 
   for (std::size_t iter = 0; iter < a.iterations; ++iter) {
     std::cerr << "Iteration " << (iter + 1) << "/" << a.iterations << ":\n";
@@ -1474,7 +1477,7 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
         .trees_merged = new_trees.size(),
         .parsimony_score = min_score,
     });
-    if (check_patience(dag_grew ? 1 : 0)) return results;
+    if (patience(dag_grew ? 1 : 0)) return results;
   }
 
   return results;
