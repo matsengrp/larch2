@@ -78,6 +78,12 @@ class extend_dag
   auto s_parents_section(std::size_t node_idx) {
     return base_.parents_section(node_idx);
   }
+  auto s_clade_section(std::size_t node_idx, std::size_t clade_i) {
+    return base_.clade_section(node_idx, clade_i);
+  }
+  std::size_t s_clade_count(std::size_t node_idx) const {
+    return base_.clade_count(node_idx);
+  }
 
   void s_link_child(std::size_t node_idx, std::size_t edge_idx) {
     base_.link_child(node_idx, edge_idx);
@@ -109,6 +115,13 @@ class extend_dag
   }
   void s_dealloc_neighbors(std::size_t start, std::size_t count) {
     base_.dealloc_neighbors(start, count);
+  }
+  void s_dealloc_clade_offsets(std::size_t start, std::size_t count) {
+    base_.dealloc_clade_offsets(start, count);
+  }
+  template <typename F>
+  void s_build_all_clade_offsets(F&& get_edge_clade_idx) {
+    base_.build_all_clade_offsets(std::forward<F>(get_edge_clade_idx));
   }
 
   auto& s_node_topos() { return base_.node_topos(); }

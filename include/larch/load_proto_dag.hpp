@@ -239,6 +239,7 @@ inline phylo_dag load_proto_dag(std::string_view path) {
     }
   }
 
+  build_clade_offsets(d);
   return d;
 }
 

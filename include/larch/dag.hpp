@@ -4,6 +4,8 @@
 #include <larch/common.hpp>
 #include <larch/chain.hpp>
 
+#include <algorithm>
+#include <cassert>
 #include <concepts>
 #include <optional>
 #include <ranges>
@@ -110,6 +112,8 @@ struct node_topology {
   std::size_t parents_count_;
   std::size_t children_start_;
   std::size_t children_count_;
+  std::size_t clade_offsets_start_ = no_idx;  // index into clade_offsets_ chain
+  std::size_t clade_count_ = 0;               // number of clades (offsets has count+1 entries)
   std::size_t annotation_index_;
 };
 
@@ -144,6 +148,8 @@ class node_view : public interface<V> {
   auto append_parent();
   auto get_children();
   auto get_parents();
+  auto get_clade(std::size_t clade_i);
+  std::size_t clade_count() const;
   void remove();
   std::size_t index() const { return index_; }
 
@@ -265,6 +271,11 @@ class dag_interface {
   auto get_edge(this auto& self, std::size_t idx) {
     return self.make_edge_variant(idx);
   }
+  template <auto V>
+  auto get_edge_as(this auto& self, std::size_t idx) {
+    using Self = std::remove_reference_t<decltype(self)>;
+    return edge_view<Self, V>{self, idx};
+  }
 
   std::size_t node_count(this auto& self) { return self.s_node_topos().size(); }
   std::size_t edge_count(this auto& self) { return self.s_edge_topos().size(); }
@@ -273,6 +284,27 @@ class dag_interface {
   }
   std::size_t edge_high_mark(this auto const& self) {
     return self.s_edge_high_mark();
+  }
+
+  // --- Clade-grouped children (CSR offsets into children section) ---
+
+  // Number of clades for this node (0 if offsets not built).
+  std::size_t clade_count(this auto const& self, std::size_t node_idx) {
+    return self.s_clade_count(node_idx);
+  }
+
+  // Contiguous section of edge indices for one clade.
+  // Requires clade offsets to have been built (clade_count > 0).
+  auto clade_section(this auto& self, std::size_t node_idx,
+                     std::size_t clade_i) {
+    return self.s_clade_section(node_idx, clade_i);
+  }
+
+  // Build CSR-style clade offsets for all nodes.
+  // F is called as get_edge_clade_idx(edge_idx) -> std::size_t.
+  template <typename F>
+  void build_all_clade_offsets(this auto& self, F&& get_edge_clade_idx) {
+    self.s_build_all_clade_offsets(std::forward<F>(get_edge_clade_idx));
   }
 
  private:
@@ -352,7 +384,10 @@ class dag_interface {
                          std::size_t count) {
     self.s_dealloc_neighbors(start, count);
   }
-
+  void dealloc_clade_offsets(this auto& self, std::size_t start,
+                             std::size_t count) {
+    self.s_dealloc_clade_offsets(start, count);
+  }
   // Factory for typed views (used by edge_view::get_child_as / get_parent_as)
   template <auto V>
   auto make_typed_node_view(this auto& self, std::size_t idx) {
@@ -415,6 +450,7 @@ class dag : public dag_interface<N, E> {
  private:
   index_type root_ = no_idx;
   chain<std::size_t> neighbors_;
+  chain<std::size_t> clade_offsets_;
   chain<node_topology<N>> node_topologies_;
   chain<edge_topology<E>> edge_topologies_;
   detail::annotation_tuple_from<node_enumerators> node_annotations_;
@@ -467,8 +503,76 @@ class dag : public dag_interface<N, E> {
         neighbors_, ntopo.parents_start_, ntopo.parents_count_};
   }
 
+  auto s_clade_section(std::size_t node_idx, std::size_t clade_i) {
+    auto& ntopo = node_topologies_[node_idx];
+    assert(ntopo.clade_count_ > 0 && clade_i < ntopo.clade_count_);
+    auto start_off = clade_offsets_[ntopo.clade_offsets_start_ + clade_i];
+    auto end_off = clade_offsets_[ntopo.clade_offsets_start_ + clade_i + 1];
+    return typename chain<std::size_t>::contiguous_section{
+        neighbors_, ntopo.children_start_ + start_off, end_off - start_off};
+  }
+
+  std::size_t s_clade_count(std::size_t node_idx) const {
+    return node_topologies_[node_idx].clade_count_;
+  }
+
+  void s_dealloc_clade_offsets(std::size_t start, std::size_t count) {
+    clade_offsets_.remove(start, count);
+  }
+
+  template <typename F>
+  void s_build_all_clade_offsets(F&& get_edge_clade_idx) {
+    for (auto& ntopo : node_topologies_) {
+      // Deallocate old offsets if any
+      if (ntopo.clade_count_ > 0) {
+        clade_offsets_.remove(ntopo.clade_offsets_start_,
+                              ntopo.clade_count_ + 1);
+        ntopo.clade_offsets_start_ = no_idx;
+        ntopo.clade_count_ = 0;
+      }
+      if (ntopo.children_count_ == 0) continue;
+
+      // Collect (clade_idx, edge_idx) pairs from children section
+      auto sec = typename chain<std::size_t>::contiguous_section{
+          neighbors_, ntopo.children_start_, ntopo.children_count_};
+      std::vector<std::pair<std::size_t, std::size_t>> pairs;
+      pairs.reserve(ntopo.children_count_);
+      for (std::size_t i = 0; i < sec.size(); ++i)
+        pairs.emplace_back(get_edge_clade_idx(sec[i]), sec[i]);
+
+      // Sort by clade index (stable to preserve order within clades)
+      std::stable_sort(pairs.begin(), pairs.end(),
+                       [](auto const& a, auto const& b) {
+                         return a.first < b.first;
+                       });
+
+      // Write back sorted edge indices
+      for (std::size_t i = 0; i < pairs.size(); ++i) sec[i] = pairs[i].second;
+
+      // Build CSR offsets
+      std::size_t num_clades = pairs.back().first + 1;
+      std::vector<std::size_t> offsets(num_clades + 1, 0);
+      for (auto const& [clade, _] : pairs) offsets[clade + 1]++;
+      for (std::size_t i = 1; i <= num_clades; ++i) offsets[i] += offsets[i - 1];
+
+      auto off_sec = clade_offsets_.move_range(std::move(offsets));
+      ntopo.clade_offsets_start_ = off_sec.start();
+      ntopo.clade_count_ = num_clades;
+    }
+  }
+
+  void s_invalidate_clade_offsets(node_topology<N>& ntopo) {
+    if (ntopo.clade_count_ > 0) {
+      clade_offsets_.remove(ntopo.clade_offsets_start_,
+                            ntopo.clade_count_ + 1);
+      ntopo.clade_offsets_start_ = no_idx;
+      ntopo.clade_count_ = 0;
+    }
+  }
+
   void s_link_child(std::size_t node_idx, std::size_t edge_idx) {
     auto& ntopo = node_topologies_[node_idx];
+    s_invalidate_clade_offsets(ntopo);
     auto sec = typename chain<std::size_t>::contiguous_section{
         neighbors_, ntopo.children_start_, ntopo.children_count_};
     sec = sec.emplace_back(edge_idx);
@@ -479,6 +583,7 @@ class dag : public dag_interface<N, E> {
   void s_unlink_child(std::size_t node_idx, std::size_t edge_idx) {
     auto& ntopo = node_topologies_[node_idx];
     if (ntopo.children_count_ == 0) return;
+    s_invalidate_clade_offsets(ntopo);
     auto sec = typename chain<std::size_t>::contiguous_section{
         neighbors_, ntopo.children_start_, ntopo.children_count_};
     for (std::size_t i = 0; i < sec.size(); ++i) {
@@ -527,6 +632,8 @@ class dag : public dag_interface<N, E> {
     topo.parents_count_ = 0;
     topo.children_start_ = no_idx;
     topo.children_count_ = 0;
+    topo.clade_offsets_start_ = no_idx;
+    topo.clade_count_ = 0;
     topo.annotation_index_ = ann_idx;
     auto topo_idx = node_topologies_.emplace(topo);
     node_topologies_[topo_idx].self_index_ = topo_idx;
@@ -551,6 +658,9 @@ class dag : public dag_interface<N, E> {
 
   void s_dealloc_node(std::size_t idx, N kind) {
     auto& ntopo = node_topologies_[idx];
+    if (ntopo.clade_count_ > 0)
+      clade_offsets_.remove(ntopo.clade_offsets_start_,
+                            ntopo.clade_count_ + 1);
     detail::enum_dispatch<node_enumerators>::call(kind, [&](auto v) {
       constexpr std::size_t I =
           node_enumerators::template index_of<decltype(v)::value>;
@@ -632,6 +742,21 @@ auto node_view<D, V>::get_parents() {
 
 template <typename D, auto V>
   requires Enum<decltype(V)>
+auto node_view<D, V>::get_clade(std::size_t clade_i) {
+  auto sec = dag_.clade_section(index_, clade_i);
+  return std::views::transform(std::move(sec), [this](auto& idx) {
+    return dag_.make_edge_variant(idx);
+  });
+}
+
+template <typename D, auto V>
+  requires Enum<decltype(V)>
+std::size_t node_view<D, V>::clade_count() const {
+  return dag_.clade_count(index_);
+}
+
+template <typename D, auto V>
+  requires Enum<decltype(V)>
 void node_view<D, V>::remove() {
   auto& ntopo = dag_.node_topo(index_);
 
@@ -658,6 +783,12 @@ void node_view<D, V>::remove() {
     dag_.dealloc_neighbors(ntopo.parents_start_, ntopo.parents_count_);
   if (ntopo.children_count_ > 0)
     dag_.dealloc_neighbors(ntopo.children_start_, ntopo.children_count_);
+  if (ntopo.clade_count_ > 0) {
+    dag_.dealloc_clade_offsets(ntopo.clade_offsets_start_,
+                               ntopo.clade_count_ + 1);
+    ntopo.clade_offsets_start_ = no_idx;
+    ntopo.clade_count_ = 0;
+  }
 
   dag_.dealloc_node(index_, ntopo.kind_);
 }

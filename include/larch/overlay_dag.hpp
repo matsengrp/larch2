@@ -51,6 +51,11 @@ class overlay_dag
     auto& dst = overlaid_nodes_[idx];
     dst = src;
 
+    // Invalidate clade offsets (overlay topology changes make them stale;
+    // base offsets reference the base's clade_offsets_ chain, not the overlay's)
+    dst.clade_offsets_start_ = no_idx;
+    dst.clade_count_ = 0;
+
     // Copy children neighbor list into overlay_neighbors_
     if (src.children_count_ > 0) {
       auto csec = base_.children_section(idx);
@@ -205,6 +210,26 @@ class overlay_dag
     return base_.parents_section(node_idx);
   }
 
+  auto s_clade_section(std::size_t node_idx, std::size_t clade_i) {
+    // Overlaid/added nodes have clade_count_==0; callers should not reach here.
+    // Non-overlaid base nodes delegate to the base's clade offsets.
+    assert(!overlaid_nodes_.contains(node_idx) && !is_added_node(node_idx));
+    return base_.clade_section(node_idx, clade_i);
+  }
+
+  std::size_t s_clade_count(std::size_t node_idx) const {
+    return s_node_topo(node_idx).clade_count_;
+  }
+
+  void s_dealloc_clade_offsets(std::size_t /*start*/, std::size_t /*count*/) {
+    // Overlay never owns clade offsets; dealloc is a no-op.
+  }
+
+  template <typename F>
+  void s_build_all_clade_offsets(F&&) {
+    // Clade offsets are not supported on overlay DAGs.
+  }
+
   void ensure_overlaid(std::size_t node_idx) {
     if (!overlaid_nodes_.contains(node_idx) && !is_added_node(node_idx))
       set_overlay_node(node_idx);
@@ -273,6 +298,8 @@ class overlay_dag
     topo.parents_count_ = 0;
     topo.children_start_ = no_idx;
     topo.children_count_ = 0;
+    topo.clade_offsets_start_ = no_idx;
+    topo.clade_count_ = 0;
     topo.annotation_index_ = 0;  // not used — annotations keyed by DAG index
 
     auto local_idx = added_nodes_.emplace(topo);

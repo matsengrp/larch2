@@ -239,6 +239,7 @@ inline phylo_dag load_parsimony_tree(std::string_view path,
         nv);
   }
 
+  build_clade_offsets(d);
   return d;
 }
 
