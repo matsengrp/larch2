@@ -1319,7 +1319,8 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
       parallel_with_progress(
           pool, spr_moves.size(),
           [&](std::size_t i) {
-            fragments[i] = apply_spr_as_fragment(sampled, spr_moves[i]);
+            fragments[i] =
+                apply_spr_move(sampled, spr_moves[i].src, spr_moves[i].dst);
           },
           prog);
 

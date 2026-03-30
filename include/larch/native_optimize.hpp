@@ -176,6 +176,7 @@ class tree_index {
   }
   std::size_t num_variable_sites() const { return num_variable_sites_; }
   std::size_t num_condensed_leaves() const { return condensed_count_; }
+  uint8_t const* get_ref_alleles_ptr() const { return ref_alleles_.data(); }
 
  private:
   static constexpr std::size_t kFitchParallelThreshold = 64;
@@ -448,11 +449,16 @@ class tree_index {
   }
 
   void compute_fitch_sets() {
+    auto const& ref = get_reference_sequence(d_);
     if (pool_ && subtree_size_[tree_root_] >= kFitchParallelThreshold) {
-      auto const& ref = get_reference_sequence(d_);
       sync_wait<void>(*pool_, fitch_bottom_up_async(tree_root_, ref));
     } else {
       fitch_bottom_up(tree_root_);
+    }
+    ref_alleles_.resize(num_variable_sites_);
+    for (std::size_t i = 0; i < num_variable_sites_; i++) {
+      auto base = nuc_base::from_char(ref.at(variable_sites_[i] - 1));
+      ref_alleles_[i] = base_to_one_hot(base);
     }
   }
 
@@ -476,6 +482,7 @@ class tree_index {
   std::vector<std::vector<std::size_t>> children_;
   std::vector<uint8_t> is_condensed_;
   std::vector<std::size_t> subtree_size_;
+  std::vector<uint8_t> ref_alleles_;
   std::size_t condensed_count_{0};
 };
 
@@ -648,6 +655,67 @@ class move_enumerator {
         total_score_change += new_cost - old_cost;
         new_fitch_map[node] = new_fitch;
       }
+
+      if (src_parent_is_binary) {
+        if (new_fitch_map.count(src_sibling)) {
+          new_fitch_map[lca] = new_fitch_map[src_sibling];
+        } else if (dst == src_sibling) {
+          new_fitch_map[lca] = new_node_fitch;
+        }
+      }
+
+      uint8_t root_old_f = index_.get_fitch_set(index_.get_tree_root(), si);
+      uint8_t root_new_f = root_old_f;
+
+      auto lca_new_it = new_fitch_map.find(lca);
+      if (lca_new_it != new_fitch_map.end()) {
+        if (lca == index_.get_tree_root()) {
+          root_new_f = lca_new_it->second;
+        } else {
+          uint8_t lca_orig = index_.get_fitch_set(lca, si);
+          if (lca_new_it->second != lca_orig) {
+            uint8_t prev_old_f = lca_orig;
+            uint8_t prev_new_f = lca_new_it->second;
+            auto above = index_.get_parent(lca);
+            while (true) {
+              if (!index_.has_child_counts(above)) break;
+
+              auto counts = index_.get_child_counts(above, si);
+              uint8_t nc = index_.get_num_children(above);
+              int old_cost_above = fitch_cost_from_counts(counts, nc);
+
+              for (int j = 0; j < 4; j++) {
+                if (prev_old_f & (1 << j)) {
+                  if (counts[j] > 0) counts[j]--;
+                }
+                if (prev_new_f & (1 << j)) counts[j]++;
+              }
+
+              int new_cost_above = fitch_cost_from_counts(counts, nc);
+              total_score_change += new_cost_above - old_cost_above;
+
+              uint8_t above_orig = index_.get_fitch_set(above, si);
+              uint8_t above_new = fitch_set_from_counts(counts, nc);
+              if (above_new == above_orig) break;
+
+              prev_old_f = above_orig;
+              prev_new_f = above_new;
+              if (above == index_.get_tree_root()) {
+                root_new_f = above_new;
+                break;
+              }
+              above = index_.get_parent(above);
+            }
+          }
+        }
+      }
+
+      if (root_old_f != root_new_f) {
+        uint8_t ref_a = index_.get_ref_alleles_ptr()[si];
+        int old_ua = (root_old_f & ref_a) ? 0 : 1;
+        int new_ua = (root_new_f & ref_a) ? 0 : 1;
+        total_score_change += new_ua - old_ua;
+      }
     }
 
     return total_score_change;
@@ -771,6 +839,8 @@ class move_enumerator {
         cur = index_.get_parent(cur);
       }
       nodes_remaining++;
+      nodes_remaining +=
+          static_cast<int>(index_.get_dfs_info(lca).level);
     }
 
     auto const* src_fitch_ptr = index_.get_fitch_set_ptr(src);
@@ -851,7 +921,32 @@ class move_enumerator {
         return total;
       }
 
-      if (node == lca) break;
+      bool fitch_changed = false;
+      for (std::size_t si = 0; si < n_sites; si++) {
+        if (prev_old_fitch[si] != prev_new_fitch[si]) {
+          fitch_changed = true;
+          break;
+        }
+      }
+
+      bool is_current_lca = (node == lca);
+
+      if (is_current_lca && !fitch_changed) break;
+      if (!is_current_lca && nodes_remaining < 0 && !fitch_changed) break;
+
+      if (node == index_.get_tree_root()) {
+        auto const* ref_alleles = index_.get_ref_alleles_ptr();
+        for (std::size_t si = 0; si < n_sites; si++) {
+          uint8_t old_f = prev_old_fitch[si];
+          uint8_t new_f = prev_new_fitch[si];
+          if (old_f != new_f) {
+            int old_ua = (old_f & ref_alleles[si]) ? 0 : 1;
+            int new_ua = (new_f & ref_alleles[si]) ? 0 : 1;
+            total += new_ua - old_ua;
+          }
+        }
+        break;
+      }
       node = index_.get_parent(node);
       is_first = false;
     }
