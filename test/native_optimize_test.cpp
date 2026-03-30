@@ -421,6 +421,92 @@ static void test_dag_grows() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: verify predicted score change matches ground truth (mutation count)
+// ---------------------------------------------------------------------------
+
+static std::size_t count_tree_mutations(phylo_dag& tree) {
+  std::size_t total = 0;
+  for (auto ev : tree.get_all_edges()) {
+    std::visit([&](auto edge) { total += edge.mutations().size(); }, ev);
+  }
+  return total;
+}
+
+static void test_score_vs_ground_truth() {
+  std::println("test_score_vs_ground_truth");
+
+  auto tree = make_suboptimal_tree();
+  auto original_score = count_tree_mutations(tree);
+  std::println("  original score: {}", original_score);
+
+  tree_index idx{tree};
+  move_enumerator enumerator{idx};
+  auto radius = compute_tree_max_depth(tree) * 2;
+
+  std::vector<profitable_move> all_moves;
+  enumerator.find_all_moves(radius, [&](auto& m) { all_moves.push_back(m); });
+
+  // Also check all src/dst pairs (brute force) for completeness
+  auto& searchable = idx.get_searchable_nodes();
+  std::vector<profitable_move> brute_moves;
+
+  for (auto src : searchable) {
+    std::vector<std::size_t> ancestors;
+    auto cur = idx.get_parent(src);
+    while (idx.has_dfs_info(cur)) {
+      ancestors.push_back(cur);
+      if (cur == idx.get_tree_root()) break;
+      cur = idx.get_parent(cur);
+    }
+
+    for (auto dst_nv : tree.get_all_nodes()) {
+      std::visit(
+          [&](auto dst_node) {
+            auto dst = dst_node.index();
+            if (is_ua(tree, dst)) return;
+            if (dst == idx.get_tree_root()) return;
+            if (dst == src) return;
+            if (idx.is_ancestor(src, dst)) return;
+            if (idx.is_ancestor(dst, src)) return;
+            if (!idx.has_dfs_info(dst)) return;
+
+            for (auto lca : ancestors) {
+              if (idx.is_ancestor(lca, dst)) {
+                int score = enumerator.compute_move_score(src, dst, lca);
+                if (score < 0) {
+                  brute_moves.push_back(
+                      profitable_move{src, dst, lca, score});
+                }
+                break;
+              }
+            }
+          },
+          dst_nv);
+    }
+  }
+
+  std::size_t mismatches = 0;
+  auto check_move = [&](profitable_move const& m, char const* label) {
+    auto result = apply_spr_move(tree, m.src, m.dst);
+    auto actual_score = static_cast<int>(count_tree_mutations(result));
+    int actual_change = actual_score - static_cast<int>(original_score);
+    if (actual_change != m.score_change) {
+      std::println("  {} MISMATCH: src={} dst={} lca={} predicted={} actual={}",
+                   label, m.src, m.dst, m.lca, m.score_change, actual_change);
+      mismatches++;
+    }
+  };
+
+  for (auto& m : all_moves) check_move(m, "enumerated");
+  for (auto& m : brute_moves) check_move(m, "brute");
+
+  std::println("  checked {} enumerated + {} brute moves, {} mismatches",
+               all_moves.size(), brute_moves.size(), mismatches);
+  assert(mismatches == 0);
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // Test 6: sampled trees are valid after optimization
 // ---------------------------------------------------------------------------
 
@@ -569,6 +655,7 @@ int main() {
   test_enumerator_finds_moves();
   test_cached_vs_independent();
   test_pruned_vs_exhaustive();
+  test_score_vs_ground_truth();
   test_dag_grows();
   test_valid_dag();
   test_native_5_trees();
