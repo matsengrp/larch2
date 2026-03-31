@@ -1083,13 +1083,22 @@ static bool drift_escape(merge& m, args const& a, std::mt19937& rng,
   std::size_t drift_iters = a.drift.value_or(0);
   if (drift_iters == 0) return false;
 
-  move_coefficients coeffs{a.move_coeff_pscore, a.move_coeff_nodes};
-
   std::cerr << "Entering drift mode for " << drift_iters << " iterations\n";
+
+  // Compute DAG min score before drift
+  std::size_t dag_score = 0;
+  {
+    auto& dag = m.get_result();
+    scoped_arena<4096> arena;
+    auto* mr = arena.get();
+    parsimony_score_ops pops;
+    subtree_weight<parsimony_score_ops> sw(dag, rng(), mr);
+    dag_score = sw.compute_weight_below(get_root_idx(dag), pops);
+  }
 
   for (std::size_t di = 0; di < drift_iters; ++di) {
     // 1. Sample min-weight tree
-    prog.phase("Drift: sampling tree");
+    prog.phase("Drift " + std::to_string(di + 1) + ": sampling");
     auto& dag = m.get_result();
     std::uint32_t seed = rng();
     std::size_t score = 0;
@@ -1098,42 +1107,44 @@ static bool drift_escape(merge& m, args const& a, std::mt19937& rng,
     fitch_assign_compact_genomes(tree);
     recompute_edge_mutations(tree);
     set_sample_ids_from_cg(tree);
-    score = 0;
-    for (auto ev : tree.get_all_edges())
-      std::visit([&](auto e) { score += e.mutations().size(); }, ev);
-    prog.done("score " + std::to_string(score));
+    prog.done("score " + std::to_string(dag_score));
 
-    // 2. Build index, find neutral moves (score_change == 0)
-    prog.phase("Drift: finding neutral moves");
-    tree_index idx{tree, pool};
-    move_enumerator enumerator{idx, 0};  // threshold 0: accept score_change <= 0
-    auto max_radius = compute_tree_max_depth(tree) * 2;
-    if (max_radius == 0) max_radius = 1;
+    // 2. Random walk: apply 1..5 sequential neutral moves on the same tree
+    std::uniform_int_distribution<std::size_t> steps_dist(1, 5);
+    std::size_t n_steps = steps_dist(rng);
+    auto drifted = std::move(tree);
+    std::size_t steps_taken = 0;
 
-    std::vector<profitable_move> neutral_moves;
-    enumerator.find_all_moves_parallel(max_radius,
-        [&](profitable_move const& mv) {
-          if (mv.score_change == 0) neutral_moves.push_back(mv);
-        }, pool);
-    prog.done(std::to_string(neutral_moves.size()) + " neutral moves");
+    for (std::size_t step = 0; step < n_steps; ++step) {
+      tree_index idx{drifted, pool};
+      move_enumerator enumerator{idx, 0};
+      auto max_radius = compute_tree_max_depth(drifted) * 2;
+      if (max_radius == 0) max_radius = 1;
 
-    if (neutral_moves.empty()) {
-      std::cerr << "  Drift iter " << (di + 1) << ": no neutral moves\n";
+      std::vector<profitable_move> neutral_moves;
+      enumerator.find_all_moves_parallel(max_radius,
+          [&](profitable_move const& mv) {
+            if (mv.score_change == 0) neutral_moves.push_back(mv);
+          }, pool);
+
+      if (neutral_moves.empty()) break;
+
+      std::uniform_int_distribution<std::size_t> dist(0, neutral_moves.size() - 1);
+      auto& chosen = neutral_moves[dist(rng)];
+      drifted = apply_spr_move(drifted, chosen.src, chosen.dst);
+      steps_taken++;
+    }
+
+    if (steps_taken == 0) {
+      std::cerr << "  Drift " << (di + 1) << ": no neutral moves\n";
       continue;
     }
 
-    // 3. Pick a random neutral move and apply it
-    std::uniform_int_distribution<std::size_t> dist(0, neutral_moves.size() - 1);
-    auto& chosen = neutral_moves[dist(rng)];
-
-    prog.phase("Drift: applying neutral SPR");
-    auto drifted = apply_spr_move(tree, chosen.src, chosen.dst);
-    prog.done();
-
-    // 4. Score all moves on the drifted tree
-    prog.phase("Drift: scoring drifted tree");
+    // 3. Score all moves on the drifted tree
+    prog.phase("Drift " + std::to_string(di + 1) + ": scoring (" +
+               std::to_string(steps_taken) + " steps)");
     tree_index drift_idx{drifted, pool};
-    move_enumerator drift_enum{drift_idx, -1};  // only improving
+    move_enumerator drift_enum{drift_idx, -1};
     auto drift_radius = compute_tree_max_depth(drifted) * 2;
     if (drift_radius == 0) drift_radius = 1;
 
@@ -1142,14 +1153,11 @@ static bool drift_escape(merge& m, args const& a, std::mt19937& rng,
         [&](profitable_move const& mv) {
           if (mv.score_change < 0) improving.push_back(mv);
         }, pool);
-    prog.done(std::to_string(improving.size()) + " improving moves");
+    prog.done(std::to_string(improving.size()) + " improving");
 
-    if (improving.empty()) {
-      std::cerr << "  Drift iter " << (di + 1) << ": no improving moves\n";
-      continue;
-    }
+    if (improving.empty()) continue;
 
-    // 5. Generate fragments for improving moves and merge
+    // 4. Generate fragments for improving moves and merge
     std::sort(improving.begin(), improving.end(),
               [](auto& a, auto& b) { return a.score_change < b.score_change; });
     if (improving.size() > a.max_moves) improving.resize(a.max_moves);
@@ -1162,7 +1170,7 @@ static bool drift_escape(merge& m, args const& a, std::mt19937& rng,
                                    .lca = mv.lca,
                                    .score_change = mv.score_change});
 
-    prog.phase("Drift: generating fragments");
+    prog.phase("Drift " + std::to_string(di + 1) + ": merging");
     std::vector<phylo_dag> fragments(spr_moves.size());
     parallel_with_progress(
         pool, spr_moves.size(),
@@ -1170,37 +1178,30 @@ static bool drift_escape(merge& m, args const& a, std::mt19937& rng,
           fragments[i] = apply_spr_as_fragment(drifted, spr_moves[i]);
         },
         prog);
-    prog.done();
-
-    prog.phase("Drift: merging");
-    if (coeffs.has_node_penalty()) {
-      struct scored_frag {
-        std::size_t idx;
-        int final_score;
-      };
-      std::vector<scored_frag> scored(fragments.size());
-      for (std::size_t i = 0; i < fragments.size(); ++i) {
-        int novel = static_cast<int>(m.count_novel_nodes(fragments[i]));
-        scored[i] = {i,
-                     coeffs.apply(spr_moves[i].score_change.value_or(0), novel)};
-      }
-      std::sort(scored.begin(), scored.end(),
-                [](auto& a, auto& b) { return a.final_score < b.final_score; });
-      std::erase_if(scored, [](auto& s) { return s.final_score > 0; });
-      if (scored.size() > a.max_moves) scored.resize(a.max_moves);
-      for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
-    } else {
-      for (auto& frag : fragments) m.add_dag(std::move(frag));
-    }
+    for (auto& frag : fragments) m.add_dag(std::move(frag));
     m.add_dag(drifted);
     prog.done(std::to_string(m.result_node_count()) + " nodes");
 
-    std::cerr << "  Drift iter " << (di + 1) << ": escaped local optimum!\n";
-    return true;
+    // 5. Check if DAG score actually improved
+    auto& new_dag = m.get_result();
+    std::size_t new_score = 0;
+    {
+      scoped_arena<4096> arena;
+      auto* mr = arena.get();
+      parsimony_score_ops pops;
+      subtree_weight<parsimony_score_ops> sw(new_dag, rng(), mr);
+      new_score = sw.compute_weight_below(get_root_idx(new_dag), pops);
+    }
+
+    if (new_score < dag_score) {
+      std::cerr << "  Drift " << (di + 1) << " (" << steps_taken
+                << " steps): escaped! " << dag_score << " -> " << new_score
+                << "\n";
+      return true;
+    }
   }
 
-  std::cerr << "Drift mode: no escape found after " << drift_iters
-            << " iterations\n";
+  std::cerr << "Drift: no escape after " << drift_iters << " iterations\n";
   return false;
 }
 
