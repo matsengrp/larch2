@@ -24,6 +24,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <optional>
@@ -1049,12 +1050,18 @@ static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed) {
 struct patience_checker {
   std::optional<std::size_t> limit;
   std::size_t count = 0;
+  std::size_t best_score = std::numeric_limits<std::size_t>::max();
 
-  bool operator()(std::size_t activity) {
+  bool operator()(std::size_t current_score) {
     if (!limit) return false;
-    count = (activity == 0) ? count + 1 : 0;
+    if (current_score < best_score) {
+      best_score = current_score;
+      count = 0;
+    } else {
+      count++;
+    }
     if (count >= *limit) {
-      std::cerr << "Early stopping: no DAG growth for " << *limit
+      std::cerr << "Early stopping: no score improvement for " << *limit
                 << " consecutive iterations\n";
       return true;
     }
@@ -1106,6 +1113,19 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
     fitch_assign_compact_genomes(sampled);
     recompute_edge_mutations(sampled);
     set_sample_ids_from_cg(sampled);
+
+    // Recompute score after optimal Fitch assignment
+    min_score = 0;
+    for (auto ev : sampled.get_all_edges()) {
+      std::visit([&](auto e) { min_score += e.mutations().size(); }, ev);
+    }
+    if (a.ignore_root_edge_mutations) {
+      // The UA edge mutations were already counted, but shouldn't be for reporting
+      for (auto ev : sampled.get_root_as<node_kind::ua>().get_children()) {
+        std::visit([&](auto e) { min_score -= e.mutations().size(); }, ev);
+      }
+    }
+
     prog.done("score " + std::to_string(min_score));
 
     // Check if we should do subtree optimization this iteration
@@ -1212,7 +1232,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             std::sort(scored.begin(), scored.end(), [](auto& a, auto& b) {
               return a.final_score < b.final_score;
             });
-            std::erase_if(scored, [](auto& s) { return s.final_score >= 0; });
+            std::erase_if(scored, [](auto& s) { return s.final_score > 0; });
             if (scored.size() > a.max_moves) scored.resize(a.max_moves);
             for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
             moves_applied = scored.size();
@@ -1221,8 +1241,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             moves_applied = moves.size();
           }
           m.add_dag(subtree_dag);
-          prog.done(std::to_string(m.result_node_count()) + " nodes, " +
-                    std::to_string(m.result_edge_count()) + " edges");
+          auto nc_after = m.result_node_count();
+          auto ec_after = m.result_edge_count();
+          prog.done(std::to_string(nc_after) + " nodes, " +
+                    std::to_string(ec_after) + " edges");
           if (a.validate)
             validate_dag(m.get_result(),
                          "iteration " + std::to_string(iter + 1) +
@@ -1247,7 +1269,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             .parsimony_score = min_score,
             .radii = std::move(radii_results),
         });
-        if (patience(total_trees_merged)) return results;
+        if (patience(min_score)) return results;
         continue;  // skip whole-tree path below
       }
     }
@@ -1343,7 +1365,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         std::sort(scored.begin(), scored.end(), [](auto& a, auto& b) {
           return a.final_score < b.final_score;
         });
-        std::erase_if(scored, [](auto& s) { return s.final_score >= 0; });
+        std::erase_if(scored, [](auto& s) { return s.final_score > 0; });
         if (scored.size() > a.max_moves) scored.resize(a.max_moves);
         for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
         moves_applied = scored.size();
@@ -1378,6 +1400,18 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         fitch_assign_compact_genomes(sampled);
         recompute_edge_mutations(sampled);
         set_sample_ids_from_cg(sampled);
+
+        // Recompute score after optimal Fitch assignment
+        resample_score = 0;
+        for (auto ev : sampled.get_all_edges()) {
+          std::visit([&](auto e) { resample_score += e.mutations().size(); }, ev);
+        }
+        if (a.ignore_root_edge_mutations) {
+          for (auto ev : sampled.get_root_as<node_kind::ua>().get_children()) {
+            std::visit([&](auto e) { resample_score -= e.mutations().size(); }, ev);
+          }
+        }
+
         prog.done("score " + std::to_string(resample_score));
 
         // Recompute max_radius from new tree depth
@@ -1409,7 +1443,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         .parsimony_score = min_score,
         .radii = std::move(radii_results),
     });
-    if (patience(total_trees_merged)) return results;
+    if (patience(min_score)) return results;
   }
 
   return results;
@@ -1450,6 +1484,19 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
     fitch_assign_compact_genomes(sampled);
     recompute_edge_mutations(sampled);
     set_sample_ids_from_cg(sampled);
+
+    // Recompute score after optimal Fitch assignment
+    min_score = 0;
+    for (auto ev : sampled.get_all_edges()) {
+      std::visit([&](auto e) { min_score += e.mutations().size(); }, ev);
+    }
+    if (a.ignore_root_edge_mutations) {
+      // The UA edge mutations were already counted, but shouldn't be for reporting
+      for (auto ev : sampled.get_root_as<node_kind::ua>().get_children()) {
+        std::visit([&](auto e) { min_score -= e.mutations().size(); }, ev);
+      }
+    }
+
     prog.done("score " + std::to_string(min_score));
 
     prog.phase("Generating random SPR moves");
@@ -1468,9 +1515,6 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
                    "random iteration " + std::to_string(iter + 1) + " merge",
                    thread_pool::get_default());
 
-    // Use DAG growth as convergence signal: random SPR always generates
-    // candidates, but only novel topologies grow the DAG.
-    bool dag_grew = (nodes_after != nodes_before || edges_after != edges_before);
     results.push_back(optimize_result{
         .iteration = iter,
         .dag_node_count = nodes_after,
@@ -1478,7 +1522,7 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
         .trees_merged = new_trees.size(),
         .parsimony_score = min_score,
     });
-    if (patience(dag_grew ? 1 : 0)) return results;
+    if (patience(min_score)) return results;
   }
 
   return results;

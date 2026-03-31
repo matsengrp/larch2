@@ -45,7 +45,7 @@ struct move_coefficients {
   bool has_node_penalty() const { return node_coeff != 0; }
 
   int apply(int parsimony_change, int novel_node_count) const {
-    return pscore_coeff * parsimony_change - node_coeff * novel_node_count;
+    return pscore_coeff * parsimony_change + node_coeff * novel_node_count;
   }
 };
 
@@ -83,10 +83,11 @@ struct scratch_buffers {
 inline int fitch_cost_from_counts(std::array<uint8_t, 4> const& counts,
                                   uint8_t num_children) {
   if (num_children <= 1) return 0;
+  uint8_t max_c = 0;
   for (int i = 0; i < 4; i++) {
-    if (counts[i] == num_children) return 0;
+    if (counts[i] > max_c) max_c = counts[i];
   }
-  return 1;
+  return static_cast<int>(num_children) - static_cast<int>(max_c);
 }
 
 inline std::size_t compute_tree_max_depth(phylo_dag& d) {
@@ -234,16 +235,16 @@ class tree_index {
           nv);
     }
 
-    // Condense identical sibling leaves: group leaves sharing the same
-    // parent and CompactGenome, keeping only one representative per group.
-    // This matches larch's full CG equality check.
+    // Mark identical sibling leaves as condensed.  They stay in children_[]
+    // (preserving correct polytomy counts for Fitch) but are excluded from
+    // searchable_nodes_ so the move enumerator skips them as sources.
     is_condensed_.assign(num_nodes_, false);
+    condensed_count_ = 0;
     for (std::size_t nid = 0; nid < num_nodes_; nid++) {
       auto& kids = children_[nid];
       if (kids.size() <= 1) continue;
 
       std::vector<bool> condensed(kids.size(), false);
-      bool any_condensed = false;
       for (std::size_t i = 0; i < kids.size(); i++) {
         if (condensed[i]) continue;
         if (!is_leaf(d_, kids[i])) continue;
@@ -255,17 +256,11 @@ class tree_index {
           if (cg_i == cg_j) {
             condensed[j] = true;
             is_condensed_[kids[j]] = true;
-            any_condensed = true;
             condensed_count_++;
           }
         }
       }
-      if (any_condensed) {
-        std::vector<std::size_t> new_kids;
-        for (std::size_t i = 0; i < kids.size(); i++)
-          if (!condensed[i]) new_kids.push_back(kids[i]);
-        kids = std::move(new_kids);
-      }
+      // NOTE: do NOT remove condensed leaves from kids.
     }
 
     // Collect searchable nodes (non-UA, non-tree-root, non-condensed)

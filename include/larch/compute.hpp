@@ -782,16 +782,15 @@ inline uint8_t base_to_one_hot(nuc_base b) {
 inline uint8_t fitch_set_from_counts(std::array<uint8_t, 4> const& counts,
                                      uint8_t num_children) {
   if (num_children == 0) return 0;
-  uint8_t intersection = 0;
+  uint8_t max_c = 0;
   for (int i = 0; i < 4; i++) {
-    if (counts[i] == num_children) intersection |= static_cast<uint8_t>(1 << i);
+    if (counts[i] > max_c) max_c = counts[i];
   }
-  if (intersection) return intersection;
-  uint8_t union_set = 0;
+  uint8_t result = 0;
   for (int i = 0; i < 4; i++) {
-    if (counts[i] > 0) union_set |= static_cast<uint8_t>(1 << i);
+    if (counts[i] == max_c) result |= static_cast<uint8_t>(1 << i);
   }
-  return union_set;
+  return result;
 }
 
 // Bottom-up + top-down Fitch pass to assign optimal inner node CGs.
