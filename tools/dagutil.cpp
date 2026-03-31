@@ -184,6 +184,7 @@ Pruning:
 
 Analysis:
   --dag-info              Print all DAG statistics (tree count, parsimony, RF)
+  --dag-quick-info        Print fast DAG statistics (tree count, parsimony min)
   --parsimony             Print parsimony score distribution
   --sum-rf-distance       Print sum RF distance distribution
   --edge-parsimony        Compute per-edge parsimony penalties (store in output)
@@ -213,6 +214,7 @@ struct args {
   bool dag_info = false;
   bool print_parsimony = false;
   bool print_rf_distance = false;
+  bool dag_quick_info = false;
   bool edge_parsimony = false;
   bool validate = false;
 };
@@ -262,6 +264,8 @@ static args parse_args(int argc, char** argv) {
     } else if (arg == "--sum-rf-distance") {
       a.dag_info = true;
       a.print_rf_distance = true;
+    } else if (arg == "--dag-quick-info") {
+      a.dag_quick_info = true;
     } else if (arg == "--edge-parsimony")
       a.edge_parsimony = true;
     else if (arg == "--validate")
@@ -372,7 +376,20 @@ int main(int argc, char** argv) try {
   if (a.validate)
     validate_dag(result, "after merge", thread_pool::get_default());
 
-  // ---- Analysis ----
+  // ---- Quick analysis (cheap O(n+m) stats only) ----
+  if (a.dag_quick_info && !a.dag_info) {
+    tree_count_ops tc_ops;
+    subtree_weight<tree_count_ops> tc_sw(result, a.seed);
+    auto tree_count = tc_sw.compute_weight_below(root_idx, tc_ops);
+    std::cout << "tree_count: " << tree_count << "\n";
+
+    parsimony_score_ops pops;
+    subtree_weight<parsimony_score_ops> psw(result, a.seed);
+    auto pmin = psw.compute_weight_below(root_idx, pops);
+    std::cout << "parsimony_min: " << pmin << "\n";
+  }
+
+  // ---- Full analysis ----
   if (a.dag_info) {
     tree_count_ops tc_ops;
     subtree_weight<tree_count_ops> tc_sw(result, a.seed);
