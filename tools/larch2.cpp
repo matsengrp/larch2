@@ -349,7 +349,8 @@ Output (required):
 
 Optimization:
   -n, --iterations <N>    Number of optimization iterations (default: 10)
-  --patience <P>          Stop after P consecutive iterations with no DAG growth (P >= 1)
+  --patience <P>          Stop after P consecutive iterations with no parsimony improvement (P >= 1)
+  --drift <N>             When patience triggers, attempt N drift iterations before stopping
   --optimizer <name>      "native" (default) or "random"
   --max-moves <N>         Max moves per iteration for native (default: 50)
   --seed <N>              Random seed
@@ -420,6 +421,7 @@ struct args {
   int move_coeff_nodes = 0;
   std::optional<int> move_score_threshold;
   std::optional<std::size_t> patience;
+  std::optional<std::size_t> drift;
 };
 
 static args parse_args(int argc, char** argv) {
@@ -496,8 +498,9 @@ static args parse_args(int argc, char** argv) {
         std::exit(1);
       }
       a.patience = p;
-    }
-    else if (arg == "--version") {
+    } else if (arg == "--drift") {
+      a.drift = std::stoull(std::string{next()});
+    } else if (arg == "--version") {
       std::cerr << "larch2 " << larch::version << " (" << larch::git_commit
                 << ")\n";
       std::exit(0);
@@ -1049,18 +1052,158 @@ static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed) {
 struct patience_checker {
   std::optional<std::size_t> limit;
   std::size_t count = 0;
+  std::optional<std::size_t> best_score;
 
-  bool operator()(std::size_t activity) {
+  bool operator()(std::size_t current_score) {
     if (!limit) return false;
-    count = (activity == 0) ? count + 1 : 0;
+    if (!best_score || current_score < *best_score) {
+      best_score = current_score;
+      count = 0;
+    } else {
+      count++;
+    }
     if (count >= *limit) {
-      std::cerr << "Early stopping: no DAG growth for " << *limit
+      std::cerr << "Early stopping: no parsimony improvement for " << *limit
                 << " consecutive iterations\n";
       return true;
     }
     return false;
   }
+
+  void reset() { count = 0; }
 };
+
+// ---------------------------------------------------------------------------
+// Drift escape: random walk on the equal-score plateau
+// ---------------------------------------------------------------------------
+
+static bool drift_escape(merge& m, args const& a, std::mt19937& rng,
+                          progress& prog) {
+  auto& pool = thread_pool::get_default();
+  std::size_t drift_iters = a.drift.value_or(0);
+  if (drift_iters == 0) return false;
+
+  std::cerr << "Entering drift mode for " << drift_iters << " iterations\n";
+
+  // Compute DAG min score before drift
+  std::size_t dag_score = 0;
+  {
+    auto& dag = m.get_result();
+    scoped_arena<4096> arena;
+    auto* mr = arena.get();
+    parsimony_score_ops pops;
+    subtree_weight<parsimony_score_ops> sw(dag, rng(), mr);
+    dag_score = sw.compute_weight_below(get_root_idx(dag), pops);
+  }
+
+  for (std::size_t di = 0; di < drift_iters; ++di) {
+    // 1. Sample min-weight tree
+    prog.phase("Drift " + std::to_string(di + 1) + ": sampling");
+    auto& dag = m.get_result();
+    std::uint32_t seed = rng();
+    std::size_t score = 0;
+    auto tree = sample_tree_from_dag(dag, m, a.sample_method, a.sample_uniformly,
+                                     a.ignore_root_edge_mutations, seed, score);
+    fitch_assign_compact_genomes(tree);
+    recompute_edge_mutations(tree);
+    set_sample_ids_from_cg(tree);
+    prog.done("score " + std::to_string(dag_score));
+
+    // 2. Random walk: apply 1..5 sequential neutral moves on the same tree
+    std::uniform_int_distribution<std::size_t> steps_dist(1, 5);
+    std::size_t n_steps = steps_dist(rng);
+    auto drifted = std::move(tree);
+    std::size_t steps_taken = 0;
+
+    for (std::size_t step = 0; step < n_steps; ++step) {
+      tree_index idx{drifted, pool};
+      move_enumerator enumerator{idx, 0};
+      auto max_radius = compute_tree_max_depth(drifted) * 2;
+      if (max_radius == 0) max_radius = 1;
+
+      std::vector<profitable_move> neutral_moves;
+      enumerator.find_all_moves_parallel(max_radius,
+          [&](profitable_move const& mv) {
+            if (mv.score_change == 0) neutral_moves.push_back(mv);
+          }, pool);
+
+      if (neutral_moves.empty()) break;
+
+      std::uniform_int_distribution<std::size_t> dist(0, neutral_moves.size() - 1);
+      auto& chosen = neutral_moves[dist(rng)];
+      drifted = apply_spr_move(drifted, chosen.src, chosen.dst);
+      steps_taken++;
+    }
+
+    if (steps_taken == 0) {
+      std::cerr << "  Drift " << (di + 1) << ": no neutral moves\n";
+      continue;
+    }
+
+    // 3. Score all moves on the drifted tree
+    prog.phase("Drift " + std::to_string(di + 1) + ": scoring (" +
+               std::to_string(steps_taken) + " steps)");
+    tree_index drift_idx{drifted, pool};
+    move_enumerator drift_enum{drift_idx, -1};
+    auto drift_radius = compute_tree_max_depth(drifted) * 2;
+    if (drift_radius == 0) drift_radius = 1;
+
+    std::vector<profitable_move> improving;
+    drift_enum.find_all_moves_parallel(drift_radius,
+        [&](profitable_move const& mv) {
+          if (mv.score_change < 0) improving.push_back(mv);
+        }, pool);
+    prog.done(std::to_string(improving.size()) + " improving");
+
+    if (improving.empty()) continue;
+
+    // 4. Generate fragments for improving moves and merge
+    std::sort(improving.begin(), improving.end(),
+              [](auto& a, auto& b) { return a.score_change < b.score_change; });
+    if (improving.size() > a.max_moves) improving.resize(a.max_moves);
+
+    std::vector<spr_move> spr_moves;
+    spr_moves.reserve(improving.size());
+    for (auto& mv : improving)
+      spr_moves.push_back(spr_move{.src = mv.src,
+                                   .dst = mv.dst,
+                                   .lca = mv.lca,
+                                   .score_change = mv.score_change});
+
+    prog.phase("Drift " + std::to_string(di + 1) + ": merging");
+    std::vector<phylo_dag> fragments(spr_moves.size());
+    parallel_with_progress(
+        pool, spr_moves.size(),
+        [&](std::size_t i) {
+          fragments[i] = apply_spr_as_fragment(drifted, spr_moves[i]);
+        },
+        prog);
+    for (auto& frag : fragments) m.add_dag(std::move(frag));
+    m.add_dag(drifted);
+    prog.done(std::to_string(m.result_node_count()) + " nodes");
+
+    // 5. Check if DAG score actually improved
+    auto& new_dag = m.get_result();
+    std::size_t new_score = 0;
+    {
+      scoped_arena<4096> arena;
+      auto* mr = arena.get();
+      parsimony_score_ops pops;
+      subtree_weight<parsimony_score_ops> sw(new_dag, rng(), mr);
+      new_score = sw.compute_weight_below(get_root_idx(new_dag), pops);
+    }
+
+    if (new_score < dag_score) {
+      std::cerr << "  Drift " << (di + 1) << " (" << steps_taken
+                << " steps): escaped! " << dag_score << " -> " << new_score
+                << "\n";
+      return true;
+    }
+  }
+
+  std::cerr << "Drift: no escape after " << drift_iters << " iterations\n";
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // Native optimizer loop with progress
@@ -1106,6 +1249,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
     fitch_assign_compact_genomes(sampled);
     recompute_edge_mutations(sampled);
     set_sample_ids_from_cg(sampled);
+    // Recompute score from actual edge mutations (may differ from DP value)
+    min_score = 0;
+    for (auto ev : sampled.get_all_edges())
+      std::visit([&](auto e) { min_score += e.mutations().size(); }, ev);
     prog.done("score " + std::to_string(min_score));
 
     // Check if we should do subtree optimization this iteration
@@ -1212,7 +1359,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             std::sort(scored.begin(), scored.end(), [](auto& a, auto& b) {
               return a.final_score < b.final_score;
             });
-            std::erase_if(scored, [](auto& s) { return s.final_score >= 0; });
+            std::erase_if(scored, [](auto& s) { return s.final_score > 0; });
             if (scored.size() > a.max_moves) scored.resize(a.max_moves);
             for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
             moves_applied = scored.size();
@@ -1247,7 +1394,13 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             .parsimony_score = min_score,
             .radii = std::move(radii_results),
         });
-        if (patience(total_trees_merged)) return results;
+        if (patience(min_score)) {
+          if (a.drift && drift_escape(m, a, rng, prog)) {
+            patience.reset();
+          } else {
+            return results;
+          }
+        }
         continue;  // skip whole-tree path below
       }
     }
@@ -1319,8 +1472,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
       parallel_with_progress(
           pool, spr_moves.size(),
           [&](std::size_t i) {
-            fragments[i] =
-                apply_spr_move(sampled, spr_moves[i].src, spr_moves[i].dst);
+            fragments[i] = apply_spr_as_fragment(sampled, spr_moves[i]);
           },
           prog);
 
@@ -1343,7 +1495,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         std::sort(scored.begin(), scored.end(), [](auto& a, auto& b) {
           return a.final_score < b.final_score;
         });
-        std::erase_if(scored, [](auto& s) { return s.final_score >= 0; });
+        std::erase_if(scored, [](auto& s) { return s.final_score > 0; });
         if (scored.size() > a.max_moves) scored.resize(a.max_moves);
         for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
         moves_applied = scored.size();
@@ -1378,6 +1530,9 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         fitch_assign_compact_genomes(sampled);
         recompute_edge_mutations(sampled);
         set_sample_ids_from_cg(sampled);
+        resample_score = 0;
+        for (auto ev : sampled.get_all_edges())
+          std::visit([&](auto e) { resample_score += e.mutations().size(); }, ev);
         prog.done("score " + std::to_string(resample_score));
 
         // Recompute max_radius from new tree depth
@@ -1409,7 +1564,13 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         .parsimony_score = min_score,
         .radii = std::move(radii_results),
     });
-    if (patience(total_trees_merged)) return results;
+    if (patience(min_score)) {
+      if (a.drift && drift_escape(m, a, rng, prog)) {
+        patience.reset();
+      } else {
+        return results;
+      }
+    }
   }
 
   return results;
@@ -1450,6 +1611,9 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
     fitch_assign_compact_genomes(sampled);
     recompute_edge_mutations(sampled);
     set_sample_ids_from_cg(sampled);
+    min_score = 0;
+    for (auto ev : sampled.get_all_edges())
+      std::visit([&](auto e) { min_score += e.mutations().size(); }, ev);
     prog.done("score " + std::to_string(min_score));
 
     prog.phase("Generating random SPR moves");
@@ -1478,7 +1642,7 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
         .trees_merged = new_trees.size(),
         .parsimony_score = min_score,
     });
-    if (patience(dag_grew ? 1 : 0)) return results;
+    if (patience(min_score)) return results;
   }
 
   return results;
