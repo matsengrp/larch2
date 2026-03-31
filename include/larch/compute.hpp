@@ -776,7 +776,7 @@ inline void validate_dag(phylo_dag& d, std::string_view label) {
 // ============================================================================
 
 inline uint8_t base_to_one_hot(nuc_base b) {
-  return static_cast<uint8_t>(1 << b.raw());
+  return b.raw();
 }
 
 inline uint8_t fitch_set_from_counts(std::array<uint8_t, 4> const& counts,
@@ -906,16 +906,9 @@ inline void fitch_assign_compact_genomes(
     nuc_base prefer_base = root_parent_cg
         ? root_parent_cg->get_base(var_sites[i], ref)
         : nuc_base::from_char(ref.at(var_sites[i] - 1));
-    if (fs & base_to_one_hot(prefer_base)) {
-      assigned[tree_root * n_sites + i] = prefer_base;
-    } else {
-      for (int j = 0; j < 4; j++) {
-        if (fs & (1 << j)) {
-          assigned[tree_root * n_sites + i] = nuc_base{static_cast<uint8_t>(j)};
-          break;
-        }
-      }
-    }
+    uint8_t intersection = fs & prefer_base.raw();
+    assigned[tree_root * n_sites + i] =
+        nuc_base{intersection ? intersection : fs};
   }
 
   std::function<void(std::size_t)> top_down = [&](std::size_t nid) {
@@ -923,17 +916,10 @@ inline void fitch_assign_compact_genomes(
       if (is_leaf(d, child)) continue;
       for (std::size_t i = 0; i < n_sites; i++) {
         uint8_t fs = fitch[child * n_sites + i];
-        nuc_base parent_base = assigned[nid * n_sites + i];
-        if (fs & base_to_one_hot(parent_base)) {
-          assigned[child * n_sites + i] = parent_base;
-        } else {
-          for (int j = 0; j < 4; j++) {
-            if (fs & (1 << j)) {
-              assigned[child * n_sites + i] = nuc_base{static_cast<uint8_t>(j)};
-              break;
-            }
-          }
-        }
+        nuc_base prefer_base = assigned[nid * n_sites + i];
+        uint8_t intersection = fs & prefer_base.raw();
+        assigned[child * n_sites + i] =
+            nuc_base{intersection ? intersection : fs};
       }
       top_down(child);
     }

@@ -69,7 +69,7 @@ class compact_genome {
       if (it != parent.mutations_.end()) {
         parent_base = it->second;
       }
-      if (!(parent_base == child_base)) {
+      if (!(parent_base.raw() & child_base.raw())) {
         result[pos] = {parent_base, child_base};
       }
     }
@@ -79,7 +79,7 @@ class compact_genome {
       if (it != child.mutations_.end()) {
         child_base = it->second;
       }
-      if (!(child_base == parent_base)) {
+      if (!(child_base.raw() & parent_base.raw())) {
         result[pos] = {parent_base, child_base};
       }
     }

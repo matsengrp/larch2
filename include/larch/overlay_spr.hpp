@@ -315,31 +315,20 @@ inline phylo_dag apply_spr_as_fragment(phylo_dag& tree, spr_move const& move) {
   auto* mr = arena.get();
 
   overlay_dag<phylo_dag> ov{tree};
-  auto fragment_root = apply_spr_topology(ov, tree, move, mr);
+  (void)apply_spr_topology(ov, tree, move, mr);
 
-  // Get the fragment root's parent CG from the overlay.  The parent's CG
-  // is unchanged by the SPR (it's above the affected region), so we can
-  // read it from the base tree.  This lets fitch_assign_compact_genomes
-  // use the correct parent state instead of the reference.
-  compact_genome const* parent_cg = nullptr;
-  compact_genome parent_cg_storage;
-  auto frag_parents = overlay_detail::get_parent_edges_of(ov, fragment_root, mr);
-  if (!frag_parents.empty()) {
-    auto parent_idx = overlay_detail::get_parent_idx_of(ov, frag_parents[0]);
-    auto pv = ov.get_node(parent_idx);
-    std::visit(
-        [&](auto node) {
-          if constexpr (requires { node.cg(); }) {
-            parent_cg_storage = node.cg();
-            parent_cg = &parent_cg_storage;
-          }
-        },
-        pv);
-  }
+  // Find the tree root (child of UA) in the overlay.
+  // Extracting the full tree as a fragment allows parsimony improvements
+  // to propagate all the way to the root.
+  auto root_idx = std::visit([](auto n) { return n.index(); }, ov.get_root());
+  auto ua_children = overlay_detail::get_child_edges_of(ov, root_idx, mr);
+  assert(!ua_children.empty());
+  auto tree_root = overlay_detail::get_child_idx_of(ov, ua_children[0]);
 
-  auto fragment = copy_subtree_from_overlay(ov, tree, fragment_root, mr);
+  auto fragment = copy_subtree_from_overlay(ov, tree, tree_root, mr);
 
-  fitch_assign_compact_genomes(fragment, parent_cg);
+  // Assign optimal CGs on the full fragment (no parent_cg anchoring)
+  fitch_assign_compact_genomes(fragment);
   recompute_edge_mutations(fragment);
   set_sample_ids_from_cg(fragment);
 
