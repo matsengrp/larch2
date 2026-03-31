@@ -45,7 +45,7 @@ struct move_coefficients {
   bool has_node_penalty() const { return node_coeff != 0; }
 
   int apply(int parsimony_change, int novel_node_count) const {
-    return pscore_coeff * parsimony_change - node_coeff * novel_node_count;
+    return pscore_coeff * parsimony_change + node_coeff * novel_node_count;
   }
 };
 
@@ -260,12 +260,8 @@ class tree_index {
           }
         }
       }
-      if (any_condensed) {
-        std::vector<std::size_t> new_kids;
-        for (std::size_t i = 0; i < kids.size(); i++)
-          if (!condensed[i]) new_kids.push_back(kids[i]);
-        kids = std::move(new_kids);
-      }
+      // Note: condensed leaves stay in children_ to preserve correct child
+      // counts.  They are excluded from searchable_nodes_ below.
     }
 
     // Collect searchable nodes (non-UA, non-tree-root, non-condensed)
