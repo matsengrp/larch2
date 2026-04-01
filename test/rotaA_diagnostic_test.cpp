@@ -781,7 +781,12 @@ int main() {
   std::println("rotaA_diagnostic_test");
   std::println("repro dir: {}\n", get_repro_dir());
 
-  test_nonoptimal_sampling();
+  test_fragment_ground_truth();   // Exp 1: scoring prediction accuracy
+  test_condensing_bug();          // Exp 1b: condensing corruption
+  test_dp_validation();           // Exp 3: DP weight correctness
+  test_basin_analysis();          // Exp 4: basin isolation
+  test_trim_score_loss();         // Exp 2: trim kills valid paths?
+  test_nonoptimal_sampling();     // Exp 5: bridge moves from non-optimal trees
 
   std::println("All experiments completed.");
   return 0;

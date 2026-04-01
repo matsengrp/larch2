@@ -1122,10 +1122,19 @@ static bool drift_escape(merge& m, args const& a, std::mt19937& rng,
       if (max_radius == 0) max_radius = 1;
 
       std::vector<profitable_move> neutral_moves;
+      std::size_t total_moves_at_step = 0;
+      int best_at_step = 1;
       enumerator.find_all_moves_parallel(max_radius,
           [&](profitable_move const& mv) {
+            total_moves_at_step++;
+            if (mv.score_change < best_at_step) best_at_step = mv.score_change;
             if (mv.score_change == 0) neutral_moves.push_back(mv);
           }, pool);
+
+      std::cerr << "  Drift " << (di + 1) << " step " << (step + 1)
+                << "/" << n_steps << ": " << neutral_moves.size()
+                << " neutral, " << total_moves_at_step << " total (best="
+                << best_at_step << ")\n";
 
       if (neutral_moves.empty()) break;
 
@@ -1149,11 +1158,15 @@ static bool drift_escape(merge& m, args const& a, std::mt19937& rng,
     if (drift_radius == 0) drift_radius = 1;
 
     std::vector<profitable_move> improving;
+    int best_improving = 0;
     drift_enum.find_all_moves_parallel(drift_radius,
         [&](profitable_move const& mv) {
           if (mv.score_change < 0) improving.push_back(mv);
+          if (mv.score_change < best_improving) best_improving = mv.score_change;
         }, pool);
     prog.done(std::to_string(improving.size()) + " improving");
+    std::cerr << "  Drift " << (di + 1) << ": " << improving.size()
+              << " improving moves (best=" << best_improving << ")\n";
 
     if (improving.empty()) continue;
 
@@ -1359,7 +1372,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             std::sort(scored.begin(), scored.end(), [](auto& a, auto& b) {
               return a.final_score < b.final_score;
             });
-            std::erase_if(scored, [](auto& s) { return s.final_score > 0; });
+            std::erase_if(scored, [&](auto& s) {
+              return s.final_score > 0 &&
+                     spr_moves[s.idx].score_change.value_or(0) >= 0;
+            });
             if (scored.size() > a.max_moves) scored.resize(a.max_moves);
             for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
             moves_applied = scored.size();
@@ -1495,7 +1511,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         std::sort(scored.begin(), scored.end(), [](auto& a, auto& b) {
           return a.final_score < b.final_score;
         });
-        std::erase_if(scored, [](auto& s) { return s.final_score > 0; });
+        std::erase_if(scored, [&](auto& s) {
+          return s.final_score > 0 &&
+                 spr_moves[s.idx].score_change.value_or(0) >= 0;
+        });
         if (scored.size() > a.max_moves) scored.resize(a.max_moves);
         for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
         moves_applied = scored.size();
