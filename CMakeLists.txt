@@ -142,6 +142,9 @@ target_link_libraries(dagutil PRIVATE larch)
 add_executable(larch2-bcr tools/larch2-bcr.cpp)
 target_link_libraries(larch2-bcr PRIVATE larch)
 
+set_target_properties(larch2 dagutil larch2-bcr PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 # --- Tests --------------------------------------------------------------------
 
 enable_testing()
