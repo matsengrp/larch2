@@ -178,6 +178,10 @@ class tree_index {
   std::size_t num_condensed_leaves() const { return condensed_count_; }
   uint8_t const* get_ref_alleles_ptr() const { return ref_alleles_.data(); }
 
+  bool is_valid(std::size_t node) const {
+    return node < num_nodes_ && is_valid_[node];
+  }
+
  private:
   static constexpr std::size_t kFitchParallelThreshold = 64;
 
@@ -206,6 +210,7 @@ class tree_index {
     // Allocate flat arrays
     dfs_info_.resize(num_nodes_);
     has_dfs_info_.assign(num_nodes_, false);
+    is_valid_.assign(num_nodes_, 0);
     fitch_sets_.resize(num_nodes_ * num_variable_sites_, 0);
     child_counts_.resize(num_nodes_ * num_variable_sites_, {0, 0, 0, 0});
     has_child_counts_.assign(num_nodes_, false);
@@ -220,6 +225,7 @@ class tree_index {
           [&](auto node) {
             auto nid = node.index();
             if (is_ua(d_, nid)) return;
+            is_valid_[nid] = 1;
 
             // Parent
             auto pes = get_parent_edges(d_, nid);
@@ -469,6 +475,7 @@ class tree_index {
 
   std::vector<dfs_info> dfs_info_;
   std::vector<uint8_t> has_dfs_info_;
+  std::vector<uint8_t> is_valid_;
   std::vector<uint8_t> fitch_sets_;
   std::vector<std::array<uint8_t, 4>> child_counts_;
   std::vector<uint8_t> has_child_counts_;
