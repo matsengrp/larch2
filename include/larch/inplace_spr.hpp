@@ -305,4 +305,67 @@ inline std::size_t reattach_at_destination(phylo_dag& d, std::size_t src,
   return ni_idx;
 }
 
+// ============================================================================
+// Phase 7: apply_spr_inplace — assemble phases 4–6 into a single function
+// ============================================================================
+
+// Compute the lowest common ancestor of two nodes using tree_index DFS
+// intervals.  Must be called before any topology changes, since detach/collapse
+// invalidates the ancestor relationship.
+inline std::size_t compute_lca(tree_index const& index, std::size_t a,
+                               std::size_t b) {
+  if (index.is_ancestor(a, b)) return a;
+  if (index.is_ancestor(b, a)) return b;
+  // Walk up from a until we find an ancestor of b.
+  auto cur = index.get_parent(a);
+  while (!index.is_ancestor(cur, b)) {
+    cur = index.get_parent(cur);
+  }
+  return cur;
+}
+
+// Apply an SPR move in-place on the phylo_dag: detach src from its parent,
+// optionally collapse the binary parent, then reattach src as a sibling of dst
+// under a freshly created inner node.
+//
+// The tree_index is used only to compute the LCA before topology changes.
+// This function does NOT recompute CGs, edge mutations, or Fitch sets.
+inline spr_result apply_spr_inplace(phylo_dag& tree, tree_index const& index,
+                                    std::size_t src, std::size_t dst) {
+  // 1. Record src_parent and child count.
+  std::size_t src_parent_val =
+      get_parent_idx(tree, get_parent_edge(tree, src));
+
+  // 2. Compute LCA before any topology changes.
+  std::size_t lca = compute_lca(index, src, dst);
+
+  // 3. Detach src (Phase 4).
+  auto old_child_count = detach_source(tree, src, src_parent_val);
+
+  // 4. If binary, collapse src_parent (Phase 5).
+  auto cinfo = collapse_binary_parent(tree, src_parent_val, old_child_count);
+
+  // 5. Record dst_parent after collapse (may have changed if
+  //    src_parent == dst_parent and collapse occurred).
+  std::size_t dst_parent_val =
+      get_parent_idx(tree, get_parent_edge(tree, dst));
+
+  // 6. Reattach at dst (Phase 6).
+  auto new_inner = reattach_at_destination(tree, src, dst);
+
+  // 7. Populate and return spr_result.
+  return spr_result{
+      .src = src,
+      .dst = dst,
+      .src_parent = src_parent_val,
+      .dst_parent = dst_parent_val,
+      .new_inner = new_inner,
+      .lca = lca,
+      .src_parent_collapsed = cinfo.has_value(),
+      .grandparent = cinfo ? cinfo->grandparent : 0,
+      .remaining_child = cinfo ? cinfo->remaining_child : 0,
+      .collapsed_node = cinfo ? cinfo->collapsed_node : 0,
+  };
+}
+
 }  // namespace larch

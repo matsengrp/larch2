@@ -1491,6 +1491,247 @@ static void test_reattach_adjacent_sibling() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 7 tests: apply_spr_inplace
+// ---------------------------------------------------------------------------
+
+static void test_apply_spr_inplace_with_collapse() {
+  std::println("test_apply_spr_inplace_with_collapse");
+
+  // Use the 6-leaf suboptimal tree:
+  //       root
+  //      /    \
+  //    i1      i2
+  //   / \     / \
+  //  i3  L4  L3  i4
+  //  /\         /\
+  // L1 L2     L5  L6
+  //
+  // Move L1 to be sibling of L5.
+  // i3 is binary so it collapses.
+  // After: root -> {i1 -> {L2, L4}, i2 -> {L3, i4 -> {new_inner -> {L5, L1}, L6}}}
+  auto d = make_suboptimal_tree();
+  tree_index idx{d};
+
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto i1_idx = get_child_idx(d, root_clades[0][0]);
+  auto i2_idx = get_child_idx(d, root_clades[1][0]);
+  auto i1_clades = get_clades(d, i1_idx);
+  auto i3_idx = get_child_idx(d, i1_clades[0][0]);
+  auto l4_idx = get_child_idx(d, i1_clades[1][0]);
+  auto i3_clades = get_clades(d, i3_idx);
+  auto l1_idx = get_child_idx(d, i3_clades[0][0]);
+  auto l2_idx = get_child_idx(d, i3_clades[1][0]);
+  auto i2_clades = get_clades(d, i2_idx);
+  auto l3_idx = get_child_idx(d, i2_clades[0][0]);
+  auto i4_idx = get_child_idx(d, i2_clades[1][0]);
+  auto i4_clades = get_clades(d, i4_idx);
+  auto l5_idx = get_child_idx(d, i4_clades[0][0]);
+  auto l6_idx = get_child_idx(d, i4_clades[1][0]);
+
+  auto r = apply_spr_inplace(d, idx, l1_idx, l5_idx);
+
+  // Verify spr_result fields
+  assert(r.src == l1_idx);
+  assert(r.dst == l5_idx);
+  assert(r.src_parent == i3_idx);
+  assert(r.dst_parent == i4_idx);
+  assert(r.lca == root_idx);  // LCA of L1 and L5 is root
+
+  // src_parent (i3) was binary, so it collapsed
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == i3_idx);
+  assert(r.grandparent == i1_idx);
+  assert(r.remaining_child == l2_idx);
+
+  // new_inner is a valid node with correct children {L5, L1}
+  auto ni_children = get_child_indices(d, r.new_inner);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(l5_idx) == 1);
+  assert(ni_set.count(l1_idx) == 1);
+  assert(ni_set.size() == 2);
+
+  // new_inner's parent is i4
+  auto ni_pes = get_parent_edges(d, r.new_inner);
+  assert(ni_pes.size() == 1);
+  assert(get_parent_idx(d, ni_pes[0]) == i4_idx);
+
+  // i4 has children {new_inner, L6}
+  auto i4_children = get_child_indices(d, i4_idx);
+  std::set<std::size_t> i4_set(i4_children.begin(), i4_children.end());
+  assert(i4_set.count(r.new_inner) == 1);
+  assert(i4_set.count(l6_idx) == 1);
+
+  // i1 has children {L2, L4} (i3 was collapsed)
+  auto i1_children = get_child_indices(d, i1_idx);
+  std::set<std::size_t> i1_set(i1_children.begin(), i1_children.end());
+  assert(i1_set.count(l2_idx) == 1);
+  assert(i1_set.count(l4_idx) == 1);
+  assert(i1_set.size() == 2);
+
+  std::println("  PASS");
+}
+
+static void test_apply_spr_inplace_no_collapse() {
+  std::println("test_apply_spr_inplace_no_collapse");
+
+  // Tree: UA -> R -> {A, B, C}.  Move A to be sibling of C.
+  // R is ternary so no collapse.
+  // After: R -> {B, new_inner -> {C, A}}
+  auto d = make_simple_tree();
+  tree_index idx{d};
+
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto a_idx = get_child_idx(d, root_clades[0][0]);
+  auto b_idx = get_child_idx(d, root_clades[1][0]);
+  auto c_idx = get_child_idx(d, root_clades[2][0]);
+
+  auto orig_node_count = count_nodes(d);
+
+  auto r = apply_spr_inplace(d, idx, a_idx, c_idx);
+
+  // Verify spr_result fields
+  assert(r.src == a_idx);
+  assert(r.dst == c_idx);
+  assert(r.src_parent == root_idx);
+  assert(r.dst_parent == root_idx);  // C's parent is R
+  assert(r.lca == root_idx);         // LCA of A and C is R
+  assert(!r.src_parent_collapsed);   // R was ternary, no collapse
+
+  // new_inner has children {C, A}
+  auto ni_children = get_child_indices(d, r.new_inner);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(c_idx) == 1);
+  assert(ni_set.count(a_idx) == 1);
+  assert(ni_set.size() == 2);
+
+  // R has children {B, new_inner}
+  auto r_children = get_child_indices(d, root_idx);
+  std::set<std::size_t> r_set(r_children.begin(), r_children.end());
+  assert(r_set.count(b_idx) == 1);
+  assert(r_set.count(r.new_inner) == 1);
+  assert(r_set.size() == 2);
+
+  // Node count: orig + 1 (new_inner, no collapse)
+  assert(count_nodes(d) == orig_node_count + 1);
+
+  std::println("  PASS");
+}
+
+static void test_apply_spr_inplace_sibling_move() {
+  std::println("test_apply_spr_inplace_sibling_move");
+
+  // Tree: UA -> R -> {A, B, C}.  Move A to be sibling of B.
+  // src_parent == dst_parent == R (ternary, no collapse).
+  // After: R -> {new_inner -> {B, A}, C}
+  auto d = make_simple_tree();
+  tree_index idx{d};
+
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto a_idx = get_child_idx(d, root_clades[0][0]);
+  auto b_idx = get_child_idx(d, root_clades[1][0]);
+  auto c_idx = get_child_idx(d, root_clades[2][0]);
+
+  auto r = apply_spr_inplace(d, idx, a_idx, b_idx);
+
+  // Verify spr_result fields — src_parent == dst_parent
+  assert(r.src == a_idx);
+  assert(r.dst == b_idx);
+  assert(r.src_parent == root_idx);
+  assert(r.dst_parent == root_idx);
+  assert(r.lca == root_idx);  // LCA of siblings is their parent
+  assert(!r.src_parent_collapsed);
+
+  // new_inner has children {B, A}
+  auto ni_children = get_child_indices(d, r.new_inner);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(b_idx) == 1);
+  assert(ni_set.count(a_idx) == 1);
+  assert(ni_set.size() == 2);
+
+  // R has children {new_inner, C}
+  auto r_children = get_child_indices(d, root_idx);
+  std::set<std::size_t> r_set(r_children.begin(), r_children.end());
+  assert(r_set.count(r.new_inner) == 1);
+  assert(r_set.count(c_idx) == 1);
+  assert(r_set.size() == 2);
+
+  std::println("  PASS");
+}
+
+static void test_apply_spr_inplace_sibling_collapse() {
+  std::println("test_apply_spr_inplace_sibling_collapse");
+
+  // Tree: UA -> R -> {P -> {A, B}, C}.  Move A to be sibling of B.
+  // src_parent == dst_parent == P (binary, collapses).
+  // After collapse: R -> {B, C}
+  // After reattach: R -> {new_inner -> {B, A}, C}
+  // dst_parent in spr_result should be R (post-collapse parent of B).
+  auto d = make_binary_parent_tree();
+  tree_index idx{d};
+
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto p_idx = get_child_idx(d, root_clades[0][0]);
+  auto c_idx = get_child_idx(d, root_clades[1][0]);
+  auto p_clades = get_clades(d, p_idx);
+  auto a_idx = get_child_idx(d, p_clades[0][0]);
+  auto b_idx = get_child_idx(d, p_clades[1][0]);
+
+  auto orig_node_count = count_nodes(d);
+
+  auto r = apply_spr_inplace(d, idx, a_idx, b_idx);
+
+  // Verify spr_result fields
+  assert(r.src == a_idx);
+  assert(r.dst == b_idx);
+  assert(r.src_parent == p_idx);
+  // dst_parent is R (post-collapse parent of B), not P
+  assert(r.dst_parent == root_idx);
+  assert(r.lca == p_idx);  // LCA of A and B was P
+
+  // P collapsed
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == p_idx);
+  assert(r.grandparent == root_idx);
+  assert(r.remaining_child == b_idx);
+
+  // new_inner has children {B, A}
+  auto ni_children = get_child_indices(d, r.new_inner);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(b_idx) == 1);
+  assert(ni_set.count(a_idx) == 1);
+  assert(ni_set.size() == 2);
+
+  // new_inner's parent is R
+  auto ni_pes = get_parent_edges(d, r.new_inner);
+  assert(ni_pes.size() == 1);
+  assert(get_parent_idx(d, ni_pes[0]) == root_idx);
+
+  // R has children {new_inner, C}
+  auto r_children = get_child_indices(d, root_idx);
+  std::set<std::size_t> r_set(r_children.begin(), r_children.end());
+  assert(r_set.count(r.new_inner) == 1);
+  assert(r_set.count(c_idx) == 1);
+  assert(r_set.size() == 2);
+
+  // Node count: orig - 1 (collapse P) + 1 (new_inner) = orig
+  assert(count_nodes(d) == orig_node_count);
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1537,6 +1778,12 @@ int main() {
   test_reattach_after_root_collapse();
   test_reattach_adjacent_sibling();
 
-  std::println("All inplace SPR phase 1-6 tests passed!");
+  // Phase 7: apply_spr_inplace
+  test_apply_spr_inplace_with_collapse();
+  test_apply_spr_inplace_no_collapse();
+  test_apply_spr_inplace_sibling_move();
+  test_apply_spr_inplace_sibling_collapse();
+
+  std::println("All inplace SPR phase 1-7 tests passed!");
   return 0;
 }
