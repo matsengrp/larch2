@@ -1106,6 +1106,7 @@ static void test_reattach_with_collapse() {
   auto b_idx = get_child_idx(d, p_clades[1][0]);
 
   auto orig_node_count = count_nodes(d);
+  auto orig_edge_count = count_edges(d);
 
   // Detach A from P, collapse P
   auto old_cc = detach_source(d, a_idx, p_idx);
@@ -1132,6 +1133,9 @@ static void test_reattach_with_collapse() {
 
   // Node count: orig - 1 (collapse) + 1 (new_inner) = orig
   assert(count_nodes(d) == orig_node_count);
+
+  // Edge count: orig - 1 (detach) - 2 + 1 (collapse) - 1 (remove dst edge) + 3 = orig
+  assert(count_edges(d) == orig_edge_count);
 
   std::println("  PASS");
 }
@@ -1238,6 +1242,254 @@ static void test_reattach_on_suboptimal_tree() {
   std::println("  PASS");
 }
 
+static void test_reattach_dst_is_tree_root() {
+  std::println("test_reattach_dst_is_tree_root");
+
+  // Tree: UA -> R -> {A, B, C}.  Detach A, reattach as sibling of R (tree root).
+  // Expected: UA -> new_inner -> {R -> {B, C}, A}
+  auto d = make_simple_tree();
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+
+  auto a_idx = get_child_idx(d, root_clades[0][0]);
+  auto b_idx = get_child_idx(d, root_clades[1][0]);
+  auto c_idx = get_child_idx(d, root_clades[2][0]);
+
+  auto orig_node_count = count_nodes(d);
+  auto orig_edge_count = count_edges(d);
+
+  // Detach A from R (ternary, no collapse)
+  detach_source(d, a_idx, root_idx);
+
+  // Reattach A as sibling of R (the tree root, child of UA)
+  auto ni_idx = reattach_at_destination(d, a_idx, root_idx);
+
+  // new_inner has children {R, A}
+  auto ni_children = get_child_indices(d, ni_idx);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(root_idx) == 1);
+  assert(ni_set.count(a_idx) == 1);
+  assert(ni_set.size() == 2);
+
+  // new_inner's parent is UA
+  auto ni_pes = get_parent_edges(d, ni_idx);
+  assert(ni_pes.size() == 1);
+  assert(get_parent_idx(d, ni_pes[0]) == ua_idx);
+
+  // R's parent is now new_inner (not UA)
+  auto r_pes = get_parent_edges(d, root_idx);
+  assert(r_pes.size() == 1);
+  assert(get_parent_idx(d, r_pes[0]) == ni_idx);
+
+  // R has children {B, C} (A was removed)
+  auto r_children = get_child_indices(d, root_idx);
+  std::set<std::size_t> r_set(r_children.begin(), r_children.end());
+  assert(r_set.count(b_idx) == 1);
+  assert(r_set.count(c_idx) == 1);
+  assert(r_set.size() == 2);
+
+  // Node count: original + 1 (new_inner, no collapse)
+  assert(count_nodes(d) == orig_node_count + 1);
+  // Edge count: original - 1 (detach) - 1 (remove dst edge) + 3 = original + 1
+  assert(count_edges(d) == orig_edge_count + 1);
+
+  std::println("  PASS");
+}
+
+static void test_reattach_dst_is_inner_node() {
+  std::println("test_reattach_dst_is_inner_node");
+
+  // Use the 6-leaf suboptimal tree:
+  //       root
+  //      /    \
+  //    i1      i2
+  //   / \     / \
+  //  i3  L4  L3  i4
+  //  /\         /\
+  // L1 L2     L5  L6
+  //
+  // Detach L4 from i1 (binary, collapses i1), reattach L4 as sibling of i2
+  // (inner node).
+  // After collapse: root -> {i3 -> {L1, L2}, i2 -> {L3, i4 -> {L5, L6}}}
+  // After reattach: root -> {i3, new_inner -> {i2 -> {L3, i4}, L4}}
+  auto d = make_suboptimal_tree();
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto i1_idx = get_child_idx(d, root_clades[0][0]);
+  auto i2_idx = get_child_idx(d, root_clades[1][0]);
+  auto i1_clades = get_clades(d, i1_idx);
+  auto i3_idx = get_child_idx(d, i1_clades[0][0]);
+  auto l4_idx = get_child_idx(d, i1_clades[1][0]);
+  auto i2_clades = get_clades(d, i2_idx);
+  auto l3_idx = get_child_idx(d, i2_clades[0][0]);
+  auto i4_idx = get_child_idx(d, i2_clades[1][0]);
+
+  auto orig_node_count = count_nodes(d);
+  auto orig_edge_count = count_edges(d);
+
+  // Detach L4 from i1 (binary, collapses i1)
+  auto old_cc = detach_source(d, l4_idx, i1_idx);
+  auto cinfo = collapse_binary_parent(d, i1_idx, old_cc);
+  assert(cinfo.has_value());
+
+  // Reattach L4 as sibling of i2 (inner node with subtree)
+  auto ni_idx = reattach_at_destination(d, l4_idx, i2_idx);
+
+  // new_inner has children {i2, L4}
+  auto ni_children = get_child_indices(d, ni_idx);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(i2_idx) == 1);
+  assert(ni_set.count(l4_idx) == 1);
+  assert(ni_set.size() == 2);
+
+  // i2's subtree is preserved: children are still {L3, i4}
+  auto i2_children = get_child_indices(d, i2_idx);
+  std::set<std::size_t> i2_set(i2_children.begin(), i2_children.end());
+  assert(i2_set.count(l3_idx) == 1);
+  assert(i2_set.count(i4_idx) == 1);
+  assert(i2_set.size() == 2);
+
+  // root has children {i3, new_inner}
+  auto r_children = get_child_indices(d, root_idx);
+  std::set<std::size_t> r_set(r_children.begin(), r_children.end());
+  assert(r_set.count(i3_idx) == 1);
+  assert(r_set.count(ni_idx) == 1);
+  assert(r_set.size() == 2);
+
+  // Node count: orig - 1 (collapse i1) + 1 (new_inner) = orig
+  assert(count_nodes(d) == orig_node_count);
+  // Edge count: orig - 1 (detach) - 2 + 1 (collapse) - 1 (remove dst edge) + 3 = orig
+  assert(count_edges(d) == orig_edge_count);
+
+  std::println("  PASS");
+}
+
+static void test_reattach_after_root_collapse() {
+  std::println("test_reattach_after_root_collapse");
+
+  // Tree: UA -> R -> {P -> {A, B}, C}.
+  // Detach C from R (R is binary, collapses).
+  // After collapse: UA -> P -> {A, B}
+  // Reattach C as sibling of A.
+  // After reattach: UA -> P -> {new_inner -> {A, C}, B}
+  auto d = make_binary_parent_tree();
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto p_idx = get_child_idx(d, root_clades[0][0]);
+  auto c_idx = get_child_idx(d, root_clades[1][0]);
+  auto p_clades = get_clades(d, p_idx);
+  auto a_idx = get_child_idx(d, p_clades[0][0]);
+  auto b_idx = get_child_idx(d, p_clades[1][0]);
+
+  auto orig_node_count = count_nodes(d);
+  auto orig_edge_count = count_edges(d);
+
+  // Detach C from R (R is binary, will collapse)
+  auto old_cc = detach_source(d, c_idx, root_idx);
+  auto cinfo = collapse_binary_parent(d, root_idx, old_cc);
+  assert(cinfo.has_value());
+  assert(cinfo->grandparent == ua_idx);
+  assert(cinfo->remaining_child == p_idx);
+
+  // After collapse: P's parent is now UA
+  auto p_pes = get_parent_edges(d, p_idx);
+  assert(p_pes.size() == 1);
+  assert(get_parent_idx(d, p_pes[0]) == ua_idx);
+
+  // Reattach C as sibling of A
+  auto ni_idx = reattach_at_destination(d, c_idx, a_idx);
+
+  // new_inner has children {A, C}
+  auto ni_children = get_child_indices(d, ni_idx);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(a_idx) == 1);
+  assert(ni_set.count(c_idx) == 1);
+  assert(ni_set.size() == 2);
+
+  // P has children {new_inner, B}
+  auto p_children = get_child_indices(d, p_idx);
+  std::set<std::size_t> p_set(p_children.begin(), p_children.end());
+  assert(p_set.count(ni_idx) == 1);
+  assert(p_set.count(b_idx) == 1);
+  assert(p_set.size() == 2);
+
+  // new_inner's parent is P
+  auto ni_pes = get_parent_edges(d, ni_idx);
+  assert(ni_pes.size() == 1);
+  assert(get_parent_idx(d, ni_pes[0]) == p_idx);
+
+  // P's parent is still UA (tree root changed from R to P)
+  p_pes = get_parent_edges(d, p_idx);
+  assert(p_pes.size() == 1);
+  assert(get_parent_idx(d, p_pes[0]) == ua_idx);
+
+  // Node count: orig - 1 (collapse R) + 1 (new_inner) = orig
+  assert(count_nodes(d) == orig_node_count);
+  // Edge count: orig - 1 (detach) - 2 + 1 (collapse) - 1 (remove dst edge) + 3 = orig
+  assert(count_edges(d) == orig_edge_count);
+
+  std::println("  PASS");
+}
+
+static void test_reattach_adjacent_sibling() {
+  std::println("test_reattach_adjacent_sibling");
+
+  // Tree: UA -> R -> {A, B, C}.  Detach A, reattach as sibling of B.
+  // Expected: R -> {new_inner -> {B, A}, C}
+  // This is a "move to adjacent node" — topologically near-trivial but still
+  // exercises the reattach path when src and dst were originally siblings.
+  auto d = make_simple_tree();
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+
+  auto a_idx = get_child_idx(d, root_clades[0][0]);
+  auto b_idx = get_child_idx(d, root_clades[1][0]);
+  auto c_idx = get_child_idx(d, root_clades[2][0]);
+
+  auto orig_node_count = count_nodes(d);
+  auto orig_edge_count = count_edges(d);
+
+  // Detach A from R (ternary, no collapse)
+  detach_source(d, a_idx, root_idx);
+
+  // Reattach A as sibling of B (A's former sibling)
+  auto ni_idx = reattach_at_destination(d, a_idx, b_idx);
+
+  // new_inner has children {B, A}
+  auto ni_children = get_child_indices(d, ni_idx);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(b_idx) == 1);
+  assert(ni_set.count(a_idx) == 1);
+  assert(ni_set.size() == 2);
+
+  // R has children {new_inner, C}
+  auto r_children = get_child_indices(d, root_idx);
+  std::set<std::size_t> r_set(r_children.begin(), r_children.end());
+  assert(r_set.count(ni_idx) == 1);
+  assert(r_set.count(c_idx) == 1);
+  assert(r_set.size() == 2);
+
+  // new_inner's parent is R
+  auto ni_pes = get_parent_edges(d, ni_idx);
+  assert(ni_pes.size() == 1);
+  assert(get_parent_idx(d, ni_pes[0]) == root_idx);
+
+  // Node count: original + 1 (new_inner, no collapse)
+  assert(count_nodes(d) == orig_node_count + 1);
+  // Edge count: original - 1 (detach) - 1 (remove dst edge) + 3 = original + 1
+  assert(count_edges(d) == orig_edge_count + 1);
+
+  std::println("  PASS");
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -1280,6 +1532,10 @@ int main() {
   test_reattach_with_collapse();
   test_reattach_preserves_clade_index();
   test_reattach_on_suboptimal_tree();
+  test_reattach_dst_is_tree_root();
+  test_reattach_dst_is_inner_node();
+  test_reattach_after_root_collapse();
+  test_reattach_adjacent_sibling();
 
   std::println("All inplace SPR phase 1-6 tests passed!");
   return 0;

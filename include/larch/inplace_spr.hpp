@@ -100,6 +100,23 @@ struct collapse_info {
   std::size_t collapsed_node;    // index of the removed node
 };
 
+// Check whether a node has at least one parent edge, without heap-allocating
+// the std::vector that get_parent_edges() returns.
+inline bool has_parent_edge(phylo_dag& d, std::size_t node_idx) {
+  bool found = false;
+  auto nv = d.get_node(node_idx);
+  std::visit(
+      [&](auto node) {
+        for (auto ev : node.get_parents()) {
+          (void)ev;
+          found = true;
+          break;
+        }
+      },
+      nv);
+  return found;
+}
+
 // Return the single parent edge index for a tree node, without heap-allocating
 // the std::vector that get_parent_edges() returns.
 // Precondition: node has exactly 1 parent edge.
@@ -116,7 +133,7 @@ inline std::size_t get_parent_edge(phylo_dag& d, std::size_t node_idx) {
                 found = true;
               },
               ev);
-          break;
+          break;  // only need the first (and only) parent edge
         }
       },
       nv);
@@ -229,10 +246,19 @@ inline std::optional<collapse_info> collapse_binary_parent(
 // Preconditions:
 //   - src has no parent edge (already detached via detach_source).
 //   - dst has exactly one parent edge.
+//   - dst is not the UA node.
+//   - src != dst.
+//
+// Note: dst_parent is resolved to a chain index (stable across appends), so
+// the index remains valid after append_node/append_edge calls below.
 //
 // Returns the index of the newly created inner node.
 inline std::size_t reattach_at_destination(phylo_dag& d, std::size_t src,
                                            std::size_t dst) {
+  assert(!has_parent_edge(d, src) && "src must have no parent edge (already detached)");
+  assert(!is_ua(d, dst) && "dst cannot be the UA node");
+  assert(src != dst && "src and dst must be different nodes");
+
   // 1. Find dst_parent and the clade index of the dst_parent -> dst edge
   auto dst_pe = get_parent_edge(d, dst);
   std::size_t dst_parent = get_parent_idx(d, dst_pe);
