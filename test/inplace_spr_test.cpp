@@ -264,6 +264,104 @@ static void test_tree_state_with_pool() {
   std::println("  PASS");
 }
 
+static void test_tree_state_zero_parsimony() {
+  std::println("test_tree_state_zero_parsimony");
+
+  // All leaves identical to reference — zero parsimony.
+  constexpr std::string_view ref = "AAA";
+  phylo_dag d;
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto l1 = d.append_node<node_kind::leaf>();
+  l1.cg() = cg_from_sequence("AAA", ref);
+  l1.sample_id() = "leaf1";
+  auto l2 = d.append_node<node_kind::leaf>();
+  l2.cg() = cg_from_sequence("AAA", ref);
+  l2.sample_id() = "leaf2";
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAA", ref);
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), l1.index(), 0);
+  add_edge(d, root.index(), l2.index(), 1);
+
+  recompute_edge_mutations(d);
+
+  tree_state state{d};
+  std::println("  parsimony_score = {}", state.parsimony_score);
+  assert(state.parsimony_score == 0);
+  assert(state.step_count == 0);
+
+  std::println("  PASS");
+}
+
+static void test_tree_state_single_leaf() {
+  std::println("test_tree_state_single_leaf");
+
+  // Degenerate tree: UA -> root (leaf).
+  constexpr std::string_view ref = "ACG";
+  phylo_dag d;
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto leaf = d.append_node<node_kind::leaf>();
+  leaf.cg() = cg_from_sequence("ACG", ref);
+  leaf.sample_id() = "only_leaf";
+
+  add_edge(d, ua.index(), leaf.index(), 0);
+
+  recompute_edge_mutations(d);
+
+  tree_state state{d};
+  std::println("  parsimony_score = {}", state.parsimony_score);
+  // Single leaf — no inner nodes, no Fitch cost.
+  assert(state.parsimony_score == 0);
+  assert(state.step_count == 0);
+
+  std::println("  PASS");
+}
+
+static void test_tree_state_no_variable_sites() {
+  std::println("test_tree_state_no_variable_sites");
+
+  // Two leaves identical to ref — no variable sites at all.
+  constexpr std::string_view ref = "GG";
+  phylo_dag d;
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto l1 = d.append_node<node_kind::leaf>();
+  l1.cg() = cg_from_sequence("GG", ref);
+  l1.sample_id() = "leaf1";
+  auto l2 = d.append_node<node_kind::leaf>();
+  l2.cg() = cg_from_sequence("GG", ref);
+  l2.sample_id() = "leaf2";
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("GG", ref);
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), l1.index(), 0);
+  add_edge(d, root.index(), l2.index(), 1);
+
+  recompute_edge_mutations(d);
+
+  tree_index idx{d};
+  std::println("  variable_sites = {}", idx.num_variable_sites());
+  assert(idx.num_variable_sites() == 0);
+
+  tree_state state{d};
+  std::println("  parsimony_score = {}", state.parsimony_score);
+  assert(state.parsimony_score == 0);
+
+  std::println("  PASS");
+}
+
 // ---------------------------------------------------------------------------
 // Phase 3 tests: is_valid_
 // ---------------------------------------------------------------------------
@@ -351,6 +449,9 @@ int main() {
   test_tree_state_construction();
   test_tree_state_simple_tree();
   test_tree_state_with_pool();
+  test_tree_state_zero_parsimony();
+  test_tree_state_single_leaf();
+  test_tree_state_no_variable_sites();
 
   // Phase 3: is_valid_
   test_is_valid_initialization();

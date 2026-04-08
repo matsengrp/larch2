@@ -35,6 +35,13 @@ struct tree_state {
   int parsimony_score;     // running total
   std::size_t step_count;  // moves applied so far
 
+  // Non-copyable/movable: index holds a reference to the same tree,
+  // and accidental copies would create a stale index sharing the same DAG.
+  tree_state(tree_state const&) = delete;
+  tree_state& operator=(tree_state const&) = delete;
+  tree_state(tree_state&&) = delete;
+  tree_state& operator=(tree_state&&) = delete;
+
   explicit tree_state(phylo_dag& t)
       : tree{t}, index{t}, parsimony_score{0}, step_count{0} {
     parsimony_score = compute_parsimony_from_index(index);
