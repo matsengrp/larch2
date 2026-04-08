@@ -1491,6 +1491,214 @@ static void test_reattach_adjacent_sibling() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 8 helpers: 12-leaf tree and topology comparison
+// ---------------------------------------------------------------------------
+
+// Node indices returned by make_12leaf_tree for easy test access.
+struct twelve_leaf_tree {
+  phylo_dag tree;
+  std::size_t root, i1, i2, i3, i4, i5, i6, i7, i8, i9;
+  std::size_t L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12;
+};
+
+// Build a 12-leaf tree with mixed binary/ternary structure:
+//
+//                      root
+//                    /       \
+//                  i1          i2
+//                 / \         / \
+//               i3   i4     i5    i6
+//              / \  / \    / \   / | \
+//            L1  L2 L3 L4 L5  L6 L7 L8 i7
+//                                      / \
+//                                    L9  i8
+//                                       / \
+//                                     L10 i9
+//                                        / \
+//                                      L11 L12
+//
+// Binary parents: root, i1, i2, i3, i4, i5, i7, i8, i9
+// Ternary parent: i6 (children: L7, L8, i7)
+//
+static twelve_leaf_tree make_12leaf_tree() {
+  constexpr std::string_view ref = "AAAAAAAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto l1 = d.append_node<node_kind::leaf>();
+  l1.cg() = cg_from_sequence("TAAAAAAA", ref);
+  l1.sample_id() = "L1";
+  auto l2 = d.append_node<node_kind::leaf>();
+  l2.cg() = cg_from_sequence("ATAAAAAA", ref);
+  l2.sample_id() = "L2";
+  auto l3 = d.append_node<node_kind::leaf>();
+  l3.cg() = cg_from_sequence("AATAAAAA", ref);
+  l3.sample_id() = "L3";
+  auto l4 = d.append_node<node_kind::leaf>();
+  l4.cg() = cg_from_sequence("AAATAAAA", ref);
+  l4.sample_id() = "L4";
+  auto l5 = d.append_node<node_kind::leaf>();
+  l5.cg() = cg_from_sequence("AAAATAAA", ref);
+  l5.sample_id() = "L5";
+  auto l6 = d.append_node<node_kind::leaf>();
+  l6.cg() = cg_from_sequence("AAAAATAA", ref);
+  l6.sample_id() = "L6";
+  auto l7 = d.append_node<node_kind::leaf>();
+  l7.cg() = cg_from_sequence("AAAAAATA", ref);
+  l7.sample_id() = "L7";
+  auto l8 = d.append_node<node_kind::leaf>();
+  l8.cg() = cg_from_sequence("AAAAAAAT", ref);
+  l8.sample_id() = "L8";
+  auto l9 = d.append_node<node_kind::leaf>();
+  l9.cg() = cg_from_sequence("TAAATAAA", ref);
+  l9.sample_id() = "L9";
+  auto l10 = d.append_node<node_kind::leaf>();
+  l10.cg() = cg_from_sequence("ATAAATAA", ref);
+  l10.sample_id() = "L10";
+  auto l11 = d.append_node<node_kind::leaf>();
+  l11.cg() = cg_from_sequence("AATAAATA", ref);
+  l11.sample_id() = "L11";
+  auto l12 = d.append_node<node_kind::leaf>();
+  l12.cg() = cg_from_sequence("AAATAAAT", ref);
+  l12.sample_id() = "L12";
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAAAAAAA", ref);
+  auto n_i1 = d.append_node<node_kind::inner>();
+  n_i1.cg() = cg_from_sequence("AAAAAAAA", ref);
+  auto n_i2 = d.append_node<node_kind::inner>();
+  n_i2.cg() = cg_from_sequence("AAAAAAAA", ref);
+  auto n_i3 = d.append_node<node_kind::inner>();
+  n_i3.cg() = cg_from_sequence("AAAAAAAA", ref);
+  auto n_i4 = d.append_node<node_kind::inner>();
+  n_i4.cg() = cg_from_sequence("AAAAAAAA", ref);
+  auto n_i5 = d.append_node<node_kind::inner>();
+  n_i5.cg() = cg_from_sequence("AAAAAAAA", ref);
+  auto n_i6 = d.append_node<node_kind::inner>();
+  n_i6.cg() = cg_from_sequence("AAAAAAAA", ref);
+  auto n_i7 = d.append_node<node_kind::inner>();
+  n_i7.cg() = cg_from_sequence("AAAAAAAA", ref);
+  auto n_i8 = d.append_node<node_kind::inner>();
+  n_i8.cg() = cg_from_sequence("AAAAAAAA", ref);
+  auto n_i9 = d.append_node<node_kind::inner>();
+  n_i9.cg() = cg_from_sequence("AAAAAAAA", ref);
+
+  // UA -> root
+  add_edge(d, ua.index(), root.index(), 0);
+  // root -> i1, i2
+  add_edge(d, root.index(), n_i1.index(), 0);
+  add_edge(d, root.index(), n_i2.index(), 1);
+  // i1 -> i3, i4
+  add_edge(d, n_i1.index(), n_i3.index(), 0);
+  add_edge(d, n_i1.index(), n_i4.index(), 1);
+  // i2 -> i5, i6
+  add_edge(d, n_i2.index(), n_i5.index(), 0);
+  add_edge(d, n_i2.index(), n_i6.index(), 1);
+  // i3 -> L1, L2
+  add_edge(d, n_i3.index(), l1.index(), 0);
+  add_edge(d, n_i3.index(), l2.index(), 1);
+  // i4 -> L3, L4
+  add_edge(d, n_i4.index(), l3.index(), 0);
+  add_edge(d, n_i4.index(), l4.index(), 1);
+  // i5 -> L5, L6
+  add_edge(d, n_i5.index(), l5.index(), 0);
+  add_edge(d, n_i5.index(), l6.index(), 1);
+  // i6 -> L7, L8, i7  (ternary)
+  add_edge(d, n_i6.index(), l7.index(), 0);
+  add_edge(d, n_i6.index(), l8.index(), 1);
+  add_edge(d, n_i6.index(), n_i7.index(), 2);
+  // i7 -> L9, i8
+  add_edge(d, n_i7.index(), l9.index(), 0);
+  add_edge(d, n_i7.index(), n_i8.index(), 1);
+  // i8 -> L10, i9
+  add_edge(d, n_i8.index(), l10.index(), 0);
+  add_edge(d, n_i8.index(), n_i9.index(), 1);
+  // i9 -> L11, L12
+  add_edge(d, n_i9.index(), l11.index(), 0);
+  add_edge(d, n_i9.index(), l12.index(), 1);
+
+  fitch_assign_compact_genomes(d);
+  recompute_edge_mutations(d);
+
+  return twelve_leaf_tree{
+      .tree = std::move(d),
+      .root = root.index(),
+      .i1 = n_i1.index(),
+      .i2 = n_i2.index(),
+      .i3 = n_i3.index(),
+      .i4 = n_i4.index(),
+      .i5 = n_i5.index(),
+      .i6 = n_i6.index(),
+      .i7 = n_i7.index(),
+      .i8 = n_i8.index(),
+      .i9 = n_i9.index(),
+      .L1 = l1.index(),
+      .L2 = l2.index(),
+      .L3 = l3.index(),
+      .L4 = l4.index(),
+      .L5 = l5.index(),
+      .L6 = l6.index(),
+      .L7 = l7.index(),
+      .L8 = l8.index(),
+      .L9 = l9.index(),
+      .L10 = l10.index(),
+      .L11 = l11.index(),
+      .L12 = l12.index(),
+  };
+}
+
+// Collect the set of leaf sample_ids from a tree.
+static std::set<std::string> collect_leaf_sample_ids(phylo_dag& d) {
+  std::set<std::string> result;
+  for (auto nv : d.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.sample_id(); }) {
+            result.insert(node.sample_id());
+          }
+        },
+        nv);
+  }
+  return result;
+}
+
+// Compute the set of "clades" for topology comparison.
+// For each non-leaf, non-UA node, compute the set of leaf sample_ids reachable
+// from it.  Two trees have the same topology iff they produce the same set of
+// clade leaf-sets (modulo node index renumbering).
+static std::set<std::set<std::string>> compute_clade_sets(phylo_dag& d) {
+  auto subtree_leaves = compute_subtree_leaves(d);
+  auto ua_idx = get_root_idx(d);
+
+  // Map node-index leaf sets to sample_id leaf sets
+  std::set<std::set<std::string>> result;
+  for (auto nv : d.get_all_nodes()) {
+    auto idx = std::visit([](auto n) { return n.index(); }, nv);
+    if (is_ua(d, idx)) continue;
+    if (is_leaf(d, idx)) continue;
+    auto const& leaf_indices = subtree_leaves[idx];
+    if (leaf_indices.empty()) continue;
+
+    std::set<std::string> leaf_ids;
+    for (auto lidx : leaf_indices) {
+      auto lnv = d.get_node(lidx);
+      std::visit(
+          [&](auto node) {
+            if constexpr (requires { node.sample_id(); }) {
+              leaf_ids.insert(node.sample_id());
+            }
+          },
+          lnv);
+    }
+    result.insert(std::move(leaf_ids));
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 7 tests: apply_spr_inplace
 // ---------------------------------------------------------------------------
 
@@ -1732,6 +1940,95 @@ static void test_apply_spr_inplace_sibling_collapse() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 8 tests: validate in-place vs clone-based SPR
+// ---------------------------------------------------------------------------
+
+static void test_inplace_vs_clone_spr() {
+  std::println("test_inplace_vs_clone_spr");
+
+  // 10 different (src, dst) pairs on the 12-leaf tree.
+  // Each pair exercises a different SPR configuration:
+  //  1. L1->L5:  cross-tree, binary collapse at i3
+  //  2. L3->L8:  cross-tree to ternary subtree, binary collapse at i4
+  //  3. L5->L3:  cross-tree, binary collapse at i5
+  //  4. L7->L1:  ternary parent i6, no collapse
+  //  5. L1->L2:  sibling move, binary collapse at i3
+  //  6. L11->L5: deep to shallow, binary collapse at i9
+  //  7. L9->L12: within-subtree, binary collapse at i7
+  //  8. L4->L6:  cross-subtree, binary collapse at i4
+  //  9. L12->L1: deep to far side, binary collapse at i9
+  // 10. L6->L10: cross-subtree, binary collapse at i5
+  struct move_spec {
+    std::size_t twelve_leaf_tree::*src;
+    std::size_t twelve_leaf_tree::*dst;
+    const char* desc;
+  };
+
+  move_spec moves[] = {
+      {&twelve_leaf_tree::L1, &twelve_leaf_tree::L5, "L1->L5 cross-tree collapse"},
+      {&twelve_leaf_tree::L3, &twelve_leaf_tree::L8, "L3->L8 cross-tree to ternary"},
+      {&twelve_leaf_tree::L5, &twelve_leaf_tree::L3, "L5->L3 cross-tree collapse"},
+      {&twelve_leaf_tree::L7, &twelve_leaf_tree::L1, "L7->L1 ternary no collapse"},
+      {&twelve_leaf_tree::L1, &twelve_leaf_tree::L2, "L1->L2 sibling collapse"},
+      {&twelve_leaf_tree::L11, &twelve_leaf_tree::L5, "L11->L5 deep to shallow"},
+      {&twelve_leaf_tree::L9, &twelve_leaf_tree::L12, "L9->L12 within subtree"},
+      {&twelve_leaf_tree::L4, &twelve_leaf_tree::L6, "L4->L6 cross-subtree"},
+      {&twelve_leaf_tree::L12, &twelve_leaf_tree::L1, "L12->L1 deep to far side"},
+      {&twelve_leaf_tree::L6, &twelve_leaf_tree::L10, "L6->L10 cross-subtree deep"},
+  };
+
+  for (auto const& [src_member, dst_member, desc] : moves) {
+    std::println("  subtest: {}", desc);
+
+    // --- Clone-based path ---
+    auto ta = make_12leaf_tree();
+    auto src_a = ta.*src_member;
+    auto dst_a = ta.*dst_member;
+    auto clone_result = apply_spr_move(ta.tree, src_a, dst_a);
+
+    // --- In-place path ---
+    auto tb = make_12leaf_tree();
+    auto src_b = tb.*src_member;
+    auto dst_b = tb.*dst_member;
+    {
+      tree_index idx{tb.tree};
+      apply_spr_inplace(tb.tree, idx, src_b, dst_b);
+    }
+    fitch_assign_compact_genomes(tb.tree);
+    recompute_edge_mutations(tb.tree);
+
+    // --- Compare leaf sets ---
+    auto leaves_clone = collect_leaf_sample_ids(clone_result);
+    auto leaves_inplace = collect_leaf_sample_ids(tb.tree);
+    assert(leaves_clone == leaves_inplace);
+
+    // --- Compare parsimony score ---
+    int pars_clone = ground_truth_parsimony(clone_result);
+    int pars_inplace = ground_truth_parsimony(tb.tree);
+    if (pars_clone != pars_inplace) {
+      std::println("    FAIL: parsimony mismatch: clone={} inplace={}",
+                   pars_clone, pars_inplace);
+    }
+    assert(pars_clone == pars_inplace);
+
+    // --- Compare topology (clade sets) ---
+    auto clades_clone = compute_clade_sets(clone_result);
+    auto clades_inplace = compute_clade_sets(tb.tree);
+    if (clades_clone != clades_inplace) {
+      std::println("    FAIL: topology mismatch for {}", desc);
+      std::println("    clone clade count: {}", clades_clone.size());
+      std::println("    inplace clade count: {}", clades_inplace.size());
+    }
+    assert(clades_clone == clades_inplace);
+
+    std::println("    OK (parsimony={}, clades={})", pars_clone,
+                 clades_clone.size());
+  }
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1784,6 +2081,9 @@ int main() {
   test_apply_spr_inplace_sibling_move();
   test_apply_spr_inplace_sibling_collapse();
 
-  std::println("All inplace SPR phase 1-7 tests passed!");
+  // Phase 8: validate in-place vs clone-based SPR
+  test_inplace_vs_clone_spr();
+
+  std::println("All inplace SPR phase 1-8 tests passed!");
   return 0;
 }
