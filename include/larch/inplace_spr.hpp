@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 namespace larch {
 
@@ -89,6 +90,41 @@ struct tree_state {
 };
 
 // ============================================================================
+// Phase 4-5 helpers
+// ============================================================================
+
+// Result of collapsing a binary parent node.
+struct collapse_info {
+  std::size_t grandparent;       // parent of the collapsed node
+  std::size_t remaining_child;   // sibling that was reparented to grandparent
+  std::size_t collapsed_node;    // index of the removed node
+};
+
+// Return the single parent edge index for a tree node, without heap-allocating
+// the std::vector that get_parent_edges() returns.
+// Precondition: node has exactly 1 parent edge.
+inline std::size_t get_parent_edge(phylo_dag& d, std::size_t node_idx) {
+  std::size_t result = 0;
+  bool found = false;
+  auto nv = d.get_node(node_idx);
+  std::visit(
+      [&](auto node) {
+        for (auto ev : node.get_parents()) {
+          std::visit(
+              [&](auto edge) {
+                result = edge.index();
+                found = true;
+              },
+              ev);
+          break;
+        }
+      },
+      nv);
+  assert(found && "node has no parent edge");
+  return result;
+}
+
+// ============================================================================
 // Phase 4: Detach source from parent
 // ============================================================================
 
@@ -111,6 +147,7 @@ inline std::size_t child_count(phylo_dag& d, std::size_t node_idx) {
 // Precondition: node has exactly 1 child.
 inline std::size_t find_remaining_child(phylo_dag& d, std::size_t node_idx) {
   std::size_t result = 0;
+  bool found = false;
   auto nv = d.get_node(node_idx);
   std::visit(
       [&](auto node) {
@@ -121,10 +158,12 @@ inline std::size_t find_remaining_child(phylo_dag& d, std::size_t node_idx) {
                 result = std::visit([](auto c) { return c.index(); }, cv);
               },
               ev);
+          found = true;
           break;  // only need the first (and only) child
         }
       },
       nv);
+  assert(found && "expected exactly one child in find_remaining_child");
   return result;
 }
 
@@ -136,9 +175,9 @@ inline std::size_t detach_source(phylo_dag& d, std::size_t src,
   std::size_t old_child_count = child_count(d, src_parent);
 
   // Find and remove the parent edge of src
-  auto pes = get_parent_edges(d, src);
-  assert(!pes.empty());
-  auto ev = d.get_edge(pes[0]);
+  auto pe = get_parent_edge(d, src);
+  assert(get_parent_idx(d, pe) == src_parent && "src_parent does not match actual parent");
+  auto ev = d.get_edge(pe);
   std::visit([](auto edge) { edge.remove(); }, ev);
 
   return old_child_count;
@@ -151,26 +190,18 @@ inline std::size_t detach_source(phylo_dag& d, std::size_t src,
 // If src_parent had exactly 2 children before detach (now 1), collapse it:
 // wire its remaining child directly to its grandparent, then remove src_parent.
 //
-// Returns true if collapse happened.
-// On collapse, sets out_grandparent, out_remaining_child, out_collapsed_node.
-inline bool collapse_binary_parent(phylo_dag& d, std::size_t src_parent,
-                                   std::size_t old_child_count,
-                                   std::size_t& out_grandparent,
-                                   std::size_t& out_remaining_child,
-                                   std::size_t& out_collapsed_node) {
-  if (old_child_count != 2) return false;
+// Returns collapse_info if collapse happened, std::nullopt otherwise.
+inline std::optional<collapse_info> collapse_binary_parent(
+    phylo_dag& d, std::size_t src_parent, std::size_t old_child_count) {
+  if (old_child_count != 2) return std::nullopt;
 
   // src_parent now has exactly 1 child — find it
   std::size_t remaining_child = find_remaining_child(d, src_parent);
-  out_remaining_child = remaining_child;
-  out_collapsed_node = src_parent;
 
   // Find grandparent (parent of src_parent) and the clade index of that edge
-  auto sp_pes = get_parent_edges(d, src_parent);
-  assert(!sp_pes.empty());
-  std::size_t grandparent = get_parent_idx(d, sp_pes[0]);
-  std::size_t gp_clade = get_clade_idx(d, sp_pes[0]);
-  out_grandparent = grandparent;
+  auto sp_pe = get_parent_edge(d, src_parent);
+  std::size_t grandparent = get_parent_idx(d, sp_pe);
+  std::size_t gp_clade = get_clade_idx(d, sp_pe);
 
   // Remove src_parent node (removes all its edges — the remaining child edge
   // and the parent edge to grandparent)
@@ -185,7 +216,7 @@ inline bool collapse_binary_parent(phylo_dag& d, std::size_t src_parent,
   auto rcv = d.get_node(remaining_child);
   std::visit([&](auto c) { e.set_child(c); }, rcv);
 
-  return true;
+  return collapse_info{grandparent, remaining_child, src_parent};
 }
 
 }  // namespace larch

@@ -688,15 +688,12 @@ static void test_collapse_binary_inner() {
   assert(old_cc == 2);
 
   // Phase 5: collapse P (binary parent)
-  std::size_t grandparent = 0, remaining_child = 0, collapsed_node = 0;
-  bool collapsed =
-      collapse_binary_parent(d, p_idx, old_cc, grandparent, remaining_child,
-                             collapsed_node);
+  auto cinfo = collapse_binary_parent(d, p_idx, old_cc);
 
-  assert(collapsed);
-  assert(grandparent == root_idx);
-  assert(remaining_child == b_idx);
-  assert(collapsed_node == p_idx);
+  assert(cinfo.has_value());
+  assert(cinfo->grandparent == root_idx);
+  assert(cinfo->remaining_child == b_idx);
+  assert(cinfo->collapsed_node == p_idx);
 
   // P is removed: node count decreased by 1
   assert(count_nodes(d) == orig_node_count - 1);
@@ -796,13 +793,12 @@ static void test_collapse_binary_with_ternary_grandparent() {
   assert(old_cc == 2);
 
   // Collapse P
-  std::size_t gp = 0, rc = 0, cn = 0;
-  bool collapsed = collapse_binary_parent(d2, p2_idx, old_cc, gp, rc, cn);
+  auto cinfo = collapse_binary_parent(d2, p2_idx, old_cc);
 
-  assert(collapsed);
-  assert(gp == root2_idx);
-  assert(rc == b_idx);
-  assert(cn == p2_idx);
+  assert(cinfo.has_value());
+  assert(cinfo->grandparent == root2_idx);
+  assert(cinfo->remaining_child == b_idx);
+  assert(cinfo->collapsed_node == p2_idx);
 
   // P removed
   assert(count_nodes(d2) == orig_node_count - 1);
@@ -838,10 +834,9 @@ static void test_no_collapse_ternary_parent() {
   assert(old_cc == 3);
 
   // Try collapse — should not happen
-  std::size_t gp = 0, rc = 0, cn = 0;
-  bool collapsed = collapse_binary_parent(d, p_idx, old_cc, gp, rc, cn);
+  auto cinfo = collapse_binary_parent(d, p_idx, old_cc);
 
-  assert(!collapsed);
+  assert(!cinfo.has_value());
 
   // Node count unchanged (no collapse)
   assert(count_nodes(d) == orig_node_count);
@@ -872,13 +867,12 @@ static void test_collapse_binary_root() {
   assert(old_cc == 2);
 
   // Collapse R (binary root)
-  std::size_t gp = 0, rc = 0, cn = 0;
-  bool collapsed = collapse_binary_parent(d, root_idx, old_cc, gp, rc, cn);
+  auto cinfo = collapse_binary_parent(d, root_idx, old_cc);
 
-  assert(collapsed);
-  assert(gp == ua_idx);
-  assert(rc == b_idx);
-  assert(cn == root_idx);
+  assert(cinfo.has_value());
+  assert(cinfo->grandparent == ua_idx);
+  assert(cinfo->remaining_child == b_idx);
+  assert(cinfo->collapsed_node == root_idx);
 
   // R is removed
   assert(count_nodes(d) == orig_node_count - 1);
@@ -924,13 +918,12 @@ static void test_detach_and_collapse_suboptimal_tree() {
   assert(old_cc == 2);
 
   // Collapse i3
-  std::size_t gp = 0, rc = 0, cn = 0;
-  bool collapsed = collapse_binary_parent(d, i3_idx, old_cc, gp, rc, cn);
+  auto cinfo = collapse_binary_parent(d, i3_idx, old_cc);
 
-  assert(collapsed);
-  assert(gp == i1_idx);
-  assert(rc == l2_idx);
-  assert(cn == i3_idx);
+  assert(cinfo.has_value());
+  assert(cinfo->grandparent == i1_idx);
+  assert(cinfo->remaining_child == l2_idx);
+  assert(cinfo->collapsed_node == i3_idx);
 
   // i3 removed
   assert(count_nodes(d) == orig_node_count - 1);
@@ -941,6 +934,73 @@ static void test_detach_and_collapse_suboptimal_tree() {
 
   // i1 still has 2 children: L2 and L4
   assert(child_count(d, i1_idx) == 2);
+
+  std::println("  PASS");
+}
+
+static void test_detach_from_root_no_collapse() {
+  std::println("test_detach_from_root_no_collapse");
+
+  // Tree: UA -> R -> {A, B, C}.  src = A, src_parent = R (tree root).
+  // R has 3 children, so detach works but collapse should not happen.
+  auto d = make_simple_tree();
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto a_idx = get_child_idx(d, root_clades[0][0]);
+
+  auto orig_node_count = count_nodes(d);
+
+  auto old_cc = detach_source(d, a_idx, root_idx);
+  assert(old_cc == 3);
+
+  auto cinfo = collapse_binary_parent(d, root_idx, old_cc);
+  assert(!cinfo.has_value());
+
+  // Node count unchanged (no collapse)
+  assert(count_nodes(d) == orig_node_count);
+
+  // R still has 2 children
+  assert(child_count(d, root_idx) == 2);
+
+  std::println("  PASS");
+}
+
+static void test_clades_after_collapse() {
+  std::println("test_clades_after_collapse");
+
+  // Tree: UA -> R -> {P -> {A, B}, C}.  Detach A, collapse P.
+  // After: R -> {B, C}.  Verify get_clades(R) is correct.
+  auto d = make_binary_parent_tree();
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto p_idx = get_child_idx(d, root_clades[0][0]);
+  auto c_idx = get_child_idx(d, root_clades[1][0]);
+  auto p_clades = get_clades(d, p_idx);
+  auto a_idx = get_child_idx(d, p_clades[0][0]);
+  auto b_idx = get_child_idx(d, p_clades[1][0]);
+
+  auto old_cc = detach_source(d, a_idx, p_idx);
+  auto cinfo = collapse_binary_parent(d, p_idx, old_cc);
+  assert(cinfo.has_value());
+
+  // Verify clades of R after collapse
+  auto new_root_clades = get_clades(d, root_idx);
+  assert(new_root_clades.size() == 2);
+
+  // Collect all children from clades
+  std::set<std::size_t> children_from_clades;
+  for (auto& clade : new_root_clades) {
+    for (auto eidx : clade) {
+      children_from_clades.insert(get_child_idx(d, eidx));
+    }
+  }
+  assert(children_from_clades.count(b_idx) == 1);
+  assert(children_from_clades.count(c_idx) == 1);
+  assert(children_from_clades.size() == 2);
 
   std::println("  PASS");
 }
@@ -979,6 +1039,8 @@ int main() {
   test_no_collapse_ternary_parent();
   test_collapse_binary_root();
   test_detach_and_collapse_suboptimal_tree();
+  test_detach_from_root_no_collapse();
+  test_clades_after_collapse();
 
   std::println("All inplace SPR phase 1-5 tests passed!");
   return 0;
