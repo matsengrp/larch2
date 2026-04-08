@@ -165,15 +165,22 @@ std::vector<uint8_t> is_valid_;   // 1 if node is live in the tree
 ```
 
 Initialize in `init()`: `is_valid_[nid] = 1` for every node visited, `0`
-otherwise. Use it in `is_ancestor()`, `get_fitch_set()`, etc. as a precondition
-guard.
+otherwise. Use `is_valid_` only in incremental update code (e.g.,
+`compute_parsimony_score`, `update_searchable_nodes`) — **not** in general
+accessors like `is_ancestor()` or `get_fitch_set()`. Those hot-path functions
+are only called during tree traversals that naturally skip invalid nodes via
+topology (`children_[]`, `parent_[]`), and the existing `has_dfs_info_` /
+bounds checks in `is_ancestor()` already handle out-of-range indices. Adding
+a branch to every accessor would penalize the common case for a cold-path
+benefit.
 
 **Files**: `include/larch/native_optimize.hpp`
 
 **Tests**:
 - Build tree_index; all tree nodes have `is_valid_ == 1`.
 - Verify `is_valid_[ua_idx] == 0` (UA is not part of the tree_index tree).
-- Manually set `is_valid_[n] = 0`; verify `is_ancestor(n, x)` returns false.
+- Manually set `is_valid_[n] = 0`; verify `compute_parsimony_score` skips
+  node `n` (it is excluded from the Fitch cost sum).
 
 ---
 
@@ -230,6 +237,8 @@ Steps:
 - Tree: UA → R → {A, B}. Detach A from R (binary, R is tree root). Verify:
   - R is removed.
   - B is now direct child of UA.
+  - Note: `tree_index::tree_root_` must be updated to B. This is tested
+    fully in Phase 15; here, verify only the DAG topology.
 
 ---
 
@@ -263,15 +272,23 @@ Steps:
 Combine phases 4–6 into a single function:
 
 ```cpp
-spr_result apply_spr_inplace(phylo_dag& tree, std::size_t src, std::size_t dst);
+spr_result apply_spr_inplace(phylo_dag& tree, tree_index const& index,
+                             std::size_t src, std::size_t dst);
 ```
+
+The `tree_index` is needed to compute the LCA via `is_ancestor()` before
+topology changes invalidate DFS intervals.
 
 This function:
 1. Records `src_parent`, `dst_parent`, child count of `src_parent`.
-2. Detaches src (Phase 4).
-3. If binary, collapses `src_parent` (Phase 5).
-4. Reattaches at dst (Phase 6).
-5. Populates and returns `spr_result`.
+2. **Computes LCA of `src` and `dst`** using the tree_index's DFS intervals
+   (`is_ancestor`). This must happen before any topology changes, because
+   detach/collapse invalidates the ancestor relationship. Store the result
+   in `spr_result.lca`.
+3. Detaches src (Phase 4).
+4. If binary, collapses `src_parent` (Phase 5).
+5. Reattaches at dst (Phase 6).
+6. Populates and returns `spr_result`.
 
 Does **not** recompute CGs, edge mutations, or Fitch sets — that is handled
 by the incremental tree_index update.
@@ -700,8 +717,14 @@ void update_fitch(spr_result const& r) {
 Where `propagate_fitch_up_to(start, stop)` recomputes from `start` upward
 but stops before `stop` (exclusive).
 
-Handle edge case: if LCA was collapsed (`r.src_parent == r.lca &&
-r.src_parent_collapsed`), use `r.grandparent` as the effective LCA.
+Edge cases:
+- **LCA collapsed** (`r.src_parent == r.lca && r.src_parent_collapsed`): use
+  `r.grandparent` as the effective LCA.
+- **src_parent == LCA, not collapsed** (src_parent had >2 children):
+  `rem_start == r.lca`, so `propagate_fitch_up_to(rem_start, r.lca)` is a
+  no-op (start == stop). This is correct: step 3 (`propagate_fitch_upward(r.lca)`)
+  recomputes the LCA's Fitch from its current children, which already reflect
+  both the removal (src detached) and insertion (new_inner added below).
 
 **Files**: `include/larch/native_optimize.hpp`
 
@@ -739,22 +762,10 @@ changes) directly from the tree_index's Fitch arrays at the root:
 ```cpp
 int tree_index::compute_parsimony_score() const {
   int score = 0;
-  // For each variable site, walk up from each node checking if
-  // the node's Fitch set is a union (cost 1) or intersection (cost 0).
-  // Equivalently: count sites where root's Fitch set has >1 bit set,
-  // plus all internal nodes where Fitch set ≠ intersection of children.
-  //
-  // Simpler: for each node with children, count sites where the
-  // Fitch set is a strict superset of any single child's Fitch set
-  // (i.e., union was needed, meaning a mutation is required).
-  //
-  // Simplest correct approach: sum over all inner nodes, sum over all
-  // sites, 1 if fitch_set has >1 bit and is not a subset of any child.
-  // Actually: Fitch cost at a node = (num_children - max_count) per site,
-  // where max_count = max over alleles of child count for that allele.
-  // But the standard formula is simpler:
-  //   cost_at_node_site = 0 if intersection is non-empty, else 1
-  //   total = sum of cost_at_node_site over all inner nodes and sites
+  // Standard Fitch cost: for each inner node and each variable site,
+  // cost is 0 if the intersection of children's Fitch sets is non-empty,
+  // 1 otherwise. We detect non-empty intersection by checking whether
+  // any allele's child_count equals num_children.
   for (std::size_t nid = 0; nid < num_nodes_; nid++) {
     if (!is_valid_[nid] || !has_child_counts_[nid]) continue;
     uint8_t nc = num_children_[nid];
@@ -823,8 +834,8 @@ Wire the delta tracking into `tree_state`:
 ```cpp
 void tree_state::apply_move(std::size_t src, std::size_t dst) {
   auto result = apply_spr_inplace(tree, src, dst);
+  index.ensure_capacity(tree.node_high_mark());  // grow arrays BEFORE writing
   index.update_topology(result);
-  index.ensure_capacity(tree.node_high_mark());
   index.recompute_dfs();
   index.update_subtree_sizes(result);
   index.update_searchable_nodes(result);
@@ -896,18 +907,22 @@ fragments.push_back(extract_fragment(tree))
 ```
 Cost: 1 × O(N × sites).
 
-**C. Record moves and replay** (deferred extraction):
-Store the sequence of `spr_move` descriptors. After the loop, replay each
-prefix of moves on the original tree (using the existing overlay-based
-`apply_spr_as_fragment`) to produce fragments.
+**C. Record moves and replay** (deferred extraction) — **Deferred**:
+Store the sequence of `spr_move` descriptors and replay on the original tree.
+This is non-trivial because after multiple in-place SPRs, node indices diverge:
+new inner nodes are created and collapsed nodes are removed. Replaying a
+work_tree move `(src, dst)` on the original tree would reference wrong or
+nonexistent node indices. Making this work requires either (a) storing moves
+in original-tree coordinates from the start via the `old_to_new` map from
+`clone_tree`, or (b) maintaining a bidirectional index map through each SPR.
+**Not implemented in v1; revisit if Strategy A proves too expensive.**
 
 Strategy B is simplest and is recommended as the default. Strategy A adds
-diversity but at proportional cost. Strategy C avoids mid-loop cloning but
-requires keeping the original tree intact (separate from the mutable copy).
+diversity but at proportional cost.
 
-Implement all three behind a configuration enum:
+Implement A and B behind a configuration enum:
 ```cpp
-enum class fragment_strategy { every_step, final_only, replay };
+enum class fragment_strategy { every_step, final_only };
 ```
 
 **Files**: `include/larch/inplace_spr.hpp`
@@ -915,8 +930,6 @@ enum class fragment_strategy { every_step, final_only, replay };
 **Tests**:
 - **every_step**: K fragments produced, each a valid tree with correct leaves.
 - **final_only**: 1 fragment produced.
-- **replay**: K fragments, each identical to what `apply_spr_as_fragment`
-  would have produced for the same move on the same base tree.
 
 ---
 
@@ -961,7 +974,7 @@ struct inplace_move_producer {
   fragment_strategy frag_mode{fragment_strategy::final_only};
   thread_pool& pool = thread_pool::get_default();
 
-  void operator()(phylo_dag& tree, move_callback cb, std::mt19937& rng);
+  void operator()(phylo_dag& tree, dag_callback frag_cb, std::mt19937& rng);
 };
 ```
 
@@ -998,6 +1011,10 @@ void inplace_move_producer::operator()(
     if (r == 0) r = 1;
 
     std::vector<profitable_move> candidates;
+    // Note: candidates.push_back in the callback is safe because
+    // find_all_moves_parallel collects into per-source vectors internally
+    // and invokes the callback sequentially from the main thread after
+    // the parallel phase completes (see native_optimize.hpp:974-990).
     enumerator.find_all_moves_parallel(r,
         [&](profitable_move const& m) { candidates.push_back(m); }, pool);
 
@@ -1080,30 +1097,39 @@ The `optimize_dag_v2` pipeline then calls `apply_spr_as_fragment(sampled, move)`
 on the original sampled tree. But for the in-place producer, the moves are
 relative to the evolving `work_tree`, not the original.
 
-Two options:
+**Decision: Option A — separate `FragmentProducer` concept.**
 
-**A. Return the work_tree itself as a fragment** (via a new callback type):
-Add a `dag_callback = std::function<void(phylo_dag)>` parameter to the
-producer. When extraction happens, clone `work_tree`, run Fitch, and call the
-dag_callback directly.
+The `inplace_move_producer` cannot satisfy the existing `MoveProducer` concept
+(3 parameters: tree, move_callback, rng) because its moves are relative to an
+evolving internal work_tree, not the caller's sampled tree. Calling
+`apply_spr_as_fragment(sampled, move)` with work_tree-relative moves would
+produce wrong topologies.
 
-**B. Integrate with `optimize_dag_v2` by producing complete fragments**:
-The producer handles extraction internally, bypassing the standard
-`apply_spr_as_fragment` path. This requires `optimize_dag_v2` to accept
-producers that emit fragments directly.
+Instead, define a new concept for producers that emit complete fragments:
 
-Option A is simpler and more self-contained. The `inplace_move_producer`
-returns complete `phylo_dag` fragments through a separate callback, and the
-caller merges them.
-
-Refine the operator signature:
 ```cpp
-void operator()(phylo_dag& tree, move_callback move_cb,
-                dag_callback frag_cb, std::mt19937& rng);
+using dag_callback = std::function<void(phylo_dag)>;
+
+template <typename F>
+concept FragmentProducer =
+    requires(F& f, phylo_dag& tree, dag_callback cb, std::mt19937& rng) {
+      { f(tree, cb, rng) };
+    };
 ```
 
-Or: adapt `optimize_dag_v2` to accept this extended signature via a concept
-that allows optional `dag_callback`.
+The `inplace_move_producer` satisfies `FragmentProducer`:
+```cpp
+void operator()(phylo_dag& tree, dag_callback frag_cb, std::mt19937& rng);
+```
+
+It handles extraction internally: clone `work_tree`, run Fitch, and call
+`frag_cb` directly. The caller merges the received fragments without
+needing `apply_spr_as_fragment`.
+
+Extend `optimize_dag_v2` to accept both `MoveProducer`s and
+`FragmentProducer`s. `MoveProducer`s go through the existing collect-then-
+fragment path; `FragmentProducer`s call `m.add_dag()` on each emitted
+fragment directly.
 
 **Files**: `include/larch/inplace_spr.hpp`, `include/larch/spr_pipeline.hpp`
 
@@ -1136,7 +1162,7 @@ struct inplace_params {
   std::optional<int> worsening_budget;
   std::optional<int> improvement_target;
   move_selector selector{best_improving};
-  fragment_strategy frag_mode{fragment_strategy::final_only};
+  fragment_strategy frag_mode{fragment_strategy::final_only};  // every_step or final_only
 };
 ```
 
@@ -1284,7 +1310,7 @@ Add command-line options to `larch2.cpp`:
 --inplace-budget B      Maximum cumulative worsening allowed (default: unlimited)
 --inplace-temperature F Simulated annealing initial temperature (default: 0 = disabled)
 --inplace-cooling F     Cooling rate (default: 0.9)
---inplace-fragments S   Fragment strategy: every|final|replay (default: final)
+--inplace-fragments S   Fragment strategy: every|final (default: final)
 ```
 
 When `--inplace-steps > 0`, add an `inplace_move_producer` to the pipeline
@@ -1352,16 +1378,24 @@ better tree.
 4. The 2-step path Y → Z → X improves parsimony (Z is worse than Y, but X
    is better than both).
 
-This requires careful sequence design. Use 4 leaves with 4-site sequences:
-```
-ref:  AAAA
-L1:   TAAA   (mutation at site 1)
-L2:   ATAA   (mutation at site 2)
-L3:   TATA   (mutations at sites 1,3)
-L4:   ATTA   (mutations at sites 2,3)
-```
-Optimal tree groups {L1, L3} and {L2, L4} (shared mutations). A suboptimal
-tree grouping {L1, L2} and {L3, L4} requires 2 SPR moves to reach optimal.
+This requires careful sequence design. **Note**: 4 leaves are insufficient —
+with only 3 unrooted topologies, any topology reaches any other in a single
+SPR move, so no non-global local minimum exists under single SPR.
+
+Use **6 leaves** with carefully designed sequences so that the suboptimal
+topology is a local minimum under single SPR. The exact sequences should be
+determined by exhaustive enumeration: for each candidate suboptimal topology,
+verify that all possible single SPR moves produce equal or worse parsimony
+scores. This verification can be done programmatically using `find_all_moves`
+on the candidate tree.
+
+Construction approach:
+1. Pick a 6-leaf optimal topology and compute its parsimony cost.
+2. Pick a topology that differs by exactly 2 SPR moves.
+3. Design sequences such that every single SPR from topology 2 is neutral
+   or worsening.
+4. **Verify by exhaustive search** (there are O(N²) possible SPR moves for
+   6 leaves — small enough to check all).
 
 Verify:
 - With `--inplace-steps 0`: optimizer stays stuck after many iterations.
@@ -1402,6 +1436,27 @@ trees, and much more for larger trees (the ratio scales with N/path_length).
 - No memory leaks: run 100 sequential in-place moves; check that
   `node_high_mark()` doesn't grow unboundedly (holes are reused or growth
   is bounded).
+
+---
+
+## Known Limitations
+
+**Move enumeration dominates per-step cost.** Each step calls
+`find_all_moves_parallel`, which is O(searchable_nodes × radius_subtree_size
+× sites). For N=100K and radius=40, this is expensive. The plan saves
+O(path × sites) on Fitch scoring via incremental updates, but the
+enumeration cost is unchanged. For K=10 steps, the total enumeration cost is
+O(K × N × radius × sites), which may dominate the Fitch savings. Future work
+could explore incremental move pruning — only re-searching nodes near the
+affected paths — but this is out of scope for v1.
+
+**Memory growth is unbounded across steps.** Each in-place SPR appends a new
+inner node (incrementing `node_high_mark()`) and may collapse one (creating a
+hole below `high_mark`). Holes are not reclaimed by `append_node`. After K
+steps, `high_mark` grows by K. For K=10 this is trivial (~10 extra slots).
+For long-running scenarios (K=1000+), this could waste memory. Phase 42 tests
+verify bounded growth for practical K values. Compaction (renumbering nodes to
+close holes) is a possible future optimization.
 
 ---
 
