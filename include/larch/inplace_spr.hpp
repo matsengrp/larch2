@@ -240,6 +240,13 @@ inline std::optional<collapse_info> collapse_binary_parent(
 // Phase 6: Reattach at destination
 // ============================================================================
 
+// Result of reattach_at_destination: the new inner node and the parent it was
+// inserted under (i.e., the effective dst_parent at reattach time).
+struct reattach_result {
+  std::size_t new_inner;   // freshly created inner node
+  std::size_t dst_parent;  // parent of new_inner (= dst's parent before reattach)
+};
+
 // Create a new inner node between dst and its parent, then attach src as a
 // sibling of dst under this new inner node.
 //
@@ -252,9 +259,9 @@ inline std::optional<collapse_info> collapse_binary_parent(
 // Note: dst_parent is resolved to a chain index (stable across appends), so
 // the index remains valid after append_node/append_edge calls below.
 //
-// Returns the index of the newly created inner node.
-inline std::size_t reattach_at_destination(phylo_dag& d, std::size_t src,
-                                           std::size_t dst) {
+// Returns the new inner node index and the dst_parent it was inserted under.
+inline reattach_result reattach_at_destination(phylo_dag& d, std::size_t src,
+                                               std::size_t dst) {
   assert(!has_parent_edge(d, src) && "src must have no parent edge (already detached)");
   assert(!is_ua(d, dst) && "dst cannot be the UA node");
   assert(src != dst && "src and dst must be different nodes");
@@ -302,7 +309,7 @@ inline std::size_t reattach_at_destination(phylo_dag& d, std::size_t src,
     std::visit([&](auto c) { e.set_child(c); }, cv);
   }
 
-  return ni_idx;
+  return reattach_result{ni_idx, dst_parent};
 }
 
 // ============================================================================
@@ -345,15 +352,11 @@ inline spr_result apply_spr_inplace(phylo_dag& tree, tree_index const& index,
   // 4. If binary, collapse src_parent (Phase 5).
   auto cinfo = collapse_binary_parent(tree, src_parent_val, old_child_count);
 
-  // 5. Record dst_parent after collapse (may have changed if
-  //    src_parent == dst_parent and collapse occurred).
-  std::size_t dst_parent_val =
-      get_parent_idx(tree, get_parent_edge(tree, dst));
+  // 5. Reattach at dst (Phase 6).  This also resolves dst_parent after
+  //    collapse (may have changed if src_parent == dst_parent collapsed).
+  auto [new_inner, dst_parent_val] = reattach_at_destination(tree, src, dst);
 
-  // 6. Reattach at dst (Phase 6).
-  auto new_inner = reattach_at_destination(tree, src, dst);
-
-  // 7. Populate and return spr_result.
+  // 6. Populate and return spr_result.
   return spr_result{
       .src = src,
       .dst = dst,

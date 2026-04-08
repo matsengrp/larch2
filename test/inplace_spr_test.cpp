@@ -1031,7 +1031,7 @@ static void test_reattach_simple() {
   detach_source(d, a_idx, root_idx);
 
   // Phase 6: reattach A as sibling of C
-  auto ni_idx = reattach_at_destination(d, a_idx, c_idx);
+  auto [ni_idx, _dp] = reattach_at_destination(d, a_idx, c_idx);
 
   // new_inner exists with children {C, A}
   std::set<std::size_t> ni_children;
@@ -1117,7 +1117,7 @@ static void test_reattach_with_collapse() {
   assert(count_nodes(d) == orig_node_count - 1);
 
   // Reattach A as sibling of C
-  auto ni_idx = reattach_at_destination(d, a_idx, c_idx);
+  auto [ni_idx, _dp] = reattach_at_destination(d, a_idx, c_idx);
 
   // new_inner has children {C, A}
   auto ni_children = get_child_indices(d, ni_idx);
@@ -1161,7 +1161,7 @@ static void test_reattach_preserves_clade_index() {
   assert(c_old_clade == 2);
 
   detach_source(d, a_idx, root_idx);
-  auto ni_idx = reattach_at_destination(d, a_idx, c_idx);
+  auto [ni_idx, _dp] = reattach_at_destination(d, a_idx, c_idx);
 
   // new_inner's edge from R should have the same clade index C had
   auto ni_pes = get_parent_edges(d, ni_idx);
@@ -1220,7 +1220,7 @@ static void test_reattach_on_suboptimal_tree() {
   collapse_binary_parent(d, i3_idx, old_cc);
 
   // Reattach L1 as sibling of L5
-  auto ni_idx = reattach_at_destination(d, l1_idx, l5_idx);
+  auto [ni_idx, _dp] = reattach_at_destination(d, l1_idx, l5_idx);
 
   // new_inner has children {L5, L1}
   auto ni_children = get_child_indices(d, ni_idx);
@@ -1264,7 +1264,7 @@ static void test_reattach_dst_is_tree_root() {
   detach_source(d, a_idx, root_idx);
 
   // Reattach A as sibling of R (the tree root, child of UA)
-  auto ni_idx = reattach_at_destination(d, a_idx, root_idx);
+  auto [ni_idx, _dp] = reattach_at_destination(d, a_idx, root_idx);
 
   // new_inner has children {R, A}
   auto ni_children = get_child_indices(d, ni_idx);
@@ -1337,7 +1337,7 @@ static void test_reattach_dst_is_inner_node() {
   assert(cinfo.has_value());
 
   // Reattach L4 as sibling of i2 (inner node with subtree)
-  auto ni_idx = reattach_at_destination(d, l4_idx, i2_idx);
+  auto [ni_idx, _dp] = reattach_at_destination(d, l4_idx, i2_idx);
 
   // new_inner has children {i2, L4}
   auto ni_children = get_child_indices(d, ni_idx);
@@ -1403,7 +1403,7 @@ static void test_reattach_after_root_collapse() {
   assert(get_parent_idx(d, p_pes[0]) == ua_idx);
 
   // Reattach C as sibling of A
-  auto ni_idx = reattach_at_destination(d, c_idx, a_idx);
+  auto [ni_idx, _dp] = reattach_at_destination(d, c_idx, a_idx);
 
   // new_inner has children {A, C}
   auto ni_children = get_child_indices(d, ni_idx);
@@ -1461,7 +1461,7 @@ static void test_reattach_adjacent_sibling() {
   detach_source(d, a_idx, root_idx);
 
   // Reattach A as sibling of B (A's former sibling)
-  auto ni_idx = reattach_at_destination(d, a_idx, b_idx);
+  auto [ni_idx, _dp] = reattach_at_destination(d, a_idx, b_idx);
 
   // new_inner has children {B, A}
   auto ni_children = get_child_indices(d, ni_idx);
