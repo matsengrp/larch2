@@ -1994,8 +1994,13 @@ static void test_inplace_vs_clone_spr() {
       tree_index idx{tb.tree};
       apply_spr_inplace(tb.tree, idx, src_b, dst_b);
     }
+    build_clade_offsets(tb.tree);
     fitch_assign_compact_genomes(tb.tree);
     recompute_edge_mutations(tb.tree);
+
+    // --- Structural equivalence (catches unary-node regressions that
+    //     compute_clade_sets would silently deduplicate away) ---
+    assert(count_nodes(clone_result) == count_nodes(tb.tree));
 
     // --- Compare leaf sets ---
     auto leaves_clone = collect_leaf_sample_ids(clone_result);
