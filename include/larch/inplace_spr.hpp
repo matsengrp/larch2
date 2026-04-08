@@ -8,23 +8,7 @@
 
 namespace larch {
 
-// ============================================================================
-// Phase 1: spr_result — captures all topology changes from an in-place SPR
-// ============================================================================
-
-struct spr_result {
-  std::size_t src;            // moved node
-  std::size_t dst;            // destination (original child of dst_parent)
-  std::size_t src_parent;     // original parent of src
-  std::size_t dst_parent;     // parent of dst (now parent of new_inner)
-  std::size_t new_inner;      // freshly created inner node
-  std::size_t lca;            // lowest common ancestor of src and dst
-
-  bool src_parent_collapsed;  // true if src_parent was binary and removed
-  std::size_t grandparent;    // parent of collapsed src_parent (valid iff collapsed)
-  std::size_t remaining_child;  // sibling of src that was reparented (valid iff collapsed)
-  std::size_t collapsed_node;   // index of the removed node (valid iff collapsed)
-};
+// spr_result is defined in native_optimize.hpp (needed by tree_index::update_topology).
 
 // ============================================================================
 // Phase 2: tree_state — mutable tree + index + running score for multi-step loop

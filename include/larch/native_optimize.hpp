@@ -113,6 +113,24 @@ inline std::size_t compute_tree_max_depth(phylo_dag& d) {
 }
 
 // ============================================================================
+// spr_result: captures all topology changes from an in-place SPR
+// ============================================================================
+
+struct spr_result {
+  std::size_t src;            // moved node
+  std::size_t dst;            // destination (original child of dst_parent)
+  std::size_t src_parent;     // original parent of src
+  std::size_t dst_parent;     // parent of dst (now parent of new_inner)
+  std::size_t new_inner;      // freshly created inner node
+  std::size_t lca;            // lowest common ancestor of src and dst
+
+  bool src_parent_collapsed;  // true if src_parent was binary and removed
+  std::size_t grandparent;    // parent of collapsed src_parent (valid iff collapsed)
+  std::size_t remaining_child;  // sibling of src that was reparented (valid iff collapsed)
+  std::size_t collapsed_node;   // index of the removed node (valid iff collapsed)
+};
+
+// ============================================================================
 // tree_index: Precomputed tree data for move enumeration
 // ============================================================================
 
@@ -180,6 +198,71 @@ class tree_index {
 
   bool is_valid(std::size_t node) const {
     return node < num_nodes_ && is_valid_[node];
+  }
+
+  // Phase 11: Grow all flat arrays so that node indices up to new_high_mark-1
+  // are valid slots.  Called by update_topology when apply_spr_inplace appends
+  // a node beyond the current capacity.
+  void ensure_capacity(std::size_t new_high_mark) {
+    if (new_high_mark <= num_nodes_) return;
+    dfs_info_.resize(new_high_mark);
+    has_dfs_info_.resize(new_high_mark, 0);
+    is_valid_.resize(new_high_mark, 0);
+    fitch_sets_.resize(new_high_mark * num_variable_sites_, 0);
+    child_counts_.resize(new_high_mark * num_variable_sites_, {0, 0, 0, 0});
+    has_child_counts_.resize(new_high_mark, 0);
+    num_children_.resize(new_high_mark, 0);
+    allele_union_.resize(new_high_mark * num_variable_sites_, 0);
+    parent_.resize(new_high_mark, 0);
+    children_.resize(new_high_mark);
+    is_condensed_.resize(new_high_mark, 0);
+    subtree_size_.resize(new_high_mark, 0);
+    num_nodes_ = new_high_mark;
+  }
+
+  // Phase 10: Patch parent_[] and children_[] to reflect the topology changes
+  // described by an spr_result.  Must be called after apply_spr_inplace().
+  void update_topology(spr_result const& r) {
+    ensure_capacity(d_.node_high_mark());
+
+    if (r.src_parent_collapsed) {
+      // Replace src_parent with remaining_child in grandparent's children.
+      auto& gp_kids = children_[r.grandparent];
+      for (auto& kid : gp_kids) {
+        if (kid == r.src_parent) {
+          kid = r.remaining_child;
+          break;
+        }
+      }
+      parent_[r.remaining_child] = r.grandparent;
+
+      // Invalidate collapsed node.
+      is_valid_[r.collapsed_node] = 0;
+      children_[r.collapsed_node].clear();
+    } else {
+      // Remove src from src_parent's children.
+      auto& sp_kids = children_[r.src_parent];
+      sp_kids.erase(std::remove(sp_kids.begin(), sp_kids.end(), r.src),
+                    sp_kids.end());
+    }
+
+    // Replace dst with new_inner in dst_parent's children.
+    auto& dp_kids = children_[r.dst_parent];
+    for (auto& kid : dp_kids) {
+      if (kid == r.dst) {
+        kid = r.new_inner;
+        break;
+      }
+    }
+
+    // Set up new_inner.
+    children_[r.new_inner] = {r.dst, r.src};
+    parent_[r.new_inner] = r.dst_parent;
+    is_valid_[r.new_inner] = 1;
+
+    // Update parent pointers for moved nodes.
+    parent_[r.dst] = r.new_inner;
+    parent_[r.src] = r.new_inner;
   }
 
  private:

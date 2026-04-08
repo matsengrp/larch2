@@ -2339,6 +2339,210 @@ static void test_edge_case_move_to_adjacent_node() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 10: tree_index::update_topology
+// ---------------------------------------------------------------------------
+
+// Verify that the tree_index's parent_[] and children_[] match the actual DAG
+// topology for every non-UA node still present in the DAG.
+static void verify_topology_matches_dag(tree_index& idx, phylo_dag& tree) {
+  for (auto nv : tree.get_all_nodes()) {
+    auto nid = std::visit([](auto n) { return n.index(); }, nv);
+    if (is_ua(tree, nid)) continue;
+
+    assert(idx.is_valid(nid));
+
+    // Check parent.
+    auto pes = get_parent_edges(tree, nid);
+    assert(pes.size() == 1);
+    auto actual_parent = get_parent_idx(tree, pes[0]);
+    if (idx.get_parent(nid) != actual_parent) {
+      std::println("  FAIL: parent mismatch at node {}: idx={} dag={}",
+                   nid, idx.get_parent(nid), actual_parent);
+    }
+    assert(idx.get_parent(nid) == actual_parent);
+
+    // Check children (compare as sets — order may differ).
+    auto actual_children = get_child_indices(tree, nid);
+    auto const& idx_children = idx.get_children(nid);
+    std::set<std::size_t> actual_set(actual_children.begin(),
+                                     actual_children.end());
+    std::set<std::size_t> idx_set(idx_children.begin(), idx_children.end());
+    if (actual_set != idx_set) {
+      std::println("  FAIL: children mismatch at node {}", nid);
+      std::print("    dag:");
+      for (auto c : actual_set) std::print(" {}", c);
+      std::println("");
+      std::print("    idx:");
+      for (auto c : idx_set) std::print(" {}", c);
+      std::println("");
+    }
+    assert(actual_set == idx_set);
+  }
+}
+
+// Test 1: Apply SPR with binary collapse, then update_topology.
+// Verify parent_[] and children_[] match the actual DAG.
+static void test_update_topology_with_collapse() {
+  std::println("test_update_topology_with_collapse");
+
+  // 12-leaf tree.  Move L1 → L5.
+  // i3 is binary → collapses.  new_inner created under i4.
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == t.i3);
+
+  idx.update_topology(r);
+
+  // The chain may reuse the collapsed slot for new_inner.  When that happens,
+  // collapsed_node == new_inner and the slot is valid (occupied by new_inner).
+  if (r.collapsed_node != r.new_inner) {
+    assert(!idx.is_valid(r.collapsed_node));
+  }
+  assert(idx.is_valid(r.new_inner));
+
+  // Verify full topology matches DAG.
+  verify_topology_matches_dag(idx, t.tree);
+
+  std::println("  PASS");
+}
+
+// Test 2: Apply SPR without collapse (ternary parent), then update_topology.
+static void test_update_topology_no_collapse() {
+  std::println("test_update_topology_no_collapse");
+
+  // 12-leaf tree.  Move L8 → L3.
+  // i6 is ternary → no collapse.
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L8, t.L3);
+  assert(!r.src_parent_collapsed);
+
+  idx.update_topology(r);
+
+  // new_inner is valid.
+  assert(idx.is_valid(r.new_inner));
+
+  // Verify full topology matches DAG.
+  verify_topology_matches_dag(idx, t.tree);
+
+  std::println("  PASS");
+}
+
+// Test 3: Sibling move (L11 → L12) with collapse, then update_topology.
+static void test_update_topology_sibling_collapse() {
+  std::println("test_update_topology_sibling_collapse");
+
+  // i9 is binary → collapses.  L12 reparented to i8, then new_inner
+  // created under i8 with children {L12, L11}.
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L11, t.L12);
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == t.i9);
+
+  idx.update_topology(r);
+
+  if (r.collapsed_node != r.new_inner) {
+    assert(!idx.is_valid(r.collapsed_node));
+  }
+  assert(idx.is_valid(r.new_inner));
+
+  verify_topology_matches_dag(idx, t.tree);
+
+  std::println("  PASS");
+}
+
+// Test 4: Multiple SPR configurations from Phase 8, all verified via
+// update_topology against the actual DAG.
+static void test_update_topology_multiple_moves() {
+  std::println("test_update_topology_multiple_moves");
+
+  struct move_spec {
+    std::size_t twelve_leaf_tree::*src;
+    std::size_t twelve_leaf_tree::*dst;
+    const char* desc;
+  };
+
+  move_spec moves[] = {
+      {&twelve_leaf_tree::L1, &twelve_leaf_tree::L5,
+       "L1->L5 cross-tree collapse"},
+      {&twelve_leaf_tree::L3, &twelve_leaf_tree::L8,
+       "L3->L8 cross-tree to ternary"},
+      {&twelve_leaf_tree::L5, &twelve_leaf_tree::L3,
+       "L5->L3 cross-tree collapse"},
+      {&twelve_leaf_tree::L7, &twelve_leaf_tree::L1,
+       "L7->L1 ternary no collapse"},
+      {&twelve_leaf_tree::L1, &twelve_leaf_tree::L2,
+       "L1->L2 sibling collapse"},
+      {&twelve_leaf_tree::L11, &twelve_leaf_tree::L5,
+       "L11->L5 deep to shallow"},
+      {&twelve_leaf_tree::L9, &twelve_leaf_tree::L12,
+       "L9->L12 within subtree"},
+      {&twelve_leaf_tree::L4, &twelve_leaf_tree::L6,
+       "L4->L6 cross-subtree"},
+      {&twelve_leaf_tree::L12, &twelve_leaf_tree::L1,
+       "L12->L1 deep to far side"},
+      {&twelve_leaf_tree::L6, &twelve_leaf_tree::L10,
+       "L6->L10 cross-subtree deep"},
+  };
+
+  for (auto const& [src_member, dst_member, desc] : moves) {
+    std::println("  subtest: {}", desc);
+
+    auto t = make_12leaf_tree();
+    tree_index idx{t.tree};
+
+    auto src = t.*src_member;
+    auto dst = t.*dst_member;
+    auto r = apply_spr_inplace(t.tree, idx, src, dst);
+    idx.update_topology(r);
+
+    if (r.src_parent_collapsed && r.collapsed_node != r.new_inner) {
+      assert(!idx.is_valid(r.collapsed_node));
+    }
+    assert(idx.is_valid(r.new_inner));
+
+    verify_topology_matches_dag(idx, t.tree);
+
+    std::println("    OK");
+  }
+
+  std::println("  PASS");
+}
+
+// Test 5: Verify ensure_capacity grows arrays when new_inner exceeds
+// num_nodes_.  Apply SPR, verify the index can address the new node.
+static void test_update_topology_ensure_capacity() {
+  std::println("test_update_topology_ensure_capacity");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  // Record state before SPR.  new_inner will be appended at the DAG's
+  // current high mark.
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+
+  // new_inner should be at or beyond the original num_nodes_.
+  // update_topology calls ensure_capacity internally.
+  idx.update_topology(r);
+
+  // If ensure_capacity didn't run, the next line would segfault or assert.
+  assert(idx.is_valid(r.new_inner));
+  assert(idx.get_parent(r.new_inner) == r.dst_parent);
+  auto const& kids = idx.get_children(r.new_inner);
+  std::set<std::size_t> kid_set(kids.begin(), kids.end());
+  assert(kid_set.count(t.L1) == 1);
+  assert(kid_set.count(t.L5) == 1);
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -2402,6 +2606,13 @@ int main() {
   test_edge_case_polytomy_no_collapse();
   test_edge_case_move_to_adjacent_node();
 
-  std::println("All inplace SPR phase 1-9 tests passed!");
+  // Phase 10: tree_index::update_topology
+  test_update_topology_with_collapse();
+  test_update_topology_no_collapse();
+  test_update_topology_sibling_collapse();
+  test_update_topology_multiple_moves();
+  test_update_topology_ensure_capacity();
+
+  std::println("All inplace SPR phase 1-10 tests passed!");
   return 0;
 }
