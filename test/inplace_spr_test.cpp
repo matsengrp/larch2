@@ -2034,6 +2034,311 @@ static void test_inplace_vs_clone_spr() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 9: Edge cases and robustness
+// ---------------------------------------------------------------------------
+
+// Helper: cross-validate in-place SPR result against clone-based SPR.
+// Both trees must be freshly constructed from the same builder.
+// Caller has already applied apply_spr_inplace to `inplace_tree`.
+static void cross_validate_vs_clone(phylo_dag& inplace_tree,
+                                    twelve_leaf_tree& clone_spec,
+                                    std::size_t twelve_leaf_tree::*src_member,
+                                    std::size_t twelve_leaf_tree::*dst_member) {
+  // Rebuild CGs and edge mutations on the in-place tree.
+  build_clade_offsets(inplace_tree);
+  fitch_assign_compact_genomes(inplace_tree);
+  recompute_edge_mutations(inplace_tree);
+
+  // Clone-based reference.
+  auto src_c = clone_spec.*src_member;
+  auto dst_c = clone_spec.*dst_member;
+  auto clone_result = apply_spr_move(clone_spec.tree, src_c, dst_c);
+
+  // Node count (catches unary-node regressions).
+  assert(count_nodes(clone_result) == count_nodes(inplace_tree));
+
+  // Leaf sets.
+  assert(collect_leaf_sample_ids(clone_result) ==
+         collect_leaf_sample_ids(inplace_tree));
+
+  // Parsimony score.
+  int pars_clone = ground_truth_parsimony(clone_result);
+  int pars_inplace = ground_truth_parsimony(inplace_tree);
+  assert(pars_clone == pars_inplace);
+
+  // Topology (clade sets).
+  assert(compute_clade_sets(clone_result) == compute_clade_sets(inplace_tree));
+}
+
+// Test 1: src is direct child of dst_parent (binary, collapses).
+// Move L3 → L4 on the 12-leaf tree.  src_parent == dst_parent == i4 (binary).
+// Verify no double-removal: i4 is collapsed exactly once, topology is valid.
+static void test_edge_case_src_is_child_of_dst_parent() {
+  std::println("test_edge_case_src_is_child_of_dst_parent");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto orig_node_count = count_nodes(t.tree);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L3, t.L4);
+
+  // src_parent == dst_parent == i4 before move
+  assert(r.src == t.L3);
+  assert(r.dst == t.L4);
+  assert(r.src_parent == t.i4);
+  // i4 was binary → collapsed
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == t.i4);
+  assert(r.grandparent == t.i1);
+  assert(r.remaining_child == t.L4);
+  // dst_parent should be i1 (post-collapse parent of L4)
+  assert(r.dst_parent == t.i1);
+  // LCA of L3 and L4 was i4
+  assert(r.lca == t.i4);
+
+  // new_inner has children {L4, L3}
+  auto ni_children = get_child_indices(t.tree, r.new_inner);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(t.L4) == 1);
+  assert(ni_set.count(t.L3) == 1);
+  assert(ni_set.size() == 2);
+
+  // No double-removal: node count = orig - 1 (collapse) + 1 (new_inner)
+  assert(count_nodes(t.tree) == orig_node_count);
+
+  // Cross-validate against clone-based SPR.
+  auto tc = make_12leaf_tree();
+  cross_validate_vs_clone(t.tree, tc, &twelve_leaf_tree::L3,
+                          &twelve_leaf_tree::L4);
+
+  std::println("  PASS");
+}
+
+// Test 2: dst is child of src_parent (sibling swap) under ternary parent.
+// Move L7 → L8 on the 12-leaf tree.  src_parent == dst_parent == i6 (ternary).
+// No collapse; topology should still be valid.
+static void test_edge_case_sibling_swap_ternary() {
+  std::println("test_edge_case_sibling_swap_ternary");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto orig_node_count = count_nodes(t.tree);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L7, t.L8);
+
+  assert(r.src == t.L7);
+  assert(r.dst == t.L8);
+  assert(r.src_parent == t.i6);
+  assert(r.dst_parent == t.i6);
+  // i6 was ternary → no collapse
+  assert(!r.src_parent_collapsed);
+  // LCA of siblings is their parent
+  assert(r.lca == t.i6);
+
+  // new_inner has children {L8, L7}
+  auto ni_children = get_child_indices(t.tree, r.new_inner);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(t.L8) == 1);
+  assert(ni_set.count(t.L7) == 1);
+  assert(ni_set.size() == 2);
+
+  // i6 still has children: {new_inner, i7} (L7 detached, L8 moved under new_inner)
+  auto i6_children = get_child_indices(t.tree, t.i6);
+  std::set<std::size_t> i6_set(i6_children.begin(), i6_children.end());
+  assert(i6_set.count(r.new_inner) == 1);
+  assert(i6_set.count(t.i7) == 1);
+  assert(i6_set.size() == 2);
+
+  // Node count: orig + 1 (new_inner, no collapse)
+  assert(count_nodes(t.tree) == orig_node_count + 1);
+
+  // Cross-validate.
+  auto tc = make_12leaf_tree();
+  cross_validate_vs_clone(t.tree, tc, &twelve_leaf_tree::L7,
+                          &twelve_leaf_tree::L8);
+
+  std::println("  PASS");
+}
+
+// Test 3: LCA is tree root (move spans entire tree).
+// Move L1 → L12 on the 12-leaf tree.  L1 is under i1 (left subtree),
+// L12 is under i2 (right subtree).  LCA == root.
+static void test_edge_case_lca_is_tree_root() {
+  std::println("test_edge_case_lca_is_tree_root");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L12);
+
+  assert(r.src == t.L1);
+  assert(r.dst == t.L12);
+  // LCA of L1 and L12 is root
+  assert(r.lca == t.root);
+  // src_parent == i3 (binary) → collapses
+  assert(r.src_parent == t.i3);
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == t.i3);
+  assert(r.grandparent == t.i1);
+  assert(r.remaining_child == t.L2);
+
+  // new_inner has children {L12, L1}
+  auto ni_children = get_child_indices(t.tree, r.new_inner);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(t.L12) == 1);
+  assert(ni_set.count(t.L1) == 1);
+  assert(ni_set.size() == 2);
+
+  // Cross-validate.
+  auto tc = make_12leaf_tree();
+  cross_validate_vs_clone(t.tree, tc, &twelve_leaf_tree::L1,
+                          &twelve_leaf_tree::L12);
+
+  std::println("  PASS");
+}
+
+// Test 4: LCA collapses (src_parent == LCA and was binary).
+// Move L1 → L2 on the 12-leaf tree.  src_parent == i3, LCA of L1 and L2 == i3.
+// i3 is binary → collapses.  Verify spr_result.grandparent == i1.
+static void test_edge_case_lca_collapses() {
+  std::println("test_edge_case_lca_collapses");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L2);
+
+  assert(r.src == t.L1);
+  assert(r.dst == t.L2);
+  // LCA of L1 and L2 is their common parent i3
+  assert(r.lca == t.i3);
+  // src_parent == LCA == i3 (binary) → collapses
+  assert(r.src_parent == t.i3);
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == t.i3);
+  assert(r.grandparent == t.i1);
+  assert(r.remaining_child == t.L2);
+
+  // After collapse, L2 is reparented to i1.
+  // Reattach creates new_inner under i1 with children {L2, L1}.
+  auto ni_children = get_child_indices(t.tree, r.new_inner);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(t.L2) == 1);
+  assert(ni_set.count(t.L1) == 1);
+  assert(ni_set.size() == 2);
+
+  // new_inner's parent is i1 (the grandparent of the collapsed LCA)
+  auto ni_pes = get_parent_edges(t.tree, r.new_inner);
+  assert(ni_pes.size() == 1);
+  assert(get_parent_idx(t.tree, ni_pes[0]) == t.i1);
+
+  // Cross-validate.
+  auto tc = make_12leaf_tree();
+  cross_validate_vs_clone(t.tree, tc, &twelve_leaf_tree::L1,
+                          &twelve_leaf_tree::L2);
+
+  std::println("  PASS");
+}
+
+// Test 5: Tree has polytomies — src_parent has >2 children, no collapse.
+// Move L8 → L3 on the 12-leaf tree.  src_parent == i6 (ternary: L7, L8, i7).
+// No collapse needed.
+static void test_edge_case_polytomy_no_collapse() {
+  std::println("test_edge_case_polytomy_no_collapse");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto orig_node_count = count_nodes(t.tree);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L8, t.L3);
+
+  assert(r.src == t.L8);
+  assert(r.dst == t.L3);
+  assert(r.src_parent == t.i6);
+  // i6 was ternary → no collapse
+  assert(!r.src_parent_collapsed);
+  // dst_parent == i4 (parent of L3)
+  assert(r.dst_parent == t.i4);
+
+  // i6 should still have 2 children after detach: {L7, i7}
+  auto i6_children = get_child_indices(t.tree, t.i6);
+  std::set<std::size_t> i6_set(i6_children.begin(), i6_children.end());
+  assert(i6_set.count(t.L7) == 1);
+  assert(i6_set.count(t.i7) == 1);
+  assert(i6_set.size() == 2);
+
+  // new_inner under i4 with children {L3, L8}
+  auto ni_children = get_child_indices(t.tree, r.new_inner);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(t.L3) == 1);
+  assert(ni_set.count(t.L8) == 1);
+  assert(ni_set.size() == 2);
+
+  // Node count: orig + 1 (new_inner, no collapse)
+  assert(count_nodes(t.tree) == orig_node_count + 1);
+
+  // Cross-validate.
+  auto tc = make_12leaf_tree();
+  cross_validate_vs_clone(t.tree, tc, &twelve_leaf_tree::L8,
+                          &twelve_leaf_tree::L3);
+
+  std::println("  PASS");
+}
+
+// Test 6: Move to adjacent node — dst is src's sibling.
+// Move L11 → L12 on the 12-leaf tree.  Both are children of i9 (binary).
+// This is a near-trivial topology change deep in the tree.  Verify valid tree.
+static void test_edge_case_move_to_adjacent_node() {
+  std::println("test_edge_case_move_to_adjacent_node");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto orig_node_count = count_nodes(t.tree);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L11, t.L12);
+
+  assert(r.src == t.L11);
+  assert(r.dst == t.L12);
+  assert(r.src_parent == t.i9);
+  // i9 was binary → collapses
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == t.i9);
+  assert(r.grandparent == t.i8);
+  assert(r.remaining_child == t.L12);
+
+  // After collapse of i9, L12 is reparented to i8.
+  // new_inner under i8 with children {L12, L11}.
+  auto ni_children = get_child_indices(t.tree, r.new_inner);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(t.L12) == 1);
+  assert(ni_set.count(t.L11) == 1);
+  assert(ni_set.size() == 2);
+
+  // Node count: orig - 1 (collapse) + 1 (new_inner) = orig
+  assert(count_nodes(t.tree) == orig_node_count);
+
+  // The tree is structurally valid: every non-UA node has exactly 1 parent.
+  auto ua_idx = get_root_idx(t.tree);
+  for (auto nv : t.tree.get_all_nodes()) {
+    auto idx2 = std::visit([](auto n) { return n.index(); }, nv);
+    if (is_ua(t.tree, idx2)) continue;
+    auto pes = get_parent_edges(t.tree, idx2);
+    assert(pes.size() == 1);
+  }
+
+  // Cross-validate.
+  auto tc = make_12leaf_tree();
+  cross_validate_vs_clone(t.tree, tc, &twelve_leaf_tree::L11,
+                          &twelve_leaf_tree::L12);
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -2089,6 +2394,14 @@ int main() {
   // Phase 8: validate in-place vs clone-based SPR
   test_inplace_vs_clone_spr();
 
-  std::println("All inplace SPR phase 1-8 tests passed!");
+  // Phase 9: edge cases and robustness
+  test_edge_case_src_is_child_of_dst_parent();
+  test_edge_case_sibling_swap_ternary();
+  test_edge_case_lca_is_tree_root();
+  test_edge_case_lca_collapses();
+  test_edge_case_polytomy_no_collapse();
+  test_edge_case_move_to_adjacent_node();
+
+  std::println("All inplace SPR phase 1-9 tests passed!");
   return 0;
 }
