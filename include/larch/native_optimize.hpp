@@ -220,8 +220,17 @@ class tree_index {
     num_nodes_ = new_high_mark;
   }
 
-  // Phase 10: Patch parent_[] and children_[] to reflect the topology changes
-  // described by an spr_result.  Must be called after apply_spr_inplace().
+  // Phase 10: Patch parent_[], children_[], and is_valid_[] to reflect the
+  // topology changes described by an spr_result.  Must be called after
+  // apply_spr_inplace().
+  //
+  // Only parent_[], children_[], and is_valid_[] are updated here.
+  // The following remain stale and must be updated by later phases:
+  //   - searchable_nodes_    (Phase 12)
+  //   - subtree_size_[]      (Phase 13)
+  //   - tree_root_           (Phase 15)
+  //   - is_condensed_[]      (Phase 16)
+  //   - dfs_info_[]          (recompute after all topology updates)
   void update_topology(spr_result const& r) {
     ensure_capacity(d_.node_high_mark());
 

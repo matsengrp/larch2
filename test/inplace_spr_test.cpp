@@ -2542,6 +2542,90 @@ static void test_update_topology_ensure_capacity() {
   std::println("  PASS");
 }
 
+// Test 6: Phase 9 edge cases verified through update_topology.
+// These are the tricky SPR configurations (sibling swaps, LCA collapse,
+// polytomy moves, etc.) that Phase 9 validated at the DAG level.
+// This test verifies update_topology also handles them correctly.
+static void test_update_topology_edge_cases() {
+  std::println("test_update_topology_edge_cases");
+
+  struct move_spec {
+    std::size_t twelve_leaf_tree::*src;
+    std::size_t twelve_leaf_tree::*dst;
+    const char* desc;
+  };
+
+  move_spec moves[] = {
+      // src is child of dst_parent (Phase 9 test 1: L3→L4, collapse)
+      {&twelve_leaf_tree::L3, &twelve_leaf_tree::L4,
+       "src_is_child_of_dst_parent (L3->L4, collapse)"},
+      // sibling swap ternary (Phase 9 test 2: L7→L8, no collapse)
+      {&twelve_leaf_tree::L7, &twelve_leaf_tree::L8,
+       "sibling_swap_ternary (L7->L8, no collapse)"},
+      // LCA is tree root (Phase 9 test 3: L1→L12)
+      {&twelve_leaf_tree::L1, &twelve_leaf_tree::L12,
+       "lca_is_tree_root (L1->L12)"},
+      // LCA collapses (Phase 9 test 4: L1→L2, sibling collapse)
+      {&twelve_leaf_tree::L1, &twelve_leaf_tree::L2,
+       "lca_collapses (L1->L2, sibling collapse)"},
+      // polytomy no collapse (Phase 9 test 5: L8→L3)
+      {&twelve_leaf_tree::L8, &twelve_leaf_tree::L3,
+       "polytomy_no_collapse (L8->L3)"},
+      // move to adjacent node (Phase 9 test 6: L11→L12, sibling collapse)
+      {&twelve_leaf_tree::L11, &twelve_leaf_tree::L12,
+       "move_to_adjacent (L11->L12, sibling collapse)"},
+  };
+
+  for (auto const& [src_member, dst_member, desc] : moves) {
+    std::println("  subtest: {}", desc);
+
+    auto t = make_12leaf_tree();
+    tree_index idx{t.tree};
+
+    auto src = t.*src_member;
+    auto dst = t.*dst_member;
+    auto r = apply_spr_inplace(t.tree, idx, src, dst);
+    idx.update_topology(r);
+
+    if (r.src_parent_collapsed && r.collapsed_node != r.new_inner) {
+      assert(!idx.is_valid(r.collapsed_node));
+    }
+    assert(idx.is_valid(r.new_inner));
+
+    verify_topology_matches_dag(idx, t.tree);
+
+    std::println("    OK");
+  }
+
+  std::println("  PASS");
+}
+
+// Test 7: Sequential SPRs — apply + update_topology twice on the same index.
+// Verifies that update_topology correctly patches an already-patched index.
+static void test_update_topology_sequential_sprs() {
+  std::println("test_update_topology_sequential_sprs");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  // First SPR: L1 -> L5 (cross-tree, binary collapse of i3).
+  auto r1 = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+  assert(r1.src_parent_collapsed);
+  idx.update_topology(r1);
+  verify_topology_matches_dag(idx, t.tree);
+  std::println("  after SPR 1 (L1->L5): OK");
+
+  // Second SPR needs fresh DFS for compute_lca (stale after first
+  // update_topology).  Build a temporary index for the LCA computation.
+  tree_index idx_for_lca{t.tree};
+  auto r2 = apply_spr_inplace(t.tree, idx_for_lca, t.L8, t.L3);
+  idx.update_topology(r2);
+  verify_topology_matches_dag(idx, t.tree);
+  std::println("  after SPR 2 (L8->L3): OK");
+
+  std::println("  PASS");
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -2612,6 +2696,8 @@ int main() {
   test_update_topology_sibling_collapse();
   test_update_topology_multiple_moves();
   test_update_topology_ensure_capacity();
+  test_update_topology_edge_cases();
+  test_update_topology_sequential_sprs();
 
   std::println("All inplace SPR phase 1-10 tests passed!");
   return 0;
