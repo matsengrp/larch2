@@ -1006,6 +1006,239 @@ static void test_clades_after_collapse() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 6 tests: reattach_at_destination
+// ---------------------------------------------------------------------------
+
+static void test_reattach_simple() {
+  std::println("test_reattach_simple");
+
+  // Tree: UA -> R -> {A, B, C}.  Detach A, reattach as sibling of C.
+  // Expected: R -> {B, new_inner -> {C, A}}
+  auto d = make_simple_tree();
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+
+  auto a_idx = get_child_idx(d, root_clades[0][0]);
+  auto b_idx = get_child_idx(d, root_clades[1][0]);
+  auto c_idx = get_child_idx(d, root_clades[2][0]);
+
+  auto orig_node_count = count_nodes(d);
+  auto orig_edge_count = count_edges(d);
+
+  // Phase 4: detach A from R
+  detach_source(d, a_idx, root_idx);
+
+  // Phase 6: reattach A as sibling of C
+  auto ni_idx = reattach_at_destination(d, a_idx, c_idx);
+
+  // new_inner exists with children {C, A}
+  std::set<std::size_t> ni_children;
+  auto nv = d.get_node(ni_idx);
+  std::visit(
+      [&](auto node) {
+        for (auto ev : node.get_children()) {
+          std::visit(
+              [&](auto edge) {
+                auto cv = edge.get_child();
+                ni_children.insert(
+                    std::visit([](auto c) { return c.index(); }, cv));
+              },
+              ev);
+        }
+      },
+      nv);
+  assert(ni_children.count(c_idx) == 1);
+  assert(ni_children.count(a_idx) == 1);
+  assert(ni_children.size() == 2);
+
+  // R has children {B, new_inner}
+  std::set<std::size_t> r_children;
+  auto rnv = d.get_node(root_idx);
+  std::visit(
+      [&](auto node) {
+        for (auto ev : node.get_children()) {
+          std::visit(
+              [&](auto edge) {
+                auto cv = edge.get_child();
+                r_children.insert(
+                    std::visit([](auto c) { return c.index(); }, cv));
+              },
+              ev);
+        }
+      },
+      rnv);
+  assert(r_children.count(b_idx) == 1);
+  assert(r_children.count(ni_idx) == 1);
+  assert(r_children.size() == 2);
+
+  // new_inner's parent is R
+  auto ni_pes = get_parent_edges(d, ni_idx);
+  assert(ni_pes.size() == 1);
+  assert(get_parent_idx(d, ni_pes[0]) == root_idx);
+
+  // Node count: original + 1 (new_inner), no collapse since R had 3 children
+  assert(count_nodes(d) == orig_node_count + 1);
+
+  // Edge count: original - 1 (detach) - 1 (removed dst edge) + 3 (new edges) = original + 1
+  assert(count_edges(d) == orig_edge_count + 1);
+
+  std::println("  PASS");
+}
+
+static void test_reattach_with_collapse() {
+  std::println("test_reattach_with_collapse");
+
+  // Tree: UA -> R -> {P -> {A, B}, C}.  Detach A from P (binary, collapses),
+  // then reattach A as sibling of C.
+  // After detach+collapse: R -> {B, C}
+  // After reattach: R -> {B, new_inner -> {C, A}}
+  auto d = make_binary_parent_tree();
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto p_idx = get_child_idx(d, root_clades[0][0]);
+  auto c_idx = get_child_idx(d, root_clades[1][0]);
+  auto p_clades = get_clades(d, p_idx);
+  auto a_idx = get_child_idx(d, p_clades[0][0]);
+  auto b_idx = get_child_idx(d, p_clades[1][0]);
+
+  auto orig_node_count = count_nodes(d);
+
+  // Detach A from P, collapse P
+  auto old_cc = detach_source(d, a_idx, p_idx);
+  auto cinfo = collapse_binary_parent(d, p_idx, old_cc);
+  assert(cinfo.has_value());
+
+  // After collapse: R -> {B, C}, node_count = orig - 1
+  assert(count_nodes(d) == orig_node_count - 1);
+
+  // Reattach A as sibling of C
+  auto ni_idx = reattach_at_destination(d, a_idx, c_idx);
+
+  // new_inner has children {C, A}
+  auto ni_children = get_child_indices(d, ni_idx);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(c_idx) == 1);
+  assert(ni_set.count(a_idx) == 1);
+
+  // R has children {B, new_inner}
+  auto r_children = get_child_indices(d, root_idx);
+  std::set<std::size_t> r_set(r_children.begin(), r_children.end());
+  assert(r_set.count(b_idx) == 1);
+  assert(r_set.count(ni_idx) == 1);
+
+  // Node count: orig - 1 (collapse) + 1 (new_inner) = orig
+  assert(count_nodes(d) == orig_node_count);
+
+  std::println("  PASS");
+}
+
+static void test_reattach_preserves_clade_index() {
+  std::println("test_reattach_preserves_clade_index");
+
+  // Tree: UA -> R -> {A(clade 0), B(clade 1), C(clade 2)}.
+  // Detach A, reattach as sibling of C.
+  // The new_inner should take C's old clade index (2) in R's children.
+  auto d = make_simple_tree();
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+
+  auto a_idx = get_child_idx(d, root_clades[0][0]);
+  auto c_idx = get_child_idx(d, root_clades[2][0]);
+
+  // Record C's clade index before the move
+  auto c_pe = get_parent_edge(d, c_idx);
+  auto c_old_clade = get_clade_idx(d, c_pe);
+  assert(c_old_clade == 2);
+
+  detach_source(d, a_idx, root_idx);
+  auto ni_idx = reattach_at_destination(d, a_idx, c_idx);
+
+  // new_inner's edge from R should have the same clade index C had
+  auto ni_pes = get_parent_edges(d, ni_idx);
+  assert(ni_pes.size() == 1);
+  assert(get_clade_idx(d, ni_pes[0]) == c_old_clade);
+
+  // C's edge from new_inner should have clade index 0
+  auto c_pes = get_parent_edges(d, c_idx);
+  assert(c_pes.size() == 1);
+  assert(get_parent_idx(d, c_pes[0]) == ni_idx);
+  assert(get_clade_idx(d, c_pes[0]) == 0);
+
+  // A's edge from new_inner should have clade index 1
+  auto a_pes = get_parent_edges(d, a_idx);
+  assert(a_pes.size() == 1);
+  assert(get_parent_idx(d, a_pes[0]) == ni_idx);
+  assert(get_clade_idx(d, a_pes[0]) == 1);
+
+  std::println("  PASS");
+}
+
+static void test_reattach_on_suboptimal_tree() {
+  std::println("test_reattach_on_suboptimal_tree");
+
+  // Use the 6-leaf suboptimal tree:
+  //       root
+  //      /    \
+  //    i1      i2
+  //   / \     / \
+  //  i3  L4  L3  i4
+  //  /\         /\
+  // L1 L2     L5  L6
+  //
+  // Detach L1 from i3 (binary, collapses i3), reattach L1 as sibling of L5.
+  // After collapse: i1 -> {L2, L4}, i4 -> {L5, L6}
+  // After reattach: i4 -> {new_inner -> {L5, L1}, L6}
+  auto d = make_suboptimal_tree();
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto i2_idx = get_child_idx(d, root_clades[1][0]);
+  auto i1_idx = get_child_idx(d, root_clades[0][0]);
+  auto i1_clades = get_clades(d, i1_idx);
+  auto i3_idx = get_child_idx(d, i1_clades[0][0]);
+  auto i3_clades = get_clades(d, i3_idx);
+  auto l1_idx = get_child_idx(d, i3_clades[0][0]);
+  auto i2_clades = get_clades(d, i2_idx);
+  auto i4_idx = get_child_idx(d, i2_clades[1][0]);
+  auto i4_clades = get_clades(d, i4_idx);
+  auto l5_idx = get_child_idx(d, i4_clades[0][0]);
+  auto l6_idx = get_child_idx(d, i4_clades[1][0]);
+
+  // Detach L1 from i3, collapse i3
+  auto old_cc = detach_source(d, l1_idx, i3_idx);
+  collapse_binary_parent(d, i3_idx, old_cc);
+
+  // Reattach L1 as sibling of L5
+  auto ni_idx = reattach_at_destination(d, l1_idx, l5_idx);
+
+  // new_inner has children {L5, L1}
+  auto ni_children = get_child_indices(d, ni_idx);
+  std::set<std::size_t> ni_set(ni_children.begin(), ni_children.end());
+  assert(ni_set.count(l5_idx) == 1);
+  assert(ni_set.count(l1_idx) == 1);
+
+  // i4 has children {new_inner, L6}
+  auto i4_children = get_child_indices(d, i4_idx);
+  std::set<std::size_t> i4_set(i4_children.begin(), i4_children.end());
+  assert(i4_set.count(ni_idx) == 1);
+  assert(i4_set.count(l6_idx) == 1);
+
+  // new_inner's parent is i4
+  auto ni_pes = get_parent_edges(d, ni_idx);
+  assert(ni_pes.size() == 1);
+  assert(get_parent_idx(d, ni_pes[0]) == i4_idx);
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1042,6 +1275,12 @@ int main() {
   test_detach_from_root_no_collapse();
   test_clades_after_collapse();
 
-  std::println("All inplace SPR phase 1-5 tests passed!");
+  // Phase 6: reattach_at_destination
+  test_reattach_simple();
+  test_reattach_with_collapse();
+  test_reattach_preserves_clade_index();
+  test_reattach_on_suboptimal_tree();
+
+  std::println("All inplace SPR phase 1-6 tests passed!");
   return 0;
 }

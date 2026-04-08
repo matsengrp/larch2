@@ -219,4 +219,64 @@ inline std::optional<collapse_info> collapse_binary_parent(
   return collapse_info{grandparent, remaining_child, src_parent};
 }
 
+// ============================================================================
+// Phase 6: Reattach at destination
+// ============================================================================
+
+// Create a new inner node between dst and its parent, then attach src as a
+// sibling of dst under this new inner node.
+//
+// Preconditions:
+//   - src has no parent edge (already detached via detach_source).
+//   - dst has exactly one parent edge.
+//
+// Returns the index of the newly created inner node.
+inline std::size_t reattach_at_destination(phylo_dag& d, std::size_t src,
+                                           std::size_t dst) {
+  // 1. Find dst_parent and the clade index of the dst_parent -> dst edge
+  auto dst_pe = get_parent_edge(d, dst);
+  std::size_t dst_parent = get_parent_idx(d, dst_pe);
+  std::size_t dst_clade = get_clade_idx(d, dst_pe);
+
+  // 2. Remove the dst_parent -> dst edge
+  auto ev = d.get_edge(dst_pe);
+  std::visit([](auto edge) { edge.remove(); }, ev);
+
+  // 3. Append a new inner node
+  auto new_inner = d.append_node<node_kind::inner>();
+  auto ni_idx = new_inner.index();
+
+  // 4. Add edge: dst_parent -> new_inner (same clade index as removed edge)
+  {
+    auto e = d.append_edge<edge_kind::clade>();
+    e.clade_index() = dst_clade;
+    auto pv = d.get_node(dst_parent);
+    std::visit([&](auto p) { e.set_parent(p); }, pv);
+    auto cv = d.get_node(ni_idx);
+    std::visit([&](auto c) { e.set_child(c); }, cv);
+  }
+
+  // 5. Add edge: new_inner -> dst (clade index 0)
+  {
+    auto e = d.append_edge<edge_kind::clade>();
+    e.clade_index() = 0;
+    auto pv = d.get_node(ni_idx);
+    std::visit([&](auto p) { e.set_parent(p); }, pv);
+    auto cv = d.get_node(dst);
+    std::visit([&](auto c) { e.set_child(c); }, cv);
+  }
+
+  // 6. Add edge: new_inner -> src (clade index 1)
+  {
+    auto e = d.append_edge<edge_kind::clade>();
+    e.clade_index() = 1;
+    auto pv = d.get_node(ni_idx);
+    std::visit([&](auto p) { e.set_parent(p); }, pv);
+    auto cv = d.get_node(src);
+    std::visit([&](auto c) { e.set_child(c); }, cv);
+  }
+
+  return ni_idx;
+}
+
 }  // namespace larch
