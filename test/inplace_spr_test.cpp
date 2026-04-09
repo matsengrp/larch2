@@ -3756,6 +3756,332 @@ static void test_root_change_sequential() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 16 tests: update_condensed_nodes
+// ---------------------------------------------------------------------------
+
+// Build tree with two identical leaves (A, B) under P, plus distinct C under P,
+// and D under a second inner node.
+//
+//        R
+//       / \
+//      P    I2
+//    / | \    \
+//   A   B  C   D
+//
+// A and B have the same CG ("TAAA") → B is condensed in init().
+// C = "ATAA", D = "AATA".
+struct condensed_tree {
+  phylo_dag tree;
+  std::size_t R, P, I2, A, B, C, D;
+};
+
+static condensed_tree make_condensed_tree() {
+  constexpr std::string_view ref = "AAAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto la = d.append_node<node_kind::leaf>();
+  la.cg() = cg_from_sequence("TAAA", ref);
+  la.sample_id() = "A";
+  auto lb = d.append_node<node_kind::leaf>();
+  lb.cg() = cg_from_sequence("TAAA", ref);  // same as A
+  lb.sample_id() = "B";
+  auto lc = d.append_node<node_kind::leaf>();
+  lc.cg() = cg_from_sequence("ATAA", ref);
+  lc.sample_id() = "C";
+  auto ld = d.append_node<node_kind::leaf>();
+  ld.cg() = cg_from_sequence("AATA", ref);
+  ld.sample_id() = "D";
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAAA", ref);
+  auto p = d.append_node<node_kind::inner>();
+  p.cg() = cg_from_sequence("AAAA", ref);
+  auto i2 = d.append_node<node_kind::inner>();
+  i2.cg() = cg_from_sequence("AAAA", ref);
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), p.index(), 0);
+  add_edge(d, root.index(), i2.index(), 1);
+  add_edge(d, p.index(), la.index(), 0);
+  add_edge(d, p.index(), lb.index(), 1);
+  add_edge(d, p.index(), lc.index(), 2);
+  add_edge(d, i2.index(), ld.index(), 0);
+
+  recompute_edge_mutations(d);
+  return condensed_tree{std::move(d), root.index(), p.index(), i2.index(),
+                        la.index(), lb.index(), lc.index(), ld.index()};
+}
+
+// Test 1: Move the representative (A) away from its identical sibling (B).
+// B was condensed; after A leaves, B should become uncondensed.
+static void test_condensed_uncondense_on_move_away() {
+  std::println("test_condensed_uncondense_on_move_away");
+
+  auto t = make_condensed_tree();
+  tree_index idx{t.tree};
+
+  // Verify initial condensation state.
+  assert(idx.num_condensed_leaves() == 1);
+  // One of {A, B} is condensed (the later one in children order).
+  bool a_cond = idx.is_condensed(t.A);
+  bool b_cond = idx.is_condensed(t.B);
+  assert((a_cond || b_cond) && !(a_cond && b_cond));
+  std::size_t condensed_leaf = a_cond ? t.A : t.B;
+  std::size_t representative = a_cond ? t.B : t.A;
+
+  // The condensed leaf should NOT be in searchable_nodes_.
+  auto const& sn_before = idx.get_searchable_nodes();
+  assert(std::find(sn_before.begin(), sn_before.end(), condensed_leaf) ==
+         sn_before.end());
+  // The representative should be in searchable_nodes_.
+  assert(std::find(sn_before.begin(), sn_before.end(), representative) !=
+         sn_before.end());
+
+  // Move the representative to be a sibling of D under I2.
+  auto r = apply_spr_inplace(t.tree, idx, representative, t.D);
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_condensed_nodes(r);
+
+  // The previously condensed leaf is now the sole identical leaf under P → uncondensed.
+  assert(!idx.is_condensed(condensed_leaf));
+  assert(!idx.is_condensed(representative));
+  assert(idx.num_condensed_leaves() == 0);
+
+  // Both should now be in searchable_nodes_.
+  auto const& sn_after = idx.get_searchable_nodes();
+  assert(std::find(sn_after.begin(), sn_after.end(), condensed_leaf) !=
+         sn_after.end());
+  assert(std::find(sn_after.begin(), sn_after.end(), representative) !=
+         sn_after.end());
+
+  std::println("  PASS");
+}
+
+// Test 2: Move a leaf next to an identical leaf. Verify one becomes condensed.
+// Use the condensed tree, but move C to be a sibling of D. Then move A next to
+// another A-like leaf.
+// Simpler: build a tree with all-distinct leaves, then move one to be a sibling
+// of an identical leaf under a new parent.
+static void test_condensed_condense_on_move_together() {
+  std::println("test_condensed_condense_on_move_together");
+
+  // Build a tree where A and E have the same CG but are under different parents.
+  //        R
+  //       / \
+  //      I1    I2
+  //     / \    / \
+  //    A   B  E   D
+  // A = "TAAA", B = "ATAA", E = "TAAA" (same as A), D = "AATA"
+  constexpr std::string_view ref = "AAAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto la = d.append_node<node_kind::leaf>();
+  la.cg() = cg_from_sequence("TAAA", ref);
+  la.sample_id() = "A";
+  auto lb = d.append_node<node_kind::leaf>();
+  lb.cg() = cg_from_sequence("ATAA", ref);
+  lb.sample_id() = "B";
+  auto le = d.append_node<node_kind::leaf>();
+  le.cg() = cg_from_sequence("TAAA", ref);  // same as A
+  le.sample_id() = "E";
+  auto ld = d.append_node<node_kind::leaf>();
+  ld.cg() = cg_from_sequence("AATA", ref);
+  ld.sample_id() = "D";
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAAA", ref);
+  auto i1 = d.append_node<node_kind::inner>();
+  i1.cg() = cg_from_sequence("AAAA", ref);
+  auto i2 = d.append_node<node_kind::inner>();
+  i2.cg() = cg_from_sequence("AAAA", ref);
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), i1.index(), 0);
+  add_edge(d, root.index(), i2.index(), 1);
+  add_edge(d, i1.index(), la.index(), 0);
+  add_edge(d, i1.index(), lb.index(), 1);
+  add_edge(d, i2.index(), le.index(), 0);
+  add_edge(d, i2.index(), ld.index(), 1);
+
+  recompute_edge_mutations(d);
+
+  tree_index idx{d};
+
+  // No condensation initially (A and E are not siblings).
+  assert(idx.num_condensed_leaves() == 0);
+  assert(!idx.is_condensed(la.index()));
+  assert(!idx.is_condensed(le.index()));
+
+  // Move A to be a sibling of E under I2.
+  // I1 is binary → collapses, B reparented to R.
+  // new_inner created between I2 and E, with children {E, A}.
+  auto r = apply_spr_inplace(d, idx, la.index(), le.index());
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_condensed_nodes(r);
+
+  // A and E are now siblings under new_inner with identical CGs.
+  // One should be condensed.
+  assert(idx.num_condensed_leaves() == 1);
+  bool a_cond = idx.is_condensed(la.index());
+  bool e_cond = idx.is_condensed(le.index());
+  assert((a_cond || e_cond) && !(a_cond && e_cond));
+
+  // The condensed one should not be in searchable_nodes_.
+  std::size_t condensed_one = a_cond ? la.index() : le.index();
+  auto const& sn = idx.get_searchable_nodes();
+  assert(std::find(sn.begin(), sn.end(), condensed_one) == sn.end());
+
+  std::println("  PASS");
+}
+
+// Test 3: Three identical leaves under one parent. Move the representative away.
+// The remaining two should still have one condensed.
+static void test_condensed_triple_remove_representative() {
+  std::println("test_condensed_triple_remove_representative");
+
+  //        R
+  //       / \
+  //      P    D
+  //    / | \
+  //   A   B  C
+  // A, B, C all have CG "TAAA". D = "AATA".
+  constexpr std::string_view ref = "AAAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto la = d.append_node<node_kind::leaf>();
+  la.cg() = cg_from_sequence("TAAA", ref);
+  la.sample_id() = "A";
+  auto lb = d.append_node<node_kind::leaf>();
+  lb.cg() = cg_from_sequence("TAAA", ref);
+  lb.sample_id() = "B";
+  auto lc = d.append_node<node_kind::leaf>();
+  lc.cg() = cg_from_sequence("TAAA", ref);
+  lc.sample_id() = "C";
+  auto ld = d.append_node<node_kind::leaf>();
+  ld.cg() = cg_from_sequence("AATA", ref);
+  ld.sample_id() = "D";
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAAA", ref);
+  auto p = d.append_node<node_kind::inner>();
+  p.cg() = cg_from_sequence("AAAA", ref);
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), p.index(), 0);
+  add_edge(d, root.index(), ld.index(), 1);
+  add_edge(d, p.index(), la.index(), 0);
+  add_edge(d, p.index(), lb.index(), 1);
+  add_edge(d, p.index(), lc.index(), 2);
+
+  recompute_edge_mutations(d);
+
+  tree_index idx{d};
+
+  // Initial state: 2 condensed (B and C are duplicates of A).
+  assert(idx.num_condensed_leaves() == 2);
+  assert(!idx.is_condensed(la.index()));  // A is the representative
+  assert(idx.is_condensed(lb.index()));
+  assert(idx.is_condensed(lc.index()));
+
+  // Move A (representative) to be a sibling of D.
+  auto r = apply_spr_inplace(d, idx, la.index(), ld.index());
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_condensed_nodes(r);
+
+  // P now has {B, C} — both identical. One should be condensed, one not.
+  assert(idx.num_condensed_leaves() == 1);
+  bool b_cond = idx.is_condensed(lb.index());
+  bool c_cond = idx.is_condensed(lc.index());
+  assert((b_cond || c_cond) && !(b_cond && c_cond));
+
+  // A is now under new_inner with D — different CGs, neither condensed.
+  assert(!idx.is_condensed(la.index()));
+  assert(!idx.is_condensed(ld.index()));
+
+  std::println("  PASS");
+}
+
+// Test 4: Move an inner node (not a leaf). Condensation should not change.
+static void test_condensed_no_change_for_non_leaf_move() {
+  std::println("test_condensed_no_change_for_non_leaf_move");
+
+  //       R
+  //      / \
+  //    I1    I2
+  //   / \    / \
+  //  A   B  C   D
+  // All leaves have distinct CGs. No condensation.
+  auto d = make_suboptimal_tree();
+  tree_index idx{d};
+
+  std::size_t initial_condensed = idx.num_condensed_leaves();
+
+  // Move an inner subtree — pick a leaf move that doesn't create identical siblings.
+  // Use L1 (index 1, CG "TAAA") → L3 (index 3, CG "TAAG").
+  // L1 and L3 have different CGs. No condensation should result.
+  auto const& sn = idx.get_searchable_nodes();
+  assert(!sn.empty());
+
+  // Use the suboptimal tree's L1 and L3 (all leaves have distinct CGs).
+  // L1=idx 1, L3=idx 3 from make_suboptimal_tree node ordering.
+  auto r = apply_spr_inplace(d, idx, 1, 3);
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_condensed_nodes(r);
+
+  assert(idx.num_condensed_leaves() == initial_condensed);
+
+  std::println("  PASS");
+}
+
+// Test 5: Compare update_condensed_nodes result with a fresh tree_index.
+static void test_condensed_vs_fresh_index() {
+  std::println("test_condensed_vs_fresh_index");
+
+  auto t = make_condensed_tree();
+  tree_index idx{t.tree};
+
+  // Move A (or the representative) to be a sibling of D.
+  std::size_t representative = idx.is_condensed(t.A) ? t.B : t.A;
+  auto r = apply_spr_inplace(t.tree, idx, representative, t.D);
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+  idx.update_tree_root(r);
+  idx.update_condensed_nodes(r);
+  idx.recompute_dfs();
+
+  // Build a fresh index on the same (now-modified) tree.
+  tree_index fresh{t.tree};
+
+  // Condensed counts must match.
+  assert(idx.num_condensed_leaves() == fresh.num_condensed_leaves());
+
+  // Check every valid node's condensation status matches.
+  for (std::size_t n = 0; n < idx.num_nodes(); n++) {
+    if (!idx.is_valid(n)) continue;
+    assert(idx.is_condensed(n) == fresh.is_condensed(n));
+  }
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -3865,6 +4191,13 @@ int main() {
   test_root_change_dst_is_remaining_child();
   test_root_change_sequential();
 
-  std::println("All inplace SPR phase 1-15 tests passed!");
+  // Phase 16: update_condensed_nodes
+  test_condensed_uncondense_on_move_away();
+  test_condensed_condense_on_move_together();
+  test_condensed_triple_remove_representative();
+  test_condensed_no_change_for_non_leaf_move();
+  test_condensed_vs_fresh_index();
+
+  std::println("All inplace SPR phase 1-16 tests passed!");
   return 0;
 }

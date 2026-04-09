@@ -194,6 +194,9 @@ class tree_index {
   }
   std::size_t num_variable_sites() const { return num_variable_sites_; }
   std::size_t num_condensed_leaves() const { return condensed_count_; }
+  bool is_condensed(std::size_t node) const {
+    return node < num_nodes_ && is_condensed_[node];
+  }
   std::size_t num_nodes() const { return num_nodes_; }
   uint8_t const* get_ref_alleles_ptr() const { return ref_alleles_.data(); }
   std::size_t get_subtree_size(std::size_t node) const { return subtree_size_[node]; }
@@ -232,7 +235,7 @@ class tree_index {
   //   - searchable_nodes_    (Phase 12 — call update_searchable_nodes())
   //   - subtree_size_[]      (Phase 13 — call update_subtree_sizes())
   //   - tree_root_           (Phase 15 — call update_tree_root())
-  //   - is_condensed_[]      (Phase 16)
+  //   - is_condensed_[]      (Phase 16 — call update_condensed_nodes())
   //   - dfs_info_[]          (Phase 14 — call recompute_dfs())
   void update_topology(spr_result const& r) {
     ensure_capacity(d_.node_high_mark());
@@ -340,6 +343,22 @@ class tree_index {
     auto ua_clades = get_clades(d_, ua_idx);
     assert(!ua_clades.empty() && !ua_clades[0].empty());
     tree_root_ = get_child_idx(d_, ua_clades[0][0]);
+  }
+
+  // Phase 16: Re-check condensation for leaf children near the SPR.
+  // An SPR can create or break CG-identical sibling pairs, changing which
+  // leaves are condensed.  Re-check only the children of the parent that
+  // lost src (source side) and the children of new_inner (destination side).
+  // Must be called after update_topology() and update_searchable_nodes().
+  void update_condensed_nodes(spr_result const& r) {
+    // Source side: the parent that lost src as a child.
+    std::size_t source_parent =
+        r.src_parent_collapsed ? r.grandparent : r.src_parent;
+    if (is_valid(source_parent)) {
+      recheck_condensation(source_parent);
+    }
+    // Destination side: new_inner has children {dst, src}.
+    recheck_condensation(r.new_inner);
   }
 
   // Phase 14: Recompute dfs_info_[] for the entire tree.
@@ -538,6 +557,69 @@ class tree_index {
       auto next = parent_[cur];
       if (next >= num_nodes_ || !is_valid_[next]) break;
       cur = next;
+    }
+  }
+
+  // Re-check condensation for leaf children of a given parent node.
+  // Clears old condensed flags for all leaf children, re-runs the O(siblings²)
+  // CG-equality check, and patches searchable_nodes_ and condensed_count_.
+  void recheck_condensation(std::size_t parent_node) {
+    auto& kids = children_[parent_node];
+
+    // Collect leaf children (use children_[] to detect leaves — no DAG query).
+    std::vector<std::size_t> leaf_kids;
+    for (auto kid : kids) {
+      if (children_[kid].empty()) leaf_kids.push_back(kid);
+    }
+
+    if (leaf_kids.size() <= 1) {
+      // At most one leaf — clear any stale condensed flag.
+      for (auto kid : leaf_kids) {
+        if (is_condensed_[kid]) {
+          is_condensed_[kid] = 0;
+          condensed_count_--;
+          searchable_nodes_.push_back(kid);
+        }
+      }
+      return;
+    }
+
+    // Remember which leaves were condensed, then clear all.
+    std::vector<uint8_t> was_condensed(leaf_kids.size());
+    for (std::size_t i = 0; i < leaf_kids.size(); i++) {
+      was_condensed[i] = is_condensed_[leaf_kids[i]];
+      if (is_condensed_[leaf_kids[i]]) {
+        is_condensed_[leaf_kids[i]] = 0;
+        condensed_count_--;
+      }
+    }
+
+    // Re-run condensation (same algorithm as init()).
+    std::vector<bool> now_condensed(leaf_kids.size(), false);
+    for (std::size_t i = 0; i < leaf_kids.size(); i++) {
+      if (now_condensed[i]) continue;
+      auto cg_i = get_node_cg(leaf_kids[i]);
+      for (std::size_t j = i + 1; j < leaf_kids.size(); j++) {
+        if (now_condensed[j]) continue;
+        auto cg_j = get_node_cg(leaf_kids[j]);
+        if (cg_i == cg_j) {
+          now_condensed[j] = true;
+          is_condensed_[leaf_kids[j]] = 1;
+          condensed_count_++;
+        }
+      }
+    }
+
+    // Patch searchable_nodes_ for status changes.
+    for (std::size_t i = 0; i < leaf_kids.size(); i++) {
+      if (!was_condensed[i] && now_condensed[i]) {
+        // Newly condensed — remove from searchable_nodes_.
+        auto& sn = searchable_nodes_;
+        sn.erase(std::remove(sn.begin(), sn.end(), leaf_kids[i]), sn.end());
+      } else if (was_condensed[i] && !now_condensed[i]) {
+        // Newly uncondensed — add to searchable_nodes_.
+        searchable_nodes_.push_back(leaf_kids[i]);
+      }
     }
   }
 
