@@ -582,6 +582,28 @@ class tree_index {
     update_fitch_removal(r, delta);
   }
 
+  // Phase 21: Fitch update for the destination insertion path.
+  // After reattaching src under new_inner next to dst, recompute Fitch
+  // along the insertion path: first initialize new_inner's Fitch from its
+  // children (src and dst), then propagate upward from dst_parent (which
+  // now has new_inner as child instead of dst).
+  //
+  // delta_out accumulates the parsimony score change: new_inner's cost
+  // (always non-negative — it's a fresh node) plus propagation changes.
+  // Must be called after update_topology().
+  void update_fitch_insertion(spr_result const& r, int& delta_out) {
+    delta_out = init_new_node_fitch(r.new_inner);
+    int propagation_delta = 0;
+    propagate_fitch_upward(r.dst_parent, propagation_delta);
+    delta_out += propagation_delta;
+  }
+
+  // Convenience overload without delta tracking.
+  void update_fitch_insertion(spr_result const& r) {
+    int delta = 0;
+    update_fitch_insertion(r, delta);
+  }
+
  private:
   static constexpr std::size_t kFitchParallelThreshold = 64;
 

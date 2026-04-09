@@ -4776,6 +4776,198 @@ static void test_update_fitch_removal_with_collapse() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 21 tests: update_fitch_insertion
+// ---------------------------------------------------------------------------
+
+// Test 1: Insertion changes dst_parent's Fitch.
+// Tree: R → {P → {A, B}, Q → {C, D}}. Move A next to C.
+// P is binary → collapses. new_inner children = {C, A}.
+// Verify new_inner Fitch reflects the union and Q's Fitch changes.
+static void test_update_fitch_insertion_basic() {
+  std::println("test_update_fitch_insertion_basic");
+
+  // ref = "AAA"
+  // A = "TAA" (mut at pos 1), B = "ATA" (pos 2),
+  // C = "AAA" (ref), D = "TAA" (pos 1)
+  // Variable sites: {1,2} → VS indices 0,1
+  constexpr std::string_view ref = "AAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto la = d.append_node<node_kind::leaf>();
+  la.cg() = cg_from_sequence("TAA", ref);
+  la.sample_id() = "A";
+  auto lb = d.append_node<node_kind::leaf>();
+  lb.cg() = cg_from_sequence("ATA", ref);
+  lb.sample_id() = "B";
+  auto lc = d.append_node<node_kind::leaf>();
+  lc.cg() = cg_from_sequence("AAA", ref);
+  lc.sample_id() = "C";
+  auto ld = d.append_node<node_kind::leaf>();
+  ld.cg() = cg_from_sequence("TAA", ref);
+  ld.sample_id() = "D";
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAA", ref);
+  auto P = d.append_node<node_kind::inner>();
+  P.cg() = cg_from_sequence("AAA", ref);
+  auto Q = d.append_node<node_kind::inner>();
+  Q.cg() = cg_from_sequence("AAA", ref);
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), P.index(), 0);
+  add_edge(d, root.index(), Q.index(), 1);
+  add_edge(d, P.index(), la.index(), 0);
+  add_edge(d, P.index(), lb.index(), 1);
+  add_edge(d, Q.index(), lc.index(), 0);
+  add_edge(d, Q.index(), ld.index(), 1);
+
+  recompute_edge_mutations(d);
+  tree_index idx{d};
+
+  auto A_idx = la.index();
+  auto C_idx = lc.index();
+  auto Q_idx = Q.index();
+  auto R_idx = root.index();
+  auto nsites = idx.num_variable_sites();
+  assert(nsites == 2);
+
+  // Apply SPR: move A next to C.
+  auto r = apply_spr_inplace(d, idx, A_idx, C_idx);
+  assert(r.src_parent_collapsed);  // P was binary
+  assert(r.dst_parent == Q_idx);
+
+  idx.update_topology(r);
+
+  // Phase 21: update insertion path.
+  idx.update_fitch_insertion(r);
+
+  // Verify new_inner Fitch: children {C, A}.
+  // VS0 (pos 1): C=A(0b0001), A=T(0b1000) → union={A,T}
+  assert(idx.get_fitch_set(r.new_inner, 0) == 0b1001);
+  // VS1 (pos 2): C=A(0b0001), A=A(0b0001) → intersection={A}
+  assert(idx.get_fitch_set(r.new_inner, 1) == 0b0001);
+
+  // Verify Q Fitch: children {new_inner, D}.
+  // VS0: NI={A,T}(0b1001), D=T(0b1000) → T count=2=nc → {T}
+  // (changed from {A,T} to {T})
+  assert(idx.get_fitch_set(Q_idx, 0) == 0b1000);
+  // VS1: NI={A}(0b0001), D=A(0b0001) → A count=2=nc → {A}
+  assert(idx.get_fitch_set(Q_idx, 1) == 0b0001);
+
+  // Verify R Fitch: children {B, Q} (B promoted after P collapsed).
+  // VS0: B=A(0b0001), Q={T}(0b1000) → union={A,T}
+  assert(idx.get_fitch_set(R_idx, 0) == 0b1001);
+  // VS1: B=T(0b1000), Q={A}(0b0001) → union={A,T}
+  assert(idx.get_fitch_set(R_idx, 1) == 0b1001);
+
+  std::println("  PASS");
+}
+
+// Test 2: Insertion does not change dst_parent (early termination).
+// Tree: R → {P → {A, B, C}, Q → {D, E}}. Move A next to D.
+// P is ternary → no collapse. new_inner children = {D, A}.
+// Q Fitch is unchanged → propagation stops at Q.
+static void test_update_fitch_insertion_early_termination() {
+  std::println("test_update_fitch_insertion_early_termination");
+
+  // ref = "AAA"
+  // A = "TAA" (pos 1), B = "ATA" (pos 2), C = "AAT" (pos 3),
+  // D = "TAT" (pos 1, pos 3), E = "AAT" (pos 3)
+  // Variable sites: {1,2,3} → VS indices 0,1,2
+  constexpr std::string_view ref = "AAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto la = d.append_node<node_kind::leaf>();
+  la.cg() = cg_from_sequence("TAA", ref);
+  la.sample_id() = "A";
+  auto lb = d.append_node<node_kind::leaf>();
+  lb.cg() = cg_from_sequence("ATA", ref);
+  lb.sample_id() = "B";
+  auto lc = d.append_node<node_kind::leaf>();
+  lc.cg() = cg_from_sequence("AAT", ref);
+  lc.sample_id() = "C";
+  auto ld = d.append_node<node_kind::leaf>();
+  ld.cg() = cg_from_sequence("TAT", ref);
+  ld.sample_id() = "D";
+  auto le = d.append_node<node_kind::leaf>();
+  le.cg() = cg_from_sequence("AAT", ref);
+  le.sample_id() = "E";
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAA", ref);
+  auto P = d.append_node<node_kind::inner>();
+  P.cg() = cg_from_sequence("AAA", ref);
+  auto Q = d.append_node<node_kind::inner>();
+  Q.cg() = cg_from_sequence("AAA", ref);
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), P.index(), 0);
+  add_edge(d, root.index(), Q.index(), 1);
+  add_edge(d, P.index(), la.index(), 0);
+  add_edge(d, P.index(), lb.index(), 1);
+  add_edge(d, P.index(), lc.index(), 2);
+  add_edge(d, Q.index(), ld.index(), 0);
+  add_edge(d, Q.index(), le.index(), 1);
+
+  recompute_edge_mutations(d);
+  tree_index idx{d};
+
+  auto A_idx = la.index();
+  auto D_idx = ld.index();
+  auto Q_idx = Q.index();
+  auto R_idx = root.index();
+  auto nsites = idx.num_variable_sites();
+  assert(nsites == 3);
+
+  // Snapshot Q and R Fitch before SPR.
+  uint8_t Q_fitch_before[3], R_fitch_before[3];
+  for (std::size_t i = 0; i < 3; i++) {
+    Q_fitch_before[i] = idx.get_fitch_set(Q_idx, i);
+    R_fitch_before[i] = idx.get_fitch_set(R_idx, i);
+  }
+
+  // Apply SPR: move A next to D.
+  auto r = apply_spr_inplace(d, idx, A_idx, D_idx);
+  assert(!r.src_parent_collapsed);  // P was ternary
+  assert(r.dst_parent == Q_idx);
+
+  idx.update_topology(r);
+
+  // Phase 21: update insertion path.
+  idx.update_fitch_insertion(r);
+
+  // Verify new_inner Fitch: children {D, A}.
+  // VS0 (pos 1): D=T(0b1000), A=T(0b1000) → intersection={T}
+  assert(idx.get_fitch_set(r.new_inner, 0) == 0b1000);
+  // VS1 (pos 2): D=A(0b0001), A=A(0b0001) → intersection={A}
+  assert(idx.get_fitch_set(r.new_inner, 1) == 0b0001);
+  // VS2 (pos 3): D=T(0b1000), A=A(0b0001) → union={A,T}
+  assert(idx.get_fitch_set(r.new_inner, 2) == 0b1001);
+
+  // Q Fitch unchanged (new_inner replaces D without changing Q's Fitch).
+  // Before: Q children {D, E} → VS0={A,T}, VS1={A}, VS2={T}.
+  // After:  Q children {NI, E} → same values.
+  for (std::size_t i = 0; i < 3; i++) {
+    assert(idx.get_fitch_set(Q_idx, i) == Q_fitch_before[i]);
+  }
+
+  // R Fitch unchanged (propagation stopped at Q).
+  for (std::size_t i = 0; i < 3; i++) {
+    assert(idx.get_fitch_set(R_idx, i) == R_fitch_before[i]);
+  }
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -4910,6 +5102,10 @@ int main() {
   test_update_fitch_removal_no_collapse();
   test_update_fitch_removal_with_collapse();
 
-  std::println("All inplace SPR phase 1-20 tests passed!");
+  // Phase 21: update_fitch_insertion
+  test_update_fitch_insertion_basic();
+  test_update_fitch_insertion_early_termination();
+
+  std::println("All inplace SPR phase 1-21 tests passed!");
   return 0;
 }
