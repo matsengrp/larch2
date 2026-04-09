@@ -506,6 +506,18 @@ class tree_index {
     return result.delta;
   }
 
+  // Phase 20: Fitch update for the source removal path.
+  // After an SPR detaches src from src_parent, the Fitch data along the
+  // removal path is stale.  If src_parent was collapsed, start from
+  // grandparent (which gained remaining_child as a direct child); otherwise
+  // start from src_parent (which lost one child).  Propagate upward to root
+  // with early termination when Fitch sets stabilize.
+  // Must be called after update_topology() and (typically) init_new_node_fitch().
+  void update_fitch_removal(spr_result const& r) {
+    std::size_t start = r.src_parent_collapsed ? r.grandparent : r.src_parent;
+    propagate_fitch_upward(start);
+  }
+
  private:
   static constexpr std::size_t kFitchParallelThreshold = 64;
 
