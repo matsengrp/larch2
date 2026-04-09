@@ -3530,6 +3530,122 @@ static void test_dfs_recompute_vs_fresh_index() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 15 tests: update_tree_root
+// ---------------------------------------------------------------------------
+
+// Tree: UA → root → {L_a, inner → {L_b, L_c}}.
+// Move L_a → L_b: root is binary → collapses.
+// Verify tree_root_ is updated to the surviving child of UA.
+static void test_root_change_basic() {
+  std::println("test_root_change_basic");
+
+  auto t = make_root_collapse_tree();
+  tree_index idx{t.tree};
+
+  assert(idx.get_tree_root() == t.root);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L_a, t.L_b);
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == t.root);
+
+  idx.update_topology(r);
+
+  // Before update_tree_root, tree_root_ still points to collapsed root.
+  assert(idx.get_tree_root() == t.root);
+
+  idx.update_tree_root(r);
+
+  // tree_root_ must have changed away from the collapsed root.
+  assert(idx.get_tree_root() != t.root);
+  assert(idx.is_valid(idx.get_tree_root()));
+
+  // New tree root should be the surviving child of UA (inner node).
+  assert(idx.get_tree_root() == t.inner);
+
+  std::println("  PASS");
+}
+
+// After root change, recompute DFS and verify tree_root has level 0.
+static void test_root_change_dfs_level() {
+  std::println("test_root_change_dfs_level");
+
+  auto t = make_root_collapse_tree();
+  tree_index idx{t.tree};
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L_a, t.L_b);
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == t.root);
+
+  idx.update_topology(r);
+  idx.update_tree_root(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+  idx.recompute_dfs();
+
+  // tree_root_ must have level 0.
+  assert(idx.get_dfs_info(idx.get_tree_root()).level == 0);
+
+  // All reachable nodes should have valid DFS info.
+  verify_dfs_info(idx);
+
+  // is_ancestor should be consistent.
+  auto nodes = collect_reachable_nodes(idx);
+  verify_is_ancestor(idx, nodes);
+
+  std::println("  PASS");
+}
+
+// No-op case: non-root collapse should leave tree_root_ unchanged.
+static void test_root_change_noop() {
+  std::println("test_root_change_noop");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+  auto original_root = idx.get_tree_root();
+
+  // SPR: L1 → L5 (collapses i3, not root).
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node != original_root);
+
+  idx.update_topology(r);
+  idx.update_tree_root(r);
+
+  // tree_root_ should remain unchanged.
+  assert(idx.get_tree_root() == original_root);
+  assert(idx.is_valid(idx.get_tree_root()));
+
+  std::println("  PASS");
+}
+
+// End-to-end: after root collapse, compare tree_root_ against fresh index.
+static void test_root_change_vs_fresh_index() {
+  std::println("test_root_change_vs_fresh_index");
+
+  auto t = make_root_collapse_tree();
+  tree_index idx{t.tree};
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L_a, t.L_b);
+  idx.update_topology(r);
+  idx.update_tree_root(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+  idx.recompute_dfs();
+
+  // Build fresh index from the same post-SPR DAG.
+  tree_index fresh{t.tree};
+
+  assert(idx.get_tree_root() == fresh.get_tree_root());
+
+  // Reachable node sets should match.
+  auto reachable = collect_reachable_nodes(idx);
+  auto fresh_reachable = collect_reachable_nodes(fresh);
+  assert(reachable.size() == fresh_reachable.size());
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -3631,6 +3747,12 @@ int main() {
   test_dfs_recompute_root_collapse();
   test_dfs_recompute_vs_fresh_index();
 
-  std::println("All inplace SPR phase 1-14 tests passed!");
+  // Phase 15: update_tree_root
+  test_root_change_basic();
+  test_root_change_dfs_level();
+  test_root_change_noop();
+  test_root_change_vs_fresh_index();
+
+  std::println("All inplace SPR phase 1-15 tests passed!");
   return 0;
 }
