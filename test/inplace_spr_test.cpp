@@ -2801,6 +2801,134 @@ static void test_update_searchable_nodes_no_collapse() {
 // update_topology + update_searchable_nodes, to verify end-to-end correctness
 // of searchable_nodes_ against the move enumerator.
 
+// ===========================================================================
+// Phase 13: update_subtree_sizes
+// ===========================================================================
+
+// Recursively recount subtree size from scratch for verification.
+static std::size_t recount_subtree_size(tree_index const& idx, std::size_t node) {
+  std::size_t size = 1;
+  for (auto child : idx.get_children(node)) {
+    size += recount_subtree_size(idx, child);
+  }
+  return size;
+}
+
+// Verify all valid nodes' subtree_size matches a fresh recount.
+static void verify_all_subtree_sizes(tree_index const& idx) {
+  auto root = idx.get_tree_root();
+  // Walk the tree from root and check every reachable node.
+  std::vector<std::size_t> stack = {root};
+  std::size_t checked = 0;
+  while (!stack.empty()) {
+    auto node = stack.back();
+    stack.pop_back();
+    auto expected = recount_subtree_size(idx, node);
+    assert(idx.get_subtree_size(node) == expected &&
+           "subtree_size mismatch after update");
+    ++checked;
+    for (auto child : idx.get_children(node)) {
+      stack.push_back(child);
+    }
+  }
+  assert(checked > 0 && "no nodes checked");
+}
+
+// SPR with collapse: L1 → L5.  i3 collapses (binary).
+static void test_subtree_size_update_with_collapse() {
+  std::println("test_subtree_size_update_with_collapse");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  // Verify initial subtree sizes are correct.
+  verify_all_subtree_sizes(idx);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+  assert(r.src_parent_collapsed);
+
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+
+  verify_all_subtree_sizes(idx);
+
+  // new_inner has exactly 2 children (L5 and L1), so subtree_size = 3.
+  assert(idx.get_subtree_size(r.new_inner) == 3);
+
+  std::println("  PASS");
+}
+
+// SPR without collapse: L7 → L1.  i6 is ternary → no collapse.
+static void test_subtree_size_update_no_collapse() {
+  std::println("test_subtree_size_update_no_collapse");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L7, t.L1);
+  assert(!r.src_parent_collapsed);
+
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+
+  verify_all_subtree_sizes(idx);
+
+  // new_inner has exactly 2 children (L1 and L7), so subtree_size = 3.
+  assert(idx.get_subtree_size(r.new_inner) == 3);
+
+  std::println("  PASS");
+}
+
+// Two sequential SPRs: verify sizes remain correct after each.
+static void test_subtree_size_update_sequential() {
+  std::println("test_subtree_size_update_sequential");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  // First move: L1 → L5 (with collapse).
+  auto r1 = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+  idx.update_topology(r1);
+  idx.update_searchable_nodes(r1);
+  idx.update_subtree_sizes(r1);
+  verify_all_subtree_sizes(idx);
+
+  // Second move: L3 → L6 (i4 is binary → collapses).
+  auto r2 = apply_spr_inplace(t.tree, idx, t.L3, t.L6);
+  idx.update_topology(r2);
+  idx.update_searchable_nodes(r2);
+  idx.update_subtree_sizes(r2);
+  verify_all_subtree_sizes(idx);
+
+  // Root subtree_size should equal total reachable nodes.
+  auto root = idx.get_tree_root();
+  assert(idx.get_subtree_size(root) == recount_subtree_size(idx, root));
+
+  std::println("  PASS");
+}
+
+// Verify subtree sizes on the initial tree (no SPR) match recount.
+static void test_subtree_size_initial() {
+  std::println("test_subtree_size_initial");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  verify_all_subtree_sizes(idx);
+
+  // Root should contain all 12 leaves + 10 inner nodes = 22.
+  assert(idx.get_subtree_size(t.root) == 22);
+  // Leaf nodes have subtree_size = 1.
+  assert(idx.get_subtree_size(t.L1) == 1);
+  assert(idx.get_subtree_size(t.L12) == 1);
+  // i9 has 2 leaves → subtree_size = 3.
+  assert(idx.get_subtree_size(t.i9) == 3);
+
+  std::println("  PASS");
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -2882,6 +3010,12 @@ int main() {
   test_update_searchable_nodes_with_collapse();
   test_update_searchable_nodes_no_collapse();
 
-  std::println("All inplace SPR phase 1-12 tests passed!");
+  // Phase 13: update_subtree_sizes
+  test_subtree_size_initial();
+  test_subtree_size_update_with_collapse();
+  test_subtree_size_update_no_collapse();
+  test_subtree_size_update_sequential();
+
+  std::println("All inplace SPR phase 1-13 tests passed!");
   return 0;
 }

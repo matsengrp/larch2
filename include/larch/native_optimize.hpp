@@ -196,6 +196,7 @@ class tree_index {
   std::size_t num_condensed_leaves() const { return condensed_count_; }
   std::size_t num_nodes() const { return num_nodes_; }
   uint8_t const* get_ref_alleles_ptr() const { return ref_alleles_.data(); }
+  std::size_t get_subtree_size(std::size_t node) const { return subtree_size_[node]; }
 
   bool is_valid(std::size_t node) const {
     return node < num_nodes_ && is_valid_[node];
@@ -229,7 +230,7 @@ class tree_index {
   // Only parent_[], children_[], and is_valid_[] are updated here.
   // The following remain stale and must be updated by later phases:
   //   - searchable_nodes_    (Phase 12 — call update_searchable_nodes())
-  //   - subtree_size_[]      (Phase 13)
+  //   - subtree_size_[]      (Phase 13 — call update_subtree_sizes())
   //   - tree_root_           (Phase 15)
   //   - is_condensed_[]      (Phase 16)
   //   - dfs_info_[]          (recompute after all topology updates)
@@ -293,6 +294,28 @@ class tree_index {
       sn.erase(std::remove(sn.begin(), sn.end(), r.collapsed_node), sn.end());
     }
     searchable_nodes_.push_back(r.new_inner);
+  }
+
+  // Phase 13: Incrementally recompute subtree_size_[] after an SPR.
+  // Walk up from the insertion point (new_inner) and the removal point
+  // (src_parent or grandparent if collapsed) to tree_root_, recomputing
+  // subtree_size_[node] = 1 + sum(subtree_size_[child]) at each step.
+  // Both paths merge at LCA so total work is bounded by 2 × depth.
+  // Must be called after update_topology().
+  void update_subtree_sizes(spr_result const& r) {
+    // Recompute subtree_size for new_inner (freshly created, not yet sized).
+    recompute_subtree_size(r.new_inner);
+
+    // Walk up from dst_parent to tree_root_ (insertion side).
+    walk_up_recompute(r.dst_parent);
+
+    // Walk up from removal side to tree_root_.
+    if (r.src_parent_collapsed) {
+      // src_parent was removed; remaining_child was reparented under grandparent.
+      walk_up_recompute(r.grandparent);
+    } else {
+      walk_up_recompute(r.src_parent);
+    }
   }
 
  private:
@@ -440,6 +463,25 @@ class tree_index {
       size += subtree_size_[child];
     }
     subtree_size_[node] = size;
+  }
+
+  // Recompute subtree_size for a single node from its children.
+  void recompute_subtree_size(std::size_t node) {
+    std::size_t size = 1;
+    for (auto child : children_[node]) {
+      size += subtree_size_[child];
+    }
+    subtree_size_[node] = size;
+  }
+
+  // Walk up from node to tree_root_, recomputing subtree_size at each step.
+  void walk_up_recompute(std::size_t node) {
+    auto cur = node;
+    while (true) {
+      recompute_subtree_size(cur);
+      if (cur == tree_root_) break;
+      cur = parent_[cur];
+    }
   }
 
   void dfs_visit(std::size_t node, std::size_t& counter, std::size_t level) {
