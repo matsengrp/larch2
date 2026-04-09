@@ -419,8 +419,45 @@ class tree_index {
     }
   }
 
+  // Phase 18: Walk from start to tree_root_, recomputing Fitch at each step.
+  // Stop early if the Fitch set at a node doesn't change (all ancestors are
+  // already correct).  Returns number of nodes updated.
+  std::size_t propagate_fitch_upward(std::size_t start) {
+    std::size_t count = 0;
+    std::size_t node = start;
+    while (node != tree_root_ && is_valid_[node]) {
+      auto old_fitch = get_fitch_snapshot(node);
+      recompute_node_fitch(node);
+      count++;
+      if (fitch_unchanged(node, old_fitch)) break;
+      node = parent_[node];
+    }
+    // Always recompute root
+    if (node == tree_root_) {
+      recompute_node_fitch(node);
+      count++;
+    }
+    return count;
+  }
+
  private:
   static constexpr std::size_t kFitchParallelThreshold = 64;
+
+  // Copy of a node's Fitch row (for change detection in propagate_fitch_upward).
+  std::vector<uint8_t> get_fitch_snapshot(std::size_t node) const {
+    std::size_t base = node * num_variable_sites_;
+    return std::vector<uint8_t>(fitch_sets_.begin() + base,
+                                fitch_sets_.begin() + base + num_variable_sites_);
+  }
+
+  // True if node's current Fitch row matches the snapshot.
+  bool fitch_unchanged(std::size_t node,
+                       std::vector<uint8_t> const& old) const {
+    std::size_t base = node * num_variable_sites_;
+    return std::equal(fitch_sets_.begin() + base,
+                      fitch_sets_.begin() + base + num_variable_sites_,
+                      old.begin());
+  }
 
   void init() {
     auto ua_idx = get_root_idx(d_);

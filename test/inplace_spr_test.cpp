@@ -4317,6 +4317,105 @@ static void test_single_node_fitch_new_child() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 18 tests: propagate_fitch_upward
+// ---------------------------------------------------------------------------
+
+// Test 1: Corrupt an inner node's Fitch sets, propagate upward, verify
+// correction and early termination at the right level.
+static void test_upward_propagation() {
+  std::println("test_upward_propagation");
+
+  // Use suboptimal tree (depth 4):
+  //         R
+  //        / \
+  //       I1   I2
+  //      / \   / \
+  //     I3  L4 L3  I4
+  //    / \       / \
+  //   L1  L2   L5  L6
+  auto tree = make_suboptimal_tree();
+  tree_index idx{tree};
+
+  auto root = idx.get_tree_root();
+  auto nsites = idx.num_variable_sites();
+
+  // Find I3 dynamically: it's a child of I1 (first child of root) that
+  // itself has children (not a leaf).
+  auto& root_kids = idx.get_children(root);
+  assert(root_kids.size() == 2);
+  auto I1 = root_kids[0];
+  auto& i1_kids = idx.get_children(I1);
+  std::size_t I3 = 0;
+  for (auto kid : i1_kids) {
+    if (!idx.get_children(kid).empty()) {
+      I3 = kid;
+      break;
+    }
+  }
+  assert(!idx.get_children(I3).empty() && "I3 must be an inner node");
+
+  // Snapshot correct Fitch sets for I3, I1, and root.
+  std::vector<uint8_t> fitch_I3(nsites), fitch_I1(nsites), fitch_R(nsites);
+  for (std::size_t i = 0; i < nsites; i++) {
+    fitch_I3[i] = idx.get_fitch_set(I3, i);
+    fitch_I1[i] = idx.get_fitch_set(I1, i);
+    fitch_R[i] = idx.get_fitch_set(root, i);
+  }
+
+  // Corrupt I3's Fitch sets (set all to 0xFF).
+  uint8_t* fitch_ptr = const_cast<uint8_t*>(idx.get_fitch_set_ptr(I3));
+  for (std::size_t i = 0; i < nsites; i++) fitch_ptr[i] = 0xFF;
+
+  // Propagate upward from I3.
+  auto count = idx.propagate_fitch_upward(I3);
+
+  // I3 should be restored to original correct values (recomputed from children).
+  for (std::size_t i = 0; i < nsites; i++)
+    assert(idx.get_fitch_set(I3, i) == fitch_I3[i]);
+
+  // I1 should be unchanged (was already correct, I3 is now fixed).
+  for (std::size_t i = 0; i < nsites; i++)
+    assert(idx.get_fitch_set(I1, i) == fitch_I1[i]);
+
+  // Root should be unchanged (propagation stopped at I1 via early termination).
+  for (std::size_t i = 0; i < nsites; i++)
+    assert(idx.get_fitch_set(root, i) == fitch_R[i]);
+
+  // Early termination: updated I3, then I1's recompute was unchanged → break.
+  // Root was NOT reached, so count = 2.
+  assert(count == 2);
+
+  std::println("  PASS");
+}
+
+// Test 2: Propagate from root — should recompute only root (1 node).
+static void test_upward_propagation_from_root() {
+  std::println("test_upward_propagation_from_root");
+
+  auto tree = make_suboptimal_tree();
+  tree_index idx{tree};
+
+  auto root = idx.get_tree_root();
+  auto nsites = idx.num_variable_sites();
+
+  // Snapshot root Fitch sets.
+  std::vector<uint8_t> fitch_before(nsites);
+  for (std::size_t i = 0; i < nsites; i++)
+    fitch_before[i] = idx.get_fitch_set(root, i);
+
+  auto count = idx.propagate_fitch_upward(root);
+
+  // Should recompute only root.
+  assert(count == 1);
+
+  // Root Fitch should be unchanged (idempotent).
+  for (std::size_t i = 0; i < nsites; i++)
+    assert(idx.get_fitch_set(root, i) == fitch_before[i]);
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -4438,6 +4537,10 @@ int main() {
   test_single_node_fitch_idempotent();
   test_single_node_fitch_new_child();
 
-  std::println("All inplace SPR phase 1-17 tests passed!");
+  // Phase 18: propagate_fitch_upward
+  test_upward_propagation();
+  test_upward_propagation_from_root();
+
+  std::println("All inplace SPR phase 1-18 tests passed!");
   return 0;
 }
