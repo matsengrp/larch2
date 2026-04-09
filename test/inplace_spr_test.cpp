@@ -4416,6 +4416,151 @@ static void test_upward_propagation_from_root() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 19 tests: init_new_node_fitch
+// ---------------------------------------------------------------------------
+
+// Test 1: New inner node whose children have disjoint Fitch sets at a site.
+// Verify the union is produced (since intersection is empty).
+static void test_init_new_node_fitch_union() {
+  std::println("test_init_new_node_fitch_union");
+
+  // Build a tree where we can test init_new_node_fitch on a fresh inner node.
+  //       R
+  //      / \
+  //     N   C
+  //    / \
+  //   A   B
+  //
+  // A = "TAA", B = "ATA", C = "AAT"
+  // At site 0: A has Fitch {T}, B has Fitch {A} → disjoint → union = {A,T}
+  // At site 1: A has Fitch {A}, B has Fitch {T} → disjoint → union = {A,T}
+  // At site 2: A has Fitch {A}, B has Fitch {A} → intersection = {A}
+  constexpr std::string_view ref = "AAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto la = d.append_node<node_kind::leaf>();
+  la.cg() = cg_from_sequence("TAA", ref);
+  la.sample_id() = "A";
+  auto lb = d.append_node<node_kind::leaf>();
+  lb.cg() = cg_from_sequence("ATA", ref);
+  lb.sample_id() = "B";
+  auto lc = d.append_node<node_kind::leaf>();
+  lc.cg() = cg_from_sequence("AAT", ref);
+  lc.sample_id() = "C";
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAA", ref);
+  auto inner = d.append_node<node_kind::inner>();
+  inner.cg() = cg_from_sequence("AAA", ref);
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), inner.index(), 0);
+  add_edge(d, root.index(), lc.index(), 1);
+  add_edge(d, inner.index(), la.index(), 0);
+  add_edge(d, inner.index(), lb.index(), 1);
+
+  recompute_edge_mutations(d);
+  tree_index idx{d};
+
+  auto N = inner.index();
+  auto nsites = idx.num_variable_sites();
+  assert(nsites == 3);
+
+  // Zero out N's Fitch data to prove init_new_node_fitch recomputes it.
+  uint8_t* fitch_ptr = const_cast<uint8_t*>(idx.get_fitch_set_ptr(N));
+  for (std::size_t i = 0; i < nsites; i++) fitch_ptr[i] = 0;
+
+  idx.init_new_node_fitch(N);
+
+  // Site 0: A=T(0b1000), B=A(0b0001) → no intersection → union = {A,T} = 0b1001
+  assert(idx.get_fitch_set(N, 0) == 0b1001);
+  // Site 1: A=A(0b0001), B=T(0b1000) → no intersection → union = {A,T} = 0b1001
+  assert(idx.get_fitch_set(N, 1) == 0b1001);
+  // Site 2: A=A(0b0001), B=A(0b0001) → intersection = {A} = 0b0001
+  assert(idx.get_fitch_set(N, 2) == 0b0001);
+
+  std::println("  PASS");
+}
+
+// Test 2: New inner node whose children have matching Fitch sets at all sites.
+// Verify the intersection is produced.
+static void test_init_new_node_fitch_intersection() {
+  std::println("test_init_new_node_fitch_intersection");
+
+  // Build a tree where two leaves have identical sequences.
+  //       R
+  //      / \
+  //     N   C
+  //    / \
+  //   A   B
+  //
+  // A = "TAT", B = "TAT", C = "AAA"
+  // At all variable sites, A and B agree → intersection.
+  constexpr std::string_view ref = "AAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto la = d.append_node<node_kind::leaf>();
+  la.cg() = cg_from_sequence("TAT", ref);
+  la.sample_id() = "A";
+  auto lb = d.append_node<node_kind::leaf>();
+  lb.cg() = cg_from_sequence("TAT", ref);
+  lb.sample_id() = "B";
+  auto lc = d.append_node<node_kind::leaf>();
+  lc.cg() = cg_from_sequence("AAA", ref);
+  lc.sample_id() = "C";
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAA", ref);
+  auto inner = d.append_node<node_kind::inner>();
+  inner.cg() = cg_from_sequence("AAA", ref);
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), inner.index(), 0);
+  add_edge(d, root.index(), lc.index(), 1);
+  add_edge(d, inner.index(), la.index(), 0);
+  add_edge(d, inner.index(), lb.index(), 1);
+
+  recompute_edge_mutations(d);
+  tree_index idx{d};
+
+  auto N = inner.index();
+  auto nsites = idx.num_variable_sites();
+
+  // Zero out N's Fitch data.
+  uint8_t* fitch_ptr = const_cast<uint8_t*>(idx.get_fitch_set_ptr(N));
+  for (std::size_t i = 0; i < nsites; i++) fitch_ptr[i] = 0;
+
+  idx.init_new_node_fitch(N);
+
+  // Variable sites: positions where A/B differ from ref or C differs from ref.
+  // A,B = "TAT", C = "AAA", ref = "AAA"
+  // Site 0 (pos 0): A=T, B=T, C=A → variable. N's children: A=T(0b1000), B=T(0b1000)
+  //   → intersection = {T} = 0b1000
+  // Site 1 (pos 2): A=T, B=T, C=A → variable. N's children: A=T(0b1000), B=T(0b1000)
+  //   → intersection = {T} = 0b1000
+  for (std::size_t i = 0; i < nsites; i++) {
+    uint8_t fitch = idx.get_fitch_set(N, i);
+    // Both children have identical Fitch sets → intersection is that same set.
+    auto& kids = idx.get_children(N);
+    uint8_t child0_fitch = idx.get_fitch_set(kids[0], i);
+    uint8_t child1_fitch = idx.get_fitch_set(kids[1], i);
+    assert(child0_fitch == child1_fitch);
+    // Intersection of identical sets is the set itself.
+    assert(fitch == child0_fitch);
+  }
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -4541,6 +4686,10 @@ int main() {
   test_upward_propagation();
   test_upward_propagation_from_root();
 
-  std::println("All inplace SPR phase 1-18 tests passed!");
+  // Phase 19: init_new_node_fitch
+  test_init_new_node_fitch_union();
+  test_init_new_node_fitch_intersection();
+
+  std::println("All inplace SPR phase 1-19 tests passed!");
   return 0;
 }

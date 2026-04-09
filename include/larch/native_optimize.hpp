@@ -491,6 +491,14 @@ class tree_index {
     return propagate_fitch_upward(start, delta);
   }
 
+  // Phase 19: Initialize Fitch data for a newly created inner node.
+  // When a new inner node is created (Phase 6), its children (dst and src)
+  // already have correct Fitch sets — only their parent changed.  This
+  // computes the new node's Fitch sets from scratch.
+  void init_new_node_fitch(std::size_t new_inner) {
+    recompute_node_fitch(new_inner);
+  }
+
  private:
   static constexpr std::size_t kFitchParallelThreshold = 64;
 
