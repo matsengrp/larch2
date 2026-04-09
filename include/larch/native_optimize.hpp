@@ -359,6 +359,12 @@ class tree_index {
     }
     // Destination side: new_inner has children {dst, src}.
     recheck_condensation(r.new_inner);
+    // dst_parent lost dst as a direct child (replaced by new_inner).
+    // If dst had identical siblings under dst_parent, their condensation
+    // status is now stale — recheck.
+    if (is_valid(r.dst_parent)) {
+      recheck_condensation(r.dst_parent);
+    }
   }
 
   // Phase 14: Recompute dfs_info_[] for the entire tree.
@@ -613,9 +619,14 @@ class tree_index {
     // Patch searchable_nodes_ for status changes.
     for (std::size_t i = 0; i < leaf_kids.size(); i++) {
       if (!was_condensed[i] && now_condensed[i]) {
-        // Newly condensed — remove from searchable_nodes_.
+        // Newly condensed — remove from searchable_nodes_ (swap-and-pop: O(1)
+        // mutation instead of O(N) shift from std::remove; order is irrelevant).
         auto& sn = searchable_nodes_;
-        sn.erase(std::remove(sn.begin(), sn.end(), leaf_kids[i]), sn.end());
+        auto it = std::find(sn.begin(), sn.end(), leaf_kids[i]);
+        if (it != sn.end()) {
+          *it = sn.back();
+          sn.pop_back();
+        }
       } else if (was_condensed[i] && !now_condensed[i]) {
         // Newly uncondensed — add to searchable_nodes_.
         searchable_nodes_.push_back(leaf_kids[i]);

@@ -4081,6 +4081,103 @@ static void test_condensed_vs_fresh_index() {
   std::println("  PASS");
 }
 
+// Test 6: dst_parent recheck — identical siblings under dst_parent.
+// Moving src to the representative under dst_parent displaces it from
+// dst_parent.  Without rechecking dst_parent, the condensed sibling (E) is
+// stranded: still marked condensed but no representative sibling exists.
+static void test_condensed_dst_parent_recheck() {
+  std::println("test_condensed_dst_parent_recheck");
+
+  //        R
+  //       / \
+  //      P       I2
+  //    / | \    / \
+  //   A   B  C  D   E
+  // A = "TAAA", B = "TAAA" (same as A), C = "ATAA"
+  // D = "AATA", E = "AATA" (same as D)
+  constexpr std::string_view ref = "AAAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto la = d.append_node<node_kind::leaf>();
+  la.cg() = cg_from_sequence("TAAA", ref);
+  la.sample_id() = "A";
+  auto lb = d.append_node<node_kind::leaf>();
+  lb.cg() = cg_from_sequence("TAAA", ref);  // same as A
+  lb.sample_id() = "B";
+  auto lc = d.append_node<node_kind::leaf>();
+  lc.cg() = cg_from_sequence("ATAA", ref);
+  lc.sample_id() = "C";
+  auto ld = d.append_node<node_kind::leaf>();
+  ld.cg() = cg_from_sequence("AATA", ref);
+  ld.sample_id() = "D";
+  auto le = d.append_node<node_kind::leaf>();
+  le.cg() = cg_from_sequence("AATA", ref);  // same as D
+  le.sample_id() = "E";
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAAA", ref);
+  auto p = d.append_node<node_kind::inner>();
+  p.cg() = cg_from_sequence("AAAA", ref);
+  auto i2 = d.append_node<node_kind::inner>();
+  i2.cg() = cg_from_sequence("AAAA", ref);
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), p.index(), 0);
+  add_edge(d, root.index(), i2.index(), 1);
+  add_edge(d, p.index(), la.index(), 0);
+  add_edge(d, p.index(), lb.index(), 1);
+  add_edge(d, p.index(), lc.index(), 2);
+  add_edge(d, i2.index(), ld.index(), 0);
+  add_edge(d, i2.index(), le.index(), 1);
+
+  recompute_edge_mutations(d);
+
+  tree_index idx{d};
+
+  // Initial: {A,B} under P → 1 condensed; {D,E} under I2 → 1 condensed.
+  assert(idx.num_condensed_leaves() == 2);
+
+  // Identify the representative (uncondensed) leaf under I2.
+  bool d_cond = idx.is_condensed(ld.index());
+  bool e_cond = idx.is_condensed(le.index());
+  assert((d_cond || e_cond) && !(d_cond && e_cond));
+  std::size_t i2_rep = d_cond ? le.index() : ld.index();
+  std::size_t i2_condensed = d_cond ? ld.index() : le.index();
+
+  // Move A to be a sibling of the representative under I2.
+  // After SPR: I2 has {new_inner, i2_condensed}; new_inner has {i2_rep, A}.
+  // i2_condensed is now the sole leaf under I2 → must become uncondensed.
+  auto r = apply_spr_inplace(d, idx, la.index(), i2_rep);
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_condensed_nodes(r);
+
+  // The previously condensed leaf under I2 should now be uncondensed.
+  assert(!idx.is_condensed(i2_condensed));
+
+  // Verify against a fresh index (run remaining phases first).
+  idx.update_subtree_sizes(r);
+  idx.update_tree_root(r);
+  idx.recompute_dfs();
+
+  tree_index fresh{d};
+  assert(idx.num_condensed_leaves() == fresh.num_condensed_leaves());
+  for (std::size_t n = 0; n < idx.num_nodes(); n++) {
+    if (!idx.is_valid(n)) continue;
+    assert(idx.is_condensed(n) == fresh.is_condensed(n));
+  }
+
+  // The formerly-condensed leaf must appear in searchable_nodes_.
+  auto const& sn = idx.get_searchable_nodes();
+  assert(std::find(sn.begin(), sn.end(), i2_condensed) != sn.end());
+
+  std::println("  PASS");
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -4197,6 +4294,7 @@ int main() {
   test_condensed_triple_remove_representative();
   test_condensed_no_change_for_non_leaf_move();
   test_condensed_vs_fresh_index();
+  test_condensed_dst_parent_recheck();
 
   std::println("All inplace SPR phase 1-16 tests passed!");
   return 0;
