@@ -233,7 +233,7 @@ class tree_index {
   //   - subtree_size_[]      (Phase 13 — call update_subtree_sizes())
   //   - tree_root_           (Phase 15)
   //   - is_condensed_[]      (Phase 16)
-  //   - dfs_info_[]          (recompute after all topology updates)
+  //   - dfs_info_[]          (Phase 14 — call recompute_dfs())
   void update_topology(spr_result const& r) {
     ensure_capacity(d_.node_high_mark());
 
@@ -325,6 +325,18 @@ class tree_index {
     if (rem_start != r.dst_parent && is_valid(rem_start)) {
       walk_up_recompute(rem_start);
     }
+  }
+
+  // Phase 14: Recompute dfs_info_[] for the entire tree.
+  // DFS indices (dfs_index, dfs_end_index, level) cannot be cheaply updated
+  // incrementally — an SPR can change the DFS interval of nodes far from the
+  // move.  Re-traverse the entire tree from tree_root_.
+  // This is O(N) with no per-site work, so negligible vs Fitch updates.
+  // Must be called after update_topology() (so children_[] is correct).
+  void recompute_dfs() {
+    std::fill(has_dfs_info_.begin(), has_dfs_info_.end(), 0);
+    std::size_t counter = 0;
+    dfs_visit(tree_root_, counter, 0);
   }
 
  private:

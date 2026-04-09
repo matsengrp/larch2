@@ -3104,6 +3104,327 @@ static void test_subtree_size_sibling_move() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 14 helpers: DFS re-traverse verification
+// ---------------------------------------------------------------------------
+
+// Recompute DFS info from scratch by walking the tree, and return a map
+// of node -> dfs_info for all reachable nodes.
+static std::unordered_map<std::size_t, dfs_info> fresh_dfs_info(
+    tree_index const& idx) {
+  std::unordered_map<std::size_t, dfs_info> result;
+  struct frame {
+    std::size_t node;
+    std::size_t level;
+  };
+  // Iterative DFS using an explicit stack (post-order needs two passes).
+  // Simpler: recursive lambda.
+  std::size_t counter = 0;
+  std::function<void(std::size_t, std::size_t)> visit =
+      [&](std::size_t node, std::size_t level) {
+        dfs_info info;
+        info.dfs_index = counter++;
+        info.level = level;
+        for (auto child : idx.get_children(node)) visit(child, level + 1);
+        info.dfs_end_index = counter;
+        result[node] = info;
+      };
+  visit(idx.get_tree_root(), 0);
+  return result;
+}
+
+// Verify that idx.dfs_info_ matches a freshly computed DFS traversal for
+// all reachable nodes.
+static void verify_dfs_info(tree_index const& idx) {
+  auto expected = fresh_dfs_info(idx);
+  assert(!expected.empty() && "fresh DFS produced no nodes");
+  for (auto const& [node, info] : expected) {
+    assert(idx.has_dfs_info(node) && "reachable node missing DFS info");
+    auto const& actual = idx.get_dfs_info(node);
+    assert(actual.dfs_index == info.dfs_index &&
+           "dfs_index mismatch after recompute_dfs");
+    assert(actual.dfs_end_index == info.dfs_end_index &&
+           "dfs_end_index mismatch after recompute_dfs");
+    assert(actual.level == info.level && "level mismatch after recompute_dfs");
+  }
+}
+
+// Verify is_ancestor returns correct results for all pairs in a sample of
+// nodes.  Uses the DFS interval property directly.
+static void verify_is_ancestor(tree_index const& idx,
+                                std::vector<std::size_t> const& nodes) {
+  for (auto a : nodes) {
+    for (auto b : nodes) {
+      if (!idx.has_dfs_info(a) || !idx.has_dfs_info(b)) continue;
+      auto const& ai = idx.get_dfs_info(a);
+      auto const& bi = idx.get_dfs_info(b);
+      bool expected = ai.dfs_index <= bi.dfs_index &&
+                      bi.dfs_index < ai.dfs_end_index;
+      assert(idx.is_ancestor(a, b) == expected &&
+             "is_ancestor disagrees with DFS intervals");
+    }
+  }
+}
+
+// Collect all reachable node indices from tree_root via children_.
+static std::vector<std::size_t> collect_reachable_nodes(
+    tree_index const& idx) {
+  std::vector<std::size_t> result;
+  std::vector<std::size_t> stack = {idx.get_tree_root()};
+  while (!stack.empty()) {
+    auto node = stack.back();
+    stack.pop_back();
+    result.push_back(node);
+    for (auto child : idx.get_children(node)) stack.push_back(child);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14 tests: DFS re-traverse
+// ---------------------------------------------------------------------------
+
+// After SPR + DFS re-traverse: dfs_info_ matches a freshly built tree_index.
+static void test_dfs_recompute_with_collapse() {
+  std::println("test_dfs_recompute_with_collapse");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  // Verify initial DFS info is correct.
+  verify_dfs_info(idx);
+
+  // SPR: L1 → L5 (i3 is binary → collapses).
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+  assert(r.src_parent_collapsed);
+
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+  idx.recompute_dfs();
+
+  verify_dfs_info(idx);
+
+  // Collapsed node should not have valid DFS info — unless its slot was
+  // recycled for new_inner (collapsed_node == new_inner).
+  if (r.collapsed_node != r.new_inner) {
+    assert(!idx.has_dfs_info(r.collapsed_node) &&
+           "collapsed node should not have DFS info");
+  }
+
+  // Tree root should have level 0.
+  assert(idx.get_dfs_info(idx.get_tree_root()).level == 0);
+
+  std::println("  PASS");
+}
+
+// SPR without collapse: verify DFS is fully correct.
+static void test_dfs_recompute_no_collapse() {
+  std::println("test_dfs_recompute_no_collapse");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  // SPR: L7 → L1 (i6 is ternary → no collapse).
+  auto r = apply_spr_inplace(t.tree, idx, t.L7, t.L1);
+  assert(!r.src_parent_collapsed);
+
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+  idx.recompute_dfs();
+
+  verify_dfs_info(idx);
+  assert(idx.get_dfs_info(idx.get_tree_root()).level == 0);
+
+  std::println("  PASS");
+}
+
+// is_ancestor returns correct results for 20+ random pairs after SPR.
+static void test_dfs_is_ancestor_after_spr() {
+  std::println("test_dfs_is_ancestor_after_spr");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  // SPR: L1 → L5 (with collapse).
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+  idx.recompute_dfs();
+
+  auto nodes = collect_reachable_nodes(idx);
+  assert(nodes.size() >= 20 && "expected at least 20 reachable nodes");
+
+  // Check all pairs among reachable nodes (covers well over 20 pairs).
+  verify_is_ancestor(idx, nodes);
+
+  // Spot-check: tree_root is ancestor of every reachable node.
+  auto root = idx.get_tree_root();
+  for (auto node : nodes) {
+    assert(idx.is_ancestor(root, node));
+  }
+
+  // Spot-check: no leaf is ancestor of any other node (except itself).
+  for (auto node : nodes) {
+    if (!idx.get_children(node).empty()) continue;  // skip inner nodes
+    for (auto other : nodes) {
+      if (other == node) {
+        assert(idx.is_ancestor(node, other));  // self-ancestry
+      } else {
+        assert(!idx.is_ancestor(node, other));
+      }
+    }
+  }
+
+  std::println("  PASS");
+}
+
+// Sequential SPRs: DFS info remains correct after each recompute.
+static void test_dfs_recompute_sequential() {
+  std::println("test_dfs_recompute_sequential");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  // First move: L1 → L5 (with collapse).
+  auto r1 = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+  idx.update_topology(r1);
+  idx.update_searchable_nodes(r1);
+  idx.update_subtree_sizes(r1);
+  idx.recompute_dfs();
+  verify_dfs_info(idx);
+
+  // Second move: L3 → L6 (i4 is binary → collapses).
+  auto r2 = apply_spr_inplace(t.tree, idx, t.L3, t.L6);
+  idx.update_topology(r2);
+  idx.update_searchable_nodes(r2);
+  idx.update_subtree_sizes(r2);
+  idx.recompute_dfs();
+  verify_dfs_info(idx);
+
+  // Verify is_ancestor on all reachable nodes after both moves.
+  auto nodes = collect_reachable_nodes(idx);
+  verify_is_ancestor(idx, nodes);
+
+  std::println("  PASS");
+}
+
+// Simple tree: verify DFS recompute on a small tree.
+static void test_dfs_recompute_simple_tree() {
+  std::println("test_dfs_recompute_simple_tree");
+
+  auto d = make_simple_tree();
+  tree_index idx{d};
+
+  verify_dfs_info(idx);
+
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto a_idx = get_child_idx(d, root_clades[0][0]);
+  auto b_idx = get_child_idx(d, root_clades[1][0]);
+
+  // SPR: A → B (root is ternary → no collapse).
+  auto r = apply_spr_inplace(d, idx, a_idx, b_idx);
+  assert(!r.src_parent_collapsed);
+
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+  idx.recompute_dfs();
+
+  verify_dfs_info(idx);
+
+  // new_inner should be at level 1 (child of root).
+  assert(idx.get_dfs_info(r.new_inner).level == 1);
+
+  // A and B should now be at level 2 (children of new_inner).
+  assert(idx.get_dfs_info(a_idx).level == 2);
+  assert(idx.get_dfs_info(b_idx).level == 2);
+
+  // Root should be at level 0.
+  assert(idx.get_dfs_info(root_idx).level == 0);
+
+  auto nodes = collect_reachable_nodes(idx);
+  verify_is_ancestor(idx, nodes);
+
+  std::println("  PASS");
+}
+
+// Idempotency: calling recompute_dfs twice produces same result.
+static void test_dfs_recompute_idempotent() {
+  std::println("test_dfs_recompute_idempotent");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  // SPR then recompute.
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+  idx.update_topology(r);
+  idx.recompute_dfs();
+
+  // Save DFS info.
+  auto first = fresh_dfs_info(idx);
+
+  // Recompute again — should be identical.
+  idx.recompute_dfs();
+
+  auto second = fresh_dfs_info(idx);
+  assert(first.size() == second.size());
+  for (auto const& [node, info] : first) {
+    auto it = second.find(node);
+    assert(it != second.end());
+    assert(it->second.dfs_index == info.dfs_index);
+    assert(it->second.dfs_end_index == info.dfs_end_index);
+    assert(it->second.level == info.level);
+  }
+
+  std::println("  PASS");
+}
+
+// Suboptimal tree: verify DFS recompute works on a different tree structure.
+static void test_dfs_recompute_suboptimal_tree() {
+  std::println("test_dfs_recompute_suboptimal_tree");
+
+  auto d = make_suboptimal_tree();
+  tree_index idx{d};
+
+  verify_dfs_info(idx);
+
+  // Find nodes for an SPR move.
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  // i1 is first child, i2 is second child of root.
+  auto i1_idx = get_child_idx(d, root_clades[0][0]);
+  auto i2_idx = get_child_idx(d, root_clades[1][0]);
+  auto i1_clades = get_clades(d, i1_idx);
+  // L4 is second child of i1.
+  auto l4_idx = get_child_idx(d, i1_clades[1][0]);
+  auto i2_clades = get_clades(d, i2_idx);
+  auto l3_idx = get_child_idx(d, i2_clades[0][0]);
+
+  // SPR: L4 → L3 (i1 is binary → collapses).
+  auto r = apply_spr_inplace(d, idx, l4_idx, l3_idx);
+  assert(r.src_parent_collapsed);
+
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+  idx.recompute_dfs();
+
+  verify_dfs_info(idx);
+
+  auto nodes = collect_reachable_nodes(idx);
+  verify_is_ancestor(idx, nodes);
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -3194,6 +3515,15 @@ int main() {
   test_subtree_size_root_collapse();
   test_subtree_size_sibling_move();
 
-  std::println("All inplace SPR phase 1-13 tests passed!");
+  // Phase 14: recompute_dfs
+  test_dfs_recompute_with_collapse();
+  test_dfs_recompute_no_collapse();
+  test_dfs_is_ancestor_after_spr();
+  test_dfs_recompute_sequential();
+  test_dfs_recompute_simple_tree();
+  test_dfs_recompute_idempotent();
+  test_dfs_recompute_suboptimal_tree();
+
+  std::println("All inplace SPR phase 1-14 tests passed!");
   return 0;
 }
