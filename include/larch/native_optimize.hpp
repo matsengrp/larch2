@@ -385,6 +385,30 @@ class tree_index {
            "recompute_dfs: tree_root_ unreachable after DFS traversal");
   }
 
+  // Phase 17: Recompute a single node's Fitch data from its current children.
+  // Cost: O(num_children × num_variable_sites) per node.
+  void recompute_node_fitch(std::size_t node_id) {
+    auto& children = children_[node_id];
+    uint8_t nc = static_cast<uint8_t>(children.size());
+    num_children_[node_id] = nc;
+    has_child_counts_[node_id] = true;
+    std::size_t base = node_id * num_variable_sites_;
+
+    for (std::size_t i = 0; i < num_variable_sites_; i++) {
+      std::array<uint8_t, 4> c = {0, 0, 0, 0};
+      uint8_t au = 0;
+      for (auto child : children) {
+        uint8_t cf = fitch_sets_[child * num_variable_sites_ + i];
+        for (int j = 0; j < 4; j++)
+          if (cf & (1 << j)) c[j]++;
+        au |= allele_union_[child * num_variable_sites_ + i];
+      }
+      child_counts_[base + i] = c;
+      fitch_sets_[base + i] = fitch_set_from_counts(c, nc);
+      allele_union_[base + i] = au;
+    }
+  }
+
  private:
   static constexpr std::size_t kFitchParallelThreshold = 64;
 

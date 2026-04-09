@@ -4179,6 +4179,144 @@ static void test_condensed_dst_parent_recheck() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 17 tests: recompute_node_fitch
+// ---------------------------------------------------------------------------
+
+// Test 1: Call recompute_node_fitch on root after full build_tree_index.
+// Fitch sets should be unchanged (idempotent).
+static void test_single_node_fitch_idempotent() {
+  std::println("test_single_node_fitch_idempotent");
+  auto tree = make_suboptimal_tree();
+  tree_index idx{tree};
+
+  auto root = idx.get_tree_root();
+  auto nsites = idx.num_variable_sites();
+
+  // Snapshot Fitch sets, child_counts, allele_union before recompute.
+  std::vector<uint8_t> fitch_before(nsites);
+  std::vector<std::array<uint8_t, 4>> counts_before(nsites);
+  std::vector<uint8_t> au_before(nsites);
+  for (std::size_t i = 0; i < nsites; i++) {
+    fitch_before[i] = idx.get_fitch_set(root, i);
+    counts_before[i] = idx.get_child_counts(root, i);
+    au_before[i] = idx.get_allele_union(root, i);
+  }
+  auto nc_before = idx.get_num_children(root);
+
+  idx.recompute_node_fitch(root);
+
+  // Verify everything is unchanged.
+  assert(idx.get_num_children(root) == nc_before);
+  for (std::size_t i = 0; i < nsites; i++) {
+    assert(idx.get_fitch_set(root, i) == fitch_before[i]);
+    assert(idx.get_child_counts(root, i) == counts_before[i]);
+    assert(idx.get_allele_union(root, i) == au_before[i]);
+  }
+
+  std::println("  PASS");
+}
+
+// Test 2: Add a child to a node (in children_[] only), call
+// recompute_node_fitch. Verify Fitch set now reflects the new child.
+static void test_single_node_fitch_new_child() {
+  std::println("test_single_node_fitch_new_child");
+
+  // Build a 4-leaf tree:
+  //       R
+  //      / \
+  //     I    C
+  //    / \
+  //   A   B
+  // A = "TAA", B = "ATA", C = "AAT"
+  // Then manually add C as a third child of I and recompute I.
+  constexpr std::string_view ref = "AAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto la = d.append_node<node_kind::leaf>();
+  la.cg() = cg_from_sequence("TAA", ref);
+  la.sample_id() = "A";
+  auto lb = d.append_node<node_kind::leaf>();
+  lb.cg() = cg_from_sequence("ATA", ref);
+  lb.sample_id() = "B";
+  auto lc = d.append_node<node_kind::leaf>();
+  lc.cg() = cg_from_sequence("AAT", ref);
+  lc.sample_id() = "C";
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAA", ref);
+  auto inner = d.append_node<node_kind::inner>();
+  inner.cg() = cg_from_sequence("AAA", ref);
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), inner.index(), 0);
+  add_edge(d, root.index(), lc.index(), 1);
+  add_edge(d, inner.index(), la.index(), 0);
+  add_edge(d, inner.index(), lb.index(), 1);
+
+  recompute_edge_mutations(d);
+  tree_index idx{d};
+
+  auto I = inner.index();
+  auto A = la.index();
+  auto B = lb.index();
+  auto C = lc.index();
+  auto nsites = idx.num_variable_sites();
+
+  // Before: I has children {A, B}.
+  // A = "TAA" → site 0: T (0b1000)
+  // B = "ATA" → site 1: T (0b1000)
+  // Fitch(I, site 0) = {A} | {T} = {A,T} (no intersection → union)
+  // Fitch(I, site 1) = {A} | {T} = {A,T}
+  // Fitch(I, site 2) = {A} & {A} = {A}
+  assert(idx.get_num_children(I) == 2);
+
+  // Snapshot I's Fitch sets before the modification.
+  std::vector<uint8_t> fitch_before(nsites);
+  for (std::size_t i = 0; i < nsites; i++)
+    fitch_before[i] = idx.get_fitch_set(I, i);
+
+  // Add C as a third child of I (topology-only, no SPR).
+  // This modifies the internal children_ vector directly.
+  // We need to access children_ — use a const_cast workaround via the
+  // mutable method.
+  auto& kids = const_cast<std::vector<std::size_t>&>(idx.get_children(I));
+  kids.push_back(C);
+
+  idx.recompute_node_fitch(I);
+
+  // Now I has 3 children: {A, B, C}.
+  assert(idx.get_num_children(I) == 3);
+
+  // fitch_set_from_counts uses intersection/union:
+  //   - intersection = bases present in ALL children
+  //   - if intersection non-empty → return intersection, else return union
+  //
+  // With 3 children {A, B, C}:
+  // Site 0 (pos 1): A=T, B=A, C=A → counts: A=2,T=1 → no base in all 3 → union={A,T}
+  // Site 1 (pos 2): A=A, B=T, C=A → counts: A=2,T=1 → no base in all 3 → union={A,T}
+  // Site 2 (pos 3): A=A, B=A, C=T → counts: A=2,T=1 → no base in all 3 → union={A,T}
+  for (std::size_t i = 0; i < nsites; i++) {
+    assert(idx.get_fitch_set(I, i) == (0b0001 | 0b1000));  // {A, T}
+  }
+
+  // allele_union should be union of all children's alleles: {A, T} for all sites.
+  for (std::size_t i = 0; i < nsites; i++) {
+    assert(idx.get_allele_union(I, i) == (0b0001 | 0b1000));  // {A, T}
+  }
+
+  // Site 2 should have changed: was {A} (intersection of A,A with 2 children),
+  // now {A,T} (union, since no base in all 3 children).
+  // Sites 0,1 were already {A,T} with 2 children (no intersection → union).
+  assert(idx.get_fitch_set(I, 2) != fitch_before[2]);
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -4296,6 +4434,10 @@ int main() {
   test_condensed_vs_fresh_index();
   test_condensed_dst_parent_recheck();
 
-  std::println("All inplace SPR phase 1-16 tests passed!");
+  // Phase 17: recompute_node_fitch
+  test_single_node_fitch_idempotent();
+  test_single_node_fitch_new_child();
+
+  std::println("All inplace SPR phase 1-17 tests passed!");
   return 0;
 }
