@@ -2627,6 +2627,86 @@ static void test_update_topology_sequential_sprs() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 11: ensure_capacity — grow flat arrays for new nodes
+// ---------------------------------------------------------------------------
+
+// Test 1: ensure_capacity grows arrays when new_inner exceeds num_nodes_.
+// Uses a non-collapsing SPR (from ternary parent i6) so the new node is
+// appended at high_mark rather than recycling a removed node's slot.
+// Calls ensure_capacity directly and verifies all new slots are zero-initialized.
+static void test_ensure_capacity_array_sizes() {
+  std::println("test_ensure_capacity_array_sizes");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+  auto old_cap = idx.num_nodes();
+
+  // L7 is under ternary parent i6 (children: L7, L8, i7).
+  // Moving L7 does NOT collapse i6, so append_node allocates at high_mark.
+  auto r = apply_spr_inplace(t.tree, idx, t.L7, t.L1);
+  assert(!r.src_parent_collapsed);
+  auto new_high = t.tree.node_high_mark();
+  assert(new_high > old_cap);
+
+  // Call ensure_capacity directly (not through update_topology) to test
+  // it in isolation.
+  idx.ensure_capacity(new_high);
+  assert(idx.num_nodes() == new_high);
+
+  // All new slots (from old_cap to new_high - 1) should be zero-initialized.
+  auto n_sites = idx.num_variable_sites();
+  for (std::size_t n = old_cap; n < new_high; n++) {
+    assert(!idx.is_valid(n));
+    assert(!idx.has_dfs_info(n));
+    assert(!idx.has_child_counts(n));
+    assert(idx.get_num_children(n) == 0);
+    for (std::size_t i = 0; i < n_sites; i++) {
+      assert(idx.get_fitch_set(n, i) == 0);
+      auto const& cc = idx.get_child_counts(n, i);
+      assert(cc[0] == 0 && cc[1] == 0 && cc[2] == 0 && cc[3] == 0);
+      assert(idx.get_allele_union(n, i) == 0);
+    }
+  }
+
+  std::println("  old_cap={} new_cap={}", old_cap, new_high);
+  std::println("  PASS");
+}
+
+// Test 2: Two SPRs in sequence; verify capacity grows monotonically.
+// First SPR is non-collapsing (truly grows arrays).  Second may collapse
+// (recycling a hole), but capacity must not shrink.
+static void test_ensure_capacity_monotonic_growth() {
+  std::println("test_ensure_capacity_monotonic_growth");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+  auto cap0 = idx.num_nodes();
+
+  // First SPR: L7 → L1 (non-collapsing from ternary i6).
+  auto r1 = apply_spr_inplace(t.tree, idx, t.L7, t.L1);
+  assert(!r1.src_parent_collapsed);
+  idx.update_topology(r1);
+  auto cap1 = idx.num_nodes();
+  assert(cap1 > cap0);
+  assert(idx.is_valid(r1.new_inner));
+
+  // Second SPR: L8 → L3.  i6 is now binary {L8, i7}, so this collapses i6.
+  // The chain recycles i6's slot for new_inner, so high_mark may not grow.
+  tree_index idx_for_lca{t.tree};
+  auto r2 = apply_spr_inplace(t.tree, idx_for_lca, t.L8, t.L3);
+  idx.update_topology(r2);
+  auto cap2 = idx.num_nodes();
+  assert(cap2 >= cap1);  // monotonic — never shrinks
+
+  // Both new_inner nodes should be valid and addressable.
+  assert(idx.is_valid(r1.new_inner));
+  assert(idx.is_valid(r2.new_inner));
+
+  std::println("  cap0={} cap1={} cap2={}", cap0, cap1, cap2);
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -2699,6 +2779,10 @@ int main() {
   test_update_topology_edge_cases();
   test_update_topology_sequential_sprs();
 
-  std::println("All inplace SPR phase 1-10 tests passed!");
+  // Phase 11: ensure_capacity
+  test_ensure_capacity_array_sizes();
+  test_ensure_capacity_monotonic_growth();
+
+  std::println("All inplace SPR phase 1-11 tests passed!");
   return 0;
 }

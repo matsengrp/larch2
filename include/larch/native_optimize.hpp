@@ -194,6 +194,7 @@ class tree_index {
   }
   std::size_t num_variable_sites() const { return num_variable_sites_; }
   std::size_t num_condensed_leaves() const { return condensed_count_; }
+  std::size_t num_nodes() const { return num_nodes_; }
   uint8_t const* get_ref_alleles_ptr() const { return ref_alleles_.data(); }
 
   bool is_valid(std::size_t node) const {
