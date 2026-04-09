@@ -491,6 +491,37 @@ class tree_index {
     return propagate_fitch_upward(start, delta);
   }
 
+  // Propagate Fitch upward from start, stopping before stop_before (exclusive).
+  // The stop_before node is NOT recomputed — the caller handles it.
+  // Returns number of nodes updated.  Prepares for Phase 22 (combined update).
+  std::size_t propagate_fitch_up_to(std::size_t start, std::size_t stop_before,
+                                    int& delta_out) {
+    std::size_t count = 0;
+    std::size_t node = start;
+    delta_out = 0;
+    while (node != stop_before && node != tree_root_ && is_valid_[node]) {
+      auto result = recompute_node_fitch_tracked(node);
+      count++;
+      delta_out += result.delta;
+      if (!result.changed) break;
+      node = parent_[node];
+    }
+    // If we reached tree_root_ (and it's not the stop point), recompute it.
+    if (node == tree_root_ && node != stop_before) {
+      auto result = recompute_node_fitch_tracked(node);
+      count++;
+      delta_out += result.delta;
+    }
+    return count;
+  }
+
+  // Convenience overload without delta tracking.
+  std::size_t propagate_fitch_up_to(std::size_t start,
+                                    std::size_t stop_before) {
+    int delta = 0;
+    return propagate_fitch_up_to(start, stop_before, delta);
+  }
+
   // Phase 19: Initialize Fitch data for a newly created inner node.
   // When a new inner node is created (Phase 6), its children (dst and src)
   // already have correct Fitch sets — only their parent changed.  This
@@ -506,16 +537,49 @@ class tree_index {
     return result.delta;
   }
 
+  // Compute total Fitch cost at a node from its current child_counts_ arrays.
+  // Used to obtain the old cost of a node about to be removed (e.g., a
+  // collapsed src_parent) so the delta tracker can account for its deletion.
+  int compute_node_fitch_cost(std::size_t node_id) const {
+    if (!has_child_counts_[node_id]) return 0;
+    uint32_t nc = num_children_[node_id];
+    if (nc <= 1) return 0;
+    int cost = 0;
+    std::size_t base = node_id * num_variable_sites_;
+    for (std::size_t i = 0; i < num_variable_sites_; i++) {
+      cost += fitch_cost_from_counts(child_counts_[base + i], nc);
+    }
+    return cost;
+  }
+
   // Phase 20: Fitch update for the source removal path.
   // After an SPR detaches src from src_parent, the Fitch data along the
   // removal path is stale.  If src_parent was collapsed, start from
   // grandparent (which gained remaining_child as a direct child); otherwise
   // start from src_parent (which lost one child).  Propagate upward to root
   // with early termination when Fitch sets stabilize.
+  //
+  // delta_out accumulates the parsimony score change along the removal path,
+  // including the cost removed by collapsing src_parent (if applicable).
   // Must be called after update_topology() and (typically) init_new_node_fitch().
-  void update_fitch_removal(spr_result const& r) {
+  void update_fitch_removal(spr_result const& r, int& delta_out) {
+    delta_out = 0;
+    // If src_parent was collapsed, its Fitch cost is removed from the tree.
+    // child_counts_/num_children_ still hold the pre-collapse values
+    // (update_topology only clears children_[] and is_valid_[]).
+    if (r.src_parent_collapsed) {
+      delta_out -= compute_node_fitch_cost(r.collapsed_node);
+    }
     std::size_t start = r.src_parent_collapsed ? r.grandparent : r.src_parent;
-    propagate_fitch_upward(start);
+    int propagation_delta = 0;
+    propagate_fitch_upward(start, propagation_delta);
+    delta_out += propagation_delta;
+  }
+
+  // Convenience overload without delta tracking.
+  void update_fitch_removal(spr_result const& r) {
+    int delta = 0;
+    update_fitch_removal(r, delta);
   }
 
  private:
