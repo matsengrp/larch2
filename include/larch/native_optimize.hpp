@@ -80,8 +80,8 @@ struct scratch_buffers {
 // ============================================================================
 // base_to_one_hot and fitch_set_from_counts are defined in compute.hpp
 
-inline int fitch_cost_from_counts(std::array<uint8_t, 4> const& counts,
-                                  uint8_t num_children) {
+inline int fitch_cost_from_counts(std::array<uint32_t, 4> const& counts,
+                                  uint32_t num_children) {
   if (num_children <= 1) return 0;
   for (int i = 0; i < 4; i++) {
     if (counts[i] == num_children) return 0;
@@ -169,8 +169,8 @@ class tree_index {
     return &fitch_sets_[node * num_variable_sites_];
   }
 
-  std::array<uint8_t, 4> const& get_child_counts(std::size_t node,
-                                                 std::size_t site_idx) const {
+  std::array<uint32_t, 4> const& get_child_counts(std::size_t node,
+                                                  std::size_t site_idx) const {
     return child_counts_[node * num_variable_sites_ + site_idx];
   }
 
@@ -178,7 +178,7 @@ class tree_index {
     return node < num_nodes_ && has_child_counts_[node];
   }
 
-  uint8_t get_num_children(std::size_t node) const {
+  uint32_t get_num_children(std::size_t node) const {
     return num_children_[node];
   }
 
@@ -388,24 +388,34 @@ class tree_index {
   // Phase 17: Recompute a single node's Fitch data from its current children.
   // Cost: O(num_children × num_variable_sites) per node.
   void recompute_node_fitch(std::size_t node_id) {
+    assert(!is_leaf(d_, node_id) &&
+           "recompute_node_fitch must not be called on a leaf node");
     auto& children = children_[node_id];
-    uint8_t nc = static_cast<uint8_t>(children.size());
+    uint32_t nc = static_cast<uint32_t>(children.size());
     num_children_[node_id] = nc;
     has_child_counts_[node_id] = true;
     std::size_t base = node_id * num_variable_sites_;
 
+    // Initialize counts and allele_union sequentially.
     for (std::size_t i = 0; i < num_variable_sites_; i++) {
-      std::array<uint8_t, 4> c = {0, 0, 0, 0};
-      uint8_t au = 0;
-      for (auto child : children) {
-        uint8_t cf = fitch_sets_[child * num_variable_sites_ + i];
+      child_counts_[base + i] = {0, 0, 0, 0};
+      allele_union_[base + i] = 0;
+    }
+
+    // Accumulate: children outer, sites inner for cache-friendly access.
+    for (auto child : children) {
+      std::size_t child_base = child * num_variable_sites_;
+      for (std::size_t i = 0; i < num_variable_sites_; i++) {
+        uint8_t cf = fitch_sets_[child_base + i];
         for (int j = 0; j < 4; j++)
-          if (cf & (1 << j)) c[j]++;
-        au |= allele_union_[child * num_variable_sites_ + i];
+          if (cf & (1 << j)) child_counts_[base + i][j]++;
+        allele_union_[base + i] |= allele_union_[child_base + i];
       }
-      child_counts_[base + i] = c;
-      fitch_sets_[base + i] = fitch_set_from_counts(c, nc);
-      allele_union_[base + i] = au;
+    }
+
+    // Finalize Fitch sets sequentially.
+    for (std::size_t i = 0; i < num_variable_sites_; i++) {
+      fitch_sets_[base + i] = fitch_set_from_counts(child_counts_[base + i], nc);
     }
   }
 
@@ -713,7 +723,7 @@ class tree_index {
       for (auto child_id : children) fitch_bottom_up_impl(child_id, ref);
 
       has_child_counts_[node_id] = true;
-      uint8_t nc = static_cast<uint8_t>(children.size());
+      uint32_t nc = static_cast<uint32_t>(children.size());
       num_children_[node_id] = nc;
 
       for (std::size_t i = 0; i < num_variable_sites_; i++) {
@@ -780,7 +790,7 @@ class tree_index {
 
     // Compute this node's Fitch data from children
     has_child_counts_[node_id] = true;
-    uint8_t nc = static_cast<uint8_t>(children.size());
+    uint32_t nc = static_cast<uint32_t>(children.size());
     num_children_[node_id] = nc;
 
     for (std::size_t i = 0; i < num_variable_sites_; i++) {
@@ -829,9 +839,9 @@ class tree_index {
   std::vector<uint8_t> has_dfs_info_;
   std::vector<uint8_t> is_valid_;
   std::vector<uint8_t> fitch_sets_;
-  std::vector<std::array<uint8_t, 4>> child_counts_;
+  std::vector<std::array<uint32_t, 4>> child_counts_;
   std::vector<uint8_t> has_child_counts_;
-  std::vector<uint8_t> num_children_;
+  std::vector<uint32_t> num_children_;
   std::vector<uint8_t> allele_union_;
   std::vector<std::size_t> parent_;
   std::vector<std::vector<std::size_t>> children_;
@@ -919,7 +929,7 @@ class move_enumerator {
 
       if (src_parent_is_binary && index_.has_child_counts(src_parent)) {
         auto counts = index_.get_child_counts(src_parent, si);
-        uint8_t nc = index_.get_num_children(src_parent);
+        uint32_t nc = index_.get_num_children(src_parent);
         total_score_change -= fitch_cost_from_counts(counts, nc);
       }
 
@@ -933,9 +943,9 @@ class move_enumerator {
         if (!index_.has_child_counts(node)) continue;
 
         auto counts = index_.get_child_counts(node, si);
-        uint8_t nc = index_.get_num_children(node);
+        uint32_t nc = index_.get_num_children(node);
         int old_cost = fitch_cost_from_counts(counts, nc);
-        uint8_t new_nc = nc;
+        uint32_t new_nc = nc;
 
         if (on_src_path.count(node)) {
           if (node == src_parent && !src_parent_is_binary) {
@@ -1036,7 +1046,7 @@ class move_enumerator {
               if (!index_.has_child_counts(above)) break;
 
               auto counts = index_.get_child_counts(above, si);
-              uint8_t nc = index_.get_num_children(above);
+              uint32_t nc = index_.get_num_children(above);
               int old_cost_above = fitch_cost_from_counts(counts, nc);
 
               for (int j = 0; j < 4; j++) {
@@ -1099,7 +1109,7 @@ class move_enumerator {
       auto const* sibling_fitch = index_.get_fitch_set_ptr(sibling);
       for (std::size_t si = 0; si < n_sites; si++) {
         auto& counts = index_.get_child_counts(src_parent, si);
-        uint8_t nc = index_.get_num_children(src_parent);
+        uint32_t nc = index_.get_num_children(src_parent);
         result.score_change -= fitch_cost_from_counts(counts, nc);
         result.old_fitch[si] = src_parent_fitch[si];
         result.new_fitch[si] = sibling_fitch[si];
@@ -1108,7 +1118,7 @@ class move_enumerator {
       auto const* src_fitch = index_.get_fitch_set_ptr(src);
       for (std::size_t si = 0; si < n_sites; si++) {
         auto counts = index_.get_child_counts(src_parent, si);
-        uint8_t nc = index_.get_num_children(src_parent);
+        uint32_t nc = index_.get_num_children(src_parent);
         int old_cost = fitch_cost_from_counts(counts, nc);
 
         uint8_t sf = src_fitch[si];
@@ -1117,7 +1127,7 @@ class move_enumerator {
             if (counts[j] > 0) counts[j]--;
           }
         }
-        uint8_t new_nc = nc - 1;
+        uint32_t new_nc = nc - 1;
         int new_cost = fitch_cost_from_counts(counts, new_nc);
         uint8_t new_fitch = fitch_set_from_counts(counts, new_nc);
 
@@ -1139,7 +1149,7 @@ class move_enumerator {
                                 src_removal_result& removal) const {
     std::size_t n_sites = index_.num_variable_sites();
     auto const* lca_fitch = index_.get_fitch_set_ptr(current_lca);
-    uint8_t nc = index_.get_num_children(current_lca);
+    uint32_t nc = index_.get_num_children(current_lca);
 
     for (std::size_t si = 0; si < n_sites; si++) {
       auto counts = index_.get_child_counts(current_lca, si);
@@ -1222,11 +1232,11 @@ class move_enumerator {
     while (true) {
       if (index_.has_child_counts(node)) {
         auto const* node_fitch_ptr = index_.get_fitch_set_ptr(node);
-        uint8_t nc = index_.get_num_children(node);
+        uint32_t nc = index_.get_num_children(node);
         bool is_lca = (node == lca);
-        uint8_t effective_nc =
-            is_lca ? static_cast<uint8_t>(static_cast<int>(nc) +
-                                          removal.lca_nc_adjustment)
+        uint32_t effective_nc =
+            is_lca ? static_cast<uint32_t>(static_cast<int>(nc) +
+                                           removal.lca_nc_adjustment)
                    : nc;
 
         for (std::size_t si = 0; si < n_sites; si++) {

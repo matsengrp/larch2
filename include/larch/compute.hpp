@@ -779,8 +779,8 @@ inline uint8_t base_to_one_hot(nuc_base b) {
   return static_cast<uint8_t>(1 << b.raw());
 }
 
-inline uint8_t fitch_set_from_counts(std::array<uint8_t, 4> const& counts,
-                                     uint8_t num_children) {
+inline uint8_t fitch_set_from_counts(std::array<uint32_t, 4> const& counts,
+                                     uint32_t num_children) {
   if (num_children == 0) return 0;
   uint8_t intersection = 0;
   for (int i = 0; i < 4; i++) {
@@ -880,9 +880,9 @@ inline void fitch_assign_compact_genomes(
     } else {
       for (auto child : children[nid]) bottom_up(child);
 
-      auto nc = static_cast<uint8_t>(children[nid].size());
+      auto nc = static_cast<uint32_t>(children[nid].size());
       for (std::size_t i = 0; i < n_sites; i++) {
-        std::array<uint8_t, 4> counts = {0, 0, 0, 0};
+        std::array<uint32_t, 4> counts = {0, 0, 0, 0};
         for (auto child : children[nid]) {
           uint8_t cf = fitch[child * n_sites + i];
           for (int j = 0; j < 4; j++) {

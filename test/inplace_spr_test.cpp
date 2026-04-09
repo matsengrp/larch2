@@ -4194,7 +4194,7 @@ static void test_single_node_fitch_idempotent() {
 
   // Snapshot Fitch sets, child_counts, allele_union before recompute.
   std::vector<uint8_t> fitch_before(nsites);
-  std::vector<std::array<uint8_t, 4>> counts_before(nsites);
+  std::vector<std::array<uint32_t, 4>> counts_before(nsites);
   std::vector<uint8_t> au_before(nsites);
   for (std::size_t i = 0; i < nsites; i++) {
     fitch_before[i] = idx.get_fitch_set(root, i);
