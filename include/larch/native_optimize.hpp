@@ -386,7 +386,8 @@ class tree_index {
   }
 
   // Phase 17: Recompute a single node's Fitch data from its current children.
-  // Cost: O(num_children × num_variable_sites) per node.
+  // Fused single-pass loop (sites-outer, children-inner) to avoid separate
+  // init/accumulate/finalize passes over num_variable_sites_.
   void recompute_node_fitch(std::size_t node_id) {
     assert(!is_leaf(d_, node_id) &&
            "recompute_node_fitch must not be called on a leaf node");
@@ -396,68 +397,103 @@ class tree_index {
     has_child_counts_[node_id] = true;
     std::size_t base = node_id * num_variable_sites_;
 
-    // Initialize counts and allele_union sequentially.
     for (std::size_t i = 0; i < num_variable_sites_; i++) {
-      child_counts_[base + i] = {0, 0, 0, 0};
-      allele_union_[base + i] = 0;
-    }
-
-    // Accumulate: children outer, sites inner for cache-friendly access.
-    for (auto child : children) {
-      std::size_t child_base = child * num_variable_sites_;
-      for (std::size_t i = 0; i < num_variable_sites_; i++) {
-        uint8_t cf = fitch_sets_[child_base + i];
+      std::array<uint32_t, 4> counts = {0, 0, 0, 0};
+      uint8_t au = 0;
+      for (auto child : children) {
+        uint8_t cf = fitch_sets_[child * num_variable_sites_ + i];
         for (int j = 0; j < 4; j++)
-          if (cf & (1 << j)) child_counts_[base + i][j]++;
-        allele_union_[base + i] |= allele_union_[child_base + i];
+          if (cf & (1 << j)) counts[j]++;
+        au |= allele_union_[child * num_variable_sites_ + i];
       }
-    }
-
-    // Finalize Fitch sets sequentially.
-    for (std::size_t i = 0; i < num_variable_sites_; i++) {
-      fitch_sets_[base + i] = fitch_set_from_counts(child_counts_[base + i], nc);
+      child_counts_[base + i] = counts;
+      fitch_sets_[base + i] = fitch_set_from_counts(counts, nc);
+      allele_union_[base + i] = au;
     }
   }
 
+  // Phase 18 helper: result of a tracked Fitch recomputation.
+  struct fitch_recompute_result {
+    bool changed;  // true if fitch_sets_ or allele_union_ differs from previous
+    int delta;     // parsimony cost change at this node
+  };
+
+  // Fused recompute with change detection (both fitch_sets_ and allele_union_)
+  // and parsimony delta tracking (prepares for Phase 25).
+  fitch_recompute_result recompute_node_fitch_tracked(std::size_t node_id) {
+    assert(!is_leaf(d_, node_id) &&
+           "recompute_node_fitch_tracked must not be called on a leaf node");
+    auto& children = children_[node_id];
+    uint32_t nc = static_cast<uint32_t>(children.size());
+    uint32_t old_nc = num_children_[node_id];
+    num_children_[node_id] = nc;
+    has_child_counts_[node_id] = true;
+    std::size_t base = node_id * num_variable_sites_;
+
+    bool changed = false;
+    int delta = 0;
+
+    for (std::size_t i = 0; i < num_variable_sites_; i++) {
+      uint8_t old_fitch = fitch_sets_[base + i];
+      uint8_t old_au = allele_union_[base + i];
+      int old_cost = fitch_cost_from_counts(child_counts_[base + i], old_nc);
+
+      std::array<uint32_t, 4> counts = {0, 0, 0, 0};
+      uint8_t au = 0;
+      for (auto child : children) {
+        uint8_t cf = fitch_sets_[child * num_variable_sites_ + i];
+        for (int j = 0; j < 4; j++)
+          if (cf & (1 << j)) counts[j]++;
+        au |= allele_union_[child * num_variable_sites_ + i];
+      }
+
+      uint8_t new_fitch = fitch_set_from_counts(counts, nc);
+      int new_cost = fitch_cost_from_counts(counts, nc);
+
+      child_counts_[base + i] = counts;
+      fitch_sets_[base + i] = new_fitch;
+      allele_union_[base + i] = au;
+
+      if (new_fitch != old_fitch || au != old_au) changed = true;
+      delta += (new_cost - old_cost);
+    }
+
+    return {changed, delta};
+  }
+
   // Phase 18: Walk from start to tree_root_, recomputing Fitch at each step.
-  // Stop early if the Fitch set at a node doesn't change (all ancestors are
-  // already correct).  Returns number of nodes updated.
-  std::size_t propagate_fitch_upward(std::size_t start) {
+  // Stop early if neither fitch_sets_ nor allele_union_ change at a node (all
+  // ancestors are already correct).  Returns number of nodes updated.
+  // delta_out accumulates the parsimony cost change across all recomputed nodes.
+  std::size_t propagate_fitch_upward(std::size_t start, int& delta_out) {
     std::size_t count = 0;
     std::size_t node = start;
+    delta_out = 0;
     while (node != tree_root_ && is_valid_[node]) {
-      auto old_fitch = get_fitch_snapshot(node);
-      recompute_node_fitch(node);
+      auto result = recompute_node_fitch_tracked(node);
       count++;
-      if (fitch_unchanged(node, old_fitch)) break;
+      delta_out += result.delta;
+      if (!result.changed) break;
       node = parent_[node];
     }
-    // Always recompute root
+    // Recompute root if propagation reached it (changes propagated all the way).
     if (node == tree_root_) {
-      recompute_node_fitch(node);
+      auto result = recompute_node_fitch_tracked(node);
       count++;
+      delta_out += result.delta;
     }
     return count;
+  }
+
+  // Convenience overload without delta tracking.
+  std::size_t propagate_fitch_upward(std::size_t start) {
+    int delta = 0;
+    return propagate_fitch_upward(start, delta);
   }
 
  private:
   static constexpr std::size_t kFitchParallelThreshold = 64;
 
-  // Copy of a node's Fitch row (for change detection in propagate_fitch_upward).
-  std::vector<uint8_t> get_fitch_snapshot(std::size_t node) const {
-    std::size_t base = node * num_variable_sites_;
-    return std::vector<uint8_t>(fitch_sets_.begin() + base,
-                                fitch_sets_.begin() + base + num_variable_sites_);
-  }
-
-  // True if node's current Fitch row matches the snapshot.
-  bool fitch_unchanged(std::size_t node,
-                       std::vector<uint8_t> const& old) const {
-    std::size_t base = node * num_variable_sites_;
-    return std::equal(fitch_sets_.begin() + base,
-                      fitch_sets_.begin() + base + num_variable_sites_,
-                      old.begin());
-  }
 
   void init() {
     auto ua_idx = get_root_idx(d_);
