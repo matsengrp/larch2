@@ -494,13 +494,23 @@ class tree_index {
     return result;
   }
 
-  void compute_subtree_sizes(std::size_t node) {
-    std::size_t size = 1;
-    for (auto child : children_[node]) {
-      compute_subtree_sizes(child);
-      size += subtree_size_[child];
+  // Iterative bottom-up traversal to avoid stack overflow on degenerate trees.
+  void compute_subtree_sizes(std::size_t root) {
+    // BFS to collect all nodes, then process in reverse for bottom-up order.
+    std::vector<std::size_t> order;
+    order.push_back(root);
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      for (auto child : children_[order[i]]) {
+        order.push_back(child);
+      }
     }
-    subtree_size_[node] = size;
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+      std::size_t size = 1;
+      for (auto child : children_[*it]) {
+        size += subtree_size_[child];
+      }
+      subtree_size_[*it] = size;
+    }
   }
 
   // Recompute subtree_size for a single node from its children.
@@ -527,16 +537,39 @@ class tree_index {
     }
   }
 
-  void dfs_visit(std::size_t node, std::size_t& counter, std::size_t level) {
-    dfs_info info;
-    info.dfs_index = counter++;
-    info.level = level;
+  // Iterative DFS to avoid stack overflow on degenerate trees.
+  // Assigns pre-order dfs_index and post-order dfs_end_index.
+  void dfs_visit(std::size_t root, std::size_t& counter,
+                 std::size_t root_level) {
+    struct frame {
+      std::size_t node;
+      std::size_t level;
+      bool entered;
+    };
+    std::vector<frame> stack;
+    stack.push_back({root, root_level, false});
 
-    for (auto child : children_[node]) dfs_visit(child, counter, level + 1);
+    while (!stack.empty()) {
+      if (!stack.back().entered) {
+        auto node = stack.back().node;
+        auto level = stack.back().level;
+        stack.back().entered = true;
 
-    info.dfs_end_index = counter;
-    dfs_info_[node] = info;
-    has_dfs_info_[node] = true;
+        dfs_info_[node].dfs_index = counter++;
+        dfs_info_[node].level = level;
+
+        // Push children in reverse order so the first child is visited first.
+        auto& ch = children_[node];
+        for (std::size_t i = ch.size(); i > 0; --i) {
+          stack.push_back({ch[i - 1], level + 1, false});
+        }
+      } else {
+        auto node = stack.back().node;
+        dfs_info_[node].dfs_end_index = counter;
+        has_dfs_info_[node] = true;
+        stack.pop_back();
+      }
+    }
   }
 
   void compute_dfs_indices() {
