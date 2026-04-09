@@ -2805,6 +2805,55 @@ static void test_update_searchable_nodes_no_collapse() {
 // Phase 13: update_subtree_sizes
 // ===========================================================================
 
+// Build a tree with binary root and one leaf child, for root-collapse tests:
+//   UA → root → {L_a, inner → {L_b, L_c}}
+// Moving L_a causes root to collapse, making inner the effective root.
+struct root_collapse_tree {
+  phylo_dag tree;
+  std::size_t root, inner, L_a, L_b, L_c;
+};
+
+static root_collapse_tree make_root_collapse_tree() {
+  constexpr std::string_view ref = "AAAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto la = d.append_node<node_kind::leaf>();
+  la.cg() = cg_from_sequence("TAAA", ref);
+  la.sample_id() = "L_a";
+  auto lb = d.append_node<node_kind::leaf>();
+  lb.cg() = cg_from_sequence("ATAA", ref);
+  lb.sample_id() = "L_b";
+  auto lc = d.append_node<node_kind::leaf>();
+  lc.cg() = cg_from_sequence("AATA", ref);
+  lc.sample_id() = "L_c";
+
+  auto root_n = d.append_node<node_kind::inner>();
+  root_n.cg() = cg_from_sequence("AAAA", ref);
+  auto inner_n = d.append_node<node_kind::inner>();
+  inner_n.cg() = cg_from_sequence("AAAA", ref);
+
+  add_edge(d, ua.index(), root_n.index(), 0);
+  add_edge(d, root_n.index(), la.index(), 0);
+  add_edge(d, root_n.index(), inner_n.index(), 1);
+  add_edge(d, inner_n.index(), lb.index(), 0);
+  add_edge(d, inner_n.index(), lc.index(), 1);
+
+  recompute_edge_mutations(d);
+
+  return root_collapse_tree{
+      .tree = std::move(d),
+      .root = root_n.index(),
+      .inner = inner_n.index(),
+      .L_a = la.index(),
+      .L_b = lb.index(),
+      .L_c = lc.index(),
+  };
+}
+
 // Recursively recount subtree size from scratch for verification.
 static std::size_t recount_subtree_size(tree_index const& idx, std::size_t node) {
   std::size_t size = 1;
@@ -2929,6 +2978,131 @@ static void test_subtree_size_initial() {
   std::println("  PASS");
 }
 
+// LCA-collapse: L1→L2.  src_parent == LCA == i3 collapses, grandparent == i1.
+// After collapse, L2 is reparented to i1, then reattach creates new_inner under
+// i1 (dst_parent).  grandparent == dst_parent → removal walk is skipped.
+static void test_subtree_size_lca_collapse() {
+  std::println("test_subtree_size_lca_collapse");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L2);
+  assert(r.src_parent_collapsed);
+  assert(r.grandparent == t.i1);
+  assert(r.dst_parent == t.i1);  // LCA collapse: grandparent == dst_parent
+
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+
+  verify_all_subtree_sizes(idx);
+
+  // new_inner has exactly 2 children (L2 and L1), so subtree_size = 3.
+  assert(idx.get_subtree_size(r.new_inner) == 3);
+
+  std::println("  PASS");
+}
+
+// Overlapping paths: L1→L4.  Removal path (i1→root) and insertion path
+// (i4→i1→root) share i1 and root.  The second walk overwrites the first
+// walk's values at shared nodes with identical (correct) results.
+static void test_subtree_size_overlapping_paths() {
+  std::println("test_subtree_size_overlapping_paths");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L4);
+  assert(r.src_parent_collapsed);
+  assert(r.grandparent == t.i1);
+  assert(r.dst_parent == t.i4);
+
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+
+  verify_all_subtree_sizes(idx);
+
+  // new_inner has children {L4, L1} → subtree_size = 3.
+  assert(idx.get_subtree_size(r.new_inner) == 3);
+  // i4: children {L3, new_inner} → subtree_size = 5.
+  assert(idx.get_subtree_size(t.i4) == 5);
+  // Total tree size unchanged (one node removed, one added).
+  assert(idx.get_subtree_size(t.root) == 22);
+
+  std::println("  PASS");
+}
+
+// Root-collapse: moving L_a from the binary root causes root to collapse.
+// grandparent is the UA node (not a valid tree_index node).
+// Verifies that update_subtree_sizes handles this without crashing or
+// corrupting subtree sizes.  tree_root_ remains stale (Phase 15 will fix it).
+static void test_subtree_size_root_collapse() {
+  std::println("test_subtree_size_root_collapse");
+
+  auto t = make_root_collapse_tree();
+  tree_index idx{t.tree};
+
+  // Verify initial sizes.
+  assert(idx.get_subtree_size(t.root) == 5);   // root, inner, L_a, L_b, L_c
+  assert(idx.get_subtree_size(t.inner) == 3);   // inner, L_b, L_c
+  assert(idx.get_subtree_size(t.L_a) == 1);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L_a, t.L_b);
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == t.root);
+
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+
+  // tree_root_ is stale (still points to collapsed root), so we can't use
+  // verify_all_subtree_sizes.  Instead, verify individual reachable nodes.
+  // After root collapse: inner → {new_inner → {L_b, L_a}, L_c}
+  assert(idx.get_subtree_size(r.new_inner) == 3);
+  assert(idx.get_subtree_size(t.inner) == 5);
+  assert(idx.get_subtree_size(t.L_a) == 1);
+  assert(idx.get_subtree_size(t.L_b) == 1);
+  assert(idx.get_subtree_size(t.L_c) == 1);
+
+  std::println("  PASS");
+}
+
+// Sibling move: A→B on ternary root.  src_parent == dst_parent == root,
+// no collapse.  Both walks start from root → second walk is skipped.
+static void test_subtree_size_sibling_move() {
+  std::println("test_subtree_size_sibling_move");
+
+  auto d = make_simple_tree();
+  tree_index idx{d};
+
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto a_idx = get_child_idx(d, root_clades[0][0]);
+  auto b_idx = get_child_idx(d, root_clades[1][0]);
+
+  auto r = apply_spr_inplace(d, idx, a_idx, b_idx);
+  assert(!r.src_parent_collapsed);
+  assert(r.src_parent == root_idx);
+  assert(r.dst_parent == root_idx);
+
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+
+  verify_all_subtree_sizes(idx);
+
+  // new_inner has children {B, A} → subtree_size = 3.
+  assert(idx.get_subtree_size(r.new_inner) == 3);
+  // Root: originally 4 (root + A + B + C), now 5 (root + new_inner(3) + C).
+  assert(idx.get_subtree_size(root_idx) == 5);
+
+  std::println("  PASS");
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -3015,6 +3189,10 @@ int main() {
   test_subtree_size_update_with_collapse();
   test_subtree_size_update_no_collapse();
   test_subtree_size_update_sequential();
+  test_subtree_size_lca_collapse();
+  test_subtree_size_overlapping_paths();
+  test_subtree_size_root_collapse();
+  test_subtree_size_sibling_move();
 
   std::println("All inplace SPR phase 1-13 tests passed!");
   return 0;

@@ -302,19 +302,28 @@ class tree_index {
   // subtree_size_[node] = 1 + sum(subtree_size_[child]) at each step.
   // Both paths merge at LCA so total work is bounded by 2 × depth.
   // Must be called after update_topology().
+  //
+  // Note: subtree_size_ must be correct before any Fitch update (Phase 17+)
+  // that uses the parallel path, since fitch_bottom_up_async checks
+  // subtree_size_[child_id] >= kFitchParallelThreshold per node.
   void update_subtree_sizes(spr_result const& r) {
+    assert(is_valid(r.new_inner) && !children_[r.new_inner].empty() &&
+           "update_topology must be called before update_subtree_sizes");
+
     // Recompute subtree_size for new_inner (freshly created, not yet sized).
     recompute_subtree_size(r.new_inner);
 
     // Walk up from dst_parent to tree_root_ (insertion side).
     walk_up_recompute(r.dst_parent);
 
-    // Walk up from removal side to tree_root_.
-    if (r.src_parent_collapsed) {
-      // src_parent was removed; remaining_child was reparented under grandparent.
-      walk_up_recompute(r.grandparent);
-    } else {
-      walk_up_recompute(r.src_parent);
+    // Walk up from removal side to tree_root_.  Skip when:
+    // - removal start equals dst_parent (sibling move or LCA-collapse case —
+    //   the insertion walk already covered the entire path), or
+    // - removal start is invalid (root-collapse case — grandparent is the UA
+    //   node; the insertion walk already covers the path to the effective root).
+    std::size_t rem_start = r.src_parent_collapsed ? r.grandparent : r.src_parent;
+    if (rem_start != r.dst_parent && is_valid(rem_start)) {
+      walk_up_recompute(rem_start);
     }
   }
 
@@ -475,12 +484,17 @@ class tree_index {
   }
 
   // Walk up from node to tree_root_, recomputing subtree_size at each step.
+  // Guards against stale tree_root_ (e.g., after root collapse before Phase 15
+  // updates tree_root_): stops if the next parent is invalid (such as the UA
+  // node).  Iteration bound prevents infinite loops on corrupted parent_ chains.
   void walk_up_recompute(std::size_t node) {
     auto cur = node;
-    while (true) {
+    for (std::size_t steps = 0; steps < num_nodes_; ++steps) {
       recompute_subtree_size(cur);
       if (cur == tree_root_) break;
-      cur = parent_[cur];
+      auto next = parent_[cur];
+      if (next >= num_nodes_ || !is_valid_[next]) break;
+      cur = next;
     }
   }
 
