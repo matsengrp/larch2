@@ -495,8 +495,15 @@ class tree_index {
   // When a new inner node is created (Phase 6), its children (dst and src)
   // already have correct Fitch sets — only their parent changed.  This
   // computes the new node's Fitch sets from scratch.
-  void init_new_node_fitch(std::size_t new_inner) {
-    recompute_node_fitch(new_inner);
+  // Returns the parsimony cost delta introduced by this node.  For a new
+  // node (num_children_ == 0 before recompute), old_cost is 0 so delta
+  // equals the new cost — the number of variable sites where the children's
+  // Fitch sets are disjoint (union sites).
+  int init_new_node_fitch(std::size_t new_inner) {
+    assert(new_inner < num_nodes_ &&
+           "init_new_node_fitch: ensure_capacity must be called first");
+    auto result = recompute_node_fitch_tracked(new_inner);
+    return result.delta;
   }
 
  private:

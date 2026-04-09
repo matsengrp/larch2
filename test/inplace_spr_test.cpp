@@ -4474,7 +4474,7 @@ static void test_init_new_node_fitch_union() {
   uint8_t* fitch_ptr = const_cast<uint8_t*>(idx.get_fitch_set_ptr(N));
   for (std::size_t i = 0; i < nsites; i++) fitch_ptr[i] = 0;
 
-  idx.init_new_node_fitch(N);
+  int delta = idx.init_new_node_fitch(N);
 
   // Site 0: A=T(0b1000), B=A(0b0001) → no intersection → union = {A,T} = 0b1001
   assert(idx.get_fitch_set(N, 0) == 0b1001);
@@ -4482,6 +4482,11 @@ static void test_init_new_node_fitch_union() {
   assert(idx.get_fitch_set(N, 1) == 0b1001);
   // Site 2: A=A(0b0001), B=A(0b0001) → intersection = {A} = 0b0001
   assert(idx.get_fitch_set(N, 2) == 0b0001);
+
+  // Delta is 0: the node already had correct child_counts_ and num_children_
+  // from the initial tree build.  Zeroing fitch_sets_ doesn't affect delta
+  // because delta is computed from child_counts_, not fitch_sets_.
+  assert(delta == 0);
 
   std::println("  PASS");
 }
@@ -4538,7 +4543,7 @@ static void test_init_new_node_fitch_intersection() {
   uint8_t* fitch_ptr = const_cast<uint8_t*>(idx.get_fitch_set_ptr(N));
   for (std::size_t i = 0; i < nsites; i++) fitch_ptr[i] = 0;
 
-  idx.init_new_node_fitch(N);
+  int delta = idx.init_new_node_fitch(N);
 
   // Variable sites: positions where A/B differ from ref or C differs from ref.
   // A,B = "TAT", C = "AAA", ref = "AAA"
@@ -4556,6 +4561,49 @@ static void test_init_new_node_fitch_intersection() {
     // Intersection of identical sets is the set itself.
     assert(fitch == child0_fitch);
   }
+
+  // Delta: all sites are intersections (cost 0), old cost was 0 → delta = 0.
+  assert(delta == 0);
+
+  std::println("  PASS");
+}
+
+// Test 3: Delta for a genuinely fresh node created by SPR.
+// After apply_spr_inplace + update_topology, new_inner has children but its
+// tracking data (num_children_, child_counts_) is zero-initialized by
+// ensure_capacity.  init_new_node_fitch should return delta = # union sites.
+static void test_init_new_node_fitch_fresh_delta() {
+  std::println("test_init_new_node_fitch_fresh_delta");
+
+  // Tree: UA -> R -> {A("TAA"), B("ATA"), C("AAT")}, ref = "AAA"
+  // Move A next to C → new_inner has children {C, A}.
+  // Variable sites (3 total):
+  //   Site 0 (pos 0): A=T, C=A → disjoint → union → cost 1
+  //   Site 1 (pos 1): A=A, C=A → same → intersection → cost 0
+  //   Site 2 (pos 2): A=A, C=T → disjoint → union → cost 1
+  // Expected delta = 2 (old_cost = 0 since num_children_ was 0).
+  auto d = make_simple_tree();
+  tree_index idx{d};
+
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto a_idx = get_child_idx(d, root_clades[0][0]);
+  auto c_idx = get_child_idx(d, root_clades[2][0]);
+
+  auto r = apply_spr_inplace(d, idx, a_idx, c_idx);
+  idx.update_topology(r);
+
+  // new_inner was just created by ensure_capacity: num_children_ = 0,
+  // child_counts_ = {0,0,0,0} at every site.
+  assert(idx.get_num_children(r.new_inner) == 0);
+
+  int delta = idx.init_new_node_fitch(r.new_inner);
+
+  // After init: num_children_ should be 2, Fitch sets correct.
+  assert(idx.get_num_children(r.new_inner) == 2);
+  assert(delta == 2);
 
   std::println("  PASS");
 }
@@ -4689,6 +4737,7 @@ int main() {
   // Phase 19: init_new_node_fitch
   test_init_new_node_fitch_union();
   test_init_new_node_fitch_intersection();
+  test_init_new_node_fitch_fresh_delta();
 
   std::println("All inplace SPR phase 1-19 tests passed!");
   return 0;
