@@ -228,7 +228,7 @@ class tree_index {
   //
   // Only parent_[], children_[], and is_valid_[] are updated here.
   // The following remain stale and must be updated by later phases:
-  //   - searchable_nodes_    (Phase 12)
+  //   - searchable_nodes_    (Phase 12 — call update_searchable_nodes())
   //   - subtree_size_[]      (Phase 13)
   //   - tree_root_           (Phase 15)
   //   - is_condensed_[]      (Phase 16)
@@ -274,6 +274,18 @@ class tree_index {
     // Update parent pointers for moved nodes.
     parent_[r.dst] = r.new_inner;
     parent_[r.src] = r.new_inner;
+  }
+
+  // Phase 12: Patch searchable_nodes_ after an SPR.
+  // - Add new_inner (always a valid inner node, never tree root or UA).
+  // - Remove collapsed_node if src_parent was binary and got collapsed.
+  // Must be called after update_topology().
+  void update_searchable_nodes(spr_result const& r) {
+    if (r.src_parent_collapsed) {
+      auto& sn = searchable_nodes_;
+      sn.erase(std::remove(sn.begin(), sn.end(), r.collapsed_node), sn.end());
+    }
+    searchable_nodes_.push_back(r.new_inner);
   }
 
  private:

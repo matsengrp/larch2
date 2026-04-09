@@ -2718,6 +2718,84 @@ static void test_ensure_capacity_monotonic_growth() {
   std::println("  PASS");
 }
 
+// Phase 12: update_searchable_nodes — patch searchable_nodes_ after SPR
+// ---------------------------------------------------------------------------
+
+// After SPR with binary collapse: collapsed_node removed, new_inner added.
+static void test_update_searchable_nodes_with_collapse() {
+  std::println("test_update_searchable_nodes_with_collapse");
+
+  // Move L1 → L5.  i3 is binary → collapses.
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  // Snapshot searchable_nodes before the move.
+  auto sn_before = idx.get_searchable_nodes();
+  std::set<std::size_t> before_set(sn_before.begin(), sn_before.end());
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+  assert(r.src_parent_collapsed);
+  auto collapsed = r.collapsed_node;
+  auto new_inner = r.new_inner;
+
+  // collapsed_node was in the original searchable set.
+  assert(before_set.count(collapsed));
+
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+
+  auto const& sn_after = idx.get_searchable_nodes();
+  std::set<std::size_t> after_set(sn_after.begin(), sn_after.end());
+
+  // new_inner must be present.
+  assert(after_set.count(new_inner));
+  // src and dst still present.
+  assert(after_set.count(t.L1));
+  assert(after_set.count(t.L5));
+
+  if (collapsed != new_inner) {
+    // When the DAG does NOT recycle the slot, collapsed_node must be gone.
+    assert(!after_set.count(collapsed));
+  }
+  // When the DAG recycles collapsed_node's slot for new_inner
+  // (collapsed == new_inner), the index is correctly present as new_inner.
+
+  std::println("  collapsed={} new_inner={} recycled={}",
+               collapsed, new_inner, collapsed == new_inner);
+  std::println("  PASS");
+}
+
+// After SPR without collapse: new_inner added, nothing removed.
+static void test_update_searchable_nodes_no_collapse() {
+  std::println("test_update_searchable_nodes_no_collapse");
+
+  // Move L7 → L1.  i6 is ternary → no collapse.
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  auto sn_before = idx.get_searchable_nodes();
+  auto count_before = sn_before.size();
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L7, t.L1);
+  assert(!r.src_parent_collapsed);
+  auto new_inner = r.new_inner;
+
+  idx.update_topology(r);
+  idx.update_searchable_nodes(r);
+
+  auto const& sn_after = idx.get_searchable_nodes();
+  std::set<std::size_t> after_set(sn_after.begin(), sn_after.end());
+
+  // new_inner must be present.
+  assert(after_set.count(new_inner));
+  // Size grew by exactly 1 (added new_inner, removed nothing).
+  assert(sn_after.size() == count_before + 1);
+
+  std::println("  new_inner={} count: {} → {}", new_inner, count_before,
+               sn_after.size());
+  std::println("  PASS");
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -2795,6 +2873,10 @@ int main() {
   test_ensure_capacity_array_sizes();
   test_ensure_capacity_monotonic_growth();
 
-  std::println("All inplace SPR phase 1-11 tests passed!");
+  // Phase 12: update_searchable_nodes
+  test_update_searchable_nodes_with_collapse();
+  test_update_searchable_nodes_no_collapse();
+
+  std::println("All inplace SPR phase 1-12 tests passed!");
   return 0;
 }
