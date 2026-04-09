@@ -330,6 +330,10 @@ class tree_index {
   // Phase 15: Re-derive tree_root_ from UA after a root-collapsing SPR.
   // Must be called after update_topology() and before recompute_dfs().
   // No-op if the collapsed node is not the current tree root.
+  //
+  // Note: reads from the DAG (get_clades(d_, ua_idx)) rather than from
+  // children_[UA] because children_[] is never populated for the UA node —
+  // init() skips UA (is_ua check in the node loop).
   void update_tree_root(spr_result const& r) {
     if (!r.src_parent_collapsed || r.collapsed_node != tree_root_) return;
     auto ua_idx = get_root_idx(d_);

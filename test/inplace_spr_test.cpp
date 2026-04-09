@@ -3645,6 +3645,116 @@ static void test_root_change_vs_fresh_index() {
   std::println("  PASS");
 }
 
+// Binary root: UA → root → {A, B}.  Move A → B.
+// After detach, root is binary → collapses.  remaining_child = B = dst.
+// Reattach creates new_inner between UA and B: UA → new_inner → {B, A}.
+// update_tree_root should set tree_root_ = new_inner.
+static void test_root_change_dst_is_remaining_child() {
+  std::println("test_root_change_dst_is_remaining_child");
+
+  auto d = make_binary_root_tree();
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto a_idx = get_child_idx(d, root_clades[0][0]);
+  auto b_idx = get_child_idx(d, root_clades[1][0]);
+
+  tree_index idx{d};
+  assert(idx.get_tree_root() == root_idx);
+
+  auto r = apply_spr_inplace(d, idx, a_idx, b_idx);
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == root_idx);
+  assert(r.remaining_child == b_idx);  // dst == remaining_child
+
+  idx.update_topology(r);
+  idx.update_tree_root(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+  idx.recompute_dfs();
+
+  // new_inner may reuse the collapsed root's index (node recycling), so we
+  // can't assert tree_root_ != root_idx.  Instead verify it equals new_inner
+  // and is valid.
+  assert(idx.get_tree_root() == r.new_inner);
+  assert(idx.is_valid(idx.get_tree_root()));
+
+  // Full consistency checks.
+  verify_dfs_info(idx);
+  verify_all_subtree_sizes(idx);
+
+  // Cross-check against a fresh index.
+  tree_index fresh{d};
+  assert(idx.get_tree_root() == fresh.get_tree_root());
+  auto reachable = collect_reachable_nodes(idx);
+  auto fresh_reachable = collect_reachable_nodes(fresh);
+  assert(reachable.size() == fresh_reachable.size());
+
+  std::println("  PASS");
+}
+
+// Two consecutive root-collapsing SPRs.
+// Tree: UA → root → {L_a, inner → {L_b, L_c}}.
+// SPR 1: L_a → L_b — root collapses, inner becomes new tree root (binary).
+// SPR 2: L_c → L_a — inner collapses, new_inner1 becomes new tree root.
+static void test_root_change_sequential() {
+  std::println("test_root_change_sequential");
+
+  auto t = make_root_collapse_tree();
+  tree_index idx{t.tree};
+  assert(idx.get_tree_root() == t.root);
+
+  // --- First SPR: L_a → L_b, root collapses ---
+  auto r1 = apply_spr_inplace(t.tree, idx, t.L_a, t.L_b);
+  assert(r1.src_parent_collapsed);
+  assert(r1.collapsed_node == t.root);
+
+  idx.update_topology(r1);
+  idx.update_tree_root(r1);
+  idx.update_searchable_nodes(r1);
+  idx.update_subtree_sizes(r1);
+  idx.recompute_dfs();
+
+  // After first SPR: tree_root_ = inner.
+  assert(idx.get_tree_root() == t.inner);
+
+  // --- Second SPR: L_c → L_a, inner (now tree root, binary) collapses ---
+  auto r2 = apply_spr_inplace(t.tree, idx, t.L_c, t.L_a);
+  assert(r2.src_parent_collapsed);
+  assert(r2.collapsed_node == t.inner);  // inner was the tree root
+
+  idx.update_topology(r2);
+
+  // Before update_tree_root, tree_root_ is stale (points to collapsed inner).
+  assert(idx.get_tree_root() == t.inner);
+
+  idx.update_tree_root(r2);
+
+  // tree_root_ must now be r1.new_inner (inner's remaining child after
+  // collapse).  Note: r1.new_inner may have recycled t.root's index, so we
+  // can't assert != t.root.
+  assert(idx.get_tree_root() == r1.new_inner);
+  assert(idx.is_valid(idx.get_tree_root()));
+
+  idx.update_searchable_nodes(r2);
+  idx.update_subtree_sizes(r2);
+  idx.recompute_dfs();
+
+  // Full consistency checks.
+  verify_dfs_info(idx);
+  verify_all_subtree_sizes(idx);
+
+  // Cross-check against fresh index.
+  tree_index fresh{t.tree};
+  assert(idx.get_tree_root() == fresh.get_tree_root());
+  auto reachable = collect_reachable_nodes(idx);
+  auto fresh_reachable = collect_reachable_nodes(fresh);
+  assert(reachable.size() == fresh_reachable.size());
+
+  std::println("  PASS");
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -3752,6 +3862,8 @@ int main() {
   test_root_change_dfs_level();
   test_root_change_noop();
   test_root_change_vs_fresh_index();
+  test_root_change_dst_is_remaining_child();
+  test_root_change_sequential();
 
   std::println("All inplace SPR phase 1-15 tests passed!");
   return 0;
