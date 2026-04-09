@@ -280,8 +280,15 @@ class tree_index {
   // - Add new_inner (always a valid inner node, never tree root or UA).
   // - Remove collapsed_node if src_parent was binary and got collapsed.
   // Must be called after update_topology().
+  // Note: src and dst stay in the list (already present).  Phase 16 may
+  // further adjust searchable_nodes_ if condensation status changes for
+  // leaves near the SPR source or destination.
   void update_searchable_nodes(spr_result const& r) {
+    assert(is_valid(r.new_inner) && "update_topology must be called first");
     if (r.src_parent_collapsed) {
+      // Note: if the DAG recycles collapsed_node's slot for new_inner
+      // (collapsed_node == new_inner), this removes then re-adds the same
+      // index — net effect is correct.
       auto& sn = searchable_nodes_;
       sn.erase(std::remove(sn.begin(), sn.end(), r.collapsed_node), sn.end());
     }

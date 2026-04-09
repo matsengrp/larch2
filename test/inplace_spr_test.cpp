@@ -2796,6 +2796,11 @@ static void test_update_searchable_nodes_no_collapse() {
   std::println("  PASS");
 }
 
+// TODO: Once Fitch incremental updates (Phase 17+) are implemented, add an
+// integration test that runs find_all_moves on a patched tree_index after SPR +
+// update_topology + update_searchable_nodes, to verify end-to-end correctness
+// of searchable_nodes_ against the move enumerator.
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
