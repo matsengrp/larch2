@@ -3755,6 +3755,81 @@ static void test_root_change_sequential() {
   std::println("  PASS");
 }
 
+// Insertion above tree root: dst == tree_root_, no collapse.
+// Tree: UA → root → {P → {A, B, C}, D}.  Move A next to root.
+// P is ternary → no collapse.  new_inner goes between UA and root.
+// tree_root_ must become new_inner.
+static void test_root_change_insertion_above_root() {
+  std::println("test_root_change_insertion_above_root");
+
+  constexpr std::string_view ref = "AAAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto la = d.append_node<node_kind::leaf>();
+  la.cg() = cg_from_sequence("TAAA", ref);
+  la.sample_id() = "A";
+  auto lb = d.append_node<node_kind::leaf>();
+  lb.cg() = cg_from_sequence("ATAA", ref);
+  lb.sample_id() = "B";
+  auto lc = d.append_node<node_kind::leaf>();
+  lc.cg() = cg_from_sequence("AATA", ref);
+  lc.sample_id() = "C";
+  auto ld = d.append_node<node_kind::leaf>();
+  ld.cg() = cg_from_sequence("AAAT", ref);
+  ld.sample_id() = "D";
+
+  auto root_n = d.append_node<node_kind::inner>();
+  root_n.cg() = cg_from_sequence("AAAA", ref);
+  auto P = d.append_node<node_kind::inner>();
+  P.cg() = cg_from_sequence("AAAA", ref);
+
+  add_edge(d, ua.index(), root_n.index(), 0);
+  add_edge(d, root_n.index(), P.index(), 0);
+  add_edge(d, root_n.index(), ld.index(), 1);
+  add_edge(d, P.index(), la.index(), 0);
+  add_edge(d, P.index(), lb.index(), 1);
+  add_edge(d, P.index(), lc.index(), 2);
+
+  recompute_edge_mutations(d);
+  tree_index idx{d};
+
+  auto root_idx = root_n.index();
+  auto A_idx = la.index();
+  assert(idx.get_tree_root() == root_idx);
+
+  // SPR: move A next to root.  dst = root, dst_parent = UA.
+  auto r = apply_spr_inplace(d, idx, A_idx, root_idx);
+  assert(!r.src_parent_collapsed);  // P was ternary
+  assert(r.dst == root_idx);
+  assert(r.dst_parent != root_idx);  // dst_parent is UA
+
+  idx.update_topology(r);
+  idx.update_tree_root(r);
+
+  // tree_root_ must now be new_inner (inserted above old root).
+  assert(idx.get_tree_root() == r.new_inner);
+  assert(idx.is_valid(idx.get_tree_root()));
+  assert(idx.get_tree_root() != root_idx);
+
+  // Full pipeline to verify consistency.
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+  idx.recompute_dfs();
+
+  verify_dfs_info(idx);
+  verify_all_subtree_sizes(idx);
+
+  // Cross-check against fresh index.
+  tree_index fresh{d};
+  assert(idx.get_tree_root() == fresh.get_tree_root());
+
+  std::println("  PASS");
+}
+
 // ---------------------------------------------------------------------------
 // Phase 16 tests: update_condensed_nodes
 // ---------------------------------------------------------------------------
@@ -5076,6 +5151,7 @@ int main() {
   test_root_change_vs_fresh_index();
   test_root_change_dst_is_remaining_child();
   test_root_change_sequential();
+  test_root_change_insertion_above_root();
 
   // Phase 16: update_condensed_nodes
   test_condensed_uncondense_on_move_away();

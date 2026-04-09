@@ -251,9 +251,13 @@ class tree_index {
       }
       parent_[r.remaining_child] = r.grandparent;
 
-      // Invalidate collapsed node.
+      // Invalidate collapsed node.  Clear Fitch bookkeeping so that if node
+      // slot reclamation is ever added, recompute_node_fitch_tracked sees a
+      // clean slate (num_children_ = 0 ⇒ old_cost = 0 for every site).
       is_valid_[r.collapsed_node] = 0;
       children_[r.collapsed_node].clear();
+      num_children_[r.collapsed_node] = 0;
+      has_child_counts_[r.collapsed_node] = false;
     } else {
       // Remove src from src_parent's children.
       auto& sp_kids = children_[r.src_parent];
@@ -330,19 +334,26 @@ class tree_index {
     }
   }
 
-  // Phase 15: Re-derive tree_root_ from UA after a root-collapsing SPR.
+  // Phase 15: Re-derive tree_root_ after an SPR that changes which node is
+  // the direct child of UA.  Two cases:
+  //   (a) Removal collapse: src_parent was binary and was the old tree root —
+  //       the surviving child takes over.  Resolved via DAG query because
+  //       children_[] is never populated for the UA node (init() skips UA).
+  //   (b) Insertion above root: dst was the tree root, so new_inner is now
+  //       the direct child of UA and becomes the new tree root.
   // Must be called after update_topology() and before recompute_dfs().
-  // No-op if the collapsed node is not the current tree root.
-  //
-  // Note: reads from the DAG (get_clades(d_, ua_idx)) rather than from
-  // children_[UA] because children_[] is never populated for the UA node —
-  // init() skips UA (is_ua check in the node loop).
   void update_tree_root(spr_result const& r) {
-    if (!r.src_parent_collapsed || r.collapsed_node != tree_root_) return;
-    auto ua_idx = get_root_idx(d_);
-    auto ua_clades = get_clades(d_, ua_idx);
-    assert(!ua_clades.empty() && !ua_clades[0].empty());
-    tree_root_ = get_child_idx(d_, ua_clades[0][0]);
+    // (a) Removal collapse: old root was collapsed during src extraction.
+    if (r.src_parent_collapsed && r.collapsed_node == tree_root_) {
+      auto ua_idx = get_root_idx(d_);
+      auto ua_clades = get_clades(d_, ua_idx);
+      assert(!ua_clades.empty() && !ua_clades[0].empty());
+      tree_root_ = get_child_idx(d_, ua_clades[0][0]);
+    }
+    // (b) Insertion above root: new_inner placed above the current tree root.
+    if (r.dst == tree_root_) {
+      tree_root_ = r.new_inner;
+    }
   }
 
   // Phase 16: Re-check condensation for leaf children near the SPR.

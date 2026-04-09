@@ -363,7 +363,10 @@ Changes needed:
 - **dst_parent**: replace dst with new_inner in `children_[dst_parent]`.
 - **dst**: `parent_[dst] = new_inner`.
 - **src**: `parent_[src] = new_inner`.
-- **collapsed_node**: mark `is_valid_[collapsed_node] = 0`.
+- **collapsed_node**: mark `is_valid_[collapsed_node] = 0`;
+  clear `num_children_[collapsed_node] = 0` and
+  `has_child_counts_[collapsed_node] = false` so a future reuse of the slot
+  sees a clean Fitch baseline (`old_cost = 0`).
 - **new_inner**: mark `is_valid_[new_inner] = 1`.
 
 Grow flat arrays if `new_inner >= num_nodes_` (the chain may have allocated
@@ -486,22 +489,23 @@ void recompute_dfs() {
 
 ### Phase 15: Handle tree root change
 
-If `src_parent` was the tree root and was collapsed, the tree root changes.
-The `tree_state` and `tree_index` must update `tree_root_`.
+Two cases can change which node is the direct child of UA:
 
-Detect: `src_parent == tree_root_ && src_parent_collapsed`. New root =
-`remaining_child` (the sibling of src that was reparented under grandparent).
-But grandparent is UA, so the new tree root is `remaining_child`.
-
-Wait — if `src_parent` was tree root, its parent is UA. After collapse, UA
-directly parents `remaining_child`. But the new inner node was also created
-(for the dst side). Depending on whether `remaining_child` or `new_inner` ends
-up as UA's child, the tree root may change.
-
-The safe approach: after topology update, re-derive `tree_root_` from UA:
+**(a) Removal collapse:** `src_parent` was binary and was the tree root. After
+collapse, `remaining_child` (or `new_inner`, if dst was the remaining child)
+becomes the direct child of UA. Re-derive from the DAG:
 ```cpp
 tree_root_ = first child of UA in the modified phylo_dag
 ```
+
+**(b) Insertion above root:** `dst == tree_root_`. `new_inner` is inserted
+between UA and the old root, so `new_inner` becomes the new tree root:
+```cpp
+if (r.dst == tree_root_) tree_root_ = r.new_inner;
+```
+
+Both cases are checked in sequence; (a) fires first so that (b) compares
+against the already-updated `tree_root_`.
 
 **Files**: `include/larch/native_optimize.hpp`
 
@@ -509,6 +513,8 @@ tree_root_ = first child of UA in the modified phylo_dag
 - Tree: UA → R → {A, B}. Move A next to some other subtree such that R
   collapses. Verify `tree_root_` is updated correctly.
 - After root change: `dfs_info_[tree_root_].level == 0`.
+- Insertion above root: tree with ternary inner node, move leaf to root as
+  dst. Verify `tree_root_` becomes `new_inner`.
 
 ---
 
