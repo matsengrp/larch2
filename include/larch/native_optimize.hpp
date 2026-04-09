@@ -231,7 +231,7 @@ class tree_index {
   // The following remain stale and must be updated by later phases:
   //   - searchable_nodes_    (Phase 12 — call update_searchable_nodes())
   //   - subtree_size_[]      (Phase 13 — call update_subtree_sizes())
-  //   - tree_root_           (Phase 15)
+  //   - tree_root_           (Phase 15 — call update_tree_root())
   //   - is_condensed_[]      (Phase 16)
   //   - dfs_info_[]          (Phase 14 — call recompute_dfs())
   void update_topology(spr_result const& r) {
@@ -327,16 +327,33 @@ class tree_index {
     }
   }
 
+  // Phase 15: Re-derive tree_root_ from UA after a root-collapsing SPR.
+  // Must be called after update_topology() and before recompute_dfs().
+  // No-op if the collapsed node is not the current tree root.
+  void update_tree_root(spr_result const& r) {
+    if (!r.src_parent_collapsed || r.collapsed_node != tree_root_) return;
+    auto ua_idx = get_root_idx(d_);
+    auto ua_clades = get_clades(d_, ua_idx);
+    assert(!ua_clades.empty() && !ua_clades[0].empty());
+    tree_root_ = get_child_idx(d_, ua_clades[0][0]);
+  }
+
   // Phase 14: Recompute dfs_info_[] for the entire tree.
   // DFS indices (dfs_index, dfs_end_index, level) cannot be cheaply updated
   // incrementally — an SPR can change the DFS interval of nodes far from the
   // move.  Re-traverse the entire tree from tree_root_.
   // This is O(N) with no per-site work, so negligible vs Fitch updates.
-  // Must be called after update_topology() (so children_[] is correct).
+  // Must be called after update_topology() (so children_[] is correct) and
+  // after update_tree_root() (so tree_root_ is valid — see Phase 15).
   void recompute_dfs() {
+    assert(is_valid_[tree_root_] &&
+           "recompute_dfs: tree_root_ is invalid — call update_tree_root() "
+           "before recompute_dfs() when the SPR may have collapsed the root");
     std::fill(has_dfs_info_.begin(), has_dfs_info_.end(), 0);
     std::size_t counter = 0;
     dfs_visit(tree_root_, counter, 0);
+    assert(has_dfs_info_[tree_root_] &&
+           "recompute_dfs: tree_root_ unreachable after DFS traversal");
   }
 
  private:

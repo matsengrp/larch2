@@ -3424,6 +3424,111 @@ static void test_dfs_recompute_suboptimal_tree() {
   std::println("  PASS");
 }
 
+// Root collapse: SPR collapses binary root, verify DFS after tree_root_ update.
+static void test_dfs_recompute_root_collapse() {
+  std::println("test_dfs_recompute_root_collapse");
+
+  // Suboptimal tree has binary root (children: i1, i2).
+  // Moving i1's child (L4) would collapse i1, not root.
+  // To collapse root, we need src_parent == root.  SPR i1 → L3 detaches i1
+  // from root (binary → root collapses), then reattaches i1 as sibling of L3.
+  auto d = make_suboptimal_tree();
+  tree_index idx{d};
+
+  auto ua_idx = get_root_idx(d);
+  auto ua_clades = get_clades(d, ua_idx);
+  auto root_idx = get_child_idx(d, ua_clades[0][0]);
+  auto root_clades = get_clades(d, root_idx);
+  auto i1_idx = get_child_idx(d, root_clades[0][0]);
+  auto i2_idx = get_child_idx(d, root_clades[1][0]);
+  auto i2_clades = get_clades(d, i2_idx);
+  auto l3_idx = get_child_idx(d, i2_clades[0][0]);
+
+  assert(idx.get_tree_root() == root_idx);
+
+  // SPR: i1 → L3 (root is binary → collapses).
+  auto r = apply_spr_inplace(d, idx, i1_idx, l3_idx);
+  assert(r.src_parent_collapsed);
+  assert(r.collapsed_node == root_idx);
+
+  idx.update_topology(r);
+  idx.update_tree_root(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+  idx.recompute_dfs();
+
+  // tree_root_ should have changed away from the collapsed root.
+  assert(idx.get_tree_root() != root_idx);
+  assert(idx.is_valid(idx.get_tree_root()));
+
+  verify_dfs_info(idx);
+
+  // New tree root should have level 0.
+  assert(idx.get_dfs_info(idx.get_tree_root()).level == 0);
+
+  // Collapsed root should not have DFS info — unless its slot was recycled
+  // for new_inner (collapsed_node == new_inner).
+  if (r.collapsed_node != r.new_inner) {
+    assert(!idx.has_dfs_info(root_idx) &&
+           "collapsed root should not have DFS info");
+  }
+
+  // is_ancestor should be correct for all reachable nodes.
+  auto nodes = collect_reachable_nodes(idx);
+  verify_is_ancestor(idx, nodes);
+
+  std::println("  PASS");
+}
+
+// End-to-end: compare incremental DFS against a fresh tree_index built from
+// the post-SPR DAG.  This catches bugs where update_topology produces a
+// children_[] state that differs from the actual DAG.
+static void test_dfs_recompute_vs_fresh_index() {
+  std::println("test_dfs_recompute_vs_fresh_index");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  // SPR: L1 → L5 (with collapse).
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+  idx.update_topology(r);
+  idx.update_tree_root(r);
+  idx.update_searchable_nodes(r);
+  idx.update_subtree_sizes(r);
+  idx.recompute_dfs();
+
+  // Build a completely fresh tree_index from the modified DAG.
+  tree_index fresh{t.tree};
+
+  assert(idx.get_tree_root() == fresh.get_tree_root());
+
+  auto reachable = collect_reachable_nodes(idx);
+  auto fresh_reachable = collect_reachable_nodes(fresh);
+  assert(reachable.size() == fresh_reachable.size() &&
+         "reachable node count mismatch between incremental and fresh index");
+
+  // Compare structural DFS properties: descendant count and level.
+  // (Exact dfs_index values may differ if child ordering diverges.)
+  for (auto node : reachable) {
+    assert(fresh.has_dfs_info(node) && idx.has_dfs_info(node));
+    auto const& a = idx.get_dfs_info(node);
+    auto const& b = fresh.get_dfs_info(node);
+    assert(a.dfs_end_index - a.dfs_index == b.dfs_end_index - b.dfs_index &&
+           "descendant count mismatch vs fresh index");
+    assert(a.level == b.level && "level mismatch vs fresh index");
+  }
+
+  // Cross-check is_ancestor for all pairs against fresh index.
+  for (auto a : reachable) {
+    for (auto b : reachable) {
+      assert(idx.is_ancestor(a, b) == fresh.is_ancestor(a, b) &&
+             "is_ancestor disagrees between incremental and fresh index");
+    }
+  }
+
+  std::println("  PASS");
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -3523,6 +3628,8 @@ int main() {
   test_dfs_recompute_simple_tree();
   test_dfs_recompute_idempotent();
   test_dfs_recompute_suboptimal_tree();
+  test_dfs_recompute_root_collapse();
+  test_dfs_recompute_vs_fresh_index();
 
   std::println("All inplace SPR phase 1-14 tests passed!");
   return 0;
