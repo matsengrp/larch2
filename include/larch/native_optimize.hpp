@@ -206,14 +206,15 @@ class tree_index {
   // a node beyond the current capacity.
   void ensure_capacity(std::size_t new_high_mark) {
     if (new_high_mark <= num_nodes_) return;
+    auto const site_slots = new_high_mark * num_variable_sites_;
     dfs_info_.resize(new_high_mark);
     has_dfs_info_.resize(new_high_mark, 0);
     is_valid_.resize(new_high_mark, 0);
-    fitch_sets_.resize(new_high_mark * num_variable_sites_, 0);
-    child_counts_.resize(new_high_mark * num_variable_sites_, {0, 0, 0, 0});
+    fitch_sets_.resize(site_slots, 0);
+    child_counts_.resize(site_slots, {0, 0, 0, 0});
     has_child_counts_.resize(new_high_mark, 0);
     num_children_.resize(new_high_mark, 0);
-    allele_union_.resize(new_high_mark * num_variable_sites_, 0);
+    allele_union_.resize(site_slots, 0);
     parent_.resize(new_high_mark, 0);
     children_.resize(new_high_mark);
     is_condensed_.resize(new_high_mark, 0);

@@ -2660,6 +2660,13 @@ static void test_ensure_capacity_array_sizes() {
     assert(!idx.has_dfs_info(n));
     assert(!idx.has_child_counts(n));
     assert(idx.get_num_children(n) == 0);
+    // dfs_info struct should be value-initialized (all zeros).
+    auto const& di = idx.get_dfs_info(n);
+    assert(di.dfs_index == 0 && di.dfs_end_index == 0 && di.level == 0);
+    // parent should default to 0.
+    assert(idx.get_parent(n) == 0);
+    // children should be an empty vector.
+    assert(idx.get_children(n).empty());
     for (std::size_t i = 0; i < n_sites; i++) {
       assert(idx.get_fitch_set(n, i) == 0);
       auto const& cc = idx.get_child_counts(n, i);
@@ -2701,6 +2708,11 @@ static void test_ensure_capacity_monotonic_growth() {
   // Both new_inner nodes should be valid and addressable.
   assert(idx.is_valid(r1.new_inner));
   assert(idx.is_valid(r2.new_inner));
+
+  // Verify full topology survives the second SPR (covers both the
+  // reallocation triggered by growth and the hole-reuse no-op case where
+  // ensure_capacity returns immediately because high_mark didn't change).
+  verify_topology_matches_dag(idx, t.tree);
 
   std::println("  cap0={} cap1={} cap2={}", cap0, cap1, cap2);
   std::println("  PASS");
