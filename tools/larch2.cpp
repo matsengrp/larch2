@@ -874,7 +874,8 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
 // Per-iteration metrics
 // ---------------------------------------------------------------------------
 
-static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed) {
+static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed,
+                          ml_scoring_config const* ml_cfg = nullptr) {
   auto root_idx = get_root_idx(dag);
   scoped_arena<4096> arena;
   auto* mr = arena.get();
@@ -888,6 +889,14 @@ static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed) {
   parsimony_score_ops pops;
   subtree_weight<parsimony_score_ops> psw(dag, seed, mr);
   auto min_pars = psw.compute_weight_below(root_idx, pops);
+
+  // ML log-likelihood on a parsimony-optimal sampled tree.
+  std::optional<double> ml_ll;
+  if (ml_cfg != nullptr && ml_cfg->model != nullptr) {
+    auto opt_tree = psw.min_weight_sample_tree(pops);
+    fitch_assign_compact_genomes(opt_tree);
+    ml_ll = -compute_dag_ml_nll(*ml_cfg->model, opt_tree);
+  }
 
   // Optimal tree count
   auto optimal_count = psw.min_weight_count(root_idx, pops);
@@ -914,8 +923,9 @@ static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed) {
             << ", parsimony [" << min_pars << ", " << max_pars << "]"
             << ", " << optimal_count.to_string() << " optimal"
             << ", RF [" << (min_rf + min_rf_shift).to_string() << ", "
-            << (max_rf + min_rf_shift).to_string() << "]"
-            << "\n";
+            << (max_rf + min_rf_shift).to_string() << "]";
+  if (ml_ll) std::cerr << ", LL(opt)=" << *ml_ll;
+  std::cerr << "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,7 +1146,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
     // Metrics (opt-in)
     if (a.log_metrics) {
       std::uint32_t metrics_seed = rng();
-      print_metrics(dag, m, metrics_seed);
+      print_metrics(dag, m, metrics_seed, &ml_config);
     }
 
     // 2. Sample tree using configured method
