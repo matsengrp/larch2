@@ -2,9 +2,14 @@
 
 #include <larch/native_optimize.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
+#include <random>
+#include <vector>
 
 namespace larch {
 
@@ -403,5 +408,138 @@ inline phylo_dag extract_fragment(phylo_dag& tree) {
   set_sample_ids_from_cg(fragment);
   return fragment;
 }
+
+// ============================================================================
+// Phases 28-35: Multi-step in-place optimizer
+// ============================================================================
+
+// Phase 28: Fragment extraction strategy.
+// every_step: extract a fragment after each in-place move (maximum DAG diversity).
+// final_only: extract one fragment after the last move (minimum overhead).
+enum class fragment_strategy { every_step, final_only };
+
+// Phase 32: Move selection policy.
+enum class move_selection { best_improving, random_weighted, random_uniform };
+
+// Phase 34: Configuration for the multi-step in-place loop.
+struct inplace_params {
+  std::size_t max_steps{10};
+  std::size_t radius{0};                // 0 = auto (depth * 2)
+  int accept_threshold{0};              // move_enumerator score_threshold
+  std::optional<int> worsening_budget;  // max cumulative worsening before abort
+  move_selection selector{move_selection::best_improving};
+  fragment_strategy frag_mode{fragment_strategy::final_only};
+  double temperature{1.0};              // initial T for random_weighted
+  double cooling_rate{0.9};             // T *= cooling_rate each step
+};
+
+// Phase 35: Result from one multi-step run.
+struct inplace_result {
+  int initial_score;
+  int final_score;
+  std::size_t steps_taken;
+  bool escaped;  // final_score < initial_score
+};
+
+// Phases 30-31: Multi-step in-place SPR producer.
+//
+// Satisfies FragmentProducer (not MoveProducer): moves are relative to an
+// evolving internal work_tree, so the producer emits complete fragment DAGs
+// rather than spr_move descriptors.
+struct inplace_move_producer {
+  inplace_params params;
+  thread_pool& pool = thread_pool::get_default();
+
+  // Core loop: clone the sampled tree, build tree_state, run up to
+  // max_steps in-place SPR moves, emit fragments via frag_cb.
+  inline inplace_result operator()(phylo_dag& tree,
+                                   std::function<void(phylo_dag)> frag_cb,
+                                   std::mt19937& rng) {
+    auto [work_tree, _] = clone_tree(tree);
+    fitch_assign_compact_genomes(work_tree);
+    recompute_edge_mutations(work_tree);
+    set_sample_ids_from_cg(work_tree);
+
+    tree_state state{work_tree, pool};
+    int initial_score = state.parsimony_score;
+    int cumulative_worsening = 0;
+
+    auto radius = params.radius > 0 ? params.radius
+                                     : compute_tree_max_depth(work_tree) * 2;
+    if (radius == 0) radius = 1;
+
+    std::size_t steps = 0;
+    for (; steps < params.max_steps; ++steps) {
+      move_enumerator enumerator{state.index, params.accept_threshold};
+      std::vector<profitable_move> candidates;
+      enumerator.find_all_moves_parallel(
+          radius, [&](auto& m) { candidates.push_back(m); }, pool);
+
+      if (candidates.empty()) break;
+
+      std::sort(candidates.begin(), candidates.end(),
+                [](auto& a, auto& b) { return a.score_change < b.score_change; });
+
+      auto& chosen = select_move(candidates, rng, steps);
+
+      if (chosen.score_change > 0) {
+        cumulative_worsening += chosen.score_change;
+        if (params.worsening_budget &&
+            cumulative_worsening > *params.worsening_budget)
+          break;
+      }
+
+      state.apply_move(chosen.src, chosen.dst);
+
+      if (params.frag_mode == fragment_strategy::every_step)
+        frag_cb(extract_fragment(state.tree));
+    }
+
+    bool escaped = state.parsimony_score < initial_score;
+    if (params.frag_mode == fragment_strategy::final_only && steps > 0)
+      frag_cb(extract_fragment(state.tree));
+
+    return inplace_result{
+        .initial_score = initial_score,
+        .final_score = state.parsimony_score,
+        .steps_taken = steps,
+        .escaped = escaped,
+    };
+  }
+
+ private:
+  profitable_move const& select_move(
+      std::vector<profitable_move> const& moves, std::mt19937& rng,
+      std::size_t step) const {
+    switch (params.selector) {
+      case move_selection::best_improving:
+        return moves.front();
+
+      case move_selection::random_uniform: {
+        std::uniform_int_distribution<std::size_t> dist(0, moves.size() - 1);
+        return moves[dist(rng)];
+      }
+
+      case move_selection::random_weighted: {
+        double T = params.temperature *
+                   std::pow(params.cooling_rate, static_cast<double>(step));
+        if (T < 1e-10) return moves.front();
+
+        std::vector<double> weights(moves.size());
+        for (std::size_t i = 0; i < moves.size(); ++i) {
+          if (moves[i].score_change <= 0)
+            weights[i] = 1.0;
+          else
+            weights[i] =
+                std::exp(-static_cast<double>(moves[i].score_change) / T);
+        }
+        std::discrete_distribution<std::size_t> dist(weights.begin(),
+                                                     weights.end());
+        return moves[dist(rng)];
+      }
+    }
+    __builtin_unreachable();
+  }
+};
 
 }  // namespace larch

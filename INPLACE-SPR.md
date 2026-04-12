@@ -893,7 +893,7 @@ per step), or once at the end, depending on the extraction strategy.
 
 ---
 
-### Phase 28: Deferred fragment extraction
+### Phase 28: Deferred fragment extraction ✓ (session 33)
 
 For the multi-step loop, we have two strategies:
 
@@ -939,7 +939,7 @@ enum class fragment_strategy { every_step, final_only };
 
 ---
 
-### Phase 29: Rebuild clade offsets before extraction
+### Phase 29: Rebuild clade offsets before extraction ✓ (session 33, handled by extract_fragment)
 
 The in-place SPR invalidates clade offsets on affected nodes. Before cloning
 (which uses `get_clades()`), rebuild clade offsets:
@@ -966,7 +966,7 @@ fragment extraction.
 
 ## Part 7 — Multi-Step Iteration Loop (Phases 30–36)
 
-### Phase 30: `inplace_move_producer` struct
+### Phase 30: `inplace_move_producer` struct ✓ (session 33)
 
 The MoveProducer concept from `spr_pipeline.hpp` takes a tree and callback.
 Define a new producer that runs the multi-step loop internally:
@@ -994,7 +994,7 @@ This is a `MoveProducer` that can be passed to `optimize_dag_v2`.
 
 ---
 
-### Phase 31: Core loop — score, select, apply, extract
+### Phase 31: Core loop — score, select, apply, extract ✓ (session 33)
 
 Implement the operator():
 
@@ -1066,7 +1066,7 @@ rethinking the callback — see Phase 33.
 
 ---
 
-### Phase 32: Move selection policy
+### Phase 32: Move selection policy ✓ (session 33)
 
 Separate move selection into a pluggable function:
 
@@ -1096,7 +1096,7 @@ selection.
 
 ---
 
-### Phase 33: Fragment generation integration
+### Phase 33: Fragment generation integration ✓ (session 33)
 
 The `move_callback` from `spr_pipeline.hpp` receives `spr_move` descriptors.
 The `optimize_dag_v2` pipeline then calls `apply_spr_as_fragment(sampled, move)`
@@ -1147,7 +1147,7 @@ fragment directly.
 
 ---
 
-### Phase 34: Configurable step count and radius
+### Phase 34: Configurable step count and radius ✓ (session 33)
 
 Add parameters to control the multi-step loop behavior:
 
@@ -1181,7 +1181,7 @@ struct inplace_params {
 
 ---
 
-### Phase 35: Escape detection
+### Phase 35: Escape detection ✓ (session 33)
 
 The loop should detect when it has found a genuine escape from the local
 minimum:
@@ -1205,7 +1205,7 @@ Log the escape: step count, initial score, final score, delta.
 
 ---
 
-### Phase 36: Integration with `optimize_dag_v2`
+### Phase 36: Integration with `optimize_dag_v2` ✓ (session 33)
 
 Add `inplace_move_producer` as an optional additional producer in the pipeline:
 
@@ -1240,7 +1240,7 @@ improving moves found).
 
 ## Part 8 — Acceptance Policies (Phases 37–38)
 
-### Phase 37: Bounded worsening (greedy with slack)
+### Phase 37: Bounded worsening (greedy with slack) ✓ (session 33, via accept_threshold + worsening_budget)
 
 The simplest policy: accept any move with `score_change <= threshold`.
 
@@ -1264,7 +1264,7 @@ preventing unbounded degradation.
 
 ---
 
-### Phase 38: Simulated annealing schedule
+### Phase 38: Simulated annealing schedule ✓ (session 33, via random_weighted selector + temperature/cooling_rate)
 
 For more sophisticated exploration, accept worsening moves with probability
 `exp(-delta / T)`, where T decreases over steps:
@@ -1306,7 +1306,7 @@ struct annealing_selector {
 
 ## Part 9 — CLI Integration and End-to-End (Phases 39–42)
 
-### Phase 39: CLI flags
+### Phase 39: CLI flags ✓ (session 33)
 
 Add command-line options to `larch2.cpp`:
 
@@ -1333,7 +1333,7 @@ the existing `drift_escape` mechanism.
 
 ---
 
-### Phase 40: Replace drift_escape with inplace loop
+### Phase 40: Replace drift_escape with inplace loop ✓ (session 33)
 
 The existing `drift_escape()` in `larch2.cpp:1080-1206` does essentially
 what the inplace loop does, but inefficiently (full tree_index rebuild + clone
@@ -1370,7 +1370,7 @@ static bool drift_escape(merge& m, args const& a, std::mt19937& rng,
 
 ---
 
-### Phase 41: End-to-end local minimum escape
+### Phase 41: End-to-end local minimum escape ✓ (session 33)
 
 Construct a test case where the optimizer is provably stuck at a local
 minimum with no single improving SPR move, but a 2-step path exists to a
@@ -1418,7 +1418,7 @@ Verify:
 
 ---
 
-### Phase 42: Performance validation
+### Phase 42: Performance validation ✓ (session 33)
 
 Benchmark incremental vs full tree_index rebuild on realistic data.
 

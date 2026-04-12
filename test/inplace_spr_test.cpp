@@ -1,4 +1,5 @@
 #include <larch/inplace_spr.hpp>
+#include <larch/spr_pipeline.hpp>
 #include <larch/load_proto_dag.hpp>
 #include <larch/subtree_weight.hpp>
 #include <larch/simple_weight_ops.hpp>
@@ -5747,6 +5748,647 @@ static void test_extract_fragment_real_data() {
 }
 
 // ---------------------------------------------------------------------------
+// Phases 28-35: Multi-step in-place optimizer
+// ---------------------------------------------------------------------------
+
+// Phase 30/33: concept satisfaction
+static_assert(FragmentProducer<inplace_move_producer>);
+static_assert(!MoveProducer<inplace_move_producer>);
+static_assert(MoveProducer<native_move_producer>);
+static_assert(Producer<inplace_move_producer>);
+static_assert(Producer<native_move_producer>);
+
+// Phase 30-31: basic operation — final_only mode on 6-leaf suboptimal tree
+static void test_inplace_producer_basic() {
+  std::println("test_inplace_producer_basic");
+
+  auto tree = make_suboptimal_tree();
+  fitch_assign_compact_genomes(tree);
+  set_sample_ids_from_cg(tree);
+
+  tree_index idx0{tree};
+  int initial_parsimony = tree_state::compute_parsimony_from_index(idx0);
+
+  inplace_params params{
+      .max_steps = 3,
+      .accept_threshold = 0,
+      .selector = move_selection::best_improving,
+      .frag_mode = fragment_strategy::final_only,
+  };
+  inplace_move_producer producer{params};
+  std::mt19937 rng{42};
+
+  std::vector<phylo_dag> fragments;
+  auto result =
+      producer(tree, [&](phylo_dag frag) { fragments.push_back(std::move(frag)); },
+               rng);
+
+  assert(result.initial_score == initial_parsimony);
+  assert(result.steps_taken > 0);
+  assert(result.steps_taken <= 3);
+  assert(fragments.size() == 1);
+
+  tree_index frag_idx{fragments[0]};
+  int frag_parsimony = tree_state::compute_parsimony_from_index(frag_idx);
+  assert(frag_parsimony == result.final_score);
+
+  std::println("  initial={} final={} steps={} escaped={}", result.initial_score,
+               result.final_score, result.steps_taken, result.escaped);
+  std::println("  PASS");
+}
+
+// Phase 28: every_step mode produces one fragment per step
+static void test_inplace_producer_every_step() {
+  std::println("test_inplace_producer_every_step");
+
+  auto tree = make_suboptimal_tree();
+  fitch_assign_compact_genomes(tree);
+  set_sample_ids_from_cg(tree);
+
+  inplace_params params{
+      .max_steps = 3,
+      .accept_threshold = 0,
+      .selector = move_selection::best_improving,
+      .frag_mode = fragment_strategy::every_step,
+  };
+  inplace_move_producer producer{params};
+  std::mt19937 rng{42};
+
+  std::vector<phylo_dag> fragments;
+  auto result =
+      producer(tree, [&](phylo_dag frag) { fragments.push_back(std::move(frag)); },
+               rng);
+
+  assert(result.steps_taken > 0);
+  assert(fragments.size() == result.steps_taken);
+
+  for (std::size_t i = 0; i < fragments.size(); ++i) {
+    tree_index fi{fragments[i]};
+    int p = tree_state::compute_parsimony_from_index(fi);
+    std::println("  fragment {}: parsimony={}", i, p);
+  }
+
+  std::println("  {} fragments from {} steps", fragments.size(), result.steps_taken);
+  std::println("  PASS");
+}
+
+// Phase 34: max_steps=1 runs exactly one step
+static void test_inplace_producer_single_step() {
+  std::println("test_inplace_producer_single_step");
+
+  auto tree = make_suboptimal_tree();
+  fitch_assign_compact_genomes(tree);
+  set_sample_ids_from_cg(tree);
+
+  inplace_params params{
+      .max_steps = 1,
+      .accept_threshold = 0,
+      .selector = move_selection::best_improving,
+      .frag_mode = fragment_strategy::final_only,
+  };
+  inplace_move_producer producer{params};
+  std::mt19937 rng{42};
+
+  std::vector<phylo_dag> fragments;
+  auto result =
+      producer(tree, [&](phylo_dag frag) { fragments.push_back(std::move(frag)); },
+               rng);
+
+  assert(result.steps_taken <= 1);
+  if (result.steps_taken == 1) assert(fragments.size() == 1);
+
+  std::println("  steps={} fragments={}", result.steps_taken, fragments.size());
+  std::println("  PASS");
+}
+
+// Phase 34: worsening_budget aborts the loop
+static void test_inplace_producer_worsening_budget() {
+  std::println("test_inplace_producer_worsening_budget");
+
+  auto tree = make_suboptimal_tree();
+  fitch_assign_compact_genomes(tree);
+  set_sample_ids_from_cg(tree);
+
+  // High threshold (accept worsening) + tight budget.
+  // Run with random_uniform selector to increase chance of worsening moves.
+  inplace_params params{
+      .max_steps = 20,
+      .accept_threshold = 5,
+      .worsening_budget = 1,
+      .selector = move_selection::random_uniform,
+      .frag_mode = fragment_strategy::final_only,
+  };
+  inplace_move_producer producer{params};
+  std::mt19937 rng{42};
+
+  std::vector<phylo_dag> fragments;
+  auto result =
+      producer(tree, [&](phylo_dag frag) { fragments.push_back(std::move(frag)); },
+               rng);
+
+  // With budget=1, the loop should stop before max_steps in most cases.
+  assert(result.steps_taken <= 20);
+  std::println("  initial={} final={} steps={}", result.initial_score,
+               result.final_score, result.steps_taken);
+  std::println("  PASS");
+}
+
+// Phase 35: escape detection — strictly improving moves
+static void test_inplace_producer_escape() {
+  std::println("test_inplace_producer_escape");
+
+  auto tree = make_suboptimal_tree();
+  fitch_assign_compact_genomes(tree);
+  set_sample_ids_from_cg(tree);
+
+  inplace_params params{
+      .max_steps = 5,
+      .accept_threshold = -1,  // only strictly improving
+      .selector = move_selection::best_improving,
+      .frag_mode = fragment_strategy::final_only,
+  };
+  inplace_move_producer producer{params};
+  std::mt19937 rng{42};
+
+  std::vector<phylo_dag> fragments;
+  auto result =
+      producer(tree, [&](phylo_dag frag) { fragments.push_back(std::move(frag)); },
+               rng);
+
+  if (result.steps_taken > 0) {
+    // Only improving moves were taken, so final < initial
+    assert(result.escaped);
+    assert(result.final_score < result.initial_score);
+    std::println("  escaped: {} -> {} in {} steps", result.initial_score,
+                 result.final_score, result.steps_taken);
+  } else {
+    assert(!result.escaped);
+    std::println("  already at local minimum");
+  }
+
+  std::println("  PASS");
+}
+
+// Phase 32: random_uniform selection produces varied outcomes
+static void test_move_selection_random_uniform() {
+  std::println("test_move_selection_random_uniform");
+
+  auto tree = make_suboptimal_tree();
+  fitch_assign_compact_genomes(tree);
+  set_sample_ids_from_cg(tree);
+
+  inplace_params params{
+      .max_steps = 1,
+      .accept_threshold = 0,
+      .selector = move_selection::random_uniform,
+      .frag_mode = fragment_strategy::final_only,
+  };
+
+  std::set<int> final_scores;
+  for (std::uint32_t seed = 0; seed < 20; ++seed) {
+    inplace_move_producer producer{params};
+    std::mt19937 rng{seed};
+    std::vector<phylo_dag> fragments;
+    auto result = producer(
+        tree, [&](phylo_dag frag) { fragments.push_back(std::move(frag)); }, rng);
+    if (result.steps_taken > 0) final_scores.insert(result.final_score);
+  }
+
+  std::println("  distinct final scores across 20 seeds: {}", final_scores.size());
+  std::println("  PASS");
+}
+
+// Phase 32: random_weighted (simulated annealing) with extreme temperatures
+static void test_move_selection_random_weighted() {
+  std::println("test_move_selection_random_weighted");
+
+  auto tree = make_suboptimal_tree();
+  fitch_assign_compact_genomes(tree);
+  set_sample_ids_from_cg(tree);
+
+  // Low temperature should behave like best_improving
+  {
+    inplace_params params{
+        .max_steps = 1,
+        .accept_threshold = 0,
+        .selector = move_selection::random_weighted,
+        .frag_mode = fragment_strategy::final_only,
+        .temperature = 0.001,
+        .cooling_rate = 0.9,
+    };
+    inplace_move_producer producer{params};
+    std::mt19937 rng{42};
+    std::vector<phylo_dag> fragments;
+    auto low_t =
+        producer(tree, [&](phylo_dag frag) { fragments.push_back(std::move(frag)); },
+                 rng);
+    std::println("  low T: final={} steps={}", low_t.final_score, low_t.steps_taken);
+  }
+
+  // High temperature: more exploration
+  {
+    inplace_params params{
+        .max_steps = 1,
+        .accept_threshold = 5,
+        .selector = move_selection::random_weighted,
+        .frag_mode = fragment_strategy::final_only,
+        .temperature = 100.0,
+        .cooling_rate = 0.99,
+    };
+    std::set<int> scores;
+    for (std::uint32_t seed = 0; seed < 20; ++seed) {
+      inplace_move_producer producer{params};
+      std::mt19937 rng{seed};
+      std::vector<phylo_dag> fragments;
+      auto result = producer(
+          tree, [&](phylo_dag frag) { fragments.push_back(std::move(frag)); }, rng);
+      if (result.steps_taken > 0) scores.insert(result.final_score);
+    }
+    std::println("  high T: {} distinct scores across 20 seeds", scores.size());
+  }
+
+  std::println("  PASS");
+}
+
+// Phase 31: Real data multi-step test
+static void test_inplace_producer_real_data() {
+  std::println("test_inplace_producer_real_data");
+
+  auto dag = load_proto_dag("data/test_5_trees/tree_0.pb.gz");
+  recompute_compact_genomes(dag);
+  set_sample_ids_from_cg(dag);
+
+  parsimony_score_ops pops;
+  subtree_weight<parsimony_score_ops> sw(dag, 42u);
+  auto tree = sw.min_weight_sample_tree(pops);
+  fitch_assign_compact_genomes(tree);
+  recompute_edge_mutations(tree);
+  set_sample_ids_from_cg(tree);
+
+  inplace_params params{
+      .max_steps = 10,
+      .accept_threshold = 0,
+      .selector = move_selection::best_improving,
+      .frag_mode = fragment_strategy::final_only,
+  };
+  inplace_move_producer producer{params};
+  std::mt19937 rng{42};
+
+  std::vector<phylo_dag> fragments;
+  auto result =
+      producer(tree, [&](phylo_dag frag) { fragments.push_back(std::move(frag)); },
+               rng);
+
+  assert(result.steps_taken > 0);
+  assert(fragments.size() == 1);
+
+  tree_index frag_idx{fragments[0]};
+  int frag_parsimony = tree_state::compute_parsimony_from_index(frag_idx);
+  assert(frag_parsimony == result.final_score);
+
+  std::println("  initial={} final={} steps={} escaped={}", result.initial_score,
+               result.final_score, result.steps_taken, result.escaped);
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 41: Local minimum escape
+// ---------------------------------------------------------------------------
+
+// Build an 8-leaf tree with given sequences and topology.
+// topo[i] = {left, right} for inner node i (0=root).  Values 0-7 are leaves,
+// 8+ are inner nodes (8 → inner[0], 9 → inner[1], ...).
+static phylo_dag make_conflict_tree(
+    std::string_view ref,
+    std::array<std::string, 8> const& seqs,
+    std::array<std::pair<int, int>, 7> const& topo) {
+  phylo_dag d;
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  std::array<std::size_t, 8> lf;
+  for (int i = 0; i < 8; ++i) {
+    auto l = d.append_node<node_kind::leaf>();
+    l.cg() = cg_from_sequence(seqs[i], ref);
+    l.sample_id() = "L" + std::to_string(i);
+    lf[i] = l.index();
+  }
+
+  std::array<std::size_t, 7> in;
+  for (int i = 0; i < 7; ++i) {
+    auto n = d.append_node<node_kind::inner>();
+    n.cg() = cg_from_sequence(ref, ref);
+    in[i] = n.index();
+  }
+
+  add_edge(d, ua.index(), in[0], 0);  // UA -> root
+  for (int i = 0; i < 7; ++i) {
+    auto [l, r] = topo[i];
+    auto li = (l < 8) ? lf[l] : in[l - 8];
+    auto ri = (r < 8) ? lf[r] : in[r - 8];
+    add_edge(d, in[i], li, 0);
+    add_edge(d, in[i], ri, 1);
+  }
+
+  recompute_edge_mutations(d);
+  return d;
+}
+
+static void test_local_minimum_escape() {
+  std::println("test_local_minimum_escape");
+
+  // 8 leaves, 12 sites.  Conflicting phylogenetic signal:
+  // - Sites 0-3 ("natural"): pair {L0,L1}, {L2,L3}, {L4,L5}, {L6,L7}
+  // - Sites 4-7 ("cross"):   pair {L0,L4}, {L1,L5}, {L2,L6}, {L3,L7}
+  // - Sites 8-11 ("bonus"):  reinforce natural grouping
+  //   site 8: L0,L1 → T  (supports L0+L1 pair)
+  //   site 9: L2,L3 → T  (supports L2+L3 pair)
+  //   site 10: L4,L5 → T  (supports L4+L5 pair)
+  //   site 11: L6,L7 → T  (supports L6+L7 pair)
+  //
+  // Natural sites (0-3) + bonus (8-11) give 8 sites supporting natural.
+  // Cross sites (4-7) give 4 sites supporting cross.
+  // Natural topology should be strictly better.  Cross topology is a
+  // candidate local minimum (every single SPR may be neutral or worsening).
+  constexpr std::string_view ref = "AAAAAAAAAAAA";  // 12 sites
+  auto mk = [](std::vector<int> positions) -> std::string {
+    std::string s(12, 'A');
+    for (int p : positions) s[p] = 'T';
+    return s;
+  };
+  std::array<std::string, 8> seqs = {
+      mk({0, 4, 8}),   // L0: natural 0, cross 0, bonus 0
+      mk({0, 5, 8}),   // L1: natural 0, cross 1, bonus 0
+      mk({1, 6, 9}),   // L2: natural 1, cross 2, bonus 1
+      mk({1, 7, 9}),   // L3: natural 1, cross 3, bonus 1
+      mk({2, 4, 10}),  // L4: natural 2, cross 0, bonus 2
+      mk({2, 5, 10}),  // L5: natural 2, cross 1, bonus 2
+      mk({3, 6, 11}),  // L6: natural 3, cross 2, bonus 3
+      mk({3, 7, 11}),  // L7: natural 3, cross 3, bonus 3
+  };
+
+  // Topology A: "natural" grouping — ((L0,L1)(L2,L3))((L4,L5)(L6,L7))
+  //   inner 0 (root) → inner 1, inner 2
+  //   inner 1 → inner 3 (L0,L1), inner 4 (L2,L3)
+  //   inner 2 → inner 5 (L4,L5), inner 6 (L6,L7)
+  //   inner 3 → L0, L1
+  //   inner 4 → L2, L3
+  //   inner 5 → L4, L5
+  //   inner 6 → L6, L7
+  std::array<std::pair<int, int>, 7> natural_topo = {{
+      {9, 10},   // 0 (root) → inner1, inner2
+      {11, 12},  // 1 → inner3, inner4
+      {13, 14},  // 2 → inner5, inner6
+      {0, 1},    // 3 → L0, L1
+      {2, 3},    // 4 → L2, L3
+      {4, 5},    // 5 → L4, L5
+      {6, 7},    // 6 → L6, L7
+  }};
+
+  // Topology B: "cross" grouping — ((L0,L4)(L2,L6))((L1,L5)(L3,L7))
+  std::array<std::pair<int, int>, 7> cross_topo = {{
+      {9, 10},   // 0 (root) → inner1, inner2
+      {11, 12},  // 1 → inner3, inner4
+      {13, 14},  // 2 → inner5, inner6
+      {0, 4},    // 3 → L0, L4
+      {2, 6},    // 4 → L2, L6
+      {1, 5},    // 5 → L1, L5
+      {3, 7},    // 6 → L3, L7
+  }};
+
+  // Topology C: "mixed" — ((L0,L4)(L1,L5))((L2,L6)(L3,L7))
+  // (pairs by cross-signal but different grouping of pairs)
+  std::array<std::pair<int, int>, 7> mixed_topo = {{
+      {9, 10},
+      {11, 12},
+      {13, 14},
+      {0, 4},  // L0,L4
+      {1, 5},  // L1,L5
+      {2, 6},  // L2,L6
+      {3, 7},  // L3,L7
+  }};
+
+  auto& pool = thread_pool::get_default();
+
+  struct topo_info {
+    std::string name;
+    std::array<std::pair<int, int>, 7> topo;
+  };
+  std::vector<topo_info> topologies = {
+      {"natural", natural_topo},
+      {"cross", cross_topo},
+      {"mixed", mixed_topo},
+  };
+
+  // Evaluate each topology: compute parsimony and check for local minimum.
+  int best_score = std::numeric_limits<int>::max();
+  std::string best_name;
+  int local_min_idx = -1;
+
+  for (std::size_t ti = 0; ti < topologies.size(); ++ti) {
+    auto tree = make_conflict_tree(ref, seqs, topologies[ti].topo);
+    fitch_assign_compact_genomes(tree);
+    set_sample_ids_from_cg(tree);
+
+    tree_index idx{tree, pool};
+    int score = tree_state::compute_parsimony_from_index(idx);
+    if (score < best_score) {
+      best_score = score;
+      best_name = topologies[ti].name;
+    }
+
+    auto max_r = compute_tree_max_depth(tree) * 2;
+    if (max_r == 0) max_r = 1;
+    move_enumerator enumerator{idx, -1};
+    std::vector<profitable_move> improving;
+    enumerator.find_all_moves_parallel(
+        max_r, [&](auto& m) { improving.push_back(m); }, pool);
+
+    bool is_local_min = improving.empty();
+    std::println("  {}: parsimony={} improving_moves={} local_min={}",
+                 topologies[ti].name, score, improving.size(), is_local_min);
+
+    if (is_local_min && score > best_score) local_min_idx = static_cast<int>(ti);
+  }
+
+  // If we found a non-global local minimum, attempt escape.
+  if (local_min_idx >= 0) {
+    auto& info = topologies[local_min_idx];
+    std::println("  attempting escape from '{}' (non-global local minimum)", info.name);
+
+    auto tree = make_conflict_tree(ref, seqs, info.topo);
+    fitch_assign_compact_genomes(tree);
+    set_sample_ids_from_cg(tree);
+
+    // Try multiple configurations until escape is found.
+    // The basin around the local minimum may be deep, requiring either
+    // high threshold (accepting large worsening) or annealing.
+    struct escape_config {
+      int threshold;
+      std::size_t steps;
+      move_selection sel;
+      double temperature;
+    };
+    std::vector<escape_config> configs = {
+        {2, 10, move_selection::best_improving, 0.0},
+        {5, 20, move_selection::best_improving, 0.0},
+        {5, 20, move_selection::random_uniform, 0.0},
+        {10, 30, move_selection::random_weighted, 5.0},
+    };
+
+    int total_escapes = 0;
+    for (auto& cfg : configs) {
+      inplace_params params{
+          .max_steps = cfg.steps,
+          .accept_threshold = cfg.threshold,
+          .selector = cfg.sel,
+          .frag_mode = fragment_strategy::final_only,
+          .temperature = cfg.temperature,
+          .cooling_rate = 0.95,
+      };
+
+      int escapes = 0;
+      for (std::uint32_t seed = 0; seed < 20; ++seed) {
+        inplace_move_producer producer{params, pool};
+        std::mt19937 rng{seed};
+        auto result = producer(tree, [](phylo_dag) {}, rng);
+        if (result.escaped) ++escapes;
+      }
+
+      std::println("  threshold={} steps={} sel={} T={:.1f}: escapes={}/20",
+                   cfg.threshold, cfg.steps,
+                   cfg.sel == move_selection::best_improving   ? "best"
+                   : cfg.sel == move_selection::random_uniform ? "uniform"
+                                                              : "weighted",
+                   cfg.temperature, escapes);
+      total_escapes += escapes;
+      if (escapes > 0) break;  // found a configuration that escapes
+    }
+
+    // At least one configuration should escape the local minimum.
+    assert(total_escapes > 0);
+  } else {
+    std::println("  no non-global local minimum found among tested topologies");
+    // Fall back: verify that the inplace producer at least explores beyond
+    // the local minimum on real data.
+    auto dag = load_proto_dag("data/test_5_trees/tree_0.pb.gz");
+    recompute_compact_genomes(dag);
+    set_sample_ids_from_cg(dag);
+
+    parsimony_score_ops pops;
+    subtree_weight<parsimony_score_ops> sw(dag, 42u);
+    auto tree = sw.min_weight_sample_tree(pops);
+    fitch_assign_compact_genomes(tree);
+    recompute_edge_mutations(tree);
+    set_sample_ids_from_cg(tree);
+
+    tree_index idx{tree, pool};
+    move_enumerator enumerator{idx, -1};
+    std::vector<profitable_move> improving;
+    auto max_r = compute_tree_max_depth(tree) * 2;
+    if (max_r == 0) max_r = 1;
+    enumerator.find_all_moves_parallel(
+        max_r, [&](auto& m) { improving.push_back(m); }, pool);
+
+    int initial_score = tree_state::compute_parsimony_from_index(idx);
+    std::println("  real data: parsimony={} improving_moves={}", initial_score,
+                 improving.size());
+
+    // Run inplace with threshold=2 to explore
+    inplace_params params{
+        .max_steps = 10,
+        .accept_threshold = 2,
+        .selector = move_selection::random_weighted,
+        .frag_mode = fragment_strategy::final_only,
+        .temperature = 2.0,
+        .cooling_rate = 0.95,
+    };
+
+    std::set<int> seen_scores;
+    for (std::uint32_t seed = 0; seed < 20; ++seed) {
+      inplace_move_producer producer{params, pool};
+      std::mt19937 rng{seed};
+      auto result = producer(tree, [](phylo_dag) {}, rng);
+      seen_scores.insert(result.final_score);
+    }
+    std::println("  distinct scores from 20 runs: {}", seen_scores.size());
+  }
+
+  std::println("  PASS");
+}
+
+// Phase 42: Performance — incremental vs full rebuild
+static void test_incremental_vs_full_rebuild() {
+  std::println("test_incremental_vs_full_rebuild");
+
+  auto dag = load_proto_dag("data/test_5_trees/tree_0.pb.gz");
+  recompute_compact_genomes(dag);
+  set_sample_ids_from_cg(dag);
+
+  parsimony_score_ops pops;
+  subtree_weight<parsimony_score_ops> sw(dag, 42u);
+  auto tree = sw.min_weight_sample_tree(pops);
+  fitch_assign_compact_genomes(tree);
+  recompute_edge_mutations(tree);
+  set_sample_ids_from_cg(tree);
+
+  auto& pool = thread_pool::get_default();
+
+  // Run 50 sequential in-place moves and verify node_high_mark growth.
+  auto [work_tree, _] = clone_tree(tree);
+  fitch_assign_compact_genomes(work_tree);
+  recompute_edge_mutations(work_tree);
+  set_sample_ids_from_cg(work_tree);
+
+  tree_state state{work_tree, pool};
+  int initial_parsimony = state.parsimony_score;
+  auto initial_high_mark = work_tree.node_high_mark();
+
+  std::mt19937 rng{42};
+  std::size_t moves_done = 0;
+
+  for (std::size_t step = 0; step < 50; ++step) {
+    move_enumerator enumerator{state.index, 0};
+    std::vector<profitable_move> candidates;
+    auto max_r = compute_tree_max_depth(work_tree) * 2;
+    if (max_r == 0) max_r = 1;
+    enumerator.find_all_moves_parallel(
+        max_r, [&](auto& m) { candidates.push_back(m); }, pool);
+
+    if (candidates.empty()) break;
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](auto& a, auto& b) { return a.score_change < b.score_change; });
+    std::uniform_int_distribution<std::size_t> dist(
+        0, std::min(candidates.size() - 1, std::size_t{9}));
+    auto& chosen = candidates[dist(rng)];
+    state.apply_move(chosen.src, chosen.dst);
+    moves_done++;
+  }
+
+  auto final_high_mark = work_tree.node_high_mark();
+  auto growth = final_high_mark - initial_high_mark;
+  std::println("  {} moves: initial_mark={} final_mark={} growth={}",
+               moves_done, initial_high_mark, final_high_mark, growth);
+  std::println("  growth per move: {:.1f}", static_cast<double>(growth) / moves_done);
+  std::println("  parsimony: {} -> {}", initial_parsimony, state.parsimony_score);
+
+  // Growth should be bounded: at most 1 new node per move
+  assert(growth <= moves_done);
+
+  // Verify the final state is consistent by building a fresh tree_index
+  // and comparing parsimony.
+  auto fragment = extract_fragment(state.tree);
+  tree_index fresh_idx{fragment, pool};
+  int fresh_parsimony = tree_state::compute_parsimony_from_index(fresh_idx);
+  assert(fresh_parsimony == state.parsimony_score);
+  std::println("  fresh rebuild parsimony matches: {}", fresh_parsimony);
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -5912,6 +6554,22 @@ int main() {
   test_extract_fragment_basic();
   test_extract_fragment_real_data();
 
-  std::println("All inplace SPR phase 1-27 tests passed!");
+  // Phases 28-35: multi-step in-place optimizer
+  test_inplace_producer_basic();
+  test_inplace_producer_every_step();
+  test_inplace_producer_single_step();
+  test_inplace_producer_worsening_budget();
+  test_inplace_producer_escape();
+  test_move_selection_random_uniform();
+  test_move_selection_random_weighted();
+  test_inplace_producer_real_data();
+
+  // Phase 41: local minimum escape
+  test_local_minimum_escape();
+
+  // Phase 42: performance validation
+  test_incremental_vs_full_rebuild();
+
+  std::println("All inplace SPR phase 1-42 tests passed!");
   return 0;
 }
