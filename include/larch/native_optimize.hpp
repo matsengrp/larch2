@@ -201,6 +201,24 @@ class tree_index {
   uint8_t const* get_ref_alleles_ptr() const { return ref_alleles_.data(); }
   std::size_t get_subtree_size(std::size_t node) const { return subtree_size_[node]; }
 
+  // Phase 24: Compute total parsimony score from tree_index flat arrays.
+  // Iterates all valid inner nodes and counts sites where children disagree
+  // (Fitch cost = 1).  O(N × sites), no recursion.
+  int compute_parsimony_score() const {
+    int score = 0;
+    for (std::size_t nid = 0; nid < num_nodes_; nid++) {
+      if (!is_valid_[nid] || !has_child_counts_[nid]) continue;
+      uint32_t nc = num_children_[nid];
+      if (nc == 0) continue;
+      std::size_t base = nid * num_variable_sites_;
+      for (std::size_t i = 0; i < num_variable_sites_; i++) {
+        score += fitch_cost_from_counts(child_counts_[base + i],
+                                        static_cast<uint8_t>(nc));
+      }
+    }
+    return score;
+  }
+
   bool is_valid(std::size_t node) const {
     return node < num_nodes_ && is_valid_[node];
   }
@@ -251,13 +269,14 @@ class tree_index {
       }
       parent_[r.remaining_child] = r.grandparent;
 
-      // Invalidate collapsed node.  Clear Fitch bookkeeping so that if node
-      // slot reclamation is ever added, recompute_node_fitch_tracked sees a
-      // clean slate (num_children_ = 0 ⇒ old_cost = 0 for every site).
+      // Invalidate collapsed node.  Preserve Fitch bookkeeping
+      // (num_children_, has_child_counts_, child_counts_) so that
+      // compute_node_fitch_cost can retrieve the old cost for delta
+      // tracking.  When the DAG recycles the slot for new_inner,
+      // recompute_node_fitch_tracked sees the old data as its "before"
+      // state and correctly computes the transition delta.
       is_valid_[r.collapsed_node] = 0;
       children_[r.collapsed_node].clear();
-      num_children_[r.collapsed_node] = 0;
-      has_child_counts_[r.collapsed_node] = false;
     } else {
       // Remove src from src_parent's children.
       auto& sp_kids = children_[r.src_parent];
@@ -576,9 +595,10 @@ class tree_index {
   void update_fitch_removal(spr_result const& r, int& delta_out) {
     delta_out = 0;
     // If src_parent was collapsed, its Fitch cost is removed from the tree.
-    // child_counts_/num_children_ still hold the pre-collapse values
-    // (update_topology only clears children_[] and is_valid_[]).
-    if (r.src_parent_collapsed) {
+    // When collapsed_node == new_inner (slot recycled by the DAG),
+    // init_new_node_fitch's tracked recompute already captures the
+    // old→new transition, so don't subtract separately.
+    if (r.src_parent_collapsed && r.collapsed_node != r.new_inner) {
       delta_out -= compute_node_fitch_cost(r.collapsed_node);
     }
     std::size_t start = r.src_parent_collapsed ? r.grandparent : r.src_parent;
@@ -613,6 +633,65 @@ class tree_index {
   void update_fitch_insertion(spr_result const& r) {
     int delta = 0;
     update_fitch_insertion(r, delta);
+  }
+
+  // Phase 22: Combined incremental Fitch update.
+  // Both the removal path (src_parent → root) and the insertion path
+  // (dst_parent → root) converge at the LCA of src and dst.  Instead of
+  // propagating both paths independently to root (doubling work on the
+  // LCA→root segment), propagate each path up to the LCA separately,
+  // then propagate once from LCA to root.
+  //
+  // Edge cases:
+  //   - LCA collapsed (src_parent == lca, binary): use grandparent as
+  //     effective LCA — the original LCA node no longer exists.
+  //   - src_parent == LCA, not collapsed: removal-side propagation is a
+  //     no-op (start == stop); the shared LCA→root pass handles it.
+  //   - dst_parent == LCA: insertion-side propagation is a no-op.
+  //
+  // delta_out accumulates the total parsimony score change.
+  // Must be called after update_topology() and update_tree_root().
+  void update_fitch(spr_result const& r, int& delta_out) {
+    delta_out = 0;
+
+    // Account for collapsed node's Fitch cost removal.
+    // When collapsed_node == new_inner (slot recycled by the DAG),
+    // init_new_node_fitch's tracked recompute already captures the
+    // old→new transition, so don't subtract separately.
+    if (r.src_parent_collapsed && r.collapsed_node != r.new_inner) {
+      delta_out -= compute_node_fitch_cost(r.collapsed_node);
+    }
+
+    // Effective LCA: if src_parent was the LCA and got collapsed,
+    // the LCA node no longer exists; use grandparent instead.
+    std::size_t effective_lca = r.lca;
+    if (r.src_parent_collapsed && r.src_parent == r.lca) {
+      effective_lca = r.grandparent;
+    }
+
+    // 1. Removal side: propagate up to (but not past) effective_lca.
+    std::size_t rem_start =
+        r.src_parent_collapsed ? r.grandparent : r.src_parent;
+    int rem_delta = 0;
+    propagate_fitch_up_to(rem_start, effective_lca, rem_delta);
+    delta_out += rem_delta;
+
+    // 2. Insertion side: init new_inner, then up to effective_lca.
+    delta_out += init_new_node_fitch(r.new_inner);
+    int ins_delta = 0;
+    propagate_fitch_up_to(r.dst_parent, effective_lca, ins_delta);
+    delta_out += ins_delta;
+
+    // 3. Shared segment: effective_lca to root.
+    int shared_delta = 0;
+    propagate_fitch_upward(effective_lca, shared_delta);
+    delta_out += shared_delta;
+  }
+
+  // Convenience overload without delta tracking.
+  void update_fitch(spr_result const& r) {
+    int delta = 0;
+    update_fitch(r, delta);
   }
 
  private:

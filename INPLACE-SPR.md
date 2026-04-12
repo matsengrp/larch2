@@ -699,7 +699,7 @@ void update_fitch_insertion(spr_result const& r) {
 
 ---
 
-### Phase 22: Combined incremental Fitch update
+### Phase 22: Combined incremental Fitch update ✓ (session 32)
 
 Combine removal and insertion path updates. Both paths converge at LCA and
 share the LCA→root segment. Optimize: propagate both paths up to LCA
@@ -742,7 +742,7 @@ Edge cases:
 
 ---
 
-### Phase 23: Validate incremental Fitch vs full rebuild
+### Phase 23: Validate incremental Fitch vs full rebuild ✓ (session 32)
 
 Comprehensive cross-validation: for many SPR moves, compare incremental
 update against a full tree_index rebuild.
@@ -760,7 +760,7 @@ update against a full tree_index rebuild.
 
 ## Part 5 — Incremental Score Tracking (Phases 24–26)
 
-### Phase 24: Compute parsimony score from tree_index
+### Phase 24: Compute parsimony score from tree_index ✓ (session 32)
 
 Add a method to compute the tree's total parsimony (number of Fitch-cost
 changes) directly from the tree_index's Fitch arrays at the root:
@@ -801,7 +801,7 @@ int tree_index::compute_parsimony_score() const {
 
 ---
 
-### Phase 25: Incremental score delta from Fitch update
+### Phase 25: Incremental score delta from Fitch update ✓ (session 32, via Phase 18/22)
 
 Instead of recomputing the full score, track the delta during the upward
 propagation. At each recomputed node, compare old vs new Fitch cost:
@@ -833,7 +833,7 @@ std::size_t propagate_fitch_upward(std::size_t start, int& delta_out);
 
 ---
 
-### Phase 26: Update `tree_state` running score
+### Phase 26: Update `tree_state` running score ✓ (session 32)
 
 Wire the delta tracking into `tree_state`:
 
@@ -863,7 +863,7 @@ void tree_state::apply_move(std::size_t src, std::size_t dst) {
 
 ## Part 6 — Fragment Extraction (Phases 27–29)
 
-### Phase 27: Copy full tree from modified `phylo_dag`
+### Phase 27: Copy full tree from modified `phylo_dag` ✓ (session 32)
 
 After in-place modification, the `phylo_dag`'s inner-node CGs and edge
 mutations are stale (only the tree_index Fitch arrays are current). To produce

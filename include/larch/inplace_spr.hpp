@@ -47,6 +47,10 @@ struct tree_state {
     return score;
   }
 
+  // Phase 26: Apply an SPR move in-place and incrementally update the index.
+  // Declared here, defined after apply_spr_inplace (below).
+  int apply_move(std::size_t src, std::size_t dst);
+
  private:
   // Recursive bottom-up Fitch cost accumulation.
   static int compute_parsimony_below(tree_index const& idx, std::size_t node) {
@@ -353,6 +357,50 @@ inline spr_result apply_spr_inplace(phylo_dag& tree, tree_index const& index,
       .remaining_child = cinfo ? cinfo->remaining_child : 0,
       .collapsed_node = cinfo ? cinfo->collapsed_node : 0,
   };
+}
+
+// Phase 26: Apply an SPR move in-place and incrementally update the index.
+// Runs the full update pipeline: topology, tree root, DFS, subtree sizes,
+// searchable nodes, condensation, and combined Fitch update.  Returns the
+// parsimony delta.
+//
+// Precondition: index.recompute_dfs() was called since the last SPR
+// (or the index was freshly constructed).  The constructor satisfies this
+// for the first move.
+inline int tree_state::apply_move(std::size_t src, std::size_t dst) {
+  auto r = apply_spr_inplace(tree, index, src, dst);
+
+  index.update_topology(r);
+  index.update_tree_root(r);
+  index.recompute_dfs();
+  index.update_subtree_sizes(r);
+  index.update_searchable_nodes(r);
+  index.update_condensed_nodes(r);
+
+  int delta = 0;
+  index.update_fitch(r, delta);
+
+  parsimony_score += delta;
+  step_count++;
+  return delta;
+}
+
+// ============================================================================
+// Phase 27: Extract a clean fragment from a modified phylo_dag
+// ============================================================================
+
+// After in-place SPR moves, inner-node CGs and edge mutations are stale.
+// extract_fragment clones the tree (skipping removed nodes/edges), then
+// runs Fitch CG assignment + edge mutation recomputation to produce a
+// merge-ready phylo_dag.
+//
+// Cost: O(N + N × sites) — not on the hot path of the multi-step loop.
+inline phylo_dag extract_fragment(phylo_dag& tree) {
+  auto [fragment, _] = clone_tree(tree);
+  fitch_assign_compact_genomes(fragment);
+  recompute_edge_mutations(fragment);
+  set_sample_ids_from_cg(fragment);
+  return fragment;
 }
 
 }  // namespace larch

@@ -1,9 +1,12 @@
 #include <larch/inplace_spr.hpp>
 #include <larch/load_proto_dag.hpp>
+#include <larch/subtree_weight.hpp>
+#include <larch/simple_weight_ops.hpp>
 
 #include <cassert>
 #include <map>
 #include <print>
+#include <random>
 #include <set>
 #include <string>
 #include <string_view>
@@ -5043,6 +5046,707 @@ static void test_update_fitch_insertion_early_termination() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 22 tests: combined incremental Fitch update (update_fitch)
+// ---------------------------------------------------------------------------
+
+// Helper: verify Fitch self-consistency — every valid inner node's Fitch set
+// must match the standard Fitch rule applied to its children's Fitch sets.
+static void verify_fitch_self_consistent(tree_index& idx) {
+  auto nsites = idx.num_variable_sites();
+  auto nnodes = idx.num_nodes();
+  for (std::size_t nid = 0; nid < nnodes; nid++) {
+    if (!idx.is_valid(nid)) continue;
+    auto const& children = idx.get_children(nid);
+    if (children.empty()) continue;  // leaf
+
+    for (std::size_t s = 0; s < nsites; s++) {
+      uint8_t intersection = 0xFF;
+      uint8_t union_bits = 0;
+      for (auto child : children) {
+        uint8_t cf = idx.get_fitch_set(child, s);
+        intersection &= cf;
+        union_bits |= cf;
+      }
+      uint8_t expected = (intersection != 0) ? intersection : union_bits;
+      uint8_t actual = idx.get_fitch_set(nid, s);
+      if (actual != expected) {
+        std::println("  FAIL: fitch mismatch at node {} site {}: "
+                     "got 0x{:x} expected 0x{:x}",
+                     nid, s, actual, expected);
+      }
+      assert(actual == expected);
+    }
+  }
+}
+
+// Helper: run the minimum update pipeline for Fitch correctness.
+// Calls update_topology, update_tree_root, and update_fitch (Phase 22).
+// Returns the parsimony delta.
+static int apply_full_fitch_update(tree_index& idx, spr_result const& r) {
+  idx.update_topology(r);
+  idx.update_tree_root(r);
+  int delta = 0;
+  idx.update_fitch(r, delta);
+  return delta;
+}
+
+// Test 1: Cross-tree binary-collapse move.
+// 12-leaf tree, move L1→L5.  i3 is binary → collapses.
+// Verify Fitch self-consistency and delta correctness.
+static void test_combined_fitch_cross_tree() {
+  std::println("test_combined_fitch_cross_tree");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+  int initial_parsimony = tree_state::compute_parsimony_from_index(idx);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L5);
+  assert(r.src_parent_collapsed);
+
+  int delta = apply_full_fitch_update(idx, r);
+  verify_fitch_self_consistent(idx);
+
+  // Verify delta matches actual parsimony change.
+  int final_parsimony = tree_state::compute_parsimony_from_index(idx);
+  if (initial_parsimony + delta != final_parsimony) {
+    std::println("  FAIL: delta={} initial={} final={} expected={}",
+                 delta, initial_parsimony, final_parsimony,
+                 final_parsimony - initial_parsimony);
+  }
+  assert(initial_parsimony + delta == final_parsimony);
+
+  std::println("  PASS");
+}
+
+// Test 2: Polytomy (ternary parent), no collapse.
+// 12-leaf tree, move L8→L3.  i6 is ternary → no collapse.
+static void test_combined_fitch_polytomy() {
+  std::println("test_combined_fitch_polytomy");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+  int initial_parsimony = tree_state::compute_parsimony_from_index(idx);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L8, t.L3);
+  assert(!r.src_parent_collapsed);
+
+  int delta = apply_full_fitch_update(idx, r);
+  verify_fitch_self_consistent(idx);
+
+  int final_parsimony = tree_state::compute_parsimony_from_index(idx);
+  assert(initial_parsimony + delta == final_parsimony);
+
+  std::println("  PASS");
+}
+
+// Test 3: LCA is tree root (L1→L12 — opposite ends of the tree).
+static void test_combined_fitch_lca_is_root() {
+  std::println("test_combined_fitch_lca_is_root");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+  int initial_parsimony = tree_state::compute_parsimony_from_index(idx);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L12);
+  assert(r.lca == t.root);
+
+  int delta = apply_full_fitch_update(idx, r);
+  verify_fitch_self_consistent(idx);
+
+  int final_parsimony = tree_state::compute_parsimony_from_index(idx);
+  assert(initial_parsimony + delta == final_parsimony);
+
+  std::println("  PASS");
+}
+
+// Test 4: Sibling collapse — LCA is src_parent and it collapses.
+// L1→L2: siblings under i3 (binary), so LCA == i3.
+// i3 collapses → effective_lca = i1 (grandparent).
+static void test_combined_fitch_lca_collapsed() {
+  std::println("test_combined_fitch_lca_collapsed");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+  int initial_parsimony = tree_state::compute_parsimony_from_index(idx);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L1, t.L2);
+  assert(r.src_parent_collapsed);
+  assert(r.src_parent == t.i3);
+  assert(r.lca == t.i3);  // LCA is src_parent
+  assert(r.grandparent == t.i1);
+
+  int delta = apply_full_fitch_update(idx, r);
+  verify_fitch_self_consistent(idx);
+
+  int final_parsimony = tree_state::compute_parsimony_from_index(idx);
+  assert(initial_parsimony + delta == final_parsimony);
+
+  std::println("  PASS");
+}
+
+// Test 5: src_parent == LCA, NOT collapsed (ternary parent at LCA).
+// L7→L3: i6 is ternary, LCA of L7 and L3 is i2 (binary parent of i5/i6),
+// but wait — L3 is under i4 which is under i1, not under i2.
+// Actually: L7 is under i6→i2→root, L3 is under i4→i1→root.
+// LCA of L7 and L3 is root.
+// For a case where src_parent == LCA and not collapsed, we need the LCA to
+// be the ternary src_parent.  L8→L9: L8 is under i6 (ternary), L9 is under
+// i7→i6.  LCA(L8, L9) = i6.  src_parent of L8 = i6 = LCA.  i6 is ternary
+// so no collapse.
+static void test_combined_fitch_lca_is_ternary_src_parent() {
+  std::println("test_combined_fitch_lca_is_ternary_src_parent");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+  int initial_parsimony = tree_state::compute_parsimony_from_index(idx);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L8, t.L9);
+  assert(!r.src_parent_collapsed);  // i6 is ternary
+  assert(r.src_parent == t.i6);
+  assert(r.lca == t.i6);  // LCA is src_parent
+
+  int delta = apply_full_fitch_update(idx, r);
+  verify_fitch_self_consistent(idx);
+
+  int final_parsimony = tree_state::compute_parsimony_from_index(idx);
+  assert(initial_parsimony + delta == final_parsimony);
+
+  std::println("  PASS");
+}
+
+// Test 6: Multiple SPR moves on the same tree, verifying after each.
+// Exercises sequential combined updates and cumulative delta tracking.
+static void test_combined_fitch_sequential() {
+  std::println("test_combined_fitch_sequential");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+  int running_parsimony = tree_state::compute_parsimony_from_index(idx);
+
+  struct move_spec {
+    std::size_t twelve_leaf_tree::*src;
+    std::size_t twelve_leaf_tree::*dst;
+    const char* desc;
+  };
+
+  move_spec moves[] = {
+      {&twelve_leaf_tree::L8, &twelve_leaf_tree::L3,
+       "polytomy_no_collapse (L8->L3)"},
+      {&twelve_leaf_tree::L1, &twelve_leaf_tree::L5,
+       "cross_tree_collapse (L1->L5)"},
+      {&twelve_leaf_tree::L11, &twelve_leaf_tree::L12,
+       "sibling_collapse (L11->L12)"},
+  };
+
+  for (auto const& [src_member, dst_member, desc] : moves) {
+    std::println("  subtest: {}", desc);
+
+    auto src = t.*src_member;
+    auto dst = t.*dst_member;
+
+    // Build a fresh index for LCA computation (DFS is stale after prior SPRs).
+    tree_index lca_idx{t.tree};
+    auto r = apply_spr_inplace(t.tree, lca_idx, src, dst);
+
+    int delta = apply_full_fitch_update(idx, r);
+    verify_fitch_self_consistent(idx);
+
+    running_parsimony += delta;
+    int actual_parsimony = tree_state::compute_parsimony_from_index(idx);
+    assert(running_parsimony == actual_parsimony);
+
+    std::println("    OK (parsimony: {} delta: {})", actual_parsimony, delta);
+  }
+
+  std::println("  PASS");
+}
+
+// Test 7: All six Phase 9 edge-case configurations verified via combined Fitch.
+// Each run starts from a fresh 12-leaf tree.
+static void test_combined_fitch_edge_cases() {
+  std::println("test_combined_fitch_edge_cases");
+
+  struct move_spec {
+    std::size_t twelve_leaf_tree::*src;
+    std::size_t twelve_leaf_tree::*dst;
+    const char* desc;
+  };
+
+  move_spec moves[] = {
+      {&twelve_leaf_tree::L3, &twelve_leaf_tree::L4,
+       "src_is_child_of_dst_parent (L3->L4, collapse)"},
+      {&twelve_leaf_tree::L7, &twelve_leaf_tree::L8,
+       "sibling_swap_ternary (L7->L8, no collapse)"},
+      {&twelve_leaf_tree::L1, &twelve_leaf_tree::L12,
+       "lca_is_tree_root (L1->L12)"},
+      {&twelve_leaf_tree::L1, &twelve_leaf_tree::L2,
+       "lca_collapses (L1->L2, sibling collapse)"},
+      {&twelve_leaf_tree::L8, &twelve_leaf_tree::L3,
+       "polytomy_no_collapse (L8->L3)"},
+      {&twelve_leaf_tree::L11, &twelve_leaf_tree::L12,
+       "move_to_adjacent (L11->L12, sibling collapse)"},
+  };
+
+  for (auto const& [src_member, dst_member, desc] : moves) {
+    std::println("  subtest: {}", desc);
+
+    auto t = make_12leaf_tree();
+    tree_index idx{t.tree};
+    int initial_parsimony = tree_state::compute_parsimony_from_index(idx);
+
+    auto src = t.*src_member;
+    auto dst = t.*dst_member;
+    auto r = apply_spr_inplace(t.tree, idx, src, dst);
+
+    int delta = apply_full_fitch_update(idx, r);
+    verify_fitch_self_consistent(idx);
+
+    int final_parsimony = tree_state::compute_parsimony_from_index(idx);
+    assert(initial_parsimony + delta == final_parsimony);
+
+    std::println("    OK (delta: {})", delta);
+  }
+
+  std::println("  PASS");
+}
+
+// Test 8: Non-zero delta — a move that changes parsimony.
+// L6→L10: L6 and L10 share a mutation at position 6 (both have T).
+// Moving L6 to be sibling of L10 reduces parsimony by grouping shared
+// mutations.  Validates delta tracking with a non-neutral move.
+static void test_combined_fitch_nonzero_delta() {
+  std::println("test_combined_fitch_nonzero_delta");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+  int initial_parsimony = tree_state::compute_parsimony_from_index(idx);
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L6, t.L10);
+
+  int delta = apply_full_fitch_update(idx, r);
+  verify_fitch_self_consistent(idx);
+
+  int final_parsimony = tree_state::compute_parsimony_from_index(idx);
+  assert(initial_parsimony + delta == final_parsimony);
+
+  // This move should improve parsimony (negative delta).
+  assert(delta < 0);
+  std::println("  delta={} (initial={} final={})", delta, initial_parsimony,
+               final_parsimony);
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 23: Validate incremental Fitch vs full rebuild on real data
+// ---------------------------------------------------------------------------
+
+// For each searchable node as src, pick a valid dst (not in src's subtree,
+// not src's parent), apply in-place SPR + combined Fitch update, verify:
+//   1. Fitch self-consistency (every inner node's Fitch matches children)
+//   2. Delta tracking (initial + sum(deltas) == recomputed parsimony)
+//   3. Compare against a fresh tree_index built on the modified DAG
+//      (after fitch_assign_compact_genomes + recompute_edge_mutations)
+static void test_incremental_fitch_vs_rebuild() {
+  std::println("test_incremental_fitch_vs_rebuild");
+
+  // Load a single protobuf tree and sample a min-weight tree.
+  auto dag = load_proto_dag("data/test_5_trees/tree_0.pb.gz");
+  recompute_compact_genomes(dag);
+  set_sample_ids_from_cg(dag);
+
+  parsimony_score_ops pops;
+  subtree_weight<parsimony_score_ops> sw(dag, 42u);
+  auto tree = sw.min_weight_sample_tree(pops);
+  fitch_assign_compact_genomes(tree);
+  recompute_edge_mutations(tree);
+
+  auto nn = node_count(tree);
+  std::println("  sampled tree: {} nodes", nn);
+
+  tree_index idx{tree};
+  int running_parsimony = tree_state::compute_parsimony_from_index(idx);
+  std::println("  initial parsimony: {}", running_parsimony);
+
+  auto nsites = idx.num_variable_sites();
+  std::println("  variable sites: {}", nsites);
+
+  std::mt19937 rng{123};
+  std::size_t moves_applied = 0;
+  std::size_t moves_target = 50;
+
+  // Collect initial searchable nodes (snapshot — list changes after SPRs).
+  auto searchable = idx.get_searchable_nodes();
+
+  for (std::size_t si = 0; si < searchable.size() && moves_applied < moves_target;
+       si++) {
+    auto src = searchable[si];
+    if (!idx.is_valid(src)) continue;
+
+    // Pick a valid dst: not in src's subtree, not src's parent, not src.
+    // Build a fresh index for DFS-based ancestor checks (DFS is stale
+    // after prior SPRs).
+    tree_index lca_idx{tree};
+    auto all_searchable = lca_idx.get_searchable_nodes();
+
+    std::size_t dst = 0;
+    bool found = false;
+    // Shuffle candidates to get variety.
+    std::vector<std::size_t> candidates(all_searchable.begin(),
+                                        all_searchable.end());
+    std::shuffle(candidates.begin(), candidates.end(), rng);
+
+    for (auto c : candidates) {
+      if (c == src) continue;
+      if (!lca_idx.is_valid(c)) continue;
+      // dst must not be in src's subtree.
+      if (lca_idx.is_ancestor(src, c)) continue;
+      // dst must not be src's parent (trivial move).
+      if (c == lca_idx.get_parent(src)) continue;
+      dst = c;
+      found = true;
+      break;
+    }
+    if (!found) continue;
+
+    // Apply in-place SPR + combined Fitch update.
+    auto r = apply_spr_inplace(tree, lca_idx, src, dst);
+    int delta = apply_full_fitch_update(idx, r);
+
+    // 1. Fitch self-consistency.
+    verify_fitch_self_consistent(idx);
+
+    // 2. Delta tracking.
+    running_parsimony += delta;
+    int actual = tree_state::compute_parsimony_from_index(idx);
+    if (running_parsimony != actual) {
+      std::println("  FAIL: move {} src={} dst={} delta={} running={} actual={}",
+                   moves_applied, src, dst, delta, running_parsimony, actual);
+    }
+    assert(running_parsimony == actual);
+
+    // 3. Compare against fresh rebuild.
+    // Assign CGs to inner nodes from current Fitch, then rebuild.
+    fitch_assign_compact_genomes(tree);
+    recompute_edge_mutations(tree);
+    tree_index fresh{tree};
+
+    // Variable sites must match.
+    assert(idx.num_variable_sites() == fresh.num_variable_sites());
+
+    // Compare Fitch sets at all valid nodes.
+    for (std::size_t nid = 0; nid < idx.num_nodes() && nid < fresh.num_nodes();
+         nid++) {
+      if (!idx.is_valid(nid)) continue;
+      if (!fresh.is_valid(nid)) continue;
+      for (std::size_t s = 0; s < nsites; s++) {
+        uint8_t inc = idx.get_fitch_set(nid, s);
+        uint8_t ref = fresh.get_fitch_set(nid, s);
+        if (inc != ref) {
+          std::println("  FAIL: move {} node {} site {}: inc=0x{:x} ref=0x{:x}",
+                       moves_applied, nid, s, inc, ref);
+        }
+        assert(inc == ref);
+      }
+    }
+
+    moves_applied++;
+    if (moves_applied % 10 == 0) {
+      std::println("  {} moves verified (parsimony={})", moves_applied, actual);
+    }
+  }
+
+  std::println("  total: {} moves verified, final parsimony={}",
+               moves_applied, running_parsimony);
+  assert(moves_applied > 0);
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 24 tests: compute_parsimony_score (flat iteration)
+// ---------------------------------------------------------------------------
+
+// Verify compute_parsimony_score matches the recursive version.
+static void test_compute_parsimony_score_basic() {
+  std::println("test_compute_parsimony_score_basic");
+
+  auto tree = make_suboptimal_tree();
+  recompute_edge_mutations(tree);
+  tree_index idx{tree};
+
+  int flat = idx.compute_parsimony_score();
+  int recursive = tree_state::compute_parsimony_from_index(idx);
+
+  assert(flat == recursive);
+  std::println("  flat={} recursive={}", flat, recursive);
+  std::println("  PASS");
+}
+
+// Verify on the 12-leaf tree.
+static void test_compute_parsimony_score_12leaf() {
+  std::println("test_compute_parsimony_score_12leaf");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+
+  int flat = idx.compute_parsimony_score();
+  int recursive = tree_state::compute_parsimony_from_index(idx);
+
+  assert(flat == recursive);
+  std::println("  score={}", flat);
+  std::println("  PASS");
+}
+
+// Verify after an SPR that changes parsimony.
+static void test_compute_parsimony_score_after_spr() {
+  std::println("test_compute_parsimony_score_after_spr");
+
+  auto t = make_12leaf_tree();
+  tree_index idx{t.tree};
+  int before = idx.compute_parsimony_score();
+
+  auto r = apply_spr_inplace(t.tree, idx, t.L6, t.L10);
+  apply_full_fitch_update(idx, r);
+
+  int flat = idx.compute_parsimony_score();
+  int recursive = tree_state::compute_parsimony_from_index(idx);
+
+  assert(flat == recursive);
+  assert(flat != before);  // L6→L10 changes parsimony
+  std::println("  before={} after={}", before, flat);
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 26 tests: tree_state::apply_move
+// ---------------------------------------------------------------------------
+
+// Apply 5 sequential moves via apply_move, verify parsimony after each.
+static void test_apply_move_sequential() {
+  std::println("test_apply_move_sequential");
+
+  auto t = make_12leaf_tree();
+  tree_state state{t.tree};
+  int initial = state.parsimony_score;
+  std::println("  initial parsimony={}", initial);
+
+  struct move_spec {
+    std::size_t twelve_leaf_tree::*src;
+    std::size_t twelve_leaf_tree::*dst;
+    const char* desc;
+  };
+
+  move_spec moves[] = {
+      {&twelve_leaf_tree::L6, &twelve_leaf_tree::L10,
+       "L6->L10 (improving move)"},
+      {&twelve_leaf_tree::L8, &twelve_leaf_tree::L3,
+       "L8->L3 (ternary)"},
+      {&twelve_leaf_tree::L1, &twelve_leaf_tree::L5,
+       "L1->L5 (collapse)"},
+      {&twelve_leaf_tree::L11, &twelve_leaf_tree::L12,
+       "L11->L12 (sibling)"},
+      {&twelve_leaf_tree::L3, &twelve_leaf_tree::L4,
+       "L3->L4 (dst child of src parent)"},
+  };
+
+  for (auto const& [src_member, dst_member, desc] : moves) {
+    auto src = t.*src_member;
+    auto dst = t.*dst_member;
+
+    int delta = state.apply_move(src, dst);
+
+    // Verify parsimony matches full recomputation.
+    int recomputed = tree_state::compute_parsimony_from_index(state.index);
+    if (state.parsimony_score != recomputed) {
+      std::println("  FAIL: {} delta={} score={} recomputed={}",
+                   desc, delta, state.parsimony_score, recomputed);
+    }
+    assert(state.parsimony_score == recomputed);
+
+    // Also verify flat compute_parsimony_score matches.
+    assert(state.index.compute_parsimony_score() == recomputed);
+
+    std::println("  {} delta={} parsimony={}", desc, delta,
+                 state.parsimony_score);
+  }
+
+  assert(state.step_count == 5);
+  std::println("  step_count={}", state.step_count);
+  std::println("  PASS");
+}
+
+// Apply moves via apply_move on real data (50 moves).
+static void test_apply_move_real_data() {
+  std::println("test_apply_move_real_data");
+
+  auto dag = load_proto_dag("data/test_5_trees/tree_0.pb.gz");
+  recompute_compact_genomes(dag);
+  set_sample_ids_from_cg(dag);
+
+  parsimony_score_ops pops;
+  subtree_weight<parsimony_score_ops> sw(dag, 42u);
+  auto tree = sw.min_weight_sample_tree(pops);
+  fitch_assign_compact_genomes(tree);
+  recompute_edge_mutations(tree);
+
+  tree_state state{tree};
+  std::println("  initial: {} nodes, parsimony={}",
+               node_count(tree), state.parsimony_score);
+
+  std::mt19937 rng{456};
+  std::size_t moves_applied = 0;
+
+  for (std::size_t i = 0; i < 50; i++) {
+    auto const& searchable = state.index.get_searchable_nodes();
+    if (searchable.empty()) break;
+
+    // Pick a random src.
+    auto src = searchable[rng() % searchable.size()];
+    if (!state.index.is_valid(src)) continue;
+
+    // Pick a valid dst.
+    std::vector<std::size_t> candidates(searchable.begin(), searchable.end());
+    std::shuffle(candidates.begin(), candidates.end(), rng);
+
+    bool found = false;
+    for (auto dst : candidates) {
+      if (dst == src) continue;
+      if (!state.index.is_valid(dst)) continue;
+      if (state.index.is_ancestor(src, dst)) continue;
+      if (dst == state.index.get_parent(src)) continue;
+
+      state.apply_move(src, dst);
+
+      int recomputed = tree_state::compute_parsimony_from_index(state.index);
+      assert(state.parsimony_score == recomputed);
+      assert(state.index.compute_parsimony_score() == recomputed);
+
+      moves_applied++;
+      found = true;
+      break;
+    }
+    if (!found) continue;
+
+    if (moves_applied % 10 == 0) {
+      std::println("  {} moves, parsimony={}", moves_applied,
+                   state.parsimony_score);
+    }
+  }
+
+  std::println("  total: {} moves, final parsimony={}, step_count={}",
+               moves_applied, state.parsimony_score, state.step_count);
+  assert(moves_applied == state.step_count);
+  assert(moves_applied > 0);
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 27 tests: extract_fragment
+// ---------------------------------------------------------------------------
+
+// Collect leaf sample IDs from a DAG.
+static std::set<std::string> get_leaf_ids(phylo_dag& d) {
+  std::set<std::string> ids;
+  for (auto nv : d.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.sample_id(); })
+            ids.insert(node.sample_id());
+        },
+        nv);
+  }
+  return ids;
+}
+
+// Apply 3 SPR moves via apply_move, extract fragment, verify validity.
+static void test_extract_fragment_basic() {
+  std::println("test_extract_fragment_basic");
+
+  auto t = make_12leaf_tree();
+  tree_state state{t.tree};
+  auto original_leaves = get_leaf_ids(t.tree);
+
+  // Apply 3 moves.
+  state.apply_move(t.L6, t.L10);
+  state.apply_move(t.L8, t.L3);
+  state.apply_move(t.L1, t.L5);
+
+  auto fragment = extract_fragment(t.tree);
+
+  // Fragment must be a valid tree.
+  assert(is_tree(fragment));
+
+  // Fragment must have the same leaf set.
+  auto frag_leaves = get_leaf_ids(fragment);
+  assert(frag_leaves == original_leaves);
+
+  // Fragment's parsimony must match tree_state's running score.
+  recompute_edge_mutations(fragment);
+  tree_index frag_idx{fragment};
+  int frag_parsimony = tree_state::compute_parsimony_from_index(frag_idx);
+  assert(frag_parsimony == state.parsimony_score);
+
+  std::println("  fragment: {} nodes, {} edges, parsimony={}",
+               node_count(fragment), edge_count(fragment), frag_parsimony);
+  std::println("  PASS");
+}
+
+// Extract fragment from real data after 10 moves.
+static void test_extract_fragment_real_data() {
+  std::println("test_extract_fragment_real_data");
+
+  auto dag = load_proto_dag("data/test_5_trees/tree_0.pb.gz");
+  recompute_compact_genomes(dag);
+  set_sample_ids_from_cg(dag);
+
+  parsimony_score_ops pops;
+  subtree_weight<parsimony_score_ops> sw(dag, 42u);
+  auto tree = sw.min_weight_sample_tree(pops);
+  fitch_assign_compact_genomes(tree);
+  recompute_edge_mutations(tree);
+
+  auto original_leaves = get_leaf_ids(tree);
+  tree_state state{tree};
+
+  std::mt19937 rng{789};
+  std::size_t moves_done = 0;
+
+  for (std::size_t i = 0; i < 10; i++) {
+    auto const& searchable = state.index.get_searchable_nodes();
+    if (searchable.empty()) break;
+
+    auto src = searchable[rng() % searchable.size()];
+    if (!state.index.is_valid(src)) continue;
+
+    std::vector<std::size_t> candidates(searchable.begin(), searchable.end());
+    std::shuffle(candidates.begin(), candidates.end(), rng);
+
+    for (auto dst : candidates) {
+      if (dst == src || !state.index.is_valid(dst)) continue;
+      if (state.index.is_ancestor(src, dst)) continue;
+      if (dst == state.index.get_parent(src)) continue;
+
+      state.apply_move(src, dst);
+      moves_done++;
+      break;
+    }
+  }
+
+  auto fragment = extract_fragment(tree);
+
+  assert(is_tree(fragment));
+  assert(get_leaf_ids(fragment) == original_leaves);
+
+  tree_index frag_idx{fragment};
+  int frag_parsimony = tree_state::compute_parsimony_from_index(frag_idx);
+  assert(frag_parsimony == state.parsimony_score);
+
+  std::println("  {} moves applied, fragment parsimony={}", moves_done,
+               frag_parsimony);
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -5182,6 +5886,32 @@ int main() {
   test_update_fitch_insertion_basic();
   test_update_fitch_insertion_early_termination();
 
-  std::println("All inplace SPR phase 1-21 tests passed!");
+  // Phase 22: update_fitch (combined)
+  test_combined_fitch_cross_tree();
+  test_combined_fitch_polytomy();
+  test_combined_fitch_lca_is_root();
+  test_combined_fitch_lca_collapsed();
+  test_combined_fitch_lca_is_ternary_src_parent();
+  test_combined_fitch_sequential();
+  test_combined_fitch_edge_cases();
+  test_combined_fitch_nonzero_delta();
+
+  // Phase 23: incremental Fitch vs full rebuild (real data)
+  test_incremental_fitch_vs_rebuild();
+
+  // Phase 24: compute_parsimony_score (flat)
+  test_compute_parsimony_score_basic();
+  test_compute_parsimony_score_12leaf();
+  test_compute_parsimony_score_after_spr();
+
+  // Phase 26: tree_state::apply_move
+  test_apply_move_sequential();
+  test_apply_move_real_data();
+
+  // Phase 27: extract_fragment
+  test_extract_fragment_basic();
+  test_extract_fragment_real_data();
+
+  std::println("All inplace SPR phase 1-27 tests passed!");
   return 0;
 }
