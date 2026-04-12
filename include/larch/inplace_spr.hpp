@@ -397,6 +397,7 @@ inline int tree_state::apply_move(std::size_t src, std::size_t dst) {
 // Cost: O(N + N × sites) — not on the hot path of the multi-step loop.
 inline phylo_dag extract_fragment(phylo_dag& tree) {
   auto [fragment, _] = clone_tree(tree);
+  build_clade_offsets(fragment);  // restore fast-path get_clades()
   fitch_assign_compact_genomes(fragment);
   recompute_edge_mutations(fragment);
   set_sample_ids_from_cg(fragment);
