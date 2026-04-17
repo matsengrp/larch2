@@ -1157,21 +1157,21 @@ static bool inplace_drift_escape(merge& m, args const& a, std::mt19937& rng,
               std::to_string(result.initial_score) + " -> " +
               std::to_string(result.final_score));
 
-    if (result.escaped) {
-      // Recheck DAG-level score
-      auto& new_dag = m.get_result();
-      std::size_t new_score = 0;
-      {
-        scoped_arena<4096> arena;
-        parsimony_score_ops pops;
-        subtree_weight<parsimony_score_ops> sw(new_dag, rng(), arena.get());
-        new_score = sw.compute_weight_below(get_root_idx(new_dag), pops);
-      }
-      if (new_score < dag_score) {
-        std::cerr << "  Inplace drift " << (di + 1) << ": escaped! "
-                  << dag_score << " -> " << new_score << "\n";
-        return true;
-      }
+    // Always re-check DAG-level score: every_step fragments may have lowered
+    // dag_score even when result.escaped is false (intermediate trajectory state
+    // emitted as fragment but trajectory final state worsened).
+    auto& new_dag = m.get_result();
+    std::size_t new_score = 0;
+    {
+      scoped_arena<4096> arena;
+      parsimony_score_ops pops;
+      subtree_weight<parsimony_score_ops> sw(new_dag, rng(), arena.get());
+      new_score = sw.compute_weight_below(get_root_idx(new_dag), pops);
+    }
+    if (new_score < dag_score) {
+      std::cerr << "  Inplace drift " << (di + 1) << ": escaped! "
+                << dag_score << " -> " << new_score << "\n";
+      return true;
     }
   }
 
