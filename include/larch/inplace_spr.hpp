@@ -461,59 +461,70 @@ struct inplace_move_producer {
 
   // Core loop: clone the sampled tree, build tree_state, run up to
   // max_steps in-place SPR moves, emit fragments via frag_cb.
+  //
+  // If work_tree_out is non-null, the trajectory-endpoint tree is moved
+  // into *work_tree_out before return (used by drift_escape_combined in
+  // larch2.cpp to do fanout scoring from the endpoint).
   inline inplace_result operator()(phylo_dag& tree,
                                    std::function<void(phylo_dag)> frag_cb,
-                                   std::mt19937& rng) {
+                                   std::mt19937& rng,
+                                   phylo_dag* work_tree_out = nullptr) {
     auto [work_tree, _] = clone_tree(tree);
     fitch_assign_compact_genomes(work_tree);
     recompute_edge_mutations(work_tree);
     set_sample_ids_from_cg(work_tree);
 
-    tree_state state{work_tree, pool};
-    int initial_score = state.parsimony_score;
-    int cumulative_worsening = 0;
+    inplace_result result{};
+    {
+      tree_state state{work_tree, pool};
+      int initial_score = state.parsimony_score;
+      int cumulative_worsening = 0;
 
-    auto radius = params.radius > 0 ? params.radius
-                                     : compute_tree_max_depth(work_tree) * 2;
-    if (radius == 0) radius = 1;
+      auto radius = params.radius > 0 ? params.radius
+                                       : compute_tree_max_depth(work_tree) * 2;
+      if (radius == 0) radius = 1;
 
-    std::size_t steps = 0;
-    for (; steps < params.max_steps; ++steps) {
-      move_enumerator enumerator{state.index, params.accept_threshold};
-      std::vector<profitable_move> candidates;
-      enumerator.find_all_moves_parallel(
-          radius, [&](auto& m) { candidates.push_back(m); }, pool);
+      std::size_t steps = 0;
+      for (; steps < params.max_steps; ++steps) {
+        move_enumerator enumerator{state.index, params.accept_threshold};
+        std::vector<profitable_move> candidates;
+        enumerator.find_all_moves_parallel(
+            radius, [&](auto& m) { candidates.push_back(m); }, pool);
 
-      if (candidates.empty()) break;
+        if (candidates.empty()) break;
 
-      std::sort(candidates.begin(), candidates.end(),
-                [](auto& a, auto& b) { return a.score_change < b.score_change; });
+        std::sort(candidates.begin(), candidates.end(),
+                  [](auto& a, auto& b) { return a.score_change < b.score_change; });
 
-      auto& chosen = select_move(candidates, rng, steps);
+        auto& chosen = select_move(candidates, rng, steps);
 
-      if (chosen.score_change > 0) {
-        cumulative_worsening += chosen.score_change;
-        if (params.worsening_budget &&
-            cumulative_worsening > *params.worsening_budget)
-          break;
+        if (chosen.score_change > 0) {
+          cumulative_worsening += chosen.score_change;
+          if (params.worsening_budget &&
+              cumulative_worsening > *params.worsening_budget)
+            break;
+        }
+
+        state.apply_move(chosen.src, chosen.dst);
+
+        if (params.frag_mode == fragment_strategy::every_step)
+          frag_cb(extract_fragment(state.tree));
       }
 
-      state.apply_move(chosen.src, chosen.dst);
-
-      if (params.frag_mode == fragment_strategy::every_step)
+      bool escaped = state.parsimony_score < initial_score;
+      if (params.frag_mode == fragment_strategy::final_only && steps > 0)
         frag_cb(extract_fragment(state.tree));
-    }
 
-    bool escaped = state.parsimony_score < initial_score;
-    if (params.frag_mode == fragment_strategy::final_only && steps > 0)
-      frag_cb(extract_fragment(state.tree));
+      result = inplace_result{
+          .initial_score = initial_score,
+          .final_score = state.parsimony_score,
+          .steps_taken = steps,
+          .escaped = escaped,
+      };
+    }  // state (and its tree_index) destroyed before we move work_tree
 
-    return inplace_result{
-        .initial_score = initial_score,
-        .final_score = state.parsimony_score,
-        .steps_taken = steps,
-        .escaped = escaped,
-    };
+    if (work_tree_out) *work_tree_out = std::move(work_tree);
+    return result;
   }
 
  private:

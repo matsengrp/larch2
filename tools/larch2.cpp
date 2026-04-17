@@ -358,6 +358,7 @@ Optimization:
   --inplace-temperature <F> Simulated annealing initial temperature (default: 0 = greedy)
   --inplace-cooling <F>  Annealing cooling rate (default: 0.9)
   --inplace-fragments <S> Fragment strategy: every|final (default: final)
+  --drift-mode <M>       Drift strategy: auto (default: inplace if --inplace-steps>0 else legacy), legacy, inplace, combine
   --optimizer <name>      "native" (default) or "random"
   --max-moves <N>         Max moves per iteration for native (default: 50)
   --seed <N>              Random seed
@@ -398,6 +399,10 @@ Other:
 )";
 }
 
+// Drift-escape mechanism: "auto" preserves the pre-combiner dispatch
+// (inplace if --inplace-steps > 0, else legacy).
+enum class drift_mode_t { auto_, legacy, inplace, combine };
+
 struct args {
   std::string dag_pb;
   std::string tree_pb;
@@ -435,6 +440,7 @@ struct args {
   double inplace_temperature = 0.0;
   double inplace_cooling = 0.9;
   std::string inplace_fragments = "final";
+  drift_mode_t drift_mode = drift_mode_t::auto_;
 };
 
 static args parse_args(int argc, char** argv) {
@@ -525,6 +531,16 @@ static args parse_args(int argc, char** argv) {
       a.inplace_cooling = std::stod(std::string{next()});
     } else if (arg == "--inplace-fragments") {
       a.inplace_fragments = next();
+    } else if (arg == "--drift-mode") {
+      std::string_view v = next();
+      if (v == "auto") a.drift_mode = drift_mode_t::auto_;
+      else if (v == "legacy") a.drift_mode = drift_mode_t::legacy;
+      else if (v == "inplace") a.drift_mode = drift_mode_t::inplace;
+      else if (v == "combine") a.drift_mode = drift_mode_t::combine;
+      else {
+        std::cerr << "error: --drift-mode must be auto|legacy|inplace|combine\n";
+        std::exit(1);
+      }
     } else if (arg == "--version") {
       std::cerr << "larch2 " << larch::version << " (" << larch::git_commit
                 << ")\n";
@@ -1303,12 +1319,164 @@ static bool drift_escape_legacy(merge& m, args const& a, std::mt19937& rng,
   return false;
 }
 
-// Dispatch to inplace or legacy drift based on --inplace-steps.
+// Combined drift escape — inplace-trajectory prefix + legacy-style fanout
+// scoring from trajectory endpoint per attempt. Combines inplace's deeper
+// reachable neighborhood with legacy's per-attempt fragment density.
+//
+// Motivation: s85 calibration data. Legacy reaches 629 from seed44 stage5
+// 630-plateau in ~1 attempt (50× fanout/attempt, reachable at 1-5 steps).
+// Inplace-greedy needs ~53 attempts at same plateau (10× density, but
+// potentially deeper reach). Combining both phases per attempt should not
+// regress the dense-local case and should extend reach on deeper plateaus.
+static bool drift_escape_combined(merge& m, args const& a, std::mt19937& rng,
+                                  progress& prog) {
+  auto& pool = thread_pool::get_default();
+  std::size_t drift_iters = a.drift.value_or(0);
+  if (drift_iters == 0) return false;
+
+  // Default the inplace-prefix to ~legacy-length when user didn't specify.
+  // All other inplace-* args already default to combiner-safe values
+  // (threshold=0, budget=unset, temperature=0, fragments=final).
+  std::size_t prefix_steps = a.inplace_steps > 0 ? a.inplace_steps : 5;
+
+  auto frag_mode = (a.inplace_fragments == "every")
+                       ? fragment_strategy::every_step
+                       : fragment_strategy::final_only;
+  auto selector = drift_default_selector(a.inplace_temperature);
+
+  inplace_params params{
+      .max_steps = prefix_steps,
+      .accept_threshold = a.inplace_threshold,
+      .worsening_budget = a.inplace_budget,
+      .selector = selector,
+      .frag_mode = frag_mode,
+      .temperature = a.inplace_temperature,
+      .cooling_rate = a.inplace_cooling,
+  };
+
+  std::cerr << "Entering combined drift mode for " << drift_iters
+            << " iterations (" << prefix_steps << " prefix steps/iter)\n";
+
+  std::size_t dag_score = 0;
+  {
+    auto& dag = m.get_result();
+    scoped_arena<4096> arena;
+    parsimony_score_ops pops;
+    subtree_weight<parsimony_score_ops> sw(dag, rng(), arena.get());
+    dag_score = sw.compute_weight_below(get_root_idx(dag), pops);
+  }
+
+  for (std::size_t di = 0; di < drift_iters; ++di) {
+    // Phase A: sample fresh tree from DAG, run inplace prefix.
+    prog.phase("Combined drift " + std::to_string(di + 1) + ": sampling");
+    auto& dag = m.get_result();
+    std::uint32_t seed = rng();
+    std::size_t score = 0;
+    auto tree = sample_tree_from_dag(dag, m, a.sample_method, a.sample_uniformly,
+                                     a.ignore_root_edge_mutations, seed, score);
+    fitch_assign_compact_genomes(tree);
+    recompute_edge_mutations(tree);
+    set_sample_ids_from_cg(tree);
+    prog.done("score " + std::to_string(dag_score));
+
+    prog.phase("Combined drift " + std::to_string(di + 1) + ": inplace prefix");
+    phylo_dag drifted;
+    inplace_move_producer producer{params, pool};
+    auto result = producer(
+        tree, [&](phylo_dag frag) { m.add_dag(std::move(frag)); }, rng,
+        &drifted);
+    prog.done(std::to_string(result.steps_taken) + " steps, " +
+              std::to_string(result.initial_score) + " -> " +
+              std::to_string(result.final_score));
+
+    // Re-assert the fitch/mutation/ids invariants on the trajectory-endpoint
+    // tree so fanout scoring operates on a fully consistent state regardless
+    // of any differences the producer's incremental updates may leave behind.
+    fitch_assign_compact_genomes(drifted);
+    recompute_edge_mutations(drifted);
+    set_sample_ids_from_cg(drifted);
+
+    // Phase B: fanout-score from trajectory endpoint at 2×depth radius.
+    prog.phase("Combined drift " + std::to_string(di + 1) + ": scoring");
+    tree_index drift_idx{drifted, pool};
+    move_enumerator drift_enum{drift_idx, -1};
+    auto drift_radius = compute_tree_max_depth(drifted) * 2;
+    if (drift_radius == 0) drift_radius = 1;
+
+    std::vector<profitable_move> improving;
+    drift_enum.find_all_moves_parallel(drift_radius,
+        [&](profitable_move const& mv) {
+          if (mv.score_change < 0) improving.push_back(mv);
+        }, pool);
+    prog.done(std::to_string(improving.size()) + " improving");
+
+    if (!improving.empty()) {
+      std::sort(improving.begin(), improving.end(),
+                [](auto& x, auto& y) { return x.score_change < y.score_change; });
+      if (improving.size() > a.max_moves) improving.resize(a.max_moves);
+
+      std::vector<spr_move> spr_moves;
+      spr_moves.reserve(improving.size());
+      for (auto& mv : improving)
+        spr_moves.push_back(spr_move{.src = mv.src,
+                                     .dst = mv.dst,
+                                     .lca = mv.lca,
+                                     .score_change = mv.score_change});
+
+      prog.phase("Combined drift " + std::to_string(di + 1) + ": merging");
+      std::vector<phylo_dag> fragments(spr_moves.size());
+      parallel_with_progress(
+          pool, spr_moves.size(),
+          [&](std::size_t i) {
+            fragments[i] = apply_spr_as_fragment(drifted, spr_moves[i]);
+          },
+          prog);
+      for (auto& frag : fragments) m.add_dag(std::move(frag));
+      m.add_dag(drifted);
+      prog.done(std::to_string(m.result_node_count()) + " nodes");
+    }
+
+    // Always re-check DAG-level score (f6cf037 invariant): prefix and fanout
+    // fragments may have lowered dag_score even when neither phase by itself
+    // escaped.
+    auto& new_dag = m.get_result();
+    std::size_t new_score = 0;
+    {
+      scoped_arena<4096> arena;
+      parsimony_score_ops pops;
+      subtree_weight<parsimony_score_ops> sw(new_dag, rng(), arena.get());
+      new_score = sw.compute_weight_below(get_root_idx(new_dag), pops);
+    }
+    if (new_score < dag_score) {
+      std::cerr << "  Combined drift " << (di + 1) << ": escaped! "
+                << dag_score << " -> " << new_score << "\n";
+      return true;
+    }
+  }
+
+  std::cerr << "Combined drift: no escape after " << drift_iters
+            << " iterations\n";
+  return false;
+}
+
+// Dispatch to drift mechanism. In `auto` mode, preserve the pre-combiner
+// dispatch (inplace if --inplace-steps > 0, else legacy). Explicit modes
+// force the corresponding mechanism.
 static bool drift_escape(merge& m, args const& a, std::mt19937& rng,
                           progress& prog) {
-  if (a.inplace_steps > 0)
-    return inplace_drift_escape(m, a, rng, prog);
-  return drift_escape_legacy(m, a, rng, prog);
+  switch (a.drift_mode) {
+    case drift_mode_t::legacy:
+      return drift_escape_legacy(m, a, rng, prog);
+    case drift_mode_t::inplace:
+      return inplace_drift_escape(m, a, rng, prog);
+    case drift_mode_t::combine:
+      return drift_escape_combined(m, a, rng, prog);
+    case drift_mode_t::auto_:
+      if (a.inplace_steps > 0)
+        return inplace_drift_escape(m, a, rng, prog);
+      return drift_escape_legacy(m, a, rng, prog);
+  }
+  __builtin_unreachable();
 }
 
 // ---------------------------------------------------------------------------
