@@ -358,7 +358,8 @@ Optimization:
   --inplace-temperature <F> Simulated annealing initial temperature (default: 0 = greedy)
   --inplace-cooling <F>  Annealing cooling rate (default: 0.9)
   --inplace-fragments <S> Fragment strategy: every|final (default: final)
-  --drift-mode <M>       Drift strategy: auto (default: inplace if --inplace-steps>0 else legacy), legacy, inplace, combine
+  --drift-mode <M>       Drift strategy: auto (default: inplace if --inplace-steps>0 else legacy), legacy, inplace, combine, combine-lwf
+  --drift-seed <N>        RNG seed used inside drift_escape_* (default: fixed constant; set to vary drift independently of --seed)
   --optimizer <name>      "native" (default) or "random"
   --max-moves <N>         Max moves per iteration for native (default: 50)
   --seed <N>              Random seed
@@ -401,7 +402,7 @@ Other:
 
 // Drift-escape mechanism: "auto" preserves the pre-combiner dispatch
 // (inplace if --inplace-steps > 0, else legacy).
-enum class drift_mode_t { auto_, legacy, inplace, combine };
+enum class drift_mode_t { auto_, legacy, inplace, combine, combine_lwf };
 
 struct args {
   std::string dag_pb;
@@ -441,6 +442,7 @@ struct args {
   double inplace_cooling = 0.9;
   std::string inplace_fragments = "final";
   drift_mode_t drift_mode = drift_mode_t::auto_;
+  std::optional<std::uint32_t> drift_seed;
 };
 
 static args parse_args(int argc, char** argv) {
@@ -537,10 +539,13 @@ static args parse_args(int argc, char** argv) {
       else if (v == "legacy") a.drift_mode = drift_mode_t::legacy;
       else if (v == "inplace") a.drift_mode = drift_mode_t::inplace;
       else if (v == "combine") a.drift_mode = drift_mode_t::combine;
+      else if (v == "combine-lwf") a.drift_mode = drift_mode_t::combine_lwf;
       else {
-        std::cerr << "error: --drift-mode must be auto|legacy|inplace|combine\n";
+        std::cerr << "error: --drift-mode must be auto|legacy|inplace|combine|combine-lwf\n";
         std::exit(1);
       }
+    } else if (arg == "--drift-seed") {
+      a.drift_seed = static_cast<std::uint32_t>(std::stoull(std::string{next()}));
     } else if (arg == "--version") {
       std::cerr << "larch2 " << larch::version << " (" << larch::git_commit
                 << ")\n";
@@ -1120,11 +1125,17 @@ struct patience_checker {
 
 // In-place drift escape — uses inplace_move_producer for efficient
 // incremental tree_index updates instead of full rebuilds per step.
-static bool inplace_drift_escape(merge& m, args const& a, std::mt19937& rng,
+static bool inplace_drift_escape(merge& m, args const& a,
+                                 [[maybe_unused]] std::mt19937& outer_rng,
                                  progress& prog) {
   auto& pool = thread_pool::get_default();
   std::size_t drift_iters = a.drift.value_or(0);
   if (drift_iters == 0) return false;
+
+  // Re-seed locally so drift behavior is reproducible across modes regardless
+  // of how many RNG draws the pre-drift pipeline consumed.
+  std::uint32_t drift_seed = a.drift_seed.value_or(0xD1F75EEDu);
+  std::mt19937 rng(drift_seed);
 
   auto frag_mode = (a.inplace_fragments == "every")
                        ? fragment_strategy::every_step
@@ -1142,7 +1153,8 @@ static bool inplace_drift_escape(merge& m, args const& a, std::mt19937& rng,
   };
 
   std::cerr << "Entering inplace drift mode for " << drift_iters
-            << " iterations (" << a.inplace_steps << " steps/iter)\n";
+            << " iterations (" << a.inplace_steps
+            << " steps/iter, drift_seed=" << drift_seed << ")\n";
 
   std::size_t dag_score = 0;
   {
@@ -1197,13 +1209,20 @@ static bool inplace_drift_escape(merge& m, args const& a, std::mt19937& rng,
 }
 
 // Legacy drift escape — full tree_index rebuild per step.
-static bool drift_escape_legacy(merge& m, args const& a, std::mt19937& rng,
+static bool drift_escape_legacy(merge& m, args const& a,
+                                [[maybe_unused]] std::mt19937& outer_rng,
                                 progress& prog) {
   auto& pool = thread_pool::get_default();
   std::size_t drift_iters = a.drift.value_or(0);
   if (drift_iters == 0) return false;
 
-  std::cerr << "Entering drift mode for " << drift_iters << " iterations\n";
+  // Re-seed locally so drift behavior is reproducible across modes regardless
+  // of how many RNG draws the pre-drift pipeline consumed.
+  std::uint32_t drift_seed = a.drift_seed.value_or(0xD1F75EEDu);
+  std::mt19937 rng(drift_seed);
+
+  std::cerr << "Entering drift mode for " << drift_iters
+            << " iterations (drift_seed=" << drift_seed << ")\n";
 
   std::size_t dag_score = 0;
   {
@@ -1328,11 +1347,17 @@ static bool drift_escape_legacy(merge& m, args const& a, std::mt19937& rng,
 // Inplace-greedy needs ~53 attempts at same plateau (10× density, but
 // potentially deeper reach). Combining both phases per attempt should not
 // regress the dense-local case and should extend reach on deeper plateaus.
-static bool drift_escape_combined(merge& m, args const& a, std::mt19937& rng,
+static bool drift_escape_combined(merge& m, args const& a,
+                                  [[maybe_unused]] std::mt19937& outer_rng,
                                   progress& prog) {
   auto& pool = thread_pool::get_default();
   std::size_t drift_iters = a.drift.value_or(0);
   if (drift_iters == 0) return false;
+
+  // Re-seed locally so drift behavior is reproducible across modes regardless
+  // of how many RNG draws the pre-drift pipeline consumed.
+  std::uint32_t drift_seed = a.drift_seed.value_or(0xD1F75EEDu);
+  std::mt19937 rng(drift_seed);
 
   // Default the inplace-prefix to ~legacy-length when user didn't specify.
   // All other inplace-* args already default to combiner-safe values
@@ -1355,7 +1380,8 @@ static bool drift_escape_combined(merge& m, args const& a, std::mt19937& rng,
   };
 
   std::cerr << "Entering combined drift mode for " << drift_iters
-            << " iterations (" << prefix_steps << " prefix steps/iter)\n";
+            << " iterations (" << prefix_steps
+            << " prefix steps/iter, drift_seed=" << drift_seed << ")\n";
 
   std::size_t dag_score = 0;
   {
@@ -1459,6 +1485,141 @@ static bool drift_escape_combined(merge& m, args const& a, std::mt19937& rng,
   return false;
 }
 
+// Combined-with-legacy-walk drift escape — Option A gate test. Uses
+// drift_escape_legacy's walk code (rebuilt tree_index per step, strictly
+// neutral filter, no fragment emission) instead of inplace_move_producer,
+// while preserving the combiner's fanout-from-endpoint and f6cf037 DAG-recheck.
+// Lets us isolate whether combine's drift-attempt overhead lives in the walk
+// or in the surrounding combiner structure.
+static bool drift_escape_combined_lwf(merge& m, args const& a,
+                                      [[maybe_unused]] std::mt19937& outer_rng,
+                                      progress& prog) {
+  auto& pool = thread_pool::get_default();
+  std::size_t drift_iters = a.drift.value_or(0);
+  if (drift_iters == 0) return false;
+
+  // Re-seed locally so drift behavior is reproducible across modes regardless
+  // of how many RNG draws the pre-drift pipeline consumed.
+  std::uint32_t drift_seed = a.drift_seed.value_or(0xD1F75EEDu);
+  std::mt19937 rng(drift_seed);
+
+  std::cerr << "Entering combined-lwf drift mode for " << drift_iters
+            << " iterations (uniform[1,5] walk steps/iter, drift_seed="
+            << drift_seed << ")\n";
+
+  std::size_t dag_score = 0;
+  {
+    auto& dag = m.get_result();
+    scoped_arena<4096> arena;
+    parsimony_score_ops pops;
+    subtree_weight<parsimony_score_ops> sw(dag, rng(), arena.get());
+    dag_score = sw.compute_weight_below(get_root_idx(dag), pops);
+  }
+
+  for (std::size_t di = 0; di < drift_iters; ++di) {
+    // Phase A: sample fresh tree from DAG, run legacy-style neutral walk.
+    prog.phase("Combined-lwf drift " + std::to_string(di + 1) + ": sampling");
+    auto& dag = m.get_result();
+    std::uint32_t seed = rng();
+    std::size_t score = 0;
+    auto tree = sample_tree_from_dag(dag, m, a.sample_method, a.sample_uniformly,
+                                     a.ignore_root_edge_mutations, seed, score);
+    fitch_assign_compact_genomes(tree);
+    recompute_edge_mutations(tree);
+    set_sample_ids_from_cg(tree);
+    prog.done("score " + std::to_string(dag_score));
+
+    prog.phase("Combined-lwf drift " + std::to_string(di + 1) + ": walk");
+    std::uniform_int_distribution<std::size_t> steps_dist(1, 5);
+    std::size_t n_steps = steps_dist(rng);
+    auto drifted = std::move(tree);
+    std::size_t steps_taken = 0;
+
+    for (std::size_t step = 0; step < n_steps; ++step) {
+      tree_index idx{drifted, pool};
+      move_enumerator enumerator{idx, 0};
+      auto max_radius = compute_tree_max_depth(drifted) * 2;
+      if (max_radius == 0) max_radius = 1;
+
+      std::vector<profitable_move> neutral_moves;
+      enumerator.find_all_moves_parallel(max_radius,
+          [&](profitable_move const& mv) {
+            if (mv.score_change == 0) neutral_moves.push_back(mv);
+          }, pool);
+
+      if (neutral_moves.empty()) break;
+
+      std::uniform_int_distribution<std::size_t> dist(0, neutral_moves.size() - 1);
+      auto& chosen = neutral_moves[dist(rng)];
+      drifted = apply_spr_move(drifted, chosen.src, chosen.dst);
+      steps_taken++;
+    }
+
+    fitch_assign_compact_genomes(drifted);
+    recompute_edge_mutations(drifted);
+    set_sample_ids_from_cg(drifted);
+    prog.done(std::to_string(steps_taken) + " walk steps");
+
+    // Phase B: fanout-score from walk endpoint at 2×depth radius.
+    prog.phase("Combined-lwf drift " + std::to_string(di + 1) + ": scoring");
+    tree_index drift_idx{drifted, pool};
+    move_enumerator drift_enum{drift_idx, -1};
+    auto drift_radius = compute_tree_max_depth(drifted) * 2;
+    if (drift_radius == 0) drift_radius = 1;
+
+    std::vector<profitable_move> improving;
+    drift_enum.find_all_moves_parallel(drift_radius,
+        [&](profitable_move const& mv) {
+          if (mv.score_change < 0) improving.push_back(mv);
+        }, pool);
+    prog.done(std::to_string(improving.size()) + " improving");
+
+    if (!improving.empty()) {
+      std::sort(improving.begin(), improving.end(),
+                [](auto& x, auto& y) { return x.score_change < y.score_change; });
+      if (improving.size() > a.max_moves) improving.resize(a.max_moves);
+
+      std::vector<spr_move> spr_moves;
+      spr_moves.reserve(improving.size());
+      for (auto& mv : improving)
+        spr_moves.push_back(spr_move{.src = mv.src,
+                                     .dst = mv.dst,
+                                     .lca = mv.lca,
+                                     .score_change = mv.score_change});
+
+      prog.phase("Combined-lwf drift " + std::to_string(di + 1) + ": merging");
+      std::vector<phylo_dag> fragments(spr_moves.size());
+      parallel_with_progress(
+          pool, spr_moves.size(),
+          [&](std::size_t i) {
+            fragments[i] = apply_spr_as_fragment(drifted, spr_moves[i]);
+          },
+          prog);
+      for (auto& frag : fragments) m.add_dag(std::move(frag));
+      m.add_dag(drifted);
+      prog.done(std::to_string(m.result_node_count()) + " nodes");
+    }
+
+    auto& new_dag = m.get_result();
+    std::size_t new_score = 0;
+    {
+      scoped_arena<4096> arena;
+      parsimony_score_ops pops;
+      subtree_weight<parsimony_score_ops> sw(new_dag, rng(), arena.get());
+      new_score = sw.compute_weight_below(get_root_idx(new_dag), pops);
+    }
+    if (new_score < dag_score) {
+      std::cerr << "  Combined-lwf drift " << (di + 1) << ": escaped! "
+                << dag_score << " -> " << new_score << "\n";
+      return true;
+    }
+  }
+
+  std::cerr << "Combined-lwf drift: no escape after " << drift_iters
+            << " iterations\n";
+  return false;
+}
+
 // Dispatch to drift mechanism. In `auto` mode, preserve the pre-combiner
 // dispatch (inplace if --inplace-steps > 0, else legacy). Explicit modes
 // force the corresponding mechanism.
@@ -1471,6 +1632,8 @@ static bool drift_escape(merge& m, args const& a, std::mt19937& rng,
       return inplace_drift_escape(m, a, rng, prog);
     case drift_mode_t::combine:
       return drift_escape_combined(m, a, rng, prog);
+    case drift_mode_t::combine_lwf:
+      return drift_escape_combined_lwf(m, a, rng, prog);
     case drift_mode_t::auto_:
       if (a.inplace_steps > 0)
         return inplace_drift_escape(m, a, rng, prog);
