@@ -358,7 +358,7 @@ Optimization:
   --inplace-temperature <F> Simulated annealing initial temperature (default: 0 = greedy)
   --inplace-cooling <F>  Annealing cooling rate (default: 0.9)
   --inplace-fragments <S> Fragment strategy: every|final (default: final)
-  --drift-mode <M>       Drift strategy: auto (default: inplace if --inplace-steps>0 else legacy), legacy, inplace, combine, combine-lwf
+  --drift-mode <M>       Drift strategy: auto (default: inplace if --inplace-steps>0 else legacy), legacy, inplace, combine, combine-lwf (see doc/DRIFT-COMBINER.md)
   --drift-seed <N>        RNG seed used inside drift_escape_* (default: fixed constant; set to vary drift independently of --seed)
   --optimizer <name>      "native" (default) or "random"
   --max-moves <N>         Max moves per iteration for native (default: 50)
@@ -1347,6 +1347,8 @@ static bool drift_escape_legacy(merge& m, args const& a,
 // Inplace-greedy needs ~53 attempts at same plateau (10× density, but
 // potentially deeper reach). Combining both phases per attempt should not
 // regress the dense-local case and should extend reach on deeper plateaus.
+//
+// Usage semantics, when-to-use, and rotaA measurements: doc/DRIFT-COMBINER.md.
 static bool drift_escape_combined(merge& m, args const& a,
                                   [[maybe_unused]] std::mt19937& outer_rng,
                                   progress& prog) {
@@ -1491,6 +1493,10 @@ static bool drift_escape_combined(merge& m, args const& a,
 // while preserving the combiner's fanout-from-endpoint and f6cf037 DAG-recheck.
 // Lets us isolate whether combine's drift-attempt overhead lives in the walk
 // or in the surrounding combiner structure.
+//
+// Not recommended for production use — strictly worse than `combine` on every
+// tested input (e.g. seed44 R3 630→629 escape: 166 attempts vs combine's 68).
+// Retained as a baseline for future combiner experimentation.
 static bool drift_escape_combined_lwf(merge& m, args const& a,
                                       [[maybe_unused]] std::mt19937& outer_rng,
                                       progress& prog) {
