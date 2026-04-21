@@ -421,6 +421,15 @@ enum class fragment_strategy { every_step, final_only };
 // Phase 32: Move selection policy.
 enum class move_selection { best_improving, random_weighted, random_uniform };
 
+// Default selector for drift-escape mode as a function of temperature.
+// random_uniform (T == 0) is required to break greedy's deterministic
+// tie-breaking on neutral plateaus — see session 56 regression diagnosis.
+// Called from tools/larch2.cpp::inplace_drift_escape.
+inline move_selection drift_default_selector(double temperature) {
+  return temperature > 0.0 ? move_selection::random_weighted
+                           : move_selection::random_uniform;
+}
+
 // Phase 34: Configuration for the multi-step in-place loop.
 struct inplace_params {
   std::size_t max_steps{10};

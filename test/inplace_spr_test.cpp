@@ -6010,6 +6010,65 @@ static void test_move_selection_random_weighted() {
   std::println("  PASS");
 }
 
+// Session 56 regression guard: direct test of drift_default_selector used
+// by tools/larch2.cpp::inplace_drift_escape. If the T==0 branch is ever
+// changed back to best_improving — the pre-session-56 default that caused
+// cross-iteration greedy lock-in on plateaus — this test fails fast.
+static void test_drift_default_selector() {
+  std::println("test_drift_default_selector");
+
+  assert(drift_default_selector(0.0) == move_selection::random_uniform);
+  assert(drift_default_selector(0.5) == move_selection::random_weighted);
+  assert(drift_default_selector(10.0) == move_selection::random_weighted);
+
+  std::println("  PASS");
+}
+
+// Session 56 characterization: best_improving returns moves.front()
+// unconditionally (see inplace_spr.hpp select_move), so across RNG seeds
+// with identical state it picks the same move, yielding identical final
+// scores. random_uniform breaks that determinism by sampling uniformly
+// over the candidate set. This is the behavioral primitive the fix at
+// larch2.cpp::inplace_drift_escape relies on.
+static void test_drift_selector_default_variation() {
+  std::println("test_drift_selector_default_variation");
+
+  auto tree = make_suboptimal_tree();
+  fitch_assign_compact_genomes(tree);
+  set_sample_ids_from_cg(tree);
+
+  auto sample_scores = [&](move_selection sel) -> std::set<int> {
+    inplace_params params{
+        .max_steps = 5,
+        .accept_threshold = 1,
+        .worsening_budget = 10,
+        .selector = sel,
+        .frag_mode = fragment_strategy::final_only,
+    };
+    std::set<int> scores;
+    for (std::uint32_t seed = 0; seed < 20; ++seed) {
+      inplace_move_producer producer{params};
+      std::mt19937 rng{seed};
+      auto result = producer(tree, [](phylo_dag) {}, rng);
+      scores.insert(result.final_score);
+    }
+    return scores;
+  };
+
+  auto best_scores = sample_scores(move_selection::best_improving);
+  auto uniform_scores = sample_scores(move_selection::random_uniform);
+
+  std::println("  best_improving across 20 seeds: {} distinct score(s)",
+               best_scores.size());
+  std::println("  random_uniform across 20 seeds: {} distinct score(s)",
+               uniform_scores.size());
+
+  assert(best_scores.size() == 1);
+  assert(uniform_scores.size() >= 2);
+
+  std::println("  PASS");
+}
+
 // Phase 31: Real data multi-step test
 static void test_inplace_producer_real_data() {
   std::println("test_inplace_producer_real_data");
@@ -6562,6 +6621,8 @@ int main() {
   test_inplace_producer_escape();
   test_move_selection_random_uniform();
   test_move_selection_random_weighted();
+  test_drift_default_selector();
+  test_drift_selector_default_variation();
   test_inplace_producer_real_data();
 
   // Phase 41: local minimum escape

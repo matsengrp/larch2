@@ -1113,9 +1113,7 @@ static bool inplace_drift_escape(merge& m, args const& a, std::mt19937& rng,
   auto frag_mode = (a.inplace_fragments == "every")
                        ? fragment_strategy::every_step
                        : fragment_strategy::final_only;
-  auto selector = (a.inplace_temperature > 0)
-                      ? move_selection::random_weighted
-                      : move_selection::best_improving;
+  auto selector = drift_default_selector(a.inplace_temperature);
 
   inplace_params params{
       .max_steps = a.inplace_steps,
