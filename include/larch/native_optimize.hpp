@@ -80,8 +80,8 @@ struct scratch_buffers {
 // ============================================================================
 // base_to_one_hot and fitch_set_from_counts are defined in compute.hpp
 
-inline int fitch_cost_from_counts(std::array<uint8_t, 4> const& counts,
-                                  uint8_t num_children) {
+inline int fitch_cost_from_counts(std::array<uint32_t, 4> const& counts,
+                                  uint32_t num_children) {
   if (num_children <= 1) return 0;
   for (int i = 0; i < 4; i++) {
     if (counts[i] == num_children) return 0;
@@ -111,6 +111,24 @@ inline std::size_t compute_tree_max_depth(phylo_dag& d) {
   }
   return max_depth;
 }
+
+// ============================================================================
+// spr_result: captures all topology changes from an in-place SPR
+// ============================================================================
+
+struct spr_result {
+  std::size_t src;            // moved node
+  std::size_t dst;            // destination (original child of dst_parent)
+  std::size_t src_parent;     // original parent of src
+  std::size_t dst_parent;     // parent of dst (now parent of new_inner)
+  std::size_t new_inner;      // freshly created inner node
+  std::size_t lca;            // lowest common ancestor of src and dst
+
+  bool src_parent_collapsed;  // true if src_parent was binary and removed
+  std::size_t grandparent;    // parent of collapsed src_parent (valid iff collapsed)
+  std::size_t remaining_child;  // sibling of src that was reparented (valid iff collapsed)
+  std::size_t collapsed_node;   // index of the removed node (valid iff collapsed)
+};
 
 // ============================================================================
 // tree_index: Precomputed tree data for move enumeration
@@ -151,8 +169,8 @@ class tree_index {
     return &fitch_sets_[node * num_variable_sites_];
   }
 
-  std::array<uint8_t, 4> const& get_child_counts(std::size_t node,
-                                                 std::size_t site_idx) const {
+  std::array<uint32_t, 4> const& get_child_counts(std::size_t node,
+                                                  std::size_t site_idx) const {
     return child_counts_[node * num_variable_sites_ + site_idx];
   }
 
@@ -160,7 +178,7 @@ class tree_index {
     return node < num_nodes_ && has_child_counts_[node];
   }
 
-  uint8_t get_num_children(std::size_t node) const {
+  uint32_t get_num_children(std::size_t node) const {
     return num_children_[node];
   }
 
@@ -176,10 +194,509 @@ class tree_index {
   }
   std::size_t num_variable_sites() const { return num_variable_sites_; }
   std::size_t num_condensed_leaves() const { return condensed_count_; }
+  bool is_condensed(std::size_t node) const {
+    return node < num_nodes_ && is_condensed_[node];
+  }
+  std::size_t num_nodes() const { return num_nodes_; }
   uint8_t const* get_ref_alleles_ptr() const { return ref_alleles_.data(); }
+  std::size_t get_subtree_size(std::size_t node) const { return subtree_size_[node]; }
+
+  // Phase 24: Compute total parsimony score from tree_index flat arrays.
+  // Iterates all valid inner nodes and counts sites where children disagree
+  // (Fitch cost = 1).  O(N × sites), no recursion.
+  int compute_parsimony_score() const {
+    int score = 0;
+    for (std::size_t nid = 0; nid < num_nodes_; nid++) {
+      if (!is_valid_[nid] || !has_child_counts_[nid]) continue;
+      uint32_t nc = num_children_[nid];
+      if (nc == 0) continue;
+      std::size_t base = nid * num_variable_sites_;
+      for (std::size_t i = 0; i < num_variable_sites_; i++) {
+        score += fitch_cost_from_counts(child_counts_[base + i],
+                                        static_cast<uint8_t>(nc));
+      }
+    }
+    return score;
+  }
+
+  bool is_valid(std::size_t node) const {
+    return node < num_nodes_ && is_valid_[node];
+  }
+
+  // Phase 11: Grow all flat arrays so that node indices up to new_high_mark-1
+  // are valid slots.  Called by update_topology when apply_spr_inplace appends
+  // a node beyond the current capacity.
+  void ensure_capacity(std::size_t new_high_mark) {
+    if (new_high_mark <= num_nodes_) return;
+    auto const site_slots = new_high_mark * num_variable_sites_;
+    dfs_info_.resize(new_high_mark);
+    has_dfs_info_.resize(new_high_mark, 0);
+    is_valid_.resize(new_high_mark, 0);
+    fitch_sets_.resize(site_slots, 0);
+    child_counts_.resize(site_slots, {0, 0, 0, 0});
+    has_child_counts_.resize(new_high_mark, 0);
+    num_children_.resize(new_high_mark, 0);
+    allele_union_.resize(site_slots, 0);
+    parent_.resize(new_high_mark, 0);
+    children_.resize(new_high_mark);
+    is_condensed_.resize(new_high_mark, 0);
+    subtree_size_.resize(new_high_mark, 0);
+    num_nodes_ = new_high_mark;
+  }
+
+  // Phase 10: Patch parent_[], children_[], and is_valid_[] to reflect the
+  // topology changes described by an spr_result.  Must be called after
+  // apply_spr_inplace().
+  //
+  // Only parent_[], children_[], and is_valid_[] are updated here.
+  // The following remain stale and must be updated by later phases:
+  //   - searchable_nodes_    (Phase 12 — call update_searchable_nodes())
+  //   - subtree_size_[]      (Phase 13 — call update_subtree_sizes())
+  //   - tree_root_           (Phase 15 — call update_tree_root())
+  //   - is_condensed_[]      (Phase 16 — call update_condensed_nodes())
+  //   - dfs_info_[]          (Phase 14 — call recompute_dfs())
+  void update_topology(spr_result const& r) {
+    ensure_capacity(d_.node_high_mark());
+
+    if (r.src_parent_collapsed) {
+      // Replace src_parent with remaining_child in grandparent's children.
+      auto& gp_kids = children_[r.grandparent];
+      for (auto& kid : gp_kids) {
+        if (kid == r.src_parent) {
+          kid = r.remaining_child;
+          break;
+        }
+      }
+      parent_[r.remaining_child] = r.grandparent;
+
+      // Invalidate collapsed node.  Preserve Fitch bookkeeping
+      // (num_children_, has_child_counts_, child_counts_) so that
+      // compute_node_fitch_cost can retrieve the old cost for delta
+      // tracking.  When the DAG recycles the slot for new_inner,
+      // recompute_node_fitch_tracked sees the old data as its "before"
+      // state and correctly computes the transition delta.
+      is_valid_[r.collapsed_node] = 0;
+      children_[r.collapsed_node].clear();
+    } else {
+      // Remove src from src_parent's children.
+      auto& sp_kids = children_[r.src_parent];
+      sp_kids.erase(std::remove(sp_kids.begin(), sp_kids.end(), r.src),
+                    sp_kids.end());
+    }
+
+    // Replace dst with new_inner in dst_parent's children.
+    auto& dp_kids = children_[r.dst_parent];
+    for (auto& kid : dp_kids) {
+      if (kid == r.dst) {
+        kid = r.new_inner;
+        break;
+      }
+    }
+
+    // Set up new_inner.
+    children_[r.new_inner] = {r.dst, r.src};
+    parent_[r.new_inner] = r.dst_parent;
+    is_valid_[r.new_inner] = 1;
+
+    // Update parent pointers for moved nodes.
+    parent_[r.dst] = r.new_inner;
+    parent_[r.src] = r.new_inner;
+  }
+
+  // Phase 12: Patch searchable_nodes_ after an SPR.
+  // - Add new_inner (always a valid inner node, never tree root or UA).
+  // - Remove collapsed_node if src_parent was binary and got collapsed.
+  // Must be called after update_topology().
+  // Note: src and dst stay in the list (already present).  Phase 16 may
+  // further adjust searchable_nodes_ if condensation status changes for
+  // leaves near the SPR source or destination.
+  void update_searchable_nodes(spr_result const& r) {
+    assert(is_valid(r.new_inner) && "update_topology must be called first");
+    if (r.src_parent_collapsed) {
+      // Note: if the DAG recycles collapsed_node's slot for new_inner
+      // (collapsed_node == new_inner), this removes then re-adds the same
+      // index — net effect is correct.
+      auto& sn = searchable_nodes_;
+      sn.erase(std::remove(sn.begin(), sn.end(), r.collapsed_node), sn.end());
+    }
+    searchable_nodes_.push_back(r.new_inner);
+  }
+
+  // Phase 13: Incrementally recompute subtree_size_[] after an SPR.
+  // Walk up from the insertion point (new_inner) and the removal point
+  // (src_parent or grandparent if collapsed) to tree_root_, recomputing
+  // subtree_size_[node] = 1 + sum(subtree_size_[child]) at each step.
+  // Both paths merge at LCA so total work is bounded by 2 × depth.
+  // Must be called after update_topology().
+  //
+  // Note: subtree_size_ must be correct before any Fitch update (Phase 17+)
+  // that uses the parallel path, since fitch_bottom_up_async checks
+  // subtree_size_[child_id] >= kFitchParallelThreshold per node.
+  void update_subtree_sizes(spr_result const& r) {
+    assert(is_valid(r.new_inner) && !children_[r.new_inner].empty() &&
+           "update_topology must be called before update_subtree_sizes");
+
+    // Recompute subtree_size for new_inner (freshly created, not yet sized).
+    recompute_subtree_size(r.new_inner);
+
+    // Walk up from dst_parent to tree_root_ (insertion side).
+    walk_up_recompute(r.dst_parent);
+
+    // Walk up from removal side to tree_root_.  Skip when:
+    // - removal start equals dst_parent (sibling move or LCA-collapse case —
+    //   the insertion walk already covered the entire path), or
+    // - removal start is invalid (root-collapse case — grandparent is the UA
+    //   node; the insertion walk already covers the path to the effective root).
+    std::size_t rem_start = r.src_parent_collapsed ? r.grandparent : r.src_parent;
+    if (rem_start != r.dst_parent && is_valid(rem_start)) {
+      walk_up_recompute(rem_start);
+    }
+  }
+
+  // Phase 15: Re-derive tree_root_ after an SPR that changes which node is
+  // the direct child of UA.  Two cases:
+  //   (a) Removal collapse: src_parent was binary and was the old tree root —
+  //       the surviving child takes over.  Resolved via DAG query because
+  //       children_[] is never populated for the UA node (init() skips UA).
+  //   (b) Insertion above root: dst was the tree root, so new_inner is now
+  //       the direct child of UA and becomes the new tree root.
+  // Must be called after update_topology() and before recompute_dfs().
+  void update_tree_root(spr_result const& r) {
+    // (a) Removal collapse: old root was collapsed during src extraction.
+    if (r.src_parent_collapsed && r.collapsed_node == tree_root_) {
+      auto ua_idx = get_root_idx(d_);
+      auto ua_clades = get_clades(d_, ua_idx);
+      assert(!ua_clades.empty() && !ua_clades[0].empty());
+      tree_root_ = get_child_idx(d_, ua_clades[0][0]);
+    }
+    // (b) Insertion above root: new_inner placed above the current tree root.
+    if (r.dst == tree_root_) {
+      tree_root_ = r.new_inner;
+    }
+  }
+
+  // Phase 16: Re-check condensation for leaf children near the SPR.
+  // An SPR can create or break CG-identical sibling pairs, changing which
+  // leaves are condensed.  Re-check only the children of the parent that
+  // lost src (source side) and the children of new_inner (destination side).
+  // Must be called after update_topology() and update_searchable_nodes().
+  void update_condensed_nodes(spr_result const& r) {
+    // Source side: the parent that lost src as a child.
+    std::size_t source_parent =
+        r.src_parent_collapsed ? r.grandparent : r.src_parent;
+    if (is_valid(source_parent)) {
+      recheck_condensation(source_parent);
+    }
+    // Destination side: new_inner has children {dst, src}.
+    recheck_condensation(r.new_inner);
+    // dst_parent lost dst as a direct child (replaced by new_inner).
+    // If dst had identical siblings under dst_parent, their condensation
+    // status is now stale — recheck.
+    if (is_valid(r.dst_parent)) {
+      recheck_condensation(r.dst_parent);
+    }
+  }
+
+  // Phase 14: Recompute dfs_info_[] for the entire tree.
+  // DFS indices (dfs_index, dfs_end_index, level) cannot be cheaply updated
+  // incrementally — an SPR can change the DFS interval of nodes far from the
+  // move.  Re-traverse the entire tree from tree_root_.
+  // This is O(N) with no per-site work, so negligible vs Fitch updates.
+  // Must be called after update_topology() (so children_[] is correct) and
+  // after update_tree_root() (so tree_root_ is valid — see Phase 15).
+  void recompute_dfs() {
+    assert(is_valid_[tree_root_] &&
+           "recompute_dfs: tree_root_ is invalid — call update_tree_root() "
+           "before recompute_dfs() when the SPR may have collapsed the root");
+    std::fill(has_dfs_info_.begin(), has_dfs_info_.end(), 0);
+    std::size_t counter = 0;
+    dfs_visit(tree_root_, counter, 0);
+    assert(has_dfs_info_[tree_root_] &&
+           "recompute_dfs: tree_root_ unreachable after DFS traversal");
+  }
+
+  // Phase 17: Recompute a single node's Fitch data from its current children.
+  // Fused single-pass loop (sites-outer, children-inner) to avoid separate
+  // init/accumulate/finalize passes over num_variable_sites_.
+  void recompute_node_fitch(std::size_t node_id) {
+    assert(!is_leaf(d_, node_id) &&
+           "recompute_node_fitch must not be called on a leaf node");
+    auto& children = children_[node_id];
+    uint32_t nc = static_cast<uint32_t>(children.size());
+    num_children_[node_id] = nc;
+    has_child_counts_[node_id] = true;
+    std::size_t base = node_id * num_variable_sites_;
+
+    for (std::size_t i = 0; i < num_variable_sites_; i++) {
+      std::array<uint32_t, 4> counts = {0, 0, 0, 0};
+      uint8_t au = 0;
+      for (auto child : children) {
+        uint8_t cf = fitch_sets_[child * num_variable_sites_ + i];
+        for (int j = 0; j < 4; j++)
+          if (cf & (1 << j)) counts[j]++;
+        au |= allele_union_[child * num_variable_sites_ + i];
+      }
+      child_counts_[base + i] = counts;
+      fitch_sets_[base + i] = fitch_set_from_counts(counts, nc);
+      allele_union_[base + i] = au;
+    }
+  }
+
+  // Phase 18 helper: result of a tracked Fitch recomputation.
+  struct fitch_recompute_result {
+    bool changed;  // true if fitch_sets_ or allele_union_ differs from previous
+    int delta;     // parsimony cost change at this node
+  };
+
+  // Fused recompute with change detection (both fitch_sets_ and allele_union_)
+  // and parsimony delta tracking (prepares for Phase 25).
+  fitch_recompute_result recompute_node_fitch_tracked(std::size_t node_id) {
+    assert(!is_leaf(d_, node_id) &&
+           "recompute_node_fitch_tracked must not be called on a leaf node");
+    auto& children = children_[node_id];
+    uint32_t nc = static_cast<uint32_t>(children.size());
+    uint32_t old_nc = num_children_[node_id];
+    num_children_[node_id] = nc;
+    has_child_counts_[node_id] = true;
+    std::size_t base = node_id * num_variable_sites_;
+
+    bool changed = false;
+    int delta = 0;
+
+    for (std::size_t i = 0; i < num_variable_sites_; i++) {
+      uint8_t old_fitch = fitch_sets_[base + i];
+      uint8_t old_au = allele_union_[base + i];
+      int old_cost = fitch_cost_from_counts(child_counts_[base + i], old_nc);
+
+      std::array<uint32_t, 4> counts = {0, 0, 0, 0};
+      uint8_t au = 0;
+      for (auto child : children) {
+        uint8_t cf = fitch_sets_[child * num_variable_sites_ + i];
+        for (int j = 0; j < 4; j++)
+          if (cf & (1 << j)) counts[j]++;
+        au |= allele_union_[child * num_variable_sites_ + i];
+      }
+
+      uint8_t new_fitch = fitch_set_from_counts(counts, nc);
+      int new_cost = fitch_cost_from_counts(counts, nc);
+
+      child_counts_[base + i] = counts;
+      fitch_sets_[base + i] = new_fitch;
+      allele_union_[base + i] = au;
+
+      if (new_fitch != old_fitch || au != old_au) changed = true;
+      delta += (new_cost - old_cost);
+    }
+
+    return {changed, delta};
+  }
+
+  // Phase 18: Walk from start to tree_root_, recomputing Fitch at each step.
+  // Stop early if neither fitch_sets_ nor allele_union_ change at a node (all
+  // ancestors are already correct).  Returns number of nodes updated.
+  // delta_out accumulates the parsimony cost change across all recomputed nodes.
+  std::size_t propagate_fitch_upward(std::size_t start, int& delta_out) {
+    std::size_t count = 0;
+    std::size_t node = start;
+    delta_out = 0;
+    while (node != tree_root_ && is_valid_[node]) {
+      auto result = recompute_node_fitch_tracked(node);
+      count++;
+      delta_out += result.delta;
+      if (!result.changed) break;
+      node = parent_[node];
+    }
+    // Recompute root if propagation reached it (changes propagated all the way).
+    if (node == tree_root_) {
+      auto result = recompute_node_fitch_tracked(node);
+      count++;
+      delta_out += result.delta;
+    }
+    return count;
+  }
+
+  // Convenience overload without delta tracking.
+  std::size_t propagate_fitch_upward(std::size_t start) {
+    int delta = 0;
+    return propagate_fitch_upward(start, delta);
+  }
+
+  // Propagate Fitch upward from start, stopping before stop_before (exclusive).
+  // The stop_before node is NOT recomputed — the caller handles it.
+  // Returns number of nodes updated.  Prepares for Phase 22 (combined update).
+  std::size_t propagate_fitch_up_to(std::size_t start, std::size_t stop_before,
+                                    int& delta_out) {
+    std::size_t count = 0;
+    std::size_t node = start;
+    delta_out = 0;
+    while (node != stop_before && node != tree_root_ && is_valid_[node]) {
+      auto result = recompute_node_fitch_tracked(node);
+      count++;
+      delta_out += result.delta;
+      if (!result.changed) break;
+      node = parent_[node];
+    }
+    // If we reached tree_root_ (and it's not the stop point), recompute it.
+    if (node == tree_root_ && node != stop_before) {
+      auto result = recompute_node_fitch_tracked(node);
+      count++;
+      delta_out += result.delta;
+    }
+    return count;
+  }
+
+  // Convenience overload without delta tracking.
+  std::size_t propagate_fitch_up_to(std::size_t start,
+                                    std::size_t stop_before) {
+    int delta = 0;
+    return propagate_fitch_up_to(start, stop_before, delta);
+  }
+
+  // Phase 19: Initialize Fitch data for a newly created inner node.
+  // When a new inner node is created (Phase 6), its children (dst and src)
+  // already have correct Fitch sets — only their parent changed.  This
+  // computes the new node's Fitch sets from scratch.
+  // Returns the parsimony cost delta introduced by this node.  For a new
+  // node (num_children_ == 0 before recompute), old_cost is 0 so delta
+  // equals the new cost — the number of variable sites where the children's
+  // Fitch sets are disjoint (union sites).
+  int init_new_node_fitch(std::size_t new_inner) {
+    assert(new_inner < num_nodes_ &&
+           "init_new_node_fitch: ensure_capacity must be called first");
+    auto result = recompute_node_fitch_tracked(new_inner);
+    return result.delta;
+  }
+
+  // Compute total Fitch cost at a node from its current child_counts_ arrays.
+  // Used to obtain the old cost of a node about to be removed (e.g., a
+  // collapsed src_parent) so the delta tracker can account for its deletion.
+  int compute_node_fitch_cost(std::size_t node_id) const {
+    if (!has_child_counts_[node_id]) return 0;
+    uint32_t nc = num_children_[node_id];
+    if (nc <= 1) return 0;
+    int cost = 0;
+    std::size_t base = node_id * num_variable_sites_;
+    for (std::size_t i = 0; i < num_variable_sites_; i++) {
+      cost += fitch_cost_from_counts(child_counts_[base + i], nc);
+    }
+    return cost;
+  }
+
+  // Phase 20: Fitch update for the source removal path.
+  // After an SPR detaches src from src_parent, the Fitch data along the
+  // removal path is stale.  If src_parent was collapsed, start from
+  // grandparent (which gained remaining_child as a direct child); otherwise
+  // start from src_parent (which lost one child).  Propagate upward to root
+  // with early termination when Fitch sets stabilize.
+  //
+  // delta_out accumulates the parsimony score change along the removal path,
+  // including the cost removed by collapsing src_parent (if applicable).
+  // Must be called after update_topology() and (typically) init_new_node_fitch().
+  void update_fitch_removal(spr_result const& r, int& delta_out) {
+    delta_out = 0;
+    // If src_parent was collapsed, its Fitch cost is removed from the tree.
+    // When collapsed_node == new_inner (slot recycled by the DAG),
+    // init_new_node_fitch's tracked recompute already captures the
+    // old→new transition, so don't subtract separately.
+    if (r.src_parent_collapsed && r.collapsed_node != r.new_inner) {
+      delta_out -= compute_node_fitch_cost(r.collapsed_node);
+    }
+    std::size_t start = r.src_parent_collapsed ? r.grandparent : r.src_parent;
+    int propagation_delta = 0;
+    propagate_fitch_upward(start, propagation_delta);
+    delta_out += propagation_delta;
+  }
+
+  // Convenience overload without delta tracking.
+  void update_fitch_removal(spr_result const& r) {
+    int delta = 0;
+    update_fitch_removal(r, delta);
+  }
+
+  // Phase 21: Fitch update for the destination insertion path.
+  // After reattaching src under new_inner next to dst, recompute Fitch
+  // along the insertion path: first initialize new_inner's Fitch from its
+  // children (src and dst), then propagate upward from dst_parent (which
+  // now has new_inner as child instead of dst).
+  //
+  // delta_out accumulates the parsimony score change: new_inner's cost
+  // (always non-negative — it's a fresh node) plus propagation changes.
+  // Must be called after update_topology().
+  void update_fitch_insertion(spr_result const& r, int& delta_out) {
+    delta_out = init_new_node_fitch(r.new_inner);
+    int propagation_delta = 0;
+    propagate_fitch_upward(r.dst_parent, propagation_delta);
+    delta_out += propagation_delta;
+  }
+
+  // Convenience overload without delta tracking.
+  void update_fitch_insertion(spr_result const& r) {
+    int delta = 0;
+    update_fitch_insertion(r, delta);
+  }
+
+  // Phase 22: Combined incremental Fitch update.
+  // Both the removal path (src_parent → root) and the insertion path
+  // (dst_parent → root) converge at the LCA of src and dst.  Instead of
+  // propagating both paths independently to root (doubling work on the
+  // LCA→root segment), propagate each path up to the LCA separately,
+  // then propagate once from LCA to root.
+  //
+  // Edge cases:
+  //   - LCA collapsed (src_parent == lca, binary): use grandparent as
+  //     effective LCA — the original LCA node no longer exists.
+  //   - src_parent == LCA, not collapsed: removal-side propagation is a
+  //     no-op (start == stop); the shared LCA→root pass handles it.
+  //   - dst_parent == LCA: insertion-side propagation is a no-op.
+  //
+  // delta_out accumulates the total parsimony score change.
+  // Must be called after update_topology() and update_tree_root().
+  void update_fitch(spr_result const& r, int& delta_out) {
+    delta_out = 0;
+
+    // Account for collapsed node's Fitch cost removal.
+    // When collapsed_node == new_inner (slot recycled by the DAG),
+    // init_new_node_fitch's tracked recompute already captures the
+    // old→new transition, so don't subtract separately.
+    if (r.src_parent_collapsed && r.collapsed_node != r.new_inner) {
+      delta_out -= compute_node_fitch_cost(r.collapsed_node);
+    }
+
+    // Effective LCA: if src_parent was the LCA and got collapsed,
+    // the LCA node no longer exists; use grandparent instead.
+    std::size_t effective_lca = r.lca;
+    if (r.src_parent_collapsed && r.src_parent == r.lca) {
+      effective_lca = r.grandparent;
+    }
+
+    // 1. Removal side: propagate up to (but not past) effective_lca.
+    std::size_t rem_start =
+        r.src_parent_collapsed ? r.grandparent : r.src_parent;
+    int rem_delta = 0;
+    propagate_fitch_up_to(rem_start, effective_lca, rem_delta);
+    delta_out += rem_delta;
+
+    // 2. Insertion side: init new_inner, then up to effective_lca.
+    delta_out += init_new_node_fitch(r.new_inner);
+    int ins_delta = 0;
+    propagate_fitch_up_to(r.dst_parent, effective_lca, ins_delta);
+    delta_out += ins_delta;
+
+    // 3. Shared segment: effective_lca to root.
+    int shared_delta = 0;
+    propagate_fitch_upward(effective_lca, shared_delta);
+    delta_out += shared_delta;
+  }
+
+  // Convenience overload without delta tracking.
+  void update_fitch(spr_result const& r) {
+    int delta = 0;
+    update_fitch(r, delta);
+  }
 
  private:
   static constexpr std::size_t kFitchParallelThreshold = 64;
+
 
   void init() {
     auto ua_idx = get_root_idx(d_);
@@ -206,6 +723,7 @@ class tree_index {
     // Allocate flat arrays
     dfs_info_.resize(num_nodes_);
     has_dfs_info_.assign(num_nodes_, false);
+    is_valid_.assign(num_nodes_, 0);
     fitch_sets_.resize(num_nodes_ * num_variable_sites_, 0);
     child_counts_.resize(num_nodes_ * num_variable_sites_, {0, 0, 0, 0});
     has_child_counts_.assign(num_nodes_, false);
@@ -220,6 +738,7 @@ class tree_index {
           [&](auto node) {
             auto nid = node.index();
             if (is_ua(d_, nid)) return;
+            is_valid_[nid] = 1;
 
             // Parent
             auto pes = get_parent_edges(d_, nid);
@@ -314,25 +833,150 @@ class tree_index {
     return result;
   }
 
-  void compute_subtree_sizes(std::size_t node) {
+  // Iterative bottom-up traversal to avoid stack overflow on degenerate trees.
+  void compute_subtree_sizes(std::size_t root) {
+    // BFS to collect all nodes, then process in reverse for bottom-up order.
+    std::vector<std::size_t> order;
+    order.push_back(root);
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      for (auto child : children_[order[i]]) {
+        order.push_back(child);
+      }
+    }
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+      std::size_t size = 1;
+      for (auto child : children_[*it]) {
+        size += subtree_size_[child];
+      }
+      subtree_size_[*it] = size;
+    }
+  }
+
+  // Recompute subtree_size for a single node from its children.
+  void recompute_subtree_size(std::size_t node) {
     std::size_t size = 1;
     for (auto child : children_[node]) {
-      compute_subtree_sizes(child);
       size += subtree_size_[child];
     }
     subtree_size_[node] = size;
   }
 
-  void dfs_visit(std::size_t node, std::size_t& counter, std::size_t level) {
-    dfs_info info;
-    info.dfs_index = counter++;
-    info.level = level;
+  // Walk up from node to tree_root_, recomputing subtree_size at each step.
+  // Guards against stale tree_root_ (e.g., after root collapse before Phase 15
+  // updates tree_root_): stops if the next parent is invalid (such as the UA
+  // node).  Iteration bound prevents infinite loops on corrupted parent_ chains.
+  void walk_up_recompute(std::size_t node) {
+    auto cur = node;
+    for (std::size_t steps = 0; steps < num_nodes_; ++steps) {
+      recompute_subtree_size(cur);
+      if (cur == tree_root_) break;
+      auto next = parent_[cur];
+      if (next >= num_nodes_ || !is_valid_[next]) break;
+      cur = next;
+    }
+  }
 
-    for (auto child : children_[node]) dfs_visit(child, counter, level + 1);
+  // Re-check condensation for leaf children of a given parent node.
+  // Clears old condensed flags for all leaf children, re-runs the O(siblings²)
+  // CG-equality check, and patches searchable_nodes_ and condensed_count_.
+  void recheck_condensation(std::size_t parent_node) {
+    auto& kids = children_[parent_node];
 
-    info.dfs_end_index = counter;
-    dfs_info_[node] = info;
-    has_dfs_info_[node] = true;
+    // Collect leaf children (use children_[] to detect leaves — no DAG query).
+    std::vector<std::size_t> leaf_kids;
+    for (auto kid : kids) {
+      if (children_[kid].empty()) leaf_kids.push_back(kid);
+    }
+
+    if (leaf_kids.size() <= 1) {
+      // At most one leaf — clear any stale condensed flag.
+      for (auto kid : leaf_kids) {
+        if (is_condensed_[kid]) {
+          is_condensed_[kid] = 0;
+          condensed_count_--;
+          searchable_nodes_.push_back(kid);
+        }
+      }
+      return;
+    }
+
+    // Remember which leaves were condensed, then clear all.
+    std::vector<uint8_t> was_condensed(leaf_kids.size());
+    for (std::size_t i = 0; i < leaf_kids.size(); i++) {
+      was_condensed[i] = is_condensed_[leaf_kids[i]];
+      if (is_condensed_[leaf_kids[i]]) {
+        is_condensed_[leaf_kids[i]] = 0;
+        condensed_count_--;
+      }
+    }
+
+    // Re-run condensation (same algorithm as init()).
+    std::vector<bool> now_condensed(leaf_kids.size(), false);
+    for (std::size_t i = 0; i < leaf_kids.size(); i++) {
+      if (now_condensed[i]) continue;
+      auto cg_i = get_node_cg(leaf_kids[i]);
+      for (std::size_t j = i + 1; j < leaf_kids.size(); j++) {
+        if (now_condensed[j]) continue;
+        auto cg_j = get_node_cg(leaf_kids[j]);
+        if (cg_i == cg_j) {
+          now_condensed[j] = true;
+          is_condensed_[leaf_kids[j]] = 1;
+          condensed_count_++;
+        }
+      }
+    }
+
+    // Patch searchable_nodes_ for status changes.
+    for (std::size_t i = 0; i < leaf_kids.size(); i++) {
+      if (!was_condensed[i] && now_condensed[i]) {
+        // Newly condensed — remove from searchable_nodes_ (swap-and-pop: O(1)
+        // mutation instead of O(N) shift from std::remove; order is irrelevant).
+        auto& sn = searchable_nodes_;
+        auto it = std::find(sn.begin(), sn.end(), leaf_kids[i]);
+        if (it != sn.end()) {
+          *it = sn.back();
+          sn.pop_back();
+        }
+      } else if (was_condensed[i] && !now_condensed[i]) {
+        // Newly uncondensed — add to searchable_nodes_.
+        searchable_nodes_.push_back(leaf_kids[i]);
+      }
+    }
+  }
+
+  // Iterative DFS to avoid stack overflow on degenerate trees.
+  // Assigns pre-order dfs_index and post-order dfs_end_index.
+  void dfs_visit(std::size_t root, std::size_t& counter,
+                 std::size_t root_level) {
+    struct frame {
+      std::size_t node;
+      std::size_t level;
+      bool entered;
+    };
+    std::vector<frame> stack;
+    stack.push_back({root, root_level, false});
+
+    while (!stack.empty()) {
+      if (!stack.back().entered) {
+        auto node = stack.back().node;
+        auto level = stack.back().level;
+        stack.back().entered = true;
+
+        dfs_info_[node].dfs_index = counter++;
+        dfs_info_[node].level = level;
+
+        // Push children in reverse order so the first child is visited first.
+        auto& ch = children_[node];
+        for (std::size_t i = ch.size(); i > 0; --i) {
+          stack.push_back({ch[i - 1], level + 1, false});
+        }
+      } else {
+        auto node = stack.back().node;
+        dfs_info_[node].dfs_end_index = counter;
+        has_dfs_info_[node] = true;
+        stack.pop_back();
+      }
+    }
   }
 
   void compute_dfs_indices() {
@@ -355,7 +999,7 @@ class tree_index {
       for (auto child_id : children) fitch_bottom_up_impl(child_id, ref);
 
       has_child_counts_[node_id] = true;
-      uint8_t nc = static_cast<uint8_t>(children.size());
+      uint32_t nc = static_cast<uint32_t>(children.size());
       num_children_[node_id] = nc;
 
       for (std::size_t i = 0; i < num_variable_sites_; i++) {
@@ -422,7 +1066,7 @@ class tree_index {
 
     // Compute this node's Fitch data from children
     has_child_counts_[node_id] = true;
-    uint8_t nc = static_cast<uint8_t>(children.size());
+    uint32_t nc = static_cast<uint32_t>(children.size());
     num_children_[node_id] = nc;
 
     for (std::size_t i = 0; i < num_variable_sites_; i++) {
@@ -469,10 +1113,11 @@ class tree_index {
 
   std::vector<dfs_info> dfs_info_;
   std::vector<uint8_t> has_dfs_info_;
+  std::vector<uint8_t> is_valid_;
   std::vector<uint8_t> fitch_sets_;
-  std::vector<std::array<uint8_t, 4>> child_counts_;
+  std::vector<std::array<uint32_t, 4>> child_counts_;
   std::vector<uint8_t> has_child_counts_;
-  std::vector<uint8_t> num_children_;
+  std::vector<uint32_t> num_children_;
   std::vector<uint8_t> allele_union_;
   std::vector<std::size_t> parent_;
   std::vector<std::vector<std::size_t>> children_;
@@ -560,7 +1205,7 @@ class move_enumerator {
 
       if (src_parent_is_binary && index_.has_child_counts(src_parent)) {
         auto counts = index_.get_child_counts(src_parent, si);
-        uint8_t nc = index_.get_num_children(src_parent);
+        uint32_t nc = index_.get_num_children(src_parent);
         total_score_change -= fitch_cost_from_counts(counts, nc);
       }
 
@@ -574,9 +1219,9 @@ class move_enumerator {
         if (!index_.has_child_counts(node)) continue;
 
         auto counts = index_.get_child_counts(node, si);
-        uint8_t nc = index_.get_num_children(node);
+        uint32_t nc = index_.get_num_children(node);
         int old_cost = fitch_cost_from_counts(counts, nc);
-        uint8_t new_nc = nc;
+        uint32_t new_nc = nc;
 
         if (on_src_path.count(node)) {
           if (node == src_parent && !src_parent_is_binary) {
@@ -677,7 +1322,7 @@ class move_enumerator {
               if (!index_.has_child_counts(above)) break;
 
               auto counts = index_.get_child_counts(above, si);
-              uint8_t nc = index_.get_num_children(above);
+              uint32_t nc = index_.get_num_children(above);
               int old_cost_above = fitch_cost_from_counts(counts, nc);
 
               for (int j = 0; j < 4; j++) {
@@ -740,7 +1385,7 @@ class move_enumerator {
       auto const* sibling_fitch = index_.get_fitch_set_ptr(sibling);
       for (std::size_t si = 0; si < n_sites; si++) {
         auto& counts = index_.get_child_counts(src_parent, si);
-        uint8_t nc = index_.get_num_children(src_parent);
+        uint32_t nc = index_.get_num_children(src_parent);
         result.score_change -= fitch_cost_from_counts(counts, nc);
         result.old_fitch[si] = src_parent_fitch[si];
         result.new_fitch[si] = sibling_fitch[si];
@@ -749,7 +1394,7 @@ class move_enumerator {
       auto const* src_fitch = index_.get_fitch_set_ptr(src);
       for (std::size_t si = 0; si < n_sites; si++) {
         auto counts = index_.get_child_counts(src_parent, si);
-        uint8_t nc = index_.get_num_children(src_parent);
+        uint32_t nc = index_.get_num_children(src_parent);
         int old_cost = fitch_cost_from_counts(counts, nc);
 
         uint8_t sf = src_fitch[si];
@@ -758,7 +1403,7 @@ class move_enumerator {
             if (counts[j] > 0) counts[j]--;
           }
         }
-        uint8_t new_nc = nc - 1;
+        uint32_t new_nc = nc - 1;
         int new_cost = fitch_cost_from_counts(counts, new_nc);
         uint8_t new_fitch = fitch_set_from_counts(counts, new_nc);
 
@@ -780,7 +1425,7 @@ class move_enumerator {
                                 src_removal_result& removal) const {
     std::size_t n_sites = index_.num_variable_sites();
     auto const* lca_fitch = index_.get_fitch_set_ptr(current_lca);
-    uint8_t nc = index_.get_num_children(current_lca);
+    uint32_t nc = index_.get_num_children(current_lca);
 
     for (std::size_t si = 0; si < n_sites; si++) {
       auto counts = index_.get_child_counts(current_lca, si);
@@ -863,11 +1508,11 @@ class move_enumerator {
     while (true) {
       if (index_.has_child_counts(node)) {
         auto const* node_fitch_ptr = index_.get_fitch_set_ptr(node);
-        uint8_t nc = index_.get_num_children(node);
+        uint32_t nc = index_.get_num_children(node);
         bool is_lca = (node == lca);
-        uint8_t effective_nc =
-            is_lca ? static_cast<uint8_t>(static_cast<int>(nc) +
-                                          removal.lca_nc_adjustment)
+        uint32_t effective_nc =
+            is_lca ? static_cast<uint32_t>(static_cast<int>(nc) +
+                                           removal.lca_nc_adjustment)
                    : nc;
 
         for (std::size_t si = 0; si < n_sites; si++) {
