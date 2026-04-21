@@ -96,9 +96,40 @@ larch2 --dag-pb INPUT -n 500 --patience 5 --drift 500 \
        -o out.dag.pb.gz --trim
 ```
 
+## Cross-drift-seed variance (N=4 per cell)
+
+Sweep at 4 drift-seeds (`0xD1F75EED`, `1`, `42`, `0xBADDCAFE`) × 3
+tree-seeds × 2 modes = 24 runs on rotaA.
+
+- **Final parsimony 629: 24/24 runs.** Robust.
+- **Trimmed-DAG enrichment: combine 6.9×–8.9× legacy** across 12
+  (drift-seed, tree-seed) cells (median 7.9×). Stable.
+- **Wall-clock combine / legacy: 1.05×–1.94× per cell** across drift-seeds.
+- **Drift attempts to first reach 629 (seed42 hard plateau)**:
+  combine is faster in 3/4 drift-seeds (0.14×, 0.38×, 0.38×) and
+  slower in 1/4 (2.62×). Geometric mean 0.48× — directional
+  support for combine's "broader-walk" advantage, but **high variance**;
+  individual drift-seeds can produce combine advantage as extreme
+  as 0.14× or disadvantage as extreme as 2.62×.
+- On seed43/44, at 3 of 4 drift-seeds the 630→629 transition is
+  handled by the **main SPR-merge loop** between drift rounds
+  rather than inside a drift round; in those cases drift mode has
+  negligible influence on the final escape.
+
+Shippable claim: combine always reaches the same final parsimony as
+legacy and produces a substantially richer trimmed DAG (~8×); its
+attempt-count advantage on hard plateaus is real on average but
+variable from drift-seed to drift-seed.
+
+See `~/agent-memory/reports/s131-variance/RESULTS.md` for the full
+matrix and methodology.
+
 ## Caveats
 
-- N=1 per (seed, mode) at pinned drift-seed. Cross-drift-seed
-  variance has not been measured systematically.
+- N=1 at pinned drift-seed in the measurement section above; N=4
+  per cell across the 4 drift-seeds listed under Cross-drift-seed
+  variance. Attempt-count metrics have high variance across
+  drift-seeds; final parsimony and trimmed-DAG enrichment do not.
 - Measurement depth is rotaA-only. Other dataset families may
-  differ.
+  differ. The theoretical argument (broader walk → fewer attempts
+  on hard plateaus) is mode-intrinsic, not rotaA-specific.
