@@ -89,9 +89,9 @@ larch2 --dag-pb INPUT -n 500 --patience 5 --drift 500 \
        --inplace-fragments every \
        -o out.dag.pb.gz --trim
 
-# Reproduce the rotaA measurement:
+# Reproduce the rotaA measurement (at the default --drift-seed):
 larch2 --dag-pb INPUT -n 500 --patience 5 --drift 500 \
-       --drift-mode combine --drift-seed 0xD1F75EED \
+       --drift-mode combine \
        --move-coeff-nodes 1 --move-coeff-pscore 1 \
        -o out.dag.pb.gz --trim
 ```

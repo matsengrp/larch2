@@ -545,7 +545,8 @@ static args parse_args(int argc, char** argv) {
         std::exit(1);
       }
     } else if (arg == "--drift-seed") {
-      a.drift_seed = static_cast<std::uint32_t>(std::stoull(std::string{next()}));
+      a.drift_seed = static_cast<std::uint32_t>(
+          std::stoull(std::string{next()}, nullptr, 0));
     } else if (arg == "--version") {
       std::cerr << "larch2 " << larch::version << " (" << larch::git_commit
                 << ")\n";
