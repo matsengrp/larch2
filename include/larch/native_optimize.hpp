@@ -201,7 +201,7 @@ class tree_index {
   uint8_t const* get_ref_alleles_ptr() const { return ref_alleles_.data(); }
   std::size_t get_subtree_size(std::size_t node) const { return subtree_size_[node]; }
 
-  // Phase 24: Compute total parsimony score from tree_index flat arrays.
+  // Compute total parsimony score from tree_index flat arrays.
   // Iterates all valid inner nodes and counts sites where children disagree
   // (Fitch cost = 1).  O(N × sites), no recursion.
   int compute_parsimony_score() const {
@@ -212,8 +212,7 @@ class tree_index {
       if (nc == 0) continue;
       std::size_t base = nid * num_variable_sites_;
       for (std::size_t i = 0; i < num_variable_sites_; i++) {
-        score += fitch_cost_from_counts(child_counts_[base + i],
-                                        static_cast<uint8_t>(nc));
+        score += fitch_cost_from_counts(child_counts_[base + i], nc);
       }
     }
     return score;
@@ -223,7 +222,7 @@ class tree_index {
     return node < num_nodes_ && is_valid_[node];
   }
 
-  // Phase 11: Grow all flat arrays so that node indices up to new_high_mark-1
+  // Grow all flat arrays so that node indices up to new_high_mark-1
   // are valid slots.  Called by update_topology when apply_spr_inplace appends
   // a node beyond the current capacity.
   void ensure_capacity(std::size_t new_high_mark) {
@@ -244,17 +243,18 @@ class tree_index {
     num_nodes_ = new_high_mark;
   }
 
-  // Phase 10: Patch parent_[], children_[], and is_valid_[] to reflect the
+  // Patch parent_[], children_[], and is_valid_[] to reflect the
   // topology changes described by an spr_result.  Must be called after
   // apply_spr_inplace().
   //
   // Only parent_[], children_[], and is_valid_[] are updated here.
-  // The following remain stale and must be updated by later phases:
-  //   - searchable_nodes_    (Phase 12 — call update_searchable_nodes())
-  //   - subtree_size_[]      (Phase 13 — call update_subtree_sizes())
-  //   - tree_root_           (Phase 15 — call update_tree_root())
-  //   - is_condensed_[]      (Phase 16 — call update_condensed_nodes())
-  //   - dfs_info_[]          (Phase 14 — call recompute_dfs())
+  // The following remain stale and must be refreshed by their dedicated
+  // update helpers:
+  //   - searchable_nodes_    (call update_searchable_nodes())
+  //   - subtree_size_[]      (call update_subtree_sizes())
+  //   - tree_root_           (call update_tree_root())
+  //   - is_condensed_[]      (call update_condensed_nodes())
+  //   - dfs_info_[]          (call recompute_dfs())
   void update_topology(spr_result const& r) {
     ensure_capacity(d_.node_high_mark());
 
@@ -303,12 +303,12 @@ class tree_index {
     parent_[r.src] = r.new_inner;
   }
 
-  // Phase 12: Patch searchable_nodes_ after an SPR.
+  // Patch searchable_nodes_ after an SPR.
   // - Add new_inner (always a valid inner node, never tree root or UA).
   // - Remove collapsed_node if src_parent was binary and got collapsed.
   // Must be called after update_topology().
-  // Note: src and dst stay in the list (already present).  Phase 16 may
-  // further adjust searchable_nodes_ if condensation status changes for
+  // Note: src and dst stay in the list (already present). Condensation may
+  // further adjust searchable_nodes_ if status changes for
   // leaves near the SPR source or destination.
   void update_searchable_nodes(spr_result const& r) {
     assert(is_valid(r.new_inner) && "update_topology must be called first");
@@ -322,14 +322,14 @@ class tree_index {
     searchable_nodes_.push_back(r.new_inner);
   }
 
-  // Phase 13: Incrementally recompute subtree_size_[] after an SPR.
+  // Incrementally recompute subtree_size_[] after an SPR.
   // Walk up from the insertion point (new_inner) and the removal point
   // (src_parent or grandparent if collapsed) to tree_root_, recomputing
   // subtree_size_[node] = 1 + sum(subtree_size_[child]) at each step.
   // Both paths merge at LCA so total work is bounded by 2 × depth.
   // Must be called after update_topology().
   //
-  // Note: subtree_size_ must be correct before any Fitch update (Phase 17+)
+  // Note: subtree_size_ must be correct before any incremental Fitch update
   // that uses the parallel path, since fitch_bottom_up_async checks
   // subtree_size_[child_id] >= kFitchParallelThreshold per node.
   void update_subtree_sizes(spr_result const& r) {
@@ -353,7 +353,7 @@ class tree_index {
     }
   }
 
-  // Phase 15: Re-derive tree_root_ after an SPR that changes which node is
+  // Re-derive tree_root_ after an SPR that changes which node is
   // the direct child of UA.  Two cases:
   //   (a) Removal collapse: src_parent was binary and was the old tree root —
   //       the surviving child takes over.  Resolved via DAG query because
@@ -375,7 +375,7 @@ class tree_index {
     }
   }
 
-  // Phase 16: Re-check condensation for leaf children near the SPR.
+  // Re-check condensation for leaf children near the SPR.
   // An SPR can create or break CG-identical sibling pairs, changing which
   // leaves are condensed.  Re-check only the children of the parent that
   // lost src (source side) and the children of new_inner (destination side).
@@ -397,13 +397,13 @@ class tree_index {
     }
   }
 
-  // Phase 14: Recompute dfs_info_[] for the entire tree.
+  // Recompute dfs_info_[] for the entire tree.
   // DFS indices (dfs_index, dfs_end_index, level) cannot be cheaply updated
   // incrementally — an SPR can change the DFS interval of nodes far from the
   // move.  Re-traverse the entire tree from tree_root_.
   // This is O(N) with no per-site work, so negligible vs Fitch updates.
   // Must be called after update_topology() (so children_[] is correct) and
-  // after update_tree_root() (so tree_root_ is valid — see Phase 15).
+  // after update_tree_root() (so tree_root_ is valid).
   void recompute_dfs() {
     assert(is_valid_[tree_root_] &&
            "recompute_dfs: tree_root_ is invalid — call update_tree_root() "
@@ -415,7 +415,7 @@ class tree_index {
            "recompute_dfs: tree_root_ unreachable after DFS traversal");
   }
 
-  // Phase 17: Recompute a single node's Fitch data from its current children.
+  // Recompute a single node's Fitch data from its current children.
   // Fused single-pass loop (sites-outer, children-inner) to avoid separate
   // init/accumulate/finalize passes over num_variable_sites_.
   void recompute_node_fitch(std::size_t node_id) {
@@ -442,14 +442,14 @@ class tree_index {
     }
   }
 
-  // Phase 18 helper: result of a tracked Fitch recomputation.
+  // Result of a tracked Fitch recomputation.
   struct fitch_recompute_result {
     bool changed;  // true if fitch_sets_ or allele_union_ differs from previous
     int delta;     // parsimony cost change at this node
   };
 
   // Fused recompute with change detection (both fitch_sets_ and allele_union_)
-  // and parsimony delta tracking (prepares for Phase 25).
+  // and parsimony delta tracking.
   fitch_recompute_result recompute_node_fitch_tracked(std::size_t node_id) {
     assert(!is_leaf(d_, node_id) &&
            "recompute_node_fitch_tracked must not be called on a leaf node");
@@ -491,7 +491,7 @@ class tree_index {
     return {changed, delta};
   }
 
-  // Phase 18: Walk from start to tree_root_, recomputing Fitch at each step.
+  // Walk from start to tree_root_, recomputing Fitch at each step.
   // Stop early if neither fitch_sets_ nor allele_union_ change at a node (all
   // ancestors are already correct).  Returns number of nodes updated.
   // delta_out accumulates the parsimony cost change across all recomputed nodes.
@@ -523,7 +523,7 @@ class tree_index {
 
   // Propagate Fitch upward from start, stopping before stop_before (exclusive).
   // The stop_before node is NOT recomputed — the caller handles it.
-  // Returns number of nodes updated.  Prepares for Phase 22 (combined update).
+  // Returns number of nodes updated.
   std::size_t propagate_fitch_up_to(std::size_t start, std::size_t stop_before,
                                     int& delta_out) {
     std::size_t count = 0;
@@ -552,8 +552,8 @@ class tree_index {
     return propagate_fitch_up_to(start, stop_before, delta);
   }
 
-  // Phase 19: Initialize Fitch data for a newly created inner node.
-  // When a new inner node is created (Phase 6), its children (dst and src)
+  // Initialize Fitch data for a newly created inner node.
+  // When a new inner node is created, its children (dst and src)
   // already have correct Fitch sets — only their parent changed.  This
   // computes the new node's Fitch sets from scratch.
   // Returns the parsimony cost delta introduced by this node.  For a new
@@ -582,7 +582,7 @@ class tree_index {
     return cost;
   }
 
-  // Phase 20: Fitch update for the source removal path.
+  // Fitch update for the source removal path.
   // After an SPR detaches src from src_parent, the Fitch data along the
   // removal path is stale.  If src_parent was collapsed, start from
   // grandparent (which gained remaining_child as a direct child); otherwise
@@ -613,7 +613,7 @@ class tree_index {
     update_fitch_removal(r, delta);
   }
 
-  // Phase 21: Fitch update for the destination insertion path.
+  // Fitch update for the destination insertion path.
   // After reattaching src under new_inner next to dst, recompute Fitch
   // along the insertion path: first initialize new_inner's Fitch from its
   // children (src and dst), then propagate upward from dst_parent (which
@@ -635,7 +635,7 @@ class tree_index {
     update_fitch_insertion(r, delta);
   }
 
-  // Phase 22: Combined incremental Fitch update.
+  // Combined incremental Fitch update.
   // Both the removal path (src_parent → root) and the insertion path
   // (dst_parent → root) converge at the LCA of src and dst.  Instead of
   // propagating both paths independently to root (doubling work on the
@@ -862,7 +862,7 @@ class tree_index {
   }
 
   // Walk up from node to tree_root_, recomputing subtree_size at each step.
-  // Guards against stale tree_root_ (e.g., after root collapse before Phase 15
+  // Guards against stale tree_root_ (e.g., after root collapse before
   // updates tree_root_): stops if the next parent is invalid (such as the UA
   // node).  Iteration bound prevents infinite loops on corrupted parent_ chains.
   void walk_up_recompute(std::size_t node) {

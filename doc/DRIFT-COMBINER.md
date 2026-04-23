@@ -12,7 +12,7 @@ which mechanism runs per attempt.
 | `legacy` | Sample tree, take 1–5 random neutral SPR steps, score all moves at radius `2*depth`, emit top `--max-moves` improving fragments, merge. |
 | `inplace` | Sample tree, run `inplace_move_producer` for up to `--inplace-steps` steps under `--inplace-threshold` / `--inplace-temperature` / `--inplace-budget`; emit final state (or every step with `--inplace-fragments every`). Used automatically under `auto` when `--inplace-steps > 0`. |
 | `combine` | Run the `inplace` prefix, then from the trajectory endpoint run the `legacy` fanout scoring. Merges both phases' fragments per attempt. |
-| `combine-lwf` | Like `combine` but substitutes legacy's neutral-walk loop for the inplace prefix. Research baseline — strictly worse than `combine` on measured inputs (see below); not recommended for production. |
+| `combine-lwf` | Like `combine` but substitutes legacy's neutral-walk loop for the inplace prefix. Experimental research baseline; slower than `combine` on the initial seed44 comparison below and not recommended for production. |
 | `auto` (default) | `inplace` if `--inplace-steps > 0`, else `legacy`. Preserves pre-combiner dispatch. |
 
 ## When to use each
@@ -20,7 +20,7 @@ which mechanism runs per attempt.
 - **`legacy`** wins on easy plateaus where improving structure is
   dense within 1–5 neutral steps of the sampled tree. Low per-attempt
   cost, 50× fanout density per attempt.
-- **`combine`** wins on hard plateaus where improving moves are
+- **`combine`** can win on hard plateaus where improving moves are
   several worsening-accepted steps away: its inplace walk reaches
   positions that a 1–5-step neutral walk cannot, and the fanout stage
   still captures dense-local structure. Also produces a substantially
@@ -60,15 +60,26 @@ Per-seed `combine / legacy` ratios:
 
 | Seed | R3 hardness | R3 att | Wall | Trimmed nodes |
 |:---:|:---|:---:|:---:|:---:|
-| 42 | hard (460) | **0.38×** | 1.16× | 8.9× |
+| 42 | hard (460) | **0.38×** at this drift seed | 1.16× | 8.9× |
 | 43 | trivial (1) | 1.00× | 1.77× | 7.9× |
 | 44 | medium (48) | 1.42× | 1.78× | 7.9× |
 
 Plateau hardness is the dominant variable. `combine` pays a per-attempt
 overhead that dominates on easy plateaus, but its inplace walk's
-broader reachable neighborhood cuts attempt count as plateaus get
-harder — and the two effects cross on seed42's hard 630→629 plateau.
-Trimmed-DAG enrichment is stable across hardness regimes.
+broader reachable neighborhood can cut attempt count as plateaus get
+harder. In the pinned-seed table above the two effects cross on seed42's
+hard 630→629 plateau; the cross-drift-seed sweep below shows the size of
+that advantage is variable. Trimmed-DAG enrichment is stable across
+hardness regimes.
+
+## `combine-lwf` baseline
+
+`combine-lwf` is retained for controlled experiments that replace the inplace
+prefix with legacy's neutral-walk loop while keeping the combiner fanout stage.
+The initial seed44 R3 630→629 comparison was slower than `combine` (166 vs 68
+drift attempts), but this single comparison is not broad enough to claim a
+general ordering. Use `combine-lwf` only when reproducing that baseline or
+running new combiner experiments; the CLI emits a warning when it is selected.
 
 ## Examples
 
@@ -130,6 +141,13 @@ matrix and methodology.
   per cell across the 4 drift-seeds listed under Cross-drift-seed
   variance. Attempt-count metrics have high variance across
   drift-seeds; final parsimony and trimmed-DAG enrichment do not.
+  Treat the pinned `0.38×` seed42 ratio as one draw, not a standalone
+  effect size.
+- Walk lengths differ by default: `combine` uses a 5-step inplace prefix
+  when `--inplace-steps` is unset, while `legacy` samples a neutral walk
+  length uniformly from 1–5 (expected length 3). This biases raw wall-time
+  ratios against `combine` by giving it more walk work per attempt before
+  any algorithmic comparison.
 - Measurement depth is rotaA-only. Other dataset families may
   differ. The theoretical argument (broader walk → fewer attempts
   on hard plateaus) is mode-intrinsic, not rotaA-specific.

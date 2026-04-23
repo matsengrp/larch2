@@ -5467,7 +5467,7 @@ static void test_incremental_fitch_vs_rebuild() {
 // Phase 24 tests: compute_parsimony_score (flat iteration)
 // ---------------------------------------------------------------------------
 
-// Verify compute_parsimony_score matches the recursive version.
+// Verify compute_parsimony_score on the small suboptimal tree.
 static void test_compute_parsimony_score_basic() {
   std::println("test_compute_parsimony_score_basic");
 
@@ -5476,10 +5476,11 @@ static void test_compute_parsimony_score_basic() {
   tree_index idx{tree};
 
   int flat = idx.compute_parsimony_score();
-  int recursive = tree_state::compute_parsimony_from_index(idx);
+  int wrapper = tree_state::compute_parsimony_from_index(idx);
 
-  assert(flat == recursive);
-  std::println("  flat={} recursive={}", flat, recursive);
+  assert(flat == 8);
+  assert(wrapper == flat);
+  std::println("  score={}", flat);
   std::println("  PASS");
 }
 
@@ -5491,9 +5492,10 @@ static void test_compute_parsimony_score_12leaf() {
   tree_index idx{t.tree};
 
   int flat = idx.compute_parsimony_score();
-  int recursive = tree_state::compute_parsimony_from_index(idx);
+  int wrapper = tree_state::compute_parsimony_from_index(idx);
 
-  assert(flat == recursive);
+  assert(flat == 16);
+  assert(wrapper == flat);
   std::println("  score={}", flat);
   std::println("  PASS");
 }
@@ -5510,11 +5512,40 @@ static void test_compute_parsimony_score_after_spr() {
   apply_full_fitch_update(idx, r);
 
   int flat = idx.compute_parsimony_score();
-  int recursive = tree_state::compute_parsimony_from_index(idx);
+  int wrapper = tree_state::compute_parsimony_from_index(idx);
 
-  assert(flat == recursive);
-  assert(flat != before);  // L6→L10 changes parsimony
+  assert(before == 16);
+  assert(flat == 15);  // L6→L10 improves parsimony by one.
+  assert(wrapper == flat);
   std::println("  before={} after={}", before, flat);
+  std::println("  PASS");
+}
+
+// Regression guard: child counts must not be narrowed to 8 bits when scoring.
+static void test_compute_parsimony_score_wide_polytomy() {
+  std::println("test_compute_parsimony_score_wide_polytomy");
+
+  phylo_dag d;
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = "A";
+  d.set_root(ua);
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("A", "A");
+  add_edge(d, ua.index(), root.index(), 0);
+
+  for (std::size_t i = 0; i < 300; ++i) {
+    auto leaf = d.append_node<node_kind::leaf>();
+    leaf.cg() = cg_from_sequence("T", "A");
+    leaf.sample_id() = "L" + std::to_string(i);
+    add_edge(d, root.index(), leaf.index(), 0);
+  }
+  recompute_edge_mutations(d);
+
+  tree_index idx{d};
+  assert(idx.get_num_children(root.index()) == 300);
+  assert(idx.compute_parsimony_score() == 0);
+  std::println("  score=0 children={}", idx.get_num_children(root.index()));
   std::println("  PASS");
 }
 
@@ -5886,8 +5917,10 @@ static void test_inplace_producer_worsening_budget() {
       producer(tree, [&](phylo_dag frag) { fragments.push_back(std::move(frag)); },
                rng);
 
-  // With budget=1, the loop should stop before max_steps in most cases.
-  assert(result.steps_taken <= 20);
+  // With budget=1 and this fixed seed, the second worsening move exhausts the
+  // budget and the loop must stop before max_steps.
+  assert(result.steps_taken < params.max_steps);
+  assert(result.steps_taken <= 2);
   std::println("  initial={} final={} steps={}", result.initial_score,
                result.final_score, result.steps_taken);
   std::println("  PASS");
@@ -5915,16 +5948,12 @@ static void test_inplace_producer_escape() {
       producer(tree, [&](phylo_dag frag) { fragments.push_back(std::move(frag)); },
                rng);
 
-  if (result.steps_taken > 0) {
-    // Only improving moves were taken, so final < initial
-    assert(result.escaped);
-    assert(result.final_score < result.initial_score);
-    std::println("  escaped: {} -> {} in {} steps", result.initial_score,
-                 result.final_score, result.steps_taken);
-  } else {
-    assert(!result.escaped);
-    std::println("  already at local minimum");
-  }
+  assert(result.steps_taken > 0);
+  // Only improving moves were accepted, so the final score must be lower.
+  assert(result.escaped);
+  assert(result.final_score < result.initial_score);
+  std::println("  escaped: {} -> {} in {} steps", result.initial_score,
+               result.final_score, result.steps_taken);
 
   std::println("  PASS");
 }
@@ -5954,6 +5983,7 @@ static void test_move_selection_random_uniform() {
     if (result.steps_taken > 0) final_scores.insert(result.final_score);
   }
 
+  assert(final_scores.size() >= 2);
   std::println("  distinct final scores across 20 seeds: {}", final_scores.size());
   std::println("  PASS");
 }
@@ -6004,6 +6034,7 @@ static void test_move_selection_random_weighted() {
           tree, [&](phylo_dag frag) { fragments.push_back(std::move(frag)); }, rng);
       if (result.steps_taken > 0) scores.insert(result.final_score);
     }
+    assert(scores.size() >= 2);
     std::println("  high T: {} distinct scores across 20 seeds", scores.size());
   }
 
@@ -6064,7 +6095,7 @@ static void test_drift_selector_default_variation() {
                uniform_scores.size());
 
   assert(best_scores.size() == 1);
-  assert(uniform_scores.size() >= 2);
+  assert(uniform_scores.size() >= 5);
 
   std::println("  PASS");
 }
@@ -6371,6 +6402,8 @@ static void test_local_minimum_escape() {
       auto result = producer(tree, [](phylo_dag) {}, rng);
       seen_scores.insert(result.final_score);
     }
+    assert(!improving.empty());
+    assert(seen_scores.size() >= 2);
     std::println("  distinct scores from 20 runs: {}", seen_scores.size());
   }
 
@@ -6604,6 +6637,7 @@ int main() {
   test_compute_parsimony_score_basic();
   test_compute_parsimony_score_12leaf();
   test_compute_parsimony_score_after_spr();
+  test_compute_parsimony_score_wide_polytomy();
 
   // Phase 26: tree_state::apply_move
   test_apply_move_sequential();

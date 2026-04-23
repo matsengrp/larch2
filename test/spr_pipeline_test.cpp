@@ -591,6 +591,8 @@ static void test_optimize_dag_v2_mixed_producers() {
   auto initial_nodes = m.result_node_count();
   auto initial_edges = m.result_edge_count();
   auto initial_leaves = get_leaf_ids(m.get_result());
+  tree_index initial_idx{m.get_result()};
+  int initial_score = initial_idx.compute_parsimony_score();
   std::println("  initial: {} nodes, {} edges", initial_nodes, initial_edges);
 
   native_move_producer native{.max_moves = 10};
@@ -619,9 +621,15 @@ static void test_optimize_dag_v2_mixed_producers() {
   auto final_leaves = get_leaf_ids(m.get_result());
   assert(final_leaves == initial_leaves);
 
-  // DAG should have grown
+  // DAG should have grown and the optimizer should improve parsimony.
   assert(final_nodes >= initial_nodes);
   assert(final_edges >= initial_edges);
+  assert(!results.empty());
+  bool improved = false;
+  for (auto& r : results)
+    if (r.parsimony_score < initial_score) improved = true;
+  assert(improved);
+  assert(results.back().parsimony_score < initial_score);
 
   // At least some trees were merged
   bool any_merged = false;

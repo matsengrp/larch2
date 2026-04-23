@@ -16,7 +16,7 @@ namespace larch {
 // spr_result is defined in native_optimize.hpp (needed by tree_index::update_topology).
 
 // ============================================================================
-// Phase 2: tree_state — mutable tree + index + running score for multi-step loop
+// tree_state — mutable tree + index + running score for multi-step loop
 // ============================================================================
 
 struct tree_state {
@@ -46,44 +46,16 @@ struct tree_state {
   // nodes and variable sites.  A Fitch cost of 1 at a site means the node's
   // children disagree (no single allele is present in all children).
   static int compute_parsimony_from_index(tree_index const& idx) {
-    int score = 0;
-    auto root = idx.get_tree_root();
-    score = compute_parsimony_below(idx, root);
-    return score;
+    return idx.compute_parsimony_score();
   }
 
-  // Phase 26: Apply an SPR move in-place and incrementally update the index.
+  // Apply an SPR move in-place and incrementally update the index.
   // Declared here, defined after apply_spr_inplace (below).
   int apply_move(std::size_t src, std::size_t dst);
-
- private:
-  // Recursive bottom-up Fitch cost accumulation.
-  static int compute_parsimony_below(tree_index const& idx, std::size_t node) {
-    int cost = 0;
-    auto const& children = idx.get_children(node);
-
-    // Leaf nodes have zero Fitch cost.
-    if (children.empty()) return 0;
-
-    // Recurse into children first.
-    for (auto child : children) {
-      cost += compute_parsimony_below(idx, child);
-    }
-
-    // Add this node's Fitch cost: count sites where children disagree.
-    auto n_sites = idx.num_variable_sites();
-    uint8_t nc = idx.get_num_children(node);
-    for (std::size_t i = 0; i < n_sites; i++) {
-      auto const& counts = idx.get_child_counts(node, i);
-      cost += fitch_cost_from_counts(counts, nc);
-    }
-
-    return cost;
-  }
 };
 
 // ============================================================================
-// Phase 4-5 helpers
+// Topology-edit helpers
 // ============================================================================
 
 // Result of collapsing a binary parent node.
@@ -135,7 +107,7 @@ inline std::size_t get_parent_edge(phylo_dag& d, std::size_t node_idx) {
 }
 
 // ============================================================================
-// Phase 4: Detach source from parent
+// Detach source from parent
 // ============================================================================
 
 // Count the number of child edges for a node (does not rely on clade offsets).
@@ -194,7 +166,7 @@ inline std::size_t detach_source(phylo_dag& d, std::size_t src,
 }
 
 // ============================================================================
-// Phase 5: Collapse binary source parent
+// Collapse binary source parent
 // ============================================================================
 
 // If src_parent had exactly 2 children before detach (now 1), collapse it:
@@ -230,7 +202,7 @@ inline std::optional<collapse_info> collapse_binary_parent(
 }
 
 // ============================================================================
-// Phase 6: Reattach at destination
+// Reattach at destination
 // ============================================================================
 
 // Result of reattach_at_destination: the new inner node and the parent it was
@@ -306,7 +278,7 @@ inline reattach_result reattach_at_destination(phylo_dag& d, std::size_t src,
 }
 
 // ============================================================================
-// Phase 7: apply_spr_inplace — assemble phases 4–6 into a single function
+// apply_spr_inplace — assemble detach/collapse/reattach into one function
 // ============================================================================
 
 // Compute the lowest common ancestor of two nodes using tree_index DFS
@@ -339,13 +311,13 @@ inline spr_result apply_spr_inplace(phylo_dag& tree, tree_index const& index,
   // 2. Compute LCA before any topology changes.
   std::size_t lca = compute_lca(index, src, dst);
 
-  // 3. Detach src (Phase 4).
+  // 3. Detach src.
   auto old_child_count = detach_source(tree, src, src_parent_val);
 
-  // 4. If binary, collapse src_parent (Phase 5).
+  // 4. If binary, collapse src_parent.
   auto cinfo = collapse_binary_parent(tree, src_parent_val, old_child_count);
 
-  // 5. Reattach at dst (Phase 6).  This also resolves dst_parent after
+  // 5. Reattach at dst. This also resolves dst_parent after
   //    collapse (may have changed if src_parent == dst_parent collapsed).
   auto [new_inner, dst_parent_val] = reattach_at_destination(tree, src, dst);
 
@@ -364,7 +336,7 @@ inline spr_result apply_spr_inplace(phylo_dag& tree, tree_index const& index,
   };
 }
 
-// Phase 26: Apply an SPR move in-place and incrementally update the index.
+// Apply an SPR move in-place and incrementally update the index.
 // Runs the full update pipeline: topology, tree root, DFS, subtree sizes,
 // searchable nodes, condensation, and combined Fitch update.  Returns the
 // parsimony delta.
@@ -391,7 +363,7 @@ inline int tree_state::apply_move(std::size_t src, std::size_t dst) {
 }
 
 // ============================================================================
-// Phase 27: Extract a clean fragment from a modified phylo_dag
+// Extract a clean fragment from a modified phylo_dag
 // ============================================================================
 
 // After in-place SPR moves, inner-node CGs and edge mutations are stale.
@@ -410,15 +382,15 @@ inline phylo_dag extract_fragment(phylo_dag& tree) {
 }
 
 // ============================================================================
-// Phases 28-35: Multi-step in-place optimizer
+// Multi-step in-place optimizer
 // ============================================================================
 
-// Phase 28: Fragment extraction strategy.
+// Fragment extraction strategy.
 // every_step: extract a fragment after each in-place move (maximum DAG diversity).
 // final_only: extract one fragment after the last move (minimum overhead).
 enum class fragment_strategy { every_step, final_only };
 
-// Phase 32: Move selection policy.
+// Move selection policy.
 enum class move_selection { best_improving, random_weighted, random_uniform };
 
 // Default selector for drift-escape mode as a function of temperature.
@@ -430,7 +402,7 @@ inline move_selection drift_default_selector(double temperature) {
                            : move_selection::random_uniform;
 }
 
-// Phase 34: Configuration for the multi-step in-place loop.
+// Configuration for the multi-step in-place loop.
 struct inplace_params {
   std::size_t max_steps{10};
   std::size_t radius{0};                // 0 = auto (depth * 2)
@@ -442,7 +414,7 @@ struct inplace_params {
   double cooling_rate{0.9};             // T *= cooling_rate each step
 };
 
-// Phase 35: Result from one multi-step run.
+// Result from one multi-step run.
 struct inplace_result {
   int initial_score;
   int final_score;
@@ -450,7 +422,7 @@ struct inplace_result {
   bool escaped;  // final_score < initial_score
 };
 
-// Phases 30-31: Multi-step in-place SPR producer.
+// Multi-step in-place SPR producer.
 //
 // Satisfies FragmentProducer (not MoveProducer): moves are relative to an
 // evolving internal work_tree, so the producer emits complete fragment DAGs
