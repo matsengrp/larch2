@@ -89,8 +89,17 @@ inline void recompute_compact_genomes(phylo_dag& d) {
                       pe.get_parent());
 
                   if constexpr (requires { node.cg(); }) {
+                    std::set<mutation_position> existing_mask;
+                    bool leaf_node = true;
+                    for (auto ce : node.get_children()) {
+                      (void)ce;
+                      leaf_node = false;
+                      break;
+                    }
+                    if (leaf_node) existing_mask = node.cg().ambiguity_mask();
                     node.cg() = compact_genome{};
                     node.cg().add_parent_edge(edge_muts, parent_cg, ref);
+                    if (leaf_node) node.cg().set_ambiguity_mask(std::move(existing_mask));
                   }
                   cg_set = true;
                 },
@@ -829,6 +838,7 @@ inline void fitch_assign_compact_genomes(
         [&](auto node) {
           if constexpr (requires { node.cg(); }) {
             for (auto& [pos, base] : node.cg()) var_sites_set.insert(pos);
+            for (auto pos : node.cg().ambiguity_mask()) var_sites_set.insert(pos);
           }
         },
         nv);
@@ -837,6 +847,7 @@ inline void fitch_assign_compact_genomes(
   // mutations at sites that are invariant within the fragment.
   if (root_parent_cg) {
     for (auto& [pos, base] : *root_parent_cg) var_sites_set.insert(pos);
+    for (auto pos : root_parent_cg->ambiguity_mask()) var_sites_set.insert(pos);
   }
   std::pmr::vector<std::size_t> var_sites(var_sites_set.begin(),
                                           var_sites_set.end(), fitch_mr);
@@ -871,9 +882,12 @@ inline void fitch_assign_compact_genomes(
       std::visit(
           [&](auto node) {
             if constexpr (requires { node.cg(); }) {
-              for (std::size_t i = 0; i < n_sites; i++)
-                fitch[nid * n_sites + i] =
-                    base_to_one_hot(node.cg().get_base(var_sites[i], ref));
+              for (std::size_t i = 0; i < n_sites; i++) {
+                auto pos = static_cast<mutation_position>(var_sites[i]);
+                fitch[nid * n_sites + i] = node.cg().is_ambiguous(pos)
+                    ? static_cast<uint8_t>(0b1111)
+                    : base_to_one_hot(node.cg().get_base(pos, ref));
+              }
             }
           },
           nv);

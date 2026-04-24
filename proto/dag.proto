@@ -28,6 +28,7 @@ message edge {
 message node_name {
     int64 node_id = 1; // The node name as given in the edges from the DAG
     repeated string condensed_leaves = 2; // A list of strings for the names of the sequence/sequences which are represented by the node above. can be just one if a leaf is unique. 
+    repeated int32 ambiguous_sites = 3; // 1-indexed leaf no-call sites (IUPAC ambiguity/gap in original alignment)
 }
 
 /// removed the newick since the DAG will have nodes that cannot be represented within a single tree anyway.  

@@ -58,6 +58,7 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
   auto entries = read_fasta(fasta_path);
   std::unordered_map<std::string, std::string> fasta_map;
   for (auto& e : entries) fasta_map[e.name] = std::move(e.sequence);
+  ambiguity_counts ambiguity;
 
   auto nw_bytes = read_file(newick_path);
   std::string newick_str{nw_bytes.data(), nw_bytes.size()};
@@ -137,19 +138,13 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
             auto it = fasta_map.find(node.sample_id());
             if (it == fasta_map.end()) return;
             auto& seq = it->second;
-            std::map<mutation_position, nuc_base> muts;
-            for (std::size_t i = 0; i < seq.size() && i < reference.size();
-                 ++i) {
-              auto ref_base = nuc_base::from_char(reference[i]);
-              auto seq_base = nuc_base::from_char(seq[i]);
-              if (!(ref_base == seq_base)) muts[i + 1] = seq_base;
-            }
-            node.cg() = compact_genome{std::move(muts)};
+            node.cg() = compact_genome_from_sequence(seq, reference, &ambiguity);
           }
         },
         nv);
   }
 
+  warn_if_ambiguities(ambiguity, "input alignment");
   fitch_assign_compact_genomes(d);
   recompute_edge_mutations(d);
   return d;

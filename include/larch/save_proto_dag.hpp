@@ -69,6 +69,10 @@ inline void save_proto_dag(phylo_dag& dag, std::string_view path,
           if constexpr (requires { node.sample_id(); }) {
             nn.condensed_leaves = {node.sample_id()};
           }
+          if constexpr (requires { node.cg(); }) {
+            for (auto pos : node.cg().ambiguity_mask())
+              nn.ambiguous_sites.push_back(static_cast<int32_t>(pos));
+          }
           data.node_names.push_back(std::move(nn));
         },
         nv);

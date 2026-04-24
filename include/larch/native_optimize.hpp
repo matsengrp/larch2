@@ -715,6 +715,16 @@ class tree_index {
           },
           ev);
     }
+    for (auto nv : d_.get_all_nodes()) {
+      std::visit(
+          [&](auto node) {
+            if constexpr (requires { node.cg(); }) {
+              for (auto& [pos, base] : node.cg()) var_sites_set.insert(pos);
+              for (auto pos : node.cg().ambiguity_mask()) var_sites_set.insert(pos);
+            }
+          },
+          nv);
+    }
     for (auto site : var_sites_set) variable_sites_.push_back(site);
     num_variable_sites_ = variable_sites_.size();
 
@@ -804,16 +814,17 @@ class tree_index {
     compute_fitch_sets();
   }
 
-  nuc_base get_node_base(std::size_t nid, std::size_t site,
-                         std::string const& ref) {
+  uint8_t get_node_fitch_set(std::size_t nid, std::size_t site,
+                             std::string const& ref) {
     auto nv = d_.get_node(nid);
-    nuc_base result;
+    uint8_t result = base_to_one_hot(nuc_base::from_char(ref.at(site - 1)));
     std::visit(
         [&](auto node) {
           if constexpr (requires { node.cg(); }) {
-            result = node.cg().get_base(site, ref);
-          } else {
-            result = nuc_base::from_char(ref.at(site - 1));
+            auto pos = static_cast<mutation_position>(site);
+            result = node.cg().is_ambiguous(pos)
+                ? static_cast<uint8_t>(0b1111)
+                : base_to_one_hot(node.cg().get_base(pos, ref));
           }
         },
         nv);
@@ -989,10 +1000,9 @@ class tree_index {
 
     if (is_leaf(d_, node_id)) {
       for (std::size_t i = 0; i < num_variable_sites_; i++) {
-        auto base = get_node_base(node_id, variable_sites_[i], ref);
-        uint8_t singleton = base_to_one_hot(base);
-        fitch_sets_[base_offset + i] = singleton;
-        allele_union_[base_offset + i] = singleton;
+        uint8_t fset = get_node_fitch_set(node_id, variable_sites_[i], ref);
+        fitch_sets_[base_offset + i] = fset;
+        allele_union_[base_offset + i] = fset;
       }
     } else {
       auto& children = children_[node_id];
@@ -1032,10 +1042,9 @@ class tree_index {
 
     if (is_leaf(d_, node_id)) {
       for (std::size_t i = 0; i < num_variable_sites_; i++) {
-        auto base = get_node_base(node_id, variable_sites_[i], ref);
-        uint8_t singleton = base_to_one_hot(base);
-        fitch_sets_[base_offset + i] = singleton;
-        allele_union_[base_offset + i] = singleton;
+        uint8_t fset = get_node_fitch_set(node_id, variable_sites_[i], ref);
+        fitch_sets_[base_offset + i] = fset;
+        allele_union_[base_offset + i] = fset;
       }
       co_return;
     }

@@ -12,6 +12,7 @@ message mut {
 
 message mutation_list {
     repeated mut mutation = 1;
+    repeated int32 ambiguous_sites = 2; // 1-indexed leaf no-call sites (IUPAC ambiguity/gap in original alignment)
 }
 
 message condensed_node {

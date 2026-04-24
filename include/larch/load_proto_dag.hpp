@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -37,6 +38,7 @@ struct dag_edge {
 struct dag_node_name {
   int64_t node_id;
   std::vector<std::string> condensed_leaves;
+  std::vector<int32_t> ambiguous_sites;
 };
 
 struct dag_data {
@@ -111,10 +113,17 @@ inline phylo_dag load_proto_dag(std::string_view path) {
   scoped_arena<32768> arena;
   auto* mr = arena.get();
   std::pmr::unordered_map<std::size_t, std::string> node_sample_ids(mr);
+  std::pmr::unordered_map<std::size_t, std::set<mutation_position>>
+      node_ambiguity_masks(mr);
   for (auto& nn : meta.node_names) {
+    auto node_id = static_cast<std::size_t>(nn.node_id);
     if (!nn.condensed_leaves.empty()) {
-      node_sample_ids[static_cast<std::size_t>(nn.node_id)] =
-          nn.condensed_leaves[0];
+      node_sample_ids[node_id] = nn.condensed_leaves[0];
+    }
+    if (!nn.ambiguous_sites.empty()) {
+      auto& mask = node_ambiguity_masks[node_id];
+      for (auto pos : nn.ambiguous_sites)
+        mask.insert(static_cast<mutation_position>(pos));
     }
   }
 
@@ -210,6 +219,19 @@ inline phylo_dag load_proto_dag(std::string_view path) {
   }
 
   recompute_compact_genomes(d);
+
+  for (auto [proto_id, mask] : node_ambiguity_masks) {
+    auto it = proto_to_dag.find(proto_id);
+    if (it == proto_to_dag.end()) continue;
+    auto dag_idx = it->second;
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.cg(); }) {
+            node.cg().set_ambiguity_mask(std::move(mask));
+          }
+        },
+        d.get_node(dag_idx));
+  }
 
   // Set sample IDs for leaves without one.
   // Use CG string as base, but disambiguate duplicates so that
