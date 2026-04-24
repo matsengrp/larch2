@@ -83,10 +83,14 @@ struct scratch_buffers {
 inline int fitch_cost_from_counts(std::array<uint32_t, 4> const& counts,
                                   uint32_t num_children) {
   if (num_children <= 1) return 0;
-  for (int i = 0; i < 4; i++) {
-    if (counts[i] == num_children) return 0;
-  }
-  return 1;
+
+  // Generalized Fitch/Sankoff for polytomies and ambiguous child state sets:
+  // assigning this node to base b costs one change for each child whose
+  // optimal state set excludes b.  Minimize that cost by choosing a base with
+  // maximum child support.
+  uint32_t max_count = 0;
+  for (auto count : counts) max_count = std::max(max_count, count);
+  return static_cast<int>(num_children - max_count);
 }
 
 inline std::size_t compute_tree_max_depth(phylo_dag& d) {
@@ -720,7 +724,8 @@ class tree_index {
           [&](auto node) {
             if constexpr (requires { node.cg(); }) {
               for (auto& [pos, base] : node.cg()) var_sites_set.insert(pos);
-              for (auto pos : node.cg().ambiguity_mask()) var_sites_set.insert(pos);
+              for (auto [pos, state_set] : node.cg().ambiguity_sets())
+                var_sites_set.insert(pos);
             }
           },
           nv);
@@ -822,9 +827,7 @@ class tree_index {
         [&](auto node) {
           if constexpr (requires { node.cg(); }) {
             auto pos = static_cast<mutation_position>(site);
-            result = node.cg().is_ambiguous(pos)
-                ? static_cast<uint8_t>(0b1111)
-                : base_to_one_hot(node.cg().get_base(pos, ref));
+            result = node.cg().get_state_set(pos, ref);
           }
         },
         nv);

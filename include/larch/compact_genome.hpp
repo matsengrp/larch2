@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cctype>
 #include <cstddef>
 #include <functional>
@@ -32,35 +33,99 @@ inline bool is_unambiguous_nuc_char(char c) {
   }
 }
 
-inline bool is_iupac_ambiguity_char(char c) {
+inline uint8_t iupac_state_set(char c) {
   switch (c) {
-    case 'N':
-    case 'n':
+    case 'A':
+    case 'a':
+      return 0b0001;
+    case 'C':
+    case 'c':
+      return 0b0010;
+    case 'G':
+    case 'g':
+      return 0b0100;
+    case 'T':
+    case 't':
+      return 0b1000;
     case 'R':
     case 'r':
+      return 0b0101;  // A or G
     case 'Y':
     case 'y':
+      return 0b1010;  // C or T
     case 'S':
     case 's':
+      return 0b0110;  // C or G
     case 'W':
     case 'w':
+      return 0b1001;  // A or T
     case 'K':
     case 'k':
+      return 0b1100;  // G or T
     case 'M':
     case 'm':
+      return 0b0011;  // A or C
     case 'B':
     case 'b':
+      return 0b1110;  // C or G or T
     case 'D':
     case 'd':
+      return 0b1101;  // A or G or T
     case 'H':
     case 'h':
+      return 0b1011;  // A or C or T
     case 'V':
     case 'v':
+      return 0b0111;  // A or C or G
+    case 'N':
+    case 'n':
     case '-':
     case '?':
-      return true;
+      return 0b1111;
     default:
-      return false;
+      return 0;
+  }
+}
+
+inline bool is_iupac_ambiguity_char(char c) {
+  auto s = iupac_state_set(c);
+  return s != 0 && std::popcount(s) != 1;
+}
+
+inline char iupac_char_from_state_set(uint8_t state_set) {
+  switch (state_set & 0b1111) {
+    case 0b0001:
+      return 'A';
+    case 0b0010:
+      return 'C';
+    case 0b0100:
+      return 'G';
+    case 0b1000:
+      return 'T';
+    case 0b0101:
+      return 'R';
+    case 0b1010:
+      return 'Y';
+    case 0b0110:
+      return 'S';
+    case 0b1001:
+      return 'W';
+    case 0b1100:
+      return 'K';
+    case 0b0011:
+      return 'M';
+    case 0b1110:
+      return 'B';
+    case 0b1101:
+      return 'D';
+    case 0b1011:
+      return 'H';
+    case 0b0111:
+      return 'V';
+    case 0b1111:
+      return 'N';
+    default:
+      return '?';
   }
 }
 
@@ -101,16 +166,16 @@ inline void warn_if_ambiguities(ambiguity_counts const& counts,
                    ? (100.0 * static_cast<double>(counts.total) /
                       static_cast<double>(counts.observed_sites))
                    : 0.0;
-  std::cerr << " ambiguity/no-call codes (" << pct
-            << "% of observed sites). These will be treated as no-calls "
-               "during compact-genome construction; no edge mutations are "
-               "emitted at those sites and Fitch parsimony treats them as "
-               "compatible with any nucleotide.\n";
+  std::cerr << " IUPAC ambiguity/no-call codes (" << pct
+            << "% of observed sites). Partial IUPAC codes will be treated as "
+               "compatible state sets during Fitch parsimony; N, gap, and ? "
+               "are treated as no-calls. No edge mutations are emitted at "
+               "ambiguous sites.\n";
 }
 
 class compact_genome {
   std::map<mutation_position, nuc_base> mutations_;
-  std::set<mutation_position> ambiguity_mask_;
+  std::map<mutation_position, uint8_t> ambiguity_sets_;
   std::size_t hash_ = 0;
 
   static void hash_combine(std::size_t& result, std::size_t value) {
@@ -120,7 +185,7 @@ class compact_genome {
 
   static std::size_t compute_hash(
       std::map<mutation_position, nuc_base> const& mutations,
-      std::set<mutation_position> const& ambiguity_mask) {
+      std::map<mutation_position, uint8_t> const& ambiguity_sets) {
     std::size_t result = 0;
     for (auto [pos, base] : mutations) {
       hash_combine(result, pos);
@@ -128,37 +193,55 @@ class compact_genome {
     }
 
     // Preserve the exact historical hash for ACGT-only compact genomes.
-    if (!ambiguity_mask.empty()) {
+    if (!ambiguity_sets.empty()) {
       hash_combine(result, static_cast<std::size_t>('?'));
-      for (auto pos : ambiguity_mask) hash_combine(result, pos);
+      for (auto [pos, state_set] : ambiguity_sets) {
+        hash_combine(result, pos);
+        hash_combine(result, state_set & 0b1111);
+      }
     }
     return result;
   }
 
-  void recompute_hash() { hash_ = compute_hash(mutations_, ambiguity_mask_); }
+  void recompute_hash() { hash_ = compute_hash(mutations_, ambiguity_sets_); }
 
  public:
   compact_genome() = default;
 
   explicit compact_genome(std::map<mutation_position, nuc_base> mutations)
       : mutations_{std::move(mutations)},
-        hash_{compute_hash(mutations_, ambiguity_mask_)} {}
+        hash_{compute_hash(mutations_, ambiguity_sets_)} {}
 
   compact_genome(std::map<mutation_position, nuc_base> mutations,
                  std::set<mutation_position> ambiguity_mask)
+      : mutations_{std::move(mutations)} {
+    for (auto pos : ambiguity_mask) ambiguity_sets_[pos] = 0b1111;
+    for (auto [pos, _] : ambiguity_sets_) mutations_.erase(pos);
+    recompute_hash();
+  }
+
+  compact_genome(std::map<mutation_position, nuc_base> mutations,
+                 std::map<mutation_position, uint8_t> ambiguity_sets)
       : mutations_{std::move(mutations)},
-        ambiguity_mask_{std::move(ambiguity_mask)},
-        hash_{compute_hash(mutations_, ambiguity_mask_)} {
-    for (auto pos : ambiguity_mask_) mutations_.erase(pos);
+        ambiguity_sets_{std::move(ambiguity_sets)} {
+    for (auto it = ambiguity_sets_.begin(); it != ambiguity_sets_.end();) {
+      it->second &= 0b1111;
+      if (it->second == 0 || std::popcount(it->second) == 1) {
+        it = ambiguity_sets_.erase(it);
+      } else {
+        mutations_.erase(it->first);
+        ++it;
+      }
+    }
     recompute_hash();
   }
 
   void add_parent_edge(edge_mutations const& muts, compact_genome const& parent,
                        std::string_view reference) {
     // Start with parent's concrete mutations. Edge mutations are fully
-    // disambiguated; ambiguity masks are leaf-local no-calls and do not
-    // propagate through internal nodes.
-    ambiguity_mask_.clear();
+    // disambiguated; ambiguity sets are leaf-local and do not propagate
+    // through internal nodes.
+    ambiguity_sets_.clear();
     for (auto [pos, base] : parent.mutations_) {
       mutations_.insert_or_assign(pos, base);
     }
@@ -218,23 +301,53 @@ class compact_genome {
     return nuc_base::from_char(reference.at(pos - 1));
   }
 
-  bool is_ambiguous(mutation_position pos) const {
-    return ambiguity_mask_.contains(pos);
+  uint8_t get_state_set(mutation_position pos,
+                        std::string_view reference) const {
+    auto ait = ambiguity_sets_.find(pos);
+    if (ait != ambiguity_sets_.end()) return ait->second;
+    return static_cast<uint8_t>(1 << get_base(pos, reference).raw());
   }
 
-  std::set<mutation_position> const& ambiguity_mask() const {
-    return ambiguity_mask_;
+  bool is_ambiguous(mutation_position pos) const {
+    return ambiguity_sets_.contains(pos);
+  }
+
+  std::map<mutation_position, uint8_t> const& ambiguity_sets() const {
+    return ambiguity_sets_;
+  }
+
+  std::set<mutation_position> ambiguity_mask() const {
+    std::set<mutation_position> result;
+    for (auto [pos, _] : ambiguity_sets_) result.insert(pos);
+    return result;
   }
 
   void set_ambiguity_mask(std::set<mutation_position> ambiguity_mask) {
-    ambiguity_mask_ = std::move(ambiguity_mask);
-    for (auto pos : ambiguity_mask_) mutations_.erase(pos);
+    ambiguity_sets_.clear();
+    for (auto pos : ambiguity_mask) ambiguity_sets_[pos] = 0b1111;
+    for (auto [pos, _] : ambiguity_sets_) mutations_.erase(pos);
     recompute_hash();
   }
 
-  void add_ambiguous_site(mutation_position pos) {
+  void set_ambiguity_sets(std::map<mutation_position, uint8_t> ambiguity_sets) {
+    ambiguity_sets_ = std::move(ambiguity_sets);
+    for (auto it = ambiguity_sets_.begin(); it != ambiguity_sets_.end();) {
+      it->second &= 0b1111;
+      if (it->second == 0 || std::popcount(it->second) == 1) {
+        it = ambiguity_sets_.erase(it);
+      } else {
+        mutations_.erase(it->first);
+        ++it;
+      }
+    }
+    recompute_hash();
+  }
+
+  void add_ambiguous_site(mutation_position pos, uint8_t state_set = 0b1111) {
+    state_set &= 0b1111;
+    if (state_set == 0 || std::popcount(state_set) == 1) return;
     mutations_.erase(pos);
-    ambiguity_mask_.insert(pos);
+    ambiguity_sets_[pos] = state_set;
     recompute_hash();
   }
 
@@ -245,15 +358,16 @@ class compact_genome {
       result += base.to_char();
       result += ",";
     }
-    for (auto pos : ambiguity_mask_) {
+    for (auto [pos, state_set] : ambiguity_sets_) {
       result += std::to_string(pos);
-      result += "?,";
+      result += iupac_char_from_state_set(state_set);
+      result += ",";
     }
     result += ">";
     return result;
   }
 
-  bool empty() const { return mutations_.empty() && ambiguity_mask_.empty(); }
+  bool empty() const { return mutations_.empty() && ambiguity_sets_.empty(); }
   std::size_t hash() const { return hash_; }
 
   auto begin() const { return mutations_.begin(); }
@@ -262,7 +376,7 @@ class compact_genome {
   bool operator==(compact_genome const& rhs) const {
     if (hash_ != rhs.hash_) return false;
     return mutations_ == rhs.mutations_ &&
-           ambiguity_mask_ == rhs.ambiguity_mask_;
+           ambiguity_sets_ == rhs.ambiguity_sets_;
   }
 };
 
@@ -270,14 +384,15 @@ inline compact_genome compact_genome_from_sequence(
     std::string_view sequence, std::string_view reference,
     ambiguity_counts* counts = nullptr) {
   std::map<mutation_position, nuc_base> muts;
-  std::set<mutation_position> ambiguity_mask;
+  std::map<mutation_position, uint8_t> ambiguity_sets;
   auto n = std::min(sequence.size(), reference.size());
   if (counts) counts->observed_sites += n;
 
   for (std::size_t i = 0; i < n; ++i) {
     char c = sequence[i];
-    if (is_iupac_ambiguity_char(c)) {
-      ambiguity_mask.insert(static_cast<mutation_position>(i + 1));
+    auto state_set = iupac_state_set(c);
+    if (state_set != 0 && std::popcount(state_set) != 1) {
+      ambiguity_sets[static_cast<mutation_position>(i + 1)] = state_set;
       if (counts) counts->add(c);
       continue;
     }
@@ -286,7 +401,7 @@ inline compact_genome compact_genome_from_sequence(
     auto seq_base = nuc_base::from_char(c);
     if (!(ref_base == seq_base)) muts[i + 1] = seq_base;
   }
-  return compact_genome{std::move(muts), std::move(ambiguity_mask)};
+  return compact_genome{std::move(muts), std::move(ambiguity_sets)};
 }
 
 }  // namespace larch

@@ -10,9 +10,15 @@ message mut {
     string chromosome = 5; // Chromosome string. Currently unused.
 }
 
+message ambiguous_site {
+    int32 position = 1;
+    int32 state_set = 2; // bitmask A=1,C=2,G=4,T=8
+}
+
 message mutation_list {
     repeated mut mutation = 1;
-    repeated int32 ambiguous_sites = 2; // 1-indexed leaf no-call sites (IUPAC ambiguity/gap in original alignment)
+    repeated int32 ambiguous_sites = 2; // legacy 1-indexed leaf no-call sites (N/gap/? or older all-IUPAC-as-no-call builds)
+    repeated ambiguous_site iupac_sites = 3; // exact IUPAC state-set sites
 }
 
 message condensed_node {

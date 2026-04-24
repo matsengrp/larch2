@@ -23,12 +23,18 @@ message edge {
     float edge_weight = 6; // e.g., if you want to attach a probability to an individual edge. Might not be needed for a bare-bones version of this. Can also add other fields.  
 }
 
+message ambiguous_site {
+    int32 position = 1;
+    int32 state_set = 2; // bitmask A=1,C=2,G=4,T=8
+}
+
 /// sample IDs linked to the integer node representation in the DAG
 /// this might also be modified to include an idea of node metadata, e.g., sample dates
 message node_name {
     int64 node_id = 1; // The node name as given in the edges from the DAG
     repeated string condensed_leaves = 2; // A list of strings for the names of the sequence/sequences which are represented by the node above. can be just one if a leaf is unique. 
-    repeated int32 ambiguous_sites = 3; // 1-indexed leaf no-call sites (IUPAC ambiguity/gap in original alignment)
+    repeated int32 ambiguous_sites = 3; // legacy 1-indexed leaf no-call sites (N/gap/? or older all-IUPAC-as-no-call builds)
+    repeated ambiguous_site iupac_sites = 4; // exact IUPAC state-set sites
 }
 
 /// removed the newick since the DAG will have nodes that cannot be represented within a single tree anyway.  

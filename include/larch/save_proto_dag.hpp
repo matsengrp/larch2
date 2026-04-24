@@ -70,8 +70,12 @@ inline void save_proto_dag(phylo_dag& dag, std::string_view path,
             nn.condensed_leaves = {node.sample_id()};
           }
           if constexpr (requires { node.cg(); }) {
-            for (auto pos : node.cg().ambiguity_mask())
-              nn.ambiguous_sites.push_back(static_cast<int32_t>(pos));
+            for (auto [pos, state_set] : node.cg().ambiguity_sets()) {
+              nn.iupac_sites.push_back({static_cast<int32_t>(pos),
+                                        static_cast<int32_t>(state_set)});
+              if ((state_set & 0b1111) == 0b1111)
+                nn.ambiguous_sites.push_back(static_cast<int32_t>(pos));
+            }
           }
           data.node_names.push_back(std::move(nn));
         },

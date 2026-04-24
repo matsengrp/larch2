@@ -6,6 +6,7 @@
 #include <larch/thread_pool.hpp>
 
 #include <algorithm>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -35,10 +36,16 @@ struct dag_edge {
   float edge_weight;
 };
 
+struct iupac_site {
+  int32_t position;
+  int32_t state_set;
+};
+
 struct dag_node_name {
   int64_t node_id;
   std::vector<std::string> condensed_leaves;
   std::vector<int32_t> ambiguous_sites;
+  std::vector<iupac_site> iupac_sites;
 };
 
 struct dag_data {
@@ -113,17 +120,24 @@ inline phylo_dag load_proto_dag(std::string_view path) {
   scoped_arena<32768> arena;
   auto* mr = arena.get();
   std::pmr::unordered_map<std::size_t, std::string> node_sample_ids(mr);
-  std::pmr::unordered_map<std::size_t, std::set<mutation_position>>
-      node_ambiguity_masks(mr);
+  std::pmr::unordered_map<std::size_t, std::map<mutation_position, uint8_t>>
+      node_ambiguity_sets(mr);
   for (auto& nn : meta.node_names) {
     auto node_id = static_cast<std::size_t>(nn.node_id);
     if (!nn.condensed_leaves.empty()) {
       node_sample_ids[node_id] = nn.condensed_leaves[0];
     }
     if (!nn.ambiguous_sites.empty()) {
-      auto& mask = node_ambiguity_masks[node_id];
+      auto& sets = node_ambiguity_sets[node_id];
       for (auto pos : nn.ambiguous_sites)
-        mask.insert(static_cast<mutation_position>(pos));
+        sets[static_cast<mutation_position>(pos)] = 0b1111;
+    }
+    for (auto const& site : nn.iupac_sites) {
+      auto state_set = static_cast<uint8_t>(site.state_set) & 0b1111;
+      if (state_set != 0) {
+        node_ambiguity_sets[node_id][static_cast<mutation_position>(
+            site.position)] = state_set;
+      }
     }
   }
 
@@ -220,14 +234,14 @@ inline phylo_dag load_proto_dag(std::string_view path) {
 
   recompute_compact_genomes(d);
 
-  for (auto [proto_id, mask] : node_ambiguity_masks) {
+  for (auto [proto_id, ambiguity_sets] : node_ambiguity_sets) {
     auto it = proto_to_dag.find(proto_id);
     if (it == proto_to_dag.end()) continue;
     auto dag_idx = it->second;
     std::visit(
         [&](auto node) {
           if constexpr (requires { node.cg(); }) {
-            node.cg().set_ambiguity_mask(std::move(mask));
+            node.cg().set_ambiguity_sets(std::move(ambiguity_sets));
           }
         },
         d.get_node(dag_idx));
