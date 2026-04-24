@@ -120,7 +120,7 @@ inline phylo_dag load_proto_dag(std::string_view path) {
   scoped_arena<32768> arena;
   auto* mr = arena.get();
   std::pmr::unordered_map<std::size_t, std::string> node_sample_ids(mr);
-  std::pmr::unordered_map<std::size_t, std::map<mutation_position, uint8_t>>
+  std::pmr::unordered_map<std::size_t, ambiguity_set_map>
       node_ambiguity_sets(mr);
   for (auto& nn : meta.node_names) {
     auto node_id = static_cast<std::size_t>(nn.node_id);

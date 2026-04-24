@@ -132,8 +132,7 @@ inline phylo_dag load_parsimony_tree(std::string_view path,
 
   // Apply mutations in preorder.
   // node_mutations are in preorder traversal order of the newick tree.
-  std::unordered_map<std::size_t, std::map<mutation_position, uint8_t>>
-      ambiguity_sets_by_node;
+  std::unordered_map<std::size_t, ambiguity_set_map> ambiguity_sets_by_node;
   std::size_t muts_idx = 0;
   auto apply_muts = [&](auto& self, std::size_t dag_idx) -> void {
     if (muts_idx >= msg.node_mutations.size()) return;

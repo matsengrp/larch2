@@ -28,7 +28,7 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
   // Accumulate per-sample mutations/IUPAC state sets, convert to compact_genome
   // at end.
   std::map<std::string, std::map<mutation_position, nuc_base>> sample_muts;
-  std::map<std::string, std::map<mutation_position, uint8_t>> sample_ambiguity;
+  std::map<std::string, ambiguity_set_map> sample_ambiguity;
   ambiguity_counts ambiguity;
 
   std::size_t pos = 0;
@@ -131,7 +131,7 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
   // Convert accumulated mutations/IUPAC state sets to compact_genomes.
   for (auto& [name, muts] : sample_muts) {
     auto amb_it = sample_ambiguity.find(name);
-    std::map<mutation_position, uint8_t> ambiguity_sets;
+    ambiguity_set_map ambiguity_sets;
     if (amb_it != sample_ambiguity.end())
       ambiguity_sets = std::move(amb_it->second);
     result.sample_genomes[name] =
@@ -164,8 +164,7 @@ inline void apply_vcf_to_dag(phylo_dag& d, vcf_data const& vcf) {
             // concrete calls, then apply VCF IUPAC state sets.
             std::map<mutation_position, nuc_base> muts;
             for (auto [pos, base] : node.cg()) muts[pos] = base;
-            std::map<mutation_position, uint8_t> ambiguity_sets =
-                node.cg().ambiguity_sets();
+            ambiguity_set_map ambiguity_sets = node.cg().ambiguity_sets();
             for (auto [pos, base] : it->second) {
               ambiguity_sets.erase(pos);
               auto ref_base = nuc_base::from_char(ref.at(pos - 1));

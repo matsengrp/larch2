@@ -90,8 +90,7 @@ inline void recompute_compact_genomes(phylo_dag& d) {
                       pe.get_parent());
 
                   if constexpr (requires { node.cg(); }) {
-                    std::map<mutation_position, uint8_t>
-                        existing_ambiguity_sets;
+                    ambiguity_set_map existing_ambiguity_sets;
                     bool leaf_node = true;
                     for (auto ce : node.get_children()) {
                       (void)ce;

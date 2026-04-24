@@ -115,8 +115,7 @@ static void test_to_edge_mutations_skips_partial_iupac() {
   std::println("test_to_edge_mutations_skips_partial_iupac");
 
   compact_genome parent;
-  compact_genome child{
-      {}, std::map<mutation_position, uint8_t>{{1, iupac_state_set('Y')}}};
+  compact_genome child{{}, ambiguity_set_map{{1, iupac_state_set('Y')}}};
   auto muts = compact_genome::to_edge_mutations("A", parent, child);
 
   assert(muts.empty());
@@ -214,8 +213,7 @@ static void test_root_parent_iupac_preference() {
   std::println("test_root_parent_iupac_preference");
 
   auto d = make_two_leaf_tree("A", "Y", "Y");
-  compact_genome parent{
-      {}, std::map<mutation_position, uint8_t>{{1, iupac_state_set('K')}}};
+  compact_genome parent{{}, ambiguity_set_map{{1, iupac_state_set('K')}}};
   fitch_assign_compact_genomes(d, &parent);
 
   bool saw_t_root = false;
@@ -423,12 +421,9 @@ static void test_ambiguity_mask_affects_leaf_dedup() {
 static void test_exact_iupac_sets_affect_leaf_dedup() {
   std::println("test_exact_iupac_sets_affect_leaf_dedup");
 
-  compact_genome y{
-      {}, std::map<mutation_position, uint8_t>{{1, iupac_state_set('Y')}}};
-  compact_genome n{
-      {}, std::map<mutation_position, uint8_t>{{1, iupac_state_set('N')}}};
-  compact_genome r{
-      {}, std::map<mutation_position, uint8_t>{{1, iupac_state_set('R')}}};
+  compact_genome y{{}, ambiguity_set_map{{1, iupac_state_set('Y')}}};
+  compact_genome n{{}, ambiguity_set_map{{1, iupac_state_set('N')}}};
+  compact_genome r{{}, ambiguity_set_map{{1, iupac_state_set('R')}}};
   assert(!(y == n));
   assert(!(y == r));
 

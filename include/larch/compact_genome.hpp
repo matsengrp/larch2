@@ -17,6 +17,9 @@
 
 namespace larch {
 
+using iupac_state_set_t = uint8_t;
+using ambiguity_set_map = std::map<mutation_position, iupac_state_set_t>;
+
 inline bool is_unambiguous_nuc_char(char c) {
   switch (c) {
     case 'A':
@@ -33,7 +36,7 @@ inline bool is_unambiguous_nuc_char(char c) {
   }
 }
 
-inline uint8_t iupac_state_set(char c) {
+inline iupac_state_set_t iupac_state_set(char c) {
   switch (c) {
     case 'A':
     case 'a':
@@ -92,7 +95,7 @@ inline bool is_iupac_ambiguity_char(char c) {
   return s != 0 && std::popcount(s) != 1;
 }
 
-inline char iupac_char_from_state_set(uint8_t state_set) {
+inline char iupac_char_from_state_set(iupac_state_set_t state_set) {
   switch (state_set & 0b1111) {
     case 0b0001:
       return 'A';
@@ -175,7 +178,7 @@ inline void warn_if_ambiguities(ambiguity_counts const& counts,
 
 class compact_genome {
   std::map<mutation_position, nuc_base> mutations_;
-  std::map<mutation_position, uint8_t> ambiguity_sets_;
+  ambiguity_set_map ambiguity_sets_;
   std::size_t hash_ = 0;
 
   static void hash_combine(std::size_t& result, std::size_t value) {
@@ -185,7 +188,7 @@ class compact_genome {
 
   static std::size_t compute_hash(
       std::map<mutation_position, nuc_base> const& mutations,
-      std::map<mutation_position, uint8_t> const& ambiguity_sets) {
+      ambiguity_set_map const& ambiguity_sets) {
     std::size_t result = 0;
     for (auto [pos, base] : mutations) {
       hash_combine(result, pos);
@@ -221,7 +224,7 @@ class compact_genome {
   }
 
   compact_genome(std::map<mutation_position, nuc_base> mutations,
-                 std::map<mutation_position, uint8_t> ambiguity_sets)
+                 ambiguity_set_map ambiguity_sets)
       : mutations_{std::move(mutations)},
         ambiguity_sets_{std::move(ambiguity_sets)} {
     for (auto it = ambiguity_sets_.begin(); it != ambiguity_sets_.end();) {
@@ -301,8 +304,8 @@ class compact_genome {
     return nuc_base::from_char(reference.at(pos - 1));
   }
 
-  uint8_t get_state_set(mutation_position pos,
-                        std::string_view reference) const {
+  iupac_state_set_t get_state_set(mutation_position pos,
+                                  std::string_view reference) const {
     auto ait = ambiguity_sets_.find(pos);
     if (ait != ambiguity_sets_.end()) return ait->second;
     return static_cast<uint8_t>(1 << get_base(pos, reference).raw());
@@ -312,9 +315,7 @@ class compact_genome {
     return ambiguity_sets_.contains(pos);
   }
 
-  std::map<mutation_position, uint8_t> const& ambiguity_sets() const {
-    return ambiguity_sets_;
-  }
+  ambiguity_set_map const& ambiguity_sets() const { return ambiguity_sets_; }
 
   std::set<mutation_position> ambiguity_mask() const {
     std::set<mutation_position> result;
@@ -329,7 +330,7 @@ class compact_genome {
     recompute_hash();
   }
 
-  void set_ambiguity_sets(std::map<mutation_position, uint8_t> ambiguity_sets) {
+  void set_ambiguity_sets(ambiguity_set_map ambiguity_sets) {
     ambiguity_sets_ = std::move(ambiguity_sets);
     for (auto it = ambiguity_sets_.begin(); it != ambiguity_sets_.end();) {
       it->second &= 0b1111;
@@ -343,7 +344,8 @@ class compact_genome {
     recompute_hash();
   }
 
-  void add_ambiguous_site(mutation_position pos, uint8_t state_set = 0b1111) {
+  void add_ambiguous_site(mutation_position pos,
+                          iupac_state_set_t state_set = 0b1111) {
     state_set &= 0b1111;
     if (state_set == 0 || std::popcount(state_set) == 1) return;
     mutations_.erase(pos);
@@ -384,7 +386,7 @@ inline compact_genome compact_genome_from_sequence(
     std::string_view sequence, std::string_view reference,
     ambiguity_counts* counts = nullptr) {
   std::map<mutation_position, nuc_base> muts;
-  std::map<mutation_position, uint8_t> ambiguity_sets;
+  ambiguity_set_map ambiguity_sets;
   auto n = std::min(sequence.size(), reference.size());
   if (counts) counts->observed_sites += n;
 
