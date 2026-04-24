@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -23,17 +24,33 @@ concept MoveProducer =
       { f(tree, cb, rng) };
     };
 
+// Phase 33: A FragmentProducer takes a sampled tree, a fragment callback, and
+// an RNG.  It runs in-place SPR moves internally and emits complete fragment
+// DAGs (not individual moves) — needed because moves are relative to an
+// evolving internal work_tree, not the caller's sampled tree.
+template <typename F>
+concept FragmentProducer =
+    requires(F& f, phylo_dag& tree, std::function<void(phylo_dag)> cb,
+             std::mt19937& rng) {
+      { f(tree, cb, rng) };
+    };
+
+// A Producer is either a MoveProducer or a FragmentProducer.
+template <typename F>
+concept Producer = MoveProducer<F> || FragmentProducer<F>;
+
 // Iterative DAG optimiser using fragment-based SPR pipeline.
 //
 // Each iteration:
 //   1. Build / refresh the merged result DAG
 //   2. Sample a min-weight (parsimony) tree
-//   3. Create a callback that extracts fragments and merges them
-//   4. Call each producer with the sampled tree and callback
-//   5. Merge the sampled tree itself
+//   3. Dispatch each producer:
+//      - MoveProducers: collect spr_move descriptors, generate fragments
+//      - FragmentProducers: collect complete fragment DAGs directly
+//   4. Merge all fragments + the sampled tree itself
 //
-// Supports any number of heterogeneous MoveProducers.
-template <MoveProducer... Producers>
+// Supports any mix of MoveProducers and FragmentProducers.
+template <Producer... Producers>
 std::vector<optimize_result> optimize_dag_v2(merge& m,
                                              std::size_t num_iterations,
                                              std::optional<std::uint32_t> seed,
@@ -60,16 +77,26 @@ std::vector<optimize_result> optimize_dag_v2(merge& m,
     recompute_edge_mutations(sampled);
     set_sample_ids_from_cg(sampled);
 
-    // 3. Collect moves from each producer
+    // 3. Dispatch producers: collect moves and/or direct fragments
     std::vector<spr_move> collected_moves;
-    move_callback collector = [&](spr_move const& move) {
-      collected_moves.push_back(move);
-    };
-    (producers(sampled, collector, rng), ...);
+    std::vector<phylo_dag> direct_fragments;
 
-    // 4. Generate fragments in parallel
+    auto dispatch = [&]<typename P>(P& p) {
+      if constexpr (MoveProducer<P>) {
+        p(sampled,
+          [&](spr_move const& move) { collected_moves.push_back(move); }, rng);
+      } else {
+        static_assert(FragmentProducer<P>);
+        p(sampled,
+          [&](phylo_dag frag) { direct_fragments.push_back(std::move(frag)); },
+          rng);
+      }
+    };
+    (dispatch(producers), ...);
+
+    // 4. Generate fragments from collected moves (MoveProducer path)
     std::vector<phylo_dag> fragments(collected_moves.size());
-    {
+    if (!collected_moves.empty()) {
       std::vector<std::size_t> indices(collected_moves.size());
       std::iota(indices.begin(), indices.end(), std::size_t{0});
       parallel_for_each(indices, [&](std::size_t i) {
@@ -77,9 +104,11 @@ std::vector<optimize_result> optimize_dag_v2(merge& m,
       });
     }
 
-    // 5. Submit fragments to merge
+    // 5. Merge all fragments
     for (auto& frag : fragments) m.add_dag(std::move(frag));
-    std::size_t trees_merged = collected_moves.size();
+    for (auto& frag : direct_fragments) m.add_dag(std::move(frag));
+    std::size_t trees_merged =
+        collected_moves.size() + direct_fragments.size();
 
     // 6. Merge the sampled tree itself
     m.add_dag(sampled);

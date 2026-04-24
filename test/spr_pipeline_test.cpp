@@ -1,4 +1,5 @@
 #include <larch/spr_pipeline.hpp>
+#include <larch/inplace_spr.hpp>
 #include <larch/load_proto_dag.hpp>
 
 #include <cassert>
@@ -577,6 +578,137 @@ static void test_ua_grandparent_fragment_root() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 36: optimize_dag_v2 with both MoveProducer and FragmentProducer
+// ---------------------------------------------------------------------------
+
+static void test_optimize_dag_v2_mixed_producers() {
+  std::println("test_optimize_dag_v2_mixed_producers");
+
+  auto tree = make_suboptimal_tree();
+  merge m("AAAA");
+  m.add_dag(tree);
+
+  auto initial_nodes = m.result_node_count();
+  auto initial_edges = m.result_edge_count();
+  auto initial_leaves = get_leaf_ids(m.get_result());
+  tree_index initial_idx{m.get_result()};
+  int initial_score = initial_idx.compute_parsimony_score();
+  std::println("  initial: {} nodes, {} edges", initial_nodes, initial_edges);
+
+  native_move_producer native{.max_moves = 10};
+  inplace_params ip{
+      .max_steps = 3,
+      .accept_threshold = 0,
+      .selector = move_selection::best_improving,
+      .frag_mode = fragment_strategy::final_only,
+  };
+  inplace_move_producer inplace{ip};
+
+  auto results = optimize_dag_v2(m, 3, std::optional<std::uint32_t>{42u},
+                                 native, inplace);
+
+  auto final_nodes = m.result_node_count();
+  auto final_edges = m.result_edge_count();
+  std::println("  final:   {} nodes, {} edges", final_nodes, final_edges);
+
+  for (auto& r : results) {
+    std::println("  iter {}: merged={} parsimony={} nodes={} edges={}",
+                 r.iteration, r.trees_merged, r.parsimony_score,
+                 r.dag_node_count, r.dag_edge_count);
+  }
+
+  // Leaf set must be preserved
+  auto final_leaves = get_leaf_ids(m.get_result());
+  assert(final_leaves == initial_leaves);
+
+  // DAG should have grown and the optimizer should improve parsimony.
+  assert(final_nodes >= initial_nodes);
+  assert(final_edges >= initial_edges);
+  assert(!results.empty());
+  bool improved = false;
+  for (auto& r : results)
+    if (r.parsimony_score < initial_score) improved = true;
+  assert(improved);
+  assert(results.back().parsimony_score < initial_score);
+
+  // At least some trees were merged
+  bool any_merged = false;
+  for (auto& r : results)
+    if (r.trees_merged > 0) any_merged = true;
+  assert(any_merged);
+
+  std::println("  PASS");
+}
+
+// Phase 36: FragmentProducer-only pipeline (no MoveProducer)
+static void test_optimize_dag_v2_fragment_only() {
+  std::println("test_optimize_dag_v2_fragment_only");
+
+  auto tree = make_suboptimal_tree();
+  merge m("AAAA");
+  m.add_dag(tree);
+
+  auto initial_leaves = get_leaf_ids(m.get_result());
+
+  inplace_params ip{
+      .max_steps = 5,
+      .accept_threshold = 0,
+      .selector = move_selection::best_improving,
+      .frag_mode = fragment_strategy::final_only,
+  };
+  inplace_move_producer producer{ip};
+
+  auto results = optimize_dag_v2(m, 3, std::optional<std::uint32_t>{42u},
+                                 producer);
+
+  for (auto& r : results) {
+    std::println("  iter {}: merged={} parsimony={} nodes={} edges={}",
+                 r.iteration, r.trees_merged, r.parsimony_score,
+                 r.dag_node_count, r.dag_edge_count);
+  }
+
+  auto final_leaves = get_leaf_ids(m.get_result());
+  assert(final_leaves == initial_leaves);
+
+  std::println("  PASS");
+}
+
+// Phase 36: Mixed producers on real data
+static void test_optimize_dag_v2_mixed_real_data() {
+  std::println("test_optimize_dag_v2_mixed_real_data");
+
+  proto_fixture f(
+      {"data/test_5_trees/tree_0.pb.gz", "data/test_5_trees/tree_1.pb.gz"});
+
+  auto initial_nodes = f.merger.result_node_count();
+  std::println("  initial: {} nodes", initial_nodes);
+
+  native_move_producer native{.max_moves = 10};
+  inplace_params ip{
+      .max_steps = 3,
+      .accept_threshold = 0,
+      .selector = move_selection::best_improving,
+      .frag_mode = fragment_strategy::final_only,
+  };
+  inplace_move_producer inplace{ip};
+
+  auto results = optimize_dag_v2(f.merger, 2,
+                                 std::optional<std::uint32_t>{42u},
+                                 native, inplace);
+
+  for (auto& r : results) {
+    std::println("  iter {}: merged={} parsimony={} nodes={} edges={}",
+                 r.iteration, r.trees_merged, r.parsimony_score,
+                 r.dag_node_count, r.dag_edge_count);
+  }
+
+  auto final_leaves = get_leaf_ids(f.merger.get_result());
+  assert(final_leaves == f.leaf_ids);
+
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -592,6 +724,11 @@ int main() {
   test_optimize_dag_v2_deterministic();
   test_optimize_dag_v2_on_proto_data();
   test_ua_grandparent_fragment_root();
+
+  // Phase 36: mixed producer pipeline
+  test_optimize_dag_v2_mixed_producers();
+  test_optimize_dag_v2_fragment_only();
+  test_optimize_dag_v2_mixed_real_data();
 
   std::println("All SPR pipeline tests passed!");
   return 0;

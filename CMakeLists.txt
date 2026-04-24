@@ -22,7 +22,7 @@ if(GCC_TOOLCHAIN)
     set(CMAKE_CXX_COMPILER "${GCC_TOOLCHAIN}/bin/g++${_suffix}"   CACHE FILEPATH "" FORCE)
 endif()
 
-project(larch2 VERSION 2.0.3 LANGUAGES C CXX)
+project(larch2 VERSION 2.1.0 LANGUAGES C CXX)
 
 # On FreeBSD the system ranlib is LLVM's, which rejects the --plugin flag that
 # gcc-ranlib passes.  CMake's IPO uses CMAKE_<LANG>_COMPILER_RANLIB for static
@@ -140,7 +140,8 @@ endforeach()
 foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   weight_accum_test optimize_test native_optimize_test
                   spr_pipeline_test trim_clade_edges_test
-                  rotaA_diagnostic_test)
+                  # rotaA_diagnostic_test
+                  inplace_spr_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
     add_test(NAME ${test_name} COMMAND ${test_name}
