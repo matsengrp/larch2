@@ -388,7 +388,7 @@ static void test_acgt_hash_unchanged() {
               0x9e3779b9 + (expected << 6) + (expected >> 2);
 
   assert(cg.hash() == expected);
-  assert((cg == compact_genome{muts, {}}));
+  assert((cg == compact_genome{muts, ambiguity_set_map{}}));
   std::println("  PASS");
 }
 
