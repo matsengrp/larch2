@@ -4,6 +4,7 @@
 #include <larch/subtree_weight.hpp>
 #include <larch/simple_weight_ops.hpp>
 
+#include <array>
 #include <cassert>
 #include <map>
 #include <print>
@@ -4370,27 +4371,29 @@ static void test_single_node_fitch_new_child() {
   // Now I has 3 children: {A, B, C}.
   assert(idx.get_num_children(I) == 3);
 
-  // fitch_set_from_counts uses intersection/union:
-  //   - intersection = bases present in ALL children
-  //   - if intersection non-empty → return intersection, else return union
+  // fitch_set_from_counts uses the generalized Fitch/Sankoff rule for
+  // multifurcations: the parent state set is the set of bases tied for maximum
+  // child support.
   //
   // With 3 children {A, B, C}:
-  // Site 0 (pos 1): A=T, B=A, C=A → counts: A=2,T=1 → no base in all 3 → union={A,T}
-  // Site 1 (pos 2): A=A, B=T, C=A → counts: A=2,T=1 → no base in all 3 → union={A,T}
-  // Site 2 (pos 3): A=A, B=A, C=T → counts: A=2,T=1 → no base in all 3 → union={A,T}
+  // Site 0 (pos 1): A=T, B=A, C=A → counts: A=2,T=1 → max={A}
+  // Site 1 (pos 2): A=A, B=T, C=A → counts: A=2,T=1 → max={A}
+  // Site 2 (pos 3): A=A, B=A, C=T → counts: A=2,T=1 → max={A}
   for (std::size_t i = 0; i < nsites; i++) {
-    assert(idx.get_fitch_set(I, i) == (0b0001 | 0b1000));  // {A, T}
+    assert(idx.get_fitch_set(I, i) == 0b0001);  // {A}
   }
 
-  // allele_union should be union of all children's alleles: {A, T} for all sites.
+  // allele_union should still be union of all children's alleles: {A, T} for
+  // all sites.
   for (std::size_t i = 0; i < nsites; i++) {
     assert(idx.get_allele_union(I, i) == (0b0001 | 0b1000));  // {A, T}
   }
 
-  // Site 2 should have changed: was {A} (intersection of A,A with 2 children),
-  // now {A,T} (union, since no base in all 3 children).
-  // Sites 0,1 were already {A,T} with 2 children (no intersection → union).
-  assert(idx.get_fitch_set(I, 2) != fitch_before[2]);
+  // Sites 0 and 1 changed from {A,T} with two children to {A} with three
+  // children. Site 2 was already {A} and remains {A}.
+  assert(idx.get_fitch_set(I, 0) != fitch_before[0]);
+  assert(idx.get_fitch_set(I, 1) != fitch_before[1]);
+  assert(idx.get_fitch_set(I, 2) == fitch_before[2]);
 
   std::println("  PASS");
 }
@@ -5051,7 +5054,8 @@ static void test_update_fitch_insertion_early_termination() {
 // ---------------------------------------------------------------------------
 
 // Helper: verify Fitch self-consistency — every valid inner node's Fitch set
-// must match the standard Fitch rule applied to its children's Fitch sets.
+// must match the generalized Fitch/Sankoff rule applied to its children's
+// Fitch sets.
 static void verify_fitch_self_consistent(tree_index& idx) {
   auto nsites = idx.num_variable_sites();
   auto nnodes = idx.num_nodes();
@@ -5061,14 +5065,15 @@ static void verify_fitch_self_consistent(tree_index& idx) {
     if (children.empty()) continue;  // leaf
 
     for (std::size_t s = 0; s < nsites; s++) {
-      uint8_t intersection = 0xFF;
-      uint8_t union_bits = 0;
+      std::array<uint32_t, 4> counts = {0, 0, 0, 0};
       for (auto child : children) {
         uint8_t cf = idx.get_fitch_set(child, s);
-        intersection &= cf;
-        union_bits |= cf;
+        for (int base = 0; base < 4; base++) {
+          if (cf & (1 << base)) counts[base]++;
+        }
       }
-      uint8_t expected = (intersection != 0) ? intersection : union_bits;
+      uint8_t expected =
+          fitch_set_from_counts(counts, static_cast<uint32_t>(children.size()));
       uint8_t actual = idx.get_fitch_set(nid, s);
       if (actual != expected) {
         std::println("  FAIL: fitch mismatch at node {} site {}: "

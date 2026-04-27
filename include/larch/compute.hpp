@@ -10,8 +10,10 @@
 #include <deque>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <memory_resource>
 #include <queue>
+#include <ranges>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -73,9 +75,9 @@ inline void recompute_compact_genomes(phylo_dag& d) {
             if (cg_set) break;
             std::visit(
                 [&](auto pe) {
-                  auto parent_idx = std::visit(
-                      [](auto parent) { return parent.index(); },
-                      pe.get_parent());
+                  auto parent_idx =
+                      std::visit([](auto parent) { return parent.index(); },
+                                 pe.get_parent());
                   if (!processed.contains(parent_idx)) return;
 
                   auto& edge_muts = pe.mutations();
@@ -89,8 +91,15 @@ inline void recompute_compact_genomes(phylo_dag& d) {
                       pe.get_parent());
 
                   if constexpr (requires { node.cg(); }) {
+                    ambiguity_set_map existing_ambiguity_sets;
+                    bool leaf_node = std::ranges::empty(node.get_children());
+                    if (leaf_node)
+                      existing_ambiguity_sets = node.cg().ambiguity_sets();
                     node.cg() = compact_genome{};
                     node.cg().add_parent_edge(edge_muts, parent_cg, ref);
+                    if (leaf_node)
+                      node.cg().set_ambiguity_sets(
+                          std::move(existing_ambiguity_sets));
                   }
                   cg_set = true;
                 },
@@ -782,16 +791,22 @@ inline uint8_t base_to_one_hot(nuc_base b) {
 inline uint8_t fitch_set_from_counts(std::array<uint32_t, 4> const& counts,
                                      uint32_t num_children) {
   if (num_children == 0) return 0;
-  uint8_t intersection = 0;
+
+  // Generalized Fitch/Sankoff for a node with any number of children and
+  // possibly ambiguous child state sets.  If this node is assigned base b,
+  // every child whose optimal state set does not contain b contributes one
+  // change.  Therefore the optimal parent states are exactly the bases that
+  // appear in the largest number of child sets.  For binary nodes this reduces
+  // to the usual intersection-if-nonempty-else-union rule.
+  uint32_t max_count = 0;
+  for (auto count : counts) max_count = std::max(max_count, count);
+
+  uint8_t result = 0;
   for (int i = 0; i < 4; i++) {
-    if (counts[i] == num_children) intersection |= static_cast<uint8_t>(1 << i);
+    if (counts[i] == max_count && max_count > 0)
+      result |= static_cast<uint8_t>(1 << i);
   }
-  if (intersection) return intersection;
-  uint8_t union_set = 0;
-  for (int i = 0; i < 4; i++) {
-    if (counts[i] > 0) union_set |= static_cast<uint8_t>(1 << i);
-  }
-  return union_set;
+  return result;
 }
 
 // Bottom-up + top-down Fitch pass to assign optimal inner node CGs.
@@ -804,8 +819,7 @@ inline uint8_t fitch_set_from_counts(std::array<uint32_t, 4> const& counts,
 // prefers the parent CG's state (instead of the reference).  This is
 // used for fragments where the root has a real parent in a larger tree.
 inline void fitch_assign_compact_genomes(
-    phylo_dag& d,
-    compact_genome const* root_parent_cg = nullptr) {
+    phylo_dag& d, compact_genome const* root_parent_cg = nullptr) {
   auto const& ref = get_reference_sequence(d);
   auto ua_idx = get_root_idx(d);
   auto ua_clades = get_clades(d, ua_idx);
@@ -829,6 +843,8 @@ inline void fitch_assign_compact_genomes(
         [&](auto node) {
           if constexpr (requires { node.cg(); }) {
             for (auto& [pos, base] : node.cg()) var_sites_set.insert(pos);
+            for (auto [pos, state_set] : node.cg().ambiguity_sets())
+              var_sites_set.insert(pos);
           }
         },
         nv);
@@ -837,6 +853,8 @@ inline void fitch_assign_compact_genomes(
   // mutations at sites that are invariant within the fragment.
   if (root_parent_cg) {
     for (auto& [pos, base] : *root_parent_cg) var_sites_set.insert(pos);
+    for (auto [pos, state_set] : root_parent_cg->ambiguity_sets())
+      var_sites_set.insert(pos);
   }
   std::pmr::vector<std::size_t> var_sites(var_sites_set.begin(),
                                           var_sites_set.end(), fitch_mr);
@@ -871,9 +889,10 @@ inline void fitch_assign_compact_genomes(
       std::visit(
           [&](auto node) {
             if constexpr (requires { node.cg(); }) {
-              for (std::size_t i = 0; i < n_sites; i++)
-                fitch[nid * n_sites + i] =
-                    base_to_one_hot(node.cg().get_base(var_sites[i], ref));
+              for (std::size_t i = 0; i < n_sites; i++) {
+                auto pos = static_cast<mutation_position>(var_sites[i]);
+                fitch[nid * n_sites + i] = node.cg().get_state_set(pos, ref);
+              }
             }
           },
           nv);
@@ -900,21 +919,20 @@ inline void fitch_assign_compact_genomes(
   std::vector<nuc_base> assigned(num_nodes * n_sites);
 
   // Assign tree root: pick base from Fitch set, preferring the parent's
-  // state.  When root_parent_cg is provided (fragment case), use the parent
-  // CG's base; otherwise fall back to the reference base.
+  // compatible state(s).  When root_parent_cg is provided (fragment case), use
+  // the parent CG's exact state set; otherwise fall back to the reference base.
   for (std::size_t i = 0; i < n_sites; i++) {
     uint8_t fs = fitch[tree_root * n_sites + i];
-    nuc_base prefer_base = root_parent_cg
-        ? root_parent_cg->get_base(var_sites[i], ref)
-        : nuc_base::from_char(ref.at(var_sites[i] - 1));
-    if (fs & base_to_one_hot(prefer_base)) {
-      assigned[tree_root * n_sites + i] = prefer_base;
-    } else {
-      for (int j = 0; j < 4; j++) {
-        if (fs & (1 << j)) {
-          assigned[tree_root * n_sites + i] = nuc_base{static_cast<uint8_t>(j)};
-          break;
-        }
+    uint8_t prefer_set =
+        root_parent_cg
+            ? root_parent_cg->get_state_set(var_sites[i], ref)
+            : base_to_one_hot(nuc_base::from_char(ref.at(var_sites[i] - 1)));
+    uint8_t choices = fs & prefer_set;
+    if (choices == 0) choices = fs;
+    for (int j = 0; j < 4; j++) {
+      if (choices & (1 << j)) {
+        assigned[tree_root * n_sites + i] = nuc_base{static_cast<uint8_t>(j)};
+        break;
       }
     }
   }

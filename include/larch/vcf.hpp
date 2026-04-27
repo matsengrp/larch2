@@ -7,6 +7,7 @@
 
 #include <charconv>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -16,6 +17,7 @@ namespace larch {
 struct vcf_data {
   std::vector<std::string> sample_names;
   std::map<std::string, compact_genome> sample_genomes;
+  ambiguity_counts ambiguity;
 };
 
 inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
@@ -23,8 +25,11 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
   std::string_view content{bytes.data(), bytes.size()};
 
   vcf_data result;
-  // Accumulate per-sample mutations, convert to compact_genome at end
+  // Accumulate per-sample mutations/IUPAC state sets, convert to compact_genome
+  // at end.
   std::map<std::string, std::map<mutation_position, nuc_base>> sample_muts;
+  std::map<std::string, ambiguity_set_map> sample_ambiguity;
+  auto& ambiguity = result.ambiguity;
 
   std::size_t pos = 0;
   while (pos < content.size()) {
@@ -96,23 +101,45 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
       int allele_idx = 0;
       if (!gt.empty() && gt[0] >= '0' && gt[0] <= '9') allele_idx = gt[0] - '0';
 
-      nuc_base sample_base = nuc_base::from_char(ref_allele[0]);
+      char allele_char = ref_allele[0];
       if (allele_idx > 0 &&
           static_cast<std::size_t>(allele_idx - 1) < alt_alleles.size()) {
-        sample_base = nuc_base::from_char(alt_alleles[allele_idx - 1][0]);
+        allele_char = alt_alleles[allele_idx - 1][0];
+      }
+      auto state_set = iupac_state_set(allele_char);
+
+      ambiguity.observed_sites++;
+      if (state_set != 0 && std::popcount(state_set) != 1) {
+        sample_muts[result.sample_names[i]].erase(mpos);
+        sample_ambiguity[result.sample_names[i]][mpos] = state_set;
+        ambiguity.add(allele_char);
+        continue;
       }
 
       // Record mutation if different from reference
+      nuc_base sample_base = nuc_base::from_char(allele_char);
       nuc_base ref_base = nuc_base::from_char(reference.at(mpos - 1));
+      sample_ambiguity[result.sample_names[i]].erase(mpos);
       if (!(sample_base == ref_base)) {
         sample_muts[result.sample_names[i]][mpos] = sample_base;
       }
     }
   }
 
-  // Convert accumulated mutations to compact_genomes
+  // Convert accumulated mutations/IUPAC state sets to compact_genomes.
   for (auto& [name, muts] : sample_muts) {
-    result.sample_genomes[name] = compact_genome{std::move(muts)};
+    auto amb_it = sample_ambiguity.find(name);
+    ambiguity_set_map ambiguity_sets;
+    if (amb_it != sample_ambiguity.end())
+      ambiguity_sets = std::move(amb_it->second);
+    result.sample_genomes[name] =
+        compact_genome{std::move(muts), std::move(ambiguity_sets)};
+  }
+  for (auto& [name, ambiguity_sets] : sample_ambiguity) {
+    if (!result.sample_genomes.contains(name)) {
+      result.sample_genomes[name] =
+          compact_genome{{}, std::move(ambiguity_sets)};
+    }
   }
 
   return result;
@@ -131,17 +158,25 @@ inline void apply_vcf_to_dag(phylo_dag& d, vcf_data const& vcf) {
             auto it = vcf.sample_genomes.find(node.sample_id());
             if (it == vcf.sample_genomes.end()) return;
 
-            // Build new mutations map: start from existing CG, overlay VCF
+            // Build new compact genome: start from existing CG, overlay VCF
+            // concrete calls, then apply VCF IUPAC state sets.
             std::map<mutation_position, nuc_base> muts;
             for (auto [pos, base] : node.cg()) muts[pos] = base;
+            ambiguity_set_map ambiguity_sets = node.cg().ambiguity_sets();
             for (auto [pos, base] : it->second) {
+              ambiguity_sets.erase(pos);
               auto ref_base = nuc_base::from_char(ref.at(pos - 1));
               if (base == ref_base)
                 muts.erase(pos);
               else
                 muts[pos] = base;
             }
-            node.cg() = compact_genome{std::move(muts)};
+            for (auto [pos, state_set] : it->second.ambiguity_sets()) {
+              muts.erase(pos);
+              ambiguity_sets[pos] = state_set;
+            }
+            node.cg() =
+                compact_genome{std::move(muts), std::move(ambiguity_sets)};
           }
         },
         nv);

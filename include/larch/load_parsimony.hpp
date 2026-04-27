@@ -7,6 +7,7 @@
 
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -25,8 +26,15 @@ struct pars_mut {
   std::string chromosome;
 };
 
+struct pars_iupac_site {
+  int32_t position;
+  int32_t state_set;
+};
+
 struct pars_mutation_list {
   std::vector<pars_mut> mutation;
+  std::vector<int32_t> ambiguous_sites;
+  std::vector<pars_iupac_site> iupac_sites;
 };
 
 struct pars_condensed_node {
@@ -122,12 +130,25 @@ inline phylo_dag load_parsimony_tree(std::string_view path,
     edge.clade_index() = 0;
   }
 
-  // Apply mutations in preorder
-  // node_mutations are in preorder traversal order of the newick tree
+  // Apply mutations in preorder.
+  // node_mutations are in preorder traversal order of the newick tree.
+  std::unordered_map<std::size_t, ambiguity_set_map> ambiguity_sets_by_node;
   std::size_t muts_idx = 0;
   auto apply_muts = [&](auto& self, std::size_t dag_idx) -> void {
     if (muts_idx >= msg.node_mutations.size()) return;
     auto& ml = msg.node_mutations[muts_idx++];
+    if (!ml.ambiguous_sites.empty()) {
+      auto& ambiguity_sets = ambiguity_sets_by_node[dag_idx];
+      for (auto pos : ml.ambiguous_sites)
+        ambiguity_sets[static_cast<mutation_position>(pos)] = 0b1111;
+    }
+    for (auto const& site : ml.iupac_sites) {
+      auto state_set = static_cast<uint8_t>(site.state_set) & 0b1111;
+      if (state_set != 0) {
+        ambiguity_sets_by_node[dag_idx][static_cast<mutation_position>(
+            site.position)] = state_set;
+      }
+    }
 
     std::visit(
         [&](auto node) {
@@ -225,6 +246,16 @@ inline phylo_dag load_parsimony_tree(std::string_view path,
   }
 
   recompute_compact_genomes(d);
+
+  for (auto& [dag_idx, ambiguity_sets] : ambiguity_sets_by_node) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.cg(); }) {
+            node.cg().set_ambiguity_sets(std::move(ambiguity_sets));
+          }
+        },
+        d.get_node(dag_idx));
+  }
 
   for (auto nv : d.get_all_nodes()) {
     std::visit(
