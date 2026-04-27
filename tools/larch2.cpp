@@ -1854,13 +1854,13 @@ static resume_state resume_state_from_msg(larch::larch_checkpoint_msg const& c) 
 }
 
 static larch::larch_checkpoint_msg build_checkpoint_msg(
-    merge& m, args const& a, std::size_t completed_iter,
+    merge& m, args const& a, std::size_t next_iteration,
     std::mt19937 const& rng, patience_checker const& patience,
     std::vector<optimize_result> const& results) {
   larch::larch_checkpoint_msg c{};
   c.schema_version = larch::checkpoint_schema_version;
   c.larch2_git_sha = larch::git_commit;
-  c.next_iteration = static_cast<int64_t>(completed_iter);
+  c.next_iteration = static_cast<int64_t>(next_iteration);
   c.optimizer = a.optimizer;
   if (a.patience) c.patience.limit = static_cast<int64_t>(*a.patience);
   c.patience.count = static_cast<int64_t>(patience.count);
@@ -1889,58 +1889,7 @@ static larch::larch_checkpoint_msg build_checkpoint_msg(
     c.results.push_back(std::move(m_r));
   }
 
-  // Serialize the merged DAG into the checkpoint's nested dag_data field.
-  // We mirror save_proto_dag's logic, but build a dag_data struct directly
-  // instead of writing it to a file.
-  auto& dag = m.get_result();
-  larch::dag_data& data = c.dag;
-  data.reference_seq = get_reference_sequence(dag);
-
-  std::unordered_map<std::size_t, int64_t> node_to_proto;
-  auto root_idx = get_root_idx(dag);
-  node_to_proto[root_idx] = 0;
-  int64_t next_id = 1;
-  for (auto nv : dag.get_all_nodes()) {
-    auto idx = std::visit([](auto n) { return n.index(); }, nv);
-    if (idx == root_idx) continue;
-    node_to_proto[idx] = next_id++;
-  }
-
-  int64_t edge_id = 0;
-  for (auto ev : dag.get_all_edges()) {
-    std::visit(
-        [&](auto edge) {
-          auto parent_idx =
-              std::visit([](auto n) { return n.index(); }, edge.get_parent());
-          auto child_idx =
-              std::visit([](auto n) { return n.index(); }, edge.get_child());
-          larch::dag_edge de;
-          de.edge_id = edge_id++;
-          de.parent_node = node_to_proto[parent_idx];
-          de.child_node = node_to_proto[child_idx];
-          de.parent_clade = static_cast<int64_t>(edge.clade_index());
-          for (auto& [pos, nucs] : edge.mutations()) {
-            larch::dag_mut dm;
-            dm.position = static_cast<int32_t>(pos);
-            dm.par_nuc = static_cast<int32_t>(nucs.first.raw());
-            dm.mut_nuc = {static_cast<int32_t>(nucs.second.raw())};
-            de.edge_mutations.push_back(std::move(dm));
-          }
-          data.edges.push_back(std::move(de));
-        },
-        ev);
-  }
-  for (auto nv : dag.get_all_nodes()) {
-    std::visit(
-        [&](auto node) {
-          larch::dag_node_name nn;
-          nn.node_id = node_to_proto[node.index()];
-          if constexpr (requires { node.sample_id(); })
-            nn.condensed_leaves = {node.sample_id()};
-          data.node_names.push_back(std::move(nn));
-        },
-        nv);
-  }
+  c.dag = larch::encode_dag_to_proto(m.get_result());
 
   c.args_payload = args_fingerprint_payload(a);
   c.args_fingerprint = larch::sha256_hex(c.args_payload);
@@ -2507,7 +2456,11 @@ int main(int argc, char** argv) {
                   << ckpt.larch2_git_sha << ", current binary is "
                   << larch::git_commit << "\n";
       }
-      // Build phylo_dag from the checkpoint's nested dag_data.
+      // Pull non-dag fields out before consuming the dag — resume_state_
+      // from_msg reads ckpt.{patience, main_rng, results, next_iteration},
+      // so building it first keeps ckpt fully valid until those fields are
+      // copied.
+      resume = resume_state_from_msg(ckpt);
       larch::dag_data_meta meta{
           .node_names = std::move(ckpt.dag.node_names),
           .reference_id = std::move(ckpt.dag.reference_id),
@@ -2515,7 +2468,6 @@ int main(int argc, char** argv) {
       };
       dag = larch::build_phylo_dag_from_proto(std::move(ckpt.dag.edges),
                                               std::move(meta));
-      resume = resume_state_from_msg(ckpt);
     } else {
       // Phase 1 / legacy raw-DAG checkpoint: equivalent to --dag-pb.
       std::cerr << "Resuming from DAG-only checkpoint " << a.resume

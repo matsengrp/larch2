@@ -108,7 +108,13 @@ inline std::mt19937 deserialize_mt19937(std::string const& s) {
 // starts with the bytes [0x08, schema_version_varint]. A raw dag_data file
 // (Phase 1 / legacy) starts with field 1 (edges, length-delimited) tagged
 // 0x0a, or another length-delimited field if edges is empty. The byte 0x08
-// uniquely identifies a larch_checkpoint.
+// uniquely identifies a larch_checkpoint. Detection assumes
+// checkpoint_schema_version > 0 — proto3 omits zero-default fields on the
+// wire, which would invert the magic byte test.
+static_assert(checkpoint_schema_version > 0,
+              "checkpoint_schema_version must be > 0 for looks_like_checkpoint "
+              "to reliably detect Phase 2 files");
+
 inline bool looks_like_checkpoint(std::span<const uint8_t> data) {
   return !data.empty() && data[0] == 0x08;
 }

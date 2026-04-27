@@ -80,9 +80,18 @@ static void test_checkpoint_msg_roundtrip() {
   assert(decoded.main_rng.mt19937_state == c.main_rng.mt19937_state);
   assert(decoded.drift_rng.mt19937_state.empty());
   assert(decoded.results.size() == 1);
-  assert(decoded.results[0].dag_node_count == 10);
+  // Every result + radius field must round-trip; a regression that silently
+  // zero-initialises any of these would also let determinism quietly drift.
+  assert(decoded.results[0].iteration == r.iteration);
+  assert(decoded.results[0].dag_node_count == r.dag_node_count);
+  assert(decoded.results[0].dag_edge_count == r.dag_edge_count);
+  assert(decoded.results[0].trees_merged == r.trees_merged);
+  assert(decoded.results[0].parsimony_score == r.parsimony_score);
   assert(decoded.results[0].radii.size() == 1);
-  assert(decoded.results[0].radii[0].radius == 2);
+  assert(decoded.results[0].radii[0].radius == rd.radius);
+  assert(decoded.results[0].radii[0].moves_found == rd.moves_found);
+  assert(decoded.results[0].radii[0].moves_applied == rd.moves_applied);
+  assert(decoded.results[0].radii[0].parsimony_score == rd.parsimony_score);
   assert(decoded.dag.reference_seq == "ACGT");
   assert(decoded.dag.reference_id == "ref");
   assert(decoded.args_fingerprint == "deadbeef");
@@ -131,11 +140,45 @@ static void test_optional_int64_present_zero() {
   std::println("test_optional_int64_present_zero: OK");
 }
 
+// Drift_rng is emitted by encoding only when its mt19937_state is
+// non-empty. Verify that a populated drift_rng survives the round-trip
+// distinct from main_rng — this is the field that would matter most if a
+// future change captured in-progress drift state at checkpoint time.
+static void test_drift_rng_roundtrip() {
+  larch_checkpoint_msg c{};
+  c.schema_version = checkpoint_schema_version;
+  c.optimizer = "native";
+
+  std::mt19937 main_rng{1};
+  std::mt19937 drift_rng{2};
+  for (int i = 0; i < 5; ++i) (void)main_rng();
+  for (int i = 0; i < 11; ++i) (void)drift_rng();
+  c.main_rng.mt19937_state = serialize_mt19937(main_rng);
+  c.drift_rng.mt19937_state = serialize_mt19937(drift_rng);
+
+  auto bytes = pb::encode(c);
+  auto decoded = pb::decode<larch_checkpoint_msg>({bytes.data(), bytes.size()});
+  assert(!decoded.drift_rng.mt19937_state.empty());
+  assert(decoded.drift_rng.mt19937_state == c.drift_rng.mt19937_state);
+  assert(decoded.main_rng.mt19937_state == c.main_rng.mt19937_state);
+  // Different RNGs must remain distinct after the round-trip.
+  assert(decoded.main_rng.mt19937_state != decoded.drift_rng.mt19937_state);
+
+  auto restored_main = deserialize_mt19937(decoded.main_rng.mt19937_state);
+  auto restored_drift = deserialize_mt19937(decoded.drift_rng.mt19937_state);
+  for (int i = 0; i < 50; ++i) {
+    assert(main_rng() == restored_main());
+    assert(drift_rng() == restored_drift());
+  }
+  std::println("test_drift_rng_roundtrip: OK");
+}
+
 int main() {
   test_mt19937_roundtrip();
   test_checkpoint_msg_roundtrip();
   test_sha256_known_vectors();
   test_optional_int64_present_zero();
+  test_drift_rng_roundtrip();
   std::println("all checkpoint tests passed");
   return 0;
 }

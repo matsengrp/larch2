@@ -52,6 +52,11 @@ run_larch --dag-pb "$FIXTURE" --iterations 6 --checkpoint-after 1 \
     --seed 42 -o "$TMP/baseline.pb.gz" --checkpoint-prefix "$TMP/baseline"
 cp "$TMP/log.out" "$TMP/baseline.log"
 BASELINE_SCORES=$(extract_scores "$TMP/baseline.log")
+if [ -z "$BASELINE_SCORES" ]; then
+    echo "FAIL: baseline run produced no per-iteration scores; log format may have changed" >&2
+    cat "$TMP/baseline.log" >&2
+    exit 1
+fi
 echo "baseline scores: $BASELINE_SCORES"
 
 # Phase 2 gate: for each K in {1, 2, 3}, resume from ckpt-K and verify the
@@ -60,7 +65,9 @@ echo "baseline scores: $BASELINE_SCORES"
 # save_proto_dag/load_proto_dag — which save_proto_dag does once load order
 # is forced to match.)
 echo "=== Test: Phase 2 deterministic resume ==="
-for K in 1 2 3; do
+# Cover every interrupt point K ∈ [1, N-1] from the issue's "every-iteration
+# interrupt" property test (issue #39 test plan #9).
+for K in 1 2 3 4 5; do
     rm -f "$TMP/resumed_${K}.pb.gz"
     run_larch --resume "$TMP/baseline.ckpt-${K}.pb.gz" \
         --iterations 6 --seed 42 -o "$TMP/resumed_${K}.pb.gz" \
@@ -105,7 +112,7 @@ echo "  multi-resume chain canonical-equal"
 # regressions if someone reverts the deterministic-resume path.
 echo "=== Test: Phase 1 score-no-worse-than-baseline ==="
 BASELINE_FINAL=$(echo "$BASELINE_SCORES" | tail -1)
-for K in 1 2 3; do
+for K in 1 2 3 4 5; do
     R_FINAL=$(extract_scores "$TMP/resumed_${K}.log" | tail -1)
     if [ "$R_FINAL" -gt "$BASELINE_FINAL" ]; then
         echo "FAIL: resumed_${K} final score ($R_FINAL) > baseline ($BASELINE_FINAL)" >&2
@@ -136,20 +143,25 @@ if ! grep -q "patience" "$TMP/log.out"; then
 fi
 echo "  patience-mismatch refused with the right error"
 
-# Forbidden input flag with --resume.
+# Forbidden input flags with --resume. Cover the input flags most likely to
+# be re-passed by mistake: --vcf (issue's specific test 8) and --dag-pb (the
+# common case where a user forgets the flag-swap).
 echo "=== Test: --resume rejects input flags ==="
-if "$LARCH2" --resume "$TMP/baseline.ckpt-1.pb.gz" --vcf /dev/null \
-    -o "$TMP/forbidden.pb.gz" > "$TMP/log.out" 2>&1; then
-    echo "FAIL: expected non-zero exit on --resume + --vcf" >&2
-    cat "$TMP/log.out" >&2
-    exit 1
-fi
-if ! grep -q -- "--vcf" "$TMP/log.out"; then
-    echo "FAIL: error message did not mention --vcf" >&2
-    cat "$TMP/log.out" >&2
-    exit 1
-fi
-echo "  --resume + --vcf refused"
+for FORBIDDEN_FLAG in --vcf --dag-pb; do
+    if "$LARCH2" --resume "$TMP/baseline.ckpt-1.pb.gz" \
+        "$FORBIDDEN_FLAG" /dev/null -o "$TMP/forbidden.pb.gz" \
+        > "$TMP/log.out" 2>&1; then
+        echo "FAIL: expected non-zero exit on --resume + $FORBIDDEN_FLAG" >&2
+        cat "$TMP/log.out" >&2
+        exit 1
+    fi
+    if ! grep -q -- "$FORBIDDEN_FLAG" "$TMP/log.out"; then
+        echo "FAIL: error message did not mention $FORBIDDEN_FLAG" >&2
+        cat "$TMP/log.out" >&2
+        exit 1
+    fi
+    echo "  --resume + $FORBIDDEN_FLAG refused"
+done
 
 # Pre-drift checkpoint: triggering drift entry should produce a
 # *.ckpt-<K>-pre-drift.pb.gz file. With --patience 2 --drift 1, the score
