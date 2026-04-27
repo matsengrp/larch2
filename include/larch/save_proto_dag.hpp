@@ -8,8 +8,13 @@
 
 namespace larch {
 
-inline void save_proto_dag(phylo_dag& dag, std::string_view path,
-                           std::vector<float> const& edge_scores) {
+// Translate an in-memory phylo_dag into the proto-mirror dag_data struct.
+// Both save_proto_dag and the larch_checkpoint writer in tools/larch2.cpp
+// need this — keeping it in one place ensures any future schema change
+// (new mutation field, changed node id allocation, etc.) only has to be
+// updated once.
+inline dag_data encode_dag_to_proto(
+    phylo_dag& dag, std::vector<float> const& edge_scores = {}) {
   assert(edge_scores.empty() || edge_scores.size() >= dag.edge_high_mark());
   dag_data data;
   data.reference_seq = get_reference_sequence(dag);
@@ -74,7 +79,12 @@ inline void save_proto_dag(phylo_dag& dag, std::string_view path,
         nv);
   }
 
-  pb::encode_file(path, data);
+  return data;
+}
+
+inline void save_proto_dag(phylo_dag& dag, std::string_view path,
+                           std::vector<float> const& edge_scores) {
+  pb::encode_file(path, encode_dag_to_proto(dag, edge_scores));
 }
 
 inline void save_proto_dag(phylo_dag& dag, std::string_view path) {

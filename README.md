@@ -93,6 +93,26 @@ larch2 [options] -o <output.pb.gz>
 | `--min-subtree-clade-size <N>` | 100 | Minimum leaves in selected subtree |
 | `--max-subtree-clade-size <N>` | 1000 | Maximum leaves in selected subtree |
 
+### Checkpointing
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--checkpoint-after <N>` | off | Write a checkpoint every N completed iterations, plus one immediately before each drift-escape entry (native optimizer only) |
+| `--checkpoint-prefix <P>` | derived | Override checkpoint path prefix (default strips `.pb.gz` from `--output`) |
+| `--resume <path>` | off | Resume from a checkpoint file. Mutually exclusive with `--dag-pb`, `--tree-pb`, `--fasta`, `--newick`, `--refseq`, `--vcf` (the checkpoint is self-describing) |
+
+Checkpoint files are written atomically (`<path>.tmp` then renamed). Iteration-boundary checkpoints are named `<prefix>.ckpt-<iter>.pb.gz`; pre-drift checkpoints are named `<prefix>.ckpt-<iter>-pre-drift.pb.gz`.
+
+A resumed run that uses the same `--seed` and the same fingerprinted args (every flag in this section EXCEPT `--output`, `--trim`, `--validate`, `--log-metrics`, and the `--diverse-*` outputs) is canonical-equivalent to the corresponding uninterrupted run. Changing a fingerprinted arg on resume is rejected with an error naming the conflicting field.
+
+```sh
+# Run 6 iters, checkpointing every iter
+larch2 --dag-pb input.pb.gz -n 6 --checkpoint-after 1 --seed 42 -o out.pb.gz
+
+# Later, resume from iter 3 to completion
+larch2 --resume out.ckpt-3.pb.gz -n 6 --seed 42 -o resumed.pb.gz
+```
+
 ### Diverse tree extraction
 
 | Option | Default | Description |

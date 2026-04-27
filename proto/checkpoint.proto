@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package ProtoDAG;
+
+import "dag.proto";
+
+/// Patience-checker state. limit mirrors args.patience (unset if --patience
+/// was not passed). count is the current consecutive-no-improvement run.
+/// best_score is the best-so-far parsimony score; absent until at least one
+/// iteration has completed.
+message patience_state {
+  optional uint64 limit = 1;
+  uint64 count = 2;
+  optional uint64 best_score = 3;
+}
+
+/// std::mt19937 state, serialized via std::ostringstream + operator<<.
+/// The C++ standard guarantees byte-exact round-trip across operator<</>>.
+message rng_state {
+  bytes mt19937_state = 1;
+}
+
+/// Mirror of the C++ radius_result struct; one entry per radius pass within
+/// an iteration.
+message radius_result_msg {
+  uint64 radius = 1;
+  uint64 moves_found = 2;
+  uint64 moves_applied = 3;
+  uint64 parsimony_score = 4;
+}
+
+/// Mirror of the C++ optimize_result struct; one entry per completed
+/// iteration in the optimization loop.
+message optimize_result_msg {
+  uint64 iteration = 1;
+  uint64 dag_node_count = 2;
+  uint64 dag_edge_count = 3;
+  uint64 trees_merged = 4;
+  uint64 parsimony_score = 5;
+  repeated radius_result_msg radii = 6;
+}
+
+/// Phase 2 checkpoint: the merged DAG plus enough optimization state to
+/// resume an interrupted run such that the resumed final output is
+/// canonical-byte-identical to an uninterrupted run with the same seeds.
+message larch_checkpoint {
+  uint32 schema_version = 1;
+  string larch2_git_sha = 2;
+  uint64 next_iteration = 3;
+  string optimizer = 4;
+  patience_state patience = 5;
+  rng_state main_rng = 6;
+  optional rng_state drift_rng = 7;
+  repeated optimize_result_msg results = 8;
+  ProtoDAG.data dag = 9;
+  /// SHA-256 hex digest of args_payload. Recomputed on resume and compared
+  /// to detect args changes that would invalidate determinism.
+  string args_fingerprint = 10;
+  /// JSON serialization of the fingerprinted args fields. Stored alongside
+  /// the digest so we can identify which specific field changed when the
+  /// digests mismatch.
+  string args_payload = 11;
+}
