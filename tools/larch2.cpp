@@ -1709,13 +1709,7 @@ static bool drift_escape(merge& m, args const& a, progress& prog) {
 // args_fingerprint and also stored verbatim alongside the digest so a
 // mismatch on resume can name the differing fields.
 static std::string args_fingerprint_payload(args const& a) {
-  auto opt_u = [](std::optional<std::uint32_t> const& v) {
-    return v ? std::to_string(*v) : std::string{"null"};
-  };
-  auto opt_z = [](std::optional<std::size_t> const& v) {
-    return v ? std::to_string(*v) : std::string{"null"};
-  };
-  auto opt_i = [](std::optional<int> const& v) {
+  auto opt = [](auto const& v) {
     return v ? std::to_string(*v) : std::string{"null"};
   };
   auto j_bool = [](bool b) { return b ? "true" : "false"; };
@@ -1739,29 +1733,29 @@ static std::string args_fingerprint_payload(args const& a) {
   os << "\"iterations\":" << a.iterations;
   os << ",\"optimizer\":" << j_str(a.optimizer);
   os << ",\"max_moves\":" << a.max_moves;
-  os << ",\"seed\":" << opt_u(a.seed);
+  os << ",\"seed\":" << opt(a.seed);
   os << ",\"sample_method\":" << j_str(a.sample_method);
   os << ",\"sample_uniformly\":" << j_bool(a.sample_uniformly);
   os << ",\"sample_per_radius\":" << j_bool(a.sample_per_radius);
   os << ",\"ignore_root_edge_mutations\":"
      << j_bool(a.ignore_root_edge_mutations);
   os << ",\"callback_option\":" << j_str(a.callback_option);
-  os << ",\"switch_subtrees\":" << opt_z(a.switch_subtrees);
+  os << ",\"switch_subtrees\":" << opt(a.switch_subtrees);
   os << ",\"min_subtree_clade_size\":" << a.min_subtree_clade_size;
   os << ",\"max_subtree_clade_size\":" << a.max_subtree_clade_size;
   os << ",\"move_coeff_pscore\":" << a.move_coeff_pscore;
   os << ",\"move_coeff_nodes\":" << a.move_coeff_nodes;
-  os << ",\"move_score_threshold\":" << opt_i(a.move_score_threshold);
-  os << ",\"patience\":" << opt_z(a.patience);
-  os << ",\"drift\":" << opt_z(a.drift);
+  os << ",\"move_score_threshold\":" << opt(a.move_score_threshold);
+  os << ",\"patience\":" << opt(a.patience);
+  os << ",\"drift\":" << opt(a.drift);
   os << ",\"inplace_steps\":" << a.inplace_steps;
   os << ",\"inplace_threshold\":" << a.inplace_threshold;
-  os << ",\"inplace_budget\":" << opt_i(a.inplace_budget);
+  os << ",\"inplace_budget\":" << opt(a.inplace_budget);
   os << ",\"inplace_temperature\":" << a.inplace_temperature;
   os << ",\"inplace_cooling\":" << a.inplace_cooling;
   os << ",\"inplace_fragments\":" << j_str(frag_to_str(a.inplace_fragments));
   os << ",\"drift_mode\":" << j_str(drift_to_str(a.drift_mode));
-  os << ",\"drift_seed\":" << opt_u(a.drift_seed);
+  os << ",\"drift_seed\":" << opt(a.drift_seed);
   os << "}";
   return os.str();
 }
@@ -1871,7 +1865,7 @@ static larch::larch_checkpoint_msg build_checkpoint_msg(
   // captured (no in-progress drift state at our checkpoint sites).
   c.results.reserve(results.size());
   for (auto const& r : results) {
-    larch::optimize_result_msg_pb m_r{};
+    larch::optimize_result_msg m_r{};
     m_r.iteration = static_cast<int64_t>(r.iteration);
     m_r.dag_node_count = static_cast<int64_t>(r.dag_node_count);
     m_r.dag_edge_count = static_cast<int64_t>(r.dag_edge_count);
@@ -1879,7 +1873,7 @@ static larch::larch_checkpoint_msg build_checkpoint_msg(
     m_r.parsimony_score = static_cast<int64_t>(r.parsimony_score);
     m_r.radii.reserve(r.radii.size());
     for (auto const& rd : r.radii) {
-      larch::radius_result_msg_pb m_rd{};
+      larch::radius_result_msg m_rd{};
       m_rd.radius = static_cast<int64_t>(rd.radius);
       m_rd.moves_found = static_cast<int64_t>(rd.moves_found);
       m_rd.moves_applied = static_cast<int64_t>(rd.moves_applied);

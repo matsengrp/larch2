@@ -46,13 +46,13 @@ static void test_checkpoint_msg_roundtrip() {
   for (int i = 0; i < 10; ++i) (void)rng();
   c.main_rng.mt19937_state = serialize_mt19937(rng);
 
-  optimize_result_msg_pb r{};
+  optimize_result_msg r{};
   r.iteration = 0;
   r.dag_node_count = 10;
   r.dag_edge_count = 9;
   r.trees_merged = 1;
   r.parsimony_score = 100;
-  radius_result_msg_pb rd{};
+  radius_result_msg rd{};
   rd.radius = 2;
   rd.moves_found = 3;
   rd.moves_applied = 2;

@@ -32,20 +32,20 @@ struct rng_state_msg {
   std::string mt19937_state;
 };
 
-struct radius_result_msg_pb {
+struct radius_result_msg {
   int64_t radius;
   int64_t moves_found;
   int64_t moves_applied;
   int64_t parsimony_score;
 };
 
-struct optimize_result_msg_pb {
+struct optimize_result_msg {
   int64_t iteration;
   int64_t dag_node_count;
   int64_t dag_edge_count;
   int64_t trees_merged;
   int64_t parsimony_score;
-  std::vector<radius_result_msg_pb> radii;
+  std::vector<radius_result_msg> radii;
 };
 
 struct larch_checkpoint_msg {
@@ -56,7 +56,7 @@ struct larch_checkpoint_msg {
   patience_state_msg patience;
   rng_state_msg main_rng;
   rng_state_msg drift_rng;  // empty mt19937_state == not present
-  std::vector<optimize_result_msg_pb> results;
+  std::vector<optimize_result_msg> results;
   dag_data dag;
   std::string args_fingerprint;  // SHA-256 hex digest of args_payload
   std::string args_payload;      // JSON of fingerprinted args (for diff
