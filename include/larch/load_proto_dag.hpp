@@ -71,35 +71,11 @@ inline constexpr auto field_numbers<larch::dag_data_meta> =
 
 namespace larch {
 
-inline phylo_dag load_proto_dag(std::string_view path) {
-  // Get raw data via mmap (plain .pb) or read_file (.pb.gz)
-  std::optional<mmap_file> mf;
-  std::vector<char> file_bytes;
-  std::span<const uint8_t> data;
-  if (!is_gzipped(path)) {
-    mf.emplace(path);
-    data = mf->span();
-  } else {
-    file_bytes = read_file(path);
-    data = {reinterpret_cast<const uint8_t*>(file_bytes.data()),
-            file_bytes.size()};
-  }
-
-  // Parallel decode edges (field 1 = repeated dag_edge)
-  auto edge_spans = pb::collect_field_spans(data, 1);
-  std::vector<dag_edge> edges(edge_spans.size());
-  {
-    std::vector<std::size_t> indices(edge_spans.size());
-    std::iota(indices.begin(), indices.end(), std::size_t{0});
-    parallel_for_each(indices, [&](std::size_t i) {
-      edges[i] = pb::decode<dag_edge>(edge_spans[i]);
-    });
-  }
-
-  // Decode remaining fields sequentially (node_names, reference_id,
-  // reference_seq)
-  auto meta = pb::decode<dag_data_meta>(data);
-
+// Build a phylo_dag from an already-decoded edges vector and metadata.
+// Shared by both load_proto_dag (parallel decode of file bytes) and the
+// checkpoint resume path (where edges live nested inside larch_checkpoint).
+inline phylo_dag build_phylo_dag_from_proto(std::vector<dag_edge> edges,
+                                            dag_data_meta meta) {
   phylo_dag d;
 
   // Create UA node with reference sequence
@@ -140,11 +116,20 @@ inline phylo_dag load_proto_dag(std::string_view path) {
     }
   }
 
-  // Create DAG nodes. Proto root maps to our UA node.
+  // Create DAG nodes. Proto root maps to our UA node. Walk proto IDs in
+  // sorted order so the resulting phylo_dag node ordering is deterministic
+  // — otherwise the unordered_map iteration order would make load+save round
+  // trips lose the original node-index layout, breaking determinism for any
+  // operation that traverses by index (e.g. sampling).
   std::pmr::unordered_map<std::size_t, std::size_t> proto_to_dag(mr);
   proto_to_dag[proto_root_id] = ua.index();
 
-  for (auto [proto_id, _] : all_node_ids) {
+  std::pmr::vector<std::size_t> sorted_proto_ids(mr);
+  sorted_proto_ids.reserve(all_node_ids.size());
+  for (auto [proto_id, _] : all_node_ids) sorted_proto_ids.push_back(proto_id);
+  std::sort(sorted_proto_ids.begin(), sorted_proto_ids.end());
+
+  for (auto proto_id : sorted_proto_ids) {
     if (proto_id == proto_root_id) continue;  // Already mapped to UA
 
     bool has_sample = node_sample_ids.contains(proto_id);
@@ -160,20 +145,13 @@ inline phylo_dag load_proto_dag(std::string_view path) {
     }
   }
 
-  // Sort edges by parent_node so that each parent's children list grows
-  // contiguously at the high-water mark of the neighbors chain, avoiding
-  // O(k^2) reallocation per high-degree node.
+  // Sort edges by edge_id (sequential append-order from save_proto_dag) so
+  // that load+save preserves the original phylo_dag internal edge indexing
+  // and per-node neighbor-list ordering. Internal ordering is observable
+  // (sampling traversals follow children-list order), so the previous
+  // parent-sort optimization broke determinism for resume-from-checkpoint.
   std::sort(edges.begin(), edges.end(),
-            [](auto& a, auto& b) { return a.parent_node < b.parent_node; });
-
-  // Phase 1: Create edges, set mutations, and link parents (builds children
-  // lists contiguously since edges are sorted by parent).
-  struct pending_child {
-    std::size_t edge_idx;
-    std::size_t child_dag_idx;
-  };
-  std::pmr::vector<pending_child> pending(mr);
-  pending.reserve(edges.size());
+            [](auto& a, auto& b) { return a.edge_id < b.edge_id; });
 
   for (auto& re : edges) {
     auto parent_idx = proto_to_dag[static_cast<std::size_t>(re.parent_node)];
@@ -191,22 +169,7 @@ inline phylo_dag load_proto_dag(std::string_view path) {
     edge.clade_index() = static_cast<std::size_t>(re.parent_clade);
 
     std::visit([&](auto p) { edge.set_parent(p); }, d.get_node(parent_idx));
-    pending.push_back({edge.index(), child_idx});
-  }
-
-  // Phase 2: Link children, sorted by child node so that each child's
-  // parents list also grows contiguously.
-  std::sort(pending.begin(), pending.end(),
-            [](auto& a, auto& b) { return a.child_dag_idx < b.child_dag_idx; });
-
-  for (auto& pc : pending) {
-    auto ev = d.get_edge(pc.edge_idx);
-    std::visit(
-        [&](auto edge) {
-          std::visit([&](auto c) { edge.set_child(c); },
-                     d.get_node(pc.child_dag_idx));
-        },
-        ev);
+    std::visit([&](auto c) { edge.set_child(c); }, d.get_node(child_idx));
   }
 
   recompute_compact_genomes(d);
@@ -241,6 +204,38 @@ inline phylo_dag load_proto_dag(std::string_view path) {
 
   build_clade_offsets(d);
   return d;
+}
+
+inline phylo_dag load_proto_dag(std::string_view path) {
+  // Get raw data via mmap (plain .pb) or read_file (.pb.gz)
+  std::optional<mmap_file> mf;
+  std::vector<char> file_bytes;
+  std::span<const uint8_t> data;
+  if (!is_gzipped(path)) {
+    mf.emplace(path);
+    data = mf->span();
+  } else {
+    file_bytes = read_file(path);
+    data = {reinterpret_cast<const uint8_t*>(file_bytes.data()),
+            file_bytes.size()};
+  }
+
+  // Parallel decode edges (field 1 = repeated dag_edge)
+  auto edge_spans = pb::collect_field_spans(data, 1);
+  std::vector<dag_edge> edges(edge_spans.size());
+  {
+    std::vector<std::size_t> indices(edge_spans.size());
+    std::iota(indices.begin(), indices.end(), std::size_t{0});
+    parallel_for_each(indices, [&](std::size_t i) {
+      edges[i] = pb::decode<dag_edge>(edge_spans[i]);
+    });
+  }
+
+  // Decode remaining fields sequentially (node_names, reference_id,
+  // reference_seq)
+  auto meta = pb::decode<dag_data_meta>(data);
+
+  return build_phylo_dag_from_proto(std::move(edges), std::move(meta));
 }
 
 }  // namespace larch

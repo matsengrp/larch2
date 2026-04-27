@@ -104,7 +104,7 @@ endif()
 
 # --- Library ------------------------------------------------------------------
 
-add_library(larch src/protobuf.cpp src/protobuf_encode.cpp)
+add_library(larch src/protobuf.cpp src/protobuf_encode.cpp src/checkpoint.cpp)
 target_include_directories(larch PUBLIC include ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(larch PUBLIC ZLIB::ZLIB Threads::Threads)
 
@@ -141,9 +141,26 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   weight_accum_test optimize_test native_optimize_test
                   spr_pipeline_test trim_clade_edges_test
                   # rotaA_diagnostic_test
-                  inplace_spr_test)
+                  inplace_spr_test checkpoint_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
     add_test(NAME ${test_name} COMMAND ${test_name}
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()
+
+# Helper used by the integration test to compare two .pb.gz files under
+# canonical ordering (sorted edges / node_names / condensed_leaves).
+add_executable(dag_canonical_equal test/dag_canonical_equal.cpp)
+target_link_libraries(dag_canonical_equal PRIVATE larch)
+
+# Integration test: the larch2 CLI checkpoint flow end-to-end, including
+# Phase 1 / Phase 2 resume, args fingerprint mismatch, and forbidden-flag
+# enforcement. Driven by a shell script so we can SIGKILL mid-run and assert
+# canonical equality on the resulting protobuf files.
+if(TARGET larch2)
+    add_test(NAME checkpoint_integration_test
+             COMMAND ${CMAKE_SOURCE_DIR}/test/checkpoint_integration.sh
+             $<TARGET_FILE:larch2>
+             $<TARGET_FILE:dag_canonical_equal>
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()

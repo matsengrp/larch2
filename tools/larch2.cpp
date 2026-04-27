@@ -1,6 +1,7 @@
 #include <larch/load_proto_dag.hpp>
 #include <larch/load_parsimony.hpp>
 #include <larch/save_proto_dag.hpp>
+#include <larch/checkpoint.hpp>
 #include <larch/fasta.hpp>
 #include <larch/vcf.hpp>
 #include <larch/merge.hpp>
@@ -389,6 +390,16 @@ Diverse tree extraction:
   --diverse-pool <N>      Override pool size (default: max(10K, 100))
   --diverse-newick <path> Write selected trees as Newick strings (one per line)
 
+Checkpointing:
+  --checkpoint-after <N>  Write a checkpoint every N completed iterations
+                          (and immediately before each drift-escape entry in
+                          the native optimizer)
+  --checkpoint-prefix <P> Override checkpoint path prefix (default: derived
+                          from --output by stripping .pb.gz)
+  --resume <path>         Resume from a checkpoint file. Mutually exclusive
+                          with all input flags (--dag-pb, --tree-pb,
+                          --fasta, --newick, --refseq, --vcf).
+
 Post-processing:
   --trim                  Trim result to minimum-parsimony trees
 
@@ -443,7 +454,32 @@ struct args {
   fragment_strategy inplace_fragments = fragment_strategy::final_only;
   drift_mode_t drift_mode = drift_mode_t::auto_;
   std::optional<std::uint32_t> drift_seed;
+  std::optional<std::size_t> checkpoint_after;
+  std::string checkpoint_prefix;
+  std::string resume;
 };
+
+// Strip a trailing ".pb.gz" or ".pb" from a path so checkpoints can be
+// named "<prefix>.ckpt-<iter>.pb.gz".
+static std::string strip_pb_suffix(std::string_view path) {
+  std::string s{path};
+  for (std::string_view suf : {".pb.gz", ".pb"}) {
+    if (s.size() >= suf.size() &&
+        s.compare(s.size() - suf.size(), suf.size(), suf) == 0) {
+      s.resize(s.size() - suf.size());
+      break;
+    }
+  }
+  return s;
+}
+
+static std::string checkpoint_filename(std::string const& prefix,
+                                       std::size_t iter, bool pre_drift) {
+  std::string out = prefix + ".ckpt-" + std::to_string(iter);
+  if (pre_drift) out += "-pre-drift";
+  out += ".pb.gz";
+  return out;
+}
 
 static args parse_args(int argc, char** argv) {
   args a;
@@ -553,6 +589,17 @@ static args parse_args(int argc, char** argv) {
     } else if (arg == "--drift-seed") {
       a.drift_seed = static_cast<std::uint32_t>(
           std::stoull(std::string{next()}, nullptr, 0));
+    } else if (arg == "--checkpoint-after") {
+      auto n = std::stoull(std::string{next()});
+      if (n == 0) {
+        std::cerr << "error: --checkpoint-after must be >= 1\n";
+        std::exit(1);
+      }
+      a.checkpoint_after = n;
+    } else if (arg == "--checkpoint-prefix") {
+      a.checkpoint_prefix = next();
+    } else if (arg == "--resume") {
+      a.resume = next();
     } else if (arg == "--version") {
       std::cerr << "larch2 " << larch::version << " (" << larch::git_commit
                 << ")\n";
@@ -570,6 +617,28 @@ static args parse_args(int argc, char** argv) {
     std::cerr << "error: --output/-o is required\n";
     usage();
     std::exit(1);
+  }
+  if (!a.resume.empty()) {
+    // --resume is mutually exclusive with all input flags. The checkpoint is
+    // self-describing (the merged DAG already contains every input mutation,
+    // including VCF-driven leaf ambiguity), so re-passing them would
+    // double-apply.
+    struct {
+      std::string_view name;
+      std::string const& value;
+    } const inputs[] = {
+        {"--dag-pb", a.dag_pb}, {"--tree-pb", a.tree_pb},
+        {"--fasta", a.fasta},   {"--newick", a.newick},
+        {"--refseq", a.refseq}, {"--vcf", a.vcf},
+    };
+    for (auto& in : inputs) {
+      if (!in.value.empty()) {
+        std::cerr << "error: " << in.name
+                  << " is forbidden with --resume (checkpoint is "
+                     "self-describing)\n";
+        std::exit(1);
+      }
+    }
   }
   return a;
 }
@@ -1632,24 +1701,292 @@ static bool drift_escape(merge& m, args const& a, progress& prog) {
 }
 
 // ---------------------------------------------------------------------------
+// Checkpointing
+// ---------------------------------------------------------------------------
+
+// JSON-encoded payload of the args fields whose values affect the
+// optimization trajectory. The payload is hashed (SHA-256) into the stored
+// args_fingerprint and also stored verbatim alongside the digest so a
+// mismatch on resume can name the differing fields.
+static std::string args_fingerprint_payload(args const& a) {
+  auto opt_u = [](std::optional<std::uint32_t> const& v) {
+    return v ? std::to_string(*v) : std::string{"null"};
+  };
+  auto opt_z = [](std::optional<std::size_t> const& v) {
+    return v ? std::to_string(*v) : std::string{"null"};
+  };
+  auto opt_i = [](std::optional<int> const& v) {
+    return v ? std::to_string(*v) : std::string{"null"};
+  };
+  auto j_bool = [](bool b) { return b ? "true" : "false"; };
+  auto j_str = [](std::string_view s) { return "\"" + std::string{s} + "\""; };
+  auto frag_to_str = [](fragment_strategy fs) {
+    return fs == fragment_strategy::every_step ? "every" : "final";
+  };
+  auto drift_to_str = [](drift_mode_t m) {
+    switch (m) {
+      case drift_mode_t::auto_:       return "auto";
+      case drift_mode_t::legacy:      return "legacy";
+      case drift_mode_t::inplace:     return "inplace";
+      case drift_mode_t::combine:     return "combine";
+      case drift_mode_t::combine_lwf: return "combine-lwf";
+    }
+    return "auto";
+  };
+
+  std::ostringstream os;
+  os << "{";
+  os << "\"iterations\":" << a.iterations;
+  os << ",\"optimizer\":" << j_str(a.optimizer);
+  os << ",\"max_moves\":" << a.max_moves;
+  os << ",\"seed\":" << opt_u(a.seed);
+  os << ",\"sample_method\":" << j_str(a.sample_method);
+  os << ",\"sample_uniformly\":" << j_bool(a.sample_uniformly);
+  os << ",\"sample_per_radius\":" << j_bool(a.sample_per_radius);
+  os << ",\"ignore_root_edge_mutations\":"
+     << j_bool(a.ignore_root_edge_mutations);
+  os << ",\"callback_option\":" << j_str(a.callback_option);
+  os << ",\"switch_subtrees\":" << opt_z(a.switch_subtrees);
+  os << ",\"min_subtree_clade_size\":" << a.min_subtree_clade_size;
+  os << ",\"max_subtree_clade_size\":" << a.max_subtree_clade_size;
+  os << ",\"move_coeff_pscore\":" << a.move_coeff_pscore;
+  os << ",\"move_coeff_nodes\":" << a.move_coeff_nodes;
+  os << ",\"move_score_threshold\":" << opt_i(a.move_score_threshold);
+  os << ",\"patience\":" << opt_z(a.patience);
+  os << ",\"drift\":" << opt_z(a.drift);
+  os << ",\"inplace_steps\":" << a.inplace_steps;
+  os << ",\"inplace_threshold\":" << a.inplace_threshold;
+  os << ",\"inplace_budget\":" << opt_i(a.inplace_budget);
+  os << ",\"inplace_temperature\":" << a.inplace_temperature;
+  os << ",\"inplace_cooling\":" << a.inplace_cooling;
+  os << ",\"inplace_fragments\":" << j_str(frag_to_str(a.inplace_fragments));
+  os << ",\"drift_mode\":" << j_str(drift_to_str(a.drift_mode));
+  os << ",\"drift_seed\":" << opt_u(a.drift_seed);
+  os << "}";
+  return os.str();
+}
+
+// Parse a JSON args_payload back into a flat key->value map for diffing.
+// The payload is generated by us with a known shape, so a minimal hand-rolled
+// parser is enough — values are bare numbers, true/false, null, or quoted
+// strings. No nested objects/arrays.
+static std::map<std::string, std::string> parse_args_payload(
+    std::string_view payload) {
+  std::map<std::string, std::string> out;
+  std::size_t i = 0;
+  auto skip_ws = [&] {
+    while (i < payload.size() &&
+           (payload[i] == ' ' || payload[i] == '\t' || payload[i] == '\n'))
+      ++i;
+  };
+  if (i < payload.size() && payload[i] == '{') ++i;
+  while (i < payload.size()) {
+    skip_ws();
+    if (i >= payload.size() || payload[i] == '}') break;
+    if (payload[i] != '"') break;
+    ++i;
+    std::size_t key_start = i;
+    while (i < payload.size() && payload[i] != '"') ++i;
+    std::string key{payload.substr(key_start, i - key_start)};
+    if (i < payload.size()) ++i;  // closing quote
+    skip_ws();
+    if (i < payload.size() && payload[i] == ':') ++i;
+    skip_ws();
+    std::string value;
+    if (i < payload.size() && payload[i] == '"') {
+      ++i;
+      std::size_t v_start = i;
+      while (i < payload.size() && payload[i] != '"') ++i;
+      value.assign(payload.substr(v_start, i - v_start));
+      if (i < payload.size()) ++i;
+    } else {
+      std::size_t v_start = i;
+      while (i < payload.size() && payload[i] != ',' && payload[i] != '}')
+        ++i;
+      value.assign(payload.substr(v_start, i - v_start));
+      while (!value.empty() &&
+             (value.back() == ' ' || value.back() == '\t' || value.back() == '\n'))
+        value.pop_back();
+    }
+    out[std::move(key)] = std::move(value);
+    skip_ws();
+    if (i < payload.size() && payload[i] == ',') ++i;
+  }
+  return out;
+}
+
+// Resume-state carried across iterations of run_native / run_random.
+struct resume_state {
+  std::size_t next_iteration = 0;
+  std::mt19937 rng;
+  patience_checker patience;
+  std::vector<optimize_result> results;
+};
+
+static resume_state resume_state_from_msg(larch::larch_checkpoint_msg const& c) {
+  resume_state s;
+  s.next_iteration = static_cast<std::size_t>(c.next_iteration);
+  s.rng = larch::deserialize_mt19937(c.main_rng.mt19937_state);
+  if (c.patience.limit) s.patience.limit = static_cast<std::size_t>(*c.patience.limit);
+  s.patience.count = static_cast<std::size_t>(c.patience.count);
+  if (c.patience.best_score)
+    s.patience.best_score = static_cast<std::size_t>(*c.patience.best_score);
+  s.results.reserve(c.results.size());
+  for (auto const& r : c.results) {
+    optimize_result o;
+    o.iteration = static_cast<std::size_t>(r.iteration);
+    o.dag_node_count = static_cast<std::size_t>(r.dag_node_count);
+    o.dag_edge_count = static_cast<std::size_t>(r.dag_edge_count);
+    o.trees_merged = static_cast<std::size_t>(r.trees_merged);
+    o.parsimony_score = static_cast<std::size_t>(r.parsimony_score);
+    o.radii.reserve(r.radii.size());
+    for (auto const& rd : r.radii) {
+      o.radii.push_back(radius_result{
+          .radius = static_cast<std::size_t>(rd.radius),
+          .moves_found = static_cast<std::size_t>(rd.moves_found),
+          .moves_applied = static_cast<std::size_t>(rd.moves_applied),
+          .parsimony_score = static_cast<std::size_t>(rd.parsimony_score),
+      });
+    }
+    s.results.push_back(std::move(o));
+  }
+  return s;
+}
+
+static larch::larch_checkpoint_msg build_checkpoint_msg(
+    merge& m, args const& a, std::size_t completed_iter,
+    std::mt19937 const& rng, patience_checker const& patience,
+    std::vector<optimize_result> const& results) {
+  larch::larch_checkpoint_msg c{};
+  c.schema_version = larch::checkpoint_schema_version;
+  c.larch2_git_sha = larch::git_commit;
+  c.next_iteration = static_cast<int64_t>(completed_iter);
+  c.optimizer = a.optimizer;
+  if (a.patience) c.patience.limit = static_cast<int64_t>(*a.patience);
+  c.patience.count = static_cast<int64_t>(patience.count);
+  if (patience.best_score)
+    c.patience.best_score = static_cast<int64_t>(*patience.best_score);
+  c.main_rng.mt19937_state = larch::serialize_mt19937(rng);
+  // drift_rng is reseeded inside drift_escape from a.drift_seed and is not
+  // captured (no in-progress drift state at our checkpoint sites).
+  c.results.reserve(results.size());
+  for (auto const& r : results) {
+    larch::optimize_result_msg_pb m_r{};
+    m_r.iteration = static_cast<int64_t>(r.iteration);
+    m_r.dag_node_count = static_cast<int64_t>(r.dag_node_count);
+    m_r.dag_edge_count = static_cast<int64_t>(r.dag_edge_count);
+    m_r.trees_merged = static_cast<int64_t>(r.trees_merged);
+    m_r.parsimony_score = static_cast<int64_t>(r.parsimony_score);
+    m_r.radii.reserve(r.radii.size());
+    for (auto const& rd : r.radii) {
+      larch::radius_result_msg_pb m_rd{};
+      m_rd.radius = static_cast<int64_t>(rd.radius);
+      m_rd.moves_found = static_cast<int64_t>(rd.moves_found);
+      m_rd.moves_applied = static_cast<int64_t>(rd.moves_applied);
+      m_rd.parsimony_score = static_cast<int64_t>(rd.parsimony_score);
+      m_r.radii.push_back(std::move(m_rd));
+    }
+    c.results.push_back(std::move(m_r));
+  }
+
+  // Serialize the merged DAG into the checkpoint's nested dag_data field.
+  // We mirror save_proto_dag's logic, but build a dag_data struct directly
+  // instead of writing it to a file.
+  auto& dag = m.get_result();
+  larch::dag_data& data = c.dag;
+  data.reference_seq = get_reference_sequence(dag);
+
+  std::unordered_map<std::size_t, int64_t> node_to_proto;
+  auto root_idx = get_root_idx(dag);
+  node_to_proto[root_idx] = 0;
+  int64_t next_id = 1;
+  for (auto nv : dag.get_all_nodes()) {
+    auto idx = std::visit([](auto n) { return n.index(); }, nv);
+    if (idx == root_idx) continue;
+    node_to_proto[idx] = next_id++;
+  }
+
+  int64_t edge_id = 0;
+  for (auto ev : dag.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          auto parent_idx =
+              std::visit([](auto n) { return n.index(); }, edge.get_parent());
+          auto child_idx =
+              std::visit([](auto n) { return n.index(); }, edge.get_child());
+          larch::dag_edge de;
+          de.edge_id = edge_id++;
+          de.parent_node = node_to_proto[parent_idx];
+          de.child_node = node_to_proto[child_idx];
+          de.parent_clade = static_cast<int64_t>(edge.clade_index());
+          for (auto& [pos, nucs] : edge.mutations()) {
+            larch::dag_mut dm;
+            dm.position = static_cast<int32_t>(pos);
+            dm.par_nuc = static_cast<int32_t>(nucs.first.raw());
+            dm.mut_nuc = {static_cast<int32_t>(nucs.second.raw())};
+            de.edge_mutations.push_back(std::move(dm));
+          }
+          data.edges.push_back(std::move(de));
+        },
+        ev);
+  }
+  for (auto nv : dag.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          larch::dag_node_name nn;
+          nn.node_id = node_to_proto[node.index()];
+          if constexpr (requires { node.sample_id(); })
+            nn.condensed_leaves = {node.sample_id()};
+          data.node_names.push_back(std::move(nn));
+        },
+        nv);
+  }
+
+  c.args_payload = args_fingerprint_payload(a);
+  c.args_fingerprint = larch::sha256_hex(c.args_payload);
+  return c;
+}
+
+// Phase 2 checkpoint write: the merged DAG plus optimization state.
+static void write_full_checkpoint(merge& m, args const& a,
+                                  std::size_t completed_iter, bool pre_drift,
+                                  std::mt19937 const& rng,
+                                  patience_checker const& patience,
+                                  std::vector<optimize_result> const& results) {
+  if (a.checkpoint_prefix.empty()) return;
+  std::string path =
+      checkpoint_filename(a.checkpoint_prefix, completed_iter, pre_drift);
+  auto msg = build_checkpoint_msg(m, a, completed_iter, rng, patience, results);
+  larch::write_checkpoint(msg, path);
+  std::cerr << "  Wrote checkpoint " << path << "\n";
+}
+
+// ---------------------------------------------------------------------------
 // Native optimizer loop with progress
 // ---------------------------------------------------------------------------
 
-static std::vector<optimize_result> run_native(merge& m, args const& a) {
+static std::vector<optimize_result> run_native(
+    merge& m, args const& a,
+    std::optional<resume_state> resume = std::nullopt) {
   auto& pool = thread_pool::get_default();
-  std::mt19937 rng(a.seed.value_or(std::random_device{}()));
+  std::mt19937 rng = resume ? std::move(resume->rng)
+                            : std::mt19937{a.seed.value_or(
+                                  std::random_device{}())};
   std::vector<optimize_result> results;
   results.reserve(a.iterations);
+  std::size_t start_iter = 0;
+  patience_checker patience{a.patience};
+  if (resume) {
+    results = std::move(resume->results);
+    start_iter = resume->next_iteration;
+    patience = std::move(resume->patience);
+  }
   progress prog;
   move_coefficients coeffs{a.move_coeff_pscore, a.move_coeff_nodes};
   int score_threshold =
       a.move_score_threshold.value_or(coeffs.has_node_penalty() ? 0 : -1);
-  // Shared across subtree and whole-tree paths: only one path executes per
-  // iteration (the subtree path ends with `continue`), so the counter
-  // reflects whichever path ran.
-  patience_checker patience{a.patience};
 
-  for (std::size_t iter = 0; iter < a.iterations; ++iter) {
+  for (std::size_t iter = start_iter; iter < a.iterations; ++iter) {
     std::cerr << "Iteration " << (iter + 1) << "/" << a.iterations << ":\n";
 
     // 1. Build merged DAG
@@ -1820,9 +2157,21 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             .parsimony_score = min_score,
             .radii = std::move(radii_results),
         });
+        std::size_t completed = iter + 1;
+        if (a.checkpoint_after && completed % *a.checkpoint_after == 0) {
+          write_full_checkpoint(m, a, completed, false, rng, patience, results);
+        }
         if (patience(min_score)) {
-          if (a.drift && drift_escape(m, a, prog)) {
-            patience.reset();
+          if (a.drift) {
+            if (a.checkpoint_after) {
+              write_full_checkpoint(m, a, completed, true, rng, patience,
+                                    results);
+            }
+            if (drift_escape(m, a, prog)) {
+              patience.reset();
+            } else {
+              return results;
+            }
           } else {
             return results;
           }
@@ -1990,9 +2339,20 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         .parsimony_score = min_score,
         .radii = std::move(radii_results),
     });
+    std::size_t completed = iter + 1;
+    if (a.checkpoint_after && completed % *a.checkpoint_after == 0) {
+      write_full_checkpoint(m, a, completed, false, rng, patience, results);
+    }
     if (patience(min_score)) {
-      if (a.drift && drift_escape(m, a, prog)) {
-        patience.reset();
+      if (a.drift) {
+        if (a.checkpoint_after) {
+          write_full_checkpoint(m, a, completed, true, rng, patience, results);
+        }
+        if (drift_escape(m, a, prog)) {
+          patience.reset();
+        } else {
+          return results;
+        }
       } else {
         return results;
       }
@@ -2006,15 +2366,25 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 // Random optimizer loop with progress
 // ---------------------------------------------------------------------------
 
-static std::vector<optimize_result> run_random(merge& m, args const& a) {
-  std::mt19937 rng(a.seed.value_or(std::random_device{}()));
+static std::vector<optimize_result> run_random(
+    merge& m, args const& a,
+    std::optional<resume_state> resume = std::nullopt) {
+  std::mt19937 rng = resume ? std::move(resume->rng)
+                            : std::mt19937{a.seed.value_or(
+                                  std::random_device{}())};
   random_spr_strategy strategy{};
   std::vector<optimize_result> results;
   results.reserve(a.iterations);
-  progress prog;
+  std::size_t start_iter = 0;
   patience_checker patience{a.patience};
+  if (resume) {
+    results = std::move(resume->results);
+    start_iter = resume->next_iteration;
+    patience = std::move(resume->patience);
+  }
+  progress prog;
 
-  for (std::size_t iter = 0; iter < a.iterations; ++iter) {
+  for (std::size_t iter = start_iter; iter < a.iterations; ++iter) {
     std::cerr << "Iteration " << (iter + 1) << "/" << a.iterations << ":\n";
 
     prog.phase("Building merged DAG");
@@ -2068,6 +2438,10 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
         .trees_merged = new_trees.size(),
         .parsimony_score = min_score,
     });
+    std::size_t completed = iter + 1;
+    if (a.checkpoint_after && completed % *a.checkpoint_after == 0) {
+      write_full_checkpoint(m, a, completed, false, rng, patience, results);
+    }
     if (patience(min_score)) return results;
   }
 
@@ -2081,9 +2455,74 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
 int main(int argc, char** argv) {
   auto a = parse_args(argc, argv);
 
+  // Derive checkpoint prefix from --output if not explicitly provided.
+  if (a.checkpoint_after && a.checkpoint_prefix.empty()) {
+    a.checkpoint_prefix = strip_pb_suffix(a.output);
+  }
+
   // ---- Load input ----
   phylo_dag dag;
-  if (!a.dag_pb.empty()) {
+  std::optional<resume_state> resume;
+  if (!a.resume.empty()) {
+    auto bytes = larch::read_checkpoint_bytes(a.resume);
+    std::span<const uint8_t> span{
+        reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()};
+    if (larch::looks_like_checkpoint(span)) {
+      auto ckpt = larch::load_checkpoint_from_bytes(span);
+      if (ckpt.schema_version > larch::checkpoint_schema_version) {
+        std::cerr << "error: checkpoint schema_version " << ckpt.schema_version
+                  << " is newer than this binary supports (max="
+                  << larch::checkpoint_schema_version << ")\n";
+        return 1;
+      }
+      // Args fingerprint check: refuse to resume if any fingerprinted arg
+      // changed. On mismatch, diff the JSON payloads to name the conflicting
+      // fields.
+      std::string runtime_payload = args_fingerprint_payload(a);
+      std::string runtime_digest = larch::sha256_hex(runtime_payload);
+      if (runtime_digest != ckpt.args_fingerprint) {
+        std::cerr << "error: --resume args mismatch (fingerprint differs)\n";
+        auto ckpt_args = parse_args_payload(ckpt.args_payload);
+        auto run_args = parse_args_payload(runtime_payload);
+        for (auto const& [k, v] : run_args) {
+          auto it = ckpt_args.find(k);
+          if (it == ckpt_args.end() || it->second != v) {
+            std::cerr << "  conflicting field: " << k
+                      << " (checkpoint=" << (it == ckpt_args.end() ? "<missing>" : it->second)
+                      << ", runtime=" << v << ")\n";
+          }
+        }
+        return 1;
+      }
+      if (a.optimizer != ckpt.optimizer) {
+        std::cerr << "error: --resume cannot switch optimizer (checkpoint='"
+                  << ckpt.optimizer << "', runtime='" << a.optimizer << "')\n";
+        return 1;
+      }
+      std::cerr << "Resuming from checkpoint " << a.resume
+                << " at iteration " << ckpt.next_iteration << "\n";
+      if (!ckpt.larch2_git_sha.empty() &&
+          ckpt.larch2_git_sha != larch::git_commit) {
+        std::cerr << "  warning: checkpoint built from larch2 commit "
+                  << ckpt.larch2_git_sha << ", current binary is "
+                  << larch::git_commit << "\n";
+      }
+      // Build phylo_dag from the checkpoint's nested dag_data.
+      larch::dag_data_meta meta{
+          .node_names = std::move(ckpt.dag.node_names),
+          .reference_id = std::move(ckpt.dag.reference_id),
+          .reference_seq = std::move(ckpt.dag.reference_seq),
+      };
+      dag = larch::build_phylo_dag_from_proto(std::move(ckpt.dag.edges),
+                                              std::move(meta));
+      resume = resume_state_from_msg(ckpt);
+    } else {
+      // Phase 1 / legacy raw-DAG checkpoint: equivalent to --dag-pb.
+      std::cerr << "Resuming from DAG-only checkpoint " << a.resume
+                << " (no iteration/RNG state recovered)\n";
+      dag = load_proto_dag(a.resume);
+    }
+  } else if (!a.dag_pb.empty()) {
     std::cerr << "Loading DAG from " << a.dag_pb << "...\n";
     dag = load_proto_dag(a.dag_pb);
   } else if (!a.tree_pb.empty()) {
@@ -2116,7 +2555,9 @@ int main(int argc, char** argv) {
     std::cerr << "Building DAG from FASTA + Newick...\n";
     dag = build_from_fasta_newick(a.fasta, a.newick, a.refseq);
   } else {
-    std::cerr << "error: one of --dag-pb, --tree-pb, or --fasta is required\n";
+    std::cerr
+        << "error: one of --dag-pb, --tree-pb, --fasta, or --resume is "
+           "required\n";
     usage();
     return 1;
   }
@@ -2144,9 +2585,9 @@ int main(int argc, char** argv) {
   std::vector<optimize_result> results;
 
   if (a.optimizer == "native") {
-    results = run_native(m, a);
+    results = run_native(m, a, std::move(resume));
   } else if (a.optimizer == "random") {
-    results = run_random(m, a);
+    results = run_random(m, a, std::move(resume));
   } else {
     std::cerr << "error: unknown optimizer '" << a.optimizer
               << "' (expected 'native' or 'random')\n";
