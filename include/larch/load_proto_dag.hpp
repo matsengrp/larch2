@@ -234,7 +234,7 @@ inline phylo_dag load_proto_dag(std::string_view path) {
 
   recompute_compact_genomes(d);
 
-  for (auto [proto_id, ambiguity_sets] : node_ambiguity_sets) {
+  for (auto& [proto_id, ambiguity_sets] : node_ambiguity_sets) {
     auto it = proto_to_dag.find(proto_id);
     if (it == proto_to_dag.end()) continue;
     auto dag_idx = it->second;

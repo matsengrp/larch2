@@ -317,7 +317,7 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
         nv);
   }
 
-  warn_if_ambiguities(ambiguity, "input alignment");
+  warn_if_ambiguities(ambiguity, "input alignment", std::cerr);
   fitch_assign_compact_genomes(d);
   recompute_edge_mutations(d);
   return d;
@@ -2123,6 +2123,7 @@ int main(int argc, char** argv) {
     std::cerr << "Applying VCF from " << a.vcf << "...\n";
     auto const& ref = get_reference_sequence(dag);
     auto vcf = read_vcf(a.vcf, ref);
+    warn_if_ambiguities(vcf.ambiguity, "VCF genotypes", std::cerr);
     apply_vcf_to_dag(dag, vcf);
     if (a.validate) validate_dag(dag, "after VCF", thread_pool::get_default());
   }

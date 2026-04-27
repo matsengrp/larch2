@@ -9,8 +9,8 @@
 #include <cctype>
 #include <cstddef>
 #include <functional>
-#include <iostream>
 #include <map>
+#include <ostream>
 #include <set>
 #include <string>
 #include <string_view>
@@ -151,17 +151,17 @@ struct ambiguity_counts {
 };
 
 inline void warn_if_ambiguities(ambiguity_counts const& counts,
-                                std::string_view label) {
+                                std::string_view label, std::ostream& out) {
   if (counts.total == 0) return;
 
-  std::cerr << "warning: " << label << " contains ";
+  out << "warning: " << label << " contains ";
   bool first = true;
   auto emit = [&](char c) {
     auto n = counts.by_char[static_cast<unsigned char>(c)];
     if (n == 0) return;
-    if (!first) std::cerr << ", ";
+    if (!first) out << ", ";
     first = false;
-    std::cerr << c << "=" << n;
+    out << c << "=" << n;
   };
   for (char c : std::string_view{"NRYWSKMBDHV-?"}) emit(c);
 
@@ -169,11 +169,11 @@ inline void warn_if_ambiguities(ambiguity_counts const& counts,
                    ? (100.0 * static_cast<double>(counts.total) /
                       static_cast<double>(counts.observed_sites))
                    : 0.0;
-  std::cerr << " IUPAC ambiguity/no-call codes (" << pct
-            << "% of observed sites). Partial IUPAC codes will be treated as "
-               "compatible state sets during Fitch parsimony; N, gap, and ? "
-               "are treated as no-calls. No edge mutations are emitted at "
-               "ambiguous sites.\n";
+  out << " IUPAC ambiguity/no-call codes (" << pct
+      << "% of observed sites). Partial IUPAC codes will be treated as "
+         "compatible state sets during Fitch parsimony; N, gap, and ? "
+         "are treated as no-calls. No edge mutations are emitted at "
+         "ambiguous sites.\n";
 }
 
 class compact_genome {
@@ -214,14 +214,6 @@ class compact_genome {
   explicit compact_genome(std::map<mutation_position, nuc_base> mutations)
       : mutations_{std::move(mutations)},
         hash_{compute_hash(mutations_, ambiguity_sets_)} {}
-
-  compact_genome(std::map<mutation_position, nuc_base> mutations,
-                 std::set<mutation_position> ambiguity_mask)
-      : mutations_{std::move(mutations)} {
-    for (auto pos : ambiguity_mask) ambiguity_sets_[pos] = 0b1111;
-    for (auto [pos, _] : ambiguity_sets_) mutations_.erase(pos);
-    recompute_hash();
-  }
 
   compact_genome(std::map<mutation_position, nuc_base> mutations,
                  ambiguity_set_map ambiguity_sets)

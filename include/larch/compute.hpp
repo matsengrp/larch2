@@ -13,6 +13,7 @@
 #include <map>
 #include <memory_resource>
 #include <queue>
+#include <ranges>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -91,12 +92,7 @@ inline void recompute_compact_genomes(phylo_dag& d) {
 
                   if constexpr (requires { node.cg(); }) {
                     ambiguity_set_map existing_ambiguity_sets;
-                    bool leaf_node = true;
-                    for (auto ce : node.get_children()) {
-                      (void)ce;
-                      leaf_node = false;
-                      break;
-                    }
+                    bool leaf_node = std::ranges::empty(node.get_children());
                     if (leaf_node)
                       existing_ambiguity_sets = node.cg().ambiguity_sets();
                     node.cg() = compact_genome{};

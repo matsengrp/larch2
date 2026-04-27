@@ -104,7 +104,7 @@ static void test_to_edge_mutations_skips_no_call() {
   std::println("test_to_edge_mutations_skips_no_call");
 
   compact_genome parent;
-  compact_genome child{{}, {1}};
+  compact_genome child{{}, ambiguity_set_map{{1, 0b1111}}};
   auto muts = compact_genome::to_edge_mutations("C", parent, child);
 
   assert(muts.empty());
@@ -321,7 +321,12 @@ static void test_parsimony_proto_loads_exact_iupac_site() {
   data.newick = "(s1);";
   data.node_mutations.resize(2);
   data.node_mutations[1].ambiguous_sites = {1};
-  data.node_mutations[1].iupac_sites = {{1, iupac_state_set('Y')}};
+  data.node_mutations[1].iupac_sites = {
+      pars_iupac_site{
+          .position = 1,
+          .state_set = iupac_state_set('Y'),
+      },
+  };
 
   auto path = std::filesystem::temp_directory_path() /
               "larch2_iupac_parsimony_exact.pb";
@@ -388,7 +393,7 @@ static void test_acgt_hash_unchanged() {
               0x9e3779b9 + (expected << 6) + (expected >> 2);
 
   assert(cg.hash() == expected);
-  assert((cg == compact_genome{muts, {}}));
+  assert((cg == compact_genome{muts, ambiguity_set_map{}}));
   std::println("  PASS");
 }
 
@@ -396,7 +401,8 @@ static void test_ambiguity_mask_affects_leaf_dedup() {
   std::println("test_ambiguity_mask_affects_leaf_dedup");
 
   compact_genome concrete = cg_from_sequence("C", "A");
-  compact_genome masked{{{1, nuc_base::from_char('C')}}, {1}};
+  compact_genome masked{{{1, nuc_base::from_char('C')}},
+                        ambiguity_set_map{{1, 0b1111}}};
   assert(!(concrete == masked));
 
   auto d = make_three_leaf_star("A", "C", "C", "A");

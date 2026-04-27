@@ -6,7 +6,6 @@
 #include <larch/nuc.hpp>
 
 #include <charconv>
-#include <iostream>
 #include <map>
 #include <set>
 #include <string>
@@ -18,6 +17,7 @@ namespace larch {
 struct vcf_data {
   std::vector<std::string> sample_names;
   std::map<std::string, compact_genome> sample_genomes;
+  ambiguity_counts ambiguity;
 };
 
 inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
@@ -29,7 +29,7 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
   // at end.
   std::map<std::string, std::map<mutation_position, nuc_base>> sample_muts;
   std::map<std::string, ambiguity_set_map> sample_ambiguity;
-  ambiguity_counts ambiguity;
+  auto& ambiguity = result.ambiguity;
 
   std::size_t pos = 0;
   while (pos < content.size()) {
@@ -125,8 +125,6 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
       }
     }
   }
-
-  warn_if_ambiguities(ambiguity, "VCF genotypes");
 
   // Convert accumulated mutations/IUPAC state sets to compact_genomes.
   for (auto& [name, muts] : sample_muts) {
