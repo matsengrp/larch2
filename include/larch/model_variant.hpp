@@ -50,6 +50,17 @@ struct likelihood_score_ops<ml_model> {
   ml_model const& model;
   std::string const& reference;
   bool ignore_ua_edge = true;
+  mutable likelihood_score_cache cache;
+
+  void clear_cache() const { cache.clear(); }
+
+  std::size_t cached_sequence_count() const {
+    return cache.cached_sequence_count();
+  }
+
+  std::size_t cached_edge_score_count() const {
+    return cache.cached_edge_score_count();
+  }
 
   weight_type compute_leaf(phylo_dag& /*dag*/, std::size_t /*node_idx*/) const {
     return 0.0;
@@ -59,19 +70,25 @@ struct likelihood_score_ops<ml_model> {
     auto parent_idx = get_parent_idx(dag, edge_idx);
     if (ignore_ua_edge && is_ua(dag, parent_idx)) return 0.0;
 
+    auto& cached = cache.edge_score_slot(dag, edge_idx);
+    if (cached) return *cached;
+
     auto ev = dag.get_edge(edge_idx);
-    return std::visit(
+    double score = std::visit(
         [&](auto edge) -> double {
           if (edge.mutations().empty()) return 0.0;
 
           auto child_idx = std::visit([](auto child) { return child.index(); },
                                       edge.get_child());
-          auto parent_seq = reconstruct_sequence(dag, parent_idx, reference);
-          auto child_seq = reconstruct_sequence(dag, child_idx, reference);
+          auto const& parent_seq =
+              cache.sequence_for(dag, parent_idx, reference);
+          auto const& child_seq = cache.sequence_for(dag, child_idx, reference);
 
           return -ml_log_likelihood(model, parent_seq, child_seq);
         },
         ev);
+    cached = score;
+    return score;
   }
 
   std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
@@ -105,20 +122,13 @@ inline void ml_adjust_rate_bias(ml_model& model, double log_factor) {
 // Compute total negative log-likelihood for all non-UA mutated edges in a DAG.
 inline double compute_dag_ml_nll(ml_model const& model, phylo_dag& dag) {
   auto const& ref = get_reference_sequence(dag);
+  ml_model_likelihood_score_ops ops{.model = model,
+                                    .reference = ref,
+                                    .ignore_ua_edge = true};
   double total_nll = 0.0;
   for (auto ev : dag.get_all_edges()) {
     std::visit(
-        [&](auto edge) {
-          if (edge.mutations().empty()) return;
-          auto parent_idx =
-              std::visit([](auto p) { return p.index(); }, edge.get_parent());
-          if (is_ua(dag, parent_idx)) return;
-          auto child_idx =
-              std::visit([](auto c) { return c.index(); }, edge.get_child());
-          auto parent_seq = reconstruct_sequence(dag, parent_idx, ref);
-          auto child_seq = reconstruct_sequence(dag, child_idx, ref);
-          total_nll += -ml_log_likelihood(model, parent_seq, child_seq);
-        },
+        [&](auto edge) { total_nll += ops.compute_edge(dag, edge.index()); },
         ev);
   }
   return total_nll;

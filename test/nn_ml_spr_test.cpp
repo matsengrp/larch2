@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <map>
 #include <print>
 #include <string>
@@ -335,6 +336,48 @@ static void assert_valid_sampled_tree(phylo_dag& sampled,
   assert_tree_parent_invariants(sampled);
 }
 
+static std::string selected_alternative_sequence(phylo_dag& sampled,
+                                                 std::string_view ref,
+                                                 std::string_view alt1,
+                                                 std::string_view alt2) {
+  std::string chosen_alt_seq;
+  std::size_t chosen_alt_count = 0;
+  for (auto nv : sampled.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr ((requires { node.cg(); }) &&
+                        !(requires { node.sample_id(); })) {
+            auto seq = reconstruct_sequence(sampled, node.index(), ref);
+            if (seq == alt1 || seq == alt2) {
+              chosen_alt_seq = std::move(seq);
+              ++chosen_alt_count;
+            }
+          }
+        },
+        nv);
+  }
+  assert(chosen_alt_count == 1);
+  return chosen_alt_seq;
+}
+
+static std::size_t first_mutated_non_ua_edge(phylo_dag& tree) {
+  std::size_t edge_idx = 0;
+  bool found = false;
+  for (auto ev : tree.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          if (!found && !edge.mutations().empty() &&
+              !is_ua(tree, get_parent_idx(tree, edge.index()))) {
+            edge_idx = edge.index();
+            found = true;
+          }
+        },
+        ev);
+  }
+  assert(found);
+  return edge_idx;
+}
+
 void test_min_weight_sample_tree() {
   auto model = rs_fivemer_model::load("data/bcr", "s5f");
   auto tree = make_test_tree();
@@ -422,6 +465,98 @@ void test_ml_model_likelihood_score_ops_ua_edge_behavior() {
                ignored_total, scored_total);
 }
 
+void test_ml_model_likelihood_score_ops_cache_reuse() {
+  auto const& model = thrifty_model();
+  auto tree = make_test_tree();
+  auto const& ref = get_reference_sequence(tree);
+  ml_model_likelihood_score_ops ops{.model = model, .reference = ref};
+
+  auto mutated_edge_idx = first_mutated_non_ua_edge(tree);
+
+  assert(ops.cached_edge_score_count() == 0);
+  assert(ops.cached_sequence_count() == 0);
+  double first = ops.compute_edge(tree, mutated_edge_idx);
+  assert(std::isfinite(first));
+  assert(first > 0.0);
+  assert(ops.cached_edge_score_count() == 1);
+  assert(ops.cached_sequence_count() == 2);
+
+  double second = ops.compute_edge(tree, mutated_edge_idx);
+  assert(second == first);
+  assert(ops.cached_edge_score_count() == 1);
+  assert(ops.cached_sequence_count() == 2);
+
+  ops.clear_cache();
+  assert(ops.cached_edge_score_count() == 0);
+  assert(ops.cached_sequence_count() == 0);
+  double after_clear = ops.compute_edge(tree, mutated_edge_idx);
+  assert(std::abs(after_clear - first) < 1e-12);
+
+  std::println("  ml_model_likelihood_score_ops cache reuse: OK "
+               "(edge score={:.6f})",
+               first);
+}
+
+void test_ml_model_likelihood_score_ops_cache_switches_dags() {
+  auto const& model = thrifty_model();
+  auto tree_a = make_test_tree();
+  auto tree_b = make_test_tree();
+  auto const& ref = get_reference_sequence(tree_a);
+  ml_model_likelihood_score_ops ops{.model = model, .reference = ref};
+
+  auto edge_a = first_mutated_non_ua_edge(tree_a);
+  auto score_a = ops.compute_edge(tree_a, edge_a);
+  assert(std::isfinite(score_a));
+  assert(ops.cached_edge_score_count() == 1);
+  assert(ops.cached_sequence_count() == 2);
+
+  auto edge_b = first_mutated_non_ua_edge(tree_b);
+  auto score_b = ops.compute_edge(tree_b, edge_b);
+  assert(std::isfinite(score_b));
+  assert(ops.cached_edge_score_count() == 1);
+  assert(ops.cached_sequence_count() == 2);
+
+  auto score_a_again = ops.compute_edge(tree_a, edge_a);
+  assert(std::abs(score_a_again - score_a) < 1e-12);
+  assert(ops.cached_edge_score_count() == 1);
+  assert(ops.cached_sequence_count() == 2);
+
+  std::println("  ml_model_likelihood_score_ops cache switches DAGs: OK "
+               "(A={:.6f}, B={:.6f})",
+               score_a, score_b);
+}
+
+void test_ml_model_likelihood_score_ops_deterministic_repeated_sampling() {
+  auto const& model = thrifty_model();
+  auto fixture = make_alternative_dag();
+  auto& dag = fixture.dag;
+  auto const& ref = get_reference_sequence(dag);
+  ml_model_likelihood_score_ops ops{.model = model, .reference = ref};
+
+  auto sample_once = [&](std::uint32_t seed) {
+    subtree_weight<ml_model_likelihood_score_ops> sw{dag, seed};
+    double score = sw.compute_weight_below(get_root_idx(dag), ops);
+    auto sampled = sw.min_weight_uniform_sample_tree(ops);
+    auto chosen = selected_alternative_sequence(sampled, ref, fixture.alt1_seq,
+                                                fixture.alt2_seq);
+    return std::pair{score, chosen};
+  };
+
+  auto [score1, chosen1] = sample_once(123u);
+  auto cached_edges_after_first = ops.cached_edge_score_count();
+  auto cached_sequences_after_first = ops.cached_sequence_count();
+  auto [score2, chosen2] = sample_once(123u);
+
+  assert(std::abs(score1 - score2) < 1e-12);
+  assert(chosen1 == chosen2);
+  assert(ops.cached_edge_score_count() == cached_edges_after_first);
+  assert(ops.cached_sequence_count() == cached_sequences_after_first);
+
+  std::println("  ml_model_likelihood_score_ops repeated sampling: OK "
+               "(score={:.6f}, chosen={})",
+               score1, chosen1);
+}
+
 void test_ml_model_likelihood_score_ops_selects_min_alternative() {
   auto const& model = thrifty_model();
   auto fixture = make_alternative_dag();
@@ -484,6 +619,9 @@ int main() {
   test_min_weight_sample_tree();
   test_ml_model_likelihood_score_ops_thrifty();
   test_ml_model_likelihood_score_ops_ua_edge_behavior();
+  test_ml_model_likelihood_score_ops_cache_reuse();
+  test_ml_model_likelihood_score_ops_cache_switches_dags();
+  test_ml_model_likelihood_score_ops_deterministic_repeated_sampling();
   test_ml_model_likelihood_score_ops_selects_min_alternative();
   std::println("All nn_ml_spr tests passed");
 }
