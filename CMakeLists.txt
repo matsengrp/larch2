@@ -234,6 +234,22 @@ set_tests_properties(dagutil_ml_sample_validate
                      FIXTURES_REQUIRED dagutil_ml_sample_fixture
                      PASS_REGULAR_EXPRESSION "tree_count: 1")
 
+# larch2 ML sampling CLI smoke tests.
+add_test(NAME larch2_ml_score_ua_edge_sample
+         COMMAND larch2
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --sample-method ml
+                 --score-ua-edge-ml
+                 --model-dir data/bcr
+                 --model-name ThriftyHumV0.2-45
+                 --seed 1
+                 -n 1
+                 --max-moves 1
+                 -o ${CMAKE_BINARY_DIR}/larch2_ml_score_ua_edge_sample.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(larch2_ml_score_ua_edge_sample
+                     PROPERTIES PASS_REGULAR_EXPRESSION "ML NLL")
+
 # Tests that need liblarch (protobuf + zlib + threads) and run from source dir
 foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   weight_accum_test optimize_test native_optimize_test

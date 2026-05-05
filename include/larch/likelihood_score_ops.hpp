@@ -97,13 +97,15 @@ struct likelihood_score_cache {
 // semantics where min weight = optimal tree).
 //
 // Model must provide: double log_likelihood(string_view parent, string_view
-// child)
+// child).  The artificial UA->root edge is ignored by default; set
+// ignore_ua_edge=false to score it.
 template <typename Model>
 struct likelihood_score_ops {
   using weight_type = double;
 
   Model const& model;
   std::string const& reference;
+  bool ignore_ua_edge = true;
   mutable likelihood_score_cache cache;
 
   void clear_cache() const { cache.clear(); }
@@ -121,6 +123,9 @@ struct likelihood_score_ops {
   }
 
   weight_type compute_edge(phylo_dag& dag, std::size_t edge_idx) const {
+    auto parent_idx = get_parent_idx(dag, edge_idx);
+    if (ignore_ua_edge && is_ua(dag, parent_idx)) return 0.0;
+
     auto& cached = cache.edge_score_slot(dag, edge_idx);
     if (cached) return *cached;
 
@@ -129,8 +134,6 @@ struct likelihood_score_ops {
         [&](auto edge) -> double {
           if (edge.mutations().empty()) return 0.0;
 
-          auto parent_idx =
-              std::visit([](auto p) { return p.index(); }, edge.get_parent());
           auto child_idx =
               std::visit([](auto c) { return c.index(); }, edge.get_child());
 

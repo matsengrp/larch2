@@ -221,6 +221,8 @@ Sampling:
   --sample-method <M>     parsimony (default), random, rf-minsum, rf-maxsum, ml/thrifty
   --sample-uniformly      Weight sampling proportional to subtree tree-counts
   --ignore-root-edge-mutations  Ignore UA->root edge mutations in parsimony
+  --ignore-ua-edge-ml    Ignore UA->root edge during ML scoring (default)
+  --score-ua-edge-ml     Score UA->root edge during ML scoring
 
 Move strategy:
   --callback-option <O>   best-moves (default) or all-moves
@@ -274,6 +276,7 @@ struct args {
   std::string sample_method = "parsimony";
   bool sample_uniformly = false;
   bool ignore_root_edge_mutations = false;
+  bool ignore_ua_edge_ml = true;
   std::string callback_option = "best-moves";
   bool log_metrics = false;
   std::optional<std::size_t> switch_subtrees;
@@ -336,6 +339,10 @@ static args parse_args(int argc, char** argv) {
       a.sample_uniformly = true;
     else if (arg == "--ignore-root-edge-mutations")
       a.ignore_root_edge_mutations = true;
+    else if (arg == "--ignore-ua-edge-ml")
+      a.ignore_ua_edge_ml = true;
+    else if (arg == "--score-ua-edge-ml")
+      a.ignore_ua_edge_ml = false;
     else if (arg == "--callback-option")
       a.callback_option = next();
     else if (arg == "--log-metrics")
@@ -428,7 +435,8 @@ static void finalize_sampled_tree(sampled_tree_result& sample,
   set_sample_ids_from_cg(sample.tree);
   sample.parsimony_score = compute_tree_parsimony_score(sample.tree);
   if (sample.ml_score && ml_cfg != nullptr && ml_cfg->model != nullptr) {
-    sample.ml_score = compute_dag_ml_nll(*ml_cfg->model, sample.tree);
+    sample.ml_score = compute_dag_ml_nll(*ml_cfg->model, sample.tree,
+                                         ml_cfg->ignore_ua_edge);
   }
 }
 
@@ -497,7 +505,9 @@ static sampled_tree_result sample_tree_from_dag(
 
     auto const& ref = get_reference_sequence(dag);
     ml_model_likelihood_score_ops ops{.model = *ml_cfg->model,
-                                      .reference = ref};
+                                      .reference = ref,
+                                      .ignore_ua_edge =
+                                          ml_cfg->ignore_ua_edge};
     subtree_weight<ml_model_likelihood_score_ops> sw(dag, seed, mr);
     auto ml_min = sw.compute_weight_below(root_idx, ops);
     auto tree = uniformly ? sw.min_weight_uniform_sample_tree(ops)
@@ -939,7 +949,8 @@ static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed,
   if (ml_cfg != nullptr && ml_cfg->model != nullptr) {
     auto opt_tree = psw.min_weight_sample_tree(pops);
     fitch_assign_compact_genomes(opt_tree);
-    ml_ll = -compute_dag_ml_nll(*ml_cfg->model, opt_tree);
+    ml_ll = -compute_dag_ml_nll(*ml_cfg->model, opt_tree,
+                                ml_cfg->ignore_ua_edge);
   }
 
   // Optimal tree count
@@ -1160,6 +1171,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
   // Load ML model once if needed for sampling, move scoring, or metrics.
   std::optional<ml_model> ml_model_storage;
   ml_scoring_config ml_config;
+  ml_config.ignore_ua_edge = a.ignore_ua_edge_ml;
   if (needs_ml_model) {
     if (!has_ml) {
       std::cerr << "error: --model-dir and --model-name required";
@@ -1590,6 +1602,7 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
 
   std::optional<ml_model> ml_model_storage;
   ml_scoring_config ml_config;
+  ml_config.ignore_ua_edge = a.ignore_ua_edge_ml;
   if (needs_ml_model) {
     if (!has_ml) {
       std::cerr << "error: --model-dir and --model-name required";

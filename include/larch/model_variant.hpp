@@ -119,12 +119,14 @@ inline void ml_adjust_rate_bias(ml_model& model, double log_factor) {
   std::visit([&](auto& m) { m.adjust_rate_bias_by(log_factor); }, model);
 }
 
-// Compute total negative log-likelihood for all non-UA mutated edges in a DAG.
-inline double compute_dag_ml_nll(ml_model const& model, phylo_dag& dag) {
+// Compute total negative log-likelihood for all mutated edges in a DAG.
+// By default the artificial UA->root edge is ignored.
+inline double compute_dag_ml_nll(ml_model const& model, phylo_dag& dag,
+                                 bool ignore_ua_edge = true) {
   auto const& ref = get_reference_sequence(dag);
   ml_model_likelihood_score_ops ops{.model = model,
                                     .reference = ref,
-                                    .ignore_ua_edge = true};
+                                    .ignore_ua_edge = ignore_ua_edge};
   double total_nll = 0.0;
   for (auto ev : dag.get_all_edges()) {
     std::visit(
@@ -187,11 +189,10 @@ inline double compute_edge_nll(ml_model const& model, phylo_dag& tree,
 inline double compute_delta_ml_score(ml_model const& model,
                                      phylo_dag& original_tree,
                                      phylo_dag& fragment,
-                                     spr_move const& move) {
+                                     spr_move const& move,
+                                     bool ignore_ua_edge = true) {
   auto affected = collect_affected_nodes(original_tree, move);
   if (affected.empty()) return 0.0;
-
-  auto const& ref = get_reference_sequence(original_tree);
 
   // Old NLL: score parent edges of affected nodes in original tree.
   double old_nll = 0.0;
@@ -199,22 +200,23 @@ inline double compute_delta_ml_score(ml_model const& model,
     auto pe = get_parent_edges(original_tree, nidx);
     if (pe.empty()) continue;
     auto parent_idx = get_parent_idx(original_tree, pe[0]);
-    if (is_ua(original_tree, parent_idx)) continue;
+    if (ignore_ua_edge && is_ua(original_tree, parent_idx)) continue;
     old_nll += compute_edge_nll(model, original_tree, parent_idx, nidx);
   }
 
-  // New NLL: score all non-UA edges in the fragment.
+  // New NLL: score all relevant edges in the fragment.
   // The fragment is the full affected subtree with new topology, so this
   // captures all new edges including the new inner node created by the SPR.
-  double new_nll = compute_dag_ml_nll(model, fragment);
+  double new_nll = compute_dag_ml_nll(model, fragment, ignore_ua_edge);
 
   return old_nll - new_nll;
 }
 
 // Backward-compatible alias.
 inline double compute_fragment_ml_score(ml_model const& model,
-                                        phylo_dag& fragment) {
-  return compute_dag_ml_nll(model, fragment);
+                                        phylo_dag& fragment,
+                                        bool ignore_ua_edge = true) {
+  return compute_dag_ml_nll(model, fragment, ignore_ua_edge);
 }
 
 // ============================================================================
@@ -224,6 +226,7 @@ inline double compute_fragment_ml_score(ml_model const& model,
 struct ml_scoring_config {
   ml_model* model = nullptr;
   double coeff = 0.0;
+  bool ignore_ua_edge = true;
 
   // Adjust a parsimony-based score with ML delta LL.
   // base_score: parsimony score (lower = better).
@@ -236,8 +239,8 @@ struct ml_scoring_config {
   double adjust_score(double base_score, phylo_dag& original_tree,
                       phylo_dag& fragment, spr_move const& move) const {
     if (model != nullptr && coeff != 0.0) {
-      double delta_ll =
-          compute_delta_ml_score(*model, original_tree, fragment, move);
+      double delta_ll = compute_delta_ml_score(*model, original_tree, fragment,
+                                               move, ignore_ua_edge);
       return base_score - coeff * delta_ll;
     }
     return base_score;

@@ -75,6 +75,8 @@ larch2 [options] -o <output.pb.gz>
 | `--sample-method <M>` | parsimony | `parsimony`, `random`, `rf-minsum`, `rf-maxsum`, or `ml`/`thrifty` |
 | `--sample-uniformly` | off | Weight sampling proportional to subtree tree-counts |
 | `--ignore-root-edge-mutations` | off | Ignore UA-to-root edge mutations in parsimony scoring |
+| `--ignore-ua-edge-ml` | on | Ignore UA-to-root edge during ML scoring |
+| `--score-ua-edge-ml` | off | Score UA-to-root edge during ML scoring |
 | `--model-dir <path>` | | Model directory for `ml`/`thrifty` sampling |
 | `--model-name <name>` | | Model name, e.g. `ThriftyHumV0.2-45` |
 
@@ -141,6 +143,8 @@ larch2 --dag-pb input.pb.gz -o output.pb.gz \
 
 Note: `--sample-method ml` controls which tree is sampled from the DAG. Native
 SPR move scoring remains parsimony-based unless `--move-coeff-ml` is also set.
+The `--ignore-ua-edge-ml` / `--score-ua-edge-ml` setting applies to all larch2
+ML scoring paths: ML sampling, ML move scoring, and ML metrics.
 
 Extract 5 diverse optimal trees as Newick:
 

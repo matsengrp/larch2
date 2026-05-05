@@ -258,6 +258,51 @@ void test_edge_scoring() {
   std::println("  edge scoring: OK (total neg-LL = {:.6f})", total_manual);
 }
 
+void test_likelihood_score_ops_ua_edge_behavior() {
+  auto model = rs_fivemer_model::load("data/bcr", "s5f");
+  auto tree = make_test_tree();
+
+  // Make UA->root a mutated edge.  Generic likelihood_score_ops should ignore
+  // this artificial edge by default, matching ml_model_likelihood_score_ops and
+  // compute_dag_ml_nll().
+  set_node_sequence(tree, 1, "CCGTACGTACGTACGTACGT");
+  recompute_edge_mutations(tree);
+
+  auto const& ref = get_reference_sequence(tree);
+  likelihood_score_ops ignore_ops{.model = model, .reference = ref};
+  likelihood_score_ops score_ops{
+      .model = model, .reference = ref, .ignore_ua_edge = false};
+
+  bool found_ua_edge = false;
+  std::size_t ua_edge_idx = 0;
+  for (auto ev : tree.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          if (is_ua(tree, get_parent_idx(tree, edge.index()))) {
+            found_ua_edge = true;
+            ua_edge_idx = edge.index();
+          }
+        },
+        ev);
+  }
+  assert(found_ua_edge);
+  assert(ignore_ops.compute_edge(tree, ua_edge_idx) == 0.0);
+  auto ua_edge_score = score_ops.compute_edge(tree, ua_edge_idx);
+  assert(std::isfinite(ua_edge_score));
+  assert(ua_edge_score > 0.0);
+
+  auto ua_idx = get_root_idx(tree);
+  subtree_weight<likelihood_score_ops<rs_fivemer_model>> ignore_sw{tree, 42u};
+  subtree_weight<likelihood_score_ops<rs_fivemer_model>> score_sw{tree, 42u};
+  auto ignored_total = ignore_sw.compute_weight_below(ua_idx, ignore_ops);
+  auto scored_total = score_sw.compute_weight_below(ua_idx, score_ops);
+  assert(std::abs(scored_total - ignored_total - ua_edge_score) < 1e-10);
+
+  std::println("  generic likelihood_score_ops UA edge behavior: OK "
+               "(ignored={:.6f}, scored={:.6f})",
+               ignored_total, scored_total);
+}
+
 void test_subtree_weight_matches_manual() {
   auto model = rs_fivemer_model::load("data/bcr", "s5f");
   auto tree = make_test_tree();
@@ -459,6 +504,8 @@ void test_ml_model_likelihood_score_ops_ua_edge_behavior() {
   assert(std::abs(scored_total - manual_edge_sum(tree, score_ops)) < 1e-8);
   assert(std::abs(scored_total - ignored_total - ua_edge_score) < 1e-8);
   assert(std::abs(ignored_total - compute_dag_ml_nll(model, tree)) < 1e-8);
+  assert(std::abs(scored_total - compute_dag_ml_nll(model, tree, false)) <
+         1e-8);
 
   std::println("  ml_model_likelihood_score_ops UA edge behavior: OK "
                "(ignored={:.6f}, scored={:.6f})",
@@ -614,6 +661,7 @@ int main() {
   std::println("=== nn_ml_spr tests ===");
   test_reconstruct_sequence();
   test_edge_scoring();
+  test_likelihood_score_ops_ua_edge_behavior();
   test_subtree_weight_matches_manual();
   test_ml_score_vs_parsimony();
   test_min_weight_sample_tree();
