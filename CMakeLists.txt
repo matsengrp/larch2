@@ -166,6 +166,74 @@ foreach(test_name rf_distance_test thread_pool_test validate_dag_test)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
+# dagutil ML sampling CLI smoke tests.
+set(DAGUTIL_ML_SAMPLE_OUT "${CMAKE_BINARY_DIR}/dagutil_ml_sample.pb.gz")
+add_test(NAME dagutil_ml_sample
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --sample
+                 --sample-method ml
+                 --model-dir data/bcr
+                 --model-name ThriftyHumV0.2-45
+                 --seed 1
+                 -o ${DAGUTIL_ML_SAMPLE_OUT}
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_ml_sample
+                     PROPERTIES FIXTURES_SETUP dagutil_ml_sample_fixture)
+add_test(NAME dagutil_thrifty_sample
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --sample
+                 --sample-method thrifty
+                 --model-dir data/bcr
+                 --model-name ThriftyHumV0.2-45
+                 --seed 1
+                 -o ${CMAKE_BINARY_DIR}/dagutil_thrifty_sample.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME dagutil_ml_missing_model_fails
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --sample
+                 --sample-method ml
+                 -o ${CMAKE_BINARY_DIR}/dagutil_missing_model.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_ml_missing_model_fails PROPERTIES WILL_FAIL TRUE)
+add_test(NAME dagutil_sample_method_without_sample_fails
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --trim
+                 --sample-method ml
+                 -o ${CMAKE_BINARY_DIR}/dagutil_ignored_sample_method.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_sample_method_without_sample_fails
+                     PROPERTIES WILL_FAIL TRUE)
+add_test(NAME dagutil_rf_sample_method_fails
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --trim
+                 --rf data/test_5_trees/tree_0.pb.gz
+                 --sample
+                 --sample-method parsimony
+                 -o ${CMAKE_BINARY_DIR}/dagutil_rf_sample_method.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_rf_sample_method_fails PROPERTIES WILL_FAIL TRUE)
+add_test(NAME dagutil_ml_sample_validate
+         COMMAND dagutil
+                 --dag-pb ${DAGUTIL_ML_SAMPLE_OUT}
+                 --force-no-vcf
+                 --validate
+                 --dag-info
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_ml_sample_validate
+                     PROPERTIES
+                     FIXTURES_REQUIRED dagutil_ml_sample_fixture
+                     PASS_REGULAR_EXPRESSION "tree_count: 1")
+
 # Tests that need liblarch (protobuf + zlib + threads) and run from source dir
 foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   weight_accum_test optimize_test native_optimize_test

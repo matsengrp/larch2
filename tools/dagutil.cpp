@@ -5,6 +5,7 @@
 #include <larch/vcf.hpp>
 #include <larch/merge.hpp>
 #include <larch/compute.hpp>
+#include <larch/model_variant.hpp>
 #include <larch/subtree_weight.hpp>
 #include <larch/weight_ops.hpp>
 #include <larch/weight_accumulator.hpp>
@@ -16,7 +17,9 @@
 #include <larch/newick.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <numeric>
@@ -155,6 +158,19 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
 }
 
 // ---------------------------------------------------------------------------
+// Sampling helpers
+// ---------------------------------------------------------------------------
+
+static bool is_ml_sample_method(std::string const& method) {
+  return method == "ml" || method == "thrifty";
+}
+
+static bool is_known_sample_method(std::string const& method) {
+  return method == "random" || method == "parsimony" ||
+         is_ml_sample_method(method);
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -179,6 +195,12 @@ Pruning:
   -t, --trim              Trim to best parsimony score
   --rf <path>             Trim to minimize RF distance to this DAG file
   -s, --sample            Sample a single tree from the DAG
+  --sample-method <M>     random (default), parsimony, ml/thrifty
+  --sample-uniformly      Weight sampling proportional to subtree tree-counts
+  --model-dir <path>      Model directory for ml/thrifty sampling
+  --model-name <name>     Model name for ml/thrifty sampling
+  --ignore-ua-edge-ml     Ignore UA->root edge during ML scoring (default)
+  --score-ua-edge-ml      Score UA->root edge during ML scoring
   --seed <N>              Random seed for sampling
 
 Analysis:
@@ -208,6 +230,12 @@ struct args {
   bool trim = false;
   std::string rf;
   bool sample = false;
+  std::string sample_method = "random";
+  bool sample_method_explicit = false;
+  bool sample_uniformly = false;
+  std::string model_dir;
+  std::string model_name;
+  bool ignore_ua_edge_ml = true;
   std::optional<std::uint32_t> seed;
   bool dag_info = false;
   bool print_parsimony = false;
@@ -249,6 +277,19 @@ static args parse_args(int argc, char** argv) {
       a.rf = next();
     else if (arg == "-s" || arg == "--sample")
       a.sample = true;
+    else if (arg == "--sample-method") {
+      a.sample_method = next();
+      a.sample_method_explicit = true;
+    } else if (arg == "--sample-uniformly")
+      a.sample_uniformly = true;
+    else if (arg == "--model-dir")
+      a.model_dir = next();
+    else if (arg == "--model-name")
+      a.model_name = next();
+    else if (arg == "--ignore-ua-edge-ml")
+      a.ignore_ua_edge_ml = true;
+    else if (arg == "--score-ua-edge-ml")
+      a.ignore_ua_edge_ml = false;
     else if (arg == "--seed")
       a.seed = static_cast<uint32_t>(std::stoull(std::string{next()}));
     else if (arg == "--dag-info") {
@@ -302,6 +343,40 @@ static args parse_args(int argc, char** argv) {
   }
   if (a.vcf.empty() && !a.force_no_vcf) {
     std::cerr << "error: --vcf is required (use --force-no-vcf to skip)\n";
+    std::exit(1);
+  }
+  if (!is_known_sample_method(a.sample_method)) {
+    std::cerr << "error: unknown sample method '" << a.sample_method << "'\n";
+    std::exit(1);
+  }
+  if (a.sample_method_explicit && !a.sample) {
+    std::cerr << "error: --sample-method requires --sample\n";
+    std::exit(1);
+  }
+  if (a.sample_method_explicit && a.sample && a.output.empty()) {
+    std::cerr << "error: --sample-method requires -o/--output because "
+                 "sampling writes an output tree\n";
+    std::exit(1);
+  }
+  if (a.trim && a.sample && a.sample_method_explicit) {
+    if (!a.rf.empty()) {
+      std::cerr << "error: --sample-method is not used with --trim --rf "
+                   "--sample; omit --sample-method because --rf selects the "
+                   "criterion\n";
+      std::exit(1);
+    }
+    if (a.sample_method != "parsimony") {
+      std::cerr << "error: --sample-method applies to --sample without "
+                   "--trim; omit --trim for "
+                << a.sample_method << " sampling\n";
+      std::exit(1);
+    }
+  }
+  if (a.sample && !a.trim && is_ml_sample_method(a.sample_method) &&
+      (a.model_dir.empty() || a.model_name.empty())) {
+    std::cerr << "error: --model-dir and --model-name required with "
+                 "--sample-method "
+              << a.sample_method << "\n";
     std::exit(1);
   }
 
@@ -479,7 +554,8 @@ int main(int argc, char** argv) try {
         sw.compute_weight_below(root_idx, pops);
         if (a.sample) {
           std::cerr << "Sampling a tree from min-parsimony options...\n";
-          auto tree = sw.min_weight_sample_tree(pops);
+          auto tree = a.sample_uniformly ? sw.min_weight_uniform_sample_tree(pops)
+                                         : sw.min_weight_sample_tree(pops);
           save_proto_dag(tree, a.output);
         } else {
           std::cerr << "Trimming DAG to min parsimony...\n";
@@ -498,7 +574,8 @@ int main(int argc, char** argv) try {
         sw.compute_weight_below(root_idx, srf);
         if (a.sample) {
           std::cerr << "Sampling a tree from min-RF options...\n";
-          auto tree = sw.min_weight_sample_tree(srf);
+          auto tree = a.sample_uniformly ? sw.min_weight_uniform_sample_tree(srf)
+                                         : sw.min_weight_sample_tree(srf);
           save_proto_dag(tree, a.output);
         } else {
           std::cerr << "Trimming DAG to min RF distance...\n";
@@ -507,12 +584,56 @@ int main(int argc, char** argv) try {
         }
       }
     } else if (a.sample) {
-      std::cerr << "Sampling a tree from the DAG...\n";
-      parsimony_score_ops pops;
-      subtree_weight<parsimony_score_ops> sw(result, a.seed, mr);
-      sw.compute_weight_below(root_idx, pops);
-      auto tree = sw.sample_tree(pops);
-      save_proto_dag(tree, a.output);
+      if (a.sample_method == "random") {
+        std::cerr << "Sampling a random tree from the DAG...\n";
+        parsimony_score_ops pops;
+        subtree_weight<parsimony_score_ops> sw(result, a.seed, mr);
+        sw.compute_weight_below(root_idx, pops);
+        auto tree = a.sample_uniformly ? sw.uniform_sample_tree(pops)
+                                       : sw.sample_tree(pops);
+        if (a.validate)
+          validate_dag(tree, "sampled random tree", thread_pool::get_default());
+        save_proto_dag(tree, a.output);
+      } else if (a.sample_method == "parsimony") {
+        std::cerr << "Sampling a tree from min-parsimony options...\n";
+        parsimony_score_ops pops;
+        subtree_weight<parsimony_score_ops> sw(result, a.seed, mr);
+        auto min_score = sw.compute_weight_below(root_idx, pops);
+        auto tree = a.sample_uniformly ? sw.min_weight_uniform_sample_tree(pops)
+                                       : sw.min_weight_sample_tree(pops);
+        std::cerr << "sampled_tree: parsimony_min=" << min_score << "\n";
+        if (a.validate)
+          validate_dag(tree, "sampled min-parsimony tree",
+                       thread_pool::get_default());
+        save_proto_dag(tree, a.output);
+      } else if (is_ml_sample_method(a.sample_method)) {
+        std::cerr << "Loading ML model " << a.model_name << "...\n";
+        auto model = load_ml_model(a.model_dir, a.model_name);
+        std::cerr << "  ML model loaded\n";
+
+        std::cerr << "Sampling a tree from min-ML options...\n";
+        auto const& ml_ref = get_reference_sequence(result);
+        ml_model_likelihood_score_ops ml_ops{.model = model,
+                                             .reference = ml_ref,
+                                             .ignore_ua_edge =
+                                                 a.ignore_ua_edge_ml};
+        subtree_weight<ml_model_likelihood_score_ops> sw(result, a.seed, mr);
+        auto ml_min = sw.compute_weight_below(root_idx, ml_ops);
+        if (!std::isfinite(ml_min)) {
+          std::cerr << "error: non-finite ML sample score\n";
+          std::exit(1);
+        }
+        auto tree = a.sample_uniformly ? sw.min_weight_uniform_sample_tree(ml_ops)
+                                       : sw.min_weight_sample_tree(ml_ops);
+        std::cerr << "sampled_tree: ML_NLL=" << std::fixed
+                  << std::setprecision(6) << ml_min
+                  << (a.ignore_ua_edge_ml ? " (UA edge ignored)"
+                                          : " (UA edge scored)")
+                  << "\n";
+        if (a.validate)
+          validate_dag(tree, "sampled min-ML tree", thread_pool::get_default());
+        save_proto_dag(tree, a.output);
+      }
     } else {
       save_proto_dag(result, a.output);
     }

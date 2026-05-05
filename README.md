@@ -187,7 +187,17 @@ times. All loaded inputs are merged into a single DAG.
 | `-t, --trim` | Trim to best parsimony score |
 | `--rf <path>` | Trim to minimize RF distance to this DAG file |
 | `-s, --sample` | Sample a single tree from the DAG |
+| `--sample-method <M>` | Sampling criterion: `random` (default), `parsimony`, or `ml`/`thrifty` |
+| `--sample-uniformly` | Weight sampling proportional to subtree tree-counts |
+| `--model-dir <path>` | Model directory for `ml`/`thrifty` sampling |
+| `--model-name <name>` | Model name, e.g. `ThriftyHumV0.2-45` |
+| `--ignore-ua-edge-ml` | Ignore UA-to-root edge during ML scoring (default) |
+| `--score-ua-edge-ml` | Score UA-to-root edge during ML scoring |
 | `--seed <N>` | Random seed for sampling |
+
+`--sample-method` is used for `--sample` tree extraction. With `--trim --rf
+--sample`, the RF criterion comes from `--rf`, so `--sample-method` should be
+omitted.
 
 ### Analysis
 
@@ -222,6 +232,14 @@ Trim to minimize RF distance to a reference DAG:
 
 ```sh
 dagutil --dag-pb input.pb.gz --force-no-vcf -o closest.pb -t --rf ref.pb.gz
+```
+
+Extract a minimum Thrifty/ML-NLL tree:
+
+```sh
+dagutil --dag-pb input.pb.gz --force-no-vcf --sample \
+    --sample-method ml --model-dir data/bcr --model-name ThriftyHumV0.2-45 \
+    -o sampled-thrifty.pb.gz
 ```
 
 ## License
