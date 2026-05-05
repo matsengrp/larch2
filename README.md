@@ -72,9 +72,11 @@ larch2 [options] -o <output.pb.gz>
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--sample-method <M>` | parsimony | `parsimony`, `random`, `rf-minsum`, or `rf-maxsum` |
+| `--sample-method <M>` | parsimony | `parsimony`, `random`, `rf-minsum`, `rf-maxsum`, or `ml`/`thrifty` |
 | `--sample-uniformly` | off | Weight sampling proportional to subtree tree-counts |
 | `--ignore-root-edge-mutations` | off | Ignore UA-to-root edge mutations in parsimony scoring |
+| `--model-dir <path>` | | Model directory for `ml`/`thrifty` sampling |
+| `--model-name <name>` | | Model name, e.g. `ThriftyHumV0.2-45` |
 
 ### Move strategy
 
@@ -129,6 +131,16 @@ Optimize a parsimony protobuf tree with RF-distance sampling:
 larch2 --tree-pb tree.pb.gz --refseq ref.txt -o output.pb.gz \
     --sample-method rf-minsum -n 50
 ```
+
+Sample optimization trees by Thrifty/ML NLL:
+
+```sh
+larch2 --dag-pb input.pb.gz -o output.pb.gz \
+    --sample-method ml --model-dir data/bcr --model-name ThriftyHumV0.2-45
+```
+
+Note: `--sample-method ml` controls which tree is sampled from the DAG. Native
+SPR move scoring remains parsimony-based unless `--move-coeff-ml` is also set.
 
 Extract 5 diverse optimal trees as Newick:
 
