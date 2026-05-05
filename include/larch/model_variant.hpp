@@ -7,10 +7,13 @@
 #include <larch/spr_move.hpp>
 #include <larch/yaml_reader.hpp>
 
+#include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -37,6 +40,62 @@ inline double ml_log_likelihood(ml_model const& model, std::string_view parent,
   return std::visit(
       [&](auto const& m) { return m.log_likelihood(parent, child); }, model);
 }
+
+// WeightOps specialization for minimum-NLL tree sampling with an ml_model
+// variant.
+template <>
+struct likelihood_score_ops<ml_model> {
+  using weight_type = double;
+
+  ml_model const& model;
+  std::string const& reference;
+  bool ignore_ua_edge = true;
+
+  weight_type compute_leaf(phylo_dag& /*dag*/, std::size_t /*node_idx*/) const {
+    return 0.0;
+  }
+
+  weight_type compute_edge(phylo_dag& dag, std::size_t edge_idx) const {
+    auto parent_idx = get_parent_idx(dag, edge_idx);
+    if (ignore_ua_edge && is_ua(dag, parent_idx)) return 0.0;
+
+    auto ev = dag.get_edge(edge_idx);
+    return std::visit(
+        [&](auto edge) -> double {
+          if (edge.mutations().empty()) return 0.0;
+
+          auto child_idx = std::visit([](auto child) { return child.index(); },
+                                      edge.get_child());
+          auto parent_seq = reconstruct_sequence(dag, parent_idx, reference);
+          auto child_seq = reconstruct_sequence(dag, child_idx, reference);
+
+          return -ml_log_likelihood(model, parent_seq, child_seq);
+        },
+        ev);
+  }
+
+  std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
+      std::vector<weight_type> const& weights) const {
+    double best = std::numeric_limits<double>::max();
+    for (auto w : weights) best = std::min(best, w);
+    std::vector<std::size_t> indices;
+    for (std::size_t i = 0; i < weights.size(); ++i)
+      if (weights[i] <= best + 1e-10) indices.push_back(i);
+    return {best, indices};
+  }
+
+  weight_type between_clades(std::vector<weight_type> const& weights) const {
+    double sum = 0.0;
+    for (auto w : weights) sum += w;
+    return sum;
+  }
+
+  weight_type above_node(weight_type edge_w, weight_type child_w) const {
+    return edge_w + child_w;
+  }
+};
+
+using ml_model_likelihood_score_ops = likelihood_score_ops<ml_model>;
 
 // Adjust rate bias through variant dispatch.
 inline void ml_adjust_rate_bias(ml_model& model, double log_factor) {
