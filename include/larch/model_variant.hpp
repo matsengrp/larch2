@@ -23,7 +23,7 @@ using ml_model = std::variant<rs_fivemer_model, indep_rs_cnn_model>;
 inline ml_model load_ml_model(std::string_view dir, std::string_view name) {
   auto yml_path = std::string{dir} + "/" + std::string{name} + ".yml";
   auto doc = read_yaml(yml_path);
-  auto model_class = doc.at("model_class").as_string();
+  auto model_class = yaml_require_key(doc, yml_path, "model_class").as_string();
   if (model_class == "RSFivemerModel") return rs_fivemer_model::load(dir, name);
   if (model_class == "IndepRSCNNModel")
     return indep_rs_cnn_model::load(dir, name);

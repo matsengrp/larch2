@@ -4,10 +4,23 @@
 
 #include <cassert>
 #include <cmath>
+#include <limits>
 #include <print>
+#include <stdexcept>
+#include <string_view>
 #include <vector>
 
 using namespace larch;
+
+static void expect_throws_contains(auto&& fn, std::string_view expected) {
+  try {
+    fn();
+  } catch (std::runtime_error const& e) {
+    assert(std::string_view{e.what()}.find(expected) != std::string_view::npos);
+    return;
+  }
+  assert(false && "expected std::runtime_error");
+}
 
 // Helper: manually compute log-likelihood for verification.
 double manual_log_likelihood(std::span<const float> rates,
@@ -208,6 +221,51 @@ void test_formula_components() {
   assert(std::abs(result - expected) < 1e-5);
 }
 
+void test_invalid_zero_rate_throws() {
+  std::vector<float> rates{0.0f, 1.0f};
+  std::vector<float> csp(2 * 4, 0.25f);
+  std::vector<int64_t> parent{0, 1};
+  std::vector<int64_t> child{1, 1};
+
+  expect_throws_contains(
+      [&] { poisson_context_log_likelihood(rates, csp, parent, child); },
+      "invalid rate");
+}
+
+void test_invalid_nan_rate_throws_without_mutations() {
+  std::vector<float> rates{std::numeric_limits<float>::quiet_NaN(), 1.0f};
+  std::vector<float> csp(2 * 4, 0.25f);
+  std::vector<int64_t> parent{0, 1};
+  std::vector<int64_t> child{0, 1};
+
+  expect_throws_contains(
+      [&] { poisson_context_log_likelihood(rates, csp, parent, child); },
+      "invalid rate");
+}
+
+void test_invalid_nan_substitution_probability_throws() {
+  std::vector<float> rates{1.0f, 1.0f};
+  std::vector<float> csp(2 * 4, 0.25f);
+  csp[1] = std::numeric_limits<float>::quiet_NaN();
+  std::vector<int64_t> parent{0, 1};
+  std::vector<int64_t> child{1, 1};
+
+  expect_throws_contains(
+      [&] { poisson_context_log_likelihood(rates, csp, parent, child); },
+      "invalid substitution probability");
+}
+
+void test_zero_substitution_probability_is_clamped() {
+  std::vector<float> rates{1.0f};
+  std::vector<float> csp{0.25f, 0.0f, 0.25f, 0.5f};
+  std::vector<int64_t> parent{0};
+  std::vector<int64_t> child{1};
+
+  double result = poisson_context_log_likelihood(rates, csp, parent, child);
+  double expected = std::log(1e-30) + std::log(1.0) - 1.0;
+  assert(std::abs(result - expected) < 1e-8);
+}
+
 // ---- softmax tests ----
 
 void test_softmax_basic() {
@@ -253,6 +311,10 @@ int main() {
   test_symmetry_of_mutation_count();
   test_longer_sequence();
   test_formula_components();
+  test_invalid_zero_rate_throws();
+  test_invalid_nan_rate_throws_without_mutations();
+  test_invalid_nan_substitution_probability_throws();
+  test_zero_substitution_probability_is_clamped();
 
   std::println("=== softmax tests ===");
   test_softmax_basic();

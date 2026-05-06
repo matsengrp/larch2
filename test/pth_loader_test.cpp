@@ -1,11 +1,68 @@
 #include <larch/pth_loader.hpp>
 #include <larch/yaml_reader.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <limits>
 #include <print>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <unistd.h>
 
 using namespace larch;
+
+static void expect_throws_contains(auto&& fn, std::string_view expected) {
+  try {
+    fn();
+  } catch (std::runtime_error const& e) {
+    assert(std::string_view{e.what()}.find(expected) != std::string_view::npos);
+    return;
+  }
+  assert(false && "expected std::runtime_error");
+}
+
+static std::filesystem::path temp_path(std::string_view name,
+                                       std::string_view extension) {
+  return std::filesystem::temp_directory_path() /
+         (std::string{name} + "_" +
+          std::to_string(static_cast<long long>(getpid())) +
+          std::string{extension});
+}
+
+static std::filesystem::path temp_yaml_path(std::string_view name) {
+  return temp_path(name, ".yml");
+}
+
+static std::filesystem::path temp_pth_path(std::string_view name) {
+  return temp_path(name, ".pth");
+}
+
+static void write_text_file(std::filesystem::path const& path,
+                            std::string_view text) {
+  std::ofstream out{path};
+  out << text;
+}
+
+static std::vector<uint8_t> read_binary_file(std::filesystem::path const& path) {
+  std::ifstream in{path, std::ios::binary};
+  return {std::istreambuf_iterator<char>{in},
+          std::istreambuf_iterator<char>{}};
+}
+
+static void write_binary_file(std::filesystem::path const& path,
+                              std::vector<uint8_t> const& bytes) {
+  std::ofstream out{path, std::ios::binary};
+  out.write(reinterpret_cast<char const*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+}
 
 // ---- ZIP reader tests ----
 
@@ -183,6 +240,42 @@ void test_yaml_cnn() {
   std::println("  yaml cnn: OK");
 }
 
+void test_yaml_malformed_line_reports_path_and_line() {
+  auto path = temp_yaml_path("larch_bad_yaml");
+  write_text_file(path, "model_class: RSFivemerModel\nthis is not yaml\n");
+  expect_throws_contains([&] { read_yaml(path.string()); }, path.string());
+  expect_throws_contains([&] { read_yaml(path.string()); }, ":2:");
+  std::filesystem::remove(path);
+  std::println("  yaml malformed line diagnostics: OK");
+}
+
+void test_yaml_tabs_rejected() {
+  auto path = temp_yaml_path("larch_tab_yaml");
+  write_text_file(path, "model_class:\n\tbad: value\n");
+  expect_throws_contains([&] { read_yaml(path.string()); },
+                         "tabs are not supported");
+  std::filesystem::remove(path);
+  std::println("  yaml tab diagnostics: OK");
+}
+
+void test_yaml_missing_key_reports_context() {
+  auto path = temp_yaml_path("larch_missing_yaml");
+  write_text_file(path, "encoder_parameters:\n  kmer_length: 5\n");
+  auto doc = read_yaml(path.string());
+  expect_throws_contains(
+      [&] { yaml_require_key(doc, path.string(), "model_class"); },
+      "missing key 'model_class'");
+  expect_throws_contains(
+      [&] {
+        auto const& enc =
+            yaml_require_map(doc, path.string(), "encoder_parameters");
+        yaml_require_key(enc, path.string(), "site_count", "encoder_parameters");
+      },
+      "encoder_parameters");
+  std::filesystem::remove(path);
+  std::println("  yaml missing-key diagnostics: OK");
+}
+
 // ---- PTH loader tests ----
 
 void test_pth_s5f() {
@@ -235,6 +328,117 @@ void test_pth_find_missing() {
   std::println("  pth find missing: OK");
 }
 
+void test_pth_missing_byteorder_fixture_fails() {
+  auto bytes = read_binary_file("data/bcr/s5f-libtorch.pth");
+  std::vector<uint8_t> pattern{'b', 'y', 't', 'e', 'o', 'r', 'd', 'e', 'r'};
+  std::vector<uint8_t> replacement{'b', 'y', 't', 'e', 'o', 'r', 'd', 'e', 'x'};
+
+  std::size_t replacements = 0;
+  auto search_begin = bytes.begin();
+  while (true) {
+    auto it = std::search(search_begin, bytes.end(), pattern.begin(),
+                          pattern.end());
+    if (it == bytes.end()) break;
+    std::copy(replacement.begin(), replacement.end(), it);
+    search_begin = it;
+    std::advance(search_begin, replacement.size());
+    ++replacements;
+  }
+  assert(replacements >= 2);  // local header and central directory names.
+
+  auto path = temp_pth_path("larch_missing_byteorder");
+  write_binary_file(path, bytes);
+  expect_throws_contains([&] { load_pth(path.string()); },
+                         "missing byteorder");
+  std::filesystem::remove(path);
+  std::println("  pth missing-byteorder fixture: OK");
+}
+
+void test_pth_corrupt_negative_shape_fixture_fails() {
+  auto bytes = read_binary_file("data/bcr/s5f-libtorch.pth");
+
+  // First tensor's shape opcode sequence in data.pkl:
+  //   BININT2 1025, BININT1 1, TUPLE2
+  // Replace it, without changing ZIP entry sizes, by:
+  //   BININT -1, TUPLE1
+  // zip_reader does not use CRCs, so this exercises load_pth() on a malformed
+  // but structurally readable fixture.
+  std::vector<uint8_t> pattern{0x4d, 0x01, 0x04, 0x4b, 0x01, 0x86};
+  std::vector<uint8_t> replacement{0x4a, 0xff, 0xff, 0xff, 0xff, 0x85};
+  auto it =
+      std::search(bytes.begin(), bytes.end(), pattern.begin(), pattern.end());
+  assert(it != bytes.end());
+  std::copy(replacement.begin(), replacement.end(), it);
+
+  auto path = temp_pth_path("larch_bad_shape");
+  write_binary_file(path, bytes);
+  expect_throws_contains([&] { load_pth(path.string()); },
+                         "negative shape dimension");
+  std::filesystem::remove(path);
+  std::println("  pth corrupt negative-shape fixture: OK");
+}
+
+void test_pth_checked_layout_rejects_negative_dim() {
+  tensor_info ti{
+      .name = "bad_negative",
+      .storage_key = "0",
+      .shape = {2, -1},
+      .stride = {1, 1},
+      .storage_offset = 0,
+      .num_elements = 2,
+  };
+  expect_throws_contains(
+      [&] { pth_detail::checked_tensor_layout(ti, 8); },
+      "negative shape dimension");
+  std::println("  pth negative shape diagnostics: OK");
+}
+
+void test_pth_checked_layout_rejects_overflow() {
+  tensor_info ti{
+      .name = "bad_overflow",
+      .storage_key = "0",
+      .shape = {std::numeric_limits<int64_t>::max(),
+                std::numeric_limits<int64_t>::max()},
+      .stride = {1, 1},
+      .storage_offset = 0,
+      .num_elements = std::numeric_limits<int64_t>::max(),
+  };
+  expect_throws_contains(
+      [&] { pth_detail::checked_tensor_layout(ti, 1024); },
+      "element count overflow");
+  std::println("  pth overflow diagnostics: OK");
+}
+
+void test_pth_checked_layout_rejects_byte_size_overflow() {
+  tensor_info ti{
+      .name = "bad_byte_size",
+      .storage_key = "0",
+      .shape = {std::numeric_limits<int64_t>::max()},
+      .stride = {1},
+      .storage_offset = 0,
+      .num_elements = 0,
+  };
+  expect_throws_contains(
+      [&] { pth_detail::checked_tensor_layout(ti, 1024); },
+      "byte size overflow");
+  std::println("  pth byte-size diagnostics: OK");
+}
+
+void test_pth_checked_layout_rejects_byte_range_overflow() {
+  tensor_info ti{
+      .name = "bad_offset",
+      .storage_key = "0",
+      .shape = {1},
+      .stride = {1},
+      .storage_offset = std::numeric_limits<int64_t>::max(),
+      .num_elements = 0,
+  };
+  expect_throws_contains(
+      [&] { pth_detail::checked_tensor_layout(ti, 1024); },
+      "byte offset overflow");
+  std::println("  pth byte-range diagnostics: OK");
+}
+
 int main() {
   std::println("=== ZIP reader tests ===");
   test_zip_reader_s5f();
@@ -248,11 +452,20 @@ int main() {
   std::println("=== YAML reader tests ===");
   test_yaml_s5f();
   test_yaml_cnn();
+  test_yaml_malformed_line_reports_path_and_line();
+  test_yaml_tabs_rejected();
+  test_yaml_missing_key_reports_context();
 
   std::println("=== PTH loader tests ===");
   test_pth_s5f();
   test_pth_cnn();
   test_pth_find_missing();
+  test_pth_missing_byteorder_fixture_fails();
+  test_pth_corrupt_negative_shape_fixture_fails();
+  test_pth_checked_layout_rejects_negative_dim();
+  test_pth_checked_layout_rejects_overflow();
+  test_pth_checked_layout_rejects_byte_size_overflow();
+  test_pth_checked_layout_rejects_byte_range_overflow();
 
   std::println("All pth_loader tests passed");
 }

@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace larch {
@@ -57,15 +58,20 @@ class rs_fivemer_model {
     auto yml_path = std::string{dir} + "/" + std::string{name} + ".yml";
 
     auto doc = read_yaml(yml_path);
-    if (doc.at("model_class").as_string() != "RSFivemerModel")
+    auto const& model_class =
+        yaml_require_key(doc, yml_path, "model_class").as_string();
+    if (model_class != "RSFivemerModel")
       throw std::runtime_error{
           "rs_fivemer_model::load: expected model_class=RSFivemerModel, got " +
-          doc.at("model_class").as_string()};
+          model_class};
 
+    auto const& enc = yaml_require_map(doc, yml_path, "encoder_parameters");
     auto kmer_length = static_cast<std::size_t>(
-        doc.at("encoder_parameters").map.at("kmer_length").as_int());
+        yaml_require_key(enc, yml_path, "kmer_length", "encoder_parameters")
+            .as_int());
     auto site_count = static_cast<std::size_t>(
-        doc.at("encoder_parameters").map.at("site_count").as_int());
+        yaml_require_key(enc, yml_path, "site_count", "encoder_parameters")
+            .as_int());
 
     return rs_fivemer_model{load_pth(pth_path),
                             kmer_encoder{kmer_length, site_count}};
@@ -79,9 +85,17 @@ class rs_fivemer_model {
     std::vector<float> rates(sc);
     std::vector<float> csp(sc * 4);
 
+    if (!std::isfinite(rate_bias_log_))
+      throw std::runtime_error{"rs_fivemer_model::forward: invalid rate bias"};
+
     for (std::size_t i = 0; i < sc; ++i) {
       auto idx = static_cast<std::size_t>(encoded.kmer_indices[i]);
-      rates[i] = std::exp(r_weights_[idx] + static_cast<float>(rate_bias_log_));
+      double log_rate = static_cast<double>(r_weights_[idx]) + rate_bias_log_;
+      double rate = std::exp(log_rate);
+      rates[i] = static_cast<float>(rate);
+      if (!std::isfinite(rates[i]) || rates[i] <= 0.0f)
+        throw std::runtime_error{
+            "rs_fivemer_model::forward: invalid rate output"};
       for (std::size_t j = 0; j < 4; ++j) {
         csp[i * 4 + j] =
             s_weights_[idx * 4 + j] + encoded.wt_modifier[i * 4 + j];

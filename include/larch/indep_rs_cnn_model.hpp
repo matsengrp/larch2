@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace larch {
@@ -156,21 +157,34 @@ class indep_rs_cnn_model {
     auto yml_path = std::string{dir} + "/" + std::string{name} + ".yml";
 
     auto doc = read_yaml(yml_path);
-    if (doc.at("model_class").as_string() != "IndepRSCNNModel")
+    auto const& model_class =
+        yaml_require_key(doc, yml_path, "model_class").as_string();
+    if (model_class != "IndepRSCNNModel")
       throw std::runtime_error{
           "indep_rs_cnn_model::load: expected IndepRSCNNModel, got " +
-          doc.at("model_class").as_string()};
+          model_class};
 
-    auto& enc = doc.at("encoder_parameters").map;
-    auto kmer_length = static_cast<std::size_t>(enc.at("kmer_length").as_int());
-    auto site_count = static_cast<std::size_t>(enc.at("site_count").as_int());
+    auto const& enc = yaml_require_map(doc, yml_path, "encoder_parameters");
+    auto kmer_length = static_cast<std::size_t>(
+        yaml_require_key(enc, yml_path, "kmer_length", "encoder_parameters")
+            .as_int());
+    auto site_count = static_cast<std::size_t>(
+        yaml_require_key(enc, yml_path, "site_count", "encoder_parameters")
+            .as_int());
 
-    auto& hyp = doc.at("model_hyperparameters").map;
-    auto embedding_dim =
-        static_cast<std::size_t>(hyp.at("embedding_dim").as_int());
-    auto filter_count =
-        static_cast<std::size_t>(hyp.at("filter_count").as_int());
-    auto kernel_size = static_cast<std::size_t>(hyp.at("kernel_size").as_int());
+    auto const& hyp = yaml_require_map(doc, yml_path, "model_hyperparameters");
+    auto embedding_dim = static_cast<std::size_t>(
+        yaml_require_key(hyp, yml_path, "embedding_dim",
+                         "model_hyperparameters")
+            .as_int());
+    auto filter_count = static_cast<std::size_t>(
+        yaml_require_key(hyp, yml_path, "filter_count",
+                         "model_hyperparameters")
+            .as_int());
+    auto kernel_size = static_cast<std::size_t>(
+        yaml_require_key(hyp, yml_path, "kernel_size",
+                         "model_hyperparameters")
+            .as_int());
 
     return indep_rs_cnn_model{load_pth(pth_path),
                               kmer_encoder{kmer_length, site_count},
@@ -204,9 +218,15 @@ class indep_rs_cnn_model {
     std::vector<float> r_rate(L);
     linear_fwd(r_rate.data(), r_feat.data(), L, r_linear_w_, r_linear_b_, F, 1);
     std::vector<float> rates(L);
-    for (std::size_t i = 0; i < L; ++i)
-      rates[i] = std::exp(base_rate[i] + r_rate[i] +
-                          static_cast<float>(rate_bias_log_));
+    for (std::size_t i = 0; i < L; ++i) {
+      double log_rate = static_cast<double>(base_rate[i]) +
+                        static_cast<double>(r_rate[i]) + rate_bias_log_;
+      double rate = std::exp(log_rate);
+      rates[i] = static_cast<float>(rate);
+      if (!std::isfinite(rates[i]) || rates[i] <= 0.0f)
+        throw std::runtime_error{
+            "indep_rs_cnn_model::forward: invalid rate output"};
+    }
 
     // S-branch: embed → conv → ReLU.
     std::vector<float> s_emb(L * E);

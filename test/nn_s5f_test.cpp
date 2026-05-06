@@ -156,6 +156,27 @@ void test_adjust_rate_bias_doubles_rates() {
   std::println("  adjust_rate_bias doubles rates: OK");
 }
 
+void test_adjust_rate_bias_small_adjustment() {
+  auto model = rs_fivemer_model::load("data/bcr", "s5f");
+  auto [rates_before, csp_before] = model.forward("ACGTACGTACGTACGTACGT");
+
+  constexpr double log_adjustment = 1e-6;
+  model.adjust_rate_bias_by(log_adjustment);
+  auto [rates_after, csp_after] = model.forward("ACGTACGTACGTACGTACGT");
+
+  double scale = std::exp(log_adjustment);
+  bool observed_change = false;
+  for (std::size_t i = 0; i < rates_before.size(); ++i) {
+    double expected = static_cast<double>(rates_before[i]) * scale;
+    assert(std::abs(static_cast<double>(rates_after[i]) - expected) <
+           2e-6 * expected);
+    if (rates_after[i] != rates_before[i]) observed_change = true;
+  }
+  assert(observed_change);
+  assert(csp_before == csp_after);
+  std::println("  adjust_rate_bias small adjustment: OK");
+}
+
 void test_adjust_rate_bias_affects_likelihood() {
   auto model = rs_fivemer_model::load("data/bcr", "s5f");
   std::string_view parent = "ACGTACGTACGTACGTACGT";
@@ -284,6 +305,7 @@ int main() {
   test_different_sequences_different_likelihoods();
   test_adjust_rate_bias_noop();
   test_adjust_rate_bias_doubles_rates();
+  test_adjust_rate_bias_small_adjustment();
   test_adjust_rate_bias_affects_likelihood();
   test_python_ground_truth_identical();
   test_python_ground_truth_single_mutations();

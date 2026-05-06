@@ -131,6 +131,27 @@ void test_log_likelihood_with_mutations() {
   std::println("  log_likelihood with mutations: OK");
 }
 
+void test_adjust_rate_bias_small_adjustment() {
+  auto model = indep_rs_cnn_model::load("data/bcr", "ThriftyHumV0.2-45");
+  auto [rates_before, csp_before] = model.forward("ACGTACGTACGTACGTACGT");
+
+  constexpr double log_adjustment = 1e-6;
+  model.adjust_rate_bias_by(log_adjustment);
+  auto [rates_after, csp_after] = model.forward("ACGTACGTACGTACGTACGT");
+
+  double scale = std::exp(log_adjustment);
+  bool observed_change = false;
+  for (std::size_t i = 0; i < rates_before.size(); ++i) {
+    double expected = static_cast<double>(rates_before[i]) * scale;
+    assert(std::abs(static_cast<double>(rates_after[i]) - expected) <
+           2e-6 * expected);
+    if (rates_after[i] != rates_before[i]) observed_change = true;
+  }
+  assert(observed_change);
+  assert(csp_before == csp_after);
+  std::println("  adjust_rate_bias small adjustment: OK");
+}
+
 int main() {
   std::println("=== nn_cnn_model tests ===");
   test_load_cnn();
@@ -143,5 +164,6 @@ int main() {
   test_forward_deterministic();
   test_log_likelihood_no_mutations();
   test_log_likelihood_with_mutations();
+  test_adjust_rate_bias_small_adjustment();
   std::println("All nn_cnn_model tests passed");
 }
