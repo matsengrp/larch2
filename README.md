@@ -63,6 +63,8 @@ larch2 [options] -o <output.pb.gz>
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-n, --iterations <N>` | 10 | Number of optimization iterations |
+| `--patience <P>` | off | Stop after P iterations without parsimony improvement |
+| `--drift <N>` | off | When patience triggers, try N drift iterations before stopping |
 | `--optimizer <name>` | native | `native` (SPR enumeration) or `random` |
 | `--max-moves <N>` | 50 | Max moves per iteration (native optimizer) |
 | `--seed <N>` | random | Random seed for reproducibility |
@@ -77,8 +79,18 @@ larch2 [options] -o <output.pb.gz>
 | `--ignore-root-edge-mutations` | off | Ignore UA-to-root edge mutations in parsimony scoring |
 | `--ignore-ua-edge-ml` | on | Ignore UA-to-root edge during ML scoring |
 | `--score-ua-edge-ml` | off | Score UA-to-root edge during ML scoring |
-| `--model-dir <path>` | | Model directory for `ml`/`thrifty` sampling |
+| `--model-dir <path>` | | Model directory for `ml`/`thrifty` sampling or ML move scoring |
 | `--model-name <name>` | | Model name, e.g. `ThriftyHumV0.2-45` |
+
+Sampling methods:
+
+| Method | Meaning |
+|--------|---------|
+| `parsimony` | Sample a minimum mutation-count tree from the DAG |
+| `random` | Sample any compatible tree from the DAG |
+| `rf-minsum` / `rf-maxsum` | Sample by RF-distance criterion during larch2 optimization |
+| `ml` / `thrifty` | Sample a minimum ML/NN negative-log-likelihood tree; requires `--model-dir` and `--model-name` |
+| `edge-weight` | Sample a minimum sum of stored protobuf/in-memory `edge_weight` values |
 
 ### Move strategy
 
@@ -87,6 +99,7 @@ larch2 [options] -o <output.pb.gz>
 | `--callback-option <O>` | best-moves | `best-moves` or `all-moves` |
 | `--move-coeff-pscore <N>` | 1 | Parsimony score coefficient for move scoring |
 | `--move-coeff-nodes <N>` | 0 | New-node penalty coefficient for move scoring |
+| `--move-coeff-ml <F>` | 0.0 | ML log-likelihood coefficient for SPR move rescoring; requires model args when positive |
 | `--move-score-threshold <N>` | -1 (or 0 with node penalty) | Max parsimony score for enumerated moves |
 
 ### Subtree optimization
@@ -138,13 +151,28 @@ Sample optimization trees by Thrifty/ML NLL:
 
 ```sh
 larch2 --dag-pb input.pb.gz -o output.pb.gz \
-    --sample-method ml --model-dir data/bcr --model-name ThriftyHumV0.2-45
+    --sample-method ml \
+    --model-dir data/bcr --model-name ThriftyHumV0.2-45
 ```
 
-Note: `--sample-method ml` controls which tree is sampled from the DAG. Native
-SPR move scoring remains parsimony-based unless `--move-coeff-ml` is also set.
-The `--ignore-ua-edge-ml` / `--score-ua-edge-ml` setting applies to all larch2
-ML scoring paths: ML sampling, ML move scoring, and ML metrics.
+Use Thrifty/ML for both DAG tree sampling and SPR move rescoring:
+
+```sh
+larch2 --dag-pb input.pb.gz -o output.pb.gz \
+    --sample-method ml \
+    --move-coeff-ml 1.0 \
+    --model-dir data/bcr --model-name ThriftyHumV0.2-45
+```
+
+Note: `--sample-method ml` controls which tree is sampled from the DAG. With
+the native optimizer, providing `--model-dir` and `--model-name` without
+`--sample-method ml` defaults move scoring to ML-only (`--move-coeff-ml 1.0`,
+and parsimony coefficient 0 unless explicitly set). With `--sample-method ml`,
+ML move scoring is still disabled unless `--move-coeff-ml` is set. The
+`--ignore-ua-edge-ml` / `--score-ua-edge-ml` setting applies to all larch2 ML
+scoring paths: ML sampling, ML move scoring, and ML metrics. ML sampling
+progress is reported as `parsimony P, ML NLL X`; edge-weight sampling is
+reported as `parsimony P, edge_weight W`.
 
 Note: `--sample-method edge-weight` is intended for DAGs where every edge has a
 meaningful stored protobuf `edge_weight`. Mixing scored and unscored DAGs, or
@@ -198,7 +226,7 @@ times. All loaded inputs are merged into a single DAG.
 | `-s, --sample` | Sample a single tree from the DAG |
 | `--sample-method <M>` | Sampling criterion: `random` (default), `parsimony`, `ml`/`thrifty`, or `edge-weight` |
 | `--sample-uniformly` | Weight sampling proportional to subtree tree-counts |
-| `--model-dir <path>` | Model directory for `ml`/`thrifty` sampling |
+| `--model-dir <path>` | Model directory for `ml`/`thrifty` sampling or `--edge-ml` |
 | `--model-name <name>` | Model name, e.g. `ThriftyHumV0.2-45` |
 | `--ignore-ua-edge-ml` | Ignore UA-to-root edge during ML scoring (default) |
 | `--score-ua-edge-ml` | Score UA-to-root edge during ML scoring |
@@ -218,8 +246,20 @@ combined with `--trim` or `--sample`; run sampling/trimming as a second command.
 | `--parsimony` | Print parsimony score distribution |
 | `--sum-rf-distance` | Print sum RF distance distribution |
 | `--edge-parsimony` | Store per-edge global parsimony penalties in protobuf `edge_weight` |
-| `--edge-ml` | Store per-edge global ML-NLL penalties in protobuf `edge_weight` (requires model args) |
+| `--edge-ml` | Store per-edge global ML-NLL penalties in protobuf `edge_weight` (requires model args; `--edge-thrifty` alias also accepted) |
 | `--validate` | Validate DAG invariants |
+
+Per-edge penalty outputs use the stored protobuf `edge_weight` field. For each
+edge `e`, dagutil writes:
+
+```text
+penalty[e] = min_score(any tree containing e) - global_min_score
+```
+
+So `edge_weight == 0` means the edge appears in at least one globally optimal
+tree under that criterion (within numerical tolerance for ML). `--edge-ml` uses
+ML/NN negative log likelihood and is affected by `--ignore-ua-edge-ml` /
+`--score-ua-edge-ml`.
 
 ### Examples
 
