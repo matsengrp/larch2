@@ -5,15 +5,18 @@
 #include <larch/protobuf.hpp>
 #include <larch/io_util.hpp>
 
+#include "test_util.hpp"
+
 #include <cassert>
 #include <cmath>
-#include <cstdio>
+#include <filesystem>
 #include <map>
 #include <numeric>
 #include <print>
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -151,6 +154,28 @@ static std::set<std::string> get_leaf_ids(larch::phylo_dag& d) {
   return ids;
 }
 
+static std::string selected_leaf_sequence(larch::phylo_dag& sampled,
+                                          std::string_view alt1,
+                                          std::string_view alt2) {
+  std::string chosen_seq;
+  std::size_t chosen_count = 0;
+  for (auto nv : sampled.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.sample_id(); }) {
+            auto seq = larch::test::node_sequence(sampled, node.index());
+            if (seq == alt1 || seq == alt2) {
+              chosen_seq = std::move(seq);
+              ++chosen_count;
+            }
+          }
+        },
+        nv);
+  }
+  assert(chosen_count == 1);
+  return chosen_seq;
+}
+
 struct test_fixture {
   std::vector<larch::phylo_dag> trees;
   larch::merge merger;
@@ -168,7 +193,8 @@ struct test_fixture {
   std::string load_trees(std::vector<std::string> const& paths) {
     trees.reserve(paths.size());
     for (auto& path : paths) {
-      trees.emplace_back(larch::load_proto_dag(path));
+      trees.emplace_back(
+          larch::load_proto_dag(larch::test::source_path_string(path)));
       larch::recompute_compact_genomes(trees.back());
       larch::set_sample_ids_from_cg(trees.back());
     }
@@ -649,6 +675,38 @@ static void test_edge_weight_score_ops_tie_selection() {
   std::println("  PASS");
 }
 
+static void test_edge_weight_uniform_tie_sampling_balance() {
+  std::println("test_edge_weight_uniform_tie_sampling_balance");
+
+  auto dag = make_edge_weight_tie_dag();
+  larch::edge_weight_score_ops ops;
+  larch::subtree_weight<larch::edge_weight_score_ops> sw(dag, 271828u);
+  auto root_idx = std::visit([](auto n) { return n.index(); }, dag.get_root());
+  assert(sw.min_weight_count(root_idx, ops) == larch::bigint{2});
+
+  int alt1_count = 0;
+  int alt2_count = 0;
+  constexpr int trials = 2000;
+  for (int i = 0; i < trials; ++i) {
+    auto sampled = sw.min_weight_uniform_sample_tree(ops);
+    auto chosen = selected_leaf_sequence(sampled, "CAAA", "ACAA");
+    if (chosen == "CAAA")
+      ++alt1_count;
+    else if (chosen == "ACAA")
+      ++alt2_count;
+    else
+      assert(false && "unexpected edge-weight sampled alternative");
+  }
+
+  assert(alt1_count + alt2_count == trials);
+  assert(alt1_count > trials * 0.4 && alt1_count < trials * 0.6);
+  assert(alt2_count > trials * 0.4 && alt2_count < trials * 0.6);
+
+  std::println("  balanced edge-weight samples: alt1={}, alt2={}",
+               alt1_count, alt2_count);
+  std::println("  PASS");
+}
+
 static void test_edge_weight_min_global_scores() {
   std::println("test_edge_weight_min_global_scores");
 
@@ -685,10 +743,11 @@ static void test_edge_weight_round_trip_and_merge() {
   auto original_sum = sum_edge_weights(dag);
   assert(std::abs(original_sum - 33.5) < 1e-10);
 
-  std::string tmp_path = "/tmp/test_edge_weight_rt.pb";
-  larch::save_proto_dag(dag, tmp_path);
+  auto tmp_path =
+      larch::test::unique_temp_path("subtree_weight_edge_weight_rt", ".pb");
+  larch::save_proto_dag(dag, tmp_path.string());
 
-  auto loaded = larch::load_proto_dag(tmp_path);
+  auto loaded = larch::load_proto_dag(tmp_path.string());
   assert(std::abs(sum_edge_weights(loaded) - original_sum) < 1e-10);
 
   larch::edge_weight_score_ops ops;
@@ -701,13 +760,14 @@ static void test_edge_weight_round_trip_and_merge() {
   larch::merge m{larch::get_reference_sequence(loaded)};
   m.add_dag(loaded);
   auto& merged = m.get_result();
+  assert(std::abs(sum_edge_weights(merged) - original_sum) < 1e-10);
   auto merged_root_idx =
       std::visit([](auto n) { return n.index(); }, merged.get_root());
   larch::subtree_weight<larch::edge_weight_score_ops> merged_sw(merged, 42u);
   assert(std::abs(merged_sw.compute_weight_below(merged_root_idx, ops) - 3.5) <
          1e-10);
 
-  std::remove(tmp_path.c_str());
+  std::filesystem::remove(tmp_path);
   std::println("  PASS");
 }
 
@@ -733,11 +793,12 @@ static void test_edge_parsimony_round_trip() {
     penalties[i] = static_cast<float>(scores[i] - global_min);
 
   // Save with edge weights
-  std::string tmp_path = "/tmp/test_edge_parsimony_rt.pb";
-  larch::save_proto_dag(dag, tmp_path, penalties);
+  auto tmp_path = larch::test::unique_temp_path(
+      "subtree_weight_edge_parsimony_rt", ".pb");
+  larch::save_proto_dag(dag, tmp_path.string(), penalties);
 
   // Load raw protobuf and check edge_weight values
-  auto file_bytes = larch::read_file(tmp_path);
+  auto file_bytes = larch::read_file(tmp_path.string());
   std::span<const uint8_t> data{
       reinterpret_cast<const uint8_t*>(file_bytes.data()), file_bytes.size()};
   auto edge_spans = pb::collect_field_spans(data, 1);
@@ -761,7 +822,7 @@ static void test_edge_parsimony_round_trip() {
   assert(nonzero_weights > 0);
 
   // Clean up
-  std::remove(tmp_path.c_str());
+  std::filesystem::remove(tmp_path);
 
   std::println("  PASS");
 }
@@ -781,6 +842,7 @@ int main() {
   test_edge_parsimony_exhaustive_ground_truth();
   test_edge_weight_score_ops_selects_min_alternative();
   test_edge_weight_score_ops_tie_selection();
+  test_edge_weight_uniform_tie_sampling_balance();
   test_edge_weight_min_global_scores();
   test_edge_weight_round_trip_and_merge();
   test_edge_parsimony_round_trip();

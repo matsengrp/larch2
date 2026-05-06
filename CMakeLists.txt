@@ -171,16 +171,22 @@ set(DAGUTIL_ML_SAMPLE_OUT "${CMAKE_BINARY_DIR}/dagutil_ml_sample.pb.gz")
 add_test(NAME dagutil_ml_sample
          COMMAND dagutil
                  --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --dag-pb data/test_5_trees/tree_1.pb.gz
                  --force-no-vcf
                  --sample
+                 --sample-uniformly
                  --sample-method ml
                  --model-dir data/bcr
                  --model-name ThriftyHumV0.2-45
+                 --validate
                  --seed 1
                  -o ${DAGUTIL_ML_SAMPLE_OUT}
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(dagutil_ml_sample
-                     PROPERTIES FIXTURES_SETUP dagutil_ml_sample_fixture)
+                     PROPERTIES
+                     FIXTURES_SETUP dagutil_ml_sample_fixture
+                     PASS_REGULAR_EXPRESSION
+                     "sampled_tree: ML_NLL=948\\.401399")
 add_test(NAME dagutil_thrifty_sample
          COMMAND dagutil
                  --dag-pb data/test_5_trees/tree_0.pb.gz
@@ -283,6 +289,7 @@ add_test(NAME dagutil_edge_ml_sample
                  --dag-pb ${DAGUTIL_EDGE_ML_SCORED_OUT}
                  --force-no-vcf
                  --sample
+                 --sample-uniformly
                  --sample-method edge-weight
                  --seed 1
                  -o ${DAGUTIL_EDGE_ML_SAMPLE_OUT}
@@ -319,7 +326,10 @@ add_test(NAME dagutil_edge_weight_score
                  -o ${DAGUTIL_EDGE_WEIGHT_SCORED_OUT}
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(dagutil_edge_weight_score
-                     PROPERTIES FIXTURES_SETUP dagutil_edge_weight_fixture)
+                     PROPERTIES
+                     FIXTURES_SETUP dagutil_edge_weight_fixture
+                     PASS_REGULAR_EXPRESSION
+                     "edge_parsimony: global_min=.*nonzero_penalty=[1-9]")
 add_test(NAME dagutil_edge_parsimony_with_sample_fails
          COMMAND dagutil
                  --dag-pb data/test_5_trees/tree_0.pb.gz
@@ -346,6 +356,7 @@ add_test(NAME dagutil_edge_weight_sample
                  --dag-pb ${DAGUTIL_EDGE_WEIGHT_SCORED_OUT}
                  --force-no-vcf
                  --sample
+                 --sample-uniformly
                  --sample-method edge-weight
                  --seed 1
                  -o ${DAGUTIL_EDGE_WEIGHT_SAMPLE_OUT}
@@ -354,7 +365,7 @@ set_tests_properties(dagutil_edge_weight_sample
                      PROPERTIES
                      FIXTURES_REQUIRED dagutil_edge_weight_fixture
                      FIXTURES_SETUP dagutil_edge_weight_sample_fixture
-                     PASS_REGULAR_EXPRESSION "edge_weight_min")
+                     PASS_REGULAR_EXPRESSION "edge_weight_min=0.000000")
 add_test(NAME dagutil_edge_weight_sample_validate
          COMMAND dagutil
                  --dag-pb ${DAGUTIL_EDGE_WEIGHT_SAMPLE_OUT}
@@ -371,6 +382,7 @@ add_test(NAME larch2_edge_weight_sample
          COMMAND larch2
                  --dag-pb ${DAGUTIL_EDGE_WEIGHT_SCORED_OUT}
                  --sample-method edge-weight
+                 --sample-uniformly
                  --seed 1
                  -n 1
                  --max-moves 1
@@ -399,6 +411,7 @@ add_test(NAME larch2_ml_score_ua_edge_sample
          COMMAND larch2
                  --dag-pb data/test_5_trees/tree_0.pb.gz
                  --sample-method ml
+                 --sample-uniformly
                  --score-ua-edge-ml
                  --model-dir data/bcr
                  --model-name ThriftyHumV0.2-45

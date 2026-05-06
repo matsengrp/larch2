@@ -6,6 +6,8 @@
 #include <larch/rs_fivemer_model.hpp>
 #include <larch/subtree_weight.hpp>
 
+#include "test_util.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -17,6 +19,7 @@
 #include <string_view>
 #include <utility>
 #include <variant>
+#include <vector>
 
 using namespace larch;
 
@@ -67,8 +70,12 @@ static typename Ops::weight_type manual_edge_sum(phylo_dag& d,
   return total;
 }
 
+static std::string bcr_data_dir() {
+  return larch::test::source_path_string("data/bcr");
+}
+
 static ml_model const& thrifty_model() {
-  static ml_model model = load_ml_model("data/bcr", "ThriftyHumV0.2-45");
+  static ml_model model = load_ml_model(bcr_data_dir(), "ThriftyHumV0.2-45");
   return model;
 }
 
@@ -254,20 +261,24 @@ void test_reconstruct_sequence() {
   auto ua_seq = reconstruct_sequence(tree, ua_idx, ref);
   assert(ua_seq == ref);
 
-  // Spot-check an inner node (i1: A→T at pos 0).
-  // i1 is at index 2 (ua=0, root=1, i1=2).
-  auto i1_seq = reconstruct_sequence(tree, 2, ref);
+  // Spot-check an inner node (i1: A→T at pos 0), found by sequence rather
+  // than insertion-order index.
+  auto i1_idx = larch::test::find_inner_node_by_sequence(
+      tree, "TCGTACGTACGTACGTACGT");
+  auto i1_seq = reconstruct_sequence(tree, i1_idx, ref);
   assert(i1_seq == "TCGTACGTACGTACGTACGT");
 
-  // Spot-check a leaf (L4: T→C at pos 11, T→C at pos 15).
-  auto l4_seq = reconstruct_sequence(tree, 7, ref);
+  // Spot-check a leaf (L4: T→C at pos 11, T→C at pos 15), also found by
+  // sequence.
+  auto l4_idx = larch::test::find_leaf_by_sample_id(tree, "L4");
+  auto l4_seq = reconstruct_sequence(tree, l4_idx, ref);
   assert(l4_seq == "ACGTACGTACGCACGCACGT");
 
   std::println("  reconstruct_sequence: OK");
 }
 
 void test_edge_scoring() {
-  auto model = rs_fivemer_model::load("data/bcr", "s5f");
+  auto model = rs_fivemer_model::load(bcr_data_dir(), "s5f");
   auto tree = make_test_tree();
   auto const& ref = get_reference_sequence(tree);
 
@@ -299,7 +310,7 @@ void test_edge_scoring() {
 }
 
 void test_likelihood_score_ops_ua_edge_behavior() {
-  auto model = rs_fivemer_model::load("data/bcr", "s5f");
+  auto model = rs_fivemer_model::load(bcr_data_dir(), "s5f");
   auto tree = make_test_tree();
 
   // Make UA->root a mutated edge.  Generic likelihood_score_ops should ignore
@@ -344,7 +355,7 @@ void test_likelihood_score_ops_ua_edge_behavior() {
 }
 
 void test_subtree_weight_matches_manual() {
-  auto model = rs_fivemer_model::load("data/bcr", "s5f");
+  auto model = rs_fivemer_model::load(bcr_data_dir(), "s5f");
   auto tree = make_test_tree();
   auto const& ref = get_reference_sequence(tree);
 
@@ -369,7 +380,7 @@ void test_subtree_weight_matches_manual() {
 }
 
 void test_ml_score_vs_parsimony() {
-  auto model = rs_fivemer_model::load("data/bcr", "s5f");
+  auto model = rs_fivemer_model::load(bcr_data_dir(), "s5f");
   auto tree = make_test_tree();
   auto const& ref = get_reference_sequence(tree);
 
@@ -445,6 +456,28 @@ static std::string selected_alternative_sequence(phylo_dag& sampled,
   return chosen_alt_seq;
 }
 
+static std::string selected_leaf_sequence(phylo_dag& sampled,
+                                          std::string_view alt1,
+                                          std::string_view alt2) {
+  std::string chosen_seq;
+  std::size_t chosen_count = 0;
+  for (auto nv : sampled.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.sample_id(); }) {
+            auto seq = larch::test::node_sequence(sampled, node.index());
+            if (seq == alt1 || seq == alt2) {
+              chosen_seq = std::move(seq);
+              ++chosen_count;
+            }
+          }
+        },
+        nv);
+  }
+  assert(chosen_count == 1);
+  return chosen_seq;
+}
+
 static std::size_t first_mutated_non_ua_edge(phylo_dag& tree) {
   std::size_t edge_idx = 0;
   bool found = false;
@@ -464,7 +497,7 @@ static std::size_t first_mutated_non_ua_edge(phylo_dag& tree) {
 }
 
 void test_min_weight_sample_tree() {
-  auto model = rs_fivemer_model::load("data/bcr", "s5f");
+  auto model = rs_fivemer_model::load(bcr_data_dir(), "s5f");
   auto tree = make_test_tree();
   auto const& ref = get_reference_sequence(tree);
 
@@ -517,6 +550,39 @@ void test_likelihood_score_ops_relative_tie_selection() {
   assert(outside_sw.min_weight_count(root_idx, outside_ops) == bigint{1});
 
   std::println("  likelihood_score_ops relative tie selection: OK");
+}
+
+void test_likelihood_score_ops_uniform_tie_sampling_balance() {
+  auto dag = make_two_alternative_ml_tie_dag();
+  auto const& ref = get_reference_sequence(dag);
+  two_alt_nll_model model{.alt1_nll = 7.0, .alt2_nll = 7.0};
+  likelihood_score_ops ops{.model = model, .reference = ref};
+  subtree_weight<likelihood_score_ops<two_alt_nll_model>> sw{dag, 8675309u};
+
+  auto root_idx = get_root_idx(dag);
+  assert(sw.min_weight_count(root_idx, ops) == bigint{2});
+
+  int alt1_count = 0;
+  int alt2_count = 0;
+  constexpr int trials = 2000;
+  for (int i = 0; i < trials; ++i) {
+    auto sampled = sw.min_weight_uniform_sample_tree(ops);
+    auto chosen = selected_leaf_sequence(sampled, "CAAA", "ACAA");
+    if (chosen == "CAAA")
+      ++alt1_count;
+    else if (chosen == "ACAA")
+      ++alt2_count;
+    else
+      assert(false && "unexpected ML sampled alternative");
+  }
+
+  assert(alt1_count + alt2_count == trials);
+  assert(alt1_count > trials * 0.4 && alt1_count < trials * 0.6);
+  assert(alt2_count > trials * 0.4 && alt2_count < trials * 0.6);
+
+  std::println("  likelihood_score_ops uniform tie sampling: OK "
+               "(alt1={}, alt2={})",
+               alt1_count, alt2_count);
 }
 
 void test_ml_model_likelihood_score_ops_thrifty() {
@@ -865,6 +931,7 @@ int main() {
   test_min_weight_sample_tree();
   test_likelihood_score_ops_exact_tie_selection();
   test_likelihood_score_ops_relative_tie_selection();
+  test_likelihood_score_ops_uniform_tie_sampling_balance();
   test_ml_model_likelihood_score_ops_thrifty();
   test_ml_model_likelihood_score_ops_ua_edge_behavior();
   test_ml_model_likelihood_score_ops_cache_reuse();
