@@ -234,6 +234,76 @@ set_tests_properties(dagutil_ml_sample_validate
                      FIXTURES_REQUIRED dagutil_ml_sample_fixture
                      PASS_REGULAR_EXPRESSION "tree_count: 1")
 
+# dagutil ML edge-penalty CLI smoke test: write ML penalties to edge_weight,
+# reload them, and sample a zero-penalty min-ML tree via edge-weight sampling.
+set(DAGUTIL_EDGE_ML_SCORED_OUT
+    "${CMAKE_BINARY_DIR}/dagutil_edge_ml_scored.pb.gz")
+set(DAGUTIL_EDGE_ML_SAMPLE_OUT
+    "${CMAKE_BINARY_DIR}/dagutil_edge_ml_sample.pb.gz")
+add_test(NAME dagutil_edge_ml_score
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --dag-pb data/test_5_trees/tree_1.pb.gz
+                 --force-no-vcf
+                 --edge-ml
+                 --model-dir data/bcr
+                 --model-name ThriftyHumV0.2-45
+                 --seed 1
+                 -o ${DAGUTIL_EDGE_ML_SCORED_OUT}
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_edge_ml_score
+                     PROPERTIES
+                     FIXTURES_SETUP dagutil_edge_ml_fixture
+                     PASS_REGULAR_EXPRESSION
+                     "edge_ml: global_min=.*nonzero_penalty=[1-9]")
+add_test(NAME dagutil_edge_ml_missing_model_fails
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --edge-ml
+                 -o ${CMAKE_BINARY_DIR}/dagutil_edge_ml_missing_model.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_edge_ml_missing_model_fails
+                     PROPERTIES WILL_FAIL TRUE)
+add_test(NAME dagutil_edge_ml_with_sample_fails
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --edge-ml
+                 --model-dir data/bcr
+                 --model-name ThriftyHumV0.2-45
+                 --sample
+                 --sample-method edge-weight
+                 -o ${CMAKE_BINARY_DIR}/dagutil_edge_ml_with_sample.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_edge_ml_with_sample_fails
+                     PROPERTIES WILL_FAIL TRUE)
+add_test(NAME dagutil_edge_ml_sample
+         COMMAND dagutil
+                 --dag-pb ${DAGUTIL_EDGE_ML_SCORED_OUT}
+                 --force-no-vcf
+                 --sample
+                 --sample-method edge-weight
+                 --seed 1
+                 -o ${DAGUTIL_EDGE_ML_SAMPLE_OUT}
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_edge_ml_sample
+                     PROPERTIES
+                     FIXTURES_REQUIRED dagutil_edge_ml_fixture
+                     FIXTURES_SETUP dagutil_edge_ml_sample_fixture
+                     PASS_REGULAR_EXPRESSION "edge_weight_min=0.000000")
+add_test(NAME dagutil_edge_ml_sample_validate
+         COMMAND dagutil
+                 --dag-pb ${DAGUTIL_EDGE_ML_SAMPLE_OUT}
+                 --force-no-vcf
+                 --validate
+                 --dag-info
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_edge_ml_sample_validate
+                     PROPERTIES
+                     FIXTURES_REQUIRED dagutil_edge_ml_sample_fixture
+                     PASS_REGULAR_EXPRESSION "tree_count: 1")
+
 # dagutil stored edge_weight CLI smoke test: write edge penalties, reload them,
 # and sample a min-edge-weight tree.
 set(DAGUTIL_EDGE_WEIGHT_SCORED_OUT

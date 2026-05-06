@@ -206,7 +206,9 @@ times. All loaded inputs are merged into a single DAG.
 
 `--sample-method` is used for `--sample` tree extraction. With `--trim --rf
 --sample`, the RF criterion comes from `--rf`, so `--sample-method` should be
-omitted.
+omitted. The `--ignore-ua-edge-ml` / `--score-ua-edge-ml` setting also applies
+to `--edge-ml`. `--edge-ml` writes penalties to an output DAG and cannot be
+combined with `--trim` or `--sample`; run sampling/trimming as a second command.
 
 ### Analysis
 
@@ -215,6 +217,8 @@ omitted.
 | `--dag-info` | Print all DAG statistics (tree count, parsimony, RF) |
 | `--parsimony` | Print parsimony score distribution |
 | `--sum-rf-distance` | Print sum RF distance distribution |
+| `--edge-parsimony` | Store per-edge global parsimony penalties in protobuf `edge_weight` |
+| `--edge-ml` | Store per-edge global ML-NLL penalties in protobuf `edge_weight` (requires model args) |
 | `--validate` | Validate DAG invariants |
 
 ### Examples
@@ -251,10 +255,15 @@ dagutil --dag-pb input.pb.gz --force-no-vcf --sample \
     -o sampled-thrifty.pb.gz
 ```
 
-Extract a tree minimizing stored protobuf `edge_weight` values:
+Compute per-edge Thrifty/ML penalties and then extract a tree minimizing the
+stored penalties:
 
 ```sh
-dagutil --dag-pb scored.pb.gz --force-no-vcf --sample \
+dagutil --dag-pb input.pb.gz --force-no-vcf --edge-ml \
+    --model-dir data/bcr --model-name ThriftyHumV0.2-45 \
+    -o ml-edge-penalties.pb.gz
+
+dagutil --dag-pb ml-edge-penalties.pb.gz --force-no-vcf --sample \
     --sample-method edge-weight -o sampled-edge-weight.pb.gz
 ```
 

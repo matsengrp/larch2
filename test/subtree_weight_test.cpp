@@ -606,6 +606,35 @@ static void test_edge_weight_score_ops_selects_min_alternative() {
   std::println("  PASS");
 }
 
+static void test_edge_weight_min_global_scores() {
+  std::println("test_edge_weight_min_global_scores");
+
+  auto dag = make_edge_weight_alternative_dag();
+  auto root_idx = std::visit([](auto n) { return n.index(); }, dag.get_root());
+  larch::edge_weight_score_ops ops;
+  larch::subtree_weight<larch::edge_weight_score_ops> sw(dag, 42u);
+
+  auto global_min = sw.compute_weight_below(root_idx, ops);
+  auto scores = sw.compute_edge_min_global_scores(ops);
+  assert(std::abs(global_min - 3.5) < 1e-10);
+
+  for (auto ev : dag.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          auto eidx = edge.index();
+          assert(scores[eidx] + 1e-10 >= global_min);
+          if (edge.edge_weight() < 2.0f) {
+            assert(std::abs(scores[eidx] - 3.5) < 1e-10);
+          } else {
+            assert(std::abs(scores[eidx] - 30.5) < 1e-10);
+          }
+        },
+        ev);
+  }
+
+  std::println("  PASS");
+}
+
 static void test_edge_weight_round_trip_and_merge() {
   std::println("test_edge_weight_round_trip_and_merge");
 
@@ -708,6 +737,7 @@ int main() {
   test_edge_parsimony_rerooting_identity();
   test_edge_parsimony_exhaustive_ground_truth();
   test_edge_weight_score_ops_selects_min_alternative();
+  test_edge_weight_min_global_scores();
   test_edge_weight_round_trip_and_merge();
   test_edge_parsimony_round_trip();
 

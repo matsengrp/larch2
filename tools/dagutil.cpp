@@ -16,6 +16,7 @@
 #include <larch/io_util.hpp>
 #include <larch/newick.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -212,6 +213,7 @@ Analysis:
   --parsimony             Print parsimony score distribution
   --sum-rf-distance       Print sum RF distance distribution
   --edge-parsimony        Compute per-edge parsimony penalties (store in output)
+  --edge-ml               Compute per-edge ML penalties (store in output)
 
 Debugging:
   --validate              Validate DAG invariants
@@ -245,6 +247,7 @@ struct args {
   bool print_parsimony = false;
   bool print_rf_distance = false;
   bool edge_parsimony = false;
+  bool edge_ml = false;
   bool validate = false;
 };
 
@@ -308,6 +311,8 @@ static args parse_args(int argc, char** argv) {
       a.print_rf_distance = true;
     } else if (arg == "--edge-parsimony")
       a.edge_parsimony = true;
+    else if (arg == "--edge-ml" || arg == "--edge-thrifty")
+      a.edge_ml = true;
     else if (arg == "--validate")
       a.validate = true;
     else if (arg == "--version") {
@@ -381,6 +386,20 @@ static args parse_args(int argc, char** argv) {
     std::cerr << "error: --model-dir and --model-name required with "
                  "--sample-method "
               << a.sample_method << "\n";
+    std::exit(1);
+  }
+  if (a.edge_parsimony && a.edge_ml) {
+    std::cerr << "error: choose only one of --edge-parsimony or --edge-ml\n";
+    std::exit(1);
+  }
+  if (a.edge_ml && (a.trim || a.sample)) {
+    std::cerr << "error: --edge-ml cannot be combined with --trim or "
+                 "--sample; write ML penalties to an output DAG first, then "
+                 "run sampling/trimming in a second command\n";
+    std::exit(1);
+  }
+  if (a.edge_ml && (a.model_dir.empty() || a.model_name.empty())) {
+    std::cerr << "error: --model-dir and --model-name required with --edge-ml\n";
     std::exit(1);
   }
 
@@ -508,7 +527,7 @@ int main(int argc, char** argv) try {
     }
   }
 
-  // ---- Edge parsimony ----
+  // ---- Per-edge global penalties ----
   std::vector<float> edge_penalties;
   if (a.edge_parsimony && (a.trim || a.sample))
     std::cerr << "warning: --edge-parsimony scores are not written when "
@@ -521,26 +540,98 @@ int main(int argc, char** argv) try {
     auto global_min = sw.compute_weight_below(root_idx, pops);
     auto scores = sw.compute_edge_min_global_scores(pops);
 
-    // Convert to penalties (float)
-    edge_penalties.resize(scores.size());
+    // Convert to penalties (float), preserving edge-index addressing for
+    // save_proto_dag() while reporting counts over live edges only.
+    edge_penalties.assign(scores.size(), 0.0f);
     std::size_t zero_penalty = 0;
     std::size_t nonzero_penalty = 0;
     std::size_t max_penalty = 0;
-    for (std::size_t i = 0; i < scores.size(); ++i) {
-      assert(scores[i] >= global_min);
-      auto penalty = scores[i] - global_min;
-      edge_penalties[i] = static_cast<float>(penalty);
-      if (penalty == 0)
-        ++zero_penalty;
-      else
-        ++nonzero_penalty;
-      if (penalty > max_penalty) max_penalty = penalty;
+    for (auto ev : result.get_all_edges()) {
+      std::visit(
+          [&](auto edge) {
+            auto i = edge.index();
+            assert(scores[i] >= global_min);
+            auto penalty = scores[i] - global_min;
+            edge_penalties[i] = static_cast<float>(penalty);
+            if (penalty == 0)
+              ++zero_penalty;
+            else
+              ++nonzero_penalty;
+            if (penalty > max_penalty) max_penalty = penalty;
+          },
+          ev);
     }
 
     std::cerr << "edge_parsimony: global_min=" << global_min
-              << " edges=" << scores.size() << " zero_penalty=" << zero_penalty
+              << " edges=" << edge_count(result)
+              << " zero_penalty=" << zero_penalty
               << " nonzero_penalty=" << nonzero_penalty
               << " max_penalty=" << max_penalty << "\n";
+  }
+  if (a.edge_ml) {
+    scoped_arena<4096> arena;
+    auto* mr = arena.get();
+
+    std::cerr << "Loading ML model " << a.model_name << "...\n";
+    auto model = load_ml_model(a.model_dir, a.model_name);
+    std::cerr << "  ML model loaded\n";
+
+    auto const& ml_ref = get_reference_sequence(result);
+    ml_model_likelihood_score_ops ml_ops{.model = model,
+                                         .reference = ml_ref,
+                                         .ignore_ua_edge =
+                                             a.ignore_ua_edge_ml};
+    subtree_weight<ml_model_likelihood_score_ops> sw(result, a.seed, mr);
+    auto global_min = sw.compute_weight_below(root_idx, ml_ops);
+    if (!std::isfinite(global_min)) {
+      std::cerr << "error: non-finite edge-ML global minimum\n";
+      std::exit(1);
+    }
+    auto scores = sw.compute_edge_min_global_scores(ml_ops);
+
+    // Convert to penalties (float).  Treat tiny negative/positive deviations
+    // around zero as floating-point noise so globally optimal edges round to 0.
+    double eps = 1e-8 * std::max(1.0, std::abs(global_min));
+    edge_penalties.assign(scores.size(), 0.0f);
+    std::size_t zero_penalty = 0;
+    std::size_t nonzero_penalty = 0;
+    double max_penalty = 0.0;
+    for (auto ev : result.get_all_edges()) {
+      std::visit(
+          [&](auto edge) {
+            auto i = edge.index();
+            if (!std::isfinite(scores[i])) {
+              std::cerr << "error: non-finite edge-ML score at edge " << i
+                        << "\n";
+              std::exit(1);
+            }
+            double penalty = scores[i] - global_min;
+            if (penalty < 0.0 && penalty >= -eps) penalty = 0.0;
+            if (penalty < 0.0) {
+              std::cerr << "error: edge-ML score below global minimum at edge "
+                        << i << " (score=" << scores[i]
+                        << ", global_min=" << global_min << ")\n";
+              std::exit(1);
+            }
+            if (penalty <= eps) penalty = 0.0;
+            edge_penalties[i] = static_cast<float>(penalty);
+            if (penalty == 0.0)
+              ++zero_penalty;
+            else
+              ++nonzero_penalty;
+            if (penalty > max_penalty) max_penalty = penalty;
+          },
+          ev);
+    }
+
+    std::cerr << "edge_ml: global_min=" << std::fixed << std::setprecision(6)
+              << global_min << " edges=" << edge_count(result)
+              << " zero_penalty=" << zero_penalty
+              << " nonzero_penalty=" << nonzero_penalty
+              << " max_penalty=" << max_penalty
+              << (a.ignore_ua_edge_ml ? " (UA edge ignored)"
+                                      : " (UA edge scored)")
+              << "\n";
   }
 
   // ---- Output ----
@@ -548,7 +639,7 @@ int main(int argc, char** argv) try {
     scoped_arena<4096> arena;
     auto* mr = arena.get();
 
-    if (a.edge_parsimony && !a.trim && !a.sample) {
+    if ((a.edge_parsimony || a.edge_ml) && !a.trim && !a.sample) {
       save_proto_dag(result, a.output, edge_penalties);
     } else if (a.trim) {
       if (a.rf.empty()) {

@@ -604,6 +604,101 @@ void test_ml_model_likelihood_score_ops_deterministic_repeated_sampling() {
                score1, chosen1);
 }
 
+void test_ml_model_edge_min_global_scores_single_tree() {
+  auto const& model = thrifty_model();
+  auto tree = make_test_tree();
+  auto const& ref = get_reference_sequence(tree);
+  ml_model_likelihood_score_ops ops{.model = model, .reference = ref};
+
+  auto close = [](double lhs, double rhs) {
+    return std::abs(lhs - rhs) <=
+           1e-8 * std::max({1.0, std::abs(lhs), std::abs(rhs)});
+  };
+
+  subtree_weight<ml_model_likelihood_score_ops> sw{tree, 42u};
+  double global_min = sw.compute_weight_below(get_root_idx(tree), ops);
+  auto scores = sw.compute_edge_min_global_scores(ops);
+  assert(std::isfinite(global_min));
+
+  for (auto ev : tree.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          assert(std::isfinite(scores[edge.index()]));
+          assert(close(scores[edge.index()], global_min));
+        },
+        ev);
+  }
+
+  std::println("  ml_model edge min global scores single tree: OK "
+               "(global={:.6f})",
+               global_min);
+}
+
+void test_ml_model_edge_min_global_scores() {
+  auto const& model = thrifty_model();
+  auto fixture = make_alternative_dag();
+  auto& dag = fixture.dag;
+  auto const& ref = get_reference_sequence(dag);
+  ml_model_likelihood_score_ops ops{.model = model, .reference = ref};
+
+  double alt1_score = ops.compute_edge(dag, fixture.root_alt1_edge) +
+                      ops.compute_edge(dag, fixture.alt1_l1_edge) +
+                      ops.compute_edge(dag, fixture.alt1_l2_edge);
+  double alt2_score = ops.compute_edge(dag, fixture.root_alt2_edge) +
+                      ops.compute_edge(dag, fixture.alt2_l1_edge) +
+                      ops.compute_edge(dag, fixture.alt2_l2_edge);
+  double expected = std::min(alt1_score, alt2_score);
+
+  auto close = [](double lhs, double rhs) {
+    return std::abs(lhs - rhs) <=
+           1e-8 * std::max({1.0, std::abs(lhs), std::abs(rhs)});
+  };
+
+  subtree_weight<ml_model_likelihood_score_ops> sw{dag, 42u};
+  double global_min = sw.compute_weight_below(get_root_idx(dag), ops);
+  auto scores = sw.compute_edge_min_global_scores(ops);
+  assert(close(global_min, expected));
+
+  for (auto ev : dag.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          auto score = scores[edge.index()];
+          assert(std::isfinite(score));
+          assert(score + 1e-8 * std::max(1.0, std::abs(global_min)) >=
+                 global_min);
+        },
+        ev);
+  }
+
+  assert(close(scores[fixture.root_alt1_edge], alt1_score));
+  assert(close(scores[fixture.alt1_l1_edge], alt1_score));
+  assert(close(scores[fixture.alt1_l2_edge], alt1_score));
+  assert(close(scores[fixture.root_alt2_edge], alt2_score));
+  assert(close(scores[fixture.alt2_l1_edge], alt2_score));
+  assert(close(scores[fixture.alt2_l2_edge], alt2_score));
+
+  constexpr double eps = 1e-8;
+  if (alt1_score + eps < alt2_score) {
+    assert(close(scores[fixture.root_alt1_edge], global_min));
+    assert(scores[fixture.root_alt2_edge] - global_min > eps);
+  } else if (alt2_score + eps < alt1_score) {
+    assert(close(scores[fixture.root_alt2_edge], global_min));
+    assert(scores[fixture.root_alt1_edge] - global_min > eps);
+  }
+
+  auto sampled = sw.min_weight_sample_tree(ops);
+  auto chosen = selected_alternative_sequence(sampled, ref, fixture.alt1_seq,
+                                              fixture.alt2_seq);
+  if (chosen == fixture.alt1_seq)
+    assert(close(scores[fixture.root_alt1_edge], global_min));
+  else
+    assert(close(scores[fixture.root_alt2_edge], global_min));
+
+  std::println("  ml_model edge min global scores: OK "
+               "(global={:.6f}, alt1={:.6f}, alt2={:.6f})",
+               global_min, alt1_score, alt2_score);
+}
+
 void test_ml_model_likelihood_score_ops_selects_min_alternative() {
   auto const& model = thrifty_model();
   auto fixture = make_alternative_dag();
@@ -670,6 +765,8 @@ int main() {
   test_ml_model_likelihood_score_ops_cache_reuse();
   test_ml_model_likelihood_score_ops_cache_switches_dags();
   test_ml_model_likelihood_score_ops_deterministic_repeated_sampling();
+  test_ml_model_edge_min_global_scores_single_tree();
+  test_ml_model_edge_min_global_scores();
   test_ml_model_likelihood_score_ops_selects_min_alternative();
   std::println("All nn_ml_spr tests passed");
 }
