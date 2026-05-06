@@ -2,8 +2,10 @@
 
 #include <larch/phylo_dag.hpp>
 #include <larch/compute.hpp>
+#include <larch/tie_tolerance.hpp>
 
-#include <limits>
+#include <algorithm>
+#include <cassert>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -52,6 +54,10 @@ struct likelihood_score_cache {
   }
 
   void ensure_for(phylo_dag& d) const {
+    // Only the DAG object address is tracked here.  In-place mutations, model
+    // state changes, scoring-option changes, or destruction/reuse of another
+    // DAG at the same address are not detectable; callers reusing an ops
+    // object across those boundaries must call clear_cache().
     if (dag != &d) {
       dag = &d;
       sequences.clear();
@@ -92,13 +98,20 @@ struct likelihood_score_cache {
   }
 };
 
+template <typename Model>
+inline double model_log_likelihood(Model const& model, std::string_view parent,
+                                   std::string_view child) {
+  return model.log_likelihood(parent, child);
+}
+
 // WeightOps for maximum-likelihood tree scoring using a neural network model.
 // Weight = negative log-likelihood (lower = better, matching parsimony
 // semantics where min weight = optimal tree).
 //
-// Model must provide: double log_likelihood(string_view parent, string_view
-// child).  The artificial UA->root edge is ignored by default; set
-// ignore_ua_edge=false to score it.
+// Model must provide double log_likelihood(string_view parent, string_view
+// child), or a model_log_likelihood(model, parent, child) overload.  The
+// artificial UA->root edge is ignored by default; set ignore_ua_edge=false to
+// score it.
 template <typename Model>
 struct likelihood_score_ops {
   using weight_type = double;
@@ -141,7 +154,7 @@ struct likelihood_score_ops {
               cache.sequence_for(dag, parent_idx, reference);
           auto const& child_seq = cache.sequence_for(dag, child_idx, reference);
 
-          return -model.log_likelihood(parent_seq, child_seq);
+          return -model_log_likelihood(model, parent_seq, child_seq);
         },
         ev);
     cached = score;
@@ -150,11 +163,11 @@ struct likelihood_score_ops {
 
   std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
       std::vector<weight_type> const& weights) const {
-    double best = std::numeric_limits<double>::max();
-    for (auto w : weights) best = std::min(best, w);
+    assert(!weights.empty());
+    double best = *std::min_element(weights.begin(), weights.end());
     std::vector<std::size_t> indices;
     for (std::size_t i = 0; i < weights.size(); ++i)
-      if (weights[i] <= best + 1e-10) indices.push_back(i);
+      if (within_min_weight_tie(weights[i], best)) indices.push_back(i);
     return {best, indices};
   }
 

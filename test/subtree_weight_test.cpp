@@ -103,6 +103,34 @@ static larch::phylo_dag make_edge_weight_alternative_dag() {
   return d;
 }
 
+static larch::phylo_dag make_edge_weight_tie_dag() {
+  constexpr std::string_view ref = "AAAA";
+  larch::phylo_dag d;
+
+  auto ua = d.append_node<larch::node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto root = d.append_node<larch::node_kind::inner>();
+  root.cg() = cg_from_sequence("AAAA", ref);
+
+  auto alt1 = d.append_node<larch::node_kind::leaf>();
+  alt1.cg() = cg_from_sequence("CAAA", ref);
+  alt1.sample_id() = "L";
+
+  auto alt2 = d.append_node<larch::node_kind::leaf>();
+  alt2.cg() = cg_from_sequence("ACAA", ref);
+  alt2.sample_id() = "L";
+
+  add_weighted_edge(d, ua.index(), root.index(), 0, 0.5f);
+  add_weighted_edge(d, root.index(), alt1.index(), 0, 1.0f);
+  add_weighted_edge(d, root.index(), alt2.index(), 0, 1.0f);
+
+  larch::recompute_edge_mutations(d);
+  larch::build_clade_offsets(d);
+  return d;
+}
+
 static double sum_edge_weights(larch::phylo_dag& d) {
   double total = 0.0;
   for (auto ev : d.get_all_edges())
@@ -606,6 +634,21 @@ static void test_edge_weight_score_ops_selects_min_alternative() {
   std::println("  PASS");
 }
 
+static void test_edge_weight_score_ops_tie_selection() {
+  std::println("test_edge_weight_score_ops_tie_selection");
+
+  auto dag = make_edge_weight_tie_dag();
+  auto root_idx = std::visit([](auto n) { return n.index(); }, dag.get_root());
+  larch::edge_weight_score_ops ops;
+  larch::subtree_weight<larch::edge_weight_score_ops> sw(dag, 42u);
+
+  auto score = sw.compute_weight_below(root_idx, ops);
+  assert(std::abs(score - 1.5) < 1e-10);
+  assert(sw.min_weight_count(root_idx, ops) == larch::bigint{2});
+
+  std::println("  PASS");
+}
+
 static void test_edge_weight_min_global_scores() {
   std::println("test_edge_weight_min_global_scores");
 
@@ -737,6 +780,7 @@ int main() {
   test_edge_parsimony_rerooting_identity();
   test_edge_parsimony_exhaustive_ground_truth();
   test_edge_weight_score_ops_selects_min_alternative();
+  test_edge_weight_score_ops_tie_selection();
   test_edge_weight_min_global_scores();
   test_edge_weight_round_trip_and_merge();
   test_edge_parsimony_round_trip();

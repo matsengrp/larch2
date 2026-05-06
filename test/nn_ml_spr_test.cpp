@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <map>
 #include <print>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -69,6 +70,45 @@ static typename Ops::weight_type manual_edge_sum(phylo_dag& d,
 static ml_model const& thrifty_model() {
   static ml_model model = load_ml_model("data/bcr", "ThriftyHumV0.2-45");
   return model;
+}
+
+struct two_alt_nll_model {
+  double alt1_nll = 1.0;
+  double alt2_nll = 1.0;
+
+  double log_likelihood(std::string_view /*parent*/,
+                        std::string_view child) const {
+    if (child == "CAAA") return -alt1_nll;
+    if (child == "ACAA") return -alt2_nll;
+    throw std::runtime_error{"two_alt_nll_model: unexpected child sequence"};
+  }
+};
+
+static phylo_dag make_two_alternative_ml_tie_dag() {
+  constexpr std::string_view ref = "AAAA";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto root = d.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("AAAA", ref);
+
+  auto alt1 = d.append_node<node_kind::leaf>();
+  alt1.cg() = cg_from_sequence("CAAA", ref);
+  alt1.sample_id() = "L";
+
+  auto alt2 = d.append_node<node_kind::leaf>();
+  alt2.cg() = cg_from_sequence("ACAA", ref);
+  alt2.sample_id() = "L";
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), alt1.index(), 0);
+  add_edge(d, root.index(), alt2.index(), 0);
+
+  recompute_edge_mutations(d);
+  return d;
 }
 
 // Build a 4-leaf tree with 20-base sequences.
@@ -439,6 +479,46 @@ void test_min_weight_sample_tree() {
   std::println("  min_weight_sample_tree: OK");
 }
 
+void test_likelihood_score_ops_exact_tie_selection() {
+  auto dag = make_two_alternative_ml_tie_dag();
+  auto const& ref = get_reference_sequence(dag);
+  two_alt_nll_model model{.alt1_nll = 7.0, .alt2_nll = 7.0};
+  likelihood_score_ops ops{.model = model, .reference = ref};
+  subtree_weight<likelihood_score_ops<two_alt_nll_model>> sw{dag, 42u};
+
+  auto root_idx = get_root_idx(dag);
+  double score = sw.compute_weight_below(root_idx, ops);
+  assert(std::abs(score - 7.0) < 1e-12);
+  assert(sw.min_weight_count(root_idx, ops) == bigint{2});
+
+  std::println("  likelihood_score_ops exact tie selection: OK");
+}
+
+void test_likelihood_score_ops_relative_tie_selection() {
+  auto dag = make_two_alternative_ml_tie_dag();
+  auto const& ref = get_reference_sequence(dag);
+  double best = 1000000.0;
+  double tol = min_weight_tie_tolerance(best);
+  two_alt_nll_model model{.alt1_nll = best, .alt2_nll = best + 0.5 * tol};
+  likelihood_score_ops ops{.model = model, .reference = ref};
+  subtree_weight<likelihood_score_ops<two_alt_nll_model>> sw{dag, 42u};
+
+  auto root_idx = get_root_idx(dag);
+  double score = sw.compute_weight_below(root_idx, ops);
+  assert(std::abs(score - best) < 1e-12);
+  assert(sw.min_weight_count(root_idx, ops) == bigint{2});
+
+  two_alt_nll_model outside_model{.alt1_nll = best,
+                                  .alt2_nll = best + 2.0 * tol};
+  likelihood_score_ops outside_ops{.model = outside_model, .reference = ref};
+  subtree_weight<likelihood_score_ops<two_alt_nll_model>> outside_sw{dag, 42u};
+  double outside_score = outside_sw.compute_weight_below(root_idx, outside_ops);
+  assert(std::abs(outside_score - best) < 1e-12);
+  assert(outside_sw.min_weight_count(root_idx, outside_ops) == bigint{1});
+
+  std::println("  likelihood_score_ops relative tie selection: OK");
+}
+
 void test_ml_model_likelihood_score_ops_thrifty() {
   auto const& model = thrifty_model();
   assert(std::holds_alternative<indep_rs_cnn_model>(model));
@@ -542,6 +622,29 @@ void test_ml_model_likelihood_score_ops_cache_reuse() {
   std::println("  ml_model_likelihood_score_ops cache reuse: OK "
                "(edge score={:.6f})",
                first);
+}
+
+void test_compute_dag_ml_nll_reuses_ops_cache() {
+  auto const& model = thrifty_model();
+  auto tree = make_test_tree();
+  auto const& ref = get_reference_sequence(tree);
+  ml_model_likelihood_score_ops ops{.model = model, .reference = ref};
+
+  double first = compute_dag_ml_nll(tree, ops);
+  auto cached_edges = ops.cached_edge_score_count();
+  auto cached_sequences = ops.cached_sequence_count();
+  assert(std::isfinite(first));
+  assert(cached_edges > 0);
+  assert(cached_sequences > 0);
+
+  double second = compute_dag_ml_nll(tree, ops);
+  assert(std::abs(second - first) < 1e-12);
+  assert(ops.cached_edge_score_count() == cached_edges);
+  assert(ops.cached_sequence_count() == cached_sequences);
+
+  std::println("  compute_dag_ml_nll ops-cache reuse: OK "
+               "(NLL={:.6f}, cached_edges={})",
+               first, cached_edges);
 }
 
 void test_ml_model_likelihood_score_ops_cache_switches_dags() {
@@ -760,9 +863,12 @@ int main() {
   test_subtree_weight_matches_manual();
   test_ml_score_vs_parsimony();
   test_min_weight_sample_tree();
+  test_likelihood_score_ops_exact_tie_selection();
+  test_likelihood_score_ops_relative_tie_selection();
   test_ml_model_likelihood_score_ops_thrifty();
   test_ml_model_likelihood_score_ops_ua_edge_behavior();
   test_ml_model_likelihood_score_ops_cache_reuse();
+  test_compute_dag_ml_nll_reuses_ops_cache();
   test_ml_model_likelihood_score_ops_cache_switches_dags();
   test_ml_model_likelihood_score_ops_deterministic_repeated_sampling();
   test_ml_model_edge_min_global_scores_single_tree();

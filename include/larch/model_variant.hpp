@@ -7,16 +7,12 @@
 #include <larch/spr_move.hpp>
 #include <larch/yaml_reader.hpp>
 
-#include <algorithm>
 #include <cmath>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_set>
-#include <utility>
 #include <variant>
-#include <vector>
 
 namespace larch {
 
@@ -35,89 +31,41 @@ inline ml_model load_ml_model(std::string_view dir, std::string_view name) {
                             model_class};
 }
 
-// Compute log_likelihood through variant dispatch.
-inline double ml_log_likelihood(ml_model const& model, std::string_view parent,
-                                std::string_view child) {
+// Compute log_likelihood through variant dispatch.  This overload is picked up
+// by likelihood_score_ops<Model>'s model_log_likelihood() customization point.
+inline double model_log_likelihood(ml_model const& model,
+                                   std::string_view parent,
+                                   std::string_view child) {
   return std::visit(
       [&](auto const& m) { return m.log_likelihood(parent, child); }, model);
 }
 
-// WeightOps specialization for minimum-NLL tree sampling with an ml_model
-// variant.
-template <>
-struct likelihood_score_ops<ml_model> {
-  using weight_type = double;
-
-  ml_model const& model;
-  std::string const& reference;
-  bool ignore_ua_edge = true;
-  mutable likelihood_score_cache cache;
-
-  void clear_cache() const { cache.clear(); }
-
-  std::size_t cached_sequence_count() const {
-    return cache.cached_sequence_count();
-  }
-
-  std::size_t cached_edge_score_count() const {
-    return cache.cached_edge_score_count();
-  }
-
-  weight_type compute_leaf(phylo_dag& /*dag*/, std::size_t /*node_idx*/) const {
-    return 0.0;
-  }
-
-  weight_type compute_edge(phylo_dag& dag, std::size_t edge_idx) const {
-    auto parent_idx = get_parent_idx(dag, edge_idx);
-    if (ignore_ua_edge && is_ua(dag, parent_idx)) return 0.0;
-
-    auto& cached = cache.edge_score_slot(dag, edge_idx);
-    if (cached) return *cached;
-
-    auto ev = dag.get_edge(edge_idx);
-    double score = std::visit(
-        [&](auto edge) -> double {
-          if (edge.mutations().empty()) return 0.0;
-
-          auto child_idx = std::visit([](auto child) { return child.index(); },
-                                      edge.get_child());
-          auto const& parent_seq =
-              cache.sequence_for(dag, parent_idx, reference);
-          auto const& child_seq = cache.sequence_for(dag, child_idx, reference);
-
-          return -ml_log_likelihood(model, parent_seq, child_seq);
-        },
-        ev);
-    cached = score;
-    return score;
-  }
-
-  std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
-      std::vector<weight_type> const& weights) const {
-    double best = std::numeric_limits<double>::max();
-    for (auto w : weights) best = std::min(best, w);
-    std::vector<std::size_t> indices;
-    for (std::size_t i = 0; i < weights.size(); ++i)
-      if (weights[i] <= best + 1e-10) indices.push_back(i);
-    return {best, indices};
-  }
-
-  weight_type between_clades(std::vector<weight_type> const& weights) const {
-    double sum = 0.0;
-    for (auto w : weights) sum += w;
-    return sum;
-  }
-
-  weight_type above_node(weight_type edge_w, weight_type child_w) const {
-    return edge_w + child_w;
-  }
-};
+// Backward-compatible spelling used by older helpers/tests.
+inline double ml_log_likelihood(ml_model const& model, std::string_view parent,
+                                std::string_view child) {
+  return model_log_likelihood(model, parent, child);
+}
 
 using ml_model_likelihood_score_ops = likelihood_score_ops<ml_model>;
 
 // Adjust rate bias through variant dispatch.
 inline void ml_adjust_rate_bias(ml_model& model, double log_factor) {
   std::visit([&](auto& m) { m.adjust_rate_bias_by(log_factor); }, model);
+}
+
+// Compute total negative log-likelihood for all mutated edges in a DAG using
+// an existing likelihood ops/cache object.  The ops object must reference this
+// DAG's reference sequence and remain scoped to an immutable DAG/model/options
+// lifetime unless clear_cache() is called at mutation boundaries.
+inline double compute_dag_ml_nll(phylo_dag& dag,
+                                 ml_model_likelihood_score_ops const& ops) {
+  double total_nll = 0.0;
+  for (auto ev : dag.get_all_edges()) {
+    std::visit(
+        [&](auto edge) { total_nll += ops.compute_edge(dag, edge.index()); },
+        ev);
+  }
+  return total_nll;
 }
 
 // Compute total negative log-likelihood for all mutated edges in a DAG.
@@ -128,17 +76,11 @@ inline double compute_dag_ml_nll(ml_model const& model, phylo_dag& dag,
   ml_model_likelihood_score_ops ops{.model = model,
                                     .reference = ref,
                                     .ignore_ua_edge = ignore_ua_edge};
-  double total_nll = 0.0;
-  for (auto ev : dag.get_all_edges()) {
-    std::visit(
-        [&](auto edge) { total_nll += ops.compute_edge(dag, edge.index()); },
-        ev);
-  }
-  return total_nll;
+  return compute_dag_ml_nll(dag, ops);
 }
 
 // ============================================================================
-// Changed-edges-only delta LL scoring
+// ML edge and full-fragment delta scoring helpers
 // ============================================================================
 
 // Collect the set of nodes whose parent edges are affected by an SPR move.
@@ -174,9 +116,14 @@ inline double compute_edge_nll(ml_model const& model, phylo_dag& tree,
                                std::size_t parent_idx,
                                std::size_t child_idx) {
   auto const& ref = get_reference_sequence(tree);
-  auto parent_seq = reconstruct_sequence(tree, parent_idx, ref);
-  auto child_seq = reconstruct_sequence(tree, child_idx, ref);
-  return -ml_log_likelihood(model, parent_seq, child_seq);
+  ml_model_likelihood_score_ops ops{.model = model,
+                                    .reference = ref,
+                                    .ignore_ua_edge = false};
+  for (auto edge_idx : get_parent_edges(tree, child_idx)) {
+    if (get_parent_idx(tree, edge_idx) == parent_idx)
+      return ops.compute_edge(tree, edge_idx);
+  }
+  throw std::runtime_error{"compute_edge_nll: parent/child edge not found"};
 }
 
 // Compute the ML improvement represented by a full-tree SPR fragment.

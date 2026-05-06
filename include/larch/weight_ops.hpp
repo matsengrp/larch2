@@ -4,10 +4,11 @@
 #include <larch/phylo_dag.hpp>
 #include <larch/compute.hpp>
 #include <larch/simple_weight_ops.hpp>
+#include <larch/tie_tolerance.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
-#include <limits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -52,8 +53,8 @@ struct parsimony_score_ops {
   // Within a clade: pick the minimum weight edges
   std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
       std::vector<weight_type> const& weights) const {
-    weight_type best = std::numeric_limits<weight_type>::max();
-    for (auto w : weights) best = std::min(best, w);
+    assert(!weights.empty());
+    weight_type best = *std::min_element(weights.begin(), weights.end());
     std::vector<std::size_t> indices;
     for (std::size_t i = 0; i < weights.size(); ++i)
       if (weights[i] == best) indices.push_back(i);
@@ -89,6 +90,7 @@ struct tree_count_ops {
   // Within a clade: sum all weights (every edge is an alternative)
   std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
       std::vector<weight_type> const& weights) const {
+    assert(!weights.empty());
     weight_type sum{0};
     for (auto const& w : weights) sum += w;
     std::vector<std::size_t> all_indices;
@@ -129,8 +131,8 @@ struct ua_free_parsimony_score_ops {
 
   std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
       std::vector<weight_type> const& weights) const {
-    weight_type best = std::numeric_limits<weight_type>::max();
-    for (auto w : weights) best = std::min(best, w);
+    assert(!weights.empty());
+    weight_type best = *std::min_element(weights.begin(), weights.end());
     std::vector<std::size_t> indices;
     for (std::size_t i = 0; i < weights.size(); ++i)
       if (weights[i] == best) indices.push_back(i);
@@ -169,11 +171,11 @@ struct edge_weight_score_ops {
 
   std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
       std::vector<weight_type> const& weights) const {
-    double best = std::numeric_limits<double>::max();
-    for (auto w : weights) best = std::min(best, w);
+    assert(!weights.empty());
+    double best = *std::min_element(weights.begin(), weights.end());
     std::vector<std::size_t> indices;
     for (std::size_t i = 0; i < weights.size(); ++i)
-      if (weights[i] <= best + 1e-10) indices.push_back(i);
+      if (within_min_weight_tie(weights[i], best)) indices.push_back(i);
     return {best, indices};
   }
 

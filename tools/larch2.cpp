@@ -520,6 +520,17 @@ static double compute_tree_edge_weight_score(phylo_dag& tree) {
   return score;
 }
 
+static double compute_tree_ml_nll(phylo_dag& tree,
+                                  ml_scoring_config const& ml_cfg) {
+  if (ml_cfg.model == nullptr)
+    throw std::logic_error{"compute_tree_ml_nll: ML model is not loaded"};
+  auto const& ref = get_reference_sequence(tree);
+  ml_model_likelihood_score_ops ops{.model = *ml_cfg.model,
+                                    .reference = ref,
+                                    .ignore_ua_edge = ml_cfg.ignore_ua_edge};
+  return compute_dag_ml_nll(tree, ops);
+}
+
 static void finalize_sampled_tree(sampled_tree_result& sample,
                                   ml_scoring_config const* ml_cfg = nullptr) {
   fitch_assign_compact_genomes(sample.tree);
@@ -530,8 +541,7 @@ static void finalize_sampled_tree(sampled_tree_result& sample,
     sample.edge_weight_score = compute_tree_edge_weight_score(sample.tree);
   }
   if (sample.ml_score && ml_cfg != nullptr && ml_cfg->model != nullptr) {
-    sample.ml_score = compute_dag_ml_nll(*ml_cfg->model, sample.tree,
-                                         ml_cfg->ignore_ua_edge);
+    sample.ml_score = compute_tree_ml_nll(sample.tree, *ml_cfg);
   }
 }
 
@@ -1411,6 +1421,9 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
     auto objective = sample_objective_score(sample, a.sample_method);
     auto min_score = sample.parsimony_score;
     prog.done(format_sample_result(sample));
+    // If ML sampling finalized this tree's NLL, reuse it for ML move rescoring
+    // instead of rebuilding a fresh likelihood cache on the same sampled tree.
+    auto sampled_pre_move_ml_nll = sample.ml_score;
     auto sampled = std::move(sample.tree);
 
     // Check if we should do subtree optimization this iteration
@@ -1449,8 +1462,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         std::vector<radius_result> radii_results;
         std::optional<double> subtree_old_pre_move_nll;
         if (ml_config.model != nullptr && ml_config.coeff != 0.0) {
-          subtree_old_pre_move_nll = compute_dag_ml_nll(
-              *ml_config.model, subtree_dag, ml_config.ignore_ua_edge);
+          subtree_old_pre_move_nll = compute_tree_ml_nll(subtree_dag, ml_config);
         }
 
         for (std::size_t radius = 2; radius <= max_radius; radius *= 2) {
@@ -1612,10 +1624,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
     std::size_t total_trees_merged = 0;
     std::vector<radius_result> radii_results;
-    std::optional<double> sampled_old_pre_move_nll;
-    if (ml_config.model != nullptr && ml_config.coeff != 0.0) {
-      sampled_old_pre_move_nll = compute_dag_ml_nll(
-          *ml_config.model, sampled, ml_config.ignore_ua_edge);
+    std::optional<double> sampled_old_pre_move_nll = sampled_pre_move_ml_nll;
+    if (ml_config.model != nullptr && ml_config.coeff != 0.0 &&
+        !sampled_old_pre_move_nll) {
+      sampled_old_pre_move_nll = compute_tree_ml_nll(sampled, ml_config);
     }
 
     for (std::size_t radius = 2; radius <= max_radius; radius *= 2) {
@@ -1755,10 +1767,12 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         finalize_sampled_tree(resample, &ml_config);
         resample_score = resample.parsimony_score;
         prog.done(format_sample_result(resample));
+        auto resample_pre_move_ml_nll = resample.ml_score;
         sampled = std::move(resample.tree);
         if (ml_config.model != nullptr && ml_config.coeff != 0.0) {
-          sampled_old_pre_move_nll = compute_dag_ml_nll(
-              *ml_config.model, sampled, ml_config.ignore_ua_edge);
+          sampled_old_pre_move_nll = resample_pre_move_ml_nll;
+          if (!sampled_old_pre_move_nll)
+            sampled_old_pre_move_nll = compute_tree_ml_nll(sampled, ml_config);
         }
 
         // Recompute max_radius from new tree depth

@@ -2,6 +2,7 @@
 
 #include <larch/phylo_dag.hpp>
 
+#include <cassert>
 #include <cstddef>
 #include <utility>
 #include <vector>
@@ -25,6 +26,7 @@ struct simple_weight_ops {
 
   std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
       std::vector<weight_type> const& weights) const {
+    assert(!weights.empty());
     weight_type optimal = weights.at(0);
     std::vector<std::size_t> indices;
     for (std::size_t i = 0; i < weights.size(); ++i) {

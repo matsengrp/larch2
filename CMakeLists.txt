@@ -418,6 +418,7 @@ add_test(NAME larch2_ml_patience_reports_objective
                  --seed 1
                  -n 2
                  --max-moves 0
+                 --move-coeff-ml 1.0
                  --patience 1
                  -o ${CMAKE_BINARY_DIR}/larch2_ml_patience.pb.gz
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
