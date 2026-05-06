@@ -218,7 +218,8 @@ Optimization:
   --sample-per-radius     Re-sample tree and rebuild index between radii
 
 Sampling:
-  --sample-method <M>     parsimony (default), random, rf-minsum, rf-maxsum, ml/thrifty
+  --sample-method <M>     parsimony (default), random, rf-minsum, rf-maxsum,
+                          ml/thrifty, edge-weight
   --sample-uniformly      Weight sampling proportional to subtree tree-counts
   --ignore-root-edge-mutations  Ignore UA->root edge mutations in parsimony
   --ignore-ua-edge-ml    Ignore UA->root edge during ML scoring (default)
@@ -415,10 +416,15 @@ struct sampled_tree_result {
   phylo_dag tree;
   std::size_t parsimony_score = 0;
   std::optional<double> ml_score;
+  std::optional<double> edge_weight_score;
 };
 
 static bool is_ml_sample_method(std::string const& method) {
   return method == "ml" || method == "thrifty";
+}
+
+static bool is_edge_weight_sample_method(std::string const& method) {
+  return method == "edge-weight" || method == "edge_weight";
 }
 
 static std::size_t compute_tree_parsimony_score(phylo_dag& tree) {
@@ -428,12 +434,22 @@ static std::size_t compute_tree_parsimony_score(phylo_dag& tree) {
   return score;
 }
 
+static double compute_tree_edge_weight_score(phylo_dag& tree) {
+  double score = 0.0;
+  for (auto ev : tree.get_all_edges())
+    std::visit([&](auto edge) { score += edge.edge_weight(); }, ev);
+  return score;
+}
+
 static void finalize_sampled_tree(sampled_tree_result& sample,
                                   ml_scoring_config const* ml_cfg = nullptr) {
   fitch_assign_compact_genomes(sample.tree);
   recompute_edge_mutations(sample.tree);
   set_sample_ids_from_cg(sample.tree);
   sample.parsimony_score = compute_tree_parsimony_score(sample.tree);
+  if (sample.edge_weight_score) {
+    sample.edge_weight_score = compute_tree_edge_weight_score(sample.tree);
+  }
   if (sample.ml_score && ml_cfg != nullptr && ml_cfg->model != nullptr) {
     sample.ml_score = compute_dag_ml_nll(*ml_cfg->model, sample.tree,
                                          ml_cfg->ignore_ua_edge);
@@ -441,6 +457,12 @@ static void finalize_sampled_tree(sampled_tree_result& sample,
 }
 
 static std::string format_sample_result(sampled_tree_result const& sample) {
+  if (sample.edge_weight_score) {
+    std::ostringstream out;
+    out << "parsimony " << sample.parsimony_score << ", edge_weight "
+        << std::fixed << std::setprecision(6) << *sample.edge_weight_score;
+    return out.str();
+  }
   if (!sample.ml_score) return "score " + std::to_string(sample.parsimony_score);
 
   std::ostringstream out;
@@ -495,6 +517,13 @@ static sampled_tree_result sample_tree_from_dag(
     auto tree = uniformly ? sw.min_weight_uniform_sample_tree(rf_weight_ops)
                           : sw.min_weight_sample_tree(rf_weight_ops);
     return {.tree = std::move(tree)};
+  } else if (is_edge_weight_sample_method(method)) {
+    edge_weight_score_ops ew_ops;
+    subtree_weight<edge_weight_score_ops> sw(dag, seed, mr);
+    auto min_score = sw.compute_weight_below(root_idx, ew_ops);
+    auto tree = uniformly ? sw.min_weight_uniform_sample_tree(ew_ops)
+                          : sw.min_weight_sample_tree(ew_ops);
+    return {.tree = std::move(tree), .edge_weight_score = min_score};
   } else if (is_ml_sample_method(method)) {
     if (ml_cfg == nullptr || ml_cfg->model == nullptr) {
       std::cerr << "error: --model-dir and --model-name required with "
@@ -590,7 +619,12 @@ static phylo_dag extract_subtree_as_dag(phylo_dag& tree,
   auto src_parent_edges = get_parent_edges(tree, subtree_root_idx);
   if (!src_parent_edges.empty()) {
     auto src_pe = tree.get_edge(src_parent_edges[0]);
-    std::visit([&](auto se) { ua_edge.mutations() = se.mutations(); }, src_pe);
+    std::visit(
+        [&](auto se) {
+          ua_edge.mutations() = se.mutations();
+          ua_edge.edge_weight() = se.edge_weight();
+        },
+        src_pe);
   }
 
   // DFS copy remaining nodes and edges
@@ -652,6 +686,7 @@ static phylo_dag extract_subtree_as_dag(phylo_dag& tree,
             [&](auto se) {
               dst_edge.mutations() = se.mutations();
               dst_edge.clade_index() = se.clade_index();
+              dst_edge.edge_weight() = se.edge_weight();
             },
             src_ev);
 

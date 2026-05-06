@@ -72,7 +72,7 @@ larch2 [options] -o <output.pb.gz>
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--sample-method <M>` | parsimony | `parsimony`, `random`, `rf-minsum`, `rf-maxsum`, or `ml`/`thrifty` |
+| `--sample-method <M>` | parsimony | `parsimony`, `random`, `rf-minsum`, `rf-maxsum`, `ml`/`thrifty`, or `edge-weight` |
 | `--sample-uniformly` | off | Weight sampling proportional to subtree tree-counts |
 | `--ignore-root-edge-mutations` | off | Ignore UA-to-root edge mutations in parsimony scoring |
 | `--ignore-ua-edge-ml` | on | Ignore UA-to-root edge during ML scoring |
@@ -146,6 +146,11 @@ SPR move scoring remains parsimony-based unless `--move-coeff-ml` is also set.
 The `--ignore-ua-edge-ml` / `--score-ua-edge-ml` setting applies to all larch2
 ML scoring paths: ML sampling, ML move scoring, and ML metrics.
 
+Note: `--sample-method edge-weight` is intended for DAGs where every edge has a
+meaningful stored protobuf `edge_weight`. Mixing scored and unscored DAGs, or
+continuing optimization after edge-weight sampling, can introduce default-zero
+new/unknown edges that later look artificially cheap.
+
 Extract 5 diverse optimal trees as Newick:
 
 ```sh
@@ -191,7 +196,7 @@ times. All loaded inputs are merged into a single DAG.
 | `-t, --trim` | Trim to best parsimony score |
 | `--rf <path>` | Trim to minimize RF distance to this DAG file |
 | `-s, --sample` | Sample a single tree from the DAG |
-| `--sample-method <M>` | Sampling criterion: `random` (default), `parsimony`, or `ml`/`thrifty` |
+| `--sample-method <M>` | Sampling criterion: `random` (default), `parsimony`, `ml`/`thrifty`, or `edge-weight` |
 | `--sample-uniformly` | Weight sampling proportional to subtree tree-counts |
 | `--model-dir <path>` | Model directory for `ml`/`thrifty` sampling |
 | `--model-name <name>` | Model name, e.g. `ThriftyHumV0.2-45` |
@@ -244,6 +249,13 @@ Extract a minimum Thrifty/ML-NLL tree:
 dagutil --dag-pb input.pb.gz --force-no-vcf --sample \
     --sample-method ml --model-dir data/bcr --model-name ThriftyHumV0.2-45 \
     -o sampled-thrifty.pb.gz
+```
+
+Extract a tree minimizing stored protobuf `edge_weight` values:
+
+```sh
+dagutil --dag-pb scored.pb.gz --force-no-vcf --sample \
+    --sample-method edge-weight -o sampled-edge-weight.pb.gz
 ```
 
 ## License

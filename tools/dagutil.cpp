@@ -165,9 +165,13 @@ static bool is_ml_sample_method(std::string const& method) {
   return method == "ml" || method == "thrifty";
 }
 
+static bool is_edge_weight_sample_method(std::string const& method) {
+  return method == "edge-weight" || method == "edge_weight";
+}
+
 static bool is_known_sample_method(std::string const& method) {
   return method == "random" || method == "parsimony" ||
-         is_ml_sample_method(method);
+         is_ml_sample_method(method) || is_edge_weight_sample_method(method);
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +199,7 @@ Pruning:
   -t, --trim              Trim to best parsimony score
   --rf <path>             Trim to minimize RF distance to this DAG file
   -s, --sample            Sample a single tree from the DAG
-  --sample-method <M>     random (default), parsimony, ml/thrifty
+  --sample-method <M>     random (default), parsimony, ml/thrifty, edge-weight
   --sample-uniformly      Weight sampling proportional to subtree tree-counts
   --model-dir <path>      Model directory for ml/thrifty sampling
   --model-name <name>     Model name for ml/thrifty sampling
@@ -604,6 +608,20 @@ int main(int argc, char** argv) try {
         std::cerr << "sampled_tree: parsimony_min=" << min_score << "\n";
         if (a.validate)
           validate_dag(tree, "sampled min-parsimony tree",
+                       thread_pool::get_default());
+        save_proto_dag(tree, a.output);
+      } else if (is_edge_weight_sample_method(a.sample_method)) {
+        std::cerr << "Sampling a tree from min-edge-weight options...\n";
+        edge_weight_score_ops ew_ops;
+        subtree_weight<edge_weight_score_ops> sw(result, a.seed, mr);
+        auto min_score = sw.compute_weight_below(root_idx, ew_ops);
+        auto tree = a.sample_uniformly
+                        ? sw.min_weight_uniform_sample_tree(ew_ops)
+                        : sw.min_weight_sample_tree(ew_ops);
+        std::cerr << "sampled_tree: edge_weight_min=" << std::fixed
+                  << std::setprecision(6) << min_score << "\n";
+        if (a.validate)
+          validate_dag(tree, "sampled min-edge-weight tree",
                        thread_pool::get_default());
         save_proto_dag(tree, a.output);
       } else if (is_ml_sample_method(a.sample_method)) {

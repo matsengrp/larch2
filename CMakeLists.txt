@@ -234,6 +234,60 @@ set_tests_properties(dagutil_ml_sample_validate
                      FIXTURES_REQUIRED dagutil_ml_sample_fixture
                      PASS_REGULAR_EXPRESSION "tree_count: 1")
 
+# dagutil stored edge_weight CLI smoke test: write edge penalties, reload them,
+# and sample a min-edge-weight tree.
+set(DAGUTIL_EDGE_WEIGHT_SCORED_OUT
+    "${CMAKE_BINARY_DIR}/dagutil_edge_weight_scored.pb.gz")
+set(DAGUTIL_EDGE_WEIGHT_SAMPLE_OUT
+    "${CMAKE_BINARY_DIR}/dagutil_edge_weight_sample.pb.gz")
+add_test(NAME dagutil_edge_weight_score
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --dag-pb data/test_5_trees/tree_1.pb.gz
+                 --force-no-vcf
+                 --edge-parsimony
+                 -o ${DAGUTIL_EDGE_WEIGHT_SCORED_OUT}
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_edge_weight_score
+                     PROPERTIES FIXTURES_SETUP dagutil_edge_weight_fixture)
+add_test(NAME dagutil_edge_weight_sample
+         COMMAND dagutil
+                 --dag-pb ${DAGUTIL_EDGE_WEIGHT_SCORED_OUT}
+                 --force-no-vcf
+                 --sample
+                 --sample-method edge-weight
+                 --seed 1
+                 -o ${DAGUTIL_EDGE_WEIGHT_SAMPLE_OUT}
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_edge_weight_sample
+                     PROPERTIES
+                     FIXTURES_REQUIRED dagutil_edge_weight_fixture
+                     FIXTURES_SETUP dagutil_edge_weight_sample_fixture
+                     PASS_REGULAR_EXPRESSION "edge_weight_min")
+add_test(NAME dagutil_edge_weight_sample_validate
+         COMMAND dagutil
+                 --dag-pb ${DAGUTIL_EDGE_WEIGHT_SAMPLE_OUT}
+                 --force-no-vcf
+                 --validate
+                 --dag-info
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_edge_weight_sample_validate
+                     PROPERTIES
+                     FIXTURES_REQUIRED dagutil_edge_weight_sample_fixture
+                     PASS_REGULAR_EXPRESSION "tree_count: 1")
+
+add_test(NAME larch2_edge_weight_sample
+         COMMAND larch2
+                 --dag-pb ${DAGUTIL_EDGE_WEIGHT_SCORED_OUT}
+                 --sample-method edge-weight
+                 --seed 1
+                 -n 1
+                 --max-moves 1
+                 -o ${CMAKE_BINARY_DIR}/larch2_edge_weight_sample.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(larch2_edge_weight_sample
+                     PROPERTIES FIXTURES_REQUIRED dagutil_edge_weight_fixture)
+
 # larch2 ML sampling CLI smoke tests.
 add_test(NAME larch2_ml_score_ua_edge_sample
          COMMAND larch2

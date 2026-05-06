@@ -524,6 +524,7 @@ class subtree_weight {
             [&](auto se) {
               dst_edge.mutations() = se.mutations();
               dst_edge.clade_index() = se.clade_index();
+              dst_edge.edge_weight() = se.edge_weight();
             },
             src_edge);
 
@@ -580,6 +581,7 @@ class subtree_weight {
             [&](auto se) {
               dst_edge.mutations() = se.mutations();
               dst_edge.clade_index() = se.clade_index();
+              dst_edge.edge_weight() = se.edge_weight();
             },
             src_edge);
 
@@ -652,6 +654,7 @@ class subtree_weight {
               [&](auto se) {
                 dst_edge.mutations() = se.mutations();
                 dst_edge.clade_index() = se.clade_index();
+                dst_edge.edge_weight() = se.edge_weight();
               },
               src_edge);
         }

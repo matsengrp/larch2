@@ -31,6 +31,7 @@ template <>
 struct annotation<edge_kind::clade> {
   edge_mutations mutations;
   std::size_t clade_index = 0;
+  float edge_weight = 0.0f;
 };
 
 template <>
@@ -56,6 +57,9 @@ struct interface<edge_kind::clade> {
   auto& mutations(this auto&& self) { return self.get_annotation().mutations; }
   auto& clade_index(this auto&& self) {
     return self.get_annotation().clade_index;
+  }
+  auto& edge_weight(this auto&& self) {
+    return self.get_annotation().edge_weight;
   }
 };
 

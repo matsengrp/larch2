@@ -149,6 +149,46 @@ struct ua_free_parsimony_score_ops {
   }
 };
 
+// Stored protobuf/in-memory edge_weight scoring.  Lower total stored edge
+// weight is better, matching subtree_weight's minimum-weight semantics.
+struct edge_weight_score_ops {
+  using weight_type = double;
+
+  weight_type compute_leaf(phylo_dag& /*dag*/, std::size_t /*node_idx*/) const {
+    return 0.0;
+  }
+
+  weight_type compute_edge(phylo_dag& dag, std::size_t edge_idx) const {
+    auto ev = dag.get_edge(edge_idx);
+    return std::visit(
+        [](auto edge) -> double {
+          return static_cast<double>(edge.edge_weight());
+        },
+        ev);
+  }
+
+  std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
+      std::vector<weight_type> const& weights) const {
+    double best = std::numeric_limits<double>::max();
+    for (auto w : weights) best = std::min(best, w);
+    std::vector<std::size_t> indices;
+    for (std::size_t i = 0; i < weights.size(); ++i)
+      if (weights[i] <= best + 1e-10) indices.push_back(i);
+    return {best, indices};
+  }
+
+  weight_type between_clades(std::vector<weight_type> const& weights) const {
+    double sum = 0.0;
+    for (auto w : weights) sum += w;
+    return sum;
+  }
+
+  weight_type above_node(weight_type edge_weight,
+                         weight_type child_weight) const {
+    return edge_weight + child_weight;
+  }
+};
+
 // Max parsimony binary ops: for computing maximum parsimony score (worst tree)
 struct max_parsimony_binary_ops {
   using weight_type = std::size_t;

@@ -1107,6 +1107,7 @@ inline std::pair<phylo_dag, std::vector<std::size_t>> clone_tree(
           auto e = dst.append_edge<edge_kind::clade>();
           e.mutations() = edge.mutations();
           e.clade_index() = edge.clade_index();
+          e.edge_weight() = edge.edge_weight();
           auto parent_idx = old_to_new[get_parent_idx(src, edge.index())];
           auto child_idx = old_to_new[get_child_idx(src, edge.index())];
           auto pv = dst.get_node(parent_idx);
