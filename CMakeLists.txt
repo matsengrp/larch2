@@ -378,6 +378,21 @@ add_test(NAME larch2_edge_weight_sample
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(larch2_edge_weight_sample
                      PROPERTIES FIXTURES_REQUIRED dagutil_edge_weight_fixture)
+add_test(NAME larch2_edge_weight_patience_reports_objective
+         COMMAND larch2
+                 --dag-pb ${DAGUTIL_EDGE_WEIGHT_SCORED_OUT}
+                 --sample-method edge-weight
+                 --seed 1
+                 -n 2
+                 --max-moves 0
+                 --patience 1
+                 -o ${CMAKE_BINARY_DIR}/larch2_edge_weight_patience.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(larch2_edge_weight_patience_reports_objective
+                     PROPERTIES
+                     FIXTURES_REQUIRED dagutil_edge_weight_fixture
+                     PASS_REGULAR_EXPRESSION
+                     "Early stopping: no edge_weight improvement")
 
 # larch2 ML sampling CLI smoke tests.
 add_test(NAME larch2_ml_score_ua_edge_sample
@@ -394,6 +409,33 @@ add_test(NAME larch2_ml_score_ua_edge_sample
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(larch2_ml_score_ua_edge_sample
                      PROPERTIES PASS_REGULAR_EXPRESSION "ML NLL")
+add_test(NAME larch2_ml_patience_reports_objective
+         COMMAND larch2
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --sample-method ml
+                 --model-dir data/bcr
+                 --model-name ThriftyHumV0.2-45
+                 --seed 1
+                 -n 2
+                 --max-moves 0
+                 --patience 1
+                 -o ${CMAKE_BINARY_DIR}/larch2_ml_patience.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(larch2_ml_patience_reports_objective
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "Early stopping: no ML NLL improvement")
+add_test(NAME larch2_ml_drift_fails
+         COMMAND bash test/expect_fail_regex.sh
+                 "objective-aware drift"
+                 $<TARGET_FILE:larch2>
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --sample-method ml
+                 --model-dir data/bcr
+                 --model-name ThriftyHumV0.2-45
+                 --drift 1
+                 -n 0
+                 -o ${CMAKE_BINARY_DIR}/larch2_ml_drift.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME larch2_unknown_sample_method_fails
          COMMAND larch2

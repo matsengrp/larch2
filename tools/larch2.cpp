@@ -19,9 +19,11 @@
 #include <larch/thread_pool.hpp>
 #include <larch/version.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -34,6 +36,7 @@
 #include <optional>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -212,8 +215,8 @@ Output (required):
 
 Optimization:
   -n, --iterations <N>    Number of optimization iterations (default: 10)
-  --patience <P>          Stop after P consecutive iterations with no parsimony improvement (P >= 1)
-  --drift <N>             When patience triggers, attempt N drift iterations before stopping
+  --patience <P>          Stop after P consecutive iterations with no sampling-objective improvement (P >= 1)
+  --drift <N>             With parsimony sampling, attempt N drift iterations when patience triggers
   --optimizer <name>      "native" (default) or "random"
   --max-moves <N>         Max moves per iteration for native (default: 50)
   --seed <N>              Random seed
@@ -352,6 +355,12 @@ static void validate_args(args const& a) {
               << a.sample_method << "\n";
     std::exit(1);
   }
+  if (a.drift && a.sample_method != "parsimony") {
+    std::cerr << "error: --drift currently supports only --sample-method "
+                 "parsimony; objective-aware drift for "
+              << a.sample_method << " is not implemented\n";
+    std::exit(1);
+  }
   if (a.move_coeff_ml > 0.0 && !has_complete_model_args(a)) {
     std::cerr << "error: --model-dir and --model-name required with "
                  "--move-coeff-ml\n";
@@ -481,9 +490,20 @@ static args parse_args(int argc, char** argv) {
 
 struct sampled_tree_result {
   phylo_dag tree;
+  // Full mutation-count parsimony of the finalized sampled tree.
   std::size_t parsimony_score = 0;
+  // Sampling-objective parsimony before finalization.  This can differ from
+  // parsimony_score when --ignore-root-edge-mutations is active.
+  std::optional<std::size_t> parsimony_objective_score;
   std::optional<double> ml_score;
   std::optional<double> edge_weight_score;
+  std::optional<double> rf_score;
+};
+
+struct sample_objective {
+  std::string kind;
+  double value = 0.0;              // Natural reported value.
+  double convergence_value = 0.0;  // Lower is better for patience.
 };
 
 static std::size_t compute_tree_parsimony_score(phylo_dag& tree) {
@@ -515,11 +535,60 @@ static void finalize_sampled_tree(sampled_tree_result& sample,
   }
 }
 
+static double require_objective_value(std::optional<double> const& value,
+                                      std::string_view method,
+                                      std::string_view field) {
+  if (!value) {
+    throw std::logic_error("missing " + std::string{field} +
+                           " for --sample-method " + std::string{method});
+  }
+  return *value;
+}
+
+static sample_objective sample_objective_score(
+    sampled_tree_result const& sample, std::string const& method) {
+  if (is_ml_sample_method(method)) {
+    double score = require_objective_value(sample.ml_score, method, "ML NLL");
+    return {.kind = "ML NLL", .value = score, .convergence_value = score};
+  }
+  if (is_edge_weight_sample_method(method)) {
+    double score = require_objective_value(sample.edge_weight_score, method,
+                                           "edge_weight score");
+    return {.kind = "edge_weight", .value = score, .convergence_value = score};
+  }
+  if (method == "rf-minsum") {
+    double score = require_objective_value(sample.rf_score, method,
+                                           "sum RF score");
+    return {.kind = "sum RF", .value = score, .convergence_value = score};
+  }
+  if (method == "rf-maxsum") {
+    double score = require_objective_value(sample.rf_score, method,
+                                           "sum RF score");
+    return {.kind = "sum RF", .value = score, .convergence_value = -score};
+  }
+
+  double score = static_cast<double>(
+      sample.parsimony_objective_score.value_or(sample.parsimony_score));
+  return {.kind = "parsimony", .value = score, .convergence_value = score};
+}
+
+static std::string format_objective_value(double value) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(6) << value;
+  return out.str();
+}
+
 static std::string format_sample_result(sampled_tree_result const& sample) {
   if (sample.edge_weight_score) {
     std::ostringstream out;
     out << "parsimony " << sample.parsimony_score << ", edge_weight "
         << std::fixed << std::setprecision(6) << *sample.edge_weight_score;
+    return out.str();
+  }
+  if (sample.rf_score) {
+    std::ostringstream out;
+    out << "parsimony " << sample.parsimony_score << ", sum RF "
+        << std::fixed << std::setprecision(6) << *sample.rf_score;
     return out.str();
   }
   if (!sample.ml_score) return "score " + std::to_string(sample.parsimony_score);
@@ -544,14 +613,18 @@ static sampled_tree_result sample_tree_from_dag(
       auto score = sw.compute_weight_below(root_idx, uops);
       auto tree = uniformly ? sw.min_weight_uniform_sample_tree(uops)
                             : sw.min_weight_sample_tree(uops);
-      return {.tree = std::move(tree), .parsimony_score = score};
+      return {.tree = std::move(tree),
+              .parsimony_score = score,
+              .parsimony_objective_score = score};
     } else {
       parsimony_score_ops pops;
       subtree_weight<parsimony_score_ops> sw(dag, seed, mr);
       auto score = sw.compute_weight_below(root_idx, pops);
       auto tree = uniformly ? sw.min_weight_uniform_sample_tree(pops)
                             : sw.min_weight_sample_tree(pops);
-      return {.tree = std::move(tree), .parsimony_score = score};
+      return {.tree = std::move(tree),
+              .parsimony_score = score,
+              .parsimony_objective_score = score};
     }
   } else if (method == "random") {
     // Sample randomly, but still compute a parsimony baseline.
@@ -564,18 +637,20 @@ static sampled_tree_result sample_tree_from_dag(
     sum_rf_distance_ops rf_ops{m, m};
     sum_rf_distance rf_weight_ops{rf_ops};
     subtree_weight<sum_rf_distance> sw(dag, seed, mr);
-    sw.compute_weight_below(root_idx, rf_weight_ops);
+    auto rf_score = sw.compute_weight_below(root_idx, rf_weight_ops);
+    auto shifted_score = rf_score + rf_weight_ops.get_ops().get_shift_sum();
     auto tree = uniformly ? sw.min_weight_uniform_sample_tree(rf_weight_ops)
                           : sw.min_weight_sample_tree(rf_weight_ops);
-    return {.tree = std::move(tree)};
+    return {.tree = std::move(tree), .rf_score = shifted_score.to_double()};
   } else if (method == "rf-maxsum") {
     max_sum_rf_distance_ops rf_ops{m, m};
     max_sum_rf_distance rf_weight_ops{rf_ops};
     subtree_weight<max_sum_rf_distance> sw(dag, seed, mr);
-    sw.compute_weight_below(root_idx, rf_weight_ops);
+    auto rf_score = sw.compute_weight_below(root_idx, rf_weight_ops);
+    auto shifted_score = rf_score + rf_weight_ops.get_ops().get_shift_sum();
     auto tree = uniformly ? sw.min_weight_uniform_sample_tree(rf_weight_ops)
                           : sw.min_weight_sample_tree(rf_weight_ops);
-    return {.tree = std::move(tree)};
+    return {.tree = std::move(tree), .rf_score = shifted_score.to_double()};
   } else if (is_edge_weight_sample_method(method)) {
     edge_weight_score_ops ew_ops;
     subtree_weight<edge_weight_score_ops> sw(dag, seed, mr);
@@ -1084,18 +1159,31 @@ static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed,
 struct patience_checker {
   std::optional<std::size_t> limit;
   std::size_t count = 0;
-  std::optional<std::size_t> best_score;
+  std::optional<double> best_score;
+  std::string objective_kind = "objective";
 
-  bool operator()(std::size_t current_score) {
+  static double improvement_tolerance(sample_objective const& score) {
+    if (score.kind == "parsimony") return 0.0;
+    return 1e-10 * std::max(1.0, std::abs(score.convergence_value));
+  }
+
+  bool operator()(sample_objective const& current_score) {
     if (!limit) return false;
-    if (!best_score || current_score < *best_score) {
-      best_score = current_score;
+    if (!std::isfinite(current_score.convergence_value)) {
+      throw std::runtime_error("non-finite convergence objective for " +
+                               current_score.kind);
+    }
+    objective_kind = current_score.kind;
+    auto tol = improvement_tolerance(current_score);
+    if (!best_score || current_score.convergence_value < *best_score - tol) {
+      best_score = current_score.convergence_value;
       count = 0;
     } else {
       count++;
     }
     if (count >= *limit) {
-      std::cerr << "Early stopping: no parsimony improvement for " << *limit
+      std::cerr << "Early stopping: no " << objective_kind
+                << " improvement for " << *limit
                 << " consecutive iterations\n";
       return true;
     }
@@ -1320,6 +1408,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         dag, m, a.sample_method, a.sample_uniformly,
         a.ignore_root_edge_mutations, iter_seed, &ml_config);
     finalize_sampled_tree(sample, &ml_config);
+    auto objective = sample_objective_score(sample, a.sample_method);
     auto min_score = sample.parsimony_score;
     prog.done(format_sample_result(sample));
     auto sampled = std::move(sample.tree);
@@ -1495,8 +1584,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             .trees_merged = total_trees_merged,
             .parsimony_score = min_score,
             .radii = std::move(radii_results),
+            .objective_kind = objective.kind,
+            .objective_score = objective.value,
         });
-        if (patience(min_score)) {
+        if (patience(objective)) {
           if (a.drift && drift_escape(m, a, rng, prog, &ml_config)) {
             patience.reset();
           } else {
@@ -1698,8 +1789,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         .trees_merged = total_trees_merged,
         .parsimony_score = min_score,
         .radii = std::move(radii_results),
+        .objective_kind = objective.kind,
+        .objective_score = objective.value,
     });
-    if (patience(min_score)) {
+    if (patience(objective)) {
       if (a.drift && drift_escape(m, a, rng, prog, &ml_config)) {
         patience.reset();
       } else {
@@ -1751,7 +1844,6 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
     prog.phase("Building merged DAG");
     auto& dag = m.get_result();
     auto nodes_before = m.result_node_count();
-    auto edges_before = m.result_edge_count();
     prog.done(std::to_string(nodes_before) + " nodes");
 
     if (a.log_metrics) {
@@ -1765,6 +1857,7 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
         dag, m, a.sample_method, a.sample_uniformly,
         a.ignore_root_edge_mutations, iter_seed, &ml_config);
     finalize_sampled_tree(sample, &ml_config);
+    auto objective = sample_objective_score(sample, a.sample_method);
     auto min_score = sample.parsimony_score;
     prog.done(format_sample_result(sample));
     auto sampled = std::move(sample.tree);
@@ -1785,17 +1878,16 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
                    "random iteration " + std::to_string(iter + 1) + " merge",
                    thread_pool::get_default());
 
-    // Use DAG growth as convergence signal: random SPR always generates
-    // candidates, but only novel topologies grow the DAG.
-    bool dag_grew = (nodes_after != nodes_before || edges_after != edges_before);
     results.push_back(optimize_result{
         .iteration = iter,
         .dag_node_count = nodes_after,
         .dag_edge_count = edges_after,
         .trees_merged = new_trees.size(),
         .parsimony_score = min_score,
+        .objective_kind = objective.kind,
+        .objective_score = objective.value,
     });
-    if (patience(min_score)) return results;
+    if (patience(objective)) return results;
   }
 
   return results;
@@ -1884,7 +1976,9 @@ int main(int argc, char** argv) {
   std::cerr << "\nSummary:\n";
   for (auto& r : results) {
     std::cerr << "  iter " << (r.iteration + 1)
-              << ": score=" << r.parsimony_score
+              << ": parsimony=" << r.parsimony_score
+              << " objective=" << r.objective_kind << " "
+              << format_objective_value(r.objective_score)
               << " nodes=" << r.dag_node_count << " edges=" << r.dag_edge_count
               << " merged=" << r.trees_merged << "\n";
     for (auto& rd : r.radii) {

@@ -63,8 +63,8 @@ larch2 [options] -o <output.pb.gz>
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-n, --iterations <N>` | 10 | Number of optimization iterations |
-| `--patience <P>` | off | Stop after P iterations without parsimony improvement |
-| `--drift <N>` | off | When patience triggers, try N drift iterations before stopping |
+| `--patience <P>` | off | Stop after P iterations without active sampling-objective improvement |
+| `--drift <N>` | off | With parsimony sampling, try N drift iterations when patience triggers |
 | `--optimizer <name>` | native | `native` (SPR enumeration) or `random` |
 | `--max-moves <N>` | 50 | Max moves per iteration (native optimizer) |
 | `--seed <N>` | random | Random seed for reproducibility |
@@ -182,6 +182,12 @@ Note: `--sample-method edge-weight` is intended for DAGs where every edge has a
 meaningful stored protobuf `edge_weight`. Mixing scored and unscored DAGs, or
 continuing optimization after edge-weight sampling, can introduce default-zero
 new/unknown edges that later look artificially cheap.
+
+Convergence reporting includes both sampled-tree parsimony and the active
+sampling objective. `--patience` tracks the active sampling objective (`ML NLL`
+for `ml`/`thrifty`, `edge_weight` for edge-weight sampling, RF score for RF
+sampling, otherwise parsimony). `--drift` is still parsimony-specific and is
+rejected with non-parsimony `--sample-method` values.
 
 Extract 5 diverse optimal trees as Newick:
 
