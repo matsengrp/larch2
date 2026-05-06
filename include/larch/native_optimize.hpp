@@ -49,6 +49,21 @@ struct move_coefficients {
   }
 };
 
+inline constexpr double rescored_move_score_tolerance = 1e-10;
+
+// Rescored move scores are lower-is-better deltas relative to the current
+// tree.  Keep only strict improvements; neutral moves are intentionally
+// excluded unless a future diversification mode opts into them explicitly.
+inline bool is_strictly_improving_rescored_move(int final_score) {
+  return final_score < 0;
+}
+
+inline bool is_strictly_improving_rescored_move(
+    double final_score,
+    double tolerance = rescored_move_score_tolerance) {
+  return final_score < -tolerance;
+}
+
 struct src_removal_result {
   int score_change{0};
   std::vector<uint8_t> new_fitch;

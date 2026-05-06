@@ -19,6 +19,7 @@
 #include <larch/version.hpp>
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -1299,6 +1300,11 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
         std::size_t total_trees_merged = 0;
         std::vector<radius_result> radii_results;
+        std::optional<double> subtree_old_pre_move_nll;
+        if (ml_config.model != nullptr && ml_config.coeff != 0.0) {
+          subtree_old_pre_move_nll = compute_dag_ml_nll(
+              *ml_config.model, subtree_dag, ml_config.ignore_ua_edge);
+        }
 
         for (std::size_t radius = 2; radius <= max_radius; radius *= 2) {
           std::cerr << "  [subtree radius " << radius << "]\n";
@@ -1355,7 +1361,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
           std::size_t moves_applied = 0;
           prog.phase("  Merging subtree fragments");
           if (ml_config.model != nullptr && ml_config.coeff != 0.0) {
-            // Delta LL re-scoring via ml_scoring_config::adjust_score().
+            // Full-tree ML delta re-scoring.  apply_spr_as_fragment() returns a
+            // complete moved subtree/tree, so compare against the cached full
+            // pre-move NLL rather than changed original edges only.
+            assert(subtree_old_pre_move_nll.has_value());
             struct scored_frag {
               std::size_t idx;
               double final_score;
@@ -1364,14 +1373,16 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             for (std::size_t i = 0; i < fragments.size(); ++i) {
               double base = static_cast<double>(
                   coeffs.apply(spr_moves[i].score_change.value_or(0), 0));
-              scored[i] = {i, ml_config.adjust_score(base, subtree_dag,
-                                                     fragments[i],
-                                                     spr_moves[i])};
+              scored[i] = {i, ml_config.adjust_score(
+                                  base, *subtree_old_pre_move_nll,
+                                  fragments[i])};
             }
             std::sort(scored.begin(), scored.end(), [](auto& x, auto& y) {
               return x.final_score < y.final_score;
             });
-            std::erase_if(scored, [](auto& s) { return s.final_score >= 0.0; });
+            std::erase_if(scored, [](auto& s) {
+              return !is_strictly_improving_rescored_move(s.final_score);
+            });
             if (scored.size() > a.max_moves) scored.resize(a.max_moves);
             for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
             moves_applied = scored.size();
@@ -1390,7 +1401,9 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             std::sort(scored.begin(), scored.end(), [](auto& a, auto& b) {
               return a.final_score < b.final_score;
             });
-            std::erase_if(scored, [](auto& s) { return s.final_score > 0; });
+            std::erase_if(scored, [](auto& s) {
+              return !is_strictly_improving_rescored_move(s.final_score);
+            });
             if (scored.size() > a.max_moves) scored.resize(a.max_moves);
             for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
             moves_applied = scored.size();
@@ -1450,6 +1463,11 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
     std::size_t total_trees_merged = 0;
     std::vector<radius_result> radii_results;
+    std::optional<double> sampled_old_pre_move_nll;
+    if (ml_config.model != nullptr && ml_config.coeff != 0.0) {
+      sampled_old_pre_move_nll = compute_dag_ml_nll(
+          *ml_config.model, sampled, ml_config.ignore_ua_edge);
+    }
 
     for (std::size_t radius = 2; radius <= max_radius; radius *= 2) {
       std::cerr << "  [radius " << radius << "]\n";
@@ -1513,7 +1531,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
       std::size_t moves_applied = 0;
       prog.phase("  Merging");
       if (ml_config.model != nullptr && ml_config.coeff != 0.0) {
-        // Delta LL re-scoring via ml_scoring_config::adjust_score().
+        // Full-tree ML delta re-scoring.  apply_spr_as_fragment() returns a
+        // complete moved tree, so compare against the cached full pre-move NLL
+        // rather than changed original edges only.
+        assert(sampled_old_pre_move_nll.has_value());
         struct scored_frag {
           std::size_t idx;
           double final_score;
@@ -1522,13 +1543,15 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         for (std::size_t i = 0; i < fragments.size(); ++i) {
           double base = static_cast<double>(
               coeffs.apply(spr_moves[i].score_change.value_or(0), 0));
-          scored[i] = {i, ml_config.adjust_score(base, sampled, fragments[i],
-                                                 spr_moves[i])};
+          scored[i] = {i, ml_config.adjust_score(base, *sampled_old_pre_move_nll,
+                                                 fragments[i])};
         }
         std::sort(scored.begin(), scored.end(), [](auto& x, auto& y) {
           return x.final_score < y.final_score;
         });
-        std::erase_if(scored, [](auto& s) { return s.final_score >= 0.0; });
+        std::erase_if(scored, [](auto& s) {
+          return !is_strictly_improving_rescored_move(s.final_score);
+        });
         if (scored.size() > a.max_moves) scored.resize(a.max_moves);
         for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
         moves_applied = scored.size();
@@ -1546,7 +1569,9 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         std::sort(scored.begin(), scored.end(), [](auto& a, auto& b) {
           return a.final_score < b.final_score;
         });
-        std::erase_if(scored, [](auto& s) { return s.final_score > 0; });
+        std::erase_if(scored, [](auto& s) {
+          return !is_strictly_improving_rescored_move(s.final_score);
+        });
         if (scored.size() > a.max_moves) scored.resize(a.max_moves);
         for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
         moves_applied = scored.size();
@@ -1582,6 +1607,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         resample_score = resample.parsimony_score;
         prog.done(format_sample_result(resample));
         sampled = std::move(resample.tree);
+        if (ml_config.model != nullptr && ml_config.coeff != 0.0) {
+          sampled_old_pre_move_nll = compute_dag_ml_nll(
+              *ml_config.model, sampled, ml_config.ignore_ua_edge);
+        }
 
         // Recompute max_radius from new tree depth
         auto new_max = compute_tree_max_depth(sampled) * 2;

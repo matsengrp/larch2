@@ -8,6 +8,7 @@
 #include <larch/yaml_reader.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -178,38 +179,43 @@ inline double compute_edge_nll(ml_model const& model, phylo_dag& tree,
   return -ml_log_likelihood(model, parent_seq, child_seq);
 }
 
-// Compute delta ML score for an SPR move by scoring only the changed edges.
+// Compute the ML improvement represented by a full-tree SPR fragment.
 //
-// Identifies nodes on the src→lca and dst→lca paths in the original tree.
-// For each such node, scores the parent edge before and after the move.
-// Returns old_NLL - new_NLL (positive = move improved likelihood).
-//
-// The fragment contains the new topology with Fitch-assigned CGs.
-// The original_tree provides the old edge topology.
+// apply_spr_as_fragment() currently returns a full moved tree (with a fresh UA
+// node and Fitch-assigned compact genomes), not a changed-edge-only fragment.
+// Therefore the unbiased delta is the full old-tree NLL minus the full new-tree
+// NLL.  Positive values mean the move improved likelihood.
+inline double compute_delta_ml_score(ml_model const& model,
+                                     double old_pre_move_nll,
+                                     phylo_dag& fragment,
+                                     bool ignore_ua_edge = true) {
+  if (!std::isfinite(old_pre_move_nll))
+    throw std::runtime_error{
+        "compute_delta_ml_score: non-finite old pre-move ML NLL"};
+
+  double new_nll = compute_dag_ml_nll(model, fragment, ignore_ua_edge);
+  if (!std::isfinite(new_nll))
+    throw std::runtime_error{
+        "compute_delta_ml_score: non-finite new post-move ML NLL"};
+
+  double delta = old_pre_move_nll - new_nll;
+  if (!std::isfinite(delta))
+    throw std::runtime_error{"compute_delta_ml_score: non-finite ML delta"};
+  return delta;
+}
+
+// Convenience overload for callers/tests that do not already have the old-tree
+// NLL cached.  The move argument is retained for source compatibility and to
+// make call sites explicit about which SPR generated the fragment.
 inline double compute_delta_ml_score(ml_model const& model,
                                      phylo_dag& original_tree,
                                      phylo_dag& fragment,
-                                     spr_move const& move,
+                                     spr_move const& /*move*/,
                                      bool ignore_ua_edge = true) {
-  auto affected = collect_affected_nodes(original_tree, move);
-  if (affected.empty()) return 0.0;
-
-  // Old NLL: score parent edges of affected nodes in original tree.
-  double old_nll = 0.0;
-  for (auto nidx : affected) {
-    auto pe = get_parent_edges(original_tree, nidx);
-    if (pe.empty()) continue;
-    auto parent_idx = get_parent_idx(original_tree, pe[0]);
-    if (ignore_ua_edge && is_ua(original_tree, parent_idx)) continue;
-    old_nll += compute_edge_nll(model, original_tree, parent_idx, nidx);
-  }
-
-  // New NLL: score all relevant edges in the fragment.
-  // The fragment is the full affected subtree with new topology, so this
-  // captures all new edges including the new inner node created by the SPR.
-  double new_nll = compute_dag_ml_nll(model, fragment, ignore_ua_edge);
-
-  return old_nll - new_nll;
+  double old_pre_move_nll =
+      compute_dag_ml_nll(model, original_tree, ignore_ua_edge);
+  return compute_delta_ml_score(model, old_pre_move_nll, fragment,
+                                ignore_ua_edge);
 }
 
 // Backward-compatible alias.
@@ -228,20 +234,37 @@ struct ml_scoring_config {
   double coeff = 0.0;
   bool ignore_ua_edge = true;
 
-  // Adjust a parsimony-based score with ML delta LL.
-  // base_score: parsimony score (lower = better).
-  // original_tree: the tree before the SPR move.
-  // fragment: the post-move subtree DAG.
-  // move: the SPR move that produced the fragment.
+  // Adjust a parsimony-based score with an ML improvement term.
+  // base_score: parsimony/node score delta (lower = better).
+  // old_pre_move_nll: ML NLL of the tree/subtree before the SPR move.
+  // fragment: the full post-move tree produced by apply_spr_as_fragment().
   //
-  // Returns: base_score - coeff * delta_LL
-  // When delta_LL > 0 (move improved ML), effective score decreases.
+  // Returns: base_score - coeff * (old_NLL - new_NLL).
+  // When old_NLL - new_NLL > 0 (move improved ML), effective score decreases.
+  double adjust_score(double base_score, double old_pre_move_nll,
+                      phylo_dag& fragment) const {
+    if (model != nullptr && coeff != 0.0) {
+      if (!std::isfinite(coeff))
+        throw std::runtime_error{
+            "ml_scoring_config::adjust_score: non-finite ML coefficient"};
+      double delta_ml = compute_delta_ml_score(*model, old_pre_move_nll,
+                                               fragment, ignore_ua_edge);
+      double adjusted = base_score - coeff * delta_ml;
+      if (!std::isfinite(adjusted))
+        throw std::runtime_error{
+            "ml_scoring_config::adjust_score: non-finite adjusted score"};
+      return adjusted;
+    }
+    return base_score;
+  }
+
+  // Compatibility overload for callers that have not cached old_pre_move_nll.
   double adjust_score(double base_score, phylo_dag& original_tree,
                       phylo_dag& fragment, spr_move const& move) const {
     if (model != nullptr && coeff != 0.0) {
-      double delta_ll = compute_delta_ml_score(*model, original_tree, fragment,
-                                               move, ignore_ua_edge);
-      return base_score - coeff * delta_ll;
+      double old_pre_move_nll =
+          compute_dag_ml_nll(*model, original_tree, ignore_ua_edge);
+      return adjust_score(base_score, old_pre_move_nll, fragment);
     }
     return base_score;
   }
