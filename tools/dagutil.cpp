@@ -188,9 +188,13 @@ Pruning:
   --sample-uniformly      Weight sampling proportional to subtree tree-counts
   --model-dir <path>      Model directory for ml/thrifty sampling or --edge-ml
   --model-name <name>     Model name for ml/thrifty sampling or --edge-ml
-  --ignore-ua-edge-ml     Ignore UA->root edge during ML scoring (default)
-  --score-ua-edge-ml      Score UA->root edge during ML scoring
+  --score-ua-edge-ml      ML ignores UA->root by default; opt in to score it
+  --ignore-ua-edge-ml     Explicitly keep the default ML UA-edge-ignore policy
   --seed <N>              Random seed for sampling
+
+Notes:
+  --sample-method applies only to --sample.  --edge-parsimony/--edge-ml write
+  output edge_weight penalties and cannot combine with --trim or --sample.
 
 Analysis:
   --dag-info              Print all DAG statistics (tree count, parsimony, RF)

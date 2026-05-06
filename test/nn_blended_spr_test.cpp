@@ -294,12 +294,21 @@ void test_rescored_move_strict_improvement_policy() {
 
 void test_adjust_rate_bias_via_variant() {
   auto model = load_ml_model("data/bcr", "s5f");
-  double ll_before = ml_log_likelihood(model, "ACGTACGT", "CCGTACGT");
+  auto const parent = std::string{"ACGTACGTACGTACGTACGT"};
+  auto rates_before = std::get<rs_fivemer_model>(model).forward(parent).rates;
+
   ml_adjust_rate_bias(model, std::log(2.0));
-  double ll_after = ml_log_likelihood(model, "ACGTACGT", "CCGTACGT");
-  assert(std::isfinite(ll_before) && ll_before < 0.0);
-  assert(std::isfinite(ll_after) && ll_after < 0.0);
-  assert(ll_after != ll_before);
+
+  auto const& adjusted = std::get<rs_fivemer_model>(model);
+  assert(std::abs(adjusted.rate_bias_log() - std::log(2.0)) < 1e-12);
+  auto rates_after = adjusted.forward(parent).rates;
+  assert(rates_after.size() == rates_before.size());
+  for (std::size_t i = 0; i < rates_before.size(); ++i) {
+    double expected = static_cast<double>(rates_before[i]) * 2.0;
+    assert(std::abs(static_cast<double>(rates_after[i]) - expected) <
+           1e-4 * expected);
+  }
+
   std::println("  adjust_rate_bias via variant: OK");
 }
 

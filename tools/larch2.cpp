@@ -216,7 +216,7 @@ Output (required):
 Optimization:
   -n, --iterations <N>    Number of optimization iterations (default: 10)
   --patience <P>          Stop after P consecutive iterations with no sampling-objective improvement (P >= 1)
-  --drift <N>             With parsimony sampling, attempt N drift iterations when patience triggers
+  --drift <N>             With parsimony sampling only, attempt N drift iterations when patience triggers
   --optimizer <name>      "native" (default) or "random"
   --max-moves <N>         Max moves per iteration for native (default: 50)
   --seed <N>              Random seed
@@ -227,8 +227,8 @@ Sampling:
                           ml/thrifty, edge-weight
   --sample-uniformly      Weight sampling proportional to subtree tree-counts
   --ignore-root-edge-mutations  Ignore UA->root edge mutations in parsimony
-  --ignore-ua-edge-ml    Ignore UA->root edge during active ML scoring (default)
-  --score-ua-edge-ml     Score UA->root edge during active ML scoring
+  --score-ua-edge-ml     ML ignores UA->root by default; opt in to score it
+  --ignore-ua-edge-ml    Explicitly keep the default ML UA-edge-ignore policy
 
 Move strategy:
   --callback-option <O>   best-moves (default) or all-moves
@@ -258,6 +258,11 @@ Diverse tree extraction:
 Post-processing:
   --trim                  Trim result to minimum-parsimony trees
                           (parsimony sampling only)
+
+Convergence notes:
+  --patience tracks the active sampling objective (ML NLL, edge_weight, RF,
+  or parsimony).  --drift, --trim, and --diverse-sample currently require
+  --sample-method parsimony.
 
 Debugging:
   --validate              Validate DAG invariants at key pipeline points

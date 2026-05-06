@@ -55,8 +55,9 @@ inline void ml_adjust_rate_bias(ml_model& model, double log_factor) {
 
 // Compute total negative log-likelihood for all mutated edges in a DAG using
 // an existing likelihood ops/cache object.  The ops object must reference this
-// DAG's reference sequence and remain scoped to an immutable DAG/model/options
-// lifetime unless clear_cache() is called at mutation boundaries.
+// DAG's reference sequence and remain scoped to one immutable DAG/model/options
+// lifetime; because the cache has no mutation epoch, call clear_cache() before
+// reuse after any DAG/model/options mutation or address reuse.
 inline double compute_dag_ml_nll(phylo_dag& dag,
                                  ml_model_likelihood_score_ops const& ops) {
   double total_nll = 0.0;

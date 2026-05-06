@@ -77,8 +77,8 @@ larch2 [options] -o <output.pb.gz>
 | `--sample-method <M>` | parsimony | `parsimony`, `random`, `rf-minsum`, `rf-maxsum`, `ml`/`thrifty`, or `edge-weight` |
 | `--sample-uniformly` | off | Weight sampling proportional to subtree tree-counts |
 | `--ignore-root-edge-mutations` | off | Ignore UA-to-root edge mutations in parsimony scoring |
-| `--ignore-ua-edge-ml` | on | Default ML behavior: ignore the UA-to-root edge |
-| `--score-ua-edge-ml` | off | Opt in to scoring the UA-to-root edge during active ML scoring |
+| `--score-ua-edge-ml` | off | ML scoring ignores the UA-to-root edge by default; this opts in to scoring it |
+| `--ignore-ua-edge-ml` | on | Explicitly request the default UA-edge-ignore behavior |
 | `--model-dir <path>` | | Model directory for `ml`/`thrifty` sampling or ML move scoring; must be paired with `--model-name` |
 | `--model-name <name>` | | Model name, e.g. `ThriftyHumV0.2-45`; must be paired with `--model-dir` |
 
@@ -171,10 +171,11 @@ Note: `--sample-method ml` controls which tree is sampled from the DAG. With
 the native optimizer, providing `--model-dir` and `--model-name` without
 `--sample-method ml` defaults move scoring to ML-only (`--move-coeff-ml 1.0`,
 and parsimony coefficient 0 unless explicitly set). With `--sample-method ml`,
-ML move scoring is still disabled unless `--move-coeff-ml` is set. The
-`--ignore-ua-edge-ml` / `--score-ua-edge-ml` setting applies to all active
-larch2 ML scoring paths: ML sampling, ML move scoring, and ML metrics; larch2
-warns if either flag is supplied when no ML scoring path is active. ML sampling
+ML move scoring is still disabled unless `--move-coeff-ml` is set. The UA-edge
+ML setting (default: ignore; use `--score-ua-edge-ml` to opt in to scoring)
+applies to all active larch2 ML scoring paths: ML sampling, ML move scoring,
+and ML metrics; larch2 warns if either flag is supplied when no ML scoring path
+is active. ML sampling
 progress is reported as `parsimony P, ML NLL X`; edge-weight sampling is
 reported as `parsimony P, edge_weight W`.
 
@@ -238,14 +239,15 @@ times. All loaded inputs are merged into a single DAG.
 | `--sample-uniformly` | Weight sampling proportional to subtree tree-counts |
 | `--model-dir <path>` | Model directory for `ml`/`thrifty` sampling or `--edge-ml` |
 | `--model-name <name>` | Model name, e.g. `ThriftyHumV0.2-45` |
-| `--ignore-ua-edge-ml` | Ignore UA-to-root edge during ML scoring (default) |
-| `--score-ua-edge-ml` | Score UA-to-root edge during ML scoring |
+| `--score-ua-edge-ml` | ML scoring ignores the UA-to-root edge by default; this opts in to scoring it |
+| `--ignore-ua-edge-ml` | Explicitly request the default UA-edge-ignore behavior |
 | `--seed <N>` | Random seed for sampling |
 
 `--sample-method` is used for `--sample` tree extraction. With `--trim --rf
 --sample`, the RF criterion comes from `--rf`, so `--sample-method` should be
-omitted. The `--ignore-ua-edge-ml` / `--score-ua-edge-ml` setting also applies
-to `--edge-ml`. `--edge-parsimony` and `--edge-ml` write penalties to an output
+omitted. The UA-edge ML setting (default: ignore; use `--score-ua-edge-ml` to
+opt in to scoring) also applies to `--edge-ml`. `--edge-parsimony` and
+`--edge-ml` write penalties to an output
 DAG and cannot be combined with `--trim` or `--sample`; run sampling/trimming as
 a second command.
 
@@ -269,8 +271,8 @@ penalty[e] = min_score(any tree containing e) - global_min_score
 
 So `edge_weight == 0` means the edge appears in at least one globally optimal
 tree under that criterion (within numerical tolerance for ML). `--edge-ml` uses
-ML/NN negative log likelihood and is affected by `--ignore-ua-edge-ml` /
-`--score-ua-edge-ml`.
+ML/NN negative log likelihood and uses the same UA-edge policy as ML sampling:
+ignore by default, or score with `--score-ua-edge-ml`.
 
 ### Examples
 

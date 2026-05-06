@@ -33,10 +33,13 @@ inline std::string reconstruct_sequence(phylo_dag& dag, std::size_t node_idx,
 
 // Per-WeightOps cache for likelihood scoring.
 //
-// The cache is intentionally tied to the phylo_dag object address used by
-// compute_edge().  Use a fresh ops object, or call clear_cache(), after
-// mutating the DAG, changing the referenced model state (for example via
-// ml_adjust_rate_bias()), or changing scoring options that affect edge scores.
+// The cache is intentionally tied only to the phylo_dag object address used by
+// compute_edge(); there is no DAG mutation epoch in the key.  A reused ops
+// object is valid only for one immutable DAG topology/annotation/reference,
+// model state, and set of scoring options.  Use a fresh ops object, or call
+// clear_cache(), after mutating the DAG, changing the referenced model state
+// (for example via ml_adjust_rate_bias()), changing scoring options that affect
+// edge scores, or reusing storage for a different DAG at the same address.
 //
 // The cache mutates inside const compute_edge(); this is intended for the
 // current serial subtree_weight use.  A shared ops object is not thread-safe
@@ -54,10 +57,11 @@ struct likelihood_score_cache {
   }
 
   void ensure_for(phylo_dag& d) const {
-    // Only the DAG object address is tracked here.  In-place mutations, model
-    // state changes, scoring-option changes, or destruction/reuse of another
-    // DAG at the same address are not detectable; callers reusing an ops
-    // object across those boundaries must call clear_cache().
+    // Only the DAG object address is tracked here.  In-place mutations of
+    // topology, compact genomes, edge mutations/weights, or the reference;
+    // model state changes; scoring-option changes; or destruction/reuse of
+    // another DAG at the same address are not detectable.  Callers reusing an
+    // ops object across any such boundary must call clear_cache().
     if (dag != &d) {
       dag = &d;
       sequences.clear();

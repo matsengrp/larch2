@@ -117,9 +117,11 @@ inline double poisson_context_log_likelihood(std::span<const float> rates,
         throw std::runtime_error{
             "poisson_context_log_likelihood: invalid substitution probability at position " +
             std::to_string(i)};
-      // Float32 softmax can legitimately underflow extremely unlikely classes
-      // to exactly zero.  Clamp only that underflow floor; NaN and negative
-      // probabilities are rejected above.
+      // Current NN models produce float32 softmax probabilities, which can
+      // legitimately underflow extremely unlikely classes to exactly zero.
+      // Clamp only that float32 underflow floor; NaN and negative probabilities
+      // are rejected above.  Revisit this floor if future models expose a
+      // different probability representation or precision.
       if (sub_prob < 1e-30) sub_prob = 1e-30;
       double lambda = rate * sub_prob;
       if (!std::isfinite(lambda) || lambda <= 0.0)
