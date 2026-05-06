@@ -1,6 +1,7 @@
 #include <larch/load_proto_dag.hpp>
 #include <larch/load_parsimony.hpp>
 #include <larch/save_proto_dag.hpp>
+#include <larch/sample_method.hpp>
 #include <larch/fasta.hpp>
 #include <larch/vcf.hpp>
 #include <larch/merge.hpp>
@@ -159,23 +160,6 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
 }
 
 // ---------------------------------------------------------------------------
-// Sampling helpers
-// ---------------------------------------------------------------------------
-
-static bool is_ml_sample_method(std::string const& method) {
-  return method == "ml" || method == "thrifty";
-}
-
-static bool is_edge_weight_sample_method(std::string const& method) {
-  return method == "edge-weight" || method == "edge_weight";
-}
-
-static bool is_known_sample_method(std::string const& method) {
-  return method == "random" || method == "parsimony" ||
-         is_ml_sample_method(method) || is_edge_weight_sample_method(method);
-}
-
-// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -202,8 +186,8 @@ Pruning:
   -s, --sample            Sample a single tree from the DAG
   --sample-method <M>     random (default), parsimony, ml/thrifty, edge-weight
   --sample-uniformly      Weight sampling proportional to subtree tree-counts
-  --model-dir <path>      Model directory for ml/thrifty sampling
-  --model-name <name>     Model name for ml/thrifty sampling
+  --model-dir <path>      Model directory for ml/thrifty sampling or --edge-ml
+  --model-name <name>     Model name for ml/thrifty sampling or --edge-ml
   --ignore-ua-edge-ml     Ignore UA->root edge during ML scoring (default)
   --score-ua-edge-ml      Score UA->root edge during ML scoring
   --seed <N>              Random seed for sampling
@@ -212,8 +196,10 @@ Analysis:
   --dag-info              Print all DAG statistics (tree count, parsimony, RF)
   --parsimony             Print parsimony score distribution
   --sum-rf-distance       Print sum RF distance distribution
-  --edge-parsimony        Compute per-edge parsimony penalties (store in output)
-  --edge-ml               Compute per-edge ML penalties (store in output)
+  --edge-parsimony        Compute per-edge parsimony penalties (store in output;
+                          cannot combine with --trim/--sample)
+  --edge-ml               Compute per-edge ML penalties (store in output;
+                          cannot combine with --trim/--sample)
 
 Debugging:
   --validate              Validate DAG invariants
@@ -392,10 +378,10 @@ static args parse_args(int argc, char** argv) {
     std::cerr << "error: choose only one of --edge-parsimony or --edge-ml\n";
     std::exit(1);
   }
-  if (a.edge_ml && (a.trim || a.sample)) {
-    std::cerr << "error: --edge-ml cannot be combined with --trim or "
-                 "--sample; write ML penalties to an output DAG first, then "
-                 "run sampling/trimming in a second command\n";
+  if ((a.edge_parsimony || a.edge_ml) && (a.trim || a.sample)) {
+    std::cerr << "error: --edge-parsimony/--edge-ml cannot be combined with "
+                 "--trim or --sample; write edge penalties to an output DAG "
+                 "first, then run sampling/trimming in a second command\n";
     std::exit(1);
   }
   if (a.edge_ml && (a.model_dir.empty() || a.model_name.empty())) {
@@ -529,9 +515,6 @@ int main(int argc, char** argv) try {
 
   // ---- Per-edge global penalties ----
   std::vector<float> edge_penalties;
-  if (a.edge_parsimony && (a.trim || a.sample))
-    std::cerr << "warning: --edge-parsimony scores are not written when "
-                 "combined with --trim or --sample\n";
   if (a.edge_parsimony) {
     scoped_arena<4096> arena;
     auto* mr = arena.get();

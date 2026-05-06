@@ -3,6 +3,7 @@
 #include <larch/model_variant.hpp>
 #include <larch/load_parsimony.hpp>
 #include <larch/save_proto_dag.hpp>
+#include <larch/sample_method.hpp>
 #include <larch/fasta.hpp>
 #include <larch/vcf.hpp>
 #include <larch/merge.hpp>
@@ -223,8 +224,8 @@ Sampling:
                           ml/thrifty, edge-weight
   --sample-uniformly      Weight sampling proportional to subtree tree-counts
   --ignore-root-edge-mutations  Ignore UA->root edge mutations in parsimony
-  --ignore-ua-edge-ml    Ignore UA->root edge during ML scoring (default)
-  --score-ua-edge-ml     Score UA->root edge during ML scoring
+  --ignore-ua-edge-ml    Ignore UA->root edge during active ML scoring (default)
+  --score-ua-edge-ml     Score UA->root edge during active ML scoring
 
 Move strategy:
   --callback-option <O>   best-moves (default) or all-moves
@@ -234,8 +235,8 @@ Move strategy:
   --move-score-threshold <N>  Max parsimony score for enumerated moves (default: -1, or 0 with --move-coeff-nodes)
 
 ML scoring:
-  --model-dir <path>      Directory containing model files (e.g. data/bcr)
-  --model-name <name>     Model name (e.g. s5f, ThriftyHumV0.2-45)
+  --model-dir <path>      Directory containing model files (must pair with --model-name)
+  --model-name <name>     Model name (must pair with --model-dir)
 
 Metrics:
   --log-metrics           Print extended per-iteration metrics to stderr
@@ -247,11 +248,13 @@ Subtree optimization:
 
 Diverse tree extraction:
   --diverse-sample <K>    Extract K maximally diverse parsimony-optimal trees
+                          (parsimony sampling only)
   --diverse-pool <N>      Override pool size (default: max(10K, 100))
   --diverse-newick <path> Write selected trees as Newick strings (one per line)
 
 Post-processing:
   --trim                  Trim result to minimum-parsimony trees
+                          (parsimony sampling only)
 
 Debugging:
   --validate              Validate DAG invariants at key pipeline points
@@ -279,6 +282,7 @@ struct args {
   bool sample_uniformly = false;
   bool ignore_root_edge_mutations = false;
   bool ignore_ua_edge_ml = true;
+  bool ua_edge_ml_explicit = false;
   std::string callback_option = "best-moves";
   bool log_metrics = false;
   std::optional<std::size_t> switch_subtrees;
@@ -299,6 +303,65 @@ struct args {
   std::optional<std::size_t> patience;
   std::optional<std::size_t> drift;
 };
+
+static bool has_any_model_arg(args const& a) {
+  return !a.model_dir.empty() || !a.model_name.empty();
+}
+
+static bool has_complete_model_args(args const& a) {
+  return !a.model_dir.empty() && !a.model_name.empty();
+}
+
+static bool native_ml_move_scoring_requested(args const& a) {
+  if (a.optimizer != "native") return false;
+  if (a.move_coeff_ml > 0.0) return true;
+  return has_complete_model_args(a) && !is_ml_sample_method(a.sample_method) &&
+         !a.move_coeff_ml_explicit;
+}
+
+static bool has_active_ml_scoring_path(args const& a) {
+  return is_ml_sample_method(a.sample_method) ||
+         native_ml_move_scoring_requested(a) ||
+         (a.log_metrics && has_complete_model_args(a));
+}
+
+static void validate_args(args const& a) {
+  if (!is_known_sample_method(a.sample_method, true)) {
+    std::cerr << "error: unknown sample method '" << a.sample_method << "'\n";
+    std::exit(1);
+  }
+  if (has_any_model_arg(a) && !has_complete_model_args(a)) {
+    std::cerr << "error: --model-dir and --model-name must be provided "
+                 "together\n";
+    std::exit(1);
+  }
+  if (a.trim && a.sample_method != "parsimony") {
+    std::cerr << "error: --trim currently supports only --sample-method "
+                 "parsimony; omit --sample-method or run non-parsimony "
+                 "sampling without --trim\n";
+    std::exit(1);
+  }
+  if (a.diverse_sample && a.sample_method != "parsimony") {
+    std::cerr << "error: --diverse-sample currently supports only "
+                 "--sample-method parsimony\n";
+    std::exit(1);
+  }
+  if (is_ml_sample_method(a.sample_method) && !has_complete_model_args(a)) {
+    std::cerr << "error: --model-dir and --model-name required with "
+                 "--sample-method "
+              << a.sample_method << "\n";
+    std::exit(1);
+  }
+  if (a.move_coeff_ml > 0.0 && !has_complete_model_args(a)) {
+    std::cerr << "error: --model-dir and --model-name required with "
+                 "--move-coeff-ml\n";
+    std::exit(1);
+  }
+  if (a.ua_edge_ml_explicit && !has_active_ml_scoring_path(a)) {
+    std::cerr << "warning: --ignore-ua-edge-ml/--score-ua-edge-ml has no "
+                 "effect because no ML scoring path is active\n";
+  }
+}
 
 static args parse_args(int argc, char** argv) {
   args a;
@@ -341,11 +404,13 @@ static args parse_args(int argc, char** argv) {
       a.sample_uniformly = true;
     else if (arg == "--ignore-root-edge-mutations")
       a.ignore_root_edge_mutations = true;
-    else if (arg == "--ignore-ua-edge-ml")
+    else if (arg == "--ignore-ua-edge-ml") {
       a.ignore_ua_edge_ml = true;
-    else if (arg == "--score-ua-edge-ml")
+      a.ua_edge_ml_explicit = true;
+    } else if (arg == "--score-ua-edge-ml") {
       a.ignore_ua_edge_ml = false;
-    else if (arg == "--callback-option")
+      a.ua_edge_ml_explicit = true;
+    } else if (arg == "--callback-option")
       a.callback_option = next();
     else if (arg == "--log-metrics")
       a.log_metrics = true;
@@ -406,6 +471,7 @@ static args parse_args(int argc, char** argv) {
     usage();
     std::exit(1);
   }
+  validate_args(a);
   return a;
 }
 
@@ -419,14 +485,6 @@ struct sampled_tree_result {
   std::optional<double> ml_score;
   std::optional<double> edge_weight_score;
 };
-
-static bool is_ml_sample_method(std::string const& method) {
-  return method == "ml" || method == "thrifty";
-}
-
-static bool is_edge_weight_sample_method(std::string const& method) {
-  return method == "edge-weight" || method == "edge_weight";
-}
 
 static std::size_t compute_tree_parsimony_score(phylo_dag& tree) {
   std::size_t score = 0;

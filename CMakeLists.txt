@@ -320,6 +320,27 @@ add_test(NAME dagutil_edge_weight_score
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(dagutil_edge_weight_score
                      PROPERTIES FIXTURES_SETUP dagutil_edge_weight_fixture)
+add_test(NAME dagutil_edge_parsimony_with_sample_fails
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --edge-parsimony
+                 --sample
+                 --sample-method edge-weight
+                 -o ${CMAKE_BINARY_DIR}/dagutil_edge_parsimony_with_sample.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_edge_parsimony_with_sample_fails
+                     PROPERTIES WILL_FAIL TRUE)
+add_test(NAME dagutil_edge_parsimony_with_trim_fails
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --edge-parsimony
+                 --trim
+                 -o ${CMAKE_BINARY_DIR}/dagutil_edge_parsimony_with_trim.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_edge_parsimony_with_trim_fails
+                     PROPERTIES WILL_FAIL TRUE)
 add_test(NAME dagutil_edge_weight_sample
          COMMAND dagutil
                  --dag-pb ${DAGUTIL_EDGE_WEIGHT_SCORED_OUT}
@@ -373,6 +394,55 @@ add_test(NAME larch2_ml_score_ua_edge_sample
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(larch2_ml_score_ua_edge_sample
                      PROPERTIES PASS_REGULAR_EXPRESSION "ML NLL")
+
+add_test(NAME larch2_unknown_sample_method_fails
+         COMMAND larch2
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --sample-method definitely-not-a-method
+                 -o ${CMAKE_BINARY_DIR}/larch2_unknown_sample_method.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(larch2_unknown_sample_method_fails
+                     PROPERTIES WILL_FAIL TRUE)
+add_test(NAME larch2_trim_ml_sample_method_fails
+         COMMAND larch2
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --trim
+                 --sample-method ml
+                 --model-dir data/bcr
+                 --model-name ThriftyHumV0.2-45
+                 -o ${CMAKE_BINARY_DIR}/larch2_trim_ml_sample_method.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(larch2_trim_ml_sample_method_fails
+                     PROPERTIES WILL_FAIL TRUE)
+add_test(NAME larch2_diverse_ml_sample_method_fails
+         COMMAND larch2
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --diverse-sample 2
+                 --sample-method ml
+                 --model-dir data/bcr
+                 --model-name ThriftyHumV0.2-45
+                 -o ${CMAKE_BINARY_DIR}/larch2_diverse_ml_sample_method.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(larch2_diverse_ml_sample_method_fails
+                     PROPERTIES WILL_FAIL TRUE)
+add_test(NAME larch2_partial_model_args_fail
+         COMMAND larch2
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --model-dir data/bcr
+                 -o ${CMAKE_BINARY_DIR}/larch2_partial_model_args.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(larch2_partial_model_args_fail PROPERTIES WILL_FAIL TRUE)
+add_test(NAME larch2_ua_flag_without_ml_warns
+         COMMAND larch2
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --optimizer random
+                 --score-ua-edge-ml
+                 -n 0
+                 -o ${CMAKE_BINARY_DIR}/larch2_ua_flag_without_ml.pb.gz
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(larch2_ua_flag_without_ml_warns
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "warning: --ignore-ua-edge-ml/--score-ua-edge-ml has no effect")
 
 # Tests that need liblarch (protobuf + zlib + threads) and run from source dir
 foreach(test_name merge_test merge_consistency_test subtree_weight_test

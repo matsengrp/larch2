@@ -77,10 +77,10 @@ larch2 [options] -o <output.pb.gz>
 | `--sample-method <M>` | parsimony | `parsimony`, `random`, `rf-minsum`, `rf-maxsum`, `ml`/`thrifty`, or `edge-weight` |
 | `--sample-uniformly` | off | Weight sampling proportional to subtree tree-counts |
 | `--ignore-root-edge-mutations` | off | Ignore UA-to-root edge mutations in parsimony scoring |
-| `--ignore-ua-edge-ml` | on | Ignore UA-to-root edge during ML scoring |
-| `--score-ua-edge-ml` | off | Score UA-to-root edge during ML scoring |
-| `--model-dir <path>` | | Model directory for `ml`/`thrifty` sampling or ML move scoring |
-| `--model-name <name>` | | Model name, e.g. `ThriftyHumV0.2-45` |
+| `--ignore-ua-edge-ml` | on | Default ML behavior: ignore the UA-to-root edge |
+| `--score-ua-edge-ml` | off | Opt in to scoring the UA-to-root edge during active ML scoring |
+| `--model-dir <path>` | | Model directory for `ml`/`thrifty` sampling or ML move scoring; must be paired with `--model-name` |
+| `--model-name <name>` | | Model name, e.g. `ThriftyHumV0.2-45`; must be paired with `--model-dir` |
 
 Sampling methods:
 
@@ -91,6 +91,9 @@ Sampling methods:
 | `rf-minsum` / `rf-maxsum` | Sample by RF-distance criterion during larch2 optimization |
 | `ml` / `thrifty` | Sample a minimum ML/NN negative-log-likelihood tree; requires `--model-dir` and `--model-name` |
 | `edge-weight` | Sample a minimum sum of stored protobuf/in-memory `edge_weight` values |
+
+`--trim` and `--diverse-sample` currently support only the parsimony sampling
+objective; non-parsimony `--sample-method` values are rejected with those modes.
 
 ### Move strategy
 
@@ -114,7 +117,7 @@ Sampling methods:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--diverse-sample <K>` | off | Extract K maximally diverse parsimony-optimal trees |
+| `--diverse-sample <K>` | off | Extract K maximally diverse parsimony-optimal trees; requires parsimony sampling |
 | `--diverse-pool <N>` | max(10K, 100) | Override the candidate pool size |
 | `--diverse-newick <path>` | | Write selected trees as Newick strings (one per line) |
 
@@ -122,7 +125,7 @@ Sampling methods:
 
 | Option | Description |
 |--------|-------------|
-| `--trim` | Trim output to a single minimum-parsimony tree |
+| `--trim` | Trim output to a single minimum-parsimony tree; rejects non-parsimony `--sample-method` |
 | `--log-metrics` | Print extended per-iteration metrics to stderr |
 | `--validate` | Validate DAG invariants at key pipeline points |
 
@@ -169,8 +172,9 @@ the native optimizer, providing `--model-dir` and `--model-name` without
 `--sample-method ml` defaults move scoring to ML-only (`--move-coeff-ml 1.0`,
 and parsimony coefficient 0 unless explicitly set). With `--sample-method ml`,
 ML move scoring is still disabled unless `--move-coeff-ml` is set. The
-`--ignore-ua-edge-ml` / `--score-ua-edge-ml` setting applies to all larch2 ML
-scoring paths: ML sampling, ML move scoring, and ML metrics. ML sampling
+`--ignore-ua-edge-ml` / `--score-ua-edge-ml` setting applies to all active
+larch2 ML scoring paths: ML sampling, ML move scoring, and ML metrics; larch2
+warns if either flag is supplied when no ML scoring path is active. ML sampling
 progress is reported as `parsimony P, ML NLL X`; edge-weight sampling is
 reported as `parsimony P, edge_weight W`.
 
@@ -235,8 +239,9 @@ times. All loaded inputs are merged into a single DAG.
 `--sample-method` is used for `--sample` tree extraction. With `--trim --rf
 --sample`, the RF criterion comes from `--rf`, so `--sample-method` should be
 omitted. The `--ignore-ua-edge-ml` / `--score-ua-edge-ml` setting also applies
-to `--edge-ml`. `--edge-ml` writes penalties to an output DAG and cannot be
-combined with `--trim` or `--sample`; run sampling/trimming as a second command.
+to `--edge-ml`. `--edge-parsimony` and `--edge-ml` write penalties to an output
+DAG and cannot be combined with `--trim` or `--sample`; run sampling/trimming as
+a second command.
 
 ### Analysis
 
@@ -245,8 +250,8 @@ combined with `--trim` or `--sample`; run sampling/trimming as a second command.
 | `--dag-info` | Print all DAG statistics (tree count, parsimony, RF) |
 | `--parsimony` | Print parsimony score distribution |
 | `--sum-rf-distance` | Print sum RF distance distribution |
-| `--edge-parsimony` | Store per-edge global parsimony penalties in protobuf `edge_weight` |
-| `--edge-ml` | Store per-edge global ML-NLL penalties in protobuf `edge_weight` (requires model args; `--edge-thrifty` alias also accepted) |
+| `--edge-parsimony` | Store per-edge global parsimony penalties in protobuf `edge_weight` (cannot combine with `--trim`/`--sample`) |
+| `--edge-ml` | Store per-edge global ML-NLL penalties in protobuf `edge_weight` (requires model args; `--edge-thrifty` alias also accepted; cannot combine with `--trim`/`--sample`) |
 | `--validate` | Validate DAG invariants |
 
 Per-edge penalty outputs use the stored protobuf `edge_weight` field. For each
