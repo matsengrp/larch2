@@ -54,7 +54,6 @@ static std::string read_refseq(std::string_view path) {
 static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
                                          std::string_view newick_path,
                                          std::string const& reference) {
-
   auto entries = read_fasta(fasta_path);
   std::unordered_map<std::string, std::string> fasta_map;
   for (auto& e : entries) fasta_map[e.name] = std::move(e.sequence);
@@ -177,9 +176,13 @@ Output:
   -o, --output <path>     Output DAG in protobuf DAG format (optional)
 
 Pruning:
-  -t, --trim              Trim to best parsimony score
-  --rf <path>             Trim to minimize RF distance to this DAG file
+  -t, --trim              Trim to selected min/max parsimony score
+                           (or RF with --rf)
+  --rf <path>             Trim/sample by RF distance to this DAG file
+  --min                   Select minimum-scoring trees (default)
+  --max, --MAX            Select maximum-scoring trees
   -s, --sample            Sample a single tree from the DAG
+                           (random unless used with --trim, --min/--max, or --rf)
   --seed <N>              Random seed for sampling
 
 Analysis:
@@ -208,6 +211,7 @@ struct args {
   std::string output;
   bool trim = false;
   std::string rf;
+  std::optional<bool> maximize;
   bool sample = false;
   std::optional<std::uint32_t> seed;
   bool dag_info = false;
@@ -248,7 +252,19 @@ static args parse_args(int argc, char** argv) {
       a.trim = true;
     else if (arg == "--rf")
       a.rf = next();
-    else if (arg == "-s" || arg == "--sample")
+    else if (arg == "--min") {
+      if (a.maximize.has_value() && *a.maximize) {
+        std::cerr << "error: cannot specify both --min and --max\n";
+        std::exit(1);
+      }
+      a.maximize = false;
+    } else if (arg == "--max" || arg == "--MAX") {
+      if (a.maximize.has_value() && !*a.maximize) {
+        std::cerr << "error: cannot specify both --min and --max\n";
+        std::exit(1);
+      }
+      a.maximize = true;
+    } else if (arg == "-s" || arg == "--sample")
       a.sample = true;
     else if (arg == "--seed")
       a.seed = static_cast<uint32_t>(std::stoull(std::string{next()}));
@@ -470,41 +486,79 @@ int main(int argc, char** argv) try {
     scoped_arena<4096> arena;
     auto* mr = arena.get();
 
+    bool const scored_sample =
+        a.sample && (a.maximize.has_value() || !a.rf.empty());
+
     if (a.edge_parsimony && !a.trim && !a.sample) {
       save_proto_dag(result, a.output, edge_penalties);
-    } else if (a.trim) {
+    } else if (a.trim || scored_sample) {
+      bool const maximize = a.maximize.value_or(false);
+      // subtree_weight's "min_weight" methods select the optimum according to
+      // the WeightOps comparator; max_* ops therefore select maximum scores.
       if (a.rf.empty()) {
-        // Trim to best parsimony
-        parsimony_score_ops pops;
-        subtree_weight<parsimony_score_ops> sw(result, a.seed, mr);
-        sw.compute_weight_below(root_idx, pops);
-        if (a.sample) {
-          std::cerr << "Sampling a tree from min-parsimony options...\n";
-          auto tree = sw.min_weight_sample_tree(pops);
-          save_proto_dag(tree, a.output);
+        if (maximize) {
+          // Trim/sample to maximum parsimony
+          max_parsimony_score_ops pops;
+          subtree_weight<max_parsimony_score_ops> sw(result, a.seed, mr);
+          sw.compute_weight_below(root_idx, pops);
+          if (a.sample) {
+            std::cerr << "Sampling a tree from max-parsimony options...\n";
+            auto tree = sw.min_weight_sample_tree(pops);
+            save_proto_dag(tree, a.output);
+          } else {
+            std::cerr << "Trimming DAG to max parsimony...\n";
+            auto trimmed = sw.trim_to_min_weight(pops);
+            save_proto_dag(trimmed, a.output);
+          }
         } else {
-          std::cerr << "Trimming DAG to min parsimony...\n";
-          auto trimmed = sw.trim_to_min_weight(pops);
-          save_proto_dag(trimmed, a.output);
+          // Trim/sample to minimum parsimony
+          parsimony_score_ops pops;
+          subtree_weight<parsimony_score_ops> sw(result, a.seed, mr);
+          sw.compute_weight_below(root_idx, pops);
+          if (a.sample) {
+            std::cerr << "Sampling a tree from min-parsimony options...\n";
+            auto tree = sw.min_weight_sample_tree(pops);
+            save_proto_dag(tree, a.output);
+          } else {
+            std::cerr << "Trimming DAG to min parsimony...\n";
+            auto trimmed = sw.trim_to_min_weight(pops);
+            save_proto_dag(trimmed, a.output);
+          }
         }
       } else {
-        // Trim to minimize RF distance to provided DAG
+        // Trim/sample by RF distance to provided DAG
         auto rf_dag = load_proto_dag(a.rf);
         merge rf_m{get_reference_sequence(rf_dag)};
         rf_m.add_dag(rf_dag);
 
-        sum_rf_distance_ops rf_ops{rf_m, m};
-        sum_rf_distance srf(rf_ops);
-        subtree_weight<sum_rf_distance> sw(result, a.seed, mr);
-        sw.compute_weight_below(root_idx, srf);
-        if (a.sample) {
-          std::cerr << "Sampling a tree from min-RF options...\n";
-          auto tree = sw.min_weight_sample_tree(srf);
-          save_proto_dag(tree, a.output);
+        if (maximize) {
+          max_sum_rf_distance_ops rf_ops{rf_m, m};
+          max_sum_rf_distance srf(rf_ops);
+          subtree_weight<max_sum_rf_distance> sw(result, a.seed, mr);
+          sw.compute_weight_below(root_idx, srf);
+          if (a.sample) {
+            std::cerr << "Sampling a tree from max-RF options...\n";
+            auto tree = sw.min_weight_sample_tree(srf);
+            save_proto_dag(tree, a.output);
+          } else {
+            std::cerr << "Trimming DAG to max RF distance...\n";
+            auto trimmed = sw.trim_to_min_weight(srf);
+            save_proto_dag(trimmed, a.output);
+          }
         } else {
-          std::cerr << "Trimming DAG to min RF distance...\n";
-          auto trimmed = sw.trim_to_min_weight(srf);
-          save_proto_dag(trimmed, a.output);
+          sum_rf_distance_ops rf_ops{rf_m, m};
+          sum_rf_distance srf(rf_ops);
+          subtree_weight<sum_rf_distance> sw(result, a.seed, mr);
+          sw.compute_weight_below(root_idx, srf);
+          if (a.sample) {
+            std::cerr << "Sampling a tree from min-RF options...\n";
+            auto tree = sw.min_weight_sample_tree(srf);
+            save_proto_dag(tree, a.output);
+          } else {
+            std::cerr << "Trimming DAG to min RF distance...\n";
+            auto trimmed = sw.trim_to_min_weight(srf);
+            save_proto_dag(trimmed, a.output);
+          }
         }
       }
     } else if (a.sample) {

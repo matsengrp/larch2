@@ -172,9 +172,11 @@ times. All loaded inputs are merged into a single DAG.
 
 | Option | Description |
 |--------|-------------|
-| `-t, --trim` | Trim to best parsimony score |
-| `--rf <path>` | Trim to minimize RF distance to this DAG file |
-| `-s, --sample` | Sample a single tree from the DAG |
+| `-t, --trim` | Trim to selected min/max parsimony score (or RF with `--rf`) |
+| `--rf <path>` | Trim/sample by RF distance to this DAG file instead of parsimony |
+| `--min` | Select minimum-scoring trees (default) |
+| `--max`, `--MAX` | Select maximum-scoring trees (`--MAX` is old-larch compatibility) |
+| `-s, --sample` | Sample a single tree from the DAG; with `--trim`, `--min`/`--max`, or `--rf`, sample from the selected score optimum |
 | `--seed <N>` | Random seed for sampling |
 
 ### Analysis
@@ -210,6 +212,12 @@ Trim to minimize RF distance to a reference DAG:
 
 ```sh
 dagutil --dag-pb input.pb.gz --force-no-vcf -o closest.pb -t --rf ref.pb.gz
+```
+
+Sample a tree with maximum RF distance to a reference DAG:
+
+```sh
+dagutil --dag-pb input.pb.gz --force-no-vcf -o farthest.pb -s --rf ref.pb.gz --max
 ```
 
 ## License
