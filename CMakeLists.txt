@@ -117,8 +117,7 @@ if(ENABLE_VULKAN)
     include(cmake/CompileShaders.cmake)
 
     compile_shaders(
-        SHADERS shaders/double_it.comp
-                shaders/fivemer_forward.comp
+        SHADERS shaders/fivemer_forward.comp
                 shaders/cnn_r_branch.comp
                 shaders/cnn_s_branch.comp
         OUTPUT_DIR ${CMAKE_BINARY_DIR}/generated/larch
@@ -523,9 +522,15 @@ endforeach()
 
 # Vulkan compute tests
 if(ENABLE_VULKAN)
+    compile_shaders(
+        SHADERS test/shaders/test_double_it.comp
+        OUTPUT_DIR ${CMAKE_BINARY_DIR}/generated/larch
+        TARGET larch_vulkan_test_shaders
+    )
+
     add_executable(vulkan_compute_test test/vulkan_compute_test.cpp)
     target_link_libraries(vulkan_compute_test PRIVATE larch_vulkan)
-    add_dependencies(vulkan_compute_test larch_shaders)
+    add_dependencies(vulkan_compute_test larch_vulkan_test_shaders)
     add_test(NAME vulkan_compute_test COMMAND vulkan_compute_test)
 
     add_executable(nn_inference_test test/nn_inference_test.cpp)

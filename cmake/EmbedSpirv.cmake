@@ -4,7 +4,7 @@
 # Variables (passed via -D):
 #   SPV_FILE  — path to the .spv binary
 #   HPP_FILE  — path to the output .hpp file
-#   NAME      — C++ identifier stem (e.g. "double_it" -> larch::shaders::double_it_spv)
+#   NAME      — C++ identifier stem (e.g. "foo" -> larch::shaders::foo_spv)
 
 file(READ "${SPV_FILE}" spv_hex HEX)
 string(LENGTH "${spv_hex}" hex_len)

@@ -12,7 +12,7 @@
 #include <vector>
 
 // Embedded SPIR-V bytecode — generated at build time.
-#include <larch/double_it_spv.hpp>
+#include <larch/test_double_it_spv.hpp>
 
 using namespace larch;
 
@@ -82,7 +82,7 @@ void test_double_it_shader(vk_context& ctx) {
 
   // Create pipeline with push constants (uint count).
   auto pipeline =
-      vk_pipeline::create(ctx, shaders::double_it, 2, sizeof(uint32_t));
+      vk_pipeline::create(ctx, shaders::test_double_it, 2, sizeof(uint32_t));
 
   uint32_t count = static_cast<uint32_t>(N);
   auto pc =
@@ -98,7 +98,7 @@ void test_double_it_shader(vk_context& ctx) {
     float expected = static_cast<float>(i) * 2.0f;
     assert(std::abs(output[i] - expected) < 1e-6f);
   }
-  std::println("  double_it shader (N={}): OK", N);
+  std::println("  test_double_it shader (N={}): OK", N);
 }
 
 void test_large_dispatch(vk_context& ctx) {
@@ -114,7 +114,7 @@ void test_large_dispatch(vk_context& ctx) {
   in_buf.upload_typed(std::span{input});
 
   auto pipeline =
-      vk_pipeline::create(ctx, shaders::double_it, 2, sizeof(uint32_t));
+      vk_pipeline::create(ctx, shaders::test_double_it, 2, sizeof(uint32_t));
 
   uint32_t count = static_cast<uint32_t>(N);
   auto pc =

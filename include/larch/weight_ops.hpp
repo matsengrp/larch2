@@ -56,6 +56,7 @@ struct parsimony_score_ops {
     assert(!weights.empty());
     weight_type best = *std::min_element(weights.begin(), weights.end());
     std::vector<std::size_t> indices;
+    // Parsimony weights are integer mutation counts, so ties are exact.
     for (std::size_t i = 0; i < weights.size(); ++i)
       if (weights[i] == best) indices.push_back(i);
     return {best, indices};
@@ -134,6 +135,7 @@ struct ua_free_parsimony_score_ops {
     assert(!weights.empty());
     weight_type best = *std::min_element(weights.begin(), weights.end());
     std::vector<std::size_t> indices;
+    // Parsimony weights are integer mutation counts, so ties are exact.
     for (std::size_t i = 0; i < weights.size(); ++i)
       if (weights[i] == best) indices.push_back(i);
     return {best, indices};
@@ -174,6 +176,8 @@ struct edge_weight_score_ops {
     assert(!weights.empty());
     double best = *std::min_element(weights.begin(), weights.end());
     std::vector<std::size_t> indices;
+    // Edge weights are floating-point penalties; treat values within the
+    // shared min-weight tolerance as ties.
     for (std::size_t i = 0; i < weights.size(); ++i)
       if (within_min_weight_tie(weights[i], best)) indices.push_back(i);
     return {best, indices};
@@ -211,6 +215,7 @@ struct max_parsimony_binary_ops {
   }
 
   bool compare_equal(weight_type lhs, weight_type rhs) const {
+    // Max-parsimony weights are also integer counts; ties are exact.
     return lhs == rhs;
   }
 

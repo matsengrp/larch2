@@ -170,6 +170,8 @@ struct likelihood_score_ops {
     assert(!weights.empty());
     double best = *std::min_element(weights.begin(), weights.end());
     std::vector<std::size_t> indices;
+    // ML weights are floating-point negative log-likelihoods; treat values
+    // within the shared min-weight tolerance as ties.
     for (std::size_t i = 0; i < weights.size(); ++i)
       if (within_min_weight_tie(weights[i], best)) indices.push_back(i);
     return {best, indices};
