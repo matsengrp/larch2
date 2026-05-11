@@ -18,12 +18,14 @@
 #include <larch/newick.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -186,8 +188,10 @@ Pruning:
   -s, --sample            Sample a single tree from the DAG
   --sample-method <M>     random (default), parsimony, ml/thrifty, edge-weight
   --sample-uniformly      Weight sampling proportional to subtree tree-counts
-  --model-dir <path>      Model directory for ml/thrifty sampling or --edge-ml
-  --model-name <name>     Model name for ml/thrifty sampling or --edge-ml
+  --model-dir <path>      Model directory for ml/thrifty sampling, --edge-ml,
+                          or --edge-thrifty
+  --model-name <name>     Model name for ml/thrifty sampling, --edge-ml,
+                          or --edge-thrifty
   --score-ua-edge-ml      ML ignores UA->root by default; opt in to score it
   --ignore-ua-edge-ml     Explicitly keep the default ML UA-edge-ignore policy
   --seed <N>              Random seed for sampling
@@ -202,7 +206,8 @@ Analysis:
   --sum-rf-distance       Print sum RF distance distribution
   --edge-parsimony        Compute per-edge parsimony penalties (store in output;
                           cannot combine with --trim/--sample)
-  --edge-ml               Compute per-edge ML penalties (store in output;
+  --edge-ml, --edge-thrifty
+                          Compute per-edge ML penalties (store in output;
                           cannot combine with --trim/--sample)
 
 Debugging:
@@ -240,6 +245,19 @@ struct args {
   bool edge_ml = false;
   bool validate = false;
 };
+
+static bool has_any_model_arg(args const& a) {
+  return !a.model_dir.empty() || !a.model_name.empty();
+}
+
+static bool has_complete_model_args(args const& a) {
+  return !a.model_dir.empty() && !a.model_name.empty();
+}
+
+static bool ml_model_requested(args const& a) {
+  return a.edge_ml ||
+         (a.sample && !a.trim && is_ml_sample_method(a.sample_method));
+}
 
 static args parse_args(int argc, char** argv) {
   args a;
@@ -348,6 +366,11 @@ static args parse_args(int argc, char** argv) {
     std::cerr << "error: unknown sample method '" << a.sample_method << "'\n";
     std::exit(1);
   }
+  if (has_any_model_arg(a) && !has_complete_model_args(a)) {
+    std::cerr << "error: --model-dir and --model-name must be provided "
+                 "together\n";
+    std::exit(1);
+  }
   if (a.sample_method_explicit && !a.sample) {
     std::cerr << "error: --sample-method requires --sample\n";
     std::exit(1);
@@ -372,7 +395,7 @@ static args parse_args(int argc, char** argv) {
     }
   }
   if (a.sample && !a.trim && is_ml_sample_method(a.sample_method) &&
-      (a.model_dir.empty() || a.model_name.empty())) {
+      !has_complete_model_args(a)) {
     std::cerr << "error: --model-dir and --model-name required with "
                  "--sample-method "
               << a.sample_method << "\n";
@@ -388,8 +411,9 @@ static args parse_args(int argc, char** argv) {
                  "first, then run sampling/trimming in a second command\n";
     std::exit(1);
   }
-  if (a.edge_ml && (a.model_dir.empty() || a.model_name.empty())) {
-    std::cerr << "error: --model-dir and --model-name required with --edge-ml\n";
+  if (a.edge_ml && !has_complete_model_args(a)) {
+    std::cerr << "error: --model-dir and --model-name required with "
+                 "--edge-ml/--edge-thrifty\n";
     std::exit(1);
   }
 
@@ -458,6 +482,16 @@ int main(int argc, char** argv) try {
 
   if (a.validate)
     validate_dag(result, "after merge", thread_pool::get_default());
+
+  std::unique_ptr<ml_model> ml_model_storage;
+  if (ml_model_requested(a)) {
+    assert(has_complete_model_args(a) &&
+           "parse_args must require model args before ML loading");
+    std::cerr << "Loading ML model " << a.model_name << "...\n";
+    ml_model_storage =
+        std::make_unique<ml_model>(load_ml_model(a.model_dir, a.model_name));
+    std::cerr << "  ML model loaded\n";
+  }
 
   // ---- Analysis ----
   if (a.dag_info) {
@@ -558,13 +592,10 @@ int main(int argc, char** argv) try {
   if (a.edge_ml) {
     scoped_arena<4096> arena;
     auto* mr = arena.get();
-
-    std::cerr << "Loading ML model " << a.model_name << "...\n";
-    auto model = load_ml_model(a.model_dir, a.model_name);
-    std::cerr << "  ML model loaded\n";
+    assert(ml_model_storage != nullptr);
 
     auto const& ml_ref = get_reference_sequence(result);
-    ml_model_likelihood_score_ops ml_ops{.model = model,
+    ml_model_likelihood_score_ops ml_ops{.model = *ml_model_storage,
                                          .reference = ml_ref,
                                          .ignore_ua_edge =
                                              a.ignore_ua_edge_ml};
@@ -703,13 +734,10 @@ int main(int argc, char** argv) try {
                        thread_pool::get_default());
         save_proto_dag(tree, a.output);
       } else if (is_ml_sample_method(a.sample_method)) {
-        std::cerr << "Loading ML model " << a.model_name << "...\n";
-        auto model = load_ml_model(a.model_dir, a.model_name);
-        std::cerr << "  ML model loaded\n";
-
+        assert(ml_model_storage != nullptr);
         std::cerr << "Sampling a tree from min-ML options...\n";
         auto const& ml_ref = get_reference_sequence(result);
-        ml_model_likelihood_score_ops ml_ops{.model = model,
+        ml_model_likelihood_score_ops ml_ops{.model = *ml_model_storage,
                                              .reference = ml_ref,
                                              .ignore_ua_edge =
                                                  a.ignore_ua_edge_ml};

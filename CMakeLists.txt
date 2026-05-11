@@ -207,6 +207,13 @@ add_test(NAME dagutil_ml_missing_model_fails
                  -o ${CMAKE_BINARY_DIR}/dagutil_missing_model.pb.gz
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(dagutil_ml_missing_model_fails PROPERTIES WILL_FAIL TRUE)
+add_test(NAME dagutil_partial_model_args_fail
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --model-dir data/bcr
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_partial_model_args_fail PROPERTIES WILL_FAIL TRUE)
 add_test(NAME dagutil_sample_method_without_sample_fails
          COMMAND dagutil
                  --dag-pb data/test_5_trees/tree_0.pb.gz

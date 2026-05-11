@@ -32,6 +32,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -375,6 +376,35 @@ static void validate_args(args const& a) {
     std::cerr << "warning: --ignore-ua-edge-ml/--score-ua-edge-ml has no "
                  "effect because no ML scoring path is active\n";
   }
+}
+
+struct ml_config_bundle {
+  std::unique_ptr<ml_model> model_storage;
+  ml_scoring_config config;
+};
+
+static bool ml_model_needed(args const& a, double ml_coeff) {
+  return is_ml_sample_method(a.sample_method) || ml_coeff > 0.0 ||
+         (a.log_metrics && has_complete_model_args(a));
+}
+
+static ml_config_bundle build_ml_config(args const& a, double ml_coeff = 0.0) {
+  ml_config_bundle result;
+  result.config.ignore_ua_edge = a.ignore_ua_edge_ml;
+  if (!ml_model_needed(a, ml_coeff)) return result;
+
+  assert(has_complete_model_args(a) &&
+         "validate_args must require model args before ML loading");
+  std::cerr << "Loading ML model " << a.model_name << "...\n";
+  result.model_storage =
+      std::make_unique<ml_model>(load_ml_model(a.model_dir, a.model_name));
+  result.config.model = result.model_storage.get();
+  result.config.coeff = ml_coeff;
+  if (ml_coeff != 0.0)
+    std::cerr << "  ML model loaded (move coeff=" << ml_coeff << ")\n";
+  else
+    std::cerr << "  ML model loaded\n";
+  return result;
 }
 
 static args parse_args(int argc, char** argv) {
@@ -1350,7 +1380,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
   // Backend-aware defaults: when ML move scoring is active, default to
   // pscore=0, nodes=0, ml=1.0 (ML-only); otherwise parsimony defaults.
-  bool has_ml = !a.model_dir.empty() && !a.model_name.empty();
+  bool has_ml = has_complete_model_args(a);
   bool ml_sampling = is_ml_sample_method(a.sample_method);
   int eff_pscore = a.move_coeff_pscore;
   int eff_nodes = a.move_coeff_nodes;
@@ -1362,31 +1392,9 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
     eff_pscore = 0;  // disable parsimony by default for ML moves
   }
 
-  bool needs_ml_model = ml_sampling || eff_ml > 0.0 || (a.log_metrics && has_ml);
-
   // Load ML model once if needed for sampling, move scoring, or metrics.
-  std::optional<ml_model> ml_model_storage;
-  ml_scoring_config ml_config;
-  ml_config.ignore_ua_edge = a.ignore_ua_edge_ml;
-  if (needs_ml_model) {
-    if (!has_ml) {
-      std::cerr << "error: --model-dir and --model-name required";
-      if (ml_sampling)
-        std::cerr << " with --sample-method " << a.sample_method;
-      else if (eff_ml > 0.0)
-        std::cerr << " with --move-coeff-ml";
-      std::cerr << "\n";
-      std::exit(1);
-    }
-    std::cerr << "Loading ML model " << a.model_name << "...\n";
-    ml_model_storage = load_ml_model(a.model_dir, a.model_name);
-    ml_config.model = &*ml_model_storage;
-    ml_config.coeff = eff_ml;
-    if (eff_ml != 0.0)
-      std::cerr << "  ML model loaded (move coeff=" << eff_ml << ")\n";
-    else
-      std::cerr << "  ML model loaded\n";
-  }
+  auto ml = build_ml_config(a, eff_ml);
+  auto const& ml_config = ml.config;
 
   std::vector<optimize_result> results;
   results.reserve(a.iterations);
@@ -1828,26 +1836,8 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 static std::vector<optimize_result> run_random(merge& m, args const& a) {
   std::mt19937 rng(a.seed.value_or(std::random_device{}()));
 
-  bool has_ml = !a.model_dir.empty() && !a.model_name.empty();
-  bool ml_sampling = is_ml_sample_method(a.sample_method);
-  bool needs_ml_model = ml_sampling || (a.log_metrics && has_ml);
-
-  std::optional<ml_model> ml_model_storage;
-  ml_scoring_config ml_config;
-  ml_config.ignore_ua_edge = a.ignore_ua_edge_ml;
-  if (needs_ml_model) {
-    if (!has_ml) {
-      std::cerr << "error: --model-dir and --model-name required";
-      if (ml_sampling)
-        std::cerr << " with --sample-method " << a.sample_method;
-      std::cerr << "\n";
-      std::exit(1);
-    }
-    std::cerr << "Loading ML model " << a.model_name << "...\n";
-    ml_model_storage = load_ml_model(a.model_dir, a.model_name);
-    ml_config.model = &*ml_model_storage;
-    std::cerr << "  ML model loaded\n";
-  }
+  auto ml = build_ml_config(a);
+  auto const& ml_config = ml.config;
 
   random_spr_strategy strategy{};
   std::vector<optimize_result> results;
