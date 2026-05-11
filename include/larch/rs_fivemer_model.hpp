@@ -5,6 +5,7 @@
 #include <larch/pth_loader.hpp>
 #include <larch/yaml_reader.hpp>
 
+#include <cassert>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -89,7 +90,10 @@ class rs_fivemer_model {
       throw std::runtime_error{"rs_fivemer_model::forward: invalid rate bias"};
 
     for (std::size_t i = 0; i < sc; ++i) {
-      auto idx = static_cast<std::size_t>(encoded.kmer_indices[i]);
+      auto raw_idx = encoded.kmer_indices[i];
+      assert(raw_idx >= 0);
+      assert(std::cmp_less(raw_idx, encoder_.kmer_count()));
+      auto idx = static_cast<std::size_t>(raw_idx);
       double log_rate = static_cast<double>(r_weights_[idx]) + rate_bias_log_;
       double rate = std::exp(log_rate);
       rates[i] = static_cast<float>(rate);

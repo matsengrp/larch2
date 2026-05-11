@@ -5,6 +5,7 @@
 #include <larch/pth_loader.hpp>
 #include <larch/yaml_reader.hpp>
 
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -55,9 +56,14 @@ class indep_rs_cnn_model {
 
   // Embedding lookup: indices[L] × weights[vocab, E] → out[L, E].
   static void embedding(float* out, int32_t const* indices, std::size_t L,
-                        float const* w, std::size_t E) {
+                        float const* w,
+                        [[maybe_unused]] std::size_t row_count,
+                        std::size_t E) {
     for (std::size_t i = 0; i < L; ++i) {
-      auto idx = static_cast<std::size_t>(indices[i]);
+      auto raw_idx = indices[i];
+      assert(raw_idx >= 0);
+      assert(std::cmp_less(raw_idx, row_count));
+      auto idx = static_cast<std::size_t>(raw_idx);
       for (std::size_t e = 0; e < E; ++e) out[i * E + e] = w[idx * E + e];
     }
   }
@@ -200,14 +206,16 @@ class indep_rs_cnn_model {
 
     // Shared path: embed → conv → ReLU.
     std::vector<float> shared_emb(L * E);
-    embedding(shared_emb.data(), encoded.kmer_indices.data(), L, embed_w_, E);
+    embedding(shared_emb.data(), encoded.kmer_indices.data(), L, embed_w_,
+              encoder_.kmer_count(), E);
     std::vector<float> shared(L * F);
     conv1d_same(shared.data(), shared_emb.data(), L, conv_w_, conv_b_, E, F, K);
     relu_inplace(shared.data(), L * F);
 
     // R-branch: embed → conv → ReLU.
     std::vector<float> r_emb(L * E);
-    embedding(r_emb.data(), encoded.kmer_indices.data(), L, r_embed_w_, E);
+    embedding(r_emb.data(), encoded.kmer_indices.data(), L, r_embed_w_,
+              encoder_.kmer_count(), E);
     std::vector<float> r_feat(L * F);
     conv1d_same(r_feat.data(), r_emb.data(), L, r_conv_w_, r_conv_b_, E, F, K);
     relu_inplace(r_feat.data(), L * F);
@@ -230,7 +238,8 @@ class indep_rs_cnn_model {
 
     // S-branch: embed → conv → ReLU.
     std::vector<float> s_emb(L * E);
-    embedding(s_emb.data(), encoded.kmer_indices.data(), L, s_embed_w_, E);
+    embedding(s_emb.data(), encoded.kmer_indices.data(), L, s_embed_w_,
+              encoder_.kmer_count(), E);
     std::vector<float> s_feat(L * F);
     conv1d_same(s_feat.data(), s_emb.data(), L, s_conv_w_, s_conv_b_, E, F, K);
     relu_inplace(s_feat.data(), L * F);
