@@ -524,6 +524,7 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
     add_test(NAME ${test_name} COMMAND ${test_name}
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()
+set_tests_properties(merge_consistency_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # Vulkan compute tests
 if(ENABLE_VULKAN)

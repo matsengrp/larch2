@@ -29,7 +29,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=gcc-builder /gcc-install /opt/gcc-trunk
 
+# Register the GCC runtime library directories discovered in this image instead
+# of assuming an architecture-specific lib64 path.
+RUN set -eux; \
+    find /opt/gcc-trunk -type f \
+        \( -name 'libstdc++.so.*' -o -name 'libgcc_s.so*' \
+           -o -name 'libgomp.so*' -o -name 'libatomic.so*' \
+           -o -name 'libasan.so*' -o -name 'libtsan.so*' \
+           -o -name 'libubsan.so*' -o -name 'liblsan.so*' \) \
+        -printf '%h\n' | sort -u > /etc/ld.so.conf.d/gcc-trunk.conf; \
+    test -s /etc/ld.so.conf.d/gcc-trunk.conf; \
+    ldconfig
+
 ENV PATH="/opt/gcc-trunk/bin:${PATH}"
-ENV LD_LIBRARY_PATH="/opt/gcc-trunk/lib64:${LD_LIBRARY_PATH}"
 
 WORKDIR /src
