@@ -204,17 +204,41 @@ static constexpr std::string_view kIgRef =
     "TCTCCTCAG";
 
 // Ground truth log-likelihoods computed by the Python S5F model.
+//
+// Tolerances were measured against data/bcr/s5f-libtorch.pth on 2026-05-11.
+// Non-saturated cases had worst abs/relative disagreement at position 50:
+// 0.192378 log-likelihood units / 2.4298%, so they use rounded 0.21 / 3%
+// limits.  Position 100 lands on a saturated float32 softmax row in the C++
+// implementation (mutant CSP rounds to 1.0 and the rest of the row to 0.0);
+// its Python/libtorch reference differs in the one-hot tail behavior by
+// 1.516640 / 16.7728%.  Keep that as an explicit narrow exception rather than
+// applying the old blanket 20% relative tolerance to every case.
+static constexpr double kRegularS5FAbsTolerance = 0.21;
+static constexpr double kRegularS5FRelTolerance = 0.03;
+static constexpr double kSaturatedS5FAbsTolerance = 1.60;
+static constexpr double kSaturatedS5FRelTolerance = 0.18;
+
 struct ground_truth_case {
   std::size_t position;
   char original;
   char mutated;
   double expected_ll;
+  double max_abs_diff;
+  double max_rel_diff;
+  bool expect_saturated_csp;
 };
 
 static constexpr ground_truth_case kS5FGroundTruth[] = {
-    {10, 'T', 'A', -8.55931615829468},  {50, 'C', 'T', -7.91756159067154},
-    {100, 'T', 'G', -9.04228067398071}, {150, 'A', 'C', -7.1298691034317},
-    {200, 'C', 'A', -6.76613847911358},
+    {10, 'T', 'A', -8.55931615829468, kRegularS5FAbsTolerance,
+     kRegularS5FRelTolerance, false},
+    {50, 'C', 'T', -7.91756159067154, kRegularS5FAbsTolerance,
+     kRegularS5FRelTolerance, false},
+    {100, 'T', 'G', -9.04228067398071, kSaturatedS5FAbsTolerance,
+     kSaturatedS5FRelTolerance, true},
+    {150, 'A', 'C', -7.1298691034317, kRegularS5FAbsTolerance,
+     kRegularS5FRelTolerance, false},
+    {200, 'C', 'A', -6.76613847911358, kRegularS5FAbsTolerance,
+     kRegularS5FRelTolerance, false},
 };
 
 void test_python_ground_truth_identical() {
@@ -226,24 +250,38 @@ void test_python_ground_truth_identical() {
 
 void test_python_ground_truth_single_mutations() {
   auto model = rs_fivemer_model::load("data/bcr", "s5f");
+  auto forward = model.forward(kIgRef);
 
   for (auto const& tc : kS5FGroundTruth) {
     std::string child{kIgRef};
     assert(child[tc.position] == tc.original);
     child[tc.position] = tc.mutated;
 
+    auto child_bases = kmer_encoder::encode_bases(child);
+    auto child_base = static_cast<std::size_t>(child_bases[tc.position]);
+    float mutation_csp = forward.csp[tc.position * 4 + child_base];
+    if (tc.expect_saturated_csp) {
+      float tail_mass = 0.0f;
+      for (std::size_t base = 0; base < 4; ++base) {
+        if (base != child_base)
+          tail_mass += forward.csp[tc.position * 4 + base];
+      }
+      assert(mutation_csp > 0.999999f);
+      assert(tail_mass < 1e-6f);
+    }
+
     double ll = model.log_likelihood(kIgRef, child);
     assert(std::isfinite(ll));
     assert(ll < 0.0);
 
-    // Verify within 20% of Python reference. The discrepancy comes from
-    // float32 softmax precision differences between pure C++ and libtorch,
-    // especially at positions where the CSP distribution is near one-hot.
-    double rel_diff = std::abs(ll - tc.expected_ll) / std::abs(tc.expected_ll);
-    if (rel_diff > 0.20) {
-      std::println("  FAIL pos {} {}→{}: expected={:.6f} actual={:.6f} rel={}",
-                   tc.position, tc.original, tc.mutated, tc.expected_ll, ll,
-                   rel_diff);
+    double abs_diff = std::abs(ll - tc.expected_ll);
+    double rel_diff = abs_diff / std::abs(tc.expected_ll);
+    if (abs_diff > tc.max_abs_diff || rel_diff > tc.max_rel_diff) {
+      std::println(
+          "  FAIL pos {} {}→{}: expected={:.6f} actual={:.6f} "
+          "abs={} (limit {}) rel={} (limit {}) csp={}",
+          tc.position, tc.original, tc.mutated, tc.expected_ll, ll, abs_diff,
+          tc.max_abs_diff, rel_diff, tc.max_rel_diff, mutation_csp);
       assert(false);
     }
   }

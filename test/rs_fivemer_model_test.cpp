@@ -191,6 +191,7 @@ void test_different_contexts_different_rates() {
 
   assert(rates1[4] > 0.0f && std::isfinite(rates1[4]));
   assert(rates2[4] > 0.0f && std::isfinite(rates2[4]));
+  assert(std::abs(rates1[4] - rates2[4]) > 1e-6f);
 
   std::println("  different contexts different rates: OK");
 }
