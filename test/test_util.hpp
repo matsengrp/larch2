@@ -8,8 +8,10 @@
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 
 #include <unistd.h>
@@ -49,6 +51,18 @@ inline std::filesystem::path unique_temp_path(std::string_view test_name,
           std::string{extension});
 }
 
+inline compact_genome cg_from_sequence(std::string_view seq,
+                                       std::string_view reference) {
+  assert(seq.size() == reference.size());
+  std::map<mutation_position, nuc_base> mutations;
+  for (std::size_t i = 0; i < seq.size(); ++i) {
+    if (seq[i] != reference[i]) {
+      mutations[i + 1] = nuc_base::from_char(seq[i]);
+    }
+  }
+  return compact_genome{std::move(mutations)};
+}
+
 inline std::string sequence_from_cg(compact_genome const& cg,
                                     std::string_view reference) {
   std::string seq{reference};
@@ -67,10 +81,68 @@ inline std::string node_sequence(phylo_dag& dag, std::size_t node_idx) {
           return sequence_from_cg(node.cg(), reference);
         } else {
           assert(false && "node has no sequence annotation");
-          return {};
+          std::unreachable();
         }
       },
       dag.get_node(node_idx));
+}
+
+inline std::size_t add_clade_edge(phylo_dag& dag, std::size_t parent_idx,
+                                  std::size_t child_idx,
+                                  std::size_t clade_idx) {
+  auto edge = dag.append_edge<edge_kind::clade>();
+  edge.clade_index() = clade_idx;
+  std::visit([&](auto parent) { edge.set_parent(parent); },
+             dag.get_node(parent_idx));
+  std::visit([&](auto child) { edge.set_child(child); },
+             dag.get_node(child_idx));
+  return edge.index();
+}
+
+// Shared 4-leaf 20-base tree used by the ML/SPR tests.
+inline phylo_dag make_test_tree() {
+  constexpr std::string_view ref = "ACGTACGTACGTACGTACGT";
+  phylo_dag dag;
+
+  auto ua = dag.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  dag.set_root(ua);
+
+  auto root = dag.append_node<node_kind::inner>();
+  root.cg() = cg_from_sequence("ACGTACGTACGTACGTACGT", ref);
+
+  auto i1 = dag.append_node<node_kind::inner>();
+  i1.cg() = cg_from_sequence("TCGTACGTACGTACGTACGT", ref);
+
+  auto i2 = dag.append_node<node_kind::inner>();
+  i2.cg() = cg_from_sequence("ACGTACGTACGCACGTACGT", ref);
+
+  auto l1 = dag.append_node<node_kind::leaf>();
+  l1.cg() = cg_from_sequence("TCGTACGTACGTACGTACGT", ref);
+  l1.sample_id() = "L1";
+
+  auto l2 = dag.append_node<node_kind::leaf>();
+  l2.cg() = cg_from_sequence("TCGCACGTACGTACGTACGT", ref);
+  l2.sample_id() = "L2";
+
+  auto l3 = dag.append_node<node_kind::leaf>();
+  l3.cg() = cg_from_sequence("ACGTACGTACGCACGTACGT", ref);
+  l3.sample_id() = "L3";
+
+  auto l4 = dag.append_node<node_kind::leaf>();
+  l4.cg() = cg_from_sequence("ACGTACGTACGCACGCACGT", ref);
+  l4.sample_id() = "L4";
+
+  add_clade_edge(dag, ua.index(), root.index(), 0);
+  add_clade_edge(dag, root.index(), i1.index(), 0);
+  add_clade_edge(dag, root.index(), i2.index(), 1);
+  add_clade_edge(dag, i1.index(), l1.index(), 0);
+  add_clade_edge(dag, i1.index(), l2.index(), 1);
+  add_clade_edge(dag, i2.index(), l3.index(), 0);
+  add_clade_edge(dag, i2.index(), l4.index(), 1);
+
+  recompute_edge_mutations(dag);
+  return dag;
 }
 
 inline std::size_t find_inner_node_by_sequence(phylo_dag& dag,

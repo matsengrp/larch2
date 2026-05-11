@@ -18,4 +18,7 @@ if [[ $status -eq 0 ]]; then
   exit 1
 fi
 
-printf '%s\n' "$output" | grep -Eq "$regex"
+printf '%s\n' "$output" | grep -Eq "$regex" || {
+  echo "output did not match regex '$regex'" >&2
+  exit 1
+}

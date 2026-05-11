@@ -5,16 +5,19 @@
 #include <larch/overlay_spr.hpp>
 #include <larch/thread_pool.hpp>
 
+#include "test_util.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
-#include <map>
 #include <print>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 using namespace larch;
+using larch::test::cg_from_sequence;
+using larch::test::make_test_tree;
 
 // Build a small 4-leaf tree with 20-base sequences.
 //       UA
@@ -32,40 +35,33 @@ static phylo_dag make_tree_from_sequences(
   constexpr std::string_view ref = "ACGTACGTACGTACGTACGT";
   phylo_dag d;
 
-  auto cg_from = [&](std::string_view seq) {
-    std::map<mutation_position, nuc_base> muts;
-    for (std::size_t i = 0; i < seq.size(); ++i)
-      if (seq[i] != ref[i]) muts[i + 1] = nuc_base::from_char(seq[i]);
-    return compact_genome{std::move(muts)};
-  };
-
   auto ua = d.append_node<node_kind::ua>();
   ua.reference_sequence() = std::string{ref};
   d.set_root(ua);
 
   auto root = d.append_node<node_kind::inner>();
-  root.cg() = cg_from(root_seq);
+  root.cg() = cg_from_sequence(root_seq, ref);
 
   auto i1 = d.append_node<node_kind::inner>();
-  i1.cg() = cg_from(i1_seq);
+  i1.cg() = cg_from_sequence(i1_seq, ref);
 
   auto i2 = d.append_node<node_kind::inner>();
-  i2.cg() = cg_from(i2_seq);
+  i2.cg() = cg_from_sequence(i2_seq, ref);
 
   auto l1 = d.append_node<node_kind::leaf>();
-  l1.cg() = cg_from(l1_seq);
+  l1.cg() = cg_from_sequence(l1_seq, ref);
   l1.sample_id() = "L1";
 
   auto l2 = d.append_node<node_kind::leaf>();
-  l2.cg() = cg_from(l2_seq);
+  l2.cg() = cg_from_sequence(l2_seq, ref);
   l2.sample_id() = "L2";
 
   auto l3 = d.append_node<node_kind::leaf>();
-  l3.cg() = cg_from(l3_seq);
+  l3.cg() = cg_from_sequence(l3_seq, ref);
   l3.sample_id() = "L3";
 
   auto l4 = d.append_node<node_kind::leaf>();
-  l4.cg() = cg_from(l4_seq);
+  l4.cg() = cg_from_sequence(l4_seq, ref);
   l4.sample_id() = "L4";
 
   auto add_edge = [&](std::size_t pi, std::size_t ci, std::size_t clade) {
@@ -87,16 +83,6 @@ static phylo_dag make_tree_from_sequences(
 
   recompute_edge_mutations(d);
   return d;
-}
-
-static phylo_dag make_test_tree() {
-  return make_tree_from_sequences("ACGTACGTACGTACGTACGT",
-                                  "TCGTACGTACGTACGTACGT",
-                                  "ACGTACGTACGCACGTACGT",
-                                  "TCGTACGTACGTACGTACGT",
-                                  "TCGCACGTACGTACGTACGT",
-                                  "ACGTACGTACGCACGTACGT",
-                                  "ACGTACGTACGCACGCACGT");
 }
 
 static phylo_dag make_ua_edge_test_tree() {

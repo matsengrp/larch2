@@ -12,7 +12,6 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
-#include <map>
 #include <print>
 #include <stdexcept>
 #include <string>
@@ -22,17 +21,10 @@
 #include <vector>
 
 using namespace larch;
+using larch::test::cg_from_sequence;
+using larch::test::make_test_tree;
 
 // --- helpers (mirrors native_optimize_test patterns) ---
-
-static compact_genome cg_from_sequence(std::string_view seq,
-                                       std::string_view ref) {
-  std::map<mutation_position, nuc_base> muts;
-  for (std::size_t i = 0; i < seq.size(); ++i) {
-    if (seq[i] != ref[i]) muts[i + 1] = nuc_base::from_char(seq[i]);
-  }
-  return compact_genome{std::move(muts)};
-}
 
 static std::size_t add_edge(phylo_dag& d, std::size_t parent_idx,
                             std::size_t child_idx,
@@ -113,68 +105,6 @@ static phylo_dag make_two_alternative_ml_tie_dag() {
   add_edge(d, ua.index(), root.index(), 0);
   add_edge(d, root.index(), alt1.index(), 0);
   add_edge(d, root.index(), alt2.index(), 0);
-
-  recompute_edge_mutations(d);
-  return d;
-}
-
-// Build a 4-leaf tree with 20-base sequences.
-//
-//       UA
-//       |
-//      root  (= ref)
-//      / \
-//    i1    i2
-//   / \   / \
-//  L1  L2 L3  L4
-//
-// Mutations:
-//   root→i1:  pos 0 A→T   (1 mutation)
-//   root→i2:  pos 11 T→C  (1 mutation)
-//   i1→L1:    none
-//   i1→L2:    pos 3 T→C   (1 mutation)
-//   i2→L3:    none
-//   i2→L4:    pos 15 T→C  (1 mutation)
-static phylo_dag make_test_tree() {
-  constexpr std::string_view ref = "ACGTACGTACGTACGTACGT";
-  phylo_dag d;
-
-  auto ua = d.append_node<node_kind::ua>();
-  ua.reference_sequence() = std::string{ref};
-  d.set_root(ua);
-
-  auto root = d.append_node<node_kind::inner>();
-  root.cg() = cg_from_sequence("ACGTACGTACGTACGTACGT", ref);
-
-  auto i1 = d.append_node<node_kind::inner>();
-  i1.cg() = cg_from_sequence("TCGTACGTACGTACGTACGT", ref);
-
-  auto i2 = d.append_node<node_kind::inner>();
-  i2.cg() = cg_from_sequence("ACGTACGTACGCACGTACGT", ref);
-
-  auto l1 = d.append_node<node_kind::leaf>();
-  l1.cg() = cg_from_sequence("TCGTACGTACGTACGTACGT", ref);
-  l1.sample_id() = "L1";
-
-  auto l2 = d.append_node<node_kind::leaf>();
-  l2.cg() = cg_from_sequence("TCGCACGTACGTACGTACGT", ref);
-  l2.sample_id() = "L2";
-
-  auto l3 = d.append_node<node_kind::leaf>();
-  l3.cg() = cg_from_sequence("ACGTACGTACGCACGTACGT", ref);
-  l3.sample_id() = "L3";
-
-  auto l4 = d.append_node<node_kind::leaf>();
-  l4.cg() = cg_from_sequence("ACGTACGTACGCACGCACGT", ref);
-  l4.sample_id() = "L4";
-
-  add_edge(d, ua.index(), root.index(), 0);
-  add_edge(d, root.index(), i1.index(), 0);
-  add_edge(d, root.index(), i2.index(), 1);
-  add_edge(d, i1.index(), l1.index(), 0);
-  add_edge(d, i1.index(), l2.index(), 1);
-  add_edge(d, i2.index(), l3.index(), 0);
-  add_edge(d, i2.index(), l4.index(), 1);
 
   recompute_edge_mutations(d);
   return d;

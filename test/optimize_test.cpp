@@ -1,8 +1,9 @@
 #include <larch/random_optimize.hpp>
 #include <larch/load_proto_dag.hpp>
 
+#include "test_util.hpp"
+
 #include <cassert>
-#include <map>
 #include <print>
 #include <random>
 #include <set>
@@ -12,6 +13,7 @@
 #include <vector>
 
 using namespace larch;
+using larch::test::cg_from_sequence;
 
 // ---------------------------------------------------------------------------
 // helpers (same patterns as subtree_weight_test / rf_distance_test)
@@ -51,15 +53,6 @@ static std::set<std::string> get_leaf_ids(phylo_dag& d) {
         nv);
   }
   return ids;
-}
-
-static compact_genome cg_from_sequence(std::string_view seq,
-                                       std::string_view ref) {
-  std::map<mutation_position, nuc_base> muts;
-  for (std::size_t i = 0; i < seq.size(); ++i) {
-    if (seq[i] != ref[i]) muts[i + 1] = nuc_base::from_char(seq[i]);
-  }
-  return compact_genome{std::move(muts)};
 }
 
 static void add_edge(phylo_dag& d, std::size_t parent_idx,

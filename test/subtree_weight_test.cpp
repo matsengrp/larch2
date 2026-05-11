@@ -10,7 +10,6 @@
 #include <cassert>
 #include <cmath>
 #include <filesystem>
-#include <map>
 #include <numeric>
 #include <print>
 #include <set>
@@ -19,6 +18,8 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+using larch::test::cg_from_sequence;
 
 // Verify that a phylo_dag is a valid tree:
 // - Every non-root node has exactly one parent
@@ -45,14 +46,6 @@ static void verify_is_tree(larch::phylo_dag& tree) {
         },
         nv);
   }
-}
-
-static larch::compact_genome cg_from_sequence(std::string_view seq,
-                                               std::string_view ref) {
-  std::map<larch::mutation_position, larch::nuc_base> muts;
-  for (std::size_t i = 0; i < seq.size(); ++i)
-    if (seq[i] != ref[i]) muts[i + 1] = larch::nuc_base::from_char(seq[i]);
-  return larch::compact_genome{std::move(muts)};
 }
 
 static std::size_t add_weighted_edge(larch::phylo_dag& d,
