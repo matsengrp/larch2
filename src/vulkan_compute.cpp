@@ -27,6 +27,86 @@ uint32_t find_memory_type(VkPhysicalDeviceMemoryProperties const& mem_props,
   throw std::runtime_error{"Vulkan: no suitable memory type found"};
 }
 
+bool wait_until_idle(VkDevice device, VkQueue queue) noexcept {
+  if (queue != VK_NULL_HANDLE && vkQueueWaitIdle(queue) == VK_SUCCESS)
+    return true;
+  return device != VK_NULL_HANDLE && vkDeviceWaitIdle(device) == VK_SUCCESS;
+}
+
+class command_buffer_guard {
+ public:
+  command_buffer_guard(VkDevice device, VkCommandPool command_pool,
+                       VkCommandBuffer command_buffer) noexcept
+      : device_{device},
+        command_pool_{command_pool},
+        command_buffer_{command_buffer} {}
+
+  ~command_buffer_guard() {
+    if (command_buffer_ == VK_NULL_HANDLE) return;
+    if (pending_ && !wait_until_idle(device_, queue_)) return;
+    vkFreeCommandBuffers(device_, command_pool_, 1, &command_buffer_);
+  }
+
+  void mark_submitted(VkQueue queue) noexcept {
+    queue_ = queue;
+    pending_ = true;
+  }
+
+  void mark_completed() noexcept { pending_ = false; }
+
+  void abandon() noexcept {
+    command_buffer_ = VK_NULL_HANDLE;
+    pending_ = false;
+  }
+
+  command_buffer_guard(command_buffer_guard const&) = delete;
+  command_buffer_guard& operator=(command_buffer_guard const&) = delete;
+  command_buffer_guard(command_buffer_guard&&) = delete;
+  command_buffer_guard& operator=(command_buffer_guard&&) = delete;
+
+ private:
+  VkDevice device_ = VK_NULL_HANDLE;
+  VkCommandPool command_pool_ = VK_NULL_HANDLE;
+  VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
+  VkQueue queue_ = VK_NULL_HANDLE;
+  bool pending_ = false;
+};
+
+class fence_guard {
+ public:
+  fence_guard(VkDevice device, VkFence fence) noexcept
+      : device_{device}, fence_{fence} {}
+
+  ~fence_guard() {
+    if (fence_ == VK_NULL_HANDLE) return;
+    if (pending_ && !wait_until_idle(device_, queue_)) return;
+    vkDestroyFence(device_, fence_, nullptr);
+  }
+
+  void mark_submitted(VkQueue queue) noexcept {
+    queue_ = queue;
+    pending_ = true;
+  }
+
+  void mark_completed() noexcept { pending_ = false; }
+
+  void abandon() noexcept {
+    fence_ = VK_NULL_HANDLE;
+    pending_ = false;
+  }
+
+  fence_guard(fence_guard const&) = delete;
+  fence_guard& operator=(fence_guard const&) = delete;
+  fence_guard(fence_guard&&) = delete;
+  fence_guard& operator=(fence_guard&&) = delete;
+
+ private:
+  VkDevice device_ = VK_NULL_HANDLE;
+  VkFence fence_ = VK_NULL_HANDLE;
+  VkQueue queue_ = VK_NULL_HANDLE;
+  bool pending_ = false;
+};
+
 }  // namespace
 
 // ============================================================================
@@ -408,9 +488,10 @@ void vk_pipeline::dispatch(std::vector<vk_buffer*> buffers,
   cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
   cbai.commandBufferCount = 1;
 
-  VkCommandBuffer cmd;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
   vk_check(vkAllocateCommandBuffers(pi.device, &cbai, &cmd),
            "vkAllocateCommandBuffers");
+  command_buffer_guard cmd_cleanup{pi.device, pi.command_pool, cmd};
 
   VkCommandBufferBeginInfo cbbi{};
   cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -435,20 +516,37 @@ void vk_pipeline::dispatch(std::vector<vk_buffer*> buffers,
   // Submit and wait.
   VkFenceCreateInfo fci{};
   fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-  VkFence fence;
+  VkFence fence = VK_NULL_HANDLE;
   vk_check(vkCreateFence(pi.device, &fci, nullptr, &fence), "vkCreateFence");
+  fence_guard fence_cleanup{pi.device, fence};
 
   VkSubmitInfo si{};
   si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   si.commandBufferCount = 1;
   si.pCommandBuffers = &cmd;
   vk_check(vkQueueSubmit(pi.queue, 1, &si, fence), "vkQueueSubmit");
+  cmd_cleanup.mark_submitted(pi.queue);
+  fence_cleanup.mark_submitted(pi.queue);
 
-  vk_check(vkWaitForFences(pi.device, 1, &fence, VK_TRUE, UINT64_MAX),
-           "vkWaitForFences");
-
-  vkDestroyFence(pi.device, fence, nullptr);
-  vkFreeCommandBuffers(pi.device, pi.command_pool, 1, &cmd);
+  VkResult wait_result =
+      vkWaitForFences(pi.device, 1, &fence, VK_TRUE, UINT64_MAX);
+  if (wait_result == VK_SUCCESS) {
+    cmd_cleanup.mark_completed();
+    fence_cleanup.mark_completed();
+  } else {
+    // After a successful submit, a failed fence wait can leave the command
+    // buffer/fence pending.  Try to make the queue/device idle before RAII
+    // cleanup; if that also fails (e.g. device loss), abandon these per-dispatch
+    // handles rather than destroying/freeing objects that may still be in use.
+    if (wait_until_idle(pi.device, pi.queue)) {
+      cmd_cleanup.mark_completed();
+      fence_cleanup.mark_completed();
+    } else {
+      cmd_cleanup.abandon();
+      fence_cleanup.abandon();
+    }
+    vk_check(wait_result, "vkWaitForFences");
+  }
 }
 
 }  // namespace larch
