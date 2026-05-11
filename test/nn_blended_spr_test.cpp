@@ -10,6 +10,7 @@
 #include <cmath>
 #include <map>
 #include <print>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -241,6 +242,17 @@ void test_ml_scoring_config_adjust_score() {
   ml_scoring_config cfg_off{.model = nullptr, .coeff = 0.0};
   double base = static_cast<double>(mv.score_change);
   assert(cfg_off.adjust_score(base, tree, frag, sm) == base);
+
+  // A non-zero ML coefficient without a model is public API misuse and should
+  // fail deterministically rather than silently disabling ML adjustment.
+  ml_scoring_config cfg_missing{.model = nullptr, .coeff = 1.0};
+  bool missing_model_threw = false;
+  try {
+    (void)cfg_missing.adjust_score(base, tree, frag, sm);
+  } catch (std::logic_error const&) {
+    missing_model_threw = true;
+  }
+  assert(missing_model_threw);
 
   // With coeff>0: adjust_score applies the full-tree NLL delta.  The cached
   // old-NLL overload is the one used by larch2 move rescoring.

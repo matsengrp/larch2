@@ -7,6 +7,7 @@
 #include <larch/spr_move.hpp>
 #include <larch/yaml_reader.hpp>
 
+#include <cassert>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -178,9 +179,31 @@ inline double compute_fragment_ml_score(ml_model const& model,
 // ============================================================================
 
 struct ml_scoring_config {
-  ml_model* model = nullptr;
+  // Non-owning model pointer.  When non-null, the pointed-to model must
+  // outlive this config and any scoring/cache objects built from it.  nullptr
+  // means ML scoring is unavailable; score adjustment is active only when a
+  // model is present and coeff is non-zero.
+  ml_model const* model = nullptr;
   double coeff = 0.0;
   bool ignore_ua_edge = true;
+
+  bool has_model() const noexcept { return model != nullptr; }
+
+  bool adjusts_scores() const {
+    if (coeff == 0.0) return false;
+    if (model == nullptr)
+      throw std::logic_error{
+          "ml_scoring_config: non-zero ML coefficient requires a model"};
+    return true;
+  }
+
+  ml_model const& require_model() const {
+    if (model == nullptr)
+      throw std::logic_error{"ml_scoring_config: ML model is not loaded"};
+    assert(model != nullptr &&
+           "ml_scoring_config model pointer must remain valid");
+    return *model;
+  }
 
   // Adjust a parsimony-based score with an ML improvement term.
   // base_score: parsimony/node score delta (lower = better).
@@ -191,12 +214,13 @@ struct ml_scoring_config {
   // When old_NLL - new_NLL > 0 (move improved ML), effective score decreases.
   double adjust_score(double base_score, double old_pre_move_nll,
                       phylo_dag& fragment) const {
-    if (model != nullptr && coeff != 0.0) {
+    if (adjusts_scores()) {
       if (!std::isfinite(coeff))
         throw std::runtime_error{
             "ml_scoring_config::adjust_score: non-finite ML coefficient"};
-      double delta_ml = compute_delta_ml_score(*model, old_pre_move_nll,
-                                               fragment, ignore_ua_edge);
+      double delta_ml = compute_delta_ml_score(require_model(),
+                                               old_pre_move_nll, fragment,
+                                               ignore_ua_edge);
       double adjusted = base_score - coeff * delta_ml;
       if (!std::isfinite(adjusted))
         throw std::runtime_error{
@@ -209,9 +233,9 @@ struct ml_scoring_config {
   // Compatibility overload for callers that have not cached old_pre_move_nll.
   double adjust_score(double base_score, phylo_dag& original_tree,
                       phylo_dag& fragment, spr_move const& move) const {
-    if (model != nullptr && coeff != 0.0) {
-      double old_pre_move_nll =
-          compute_dag_ml_nll(*model, original_tree, ignore_ua_edge);
+    if (adjusts_scores()) {
+      double old_pre_move_nll = compute_dag_ml_nll(
+          require_model(), original_tree, ignore_ua_edge);
       return adjust_score(base_score, old_pre_move_nll, fragment);
     }
     return base_score;

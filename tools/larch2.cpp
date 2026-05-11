@@ -527,10 +527,9 @@ static double compute_tree_edge_weight_score(phylo_dag& tree) {
 
 static double compute_tree_ml_nll(phylo_dag& tree,
                                   ml_scoring_config const& ml_cfg) {
-  if (ml_cfg.model == nullptr)
-    throw std::logic_error{"compute_tree_ml_nll: ML model is not loaded"};
+  auto const& model = ml_cfg.require_model();
   auto const& ref = get_reference_sequence(tree);
-  ml_model_likelihood_score_ops ops{.model = *ml_cfg.model,
+  ml_model_likelihood_score_ops ops{.model = model,
                                     .reference = ref,
                                     .ignore_ua_edge = ml_cfg.ignore_ua_edge};
   return compute_dag_ml_nll(tree, ops);
@@ -545,7 +544,7 @@ static void finalize_sampled_tree(sampled_tree_result& sample,
   if (sample.edge_weight_score) {
     sample.edge_weight_score = compute_tree_edge_weight_score(sample.tree);
   }
-  if (sample.ml_score && ml_cfg != nullptr && ml_cfg->model != nullptr) {
+  if (sample.ml_score && ml_cfg != nullptr && ml_cfg->has_model()) {
     sample.ml_score = compute_tree_ml_nll(sample.tree, *ml_cfg);
   }
 }
@@ -674,7 +673,7 @@ static sampled_tree_result sample_tree_from_dag(
                           : sw.min_weight_sample_tree(ew_ops);
     return {.tree = std::move(tree), .edge_weight_score = min_score};
   } else if (is_ml_sample_method(method)) {
-    if (ml_cfg == nullptr || ml_cfg->model == nullptr) {
+    if (ml_cfg == nullptr || !ml_cfg->has_model()) {
       std::cerr << "error: --model-dir and --model-name required with "
                    "--sample-method "
                 << method << "\n";
@@ -682,7 +681,7 @@ static sampled_tree_result sample_tree_from_dag(
     }
 
     auto const& ref = get_reference_sequence(dag);
-    ml_model_likelihood_score_ops ops{.model = *ml_cfg->model,
+    ml_model_likelihood_score_ops ops{.model = ml_cfg->require_model(),
                                       .reference = ref,
                                       .ignore_ua_edge =
                                           ml_cfg->ignore_ua_edge};
@@ -1130,10 +1129,10 @@ static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed,
 
   // ML log-likelihood on a parsimony-optimal sampled tree.
   std::optional<double> ml_ll;
-  if (ml_cfg != nullptr && ml_cfg->model != nullptr) {
+  if (ml_cfg != nullptr && ml_cfg->has_model()) {
     auto opt_tree = psw.min_weight_sample_tree(pops);
     fitch_assign_compact_genomes(opt_tree);
-    ml_ll = -compute_dag_ml_nll(*ml_cfg->model, opt_tree,
+    ml_ll = -compute_dag_ml_nll(ml_cfg->require_model(), opt_tree,
                                 ml_cfg->ignore_ua_edge);
   }
 
@@ -1466,7 +1465,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         std::size_t total_trees_merged = 0;
         std::vector<radius_result> radii_results;
         std::optional<double> subtree_old_pre_move_nll;
-        if (ml_config.model != nullptr && ml_config.coeff != 0.0) {
+        if (ml_config.adjusts_scores()) {
           subtree_old_pre_move_nll = compute_tree_ml_nll(subtree_dag, ml_config);
         }
 
@@ -1524,7 +1523,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
           std::size_t moves_applied = 0;
           prog.phase("  Merging subtree fragments");
-          if (ml_config.model != nullptr && ml_config.coeff != 0.0) {
+          if (ml_config.adjusts_scores()) {
             // Full-tree ML delta re-scoring.  apply_spr_as_fragment() returns a
             // complete moved subtree/tree, so compare against the cached full
             // pre-move NLL rather than changed original edges only.
@@ -1630,8 +1629,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
     std::size_t total_trees_merged = 0;
     std::vector<radius_result> radii_results;
     std::optional<double> sampled_old_pre_move_nll = sampled_pre_move_ml_nll;
-    if (ml_config.model != nullptr && ml_config.coeff != 0.0 &&
-        !sampled_old_pre_move_nll) {
+    if (ml_config.adjusts_scores() && !sampled_old_pre_move_nll) {
       sampled_old_pre_move_nll = compute_tree_ml_nll(sampled, ml_config);
     }
 
@@ -1696,7 +1694,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
       // 7. Merge fragments (with optional ML or node-penalty re-scoring)
       std::size_t moves_applied = 0;
       prog.phase("  Merging");
-      if (ml_config.model != nullptr && ml_config.coeff != 0.0) {
+      if (ml_config.adjusts_scores()) {
         // Full-tree ML delta re-scoring.  apply_spr_as_fragment() returns a
         // complete moved tree, so compare against the cached full pre-move NLL
         // rather than changed original edges only.
@@ -1774,7 +1772,7 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         prog.done(format_sample_result(resample));
         auto resample_pre_move_ml_nll = resample.ml_score;
         sampled = std::move(resample.tree);
-        if (ml_config.model != nullptr && ml_config.coeff != 0.0) {
+        if (ml_config.adjusts_scores()) {
           sampled_old_pre_move_nll = resample_pre_move_ml_nll;
           if (!sampled_old_pre_move_nll)
             sampled_old_pre_move_nll = compute_tree_ml_nll(sampled, ml_config);

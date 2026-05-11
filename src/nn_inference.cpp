@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 
 namespace larch {
@@ -256,11 +257,19 @@ nn_inference::~nn_inference() = default;
 nn_inference::nn_inference(nn_inference&&) noexcept = default;
 nn_inference& nn_inference::operator=(nn_inference&&) noexcept = default;
 
+nn_inference::impl& nn_inference::require_impl() const {
+  if (!impl_)
+    throw std::logic_error{
+        "nn_inference: operation on moved-from object"};
+  return *impl_;
+}
+
 nn_inference::forward_result nn_inference::forward(
     std::string_view parent_seq) const {
-  if (impl_->kind == impl::model_kind::fivemer)
-    return impl_->forward_fivemer(parent_seq);
-  return impl_->forward_cnn(parent_seq);
+  auto& impl = require_impl();
+  if (impl.kind == impl::model_kind::fivemer)
+    return impl.forward_fivemer(parent_seq);
+  return impl.forward_cnn(parent_seq);
 }
 
 double nn_inference::log_likelihood(std::string_view parent_seq,
@@ -271,6 +280,6 @@ double nn_inference::log_likelihood(std::string_view parent_seq,
   return poisson_context_log_likelihood(rates, csp, parent_bases, child_bases);
 }
 
-std::size_t nn_inference::site_count() const { return impl_->sc; }
+std::size_t nn_inference::site_count() const { return require_impl().sc; }
 
 }  // namespace larch

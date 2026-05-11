@@ -39,6 +39,8 @@ class nn_inference {
 
  private:
   struct impl;
+  impl& require_impl() const;
+
   std::unique_ptr<impl> impl_;
 };
 

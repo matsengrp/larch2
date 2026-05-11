@@ -9,6 +9,8 @@
 #include <exception>
 #include <memory>
 #include <print>
+#include <stdexcept>
+#include <utility>
 
 using namespace larch;
 
@@ -22,6 +24,17 @@ static void check_close(float a, float b, float tol, const char* label,
                  b, diff);
     assert(false);
   }
+}
+
+template <typename Fn>
+static void expect_logic_error(Fn&& fn) {
+  bool threw = false;
+  try {
+    std::forward<Fn>(fn)();
+  } catch (std::logic_error const&) {
+    threw = true;
+  }
+  assert(threw);
 }
 
 // --- Fivemer tests ---
@@ -88,6 +101,18 @@ void test_fivemer_gpu_output_shapes(vk_context& ctx) {
   assert(result.csp.size() == 2000);
   assert(gpu.site_count() == 500);
   std::println("  fivemer GPU output shapes: OK");
+}
+
+void test_nn_inference_moved_from_throws(vk_context& ctx) {
+  auto model = rs_fivemer_model::load("data/bcr", "s5f");
+  nn_inference gpu{ctx, model};
+  nn_inference moved{std::move(gpu)};
+  assert(moved.site_count() == model.site_count());
+
+  expect_logic_error([&] { (void)gpu.site_count(); });
+  expect_logic_error([&] { (void)gpu.forward("ACGT"); });
+  expect_logic_error([&] { (void)gpu.log_likelihood("ACGT", "TCGT"); });
+  std::println("  moved-from nn_inference throws: OK");
 }
 
 void test_fivemer_gpu_rates_positive(vk_context& ctx) {
@@ -243,6 +268,7 @@ int main() {
   test_fivemer_gpu_vs_cpu(*ctx);
   test_fivemer_log_likelihood_gpu_vs_cpu(*ctx);
   test_fivemer_gpu_deterministic(*ctx);
+  test_nn_inference_moved_from_throws(*ctx);
 
   std::println("--- CNN ---");
   test_cnn_gpu_output_shapes(*ctx);
