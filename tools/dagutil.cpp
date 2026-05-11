@@ -231,7 +231,8 @@ struct args {
   bool trim = false;
   std::string rf;
   bool sample = false;
-  std::string sample_method = "random";
+  std::string sample_method_text = "random";
+  sample_method sampling_method = sample_method::random;
   bool sample_method_explicit = false;
   bool sample_uniformly = false;
   std::string model_dir;
@@ -256,7 +257,7 @@ static bool has_complete_model_args(args const& a) {
 
 static bool ml_model_requested(args const& a) {
   return a.edge_ml ||
-         (a.sample && !a.trim && is_ml_sample_method(a.sample_method));
+         (a.sample && !a.trim && is_ml_sample_method(a.sampling_method));
 }
 
 static args parse_args(int argc, char** argv) {
@@ -293,7 +294,7 @@ static args parse_args(int argc, char** argv) {
     else if (arg == "-s" || arg == "--sample")
       a.sample = true;
     else if (arg == "--sample-method") {
-      a.sample_method = next();
+      a.sample_method_text = next();
       a.sample_method_explicit = true;
     } else if (arg == "--sample-uniformly")
       a.sample_uniformly = true;
@@ -362,10 +363,14 @@ static args parse_args(int argc, char** argv) {
     std::cerr << "error: --vcf is required (use --force-no-vcf to skip)\n";
     std::exit(1);
   }
-  if (!is_known_sample_method(a.sample_method)) {
-    std::cerr << "error: unknown sample method '" << a.sample_method << "'\n";
+  auto parsed_method = parse_sample_method(a.sample_method_text);
+  if (!parsed_method) {
+    std::cerr << "error: unknown sample method '" << a.sample_method_text
+              << "'\n";
     std::exit(1);
   }
+  a.sampling_method = *parsed_method;
+
   if (has_any_model_arg(a) && !has_complete_model_args(a)) {
     std::cerr << "error: --model-dir and --model-name must be provided "
                  "together\n";
@@ -387,18 +392,18 @@ static args parse_args(int argc, char** argv) {
                    "criterion\n";
       std::exit(1);
     }
-    if (a.sample_method != "parsimony") {
+    if (a.sampling_method != sample_method::parsimony) {
       std::cerr << "error: --sample-method applies to --sample without "
                    "--trim; omit --trim for "
-                << a.sample_method << " sampling\n";
+                << a.sample_method_text << " sampling\n";
       std::exit(1);
     }
   }
-  if (a.sample && !a.trim && is_ml_sample_method(a.sample_method) &&
+  if (a.sample && !a.trim && is_ml_sample_method(a.sampling_method) &&
       !has_complete_model_args(a)) {
     std::cerr << "error: --model-dir and --model-name required with "
                  "--sample-method "
-              << a.sample_method << "\n";
+              << a.sample_method_text << "\n";
     std::exit(1);
   }
   if (a.edge_parsimony && a.edge_ml) {
@@ -697,66 +702,85 @@ int main(int argc, char** argv) try {
         }
       }
     } else if (a.sample) {
-      if (a.sample_method == "random") {
-        std::cerr << "Sampling a random tree from the DAG...\n";
-        parsimony_score_ops pops;
-        subtree_weight<parsimony_score_ops> sw(result, a.seed, mr);
-        sw.compute_weight_below(root_idx, pops);
-        auto tree = a.sample_uniformly ? sw.uniform_sample_tree(pops)
-                                       : sw.sample_tree(pops);
-        if (a.validate)
-          validate_dag(tree, "sampled random tree", thread_pool::get_default());
-        save_proto_dag(tree, a.output);
-      } else if (a.sample_method == "parsimony") {
-        std::cerr << "Sampling a tree from min-parsimony options...\n";
-        parsimony_score_ops pops;
-        subtree_weight<parsimony_score_ops> sw(result, a.seed, mr);
-        auto min_score = sw.compute_weight_below(root_idx, pops);
-        auto tree = a.sample_uniformly ? sw.min_weight_uniform_sample_tree(pops)
-                                       : sw.min_weight_sample_tree(pops);
-        std::cerr << "sampled_tree: parsimony_min=" << min_score << "\n";
-        if (a.validate)
-          validate_dag(tree, "sampled min-parsimony tree",
-                       thread_pool::get_default());
-        save_proto_dag(tree, a.output);
-      } else if (is_edge_weight_sample_method(a.sample_method)) {
-        std::cerr << "Sampling a tree from min-edge-weight options...\n";
-        edge_weight_score_ops ew_ops;
-        subtree_weight<edge_weight_score_ops> sw(result, a.seed, mr);
-        auto min_score = sw.compute_weight_below(root_idx, ew_ops);
-        auto tree = a.sample_uniformly
-                        ? sw.min_weight_uniform_sample_tree(ew_ops)
-                        : sw.min_weight_sample_tree(ew_ops);
-        std::cerr << "sampled_tree: edge_weight_min=" << std::fixed
-                  << std::setprecision(6) << min_score << "\n";
-        if (a.validate)
-          validate_dag(tree, "sampled min-edge-weight tree",
-                       thread_pool::get_default());
-        save_proto_dag(tree, a.output);
-      } else if (is_ml_sample_method(a.sample_method)) {
-        assert(ml_model_storage != nullptr);
-        std::cerr << "Sampling a tree from min-ML options...\n";
-        auto const& ml_ref = get_reference_sequence(result);
-        ml_model_likelihood_score_ops ml_ops{.model = *ml_model_storage,
-                                             .reference = ml_ref,
-                                             .ignore_ua_edge =
-                                                 a.ignore_ua_edge_ml};
-        subtree_weight<ml_model_likelihood_score_ops> sw(result, a.seed, mr);
-        auto ml_min = sw.compute_weight_below(root_idx, ml_ops);
-        if (!std::isfinite(ml_min)) {
-          std::cerr << "error: non-finite ML sample score\n";
-          std::exit(1);
+      switch (a.sampling_method) {
+        case sample_method::random: {
+          std::cerr << "Sampling a random tree from the DAG...\n";
+          parsimony_score_ops pops;
+          subtree_weight<parsimony_score_ops> sw(result, a.seed, mr);
+          sw.compute_weight_below(root_idx, pops);
+          auto tree = a.sample_uniformly ? sw.uniform_sample_tree(pops)
+                                         : sw.sample_tree(pops);
+          if (a.validate)
+            validate_dag(tree, "sampled random tree",
+                         thread_pool::get_default());
+          save_proto_dag(tree, a.output);
+          break;
         }
-        auto tree = a.sample_uniformly ? sw.min_weight_uniform_sample_tree(ml_ops)
-                                       : sw.min_weight_sample_tree(ml_ops);
-        std::cerr << "sampled_tree: ML_NLL=" << std::fixed
-                  << std::setprecision(6) << ml_min
-                  << (a.ignore_ua_edge_ml ? " (UA edge ignored)"
-                                          : " (UA edge scored)")
-                  << "\n";
-        if (a.validate)
-          validate_dag(tree, "sampled min-ML tree", thread_pool::get_default());
-        save_proto_dag(tree, a.output);
+        case sample_method::parsimony: {
+          std::cerr << "Sampling a tree from min-parsimony options...\n";
+          parsimony_score_ops pops;
+          subtree_weight<parsimony_score_ops> sw(result, a.seed, mr);
+          auto min_score = sw.compute_weight_below(root_idx, pops);
+          auto tree = a.sample_uniformly
+                          ? sw.min_weight_uniform_sample_tree(pops)
+                          : sw.min_weight_sample_tree(pops);
+          std::cerr << "sampled_tree: parsimony_min=" << min_score << "\n";
+          if (a.validate)
+            validate_dag(tree, "sampled min-parsimony tree",
+                         thread_pool::get_default());
+          save_proto_dag(tree, a.output);
+          break;
+        }
+        case sample_method::edge_weight: {
+          std::cerr << "Sampling a tree from min-edge-weight options...\n";
+          edge_weight_score_ops ew_ops;
+          subtree_weight<edge_weight_score_ops> sw(result, a.seed, mr);
+          auto min_score = sw.compute_weight_below(root_idx, ew_ops);
+          auto tree = a.sample_uniformly
+                          ? sw.min_weight_uniform_sample_tree(ew_ops)
+                          : sw.min_weight_sample_tree(ew_ops);
+          std::cerr << "sampled_tree: edge_weight_min=" << std::fixed
+                    << std::setprecision(6) << min_score << "\n";
+          if (a.validate)
+            validate_dag(tree, "sampled min-edge-weight tree",
+                         thread_pool::get_default());
+          save_proto_dag(tree, a.output);
+          break;
+        }
+        case sample_method::ml: {
+          assert(ml_model_storage != nullptr);
+          std::cerr << "Sampling a tree from min-ML options...\n";
+          auto const& ml_ref = get_reference_sequence(result);
+          ml_model_likelihood_score_ops ml_ops{.model = *ml_model_storage,
+                                               .reference = ml_ref,
+                                               .ignore_ua_edge =
+                                                   a.ignore_ua_edge_ml};
+          subtree_weight<ml_model_likelihood_score_ops> sw(result, a.seed, mr);
+          auto ml_min = sw.compute_weight_below(root_idx, ml_ops);
+          if (!std::isfinite(ml_min)) {
+            std::cerr << "error: non-finite ML sample score\n";
+            std::exit(1);
+          }
+          auto tree = a.sample_uniformly
+                          ? sw.min_weight_uniform_sample_tree(ml_ops)
+                          : sw.min_weight_sample_tree(ml_ops);
+          std::cerr << "sampled_tree: ML_NLL=" << std::fixed
+                    << std::setprecision(6) << ml_min
+                    << (a.ignore_ua_edge_ml ? " (UA edge ignored)"
+                                            : " (UA edge scored)")
+                    << "\n";
+          if (a.validate)
+            validate_dag(tree, "sampled min-ML tree",
+                         thread_pool::get_default());
+          save_proto_dag(tree, a.output);
+          break;
+        }
+        case sample_method::rf_minsum:
+        case sample_method::rf_maxsum:
+          std::cerr << "error: --sample-method "
+                    << format_sample_method(a.sampling_method)
+                    << " is not supported by dagutil sampling\n";
+          std::exit(1);
       }
     } else {
       save_proto_dag(result, a.output);
