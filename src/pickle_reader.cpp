@@ -1,12 +1,17 @@
 #include <larch/pickle_reader.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 
 namespace larch {
 namespace {
+
+constexpr std::size_t k_max_stack_entries = 10'000;
+constexpr std::size_t k_max_memo_entries = 1'000'000;
+constexpr std::size_t k_max_tensors = 10'000;
 
 // Pickle protocol 2 opcodes used by torch.save state dicts.
 enum : uint8_t {
@@ -51,6 +56,28 @@ enum : uint8_t {
   OP_SHORT_BINBYTES = 0x43,
   OP_BINBYTES = 0x42,
 };
+
+template <typename UInt>
+UInt native_from_little_endian(UInt v) {
+  if constexpr (std::endian::native == std::endian::little) {
+    return v;
+  } else if constexpr (std::endian::native == std::endian::big) {
+    return std::byteswap(v);
+  } else {
+    throw std::runtime_error{"pickle_reader: unsupported mixed-endian host"};
+  }
+}
+
+template <typename UInt>
+UInt native_from_big_endian(UInt v) {
+  if constexpr (std::endian::native == std::endian::big) {
+    return v;
+  } else if constexpr (std::endian::native == std::endian::little) {
+    return std::byteswap(v);
+  } else {
+    throw std::runtime_error{"pickle_reader: unsupported mixed-endian host"};
+  }
+}
 
 // Lightweight tagged value for the pickle VM stack.
 struct pval {
@@ -123,20 +150,19 @@ class pickle_vm {
     uint16_t v;
     std::memcpy(&v, pos_, 2);
     pos_ += 2;
-    return v;
+    return native_from_little_endian(v);
   }
   uint32_t read_u32() {
     require(4);
     uint32_t v;
     std::memcpy(&v, pos_, 4);
     pos_ += 4;
-    return v;
+    return native_from_little_endian(v);
   }
   int32_t read_i32() {
-    require(4);
+    uint32_t bits = read_u32();
     int32_t v;
-    std::memcpy(&v, pos_, 4);
-    pos_ += 4;
+    std::memcpy(&v, &bits, 4);
     return v;
   }
   uint64_t read_u64() {
@@ -144,7 +170,7 @@ class pickle_vm {
     uint64_t v;
     std::memcpy(&v, pos_, 8);
     pos_ += 8;
-    return v;
+    return native_from_little_endian(v);
   }
   double read_f64_be() {
     // BINFLOAT stores IEEE 754 big-endian double.
@@ -152,8 +178,7 @@ class pickle_vm {
     uint64_t bits;
     std::memcpy(&bits, pos_, 8);
     pos_ += 8;
-    // Byte-swap from big-endian to host (little-endian x86).
-    bits = __builtin_bswap64(bits);
+    bits = native_from_big_endian(bits);
     double v;
     std::memcpy(&v, &bits, 8);
     return v;
@@ -176,7 +201,38 @@ class pickle_vm {
     return s;
   }
 
-  void push(pval v) { stack_.push_back(std::move(v)); }
+  void check_stack_cap() const {
+    if (stack_.size() > k_max_stack_entries)
+      throw std::runtime_error{
+          "pickle_reader: stack entry limit exceeded (max 10000)"};
+  }
+
+  void check_memo_cap() const {
+    if (memo_.size() > k_max_memo_entries)
+      throw std::runtime_error{
+          "pickle_reader: memo entry limit exceeded (max 1000000)"};
+  }
+
+  void check_tensor_cap() const {
+    if (tensors_.size() > k_max_tensors)
+      throw std::runtime_error{
+          "pickle_reader: tensor limit exceeded (max 10000)"};
+  }
+
+  void push(pval v) {
+    stack_.push_back(std::move(v));
+    check_stack_cap();
+  }
+
+  void memoize(uint32_t idx) {
+    if (!stack_.empty()) {
+      if (!memo_.contains(idx) && memo_.size() >= k_max_memo_entries)
+        throw std::runtime_error{
+            "pickle_reader: memo entry limit exceeded (max 1000000)"};
+      memo_[idx] = stack_.back();
+      check_memo_cap();
+    }
+  }
 
   pval pop() {
     if (stack_.empty())
@@ -252,6 +308,7 @@ class pickle_vm {
     result = pval::make_reduced();
     result.int_val = static_cast<int64_t>(tensors_.size());
     tensors_.push_back(std::move(ti));
+    check_tensor_cap();
     return true;
   }
 
@@ -415,12 +472,12 @@ class pickle_vm {
 
         case OP_BINPUT: {
           uint8_t idx = read_u8();
-          if (!stack_.empty()) memo_[idx] = stack_.back();
+          memoize(idx);
           break;
         }
         case OP_LONG_BINPUT: {
           uint32_t idx = read_u32();
-          if (!stack_.empty()) memo_[idx] = stack_.back();
+          memoize(idx);
           break;
         }
         case OP_BINGET: {
@@ -440,7 +497,7 @@ class pickle_vm {
           break;
         }
         case OP_MEMOIZE: {
-          if (!stack_.empty()) memo_[next_memo_++] = stack_.back();
+          if (!stack_.empty()) memoize(next_memo_++);
           break;
         }
 

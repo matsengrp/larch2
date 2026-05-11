@@ -128,6 +128,17 @@ void test_zip_reader_entries() {
 
 // ---- Pickle parser tests ----
 
+static void append_ascii(std::vector<uint8_t>& bytes, std::string_view text) {
+  bytes.insert(bytes.end(), text.begin(), text.end());
+}
+
+static void append_u32_le(std::vector<uint8_t>& bytes, uint32_t value) {
+  bytes.push_back(static_cast<uint8_t>(value & 0xff));
+  bytes.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+  bytes.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
+  bytes.push_back(static_cast<uint8_t>((value >> 24) & 0xff));
+}
+
 void test_pickle_s5f() {
   zip_reader zip{"data/bcr/s5f-libtorch.pth"};
   auto pkl = zip.get_by_suffix("data.pkl");
@@ -194,6 +205,54 @@ void test_pickle_cnn() {
   assert(s_lin_b->shape == std::vector<int64_t>{4});
 
   std::println("  pickle cnn: OK");
+}
+
+void test_pickle_stack_limit_rejected() {
+  // NONE pushes one stack entry. The parser caps the VM stack at 10,000
+  // entries, so the 10,001st opcode must be rejected.
+  std::vector<uint8_t> pkl(10'001, 0x4e);
+  expect_throws_contains([&] { parse_state_dict(pkl); },
+                         "stack entry limit exceeded");
+  std::println("  pickle stack cap diagnostics: OK");
+}
+
+void test_pickle_tensor_limit_rejected() {
+  std::vector<uint8_t> pkl;
+  pkl.reserve(430'000);
+
+  for (int i = 0; i < 10'001; ++i) {
+    pkl.push_back(0x63);  // GLOBAL
+    append_ascii(pkl, "torch._utils\n_rebuild_tensor_v2\n");
+    pkl.push_back(0x28);  // MARK
+    pkl.push_back(0x4e);  // NONE: placeholder persistent id
+    pkl.push_back(0x4b);  // BININT1: storage offset 0
+    pkl.push_back(0x00);
+    pkl.push_back(0x29);  // EMPTY_TUPLE: shape
+    pkl.push_back(0x29);  // EMPTY_TUPLE: stride
+    pkl.push_back(0x89);  // NEWFALSE: requires_grad
+    pkl.push_back(0x74);  // TUPLE: args
+    pkl.push_back(0x52);  // REDUCE: extracts tensor_info
+    pkl.push_back(0x30);  // POP: keep stack small while tensors_ grows
+  }
+
+  expect_throws_contains([&] { parse_state_dict(pkl); },
+                         "tensor limit exceeded");
+  std::println("  pickle tensor cap diagnostics: OK");
+}
+
+void test_pickle_memo_limit_rejected() {
+  std::vector<uint8_t> pkl;
+  pkl.reserve(1 + 5 * 1'000'001);
+  pkl.push_back(0x4e);  // NONE: one stack value for LONG_BINPUT to memoize.
+
+  for (uint32_t idx = 0; idx <= 1'000'000; ++idx) {
+    pkl.push_back(0x72);  // LONG_BINPUT
+    append_u32_le(pkl, idx);
+  }
+
+  expect_throws_contains([&] { parse_state_dict(pkl); },
+                         "memo entry limit exceeded");
+  std::println("  pickle memo cap diagnostics: OK");
 }
 
 // ---- YAML reader tests ----
@@ -448,6 +507,9 @@ int main() {
   std::println("=== Pickle parser tests ===");
   test_pickle_s5f();
   test_pickle_cnn();
+  test_pickle_stack_limit_rejected();
+  test_pickle_tensor_limit_rejected();
+  test_pickle_memo_limit_rejected();
 
   std::println("=== YAML reader tests ===");
   test_yaml_s5f();
