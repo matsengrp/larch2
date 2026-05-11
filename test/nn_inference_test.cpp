@@ -6,6 +6,8 @@
 
 #include <cassert>
 #include <cmath>
+#include <exception>
+#include <memory>
 #include <print>
 
 using namespace larch;
@@ -24,8 +26,7 @@ static void check_close(float a, float b, float tol, const char* label,
 
 // --- Fivemer tests ---
 
-void test_fivemer_gpu_vs_cpu() {
-  vk_context ctx;
+void test_fivemer_gpu_vs_cpu(vk_context& ctx) {
   auto model = rs_fivemer_model::load("data/bcr", "s5f");
   nn_inference gpu{ctx, model};
 
@@ -46,8 +47,7 @@ void test_fivemer_gpu_vs_cpu() {
   std::println("  fivemer GPU vs CPU: OK");
 }
 
-void test_fivemer_log_likelihood_gpu_vs_cpu() {
-  vk_context ctx;
+void test_fivemer_log_likelihood_gpu_vs_cpu(vk_context& ctx) {
   auto model = rs_fivemer_model::load("data/bcr", "s5f");
   nn_inference gpu{ctx, model};
 
@@ -66,8 +66,7 @@ void test_fivemer_log_likelihood_gpu_vs_cpu() {
       gpu_ll);
 }
 
-void test_fivemer_gpu_deterministic() {
-  vk_context ctx;
+void test_fivemer_gpu_deterministic(vk_context& ctx) {
   auto model = rs_fivemer_model::load("data/bcr", "s5f");
   nn_inference gpu{ctx, model};
 
@@ -80,8 +79,7 @@ void test_fivemer_gpu_deterministic() {
   std::println("  fivemer GPU deterministic: OK");
 }
 
-void test_fivemer_gpu_output_shapes() {
-  vk_context ctx;
+void test_fivemer_gpu_output_shapes(vk_context& ctx) {
   auto model = rs_fivemer_model::load("data/bcr", "s5f");
   nn_inference gpu{ctx, model};
 
@@ -92,8 +90,7 @@ void test_fivemer_gpu_output_shapes() {
   std::println("  fivemer GPU output shapes: OK");
 }
 
-void test_fivemer_gpu_rates_positive() {
-  vk_context ctx;
+void test_fivemer_gpu_rates_positive(vk_context& ctx) {
   auto model = rs_fivemer_model::load("data/bcr", "s5f");
   nn_inference gpu{ctx, model};
 
@@ -105,8 +102,7 @@ void test_fivemer_gpu_rates_positive() {
   std::println("  fivemer GPU rates positive: OK");
 }
 
-void test_fivemer_gpu_csp_sums_to_one() {
-  vk_context ctx;
+void test_fivemer_gpu_csp_sums_to_one(vk_context& ctx) {
   auto model = rs_fivemer_model::load("data/bcr", "s5f");
   nn_inference gpu{ctx, model};
 
@@ -125,8 +121,7 @@ void test_fivemer_gpu_csp_sums_to_one() {
 
 // --- CNN tests ---
 
-void test_cnn_gpu_vs_cpu() {
-  vk_context ctx;
+void test_cnn_gpu_vs_cpu(vk_context& ctx) {
   auto model = indep_rs_cnn_model::load("data/bcr", "ThriftyHumV0.2-45");
   nn_inference gpu{ctx, model};
 
@@ -146,8 +141,7 @@ void test_cnn_gpu_vs_cpu() {
   std::println("  cnn GPU vs CPU: OK");
 }
 
-void test_cnn_log_likelihood_gpu_vs_cpu() {
-  vk_context ctx;
+void test_cnn_log_likelihood_gpu_vs_cpu(vk_context& ctx) {
   auto model = indep_rs_cnn_model::load("data/bcr", "ThriftyHumV0.2-45");
   nn_inference gpu{ctx, model};
 
@@ -165,8 +159,7 @@ void test_cnn_log_likelihood_gpu_vs_cpu() {
                cpu_ll, gpu_ll);
 }
 
-void test_cnn_gpu_deterministic() {
-  vk_context ctx;
+void test_cnn_gpu_deterministic(vk_context& ctx) {
   auto model = indep_rs_cnn_model::load("data/bcr", "ThriftyHumV0.2-45");
   nn_inference gpu{ctx, model};
 
@@ -179,8 +172,7 @@ void test_cnn_gpu_deterministic() {
   std::println("  cnn GPU deterministic: OK");
 }
 
-void test_cnn_gpu_output_shapes() {
-  vk_context ctx;
+void test_cnn_gpu_output_shapes(vk_context& ctx) {
   auto model = indep_rs_cnn_model::load("data/bcr", "ThriftyHumV0.2-45");
   nn_inference gpu{ctx, model};
 
@@ -191,8 +183,7 @@ void test_cnn_gpu_output_shapes() {
   std::println("  cnn GPU output shapes: OK");
 }
 
-void test_cnn_gpu_rates_positive() {
-  vk_context ctx;
+void test_cnn_gpu_rates_positive(vk_context& ctx) {
   auto model = indep_rs_cnn_model::load("data/bcr", "ThriftyHumV0.2-45");
   nn_inference gpu{ctx, model};
 
@@ -204,8 +195,7 @@ void test_cnn_gpu_rates_positive() {
   std::println("  cnn GPU rates positive: OK");
 }
 
-void test_cnn_gpu_csp_sums_to_one() {
-  vk_context ctx;
+void test_cnn_gpu_csp_sums_to_one(vk_context& ctx) {
   auto model = indep_rs_cnn_model::load("data/bcr", "ThriftyHumV0.2-45");
   nn_inference gpu{ctx, model};
 
@@ -222,8 +212,7 @@ void test_cnn_gpu_csp_sums_to_one() {
   std::println("  cnn GPU csp sums to one: OK");
 }
 
-void test_cnn_gpu_parent_base_masked() {
-  vk_context ctx;
+void test_cnn_gpu_parent_base_masked(vk_context& ctx) {
   auto model = indep_rs_cnn_model::load("data/bcr", "ThriftyHumV0.2-45");
   nn_inference gpu{ctx, model};
 
@@ -239,22 +228,30 @@ void test_cnn_gpu_parent_base_masked() {
 int main() {
   std::println("=== nn_inference tests (GPU) ===");
 
+  std::unique_ptr<vk_context> ctx;
+  try {
+    ctx = std::make_unique<vk_context>();
+  } catch (std::exception const& e) {
+    std::println("SKIP: Vulkan context unavailable: {}", e.what());
+    return 77;
+  }
+
   std::println("--- Fivemer ---");
-  test_fivemer_gpu_output_shapes();
-  test_fivemer_gpu_rates_positive();
-  test_fivemer_gpu_csp_sums_to_one();
-  test_fivemer_gpu_vs_cpu();
-  test_fivemer_log_likelihood_gpu_vs_cpu();
-  test_fivemer_gpu_deterministic();
+  test_fivemer_gpu_output_shapes(*ctx);
+  test_fivemer_gpu_rates_positive(*ctx);
+  test_fivemer_gpu_csp_sums_to_one(*ctx);
+  test_fivemer_gpu_vs_cpu(*ctx);
+  test_fivemer_log_likelihood_gpu_vs_cpu(*ctx);
+  test_fivemer_gpu_deterministic(*ctx);
 
   std::println("--- CNN ---");
-  test_cnn_gpu_output_shapes();
-  test_cnn_gpu_rates_positive();
-  test_cnn_gpu_csp_sums_to_one();
-  test_cnn_gpu_parent_base_masked();
-  test_cnn_gpu_vs_cpu();
-  test_cnn_log_likelihood_gpu_vs_cpu();
-  test_cnn_gpu_deterministic();
+  test_cnn_gpu_output_shapes(*ctx);
+  test_cnn_gpu_rates_positive(*ctx);
+  test_cnn_gpu_csp_sums_to_one(*ctx);
+  test_cnn_gpu_parent_base_masked(*ctx);
+  test_cnn_gpu_vs_cpu(*ctx);
+  test_cnn_log_likelihood_gpu_vs_cpu(*ctx);
+  test_cnn_gpu_deterministic(*ctx);
 
   std::println("All nn_inference tests passed");
 }

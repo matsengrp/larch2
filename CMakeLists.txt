@@ -526,4 +526,7 @@ if(ENABLE_VULKAN)
     add_dependencies(nn_inference_test larch_shaders)
     add_test(NAME nn_inference_test COMMAND nn_inference_test
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    set_tests_properties(vulkan_compute_test nn_inference_test
+                         PROPERTIES SKIP_RETURN_CODE 77)
 endif()

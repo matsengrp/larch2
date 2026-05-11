@@ -4,6 +4,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <exception>
+#include <memory>
 #include <print>
 #include <span>
 #include <vector>
@@ -13,16 +15,13 @@
 
 using namespace larch;
 
-void test_context_creation() {
-  vk_context ctx;
+void test_context_creation(vk_context& ctx) {
   auto name = ctx.device_name();
   assert(!name.empty());
   std::println("  device: {}", name);
 }
 
-void test_buffer_upload_download() {
-  vk_context ctx;
-
+void test_buffer_upload_download(vk_context& ctx) {
   std::vector<float> data{1.0f, 2.0f, 3.0f, 4.0f};
   auto buf = vk_buffer::create(ctx, data.size() * sizeof(float),
                                vk_buffer::usage::storage_read_write);
@@ -39,9 +38,7 @@ void test_buffer_upload_download() {
   std::println("  buffer round-trip: OK");
 }
 
-void test_double_it_shader() {
-  vk_context ctx;
-
+void test_double_it_shader(vk_context& ctx) {
   constexpr std::size_t N = 256;
   std::vector<float> input(N);
   for (std::size_t i = 0; i < N; ++i) input[i] = static_cast<float>(i);
@@ -74,9 +71,7 @@ void test_double_it_shader() {
   std::println("  double_it shader (N={}): OK", N);
 }
 
-void test_large_dispatch() {
-  vk_context ctx;
-
+void test_large_dispatch(vk_context& ctx) {
   constexpr std::size_t N = 10000;
   std::vector<float> input(N);
   for (std::size_t i = 0; i < N; ++i) input[i] = static_cast<float>(i) * 0.1f;
@@ -109,9 +104,18 @@ void test_large_dispatch() {
 
 int main() {
   std::println("=== Vulkan compute tests ===");
-  test_context_creation();
-  test_buffer_upload_download();
-  test_double_it_shader();
-  test_large_dispatch();
+
+  std::unique_ptr<vk_context> ctx;
+  try {
+    ctx = std::make_unique<vk_context>();
+  } catch (std::exception const& e) {
+    std::println("SKIP: Vulkan context unavailable: {}", e.what());
+    return 77;
+  }
+
+  test_context_creation(*ctx);
+  test_buffer_upload_download(*ctx);
+  test_double_it_shader(*ctx);
+  test_large_dispatch(*ctx);
   std::println("All vulkan_compute tests passed");
 }
