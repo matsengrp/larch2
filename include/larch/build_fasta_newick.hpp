@@ -78,16 +78,10 @@ inline phylo_dag build_from_fasta_newick(
   for (auto& ne : nw_edges) {
     auto edge = d.append_edge<edge_kind::clade>();
     edge.clade_index() = ne.clade;
-    auto pi = nw_to_dag[ne.parent];
-    auto ci = nw_to_dag[ne.child];
-    for (auto nv : d.get_all_nodes()) {
-      std::visit(
-          [&](auto n) {
-            if (n.index() == pi) edge.set_parent(n);
-            if (n.index() == ci) edge.set_child(n);
-          },
-          nv);
-    }
+    std::visit([&](auto parent) { edge.set_parent(parent); },
+               d.get_node(nw_to_dag.at(ne.parent)));
+    std::visit([&](auto child) { edge.set_child(child); },
+               d.get_node(nw_to_dag.at(ne.child)));
   }
 
   // Add UA node
@@ -96,14 +90,8 @@ inline phylo_dag build_from_fasta_newick(
   d.set_root(ua);
   {
     auto edge = ua.append_child<edge_kind::clade>();
-    auto root_dag_idx = nw_to_dag[newick_root];
-    for (auto nv : d.get_all_nodes()) {
-      std::visit(
-          [&](auto n) {
-            if (n.index() == root_dag_idx) edge.set_child(n);
-          },
-          nv);
-    }
+    std::visit([&](auto child) { edge.set_child(child); },
+               d.get_node(nw_to_dag.at(newick_root)));
     edge.clade_index() = 0;
   }
 

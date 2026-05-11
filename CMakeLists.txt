@@ -148,6 +148,11 @@ set_target_properties(larch2 dagutil larch2-bcr PROPERTIES
 
 enable_testing()
 
+add_test(NAME larch2_bcr_non_treefile_suffix
+         COMMAND bash test/larch2_bcr_non_treefile_suffix.sh
+                 $<TARGET_FILE:larch2-bcr>
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 # Header-only tests (no library link needed beyond include path)
 foreach(test_name chain_test dag_test hash_chain_test extend_dag_test
                   overlay_dag_test bigint_test weight_counter_test
@@ -511,9 +516,9 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   weight_accum_test optimize_test native_optimize_test
                   spr_pipeline_test trim_clade_edges_test
                   rotaA_diagnostic_test
-                  pth_loader_test rs_fivemer_model_test
-                  nn_cnn_test nn_s5f_test nn_ml_spr_test
-                  nn_blended_spr_test)
+                  pth_loader_test build_fasta_newick_test
+                  rs_fivemer_model_test nn_cnn_test nn_s5f_test
+                  nn_ml_spr_test nn_blended_spr_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
     add_test(NAME ${test_name} COMMAND ${test_name}

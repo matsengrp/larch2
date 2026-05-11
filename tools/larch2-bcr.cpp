@@ -29,7 +29,8 @@ Usage:
 
 Options:
   --fasta FILE        Path to FASTA file (can be specified multiple times)
-  --trees DIR         Directory containing Newick tree files (*.treefile)
+  --trees DIR         Directory containing Newick tree files matched by
+                      --tree-suffix
   --reference FILE    Path to reference sequence file (FASTA or raw text)
   -o, --output FILE   Path to output DAG protobuf file
   --tree-suffix STR   Suffix filter for tree files (default: -rerooted.treefile)
@@ -121,12 +122,15 @@ int main(int argc, char** argv) try {
 
   // Scan trees directory for matching Newick files.
   std::vector<std::string> tree_paths;
+  auto const tree_suffix_extension =
+      std::filesystem::path{tree_suffix}.extension();
   for (auto const& entry : std::filesystem::directory_iterator{trees_dir}) {
-    if (entry.path().extension() != ".treefile") continue;
+    if (!entry.is_regular_file()) continue;
+    if (!tree_suffix_extension.empty() &&
+        entry.path().extension() != tree_suffix_extension)
+      continue;
     auto filename = entry.path().filename().string();
-    // Check if filename contains the suffix stem (before the extension).
-    auto suffix_stem = tree_suffix.substr(0, tree_suffix.find('.'));
-    if (filename.find(suffix_stem) == std::string::npos) continue;
+    if (!filename.ends_with(tree_suffix)) continue;
     tree_paths.push_back(entry.path().string());
   }
   std::sort(tree_paths.begin(), tree_paths.end());
