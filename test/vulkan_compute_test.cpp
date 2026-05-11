@@ -8,6 +8,7 @@
 #include <memory>
 #include <print>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 // Embedded SPIR-V bytecode — generated at build time.
@@ -36,6 +37,35 @@ void test_buffer_upload_download(vk_context& ctx) {
     assert(out[static_cast<std::size_t>(i)] ==
            data[static_cast<std::size_t>(i)]);
   std::println("  buffer round-trip: OK");
+}
+
+void test_buffer_usage_access_checks(vk_context& ctx) {
+  std::vector<float> data{42.0f};
+  std::vector<float> out(1);
+
+  auto read_buf = vk_buffer::create(ctx, data.size() * sizeof(float),
+                                    vk_buffer::usage::storage_read);
+  read_buf.upload_typed(std::span{data});
+
+  bool download_rejected = false;
+  try {
+    read_buf.download_typed(std::span{out});
+  } catch (std::logic_error const&) {
+    download_rejected = true;
+  }
+  assert(download_rejected);
+
+  auto write_buf = vk_buffer::create(ctx, data.size() * sizeof(float),
+                                     vk_buffer::usage::storage_write);
+  bool upload_rejected = false;
+  try {
+    write_buf.upload_typed(std::span{data});
+  } catch (std::logic_error const&) {
+    upload_rejected = true;
+  }
+  assert(upload_rejected);
+
+  std::println("  buffer usage access checks: OK");
 }
 
 void test_double_it_shader(vk_context& ctx) {
@@ -115,6 +145,7 @@ int main() {
 
   test_context_creation(*ctx);
   test_buffer_upload_download(*ctx);
+  test_buffer_usage_access_checks(*ctx);
   test_double_it_shader(*ctx);
   test_large_dispatch(*ctx);
   std::println("All vulkan_compute tests passed");

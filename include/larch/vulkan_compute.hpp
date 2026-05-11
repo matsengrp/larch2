@@ -34,6 +34,13 @@ class vk_context {
 // GPU buffer — wraps VkBuffer + VkDeviceMemory. Move-only.
 class vk_buffer {
  public:
+  // Intended shader storage-buffer access, from the shader's perspective:
+  //   storage_read       shader reads; host may upload initial contents
+  //   storage_write      shader writes; host may download results
+  //   storage_read_write shader may read/write; host may upload/download
+  // All variants bind as VK_DESCRIPTOR_TYPE_STORAGE_BUFFER. The current
+  // wrapper has no descriptor-layout read-only/write-only hint; GLSL
+  // readonly/writeonly qualifiers provide shader-level documentation/checking.
   enum class usage { storage_read, storage_write, storage_read_write };
 
   static vk_buffer create(vk_context& ctx, std::size_t size_bytes, usage u);

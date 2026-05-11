@@ -33,6 +33,32 @@ bool wait_until_idle(VkDevice device, VkQueue queue) noexcept {
   return device != VK_NULL_HANDLE && vkDeviceWaitIdle(device) == VK_SUCCESS;
 }
 
+VkBufferUsageFlags buffer_usage_flags(vk_buffer::usage u) {
+  switch (u) {
+    case vk_buffer::usage::storage_read:
+      return VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+             VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    case vk_buffer::usage::storage_write:
+      return VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+             VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    case vk_buffer::usage::storage_read_write:
+      return VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+             VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+             VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  }
+  throw std::logic_error{"vk_buffer::create: unknown buffer usage"};
+}
+
+bool permits_upload(vk_buffer::usage u) noexcept {
+  return u == vk_buffer::usage::storage_read ||
+         u == vk_buffer::usage::storage_read_write;
+}
+
+bool permits_download(vk_buffer::usage u) noexcept {
+  return u == vk_buffer::usage::storage_write ||
+         u == vk_buffer::usage::storage_read_write;
+}
+
 class command_buffer_guard {
  public:
   command_buffer_guard(VkDevice device, VkCommandPool command_pool,
@@ -255,6 +281,7 @@ struct vk_buffer::impl {
   VkDeviceMemory memory = VK_NULL_HANDLE;
   void* mapped = nullptr;
   std::size_t size = 0;
+  vk_buffer::usage usage = vk_buffer::usage::storage_read_write;
 
   ~impl() {
     if (device) {
@@ -278,16 +305,17 @@ vk_buffer::impl& vk_buffer::get_impl() { return *impl_; }
 std::size_t vk_buffer::size_bytes() const { return impl_->size; }
 
 vk_buffer vk_buffer::create(vk_context& ctx, std::size_t size_bytes,
-                            usage /*u*/) {
+                            usage u) {
   auto& c = ctx.get_impl();
   auto p = std::make_unique<impl>();
   p->device = c.device;
   p->size = size_bytes;
+  p->usage = u;
 
   VkBufferCreateInfo bci{};
   bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
   bci.size = size_bytes;
-  bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  bci.usage = buffer_usage_flags(u);
   bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
   vk_check(vkCreateBuffer(c.device, &bci, nullptr, &p->buffer),
@@ -315,12 +343,18 @@ vk_buffer vk_buffer::create(vk_context& ctx, std::size_t size_bytes,
 }
 
 void vk_buffer::upload(std::span<const std::byte> data) {
+  if (!permits_upload(impl_->usage))
+    throw std::logic_error{
+        "vk_buffer::upload: buffer usage does not permit upload"};
   if (data.size() > impl_->size)
     throw std::runtime_error{"vk_buffer::upload: data exceeds buffer size"};
   std::memcpy(impl_->mapped, data.data(), data.size());
 }
 
 void vk_buffer::download(std::span<std::byte> out) const {
+  if (!permits_download(impl_->usage))
+    throw std::logic_error{
+        "vk_buffer::download: buffer usage does not permit download"};
   if (out.size() > impl_->size)
     throw std::runtime_error{"vk_buffer::download: span exceeds buffer size"};
   std::memcpy(out.data(), impl_->mapped, out.size());
