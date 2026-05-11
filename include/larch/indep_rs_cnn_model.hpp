@@ -2,6 +2,7 @@
 
 #include <larch/kmer_encoder.hpp>
 #include <larch/likelihood.hpp>
+#include <larch/ml_forward_result.hpp>
 #include <larch/pth_loader.hpp>
 #include <larch/yaml_reader.hpp>
 
@@ -120,10 +121,7 @@ class indep_rs_cnn_model {
   }
 
  public:
-  struct forward_result {
-    std::vector<float> rates;  // [site_count]
-    std::vector<float> csp;    // [site_count * 4]
-  };
+  using forward_result = ml_forward_result;
 
   indep_rs_cnn_model(pth_file pth, kmer_encoder encoder,
                      std::size_t embedding_dim, std::size_t filter_count,
@@ -256,11 +254,7 @@ class indep_rs_cnn_model {
 
   double log_likelihood(std::string_view parent_seq,
                         std::string_view child_seq) const {
-    auto [rates, csp] = forward(parent_seq);
-    auto parent_bases = kmer_encoder::encode_bases(parent_seq);
-    auto child_bases = kmer_encoder::encode_bases(child_seq);
-    return poisson_context_log_likelihood(rates, csp, parent_bases,
-                                          child_bases);
+    return model_forward_log_likelihood(*this, parent_seq, child_seq);
   }
 
   std::size_t kmer_length() const { return encoder_.kmer_length(); }

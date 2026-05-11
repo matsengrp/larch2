@@ -2,6 +2,7 @@
 
 #include <larch/kmer_encoder.hpp>
 #include <larch/likelihood.hpp>
+#include <larch/ml_forward_result.hpp>
 #include <larch/pth_loader.hpp>
 #include <larch/yaml_reader.hpp>
 
@@ -27,10 +28,7 @@ class rs_fivemer_model {
   double rate_bias_log_ = 0.0;  // additive log-bias applied to all rates
 
  public:
-  struct forward_result {
-    std::vector<float> rates;  // [site_count]
-    std::vector<float> csp;    // [site_count * 4]
-  };
+  using forward_result = ml_forward_result;
 
   rs_fivemer_model(pth_file pth, kmer_encoder encoder)
       : pth_{std::move(pth)}, encoder_{std::move(encoder)} {
@@ -113,11 +111,7 @@ class rs_fivemer_model {
   // Compute Poisson context log-likelihood for a parent→child edge.
   double log_likelihood(std::string_view parent_seq,
                         std::string_view child_seq) const {
-    auto [rates, csp] = forward(parent_seq);
-    auto parent_bases = kmer_encoder::encode_bases(parent_seq);
-    auto child_bases = kmer_encoder::encode_bases(child_seq);
-    return poisson_context_log_likelihood(rates, csp, parent_bases,
-                                          child_bases);
+    return model_forward_log_likelihood(*this, parent_seq, child_seq);
   }
 
   std::size_t kmer_length() const { return encoder_.kmer_length(); }

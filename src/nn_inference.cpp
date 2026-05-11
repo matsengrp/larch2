@@ -274,10 +274,7 @@ nn_inference::forward_result nn_inference::forward(
 
 double nn_inference::log_likelihood(std::string_view parent_seq,
                                     std::string_view child_seq) const {
-  auto [rates, csp] = forward(parent_seq);
-  auto parent_bases = kmer_encoder::encode_bases(parent_seq);
-  auto child_bases = kmer_encoder::encode_bases(child_seq);
-  return poisson_context_log_likelihood(rates, csp, parent_bases, child_bases);
+  return model_forward_log_likelihood(*this, parent_seq, child_seq);
 }
 
 std::size_t nn_inference::site_count() const { return require_impl().sc; }

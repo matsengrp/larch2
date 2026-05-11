@@ -1,9 +1,10 @@
 #pragma once
 
+#include <larch/ml_forward_result.hpp>
+
 #include <cstddef>
 #include <memory>
 #include <string_view>
-#include <vector>
 
 namespace larch {
 
@@ -16,10 +17,7 @@ class indep_rs_cnn_model;
 // interface as the CPU models, so it can be used with likelihood_score_ops.
 class nn_inference {
  public:
-  struct forward_result {
-    std::vector<float> rates;  // [site_count]
-    std::vector<float> csp;    // [site_count * 4]
-  };
+  using forward_result = ml_forward_result;
 
   nn_inference(vk_context& ctx, rs_fivemer_model const& model);
   nn_inference(vk_context& ctx, indep_rs_cnn_model const& model);
