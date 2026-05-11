@@ -265,11 +265,13 @@ void test_yaml_s5f() {
   assert(doc.at("serialization_version").as_int() == 0);
 
   assert(doc.at("encoder_parameters").is_map());
-  assert(doc.at("encoder_parameters").map.at("kmer_length").as_int() == 5);
-  assert(doc.at("encoder_parameters").map.at("site_count").as_int() == 500);
+  assert(doc.at("encoder_parameters").as_map().at("kmer_length").as_int() == 5);
+  assert(doc.at("encoder_parameters").as_map().at("site_count").as_int() ==
+         500);
 
   assert(doc.at("model_hyperparameters").is_map());
-  assert(doc.at("model_hyperparameters").map.at("kmer_length").as_int() == 5);
+  assert(doc.at("model_hyperparameters").as_map().at("kmer_length").as_int() ==
+         5);
 
   std::println("  yaml s5f: OK");
 }
@@ -280,18 +282,18 @@ void test_yaml_cnn() {
   assert(doc.at("model_class").as_string() == "IndepRSCNNModel");
   assert(doc.at("encoder_class").as_string() == "KmerSequenceEncoder");
 
-  auto& enc = doc.at("encoder_parameters").map;
+  auto& enc = doc.at("encoder_parameters").as_map();
   assert(enc.at("kmer_length").as_int() == 3);
   assert(enc.at("site_count").as_int() == 500);
 
-  auto& hyp = doc.at("model_hyperparameters").map;
+  auto& hyp = doc.at("model_hyperparameters").as_map();
   assert(hyp.at("embedding_dim").as_int() == 7);
   assert(hyp.at("filter_count").as_int() == 16);
   assert(hyp.at("kernel_size").as_int() == 9);
   assert(hyp.at("kmer_length").as_int() == 3);
   assert(std::abs(hyp.at("dropout_prob").as_float() - 0.2) < 1e-9);
 
-  auto& train = doc.at("training_hyperparameters").map;
+  auto& train = doc.at("training_hyperparameters").as_map();
   assert(std::abs(train.at("learning_rate").as_float() - 0.001) < 1e-9);
   assert(std::abs(train.at("min_learning_rate").as_float() - 1e-6) < 1e-15);
   assert(std::abs(train.at("weight_decay").as_float() - 1e-6) < 1e-15);
@@ -328,11 +330,55 @@ void test_yaml_missing_key_reports_context() {
       [&] {
         auto const& enc =
             yaml_require_map(doc, path.string(), "encoder_parameters");
-        yaml_require_key(enc, path.string(), "site_count", "encoder_parameters");
+        yaml_require_key(enc, path.string(), "site_count",
+                         "encoder_parameters");
       },
       "encoder_parameters");
   std::filesystem::remove(path);
   std::println("  yaml missing-key diagnostics: OK");
+}
+
+void test_yaml_empty_value_is_scalar() {
+  auto path = temp_yaml_path("larch_empty_scalar_yaml");
+  write_text_file(path, "empty:\nnonempty: value\n");
+  auto doc = read_yaml(path.string());
+
+  assert(doc.at("empty").is_scalar());
+  assert(!doc.at("empty").is_map());
+  assert(doc.at("empty").as_string().empty());
+  assert(doc.at("nonempty").as_string() == "value");
+  expect_throws_contains([&] { (void)doc.at("empty").as_map(); },
+                         "expected map, found scalar");
+  expect_throws_contains([&] { yaml_require_map(doc, path.string(), "empty"); },
+                         "expected map at key 'empty'");
+
+  std::filesystem::remove(path);
+  std::println("  yaml empty scalar kind: OK");
+}
+
+void test_yaml_nested_map_kind() {
+  auto path = temp_yaml_path("larch_nested_map_yaml");
+  write_text_file(path,
+                  "parent:\n"
+                  "  child: value\n"
+                  "  empty_child:\n"
+                  "empty_map: {}\n"
+                  "empty_scalar:\n");
+  auto doc = read_yaml(path.string());
+
+  assert(doc.at("parent").is_map());
+  auto const& parent = doc.at("parent").as_map();
+  assert(parent.at("child").is_scalar());
+  assert(parent.at("child").as_string() == "value");
+  assert(parent.at("empty_child").is_scalar());
+  assert(parent.at("empty_child").as_string().empty());
+  assert(doc.at("empty_map").is_map());
+  assert(doc.at("empty_map").as_map().empty());
+  assert(doc.at("empty_scalar").is_scalar());
+  assert(doc.at("empty_scalar").as_string().empty());
+
+  std::filesystem::remove(path);
+  std::println("  yaml nested map kind: OK");
 }
 
 // ---- PTH loader tests ----
@@ -517,6 +563,8 @@ int main() {
   test_yaml_malformed_line_reports_path_and_line();
   test_yaml_tabs_rejected();
   test_yaml_missing_key_reports_context();
+  test_yaml_empty_value_is_scalar();
+  test_yaml_nested_map_kind();
 
   std::println("=== PTH loader tests ===");
   test_pth_s5f();
