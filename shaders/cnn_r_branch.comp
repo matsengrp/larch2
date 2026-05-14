@@ -1,0 +1,73 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Shared branch weights.
+layout(set = 0, binding = 0) readonly buffer KmerIndices { int kmer_indices[]; };
+layout(set = 0, binding = 1) readonly buffer EmbedW      { float embed_w[]; };
+layout(set = 0, binding = 2) readonly buffer ConvW       { float conv_w[]; };
+layout(set = 0, binding = 3) readonly buffer ConvB       { float conv_b[]; };
+layout(set = 0, binding = 4) readonly buffer LinearW     { float linear_w[]; };
+layout(set = 0, binding = 5) readonly buffer LinearB     { float linear_b[]; };
+
+// R-branch weights.
+layout(set = 0, binding = 6)  readonly buffer REmbedW    { float r_embed_w[]; };
+layout(set = 0, binding = 7)  readonly buffer RConvW     { float r_conv_w[]; };
+layout(set = 0, binding = 8)  readonly buffer RConvB     { float r_conv_b[]; };
+layout(set = 0, binding = 9)  readonly buffer RLinearW   { float r_linear_w[]; };
+layout(set = 0, binding = 10) readonly buffer RLinearB   { float r_linear_b[]; };
+
+// Output.
+layout(set = 0, binding = 11) writeonly buffer RatesOut  { float rates_out[]; };
+
+layout(push_constant) uniform Params {
+    uint L;  // site_count
+    uint E;  // embedding_dim
+    uint F;  // filter_count
+    uint K;  // kernel_size
+};
+
+void main() {
+    uint l = gl_GlobalInvocationID.x;
+    if (l >= L) return;
+
+    int half_k = int(K / 2u);
+
+    float base_rate = linear_b[0];
+    float r_rate = r_linear_b[0];
+
+    for (uint co = 0; co < F; ++co) {
+        // Shared branch: fused embed + conv1d at position l, filter co.
+        float shared_val = conv_b[co];
+        for (uint k = 0; k < K; ++k) {
+            int src = int(l) + int(k) - half_k;
+            if (src >= 0 && src < int(L)) {
+                int src_idx = kmer_indices[src];
+                for (uint e = 0; e < E; ++e) {
+                    shared_val += embed_w[src_idx * E + e]
+                                * conv_w[co * E * K + e * K + k];
+                }
+            }
+        }
+        shared_val = max(shared_val, 0.0);  // ReLU
+
+        // R-branch: fused r_embed + r_conv1d at position l, filter co.
+        float r_val = r_conv_b[co];
+        for (uint k = 0; k < K; ++k) {
+            int src = int(l) + int(k) - half_k;
+            if (src >= 0 && src < int(L)) {
+                int src_idx = kmer_indices[src];
+                for (uint e = 0; e < E; ++e) {
+                    r_val += r_embed_w[src_idx * E + e]
+                           * r_conv_w[co * E * K + e * K + k];
+                }
+            }
+        }
+        r_val = max(r_val, 0.0);  // ReLU
+
+        base_rate += linear_w[co] * shared_val;
+        r_rate += r_linear_w[co] * r_val;
+    }
+
+    rates_out[l] = exp(base_rate + r_rate);
+}

@@ -2,6 +2,7 @@
 
 #include <larch/compute.hpp>
 #include <larch/merge.hpp>
+#include <larch/sample_method.hpp>
 #include <larch/subtree_weight.hpp>
 #include <larch/weight_ops.hpp>
 
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <optional>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace larch {
@@ -35,6 +37,8 @@ struct optimize_result {
   std::size_t trees_merged;
   std::size_t parsimony_score;
   std::vector<radius_result> radii;
+  larch::objective_kind objective_kind = larch::objective_kind::parsimony;
+  double objective_score = 0.0;
 };
 
 // Iterative DAG optimiser.
@@ -87,6 +91,8 @@ std::vector<optimize_result> optimize_dag(
         .dag_edge_count = m.result_edge_count(),
         .trees_merged = new_trees.size(),
         .parsimony_score = min_score,
+        .objective_kind = larch::objective_kind::parsimony,
+        .objective_score = static_cast<double>(min_score),
     });
   }
 

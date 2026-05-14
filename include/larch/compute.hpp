@@ -73,9 +73,9 @@ inline void recompute_compact_genomes(phylo_dag& d) {
             if (cg_set) break;
             std::visit(
                 [&](auto pe) {
-                  auto parent_idx = std::visit(
-                      [](auto parent) { return parent.index(); },
-                      pe.get_parent());
+                  auto parent_idx =
+                      std::visit([](auto parent) { return parent.index(); },
+                                 pe.get_parent());
                   if (!processed.contains(parent_idx)) return;
 
                   auto& edge_muts = pe.mutations();
@@ -804,8 +804,7 @@ inline uint8_t fitch_set_from_counts(std::array<uint32_t, 4> const& counts,
 // prefers the parent CG's state (instead of the reference).  This is
 // used for fragments where the root has a real parent in a larger tree.
 inline void fitch_assign_compact_genomes(
-    phylo_dag& d,
-    compact_genome const* root_parent_cg = nullptr) {
+    phylo_dag& d, compact_genome const* root_parent_cg = nullptr) {
   auto const& ref = get_reference_sequence(d);
   auto ua_idx = get_root_idx(d);
   auto ua_clades = get_clades(d, ua_idx);
@@ -905,8 +904,8 @@ inline void fitch_assign_compact_genomes(
   for (std::size_t i = 0; i < n_sites; i++) {
     uint8_t fs = fitch[tree_root * n_sites + i];
     nuc_base prefer_base = root_parent_cg
-        ? root_parent_cg->get_base(var_sites[i], ref)
-        : nuc_base::from_char(ref.at(var_sites[i] - 1));
+                               ? root_parent_cg->get_base(var_sites[i], ref)
+                               : nuc_base::from_char(ref.at(var_sites[i] - 1));
     if (fs & base_to_one_hot(prefer_base)) {
       assigned[tree_root * n_sites + i] = prefer_base;
     } else {

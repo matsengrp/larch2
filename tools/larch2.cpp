@@ -1,6 +1,9 @@
+#include <larch/build_fasta_newick.hpp>
 #include <larch/load_proto_dag.hpp>
+#include <larch/model_variant.hpp>
 #include <larch/load_parsimony.hpp>
 #include <larch/save_proto_dag.hpp>
+#include <larch/sample_method.hpp>
 #include <larch/fasta.hpp>
 #include <larch/vcf.hpp>
 #include <larch/merge.hpp>
@@ -17,18 +20,25 @@
 #include <larch/thread_pool.hpp>
 #include <larch/version.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <random>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -186,149 +196,6 @@ struct random_spr_strategy {
 };
 
 // ---------------------------------------------------------------------------
-// FASTA+Newick DAG builder
-// ---------------------------------------------------------------------------
-
-static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
-                                         std::string_view newick_path,
-                                         std::string_view refseq_path) {
-  // Read reference sequence (may be FASTA or raw text)
-  auto ref_bytes = read_file(refseq_path);
-  std::string_view ref_content{ref_bytes.data(), ref_bytes.size()};
-  std::string reference;
-  if (!ref_content.empty() && ref_content[0] == '>') {
-    auto entries = read_fasta(refseq_path);
-    if (!entries.empty()) reference = std::move(entries[0].sequence);
-  } else {
-    for (char c : ref_content) {
-      if (c != '\n' && c != '\r' && c != ' ' && c != '\t')
-        reference +=
-            static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    }
-  }
-
-  // Read FASTA leaf sequences
-  auto entries = read_fasta(fasta_path);
-  std::unordered_map<std::string, std::string> fasta_map;
-  for (auto& e : entries) fasta_map[e.name] = std::move(e.sequence);
-
-  // Read newick string
-  auto nw_bytes = read_file(newick_path);
-  std::string newick_str{nw_bytes.data(), nw_bytes.size()};
-
-  // Build tree from newick (same pattern as load_parsimony_tree)
-  phylo_dag d;
-
-  std::unordered_map<std::size_t, std::size_t> num_children;
-  std::map<std::size_t, std::string> seq_ids;
-  struct nw_edge_t {
-    std::size_t parent, child, clade;
-  };
-  std::vector<nw_edge_t> nw_edges;
-
-  parse_newick(
-      newick_str,
-      [&](std::size_t id, std::string_view label, std::optional<double>) {
-        seq_ids[id] = std::string{label};
-      },
-      [&](std::size_t parent, std::size_t child) {
-        nw_edges.push_back({parent, child, num_children[parent]++});
-      });
-
-  // Determine leaf vs inner
-  std::unordered_map<std::size_t, bool> has_children;
-  std::unordered_map<std::size_t, bool> is_child;
-  for (auto& e : nw_edges) {
-    has_children[e.parent] = true;
-    is_child[e.child] = true;
-  }
-
-  // Find newick root
-  std::size_t newick_root = 0;
-  for (auto& [id, _] : seq_ids) {
-    if (!is_child.contains(id)) {
-      newick_root = id;
-      break;
-    }
-  }
-
-  // Create nodes
-  std::unordered_map<std::size_t, std::size_t> nw_to_dag;
-  for (auto& [nw_id, label] : seq_ids) {
-    bool is_leaf_node = !has_children.contains(nw_id);
-    if (is_leaf_node) {
-      auto leaf = d.append_node<node_kind::leaf>();
-      if (!label.empty()) leaf.sample_id() = label;
-      nw_to_dag[nw_id] = leaf.index();
-    } else {
-      auto inner = d.append_node<node_kind::inner>();
-      nw_to_dag[nw_id] = inner.index();
-    }
-  }
-
-  // Create edges
-  for (auto& ne : nw_edges) {
-    auto edge = d.append_edge<edge_kind::clade>();
-    edge.clade_index() = ne.clade;
-    auto pi = nw_to_dag[ne.parent];
-    auto ci = nw_to_dag[ne.child];
-    for (auto nv : d.get_all_nodes()) {
-      std::visit(
-          [&](auto n) {
-            if (n.index() == pi) edge.set_parent(n);
-            if (n.index() == ci) edge.set_child(n);
-          },
-          nv);
-    }
-  }
-
-  // Add UA node
-  auto ua = d.append_node<node_kind::ua>();
-  ua.reference_sequence() = reference;
-  d.set_root(ua);
-  {
-    auto edge = ua.append_child<edge_kind::clade>();
-    auto root_dag_idx = nw_to_dag[newick_root];
-    for (auto nv : d.get_all_nodes()) {
-      std::visit(
-          [&](auto n) {
-            if (n.index() == root_dag_idx) edge.set_child(n);
-          },
-          nv);
-    }
-    edge.clade_index() = 0;
-  }
-
-  // Assign leaf CGs from FASTA by diffing against reference
-  for (auto nv : d.get_all_nodes()) {
-    std::visit(
-        [&](auto node) {
-          if constexpr (requires {
-                          node.sample_id();
-                          node.cg();
-                        }) {
-            auto it = fasta_map.find(node.sample_id());
-            if (it == fasta_map.end()) return;
-            auto& seq = it->second;
-            std::map<mutation_position, nuc_base> muts;
-            for (std::size_t i = 0; i < seq.size() && i < reference.size();
-                 ++i) {
-              auto ref_base = nuc_base::from_char(reference[i]);
-              auto seq_base = nuc_base::from_char(seq[i]);
-              if (!(ref_base == seq_base)) muts[i + 1] = seq_base;
-            }
-            node.cg() = compact_genome{std::move(muts)};
-          }
-        },
-        nv);
-  }
-
-  fitch_assign_compact_genomes(d);
-  recompute_edge_mutations(d);
-  return d;
-}
-
-// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -350,8 +217,8 @@ Output (required):
 
 Optimization:
   -n, --iterations <N>    Number of optimization iterations (default: 10)
-  --patience <P>          Stop after P consecutive iterations with no parsimony improvement (P >= 1)
-  --drift <N>             When patience triggers, attempt N drift iterations before stopping
+  --patience <P>          Stop after P consecutive iterations with no sampling-objective improvement (P >= 1)
+  --drift <N>             With parsimony sampling only, attempt N drift iterations when patience triggers
   --inplace-steps <N>     In-place SPR steps per drift iteration (default: 0 = use legacy drift)
   --inplace-threshold <T> Accept moves with score_change <= T (default: 0 = neutral+improving)
   --inplace-budget <B>    Max cumulative worsening in in-place loop (default: unlimited)
@@ -366,15 +233,23 @@ Optimization:
   --sample-per-radius     Re-sample tree and rebuild index between radii
 
 Sampling:
-  --sample-method <M>     parsimony (default), random, rf-minsum, rf-maxsum
+  --sample-method <M>     parsimony (default), random, rf-minsum, rf-maxsum,
+                          ml/thrifty, edge-weight
   --sample-uniformly      Weight sampling proportional to subtree tree-counts
   --ignore-root-edge-mutations  Ignore UA->root edge mutations in parsimony
+  --score-ua-edge-ml     ML ignores UA->root by default; opt in to score it
+  --ignore-ua-edge-ml    Explicitly keep the default ML UA-edge-ignore policy
 
 Move strategy:
   --callback-option <O>   best-moves (default) or all-moves
   --move-coeff-pscore <N>  Parsimony score coefficient for scoring moves (default: 1)
   --move-coeff-nodes <N>   New node coefficient for scoring moves (default: 0)
+  --move-coeff-ml <F>      ML log-likelihood coefficient (default: 0.0, disabled)
   --move-score-threshold <N>  Max parsimony score for enumerated moves (default: -1, or 0 with --move-coeff-nodes)
+
+ML scoring:
+  --model-dir <path>      Directory containing model files (must pair with --model-name)
+  --model-name <name>     Model name (must pair with --model-dir)
 
 Metrics:
   --log-metrics           Print extended per-iteration metrics to stderr
@@ -386,11 +261,18 @@ Subtree optimization:
 
 Diverse tree extraction:
   --diverse-sample <K>    Extract K maximally diverse parsimony-optimal trees
+                          (parsimony sampling only)
   --diverse-pool <N>      Override pool size (default: max(10K, 100))
   --diverse-newick <path> Write selected trees as Newick strings (one per line)
 
 Post-processing:
   --trim                  Trim result to minimum-parsimony trees
+                          (parsimony sampling only)
+
+Convergence notes:
+  --patience tracks the active sampling objective (ML NLL, edge_weight, RF,
+  or parsimony).  --drift, --trim, and --diverse-sample currently require
+  --sample-method parsimony.
 
 Debugging:
   --validate              Validate DAG invariants at key pipeline points
@@ -418,9 +300,12 @@ struct args {
   std::optional<std::uint32_t> seed;
   bool sample_per_radius = false;
   bool trim = false;
-  std::string sample_method = "parsimony";
+  std::string sample_method_text = "parsimony";
+  sample_method sampling_method = sample_method::parsimony;
   bool sample_uniformly = false;
   bool ignore_root_edge_mutations = false;
+  bool ignore_ua_edge_ml = true;
+  bool ua_edge_ml_explicit = false;
   std::string callback_option = "best-moves";
   bool log_metrics = false;
   std::optional<std::size_t> switch_subtrees;
@@ -431,7 +316,12 @@ struct args {
   std::optional<std::size_t> diverse_pool;
   std::string diverse_newick;
   int move_coeff_pscore = 1;
+  bool move_coeff_pscore_explicit = false;
   int move_coeff_nodes = 0;
+  double move_coeff_ml = 0.0;
+  bool move_coeff_ml_explicit = false;
+  std::string model_dir;
+  std::string model_name;
   std::optional<int> move_score_threshold;
   std::optional<std::size_t> patience;
   std::optional<std::size_t> drift;
@@ -444,6 +334,105 @@ struct args {
   drift_mode_t drift_mode = drift_mode_t::auto_;
   std::optional<std::uint32_t> drift_seed;
 };
+
+static bool has_any_model_arg(args const& a) {
+  return !a.model_dir.empty() || !a.model_name.empty();
+}
+
+static bool has_complete_model_args(args const& a) {
+  return !a.model_dir.empty() && !a.model_name.empty();
+}
+
+static bool native_ml_move_scoring_requested(args const& a) {
+  if (a.optimizer != "native") return false;
+  if (a.move_coeff_ml > 0.0) return true;
+  return has_complete_model_args(a) &&
+         !is_ml_sample_method(a.sampling_method) &&
+         !a.move_coeff_ml_explicit;
+}
+
+static bool has_active_ml_scoring_path(args const& a) {
+  return is_ml_sample_method(a.sampling_method) ||
+         native_ml_move_scoring_requested(a) ||
+         (a.log_metrics && has_complete_model_args(a));
+}
+
+static void validate_args(args& a) {
+  auto parsed_method = parse_sample_method(a.sample_method_text, true);
+  if (!parsed_method) {
+    std::cerr << "error: unknown sample method '" << a.sample_method_text
+              << "'\n";
+    std::exit(1);
+  }
+  a.sampling_method = *parsed_method;
+
+  if (has_any_model_arg(a) && !has_complete_model_args(a)) {
+    std::cerr << "error: --model-dir and --model-name must be provided "
+                 "together\n";
+    std::exit(1);
+  }
+  if (a.trim && a.sampling_method != sample_method::parsimony) {
+    std::cerr << "error: --trim currently supports only --sample-method "
+                 "parsimony; omit --sample-method or run non-parsimony "
+                 "sampling without --trim\n";
+    std::exit(1);
+  }
+  if (a.diverse_sample && a.sampling_method != sample_method::parsimony) {
+    std::cerr << "error: --diverse-sample currently supports only "
+                 "--sample-method parsimony\n";
+    std::exit(1);
+  }
+  if (is_ml_sample_method(a.sampling_method) && !has_complete_model_args(a)) {
+    std::cerr << "error: --model-dir and --model-name required with "
+                 "--sample-method "
+              << a.sample_method_text << "\n";
+    std::exit(1);
+  }
+  if (a.drift && a.sampling_method != sample_method::parsimony) {
+    std::cerr << "error: --drift currently supports only --sample-method "
+                 "parsimony; objective-aware drift for "
+              << a.sample_method_text << " is not implemented\n";
+    std::exit(1);
+  }
+  if (a.move_coeff_ml > 0.0 && !has_complete_model_args(a)) {
+    std::cerr << "error: --model-dir and --model-name required with "
+                 "--move-coeff-ml\n";
+    std::exit(1);
+  }
+  if (a.ua_edge_ml_explicit && !has_active_ml_scoring_path(a)) {
+    std::cerr << "warning: --ignore-ua-edge-ml/--score-ua-edge-ml has no "
+                 "effect because no ML scoring path is active\n";
+  }
+}
+
+struct ml_config_bundle {
+  std::unique_ptr<ml_model> model_storage;
+  ml_scoring_config config;
+};
+
+static bool ml_model_needed(args const& a, double ml_coeff) {
+  return is_ml_sample_method(a.sampling_method) || ml_coeff > 0.0 ||
+         (a.log_metrics && has_complete_model_args(a));
+}
+
+static ml_config_bundle build_ml_config(args const& a, double ml_coeff = 0.0) {
+  ml_config_bundle result;
+  result.config.ignore_ua_edge = a.ignore_ua_edge_ml;
+  if (!ml_model_needed(a, ml_coeff)) return result;
+
+  assert(has_complete_model_args(a) &&
+         "validate_args must require model args before ML loading");
+  std::cerr << "Loading ML model " << a.model_name << "...\n";
+  result.model_storage =
+      std::make_unique<ml_model>(load_ml_model(a.model_dir, a.model_name));
+  result.config.model = result.model_storage.get();
+  result.config.coeff = ml_coeff;
+  if (ml_coeff != 0.0)
+    std::cerr << "  ML model loaded (move coeff=" << ml_coeff << ")\n";
+  else
+    std::cerr << "  ML model loaded\n";
+  return result;
+}
 
 static args parse_args(int argc, char** argv) {
   args a;
@@ -481,12 +470,18 @@ static args parse_args(int argc, char** argv) {
     else if (arg == "--sample-per-radius")
       a.sample_per_radius = true;
     else if (arg == "--sample-method")
-      a.sample_method = next();
+      a.sample_method_text = next();
     else if (arg == "--sample-uniformly")
       a.sample_uniformly = true;
     else if (arg == "--ignore-root-edge-mutations")
       a.ignore_root_edge_mutations = true;
-    else if (arg == "--callback-option")
+    else if (arg == "--ignore-ua-edge-ml") {
+      a.ignore_ua_edge_ml = true;
+      a.ua_edge_ml_explicit = true;
+    } else if (arg == "--score-ua-edge-ml") {
+      a.ignore_ua_edge_ml = false;
+      a.ua_edge_ml_explicit = true;
+    } else if (arg == "--callback-option")
       a.callback_option = next();
     else if (arg == "--log-metrics")
       a.log_metrics = true;
@@ -506,10 +501,18 @@ static args parse_args(int argc, char** argv) {
       a.diverse_pool = std::stoull(std::string{next()});
     else if (arg == "--diverse-newick")
       a.diverse_newick = next();
-    else if (arg == "--move-coeff-pscore")
+    else if (arg == "--move-coeff-pscore") {
       a.move_coeff_pscore = std::stoi(std::string{next()});
-    else if (arg == "--move-coeff-nodes")
+      a.move_coeff_pscore_explicit = true;
+    } else if (arg == "--move-coeff-nodes")
       a.move_coeff_nodes = std::stoi(std::string{next()});
+    else if (arg == "--move-coeff-ml") {
+      a.move_coeff_ml = std::stod(std::string{next()});
+      a.move_coeff_ml_explicit = true;
+    } else if (arg == "--model-dir")
+      a.model_dir = next();
+    else if (arg == "--model-name")
+      a.model_name = next();
     else if (arg == "--move-score-threshold")
       a.move_score_threshold = std::stoi(std::string{next()});
     else if (arg == "--patience") {
@@ -571,6 +574,7 @@ static args parse_args(int argc, char** argv) {
     usage();
     std::exit(1);
   }
+  validate_args(a);
   return a;
 }
 
@@ -578,71 +582,228 @@ static args parse_args(int argc, char** argv) {
 // Sampling dispatch
 // ---------------------------------------------------------------------------
 
-static phylo_dag sample_tree_from_dag(phylo_dag& dag, merge& m,
-                                      std::string const& method, bool uniformly,
-                                      bool ua_free, std::uint32_t seed,
-                                      std::size_t& out_score) {
+struct sampled_tree_result {
+  phylo_dag tree;
+  // Full mutation-count parsimony of the finalized sampled tree.
+  std::size_t parsimony_score = 0;
+  // Sampling-objective parsimony before finalization.  This can differ from
+  // parsimony_score when --ignore-root-edge-mutations is active.
+  std::optional<std::size_t> parsimony_objective_score;
+  std::optional<double> ml_score;
+  std::optional<double> edge_weight_score;
+  std::optional<double> rf_score;
+};
+
+struct sample_objective {
+  objective_kind kind = objective_kind::parsimony;
+  double value = 0.0;              // Natural reported value.
+  double convergence_value = 0.0;  // Lower is better for patience.
+};
+
+static std::size_t compute_tree_parsimony_score(phylo_dag& tree) {
+  std::size_t score = 0;
+  for (auto ev : tree.get_all_edges())
+    std::visit([&](auto edge) { score += edge.mutations().size(); }, ev);
+  return score;
+}
+
+static double compute_tree_edge_weight_score(phylo_dag& tree) {
+  double score = 0.0;
+  for (auto ev : tree.get_all_edges())
+    std::visit([&](auto edge) { score += edge.edge_weight(); }, ev);
+  return score;
+}
+
+static double compute_tree_ml_nll(phylo_dag& tree,
+                                  ml_scoring_config const& ml_cfg) {
+  auto const& model = ml_cfg.require_model();
+  auto const& ref = get_reference_sequence(tree);
+  ml_model_likelihood_score_ops ops{.model = model,
+                                    .reference = ref,
+                                    .ignore_ua_edge = ml_cfg.ignore_ua_edge};
+  return compute_dag_ml_nll(tree, ops);
+}
+
+static void finalize_sampled_tree(sampled_tree_result& sample,
+                                  ml_scoring_config const* ml_cfg = nullptr) {
+  fitch_assign_compact_genomes(sample.tree);
+  recompute_edge_mutations(sample.tree);
+  set_sample_ids_from_cg(sample.tree);
+  sample.parsimony_score = compute_tree_parsimony_score(sample.tree);
+  if (sample.edge_weight_score) {
+    sample.edge_weight_score = compute_tree_edge_weight_score(sample.tree);
+  }
+  if (sample.ml_score && ml_cfg != nullptr && ml_cfg->has_model()) {
+    sample.ml_score = compute_tree_ml_nll(sample.tree, *ml_cfg);
+  }
+}
+
+static double require_objective_value(std::optional<double> const& value,
+                                      sample_method method,
+                                      std::string_view field) {
+  if (!value) {
+    throw std::logic_error("missing " + std::string{field} +
+                           " for --sample-method " +
+                           std::string{format_sample_method(method)});
+  }
+  return *value;
+}
+
+static sample_objective sample_objective_score(
+    sampled_tree_result const& sample, sample_method method) {
+  switch (method) {
+    case sample_method::ml: {
+      double score = require_objective_value(sample.ml_score, method, "ML NLL");
+      return {.kind = objective_kind::ml_nll,
+              .value = score,
+              .convergence_value = score};
+    }
+    case sample_method::edge_weight: {
+      double score = require_objective_value(sample.edge_weight_score, method,
+                                             "edge_weight score");
+      return {.kind = objective_kind::edge_weight,
+              .value = score,
+              .convergence_value = score};
+    }
+    case sample_method::rf_minsum: {
+      double score = require_objective_value(sample.rf_score, method,
+                                             "sum RF score");
+      return {.kind = objective_kind::sum_rf,
+              .value = score,
+              .convergence_value = score};
+    }
+    case sample_method::rf_maxsum: {
+      double score = require_objective_value(sample.rf_score, method,
+                                             "sum RF score");
+      return {.kind = objective_kind::sum_rf,
+              .value = score,
+              .convergence_value = -score};
+    }
+    case sample_method::random:
+    case sample_method::parsimony: {
+      double score = static_cast<double>(
+          sample.parsimony_objective_score.value_or(sample.parsimony_score));
+      return {.kind = objective_kind::parsimony,
+              .value = score,
+              .convergence_value = score};
+    }
+  }
+  throw std::logic_error("unhandled sample method");
+}
+
+static std::string format_objective_value(double value) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(6) << value;
+  return out.str();
+}
+
+static std::string format_sample_result(sampled_tree_result const& sample) {
+  if (sample.edge_weight_score) {
+    std::ostringstream out;
+    out << "parsimony " << sample.parsimony_score << ", edge_weight "
+        << std::fixed << std::setprecision(6) << *sample.edge_weight_score;
+    return out.str();
+  }
+  if (sample.rf_score) {
+    std::ostringstream out;
+    out << "parsimony " << sample.parsimony_score << ", sum RF "
+        << std::fixed << std::setprecision(6) << *sample.rf_score;
+    return out.str();
+  }
+  if (!sample.ml_score) return "score " + std::to_string(sample.parsimony_score);
+
+  std::ostringstream out;
+  out << "parsimony " << sample.parsimony_score << ", ML NLL " << std::fixed
+      << std::setprecision(6) << *sample.ml_score;
+  return out.str();
+}
+
+static sampled_tree_result sample_tree_from_dag(
+    phylo_dag& dag, merge& m, sample_method method, bool uniformly,
+    bool ua_free, std::uint32_t seed, ml_scoring_config const* ml_cfg) {
   auto root_idx = get_root_idx(dag);
   scoped_arena<4096> arena;
   auto* mr = arena.get();
 
-  if (method == "parsimony" || method.empty()) {
-    if (ua_free) {
-      ua_free_parsimony_score_ops uops;
-      subtree_weight<ua_free_parsimony_score_ops> sw(dag, seed, mr);
-      out_score = sw.compute_weight_below(root_idx, uops);
-      if (uniformly)
-        return sw.min_weight_uniform_sample_tree(uops);
-      else
-        return sw.min_weight_sample_tree(uops);
-    } else {
+  switch (method) {
+    case sample_method::parsimony:
+      if (ua_free) {
+        ua_free_parsimony_score_ops uops;
+        subtree_weight<ua_free_parsimony_score_ops> sw(dag, seed, mr);
+        auto score = sw.compute_weight_below(root_idx, uops);
+        auto tree = uniformly ? sw.min_weight_uniform_sample_tree(uops)
+                              : sw.min_weight_sample_tree(uops);
+        return {.tree = std::move(tree),
+                .parsimony_score = score,
+                .parsimony_objective_score = score};
+      } else {
+        parsimony_score_ops pops;
+        subtree_weight<parsimony_score_ops> sw(dag, seed, mr);
+        auto score = sw.compute_weight_below(root_idx, pops);
+        auto tree = uniformly ? sw.min_weight_uniform_sample_tree(pops)
+                              : sw.min_weight_sample_tree(pops);
+        return {.tree = std::move(tree),
+                .parsimony_score = score,
+                .parsimony_objective_score = score};
+      }
+    case sample_method::random: {
+      // Sample randomly, but still compute a parsimony baseline.
       parsimony_score_ops pops;
       subtree_weight<parsimony_score_ops> sw(dag, seed, mr);
-      out_score = sw.compute_weight_below(root_idx, pops);
-      if (uniformly)
-        return sw.min_weight_uniform_sample_tree(pops);
-      else
-        return sw.min_weight_sample_tree(pops);
+      auto score = sw.compute_weight_below(root_idx, pops);
+      auto tree =
+          uniformly ? sw.uniform_sample_tree(pops) : sw.sample_tree(pops);
+      return {.tree = std::move(tree), .parsimony_score = score};
     }
-  } else if (method == "random") {
-    // Sample randomly, but still compute parsimony score
-    parsimony_score_ops pops;
-    subtree_weight<parsimony_score_ops> sw(dag, seed, mr);
-    out_score = sw.compute_weight_below(root_idx, pops);
-    if (uniformly)
-      return sw.uniform_sample_tree(pops);
-    else
-      return sw.sample_tree(pops);
-  } else if (method == "rf-minsum") {
-    sum_rf_distance_ops rf_ops{m, m};
-    sum_rf_distance rf_weight_ops{rf_ops};
-    subtree_weight<sum_rf_distance> sw(dag, seed, mr);
-    sw.compute_weight_below(root_idx, rf_weight_ops);
-    auto sampled = uniformly ? sw.min_weight_uniform_sample_tree(rf_weight_ops)
-                             : sw.min_weight_sample_tree(rf_weight_ops);
-    // Compute parsimony score on the actual sampled tree
-    out_score = 0;
-    for (auto ev : sampled.get_all_edges()) {
-      std::visit([&](auto e) { out_score += e.mutations().size(); }, ev);
+    case sample_method::rf_minsum: {
+      sum_rf_distance_ops rf_ops{m, m};
+      sum_rf_distance rf_weight_ops{rf_ops};
+      subtree_weight<sum_rf_distance> sw(dag, seed, mr);
+      auto rf_score = sw.compute_weight_below(root_idx, rf_weight_ops);
+      auto shifted_score = rf_score + rf_weight_ops.get_ops().get_shift_sum();
+      auto tree = uniformly ? sw.min_weight_uniform_sample_tree(rf_weight_ops)
+                            : sw.min_weight_sample_tree(rf_weight_ops);
+      return {.tree = std::move(tree), .rf_score = shifted_score.to_double()};
     }
-    return sampled;
-  } else if (method == "rf-maxsum") {
-    max_sum_rf_distance_ops rf_ops{m, m};
-    max_sum_rf_distance rf_weight_ops{rf_ops};
-    subtree_weight<max_sum_rf_distance> sw(dag, seed, mr);
-    sw.compute_weight_below(root_idx, rf_weight_ops);
-    auto sampled = uniformly ? sw.min_weight_uniform_sample_tree(rf_weight_ops)
-                             : sw.min_weight_sample_tree(rf_weight_ops);
-    // Compute parsimony score on the actual sampled tree
-    out_score = 0;
-    for (auto ev : sampled.get_all_edges()) {
-      std::visit([&](auto e) { out_score += e.mutations().size(); }, ev);
+    case sample_method::rf_maxsum: {
+      max_sum_rf_distance_ops rf_ops{m, m};
+      max_sum_rf_distance rf_weight_ops{rf_ops};
+      subtree_weight<max_sum_rf_distance> sw(dag, seed, mr);
+      auto rf_score = sw.compute_weight_below(root_idx, rf_weight_ops);
+      auto shifted_score = rf_score + rf_weight_ops.get_ops().get_shift_sum();
+      auto tree = uniformly ? sw.min_weight_uniform_sample_tree(rf_weight_ops)
+                            : sw.min_weight_sample_tree(rf_weight_ops);
+      return {.tree = std::move(tree), .rf_score = shifted_score.to_double()};
     }
-    return sampled;
-  } else {
-    std::cerr << "error: unknown sample method '" << method << "'\n";
-    std::exit(1);
+    case sample_method::edge_weight: {
+      edge_weight_score_ops ew_ops;
+      subtree_weight<edge_weight_score_ops> sw(dag, seed, mr);
+      auto min_score = sw.compute_weight_below(root_idx, ew_ops);
+      auto tree = uniformly ? sw.min_weight_uniform_sample_tree(ew_ops)
+                            : sw.min_weight_sample_tree(ew_ops);
+      return {.tree = std::move(tree), .edge_weight_score = min_score};
+    }
+    case sample_method::ml: {
+      if (ml_cfg == nullptr || !ml_cfg->has_model()) {
+        std::cerr << "error: --model-dir and --model-name required with "
+                     "--sample-method "
+                  << format_sample_method(method) << "\n";
+        std::exit(1);
+      }
+
+      auto const& ref = get_reference_sequence(dag);
+      ml_model_likelihood_score_ops ops{.model = ml_cfg->require_model(),
+                                        .reference = ref,
+                                        .ignore_ua_edge =
+                                            ml_cfg->ignore_ua_edge};
+      subtree_weight<ml_model_likelihood_score_ops> sw(dag, seed, mr);
+      auto ml_min = sw.compute_weight_below(root_idx, ops);
+      auto tree = uniformly ? sw.min_weight_uniform_sample_tree(ops)
+                            : sw.min_weight_sample_tree(ops);
+      return {.tree = std::move(tree), .ml_score = ml_min};
+    }
   }
+  throw std::logic_error("unhandled sample method");
 }
 
 // ---------------------------------------------------------------------------
@@ -716,7 +877,12 @@ static phylo_dag extract_subtree_as_dag(phylo_dag& tree,
   auto src_parent_edges = get_parent_edges(tree, subtree_root_idx);
   if (!src_parent_edges.empty()) {
     auto src_pe = tree.get_edge(src_parent_edges[0]);
-    std::visit([&](auto se) { ua_edge.mutations() = se.mutations(); }, src_pe);
+    std::visit(
+        [&](auto se) {
+          ua_edge.mutations() = se.mutations();
+          ua_edge.edge_weight() = se.edge_weight();
+        },
+        src_pe);
   }
 
   // DFS copy remaining nodes and edges
@@ -778,6 +944,7 @@ static phylo_dag extract_subtree_as_dag(phylo_dag& tree,
             [&](auto se) {
               dst_edge.mutations() = se.mutations();
               dst_edge.clade_index() = se.clade_index();
+              dst_edge.edge_weight() = se.edge_weight();
             },
             src_ev);
 
@@ -910,8 +1077,7 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
     auto compute_fitch_parsimony = [](phylo_dag& tree) -> std::size_t {
       std::size_t score = 0;
       for (auto ev : tree.get_all_edges()) {
-        std::visit(
-            [&](auto edge) { score += edge.mutations().size(); }, ev);
+        std::visit([&](auto edge) { score += edge.mutations().size(); }, ev);
       }
       return score;
     };
@@ -924,8 +1090,9 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
     // Sort pool indices by Fitch score (ascending = best first).
     std::vector<std::size_t> order(unique_pool.size());
     std::iota(order.begin(), order.end(), std::size_t{0});
-    std::sort(order.begin(), order.end(),
-              [&](auto a, auto b) { return fitch_scores[a] < fitch_scores[b]; });
+    std::sort(order.begin(), order.end(), [&](auto a, auto b) {
+      return fitch_scores[a] < fitch_scores[b];
+    });
 
     std::size_t min_fitch = fitch_scores[order[0]];
     std::size_t max_fitch = fitch_scores[order.back()];
@@ -1054,7 +1221,8 @@ static std::vector<phylo_dag> pool_diverse_sample(phylo_dag& dag, std::size_t k,
 // Per-iteration metrics
 // ---------------------------------------------------------------------------
 
-static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed) {
+static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed,
+                          ml_scoring_config const* ml_cfg = nullptr) {
   auto root_idx = get_root_idx(dag);
   scoped_arena<4096> arena;
   auto* mr = arena.get();
@@ -1068,6 +1236,15 @@ static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed) {
   parsimony_score_ops pops;
   subtree_weight<parsimony_score_ops> psw(dag, seed, mr);
   auto min_pars = psw.compute_weight_below(root_idx, pops);
+
+  // ML log-likelihood on a parsimony-optimal sampled tree.
+  std::optional<double> ml_ll;
+  if (ml_cfg != nullptr && ml_cfg->has_model()) {
+    auto opt_tree = psw.min_weight_sample_tree(pops);
+    fitch_assign_compact_genomes(opt_tree);
+    ml_ll = -compute_dag_ml_nll(ml_cfg->require_model(), opt_tree,
+                                ml_cfg->ignore_ua_edge);
+  }
 
   // Optimal tree count
   auto optimal_count = psw.min_weight_count(root_idx, pops);
@@ -1094,8 +1271,9 @@ static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed) {
             << ", parsimony [" << min_pars << ", " << max_pars << "]"
             << ", " << optimal_count.to_string() << " optimal"
             << ", RF [" << (min_rf + min_rf_shift).to_string() << ", "
-            << (max_rf + min_rf_shift).to_string() << "]"
-            << "\n";
+            << (max_rf + min_rf_shift).to_string() << "]";
+  if (ml_ll) std::cerr << ", LL(opt)=" << *ml_ll;
+  std::cerr << "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,18 +1283,32 @@ static void print_metrics(phylo_dag& dag, merge& m, std::uint32_t seed) {
 struct patience_checker {
   std::optional<std::size_t> limit;
   std::size_t count = 0;
-  std::optional<std::size_t> best_score;
+  std::optional<double> best_score;
+  objective_kind objective = objective_kind::generic;
 
-  bool operator()(std::size_t current_score) {
+  static double improvement_tolerance(sample_objective const& score) {
+    if (score.kind == objective_kind::parsimony) return 0.0;
+    return 1e-10 * std::max(1.0, std::abs(score.convergence_value));
+  }
+
+  bool operator()(sample_objective const& current_score) {
     if (!limit) return false;
-    if (!best_score || current_score < *best_score) {
-      best_score = current_score;
+    if (!std::isfinite(current_score.convergence_value)) {
+      throw std::runtime_error("non-finite convergence objective for " +
+                               std::string{format_objective_kind(
+                                   current_score.kind)});
+    }
+    objective = current_score.kind;
+    auto tol = improvement_tolerance(current_score);
+    if (!best_score || current_score.convergence_value < *best_score - tol) {
+      best_score = current_score.convergence_value;
       count = 0;
     } else {
       count++;
     }
     if (count >= *limit) {
-      std::cerr << "Early stopping: no parsimony improvement for " << *limit
+      std::cerr << "Early stopping: no " << format_objective_kind(objective)
+                << " improvement for " << *limit
                 << " consecutive iterations\n";
       return true;
     }
@@ -1227,13 +1419,13 @@ static bool inplace_drift_escape(merge& m, args const& a, progress& prog) {
     prog.phase("Inplace drift " + std::to_string(di + 1) + ": sampling");
     auto& dag = m.get_result();
     std::uint32_t seed = rng();
-    std::size_t score = 0;
-    auto tree = sample_tree_from_dag(dag, m, a.sample_method, a.sample_uniformly,
-                                     a.ignore_root_edge_mutations, seed, score);
-    fitch_assign_compact_genomes(tree);
-    recompute_edge_mutations(tree);
-    set_sample_ids_from_cg(tree);
-    prog.done("score " + std::to_string(dag_score));
+    auto sample = sample_tree_from_dag(dag, m, a.sampling_method,
+                                       a.sample_uniformly,
+                                       a.ignore_root_edge_mutations, seed,
+                                       nullptr);
+    finalize_sampled_tree(sample, nullptr);
+    prog.done(format_sample_result(sample));
+    auto tree = std::move(sample.tree);
 
     prog.phase("Inplace drift " + std::to_string(di + 1) + ": running");
     inplace_move_producer producer{params, pool};
@@ -1295,13 +1487,13 @@ static bool drift_escape_legacy(merge& m, args const& a, progress& prog) {
     prog.phase("Drift " + std::to_string(di + 1) + ": sampling");
     auto& dag = m.get_result();
     std::uint32_t seed = rng();
-    std::size_t score = 0;
-    auto tree = sample_tree_from_dag(dag, m, a.sample_method, a.sample_uniformly,
-                                     a.ignore_root_edge_mutations, seed, score);
-    fitch_assign_compact_genomes(tree);
-    recompute_edge_mutations(tree);
-    set_sample_ids_from_cg(tree);
-    prog.done("score " + std::to_string(dag_score));
+    auto sample = sample_tree_from_dag(dag, m, a.sampling_method,
+                                       a.sample_uniformly,
+                                       a.ignore_root_edge_mutations, seed,
+                                       nullptr);
+    finalize_sampled_tree(sample, nullptr);
+    prog.done(format_sample_result(sample));
+    auto tree = std::move(sample.tree);
 
     std::uniform_int_distribution<std::size_t> steps_dist(1, 5);
     std::size_t n_steps = steps_dist(rng);
@@ -1453,13 +1645,13 @@ static bool drift_escape_combined(merge& m, args const& a, progress& prog) {
     prog.phase("Combined drift " + std::to_string(di + 1) + ": sampling");
     auto& dag = m.get_result();
     std::uint32_t seed = rng();
-    std::size_t score = 0;
-    auto tree = sample_tree_from_dag(dag, m, a.sample_method, a.sample_uniformly,
-                                     a.ignore_root_edge_mutations, seed, score);
-    fitch_assign_compact_genomes(tree);
-    recompute_edge_mutations(tree);
-    set_sample_ids_from_cg(tree);
-    prog.done("score " + std::to_string(dag_score));
+    auto sample = sample_tree_from_dag(dag, m, a.sampling_method,
+                                       a.sample_uniformly,
+                                       a.ignore_root_edge_mutations, seed,
+                                       nullptr);
+    finalize_sampled_tree(sample, nullptr);
+    prog.done(format_sample_result(sample));
+    auto tree = std::move(sample.tree);
 
     prog.phase("Combined drift " + std::to_string(di + 1) + ": inplace prefix");
     phylo_dag drifted;
@@ -1547,13 +1739,13 @@ static bool drift_escape_combined_lwf(merge& m, args const& a, progress& prog) {
     prog.phase("Combined-lwf drift " + std::to_string(di + 1) + ": sampling");
     auto& dag = m.get_result();
     std::uint32_t seed = rng();
-    std::size_t score = 0;
-    auto tree = sample_tree_from_dag(dag, m, a.sample_method, a.sample_uniformly,
-                                     a.ignore_root_edge_mutations, seed, score);
-    fitch_assign_compact_genomes(tree);
-    recompute_edge_mutations(tree);
-    set_sample_ids_from_cg(tree);
-    prog.done("score " + std::to_string(dag_score));
+    auto sample = sample_tree_from_dag(dag, m, a.sampling_method,
+                                       a.sample_uniformly,
+                                       a.ignore_root_edge_mutations, seed,
+                                       nullptr);
+    finalize_sampled_tree(sample, nullptr);
+    prog.done(format_sample_result(sample));
+    auto tree = std::move(sample.tree);
 
     prog.phase("Combined-lwf drift " + std::to_string(di + 1) + ": walk");
     std::uniform_int_distribution<std::size_t> steps_dist(1, 5);
@@ -1631,6 +1823,12 @@ static bool drift_escape(merge& m, args const& a, progress& prog) {
   __builtin_unreachable();
 }
 
+template <typename Score>
+struct scored_frag {
+  std::size_t idx;
+  Score final_score;
+};
+
 // ---------------------------------------------------------------------------
 // Native optimizer loop with progress
 // ---------------------------------------------------------------------------
@@ -1638,10 +1836,29 @@ static bool drift_escape(merge& m, args const& a, progress& prog) {
 static std::vector<optimize_result> run_native(merge& m, args const& a) {
   auto& pool = thread_pool::get_default();
   std::mt19937 rng(a.seed.value_or(std::random_device{}()));
+
+  // Backend-aware defaults: when ML move scoring is active, default to
+  // pscore=0, nodes=0, ml=1.0 (ML-only); otherwise parsimony defaults.
+  bool has_ml = has_complete_model_args(a);
+  bool ml_sampling = is_ml_sample_method(a.sampling_method);
+  int eff_pscore = a.move_coeff_pscore;
+  int eff_nodes = a.move_coeff_nodes;
+  double eff_ml = a.move_coeff_ml;
+  if (has_ml && !ml_sampling && !a.move_coeff_ml_explicit) {
+    eff_ml = 1.0;  // preserve existing model-args => ML-moves default
+  }
+  if (eff_ml > 0.0 && !a.move_coeff_pscore_explicit) {
+    eff_pscore = 0;  // disable parsimony by default for ML moves
+  }
+
+  // Load ML model once if needed for sampling, move scoring, or metrics.
+  auto ml = build_ml_config(a, eff_ml);
+  auto const& ml_config = ml.config;
+
   std::vector<optimize_result> results;
   results.reserve(a.iterations);
   progress prog;
-  move_coefficients coeffs{a.move_coeff_pscore, a.move_coeff_nodes};
+  move_coefficients coeffs{eff_pscore, eff_nodes};
   int score_threshold =
       a.move_score_threshold.value_or(coeffs.has_node_penalty() ? 0 : -1);
   // Shared across subtree and whole-tree paths: only one path executes per
@@ -1662,24 +1879,23 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
     // Metrics (opt-in)
     if (a.log_metrics) {
       std::uint32_t metrics_seed = rng();
-      print_metrics(dag, m, metrics_seed);
+      print_metrics(dag, m, metrics_seed, &ml_config);
     }
 
     // 2. Sample tree using configured method
     prog.phase("Sampling tree");
     std::uint32_t iter_seed = rng();
-    std::size_t min_score = 0;
-    auto sampled = sample_tree_from_dag(
-        dag, m, a.sample_method, a.sample_uniformly,
-        a.ignore_root_edge_mutations, iter_seed, min_score);
-    fitch_assign_compact_genomes(sampled);
-    recompute_edge_mutations(sampled);
-    set_sample_ids_from_cg(sampled);
-    // Recompute score from actual edge mutations (may differ from DP value)
-    min_score = 0;
-    for (auto ev : sampled.get_all_edges())
-      std::visit([&](auto e) { min_score += e.mutations().size(); }, ev);
-    prog.done("score " + std::to_string(min_score));
+    auto sample = sample_tree_from_dag(
+        dag, m, a.sampling_method, a.sample_uniformly,
+        a.ignore_root_edge_mutations, iter_seed, &ml_config);
+    finalize_sampled_tree(sample, &ml_config);
+    auto objective = sample_objective_score(sample, a.sampling_method);
+    auto min_score = sample.parsimony_score;
+    prog.done(format_sample_result(sample));
+    // If ML sampling finalized this tree's NLL, reuse it for ML move rescoring
+    // instead of rebuilding a fresh likelihood cache on the same sampled tree.
+    auto sampled_pre_move_ml_nll = sample.ml_score;
+    auto sampled = std::move(sample.tree);
 
     // Check if we should do subtree optimization this iteration
     bool use_subtrees =
@@ -1715,6 +1931,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
         std::size_t total_trees_merged = 0;
         std::vector<radius_result> radii_results;
+        std::optional<double> subtree_old_pre_move_nll;
+        if (ml_config.adjusts_scores()) {
+          subtree_old_pre_move_nll = compute_tree_ml_nll(subtree_dag, ml_config);
+        }
 
         for (std::size_t radius = 2; radius <= max_radius; radius *= 2) {
           std::cerr << "  [subtree radius " << radius << "]\n";
@@ -1770,12 +1990,30 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
           std::size_t moves_applied = 0;
           prog.phase("  Merging subtree fragments");
-          if (coeffs.has_node_penalty()) {
-            struct scored_frag {
-              std::size_t idx;
-              int final_score;
-            };
-            std::vector<scored_frag> scored(fragments.size());
+          if (ml_config.adjusts_scores()) {
+            // Full-tree ML delta re-scoring.  apply_spr_as_fragment() returns a
+            // complete moved subtree/tree, so compare against the cached full
+            // pre-move NLL rather than changed original edges only.
+            assert(subtree_old_pre_move_nll.has_value());
+            std::vector<scored_frag<double>> scored(fragments.size());
+            for (std::size_t i = 0; i < fragments.size(); ++i) {
+              double base = static_cast<double>(
+                  coeffs.apply(spr_moves[i].score_change.value_or(0), 0));
+              scored[i] = {i, ml_config.adjust_score(
+                                  base, *subtree_old_pre_move_nll,
+                                  fragments[i])};
+            }
+            std::sort(scored.begin(), scored.end(), [](auto& x, auto& y) {
+              return x.final_score < y.final_score;
+            });
+            std::erase_if(scored, [](auto& s) {
+              return !is_strictly_improving_rescored_move(s.final_score);
+            });
+            if (scored.size() > a.max_moves) scored.resize(a.max_moves);
+            for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
+            moves_applied = scored.size();
+          } else if (coeffs.has_node_penalty()) {
+            std::vector<scored_frag<int>> scored(fragments.size());
             for (std::size_t i = 0; i < fragments.size(); ++i) {
               int novel = static_cast<int>(m.count_novel_nodes(fragments[i]));
               scored[i] = {
@@ -1785,7 +2023,9 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             std::sort(scored.begin(), scored.end(), [](auto& a, auto& b) {
               return a.final_score < b.final_score;
             });
-            std::erase_if(scored, [](auto& s) { return s.final_score > 0; });
+            std::erase_if(scored, [](auto& s) {
+              return !is_strictly_improving_rescored_move(s.final_score);
+            });
             if (scored.size() > a.max_moves) scored.resize(a.max_moves);
             for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
             moves_applied = scored.size();
@@ -1819,8 +2059,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
             .trees_merged = total_trees_merged,
             .parsimony_score = min_score,
             .radii = std::move(radii_results),
+            .objective_kind = objective.kind,
+            .objective_score = objective.value,
         });
-        if (patience(min_score)) {
+        if (patience(objective)) {
           if (a.drift && drift_escape(m, a, prog)) {
             patience.reset();
           } else {
@@ -1845,6 +2087,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
     std::size_t total_trees_merged = 0;
     std::vector<radius_result> radii_results;
+    std::optional<double> sampled_old_pre_move_nll = sampled_pre_move_ml_nll;
+    if (ml_config.adjusts_scores() && !sampled_old_pre_move_nll) {
+      sampled_old_pre_move_nll = compute_tree_ml_nll(sampled, ml_config);
+    }
 
     for (std::size_t radius = 2; radius <= max_radius; radius *= 2) {
       std::cerr << "  [radius " << radius << "]\n";
@@ -1904,15 +2150,32 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
       prog.done();
 
-      // 7. Merge fragments
+      // 7. Merge fragments (with optional ML or node-penalty re-scoring)
       std::size_t moves_applied = 0;
       prog.phase("  Merging");
-      if (coeffs.has_node_penalty()) {
-        struct scored_frag {
-          std::size_t idx;
-          int final_score;
-        };
-        std::vector<scored_frag> scored(fragments.size());
+      if (ml_config.adjusts_scores()) {
+        // Full-tree ML delta re-scoring.  apply_spr_as_fragment() returns a
+        // complete moved tree, so compare against the cached full pre-move NLL
+        // rather than changed original edges only.
+        assert(sampled_old_pre_move_nll.has_value());
+        std::vector<scored_frag<double>> scored(fragments.size());
+        for (std::size_t i = 0; i < fragments.size(); ++i) {
+          double base = static_cast<double>(
+              coeffs.apply(spr_moves[i].score_change.value_or(0), 0));
+          scored[i] = {i, ml_config.adjust_score(base, *sampled_old_pre_move_nll,
+                                                 fragments[i])};
+        }
+        std::sort(scored.begin(), scored.end(), [](auto& x, auto& y) {
+          return x.final_score < y.final_score;
+        });
+        std::erase_if(scored, [](auto& s) {
+          return !is_strictly_improving_rescored_move(s.final_score);
+        });
+        if (scored.size() > a.max_moves) scored.resize(a.max_moves);
+        for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
+        moves_applied = scored.size();
+      } else if (coeffs.has_node_penalty()) {
+        std::vector<scored_frag<int>> scored(fragments.size());
         for (std::size_t i = 0; i < fragments.size(); ++i) {
           int novel = static_cast<int>(m.count_novel_nodes(fragments[i]));
           scored[i] = {
@@ -1921,7 +2184,9 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         std::sort(scored.begin(), scored.end(), [](auto& a, auto& b) {
           return a.final_score < b.final_score;
         });
-        std::erase_if(scored, [](auto& s) { return s.final_score > 0; });
+        std::erase_if(scored, [](auto& s) {
+          return !is_strictly_improving_rescored_move(s.final_score);
+        });
         if (scored.size() > a.max_moves) scored.resize(a.max_moves);
         for (auto& s : scored) m.add_dag(std::move(fragments[s.idx]));
         moves_applied = scored.size();
@@ -1950,16 +2215,19 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         prog.phase("  Re-sampling");
         auto& new_dag = m.get_result();
         std::uint32_t resample_seed = rng();
-        sampled = sample_tree_from_dag(
-            new_dag, m, a.sample_method, a.sample_uniformly,
-            a.ignore_root_edge_mutations, resample_seed, resample_score);
-        fitch_assign_compact_genomes(sampled);
-        recompute_edge_mutations(sampled);
-        set_sample_ids_from_cg(sampled);
-        resample_score = 0;
-        for (auto ev : sampled.get_all_edges())
-          std::visit([&](auto e) { resample_score += e.mutations().size(); }, ev);
-        prog.done("score " + std::to_string(resample_score));
+        auto resample = sample_tree_from_dag(
+            new_dag, m, a.sampling_method, a.sample_uniformly,
+            a.ignore_root_edge_mutations, resample_seed, &ml_config);
+        finalize_sampled_tree(resample, &ml_config);
+        resample_score = resample.parsimony_score;
+        prog.done(format_sample_result(resample));
+        auto resample_pre_move_ml_nll = resample.ml_score;
+        sampled = std::move(resample.tree);
+        if (ml_config.adjusts_scores()) {
+          sampled_old_pre_move_nll = resample_pre_move_ml_nll;
+          if (!sampled_old_pre_move_nll)
+            sampled_old_pre_move_nll = compute_tree_ml_nll(sampled, ml_config);
+        }
 
         // Recompute max_radius from new tree depth
         auto new_max = compute_tree_max_depth(sampled) * 2;
@@ -1989,8 +2257,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
         .trees_merged = total_trees_merged,
         .parsimony_score = min_score,
         .radii = std::move(radii_results),
+        .objective_kind = objective.kind,
+        .objective_score = objective.value,
     });
-    if (patience(min_score)) {
+    if (patience(objective)) {
       if (a.drift && drift_escape(m, a, prog)) {
         patience.reset();
       } else {
@@ -2008,6 +2278,10 @@ static std::vector<optimize_result> run_native(merge& m, args const& a) {
 
 static std::vector<optimize_result> run_random(merge& m, args const& a) {
   std::mt19937 rng(a.seed.value_or(std::random_device{}()));
+
+  auto ml = build_ml_config(a);
+  auto const& ml_config = ml.config;
+
   random_spr_strategy strategy{};
   std::vector<optimize_result> results;
   results.reserve(a.iterations);
@@ -2020,27 +2294,23 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
     prog.phase("Building merged DAG");
     auto& dag = m.get_result();
     auto nodes_before = m.result_node_count();
-    auto edges_before = m.result_edge_count();
     prog.done(std::to_string(nodes_before) + " nodes");
 
     if (a.log_metrics) {
       std::uint32_t metrics_seed = rng();
-      print_metrics(dag, m, metrics_seed);
+      print_metrics(dag, m, metrics_seed, &ml_config);
     }
 
     prog.phase("Sampling tree");
     std::uint32_t iter_seed = rng();
-    std::size_t min_score = 0;
-    auto sampled = sample_tree_from_dag(
-        dag, m, a.sample_method, a.sample_uniformly,
-        a.ignore_root_edge_mutations, iter_seed, min_score);
-    fitch_assign_compact_genomes(sampled);
-    recompute_edge_mutations(sampled);
-    set_sample_ids_from_cg(sampled);
-    min_score = 0;
-    for (auto ev : sampled.get_all_edges())
-      std::visit([&](auto e) { min_score += e.mutations().size(); }, ev);
-    prog.done("score " + std::to_string(min_score));
+    auto sample = sample_tree_from_dag(
+        dag, m, a.sampling_method, a.sample_uniformly,
+        a.ignore_root_edge_mutations, iter_seed, &ml_config);
+    finalize_sampled_tree(sample, &ml_config);
+    auto objective = sample_objective_score(sample, a.sampling_method);
+    auto min_score = sample.parsimony_score;
+    prog.done(format_sample_result(sample));
+    auto sampled = std::move(sample.tree);
 
     prog.phase("Generating random SPR moves");
     auto new_trees = strategy(sampled, rng);
@@ -2058,17 +2328,16 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
                    "random iteration " + std::to_string(iter + 1) + " merge",
                    thread_pool::get_default());
 
-    // Use DAG growth as convergence signal: random SPR always generates
-    // candidates, but only novel topologies grow the DAG.
-    bool dag_grew = (nodes_after != nodes_before || edges_after != edges_before);
     results.push_back(optimize_result{
         .iteration = iter,
         .dag_node_count = nodes_after,
         .dag_edge_count = edges_after,
         .trees_merged = new_trees.size(),
         .parsimony_score = min_score,
+        .objective_kind = objective.kind,
+        .objective_score = objective.value,
     });
-    if (patience(min_score)) return results;
+    if (patience(objective)) return results;
   }
 
   return results;
@@ -2157,7 +2426,9 @@ int main(int argc, char** argv) {
   std::cerr << "\nSummary:\n";
   for (auto& r : results) {
     std::cerr << "  iter " << (r.iteration + 1)
-              << ": score=" << r.parsimony_score
+              << ": parsimony=" << r.parsimony_score
+              << " objective=" << format_objective_kind(r.objective_kind) << " "
+              << format_objective_value(r.objective_score)
               << " nodes=" << r.dag_node_count << " edges=" << r.dag_edge_count
               << " merged=" << r.trees_merged << "\n";
     for (auto& rd : r.radii) {
@@ -2245,7 +2516,7 @@ int main(int argc, char** argv) {
               << edge_count(trimmed) << " edges\n";
     if (a.validate)
       validate_dag(trimmed, "before output (trimmed)",
-                    thread_pool::get_default());
+                   thread_pool::get_default());
     save_proto_dag(trimmed, a.output);
   } else {
     auto& result_dag = m.get_result();

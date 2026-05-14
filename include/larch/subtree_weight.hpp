@@ -6,6 +6,7 @@
 #include <larch/weight_ops.hpp>
 
 #include <cassert>
+#include <concepts>
 #include <limits>
 #include <memory_resource>
 #include <optional>
@@ -15,6 +16,20 @@
 #include <vector>
 
 namespace larch {
+
+// Type requirement for global upward scoring.  The algorithms that compute
+// weights above nodes and per-edge global scores are intended for additive,
+// lower-is-better objectives whose local edge/leaf contributions are
+// non-negative (parsimony counts, ML NLL, stored edge penalties).  Non-additive
+// objectives such as tree counts/RF summaries need their own upward pass.
+template <typename T>
+concept AdditiveGlobalWeight =
+    std::numeric_limits<T>::is_specialized && requires(T a, T b) {
+      { T{0} } -> std::convertible_to<T>;
+      { a + b } -> std::convertible_to<T>;
+      { a - b } -> std::convertible_to<T>;
+      { a < b } -> std::convertible_to<bool>;
+    };
 
 // Helper to get node_kind from a node_view
 template <typename N>
@@ -193,17 +208,22 @@ class subtree_weight {
     return extract_dag_min_weight();
   }
 
-  // Compute min weight above each node (complement of subtree).
-  // Requires compute_weight_below to have been called first.
+  // Compute min additive score above each node (the optimal contribution of
+  // everything outside that node's subtree).
+  //
+  // Requires compute_weight_below to have been called first.  This upward pass
+  // assumes the objective is a sum of non-negative local weights, and that
+  // clades combine by summing independently chosen clade minima.  It is not a
+  // generic inverse for arbitrary WeightOps.
   // Returns vector indexed by node index.
   std::vector<weight_type> compute_weight_above(Ops const& ops) {
-    // The upward pass uses raw +/- instead of ops.above_node(), so it only
-    // works for additive weight types where weight_type is std::size_t.
-    // A proper generalization would need a new WeightOps primitive like
-    // exclude_clade(total, one_clade).
-    static_assert(std::is_same_v<weight_type, std::size_t>,
-                  "compute_weight_above requires weight_type == std::size_t "
-                  "(additive ops only; raw +/- is used instead of ops methods)");
+    // The upward pass uses raw +/- instead of ops.above_node(), so it is only
+    // valid for additive, non-negative min/sum weights such as std::size_t
+    // parsimony or double ML/edge_weight penalties.
+    static_assert(
+        AdditiveGlobalWeight<weight_type>,
+        "compute_weight_above requires an additive non-negative weight_type "
+        "supporting default construction, +, -, and <");
     assert(!cached_clade_weights_.empty() &&
            "compute_weight_below must be called before compute_weight_above");
     auto constexpr max_w = std::numeric_limits<weight_type>::max() / 2;
@@ -264,8 +284,7 @@ class subtree_weight {
           auto child_idx = get_child_idx(edge_idx);
           auto edge_w = ops.compute_edge(dag_, edge_idx);
           assert(above[nidx] < max_w);
-          auto above_via_e =
-              above[nidx] + (total - clade_min_j) + edge_w;
+          auto above_via_e = above[nidx] + (total - clade_min_j) + edge_w;
           above[child_idx] = std::min(above[child_idx], above_via_e);
 
           if (--in_degree[child_idx] == 0) {
@@ -278,15 +297,17 @@ class subtree_weight {
     return above;
   }
 
-  // Compute per-edge minimum global parsimony score.
-  // Requires compute_weight_below to have been called first.
-  // Returns vector indexed by edge index: min parsimony score of any
-  // tree containing that edge.
+  // Compute per-edge minimum global additive score.
+  // Requires compute_weight_below to have been called first and shares the
+  // additive/non-negative assumptions from compute_weight_above().
+  // Returns vector indexed by edge index: min total score of any tree
+  // containing that edge.
   std::vector<weight_type> compute_edge_min_global_scores(Ops const& ops) {
-    // Same additive-only restriction as compute_weight_above.
-    static_assert(std::is_same_v<weight_type, std::size_t>,
-                  "compute_edge_min_global_scores requires weight_type == "
-                  "std::size_t (additive ops only)");
+    // Same additive, non-negative restriction as compute_weight_above.
+    static_assert(
+        AdditiveGlobalWeight<weight_type>,
+        "compute_edge_min_global_scores requires an additive non-negative "
+        "weight_type supporting default construction, +, -, and <");
     assert(!cached_clade_weights_.empty() &&
            "compute_weight_below must be called before "
            "compute_edge_min_global_scores");
@@ -299,10 +320,10 @@ class subtree_weight {
       std::visit(
           [&](auto edge) {
             auto eidx = edge.index();
-            auto parent_idx = std::visit(
-                [](auto p) { return p.index(); }, edge.get_parent());
-            auto child_idx = std::visit(
-                [](auto c) { return c.index(); }, edge.get_child());
+            auto parent_idx =
+                std::visit([](auto p) { return p.index(); }, edge.get_parent());
+            auto child_idx =
+                std::visit([](auto c) { return c.index(); }, edge.get_child());
 
             auto edge_w = ops.compute_edge(dag_, eidx);
             auto total = total_clade_min_for(parent_idx);
@@ -314,9 +335,8 @@ class subtree_weight {
               child_below = *cached_weights_[child_idx];
             }
 
-            scores[eidx] = above[parent_idx] +
-                            (total - clade_min_j) + edge_w +
-                            child_below;
+            scores[eidx] = above[parent_idx] + (total - clade_min_j) + edge_w +
+                           child_below;
           },
           ev);
     }
@@ -525,6 +545,7 @@ class subtree_weight {
             [&](auto se) {
               dst_edge.mutations() = se.mutations();
               dst_edge.clade_index() = se.clade_index();
+              dst_edge.edge_weight() = se.edge_weight();
             },
             src_edge);
 
@@ -581,6 +602,7 @@ class subtree_weight {
             [&](auto se) {
               dst_edge.mutations() = se.mutations();
               dst_edge.clade_index() = se.clade_index();
+              dst_edge.edge_weight() = se.edge_weight();
             },
             src_edge);
 
@@ -653,6 +675,7 @@ class subtree_weight {
               [&](auto se) {
                 dst_edge.mutations() = se.mutations();
                 dst_edge.clade_index() = se.clade_index();
+                dst_edge.edge_weight() = se.edge_weight();
               },
               src_edge);
         }

@@ -1,0 +1,245 @@
+#pragma once
+
+#include <larch/compute.hpp>
+#include <larch/indep_rs_cnn_model.hpp>
+#include <larch/likelihood_score_ops.hpp>
+#include <larch/rs_fivemer_model.hpp>
+#include <larch/spr_move.hpp>
+#include <larch/yaml_reader.hpp>
+
+#include <cassert>
+#include <cmath>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_set>
+#include <variant>
+
+namespace larch {
+
+// Type-erased model wrapper holding either model type.
+using ml_model = std::variant<rs_fivemer_model, indep_rs_cnn_model>;
+
+// Auto-detect model type from YAML and load weights.
+inline ml_model load_ml_model(std::string_view dir, std::string_view name) {
+  auto yml_path = std::string{dir} + "/" + std::string{name} + ".yml";
+  auto doc = read_yaml(yml_path);
+  auto model_class = yaml_require_key(doc, yml_path, "model_class").as_string();
+  if (model_class == "RSFivemerModel") return rs_fivemer_model::load(dir, name);
+  if (model_class == "IndepRSCNNModel")
+    return indep_rs_cnn_model::load(dir, name);
+  throw std::runtime_error{"load_ml_model: unknown model_class: " +
+                            model_class};
+}
+
+// Compute log_likelihood through variant dispatch.  This overload is picked up
+// by likelihood_score_ops<Model>'s model_log_likelihood() customization point.
+inline double model_log_likelihood(ml_model const& model,
+                                   std::string_view parent,
+                                   std::string_view child) {
+  return std::visit(
+      [&](auto const& m) { return m.log_likelihood(parent, child); }, model);
+}
+
+// Backward-compatible spelling used by older helpers/tests.
+inline double ml_log_likelihood(ml_model const& model, std::string_view parent,
+                                std::string_view child) {
+  return model_log_likelihood(model, parent, child);
+}
+
+using ml_model_likelihood_score_ops = likelihood_score_ops<ml_model>;
+
+// Adjust rate bias through variant dispatch.
+inline void ml_adjust_rate_bias(ml_model& model, double log_factor) {
+  std::visit([&](auto& m) { m.adjust_rate_bias_by(log_factor); }, model);
+}
+
+// Compute total negative log-likelihood for all mutated edges in a DAG using
+// an existing likelihood ops/cache object.  The ops object must reference this
+// DAG's reference sequence and remain scoped to one immutable DAG/model/options
+// lifetime; because the cache has no mutation epoch, call clear_cache() before
+// reuse after any DAG/model/options mutation or address reuse.
+inline double compute_dag_ml_nll(phylo_dag& dag,
+                                 ml_model_likelihood_score_ops const& ops) {
+  double total_nll = 0.0;
+  for (auto ev : dag.get_all_edges()) {
+    std::visit(
+        [&](auto edge) { total_nll += ops.compute_edge(dag, edge.index()); },
+        ev);
+  }
+  return total_nll;
+}
+
+// Compute total negative log-likelihood for all mutated edges in a DAG.
+// By default the artificial UA->root edge is ignored.
+inline double compute_dag_ml_nll(ml_model const& model, phylo_dag& dag,
+                                 bool ignore_ua_edge = true) {
+  auto const& ref = get_reference_sequence(dag);
+  ml_model_likelihood_score_ops ops{.model = model,
+                                    .reference = ref,
+                                    .ignore_ua_edge = ignore_ua_edge};
+  return compute_dag_ml_nll(dag, ops);
+}
+
+// ============================================================================
+// ML edge and full-fragment delta scoring helpers
+// ============================================================================
+
+// Collect the set of nodes whose parent edges are affected by an SPR move.
+// These are nodes on the path from src to lca and from dst to lca,
+// plus src itself and dst itself (whose parent edges change).
+inline std::unordered_set<std::size_t> collect_affected_nodes(
+    phylo_dag& tree, spr_move const& move) {
+  std::unordered_set<std::size_t> affected;
+
+  // Walk src → lca: every node on this path has its parent edge changed.
+  auto cur = move.src;
+  while (cur != move.lca) {
+    affected.insert(cur);
+    auto pe = get_parent_edges(tree, cur);
+    if (pe.empty()) break;
+    cur = get_parent_idx(tree, pe[0]);
+  }
+
+  // Walk dst → lca: same.
+  cur = move.dst;
+  while (cur != move.lca) {
+    affected.insert(cur);
+    auto pe = get_parent_edges(tree, cur);
+    if (pe.empty()) break;
+    cur = get_parent_idx(tree, pe[0]);
+  }
+
+  return affected;
+}
+
+// Compute NLL for a single edge given parent/child node indices in a tree.
+inline double compute_edge_nll(ml_model const& model, phylo_dag& tree,
+                               std::size_t parent_idx,
+                               std::size_t child_idx) {
+  auto const& ref = get_reference_sequence(tree);
+  ml_model_likelihood_score_ops ops{.model = model,
+                                    .reference = ref,
+                                    .ignore_ua_edge = false};
+  for (auto edge_idx : get_parent_edges(tree, child_idx)) {
+    if (get_parent_idx(tree, edge_idx) == parent_idx)
+      return ops.compute_edge(tree, edge_idx);
+  }
+  throw std::runtime_error{"compute_edge_nll: parent/child edge not found"};
+}
+
+// Compute the ML improvement represented by a full-tree SPR fragment.
+//
+// apply_spr_as_fragment() currently returns a full moved tree (with a fresh UA
+// node and Fitch-assigned compact genomes), not a changed-edge-only fragment.
+// Therefore the unbiased delta is the full old-tree NLL minus the full new-tree
+// NLL.  Positive values mean the move improved likelihood.
+inline double compute_delta_ml_score(ml_model const& model,
+                                     double old_pre_move_nll,
+                                     phylo_dag& fragment,
+                                     bool ignore_ua_edge = true) {
+  if (!std::isfinite(old_pre_move_nll))
+    throw std::runtime_error{
+        "compute_delta_ml_score: non-finite old pre-move ML NLL"};
+
+  double new_nll = compute_dag_ml_nll(model, fragment, ignore_ua_edge);
+  if (!std::isfinite(new_nll))
+    throw std::runtime_error{
+        "compute_delta_ml_score: non-finite new post-move ML NLL"};
+
+  double delta = old_pre_move_nll - new_nll;
+  if (!std::isfinite(delta))
+    throw std::runtime_error{"compute_delta_ml_score: non-finite ML delta"};
+  return delta;
+}
+
+// Convenience overload for callers/tests that do not already have the old-tree
+// NLL cached.  The move argument is retained for source compatibility and to
+// make call sites explicit about which SPR generated the fragment.
+inline double compute_delta_ml_score(ml_model const& model,
+                                     phylo_dag& original_tree,
+                                     phylo_dag& fragment,
+                                     spr_move const& /*move*/,
+                                     bool ignore_ua_edge = true) {
+  double old_pre_move_nll =
+      compute_dag_ml_nll(model, original_tree, ignore_ua_edge);
+  return compute_delta_ml_score(model, old_pre_move_nll, fragment,
+                                ignore_ua_edge);
+}
+
+// Backward-compatible alias.
+inline double compute_fragment_ml_score(ml_model const& model,
+                                        phylo_dag& fragment,
+                                        bool ignore_ua_edge = true) {
+  return compute_dag_ml_nll(model, fragment, ignore_ua_edge);
+}
+
+// ============================================================================
+// MLScoringConfig: encapsulates ML model + coefficient for move scoring.
+// ============================================================================
+
+struct ml_scoring_config {
+  // Non-owning model pointer.  When non-null, the pointed-to model must
+  // outlive this config and any scoring/cache objects built from it.  nullptr
+  // means ML scoring is unavailable; score adjustment is active only when a
+  // model is present and coeff is non-zero.
+  ml_model const* model = nullptr;
+  double coeff = 0.0;
+  bool ignore_ua_edge = true;
+
+  bool has_model() const noexcept { return model != nullptr; }
+
+  bool adjusts_scores() const {
+    if (coeff == 0.0) return false;
+    if (model == nullptr)
+      throw std::logic_error{
+          "ml_scoring_config: non-zero ML coefficient requires a model"};
+    return true;
+  }
+
+  ml_model const& require_model() const {
+    if (model == nullptr)
+      throw std::logic_error{"ml_scoring_config: ML model is not loaded"};
+    assert(model != nullptr &&
+           "ml_scoring_config model pointer must remain valid");
+    return *model;
+  }
+
+  // Adjust a parsimony-based score with an ML improvement term.
+  // base_score: parsimony/node score delta (lower = better).
+  // old_pre_move_nll: ML NLL of the tree/subtree before the SPR move.
+  // fragment: the full post-move tree produced by apply_spr_as_fragment().
+  //
+  // Returns: base_score - coeff * (old_NLL - new_NLL).
+  // When old_NLL - new_NLL > 0 (move improved ML), effective score decreases.
+  double adjust_score(double base_score, double old_pre_move_nll,
+                      phylo_dag& fragment) const {
+    if (adjusts_scores()) {
+      if (!std::isfinite(coeff))
+        throw std::runtime_error{
+            "ml_scoring_config::adjust_score: non-finite ML coefficient"};
+      double delta_ml = compute_delta_ml_score(require_model(),
+                                               old_pre_move_nll, fragment,
+                                               ignore_ua_edge);
+      double adjusted = base_score - coeff * delta_ml;
+      if (!std::isfinite(adjusted))
+        throw std::runtime_error{
+            "ml_scoring_config::adjust_score: non-finite adjusted score"};
+      return adjusted;
+    }
+    return base_score;
+  }
+
+  // Compatibility overload for callers that have not cached old_pre_move_nll.
+  double adjust_score(double base_score, phylo_dag& original_tree,
+                      phylo_dag& fragment, spr_move const& move) const {
+    if (adjusts_scores()) {
+      double old_pre_move_nll = compute_dag_ml_nll(
+          require_model(), original_tree, ignore_ua_edge);
+      return adjust_score(base_score, old_pre_move_nll, fragment);
+    }
+    return base_score;
+  }
+};
+
+}  // namespace larch

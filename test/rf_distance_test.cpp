@@ -4,6 +4,8 @@
 #include <larch/compute.hpp>
 #include <larch/merge.hpp>
 
+#include "test_util.hpp"
+
 #include <cassert>
 #include <iomanip>
 #include <iostream>
@@ -16,18 +18,7 @@
 #include <vector>
 
 using namespace larch;
-
-// Helper: build compact_genome from full sequence + reference
-static compact_genome cg_from_sequence(std::string_view seq,
-                                       std::string_view ref) {
-  std::map<mutation_position, nuc_base> muts;
-  for (std::size_t i = 0; i < seq.size(); ++i) {
-    if (seq[i] != ref[i]) {
-      muts[i + 1] = nuc_base::from_char(seq[i]);
-    }
-  }
-  return compact_genome{std::move(muts)};
-}
+using larch::test::cg_from_sequence;
 
 // Helper: add edge between parent and child with given clade index
 static void add_edge(phylo_dag& d, std::size_t parent_idx,

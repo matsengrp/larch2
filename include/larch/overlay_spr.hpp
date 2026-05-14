@@ -281,6 +281,7 @@ inline phylo_dag copy_subtree_from_overlay(
 
                   auto e = fragment.append_edge<edge_kind::clade>();
                   e.clade_index() = edge.clade_index();
+                  e.edge_weight() = edge.edge_weight();
                   auto pv = fragment.get_node(new_idx);
                   std::visit([&](auto p) { e.set_parent(p); }, pv);
                   auto ccv = fragment.get_node(new_child_idx);

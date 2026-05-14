@@ -49,6 +49,21 @@ struct move_coefficients {
   }
 };
 
+inline constexpr double rescored_move_score_tolerance = 1e-10;
+
+// Rescored move scores are lower-is-better deltas relative to the current
+// tree.  Keep only strict improvements; neutral moves are intentionally
+// excluded unless a future diversification mode opts into them explicitly.
+inline bool is_strictly_improving_rescored_move(int final_score) {
+  return final_score < 0;
+}
+
+inline bool is_strictly_improving_rescored_move(
+    double final_score,
+    double tolerance = rescored_move_score_tolerance) {
+  return final_score < -tolerance;
+}
+
 struct src_removal_result {
   int score_change{0};
   std::vector<uint8_t> new_fitch;
@@ -1752,6 +1767,7 @@ inline std::pair<phylo_dag, std::vector<std::size_t>> clone_tree(
           auto e = dst.append_edge<edge_kind::clade>();
           e.mutations() = edge.mutations();
           e.clade_index() = edge.clade_index();
+          e.edge_weight() = edge.edge_weight();
           auto parent_idx = old_to_new[get_parent_idx(src, edge.index())];
           auto child_idx = old_to_new[get_child_idx(src, edge.index())];
           auto pv = dst.get_node(parent_idx);

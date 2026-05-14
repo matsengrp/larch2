@@ -45,6 +45,8 @@ inline void save_proto_dag(phylo_dag& dag, std::string_view path,
           auto eidx = edge.index();
           if (eidx < edge_scores.size())
             de.edge_weight = edge_scores[eidx];
+          else
+            de.edge_weight = edge.edge_weight();
 
           for (auto& [pos, nucs] : edge.mutations()) {
             dag_mut dm;
