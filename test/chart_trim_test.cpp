@@ -10,6 +10,7 @@
 #include <numeric>
 #include <optional>
 #include <print>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -48,6 +49,105 @@ static larch::test::tiny_tree_node paper_tree2_spec() {
                   {tiny_leaf("D", "CA"),
                    tiny_inner("CE", "AA",
                               {tiny_leaf("C", "AC"), tiny_leaf("E", "CC")})})});
+}
+
+static larch::test::tiny_tree_node paper_tree1_with_invariant_spec() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "AAA",
+      {tiny_inner("AB", "AAA", {tiny_leaf("A", "AAC"), tiny_leaf("B", "AAC")}),
+       tiny_inner(
+           "CDE", "AAA",
+           {tiny_leaf("C", "ACC"),
+            tiny_inner("DE", "AAA",
+                       {tiny_leaf("D", "CAC"), tiny_leaf("E", "CCC")})})});
+}
+
+static larch::test::tiny_tree_node paper_tree2_with_invariant_spec() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "AAA",
+      {tiny_inner("AB", "AAA", {tiny_leaf("A", "AAC"), tiny_leaf("B", "AAC")}),
+       tiny_inner(
+           "CDE", "AAA",
+           {tiny_leaf("D", "CAC"),
+            tiny_inner("CE", "AAA",
+                       {tiny_leaf("C", "ACC"), tiny_leaf("E", "CCC")})})});
+}
+
+static larch::test::tiny_tree_node concordant_tree1_spec() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "AA",
+      {tiny_inner("AB", "AA", {tiny_leaf("A", "AA"), tiny_leaf("B", "AA")}),
+       tiny_inner("CDE", "AA",
+                  {tiny_leaf("C", "AA"),
+                   tiny_inner("DE", "AA",
+                              {tiny_leaf("D", "CC"), tiny_leaf("E", "CC")})})});
+}
+
+static larch::test::tiny_tree_node concordant_tree2_spec() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "AA",
+      {tiny_inner("AB", "AA", {tiny_leaf("A", "AA"), tiny_leaf("B", "AA")}),
+       tiny_inner("CDE", "AA",
+                  {tiny_leaf("D", "CC"),
+                   tiny_inner("CE", "AA",
+                              {tiny_leaf("C", "AA"), tiny_leaf("E", "CC")})})});
+}
+
+static larch::test::tiny_tree_node invariant_tree1_spec() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AB", "A", {tiny_leaf("A", "A"), tiny_leaf("B", "A")}),
+       tiny_inner("CDE", "A",
+                  {tiny_leaf("C", "A"),
+                   tiny_inner("DE", "A",
+                              {tiny_leaf("D", "A"), tiny_leaf("E", "A")})})});
+}
+
+static larch::test::tiny_tree_node invariant_tree2_spec() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AB", "A", {tiny_leaf("A", "A"), tiny_leaf("B", "A")}),
+       tiny_inner("CDE", "A",
+                  {tiny_leaf("D", "A"),
+                   tiny_inner("CE", "A",
+                              {tiny_leaf("C", "A"), tiny_leaf("E", "A")})})});
+}
+
+static larch::test::tiny_tree_node random_tree_spec(
+    std::vector<std::pair<std::string, std::string>> leaves,
+    std::string const& reference, std::mt19937& rng, int& inner_id) {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+
+  if (leaves.size() == 1) {
+    return tiny_leaf(leaves.front().first, leaves.front().second);
+  }
+
+  std::shuffle(leaves.begin(), leaves.end(), rng);
+  std::uniform_int_distribution<int> split_dist(
+      1, static_cast<int>(leaves.size()) - 1);
+  auto split = static_cast<std::size_t>(split_dist(rng));
+  std::vector<std::pair<std::string, std::string>> left(leaves.begin(),
+                                                        leaves.begin() + split);
+  std::vector<std::pair<std::string, std::string>> right(leaves.begin() + split,
+                                                         leaves.end());
+
+  return tiny_inner(
+      "R" + std::to_string(inner_id++), reference,
+      {random_tree_spec(std::move(left), reference, rng, inner_id),
+       random_tree_spec(std::move(right), reference, rng, inner_id)});
 }
 
 static larch::taxon_id taxon_for(larch::clade_grammar const& grammar,
@@ -187,18 +287,19 @@ static std::vector<brute_topology> brute_enumerate_topologies(
           if (left.selected_prod_by_clade[cid] != larch::no_production)
             topo.selected_prod_by_clade[cid] = left.selected_prod_by_clade[cid];
           if (right.selected_prod_by_clade[cid] != larch::no_production)
-            topo.selected_prod_by_clade[cid] = right.selected_prod_by_clade[cid];
+            topo.selected_prod_by_clade[cid] =
+                right.selected_prod_by_clade[cid];
         }
         for (std::size_t i = 0; i < grammar.productions.size(); ++i) {
-          topo.used_production[i] = left.used_production[i] ||
-                                    right.used_production[i];
+          topo.used_production[i] =
+              left.used_production[i] || right.used_production[i];
         }
 
         topo.selected_prod_by_clade[clade] = pid;
         topo.used_production[pid] = true;
-        topo.inside_by_clade[clade] = brute_combine_binary(
-            topo.inside_by_clade[prod.children[0]],
-            topo.inside_by_clade[prod.children[1]]);
+        topo.inside_by_clade[clade] =
+            brute_combine_binary(topo.inside_by_clade[prod.children[0]],
+                                 topo.inside_by_clade[prod.children[1]]);
         result.push_back(std::move(topo));
         CHECK(result.size() < 10000);
       }
@@ -248,17 +349,17 @@ static std::vector<row_t> brute_topology_outside(
         larch::chart_cost sibling_best = larch::chart_inf;
         for (std::uint8_t sibling_state = 0;
              sibling_state < larch::nuc_state_count; ++sibling_state) {
-          sibling_best = std::min(
-              sibling_best,
-              brute_add(topo.inside_by_clade[sibling][sibling_state],
-                        parent_state == sibling_state ? 0 : 1));
+          sibling_best =
+              std::min(sibling_best,
+                       brute_add(topo.inside_by_clade[sibling][sibling_state],
+                                 parent_state == sibling_state ? 0 : 1));
         }
-        for (std::uint8_t child_state = 0;
-             child_state < larch::nuc_state_count; ++child_state) {
-          auto candidate = brute_add(
-              brute_add(base, sibling_best),
-              parent_state == child_state ? larch::chart_cost{0}
-                                          : larch::chart_cost{1});
+        for (std::uint8_t child_state = 0; child_state < larch::nuc_state_count;
+             ++child_state) {
+          auto candidate =
+              brute_add(brute_add(base, sibling_best),
+                        parent_state == child_state ? larch::chart_cost{0}
+                                                    : larch::chart_cost{1});
           outside[child][child_state] =
               std::min(outside[child][child_state], candidate);
         }
@@ -274,13 +375,14 @@ static void compare_outside_and_mask_to_bruteforce(
     larch::single_site_chart const& chart,
     larch::single_site_outside_chart const& outside,
     larch::chart_trim_mask const& mask) {
-  auto topologies = brute_enumerate_topologies(grammar, states,
-                                               grammar.root_clade);
+  auto topologies =
+      brute_enumerate_topologies(grammar, states, grammar.root_clade);
   CHECK(!topologies.empty());
 
   larch::chart_cost optimum = larch::chart_inf;
   for (auto const& topo : topologies)
-    optimum = std::min(optimum, row_min(topo.inside_by_clade[grammar.root_clade]));
+    optimum =
+        std::min(optimum, row_min(topo.inside_by_clade[grammar.root_clade]));
   CHECK(optimum == outside.global_min);
   CHECK(optimum == chart.root_min_excluding_ua(grammar.root_clade));
 
@@ -349,9 +451,8 @@ static void test_paper_counterexample_outside_trim_and_traceback() {
 
   larch::chart_trim_options bool_only_trim;
   bool_only_trim.store_optimal_choices = false;
-  auto bool_only_mask1 =
-      larch::build_single_site_trim_mask(grammar, chart1, outside1,
-                                         bool_only_trim);
+  auto bool_only_mask1 = larch::build_single_site_trim_mask(
+      grammar, chart1, outside1, bool_only_trim);
   CHECK(bool_only_mask1.keep_production == mask1.keep_production);
   CHECK(bool_only_mask1.optimal_choices_by_production.empty());
   CHECK(bool_only_mask1.kept_production_choice_count ==
@@ -400,11 +501,11 @@ static void test_single_tree_keeps_all_productions() {
   auto spec = larch::test::tiny_inner(
       "root", "A",
       {larch::test::tiny_inner("AB", "A",
-                                {larch::test::tiny_leaf("A", "A"),
-                                 larch::test::tiny_leaf("B", "C")}),
+                               {larch::test::tiny_leaf("A", "A"),
+                                larch::test::tiny_leaf("B", "C")}),
        larch::test::tiny_inner("CD", "A",
-                                {larch::test::tiny_leaf("C", "G"),
-                                 larch::test::tiny_leaf("D", "T")})});
+                               {larch::test::tiny_leaf("C", "G"),
+                                larch::test::tiny_leaf("D", "T")})});
   auto tree = larch::test::make_tiny_labelled_tree("A", spec);
   auto grammar = larch::build_clade_grammar(tree);
   auto states = larch::extract_leaf_site_states(tree, grammar, 1);
@@ -421,7 +522,8 @@ static void test_single_tree_keeps_all_productions() {
   CHECK(traceback.score == chart.root_min_excluding_ua(grammar.root_clade));
   CHECK(traceback.productions.size() == grammar.productions.size());
   for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid)
-    CHECK(contains(traceback.productions, static_cast<larch::production_id>(pid)));
+    CHECK(contains(traceback.productions,
+                   static_cast<larch::production_id>(pid)));
 
   compare_outside_and_mask_to_bruteforce(grammar, states, chart, outside, mask);
 
@@ -432,8 +534,8 @@ static void test_reference_edge_outside_boundary() {
   std::println("test_reference_edge_outside_boundary");
 
   auto spec = larch::test::tiny_inner(
-      "root", "A", {larch::test::tiny_leaf("A", "C"),
-                     larch::test::tiny_leaf("B", "C")});
+      "root", "A",
+      {larch::test::tiny_leaf("A", "C"), larch::test::tiny_leaf("B", "C")});
   auto tree = larch::test::make_tiny_labelled_tree("A", spec);
   auto grammar = larch::build_clade_grammar(tree);
   auto states = larch::extract_leaf_site_states(tree, grammar, 1);
@@ -454,7 +556,8 @@ static void test_reference_edge_outside_boundary() {
   auto traceback = larch::deterministic_optimal_single_site_traceback(
       grammar, chart, outside);
   CHECK(traceback.score == 1);
-  CHECK(traceback.root_state_by_clade[grammar.root_clade] == larch::nuc_base::C);
+  CHECK(traceback.root_state_by_clade[grammar.root_clade] ==
+        larch::nuc_base::C);
 
   larch::chart_options ua_free_opts;
   CHECK(!throws_runtime_error([&] {
@@ -484,6 +587,280 @@ static void test_reference_edge_outside_boundary() {
   std::println("  PASS");
 }
 
+static void test_multisite_composite_counterexample() {
+  std::println("test_multisite_composite_counterexample");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", paper_tree1_spec()));
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", paper_tree2_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto patterns = larch::build_site_patterns(merged, grammar);
+
+  auto c = clade_for(grammar, {"C"});
+  auto d = clade_for(grammar, {"D"});
+  auto de = clade_for(grammar, {"D", "E"});
+  auto ce = clade_for(grammar, {"C", "E"});
+  auto cde = clade_for(grammar, {"C", "D", "E"});
+  auto prod_c_de = production_id_for(grammar, cde, {c, de});
+  auto prod_d_ce = production_id_for(grammar, cde, {d, ce});
+
+  CHECK(patterns.patterns.size() == 2);
+  auto composite = larch::build_composite_chart_score(grammar, patterns);
+  CHECK(composite.weighted_lower_bound == 2);
+  CHECK(composite.per_pattern_root_min.size() == 2);
+  for (auto root_min : composite.per_pattern_root_min) CHECK(root_min == 1);
+
+  auto brute = larch::brute_force_multisite_topologies(grammar, patterns);
+  CHECK(brute.topology_count == 2);
+  CHECK(brute.optimum == 3);
+
+  auto bnb = larch::build_multisite_trim(grammar, patterns);
+  CHECK(bnb.composite_lower_bound == 2);
+  CHECK(bnb.initial_upper_bound == 3);
+  CHECK(bnb.optimum == 3);
+  CHECK(bnb.frontier_sizes_by_clade[grammar.root_clade] == 2);
+  CHECK(bnb.keep_production == brute.keep_production);
+  CHECK(bnb.keep_production[prod_c_de]);
+  CHECK(bnb.keep_production[prod_d_ce]);
+
+  std::println("  PASS");
+}
+
+static void test_multisite_parent_combine_fixes_child_topology() {
+  std::println("test_multisite_parent_combine_fixes_child_topology");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", paper_tree1_spec()));
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", paper_tree2_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto patterns = larch::build_site_patterns(merged, grammar);
+  auto cde = clade_for(grammar, {"C", "D", "E"});
+
+  larch::multisite_trim_options no_bound_pruning;
+  no_bound_pruning.use_bound_pruning = false;
+  auto bnb =
+      larch::build_multisite_trim(grammar, patterns, {}, no_bound_pruning);
+  auto brute = larch::brute_force_multisite_topologies(grammar, patterns);
+
+  // The CDE child has two fixed topology entries: one preferred by site 1 and
+  // one by site 2.  The parent/root combine must choose one child entry before
+  // minimizing over states; if it re-minimized child topology independently per
+  // pattern, this would incorrectly collapse to the composite lower bound 2.
+  CHECK(bnb.frontier_sizes_by_clade[cde] == 2);
+  CHECK(bnb.composite_lower_bound == 2);
+  CHECK(bnb.optimum == 3);
+  CHECK(brute.optimum == 3);
+  CHECK(bnb.keep_production == brute.keep_production);
+
+  std::println("  PASS");
+}
+
+static void test_multisite_concordant_sites_equal_lower_bound() {
+  std::println("test_multisite_concordant_sites_equal_lower_bound");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", concordant_tree1_spec()));
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", concordant_tree2_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto patterns = larch::build_site_patterns(merged, grammar);
+
+  auto c = clade_for(grammar, {"C"});
+  auto d = clade_for(grammar, {"D"});
+  auto de = clade_for(grammar, {"D", "E"});
+  auto ce = clade_for(grammar, {"C", "E"});
+  auto cde = clade_for(grammar, {"C", "D", "E"});
+  auto prod_c_de = production_id_for(grammar, cde, {c, de});
+  auto prod_d_ce = production_id_for(grammar, cde, {d, ce});
+
+  CHECK(patterns.patterns.size() == 1);
+  CHECK(patterns.patterns.front().weight == 2);
+
+  auto composite = larch::build_composite_chart_score(grammar, patterns);
+  auto brute = larch::brute_force_multisite_topologies(grammar, patterns);
+  auto bnb = larch::build_multisite_trim(grammar, patterns);
+
+  CHECK(composite.weighted_lower_bound == 2);
+  CHECK(brute.optimum == 2);
+  CHECK(bnb.optimum == 2);
+  CHECK(bnb.optimum == bnb.composite_lower_bound);
+  CHECK(bnb.keep_production == brute.keep_production);
+  CHECK(bnb.keep_production[prod_c_de]);
+  CHECK(!bnb.keep_production[prod_d_ce]);
+
+  std::println("  PASS");
+}
+
+static void test_multisite_invariant_sites_and_reference_edge_constant() {
+  std::println("test_multisite_invariant_sites_and_reference_edge_constant");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree1_with_invariant_spec()));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree2_with_invariant_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+
+  auto keep_patterns = larch::build_site_patterns(merged, grammar);
+  CHECK(keep_patterns.invariant_site_count == 1);
+  CHECK(keep_patterns.variable_site_count == 2);
+  auto keep_bnb = larch::build_multisite_trim(grammar, keep_patterns);
+  CHECK(keep_bnb.optimum == 3);
+  CHECK(keep_bnb.invariant_constant_offset == 0);
+
+  larch::site_pattern_options skip_invariant;
+  skip_invariant.skip_invariant_sites = true;
+  auto skipped_patterns =
+      larch::build_site_patterns(merged, grammar, skip_invariant);
+  CHECK(skipped_patterns.patterns.size() == 2);
+  CHECK(skipped_patterns.skipped_invariant_site_count == 1);
+  auto skipped_bnb = larch::build_multisite_trim(grammar, skipped_patterns);
+  CHECK(skipped_bnb.optimum == keep_bnb.optimum);
+  CHECK(skipped_bnb.keep_production == keep_bnb.keep_production);
+
+  larch::chart_options with_reference_edge;
+  with_reference_edge.score_ua_edge = true;
+  auto with_ua_bnb = larch::build_multisite_trim(grammar, skipped_patterns,
+                                                 with_reference_edge);
+  CHECK(with_ua_bnb.invariant_constant_offset == 1);
+  CHECK(with_ua_bnb.optimum == keep_bnb.optimum + 1);
+  CHECK(with_ua_bnb.keep_production == keep_bnb.keep_production);
+
+  std::println("  PASS");
+}
+
+static void test_composite_reference_state_diagnostics() {
+  std::println("test_composite_reference_state_diagnostics");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AG", larch::test::tiny_inner("root", "AG",
+                                    {larch::test::tiny_leaf("L1", "AA"),
+                                     larch::test::tiny_leaf("L2", "CC")}));
+  auto grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, grammar);
+  CHECK(patterns.patterns.size() == 1);
+  CHECK(patterns.patterns.front().weight == 2);
+  CHECK(patterns.patterns.front().reference_state_counts[larch::nuc_base::A] ==
+        1);
+  CHECK(patterns.patterns.front().reference_state_counts[larch::nuc_base::G] ==
+        1);
+
+  larch::chart_options with_reference_edge;
+  with_reference_edge.score_ua_edge = true;
+  auto composite = larch::build_composite_chart_score(grammar, patterns,
+                                                      with_reference_edge);
+  CHECK(composite.weighted_lower_bound == 3);
+  CHECK(composite.per_pattern_root_min.size() == 1);
+  CHECK(composite.per_pattern_root_min.front() == 1);
+  CHECK(composite.per_pattern_root_min_by_reference_state.size() == 1);
+  auto const& by_reference =
+      composite.per_pattern_root_min_by_reference_state.front();
+  CHECK(by_reference[larch::nuc_base::A] == 1);
+  CHECK(by_reference[larch::nuc_base::G] == 2);
+  CHECK(by_reference[larch::nuc_base::C] == larch::chart_inf);
+  CHECK(by_reference[larch::nuc_base::T] == larch::chart_inf);
+
+  std::println("  PASS");
+}
+
+static void test_multisite_equal_dedup_merges_provenance() {
+  std::println("test_multisite_equal_dedup_merges_provenance");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", invariant_tree1_spec()));
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", invariant_tree2_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto patterns = larch::build_site_patterns(merged, grammar);
+
+  auto brute = larch::brute_force_multisite_topologies(grammar, patterns);
+  auto bnb = larch::build_multisite_trim(grammar, patterns);
+
+  CHECK(patterns.invariant_site_count == 1);
+  CHECK(bnb.active_pattern_count == 0);
+  CHECK(brute.optimum == 0);
+  CHECK(bnb.optimum == 0);
+  CHECK(bnb.keep_production == brute.keep_production);
+  CHECK(bnb.equality_deduplicated > 0);
+  for (bool keep : bnb.keep_production) CHECK(keep);
+
+  std::println("  PASS");
+}
+
+static void test_multisite_randomized_tiny_bnb_matches_bruteforce() {
+  std::println("test_multisite_randomized_tiny_bnb_matches_bruteforce");
+
+  std::mt19937 rng{20260518};
+  auto random_base = [&]() -> char {
+    static constexpr std::array<char, 4> bases{'A', 'C', 'G', 'T'};
+    std::uniform_int_distribution<int> dist(0, 3);
+    return bases[dist(rng)];
+  };
+
+  for (std::size_t trial = 0; trial < 18; ++trial) {
+    auto site_count = 3 + (trial % 3);
+    std::string reference;
+    reference.reserve(site_count);
+    for (std::size_t pos = 0; pos < site_count; ++pos)
+      reference.push_back(random_base());
+
+    std::vector<std::pair<std::string, std::string>> leaves;
+    for (std::size_t taxon = 0; taxon < 5; ++taxon) {
+      std::string sequence;
+      sequence.reserve(site_count);
+      for (std::size_t pos = 0; pos < site_count; ++pos) {
+        // Bias toward A/C to create repeated patterns and ties, with occasional
+        // other states to exercise non-binary exact patterns.
+        std::uniform_int_distribution<int> biased(0, 7);
+        auto draw = biased(rng);
+        sequence.push_back(draw < 3 ? 'A' : (draw < 6 ? 'C' : random_base()));
+      }
+      leaves.emplace_back("T" + std::to_string(taxon), std::move(sequence));
+    }
+
+    std::vector<larch::phylo_dag> trees;
+    for (std::size_t tree_idx = 0; tree_idx < 3; ++tree_idx) {
+      int inner_id = static_cast<int>(1000 * trial + 100 * tree_idx);
+      auto spec = random_tree_spec(leaves, reference, rng, inner_id);
+      trees.push_back(larch::test::make_tiny_labelled_tree(reference, spec));
+    }
+
+    auto merged = larch::test::merge_tiny_trees(std::move(trees));
+    auto grammar = larch::build_clade_grammar(merged);
+    auto patterns = larch::build_site_patterns(merged, grammar);
+
+    auto brute =
+        larch::brute_force_multisite_topologies(grammar, patterns, {}, 200000);
+    auto bnb = larch::build_multisite_trim(grammar, patterns);
+    CHECK(bnb.optimum == brute.optimum);
+    CHECK(bnb.keep_production == brute.keep_production);
+
+    if (trial % 3 == 0) {
+      larch::chart_options with_reference_edge;
+      with_reference_edge.score_ua_edge = true;
+      auto brute_ua = larch::brute_force_multisite_topologies(
+          grammar, patterns, with_reference_edge, 200000);
+      auto bnb_ua =
+          larch::build_multisite_trim(grammar, patterns, with_reference_edge);
+      CHECK(bnb_ua.optimum == brute_ua.optimum);
+      CHECK(bnb_ua.keep_production == brute_ua.keep_production);
+    }
+  }
+
+  std::println("  PASS");
+}
+
 static void test_exhaustive_binary_assignments() {
   std::println("test_exhaustive_binary_assignments");
 
@@ -495,28 +872,28 @@ static void test_exhaustive_binary_assignments() {
     auto s = [](char c) { return std::string(1, c); };
     auto tree1 = larch::test::tiny_inner(
         "root", "A",
-        {larch::test::tiny_inner(
-             "AB", "A",
-             {larch::test::tiny_leaf("A", s(states[0])),
-              larch::test::tiny_leaf("B", s(states[1]))}),
+        {larch::test::tiny_inner("AB", "A",
+                                 {larch::test::tiny_leaf("A", s(states[0])),
+                                  larch::test::tiny_leaf("B", s(states[1]))}),
          larch::test::tiny_inner(
              "CDE", "A",
              {larch::test::tiny_leaf("C", s(states[2])),
               larch::test::tiny_inner(
-                  "DE", "A", {larch::test::tiny_leaf("D", s(states[3])),
-                                larch::test::tiny_leaf("E", s(states[4]))})})});
+                  "DE", "A",
+                  {larch::test::tiny_leaf("D", s(states[3])),
+                   larch::test::tiny_leaf("E", s(states[4]))})})});
     auto tree2 = larch::test::tiny_inner(
         "root", "A",
-        {larch::test::tiny_inner(
-             "AB", "A",
-             {larch::test::tiny_leaf("A", s(states[0])),
-              larch::test::tiny_leaf("B", s(states[1]))}),
+        {larch::test::tiny_inner("AB", "A",
+                                 {larch::test::tiny_leaf("A", s(states[0])),
+                                  larch::test::tiny_leaf("B", s(states[1]))}),
          larch::test::tiny_inner(
              "CDE", "A",
              {larch::test::tiny_leaf("D", s(states[3])),
               larch::test::tiny_inner(
-                  "CE", "A", {larch::test::tiny_leaf("C", s(states[2])),
-                                larch::test::tiny_leaf("E", s(states[4]))})})});
+                  "CE", "A",
+                  {larch::test::tiny_leaf("C", s(states[2])),
+                   larch::test::tiny_leaf("E", s(states[4]))})})});
 
     std::vector<larch::phylo_dag> trees;
     trees.push_back(larch::test::make_tiny_labelled_tree("A", tree1));
@@ -538,6 +915,13 @@ int main() {
   test_paper_counterexample_outside_trim_and_traceback();
   test_single_tree_keeps_all_productions();
   test_reference_edge_outside_boundary();
+  test_multisite_composite_counterexample();
+  test_multisite_parent_combine_fixes_child_topology();
+  test_multisite_concordant_sites_equal_lower_bound();
+  test_multisite_invariant_sites_and_reference_edge_constant();
+  test_composite_reference_state_diagnostics();
+  test_multisite_equal_dedup_merges_provenance();
+  test_multisite_randomized_tiny_bnb_matches_bruteforce();
   test_exhaustive_binary_assignments();
 
   std::println("All chart trim tests passed!");

@@ -1,15 +1,19 @@
 #pragma once
 
 #include <larch/parsimony_chart.hpp>
+#include <larch/site_patterns.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -81,8 +85,7 @@ inline std::vector<clade_id> clades_by_decreasing_size(
     clade_grammar const& grammar) {
   std::vector<clade_id> order(grammar.clades.size());
   std::iota(order.begin(), order.end(), clade_id{0});
-  std::stable_sort(order.begin(), order.end(), [&](clade_id lhs,
-                                                   clade_id rhs) {
+  std::stable_sort(order.begin(), order.end(), [&](clade_id lhs, clade_id rhs) {
     auto const& ltaxa = grammar.clades[lhs].taxa;
     auto const& rtaxa = grammar.clades[rhs].taxa;
     if (ltaxa.size() != rtaxa.size()) return ltaxa.size() > rtaxa.size();
@@ -114,7 +117,8 @@ inline void validate_production_indices(clade_grammar const& grammar) {
             "chart trim: productions_by_child contains invalid production id");
       }
       auto const& children = grammar.productions[pid].children;
-      if (std::find(children.begin(), children.end(), child) == children.end()) {
+      if (std::find(children.begin(), children.end(), child) ==
+          children.end()) {
         throw std::runtime_error(
             "chart trim: productions_by_child contains mismatched child");
       }
@@ -207,7 +211,8 @@ inline chart_cost production_choice_inside_cost(
   for (std::size_t child_i = 0; child_i < 2; ++child_i) {
     auto child = prod.children[child_i];
     if (child == no_clade || child >= chart.inside.size()) {
-      throw std::runtime_error("chart trim: production child clade out of range");
+      throw std::runtime_error(
+          "chart trim: production child clade out of range");
     }
     auto child_state = child_states[child_i];
     parsimony_chart_detail::validate_state(child_state,
@@ -234,10 +239,10 @@ inline chart_cost compute_global_min(clade_grammar const& grammar,
   return best;
 }
 
-inline bool is_globally_optimal_state(
-    clade_grammar const& grammar, single_site_chart const& chart,
-    single_site_outside_chart const& outside, clade_id clade,
-    std::uint8_t state) {
+inline bool is_globally_optimal_state(clade_grammar const& grammar,
+                                      single_site_chart const& chart,
+                                      single_site_outside_chart const& outside,
+                                      clade_id clade, std::uint8_t state) {
   if (clade == no_clade || clade >= grammar.clades.size()) {
     throw std::runtime_error("chart trim: clade id out of range");
   }
@@ -291,7 +296,8 @@ inline std::vector<chart_production_choice> globally_optimal_choices_for_state(
 
     auto local = production_choice_inside_cost(grammar, chart, prod,
                                                parent_state, child_states);
-    if (local >= chart_inf || local != chart.inside[clade][parent_state]) return;
+    if (local >= chart_inf || local != chart.inside[clade][parent_state])
+      return;
 
     auto complete = parsimony_chart_detail::saturated_add(
         outside.outside[clade][parent_state], local);
@@ -306,8 +312,8 @@ inline std::vector<chart_production_choice> globally_optimal_choices_for_state(
     }
 
     append_unique_choice(
-        choices, chart_production_choice{pid, parent_state, child_states,
-                                         complete});
+        choices,
+        chart_production_choice{pid, parent_state, child_states, complete});
   };
 
   if (chart.has_trace()) {
@@ -401,11 +407,13 @@ chart_traceback_result optimal_single_site_traceback_impl(
                                                       clade, state);
     if (choices.empty()) {
       throw std::runtime_error(
-          "chart trim: non-leaf optimal state has no optimal production choice");
+          "chart trim: non-leaf optimal state has no optimal production "
+          "choice");
     }
     auto choice_index = choose_index(choices.size());
     if (choice_index >= choices.size()) {
-      throw std::runtime_error("chart trim: traceback choice index out of range");
+      throw std::runtime_error(
+          "chart trim: traceback choice index out of range");
     }
     auto const& choice = choices[choice_index];
     result.productions.push_back(choice.production);
@@ -419,7 +427,8 @@ chart_traceback_result optimal_single_site_traceback_impl(
 
   auto root_choice_index = choose_index(root_states.size());
   if (root_choice_index >= root_states.size()) {
-    throw std::runtime_error("chart trim: traceback root choice index out of range");
+    throw std::runtime_error(
+        "chart trim: traceback root choice index out of range");
   }
   trace_clade(trace_clade, grammar.root_clade, root_states[root_choice_index]);
   return result;
@@ -439,13 +448,13 @@ inline single_site_outside_chart build_single_site_outside_chart(
 
   auto root = grammar.root_clade;
   for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
-    result.outside[root][state] =
-        options.score_ua_edge ? transition_cost(reference_state, state)
-                              : chart_cost{0};
+    result.outside[root][state] = options.score_ua_edge
+                                      ? transition_cost(reference_state, state)
+                                      : chart_cost{0};
   }
 
-  result.global_min = chart_trim_detail::compute_global_min(grammar, chart,
-                                                            result);
+  result.global_min =
+      chart_trim_detail::compute_global_min(grammar, chart, result);
 
   // This dense outside pass scans productions_by_parent in topological order.
   // productions_by_child is not needed for the all-clade pass, but is validated
@@ -474,11 +483,11 @@ inline single_site_outside_chart build_single_site_outside_chart(
         std::array<chart_cost, 2> sibling_best{chart_inf, chart_inf};
         for (std::size_t child_i = 0; child_i < 2; ++child_i) {
           auto sibling = children[1 - child_i];
-          for (std::uint8_t sibling_state = 0;
-               sibling_state < nuc_state_count; ++sibling_state) {
-            auto candidate = saturated_add(
-                chart.inside[sibling][sibling_state],
-                transition_cost(parent_state, sibling_state));
+          for (std::uint8_t sibling_state = 0; sibling_state < nuc_state_count;
+               ++sibling_state) {
+            auto candidate =
+                saturated_add(chart.inside[sibling][sibling_state],
+                              transition_cost(parent_state, sibling_state));
             sibling_best[child_i] = std::min(sibling_best[child_i], candidate);
           }
         }
@@ -652,6 +661,937 @@ inline chart_traceback_result random_optimal_single_site_traceback(
   auto outside =
       build_single_site_outside_chart(grammar, chart, options, reference_state);
   return random_optimal_single_site_traceback(grammar, chart, outside, seed);
+}
+
+inline constexpr std::uint64_t multisite_score_inf =
+    std::numeric_limits<std::uint64_t>::max() / 4;
+
+struct composite_chart_score {
+  // Sum of independent single-site/pattern optima.  This is a lower bound for
+  // multi-site topology optimization, not an exact score unless all patterns
+  // can share one optimal topology.
+  std::uint64_t weighted_lower_bound = 0;
+
+  // Coarse diagnostic per exact pattern. With score_ua_edge=false this is the
+  // UA-free root optimum. With score_ua_edge=true a compressed pattern can span
+  // sites with different UA/reference states; in that case this is only the
+  // minimum over observed reference-state-specific optima. Use
+  // per_pattern_root_min_by_reference_state for lossless UA-edge diagnostics.
+  std::vector<chart_cost> per_pattern_root_min;
+
+  // Indexed [pattern][reference_state]. With score_ua_edge=true, entries for
+  // reference states that occur in the compressed pattern contain the exact
+  // root optimum including that reference edge and absent states are INF. With
+  // score_ua_edge=false all four entries are filled with the UA-free root
+  // optimum for convenience.
+  std::vector<std::array<chart_cost, nuc_state_count>>
+      per_pattern_root_min_by_reference_state;
+};
+
+struct multisite_cost_function {
+  // Flattened [active_pattern][state], unweighted.  Pattern weights are applied
+  // only in objective, lower-bound, and upper-bound calculations.
+  std::vector<chart_cost> cost;
+  // Debug/acceleration only.  Equal hashes are never treated as identity.
+  std::uint64_t topology_hash = 0;
+};
+
+struct frontier_entry {
+  multisite_cost_function f;
+  // Provenance for the partial topology below this clade.  Equal cost vectors
+  // merge provenance so trimming does not lose equally optimal productions.
+  std::vector<bool> used_production;
+};
+
+struct multisite_trim_options {
+  bool use_bound_pruning = true;
+
+  // 0 means unlimited.
+  std::size_t max_frontier_entries_per_clade = 0;
+};
+
+struct multisite_trim_result {
+  std::uint64_t optimum = multisite_score_inf;
+  std::uint64_t composite_lower_bound = multisite_score_inf;
+  std::uint64_t initial_upper_bound = multisite_score_inf;
+  std::vector<bool> keep_production;
+  std::vector<std::size_t> frontier_sizes_by_clade;
+  // Reserved for future exact, provenance-preserving dominance pruning. The
+  // public Phase-5 trim path currently leaves this at zero so keep_production
+  // remains an exact optimal-production mask.
+  std::size_t dominance_pruned = 0;
+  std::size_t bound_pruned = 0;
+  std::size_t equality_deduplicated = 0;
+  std::size_t active_pattern_count = 0;
+  std::uint64_t invariant_constant_offset = 0;
+};
+
+struct multisite_bruteforce_result {
+  std::uint64_t optimum = multisite_score_inf;
+  std::vector<bool> keep_production;
+  std::size_t topology_count = 0;
+};
+
+namespace chart_multisite_detail {
+
+using chart_row = std::array<chart_cost, nuc_state_count>;
+
+struct chart_cost_vector_hash {
+  std::size_t operator()(std::vector<chart_cost> const& values) const noexcept {
+    std::size_t h = values.size();
+    for (auto value : values) {
+      h ^= std::hash<chart_cost>{}(value) + 0x9e3779b97f4a7c15ULL + (h << 6) +
+           (h >> 2);
+    }
+    return h;
+  }
+};
+
+inline std::uint64_t mix_hash(std::uint64_t seed, std::uint64_t value) {
+  seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+  return seed;
+}
+
+inline std::size_t cost_index(std::size_t active_pattern, std::uint8_t state) {
+  parsimony_chart_detail::validate_state(state, "multi-site state");
+  return active_pattern * nuc_state_count + state;
+}
+
+inline std::uint64_t checked_add_u64(std::uint64_t lhs, std::uint64_t rhs,
+                                     std::string const& label) {
+  if (lhs >= multisite_score_inf || rhs >= multisite_score_inf)
+    return multisite_score_inf;
+  if (lhs > std::numeric_limits<std::uint64_t>::max() - rhs) {
+    throw std::runtime_error("multi-site trim: uint64 overflow while adding " +
+                             label);
+  }
+  auto result = lhs + rhs;
+  return result >= multisite_score_inf ? multisite_score_inf : result;
+}
+
+inline std::uint64_t checked_mul_cost(std::uint64_t weight, chart_cost cost,
+                                      std::string const& label) {
+  if (weight == 0) return 0;
+  if (cost >= chart_inf) return multisite_score_inf;
+  if (cost > std::numeric_limits<std::uint64_t>::max() / weight) {
+    throw std::runtime_error(
+        "multi-site trim: uint64 overflow while multiplying " + label);
+  }
+  auto result = weight * static_cast<std::uint64_t>(cost);
+  return result >= multisite_score_inf ? multisite_score_inf : result;
+}
+
+inline chart_cost row_min(chart_row const& row) {
+  chart_cost best = chart_inf;
+  for (auto cost : row) best = std::min(best, cost);
+  return best;
+}
+
+inline chart_row make_inf_row() {
+  chart_row row{};
+  row.fill(chart_inf);
+  return row;
+}
+
+inline chart_row combine_binary_rows(chart_row const& left,
+                                     chart_row const& right) {
+  chart_row row = make_inf_row();
+  for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+       ++parent_state) {
+    chart_cost best_left = chart_inf;
+    chart_cost best_right = chart_inf;
+    for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+         ++child_state) {
+      best_left = std::min(
+          best_left,
+          parsimony_chart_detail::saturated_add(
+              left[child_state], parsimony_chart_detail::transition_cost(
+                                     parent_state, child_state)));
+      best_right = std::min(
+          best_right,
+          parsimony_chart_detail::saturated_add(
+              right[child_state], parsimony_chart_detail::transition_cost(
+                                      parent_state, child_state)));
+    }
+    row[parent_state] =
+        parsimony_chart_detail::saturated_add(best_left, best_right);
+  }
+  return row;
+}
+
+inline void merge_used_productions(std::vector<bool>& dst,
+                                   std::vector<bool> const& src) {
+  if (dst.size() != src.size()) {
+    throw std::runtime_error(
+        "multi-site trim: provenance vector size mismatch");
+  }
+  for (std::size_t i = 0; i < dst.size(); ++i) dst[i] = dst[i] || src[i];
+}
+
+inline bool is_active_pattern(site_pattern const& pattern) {
+  return !is_invariant_site_pattern(pattern);
+}
+
+inline void validate_pattern_reference_counts(site_pattern const& pattern,
+                                              std::size_t pattern_index) {
+  std::uint64_t sum = 0;
+  for (auto count : pattern.reference_state_counts) sum += count;
+  if (sum != pattern.weight) {
+    throw std::runtime_error(
+        "multi-site trim: reference-state counts do not sum to pattern "
+        "weight for pattern " +
+        std::to_string(pattern_index));
+  }
+}
+
+inline std::uint64_t invariant_constant_offset(site_pattern_set const& patterns,
+                                               chart_options const& options) {
+  if (!options.score_ua_edge) return 0;
+
+  std::uint64_t total = checked_add_u64(
+      0, patterns.skipped_invariant_constant_score_with_reference_edge,
+      "skipped invariant UA-edge offset");
+
+  for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+       ++pattern_index) {
+    auto const& pattern = patterns.patterns[pattern_index];
+    validate_pattern_reference_counts(pattern, pattern_index);
+    if (!is_invariant_site_pattern(pattern)) continue;
+    if (pattern.state_by_taxon.empty()) {
+      throw std::runtime_error(
+          "multi-site trim: invariant pattern has no taxa");
+    }
+    auto invariant_state = pattern.state_by_taxon.front();
+    parsimony_chart_detail::validate_state(invariant_state,
+                                           "invariant pattern state");
+    for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+         ++reference_state) {
+      auto count = pattern.reference_state_counts[reference_state];
+      if (count == 0) continue;
+      auto cost = parsimony_chart_detail::transition_cost(reference_state,
+                                                          invariant_state);
+      total = checked_add_u64(
+          total, checked_mul_cost(count, cost, "invariant UA-edge offset"),
+          "invariant UA-edge offset total");
+    }
+  }
+  return total;
+}
+
+inline std::uint64_t weighted_root_score_from_row(
+    chart_row const& row, site_pattern const& pattern,
+    chart_options const& options) {
+  if (!options.score_ua_edge) {
+    return checked_mul_cost(pattern.weight, row_min(row),
+                            "weighted topology root cost");
+  }
+
+  validate_pattern_reference_counts(pattern, 0);
+  std::uint64_t total = 0;
+  for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+       ++reference_state) {
+    auto count = pattern.reference_state_counts[reference_state];
+    if (count == 0) continue;
+    chart_cost best = chart_inf;
+    for (std::uint8_t root_state = 0; root_state < nuc_state_count;
+         ++root_state) {
+      best = std::min(
+          best, parsimony_chart_detail::saturated_add(
+                    row[root_state], parsimony_chart_detail::transition_cost(
+                                         reference_state, root_state)));
+    }
+    total = checked_add_u64(
+        total,
+        checked_mul_cost(count, best, "weighted topology root-edge cost"),
+        "weighted topology root-edge total");
+  }
+  return total;
+}
+
+struct active_pattern_info {
+  std::size_t pattern_index = no_site_pattern;
+  std::uint32_t weight = 0;
+  std::array<std::uint32_t, nuc_state_count> reference_state_counts{};
+  std::vector<std::uint8_t> state_by_taxon;
+  single_site_chart chart;
+  single_site_outside_chart outside_ua_free;
+  std::array<single_site_outside_chart, nuc_state_count> outside_by_reference;
+};
+
+inline std::vector<active_pattern_info> build_active_pattern_info(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options) {
+  std::vector<active_pattern_info> active;
+  chart_options chart_build_options = options;
+  chart_build_options.keep_trace = false;
+  chart_build_options.max_trace_choices = 0;
+
+  for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+       ++pattern_index) {
+    auto const& pattern = patterns.patterns[pattern_index];
+    if (options.score_ua_edge)
+      validate_pattern_reference_counts(pattern, pattern_index);
+    if (!is_active_pattern(pattern)) continue;
+
+    leaf_site_states states;
+    states.state_by_taxon = pattern.state_by_taxon;
+
+    active_pattern_info info;
+    info.pattern_index = pattern_index;
+    info.weight = pattern.weight;
+    info.reference_state_counts = pattern.reference_state_counts;
+    info.state_by_taxon = pattern.state_by_taxon;
+    info.chart = build_single_site_chart(grammar, states, chart_build_options);
+    if (options.score_ua_edge) {
+      for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+           ++reference_state) {
+        if (info.reference_state_counts[reference_state] == 0) continue;
+        info.outside_by_reference[reference_state] =
+            build_single_site_outside_chart(grammar, info.chart, options,
+                                            reference_state);
+      }
+    } else {
+      info.outside_ua_free =
+          build_single_site_outside_chart(grammar, info.chart, options);
+    }
+    active.push_back(std::move(info));
+  }
+  return active;
+}
+
+inline std::uint64_t lower_bound_for_entry(
+    frontier_entry const& entry, clade_id clade,
+    std::vector<active_pattern_info> const& active,
+    std::uint64_t invariant_offset, chart_options const& options) {
+  std::uint64_t total = invariant_offset;
+  if (entry.f.cost.size() != active.size() * nuc_state_count) {
+    throw std::runtime_error(
+        "multi-site trim: frontier cost vector has wrong size");
+  }
+
+  for (std::size_t active_index = 0; active_index < active.size();
+       ++active_index) {
+    auto const& info = active[active_index];
+    if (!options.score_ua_edge) {
+      if (clade >= info.outside_ua_free.outside.size()) {
+        throw std::runtime_error("multi-site trim: clade out of outside range");
+      }
+      chart_cost best = chart_inf;
+      for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+        best = std::min(best, parsimony_chart_detail::saturated_add(
+                                  entry.f.cost[cost_index(active_index, state)],
+                                  info.outside_ua_free.outside[clade][state]));
+      }
+      total = checked_add_u64(
+          total,
+          checked_mul_cost(info.weight, best,
+                           "weighted active-pattern lower bound"),
+          "active-pattern lower-bound total");
+    } else {
+      for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+           ++reference_state) {
+        auto count = info.reference_state_counts[reference_state];
+        if (count == 0) continue;
+        auto const& outside = info.outside_by_reference[reference_state];
+        if (clade >= outside.outside.size()) {
+          throw std::runtime_error(
+              "multi-site trim: clade out of reference outside range");
+        }
+        chart_cost best = chart_inf;
+        for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+          best =
+              std::min(best, parsimony_chart_detail::saturated_add(
+                                 entry.f.cost[cost_index(active_index, state)],
+                                 outside.outside[clade][state]));
+        }
+        total = checked_add_u64(
+            total,
+            checked_mul_cost(count, best,
+                             "weighted active-pattern root-edge lower "
+                             "bound"),
+            "active-pattern root-edge lower-bound total");
+      }
+    }
+  }
+  return total;
+}
+
+inline frontier_entry make_leaf_frontier_entry(
+    clade_grammar const& grammar, clade_id clade,
+    std::vector<active_pattern_info> const& active) {
+  auto const& key = grammar.clades[clade];
+  if (key.taxa.size() != 1) {
+    throw std::runtime_error(
+        "multi-site trim: leaf frontier requested for non-singleton clade");
+  }
+  auto taxon = key.taxa.front();
+  frontier_entry entry;
+  entry.f.cost.assign(active.size() * nuc_state_count, chart_inf);
+  entry.f.topology_hash = mix_hash(0x6c656166ULL, taxon);
+  entry.used_production.assign(grammar.productions.size(), false);
+
+  for (std::size_t active_index = 0; active_index < active.size();
+       ++active_index) {
+    auto const& states = active[active_index].state_by_taxon;
+    if (taxon >= states.size()) {
+      throw std::runtime_error(
+          "multi-site trim: taxon out of active pattern range");
+    }
+    auto observed = states[taxon];
+    parsimony_chart_detail::validate_state(observed, "leaf observed state");
+    for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+      entry.f.cost[cost_index(active_index, state)] =
+          state == observed ? chart_cost{0} : chart_inf;
+    }
+  }
+  return entry;
+}
+
+inline frontier_entry combine_frontier_entries(
+    clade_grammar const& grammar, grammar_production const& prod,
+    production_id pid, frontier_entry const& left, frontier_entry const& right,
+    std::size_t active_pattern_count) {
+  if (prod.children.size() != 2) {
+    throw std::runtime_error(
+        "multi-site trim: parent combine supports binary productions only");
+  }
+  auto expected_size = active_pattern_count * nuc_state_count;
+  if (left.f.cost.size() != expected_size ||
+      right.f.cost.size() != expected_size) {
+    throw std::runtime_error(
+        "multi-site trim: child frontier cost vector has wrong size");
+  }
+  if (left.used_production.size() != grammar.productions.size() ||
+      right.used_production.size() != grammar.productions.size()) {
+    throw std::runtime_error(
+        "multi-site trim: child provenance vector has wrong size");
+  }
+
+  frontier_entry candidate;
+  candidate.f.cost.assign(expected_size, chart_inf);
+  candidate.f.topology_hash =
+      mix_hash(mix_hash(mix_hash(0x70726f64ULL, pid), left.f.topology_hash),
+               right.f.topology_hash);
+  candidate.used_production = left.used_production;
+  merge_used_productions(candidate.used_production, right.used_production);
+  if (pid == no_production || pid >= grammar.productions.size()) {
+    throw std::runtime_error("multi-site trim: production id out of range");
+  }
+  candidate.used_production[pid] = true;
+
+  for (std::size_t active_index = 0; active_index < active_pattern_count;
+       ++active_index) {
+    for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+         ++parent_state) {
+      chart_cost best_left = chart_inf;
+      chart_cost best_right = chart_inf;
+      for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+           ++child_state) {
+        best_left = std::min(
+            best_left, parsimony_chart_detail::saturated_add(
+                           left.f.cost[cost_index(active_index, child_state)],
+                           parsimony_chart_detail::transition_cost(
+                               parent_state, child_state)));
+        best_right = std::min(
+            best_right, parsimony_chart_detail::saturated_add(
+                            right.f.cost[cost_index(active_index, child_state)],
+                            parsimony_chart_detail::transition_cost(
+                                parent_state, child_state)));
+      }
+      candidate.f.cost[cost_index(active_index, parent_state)] =
+          parsimony_chart_detail::saturated_add(best_left, best_right);
+    }
+  }
+  return candidate;
+}
+
+inline bool dominates(multisite_cost_function const& lhs,
+                      multisite_cost_function const& rhs) {
+  if (lhs.cost.size() != rhs.cost.size()) {
+    throw std::runtime_error(
+        "multi-site trim: dominance cost vector size mismatch");
+  }
+  for (std::size_t i = 0; i < lhs.cost.size(); ++i) {
+    if (lhs.cost[i] > rhs.cost[i]) return false;
+  }
+  return true;
+}
+
+inline void apply_dominance_pruning(std::vector<frontier_entry>& entries,
+                                    std::size_t& dominance_pruned) {
+  std::vector<bool> remove(entries.size(), false);
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (remove[i]) continue;
+    for (std::size_t j = 0; j < entries.size(); ++j) {
+      if (i == j || remove[j]) continue;
+      if (entries[i].f.cost == entries[j].f.cost) continue;
+      if (dominates(entries[i].f, entries[j].f)) {
+        merge_used_productions(entries[i].used_production,
+                               entries[j].used_production);
+        remove[j] = true;
+        ++dominance_pruned;
+      }
+    }
+  }
+
+  std::vector<frontier_entry> kept;
+  kept.reserve(entries.size());
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (!remove[i]) kept.push_back(std::move(entries[i]));
+  }
+  entries = std::move(kept);
+}
+
+inline void insert_or_merge_frontier_entry(
+    std::vector<frontier_entry>& entries,
+    std::unordered_map<std::vector<chart_cost>, std::size_t,
+                       chart_cost_vector_hash>& index_by_cost,
+    frontier_entry candidate, std::size_t& equality_deduplicated) {
+  auto found = index_by_cost.find(candidate.f.cost);
+  if (found != index_by_cost.end()) {
+    merge_used_productions(entries[found->second].used_production,
+                           candidate.used_production);
+    entries[found->second].f.topology_hash = mix_hash(
+        entries[found->second].f.topology_hash, candidate.f.topology_hash);
+    ++equality_deduplicated;
+    return;
+  }
+  auto entry_index = entries.size();
+  auto [_, inserted] = index_by_cost.emplace(candidate.f.cost, entry_index);
+  (void)_;
+  (void)inserted;
+  entries.push_back(std::move(candidate));
+}
+
+struct selected_topology {
+  std::vector<production_id> selected_production_by_clade;
+  std::vector<bool> used_production;
+};
+
+inline selected_topology empty_selected_topology(clade_grammar const& grammar) {
+  selected_topology topo;
+  topo.selected_production_by_clade.assign(grammar.clades.size(),
+                                           no_production);
+  topo.used_production.assign(grammar.productions.size(), false);
+  return topo;
+}
+
+inline void fill_first_topology(clade_grammar const& grammar, clade_id clade,
+                                selected_topology& topo) {
+  if (grammar.clades[clade].taxa.size() == 1) return;
+  auto const& productions = grammar.productions_by_parent[clade];
+  if (productions.empty()) {
+    throw std::runtime_error(
+        "multi-site trim: non-singleton clade has no productions");
+  }
+  auto pid = productions.front();
+  auto const& prod = grammar.productions[pid];
+  chart_trim_detail::validate_binary_production_for_trim(grammar, prod, pid);
+  topo.selected_production_by_clade[clade] = pid;
+  topo.used_production[pid] = true;
+  for (auto child : prod.children) fill_first_topology(grammar, child, topo);
+}
+
+inline selected_topology first_topology(clade_grammar const& grammar) {
+  auto topo = empty_selected_topology(grammar);
+  fill_first_topology(grammar, grammar.root_clade, topo);
+  return topo;
+}
+
+inline selected_topology topology_from_traceback(
+    clade_grammar const& grammar, chart_traceback_result const& trace) {
+  auto topo = empty_selected_topology(grammar);
+  for (auto pid : trace.productions) {
+    if (pid == no_production || pid >= grammar.productions.size()) {
+      throw std::runtime_error(
+          "multi-site trim: traceback production id out of range");
+    }
+    auto parent = grammar.productions[pid].parent;
+    if (parent == no_clade || parent >= grammar.clades.size()) {
+      throw std::runtime_error(
+          "multi-site trim: traceback production parent out of range");
+    }
+    if (topo.selected_production_by_clade[parent] != no_production &&
+        topo.selected_production_by_clade[parent] != pid) {
+      throw std::runtime_error(
+          "multi-site trim: traceback has conflicting production choices");
+    }
+    topo.selected_production_by_clade[parent] = pid;
+    topo.used_production[pid] = true;
+  }
+  return topo;
+}
+
+inline chart_row restricted_topology_row_impl(
+    clade_grammar const& grammar, site_pattern const& pattern,
+    selected_topology const& topo, clade_id clade,
+    std::vector<std::optional<chart_row>>& memo) {
+  if (memo[clade].has_value()) return *memo[clade];
+
+  chart_row row = make_inf_row();
+  auto const& key = grammar.clades[clade];
+  if (key.taxa.size() == 1) {
+    auto taxon = key.taxa.front();
+    if (taxon >= pattern.state_by_taxon.size()) {
+      throw std::runtime_error(
+          "multi-site trim: taxon out of site-pattern range");
+    }
+    auto observed = pattern.state_by_taxon[taxon];
+    parsimony_chart_detail::validate_state(observed,
+                                           "restricted topology leaf state");
+    row[observed] = 0;
+  } else {
+    auto pid = topo.selected_production_by_clade[clade];
+    if (pid == no_production || pid >= grammar.productions.size()) {
+      throw std::runtime_error(
+          "multi-site trim: selected topology missing production for clade");
+    }
+    auto const& prod = grammar.productions[pid];
+    if (prod.parent != clade) {
+      throw std::runtime_error(
+          "multi-site trim: selected production parent mismatch");
+    }
+    chart_trim_detail::validate_binary_production_for_trim(grammar, prod, pid);
+    auto left = restricted_topology_row_impl(grammar, pattern, topo,
+                                             prod.children[0], memo);
+    auto right = restricted_topology_row_impl(grammar, pattern, topo,
+                                              prod.children[1], memo);
+    row = combine_binary_rows(left, right);
+  }
+
+  memo[clade] = row;
+  return row;
+}
+
+inline chart_row restricted_topology_row(clade_grammar const& grammar,
+                                         site_pattern const& pattern,
+                                         selected_topology const& topo) {
+  std::vector<std::optional<chart_row>> memo(grammar.clades.size());
+  return restricted_topology_row_impl(grammar, pattern, topo,
+                                      grammar.root_clade, memo);
+}
+
+inline std::uint64_t score_selected_topology(clade_grammar const& grammar,
+                                             site_pattern_set const& patterns,
+                                             selected_topology const& topo,
+                                             chart_options const& options) {
+  std::uint64_t total = invariant_constant_offset(patterns, options);
+  for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+       ++pattern_index) {
+    auto const& pattern = patterns.patterns[pattern_index];
+    if (options.score_ua_edge)
+      validate_pattern_reference_counts(pattern, pattern_index);
+    if (!is_active_pattern(pattern)) continue;
+    auto row = restricted_topology_row(grammar, pattern, topo);
+    total = checked_add_u64(total,
+                            weighted_root_score_from_row(row, pattern, options),
+                            "selected topology score");
+  }
+  return total;
+}
+
+inline std::uint64_t initial_upper_bound(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    std::vector<active_pattern_info> const& active,
+    chart_options const& options) {
+  std::uint64_t best = multisite_score_inf;
+  auto first = first_topology(grammar);
+  best = std::min(best,
+                  score_selected_topology(grammar, patterns, first, options));
+
+  for (auto const& info : active) {
+    single_site_outside_chart const* outside = nullptr;
+    if (options.score_ua_edge) {
+      for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+           ++reference_state) {
+        if (info.reference_state_counts[reference_state] != 0) {
+          outside = &info.outside_by_reference[reference_state];
+          break;
+        }
+      }
+    } else {
+      outside = &info.outside_ua_free;
+    }
+    if (outside == nullptr) continue;
+    auto trace = deterministic_optimal_single_site_traceback(
+        grammar, info.chart, *outside);
+    auto topo = topology_from_traceback(grammar, trace);
+    best = std::min(best,
+                    score_selected_topology(grammar, patterns, topo, options));
+  }
+  return best;
+}
+
+inline std::vector<selected_topology> enumerate_topologies(
+    clade_grammar const& grammar, clade_id clade, std::size_t max_topologies) {
+  if (grammar.clades[clade].taxa.size() == 1) {
+    return {empty_selected_topology(grammar)};
+  }
+
+  std::vector<selected_topology> result;
+  for (auto pid : grammar.productions_by_parent[clade]) {
+    auto const& prod = grammar.productions[pid];
+    chart_trim_detail::validate_binary_production_for_trim(grammar, prod, pid);
+    auto left_topologies =
+        enumerate_topologies(grammar, prod.children[0], max_topologies);
+    auto right_topologies =
+        enumerate_topologies(grammar, prod.children[1], max_topologies);
+    for (auto const& left : left_topologies) {
+      for (auto const& right : right_topologies) {
+        if (max_topologies != 0 && result.size() >= max_topologies) {
+          throw std::runtime_error(
+              "multi-site trim: brute-force topology cap exceeded");
+        }
+        auto topo = empty_selected_topology(grammar);
+        for (std::size_t cid = 0; cid < grammar.clades.size(); ++cid) {
+          auto lpid = left.selected_production_by_clade[cid];
+          auto rpid = right.selected_production_by_clade[cid];
+          if (lpid != no_production)
+            topo.selected_production_by_clade[cid] = lpid;
+          if (rpid != no_production) {
+            if (topo.selected_production_by_clade[cid] != no_production &&
+                topo.selected_production_by_clade[cid] != rpid) {
+              throw std::runtime_error(
+                  "multi-site trim: incompatible child topology choices");
+            }
+            topo.selected_production_by_clade[cid] = rpid;
+          }
+        }
+        topo.used_production = left.used_production;
+        merge_used_productions(topo.used_production, right.used_production);
+        topo.selected_production_by_clade[clade] = pid;
+        topo.used_production[pid] = true;
+        result.push_back(std::move(topo));
+      }
+    }
+  }
+  return result;
+}
+
+inline void validate_multisite_inputs(clade_grammar const& grammar,
+                                      site_pattern_set const& patterns,
+                                      chart_options const& options) {
+  parsimony_chart_detail::validate_chart_grammar(grammar);
+  chart_trim_detail::validate_production_indices(grammar);
+  if (grammar.root_clade == no_clade ||
+      grammar.root_clade >= grammar.clades.size()) {
+    throw std::runtime_error("multi-site trim: root clade out of range");
+  }
+  for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+       ++pattern_index) {
+    auto const& pattern = patterns.patterns[pattern_index];
+    if (pattern.state_by_taxon.size() != grammar.taxa.id_to_sample_id.size()) {
+      throw std::runtime_error(
+          "multi-site trim: site-pattern taxon count mismatch");
+    }
+    for (auto state : pattern.state_by_taxon) {
+      parsimony_chart_detail::validate_state(state, "site-pattern state");
+    }
+    if (options.score_ua_edge)
+      validate_pattern_reference_counts(pattern, pattern_index);
+  }
+}
+
+}  // namespace chart_multisite_detail
+
+inline composite_chart_score build_composite_chart_score(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options = {}) {
+  chart_multisite_detail::validate_multisite_inputs(grammar, patterns, options);
+
+  composite_chart_score result;
+  result.per_pattern_root_min.reserve(patterns.patterns.size());
+  result.per_pattern_root_min_by_reference_state.reserve(
+      patterns.patterns.size());
+  chart_options chart_build_options = options;
+  chart_build_options.keep_trace = false;
+  chart_build_options.max_trace_choices = 0;
+
+  std::uint64_t total = 0;
+  for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+       ++pattern_index) {
+    auto const& pattern = patterns.patterns[pattern_index];
+    leaf_site_states states;
+    states.state_by_taxon = pattern.state_by_taxon;
+    auto chart = build_single_site_chart(grammar, states, chart_build_options);
+
+    std::array<chart_cost, nuc_state_count> by_reference{};
+    by_reference.fill(chart_inf);
+    chart_cost diagnostic_min = chart_inf;
+    if (!options.score_ua_edge) {
+      diagnostic_min = chart.root_min_excluding_ua(grammar.root_clade);
+      by_reference.fill(diagnostic_min);
+      total = chart_multisite_detail::checked_add_u64(
+          total,
+          chart_multisite_detail::checked_mul_cost(
+              pattern.weight, diagnostic_min, "composite weighted root cost"),
+          "composite lower bound");
+    } else {
+      for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+           ++reference_state) {
+        auto count = pattern.reference_state_counts[reference_state];
+        if (count == 0) continue;
+        auto cost = chart.root_min_with_reference_edge(grammar.root_clade,
+                                                       reference_state);
+        by_reference[reference_state] = cost;
+        diagnostic_min = std::min(diagnostic_min, cost);
+        total = chart_multisite_detail::checked_add_u64(
+            total,
+            chart_multisite_detail::checked_mul_cost(
+                count, cost, "composite weighted root-edge cost"),
+            "composite root-edge lower bound");
+      }
+    }
+    result.per_pattern_root_min.push_back(diagnostic_min);
+    result.per_pattern_root_min_by_reference_state.push_back(by_reference);
+  }
+
+  if (options.score_ua_edge) {
+    total = chart_multisite_detail::checked_add_u64(
+        total, patterns.skipped_invariant_constant_score_with_reference_edge,
+        "composite skipped invariant UA-edge offset");
+  }
+  result.weighted_lower_bound = total;
+  return result;
+}
+
+inline multisite_bruteforce_result brute_force_multisite_topologies(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options = {}, std::size_t max_topologies = 100000) {
+  using namespace chart_multisite_detail;
+  validate_multisite_inputs(grammar, patterns, options);
+
+  multisite_bruteforce_result result;
+  result.keep_production.assign(grammar.productions.size(), false);
+
+  auto topologies =
+      enumerate_topologies(grammar, grammar.root_clade, max_topologies);
+  result.topology_count = topologies.size();
+  for (auto const& topo : topologies) {
+    auto score = score_selected_topology(grammar, patterns, topo, options);
+    if (score < result.optimum) {
+      result.optimum = score;
+      std::fill(result.keep_production.begin(), result.keep_production.end(),
+                false);
+    }
+    if (score == result.optimum) {
+      merge_used_productions(result.keep_production, topo.used_production);
+    }
+  }
+  return result;
+}
+
+inline multisite_trim_result build_multisite_trim(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options = {},
+    multisite_trim_options const& trim_options = {}) {
+  using namespace chart_multisite_detail;
+  validate_multisite_inputs(grammar, patterns, options);
+
+  multisite_trim_result result;
+  auto composite = build_composite_chart_score(grammar, patterns, options);
+  result.composite_lower_bound = composite.weighted_lower_bound;
+  result.keep_production.assign(grammar.productions.size(), false);
+  result.frontier_sizes_by_clade.assign(grammar.clades.size(), 0);
+  result.invariant_constant_offset =
+      invariant_constant_offset(patterns, options);
+
+  auto active = build_active_pattern_info(grammar, patterns, options);
+  result.active_pattern_count = active.size();
+  result.initial_upper_bound =
+      initial_upper_bound(grammar, patterns, active, options);
+
+  std::vector<clade_id> order(grammar.clades.size());
+  std::iota(order.begin(), order.end(), clade_id{0});
+  std::stable_sort(order.begin(), order.end(), [&](clade_id lhs, clade_id rhs) {
+    auto lsize = grammar.clades[lhs].taxa.size();
+    auto rsize = grammar.clades[rhs].taxa.size();
+    if (lsize != rsize) return lsize < rsize;
+    return lhs < rhs;
+  });
+
+  std::vector<std::vector<frontier_entry>> frontiers(grammar.clades.size());
+  for (auto clade : order) {
+    auto const& key = grammar.clades[clade];
+    if (key.taxa.size() == 1) {
+      frontiers[clade].push_back(
+          make_leaf_frontier_entry(grammar, clade, active));
+      result.frontier_sizes_by_clade[clade] = frontiers[clade].size();
+      continue;
+    }
+
+    std::unordered_map<std::vector<chart_cost>, std::size_t,
+                       chart_cost_vector_hash>
+        index_by_cost;
+    auto& entries = frontiers[clade];
+    for (auto pid : grammar.productions_by_parent[clade]) {
+      auto const& prod = grammar.productions[pid];
+      if (prod.parent != clade) {
+        throw std::runtime_error(
+            "multi-site trim: production parent mismatch during frontier "
+            "construction");
+      }
+      chart_trim_detail::validate_binary_production_for_trim(grammar, prod,
+                                                             pid);
+      auto left_child = prod.children[0];
+      auto right_child = prod.children[1];
+      if (left_child >= frontiers.size() || right_child >= frontiers.size()) {
+        throw std::runtime_error(
+            "multi-site trim: production child out of frontier range");
+      }
+      for (auto const& left : frontiers[left_child]) {
+        for (auto const& right : frontiers[right_child]) {
+          auto candidate = combine_frontier_entries(grammar, prod, pid, left,
+                                                    right, active.size());
+          if (trim_options.use_bound_pruning &&
+              result.initial_upper_bound < multisite_score_inf) {
+            auto lb = lower_bound_for_entry(candidate, clade, active,
+                                            result.invariant_constant_offset,
+                                            options);
+            if (lb > result.initial_upper_bound) {
+              ++result.bound_pruned;
+              continue;
+            }
+          }
+          insert_or_merge_frontier_entry(entries, index_by_cost,
+                                         std::move(candidate),
+                                         result.equality_deduplicated);
+        }
+      }
+    }
+
+    if (trim_options.max_frontier_entries_per_clade != 0 &&
+        entries.size() > trim_options.max_frontier_entries_per_clade) {
+      throw std::runtime_error(
+          "multi-site trim: frontier entry cap exceeded for clade " +
+          std::to_string(clade));
+    }
+    // Bound pruning can empty a non-root clade frontier when every topology
+    // using that clade is already provably worse than the current feasible
+    // upper bound.  Parent combinations that depend on it simply generate no
+    // candidates.  The root frontier is checked after the pass.
+    result.frontier_sizes_by_clade[clade] = entries.size();
+  }
+
+  auto const& root_frontier = frontiers[grammar.root_clade];
+  if (root_frontier.empty()) {
+    throw std::runtime_error("multi-site trim: empty root frontier");
+  }
+
+  for (auto const& entry : root_frontier) {
+    auto score =
+        lower_bound_for_entry(entry, grammar.root_clade, active,
+                              result.invariant_constant_offset, options);
+    if (score < result.optimum) {
+      result.optimum = score;
+      std::fill(result.keep_production.begin(), result.keep_production.end(),
+                false);
+    }
+    if (score == result.optimum) {
+      merge_used_productions(result.keep_production, entry.used_production);
+    }
+  }
+  return result;
 }
 
 }  // namespace larch
