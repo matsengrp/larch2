@@ -521,7 +521,7 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   nn_ml_spr_test nn_blended_spr_test
                   inplace_spr_test wric_phase0_test clade_grammar_test
                   parsimony_chart_test site_patterns_test chart_trim_test
-                  chart_spr_test plateau_test)
+                  chart_spr_test plateau_test rank3_rewrite_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
     add_test(NAME ${test_name} COMMAND ${test_name}
