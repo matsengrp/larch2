@@ -1,8 +1,9 @@
 // rotaA_diagnostic_test.cpp — Diagnostic test suite for the rotavirusA
 // 1-step parsimony score gap (larch2#33).
 //
-// Requires repro data directory set via ROTAA_REPRO_DIR env var
-// (default: ~/Downloads/larch2-rotaA-repro/larch2-rotaA-repro).
+// Requires repro data directory set via ROTAA_REPRO_DIR env var.
+// The test exits 77 (CTest skip) when the external repro data is not
+// explicitly requested, keeping the default sanitizer suite self-contained.
 //
 // Experiments:
 //   1. Fragment ground-truth audit (H1/H3: scoring bugs)
@@ -33,15 +34,17 @@ using namespace larch;
 // ---------------------------------------------------------------------------
 
 static std::string get_repro_dir() {
-  if (auto* env = std::getenv("ROTAA_REPRO_DIR")) return env;
-  // Default location
-  if (auto* home = std::getenv("HOME")) {
-    auto p = std::filesystem::path{home} /
-             "Downloads/larch2-rotaA-repro/larch2-rotaA-repro";
+  auto* env = std::getenv("ROTAA_REPRO_DIR");
+  if (env != nullptr && *env != '\0') {
+    std::filesystem::path p{env};
     if (std::filesystem::exists(p)) return p.string();
+    std::println(stderr, "SKIP: ROTAA_REPRO_DIR does not exist: {}", p.string());
+    std::exit(77);
   }
-  std::println(stderr, "error: set ROTAA_REPRO_DIR to the repro data directory");
-  std::exit(1);
+
+  std::println(stderr,
+               "SKIP: set ROTAA_REPRO_DIR to run rotaA external-data diagnostics");
+  std::exit(77);
 }
 
 static std::size_t count_tree_mutations(phylo_dag& tree) {
