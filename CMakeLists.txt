@@ -520,7 +520,7 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   rs_fivemer_model_test nn_cnn_test nn_s5f_test
                   nn_ml_spr_test nn_blended_spr_test
                   inplace_spr_test wric_phase0_test clade_grammar_test
-                  parsimony_chart_test site_patterns_test)
+                  parsimony_chart_test site_patterns_test chart_trim_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
     add_test(NAME ${test_name} COMMAND ${test_name}
