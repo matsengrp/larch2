@@ -32,6 +32,15 @@ static larch::test::tiny_tree_node four_taxon_base_tree() {
        tiny_inner("CD", "C", {tiny_leaf("C", "C"), tiny_leaf("D", "C")})});
 }
 
+static larch::test::tiny_tree_node four_taxon_alt_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AC", "A", {tiny_leaf("A", "A"), tiny_leaf("C", "C")}),
+       tiny_inner("BD", "A", {tiny_leaf("B", "A"), tiny_leaf("D", "C")})});
+}
+
 static larch::taxon_id taxon_for(larch::clade_grammar const& grammar,
                                  std::string const& sample_id) {
   auto it = grammar.taxa.sample_id_to_id.find(sample_id);
@@ -72,6 +81,23 @@ static larch::production_id production_id_for(
   }
   CHECK(false && "missing production");
   return larch::no_production;
+}
+
+static std::size_t leaf_node_for(larch::phylo_dag& dag,
+                                 std::string const& sample_id) {
+  for (auto nv : dag.get_all_nodes()) {
+    std::optional<std::size_t> found;
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.sample_id(); }) {
+            if (node.sample_id() == sample_id) found = node.index();
+          }
+        },
+        nv);
+    if (found) return *found;
+  }
+  CHECK(false && "missing leaf node");
+  return 0;
 }
 
 static std::set<std::string> production_shape(larch::clade_grammar const& grammar) {
@@ -331,6 +357,174 @@ static void test_score_ua_edge_true_single_site_overload() {
   std::println("  PASS");
 }
 
+static void test_option_b_stages_overlay_without_mutating_source() {
+  std::println("test_option_b_stages_overlay_without_mutating_source");
+
+  auto dag = larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
+  auto before_grammar = larch::build_clade_grammar(dag);
+  auto before_shape = production_shape(before_grammar);
+  auto before_nodes = larch::node_count(dag);
+  auto before_edges = larch::edge_count(dag);
+  auto src = leaf_node_for(dag, "A");
+  auto dst = leaf_node_for(dag, "D");
+  larch::spr_move move{.src = src,
+                       .dst = dst,
+                       .lca = larch::compute_lca(dag, src, dst),
+                       .score_change = std::nullopt};
+
+  auto stage = larch::stage_rank3_option_b_overlay(dag, move);
+  CHECK(stage.fragment_root != larch::no_idx);
+  CHECK(larch::node_count(dag) == before_nodes);
+  CHECK(larch::edge_count(dag) == before_edges);
+  auto still_before = larch::build_clade_grammar(dag);
+  CHECK(production_shape(still_before) == before_shape);
+
+  auto overlay_tree = larch::materialize_rank3_option_b_overlay_tree(stage);
+  auto overlay_grammar = larch::build_clade_grammar(overlay_tree);
+  auto after_tree = larch::apply_spr_move(dag, src, dst);
+  auto after_grammar = larch::build_clade_grammar(after_tree);
+  CHECK(production_shape(overlay_grammar) == production_shape(after_grammar));
+
+  std::println("  PASS");
+}
+
+static void test_option_b_projected_candidate_materializes_replacement() {
+  std::println("test_option_b_projected_candidate_materializes_replacement");
+
+  auto dag = larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
+  auto base_grammar = larch::build_clade_grammar(dag);
+  auto src = leaf_node_for(dag, "A");
+  auto dst = leaf_node_for(dag, "D");
+  larch::spr_move move{.src = src,
+                       .dst = dst,
+                       .lca = larch::compute_lca(dag, src, dst),
+                       .score_change = std::nullopt};
+  auto candidate = larch::project_tree_spr_move_to_candidate(base_grammar, dag,
+                                                             move);
+  CHECK(candidate.has_value());
+
+  larch::rank3_option_b_options options;
+  options.include_original_dag = false;
+  auto result = larch::materialize_rank3_option_b(dag, base_grammar,
+                                                  *candidate, options);
+  CHECK(result.staged_in_overlay);
+  CHECK(result.used_source_tree_move);
+  CHECK(result.materialized_tree_count == 1);
+  CHECK(result.all_intended_productions_present());
+  CHECK(has_clade(result.rebuilt.grammar, {"A", "D"}));
+  CHECK(has_clade(result.rebuilt.grammar, {"A", "C", "D"}));
+  CHECK(!has_clade(result.rebuilt.grammar, {"A", "B"}));
+  CHECK(!has_clade(result.rebuilt.grammar, {"C", "D"}));
+
+  std::println("  PASS");
+}
+
+static void test_option_b_requires_projected_source_move() {
+  std::println("test_option_b_requires_projected_source_move");
+
+  auto dag = larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
+  auto base_grammar = larch::build_clade_grammar(dag);
+  auto candidate = cross_candidate(base_grammar);
+
+  bool threw = false;
+  try {
+    (void)larch::materialize_rank3_option_b(dag, base_grammar, candidate);
+  } catch (std::runtime_error const&) {
+    threw = true;
+  }
+  CHECK(threw);
+
+  std::println("  PASS");
+}
+
+static void test_option_b_added_edge_weights_do_not_lower_existing_weights() {
+  std::println("test_option_b_added_edge_weights_do_not_lower_existing_weights");
+
+  auto dag = larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
+  set_all_edge_weights(dag, 7.0f);
+  auto base_grammar = larch::build_clade_grammar(dag);
+  auto src = leaf_node_for(dag, "A");
+  auto dst = leaf_node_for(dag, "D");
+  larch::spr_move move{.src = src,
+                       .dst = dst,
+                       .lca = larch::compute_lca(dag, src, dst),
+                       .score_change = std::nullopt};
+  auto candidate = larch::project_tree_spr_move_to_candidate(base_grammar, dag,
+                                                             move);
+  CHECK(candidate.has_value());
+
+  auto result = larch::materialize_rank3_option_b(dag, base_grammar,
+                                                  *candidate);
+  CHECK(result.all_intended_productions_present());
+  CHECK(min_edge_weight(result.dag) == 7.0);
+
+  std::println("  PASS");
+}
+
+static void test_option_b_accepts_collapsed_dag_base_grammar() {
+  std::println("test_option_b_accepts_collapsed_dag_base_grammar");
+
+  auto source_tree = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_base_tree());
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_base_tree()));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_alt_tree()));
+  auto base_dag = larch::test::merge_tiny_trees(trees);
+  auto base_grammar = larch::build_clade_grammar(base_dag);
+  CHECK(base_grammar.productions.size() >
+        larch::build_clade_grammar(source_tree).productions.size());
+
+  auto src = leaf_node_for(source_tree, "A");
+  auto dst = leaf_node_for(source_tree, "D");
+  larch::spr_move move{.src = src,
+                       .dst = dst,
+                       .lca = larch::compute_lca(source_tree, src, dst),
+                       .score_change = std::nullopt};
+  auto candidate = larch::project_tree_spr_move_to_candidate(
+      base_grammar, source_tree, move);
+  CHECK(candidate.has_value());
+
+  larch::rank3_option_b_options options;
+  options.include_original_dag = false;
+  auto result = larch::materialize_rank3_option_b(
+      source_tree, base_grammar, *candidate, options);
+  CHECK(result.all_intended_productions_present());
+  CHECK(has_clade(result.rebuilt.grammar, {"A", "D"}));
+  CHECK(has_clade(result.rebuilt.grammar, {"A", "C", "D"}));
+
+  std::println("  PASS");
+}
+
+static void test_option_b_rejects_stale_projected_candidate() {
+  std::println("test_option_b_rejects_stale_projected_candidate");
+
+  auto dag = larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
+  auto base_grammar = larch::build_clade_grammar(dag);
+  auto src = leaf_node_for(dag, "A");
+  auto dst = leaf_node_for(dag, "D");
+  larch::spr_move move{.src = src,
+                       .dst = dst,
+                       .lca = larch::compute_lca(dag, src, dst),
+                       .score_change = std::nullopt};
+  auto candidate = larch::project_tree_spr_move_to_candidate(base_grammar, dag,
+                                                             move);
+  CHECK(candidate.has_value());
+  candidate->new_sibling_or_target =
+      larch::base_clade_ref(clade_for(base_grammar, {"C"}));
+
+  bool threw = false;
+  try {
+    (void)larch::stage_rank3_option_b_overlay(dag, base_grammar, *candidate);
+  } catch (std::runtime_error const&) {
+    threw = true;
+  }
+  CHECK(threw);
+
+  std::println("  PASS");
+}
+
 static void test_invalid_unreachable_used_production_rejected() {
   std::println("test_invalid_unreachable_used_production_rejected");
 
@@ -366,6 +560,12 @@ int main() {
   test_generated_edge_weights_do_not_lower_existing_weights();
   test_include_original_false_replaces_with_generated_tree();
   test_score_ua_edge_true_single_site_overload();
+  test_option_b_stages_overlay_without_mutating_source();
+  test_option_b_projected_candidate_materializes_replacement();
+  test_option_b_requires_projected_source_move();
+  test_option_b_added_edge_weights_do_not_lower_existing_weights();
+  test_option_b_accepts_collapsed_dag_base_grammar();
+  test_option_b_rejects_stale_projected_candidate();
   test_invalid_unreachable_used_production_rejected();
   std::println("rank3_rewrite_test PASS");
   return 0;
