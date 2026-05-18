@@ -16,6 +16,7 @@
 #include <larch/pmr_arena.hpp>
 #include <larch/io_util.hpp>
 #include <larch/newick.hpp>
+#include <larch/clade_grammar.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -202,6 +203,8 @@ Notes:
 
 Analysis:
   --dag-info              Print all DAG statistics (tree count, parsimony, RF)
+  --wric-audit            Build collapsed clade grammar and print multiplicity
+                          diagnostics (allows polytomies for audit only)
   --parsimony             Print parsimony score distribution
   --sum-rf-distance       Print sum RF distance distribution
   --edge-parsimony        Compute per-edge parsimony penalties (store in output;
@@ -245,6 +248,7 @@ struct args {
   bool edge_parsimony = false;
   bool edge_ml = false;
   bool validate = false;
+  bool wric_audit = false;
 };
 
 static bool has_any_model_arg(args const& a) {
@@ -318,6 +322,8 @@ static args parse_args(int argc, char** argv) {
     } else if (arg == "--sum-rf-distance") {
       a.dag_info = true;
       a.print_rf_distance = true;
+    } else if (arg == "--wric-audit") {
+      a.wric_audit = true;
     } else if (arg == "--edge-parsimony")
       a.edge_parsimony = true;
     else if (arg == "--edge-ml" || arg == "--edge-thrifty")
@@ -499,6 +505,13 @@ int main(int argc, char** argv) try {
   }
 
   // ---- Analysis ----
+  if (a.wric_audit) {
+    clade_grammar_options grammar_opts;
+    grammar_opts.allow_polytomies = true;
+    auto built = build_clade_grammar_with_audit(result, grammar_opts);
+    print_clade_grammar_audit(std::cout, built.audit);
+  }
+
   if (a.dag_info) {
     tree_count_ops tc_ops;
     subtree_weight<tree_count_ops> tc_sw(result, a.seed);
