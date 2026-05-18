@@ -21,9 +21,11 @@ class compact_genome {
     for (auto [pos, base] : mutations) {
       result ^= std::hash<std::size_t>{}(pos) + 0x9e3779b9 + (result << 6) +
                 (result >> 2);
-      result ^=
-          std::hash<std::size_t>{}(static_cast<std::size_t>(base.to_char())) +
-          0x9e3779b9 + (result << 6) + (result >> 2);
+      // Hash the raw stored value rather than to_char(); callers such as the
+      // WRIC strict nucleotide audit must be able to construct/test invalid
+      // nuc_base values and reject them explicitly without hash-time UB.
+      result ^= std::hash<std::size_t>{}(static_cast<std::size_t>(base.raw())) +
+                0x9e3779b9 + (result << 6) + (result >> 2);
     }
     return result;
   }
