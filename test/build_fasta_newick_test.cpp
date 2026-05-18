@@ -8,6 +8,7 @@
 #include <fstream>
 #include <map>
 #include <print>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -36,6 +37,19 @@ void write_text(std::filesystem::path const& path, std::string_view contents) {
   std::ofstream out{path};
   out << contents;
   assert(out.good());
+}
+
+void check(bool expr, std::string_view message) {
+  if (!expr) throw std::runtime_error(std::string{message});
+}
+
+bool throws_runtime_error(auto&& f) {
+  try {
+    f();
+  } catch (std::runtime_error const&) {
+    return true;
+  }
+  return false;
 }
 
 }  // namespace
@@ -85,6 +99,30 @@ TTAA
 
   auto const real_root_idx = get_non_ua_root_idx(dag);
   assert(get_child_indices(dag, real_root_idx).size() == 2);
+
+  auto const bad_fasta_path = tmp.path() / "bad_sequences.fa";
+  write_text(bad_fasta_path, R"(>A
+AANA
+>B
+AACA
+>C
+TTAA
+)");
+  check(throws_runtime_error([&] {
+          (void)build_from_fasta_newick(bad_fasta_path.string(),
+                                        newick_path.string(),
+                                        reference_path.string());
+        }),
+        "bad FASTA nucleotide should throw");
+
+  auto const bad_reference_path = tmp.path() / "bad_reference.txt";
+  write_text(bad_reference_path, "AANA\n");
+  check(throws_runtime_error([&] {
+          (void)build_from_fasta_newick(fasta_path.string(),
+                                        newick_path.string(),
+                                        bad_reference_path.string());
+        }),
+        "bad reference nucleotide should throw");
 
   std::println("build_fasta_newick test passed");
 }

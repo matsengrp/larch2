@@ -7,11 +7,55 @@
 
 #include <charconv>
 #include <map>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <string_view>
 #include <vector>
 
 namespace larch {
+
+namespace vcf_detail {
+
+inline nuc_base strict_nuc_from_char(char c, std::string_view label,
+                                     mutation_position pos) {
+  switch (c) {
+    case 'A':
+    case 'a':
+      return nuc_base{nuc_base::A};
+    case 'C':
+    case 'c':
+      return nuc_base{nuc_base::C};
+    case 'G':
+    case 'g':
+      return nuc_base{nuc_base::G};
+    case 'T':
+    case 't':
+      return nuc_base{nuc_base::T};
+    default:
+      throw std::runtime_error(std::string{"VCF: non-ACGT "} +
+                               std::string{label} + " nucleotide '" + c +
+                               "' at position " + std::to_string(pos));
+  }
+}
+
+inline void validate_reference(std::string_view reference) {
+  for (std::size_t i = 0; i < reference.size(); ++i)
+    (void)strict_nuc_from_char(reference[i], "reference", i + 1);
+}
+
+inline mutation_position parse_position(std::string_view text) {
+  std::size_t site_pos = 0;
+  auto [ptr, ec] =
+      std::from_chars(text.data(), text.data() + text.size(), site_pos);
+  if (ec != std::errc{} || ptr != text.data() + text.size() || site_pos == 0) {
+    throw std::runtime_error("VCF: invalid positive integer POS field '" +
+                             std::string{text} + "'");
+  }
+  return static_cast<mutation_position>(site_pos);
+}
+
+}  // namespace vcf_detail
 
 struct vcf_data {
   std::vector<std::string> sample_names;
@@ -19,6 +63,7 @@ struct vcf_data {
 };
 
 inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
+  vcf_detail::validate_reference(reference);
   auto bytes = read_file(path);
   std::string_view content{bytes.data(), bytes.size()};
 
@@ -84,9 +129,17 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
     if (!all_snp) continue;
 
     // Parse position (1-indexed)
-    std::size_t site_pos = 0;
-    std::from_chars(cols[1].data(), cols[1].data() + cols[1].size(), site_pos);
-    auto mpos = static_cast<mutation_position>(site_pos);
+    auto mpos = vcf_detail::parse_position(cols[1]);
+    if (mpos > reference.size()) {
+      throw std::runtime_error("VCF: POS " + std::to_string(mpos) +
+                               " outside reference length " +
+                               std::to_string(reference.size()));
+    }
+
+    (void)vcf_detail::strict_nuc_from_char(ref_allele[0], "REF allele", mpos);
+    for (auto allele : alt_alleles) {
+      (void)vcf_detail::strict_nuc_from_char(allele[0], "ALT allele", mpos);
+    }
 
     // Per-sample genotype
     for (std::size_t i = 0;
@@ -96,14 +149,17 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
       int allele_idx = 0;
       if (!gt.empty() && gt[0] >= '0' && gt[0] <= '9') allele_idx = gt[0] - '0';
 
-      nuc_base sample_base = nuc_base::from_char(ref_allele[0]);
+      nuc_base sample_base =
+          vcf_detail::strict_nuc_from_char(ref_allele[0], "REF allele", mpos);
       if (allele_idx > 0 &&
           static_cast<std::size_t>(allele_idx - 1) < alt_alleles.size()) {
-        sample_base = nuc_base::from_char(alt_alleles[allele_idx - 1][0]);
+        sample_base = vcf_detail::strict_nuc_from_char(
+            alt_alleles[allele_idx - 1][0], "ALT allele", mpos);
       }
 
       // Record mutation if different from reference
-      nuc_base ref_base = nuc_base::from_char(reference.at(mpos - 1));
+      nuc_base ref_base = vcf_detail::strict_nuc_from_char(
+          reference.at(mpos - 1), "reference", mpos);
       if (!(sample_base == ref_base)) {
         sample_muts[result.sample_names[i]][mpos] = sample_base;
       }
@@ -135,7 +191,15 @@ inline void apply_vcf_to_dag(phylo_dag& d, vcf_data const& vcf) {
             std::map<mutation_position, nuc_base> muts;
             for (auto [pos, base] : node.cg()) muts[pos] = base;
             for (auto [pos, base] : it->second) {
-              auto ref_base = nuc_base::from_char(ref.at(pos - 1));
+              if (pos == 0 || pos > ref.size()) {
+                throw std::runtime_error(
+                    "VCF: compact-genome mutation position " +
+                    std::to_string(pos) + " for sample '" +
+                    std::string{node.sample_id()} +
+                    "' outside reference length " + std::to_string(ref.size()));
+              }
+              auto ref_base = vcf_detail::strict_nuc_from_char(
+                  ref.at(pos - 1), "reference", pos);
               if (base == ref_base)
                 muts.erase(pos);
               else

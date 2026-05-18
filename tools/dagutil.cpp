@@ -17,6 +17,7 @@
 #include <larch/io_util.hpp>
 #include <larch/newick.hpp>
 #include <larch/clade_grammar.hpp>
+#include <larch/site_patterns.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -29,6 +30,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -39,6 +41,34 @@ using namespace larch;
 // ---------------------------------------------------------------------------
 // Read reference sequence from file (FASTA or raw text)
 // ---------------------------------------------------------------------------
+
+static nuc_base strict_fasta_nuc_from_char(char c, std::string_view label,
+                                           mutation_position pos) {
+  switch (c) {
+    case 'A':
+    case 'a':
+      return nuc_base{nuc_base::A};
+    case 'C':
+    case 'c':
+      return nuc_base{nuc_base::C};
+    case 'G':
+    case 'g':
+      return nuc_base{nuc_base::G};
+    case 'T':
+    case 't':
+      return nuc_base{nuc_base::T};
+    default:
+      throw std::runtime_error(std::string{"FASTA/Newick input: non-ACGT "} +
+                               std::string{label} + " nucleotide '" + c +
+                               "' at position " + std::to_string(pos));
+  }
+}
+
+static void validate_fasta_acgt_sequence(std::string_view sequence,
+                                         std::string_view label) {
+  for (std::size_t i = 0; i < sequence.size(); ++i)
+    (void)strict_fasta_nuc_from_char(sequence[i], label, i + 1);
+}
 
 static std::string read_refseq(std::string_view path) {
   auto bytes = read_file(path);
@@ -62,9 +92,15 @@ static std::string read_refseq(std::string_view path) {
 static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
                                          std::string_view newick_path,
                                          std::string const& reference) {
+  validate_fasta_acgt_sequence(reference, "reference");
+
   auto entries = read_fasta(fasta_path);
   std::unordered_map<std::string, std::string> fasta_map;
-  for (auto& e : entries) fasta_map[e.name] = std::move(e.sequence);
+  for (auto& e : entries) {
+    validate_fasta_acgt_sequence(e.sequence,
+                                 std::string{"sample '"} + e.name + "'");
+    fasta_map[e.name] = std::move(e.sequence);
+  }
 
   auto nw_bytes = read_file(newick_path);
   std::string newick_str{nw_bytes.data(), nw_bytes.size()};
@@ -147,8 +183,11 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
             std::map<mutation_position, nuc_base> muts;
             for (std::size_t i = 0; i < seq.size() && i < reference.size();
                  ++i) {
-              auto ref_base = nuc_base::from_char(reference[i]);
-              auto seq_base = nuc_base::from_char(seq[i]);
+              auto ref_base = strict_fasta_nuc_from_char(reference[i],
+                                                         "reference", i + 1);
+              auto seq_base = strict_fasta_nuc_from_char(
+                  seq[i], std::string{"sample '"} + node.sample_id() + "'",
+                  i + 1);
               if (!(ref_base == seq_base)) muts[i + 1] = seq_base;
             }
             node.cg() = compact_genome{std::move(muts)};
@@ -205,6 +244,8 @@ Analysis:
   --dag-info              Print all DAG statistics (tree count, parsimony, RF)
   --wric-audit            Build collapsed clade grammar and print multiplicity
                           diagnostics (allows polytomies for audit only)
+  --chart-pattern-info    Print exact/invariant/normalized site-pattern counts
+                          using the collapsed clade grammar taxa
   --parsimony             Print parsimony score distribution
   --sum-rf-distance       Print sum RF distance distribution
   --edge-parsimony        Compute per-edge parsimony penalties (store in output;
@@ -249,6 +290,7 @@ struct args {
   bool edge_ml = false;
   bool validate = false;
   bool wric_audit = false;
+  bool chart_pattern_info = false;
 };
 
 static bool has_any_model_arg(args const& a) {
@@ -324,6 +366,8 @@ static args parse_args(int argc, char** argv) {
       a.print_rf_distance = true;
     } else if (arg == "--wric-audit") {
       a.wric_audit = true;
+    } else if (arg == "--chart-pattern-info") {
+      a.chart_pattern_info = true;
     } else if (arg == "--edge-parsimony")
       a.edge_parsimony = true;
     else if (arg == "--edge-ml" || arg == "--edge-thrifty")
@@ -510,6 +554,16 @@ int main(int argc, char** argv) try {
     grammar_opts.allow_polytomies = true;
     auto built = build_clade_grammar_with_audit(result, grammar_opts);
     print_clade_grammar_audit(std::cout, built.audit);
+  }
+
+  if (a.chart_pattern_info) {
+    clade_grammar_options grammar_opts;
+    grammar_opts.allow_polytomies = true;
+    auto grammar = build_clade_grammar(result, grammar_opts);
+    site_pattern_options pattern_opts;
+    pattern_opts.build_normalized_binary_patterns = true;
+    auto patterns = build_site_patterns(result, grammar, pattern_opts);
+    print_site_pattern_summary(std::cout, patterns);
   }
 
   if (a.dag_info) {

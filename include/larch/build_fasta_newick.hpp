@@ -8,6 +8,7 @@
 #include <cctype>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -15,12 +16,50 @@
 
 namespace larch {
 
+namespace build_fasta_newick_detail {
+
+inline nuc_base strict_nuc_from_char(char c, std::string_view label,
+                                     mutation_position pos) {
+  switch (c) {
+    case 'A':
+    case 'a':
+      return nuc_base{nuc_base::A};
+    case 'C':
+    case 'c':
+      return nuc_base{nuc_base::C};
+    case 'G':
+    case 'g':
+      return nuc_base{nuc_base::G};
+    case 'T':
+    case 't':
+      return nuc_base{nuc_base::T};
+    default:
+      throw std::runtime_error(std::string{"FASTA/Newick builder: non-ACGT "} +
+                               std::string{label} + " nucleotide '" + c +
+                               "' at position " + std::to_string(pos));
+  }
+}
+
+inline void validate_acgt_sequence(std::string_view sequence,
+                                   std::string_view label) {
+  for (std::size_t i = 0; i < sequence.size(); ++i)
+    (void)strict_nuc_from_char(sequence[i], label, i + 1);
+}
+
+}  // namespace build_fasta_newick_detail
+
 // Build a phylo_dag tree from a pre-loaded FASTA map, a Newick file, and a
 // reference sequence string.  Assigns leaf compact genomes by diffing against
 // the reference, then runs Fitch assignment for inner nodes.
 inline phylo_dag build_from_fasta_newick(
     std::unordered_map<std::string, std::string> const& fasta_map,
     std::string_view newick_path, std::string const& reference) {
+  build_fasta_newick_detail::validate_acgt_sequence(reference, "reference");
+  for (auto const& [sample_id, sequence] : fasta_map) {
+    build_fasta_newick_detail::validate_acgt_sequence(
+        sequence, std::string{"sample '"} + sample_id + "'");
+  }
+
   // Read newick string
   auto nw_bytes = read_file(newick_path);
   std::string newick_str{nw_bytes.data(), nw_bytes.size()};
@@ -109,8 +148,11 @@ inline phylo_dag build_from_fasta_newick(
             std::map<mutation_position, nuc_base> muts;
             for (std::size_t i = 0; i < seq.size() && i < reference.size();
                  ++i) {
-              auto ref_base = nuc_base::from_char(reference[i]);
-              auto seq_base = nuc_base::from_char(seq[i]);
+              auto ref_base = build_fasta_newick_detail::strict_nuc_from_char(
+                  reference[i], "reference", i + 1);
+              auto seq_base = build_fasta_newick_detail::strict_nuc_from_char(
+                  seq[i], std::string{"sample '"} + node.sample_id() + "'",
+                  i + 1);
               if (!(ref_base == seq_base)) muts[i + 1] = seq_base;
             }
             node.cg() = compact_genome{std::move(muts)};

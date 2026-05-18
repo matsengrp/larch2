@@ -516,11 +516,11 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   weight_accum_test optimize_test native_optimize_test
                   spr_pipeline_test trim_clade_edges_test
                   rotaA_diagnostic_test
-                  pth_loader_test build_fasta_newick_test
+                  pth_loader_test build_fasta_newick_test vcf_test
                   rs_fivemer_model_test nn_cnn_test nn_s5f_test
                   nn_ml_spr_test nn_blended_spr_test
                   inplace_spr_test wric_phase0_test clade_grammar_test
-                  parsimony_chart_test)
+                  parsimony_chart_test site_patterns_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
     add_test(NAME ${test_name} COMMAND ${test_name}
