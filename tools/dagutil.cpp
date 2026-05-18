@@ -18,6 +18,7 @@
 #include <larch/newick.hpp>
 #include <larch/clade_grammar.hpp>
 #include <larch/site_patterns.hpp>
+#include <larch/plateau.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -246,6 +247,9 @@ Analysis:
                           diagnostics (allows polytomies for audit only)
   --chart-pattern-info    Print exact/invariant/normalized site-pattern counts
                           using the collapsed clade grammar taxa
+  --chart-fluidity-site <POS>
+                          Print a single-site chart trace/fluidity report
+                          (alias: --plateau-site)
   --parsimony             Print parsimony score distribution
   --sum-rf-distance       Print sum RF distance distribution
   --edge-parsimony        Compute per-edge parsimony penalties (store in output;
@@ -291,6 +295,7 @@ struct args {
   bool validate = false;
   bool wric_audit = false;
   bool chart_pattern_info = false;
+  std::optional<mutation_position> chart_fluidity_site;
 };
 
 static bool has_any_model_arg(args const& a) {
@@ -368,6 +373,14 @@ static args parse_args(int argc, char** argv) {
       a.wric_audit = true;
     } else if (arg == "--chart-pattern-info") {
       a.chart_pattern_info = true;
+    } else if (arg == "--chart-fluidity-site" || arg == "--plateau-site") {
+      auto pos =
+          static_cast<mutation_position>(std::stoull(std::string{next()}));
+      if (pos == 0) {
+        std::cerr << "error: chart fluidity site positions are 1-based\n";
+        std::exit(1);
+      }
+      a.chart_fluidity_site = pos;
     } else if (arg == "--edge-parsimony")
       a.edge_parsimony = true;
     else if (arg == "--edge-ml" || arg == "--edge-thrifty")
@@ -564,6 +577,19 @@ int main(int argc, char** argv) try {
     pattern_opts.build_normalized_binary_patterns = true;
     auto patterns = build_site_patterns(result, grammar, pattern_opts);
     print_site_pattern_summary(std::cout, patterns);
+  }
+
+  if (a.chart_fluidity_site) {
+    auto grammar = build_clade_grammar(result);
+    auto states =
+        extract_leaf_site_states(result, grammar, *a.chart_fluidity_site);
+    chart_options chart_opts;
+    chart_opts.keep_trace = true;
+    auto chart = build_single_site_chart(grammar, states, chart_opts);
+    auto outside = build_single_site_outside_chart(grammar, chart);
+    auto report = build_single_site_fluidity_report(grammar, chart, outside);
+    std::cout << "chart_fluidity_site: " << *a.chart_fluidity_site << "\n";
+    print_fluidity_report(std::cout, grammar, report);
   }
 
   if (a.dag_info) {
