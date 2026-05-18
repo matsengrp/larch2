@@ -42,8 +42,15 @@ class merge {
   // Phase 3: Deduplicated nodes (map: node_label -> result node index)
   hash_chain<node_label, std::size_t> result_nodes_;
 
-  // Phase 4: Deduplicated edges (map: edge_label -> result edge index)
-  hash_chain<edge_label, std::size_t> result_edges_;
+  // Phase 4: Deduplicated edges (map: edge_label -> stored edge_weight).
+  // If multiple input edges merge to the same edge_label, keep the minimum
+  // stored weight so edge-weight sampling remains conservative.
+  hash_chain<edge_label, float> result_edges_;
+
+  // Stored edge_weight for UA->root edges, keyed by child node label.  These
+  // source edges are skipped in result_edges_ because merge synthesizes UA
+  // edges when building the result DAG.
+  hash_chain<node_label, float> root_edge_weights_;
 
   // CG index for sample_ids (leaf sample_id -> cg_idx)
   std::unordered_map<std::string, std::size_t> sample_id_to_cg_idx_;
@@ -67,7 +74,8 @@ class merge {
     hash_chain<std::string> leaf_ids;  // sample_id -> unique leaf index
     hash_chain<leaf_set> leaf_sets;
     hash_chain<node_label, std::size_t> nodes;
-    hash_chain<edge_label, std::size_t> edges;
+    hash_chain<edge_label, float> edges;
+    hash_chain<node_label, float> root_edge_weights;
     std::vector<std::pair<std::string, std::size_t>> sample_mappings;
   };
 
@@ -317,14 +325,26 @@ class merge {
             auto parent_idx = std::visit([](auto n) { return n.index(); }, pv);
             auto child_idx = std::visit([](auto n) { return n.index(); }, cv);
 
-            if (is_ua(pv)) return;  // skip UA edges
+            auto& child_label = info.labels[child_idx];
+            if (child_label.empty()) return;
+
+            if (is_ua(pv)) {
+              auto [idx, inserted] = result.root_edge_weights.insert(
+                  {child_label, e.edge_weight()});
+              if (!inserted)
+                result.root_edge_weights[idx].second = std::min(
+                    result.root_edge_weights[idx].second, e.edge_weight());
+              return;
+            }
 
             auto& parent_label = info.labels[parent_idx];
-            auto& child_label = info.labels[child_idx];
-            if (parent_label.empty() || child_label.empty()) return;
+            if (parent_label.empty()) return;
 
             edge_label el{parent_label, child_label};
-            result.edges.insert({el, no_idx});
+            auto [idx, inserted] = result.edges.insert({el, e.edge_weight()});
+            if (!inserted)
+              result.edges[idx].second =
+                  std::min(result.edges[idx].second, e.edge_weight());
           },
           ev);
     }
@@ -418,10 +438,29 @@ class merge {
         el.child.leaf_id_idx = lid_remap.at(el.child.leaf_id_idx);
       if (el.child.ls_idx != no_idx)
         el.child.ls_idx = ls_remap.at(el.child.ls_idx);
-      result_edges_.insert({el, no_idx});
+      auto edge_weight = (*it).second;
+      auto [idx, inserted] = result_edges_.insert({el, edge_weight});
+      if (!inserted)
+        result_edges_[idx].second = std::min(result_edges_[idx].second,
+                                            edge_weight);
     }
 
-    // Step 5: Update sample_id_to_cg_idx_
+    // Step 5: Remap and insert UA->root edge weights
+    for (auto it = lr.root_edge_weights.begin();
+         it != lr.root_edge_weights.end(); ++it) {
+      node_label label = (*it).first;  // copy to modify
+      if (label.cg_idx != no_idx) label.cg_idx = cg_remap.at(label.cg_idx);
+      if (label.leaf_id_idx != no_idx)
+        label.leaf_id_idx = lid_remap.at(label.leaf_id_idx);
+      if (label.ls_idx != no_idx) label.ls_idx = ls_remap.at(label.ls_idx);
+      auto edge_weight = (*it).second;
+      auto [idx, inserted] = root_edge_weights_.insert({label, edge_weight});
+      if (!inserted)
+        root_edge_weights_[idx].second = std::min(
+            root_edge_weights_[idx].second, edge_weight);
+    }
+
+    // Step 6: Update sample_id_to_cg_idx_
     for (auto& [sid, local_cg_idx] : lr.sample_mappings) {
       sample_id_to_cg_idx_[sid] = cg_remap.at(local_cg_idx);
     }
@@ -547,6 +586,9 @@ class merge {
 
             edge.mutations() = compact_genome::to_edge_mutations(
                 reference_sequence_, parent_cg, child_cg);
+            auto root_weight_it = root_edge_weights_.find(label);
+            if (root_weight_it != no_idx)
+              edge.edge_weight() = root_edge_weights_[root_weight_it].second;
             connected = true;
           }
         }
@@ -572,12 +614,15 @@ class merge {
         }
         edge.mutations() = compact_genome::to_edge_mutations(
             reference_sequence_, compact_genome{}, child_cg);
+        auto root_weight_it = root_edge_weights_.find(label);
+        if (root_weight_it != no_idx)
+          edge.edge_weight() = root_edge_weights_[root_weight_it].second;
       }
     }
 
     // Create edges
     for (auto it = result_edges_.begin(); it != result_edges_.end(); ++it) {
-      auto& [el, _] = *it;
+      auto& [el, stored_edge_weight] = *it;
 
       auto parent_it = result_nodes_.find(el.parent);
       auto child_it = result_nodes_.find(el.child);
@@ -605,6 +650,7 @@ class merge {
 
       auto edge = result_dag_.append_edge<edge_kind::clade>();
       edge.clade_index() = clade_idx;
+      edge.edge_weight() = stored_edge_weight;
 
       // Set parent and child
       std::visit([&](auto n) { edge.set_parent(n); },

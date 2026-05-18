@@ -29,8 +29,8 @@ class chain {
 
   static constexpr bool needs_padding_ = sizeof(T) < sizeof(hole);
 
-  struct alignas(alignof(T) > alignof(hole) ? alignof(T) : alignof(hole))
-      padded_slot {
+  struct alignas(alignof(T) > alignof(hole) ? alignof(T)
+                                            : alignof(hole)) padded_slot {
     std::byte storage[sizeof(hole)];
   };
 

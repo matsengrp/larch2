@@ -31,7 +31,7 @@ struct dag_edge {
   int64_t parent_clade;
   int64_t child_node;
   std::vector<dag_mut> edge_mutations;
-  float edge_weight;
+  float edge_weight = 0.0f;
 };
 
 struct dag_node_name {
@@ -189,6 +189,7 @@ inline phylo_dag load_proto_dag(std::string_view path) {
     auto edge = d.append_edge<edge_kind::clade>();
     edge.mutations() = std::move(muts);
     edge.clade_index() = static_cast<std::size_t>(re.parent_clade);
+    edge.edge_weight() = re.edge_weight;
 
     std::visit([&](auto p) { edge.set_parent(p); }, d.get_node(parent_idx));
     pending.push_back({edge.index(), child_idx});

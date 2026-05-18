@@ -5,15 +5,21 @@
 #include <larch/protobuf.hpp>
 #include <larch/io_util.hpp>
 
+#include "test_util.hpp"
+
 #include <cassert>
 #include <cmath>
-#include <cstdio>
+#include <filesystem>
 #include <numeric>
 #include <print>
 #include <set>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
+
+using larch::test::cg_from_sequence;
 
 // Verify that a phylo_dag is a valid tree:
 // - Every non-root node has exactly one parent
@@ -42,6 +48,92 @@ static void verify_is_tree(larch::phylo_dag& tree) {
   }
 }
 
+static std::size_t add_weighted_edge(larch::phylo_dag& d,
+                                     std::size_t parent_idx,
+                                     std::size_t child_idx,
+                                     std::size_t clade_idx,
+                                     float edge_weight) {
+  auto edge = d.append_edge<larch::edge_kind::clade>();
+  edge.clade_index() = clade_idx;
+  edge.edge_weight() = edge_weight;
+  std::visit([&](auto p) { edge.set_parent(p); }, d.get_node(parent_idx));
+  std::visit([&](auto c) { edge.set_child(c); }, d.get_node(child_idx));
+  return edge.index();
+}
+
+static larch::phylo_dag make_edge_weight_alternative_dag() {
+  constexpr std::string_view ref = "AAAA";
+  larch::phylo_dag d;
+
+  auto ua = d.append_node<larch::node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto root = d.append_node<larch::node_kind::inner>();
+  root.cg() = cg_from_sequence("AAAA", ref);
+
+  auto alt1 = d.append_node<larch::node_kind::inner>();
+  alt1.cg() = cg_from_sequence("CAAA", ref);
+
+  auto alt2 = d.append_node<larch::node_kind::inner>();
+  alt2.cg() = cg_from_sequence("ACAA", ref);
+
+  auto l1 = d.append_node<larch::node_kind::leaf>();
+  l1.cg() = cg_from_sequence("CCAA", ref);
+  l1.sample_id() = "L1";
+
+  auto l2 = d.append_node<larch::node_kind::leaf>();
+  l2.cg() = cg_from_sequence("CACA", ref);
+  l2.sample_id() = "L2";
+
+  add_weighted_edge(d, ua.index(), root.index(), 0, 0.5f);
+  add_weighted_edge(d, root.index(), alt1.index(), 0, 1.0f);
+  add_weighted_edge(d, root.index(), alt2.index(), 0, 10.0f);
+  add_weighted_edge(d, alt1.index(), l1.index(), 0, 1.0f);
+  add_weighted_edge(d, alt1.index(), l2.index(), 1, 1.0f);
+  add_weighted_edge(d, alt2.index(), l1.index(), 0, 10.0f);
+  add_weighted_edge(d, alt2.index(), l2.index(), 1, 10.0f);
+
+  larch::recompute_edge_mutations(d);
+  larch::build_clade_offsets(d);
+  return d;
+}
+
+static larch::phylo_dag make_edge_weight_tie_dag() {
+  constexpr std::string_view ref = "AAAA";
+  larch::phylo_dag d;
+
+  auto ua = d.append_node<larch::node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto root = d.append_node<larch::node_kind::inner>();
+  root.cg() = cg_from_sequence("AAAA", ref);
+
+  auto alt1 = d.append_node<larch::node_kind::leaf>();
+  alt1.cg() = cg_from_sequence("CAAA", ref);
+  alt1.sample_id() = "L";
+
+  auto alt2 = d.append_node<larch::node_kind::leaf>();
+  alt2.cg() = cg_from_sequence("ACAA", ref);
+  alt2.sample_id() = "L";
+
+  add_weighted_edge(d, ua.index(), root.index(), 0, 0.5f);
+  add_weighted_edge(d, root.index(), alt1.index(), 0, 1.0f);
+  add_weighted_edge(d, root.index(), alt2.index(), 0, 1.0f);
+
+  larch::recompute_edge_mutations(d);
+  larch::build_clade_offsets(d);
+  return d;
+}
+
+static double sum_edge_weights(larch::phylo_dag& d) {
+  double total = 0.0;
+  for (auto ev : d.get_all_edges())
+    std::visit([&](auto edge) { total += edge.edge_weight(); }, ev);
+  return total;
+}
+
 static std::set<std::string> get_leaf_ids(larch::phylo_dag& d) {
   std::set<std::string> ids;
   for (auto nv : d.get_all_nodes()) {
@@ -53,6 +145,28 @@ static std::set<std::string> get_leaf_ids(larch::phylo_dag& d) {
         nv);
   }
   return ids;
+}
+
+static std::string selected_leaf_sequence(larch::phylo_dag& sampled,
+                                          std::string_view alt1,
+                                          std::string_view alt2) {
+  std::string chosen_seq;
+  std::size_t chosen_count = 0;
+  for (auto nv : sampled.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.sample_id(); }) {
+            auto seq = larch::test::node_sequence(sampled, node.index());
+            if (seq == alt1 || seq == alt2) {
+              chosen_seq = std::move(seq);
+              ++chosen_count;
+            }
+          }
+        },
+        nv);
+  }
+  assert(chosen_count == 1);
+  return chosen_seq;
 }
 
 struct test_fixture {
@@ -72,7 +186,8 @@ struct test_fixture {
   std::string load_trees(std::vector<std::string> const& paths) {
     trees.reserve(paths.size());
     for (auto& path : paths) {
-      trees.emplace_back(larch::load_proto_dag(path));
+      trees.emplace_back(
+          larch::load_proto_dag(larch::test::source_path_string(path)));
       larch::recompute_compact_genomes(trees.back());
       larch::set_sample_ids_from_cg(trees.back());
     }
@@ -483,13 +598,11 @@ static void test_edge_parsimony_exhaustive_ground_truth() {
 
     // Compute this tree's total parsimony score
     std::size_t tree_score = 0;
-    for (auto eidx : chosen_edges)
-      tree_score += pops.compute_edge(dag, eidx);
+    for (auto eidx : chosen_edges) tree_score += pops.compute_edge(dag, eidx);
 
     // Update min score seen for each edge in this tree
     for (auto eidx : chosen_edges) {
-      if (tree_score < min_score_seen[eidx])
-        min_score_seen[eidx] = tree_score;
+      if (tree_score < min_score_seen[eidx]) min_score_seen[eidx] = tree_score;
     }
   }
 
@@ -522,6 +635,135 @@ static void test_edge_parsimony_exhaustive_ground_truth() {
   std::println("  PASS");
 }
 
+static void test_edge_weight_score_ops_selects_min_alternative() {
+  std::println("test_edge_weight_score_ops_selects_min_alternative");
+
+  auto dag = make_edge_weight_alternative_dag();
+  auto root_idx = std::visit([](auto n) { return n.index(); }, dag.get_root());
+  larch::edge_weight_score_ops ops;
+  larch::subtree_weight<larch::edge_weight_score_ops> sw(dag, 42u);
+
+  auto score = sw.compute_weight_below(root_idx, ops);
+  assert(std::abs(score - 3.5) < 1e-10);
+
+  auto sampled = sw.min_weight_sample_tree(ops);
+  verify_is_tree(sampled);
+  assert(std::abs(sum_edge_weights(sampled) - 3.5) < 1e-10);
+
+  std::println("  PASS");
+}
+
+static void test_edge_weight_score_ops_tie_selection() {
+  std::println("test_edge_weight_score_ops_tie_selection");
+
+  auto dag = make_edge_weight_tie_dag();
+  auto root_idx = std::visit([](auto n) { return n.index(); }, dag.get_root());
+  larch::edge_weight_score_ops ops;
+  larch::subtree_weight<larch::edge_weight_score_ops> sw(dag, 42u);
+
+  auto score = sw.compute_weight_below(root_idx, ops);
+  assert(std::abs(score - 1.5) < 1e-10);
+  assert(sw.min_weight_count(root_idx, ops) == larch::bigint{2});
+
+  std::println("  PASS");
+}
+
+static void test_edge_weight_uniform_tie_sampling_balance() {
+  std::println("test_edge_weight_uniform_tie_sampling_balance");
+
+  auto dag = make_edge_weight_tie_dag();
+  larch::edge_weight_score_ops ops;
+  larch::subtree_weight<larch::edge_weight_score_ops> sw(dag, 271828u);
+  auto root_idx = std::visit([](auto n) { return n.index(); }, dag.get_root());
+  assert(sw.min_weight_count(root_idx, ops) == larch::bigint{2});
+
+  int alt1_count = 0;
+  int alt2_count = 0;
+  constexpr int trials = 2000;
+  for (int i = 0; i < trials; ++i) {
+    auto sampled = sw.min_weight_uniform_sample_tree(ops);
+    auto chosen = selected_leaf_sequence(sampled, "CAAA", "ACAA");
+    if (chosen == "CAAA")
+      ++alt1_count;
+    else if (chosen == "ACAA")
+      ++alt2_count;
+    else
+      assert(false && "unexpected edge-weight sampled alternative");
+  }
+
+  assert(alt1_count + alt2_count == trials);
+  assert(alt1_count > trials * 0.4 && alt1_count < trials * 0.6);
+  assert(alt2_count > trials * 0.4 && alt2_count < trials * 0.6);
+
+  std::println("  balanced edge-weight samples: alt1={}, alt2={}",
+               alt1_count, alt2_count);
+  std::println("  PASS");
+}
+
+static void test_edge_weight_min_global_scores() {
+  std::println("test_edge_weight_min_global_scores");
+
+  auto dag = make_edge_weight_alternative_dag();
+  auto root_idx = std::visit([](auto n) { return n.index(); }, dag.get_root());
+  larch::edge_weight_score_ops ops;
+  larch::subtree_weight<larch::edge_weight_score_ops> sw(dag, 42u);
+
+  auto global_min = sw.compute_weight_below(root_idx, ops);
+  auto scores = sw.compute_edge_min_global_scores(ops);
+  assert(std::abs(global_min - 3.5) < 1e-10);
+
+  for (auto ev : dag.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          auto eidx = edge.index();
+          assert(scores[eidx] + 1e-10 >= global_min);
+          if (edge.edge_weight() < 2.0f) {
+            assert(std::abs(scores[eidx] - 3.5) < 1e-10);
+          } else {
+            assert(std::abs(scores[eidx] - 30.5) < 1e-10);
+          }
+        },
+        ev);
+  }
+
+  std::println("  PASS");
+}
+
+static void test_edge_weight_round_trip_and_merge() {
+  std::println("test_edge_weight_round_trip_and_merge");
+
+  auto dag = make_edge_weight_alternative_dag();
+  auto original_sum = sum_edge_weights(dag);
+  assert(std::abs(original_sum - 33.5) < 1e-10);
+
+  auto tmp_path =
+      larch::test::unique_temp_path("subtree_weight_edge_weight_rt", ".pb");
+  larch::save_proto_dag(dag, tmp_path.string());
+
+  auto loaded = larch::load_proto_dag(tmp_path.string());
+  assert(std::abs(sum_edge_weights(loaded) - original_sum) < 1e-10);
+
+  larch::edge_weight_score_ops ops;
+  auto loaded_root_idx =
+      std::visit([](auto n) { return n.index(); }, loaded.get_root());
+  larch::subtree_weight<larch::edge_weight_score_ops> loaded_sw(loaded, 42u);
+  assert(std::abs(loaded_sw.compute_weight_below(loaded_root_idx, ops) - 3.5) <
+         1e-10);
+
+  larch::merge m{larch::get_reference_sequence(loaded)};
+  m.add_dag(loaded);
+  auto& merged = m.get_result();
+  assert(std::abs(sum_edge_weights(merged) - original_sum) < 1e-10);
+  auto merged_root_idx =
+      std::visit([](auto n) { return n.index(); }, merged.get_root());
+  larch::subtree_weight<larch::edge_weight_score_ops> merged_sw(merged, 42u);
+  assert(std::abs(merged_sw.compute_weight_below(merged_root_idx, ops) - 3.5) <
+         1e-10);
+
+  std::filesystem::remove(tmp_path);
+  std::println("  PASS");
+}
+
 static void test_edge_parsimony_round_trip() {
   std::println("test_edge_parsimony_round_trip");
 
@@ -544,11 +786,12 @@ static void test_edge_parsimony_round_trip() {
     penalties[i] = static_cast<float>(scores[i] - global_min);
 
   // Save with edge weights
-  std::string tmp_path = "/tmp/test_edge_parsimony_rt.pb";
-  larch::save_proto_dag(dag, tmp_path, penalties);
+  auto tmp_path = larch::test::unique_temp_path(
+      "subtree_weight_edge_parsimony_rt", ".pb");
+  larch::save_proto_dag(dag, tmp_path.string(), penalties);
 
   // Load raw protobuf and check edge_weight values
-  auto file_bytes = larch::read_file(tmp_path);
+  auto file_bytes = larch::read_file(tmp_path.string());
   std::span<const uint8_t> data{
       reinterpret_cast<const uint8_t*>(file_bytes.data()), file_bytes.size()};
   auto edge_spans = pb::collect_field_spans(data, 1);
@@ -572,7 +815,7 @@ static void test_edge_parsimony_round_trip() {
   assert(nonzero_weights > 0);
 
   // Clean up
-  std::remove(tmp_path.c_str());
+  std::filesystem::remove(tmp_path);
 
   std::println("  PASS");
 }
@@ -590,6 +833,11 @@ int main() {
   test_edge_parsimony_ua_root_edge();
   test_edge_parsimony_rerooting_identity();
   test_edge_parsimony_exhaustive_ground_truth();
+  test_edge_weight_score_ops_selects_min_alternative();
+  test_edge_weight_score_ops_tie_selection();
+  test_edge_weight_uniform_tie_sampling_balance();
+  test_edge_weight_min_global_scores();
+  test_edge_weight_round_trip_and_merge();
   test_edge_parsimony_round_trip();
 
   std::println("All subtree_weight tests passed!");

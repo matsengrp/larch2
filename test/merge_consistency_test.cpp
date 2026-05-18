@@ -9,17 +9,20 @@
 #include <larch/thread_pool.hpp>
 
 #include <cassert>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <optional>
 #include <print>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 using namespace larch;
 
-// Build a tree from FASTA+Newick (same logic as dagutil's build_from_fasta_newick).
+// Build a tree from FASTA+Newick (same logic as dagutil's
+// build_from_fasta_newick).
 static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
                                          std::string_view newick_path,
                                          std::string_view refseq_path) {
@@ -229,19 +232,37 @@ static void test_merge_roundtrip(std::string const& repro) {
   std::println("  PASS");
 }
 
-int main() {
-  std::string repro =
-      "/home/matsen/re/pz/maple/experiments/"
-      "2026-03-18-madag-sampling-factorial/runs/dagmerge_debug_rota";
+static constexpr int k_ctest_skip = 77;
 
-  if (!std::filesystem::exists(repro + "/input.fa")) {
-    std::println("(skipping merge_consistency_test: repro data not found at {})",
-                 repro);
-    return 0;
+static std::optional<std::filesystem::path> missing_repro_file(
+    std::filesystem::path const& repro) {
+  for (auto name : {"input.fa", "root.fa", "tree0.nwk", "tree1.nwk"}) {
+    auto path = repro / name;
+    if (!std::filesystem::exists(path)) return path;
+  }
+  return std::nullopt;
+}
+
+int main() {
+  auto const* repro_env = std::getenv("LARCH_REPRO_DATA");
+  if (repro_env == nullptr || std::string_view{repro_env}.empty()) {
+    std::println(
+        "(skipping merge_consistency_test: set LARCH_REPRO_DATA to a "
+        "directory containing input.fa, root.fa, tree0.nwk, and tree1.nwk)");
+    return k_ctest_skip;
+  }
+
+  std::filesystem::path repro{repro_env};
+  if (auto missing = missing_repro_file(repro)) {
+    std::println(
+        "merge_consistency_test: LARCH_REPRO_DATA={} is missing required "
+        "file {}",
+        repro.string(), missing->string());
+    return 1;
   }
 
   std::println("test_merge_roundtrip");
-  test_merge_roundtrip(repro);
+  test_merge_roundtrip(repro.string());
 
   std::println("All merge consistency checks passed!");
   return 0;

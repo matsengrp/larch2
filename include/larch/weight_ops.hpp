@@ -4,10 +4,11 @@
 #include <larch/phylo_dag.hpp>
 #include <larch/compute.hpp>
 #include <larch/simple_weight_ops.hpp>
+#include <larch/tie_tolerance.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
-#include <limits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -52,9 +53,10 @@ struct parsimony_score_ops {
   // Within a clade: pick the minimum weight edges
   std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
       std::vector<weight_type> const& weights) const {
-    weight_type best = std::numeric_limits<weight_type>::max();
-    for (auto w : weights) best = std::min(best, w);
+    assert(!weights.empty());
+    weight_type best = *std::min_element(weights.begin(), weights.end());
     std::vector<std::size_t> indices;
+    // Parsimony weights are integer mutation counts, so ties are exact.
     for (std::size_t i = 0; i < weights.size(); ++i)
       if (weights[i] == best) indices.push_back(i);
     return {best, indices};
@@ -89,6 +91,7 @@ struct tree_count_ops {
   // Within a clade: sum all weights (every edge is an alternative)
   std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
       std::vector<weight_type> const& weights) const {
+    assert(!weights.empty());
     weight_type sum{0};
     for (auto const& w : weights) sum += w;
     std::vector<std::size_t> all_indices;
@@ -129,9 +132,10 @@ struct ua_free_parsimony_score_ops {
 
   std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
       std::vector<weight_type> const& weights) const {
-    weight_type best = std::numeric_limits<weight_type>::max();
-    for (auto w : weights) best = std::min(best, w);
+    assert(!weights.empty());
+    weight_type best = *std::min_element(weights.begin(), weights.end());
     std::vector<std::size_t> indices;
+    // Parsimony weights are integer mutation counts, so ties are exact.
     for (std::size_t i = 0; i < weights.size(); ++i)
       if (weights[i] == best) indices.push_back(i);
     return {best, indices};
@@ -139,6 +143,48 @@ struct ua_free_parsimony_score_ops {
 
   weight_type between_clades(std::vector<weight_type> const& weights) const {
     weight_type sum = 0;
+    for (auto w : weights) sum += w;
+    return sum;
+  }
+
+  weight_type above_node(weight_type edge_weight,
+                         weight_type child_weight) const {
+    return edge_weight + child_weight;
+  }
+};
+
+// Stored protobuf/in-memory edge_weight scoring.  Lower total stored edge
+// weight is better, matching subtree_weight's minimum-weight semantics.
+struct edge_weight_score_ops {
+  using weight_type = double;
+
+  weight_type compute_leaf(phylo_dag& /*dag*/, std::size_t /*node_idx*/) const {
+    return 0.0;
+  }
+
+  weight_type compute_edge(phylo_dag& dag, std::size_t edge_idx) const {
+    auto ev = dag.get_edge(edge_idx);
+    return std::visit(
+        [](auto edge) -> double {
+          return static_cast<double>(edge.edge_weight());
+        },
+        ev);
+  }
+
+  std::pair<weight_type, std::vector<std::size_t>> within_clade_accum(
+      std::vector<weight_type> const& weights) const {
+    assert(!weights.empty());
+    double best = *std::min_element(weights.begin(), weights.end());
+    std::vector<std::size_t> indices;
+    // Edge weights are floating-point penalties; treat values within the
+    // shared min-weight tolerance as ties.
+    for (std::size_t i = 0; i < weights.size(); ++i)
+      if (within_min_weight_tie(weights[i], best)) indices.push_back(i);
+    return {best, indices};
+  }
+
+  weight_type between_clades(std::vector<weight_type> const& weights) const {
+    double sum = 0.0;
     for (auto w : weights) sum += w;
     return sum;
   }
@@ -169,6 +215,7 @@ struct max_parsimony_binary_ops {
   }
 
   bool compare_equal(weight_type lhs, weight_type rhs) const {
+    // Max-parsimony weights are also integer counts; ties are exact.
     return lhs == rhs;
   }
 

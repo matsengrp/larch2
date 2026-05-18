@@ -3,25 +3,16 @@
 #include <larch/merge.hpp>
 #include <larch/subtree_weight.hpp>
 
+#include "test_util.hpp"
+
 #include <cassert>
 #include <cstring>
-#include <map>
 #include <print>
 #include <set>
 #include <string>
 
 using namespace larch;
-
-static compact_genome cg_from_sequence(std::string_view seq,
-                                       std::string_view ref) {
-  std::map<mutation_position, nuc_base> muts;
-  for (std::size_t i = 0; i < seq.size(); ++i) {
-    if (seq[i] != ref[i]) {
-      muts[i + 1] = nuc_base::from_char(seq[i]);
-    }
-  }
-  return compact_genome{std::move(muts)};
-}
+using larch::test::cg_from_sequence;
 
 static void add_edge(phylo_dag& d, std::size_t parent_idx,
                      std::size_t child_idx, std::size_t clade_idx) {
