@@ -68,6 +68,32 @@ static larch::phylo_dag make_four_taxon_star() {
                           tiny_leaf("C", "AAGA"), tiny_leaf("D", "AAAT")}));
 }
 
+static larch::phylo_dag make_four_taxon_star_with_observed_bcd_alternatives() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(make_four_taxon_star());
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAAA",
+      tiny_inner("root", "AAAA",
+                 {tiny_leaf("A", "AAAA"),
+                  tiny_inner("BCD", "AAAA",
+                             {tiny_leaf("B", "CAAA"),
+                              tiny_inner("CD", "AAAA",
+                                         {tiny_leaf("C", "AAGA"),
+                                          tiny_leaf("D", "AAAT")})})})));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAAA",
+      tiny_inner("root", "AAAA",
+                 {tiny_leaf("A", "AAAA"),
+                  tiny_inner("BCD", "AAAA",
+                             {tiny_leaf("C", "AAGA"),
+                              tiny_inner("BD", "AAAA",
+                                         {tiny_leaf("B", "CAAA"),
+                                          tiny_leaf("D", "AAAT")})})})));
+  return larch::test::merge_tiny_trees(std::move(trees));
+}
+
 static larch::phylo_dag make_four_taxon_abcd_polytomy_with_ab() {
   using larch::test::tiny_inner;
   using larch::test::tiny_leaf;
@@ -541,6 +567,46 @@ static larch::phylo_dag make_two_polytomy_tree(
                                    {leaf("A"), leaf("B"), leaf("C")}),
            larch::test::tiny_inner("DEF", "",
                                    {leaf("D"), leaf("E"), leaf("F")})}));
+}
+
+static larch::phylo_dag make_two_four_polytomy_tree(
+    std::string const& reference,
+    std::map<std::string, std::string> const& sequences) {
+  auto leaf = [&](std::string const& label) {
+    auto found = sequences.find(label);
+    CHECK(found != sequences.end());
+    return larch::test::tiny_leaf(label, found->second);
+  };
+  return larch::test::make_tiny_labelled_tree(
+      reference,
+      larch::test::tiny_inner(
+          "root", "",
+          {larch::test::tiny_inner(
+               "ABCD", "", {leaf("A"), leaf("B"), leaf("C"), leaf("D")}),
+           larch::test::tiny_inner(
+               "EFGH", "", {leaf("E"), leaf("F"), leaf("G"), leaf("H")})}));
+}
+
+static bool same_grammar_signature(larch::clade_grammar const& lhs,
+                                   larch::clade_grammar const& rhs) {
+  if (lhs.root_clade != rhs.root_clade ||
+      lhs.clades.size() != rhs.clades.size() ||
+      lhs.productions.size() != rhs.productions.size()) {
+    return false;
+  }
+  for (std::size_t cid = 0; cid < lhs.clades.size(); ++cid) {
+    if (lhs.clades[cid].taxa != rhs.clades[cid].taxa) return false;
+  }
+  for (std::size_t pid = 0; pid < lhs.productions.size(); ++pid) {
+    auto const& lp = lhs.productions[pid];
+    auto const& rp = rhs.productions[pid];
+    if (lp.parent != rp.parent || lp.children != rp.children ||
+        lp.multiplicity != rp.multiplicity) {
+      return false;
+    }
+  }
+  return lhs.productions_by_parent == rhs.productions_by_parent &&
+         lhs.productions_by_child == rhs.productions_by_child;
 }
 
 static larch::phylo_dag make_two_polytomy_refinement_tree(
@@ -1263,6 +1329,198 @@ static void test_phase2_multiple_independent_polytomies_match_explicit() {
   std::println("  PASS");
 }
 
+static void test_phase3_bounded_large_star_truncated_repeatable() {
+  std::println("test_phase3_bounded_large_star_truncated_repeatable");
+
+  std::vector<std::string> labels{"A", "B", "C", "D", "E", "F", "G"};
+  std::string reference = "A";
+  auto sequences = sequences_from_states(labels, {0, 1, 2, 3, 0, 1, 2});
+
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_bounded;
+  opts.max_shapes_per_polytomy = 4;
+  opts.max_bounded_productions_per_polytomy = 128;
+
+  auto dag1 = make_star_polytomy_tree(reference, labels, sequences);
+  auto result1 = larch::build_polytomy_refined_clade_grammar(
+      dag1, larch::clade_grammar_options{}, opts);
+  auto dag2 = make_star_polytomy_tree(reference, labels, sequences);
+  auto result2 = larch::build_polytomy_refined_clade_grammar(
+      dag2, larch::clade_grammar_options{}, opts);
+
+  CHECK(same_grammar_signature(result1.grammar, result2.grammar));
+  CHECK(larch::grammar_is_binary_chart_compatible(result1.grammar));
+  CHECK(!result1.audit.contains_kary_productions);
+  CHECK(!result1.audit.exact_for_soft_polytomies);
+  CHECK(result1.audit.any_truncated);
+  CHECK(result1.audit.events.size() == 1);
+  auto const& event = result1.audit.events.front();
+  CHECK(event.expanded);
+  CHECK(!event.exact);
+  CHECK(event.truncated_by_shape_cap);
+  CHECK(!event.truncated_by_production_cap);
+  CHECK(event.selected_seed_shape_count == 4);
+  CHECK(event.represented_refinement_count >= event.selected_seed_shape_count);
+  CHECK(throws_runtime_error([&] {
+    larch::require_polytomy_refinement_exact_for_soft_polytomies(
+        result1.audit, "bounded phase3 test");
+  }));
+  CHECK(count_derivations(result1.grammar) ==
+        event.represented_refinement_count);
+
+  auto states = leaf_states_for_labels(result1.grammar, labels,
+                                       {0, 1, 2, 3, 0, 1, 2});
+  auto chart = larch::build_single_site_chart(result1.grammar, states);
+  CHECK(chart.root_min_excluding_ua(result1.grammar.root_clade) <
+        larch::chart_inf);
+
+  CHECK(result1.audit.events.front().represented_refinement_count ==
+        result2.audit.events.front().represented_refinement_count);
+  CHECK(result1.audit.synthetic_clade_count ==
+        result2.audit.synthetic_clade_count);
+  CHECK(result1.audit.synthetic_production_count ==
+        result2.audit.synthetic_production_count);
+
+  std::println("  PASS");
+}
+
+static void test_phase3_bounded_production_cap_rejects_incomplete_shape() {
+  std::println("test_phase3_bounded_production_cap_rejects_incomplete_shape");
+
+  std::vector<std::string> labels{"A", "B", "C", "D"};
+  std::string reference = "A";
+  auto sequences = sequences_from_states(labels, {0, 1, 2, 3});
+  auto dag = make_star_polytomy_tree(reference, labels, sequences);
+
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_bounded;
+  opts.max_shapes_per_polytomy = 16;
+  opts.max_bounded_productions_per_polytomy = 2;
+  CHECK(throws_runtime_error([&] {
+    (void)larch::build_polytomy_refined_clade_grammar(
+        dag, larch::clade_grammar_options{}, opts);
+  }));
+
+  std::println("  PASS");
+}
+
+static void test_phase3_bounded_multiple_polytomies_fair_budget() {
+  std::println("test_phase3_bounded_multiple_polytomies_fair_budget");
+
+  std::vector<std::string> labels{"A", "B", "C", "D",
+                                  "E", "F", "G", "H"};
+  std::string reference = "A";
+  auto sequences = sequences_from_states(labels, {0, 1, 2, 3, 0, 1, 2, 3});
+  auto dag = make_two_four_polytomy_tree(reference, sequences);
+
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_bounded;
+  opts.max_shapes_per_polytomy = 16;
+  opts.max_bounded_productions_per_polytomy = 64;
+  opts.max_total_new_productions = 6;
+
+  auto result = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, opts);
+  CHECK(larch::grammar_is_binary_chart_compatible(result.grammar));
+  CHECK(result.audit.events.size() == 2);
+  CHECK(result.audit.synthetic_production_count == 6);
+  CHECK(result.audit.any_truncated);
+  CHECK(!result.audit.exact_for_soft_polytomies);
+  for (auto const& event : result.audit.events) {
+    CHECK(event.selected_seed_shape_count == 1);
+    CHECK(event.new_productions_added == 3);
+    CHECK(event.truncated_by_production_cap);
+  }
+
+  std::println("  PASS");
+}
+
+static void test_phase3_bounded_reports_shared_intermediate_recombination() {
+  std::println(
+      "test_phase3_bounded_reports_shared_intermediate_recombination");
+
+  std::vector<std::string> labels{"A", "B", "C", "D", "E", "F"};
+  std::string reference = "A";
+  auto sequences = sequences_from_states(labels, {0, 1, 2, 3, 0, 1});
+
+  bool found_recombination = false;
+  for (std::size_t shape_cap = 2; shape_cap <= 64 && !found_recombination;
+       ++shape_cap) {
+    auto dag = make_star_polytomy_tree(reference, labels, sequences);
+    larch::polytomy_refinement_options opts;
+    opts.mode = larch::polytomy_mode::expand_soft_bounded;
+    opts.max_shapes_per_polytomy = shape_cap;
+    opts.max_bounded_productions_per_polytomy = 1024;
+    auto result = larch::build_polytomy_refined_clade_grammar(
+        dag, larch::clade_grammar_options{}, opts);
+    auto const& event = result.audit.events.front();
+    CHECK(count_derivations(result.grammar) ==
+          event.represented_refinement_count);
+    if (event.represented_refinement_count > event.selected_seed_shape_count) {
+      CHECK(!result.audit.exact_for_soft_polytomies);
+      CHECK(result.audit.any_truncated);
+      found_recombination = true;
+    }
+  }
+
+  CHECK(found_recombination);
+
+  std::println("  PASS");
+}
+
+static void test_phase3_bounded_large_arity_uses_capped_generator() {
+  std::println("test_phase3_bounded_large_arity_uses_capped_generator");
+
+  std::vector<std::string> labels{"A", "B", "C", "D", "E",
+                                  "F", "G", "H", "I", "J"};
+  std::string reference = "A";
+  auto sequences = sequences_from_states(labels,
+                                         {0, 1, 2, 3, 0, 1, 2, 3, 0, 1});
+  auto dag = make_star_polytomy_tree(reference, labels, sequences);
+
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_bounded;
+  opts.max_shapes_per_polytomy = 2;
+  opts.max_bounded_productions_per_polytomy = 64;
+
+  auto result = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, opts);
+  CHECK(larch::grammar_is_binary_chart_compatible(result.grammar));
+  CHECK(result.audit.events.size() == 1);
+  auto const& event = result.audit.events.front();
+  CHECK(event.arity == 10);
+  CHECK(event.selected_seed_shape_count == 2);
+  CHECK(event.truncated_by_shape_cap);
+  CHECK(!event.exact);
+  CHECK(event.represented_refinement_count >= event.selected_seed_shape_count);
+
+  std::println("  PASS");
+}
+
+static void test_phase3_bounded_counts_final_reused_intermediates() {
+  std::println("test_phase3_bounded_counts_final_reused_intermediates");
+
+  auto dag = make_four_taxon_star_with_observed_bcd_alternatives();
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_bounded;
+  opts.max_shapes_per_polytomy = 1;
+  opts.max_bounded_productions_per_polytomy = 64;
+
+  auto result = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, opts);
+  CHECK(larch::grammar_is_binary_chart_compatible(result.grammar));
+  CHECK(result.audit.events.size() == 1);
+  auto const& event = result.audit.events.front();
+  CHECK(event.selected_seed_shape_count == 1);
+  CHECK(event.represented_refinement_count ==
+        count_derivations(result.grammar));
+  CHECK(event.represented_refinement_count > event.selected_seed_shape_count);
+  CHECK(!event.exact);
+  CHECK(result.audit.any_truncated);
+
+  std::println("  PASS");
+}
+
 int main() {
   test_default_reject_mode_rejects_kary();
   test_reject_mode_accepts_binary_grammar();
@@ -1282,6 +1540,12 @@ int main() {
   test_phase2_multisite_bnb_matches_explicit_refinements();
   test_phase2_embedded_polytomy_matches_explicit_refinements();
   test_phase2_multiple_independent_polytomies_match_explicit();
+  test_phase3_bounded_large_star_truncated_repeatable();
+  test_phase3_bounded_production_cap_rejects_incomplete_shape();
+  test_phase3_bounded_multiple_polytomies_fair_budget();
+  test_phase3_bounded_reports_shared_intermediate_recombination();
+  test_phase3_bounded_large_arity_uses_capped_generator();
+  test_phase3_bounded_counts_final_reused_intermediates();
 
   std::println("All polytomy refinement tests passed!");
   return 0;

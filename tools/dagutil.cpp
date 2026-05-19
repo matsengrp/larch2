@@ -321,6 +321,12 @@ static void print_wric_polytomy_audit_fields(
   for (auto pid : kary)
     ++arity_histogram[grammar.productions[pid].children.size()];
 
+  out << "  polytomy_refinement_label: "
+      << polytomy_refinement_status_label(audit) << "\n";
+  out << "  exact_for_soft_polytomies: "
+      << (audit.exact_for_soft_polytomies ? "true" : "false") << "\n";
+  out << "  any_truncated: " << (audit.any_truncated ? "true" : "false")
+      << "\n";
   out << "  kary_productions: " << audit.source_kary_production_count << "\n";
   out << "  kary_production_arity_histogram:\n";
   if (arity_histogram.empty()) {
@@ -359,6 +365,51 @@ static void print_wric_polytomy_audit_fields(
       << "\n";
   out << "  kary_grammar_diagnostic_only: "
       << (audit.contains_kary_productions ? "true" : "false") << "\n";
+  out << "  polytomy_refinement_events:\n";
+  if (audit.events.empty()) {
+    out << "    <empty>\n";
+  } else {
+    for (auto const& event : audit.events) {
+      out << "    - source_production: " << event.source_production << "\n";
+      out << "      parent_clade: " << event.parent << "\n";
+      out << "      arity: " << event.arity << "\n";
+      out << "      selected_seed_shapes: "
+          << event.selected_seed_shape_count << "\n";
+      out << "      represented_refinement_count: "
+          << event.represented_refinement_count
+          << (event.refinement_count_saturated ? " (saturated)" : "")
+          << "\n";
+      out << "      exact: " << (event.exact ? "true" : "false") << "\n";
+      out << "      truncated_by_shape_cap: "
+          << (event.truncated_by_shape_cap ? "true" : "false") << "\n";
+      out << "      truncated_by_production_cap: "
+          << (event.truncated_by_production_cap ? "true" : "false")
+          << "\n";
+    }
+  }
+}
+
+static void print_wric_polytomy_score_fields(
+    std::ostream& out, polytomy_refinement_audit const& audit) {
+  out << "  polytomy_refinement_label: "
+      << polytomy_refinement_status_label(audit) << "\n";
+  out << "  exact_for_full_soft_polytomy_space: "
+      << (audit.exact_for_soft_polytomies ? "true" : "false") << "\n";
+  out << "  binary_chart_compatible: "
+      << (audit.binary_chart_compatible ? "true" : "false") << "\n";
+  out << "  contains_kary_productions: "
+      << (audit.contains_kary_productions ? "true" : "false") << "\n";
+  if (!audit.exact_for_soft_polytomies) {
+    out << "  score_scope: BOUNDED_REFINED_GRAMMAR\n";
+  } else {
+    out << "  score_scope: FULL_SOFT_POLYTOMY_SPACE\n";
+  }
+}
+
+static char const* exact_or_bounded_score_kind(
+    polytomy_refinement_audit const& audit) {
+  return audit.exact_for_soft_polytomies ? "EXACT"
+                                         : "BOUNDED_REFINED_GRAMMAR";
 }
 
 static void print_key_chart_clade_entries(
@@ -463,6 +514,15 @@ Analysis:
   --dag-info              Print all DAG statistics (tree count, parsimony, RF)
   --wric-audit            Build collapsed clade grammar and print multiplicity
                           diagnostics (allows polytomies for audit only)
+  --wric-polytomy-mode <M>
+                          reject (default), audit-kary, expand-exact,
+                          or expand-bounded for WRIC chart diagnostics
+  --wric-polytomy-max-exact-arity <N>
+                          Exact expansion arity cap (default 6)
+  --wric-polytomy-max-shapes <N>
+                          Bounded seed-shape cap per polytomy (default 16)
+  --wric-polytomy-max-productions <N>
+                          Per-polytomy production cap for expansion
   --chart-site <POS>      Build a one-site chart and print root optimum plus
                           key clade entries (POS is 1-based)
   --chart-pattern-info    Print exact/invariant/normalized site-pattern counts
@@ -528,6 +588,8 @@ struct args {
   bool edge_ml = false;
   bool validate = false;
   bool wric_audit = false;
+  polytomy_refinement_options wric_polytomy_opts;
+  bool wric_polytomy_mode_explicit = false;
   std::optional<mutation_position> chart_site;
   bool chart_pattern_info = false;
   std::optional<mutation_position> chart_trim_site;
@@ -551,6 +613,20 @@ static bool has_complete_model_args(args const& a) {
 static bool ml_model_requested(args const& a) {
   return a.edge_ml ||
          (a.sample && !a.trim && is_ml_sample_method(a.sampling_method));
+}
+
+static std::optional<polytomy_mode> parse_wric_polytomy_mode(
+    std::string_view text) {
+  if (text == "reject") return polytomy_mode::reject;
+  if (text == "audit-kary" || text == "audit_kary")
+    return polytomy_mode::audit_kary;
+  if (text == "expand-exact" || text == "expand_exact" ||
+      text == "expand_soft_exact_or_fail")
+    return polytomy_mode::expand_soft_exact_or_fail;
+  if (text == "expand-bounded" || text == "expand_bounded" ||
+      text == "expand_soft_bounded")
+    return polytomy_mode::expand_soft_bounded;
+  return std::nullopt;
 }
 
 static args parse_args(int argc, char** argv) {
@@ -613,6 +689,27 @@ static args parse_args(int argc, char** argv) {
       a.print_rf_distance = true;
     } else if (arg == "--wric-audit") {
       a.wric_audit = true;
+    } else if (arg == "--wric-polytomy-mode") {
+      auto value = next();
+      auto mode = parse_wric_polytomy_mode(value);
+      if (!mode) {
+        std::cerr << "error: unknown --wric-polytomy-mode '" << value
+                  << "'\n";
+        std::exit(1);
+      }
+      a.wric_polytomy_opts.mode = *mode;
+      a.wric_polytomy_mode_explicit = true;
+    } else if (arg == "--wric-polytomy-max-exact-arity") {
+      a.wric_polytomy_opts.max_exact_arity = static_cast<std::size_t>(
+          std::stoull(std::string{next()}));
+    } else if (arg == "--wric-polytomy-max-shapes") {
+      a.wric_polytomy_opts.max_shapes_per_polytomy = static_cast<std::size_t>(
+          std::stoull(std::string{next()}));
+    } else if (arg == "--wric-polytomy-max-productions") {
+      auto value = static_cast<std::size_t>(
+          std::stoull(std::string{next()}));
+      a.wric_polytomy_opts.max_new_productions_per_polytomy = value;
+      a.wric_polytomy_opts.max_bounded_productions_per_polytomy = value;
     } else if (arg == "--chart-site") {
       auto pos =
           static_cast<mutation_position>(std::stoull(std::string{next()}));
@@ -834,29 +931,25 @@ int main(int argc, char** argv) try {
   }
 
   // ---- Analysis ----
-  std::optional<clade_grammar> chart_grammar_cache;
+  std::optional<polytomy_refinement_result> chart_refinement_cache;
   double chart_grammar_build_ms = 0.0;
-  auto get_chart_grammar = [&]() -> clade_grammar& {
-    if (!chart_grammar_cache) {
+  auto get_chart_refinement = [&]() -> polytomy_refinement_result& {
+    if (!chart_refinement_cache) {
       auto start = std::chrono::steady_clock::now();
       clade_grammar_options grammar_opts;
-      grammar_opts.allow_polytomies = true;
-      auto built = build_clade_grammar_with_audit(result, grammar_opts);
+      chart_refinement_cache = build_polytomy_refined_clade_grammar(
+          result, grammar_opts, a.wric_polytomy_opts);
       chart_grammar_build_ms =
           elapsed_ms(start, std::chrono::steady_clock::now());
-      if (!grammar_is_binary_chart_compatible(built.grammar)) {
-        auto const kary_count = kary_productions(built.grammar).size();
-        throw std::runtime_error(
-            "WRIC chart requires a binary-compatible grammar.\n"
-            "Found " +
-            std::to_string(kary_count) +
-            " k-ary productions. Run --wric-audit for diagnostic-only "
-            "polytomy reporting; binary charting is disabled until an "
-            "explicit expansion mode is implemented.");
-      }
-      chart_grammar_cache = std::move(built.grammar);
+      require_polytomy_refinement_binary_charting(
+          chart_refinement_cache->audit,
+          "WRIC chart diagnostics (use --wric-polytomy-mode expand-exact "
+          "or expand-bounded for soft polytomies)");
     }
-    return *chart_grammar_cache;
+    return *chart_refinement_cache;
+  };
+  auto get_chart_grammar = [&]() -> clade_grammar& {
+    return get_chart_refinement().grammar;
   };
 
   std::optional<site_pattern_set> exact_patterns_cache;
@@ -874,8 +967,9 @@ int main(int argc, char** argv) try {
 
   if (a.wric_audit) {
     clade_grammar_options grammar_opts;
-    polytomy_refinement_options refinement_opts;
-    refinement_opts.mode = polytomy_mode::audit_kary;
+    auto refinement_opts = a.wric_polytomy_opts;
+    if (!a.wric_polytomy_mode_explicit)
+      refinement_opts.mode = polytomy_mode::audit_kary;
     auto start = std::chrono::steady_clock::now();
     auto refined = build_polytomy_refined_clade_grammar(
         result, grammar_opts, refinement_opts);
@@ -887,7 +981,8 @@ int main(int argc, char** argv) try {
   }
 
   if (a.chart_site) {
-    auto& grammar = get_chart_grammar();
+    auto& refinement = get_chart_refinement();
+    auto& grammar = refinement.grammar;
     chart_options chart_opts;
     chart_opts.score_ua_edge = a.chart_score_ua_edge;
 
@@ -913,6 +1008,7 @@ int main(int argc, char** argv) try {
     std::cout << "  clades: " << grammar.clades.size() << "\n";
     std::cout << "  productions: " << grammar.productions.size() << "\n";
     std::cout << "  root_clade: " << grammar.root_clade << "\n";
+    print_wric_polytomy_score_fields(std::cout, refinement.audit);
     std::cout << "  root_min: ";
     print_chart_cost(std::cout, optimum);
     std::cout << "\n";
@@ -930,25 +1026,24 @@ int main(int argc, char** argv) try {
   }
 
   if (a.chart_pattern_info) {
-    clade_grammar_options grammar_opts;
-    grammar_opts.allow_polytomies = true;
-    auto grammar_start = std::chrono::steady_clock::now();
-    auto grammar = build_clade_grammar(result, grammar_opts);
-    auto grammar_ms = elapsed_ms(grammar_start, std::chrono::steady_clock::now());
+    auto& refinement = get_chart_refinement();
+    auto& grammar = refinement.grammar;
     site_pattern_options pattern_opts;
     pattern_opts.build_normalized_binary_patterns = true;
     auto pattern_start = std::chrono::steady_clock::now();
     auto patterns = build_site_patterns(result, grammar, pattern_opts);
     auto pattern_ms = elapsed_ms(pattern_start, std::chrono::steady_clock::now());
     print_site_pattern_summary(std::cout, patterns);
+    print_wric_polytomy_score_fields(std::cout, refinement.audit);
     std::cout << "  grammar_build_ms: " << std::fixed
-              << std::setprecision(3) << grammar_ms << "\n";
+              << std::setprecision(3) << chart_grammar_build_ms << "\n";
     std::cout << "  pattern_build_ms: " << std::fixed
               << std::setprecision(3) << pattern_ms << "\n";
   }
 
   if (a.chart_trim_site) {
-    auto& grammar = get_chart_grammar();
+    auto& refinement = get_chart_refinement();
+    auto& grammar = refinement.grammar;
     chart_options chart_opts;
     chart_opts.score_ua_edge = a.chart_score_ua_edge;
 
@@ -975,6 +1070,7 @@ int main(int argc, char** argv) try {
     std::cout << "  pos: " << *a.chart_trim_site << "\n";
     std::cout << "  score_ua_edge: "
               << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+    print_wric_polytomy_score_fields(std::cout, refinement.audit);
     std::cout << "  global_min: ";
     print_chart_cost(std::cout, mask.global_min);
     std::cout << "\n";
@@ -1018,7 +1114,8 @@ int main(int argc, char** argv) try {
   }
 
   if (a.chart_composite_score) {
-    auto& grammar = get_chart_grammar();
+    auto& refinement = get_chart_refinement();
+    auto& grammar = refinement.grammar;
     auto& patterns = get_exact_patterns();
     chart_options chart_opts;
     chart_opts.score_ua_edge = a.chart_score_ua_edge;
@@ -1030,6 +1127,7 @@ int main(int argc, char** argv) try {
 
     std::cout << "chart_composite_score:\n";
     std::cout << "  score_kind: LOWER_BOUND\n";
+    print_wric_polytomy_score_fields(std::cout, refinement.audit);
     std::cout << "  weighted_lower_bound: "
               << composite.weighted_lower_bound << "\n";
     std::cout << "  score_ua_edge: "
@@ -1051,7 +1149,8 @@ int main(int argc, char** argv) try {
   }
 
   if (a.chart_bnb_trim) {
-    auto& grammar = get_chart_grammar();
+    auto& refinement = get_chart_refinement();
+    auto& grammar = refinement.grammar;
     auto& patterns = get_exact_patterns();
     chart_options chart_opts;
     chart_opts.score_ua_edge = a.chart_score_ua_edge;
@@ -1064,7 +1163,9 @@ int main(int argc, char** argv) try {
     auto bnb_ms = elapsed_ms(bnb_start, std::chrono::steady_clock::now());
 
     std::cout << "chart_bnb_trim:\n";
-    std::cout << "  score_kind: EXACT\n";
+    std::cout << "  score_kind: "
+              << exact_or_bounded_score_kind(refinement.audit) << "\n";
+    print_wric_polytomy_score_fields(std::cout, refinement.audit);
     std::cout << "  optimum: " << trim.optimum << "\n";
     std::cout << "  composite_lower_bound_kind: LOWER_BOUND\n";
     std::cout << "  composite_lower_bound: "
@@ -1099,7 +1200,8 @@ int main(int argc, char** argv) try {
   }
 
   if (a.chart_fluidity_site) {
-    auto& grammar = get_chart_grammar();
+    auto& refinement = get_chart_refinement();
+    auto& grammar = refinement.grammar;
     auto states =
         extract_leaf_site_states(result, grammar, *a.chart_fluidity_site);
     chart_options chart_opts;
@@ -1112,6 +1214,7 @@ int main(int argc, char** argv) try {
     std::cout << "chart_fluidity_site: " << *a.chart_fluidity_site << "\n";
     std::cout << "chart_fluidity_score_ua_edge: "
               << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+    print_wric_polytomy_score_fields(std::cout, refinement.audit);
     print_fluidity_report(std::cout, grammar, report);
   }
 

@@ -10,6 +10,7 @@
 #include <map>
 #include <numeric>
 #include <ostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -28,8 +29,7 @@ struct polytomy_refinement_options {
   polytomy_mode mode = polytomy_mode::reject;
 
   // Exact expansion uses compact subset-closure.  If a polytomy exceeds these
-  // caps, exact_or_fail throws and bounded mode (implemented in a later phase)
-  // will truncate with diagnostics.
+  // caps, exact_or_fail throws and bounded mode truncates with diagnostics.
   std::size_t max_exact_arity = 6;
   std::size_t max_new_clades_per_polytomy = 256;
   std::size_t max_new_productions_per_polytomy = 1024;
@@ -955,6 +955,790 @@ inline polytomy_event_audit expand_kary_production_exact(
   return event;
 }
 
+inline constexpr std::uint32_t k_no_refinement_shape_node =
+    std::numeric_limits<std::uint32_t>::max();
+
+struct refinement_shape_node {
+  std::uint64_t mask = 0;
+  std::uint32_t left = k_no_refinement_shape_node;
+  std::uint32_t right = k_no_refinement_shape_node;
+};
+
+struct refinement_shape {
+  std::vector<refinement_shape_node> nodes;
+  std::uint32_t root = k_no_refinement_shape_node;
+};
+
+inline bool refinement_shape_node_is_leaf(refinement_shape_node const& node) {
+  return node.left == k_no_refinement_shape_node &&
+         node.right == k_no_refinement_shape_node;
+}
+
+inline std::string mask_leaf_serialized(std::uint64_t mask) {
+  if (mask == 0 || std::popcount(mask) != 1) {
+    throw std::runtime_error(
+        "polytomy refinement: invalid leaf mask during shape serialization");
+  }
+  return std::to_string(std::countr_zero(mask));
+}
+
+inline std::string shape_serialized(refinement_shape const& shape,
+                                    std::uint32_t node) {
+  if (node == k_no_refinement_shape_node || node >= shape.nodes.size()) {
+    throw std::runtime_error(
+        "polytomy refinement: shape serialization node out of range");
+  }
+  auto const& current = shape.nodes[node];
+  if (refinement_shape_node_is_leaf(current))
+    return mask_leaf_serialized(current.mask);
+  return "(" + shape_serialized(shape, current.left) + "," +
+         shape_serialized(shape, current.right) + ")";
+}
+
+inline std::size_t shape_max_depth(refinement_shape const& shape,
+                                   std::uint32_t node) {
+  if (node == k_no_refinement_shape_node || node >= shape.nodes.size()) {
+    throw std::runtime_error(
+        "polytomy refinement: shape depth node out of range");
+  }
+  auto const& current = shape.nodes[node];
+  if (refinement_shape_node_is_leaf(current)) return 0;
+  return 1 + std::max(shape_max_depth(shape, current.left),
+                      shape_max_depth(shape, current.right));
+}
+
+inline std::uint64_t shape_balance_score(refinement_shape const& shape,
+                                         std::uint32_t node) {
+  if (node == k_no_refinement_shape_node || node >= shape.nodes.size()) {
+    throw std::runtime_error(
+        "polytomy refinement: shape balance node out of range");
+  }
+  auto const& current = shape.nodes[node];
+  if (refinement_shape_node_is_leaf(current)) return 0;
+  auto const& left = shape.nodes[current.left];
+  auto const& right = shape.nodes[current.right];
+  auto left_size = std::popcount(left.mask);
+  auto right_size = std::popcount(right.mask);
+  auto imbalance = left_size > right_size ? left_size - right_size
+                                          : right_size - left_size;
+  bool saturated = false;
+  auto total = detail::saturated_add(
+      static_cast<std::uint64_t>(imbalance),
+      shape_balance_score(shape, current.left), saturated);
+  total = detail::saturated_add(total, shape_balance_score(shape, current.right),
+                                saturated);
+  return total;
+}
+
+inline bool refinement_shape_less(refinement_shape const& lhs,
+                                  refinement_shape const& rhs) {
+  auto lhs_depth = shape_max_depth(lhs, lhs.root);
+  auto rhs_depth = shape_max_depth(rhs, rhs.root);
+  if (lhs_depth != rhs_depth) return lhs_depth < rhs_depth;
+
+  auto lhs_balance = shape_balance_score(lhs, lhs.root);
+  auto rhs_balance = shape_balance_score(rhs, rhs.root);
+  if (lhs_balance != rhs_balance) return lhs_balance < rhs_balance;
+
+  return shape_serialized(lhs, lhs.root) < shape_serialized(rhs, rhs.root);
+}
+
+inline refinement_shape combine_refinement_shapes(
+    std::uint64_t mask, refinement_shape const& left,
+    refinement_shape const& right) {
+  refinement_shape result;
+  result.nodes = left.nodes;
+  auto right_offset = static_cast<std::uint32_t>(result.nodes.size());
+  for (auto node : right.nodes) {
+    if (node.left != k_no_refinement_shape_node) node.left += right_offset;
+    if (node.right != k_no_refinement_shape_node) node.right += right_offset;
+    result.nodes.push_back(node);
+  }
+  result.root = static_cast<std::uint32_t>(result.nodes.size());
+  result.nodes.push_back(
+      refinement_shape_node{mask, left.root, right.root + right_offset});
+  return result;
+}
+
+inline std::vector<refinement_shape> const& enumerate_shapes_for_mask(
+    std::uint64_t mask,
+    std::map<std::uint64_t, std::vector<refinement_shape>>& memo) {
+  auto found = memo.find(mask);
+  if (found != memo.end()) return found->second;
+  if (mask == 0) {
+    throw std::runtime_error(
+        "polytomy refinement: attempted to enumerate empty refinement mask");
+  }
+
+  std::vector<refinement_shape> result;
+  if (std::popcount(mask) == 1) {
+    refinement_shape leaf;
+    leaf.nodes.push_back(refinement_shape_node{mask});
+    leaf.root = 0;
+    result.push_back(std::move(leaf));
+  } else {
+    auto lowest = mask & (~mask + 1);
+    for (auto sub = (mask - 1) & mask; sub != 0; sub = (sub - 1) & mask) {
+      if ((sub & lowest) == 0) continue;
+      auto other = mask ^ sub;
+      if (other == 0) continue;
+      auto const& left_shapes = enumerate_shapes_for_mask(sub, memo);
+      auto const& right_shapes = enumerate_shapes_for_mask(other, memo);
+      for (auto const& left : left_shapes) {
+        for (auto const& right : right_shapes)
+          result.push_back(combine_refinement_shapes(mask, left, right));
+      }
+    }
+  }
+
+  std::sort(result.begin(), result.end(), refinement_shape_less);
+  result.erase(std::unique(result.begin(), result.end(),
+                           [](refinement_shape const& lhs,
+                              refinement_shape const& rhs) {
+                             return shape_serialized(lhs, lhs.root) ==
+                                    shape_serialized(rhs, rhs.root);
+                           }),
+               result.end());
+  auto [it, _] = memo.emplace(mask, std::move(result));
+  return it->second;
+}
+
+inline std::vector<refinement_shape> enumerate_refinement_shapes(
+    std::size_t arity) {
+  if (arity == 0 || arity > 63) {
+    throw std::runtime_error(
+        "polytomy refinement: bounded shape enumeration requires arity 1..63");
+  }
+  std::map<std::uint64_t, std::vector<refinement_shape>> memo;
+  auto full = (std::uint64_t{1} << arity) - 1;
+  return enumerate_shapes_for_mask(full, memo);
+}
+
+inline std::vector<std::uint64_t> refinement_mask_bits(std::uint64_t mask) {
+  std::vector<std::uint64_t> bits;
+  while (mask != 0) {
+    auto bit = mask & (~mask + 1);
+    bits.push_back(bit);
+    mask ^= bit;
+  }
+  return bits;
+}
+
+inline void generate_limited_combinations(
+    std::vector<std::uint64_t> const& bits, std::size_t start,
+    std::size_t choose, std::uint64_t current,
+    std::vector<std::uint64_t>& out, std::size_t limit) {
+  if (out.size() >= limit) return;
+  if (choose == 0) {
+    out.push_back(current);
+    return;
+  }
+  if (start >= bits.size() || bits.size() - start < choose) return;
+
+  auto last = bits.size() - choose;
+  for (std::size_t i = start; i <= last && out.size() < limit; ++i) {
+    generate_limited_combinations(bits, i + 1, choose - 1,
+                                  current | bits[i], out, limit);
+  }
+}
+
+inline std::vector<std::pair<std::uint64_t, std::uint64_t>>
+limited_canonical_splits(std::uint64_t mask, std::size_t limit) {
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> splits;
+  if (limit == 0) return splits;
+  auto arity = static_cast<std::size_t>(std::popcount(mask));
+  if (arity < 2) return splits;
+
+  auto lowest = mask & (~mask + 1);
+  auto rest_bits = refinement_mask_bits(mask ^ lowest);
+  std::vector<std::size_t> left_sizes;
+  left_sizes.reserve(arity - 1);
+  for (std::size_t size = 1; size < arity; ++size)
+    left_sizes.push_back(size);
+  std::stable_sort(left_sizes.begin(), left_sizes.end(),
+                   [arity](std::size_t lhs, std::size_t rhs) {
+                     auto lhs_imbalance = lhs > arity - lhs
+                                               ? lhs - (arity - lhs)
+                                               : (arity - lhs) - lhs;
+                     auto rhs_imbalance = rhs > arity - rhs
+                                               ? rhs - (arity - rhs)
+                                               : (arity - rhs) - rhs;
+                     if (lhs_imbalance != rhs_imbalance)
+                       return lhs_imbalance < rhs_imbalance;
+                     return lhs < rhs;
+                   });
+
+  for (auto left_size : left_sizes) {
+    if (splits.size() >= limit) break;
+    auto choose = left_size - 1;
+    std::vector<std::uint64_t> left_masks;
+    generate_limited_combinations(rest_bits, 0, choose, lowest, left_masks,
+                                  limit - splits.size());
+    for (auto left : left_masks) {
+      auto right = mask ^ left;
+      if (right == 0) continue;
+      splits.emplace_back(left, right);
+      if (splits.size() >= limit) break;
+    }
+  }
+  return splits;
+}
+
+inline refinement_shape make_refinement_seed_shape(std::uint64_t mask,
+                                                   std::uint64_t seed) {
+  if (mask == 0) {
+    throw std::runtime_error(
+        "polytomy refinement: attempted to build empty bounded shape");
+  }
+  if (std::popcount(mask) == 1) {
+    refinement_shape leaf;
+    leaf.nodes.push_back(refinement_shape_node{mask});
+    leaf.root = 0;
+    return leaf;
+  }
+
+  auto splits = limited_canonical_splits(mask, 64);
+  if (splits.empty()) {
+    throw std::runtime_error(
+        "polytomy refinement: bounded seed generator produced no split");
+  }
+  auto split_index = static_cast<std::size_t>(seed % splits.size());
+  auto child_seed = seed / splits.size();
+  auto left = make_refinement_seed_shape(splits[split_index].first,
+                                         child_seed);
+  auto right = make_refinement_seed_shape(splits[split_index].second,
+                                          child_seed);
+  return combine_refinement_shapes(mask, left, right);
+}
+
+inline std::size_t bounded_shape_attempt_limit(std::size_t cap) {
+  if (cap == 0) return 0;
+  auto extra_units = std::min<std::size_t>(cap, 4096);
+  auto extra = extra_units * 64;
+  auto limit = cap;
+  if (limit <= std::numeric_limits<std::size_t>::max() - extra)
+    limit += extra;
+  limit = std::max<std::size_t>(limit, 64);
+  return limit;
+}
+
+inline constexpr std::uint64_t k_max_exhaustive_bounded_shape_count = 100000;
+
+struct bounded_shape_generation_result {
+  std::vector<refinement_shape> shapes;
+  std::uint64_t total_shape_count = 0;
+  bool total_shape_count_saturated = false;
+  bool exhaustive = false;
+};
+
+inline bounded_shape_generation_result generate_bounded_refinement_shapes(
+    std::size_t arity, std::size_t cap) {
+  if (arity == 0 || arity > 63) {
+    throw std::runtime_error(
+        "polytomy refinement: bounded shape generation requires arity 1..63");
+  }
+
+  bounded_shape_generation_result result;
+  bool total_saturated = false;
+  result.total_shape_count = rooted_binary_refinement_count(arity,
+                                                            total_saturated);
+  result.total_shape_count_saturated = total_saturated;
+  if (cap == 0) return result;
+
+  if (!total_saturated && result.total_shape_count <= cap &&
+      result.total_shape_count <= k_max_exhaustive_bounded_shape_count) {
+    result.shapes = enumerate_refinement_shapes(arity);
+    result.exhaustive = true;
+    return result;
+  }
+
+  auto full = (std::uint64_t{1} << arity) - 1;
+  std::set<std::string> seen;
+  auto attempt_limit = bounded_shape_attempt_limit(cap);
+  for (std::uint64_t seed = 0;
+       seed < attempt_limit && result.shapes.size() < cap; ++seed) {
+    auto shape = make_refinement_seed_shape(full, seed);
+    auto serialized = shape_serialized(shape, shape.root);
+    if (!seen.insert(serialized).second) continue;
+    result.shapes.push_back(std::move(shape));
+  }
+
+  std::sort(result.shapes.begin(), result.shapes.end(), refinement_shape_less);
+  if (result.shapes.size() > cap) result.shapes.resize(cap);
+  result.exhaustive = false;
+  return result;
+}
+
+inline void validate_refinement_shape(refinement_shape const& shape,
+                                      std::size_t arity) {
+  if (shape.root == k_no_refinement_shape_node ||
+      shape.root >= shape.nodes.size()) {
+    throw std::runtime_error("polytomy refinement: invalid shape root");
+  }
+  auto full = (std::uint64_t{1} << arity) - 1;
+  if (shape.nodes[shape.root].mask != full) {
+    throw std::runtime_error(
+        "polytomy refinement: shape root mask does not match arity");
+  }
+  for (auto const& node : shape.nodes) {
+    if (node.mask == 0 || (node.mask & ~full) != 0) {
+      throw std::runtime_error(
+          "polytomy refinement: shape node mask outside full mask");
+    }
+    if (refinement_shape_node_is_leaf(node)) {
+      if (std::popcount(node.mask) != 1) {
+        throw std::runtime_error(
+            "polytomy refinement: non-singleton shape leaf");
+      }
+      continue;
+    }
+    if (node.left >= shape.nodes.size() || node.right >= shape.nodes.size()) {
+      throw std::runtime_error(
+          "polytomy refinement: shape child node out of range");
+    }
+    auto const& left = shape.nodes[node.left];
+    auto const& right = shape.nodes[node.right];
+    if ((left.mask & right.mask) != 0 ||
+        (left.mask | right.mask) != node.mask) {
+      throw std::runtime_error(
+          "polytomy refinement: shape children do not partition parent mask");
+    }
+  }
+}
+
+struct bounded_shape_preflight {
+  std::size_t new_clades = 0;
+  std::size_t new_productions = 0;
+};
+
+struct bounded_event_budget {
+  std::size_t clades = 0;
+  std::size_t productions = 0;
+};
+
+inline std::size_t remaining_budget(std::size_t used, std::size_t cap) {
+  return used >= cap ? 0 : cap - used;
+}
+
+inline std::size_t fair_remaining_budget(std::size_t remaining,
+                                         std::size_t remaining_events) {
+  if (remaining == 0 || remaining_events == 0) return 0;
+  return std::max<std::size_t>(1, remaining / remaining_events);
+}
+
+inline bounded_event_budget compute_bounded_event_budget(
+    exact_expansion_context const& ctx, std::size_t remaining_events) {
+  if (remaining_events == 0) {
+    throw std::runtime_error(
+        "polytomy refinement: internal bounded budget event count is zero");
+  }
+
+  auto remaining_clades = remaining_budget(ctx.total_new_clades,
+                                           ctx.options.max_total_new_clades);
+  auto remaining_productions = remaining_budget(
+      ctx.total_new_productions, ctx.options.max_total_new_productions);
+
+  bounded_event_budget budget;
+  budget.clades = std::min(ctx.options.max_new_clades_per_polytomy,
+                           fair_remaining_budget(remaining_clades,
+                                                 remaining_events));
+  budget.productions = std::min(
+      std::min(ctx.options.max_new_productions_per_polytomy,
+               ctx.options.max_bounded_productions_per_polytomy),
+      fair_remaining_budget(remaining_productions, remaining_events));
+  return budget;
+}
+
+inline std::map<std::uint64_t, clade_id> singleton_mask_to_source_child_clades(
+    exact_expansion_context const& ctx, grammar_production const& prod) {
+  std::map<std::uint64_t, clade_id> mask_to_clade;
+  for (std::size_t i = 0; i < prod.children.size(); ++i) {
+    auto child = prod.children[i];
+    if (child == no_clade || child >= ctx.source_clade_to_draft.size() ||
+        ctx.source_clade_to_draft[child] == no_clade) {
+      throw std::runtime_error(
+          "polytomy refinement: bounded k-ary child clade out of range");
+    }
+    mask_to_clade.emplace(std::uint64_t{1} << i,
+                          ctx.source_clade_to_draft[child]);
+  }
+  return mask_to_clade;
+}
+
+inline bounded_shape_preflight preflight_bounded_shape_insertion(
+    exact_expansion_context const& ctx, grammar_production const& prod,
+    refinement_shape const& shape) {
+  bounded_shape_preflight result;
+
+  std::map<std::vector<taxon_id>, clade_id> local_clade_by_taxa =
+      ctx.clade_by_taxa;
+  std::vector<std::vector<taxon_id>> local_taxa_by_clade;
+  local_taxa_by_clade.reserve(ctx.draft.clades.size() + shape.nodes.size());
+  for (auto const& clade : ctx.draft.clades)
+    local_taxa_by_clade.push_back(clade.taxa);
+
+  auto mask_to_clade = singleton_mask_to_source_child_clades(ctx, prod);
+
+  for (auto const& node : shape.nodes) {
+    if (refinement_shape_node_is_leaf(node)) continue;
+    auto taxa = union_taxa_for_child_mask(ctx.source, prod, node.mask);
+    auto found = local_clade_by_taxa.find(taxa);
+    clade_id cid = no_clade;
+    if (found != local_clade_by_taxa.end()) {
+      cid = found->second;
+    } else {
+      if (node.mask == shape.nodes[shape.root].mask) {
+        throw std::runtime_error(
+            "polytomy refinement: bounded full mask did not resolve to the "
+            "observed parent clade during preflight");
+      }
+      if (local_taxa_by_clade.size() >= static_cast<std::size_t>(no_clade)) {
+        throw std::runtime_error(
+            "polytomy refinement: too many refined clades during bounded "
+            "preflight");
+      }
+      cid = static_cast<clade_id>(local_taxa_by_clade.size());
+      local_clade_by_taxa.emplace(taxa, cid);
+      local_taxa_by_clade.push_back(std::move(taxa));
+      ++result.new_clades;
+    }
+    mask_to_clade[node.mask] = cid;
+  }
+
+  std::map<detail::production_map_key, bool> local_new_productions;
+  for (auto const& node : shape.nodes) {
+    if (refinement_shape_node_is_leaf(node)) continue;
+    auto parent = mask_to_clade.at(node.mask);
+    auto const& left = shape.nodes.at(node.left);
+    auto const& right = shape.nodes.at(node.right);
+    std::vector<clade_id> children{mask_to_clade.at(left.mask),
+                                   mask_to_clade.at(right.mask)};
+    if (ctx.options.canonicalize_binary_children) {
+      std::stable_sort(
+          children.begin(), children.end(), [&](clade_id lhs, clade_id rhs) {
+            return local_clade_id_key_less(local_taxa_by_clade, lhs, rhs);
+          });
+    }
+
+    detail::production_map_key key{parent, std::move(children)};
+    if (ctx.production_by_key.find(key) != ctx.production_by_key.end())
+      continue;
+    if (!local_new_productions.emplace(std::move(key), true).second) continue;
+    ++result.new_productions;
+  }
+
+  return result;
+}
+
+inline bool bounded_shape_fits_budget(
+    exact_expansion_context const& ctx, polytomy_event_audit const& event,
+    bounded_shape_preflight const& preflight,
+    bounded_event_budget const& budget) {
+  return !addition_exceeds_cap(event.new_clades_added, preflight.new_clades,
+                               budget.clades) &&
+         !addition_exceeds_cap(ctx.total_new_clades, preflight.new_clades,
+                               ctx.options.max_total_new_clades) &&
+         !addition_exceeds_cap(event.new_productions_added,
+                               preflight.new_productions, budget.productions) &&
+         !addition_exceeds_cap(ctx.total_new_productions,
+                               preflight.new_productions,
+                               ctx.options.max_total_new_productions);
+}
+
+inline void add_bounded_shape(
+    exact_expansion_context& ctx, grammar_production const& prod,
+    production_id source_pid,
+    std::vector<std::size_t> const& source_parent_nodes,
+    refinement_shape const& shape, polytomy_event_audit& event,
+    std::vector<production_id>& selected_productions) {
+  auto mask_to_clade = singleton_mask_to_source_child_clades(ctx, prod);
+
+  for (auto const& node : shape.nodes) {
+    if (refinement_shape_node_is_leaf(node)) continue;
+    auto taxa = union_taxa_for_child_mask(ctx.source, prod, node.mask);
+    auto origin = node.mask == shape.nodes[shape.root].mask
+                      ? refined_clade_origin::observed_input
+                      : refined_clade_origin::synthetic_polytomy_intermediate;
+    auto [cid, _] = ctx.ensure_refined_clade(
+        std::move(taxa), origin, source_pid, source_parent_nodes, &event);
+    mask_to_clade[node.mask] = cid;
+  }
+
+  for (auto const& node : shape.nodes) {
+    if (refinement_shape_node_is_leaf(node)) continue;
+    auto const& left = shape.nodes.at(node.left);
+    auto const& right = shape.nodes.at(node.right);
+
+    grammar_production candidate;
+    candidate.parent = mask_to_clade.at(node.mask);
+    candidate.children = {mask_to_clade.at(left.mask),
+                          mask_to_clade.at(right.mask)};
+    candidate.multiplicity = 0;
+
+    auto [pid, _] = ctx.add_production(
+        std::move(candidate),
+        refined_production_origin::synthetic_polytomy_refinement, {source_pid},
+        source_parent_nodes, &event);
+    selected_productions.push_back(pid);
+  }
+}
+
+inline std::uint64_t represented_refinement_count_from_sparse_splits(
+    std::uint64_t mask,
+    std::map<std::uint64_t,
+             std::set<std::pair<std::uint64_t, std::uint64_t>>> const& splits,
+    std::map<std::uint64_t, std::uint64_t>& memo, bool& saturated) {
+  if (mask == 0) return 0;
+  if (std::popcount(mask) == 1) return 1;
+  auto memo_found = memo.find(mask);
+  if (memo_found != memo.end()) return memo_found->second;
+
+  std::uint64_t total = 0;
+  auto split_found = splits.find(mask);
+  if (split_found != splits.end()) {
+    for (auto const& [left, right] : split_found->second) {
+      auto left_count = represented_refinement_count_from_sparse_splits(
+          left, splits, memo, saturated);
+      auto right_count = represented_refinement_count_from_sparse_splits(
+          right, splits, memo, saturated);
+      auto product = detail::saturated_mul(left_count, right_count,
+                                           saturated);
+      total = detail::saturated_add(total, product, saturated);
+    }
+  }
+
+  memo.emplace(mask, total);
+  return total;
+}
+
+inline std::uint64_t clade_mask_for_source_child_unions(
+    clade_grammar const& source, grammar_production const& prod,
+    std::vector<taxon_id> const& taxa) {
+  std::uint64_t mask = 0;
+  std::vector<taxon_id> reconstructed;
+  for (std::size_t i = 0; i < prod.children.size(); ++i) {
+    auto const& child_taxa = source.clades[prod.children[i]].taxa;
+    std::vector<taxon_id> overlap;
+    std::set_intersection(taxa.begin(), taxa.end(), child_taxa.begin(),
+                          child_taxa.end(), std::back_inserter(overlap));
+    if (overlap.empty()) continue;
+    if (overlap != child_taxa) return 0;
+    mask |= std::uint64_t{1} << i;
+    reconstructed.insert(reconstructed.end(), child_taxa.begin(),
+                         child_taxa.end());
+  }
+  std::sort(reconstructed.begin(), reconstructed.end());
+  reconstructed.erase(std::unique(reconstructed.begin(), reconstructed.end()),
+                      reconstructed.end());
+  return reconstructed == taxa ? mask : 0;
+}
+
+inline std::uint64_t represented_refinement_count_for_bounded_event(
+    exact_expansion_context const& ctx, production_id source_pid,
+    bool& saturated) {
+  auto const& source = ctx.source;
+  if (source_pid == no_production || source_pid >= source.productions.size()) {
+    throw std::runtime_error(
+        "polytomy refinement: bounded count source production out of range");
+  }
+  auto const& prod = source.productions[source_pid];
+  auto arity = prod.children.size();
+  if (arity == 0 || arity > 63) {
+    saturated = true;
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+
+  std::vector<std::uint64_t> clade_to_mask(ctx.draft.clades.size(), 0);
+  for (std::size_t cid = 0; cid < ctx.draft.clades.size(); ++cid) {
+    clade_to_mask[cid] = clade_mask_for_source_child_unions(
+        source, prod, ctx.draft.clades[cid].taxa);
+  }
+
+  std::map<std::uint64_t,
+           std::set<std::pair<std::uint64_t, std::uint64_t>>>
+      splits;
+  for (auto const& record : ctx.productions) {
+    auto const& candidate = record.prod;
+    if (candidate.children.size() != 2) continue;
+    if (candidate.parent >= clade_to_mask.size()) continue;
+    auto parent_mask = clade_to_mask[candidate.parent];
+    if (parent_mask == 0 || std::popcount(parent_mask) == 1) continue;
+    auto left = candidate.children[0] < clade_to_mask.size()
+                    ? clade_to_mask[candidate.children[0]]
+                    : 0;
+    auto right = candidate.children[1] < clade_to_mask.size()
+                     ? clade_to_mask[candidate.children[1]]
+                     : 0;
+    if (left == 0 || right == 0) continue;
+    if ((left & right) != 0 || (left | right) != parent_mask) continue;
+    auto split = std::minmax(left, right);
+    splits[parent_mask].emplace(split.first, split.second);
+  }
+
+  auto full = (std::uint64_t{1} << arity) - 1;
+  std::map<std::uint64_t, std::uint64_t> memo;
+  return represented_refinement_count_from_sparse_splits(full, splits, memo,
+                                                         saturated);
+}
+
+inline polytomy_event_audit expand_kary_production_bounded(
+    exact_expansion_context& ctx, production_id source_pid,
+    std::size_t remaining_events) {
+  auto const& source = ctx.source;
+  if (source_pid == no_production || source_pid >= source.productions.size()) {
+    throw std::runtime_error(
+        "polytomy refinement: source k-ary production out of range");
+  }
+  auto const& prod = source.productions[source_pid];
+
+  polytomy_event_audit event;
+  event.source_production = source_pid;
+  event.parent = ctx.source_clade_to_draft.at(prod.parent);
+  event.arity = prod.children.size();
+  event.source_multiplicity = prod.multiplicity;
+  event.expanded = true;
+  event.exact = false;
+
+  if (event.arity < 3) {
+    throw std::runtime_error(
+        "polytomy refinement: bounded expansion expected arity >= 3");
+  }
+  if (event.arity > 63) {
+    throw std::runtime_error(
+        "polytomy refinement: bounded expansion requires arity <= 63");
+  }
+  if (ctx.options.expand_child_group_alternatives) {
+    throw std::runtime_error(
+        "polytomy refinement: child-group alternative expansion is not "
+        "implemented");
+  }
+  if (!production_children_partition_parent(source, prod)) {
+    throw std::runtime_error(
+        "polytomy refinement: k-ary production children do not partition "
+        "the parent clade");
+  }
+
+  auto generated = generate_bounded_refinement_shapes(
+      event.arity, ctx.options.max_shapes_per_polytomy);
+  auto const& shapes = generated.shapes;
+  if (shapes.empty()) {
+    throw std::runtime_error(
+        "polytomy refinement: bounded shape generation produced no shapes");
+  }
+  for (auto const& shape : shapes) validate_refinement_shape(shape, event.arity);
+
+  auto budget = compute_bounded_event_budget(ctx, remaining_events);
+  auto source_parent_nodes = production_parent_nodes(prod);
+  std::vector<production_id> selected_productions;
+
+  for (auto const& shape : shapes) {
+    if (event.selected_seed_shape_count >=
+        ctx.options.max_shapes_per_polytomy) {
+      event.truncated_by_shape_cap = true;
+      break;
+    }
+
+    auto preflight = preflight_bounded_shape_insertion(ctx, prod, shape);
+    if (!bounded_shape_fits_budget(ctx, event, preflight, budget)) {
+      event.truncated_by_production_cap = true;
+      break;
+    }
+
+    add_bounded_shape(ctx, prod, source_pid, source_parent_nodes, shape, event,
+                      selected_productions);
+    ++event.selected_seed_shape_count;
+  }
+
+  if (event.selected_seed_shape_count == 0) {
+    event.truncated_by_production_cap = true;
+    throw std::runtime_error(
+        "polytomy refinement: bounded expansion caps do not permit one "
+        "complete binary seed shape");
+  }
+
+  if (generated.total_shape_count_saturated ||
+      event.selected_seed_shape_count < generated.total_shape_count) {
+    if (!event.truncated_by_production_cap ||
+        event.selected_seed_shape_count >= ctx.options.max_shapes_per_polytomy ||
+        !generated.exhaustive) {
+      event.truncated_by_shape_cap = true;
+    }
+  }
+
+  bool expected_saturated = false;
+  auto expected = rooted_binary_refinement_count(event.arity,
+                                                 expected_saturated);
+  event.refinement_count_saturated = expected_saturated;
+  event.exact = generated.exhaustive && !expected_saturated &&
+                event.selected_seed_shape_count == expected &&
+                !event.truncated_by_shape_cap &&
+                !event.truncated_by_production_cap;
+  if (!event.exact) {
+    sort_unique(selected_productions);
+    for (auto pid : selected_productions) {
+      if (pid >= ctx.productions.size()) {
+        throw std::runtime_error(
+            "polytomy refinement: bounded selected production out of range");
+      }
+      ctx.productions[pid].info.exact_refinement_component = false;
+    }
+  }
+
+  return event;
+}
+
+inline polytomy_refinement_result finalize_exact_expansion(
+    clade_grammar_build_result&& built, exact_expansion_context& ctx,
+    std::vector<polytomy_event_audit> events);
+
+inline void recompute_bounded_event_counts_from_final_context(
+    exact_expansion_context const& ctx,
+    std::vector<polytomy_event_audit>& events) {
+  for (auto& event : events) {
+    bool saturated = false;
+    event.represented_refinement_count =
+        represented_refinement_count_for_bounded_event(
+            ctx, event.source_production, saturated);
+
+    bool expected_saturated = false;
+    auto expected = rooted_binary_refinement_count(event.arity,
+                                                   expected_saturated);
+    event.refinement_count_saturated = saturated || expected_saturated;
+    if (!saturated && !expected_saturated &&
+        event.represented_refinement_count > expected) {
+      throw std::runtime_error(
+          "polytomy refinement: bounded subgrammar represents more "
+          "derivations than the complete soft-polytomy space");
+    }
+
+    auto actual_full_soft_space = !saturated && !expected_saturated &&
+                                  event.represented_refinement_count ==
+                                      expected;
+    event.exact = event.exact && actual_full_soft_space &&
+                  !event.truncated_by_shape_cap &&
+                  !event.truncated_by_production_cap;
+  }
+}
+
+inline polytomy_refinement_result make_bounded_expansion_result(
+    clade_grammar_build_result&& built,
+    polytomy_refinement_options const& refinement_opts) {
+  exact_expansion_context ctx{built.grammar, refinement_opts};
+  copy_observed_binary_productions(ctx);
+
+  auto kary = kary_productions(ctx.source);
+  std::vector<polytomy_event_audit> events;
+  events.reserve(kary.size());
+  for (std::size_t i = 0; i < kary.size(); ++i) {
+    auto remaining_events = kary.size() - i;
+    events.push_back(
+        expand_kary_production_bounded(ctx, kary[i], remaining_events));
+  }
+  recompute_bounded_event_counts_from_final_context(ctx, events);
+
+  return finalize_exact_expansion(std::move(built), ctx, std::move(events));
+}
+
 inline void sort_unique_provenance(polytomy_refinement_result& result) {
   for (auto& info : result.clade_info) {
     sort_unique(info.source_kary_productions);
@@ -1116,11 +1900,24 @@ inline polytomy_refinement_result finalize_exact_expansion(
       grammar_has_kary_productions(result.grammar);
   result.audit.binary_chart_compatible =
       grammar_is_binary_chart_compatible(result.grammar);
+  result.audit.any_truncated = std::any_of(
+      result.audit.events.begin(), result.audit.events.end(),
+      [](polytomy_event_audit const& event) {
+        return event.truncated_by_shape_cap ||
+               event.truncated_by_production_cap;
+      });
+  result.audit.any_refused = std::any_of(
+      result.audit.events.begin(), result.audit.events.end(),
+      [](polytomy_event_audit const& event) {
+        return event.refused_by_exact_cap;
+      });
+  auto all_events_exact = std::all_of(
+      result.audit.events.begin(), result.audit.events.end(),
+      [](polytomy_event_audit const& event) { return event.exact; });
   result.audit.exact_for_soft_polytomies =
       !result.audit.contains_kary_productions &&
-      result.audit.binary_chart_compatible;
-  result.audit.any_truncated = false;
-  result.audit.any_refused = false;
+      result.audit.binary_chart_compatible && all_events_exact &&
+      !result.audit.any_truncated && !result.audit.any_refused;
 
   sort_unique_provenance(result);
   validate_expanded_public_maps(result, source);
@@ -1254,19 +2051,50 @@ inline polytomy_refinement_result build_polytomy_refined_clade_grammar(
         return polytomy_refinement_detail::make_phase0_result(
             std::move(built), refinement_opts.mode);
       }
-      throw std::runtime_error(
-          "polytomy refinement: bounded soft-polytomy expansion is not "
-          "implemented yet; use expand_soft_exact_or_fail for exact "
-          "subset-closure expansion of small polytomies");
+      return polytomy_refinement_detail::make_bounded_expansion_result(
+          std::move(built), refinement_opts);
     }
   }
 
   throw std::runtime_error("polytomy refinement: unknown polytomy mode");
 }
 
+inline char const* polytomy_refinement_status_label(
+    polytomy_refinement_audit const& audit) {
+  if (audit.contains_kary_productions) return "POLYTOMY_REFINEMENT_AUDIT_KARY";
+  if (audit.any_truncated) return "POLYTOMY_REFINEMENT_TRUNCATED";
+  if (audit.exact_for_soft_polytomies) return "POLYTOMY_REFINEMENT_EXACT";
+  return "POLYTOMY_REFINEMENT_BOUNDED";
+}
+
+inline bool polytomy_refinement_allows_binary_charting(
+    polytomy_refinement_audit const& audit) {
+  return audit.binary_chart_compatible && !audit.contains_kary_productions;
+}
+
+inline void require_polytomy_refinement_binary_charting(
+    polytomy_refinement_audit const& audit, char const* context) {
+  if (polytomy_refinement_allows_binary_charting(audit)) return;
+  throw std::runtime_error(
+      std::string{context} +
+      ": WRIC binary charting requires a binary-compatible polytomy "
+      "refinement; status=" +
+      polytomy_refinement_status_label(audit));
+}
+
+inline void require_polytomy_refinement_exact_for_soft_polytomies(
+    polytomy_refinement_audit const& audit, char const* context) {
+  if (audit.exact_for_soft_polytomies) return;
+  throw std::runtime_error(
+      std::string{context} +
+      ": refusing to claim exact full-soft-polytomy results for " +
+      polytomy_refinement_status_label(audit));
+}
+
 inline std::ostream& print_polytomy_refinement_audit(
     std::ostream& out, polytomy_refinement_audit const& audit) {
   out << "polytomy_refinement:\n";
+  out << "  status: " << polytomy_refinement_status_label(audit) << "\n";
   out << "  source_clades: " << audit.source_clade_count << "\n";
   out << "  source_productions: " << audit.source_production_count << "\n";
   out << "  source_kary_productions: " << audit.source_kary_production_count
@@ -1286,6 +2114,22 @@ inline std::ostream& print_polytomy_refinement_audit(
       << "\n";
   out << "  any_refused: " << (audit.any_refused ? "true" : "false") << "\n";
   out << "  events: " << audit.events.size() << "\n";
+  for (auto const& event : audit.events) {
+    out << "    - source_production: " << event.source_production << "\n";
+    out << "      parent_clade: " << event.parent << "\n";
+    out << "      arity: " << event.arity << "\n";
+    out << "      selected_seed_shapes: " << event.selected_seed_shape_count
+        << "\n";
+    out << "      represented_refinement_count: "
+        << event.represented_refinement_count
+        << (event.refinement_count_saturated ? " (saturated)" : "") << "\n";
+    out << "      expanded: " << (event.expanded ? "true" : "false") << "\n";
+    out << "      exact: " << (event.exact ? "true" : "false") << "\n";
+    out << "      truncated_by_shape_cap: "
+        << (event.truncated_by_shape_cap ? "true" : "false") << "\n";
+    out << "      truncated_by_production_cap: "
+        << (event.truncated_by_production_cap ? "true" : "false") << "\n";
+  }
   return out;
 }
 
