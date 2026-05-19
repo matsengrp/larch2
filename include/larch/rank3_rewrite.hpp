@@ -7,10 +7,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -102,6 +105,23 @@ struct rank3_option_a_result {
   }
 };
 
+enum class grammar_native_selection_kind {
+  heuristic,
+  exact,
+  caller_supplied,
+};
+
+struct grammar_native_selection_diagnostics {
+  std::size_t reachable_temp_production_count = 0;
+  std::vector<std::size_t> selected_temp_production_count_by_topology;
+  std::vector<production_id> uncovered_temp_productions;
+  grammar_native_selection_kind selection_kind =
+      grammar_native_selection_kind::heuristic;
+  bool topology_cap_truncated = false;
+  std::size_t selected_topology_count = 0;
+  std::size_t max_materialized_topologies = 0;
+};
+
 struct rank3_option_b_options {
   // Like Option A, the conservative default adds the accepted overlay tree to
   // the current history DAG via merge.  Set false to materialize a replacement
@@ -115,13 +135,16 @@ struct rank3_option_b_options {
   // they do not lower an existing edge-weight objective by default.
   float added_edge_weight = std::numeric_limits<float>::max();
 
-  // A grammar_spr_candidate materialized through Option B must carry a
-  // source_tree_move: grammar-native Option B staging is not implemented yet.
-  // When enabled, re-project that concrete move against the supplied base
-  // grammar and require it to describe the same source-tree-local rewrite as
-  // the candidate.  This deliberately does not compare against the full
-  // materialized collapsed-DAG overlay, which may contain unrelated alternative
-  // productions from the base grammar.
+  // Candidate overloads use the grammar-native materializer by default.  Set
+  // this true to explicitly replay candidate.source_tree_move through the old
+  // overlay_spr staging path.
+  bool use_source_tree_overlay_staging = false;
+
+  // When source-tree overlay staging is requested, re-project that concrete
+  // move against the supplied base grammar and require it to describe the same
+  // source-tree-local rewrite as the candidate.  This deliberately does not
+  // compare against the full materialized collapsed-DAG overlay, which may
+  // contain unrelated alternative productions from the base grammar.
   bool validate_projected_candidate = true;
 
   // Treat absence of intended overlay-added productions after the full grammar
@@ -141,11 +164,77 @@ struct rank3_option_b_result {
   std::vector<rank3_production_taxa_key> intended_productions;
   std::vector<bool> intended_production_present;
 
+  // Populated when this result came from grammar-native materialization.
+  std::optional<grammar_native_selection_diagnostics> selection_diagnostics;
+
   [[nodiscard]] bool all_intended_productions_present() const {
     return std::all_of(intended_production_present.begin(),
                        intended_production_present.end(),
                        [](bool present) { return present; });
   }
+};
+
+enum class grammar_native_topology_policy {
+  // Default safe mode: choose deterministic concrete topologies that include
+  // reachable temporary productions when they are mutually compatible.
+  prefer_temp_deterministic,
+  // Caller supplies dense-overlay rank3_topology values.
+  explicit_topologies,
+  // Use a single-site chart/traceback over the dense overlay grammar.
+  single_site_optimal,
+  // Use Phase-5 exact multi-site B&B over the dense overlay grammar.
+  multisite_bnb_optimal,
+  // Enumerate compatible concrete topologies up to a hard cap.
+  bounded_enumeration,
+};
+
+class grammar_native_selection_error : public std::runtime_error {
+ public:
+  grammar_native_selection_diagnostics diagnostics;
+
+  grammar_native_selection_error(
+      std::string const& message,
+      grammar_native_selection_diagnostics diagnostics_)
+      : std::runtime_error(message), diagnostics(std::move(diagnostics_)) {}
+};
+
+using grammar_native_topology_selector = std::function<std::vector<rank3_topology>(
+    overlay_materialization_result const&)>;
+
+struct grammar_native_materialization_options {
+  bool include_original_dag = true;
+  bool validate = true;
+  float generated_edge_weight = std::numeric_limits<float>::max();
+  bool require_intended_productions_present = true;
+  bool require_all_reachable_temp_productions_selected = true;
+  // 0 means unlimited.  The default materializes one deterministic topology.
+  std::size_t max_materialized_topologies = 1;
+  grammar_native_topology_policy topology_policy =
+      grammar_native_topology_policy::prefer_temp_deterministic;
+  clade_grammar_options rebuild_grammar_options = {};
+
+  // Used only when topology_policy == explicit_topologies.  The IDs are dense
+  // overlay grammar IDs returned by materialize_overlay_grammar().
+  std::vector<rank3_topology> explicit_topologies;
+
+  // Optional selector hook for optimal policies whose caller already has a
+  // chart/B&B traceback.  Returned topologies use dense overlay grammar IDs.
+  grammar_native_topology_selector topology_selector = {};
+
+  // Built-in single_site_optimal inputs.  When score_ua_edge is true, provide
+  // single_site_reference_state for the scored site.
+  std::optional<leaf_site_states> single_site_leaf_states = std::nullopt;
+  chart_options single_site_chart_options = {};
+  std::optional<std::uint8_t> single_site_reference_state = std::nullopt;
+};
+
+struct grammar_native_materialization_result {
+  overlay_materialization_result overlay;
+  std::vector<rank3_topology> selected_topologies;
+  std::vector<phylo_dag> materialized_trees;
+  rank3_option_b_result merged;
+  std::vector<rank3_production_taxa_key> intended_temp_productions;
+  grammar_native_selection_diagnostics selection_diagnostics;
 };
 
 class rank3_option_b_stage {
@@ -517,6 +606,158 @@ inline void append_intended_temp_overlay_keys(
   }
 }
 
+inline std::vector<taxon_id> overlay_taxa_for_ref(
+    overlay_clade_grammar const& overlay, overlay_clade_ref ref,
+    std::string_view context) {
+  try {
+    return chart_spr_detail::clade_key_for_ref(overlay, ref).taxa;
+  } catch (std::runtime_error const& e) {
+    throw std::runtime_error(std::string{context} + ": " + e.what());
+  }
+}
+
+inline std::string taxa_vector_to_string(std::vector<taxon_id> const& taxa) {
+  std::string out{"{"};
+  for (std::size_t i = 0; i < taxa.size(); ++i) {
+    if (i != 0) out += ",";
+    out += std::to_string(taxa[i]);
+  }
+  out += "}";
+  return out;
+}
+
+inline void validate_temp_production_partition(
+    overlay_clade_grammar const& overlay, std::size_t temp_pid) {
+  if (temp_pid >= overlay.temp_productions.size()) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: temp production out of range");
+  }
+  auto const& prod = overlay.temp_productions[temp_pid];
+  if (prod.children.size() != 2) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: temp production " +
+        std::to_string(temp_pid) + " has arity " +
+        std::to_string(prod.children.size()) +
+        "; grammar-native materialization is binary-only");
+  }
+
+  auto parent_taxa = overlay_taxa_for_ref(
+      overlay, prod.parent,
+      "rank3 grammar-native materialization temp production parent");
+  std::vector<taxon_id> covered;
+  for (std::size_t child_i = 0; child_i < prod.children.size(); ++child_i) {
+    auto child_taxa = overlay_taxa_for_ref(
+        overlay, prod.children[child_i],
+        "rank3 grammar-native materialization temp production child");
+    if (child_taxa == parent_taxa) {
+      throw std::runtime_error(
+          "rank3 grammar-native materialization: temp production " +
+          std::to_string(temp_pid) + " child " + std::to_string(child_i) +
+          " has the same taxon set as its parent");
+    }
+
+    std::vector<taxon_id> overlap;
+    std::set_intersection(covered.begin(), covered.end(), child_taxa.begin(),
+                          child_taxa.end(), std::back_inserter(overlap));
+    if (!overlap.empty()) {
+      throw std::runtime_error(
+          "rank3 grammar-native materialization: temp production " +
+          std::to_string(temp_pid) +
+          " children overlap on taxa " + taxa_vector_to_string(overlap));
+    }
+
+    std::vector<taxon_id> next;
+    std::set_union(covered.begin(), covered.end(), child_taxa.begin(),
+                   child_taxa.end(), std::back_inserter(next));
+    covered = std::move(next);
+  }
+
+  if (covered != parent_taxa) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: temp production " +
+        std::to_string(temp_pid) + " children union " +
+        taxa_vector_to_string(covered) + " does not equal parent " +
+        taxa_vector_to_string(parent_taxa));
+  }
+}
+
+inline overlay_materialization_result validate_and_dense_materialize_candidate_impl(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    grammar_native_materialization_options const& options) {
+  for (auto ref : candidate.removed_productions) {
+    if (ref.space != overlay_id_space::base) {
+      throw std::runtime_error(
+          "rank3 grammar-native materialization: candidate tombstones a temp "
+          "production");
+    }
+  }
+
+  auto overlay = overlay_from_candidate(base, candidate);
+  chart_spr_detail::validate_clade_ref(overlay, candidate.moved_clade,
+                                       "candidate moved_clade");
+  chart_spr_detail::validate_clade_ref(overlay, candidate.old_parent,
+                                       "candidate old_parent");
+  chart_spr_detail::validate_clade_ref(overlay, candidate.old_sibling,
+                                       "candidate old_sibling");
+  chart_spr_detail::validate_clade_ref(overlay,
+                                       candidate.new_sibling_or_target,
+                                       "candidate new_sibling_or_target");
+  for (std::size_t i = 0; i < overlay.temp_productions.size(); ++i) {
+    validate_temp_production_partition(overlay, i);
+  }
+
+  auto materialized = materialize_overlay_grammar(overlay);
+  parsimony_chart_detail::validate_chart_grammar(materialized.grammar);
+  chart_trim_detail::validate_production_indices(materialized.grammar);
+
+  for (std::size_t i = 0; i < materialized.temp_production_to_dense.size();
+       ++i) {
+    auto dense_pid = materialized.temp_production_to_dense[i];
+    if (dense_pid == no_production) {
+      throw std::runtime_error(
+          "rank3 grammar-native materialization: temp production " +
+          std::to_string(i) + " is unreachable from the overlay root");
+    }
+    if (dense_pid >= materialized.grammar.productions.size()) {
+      throw std::runtime_error(
+          "rank3 grammar-native materialization: temp production dense id out "
+          "of range");
+    }
+  }
+  (void)options;
+  return materialized;
+}
+
+inline std::vector<production_id> reachable_temp_dense_productions(
+    overlay_materialization_result const& materialized) {
+  std::vector<production_id> result;
+  result.reserve(materialized.temp_production_to_dense.size());
+  for (auto dense_pid : materialized.temp_production_to_dense) {
+    if (dense_pid == no_production) continue;
+    if (dense_pid >= materialized.grammar.productions.size()) {
+      throw std::runtime_error(
+          "rank3 grammar-native materialization: temp dense production out of "
+          "range");
+    }
+    result.push_back(dense_pid);
+  }
+  std::sort(result.begin(), result.end());
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
+}
+
+inline bool dense_production_is_temp(
+    overlay_materialization_result const& materialized, production_id pid) {
+  if (pid == no_production ||
+      pid >= materialized.dense_production_to_ref.size()) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: dense production ref out of "
+        "range");
+  }
+  return materialized.dense_production_to_ref[pid].space ==
+         overlay_id_space::temp;
+}
+
 inline std::vector<bool> production_key_presence(
     clade_grammar const& grammar,
     std::vector<rank3_production_taxa_key> const& keys) {
@@ -822,6 +1063,360 @@ inline rank3_topology first_rank3_topology(clade_grammar const& grammar) {
   return topology;
 }
 
+namespace rank3_detail {
+
+inline std::vector<std::vector<taxon_id>> production_child_taxa_for_sort(
+    clade_grammar const& grammar, production_id pid) {
+  if (pid == no_production || pid >= grammar.productions.size()) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: production id out of range");
+  }
+  std::vector<std::vector<taxon_id>> child_taxa;
+  child_taxa.reserve(grammar.productions[pid].children.size());
+  for (auto child : grammar.productions[pid].children) {
+    if (child == no_clade || child >= grammar.clades.size()) {
+      throw std::runtime_error(
+          "rank3 grammar-native materialization: production child out of "
+          "range");
+    }
+    child_taxa.push_back(grammar.clades[child].taxa);
+  }
+  std::sort(child_taxa.begin(), child_taxa.end());
+  return child_taxa;
+}
+
+inline std::vector<production_id> sorted_productions_for_native_selection(
+    overlay_materialization_result const& materialized, clade_id clade) {
+  auto const& grammar = materialized.grammar;
+  if (clade == no_clade || clade >= grammar.productions_by_parent.size()) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: parent clade out of range");
+  }
+  auto productions = grammar.productions_by_parent[clade];
+  std::stable_sort(productions.begin(), productions.end(),
+                   [&](production_id lhs, production_id rhs) {
+                     auto lhs_temp = dense_production_is_temp(materialized,
+                                                              lhs);
+                     auto rhs_temp = dense_production_is_temp(materialized,
+                                                              rhs);
+                     if (lhs_temp != rhs_temp) return lhs_temp > rhs_temp;
+                     if (lhs != rhs) return lhs < rhs;
+                     return production_child_taxa_for_sort(grammar, lhs) <
+                            production_child_taxa_for_sort(grammar, rhs);
+                   });
+  return productions;
+}
+
+inline void merge_topology_into(rank3_topology& dst,
+                                rank3_topology const& src) {
+  if (dst.selected_production_by_clade.size() !=
+          src.selected_production_by_clade.size() ||
+      dst.used_production.size() != src.used_production.size()) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: topology shape mismatch");
+  }
+  for (std::size_t cid = 0; cid < src.selected_production_by_clade.size();
+       ++cid) {
+    auto pid = src.selected_production_by_clade[cid];
+    if (pid == no_production) continue;
+    auto& selected = dst.selected_production_by_clade[cid];
+    if (selected != no_production && selected != pid) {
+      throw std::runtime_error(
+          "rank3 grammar-native materialization: incompatible child topology "
+          "choices for clade " +
+          std::to_string(cid));
+    }
+    selected = pid;
+  }
+  for (std::size_t pid = 0; pid < src.used_production.size(); ++pid) {
+    dst.used_production[pid] = dst.used_production[pid] ||
+                               src.used_production[pid];
+  }
+}
+
+inline rank3_topology combine_native_child_topologies(
+    clade_grammar const& grammar, clade_id parent, production_id pid,
+    rank3_topology const& left, rank3_topology const& right) {
+  auto topology = make_empty_rank3_topology(grammar);
+  merge_topology_into(topology, left);
+  merge_topology_into(topology, right);
+  if (parent == no_clade || parent >= topology.selected_production_by_clade.size()) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: parent clade out of range");
+  }
+  auto& selected = topology.selected_production_by_clade[parent];
+  if (selected != no_production && selected != pid) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: incompatible parent topology "
+        "choice");
+  }
+  selected = pid;
+  if (pid == no_production || pid >= topology.used_production.size()) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: selected production out of "
+        "range");
+  }
+  topology.used_production[pid] = true;
+  return topology;
+}
+
+inline std::vector<rank3_topology> enumerate_native_topologies_from_clade(
+    overlay_materialization_result const& materialized, clade_id clade,
+    std::size_t max_topologies) {
+  auto const& grammar = materialized.grammar;
+  if (clade == no_clade || clade >= grammar.clades.size()) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: clade out of range");
+  }
+  if (grammar.clades[clade].taxa.size() == 1) {
+    return {make_empty_rank3_topology(grammar)};
+  }
+
+  std::vector<rank3_topology> result;
+  auto productions = sorted_productions_for_native_selection(materialized,
+                                                             clade);
+  if (productions.empty()) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: non-singleton clade has no "
+        "production");
+  }
+
+  for (auto pid : productions) {
+    if (max_topologies != 0 && result.size() >= max_topologies) break;
+    auto const& prod = grammar.productions[pid];
+    if (prod.parent != clade) {
+      throw std::runtime_error(
+          "rank3 grammar-native materialization: production parent mismatch");
+    }
+    chart_trim_detail::validate_binary_production_for_trim(grammar, prod, pid);
+    auto left_topologies = enumerate_native_topologies_from_clade(
+        materialized, prod.children[0], max_topologies);
+    auto right_topologies = enumerate_native_topologies_from_clade(
+        materialized, prod.children[1], max_topologies);
+
+    for (auto const& left : left_topologies) {
+      for (auto const& right : right_topologies) {
+        if (max_topologies != 0 && result.size() >= max_topologies) break;
+        auto topology = combine_native_child_topologies(grammar, clade, pid,
+                                                        left, right);
+        result.push_back(std::move(topology));
+      }
+      if (max_topologies != 0 && result.size() >= max_topologies) break;
+    }
+  }
+  return result;
+}
+
+inline std::vector<bool> union_used_productions(
+    clade_grammar const& grammar, std::vector<rank3_topology> const& topologies) {
+  std::vector<bool> used(grammar.productions.size(), false);
+  for (auto const& topology : topologies) {
+    auto reachable = validate_topology(grammar, topology);
+    for (std::size_t pid = 0; pid < reachable.size(); ++pid)
+      used[pid] = used[pid] || reachable[pid];
+  }
+  return used;
+}
+
+inline std::string production_id_vector_to_string(
+    std::vector<production_id> const& ids) {
+  std::string out{"["};
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    if (i != 0) out += ",";
+    out += std::to_string(ids[i]);
+  }
+  out += "]";
+  return out;
+}
+
+struct native_topology_selection_result {
+  std::vector<rank3_topology> topologies;
+  grammar_native_selection_diagnostics diagnostics;
+};
+
+inline grammar_native_selection_diagnostics build_selection_diagnostics(
+    overlay_materialization_result const& materialized,
+    std::vector<rank3_topology> const& topologies,
+    grammar_native_selection_kind selection_kind, bool cap_truncated,
+    std::size_t max_materialized_topologies) {
+  auto temp_dense = reachable_temp_dense_productions(materialized);
+  std::vector<bool> covered(materialized.grammar.productions.size(), false);
+
+  grammar_native_selection_diagnostics diagnostics;
+  diagnostics.reachable_temp_production_count = temp_dense.size();
+  diagnostics.selection_kind = selection_kind;
+  diagnostics.topology_cap_truncated = cap_truncated;
+  diagnostics.selected_topology_count = topologies.size();
+  diagnostics.max_materialized_topologies = max_materialized_topologies;
+  diagnostics.selected_temp_production_count_by_topology.reserve(
+      topologies.size());
+
+  for (auto const& topology : topologies) {
+    auto reachable = validate_topology(materialized.grammar, topology);
+    std::size_t selected_temp_count = 0;
+    for (auto dense_pid : temp_dense) {
+      if (dense_pid >= reachable.size()) {
+        throw std::runtime_error(
+            "rank3 grammar-native materialization: temp production dense id "
+            "out of topology range");
+      }
+      if (!reachable[dense_pid]) continue;
+      ++selected_temp_count;
+      covered[dense_pid] = true;
+    }
+    diagnostics.selected_temp_production_count_by_topology.push_back(
+        selected_temp_count);
+  }
+
+  for (auto dense_pid : temp_dense) {
+    if (dense_pid >= covered.size() || !covered[dense_pid])
+      diagnostics.uncovered_temp_productions.push_back(dense_pid);
+  }
+  return diagnostics;
+}
+
+inline void require_reachable_temp_productions_selected(
+    grammar_native_materialization_options const& options,
+    grammar_native_selection_diagnostics const& diagnostics) {
+  if (!options.require_all_reachable_temp_productions_selected) return;
+  if (diagnostics.uncovered_temp_productions.empty()) return;
+  throw grammar_native_selection_error(
+      "rank3 grammar-native materialization: reachable temp productions " +
+          production_id_vector_to_string(
+              diagnostics.uncovered_temp_productions) +
+          " are not selected by the materialized topology set",
+      diagnostics);
+}
+
+inline void enforce_native_selection_cap(
+    std::vector<rank3_topology> const& topologies,
+    grammar_native_materialization_options const& options,
+    std::string_view context) {
+  if (options.max_materialized_topologies == 0) return;
+  if (topologies.size() <= options.max_materialized_topologies) return;
+  throw std::runtime_error(
+      "rank3 grammar-native materialization: " + std::string{context} +
+      " topology count exceeds max_materialized_topologies");
+}
+
+inline rank3_topology single_site_native_topology(
+    clade_grammar const& grammar,
+    grammar_native_materialization_options const& options) {
+  if (!options.single_site_leaf_states.has_value()) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: single_site_optimal requires "
+        "single_site_leaf_states or topology_selector");
+  }
+
+  auto const& chart_options = options.single_site_chart_options;
+  auto chart = build_single_site_chart(grammar,
+                                       *options.single_site_leaf_states,
+                                       chart_options);
+  if (chart_options.score_ua_edge) {
+    if (!options.single_site_reference_state.has_value()) {
+      throw std::runtime_error(
+          "rank3 grammar-native materialization: single_site_optimal with "
+          "score_ua_edge requires single_site_reference_state");
+    }
+    auto outside = build_single_site_outside_chart(
+        grammar, chart, chart_options, *options.single_site_reference_state);
+    return rank3_topology_from_traceback(
+        grammar, deterministic_optimal_single_site_traceback(grammar, chart,
+                                                             outside));
+  }
+
+  auto outside = build_single_site_outside_chart(grammar, chart,
+                                                chart_options);
+  return rank3_topology_from_traceback(
+      grammar, deterministic_optimal_single_site_traceback(grammar, chart,
+                                                           outside));
+}
+
+inline native_topology_selection_result select_native_topologies(
+    overlay_materialization_result const& materialized,
+    grammar_native_materialization_options const& options) {
+  auto const& grammar = materialized.grammar;
+  native_topology_selection_result result;
+  auto selection_kind = grammar_native_selection_kind::heuristic;
+  bool cap_truncated = false;
+
+  switch (options.topology_policy) {
+    case grammar_native_topology_policy::explicit_topologies:
+      if (options.explicit_topologies.empty()) {
+        throw std::runtime_error(
+            "rank3 grammar-native materialization: explicit topology policy "
+            "requires at least one topology");
+      }
+      result.topologies = options.explicit_topologies;
+      enforce_native_selection_cap(result.topologies, options, "explicit");
+      selection_kind = grammar_native_selection_kind::caller_supplied;
+      break;
+
+    case grammar_native_topology_policy::prefer_temp_deterministic:
+    case grammar_native_topology_policy::bounded_enumeration: {
+      auto requested = options.max_materialized_topologies;
+      auto enumeration_cap = requested;
+      if (requested != 0 &&
+          requested < std::numeric_limits<std::size_t>::max()) {
+        enumeration_cap = requested + 1;
+      }
+      result.topologies = enumerate_native_topologies_from_clade(
+          materialized, grammar.root_clade, enumeration_cap);
+      if (requested != 0 && result.topologies.size() > requested) {
+        cap_truncated = true;
+        result.topologies.resize(requested);
+      }
+      if (result.topologies.empty()) {
+        throw std::runtime_error(
+            "rank3 grammar-native materialization: no concrete topologies "
+            "selected from dense overlay grammar");
+      }
+      selection_kind = grammar_native_selection_kind::heuristic;
+      break;
+    }
+
+    case grammar_native_topology_policy::single_site_optimal:
+      if (options.topology_selector) {
+        result.topologies = options.topology_selector(materialized);
+        selection_kind = grammar_native_selection_kind::caller_supplied;
+      } else {
+        result.topologies.push_back(single_site_native_topology(grammar,
+                                                                options));
+        selection_kind = grammar_native_selection_kind::exact;
+      }
+      enforce_native_selection_cap(result.topologies, options, "single-site");
+      break;
+
+    case grammar_native_topology_policy::multisite_bnb_optimal:
+      if (!options.topology_selector) {
+        throw std::runtime_error(
+            "rank3 grammar-native materialization: multisite_bnb_optimal "
+            "requires topology_selector returning dense-overlay B&B "
+            "topologies");
+      }
+      result.topologies = options.topology_selector(materialized);
+      enforce_native_selection_cap(result.topologies, options, "multi-site");
+      selection_kind = grammar_native_selection_kind::caller_supplied;
+      break;
+  }
+
+  if (result.topologies.empty()) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: topology selector returned no "
+        "topologies");
+  }
+
+  for (auto const& topology : result.topologies)
+    (void)validate_topology(grammar, topology);
+  result.diagnostics = build_selection_diagnostics(
+      materialized, result.topologies, selection_kind, cap_truncated,
+      options.max_materialized_topologies);
+  require_reachable_temp_productions_selected(options, result.diagnostics);
+  return result;
+}
+
+}  // namespace rank3_detail
+
 inline rank3_topology rank3_topology_preferring_productions(
     clade_grammar const& grammar,
     std::vector<production_id> const& preferred_productions) {
@@ -1095,6 +1690,124 @@ inline rank3_option_a_result materialize_rank3_option_a_single_site(
                                     options);
 }
 
+inline overlay_materialization_result validate_and_dense_materialize_candidate(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    grammar_native_materialization_options const& options = {}) {
+  return rank3_detail::validate_and_dense_materialize_candidate_impl(
+      base, candidate, options);
+}
+
+inline rank3_option_b_result merge_rank3_native_trees_option_b(
+    phylo_dag& source, clade_grammar const& base_grammar,
+    std::vector<phylo_dag>& trees,
+    std::vector<rank3_production_taxa_key> intended_productions,
+    grammar_native_materialization_options const& options = {}) {
+  if (trees.empty()) {
+    throw std::runtime_error(
+        "rank3 grammar-native materialization: no generated trees to merge");
+  }
+
+  merge merger{get_reference_sequence(source)};
+  if (options.include_original_dag) {
+    build_clade_offsets(source);
+    merger.add_dag(source);
+  }
+  for (auto& tree : trees) {
+    if (get_reference_sequence(tree) != get_reference_sequence(source)) {
+      throw std::runtime_error(
+          "rank3 grammar-native materialization: generated tree reference "
+          "mismatch");
+    }
+    build_clade_offsets(tree);
+    merger.add_dag(tree);
+  }
+
+  rank3_option_b_result result;
+  result.materialized_tree_count = trees.size();
+  result.staged_in_overlay = false;
+  result.used_source_tree_move = false;
+  result.intended_productions = std::move(intended_productions);
+  result.dag = std::move(merger.get_result());
+  build_clade_offsets(result.dag);
+  if (options.validate) {
+    validate_dag(result.dag,
+                 "rank3 grammar-native materialized/merged DAG",
+                 thread_pool::get_default());
+  }
+  result.rebuilt = build_clade_grammar_with_audit(
+      result.dag, options.rebuild_grammar_options);
+  rank3_detail::validate_same_taxa_for_rank3(
+      "rank3 grammar-native materialization", base_grammar,
+      result.rebuilt.grammar);
+  result.intended_production_present = rank3_detail::production_key_presence(
+      result.rebuilt.grammar, result.intended_productions);
+
+  if (options.require_intended_productions_present) {
+    for (std::size_t i = 0; i < result.intended_productions.size(); ++i) {
+      if (result.intended_production_present[i]) continue;
+      throw std::runtime_error(
+          "rank3 grammar-native materialization: intended production missing "
+          "after grammar rebuild: " +
+          rank3_detail::production_key_to_string(
+              result.intended_productions[i]));
+    }
+  }
+  return result;
+}
+
+inline grammar_native_materialization_result materialize_grammar_native_overlay(
+    phylo_dag& source, clade_grammar const& base_grammar,
+    grammar_spr_candidate const& candidate,
+    grammar_native_materialization_options const& options = {}) {
+  // Validate source leaf compact genomes before selecting/materializing trees;
+  // materialize_rank3_tree_from_topology repeats this check for the dense
+  // grammar, but doing it here produces a grammar-native diagnostic before any
+  // generated tree work starts.
+  try {
+    (void)rank3_detail::collect_leaf_compact_genomes(source, base_grammar);
+  } catch (std::runtime_error const& e) {
+    throw std::runtime_error(
+        std::string{"rank3 grammar-native materialization: "} + e.what());
+  }
+
+  grammar_native_materialization_result result;
+  result.overlay = validate_and_dense_materialize_candidate(base_grammar,
+                                                            candidate,
+                                                            options);
+  rank3_detail::append_intended_temp_overlay_keys(
+      result.overlay, result.intended_temp_productions);
+
+  auto selection = rank3_detail::select_native_topologies(result.overlay,
+                                                          options);
+  result.selected_topologies = std::move(selection.topologies);
+  result.selection_diagnostics = std::move(selection.diagnostics);
+  result.materialized_trees = materialize_rank3_trees_from_topologies(
+      source, result.overlay.grammar, result.selected_topologies,
+      options.validate, options.generated_edge_weight);
+
+  result.merged = merge_rank3_native_trees_option_b(
+      source, base_grammar, result.materialized_trees,
+      result.intended_temp_productions, options);
+  return result;
+}
+
+inline rank3_option_b_result materialize_rank3_option_b_grammar_native(
+    phylo_dag& source, clade_grammar const& base_grammar,
+    grammar_spr_candidate const& candidate,
+    rank3_option_b_options const& options = {}) {
+  grammar_native_materialization_options native_options;
+  native_options.include_original_dag = options.include_original_dag;
+  native_options.validate = options.validate;
+  native_options.generated_edge_weight = options.added_edge_weight;
+  native_options.require_intended_productions_present =
+      options.require_intended_productions_present;
+  native_options.rebuild_grammar_options = options.rebuild_grammar_options;
+  auto result = materialize_grammar_native_overlay(source, base_grammar,
+                                                   candidate, native_options);
+  result.merged.selection_diagnostics = result.selection_diagnostics;
+  return std::move(result.merged);
+}
+
 inline spr_move rank3_option_b_validated_move(phylo_dag& source,
                                               spr_move move) {
   build_clade_offsets(source);
@@ -1140,9 +1853,8 @@ inline spr_move rank3_option_b_validated_candidate_move(
     rank3_option_b_options const& options = {}) {
   if (!candidate.source_tree_move.has_value()) {
     throw std::runtime_error(
-        "rank3 option B: grammar_spr_candidate must carry source_tree_move; "
-        "grammar-native Option B materialization is not implemented yet; use "
-        "Option A or bootstrap/project a concrete tree SPR move first");
+        "rank3 option B: overlay_spr staging requires source_tree_move; use "
+        "materialize_rank3_option_b for grammar-native materialization");
   }
 
   auto move = rank3_option_b_validated_move(source,
@@ -1272,12 +1984,17 @@ inline rank3_option_b_result materialize_rank3_option_b(
     phylo_dag& source, clade_grammar const& base_grammar,
     grammar_spr_candidate const& candidate,
     rank3_option_b_options const& options = {}) {
+  if (!options.use_source_tree_overlay_staging) {
+    return materialize_rank3_option_b_grammar_native(source, base_grammar,
+                                                     candidate, options);
+  }
+
   auto stage = stage_rank3_option_b_overlay(source, base_grammar, candidate,
                                             options);
   auto tree = materialize_rank3_option_b_overlay_tree(stage, options.validate);
 
-  auto candidate_overlay = overlay_from_candidate(base_grammar, candidate);
-  auto expected_overlay = materialize_overlay_grammar(candidate_overlay);
+  auto expected_overlay = validate_and_dense_materialize_candidate(
+      base_grammar, candidate);
 
   std::vector<rank3_production_taxa_key> intended;
   rank3_detail::append_intended_temp_overlay_keys(expected_overlay, intended);
