@@ -1521,6 +1521,189 @@ static void test_phase3_bounded_counts_final_reused_intermediates() {
   std::println("  PASS");
 }
 
+static void set_all_edge_weights(larch::phylo_dag& dag, float weight) {
+  for (auto ev : dag.get_all_edges()) {
+    std::visit([&](auto edge) { edge.edge_weight() = weight; }, ev);
+  }
+}
+
+static double min_edge_weight(larch::phylo_dag& dag) {
+  double best = std::numeric_limits<double>::infinity();
+  for (auto ev : dag.get_all_edges()) {
+    std::visit([&](auto edge) {
+      best = std::min(best, static_cast<double>(edge.edge_weight()));
+    }, ev);
+  }
+  return best;
+}
+
+static larch::rank3_topology three_taxon_refined_topology_a_bc(
+    larch::clade_grammar const& grammar) {
+  auto a = clade_for(grammar, {"A"});
+  auto b = clade_for(grammar, {"B"});
+  auto c = clade_for(grammar, {"C"});
+  auto bc = clade_for(grammar, {"B", "C"});
+  auto root = grammar.root_clade;
+  auto bc_prod = production_for(grammar, bc, {b, c});
+  auto root_prod = production_for(grammar, root, {a, bc});
+  return larch::rank3_topology_from_productions(grammar,
+                                                {root_prod, bc_prod});
+}
+
+static void test_phase5_traceback_through_polytomy_materializes_and_merges() {
+  std::println("test_phase5_traceback_through_polytomy_materializes_and_merges");
+
+  auto dag = make_three_taxon_star();
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_exact_or_fail;
+  auto refinement = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, opts);
+
+  larch::chart_options chart_opts;
+  chart_opts.keep_trace = true;
+  auto states = larch::extract_leaf_site_states(dag, refinement.grammar, 1);
+  auto chart = larch::build_single_site_chart(refinement.grammar, states,
+                                              chart_opts);
+  auto outside = larch::build_single_site_outside_chart(refinement.grammar,
+                                                        chart, chart_opts);
+  auto trace = larch::deterministic_optimal_single_site_traceback(
+      refinement.grammar, chart, outside);
+  auto topology = larch::rank3_topology_from_traceback(refinement.grammar,
+                                                       trace);
+
+  std::size_t synthetic_trace_productions = 0;
+  for (auto pid : trace.productions) {
+    if (larch::refined_production_has_synthetic_polytomy_provenance(
+            refinement, pid)) {
+      ++synthetic_trace_productions;
+    }
+  }
+  CHECK(synthetic_trace_productions == 2);
+
+  auto result = larch::materialize_rank3_option_a(dag, refinement, topology);
+  CHECK(result.materialized_tree_count == 1);
+  CHECK(result.all_intended_productions_present());
+  CHECK(result.all_intended_synthetic_splits_reappear());
+  CHECK(result.materialization_audit.synthetic_productions_in_materialized_topologies ==
+        synthetic_trace_productions);
+  CHECK(larch::grammar_is_binary_chart_compatible(
+      result.rebuilt_refinement.grammar));
+
+  std::println("  PASS");
+}
+
+static void test_phase5_option_a_materializes_synthetic_polytomy_topology() {
+  std::println("test_phase5_option_a_materializes_synthetic_polytomy_topology");
+
+  auto dag = make_three_taxon_star();
+  set_all_edge_weights(dag, 7.0f);
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_exact_or_fail;
+  auto refinement = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, opts);
+  auto topology = three_taxon_refined_topology_a_bc(refinement.grammar);
+
+  CHECK(throws_runtime_error([&] {
+    (void)larch::materialize_rank3_option_a(dag, refinement.grammar,
+                                            topology);
+  }));
+
+  auto result = larch::materialize_rank3_option_a(dag, refinement, topology);
+  CHECK(result.materialized_tree_count == 1);
+  CHECK(result.rebuilt_base.audit.non_binary_production_count == 1);
+  CHECK(result.rebuilt_refinement.audit.source_kary_production_count == 1);
+  CHECK(larch::grammar_is_binary_chart_compatible(
+      result.rebuilt_refinement.grammar));
+  CHECK(result.all_intended_productions_present());
+  CHECK(result.all_intended_synthetic_splits_reappear());
+  CHECK(result.materialization_audit.reran_polytomy_refinement);
+  CHECK(result.materialization_audit.rebuilt_with_allow_polytomies);
+  CHECK(result.materialization_audit.synthetic_productions_in_materialized_topologies ==
+        2);
+  CHECK(result.materialization_audit.intended_synthetic_productions.size() ==
+        2);
+  CHECK(!result.materialization_audit.bounded_refinement_used);
+  CHECK(min_edge_weight(result.dag) == 7.0);
+
+  auto const& rebuilt = result.rebuilt_refinement.grammar;
+  auto a = clade_for(rebuilt, {"A"});
+  auto b = clade_for(rebuilt, {"B"});
+  auto c = clade_for(rebuilt, {"C"});
+  auto bc = clade_for(rebuilt, {"B", "C"});
+  CHECK(production_for(rebuilt, bc, {b, c}) != larch::no_production);
+  CHECK(production_for(rebuilt, rebuilt.root_clade, {a, bc}) !=
+        larch::no_production);
+
+  auto repeated = larch::materialize_rank3_option_a(
+      dag, refinement, std::vector<larch::rank3_topology>{topology, topology});
+  CHECK(repeated.materialized_tree_count == 2);
+  CHECK(repeated.materialization_audit.synthetic_productions_in_materialized_topologies ==
+        4);
+  CHECK(repeated.materialization_audit.intended_synthetic_productions.size() ==
+        2);
+
+  std::println("  PASS");
+}
+
+static void test_phase5_include_original_false_generated_binary_only() {
+  std::println("test_phase5_include_original_false_generated_binary_only");
+
+  auto dag = make_three_taxon_star();
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_exact_or_fail;
+  auto refinement = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, opts);
+  auto topology = three_taxon_refined_topology_a_bc(refinement.grammar);
+
+  larch::rank3_option_a_options materialize_opts;
+  materialize_opts.include_original_dag = false;
+  auto result = larch::materialize_rank3_option_a(dag, refinement, topology,
+                                                  materialize_opts);
+  CHECK(result.materialized_tree_count == 1);
+  CHECK(result.rebuilt_base.audit.non_binary_production_count == 0);
+  CHECK(!result.materialization_audit.rebuilt_with_allow_polytomies);
+  CHECK(result.rebuilt_refinement.audit.source_kary_production_count == 0);
+  CHECK(larch::grammar_is_binary_chart_compatible(
+      result.rebuilt_refinement.grammar));
+  CHECK(count_derivations(result.rebuilt_refinement.grammar) == 1);
+  CHECK(result.all_intended_productions_present());
+  CHECK(result.all_intended_synthetic_splits_reappear());
+
+  std::println("  PASS");
+}
+
+static void test_phase5_direct_mutation_rejects_synthetic_productions() {
+  std::println("test_phase5_direct_mutation_rejects_synthetic_productions");
+
+  auto dag = make_three_taxon_star();
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_exact_or_fail;
+  auto refinement = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, opts);
+  auto b = clade_for(refinement.grammar, {"B"});
+  auto c = clade_for(refinement.grammar, {"C"});
+  auto bc = clade_for(refinement.grammar, {"B", "C"});
+  auto synthetic_pid = production_for(refinement.grammar, bc, {b, c});
+  CHECK(throws_runtime_error([&] {
+    larch::require_no_synthetic_polytomy_productions_for_direct_mutation(
+        refinement, {synthetic_pid}, "phase5 direct mutation test");
+  }));
+
+  auto binary_dag = make_three_taxon_binary_tree();
+  auto binary_refinement = larch::build_polytomy_refined_clade_grammar(
+      binary_dag, larch::clade_grammar_options{},
+      larch::polytomy_refinement_options{});
+  auto bb = clade_for(binary_refinement.grammar, {"B"});
+  auto cc = clade_for(binary_refinement.grammar, {"C"});
+  auto bcbc = clade_for(binary_refinement.grammar, {"B", "C"});
+  auto observed_pid = production_for(binary_refinement.grammar, bcbc,
+                                     {bb, cc});
+  larch::require_no_synthetic_polytomy_productions_for_direct_mutation(
+      binary_refinement, {observed_pid}, "phase5 direct mutation test");
+
+  std::println("  PASS");
+}
+
 int main() {
   test_default_reject_mode_rejects_kary();
   test_reject_mode_accepts_binary_grammar();
@@ -1546,6 +1729,10 @@ int main() {
   test_phase3_bounded_reports_shared_intermediate_recombination();
   test_phase3_bounded_large_arity_uses_capped_generator();
   test_phase3_bounded_counts_final_reused_intermediates();
+  test_phase5_traceback_through_polytomy_materializes_and_merges();
+  test_phase5_option_a_materializes_synthetic_polytomy_topology();
+  test_phase5_include_original_false_generated_binary_only();
+  test_phase5_direct_mutation_rejects_synthetic_productions();
 
   std::println("All polytomy refinement tests passed!");
   return 0;

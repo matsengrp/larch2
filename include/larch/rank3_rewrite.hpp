@@ -4,6 +4,7 @@
 #include <larch/grammar_topology.hpp>
 #include <larch/merge.hpp>
 #include <larch/overlay_spr.hpp>
+#include <larch/polytomy_refinement.hpp>
 #include <larch/thread_pool.hpp>
 
 #include <algorithm>
@@ -98,6 +99,45 @@ struct rank3_option_a_result {
     return std::all_of(intended_production_present.begin(),
                        intended_production_present.end(),
                        [](bool present) { return present; });
+  }
+};
+
+struct rank3_polytomy_materialization_audit {
+  polytomy_refinement_audit source_refinement_audit;
+  polytomy_refinement_audit rebuilt_refinement_audit;
+
+  // Counts per-topology usages: if two materialized trees use the same
+  // synthetic refined production, it contributes 2 here. Intended split keys
+  // below remain deduplicated for rebuild-presence validation.
+  std::size_t synthetic_productions_in_materialized_topologies = 0;
+  bool all_intended_synthetic_splits_reappear = true;
+  bool bounded_refinement_used = false;
+  bool rebuilt_with_allow_polytomies = false;
+  bool reran_polytomy_refinement = false;
+
+  std::vector<rank3_production_taxa_key> intended_synthetic_productions;
+  std::vector<bool> intended_synthetic_production_present;
+};
+
+struct rank3_polytomy_option_a_result {
+  phylo_dag dag;
+  clade_grammar_build_result rebuilt_base;
+  polytomy_refinement_result rebuilt_refinement;
+  std::size_t materialized_tree_count = 0;
+
+  std::vector<rank3_production_taxa_key> intended_productions;
+  std::vector<bool> intended_production_present;
+
+  rank3_polytomy_materialization_audit materialization_audit;
+
+  [[nodiscard]] bool all_intended_productions_present() const {
+    return std::all_of(intended_production_present.begin(),
+                       intended_production_present.end(),
+                       [](bool present) { return present; });
+  }
+
+  [[nodiscard]] bool all_intended_synthetic_splits_reappear() const {
+    return materialization_audit.all_intended_synthetic_splits_reappear;
   }
 };
 
@@ -611,6 +651,79 @@ inline std::vector<rank3_production_taxa_key> intended_keys_from_topologies(
                                   grammar, static_cast<production_id>(pid)));
     }
   }
+  return keys;
+}
+
+inline void validate_polytomy_refinement_for_option_a(
+    polytomy_refinement_result const& refinement) {
+  require_polytomy_refinement_binary_charting(
+      refinement.audit, "rank3 option A polytomy materialization");
+  if (refinement.clade_info.size() != refinement.grammar.clades.size()) {
+    throw std::runtime_error(
+        "rank3 option A polytomy materialization: clade-info size mismatch");
+  }
+  if (refinement.production_info.size() !=
+      refinement.grammar.productions.size()) {
+    throw std::runtime_error(
+        "rank3 option A polytomy materialization: production-info size "
+        "mismatch");
+  }
+  parsimony_chart_detail::validate_chart_grammar(refinement.grammar);
+  chart_trim_detail::validate_production_indices(refinement.grammar);
+}
+
+inline std::vector<production_id> reachable_synthetic_polytomy_productions(
+    polytomy_refinement_result const& refinement,
+    std::vector<rank3_topology> const& topologies) {
+  validate_polytomy_refinement_for_option_a(refinement);
+  std::vector<bool> used(refinement.grammar.productions.size(), false);
+  for (auto const& topology : topologies) {
+    auto reachable = validate_topology(refinement.grammar, topology);
+    for (std::size_t pid = 0; pid < reachable.size(); ++pid) {
+      if (!reachable[pid]) continue;
+      auto production = static_cast<production_id>(pid);
+      if (!refined_production_has_synthetic_polytomy_provenance(
+              refinement, production)) {
+        continue;
+      }
+      used[pid] = true;
+    }
+  }
+
+  std::vector<production_id> result;
+  for (std::size_t pid = 0; pid < used.size(); ++pid) {
+    if (used[pid]) result.push_back(static_cast<production_id>(pid));
+  }
+  return result;
+}
+
+inline std::size_t count_synthetic_polytomy_production_usages(
+    polytomy_refinement_result const& refinement,
+    std::vector<rank3_topology> const& topologies) {
+  validate_polytomy_refinement_for_option_a(refinement);
+  std::size_t count = 0;
+  for (auto const& topology : topologies) {
+    auto reachable = validate_topology(refinement.grammar, topology);
+    for (std::size_t pid = 0; pid < reachable.size(); ++pid) {
+      if (!reachable[pid]) continue;
+      if (refined_production_has_synthetic_polytomy_provenance(
+              refinement, static_cast<production_id>(pid))) {
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
+inline std::vector<rank3_production_taxa_key>
+intended_synthetic_polytomy_keys_from_topologies(
+    polytomy_refinement_result const& refinement,
+    std::vector<rank3_topology> const& topologies) {
+  std::vector<rank3_production_taxa_key> keys;
+  auto synthetic = reachable_synthetic_polytomy_productions(refinement,
+                                                            topologies);
+  for (auto pid : synthetic)
+    append_unique_key(keys, production_key_from_id(refinement.grammar, pid));
   return keys;
 }
 
@@ -1727,6 +1840,125 @@ inline rank3_option_a_result merge_rank3_trees_option_a(
   return result;
 }
 
+inline rank3_polytomy_option_a_result merge_rank3_trees_option_a(
+    phylo_dag& source, polytomy_refinement_result const& refinement,
+    std::vector<rank3_topology> const& topologies,
+    rank3_option_a_options const& options = {}) {
+  if (topologies.empty()) {
+    throw std::runtime_error(
+        "rank3 option A polytomy materialization: no topologies to merge");
+  }
+  rank3_detail::validate_polytomy_refinement_for_option_a(refinement);
+
+  auto trees = materialize_rank3_trees_from_topologies(
+      source, refinement.grammar, topologies, options.validate,
+      options.generated_edge_weight);
+
+  merge merger{get_reference_sequence(source)};
+  if (options.include_original_dag) {
+    build_clade_offsets(source);
+    merger.add_dag(source);
+  }
+  for (auto& tree : trees) {
+    if (get_reference_sequence(tree) != get_reference_sequence(source)) {
+      throw std::runtime_error(
+          "rank3 option A polytomy materialization: generated tree reference "
+          "mismatch");
+    }
+    build_clade_offsets(tree);
+    merger.add_dag(tree);
+  }
+
+  rank3_polytomy_option_a_result result;
+  result.materialized_tree_count = trees.size();
+  result.intended_productions =
+      rank3_detail::intended_keys_from_topologies(refinement.grammar,
+                                                  topologies);
+  auto& materialization_audit = result.materialization_audit;
+  materialization_audit.source_refinement_audit = refinement.audit;
+  materialization_audit.synthetic_productions_in_materialized_topologies =
+      rank3_detail::count_synthetic_polytomy_production_usages(refinement,
+                                                               topologies);
+  materialization_audit.intended_synthetic_productions =
+      rank3_detail::intended_synthetic_polytomy_keys_from_topologies(
+          refinement, topologies);
+  materialization_audit.bounded_refinement_used =
+      refinement.options.mode == polytomy_mode::expand_soft_bounded ||
+      refinement.audit.any_truncated;
+
+  result.dag = std::move(merger.get_result());
+  build_clade_offsets(result.dag);
+  if (options.validate) {
+    validate_dag(result.dag, "rank3 option A polytomy merged DAG",
+                 thread_pool::get_default());
+  }
+
+  auto base_rebuild_options = options.rebuild_grammar_options;
+  if (options.include_original_dag &&
+      refinement.audit.source_kary_production_count != 0) {
+    base_rebuild_options.allow_polytomies = true;
+  }
+  materialization_audit.rebuilt_with_allow_polytomies =
+      base_rebuild_options.allow_polytomies;
+  result.rebuilt_base = build_clade_grammar_with_audit(result.dag,
+                                                       base_rebuild_options);
+  rank3_detail::validate_same_taxa_for_rank3(
+      "rank3 option A polytomy materialization", refinement.grammar,
+      result.rebuilt_base.grammar);
+
+  auto refinement_options = refinement.options;
+  if (refinement_options.mode == polytomy_mode::reject &&
+      result.rebuilt_base.audit.non_binary_production_count != 0) {
+    throw std::runtime_error(
+        "rank3 option A polytomy materialization: rebuilt DAG contains "
+        "polytomies but the stored refinement options are reject-mode");
+  }
+  result.rebuilt_refinement = build_polytomy_refined_clade_grammar(
+      result.dag, options.rebuild_grammar_options, refinement_options);
+  materialization_audit.reran_polytomy_refinement = true;
+  materialization_audit.rebuilt_refinement_audit =
+      result.rebuilt_refinement.audit;
+  rank3_detail::validate_same_taxa_for_rank3(
+      "rank3 option A polytomy materialization refined rebuild",
+      refinement.grammar, result.rebuilt_refinement.grammar);
+
+  result.intended_production_present = rank3_detail::production_key_presence(
+      result.rebuilt_refinement.grammar, result.intended_productions);
+  materialization_audit.intended_synthetic_production_present =
+      rank3_detail::production_key_presence(
+          result.rebuilt_refinement.grammar,
+          materialization_audit.intended_synthetic_productions);
+  auto const& synthetic_presence =
+      materialization_audit.intended_synthetic_production_present;
+  materialization_audit.all_intended_synthetic_splits_reappear =
+      std::all_of(synthetic_presence.begin(), synthetic_presence.end(),
+                  [](bool present) { return present; });
+
+  if (options.require_intended_productions_present) {
+    for (std::size_t i = 0; i < result.intended_productions.size(); ++i) {
+      if (result.intended_production_present[i]) continue;
+      throw std::runtime_error(
+          "rank3 option A polytomy materialization: intended production "
+          "missing after refined grammar rebuild: " +
+          rank3_detail::production_key_to_string(
+              result.intended_productions[i]));
+    }
+    for (std::size_t i = 0;
+         i < materialization_audit.intended_synthetic_productions.size();
+         ++i) {
+      if (materialization_audit.intended_synthetic_production_present[i])
+        continue;
+      throw std::runtime_error(
+          "rank3 option A polytomy materialization: intended synthetic split "
+          "missing after refined grammar rebuild: " +
+          rank3_detail::production_key_to_string(
+              materialization_audit.intended_synthetic_productions[i]));
+    }
+  }
+
+  return result;
+}
+
 inline rank3_option_a_result materialize_rank3_option_a(
     phylo_dag& source, clade_grammar const& topology_grammar,
     rank3_topology const& topology,
@@ -1742,6 +1974,47 @@ inline rank3_option_a_result materialize_rank3_option_a(
     rank3_option_a_options const& options = {}) {
   return merge_rank3_trees_option_a(source, topology_grammar, topologies,
                                     options);
+}
+
+inline rank3_polytomy_option_a_result materialize_rank3_option_a(
+    phylo_dag& source, polytomy_refinement_result const& refinement,
+    rank3_topology const& topology,
+    rank3_option_a_options const& options = {}) {
+  return merge_rank3_trees_option_a(source, refinement,
+                                    std::vector<rank3_topology>{topology},
+                                    options);
+}
+
+inline rank3_polytomy_option_a_result materialize_rank3_option_a(
+    phylo_dag& source, polytomy_refinement_result const& refinement,
+    std::vector<rank3_topology> const& topologies,
+    rank3_option_a_options const& options = {}) {
+  return merge_rank3_trees_option_a(source, refinement, topologies, options);
+}
+
+inline rank3_polytomy_option_a_result materialize_rank3_option_a_single_site(
+    phylo_dag& source, polytomy_refinement_result const& refinement,
+    leaf_site_states const& leaf_states, chart_options chart_opts = {},
+    rank3_option_a_options const& options = {}) {
+  if (chart_opts.score_ua_edge) {
+    throw std::runtime_error(
+        "rank3 option A polytomy materialization: reference state overload is "
+        "required when score_ua_edge is true");
+  }
+  auto topology = deterministic_optimal_rank3_topology(refinement.grammar,
+                                                       leaf_states,
+                                                       chart_opts);
+  return materialize_rank3_option_a(source, refinement, topology, options);
+}
+
+inline rank3_polytomy_option_a_result materialize_rank3_option_a_single_site(
+    phylo_dag& source, polytomy_refinement_result const& refinement,
+    leaf_site_states const& leaf_states, chart_options chart_opts,
+    std::uint8_t reference_state,
+    rank3_option_a_options const& options = {}) {
+  auto topology = deterministic_optimal_rank3_topology(
+      refinement.grammar, leaf_states, chart_opts, reference_state);
+  return materialize_rank3_option_a(source, refinement, topology, options);
 }
 
 inline rank3_option_a_result materialize_rank3_option_a(

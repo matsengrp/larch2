@@ -112,6 +112,7 @@ struct polytomy_refinement_result {
   clade_grammar grammar;
   polytomy_refinement_audit audit;
   clade_grammar_audit source_grammar_audit;
+  polytomy_refinement_options options;
   std::vector<refined_clade_info> clade_info;
   std::vector<refined_production_info> production_info;
 
@@ -212,10 +213,12 @@ inline void validate_phase0_public_maps(polytomy_refinement_result const& r) {
 }
 
 inline polytomy_refinement_result make_phase0_result(
-    clade_grammar_build_result&& built, polytomy_mode mode) {
+    clade_grammar_build_result&& built,
+    polytomy_refinement_options const& options) {
   polytomy_refinement_result result;
   result.grammar = std::move(built.grammar);
   result.source_grammar_audit = std::move(built.audit);
+  result.options = options;
 
   auto const& grammar = result.grammar;
   auto const kary = kary_productions(grammar);
@@ -229,7 +232,8 @@ inline polytomy_refinement_result make_phase0_result(
   result.audit.binary_chart_compatible =
       grammar_is_binary_chart_compatible(grammar);
   result.audit.exact_for_soft_polytomies =
-      mode != polytomy_mode::audit_kary && result.audit.binary_chart_compatible;
+      options.mode != polytomy_mode::audit_kary &&
+      result.audit.binary_chart_compatible;
 
   result.clade_info.assign(grammar.clades.size(), refined_clade_info{});
   result.production_info.assign(grammar.productions.size(),
@@ -255,7 +259,8 @@ inline polytomy_refinement_result make_phase0_result(
     if (prod.children.size() == 2) {
       info.origin = refined_production_origin::observed_binary;
       info.exact_refinement_component = true;
-    } else if (prod.children.size() > 2 && mode == polytomy_mode::audit_kary) {
+    } else if (prod.children.size() > 2 &&
+               options.mode == polytomy_mode::audit_kary) {
       info.origin = refined_production_origin::observed_kary_unexpanded;
       info.exact_refinement_component = false;
 
@@ -1789,6 +1794,7 @@ inline polytomy_refinement_result finalize_exact_expansion(
     std::vector<polytomy_event_audit> events) {
   polytomy_refinement_result result;
   result.source_grammar_audit = std::move(built.audit);
+  result.options = ctx.options;
   auto const& source = ctx.source;
 
   std::vector<clade_id> draft_to_final(ctx.draft.clades.size(), no_clade);
@@ -2030,20 +2036,20 @@ inline polytomy_refinement_result build_polytomy_refined_clade_grammar(
       grammar_opts.allow_polytomies = false;
       auto built = build_clade_grammar_with_audit(dag, grammar_opts);
       return polytomy_refinement_detail::make_phase0_result(
-          std::move(built), refinement_opts.mode);
+          std::move(built), refinement_opts);
     }
     case polytomy_mode::audit_kary: {
       grammar_opts.allow_polytomies = true;
       auto built = build_clade_grammar_with_audit(dag, grammar_opts);
       return polytomy_refinement_detail::make_phase0_result(
-          std::move(built), refinement_opts.mode);
+          std::move(built), refinement_opts);
     }
     case polytomy_mode::expand_soft_exact_or_fail: {
       grammar_opts.allow_polytomies = true;
       auto built = build_clade_grammar_with_audit(dag, grammar_opts);
       if (!grammar_has_kary_productions(built.grammar)) {
         return polytomy_refinement_detail::make_phase0_result(
-            std::move(built), refinement_opts.mode);
+            std::move(built), refinement_opts);
       }
       return polytomy_refinement_detail::make_exact_expansion_result(
           std::move(built), refinement_opts);
@@ -2053,7 +2059,7 @@ inline polytomy_refinement_result build_polytomy_refined_clade_grammar(
       auto built = build_clade_grammar_with_audit(dag, grammar_opts);
       if (!grammar_has_kary_productions(built.grammar)) {
         return polytomy_refinement_detail::make_phase0_result(
-            std::move(built), refinement_opts.mode);
+            std::move(built), refinement_opts);
       }
       return polytomy_refinement_detail::make_bounded_expansion_result(
           std::move(built), refinement_opts);
@@ -2093,6 +2099,39 @@ inline void require_polytomy_refinement_exact_for_soft_polytomies(
       std::string{context} +
       ": refusing to claim exact full-soft-polytomy results for " +
       polytomy_refinement_status_label(audit));
+}
+
+inline bool refined_production_has_synthetic_polytomy_provenance(
+    refined_production_info const& info) {
+  return info.origin ==
+             refined_production_origin::synthetic_polytomy_refinement ||
+         info.origin == refined_production_origin::observed_and_synthetic;
+}
+
+inline bool refined_production_has_synthetic_polytomy_provenance(
+    polytomy_refinement_result const& refinement, production_id production) {
+  if (production == no_production ||
+      production >= refinement.production_info.size()) {
+    throw std::runtime_error(
+        "polytomy refinement: production info id out of range");
+  }
+  return refined_production_has_synthetic_polytomy_provenance(
+      refinement.production_info[production]);
+}
+
+inline void require_no_synthetic_polytomy_productions_for_direct_mutation(
+    polytomy_refinement_result const& refinement,
+    std::vector<production_id> const& productions, char const* context) {
+  for (auto pid : productions) {
+    if (!refined_production_has_synthetic_polytomy_provenance(refinement, pid))
+      continue;
+    throw std::runtime_error(
+        std::string{context} +
+        ": direct in-place DAG mutation is not implemented for synthetic "
+        "polytomy-refinement production " +
+        std::to_string(pid) +
+        "; use Option-A materialization/generate-Fitch-merge instead");
+  }
 }
 
 inline std::ostream& print_polytomy_refinement_audit(
