@@ -17,6 +17,7 @@
 #include <larch/io_util.hpp>
 #include <larch/newick.hpp>
 #include <larch/clade_grammar.hpp>
+#include <larch/polytomy_refinement.hpp>
 #include <larch/parsimony_chart.hpp>
 #include <larch/site_patterns.hpp>
 #include <larch/chart_trim.hpp>
@@ -31,6 +32,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -285,6 +287,78 @@ static void print_frontier_size_stats(
     for (auto const& [size, count] : hist)
       out << "    " << size << ": " << count << "\n";
   }
+}
+
+static std::vector<std::size_t> direct_parent_witness_nodes(
+    grammar_production const& prod) {
+  std::vector<std::size_t> nodes;
+  nodes.reserve(prod.witnesses.size());
+  for (auto const& witness : prod.witnesses) {
+    if (witness.parent_node != std::numeric_limits<std::size_t>::max())
+      nodes.push_back(witness.parent_node);
+  }
+  std::sort(nodes.begin(), nodes.end());
+  nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+  return nodes;
+}
+
+static void print_size_list(std::ostream& out,
+                            std::vector<std::size_t> const& values) {
+  out << "[";
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) out << ", ";
+    out << values[i];
+  }
+  out << "]";
+}
+
+static void print_wric_polytomy_audit_fields(
+    std::ostream& out, polytomy_refinement_result const& refinement) {
+  auto const& grammar = refinement.grammar;
+  auto const& audit = refinement.audit;
+  auto kary = kary_productions(grammar);
+  std::map<std::size_t, std::size_t> arity_histogram;
+  for (auto pid : kary)
+    ++arity_histogram[grammar.productions[pid].children.size()];
+
+  out << "  kary_productions: " << audit.source_kary_production_count << "\n";
+  out << "  kary_production_arity_histogram:\n";
+  if (arity_histogram.empty()) {
+    out << "    <empty>\n";
+  } else {
+    for (auto const& [arity, count] : arity_histogram)
+      out << "    " << arity << ": " << count << "\n";
+  }
+  out << "  kary_production_details:\n";
+  if (kary.empty()) {
+    out << "    <empty>\n";
+  } else {
+    for (auto pid : kary) {
+      auto const& prod = grammar.productions[pid];
+      auto parent_nodes =
+          pid < refinement.production_info.size()
+              ? refinement.production_info[pid].source_parent_nodes
+              : direct_parent_witness_nodes(prod);
+      out << "    - production: " << pid << "\n";
+      out << "      parent_clade: " << prod.parent << "\n";
+      out << "      arity: " << prod.children.size() << "\n";
+      out << "      witness_multiplicity: " << prod.multiplicity << "\n";
+      out << "      source_parent_nodes: ";
+      print_size_list(out, parent_nodes);
+      out << "\n";
+    }
+  }
+  out << "  contains_kary_productions: "
+      << (audit.contains_kary_productions ? "true" : "false") << "\n";
+  out << "  binary_chart_compatible: "
+      << (audit.binary_chart_compatible ? "true" : "false") << "\n";
+  out << "  downstream_binary_charting_allowed: "
+      << (audit.binary_chart_compatible && !audit.contains_kary_productions
+              ? "true"
+              : "false")
+      << "\n";
+  out << "  kary_grammar_diagnostic_only: "
+      << (audit.contains_kary_productions ? "true" : "false") << "\n";
 }
 
 static void print_key_chart_clade_entries(
@@ -770,14 +844,15 @@ int main(int argc, char** argv) try {
       auto built = build_clade_grammar_with_audit(result, grammar_opts);
       chart_grammar_build_ms =
           elapsed_ms(start, std::chrono::steady_clock::now());
-      if (built.audit.non_binary_production_count != 0) {
+      if (!grammar_is_binary_chart_compatible(built.grammar)) {
+        auto const kary_count = kary_productions(built.grammar).size();
         throw std::runtime_error(
             "WRIC chart requires a binary-compatible grammar.\n"
             "Found " +
-            std::to_string(built.audit.non_binary_production_count) +
-            " non-binary productions. Run --wric-audit or use\n"
-            "--wric-polytomy-mode expand-exact / expand-bounded once "
-            "implemented.");
+            std::to_string(kary_count) +
+            " k-ary productions. Run --wric-audit for diagnostic-only "
+            "polytomy reporting; binary charting is disabled until an "
+            "explicit expansion mode is implemented.");
       }
       chart_grammar_cache = std::move(built.grammar);
     }
@@ -799,11 +874,14 @@ int main(int argc, char** argv) try {
 
   if (a.wric_audit) {
     clade_grammar_options grammar_opts;
-    grammar_opts.allow_polytomies = true;
+    polytomy_refinement_options refinement_opts;
+    refinement_opts.mode = polytomy_mode::audit_kary;
     auto start = std::chrono::steady_clock::now();
-    auto built = build_clade_grammar_with_audit(result, grammar_opts);
+    auto refined = build_polytomy_refined_clade_grammar(
+        result, grammar_opts, refinement_opts);
     auto build_ms = elapsed_ms(start, std::chrono::steady_clock::now());
-    print_clade_grammar_audit(std::cout, built.audit);
+    print_clade_grammar_audit(std::cout, refined.source_grammar_audit);
+    print_wric_polytomy_audit_fields(std::cout, refined);
     std::cout << "  grammar_build_ms: " << std::fixed
               << std::setprecision(3) << build_ms << "\n";
   }

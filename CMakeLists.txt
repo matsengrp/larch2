@@ -218,6 +218,16 @@ add_test(NAME dagutil_partial_model_args_fail
                  --model-dir data/bcr
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(dagutil_partial_model_args_fail PROPERTIES WILL_FAIL TRUE)
+add_test(NAME dagutil_wric_audit_polytomy_diagnostic
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-audit
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_audit_polytomy_diagnostic
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "kary_grammar_diagnostic_only: true")
+
 add_test(NAME dagutil_sample_method_without_sample_fails
          COMMAND dagutil
                  --dag-pb data/test_5_trees/tree_0.pb.gz
@@ -520,7 +530,8 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   rs_fivemer_model_test nn_cnn_test nn_s5f_test
                   nn_ml_spr_test nn_blended_spr_test
                   inplace_spr_test wric_phase0_test clade_grammar_test
-                  parsimony_chart_test site_patterns_test chart_trim_test
+                  polytomy_refinement_test parsimony_chart_test
+                  site_patterns_test chart_trim_test
                   chart_spr_test plateau_test rank3_rewrite_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
