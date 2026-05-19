@@ -17,13 +17,17 @@
 #include <larch/io_util.hpp>
 #include <larch/newick.hpp>
 #include <larch/clade_grammar.hpp>
+#include <larch/parsimony_chart.hpp>
 #include <larch/site_patterns.hpp>
+#include <larch/chart_trim.hpp>
 #include <larch/plateau.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -203,6 +207,146 @@ static phylo_dag build_from_fasta_newick(std::string_view fasta_path,
 }
 
 // ---------------------------------------------------------------------------
+// WRIC/chart diagnostic helpers
+// ---------------------------------------------------------------------------
+
+static char chart_state_label(std::uint8_t state) {
+  switch (state) {
+    case nuc_base::A:
+      return 'A';
+    case nuc_base::C:
+      return 'C';
+    case nuc_base::G:
+      return 'G';
+    case nuc_base::T:
+      return 'T';
+    default:
+      return '?';
+  }
+}
+
+static void print_chart_cost(std::ostream& out, chart_cost cost) {
+  if (cost >= chart_inf)
+    out << "INF";
+  else
+    out << cost;
+}
+
+static void print_chart_row(
+    std::ostream& out,
+    std::array<chart_cost, nuc_state_count> const& row) {
+  out << "[";
+  for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+    if (state != 0) out << ", ";
+    out << chart_state_label(state) << ":";
+    print_chart_cost(out, row[state]);
+  }
+  out << "]";
+}
+
+static double elapsed_ms(std::chrono::steady_clock::time_point start,
+                         std::chrono::steady_clock::time_point end) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+static bool within_limit(std::size_t printed, std::size_t limit) {
+  return limit == 0 || printed < limit;
+}
+
+static std::size_t count_kept_clade_states(chart_trim_mask const& mask) {
+  std::size_t count = 0;
+  for (auto const& row : mask.keep_clade_state)
+    for (bool keep : row)
+      if (keep) ++count;
+  return count;
+}
+
+static std::size_t count_true(std::vector<bool> const& values) {
+  return static_cast<std::size_t>(
+      std::count(values.begin(), values.end(), true));
+}
+
+static void print_frontier_size_stats(
+    std::ostream& out, std::vector<std::size_t> const& frontier_sizes) {
+  std::size_t sum = 0;
+  std::size_t max_size = 0;
+  std::map<std::size_t, std::size_t> hist;
+  for (auto size : frontier_sizes) {
+    sum += size;
+    max_size = std::max(max_size, size);
+    ++hist[size];
+  }
+  out << "  frontier_size_sum: " << sum << "\n";
+  out << "  frontier_size_max: " << max_size << "\n";
+  out << "  frontier_size_histogram:\n";
+  if (hist.empty()) {
+    out << "    <empty>\n";
+  } else {
+    for (auto const& [size, count] : hist)
+      out << "    " << size << ": " << count << "\n";
+  }
+}
+
+static void print_key_chart_clade_entries(
+    std::ostream& out, clade_grammar const& grammar,
+    single_site_chart const& chart, std::size_t entry_limit) {
+  std::vector<clade_id> clades(grammar.clades.size());
+  std::iota(clades.begin(), clades.end(), clade_id{0});
+  std::stable_sort(clades.begin(), clades.end(), [&](clade_id lhs,
+                                                     clade_id rhs) {
+    if (lhs == grammar.root_clade) return true;
+    if (rhs == grammar.root_clade) return false;
+    auto lsize = grammar.clades[lhs].taxa.size();
+    auto rsize = grammar.clades[rhs].taxa.size();
+    if (lsize != rsize) return lsize > rsize;
+    return lhs < rhs;
+  });
+
+  out << "  clade_entries:\n";
+  std::size_t printed = 0;
+  std::size_t eligible = 0;
+  for (auto cid : clades) {
+    auto size = grammar.clades[cid].taxa.size();
+    if (cid != grammar.root_clade && size == 1) continue;
+    ++eligible;
+    if (!within_limit(printed, entry_limit)) continue;
+    out << "    - clade: " << cid << "\n";
+    out << "      size: " << size << "\n";
+    out << "      parent_productions: "
+        << grammar.productions_by_parent[cid].size() << "\n";
+    out << "      inside: ";
+    print_chart_row(out, chart.inside[cid]);
+    out << "\n";
+    ++printed;
+  }
+  out << "  clade_entries_printed: " << printed << "\n";
+  out << "  clade_entries_total_internal_or_root: " << eligible << "\n";
+  if (entry_limit != 0 && printed < eligible)
+    out << "  clade_entries_truncated: true\n";
+}
+
+static void print_limited_per_pattern_roots(
+    std::ostream& out, site_pattern_set const& patterns,
+    composite_chart_score const& score, std::size_t entry_limit) {
+  out << "  per_pattern_root_min:\n";
+  std::size_t printed = 0;
+  for (std::size_t i = 0; i < patterns.patterns.size(); ++i) {
+    if (!within_limit(printed, entry_limit)) continue;
+    out << "    - pattern: " << i << "\n";
+    out << "      weight: " << patterns.patterns[i].weight << "\n";
+    out << "      positions: " << patterns.patterns[i].positions.size()
+        << "\n";
+    out << "      root_min: ";
+    print_chart_cost(out, score.per_pattern_root_min[i]);
+    out << "\n";
+    ++printed;
+  }
+  out << "  per_pattern_root_min_printed: " << printed << "\n";
+  if (entry_limit != 0 && printed < patterns.patterns.size())
+    out << "  per_pattern_root_min_truncated: true\n";
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -245,11 +389,27 @@ Analysis:
   --dag-info              Print all DAG statistics (tree count, parsimony, RF)
   --wric-audit            Build collapsed clade grammar and print multiplicity
                           diagnostics (allows polytomies for audit only)
+  --chart-site <POS>      Build a one-site chart and print root optimum plus
+                          key clade entries (POS is 1-based)
   --chart-pattern-info    Print exact/invariant/normalized site-pattern counts
                           using the collapsed clade grammar taxa
+  --chart-trim-site <POS> Print single-site optimal production/clade-state
+                          counts (POS is 1-based)
+  --chart-composite-score Print summed per-pattern chart score labelled as a
+                          LOWER_BOUND diagnostic
+  --chart-bnb-trim        Run exact multi-site B&B trimming and print frontier
+                          statistics (intended for small/medium DAGs)
   --chart-fluidity-site <POS>
                           Print a single-site chart trace/fluidity report
                           (alias: --plateau-site)
+  --chart-score-ua-edge   Include the UA/reference edge in chart diagnostics
+  --chart-entry-limit <N> Limit printed chart/pattern entries (default 20;
+                          0 means no limit)
+  --chart-bnb-max-frontier <N>
+                          Fail if any B&B clade frontier exceeds N entries
+                          (default 0, no cap)
+  --chart-bnb-no-bound-pruning
+                          Disable B&B lower-bound pruning for diagnostics
   --parsimony             Print parsimony score distribution
   --sum-rf-distance       Print sum RF distance distribution
   --edge-parsimony        Compute per-edge parsimony penalties (store in output;
@@ -294,8 +454,16 @@ struct args {
   bool edge_ml = false;
   bool validate = false;
   bool wric_audit = false;
+  std::optional<mutation_position> chart_site;
   bool chart_pattern_info = false;
+  std::optional<mutation_position> chart_trim_site;
+  bool chart_composite_score = false;
+  bool chart_bnb_trim = false;
   std::optional<mutation_position> chart_fluidity_site;
+  bool chart_score_ua_edge = false;
+  std::size_t chart_entry_limit = 20;
+  std::size_t chart_bnb_max_frontier = 0;
+  bool chart_bnb_no_bound_pruning = false;
 };
 
 static bool has_any_model_arg(args const& a) {
@@ -371,8 +539,28 @@ static args parse_args(int argc, char** argv) {
       a.print_rf_distance = true;
     } else if (arg == "--wric-audit") {
       a.wric_audit = true;
+    } else if (arg == "--chart-site") {
+      auto pos =
+          static_cast<mutation_position>(std::stoull(std::string{next()}));
+      if (pos == 0) {
+        std::cerr << "error: chart site positions are 1-based\n";
+        std::exit(1);
+      }
+      a.chart_site = pos;
     } else if (arg == "--chart-pattern-info") {
       a.chart_pattern_info = true;
+    } else if (arg == "--chart-trim-site") {
+      auto pos =
+          static_cast<mutation_position>(std::stoull(std::string{next()}));
+      if (pos == 0) {
+        std::cerr << "error: chart trim site positions are 1-based\n";
+        std::exit(1);
+      }
+      a.chart_trim_site = pos;
+    } else if (arg == "--chart-composite-score") {
+      a.chart_composite_score = true;
+    } else if (arg == "--chart-bnb-trim") {
+      a.chart_bnb_trim = true;
     } else if (arg == "--chart-fluidity-site" || arg == "--plateau-site") {
       auto pos =
           static_cast<mutation_position>(std::stoull(std::string{next()}));
@@ -381,6 +569,16 @@ static args parse_args(int argc, char** argv) {
         std::exit(1);
       }
       a.chart_fluidity_site = pos;
+    } else if (arg == "--chart-score-ua-edge") {
+      a.chart_score_ua_edge = true;
+    } else if (arg == "--chart-entry-limit") {
+      a.chart_entry_limit = static_cast<std::size_t>(
+          std::stoull(std::string{next()}));
+    } else if (arg == "--chart-bnb-max-frontier") {
+      a.chart_bnb_max_frontier = static_cast<std::size_t>(
+          std::stoull(std::string{next()}));
+    } else if (arg == "--chart-bnb-no-bound-pruning") {
+      a.chart_bnb_no_bound_pruning = true;
     } else if (arg == "--edge-parsimony")
       a.edge_parsimony = true;
     else if (arg == "--edge-ml" || arg == "--edge-thrifty")
@@ -562,33 +760,280 @@ int main(int argc, char** argv) try {
   }
 
   // ---- Analysis ----
+  std::optional<clade_grammar> chart_grammar_cache;
+  double chart_grammar_build_ms = 0.0;
+  auto get_chart_grammar = [&]() -> clade_grammar& {
+    if (!chart_grammar_cache) {
+      auto start = std::chrono::steady_clock::now();
+      clade_grammar_options grammar_opts;
+      grammar_opts.allow_polytomies = true;
+      auto built = build_clade_grammar_with_audit(result, grammar_opts);
+      chart_grammar_build_ms =
+          elapsed_ms(start, std::chrono::steady_clock::now());
+      if (built.audit.non_binary_production_count != 0) {
+        throw std::runtime_error(
+            "WRIC chart requires a binary-compatible grammar.\n"
+            "Found " +
+            std::to_string(built.audit.non_binary_production_count) +
+            " non-binary productions. Run --wric-audit or use\n"
+            "--wric-polytomy-mode expand-exact / expand-bounded once "
+            "implemented.");
+      }
+      chart_grammar_cache = std::move(built.grammar);
+    }
+    return *chart_grammar_cache;
+  };
+
+  std::optional<site_pattern_set> exact_patterns_cache;
+  double exact_pattern_build_ms = 0.0;
+  auto get_exact_patterns = [&]() -> site_pattern_set& {
+    if (!exact_patterns_cache) {
+      auto& grammar = get_chart_grammar();
+      site_pattern_options pattern_opts;
+      auto start = std::chrono::steady_clock::now();
+      exact_patterns_cache = build_site_patterns(result, grammar, pattern_opts);
+      exact_pattern_build_ms = elapsed_ms(start, std::chrono::steady_clock::now());
+    }
+    return *exact_patterns_cache;
+  };
+
   if (a.wric_audit) {
     clade_grammar_options grammar_opts;
     grammar_opts.allow_polytomies = true;
+    auto start = std::chrono::steady_clock::now();
     auto built = build_clade_grammar_with_audit(result, grammar_opts);
+    auto build_ms = elapsed_ms(start, std::chrono::steady_clock::now());
     print_clade_grammar_audit(std::cout, built.audit);
+    std::cout << "  grammar_build_ms: " << std::fixed
+              << std::setprecision(3) << build_ms << "\n";
+  }
+
+  if (a.chart_site) {
+    auto& grammar = get_chart_grammar();
+    chart_options chart_opts;
+    chart_opts.score_ua_edge = a.chart_score_ua_edge;
+
+    auto state_start = std::chrono::steady_clock::now();
+    auto states = extract_leaf_site_states(result, grammar, *a.chart_site);
+    auto state_ms = elapsed_ms(state_start, std::chrono::steady_clock::now());
+
+    auto chart_start = std::chrono::steady_clock::now();
+    auto chart = build_single_site_chart(grammar, states, chart_opts);
+    auto chart_ms = elapsed_ms(chart_start, std::chrono::steady_clock::now());
+
+    auto reference_state = extract_reference_site_state(result, *a.chart_site);
+    auto optimum = root_min(chart, grammar.root_clade, chart_opts,
+                            reference_state);
+
+    std::cout << "chart_site:\n";
+    std::cout << "  pos: " << *a.chart_site << "\n";
+    std::cout << "  score_ua_edge: "
+              << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+    std::cout << "  reference_state: " << chart_state_label(reference_state)
+              << "\n";
+    std::cout << "  taxa: " << grammar.taxa.id_to_sample_id.size() << "\n";
+    std::cout << "  clades: " << grammar.clades.size() << "\n";
+    std::cout << "  productions: " << grammar.productions.size() << "\n";
+    std::cout << "  root_clade: " << grammar.root_clade << "\n";
+    std::cout << "  root_min: ";
+    print_chart_cost(std::cout, optimum);
+    std::cout << "\n";
+    std::cout << "  root_inside: ";
+    print_chart_row(std::cout, chart.inside[grammar.root_clade]);
+    std::cout << "\n";
+    std::cout << "  grammar_build_ms: " << std::fixed
+              << std::setprecision(3) << chart_grammar_build_ms << "\n";
+    std::cout << "  leaf_state_extract_ms: " << std::fixed
+              << std::setprecision(3) << state_ms << "\n";
+    std::cout << "  chart_build_ms: " << std::fixed << std::setprecision(3)
+              << chart_ms << "\n";
+    print_key_chart_clade_entries(std::cout, grammar, chart,
+                                  a.chart_entry_limit);
   }
 
   if (a.chart_pattern_info) {
     clade_grammar_options grammar_opts;
     grammar_opts.allow_polytomies = true;
+    auto grammar_start = std::chrono::steady_clock::now();
     auto grammar = build_clade_grammar(result, grammar_opts);
+    auto grammar_ms = elapsed_ms(grammar_start, std::chrono::steady_clock::now());
     site_pattern_options pattern_opts;
     pattern_opts.build_normalized_binary_patterns = true;
+    auto pattern_start = std::chrono::steady_clock::now();
     auto patterns = build_site_patterns(result, grammar, pattern_opts);
+    auto pattern_ms = elapsed_ms(pattern_start, std::chrono::steady_clock::now());
     print_site_pattern_summary(std::cout, patterns);
+    std::cout << "  grammar_build_ms: " << std::fixed
+              << std::setprecision(3) << grammar_ms << "\n";
+    std::cout << "  pattern_build_ms: " << std::fixed
+              << std::setprecision(3) << pattern_ms << "\n";
+  }
+
+  if (a.chart_trim_site) {
+    auto& grammar = get_chart_grammar();
+    chart_options chart_opts;
+    chart_opts.score_ua_edge = a.chart_score_ua_edge;
+
+    auto state_start = std::chrono::steady_clock::now();
+    auto states = extract_leaf_site_states(result, grammar, *a.chart_trim_site);
+    auto state_ms = elapsed_ms(state_start, std::chrono::steady_clock::now());
+
+    auto chart_start = std::chrono::steady_clock::now();
+    auto chart = build_single_site_chart(grammar, states, chart_opts);
+    auto chart_ms = elapsed_ms(chart_start, std::chrono::steady_clock::now());
+
+    auto outside_start = std::chrono::steady_clock::now();
+    auto outside = build_single_site_outside_chart(
+        grammar, chart, chart_opts, result, *a.chart_trim_site);
+    auto outside_ms = elapsed_ms(outside_start, std::chrono::steady_clock::now());
+
+    chart_trim_options trim_opts;
+    trim_opts.store_optimal_choices = true;
+    auto trim_start = std::chrono::steady_clock::now();
+    auto mask = build_single_site_trim_mask(grammar, chart, outside, trim_opts);
+    auto trim_ms = elapsed_ms(trim_start, std::chrono::steady_clock::now());
+
+    std::cout << "chart_trim_site:\n";
+    std::cout << "  pos: " << *a.chart_trim_site << "\n";
+    std::cout << "  score_ua_edge: "
+              << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+    std::cout << "  global_min: ";
+    print_chart_cost(std::cout, mask.global_min);
+    std::cout << "\n";
+    std::cout << "  kept_productions: " << count_true(mask.keep_production)
+              << "\n";
+    std::cout << "  total_productions: " << grammar.productions.size()
+              << "\n";
+    std::cout << "  kept_clade_states: "
+              << count_kept_clade_states(mask) << "\n";
+    std::cout << "  total_clade_states: "
+              << grammar.clades.size() * nuc_state_count << "\n";
+    std::cout << "  kept_production_choice_count: "
+              << mask.kept_production_choice_count << "\n";
+    std::cout << "  grammar_build_ms: " << std::fixed
+              << std::setprecision(3) << chart_grammar_build_ms << "\n";
+    std::cout << "  leaf_state_extract_ms: " << std::fixed
+              << std::setprecision(3) << state_ms << "\n";
+    std::cout << "  chart_build_ms: " << std::fixed << std::setprecision(3)
+              << chart_ms << "\n";
+    std::cout << "  outside_build_ms: " << std::fixed << std::setprecision(3)
+              << outside_ms << "\n";
+    std::cout << "  trim_mask_build_ms: " << std::fixed
+              << std::setprecision(3) << trim_ms << "\n";
+    std::cout << "  kept_productions_by_parent_clade:\n";
+    std::size_t printed = 0;
+    std::size_t eligible = 0;
+    for (clade_id cid = 0; cid < grammar.productions_by_parent.size(); ++cid) {
+      std::size_t kept = 0;
+      for (auto pid : grammar.productions_by_parent[cid])
+        if (mask.keep_production[pid]) ++kept;
+      if (kept == 0) continue;
+      ++eligible;
+      if (!within_limit(printed, a.chart_entry_limit)) continue;
+      std::cout << "    " << cid << ": " << kept << "/"
+                << grammar.productions_by_parent[cid].size() << "\n";
+      ++printed;
+    }
+    std::cout << "  kept_parent_clades_printed: " << printed << "\n";
+    if (a.chart_entry_limit != 0 && printed < eligible)
+      std::cout << "  kept_parent_clades_truncated: true\n";
+  }
+
+  if (a.chart_composite_score) {
+    auto& grammar = get_chart_grammar();
+    auto& patterns = get_exact_patterns();
+    chart_options chart_opts;
+    chart_opts.score_ua_edge = a.chart_score_ua_edge;
+
+    auto composite_start = std::chrono::steady_clock::now();
+    auto composite = build_composite_chart_score(grammar, patterns, chart_opts);
+    auto composite_ms = elapsed_ms(composite_start,
+                                   std::chrono::steady_clock::now());
+
+    std::cout << "chart_composite_score:\n";
+    std::cout << "  score_kind: LOWER_BOUND\n";
+    std::cout << "  weighted_lower_bound: "
+              << composite.weighted_lower_bound << "\n";
+    std::cout << "  score_ua_edge: "
+              << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+    std::cout << "  exact_patterns: " << patterns.patterns.size() << "\n";
+    std::cout << "  total_sites: " << patterns.total_site_count << "\n";
+    std::cout << "  invariant_sites: " << patterns.invariant_site_count
+              << "\n";
+    std::cout << "  skipped_invariant_sites: "
+              << patterns.skipped_invariant_site_count << "\n";
+    std::cout << "  grammar_build_ms: " << std::fixed
+              << std::setprecision(3) << chart_grammar_build_ms << "\n";
+    std::cout << "  pattern_build_ms: " << std::fixed
+              << std::setprecision(3) << exact_pattern_build_ms << "\n";
+    std::cout << "  composite_chart_ms: " << std::fixed
+              << std::setprecision(3) << composite_ms << "\n";
+    print_limited_per_pattern_roots(std::cout, patterns, composite,
+                                    a.chart_entry_limit);
+  }
+
+  if (a.chart_bnb_trim) {
+    auto& grammar = get_chart_grammar();
+    auto& patterns = get_exact_patterns();
+    chart_options chart_opts;
+    chart_opts.score_ua_edge = a.chart_score_ua_edge;
+    multisite_trim_options trim_opts;
+    trim_opts.use_bound_pruning = !a.chart_bnb_no_bound_pruning;
+    trim_opts.max_frontier_entries_per_clade = a.chart_bnb_max_frontier;
+
+    auto bnb_start = std::chrono::steady_clock::now();
+    auto trim = build_multisite_trim(grammar, patterns, chart_opts, trim_opts);
+    auto bnb_ms = elapsed_ms(bnb_start, std::chrono::steady_clock::now());
+
+    std::cout << "chart_bnb_trim:\n";
+    std::cout << "  score_kind: EXACT\n";
+    std::cout << "  optimum: " << trim.optimum << "\n";
+    std::cout << "  composite_lower_bound_kind: LOWER_BOUND\n";
+    std::cout << "  composite_lower_bound: "
+              << trim.composite_lower_bound << "\n";
+    std::cout << "  initial_upper_bound: " << trim.initial_upper_bound
+              << "\n";
+    std::cout << "  score_ua_edge: "
+              << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+    std::cout << "  active_patterns: " << trim.active_pattern_count << "\n";
+    std::cout << "  exact_patterns: " << patterns.patterns.size() << "\n";
+    std::cout << "  invariant_constant_offset: "
+              << trim.invariant_constant_offset << "\n";
+    std::cout << "  kept_productions: " << count_true(trim.keep_production)
+              << "\n";
+    std::cout << "  total_productions: " << grammar.productions.size()
+              << "\n";
+    std::cout << "  equality_deduplicated: "
+              << trim.equality_deduplicated << "\n";
+    std::cout << "  dominance_pruned: " << trim.dominance_pruned << "\n";
+    std::cout << "  bound_pruned: " << trim.bound_pruned << "\n";
+    std::cout << "  bound_pruning: "
+              << (trim_opts.use_bound_pruning ? "true" : "false") << "\n";
+    std::cout << "  max_frontier_entries_per_clade: "
+              << trim_opts.max_frontier_entries_per_clade << "\n";
+    std::cout << "  grammar_build_ms: " << std::fixed
+              << std::setprecision(3) << chart_grammar_build_ms << "\n";
+    std::cout << "  pattern_build_ms: " << std::fixed
+              << std::setprecision(3) << exact_pattern_build_ms << "\n";
+    std::cout << "  bnb_trim_ms: " << std::fixed << std::setprecision(3)
+              << bnb_ms << "\n";
+    print_frontier_size_stats(std::cout, trim.frontier_sizes_by_clade);
   }
 
   if (a.chart_fluidity_site) {
-    auto grammar = build_clade_grammar(result);
+    auto& grammar = get_chart_grammar();
     auto states =
         extract_leaf_site_states(result, grammar, *a.chart_fluidity_site);
     chart_options chart_opts;
     chart_opts.keep_trace = true;
+    chart_opts.score_ua_edge = a.chart_score_ua_edge;
     auto chart = build_single_site_chart(grammar, states, chart_opts);
-    auto outside = build_single_site_outside_chart(grammar, chart);
+    auto outside = build_single_site_outside_chart(
+        grammar, chart, chart_opts, result, *a.chart_fluidity_site);
     auto report = build_single_site_fluidity_report(grammar, chart, outside);
     std::cout << "chart_fluidity_site: " << *a.chart_fluidity_site << "\n";
+    std::cout << "chart_fluidity_score_ua_edge: "
+              << (a.chart_score_ua_edge ? "true" : "false") << "\n";
     print_fluidity_report(std::cout, grammar, report);
   }
 
