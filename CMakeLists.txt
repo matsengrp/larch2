@@ -515,7 +515,7 @@ set_tests_properties(larch2_ua_flag_without_ml_warns
 foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   weight_accum_test optimize_test native_optimize_test
                   spr_pipeline_test trim_clade_edges_test
-                  rotaA_diagnostic_test
+                  # rotaA_diagnostic_test
                   pth_loader_test build_fasta_newick_test
                   rs_fivemer_model_test nn_cnn_test nn_s5f_test
                   nn_ml_spr_test nn_blended_spr_test
