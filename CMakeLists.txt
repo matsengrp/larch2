@@ -228,6 +228,17 @@ set_tests_properties(dagutil_wric_audit_polytomy_diagnostic
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "kary_grammar_diagnostic_only: true")
 
+add_test(NAME dagutil_wric_phase9_tree_pb_audit
+         COMMAND dagutil
+                 --tree-pb data/seedtree/seedtree.pb.gz
+                 --refseq data/seedtree/refseq.txt.gz
+                 --force-no-vcf
+                 --wric-audit
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_phase9_tree_pb_audit
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "source_kary_productions: 105")
+
 add_test(NAME dagutil_wric_polytomy_report_audit
          COMMAND dagutil
                  --dag-pb data/test_5_trees/tree_0.pb.gz
@@ -299,6 +310,74 @@ set_tests_properties(dagutil_wric_polytomy_benchmark_bounded_frequency
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "bounded_truncation_frequency:")
 
+add_test(NAME dagutil_wric_phase9_benchmark_alias
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-benchmark
+                 --wric-polytomy-benchmark-shape-caps 1
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_phase9_benchmark_alias
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "benchmark_scope: WRIC_PHASE9_POLYTOMY_AWARE")
+
+add_test(NAME dagutil_wric_phase9_chart_site
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-site 1
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_phase9_chart_site
+                     PROPERTIES PASS_REGULAR_EXPRESSION "chart_site:")
+
+add_test(NAME dagutil_wric_phase9_chart_trim_site
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-trim-site 1
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_phase9_chart_trim_site
+                     PROPERTIES PASS_REGULAR_EXPRESSION "chart_trim_site:")
+
+add_test(NAME dagutil_wric_phase9_chart_composite_score
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-composite-score
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_phase9_chart_composite_score
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "score_kind: LOWER_BOUND")
+
+add_test(NAME dagutil_wric_phase9_chart_bnb_trim
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-bnb-trim
+                 --chart-bnb-max-frontier 1000
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_phase9_chart_bnb_trim
+                     PROPERTIES PASS_REGULAR_EXPRESSION "chart_bnb_trim:")
+
+add_test(NAME dagutil_wric_phase9_chart_fluidity_site
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-fluidity-site 1
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_phase9_chart_fluidity_site
+                     PROPERTIES PASS_REGULAR_EXPRESSION "fluidity:")
+
 add_test(NAME dagutil_wric_polytomy_benchmark_bad_shape_cap_suffix
          COMMAND bash -c
                  "\"$<TARGET_FILE:dagutil>\" --wric-polytomy-benchmark-shape-caps 1x 2>&1 | grep -q 'unsigned decimal integer'"
@@ -312,6 +391,31 @@ add_test(NAME dagutil_wric_polytomy_benchmark_bad_shape_cap_sign
 add_test(NAME dagutil_wric_polytomy_benchmark_bad_shape_cap_limit
          COMMAND bash -c
                  "\"$<TARGET_FILE:dagutil>\" --wric-polytomy-benchmark-shape-caps 100001 2>&1 | grep -q 'benchmark safety limit'"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_chart_site_bad_suffix
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --chart-site 1x 2>&1 | grep -q 'unsigned decimal integer'"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_chart_site_zero
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --chart-site 0 2>&1 | grep -q 'positions are 1-based'"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_chart_entry_limit_zero
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --chart-entry-limit 0 2>&1 | grep -q 'must be positive'"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_chart_bnb_max_frontier_bad_suffix
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --chart-bnb-max-frontier 10x 2>&1 | grep -q 'unsigned decimal integer'"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_chart_bnb_max_frontier_zero
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --chart-bnb-max-frontier 0 2>&1 | grep -q 'must be positive'"
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_sample_method_without_sample_fails

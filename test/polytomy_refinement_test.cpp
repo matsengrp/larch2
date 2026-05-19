@@ -669,6 +669,25 @@ static void test_reject_mode_accepts_binary_grammar() {
   std::println("  PASS");
 }
 
+static void test_audit_kary_binary_grammar_remains_exact() {
+  std::println("test_audit_kary_binary_grammar_remains_exact");
+
+  auto dag = make_three_taxon_binary_tree();
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::audit_kary;
+  auto result = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, opts);
+
+  CHECK(!result.audit.contains_kary_productions);
+  CHECK(result.audit.binary_chart_compatible);
+  CHECK(result.audit.exact_for_soft_polytomies);
+  CHECK(result.audit.events.empty());
+  CHECK(std::string{larch::polytomy_refinement_status_label(result.audit)} ==
+        "POLYTOMY_REFINEMENT_EXACT");
+
+  std::println("  PASS");
+}
+
 static void test_audit_kary_returns_diagnostic_grammar() {
   std::println("test_audit_kary_returns_diagnostic_grammar");
 
@@ -1707,6 +1726,7 @@ static void test_phase5_direct_mutation_rejects_synthetic_productions() {
 int main() {
   test_default_reject_mode_rejects_kary();
   test_reject_mode_accepts_binary_grammar();
+  test_audit_kary_binary_grammar_remains_exact();
   test_audit_kary_returns_diagnostic_grammar();
   test_binary_chart_rejects_audit_kary_grammar();
   test_exact_expansion_three_taxon_star();

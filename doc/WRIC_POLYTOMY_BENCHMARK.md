@@ -1,7 +1,7 @@
 # WRIC polytomy benchmark notes
 
-Adds a reproducible benchmark entry point for soft-polytomy binary
-refinement expansion:
+Adds a reproducible Phase-9 benchmark entry point for WRIC grammar/chart
+metrics and soft-polytomy binary refinement expansion:
 
 ```bash
 cmake --build build/wric-asan --target dagutil
@@ -10,9 +10,24 @@ cmake --build build/wric-asan --target dagutil
 
 Set `DAGUTIL=/path/to/dagutil` to use a different build.  The script runs the
 real `data/test_5_trees/tree_0.pb.gz` fixture, any optional local DAG fixtures
-listed in `WRIC_POLYTOMY_EXTRA_DAG_PBS`, the committed two-polytomy FASTA/Newick
-fixture, and generated synthetic stars (`4 6 8` by default; set
-`WRIC_POLYTOMY_SYNTHETIC_ARITIES`).
+listed in `WRIC_POLYTOMY_EXTRA_DAG_PBS`, optional tree protobuf fixtures listed
+as `tree.pb.gz:refseq` pairs in `WRIC_POLYTOMY_EXTRA_TREE_PBS`, the committed
+two-polytomy FASTA/Newick fixture, and generated synthetic stars (`4 6 8` by
+default; set `WRIC_POLYTOMY_SYNTHETIC_ARITIES`).
+
+Use `--wric-benchmark` for the general Phase-9 CLI entry point; it is a
+polytomy-aware alias of the older `--wric-polytomy-benchmark` flag.  To include
+larger committed tree-protobuf fixtures from `data/seedtree` and one
+representative `data/20D_from_fasta` tree, run for example:
+
+```bash
+WRIC_POLYTOMY_INCLUDE_DATA_FIXTURES=1 \
+WRIC_POLYTOMY_BENCHMARK_SHAPE_CAPS=1 \
+./tools/wric_polytomy_benchmark.sh
+```
+
+Keeping the shape cap at `1` is recommended for routine large-fixture smoke
+runs; use `1,4,16` for more thorough bounded-refinement timing.
 
 ## Representative local results
 

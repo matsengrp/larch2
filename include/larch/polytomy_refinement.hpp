@@ -231,9 +231,11 @@ inline polytomy_refinement_result make_phase0_result(
   result.audit.contains_kary_productions = !kary.empty();
   result.audit.binary_chart_compatible =
       grammar_is_binary_chart_compatible(grammar);
+  // Even in audit_kary mode, a grammar with no k-ary productions is already
+  // exact for the full soft-polytomy space because there is nothing to refine.
   result.audit.exact_for_soft_polytomies =
-      options.mode != polytomy_mode::audit_kary &&
-      result.audit.binary_chart_compatible;
+      result.audit.binary_chart_compatible &&
+      !result.audit.contains_kary_productions;
 
   result.clade_info.assign(grammar.clades.size(), refined_clade_info{});
   result.production_info.assign(grammar.productions.size(),

@@ -1144,6 +1144,8 @@ Analysis:
   --dag-info              Print all DAG statistics (tree count, parsimony, RF)
   --wric-audit            Build collapsed clade grammar and print multiplicity
                           diagnostics (allows polytomies for audit only)
+  --wric-benchmark        Run the Phase-9 WRIC grammar/chart/pattern benchmark
+                          (polytomy-aware alias of --wric-polytomy-benchmark)
   --wric-polytomy-mode <M>
                           reject (default), audit-kary, expand-exact,
                           or expand-bounded for WRIC chart diagnostics
@@ -1185,10 +1187,10 @@ Analysis:
                           (alias: --plateau-site)
   --chart-score-ua-edge   Include the UA/reference edge in chart diagnostics
   --chart-entry-limit <N> Limit printed chart/pattern entries (default 20;
-                          0 means no limit)
+                          positive integer)
   --chart-bnb-max-frontier <N>
                           Fail if any B&B clade frontier exceeds N entries
-                          (default 0, no cap)
+                          (omit for no cap; if supplied, must be positive)
   --chart-bnb-no-bound-pruning
                           Disable B&B lower-bound pruning for diagnostics
   --parsimony             Print parsimony score distribution
@@ -1235,6 +1237,7 @@ struct args {
   bool edge_ml = false;
   bool validate = false;
   bool wric_audit = false;
+  bool wric_benchmark = false;
   polytomy_refinement_options wric_polytomy_opts;
   bool wric_polytomy_mode_explicit = false;
   bool wric_polytomy_report = false;
@@ -1315,6 +1318,16 @@ static std::size_t parse_size_token_strict(std::string_view token,
                              "' exceeds size_t range");
   }
   return static_cast<std::size_t>(parsed);
+}
+
+static std::size_t parse_positive_size_token_strict(
+    std::string_view token, std::string_view arg_name) {
+  auto value = parse_size_token_strict(token, arg_name);
+  if (value == 0) {
+    throw std::runtime_error(std::string{arg_name} +
+                             " value must be positive");
+  }
+  return value;
 }
 
 static std::vector<std::size_t> parse_size_csv(std::string_view text,
@@ -1412,6 +1425,8 @@ static args parse_args(int argc, char** argv) {
       a.print_rf_distance = true;
     } else if (arg == "--wric-audit") {
       a.wric_audit = true;
+    } else if (arg == "--wric-benchmark") {
+      a.wric_benchmark = true;
     } else if (arg == "--wric-polytomy-mode") {
       auto value = next();
       auto mode = parse_wric_polytomy_mode(value);
@@ -1445,8 +1460,7 @@ static args parse_args(int argc, char** argv) {
       auto pos = static_cast<mutation_position>(parse_size_token_strict(
           next(), "--wric-polytomy-benchmark-site"));
       if (pos == 0) {
-        std::cerr << "error: benchmark site positions are 1-based\n";
-        std::exit(1);
+        throw std::runtime_error("benchmark site positions are 1-based");
       }
       a.wric_polytomy_benchmark_site = pos;
     } else if (arg == "--wric-polytomy-benchmark-bnb") {
@@ -1458,21 +1472,19 @@ static args parse_args(int argc, char** argv) {
     } else if (arg == "--wric-polytomy-report") {
       a.wric_polytomy_report = true;
     } else if (arg == "--chart-site") {
-      auto pos =
-          static_cast<mutation_position>(std::stoull(std::string{next()}));
+      auto pos = static_cast<mutation_position>(
+          parse_size_token_strict(next(), "--chart-site"));
       if (pos == 0) {
-        std::cerr << "error: chart site positions are 1-based\n";
-        std::exit(1);
+        throw std::runtime_error("chart site positions are 1-based");
       }
       a.chart_site = pos;
     } else if (arg == "--chart-pattern-info") {
       a.chart_pattern_info = true;
     } else if (arg == "--chart-trim-site") {
-      auto pos =
-          static_cast<mutation_position>(std::stoull(std::string{next()}));
+      auto pos = static_cast<mutation_position>(
+          parse_size_token_strict(next(), "--chart-trim-site"));
       if (pos == 0) {
-        std::cerr << "error: chart trim site positions are 1-based\n";
-        std::exit(1);
+        throw std::runtime_error("chart trim site positions are 1-based");
       }
       a.chart_trim_site = pos;
     } else if (arg == "--chart-composite-score") {
@@ -1480,21 +1492,20 @@ static args parse_args(int argc, char** argv) {
     } else if (arg == "--chart-bnb-trim") {
       a.chart_bnb_trim = true;
     } else if (arg == "--chart-fluidity-site" || arg == "--plateau-site") {
-      auto pos =
-          static_cast<mutation_position>(std::stoull(std::string{next()}));
+      auto pos = static_cast<mutation_position>(
+          parse_size_token_strict(next(), std::string{arg}));
       if (pos == 0) {
-        std::cerr << "error: chart fluidity site positions are 1-based\n";
-        std::exit(1);
+        throw std::runtime_error("chart fluidity site positions are 1-based");
       }
       a.chart_fluidity_site = pos;
     } else if (arg == "--chart-score-ua-edge") {
       a.chart_score_ua_edge = true;
     } else if (arg == "--chart-entry-limit") {
-      a.chart_entry_limit = static_cast<std::size_t>(
-          std::stoull(std::string{next()}));
+      a.chart_entry_limit = parse_positive_size_token_strict(
+          next(), "--chart-entry-limit");
     } else if (arg == "--chart-bnb-max-frontier") {
-      a.chart_bnb_max_frontier = static_cast<std::size_t>(
-          std::stoull(std::string{next()}));
+      a.chart_bnb_max_frontier = parse_positive_size_token_strict(
+          next(), "--chart-bnb-max-frontier");
     } else if (arg == "--chart-bnb-no-bound-pruning") {
       a.chart_bnb_no_bound_pruning = true;
     } else if (arg == "--edge-parsimony")
@@ -1766,6 +1777,7 @@ static void print_binary_refinement_performance_benchmark(
   }
 
   site_pattern_options pattern_opts;
+  pattern_opts.build_normalized_binary_patterns = true;
   auto pattern_start = std::chrono::steady_clock::now();
   auto patterns = build_site_patterns(dag, grammar, pattern_opts);
   auto pattern_ms = elapsed_ms(pattern_start, std::chrono::steady_clock::now());
@@ -1804,12 +1816,43 @@ static void print_binary_refinement_performance_benchmark(
   } else {
     out << child << "chart_with_trace_error: " << trace_error << "\n";
   }
+  auto pattern_build_ms_per_site =
+      patterns.total_site_count == 0
+          ? 0.0
+          : pattern_ms / static_cast<double>(patterns.total_site_count);
+  auto composite_ms_per_pattern =
+      patterns.patterns.empty()
+          ? 0.0
+          : composite_ms / static_cast<double>(patterns.patterns.size());
   out << child << "pattern_build_ms: " << std::fixed
       << std::setprecision(3) << pattern_ms << "\n";
+  out << child << "pattern_build_ms_per_site: " << std::fixed
+      << std::setprecision(6) << pattern_build_ms_per_site << "\n";
   out << child << "exact_patterns: " << patterns.patterns.size() << "\n";
   out << child << "total_sites: " << patterns.total_site_count << "\n";
+  out << child << "taxa: " << patterns.taxon_count << "\n";
+  out << child << "invariant_sites: " << patterns.invariant_site_count
+      << "\n";
+  out << child << "variable_sites: " << patterns.variable_site_count
+      << "\n";
+  out << child << "binary_variable_sites: "
+      << patterns.binary_variable_site_count << "\n";
+  out << child << "nonbinary_variable_sites: "
+      << patterns.nonbinary_variable_site_count << "\n";
+  out << child << "skipped_invariant_sites: "
+      << patterns.skipped_invariant_site_count << "\n";
+  out << child << "normalized_binary_patterns: "
+      << patterns.normalized_binary_patterns.size() << "\n";
+  out << child << "invariant_constant_score_excluding_ua: "
+      << patterns.invariant_constant_score_excluding_ua << "\n";
+  out << child << "invariant_constant_score_with_reference_edge: "
+      << patterns.invariant_constant_score_with_reference_edge << "\n";
+  out << child << "skipped_invariant_constant_score_with_reference_edge: "
+      << patterns.skipped_invariant_constant_score_with_reference_edge << "\n";
   out << child << "composite_chart_ms: " << std::fixed
       << std::setprecision(3) << composite_ms << "\n";
+  out << child << "composite_chart_ms_per_pattern: " << std::fixed
+      << std::setprecision(6) << composite_ms_per_pattern << "\n";
   out << child << "composite_lower_bound: "
       << composite.weighted_lower_bound << "\n";
 
@@ -1833,6 +1876,10 @@ static void print_binary_refinement_performance_benchmark(
         << bnb_ms << "\n";
     out << child << "optimum: " << trim.optimum << "\n";
     out << child << "active_patterns: " << trim.active_pattern_count << "\n";
+    out << child << "equality_deduplicated: "
+        << trim.equality_deduplicated << "\n";
+    out << child << "dominance_pruned: " << trim.dominance_pruned << "\n";
+    out << child << "bound_pruned: " << trim.bound_pruned << "\n";
     out << child << "bound_pruning: "
         << (trim_opts.use_bound_pruning ? "true" : "false") << "\n";
     out << child << "max_frontier_entries_per_clade: "
@@ -1887,6 +1934,7 @@ static void run_wric_polytomy_benchmark(std::ostream& out, phylo_dag& dag,
       audit_refinement.grammar, soft_count_saturated);
 
   out << "wric_polytomy_benchmark:\n";
+  out << "  benchmark_scope: WRIC_PHASE9_POLYTOMY_AWARE\n";
   out << "  benchmark_site: " << site << "\n";
   out << "  audit_build_ms: " << std::fixed << std::setprecision(3)
       << audit_ms << "\n";
@@ -1894,6 +1942,24 @@ static void run_wric_polytomy_benchmark(std::ostream& out, phylo_dag& dag,
       << "\n";
   out << "  source_productions: "
       << audit_refinement.audit.source_production_count << "\n";
+  out << "  source_history_nodes_per_collapsed_clade_max: "
+      << audit_refinement.source_grammar_audit.max_nodes_per_collapsed_clade
+      << "\n";
+  out << "  source_history_nodes_per_collapsed_clade_mean: " << std::fixed
+      << std::setprecision(3)
+      << audit_refinement.source_grammar_audit.mean_nodes_per_collapsed_clade
+      << "\n";
+  out << "  source_history_nodes_per_collapsed_clade_median: " << std::fixed
+      << std::setprecision(3)
+      << audit_refinement.source_grammar_audit.median_nodes_per_collapsed_clade
+      << "\n";
+  out << "  source_strict_reference_acgt_fail: "
+      << audit_refinement.source_grammar_audit.strict_reference_acgt_fail
+      << "\n";
+  out << "  source_strict_leaf_compact_genome_acgt_fail: "
+      << audit_refinement.source_grammar_audit
+             .strict_leaf_compact_genome_acgt_fail
+      << "\n";
   out << "  source_kary_productions: "
       << audit_refinement.audit.source_kary_production_count << "\n";
   out << "  source_kary_arity_histogram:\n";
@@ -2109,7 +2175,7 @@ int main(int argc, char** argv) try {
               << std::setprecision(3) << build_ms << "\n";
   }
 
-  if (a.wric_polytomy_benchmark) {
+  if (a.wric_benchmark || a.wric_polytomy_benchmark) {
     run_wric_polytomy_benchmark(std::cout, result, a);
   }
 
