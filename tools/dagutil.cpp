@@ -357,6 +357,120 @@ static std::uint64_t dagutil_saturated_mul(std::uint64_t lhs,
   return lhs * rhs;
 }
 
+static constexpr std::uint64_t k_wric_exact_warning_clade_threshold = 4096;
+static constexpr std::uint64_t k_wric_exact_warning_production_threshold =
+    100000;
+static constexpr std::uint64_t k_wric_exact_warning_refinement_threshold =
+    1000;
+static constexpr std::size_t k_wric_benchmark_shape_cap_limit = 100000;
+
+struct wric_exact_event_size_estimate {
+  std::size_t arity = 0;
+  std::uint64_t synthetic_clade_upper_bound = 0;
+  std::uint64_t binary_production_upper_bound = 0;
+  std::uint64_t rooted_binary_refinement_count = 0;
+  bool synthetic_clade_upper_bound_saturated = false;
+  bool binary_production_upper_bound_saturated = false;
+  bool rooted_binary_refinement_count_saturated = false;
+
+  [[nodiscard]] bool size_estimates_saturated() const {
+    return synthetic_clade_upper_bound_saturated ||
+           binary_production_upper_bound_saturated;
+  }
+};
+
+static std::uint64_t wric_saturated_pow_u64(std::uint64_t base,
+                                            std::size_t exp,
+                                            bool& saturated) {
+  std::uint64_t result = 1;
+  for (std::size_t i = 0; i < exp; ++i)
+    result = dagutil_saturated_mul(result, base, saturated);
+  return result;
+}
+
+static std::uint64_t wric_rooted_binary_refinement_count(std::size_t arity,
+                                                         bool& saturated) {
+  if (arity <= 2) return 1;
+  std::uint64_t result = 1;
+  for (std::size_t value = 3; value <= 2 * arity - 3; value += 2)
+    result = dagutil_saturated_mul(result, static_cast<std::uint64_t>(value),
+                                   saturated);
+  return result;
+}
+
+static wric_exact_event_size_estimate estimate_wric_exact_event_size(
+    std::size_t arity) {
+  wric_exact_event_size_estimate estimate;
+  estimate.arity = arity;
+
+  if (arity >= 3) {
+    bool clade_saturated = false;
+    auto pow2 = wric_saturated_pow_u64(2, arity, clade_saturated);
+    if (clade_saturated || pow2 < arity + 2) {
+      estimate.synthetic_clade_upper_bound_saturated = true;
+      estimate.synthetic_clade_upper_bound =
+          std::numeric_limits<std::uint64_t>::max();
+    } else {
+      estimate.synthetic_clade_upper_bound =
+          pow2 - static_cast<std::uint64_t>(arity) - 2;
+    }
+  }
+
+  if (arity >= 2) {
+    bool production_saturated = false;
+    auto pow3 = wric_saturated_pow_u64(3, arity, production_saturated);
+    auto pow2_next =
+        wric_saturated_pow_u64(2, arity + 1, production_saturated);
+    if (production_saturated || pow3 < pow2_next - 1) {
+      estimate.binary_production_upper_bound_saturated = true;
+      estimate.binary_production_upper_bound =
+          std::numeric_limits<std::uint64_t>::max();
+    } else {
+      estimate.binary_production_upper_bound =
+          (pow3 - pow2_next + 1) / 2;
+    }
+  }
+
+  bool refinement_saturated = false;
+  estimate.rooted_binary_refinement_count =
+      wric_rooted_binary_refinement_count(arity, refinement_saturated);
+  estimate.rooted_binary_refinement_count_saturated = refinement_saturated;
+  return estimate;
+}
+
+static bool wric_u64_exceeds_size_cap(std::uint64_t value, bool saturated,
+                                      std::size_t cap) {
+  if (saturated) return true;
+  if (value >
+      static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    return true;
+  }
+  return static_cast<std::size_t>(value) > cap;
+}
+
+static std::size_t recommended_wric_exact_arity_cap() {
+  polytomy_refinement_options defaults;
+  std::size_t recommendation = 2;
+  for (std::size_t arity = 3; arity <= 63; ++arity) {
+    auto estimate = estimate_wric_exact_event_size(arity);
+    if (wric_u64_exceeds_size_cap(
+            estimate.synthetic_clade_upper_bound,
+            estimate.synthetic_clade_upper_bound_saturated,
+            defaults.max_new_clades_per_polytomy) ||
+        wric_u64_exceeds_size_cap(
+            estimate.binary_production_upper_bound,
+            estimate.binary_production_upper_bound_saturated,
+            defaults.max_new_productions_per_polytomy) ||
+        estimate.rooted_binary_refinement_count_saturated ||
+        estimate.rooted_binary_refinement_count >
+            k_wric_exact_warning_refinement_threshold) {
+      break;
+    }
+    recommendation = arity;
+  }
+  return recommendation;
+}
+
 static std::uint64_t grammar_tree_count_for_clade(
     clade_grammar const& grammar, clade_id clade,
     std::vector<std::uint64_t>& memo, std::vector<bool>& memoized,
@@ -417,6 +531,67 @@ static std::uint64_t grammar_tree_count(clade_grammar const& grammar,
                                       memoized, visiting, saturated);
 }
 
+static std::uint64_t soft_refinement_tree_count_for_clade(
+    clade_grammar const& grammar, clade_id clade,
+    std::vector<std::uint64_t>& memo, std::vector<bool>& memoized,
+    std::vector<bool>& visiting, bool& saturated) {
+  if (clade == no_clade || clade >= grammar.clades.size()) {
+    saturated = true;
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  if (memoized[clade]) return memo[clade];
+  if (visiting[clade]) {
+    throw std::runtime_error(
+        "WRIC soft-refinement tree-count DP found a cycle");
+  }
+  visiting[clade] = true;
+
+  std::uint64_t total = 0;
+  auto const& parent_productions = grammar.productions_by_parent[clade];
+  if (parent_productions.empty()) {
+    total = 1;
+  } else {
+    for (auto pid : parent_productions) {
+      if (pid == no_production || pid >= grammar.productions.size()) {
+        saturated = true;
+        total = std::numeric_limits<std::uint64_t>::max();
+        break;
+      }
+      auto const& prod = grammar.productions[pid];
+      auto arity = prod.children.size();
+      auto prod_weight = arity >= 3 ? wric_rooted_binary_refinement_count(
+                                          arity, saturated)
+                                    : std::uint64_t{1};
+      std::uint64_t prod_count = prod_weight;
+      for (auto child : prod.children) {
+        auto child_count = soft_refinement_tree_count_for_clade(
+            grammar, child, memo, memoized, visiting, saturated);
+        prod_count = dagutil_saturated_mul(prod_count, child_count,
+                                           saturated);
+      }
+      total = dagutil_saturated_add(total, prod_count, saturated);
+    }
+  }
+
+  visiting[clade] = false;
+  memo[clade] = total;
+  memoized[clade] = true;
+  return total;
+}
+
+static std::uint64_t soft_refinement_tree_count_estimate(
+    clade_grammar const& grammar, bool& saturated) {
+  if (grammar.clades.empty() || grammar.root_clade == no_clade ||
+      grammar.root_clade >= grammar.clades.size()) {
+    return 0;
+  }
+  std::vector<std::uint64_t> memo(grammar.clades.size(), 0);
+  std::vector<bool> memoized(grammar.clades.size(), false);
+  std::vector<bool> visiting(grammar.clades.size(), false);
+  return soft_refinement_tree_count_for_clade(
+      grammar, grammar.root_clade, memo, memoized, visiting, saturated);
+}
+
 static wric_polytomy_report_totals summarize_wric_polytomy_report(
     polytomy_refinement_result const& refinement) {
   auto const& audit = refinement.audit;
@@ -455,6 +630,232 @@ static std::map<std::size_t, std::size_t> source_kary_arity_histogram(
   for (auto pid : kary_productions(grammar))
     ++histogram[grammar.productions[pid].children.size()];
   return histogram;
+}
+
+struct wric_exact_preflight_summary {
+  std::size_t event_count = 0;
+  std::size_t max_arity = 0;
+  std::uint64_t total_synthetic_clade_upper_bound = 0;
+  std::uint64_t total_binary_production_upper_bound = 0;
+  std::uint64_t full_soft_refinement_count_product = 1;
+  bool total_synthetic_clade_upper_bound_saturated = false;
+  bool total_binary_production_upper_bound_saturated = false;
+  bool full_soft_refinement_count_product_saturated = false;
+  std::size_t events_exceeding_exact_arity_cap = 0;
+  std::size_t events_exceeding_clade_cap = 0;
+  std::size_t events_exceeding_production_cap = 0;
+  std::size_t events_exceeding_warning_threshold = 0;
+  bool exceeds_total_clade_cap = false;
+  bool exceeds_total_production_cap = false;
+
+  [[nodiscard]] bool fits_configured_exact_caps() const {
+    return events_exceeding_exact_arity_cap == 0 &&
+           events_exceeding_clade_cap == 0 &&
+           events_exceeding_production_cap == 0 &&
+           !exceeds_total_clade_cap && !exceeds_total_production_cap &&
+           !total_synthetic_clade_upper_bound_saturated &&
+           !total_binary_production_upper_bound_saturated;
+  }
+};
+
+static wric_exact_preflight_summary summarize_wric_exact_preflight(
+    polytomy_refinement_result const& refinement,
+    polytomy_refinement_options const& options) {
+  wric_exact_preflight_summary summary;
+  summary.event_count = refinement.audit.events.size();
+  for (auto const& event : refinement.audit.events) {
+    if (event.arity < 3) continue;
+    summary.max_arity = std::max(summary.max_arity, event.arity);
+    auto estimate = estimate_wric_exact_event_size(event.arity);
+    summary.total_synthetic_clade_upper_bound_saturated |=
+        estimate.synthetic_clade_upper_bound_saturated;
+    summary.total_synthetic_clade_upper_bound = dagutil_saturated_add(
+        summary.total_synthetic_clade_upper_bound,
+        estimate.synthetic_clade_upper_bound,
+        summary.total_synthetic_clade_upper_bound_saturated);
+    summary.total_binary_production_upper_bound_saturated |=
+        estimate.binary_production_upper_bound_saturated;
+    summary.total_binary_production_upper_bound = dagutil_saturated_add(
+        summary.total_binary_production_upper_bound,
+        estimate.binary_production_upper_bound,
+        summary.total_binary_production_upper_bound_saturated);
+    summary.full_soft_refinement_count_product_saturated |=
+        estimate.rooted_binary_refinement_count_saturated;
+    summary.full_soft_refinement_count_product = dagutil_saturated_mul(
+        summary.full_soft_refinement_count_product,
+        estimate.rooted_binary_refinement_count,
+        summary.full_soft_refinement_count_product_saturated);
+
+    if (event.arity > options.max_exact_arity || event.arity > 63)
+      ++summary.events_exceeding_exact_arity_cap;
+    if (wric_u64_exceeds_size_cap(
+            estimate.synthetic_clade_upper_bound,
+            estimate.synthetic_clade_upper_bound_saturated,
+            options.max_new_clades_per_polytomy)) {
+      ++summary.events_exceeding_clade_cap;
+    }
+    if (wric_u64_exceeds_size_cap(
+            estimate.binary_production_upper_bound,
+            estimate.binary_production_upper_bound_saturated,
+            options.max_new_productions_per_polytomy)) {
+      ++summary.events_exceeding_production_cap;
+    }
+    if (estimate.size_estimates_saturated() ||
+        estimate.rooted_binary_refinement_count_saturated ||
+        estimate.synthetic_clade_upper_bound >
+            k_wric_exact_warning_clade_threshold ||
+        estimate.binary_production_upper_bound >
+            k_wric_exact_warning_production_threshold ||
+        estimate.rooted_binary_refinement_count >
+            k_wric_exact_warning_refinement_threshold) {
+      ++summary.events_exceeding_warning_threshold;
+    }
+  }
+
+  summary.exceeds_total_clade_cap = wric_u64_exceeds_size_cap(
+      summary.total_synthetic_clade_upper_bound,
+      summary.total_synthetic_clade_upper_bound_saturated,
+      options.max_total_new_clades);
+  summary.exceeds_total_production_cap = wric_u64_exceeds_size_cap(
+      summary.total_binary_production_upper_bound,
+      summary.total_binary_production_upper_bound_saturated,
+      options.max_total_new_productions);
+  return summary;
+}
+
+static void print_saturated_u64(std::ostream& out, std::uint64_t value,
+                                bool saturated) {
+  out << value;
+  if (saturated) out << " (saturated)";
+}
+
+static void print_wric_exact_expansion_preflight(
+    std::ostream& out, polytomy_refinement_result const& refinement,
+    polytomy_refinement_options const& options) {
+  auto summary = summarize_wric_exact_preflight(refinement, options);
+  out << "  exact_expansion_preflight:\n";
+  out << "    default_exact_arity_cap_recommendation: "
+      << recommended_wric_exact_arity_cap() << "\n";
+  out << "    default_exact_arity_cap_recommendation_basis: "
+      << "largest arity within default per-event size caps and rooted "
+         "refinement warning threshold\n";
+  out << "    configured_max_exact_arity: " << options.max_exact_arity
+      << "\n";
+  out << "    configured_max_new_clades_per_polytomy: "
+      << options.max_new_clades_per_polytomy << "\n";
+  out << "    configured_max_new_productions_per_polytomy: "
+      << options.max_new_productions_per_polytomy << "\n";
+  out << "    warning_clade_threshold: "
+      << k_wric_exact_warning_clade_threshold << "\n";
+  out << "    warning_production_threshold: "
+      << k_wric_exact_warning_production_threshold << "\n";
+  out << "    warning_rooted_refinement_count_threshold: "
+      << k_wric_exact_warning_refinement_threshold << "\n";
+  out << "    source_kary_events: " << summary.event_count << "\n";
+  out << "    max_observed_kary_arity: " << summary.max_arity << "\n";
+  out << "    total_exact_synthetic_clade_upper_bound: ";
+  print_saturated_u64(out, summary.total_synthetic_clade_upper_bound,
+                      summary.total_synthetic_clade_upper_bound_saturated);
+  out << "\n";
+  out << "    total_exact_binary_production_upper_bound: ";
+  print_saturated_u64(out, summary.total_binary_production_upper_bound,
+                      summary.total_binary_production_upper_bound_saturated);
+  out << "\n";
+  out << "    product_event_full_soft_refinement_count: ";
+  print_saturated_u64(out, summary.full_soft_refinement_count_product,
+                      summary.full_soft_refinement_count_product_saturated);
+  out << "\n";
+  out << "    events_exceeding_configured_exact_arity_cap: "
+      << summary.events_exceeding_exact_arity_cap << "\n";
+  out << "    events_whose_theoretical_clade_upper_bound_exceeds_configured_cap: "
+      << summary.events_exceeding_clade_cap << "\n";
+  out << "    events_whose_theoretical_production_upper_bound_exceeds_configured_cap: "
+      << summary.events_exceeding_production_cap << "\n";
+  out << "    events_exceeding_warning_threshold: "
+      << summary.events_exceeding_warning_threshold << "\n";
+  out << "    theoretical_total_clade_upper_bound_exceeds_total_cap: "
+      << (summary.exceeds_total_clade_cap ? "true" : "false") << "\n";
+  out << "    theoretical_total_production_upper_bound_exceeds_total_cap: "
+      << (summary.exceeds_total_production_cap ? "true" : "false")
+      << "\n";
+  out << "    exact_expansion_theoretical_upper_bound_fits_configured_caps: "
+      << (summary.fits_configured_exact_caps() ? "true" : "false")
+      << "\n";
+  out << "    exact_expansion_preflight_may_exceed_configured_caps: "
+      << (summary.fits_configured_exact_caps() ? "false" : "true")
+      << "\n";
+  out << "    warnings:\n";
+  bool printed_warning = false;
+  auto print_warning = [&](std::string const& message) {
+    printed_warning = true;
+    out << "      - " << message << "\n";
+  };
+  if (summary.events_exceeding_exact_arity_cap != 0) {
+    print_warning("one or more polytomies exceed the configured exact arity "
+                  "cap; exact expansion will fail unless the cap is raised");
+  }
+  if (summary.events_exceeding_clade_cap != 0 ||
+      summary.exceeds_total_clade_cap) {
+    print_warning("theoretical upper-bound exact synthetic clades may exceed "
+                  "configured clade caps; run exact expansion/benchmark to "
+                  "report reuse-aware success or failure");
+  }
+  if (summary.events_exceeding_production_cap != 0 ||
+      summary.exceeds_total_production_cap) {
+    print_warning("theoretical upper-bound exact binary productions may "
+                  "exceed configured production caps; run exact "
+                  "expansion/benchmark to report reuse-aware success or "
+                  "failure");
+  }
+  if (summary.events_exceeding_warning_threshold != 0) {
+    print_warning("theoretical exact expansion estimates exceed benchmark "
+                  "warning thresholds; audit/benchmark before scoring");
+  }
+  if (!printed_warning) out << "      <empty>\n";
+
+  out << "    event_estimates:\n";
+  if (refinement.audit.events.empty()) {
+    out << "      <empty>\n";
+    return;
+  }
+  for (auto const& event : refinement.audit.events) {
+    auto estimate = estimate_wric_exact_event_size(event.arity);
+    out << "      - source_production: " << event.source_production << "\n";
+    out << "        arity: " << event.arity << "\n";
+    out << "        exact_synthetic_clade_upper_bound: ";
+    print_saturated_u64(out, estimate.synthetic_clade_upper_bound,
+                        estimate.synthetic_clade_upper_bound_saturated);
+    out << "\n";
+    out << "        exact_binary_production_upper_bound: ";
+    print_saturated_u64(out, estimate.binary_production_upper_bound,
+                        estimate.binary_production_upper_bound_saturated);
+    out << "\n";
+    out << "        rooted_binary_refinement_count: ";
+    print_saturated_u64(out, estimate.rooted_binary_refinement_count,
+                        estimate.rooted_binary_refinement_count_saturated);
+    out << "\n";
+    out << "        exceeds_configured_exact_arity_cap: "
+        << (event.arity > options.max_exact_arity || event.arity > 63
+                ? "true"
+                : "false")
+        << "\n";
+    out << "        theoretical_clade_upper_bound_exceeds_configured_cap: "
+        << (wric_u64_exceeds_size_cap(
+                estimate.synthetic_clade_upper_bound,
+                estimate.synthetic_clade_upper_bound_saturated,
+                options.max_new_clades_per_polytomy)
+                ? "true"
+                : "false")
+        << "\n";
+    out << "        theoretical_production_upper_bound_exceeds_configured_cap: "
+        << (wric_u64_exceeds_size_cap(
+                estimate.binary_production_upper_bound,
+                estimate.binary_production_upper_bound_saturated,
+                options.max_new_productions_per_polytomy)
+                ? "true"
+                : "false")
+        << "\n";
+  }
 }
 
 static void print_wric_polytomy_summary_fields(
@@ -609,6 +1010,7 @@ static void print_wric_polytomy_audit_fields(
   auto const& audit = refinement.audit;
   print_wric_polytomy_summary_fields(out, refinement, mode);
   print_wric_polytomy_source_kary_details(out, refinement);
+  print_wric_exact_expansion_preflight(out, refinement, refinement.options);
   out << "  downstream_binary_charting_allowed: "
       << (audit.binary_chart_compatible && !audit.contains_kary_productions
               ? "true"
@@ -751,6 +1153,21 @@ Analysis:
                           Bounded seed-shape cap per polytomy (default 16)
   --wric-polytomy-max-productions <N>
                           Per-polytomy production cap for expansion
+  --wric-polytomy-max-clades <N>
+                          Per-polytomy synthetic-clade cap for expansion
+  --wric-polytomy-benchmark
+                          Benchmark audit/exact/bounded refinement and chart
+                          timings for the loaded DAG(s)
+  --wric-polytomy-benchmark-shape-caps <CSV>
+                          Candidate bounded seed-shape caps (default 1,4,16;
+                          positive integers, each <= 100000)
+  --wric-polytomy-benchmark-site <POS>
+                          Site used for single-site benchmark (default 1)
+  --wric-polytomy-benchmark-bnb
+                          Also run exact multi-site B&B frontier benchmark
+  --wric-polytomy-benchmark-max-trace-choices <N>
+                          Trace-choice cap for benchmark chart-with-trace
+                          (default 1000000; 0 means no cap)
   --wric-polytomy-report  Print polytomy refinement status/audit details;
                           chart reports include per-event details
   --chart-site <POS>      Build a one-site chart and print root optimum plus
@@ -821,6 +1238,11 @@ struct args {
   polytomy_refinement_options wric_polytomy_opts;
   bool wric_polytomy_mode_explicit = false;
   bool wric_polytomy_report = false;
+  bool wric_polytomy_benchmark = false;
+  std::vector<std::size_t> wric_polytomy_benchmark_shape_caps{1, 4, 16};
+  std::optional<mutation_position> wric_polytomy_benchmark_site;
+  bool wric_polytomy_benchmark_bnb = false;
+  std::size_t wric_polytomy_benchmark_max_trace_choices = 1000000;
   std::optional<mutation_position> chart_site;
   bool chart_pattern_info = false;
   std::optional<mutation_position> chart_trim_site;
@@ -858,6 +1280,76 @@ static std::optional<polytomy_mode> parse_wric_polytomy_mode(
       text == "expand_soft_bounded")
     return polytomy_mode::expand_soft_bounded;
   return std::nullopt;
+}
+
+static std::size_t parse_size_token_strict(std::string_view token,
+                                           std::string_view arg_name) {
+  if (token.empty()) {
+    throw std::runtime_error(std::string{arg_name} +
+                             " contains an empty value");
+  }
+  for (char c : token) {
+    if (c < '0' || c > '9') {
+      throw std::runtime_error(std::string{arg_name} + " value '" +
+                               std::string{token} +
+                               "' must be an unsigned decimal integer");
+    }
+  }
+
+  std::string owned{token};
+  std::size_t pos = 0;
+  unsigned long long parsed = 0;
+  try {
+    parsed = std::stoull(owned, &pos, 10);
+  } catch (std::exception const&) {
+    throw std::runtime_error(std::string{arg_name} + " value '" + owned +
+                             "' is out of range");
+  }
+  if (pos != owned.size()) {
+    throw std::runtime_error(std::string{arg_name} + " value '" + owned +
+                             "' has trailing characters");
+  }
+  if (parsed > static_cast<unsigned long long>(
+                   std::numeric_limits<std::size_t>::max())) {
+    throw std::runtime_error(std::string{arg_name} + " value '" + owned +
+                             "' exceeds size_t range");
+  }
+  return static_cast<std::size_t>(parsed);
+}
+
+static std::vector<std::size_t> parse_size_csv(std::string_view text,
+                                               std::string_view arg_name) {
+  std::vector<std::size_t> values;
+  std::size_t begin = 0;
+  while (begin <= text.size()) {
+    auto comma = text.find(',', begin);
+    auto end = comma == std::string_view::npos ? text.size() : comma;
+    auto token = text.substr(begin, end - begin);
+    if (token.empty()) {
+      throw std::runtime_error(std::string{arg_name} +
+                               " contains an empty CSV entry");
+    }
+    auto value = parse_size_token_strict(token, arg_name);
+    if (value == 0) {
+      throw std::runtime_error(std::string{arg_name} +
+                               " values must be positive");
+    }
+    if (value > k_wric_benchmark_shape_cap_limit) {
+      throw std::runtime_error(std::string{arg_name} + " value '" +
+                               std::string{token} +
+                               "' exceeds benchmark safety limit " +
+                               std::to_string(
+                                   k_wric_benchmark_shape_cap_limit));
+    }
+    values.push_back(value);
+    if (comma == std::string_view::npos) break;
+    begin = comma + 1;
+  }
+  if (values.empty()) {
+    throw std::runtime_error(std::string{arg_name} +
+                             " must contain at least one value");
+  }
+  return values;
 }
 
 static args parse_args(int argc, char** argv) {
@@ -941,6 +1433,28 @@ static args parse_args(int argc, char** argv) {
           std::stoull(std::string{next()}));
       a.wric_polytomy_opts.max_new_productions_per_polytomy = value;
       a.wric_polytomy_opts.max_bounded_productions_per_polytomy = value;
+    } else if (arg == "--wric-polytomy-max-clades") {
+      a.wric_polytomy_opts.max_new_clades_per_polytomy =
+          static_cast<std::size_t>(std::stoull(std::string{next()}));
+    } else if (arg == "--wric-polytomy-benchmark") {
+      a.wric_polytomy_benchmark = true;
+    } else if (arg == "--wric-polytomy-benchmark-shape-caps") {
+      a.wric_polytomy_benchmark_shape_caps =
+          parse_size_csv(next(), "--wric-polytomy-benchmark-shape-caps");
+    } else if (arg == "--wric-polytomy-benchmark-site") {
+      auto pos = static_cast<mutation_position>(parse_size_token_strict(
+          next(), "--wric-polytomy-benchmark-site"));
+      if (pos == 0) {
+        std::cerr << "error: benchmark site positions are 1-based\n";
+        std::exit(1);
+      }
+      a.wric_polytomy_benchmark_site = pos;
+    } else if (arg == "--wric-polytomy-benchmark-bnb") {
+      a.wric_polytomy_benchmark_bnb = true;
+    } else if (arg == "--wric-polytomy-benchmark-max-trace-choices") {
+      a.wric_polytomy_benchmark_max_trace_choices =
+          parse_size_token_strict(
+              next(), "--wric-polytomy-benchmark-max-trace-choices");
     } else if (arg == "--wric-polytomy-report") {
       a.wric_polytomy_report = true;
     } else if (arg == "--chart-site") {
@@ -1090,6 +1604,387 @@ static args parse_args(int argc, char** argv) {
   return a;
 }
 
+static std::size_t saturating_size_add(std::size_t lhs, std::size_t rhs) {
+  auto max = std::numeric_limits<std::size_t>::max();
+  if (max - lhs < rhs) return max;
+  return lhs + rhs;
+}
+
+static std::size_t saturating_size_mul(std::size_t lhs, std::size_t rhs) {
+  auto max = std::numeric_limits<std::size_t>::max();
+  if (lhs != 0 && rhs > max / lhs) return max;
+  return lhs * rhs;
+}
+
+static std::size_t estimate_chart_memory_without_trace_bytes(
+    clade_grammar const& grammar) {
+  return saturating_size_mul(grammar.clades.size(),
+                             sizeof(std::array<chart_cost, nuc_state_count>));
+}
+
+static std::size_t estimate_chart_memory_with_trace_bytes(
+    clade_grammar const& grammar, single_site_chart const& chart) {
+  auto total = estimate_chart_memory_without_trace_bytes(grammar);
+  auto vector_count = saturating_size_mul(grammar.clades.size(),
+                                          nuc_state_count);
+  total = saturating_size_add(
+      total,
+      saturating_size_mul(vector_count, sizeof(std::vector<chart_choice>)));
+  total = saturating_size_add(
+      total, saturating_size_mul(chart.trace_choice_count,
+                                 sizeof(chart_choice)));
+  return total;
+}
+
+static bool clade_info_has_synthetic_polytomy_origin(
+    refined_clade_info const& info) {
+  return info.origin == refined_clade_origin::synthetic_polytomy_intermediate ||
+         info.origin == refined_clade_origin::observed_and_synthetic;
+}
+
+struct frontier_size_summary {
+  std::size_t clades = 0;
+  std::size_t sum = 0;
+  std::size_t max = 0;
+  std::map<std::size_t, std::size_t> histogram;
+};
+
+static frontier_size_summary summarize_frontier_sizes(
+    std::vector<std::size_t> const& frontier_sizes,
+    std::vector<bool> const* include_clade = nullptr) {
+  frontier_size_summary summary;
+  for (std::size_t cid = 0; cid < frontier_sizes.size(); ++cid) {
+    if (include_clade != nullptr &&
+        (cid >= include_clade->size() || !(*include_clade)[cid])) {
+      continue;
+    }
+    auto size = frontier_sizes[cid];
+    ++summary.clades;
+    summary.sum = saturating_size_add(summary.sum, size);
+    summary.max = std::max(summary.max, size);
+    ++summary.histogram[size];
+  }
+  return summary;
+}
+
+static void print_named_frontier_summary(std::ostream& out,
+                                         std::string_view name,
+                                         frontier_size_summary const& summary,
+                                         std::string const& indent) {
+  out << indent << name << ":\n";
+  auto child = indent + "  ";
+  out << child << "clades: " << summary.clades << "\n";
+  out << child << "frontier_size_sum: " << summary.sum << "\n";
+  out << child << "frontier_size_max: " << summary.max << "\n";
+  out << child << "frontier_size_histogram:\n";
+  if (summary.histogram.empty()) {
+    out << child << "  <empty>\n";
+  } else {
+    for (auto const& [size, count] : summary.histogram)
+      out << child << "  " << size << ": " << count << "\n";
+  }
+}
+
+static void print_refinement_benchmark_summary(
+    std::ostream& out, polytomy_refinement_result const& refinement,
+    std::string const& indent) {
+  auto const& audit = refinement.audit;
+  auto totals = summarize_wric_polytomy_report(refinement);
+  out << indent << "status: " << polytomy_refinement_status_label(audit)
+      << "\n";
+  out << indent << "source_kary_productions: "
+      << audit.source_kary_production_count << "\n";
+  out << indent << "refined_clades: " << audit.refined_clade_count << "\n";
+  out << indent << "refined_productions: "
+      << audit.refined_production_count << "\n";
+  out << indent << "synthetic_clades: " << audit.synthetic_clade_count
+      << "\n";
+  out << indent << "synthetic_productions: "
+      << audit.synthetic_production_count << "\n";
+  out << indent << "selected_seed_shapes: " << totals.selected_seed_shapes
+      << "\n";
+  out << indent << "represented_refinement_count: ";
+  print_saturated_u64(out, totals.refined_grammar_tree_count,
+                      totals.refined_grammar_tree_count_saturated);
+  out << "\n";
+  out << indent << "exact_for_soft_polytomies: "
+      << (audit.exact_for_soft_polytomies ? "true" : "false") << "\n";
+  out << indent << "truncated_events: " << totals.truncated_events << "\n";
+  auto event_count = audit.events.size();
+  double fraction = event_count == 0
+                        ? 0.0
+                        : static_cast<double>(totals.truncated_events) /
+                              static_cast<double>(event_count);
+  out << indent << "bounded_truncation_frequency: " << std::fixed
+      << std::setprecision(3) << fraction << "\n";
+}
+
+static void print_binary_refinement_performance_benchmark(
+    std::ostream& out, phylo_dag& dag,
+    polytomy_refinement_result const& refinement, mutation_position site,
+    args const& a, std::string const& indent) {
+  out << indent << "binary_chart_benchmark:\n";
+  auto child = indent + "  ";
+  if (!polytomy_refinement_allows_binary_charting(refinement.audit)) {
+    out << child << "skipped: true\n";
+    out << child
+        << "skipped_reason: grammar is not binary-chart-compatible\n";
+    return;
+  }
+
+  auto const& grammar = refinement.grammar;
+  chart_options chart_opts;
+  chart_opts.score_ua_edge = a.chart_score_ua_edge;
+
+  auto state_start = std::chrono::steady_clock::now();
+  auto states = extract_leaf_site_states(dag, grammar, site);
+  auto state_ms = elapsed_ms(state_start, std::chrono::steady_clock::now());
+
+  auto chart_start = std::chrono::steady_clock::now();
+  auto chart = build_single_site_chart(grammar, states, chart_opts);
+  auto chart_ms = elapsed_ms(chart_start, std::chrono::steady_clock::now());
+
+  auto reference_state = extract_reference_site_state(dag, site);
+  auto optimum = root_min(chart, grammar.root_clade, chart_opts,
+                          reference_state);
+
+  bool trace_success = true;
+  std::string trace_error;
+  single_site_chart trace_chart;
+  double trace_ms = 0.0;
+  try {
+    auto trace_opts = chart_opts;
+    trace_opts.keep_trace = true;
+    trace_opts.max_trace_choices =
+        a.wric_polytomy_benchmark_max_trace_choices;
+    auto trace_start = std::chrono::steady_clock::now();
+    trace_chart = build_single_site_chart(grammar, states, trace_opts);
+    trace_ms = elapsed_ms(trace_start, std::chrono::steady_clock::now());
+  } catch (std::exception const& e) {
+    trace_success = false;
+    trace_error = e.what();
+  }
+
+  site_pattern_options pattern_opts;
+  auto pattern_start = std::chrono::steady_clock::now();
+  auto patterns = build_site_patterns(dag, grammar, pattern_opts);
+  auto pattern_ms = elapsed_ms(pattern_start, std::chrono::steady_clock::now());
+
+  auto composite_start = std::chrono::steady_clock::now();
+  auto composite = build_composite_chart_score(grammar, patterns, chart_opts);
+  auto composite_ms = elapsed_ms(composite_start,
+                                 std::chrono::steady_clock::now());
+
+  out << child << "site: " << site << "\n";
+  out << child << "score_ua_edge: "
+      << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+  out << child << "reference_state: " << chart_state_label(reference_state)
+      << "\n";
+  out << child << "root_min: ";
+  print_chart_cost(out, optimum);
+  out << "\n";
+  out << child << "leaf_state_extract_ms: " << std::fixed
+      << std::setprecision(3) << state_ms << "\n";
+  out << child << "chart_without_trace_ms: " << std::fixed
+      << std::setprecision(3) << chart_ms << "\n";
+  out << child << "chart_estimated_memory_without_trace_bytes: "
+      << estimate_chart_memory_without_trace_bytes(grammar) << "\n";
+  out << child << "chart_with_trace_success: "
+      << (trace_success ? "true" : "false") << "\n";
+  out << child << "chart_trace_choice_cap: "
+      << a.wric_polytomy_benchmark_max_trace_choices << "\n";
+  if (trace_success) {
+    out << child << "chart_with_trace_ms: " << std::fixed
+        << std::setprecision(3) << trace_ms << "\n";
+    out << child << "chart_trace_choice_count: "
+        << trace_chart.trace_choice_count << "\n";
+    out << child << "chart_estimated_memory_with_trace_bytes: "
+        << estimate_chart_memory_with_trace_bytes(grammar, trace_chart)
+        << "\n";
+  } else {
+    out << child << "chart_with_trace_error: " << trace_error << "\n";
+  }
+  out << child << "pattern_build_ms: " << std::fixed
+      << std::setprecision(3) << pattern_ms << "\n";
+  out << child << "exact_patterns: " << patterns.patterns.size() << "\n";
+  out << child << "total_sites: " << patterns.total_site_count << "\n";
+  out << child << "composite_chart_ms: " << std::fixed
+      << std::setprecision(3) << composite_ms << "\n";
+  out << child << "composite_lower_bound: "
+      << composite.weighted_lower_bound << "\n";
+
+  out << indent << "bnb_frontier_benchmark:\n";
+  if (!a.wric_polytomy_benchmark_bnb) {
+    out << child << "skipped: true\n";
+    out << child
+        << "skipped_reason: enable --wric-polytomy-benchmark-bnb\n";
+    return;
+  }
+
+  multisite_trim_options trim_opts;
+  trim_opts.use_bound_pruning = !a.chart_bnb_no_bound_pruning;
+  trim_opts.max_frontier_entries_per_clade = a.chart_bnb_max_frontier;
+  try {
+    auto bnb_start = std::chrono::steady_clock::now();
+    auto trim = build_multisite_trim(grammar, patterns, chart_opts, trim_opts);
+    auto bnb_ms = elapsed_ms(bnb_start, std::chrono::steady_clock::now());
+    out << child << "success: true\n";
+    out << child << "bnb_trim_ms: " << std::fixed << std::setprecision(3)
+        << bnb_ms << "\n";
+    out << child << "optimum: " << trim.optimum << "\n";
+    out << child << "active_patterns: " << trim.active_pattern_count << "\n";
+    out << child << "bound_pruning: "
+        << (trim_opts.use_bound_pruning ? "true" : "false") << "\n";
+    out << child << "max_frontier_entries_per_clade: "
+        << trim_opts.max_frontier_entries_per_clade << "\n";
+    print_named_frontier_summary(
+        out, "frontier_all_clades",
+        summarize_frontier_sizes(trim.frontier_sizes_by_clade), child);
+
+    std::vector<bool> synthetic_clades(refinement.clade_info.size(), false);
+    for (std::size_t cid = 0; cid < refinement.clade_info.size(); ++cid) {
+      synthetic_clades[cid] = clade_info_has_synthetic_polytomy_origin(
+          refinement.clade_info[cid]);
+    }
+    print_named_frontier_summary(
+        out, "frontier_synthetic_clades",
+        summarize_frontier_sizes(trim.frontier_sizes_by_clade,
+                                 &synthetic_clades),
+        child);
+  } catch (std::exception const& e) {
+    out << child << "success: false\n";
+    out << child << "error: " << e.what() << "\n";
+  }
+}
+
+static mutation_position benchmark_site(args const& a, phylo_dag& dag) {
+  if (a.wric_polytomy_benchmark_site) return *a.wric_polytomy_benchmark_site;
+  auto const& reference = get_reference_sequence(dag);
+  if (reference.empty()) {
+    throw std::runtime_error(
+        "WRIC polytomy benchmark requires a non-empty reference sequence");
+  }
+  return 1;
+}
+
+static void run_wric_polytomy_benchmark(std::ostream& out, phylo_dag& dag,
+                                        args const& a) {
+  auto site = benchmark_site(a, dag);
+
+  clade_grammar_options grammar_opts;
+  auto audit_opts = a.wric_polytomy_opts;
+  audit_opts.mode = polytomy_mode::audit_kary;
+
+  auto audit_start = std::chrono::steady_clock::now();
+  auto audit_refinement = build_polytomy_refined_clade_grammar(
+      dag, grammar_opts, audit_opts);
+  auto audit_ms = elapsed_ms(audit_start, std::chrono::steady_clock::now());
+
+  auto exact_preflight = summarize_wric_exact_preflight(
+      audit_refinement, a.wric_polytomy_opts);
+  bool soft_count_saturated = false;
+  auto soft_count = soft_refinement_tree_count_estimate(
+      audit_refinement.grammar, soft_count_saturated);
+
+  out << "wric_polytomy_benchmark:\n";
+  out << "  benchmark_site: " << site << "\n";
+  out << "  audit_build_ms: " << std::fixed << std::setprecision(3)
+      << audit_ms << "\n";
+  out << "  source_clades: " << audit_refinement.audit.source_clade_count
+      << "\n";
+  out << "  source_productions: "
+      << audit_refinement.audit.source_production_count << "\n";
+  out << "  source_kary_productions: "
+      << audit_refinement.audit.source_kary_production_count << "\n";
+  out << "  source_kary_arity_histogram:\n";
+  auto histogram = source_kary_arity_histogram(audit_refinement);
+  if (histogram.empty()) {
+    out << "    <empty>\n";
+  } else {
+    for (auto const& [arity, count] : histogram)
+      out << "    " << arity << ": " << count << "\n";
+  }
+  out << "  source_grammar_tree_count_estimate: ";
+  print_saturated_u64(
+      out, audit_refinement.source_grammar_audit.grammar_tree_count_estimate,
+      audit_refinement.source_grammar_audit
+          .grammar_tree_count_estimate_saturated);
+  out << "\n";
+  out << "  full_soft_refinement_count_estimate: ";
+  print_saturated_u64(out, soft_count, soft_count_saturated);
+  out << "\n";
+  print_wric_exact_expansion_preflight(out, audit_refinement,
+                                       a.wric_polytomy_opts);
+
+  out << "  source_chart_benchmark:\n";
+  if (polytomy_refinement_allows_binary_charting(audit_refinement.audit)) {
+    print_binary_refinement_performance_benchmark(out, dag, audit_refinement,
+                                                  site, a, "    ");
+  } else {
+    out << "    skipped: true\n";
+    out << "    skipped_reason: source grammar contains k-ary productions\n";
+  }
+
+  out << "  exact_expansion_benchmark:\n";
+  out << "    preflight_theoretical_upper_bound_fits_configured_caps: "
+      << (exact_preflight.fits_configured_exact_caps() ? "true" : "false")
+      << "\n";
+  if (!exact_preflight.fits_configured_exact_caps()) {
+    out << "    preflight_note: theoretical upper bounds may exceed "
+           "configured caps; attempting reuse-aware exact expansion\n";
+  }
+  auto exact_opts = a.wric_polytomy_opts;
+  exact_opts.mode = polytomy_mode::expand_soft_exact_or_fail;
+  auto exact_start = std::chrono::steady_clock::now();
+  try {
+    auto exact_refinement = build_polytomy_refined_clade_grammar(
+        dag, grammar_opts, exact_opts);
+    auto exact_ms = elapsed_ms(exact_start, std::chrono::steady_clock::now());
+    out << "    attempted: true\n";
+    out << "    success: true\n";
+    out << "    exact_expansion_ms: " << std::fixed
+        << std::setprecision(3) << exact_ms << "\n";
+    print_refinement_benchmark_summary(out, exact_refinement, "    ");
+    print_binary_refinement_performance_benchmark(out, dag, exact_refinement,
+                                                  site, a, "    ");
+  } catch (std::exception const& e) {
+    auto exact_ms = elapsed_ms(exact_start, std::chrono::steady_clock::now());
+    out << "    attempted: true\n";
+    out << "    success: false\n";
+    out << "    exact_expansion_ms: " << std::fixed
+        << std::setprecision(3) << exact_ms << "\n";
+    out << "    error: " << e.what() << "\n";
+  }
+
+  out << "  bounded_expansion_benchmarks:\n";
+  for (auto cap : a.wric_polytomy_benchmark_shape_caps) {
+    out << "    - max_shapes_per_polytomy: " << cap << "\n";
+    auto bounded_opts = a.wric_polytomy_opts;
+    bounded_opts.mode = polytomy_mode::expand_soft_bounded;
+    bounded_opts.max_shapes_per_polytomy = cap;
+    auto bounded_start = std::chrono::steady_clock::now();
+    try {
+      auto bounded_refinement = build_polytomy_refined_clade_grammar(
+          dag, grammar_opts, bounded_opts);
+      auto bounded_ms = elapsed_ms(bounded_start,
+                                   std::chrono::steady_clock::now());
+      out << "      success: true\n";
+      out << "      bounded_expansion_ms: " << std::fixed
+          << std::setprecision(3) << bounded_ms << "\n";
+      print_refinement_benchmark_summary(out, bounded_refinement, "      ");
+      print_binary_refinement_performance_benchmark(
+          out, dag, bounded_refinement, site, a, "      ");
+    } catch (std::exception const& e) {
+      auto bounded_ms = elapsed_ms(bounded_start,
+                                   std::chrono::steady_clock::now());
+      out << "      success: false\n";
+      out << "      bounded_expansion_ms: " << std::fixed
+          << std::setprecision(3) << bounded_ms << "\n";
+      out << "      error: " << e.what() << "\n";
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1212,6 +2107,10 @@ int main(int argc, char** argv) try {
                                      refinement_opts.mode);
     std::cout << "  grammar_build_ms: " << std::fixed
               << std::setprecision(3) << build_ms << "\n";
+  }
+
+  if (a.wric_polytomy_benchmark) {
+    run_wric_polytomy_benchmark(std::cout, result, a);
   }
 
   if (a.chart_site) {

@@ -275,6 +275,45 @@ set_tests_properties(dagutil_wric_polytomy_report_two_polytomy_count
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "represented_refinement_count: 9")
 
+add_test(NAME dagutil_wric_polytomy_benchmark
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-benchmark
+                 --wric-polytomy-benchmark-shape-caps 1
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_polytomy_benchmark
+                     PROPERTIES
+                     PASS_REGULAR_EXPRESSION "attempted: true"
+                     FAIL_REGULAR_EXPRESSION
+                     "skipped_reason: configured exact caps would be exceeded")
+
+add_test(NAME dagutil_wric_polytomy_benchmark_bounded_frequency
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-benchmark
+                 --wric-polytomy-benchmark-shape-caps 1
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_polytomy_benchmark_bounded_frequency
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "bounded_truncation_frequency:")
+
+add_test(NAME dagutil_wric_polytomy_benchmark_bad_shape_cap_suffix
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --wric-polytomy-benchmark-shape-caps 1x 2>&1 | grep -q 'unsigned decimal integer'"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_wric_polytomy_benchmark_bad_shape_cap_sign
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --wric-polytomy-benchmark-shape-caps -1 2>&1 | grep -q 'unsigned decimal integer'"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_wric_polytomy_benchmark_bad_shape_cap_limit
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --wric-polytomy-benchmark-shape-caps 100001 2>&1 | grep -q 'benchmark safety limit'"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 add_test(NAME dagutil_sample_method_without_sample_fails
          COMMAND dagutil
                  --dag-pb data/test_5_trees/tree_0.pb.gz
