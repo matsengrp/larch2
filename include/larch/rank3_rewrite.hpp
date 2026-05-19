@@ -1,6 +1,7 @@
 #pragma once
 
 #include <larch/chart_spr.hpp>
+#include <larch/grammar_topology.hpp>
 #include <larch/merge.hpp>
 #include <larch/overlay_spr.hpp>
 #include <larch/thread_pool.hpp>
@@ -44,12 +45,7 @@ struct rank3_rewrite_rule {
   spr_score_result score;
 };
 
-struct rank3_topology {
-  // selected_production_by_clade[c] is the production chosen for non-leaf clade
-  // c. Leaf clades and unreachable clades contain no_production.
-  std::vector<production_id> selected_production_by_clade;
-  std::vector<bool> used_production;
-};
+using rank3_topology = grammar_topology;
 
 struct rank3_production_taxa_key {
   std::vector<taxon_id> parent;
@@ -115,11 +111,21 @@ struct grammar_native_selection_diagnostics {
   std::size_t reachable_temp_production_count = 0;
   std::vector<std::size_t> selected_temp_production_count_by_topology;
   std::vector<production_id> uncovered_temp_productions;
+  std::vector<production_id> uncovered_required_productions;
   grammar_native_selection_kind selection_kind =
       grammar_native_selection_kind::heuristic;
   bool topology_cap_truncated = false;
   std::size_t selected_topology_count = 0;
   std::size_t max_materialized_topologies = 0;
+
+  std::uint64_t multisite_optimum = multisite_score_inf;
+  std::uint64_t composite_lower_bound = multisite_score_inf;
+  std::uint64_t initial_upper_bound = multisite_score_inf;
+  std::vector<std::size_t> frontier_sizes_by_clade;
+  std::size_t equality_deduplicated = 0;
+  std::size_t dominance_pruned = 0;
+  std::size_t bound_pruned = 0;
+  bool exact_bnb_certificate = false;
 };
 
 struct rank3_option_b_options {
@@ -198,6 +204,12 @@ class grammar_native_selection_error : public std::runtime_error {
       : std::runtime_error(message), diagnostics(std::move(diagnostics_)) {}
 };
 
+class grammar_native_bnb_selection_error
+    : public grammar_native_selection_error {
+ public:
+  using grammar_native_selection_error::grammar_native_selection_error;
+};
+
 using grammar_native_topology_selector = std::function<std::vector<rank3_topology>(
     overlay_materialization_result const&)>;
 
@@ -226,6 +238,12 @@ struct grammar_native_materialization_options {
   std::optional<leaf_site_states> single_site_leaf_states = std::nullopt;
   chart_options single_site_chart_options = {};
   std::optional<std::uint8_t> single_site_reference_state = std::nullopt;
+
+  // Built-in multisite_bnb_optimal inputs.  The site patterns must use the
+  // same taxon registry as the dense overlay grammar.
+  site_pattern_set const* multisite_patterns = nullptr;
+  chart_options multisite_chart_options = {};
+  multisite_topology_trace_options multisite_trace_options = {};
 };
 
 struct grammar_native_materialization_result {
@@ -758,6 +776,22 @@ inline bool dense_production_is_temp(
          overlay_id_space::temp;
 }
 
+inline void append_selected_temp_overlay_keys(
+    overlay_materialization_result const& materialized,
+    std::vector<rank3_topology> const& topologies,
+    std::vector<rank3_production_taxa_key>& keys) {
+  for (auto const& topology : topologies) {
+    auto reachable = validate_grammar_topology(materialized.grammar, topology);
+    for (std::size_t pid = 0; pid < reachable.size(); ++pid) {
+      if (!reachable[pid]) continue;
+      auto dense_pid = static_cast<production_id>(pid);
+      if (!dense_production_is_temp(materialized, dense_pid)) continue;
+      append_unique_key(keys, production_key_from_id(materialized.grammar,
+                                                     dense_pid));
+    }
+  }
+}
+
 inline std::vector<bool> production_key_presence(
     clade_grammar const& grammar,
     std::vector<rank3_production_taxa_key> const& keys) {
@@ -990,11 +1024,7 @@ inline void enforce_intended_productions_present(
 
 inline rank3_topology make_empty_rank3_topology(
     clade_grammar const& grammar) {
-  rank3_topology topology;
-  topology.selected_production_by_clade.assign(grammar.clades.size(),
-                                               no_production);
-  topology.used_production.assign(grammar.productions.size(), false);
-  return topology;
+  return make_empty_grammar_topology(grammar);
 }
 
 inline rank3_topology rank3_topology_from_productions(
@@ -1275,6 +1305,23 @@ inline grammar_native_selection_diagnostics build_selection_diagnostics(
   return diagnostics;
 }
 
+inline void copy_bnb_trace_diagnostics(
+    grammar_native_selection_diagnostics& diagnostics,
+    multisite_topology_trace_result const& trace) {
+  diagnostics.multisite_optimum = trace.optimum;
+  diagnostics.composite_lower_bound = trace.composite_lower_bound;
+  diagnostics.initial_upper_bound = trace.initial_upper_bound;
+  diagnostics.frontier_sizes_by_clade = trace.frontier_sizes_by_clade;
+  diagnostics.equality_deduplicated = trace.equality_deduplicated;
+  diagnostics.dominance_pruned = trace.dominance_pruned;
+  diagnostics.bound_pruned = trace.bound_pruned;
+  diagnostics.uncovered_required_productions =
+      trace.uncovered_required_productions;
+  diagnostics.exact_bnb_certificate = true;
+  diagnostics.topology_cap_truncated = diagnostics.topology_cap_truncated ||
+                                       trace.topology_cap_truncated;
+}
+
 inline void require_reachable_temp_productions_selected(
     grammar_native_materialization_options const& options,
     grammar_native_selection_diagnostics const& diagnostics) {
@@ -1339,6 +1386,8 @@ inline native_topology_selection_result select_native_topologies(
   native_topology_selection_result result;
   auto selection_kind = grammar_native_selection_kind::heuristic;
   bool cap_truncated = false;
+  std::optional<multisite_topology_trace_result> bnb_trace;
+  std::vector<production_id> bnb_caller_required_productions;
 
   switch (options.topology_policy) {
     case grammar_native_topology_policy::explicit_topologies:
@@ -1388,15 +1437,69 @@ inline native_topology_selection_result select_native_topologies(
       break;
 
     case grammar_native_topology_policy::multisite_bnb_optimal:
-      if (!options.topology_selector) {
-        throw std::runtime_error(
-            "rank3 grammar-native materialization: multisite_bnb_optimal "
-            "requires topology_selector returning dense-overlay B&B "
-            "topologies");
+      if (options.topology_selector) {
+        result.topologies = options.topology_selector(materialized);
+        enforce_native_selection_cap(result.topologies, options, "multi-site");
+        selection_kind = grammar_native_selection_kind::caller_supplied;
+        break;
       }
-      result.topologies = options.topology_selector(materialized);
-      enforce_native_selection_cap(result.topologies, options, "multi-site");
-      selection_kind = grammar_native_selection_kind::caller_supplied;
+
+      if (options.multisite_patterns == nullptr) {
+        auto diagnostics = build_selection_diagnostics(
+            materialized, {}, grammar_native_selection_kind::heuristic, false,
+            options.max_materialized_topologies);
+        throw grammar_native_bnb_selection_error(
+            "rank3 grammar-native materialization: multisite_bnb_optimal "
+            "requires multisite_patterns when no topology_selector is "
+            "provided",
+            diagnostics);
+      }
+
+      try {
+        auto trace_options = options.multisite_trace_options;
+        bnb_caller_required_productions = trace_options.required_productions;
+        std::sort(bnb_caller_required_productions.begin(),
+                  bnb_caller_required_productions.end());
+        bnb_caller_required_productions.erase(
+            std::unique(bnb_caller_required_productions.begin(),
+                        bnb_caller_required_productions.end()),
+            bnb_caller_required_productions.end());
+        auto required = bnb_caller_required_productions;
+        auto temp_dense = reachable_temp_dense_productions(materialized);
+        required.insert(required.end(), temp_dense.begin(), temp_dense.end());
+        std::sort(required.begin(), required.end());
+        required.erase(std::unique(required.begin(), required.end()),
+                       required.end());
+        trace_options.required_productions = std::move(required);
+        // Let this materialization layer turn uncovered temp productions into
+        // grammar_native_bnb_selection_error with overlay-selection diagnostics.
+        trace_options.require_required_production_coverage = false;
+        if (trace_options.max_optimal_topologies == 1) {
+          trace_options.max_optimal_topologies =
+              options.max_materialized_topologies;
+        }
+
+        bnb_trace = build_multisite_optimal_topologies(
+            grammar, *options.multisite_patterns,
+            options.multisite_chart_options, trace_options);
+      } catch (grammar_native_bnb_selection_error const&) {
+        throw;
+      } catch (std::runtime_error const& e) {
+        auto diagnostics = build_selection_diagnostics(
+            materialized, {}, grammar_native_selection_kind::exact, false,
+            options.max_materialized_topologies);
+        throw grammar_native_bnb_selection_error(
+            std::string{"rank3 grammar-native materialization: built-in "
+                        "multi-site B&B topology selection failed: "} +
+                e.what(),
+            diagnostics);
+      }
+
+      result.topologies = bnb_trace->topologies;
+      enforce_native_selection_cap(result.topologies, options,
+                                   "multi-site B&B");
+      cap_truncated = bnb_trace->topology_cap_truncated;
+      selection_kind = grammar_native_selection_kind::exact;
       break;
   }
 
@@ -1411,6 +1514,36 @@ inline native_topology_selection_result select_native_topologies(
   result.diagnostics = build_selection_diagnostics(
       materialized, result.topologies, selection_kind, cap_truncated,
       options.max_materialized_topologies);
+  if (bnb_trace.has_value()) {
+    copy_bnb_trace_diagnostics(result.diagnostics, *bnb_trace);
+    std::vector<production_id> uncovered_caller_required;
+    for (auto pid : bnb_caller_required_productions) {
+      if (std::find(bnb_trace->uncovered_required_productions.begin(),
+                    bnb_trace->uncovered_required_productions.end(),
+                    pid) != bnb_trace->uncovered_required_productions.end()) {
+        uncovered_caller_required.push_back(pid);
+      }
+    }
+    if (!uncovered_caller_required.empty()) {
+      throw grammar_native_bnb_selection_error(
+          "rank3 grammar-native materialization: built-in multi-site B&B "
+          "found no emitted exact-optimal topology set covering "
+          "caller-required productions " +
+              production_id_vector_to_string(uncovered_caller_required),
+          result.diagnostics);
+    }
+  }
+  if (bnb_trace.has_value() &&
+      options.require_all_reachable_temp_productions_selected &&
+      !result.diagnostics.uncovered_temp_productions.empty()) {
+    throw grammar_native_bnb_selection_error(
+        "rank3 grammar-native materialization: built-in multi-site B&B found "
+        "no emitted exact-optimal topology set covering reachable temp "
+        "productions " +
+            production_id_vector_to_string(
+                result.diagnostics.uncovered_temp_productions),
+        result.diagnostics);
+  }
   require_reachable_temp_productions_selected(options, result.diagnostics);
   return result;
 }
@@ -1774,13 +1907,21 @@ inline grammar_native_materialization_result materialize_grammar_native_overlay(
   result.overlay = validate_and_dense_materialize_candidate(base_grammar,
                                                             candidate,
                                                             options);
-  rank3_detail::append_intended_temp_overlay_keys(
-      result.overlay, result.intended_temp_productions);
 
   auto selection = rank3_detail::select_native_topologies(result.overlay,
                                                           options);
   result.selected_topologies = std::move(selection.topologies);
   result.selection_diagnostics = std::move(selection.diagnostics);
+
+  if (options.require_all_reachable_temp_productions_selected) {
+    rank3_detail::append_intended_temp_overlay_keys(
+        result.overlay, result.intended_temp_productions);
+  } else {
+    rank3_detail::append_selected_temp_overlay_keys(
+        result.overlay, result.selected_topologies,
+        result.intended_temp_productions);
+  }
+
   result.materialized_trees = materialize_rank3_trees_from_topologies(
       source, result.overlay.grammar, result.selected_topologies,
       options.validate, options.generated_edge_weight);
@@ -1788,6 +1929,7 @@ inline grammar_native_materialization_result materialize_grammar_native_overlay(
   result.merged = merge_rank3_native_trees_option_b(
       source, base_grammar, result.materialized_trees,
       result.intended_temp_productions, options);
+  result.merged.selection_diagnostics = result.selection_diagnostics;
   return result;
 }
 

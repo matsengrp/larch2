@@ -41,6 +41,24 @@ static larch::test::tiny_tree_node four_taxon_alt_tree() {
        tiny_inner("BD", "A", {tiny_leaf("B", "A"), tiny_leaf("D", "C")})});
 }
 
+static larch::test::tiny_tree_node four_taxon_cross_preferred_base_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AB", "A", {tiny_leaf("A", "A"), tiny_leaf("B", "C")}),
+       tiny_inner("CD", "A", {tiny_leaf("C", "A"), tiny_leaf("D", "C")})});
+}
+
+static larch::test::tiny_tree_node four_taxon_invariant_base_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AB", "A", {tiny_leaf("A", "A"), tiny_leaf("B", "A")}),
+       tiny_inner("CD", "A", {tiny_leaf("C", "A"), tiny_leaf("D", "A")})});
+}
+
 static larch::test::tiny_tree_node three_taxon_missing_d_tree() {
   using larch::test::tiny_inner;
   using larch::test::tiny_leaf;
@@ -90,6 +108,11 @@ static larch::production_id production_id_for(
   }
   CHECK(false && "missing production");
   return larch::no_production;
+}
+
+static bool contains(std::vector<larch::production_id> const& ids,
+                     larch::production_id needle) {
+  return std::find(ids.begin(), ids.end(), needle) != ids.end();
 }
 
 static std::size_t leaf_node_for(larch::phylo_dag& dag,
@@ -576,6 +599,107 @@ static void test_grammar_native_multisite_policy_uses_selector() {
   std::println("  PASS");
 }
 
+static void test_grammar_native_multisite_bnb_policy_builtin() {
+  std::println("test_grammar_native_multisite_bnb_policy_builtin");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_cross_preferred_base_tree());
+  auto base_grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, base_grammar);
+  auto candidate = cross_candidate_without_tombstone(base_grammar);
+
+  larch::grammar_native_materialization_options options;
+  options.include_original_dag = false;
+  options.topology_policy =
+      larch::grammar_native_topology_policy::multisite_bnb_optimal;
+  options.multisite_patterns = &patterns;
+  auto result = larch::materialize_grammar_native_overlay(
+      dag, base_grammar, candidate, options);
+
+  CHECK(result.selected_topologies.size() == 1);
+  CHECK(result.selection_diagnostics.selection_kind ==
+        larch::grammar_native_selection_kind::exact);
+  CHECK(result.selection_diagnostics.exact_bnb_certificate);
+  CHECK(result.selection_diagnostics.multisite_optimum == 1);
+  CHECK(result.merged.selection_diagnostics.has_value());
+  CHECK(result.merged.selection_diagnostics->exact_bnb_certificate);
+  CHECK(result.merged.all_intended_productions_present());
+  CHECK(has_clade(result.merged.rebuilt.grammar, {"A", "C"}));
+  CHECK(has_clade(result.merged.rebuilt.grammar, {"B", "D"}));
+
+  std::println("  PASS");
+}
+
+static void test_grammar_native_multisite_bnb_rejects_uncovered_required() {
+  std::println("test_grammar_native_multisite_bnb_rejects_uncovered_required");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_cross_preferred_base_tree());
+  auto base_grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, base_grammar);
+  auto candidate = cross_candidate_without_tombstone(base_grammar);
+  auto dense = larch::validate_and_dense_materialize_candidate(
+      base_grammar, candidate);
+
+  auto ab = clade_for(dense.grammar, {"A", "B"});
+  auto cd = clade_for(dense.grammar, {"C", "D"});
+  auto required_base_root = production_id_for(
+      dense.grammar, dense.grammar.root_clade, {ab, cd});
+
+  larch::grammar_native_materialization_options options;
+  options.include_original_dag = false;
+  options.topology_policy =
+      larch::grammar_native_topology_policy::multisite_bnb_optimal;
+  options.multisite_patterns = &patterns;
+  options.multisite_trace_options.required_productions.push_back(
+      required_base_root);
+
+  bool threw = false;
+  try {
+    (void)larch::materialize_grammar_native_overlay(
+        dag, base_grammar, candidate, options);
+  } catch (larch::grammar_native_bnb_selection_error const& e) {
+    threw = true;
+    CHECK(contains(e.diagnostics.uncovered_required_productions,
+                   required_base_root));
+  }
+  CHECK(threw);
+
+  std::println("  PASS");
+}
+
+static void test_grammar_native_multisite_bnb_enforces_materialization_cap() {
+  std::println(
+      "test_grammar_native_multisite_bnb_enforces_materialization_cap");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_invariant_base_tree());
+  auto base_grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, base_grammar);
+  auto candidate = mutually_exclusive_cross_candidate(base_grammar);
+
+  larch::grammar_native_materialization_options options;
+  options.include_original_dag = false;
+  options.topology_policy =
+      larch::grammar_native_topology_policy::multisite_bnb_optimal;
+  options.multisite_patterns = &patterns;
+  options.max_materialized_topologies = 1;
+  options.multisite_trace_options.max_optimal_topologies = 0;
+
+  bool threw = false;
+  try {
+    (void)larch::materialize_grammar_native_overlay(
+        dag, base_grammar, candidate, options);
+  } catch (std::runtime_error const& e) {
+    threw = true;
+    CHECK(std::string{e.what()}.find("max_materialized_topologies") !=
+          std::string::npos);
+  }
+  CHECK(threw);
+
+  std::println("  PASS");
+}
+
 static void test_grammar_native_mutually_exclusive_temp_productions() {
   std::println("test_grammar_native_mutually_exclusive_temp_productions");
 
@@ -913,6 +1037,9 @@ int main() {
   test_grammar_native_explicit_topology_path();
   test_grammar_native_single_site_policy_path();
   test_grammar_native_multisite_policy_uses_selector();
+  test_grammar_native_multisite_bnb_policy_builtin();
+  test_grammar_native_multisite_bnb_rejects_uncovered_required();
+  test_grammar_native_multisite_bnb_enforces_materialization_cap();
   test_grammar_native_mutually_exclusive_temp_productions();
   test_grammar_native_rejects_invalid_temp_partition();
   test_grammar_native_rejects_temp_clade_taxon_out_of_range();

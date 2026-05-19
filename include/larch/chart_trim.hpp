@@ -1,5 +1,6 @@
 #pragma once
 
+#include <larch/grammar_topology.hpp>
 #include <larch/parsimony_chart.hpp>
 #include <larch/site_patterns.hpp>
 
@@ -696,11 +697,22 @@ struct multisite_cost_function {
   std::uint64_t topology_hash = 0;
 };
 
+struct frontier_provenance_choice {
+  production_id production = no_production;
+  std::size_t left_entry = 0;
+  std::size_t right_entry = 0;
+};
+
 struct frontier_entry {
   multisite_cost_function f;
   // Provenance for the partial topology below this clade.  Equal cost vectors
   // merge provenance so trimming does not lose equally optimal productions.
   std::vector<bool> used_production;
+
+  // Opt-in topology provenance.  For an internal clade entry, each choice fixes
+  // one parent production and the exact child frontier entries that were
+  // combined to produce this cost vector.  Leaf entries have no choices.
+  std::vector<frontier_provenance_choice> provenance;
 };
 
 struct multisite_trim_options {
@@ -722,6 +734,34 @@ struct multisite_trim_result {
   std::size_t dominance_pruned = 0;
   std::size_t bound_pruned = 0;
   std::size_t equality_deduplicated = 0;
+  std::size_t active_pattern_count = 0;
+  std::uint64_t invariant_constant_offset = 0;
+};
+
+struct multisite_topology_trace_options {
+  bool keep_provenance = true;
+  // 0 means unlimited.
+  std::size_t max_optimal_topologies = 1;
+  // 0 means unlimited.
+  std::size_t max_provenance_choices_per_entry = 0;
+  std::vector<production_id> required_productions;
+  bool require_required_production_coverage = true;
+  multisite_trim_options trim_options = {};
+};
+
+struct multisite_topology_trace_result {
+  std::uint64_t optimum = multisite_score_inf;
+  std::uint64_t composite_lower_bound = multisite_score_inf;
+  std::uint64_t initial_upper_bound = multisite_score_inf;
+  std::vector<grammar_topology> topologies;
+  std::vector<bool> keep_production;
+  std::vector<std::size_t> frontier_sizes_by_clade;
+  std::size_t equality_deduplicated = 0;
+  std::size_t dominance_pruned = 0;
+  std::size_t bound_pruned = 0;
+  std::size_t optimal_frontier_entry_count = 0;
+  bool topology_cap_truncated = false;
+  std::vector<production_id> uncovered_required_productions;
   std::size_t active_pattern_count = 0;
   std::uint64_t invariant_constant_offset = 0;
 };
@@ -826,6 +866,34 @@ inline void merge_used_productions(std::vector<bool>& dst,
         "multi-site trim: provenance vector size mismatch");
   }
   for (std::size_t i = 0; i < dst.size(); ++i) dst[i] = dst[i] || src[i];
+}
+
+inline bool same_provenance_choice(frontier_provenance_choice const& lhs,
+                                   frontier_provenance_choice const& rhs) {
+  return lhs.production == rhs.production && lhs.left_entry == rhs.left_entry &&
+         lhs.right_entry == rhs.right_entry;
+}
+
+inline void merge_provenance_choices(
+    std::vector<frontier_provenance_choice>& dst,
+    std::vector<frontier_provenance_choice> const& src,
+    std::size_t max_choices_per_entry = 0) {
+  for (auto choice : src) {
+    auto found = std::find_if(dst.begin(), dst.end(), [&](auto const& existing) {
+      return same_provenance_choice(existing, choice);
+    });
+    if (found != dst.end()) continue;
+    if (max_choices_per_entry != 0 && dst.size() >= max_choices_per_entry) {
+      throw std::runtime_error(
+          "multi-site topology trace: provenance-choice cap exceeded");
+    }
+    dst.push_back(choice);
+  }
+  std::sort(dst.begin(), dst.end(), [](auto const& lhs, auto const& rhs) {
+    if (lhs.production != rhs.production) return lhs.production < rhs.production;
+    if (lhs.left_entry != rhs.left_entry) return lhs.left_entry < rhs.left_entry;
+    return lhs.right_entry < rhs.right_entry;
+  });
 }
 
 inline bool is_active_pattern(site_pattern const& pattern) {
@@ -1128,6 +1196,8 @@ inline void apply_dominance_pruning(std::vector<frontier_entry>& entries,
       if (dominates(entries[i].f, entries[j].f)) {
         merge_used_productions(entries[i].used_production,
                                entries[j].used_production);
+        merge_provenance_choices(entries[i].provenance,
+                                 entries[j].provenance);
         remove[j] = true;
         ++dominance_pruned;
       }
@@ -1146,15 +1216,24 @@ inline void insert_or_merge_frontier_entry(
     std::vector<frontier_entry>& entries,
     std::unordered_map<std::vector<chart_cost>, std::size_t,
                        chart_cost_vector_hash>& index_by_cost,
-    frontier_entry candidate, std::size_t& equality_deduplicated) {
+    frontier_entry candidate, std::size_t& equality_deduplicated,
+    std::size_t max_provenance_choices_per_entry = 0) {
   auto found = index_by_cost.find(candidate.f.cost);
   if (found != index_by_cost.end()) {
     merge_used_productions(entries[found->second].used_production,
                            candidate.used_production);
+    merge_provenance_choices(entries[found->second].provenance,
+                             candidate.provenance,
+                             max_provenance_choices_per_entry);
     entries[found->second].f.topology_hash = mix_hash(
         entries[found->second].f.topology_hash, candidate.f.topology_hash);
     ++equality_deduplicated;
     return;
+  }
+  if (max_provenance_choices_per_entry != 0 &&
+      candidate.provenance.size() > max_provenance_choices_per_entry) {
+    throw std::runtime_error(
+        "multi-site topology trace: provenance-choice cap exceeded");
   }
   auto entry_index = entries.size();
   auto [_, inserted] = index_by_cost.emplace(candidate.f.cost, entry_index);
@@ -1163,17 +1242,10 @@ inline void insert_or_merge_frontier_entry(
   entries.push_back(std::move(candidate));
 }
 
-struct selected_topology {
-  std::vector<production_id> selected_production_by_clade;
-  std::vector<bool> used_production;
-};
+using selected_topology = grammar_topology;
 
 inline selected_topology empty_selected_topology(clade_grammar const& grammar) {
-  selected_topology topo;
-  topo.selected_production_by_clade.assign(grammar.clades.size(),
-                                           no_production);
-  topo.used_production.assign(grammar.productions.size(), false);
-  return topo;
+  return make_empty_grammar_topology(grammar);
 }
 
 inline void fill_first_topology(clade_grammar const& grammar, clade_id clade,
@@ -1368,6 +1440,251 @@ inline std::vector<selected_topology> enumerate_topologies(
   return result;
 }
 
+inline void merge_topology_into(selected_topology& dst,
+                                selected_topology const& src) {
+  if (dst.selected_production_by_clade.size() !=
+          src.selected_production_by_clade.size() ||
+      dst.used_production.size() != src.used_production.size()) {
+    throw std::runtime_error(
+        "multi-site topology trace: topology shape mismatch");
+  }
+  for (std::size_t cid = 0; cid < src.selected_production_by_clade.size();
+       ++cid) {
+    auto pid = src.selected_production_by_clade[cid];
+    if (pid == no_production) continue;
+    auto& selected = dst.selected_production_by_clade[cid];
+    if (selected != no_production && selected != pid) {
+      throw std::runtime_error(
+          "multi-site topology trace: incompatible child topology choices");
+    }
+    selected = pid;
+  }
+  merge_used_productions(dst.used_production, src.used_production);
+}
+
+inline selected_topology combine_selected_child_topologies(
+    clade_grammar const& grammar, clade_id parent, production_id pid,
+    selected_topology const& left, selected_topology const& right) {
+  auto topology = empty_selected_topology(grammar);
+  merge_topology_into(topology, left);
+  merge_topology_into(topology, right);
+  if (parent == no_clade ||
+      parent >= topology.selected_production_by_clade.size()) {
+    throw std::runtime_error(
+        "multi-site topology trace: parent clade out of range");
+  }
+  auto& selected = topology.selected_production_by_clade[parent];
+  if (selected != no_production && selected != pid) {
+    throw std::runtime_error(
+        "multi-site topology trace: incompatible parent topology choice");
+  }
+  if (pid == no_production || pid >= topology.used_production.size()) {
+    throw std::runtime_error(
+        "multi-site topology trace: selected production out of range");
+  }
+  selected = pid;
+  topology.used_production[pid] = true;
+  return topology;
+}
+
+inline bool topology_lexicographic_less(selected_topology const& lhs,
+                                        selected_topology const& rhs) {
+  return grammar_topology_less(lhs, rhs);
+}
+
+inline void sort_and_unique_topologies(std::vector<selected_topology>& topologies) {
+  std::sort(topologies.begin(), topologies.end(), topology_lexicographic_less);
+  topologies.erase(std::unique(topologies.begin(), topologies.end(),
+                               grammar_topology_equal),
+                   topologies.end());
+}
+
+inline std::vector<selected_topology> enumerate_topologies_from_provenance(
+    clade_grammar const& grammar,
+    std::vector<std::vector<frontier_entry>> const& frontiers,
+    clade_id clade, std::size_t entry_index, std::size_t max_topologies,
+    bool& truncated) {
+  if (clade == no_clade || clade >= grammar.clades.size() ||
+      clade >= frontiers.size()) {
+    throw std::runtime_error(
+        "multi-site topology trace: clade out of provenance range");
+  }
+  if (entry_index >= frontiers[clade].size()) {
+    throw std::runtime_error(
+        "multi-site topology trace: frontier entry out of range");
+  }
+  if (grammar.clades[clade].taxa.size() == 1) {
+    return {empty_selected_topology(grammar)};
+  }
+
+  auto const& entry = frontiers[clade][entry_index];
+  if (entry.provenance.empty()) {
+    throw std::runtime_error(
+        "multi-site topology trace: internal frontier entry has no provenance");
+  }
+
+  std::vector<selected_topology> result;
+  for (auto const& choice : entry.provenance) {
+    if (max_topologies != 0 && result.size() >= max_topologies) {
+      truncated = true;
+      break;
+    }
+    if (choice.production == no_production ||
+        choice.production >= grammar.productions.size()) {
+      throw std::runtime_error(
+          "multi-site topology trace: provenance production out of range");
+    }
+    auto const& prod = grammar.productions[choice.production];
+    if (prod.parent != clade) {
+      throw std::runtime_error(
+          "multi-site topology trace: provenance parent mismatch");
+    }
+    chart_trim_detail::validate_binary_production_for_trim(
+        grammar, prod, choice.production);
+
+    auto remaining = [&](std::size_t used) -> std::size_t {
+      if (max_topologies == 0) return std::size_t{0};
+      return used >= max_topologies ? std::size_t{1}
+                                    : max_topologies - used;
+    };
+
+    auto left_topologies = enumerate_topologies_from_provenance(
+        grammar, frontiers, prod.children[0], choice.left_entry,
+        remaining(result.size()), truncated);
+    auto right_topologies = enumerate_topologies_from_provenance(
+        grammar, frontiers, prod.children[1], choice.right_entry,
+        remaining(result.size()), truncated);
+
+    for (auto const& left : left_topologies) {
+      for (auto const& right : right_topologies) {
+        if (max_topologies != 0 && result.size() >= max_topologies) {
+          truncated = true;
+          break;
+        }
+        result.push_back(combine_selected_child_topologies(
+            grammar, clade, choice.production, left, right));
+      }
+      if (max_topologies != 0 && result.size() >= max_topologies) break;
+    }
+  }
+  sort_and_unique_topologies(result);
+  return result;
+}
+
+inline std::size_t count_new_required_coverage(
+    selected_topology const& topology, std::vector<production_id> const& required,
+    std::vector<bool> const& covered) {
+  if (topology.used_production.empty()) return 0;
+  std::size_t count = 0;
+  for (auto pid : required) {
+    if (pid == no_production || pid >= topology.used_production.size()) {
+      throw std::runtime_error(
+          "multi-site topology trace: required production out of range");
+    }
+    if (!covered[pid] && topology.used_production[pid]) ++count;
+  }
+  return count;
+}
+
+inline std::vector<selected_topology> choose_topologies_for_required_coverage(
+    clade_grammar const& grammar, std::vector<selected_topology> topologies,
+    std::vector<production_id> const& required, std::size_t max_topologies,
+    std::vector<production_id>& uncovered) {
+  sort_and_unique_topologies(topologies);
+  std::vector<selected_topology> chosen;
+  std::vector<bool> selected(topologies.size(), false);
+  std::vector<bool> covered(grammar.productions.size(), false);
+
+  auto mark_covered = [&](selected_topology const& topology) {
+    auto reachable = validate_grammar_topology(grammar, topology);
+    for (auto pid : required) {
+      if (pid == no_production || pid >= reachable.size()) {
+        throw std::runtime_error(
+            "multi-site topology trace: required production out of range");
+      }
+      if (reachable[pid]) covered[pid] = true;
+    }
+  };
+
+  if (required.empty()) {
+    for (auto const& topology : topologies) {
+      if (max_topologies != 0 && chosen.size() >= max_topologies) break;
+      chosen.push_back(topology);
+      mark_covered(chosen.back());
+    }
+  } else {
+    while (max_topologies == 0 || chosen.size() < max_topologies) {
+      std::size_t best = topologies.size();
+      std::size_t best_count = 0;
+      for (std::size_t i = 0; i < topologies.size(); ++i) {
+        if (selected[i]) continue;
+        auto count = count_new_required_coverage(topologies[i], required,
+                                                 covered);
+        if (count > best_count ||
+            (count == best_count && count != 0 && best != topologies.size() &&
+             topology_lexicographic_less(topologies[i], topologies[best]))) {
+          best = i;
+          best_count = count;
+        }
+      }
+      if (best == topologies.size() || best_count == 0) break;
+      selected[best] = true;
+      chosen.push_back(topologies[best]);
+      mark_covered(chosen.back());
+
+      bool all_covered = true;
+      for (auto pid : required) all_covered = all_covered && covered[pid];
+      if (all_covered) break;
+    }
+
+    if (chosen.empty() && !topologies.empty() &&
+        (max_topologies == 0 || chosen.size() < max_topologies)) {
+      selected[0] = true;
+      chosen.push_back(topologies.front());
+      mark_covered(chosen.back());
+    }
+
+    bool all_covered = true;
+    for (auto pid : required) all_covered = all_covered && covered[pid];
+    if (!all_covered) {
+      for (std::size_t i = 0; i < topologies.size(); ++i) {
+        if (selected[i]) continue;
+        if (max_topologies != 0 && chosen.size() >= max_topologies) break;
+        selected[i] = true;
+        chosen.push_back(topologies[i]);
+        mark_covered(chosen.back());
+      }
+    }
+  }
+
+  uncovered.clear();
+  for (auto pid : required) {
+    if (pid == no_production || pid >= covered.size()) {
+      throw std::runtime_error(
+          "multi-site topology trace: required production out of range");
+    }
+    if (!covered[pid]) uncovered.push_back(pid);
+  }
+  return chosen;
+}
+
+inline void validate_required_productions(
+    clade_grammar const& grammar,
+    std::vector<production_id> const& required_productions) {
+  std::vector<production_id> sorted = required_productions;
+  std::sort(sorted.begin(), sorted.end());
+  if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+    throw std::runtime_error(
+        "multi-site topology trace: duplicate required production id");
+  }
+  for (auto pid : sorted) {
+    if (pid == no_production || pid >= grammar.productions.size()) {
+      throw std::runtime_error(
+          "multi-site topology trace: required production out of range");
+    }
+  }
+}
+
 inline void validate_multisite_inputs(clade_grammar const& grammar,
                                       site_pattern_set const& patterns,
                                       chart_options const& options) {
@@ -1376,6 +1693,10 @@ inline void validate_multisite_inputs(clade_grammar const& grammar,
   if (grammar.root_clade == no_clade ||
       grammar.root_clade >= grammar.clades.size()) {
     throw std::runtime_error("multi-site trim: root clade out of range");
+  }
+  if (patterns.taxon_count != grammar.taxa.id_to_sample_id.size()) {
+    throw std::runtime_error(
+        "multi-site trim: site-pattern set taxon count mismatch");
   }
   for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
        ++pattern_index) {
@@ -1591,6 +1912,220 @@ inline multisite_trim_result build_multisite_trim(
       merge_used_productions(result.keep_production, entry.used_production);
     }
   }
+  return result;
+}
+
+inline std::uint64_t score_selected_topology(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    grammar_topology const& topology, chart_options const& options = {}) {
+  chart_multisite_detail::validate_multisite_inputs(grammar, patterns, options);
+  (void)validate_grammar_topology(grammar, topology);
+  return chart_multisite_detail::score_selected_topology(grammar, patterns,
+                                                         topology, options);
+}
+
+inline multisite_topology_trace_result build_multisite_optimal_topologies(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options = {},
+    multisite_topology_trace_options const& trace_opts = {}) {
+  using namespace chart_multisite_detail;
+  validate_multisite_inputs(grammar, patterns, options);
+  validate_required_productions(grammar, trace_opts.required_productions);
+  if (!trace_opts.keep_provenance) {
+    throw std::runtime_error(
+        "multi-site topology trace: keep_provenance=false cannot emit "
+        "concrete topologies");
+  }
+
+  multisite_topology_trace_result result;
+  auto composite = build_composite_chart_score(grammar, patterns, options);
+  result.composite_lower_bound = composite.weighted_lower_bound;
+  result.keep_production.assign(grammar.productions.size(), false);
+  result.frontier_sizes_by_clade.assign(grammar.clades.size(), 0);
+  result.invariant_constant_offset = invariant_constant_offset(patterns, options);
+
+  auto active = build_active_pattern_info(grammar, patterns, options);
+  result.active_pattern_count = active.size();
+  result.initial_upper_bound = initial_upper_bound(grammar, patterns, active,
+                                                   options);
+
+  std::vector<clade_id> order(grammar.clades.size());
+  std::iota(order.begin(), order.end(), clade_id{0});
+  std::stable_sort(order.begin(), order.end(), [&](clade_id lhs, clade_id rhs) {
+    auto lsize = grammar.clades[lhs].taxa.size();
+    auto rsize = grammar.clades[rhs].taxa.size();
+    if (lsize != rsize) return lsize < rsize;
+    return lhs < rhs;
+  });
+
+  std::vector<std::vector<frontier_entry>> frontiers(grammar.clades.size());
+  for (auto clade : order) {
+    auto const& key = grammar.clades[clade];
+    if (key.taxa.size() == 1) {
+      frontiers[clade].push_back(
+          make_leaf_frontier_entry(grammar, clade, active));
+      result.frontier_sizes_by_clade[clade] = frontiers[clade].size();
+      continue;
+    }
+
+    std::unordered_map<std::vector<chart_cost>, std::size_t,
+                       chart_cost_vector_hash>
+        index_by_cost;
+    auto& entries = frontiers[clade];
+    for (auto pid : grammar.productions_by_parent[clade]) {
+      auto const& prod = grammar.productions[pid];
+      if (prod.parent != clade) {
+        throw std::runtime_error(
+            "multi-site topology trace: production parent mismatch during "
+            "frontier construction");
+      }
+      chart_trim_detail::validate_binary_production_for_trim(grammar, prod,
+                                                             pid);
+      auto left_child = prod.children[0];
+      auto right_child = prod.children[1];
+      if (left_child >= frontiers.size() || right_child >= frontiers.size()) {
+        throw std::runtime_error(
+            "multi-site topology trace: production child out of frontier "
+            "range");
+      }
+      for (std::size_t left_index = 0;
+           left_index < frontiers[left_child].size(); ++left_index) {
+        auto const& left = frontiers[left_child][left_index];
+        for (std::size_t right_index = 0;
+             right_index < frontiers[right_child].size(); ++right_index) {
+          auto const& right = frontiers[right_child][right_index];
+          auto candidate = combine_frontier_entries(grammar, prod, pid, left,
+                                                    right, active.size());
+          candidate.provenance.push_back(frontier_provenance_choice{
+              pid, left_index, right_index});
+          if (trace_opts.trim_options.use_bound_pruning &&
+              result.initial_upper_bound < multisite_score_inf) {
+            auto lb = lower_bound_for_entry(candidate, clade, active,
+                                            result.invariant_constant_offset,
+                                            options);
+            if (lb > result.initial_upper_bound) {
+              ++result.bound_pruned;
+              continue;
+            }
+          }
+          insert_or_merge_frontier_entry(
+              entries, index_by_cost, std::move(candidate),
+              result.equality_deduplicated,
+              trace_opts.max_provenance_choices_per_entry);
+        }
+      }
+    }
+
+    if (trace_opts.trim_options.max_frontier_entries_per_clade != 0 &&
+        entries.size() > trace_opts.trim_options.max_frontier_entries_per_clade) {
+      throw std::runtime_error(
+          "multi-site topology trace: frontier entry cap exceeded for clade " +
+          std::to_string(clade));
+    }
+    result.frontier_sizes_by_clade[clade] = entries.size();
+  }
+
+  auto const& root_frontier = frontiers[grammar.root_clade];
+  if (root_frontier.empty()) {
+    throw std::runtime_error("multi-site topology trace: empty root frontier");
+  }
+
+  std::vector<std::size_t> optimal_root_entries;
+  for (std::size_t entry_index = 0; entry_index < root_frontier.size();
+       ++entry_index) {
+    auto score = lower_bound_for_entry(root_frontier[entry_index],
+                                       grammar.root_clade, active,
+                                       result.invariant_constant_offset,
+                                       options);
+    if (score < result.optimum) {
+      result.optimum = score;
+      optimal_root_entries.clear();
+    }
+    if (score == result.optimum) optimal_root_entries.push_back(entry_index);
+  }
+  result.optimal_frontier_entry_count = optimal_root_entries.size();
+  if (result.optimum >= multisite_score_inf || optimal_root_entries.empty()) {
+    throw std::runtime_error(
+        "multi-site topology trace: no finite optimal topology");
+  }
+
+  std::sort(optimal_root_entries.begin(), optimal_root_entries.end(),
+            [&](std::size_t lhs, std::size_t rhs) {
+              auto const& lcost = root_frontier[lhs].f.cost;
+              auto const& rcost = root_frontier[rhs].f.cost;
+              if (lcost != rcost) return lcost < rcost;
+              return lhs < rhs;
+            });
+
+  auto enumeration_limit = trace_opts.max_optimal_topologies;
+  if (enumeration_limit != 0 &&
+      enumeration_limit < std::numeric_limits<std::size_t>::max()) {
+    ++enumeration_limit;
+  }
+
+  bool provenance_truncated = false;
+  std::vector<grammar_topology> all_emitted;
+  for (auto entry_index : optimal_root_entries) {
+    if (enumeration_limit != 0 && all_emitted.size() >= enumeration_limit) {
+      provenance_truncated = true;
+      break;
+    }
+    auto remaining = enumeration_limit == 0
+                         ? std::size_t{0}
+                         : enumeration_limit - all_emitted.size();
+    auto topologies = enumerate_topologies_from_provenance(
+        grammar, frontiers, grammar.root_clade, entry_index, remaining,
+        provenance_truncated);
+    all_emitted.insert(all_emitted.end(), topologies.begin(), topologies.end());
+  }
+  sort_and_unique_topologies(all_emitted);
+
+  if (trace_opts.max_optimal_topologies != 0 &&
+      all_emitted.size() > trace_opts.max_optimal_topologies) {
+    result.topology_cap_truncated = true;
+  }
+  result.topology_cap_truncated = result.topology_cap_truncated ||
+                                  provenance_truncated;
+
+  std::vector<production_id> uncovered;
+  result.topologies = choose_topologies_for_required_coverage(
+      grammar, all_emitted, trace_opts.required_productions,
+      trace_opts.max_optimal_topologies, uncovered);
+  result.uncovered_required_productions = uncovered;
+
+  if (result.topologies.empty()) {
+    throw std::runtime_error(
+        "multi-site topology trace: no optimal topologies were emitted");
+  }
+
+  for (auto const& topology : result.topologies) {
+    auto reachable = validate_grammar_topology(grammar, topology);
+    auto score = chart_multisite_detail::score_selected_topology(
+        grammar, patterns, topology, options);
+    if (score != result.optimum) {
+      throw std::runtime_error(
+          "multi-site topology trace: emitted topology failed exact re-score");
+    }
+    merge_used_productions(result.keep_production, reachable);
+  }
+
+  if (!result.uncovered_required_productions.empty() &&
+      trace_opts.require_required_production_coverage) {
+    std::string message =
+        "multi-site topology trace: required productions are not covered by "
+        "emitted optimal topologies (optimum=" +
+        std::to_string(result.optimum) + ", emitted=" +
+        std::to_string(result.topologies.size()) + ", uncovered=[";
+    for (std::size_t i = 0; i < result.uncovered_required_productions.size();
+         ++i) {
+      if (i != 0) message += ",";
+      message += std::to_string(result.uncovered_required_productions[i]);
+    }
+    message += result.topology_cap_truncated ? "], cap_truncated=true)"
+                                             : "], cap_truncated=false)";
+    throw std::runtime_error(message);
+  }
+
   return result;
 }
 

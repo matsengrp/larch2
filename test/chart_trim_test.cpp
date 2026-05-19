@@ -626,6 +626,18 @@ static void test_multisite_composite_counterexample() {
   CHECK(bnb.keep_production[prod_c_de]);
   CHECK(bnb.keep_production[prod_d_ce]);
 
+  larch::multisite_topology_trace_options trace_opts;
+  trace_opts.max_optimal_topologies = 0;
+  auto traced = larch::build_multisite_optimal_topologies(
+      grammar, patterns, {}, trace_opts);
+  CHECK(traced.composite_lower_bound == 2);
+  CHECK(traced.optimum == 3);
+  CHECK(traced.topologies.size() == 2);
+  CHECK(traced.keep_production == brute.keep_production);
+  for (auto const& topology : traced.topologies) {
+    CHECK(larch::score_selected_topology(grammar, patterns, topology) == 3);
+  }
+
   std::println("  PASS");
 }
 
@@ -772,6 +784,25 @@ static void test_composite_reference_state_diagnostics() {
   std::println("  PASS");
 }
 
+static void test_multisite_rejects_pattern_taxon_count_mismatch() {
+  std::println("test_multisite_rejects_pattern_taxon_count_mismatch");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", invariant_tree1_spec());
+  auto grammar = larch::build_clade_grammar(dag);
+  larch::site_pattern_options pattern_options;
+  pattern_options.skip_invariant_sites = true;
+  auto patterns = larch::build_site_patterns(dag, grammar, pattern_options);
+  CHECK(patterns.patterns.empty());
+  ++patterns.taxon_count;
+
+  CHECK(throws_runtime_error([&] {
+    (void)larch::build_multisite_trim(grammar, patterns);
+  }));
+
+  std::println("  PASS");
+}
+
 static void test_multisite_equal_dedup_merges_provenance() {
   std::println("test_multisite_equal_dedup_merges_provenance");
 
@@ -794,6 +825,15 @@ static void test_multisite_equal_dedup_merges_provenance() {
   CHECK(bnb.keep_production == brute.keep_production);
   CHECK(bnb.equality_deduplicated > 0);
   for (bool keep : bnb.keep_production) CHECK(keep);
+
+  larch::multisite_topology_trace_options trace_opts;
+  trace_opts.max_optimal_topologies = 0;
+  auto traced = larch::build_multisite_optimal_topologies(
+      grammar, patterns, {}, trace_opts);
+  CHECK(traced.equality_deduplicated > 0);
+  CHECK(traced.topologies.size() == brute.topology_count);
+  CHECK(traced.keep_production == brute.keep_production);
+  for (bool keep : traced.keep_production) CHECK(keep);
 
   std::println("  PASS");
 }
@@ -920,6 +960,7 @@ int main() {
   test_multisite_concordant_sites_equal_lower_bound();
   test_multisite_invariant_sites_and_reference_edge_constant();
   test_composite_reference_state_diagnostics();
+  test_multisite_rejects_pattern_taxon_count_mismatch();
   test_multisite_equal_dedup_merges_provenance();
   test_multisite_randomized_tiny_bnb_matches_bruteforce();
   test_exhaustive_binary_assignments();
