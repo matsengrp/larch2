@@ -312,52 +312,303 @@ static void print_size_list(std::ostream& out,
   out << "]";
 }
 
-static void print_wric_polytomy_audit_fields(
-    std::ostream& out, polytomy_refinement_result const& refinement) {
-  auto const& grammar = refinement.grammar;
-  auto const& audit = refinement.audit;
-  auto kary = kary_productions(grammar);
-  std::map<std::size_t, std::size_t> arity_histogram;
-  for (auto pid : kary)
-    ++arity_histogram[grammar.productions[pid].children.size()];
-
-  out << "  polytomy_refinement_label: "
-      << polytomy_refinement_status_label(audit) << "\n";
-  out << "  exact_for_soft_polytomies: "
-      << (audit.exact_for_soft_polytomies ? "true" : "false") << "\n";
-  out << "  any_truncated: " << (audit.any_truncated ? "true" : "false")
-      << "\n";
-  out << "  kary_productions: " << audit.source_kary_production_count << "\n";
-  out << "  kary_production_arity_histogram:\n";
-  if (arity_histogram.empty()) {
-    out << "    <empty>\n";
-  } else {
-    for (auto const& [arity, count] : arity_histogram)
-      out << "    " << arity << ": " << count << "\n";
+static char const* wric_polytomy_mode_name(polytomy_mode mode) {
+  switch (mode) {
+    case polytomy_mode::reject:
+      return "reject";
+    case polytomy_mode::audit_kary:
+      return "audit-kary";
+    case polytomy_mode::expand_soft_exact_or_fail:
+      return "expand-exact";
+    case polytomy_mode::expand_soft_bounded:
+      return "expand-bounded";
   }
-  out << "  kary_production_details:\n";
-  if (kary.empty()) {
-    out << "    <empty>\n";
+  return "unknown";
+}
+
+struct wric_polytomy_report_totals {
+  std::size_t selected_seed_shapes = 0;
+  std::uint64_t refined_grammar_tree_count = 0;
+  bool refined_grammar_tree_count_saturated = false;
+  std::uint64_t sum_event_represented_refinement_counts = 0;
+  bool sum_event_represented_refinement_counts_saturated = false;
+  std::size_t truncated_events = 0;
+};
+
+static std::uint64_t dagutil_saturated_add(std::uint64_t lhs,
+                                           std::uint64_t rhs,
+                                           bool& saturated) {
+  auto max = std::numeric_limits<std::uint64_t>::max();
+  if (max - lhs < rhs) {
+    saturated = true;
+    return max;
+  }
+  return lhs + rhs;
+}
+
+static std::uint64_t dagutil_saturated_mul(std::uint64_t lhs,
+                                           std::uint64_t rhs,
+                                           bool& saturated) {
+  auto max = std::numeric_limits<std::uint64_t>::max();
+  if (lhs != 0 && rhs > max / lhs) {
+    saturated = true;
+    return max;
+  }
+  return lhs * rhs;
+}
+
+static std::uint64_t grammar_tree_count_for_clade(
+    clade_grammar const& grammar, clade_id clade,
+    std::vector<std::uint64_t>& memo, std::vector<bool>& memoized,
+    std::vector<bool>& visiting, bool& saturated) {
+  if (clade == no_clade || clade >= grammar.clades.size()) {
+    saturated = true;
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  if (memoized[clade]) return memo[clade];
+  if (visiting[clade]) {
+    throw std::runtime_error("WRIC grammar tree-count DP found a cycle");
+  }
+  visiting[clade] = true;
+
+  if (clade >= grammar.productions_by_parent.size()) {
+    saturated = true;
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+
+  std::uint64_t total = 0;
+  auto const& parent_productions = grammar.productions_by_parent[clade];
+  if (parent_productions.empty()) {
+    total = 1;
   } else {
-    for (auto pid : kary) {
-      auto const& prod = grammar.productions[pid];
-      auto parent_nodes =
-          pid < refinement.production_info.size()
-              ? refinement.production_info[pid].source_parent_nodes
-              : direct_parent_witness_nodes(prod);
-      out << "    - production: " << pid << "\n";
-      out << "      parent_clade: " << prod.parent << "\n";
-      out << "      arity: " << prod.children.size() << "\n";
-      out << "      witness_multiplicity: " << prod.multiplicity << "\n";
-      out << "      source_parent_nodes: ";
-      print_size_list(out, parent_nodes);
-      out << "\n";
+    for (auto pid : parent_productions) {
+      if (pid == no_production || pid >= grammar.productions.size()) {
+        saturated = true;
+        total = std::numeric_limits<std::uint64_t>::max();
+        break;
+      }
+      std::uint64_t prod_count = 1;
+      for (auto child : grammar.productions[pid].children) {
+        auto child_count = grammar_tree_count_for_clade(
+            grammar, child, memo, memoized, visiting, saturated);
+        prod_count = dagutil_saturated_mul(prod_count, child_count,
+                                           saturated);
+      }
+      total = dagutil_saturated_add(total, prod_count, saturated);
     }
   }
+
+  visiting[clade] = false;
+  memo[clade] = total;
+  memoized[clade] = true;
+  return total;
+}
+
+static std::uint64_t grammar_tree_count(clade_grammar const& grammar,
+                                        bool& saturated) {
+  if (grammar.clades.empty() || grammar.root_clade == no_clade ||
+      grammar.root_clade >= grammar.clades.size()) {
+    return 0;
+  }
+  std::vector<std::uint64_t> memo(grammar.clades.size(), 0);
+  std::vector<bool> memoized(grammar.clades.size(), false);
+  std::vector<bool> visiting(grammar.clades.size(), false);
+  return grammar_tree_count_for_clade(grammar, grammar.root_clade, memo,
+                                      memoized, visiting, saturated);
+}
+
+static wric_polytomy_report_totals summarize_wric_polytomy_report(
+    polytomy_refinement_result const& refinement) {
+  auto const& audit = refinement.audit;
+  wric_polytomy_report_totals totals;
+  totals.refined_grammar_tree_count =
+      grammar_tree_count(refinement.grammar,
+                         totals.refined_grammar_tree_count_saturated);
+  for (auto const& event : audit.events) {
+    totals.selected_seed_shapes += event.selected_seed_shape_count;
+    if (event.truncated_by_shape_cap || event.truncated_by_production_cap)
+      ++totals.truncated_events;
+    if (event.refinement_count_saturated) {
+      totals.sum_event_represented_refinement_counts_saturated = true;
+      totals.sum_event_represented_refinement_counts =
+          std::numeric_limits<std::uint64_t>::max();
+      continue;
+    }
+    totals.sum_event_represented_refinement_counts = dagutil_saturated_add(
+        totals.sum_event_represented_refinement_counts,
+        event.represented_refinement_count,
+        totals.sum_event_represented_refinement_counts_saturated);
+  }
+  return totals;
+}
+
+static std::map<std::size_t, std::size_t> source_kary_arity_histogram(
+    polytomy_refinement_result const& refinement) {
+  std::map<std::size_t, std::size_t> histogram;
+  for (auto const& event : refinement.audit.events) {
+    if (event.arity >= 3) ++histogram[event.arity];
+  }
+  if (!histogram.empty()) return histogram;
+
+  // Fallback for diagnostic grammars not represented by event records.
+  auto const& grammar = refinement.grammar;
+  for (auto pid : kary_productions(grammar))
+    ++histogram[grammar.productions[pid].children.size()];
+  return histogram;
+}
+
+static void print_wric_polytomy_summary_fields(
+    std::ostream& out, polytomy_refinement_result const& refinement,
+    polytomy_mode mode) {
+  auto const& audit = refinement.audit;
+  auto totals = summarize_wric_polytomy_report(refinement);
+  out << "  polytomy_mode: " << wric_polytomy_mode_name(mode) << "\n";
+  out << "  polytomy_refinement_label: "
+      << polytomy_refinement_status_label(audit) << "\n";
+  out << "  source_kary_productions: "
+      << audit.source_kary_production_count << "\n";
   out << "  contains_kary_productions: "
       << (audit.contains_kary_productions ? "true" : "false") << "\n";
   out << "  binary_chart_compatible: "
       << (audit.binary_chart_compatible ? "true" : "false") << "\n";
+  out << "  synthetic_clades: " << audit.synthetic_clade_count << "\n";
+  out << "  synthetic_productions: " << audit.synthetic_production_count
+      << "\n";
+  out << "  selected_seed_shapes: " << totals.selected_seed_shapes << "\n";
+  out << "  represented_refinement_count: "
+      << totals.refined_grammar_tree_count
+      << (totals.refined_grammar_tree_count_saturated ? " (saturated)" : "")
+      << "\n";
+  out << "  sum_event_represented_refinement_counts: "
+      << totals.sum_event_represented_refinement_counts
+      << (totals.sum_event_represented_refinement_counts_saturated
+              ? " (saturated)"
+              : "")
+      << "\n";
+  out << "  exact_for_soft_polytomies: "
+      << (audit.exact_for_soft_polytomies ? "true" : "false") << "\n";
+  out << "  truncated_events: " << totals.truncated_events << "\n";
+  out << "  any_truncated: " << (audit.any_truncated ? "true" : "false")
+      << "\n";
+}
+
+static std::vector<std::size_t> source_parent_nodes_for_polytomy_event(
+    polytomy_refinement_result const& refinement,
+    polytomy_event_audit const& event) {
+  std::vector<std::size_t> nodes;
+  if (event.source_production == no_production) return nodes;
+  for (auto const& info : refinement.production_info) {
+    if (std::find(info.source_productions.begin(),
+                  info.source_productions.end(),
+                  event.source_production) == info.source_productions.end()) {
+      continue;
+    }
+    nodes.insert(nodes.end(), info.source_parent_nodes.begin(),
+                 info.source_parent_nodes.end());
+  }
+  std::sort(nodes.begin(), nodes.end());
+  nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+  return nodes;
+}
+
+static void print_wric_polytomy_event_details(
+    std::ostream& out, polytomy_refinement_result const& refinement) {
+  auto const& audit = refinement.audit;
+  out << "  polytomy_refinement_events:\n";
+  if (audit.events.empty()) {
+    out << "    <empty>\n";
+    return;
+  }
+  for (auto const& event : audit.events) {
+    auto parent_nodes = source_parent_nodes_for_polytomy_event(refinement,
+                                                               event);
+    out << "    - source_production: " << event.source_production << "\n";
+    out << "      source_parent_clade: " << event.source_parent << "\n";
+    out << "      refined_parent_clade: " << event.parent << "\n";
+    out << "      arity: " << event.arity << "\n";
+    out << "      source_multiplicity: " << event.source_multiplicity << "\n";
+    out << "      source_parent_nodes: ";
+    print_size_list(out, parent_nodes);
+    out << "\n";
+    out << "      new_clades_added: " << event.new_clades_added << "\n";
+    out << "      new_productions_added: " << event.new_productions_added
+        << "\n";
+    out << "      selected_seed_shapes: " << event.selected_seed_shape_count
+        << "\n";
+    out << "      represented_refinement_count: "
+        << event.represented_refinement_count
+        << (event.refinement_count_saturated ? " (saturated)" : "")
+        << "\n";
+    out << "      expanded: " << (event.expanded ? "true" : "false") << "\n";
+    out << "      exact: " << (event.exact ? "true" : "false") << "\n";
+    out << "      truncated_by_shape_cap: "
+        << (event.truncated_by_shape_cap ? "true" : "false") << "\n";
+    out << "      truncated_by_production_cap: "
+        << (event.truncated_by_production_cap ? "true" : "false") << "\n";
+    out << "      refused_by_exact_cap: "
+        << (event.refused_by_exact_cap ? "true" : "false") << "\n";
+  }
+}
+
+static void print_wric_polytomy_source_kary_details(
+    std::ostream& out, polytomy_refinement_result const& refinement) {
+  auto histogram = source_kary_arity_histogram(refinement);
+  out << "  kary_productions: "
+      << refinement.audit.source_kary_production_count << "\n";
+  out << "  source_kary_production_arity_histogram:\n";
+  if (histogram.empty()) {
+    out << "    <empty>\n";
+  } else {
+    for (auto const& [arity, count] : histogram)
+      out << "    " << arity << ": " << count << "\n";
+  }
+
+  out << "  source_kary_production_details:\n";
+  auto const& grammar = refinement.grammar;
+  if (!refinement.audit.events.empty()) {
+    for (auto const& event : refinement.audit.events) {
+      auto parent_nodes = source_parent_nodes_for_polytomy_event(refinement,
+                                                                 event);
+      out << "    - source_production: " << event.source_production << "\n";
+      out << "      source_parent_clade: " << event.source_parent << "\n";
+      out << "      refined_parent_clade: " << event.parent << "\n";
+      out << "      arity: " << event.arity << "\n";
+      out << "      witness_multiplicity: " << event.source_multiplicity
+          << "\n";
+      out << "      source_parent_nodes: ";
+      print_size_list(out, parent_nodes);
+      out << "\n";
+    }
+    return;
+  }
+
+  auto kary = kary_productions(grammar);
+  if (kary.empty()) {
+    out << "    <empty>\n";
+    return;
+  }
+  for (auto pid : kary) {
+    auto const& prod = grammar.productions[pid];
+    auto parent_nodes =
+        pid < refinement.production_info.size()
+            ? refinement.production_info[pid].source_parent_nodes
+            : direct_parent_witness_nodes(prod);
+    out << "    - source_production: " << pid << "\n";
+    out << "      parent_clade: " << prod.parent << "\n";
+    out << "      arity: " << prod.children.size() << "\n";
+    out << "      witness_multiplicity: " << prod.multiplicity << "\n";
+    out << "      source_parent_nodes: ";
+    print_size_list(out, parent_nodes);
+    out << "\n";
+  }
+}
+
+static void print_wric_polytomy_audit_fields(
+    std::ostream& out, polytomy_refinement_result const& refinement,
+    polytomy_mode mode) {
+  auto const& audit = refinement.audit;
+  print_wric_polytomy_summary_fields(out, refinement, mode);
+  print_wric_polytomy_source_kary_details(out, refinement);
   out << "  downstream_binary_charting_allowed: "
       << (audit.binary_chart_compatible && !audit.contains_kary_productions
               ? "true"
@@ -365,45 +616,22 @@ static void print_wric_polytomy_audit_fields(
       << "\n";
   out << "  kary_grammar_diagnostic_only: "
       << (audit.contains_kary_productions ? "true" : "false") << "\n";
-  out << "  polytomy_refinement_events:\n";
-  if (audit.events.empty()) {
-    out << "    <empty>\n";
-  } else {
-    for (auto const& event : audit.events) {
-      out << "    - source_production: " << event.source_production << "\n";
-      out << "      parent_clade: " << event.parent << "\n";
-      out << "      arity: " << event.arity << "\n";
-      out << "      selected_seed_shapes: "
-          << event.selected_seed_shape_count << "\n";
-      out << "      represented_refinement_count: "
-          << event.represented_refinement_count
-          << (event.refinement_count_saturated ? " (saturated)" : "")
-          << "\n";
-      out << "      exact: " << (event.exact ? "true" : "false") << "\n";
-      out << "      truncated_by_shape_cap: "
-          << (event.truncated_by_shape_cap ? "true" : "false") << "\n";
-      out << "      truncated_by_production_cap: "
-          << (event.truncated_by_production_cap ? "true" : "false")
-          << "\n";
-    }
-  }
+  print_wric_polytomy_event_details(out, refinement);
 }
 
 static void print_wric_polytomy_score_fields(
-    std::ostream& out, polytomy_refinement_audit const& audit) {
-  out << "  polytomy_refinement_label: "
-      << polytomy_refinement_status_label(audit) << "\n";
+    std::ostream& out, polytomy_refinement_result const& refinement,
+    polytomy_mode mode, bool detailed_report) {
+  auto const& audit = refinement.audit;
+  print_wric_polytomy_summary_fields(out, refinement, mode);
   out << "  exact_for_full_soft_polytomy_space: "
       << (audit.exact_for_soft_polytomies ? "true" : "false") << "\n";
-  out << "  binary_chart_compatible: "
-      << (audit.binary_chart_compatible ? "true" : "false") << "\n";
-  out << "  contains_kary_productions: "
-      << (audit.contains_kary_productions ? "true" : "false") << "\n";
   if (!audit.exact_for_soft_polytomies) {
     out << "  score_scope: BOUNDED_REFINED_GRAMMAR\n";
   } else {
     out << "  score_scope: FULL_SOFT_POLYTOMY_SPACE\n";
   }
+  if (detailed_report) print_wric_polytomy_event_details(out, refinement);
 }
 
 static char const* exact_or_bounded_score_kind(
@@ -523,6 +751,8 @@ Analysis:
                           Bounded seed-shape cap per polytomy (default 16)
   --wric-polytomy-max-productions <N>
                           Per-polytomy production cap for expansion
+  --wric-polytomy-report  Print polytomy refinement status/audit details;
+                          chart reports include per-event details
   --chart-site <POS>      Build a one-site chart and print root optimum plus
                           key clade entries (POS is 1-based)
   --chart-pattern-info    Print exact/invariant/normalized site-pattern counts
@@ -590,6 +820,7 @@ struct args {
   bool wric_audit = false;
   polytomy_refinement_options wric_polytomy_opts;
   bool wric_polytomy_mode_explicit = false;
+  bool wric_polytomy_report = false;
   std::optional<mutation_position> chart_site;
   bool chart_pattern_info = false;
   std::optional<mutation_position> chart_trim_site;
@@ -710,6 +941,8 @@ static args parse_args(int argc, char** argv) {
           std::stoull(std::string{next()}));
       a.wric_polytomy_opts.max_new_productions_per_polytomy = value;
       a.wric_polytomy_opts.max_bounded_productions_per_polytomy = value;
+    } else if (arg == "--wric-polytomy-report") {
+      a.wric_polytomy_report = true;
     } else if (arg == "--chart-site") {
       auto pos =
           static_cast<mutation_position>(std::stoull(std::string{next()}));
@@ -965,7 +1198,7 @@ int main(int argc, char** argv) try {
     return *exact_patterns_cache;
   };
 
-  if (a.wric_audit) {
+  if (a.wric_audit || a.wric_polytomy_report) {
     clade_grammar_options grammar_opts;
     auto refinement_opts = a.wric_polytomy_opts;
     if (!a.wric_polytomy_mode_explicit)
@@ -975,7 +1208,8 @@ int main(int argc, char** argv) try {
         result, grammar_opts, refinement_opts);
     auto build_ms = elapsed_ms(start, std::chrono::steady_clock::now());
     print_clade_grammar_audit(std::cout, refined.source_grammar_audit);
-    print_wric_polytomy_audit_fields(std::cout, refined);
+    print_wric_polytomy_audit_fields(std::cout, refined,
+                                     refinement_opts.mode);
     std::cout << "  grammar_build_ms: " << std::fixed
               << std::setprecision(3) << build_ms << "\n";
   }
@@ -1008,7 +1242,9 @@ int main(int argc, char** argv) try {
     std::cout << "  clades: " << grammar.clades.size() << "\n";
     std::cout << "  productions: " << grammar.productions.size() << "\n";
     std::cout << "  root_clade: " << grammar.root_clade << "\n";
-    print_wric_polytomy_score_fields(std::cout, refinement.audit);
+    print_wric_polytomy_score_fields(std::cout, refinement,
+                                      a.wric_polytomy_opts.mode,
+                                      a.wric_polytomy_report);
     std::cout << "  root_min: ";
     print_chart_cost(std::cout, optimum);
     std::cout << "\n";
@@ -1034,7 +1270,9 @@ int main(int argc, char** argv) try {
     auto patterns = build_site_patterns(result, grammar, pattern_opts);
     auto pattern_ms = elapsed_ms(pattern_start, std::chrono::steady_clock::now());
     print_site_pattern_summary(std::cout, patterns);
-    print_wric_polytomy_score_fields(std::cout, refinement.audit);
+    print_wric_polytomy_score_fields(std::cout, refinement,
+                                      a.wric_polytomy_opts.mode,
+                                      a.wric_polytomy_report);
     std::cout << "  grammar_build_ms: " << std::fixed
               << std::setprecision(3) << chart_grammar_build_ms << "\n";
     std::cout << "  pattern_build_ms: " << std::fixed
@@ -1070,7 +1308,9 @@ int main(int argc, char** argv) try {
     std::cout << "  pos: " << *a.chart_trim_site << "\n";
     std::cout << "  score_ua_edge: "
               << (a.chart_score_ua_edge ? "true" : "false") << "\n";
-    print_wric_polytomy_score_fields(std::cout, refinement.audit);
+    print_wric_polytomy_score_fields(std::cout, refinement,
+                                      a.wric_polytomy_opts.mode,
+                                      a.wric_polytomy_report);
     std::cout << "  global_min: ";
     print_chart_cost(std::cout, mask.global_min);
     std::cout << "\n";
@@ -1127,7 +1367,9 @@ int main(int argc, char** argv) try {
 
     std::cout << "chart_composite_score:\n";
     std::cout << "  score_kind: LOWER_BOUND\n";
-    print_wric_polytomy_score_fields(std::cout, refinement.audit);
+    print_wric_polytomy_score_fields(std::cout, refinement,
+                                      a.wric_polytomy_opts.mode,
+                                      a.wric_polytomy_report);
     std::cout << "  weighted_lower_bound: "
               << composite.weighted_lower_bound << "\n";
     std::cout << "  score_ua_edge: "
@@ -1165,7 +1407,9 @@ int main(int argc, char** argv) try {
     std::cout << "chart_bnb_trim:\n";
     std::cout << "  score_kind: "
               << exact_or_bounded_score_kind(refinement.audit) << "\n";
-    print_wric_polytomy_score_fields(std::cout, refinement.audit);
+    print_wric_polytomy_score_fields(std::cout, refinement,
+                                      a.wric_polytomy_opts.mode,
+                                      a.wric_polytomy_report);
     std::cout << "  optimum: " << trim.optimum << "\n";
     std::cout << "  composite_lower_bound_kind: LOWER_BOUND\n";
     std::cout << "  composite_lower_bound: "
@@ -1214,7 +1458,9 @@ int main(int argc, char** argv) try {
     std::cout << "chart_fluidity_site: " << *a.chart_fluidity_site << "\n";
     std::cout << "chart_fluidity_score_ua_edge: "
               << (a.chart_score_ua_edge ? "true" : "false") << "\n";
-    print_wric_polytomy_score_fields(std::cout, refinement.audit);
+    print_wric_polytomy_score_fields(std::cout, refinement,
+                                      a.wric_polytomy_opts.mode,
+                                      a.wric_polytomy_report);
     print_fluidity_report(std::cout, grammar, report);
   }
 

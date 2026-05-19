@@ -71,6 +71,7 @@ struct refined_production_info {
 
 struct polytomy_event_audit {
   production_id source_production = no_production;
+  clade_id source_parent = no_clade;
   clade_id parent = no_clade;
   std::size_t arity = 0;
   std::uint64_t source_multiplicity = 0;
@@ -260,6 +261,7 @@ inline polytomy_refinement_result make_phase0_result(
 
       polytomy_event_audit event;
       event.source_production = pid;
+      event.source_parent = prod.parent;
       event.parent = prod.parent;
       event.arity = prod.children.size();
       event.source_multiplicity = prod.multiplicity;
@@ -875,6 +877,7 @@ inline polytomy_event_audit expand_kary_production_exact(
 
   polytomy_event_audit event;
   event.source_production = source_pid;
+  event.source_parent = prod.parent;
   event.parent = ctx.source_clade_to_draft.at(prod.parent);
   event.arity = prod.children.size();
   event.source_multiplicity = prod.multiplicity;
@@ -1593,6 +1596,7 @@ inline polytomy_event_audit expand_kary_production_bounded(
 
   polytomy_event_audit event;
   event.source_production = source_pid;
+  event.source_parent = prod.parent;
   event.parent = ctx.source_clade_to_draft.at(prod.parent);
   event.arity = prod.children.size();
   event.source_multiplicity = prod.multiplicity;
@@ -2116,7 +2120,8 @@ inline std::ostream& print_polytomy_refinement_audit(
   out << "  events: " << audit.events.size() << "\n";
   for (auto const& event : audit.events) {
     out << "    - source_production: " << event.source_production << "\n";
-    out << "      parent_clade: " << event.parent << "\n";
+    out << "      source_parent_clade: " << event.source_parent << "\n";
+    out << "      refined_parent_clade: " << event.parent << "\n";
     out << "      arity: " << event.arity << "\n";
     out << "      selected_seed_shapes: " << event.selected_seed_shape_count
         << "\n";

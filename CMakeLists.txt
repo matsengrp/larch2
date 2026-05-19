@@ -228,6 +228,53 @@ set_tests_properties(dagutil_wric_audit_polytomy_diagnostic
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "kary_grammar_diagnostic_only: true")
 
+add_test(NAME dagutil_wric_polytomy_report_audit
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-report
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_polytomy_report_audit
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "polytomy_mode: audit-kary")
+
+add_test(NAME dagutil_wric_polytomy_report_bounded_chart_label
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-pattern-info
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_polytomy_report_bounded_chart_label
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "score_scope: BOUNDED_REFINED_GRAMMAR")
+
+add_test(NAME dagutil_wric_polytomy_report_expanded_source_nodes
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --wric-polytomy-report
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_polytomy_report_expanded_source_nodes
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "source_parent_nodes: \\[[0-9]+")
+
+add_test(NAME dagutil_wric_polytomy_report_two_polytomy_count
+         COMMAND dagutil
+                 --fasta test/wric_two_polytomy.fa
+                 --newick test/wric_two_polytomy.nwk
+                 --refseq test/wric_two_polytomy.ref
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-exact
+                 --wric-polytomy-report
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_wric_polytomy_report_two_polytomy_count
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "represented_refinement_count: 9")
+
 add_test(NAME dagutil_sample_method_without_sample_fails
          COMMAND dagutil
                  --dag-pb data/test_5_trees/tree_0.pb.gz
