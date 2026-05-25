@@ -1203,17 +1203,30 @@ Analysis:
   --chart-spr-candidates  Enumerate grammar-native SPR candidates with the
                           streaming Phase-1 API and print generation counters
   --chart-spr-score-local Score streamed grammar-native candidates with the
-                          Phase-1 cached-chart local scorer diagnostic
-  --chart-spr-search      Run the Phase-1 grammar-native rank-only search
-                          surface diagnostic (scores/ranks candidates; no DAG
-                          mutation or multi-iteration accept/reject yet)
+                          cached-chart local overlay-delta scorer diagnostic
+  --chart-spr-search      Run the Phase-4 grammar-native ranking plus exact
+                          acceptance gate (no DAG mutation/materialized commit
+                          until the Phase-5 search loop)
   --chart-spr-max-candidates <N>
                           Candidate cap for chart-SPR diagnostics
                           (default 0, unlimited; post-dedup)
   --chart-spr-max-iterations <N>
                           Requested iteration cap for future full search
-                          (default 1; Phase-1 rank-only diagnostic reports it
-                          but runs one non-mutating ranking pass)
+                          (default 1; Phase-4 gate runs one non-mutating
+                          ranking/acceptance pass)
+  --chart-spr-top-k-exact <N>
+                          Number of lower-bound-ranked candidates exact-verified
+                          in lower-bound-top-k mode (default 16; 0 verifies none)
+  --chart-spr-acceptance <M>
+                          exact/exact-multisite (default), fixed-topology,
+                          or lower-bound/lower-bound-heuristic
+  --chart-spr-candidate-selection <M>
+                          exhaustive-exact, lower-bound-top-k (default),
+                          lower-bound-first-improvement, or randomized
+  --chart-spr-topology-selector <M>
+                          Deterministic selector used by fixed-topology mode
+                          when no explicit certificate provider is wired
+                          (default first-reachable-overlay-topology)
   --chart-spr-max-upward-path-expansions <N>
                           Hard budget for lazy upward-path expansions
                           (default 0, unlimited)
@@ -1299,6 +1312,13 @@ struct args {
   bool chart_spr_score_local = false;
   bool chart_spr_search = false;
   std::size_t chart_spr_max_iterations = 1;
+  std::size_t chart_spr_top_k_exact = 16;
+  chart_spr_acceptance_mode chart_spr_acceptance =
+      chart_spr_acceptance_mode::exact_multisite;
+  chart_spr_candidate_selection_mode chart_spr_candidate_selection =
+      chart_spr_candidate_selection_mode::lower_bound_top_k;
+  std::string chart_spr_topology_selector =
+      "first_reachable_overlay_topology";
   grammar_spr_enumeration_options chart_spr_enumeration;
 };
 
@@ -1326,6 +1346,46 @@ static std::optional<polytomy_mode> parse_wric_polytomy_mode(
   if (text == "expand-bounded" || text == "expand_bounded" ||
       text == "expand_soft_bounded")
     return polytomy_mode::expand_soft_bounded;
+  return std::nullopt;
+}
+
+static std::optional<chart_spr_acceptance_mode>
+parse_chart_spr_acceptance_mode(std::string_view text) {
+  if (text == "exact" || text == "exact-multisite" ||
+      text == "exact_multisite") {
+    return chart_spr_acceptance_mode::exact_multisite;
+  }
+  if (text == "fixed-topology" || text == "fixed_topology" ||
+      text == "fixed-topology-exact" || text == "fixed_topology_exact") {
+    return chart_spr_acceptance_mode::fixed_topology_exact;
+  }
+  if (text == "lower-bound" || text == "lower_bound" ||
+      text == "lower-bound-heuristic" ||
+      text == "lower_bound_heuristic") {
+    return chart_spr_acceptance_mode::lower_bound_heuristic;
+  }
+  return std::nullopt;
+}
+
+static std::optional<chart_spr_candidate_selection_mode>
+parse_chart_spr_candidate_selection_mode(std::string_view text) {
+  if (text == "exhaustive-exact" || text == "exhaustive_exact" ||
+      text == "exhaustive") {
+    return chart_spr_candidate_selection_mode::exhaustive_exact;
+  }
+  if (text == "lower-bound-top-k" || text == "lower_bound_top_k" ||
+      text == "top-k" || text == "top_k") {
+    return chart_spr_candidate_selection_mode::lower_bound_top_k;
+  }
+  if (text == "lower-bound-first-improvement" ||
+      text == "lower_bound_first_improvement" ||
+      text == "first-improvement" || text == "first_improvement") {
+    return chart_spr_candidate_selection_mode::lower_bound_first_improvement;
+  }
+  if (text == "randomized" || text == "sampled" ||
+      text == "sampled-or-randomized" || text == "sampled_or_randomized") {
+    return chart_spr_candidate_selection_mode::sampled_or_randomized;
+  }
   return std::nullopt;
 }
 
@@ -1569,6 +1629,35 @@ static args parse_args(int argc, char** argv) {
     } else if (arg == "--chart-spr-max-iterations") {
       a.chart_spr_max_iterations = parse_positive_size_token_strict(
           next(), "--chart-spr-max-iterations");
+    } else if (arg == "--chart-spr-top-k-exact") {
+      a.chart_spr_top_k_exact = parse_size_token_strict(
+          next(), "--chart-spr-top-k-exact");
+    } else if (arg == "--chart-spr-acceptance") {
+      auto value = next();
+      auto mode = parse_chart_spr_acceptance_mode(value);
+      if (!mode) {
+        std::cerr << "error: unknown --chart-spr-acceptance '" << value
+                  << "'\n";
+        std::exit(1);
+      }
+      a.chart_spr_acceptance = *mode;
+    } else if (arg == "--chart-spr-candidate-selection") {
+      auto value = next();
+      auto mode = parse_chart_spr_candidate_selection_mode(value);
+      if (!mode) {
+        std::cerr << "error: unknown --chart-spr-candidate-selection '"
+                  << value << "'\n";
+        std::exit(1);
+      }
+      a.chart_spr_candidate_selection = *mode;
+    } else if (arg == "--chart-spr-topology-selector") {
+      a.chart_spr_topology_selector = std::string{next()};
+      if (!chart_spr_builtin_fixed_topology_selector_name(
+              a.chart_spr_topology_selector)) {
+        std::cerr << "error: unknown --chart-spr-topology-selector '"
+                  << a.chart_spr_topology_selector << "'\n";
+        std::exit(1);
+      }
     } else if (arg == "--chart-spr-max-upward-path-expansions") {
       a.chart_spr_enumeration.max_upward_path_expansions =
           parse_size_token_strict(next(),
@@ -2463,6 +2552,164 @@ static void run_chart_spr_local_scoring_diagnostic(
   print_chart_spr_search_counter_fields(out, state.counters, "    ");
 }
 
+static std::string chart_spr_topology_selection_label(
+    chart_spr_topology_selection const& selection) {
+  std::string label = chart_spr_topology_selection_kind_name(selection.kind);
+  if (!selection.selector_name.empty()) {
+    label += ":";
+    label += selection.selector_name;
+  }
+  if (selection.certificate) label += ":certificate";
+  return label;
+}
+
+static chart_spr_search_options make_chart_spr_search_options(
+    args const& a) {
+  chart_spr_search_options options;
+  options.max_iterations = a.chart_spr_max_iterations;
+  options.max_candidates_per_iteration = 0;
+  options.top_k_exact_verify = a.chart_spr_top_k_exact;
+  options.acceptance_mode = a.chart_spr_acceptance;
+  options.candidate_selection = a.chart_spr_candidate_selection;
+  options.fixed_topology_selector_name = a.chart_spr_topology_selector;
+  options.enumeration = a.chart_spr_enumeration;
+  options.chart.score_ua_edge = a.chart_score_ua_edge;
+  options.exact_trim.use_bound_pruning = !a.chart_bnb_no_bound_pruning;
+  options.exact_trim.max_frontier_entries_per_clade =
+      a.chart_bnb_max_frontier;
+  return options;
+}
+
+static void run_chart_spr_acceptance_gate_diagnostic(
+    std::ostream& out, phylo_dag& dag,
+    polytomy_refinement_result& refinement, args const& a) {
+  auto options = make_chart_spr_search_options(a);
+
+  auto cache_start = std::chrono::steady_clock::now();
+  auto state = build_chart_spr_search_state(dag, refinement.grammar, options);
+  auto cache_ms = elapsed_ms(cache_start, std::chrono::steady_clock::now());
+
+  auto iteration_start = std::chrono::steady_clock::now();
+  auto iteration = run_chart_spr_acceptance_iteration(state, options, 0);
+  auto iteration_ms = elapsed_ms(iteration_start,
+                                 std::chrono::steady_clock::now());
+
+  out << "chart_spr_search:\n";
+  out << "  api: search_state_cached_active_pattern_charts\n";
+  out << "  search_mode: phase4_acceptance_gate_no_dag_mutation\n";
+  out << "  actual_dag_mutation: false\n";
+  out << "  acceptance: "
+      << chart_spr_acceptance_mode_name(options.acceptance_mode) << "\n";
+  out << "  candidate_selection: "
+      << chart_spr_candidate_selection_mode_name(options.candidate_selection)
+      << "\n";
+  out << "  top_k_exact_verify: " << options.top_k_exact_verify << "\n";
+  out << "  topology_selection: ";
+  if (options.acceptance_mode ==
+      chart_spr_acceptance_mode::fixed_topology_exact) {
+    out << "deterministic_selector:"
+        << options.fixed_topology_selector_name << "\n";
+  } else {
+    out << "none\n";
+  }
+  out << "  objective: ";
+  if (options.acceptance_mode ==
+      chart_spr_acceptance_mode::lower_bound_heuristic) {
+    out << "composite_lower_bound_heuristic\n";
+  } else if (options.acceptance_mode ==
+             chart_spr_acceptance_mode::fixed_topology_exact) {
+    out << "fixed_topology_exact\n";
+  } else {
+    out << "grammar_exact\n";
+  }
+  out << "  score_ua_edge: "
+      << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+  out << "  active_patterns: "
+      << state.active_patterns.patterns.patterns.size() << "\n";
+  out << "  skipped_invariant_sites: "
+      << state.skipped_invariant_site_count << "\n";
+  out << "  invariant_constant_offset: "
+      << state.invariant_constant_offset << "\n";
+  out << "  chart_cache_estimated_bytes: "
+      << estimate_chart_spr_pattern_cache_bytes(state) << "\n";
+  out << "  cache_build_ms: " << std::fixed << std::setprecision(3)
+      << cache_ms << "\n";
+  out << "  acceptance_gate_ms: " << std::fixed << std::setprecision(3)
+      << iteration_ms << "\n";
+  out << "  requested_max_iterations: " << a.chart_spr_max_iterations
+      << "\n";
+  out << "  implemented_gate_iterations: 1\n";
+  out << "  candidates_generated: " << iteration.candidates_generated
+      << "\n";
+  out << "  candidates_scored: " << iteration.candidates_scored << "\n";
+  out << "  candidate_score_failures: "
+      << iteration.candidate_score_failures << "\n";
+  out << "  local_improving_candidates: "
+      << iteration.local_improving_candidates << "\n";
+  out << "  locally_ranked_candidates_retained: "
+      << iteration.locally_ranked_candidates_retained << "\n";
+  out << "  candidates_exact_verified: "
+      << iteration.candidates_exact_verified << "\n";
+  out << "  unverified_candidates_may_contain_improvements: "
+      << (iteration.unverified_candidates_may_contain_improvements ? "true"
+                                                                    : "false")
+      << "\n";
+  out << "  state_score_before: " << iteration.state_score_before << "\n";
+  out << "  state_score_after: " << iteration.state_score_after << "\n";
+  out << "  accepted_move_present: "
+      << (iteration.accepted ? "true" : "false") << "\n";
+  out << "  output_dag_mutated: false\n";
+  if (!iteration.no_accept_reason.empty()) {
+    out << "  no_accept_reason: " << iteration.no_accept_reason << "\n";
+  }
+  if (iteration.accepted) {
+    auto const& accepted = *iteration.accepted;
+    out << "  accepted_lower_bound_delta: "
+        << accepted.lower_bound.value.delta << "\n";
+    out << "  accepted_lower_bound_new_score: "
+        << accepted.lower_bound.value.new_score << "\n";
+    if (accepted.exact) {
+      out << "  accepted_exact_kind: "
+          << chart_spr_score_kind_name(accepted.exact->kind) << "\n";
+      out << "  accepted_exact_delta: " << accepted.exact->value.delta
+          << "\n";
+      out << "  accepted_exact_new_score: "
+          << accepted.exact->value.new_score << "\n";
+    }
+    out << "  accepted_affected_clades: "
+        << accepted.affected_clade_count << "\n";
+    out << "  accepted_topology_selection: "
+        << chart_spr_topology_selection_label(accepted.topology_selection)
+        << "\n";
+    if (accepted.topology_selection.certificate) {
+      auto const& cert = *accepted.topology_selection.certificate;
+      out << "  accepted_topology_certificate_before_productions: "
+          << cert.before_overlay_productions.size() << "\n";
+      out << "  accepted_topology_certificate_after_productions: "
+          << cert.after_overlay_productions.size() << "\n";
+      out << "  accepted_topology_certificate_before_signatures: "
+          << cert.before_signatures.size() << "\n";
+      out << "  accepted_topology_certificate_after_signatures: "
+          << cert.after_signatures.size() << "\n";
+    }
+    out << "  accepted_candidate_signature: "
+        << chart_spr_candidate_taxon_signature(state.grammar,
+                                               accepted.candidate)
+        << "\n";
+  }
+  out << "  affected_clade_count_distribution:\n";
+  out << "    mean: " << std::fixed << std::setprecision(3)
+      << iteration.affected_distribution.mean << "\n";
+  out << "    p50: " << iteration.affected_distribution.p50 << "\n";
+  out << "    p95: " << iteration.affected_distribution.p95 << "\n";
+  out << "    max: " << iteration.affected_distribution.max << "\n";
+  out << "  candidate_generation:\n";
+  print_chart_spr_generation_stats(out, iteration.candidate_generation,
+                                   "    ");
+  out << "  counters:\n";
+  print_chart_spr_search_counter_fields(out, state.counters, "    ");
+}
+
 static void run_chart_spr_helper_benchmark(
     std::ostream& out, polytomy_refinement_result& refinement,
     double grammar_build_ms, site_pattern_set& patterns,
@@ -2766,8 +3013,8 @@ int main(int argc, char** argv) try {
 
   if (a.chart_spr_search) {
     auto& refinement = get_chart_refinement();
-    run_chart_spr_local_scoring_diagnostic(
-        std::cout, result, refinement, a, "chart_spr_search");
+    run_chart_spr_acceptance_gate_diagnostic(
+        std::cout, result, refinement, a);
   }
 
   if (a.chart_site) {

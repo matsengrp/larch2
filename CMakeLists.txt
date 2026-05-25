@@ -417,7 +417,7 @@ add_test(NAME dagutil_chart_spr_search
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(dagutil_chart_spr_search
                      PROPERTIES PASS_REGULAR_EXPRESSION
-                     "search_mode: phase3_rank_only_no_dag_mutation")
+                     "search_mode: phase4_acceptance_gate_no_dag_mutation")
 
 add_test(NAME dagutil_chart_spr_helper_benchmark_seedtree_larger_fixture
          COMMAND dagutil

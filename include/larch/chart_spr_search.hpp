@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -74,6 +75,19 @@ enum class chart_spr_acceptance_mode {
   lower_bound_heuristic,
 };
 
+inline char const* chart_spr_acceptance_mode_name(
+    chart_spr_acceptance_mode mode) {
+  switch (mode) {
+    case chart_spr_acceptance_mode::exact_multisite:
+      return "exact_multisite";
+    case chart_spr_acceptance_mode::fixed_topology_exact:
+      return "fixed_topology_exact";
+    case chart_spr_acceptance_mode::lower_bound_heuristic:
+      return "lower_bound_heuristic";
+  }
+  return "unknown";
+}
+
 enum class chart_spr_candidate_selection_mode {
   exhaustive_exact,
   lower_bound_top_k,
@@ -81,17 +95,47 @@ enum class chart_spr_candidate_selection_mode {
   sampled_or_randomized,
 };
 
+inline char const* chart_spr_candidate_selection_mode_name(
+    chart_spr_candidate_selection_mode mode) {
+  switch (mode) {
+    case chart_spr_candidate_selection_mode::exhaustive_exact:
+      return "exhaustive_exact";
+    case chart_spr_candidate_selection_mode::lower_bound_top_k:
+      return "lower_bound_top_k";
+    case chart_spr_candidate_selection_mode::lower_bound_first_improvement:
+      return "lower_bound_first_improvement";
+    case chart_spr_candidate_selection_mode::sampled_or_randomized:
+      return "sampled_or_randomized";
+  }
+  return "unknown";
+}
+
 enum class chart_spr_topology_selection_kind {
   none,
   explicit_certificate,
   deterministic_selector,
 };
 
+inline char const* chart_spr_topology_selection_kind_name(
+    chart_spr_topology_selection_kind kind) {
+  switch (kind) {
+    case chart_spr_topology_selection_kind::none:
+      return "none";
+    case chart_spr_topology_selection_kind::explicit_certificate:
+      return "explicit_certificate";
+    case chart_spr_topology_selection_kind::deterministic_selector:
+      return "deterministic_selector";
+  }
+  return "unknown";
+}
+
 struct chart_spr_production_signature {
   // Stable across dense overlay materialization/rebuild.  In-process reports
   // use taxon IDs; cross-run reports can translate them to sample IDs.
   std::vector<taxon_id> parent_taxa;
   std::vector<std::vector<taxon_id>> child_taxa;
+
+  bool operator==(chart_spr_production_signature const&) const = default;
 };
 
 struct chart_spr_topology_certificate {
@@ -113,11 +157,77 @@ struct chart_spr_topology_selection {
   std::optional<chart_spr_topology_certificate> certificate;
 };
 
+inline chart_spr_production_signature chart_spr_production_signature_for_ref(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    overlay_production_ref ref) {
+  chart_spr_production_signature signature;
+  if (ref.space == overlay_id_space::base) {
+    if (ref.id == no_production || ref.id >= base.productions.size()) {
+      throw std::runtime_error(
+          "chart SPR topology certificate: base production ref out of range");
+    }
+    auto const& prod = base.productions[ref.id];
+    signature.parent_taxa = base.clades[prod.parent].taxa;
+    signature.child_taxa.reserve(prod.children.size());
+    for (auto child : prod.children) {
+      signature.child_taxa.push_back(base.clades[child].taxa);
+    }
+  } else {
+    if (ref.id == no_production ||
+        ref.id >= candidate.added_productions.size()) {
+      throw std::runtime_error(
+          "chart SPR topology certificate: temp production ref out of range");
+    }
+    auto const& prod = candidate.added_productions[ref.id];
+    signature.parent_taxa =
+        chart_spr_clade_taxa_for_ref(base, candidate, prod.parent);
+    signature.child_taxa.reserve(prod.children.size());
+    for (auto child : prod.children) {
+      signature.child_taxa.push_back(
+          chart_spr_clade_taxa_for_ref(base, candidate, child));
+    }
+  }
+  std::sort(signature.parent_taxa.begin(), signature.parent_taxa.end());
+  for (auto& child : signature.child_taxa) {
+    std::sort(child.begin(), child.end());
+  }
+  std::sort(signature.child_taxa.begin(), signature.child_taxa.end());
+  return signature;
+}
+
+inline chart_spr_topology_certificate make_chart_spr_topology_certificate(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    std::vector<overlay_production_ref> before,
+    std::vector<overlay_production_ref> after) {
+  chart_spr_topology_certificate certificate;
+  certificate.before_overlay_productions = std::move(before);
+  certificate.after_overlay_productions = std::move(after);
+  certificate.before_signatures.reserve(
+      certificate.before_overlay_productions.size());
+  for (auto ref : certificate.before_overlay_productions) {
+    certificate.before_signatures.push_back(
+        chart_spr_production_signature_for_ref(base, candidate, ref));
+  }
+  certificate.after_signatures.reserve(
+      certificate.after_overlay_productions.size());
+  for (auto ref : certificate.after_overlay_productions) {
+    certificate.after_signatures.push_back(
+        chart_spr_production_signature_for_ref(base, candidate, ref));
+  }
+  return certificate;
+}
+
 struct chart_cache_options {
   std::size_t max_cached_patterns = 0;  // 0 = all patterns
   std::size_t memory_budget_bytes = 0;  // 0 = no explicit budget
   std::size_t candidate_batch_size = 0; // 0 = choose from memory budget
 };
+
+struct chart_spr_search_state;
+
+using chart_spr_topology_selection_provider = std::function<
+    std::optional<chart_spr_topology_selection>(
+        chart_spr_search_state const&, grammar_spr_candidate const&)>;
 
 struct chart_spr_search_options {
   std::size_t max_iterations = 1;
@@ -133,6 +243,15 @@ struct chart_spr_search_options {
   multisite_trim_options exact_trim = {};
   chart_cache_options cache = {};
 
+  // Optional hook for fixed_topology_exact callers that already have a
+  // complete before/after topology certificate (for example, projected
+  // sampled-tree moves). If absent, fixed_topology_exact uses the deterministic
+  // selector named below and records the resulting certificate on each scored
+  // candidate.
+  chart_spr_topology_selection_provider topology_selection_provider = {};
+  std::string fixed_topology_selector_name =
+      "first_reachable_overlay_topology";
+
   bool materialize_accepted_moves = true;
   bool rebuild_after_accept = true;  // conservative first production default
   bool verify_local_against_full_for_tests = false;
@@ -145,10 +264,33 @@ enum class chart_spr_score_kind {
   grammar_exact,
 };
 
+inline char const* chart_spr_score_kind_name(chart_spr_score_kind kind) {
+  switch (kind) {
+    case chart_spr_score_kind::composite_lower_bound:
+      return "composite_lower_bound";
+    case chart_spr_score_kind::fixed_topology_exact:
+      return "fixed_topology_exact";
+    case chart_spr_score_kind::grammar_exact:
+      return "grammar_exact";
+  }
+  return "unknown";
+}
+
 enum class chart_spr_score_convention {
   active_only,
   full_with_invariants,
 };
+
+inline char const* chart_spr_score_convention_name(
+    chart_spr_score_convention convention) {
+  switch (convention) {
+    case chart_spr_score_convention::active_only:
+      return "active_only";
+    case chart_spr_score_convention::full_with_invariants:
+      return "full_with_invariants";
+  }
+  return "unknown";
+}
 
 struct chart_spr_objective_score {
   spr_score_result value;
@@ -181,9 +323,19 @@ struct affected_clade_distribution {
 
 struct chart_spr_iteration_result {
   std::size_t iteration = 0;
+  chart_spr_acceptance_mode acceptance_mode =
+      chart_spr_acceptance_mode::exact_multisite;
+  chart_spr_candidate_selection_mode candidate_selection =
+      chart_spr_candidate_selection_mode::lower_bound_top_k;
+  chart_spr_candidate_generation_stats candidate_generation;
   std::size_t candidates_generated = 0;
   std::size_t candidates_scored = 0;
   std::size_t candidates_exact_verified = 0;
+  std::size_t candidate_score_failures = 0;
+  std::size_t local_improving_candidates = 0;
+  std::size_t locally_ranked_candidates_retained = 0;
+  bool unverified_candidates_may_contain_improvements = false;
+  std::string no_accept_reason;
   affected_clade_distribution affected_distribution;
   std::optional<chart_spr_candidate_score> accepted;
   std::uint64_t state_score_before = 0;
@@ -576,8 +728,10 @@ struct chart_spr_search_state {
   std::uint64_t composite_lower_bound_with_invariants = 0;
 
   // Active-pattern-only exact result.  Add invariant_constant_offset exactly
-  // once when comparing/reporting the full objective.
-  std::optional<multisite_trim_result> exact_trim_active_only;
+  // once when comparing/reporting the full objective.  This is mutable so the
+  // Phase-4 exact acceptance gate can lazily build and then reuse the current
+  // state's old exact score even when verification APIs take a const state.
+  mutable std::optional<multisite_trim_result> exact_trim_active_only;
 
   mutable chart_spr_search_counters counters;
 };
@@ -1586,6 +1740,838 @@ inline affected_clade_distribution summarize_affected_clade_counts(
   summary.p95 = counts[p95_index - 1];
   summary.max = counts.back();
   return summary;
+}
+
+inline void record_chart_spr_candidate_generation_stats(
+    chart_spr_candidate_generation_stats const& stats,
+    chart_spr_search_counters& counters) {
+  counters.upward_path_iterator_steps += stats.upward_path_iterator_steps;
+  counters.upward_paths_completed += stats.upward_paths_completed;
+  counters.path_pairs_considered += stats.path_pairs_considered;
+  counters.candidates_constructed += stats.candidates_constructed;
+  counters.candidates_pruned_before_construction +=
+      stats.candidates_pruned_before_construction;
+  counters.candidates_pruned_after_construction +=
+      stats.candidates_pruned_after_construction;
+  counters.candidates_generated_after_dedup +=
+      stats.candidates_generated_after_dedup;
+  if (stats.stop_reason == chart_spr_candidate_stop_reason::candidate_cap) {
+    ++counters.candidate_cap_cutoffs;
+  }
+  if (stats.stop_reason == chart_spr_candidate_stop_reason::path_budget) {
+    ++counters.path_budget_cutoffs;
+  }
+}
+
+inline std::uint64_t chart_spr_add_invariant_offset(
+    std::uint64_t active_score, chart_spr_search_state const& state,
+    std::string const& label) {
+  return chart_multisite_detail::checked_add_u64(
+      active_score, state.invariant_constant_offset, label);
+}
+
+inline chart_spr_objective_score make_chart_spr_objective_score(
+    spr_score_result value, chart_spr_score_kind kind,
+    chart_spr_score_convention convention,
+    std::uint64_t invariant_offset_applied = 0) {
+  chart_spr_objective_score score;
+  score.value = value;
+  score.kind = kind;
+  score.convention = convention;
+  score.invariant_offset_applied = invariant_offset_applied;
+  return score;
+}
+
+inline multisite_trim_result const& ensure_chart_spr_state_exact_trim(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options = {}) {
+  state.active_patterns.assert_no_skipped_invariant_metadata();
+  if (!state.exact_trim_active_only) {
+    state.exact_trim_active_only = build_multisite_trim_active(
+        state.grammar, state.active_patterns, state.chart_opts,
+        trim_options);
+  }
+  return *state.exact_trim_active_only;
+}
+
+inline std::uint64_t chart_spr_state_exact_score_with_invariants(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options = {}) {
+  auto const& trim = ensure_chart_spr_state_exact_trim(state, trim_options);
+  return chart_spr_add_invariant_offset(
+      trim.optimum, state, "chart-SPR exact state invariant offset");
+}
+
+// Phase-4 exact verification gate.  This intentionally does not call the
+// legacy diagnostic exact multisite helper: the current state's
+// old exact active-pattern score is read from (or lazily built into)
+// state.exact_trim_active_only, and only the candidate's new materialized
+// overlay grammar is trimmed here.  Overlay materialization is counted in the
+// exact-verification bucket, not as local scoring and not as accepted-state
+// sidecar rebuilding.
+inline chart_spr_candidate_score verify_candidate_exact_against_state(
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate,
+    multisite_trim_options const& trim_options = {}) {
+  if (!candidate.valid) return candidate;
+  ++state.counters.exact_verifications;
+
+  try {
+    auto const& old_trim =
+        ensure_chart_spr_state_exact_trim(state, trim_options);
+    auto overlay = overlay_from_candidate(state.grammar, candidate.candidate);
+    auto materialized = materialize_overlay_grammar(overlay);
+    ++state.counters.full_overlay_materializations;
+    ++state.counters.overlay_materializations_for_exact_verification;
+
+    auto new_trim = build_multisite_trim_active(
+        materialized.grammar, state.active_patterns, state.chart_opts,
+        trim_options);
+
+    auto old_full = chart_spr_add_invariant_offset(
+        old_trim.optimum, state,
+        "chart-SPR exact old-score invariant offset");
+    auto new_full = chart_spr_add_invariant_offset(
+        new_trim.optimum, state,
+        "chart-SPR exact new-score invariant offset");
+    candidate.exact = make_chart_spr_objective_score(
+        spr_score_result{chart_spr_detail::signed_delta(old_full, new_full),
+                         old_full, new_full, true},
+        chart_spr_score_kind::grammar_exact,
+        chart_spr_score_convention::full_with_invariants,
+        state.invariant_constant_offset);
+  } catch (std::exception const& e) {
+    candidate.valid = false;
+    candidate.invalid_reason = e.what();
+  }
+  return candidate;
+}
+
+inline bool chart_spr_topology_selection_has_certificate_or_selector(
+    chart_spr_topology_selection const& selection) {
+  if (selection.kind == chart_spr_topology_selection_kind::none) return false;
+  if (selection.certificate) return true;
+  return !selection.selector_name.empty();
+}
+
+inline std::vector<production_id> chart_spr_base_production_ids_from_refs(
+    std::vector<overlay_production_ref> const& refs) {
+  std::vector<production_id> ids;
+  ids.reserve(refs.size());
+  for (auto ref : refs) {
+    if (ref.space != overlay_id_space::base) {
+      throw std::runtime_error(
+          "fixed_topology_exact certificate: before-topology production "
+          "must refer to the base grammar");
+    }
+    ids.push_back(ref.id);
+  }
+  return ids;
+}
+
+inline production_id chart_spr_dense_production_id_for_ref(
+    overlay_materialization_result const& materialized,
+    overlay_production_ref ref) {
+  production_id dense = no_production;
+  if (ref.space == overlay_id_space::base) {
+    if (ref.id == no_production ||
+        ref.id >= materialized.base_production_to_dense.size()) {
+      throw std::runtime_error(
+          "fixed_topology_exact certificate: base production ref out of "
+          "materialized range");
+    }
+    dense = materialized.base_production_to_dense[ref.id];
+  } else {
+    if (ref.id == no_production ||
+        ref.id >= materialized.temp_production_to_dense.size()) {
+      throw std::runtime_error(
+          "fixed_topology_exact certificate: temp production ref out of "
+          "materialized range");
+    }
+    dense = materialized.temp_production_to_dense[ref.id];
+  }
+  if (dense == no_production ||
+      dense >= materialized.grammar.productions.size()) {
+    throw std::runtime_error(
+        "fixed_topology_exact certificate: selected after-topology "
+        "production is not reachable in the materialized overlay grammar");
+  }
+  return dense;
+}
+
+inline void validate_chart_spr_topology_certificate_signatures(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    chart_spr_topology_certificate const& certificate) {
+  if (certificate.before_signatures.size() !=
+      certificate.before_overlay_productions.size()) {
+    throw std::runtime_error(
+        "fixed_topology_exact certificate: before signature count does not "
+        "match before production refs");
+  }
+  for (std::size_t i = 0; i < certificate.before_signatures.size(); ++i) {
+    auto expected = chart_spr_production_signature_for_ref(
+        base, candidate, certificate.before_overlay_productions[i]);
+    if (!(certificate.before_signatures[i] == expected)) {
+      throw std::runtime_error(
+          "fixed_topology_exact certificate: before production signature "
+          "does not match its overlay ref");
+    }
+  }
+  if (certificate.after_signatures.size() !=
+      certificate.after_overlay_productions.size()) {
+    throw std::runtime_error(
+        "fixed_topology_exact certificate: after signature count does not "
+        "match after production refs");
+  }
+  for (std::size_t i = 0; i < certificate.after_signatures.size(); ++i) {
+    auto expected = chart_spr_production_signature_for_ref(
+        base, candidate, certificate.after_overlay_productions[i]);
+    if (!(certificate.after_signatures[i] == expected)) {
+      throw std::runtime_error(
+          "fixed_topology_exact certificate: after production signature "
+          "does not match its overlay ref");
+    }
+  }
+}
+
+inline bool chart_spr_candidate_removes_base_production(
+    grammar_spr_candidate const& candidate, production_id pid) {
+  for (auto ref : candidate.removed_productions) {
+    if (ref.space == overlay_id_space::base && ref.id == pid) return true;
+  }
+  return false;
+}
+
+inline std::vector<overlay_clade_ref> chart_spr_overlay_production_children(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    overlay_production_ref ref) {
+  std::vector<overlay_clade_ref> children;
+  if (ref.space == overlay_id_space::base) {
+    if (ref.id == no_production || ref.id >= base.productions.size()) {
+      throw std::runtime_error(
+          "fixed_topology_exact selector: base production ref out of range");
+    }
+    auto const& prod = base.productions[ref.id];
+    children.reserve(prod.children.size());
+    for (auto child : prod.children) children.push_back(base_clade_ref(child));
+    return children;
+  }
+  if (ref.id == no_production || ref.id >= candidate.added_productions.size()) {
+    throw std::runtime_error(
+        "fixed_topology_exact selector: temp production ref out of range");
+  }
+  return candidate.added_productions[ref.id].children;
+}
+
+inline bool chart_spr_try_collect_first_base_topology_refs(
+    clade_grammar const& base, clade_id clade,
+    std::vector<std::uint8_t>& clade_state,
+    std::vector<overlay_production_ref>& refs) {
+  if (clade == no_clade || clade >= base.clades.size()) {
+    throw std::runtime_error(
+        "fixed_topology_exact selector: base clade out of range");
+  }
+  if (clade_state[clade] != 0) return false;
+  clade_state[clade] = 1;
+
+  if (base.clades[clade].taxa.size() == 1) {
+    if (!base.productions_by_parent[clade].empty()) {
+      throw std::runtime_error(
+          "fixed_topology_exact selector: singleton clade has productions");
+    }
+    clade_state[clade] = 2;
+    return true;
+  }
+
+  auto choices = base.productions_by_parent[clade];
+  std::sort(choices.begin(), choices.end());
+  for (auto pid : choices) {
+    if (pid == no_production || pid >= base.productions.size()) {
+      throw std::runtime_error(
+          "fixed_topology_exact selector: base production out of range");
+    }
+    auto const& prod = base.productions[pid];
+    if (prod.parent != clade) {
+      throw std::runtime_error(
+          "fixed_topology_exact selector: production parent mismatch");
+    }
+    auto state_snapshot = clade_state;
+    auto ref_size = refs.size();
+    refs.push_back(base_production_ref(pid));
+    bool ok = true;
+    for (auto child : prod.children) {
+      if (!chart_spr_try_collect_first_base_topology_refs(
+              base, child, clade_state, refs)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      clade_state[clade] = 2;
+      return true;
+    }
+    refs.resize(ref_size);
+    clade_state = std::move(state_snapshot);
+  }
+
+  clade_state[clade] = 0;
+  return false;
+}
+
+inline std::vector<overlay_production_ref> chart_spr_first_base_topology_refs(
+    clade_grammar const& base) {
+  std::vector<std::uint8_t> clade_state(base.clades.size(), 0);
+  std::vector<overlay_production_ref> refs;
+  if (!chart_spr_try_collect_first_base_topology_refs(
+          base, base.root_clade, clade_state, refs)) {
+    throw std::runtime_error(
+        "fixed_topology_exact selector: no complete base topology found");
+  }
+  return refs;
+}
+
+inline std::uint8_t chart_spr_overlay_clade_state(
+    std::vector<std::uint8_t> const& base_state,
+    std::vector<std::uint8_t> const& temp_state, overlay_clade_ref ref) {
+  if (ref.space == overlay_id_space::base) {
+    if (ref.id == no_clade || ref.id >= base_state.size()) {
+      throw std::runtime_error(
+          "fixed_topology_exact selector: base clade state out of range");
+    }
+    return base_state[ref.id];
+  }
+  if (ref.id == no_clade || ref.id >= temp_state.size()) {
+    throw std::runtime_error(
+        "fixed_topology_exact selector: temp clade state out of range");
+  }
+  return temp_state[ref.id];
+}
+
+inline void chart_spr_set_overlay_clade_state(
+    std::vector<std::uint8_t>& base_state,
+    std::vector<std::uint8_t>& temp_state, overlay_clade_ref ref,
+    std::uint8_t value) {
+  if (ref.space == overlay_id_space::base) {
+    if (ref.id == no_clade || ref.id >= base_state.size()) {
+      throw std::runtime_error(
+          "fixed_topology_exact selector: base clade state out of range");
+    }
+    base_state[ref.id] = value;
+    return;
+  }
+  if (ref.id == no_clade || ref.id >= temp_state.size()) {
+    throw std::runtime_error(
+        "fixed_topology_exact selector: temp clade state out of range");
+  }
+  temp_state[ref.id] = value;
+}
+
+inline std::vector<overlay_production_ref>
+chart_spr_available_overlay_productions_for_parent(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    overlay_clade_ref parent) {
+  std::vector<overlay_production_ref> choices;
+
+  // Prefer candidate-added productions when building the deterministic
+  // after-topology witness.  On tree-like inputs this forces the selected
+  // topology through the SPR rewrite rather than silently falling back to an
+  // unaffected base alternative when both are reachable in a DAG grammar.
+  for (std::size_t i = 0; i < candidate.added_productions.size(); ++i) {
+    if (candidate.added_productions[i].parent == parent) {
+      choices.push_back(temp_production_ref(static_cast<production_id>(i)));
+    }
+  }
+
+  if (parent.space == overlay_id_space::base) {
+    if (parent.id == no_clade || parent.id >= base.productions_by_parent.size()) {
+      throw std::runtime_error(
+          "fixed_topology_exact selector: base parent out of range");
+    }
+    auto base_choices = base.productions_by_parent[parent.id];
+    std::sort(base_choices.begin(), base_choices.end());
+    for (auto pid : base_choices) {
+      if (!chart_spr_candidate_removes_base_production(candidate, pid)) {
+        choices.push_back(base_production_ref(pid));
+      }
+    }
+  }
+  return choices;
+}
+
+inline bool chart_spr_try_collect_first_overlay_topology_refs(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    overlay_clade_ref clade, std::vector<std::uint8_t>& base_state,
+    std::vector<std::uint8_t>& temp_state,
+    std::vector<overlay_production_ref>& refs) {
+  (void)chart_spr_clade_taxa_for_ref(base, candidate, clade);
+  if (chart_spr_overlay_clade_state(base_state, temp_state, clade) != 0) {
+    return false;
+  }
+  chart_spr_set_overlay_clade_state(base_state, temp_state, clade, 1);
+
+  if (chart_spr_clade_taxa_for_ref(base, candidate, clade).size() == 1) {
+    auto choices = chart_spr_available_overlay_productions_for_parent(
+        base, candidate, clade);
+    if (!choices.empty()) {
+      throw std::runtime_error(
+          "fixed_topology_exact selector: singleton overlay clade has "
+          "productions");
+    }
+    chart_spr_set_overlay_clade_state(base_state, temp_state, clade, 2);
+    return true;
+  }
+
+  auto choices = chart_spr_available_overlay_productions_for_parent(
+      base, candidate, clade);
+  for (auto prod_ref : choices) {
+    auto base_snapshot = base_state;
+    auto temp_snapshot = temp_state;
+    auto ref_size = refs.size();
+    refs.push_back(prod_ref);
+    bool ok = true;
+    for (auto child : chart_spr_overlay_production_children(
+             base, candidate, prod_ref)) {
+      if (!chart_spr_try_collect_first_overlay_topology_refs(
+              base, candidate, child, base_state, temp_state, refs)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      chart_spr_set_overlay_clade_state(base_state, temp_state, clade, 2);
+      return true;
+    }
+    refs.resize(ref_size);
+    base_state = std::move(base_snapshot);
+    temp_state = std::move(temp_snapshot);
+  }
+
+  chart_spr_set_overlay_clade_state(base_state, temp_state, clade, 0);
+  return false;
+}
+
+inline std::vector<overlay_production_ref>
+chart_spr_first_overlay_topology_refs(clade_grammar const& base,
+                                      grammar_spr_candidate const& candidate) {
+  std::vector<std::uint8_t> base_state(base.clades.size(), 0);
+  std::vector<std::uint8_t> temp_state(candidate.added_clades.size(), 0);
+  std::vector<overlay_production_ref> refs;
+  if (!chart_spr_try_collect_first_overlay_topology_refs(
+          base, candidate, base_clade_ref(base.root_clade), base_state,
+          temp_state, refs)) {
+    throw std::runtime_error(
+        "fixed_topology_exact selector: no complete overlay topology found");
+  }
+  return refs;
+}
+
+inline bool chart_spr_builtin_fixed_topology_selector_name(
+    std::string const& name) {
+  return name.empty() || name == "first" ||
+         name == "first-reachable-overlay-topology" ||
+         name == "first_reachable_overlay_topology";
+}
+
+inline chart_spr_topology_selection
+make_chart_spr_builtin_fixed_topology_selection(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    std::string selector_name = "first_reachable_overlay_topology") {
+  if (!chart_spr_builtin_fixed_topology_selector_name(selector_name)) {
+    throw std::runtime_error(
+        "fixed_topology_exact selector: unsupported deterministic selector '" +
+        selector_name + "'");
+  }
+  if (selector_name.empty() || selector_name == "first" ||
+      selector_name == "first-reachable-overlay-topology") {
+    selector_name = "first_reachable_overlay_topology";
+  }
+
+  chart_spr_topology_selection selection;
+  selection.kind = chart_spr_topology_selection_kind::deterministic_selector;
+  selection.selector_name = std::move(selector_name);
+  selection.certificate = make_chart_spr_topology_certificate(
+      base, candidate, chart_spr_first_base_topology_refs(base),
+      chart_spr_first_overlay_topology_refs(base, candidate));
+  return selection;
+}
+
+inline void attach_fixed_topology_selection_for_acceptance(
+    chart_spr_search_state const& state, chart_spr_candidate_score& scored,
+    chart_spr_search_options const& options) {
+  if (!scored.valid || options.acceptance_mode !=
+                           chart_spr_acceptance_mode::fixed_topology_exact) {
+    return;
+  }
+  try {
+    std::optional<chart_spr_topology_selection> selection;
+    if (options.topology_selection_provider) {
+      selection = options.topology_selection_provider(state, scored.candidate);
+    } else {
+      selection = make_chart_spr_builtin_fixed_topology_selection(
+          state.grammar, scored.candidate,
+          options.fixed_topology_selector_name);
+    }
+    if (!selection) {
+      scored.valid = false;
+      scored.invalid_reason =
+          "fixed_topology_exact acceptance requires topology selection; "
+          "the configured provider returned none";
+      return;
+    }
+    scored.topology_selection = std::move(*selection);
+  } catch (std::exception const& e) {
+    scored.valid = false;
+    scored.invalid_reason = e.what();
+  }
+}
+
+inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate) {
+  if (!candidate.valid) return candidate;
+  if (!chart_spr_topology_selection_has_certificate_or_selector(
+          candidate.topology_selection)) {
+    candidate.valid = false;
+    candidate.invalid_reason =
+        "fixed_topology_exact acceptance requires an explicit complete "
+        "topology certificate or a recorded deterministic topology selector; "
+        "a bare grammar_spr_candidate is not exact";
+    return candidate;
+  }
+  if (!candidate.topology_selection.certificate) {
+    candidate.valid = false;
+    candidate.invalid_reason =
+        "fixed_topology_exact deterministic selectors must be resolved to a "
+        "complete topology certificate before verification";
+    return candidate;
+  }
+
+  ++state.counters.exact_verifications;
+  try {
+    state.active_patterns.assert_no_skipped_invariant_metadata();
+    auto const& certificate = *candidate.topology_selection.certificate;
+    validate_chart_spr_topology_certificate_signatures(
+        state.grammar, candidate.candidate, certificate);
+
+    auto before_ids = chart_spr_base_production_ids_from_refs(
+        certificate.before_overlay_productions);
+    auto before_topology = grammar_topology_from_productions(state.grammar,
+                                                            before_ids);
+    auto old_active = score_selected_topology(
+        state.grammar, state.active_patterns.patterns, before_topology,
+        state.chart_opts);
+
+    auto overlay = overlay_from_candidate(state.grammar, candidate.candidate);
+    auto materialized = materialize_overlay_grammar(overlay);
+    ++state.counters.full_overlay_materializations;
+    ++state.counters.overlay_materializations_for_exact_verification;
+
+    std::vector<production_id> after_ids;
+    after_ids.reserve(certificate.after_overlay_productions.size());
+    for (auto ref : certificate.after_overlay_productions) {
+      after_ids.push_back(
+          chart_spr_dense_production_id_for_ref(materialized, ref));
+    }
+    auto after_topology = grammar_topology_from_productions(
+        materialized.grammar, after_ids);
+    auto new_active = score_selected_topology(
+        materialized.grammar, state.active_patterns.patterns, after_topology,
+        state.chart_opts);
+
+    auto old_full = chart_spr_add_invariant_offset(
+        old_active, state,
+        "chart-SPR fixed-topology old-score invariant offset");
+    auto new_full = chart_spr_add_invariant_offset(
+        new_active, state,
+        "chart-SPR fixed-topology new-score invariant offset");
+    candidate.exact = make_chart_spr_objective_score(
+        spr_score_result{chart_spr_detail::signed_delta(old_full, new_full),
+                         old_full, new_full, true},
+        chart_spr_score_kind::fixed_topology_exact,
+        chart_spr_score_convention::full_with_invariants,
+        state.invariant_constant_offset);
+  } catch (std::exception const& e) {
+    candidate.valid = false;
+    candidate.invalid_reason = e.what();
+  }
+  return candidate;
+}
+
+inline chart_spr_candidate_score verify_candidate_for_acceptance(
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate,
+    chart_spr_search_options const& options) {
+  switch (options.acceptance_mode) {
+    case chart_spr_acceptance_mode::lower_bound_heuristic:
+      return candidate;
+    case chart_spr_acceptance_mode::exact_multisite:
+      return verify_candidate_exact_against_state(
+          state, std::move(candidate), options.exact_trim);
+    case chart_spr_acceptance_mode::fixed_topology_exact:
+      return verify_candidate_fixed_topology_exact(state, std::move(candidate));
+  }
+  return candidate;
+}
+
+inline bool chart_spr_candidate_has_accepting_improvement(
+    chart_spr_candidate_score const& candidate,
+    chart_spr_acceptance_mode mode) {
+  if (!candidate.valid) return false;
+  switch (mode) {
+    case chart_spr_acceptance_mode::lower_bound_heuristic:
+      return candidate.lower_bound.value.improves();
+    case chart_spr_acceptance_mode::exact_multisite:
+    case chart_spr_acceptance_mode::fixed_topology_exact:
+      return candidate.exact && candidate.exact->value.improves();
+  }
+  return false;
+}
+
+inline spr_score_result const& chart_spr_candidate_acceptance_score(
+    chart_spr_candidate_score const& candidate,
+    chart_spr_acceptance_mode mode) {
+  if (mode == chart_spr_acceptance_mode::lower_bound_heuristic) {
+    return candidate.lower_bound.value;
+  }
+  if (!candidate.exact) {
+    throw std::runtime_error(
+        "chart SPR acceptance score requested before exact verification");
+  }
+  return candidate.exact->value;
+}
+
+inline bool chart_spr_ranked_candidate_better(
+    clade_grammar const& grammar, chart_spr_candidate_score const& lhs,
+    chart_spr_candidate_score const& rhs) {
+  if (lhs.valid != rhs.valid) return lhs.valid;
+  if (lhs.lower_bound.value.delta != rhs.lower_bound.value.delta) {
+    return lhs.lower_bound.value.delta < rhs.lower_bound.value.delta;
+  }
+  if (lhs.affected_clade_count != rhs.affected_clade_count) {
+    return lhs.affected_clade_count < rhs.affected_clade_count;
+  }
+  return chart_spr_candidate_taxon_signature(grammar, lhs.candidate) <
+         chart_spr_candidate_taxon_signature(grammar, rhs.candidate);
+}
+
+inline bool chart_spr_acceptance_candidate_better(
+    chart_spr_acceptance_mode mode, clade_grammar const& grammar,
+    chart_spr_candidate_score const& lhs,
+    chart_spr_candidate_score const& rhs) {
+  auto const& lscore = chart_spr_candidate_acceptance_score(lhs, mode);
+  auto const& rscore = chart_spr_candidate_acceptance_score(rhs, mode);
+  if (lscore.new_score != rscore.new_score) {
+    return lscore.new_score < rscore.new_score;
+  }
+  if (lscore.delta != rscore.delta) return lscore.delta < rscore.delta;
+  return chart_spr_ranked_candidate_better(grammar, lhs, rhs);
+}
+
+inline constexpr std::size_t chart_spr_rank_unlimited =
+    std::numeric_limits<std::size_t>::max();
+
+inline void chart_spr_insert_ranked_candidate(
+    clade_grammar const& grammar, std::vector<chart_spr_candidate_score>& ranked,
+    chart_spr_candidate_score candidate, std::size_t max_ranked) {
+  if (!candidate.valid || max_ranked == 0) return;
+  auto pos = std::lower_bound(
+      ranked.begin(), ranked.end(), candidate,
+      [&](chart_spr_candidate_score const& existing,
+          chart_spr_candidate_score const& value) {
+        return chart_spr_ranked_candidate_better(grammar, existing, value);
+      });
+  ranked.insert(pos, std::move(candidate));
+  if (max_ranked != chart_spr_rank_unlimited && ranked.size() > max_ranked) {
+    ranked.pop_back();
+  }
+}
+
+inline std::size_t chart_spr_rank_buffer_limit(
+    chart_spr_search_options const& options) {
+  switch (options.acceptance_mode) {
+    case chart_spr_acceptance_mode::lower_bound_heuristic:
+      return 1;
+    case chart_spr_acceptance_mode::fixed_topology_exact:
+    case chart_spr_acceptance_mode::exact_multisite:
+      break;
+  }
+  switch (options.candidate_selection) {
+    case chart_spr_candidate_selection_mode::exhaustive_exact:
+      return chart_spr_rank_unlimited;
+    case chart_spr_candidate_selection_mode::lower_bound_top_k:
+      return options.top_k_exact_verify;
+    case chart_spr_candidate_selection_mode::lower_bound_first_improvement:
+      return 1;
+    case chart_spr_candidate_selection_mode::sampled_or_randomized:
+      throw std::runtime_error(
+          "chart SPR Phase-4 gate: sampled/randomized candidate selection is "
+          "not implemented for grammar-native enumeration");
+  }
+  return options.top_k_exact_verify;
+}
+
+inline grammar_spr_enumeration_options chart_spr_iteration_enumeration_options(
+    chart_spr_search_options const& options) {
+  auto enumeration = options.enumeration;
+  if (options.max_candidates_per_iteration != 0) {
+    enumeration.max_candidates = options.max_candidates_per_iteration;
+    enumeration.max_candidates_is_post_dedup = true;
+  }
+  return enumeration;
+}
+
+inline std::uint64_t chart_spr_iteration_state_score_before(
+    chart_spr_search_state const& state,
+    chart_spr_search_options const& options) {
+  if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite) {
+    return chart_spr_state_exact_score_with_invariants(state,
+                                                       options.exact_trim);
+  }
+  return state.composite_lower_bound_with_invariants;
+}
+
+// Score candidates with the Phase-3 local lower-bound scorer, retain the best
+// candidates according to the configured candidate-selection policy, and apply
+// the Phase-4 acceptance gate.  This function does not mutate/materialize the
+// DAG; Phase 5 is responsible for applying an accepted candidate and rebuilding
+// sidecar state.  Rejected candidates are locally scored only, while exact
+// verification materializes overlays only for the retained verified set.
+inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
+    chart_spr_search_state const& state,
+    chart_spr_search_options options = {}, std::size_t iteration = 0) {
+  validate_supported_chart_cache_options(options.cache);
+  if (options.candidate_selection ==
+      chart_spr_candidate_selection_mode::sampled_or_randomized) {
+    throw std::runtime_error(
+        "chart SPR Phase-4 gate: sampled/randomized candidate selection is "
+        "not implemented for grammar-native enumeration");
+  }
+
+  chart_spr_iteration_result result;
+  result.iteration = iteration;
+  result.acceptance_mode = options.acceptance_mode;
+  result.candidate_selection = options.candidate_selection;
+  result.state_score_before =
+      chart_spr_iteration_state_score_before(state, options);
+  result.state_score_after = result.state_score_before;
+
+  auto enumeration = chart_spr_iteration_enumeration_options(options);
+  std::vector<chart_spr_candidate_score> ranked;
+  auto rank_limit = chart_spr_rank_buffer_limit(options);
+  if (rank_limit != 0 && rank_limit != chart_spr_rank_unlimited) {
+    ranked.reserve(rank_limit);
+  }
+  std::vector<std::size_t> affected_counts;
+
+  auto local_options = local_spr_score_options{};
+  local_options.verify_against_full_overlay =
+      options.verify_local_against_full_for_tests;
+
+  auto generation = for_each_grammar_spr_candidate(
+      state.grammar, enumeration,
+      [&](grammar_spr_candidate const& candidate) {
+        auto scored = score_candidate_locally(state, candidate, local_options);
+        ++result.candidates_scored;
+        if (!scored.valid) {
+          ++result.candidate_score_failures;
+          return true;
+        }
+        affected_counts.push_back(scored.affected_clade_count);
+        if (scored.lower_bound.value.improves()) {
+          ++result.local_improving_candidates;
+        }
+        chart_spr_insert_ranked_candidate(state.grammar, ranked,
+                                          std::move(scored), rank_limit);
+        if (options.candidate_selection ==
+                chart_spr_candidate_selection_mode::lower_bound_first_improvement &&
+            result.local_improving_candidates > 0) {
+          return false;
+        }
+        return true;
+      });
+
+  result.candidate_generation = generation;
+  result.candidates_generated = generation.candidates_generated_after_dedup;
+  result.locally_ranked_candidates_retained = ranked.size();
+  result.affected_distribution =
+      summarize_affected_clade_counts(std::move(affected_counts));
+  record_chart_spr_candidate_generation_stats(generation, state.counters);
+
+  if (options.acceptance_mode ==
+      chart_spr_acceptance_mode::lower_bound_heuristic) {
+    for (auto const& candidate : ranked) {
+      if (chart_spr_candidate_has_accepting_improvement(
+              candidate, options.acceptance_mode)) {
+        result.accepted = candidate;
+        result.state_score_before = candidate.lower_bound.value.old_score;
+        result.state_score_after = candidate.lower_bound.value.new_score;
+        ++state.counters.candidate_accepts_attempted;
+        break;
+      }
+    }
+  } else {
+    std::vector<chart_spr_candidate_score> verified;
+    verified.reserve(ranked.size());
+    for (auto& candidate : ranked) {
+      attach_fixed_topology_selection_for_acceptance(state, candidate, options);
+      auto exact_verifications_before = state.counters.exact_verifications;
+      auto verified_candidate = verify_candidate_for_acceptance(
+          state, std::move(candidate), options);
+      if (state.counters.exact_verifications > exact_verifications_before ||
+          verified_candidate.exact) {
+        ++result.candidates_exact_verified;
+      }
+      verified.push_back(std::move(verified_candidate));
+    }
+
+    for (auto const& candidate : verified) {
+      if (!chart_spr_candidate_has_accepting_improvement(
+              candidate, options.acceptance_mode)) {
+        continue;
+      }
+      if (!result.accepted || chart_spr_acceptance_candidate_better(
+                                  options.acceptance_mode, state.grammar,
+                                  candidate, *result.accepted)) {
+        result.accepted = candidate;
+      }
+    }
+    if (result.accepted) {
+      auto const& accepted_score = chart_spr_candidate_acceptance_score(
+          *result.accepted, options.acceptance_mode);
+      result.state_score_before = accepted_score.old_score;
+      result.state_score_after = accepted_score.new_score;
+      ++state.counters.candidate_accepts_attempted;
+    }
+  }
+
+  if (!result.accepted) {
+    if (result.candidates_scored == 0) {
+      result.no_accept_reason = "no candidates scored";
+    } else if (options.acceptance_mode ==
+               chart_spr_acceptance_mode::lower_bound_heuristic) {
+      result.no_accept_reason = "no lower-bound-improving candidate";
+    } else if (ranked.empty()) {
+      result.no_accept_reason = "no valid locally scored candidates retained";
+    } else {
+      result.no_accept_reason = "no exact-improving verified candidate";
+    }
+  }
+
+  bool generation_truncated =
+      result.candidate_generation.stop_reason !=
+      chart_spr_candidate_stop_reason::exhausted;
+  bool exact_selection_non_exhaustive =
+      options.acceptance_mode !=
+          chart_spr_acceptance_mode::lower_bound_heuristic &&
+      options.candidate_selection !=
+          chart_spr_candidate_selection_mode::exhaustive_exact &&
+      result.candidates_scored > result.candidates_exact_verified;
+  if (generation_truncated || exact_selection_non_exhaustive) {
+    result.unverified_candidates_may_contain_improvements = true;
+  }
+
+  if (result.candidates_scored > (result.accepted ? 1U : 0U)) {
+    state.counters.rejected_moves +=
+        result.candidates_scored - (result.accepted ? 1U : 0U);
+  }
+  return result;
 }
 
 inline void record_chart_spr_local_candidate_score(

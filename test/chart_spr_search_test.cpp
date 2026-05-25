@@ -27,6 +27,15 @@ static larch::test::tiny_tree_node four_taxon_base_tree() {
        tiny_inner("CD", "C", {tiny_leaf("C", "C"), tiny_leaf("D", "C")})});
 }
 
+static larch::test::tiny_tree_node four_taxon_misplaced_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AC", "A", {tiny_leaf("A", "A"), tiny_leaf("C", "C")}),
+       tiny_inner("BD", "A", {tiny_leaf("B", "A"), tiny_leaf("D", "C")})});
+}
+
 struct tiny_chart_spr_fixture {
   larch::phylo_dag dag;
   larch::clade_grammar grammar;
@@ -782,6 +791,282 @@ static void test_eager_diagnostic_enumeration_exposes_cap_after_path_precompute(
   std::println("  PASS");
 }
 
+static void test_exact_verification_reuses_state_old_score() {
+  std::println("test_exact_verification_reuses_state_old_score");
+
+  auto fixture = make_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  auto state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, options);
+  CHECK(state.exact_trim_active_only.has_value());
+
+  auto local = larch::score_candidate_locally(state, fixture.candidates.front());
+  auto exact = larch::verify_candidate_exact_against_state(
+      state, local, options.exact_trim);
+  auto oracle = larch::score_multisite_spr_candidate_exact_oracle(
+      fixture.grammar, fixture.patterns, fixture.candidates.front());
+
+  CHECK(exact.valid);
+  CHECK(exact.exact.has_value());
+  CHECK(exact.exact->kind == larch::chart_spr_score_kind::grammar_exact);
+  CHECK(exact.exact->convention ==
+        larch::chart_spr_score_convention::full_with_invariants);
+  CHECK(exact.exact->value.old_score == oracle.old_score);
+  CHECK(exact.exact->value.new_score == oracle.new_score);
+  CHECK(exact.exact->value.delta == oracle.delta);
+  CHECK(state.counters.exact_verifications == 1);
+  CHECK(state.counters.full_overlay_materializations == 1);
+  CHECK(state.counters.overlay_materializations_for_exact_verification == 1);
+  CHECK(state.counters.overlay_materializations_for_oracle == 0);
+  CHECK(state.counters.full_composite_rebuilds == 0);
+
+  std::println("  PASS");
+}
+
+static void test_top_k_exact_verification_count_is_bounded() {
+  std::println("test_top_k_exact_verification_count_is_bounded");
+
+  auto fixture = make_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 1;
+  options.enumeration.max_candidates = 6;
+  auto state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, options);
+
+  auto iteration = larch::run_chart_spr_acceptance_iteration(state, options);
+
+  CHECK(iteration.candidates_scored > 1);
+  CHECK(iteration.candidates_exact_verified <= 1);
+  CHECK(state.counters.exact_verifications <= 1);
+  CHECK(state.counters.overlay_materializations_for_exact_verification ==
+        state.counters.exact_verifications);
+  CHECK(state.counters.local_candidate_scores == iteration.candidates_scored);
+  CHECK(state.counters.full_composite_rebuilds == 0);
+  CHECK(iteration.unverified_candidates_may_contain_improvements);
+  CHECK(std::string{larch::chart_spr_candidate_selection_mode_name(
+            iteration.candidate_selection)} == "lower_bound_top_k");
+
+  std::println("  PASS");
+}
+
+static void test_lower_bound_heuristic_acceptance_is_explicit() {
+  std::println("test_lower_bound_heuristic_acceptance_is_explicit");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, grammar);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::lower_bound_heuristic;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.enumeration.max_candidates = 0;
+  auto state = larch::build_chart_spr_search_state(dag, grammar, patterns);
+  auto iteration = larch::run_chart_spr_acceptance_iteration(state, options);
+
+  CHECK(iteration.local_improving_candidates > 0);
+  CHECK(iteration.accepted.has_value());
+  CHECK(iteration.accepted->lower_bound.value.improves());
+  CHECK(!iteration.accepted->exact.has_value());
+  CHECK(state.counters.exact_verifications == 0);
+  CHECK(state.counters.overlay_materializations_for_exact_verification == 0);
+  CHECK(state.counters.accepted_moves == 0);
+  CHECK(state.counters.candidate_accepts_attempted == 1);
+  CHECK(std::string{larch::chart_spr_acceptance_mode_name(
+            iteration.acceptance_mode)} == "lower_bound_heuristic");
+
+  std::println("  PASS");
+}
+
+static void test_fixed_topology_exact_rejects_bare_candidate() {
+  std::println("test_fixed_topology_exact_rejects_bare_candidate");
+
+  auto fixture = make_fixture();
+  auto state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, fixture.patterns);
+  auto local = larch::score_candidate_locally(state, fixture.candidates.front());
+  auto rejected = larch::verify_candidate_fixed_topology_exact(state, local);
+
+  CHECK(!rejected.valid);
+  CHECK(rejected.invalid_reason.find("requires") != std::string::npos);
+  CHECK(!rejected.exact.has_value());
+  CHECK(state.counters.exact_verifications == 0);
+
+  std::println("  PASS");
+}
+
+static void test_fixed_topology_iteration_uses_default_selector() {
+  std::println("test_fixed_topology_iteration_uses_default_selector");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, grammar);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 4;
+  auto state = larch::build_chart_spr_search_state(dag, grammar, patterns);
+  auto iteration = larch::run_chart_spr_acceptance_iteration(state, options);
+
+  CHECK(iteration.candidates_exact_verified > 0);
+  CHECK(state.counters.exact_verifications ==
+        iteration.candidates_exact_verified);
+  CHECK(iteration.accepted.has_value());
+  CHECK(iteration.accepted->exact.has_value());
+  CHECK(iteration.accepted->exact->value.improves());
+  CHECK(iteration.accepted->topology_selection.kind ==
+        larch::chart_spr_topology_selection_kind::deterministic_selector);
+  CHECK(iteration.accepted->topology_selection.selector_name ==
+        "first_reachable_overlay_topology");
+  CHECK(iteration.accepted->topology_selection.certificate.has_value());
+  CHECK(state.counters.accepted_moves == 0);
+  CHECK(state.counters.candidate_accepts_attempted == 1);
+
+  std::println("  PASS");
+}
+
+static void test_fixed_topology_exact_certificate_scores_selected_topology() {
+  std::println("test_fixed_topology_exact_certificate_scores_selected_topology");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, grammar);
+  auto candidates = larch::enumerate_grammar_spr_candidates(grammar);
+  auto state = larch::build_chart_spr_search_state(dag, grammar, patterns);
+
+  std::optional<larch::chart_spr_candidate_score> chosen;
+  for (auto const& candidate : candidates) {
+    auto local = larch::score_candidate_locally(state, candidate);
+    if (local.valid && local.lower_bound.value.improves()) {
+      chosen = std::move(local);
+      break;
+    }
+  }
+  CHECK(chosen.has_value());
+
+  std::vector<larch::overlay_production_ref> before_refs;
+  for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
+    before_refs.push_back(larch::base_production_ref(
+        static_cast<larch::production_id>(pid)));
+  }
+  auto overlay = larch::overlay_from_candidate(grammar, chosen->candidate);
+  auto materialized = larch::materialize_overlay_grammar(overlay);
+  auto after_refs = materialized.dense_production_to_ref;
+
+  chosen->topology_selection.kind =
+      larch::chart_spr_topology_selection_kind::explicit_certificate;
+  chosen->topology_selection.certificate =
+      larch::make_chart_spr_topology_certificate(
+          grammar, chosen->candidate, before_refs, after_refs);
+
+  auto fixed = larch::verify_candidate_fixed_topology_exact(state, *chosen);
+  CHECK(fixed.valid);
+  CHECK(fixed.exact.has_value());
+  CHECK(fixed.exact->kind ==
+        larch::chart_spr_score_kind::fixed_topology_exact);
+  CHECK(fixed.exact->value.improves());
+  CHECK(state.counters.exact_verifications == 1);
+  CHECK(state.counters.overlay_materializations_for_exact_verification == 1);
+
+  std::vector<larch::production_id> before_ids;
+  for (auto ref : before_refs) before_ids.push_back(ref.id);
+  auto before_topology = larch::grammar_topology_from_productions(
+      grammar, before_ids);
+  std::vector<larch::production_id> after_ids;
+  for (std::size_t pid = 0; pid < materialized.grammar.productions.size(); ++pid) {
+    after_ids.push_back(static_cast<larch::production_id>(pid));
+  }
+  auto after_topology = larch::grammar_topology_from_productions(
+      materialized.grammar, after_ids);
+  auto old_score = larch::score_selected_topology(
+      grammar, patterns, before_topology);
+  auto new_score = larch::score_selected_topology(
+      materialized.grammar, patterns, after_topology);
+  CHECK(fixed.exact->value.old_score == old_score);
+  CHECK(fixed.exact->value.new_score == new_score);
+
+  std::println("  PASS");
+}
+
+static void test_enumeration_truncation_sets_unverified_flag_even_exhaustive() {
+  std::println("test_enumeration_truncation_sets_unverified_flag_even_exhaustive");
+
+  auto fixture = make_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.enumeration.max_candidates = 1;
+  auto state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, options);
+  auto iteration = larch::run_chart_spr_acceptance_iteration(state, options);
+
+  CHECK(iteration.candidate_generation.stop_reason ==
+        larch::chart_spr_candidate_stop_reason::candidate_cap);
+  CHECK(iteration.candidates_scored == 1);
+  CHECK(iteration.candidates_exact_verified == 1);
+  CHECK(iteration.unverified_candidates_may_contain_improvements);
+
+  std::println("  PASS");
+}
+
+static void test_exhaustive_exact_acceptance_matches_oracle() {
+  std::println("test_exhaustive_exact_acceptance_matches_oracle");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, grammar);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.enumeration.max_candidates = 0;
+  auto state = larch::build_chart_spr_search_state(dag, grammar, patterns);
+  auto iteration = larch::run_chart_spr_acceptance_iteration(state, options);
+
+  auto candidates = larch::enumerate_grammar_spr_candidates(
+      grammar, options.enumeration);
+  std::optional<larch::spr_score_result> best_oracle;
+  for (auto const& candidate : candidates) {
+    auto oracle = larch::score_multisite_spr_candidate_exact_oracle(
+        grammar, patterns, candidate);
+    if (!oracle.improves()) continue;
+    if (!best_oracle || oracle.new_score < best_oracle->new_score ||
+        (oracle.new_score == best_oracle->new_score &&
+         oracle.delta < best_oracle->delta)) {
+      best_oracle = oracle;
+    }
+  }
+
+  CHECK(iteration.candidates_exact_verified == iteration.candidates_scored);
+  CHECK(state.counters.exact_verifications == iteration.candidates_scored);
+  CHECK(iteration.unverified_candidates_may_contain_improvements == false);
+  if (best_oracle) {
+    CHECK(iteration.accepted.has_value());
+    CHECK(iteration.accepted->exact.has_value());
+    CHECK(iteration.accepted->exact->value.new_score ==
+          best_oracle->new_score);
+    CHECK(iteration.accepted->exact->value.delta == best_oracle->delta);
+  } else {
+    CHECK(!iteration.accepted.has_value());
+  }
+
+  std::println("  PASS");
+}
+
 int main() {
   test_lower_bound_oracle_counters_show_full_rebuild_cost();
   test_local_rejected_candidate_counter_guardrail();
@@ -806,6 +1091,14 @@ int main() {
   test_streaming_candidate_cap_stops_before_eager_path_precompute();
   test_streaming_path_pair_budget_stops_early();
   test_eager_diagnostic_enumeration_exposes_cap_after_path_precompute();
+  test_exact_verification_reuses_state_old_score();
+  test_top_k_exact_verification_count_is_bounded();
+  test_lower_bound_heuristic_acceptance_is_explicit();
+  test_fixed_topology_exact_rejects_bare_candidate();
+  test_fixed_topology_iteration_uses_default_selector();
+  test_fixed_topology_exact_certificate_scores_selected_topology();
+  test_enumeration_truncation_sets_unverified_flag_even_exhaustive();
+  test_exhaustive_exact_acceptance_matches_oracle();
   std::println("chart_spr_search_test PASS");
   return 0;
 }
