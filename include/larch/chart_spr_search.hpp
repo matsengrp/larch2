@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -26,6 +27,11 @@ struct chart_spr_search_counters {
   // state sidecar rebuilds and must be reported separately.
   std::size_t full_overlay_materializations = 0;
   std::size_t overlay_materializations_for_oracle = 0;
+  // Phase-1 bridge path: local scorer reuses cached base charts but still
+  // materializes one dense overlay per candidate until Phase-3 overlay-delta
+  // scoring replaces this implementation detail.  Count it separately from
+  // oracle/debug materializations.
+  std::size_t overlay_materializations_for_local_scoring_bridge = 0;
   std::size_t overlay_materializations_for_exact_verification = 0;
   std::size_t overlay_materializations_for_accept_materialization = 0;
   std::size_t sidecar_rebuilds_after_accept = 0;
@@ -59,37 +65,106 @@ struct chart_spr_search_counters {
   std::size_t reachability_full_grammar_like_passes = 0;
 };
 
-enum class chart_spr_candidate_stop_reason {
-  exhausted,
-  candidate_cap,
-  path_budget,
-  callback_stop,
+enum class chart_spr_acceptance_mode {
+  exact_multisite,
+  fixed_topology_exact,
+  lower_bound_heuristic,
 };
 
-inline char const* chart_spr_candidate_stop_reason_name(
-    chart_spr_candidate_stop_reason reason) {
-  switch (reason) {
-    case chart_spr_candidate_stop_reason::exhausted:
-      return "exhausted";
-    case chart_spr_candidate_stop_reason::candidate_cap:
-      return "candidate_cap";
-    case chart_spr_candidate_stop_reason::path_budget:
-      return "path_budget";
-    case chart_spr_candidate_stop_reason::callback_stop:
-      return "callback_stop";
-  }
-  return "unknown";
-}
+enum class chart_spr_candidate_selection_mode {
+  exhaustive_exact,
+  lower_bound_top_k,
+  lower_bound_first_improvement,
+  sampled_or_randomized,
+};
 
-struct chart_spr_candidate_generation_stats {
-  std::size_t upward_path_iterator_steps = 0;
-  std::size_t upward_paths_completed = 0;
-  std::size_t path_pairs_considered = 0;
-  std::size_t candidates_constructed = 0;
-  std::size_t candidates_pruned_before_construction = 0;
-  std::size_t candidates_pruned_after_construction = 0;
-  chart_spr_candidate_stop_reason stop_reason =
-      chart_spr_candidate_stop_reason::exhausted;
+enum class chart_spr_topology_selection_kind {
+  none,
+  explicit_certificate,
+  deterministic_selector,
+};
+
+struct chart_spr_production_signature {
+  // Stable across dense overlay materialization/rebuild.  In-process reports
+  // use taxon IDs; cross-run reports can translate them to sample IDs.
+  std::vector<taxon_id> parent_taxa;
+  std::vector<std::vector<taxon_id>> child_taxa;
+};
+
+struct chart_spr_topology_certificate {
+  // Overlay refs are stable inside one candidate overlay and avoid tying the
+  // certificate to dense materialized production IDs.
+  std::vector<overlay_production_ref> before_overlay_productions;
+  std::vector<overlay_production_ref> after_overlay_productions;
+
+  // Taxon-key signatures let the certificate survive overlay materialization,
+  // accepted-state rebuilds, and diagnostic JSON round trips.
+  std::vector<chart_spr_production_signature> before_signatures;
+  std::vector<chart_spr_production_signature> after_signatures;
+};
+
+struct chart_spr_topology_selection {
+  chart_spr_topology_selection_kind kind =
+      chart_spr_topology_selection_kind::none;
+  std::string selector_name;
+  std::optional<chart_spr_topology_certificate> certificate;
+};
+
+struct chart_cache_options {
+  std::size_t max_cached_patterns = 0;  // 0 = all patterns
+  std::size_t memory_budget_bytes = 0;  // 0 = no explicit budget
+  std::size_t candidate_batch_size = 0; // 0 = choose from memory budget
+};
+
+struct chart_spr_search_options {
+  std::size_t max_iterations = 1;
+  std::size_t max_candidates_per_iteration = 0;  // 0 = unlimited
+  std::size_t top_k_exact_verify = 16;
+  chart_spr_acceptance_mode acceptance_mode =
+      chart_spr_acceptance_mode::exact_multisite;
+  chart_spr_candidate_selection_mode candidate_selection =
+      chart_spr_candidate_selection_mode::lower_bound_top_k;
+
+  grammar_spr_enumeration_options enumeration = {};
+  chart_options chart = {};
+  multisite_trim_options exact_trim = {};
+  chart_cache_options cache = {};
+
+  bool materialize_accepted_moves = true;
+  bool rebuild_after_accept = true;  // conservative first production default
+  bool verify_local_against_full_for_tests = false;
+  std::uint32_t seed = 1;
+};
+
+enum class chart_spr_score_kind {
+  composite_lower_bound,
+  fixed_topology_exact,
+  grammar_exact,
+};
+
+enum class chart_spr_score_convention {
+  active_only,
+  full_with_invariants,
+};
+
+struct chart_spr_objective_score {
+  spr_score_result value;
+  chart_spr_score_kind kind = chart_spr_score_kind::composite_lower_bound;
+  chart_spr_score_convention convention =
+      chart_spr_score_convention::full_with_invariants;
+
+  // Nonzero only when convention == full_with_invariants.  Keeping this field
+  // beside the score makes active-only vs full-objective comparisons explicit.
+  std::uint64_t invariant_offset_applied = 0;
+};
+
+struct chart_spr_candidate_score {
+  grammar_spr_candidate candidate;
+  chart_spr_objective_score lower_bound;
+  std::optional<chart_spr_objective_score> exact;
+  chart_spr_topology_selection topology_selection;
+  std::size_t affected_clade_count = 0;
+  double local_score_ms = 0.0;
 };
 
 struct affected_clade_distribution {
@@ -98,6 +173,136 @@ struct affected_clade_distribution {
   std::size_t p95 = 0;
   std::size_t max = 0;
 };
+
+struct chart_spr_iteration_result {
+  std::size_t iteration = 0;
+  std::size_t candidates_generated = 0;
+  std::size_t candidates_scored = 0;
+  std::size_t candidates_exact_verified = 0;
+  affected_clade_distribution affected_distribution;
+  std::optional<chart_spr_candidate_score> accepted;
+  std::uint64_t state_score_before = 0;
+  std::uint64_t state_score_after = 0;
+};
+
+struct chart_spr_search_result {
+  phylo_dag dag;
+  std::vector<chart_spr_iteration_result> iterations;
+  chart_spr_search_counters counters;
+};
+
+struct chart_spr_search_state {
+  phylo_dag* dag = nullptr;
+  clade_grammar grammar;
+  site_pattern_set patterns;
+  chart_options chart_opts;
+  std::vector<single_site_chart> pattern_charts;
+  std::uint64_t composite_lower_bound_with_invariants = 0;
+  chart_spr_search_counters counters;
+};
+
+inline chart_spr_search_state build_chart_spr_search_state(
+    phylo_dag& dag, clade_grammar grammar, site_pattern_set patterns,
+    chart_options options = {}) {
+  chart_spr_search_state state;
+  state.dag = &dag;
+  state.grammar = std::move(grammar);
+  state.patterns = std::move(patterns);
+  state.chart_opts = options;
+  ++state.counters.base_chart_cache_rebuilds;
+  state.counters.skipped_invariant_sites =
+      state.patterns.skipped_invariant_site_count;
+
+  auto chart_build_options = options;
+  chart_build_options.keep_trace = false;
+  chart_build_options.max_trace_choices = 0;
+  state.pattern_charts.reserve(state.patterns.patterns.size());
+
+  std::uint64_t total = 0;
+  for (auto const& pattern : state.patterns.patterns) {
+    leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
+    auto chart = build_single_site_chart(state.grammar, states,
+                                         chart_build_options);
+    total = chart_multisite_detail::checked_add_u64(
+        total,
+        chart_multisite_detail::weighted_root_score_from_row(
+            chart.inside[state.grammar.root_clade], pattern, options),
+        "chart-SPR cached composite lower bound");
+    state.pattern_charts.push_back(std::move(chart));
+  }
+  if (options.score_ua_edge) {
+    total = chart_multisite_detail::checked_add_u64(
+        total,
+        state.patterns.skipped_invariant_constant_score_with_reference_edge,
+        "chart-SPR skipped invariant UA-edge offset");
+  }
+  state.composite_lower_bound_with_invariants = total;
+  return state;
+}
+
+// Phase-1 local scoring entry point.  This uses the existing materialized
+// overlay-local recompute as the implementation bridge until the Phase-3
+// lightweight overlay-delta scorer replaces the materialization step.  It
+// reuses the state's cached base charts and does not call
+// build_composite_chart_score() per rejected candidate.  Bridge overlay
+// materializations are counted as local-scoring bridge work, not oracle work.
+inline chart_spr_candidate_score score_candidate_locally(
+    chart_spr_search_state& state, grammar_spr_candidate const& candidate) {
+  if (state.pattern_charts.size() != state.patterns.patterns.size()) {
+    throw std::runtime_error(
+        "chart SPR local score: pattern chart cache size mismatch");
+  }
+
+  auto overlay = overlay_from_candidate(state.grammar, candidate);
+  auto materialized = materialize_overlay_grammar(overlay);
+  ++state.counters.full_overlay_materializations;
+  ++state.counters.overlay_materializations_for_local_scoring_bridge;
+  ++state.counters.local_candidate_scores;
+
+  std::uint64_t new_score = 0;
+  std::size_t affected_count = 0;
+  auto chart_build_options = state.chart_opts;
+  chart_build_options.keep_trace = false;
+  chart_build_options.max_trace_choices = 0;
+
+  for (std::size_t pattern_index = 0;
+       pattern_index < state.patterns.patterns.size(); ++pattern_index) {
+    auto const& pattern = state.patterns.patterns[pattern_index];
+    leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
+    auto local = build_single_site_overlay_chart_locally(
+        overlay, materialized, state.pattern_charts[pattern_index], states,
+        chart_build_options);
+    affected_count = std::max(affected_count, local.affected_clade_count);
+    new_score = chart_multisite_detail::checked_add_u64(
+        new_score,
+        chart_multisite_detail::weighted_root_score_from_row(
+            local.chart.inside[materialized.grammar.root_clade], pattern,
+            state.chart_opts),
+        "chart-SPR local candidate lower bound");
+  }
+  if (state.chart_opts.score_ua_edge) {
+    new_score = chart_multisite_detail::checked_add_u64(
+        new_score,
+        state.patterns.skipped_invariant_constant_score_with_reference_edge,
+        "chart-SPR local skipped invariant UA-edge offset");
+  }
+
+  auto old_score = state.composite_lower_bound_with_invariants;
+  chart_spr_candidate_score scored;
+  scored.candidate = candidate;
+  scored.lower_bound.value = spr_score_result{
+      chart_spr_detail::signed_delta(old_score, new_score), old_score,
+      new_score, false};
+  scored.lower_bound.kind = chart_spr_score_kind::composite_lower_bound;
+  scored.lower_bound.convention =
+      chart_spr_score_convention::full_with_invariants;
+  if (state.chart_opts.score_ua_edge) {
+    scored.lower_bound.invariant_offset_applied =
+        state.patterns.skipped_invariant_constant_score_with_reference_edge;
+  }
+  scored.affected_clade_count = affected_count;
+  return scored;
+}
 
 inline affected_clade_distribution summarize_affected_clade_counts(
     std::vector<std::size_t> counts) {
@@ -298,6 +503,7 @@ enumerate_grammar_spr_candidates_eager_diagnostic(
             }
 
             result.candidates.push_back(std::move(*candidate));
+            ++result.stats.candidates_generated_after_dedup;
             if (counters != nullptr) ++counters->candidates_generated_after_dedup;
 
             if (options.max_candidates != 0 &&

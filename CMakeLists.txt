@@ -380,6 +380,45 @@ set_tests_properties(dagutil_chart_spr_helper_benchmark
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "full_composite_rebuilds: 2")
 
+add_test(NAME dagutil_chart_spr_candidates_streaming
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-spr-candidates
+                 --chart-spr-max-candidates 1
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_chart_spr_candidates_streaming
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "stop_reason: candidate_cap")
+
+add_test(NAME dagutil_chart_spr_score_local
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-spr-score-local
+                 --chart-spr-max-candidates 1
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_chart_spr_score_local
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "chart_spr_score_local:")
+
+add_test(NAME dagutil_chart_spr_search
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-spr-search
+                 --chart-spr-max-candidates 1
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_chart_spr_search
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "search_mode: phase1_rank_only_no_dag_mutation")
+
 add_test(NAME dagutil_chart_spr_helper_benchmark_seedtree_larger_fixture
          COMMAND dagutil
                  --tree-pb data/seedtree/seedtree.pb.gz

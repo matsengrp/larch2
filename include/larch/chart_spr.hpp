@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -134,9 +135,73 @@ struct single_site_overlay_recompute_result {
   bool used_full_rebuild = false;
 };
 
+enum class chart_spr_candidate_source {
+  grammar,
+  sampled_tree,
+  hybrid,
+};
+
+// Candidate cap/budget stop reason for the public streaming enumerator.
+enum class chart_spr_candidate_stop_reason {
+  exhausted,
+  candidate_cap,
+  path_budget,
+  callback_stop,
+};
+
+inline char const* chart_spr_candidate_stop_reason_name(
+    chart_spr_candidate_stop_reason reason) {
+  switch (reason) {
+    case chart_spr_candidate_stop_reason::exhausted:
+      return "exhausted";
+    case chart_spr_candidate_stop_reason::candidate_cap:
+      return "candidate_cap";
+    case chart_spr_candidate_stop_reason::path_budget:
+      return "path_budget";
+    case chart_spr_candidate_stop_reason::callback_stop:
+      return "callback_stop";
+  }
+  return "unknown";
+}
+
 struct grammar_spr_enumeration_options {
+  // Candidate cap semantics are post-dedup by default because that is what the
+  // optimizer consumes.  Diagnostics should also report pre-dedup constructed
+  // and pruned counts from chart_spr_candidate_generation_stats.
+  std::size_t max_candidates = 0;  // 0 = unlimited
+  bool max_candidates_is_post_dedup = true;
+
+  // Path budgets stop lazy expansion before constructing later candidates.
   // 0 means unlimited.
-  std::size_t max_candidates = 0;
+  std::size_t max_upward_path_expansions = 0;
+  std::size_t max_path_pairs_considered = 0;
+
+  // Taxon-count filters; 0 upper bound means unlimited.
+  std::size_t min_moved_clade_size = 1;
+  std::size_t max_moved_clade_size = 0;
+  std::size_t min_target_clade_size = 1;
+  std::size_t max_target_clade_size = 0;
+  std::size_t max_estimated_affected_clades = 0;
+
+  bool include_root_moves = false;
+  bool include_neutral_or_reversal_candidates = false;
+  chart_spr_candidate_source source = chart_spr_candidate_source::grammar;
+
+  bool randomize_order = false;
+  bool reservoir_sample = false;
+  std::uint32_t seed = 1;
+};
+
+struct chart_spr_candidate_generation_stats {
+  std::size_t upward_path_iterator_steps = 0;
+  std::size_t upward_paths_completed = 0;
+  std::size_t path_pairs_considered = 0;
+  std::size_t candidates_constructed = 0;
+  std::size_t candidates_pruned_before_construction = 0;
+  std::size_t candidates_pruned_after_construction = 0;
+  std::size_t candidates_generated_after_dedup = 0;
+  chart_spr_candidate_stop_reason stop_reason =
+      chart_spr_candidate_stop_reason::exhausted;
 };
 
 struct tree_spr_bootstrap_options {
@@ -920,7 +985,405 @@ inline void append_deduplicated_candidate(
   candidates.push_back(std::move(candidate));
 }
 
+inline bool clade_size_allowed(std::size_t size, std::size_t min_size,
+                               std::size_t max_size) {
+  if (size < min_size) return false;
+  if (max_size != 0 && size > max_size) return false;
+  return true;
+}
+
+inline std::size_t estimate_candidate_affected_clades(
+    grammar_spr_candidate const& candidate) {
+  return candidate.added_clades.size() + candidate.added_productions.size() +
+         candidate.removed_productions.size();
+}
+
+inline std::size_t estimate_candidate_affected_clades_before_construction(
+    upward_path const& source_path, upward_path const& dest_path) {
+  // Cheap path-length proxy used only as an early filter before
+  // grammar_spr_candidate construction.  The final affected-clade count is
+  // candidate/overlay dependent and is reported by the scorer.
+  return 1 + source_path.size() + dest_path.size();
+}
+
+template <typename F>
+bool invoke_candidate_callback(F& callback,
+                               grammar_spr_candidate const& candidate) {
+  if constexpr (std::is_void_v<decltype(callback(candidate))>) {
+    callback(candidate);
+    return true;
+  } else {
+    return static_cast<bool>(callback(candidate));
+  }
+}
+
+struct lazy_upward_path_control {
+  bool budget_exhausted = false;
+  bool callback_stop = false;
+};
+
+template <typename F>
+void for_each_upward_path_to_root_lazy(
+    clade_grammar const& grammar, clade_id start,
+    grammar_spr_enumeration_options const& options,
+    chart_spr_candidate_generation_stats& stats, F&& callback,
+    lazy_upward_path_control& control) {
+  upward_path current;
+  std::set<clade_id> active;
+
+  auto dfs = [&](auto&& self, clade_id clade) -> bool {
+    if (control.budget_exhausted || control.callback_stop) return false;
+    if (clade == grammar.root_clade) {
+      ++stats.upward_paths_completed;
+      if (!callback(current)) {
+        control.callback_stop = true;
+        return false;
+      }
+      return true;
+    }
+    if (!active.insert(clade).second) return true;
+
+    for (auto pid : grammar.productions_by_child[clade]) {
+      auto const& prod = grammar.productions[pid];
+      auto sibling = binary_sibling_for_child(grammar, pid, clade);
+      if (!sibling) continue;
+      if (grammar.clades[prod.parent].taxa.size() <=
+          grammar.clades[clade].taxa.size()) {
+        continue;
+      }
+      if (options.max_upward_path_expansions != 0 &&
+          stats.upward_path_iterator_steps >=
+              options.max_upward_path_expansions) {
+        control.budget_exhausted = true;
+        active.erase(clade);
+        return false;
+      }
+      ++stats.upward_path_iterator_steps;
+      current.push_back(upward_path_step{pid, prod.parent, clade, *sibling});
+      if (!self(self, prod.parent)) {
+        current.pop_back();
+        active.erase(clade);
+        return false;
+      }
+      current.pop_back();
+    }
+
+    active.erase(clade);
+    return true;
+  };
+
+  (void)dfs(dfs, start);
+}
+
 }  // namespace chart_spr_detail
+
+inline std::vector<taxon_id> const& chart_spr_clade_taxa_for_ref(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    overlay_clade_ref ref) {
+  if (ref.space == overlay_id_space::base) {
+    if (ref.id == no_clade || ref.id >= base.clades.size()) {
+      throw std::runtime_error(
+          "chart SPR candidate signature: base clade ref out of range");
+    }
+    return base.clades[ref.id].taxa;
+  }
+  if (ref.id == no_clade || ref.id >= candidate.added_clades.size()) {
+    throw std::runtime_error(
+        "chart SPR candidate signature: temp clade ref out of range");
+  }
+  return candidate.added_clades[ref.id].taxa;
+}
+
+inline void chart_spr_append_taxa_key(std::ostringstream& out,
+                                      std::vector<taxon_id> const& taxa) {
+  out << "{";
+  for (auto taxon : taxa) out << taxon << ",";
+  out << "}";
+}
+
+inline void chart_spr_append_production_taxa_signature(
+    std::ostringstream& out, std::vector<taxon_id> parent_taxa,
+    std::vector<std::vector<taxon_id>> child_taxa) {
+  std::sort(parent_taxa.begin(), parent_taxa.end());
+  for (auto& child : child_taxa) std::sort(child.begin(), child.end());
+  std::sort(child_taxa.begin(), child_taxa.end());
+
+  chart_spr_append_taxa_key(out, parent_taxa);
+  out << "->";
+  for (auto const& child : child_taxa) chart_spr_append_taxa_key(out, child);
+}
+
+inline std::string chart_spr_candidate_taxon_signature(
+    clade_grammar const& base, grammar_spr_candidate const& candidate) {
+  std::ostringstream out;
+  out << "m=";
+  chart_spr_append_taxa_key(
+      out, chart_spr_clade_taxa_for_ref(base, candidate,
+                                        candidate.moved_clade));
+  out << ";op=";
+  chart_spr_append_taxa_key(
+      out, chart_spr_clade_taxa_for_ref(base, candidate,
+                                        candidate.old_parent));
+  out << ";os=";
+  chart_spr_append_taxa_key(
+      out, chart_spr_clade_taxa_for_ref(base, candidate,
+                                        candidate.old_sibling));
+  out << ";nt=";
+  chart_spr_append_taxa_key(
+      out, chart_spr_clade_taxa_for_ref(base, candidate,
+                                        candidate.new_sibling_or_target));
+
+  std::vector<std::vector<taxon_id>> added_clades;
+  added_clades.reserve(candidate.added_clades.size());
+  for (auto const& key : candidate.added_clades) {
+    added_clades.push_back(key.taxa);
+  }
+  std::sort(added_clades.begin(), added_clades.end());
+  out << ";clades=";
+  for (auto const& taxa : added_clades) chart_spr_append_taxa_key(out, taxa);
+
+  std::vector<std::string> removed;
+  for (auto ref : candidate.removed_productions) {
+    if (ref.space != overlay_id_space::base) {
+      throw std::runtime_error(
+          "chart SPR candidate signature: removed production is not base");
+    }
+    if (ref.id == no_production || ref.id >= base.productions.size()) {
+      throw std::runtime_error(
+          "chart SPR candidate signature: removed production out of range");
+    }
+    auto const& prod = base.productions[ref.id];
+    std::vector<std::vector<taxon_id>> child_taxa;
+    child_taxa.reserve(prod.children.size());
+    for (auto child : prod.children) {
+      child_taxa.push_back(base.clades[child].taxa);
+    }
+    std::ostringstream sig;
+    chart_spr_append_production_taxa_signature(
+        sig, base.clades[prod.parent].taxa, std::move(child_taxa));
+    removed.push_back(sig.str());
+  }
+  std::sort(removed.begin(), removed.end());
+  out << ";rm=";
+  for (auto const& signature : removed) out << signature << ";";
+
+  std::vector<std::string> added;
+  added.reserve(candidate.added_productions.size());
+  for (auto const& prod : candidate.added_productions) {
+    std::vector<std::vector<taxon_id>> child_taxa;
+    child_taxa.reserve(prod.children.size());
+    for (auto child : prod.children) {
+      child_taxa.push_back(chart_spr_clade_taxa_for_ref(base, candidate, child));
+    }
+    std::ostringstream sig;
+    chart_spr_append_production_taxa_signature(
+        sig, chart_spr_clade_taxa_for_ref(base, candidate, prod.parent),
+        std::move(child_taxa));
+    added.push_back(sig.str());
+  }
+  std::sort(added.begin(), added.end());
+  out << ";add=";
+  for (auto const& signature : added) out << signature << ";";
+  return out.str();
+}
+
+// Streaming grammar-native SPR candidate enumeration.  Unlike the legacy eager
+// vector helper, this enumerates upward paths lazily for the source/target pair
+// currently under consideration and honors candidate/path budgets before
+// exploring unrelated clades.
+template <typename F>
+chart_spr_candidate_generation_stats for_each_grammar_spr_candidate(
+    clade_grammar const& grammar,
+    grammar_spr_enumeration_options const& options, F&& callback) {
+  using namespace chart_spr_detail;
+  parsimony_chart_detail::validate_chart_grammar(grammar);
+  chart_trim_detail::validate_production_indices(grammar);
+
+  if (options.source != chart_spr_candidate_source::grammar) {
+    throw std::runtime_error(
+        "chart SPR candidate enumeration: only grammar source is supported by "
+        "for_each_grammar_spr_candidate");
+  }
+  if (options.randomize_order || options.reservoir_sample) {
+    throw std::runtime_error(
+        "chart SPR candidate enumeration: randomized/reservoir ordering is "
+        "not implemented for the deterministic grammar stream");
+  }
+  if (options.include_neutral_or_reversal_candidates) {
+    throw std::runtime_error(
+        "chart SPR candidate enumeration: neutral/reversal candidates are not "
+        "implemented in the grammar stream");
+  }
+
+  chart_spr_candidate_generation_stats stats;
+  auto base_lookup = build_clade_lookup(grammar);
+  std::set<std::string> seen;
+
+  auto request_stop = [&](chart_spr_candidate_stop_reason reason) -> bool {
+    if (stats.stop_reason == chart_spr_candidate_stop_reason::exhausted) {
+      stats.stop_reason = reason;
+    }
+    return false;
+  };
+  auto stopped = [&]() {
+    return stats.stop_reason != chart_spr_candidate_stop_reason::exhausted;
+  };
+  auto pre_dedup_cap_reached = [&]() {
+    return options.max_candidates != 0 &&
+           !options.max_candidates_is_post_dedup &&
+           stats.candidates_constructed >= options.max_candidates;
+  };
+  auto post_dedup_cap_reached = [&]() {
+    return options.max_candidates != 0 &&
+           options.max_candidates_is_post_dedup &&
+           stats.candidates_generated_after_dedup >= options.max_candidates;
+  };
+
+  for (std::size_t source_pid_raw = 0;
+       source_pid_raw < grammar.productions.size() && !stopped();
+       ++source_pid_raw) {
+    if (pre_dedup_cap_reached()) {
+      request_stop(chart_spr_candidate_stop_reason::candidate_cap);
+      break;
+    }
+    auto source_pid = static_cast<production_id>(source_pid_raw);
+    auto const& source_prod = grammar.productions[source_pid];
+    if (source_prod.children.size() != 2) continue;
+    if (!options.include_root_moves &&
+        source_prod.parent == grammar.root_clade) {
+      ++stats.candidates_pruned_before_construction;
+      continue;
+    }
+
+    for (std::size_t moved_i = 0; moved_i < 2 && !stopped(); ++moved_i) {
+      auto moved = source_prod.children[moved_i];
+      auto old_sibling = source_prod.children[1 - moved_i];
+      auto const& moved_taxa = grammar.clades[moved].taxa;
+      if (!clade_size_allowed(moved_taxa.size(),
+                              options.min_moved_clade_size,
+                              options.max_moved_clade_size)) {
+        ++stats.candidates_pruned_before_construction;
+        continue;
+      }
+
+      for (clade_id target = 0;
+           target < grammar.clades.size() && !stopped(); ++target) {
+        if (pre_dedup_cap_reached()) {
+          request_stop(chart_spr_candidate_stop_reason::candidate_cap);
+          break;
+        }
+        if (target == moved || target == old_sibling ||
+            target == source_prod.parent ||
+            (!options.include_root_moves && target == grammar.root_clade)) {
+          ++stats.candidates_pruned_before_construction;
+          continue;
+        }
+        auto const& target_taxa = grammar.clades[target].taxa;
+        if (!clade_size_allowed(target_taxa.size(),
+                                options.min_target_clade_size,
+                                options.max_target_clade_size)) {
+          ++stats.candidates_pruned_before_construction;
+          continue;
+        }
+        if (!disjoint_taxa(moved_taxa, target_taxa)) {
+          ++stats.candidates_pruned_before_construction;
+          continue;
+        }
+
+        lazy_upward_path_control source_control;
+        for_each_upward_path_to_root_lazy(
+            grammar, source_prod.parent, options, stats,
+            [&](upward_path const& source_path) -> bool {
+              if (stopped()) return false;
+              if (options.max_estimated_affected_clades != 0 &&
+                  1 + source_path.size() >
+                      options.max_estimated_affected_clades) {
+                ++stats.candidates_pruned_before_construction;
+                return true;
+              }
+              lazy_upward_path_control dest_control;
+              for_each_upward_path_to_root_lazy(
+                  grammar, target, options, stats,
+                  [&](upward_path const& dest_path) -> bool {
+                    if (stopped()) return false;
+                    if (options.max_path_pairs_considered != 0 &&
+                        stats.path_pairs_considered >=
+                            options.max_path_pairs_considered) {
+                      return request_stop(
+                          chart_spr_candidate_stop_reason::path_budget);
+                    }
+                    ++stats.path_pairs_considered;
+                    auto affected_estimate =
+                        estimate_candidate_affected_clades_before_construction(
+                            source_path, dest_path);
+                    if (options.max_estimated_affected_clades != 0 &&
+                        affected_estimate >
+                            options.max_estimated_affected_clades) {
+                      ++stats.candidates_pruned_before_construction;
+                      return true;
+                    }
+
+                    auto candidate = make_general_spr_candidate(
+                        grammar, base_lookup, source_pid, moved, old_sibling,
+                        target, source_path, dest_path);
+                    if (!candidate) {
+                      ++stats.candidates_pruned_after_construction;
+                      return true;
+                    }
+                    ++stats.candidates_constructed;
+
+                    if (options.max_estimated_affected_clades != 0 &&
+                        estimate_candidate_affected_clades(*candidate) >
+                            options.max_estimated_affected_clades) {
+                      ++stats.candidates_pruned_after_construction;
+                      if (pre_dedup_cap_reached()) {
+                        return request_stop(
+                            chart_spr_candidate_stop_reason::candidate_cap);
+                      }
+                      return true;
+                    }
+
+                    auto signature = chart_spr_candidate_taxon_signature(
+                        grammar, *candidate);
+                    if (!seen.insert(std::move(signature)).second) {
+                      ++stats.candidates_pruned_after_construction;
+                      if (pre_dedup_cap_reached()) {
+                        return request_stop(
+                            chart_spr_candidate_stop_reason::candidate_cap);
+                      }
+                      return true;
+                    }
+
+                    ++stats.candidates_generated_after_dedup;
+                    if (!invoke_candidate_callback(callback, *candidate)) {
+                      return request_stop(
+                          chart_spr_candidate_stop_reason::callback_stop);
+                    }
+                    if (pre_dedup_cap_reached() || post_dedup_cap_reached()) {
+                      return request_stop(
+                          chart_spr_candidate_stop_reason::candidate_cap);
+                    }
+                    return true;
+                  },
+                  dest_control);
+
+              if (dest_control.budget_exhausted) {
+                return request_stop(
+                    chart_spr_candidate_stop_reason::path_budget);
+              }
+              return !stopped();
+            },
+            source_control);
+
+        if (source_control.budget_exhausted) {
+          request_stop(chart_spr_candidate_stop_reason::path_budget);
+        }
+      }
+    }
+  }
+
+  return stats;
+}
 
 inline overlay_clade_grammar overlay_from_candidate(
     clade_grammar const& base, grammar_spr_candidate const& candidate) {
@@ -1107,11 +1570,12 @@ inline single_site_chart build_single_site_overlay_chart(
 }
 
 inline single_site_overlay_recompute_result build_single_site_overlay_chart_locally(
-    overlay_clade_grammar const& overlay, single_site_chart const& base_chart,
-    leaf_site_states const& leaf_states, chart_options const& options = {}) {
+    overlay_clade_grammar const& overlay,
+    overlay_materialization_result const& materialized,
+    single_site_chart const& base_chart, leaf_site_states const& leaf_states,
+    chart_options const& options = {}) {
   using namespace chart_spr_detail;
   validate_overlay(overlay);
-  auto materialized = materialize_overlay_grammar(overlay);
   auto const& dense = materialized.grammar;
   auto const& base = *overlay.base;
 
@@ -1194,6 +1658,14 @@ inline single_site_overlay_recompute_result build_single_site_overlay_chart_loca
 
   result.affected_clade_count = affected.size();
   return result;
+}
+
+inline single_site_overlay_recompute_result build_single_site_overlay_chart_locally(
+    overlay_clade_grammar const& overlay, single_site_chart const& base_chart,
+    leaf_site_states const& leaf_states, chart_options const& options = {}) {
+  auto materialized = materialize_overlay_grammar(overlay);
+  return build_single_site_overlay_chart_locally(
+      overlay, materialized, base_chart, leaf_states, options);
 }
 
 inline bool overlay_local_recompute_matches_full(
@@ -1291,55 +1763,12 @@ inline spr_score_result score_multisite_spr_candidate_exact(
 inline std::vector<grammar_spr_candidate> enumerate_grammar_spr_candidates(
     clade_grammar const& grammar,
     grammar_spr_enumeration_options options = {}) {
-  using namespace chart_spr_detail;
-  parsimony_chart_detail::validate_chart_grammar(grammar);
-  chart_trim_detail::validate_production_indices(grammar);
-
-  auto base_lookup = build_clade_lookup(grammar);
   std::vector<grammar_spr_candidate> candidates;
-  std::set<std::string> seen;
-
-  std::vector<std::vector<upward_path>> paths_to_root(grammar.clades.size());
-  for (clade_id cid = 0; cid < grammar.clades.size(); ++cid) {
-    paths_to_root[cid] = enumerate_upward_paths_to_root(grammar, cid);
-  }
-
-  for (std::size_t source_pid_raw = 0;
-       source_pid_raw < grammar.productions.size(); ++source_pid_raw) {
-    auto source_pid = static_cast<production_id>(source_pid_raw);
-    auto const& source_prod = grammar.productions[source_pid];
-    if (source_prod.children.size() != 2) continue;
-
-    for (std::size_t moved_i = 0; moved_i < 2; ++moved_i) {
-      auto moved = source_prod.children[moved_i];
-      auto old_sibling = source_prod.children[1 - moved_i];
-      auto const& moved_taxa = grammar.clades[moved].taxa;
-
-      for (clade_id target = 0; target < grammar.clades.size(); ++target) {
-        if (target == moved || target == old_sibling || target == source_prod.parent)
-          continue;
-        auto const& target_taxa = grammar.clades[target].taxa;
-        if (!disjoint_taxa(moved_taxa, target_taxa)) continue;
-
-        for (auto const& source_path : paths_to_root[source_prod.parent]) {
-          for (auto const& dest_path : paths_to_root[target]) {
-            auto candidate = make_general_spr_candidate(
-                grammar, base_lookup, source_pid, moved, old_sibling, target,
-                source_path, dest_path);
-            if (!candidate) continue;
-            append_deduplicated_candidate(candidates, seen,
-                                          std::move(*candidate),
-                                          options.max_candidates);
-            if (options.max_candidates != 0 &&
-                candidates.size() >= options.max_candidates) {
-              return candidates;
-            }
-          }
-        }
-      }
-    }
-  }
-
+  (void)for_each_grammar_spr_candidate(
+      grammar, options, [&](grammar_spr_candidate const& candidate) {
+        candidates.push_back(candidate);
+        return true;
+      });
   return candidates;
 }
 
