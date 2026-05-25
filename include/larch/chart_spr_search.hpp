@@ -3,6 +3,7 @@
 #include <larch/chart_spr.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace larch {
@@ -191,52 +193,487 @@ struct chart_spr_search_result {
   chart_spr_search_counters counters;
 };
 
+struct active_site_pattern_set {
+  site_pattern_set patterns;
+
+  // Search-state internals are active/topology-informative only.  Invariant
+  // sites and their topology-independent score contribution live on
+  // chart_spr_search_state, so this wrapper must not carry skipped-invariant
+  // metadata or invariant patterns into active-only chart/B&B calls.
+  void assert_no_skipped_invariant_metadata() const {
+    if (patterns.skipped_invariant_site_count != 0) {
+      throw std::runtime_error(
+          "chart SPR active patterns: skipped invariant site metadata must be "
+          "owned by the search state");
+    }
+    if (patterns.skipped_invariant_constant_score_with_reference_edge != 0) {
+      throw std::runtime_error(
+          "chart SPR active patterns: skipped invariant score metadata must be "
+          "owned by the search state");
+    }
+    if (patterns.invariant_site_count != 0 ||
+        patterns.invariant_constant_score_excluding_ua != 0 ||
+        patterns.invariant_constant_score_with_reference_edge != 0) {
+      throw std::runtime_error(
+          "chart SPR active patterns: invariant-site metadata must be owned "
+          "by the search state");
+    }
+    for (std::size_t i = 0; i < patterns.patterns.size(); ++i) {
+      if (is_invariant_site_pattern(patterns.patterns[i])) {
+        throw std::runtime_error(
+            "chart SPR active patterns: invariant pattern at active index " +
+            std::to_string(i));
+      }
+    }
+  }
+};
+
+struct chart_spr_pattern_source_fingerprint {
+  std::uint64_t reference_hash = 0;
+  std::uint64_t sample_id_hash = 0;
+  std::uint64_t compact_genome_hash = 0;
+  std::uint64_t taxon_registry_hash = 0;
+
+  bool operator==(chart_spr_pattern_source_fingerprint const&) const = default;
+};
+
+struct pattern_chart_cache_entry {
+  single_site_chart chart;  // no trace in hot path
+
+  // Keep the whole root row, not just a scalar root minimum.  With
+  // score_ua_edge=true, one compressed leaf-state pattern can contain
+  // positions with different UA/reference states.
+  std::array<chart_cost, nuc_state_count> root_row =
+      parsimony_chart_detail::make_inf_row();
+  chart_cost root_min_excluding_ua = chart_inf;
+  std::array<chart_cost, nuc_state_count> root_min_by_reference_state =
+      parsimony_chart_detail::make_inf_row();
+  std::array<std::uint64_t, nuc_state_count> reference_state_counts{};
+  std::uint64_t weighted_root_score = 0;
+};
+
+struct chart_spr_active_pattern_build_result {
+  active_site_pattern_set active_patterns;
+  chart_spr_pattern_source_fingerprint pattern_source_fingerprint;
+  std::uint64_t invariant_constant_offset = 0;
+  std::size_t skipped_invariant_site_count = 0;
+};
+
+namespace chart_spr_search_detail {
+
+inline std::uint64_t mix_u64(std::uint64_t seed, std::uint64_t value) {
+  seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+  return seed;
+}
+
+inline std::uint64_t fnv1a_append_byte(std::uint64_t seed,
+                                        std::uint8_t byte) {
+  return (seed ^ static_cast<std::uint64_t>(byte)) * 1099511628211ULL;
+}
+
+inline std::uint64_t hash_string_u64(std::string const& value) {
+  std::uint64_t seed = 1469598103934665603ULL;
+  for (unsigned char byte : value) seed = fnv1a_append_byte(seed, byte);
+  return seed;
+}
+
+inline void validate_binary_chart_compatible_grammar(
+    clade_grammar const& grammar) {
+  parsimony_chart_detail::validate_chart_grammar(grammar);
+  chart_trim_detail::validate_production_indices(grammar);
+  if (grammar.root_clade == no_clade ||
+      grammar.root_clade >= grammar.clades.size()) {
+    throw std::runtime_error("chart SPR search: root clade out of range");
+  }
+  for (std::size_t cid = 0; cid < grammar.clades.size(); ++cid) {
+    auto const& clade = grammar.clades[cid];
+    auto const& productions = grammar.productions_by_parent[cid];
+    if (clade.taxa.size() == 1) {
+      if (!productions.empty()) {
+        throw std::runtime_error(
+            "chart SPR search: singleton clade " + std::to_string(cid) +
+            " has productions; expected leaf clades to be productionless");
+      }
+    } else if (productions.empty()) {
+      throw std::runtime_error(
+          "chart SPR search: non-singleton clade " + std::to_string(cid) +
+          " has no productions; DAG-native chart-SPR requires a binary "
+          "chart-compatible grammar");
+    }
+  }
+
+  for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
+    auto const& prod = grammar.productions[pid];
+    if (prod.children.size() != 2) {
+      throw std::runtime_error(
+          "chart SPR search: production " + std::to_string(pid) +
+          " has arity " + std::to_string(prod.children.size()) +
+          "; DAG-native chart-SPR requires a binary chart-compatible grammar "
+          "(run/refine polytomies first or choose reject mode)");
+    }
+    parsimony_chart_detail::validate_binary_production_partition(
+        grammar, prod, static_cast<production_id>(pid));
+  }
+}
+
+inline std::uint64_t invariant_pattern_reference_edge_offset(
+    site_pattern const& pattern) {
+  if (pattern.state_by_taxon.empty()) {
+    throw std::runtime_error(
+        "chart SPR active patterns: invariant pattern has no taxa");
+  }
+  auto invariant_state = pattern.state_by_taxon.front();
+  parsimony_chart_detail::validate_state(invariant_state,
+                                         "invariant pattern state");
+  std::uint64_t total = 0;
+  std::uint64_t reference_count_sum = 0;
+  for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+       ++reference_state) {
+    auto count = static_cast<std::uint64_t>(
+        pattern.reference_state_counts[reference_state]);
+    reference_count_sum += count;
+    if (count == 0) continue;
+    auto cost = parsimony_chart_detail::transition_cost(reference_state,
+                                                        invariant_state);
+    total = chart_multisite_detail::checked_add_u64(
+        total,
+        chart_multisite_detail::checked_mul_cost(
+            count, cost, "chart-SPR invariant UA-edge offset"),
+        "chart-SPR invariant UA-edge offset total");
+  }
+  if (reference_count_sum != pattern.weight) {
+    throw std::runtime_error(
+        "chart SPR active patterns: invariant reference-state counts do not "
+        "sum to pattern weight");
+  }
+  return total;
+}
+
+inline void append_active_pattern_metadata(site_pattern_set& active,
+                                           site_pattern const& pattern) {
+  active.patterns.push_back(pattern);
+  active.total_site_count += pattern.weight;
+  active.variable_site_count += pattern.weight;
+  if (is_binary_variable_site_pattern(pattern)) {
+    active.binary_variable_site_count += pattern.weight;
+  } else {
+    active.nonbinary_variable_site_count += pattern.weight;
+  }
+}
+
+inline pattern_chart_cache_entry build_pattern_chart_cache_entry(
+    clade_grammar const& grammar, site_pattern const& pattern,
+    chart_options const& chart_opts, chart_options const& chart_build_opts) {
+  leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
+  pattern_chart_cache_entry entry;
+  entry.chart = build_single_site_chart(grammar, states, chart_build_opts);
+  if (grammar.root_clade == no_clade ||
+      grammar.root_clade >= entry.chart.inside.size()) {
+    throw std::runtime_error(
+        "chart SPR search state: root clade out of chart range");
+  }
+  entry.root_row = entry.chart.inside[grammar.root_clade];
+  entry.root_min_excluding_ua =
+      entry.chart.root_min_excluding_ua(grammar.root_clade);
+  for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+       ++reference_state) {
+    entry.root_min_by_reference_state[reference_state] =
+        entry.chart.root_min_with_reference_edge(grammar.root_clade,
+                                                 reference_state);
+    entry.reference_state_counts[reference_state] =
+        pattern.reference_state_counts[reference_state];
+  }
+  entry.weighted_root_score =
+      chart_multisite_detail::weighted_root_score_from_row(
+          entry.root_row, pattern, chart_opts);
+  return entry;
+}
+
+}  // namespace chart_spr_search_detail
+
+inline void validate_supported_chart_cache_options(
+    chart_cache_options const& cache) {
+  if (cache.max_cached_patterns != 0 || cache.memory_budget_bytes != 0 ||
+      cache.candidate_batch_size != 0) {
+    throw std::runtime_error(
+        "chart SPR search: bounded/batched chart cache options are not "
+        "implemented yet; leave max_cached_patterns, memory_budget_bytes, and "
+        "candidate_batch_size at 0 for the current all-active-pattern cache");
+  }
+}
+
+inline chart_spr_pattern_source_fingerprint
+build_chart_spr_pattern_source_fingerprint(phylo_dag& dag,
+                                           clade_grammar const& grammar) {
+  using chart_spr_search_detail::hash_string_u64;
+  using chart_spr_search_detail::mix_u64;
+
+  chart_spr_pattern_source_fingerprint fp;
+  fp.reference_hash = hash_string_u64(get_reference_sequence(dag));
+
+  std::uint64_t sample_seed = grammar.taxa.id_to_sample_id.size();
+  for (auto const& sample_id : grammar.taxa.id_to_sample_id) {
+    sample_seed = mix_u64(sample_seed, hash_string_u64(sample_id));
+  }
+  fp.sample_id_hash = sample_seed;
+
+  std::vector<std::pair<std::string, std::uint64_t>> leaf_hashes;
+  auto reachable = detail::collect_reachable(dag);
+  for (auto node_idx : reachable.nodes) {
+    auto nv = dag.get_node(node_idx);
+    if (!detail::is_leaf_node(nv)) continue;
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires {
+                          node.sample_id();
+                          node.cg();
+                        }) {
+            std::uint64_t cg_seed = 1469598103934665603ULL;
+            for (auto const& [pos, base] : node.cg()) {
+              cg_seed = mix_u64(cg_seed, static_cast<std::uint64_t>(pos));
+              cg_seed = mix_u64(cg_seed,
+                                static_cast<std::uint64_t>(base.raw()));
+            }
+            leaf_hashes.emplace_back(std::string{node.sample_id()}, cg_seed);
+          } else {
+            throw std::runtime_error(
+                "chart SPR pattern fingerprint: reachable leaf node lacks "
+                "sample_id/cg annotations");
+          }
+        },
+        nv);
+  }
+  std::sort(leaf_hashes.begin(), leaf_hashes.end());
+  std::uint64_t cg_seed = leaf_hashes.size();
+  for (auto const& [sample_id, hash] : leaf_hashes) {
+    cg_seed = mix_u64(cg_seed, hash_string_u64(sample_id));
+    cg_seed = mix_u64(cg_seed, hash);
+  }
+  fp.compact_genome_hash = cg_seed;
+
+  std::uint64_t registry_seed = grammar.taxa.id_to_sample_id.size();
+  for (std::size_t id = 0; id < grammar.taxa.id_to_sample_id.size(); ++id) {
+    registry_seed = mix_u64(registry_seed, static_cast<std::uint64_t>(id));
+    registry_seed = mix_u64(registry_seed,
+                            hash_string_u64(grammar.taxa.id_to_sample_id[id]));
+  }
+  std::vector<std::pair<std::string, taxon_id>> taxon_map_entries;
+  taxon_map_entries.reserve(grammar.taxa.sample_id_to_id.size());
+  for (auto const& [sample_id, id] : grammar.taxa.sample_id_to_id) {
+    taxon_map_entries.emplace_back(sample_id, id);
+  }
+  std::sort(taxon_map_entries.begin(), taxon_map_entries.end());
+  for (auto const& [sample_id, id] : taxon_map_entries) {
+    registry_seed = mix_u64(registry_seed, hash_string_u64(sample_id));
+    registry_seed = mix_u64(registry_seed, static_cast<std::uint64_t>(id));
+  }
+  fp.taxon_registry_hash = registry_seed;
+  return fp;
+}
+
+inline bool chart_spr_pattern_source_fingerprint_matches(
+    phylo_dag& dag, clade_grammar const& grammar,
+    chart_spr_pattern_source_fingerprint const& expected) {
+  return build_chart_spr_pattern_source_fingerprint(dag, grammar) == expected;
+}
+
+inline chart_spr_active_pattern_build_result make_active_search_patterns(
+    site_pattern_set const& source_patterns,
+    chart_options const& chart_opts = {}) {
+  chart_spr_active_pattern_build_result result;
+  auto& active = result.active_patterns.patterns;
+  active.taxon_count = source_patterns.taxon_count;
+
+  result.skipped_invariant_site_count =
+      source_patterns.skipped_invariant_site_count;
+  if (chart_opts.score_ua_edge) {
+    result.invariant_constant_offset =
+        chart_multisite_detail::checked_add_u64(
+            result.invariant_constant_offset,
+            source_patterns
+                .skipped_invariant_constant_score_with_reference_edge,
+            "chart-SPR skipped invariant UA-edge offset");
+  }
+
+  active.patterns.reserve(source_patterns.patterns.size());
+  for (std::size_t pattern_index = 0;
+       pattern_index < source_patterns.patterns.size(); ++pattern_index) {
+    auto const& pattern = source_patterns.patterns[pattern_index];
+    if (chart_opts.score_ua_edge) {
+      chart_multisite_detail::validate_pattern_reference_counts(pattern,
+                                                                pattern_index);
+    }
+    if (is_invariant_site_pattern(pattern)) {
+      result.skipped_invariant_site_count += pattern.weight;
+      if (chart_opts.score_ua_edge) {
+        result.invariant_constant_offset =
+            chart_multisite_detail::checked_add_u64(
+                result.invariant_constant_offset,
+                chart_spr_search_detail::
+                    invariant_pattern_reference_edge_offset(pattern),
+                "chart-SPR invariant pattern UA-edge offset");
+      }
+      continue;
+    }
+    chart_spr_search_detail::append_active_pattern_metadata(active, pattern);
+  }
+
+  active.exact_pattern_to_normalized_binary_pattern.assign(
+      active.patterns.size(), no_site_pattern);
+  active.exact_pattern_to_normalized_binary_state_map.assign(
+      active.patterns.size(), normalized_binary_state_map{});
+
+  result.active_patterns.assert_no_skipped_invariant_metadata();
+  return result;
+}
+
+inline chart_spr_active_pattern_build_result make_active_search_patterns(
+    phylo_dag& dag, clade_grammar const& grammar,
+    chart_options const& chart_opts = {},
+    site_pattern_options pattern_opts = {}) {
+  pattern_opts.skip_invariant_sites = true;
+  auto raw_patterns = build_site_patterns(dag, grammar, pattern_opts);
+  auto result = make_active_search_patterns(raw_patterns, chart_opts);
+  result.pattern_source_fingerprint =
+      build_chart_spr_pattern_source_fingerprint(dag, grammar);
+  return result;
+}
+
+inline composite_chart_score build_composite_chart_score_active(
+    clade_grammar const& grammar, active_site_pattern_set const& patterns,
+    chart_options const& options = {}) {
+  patterns.assert_no_skipped_invariant_metadata();
+  return build_composite_chart_score(grammar, patterns.patterns, options);
+}
+
+inline multisite_trim_result build_multisite_trim_active(
+    clade_grammar const& grammar, active_site_pattern_set const& patterns,
+    chart_options const& options = {},
+    multisite_trim_options const& trim_options = {}) {
+  patterns.assert_no_skipped_invariant_metadata();
+  return build_multisite_trim(grammar, patterns.patterns, options,
+                              trim_options);
+}
+
 struct chart_spr_search_state {
   phylo_dag* dag = nullptr;
   clade_grammar grammar;
-  site_pattern_set patterns;
+
+  // Active/topology-informative patterns only.  Invariant-site metadata is
+  // stored as invariant_constant_offset/skipped_invariant_site_count below and
+  // added exactly once at objective/reporting boundaries.
+  active_site_pattern_set active_patterns;
+  chart_spr_pattern_source_fingerprint pattern_source_fingerprint;
+  std::uint64_t invariant_constant_offset = 0;
+  std::size_t skipped_invariant_site_count = 0;
+
   chart_options chart_opts;
-  std::vector<single_site_chart> pattern_charts;
+  std::vector<pattern_chart_cache_entry> pattern_charts;
+  std::uint64_t composite_lower_bound_without_invariants = 0;
   std::uint64_t composite_lower_bound_with_invariants = 0;
+
+  // Active-pattern-only exact result.  Add invariant_constant_offset exactly
+  // once when comparing/reporting the full objective.
+  std::optional<multisite_trim_result> exact_trim_active_only;
+
   chart_spr_search_counters counters;
 };
 
-inline chart_spr_search_state build_chart_spr_search_state(
-    phylo_dag& dag, clade_grammar grammar, site_pattern_set patterns,
-    chart_options options = {}) {
+inline std::size_t estimate_chart_spr_pattern_cache_bytes(
+    chart_spr_search_state const& state) {
+  std::size_t total = state.pattern_charts.size() *
+                      sizeof(pattern_chart_cache_entry);
+  for (auto const& entry : state.pattern_charts) {
+    total += entry.chart.inside.size() * sizeof(entry.chart.inside.front());
+    total += entry.chart.optimal_choices.size() *
+             sizeof(decltype(entry.chart.optimal_choices)::value_type);
+  }
+  return total;
+}
+
+inline chart_spr_search_state build_chart_spr_search_state_from_active(
+    phylo_dag& dag, clade_grammar grammar,
+    chart_spr_active_pattern_build_result active_build,
+    chart_options options = {}, bool build_exact_trim = false,
+    multisite_trim_options const& trim_options = {}) {
+  chart_spr_search_detail::validate_binary_chart_compatible_grammar(grammar);
+  active_build.active_patterns.assert_no_skipped_invariant_metadata();
+  chart_multisite_detail::validate_multisite_inputs(
+      grammar, active_build.active_patterns.patterns, options);
+
   chart_spr_search_state state;
   state.dag = &dag;
   state.grammar = std::move(grammar);
-  state.patterns = std::move(patterns);
+  state.active_patterns = std::move(active_build.active_patterns);
+  state.pattern_source_fingerprint =
+      active_build.pattern_source_fingerprint;
+  state.invariant_constant_offset = active_build.invariant_constant_offset;
+  state.skipped_invariant_site_count =
+      active_build.skipped_invariant_site_count;
   state.chart_opts = options;
   ++state.counters.base_chart_cache_rebuilds;
   state.counters.skipped_invariant_sites =
-      state.patterns.skipped_invariant_site_count;
+      state.skipped_invariant_site_count;
 
   auto chart_build_options = options;
   chart_build_options.keep_trace = false;
   chart_build_options.max_trace_choices = 0;
-  state.pattern_charts.reserve(state.patterns.patterns.size());
+  state.pattern_charts.reserve(
+      state.active_patterns.patterns.patterns.size());
 
-  std::uint64_t total = 0;
-  for (auto const& pattern : state.patterns.patterns) {
-    leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
-    auto chart = build_single_site_chart(state.grammar, states,
-                                         chart_build_options);
-    total = chart_multisite_detail::checked_add_u64(
-        total,
-        chart_multisite_detail::weighted_root_score_from_row(
-            chart.inside[state.grammar.root_clade], pattern, options),
-        "chart-SPR cached composite lower bound");
-    state.pattern_charts.push_back(std::move(chart));
+  std::uint64_t active_total = 0;
+  for (auto const& pattern : state.active_patterns.patterns.patterns) {
+    auto entry = chart_spr_search_detail::build_pattern_chart_cache_entry(
+        state.grammar, pattern, options, chart_build_options);
+    active_total = chart_multisite_detail::checked_add_u64(
+        active_total, entry.weighted_root_score,
+        "chart-SPR cached active-pattern lower bound");
+    state.pattern_charts.push_back(std::move(entry));
   }
-  if (options.score_ua_edge) {
-    total = chart_multisite_detail::checked_add_u64(
-        total,
-        state.patterns.skipped_invariant_constant_score_with_reference_edge,
-        "chart-SPR skipped invariant UA-edge offset");
+
+  state.composite_lower_bound_without_invariants = active_total;
+  state.composite_lower_bound_with_invariants =
+      chart_multisite_detail::checked_add_u64(
+          active_total, state.invariant_constant_offset,
+          "chart-SPR cached lower bound invariant offset");
+
+  if (build_exact_trim) {
+    state.exact_trim_active_only = build_multisite_trim_active(
+        state.grammar, state.active_patterns, options, trim_options);
   }
-  state.composite_lower_bound_with_invariants = total;
+  return state;
+}
+
+inline chart_spr_search_state build_chart_spr_search_state(
+    phylo_dag& dag, clade_grammar grammar, site_pattern_set patterns,
+    chart_options options = {}) {
+  auto active_build = make_active_search_patterns(patterns, options);
+  active_build.pattern_source_fingerprint =
+      build_chart_spr_pattern_source_fingerprint(dag, grammar);
+  return build_chart_spr_search_state_from_active(
+      dag, std::move(grammar), std::move(active_build), options);
+}
+
+inline chart_spr_search_state build_chart_spr_search_state(
+    phylo_dag& dag, clade_grammar grammar, chart_options options = {}) {
+  auto active_build = make_active_search_patterns(dag, grammar, options);
+  auto state = build_chart_spr_search_state_from_active(
+      dag, std::move(grammar), std::move(active_build), options);
+  ++state.counters.pattern_rebuilds;
+  return state;
+}
+
+inline chart_spr_search_state build_chart_spr_search_state(
+    phylo_dag& dag, clade_grammar grammar,
+    chart_spr_search_options const& options) {
+  validate_supported_chart_cache_options(options.cache);
+  auto active_build = make_active_search_patterns(dag, grammar, options.chart);
+  bool build_exact =
+      options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite;
+  auto state = build_chart_spr_search_state_from_active(
+      dag, std::move(grammar), std::move(active_build), options.chart,
+      build_exact, options.exact_trim);
+  ++state.counters.pattern_rebuilds;
   return state;
 }
 
@@ -248,7 +685,9 @@ inline chart_spr_search_state build_chart_spr_search_state(
 // materializations are counted as local-scoring bridge work, not oracle work.
 inline chart_spr_candidate_score score_candidate_locally(
     chart_spr_search_state& state, grammar_spr_candidate const& candidate) {
-  if (state.pattern_charts.size() != state.patterns.patterns.size()) {
+  state.active_patterns.assert_no_skipped_invariant_metadata();
+  if (state.pattern_charts.size() !=
+      state.active_patterns.patterns.patterns.size()) {
     throw std::runtime_error(
         "chart SPR local score: pattern chart cache size mismatch");
   }
@@ -259,34 +698,33 @@ inline chart_spr_candidate_score score_candidate_locally(
   ++state.counters.overlay_materializations_for_local_scoring_bridge;
   ++state.counters.local_candidate_scores;
 
-  std::uint64_t new_score = 0;
+  std::uint64_t new_active_score = 0;
   std::size_t affected_count = 0;
   auto chart_build_options = state.chart_opts;
   chart_build_options.keep_trace = false;
   chart_build_options.max_trace_choices = 0;
 
   for (std::size_t pattern_index = 0;
-       pattern_index < state.patterns.patterns.size(); ++pattern_index) {
-    auto const& pattern = state.patterns.patterns[pattern_index];
+       pattern_index < state.active_patterns.patterns.patterns.size();
+       ++pattern_index) {
+    auto const& pattern =
+        state.active_patterns.patterns.patterns[pattern_index];
+    auto const& cache_entry = state.pattern_charts[pattern_index];
     leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
     auto local = build_single_site_overlay_chart_locally(
-        overlay, materialized, state.pattern_charts[pattern_index], states,
-        chart_build_options);
+        overlay, materialized, cache_entry.chart, states, chart_build_options);
     affected_count = std::max(affected_count, local.affected_clade_count);
-    new_score = chart_multisite_detail::checked_add_u64(
-        new_score,
+    new_active_score = chart_multisite_detail::checked_add_u64(
+        new_active_score,
         chart_multisite_detail::weighted_root_score_from_row(
             local.chart.inside[materialized.grammar.root_clade], pattern,
             state.chart_opts),
-        "chart-SPR local candidate lower bound");
-  }
-  if (state.chart_opts.score_ua_edge) {
-    new_score = chart_multisite_detail::checked_add_u64(
-        new_score,
-        state.patterns.skipped_invariant_constant_score_with_reference_edge,
-        "chart-SPR local skipped invariant UA-edge offset");
+        "chart-SPR local candidate active lower bound");
   }
 
+  auto new_score = chart_multisite_detail::checked_add_u64(
+      new_active_score, state.invariant_constant_offset,
+      "chart-SPR local candidate invariant offset");
   auto old_score = state.composite_lower_bound_with_invariants;
   chart_spr_candidate_score scored;
   scored.candidate = candidate;
@@ -296,10 +734,8 @@ inline chart_spr_candidate_score score_candidate_locally(
   scored.lower_bound.kind = chart_spr_score_kind::composite_lower_bound;
   scored.lower_bound.convention =
       chart_spr_score_convention::full_with_invariants;
-  if (state.chart_opts.score_ua_edge) {
-    scored.lower_bound.invariant_offset_applied =
-        state.patterns.skipped_invariant_constant_score_with_reference_edge;
-  }
+  scored.lower_bound.invariant_offset_applied =
+      state.invariant_constant_offset;
   scored.affected_clade_count = affected_count;
   return scored;
 }

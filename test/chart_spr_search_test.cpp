@@ -44,6 +44,28 @@ static tiny_chart_spr_fixture make_fixture() {
   return fixture;
 }
 
+static larch::test::tiny_tree_node four_taxon_offset_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "CCAA",
+      {tiny_inner("AB", "CCAA", {tiny_leaf("A", "CCAA"),
+                                    tiny_leaf("B", "CCAA")}),
+       tiny_inner("CD", "CCGA", {tiny_leaf("C", "CCGA"),
+                                    tiny_leaf("D", "CCGA")})});
+}
+
+static larch::test::tiny_tree_node four_taxon_repeated_reference_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "AA",
+      {tiny_inner("AB", "AA", {tiny_leaf("A", "AA"),
+                                  tiny_leaf("B", "AA")}),
+       tiny_inner("CD", "AC", {tiny_leaf("C", "AA"),
+                                  tiny_leaf("D", "CC")})});
+}
+
 static void test_lower_bound_oracle_counters_show_full_rebuild_cost() {
   std::println("test_lower_bound_oracle_counters_show_full_rebuild_cost");
 
@@ -145,6 +167,164 @@ static void test_search_state_local_score_entry_point_matches_oracle() {
   CHECK(state.counters.base_chart_cache_rebuilds == 1);
   CHECK(state.counters.local_candidate_scores == 1);
   CHECK(state.counters.full_composite_rebuilds == 0);
+
+  std::println("  PASS");
+}
+
+static void test_persistent_active_pattern_cache_matches_full_composite() {
+  std::println("test_persistent_active_pattern_cache_matches_full_composite");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "ATGA", four_taxon_offset_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto full_patterns = larch::build_site_patterns(dag, grammar);
+  larch::chart_options opts;
+  opts.score_ua_edge = true;
+
+  auto active_build = larch::make_active_search_patterns(full_patterns, opts);
+  CHECK(active_build.skipped_invariant_site_count == 3);
+  CHECK(active_build.invariant_constant_offset == 2);
+  active_build.active_patterns.assert_no_skipped_invariant_metadata();
+
+  auto active_composite = larch::build_composite_chart_score_active(
+      grammar, active_build.active_patterns, opts);
+  auto full_composite = larch::build_composite_chart_score(
+      grammar, full_patterns, opts);
+
+  auto state = larch::build_chart_spr_search_state(
+      dag, grammar, full_patterns, opts);
+  CHECK(state.pattern_charts.size() ==
+        active_build.active_patterns.patterns.patterns.size());
+  CHECK(state.skipped_invariant_site_count == 3);
+  CHECK(state.invariant_constant_offset == 2);
+  CHECK(state.composite_lower_bound_without_invariants ==
+        active_composite.weighted_lower_bound);
+  CHECK(state.composite_lower_bound_with_invariants ==
+        full_composite.weighted_lower_bound);
+  CHECK(state.composite_lower_bound_with_invariants ==
+        state.composite_lower_bound_without_invariants +
+            state.invariant_constant_offset);
+  CHECK(state.counters.base_chart_cache_rebuilds == 1);
+
+  std::println("  PASS");
+}
+
+static void test_root_reference_counts_preserved_in_cache() {
+  std::println("test_root_reference_counts_preserved_in_cache");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AC", four_taxon_repeated_reference_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, grammar);
+  CHECK(patterns.patterns.size() == 1);
+  CHECK(patterns.patterns.front().weight == 2);
+  CHECK(patterns.patterns.front()
+            .reference_state_counts[larch::nuc_base::A] == 1);
+  CHECK(patterns.patterns.front()
+            .reference_state_counts[larch::nuc_base::C] == 1);
+
+  larch::chart_options opts;
+  opts.score_ua_edge = true;
+  auto state = larch::build_chart_spr_search_state(
+      dag, grammar, patterns, opts);
+  CHECK(state.pattern_charts.size() == 1);
+  auto const& entry = state.pattern_charts.front();
+  CHECK(entry.reference_state_counts[larch::nuc_base::A] == 1);
+  CHECK(entry.reference_state_counts[larch::nuc_base::C] == 1);
+  CHECK(entry.root_min_excluding_ua == 1);
+  CHECK(entry.weighted_root_score == 3);
+  CHECK(entry.weighted_root_score >
+        patterns.patterns.front().weight * entry.root_min_excluding_ua);
+  CHECK(state.composite_lower_bound_without_invariants == 3);
+  CHECK(state.composite_lower_bound_with_invariants == 3);
+
+  std::println("  PASS");
+}
+
+static void test_active_pattern_assertions_reject_skipped_metadata() {
+  std::println("test_active_pattern_assertions_reject_skipped_metadata");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "ATGA", four_taxon_offset_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  larch::site_pattern_options pattern_opts;
+  pattern_opts.skip_invariant_sites = true;
+  auto skipped = larch::build_site_patterns(dag, grammar, pattern_opts);
+  CHECK(skipped.skipped_invariant_site_count == 3);
+
+  larch::active_site_pattern_set bad{skipped};
+  bool threw = false;
+  try {
+    bad.assert_no_skipped_invariant_metadata();
+  } catch (std::exception const&) {
+    threw = true;
+  }
+  CHECK(threw);
+
+  std::println("  PASS");
+}
+
+static void test_state_builder_from_dag_rebuilds_patterns_once() {
+  std::println("test_state_builder_from_dag_rebuilds_patterns_once");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "ATGA", four_taxon_offset_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  larch::chart_options opts;
+  opts.score_ua_edge = true;
+
+  auto state = larch::build_chart_spr_search_state(dag, grammar, opts);
+  CHECK(state.counters.pattern_rebuilds == 1);
+  CHECK(state.counters.base_chart_cache_rebuilds == 1);
+  CHECK(state.skipped_invariant_site_count == 3);
+  CHECK(state.invariant_constant_offset == 2);
+  CHECK(larch::chart_spr_pattern_source_fingerprint_matches(
+      dag, grammar, state.pattern_source_fingerprint));
+  state.active_patterns.assert_no_skipped_invariant_metadata();
+
+  std::println("  PASS");
+}
+
+static void test_non_default_cache_options_throw_until_batching_exists() {
+  std::println("test_non_default_cache_options_throw_until_batching_exists");
+
+  auto fixture = make_fixture();
+  larch::chart_spr_search_options options;
+  options.cache.max_cached_patterns = 1;
+
+  bool threw = false;
+  try {
+    (void)larch::build_chart_spr_search_state(
+        fixture.dag, fixture.grammar, options);
+  } catch (std::exception const&) {
+    threw = true;
+  }
+  CHECK(threw);
+
+  std::println("  PASS");
+}
+
+static void test_unchartable_grammar_rejected_with_empty_active_patterns() {
+  std::println("test_unchartable_grammar_rejected_with_empty_active_patterns");
+
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", tiny_inner("root", "A", {tiny_leaf("A", "A"),
+                                      tiny_leaf("B", "A")}));
+  auto grammar = larch::build_clade_grammar(dag);
+  grammar.productions.clear();
+  grammar.productions_by_parent.assign(grammar.clades.size(), {});
+  grammar.productions_by_child.assign(grammar.clades.size(), {});
+  auto patterns = larch::build_site_patterns(dag, grammar);
+
+  bool threw = false;
+  try {
+    (void)larch::build_chart_spr_search_state(dag, grammar, patterns);
+  } catch (std::exception const&) {
+    threw = true;
+  }
+  CHECK(threw);
 
   std::println("  PASS");
 }
@@ -272,6 +452,12 @@ int main() {
   test_local_rejected_candidate_counter_guardrail();
   test_streaming_and_eager_candidate_apis_match();
   test_search_state_local_score_entry_point_matches_oracle();
+  test_persistent_active_pattern_cache_matches_full_composite();
+  test_root_reference_counts_preserved_in_cache();
+  test_active_pattern_assertions_reject_skipped_metadata();
+  test_state_builder_from_dag_rebuilds_patterns_once();
+  test_non_default_cache_options_throw_until_batching_exists();
+  test_unchartable_grammar_rejected_with_empty_active_patterns();
   test_unsupported_enumeration_options_fail_explicitly();
   test_max_affected_estimate_prunes_before_construction();
   test_streaming_candidate_cap_stops_before_eager_path_precompute();

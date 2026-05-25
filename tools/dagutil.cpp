@@ -2323,14 +2323,14 @@ static void print_chart_spr_generation_stats(
 
 static void run_chart_spr_local_scoring_diagnostic(
     std::ostream& out, phylo_dag& dag,
-    polytomy_refinement_result& refinement, site_pattern_set& patterns,
-    args const& a, std::string_view report_name) {
+    polytomy_refinement_result& refinement, args const& a,
+    std::string_view report_name) {
   chart_options chart_opts;
   chart_opts.score_ua_edge = a.chart_score_ua_edge;
 
   auto cache_start = std::chrono::steady_clock::now();
   auto state = build_chart_spr_search_state(dag, refinement.grammar,
-                                            patterns, chart_opts);
+                                            chart_opts);
   auto cache_ms = elapsed_ms(cache_start, std::chrono::steady_clock::now());
 
   std::vector<grammar_spr_candidate> candidates;
@@ -2384,7 +2384,7 @@ static void run_chart_spr_local_scoring_diagnostic(
                                           static_cast<double>(scored_count);
 
   out << report_name << ":\n";
-  out << "  api: search_state_cached_charts\n";
+  out << "  api: search_state_cached_active_pattern_charts\n";
   out << "  score_kind: composite_lower_bound\n";
   out << "  phase1_materialized_overlay_local_recompute: true\n";
   if (report_name == "chart_spr_search") {
@@ -2398,6 +2398,14 @@ static void run_chart_spr_local_scoring_diagnostic(
   }
   out << "  score_ua_edge: "
       << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+  out << "  active_patterns: "
+      << state.active_patterns.patterns.patterns.size() << "\n";
+  out << "  skipped_invariant_sites: "
+      << state.skipped_invariant_site_count << "\n";
+  out << "  invariant_constant_offset: "
+      << state.invariant_constant_offset << "\n";
+  out << "  chart_cache_estimated_bytes: "
+      << estimate_chart_spr_pattern_cache_bytes(state) << "\n";
   out << "  cache_build_ms: " << std::fixed << std::setprecision(3)
       << cache_ms << "\n";
   out << "  candidate_generation_ms: " << std::fixed << std::setprecision(3)
@@ -2413,6 +2421,8 @@ static void run_chart_spr_local_scoring_diagnostic(
   out << "  candidates_scored: " << scored_count << "\n";
   out << "  candidate_score_failures: " << failures << "\n";
   if (!last_error.empty()) out << "  last_score_error: " << last_error << "\n";
+  out << "  current_lower_bound_active_only: "
+      << state.composite_lower_bound_without_invariants << "\n";
   out << "  current_lower_bound: "
       << state.composite_lower_bound_with_invariants << "\n";
   if (best) {
@@ -2744,16 +2754,14 @@ int main(int argc, char** argv) try {
 
   if (a.chart_spr_score_local) {
     auto& refinement = get_chart_refinement();
-    auto& patterns = get_exact_patterns();
     run_chart_spr_local_scoring_diagnostic(
-        std::cout, result, refinement, patterns, a, "chart_spr_score_local");
+        std::cout, result, refinement, a, "chart_spr_score_local");
   }
 
   if (a.chart_spr_search) {
     auto& refinement = get_chart_refinement();
-    auto& patterns = get_exact_patterns();
     run_chart_spr_local_scoring_diagnostic(
-        std::cout, result, refinement, patterns, a, "chart_spr_search");
+        std::cout, result, refinement, a, "chart_spr_search");
   }
 
   if (a.chart_site) {
