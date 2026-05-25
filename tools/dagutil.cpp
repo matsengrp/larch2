@@ -21,6 +21,7 @@
 #include <larch/parsimony_chart.hpp>
 #include <larch/site_patterns.hpp>
 #include <larch/chart_trim.hpp>
+#include <larch/chart_spr_search.hpp>
 #include <larch/plateau.hpp>
 
 #include <algorithm>
@@ -1193,6 +1194,12 @@ Analysis:
                           (omit for no cap; if supplied, must be positive)
   --chart-bnb-no-bound-pruning
                           Disable B&B lower-bound pruning for diagnostics
+  --chart-spr-helper-benchmark
+                          Benchmark legacy chart-SPR helper costs and counters
+                          (diagnostic/oracle path; not production search)
+  --chart-spr-helper-benchmark-max-candidates <N>
+                          Candidate cap for --chart-spr-helper-benchmark
+                          (default 16; 0 means unlimited)
   --parsimony             Print parsimony score distribution
   --sum-rf-distance       Print sum RF distance distribution
   --edge-parsimony        Compute per-edge parsimony penalties (store in output;
@@ -1256,6 +1263,8 @@ struct args {
   std::size_t chart_entry_limit = 20;
   std::size_t chart_bnb_max_frontier = 0;
   bool chart_bnb_no_bound_pruning = false;
+  bool chart_spr_helper_benchmark = false;
+  std::size_t chart_spr_helper_benchmark_max_candidates = 16;
 };
 
 static bool has_any_model_arg(args const& a) {
@@ -1508,6 +1517,11 @@ static args parse_args(int argc, char** argv) {
           next(), "--chart-bnb-max-frontier");
     } else if (arg == "--chart-bnb-no-bound-pruning") {
       a.chart_bnb_no_bound_pruning = true;
+    } else if (arg == "--chart-spr-helper-benchmark") {
+      a.chart_spr_helper_benchmark = true;
+    } else if (arg == "--chart-spr-helper-benchmark-max-candidates") {
+      a.chart_spr_helper_benchmark_max_candidates = parse_size_token_strict(
+          next(), "--chart-spr-helper-benchmark-max-candidates");
     } else if (arg == "--edge-parsimony")
       a.edge_parsimony = true;
     else if (arg == "--edge-ml" || arg == "--edge-thrifty")
@@ -2051,6 +2065,225 @@ static void run_wric_polytomy_benchmark(std::ostream& out, phylo_dag& dag,
   }
 }
 
+static void print_chart_spr_search_counter_fields(
+    std::ostream& out, chart_spr_search_counters const& counters,
+    std::string const& indent) {
+  out << indent << "grammar_rebuilds: " << counters.grammar_rebuilds << "\n";
+  out << indent << "pattern_rebuilds: " << counters.pattern_rebuilds << "\n";
+  out << indent << "base_chart_cache_rebuilds: "
+      << counters.base_chart_cache_rebuilds << "\n";
+  out << indent << "full_overlay_materializations: "
+      << counters.full_overlay_materializations << "\n";
+  out << indent << "overlay_materializations_for_oracle: "
+      << counters.overlay_materializations_for_oracle << "\n";
+  out << indent << "overlay_materializations_for_exact_verification: "
+      << counters.overlay_materializations_for_exact_verification << "\n";
+  out << indent << "overlay_materializations_for_accept_materialization: "
+      << counters.overlay_materializations_for_accept_materialization << "\n";
+  out << indent << "sidecar_rebuilds_after_accept: "
+      << counters.sidecar_rebuilds_after_accept << "\n";
+  out << indent << "full_composite_rebuilds: "
+      << counters.full_composite_rebuilds << "\n";
+  out << indent << "local_candidate_scores: "
+      << counters.local_candidate_scores << "\n";
+  out << indent << "exact_verifications: " << counters.exact_verifications
+      << "\n";
+  out << indent << "accepted_moves: " << counters.accepted_moves << "\n";
+  out << indent << "candidate_accepts_attempted: "
+      << counters.candidate_accepts_attempted << "\n";
+  out << indent << "rejected_moves: " << counters.rejected_moves << "\n";
+  out << indent << "post_materialization_rejections: "
+      << counters.post_materialization_rejections << "\n";
+  out << indent << "skipped_invariant_sites: "
+      << counters.skipped_invariant_sites << "\n";
+  out << indent << "candidate_source_productions_considered: "
+      << counters.candidate_source_productions_considered << "\n";
+  out << indent << "upward_path_iterator_steps: "
+      << counters.upward_path_iterator_steps << "\n";
+  out << indent << "upward_paths_completed: "
+      << counters.upward_paths_completed << "\n";
+  out << indent << "path_pairs_considered: "
+      << counters.path_pairs_considered << "\n";
+  out << indent << "candidates_constructed: "
+      << counters.candidates_constructed << "\n";
+  out << indent << "candidates_pruned_before_construction: "
+      << counters.candidates_pruned_before_construction << "\n";
+  out << indent << "candidates_pruned_after_construction: "
+      << counters.candidates_pruned_after_construction << "\n";
+  out << indent << "candidates_generated_after_dedup: "
+      << counters.candidates_generated_after_dedup << "\n";
+  out << indent << "candidate_cap_cutoffs: "
+      << counters.candidate_cap_cutoffs << "\n";
+  out << indent << "path_budget_cutoffs: "
+      << counters.path_budget_cutoffs << "\n";
+  out << indent << "overlay_reachability_validations: "
+      << counters.overlay_reachability_validations << "\n";
+  out << indent << "reachable_clades_traversed: "
+      << counters.reachable_clades_traversed << "\n";
+  out << indent << "reachable_productions_traversed: "
+      << counters.reachable_productions_traversed << "\n";
+  out << indent << "reachable_temp_clades_traversed: "
+      << counters.reachable_temp_clades_traversed << "\n";
+  out << indent << "reachable_temp_productions_traversed: "
+      << counters.reachable_temp_productions_traversed << "\n";
+  out << indent << "reachability_full_grammar_like_passes: "
+      << counters.reachability_full_grammar_like_passes << "\n";
+}
+
+static void run_chart_spr_helper_benchmark(
+    std::ostream& out, polytomy_refinement_result& refinement,
+    double grammar_build_ms, site_pattern_set& patterns,
+    double pattern_build_ms, args const& a) {
+  auto const& grammar = refinement.grammar;
+  chart_options chart_opts;
+  chart_opts.score_ua_edge = a.chart_score_ua_edge;
+
+  chart_spr_search_counters counters;
+  counters.grammar_rebuilds = 1;
+  counters.pattern_rebuilds = 1;
+  counters.skipped_invariant_sites = patterns.skipped_invariant_site_count;
+
+  auto composite_start = std::chrono::steady_clock::now();
+  auto composite = build_composite_chart_score(grammar, patterns, chart_opts);
+  auto composite_ms = elapsed_ms(composite_start,
+                                 std::chrono::steady_clock::now());
+
+  grammar_spr_enumeration_options enum_opts;
+  enum_opts.max_candidates = a.chart_spr_helper_benchmark_max_candidates;
+  auto generation_start = std::chrono::steady_clock::now();
+  auto enumeration = enumerate_grammar_spr_candidates_eager_diagnostic(
+      grammar, enum_opts, &counters);
+  auto generation_ms = elapsed_ms(generation_start,
+                                  std::chrono::steady_clock::now());
+
+  double helper_ms_total = 0.0;
+  std::size_t helper_improving_candidates = 0;
+  std::size_t helper_failures = 0;
+  std::string helper_last_error;
+  for (auto const& candidate : enumeration.candidates) {
+    auto start = std::chrono::steady_clock::now();
+    try {
+      auto score = score_multisite_spr_candidate_lower_bound_oracle(
+          grammar, patterns, candidate, chart_opts, &counters);
+      if (score.improves()) ++helper_improving_candidates;
+    } catch (std::exception const& e) {
+      ++helper_failures;
+      helper_last_error = e.what();
+    }
+    helper_ms_total += elapsed_ms(start, std::chrono::steady_clock::now());
+  }
+
+  bool local_oracle_available = !patterns.patterns.empty();
+  double local_oracle_base_chart_ms = 0.0;
+  double local_oracle_ms_total = 0.0;
+  std::size_t local_oracle_failures = 0;
+  std::string local_oracle_last_error;
+  std::vector<std::size_t> affected_counts;
+  single_site_chart base_chart;
+  leaf_site_states first_pattern_states;
+  if (local_oracle_available) {
+    first_pattern_states.state_by_taxon = patterns.patterns.front().state_by_taxon;
+    auto start = std::chrono::steady_clock::now();
+    base_chart = build_single_site_chart(grammar, first_pattern_states,
+                                         chart_opts);
+    local_oracle_base_chart_ms = elapsed_ms(start,
+                                            std::chrono::steady_clock::now());
+  }
+
+  if (local_oracle_available) {
+    for (auto const& candidate : enumeration.candidates) {
+      auto start = std::chrono::steady_clock::now();
+      try {
+        auto overlay = overlay_from_candidate(grammar, candidate);
+        auto local = score_rejected_candidate_with_local_recompute_oracle(
+            overlay, base_chart, first_pattern_states, chart_opts, &counters);
+        affected_counts.push_back(local.affected_clade_count);
+      } catch (std::exception const& e) {
+        ++local_oracle_failures;
+        local_oracle_last_error = e.what();
+      }
+      local_oracle_ms_total += elapsed_ms(start,
+                                          std::chrono::steady_clock::now());
+    }
+  }
+
+  auto affected = summarize_affected_clade_counts(std::move(affected_counts));
+  auto candidate_count = enumeration.candidates.size();
+  auto helper_ms_per_candidate = candidate_count == 0
+                                     ? 0.0
+                                     : helper_ms_total /
+                                           static_cast<double>(candidate_count);
+  auto local_oracle_ms_per_candidate = candidate_count == 0
+                                           ? 0.0
+                                           : local_oracle_ms_total /
+                                                 static_cast<double>(candidate_count);
+
+  out << "chart_spr_helper_benchmark:\n";
+  out << "  benchmark_scope: CHART_SPR_PHASE0_HELPER_BASELINE\n";
+  out << "  diagnostic_oracle_path: true\n";
+  out << "  score_ua_edge: "
+      << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+  out << "  grammar_build_ms: " << std::fixed << std::setprecision(3)
+      << grammar_build_ms << "\n";
+  out << "  pattern_extraction_ms: " << std::fixed << std::setprecision(3)
+      << pattern_build_ms << "\n";
+  out << "  composite_chart_ms: " << std::fixed << std::setprecision(3)
+      << composite_ms << "\n";
+  out << "  baseline_composite_lower_bound: "
+      << composite.weighted_lower_bound << "\n";
+  out << "  baseline_full_composite_rebuilds: 1\n";
+  out << "  candidate_generation_ms: " << std::fixed << std::setprecision(3)
+      << generation_ms << "\n";
+  out << "  candidate_count: " << candidate_count << "\n";
+  out << "  candidate_cap: " << enum_opts.max_candidates << "\n";
+  out << "  current_helper_ms_total: " << std::fixed << std::setprecision(3)
+      << helper_ms_total << "\n";
+  out << "  current_helper_ms_per_candidate: " << std::fixed
+      << std::setprecision(6) << helper_ms_per_candidate << "\n";
+  out << "  current_helper_failures: " << helper_failures << "\n";
+  if (!helper_last_error.empty())
+    out << "  current_helper_last_error: " << helper_last_error << "\n";
+  out << "  current_helper_improving_candidates: "
+      << helper_improving_candidates << "\n";
+  out << "  local_recompute_oracle_available: "
+      << (local_oracle_available ? "true" : "false") << "\n";
+  out << "  local_recompute_oracle_base_chart_ms: " << std::fixed
+      << std::setprecision(3) << local_oracle_base_chart_ms << "\n";
+  out << "  local_recompute_oracle_ms_total: " << std::fixed
+      << std::setprecision(3) << local_oracle_ms_total << "\n";
+  out << "  local_recompute_oracle_ms_per_candidate: " << std::fixed
+      << std::setprecision(6) << local_oracle_ms_per_candidate << "\n";
+  out << "  local_recompute_oracle_failures: "
+      << local_oracle_failures << "\n";
+  if (!local_oracle_last_error.empty())
+    out << "  local_recompute_oracle_last_error: "
+        << local_oracle_last_error << "\n";
+  out << "  affected_clade_count_distribution:\n";
+  out << "    mean: " << std::fixed << std::setprecision(3)
+      << affected.mean << "\n";
+  out << "    p50: " << affected.p50 << "\n";
+  out << "    p95: " << affected.p95 << "\n";
+  out << "    max: " << affected.max << "\n";
+  out << "  candidate_generation:\n";
+  out << "    stop_reason: "
+      << chart_spr_candidate_stop_reason_name(enumeration.stats.stop_reason)
+      << "\n";
+  out << "    upward_path_iterator_steps: "
+      << enumeration.stats.upward_path_iterator_steps << "\n";
+  out << "    upward_paths_completed: "
+      << enumeration.stats.upward_paths_completed << "\n";
+  out << "    path_pairs_considered: "
+      << enumeration.stats.path_pairs_considered << "\n";
+  out << "    candidates_constructed: "
+      << enumeration.stats.candidates_constructed << "\n";
+  out << "    candidates_pruned_before_construction: "
+      << enumeration.stats.candidates_pruned_before_construction << "\n";
+  out << "    candidates_pruned_after_construction: "
+      << enumeration.stats.candidates_pruned_after_construction << "\n";
+  out << "  counters:\n";
+  print_chart_spr_search_counter_fields(out, counters, "    ");
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -2177,6 +2410,14 @@ int main(int argc, char** argv) try {
 
   if (a.wric_benchmark || a.wric_polytomy_benchmark) {
     run_wric_polytomy_benchmark(std::cout, result, a);
+  }
+
+  if (a.chart_spr_helper_benchmark) {
+    auto& refinement = get_chart_refinement();
+    auto& patterns = get_exact_patterns();
+    run_chart_spr_helper_benchmark(std::cout, refinement,
+                                   chart_grammar_build_ms, patterns,
+                                   exact_pattern_build_ms, a);
   }
 
   if (a.chart_site) {

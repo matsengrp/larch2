@@ -367,6 +367,33 @@ add_test(NAME dagutil_wric_phase9_chart_bnb_trim
 set_tests_properties(dagutil_wric_phase9_chart_bnb_trim
                      PROPERTIES PASS_REGULAR_EXPRESSION "chart_bnb_trim:")
 
+add_test(NAME dagutil_chart_spr_helper_benchmark
+         COMMAND dagutil
+                 --dag-pb data/test_5_trees/tree_0.pb.gz
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-spr-helper-benchmark
+                 --chart-spr-helper-benchmark-max-candidates 1
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_chart_spr_helper_benchmark
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "full_composite_rebuilds: 2")
+
+add_test(NAME dagutil_chart_spr_helper_benchmark_seedtree_larger_fixture
+         COMMAND dagutil
+                 --tree-pb data/seedtree/seedtree.pb.gz
+                 --refseq data/seedtree/refseq.txt.gz
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-spr-helper-benchmark
+                 --chart-spr-helper-benchmark-max-candidates 1
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_chart_spr_helper_benchmark_seedtree_larger_fixture
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "full_composite_rebuilds: 2")
+
 add_test(NAME dagutil_wric_phase9_chart_fluidity_site
          COMMAND dagutil
                  --dag-pb data/test_5_trees/tree_0.pb.gz
@@ -722,7 +749,8 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   inplace_spr_test wric_phase0_test clade_grammar_test
                   polytomy_refinement_test parsimony_chart_test
                   site_patterns_test chart_trim_test
-                  chart_spr_test plateau_test rank3_rewrite_test)
+                  chart_spr_test chart_spr_search_test plateau_test
+                  rank3_rewrite_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
     add_test(NAME ${test_name} COMMAND ${test_name}
@@ -730,6 +758,10 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
 endforeach()
 set_tests_properties(merge_consistency_test rotaA_diagnostic_test
                      PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME no_direct_chart_spr_multisite_helpers
+         COMMAND bash test/no_direct_chart_spr_multisite_helpers.sh
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Vulkan compute tests
 if(ENABLE_VULKAN)

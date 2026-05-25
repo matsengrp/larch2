@@ -1247,6 +1247,13 @@ inline spr_score_result score_single_site_spr_candidate(
                                    reference_state);
 }
 
+// Diagnostic/oracle helper, not production hot-loop scoring.  This builds a
+// dense overlay grammar for the candidate and then calls
+// build_composite_chart_score() on both the base grammar and the overlay
+// grammar.  Used naively, rejected candidates pay two full composite chart
+// rebuilds each; production chart-SPR search must use cached local scoring
+// instead.  The result is a composite lower bound, not an exact coupled
+// multi-site objective.
 inline spr_score_result score_multisite_spr_candidate_lower_bound(
     clade_grammar const& base, site_pattern_set const& patterns,
     grammar_spr_candidate const& candidate, chart_options const& options = {}) {
@@ -1261,6 +1268,11 @@ inline spr_score_result score_multisite_spr_candidate_lower_bound(
                           old_score, new_score, false};
 }
 
+// Diagnostic/oracle helper, not production top-K verification.  This
+// materializes the candidate overlay and recomputes both the old exact trim and
+// the new exact trim from scratch.  Production exact verification should reuse
+// the search state's cached old exact score and build only the candidate's new
+// exact objective for the small verified set.
 inline spr_score_result score_multisite_spr_candidate_exact(
     clade_grammar const& base, site_pattern_set const& patterns,
     grammar_spr_candidate const& candidate, chart_options const& options = {},
