@@ -1101,6 +1101,17 @@ inline void chart_spr_append_taxa_key(std::ostringstream& out,
   out << "}";
 }
 
+inline void chart_spr_append_optional_ref_taxa_key(
+    std::ostringstream& out, clade_grammar const& base,
+    grammar_spr_candidate const& candidate, overlay_clade_ref ref) {
+  if (ref.id == no_clade) {
+    chart_spr_append_taxa_key(out, std::vector<taxon_id>{});
+    return;
+  }
+  chart_spr_append_taxa_key(
+      out, chart_spr_clade_taxa_for_ref(base, candidate, ref));
+}
+
 inline void chart_spr_append_production_taxa_signature(
     std::ostringstream& out, std::vector<taxon_id> parent_taxa,
     std::vector<std::vector<taxon_id>> child_taxa) {
@@ -1117,21 +1128,17 @@ inline std::string chart_spr_candidate_taxon_signature(
     clade_grammar const& base, grammar_spr_candidate const& candidate) {
   std::ostringstream out;
   out << "m=";
-  chart_spr_append_taxa_key(
-      out, chart_spr_clade_taxa_for_ref(base, candidate,
-                                        candidate.moved_clade));
+  chart_spr_append_optional_ref_taxa_key(out, base, candidate,
+                                         candidate.moved_clade);
   out << ";op=";
-  chart_spr_append_taxa_key(
-      out, chart_spr_clade_taxa_for_ref(base, candidate,
-                                        candidate.old_parent));
+  chart_spr_append_optional_ref_taxa_key(out, base, candidate,
+                                         candidate.old_parent);
   out << ";os=";
-  chart_spr_append_taxa_key(
-      out, chart_spr_clade_taxa_for_ref(base, candidate,
-                                        candidate.old_sibling));
+  chart_spr_append_optional_ref_taxa_key(out, base, candidate,
+                                         candidate.old_sibling);
   out << ";nt=";
-  chart_spr_append_taxa_key(
-      out, chart_spr_clade_taxa_for_ref(base, candidate,
-                                        candidate.new_sibling_or_target));
+  chart_spr_append_optional_ref_taxa_key(
+      out, base, candidate, candidate.new_sibling_or_target);
 
   std::vector<std::vector<taxon_id>> added_clades;
   added_clades.reserve(candidate.added_clades.size());

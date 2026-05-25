@@ -6,6 +6,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
+#include <limits>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -29,10 +31,9 @@ struct chart_spr_search_counters {
   // state sidecar rebuilds and must be reported separately.
   std::size_t full_overlay_materializations = 0;
   std::size_t overlay_materializations_for_oracle = 0;
-  // Phase-1 bridge path: local scorer reuses cached base charts but still
-  // materializes one dense overlay per candidate until Phase-3 overlay-delta
-  // scoring replaces this implementation detail.  Count it separately from
-  // oracle/debug materializations.
+  // Legacy Phase-1 bridge path counter.  The Phase-3 overlay-delta scorer
+  // should leave this at zero; keep the field so diagnostics can catch
+  // accidental regressions to dense overlay materialization in local scoring.
   std::size_t overlay_materializations_for_local_scoring_bridge = 0;
   std::size_t overlay_materializations_for_exact_verification = 0;
   std::size_t overlay_materializations_for_accept_materialization = 0;
@@ -167,6 +168,8 @@ struct chart_spr_candidate_score {
   chart_spr_topology_selection topology_selection;
   std::size_t affected_clade_count = 0;
   double local_score_ms = 0.0;
+  bool valid = true;
+  std::string invalid_reason;
 };
 
 struct affected_clade_distribution {
@@ -576,7 +579,7 @@ struct chart_spr_search_state {
   // once when comparing/reporting the full objective.
   std::optional<multisite_trim_result> exact_trim_active_only;
 
-  chart_spr_search_counters counters;
+  mutable chart_spr_search_counters counters;
 };
 
 inline std::size_t estimate_chart_spr_pattern_cache_bytes(
@@ -677,49 +680,878 @@ inline chart_spr_search_state build_chart_spr_search_state(
   return state;
 }
 
-// Phase-1 local scoring entry point.  This uses the existing materialized
-// overlay-local recompute as the implementation bridge until the Phase-3
-// lightweight overlay-delta scorer replaces the materialization step.  It
-// reuses the state's cached base charts and does not call
-// build_composite_chart_score() per rejected candidate.  Bridge overlay
-// materializations are counted as local-scoring bridge work, not oracle work.
+inline constexpr std::size_t chart_spr_overlay_row_npos =
+    std::numeric_limits<std::size_t>::max();
+
+struct overlay_reachability_stats {
+  std::size_t reachable_clades = 0;
+  std::size_t reachable_productions = 0;
+  std::size_t reachable_temp_clades = 0;
+  std::size_t reachable_temp_productions = 0;
+  bool full_grammar_like = false;
+};
+
+struct spr_overlay_delta {
+  clade_grammar const* base = nullptr;
+  grammar_spr_candidate const* candidate = nullptr;
+
+  std::vector<clade_key> temp_clades;
+  std::vector<overlay_grammar_production> temp_productions;
+  std::vector<production_id> removed_base_productions;
+
+  // Affected base clades plus temp clades, sorted bottom-up.
+  std::vector<overlay_clade_ref> affected_order;
+  std::vector<bool> affected_base_clade;
+  std::vector<bool> affected_temp_clade;
+  std::vector<std::size_t> affected_base_row_slot;
+  std::vector<std::size_t> affected_temp_row_slot;
+
+  overlay_clade_ref root;
+  overlay_reachability_stats reachability_stats;
+
+  // Candidate-local indices built once and reused across all active patterns.
+  std::vector<bool> removed_base_production;
+  std::vector<bool> reachable_base_clade;
+  std::vector<bool> reachable_temp_clade;
+  std::vector<std::vector<production_id>> temp_productions_by_base_parent;
+  std::vector<std::vector<production_id>> temp_productions_by_temp_parent;
+  std::vector<std::vector<production_id>> temp_productions_by_base_child;
+  std::vector<std::vector<production_id>> temp_productions_by_temp_child;
+};
+
+struct local_overlay_chart_rows {
+  static constexpr std::size_t npos = chart_spr_overlay_row_npos;
+
+  // Rows only for affected base clades and reachable temp clades.  Slot maps
+  // are candidate-delta owned, not rebuilt for every active pattern.
+  std::vector<std::array<chart_cost, nuc_state_count>> rows;
+  std::vector<std::size_t> const* base_row_slot = nullptr;
+  std::vector<std::size_t> const* temp_row_slot = nullptr;
+
+  [[nodiscard]] std::size_t slot_for(overlay_clade_ref ref) const {
+    if (ref.space == overlay_id_space::base) {
+      if (base_row_slot == nullptr) {
+        throw std::runtime_error(
+            "chart SPR overlay-delta row: missing base row slot map");
+      }
+      auto const& slots = *base_row_slot;
+      if (ref.id == no_clade || ref.id >= slots.size()) {
+        throw std::runtime_error(
+            "chart SPR overlay-delta row: base clade ref out of range");
+      }
+      return slots[ref.id];
+    }
+    if (temp_row_slot == nullptr) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta row: missing temp row slot map");
+    }
+    auto const& slots = *temp_row_slot;
+    if (ref.id == no_clade || ref.id >= slots.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta row: temp clade ref out of range");
+    }
+    return slots[ref.id];
+  }
+
+  [[nodiscard]] bool has_local_row(overlay_clade_ref ref) const {
+    return slot_for(ref) != npos;
+  }
+};
+
+struct local_spr_score_options {
+  bool verify_against_full_overlay = false;  // tests/debug only
+  bool exact_multisite = false;              // false = composite/lower bound
+  bool validate_cached_chart_shapes = false; // tests/debug only
+
+  // Mark reachability validation as full-grammar-like when visited base
+  // clades or productions exceed this fraction of the base grammar.  0
+  // disables the flag.
+  double full_grammar_like_reachability_fraction = 0.50;
+};
+
+namespace chart_spr_search_detail {
+
+inline clade_key const& overlay_delta_clade_key(spr_overlay_delta const& delta,
+                                                overlay_clade_ref ref) {
+  if (delta.base == nullptr) {
+    throw std::runtime_error("chart SPR overlay-delta: missing base grammar");
+  }
+  if (ref.space == overlay_id_space::base) {
+    if (ref.id == no_clade || ref.id >= delta.base->clades.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: base clade ref out of range");
+    }
+    return delta.base->clades[ref.id];
+  }
+  if (ref.id == no_clade || ref.id >= delta.temp_clades.size()) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: temp clade ref out of range");
+  }
+  return delta.temp_clades[ref.id];
+}
+
+inline std::size_t overlay_delta_clade_size(spr_overlay_delta const& delta,
+                                            overlay_clade_ref ref) {
+  return overlay_delta_clade_key(delta, ref).taxa.size();
+}
+
+inline bool overlay_delta_base_production_removed(
+    spr_overlay_delta const& delta, production_id pid) {
+  if (pid == no_production || pid >= delta.removed_base_production.size()) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: base production id out of range");
+  }
+  return delta.removed_base_production[pid];
+}
+
+inline bool overlay_delta_ref_is_reachable(spr_overlay_delta const& delta,
+                                           overlay_clade_ref ref) {
+  if (ref.space == overlay_id_space::base) {
+    if (ref.id == no_clade || ref.id >= delta.reachable_base_clade.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: base reachability ref out of range");
+    }
+    return delta.reachable_base_clade[ref.id];
+  }
+  if (ref.id == no_clade || ref.id >= delta.reachable_temp_clade.size()) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: temp reachability ref out of range");
+  }
+  return delta.reachable_temp_clade[ref.id];
+}
+
+inline std::array<chart_cost, nuc_state_count> overlay_delta_leaf_row(
+    spr_overlay_delta const& delta, overlay_clade_ref ref,
+    leaf_site_states const& leaf_states) {
+  auto const& key = overlay_delta_clade_key(delta, ref);
+  if (key.taxa.size() != 1) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: leaf row requested for non-leaf clade");
+  }
+  auto taxon = key.taxa.front();
+  if (taxon >= leaf_states.state_by_taxon.size()) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: leaf taxon out of state range");
+  }
+  auto observed = leaf_states.state_by_taxon[taxon];
+  parsimony_chart_detail::validate_state(observed,
+                                         "overlay-delta leaf state");
+  auto row = parsimony_chart_detail::make_inf_row();
+  row[observed] = 0;
+  return row;
+}
+
+inline void validate_overlay_delta_binary_partition(
+    spr_overlay_delta const& delta, overlay_grammar_production const& prod,
+    production_id pid) {
+  if (prod.children.size() != 2) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: temp production " +
+        std::to_string(pid) + " has arity " +
+        std::to_string(prod.children.size()) +
+        "; local scoring requires binary productions");
+  }
+
+  auto const& parent_taxa = overlay_delta_clade_key(delta, prod.parent).taxa;
+  std::vector<taxon_id> covered;
+  for (auto child : prod.children) {
+    auto const& child_taxa = overlay_delta_clade_key(delta, child).taxa;
+    if (child_taxa.size() >= parent_taxa.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: temp production child is not smaller "
+          "than parent");
+    }
+    if (!std::includes(parent_taxa.begin(), parent_taxa.end(),
+                       child_taxa.begin(), child_taxa.end())) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: temp production child is not a subset "
+          "of parent");
+    }
+
+    std::vector<taxon_id> overlap;
+    std::set_intersection(covered.begin(), covered.end(),
+                          child_taxa.begin(), child_taxa.end(),
+                          std::back_inserter(overlap));
+    if (!overlap.empty()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: temp production children overlap");
+    }
+
+    std::vector<taxon_id> next;
+    std::set_union(covered.begin(), covered.end(), child_taxa.begin(),
+                   child_taxa.end(), std::back_inserter(next));
+    covered = std::move(next);
+  }
+  if (covered != parent_taxa) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: temp production children do not union to "
+        "the parent clade");
+  }
+}
+
+inline void append_temp_production_index(
+    std::vector<std::vector<production_id>>& base_index,
+    std::vector<std::vector<production_id>>& temp_index, overlay_clade_ref ref,
+    production_id pid) {
+  if (ref.space == overlay_id_space::base) {
+    if (ref.id == no_clade || ref.id >= base_index.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: base ref out of temp index range");
+    }
+    base_index[ref.id].push_back(pid);
+  } else {
+    if (ref.id == no_clade || ref.id >= temp_index.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: temp ref out of temp index range");
+    }
+    temp_index[ref.id].push_back(pid);
+  }
+}
+
+inline std::vector<production_id> const& temp_productions_for_parent(
+    spr_overlay_delta const& delta, overlay_clade_ref parent) {
+  if (parent.space == overlay_id_space::base) {
+    if (parent.id == no_clade ||
+        parent.id >= delta.temp_productions_by_base_parent.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: base parent out of temp index range");
+    }
+    return delta.temp_productions_by_base_parent[parent.id];
+  }
+  if (parent.id == no_clade ||
+      parent.id >= delta.temp_productions_by_temp_parent.size()) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: temp parent out of temp index range");
+  }
+  return delta.temp_productions_by_temp_parent[parent.id];
+}
+
+inline std::size_t available_production_count_for_parent(
+    spr_overlay_delta const& delta, overlay_clade_ref parent) {
+  auto const& base = *delta.base;
+  std::size_t count = 0;
+  if (parent.space == overlay_id_space::base) {
+    if (parent.id == no_clade || parent.id >= base.productions_by_parent.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: base parent out of range");
+    }
+    for (auto pid : base.productions_by_parent[parent.id]) {
+      if (!overlay_delta_base_production_removed(delta, pid)) ++count;
+    }
+  }
+  count += temp_productions_for_parent(delta, parent).size();
+  return count;
+}
+
+inline void validate_reachable_base_production(
+    spr_overlay_delta const& delta, production_id pid) {
+  auto const& base = *delta.base;
+  if (pid == no_production || pid >= base.productions.size()) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: reachable base production out of range");
+  }
+  auto const& prod = base.productions[pid];
+  if (prod.children.size() != 2) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: reachable base production " +
+        std::to_string(pid) + " has arity " +
+        std::to_string(prod.children.size()) +
+        "; local scoring requires binary productions");
+  }
+  parsimony_chart_detail::validate_binary_production_partition(base, prod,
+                                                               pid);
+}
+
+inline void mark_overlay_delta_affected(
+    spr_overlay_delta const& delta, std::vector<bool>& affected_base,
+    std::vector<bool>& affected_temp, std::vector<overlay_clade_ref>& queue,
+    overlay_clade_ref ref) {
+  (void)overlay_delta_clade_key(delta, ref);
+  if (ref.space == overlay_id_space::base) {
+    if (!affected_base[ref.id]) {
+      affected_base[ref.id] = true;
+      queue.push_back(ref);
+    }
+  } else {
+    if (!affected_temp[ref.id]) {
+      affected_temp[ref.id] = true;
+      queue.push_back(ref);
+    }
+  }
+}
+
+inline bool overlay_delta_ref_present(overlay_clade_ref ref) {
+  return ref.id != no_clade;
+}
+
+inline void mark_overlay_delta_affected_if_present(
+    spr_overlay_delta const& delta, std::vector<bool>& affected_base,
+    std::vector<bool>& affected_temp, std::vector<overlay_clade_ref>& queue,
+    overlay_clade_ref ref) {
+  if (!overlay_delta_ref_present(ref)) return;
+  mark_overlay_delta_affected(delta, affected_base, affected_temp, queue, ref);
+}
+
+inline void validate_reachable_overlay_clade(
+    spr_overlay_delta const& delta, overlay_clade_ref ref) {
+  auto size = overlay_delta_clade_size(delta, ref);
+  auto available = available_production_count_for_parent(delta, ref);
+  if (size == 1) {
+    if (available != 0) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: reachable singleton clade has "
+          "available productions");
+    }
+    return;
+  }
+  if (available == 0) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: reachable non-singleton clade has no "
+        "available productions");
+  }
+}
+
+inline void build_overlay_delta_temp_indices(spr_overlay_delta& delta) {
+  auto const& base = *delta.base;
+  delta.temp_productions_by_base_parent.assign(base.clades.size(), {});
+  delta.temp_productions_by_temp_parent.assign(delta.temp_clades.size(), {});
+  delta.temp_productions_by_base_child.assign(base.clades.size(), {});
+  delta.temp_productions_by_temp_child.assign(delta.temp_clades.size(), {});
+
+  for (std::size_t i = 0; i < delta.temp_productions.size(); ++i) {
+    auto pid = static_cast<production_id>(i);
+    auto const& prod = delta.temp_productions[i];
+    validate_overlay_delta_binary_partition(delta, prod, pid);
+    append_temp_production_index(delta.temp_productions_by_base_parent,
+                                 delta.temp_productions_by_temp_parent,
+                                 prod.parent, pid);
+
+    auto children = prod.children;
+    std::sort(children.begin(), children.end());
+    children.erase(std::unique(children.begin(), children.end()),
+                   children.end());
+    for (auto child : children) {
+      append_temp_production_index(delta.temp_productions_by_base_child,
+                                   delta.temp_productions_by_temp_child,
+                                   child, pid);
+    }
+  }
+}
+
+inline void compute_overlay_delta_reachability(
+    spr_overlay_delta& delta,
+    local_spr_score_options const& options) {
+  auto const& base = *delta.base;
+  delta.reachable_base_clade.assign(base.clades.size(), false);
+  delta.reachable_temp_clade.assign(delta.temp_clades.size(), false);
+  delta.reachability_stats = overlay_reachability_stats{};
+
+  std::size_t reachable_base_clades = 0;
+  std::size_t reachable_base_productions = 0;
+  std::vector<overlay_clade_ref> stack{delta.root};
+  while (!stack.empty()) {
+    auto ref = stack.back();
+    stack.pop_back();
+    (void)overlay_delta_clade_key(delta, ref);
+
+    bool newly_reachable = false;
+    if (ref.space == overlay_id_space::base) {
+      newly_reachable = !delta.reachable_base_clade[ref.id];
+      if (newly_reachable) {
+        delta.reachable_base_clade[ref.id] = true;
+        ++reachable_base_clades;
+      }
+    } else {
+      newly_reachable = !delta.reachable_temp_clade[ref.id];
+      if (newly_reachable) {
+        delta.reachable_temp_clade[ref.id] = true;
+        ++delta.reachability_stats.reachable_temp_clades;
+      }
+    }
+    if (!newly_reachable) continue;
+
+    validate_reachable_overlay_clade(delta, ref);
+
+    if (ref.space == overlay_id_space::base) {
+      for (auto pid : base.productions_by_parent[ref.id]) {
+        if (overlay_delta_base_production_removed(delta, pid)) continue;
+        validate_reachable_base_production(delta, pid);
+        ++reachable_base_productions;
+        for (auto child : base.productions[pid].children) {
+          stack.push_back(base_clade_ref(child));
+        }
+      }
+    }
+
+    for (auto temp_pid : temp_productions_for_parent(delta, ref)) {
+      if (temp_pid == no_production ||
+          temp_pid >= delta.temp_productions.size()) {
+        throw std::runtime_error(
+            "chart SPR overlay-delta: temp production id out of range");
+      }
+      ++delta.reachability_stats.reachable_temp_productions;
+      auto const& prod = delta.temp_productions[temp_pid];
+      validate_overlay_delta_binary_partition(delta, prod, temp_pid);
+      for (auto child : prod.children) stack.push_back(child);
+    }
+  }
+
+  delta.reachability_stats.reachable_clades =
+      reachable_base_clades + delta.reachability_stats.reachable_temp_clades;
+  delta.reachability_stats.reachable_productions =
+      reachable_base_productions +
+      delta.reachability_stats.reachable_temp_productions;
+
+  auto fraction = options.full_grammar_like_reachability_fraction;
+  if (fraction > 0.0) {
+    bool base_clade_like =
+        !base.clades.empty() &&
+        (static_cast<double>(reachable_base_clades) /
+             static_cast<double>(base.clades.size()) >
+         fraction);
+    bool base_production_like =
+        !base.productions.empty() &&
+        (static_cast<double>(reachable_base_productions) /
+             static_cast<double>(base.productions.size()) >
+         fraction);
+    delta.reachability_stats.full_grammar_like =
+        base_clade_like || base_production_like;
+  }
+}
+
+inline void compute_overlay_delta_affected_order(spr_overlay_delta& delta) {
+  auto const& base = *delta.base;
+  std::vector<bool> affected_base(base.clades.size(), false);
+  std::vector<bool> affected_temp(delta.temp_clades.size(), false);
+  std::vector<overlay_clade_ref> queue;
+
+  for (std::size_t i = 0; i < delta.temp_clades.size(); ++i) {
+    mark_overlay_delta_affected(delta, affected_base, affected_temp, queue,
+                                temp_clade_ref(static_cast<clade_id>(i)));
+  }
+  for (auto pid : delta.removed_base_productions) {
+    if (pid == no_production || pid >= base.productions.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: removed production out of range");
+    }
+    mark_overlay_delta_affected(delta, affected_base, affected_temp, queue,
+                                base_clade_ref(base.productions[pid].parent));
+  }
+  for (std::size_t i = 0; i < delta.temp_productions.size(); ++i) {
+    mark_overlay_delta_affected(delta, affected_base, affected_temp, queue,
+                                delta.temp_productions[i].parent);
+  }
+  if (delta.candidate != nullptr) {
+    mark_overlay_delta_affected_if_present(delta, affected_base,
+                                           affected_temp, queue,
+                                           delta.candidate->old_parent);
+    mark_overlay_delta_affected_if_present(
+        delta, affected_base, affected_temp, queue,
+        delta.candidate->new_sibling_or_target);
+  }
+
+  for (std::size_t head = 0; head < queue.size(); ++head) {
+    auto child = queue[head];
+    if (child.space == overlay_id_space::base) {
+      for (auto pid : base.productions_by_child[child.id]) {
+        if (overlay_delta_base_production_removed(delta, pid)) continue;
+        auto parent = base.productions[pid].parent;
+        mark_overlay_delta_affected(delta, affected_base, affected_temp, queue,
+                                    base_clade_ref(parent));
+      }
+      for (auto temp_pid : delta.temp_productions_by_base_child[child.id]) {
+        mark_overlay_delta_affected(delta, affected_base, affected_temp, queue,
+                                    delta.temp_productions[temp_pid].parent);
+      }
+    } else {
+      for (auto temp_pid : delta.temp_productions_by_temp_child[child.id]) {
+        mark_overlay_delta_affected(delta, affected_base, affected_temp, queue,
+                                    delta.temp_productions[temp_pid].parent);
+      }
+    }
+  }
+
+  delta.affected_base_clade.assign(base.clades.size(), false);
+  delta.affected_temp_clade.assign(delta.temp_clades.size(), false);
+  delta.affected_base_row_slot.assign(base.clades.size(),
+                                      chart_spr_overlay_row_npos);
+  delta.affected_temp_row_slot.assign(delta.temp_clades.size(),
+                                      chart_spr_overlay_row_npos);
+  delta.affected_order.clear();
+  for (clade_id cid = 0; cid < base.clades.size(); ++cid) {
+    if (!affected_base[cid] || !delta.reachable_base_clade[cid]) continue;
+    delta.affected_order.push_back(base_clade_ref(cid));
+  }
+  for (clade_id cid = 0; cid < delta.temp_clades.size(); ++cid) {
+    if (!affected_temp[cid] || !delta.reachable_temp_clade[cid]) continue;
+    delta.affected_order.push_back(temp_clade_ref(cid));
+  }
+
+  std::stable_sort(delta.affected_order.begin(), delta.affected_order.end(),
+                   [&](overlay_clade_ref lhs, overlay_clade_ref rhs) {
+                     auto lsize = overlay_delta_clade_size(delta, lhs);
+                     auto rsize = overlay_delta_clade_size(delta, rhs);
+                     if (lsize != rsize) return lsize < rsize;
+                     return lhs < rhs;
+                   });
+
+  for (std::size_t slot = 0; slot < delta.affected_order.size(); ++slot) {
+    auto ref = delta.affected_order[slot];
+    if (ref.space == overlay_id_space::base) {
+      delta.affected_base_clade[ref.id] = true;
+      delta.affected_base_row_slot[ref.id] = slot;
+    } else {
+      delta.affected_temp_clade[ref.id] = true;
+      delta.affected_temp_row_slot[ref.id] = slot;
+    }
+  }
+}
+
+inline void record_overlay_delta_reachability_counters(
+    chart_spr_search_counters& counters,
+    overlay_reachability_stats const& stats) {
+  ++counters.overlay_reachability_validations;
+  counters.reachable_clades_traversed += stats.reachable_clades;
+  counters.reachable_productions_traversed += stats.reachable_productions;
+  counters.reachable_temp_clades_traversed += stats.reachable_temp_clades;
+  counters.reachable_temp_productions_traversed +=
+      stats.reachable_temp_productions;
+  if (stats.full_grammar_like) ++counters.reachability_full_grammar_like_passes;
+}
+
+}  // namespace chart_spr_search_detail
+
+inline spr_overlay_delta build_spr_overlay_delta(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    local_spr_score_options const& options = {}) {
+  if (base.root_clade == no_clade || base.root_clade >= base.clades.size()) {
+    throw std::runtime_error("chart SPR overlay-delta: root clade out of range");
+  }
+
+  spr_overlay_delta delta;
+  delta.base = &base;
+  delta.candidate = &candidate;
+  delta.temp_clades = candidate.added_clades;
+  delta.temp_productions = candidate.added_productions;
+  delta.root = base_clade_ref(base.root_clade);
+
+  auto taxon_count = base.taxa.id_to_sample_id.size();
+  for (std::size_t i = 0; i < delta.temp_clades.size(); ++i) {
+    chart_spr_detail::validate_clade_key(
+        delta.temp_clades[i], taxon_count,
+        "overlay-delta temp clade " + std::to_string(i));
+  }
+
+  delta.removed_base_productions.reserve(candidate.removed_productions.size());
+  for (auto ref : candidate.removed_productions) {
+    if (ref.space != overlay_id_space::base) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: candidates may tombstone only base "
+          "productions");
+    }
+    if (ref.id == no_production || ref.id >= base.productions.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: removed production out of range");
+    }
+    delta.removed_base_productions.push_back(ref.id);
+  }
+  std::sort(delta.removed_base_productions.begin(),
+            delta.removed_base_productions.end());
+  delta.removed_base_productions.erase(
+      std::unique(delta.removed_base_productions.begin(),
+                  delta.removed_base_productions.end()),
+      delta.removed_base_productions.end());
+
+  delta.removed_base_production.assign(base.productions.size(), false);
+  for (auto pid : delta.removed_base_productions) {
+    delta.removed_base_production[pid] = true;
+  }
+
+  chart_spr_search_detail::build_overlay_delta_temp_indices(delta);
+  chart_spr_search_detail::compute_overlay_delta_reachability(delta, options);
+  chart_spr_search_detail::compute_overlay_delta_affected_order(delta);
+  return delta;
+}
+
+inline std::array<chart_cost, nuc_state_count> const&
+local_overlay_chart_row(local_overlay_chart_rows const& rows,
+                        single_site_chart const& base_chart,
+                        overlay_clade_ref ref) {
+  auto slot = rows.slot_for(ref);
+  if (slot != local_overlay_chart_rows::npos) {
+    if (slot >= rows.rows.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta row: local row slot out of range");
+    }
+    return rows.rows[slot];
+  }
+  if (ref.space != overlay_id_space::base) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta row: reachable temp clade has no local row");
+  }
+  if (ref.id == no_clade || ref.id >= base_chart.inside.size()) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta row: base chart row out of range");
+  }
+  return base_chart.inside[ref.id];
+}
+
+struct overlay_row_provider {
+  spr_overlay_delta const& delta;
+  single_site_chart const& base_chart;
+  local_overlay_chart_rows const& local_rows;
+
+  [[nodiscard]] std::array<chart_cost, nuc_state_count> const& row(
+      overlay_clade_ref ref) const {
+    (void)delta;
+    return local_overlay_chart_row(local_rows, base_chart, ref);
+  }
+};
+
+namespace chart_spr_search_detail {
+
+inline void accumulate_overlay_production_row(
+    std::array<chart_cost, nuc_state_count>& row,
+    std::vector<overlay_clade_ref> const& children,
+    overlay_row_provider const& provider) {
+  if (children.size() != 2) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: local row recompute requires binary "
+        "productions");
+  }
+
+  for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+       ++parent_state) {
+    chart_cost total = 0;
+    for (std::size_t child_i = 0; child_i < 2; ++child_i) {
+      auto const& child_row = provider.row(children[child_i]);
+      chart_cost best_child = chart_inf;
+      for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+           ++child_state) {
+        best_child = std::min(
+            best_child,
+            parsimony_chart_detail::saturated_add(
+                child_row[child_state],
+                parsimony_chart_detail::transition_cost(parent_state,
+                                                        child_state)));
+      }
+      total = parsimony_chart_detail::saturated_add(total, best_child);
+    }
+    row[parent_state] = std::min(row[parent_state], total);
+  }
+}
+
+inline std::array<chart_cost, nuc_state_count> recompute_overlay_delta_row(
+    spr_overlay_delta const& delta, leaf_site_states const& leaf_states,
+    overlay_row_provider const& provider, overlay_clade_ref ref) {
+  auto const& base = *delta.base;
+  auto const& key = overlay_delta_clade_key(delta, ref);
+  if (key.taxa.size() == 1) {
+    if (available_production_count_for_parent(delta, ref) != 0) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: singleton clade has productions during "
+          "local row recompute");
+    }
+    return overlay_delta_leaf_row(delta, ref, leaf_states);
+  }
+
+  auto row = parsimony_chart_detail::make_inf_row();
+  bool saw_production = false;
+  if (ref.space == overlay_id_space::base) {
+    for (auto pid : base.productions_by_parent[ref.id]) {
+      if (overlay_delta_base_production_removed(delta, pid)) continue;
+      validate_reachable_base_production(delta, pid);
+      std::vector<overlay_clade_ref> children;
+      children.reserve(base.productions[pid].children.size());
+      for (auto child : base.productions[pid].children) {
+        children.push_back(base_clade_ref(child));
+      }
+      accumulate_overlay_production_row(row, children, provider);
+      saw_production = true;
+    }
+  }
+
+  for (auto temp_pid : temp_productions_for_parent(delta, ref)) {
+    if (temp_pid == no_production ||
+        temp_pid >= delta.temp_productions.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta: temp production id out of range during "
+          "row recompute");
+    }
+    auto const& prod = delta.temp_productions[temp_pid];
+    validate_overlay_delta_binary_partition(delta, prod, temp_pid);
+    accumulate_overlay_production_row(row, prod.children, provider);
+    saw_production = true;
+  }
+
+  if (!saw_production) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: non-singleton clade has no productions "
+        "during local row recompute");
+  }
+  return row;
+}
+
+}  // namespace chart_spr_search_detail
+
+inline local_overlay_chart_rows build_local_overlay_chart_rows(
+    spr_overlay_delta const& delta, single_site_chart const& base_chart,
+    leaf_site_states const& leaf_states, chart_options const& options = {},
+    bool validate_base_chart_shapes = false) {
+  if (options.keep_trace) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: local row scorer does not support trace "
+        "storage");
+  }
+  if (delta.base == nullptr) {
+    throw std::runtime_error("chart SPR overlay-delta: missing base grammar");
+  }
+  auto const& base = *delta.base;
+  if (validate_base_chart_shapes) {
+    chart_trim_detail::validate_chart_shapes(base, base_chart);
+  }
+  if (base_chart.inside.size() != base.clades.size()) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: cached base chart clade count mismatch");
+  }
+  if (leaf_states.state_by_taxon.size() != base.taxa.id_to_sample_id.size()) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: leaf state count mismatch");
+  }
+  if (delta.affected_base_row_slot.size() != base.clades.size() ||
+      delta.affected_temp_row_slot.size() != delta.temp_clades.size()) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: affected row slot map size mismatch");
+  }
+
+  local_overlay_chart_rows rows;
+  rows.base_row_slot = &delta.affected_base_row_slot;
+  rows.temp_row_slot = &delta.affected_temp_row_slot;
+  rows.rows.assign(delta.affected_order.size(),
+                   parsimony_chart_detail::make_inf_row());
+
+  overlay_row_provider provider{delta, base_chart, rows};
+  for (std::size_t i = 0; i < delta.affected_order.size(); ++i) {
+    auto ref = delta.affected_order[i];
+    rows.rows[i] = chart_spr_search_detail::recompute_overlay_delta_row(
+        delta, leaf_states, provider, ref);
+  }
+  return rows;
+}
+
+inline chart_spr_candidate_score make_invalid_local_candidate_score(
+    chart_spr_search_state const& state, grammar_spr_candidate const& candidate,
+    std::string reason) {
+  auto old_score = state.composite_lower_bound_with_invariants;
+  chart_spr_candidate_score scored;
+  scored.candidate = candidate;
+  scored.lower_bound.value = spr_score_result{0, old_score, old_score, false};
+  scored.lower_bound.kind = chart_spr_score_kind::composite_lower_bound;
+  scored.lower_bound.convention =
+      chart_spr_score_convention::full_with_invariants;
+  scored.lower_bound.invariant_offset_applied =
+      state.invariant_constant_offset;
+  scored.valid = false;
+  scored.invalid_reason = std::move(reason);
+  return scored;
+}
+
+inline void verify_local_overlay_rows_against_full(
+    spr_overlay_delta const& delta, local_overlay_chart_rows const& local_rows,
+    single_site_chart const& base_chart,
+    overlay_materialization_result const& materialized,
+    leaf_site_states const& leaf_states, chart_options options) {
+  (void)delta;
+  options.keep_trace = false;
+  options.max_trace_choices = 0;
+  auto full = build_single_site_chart(materialized.grammar, leaf_states,
+                                      options);
+  if (full.inside.size() != materialized.dense_clade_to_ref.size()) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta verification: dense clade map size mismatch");
+  }
+  for (std::size_t dense = 0; dense < materialized.dense_clade_to_ref.size();
+       ++dense) {
+    auto ref = materialized.dense_clade_to_ref[dense];
+    auto const& local = local_overlay_chart_row(local_rows, base_chart, ref);
+    if (local != full.inside[dense]) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta verification: local row differs from "
+          "full overlay chart");
+    }
+  }
+}
+
+// Phase-3 local scoring entry point.  This recomputes only rows in the
+// candidate's reachable affected overlay closure and reads all other base rows
+// from the persistent per-pattern chart cache.  It does not materialize a dense
+// overlay grammar and does not rebuild composite charts unless the explicit
+// test/debug verification option is enabled.
 inline chart_spr_candidate_score score_candidate_locally(
-    chart_spr_search_state& state, grammar_spr_candidate const& candidate) {
-  state.active_patterns.assert_no_skipped_invariant_metadata();
+    chart_spr_search_state const& state, grammar_spr_candidate const& candidate,
+    local_spr_score_options const& options = {}) {
   if (state.pattern_charts.size() !=
       state.active_patterns.patterns.patterns.size()) {
     throw std::runtime_error(
         "chart SPR local score: pattern chart cache size mismatch");
   }
+  if (options.exact_multisite) {
+    throw std::runtime_error(
+        "chart SPR local score: exact_multisite belongs to the Phase-4 "
+        "verification gate, not the Phase-3 composite local scorer");
+  }
 
-  auto overlay = overlay_from_candidate(state.grammar, candidate);
-  auto materialized = materialize_overlay_grammar(overlay);
-  ++state.counters.full_overlay_materializations;
-  ++state.counters.overlay_materializations_for_local_scoring_bridge;
   ++state.counters.local_candidate_scores;
 
-  std::uint64_t new_active_score = 0;
-  std::size_t affected_count = 0;
-  auto chart_build_options = state.chart_opts;
-  chart_build_options.keep_trace = false;
-  chart_build_options.max_trace_choices = 0;
+  spr_overlay_delta delta;
+  try {
+    delta = build_spr_overlay_delta(state.grammar, candidate, options);
+  } catch (std::exception const& e) {
+    return make_invalid_local_candidate_score(state, candidate, e.what());
+  }
+  chart_spr_search_detail::record_overlay_delta_reachability_counters(
+      state.counters, delta.reachability_stats);
 
-  for (std::size_t pattern_index = 0;
-       pattern_index < state.active_patterns.patterns.patterns.size();
-       ++pattern_index) {
-    auto const& pattern =
-        state.active_patterns.patterns.patterns[pattern_index];
-    auto const& cache_entry = state.pattern_charts[pattern_index];
-    leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
-    auto local = build_single_site_overlay_chart_locally(
-        overlay, materialized, cache_entry.chart, states, chart_build_options);
-    affected_count = std::max(affected_count, local.affected_clade_count);
-    new_active_score = chart_multisite_detail::checked_add_u64(
-        new_active_score,
-        chart_multisite_detail::weighted_root_score_from_row(
-            local.chart.inside[materialized.grammar.root_clade], pattern,
-            state.chart_opts),
-        "chart-SPR local candidate active lower bound");
+  std::optional<overlay_clade_grammar> verification_overlay;
+  std::optional<overlay_materialization_result> verification_materialized;
+  if (options.verify_against_full_overlay) {
+    verification_overlay = overlay_from_candidate(state.grammar, candidate);
+    verification_materialized =
+        materialize_overlay_grammar(*verification_overlay);
+    ++state.counters.full_overlay_materializations;
+    ++state.counters.overlay_materializations_for_oracle;
+  }
+
+  std::uint64_t new_active_score = 0;
+  try {
+    for (std::size_t pattern_index = 0;
+         pattern_index < state.active_patterns.patterns.patterns.size();
+         ++pattern_index) {
+      auto const& pattern =
+          state.active_patterns.patterns.patterns[pattern_index];
+      auto const& cache_entry = state.pattern_charts[pattern_index];
+      leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
+      auto chart_build_options = state.chart_opts;
+      chart_build_options.keep_trace = false;
+      chart_build_options.max_trace_choices = 0;
+      auto local_rows = build_local_overlay_chart_rows(
+          delta, cache_entry.chart, states, chart_build_options,
+          options.validate_cached_chart_shapes);
+      if (verification_materialized) {
+        verify_local_overlay_rows_against_full(
+            delta, local_rows, cache_entry.chart, *verification_materialized,
+            states, state.chart_opts);
+      }
+      auto const& root_row =
+          local_overlay_chart_row(local_rows, cache_entry.chart, delta.root);
+      new_active_score = chart_multisite_detail::checked_add_u64(
+          new_active_score,
+          chart_multisite_detail::weighted_root_score_from_row(
+              root_row, pattern, state.chart_opts),
+          "chart-SPR local candidate active lower bound");
+    }
+  } catch (std::exception const& e) {
+    return make_invalid_local_candidate_score(state, candidate, e.what());
   }
 
   auto new_score = chart_multisite_detail::checked_add_u64(
@@ -736,7 +1568,7 @@ inline chart_spr_candidate_score score_candidate_locally(
       chart_spr_score_convention::full_with_invariants;
   scored.lower_bound.invariant_offset_applied =
       state.invariant_constant_offset;
-  scored.affected_clade_count = affected_count;
+  scored.affected_clade_count = delta.affected_order.size();
   return scored;
 }
 

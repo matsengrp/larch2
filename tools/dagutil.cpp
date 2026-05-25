@@ -2361,6 +2361,11 @@ static void run_chart_spr_local_scoring_diagnostic(
       scored.local_score_ms = elapsed_ms(score_start,
                                          std::chrono::steady_clock::now());
       local_ms_total += scored.local_score_ms;
+      if (!scored.valid) {
+        ++failures;
+        last_error = scored.invalid_reason;
+        continue;
+      }
       affected_counts.push_back(scored.affected_clade_count);
       if (!best || scored.lower_bound.value.delta <
                        best->lower_bound.value.delta) {
@@ -2386,14 +2391,15 @@ static void run_chart_spr_local_scoring_diagnostic(
   out << report_name << ":\n";
   out << "  api: search_state_cached_active_pattern_charts\n";
   out << "  score_kind: composite_lower_bound\n";
-  out << "  phase1_materialized_overlay_local_recompute: true\n";
+  out << "  phase1_materialized_overlay_local_recompute: false\n";
+  out << "  phase3_lightweight_overlay_delta: true\n";
   if (report_name == "chart_spr_search") {
-    out << "  search_mode: phase1_rank_only_no_dag_mutation\n";
+    out << "  search_mode: phase3_rank_only_no_dag_mutation\n";
     out << "  actual_accept_reject_search: false\n";
     out << "  requested_max_iterations: " << a.chart_spr_max_iterations
         << "\n";
     out << "  implemented_rank_only_iterations: 1\n";
-    out << "  max_iterations_note: ignored by the Phase-1 rank-only "
+    out << "  max_iterations_note: ignored by the Phase-3 rank-only "
            "diagnostic; Phase-5 implements multi-iteration mutation\n";
   }
   out << "  score_ua_edge: "
