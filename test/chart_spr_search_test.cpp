@@ -76,6 +76,17 @@ static larch::test::tiny_tree_node four_taxon_repeated_reference_tree() {
                                   tiny_leaf("D", "CC")})});
 }
 
+static larch::test::tiny_tree_node four_taxon_two_pattern_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "AAA",
+      {tiny_inner("AB", "AAA", {tiny_leaf("A", "AAA"),
+                                   tiny_leaf("B", "AAC")}),
+       tiny_inner("CD", "CCC", {tiny_leaf("C", "CCA"),
+                                   tiny_leaf("D", "CCC")})});
+}
+
 static larch::test::tiny_tree_node five_taxon_multiparent_tree_one() {
   using larch::test::tiny_inner;
   using larch::test::tiny_leaf;
@@ -658,21 +669,172 @@ static void test_state_builder_from_dag_rebuilds_patterns_once() {
   std::println("  PASS");
 }
 
-static void test_non_default_cache_options_throw_until_batching_exists() {
-  std::println("test_non_default_cache_options_throw_until_batching_exists");
+static void test_pattern_batch_cache_options_match_all_cache() {
+  std::println("test_pattern_batch_cache_options_match_all_cache");
 
-  auto fixture = make_fixture();
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AAA", four_taxon_two_pattern_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto candidates = larch::enumerate_grammar_spr_candidates(grammar);
+  CHECK(candidates.size() >= 2);
+
+  auto all_state = larch::build_chart_spr_search_state(dag, grammar);
+  CHECK(all_state.active_patterns.patterns.patterns.size() >= 2);
+  CHECK(all_state.cache_strategy ==
+        larch::chart_spr_cache_strategy::all_active_patterns);
+
   larch::chart_spr_search_options options;
   options.cache.max_cached_patterns = 1;
+  options.cache.candidate_batch_size = 2;
+  auto batched_state = larch::build_chart_spr_search_state(
+      dag, grammar, options);
+  CHECK(batched_state.cache_strategy ==
+        larch::chart_spr_cache_strategy::pattern_batches);
+  CHECK(batched_state.pattern_charts.empty());
+  CHECK(batched_state.effective_pattern_batch_size == 1);
+  CHECK(batched_state.composite_lower_bound_with_invariants ==
+        all_state.composite_lower_bound_with_invariants);
 
-  bool threw = false;
-  try {
-    (void)larch::build_chart_spr_search_state(
-        fixture.dag, fixture.grammar, options);
-  } catch (std::exception const&) {
-    threw = true;
+  std::vector<larch::grammar_spr_candidate> subset{
+      candidates[0], candidates[1]};
+  auto all_scores = larch::score_candidates_locally(all_state, subset, {}, 1);
+  auto batched_scores = larch::score_candidates_locally(
+      batched_state, subset, {}, 1);
+  CHECK(all_scores.size() == batched_scores.size());
+  for (std::size_t i = 0; i < all_scores.size(); ++i) {
+    CHECK(all_scores[i].valid == batched_scores[i].valid);
+    CHECK(all_scores[i].lower_bound.value.old_score ==
+          batched_scores[i].lower_bound.value.old_score);
+    CHECK(all_scores[i].lower_bound.value.new_score ==
+          batched_scores[i].lower_bound.value.new_score);
+    CHECK(all_scores[i].lower_bound.value.delta ==
+          batched_scores[i].lower_bound.value.delta);
+    CHECK(all_scores[i].affected_clade_count ==
+          batched_scores[i].affected_clade_count);
   }
-  CHECK(threw);
+  CHECK(batched_state.counters.local_candidate_scores == subset.size());
+  CHECK(batched_state.counters.pattern_batch_cache_builds >=
+        batched_state.active_patterns.patterns.patterns.size());
+  CHECK(batched_scores.front().local_score_ms > 0.0);
+
+  bool single_threw = false;
+  try {
+    (void)larch::score_candidate_locally(batched_state, subset.front());
+  } catch (std::exception const& e) {
+    single_threw = true;
+    CHECK(std::string{e.what()}.find("score_candidates_locally") !=
+          std::string::npos);
+  }
+  CHECK(single_threw);
+
+  larch::chart_spr_search_options memory_options;
+  memory_options.cache.memory_budget_bytes = 1;
+  memory_options.cache.candidate_batch_size = 2;
+  auto memory_state = larch::build_chart_spr_search_state(
+      dag, grammar, memory_options);
+  CHECK(memory_state.cache_strategy ==
+        larch::chart_spr_cache_strategy::pattern_batches);
+  auto memory_scores = larch::score_candidates_locally(
+      memory_state, subset, {}, 1);
+  CHECK(memory_scores.size() == all_scores.size());
+  for (std::size_t i = 0; i < all_scores.size(); ++i) {
+    CHECK(memory_scores[i].lower_bound.value.new_score ==
+          all_scores[i].lower_bound.value.new_score);
+    CHECK(memory_scores[i].lower_bound.value.delta ==
+          all_scores[i].lower_bound.value.delta);
+  }
+
+  std::println("  PASS");
+}
+
+static void test_parallel_local_scores_match_serial() {
+  std::println("test_parallel_local_scores_match_serial");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AAA", four_taxon_two_pattern_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto candidates = larch::enumerate_grammar_spr_candidates(grammar);
+  CHECK(candidates.size() >= 2);
+  if (candidates.size() > 6) candidates.resize(6);
+
+  auto serial_state = larch::build_chart_spr_search_state(dag, grammar);
+  auto parallel_state = larch::build_chart_spr_search_state(dag, grammar);
+  auto serial = larch::score_candidates_locally(serial_state, candidates, {}, 1);
+  auto parallel = larch::score_candidates_locally(
+      parallel_state, candidates, {}, 2);
+
+  CHECK(serial.size() == parallel.size());
+  for (std::size_t i = 0; i < serial.size(); ++i) {
+    CHECK(serial[i].valid == parallel[i].valid);
+    CHECK(serial[i].lower_bound.value.old_score ==
+          parallel[i].lower_bound.value.old_score);
+    CHECK(serial[i].lower_bound.value.new_score ==
+          parallel[i].lower_bound.value.new_score);
+    CHECK(serial[i].lower_bound.value.delta ==
+          parallel[i].lower_bound.value.delta);
+    CHECK(serial[i].affected_clade_count == parallel[i].affected_clade_count);
+  }
+  CHECK(parallel_state.counters.local_candidate_scores == candidates.size());
+  CHECK(parallel_state.counters.local_score_parallel_batches == 1);
+  CHECK(parallel_state.counters.local_score_worker_tasks == 2);
+  CHECK(parallel_state.counters.local_rows_recomputed ==
+        serial_state.counters.local_rows_recomputed);
+
+  larch::chart_spr_search_options batched_options;
+  batched_options.cache.max_cached_patterns = 1;
+  batched_options.cache.candidate_batch_size = candidates.size();
+  auto batched_serial_state = larch::build_chart_spr_search_state(
+      dag, grammar, batched_options);
+  auto batched_parallel_state = larch::build_chart_spr_search_state(
+      dag, grammar, batched_options);
+  auto batched_serial = larch::score_candidates_locally(
+      batched_serial_state, candidates, {}, 1);
+  auto batched_parallel = larch::score_candidates_locally(
+      batched_parallel_state, candidates, {}, 2);
+  CHECK(batched_serial.size() == batched_parallel.size());
+  for (std::size_t i = 0; i < batched_serial.size(); ++i) {
+    CHECK(batched_serial[i].valid == batched_parallel[i].valid);
+    CHECK(batched_serial[i].lower_bound.value.old_score ==
+          batched_parallel[i].lower_bound.value.old_score);
+    CHECK(batched_serial[i].lower_bound.value.new_score ==
+          batched_parallel[i].lower_bound.value.new_score);
+    CHECK(batched_serial[i].lower_bound.value.delta ==
+          batched_parallel[i].lower_bound.value.delta);
+  }
+  CHECK(batched_parallel_state.counters.local_score_parallel_batches == 1);
+  CHECK(batched_parallel_state.counters.pattern_batch_cache_builds >=
+        batched_parallel_state.active_patterns.patterns.patterns.size());
+  CHECK(batched_parallel_state.counters.local_rows_recomputed ==
+        batched_serial_state.counters.local_rows_recomputed);
+
+  std::println("  PASS");
+}
+
+static void test_pattern_batch_nonreplayable_uses_automatic_candidate_batch() {
+  std::println(
+      "test_pattern_batch_nonreplayable_uses_automatic_candidate_batch");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AAA", four_taxon_two_pattern_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  larch::chart_spr_search_options options;
+  options.cache.max_cached_patterns = 1;
+  auto state = larch::build_chart_spr_search_state(dag, grammar, options);
+  CHECK(state.cache_strategy ==
+        larch::chart_spr_cache_strategy::pattern_batches);
+
+  auto enumeration = options.enumeration;
+  enumeration.source = larch::chart_spr_candidate_source::sampled_tree;
+  auto automatic_batch_size = larch::chart_spr_effective_candidate_batch_size(
+      state, options);
+  CHECK(automatic_batch_size != 0);
+  larch::validate_chart_spr_pattern_batch_replay_strategy(
+      state, options, enumeration, automatic_batch_size);
+
+  options.cache.candidate_batch_size = 2;
+  larch::validate_chart_spr_pattern_batch_replay_strategy(
+      state, options, enumeration,
+      larch::chart_spr_effective_candidate_batch_size(state, options));
 
   std::println("  PASS");
 }
@@ -1379,7 +1541,9 @@ int main() {
   test_root_reference_counts_preserved_in_cache();
   test_active_pattern_assertions_reject_skipped_metadata();
   test_state_builder_from_dag_rebuilds_patterns_once();
-  test_non_default_cache_options_throw_until_batching_exists();
+  test_pattern_batch_cache_options_match_all_cache();
+  test_parallel_local_scores_match_serial();
+  test_pattern_batch_nonreplayable_uses_automatic_candidate_batch();
   test_unchartable_grammar_rejected_with_empty_active_patterns();
   test_unsupported_enumeration_options_fail_explicitly();
   test_max_affected_estimate_prunes_before_construction();

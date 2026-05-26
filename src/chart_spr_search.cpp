@@ -50,6 +50,8 @@ void chart_spr_add_search_state_rebuild_counters(
   accumulated.pattern_rebuilds += rebuild_counters.pattern_rebuilds;
   accumulated.base_chart_cache_rebuilds +=
       rebuild_counters.base_chart_cache_rebuilds;
+  accumulated.pattern_batch_cache_builds +=
+      rebuild_counters.pattern_batch_cache_builds;
   if (update_current_skipped_invariant_sites) {
     accumulated.skipped_invariant_sites =
         rebuild_counters.skipped_invariant_sites;
@@ -79,14 +81,14 @@ chart_spr_search_state rebuild_chart_spr_search_state_after_accept(
         previous_state.skipped_invariant_site_count;
     return build_chart_spr_search_state_from_active(
         rebuilt_dag, std::move(rebuilt_grammar), std::move(active_build),
-        options.chart, build_exact, options.exact_trim);
+        options.chart, build_exact, options.exact_trim, options.cache);
   }
 
   auto active_build = make_active_search_patterns(
       rebuilt_dag, rebuilt_grammar, options.chart);
   auto state = build_chart_spr_search_state_from_active(
       rebuilt_dag, std::move(rebuilt_grammar), std::move(active_build),
-      options.chart, build_exact, options.exact_trim);
+      options.chart, build_exact, options.exact_trim, options.cache);
   ++state.counters.pattern_rebuilds;
   return state;
 }
@@ -157,6 +159,9 @@ void chart_spr_refresh_search_summary_from_counters(
     chart_spr_search_counters const& counters) {
   summary.accepted_moves = counters.accepted_moves;
   summary.candidates_locally_scored = counters.local_candidate_scores;
+  summary.local_rows_recomputed = counters.local_rows_recomputed;
+  summary.candidate_batches_scored = counters.candidate_batches_scored;
+  summary.pattern_batch_cache_builds = counters.pattern_batch_cache_builds;
   summary.exact_verifications = counters.exact_verifications;
   summary.overlay_materializations_for_exact_verification =
       counters.overlay_materializations_for_exact_verification;
@@ -195,6 +200,17 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.initial_score =
       chart_spr_iteration_state_score_before(state, options);
   result.summary.final_score = result.summary.initial_score;
+  result.summary.active_pattern_count =
+      state.active_patterns.patterns.patterns.size();
+  result.summary.chart_cache_estimated_full_bytes =
+      state.estimated_full_pattern_cache_bytes;
+  result.summary.chart_cache_resident_bytes =
+      state.resident_pattern_cache_bytes;
+  result.summary.effective_pattern_batch_size =
+      state.effective_pattern_batch_size;
+  result.summary.local_score_worker_count =
+      chart_spr_search_detail::normalize_chart_spr_worker_count(
+          options.local_score_worker_count);
   std::vector<std::size_t> aggregate_affected_counts;
 
   std::string immediate_reversal_key_to_skip;
@@ -302,8 +318,26 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.iterations = result.iterations.size();
   chart_spr_refresh_search_summary_from_counters(result.summary,
                                                  result.counters);
+  result.summary.active_pattern_count =
+      state.active_patterns.patterns.patterns.size();
+  result.summary.chart_cache_estimated_full_bytes =
+      state.estimated_full_pattern_cache_bytes;
+  result.summary.chart_cache_resident_bytes =
+      state.resident_pattern_cache_bytes;
+  result.summary.effective_pattern_batch_size =
+      state.effective_pattern_batch_size;
   result.summary.total_ms = chart_spr_elapsed_ms(
       total_start, std::chrono::steady_clock::now());
+  result.summary.effective_candidate_batch_size =
+      state.effective_candidate_batch_size;
+  if (result.summary.local_scoring_ms > 0.0) {
+    auto seconds = result.summary.local_scoring_ms / 1000.0;
+    result.summary.local_candidates_per_second =
+        static_cast<double>(result.summary.candidates_locally_scored) /
+        seconds;
+    result.summary.local_rows_recomputed_per_second =
+        static_cast<double>(result.summary.local_rows_recomputed) / seconds;
+  }
   result.summary.affected_distribution =
       summarize_affected_clade_counts(std::move(aggregate_affected_counts));
   return result;
