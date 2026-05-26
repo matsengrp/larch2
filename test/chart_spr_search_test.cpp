@@ -37,6 +37,28 @@ static larch::test::tiny_tree_node four_taxon_misplaced_tree() {
        tiny_inner("BD", "A", {tiny_leaf("B", "A"), tiny_leaf("D", "C")})});
 }
 
+static larch::test::tiny_tree_node four_taxon_two_site_misplaced_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "AA",
+      {tiny_inner("AC", "AA", {tiny_leaf("A", "AC"), tiny_leaf("C", "CG")}),
+       tiny_inner("BD", "AA", {tiny_leaf("B", "AC"), tiny_leaf("D", "CG")})});
+}
+
+static larch::test::tiny_tree_node six_taxon_paired_misplaced_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AD", "A", {tiny_leaf("A", "A"), tiny_leaf("D", "C")}),
+       tiny_inner("rest", "A",
+                  {tiny_inner("BE", "A", {tiny_leaf("B", "A"),
+                                             tiny_leaf("E", "C")}),
+                   tiny_inner("CF", "A", {tiny_leaf("C", "A"),
+                                             tiny_leaf("F", "C")})})});
+}
+
 struct tiny_chart_spr_fixture {
   larch::phylo_dag dag;
   larch::clade_grammar grammar;
@@ -1274,6 +1296,7 @@ static void test_phase5_no_improvement_search_stops_without_commit() {
   CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
   CHECK(search.summary.initial_search_state_rebuilds == 1);
   CHECK(search.summary.full_search_state_rebuilds == 1);
+  CHECK(search.summary.final_compaction_rebuilds == 0);
   CHECK(search.counters.local_candidate_scores ==
         search.iterations.front().candidates_scored);
   CHECK(larch::node_count(search.dag) == initial_nodes);
@@ -1311,6 +1334,7 @@ static void test_phase5_known_improving_search_commits_once() {
   CHECK(search.counters.overlay_materializations_for_accept_materialization == 1);
   CHECK(search.summary.initial_search_state_rebuilds == 1);
   CHECK(search.summary.full_search_state_rebuilds == 2);
+  CHECK(search.summary.final_compaction_rebuilds == 0);
   CHECK(search.summary.final_score <= search.summary.initial_score);
   CHECK(search.iterations.front().state_score_after <=
         search.iterations.front().state_score_before);
@@ -1329,6 +1353,208 @@ static void test_phase5_known_improving_search_commits_once() {
         larch::temp_production_ref(static_cast<larch::production_id>(pid)));
     CHECK(grammar_contains_production_signature(rebuilt, signature));
   }
+
+  std::println("  PASS");
+}
+
+static void test_phase9_known_improving_search_uses_local_accept_update() {
+  std::println("test_phase9_known_improving_search_uses_local_accept_update");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 8;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.verify_local_against_full_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar,
+                                            options);
+
+  CHECK(search.iterations.size() == 1);
+  CHECK(search.iterations.front().accepted.has_value());
+  CHECK(search.iterations.front().accepted_move_committed);
+  CHECK(!search.iterations.front().post_materialization_rejected);
+  CHECK(search.iterations.front().reused_patterns_after_accept);
+  CHECK(search.counters.candidate_accepts_attempted == 1);
+  CHECK(search.counters.accepted_moves == 1);
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
+  CHECK(search.summary.initial_search_state_rebuilds == 1);
+  CHECK(search.summary.full_search_state_rebuilds == 1);
+  CHECK(search.summary.final_compaction_rebuilds == 1);
+  CHECK(search.summary.final_compaction_ms > 0.0);
+  CHECK(search.summary.final_score <= search.summary.initial_score);
+  auto rebuilt = larch::build_clade_grammar(search.dag);
+  CHECK(rebuilt.clades.size() > 0);
+  CHECK(search.summary.final_grammar_clade_count == rebuilt.clades.size());
+  CHECK(search.summary.final_grammar_production_count ==
+        rebuilt.productions.size());
+  auto rebuilt_state = larch::build_chart_spr_search_state(
+      search.dag, rebuilt, options);
+  CHECK(larch::chart_spr_state_exact_score_with_invariants(
+            rebuilt_state, options.exact_trim) == search.summary.final_score);
+
+  std::println("  PASS");
+}
+
+static void test_phase9_final_compaction_mismatch_fails_clearly() {
+  std::println("test_phase9_final_compaction_mismatch_fails_clearly");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 8;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.override_final_compaction_rebuilt_score_for_tests =
+      std::numeric_limits<std::uint64_t>::max();
+
+  bool threw = false;
+  try {
+    (void)larch::run_chart_spr_search(std::move(dag), grammar, options);
+  } catch (std::runtime_error const& e) {
+    threw = std::string{e.what()}.find("final compaction") !=
+            std::string::npos;
+  }
+  CHECK(threw);
+
+  std::println("  PASS");
+}
+
+static void test_phase9_pattern_batch_local_update_matches_output_dag() {
+  std::println("test_phase9_pattern_batch_local_update_matches_output_dag");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AA", four_taxon_two_site_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 8;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.verify_local_against_full_for_tests = true;
+  options.cache.pattern_batch_size = 1;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar,
+                                            options);
+
+  CHECK(search.iterations.size() == 1);
+  CHECK(search.iterations.front().accepted_move_committed);
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
+  CHECK(search.summary.final_compaction_rebuilds == 1);
+  CHECK(search.summary.effective_pattern_batch_size == 1);
+  CHECK(search.counters.pattern_batch_cache_builds > 0);
+  auto rebuilt = larch::build_clade_grammar(search.dag);
+  auto rebuilt_state = larch::build_chart_spr_search_state(
+      search.dag, rebuilt, options);
+  CHECK(larch::chart_spr_state_exact_score_with_invariants(
+            rebuilt_state, options.exact_trim) == search.summary.final_score);
+
+  std::println("  PASS");
+}
+
+static void test_phase9_fixed_topology_compaction_uses_certificate() {
+  std::println("test_phase9_fixed_topology_compaction_uses_certificate");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 8;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar,
+                                            options);
+
+  CHECK(search.iterations.size() == 1);
+  CHECK(search.iterations.front().accepted_move_committed);
+  CHECK(search.iterations.front().accepted->exact.has_value());
+  CHECK(search.summary.final_score ==
+        search.iterations.front().accepted->exact->value.new_score);
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
+  CHECK(search.summary.final_compaction_rebuilds == 1);
+  CHECK(larch::build_clade_grammar(search.dag).clades.size() > 0);
+
+  std::println("  PASS");
+}
+
+static void test_phase9_lower_bound_compaction_matches_output_dag() {
+  std::println("test_phase9_lower_bound_compaction_matches_output_dag");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::lower_bound_heuristic;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar,
+                                            options);
+
+  CHECK(search.iterations.size() == 1);
+  CHECK(search.iterations.front().accepted_move_committed);
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
+  CHECK(search.summary.final_compaction_rebuilds == 1);
+  auto rebuilt = larch::build_clade_grammar(search.dag);
+  auto rebuilt_state = larch::build_chart_spr_search_state(
+      search.dag, rebuilt, options);
+  CHECK(rebuilt_state.composite_lower_bound_with_invariants ==
+        search.summary.final_score);
+
+  std::println("  PASS");
+}
+
+static void test_phase9_multi_iteration_local_updates_match_output_dag() {
+  std::println("test_phase9_multi_iteration_local_updates_match_output_dag");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", six_taxon_paired_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 32;
+  options.max_iterations = 3;
+  options.rebuild_after_accept = false;
+  options.verify_local_against_full_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar,
+                                            options);
+
+  CHECK(search.counters.accepted_moves >= 2);
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
+  CHECK(search.summary.final_compaction_rebuilds == 1);
+  auto rebuilt = larch::build_clade_grammar(search.dag);
+  auto rebuilt_state = larch::build_chart_spr_search_state(
+      search.dag, rebuilt, options);
+  CHECK(larch::chart_spr_state_exact_score_with_invariants(
+            rebuilt_state, options.exact_trim) == search.summary.final_score);
 
   std::println("  PASS");
 }
@@ -1614,6 +1840,12 @@ int main() {
   test_enumeration_truncation_sets_unverified_flag_even_exhaustive();
   test_phase5_no_improvement_search_stops_without_commit();
   test_phase5_known_improving_search_commits_once();
+  test_phase9_known_improving_search_uses_local_accept_update();
+  test_phase9_final_compaction_mismatch_fails_clearly();
+  test_phase9_pattern_batch_local_update_matches_output_dag();
+  test_phase9_fixed_topology_compaction_uses_certificate();
+  test_phase9_lower_bound_compaction_matches_output_dag();
+  test_phase9_multi_iteration_local_updates_match_output_dag();
   test_phase5_rejected_candidates_do_not_rebuild_sidecar();
   test_phase5_post_materialization_worsening_rejects_commit();
   test_phase5_fixed_topology_mode_commits_with_rebuilt_certificate_gate();

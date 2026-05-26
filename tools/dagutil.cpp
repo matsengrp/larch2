@@ -1204,9 +1204,15 @@ Analysis:
                           streaming Phase-1 API and print generation counters
   --chart-spr-score-local Score streamed grammar-native candidates with the
                           cached-chart local overlay-delta scorer diagnostic
-  --chart-spr-search      Run the Phase-5 grammar-native chart-SPR search loop
-                          with conservative accepted-move materialization and
-                          one sidecar rebuild per attempted commit
+  --chart-spr-search      Run the grammar-native chart-SPR search loop
+                          (conservative accepted-move materialization/rebuild
+                          by default)
+  --chart-spr-local-accept-updates
+                          Use optional Phase-9 accepted-state local cache
+                          updates instead of rebuilding sidecar state after
+                          each accepted move; accepted overlays are still
+                          densely materialized, and final compaction emits one
+                          selected tree with a rebuild-equivalence check
   --chart-spr-max-candidates <N>
                           Candidate cap for chart-SPR diagnostics
                           (default 0, unlimited; post-dedup)
@@ -1353,6 +1359,7 @@ struct args {
   grammar_spr_enumeration_options chart_spr_enumeration;
   chart_cache_options chart_spr_cache;
   std::size_t chart_spr_local_score_workers = 1;
+  bool chart_spr_local_accept_updates = false;
 };
 
 static bool has_any_model_arg(args const& a) {
@@ -1667,6 +1674,9 @@ static args parse_args(int argc, char** argv) {
       a.chart_spr_score_local = true;
     } else if (arg == "--chart-spr-search") {
       a.chart_spr_search = true;
+    } else if (arg == "--chart-spr-local-accept-updates" ||
+               arg == "--chart-spr-no-rebuild-after-accept") {
+      a.chart_spr_local_accept_updates = true;
     } else if (arg == "--chart-spr-max-candidates") {
       a.chart_spr_enumeration.max_candidates = parse_size_token_strict(
           next(), "--chart-spr-max-candidates");
@@ -2778,6 +2788,7 @@ static chart_spr_search_options make_chart_spr_search_options(
   options.enumeration = a.chart_spr_enumeration;
   options.cache = a.chart_spr_cache;
   options.local_score_worker_count = a.chart_spr_local_score_workers;
+  options.rebuild_after_accept = !a.chart_spr_local_accept_updates;
   options.seed = a.seed.value_or(options.seed);
   options.chart.score_ua_edge = a.chart_score_ua_edge;
   options.exact_trim.use_bound_pruning = !a.chart_bnb_no_bound_pruning;
@@ -2797,7 +2808,27 @@ static void run_chart_spr_search_diagnostic(
 
   out << "chart_spr_search:\n";
   out << "  api: search_state_cached_active_pattern_charts\n";
-  out << "  search_mode: phase5_accept_reject_materialize_rebuild\n";
+  out << "  search_mode: "
+      << (options.rebuild_after_accept
+              ? "phase5_accept_reject_materialize_rebuild"
+              : "phase9_accept_reject_local_cache_update")
+      << "\n";
+  out << "  accepted_state_update_mode: "
+      << (options.rebuild_after_accept ? "materialize_rebuild"
+                                       : "local_cache_update")
+      << "\n";
+  out << "  accepted_state_materialization: "
+      << (options.rebuild_after_accept ? "materialize_dag_and_rebuild"
+                                       : "dense_overlay_grammar_per_accept")
+      << "\n";
+  out << "  final_compaction_mode: "
+      << (options.rebuild_after_accept
+              ? "per_accept_materialized_dag"
+              : "selected_tree_rebuild_equivalence_checked")
+      << "\n";
+  out << "  preserves_full_accepted_overlay_dag: "
+      << (options.rebuild_after_accept ? "not_applicable" : "false")
+      << "\n";
   out << "  actual_dag_mutation: "
       << (search.summary.accepted_moves > 0 ? "true" : "false") << "\n";
   out << "  acceptance: "
@@ -2897,6 +2928,8 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.sidecar_rebuilds_after_accept << "\n";
   out << "  full_search_state_rebuilds: "
       << search.summary.full_search_state_rebuilds << "\n";
+  out << "  final_compaction_rebuilds: "
+      << search.summary.final_compaction_rebuilds << "\n";
   out << "  overlay_materializations_for_exact_verification: "
       << search.summary.overlay_materializations_for_exact_verification
       << "\n";
@@ -2923,6 +2956,8 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.exact_verification_ms << "\n";
   out << "  accepted_rebuild_ms: " << std::fixed << std::setprecision(3)
       << search.summary.accepted_rebuild_ms << "\n";
+  out << "  final_compaction_ms: " << std::fixed << std::setprecision(3)
+      << search.summary.final_compaction_ms << "\n";
   out << "  post_materialization_check_ms: " << std::fixed
       << std::setprecision(3)
       << search.summary.post_materialization_check_ms << "\n";

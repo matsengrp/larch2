@@ -4,6 +4,12 @@ Committed Phase-8 sanity tables from the harness in `tools/wric_spr_search_bench
 
 A strict final Phase-8 table should additionally run the exact chart-SPR modes (`sampled_tree_fixed`, `grammar_exact`, and `hybrid_exact`) on the chosen medium and real fixtures in an appropriate benchmark build. The ASAN tables below deliberately keep exact mode to the small fixture so they remain reproducible during development.
 
+## Phase-9 local accept-update caveats
+
+`--chart-spr-local-accept-updates` is currently a safe local-cache-update mode, not the full base-plus-overlay-chain design described in the planning notes. Accepted moves avoid full search-state rebuilds, but each accepted candidate is still committed by dense `materialize_overlay_grammar()` materialization into the next search grammar.
+
+Final local-update compaction is also tree-valued: the code selects one concrete topology, materializes that tree, rebuilds the search state from the output DAG, and checks that the rebuilt objective equals the local sidecar objective. This is score-safe, but it does not preserve every accepted overlay production/topology in the output DAG. The final safety rebuild is reported separately as `final_compaction_rebuilds`/`final_compaction_ms`, not as a per-accepted-move sidecar rebuild. Use conservative rebuild mode when output DAG structural diversity must be preserved beyond the selected score-equivalent tree.
+
 ## Small/medium/repo-DAG lower-bound smoke comparison
 
 Command:

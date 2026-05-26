@@ -276,7 +276,19 @@ struct chart_spr_search_options {
       "first_reachable_overlay_topology";
 
   bool materialize_accepted_moves = true;
-  bool rebuild_after_accept = true;  // conservative first production default
+  // true: conservative Phase-5 path materializes an accepted move and rebuilds
+  // the grammar/pattern/chart sidecar before the next iteration. false:
+  // optional Phase-9 mode locally commits the accepted overlay into the search
+  // grammar/cache and defers DAG compaction, avoiding sidecar rebuilds after
+  // ordinary accepted moves.
+  //
+  // Current Phase-9 scope: this is a safe local-cache-update mode, not the
+  // full base-plus-overlay-chain design. Each accepted move is still committed
+  // by dense overlay-grammar materialization, and final compaction emits one
+  // selected concrete tree whose rebuilt objective is checked against the
+  // local sidecar objective. It does not preserve every accepted overlay
+  // production/topology in the output DAG.
+  bool rebuild_after_accept = true;
 
   // Test/diagnostic hooks for validating expensive guardrails without needing
   // pathological input DAGs.
@@ -284,6 +296,8 @@ struct chart_spr_search_options {
   bool force_pattern_fingerprint_mismatch_for_tests = false;
   std::optional<std::uint64_t>
       override_post_materialization_rebuilt_score_for_tests;
+  std::optional<std::uint64_t>
+      override_final_compaction_rebuilt_score_for_tests;
 
   std::uint32_t seed = 1;
 };
@@ -394,6 +408,10 @@ struct chart_spr_search_summary {
   std::size_t sidecar_rebuilds_after_accept = 0;
   std::size_t initial_search_state_rebuilds = 0;
   std::size_t full_search_state_rebuilds = 0;
+  // Phase-9 local-update final compaction performs one safety rebuild from the
+  // output DAG.  Keep it separate from per-accepted-move sidecar rebuilds so
+  // benchmark reports can distinguish amortized final verification cost.
+  std::size_t final_compaction_rebuilds = 0;
   std::size_t candidate_accepts_attempted = 0;
   std::size_t post_materialization_rejections = 0;
   chart_spr_candidate_selection_mode candidate_selection =
@@ -409,6 +427,7 @@ struct chart_spr_search_summary {
   double local_rows_recomputed_per_second = 0.0;
   double exact_verification_ms = 0.0;
   double accepted_rebuild_ms = 0.0;
+  double final_compaction_ms = 0.0;
   double post_materialization_check_ms = 0.0;
   std::size_t active_pattern_count = 0;
   std::size_t initial_grammar_clade_count = 0;
