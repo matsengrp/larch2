@@ -1223,6 +1223,23 @@ Analysis:
   --chart-spr-candidate-selection <M>
                           exhaustive-exact, lower-bound-top-k (default),
                           lower-bound-first-improvement, or randomized
+  --chart-spr-candidate-source <M>
+                          grammar (default), sampled-tree, or hybrid
+  --chart-spr-randomize-order
+                          Seeded lazy traversal randomization for chart-SPR
+                          candidate enumeration
+  --chart-spr-reservoir-sample
+                          Use max-candidates as a bounded reservoir sample
+                          size instead of an early stream cutoff
+  --chart-spr-include-immediate-reversals
+                          Do not suppress the taxon-key reverse of the
+                          immediately previous accepted chart-SPR move
+  --chart-spr-sampled-tree-count <N>
+                          Number of representative grammar trees to project in
+                          sampled-tree/hybrid source modes (default 1)
+  --chart-spr-sampled-tree-radius <N>
+                          Tree-SPR radius for sampled-tree projected moves
+                          (default 0 => tree depth * 2)
   --chart-spr-topology-selector <M>
                           Deterministic selector used by fixed-topology mode
                           when no explicit certificate provider is wired
@@ -1386,6 +1403,17 @@ parse_chart_spr_candidate_selection_mode(std::string_view text) {
       text == "sampled-or-randomized" || text == "sampled_or_randomized") {
     return chart_spr_candidate_selection_mode::sampled_or_randomized;
   }
+  return std::nullopt;
+}
+
+static std::optional<chart_spr_candidate_source>
+parse_chart_spr_candidate_source(std::string_view text) {
+  if (text == "grammar") return chart_spr_candidate_source::grammar;
+  if (text == "sampled-tree" || text == "sampled_tree" ||
+      text == "sampled") {
+    return chart_spr_candidate_source::sampled_tree;
+  }
+  if (text == "hybrid") return chart_spr_candidate_source::hybrid;
   return std::nullopt;
 }
 
@@ -1650,6 +1678,27 @@ static args parse_args(int argc, char** argv) {
         std::exit(1);
       }
       a.chart_spr_candidate_selection = *mode;
+    } else if (arg == "--chart-spr-candidate-source") {
+      auto value = next();
+      auto source = parse_chart_spr_candidate_source(value);
+      if (!source) {
+        std::cerr << "error: unknown --chart-spr-candidate-source '"
+                  << value << "'\n";
+        std::exit(1);
+      }
+      a.chart_spr_enumeration.source = *source;
+    } else if (arg == "--chart-spr-randomize-order") {
+      a.chart_spr_enumeration.randomize_order = true;
+    } else if (arg == "--chart-spr-reservoir-sample") {
+      a.chart_spr_enumeration.reservoir_sample = true;
+    } else if (arg == "--chart-spr-include-immediate-reversals") {
+      a.chart_spr_enumeration.include_immediate_reversal_candidates = true;
+    } else if (arg == "--chart-spr-sampled-tree-count") {
+      a.chart_spr_enumeration.sampled_tree_count =
+          parse_size_token_strict(next(), "--chart-spr-sampled-tree-count");
+    } else if (arg == "--chart-spr-sampled-tree-radius") {
+      a.chart_spr_enumeration.sampled_tree_spr_radius =
+          parse_size_token_strict(next(), "--chart-spr-sampled-tree-radius");
     } else if (arg == "--chart-spr-topology-selector") {
       a.chart_spr_topology_selector = std::string{next()};
       if (!chart_spr_builtin_fixed_topology_selector_name(
@@ -1796,6 +1845,7 @@ static args parse_args(int argc, char** argv) {
                  "--chart-spr-max-target-clade-size\n";
     std::exit(1);
   }
+  if (a.seed) a.chart_spr_enumeration.seed = *a.seed;
 
   return a;
 }
@@ -2285,6 +2335,22 @@ static void print_chart_spr_search_counter_fields(
       << counters.candidates_pruned_after_construction << "\n";
   out << indent << "candidates_generated_after_dedup: "
       << counters.candidates_generated_after_dedup << "\n";
+  out << indent << "candidates_pruned_root_or_trivial: "
+      << counters.candidates_pruned_root_or_trivial << "\n";
+  out << indent << "candidates_pruned_moved_size: "
+      << counters.candidates_pruned_moved_size << "\n";
+  out << indent << "candidates_pruned_target_size: "
+      << counters.candidates_pruned_target_size << "\n";
+  out << indent << "candidates_pruned_overlap: "
+      << counters.candidates_pruned_overlap << "\n";
+  out << indent << "candidates_pruned_affected_estimate: "
+      << counters.candidates_pruned_affected_estimate << "\n";
+  out << indent << "candidates_pruned_immediate_reversal: "
+      << counters.candidates_pruned_immediate_reversal << "\n";
+  out << indent << "candidates_pruned_duplicate: "
+      << counters.candidates_pruned_duplicate << "\n";
+  out << indent << "candidates_pruned_invalid: "
+      << counters.candidates_pruned_invalid << "\n";
   out << indent << "candidate_cap_cutoffs: "
       << counters.candidate_cap_cutoffs << "\n";
   out << indent << "path_budget_cutoffs: "
@@ -2304,17 +2370,23 @@ static void print_chart_spr_search_counter_fields(
 }
 
 static void run_chart_spr_candidate_diagnostic(
-    std::ostream& out, polytomy_refinement_result& refinement, args const& a) {
+    std::ostream& out, phylo_dag& dag,
+    polytomy_refinement_result& refinement, args const& a) {
   auto const& grammar = refinement.grammar;
-  auto const& opts = a.chart_spr_enumeration;
+  auto opts = a.chart_spr_enumeration;
+  if (opts.source != chart_spr_candidate_source::grammar) {
+    opts.sampled_tree_source_dag = &dag;
+  }
 
   std::vector<std::string> signatures;
+  std::size_t candidates_emitted = 0;
   auto start = std::chrono::steady_clock::now();
   auto stats = for_each_grammar_spr_candidate(
       grammar, opts, [&](grammar_spr_candidate const& candidate) {
+        ++candidates_emitted;
         if (within_limit(signatures.size(), a.chart_entry_limit)) {
           signatures.push_back(
-              chart_spr_candidate_taxon_signature(grammar, candidate));
+              chart_spr_candidate_sample_signature(grammar, candidate));
         }
         return true;
       });
@@ -2322,11 +2394,24 @@ static void run_chart_spr_candidate_diagnostic(
 
   out << "chart_spr_candidates:\n";
   out << "  api: streaming\n";
-  out << "  source: grammar\n";
+  out << "  source: " << chart_spr_candidate_source_name(opts.source)
+      << "\n";
+  out << "  randomize_order: "
+      << (opts.randomize_order ? "true" : "false") << "\n";
+  out << "  reservoir_sample: "
+      << (opts.reservoir_sample ? "true" : "false") << "\n";
+  out << "  sampled_tree_count: " << opts.sampled_tree_count << "\n";
+  out << "  sampled_tree_spr_radius: " << opts.sampled_tree_spr_radius
+      << "\n";
+  out << "  sampled_tree_score_threshold: "
+      << opts.sampled_tree_score_threshold << "\n";
   out << "  generation_ms: " << std::fixed << std::setprecision(3)
       << generation_ms << "\n";
-  out << "  candidate_count: " << stats.candidates_generated_after_dedup
-      << "\n";
+  out << "  candidate_count: " << candidates_emitted << "\n";
+  out << "  candidates_emitted: " << candidates_emitted << "\n";
+  if (opts.reservoir_sample && opts.max_candidates != 0) {
+    out << "  reservoir_size: " << candidates_emitted << "\n";
+  }
   out << "  candidate_cap: " << opts.max_candidates << "\n";
   out << "  candidate_cap_semantics: "
       << (opts.max_candidates_is_post_dedup ? "post_dedup" : "pre_dedup")
@@ -2356,6 +2441,21 @@ static void run_chart_spr_candidate_diagnostic(
       << stats.candidates_pruned_after_construction << "\n";
   out << "    candidates_generated_after_dedup: "
       << stats.candidates_generated_after_dedup << "\n";
+  out << "    pruned_root_or_trivial: "
+      << stats.candidates_pruned_root_or_trivial << "\n";
+  out << "    pruned_moved_size: " << stats.candidates_pruned_moved_size
+      << "\n";
+  out << "    pruned_target_size: " << stats.candidates_pruned_target_size
+      << "\n";
+  out << "    pruned_overlap: " << stats.candidates_pruned_overlap
+      << "\n";
+  out << "    pruned_affected_estimate: "
+      << stats.candidates_pruned_affected_estimate << "\n";
+  out << "    pruned_immediate_reversal: "
+      << stats.candidates_pruned_immediate_reversal << "\n";
+  out << "    pruned_duplicate: " << stats.candidates_pruned_duplicate
+      << "\n";
+  out << "    pruned_invalid: " << stats.candidates_pruned_invalid << "\n";
   out << "  candidate_signatures:\n";
   if (signatures.empty()) {
     out << "    <empty>\n";
@@ -2364,8 +2464,7 @@ static void run_chart_spr_candidate_diagnostic(
       out << "    - " << signature << "\n";
     }
   }
-  if (a.chart_entry_limit != 0 &&
-      signatures.size() < stats.candidates_generated_after_dedup) {
+  if (a.chart_entry_limit != 0 && signatures.size() < candidates_emitted) {
     out << "  candidate_signatures_truncated: true\n";
   }
 }
@@ -2383,6 +2482,17 @@ static void add_candidate_generation_stats_to_counters(
       stats.candidates_pruned_after_construction;
   counters.candidates_generated_after_dedup +=
       stats.candidates_generated_after_dedup;
+  counters.candidates_pruned_root_or_trivial +=
+      stats.candidates_pruned_root_or_trivial;
+  counters.candidates_pruned_moved_size += stats.candidates_pruned_moved_size;
+  counters.candidates_pruned_target_size += stats.candidates_pruned_target_size;
+  counters.candidates_pruned_overlap += stats.candidates_pruned_overlap;
+  counters.candidates_pruned_affected_estimate +=
+      stats.candidates_pruned_affected_estimate;
+  counters.candidates_pruned_immediate_reversal +=
+      stats.candidates_pruned_immediate_reversal;
+  counters.candidates_pruned_duplicate += stats.candidates_pruned_duplicate;
+  counters.candidates_pruned_invalid += stats.candidates_pruned_invalid;
   if (stats.stop_reason == chart_spr_candidate_stop_reason::candidate_cap)
     ++counters.candidate_cap_cutoffs;
   if (stats.stop_reason == chart_spr_candidate_stop_reason::path_budget)
@@ -2408,6 +2518,22 @@ static void print_chart_spr_generation_stats(
       << stats.candidates_pruned_after_construction << "\n";
   out << indent << "candidates_generated_after_dedup: "
       << stats.candidates_generated_after_dedup << "\n";
+  out << indent << "pruned_root_or_trivial: "
+      << stats.candidates_pruned_root_or_trivial << "\n";
+  out << indent << "pruned_moved_size: "
+      << stats.candidates_pruned_moved_size << "\n";
+  out << indent << "pruned_target_size: "
+      << stats.candidates_pruned_target_size << "\n";
+  out << indent << "pruned_overlap: "
+      << stats.candidates_pruned_overlap << "\n";
+  out << indent << "pruned_affected_estimate: "
+      << stats.candidates_pruned_affected_estimate << "\n";
+  out << indent << "pruned_immediate_reversal: "
+      << stats.candidates_pruned_immediate_reversal << "\n";
+  out << indent << "pruned_duplicate: "
+      << stats.candidates_pruned_duplicate << "\n";
+  out << indent << "pruned_invalid: "
+      << stats.candidates_pruned_invalid << "\n";
 }
 
 static void run_chart_spr_local_scoring_diagnostic(
@@ -2422,13 +2548,17 @@ static void run_chart_spr_local_scoring_diagnostic(
                                             chart_opts);
   auto cache_ms = elapsed_ms(cache_start, std::chrono::steady_clock::now());
 
+  auto enumeration = a.chart_spr_enumeration;
+  if (enumeration.source != chart_spr_candidate_source::grammar) {
+    enumeration.sampled_tree_source_dag = state.dag;
+  }
   std::vector<grammar_spr_candidate> candidates;
-  candidates.reserve(a.chart_spr_enumeration.max_candidates == 0
+  candidates.reserve(enumeration.max_candidates == 0
                          ? 0
-                         : a.chart_spr_enumeration.max_candidates);
+                         : enumeration.max_candidates);
   auto generation_start = std::chrono::steady_clock::now();
   auto generation = for_each_grammar_spr_candidate(
-      state.grammar, a.chart_spr_enumeration,
+      state.grammar, enumeration,
       [&](grammar_spr_candidate const& candidate) {
         candidates.push_back(candidate);
         return true;
@@ -2503,6 +2633,15 @@ static void run_chart_spr_local_scoring_diagnostic(
       << estimate_chart_spr_pattern_cache_bytes(state) << "\n";
   out << "  cache_build_ms: " << std::fixed << std::setprecision(3)
       << cache_ms << "\n";
+  out << "  candidate_source: "
+      << chart_spr_candidate_source_name(enumeration.source) << "\n";
+  out << "  randomize_order: "
+      << (enumeration.randomize_order ? "true" : "false") << "\n";
+  out << "  reservoir_sample: "
+      << (enumeration.reservoir_sample ? "true" : "false") << "\n";
+  out << "  sampled_tree_count: " << enumeration.sampled_tree_count << "\n";
+  out << "  sampled_tree_spr_radius: "
+      << enumeration.sampled_tree_spr_radius << "\n";
   out << "  candidate_generation_ms: " << std::fixed << std::setprecision(3)
       << generation_ms << "\n";
   out << "  local_scoring_wall_ms: " << std::fixed << std::setprecision(3)
@@ -2513,6 +2652,10 @@ static void run_chart_spr_local_scoring_diagnostic(
       << std::setprecision(6) << local_ms_per_candidate << "\n";
   out << "  candidates_generated: "
       << generation.candidates_generated_after_dedup << "\n";
+  out << "  candidates_emitted: " << candidates.size() << "\n";
+  if (enumeration.reservoir_sample && enumeration.max_candidates != 0) {
+    out << "  reservoir_size: " << candidates.size() << "\n";
+  }
   out << "  candidates_scored: " << scored_count << "\n";
   out << "  candidate_score_failures: " << failures << "\n";
   if (!last_error.empty()) out << "  last_score_error: " << last_error << "\n";
@@ -2527,8 +2670,8 @@ static void run_chart_spr_local_scoring_diagnostic(
         << (best->lower_bound.value.improves() ? "true" : "false") << "\n";
     out << "  best_affected_clades: " << best->affected_clade_count << "\n";
     out << "  best_candidate_signature: "
-        << chart_spr_candidate_taxon_signature(state.grammar,
-                                               best->candidate)
+        << chart_spr_candidate_sample_signature(state.grammar,
+                                                best->candidate)
         << "\n";
     if (report_name == "chart_spr_search") {
       out << "  accepted_move_present: "
@@ -2573,6 +2716,7 @@ static chart_spr_search_options make_chart_spr_search_options(
   options.candidate_selection = a.chart_spr_candidate_selection;
   options.fixed_topology_selector_name = a.chart_spr_topology_selector;
   options.enumeration = a.chart_spr_enumeration;
+  options.seed = a.seed.value_or(options.seed);
   options.chart.score_ua_edge = a.chart_score_ua_edge;
   options.exact_trim.use_bound_pruning = !a.chart_bnb_no_bound_pruning;
   options.exact_trim.max_frontier_entries_per_clade =
@@ -2599,6 +2743,18 @@ static void run_chart_spr_search_diagnostic(
   out << "  candidate_selection: "
       << chart_spr_candidate_selection_mode_name(options.candidate_selection)
       << "\n";
+  out << "  candidate_source: "
+      << chart_spr_candidate_source_name(options.enumeration.source) << "\n";
+  out << "  randomize_order: "
+      << (options.enumeration.randomize_order ? "true" : "false")
+      << "\n";
+  out << "  reservoir_sample: "
+      << (options.enumeration.reservoir_sample ? "true" : "false")
+      << "\n";
+  out << "  sampled_tree_count: " << options.enumeration.sampled_tree_count
+      << "\n";
+  out << "  sampled_tree_spr_radius: "
+      << options.enumeration.sampled_tree_spr_radius << "\n";
   out << "  top_k_exact_verify: " << options.top_k_exact_verify << "\n";
   out << "  topology_selection: ";
   if (options.acceptance_mode ==
@@ -2748,7 +2904,7 @@ static void run_chart_spr_search_diagnostic(
             << iteration.post_materialization_rebuilt_score << "\n";
         if (iteration.iteration == 0) {
           out << "      accepted_candidate_signature: "
-              << chart_spr_candidate_taxon_signature(
+              << chart_spr_candidate_sample_signature(
                      refinement.grammar, accepted.candidate)
               << "\n";
         }
@@ -3063,7 +3219,7 @@ int main(int argc, char** argv) try {
 
   if (a.chart_spr_candidates) {
     auto& refinement = get_chart_refinement();
-    run_chart_spr_candidate_diagnostic(std::cout, refinement, a);
+    run_chart_spr_candidate_diagnostic(std::cout, result, refinement, a);
   }
 
   if (a.chart_spr_score_local) {

@@ -6,6 +6,7 @@
 #include <limits>
 #include <optional>
 #include <print>
+#include <random>
 #include <stdexcept>
 #include <set>
 #include <sstream>
@@ -30,6 +31,24 @@ static larch::test::tiny_tree_node four_taxon_base_tree() {
       "root", "A",
       {tiny_inner("AB", "A", {tiny_leaf("A", "A"), tiny_leaf("B", "A")}),
        tiny_inner("CD", "C", {tiny_leaf("C", "C"), tiny_leaf("D", "C")})});
+}
+
+static larch::test::tiny_tree_node four_taxon_base_tree_root_swapped() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("CD", "C", {tiny_leaf("C", "C"), tiny_leaf("D", "C")}),
+       tiny_inner("AB", "A", {tiny_leaf("A", "A"), tiny_leaf("B", "A")})});
+}
+
+static larch::test::tiny_tree_node four_taxon_cross_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AC", "A", {tiny_leaf("A", "A"), tiny_leaf("C", "C")}),
+       tiny_inner("BD", "A", {tiny_leaf("B", "A"), tiny_leaf("D", "C")})});
 }
 
 static larch::taxon_id taxon_for(larch::clade_grammar const& grammar,
@@ -114,6 +133,41 @@ static std::set<std::string> production_shape(larch::clade_grammar const& gramma
     result.insert(out.str());
   }
   return result;
+}
+
+static std::vector<larch::grammar_spr_candidate> collect_candidates(
+    larch::clade_grammar const& grammar,
+    larch::grammar_spr_enumeration_options options,
+    larch::chart_spr_candidate_generation_stats* stats_out = nullptr) {
+  std::vector<larch::grammar_spr_candidate> candidates;
+  auto stats = larch::for_each_grammar_spr_candidate(
+      grammar, options, [&](larch::grammar_spr_candidate const& candidate) {
+        candidates.push_back(candidate);
+        return true;
+      });
+  if (stats_out != nullptr) *stats_out = stats;
+  return candidates;
+}
+
+static std::vector<std::string> collect_candidate_signature_vector(
+    larch::clade_grammar const& grammar,
+    larch::grammar_spr_enumeration_options options,
+    larch::chart_spr_candidate_generation_stats* stats_out = nullptr) {
+  auto candidates = collect_candidates(grammar, options, stats_out);
+  std::vector<std::string> signatures;
+  signatures.reserve(candidates.size());
+  for (auto const& candidate : candidates) {
+    signatures.push_back(
+        larch::chart_spr_candidate_taxon_signature(grammar, candidate));
+  }
+  return signatures;
+}
+
+static std::set<std::string> collect_candidate_signature_set(
+    larch::clade_grammar const& grammar,
+    larch::grammar_spr_enumeration_options options) {
+  auto signatures = collect_candidate_signature_vector(grammar, options);
+  return std::set<std::string>(signatures.begin(), signatures.end());
 }
 
 static larch::overlay_grammar_production temp_prod(
@@ -316,6 +370,172 @@ static void test_bootstrap_projection_from_tree_validates_against_apply() {
   std::println("  PASS");
 }
 
+static void test_phase6_randomized_and_reservoir_enumeration() {
+  std::println("test_phase6_randomized_and_reservoir_enumeration");
+
+  auto dag = larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::grammar_spr_enumeration_options randomized;
+  randomized.randomize_order = true;
+  randomized.seed = 7;
+  randomized.max_candidates = 3;
+  auto first = collect_candidate_signature_vector(grammar, randomized);
+  auto second = collect_candidate_signature_vector(grammar, randomized);
+  CHECK(first == second);
+  CHECK(first.size() == 3);
+
+  larch::grammar_spr_enumeration_options reservoir;
+  reservoir.reservoir_sample = true;
+  reservoir.seed = 11;
+  reservoir.max_candidates = 2;
+  larch::chart_spr_candidate_generation_stats stats;
+  auto sampled = collect_candidate_signature_vector(grammar, reservoir, &stats);
+  CHECK(sampled.size() == 2);
+  CHECK(stats.stop_reason == larch::chart_spr_candidate_stop_reason::exhausted);
+  CHECK(stats.candidates_generated_after_dedup >= sampled.size());
+  CHECK(stats.candidates_constructed >= sampled.size());
+
+  std::println("  PASS");
+}
+
+static void test_phase6_stable_taxon_dedup_across_equivalent_builds() {
+  std::println("test_phase6_stable_taxon_dedup_across_equivalent_builds");
+
+  auto dag1 = larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
+  auto dag2 = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_base_tree_root_swapped());
+  auto grammar1 = larch::build_clade_grammar(dag1);
+  auto grammar2 = larch::build_clade_grammar(dag2);
+
+  CHECK(collect_candidate_signature_set(grammar1, {}) ==
+        collect_candidate_signature_set(grammar2, {}));
+
+  std::println("  PASS");
+}
+
+static void test_phase6_sampled_tree_and_hybrid_sources() {
+  std::println("test_phase6_sampled_tree_and_hybrid_sources");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree()));
+  trees.push_back(larch::test::make_tiny_labelled_tree("A", four_taxon_cross_tree()));
+  auto dag = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::grammar_spr_enumeration_options sampled_opts;
+  sampled_opts.source = larch::chart_spr_candidate_source::sampled_tree;
+  sampled_opts.sampled_tree_source_dag = &dag;
+  sampled_opts.sampled_tree_count = 2;
+  sampled_opts.max_candidates = 16;
+  auto sampled = collect_candidates(grammar, sampled_opts);
+  CHECK(!sampled.empty());
+  for (auto const& candidate : sampled) {
+    CHECK(candidate.source_tree_move.has_value());
+    CHECK(candidate.source_tree_move->score_change.has_value());
+  }
+
+  auto single_sample_opts = sampled_opts;
+  single_sample_opts.sampled_tree_count = 1;
+  single_sample_opts.max_candidates = 1;
+  auto single_sampled = collect_candidates(grammar, single_sample_opts);
+  CHECK(single_sampled.size() == 1);
+  CHECK(single_sampled.front().source_tree_move.has_value());
+  auto const& sampled_move = *single_sampled.front().source_tree_move;
+  CHECK(sampled_move.score_change.has_value());
+
+  std::mt19937 sampled_tree_rng(single_sample_opts.seed);
+  auto representative_tree =
+      larch::chart_spr_detail::build_sampled_tree_from_grammar(
+          grammar, single_sample_opts, 0, sampled_tree_rng);
+  larch::tree_index before_index{representative_tree};
+  auto after_tree = larch::apply_spr_move(representative_tree,
+                                          sampled_move.src,
+                                          sampled_move.dst);
+  larch::tree_index after_index{after_tree};
+  CHECK(*sampled_move.score_change ==
+        after_index.compute_parsimony_score() -
+            before_index.compute_parsimony_score());
+
+  larch::grammar_spr_enumeration_options grammar_opts;
+  grammar_opts.source = larch::chart_spr_candidate_source::grammar;
+  auto direct_signatures = collect_candidate_signature_set(grammar, grammar_opts);
+  std::set<std::string> sampled_signatures;
+  for (auto const& candidate : sampled) {
+    sampled_signatures.insert(
+        larch::chart_spr_candidate_taxon_signature(grammar, candidate));
+  }
+
+  larch::grammar_spr_enumeration_options hybrid_opts;
+  hybrid_opts.source = larch::chart_spr_candidate_source::hybrid;
+  hybrid_opts.sampled_tree_source_dag = &dag;
+  hybrid_opts.sampled_tree_count = 2;
+  hybrid_opts.max_candidates = 64;
+  auto hybrid = collect_candidates(grammar, hybrid_opts);
+  CHECK(!hybrid.empty());
+
+  std::set<std::string> hybrid_signatures;
+  bool has_projected = false;
+  bool has_direct_extra = false;
+  for (auto const& candidate : hybrid) {
+    auto signature = larch::chart_spr_candidate_taxon_signature(grammar, candidate);
+    CHECK(hybrid_signatures.insert(signature).second);
+    has_projected = has_projected || candidate.source_tree_move.has_value();
+    if (!candidate.source_tree_move && !sampled_signatures.contains(signature)) {
+      has_direct_extra = true;
+    }
+  }
+  CHECK(has_projected);
+  bool direct_has_extra = false;
+  for (auto const& signature : direct_signatures) {
+    if (!sampled_signatures.contains(signature)) {
+      direct_has_extra = true;
+      CHECK(hybrid_signatures.contains(signature));
+      break;
+    }
+  }
+  CHECK(!direct_has_extra || has_direct_extra);
+
+  auto hybrid_pre_cap_opts = hybrid_opts;
+  hybrid_pre_cap_opts.max_candidates = 1;
+  hybrid_pre_cap_opts.max_candidates_is_post_dedup = false;
+  larch::chart_spr_candidate_generation_stats pre_cap_stats;
+  (void)collect_candidates(grammar, hybrid_pre_cap_opts, &pre_cap_stats);
+  CHECK(pre_cap_stats.stop_reason ==
+        larch::chart_spr_candidate_stop_reason::candidate_cap);
+  CHECK(pre_cap_stats.candidates_constructed <= 1);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_immediate_reversal_filter_reports_prune() {
+  std::println("test_phase6_immediate_reversal_filter_reports_prune");
+
+  auto dag = larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto candidates = collect_candidates(grammar, {});
+  CHECK(!candidates.empty());
+  auto blocked_key = larch::chart_spr_candidate_reversal_key(
+      grammar, candidates.front());
+  auto blocked_signature = larch::chart_spr_candidate_taxon_signature(
+      grammar, candidates.front());
+
+  larch::grammar_spr_enumeration_options options;
+  options.immediate_reversal_candidate_key_to_skip = blocked_key;
+  larch::chart_spr_candidate_generation_stats stats;
+  auto filtered = collect_candidate_signature_vector(grammar, options, &stats);
+  CHECK(std::find(filtered.begin(), filtered.end(), blocked_signature) ==
+        filtered.end());
+  CHECK(stats.candidates_pruned_immediate_reversal > 0);
+
+  options.include_immediate_reversal_candidates = true;
+  auto unfiltered = collect_candidate_signature_vector(grammar, options);
+  CHECK(std::find(unfiltered.begin(), unfiltered.end(), blocked_signature) !=
+        unfiltered.end());
+
+  std::println("  PASS");
+}
+
 static void test_multisite_exact_vs_lower_bound_labels() {
   std::println("test_multisite_exact_vs_lower_bound_labels");
 
@@ -343,6 +563,10 @@ int main() {
   test_grammar_native_candidate_enumeration();
   test_projected_tree_spr_matches_apply_spr_move();
   test_bootstrap_projection_from_tree_validates_against_apply();
+  test_phase6_randomized_and_reservoir_enumeration();
+  test_phase6_stable_taxon_dedup_across_equivalent_builds();
+  test_phase6_sampled_tree_and_hybrid_sources();
+  test_phase6_immediate_reversal_filter_reports_prune();
   test_multisite_exact_vs_lower_bound_labels();
   std::println("chart_spr_test PASS");
   return 0;

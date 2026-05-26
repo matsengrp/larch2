@@ -197,8 +197,17 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.final_score = result.summary.initial_score;
   std::vector<std::size_t> aggregate_affected_counts;
 
+  std::string immediate_reversal_key_to_skip;
   for (std::size_t iter = 0; iter < options.max_iterations; ++iter) {
-    auto iteration = run_chart_spr_acceptance_iteration(state, options, iter);
+    auto iteration_options = options;
+    iteration_options.enumeration.immediate_reversal_candidate_key_to_skip =
+        immediate_reversal_key_to_skip;
+    auto iteration_seed = options.seed + static_cast<std::uint32_t>(iter);
+    iteration_options.seed = iteration_seed;
+    iteration_options.enumeration.seed = iteration_seed;
+    auto iteration = run_chart_spr_acceptance_iteration(state,
+                                                        iteration_options,
+                                                        iter);
     result.summary.candidates_generated += iteration.candidates_generated;
     result.summary.local_scoring_ms += iteration.local_scoring_ms;
     result.summary.exact_verification_ms += iteration.exact_verification_ms;
@@ -261,6 +270,8 @@ chart_spr_search_result run_chart_spr_search(
         break;
       }
 
+      immediate_reversal_key_to_skip = chart_spr_candidate_immediate_reverse_key(
+          state.grammar, iteration.accepted->candidate);
       ++attempt_counters.accepted_moves;
       result.dag = std::move(materialized.dag);
       tentative_state.dag = &result.dag;

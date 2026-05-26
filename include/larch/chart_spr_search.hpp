@@ -58,6 +58,14 @@ struct chart_spr_search_counters {
   std::size_t candidates_pruned_before_construction = 0;
   std::size_t candidates_pruned_after_construction = 0;
   std::size_t candidates_generated_after_dedup = 0;
+  std::size_t candidates_pruned_root_or_trivial = 0;
+  std::size_t candidates_pruned_moved_size = 0;
+  std::size_t candidates_pruned_target_size = 0;
+  std::size_t candidates_pruned_overlap = 0;
+  std::size_t candidates_pruned_affected_estimate = 0;
+  std::size_t candidates_pruned_immediate_reversal = 0;
+  std::size_t candidates_pruned_duplicate = 0;
+  std::size_t candidates_pruned_invalid = 0;
   std::size_t candidate_cap_cutoffs = 0;
   std::size_t path_budget_cutoffs = 0;
 
@@ -1800,6 +1808,17 @@ inline void record_chart_spr_candidate_generation_stats(
       stats.candidates_pruned_after_construction;
   counters.candidates_generated_after_dedup +=
       stats.candidates_generated_after_dedup;
+  counters.candidates_pruned_root_or_trivial +=
+      stats.candidates_pruned_root_or_trivial;
+  counters.candidates_pruned_moved_size += stats.candidates_pruned_moved_size;
+  counters.candidates_pruned_target_size += stats.candidates_pruned_target_size;
+  counters.candidates_pruned_overlap += stats.candidates_pruned_overlap;
+  counters.candidates_pruned_affected_estimate +=
+      stats.candidates_pruned_affected_estimate;
+  counters.candidates_pruned_immediate_reversal +=
+      stats.candidates_pruned_immediate_reversal;
+  counters.candidates_pruned_duplicate += stats.candidates_pruned_duplicate;
+  counters.candidates_pruned_invalid += stats.candidates_pruned_invalid;
   if (stats.stop_reason == chart_spr_candidate_stop_reason::candidate_cap) {
     ++counters.candidate_cap_cutoffs;
   }
@@ -2445,9 +2464,7 @@ inline std::size_t chart_spr_rank_buffer_limit(
     case chart_spr_candidate_selection_mode::lower_bound_first_improvement:
       return 1;
     case chart_spr_candidate_selection_mode::sampled_or_randomized:
-      throw std::runtime_error(
-          "chart SPR Phase-4 gate: sampled/randomized candidate selection is "
-          "not implemented for grammar-native enumeration");
+      return options.top_k_exact_verify;
   }
   return options.top_k_exact_verify;
 }
@@ -2455,6 +2472,11 @@ inline std::size_t chart_spr_rank_buffer_limit(
 inline grammar_spr_enumeration_options chart_spr_iteration_enumeration_options(
     chart_spr_search_options const& options) {
   auto enumeration = options.enumeration;
+  if (options.candidate_selection ==
+      chart_spr_candidate_selection_mode::sampled_or_randomized) {
+    enumeration.randomize_order = true;
+    enumeration.seed = options.seed;
+  }
   if (options.max_candidates_per_iteration != 0) {
     enumeration.max_candidates = options.max_candidates_per_iteration;
     enumeration.max_candidates_is_post_dedup = true;
@@ -2484,9 +2506,8 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   validate_supported_chart_cache_options(options.cache);
   if (options.candidate_selection ==
       chart_spr_candidate_selection_mode::sampled_or_randomized) {
-    throw std::runtime_error(
-        "chart SPR Phase-4 gate: sampled/randomized candidate selection is "
-        "not implemented for grammar-native enumeration");
+    options.enumeration.randomize_order = true;
+    options.enumeration.seed = options.seed;
   }
 
   chart_spr_iteration_result result;
@@ -2498,6 +2519,10 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   result.state_score_after = result.state_score_before;
 
   auto enumeration = chart_spr_iteration_enumeration_options(options);
+  if (enumeration.source != chart_spr_candidate_source::grammar &&
+      state.dag != nullptr) {
+    enumeration.sampled_tree_source_dag = state.dag;
+  }
   std::vector<chart_spr_candidate_score> ranked;
   auto rank_limit = chart_spr_rank_buffer_limit(options);
   if (rank_limit != 0 && rank_limit != chart_spr_rank_unlimited) {
@@ -2817,7 +2842,8 @@ enumerate_grammar_spr_candidates_eager_diagnostic(
             ++result.stats.candidates_constructed;
             if (counters != nullptr) ++counters->candidates_constructed;
 
-            auto signature = candidate_signature(*candidate);
+            auto signature = chart_spr_candidate_taxon_signature(
+                grammar, *candidate);
             if (!seen.insert(std::move(signature)).second) {
               note_pruned_after(result.stats, counters);
               continue;
