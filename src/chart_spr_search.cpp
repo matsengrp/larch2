@@ -1,10 +1,12 @@
 #include <larch/chart_spr_search.hpp>
 #include <larch/rank3_rewrite.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace larch {
 namespace {
@@ -27,19 +29,12 @@ void validate_chart_spr_search_loop_options(
         "chart SPR search: accepted-state local cache updates are not "
         "implemented yet; rebuild_after_accept must remain true");
   }
-  if (options.acceptance_mode ==
-      chart_spr_acceptance_mode::fixed_topology_exact) {
-    throw std::runtime_error(
-        "chart SPR Phase-5 search: fixed_topology_exact acceptance is not "
-        "supported until the post-materialization commit gate can rescore the "
-        "same selected topology certificate on the rebuilt grammar");
-  }
 }
 
 bool chart_spr_rebuild_after_accept_needs_exact_trim(
     chart_spr_search_options const& options) {
-  return options.acceptance_mode !=
-         chart_spr_acceptance_mode::lower_bound_heuristic;
+  return options.acceptance_mode ==
+         chart_spr_acceptance_mode::exact_multisite;
 }
 
 void chart_spr_add_search_state_rebuild_counters(
@@ -93,18 +88,95 @@ chart_spr_search_state rebuild_chart_spr_search_state_after_accept(
   return state;
 }
 
+chart_spr_production_signature chart_spr_production_signature_for_id(
+    clade_grammar const& grammar, production_id pid) {
+  if (pid == no_production || pid >= grammar.productions.size()) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology post-materialization check: production "
+        "id out of range");
+  }
+  auto const& prod = grammar.productions[pid];
+  chart_spr_production_signature signature;
+  signature.parent_taxa = grammar.clades[prod.parent].taxa;
+  std::sort(signature.parent_taxa.begin(), signature.parent_taxa.end());
+  signature.child_taxa.reserve(prod.children.size());
+  for (auto child : prod.children) {
+    auto child_taxa = grammar.clades[child].taxa;
+    std::sort(child_taxa.begin(), child_taxa.end());
+    signature.child_taxa.push_back(std::move(child_taxa));
+  }
+  std::sort(signature.child_taxa.begin(), signature.child_taxa.end());
+  return signature;
+}
+
+production_id chart_spr_find_unique_production_by_signature(
+    clade_grammar const& grammar,
+    chart_spr_production_signature const& signature) {
+  production_id match = no_production;
+  for (std::size_t i = 0; i < grammar.productions.size(); ++i) {
+    auto pid = static_cast<production_id>(i);
+    if (chart_spr_production_signature_for_id(grammar, pid) == signature) {
+      if (match != no_production) {
+        throw std::runtime_error(
+            "chart SPR fixed-topology post-materialization check: selected "
+            "production signature is ambiguous in rebuilt grammar");
+      }
+      match = pid;
+    }
+  }
+  if (match == no_production) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology post-materialization check: selected "
+        "production signature is missing from rebuilt grammar");
+  }
+  return match;
+}
+
+std::uint64_t chart_spr_rebuilt_fixed_topology_score_with_invariants(
+    chart_spr_search_state const& rebuilt_state,
+    chart_spr_candidate_score const& accepted) {
+  if (!accepted.topology_selection.certificate) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology post-materialization check requires the "
+        "accepted candidate's complete topology certificate");
+  }
+  auto const& certificate = *accepted.topology_selection.certificate;
+  if (certificate.after_signatures.empty()) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology post-materialization check requires "
+        "after-topology production signatures");
+  }
+
+  rebuilt_state.active_patterns.assert_no_skipped_invariant_metadata();
+  std::vector<production_id> rebuilt_after_ids;
+  rebuilt_after_ids.reserve(certificate.after_signatures.size());
+  for (auto const& signature : certificate.after_signatures) {
+    rebuilt_after_ids.push_back(
+        chart_spr_find_unique_production_by_signature(rebuilt_state.grammar,
+                                                      signature));
+  }
+  auto topology = grammar_topology_from_productions(rebuilt_state.grammar,
+                                                    rebuilt_after_ids);
+  auto active_score = score_selected_topology(
+      rebuilt_state.grammar, rebuilt_state.active_patterns.patterns, topology,
+      rebuilt_state.chart_opts);
+  return chart_spr_add_invariant_offset(
+      active_score, rebuilt_state,
+      "chart-SPR fixed-topology rebuilt-score invariant offset");
+}
+
 std::uint64_t chart_spr_post_materialization_objective_score(
     chart_spr_search_state const& rebuilt_state,
-    chart_spr_search_options const& options) {
+    chart_spr_search_options const& options,
+    chart_spr_candidate_score const& accepted) {
   if (options.acceptance_mode ==
       chart_spr_acceptance_mode::lower_bound_heuristic) {
     return rebuilt_state.composite_lower_bound_with_invariants;
   }
   if (options.acceptance_mode ==
       chart_spr_acceptance_mode::fixed_topology_exact) {
-    throw std::runtime_error(
-        "chart SPR Phase-5 search: fixed_topology_exact rebuilt-objective "
-        "gate is not implemented");
+    return chart_spr_rebuilt_fixed_topology_score_with_invariants(
+        rebuilt_state, accepted);
   }
   return chart_spr_state_exact_score_with_invariants(rebuilt_state,
                                                      options.exact_trim);
@@ -202,6 +274,13 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.final_score = result.summary.initial_score;
   result.summary.active_pattern_count =
       state.active_patterns.patterns.patterns.size();
+  result.summary.initial_grammar_clade_count = state.grammar.clades.size();
+  result.summary.initial_grammar_production_count =
+      state.grammar.productions.size();
+  result.summary.final_grammar_clade_count =
+      result.summary.initial_grammar_clade_count;
+  result.summary.final_grammar_production_count =
+      result.summary.initial_grammar_production_count;
   result.summary.chart_cache_estimated_full_bytes =
       state.estimated_full_pattern_cache_bytes;
   result.summary.chart_cache_resident_bytes =
@@ -237,6 +316,16 @@ chart_spr_search_result run_chart_spr_search(
       break;
     }
 
+    if (options.acceptance_mode ==
+            chart_spr_acceptance_mode::fixed_topology_exact &&
+        result.iterations.empty()) {
+      // Fixed-topology exact mode scores the selected before/after topology
+      // for each accepted candidate rather than a single grammar-wide state
+      // optimum.  Once a move is selected, report the same selected-topology
+      // convention for the summary's initial/final scores.
+      result.summary.initial_score = iteration.state_score_before;
+    }
+
     auto attempt_counters = state.counters;
     auto materialize_start = std::chrono::steady_clock::now();
     try {
@@ -259,7 +348,7 @@ chart_spr_search_result run_chart_spr_search(
 
       auto check_start = std::chrono::steady_clock::now();
       auto rebuilt_score = chart_spr_post_materialization_objective_score(
-          tentative_state, options);
+          tentative_state, options, *iteration.accepted);
       if (options.override_post_materialization_rebuilt_score_for_tests) {
         rebuilt_score =
             *options.override_post_materialization_rebuilt_score_for_tests;
@@ -320,6 +409,9 @@ chart_spr_search_result run_chart_spr_search(
                                                  result.counters);
   result.summary.active_pattern_count =
       state.active_patterns.patterns.patterns.size();
+  result.summary.final_grammar_clade_count = state.grammar.clades.size();
+  result.summary.final_grammar_production_count =
+      state.grammar.productions.size();
   result.summary.chart_cache_estimated_full_bytes =
       state.estimated_full_pattern_cache_bytes;
   result.summary.chart_cache_resident_bytes =

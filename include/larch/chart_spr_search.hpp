@@ -266,10 +266,11 @@ struct chart_spr_search_options {
   std::size_t local_score_worker_count = 1;
 
   // Optional hook for fixed_topology_exact callers that already have a
-  // complete before/after topology certificate (for example, projected
-  // sampled-tree moves). If absent, fixed_topology_exact uses the deterministic
-  // selector named below and records the resulting certificate on each scored
-  // candidate.
+  // complete before/after topology certificate. If absent,
+  // fixed_topology_exact first consumes a projected sampled-tree candidate's
+  // source topology certificate when present; otherwise it uses the
+  // deterministic selector named below and records the resulting certificate on
+  // each scored candidate.
   chart_spr_topology_selection_provider topology_selection_provider = {};
   std::string fixed_topology_selector_name =
       "first_reachable_overlay_topology";
@@ -410,6 +411,10 @@ struct chart_spr_search_summary {
   double accepted_rebuild_ms = 0.0;
   double post_materialization_check_ms = 0.0;
   std::size_t active_pattern_count = 0;
+  std::size_t initial_grammar_clade_count = 0;
+  std::size_t initial_grammar_production_count = 0;
+  std::size_t final_grammar_clade_count = 0;
+  std::size_t final_grammar_production_count = 0;
   std::size_t chart_cache_estimated_full_bytes = 0;
   std::size_t chart_cache_resident_bytes = 0;
   std::size_t effective_pattern_batch_size = 0;
@@ -2764,6 +2769,22 @@ make_chart_spr_builtin_fixed_topology_selection(
   return selection;
 }
 
+inline std::optional<chart_spr_topology_selection>
+make_chart_spr_source_tree_topology_selection(
+    clade_grammar const& base, grammar_spr_candidate const& candidate) {
+  if (!candidate.source_before_topology_productions ||
+      !candidate.source_after_topology_productions) {
+    return std::nullopt;
+  }
+  chart_spr_topology_selection selection;
+  selection.kind = chart_spr_topology_selection_kind::explicit_certificate;
+  selection.selector_name = "source_tree_move_certificate";
+  selection.certificate = make_chart_spr_topology_certificate(
+      base, candidate, *candidate.source_before_topology_productions,
+      *candidate.source_after_topology_productions);
+  return selection;
+}
+
 inline void attach_fixed_topology_selection_for_acceptance(
     chart_spr_search_state const& state, chart_spr_candidate_score& scored,
     chart_spr_search_options const& options) {
@@ -2776,9 +2797,13 @@ inline void attach_fixed_topology_selection_for_acceptance(
     if (options.topology_selection_provider) {
       selection = options.topology_selection_provider(state, scored.candidate);
     } else {
-      selection = make_chart_spr_builtin_fixed_topology_selection(
-          state.grammar, scored.candidate,
-          options.fixed_topology_selector_name);
+      selection = make_chart_spr_source_tree_topology_selection(
+          state.grammar, scored.candidate);
+      if (!selection) {
+        selection = make_chart_spr_builtin_fixed_topology_selection(
+            state.grammar, scored.candidate,
+            options.fixed_topology_selector_name);
+      }
     }
     if (!selection) {
       scored.valid = false;

@@ -1217,9 +1217,9 @@ Analysis:
                           Number of lower-bound-ranked candidates exact-verified
                           in lower-bound-top-k mode (default 16; 0 verifies none)
   --chart-spr-acceptance <M>
-                          exact/exact-multisite (default), or
-                          lower-bound/lower-bound-heuristic; fixed-topology
-                          remains Phase-4-only and is rejected by Phase-5 search
+                          exact/exact-multisite (default), fixed-topology/
+                          fixed-topology-exact, or lower-bound/
+                          lower-bound-heuristic
   --chart-spr-candidate-selection <M>
                           exhaustive-exact, lower-bound-top-k (default),
                           lower-bound-first-improvement, or randomized
@@ -2821,8 +2821,15 @@ static void run_chart_spr_search_diagnostic(
   out << "  topology_selection: ";
   if (options.acceptance_mode ==
       chart_spr_acceptance_mode::fixed_topology_exact) {
-    out << "deterministic_selector:"
-        << options.fixed_topology_selector_name << "\n";
+    if (options.enumeration.source ==
+            chart_spr_candidate_source::sampled_tree ||
+        options.enumeration.source == chart_spr_candidate_source::hybrid) {
+      out << "source_tree_move_certificate_or_deterministic_selector:"
+          << options.fixed_topology_selector_name << "\n";
+    } else {
+      out << "deterministic_selector:"
+          << options.fixed_topology_selector_name << "\n";
+    }
   } else {
     out << "none\n";
   }
@@ -2832,7 +2839,7 @@ static void run_chart_spr_search_diagnostic(
     out << "composite_lower_bound_heuristic\n";
   } else if (options.acceptance_mode ==
              chart_spr_acceptance_mode::fixed_topology_exact) {
-    out << "fixed_topology_exact_phase5_unsupported\n";
+    out << "fixed_topology_exact\n";
   } else {
     out << "grammar_exact\n";
   }
@@ -2850,6 +2857,14 @@ static void run_chart_spr_search_diagnostic(
   }
   out << "  active_patterns: "
       << search.summary.active_pattern_count << "\n";
+  out << "  initial_grammar_clades: "
+      << search.summary.initial_grammar_clade_count << "\n";
+  out << "  initial_grammar_productions: "
+      << search.summary.initial_grammar_production_count << "\n";
+  out << "  final_grammar_clades: "
+      << search.summary.final_grammar_clade_count << "\n";
+  out << "  final_grammar_productions: "
+      << search.summary.final_grammar_production_count << "\n";
   out << "  chart_cache_estimated_full_bytes: "
       << search.summary.chart_cache_estimated_full_bytes << "\n";
   out << "  chart_cache_resident_bytes: "

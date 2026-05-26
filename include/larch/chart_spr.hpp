@@ -108,6 +108,16 @@ struct grammar_spr_candidate {
   // Optional source move from a sampled tree, when a candidate was bootstrapped
   // from the existing tree-centric SPR enumerator.
   std::optional<spr_move> source_tree_move;
+
+  // When source_tree_move is present, these optional complete topology
+  // certificates identify the exact before/after sampled-tree topology that
+  // produced the move.  Fixed-topology exact scoring can consume these refs so
+  // sampled-tree benchmarks score the sampled SPR move, not an arbitrary
+  // deterministic reachable topology from the overlay grammar.
+  std::optional<std::vector<overlay_production_ref>>
+      source_before_topology_productions;
+  std::optional<std::vector<overlay_production_ref>>
+      source_after_topology_productions;
 };
 
 struct spr_score_result {
@@ -767,6 +777,86 @@ inline std::optional<production_id> find_base_production_by_key(
   return std::nullopt;
 }
 
+inline std::vector<taxon_id> candidate_clade_ref_taxa_copy(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    overlay_clade_ref ref) {
+  if (ref.space == overlay_id_space::base) {
+    if (ref.id == no_clade || ref.id >= base.clades.size()) {
+      throw std::runtime_error(
+          "chart SPR sampled-tree certificate: base clade ref out of range");
+    }
+    return base.clades[ref.id].taxa;
+  }
+  if (ref.id == no_clade || ref.id >= candidate.added_clades.size()) {
+    throw std::runtime_error(
+        "chart SPR sampled-tree certificate: temp clade ref out of range");
+  }
+  return candidate.added_clades[ref.id].taxa;
+}
+
+inline production_taxa_key production_key_from_candidate_production(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    overlay_grammar_production const& prod) {
+  production_taxa_key key;
+  key.parent = candidate_clade_ref_taxa_copy(base, candidate, prod.parent);
+  key.children.reserve(prod.children.size());
+  for (auto child : prod.children) {
+    key.children.push_back(
+        candidate_clade_ref_taxa_copy(base, candidate, child));
+  }
+  normalize_production_taxa_key(key);
+  return key;
+}
+
+inline std::optional<overlay_production_ref>
+find_available_candidate_production_by_key(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    std::map<std::vector<taxon_id>, clade_id> const& base_lookup,
+    production_taxa_key const& key) {
+  auto base_pid = find_base_production_by_key(base, base_lookup, key);
+  if (base_pid && !candidate_removes_base_production(candidate, *base_pid)) {
+    return base_production_ref(*base_pid);
+  }
+  for (std::size_t i = 0; i < candidate.added_productions.size(); ++i) {
+    if (production_key_from_candidate_production(
+            base, candidate, candidate.added_productions[i]) == key) {
+      return temp_production_ref(static_cast<production_id>(i));
+    }
+  }
+  return std::nullopt;
+}
+
+inline std::optional<std::vector<overlay_production_ref>>
+source_before_topology_refs_from_tree_keys(
+    clade_grammar const& base,
+    std::map<std::vector<taxon_id>, clade_id> const& base_lookup,
+    std::vector<production_taxa_key> const& keys) {
+  std::vector<overlay_production_ref> refs;
+  refs.reserve(keys.size());
+  for (auto const& key : keys) {
+    auto base_pid = find_base_production_by_key(base, base_lookup, key);
+    if (!base_pid) return std::nullopt;
+    refs.push_back(base_production_ref(*base_pid));
+  }
+  return refs;
+}
+
+inline std::optional<std::vector<overlay_production_ref>>
+source_after_topology_refs_from_tree_keys(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    std::map<std::vector<taxon_id>, clade_id> const& base_lookup,
+    std::vector<production_taxa_key> const& keys) {
+  std::vector<overlay_production_ref> refs;
+  refs.reserve(keys.size());
+  for (auto const& key : keys) {
+    auto ref = find_available_candidate_production_by_key(
+        base, candidate, base_lookup, key);
+    if (!ref) return std::nullopt;
+    refs.push_back(*ref);
+  }
+  return refs;
+}
+
 inline void add_candidate_production_by_taxa(
     clade_grammar const& grammar, grammar_spr_candidate& candidate,
     std::map<std::vector<taxon_id>, clade_id> const& base_lookup,
@@ -793,9 +883,12 @@ inline std::optional<grammar_spr_candidate> make_candidate_from_tree_diff(
   std::map<std::vector<taxon_id>, clade_id> temp_lookup;
 
   std::set<production_taxa_key> before_keys;
+  std::vector<production_taxa_key> ordered_before_keys;
+  ordered_before_keys.reserve(before_tree.productions.size());
   for (auto const& prod : before_tree.productions) {
-    before_keys.insert(
-        production_key_from_tree_in_base_taxa(base, before_tree, prod));
+    auto key = production_key_from_tree_in_base_taxa(base, before_tree, prod);
+    before_keys.insert(key);
+    ordered_before_keys.push_back(std::move(key));
   }
 
   std::set<production_taxa_key> after_keys;
@@ -834,6 +927,15 @@ inline std::optional<grammar_spr_candidate> make_candidate_from_tree_diff(
   if (candidate.removed_productions.empty() &&
       candidate.added_productions.empty()) {
     return std::nullopt;
+  }
+
+  auto source_before = source_before_topology_refs_from_tree_keys(
+      base, base_lookup, ordered_before_keys);
+  auto source_after = source_after_topology_refs_from_tree_keys(
+      base, candidate, base_lookup, ordered_after_keys);
+  if (source_before && source_after) {
+    candidate.source_before_topology_productions = std::move(*source_before);
+    candidate.source_after_topology_productions = std::move(*source_after);
   }
   return candidate;
 }

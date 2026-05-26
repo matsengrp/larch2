@@ -199,6 +199,8 @@ static void clear_optional_candidate_metadata(
   candidate.old_sibling = {};
   candidate.new_sibling_or_target = {};
   candidate.source_tree_move.reset();
+  candidate.source_before_topology_productions.reset();
+  candidate.source_after_topology_productions.reset();
 }
 
 static void test_lower_bound_oracle_counters_show_full_rebuild_cost() {
@@ -1126,6 +1128,45 @@ static void test_fixed_topology_iteration_uses_default_selector() {
   std::println("  PASS");
 }
 
+static void test_sampled_tree_fixed_topology_uses_source_certificate() {
+  std::println("test_sampled_tree_fixed_topology_uses_source_certificate");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, grammar);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.enumeration.source = larch::chart_spr_candidate_source::sampled_tree;
+  options.enumeration.max_candidates = 8;
+  options.top_k_exact_verify = 8;
+
+  auto state = larch::build_chart_spr_search_state(dag, grammar, patterns);
+  auto iteration = larch::run_chart_spr_acceptance_iteration(state, options);
+
+  CHECK(iteration.candidates_scored > 0);
+  CHECK(iteration.candidates_exact_verified > 0);
+  CHECK(iteration.accepted.has_value());
+  CHECK(iteration.accepted->candidate.source_tree_move.has_value());
+  CHECK(iteration.accepted->candidate.source_before_topology_productions
+            .has_value());
+  CHECK(iteration.accepted->candidate.source_after_topology_productions
+            .has_value());
+  CHECK(iteration.accepted->topology_selection.kind ==
+        larch::chart_spr_topology_selection_kind::explicit_certificate);
+  CHECK(iteration.accepted->topology_selection.selector_name ==
+        "source_tree_move_certificate");
+  CHECK(iteration.accepted->topology_selection.certificate.has_value());
+  CHECK(iteration.accepted->exact.has_value());
+  CHECK(iteration.accepted->exact->value.improves());
+
+  std::println("  PASS");
+}
+
 static void test_fixed_topology_exact_certificate_scores_selected_topology() {
   std::println("test_fixed_topology_exact_certificate_scores_selected_topology");
 
@@ -1357,8 +1398,10 @@ static void test_phase5_post_materialization_worsening_rejects_commit() {
   std::println("  PASS");
 }
 
-static void test_phase5_fixed_topology_mode_is_disallowed_until_commit_gate() {
-  std::println("test_phase5_fixed_topology_mode_is_disallowed_until_commit_gate");
+static void
+    test_phase5_fixed_topology_mode_commits_with_rebuilt_certificate_gate() {
+  std::println(
+      "test_phase5_fixed_topology_mode_commits_with_rebuilt_certificate_gate");
 
   auto dag = larch::test::make_tiny_labelled_tree(
       "A", four_taxon_misplaced_tree());
@@ -1367,16 +1410,27 @@ static void test_phase5_fixed_topology_mode_is_disallowed_until_commit_gate() {
   larch::chart_spr_search_options options;
   options.acceptance_mode =
       larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 8;
+  options.max_iterations = 1;
 
-  bool threw = false;
-  try {
-    (void)larch::run_chart_spr_search(std::move(dag), grammar, options);
-  } catch (std::exception const& e) {
-    threw = true;
-    CHECK(std::string{e.what()}.find("fixed_topology_exact") !=
-          std::string::npos);
-  }
-  CHECK(threw);
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar,
+                                            options);
+
+  CHECK(search.iterations.size() == 1);
+  CHECK(search.iterations.front().accepted.has_value());
+  CHECK(search.iterations.front().accepted_move_committed);
+  CHECK(!search.iterations.front().post_materialization_rejected);
+  CHECK(search.iterations.front().accepted->exact.has_value());
+  CHECK(search.iterations.front().accepted->exact->kind ==
+        larch::chart_spr_score_kind::fixed_topology_exact);
+  CHECK(search.counters.accepted_moves == 1);
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 1);
+  CHECK(search.iterations.front().state_score_after <=
+        search.iterations.front().state_score_before);
+  CHECK(search.summary.final_grammar_clade_count > 0);
+  CHECK(search.summary.final_grammar_production_count > 0);
 
   std::println("  PASS");
 }
@@ -1555,13 +1609,14 @@ int main() {
   test_lower_bound_heuristic_acceptance_is_explicit();
   test_fixed_topology_exact_rejects_bare_candidate();
   test_fixed_topology_iteration_uses_default_selector();
+  test_sampled_tree_fixed_topology_uses_source_certificate();
   test_fixed_topology_exact_certificate_scores_selected_topology();
   test_enumeration_truncation_sets_unverified_flag_even_exhaustive();
   test_phase5_no_improvement_search_stops_without_commit();
   test_phase5_known_improving_search_commits_once();
   test_phase5_rejected_candidates_do_not_rebuild_sidecar();
   test_phase5_post_materialization_worsening_rejects_commit();
-  test_phase5_fixed_topology_mode_is_disallowed_until_commit_gate();
+  test_phase5_fixed_topology_mode_commits_with_rebuilt_certificate_gate();
   test_phase5_pattern_fingerprint_mismatch_rebuilds_patterns();
   test_phase5_seeded_multi_iteration_is_deterministic();
   test_exhaustive_exact_acceptance_matches_oracle();
