@@ -36,7 +36,7 @@ jobs:
       - name: Prepare release artifact
         run: |
           mkdir larch2-linux-x86_64
-          cp build/larch2 build/dagutil larch2-linux-x86_64/
+          cp build/bin/larch2 build/bin/dagutil larch2-linux-x86_64/
           zip -j larch2-linux-x86_64.zip larch2-linux-x86_64/*
 
       - name: Get version info
