@@ -1464,6 +1464,11 @@ inline std::string chart_spr_candidate_signature_impl(
   return out.str();
 }
 
+// Stable candidate identities for deduplication and reports.  Dense clade and
+// production IDs are valid only inside one grammar build, so public diagnostics
+// use normalized moved/parent/sibling/target taxa plus removed/added production
+// taxon keys.  Use the sample signature for cross-run/JSON reports when sample
+// IDs are more stable than in-process taxon IDs.
 inline std::string chart_spr_candidate_taxon_signature(
     clade_grammar const& base, grammar_spr_candidate const& candidate) {
   return chart_spr_candidate_signature_impl(base, candidate,
@@ -2200,9 +2205,10 @@ inline spr_score_result score_single_site_spr_candidate(
 // dense overlay grammar for the candidate and then calls
 // build_composite_chart_score() on both the base grammar and the overlay
 // grammar.  Used naively, rejected candidates pay two full composite chart
-// rebuilds each; production chart-SPR search must use cached local scoring
-// instead.  The result is a composite lower bound, not an exact coupled
-// multi-site objective.
+// rebuilds each; production chart-SPR search must use chart_spr_search_state
+// and the overlay-delta local scorer instead.  The result is a composite lower
+// bound, not an exact coupled multi-site objective, so it is appropriate for
+// tests/diagnostics but not for an accept/reject optimizer loop.
 inline spr_score_result score_multisite_spr_candidate_lower_bound(
     clade_grammar const& base, site_pattern_set const& patterns,
     grammar_spr_candidate const& candidate, chart_options const& options = {}) {
@@ -2220,8 +2226,9 @@ inline spr_score_result score_multisite_spr_candidate_lower_bound(
 // Diagnostic/oracle helper, not production top-K verification.  This
 // materializes the candidate overlay and recomputes both the old exact trim and
 // the new exact trim from scratch.  Production exact verification should reuse
-// the search state's cached old exact score and build only the candidate's new
-// exact objective for the small verified set.
+// the search state's cached old active-only exact score, materialize/count only
+// the candidate's new overlay objective for the small verified set, and add any
+// invariant offset exactly once at the comparison boundary.
 inline spr_score_result score_multisite_spr_candidate_exact(
     clade_grammar const& base, site_pattern_set const& patterns,
     grammar_spr_candidate const& candidate, chart_options const& options = {},

@@ -813,6 +813,10 @@ add_test(NAME no_direct_chart_spr_multisite_helpers
          COMMAND bash test/no_direct_chart_spr_multisite_helpers.sh
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+add_test(NAME no_direct_chart_spr_root_score_detail
+         COMMAND bash test/no_direct_chart_spr_root_score_detail.sh
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 # Vulkan compute tests
 if(ENABLE_VULKAN)
     compile_shaders(

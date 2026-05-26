@@ -946,6 +946,13 @@ inline std::uint64_t invariant_constant_offset(site_pattern_set const& patterns,
   return total;
 }
 
+// Shared checked root-row scorer for compressed site patterns.  In
+// score_ua_edge=false mode this is weight * min(root_row).  In
+// score_ua_edge=true mode one compressed pattern can contain positions with
+// different reference states, so this sums each reference-state count times
+// min_root_state(root_row[root] + c(reference, root)).  Chart-SPR search wraps
+// this helper and local scorers must use that wrapper instead of open-coding
+// UA/reference-edge arithmetic.
 inline std::uint64_t weighted_root_score_from_row(
     chart_row const& row, site_pattern const& pattern,
     chart_options const& options) {

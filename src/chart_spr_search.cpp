@@ -264,9 +264,8 @@ pattern_chart_cache_entry chart_spr_cache_entry_from_chart(
     entry.reference_state_counts[reference_state] =
         pattern.reference_state_counts[reference_state];
   }
-  entry.weighted_root_score =
-      chart_multisite_detail::weighted_root_score_from_row(
-          entry.root_row, pattern, chart_opts);
+  entry.weighted_root_score = chart_spr_weighted_root_score_from_row(
+      entry.root_row, pattern, chart_opts);
   return entry;
 }
 

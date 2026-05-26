@@ -86,6 +86,24 @@ struct chart_spr_search_counters {
   std::size_t reachability_full_grammar_like_passes = 0;
 };
 
+// Acceptance modes describe the objective used to accept a candidate.  They
+// are intentionally independent from chart_spr_candidate_selection_mode below,
+// which describes how many locally ranked candidates receive exact
+// verification.
+//
+// exact_multisite (default): grammar-exact multi-site B&B over the modified
+// grammar/topology set.  The current state's old exact score is cached; top-K
+// verification materializes only candidate overlays and is counted separately
+// from accepted-state rebuilds.
+//
+// fixed_topology_exact: exact only for one complete before/after topology
+// certificate or deterministic selector recorded in the result.  A bare
+// grammar_spr_candidate is not enough because it leaves grammar production
+// choices open.
+//
+// lower_bound_heuristic: opt-in exploratory mode that accepts a composite
+// lower-bound improvement.  It is not a coupled multi-site parsimony proof and
+// reports must label it as heuristic.
 enum class chart_spr_acceptance_mode {
   exact_multisite,
   fixed_topology_exact,
@@ -105,6 +123,11 @@ inline char const* chart_spr_acceptance_mode_name(
   return "unknown";
 }
 
+// Candidate-selection modes describe which generated/scored candidates are
+// exact-verified.  They do not change the acceptance objective above.  For
+// example, exact_multisite + lower_bound_top_k means the accepted move (if any)
+// passed grammar-exact verification, but unverified candidates may still hide
+// improvements; exhaustive_exact is the fully exhaustive policy.
 enum class chart_spr_candidate_selection_mode {
   exhaustive_exact,
   lower_bound_top_k,
@@ -336,6 +359,17 @@ inline char const* chart_spr_score_convention_name(
   return "unknown";
 }
 
+// Single chart-SPR root-row scoring entry point.  It delegates to the checked
+// multi-site chart helper so every search cache/local scorer handles
+// score_ua_edge=true compressed patterns the same way: reference-state counts
+// are applied to the full root row, not to a pre-collapsed scalar root minimum.
+inline std::uint64_t chart_spr_weighted_root_score_from_row(
+    std::array<chart_cost, nuc_state_count> const& root_row,
+    site_pattern const& pattern, chart_options const& options) {
+  return chart_multisite_detail::weighted_root_score_from_row(root_row, pattern,
+                                                              options);
+}
+
 struct chart_spr_objective_score {
   spr_score_result value;
   chart_spr_score_kind kind = chart_spr_score_kind::composite_lower_bound;
@@ -465,6 +499,20 @@ inline char const* chart_spr_cache_strategy_name(
   return "unknown";
 }
 
+// Search-cache objective convention:
+//
+// * chart_spr_search_state stores only active/topology-informative patterns in
+//   active_site_pattern_set.  Invariant sites are omitted from the hot chart
+//   cache and represented by invariant_constant_offset plus
+//   skipped_invariant_site_count on the state.
+// * Internal cache/B&B/oracle values are active-only unless a field name or
+//   chart_spr_score_convention explicitly says full_with_invariants.
+// * The invariant offset is added exactly once at report/comparison/commit
+//   boundaries.
+// * The active wrapper below mechanically rejects any site_pattern_set carrying
+//   skipped-invariant metadata or invariant patterns.
+// * Root rows are scored through chart_spr_weighted_root_score_from_row() so
+//   score_ua_edge=true compressed patterns use per-reference-state counts.
 struct active_site_pattern_set {
   site_pattern_set patterns;
 
@@ -655,9 +703,8 @@ inline pattern_chart_cache_entry build_pattern_chart_cache_entry(
     entry.reference_state_counts[reference_state] =
         pattern.reference_state_counts[reference_state];
   }
-  entry.weighted_root_score =
-      chart_multisite_detail::weighted_root_score_from_row(
-          entry.root_row, pattern, chart_opts);
+  entry.weighted_root_score = chart_spr_weighted_root_score_from_row(
+      entry.root_row, pattern, chart_opts);
   return entry;
 }
 
@@ -2031,8 +2078,8 @@ inline void accumulate_prepared_local_candidate_patterns(
           scratch.rows, cache_entry.chart, prepared.delta.root);
       prepared.new_active_score = chart_multisite_detail::checked_add_u64(
           prepared.new_active_score,
-          chart_multisite_detail::weighted_root_score_from_row(
-              root_row, pattern, state.chart_opts),
+          chart_spr_weighted_root_score_from_row(root_row, pattern,
+                                                 state.chart_opts),
           "chart-SPR local candidate active lower bound");
     }
   } catch (std::exception const& e) {

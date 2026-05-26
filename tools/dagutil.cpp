@@ -1149,7 +1149,10 @@ Analysis:
                           (polytomy-aware alias of --wric-polytomy-benchmark)
   --wric-polytomy-mode <M>
                           reject (default), audit-kary, expand-exact,
-                          or expand-bounded for WRIC chart diagnostics
+                          or expand-bounded for WRIC chart diagnostics;
+                          chart-SPR search also uses this mode and requires a
+                          binary chart-compatible grammar (reject fails fast on
+                          unresolved high-arity productions)
   --wric-polytomy-max-exact-arity <N>
                           Exact expansion arity cap (default 6)
   --wric-polytomy-max-shapes <N>
@@ -1206,7 +1209,9 @@ Analysis:
                           cached-chart local overlay-delta scorer diagnostic
   --chart-spr-search      Run the grammar-native chart-SPR search loop
                           (conservative accepted-move materialization/rebuild
-                          by default)
+                          by default). Acceptance objective and candidate-
+                          selection exact-verification policy are separate and
+                          reported separately.
   --chart-spr-local-accept-updates
                           Use optional Phase-9 accepted-state local cache
                           updates instead of rebuilding sidecar state after
@@ -1223,12 +1228,18 @@ Analysis:
                           Number of lower-bound-ranked candidates exact-verified
                           in lower-bound-top-k mode (default 16; 0 verifies none)
   --chart-spr-acceptance <M>
-                          exact/exact-multisite (default), fixed-topology/
-                          fixed-topology-exact, or lower-bound/
-                          lower-bound-heuristic
+                          Objective used to accept a move: exact/exact-
+                          multisite (default grammar-exact B&B), fixed-
+                          topology/fixed-topology-exact (requires/records a
+                          complete topology certificate or selector), or lower-
+                          bound/lower-bound-heuristic (opt-in composite lower
+                          bound, not an exact parsimony proof)
   --chart-spr-candidate-selection <M>
-                          exhaustive-exact, lower-bound-top-k (default),
-                          lower-bound-first-improvement, or randomized
+                          Which locally ranked candidates get exact
+                          verification: exhaustive-exact, lower-bound-top-k
+                          (default), lower-bound-first-improvement, or
+                          randomized. Non-exhaustive exact modes can leave
+                          unverified improvements in the candidate stream.
   --chart-spr-candidate-source <M>
                           grammar (default), sampled-tree, or hybrid
   --chart-spr-local-score-workers <N>
@@ -2445,8 +2456,13 @@ static void run_chart_spr_candidate_diagnostic(
 
   out << "chart_spr_candidates:\n";
   out << "  api: streaming\n";
+  out << "  polytomy_mode: "
+      << wric_polytomy_mode_name(a.wric_polytomy_opts.mode) << "\n";
+  out << "  binary_chart_compatibility: required_checked\n";
   out << "  source: " << chart_spr_candidate_source_name(opts.source)
       << "\n";
+  out << "  candidate_signature_identity: "
+      << "stable_sample_taxa_and_production_keys\n";
   out << "  randomize_order: "
       << (opts.randomize_order ? "true" : "false") << "\n";
   out << "  reservoir_sample: "
@@ -2656,7 +2672,11 @@ static void run_chart_spr_local_scoring_diagnostic(
 
   out << report_name << ":\n";
   out << "  api: search_state_cached_active_pattern_charts\n";
+  out << "  polytomy_mode: "
+      << wric_polytomy_mode_name(a.wric_polytomy_opts.mode) << "\n";
+  out << "  binary_chart_compatibility: required_checked\n";
   out << "  score_kind: composite_lower_bound\n";
+  out << "  score_convention: active_cache_plus_single_invariant_offset\n";
   out << "  phase1_materialized_overlay_local_recompute: false\n";
   out << "  phase3_lightweight_overlay_delta: true\n";
   if (report_name == "chart_spr_search") {
@@ -2670,6 +2690,7 @@ static void run_chart_spr_local_scoring_diagnostic(
   }
   out << "  score_ua_edge: "
       << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+  out << "  root_row_scoring_api: chart_spr_weighted_root_score_from_row\n";
   out << "  active_patterns: "
       << state.active_patterns.patterns.patterns.size() << "\n";
   out << "  skipped_invariant_sites: "
@@ -2692,6 +2713,8 @@ static void run_chart_spr_local_scoring_diagnostic(
       << cache_ms << "\n";
   out << "  candidate_source: "
       << chart_spr_candidate_source_name(enumeration.source) << "\n";
+  out << "  candidate_signature_identity: "
+      << "stable_sample_taxa_and_production_keys\n";
   out << "  randomize_order: "
       << (enumeration.randomize_order ? "true" : "false") << "\n";
   out << "  reservoir_sample: "
@@ -2808,6 +2831,9 @@ static void run_chart_spr_search_diagnostic(
 
   out << "chart_spr_search:\n";
   out << "  api: search_state_cached_active_pattern_charts\n";
+  out << "  polytomy_mode: "
+      << wric_polytomy_mode_name(a.wric_polytomy_opts.mode) << "\n";
+  out << "  binary_chart_compatibility: required_checked\n";
   out << "  search_mode: "
       << (options.rebuild_after_accept
               ? "phase5_accept_reject_materialize_rebuild"
@@ -2838,6 +2864,8 @@ static void run_chart_spr_search_diagnostic(
       << "\n";
   out << "  candidate_source: "
       << chart_spr_candidate_source_name(options.enumeration.source) << "\n";
+  out << "  candidate_signature_identity: "
+      << "stable_sample_taxa_and_production_keys\n";
   out << "  randomize_order: "
       << (options.enumeration.randomize_order ? "true" : "false")
       << "\n";
@@ -2874,8 +2902,10 @@ static void run_chart_spr_search_diagnostic(
   } else {
     out << "grammar_exact\n";
   }
+  out << "  score_convention: active_cache_plus_single_invariant_offset\n";
   out << "  score_ua_edge: "
       << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+  out << "  root_row_scoring_api: chart_spr_weighted_root_score_from_row\n";
   out << "  local_score_workers: "
       << search.summary.local_score_worker_count << "\n";
   out << "  cache_strategy: ";

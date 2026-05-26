@@ -1,6 +1,6 @@
 # WRIC chart-SPR search benchmark
 
-Phase 8 adds a reproducible harness for comparing the current sample--explore--merge optimizer with the DAG-native chart-SPR search path.  A committed CI-scale result table lives in [`WRIC-SPR-SEARCH-BENCHMARK-RESULTS.md`](WRIC-SPR-SEARCH-BENCHMARK-RESULTS.md).
+Phase 8 adds a reproducible harness for comparing the current sample--explore--merge optimizer with the DAG-native chart-SPR search path.  A committed CI-scale result table lives in [`WRIC-SPR-SEARCH-BENCHMARK-RESULTS.md`](WRIC-SPR-SEARCH-BENCHMARK-RESULTS.md).  For API/cost-model details, see [`WRIC-SPR-SEARCH.md`](WRIC-SPR-SEARCH.md).
 
 ## Smoke run
 
