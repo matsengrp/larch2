@@ -1204,22 +1204,22 @@ Analysis:
                           streaming Phase-1 API and print generation counters
   --chart-spr-score-local Score streamed grammar-native candidates with the
                           cached-chart local overlay-delta scorer diagnostic
-  --chart-spr-search      Run the Phase-4 grammar-native ranking plus exact
-                          acceptance gate (no DAG mutation/materialized commit
-                          until the Phase-5 search loop)
+  --chart-spr-search      Run the Phase-5 grammar-native chart-SPR search loop
+                          with conservative accepted-move materialization and
+                          one sidecar rebuild per attempted commit
   --chart-spr-max-candidates <N>
                           Candidate cap for chart-SPR diagnostics
                           (default 0, unlimited; post-dedup)
   --chart-spr-max-iterations <N>
-                          Requested iteration cap for future full search
-                          (default 1; Phase-4 gate runs one non-mutating
-                          ranking/acceptance pass)
+                          Maximum chart-SPR accept/reject iterations
+                          (default 1)
   --chart-spr-top-k-exact <N>
                           Number of lower-bound-ranked candidates exact-verified
                           in lower-bound-top-k mode (default 16; 0 verifies none)
   --chart-spr-acceptance <M>
-                          exact/exact-multisite (default), fixed-topology,
-                          or lower-bound/lower-bound-heuristic
+                          exact/exact-multisite (default), or
+                          lower-bound/lower-bound-heuristic; fixed-topology
+                          remains Phase-4-only and is rejected by Phase-5 search
   --chart-spr-candidate-selection <M>
                           exhaustive-exact, lower-bound-top-k (default),
                           lower-bound-first-improvement, or randomized
@@ -2580,24 +2580,20 @@ static chart_spr_search_options make_chart_spr_search_options(
   return options;
 }
 
-static void run_chart_spr_acceptance_gate_diagnostic(
+static void run_chart_spr_search_diagnostic(
     std::ostream& out, phylo_dag& dag,
     polytomy_refinement_result& refinement, args const& a) {
   auto options = make_chart_spr_search_options(a);
-
-  auto cache_start = std::chrono::steady_clock::now();
-  auto state = build_chart_spr_search_state(dag, refinement.grammar, options);
-  auto cache_ms = elapsed_ms(cache_start, std::chrono::steady_clock::now());
-
-  auto iteration_start = std::chrono::steady_clock::now();
-  auto iteration = run_chart_spr_acceptance_iteration(state, options, 0);
-  auto iteration_ms = elapsed_ms(iteration_start,
-                                 std::chrono::steady_clock::now());
+  auto search = run_chart_spr_search(std::move(dag), refinement.grammar,
+                                     options);
+  dag = std::move(search.dag);
+  build_clade_offsets(dag);
 
   out << "chart_spr_search:\n";
   out << "  api: search_state_cached_active_pattern_charts\n";
-  out << "  search_mode: phase4_acceptance_gate_no_dag_mutation\n";
-  out << "  actual_dag_mutation: false\n";
+  out << "  search_mode: phase5_accept_reject_materialize_rebuild\n";
+  out << "  actual_dag_mutation: "
+      << (search.summary.accepted_moves > 0 ? "true" : "false") << "\n";
   out << "  acceptance: "
       << chart_spr_acceptance_mode_name(options.acceptance_mode) << "\n";
   out << "  candidate_selection: "
@@ -2618,96 +2614,161 @@ static void run_chart_spr_acceptance_gate_diagnostic(
     out << "composite_lower_bound_heuristic\n";
   } else if (options.acceptance_mode ==
              chart_spr_acceptance_mode::fixed_topology_exact) {
-    out << "fixed_topology_exact\n";
+    out << "fixed_topology_exact_phase5_unsupported\n";
   } else {
     out << "grammar_exact\n";
   }
   out << "  score_ua_edge: "
       << (a.chart_score_ua_edge ? "true" : "false") << "\n";
-  out << "  active_patterns: "
-      << state.active_patterns.patterns.patterns.size() << "\n";
-  out << "  skipped_invariant_sites: "
-      << state.skipped_invariant_site_count << "\n";
-  out << "  invariant_constant_offset: "
-      << state.invariant_constant_offset << "\n";
-  out << "  chart_cache_estimated_bytes: "
-      << estimate_chart_spr_pattern_cache_bytes(state) << "\n";
-  out << "  cache_build_ms: " << std::fixed << std::setprecision(3)
-      << cache_ms << "\n";
-  out << "  acceptance_gate_ms: " << std::fixed << std::setprecision(3)
-      << iteration_ms << "\n";
   out << "  requested_max_iterations: " << a.chart_spr_max_iterations
       << "\n";
-  out << "  implemented_gate_iterations: 1\n";
-  out << "  candidates_generated: " << iteration.candidates_generated
+  out << "  iterations: " << search.summary.iterations << "\n";
+  out << "  accepted_moves: " << search.summary.accepted_moves << "\n";
+  out << "  output_dag_mutated: "
+      << (search.summary.accepted_moves > 0 ? "true" : "false") << "\n";
+  out << "  candidate_accepts_attempted: "
+      << search.summary.candidate_accepts_attempted << "\n";
+  out << "  post_materialization_rejections: "
+      << search.summary.post_materialization_rejections << "\n";
+  out << "  initial_score: " << search.summary.initial_score << "\n";
+  out << "  final_score: " << search.summary.final_score << "\n";
+  out << "  candidates_generated: "
+      << search.summary.candidates_generated << "\n";
+  out << "  candidates_scored: "
+      << search.summary.candidates_locally_scored << "\n";
+  out << "  exact_verifications: "
+      << search.summary.exact_verifications << "\n";
+  out << "  initial_search_state_rebuilds: "
+      << search.summary.initial_search_state_rebuilds << "\n";
+  out << "  sidecar_rebuilds_after_accept: "
+      << search.summary.sidecar_rebuilds_after_accept << "\n";
+  out << "  full_search_state_rebuilds: "
+      << search.summary.full_search_state_rebuilds << "\n";
+  out << "  overlay_materializations_for_exact_verification: "
+      << search.summary.overlay_materializations_for_exact_verification
       << "\n";
-  out << "  candidates_scored: " << iteration.candidates_scored << "\n";
-  out << "  candidate_score_failures: "
-      << iteration.candidate_score_failures << "\n";
-  out << "  local_improving_candidates: "
-      << iteration.local_improving_candidates << "\n";
-  out << "  locally_ranked_candidates_retained: "
-      << iteration.locally_ranked_candidates_retained << "\n";
-  out << "  candidates_exact_verified: "
-      << iteration.candidates_exact_verified << "\n";
-  out << "  unverified_candidates_may_contain_improvements: "
-      << (iteration.unverified_candidates_may_contain_improvements ? "true"
-                                                                    : "false")
+  out << "  overlay_materializations_for_accept_materialization: "
+      << search.summary.overlay_materializations_for_accept_materialization
       << "\n";
-  out << "  state_score_before: " << iteration.state_score_before << "\n";
-  out << "  state_score_after: " << iteration.state_score_after << "\n";
-  out << "  accepted_move_present: "
-      << (iteration.accepted ? "true" : "false") << "\n";
-  out << "  output_dag_mutated: false\n";
-  if (!iteration.no_accept_reason.empty()) {
-    out << "  no_accept_reason: " << iteration.no_accept_reason << "\n";
-  }
-  if (iteration.accepted) {
-    auto const& accepted = *iteration.accepted;
-    out << "  accepted_lower_bound_delta: "
-        << accepted.lower_bound.value.delta << "\n";
-    out << "  accepted_lower_bound_new_score: "
-        << accepted.lower_bound.value.new_score << "\n";
-    if (accepted.exact) {
-      out << "  accepted_exact_kind: "
-          << chart_spr_score_kind_name(accepted.exact->kind) << "\n";
-      out << "  accepted_exact_delta: " << accepted.exact->value.delta
-          << "\n";
-      out << "  accepted_exact_new_score: "
-          << accepted.exact->value.new_score << "\n";
-    }
-    out << "  accepted_affected_clades: "
-        << accepted.affected_clade_count << "\n";
-    out << "  accepted_topology_selection: "
-        << chart_spr_topology_selection_label(accepted.topology_selection)
-        << "\n";
-    if (accepted.topology_selection.certificate) {
-      auto const& cert = *accepted.topology_selection.certificate;
-      out << "  accepted_topology_certificate_before_productions: "
-          << cert.before_overlay_productions.size() << "\n";
-      out << "  accepted_topology_certificate_after_productions: "
-          << cert.after_overlay_productions.size() << "\n";
-      out << "  accepted_topology_certificate_before_signatures: "
-          << cert.before_signatures.size() << "\n";
-      out << "  accepted_topology_certificate_after_signatures: "
-          << cert.after_signatures.size() << "\n";
-    }
-    out << "  accepted_candidate_signature: "
-        << chart_spr_candidate_taxon_signature(state.grammar,
-                                               accepted.candidate)
-        << "\n";
-  }
+  out << "  cache_build_ms: " << std::fixed << std::setprecision(3)
+      << search.summary.cache_build_ms << "\n";
+  out << "  local_scoring_ms: " << std::fixed << std::setprecision(3)
+      << search.summary.local_scoring_ms << "\n";
+  out << "  exact_verification_ms: " << std::fixed << std::setprecision(3)
+      << search.summary.exact_verification_ms << "\n";
+  out << "  accepted_rebuild_ms: " << std::fixed << std::setprecision(3)
+      << search.summary.accepted_rebuild_ms << "\n";
+  out << "  post_materialization_check_ms: " << std::fixed
+      << std::setprecision(3)
+      << search.summary.post_materialization_check_ms << "\n";
+  out << "  total_ms: " << std::fixed << std::setprecision(3)
+      << search.summary.total_ms << "\n";
+  out << "  final_dag:\n";
+  out << "    leaves: " << leaf_count(dag) << "\n";
+  out << "    nodes: " << node_count(dag) << "\n";
+  out << "    edges: " << edge_count(dag) << "\n";
   out << "  affected_clade_count_distribution:\n";
   out << "    mean: " << std::fixed << std::setprecision(3)
-      << iteration.affected_distribution.mean << "\n";
-  out << "    p50: " << iteration.affected_distribution.p50 << "\n";
-  out << "    p95: " << iteration.affected_distribution.p95 << "\n";
-  out << "    max: " << iteration.affected_distribution.max << "\n";
-  out << "  candidate_generation:\n";
-  print_chart_spr_generation_stats(out, iteration.candidate_generation,
-                                   "    ");
+      << search.summary.affected_distribution.mean << "\n";
+  out << "    p50: " << search.summary.affected_distribution.p50 << "\n";
+  out << "    p95: " << search.summary.affected_distribution.p95 << "\n";
+  out << "    max: " << search.summary.affected_distribution.max << "\n";
+  out << "  iteration_reports:\n";
+  if (search.iterations.empty()) {
+    out << "    <empty>\n";
+  } else {
+    for (auto const& iteration : search.iterations) {
+      out << "    - iteration: " << iteration.iteration << "\n";
+      out << "      candidates_generated: "
+          << iteration.candidates_generated << "\n";
+      out << "      candidates_scored: " << iteration.candidates_scored
+          << "\n";
+      out << "      candidate_score_failures: "
+          << iteration.candidate_score_failures << "\n";
+      out << "      local_improving_candidates: "
+          << iteration.local_improving_candidates << "\n";
+      out << "      locally_ranked_candidates_retained: "
+          << iteration.locally_ranked_candidates_retained << "\n";
+      out << "      candidates_exact_verified: "
+          << iteration.candidates_exact_verified << "\n";
+      out << "      local_scoring_ms: " << std::fixed << std::setprecision(3)
+          << iteration.local_scoring_ms << "\n";
+      out << "      exact_verification_ms: " << std::fixed
+          << std::setprecision(3) << iteration.exact_verification_ms
+          << "\n";
+      out << "      unverified_candidates_may_contain_improvements: "
+          << (iteration.unverified_candidates_may_contain_improvements
+                  ? "true"
+                  : "false")
+          << "\n";
+      out << "      state_score_before: "
+          << iteration.state_score_before << "\n";
+      out << "      state_score_after: "
+          << iteration.state_score_after << "\n";
+      out << "      accepted_move_present: "
+          << (iteration.accepted ? "true" : "false") << "\n";
+      out << "      accepted_move_committed: "
+          << (iteration.accepted_move_committed ? "true" : "false")
+          << "\n";
+      out << "      post_materialization_rejected: "
+          << (iteration.post_materialization_rejected ? "true" : "false")
+          << "\n";
+      if (!iteration.no_accept_reason.empty()) {
+        out << "      no_accept_reason: "
+            << iteration.no_accept_reason << "\n";
+      }
+      if (!iteration.post_materialization_rejection_reason.empty()) {
+        out << "      post_materialization_rejection_reason: "
+            << iteration.post_materialization_rejection_reason << "\n";
+      }
+      if (iteration.accepted) {
+        auto const& accepted = *iteration.accepted;
+        out << "      accepted_lower_bound_delta: "
+            << accepted.lower_bound.value.delta << "\n";
+        out << "      accepted_lower_bound_new_score: "
+            << accepted.lower_bound.value.new_score << "\n";
+        if (accepted.exact) {
+          out << "      accepted_exact_kind: "
+              << chart_spr_score_kind_name(accepted.exact->kind) << "\n";
+          out << "      accepted_exact_delta: "
+              << accepted.exact->value.delta << "\n";
+          out << "      accepted_exact_new_score: "
+              << accepted.exact->value.new_score << "\n";
+        }
+        out << "      accepted_affected_clades: "
+            << accepted.affected_clade_count << "\n";
+        out << "      accepted_topology_selection: "
+            << chart_spr_topology_selection_label(
+                   accepted.topology_selection)
+            << "\n";
+        out << "      reused_patterns_after_accept: "
+            << (iteration.reused_patterns_after_accept ? "true" : "false")
+            << "\n";
+        out << "      post_materialization_rebuilt_score: "
+            << iteration.post_materialization_rebuilt_score << "\n";
+        if (iteration.iteration == 0) {
+          out << "      accepted_candidate_signature: "
+              << chart_spr_candidate_taxon_signature(
+                     refinement.grammar, accepted.candidate)
+              << "\n";
+        }
+      }
+      out << "      affected_clade_count_distribution:\n";
+      out << "        mean: " << std::fixed << std::setprecision(3)
+          << iteration.affected_distribution.mean << "\n";
+      out << "        p50: " << iteration.affected_distribution.p50
+          << "\n";
+      out << "        p95: " << iteration.affected_distribution.p95
+          << "\n";
+      out << "        max: " << iteration.affected_distribution.max
+          << "\n";
+      out << "      candidate_generation:\n";
+      print_chart_spr_generation_stats(out, iteration.candidate_generation,
+                                       "        ");
+    }
+  }
   out << "  counters:\n";
-  print_chart_spr_search_counter_fields(out, state.counters, "    ");
+  print_chart_spr_search_counter_fields(out, search.counters, "    ");
 }
 
 static void run_chart_spr_helper_benchmark(
@@ -3013,8 +3074,13 @@ int main(int argc, char** argv) try {
 
   if (a.chart_spr_search) {
     auto& refinement = get_chart_refinement();
-    run_chart_spr_acceptance_gate_diagnostic(
+    run_chart_spr_search_diagnostic(
         std::cout, result, refinement, a);
+    root_idx = get_root_idx(result);
+    chart_refinement_cache.reset();
+    exact_patterns_cache.reset();
+    chart_grammar_build_ms = 0.0;
+    exact_pattern_build_ms = 0.0;
   }
 
   if (a.chart_site) {

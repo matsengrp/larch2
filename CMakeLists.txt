@@ -104,7 +104,7 @@ endif()
 
 # --- Library ------------------------------------------------------------------
 
-add_library(larch src/protobuf.cpp src/protobuf_encode.cpp src/pickle_reader.cpp)
+add_library(larch src/protobuf.cpp src/protobuf_encode.cpp src/pickle_reader.cpp src/chart_spr_search.cpp)
 target_include_directories(larch PUBLIC include ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(larch PUBLIC ZLIB::ZLIB Threads::Threads)
 
@@ -417,7 +417,7 @@ add_test(NAME dagutil_chart_spr_search
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(dagutil_chart_spr_search
                      PROPERTIES PASS_REGULAR_EXPRESSION
-                     "search_mode: phase4_acceptance_gate_no_dag_mutation")
+                     "search_mode: phase5_accept_reject_materialize_rebuild")
 
 add_test(NAME dagutil_chart_spr_helper_benchmark_seedtree_larger_fixture
          COMMAND dagutil

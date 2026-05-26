@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -254,7 +255,14 @@ struct chart_spr_search_options {
 
   bool materialize_accepted_moves = true;
   bool rebuild_after_accept = true;  // conservative first production default
+
+  // Test/diagnostic hooks for validating expensive guardrails without needing
+  // pathological input DAGs.
   bool verify_local_against_full_for_tests = false;
+  bool force_pattern_fingerprint_mismatch_for_tests = false;
+  std::optional<std::uint64_t>
+      override_post_materialization_rebuilt_score_for_tests;
+
   std::uint32_t seed = 1;
 };
 
@@ -337,15 +345,52 @@ struct chart_spr_iteration_result {
   bool unverified_candidates_may_contain_improvements = false;
   std::string no_accept_reason;
   affected_clade_distribution affected_distribution;
+  std::vector<std::size_t> affected_clade_counts;
   std::optional<chart_spr_candidate_score> accepted;
+  bool accepted_move_committed = false;
+  bool post_materialization_rejected = false;
+  std::string post_materialization_rejection_reason;
+  bool reused_patterns_after_accept = false;
+  std::uint64_t post_materialization_rebuilt_score = 0;
   std::uint64_t state_score_before = 0;
   std::uint64_t state_score_after = 0;
+  double local_scoring_ms = 0.0;
+  double exact_verification_ms = 0.0;
+};
+
+struct chart_spr_search_summary {
+  std::size_t iterations = 0;
+  std::size_t accepted_moves = 0;
+  std::size_t candidates_generated = 0;
+  std::size_t candidates_locally_scored = 0;
+  std::size_t exact_verifications = 0;
+  std::size_t overlay_materializations_for_exact_verification = 0;
+  std::size_t overlay_materializations_for_accept_materialization = 0;
+  std::size_t sidecar_rebuilds_after_accept = 0;
+  std::size_t initial_search_state_rebuilds = 0;
+  std::size_t full_search_state_rebuilds = 0;
+  std::size_t candidate_accepts_attempted = 0;
+  std::size_t post_materialization_rejections = 0;
+  chart_spr_candidate_selection_mode candidate_selection =
+      chart_spr_candidate_selection_mode::lower_bound_top_k;
+  chart_spr_acceptance_mode acceptance_mode =
+      chart_spr_acceptance_mode::exact_multisite;
+  std::uint64_t initial_score = 0;
+  std::uint64_t final_score = 0;
+  double total_ms = 0.0;
+  double cache_build_ms = 0.0;
+  double local_scoring_ms = 0.0;
+  double exact_verification_ms = 0.0;
+  double accepted_rebuild_ms = 0.0;
+  double post_materialization_check_ms = 0.0;
+  affected_clade_distribution affected_distribution;
 };
 
 struct chart_spr_search_result {
   phylo_dag dag;
   std::vector<chart_spr_iteration_result> iterations;
   chart_spr_search_counters counters;
+  chart_spr_search_summary summary;
 };
 
 struct active_site_pattern_set {
@@ -2467,7 +2512,13 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   auto generation = for_each_grammar_spr_candidate(
       state.grammar, enumeration,
       [&](grammar_spr_candidate const& candidate) {
+        auto local_start = std::chrono::steady_clock::now();
         auto scored = score_candidate_locally(state, candidate, local_options);
+        auto local_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - local_start)
+                            .count();
+        result.local_scoring_ms += local_ms;
+        scored.local_score_ms = local_ms;
         ++result.candidates_scored;
         if (!scored.valid) {
           ++result.candidate_score_failures;
@@ -2491,7 +2542,8 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   result.candidates_generated = generation.candidates_generated_after_dedup;
   result.locally_ranked_candidates_retained = ranked.size();
   result.affected_distribution =
-      summarize_affected_clade_counts(std::move(affected_counts));
+      summarize_affected_clade_counts(affected_counts);
+  result.affected_clade_counts = std::move(affected_counts);
   record_chart_spr_candidate_generation_stats(generation, state.counters);
 
   if (options.acceptance_mode ==
@@ -2512,8 +2564,13 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     for (auto& candidate : ranked) {
       attach_fixed_topology_selection_for_acceptance(state, candidate, options);
       auto exact_verifications_before = state.counters.exact_verifications;
+      auto exact_start = std::chrono::steady_clock::now();
       auto verified_candidate = verify_candidate_for_acceptance(
           state, std::move(candidate), options);
+      result.exact_verification_ms +=
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - exact_start)
+              .count();
       if (state.counters.exact_verifications > exact_verifications_before ||
           verified_candidate.exact) {
         ++result.candidates_exact_verified;
@@ -2573,6 +2630,16 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   }
   return result;
 }
+
+// Phase-5 conservative DAG-native SPR search loop.  Candidate generation and
+// broad ranking use the cached local overlay-delta scorer.  Only accepted
+// candidates are materialized into a tentative DAG through the rank-3 grammar-
+// native path, then the sidecar search state is rebuilt once and the rebuilt
+// objective gates the commit.  Locally rejected candidates therefore do not
+// trigger full search-state rebuilds.
+chart_spr_search_result run_chart_spr_search(
+    phylo_dag initial_dag, clade_grammar initial_grammar,
+    chart_spr_search_options options = {});
 
 inline void record_chart_spr_local_candidate_score(
     chart_spr_search_counters& counters) {
