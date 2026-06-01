@@ -104,7 +104,7 @@ endif()
 
 # --- Library ------------------------------------------------------------------
 
-add_library(larch src/protobuf.cpp src/protobuf_encode.cpp src/pickle_reader.cpp src/chart_spr_search.cpp)
+add_library(larch src/protobuf.cpp src/protobuf_encode.cpp src/pickle_reader.cpp src/chart_spr_search.cpp src/chart_bnb_trim_apply.cpp)
 target_include_directories(larch PUBLIC include ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(larch PUBLIC ZLIB::ZLIB Threads::Threads)
 
@@ -372,6 +372,13 @@ set_tests_properties(dagutil_wric_phase9_chart_bnb_trim
 add_test(NAME dagutil_wric_phase9_chart_bnb_phase0_labels
          COMMAND bash -c
                  "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-dominance off --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_mode: off' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'keep_mask_kind: exact_optimal_production_union' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'keep_production_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'kept_productions_count_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_candidates_considered: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_pruned_score_pass: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_pruned_mask_pass: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_pruned: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'exact_mask_recovery_passes: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && \"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-dominance off --chart-bnb-score-only --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\" && grep -q 'keep_mask_kind: score_only_not_exact' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\" && grep -q 'keep_production_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\" && grep -q 'kept_productions_count_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\""
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+set(DAGUTIL_CHART_BNB_APPLY_OUT
+    "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_materialize.pb.gz")
+add_test(NAME dagutil_wric_phase9_chart_bnb_apply_materialize
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-apply-trim --chart-bnb-trim-application optimal-topology-materialize --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 -o \"${DAGUTIL_CHART_BNB_APPLY_OUT}\" > \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_materialize.out\" && grep -q 'trim_application_mode: optimal_topology_materialize' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_materialize.out\" && grep -q 'grammar_topology_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_materialize.out\" && grep -q 'identity_preserving_tree_set: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_materialize.out\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${DAGUTIL_CHART_BNB_APPLY_OUT}\" --force-no-vcf --validate > /dev/null"
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_chart_spr_helper_benchmark
@@ -805,7 +812,7 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   nn_ml_spr_test nn_blended_spr_test
                   inplace_spr_test wric_phase0_test clade_grammar_test
                   polytomy_refinement_test parsimony_chart_test
-                  site_patterns_test chart_trim_test
+                  site_patterns_test chart_trim_test chart_bnb_trim_apply_test
                   chart_spr_test chart_spr_search_test plateau_test
                   rank3_rewrite_test)
     add_executable(${test_name} test/${test_name}.cpp)

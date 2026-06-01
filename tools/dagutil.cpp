@@ -21,6 +21,7 @@
 #include <larch/parsimony_chart.hpp>
 #include <larch/site_patterns.hpp>
 #include <larch/chart_trim.hpp>
+#include <larch/chart_bnb_trim_apply.hpp>
 #include <larch/chart_spr_search.hpp>
 #include <larch/plateau.hpp>
 
@@ -31,6 +32,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -1204,6 +1206,17 @@ Analysis:
                           off; other modes fail clearly until implemented.
   --chart-bnb-score-only  Report the B&B result as score-only/non-exact-mask
                           instead of requiring an exact keep-production mask
+  --chart-bnb-apply-trim  Apply exact B&B trim results and optionally write a DAG
+  --chart-bnb-trim-application <M>
+                          production-mask (default) or
+                          optimal-topology-materialize
+  --chart-bnb-max-exact-topologies <N>
+                          Cap optimal topology materialization; explicit 0
+                          means unlimited (unset uses a conservative cap)
+  --chart-bnb-output-dag <path>
+                          Output path for --chart-bnb-apply-trim (or use -o)
+  --chart-bnb-report-json <path>
+                          Write a small JSON report for B&B trim application
   --chart-spr-helper-benchmark
                           Benchmark legacy chart-SPR helper costs and counters
                           (diagnostic/oracle path; not production search)
@@ -1364,6 +1377,12 @@ struct args {
   multisite_dominance_mode chart_bnb_dominance =
       multisite_dominance_mode::off;
   bool chart_bnb_score_only = false;
+  bool chart_bnb_apply_trim = false;
+  chart_bnb_trim_application_mode chart_bnb_application_mode =
+      chart_bnb_trim_application_mode::production_mask_superset;
+  std::optional<std::size_t> chart_bnb_max_exact_topologies;
+  std::string chart_bnb_output_dag;
+  std::string chart_bnb_report_json;
   bool chart_spr_helper_benchmark = false;
   std::size_t chart_spr_helper_benchmark_max_candidates = 16;
   bool chart_spr_candidates = false;
@@ -1466,6 +1485,21 @@ parse_multisite_dominance_mode(std::string_view text) {
   if (text == "provenance-preserving" ||
       text == "provenance_preserving") {
     return multisite_dominance_mode::provenance_preserving;
+  }
+  return std::nullopt;
+}
+
+static std::optional<chart_bnb_trim_application_mode>
+parse_chart_bnb_trim_application_mode(std::string_view text) {
+  if (text == "production-mask" || text == "production_mask" ||
+      text == "production-mask-superset" ||
+      text == "production_mask_superset") {
+    return chart_bnb_trim_application_mode::production_mask_superset;
+  }
+  if (text == "optimal-topology-materialize" ||
+      text == "optimal_topology_materialize" ||
+      text == "topology-materialize" || text == "topology_materialize") {
+    return chart_bnb_trim_application_mode::optimal_topology_materialize;
   }
   return std::nullopt;
 }
@@ -1715,6 +1749,24 @@ static args parse_args(int argc, char** argv) {
       a.chart_bnb_dominance = *mode;
     } else if (arg == "--chart-bnb-score-only") {
       a.chart_bnb_score_only = true;
+    } else if (arg == "--chart-bnb-apply-trim") {
+      a.chart_bnb_apply_trim = true;
+    } else if (arg == "--chart-bnb-trim-application") {
+      auto value = next();
+      auto mode = parse_chart_bnb_trim_application_mode(value);
+      if (!mode) {
+        std::cerr << "error: unknown --chart-bnb-trim-application '" << value
+                  << "'\n";
+        std::exit(1);
+      }
+      a.chart_bnb_application_mode = *mode;
+    } else if (arg == "--chart-bnb-max-exact-topologies") {
+      a.chart_bnb_max_exact_topologies = parse_size_token_strict(
+          next(), "--chart-bnb-max-exact-topologies");
+    } else if (arg == "--chart-bnb-output-dag") {
+      a.chart_bnb_output_dag = next();
+    } else if (arg == "--chart-bnb-report-json") {
+      a.chart_bnb_report_json = next();
     } else if (arg == "--chart-spr-helper-benchmark") {
       a.chart_spr_helper_benchmark = true;
     } else if (arg == "--chart-spr-helper-benchmark-max-candidates") {
@@ -1938,6 +1990,35 @@ static args parse_args(int argc, char** argv) {
                  "--chart-spr-max-target-clade-size\n";
     std::exit(1);
   }
+  if (a.chart_bnb_apply_trim) {
+    a.chart_bnb_trim = true;
+    if (a.trim || a.sample || a.edge_parsimony || a.edge_ml) {
+      std::cerr << "error: --chart-bnb-apply-trim cannot be combined with "
+                   "--trim, --sample, --edge-parsimony, or --edge-ml\n";
+      std::exit(1);
+    }
+    if (a.chart_bnb_score_only) {
+      std::cerr << "error: --chart-bnb-apply-trim requires an exact keep "
+                   "mask; remove --chart-bnb-score-only\n";
+      std::exit(1);
+    }
+    if (!a.chart_bnb_output_dag.empty() && !a.output.empty() &&
+        a.chart_bnb_output_dag != a.output) {
+      std::cerr << "error: use only one B&B output path (-o/--output or "
+                   "--chart-bnb-output-dag)\n";
+      std::exit(1);
+    }
+  }
+  if (!a.chart_bnb_output_dag.empty() && !a.chart_bnb_apply_trim) {
+    std::cerr << "error: --chart-bnb-output-dag requires "
+                 "--chart-bnb-apply-trim\n";
+    std::exit(1);
+  }
+  if (!a.chart_bnb_report_json.empty() && !a.chart_bnb_apply_trim) {
+    std::cerr << "error: --chart-bnb-report-json requires "
+                 "--chart-bnb-apply-trim\n";
+    std::exit(1);
+  }
   if (a.seed) a.chart_spr_enumeration.seed = *a.seed;
 
   return a;
@@ -1950,6 +2031,156 @@ static multisite_trim_options make_chart_bnb_trim_options(args const& a) {
   trim_opts.require_exact_keep_mask = !a.chart_bnb_score_only;
   trim_opts.max_frontier_entries_per_clade = a.chart_bnb_max_frontier;
   return trim_opts;
+}
+
+static chart_bnb_trim_apply_options make_chart_bnb_trim_apply_options(
+    args const& a) {
+  chart_bnb_trim_apply_options opts;
+  opts.mode = a.chart_bnb_application_mode;
+  opts.max_exact_topologies_to_materialize =
+      a.chart_bnb_max_exact_topologies;
+  return opts;
+}
+
+static void print_chart_bnb_apply_result(
+    std::ostream& out, chart_bnb_trim_apply_result const& apply,
+    std::string const& indent) {
+  out << indent << "trim_application_mode: "
+      << chart_bnb_trim_application_mode_name(apply.mode) << "\n";
+  out << indent << "topology_exact: "
+      << (apply.topology_exact ? "true" : "false") << "\n";
+  out << indent << "grammar_topology_exact: "
+      << (apply.grammar_topology_exact ? "true" : "false") << "\n";
+  out << indent << "source_history_topology_exact: "
+      << (apply.source_history_topology_exact ? "true" : "false") << "\n";
+  out << indent << "coupled_frontier_exact: "
+      << (apply.coupled_frontier_exact ? "true" : "false") << "\n";
+  out << indent << "annotated_optimal_trim: "
+      << (apply.annotated_optimal_trim ? "true" : "false") << "\n";
+  out << indent << "identity_preserving_tree_set: "
+      << (apply.identity_preserving_tree_set ? "true" : "false") << "\n";
+  out << indent << "production_mask_superset: "
+      << (apply.production_mask_superset ? "true" : "false") << "\n";
+  out << indent << "refinement_exactness: " << apply.refinement_exactness
+      << "\n";
+  out << indent << "bnb_optimum: " << apply.bnb_optimum << "\n";
+  out << indent << "validated_output_parsimony_min: "
+      << apply.validated_output_parsimony_min << "\n";
+  out << indent << "validated_output_parsimony_min_exact: "
+      << (apply.validated_output_parsimony_min_exact ? "true" : "false")
+      << "\n";
+  out << indent << "validation_oracle: " << apply.validation_oracle << "\n";
+  out << indent << "validation_strength: " << apply.validation_strength
+      << "\n";
+  out << indent << "output_contains_only_optimal_topologies: "
+      << apply.output_contains_only_optimal_topologies << "\n";
+  out << indent << "source_edges_removed: " << apply.source_edges_removed
+      << "\n";
+  out << indent << "source_nodes_removed: " << apply.source_nodes_removed
+      << "\n";
+  out << indent << "materialized_topologies: "
+      << apply.materialized_topologies << "\n";
+  out << indent << "topology_cap_truncated: "
+      << (apply.topology_cap_truncated ? "true" : "false") << "\n";
+  out << indent << "kept_productions_requested: "
+      << apply.kept_productions_requested << "\n";
+  out << indent << "kept_productions_rebuilt: "
+      << apply.kept_productions_rebuilt << "\n";
+  out << indent << "masked_productions_reappeared: "
+      << apply.masked_productions_reappeared << "\n";
+  out << indent << "validation_status: " << apply.validation_status << "\n";
+}
+
+static std::string json_escape(std::string_view text) {
+  std::string out;
+  out.reserve(text.size() + 2);
+  for (char c : text) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += c;
+        break;
+    }
+  }
+  return out;
+}
+
+static void write_chart_bnb_apply_json(
+    std::string const& path, multisite_trim_result const& trim,
+    chart_bnb_trim_apply_result const& apply) {
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("failed to open JSON report: " + path);
+  out << "{\n";
+  out << "  \"trim_application_mode\": \""
+      << chart_bnb_trim_application_mode_name(apply.mode) << "\",\n";
+  out << "  \"dominance_mode\": \""
+      << multisite_dominance_mode_name(trim.dominance_mode) << "\",\n";
+  out << "  \"keep_mask_kind\": \""
+      << multisite_keep_mask_kind_name(trim.keep_mask_kind) << "\",\n";
+  out << "  \"keep_production_exact\": "
+      << (trim.keep_production_exact ? "true" : "false") << ",\n";
+  out << "  \"topology_exact\": "
+      << (apply.topology_exact ? "true" : "false") << ",\n";
+  out << "  \"grammar_topology_exact\": "
+      << (apply.grammar_topology_exact ? "true" : "false") << ",\n";
+  out << "  \"source_history_topology_exact\": "
+      << (apply.source_history_topology_exact ? "true" : "false")
+      << ",\n";
+  out << "  \"coupled_frontier_exact\": "
+      << (apply.coupled_frontier_exact ? "true" : "false") << ",\n";
+  out << "  \"annotated_optimal_trim\": "
+      << (apply.annotated_optimal_trim ? "true" : "false") << ",\n";
+  out << "  \"identity_preserving_tree_set\": "
+      << (apply.identity_preserving_tree_set ? "true" : "false")
+      << ",\n";
+  out << "  \"production_mask_superset\": "
+      << (apply.production_mask_superset ? "true" : "false") << ",\n";
+  out << "  \"refinement_exactness\": \""
+      << json_escape(apply.refinement_exactness) << "\",\n";
+  out << "  \"bnb_optimum\": " << apply.bnb_optimum << ",\n";
+  out << "  \"validated_output_parsimony_min\": "
+      << apply.validated_output_parsimony_min << ",\n";
+  out << "  \"validated_output_parsimony_min_exact\": "
+      << (apply.validated_output_parsimony_min_exact ? "true" : "false")
+      << ",\n";
+  out << "  \"validation_oracle\": \""
+      << json_escape(apply.validation_oracle) << "\",\n";
+  out << "  \"validation_strength\": \""
+      << json_escape(apply.validation_strength) << "\",\n";
+  out << "  \"output_contains_only_optimal_topologies\": \""
+      << json_escape(apply.output_contains_only_optimal_topologies)
+      << "\",\n";
+  out << "  \"source_edges_removed\": " << apply.source_edges_removed
+      << ",\n";
+  out << "  \"source_nodes_removed\": " << apply.source_nodes_removed
+      << ",\n";
+  out << "  \"materialized_topologies\": "
+      << apply.materialized_topologies << ",\n";
+  out << "  \"topology_cap_truncated\": "
+      << (apply.topology_cap_truncated ? "true" : "false") << ",\n";
+  out << "  \"kept_productions_requested\": "
+      << apply.kept_productions_requested << ",\n";
+  out << "  \"kept_productions_rebuilt\": "
+      << apply.kept_productions_rebuilt << ",\n";
+  out << "  \"masked_productions_reappeared\": "
+      << apply.masked_productions_reappeared << ",\n";
+  out << "  \"validation_status\": \""
+      << json_escape(apply.validation_status) << "\"\n";
+  out << "}\n";
 }
 
 static std::size_t saturating_size_add(std::size_t lhs, std::size_t rhs) {
@@ -3726,6 +3957,30 @@ int main(int argc, char** argv) try {
     std::cout << "  bnb_trim_ms: " << std::fixed << std::setprecision(3)
               << bnb_ms << "\n";
     print_frontier_size_stats(std::cout, trim.frontier_sizes_by_clade);
+
+    if (a.chart_bnb_apply_trim) {
+      auto apply_opts = make_chart_bnb_trim_apply_options(a);
+      auto apply_start = std::chrono::steady_clock::now();
+      auto apply = apply_chart_bnb_trim(result, refinement, patterns,
+                                        chart_opts, trim, apply_opts);
+      auto apply_ms = elapsed_ms(apply_start,
+                                 std::chrono::steady_clock::now());
+      std::cout << "  apply_trim_ms: " << std::fixed << std::setprecision(3)
+                << apply_ms << "\n";
+      print_chart_bnb_apply_result(std::cout, apply, "  ");
+
+      auto output_path = !a.chart_bnb_output_dag.empty()
+                             ? a.chart_bnb_output_dag
+                             : a.output;
+      if (!output_path.empty()) {
+        save_proto_dag(apply.dag, output_path);
+        std::cout << "  output_dag: " << output_path << "\n";
+      }
+      if (!a.chart_bnb_report_json.empty()) {
+        write_chart_bnb_apply_json(a.chart_bnb_report_json, trim, apply);
+        std::cout << "  report_json: " << a.chart_bnb_report_json << "\n";
+      }
+    }
   }
 
   if (a.chart_fluidity_site) {
@@ -3908,7 +4163,7 @@ int main(int argc, char** argv) try {
   }
 
   // ---- Output ----
-  if (!a.output.empty()) {
+  if (!a.output.empty() && !a.chart_bnb_apply_trim) {
     scoped_arena<4096> arena;
     auto* mr = arena.get();
 
