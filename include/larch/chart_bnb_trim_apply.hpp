@@ -13,6 +13,10 @@ namespace larch {
 enum class chart_bnb_trim_application_mode {
   production_mask_superset,
   optimal_topology_materialize,
+  // Compact exact Phase-5 packed frontier/provenance annotation.  This is not
+  // an ordinary recombining phylo_dag output; it preserves coupling constraints
+  // in chart-frontier space.
+  annotated_optimal_trim,
 };
 
 char const* chart_bnb_trim_application_mode_name(
@@ -23,7 +27,9 @@ struct chart_bnb_trim_apply_options {
       chart_bnb_trim_application_mode::production_mask_superset;
   bool validate_output_dag = true;
   bool rebuild_and_verify_grammar = true;
-  // unset = conservative default cap; explicit 0 from CLI = unlimited.
+  // unset = conservative default cap; explicit 0 from CLI = unlimited.  In
+  // annotated_optimal_trim mode this bounds optional small-fixture validation
+  // enumeration only; the packed annotation itself is not topology-capped.
   std::optional<std::size_t> max_exact_topologies_to_materialize;
 };
 
@@ -31,6 +37,8 @@ struct chart_bnb_trim_apply_result {
   phylo_dag dag;
   chart_bnb_trim_application_mode mode =
       chart_bnb_trim_application_mode::production_mask_superset;
+  bool output_dag_available = true;
+  std::string output_artifact_kind = "phylo_dag";
   // Set only for the stronger source-history exact claim; grammar-topology
   // exactness is reported separately below.
   bool topology_exact = false;
@@ -44,7 +52,11 @@ struct chart_bnb_trim_apply_result {
   std::size_t source_edges_removed = 0;
   std::size_t source_nodes_removed = 0;
   std::size_t materialized_topologies = 0;
+  // Output-artifact topology cap (for topology materialization).  Annotated
+  // trim stores a packed annotation and uses validation_topology_cap_truncated
+  // for its optional validation enumeration cap.
   bool topology_cap_truncated = false;
+  bool validation_topology_cap_truncated = false;
   std::size_t kept_productions_requested = 0;
   std::size_t kept_productions_rebuilt = 0;
   std::size_t masked_productions_reappeared = 0;
@@ -56,11 +68,15 @@ struct chart_bnb_trim_apply_result {
   std::string output_contains_only_optimal_topologies = "unknown";
   std::string validation_status = "not_run";
   bool validation_succeeded = false;
+  multisite_coupled_frontier_trim_result coupled_frontier_annotation;
+  std::size_t coupled_frontier_entries = 0;
+  std::size_t coupled_provenance_choices = 0;
+  std::size_t coupled_root_frontier_entries = 0;
 };
 
-phylo_dag materialize_grammar_topology_tree(
-    phylo_dag& source_dag, clade_grammar const& grammar,
-    grammar_topology const& topology);
+phylo_dag materialize_grammar_topology_tree(phylo_dag& source_dag,
+                                            clade_grammar const& grammar,
+                                            grammar_topology const& topology);
 
 phylo_dag merge_grammar_topology_trees_identity_preserving(
     phylo_dag& source_dag, clade_grammar const& grammar,

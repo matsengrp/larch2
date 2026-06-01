@@ -1123,7 +1123,8 @@ Input (repeatable, at least one required):
   --force-no-vcf          Skip VCF requirement
 
 Output:
-  -o, --output <path>     Output DAG in protobuf DAG format (optional)
+  -o, --output <path>     Output DAG in protobuf DAG format (optional); with
+                          chart-B&B annotated trim, writes annotation JSON
 
 Pruning:
   -t, --trim              Trim to best parsimony score
@@ -1211,15 +1212,21 @@ Analysis:
                           instead of requiring an exact keep-production mask
   --chart-bnb-apply-trim  Apply exact B&B trim results and optionally write a DAG
   --chart-bnb-trim-application <M>
-                          production-mask (default) or
+                          production-mask (default), annotated-optimal-trim
+                          (coupled frontier annotation; no protobuf DAG), or
                           optimal-topology-materialize
   --chart-bnb-max-exact-topologies <N>
                           Cap optimal topology materialization; explicit 0
-                          means unlimited (unset uses a conservative cap)
+                          means unlimited (unset uses a conservative cap). For
+                          annotated-optimal-trim this caps optional validation
+                          enumeration only.
   --chart-bnb-output-dag <path>
-                          Output path for --chart-bnb-apply-trim (or use -o)
+                          Output path for --chart-bnb-apply-trim (DAG protobuf
+                          for DAG modes; annotation JSON for annotated mode;
+                          or use -o)
   --chart-bnb-report-json <path>
-                          Write a small JSON report for B&B trim application
+                          Write JSON report for B&B trim application; annotated
+                          mode embeds the coupled frontier annotation
   --chart-spr-helper-benchmark
                           Benchmark legacy chart-SPR helper costs and counters
                           (diagnostic/oracle path; not production search)
@@ -1498,6 +1505,13 @@ parse_chart_bnb_trim_application_mode(std::string_view text) {
       text == "production-mask-superset" ||
       text == "production_mask_superset") {
     return chart_bnb_trim_application_mode::production_mask_superset;
+  }
+  if (text == "annotated-optimal-trim" ||
+      text == "annotated_optimal_trim" ||
+      text == "coupled-frontier-exact" ||
+      text == "coupled_frontier_exact" ||
+      text == "coupled-frontier" || text == "coupled_frontier") {
+    return chart_bnb_trim_application_mode::annotated_optimal_trim;
   }
   if (text == "optimal-topology-materialize" ||
       text == "optimal_topology_materialize" ||
@@ -2050,6 +2064,10 @@ static void print_chart_bnb_apply_result(
     std::string const& indent) {
   out << indent << "trim_application_mode: "
       << chart_bnb_trim_application_mode_name(apply.mode) << "\n";
+  out << indent << "output_artifact_kind: " << apply.output_artifact_kind
+      << "\n";
+  out << indent << "output_dag_available: "
+      << (apply.output_dag_available ? "true" : "false") << "\n";
   out << indent << "topology_exact: "
       << (apply.topology_exact ? "true" : "false") << "\n";
   out << indent << "grammar_topology_exact: "
@@ -2064,6 +2082,12 @@ static void print_chart_bnb_apply_result(
       << (apply.identity_preserving_tree_set ? "true" : "false") << "\n";
   out << indent << "production_mask_superset: "
       << (apply.production_mask_superset ? "true" : "false") << "\n";
+  out << indent << "coupled_frontier_entries: "
+      << apply.coupled_frontier_entries << "\n";
+  out << indent << "coupled_provenance_choices: "
+      << apply.coupled_provenance_choices << "\n";
+  out << indent << "coupled_root_frontier_entries: "
+      << apply.coupled_root_frontier_entries << "\n";
   out << indent << "refinement_exactness: " << apply.refinement_exactness
       << "\n";
   out << indent << "bnb_optimum: " << apply.bnb_optimum << "\n";
@@ -2085,6 +2109,9 @@ static void print_chart_bnb_apply_result(
       << apply.materialized_topologies << "\n";
   out << indent << "topology_cap_truncated: "
       << (apply.topology_cap_truncated ? "true" : "false") << "\n";
+  out << indent << "validation_topology_cap_truncated: "
+      << (apply.validation_topology_cap_truncated ? "true" : "false")
+      << "\n";
   out << indent << "kept_productions_requested: "
       << apply.kept_productions_requested << "\n";
   out << indent << "kept_productions_rebuilt: "
@@ -2122,6 +2149,138 @@ static std::string json_escape(std::string_view text) {
   return out;
 }
 
+static void write_json_bool_vector(std::ostream& out,
+                                   std::vector<bool> const& values) {
+  out << "[";
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) out << ", ";
+    out << (values[i] ? "true" : "false");
+  }
+  out << "]";
+}
+
+static void write_json_size_vector(std::ostream& out,
+                                   std::vector<std::size_t> const& values) {
+  out << "[";
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) out << ", ";
+    out << values[i];
+  }
+  out << "]";
+}
+
+static void write_json_chart_cost_vector(
+    std::ostream& out, std::vector<chart_cost> const& values) {
+  out << "[";
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) out << ", ";
+    out << values[i];
+  }
+  out << "]";
+}
+
+static void write_coupled_frontier_annotation_json(
+    std::ostream& out,
+    multisite_coupled_frontier_trim_result const& annotation,
+    std::string const& indent) {
+  auto child = indent + "  ";
+  auto grandchild = child + "  ";
+  auto great_grandchild = grandchild + "  ";
+  auto entry_indent = great_grandchild + "  ";
+  auto entry_field = entry_indent + "  ";
+  auto choice_indent = entry_field + "  ";
+
+  out << "{\n";
+  out << child << "\"schema\": "
+      << "\"larch.multisite_coupled_frontier_trim_result\",\n";
+  out << child << "\"schema_version\": 1,\n";
+  out << child << "\"cost_vector_layout\": "
+      << "\"cost[active_pattern * 4 + state]; state_order=A,C,G,T\",\n";
+  out << child << "\"clade_count\": "
+      << annotation.entries_by_clade.size() << ",\n";
+  out << child << "\"production_count\": "
+      << annotation.keep_production.size() << ",\n";
+  out << child << "\"optimum\": " << annotation.optimum << ",\n";
+  out << child << "\"composite_lower_bound\": "
+      << annotation.composite_lower_bound << ",\n";
+  out << child << "\"initial_upper_bound\": "
+      << annotation.initial_upper_bound << ",\n";
+  out << child << "\"dominance_mode\": \""
+      << multisite_dominance_mode_name(annotation.dominance_mode) << "\",\n";
+  out << child << "\"equality_deduplicated\": "
+      << annotation.equality_deduplicated << ",\n";
+  out << child << "\"dominance_candidates_considered\": "
+      << annotation.dominance_candidates_considered << ",\n";
+  out << child << "\"dominance_pruned\": "
+      << annotation.dominance_pruned << ",\n";
+  out << child << "\"bound_pruned\": " << annotation.bound_pruned
+      << ",\n";
+  out << child << "\"optimal_root_frontier_entry_count\": "
+      << annotation.optimal_root_frontier_entry_count << ",\n";
+  out << child << "\"coupled_frontier_entry_count\": "
+      << annotation.coupled_frontier_entry_count << ",\n";
+  out << child << "\"coupled_provenance_choice_count\": "
+      << annotation.coupled_provenance_choice_count << ",\n";
+  out << child << "\"coupled_frontier_exact\": "
+      << (annotation.coupled_frontier_exact ? "true" : "false") << ",\n";
+  out << child << "\"annotated_optimal_trim\": "
+      << (annotation.annotated_optimal_trim ? "true" : "false") << ",\n";
+  out << child << "\"active_pattern_count\": "
+      << annotation.active_pattern_count << ",\n";
+  out << child << "\"invariant_constant_offset\": "
+      << annotation.invariant_constant_offset << ",\n";
+  out << child << "\"keep_production\": ";
+  write_json_bool_vector(out, annotation.keep_production);
+  out << ",\n";
+  out << child << "\"frontier_sizes_by_clade\": ";
+  write_json_size_vector(out, annotation.frontier_sizes_by_clade);
+  out << ",\n";
+  out << child << "\"coupled_frontier_entries_by_clade\": ";
+  write_json_size_vector(out, annotation.coupled_frontier_entries_by_clade);
+  out << ",\n";
+  out << child << "\"entries_by_clade\": [\n";
+
+  for (std::size_t clade = 0; clade < annotation.entries_by_clade.size();
+       ++clade) {
+    out << grandchild << "{\n";
+    out << great_grandchild << "\"clade\": " << clade << ",\n";
+    out << great_grandchild << "\"entries\": [\n";
+    auto const& entries = annotation.entries_by_clade[clade];
+    for (std::size_t entry_index = 0; entry_index < entries.size();
+         ++entry_index) {
+      auto const& entry = entries[entry_index];
+      out << entry_indent << "{\n";
+      out << entry_field << "\"entry\": " << entry_index << ",\n";
+      out << entry_field << "\"cost\": ";
+      write_json_chart_cost_vector(out, entry.f.cost);
+      out << ",\n";
+      out << entry_field << "\"topology_hash\": "
+          << entry.f.topology_hash << ",\n";
+      out << entry_field << "\"choices\": [\n";
+      for (std::size_t choice_index = 0;
+           choice_index < entry.choices.size(); ++choice_index) {
+        auto const& choice = entry.choices[choice_index];
+        out << choice_indent << "{\"production\": " << choice.production
+            << ", \"left_child\": " << choice.left_child
+            << ", \"right_child\": " << choice.right_child
+            << ", \"left_entry\": " << choice.left_entry
+            << ", \"right_entry\": " << choice.right_entry << "}";
+        out << (choice_index + 1 == entry.choices.size() ? "\n" : ",\n");
+      }
+      out << entry_field << "]\n";
+      out << entry_indent << "}";
+      out << (entry_index + 1 == entries.size() ? "\n" : ",\n");
+    }
+    out << great_grandchild << "]\n";
+    out << grandchild << "}";
+    out << (clade + 1 == annotation.entries_by_clade.size() ? "\n"
+                                                              : ",\n");
+  }
+
+  out << child << "]\n";
+  out << indent << "}";
+}
+
 static void write_chart_bnb_apply_json(
     std::string const& path, multisite_trim_result const& trim,
     chart_bnb_trim_apply_result const& apply) {
@@ -2130,6 +2289,10 @@ static void write_chart_bnb_apply_json(
   out << "{\n";
   out << "  \"trim_application_mode\": \""
       << chart_bnb_trim_application_mode_name(apply.mode) << "\",\n";
+  out << "  \"output_artifact_kind\": \""
+      << json_escape(apply.output_artifact_kind) << "\",\n";
+  out << "  \"output_dag_available\": "
+      << (apply.output_dag_available ? "true" : "false") << ",\n";
   out << "  \"dominance_mode\": \""
       << multisite_dominance_mode_name(trim.dominance_mode) << "\",\n";
   out << "  \"keep_mask_kind\": \""
@@ -2152,6 +2315,12 @@ static void write_chart_bnb_apply_json(
       << ",\n";
   out << "  \"production_mask_superset\": "
       << (apply.production_mask_superset ? "true" : "false") << ",\n";
+  out << "  \"coupled_frontier_entries\": "
+      << apply.coupled_frontier_entries << ",\n";
+  out << "  \"coupled_provenance_choices\": "
+      << apply.coupled_provenance_choices << ",\n";
+  out << "  \"coupled_root_frontier_entries\": "
+      << apply.coupled_root_frontier_entries << ",\n";
   out << "  \"refinement_exactness\": \""
       << json_escape(apply.refinement_exactness) << "\",\n";
   out << "  \"bnb_optimum\": " << apply.bnb_optimum << ",\n";
@@ -2175,6 +2344,9 @@ static void write_chart_bnb_apply_json(
       << apply.materialized_topologies << ",\n";
   out << "  \"topology_cap_truncated\": "
       << (apply.topology_cap_truncated ? "true" : "false") << ",\n";
+  out << "  \"validation_topology_cap_truncated\": "
+      << (apply.validation_topology_cap_truncated ? "true" : "false")
+      << ",\n";
   out << "  \"kept_productions_requested\": "
       << apply.kept_productions_requested << ",\n";
   out << "  \"kept_productions_rebuilt\": "
@@ -2182,7 +2354,15 @@ static void write_chart_bnb_apply_json(
   out << "  \"masked_productions_reappeared\": "
       << apply.masked_productions_reappeared << ",\n";
   out << "  \"validation_status\": \""
-      << json_escape(apply.validation_status) << "\"\n";
+      << json_escape(apply.validation_status) << "\",\n";
+  out << "  \"coupled_frontier_annotation\": ";
+  if (apply.annotated_optimal_trim || apply.coupled_frontier_exact) {
+    write_coupled_frontier_annotation_json(
+        out, apply.coupled_frontier_annotation, "  ");
+    out << "\n";
+  } else {
+    out << "null\n";
+  }
   out << "}\n";
 }
 
@@ -3976,8 +4156,22 @@ int main(int argc, char** argv) try {
                              ? a.chart_bnb_output_dag
                              : a.output;
       if (!output_path.empty()) {
-        save_proto_dag(apply.dag, output_path);
-        std::cout << "  output_dag: " << output_path << "\n";
+        if (apply.output_dag_available) {
+          save_proto_dag(apply.dag, output_path);
+          std::cout << "  output_dag: " << output_path << "\n";
+        } else if (apply.mode ==
+                   chart_bnb_trim_application_mode::annotated_optimal_trim) {
+          write_chart_bnb_apply_json(output_path, trim, apply);
+          std::cout << "  output_artifact: " << output_path << "\n";
+        } else {
+          throw std::runtime_error(
+              "chart B&B trim application '" +
+              std::string{chart_bnb_trim_application_mode_name(apply.mode)} +
+              "' produces a " + apply.output_artifact_kind +
+              ", not an ordinary protobuf DAG and has no CLI serializer; "
+              "omit -o/--chart-bnb-output-dag or choose "
+              "production-mask/optimal-topology-materialize");
+        }
       }
       if (!a.chart_bnb_report_json.empty()) {
         write_chart_bnb_apply_json(a.chart_bnb_report_json, trim, apply);

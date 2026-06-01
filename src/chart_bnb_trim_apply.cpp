@@ -21,6 +21,8 @@ char const* chart_bnb_trim_application_mode_name(
   switch (mode) {
     case chart_bnb_trim_application_mode::production_mask_superset:
       return "production_mask_superset";
+    case chart_bnb_trim_application_mode::annotated_optimal_trim:
+      return "annotated_optimal_trim";
     case chart_bnb_trim_application_mode::optimal_topology_materialize:
       return "optimal_topology_materialize";
   }
@@ -1027,6 +1029,130 @@ static std::uint64_t validate_output_parsimony_with_rebuilt_bnb(
   return trim.optimum;
 }
 
+static chart_bnb_trim_apply_result apply_annotated_optimal_trim(
+    phylo_dag& source, polytomy_refinement_result const& refinement,
+    site_pattern_set const& patterns, chart_options const& chart_opts,
+    multisite_trim_result const& trim,
+    chart_bnb_trim_apply_options const& options) {
+  auto const& grammar = refinement.grammar;
+  if (trim.optimum >= multisite_score_inf) {
+    throw std::runtime_error(
+        "chart B&B trim apply: cannot build annotated optimal trim for "
+        "infinite B&B optimum");
+  }
+
+  multisite_coupled_frontier_trim_options coupled_opts;
+  coupled_opts.trim_options.dominance_mode = multisite_dominance_mode::off;
+  coupled_opts.trim_options.require_exact_keep_mask = true;
+  coupled_opts.trim_options.use_bound_pruning = true;
+  coupled_opts.trim_options.upper_bound_override = trim.optimum;
+  coupled_opts.trim_options.known_exact_optimum = trim.optimum;
+
+  auto coupled = build_multisite_coupled_frontier_trim(
+      grammar, patterns, chart_opts, coupled_opts);
+  if (coupled.optimum != trim.optimum) {
+    throw std::runtime_error(
+        "chart B&B trim apply: annotated trim optimum does not match trim "
+        "optimum");
+  }
+
+  chart_bnb_trim_apply_result result;
+  result.mode = chart_bnb_trim_application_mode::annotated_optimal_trim;
+  result.output_dag_available = false;
+  result.output_artifact_kind = "coupled_frontier_annotation";
+  result.refinement_exactness = refinement_exactness_label(refinement.audit);
+  result.bnb_optimum = trim.optimum;
+  result.coupled_frontier_exact = true;
+  result.annotated_optimal_trim = true;
+  result.production_mask_superset = false;
+  result.identity_preserving_tree_set = false;
+  result.grammar_topology_exact = false;
+  result.source_history_topology_exact = false;
+  result.topology_exact = false;
+  result.output_contains_only_optimal_topologies = "true";
+  result.coupled_frontier_entries = coupled.coupled_frontier_entry_count;
+  result.coupled_provenance_choices =
+      coupled.coupled_provenance_choice_count;
+  result.coupled_root_frontier_entries =
+      coupled.optimal_root_frontier_entry_count;
+  result.kept_productions_requested = count_true(coupled.keep_production);
+  result.validated_output_parsimony_min = trim.optimum;
+  result.validated_output_parsimony_min_exact = true;
+
+  std::size_t validation_cap =
+      options.max_exact_topologies_to_materialize.value_or(std::size_t{10000});
+  auto enumeration = enumerate_multisite_coupled_frontier_topologies(
+      grammar, coupled, validation_cap);
+  result.validation_topology_cap_truncated =
+      enumeration.topology_cap_truncated;
+  if (!enumeration.topology_cap_truncated) {
+    if (enumeration.topologies.empty()) {
+      throw std::runtime_error(
+          "chart B&B trim apply: annotated trim validation found no "
+          "represented topologies");
+    }
+    for (auto const& topology : enumeration.topologies) {
+      auto score = fitch_score_materialized_topology(source, grammar, topology,
+                                                     chart_opts);
+      if (score != trim.optimum) {
+        throw std::runtime_error(
+            "chart B&B trim apply: annotated trim represents a non-optimal "
+            "topology under independent Fitch validation");
+      }
+    }
+
+    bool compared_to_bruteforce = false;
+    try {
+      auto brute = brute_force_multisite_topologies(
+          grammar, patterns, chart_opts, std::size_t{100000});
+      if (brute.optimum != trim.optimum) {
+        throw std::runtime_error(
+            "chart B&B trim apply: brute-force optimum does not match "
+            "annotated trim optimum");
+      }
+      if (brute.optimal_topology_count != enumeration.topologies.size()) {
+        throw std::runtime_error(
+            "chart B&B trim apply: annotated trim topology count " +
+            std::to_string(enumeration.topologies.size()) +
+            " does not match brute-force optimal topology count " +
+            std::to_string(brute.optimal_topology_count));
+      }
+      if (brute.keep_production != coupled.keep_production) {
+        throw std::runtime_error(
+            "chart B&B trim apply: annotated trim production union does not "
+            "match brute force");
+      }
+      compared_to_bruteforce = true;
+    } catch (std::runtime_error const& e) {
+      std::string message = e.what();
+      if (message.find("brute-force topology cap exceeded") ==
+          std::string::npos) {
+        throw;
+      }
+    }
+
+    result.validation_oracle = compared_to_bruteforce
+                                   ? "coupled_frontier_annotation_enumeration_"
+                                     "fitch_and_bruteforce_compare"
+                                   : "coupled_frontier_annotation_enumeration_"
+                                     "fitch";
+    result.validation_strength = compared_to_bruteforce
+                                     ? "exact_small_fixture_independent_"
+                                       "coupled_frontier_annotation"
+                                     : "exact_enumerated_annotation_not_"
+                                       "complete_bruteforce_compared";
+  } else {
+    result.validation_oracle =
+        "coupled_frontier_annotation_structural_reachability";
+    result.validation_strength =
+        "exact_by_bnb_frontier_annotation_not_independent";
+  }
+
+  result.coupled_frontier_annotation = std::move(coupled);
+  record_validation_success(result);
+  return result;
+}
+
 static chart_bnb_trim_apply_result apply_production_mask_superset(
     phylo_dag& source, polytomy_refinement_result const& refinement,
     chart_options const& chart_opts, multisite_trim_result const& trim,
@@ -1087,6 +1213,7 @@ static chart_bnb_trim_apply_result apply_production_mask_superset(
 
   auto small_validation = validate_output_parsimony_with_fitch(
       dag, rebuilt.grammar, chart_opts, trim.optimum, true);
+  result.validation_topology_cap_truncated = small_validation.truncated;
   if (small_validation.ran) {
     result.validated_output_parsimony_min = small_validation.min_score;
     result.validated_output_parsimony_min_exact = true;
@@ -1191,6 +1318,7 @@ static chart_bnb_trim_apply_result apply_optimal_topology_materialize(
 
   auto small_validation = validate_output_parsimony_with_fitch(
       dag, rebuilt.grammar, chart_opts, trim.optimum, true);
+  result.validation_topology_cap_truncated = small_validation.truncated;
   if (small_validation.ran) {
     auto expected_topologies = topology_signature_set(grammar, trace.topologies);
     auto observed_topologies = topology_signature_set(rebuilt.grammar,
@@ -1253,6 +1381,9 @@ chart_bnb_trim_apply_result apply_chart_bnb_trim(
     case chart_bnb_trim_application_mode::production_mask_superset:
       return chart_bnb_trim_apply_detail::apply_production_mask_superset(
           source_dag, refinement, chart_options, trim, options);
+    case chart_bnb_trim_application_mode::annotated_optimal_trim:
+      return chart_bnb_trim_apply_detail::apply_annotated_optimal_trim(
+          source_dag, refinement, patterns, chart_options, trim, options);
     case chart_bnb_trim_application_mode::optimal_topology_materialize:
       return chart_bnb_trim_apply_detail::apply_optimal_topology_materialize(
           source_dag, refinement, patterns, chart_options, trim, options);

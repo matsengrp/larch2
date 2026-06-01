@@ -820,10 +820,74 @@ struct multisite_topology_trace_result {
   std::uint64_t invariant_constant_offset = 0;
 };
 
+struct coupled_frontier_choice {
+  production_id production = no_production;
+  clade_id left_child = no_clade;
+  clade_id right_child = no_clade;
+  // Child entry indices are compact indices into
+  // multisite_coupled_frontier_trim_result::entries_by_clade[child].
+  std::size_t left_entry = 0;
+  std::size_t right_entry = 0;
+};
+
+struct coupled_frontier_entry {
+  // Cost vector for this exact coupled partial topology class.  All retained
+  // provenance choices for this entry have this same vector, so replacing one
+  // retained choice with another cannot change the multi-site score seen by an
+  // optimal outside context.
+  multisite_cost_function f;
+  std::vector<coupled_frontier_choice> choices;
+};
+
+struct multisite_coupled_frontier_trim_options {
+  multisite_trim_options trim_options = {};
+  // 0 means unlimited.  This bounds per-entry packed provenance, not the
+  // number of represented optimal topologies.
+  std::size_t max_provenance_choices_per_entry = 0;
+};
+
+struct multisite_coupled_frontier_trim_result {
+  std::uint64_t optimum = multisite_score_inf;
+  std::uint64_t composite_lower_bound = multisite_score_inf;
+  std::uint64_t initial_upper_bound = multisite_score_inf;
+
+  // Compact packed forest of exactly optimal coupled frontier combinations.
+  // For each clade, only entries reachable from an optimal root entry are
+  // retained; child indices in coupled_frontier_choice are remapped to this
+  // compact space.  An ordinary production union may recombine these choices,
+  // but this annotated forest preserves the correlations.
+  std::vector<std::vector<coupled_frontier_entry>> entries_by_clade;
+  std::vector<bool> keep_production;
+
+  // Full bottom-up frontier sizes before compacting to the optimal annotation,
+  // plus compact sizes after top-down optimal-context recovery.
+  std::vector<std::size_t> frontier_sizes_by_clade;
+  std::vector<std::size_t> coupled_frontier_entries_by_clade;
+
+  multisite_dominance_mode dominance_mode = multisite_dominance_mode::off;
+  std::size_t equality_deduplicated = 0;
+  std::size_t dominance_candidates_considered = 0;
+  std::size_t dominance_pruned = 0;
+  std::size_t bound_pruned = 0;
+  std::size_t optimal_root_frontier_entry_count = 0;
+  std::size_t coupled_frontier_entry_count = 0;
+  std::size_t coupled_provenance_choice_count = 0;
+  bool coupled_frontier_exact = false;
+  bool annotated_optimal_trim = false;
+  std::size_t active_pattern_count = 0;
+  std::uint64_t invariant_constant_offset = 0;
+};
+
+struct multisite_coupled_frontier_enumeration_result {
+  std::vector<grammar_topology> topologies;
+  bool topology_cap_truncated = false;
+};
+
 struct multisite_bruteforce_result {
   std::uint64_t optimum = multisite_score_inf;
   std::vector<bool> keep_production;
   std::size_t topology_count = 0;
+  std::size_t optimal_topology_count = 0;
 };
 
 namespace chart_multisite_detail {
@@ -2291,10 +2355,12 @@ inline multisite_bruteforce_result brute_force_multisite_topologies(
     auto score = score_selected_topology(grammar, patterns, topo, options);
     if (score < result.optimum) {
       result.optimum = score;
+      result.optimal_topology_count = 0;
       std::fill(result.keep_production.begin(), result.keep_production.end(),
                 false);
     }
     if (score == result.optimum) {
+      ++result.optimal_topology_count;
       merge_used_productions(result.keep_production, topo.used_production);
     }
   }
@@ -2577,6 +2643,319 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
     throw std::runtime_error(message);
   }
 
+  return result;
+}
+
+inline multisite_coupled_frontier_trim_result
+build_multisite_coupled_frontier_trim(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options = {},
+    multisite_coupled_frontier_trim_options const& coupled_opts = {}) {
+  using namespace chart_multisite_detail;
+  validate_multisite_inputs(grammar, patterns, options);
+  if (!coupled_opts.trim_options.require_exact_keep_mask) {
+    throw std::runtime_error(
+        "multi-site coupled frontier trim: annotated optimal trim requires "
+        "exact keep-mask/provenance semantics; score-only mode is not a "
+        "valid coupled exact output");
+  }
+  validate_multisite_trim_options_supported(
+      coupled_opts.trim_options, "multi-site coupled frontier trim", false);
+
+  multisite_frontier_build_options build_options;
+  build_options.keep_provenance = true;
+  build_options.keep_used_production = false;
+  build_options.use_bound_pruning = coupled_opts.trim_options.use_bound_pruning;
+  build_options.dominance_mode = coupled_opts.trim_options.dominance_mode;
+  build_options.upper_bound_override =
+      coupled_opts.trim_options.upper_bound_override;
+  build_options.max_frontier_entries_per_clade =
+      coupled_opts.trim_options.max_frontier_entries_per_clade;
+  build_options.max_provenance_choices_per_entry =
+      coupled_opts.max_provenance_choices_per_entry;
+  auto build =
+      build_multisite_frontiers(grammar, patterns, options, build_options,
+                                "multi-site coupled frontier trim");
+
+  multisite_coupled_frontier_trim_result result;
+  result.coupled_frontier_exact = true;
+  result.annotated_optimal_trim = true;
+  result.composite_lower_bound = build.composite_lower_bound;
+  result.initial_upper_bound = build.initial_upper_bound;
+  result.frontier_sizes_by_clade = build.frontier_sizes_by_clade;
+  result.coupled_frontier_entries_by_clade.assign(grammar.clades.size(), 0);
+  result.entries_by_clade.assign(grammar.clades.size(), {});
+  result.keep_production.assign(grammar.productions.size(), false);
+  result.dominance_mode = coupled_opts.trim_options.dominance_mode;
+  result.equality_deduplicated = build.equality_deduplicated;
+  result.dominance_candidates_considered =
+      build.dominance_candidates_considered;
+  result.dominance_pruned = build.dominance_pruned;
+  result.bound_pruned = build.bound_pruned;
+  result.active_pattern_count = build.active_pattern_count;
+  result.invariant_constant_offset = build.invariant_constant_offset;
+
+  auto const& frontiers = build.frontiers;
+  if (grammar.root_clade == no_clade ||
+      grammar.root_clade >= frontiers.size()) {
+    throw std::runtime_error(
+        "multi-site coupled frontier trim: root clade out of range");
+  }
+  auto const& root_frontier = frontiers[grammar.root_clade];
+  if (root_frontier.empty()) {
+    throw std::runtime_error(
+        "multi-site coupled frontier trim: empty root frontier");
+  }
+
+  std::vector<std::size_t> optimal_root_entries;
+  for (std::size_t entry_index = 0; entry_index < root_frontier.size();
+       ++entry_index) {
+    auto score = lower_bound_for_entry(
+        root_frontier[entry_index], grammar.root_clade, build.active_patterns,
+        result.invariant_constant_offset, options);
+    if (score < result.optimum) {
+      result.optimum = score;
+      optimal_root_entries.clear();
+    }
+    if (score == result.optimum) optimal_root_entries.push_back(entry_index);
+  }
+  result.optimal_root_frontier_entry_count = optimal_root_entries.size();
+  if (result.optimum >= multisite_score_inf || optimal_root_entries.empty()) {
+    throw std::runtime_error(
+        "multi-site coupled frontier trim: no finite optimal topology");
+  }
+  validate_known_exact_optimum(result.optimum, coupled_opts.trim_options,
+                               "multi-site coupled frontier trim");
+
+  std::vector<std::vector<bool>> marked(grammar.clades.size());
+  for (std::size_t clade = 0; clade < grammar.clades.size(); ++clade) {
+    marked[clade].assign(frontiers[clade].size(), false);
+  }
+
+  std::function<void(clade_id, std::size_t)> mark_entry =
+      [&](clade_id clade, std::size_t entry_index) {
+        if (clade == no_clade || clade >= frontiers.size()) {
+          throw std::runtime_error(
+              "multi-site coupled frontier trim: clade out of frontier range");
+        }
+        if (entry_index >= frontiers[clade].size()) {
+          throw std::runtime_error(
+              "multi-site coupled frontier trim: entry out of frontier range");
+        }
+        if (marked[clade][entry_index]) return;
+        marked[clade][entry_index] = true;
+
+        if (grammar.clades[clade].taxa.size() == 1) return;
+        auto const& entry = frontiers[clade][entry_index];
+        if (entry.provenance.empty()) {
+          throw std::runtime_error(
+              "multi-site coupled frontier trim: marked internal entry has "
+              "no packed provenance");
+        }
+        for (auto const& choice : entry.provenance) {
+          if (choice.production == no_production ||
+              choice.production >= grammar.productions.size()) {
+            throw std::runtime_error(
+                "multi-site coupled frontier trim: provenance production out "
+                "of range");
+          }
+          auto const& prod = grammar.productions[choice.production];
+          if (prod.parent != clade) {
+            throw std::runtime_error(
+                "multi-site coupled frontier trim: provenance parent "
+                "mismatch");
+          }
+          chart_trim_detail::validate_binary_production_for_trim(
+              grammar, prod, choice.production);
+          mark_entry(prod.children[0], choice.left_entry);
+          mark_entry(prod.children[1], choice.right_entry);
+        }
+      };
+
+  for (auto entry_index : optimal_root_entries) {
+    mark_entry(grammar.root_clade, entry_index);
+  }
+
+  std::vector<std::vector<std::size_t>> old_to_compact(grammar.clades.size());
+  for (std::size_t clade = 0; clade < grammar.clades.size(); ++clade) {
+    old_to_compact[clade].assign(frontiers[clade].size(), no_idx);
+    for (std::size_t entry_index = 0; entry_index < frontiers[clade].size();
+         ++entry_index) {
+      if (!marked[clade][entry_index]) continue;
+      old_to_compact[clade][entry_index] =
+          result.entries_by_clade[clade].size();
+      coupled_frontier_entry compact;
+      compact.f = frontiers[clade][entry_index].f;
+      result.entries_by_clade[clade].push_back(std::move(compact));
+      ++result.coupled_frontier_entry_count;
+    }
+    result.coupled_frontier_entries_by_clade[clade] =
+        result.entries_by_clade[clade].size();
+  }
+
+  for (std::size_t clade = 0; clade < grammar.clades.size(); ++clade) {
+    for (std::size_t entry_index = 0; entry_index < frontiers[clade].size();
+         ++entry_index) {
+      if (!marked[clade][entry_index]) continue;
+      auto compact_index = old_to_compact[clade][entry_index];
+      if (compact_index == no_idx ||
+          compact_index >= result.entries_by_clade[clade].size()) {
+        throw std::runtime_error(
+            "multi-site coupled frontier trim: compact entry remap failed");
+      }
+      if (grammar.clades[clade].taxa.size() == 1) continue;
+
+      auto& compact_entry = result.entries_by_clade[clade][compact_index];
+      for (auto const& choice : frontiers[clade][entry_index].provenance) {
+        auto const& prod = grammar.productions[choice.production];
+        auto left_child = prod.children[0];
+        auto right_child = prod.children[1];
+        auto left_compact = old_to_compact[left_child].at(choice.left_entry);
+        auto right_compact = old_to_compact[right_child].at(choice.right_entry);
+        if (left_compact == no_idx || right_compact == no_idx) {
+          throw std::runtime_error(
+              "multi-site coupled frontier trim: retained provenance points "
+              "to an unmarked child entry");
+        }
+        compact_entry.choices.push_back(
+            coupled_frontier_choice{choice.production, left_child, right_child,
+                                    left_compact, right_compact});
+        result.keep_production[choice.production] = true;
+        ++result.coupled_provenance_choice_count;
+      }
+      if (compact_entry.choices.empty()) {
+        throw std::runtime_error(
+            "multi-site coupled frontier trim: compact internal entry has no "
+            "choices");
+      }
+    }
+  }
+
+  return result;
+}
+
+namespace chart_multisite_detail {
+
+inline std::vector<selected_topology> enumerate_coupled_frontier_entry(
+    clade_grammar const& grammar,
+    multisite_coupled_frontier_trim_result const& coupled, clade_id clade,
+    std::size_t entry_index, std::size_t max_topologies, bool& truncated) {
+  if (clade == no_clade || clade >= grammar.clades.size() ||
+      clade >= coupled.entries_by_clade.size()) {
+    throw std::runtime_error(
+        "multi-site coupled frontier enumeration: clade out of range");
+  }
+  if (entry_index >= coupled.entries_by_clade[clade].size()) {
+    throw std::runtime_error(
+        "multi-site coupled frontier enumeration: entry out of range");
+  }
+  if (grammar.clades[clade].taxa.size() == 1) {
+    return {empty_selected_topology(grammar)};
+  }
+
+  auto const& entry = coupled.entries_by_clade[clade][entry_index];
+  if (entry.choices.empty()) {
+    throw std::runtime_error(
+        "multi-site coupled frontier enumeration: internal entry has no "
+        "choices");
+  }
+
+  std::vector<selected_topology> result;
+  for (auto const& choice : entry.choices) {
+    if (max_topologies != 0 && result.size() >= max_topologies) {
+      truncated = true;
+      break;
+    }
+    if (choice.production == no_production ||
+        choice.production >= grammar.productions.size()) {
+      throw std::runtime_error(
+          "multi-site coupled frontier enumeration: production out of range");
+    }
+    auto const& prod = grammar.productions[choice.production];
+    if (prod.parent != clade || prod.children.size() != 2 ||
+        prod.children[0] != choice.left_child ||
+        prod.children[1] != choice.right_child) {
+      throw std::runtime_error(
+          "multi-site coupled frontier enumeration: production/child "
+          "annotation mismatch");
+    }
+
+    auto remaining = [&](std::size_t used) -> std::size_t {
+      if (max_topologies == 0) return std::size_t{0};
+      return used >= max_topologies ? std::size_t{1} : max_topologies - used;
+    };
+    auto left_topologies = enumerate_coupled_frontier_entry(
+        grammar, coupled, choice.left_child, choice.left_entry,
+        remaining(result.size()), truncated);
+    auto right_topologies = enumerate_coupled_frontier_entry(
+        grammar, coupled, choice.right_child, choice.right_entry,
+        remaining(result.size()), truncated);
+
+    for (auto const& left : left_topologies) {
+      for (auto const& right : right_topologies) {
+        if (max_topologies != 0 && result.size() >= max_topologies) {
+          truncated = true;
+          break;
+        }
+        result.push_back(combine_selected_child_topologies(
+            grammar, clade, choice.production, left, right));
+      }
+      if (max_topologies != 0 && result.size() >= max_topologies) break;
+    }
+  }
+  sort_and_unique_topologies(result);
+  return result;
+}
+
+}  // namespace chart_multisite_detail
+
+inline multisite_coupled_frontier_enumeration_result
+enumerate_multisite_coupled_frontier_topologies(
+    clade_grammar const& grammar,
+    multisite_coupled_frontier_trim_result const& coupled,
+    std::size_t max_topologies = 0) {
+  using namespace chart_multisite_detail;
+  if (grammar.root_clade == no_clade ||
+      grammar.root_clade >= coupled.entries_by_clade.size()) {
+    throw std::runtime_error(
+        "multi-site coupled frontier enumeration: root clade out of range");
+  }
+  if (coupled.entries_by_clade[grammar.root_clade].empty()) {
+    throw std::runtime_error(
+        "multi-site coupled frontier enumeration: no optimal root entries");
+  }
+
+  auto enumeration_limit = max_topologies;
+  if (enumeration_limit != 0 &&
+      enumeration_limit < std::numeric_limits<std::size_t>::max()) {
+    ++enumeration_limit;
+  }
+
+  multisite_coupled_frontier_enumeration_result result;
+  for (std::size_t entry_index = 0;
+       entry_index < coupled.entries_by_clade[grammar.root_clade].size();
+       ++entry_index) {
+    if (enumeration_limit != 0 &&
+        result.topologies.size() >= enumeration_limit) {
+      result.topology_cap_truncated = true;
+      break;
+    }
+    bool truncated = false;
+    auto remaining = enumeration_limit == 0
+                         ? std::size_t{0}
+                         : enumeration_limit - result.topologies.size();
+    auto topologies =
+        enumerate_coupled_frontier_entry(grammar, coupled, grammar.root_clade,
+                                         entry_index, remaining, truncated);
+    result.topologies.insert(result.topologies.end(), topologies.begin(),
+                             topologies.end());
+    result.topology_cap_truncated = result.topology_cap_truncated || truncated;
+  }
+  sort_and_unique_topologies(result.topologies);
+  if (max_topologies != 0 && result.topologies.size() > max_topologies) {
+    result.topology_cap_truncated = true;
+    result.topologies.resize(max_topologies);
+  }
   return result;
 }
 

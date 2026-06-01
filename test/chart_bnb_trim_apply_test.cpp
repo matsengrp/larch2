@@ -332,6 +332,63 @@ static void test_production_mask_reports_recombination_superset() {
   CHECK(applied.validated_output_parsimony_min == trim.optimum);
   CHECK(applied.output_contains_only_optimal_topologies == "false");
   CHECK(applied.validation_oracle == "brute_force_topology_enumeration_fitch");
+
+  options.mode = larch::chart_bnb_trim_application_mode::annotated_optimal_trim;
+  auto annotated = larch::apply_chart_bnb_trim(dag, refinement, patterns, {},
+                                               trim, options);
+  CHECK(annotated.annotated_optimal_trim);
+  CHECK(annotated.coupled_frontier_exact);
+  CHECK(!annotated.production_mask_superset);
+  CHECK(!annotated.output_dag_available);
+  CHECK(annotated.output_artifact_kind == "coupled_frontier_annotation");
+  CHECK(annotated.output_contains_only_optimal_topologies == "true");
+  CHECK(annotated.validated_output_parsimony_min == trim.optimum);
+  CHECK(annotated.validation_succeeded);
+  CHECK(annotated.coupled_frontier_entries > 0);
+  CHECK(annotated.coupled_provenance_choices > 0);
+
+  auto enumerated = larch::enumerate_multisite_coupled_frontier_topologies(
+      refinement.grammar, annotated.coupled_frontier_annotation, 0);
+  CHECK(!enumerated.topology_cap_truncated);
+  auto brute = larch::brute_force_multisite_topologies(refinement.grammar,
+                                                       patterns);
+  CHECK(enumerated.topologies.size() == brute.optimal_topology_count);
+  for (auto const& topology : enumerated.topologies) {
+    CHECK(larch::score_selected_topology(refinement.grammar, patterns,
+                                         topology) == trim.optimum);
+  }
+}
+
+static void test_annotated_validation_cap_truncation_reported() {
+  std::println("test_annotated_validation_cap_truncation_reported");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree("AA", paper_tree1_spec()));
+  trees.push_back(larch::test::make_tiny_labelled_tree("AA", paper_tree2_spec()));
+  auto dag = larch::test::merge_tiny_trees(trees);
+
+  auto refinement = binary_refinement(dag);
+  auto patterns = larch::build_site_patterns(dag, refinement.grammar);
+  auto brute = larch::brute_force_multisite_topologies(refinement.grammar,
+                                                       patterns);
+  CHECK(brute.optimal_topology_count > 1);
+  auto trim = larch::build_multisite_trim(refinement.grammar, patterns);
+
+  larch::chart_bnb_trim_apply_options options;
+  options.mode =
+      larch::chart_bnb_trim_application_mode::annotated_optimal_trim;
+  options.max_exact_topologies_to_materialize = 1;
+  auto applied = larch::apply_chart_bnb_trim(dag, refinement, patterns, {},
+                                             trim, options);
+  CHECK(applied.annotated_optimal_trim);
+  CHECK(applied.coupled_frontier_exact);
+  CHECK(!applied.topology_cap_truncated);
+  CHECK(applied.validation_topology_cap_truncated);
+  CHECK(applied.validation_oracle ==
+        "coupled_frontier_annotation_structural_reachability");
+  CHECK(applied.validation_strength ==
+        "exact_by_bnb_frontier_annotation_not_independent");
+  CHECK(applied.validation_succeeded);
 }
 
 static void test_missing_and_bad_witnesses_fail_clearly() {
@@ -382,6 +439,7 @@ int main() {
   test_score_ua_edge_single_taxon_validation();
   test_production_mask_round_trips_through_protobuf();
   test_production_mask_reports_recombination_superset();
+  test_annotated_validation_cap_truncation_reported();
   test_missing_and_bad_witnesses_fail_clearly();
   return 0;
 }

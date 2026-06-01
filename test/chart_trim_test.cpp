@@ -125,6 +125,30 @@ static larch::test::tiny_tree_node invariant_tree2_spec() {
                               {tiny_leaf("C", "A"), tiny_leaf("E", "A")})})});
 }
 
+static larch::test::tiny_tree_node invariant_reference_mismatch_tree1_spec() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "C",
+      {tiny_inner("AB", "C", {tiny_leaf("A", "C"), tiny_leaf("B", "C")}),
+       tiny_inner("CDE", "C",
+                  {tiny_leaf("C", "C"),
+                   tiny_inner("DE", "C",
+                              {tiny_leaf("D", "C"), tiny_leaf("E", "C")})})});
+}
+
+static larch::test::tiny_tree_node invariant_reference_mismatch_tree2_spec() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "C",
+      {tiny_inner("AB", "C", {tiny_leaf("A", "C"), tiny_leaf("B", "C")}),
+       tiny_inner("CDE", "C",
+                  {tiny_leaf("D", "C"),
+                   tiny_inner("CE", "C",
+                              {tiny_leaf("C", "C"), tiny_leaf("E", "C")})})});
+}
+
 static larch::test::tiny_tree_node dominance_dominating_tree_spec() {
   using larch::test::tiny_inner;
   using larch::test::tiny_leaf;
@@ -819,6 +843,63 @@ static void test_multisite_phase0_diagnostics_and_exactness_labels() {
   std::println("  PASS");
 }
 
+static void test_multisite_coupled_frontier_annotation_exact() {
+  std::println("test_multisite_coupled_frontier_annotation_exact");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", paper_tree1_spec()));
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", paper_tree2_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto patterns = larch::build_site_patterns(merged, grammar);
+  auto brute = larch::brute_force_multisite_topologies(grammar, patterns);
+
+  auto coupled =
+      larch::build_multisite_coupled_frontier_trim(grammar, patterns);
+  CHECK(coupled.annotated_optimal_trim);
+  CHECK(coupled.coupled_frontier_exact);
+  CHECK(coupled.optimum == brute.optimum);
+  CHECK(coupled.keep_production == brute.keep_production);
+  CHECK(coupled.optimal_root_frontier_entry_count > 0);
+  CHECK(coupled.coupled_frontier_entry_count > 0);
+  CHECK(coupled.coupled_frontier_entries_by_clade[grammar.root_clade] ==
+        coupled.optimal_root_frontier_entry_count);
+
+  auto enumerated = larch::enumerate_multisite_coupled_frontier_topologies(
+      grammar, coupled, 0);
+  CHECK(!enumerated.topology_cap_truncated);
+  CHECK(enumerated.topologies.size() == brute.optimal_topology_count);
+  std::vector<bool> enumerated_keep(grammar.productions.size(), false);
+  for (auto const& topology : enumerated.topologies) {
+    CHECK(larch::score_selected_topology(grammar, patterns, topology) ==
+          brute.optimum);
+    auto reachable = larch::validate_grammar_topology(grammar, topology);
+    for (std::size_t pid = 0; pid < reachable.size(); ++pid) {
+      if (reachable[pid]) enumerated_keep[pid] = true;
+    }
+  }
+  CHECK(enumerated_keep == brute.keep_production);
+
+  auto capped = larch::enumerate_multisite_coupled_frontier_topologies(
+      grammar, coupled, 1);
+  CHECK(capped.topology_cap_truncated);
+  CHECK(capped.topologies.size() == 1);
+
+  larch::multisite_coupled_frontier_trim_options bad_opts;
+  bad_opts.trim_options.dominance_mode =
+      larch::multisite_dominance_mode::score_only;
+  bad_opts.trim_options.require_exact_keep_mask = false;
+  auto message = runtime_error_message([&] {
+    (void)larch::build_multisite_coupled_frontier_trim(grammar, patterns, {},
+                                                       bad_opts);
+  });
+  CHECK(message.find("annotated optimal trim requires") != std::string::npos);
+
+  std::println("  PASS");
+}
+
 static void test_multisite_strict_mask_safe_dominance_matches_bruteforce() {
   std::println("test_multisite_strict_mask_safe_dominance_matches_bruteforce");
 
@@ -920,6 +1001,20 @@ static void test_multisite_strict_mask_safe_dominance_matches_bruteforce() {
     CHECK(larch::score_selected_topology(grammar, patterns, topology) ==
           brute.optimum);
   }
+
+  larch::multisite_coupled_frontier_trim_options coupled_strict_opts;
+  coupled_strict_opts.trim_options = strict_opts;
+  auto coupled_strict = larch::build_multisite_coupled_frontier_trim(
+      grammar, patterns, {}, coupled_strict_opts);
+  CHECK(coupled_strict.optimum == brute.optimum);
+  CHECK(coupled_strict.keep_production == brute.keep_production);
+  CHECK(coupled_strict.dominance_pruned > 0);
+  auto coupled_strict_enumerated =
+      larch::enumerate_multisite_coupled_frontier_topologies(grammar,
+                                                             coupled_strict, 0);
+  CHECK(!coupled_strict_enumerated.topology_cap_truncated);
+  CHECK(coupled_strict_enumerated.topologies.size() ==
+        brute.optimal_topology_count);
 
   std::println("  PASS");
 }
@@ -1261,6 +1356,20 @@ static void test_multisite_invariant_sites_and_reference_edge_constant() {
   CHECK(with_ua_two_pass.optimum == with_ua_bnb.optimum);
   CHECK(with_ua_two_pass.keep_production == with_ua_bnb.keep_production);
 
+  auto brute_ua = larch::brute_force_multisite_topologies(
+      grammar, skipped_patterns, with_reference_edge);
+  auto with_ua_coupled = larch::build_multisite_coupled_frontier_trim(
+      grammar, skipped_patterns, with_reference_edge);
+  CHECK(with_ua_coupled.invariant_constant_offset == 1);
+  CHECK(with_ua_coupled.optimum == brute_ua.optimum);
+  CHECK(with_ua_coupled.keep_production == brute_ua.keep_production);
+  auto with_ua_coupled_enumerated =
+      larch::enumerate_multisite_coupled_frontier_topologies(
+          grammar, with_ua_coupled, 0);
+  CHECK(!with_ua_coupled_enumerated.topology_cap_truncated);
+  CHECK(with_ua_coupled_enumerated.topologies.size() ==
+        brute_ua.optimal_topology_count);
+
   std::println("  PASS");
 }
 
@@ -1347,6 +1456,65 @@ static void test_multisite_equal_dedup_merges_provenance() {
   CHECK(traced.keep_production == brute.keep_production);
   for (bool keep : traced.keep_production) CHECK(keep);
 
+  auto coupled = larch::build_multisite_coupled_frontier_trim(grammar,
+                                                              patterns);
+  CHECK(coupled.active_pattern_count == 0);
+  CHECK(coupled.optimum == brute.optimum);
+  CHECK(coupled.keep_production == brute.keep_production);
+  CHECK(coupled.equality_deduplicated > 0);
+  for (bool keep : coupled.keep_production) CHECK(keep);
+  auto coupled_enumerated =
+      larch::enumerate_multisite_coupled_frontier_topologies(grammar, coupled,
+                                                             0);
+  CHECK(!coupled_enumerated.topology_cap_truncated);
+  CHECK(coupled_enumerated.topologies.size() == brute.topology_count);
+
+  std::println("  PASS");
+}
+
+static void test_multisite_all_invariant_coupled_frontier_with_reference_edge() {
+  std::println(
+      "test_multisite_all_invariant_coupled_frontier_with_reference_edge");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", invariant_reference_mismatch_tree1_spec()));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", invariant_reference_mismatch_tree2_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto patterns = larch::build_site_patterns(merged, grammar);
+  CHECK(patterns.invariant_site_count == 1);
+
+  larch::chart_options with_reference_edge;
+  with_reference_edge.score_ua_edge = true;
+  auto brute = larch::brute_force_multisite_topologies(
+      grammar, patterns, with_reference_edge);
+  auto bnb = larch::build_multisite_trim(grammar, patterns,
+                                         with_reference_edge);
+  auto coupled = larch::build_multisite_coupled_frontier_trim(
+      grammar, patterns, with_reference_edge);
+
+  CHECK(brute.optimum == 1);
+  CHECK(bnb.optimum == brute.optimum);
+  CHECK(coupled.optimum == brute.optimum);
+  CHECK(bnb.active_pattern_count == 0);
+  CHECK(coupled.active_pattern_count == 0);
+  CHECK(bnb.invariant_constant_offset == 1);
+  CHECK(coupled.invariant_constant_offset == 1);
+  CHECK(coupled.keep_production == brute.keep_production);
+  for (bool keep : coupled.keep_production) CHECK(keep);
+
+  auto enumerated = larch::enumerate_multisite_coupled_frontier_topologies(
+      grammar, coupled, 0);
+  CHECK(!enumerated.topology_cap_truncated);
+  CHECK(enumerated.topologies.size() == brute.optimal_topology_count);
+  for (auto const& topology : enumerated.topologies) {
+    CHECK(larch::score_selected_topology(grammar, patterns, topology,
+                                         with_reference_edge) ==
+          brute.optimum);
+  }
+
   std::println("  PASS");
 }
 
@@ -1398,6 +1566,21 @@ static void test_multisite_randomized_tiny_bnb_matches_bruteforce() {
     CHECK(bnb.optimum == brute.optimum);
     CHECK(bnb.keep_production == brute.keep_production);
 
+    if (trial < 6) {
+      auto coupled = larch::build_multisite_coupled_frontier_trim(grammar,
+                                                                  patterns);
+      CHECK(coupled.optimum == brute.optimum);
+      CHECK(coupled.keep_production == brute.keep_production);
+      auto enumerated = larch::enumerate_multisite_coupled_frontier_topologies(
+          grammar, coupled, 0);
+      CHECK(!enumerated.topology_cap_truncated);
+      CHECK(enumerated.topologies.size() == brute.optimal_topology_count);
+      for (auto const& topology : enumerated.topologies) {
+        CHECK(larch::score_selected_topology(grammar, patterns, topology) ==
+              brute.optimum);
+      }
+    }
+
     larch::multisite_trim_options score_only_opts;
     score_only_opts.dominance_mode =
         larch::multisite_dominance_mode::score_only;
@@ -1438,6 +1621,23 @@ static void test_multisite_randomized_tiny_bnb_matches_bruteforce() {
           larch::build_multisite_trim(grammar, patterns, with_reference_edge);
       CHECK(bnb_ua.optimum == brute_ua.optimum);
       CHECK(bnb_ua.keep_production == brute_ua.keep_production);
+      auto coupled_ua = larch::build_multisite_coupled_frontier_trim(
+          grammar, patterns, with_reference_edge);
+      CHECK(coupled_ua.optimum == brute_ua.optimum);
+      CHECK(coupled_ua.keep_production == brute_ua.keep_production);
+      if (trial < 6) {
+        auto enumerated_ua =
+            larch::enumerate_multisite_coupled_frontier_topologies(
+                grammar, coupled_ua, 0);
+        CHECK(!enumerated_ua.topology_cap_truncated);
+        CHECK(enumerated_ua.topologies.size() ==
+              brute_ua.optimal_topology_count);
+        for (auto const& topology : enumerated_ua.topologies) {
+          CHECK(larch::score_selected_topology(
+                    grammar, patterns, topology, with_reference_edge) ==
+                brute_ua.optimum);
+        }
+      }
       auto score_only_ua = larch::build_multisite_trim(
           grammar, patterns, with_reference_edge, score_only_opts);
       CHECK(score_only_ua.optimum == brute_ua.optimum);
@@ -1514,6 +1714,7 @@ int main() {
   test_reference_edge_outside_boundary();
   test_multisite_composite_counterexample();
   test_multisite_phase0_diagnostics_and_exactness_labels();
+  test_multisite_coupled_frontier_annotation_exact();
   test_multisite_strict_mask_safe_dominance_matches_bruteforce();
   test_multisite_score_only_dominance_matches_bruteforce_and_labels();
   test_multisite_two_pass_dominated_suboptimal_does_not_overkeep();
@@ -1524,6 +1725,7 @@ int main() {
   test_composite_reference_state_diagnostics();
   test_multisite_rejects_pattern_taxon_count_mismatch();
   test_multisite_equal_dedup_merges_provenance();
+  test_multisite_all_invariant_coupled_frontier_with_reference_edge();
   test_multisite_randomized_tiny_bnb_matches_bruteforce();
   test_exhaustive_binary_assignments();
 

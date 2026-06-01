@@ -396,6 +396,13 @@ add_test(NAME dagutil_wric_phase9_chart_bnb_apply_materialize
                  "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-apply-trim --chart-bnb-trim-application optimal-topology-materialize --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 -o \"${DAGUTIL_CHART_BNB_APPLY_OUT}\" > \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_materialize.out\" && grep -q 'trim_application_mode: optimal_topology_materialize' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_materialize.out\" && grep -q 'grammar_topology_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_materialize.out\" && grep -q 'identity_preserving_tree_set: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_materialize.out\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${DAGUTIL_CHART_BNB_APPLY_OUT}\" --force-no-vcf --validate > /dev/null"
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+set(DAGUTIL_CHART_BNB_ANNOTATED_JSON
+    "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_annotated.json")
+add_test(NAME dagutil_wric_phase9_chart_bnb_apply_annotated
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-apply-trim --chart-bnb-trim-application annotated-optimal-trim --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 -o \"${DAGUTIL_CHART_BNB_ANNOTATED_JSON}\" > \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_annotated.out\" && grep -q 'trim_application_mode: annotated_optimal_trim' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_annotated.out\" && grep -q 'coupled_frontier_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_annotated.out\" && grep -q 'annotated_optimal_trim: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_annotated.out\" && grep -q 'output_dag_available: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_annotated.out\" && grep -q 'output_artifact_kind: coupled_frontier_annotation' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_annotated.out\" && grep -q 'output_artifact:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_annotated.out\" && grep -q '\"coupled_frontier_annotation\"' \"${DAGUTIL_CHART_BNB_ANNOTATED_JSON}\" && grep -q '\"validation_topology_cap_truncated\"' \"${DAGUTIL_CHART_BNB_ANNOTATED_JSON}\" && grep -q '\"entries_by_clade\"' \"${DAGUTIL_CHART_BNB_ANNOTATED_JSON}\""
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 add_test(NAME dagutil_chart_spr_helper_benchmark
          COMMAND dagutil
                  --dag-pb data/test_5_trees/tree_0.pb.gz
