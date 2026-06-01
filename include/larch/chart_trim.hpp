@@ -1814,11 +1814,31 @@ inline void validate_multisite_trim_options_supported(
     return;
   }
 
+  if (trim_options.dominance_mode ==
+      multisite_dominance_mode::two_pass_exact_mask) {
+    if (!allow_score_only_dominance) {
+      throw std::runtime_error(
+          context +
+          ": two-pass exact-mask dominance cannot emit exact topology "
+          "witnesses; rerun with dominance off (or a future "
+          "provenance-preserving mode) and a validated known_exact_optimum");
+    }
+    if (!trim_options.require_exact_keep_mask) {
+      throw std::runtime_error(
+          context +
+          ": two-pass-exact-mask dominance is an exact-mask recovery mode; "
+          "use dominance score-only with require_exact_keep_mask=false (CLI: "
+          "--chart-bnb-dominance score-only --chart-bnb-score-only) for a "
+          "score-only run");
+    }
+    return;
+  }
+
   throw std::runtime_error(
       context + ": dominance mode '" +
       multisite_dominance_mode_name(trim_options.dominance_mode) +
       "' is not implemented in this public trim path yet; implemented modes "
-      "are off and score-only");
+      "are off, score-only, and two-pass-exact-mask for exact masks");
 }
 
 inline multisite_keep_mask_kind keep_mask_kind_for_options(
@@ -2088,9 +2108,16 @@ inline multisite_frontier_build_result build_multisite_frontiers(
 
     if (build_options.max_frontier_entries_per_clade != 0 &&
         entries.size() > build_options.max_frontier_entries_per_clade) {
-      throw std::runtime_error(context +
-                               ": frontier entry cap exceeded for clade " +
-                               std::to_string(clade));
+      std::string message = context +
+                            ": frontier entry cap exceeded for clade " +
+                            std::to_string(clade);
+      if (context.find("exact mask recovery pass") != std::string::npos) {
+        message +=
+            "; exact mask recovery pass exceeded the frontier cap; rerun "
+            "with a larger cap or use score-only mode if an exact mask is "
+            "not required";
+      }
+      throw std::runtime_error(message);
     }
     // Bound pruning can empty a non-root clade frontier when every topology
     // using that clade is already provably worse than the current feasible
@@ -2100,6 +2127,39 @@ inline multisite_frontier_build_result build_multisite_frontiers(
   }
 
   return result;
+}
+
+inline std::uint64_t compute_root_frontier_optimum_and_update_mask(
+    clade_grammar const& grammar, chart_options const& options,
+    multisite_frontier_build_result const& build,
+    bool merge_exact_keep_mask, std::vector<bool>& keep_production,
+    std::string const& context) {
+  auto const& root_frontier = build.frontiers[grammar.root_clade];
+  if (root_frontier.empty()) {
+    throw std::runtime_error(context + ": empty root frontier");
+  }
+  if (merge_exact_keep_mask &&
+      keep_production.size() != grammar.productions.size()) {
+    throw std::runtime_error(context +
+                             ": keep-production mask size mismatch");
+  }
+
+  std::uint64_t optimum = multisite_score_inf;
+  for (auto const& entry : root_frontier) {
+    auto score = lower_bound_for_entry(
+        entry, grammar.root_clade, build.active_patterns,
+        build.invariant_constant_offset, options);
+    if (score < optimum) {
+      optimum = score;
+      if (merge_exact_keep_mask) {
+        std::fill(keep_production.begin(), keep_production.end(), false);
+      }
+    }
+    if (score == optimum && merge_exact_keep_mask) {
+      merge_used_productions(keep_production, entry.used_production);
+    }
+  }
+  return optimum;
 }
 
 }  // namespace chart_multisite_detail
@@ -2143,6 +2203,77 @@ inline multisite_trim_result build_multisite_trim(
   auto keep_production_exact =
       keep_mask_kind == multisite_keep_mask_kind::exact_optimal_production_union;
 
+  multisite_trim_result result;
+  result.dominance_mode = trim_options.dominance_mode;
+  result.keep_mask_kind = keep_mask_kind;
+  result.keep_production_exact = keep_production_exact;
+  result.keep_production.assign(grammar.productions.size(), false);
+
+  if (trim_options.dominance_mode ==
+      multisite_dominance_mode::two_pass_exact_mask) {
+    // Phase 3 two-pass exact-mask recovery: use score-only dominance only for
+    // the scalar objective pass, then rebuild without dominance under the
+    // validated optimum to recover the exact optimal-production union mask.
+    multisite_frontier_build_options score_build_options;
+    score_build_options.keep_provenance = false;
+    score_build_options.keep_used_production = false;
+    score_build_options.use_bound_pruning = trim_options.use_bound_pruning;
+    score_build_options.dominance_mode = multisite_dominance_mode::score_only;
+    score_build_options.upper_bound_override =
+        trim_options.upper_bound_override;
+    score_build_options.max_frontier_entries_per_clade =
+        trim_options.max_frontier_entries_per_clade;
+    auto score_build = build_multisite_frontiers(
+        grammar, patterns, options, score_build_options,
+        "multi-site trim score pass");
+
+    result.optimum = compute_root_frontier_optimum_and_update_mask(
+        grammar, options, score_build, false, result.keep_production,
+        "multi-site trim score pass");
+    validate_known_exact_optimum(result.optimum, trim_options,
+                                 "multi-site trim score pass");
+
+    multisite_frontier_build_options mask_build_options;
+    mask_build_options.keep_provenance = false;
+    mask_build_options.keep_used_production = true;
+    mask_build_options.use_bound_pruning = trim_options.use_bound_pruning;
+    mask_build_options.dominance_mode = multisite_dominance_mode::off;
+    // The score-pass optimum is a pruning threshold only until the recovered
+    // root frontier independently validates it below.
+    mask_build_options.upper_bound_override = result.optimum;
+    mask_build_options.max_frontier_entries_per_clade =
+        trim_options.max_frontier_entries_per_clade;
+    auto mask_build = build_multisite_frontiers(
+        grammar, patterns, options, mask_build_options,
+        "multi-site trim exact mask recovery pass");
+
+    auto recovered_optimum = compute_root_frontier_optimum_and_update_mask(
+        grammar, options, mask_build, true, result.keep_production,
+        "multi-site trim exact mask recovery pass");
+    multisite_trim_options recovery_validation_options;
+    recovery_validation_options.known_exact_optimum = result.optimum;
+    validate_known_exact_optimum(
+        recovered_optimum, recovery_validation_options,
+        "multi-site trim exact mask recovery pass");
+
+    result.composite_lower_bound = score_build.composite_lower_bound;
+    result.initial_upper_bound = score_build.initial_upper_bound;
+    result.frontier_sizes_by_clade = mask_build.frontier_sizes_by_clade;
+    result.dominance_candidates_considered =
+        score_build.dominance_candidates_considered;
+    result.dominance_pruned_score_pass = score_build.dominance_pruned;
+    result.dominance_pruned_mask_pass = mask_build.dominance_pruned;
+    result.bound_pruned = score_build.bound_pruned + mask_build.bound_pruned;
+    result.equality_deduplicated = score_build.equality_deduplicated +
+                                   mask_build.equality_deduplicated;
+    result.active_pattern_count = score_build.active_pattern_count;
+    result.invariant_constant_offset = score_build.invariant_constant_offset;
+    result.exact_mask_recovery_passes = 1;
+    result.dominance_pruned = result.dominance_pruned_score_pass +
+                              result.dominance_pruned_mask_pass;
+    return result;
+  }
+
   multisite_frontier_build_options build_options;
   build_options.keep_provenance = false;
   build_options.keep_used_production = keep_production_exact;
@@ -2154,13 +2285,8 @@ inline multisite_trim_result build_multisite_trim(
   auto build = build_multisite_frontiers(grammar, patterns, options,
                                          build_options, "multi-site trim");
 
-  multisite_trim_result result;
-  result.dominance_mode = trim_options.dominance_mode;
-  result.keep_mask_kind = keep_mask_kind;
-  result.keep_production_exact = keep_production_exact;
   result.composite_lower_bound = build.composite_lower_bound;
   result.initial_upper_bound = build.initial_upper_bound;
-  result.keep_production.assign(grammar.productions.size(), false);
   result.frontier_sizes_by_clade = build.frontier_sizes_by_clade;
   result.dominance_candidates_considered =
       build.dominance_candidates_considered;
@@ -2171,25 +2297,9 @@ inline multisite_trim_result build_multisite_trim(
   result.active_pattern_count = build.active_pattern_count;
   result.invariant_constant_offset = build.invariant_constant_offset;
 
-  auto const& root_frontier = build.frontiers[grammar.root_clade];
-  if (root_frontier.empty()) {
-    throw std::runtime_error("multi-site trim: empty root frontier");
-  }
-
-  for (auto const& entry : root_frontier) {
-    auto score = lower_bound_for_entry(entry, grammar.root_clade,
-                                       build.active_patterns,
-                                       result.invariant_constant_offset,
-                                       options);
-    if (score < result.optimum) {
-      result.optimum = score;
-      std::fill(result.keep_production.begin(), result.keep_production.end(),
-                false);
-    }
-    if (score == result.optimum && result.keep_production_exact) {
-      merge_used_productions(result.keep_production, entry.used_production);
-    }
-  }
+  result.optimum = compute_root_frontier_optimum_and_update_mask(
+      grammar, options, build, result.keep_production_exact,
+      result.keep_production, "multi-site trim");
   validate_known_exact_optimum(result.optimum, trim_options,
                                "multi-site trim");
   result.dominance_pruned = result.dominance_pruned_score_pass +

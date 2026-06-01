@@ -379,6 +379,11 @@ add_test(NAME dagutil_wric_phase9_chart_bnb_score_only_dominance
                  "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-dominance score-only --chart-bnb-score-only --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_bnb_score_only_dominance.out\" && grep -q 'dominance_mode: score-only' \"${CMAKE_BINARY_DIR}/dagutil_bnb_score_only_dominance.out\" && grep -q 'keep_mask_kind: score_only_not_exact' \"${CMAKE_BINARY_DIR}/dagutil_bnb_score_only_dominance.out\" && grep -q 'keep_production_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_bnb_score_only_dominance.out\" && grep -q 'kept_productions_count_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_bnb_score_only_dominance.out\" && grep -q 'dominance_pruned_score_pass:' \"${CMAKE_BINARY_DIR}/dagutil_bnb_score_only_dominance.out\""
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+add_test(NAME dagutil_wric_phase9_chart_bnb_two_pass_exact_mask
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-dominance two-pass-exact-mask --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'dominance_mode: two-pass-exact-mask' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'keep_mask_kind: exact_optimal_production_union' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'keep_production_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'kept_productions_count_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'exact_mask_recovery_passes: 1' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'dominance_pruned_score_pass:' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'dominance_pruned_mask_pass: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\""
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 set(DAGUTIL_CHART_BNB_APPLY_OUT
     "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_materialize.pb.gz")
 add_test(NAME dagutil_wric_phase9_chart_bnb_apply_materialize
