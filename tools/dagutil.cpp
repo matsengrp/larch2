@@ -1204,8 +1204,9 @@ Analysis:
                           strict-mask-safe, two-pass-exact-mask, or
                           provenance-preserving. score-only requires
                           --chart-bnb-score-only and returns no exact mask;
-                          later exact-mask dominance modes fail clearly until
-                          implemented.
+                          strict-mask-safe is exact for masks/topology
+                          witnesses; provenance-preserving is reserved for a
+                          future compact provenance mode.
   --chart-bnb-score-only  Report the B&B result as score-only/non-exact-mask
                           instead of requiring an exact keep-production mask
   --chart-bnb-apply-trim  Apply exact B&B trim results and optionally write a DAG

@@ -151,8 +151,8 @@ static larch::test::tiny_tree_node dominance_suboptimal_dominating_tree_spec() {
       {tiny_leaf("A", "A"),
        tiny_inner("BCD", "A",
                   {tiny_leaf("B", "A"),
-                   tiny_inner("CD", "A", {tiny_leaf("C", "C"),
-                                            tiny_leaf("D", "C")})})});
+                   tiny_inner("CD", "A",
+                              {tiny_leaf("C", "C"), tiny_leaf("D", "C")})})});
 }
 
 static larch::test::tiny_tree_node dominance_suboptimal_dominated_tree_spec() {
@@ -161,10 +161,28 @@ static larch::test::tiny_tree_node dominance_suboptimal_dominated_tree_spec() {
   return tiny_inner(
       "root", "A",
       {tiny_leaf("A", "A"),
-       tiny_inner("BCD", "A",
-                  {tiny_inner("BC", "A", {tiny_leaf("B", "A"),
-                                            tiny_leaf("C", "C")}),
-                   tiny_leaf("D", "C")})});
+       tiny_inner(
+           "BCD", "A",
+           {tiny_inner("BC", "A", {tiny_leaf("B", "A"), tiny_leaf("C", "C")}),
+            tiny_leaf("D", "C")})});
+}
+
+static larch::test::tiny_tree_node strict_mask_safe_dominating_tree_spec() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AB", "A", {tiny_leaf("A", "A"), tiny_leaf("B", "A")}),
+       tiny_inner("CD", "C", {tiny_leaf("C", "C"), tiny_leaf("D", "C")})});
+}
+
+static larch::test::tiny_tree_node strict_mask_safe_dominated_tree_spec() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AC", "A", {tiny_leaf("A", "A"), tiny_leaf("C", "C")}),
+       tiny_inner("BD", "A", {tiny_leaf("B", "A"), tiny_leaf("D", "C")})});
 }
 
 static larch::test::tiny_tree_node random_tree_spec(
@@ -678,8 +696,7 @@ static void test_multisite_composite_counterexample() {
   CHECK(bnb.keep_production[prod_d_ce]);
 
   larch::multisite_trim_options score_only_cap;
-  score_only_cap.dominance_mode =
-      larch::multisite_dominance_mode::score_only;
+  score_only_cap.dominance_mode = larch::multisite_dominance_mode::score_only;
   score_only_cap.require_exact_keep_mask = false;
   score_only_cap.max_frontier_entries_per_clade = 1;
   CHECK(throws_runtime_error([&] {
@@ -688,8 +705,8 @@ static void test_multisite_composite_counterexample() {
 
   larch::multisite_topology_trace_options trace_opts;
   trace_opts.max_optimal_topologies = 0;
-  auto traced = larch::build_multisite_optimal_topologies(
-      grammar, patterns, {}, trace_opts);
+  auto traced = larch::build_multisite_optimal_topologies(grammar, patterns, {},
+                                                          trace_opts);
   CHECK(traced.composite_lower_bound == 2);
   CHECK(traced.optimum == 3);
   CHECK(traced.topologies.size() == 2);
@@ -725,8 +742,8 @@ static void test_multisite_phase0_diagnostics_and_exactness_labels() {
   CHECK(bnb.dominance_pruned_score_pass == 0);
   CHECK(bnb.dominance_pruned_mask_pass == 0);
   CHECK(bnb.dominance_pruned == 0);
-  CHECK(bnb.dominance_pruned == bnb.dominance_pruned_score_pass +
-                                    bnb.dominance_pruned_mask_pass);
+  CHECK(bnb.dominance_pruned ==
+        bnb.dominance_pruned_score_pass + bnb.dominance_pruned_mask_pass);
   CHECK(bnb.exact_mask_recovery_passes == 0);
 
   larch::multisite_trim_options score_only;
@@ -764,30 +781,151 @@ static void test_multisite_phase0_diagnostics_and_exactness_labels() {
         larch::multisite_keep_mask_kind::exact_optimal_production_union);
 
   larch::multisite_trim_options exact_score_only;
-  exact_score_only.dominance_mode =
-      larch::multisite_dominance_mode::score_only;
+  exact_score_only.dominance_mode = larch::multisite_dominance_mode::score_only;
   auto exact_score_only_message = runtime_error_message([&] {
-    (void)larch::build_multisite_trim(grammar, patterns, {},
-                                      exact_score_only);
+    (void)larch::build_multisite_trim(grammar, patterns, {}, exact_score_only);
   });
-  CHECK(exact_score_only_message.find(
-            "score-only dominance cannot return an exact keep-production mask") !=
-        std::string::npos);
+  CHECK(
+      exact_score_only_message.find(
+          "score-only dominance cannot return an exact keep-production mask") !=
+      std::string::npos);
+
+  larch::multisite_trim_options strict_labels;
+  strict_labels.dominance_mode =
+      larch::multisite_dominance_mode::strict_mask_safe;
+  auto strict_bnb =
+      larch::build_multisite_trim(grammar, patterns, {}, strict_labels);
+  CHECK(strict_bnb.optimum == bnb.optimum);
+  CHECK(strict_bnb.keep_production == bnb.keep_production);
+  CHECK(strict_bnb.dominance_mode ==
+        larch::multisite_dominance_mode::strict_mask_safe);
+  CHECK(strict_bnb.keep_mask_kind ==
+        larch::multisite_keep_mask_kind::exact_optimal_production_union);
+  CHECK(strict_bnb.keep_production_exact);
+  CHECK(strict_bnb.dominance_pruned_score_pass == 0);
+  CHECK(strict_bnb.dominance_pruned == strict_bnb.dominance_pruned_mask_pass);
+  CHECK(strict_bnb.exact_mask_recovery_passes == 0);
 
   larch::multisite_trim_options unsupported;
   unsupported.dominance_mode =
-      larch::multisite_dominance_mode::strict_mask_safe;
+      larch::multisite_dominance_mode::provenance_preserving;
   auto dominance_message = runtime_error_message([&] {
     (void)larch::build_multisite_trim(grammar, patterns, {}, unsupported);
   });
-  CHECK(dominance_message.find("dominance mode 'strict-mask-safe'") !=
+  CHECK(dominance_message.find("dominance mode 'provenance-preserving'") !=
         std::string::npos);
   CHECK(dominance_message.find("not implemented") != std::string::npos);
 
   std::println("  PASS");
 }
 
-static void test_multisite_score_only_dominance_matches_bruteforce_and_labels() {
+static void test_multisite_strict_mask_safe_dominance_matches_bruteforce() {
+  std::println("test_multisite_strict_mask_safe_dominance_matches_bruteforce");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", strict_mask_safe_dominating_tree_spec()));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", strict_mask_safe_dominated_tree_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto patterns = larch::build_site_patterns(merged, grammar);
+
+  auto a = clade_for(grammar, {"A"});
+  auto b = clade_for(grammar, {"B"});
+  auto c = clade_for(grammar, {"C"});
+  auto d = clade_for(grammar, {"D"});
+  auto ab = clade_for(grammar, {"A", "B"});
+  auto cd = clade_for(grammar, {"C", "D"});
+  auto ac = clade_for(grammar, {"A", "C"});
+  auto bd = clade_for(grammar, {"B", "D"});
+  auto abcd = clade_for(grammar, {"A", "B", "C", "D"});
+  CHECK(abcd == grammar.root_clade);
+  auto prod_ab_cd = production_id_for(grammar, abcd, {ab, cd});
+  auto prod_ac_bd = production_id_for(grammar, abcd, {ac, bd});
+  auto prod_a_b = production_id_for(grammar, ab, {a, b});
+  auto prod_c_d = production_id_for(grammar, cd, {c, d});
+  auto prod_a_c = production_id_for(grammar, ac, {a, c});
+  auto prod_b_d = production_id_for(grammar, bd, {b, d});
+
+  auto brute = larch::brute_force_multisite_topologies(grammar, patterns);
+  CHECK(brute.topology_count == 2);
+  CHECK(brute.optimum == 1);
+
+  larch::multisite_trim_options no_bound;
+  no_bound.use_bound_pruning = false;
+  auto exact = larch::build_multisite_trim(grammar, patterns, {}, no_bound);
+  CHECK(exact.optimum == brute.optimum);
+  CHECK(exact.keep_production == brute.keep_production);
+  CHECK(exact.frontier_sizes_by_clade[grammar.root_clade] == 2);
+  CHECK(exact.keep_production[prod_ab_cd]);
+  CHECK(exact.keep_production[prod_a_b]);
+  CHECK(exact.keep_production[prod_c_d]);
+  CHECK(!exact.keep_production[prod_ac_bd]);
+  CHECK(!exact.keep_production[prod_a_c]);
+  CHECK(!exact.keep_production[prod_b_d]);
+
+  larch::multisite_trim_options strict_opts;
+  strict_opts.dominance_mode =
+      larch::multisite_dominance_mode::strict_mask_safe;
+  strict_opts.use_bound_pruning = false;
+  auto strict = larch::build_multisite_trim(grammar, patterns, {}, strict_opts);
+  CHECK(strict.optimum == brute.optimum);
+  CHECK(strict.keep_production == brute.keep_production);
+  CHECK(strict.dominance_mode ==
+        larch::multisite_dominance_mode::strict_mask_safe);
+  CHECK(strict.keep_mask_kind ==
+        larch::multisite_keep_mask_kind::exact_optimal_production_union);
+  CHECK(strict.keep_production_exact);
+  CHECK(strict.exact_mask_recovery_passes == 0);
+  CHECK(strict.dominance_candidates_considered > 0);
+  CHECK(strict.dominance_pruned_score_pass == 0);
+  CHECK(strict.dominance_pruned_mask_pass > 0);
+  CHECK(strict.dominance_pruned == strict.dominance_pruned_mask_pass);
+  CHECK(strict.frontier_sizes_by_clade[grammar.root_clade] == 1);
+
+  auto zero_weight_patterns = patterns;
+  for (auto& pattern : zero_weight_patterns.patterns) pattern.weight = 0;
+  auto brute_zero =
+      larch::brute_force_multisite_topologies(grammar, zero_weight_patterns);
+  CHECK(brute_zero.topology_count == 2);
+  CHECK(brute_zero.optimum == 0);
+  CHECK(brute_zero.keep_production[prod_ab_cd]);
+  CHECK(brute_zero.keep_production[prod_ac_bd]);
+  CHECK(brute_zero.keep_production[prod_a_b]);
+  CHECK(brute_zero.keep_production[prod_c_d]);
+  CHECK(brute_zero.keep_production[prod_a_c]);
+  CHECK(brute_zero.keep_production[prod_b_d]);
+  auto exact_zero =
+      larch::build_multisite_trim(grammar, zero_weight_patterns, {}, no_bound);
+  CHECK(exact_zero.keep_production == brute_zero.keep_production);
+  auto strict_zero = larch::build_multisite_trim(grammar, zero_weight_patterns,
+                                                 {}, strict_opts);
+  CHECK(strict_zero.optimum == brute_zero.optimum);
+  CHECK(strict_zero.keep_production == brute_zero.keep_production);
+  CHECK(strict_zero.dominance_pruned_mask_pass == 0);
+  CHECK(strict_zero.frontier_sizes_by_clade ==
+        exact_zero.frontier_sizes_by_clade);
+
+  larch::multisite_topology_trace_options trace_opts;
+  trace_opts.max_optimal_topologies = 0;
+  trace_opts.trim_options = strict_opts;
+  auto traced = larch::build_multisite_optimal_topologies(grammar, patterns, {},
+                                                          trace_opts);
+  CHECK(traced.optimum == brute.optimum);
+  CHECK(traced.topologies.size() == 1);
+  CHECK(traced.keep_production == brute.keep_production);
+  CHECK(traced.dominance_pruned > 0);
+  for (auto const& topology : traced.topologies) {
+    CHECK(larch::score_selected_topology(grammar, patterns, topology) ==
+          brute.optimum);
+  }
+
+  std::println("  PASS");
+}
+
+static void
+test_multisite_score_only_dominance_matches_bruteforce_and_labels() {
   std::println(
       "test_multisite_score_only_dominance_matches_bruteforce_and_labels");
 
@@ -808,11 +946,10 @@ static void test_multisite_score_only_dominance_matches_bruteforce_and_labels() 
   CHECK(exact.frontier_sizes_by_clade[grammar.root_clade] == 2);
 
   larch::multisite_trim_options score_only_opts;
-  score_only_opts.dominance_mode =
-      larch::multisite_dominance_mode::score_only;
+  score_only_opts.dominance_mode = larch::multisite_dominance_mode::score_only;
   score_only_opts.require_exact_keep_mask = false;
-  auto score_only = larch::build_multisite_trim(grammar, patterns, {},
-                                                score_only_opts);
+  auto score_only =
+      larch::build_multisite_trim(grammar, patterns, {}, score_only_opts);
   CHECK(score_only.optimum == brute.optimum);
   CHECK(score_only.dominance_mode ==
         larch::multisite_dominance_mode::score_only);
@@ -822,8 +959,7 @@ static void test_multisite_score_only_dominance_matches_bruteforce_and_labels() 
   CHECK(score_only.dominance_candidates_considered > 0);
   CHECK(score_only.dominance_pruned_score_pass > 0);
   CHECK(score_only.dominance_pruned_mask_pass == 0);
-  CHECK(score_only.dominance_pruned ==
-        score_only.dominance_pruned_score_pass);
+  CHECK(score_only.dominance_pruned == score_only.dominance_pruned_score_pass);
   CHECK(score_only.frontier_sizes_by_clade[grammar.root_clade] == 1);
   CHECK(score_only.keep_production != brute.keep_production);
   CHECK(std::none_of(score_only.keep_production.begin(),
@@ -838,8 +974,8 @@ static void test_multisite_score_only_dominance_matches_bruteforce_and_labels() 
 
   auto score_only_cap = score_only_opts;
   score_only_cap.max_frontier_entries_per_clade = 1;
-  auto capped = larch::build_multisite_trim(grammar, patterns, {},
-                                            score_only_cap);
+  auto capped =
+      larch::build_multisite_trim(grammar, patterns, {}, score_only_cap);
   CHECK(capped.optimum == brute.optimum);
   CHECK(capped.frontier_sizes_by_clade[grammar.root_clade] == 1);
 
@@ -894,12 +1030,11 @@ static void test_multisite_two_pass_dominated_suboptimal_does_not_overkeep() {
   CHECK(!exact.keep_production[prod_b_c]);
 
   larch::multisite_trim_options score_only_opts;
-  score_only_opts.dominance_mode =
-      larch::multisite_dominance_mode::score_only;
+  score_only_opts.dominance_mode = larch::multisite_dominance_mode::score_only;
   score_only_opts.require_exact_keep_mask = false;
   score_only_opts.use_bound_pruning = false;
-  auto score_only = larch::build_multisite_trim(grammar, patterns, {},
-                                                score_only_opts);
+  auto score_only =
+      larch::build_multisite_trim(grammar, patterns, {}, score_only_opts);
   CHECK(score_only.optimum == brute.optimum);
   CHECK(score_only.dominance_pruned_score_pass > 0);
   CHECK(score_only.frontier_sizes_by_clade[bcd] == 1);
@@ -908,8 +1043,8 @@ static void test_multisite_two_pass_dominated_suboptimal_does_not_overkeep() {
   two_pass_opts.dominance_mode =
       larch::multisite_dominance_mode::two_pass_exact_mask;
   two_pass_opts.use_bound_pruning = false;
-  auto two_pass = larch::build_multisite_trim(grammar, patterns, {},
-                                              two_pass_opts);
+  auto two_pass =
+      larch::build_multisite_trim(grammar, patterns, {}, two_pass_opts);
   CHECK(two_pass.optimum == brute.optimum);
   CHECK(two_pass.keep_production == brute.keep_production);
   CHECK(two_pass.keep_production_exact);
@@ -943,8 +1078,8 @@ static void test_multisite_two_pass_exact_mask_matches_bruteforce() {
   larch::multisite_trim_options two_pass_opts;
   two_pass_opts.dominance_mode =
       larch::multisite_dominance_mode::two_pass_exact_mask;
-  auto two_pass = larch::build_multisite_trim(grammar, patterns, {},
-                                              two_pass_opts);
+  auto two_pass =
+      larch::build_multisite_trim(grammar, patterns, {}, two_pass_opts);
   CHECK(two_pass.optimum == brute.optimum);
   CHECK(two_pass.keep_production == brute.keep_production);
   CHECK(two_pass.keep_production == exact.keep_production);
@@ -957,27 +1092,24 @@ static void test_multisite_two_pass_exact_mask_matches_bruteforce() {
   CHECK(two_pass.dominance_candidates_considered > 0);
   CHECK(two_pass.dominance_pruned_score_pass > 0);
   CHECK(two_pass.dominance_pruned_mask_pass == 0);
-  CHECK(two_pass.dominance_pruned ==
-        two_pass.dominance_pruned_score_pass +
-            two_pass.dominance_pruned_mask_pass);
+  CHECK(two_pass.dominance_pruned == two_pass.dominance_pruned_score_pass +
+                                         two_pass.dominance_pruned_mask_pass);
   CHECK(two_pass.frontier_sizes_by_clade == exact.frontier_sizes_by_clade);
 
   larch::multisite_trim_options no_bound = two_pass_opts;
   no_bound.use_bound_pruning = false;
-  auto two_pass_no_bound = larch::build_multisite_trim(grammar, patterns, {},
-                                                       no_bound);
+  auto two_pass_no_bound =
+      larch::build_multisite_trim(grammar, patterns, {}, no_bound);
   CHECK(two_pass_no_bound.optimum == two_pass.optimum);
   CHECK(two_pass_no_bound.keep_production == two_pass.keep_production);
   CHECK(two_pass_no_bound.bound_pruned == 0);
 
   larch::multisite_trim_options cap = two_pass_opts;
   cap.max_frontier_entries_per_clade = 1;
-  auto cap_message = runtime_error_message([&] {
-    (void)larch::build_multisite_trim(grammar, patterns, {}, cap);
-  });
+  auto cap_message = runtime_error_message(
+      [&] { (void)larch::build_multisite_trim(grammar, patterns, {}, cap); });
   CHECK(cap_message.find("exact mask recovery pass") != std::string::npos);
-  CHECK(cap_message.find("frontier entry cap exceeded") !=
-        std::string::npos);
+  CHECK(cap_message.find("frontier entry cap exceeded") != std::string::npos);
 
   larch::multisite_trim_options wrong_known = two_pass_opts;
   wrong_known.known_exact_optimum = brute.optimum + 1;
@@ -1118,8 +1250,8 @@ static void test_multisite_invariant_sites_and_reference_edge_constant() {
   larch::multisite_trim_options two_pass_opts;
   two_pass_opts.dominance_mode =
       larch::multisite_dominance_mode::two_pass_exact_mask;
-  auto skipped_two_pass = larch::build_multisite_trim(
-      grammar, skipped_patterns, {}, two_pass_opts);
+  auto skipped_two_pass =
+      larch::build_multisite_trim(grammar, skipped_patterns, {}, two_pass_opts);
   CHECK(skipped_two_pass.optimum == skipped_bnb.optimum);
   CHECK(skipped_two_pass.keep_production == skipped_bnb.keep_production);
   CHECK(skipped_two_pass.exact_mask_recovery_passes == 1);
@@ -1169,8 +1301,7 @@ static void test_composite_reference_state_diagnostics() {
 static void test_multisite_rejects_pattern_taxon_count_mismatch() {
   std::println("test_multisite_rejects_pattern_taxon_count_mismatch");
 
-  auto dag = larch::test::make_tiny_labelled_tree(
-      "A", invariant_tree1_spec());
+  auto dag = larch::test::make_tiny_labelled_tree("A", invariant_tree1_spec());
   auto grammar = larch::build_clade_grammar(dag);
   larch::site_pattern_options pattern_options;
   pattern_options.skip_invariant_sites = true;
@@ -1178,9 +1309,8 @@ static void test_multisite_rejects_pattern_taxon_count_mismatch() {
   CHECK(patterns.patterns.empty());
   ++patterns.taxon_count;
 
-  CHECK(throws_runtime_error([&] {
-    (void)larch::build_multisite_trim(grammar, patterns);
-  }));
+  CHECK(throws_runtime_error(
+      [&] { (void)larch::build_multisite_trim(grammar, patterns); }));
 
   std::println("  PASS");
 }
@@ -1210,8 +1340,8 @@ static void test_multisite_equal_dedup_merges_provenance() {
 
   larch::multisite_topology_trace_options trace_opts;
   trace_opts.max_optimal_topologies = 0;
-  auto traced = larch::build_multisite_optimal_topologies(
-      grammar, patterns, {}, trace_opts);
+  auto traced = larch::build_multisite_optimal_topologies(grammar, patterns, {},
+                                                          trace_opts);
   CHECK(traced.equality_deduplicated > 0);
   CHECK(traced.topologies.size() == brute.topology_count);
   CHECK(traced.keep_production == brute.keep_production);
@@ -1272,18 +1402,28 @@ static void test_multisite_randomized_tiny_bnb_matches_bruteforce() {
     score_only_opts.dominance_mode =
         larch::multisite_dominance_mode::score_only;
     score_only_opts.require_exact_keep_mask = false;
-    auto score_only = larch::build_multisite_trim(grammar, patterns, {},
-                                                  score_only_opts);
+    auto score_only =
+        larch::build_multisite_trim(grammar, patterns, {}, score_only_opts);
     CHECK(score_only.optimum == brute.optimum);
     CHECK(score_only.keep_mask_kind ==
           larch::multisite_keep_mask_kind::score_only_not_exact);
     CHECK(!score_only.keep_production_exact);
 
+    larch::multisite_trim_options strict_opts;
+    strict_opts.dominance_mode =
+        larch::multisite_dominance_mode::strict_mask_safe;
+    auto strict =
+        larch::build_multisite_trim(grammar, patterns, {}, strict_opts);
+    CHECK(strict.optimum == brute.optimum);
+    CHECK(strict.keep_production == brute.keep_production);
+    CHECK(strict.keep_production_exact);
+    CHECK(strict.exact_mask_recovery_passes == 0);
+
     larch::multisite_trim_options two_pass_opts;
     two_pass_opts.dominance_mode =
         larch::multisite_dominance_mode::two_pass_exact_mask;
-    auto two_pass = larch::build_multisite_trim(grammar, patterns, {},
-                                                two_pass_opts);
+    auto two_pass =
+        larch::build_multisite_trim(grammar, patterns, {}, two_pass_opts);
     CHECK(two_pass.optimum == brute.optimum);
     CHECK(two_pass.keep_production == brute.keep_production);
     CHECK(two_pass.keep_production_exact);
@@ -1302,6 +1442,11 @@ static void test_multisite_randomized_tiny_bnb_matches_bruteforce() {
           grammar, patterns, with_reference_edge, score_only_opts);
       CHECK(score_only_ua.optimum == brute_ua.optimum);
       CHECK(!score_only_ua.keep_production_exact);
+      auto strict_ua = larch::build_multisite_trim(
+          grammar, patterns, with_reference_edge, strict_opts);
+      CHECK(strict_ua.optimum == brute_ua.optimum);
+      CHECK(strict_ua.keep_production == brute_ua.keep_production);
+      CHECK(strict_ua.keep_production_exact);
       auto two_pass_ua = larch::build_multisite_trim(
           grammar, patterns, with_reference_edge, two_pass_opts);
       CHECK(two_pass_ua.optimum == brute_ua.optimum);
@@ -1369,6 +1514,7 @@ int main() {
   test_reference_edge_outside_boundary();
   test_multisite_composite_counterexample();
   test_multisite_phase0_diagnostics_and_exactness_labels();
+  test_multisite_strict_mask_safe_dominance_matches_bruteforce();
   test_multisite_score_only_dominance_matches_bruteforce_and_labels();
   test_multisite_two_pass_dominated_suboptimal_does_not_overkeep();
   test_multisite_two_pass_exact_mask_matches_bruteforce();

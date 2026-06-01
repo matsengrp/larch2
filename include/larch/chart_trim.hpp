@@ -933,9 +933,10 @@ inline void merge_provenance_choices(
     std::vector<frontier_provenance_choice> const& src,
     std::size_t max_choices_per_entry = 0) {
   for (auto choice : src) {
-    auto found = std::find_if(dst.begin(), dst.end(), [&](auto const& existing) {
-      return same_provenance_choice(existing, choice);
-    });
+    auto found =
+        std::find_if(dst.begin(), dst.end(), [&](auto const& existing) {
+          return same_provenance_choice(existing, choice);
+        });
     if (found != dst.end()) continue;
     if (max_choices_per_entry != 0 && dst.size() >= max_choices_per_entry) {
       throw std::runtime_error(
@@ -944,8 +945,10 @@ inline void merge_provenance_choices(
     dst.push_back(choice);
   }
   std::sort(dst.begin(), dst.end(), [](auto const& lhs, auto const& rhs) {
-    if (lhs.production != rhs.production) return lhs.production < rhs.production;
-    if (lhs.left_entry != rhs.left_entry) return lhs.left_entry < rhs.left_entry;
+    if (lhs.production != rhs.production)
+      return lhs.production < rhs.production;
+    if (lhs.left_entry != rhs.left_entry)
+      return lhs.left_entry < rhs.left_entry;
     return lhs.right_entry < rhs.right_entry;
   });
 }
@@ -1268,8 +1271,7 @@ inline void apply_dominance_pruning(std::vector<frontier_entry>& entries,
       if (dominates(entries[i].f, entries[j].f)) {
         merge_used_productions(entries[i].used_production,
                                entries[j].used_production);
-        merge_provenance_choices(entries[i].provenance,
-                                 entries[j].provenance);
+        merge_provenance_choices(entries[i].provenance, entries[j].provenance);
         remove[j] = true;
         ++dominance_pruned;
       }
@@ -1301,6 +1303,100 @@ inline void apply_score_only_dominance_pruning(
       if (entries[i].f.cost == entries[j].f.cost) continue;
       ++dominance_candidates_considered;
       if (dominates(entries[i].f, entries[j].f)) {
+        remove[j] = true;
+        ++dominance_pruned;
+      }
+    }
+  }
+
+  std::vector<frontier_entry> kept;
+  kept.reserve(entries.size());
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (!remove[i]) kept.push_back(std::move(entries[i]));
+  }
+  entries = std::move(kept);
+}
+
+inline bool component_has_finite_outside_completion(
+    clade_id clade, active_pattern_info const& info, std::uint8_t state,
+    chart_options const& options) {
+  parsimony_chart_detail::validate_state(state,
+                                         "strict dominance outside state");
+  if (!options.score_ua_edge) {
+    if (info.weight == 0) return false;
+    if (clade >= info.outside_ua_free.outside.size()) {
+      throw std::runtime_error(
+          "multi-site trim: clade out of outside range during strict "
+          "dominance");
+    }
+    return info.outside_ua_free.outside[clade][state] < chart_inf;
+  }
+
+  for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+       ++reference_state) {
+    auto count = info.reference_state_counts[reference_state];
+    if (count == 0) continue;
+    auto const& outside = info.outside_by_reference[reference_state];
+    if (clade >= outside.outside.size()) {
+      throw std::runtime_error(
+          "multi-site trim: clade out of reference outside range during "
+          "strict dominance");
+    }
+    if (outside.outside[clade][state] < chart_inf) return true;
+  }
+  return false;
+}
+
+inline bool strictly_mask_safely_dominates(
+    multisite_cost_function const& lhs, multisite_cost_function const& rhs,
+    clade_id clade, std::vector<active_pattern_info> const& active,
+    chart_options const& options) {
+  if (lhs.cost.size() != rhs.cost.size()) {
+    throw std::runtime_error(
+        "multi-site trim: strict dominance cost vector size mismatch");
+  }
+  if (lhs.cost.size() != active.size() * nuc_state_count) {
+    throw std::runtime_error(
+        "multi-site trim: strict dominance cost vector has wrong size");
+  }
+  if (!dominates(lhs, rhs)) return false;
+
+  bool saw_finite_outside_component = false;
+  for (std::size_t active_index = 0; active_index < active.size();
+       ++active_index) {
+    auto const& info = active[active_index];
+    for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+      if (!component_has_finite_outside_completion(clade, info, state,
+                                                   options)) {
+        continue;
+      }
+      saw_finite_outside_component = true;
+      auto index = cost_index(active_index, state);
+      if (!(lhs.cost[index] < rhs.cost[index])) return false;
+    }
+  }
+  return saw_finite_outside_component;
+}
+
+inline void apply_strict_mask_safe_dominance_pruning(
+    std::vector<frontier_entry>& entries, clade_id clade,
+    std::vector<active_pattern_info> const& active,
+    chart_options const& options, std::size_t& dominance_candidates_considered,
+    std::size_t& dominance_pruned) {
+  // Strict mask-safe dominance is conservative: a dominated entry is discarded
+  // only when the dominator is strictly better on every component that can be
+  // used by a finite outside completion for this clade.  Such an entry cannot
+  // participate in a globally optimal topology, so its provenance must not be
+  // merged into the dominator.
+  std::vector<bool> remove(entries.size(), false);
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (remove[i]) continue;
+    for (std::size_t j = 0; j < entries.size(); ++j) {
+      if (i == j || remove[j]) continue;
+      if (entries[i].f.cost == entries[j].f.cost) continue;
+      ++dominance_candidates_considered;
+      if (strictly_mask_safely_dominates(entries[i].f, entries[j].f, clade,
+                                         active, options)) {
         remove[j] = true;
         ++dominance_pruned;
       }
@@ -1598,18 +1694,18 @@ inline bool topology_lexicographic_less(selected_topology const& lhs,
   return grammar_topology_less(lhs, rhs);
 }
 
-inline void sort_and_unique_topologies(std::vector<selected_topology>& topologies) {
+inline void sort_and_unique_topologies(
+    std::vector<selected_topology>& topologies) {
   std::sort(topologies.begin(), topologies.end(), topology_lexicographic_less);
-  topologies.erase(std::unique(topologies.begin(), topologies.end(),
-                               grammar_topology_equal),
-                   topologies.end());
+  topologies.erase(
+      std::unique(topologies.begin(), topologies.end(), grammar_topology_equal),
+      topologies.end());
 }
 
 inline std::vector<selected_topology> enumerate_topologies_from_provenance(
     clade_grammar const& grammar,
-    std::vector<std::vector<frontier_entry>> const& frontiers,
-    clade_id clade, std::size_t entry_index, std::size_t max_topologies,
-    bool& truncated) {
+    std::vector<std::vector<frontier_entry>> const& frontiers, clade_id clade,
+    std::size_t entry_index, std::size_t max_topologies, bool& truncated) {
   if (clade == no_clade || clade >= grammar.clades.size() ||
       clade >= frontiers.size()) {
     throw std::runtime_error(
@@ -1645,13 +1741,12 @@ inline std::vector<selected_topology> enumerate_topologies_from_provenance(
       throw std::runtime_error(
           "multi-site topology trace: provenance parent mismatch");
     }
-    chart_trim_detail::validate_binary_production_for_trim(
-        grammar, prod, choice.production);
+    chart_trim_detail::validate_binary_production_for_trim(grammar, prod,
+                                                           choice.production);
 
     auto remaining = [&](std::size_t used) -> std::size_t {
       if (max_topologies == 0) return std::size_t{0};
-      return used >= max_topologies ? std::size_t{1}
-                                    : max_topologies - used;
+      return used >= max_topologies ? std::size_t{1} : max_topologies - used;
     };
 
     auto left_topologies = enumerate_topologies_from_provenance(
@@ -1678,7 +1773,8 @@ inline std::vector<selected_topology> enumerate_topologies_from_provenance(
 }
 
 inline std::size_t count_new_required_coverage(
-    selected_topology const& topology, std::vector<production_id> const& required,
+    selected_topology const& topology,
+    std::vector<production_id> const& required,
     std::vector<bool> const& covered) {
   if (topology.used_production.empty()) return 0;
   std::size_t count = 0;
@@ -1724,8 +1820,8 @@ inline std::vector<selected_topology> choose_topologies_for_required_coverage(
       std::size_t best_count = 0;
       for (std::size_t i = 0; i < topologies.size(); ++i) {
         if (selected[i]) continue;
-        auto count = count_new_required_coverage(topologies[i], required,
-                                                 covered);
+        auto count =
+            count_new_required_coverage(topologies[i], required, covered);
         if (count > best_count ||
             (count == best_count && count != 0 && best != topologies.size() &&
              topology_lexicographic_less(topologies[i], topologies[best]))) {
@@ -1796,13 +1892,21 @@ inline void validate_multisite_trim_options_supported(
     bool allow_score_only_dominance) {
   if (trim_options.dominance_mode == multisite_dominance_mode::off) return;
 
+  if (trim_options.dominance_mode ==
+      multisite_dominance_mode::strict_mask_safe) {
+    // Strict mask-safe dominance discards only entries that are strictly worse
+    // on every finite outside-completable component, so it is safe for exact
+    // keep-production masks and exact topology witnesses.
+    return;
+  }
+
   if (trim_options.dominance_mode == multisite_dominance_mode::score_only) {
     if (!allow_score_only_dominance) {
       throw std::runtime_error(
           context +
           ": score-only dominance cannot emit exact topology witnesses; rerun "
-          "with dominance off (or a future provenance-preserving mode) and a "
-          "validated known_exact_optimum");
+          "with dominance off or strict-mask-safe dominance (or a future "
+          "provenance-preserving mode) and a validated known_exact_optimum");
     }
     if (trim_options.require_exact_keep_mask) {
       throw std::runtime_error(
@@ -1820,8 +1924,9 @@ inline void validate_multisite_trim_options_supported(
       throw std::runtime_error(
           context +
           ": two-pass exact-mask dominance cannot emit exact topology "
-          "witnesses; rerun with dominance off (or a future "
-          "provenance-preserving mode) and a validated known_exact_optimum");
+          "witnesses; rerun with dominance off or strict-mask-safe dominance "
+          "(or a future provenance-preserving mode) and a validated "
+          "known_exact_optimum");
     }
     if (!trim_options.require_exact_keep_mask) {
       throw std::runtime_error(
@@ -1838,7 +1943,8 @@ inline void validate_multisite_trim_options_supported(
       context + ": dominance mode '" +
       multisite_dominance_mode_name(trim_options.dominance_mode) +
       "' is not implemented in this public trim path yet; implemented modes "
-      "are off, score-only, and two-pass-exact-mask for exact masks");
+      "are off, score-only, strict-mask-safe, and two-pass-exact-mask for "
+      "exact masks");
 }
 
 inline multisite_keep_mask_kind keep_mask_kind_for_options(
@@ -1865,7 +1971,8 @@ inline void validate_known_exact_optimum(
   if (!trim_options.known_exact_optimum) return;
   if (computed_root_optimum == *trim_options.known_exact_optimum) return;
   throw std::runtime_error(
-      context + ": known_exact_optimum validation failed: computed root "
+      context +
+      ": known_exact_optimum validation failed: computed root "
       "optimum " +
       std::to_string(computed_root_optimum) +
       " differs from known_exact_optimum " +
@@ -2004,7 +2111,9 @@ inline multisite_frontier_build_result build_multisite_frontiers(
         ": score-only dominance cannot build exact topology provenance");
   }
   if (build_options.dominance_mode != multisite_dominance_mode::off &&
-      build_options.dominance_mode != multisite_dominance_mode::score_only) {
+      build_options.dominance_mode != multisite_dominance_mode::score_only &&
+      build_options.dominance_mode !=
+          multisite_dominance_mode::strict_mask_safe) {
     throw std::runtime_error(
         context + ": dominance mode '" +
         multisite_dominance_mode_name(build_options.dominance_mode) +
@@ -2015,21 +2124,21 @@ inline multisite_frontier_build_result build_multisite_frontiers(
   auto composite = build_composite_chart_score(grammar, patterns, options);
   result.composite_lower_bound = composite.weighted_lower_bound;
   result.frontier_sizes_by_clade.assign(grammar.clades.size(), 0);
-  result.invariant_constant_offset = invariant_constant_offset(patterns, options);
+  result.invariant_constant_offset =
+      invariant_constant_offset(patterns, options);
 
-  result.active_patterns = build_active_pattern_info(grammar, patterns, options);
+  result.active_patterns =
+      build_active_pattern_info(grammar, patterns, options);
   result.active_pattern_count = result.active_patterns.size();
-  result.initial_upper_bound = initial_upper_bound(
-      grammar, patterns, result.active_patterns, options);
-  auto pruning_upper_bound =
-      build_options.upper_bound_override
-          ? *build_options.upper_bound_override
-          : result.initial_upper_bound;
+  result.initial_upper_bound =
+      initial_upper_bound(grammar, patterns, result.active_patterns, options);
+  auto pruning_upper_bound = build_options.upper_bound_override
+                                 ? *build_options.upper_bound_override
+                                 : result.initial_upper_bound;
 
   std::vector<clade_id> order(grammar.clades.size());
   std::iota(order.begin(), order.end(), clade_id{0});
-  std::stable_sort(order.begin(), order.end(), [&](clade_id lhs,
-                                                   clade_id rhs) {
+  std::stable_sort(order.begin(), order.end(), [&](clade_id lhs, clade_id rhs) {
     auto lsize = grammar.clades[lhs].taxa.size();
     auto rsize = grammar.clades[rhs].taxa.size();
     if (lsize != rsize) return lsize < rsize;
@@ -2040,11 +2149,10 @@ inline multisite_frontier_build_result build_multisite_frontiers(
   for (auto clade : order) {
     auto const& key = grammar.clades[clade];
     if (key.taxa.size() == 1) {
-      result.frontiers[clade].push_back(make_leaf_frontier_entry(
-          grammar, clade, result.active_patterns,
-          build_options.keep_used_production));
-      result.frontier_sizes_by_clade[clade] =
-          result.frontiers[clade].size();
+      result.frontiers[clade].push_back(
+          make_leaf_frontier_entry(grammar, clade, result.active_patterns,
+                                   build_options.keep_used_production));
+      result.frontier_sizes_by_clade[clade] = result.frontiers[clade].size();
       continue;
     }
 
@@ -2065,8 +2173,8 @@ inline multisite_frontier_build_result build_multisite_frontiers(
       auto right_child = prod.children[1];
       if (left_child >= result.frontiers.size() ||
           right_child >= result.frontiers.size()) {
-        throw std::runtime_error(
-            context + ": production child out of frontier range");
+        throw std::runtime_error(context +
+                                 ": production child out of frontier range");
       }
       for (std::size_t left_index = 0;
            left_index < result.frontiers[left_child].size(); ++left_index) {
@@ -2101,9 +2209,14 @@ inline multisite_frontier_build_result build_multisite_frontiers(
     }
 
     if (build_options.dominance_mode == multisite_dominance_mode::score_only) {
-      apply_score_only_dominance_pruning(
-          entries, result.dominance_candidates_considered,
-          result.dominance_pruned);
+      apply_score_only_dominance_pruning(entries,
+                                         result.dominance_candidates_considered,
+                                         result.dominance_pruned);
+    } else if (build_options.dominance_mode ==
+               multisite_dominance_mode::strict_mask_safe) {
+      apply_strict_mask_safe_dominance_pruning(
+          entries, clade, result.active_patterns, options,
+          result.dominance_candidates_considered, result.dominance_pruned);
     }
 
     if (build_options.max_frontier_entries_per_clade != 0 &&
@@ -2131,24 +2244,22 @@ inline multisite_frontier_build_result build_multisite_frontiers(
 
 inline std::uint64_t compute_root_frontier_optimum_and_update_mask(
     clade_grammar const& grammar, chart_options const& options,
-    multisite_frontier_build_result const& build,
-    bool merge_exact_keep_mask, std::vector<bool>& keep_production,
-    std::string const& context) {
+    multisite_frontier_build_result const& build, bool merge_exact_keep_mask,
+    std::vector<bool>& keep_production, std::string const& context) {
   auto const& root_frontier = build.frontiers[grammar.root_clade];
   if (root_frontier.empty()) {
     throw std::runtime_error(context + ": empty root frontier");
   }
   if (merge_exact_keep_mask &&
       keep_production.size() != grammar.productions.size()) {
-    throw std::runtime_error(context +
-                             ": keep-production mask size mismatch");
+    throw std::runtime_error(context + ": keep-production mask size mismatch");
   }
 
   std::uint64_t optimum = multisite_score_inf;
   for (auto const& entry : root_frontier) {
-    auto score = lower_bound_for_entry(
-        entry, grammar.root_clade, build.active_patterns,
-        build.invariant_constant_offset, options);
+    auto score =
+        lower_bound_for_entry(entry, grammar.root_clade, build.active_patterns,
+                              build.invariant_constant_offset, options);
     if (score < optimum) {
       optimum = score;
       if (merge_exact_keep_mask) {
@@ -2201,7 +2312,8 @@ inline multisite_trim_result build_multisite_trim(
 
   auto keep_mask_kind = keep_mask_kind_for_options(trim_options);
   auto keep_production_exact =
-      keep_mask_kind == multisite_keep_mask_kind::exact_optimal_production_union;
+      keep_mask_kind ==
+      multisite_keep_mask_kind::exact_optimal_production_union;
 
   multisite_trim_result result;
   result.dominance_mode = trim_options.dominance_mode;
@@ -2223,9 +2335,9 @@ inline multisite_trim_result build_multisite_trim(
         trim_options.upper_bound_override;
     score_build_options.max_frontier_entries_per_clade =
         trim_options.max_frontier_entries_per_clade;
-    auto score_build = build_multisite_frontiers(
-        grammar, patterns, options, score_build_options,
-        "multi-site trim score pass");
+    auto score_build = build_multisite_frontiers(grammar, patterns, options,
+                                                 score_build_options,
+                                                 "multi-site trim score pass");
 
     result.optimum = compute_root_frontier_optimum_and_update_mask(
         grammar, options, score_build, false, result.keep_production,
@@ -2252,9 +2364,8 @@ inline multisite_trim_result build_multisite_trim(
         "multi-site trim exact mask recovery pass");
     multisite_trim_options recovery_validation_options;
     recovery_validation_options.known_exact_optimum = result.optimum;
-    validate_known_exact_optimum(
-        recovered_optimum, recovery_validation_options,
-        "multi-site trim exact mask recovery pass");
+    validate_known_exact_optimum(recovered_optimum, recovery_validation_options,
+                                 "multi-site trim exact mask recovery pass");
 
     result.composite_lower_bound = score_build.composite_lower_bound;
     result.initial_upper_bound = score_build.initial_upper_bound;
@@ -2264,13 +2375,13 @@ inline multisite_trim_result build_multisite_trim(
     result.dominance_pruned_score_pass = score_build.dominance_pruned;
     result.dominance_pruned_mask_pass = mask_build.dominance_pruned;
     result.bound_pruned = score_build.bound_pruned + mask_build.bound_pruned;
-    result.equality_deduplicated = score_build.equality_deduplicated +
-                                   mask_build.equality_deduplicated;
+    result.equality_deduplicated =
+        score_build.equality_deduplicated + mask_build.equality_deduplicated;
     result.active_pattern_count = score_build.active_pattern_count;
     result.invariant_constant_offset = score_build.invariant_constant_offset;
     result.exact_mask_recovery_passes = 1;
-    result.dominance_pruned = result.dominance_pruned_score_pass +
-                              result.dominance_pruned_mask_pass;
+    result.dominance_pruned =
+        result.dominance_pruned_score_pass + result.dominance_pruned_mask_pass;
     return result;
   }
 
@@ -2290,8 +2401,15 @@ inline multisite_trim_result build_multisite_trim(
   result.frontier_sizes_by_clade = build.frontier_sizes_by_clade;
   result.dominance_candidates_considered =
       build.dominance_candidates_considered;
-  result.dominance_pruned_score_pass = build.dominance_pruned;
-  result.dominance_pruned_mask_pass = 0;
+  if (trim_options.dominance_mode ==
+          multisite_dominance_mode::strict_mask_safe &&
+      result.keep_production_exact) {
+    result.dominance_pruned_score_pass = 0;
+    result.dominance_pruned_mask_pass = build.dominance_pruned;
+  } else {
+    result.dominance_pruned_score_pass = build.dominance_pruned;
+    result.dominance_pruned_mask_pass = 0;
+  }
   result.bound_pruned = build.bound_pruned;
   result.equality_deduplicated = build.equality_deduplicated;
   result.active_pattern_count = build.active_pattern_count;
@@ -2300,10 +2418,9 @@ inline multisite_trim_result build_multisite_trim(
   result.optimum = compute_root_frontier_optimum_and_update_mask(
       grammar, options, build, result.keep_production_exact,
       result.keep_production, "multi-site trim");
-  validate_known_exact_optimum(result.optimum, trim_options,
-                               "multi-site trim");
-  result.dominance_pruned = result.dominance_pruned_score_pass +
-                            result.dominance_pruned_mask_pass;
+  validate_known_exact_optimum(result.optimum, trim_options, "multi-site trim");
+  result.dominance_pruned =
+      result.dominance_pruned_score_pass + result.dominance_pruned_mask_pass;
   return result;
 }
 
@@ -2324,8 +2441,7 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
   validate_multisite_inputs(grammar, patterns, options);
   validate_required_productions(grammar, trace_opts.required_productions);
   validate_multisite_trim_options_supported(trace_opts.trim_options,
-                                            "multi-site topology trace",
-                                            false);
+                                            "multi-site topology trace", false);
   if (!trace_opts.keep_provenance) {
     throw std::runtime_error(
         "multi-site topology trace: keep_provenance=false cannot emit "
@@ -2343,9 +2459,8 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
       trace_opts.trim_options.max_frontier_entries_per_clade;
   build_options.max_provenance_choices_per_entry =
       trace_opts.max_provenance_choices_per_entry;
-  auto build = build_multisite_frontiers(grammar, patterns, options,
-                                         build_options,
-                                         "multi-site topology trace");
+  auto build = build_multisite_frontiers(
+      grammar, patterns, options, build_options, "multi-site topology trace");
 
   multisite_topology_trace_result result;
   result.composite_lower_bound = build.composite_lower_bound;
@@ -2367,11 +2482,9 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
   std::vector<std::size_t> optimal_root_entries;
   for (std::size_t entry_index = 0; entry_index < root_frontier.size();
        ++entry_index) {
-    auto score = lower_bound_for_entry(root_frontier[entry_index],
-                                       grammar.root_clade,
-                                       build.active_patterns,
-                                       result.invariant_constant_offset,
-                                       options);
+    auto score = lower_bound_for_entry(
+        root_frontier[entry_index], grammar.root_clade, build.active_patterns,
+        result.invariant_constant_offset, options);
     if (score < result.optimum) {
       result.optimum = score;
       optimal_root_entries.clear();
@@ -2421,8 +2534,8 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
       all_emitted.size() > trace_opts.max_optimal_topologies) {
     result.topology_cap_truncated = true;
   }
-  result.topology_cap_truncated = result.topology_cap_truncated ||
-                                  provenance_truncated;
+  result.topology_cap_truncated =
+      result.topology_cap_truncated || provenance_truncated;
 
   std::vector<production_id> uncovered;
   result.topologies = choose_topologies_for_required_coverage(
@@ -2451,8 +2564,9 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
     std::string message =
         "multi-site topology trace: required productions are not covered by "
         "emitted optimal topologies (optimum=" +
-        std::to_string(result.optimum) + ", emitted=" +
-        std::to_string(result.topologies.size()) + ", uncovered=[";
+        std::to_string(result.optimum) +
+        ", emitted=" + std::to_string(result.topologies.size()) +
+        ", uncovered=[";
     for (std::size_t i = 0; i < result.uncovered_required_productions.size();
          ++i) {
       if (i != 0) message += ",";
