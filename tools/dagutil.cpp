@@ -1202,8 +1202,10 @@ Analysis:
   --chart-bnb-dominance <M>
                           B&B dominance mode: off (default), score-only,
                           strict-mask-safe, two-pass-exact-mask, or
-                          provenance-preserving. Phase-0 diagnostics support
-                          off; other modes fail clearly until implemented.
+                          provenance-preserving. score-only requires
+                          --chart-bnb-score-only and returns no exact mask;
+                          later exact-mask dominance modes fail clearly until
+                          implemented.
   --chart-bnb-score-only  Report the B&B result as score-only/non-exact-mask
                           instead of requiring an exact keep-production mask
   --chart-bnb-apply-trim  Apply exact B&B trim results and optionally write a DAG

@@ -1147,7 +1147,8 @@ inline std::uint64_t lower_bound_for_entry(
 
 inline frontier_entry make_leaf_frontier_entry(
     clade_grammar const& grammar, clade_id clade,
-    std::vector<active_pattern_info> const& active) {
+    std::vector<active_pattern_info> const& active,
+    bool keep_used_production = true) {
   auto const& key = grammar.clades[clade];
   if (key.taxa.size() != 1) {
     throw std::runtime_error(
@@ -1157,7 +1158,9 @@ inline frontier_entry make_leaf_frontier_entry(
   frontier_entry entry;
   entry.f.cost.assign(active.size() * nuc_state_count, chart_inf);
   entry.f.topology_hash = mix_hash(0x6c656166ULL, taxon);
-  entry.used_production.assign(grammar.productions.size(), false);
+  if (keep_used_production) {
+    entry.used_production.assign(grammar.productions.size(), false);
+  }
 
   for (std::size_t active_index = 0; active_index < active.size();
        ++active_index) {
@@ -1179,7 +1182,7 @@ inline frontier_entry make_leaf_frontier_entry(
 inline frontier_entry combine_frontier_entries(
     clade_grammar const& grammar, grammar_production const& prod,
     production_id pid, frontier_entry const& left, frontier_entry const& right,
-    std::size_t active_pattern_count) {
+    std::size_t active_pattern_count, bool keep_used_production = true) {
   if (prod.children.size() != 2) {
     throw std::runtime_error(
         "multi-site trim: parent combine supports binary productions only");
@@ -1190,10 +1193,16 @@ inline frontier_entry combine_frontier_entries(
     throw std::runtime_error(
         "multi-site trim: child frontier cost vector has wrong size");
   }
-  if (left.used_production.size() != grammar.productions.size() ||
-      right.used_production.size() != grammar.productions.size()) {
+  if (keep_used_production) {
+    if (left.used_production.size() != grammar.productions.size() ||
+        right.used_production.size() != grammar.productions.size()) {
+      throw std::runtime_error(
+          "multi-site trim: child provenance vector has wrong size");
+    }
+  } else if (!left.used_production.empty() || !right.used_production.empty()) {
     throw std::runtime_error(
-        "multi-site trim: child provenance vector has wrong size");
+        "multi-site trim: score-only frontier unexpectedly carries provenance "
+        "bitsets");
   }
 
   frontier_entry candidate;
@@ -1201,12 +1210,14 @@ inline frontier_entry combine_frontier_entries(
   candidate.f.topology_hash =
       mix_hash(mix_hash(mix_hash(0x70726f64ULL, pid), left.f.topology_hash),
                right.f.topology_hash);
-  candidate.used_production = left.used_production;
-  merge_used_productions(candidate.used_production, right.used_production);
   if (pid == no_production || pid >= grammar.productions.size()) {
     throw std::runtime_error("multi-site trim: production id out of range");
   }
-  candidate.used_production[pid] = true;
+  if (keep_used_production) {
+    candidate.used_production = left.used_production;
+    merge_used_productions(candidate.used_production, right.used_production);
+    candidate.used_production[pid] = true;
+  }
 
   for (std::size_t active_index = 0; active_index < active_pattern_count;
        ++active_index) {
@@ -1273,6 +1284,37 @@ inline void apply_dominance_pruning(std::vector<frontier_entry>& entries,
   entries = std::move(kept);
 }
 
+inline void apply_score_only_dominance_pruning(
+    std::vector<frontier_entry>& entries,
+    std::size_t& dominance_candidates_considered,
+    std::size_t& dominance_pruned) {
+  // Score-only dominance is safe for the scalar optimum, but it must not merge
+  // dominated provenance into the dominator.  A dominated entry can tie the
+  // dominator in an optimal outside context, so merging would over-keep and
+  // discarding would under-keep for exact optimal-production masks.  Public
+  // callers using this helper must label keep_production as non-exact.
+  std::vector<bool> remove(entries.size(), false);
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (remove[i]) continue;
+    for (std::size_t j = 0; j < entries.size(); ++j) {
+      if (i == j || remove[j]) continue;
+      if (entries[i].f.cost == entries[j].f.cost) continue;
+      ++dominance_candidates_considered;
+      if (dominates(entries[i].f, entries[j].f)) {
+        remove[j] = true;
+        ++dominance_pruned;
+      }
+    }
+  }
+
+  std::vector<frontier_entry> kept;
+  kept.reserve(entries.size());
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (!remove[i]) kept.push_back(std::move(entries[i]));
+  }
+  entries = std::move(kept);
+}
+
 inline void insert_or_merge_frontier_entry(
     std::vector<frontier_entry>& entries,
     std::unordered_map<std::vector<chart_cost>, std::size_t,
@@ -1281,8 +1323,11 @@ inline void insert_or_merge_frontier_entry(
     std::size_t max_provenance_choices_per_entry = 0) {
   auto found = index_by_cost.find(candidate.f.cost);
   if (found != index_by_cost.end()) {
-    merge_used_productions(entries[found->second].used_production,
-                           candidate.used_production);
+    if (!entries[found->second].used_production.empty() ||
+        !candidate.used_production.empty()) {
+      merge_used_productions(entries[found->second].used_production,
+                             candidate.used_production);
+    }
     merge_provenance_choices(entries[found->second].provenance,
                              candidate.provenance,
                              max_provenance_choices_per_entry);
@@ -1747,19 +1792,39 @@ inline void validate_required_productions(
 }
 
 inline void validate_multisite_trim_options_supported(
-    multisite_trim_options const& trim_options, std::string const& context) {
-  if (trim_options.dominance_mode != multisite_dominance_mode::off) {
-    throw std::runtime_error(
-        context + ": dominance mode '" +
-        multisite_dominance_mode_name(trim_options.dominance_mode) +
-        "' is not implemented in this public trim path yet; dominance is "
-        "currently disabled, use off");
+    multisite_trim_options const& trim_options, std::string const& context,
+    bool allow_score_only_dominance) {
+  if (trim_options.dominance_mode == multisite_dominance_mode::off) return;
+
+  if (trim_options.dominance_mode == multisite_dominance_mode::score_only) {
+    if (!allow_score_only_dominance) {
+      throw std::runtime_error(
+          context +
+          ": score-only dominance cannot emit exact topology witnesses; rerun "
+          "with dominance off (or a future provenance-preserving mode) and a "
+          "validated known_exact_optimum");
+    }
+    if (trim_options.require_exact_keep_mask) {
+      throw std::runtime_error(
+          context +
+          ": score-only dominance cannot return an exact keep-production "
+          "mask; set require_exact_keep_mask=false (CLI: "
+          "--chart-bnb-score-only)");
+    }
+    return;
   }
+
+  throw std::runtime_error(
+      context + ": dominance mode '" +
+      multisite_dominance_mode_name(trim_options.dominance_mode) +
+      "' is not implemented in this public trim path yet; implemented modes "
+      "are off and score-only");
 }
 
 inline multisite_keep_mask_kind keep_mask_kind_for_options(
     multisite_trim_options const& trim_options) {
-  if (!trim_options.require_exact_keep_mask) {
+  if (!trim_options.require_exact_keep_mask ||
+      trim_options.dominance_mode == multisite_dominance_mode::score_only) {
     return multisite_keep_mask_kind::score_only_not_exact;
   }
   return multisite_keep_mask_kind::exact_optimal_production_union;
@@ -1880,6 +1945,165 @@ inline composite_chart_score build_composite_chart_score(
   return result;
 }
 
+namespace chart_multisite_detail {
+
+struct multisite_frontier_build_options {
+  bool keep_provenance = false;
+  bool keep_used_production = true;
+  bool use_bound_pruning = true;
+  multisite_dominance_mode dominance_mode = multisite_dominance_mode::off;
+  std::optional<std::uint64_t> upper_bound_override;
+  std::size_t max_frontier_entries_per_clade = 0;
+  std::size_t max_provenance_choices_per_entry = 0;
+};
+
+struct multisite_frontier_build_result {
+  std::vector<std::vector<frontier_entry>> frontiers;
+  std::vector<active_pattern_info> active_patterns;
+  std::uint64_t composite_lower_bound = 0;
+  std::uint64_t initial_upper_bound = 0;
+  std::uint64_t invariant_constant_offset = 0;
+  std::vector<std::size_t> frontier_sizes_by_clade;
+  std::size_t equality_deduplicated = 0;
+  std::size_t bound_pruned = 0;
+  std::size_t dominance_candidates_considered = 0;
+  std::size_t dominance_pruned = 0;
+  std::size_t active_pattern_count = 0;
+};
+
+inline multisite_frontier_build_result build_multisite_frontiers(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options,
+    multisite_frontier_build_options const& build_options,
+    std::string const& context) {
+  validate_multisite_inputs(grammar, patterns, options);
+  if (build_options.keep_provenance &&
+      build_options.dominance_mode == multisite_dominance_mode::score_only) {
+    throw std::runtime_error(
+        context +
+        ": score-only dominance cannot build exact topology provenance");
+  }
+  if (build_options.dominance_mode != multisite_dominance_mode::off &&
+      build_options.dominance_mode != multisite_dominance_mode::score_only) {
+    throw std::runtime_error(
+        context + ": dominance mode '" +
+        multisite_dominance_mode_name(build_options.dominance_mode) +
+        "' is not implemented in frontier construction");
+  }
+
+  multisite_frontier_build_result result;
+  auto composite = build_composite_chart_score(grammar, patterns, options);
+  result.composite_lower_bound = composite.weighted_lower_bound;
+  result.frontier_sizes_by_clade.assign(grammar.clades.size(), 0);
+  result.invariant_constant_offset = invariant_constant_offset(patterns, options);
+
+  result.active_patterns = build_active_pattern_info(grammar, patterns, options);
+  result.active_pattern_count = result.active_patterns.size();
+  result.initial_upper_bound = initial_upper_bound(
+      grammar, patterns, result.active_patterns, options);
+  auto pruning_upper_bound =
+      build_options.upper_bound_override
+          ? *build_options.upper_bound_override
+          : result.initial_upper_bound;
+
+  std::vector<clade_id> order(grammar.clades.size());
+  std::iota(order.begin(), order.end(), clade_id{0});
+  std::stable_sort(order.begin(), order.end(), [&](clade_id lhs,
+                                                   clade_id rhs) {
+    auto lsize = grammar.clades[lhs].taxa.size();
+    auto rsize = grammar.clades[rhs].taxa.size();
+    if (lsize != rsize) return lsize < rsize;
+    return lhs < rhs;
+  });
+
+  result.frontiers.assign(grammar.clades.size(), {});
+  for (auto clade : order) {
+    auto const& key = grammar.clades[clade];
+    if (key.taxa.size() == 1) {
+      result.frontiers[clade].push_back(make_leaf_frontier_entry(
+          grammar, clade, result.active_patterns,
+          build_options.keep_used_production));
+      result.frontier_sizes_by_clade[clade] =
+          result.frontiers[clade].size();
+      continue;
+    }
+
+    std::unordered_map<std::vector<chart_cost>, std::size_t,
+                       chart_cost_vector_hash>
+        index_by_cost;
+    auto& entries = result.frontiers[clade];
+    for (auto pid : grammar.productions_by_parent[clade]) {
+      auto const& prod = grammar.productions[pid];
+      if (prod.parent != clade) {
+        throw std::runtime_error(
+            context +
+            ": production parent mismatch during frontier construction");
+      }
+      chart_trim_detail::validate_binary_production_for_trim(grammar, prod,
+                                                             pid);
+      auto left_child = prod.children[0];
+      auto right_child = prod.children[1];
+      if (left_child >= result.frontiers.size() ||
+          right_child >= result.frontiers.size()) {
+        throw std::runtime_error(
+            context + ": production child out of frontier range");
+      }
+      for (std::size_t left_index = 0;
+           left_index < result.frontiers[left_child].size(); ++left_index) {
+        auto const& left = result.frontiers[left_child][left_index];
+        for (std::size_t right_index = 0;
+             right_index < result.frontiers[right_child].size();
+             ++right_index) {
+          auto const& right = result.frontiers[right_child][right_index];
+          auto candidate = combine_frontier_entries(
+              grammar, prod, pid, left, right, result.active_patterns.size(),
+              build_options.keep_used_production);
+          if (build_options.keep_provenance) {
+            candidate.provenance.push_back(
+                frontier_provenance_choice{pid, left_index, right_index});
+          }
+          if (build_options.use_bound_pruning &&
+              pruning_upper_bound < multisite_score_inf) {
+            auto lb = lower_bound_for_entry(
+                candidate, clade, result.active_patterns,
+                result.invariant_constant_offset, options);
+            if (lb > pruning_upper_bound) {
+              ++result.bound_pruned;
+              continue;
+            }
+          }
+          insert_or_merge_frontier_entry(
+              entries, index_by_cost, std::move(candidate),
+              result.equality_deduplicated,
+              build_options.max_provenance_choices_per_entry);
+        }
+      }
+    }
+
+    if (build_options.dominance_mode == multisite_dominance_mode::score_only) {
+      apply_score_only_dominance_pruning(
+          entries, result.dominance_candidates_considered,
+          result.dominance_pruned);
+    }
+
+    if (build_options.max_frontier_entries_per_clade != 0 &&
+        entries.size() > build_options.max_frontier_entries_per_clade) {
+      throw std::runtime_error(context +
+                               ": frontier entry cap exceeded for clade " +
+                               std::to_string(clade));
+    }
+    // Bound pruning can empty a non-root clade frontier when every topology
+    // using that clade is already provably worse than the current feasible
+    // upper bound.  Parent combinations that depend on it simply generate no
+    // candidates.  The root frontier is checked by the caller after the pass.
+    result.frontier_sizes_by_clade[clade] = entries.size();
+  }
+
+  return result;
+}
+
+}  // namespace chart_multisite_detail
+
 inline multisite_bruteforce_result brute_force_multisite_topologies(
     clade_grammar const& grammar, site_pattern_set const& patterns,
     chart_options const& options = {}, std::size_t max_topologies = 100000) {
@@ -1912,115 +2136,57 @@ inline multisite_trim_result build_multisite_trim(
     multisite_trim_options const& trim_options = {}) {
   using namespace chart_multisite_detail;
   validate_multisite_inputs(grammar, patterns, options);
-  validate_multisite_trim_options_supported(trim_options, "multi-site trim");
+  validate_multisite_trim_options_supported(trim_options, "multi-site trim",
+                                            true);
+
+  auto keep_mask_kind = keep_mask_kind_for_options(trim_options);
+  auto keep_production_exact =
+      keep_mask_kind == multisite_keep_mask_kind::exact_optimal_production_union;
+
+  multisite_frontier_build_options build_options;
+  build_options.keep_provenance = false;
+  build_options.keep_used_production = keep_production_exact;
+  build_options.use_bound_pruning = trim_options.use_bound_pruning;
+  build_options.dominance_mode = trim_options.dominance_mode;
+  build_options.upper_bound_override = trim_options.upper_bound_override;
+  build_options.max_frontier_entries_per_clade =
+      trim_options.max_frontier_entries_per_clade;
+  auto build = build_multisite_frontiers(grammar, patterns, options,
+                                         build_options, "multi-site trim");
 
   multisite_trim_result result;
   result.dominance_mode = trim_options.dominance_mode;
-  result.keep_mask_kind = keep_mask_kind_for_options(trim_options);
-  result.keep_production_exact =
-      result.keep_mask_kind ==
-      multisite_keep_mask_kind::exact_optimal_production_union;
-  auto composite = build_composite_chart_score(grammar, patterns, options);
-  result.composite_lower_bound = composite.weighted_lower_bound;
+  result.keep_mask_kind = keep_mask_kind;
+  result.keep_production_exact = keep_production_exact;
+  result.composite_lower_bound = build.composite_lower_bound;
+  result.initial_upper_bound = build.initial_upper_bound;
   result.keep_production.assign(grammar.productions.size(), false);
-  result.frontier_sizes_by_clade.assign(grammar.clades.size(), 0);
-  result.invariant_constant_offset =
-      invariant_constant_offset(patterns, options);
+  result.frontier_sizes_by_clade = build.frontier_sizes_by_clade;
+  result.dominance_candidates_considered =
+      build.dominance_candidates_considered;
+  result.dominance_pruned_score_pass = build.dominance_pruned;
+  result.dominance_pruned_mask_pass = 0;
+  result.bound_pruned = build.bound_pruned;
+  result.equality_deduplicated = build.equality_deduplicated;
+  result.active_pattern_count = build.active_pattern_count;
+  result.invariant_constant_offset = build.invariant_constant_offset;
 
-  auto active = build_active_pattern_info(grammar, patterns, options);
-  result.active_pattern_count = active.size();
-  result.initial_upper_bound =
-      initial_upper_bound(grammar, patterns, active, options);
-  auto pruning_upper_bound =
-      effective_pruning_upper_bound(result.initial_upper_bound, trim_options);
-
-  std::vector<clade_id> order(grammar.clades.size());
-  std::iota(order.begin(), order.end(), clade_id{0});
-  std::stable_sort(order.begin(), order.end(), [&](clade_id lhs, clade_id rhs) {
-    auto lsize = grammar.clades[lhs].taxa.size();
-    auto rsize = grammar.clades[rhs].taxa.size();
-    if (lsize != rsize) return lsize < rsize;
-    return lhs < rhs;
-  });
-
-  std::vector<std::vector<frontier_entry>> frontiers(grammar.clades.size());
-  for (auto clade : order) {
-    auto const& key = grammar.clades[clade];
-    if (key.taxa.size() == 1) {
-      frontiers[clade].push_back(
-          make_leaf_frontier_entry(grammar, clade, active));
-      result.frontier_sizes_by_clade[clade] = frontiers[clade].size();
-      continue;
-    }
-
-    std::unordered_map<std::vector<chart_cost>, std::size_t,
-                       chart_cost_vector_hash>
-        index_by_cost;
-    auto& entries = frontiers[clade];
-    for (auto pid : grammar.productions_by_parent[clade]) {
-      auto const& prod = grammar.productions[pid];
-      if (prod.parent != clade) {
-        throw std::runtime_error(
-            "multi-site trim: production parent mismatch during frontier "
-            "construction");
-      }
-      chart_trim_detail::validate_binary_production_for_trim(grammar, prod,
-                                                             pid);
-      auto left_child = prod.children[0];
-      auto right_child = prod.children[1];
-      if (left_child >= frontiers.size() || right_child >= frontiers.size()) {
-        throw std::runtime_error(
-            "multi-site trim: production child out of frontier range");
-      }
-      for (auto const& left : frontiers[left_child]) {
-        for (auto const& right : frontiers[right_child]) {
-          auto candidate = combine_frontier_entries(grammar, prod, pid, left,
-                                                    right, active.size());
-          if (trim_options.use_bound_pruning &&
-              pruning_upper_bound < multisite_score_inf) {
-            auto lb = lower_bound_for_entry(candidate, clade, active,
-                                            result.invariant_constant_offset,
-                                            options);
-            if (lb > pruning_upper_bound) {
-              ++result.bound_pruned;
-              continue;
-            }
-          }
-          insert_or_merge_frontier_entry(entries, index_by_cost,
-                                         std::move(candidate),
-                                         result.equality_deduplicated);
-        }
-      }
-    }
-
-    if (trim_options.max_frontier_entries_per_clade != 0 &&
-        entries.size() > trim_options.max_frontier_entries_per_clade) {
-      throw std::runtime_error(
-          "multi-site trim: frontier entry cap exceeded for clade " +
-          std::to_string(clade));
-    }
-    // Bound pruning can empty a non-root clade frontier when every topology
-    // using that clade is already provably worse than the current feasible
-    // upper bound.  Parent combinations that depend on it simply generate no
-    // candidates.  The root frontier is checked after the pass.
-    result.frontier_sizes_by_clade[clade] = entries.size();
-  }
-
-  auto const& root_frontier = frontiers[grammar.root_clade];
+  auto const& root_frontier = build.frontiers[grammar.root_clade];
   if (root_frontier.empty()) {
     throw std::runtime_error("multi-site trim: empty root frontier");
   }
 
   for (auto const& entry : root_frontier) {
-    auto score =
-        lower_bound_for_entry(entry, grammar.root_clade, active,
-                              result.invariant_constant_offset, options);
+    auto score = lower_bound_for_entry(entry, grammar.root_clade,
+                                       build.active_patterns,
+                                       result.invariant_constant_offset,
+                                       options);
     if (score < result.optimum) {
       result.optimum = score;
       std::fill(result.keep_production.begin(), result.keep_production.end(),
                 false);
     }
-    if (score == result.optimum) {
+    if (score == result.optimum && result.keep_production_exact) {
       merge_used_productions(result.keep_production, entry.used_production);
     }
   }
@@ -2048,103 +2214,41 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
   validate_multisite_inputs(grammar, patterns, options);
   validate_required_productions(grammar, trace_opts.required_productions);
   validate_multisite_trim_options_supported(trace_opts.trim_options,
-                                            "multi-site topology trace");
+                                            "multi-site topology trace",
+                                            false);
   if (!trace_opts.keep_provenance) {
     throw std::runtime_error(
         "multi-site topology trace: keep_provenance=false cannot emit "
         "concrete topologies");
   }
 
+  multisite_frontier_build_options build_options;
+  build_options.keep_provenance = true;
+  build_options.keep_used_production = false;
+  build_options.use_bound_pruning = trace_opts.trim_options.use_bound_pruning;
+  build_options.dominance_mode = trace_opts.trim_options.dominance_mode;
+  build_options.upper_bound_override =
+      trace_opts.trim_options.upper_bound_override;
+  build_options.max_frontier_entries_per_clade =
+      trace_opts.trim_options.max_frontier_entries_per_clade;
+  build_options.max_provenance_choices_per_entry =
+      trace_opts.max_provenance_choices_per_entry;
+  auto build = build_multisite_frontiers(grammar, patterns, options,
+                                         build_options,
+                                         "multi-site topology trace");
+
   multisite_topology_trace_result result;
-  auto composite = build_composite_chart_score(grammar, patterns, options);
-  result.composite_lower_bound = composite.weighted_lower_bound;
+  result.composite_lower_bound = build.composite_lower_bound;
+  result.initial_upper_bound = build.initial_upper_bound;
   result.keep_production.assign(grammar.productions.size(), false);
-  result.frontier_sizes_by_clade.assign(grammar.clades.size(), 0);
-  result.invariant_constant_offset = invariant_constant_offset(patterns, options);
+  result.frontier_sizes_by_clade = build.frontier_sizes_by_clade;
+  result.equality_deduplicated = build.equality_deduplicated;
+  result.dominance_pruned = build.dominance_pruned;
+  result.bound_pruned = build.bound_pruned;
+  result.active_pattern_count = build.active_pattern_count;
+  result.invariant_constant_offset = build.invariant_constant_offset;
 
-  auto active = build_active_pattern_info(grammar, patterns, options);
-  result.active_pattern_count = active.size();
-  result.initial_upper_bound = initial_upper_bound(grammar, patterns, active,
-                                                   options);
-  auto pruning_upper_bound = effective_pruning_upper_bound(
-      result.initial_upper_bound, trace_opts.trim_options);
-
-  std::vector<clade_id> order(grammar.clades.size());
-  std::iota(order.begin(), order.end(), clade_id{0});
-  std::stable_sort(order.begin(), order.end(), [&](clade_id lhs, clade_id rhs) {
-    auto lsize = grammar.clades[lhs].taxa.size();
-    auto rsize = grammar.clades[rhs].taxa.size();
-    if (lsize != rsize) return lsize < rsize;
-    return lhs < rhs;
-  });
-
-  std::vector<std::vector<frontier_entry>> frontiers(grammar.clades.size());
-  for (auto clade : order) {
-    auto const& key = grammar.clades[clade];
-    if (key.taxa.size() == 1) {
-      frontiers[clade].push_back(
-          make_leaf_frontier_entry(grammar, clade, active));
-      result.frontier_sizes_by_clade[clade] = frontiers[clade].size();
-      continue;
-    }
-
-    std::unordered_map<std::vector<chart_cost>, std::size_t,
-                       chart_cost_vector_hash>
-        index_by_cost;
-    auto& entries = frontiers[clade];
-    for (auto pid : grammar.productions_by_parent[clade]) {
-      auto const& prod = grammar.productions[pid];
-      if (prod.parent != clade) {
-        throw std::runtime_error(
-            "multi-site topology trace: production parent mismatch during "
-            "frontier construction");
-      }
-      chart_trim_detail::validate_binary_production_for_trim(grammar, prod,
-                                                             pid);
-      auto left_child = prod.children[0];
-      auto right_child = prod.children[1];
-      if (left_child >= frontiers.size() || right_child >= frontiers.size()) {
-        throw std::runtime_error(
-            "multi-site topology trace: production child out of frontier "
-            "range");
-      }
-      for (std::size_t left_index = 0;
-           left_index < frontiers[left_child].size(); ++left_index) {
-        auto const& left = frontiers[left_child][left_index];
-        for (std::size_t right_index = 0;
-             right_index < frontiers[right_child].size(); ++right_index) {
-          auto const& right = frontiers[right_child][right_index];
-          auto candidate = combine_frontier_entries(grammar, prod, pid, left,
-                                                    right, active.size());
-          candidate.provenance.push_back(frontier_provenance_choice{
-              pid, left_index, right_index});
-          if (trace_opts.trim_options.use_bound_pruning &&
-              pruning_upper_bound < multisite_score_inf) {
-            auto lb = lower_bound_for_entry(candidate, clade, active,
-                                            result.invariant_constant_offset,
-                                            options);
-            if (lb > pruning_upper_bound) {
-              ++result.bound_pruned;
-              continue;
-            }
-          }
-          insert_or_merge_frontier_entry(
-              entries, index_by_cost, std::move(candidate),
-              result.equality_deduplicated,
-              trace_opts.max_provenance_choices_per_entry);
-        }
-      }
-    }
-
-    if (trace_opts.trim_options.max_frontier_entries_per_clade != 0 &&
-        entries.size() > trace_opts.trim_options.max_frontier_entries_per_clade) {
-      throw std::runtime_error(
-          "multi-site topology trace: frontier entry cap exceeded for clade " +
-          std::to_string(clade));
-    }
-    result.frontier_sizes_by_clade[clade] = entries.size();
-  }
-
+  auto const& frontiers = build.frontiers;
   auto const& root_frontier = frontiers[grammar.root_clade];
   if (root_frontier.empty()) {
     throw std::runtime_error("multi-site topology trace: empty root frontier");
@@ -2154,7 +2258,8 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
   for (std::size_t entry_index = 0; entry_index < root_frontier.size();
        ++entry_index) {
     auto score = lower_bound_for_entry(root_frontier[entry_index],
-                                       grammar.root_clade, active,
+                                       grammar.root_clade,
+                                       build.active_patterns,
                                        result.invariant_constant_offset,
                                        options);
     if (score < result.optimum) {
