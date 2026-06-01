@@ -715,8 +715,56 @@ struct frontier_entry {
   std::vector<frontier_provenance_choice> provenance;
 };
 
+enum class multisite_keep_mask_kind {
+  none,
+  exact_optimal_production_union,
+  score_only_not_exact,
+};
+
+inline char const* multisite_keep_mask_kind_name(
+    multisite_keep_mask_kind kind) {
+  switch (kind) {
+    case multisite_keep_mask_kind::none:
+      return "none";
+    case multisite_keep_mask_kind::exact_optimal_production_union:
+      return "exact_optimal_production_union";
+    case multisite_keep_mask_kind::score_only_not_exact:
+      return "score_only_not_exact";
+  }
+  return "unknown";
+}
+
+enum class multisite_dominance_mode {
+  off,
+  score_only,
+  strict_mask_safe,
+  two_pass_exact_mask,
+  provenance_preserving,
+};
+
+inline char const* multisite_dominance_mode_name(
+    multisite_dominance_mode mode) {
+  switch (mode) {
+    case multisite_dominance_mode::off:
+      return "off";
+    case multisite_dominance_mode::score_only:
+      return "score-only";
+    case multisite_dominance_mode::strict_mask_safe:
+      return "strict-mask-safe";
+    case multisite_dominance_mode::two_pass_exact_mask:
+      return "two-pass-exact-mask";
+    case multisite_dominance_mode::provenance_preserving:
+      return "provenance-preserving";
+  }
+  return "unknown";
+}
+
 struct multisite_trim_options {
   bool use_bound_pruning = true;
+  multisite_dominance_mode dominance_mode = multisite_dominance_mode::off;
+  bool require_exact_keep_mask = true;
+  std::optional<std::uint64_t> upper_bound_override;
+  std::optional<std::uint64_t> known_exact_optimum;
 
   // 0 means unlimited.
   std::size_t max_frontier_entries_per_clade = 0;
@@ -728,10 +776,16 @@ struct multisite_trim_result {
   std::uint64_t initial_upper_bound = multisite_score_inf;
   std::vector<bool> keep_production;
   std::vector<std::size_t> frontier_sizes_by_clade;
-  // Reserved for future exact, provenance-preserving dominance pruning. The
-  // public Phase-5 trim path currently leaves this at zero so keep_production
-  // remains an exact optimal-production mask.
+  multisite_dominance_mode dominance_mode = multisite_dominance_mode::off;
+  multisite_keep_mask_kind keep_mask_kind =
+      multisite_keep_mask_kind::exact_optimal_production_union;
+  bool keep_production_exact = true;
+  std::size_t dominance_candidates_considered = 0;
+  std::size_t dominance_pruned_score_pass = 0;
+  std::size_t dominance_pruned_mask_pass = 0;
+  // Legacy/total alias: score-pass plus mask-pass dominance pruning.
   std::size_t dominance_pruned = 0;
+  std::size_t exact_mask_recovery_passes = 0;
   std::size_t bound_pruned = 0;
   std::size_t equality_deduplicated = 0;
   std::size_t active_pattern_count = 0;
@@ -1692,6 +1746,49 @@ inline void validate_required_productions(
   }
 }
 
+inline void validate_multisite_trim_options_supported(
+    multisite_trim_options const& trim_options, std::string const& context) {
+  if (trim_options.dominance_mode != multisite_dominance_mode::off) {
+    throw std::runtime_error(
+        context + ": dominance mode '" +
+        multisite_dominance_mode_name(trim_options.dominance_mode) +
+        "' is not implemented in this public trim path yet; dominance is "
+        "currently disabled, use off");
+  }
+}
+
+inline multisite_keep_mask_kind keep_mask_kind_for_options(
+    multisite_trim_options const& trim_options) {
+  if (!trim_options.require_exact_keep_mask) {
+    return multisite_keep_mask_kind::score_only_not_exact;
+  }
+  return multisite_keep_mask_kind::exact_optimal_production_union;
+}
+
+inline std::uint64_t effective_pruning_upper_bound(
+    std::uint64_t initial_upper_bound,
+    multisite_trim_options const& trim_options) {
+  if (trim_options.upper_bound_override) {
+    return *trim_options.upper_bound_override;
+  }
+  return initial_upper_bound;
+}
+
+inline void validate_known_exact_optimum(
+    std::uint64_t computed_root_optimum,
+    multisite_trim_options const& trim_options, std::string const& context) {
+  if (!trim_options.known_exact_optimum) return;
+  if (computed_root_optimum == *trim_options.known_exact_optimum) return;
+  throw std::runtime_error(
+      context + ": known_exact_optimum validation failed: computed root "
+      "optimum " +
+      std::to_string(computed_root_optimum) +
+      " differs from known_exact_optimum " +
+      std::to_string(*trim_options.known_exact_optimum) +
+      "; upper_bound_override is pruning-only and is not evidence of "
+      "exactness");
+}
+
 inline void validate_multisite_inputs(clade_grammar const& grammar,
                                       site_pattern_set const& patterns,
                                       chart_options const& options) {
@@ -1815,8 +1912,14 @@ inline multisite_trim_result build_multisite_trim(
     multisite_trim_options const& trim_options = {}) {
   using namespace chart_multisite_detail;
   validate_multisite_inputs(grammar, patterns, options);
+  validate_multisite_trim_options_supported(trim_options, "multi-site trim");
 
   multisite_trim_result result;
+  result.dominance_mode = trim_options.dominance_mode;
+  result.keep_mask_kind = keep_mask_kind_for_options(trim_options);
+  result.keep_production_exact =
+      result.keep_mask_kind ==
+      multisite_keep_mask_kind::exact_optimal_production_union;
   auto composite = build_composite_chart_score(grammar, patterns, options);
   result.composite_lower_bound = composite.weighted_lower_bound;
   result.keep_production.assign(grammar.productions.size(), false);
@@ -1828,6 +1931,8 @@ inline multisite_trim_result build_multisite_trim(
   result.active_pattern_count = active.size();
   result.initial_upper_bound =
       initial_upper_bound(grammar, patterns, active, options);
+  auto pruning_upper_bound =
+      effective_pruning_upper_bound(result.initial_upper_bound, trim_options);
 
   std::vector<clade_id> order(grammar.clades.size());
   std::iota(order.begin(), order.end(), clade_id{0});
@@ -1872,11 +1977,11 @@ inline multisite_trim_result build_multisite_trim(
           auto candidate = combine_frontier_entries(grammar, prod, pid, left,
                                                     right, active.size());
           if (trim_options.use_bound_pruning &&
-              result.initial_upper_bound < multisite_score_inf) {
+              pruning_upper_bound < multisite_score_inf) {
             auto lb = lower_bound_for_entry(candidate, clade, active,
                                             result.invariant_constant_offset,
                                             options);
-            if (lb > result.initial_upper_bound) {
+            if (lb > pruning_upper_bound) {
               ++result.bound_pruned;
               continue;
             }
@@ -1919,6 +2024,10 @@ inline multisite_trim_result build_multisite_trim(
       merge_used_productions(result.keep_production, entry.used_production);
     }
   }
+  validate_known_exact_optimum(result.optimum, trim_options,
+                               "multi-site trim");
+  result.dominance_pruned = result.dominance_pruned_score_pass +
+                            result.dominance_pruned_mask_pass;
   return result;
 }
 
@@ -1938,6 +2047,8 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
   using namespace chart_multisite_detail;
   validate_multisite_inputs(grammar, patterns, options);
   validate_required_productions(grammar, trace_opts.required_productions);
+  validate_multisite_trim_options_supported(trace_opts.trim_options,
+                                            "multi-site topology trace");
   if (!trace_opts.keep_provenance) {
     throw std::runtime_error(
         "multi-site topology trace: keep_provenance=false cannot emit "
@@ -1955,6 +2066,8 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
   result.active_pattern_count = active.size();
   result.initial_upper_bound = initial_upper_bound(grammar, patterns, active,
                                                    options);
+  auto pruning_upper_bound = effective_pruning_upper_bound(
+      result.initial_upper_bound, trace_opts.trim_options);
 
   std::vector<clade_id> order(grammar.clades.size());
   std::iota(order.begin(), order.end(), clade_id{0});
@@ -2006,11 +2119,11 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
           candidate.provenance.push_back(frontier_provenance_choice{
               pid, left_index, right_index});
           if (trace_opts.trim_options.use_bound_pruning &&
-              result.initial_upper_bound < multisite_score_inf) {
+              pruning_upper_bound < multisite_score_inf) {
             auto lb = lower_bound_for_entry(candidate, clade, active,
                                             result.invariant_constant_offset,
                                             options);
-            if (lb > result.initial_upper_bound) {
+            if (lb > pruning_upper_bound) {
               ++result.bound_pruned;
               continue;
             }
@@ -2055,6 +2168,8 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
     throw std::runtime_error(
         "multi-site topology trace: no finite optimal topology");
   }
+  validate_known_exact_optimum(result.optimum, trace_opts.trim_options,
+                               "multi-site topology trace");
 
   std::sort(optimal_root_entries.begin(), optimal_root_entries.end(),
             [&](std::size_t lhs, std::size_t rhs) {

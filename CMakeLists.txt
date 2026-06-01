@@ -362,10 +362,17 @@ add_test(NAME dagutil_wric_phase9_chart_bnb_trim
                  --wric-polytomy-mode expand-bounded
                  --wric-polytomy-max-shapes 1
                  --chart-bnb-trim
+                 --chart-bnb-dominance off
                  --chart-bnb-max-frontier 1000
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(dagutil_wric_phase9_chart_bnb_trim
-                     PROPERTIES PASS_REGULAR_EXPRESSION "chart_bnb_trim:")
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "keep_mask_kind: exact_optimal_production_union")
+
+add_test(NAME dagutil_wric_phase9_chart_bnb_phase0_labels
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-dominance off --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_mode: off' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'keep_mask_kind: exact_optimal_production_union' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'keep_production_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'kept_productions_count_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_candidates_considered: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_pruned_score_pass: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_pruned_mask_pass: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_pruned: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'exact_mask_recovery_passes: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && \"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-dominance off --chart-bnb-score-only --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\" && grep -q 'keep_mask_kind: score_only_not_exact' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\" && grep -q 'keep_production_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\" && grep -q 'kept_productions_count_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\""
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_chart_spr_helper_benchmark
          COMMAND dagutil

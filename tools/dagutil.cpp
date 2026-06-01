@@ -1197,6 +1197,13 @@ Analysis:
                           (omit for no cap; if supplied, must be positive)
   --chart-bnb-no-bound-pruning
                           Disable B&B lower-bound pruning for diagnostics
+  --chart-bnb-dominance <M>
+                          B&B dominance mode: off (default), score-only,
+                          strict-mask-safe, two-pass-exact-mask, or
+                          provenance-preserving. Phase-0 diagnostics support
+                          off; other modes fail clearly until implemented.
+  --chart-bnb-score-only  Report the B&B result as score-only/non-exact-mask
+                          instead of requiring an exact keep-production mask
   --chart-spr-helper-benchmark
                           Benchmark legacy chart-SPR helper costs and counters
                           (diagnostic/oracle path; not production search)
@@ -1354,6 +1361,9 @@ struct args {
   std::size_t chart_entry_limit = 20;
   std::size_t chart_bnb_max_frontier = 0;
   bool chart_bnb_no_bound_pruning = false;
+  multisite_dominance_mode chart_bnb_dominance =
+      multisite_dominance_mode::off;
+  bool chart_bnb_score_only = false;
   bool chart_spr_helper_benchmark = false;
   std::size_t chart_spr_helper_benchmark_max_candidates = 16;
   bool chart_spr_candidates = false;
@@ -1436,6 +1446,26 @@ parse_chart_spr_candidate_selection_mode(std::string_view text) {
   if (text == "randomized" || text == "sampled" ||
       text == "sampled-or-randomized" || text == "sampled_or_randomized") {
     return chart_spr_candidate_selection_mode::sampled_or_randomized;
+  }
+  return std::nullopt;
+}
+
+static std::optional<multisite_dominance_mode>
+parse_multisite_dominance_mode(std::string_view text) {
+  if (text == "off") return multisite_dominance_mode::off;
+  if (text == "score-only" || text == "score_only") {
+    return multisite_dominance_mode::score_only;
+  }
+  if (text == "strict-mask-safe" || text == "strict_mask_safe") {
+    return multisite_dominance_mode::strict_mask_safe;
+  }
+  if (text == "two-pass-exact-mask" ||
+      text == "two_pass_exact_mask") {
+    return multisite_dominance_mode::two_pass_exact_mask;
+  }
+  if (text == "provenance-preserving" ||
+      text == "provenance_preserving") {
+    return multisite_dominance_mode::provenance_preserving;
   }
   return std::nullopt;
 }
@@ -1674,6 +1704,17 @@ static args parse_args(int argc, char** argv) {
           next(), "--chart-bnb-max-frontier");
     } else if (arg == "--chart-bnb-no-bound-pruning") {
       a.chart_bnb_no_bound_pruning = true;
+    } else if (arg == "--chart-bnb-dominance") {
+      auto value = next();
+      auto mode = parse_multisite_dominance_mode(value);
+      if (!mode) {
+        std::cerr << "error: unknown --chart-bnb-dominance '" << value
+                  << "'\n";
+        std::exit(1);
+      }
+      a.chart_bnb_dominance = *mode;
+    } else if (arg == "--chart-bnb-score-only") {
+      a.chart_bnb_score_only = true;
     } else if (arg == "--chart-spr-helper-benchmark") {
       a.chart_spr_helper_benchmark = true;
     } else if (arg == "--chart-spr-helper-benchmark-max-candidates") {
@@ -1900,6 +1941,15 @@ static args parse_args(int argc, char** argv) {
   if (a.seed) a.chart_spr_enumeration.seed = *a.seed;
 
   return a;
+}
+
+static multisite_trim_options make_chart_bnb_trim_options(args const& a) {
+  multisite_trim_options trim_opts;
+  trim_opts.use_bound_pruning = !a.chart_bnb_no_bound_pruning;
+  trim_opts.dominance_mode = a.chart_bnb_dominance;
+  trim_opts.require_exact_keep_mask = !a.chart_bnb_score_only;
+  trim_opts.max_frontier_entries_per_clade = a.chart_bnb_max_frontier;
+  return trim_opts;
 }
 
 static std::size_t saturating_size_add(std::size_t lhs, std::size_t rhs) {
@@ -2151,9 +2201,7 @@ static void print_binary_refinement_performance_benchmark(
     return;
   }
 
-  multisite_trim_options trim_opts;
-  trim_opts.use_bound_pruning = !a.chart_bnb_no_bound_pruning;
-  trim_opts.max_frontier_entries_per_clade = a.chart_bnb_max_frontier;
+  auto trim_opts = make_chart_bnb_trim_options(a);
   try {
     auto bnb_start = std::chrono::steady_clock::now();
     auto trim = build_multisite_trim(grammar, patterns, chart_opts, trim_opts);
@@ -2165,10 +2213,30 @@ static void print_binary_refinement_performance_benchmark(
     out << child << "active_patterns: " << trim.active_pattern_count << "\n";
     out << child << "equality_deduplicated: "
         << trim.equality_deduplicated << "\n";
+    out << child << "dominance_mode: "
+        << multisite_dominance_mode_name(trim.dominance_mode) << "\n";
+    out << child << "keep_mask_kind: "
+        << multisite_keep_mask_kind_name(trim.keep_mask_kind) << "\n";
+    out << child << "keep_production_exact: "
+        << (trim.keep_production_exact ? "true" : "false") << "\n";
+    out << child << "dominance_candidates_considered: "
+        << trim.dominance_candidates_considered << "\n";
+    out << child << "dominance_pruned_score_pass: "
+        << trim.dominance_pruned_score_pass << "\n";
+    out << child << "dominance_pruned_mask_pass: "
+        << trim.dominance_pruned_mask_pass << "\n";
     out << child << "dominance_pruned: " << trim.dominance_pruned << "\n";
+    out << child << "exact_mask_recovery_passes: "
+        << trim.exact_mask_recovery_passes << "\n";
     out << child << "bound_pruned: " << trim.bound_pruned << "\n";
     out << child << "bound_pruning: "
         << (trim_opts.use_bound_pruning ? "true" : "false") << "\n";
+    out << child << "upper_bound_override: "
+        << (trim_opts.upper_bound_override
+                ? std::to_string(*trim_opts.upper_bound_override)
+                : std::string{"none"})
+        << "\n";
+    out << child << "upper_bound_override_kind: PRUNING_ONLY\n";
     out << child << "max_frontier_entries_per_clade: "
         << trim_opts.max_frontier_entries_per_clade << "\n";
     print_named_frontier_summary(
@@ -2814,9 +2882,7 @@ static chart_spr_search_options make_chart_spr_search_options(
   options.rebuild_after_accept = !a.chart_spr_local_accept_updates;
   options.seed = a.seed.value_or(options.seed);
   options.chart.score_ua_edge = a.chart_score_ua_edge;
-  options.exact_trim.use_bound_pruning = !a.chart_bnb_no_bound_pruning;
-  options.exact_trim.max_frontier_entries_per_clade =
-      a.chart_bnb_max_frontier;
+  options.exact_trim = make_chart_bnb_trim_options(a);
   return options;
 }
 
@@ -3595,9 +3661,7 @@ int main(int argc, char** argv) try {
     auto& patterns = get_exact_patterns();
     chart_options chart_opts;
     chart_opts.score_ua_edge = a.chart_score_ua_edge;
-    multisite_trim_options trim_opts;
-    trim_opts.use_bound_pruning = !a.chart_bnb_no_bound_pruning;
-    trim_opts.max_frontier_entries_per_clade = a.chart_bnb_max_frontier;
+    auto trim_opts = make_chart_bnb_trim_options(a);
 
     auto bnb_start = std::chrono::steady_clock::now();
     auto trim = build_multisite_trim(grammar, patterns, chart_opts, trim_opts);
@@ -3623,14 +3687,36 @@ int main(int argc, char** argv) try {
               << trim.invariant_constant_offset << "\n";
     std::cout << "  kept_productions: " << count_true(trim.keep_production)
               << "\n";
+    std::cout << "  kept_productions_count_exact: "
+              << (trim.keep_production_exact ? "true" : "false") << "\n";
     std::cout << "  total_productions: " << grammar.productions.size()
               << "\n";
     std::cout << "  equality_deduplicated: "
               << trim.equality_deduplicated << "\n";
+    std::cout << "  dominance_mode: "
+              << multisite_dominance_mode_name(trim.dominance_mode) << "\n";
+    std::cout << "  keep_mask_kind: "
+              << multisite_keep_mask_kind_name(trim.keep_mask_kind) << "\n";
+    std::cout << "  keep_production_exact: "
+              << (trim.keep_production_exact ? "true" : "false") << "\n";
+    std::cout << "  dominance_candidates_considered: "
+              << trim.dominance_candidates_considered << "\n";
+    std::cout << "  dominance_pruned_score_pass: "
+              << trim.dominance_pruned_score_pass << "\n";
+    std::cout << "  dominance_pruned_mask_pass: "
+              << trim.dominance_pruned_mask_pass << "\n";
     std::cout << "  dominance_pruned: " << trim.dominance_pruned << "\n";
+    std::cout << "  exact_mask_recovery_passes: "
+              << trim.exact_mask_recovery_passes << "\n";
     std::cout << "  bound_pruned: " << trim.bound_pruned << "\n";
     std::cout << "  bound_pruning: "
               << (trim_opts.use_bound_pruning ? "true" : "false") << "\n";
+    std::cout << "  upper_bound_override: "
+              << (trim_opts.upper_bound_override
+                      ? std::to_string(*trim_opts.upper_bound_override)
+                      : std::string{"none"})
+              << "\n";
+    std::cout << "  upper_bound_override_kind: PRUNING_ONLY\n";
     std::cout << "  max_frontier_entries_per_clade: "
               << trim_opts.max_frontier_entries_per_clade << "\n";
     std::cout << "  grammar_build_ms: " << std::fixed

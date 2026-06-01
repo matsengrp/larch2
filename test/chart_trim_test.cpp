@@ -201,6 +201,15 @@ static bool throws_runtime_error(auto&& f) {
   return false;
 }
 
+static std::string runtime_error_message(auto&& f) {
+  try {
+    f();
+  } catch (std::runtime_error const& e) {
+    return e.what();
+  }
+  return {};
+}
+
 using row_t = std::array<larch::chart_cost, larch::nuc_state_count>;
 
 static larch::chart_cost brute_add(larch::chart_cost lhs,
@@ -641,6 +650,78 @@ static void test_multisite_composite_counterexample() {
   std::println("  PASS");
 }
 
+static void test_multisite_phase0_diagnostics_and_exactness_labels() {
+  std::println("test_multisite_phase0_diagnostics_and_exactness_labels");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", paper_tree1_spec()));
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", paper_tree2_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto patterns = larch::build_site_patterns(merged, grammar);
+  auto brute = larch::brute_force_multisite_topologies(grammar, patterns);
+
+  auto bnb = larch::build_multisite_trim(grammar, patterns);
+  CHECK(bnb.optimum == brute.optimum);
+  CHECK(bnb.keep_production == brute.keep_production);
+  CHECK(bnb.dominance_mode == larch::multisite_dominance_mode::off);
+  CHECK(bnb.keep_mask_kind ==
+        larch::multisite_keep_mask_kind::exact_optimal_production_union);
+  CHECK(bnb.keep_production_exact);
+  CHECK(bnb.dominance_candidates_considered == 0);
+  CHECK(bnb.dominance_pruned_score_pass == 0);
+  CHECK(bnb.dominance_pruned_mask_pass == 0);
+  CHECK(bnb.dominance_pruned == 0);
+  CHECK(bnb.dominance_pruned == bnb.dominance_pruned_score_pass +
+                                    bnb.dominance_pruned_mask_pass);
+  CHECK(bnb.exact_mask_recovery_passes == 0);
+
+  larch::multisite_trim_options score_only;
+  score_only.require_exact_keep_mask = false;
+  auto score_only_bnb =
+      larch::build_multisite_trim(grammar, patterns, {}, score_only);
+  CHECK(score_only_bnb.optimum == bnb.optimum);
+  CHECK(score_only_bnb.dominance_mode == larch::multisite_dominance_mode::off);
+  CHECK(score_only_bnb.keep_mask_kind ==
+        larch::multisite_keep_mask_kind::score_only_not_exact);
+  CHECK(!score_only_bnb.keep_production_exact);
+
+  larch::multisite_trim_options with_known = score_only;
+  with_known.require_exact_keep_mask = true;
+  with_known.upper_bound_override = bnb.optimum;
+  with_known.known_exact_optimum = bnb.optimum - 1;
+  auto known_message = runtime_error_message([&] {
+    (void)larch::build_multisite_trim(grammar, patterns, {}, with_known);
+  });
+  CHECK(known_message.find("known_exact_optimum validation failed") !=
+        std::string::npos);
+  CHECK(known_message.find("upper_bound_override is pruning-only") !=
+        std::string::npos);
+
+  larch::multisite_trim_options with_upper_override;
+  with_upper_override.upper_bound_override = bnb.optimum;
+  auto override_bnb =
+      larch::build_multisite_trim(grammar, patterns, {}, with_upper_override);
+  CHECK(override_bnb.optimum == bnb.optimum);
+  CHECK(override_bnb.initial_upper_bound == bnb.initial_upper_bound);
+  CHECK(override_bnb.keep_mask_kind ==
+        larch::multisite_keep_mask_kind::exact_optimal_production_union);
+
+  larch::multisite_trim_options unsupported;
+  unsupported.dominance_mode = larch::multisite_dominance_mode::score_only;
+  unsupported.require_exact_keep_mask = false;
+  auto dominance_message = runtime_error_message([&] {
+    (void)larch::build_multisite_trim(grammar, patterns, {}, unsupported);
+  });
+  CHECK(dominance_message.find("dominance mode 'score-only'") !=
+        std::string::npos);
+  CHECK(dominance_message.find("currently disabled") != std::string::npos);
+
+  std::println("  PASS");
+}
+
 static void test_multisite_parent_combine_fixes_child_topology() {
   std::println("test_multisite_parent_combine_fixes_child_topology");
 
@@ -956,6 +1037,7 @@ int main() {
   test_single_tree_keeps_all_productions();
   test_reference_edge_outside_boundary();
   test_multisite_composite_counterexample();
+  test_multisite_phase0_diagnostics_and_exactness_labels();
   test_multisite_parent_combine_fixes_child_topology();
   test_multisite_concordant_sites_equal_lower_bound();
   test_multisite_invariant_sites_and_reference_edge_constant();
