@@ -19,6 +19,10 @@
 #include <larch/overlay_spr.hpp>
 #include <larch/thread_pool.hpp>
 #include <larch/version.hpp>
+#include <larch/polytomy_refinement.hpp>
+#include <larch/site_patterns.hpp>
+#include <larch/chart_trim.hpp>
+#include <larch/chart_bnb_trim_apply.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -32,6 +36,7 @@
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -267,12 +272,33 @@ Diverse tree extraction:
 
 Post-processing:
   --trim                  Trim result to minimum-parsimony trees
-                          (parsimony sampling only)
+                          (parsimony sampling only unless --trim-mode chart-bnb)
+  --trim-mode <M>         parsimony (default) or chart-bnb. chart-bnb runs the
+                          chart B&B trim/apply path for the selected/refined
+                          grammar; refinement exactness is reported.
+  --chart-bnb-trim        Alias for --trim-mode chart-bnb
+  --chart-bnb-trim-application <M>
+                          production-mask or optimal-topology-materialize.
+                          Default auto-selects production-mask when witness-safe
+                          and otherwise materializes optimal topologies.
+  --chart-bnb-max-frontier <N>
+                          Fail if any B&B clade frontier exceeds N entries
+  --chart-bnb-max-exact-topologies <N>
+                          Cap optimal topology materialization; 0 = unlimited
+  --wric-polytomy-mode <M>
+                          reject, audit-kary, expand-exact, or expand-bounded
+                          (chart-bnb default: expand-bounded)
+  --wric-polytomy-max-shapes <N>
+                          Bounded soft-polytomy shape cap for chart-bnb trim
+                          (chart-bnb default: 1; raise for broader bounded
+                          refined grammars)
 
 Convergence notes:
   --patience tracks the active sampling objective (ML NLL, edge_weight, RF,
-  or parsimony).  --drift, --trim, and --diverse-sample currently require
-  --sample-method parsimony.
+  or parsimony).  --drift and --diverse-sample currently require
+  --sample-method parsimony.  Legacy --trim requires parsimony sampling;
+  --trim-mode chart-bnb is a chart-B&B parsimony post-processing output mode
+  whose refinement exactness is reported.
 
 Debugging:
   --validate              Validate DAG invariants at key pipeline points
@@ -285,6 +311,8 @@ Other:
 // Drift-escape mechanism: "auto" preserves the pre-combiner dispatch
 // (inplace if --inplace-steps > 0, else legacy).
 enum class drift_mode_t { auto_, legacy, inplace, combine, combine_lwf };
+
+enum class trim_mode_t { parsimony, chart_bnb };
 
 struct args {
   std::string dag_pb;
@@ -300,6 +328,18 @@ struct args {
   std::optional<std::uint32_t> seed;
   bool sample_per_radius = false;
   bool trim = false;
+  trim_mode_t trim_mode = trim_mode_t::parsimony;
+  bool chart_bnb_trim_application_explicit = false;
+  chart_bnb_trim_application_mode chart_bnb_application_mode =
+      chart_bnb_trim_application_mode::production_mask_superset;
+  std::size_t chart_bnb_max_frontier = 0;
+  std::optional<std::size_t> chart_bnb_max_exact_topologies;
+  polytomy_refinement_options chart_bnb_polytomy_opts = [] {
+    polytomy_refinement_options opts;
+    opts.mode = polytomy_mode::expand_soft_bounded;
+    opts.max_shapes_per_polytomy = 1;
+    return opts;
+  }();
   std::string sample_method_text = "parsimony";
   sample_method sampling_method = sample_method::parsimony;
   bool sample_uniformly = false;
@@ -357,6 +397,105 @@ static bool has_active_ml_scoring_path(args const& a) {
          (a.log_metrics && has_complete_model_args(a));
 }
 
+static char const* trim_mode_name(trim_mode_t mode) {
+  switch (mode) {
+    case trim_mode_t::parsimony:
+      return "parsimony";
+    case trim_mode_t::chart_bnb:
+      return "chart-bnb";
+  }
+  return "unknown";
+}
+
+static char const* larch2_polytomy_mode_name(polytomy_mode mode) {
+  switch (mode) {
+    case polytomy_mode::reject:
+      return "reject";
+    case polytomy_mode::audit_kary:
+      return "audit-kary";
+    case polytomy_mode::expand_soft_exact_or_fail:
+      return "expand-exact";
+    case polytomy_mode::expand_soft_bounded:
+      return "expand-bounded";
+  }
+  return "unknown";
+}
+
+static std::optional<trim_mode_t> parse_trim_mode(std::string_view text) {
+  if (text == "parsimony" || text == "legacy") return trim_mode_t::parsimony;
+  if (text == "chart-bnb" || text == "chart_bnb") {
+    return trim_mode_t::chart_bnb;
+  }
+  return std::nullopt;
+}
+
+static std::optional<polytomy_mode> parse_larch2_polytomy_mode(
+    std::string_view text) {
+  if (text == "reject") return polytomy_mode::reject;
+  if (text == "audit-kary" || text == "audit_kary") {
+    return polytomy_mode::audit_kary;
+  }
+  if (text == "expand-exact" || text == "expand_exact" ||
+      text == "expand_soft_exact_or_fail") {
+    return polytomy_mode::expand_soft_exact_or_fail;
+  }
+  if (text == "expand-bounded" || text == "expand_bounded" ||
+      text == "expand_soft_bounded") {
+    return polytomy_mode::expand_soft_bounded;
+  }
+  return std::nullopt;
+}
+
+static std::optional<chart_bnb_trim_application_mode>
+parse_larch2_chart_bnb_application_mode(std::string_view text) {
+  if (text == "production-mask" || text == "production_mask" ||
+      text == "production-mask-superset" ||
+      text == "production_mask_superset") {
+    return chart_bnb_trim_application_mode::production_mask_superset;
+  }
+  if (text == "optimal-topology-materialize" ||
+      text == "optimal_topology_materialize" ||
+      text == "topology-materialize" || text == "topology_materialize") {
+    return chart_bnb_trim_application_mode::optimal_topology_materialize;
+  }
+  return std::nullopt;
+}
+
+static std::size_t parse_size_arg(std::string_view text,
+                                  std::string_view option_name) {
+  auto fail = [&]() -> std::size_t {
+    std::cerr << "error: " << option_name
+              << " expects an unsigned decimal integer\n";
+    std::exit(1);
+  };
+  if (text.empty()) return fail();
+  for (char c : text) {
+    if (c < '0' || c > '9') return fail();
+  }
+  try {
+    std::size_t pos = 0;
+    auto value = std::stoull(std::string{text}, &pos, 10);
+    if (pos != text.size()) throw std::invalid_argument("trailing");
+    if (value > static_cast<unsigned long long>(
+                    std::numeric_limits<std::size_t>::max())) {
+      throw std::out_of_range("size_t");
+    }
+    return static_cast<std::size_t>(value);
+  } catch (std::exception const&) {
+    return fail();
+  }
+}
+
+static bool refinement_has_synthetic_polytomy_productions(
+    polytomy_refinement_result const& refinement) {
+  for (auto const& info : refinement.production_info) {
+    if (refined_production_has_synthetic_polytomy_provenance(info)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static void validate_args(args& a) {
   auto parsed_method = parse_sample_method(a.sample_method_text, true);
   if (!parsed_method) {
@@ -371,15 +510,23 @@ static void validate_args(args& a) {
                  "together\n";
     std::exit(1);
   }
-  if (a.trim && a.sampling_method != sample_method::parsimony) {
-    std::cerr << "error: --trim currently supports only --sample-method "
-                 "parsimony; omit --sample-method or run non-parsimony "
-                 "sampling without --trim\n";
+  if (a.trim && a.trim_mode == trim_mode_t::parsimony &&
+      a.sampling_method != sample_method::parsimony) {
+    std::cerr << "error: legacy --trim currently supports only "
+                 "--sample-method parsimony; omit --sample-method, run "
+                 "non-parsimony sampling without --trim, or use "
+                 "--trim-mode chart-bnb for chart-B&B parsimony output\n";
     std::exit(1);
   }
   if (a.diverse_sample && a.sampling_method != sample_method::parsimony) {
     std::cerr << "error: --diverse-sample currently supports only "
                  "--sample-method parsimony\n";
+    std::exit(1);
+  }
+  if (a.diverse_sample && a.trim && a.trim_mode == trim_mode_t::chart_bnb) {
+    std::cerr << "error: --diverse-sample and --trim-mode chart-bnb/"
+                 "--chart-bnb-trim are both output modes and cannot be "
+                 "combined\n";
     std::exit(1);
   }
   if (is_ml_sample_method(a.sampling_method) && !has_complete_model_args(a)) {
@@ -493,7 +640,49 @@ static args parse_args(int argc, char** argv) {
       a.max_subtree_clade_size = std::stoull(std::string{next()});
     else if (arg == "--trim")
       a.trim = true;
-    else if (arg == "--validate")
+    else if (arg == "--trim-mode") {
+      auto value = next();
+      auto mode = parse_trim_mode(value);
+      if (!mode) {
+        std::cerr << "error: --trim-mode must be parsimony|chart-bnb\n";
+        std::exit(1);
+      }
+      a.trim_mode = *mode;
+      if (a.trim_mode == trim_mode_t::chart_bnb) a.trim = true;
+    } else if (arg == "--chart-bnb-trim") {
+      a.trim = true;
+      a.trim_mode = trim_mode_t::chart_bnb;
+    } else if (arg == "--chart-bnb-trim-application") {
+      auto value = next();
+      auto mode = parse_larch2_chart_bnb_application_mode(value);
+      if (!mode) {
+        std::cerr << "error: --chart-bnb-trim-application must be "
+                     "production-mask|optimal-topology-materialize\n";
+        std::exit(1);
+      }
+      a.chart_bnb_application_mode = *mode;
+      a.chart_bnb_trim_application_explicit = true;
+    } else if (arg == "--chart-bnb-max-frontier") {
+      a.chart_bnb_max_frontier = parse_size_arg(next(), arg);
+      if (a.chart_bnb_max_frontier == 0) {
+        std::cerr << "error: --chart-bnb-max-frontier must be positive\n";
+        std::exit(1);
+      }
+    } else if (arg == "--chart-bnb-max-exact-topologies") {
+      a.chart_bnb_max_exact_topologies = parse_size_arg(next(), arg);
+    } else if (arg == "--wric-polytomy-mode") {
+      auto value = next();
+      auto mode = parse_larch2_polytomy_mode(value);
+      if (!mode) {
+        std::cerr << "error: unknown --wric-polytomy-mode '" << value
+                  << "'\n";
+        std::exit(1);
+      }
+      a.chart_bnb_polytomy_opts.mode = *mode;
+    } else if (arg == "--wric-polytomy-max-shapes") {
+      a.chart_bnb_polytomy_opts.max_shapes_per_polytomy =
+          parse_size_arg(next(), arg);
+    } else if (arg == "--validate")
       a.validate = true;
     else if (arg == "--diverse-sample")
       a.diverse_sample = std::stoull(std::string{next()});
@@ -2344,6 +2533,194 @@ static std::vector<optimize_result> run_random(merge& m, args const& a) {
 }
 
 // ---------------------------------------------------------------------------
+// Chart B&B trim output
+// ---------------------------------------------------------------------------
+
+static char const* chart_bnb_application_exactness_label(
+    chart_bnb_trim_apply_result const& apply) {
+  if (apply.source_history_topology_exact) return "source_history_topology_exact";
+  if (apply.grammar_topology_exact) return "grammar_topology_exact";
+  if (apply.coupled_frontier_exact) return "coupled_frontier_exact";
+  if (apply.production_mask_superset) return "production_mask_superset";
+  return "unknown";
+}
+
+static void print_chart_bnb_trim_report(
+    multisite_trim_result const& trim,
+    chart_bnb_trim_apply_result const& apply,
+    polytomy_refinement_result const& refinement,
+    polytomy_refinement_options const& polytomy_opts,
+    chart_options const& chart_opts,
+    chart_bnb_trim_application_mode requested_mode, bool auto_fallback) {
+  auto kept = static_cast<std::size_t>(
+      std::count(trim.keep_production.begin(), trim.keep_production.end(),
+                 true));
+
+  std::cerr << "chart_bnb_trim:\n";
+  std::cerr << "  trim_mode: chart-bnb\n";
+  std::cerr << "  polytomy_mode: "
+            << larch2_polytomy_mode_name(polytomy_opts.mode) << "\n";
+  std::cerr << "  polytomy_max_shapes_per_polytomy: "
+            << polytomy_opts.max_shapes_per_polytomy << "\n";
+  std::cerr << "  polytomy_refinement_status: "
+            << polytomy_refinement_status_label(refinement.audit) << "\n";
+  std::cerr << "  refinement_exactness: " << apply.refinement_exactness
+            << "\n";
+  std::cerr << "  exact_bnb_objective: " << trim.optimum << "\n";
+  std::cerr << "  composite_lower_bound_kind: LOWER_BOUND\n";
+  std::cerr << "  composite_lower_bound: " << trim.composite_lower_bound
+            << "\n";
+  std::cerr << "  initial_upper_bound: " << trim.initial_upper_bound
+            << "\n";
+  std::cerr << "  score_ua_edge: "
+            << (chart_opts.score_ua_edge ? "true" : "false") << "\n";
+  std::cerr << "  active_patterns: " << trim.active_pattern_count << "\n";
+  std::cerr << "  invariant_constant_offset: "
+            << trim.invariant_constant_offset << "\n";
+  std::cerr << "  kept_productions: " << kept << "\n";
+  std::cerr << "  keep_mask_kind: "
+            << multisite_keep_mask_kind_name(trim.keep_mask_kind) << "\n";
+  std::cerr << "  keep_production_exact: "
+            << (trim.keep_production_exact ? "true" : "false") << "\n";
+  std::cerr << "  dominance_mode: "
+            << multisite_dominance_mode_name(trim.dominance_mode) << "\n";
+  std::cerr << "  trim_application_requested_mode: "
+            << chart_bnb_trim_application_mode_name(requested_mode) << "\n";
+  std::cerr << "  trim_application_auto_fallback: "
+            << (auto_fallback ? "true" : "false") << "\n";
+  std::cerr << "  trim_application_mode: "
+            << chart_bnb_trim_application_mode_name(apply.mode) << "\n";
+  std::cerr << "  trim_application_exactness: "
+            << chart_bnb_application_exactness_label(apply) << "\n";
+  std::cerr << "  production_mask_superset: "
+            << (apply.production_mask_superset ? "true" : "false") << "\n";
+  std::cerr << "  grammar_topology_exact: "
+            << (apply.grammar_topology_exact ? "true" : "false") << "\n";
+  std::cerr << "  source_history_topology_exact: "
+            << (apply.source_history_topology_exact ? "true" : "false")
+            << "\n";
+  std::cerr << "  identity_preserving_tree_set: "
+            << (apply.identity_preserving_tree_set ? "true" : "false")
+            << "\n";
+  std::cerr << "  output_contains_only_optimal_topologies: "
+            << apply.output_contains_only_optimal_topologies << "\n";
+  std::cerr << "  bnb_optimum: " << apply.bnb_optimum << "\n";
+  std::cerr << "  validated_output_parsimony_min: "
+            << apply.validated_output_parsimony_min << "\n";
+  std::cerr << "  validated_output_parsimony_min_exact: "
+            << (apply.validated_output_parsimony_min_exact ? "true" : "false")
+            << "\n";
+  std::cerr << "  validation_oracle: " << apply.validation_oracle << "\n";
+  std::cerr << "  validation_strength: " << apply.validation_strength
+            << "\n";
+  std::cerr << "  validation_status: " << apply.validation_status << "\n";
+  std::cerr << "  materialized_topologies: " << apply.materialized_topologies
+            << "\n";
+  std::cerr << "  topology_cap_truncated: "
+            << (apply.topology_cap_truncated ? "true" : "false") << "\n";
+  std::cerr << "  source_edges_removed: " << apply.source_edges_removed
+            << "\n";
+  std::cerr << "  source_nodes_removed: " << apply.source_nodes_removed
+            << "\n";
+  std::cerr << "  masked_productions_reappeared: "
+            << apply.masked_productions_reappeared << "\n";
+}
+
+static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
+    phylo_dag& result_dag, args const& a) {
+  std::cerr << "Running chart B&B trim for selected/refined grammar...\n";
+
+  auto grammar_start = std::chrono::steady_clock::now();
+  clade_grammar_options grammar_opts;
+  auto refinement = build_polytomy_refined_clade_grammar(
+      result_dag, grammar_opts, a.chart_bnb_polytomy_opts);
+  auto grammar_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - grammar_start)
+                        .count();
+  require_polytomy_refinement_binary_charting(
+      refinement.audit,
+      "larch2 --trim-mode chart-bnb (use --wric-polytomy-mode "
+      "expand-exact or expand-bounded for soft polytomies)");
+
+  auto pattern_start = std::chrono::steady_clock::now();
+  site_pattern_options pattern_opts;
+  auto patterns = build_site_patterns(result_dag, refinement.grammar,
+                                      pattern_opts);
+  auto pattern_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - pattern_start)
+                        .count();
+
+  chart_options chart_opts;
+  // Match larch2's legacy parsimony-trim objective, which includes the
+  // UA/reference edge.  dagutil keeps this as an explicit diagnostic knob.
+  chart_opts.score_ua_edge = true;
+
+  multisite_trim_options trim_opts;
+  trim_opts.dominance_mode = multisite_dominance_mode::off;
+  trim_opts.require_exact_keep_mask = true;
+  trim_opts.max_frontier_entries_per_clade = a.chart_bnb_max_frontier;
+
+  auto bnb_start = std::chrono::steady_clock::now();
+  auto trim = build_multisite_trim(refinement.grammar, patterns, chart_opts,
+                                   trim_opts);
+  auto bnb_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - bnb_start)
+                    .count();
+
+  chart_bnb_trim_apply_options apply_opts;
+  apply_opts.mode = a.chart_bnb_application_mode;
+  apply_opts.max_exact_topologies_to_materialize =
+      a.chart_bnb_max_exact_topologies;
+
+  bool auto_fallback = false;
+  if (!a.chart_bnb_trim_application_explicit &&
+      apply_opts.mode ==
+          chart_bnb_trim_application_mode::production_mask_superset &&
+      refinement_has_synthetic_polytomy_productions(refinement)) {
+    apply_opts.mode =
+        chart_bnb_trim_application_mode::optimal_topology_materialize;
+    auto_fallback = true;
+  }
+
+  chart_bnb_trim_apply_result apply;
+  auto apply_start = std::chrono::steady_clock::now();
+  try {
+    apply = apply_chart_bnb_trim(result_dag, refinement, patterns, chart_opts,
+                                 trim, apply_opts);
+  } catch (std::runtime_error const& e) {
+    if (a.chart_bnb_trim_application_explicit ||
+        apply_opts.mode !=
+            chart_bnb_trim_application_mode::production_mask_superset) {
+      throw;
+    }
+    std::cerr << "  production-mask apply was not witness-safe (" << e.what()
+              << "); falling back to optimal-topology materialization\n";
+    apply_opts.mode =
+        chart_bnb_trim_application_mode::optimal_topology_materialize;
+    auto_fallback = true;
+    apply = apply_chart_bnb_trim(result_dag, refinement, patterns, chart_opts,
+                                 trim, apply_opts);
+  }
+  auto apply_ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - apply_start)
+                      .count();
+
+  print_chart_bnb_trim_report(trim, apply, refinement, a.chart_bnb_polytomy_opts,
+                              chart_opts, a.chart_bnb_application_mode,
+                              auto_fallback);
+  std::cerr << "  chart_grammar_build_ms: " << std::fixed
+            << std::setprecision(3) << grammar_ms << "\n";
+  std::cerr << "  pattern_build_ms: " << std::fixed << std::setprecision(3)
+            << pattern_ms << "\n";
+  std::cerr << "  bnb_trim_ms: " << std::fixed << std::setprecision(3)
+            << bnb_ms << "\n";
+  std::cerr << "  apply_trim_ms: " << std::fixed << std::setprecision(3)
+            << apply_ms << "\n";
+
+  return apply;
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -2502,7 +2879,24 @@ int main(int argc, char** argv) {
   }
 
   // ---- Output ----
-  if (a.trim) {
+  if (a.trim && a.trim_mode == trim_mode_t::chart_bnb) {
+    auto& result_dag = m.get_result();
+    try {
+      auto apply = run_chart_bnb_trim_output(result_dag, a);
+      if (!apply.output_dag_available) {
+        std::cerr << "error: --trim-mode " << trim_mode_name(a.trim_mode)
+                  << " produced a " << apply.output_artifact_kind
+                  << ", not a protobuf DAG\n";
+        return 1;
+      }
+      std::cerr << "Chart B&B trimmed: " << node_count(apply.dag)
+                << " nodes, " << edge_count(apply.dag) << " edges\n";
+      save_proto_dag(apply.dag, a.output);
+    } catch (std::exception const& e) {
+      std::cerr << "error: chart B&B trim failed: " << e.what() << "\n";
+      return 1;
+    }
+  } else if (a.trim) {
     std::cerr << "Trimming DAG to minimum-parsimony edges...\n";
     auto& result_dag = m.get_result();
     parsimony_score_ops pops;

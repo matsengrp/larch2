@@ -389,6 +389,20 @@ add_test(NAME dagutil_wric_phase9_chart_bnb_two_pass_exact_mask
                  "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-dominance two-pass-exact-mask --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'dominance_mode: two-pass-exact-mask' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'keep_mask_kind: exact_optimal_production_union' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'keep_production_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'kept_productions_count_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'exact_mask_recovery_passes: 1' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'dominance_pruned_score_pass:' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\" && grep -q 'dominance_pruned_mask_pass: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_two_pass_exact_mask.out\""
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+set(DAGUTIL_CHART_BNB_APPLY_DEFAULT_OUT
+    "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.pb.gz")
+add_test(NAME dagutil_wric_phase9_chart_bnb_apply_default_writes_dag
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-apply-trim --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 -o \"${DAGUTIL_CHART_BNB_APPLY_DEFAULT_OUT}\" > \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && test -s \"${DAGUTIL_CHART_BNB_APPLY_DEFAULT_OUT}\" && grep -q 'trim_application_requested_mode: production_mask_superset' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && grep -q 'trim_application_auto_fallback: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && grep -q 'trim_application_mode: optimal_topology_materialize' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && grep -q 'composite_lower_bound_kind: LOWER_BOUND' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && grep -q 'validated_output_parsimony_min:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && grep -q 'validation_strength:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${DAGUTIL_CHART_BNB_APPLY_DEFAULT_OUT}\" --force-no-vcf --validate > /dev/null"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+set(DAGUTIL_CHART_BNB_DIAGNOSTIC_OUTPUT_OUT
+    "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_diagnostic_without_apply.pb.gz")
+add_test(NAME dagutil_chart_bnb_output_without_apply_retains_current_output
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-max-frontier 1000 -o \"${DAGUTIL_CHART_BNB_DIAGNOSTIC_OUTPUT_OUT}\" > \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_diagnostic_without_apply.out\" && test -s \"${DAGUTIL_CHART_BNB_DIAGNOSTIC_OUTPUT_OUT}\" && grep -q 'chart_bnb_trim:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_diagnostic_without_apply.out\" && ! grep -q 'trim_application_mode:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_diagnostic_without_apply.out\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${DAGUTIL_CHART_BNB_DIAGNOSTIC_OUTPUT_OUT}\" --force-no-vcf --validate > /dev/null"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 set(DAGUTIL_CHART_BNB_APPLY_OUT
     "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_materialize.pb.gz")
 add_test(NAME dagutil_wric_phase9_chart_bnb_apply_materialize
@@ -823,6 +837,23 @@ add_test(NAME larch2_ua_flag_without_ml_warns
 set_tests_properties(larch2_ua_flag_without_ml_warns
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "warning: --ignore-ua-edge-ml/--score-ua-edge-ml has no effect")
+
+set(LARCH2_CHART_BNB_TRIM_OUT
+    "${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.pb.gz")
+add_test(NAME larch2_chart_bnb_trim_mode_writes_dag
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:larch2>\" --dag-pb data/test_5_trees/tree_0.pb.gz -n 0 --trim-mode chart-bnb --wric-polytomy-mode expand-bounded --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 -o \"${LARCH2_CHART_BNB_TRIM_OUT}\" > \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stdout\" 2> \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && test -s \"${LARCH2_CHART_BNB_TRIM_OUT}\" && grep -q 'chart_bnb_trim:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'polytomy_max_shapes_per_polytomy: 1' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'exact_bnb_objective:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'composite_lower_bound_kind: LOWER_BOUND' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'validated_output_parsimony_min:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'validation_strength:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'trim_application_auto_fallback: true' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'refinement_exactness: BOUNDED_REFINED_GRAMMAR' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${LARCH2_CHART_BNB_TRIM_OUT}\" --force-no-vcf --validate > /dev/null"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME larch2_chart_bnb_diverse_sample_rejected
+         COMMAND bash -c
+                 "! \"$<TARGET_FILE:larch2>\" --dag-pb data/test_5_trees/tree_0.pb.gz -n 0 --chart-bnb-trim --diverse-sample 1 -o \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_diverse.pb.gz\" > \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_diverse.stdout\" 2> \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_diverse.stderr\" && grep -q 'cannot be combined' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_diverse.stderr\""
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME larch2_chart_bnb_strict_unsigned_args_reject_negative
+         COMMAND bash -c
+                 "for opt in --chart-bnb-max-frontier --chart-bnb-max-exact-topologies --wric-polytomy-max-shapes; do if \"$<TARGET_FILE:larch2>\" \"$opt\" -1 -o \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_bad_size.pb.gz\" > \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_bad_size.stderr\" 2>&1; then exit 1; fi; grep -q 'unsigned decimal integer' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_bad_size.stderr\" || exit 1; done"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Tests that need liblarch (protobuf + zlib + threads) and run from source dir
 foreach(test_name merge_test merge_consistency_test subtree_weight_test

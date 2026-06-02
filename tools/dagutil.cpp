@@ -1212,9 +1212,11 @@ Analysis:
                           instead of requiring an exact keep-production mask
   --chart-bnb-apply-trim  Apply exact B&B trim results and optionally write a DAG
   --chart-bnb-trim-application <M>
-                          production-mask (default), annotated-optimal-trim
-                          (coupled frontier annotation; no protobuf DAG), or
-                          optimal-topology-materialize
+                          production-mask, annotated-optimal-trim (coupled
+                          frontier annotation; no protobuf DAG), or
+                          optimal-topology-materialize. Default auto-selects
+                          production-mask when witness-safe and otherwise
+                          materializes optimal topologies for DAG output.
   --chart-bnb-max-exact-topologies <N>
                           Cap optimal topology materialization; explicit 0
                           means unlimited (unset uses a conservative cap). For
@@ -1388,6 +1390,7 @@ struct args {
       multisite_dominance_mode::off;
   bool chart_bnb_score_only = false;
   bool chart_bnb_apply_trim = false;
+  bool chart_bnb_application_mode_explicit = false;
   chart_bnb_trim_application_mode chart_bnb_application_mode =
       chart_bnb_trim_application_mode::production_mask_superset;
   std::optional<std::size_t> chart_bnb_max_exact_topologies;
@@ -1777,6 +1780,7 @@ static args parse_args(int argc, char** argv) {
         std::exit(1);
       }
       a.chart_bnb_application_mode = *mode;
+      a.chart_bnb_application_mode_explicit = true;
     } else if (arg == "--chart-bnb-max-exact-topologies") {
       a.chart_bnb_max_exact_topologies = parse_size_token_strict(
           next(), "--chart-bnb-max-exact-topologies");
@@ -2402,6 +2406,16 @@ static bool clade_info_has_synthetic_polytomy_origin(
     refined_clade_info const& info) {
   return info.origin == refined_clade_origin::synthetic_polytomy_intermediate ||
          info.origin == refined_clade_origin::observed_and_synthetic;
+}
+
+static bool refinement_has_synthetic_polytomy_productions(
+    polytomy_refinement_result const& refinement) {
+  for (auto const& info : refinement.production_info) {
+    if (refined_production_has_synthetic_polytomy_provenance(info)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 struct frontier_size_summary {
@@ -4143,13 +4157,45 @@ int main(int argc, char** argv) try {
 
     if (a.chart_bnb_apply_trim) {
       auto apply_opts = make_chart_bnb_trim_apply_options(a);
+      auto requested_apply_mode = apply_opts.mode;
+      bool application_auto_fallback = false;
+      if (!a.chart_bnb_application_mode_explicit &&
+          apply_opts.mode ==
+              chart_bnb_trim_application_mode::production_mask_superset &&
+          refinement_has_synthetic_polytomy_productions(refinement)) {
+        apply_opts.mode =
+            chart_bnb_trim_application_mode::optimal_topology_materialize;
+        application_auto_fallback = true;
+      }
+
       auto apply_start = std::chrono::steady_clock::now();
-      auto apply = apply_chart_bnb_trim(result, refinement, patterns,
-                                        chart_opts, trim, apply_opts);
+      chart_bnb_trim_apply_result apply;
+      try {
+        apply = apply_chart_bnb_trim(result, refinement, patterns,
+                                     chart_opts, trim, apply_opts);
+      } catch (std::runtime_error const& e) {
+        if (a.chart_bnb_application_mode_explicit ||
+            apply_opts.mode !=
+                chart_bnb_trim_application_mode::production_mask_superset) {
+          throw;
+        }
+        std::cout << "  production_mask_apply_witness_safe: false\n";
+        std::cout << "  production_mask_apply_error: " << e.what() << "\n";
+        apply_opts.mode =
+            chart_bnb_trim_application_mode::optimal_topology_materialize;
+        application_auto_fallback = true;
+        apply = apply_chart_bnb_trim(result, refinement, patterns,
+                                     chart_opts, trim, apply_opts);
+      }
       auto apply_ms = elapsed_ms(apply_start,
                                  std::chrono::steady_clock::now());
       std::cout << "  apply_trim_ms: " << std::fixed << std::setprecision(3)
                 << apply_ms << "\n";
+      std::cout << "  trim_application_requested_mode: "
+                << chart_bnb_trim_application_mode_name(requested_apply_mode)
+                << "\n";
+      std::cout << "  trim_application_auto_fallback: "
+                << (application_auto_fallback ? "true" : "false") << "\n";
       print_chart_bnb_apply_result(std::cout, apply, "  ");
 
       auto output_path = !a.chart_bnb_output_dag.empty()
