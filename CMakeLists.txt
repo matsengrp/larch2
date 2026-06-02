@@ -480,6 +480,17 @@ set_tests_properties(wric_spr_search_benchmark_smoke
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "benchmark_scope: CHART_SPR_PHASE8_SEARCH_COMPARISON")
 
+add_test(NAME wric_bnb_trim_benchmark_smoke
+         COMMAND tools/wric_bnb_trim_benchmark.sh
+                 --smoke
+                 --dagutil $<TARGET_FILE:dagutil>
+                 --larch2 $<TARGET_FILE:larch2>
+                 --out-dir ${CMAKE_BINARY_DIR}/wric_bnb_trim_benchmark_smoke
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(wric_bnb_trim_benchmark_smoke
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "benchmark_scope: WRIC_BNB_TRIM_PHASE7")
+
 add_test(NAME dagutil_chart_spr_helper_benchmark_seedtree_larger_fixture
          COMMAND dagutil
                  --tree-pb data/seedtree/seedtree.pb.gz
