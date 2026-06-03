@@ -4113,8 +4113,10 @@ int main(int argc, char** argv) try {
     std::cout << "  exact_patterns: " << patterns.patterns.size() << "\n";
     std::cout << "  invariant_constant_offset: "
               << trim.invariant_constant_offset << "\n";
-    std::cout << "  kept_productions: " << count_true(trim.keep_production)
-              << "\n";
+    auto kept_productions = trim.keep_production_exact
+                                ? count_true(trim.keep_production)
+                                : std::size_t{0};
+    std::cout << "  kept_productions: " << kept_productions << "\n";
     std::cout << "  kept_productions_count_exact: "
               << (trim.keep_production_exact ? "true" : "false") << "\n";
     std::cout << "  total_productions: " << grammar.productions.size()

@@ -1252,7 +1252,6 @@ static chart_bnb_trim_apply_result apply_optimal_topology_materialize(
   result.mode = chart_bnb_trim_application_mode::optimal_topology_materialize;
   result.refinement_exactness = refinement_exactness_label(refinement.audit);
   result.bnb_optimum = trim.optimum;
-  result.kept_productions_requested = count_true(trim.keep_production);
   result.identity_preserving_tree_set = true;
   result.grammar_topology_exact = true;
   result.source_history_topology_exact = false;
@@ -1298,6 +1297,7 @@ static chart_bnb_trim_apply_result apply_optimal_topology_materialize(
   auto dag = merge_grammar_topology_trees_identity_preserving_impl(
       source, grammar, trace.topologies, options.validate_output_dag);
   result.materialized_topologies = trace.topologies.size();
+  result.kept_productions_requested = count_true(trace.keep_production);
   result.kept_productions_rebuilt = count_true(trace.keep_production);
 
   auto rebuilt = rebuild_output_grammar(dag);

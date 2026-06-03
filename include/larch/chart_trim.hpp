@@ -1312,6 +1312,13 @@ inline frontier_entry combine_frontier_entries(
   return candidate;
 }
 
+// Component-wise dominance is a score-ordering relation only.  It proves that
+// any scalar completion available to rhs can be matched no-worse by lhs, so it
+// is safe for computing the optimum.  It does not prove that rhs' productions
+// are absent from every optimal topology: rhs can tie lhs under a particular
+// outside state/context.  Exact keep_production recovery therefore needs either
+// no dominance, strict mask-safe dominance, a second exact-mask pass, or a
+// provenance-preserving representation.
 inline bool dominates(multisite_cost_function const& lhs,
                       multisite_cost_function const& rhs) {
   if (lhs.cost.size() != rhs.cost.size()) {
@@ -1324,6 +1331,12 @@ inline bool dominates(multisite_cost_function const& lhs,
   return true;
 }
 
+// Legacy provenance-merging dominance helper.  Merging a dominated entry's
+// used_production/provenance into the dominator is not a valid exact-mask
+// recovery strategy: it can over-keep productions that are never globally
+// optimal, while simply discarding the dominated entry can under-keep tied
+// outside-context optima.  Public B&B trim modes use the score-only,
+// strict-mask-safe, or two-pass helpers below instead.
 inline void apply_dominance_pruning(std::vector<frontier_entry>& entries,
                                     std::size_t& dominance_pruned) {
   std::vector<bool> remove(entries.size(), false);

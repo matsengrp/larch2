@@ -2552,6 +2552,10 @@ static void print_chart_bnb_trim_report(
     polytomy_refinement_options const& polytomy_opts,
     chart_options const& chart_opts,
     chart_bnb_trim_application_mode requested_mode, bool auto_fallback) {
+  if (!trim.keep_production_exact) {
+    throw std::runtime_error(
+        "larch2 chart-B&B trim report requires an exact keep-production mask");
+  }
   auto kept = static_cast<std::size_t>(
       std::count(trim.keep_production.begin(), trim.keep_production.end(),
                  true));

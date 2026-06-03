@@ -403,6 +403,15 @@ add_test(NAME dagutil_chart_bnb_output_without_apply_retains_current_output
                  "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-max-frontier 1000 -o \"${DAGUTIL_CHART_BNB_DIAGNOSTIC_OUTPUT_OUT}\" > \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_diagnostic_without_apply.out\" && test -s \"${DAGUTIL_CHART_BNB_DIAGNOSTIC_OUTPUT_OUT}\" && grep -q 'chart_bnb_trim:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_diagnostic_without_apply.out\" && ! grep -q 'trim_application_mode:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_diagnostic_without_apply.out\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${DAGUTIL_CHART_BNB_DIAGNOSTIC_OUTPUT_OUT}\" --force-no-vcf --validate > /dev/null"
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+set(DAGUTIL_CHART_BNB_PRODUCTION_MASK_OUT
+    "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.pb.gz")
+set(DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON
+    "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.json")
+add_test(NAME dagutil_wric_phase9_chart_bnb_apply_production_mask_labels
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_binary_four.fa --newick test/wric_binary_four.nwk --refseq test/wric_binary_four.ref --force-no-vcf --wric-polytomy-mode reject --chart-bnb-trim --chart-bnb-apply-trim --chart-bnb-trim-application production-mask --chart-bnb-max-frontier 1000 --chart-bnb-report-json \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" -o \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_OUT}\" > \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && test -s \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_OUT}\" && grep -q 'trim_application_mode: production_mask_superset' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'trim_application_auto_fallback: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'keep_production_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'production_mask_superset: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'topology_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'grammar_topology_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'source_history_topology_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'identity_preserving_tree_set: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'validation_oracle:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'validation_strength:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q '\"production_mask_superset\": true' \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" && grep -q '\"topology_exact\": false' \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" && ! grep -q '\"topology_exact\": true' \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_OUT}\" --force-no-vcf --validate > /dev/null"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 set(DAGUTIL_CHART_BNB_APPLY_OUT
     "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_materialize.pb.gz")
 add_test(NAME dagutil_wric_phase9_chart_bnb_apply_materialize
@@ -893,6 +902,14 @@ add_test(NAME no_direct_chart_spr_multisite_helpers
 
 add_test(NAME no_direct_chart_spr_root_score_detail
          COMMAND bash test/no_direct_chart_spr_root_score_detail.sh
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME no_chart_bnb_superset_topology_exact
+         COMMAND bash test/no_chart_bnb_superset_topology_exact.sh
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME no_keep_production_without_exact_check
+         COMMAND bash test/no_keep_production_without_exact_check.sh
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Vulkan compute tests
