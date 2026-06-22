@@ -887,12 +887,32 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   polytomy_refinement_test parsimony_chart_test
                   site_patterns_test chart_trim_test chart_bnb_trim_apply_test
                   chart_spr_test chart_spr_search_test plateau_test
-                  rank3_rewrite_test)
+                  rank3_rewrite_test chart_two_chart_oracle_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
     add_test(NAME ${test_name} COMMAND ${test_name}
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()
+
+# Compile-only guard for the Phase 0 counter-baseline generator
+# (tools/wric_counter_baseline.cpp).  The generator is deliberately a one-shot
+# tool, not a build target or a run-ctest: its output is a checked-in snapshot
+# and running it does a full search.  But it is easy for a renamed counter
+# field to slip through and silently break regeneration until someone runs the
+# tool by hand.  This compile-only ctest compiles the generator against the
+# current headers/liblarch on demand (EXCLUDE_FROM_ALL keeps it out of the
+# default `cmake --build` so normal builds are unaffected) so a renamed field
+# breaks CI at `ctest` time.  The binary is never executed by this test.
+add_executable(wric_counter_baseline_compile_check tools/wric_counter_baseline.cpp)
+target_link_libraries(wric_counter_baseline_compile_check PRIVATE larch)
+set_target_properties(wric_counter_baseline_compile_check
+                       PROPERTIES EXCLUDE_FROM_ALL ON)
+add_test(NAME wric_counter_baseline_compiles
+         COMMAND ${CMAKE_COMMAND}
+                 --build "${CMAKE_BINARY_DIR}"
+                 --target wric_counter_baseline_compile_check
+                 --config $<CONFIG>
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(merge_consistency_test rotaA_diagnostic_test
                      PROPERTIES SKIP_RETURN_CODE 77)
 
