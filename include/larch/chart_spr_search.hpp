@@ -84,6 +84,38 @@ struct chart_spr_search_counters {
   std::size_t reachable_temp_clades_traversed = 0;
   std::size_t reachable_temp_productions_traversed = 0;
   std::size_t reachability_full_grammar_like_passes = 0;
+
+  // Phase 4 (Work item 1+3 integration) local-commit counters.  Accepted
+  // SPR moves commit to the overlay chain + persistent inside/outside caches
+  // instead of dense-materializing per accept.  These make the cross-cutting
+  // counter contract visible: a regression to "full chart rebuild per accept"
+  // shows up as `inside_rows_recomputed_on_commit` /
+  // `outside_rows_recomputed_on_commit` recovers the whole grammar, while a
+  // regression to "dense materialize per accept" shows up as a nonzero
+  // `overlay_materializations_for_accept_materialization` (the Phase-9 path's
+  // per-accept counter, which the Phase-4 path leaves at zero).
+  //
+  // Local commits performed (only exact-gate accepts may commit locally).
+  std::size_t local_commit_accepted_moves = 0;
+  // Labelled, counted skips of accepted candidates whose tombstones do not
+  // resolve to frozen-base productions (the Phase-4 tombstone-scope gate,
+  // resolution (a) in the plan).  Distinct from an accept and never a silent
+  // no-op.
+  std::size_t local_commit_tombstone_scope_skips = 0;
+  // (pattern, clade) inside / outside row recomputations across all local
+  // commits, mirrored from the persistent caches so the contract is visible
+  // in the search counters / summary without exposing the cache objects.
+  std::size_t inside_rows_recomputed_on_commit = 0;
+  std::size_t outside_rows_recomputed_on_commit = 0;
+  // Number of times the Phase-4 self-check two-chart oracle ran after a local
+  // commit (only when verify_local_commit_two_chart_oracle_for_tests is set).
+  std::size_t local_commit_two_chart_oracle_runs = 0;
+  // Number of times the tip grammar view was refreshed from the chain for
+  // candidate generation.  This is a grammar-only materialization (no chart
+  // rescoring -- the charts come from the persistent caches); it is reported
+  // separately so it is never hidden behind `full_overlay_materializations`.
+  // Eliminating it entirely is the Phase 6/7 (Option C splice) scope.
+  std::size_t local_commit_tip_grammar_refreshes = 0;
 };
 
 // Acceptance modes describe the objective used to accept a candidate.  They
@@ -317,6 +349,14 @@ struct chart_spr_search_options {
   // pathological input DAGs.
   bool verify_local_against_full_for_tests = false;
   bool force_pattern_fingerprint_mismatch_for_tests = false;
+  // Phase 4 self-check: after every local commit, recompute BOTH the inside and
+  // the outside chart from scratch on the materialized chain (Phase 0's
+  // two-chart oracle) and assert the persistent caches agree, per Work item
+  // 3's correctness invariant.  This is the load-bearing guard against
+  // affected-set under-inclusion (the most likely silent bug).  Off by default;
+  // the Phase 4 tests enable it to satisfy the "two-chart oracle green after
+  // every accept" exit criterion without exposing the cache objects.
+  bool verify_local_commit_two_chart_oracle_for_tests = false;
   std::optional<std::uint64_t>
       override_post_materialization_rebuilt_score_for_tests;
   std::optional<std::uint64_t>
@@ -448,6 +488,13 @@ struct chart_spr_search_summary {
   std::size_t final_compaction_rebuilds = 0;
   std::size_t candidate_accepts_attempted = 0;
   std::size_t post_materialization_rejections = 0;
+  // Phase 4 local-commit visibility (mirror of the counter-contract fields so
+  // a regression to "full rebuild per accept" is visible in benchmark/CI
+  // tables without drilling into the counters struct).
+  std::size_t local_commit_accepted_moves = 0;
+  std::size_t local_commit_tombstone_scope_skips = 0;
+  std::size_t inside_rows_recomputed_on_commit = 0;
+  std::size_t outside_rows_recomputed_on_commit = 0;
   chart_spr_candidate_selection_mode candidate_selection =
       chart_spr_candidate_selection_mode::lower_bound_top_k;
   chart_spr_acceptance_mode acceptance_mode =

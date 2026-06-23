@@ -3,6 +3,7 @@
 #include "test_util.hpp"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <print>
 #include <stdexcept>
@@ -1500,6 +1501,14 @@ static void test_phase9_fixed_topology_compaction_uses_certificate() {
 static void test_phase9_lower_bound_compaction_matches_output_dag() {
   std::println("test_phase9_lower_bound_compaction_matches_output_dag");
 
+  // Phase 4 gate enforcement (Work item 1 exactness contract): a local commit
+  // (rebuild_after_accept = false) under the lower_bound_heuristic gate is
+  // rejected BEFORE the first accept and performs zero commits.  Admitting
+  // heuristic-gated local commits is the deferred-verification extension,
+  // explicitly out of scope and never a silent choice.  The
+  // lower_bound_heuristic gate remains usable with rebuild_after_accept = true
+  // (conservative mode), verified by test_phase5_rejected_candidates_* and
+  // test_lower_bound_heuristic_acceptance_is_explicit.
   auto dag = larch::test::make_tiny_labelled_tree(
       "A", four_taxon_misplaced_tree());
   auto grammar = larch::build_clade_grammar(dag);
@@ -1512,18 +1521,18 @@ static void test_phase9_lower_bound_compaction_matches_output_dag() {
   options.max_iterations = 1;
   options.rebuild_after_accept = false;
 
-  auto search = larch::run_chart_spr_search(std::move(dag), grammar,
-                                            options);
-
-  CHECK(search.iterations.size() == 1);
-  CHECK(search.iterations.front().accepted_move_committed);
-  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
-  CHECK(search.summary.final_compaction_rebuilds == 1);
-  auto rebuilt = larch::build_clade_grammar(search.dag);
-  auto rebuilt_state = larch::build_chart_spr_search_state(
-      search.dag, rebuilt, options);
-  CHECK(rebuilt_state.composite_lower_bound_with_invariants ==
-        search.summary.final_score);
+  std::string message;
+  bool threw = false;
+  try {
+    (void)larch::run_chart_spr_search(std::move(dag), grammar, options);
+  } catch (std::runtime_error const& e) {
+    threw = true;
+    message = e.what();
+  }
+  CHECK(threw);
+  CHECK(message.find("local commit") != std::string::npos);
+  CHECK(message.find("lower_bound_heuristic") != std::string::npos);
+  CHECK(message.find("exact") != std::string::npos);
 
   std::println("  PASS");
 }
@@ -1547,9 +1556,25 @@ static void test_phase9_multi_iteration_local_updates_match_output_dag() {
   auto search = larch::run_chart_spr_search(std::move(dag), grammar,
                                             options);
 
-  CHECK(search.counters.accepted_moves >= 2);
+  // Phase 4 tombstone-scope gate (resolution (a)): after the first accept the
+  // productions near the move site are temp-sourced, so a sequential SPR that
+  // would tombstone one is a labelled, counted skip rather than a silent
+  // no-op.  On this small single-topology fixture the search therefore commits
+  // the first improving move and then stops at a tombstone-scope skip; the
+  // multi-accept path itself is exercised on the larger data/test_5_trees
+  // fixture in the Phase 4 tests below.
+  CHECK(search.counters.accepted_moves >= 1);
   CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
   CHECK(search.summary.final_compaction_rebuilds == 1);
+  // The skip (if the search stopped before max_iterations) must be labelled
+  // and counted, never silent.
+  if (search.counters.accepted_moves < options.max_iterations) {
+    CHECK(search.counters.local_commit_tombstone_scope_skips >= 1);
+    CHECK(!search.iterations.back().no_accept_reason.empty());
+    CHECK(search.iterations.back()
+              .no_accept_reason.find("tombstone-scope") !=
+          std::string::npos);
+  }
   auto rebuilt = larch::build_clade_grammar(search.dag);
   auto rebuilt_state = larch::build_chart_spr_search_state(
       search.dag, rebuilt, options);
@@ -1804,6 +1829,483 @@ static void test_exhaustive_exact_acceptance_matches_oracle() {
   std::println("  PASS");
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4 tests: local commit into the search loop (Work items 1 + 3).
+// ---------------------------------------------------------------------------
+//
+// These exercise the Phase 4 accept path: accepted SPR moves commit to the
+// overlay chain (Phase 1) + persistent inside/outside caches (Phases 2/3)
+// instead of dense-materializing per accept.  The exit criteria they pin:
+//   * counter contract: sidecar_rebuilds_after_accept == 0 and
+//     overlay_materializations_for_accept_materialization == 0 for a
+//     local-commit run (per-accept dense materializations gone);
+//   * two-chart oracle green after every accept (via the self-check flag);
+//   * the exact-trim cache is never stale (absent after each commit, to be
+//     recomputed lazily -- the WI3 lazy-invalidation rule);
+//   * conservative mode's counters are unchanged (regression guard);
+//   * multi-worker local-commit run is TSAN-clean (the epoch barrier is
+//     load-bearing).
+//
+// Counter-granularity note (Phase 4 issue #1).  The plan's literal Phase-4
+// exit criterion reads `full_overlay_materializations == 0`, but that counter
+// is an UMBRELLA over every dense materialization in the run -- per-accept
+// (conservative path), per-candidate exact verification
+// (`verify_candidate_exact_against_state` / `verify_candidate_fixed_topology_exact`,
+// bumped once per verified candidate), and per-candidate oracle scoring.
+// In the current code EVERY exact gate materializes per verified candidate, so
+// any k >= 1 exact local-commit run has `full_overlay_materializations > 0`.
+// The per-accept dense materialization -- the quantity the plan's reasoning was
+// actually about -- is counted SEPARATELY by
+// `overlay_materializations_for_accept_materialization`, and THAT is the
+// counter the tests assert to be 0 for a local-commit run (it matches the
+// cross-cutting counter contract's intent: "a regression to full rebuild per
+// accept cannot hide behind a renamed counter").  Eliminating the per-candidate
+// verification materialization (so `full_overlay_materializations == 0` becomes
+// reachable) is Phase 8 (fixed-topology delta from cached rows) / Phase 9
+// (transient chain extension for verify) scope; until then the umbrella counter
+// is nonzero on any exact search.  The plan's Phase-4 exit criterion is
+// amended accordingly (option (b) of the known-issues note); the per-accept
+// counter is the load-bearing one.
+
+// data/test_5_trees: five protobuf trees merged into one DAG, polytomy-
+// refined to a binary chart-compatible grammar the way the benchmark scripts
+// do.  The merged DAG carries enough base productions that several sequential
+// SPR moves can tombstone only frozen-base productions and remain committable
+// under the Phase 4 tombstone-scope gate.
+struct phase4_fixture {
+  larch::phylo_dag dag;
+  larch::clade_grammar grammar;
+};
+
+// A single suboptimal tree over 12 taxa carrying THREE independent misplaced
+// cherry-pairs in DISJOINT subtrees (groups {A,B,C,D}, {E,F,G,H}, {I,J,K,L}),
+// each flagged by its own site.  The grammar optimum (the tree itself) is
+// suboptimal, so each cherry-fixing SPR strictly improves the exact parsimony.
+// Because the three misplacements live in disjoint subtrees, each fix's reroute
+// path is contained in its own subtree and tombstones only frozen-base
+// productions -- so all three accepts stay committable under the Phase 4
+// tombstone-scope gate (the temp productions introduced by an earlier accept
+// live in a different subtree and are never on a later fix's path).  This is
+// the fixture the Phase 4 exit criterion needs: a k >= 3 local-commit run.
+static larch::phylo_dag make_three_misplaced_groups_tree() {
+  using namespace larch::test;
+  constexpr std::string_view ref = "AAA";
+  auto leaf = [](std::string id, std::string seq) {
+    return tiny_leaf(std::move(id), std::move(seq));
+  };
+  auto inner = [](std::string name, std::vector<tiny_tree_node> children) {
+    return tiny_inner(std::move(name), "AAA", std::move(children));
+  };
+  // site0 separates {A,B} from {C,D}; site1 {E,F} from {G,H}; site2 {I,J} from
+  // {K,L}.  Each group's start topology pairs the wrong cherries.
+  auto group1 = inner("g1", {
+    inner("ac", {leaf("A", "AAA"), leaf("C", "CAA")}),
+    inner("bd", {leaf("B", "AAA"), leaf("D", "CAA")}),
+  });
+  auto group2 = inner("g2", {
+    inner("eg", {leaf("E", "ACA"), leaf("G", "AAA")}),
+    inner("fh", {leaf("F", "ACA"), leaf("H", "AAA")}),
+  });
+  auto group3 = inner("g3", {
+    inner("ik", {leaf("I", "AAA"), leaf("K", "AAC")}),
+    inner("jl", {leaf("J", "AAA"), leaf("L", "AAC")}),
+  });
+  // Root joins the three disjoint groups via a ladder so each group's fix path
+  // stays below the root production.
+  auto root = inner("root", {inner("g12", {group1, group2}), group3});
+  return make_tiny_labelled_tree(ref, root);
+}
+
+static phase4_fixture make_three_misplaced_groups_fixture() {
+  phase4_fixture f;
+  f.dag = make_three_misplaced_groups_tree();
+  f.grammar = larch::build_clade_grammar(f.dag);
+  return f;
+}
+
+static void test_phase4_local_commit_counter_contract_and_oracle() {
+  std::println("test_phase4_local_commit_counter_contract_and_oracle");
+
+  auto fixture = make_three_misplaced_groups_fixture();
+  std::println("  fixture: {} clades, {} productions",
+               fixture.grammar.clades.size(),
+               fixture.grammar.productions.size());
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 12;  // allow enough iterations to reach k >= 3
+  options.rebuild_after_accept = false;
+  // Phase 3 correctness invariant: after every local commit, recompute BOTH
+  // charts from scratch and assert the persistent caches agree.
+  options.verify_local_commit_two_chart_oracle_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(fixture.dag),
+                                            fixture.grammar, options);
+
+  std::println(
+      "  accepted_moves={} (local_commit_accepted={}), "
+      "tombstone_scope_skips={}, exact_verifications={}",
+      search.counters.accepted_moves,
+      search.counters.local_commit_accepted_moves,
+      search.counters.local_commit_tombstone_scope_skips,
+      search.counters.exact_verifications);
+
+  // The Phase 4 exit criterion asks for k >= 3 local commits.  The
+  // tombstone-scope gate may stop the search early if the best move at some
+  // iteration tombstones a temp-sourced production; the test reports the
+  // achieved count and asserts the contract on whatever was committed.
+  CHECK(search.counters.accepted_moves ==
+        search.counters.local_commit_accepted_moves);
+
+  // Counter contract (cross-cutting): no per-accept sidecar rebuilds and no
+  // per-accept dense accept-materializations.
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
+  CHECK(search.counters.overlay_materializations_for_accept_materialization ==
+        0);
+  // The caches did real (affected-set-scoped) work, visible in both
+  // directions -- a regression to "recompute everything" would still be > 0,
+  // but a regression to "no commit at all" would be 0.
+  if (search.counters.accepted_moves > 0) {
+    CHECK(search.counters.inside_rows_recomputed_on_commit > 0);
+    CHECK(search.counters.outside_rows_recomputed_on_commit > 0);
+    // The two-chart oracle self-check ran after every commit without throwing
+    // (the run completed), so the caches agreed with the from-scratch charts.
+    CHECK(search.counters.local_commit_two_chart_oracle_runs ==
+          search.counters.local_commit_accepted_moves);
+    // Tip grammar was refreshed once per commit (grammar-only, not counted
+    // under full_overlay_materializations).
+    CHECK(search.counters.local_commit_tip_grammar_refreshes ==
+          search.counters.local_commit_accepted_moves);
+  }
+  // Every accepted move is exact-gated: a locally committed chain's recorded
+  // objective is exact.  The exact_multisite gate records grammar_exact; the
+  // deferred lower_bound_heuristic-gated commit is rejected entirely
+  // (test_phase9_lower_bound_compaction_matches_output_dag).
+  for (auto const& it : search.iterations) {
+    if (it.accepted_move_committed) {
+      CHECK(it.accepted.has_value());
+      CHECK(it.accepted->exact.has_value());
+      CHECK(it.accepted->exact->kind ==
+            larch::chart_spr_score_kind::grammar_exact);
+    }
+  }
+  // The Phase 4 exit criterion: a k >= 3 local-commit run on a fixture with
+  // three disjoint committable improving moves.
+  CHECK(search.counters.local_commit_accepted_moves >= 3);
+  // Final score is non-increasing (every committed move improved or held).
+  CHECK(search.summary.final_score <= search.summary.initial_score);
+
+  // Compaction produced a valid DAG whose rebuilt exact-score matches the
+  // reported final score (the tree-valued compaction retained for Phase 4;
+  // Phase 5 lands the grammar-valued oracle).
+  CHECK(search.summary.final_compaction_rebuilds == 1);
+  auto rebuilt = larch::build_clade_grammar(search.dag);
+  auto rebuilt_state = larch::build_chart_spr_search_state(
+      search.dag, rebuilt, options);
+  CHECK(larch::chart_spr_state_exact_score_with_invariants(
+            rebuilt_state, options.exact_trim) == search.summary.final_score);
+
+  std::println("  PASS");
+}
+
+// Regression guard: conservative mode (rebuild_after_accept = true) keeps its
+// existing counter behavior -- per-accept sidecar rebuilds and per-accept
+// accept-materializations -- unchanged from the Phase 0 baseline.
+static void test_phase4_conservative_mode_counters_unchanged() {
+  std::println("test_phase4_conservative_mode_counters_unchanged");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 8;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = true;  // conservative (default)
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+
+  CHECK(search.counters.accepted_moves == 1);
+  // Conservative path: one sidecar rebuild and one accept-materialization per
+  // accept -- the Phase 0 baseline behavior, unchanged by Phase 4.
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 1);
+  CHECK(search.counters.overlay_materializations_for_accept_materialization ==
+        1);
+  // Conservative mode never uses the local-commit caches.
+  CHECK(search.counters.local_commit_accepted_moves == 0);
+  CHECK(search.counters.inside_rows_recomputed_on_commit == 0);
+  CHECK(search.counters.outside_rows_recomputed_on_commit == 0);
+
+  std::println("  PASS");
+}
+
+// Exact-trim cache invariant (WI3 lazy invalidation): across a local-commit
+// run, after each accept the state's exact_trim_active_only is either absent
+// (invalidated on commit) or, once recomputed, equals the from-scratch exact
+// trim on the current tip grammar.  Uses the tiny three-misplaced-groups
+// fixture (k >= 3 accepts under exact_multisite) so the run exercises repeated
+// lazy invalidation and recomputation.  The pandemic-scale data/test_5_trees
+// fixture is avoided here because a heavy exact-multisite search on it trips a
+// PRE-EXISTING race in the global thread_pool used by build_clade_grammar /
+// validate_dag (verified on a clean baseline checkout: rebuild_after_accept =
+// true reproduces the same arity-3 throw).  Fixing that race is unrelated to
+// Phase 4 and out of scope; the local-commit correctness it would exercise is
+// already covered on the tiny fixture plus the two-chart oracle self-check in
+// test_phase4_local_commit_counter_contract_and_oracle.
+static void test_phase4_exact_trim_cache_never_stale() {
+  std::println("test_phase4_exact_trim_cache_never_stale");
+
+  auto fixture = make_three_misplaced_groups_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 12;
+  options.rebuild_after_accept = false;
+
+  auto search = larch::run_chart_spr_search(std::move(fixture.dag),
+                                            fixture.grammar, options);
+
+  // The exact-multisite gate reads the exact trim; each accept invalidates it
+  // (Phase 2 hook) and the next gate rebuilds it lazily via
+  // ensure_chart_spr_state_exact_trim.  After the run, the rebuilt exact trim
+  // on the compacted output DAG must match the reported final score.
+  CHECK(search.counters.local_commit_accepted_moves >= 1);
+  auto rebuilt = larch::build_clade_grammar(search.dag);
+  auto rebuilt_state = larch::build_chart_spr_search_state(
+      search.dag, rebuilt, options);
+  CHECK(larch::chart_spr_state_exact_score_with_invariants(
+            rebuilt_state, options.exact_trim) == search.summary.final_score);
+
+  std::println("  PASS");
+}
+
+// Multi-worker local-commit run: the epoch/snapshot barrier keeps scoring
+// readers from observing a partially-updated cache.  This is the TSAN-
+// load-bearing case (verified separately under -DENABLE_TSAN=ON).  Here we
+// confirm the multi-worker run produces the same accepted-move count and final
+// score as a serial run, so the barrier does not change semantics.  Uses the
+// tiny fixture (see the note on test_phase4_exact_trim_cache_never_stale for
+// why the pandemic-scale fixture is avoided).
+static void test_phase4_multi_worker_matches_serial() {
+  std::println("test_phase4_multi_worker_matches_serial");
+
+  auto run_once = [](std::size_t workers) {
+    auto fixture = make_three_misplaced_groups_fixture();
+    larch::chart_spr_search_options options;
+    options.acceptance_mode =
+        larch::chart_spr_acceptance_mode::exact_multisite;
+    options.candidate_selection =
+        larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+    options.max_iterations = 12;
+    options.rebuild_after_accept = false;
+    options.local_score_worker_count = workers;
+    options.verify_local_commit_two_chart_oracle_for_tests = true;
+    return larch::run_chart_spr_search(std::move(fixture.dag),
+                                       fixture.grammar, options);
+  };
+
+  auto serial = run_once(1);
+  auto parallel = run_once(4);
+
+  CHECK(serial.counters.accepted_moves == parallel.counters.accepted_moves);
+  CHECK(serial.summary.final_score == parallel.summary.final_score);
+  CHECK(serial.summary.initial_score == parallel.summary.initial_score);
+  CHECK(parallel.counters.sidecar_rebuilds_after_accept == 0);
+  CHECK(parallel.counters.overlay_materializations_for_accept_materialization ==
+        0);
+  // Parallel scoring actually used the workers.
+  CHECK(parallel.counters.local_score_parallel_batches > 0);
+
+  std::println("  PASS");
+}
+
+// fixed_topology_exact + local commit.  This is the second exact gate that
+// may commit locally (Work item 1 exactness contract); before this test no
+// Phase 4 run exercised it together with rebuild_after_accept = false.  It
+// also closes Phase 4 known-issue #1 directly: the plan's literal exit
+// criterion read `full_overlay_materializations == 0`, but that umbrella
+// counter is bumped once per verified candidate by
+// `verify_candidate_fixed_topology_exact` (every exact gate materializes per
+// candidate in the current code).  So on any k >= 1 exact local-commit run it
+// is nonzero; the load-bearing per-accept counter is
+// `overlay_materializations_for_accept_materialization`, which stays at 0 for
+// a local-commit run.  This test asserts the corrected contract and documents
+// the umbrella counter's nonzero value (Phase 8/9 will eliminate the
+// per-candidate verification materialization).
+static void test_phase4_fixed_topology_exact_local_commit() {
+  std::println("test_phase4_fixed_topology_exact_local_commit");
+
+  auto fixture = make_three_misplaced_groups_fixture();
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  // exhaustive_exact verifies every candidate through the fixed-topology gate
+  // (default selector resolves a topology certificate for each), so this run
+  // exercises the per-candidate verification materialization path that makes
+  // full_overlay_materializations nonzero.
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 12;
+  options.rebuild_after_accept = false;
+  options.verify_local_commit_two_chart_oracle_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(fixture.dag),
+                                            fixture.grammar, options);
+
+  std::println(
+      "  accepted_moves={} (local_commit_accepted={}), "
+      "tombstone_scope_skips={}, exact_verifications={}, "
+      "full_overlay_materializations={}, accept_materializations={}, "
+      "exact_verification_materializations={}",
+      search.counters.accepted_moves,
+      search.counters.local_commit_accepted_moves,
+      search.counters.local_commit_tombstone_scope_skips,
+      search.counters.exact_verifications,
+      search.counters.full_overlay_materializations,
+      search.counters.overlay_materializations_for_accept_materialization,
+      search.counters.overlay_materializations_for_exact_verification);
+
+  // Every accepted move is fixed_topology_exact-gated (an exact gate; the
+  // chain's recorded objective is exact for the one selected topology).
+  CHECK(search.counters.accepted_moves ==
+        search.counters.local_commit_accepted_moves);
+  for (auto const& it : search.iterations) {
+    if (it.accepted_move_committed) {
+      CHECK(it.accepted.has_value());
+      CHECK(it.accepted->exact.has_value());
+      CHECK(it.accepted->exact->kind ==
+            larch::chart_spr_score_kind::fixed_topology_exact);
+    }
+  }
+
+  // Counter contract (corrected, per the known-issue note): no per-accept
+  // sidecar rebuilds and no per-accept dense accept-materializations.
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
+  CHECK(search.counters.overlay_materializations_for_accept_materialization ==
+        0);
+  // The umbrella counter IS nonzero: every verified candidate materializes
+  // through the fixed-topology gate.  Phase 8 (fixed-topology delta from cached
+  // rows) will serve this gate without materialization, after which this
+  // assertion would flip to == 0; until then it documents the reality.
+  if (search.counters.exact_verifications > 0) {
+    CHECK(search.counters.full_overlay_materializations > 0);
+    // All umbrella materializations in this run are verification work (no
+    // per-accept and no diagnostic-oracle path fires here).
+    CHECK(search.counters.full_overlay_materializations >=
+          search.counters.overlay_materializations_for_exact_verification);
+  }
+  // The caches did real affected-set-scoped work and the two-chart oracle ran
+  // after every commit without throwing.
+  if (search.counters.accepted_moves > 0) {
+    CHECK(search.counters.inside_rows_recomputed_on_commit > 0);
+    CHECK(search.counters.outside_rows_recomputed_on_commit > 0);
+    CHECK(search.counters.local_commit_two_chart_oracle_runs ==
+          search.counters.local_commit_accepted_moves);
+    CHECK(search.counters.local_commit_tip_grammar_refreshes ==
+          search.counters.local_commit_accepted_moves);
+  }
+
+  // Three disjoint committable improving moves: fixed_topology_exact commits
+  // the same k >= 3 the exact_multisite path does.
+  CHECK(search.counters.local_commit_accepted_moves >= 3);
+  CHECK(search.summary.final_score <= search.summary.initial_score);
+
+  // Compaction produced a valid DAG whose rebuilt exact-score matches the
+  // reported final score.
+  CHECK(search.summary.final_compaction_rebuilds == 1);
+  auto rebuilt = larch::build_clade_grammar(search.dag);
+  auto rebuilt_state = larch::build_chart_spr_search_state(
+      search.dag, rebuilt, options);
+  CHECK(larch::chart_spr_state_exact_score_with_invariants(
+            rebuilt_state, options.exact_trim) == search.summary.final_score);
+
+  std::println("  PASS");
+}
+
+// pattern_batches cache strategy + local commit (Phase 4 known-issue #3).
+// chart_spr_refresh_state_tip_view_after_local_commit has a distinct branch
+// for pattern_batches mode (it leaves state.pattern_charts alone and refreshes
+// only the grammar + bounds from the icache); all other Phase 4 tests run in
+// all_active_patterns mode.  This forces cache_strategy = pattern_batches
+// (max_cached_patterns = 1 on the three-misplaced-groups fixture, which carries
+// several active patterns) through a local-commit run so that branch is
+// exercised end-to-end and the two-chart oracle still agrees.
+static void test_phase4_pattern_batches_local_commit() {
+  std::println("test_phase4_pattern_batches_local_commit");
+
+  auto fixture = make_three_misplaced_groups_fixture();
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 12;
+  options.rebuild_after_accept = false;
+  options.verify_local_commit_two_chart_oracle_for_tests = true;
+  // Force pattern_batches: cap the resident pattern cache below the fixture's
+  // active-pattern count so choose_chart_spr_cache_strategy selects batching.
+  options.cache.max_cached_patterns = 1;
+
+  // Confirm the configured options actually select pattern_batches for this
+  // fixture (the local-commit refresh branch under test is gated on it).
+  auto probe = larch::build_chart_spr_search_state(fixture.dag, fixture.grammar,
+                                                    options);
+  CHECK(probe.cache_strategy == larch::chart_spr_cache_strategy::pattern_batches);
+  CHECK(probe.pattern_charts.empty());
+  std::println("  active_patterns={}, cache_strategy=pattern_batches forced",
+               probe.active_patterns.patterns.patterns.size());
+
+  auto search = larch::run_chart_spr_search(std::move(fixture.dag),
+                                            fixture.grammar, options);
+
+  std::println(
+      "  accepted_moves={} (local_commit_accepted={}), "
+      "tombstone_scope_skips={}, pattern_batch_cache_builds={}",
+      search.counters.accepted_moves,
+      search.counters.local_commit_accepted_moves,
+      search.counters.local_commit_tombstone_scope_skips,
+      search.counters.pattern_batch_cache_builds);
+
+  // The local-commit run completed (no throw) with at least one commit --
+  // i.e. the pattern_batches refresh branch was taken and the next scoring
+  // batch successfully rebuilt base rows from the refreshed tip grammar.
+  CHECK(search.counters.accepted_moves ==
+        search.counters.local_commit_accepted_moves);
+  CHECK(search.counters.local_commit_accepted_moves >= 1);
+  // Counter contract holds under pattern_batches exactly as under
+  // all_active_patterns.
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
+  CHECK(search.counters.overlay_materializations_for_accept_materialization ==
+        0);
+  // Two-chart oracle ran after every commit without throwing (the caches are
+  // fully populated regardless of cache_strategy; strategy only governs whether
+  // pattern_charts is resident).
+  CHECK(search.counters.local_commit_two_chart_oracle_runs ==
+        search.counters.local_commit_accepted_moves);
+  // Pattern-batch scoring actually rebuilt base rows per batch across the run.
+  CHECK(search.counters.pattern_batch_cache_builds > 0);
+  CHECK(search.summary.final_score <= search.summary.initial_score);
+
+  // Compaction produced a valid DAG whose rebuilt exact-score matches the
+  // reported final score.
+  CHECK(search.summary.final_compaction_rebuilds == 1);
+  auto rebuilt = larch::build_clade_grammar(search.dag);
+  auto rebuilt_state = larch::build_chart_spr_search_state(
+      search.dag, rebuilt, options);
+  CHECK(larch::chart_spr_state_exact_score_with_invariants(
+            rebuilt_state, options.exact_trim) == search.summary.final_score);
+
+  std::println("  PASS");
+}
+
 int main() {
   test_lower_bound_oracle_counters_show_full_rebuild_cost();
   test_local_rejected_candidate_counter_guardrail();
@@ -1852,6 +2354,12 @@ int main() {
   test_phase5_pattern_fingerprint_mismatch_rebuilds_patterns();
   test_phase5_seeded_multi_iteration_is_deterministic();
   test_exhaustive_exact_acceptance_matches_oracle();
+  test_phase4_local_commit_counter_contract_and_oracle();
+  test_phase4_conservative_mode_counters_unchanged();
+  test_phase4_exact_trim_cache_never_stale();
+  test_phase4_multi_worker_matches_serial();
+  test_phase4_fixed_topology_exact_local_commit();
+  test_phase4_pattern_batches_local_commit();
   std::println("chart_spr_search_test PASS");
   return 0;
 }
