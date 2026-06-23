@@ -888,7 +888,8 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   site_patterns_test chart_trim_test chart_bnb_trim_apply_test
                   chart_spr_test chart_spr_search_test plateau_test
                   rank3_rewrite_test chart_two_chart_oracle_test
-                  overlay_chain_test inside_chart_cache_test)
+                  overlay_chain_test inside_chart_cache_test
+                  outside_chart_cache_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE larch)
     add_test(NAME ${test_name} COMMAND ${test_name}

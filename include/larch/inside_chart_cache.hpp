@@ -387,6 +387,16 @@ struct inside_chart_cache {
   std::vector<std::vector<std::array<chart_cost, nuc_state_count>>> temp_rows;
   std::size_t temp_clade_count = 0;
 
+  // Pairing epoch: the number of inside commits applied to this cache (0 at
+  // cold build).  After a correctly paired commit it equals `chain.size()`.
+  // `apply_commit_to_outside_cache` requires this to match the chain tip so a
+  // caller that forgot the inside commit (even a tombstone-only delta, which
+  // adds no temp clades and so slipped the old temp_clade_count guard) cannot
+  // silently read stale inside rows.  This is the Phase 3 pairing guard; it is
+  // the natural substrate for Phase 4's reader-snapshot epoch, which will
+  // number whole chain+cache snapshots the same way.
+  std::size_t commit_epoch = 0;
+
   // Lazy exact-trim cache over the current tip grammar (active-only, like
   // chart_spr_search_state::exact_trim_active_only).  Reset to absent on every
   // commit by `apply_commit_to_inside_cache`; recomputed lazily by the next
@@ -586,6 +596,16 @@ inline std::vector<overlay_clade_ref> compute_chain_inside_affected_set(
 // exact-trim cache, and bump `inside_rows_recomputed_on_commit` by the number
 // of (pattern, clade) rows recomputed.  Rows outside the affected set are left
 // untouched (reused).
+//
+// Pairing contract.  `apply_commit_to_inside_cache` and
+// `apply_commit_to_outside_cache` (Phase 3) must be invoked as a paired
+// inside-then-outside step for every appended delta.  This is enforced by the
+// `commit_epoch` field: the inside primitive requires the cache to be exactly
+// one commit behind the chain tip (`commit_epoch == chain.size() - 1`) and
+// advances it to the tip (`commit_epoch = chain.size()`); the outside
+// primitive then requires the inside cache to be at the tip.  A skipped,
+// doubled, or out-of-order commit throws a labelled error rather than reading
+// stale rows.
 inline void apply_commit_to_inside_cache(overlay_chain const& chain,
                                          inside_chart_cache& cache) {
   if (chain.empty()) {
@@ -599,6 +619,20 @@ inline void apply_commit_to_inside_cache(overlay_chain const& chain,
   if (cache.base != &chain.base()) {
     throw std::runtime_error(
         "apply_commit_to_inside_cache: cache base does not match chain base");
+  }
+
+  // Pairing guard: the cache must be exactly one commit behind the tip.  This
+  // catches a doubled inside commit (ahead of the chain) and an inside commit
+  // issued without a fresh append (stale); the outside-commit guard below
+  // catches a skipped inside commit.  chain.size() >= 1 here (empty-chain check
+  // above), so `chain.size() - 1` is well-defined.
+  if (cache.commit_epoch + 1 != chain.size()) {
+    throw std::runtime_error(
+        "apply_commit_to_inside_cache: inside cache commit_epoch (" +
+        std::to_string(cache.commit_epoch) +
+        ") is not exactly one behind the chain tip (" +
+        std::to_string(chain.size()) +
+        "); inside/outside commits must be paired one-per-appended delta");
   }
 
   auto idx = inside_chart_cache_detail::build_chain_tip_index(chain);
@@ -636,6 +670,10 @@ inline void apply_commit_to_inside_cache(overlay_chain const& chain,
 
   cache.inside_rows_recomputed_on_commit +=
       affected.size() * cache.patterns.size();
+
+  // Advance the pairing epoch to the tip (the post-state the outside-commit
+  // guard requires).  Bumped last so the epoch reflects a completed commit.
+  cache.commit_epoch = chain.size();
 
   // Lazy-invalidation hook (WI3): the exact-trim cache is recomputed by the
   // next exact gate, never eagerly.  Phase 3's outside commit inherits this
