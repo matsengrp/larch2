@@ -2857,6 +2857,18 @@ static void print_chart_spr_search_counter_fields(
       << counters.overlay_materializations_for_final_compaction << "\n";
   out << indent << "sidecar_rebuilds_after_accept: "
       << counters.sidecar_rebuilds_after_accept << "\n";
+  out << indent << "local_commit_accepted_moves: "
+      << counters.local_commit_accepted_moves << "\n";
+  out << indent << "local_commit_tombstone_scope_skips: "
+      << counters.local_commit_tombstone_scope_skips << "\n";
+  out << indent << "inside_rows_recomputed_on_commit: "
+      << counters.inside_rows_recomputed_on_commit << "\n";
+  out << indent << "outside_rows_recomputed_on_commit: "
+      << counters.outside_rows_recomputed_on_commit << "\n";
+  out << indent << "local_commit_two_chart_oracle_runs: "
+      << counters.local_commit_two_chart_oracle_runs << "\n";
+  out << indent << "local_commit_tip_grammar_refreshes: "
+      << counters.local_commit_tip_grammar_refreshes << "\n";
   out << indent << "full_composite_rebuilds: "
       << counters.full_composite_rebuilds << "\n";
   out << indent << "local_candidate_scores: "
@@ -3335,23 +3347,24 @@ static void run_chart_spr_search_diagnostic(
   out << "  search_mode: "
       << (options.rebuild_after_accept
               ? "phase5_accept_reject_materialize_rebuild"
-              : "phase9_accept_reject_local_cache_update")
+              : "phase5_accept_reject_overlay_chain_local_commit")
       << "\n";
   out << "  accepted_state_update_mode: "
       << (options.rebuild_after_accept ? "materialize_rebuild"
-                                       : "local_cache_update")
+                                       : "overlay_chain_local_cache_commit")
       << "\n";
   out << "  accepted_state_materialization: "
-      << (options.rebuild_after_accept ? "materialize_dag_and_rebuild"
-                                       : "dense_overlay_grammar_per_accept")
+      << (options.rebuild_after_accept
+              ? "materialize_dag_and_rebuild"
+              : "none_per_accept_overlay_chain_local_cache_update")
       << "\n";
   out << "  final_compaction_mode: "
       << (options.rebuild_after_accept
               ? "per_accept_materialized_dag"
-              : "selected_tree_rebuild_equivalence_checked")
+              : "grammar_level_exact_multi_tree_compaction")
       << "\n";
   out << "  preserves_full_accepted_overlay_dag: "
-      << (options.rebuild_after_accept ? "not_applicable" : "false")
+      << (options.rebuild_after_accept ? "not_applicable" : "true")
       << "\n";
   out << "  actual_dag_mutation: "
       << (search.summary.accepted_moves > 0 ? "true" : "false") << "\n";
@@ -3436,6 +3449,10 @@ static void run_chart_spr_search_diagnostic(
       << "\n";
   out << "  iterations: " << search.summary.iterations << "\n";
   out << "  accepted_moves: " << search.summary.accepted_moves << "\n";
+  out << "  local_commit_accepted_moves: "
+      << search.summary.local_commit_accepted_moves << "\n";
+  out << "  local_commit_tombstone_scope_skips: "
+      << search.summary.local_commit_tombstone_scope_skips << "\n";
   out << "  output_dag_mutated: "
       << (search.summary.accepted_moves > 0 ? "true" : "false") << "\n";
   out << "  candidate_accepts_attempted: "
@@ -3480,6 +3497,14 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.local_candidates_per_second << "\n";
   out << "  local_rows_recomputed: "
       << search.summary.local_rows_recomputed << "\n";
+  out << "  inside_rows_recomputed_on_commit: "
+      << search.summary.inside_rows_recomputed_on_commit << "\n";
+  out << "  outside_rows_recomputed_on_commit: "
+      << search.summary.outside_rows_recomputed_on_commit << "\n";
+  out << "  local_commit_two_chart_oracle_runs: "
+      << search.summary.local_commit_two_chart_oracle_runs << "\n";
+  out << "  local_commit_tip_grammar_refreshes: "
+      << search.summary.local_commit_tip_grammar_refreshes << "\n";
   out << "  local_rows_recomputed_per_second: " << std::fixed
       << std::setprecision(3)
       << search.summary.local_rows_recomputed_per_second << "\n";

@@ -327,19 +327,14 @@ std::vector<production_id> chart_spr_existing_productions_for_keys(
   return ids;
 }
 
-rank3_topology chart_spr_fixed_topology_from_last_accept(
+rank3_topology chart_spr_topology_from_certificate_after_signatures(
     chart_spr_search_state const& state,
-    chart_spr_candidate_score const* last_accepted) {
-  if (last_accepted == nullptr || !last_accepted->topology_selection.certificate) {
-    throw std::runtime_error(
-        "chart SPR local accepted-state final compaction: fixed-topology "
-        "mode requires the last accepted candidate's topology certificate");
-  }
-  auto const& certificate = *last_accepted->topology_selection.certificate;
+    chart_spr_topology_certificate const& certificate,
+    std::string const& context) {
   if (certificate.after_signatures.empty()) {
-    throw std::runtime_error(
-        "chart SPR local accepted-state final compaction: fixed-topology "
-        "certificate has no after-topology signatures");
+    throw std::runtime_error(context +
+                             ": topology certificate has no after-topology "
+                             "signatures");
   }
 
   std::vector<production_id> after_ids;
@@ -352,6 +347,46 @@ rank3_topology chart_spr_fixed_topology_from_last_accept(
   auto topology = grammar_topology_from_productions(state.grammar, after_ids);
   (void)validate_grammar_topology(state.grammar, topology);
   return topology;
+}
+
+rank3_topology chart_spr_fixed_topology_from_last_accept(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const* last_accepted) {
+  if (last_accepted == nullptr || !last_accepted->topology_selection.certificate) {
+    throw std::runtime_error(
+        "chart SPR local accepted-state final compaction: fixed-topology "
+        "mode requires the last accepted candidate's topology certificate");
+  }
+  return chart_spr_topology_from_certificate_after_signatures(
+      state, *last_accepted->topology_selection.certificate,
+      "chart SPR local accepted-state final compaction: fixed-topology "
+      "last accepted certificate");
+}
+
+rank3_production_taxa_key chart_spr_key_from_production_signature(
+    chart_spr_production_signature signature) {
+  rank3_production_taxa_key key;
+  key.parent = std::move(signature.parent_taxa);
+  key.children = std::move(signature.child_taxa);
+  rank3_detail::normalize_production_key(key);
+  return key;
+}
+
+std::vector<rank3_production_taxa_key>
+chart_spr_topology_certificate_after_key_set(
+    chart_spr_topology_certificate const& certificate) {
+  if (certificate.after_signatures.empty()) {
+    throw std::runtime_error(
+        "chart SPR local accepted-state final compaction: accepted topology "
+        "certificate has no after-topology signatures");
+  }
+  std::vector<rank3_production_taxa_key> keys;
+  keys.reserve(certificate.after_signatures.size());
+  for (auto const& signature : certificate.after_signatures) {
+    rank3_detail::append_unique_key(
+        keys, chart_spr_key_from_production_signature(signature));
+  }
+  return keys;
 }
 
 rank3_topology chart_spr_choose_local_update_compaction_topology(
@@ -390,6 +425,41 @@ rank3_topology chart_spr_choose_local_update_compaction_topology(
   return rank3_topology_preferring_productions(state.grammar, preferred_ids);
 }
 
+std::vector<rank3_topology>
+chart_spr_collect_local_update_compaction_witness_topologies(
+    chart_spr_search_state const& state,
+    chart_spr_search_options const& options,
+    chart_spr_candidate_score const* last_accepted) {
+  std::vector<rank3_topology> witnesses;
+
+  // Keep the final exact-objective witness used by the grammar-valued safety
+  // check.  For exact_multisite this is a deterministic B&B optimum of the
+  // final chain tip; for fixed_topology_exact it is the last accepted
+  // certificate resolved in the final chain tip when possible.  Historical
+  // accepted fixed-topology certificates are passed separately as stable
+  // production-key sets because later deltas may tombstone base productions
+  // they used, making them intentionally unresolvable in the final chain
+  // grammar until compaction augments the materialization grammar.
+  auto final_witness = chart_spr_choose_local_update_compaction_topology(
+      state, options, {}, last_accepted);
+  overlay_chain_compaction_detail::append_unique_topology(
+      witnesses, state.grammar, std::move(final_witness));
+
+  return witnesses;
+}
+
+std::vector<std::vector<rank3_production_taxa_key>>
+chart_spr_collect_local_update_compaction_witness_key_sets(
+    std::vector<chart_spr_topology_certificate> const& accepted_certificates) {
+  std::vector<std::vector<rank3_production_taxa_key>> key_sets;
+  key_sets.reserve(accepted_certificates.size());
+  for (auto const& certificate : accepted_certificates) {
+    key_sets.push_back(
+        chart_spr_topology_certificate_after_key_set(certificate));
+  }
+  return key_sets;
+}
+
 std::uint64_t chart_spr_local_update_final_expected_score(
     chart_spr_search_state const& state,
     chart_spr_search_options const& options,
@@ -425,6 +495,7 @@ chart_spr_compact_and_verify_local_update_state(
     phylo_dag& source, overlay_chain const& chain,
     chart_spr_search_state const& local_state,
     chart_spr_search_options const& options,
+    std::vector<chart_spr_topology_certificate> const& accepted_certificates,
     chart_spr_candidate_score const* last_accepted,
     chart_spr_search_counters& counters) {
   auto expected_score = chart_spr_local_update_final_expected_score(
@@ -434,14 +505,22 @@ chart_spr_compact_and_verify_local_update_state(
   compaction_options.validate = true;
   compaction_options.generated_edge_weight =
       std::numeric_limits<float>::max();
-  compaction_options.witness_topologies.push_back(
-      chart_spr_choose_local_update_compaction_topology(
-          local_state, options, {}, last_accepted));
+  compaction_options.witness_topologies =
+      chart_spr_collect_local_update_compaction_witness_topologies(
+          local_state, options, last_accepted);
+  compaction_options.witness_topology_key_sets =
+      chart_spr_collect_local_update_compaction_witness_key_sets(
+          accepted_certificates);
 
   ++counters.full_overlay_materializations;
   ++counters.overlay_materializations_for_final_compaction;
   auto compacted = compact_overlay_chain_to_dag(source, chain,
                                                 compaction_options);
+  if (!compacted.all_witness_topologies_present()) {
+    throw std::runtime_error(
+        "chart SPR local accepted-state final compaction: compacted output "
+        "DAG failed to preserve every accepted topology witness");
+  }
 
   auto oracle = grammar_level_exact_parsimony(
       compacted.rebuilt.grammar, local_state.active_patterns,
@@ -863,6 +942,10 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.inside_rows_recomputed_on_commit;
   summary.outside_rows_recomputed_on_commit =
       counters.outside_rows_recomputed_on_commit;
+  summary.local_commit_two_chart_oracle_runs =
+      counters.local_commit_two_chart_oracle_runs;
+  summary.local_commit_tip_grammar_refreshes =
+      counters.local_commit_tip_grammar_refreshes;
   summary.full_search_state_rebuilds =
       summary.initial_search_state_rebuilds +
       summary.sidecar_rebuilds_after_accept;
@@ -911,6 +994,8 @@ chart_spr_search_result run_chart_spr_search(
           options.local_score_worker_count);
   std::vector<std::size_t> aggregate_affected_counts;
   std::optional<chart_spr_candidate_score> last_local_update_accepted;
+  std::vector<chart_spr_topology_certificate>
+      local_update_accepted_topology_certificates;
   bool used_local_accept_updates = false;
 
   // Phase 4 local-commit substrate: the overlay chain + persistent inside /
@@ -1117,6 +1202,10 @@ chart_spr_search_result run_chart_spr_search(
         // state.grammar / pattern_charts / bounds were refreshed in place by
         // the commit; sync the counters.
         state.counters = attempt_counters;
+        if (iteration.accepted->topology_selection.certificate) {
+          local_update_accepted_topology_certificates.push_back(
+              *iteration.accepted->topology_selection.certificate);
+        }
         last_local_update_accepted = *iteration.accepted;
         used_local_accept_updates = true;
         iteration.accepted_move_committed = true;
@@ -1156,6 +1245,7 @@ chart_spr_search_result run_chart_spr_search(
     auto preserved_counters = state.counters;
     auto compacted = chart_spr_compact_and_verify_local_update_state(
         result.dag, *local_commit_substrate->chain, state, options,
+        local_update_accepted_topology_certificates,
         last_local_update_accepted ? &*last_local_update_accepted : nullptr,
         preserved_counters);
     result.dag = std::move(compacted.dag);

@@ -9,6 +9,7 @@
 #include <print>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 [[noreturn]] static void test_fail(char const* expr, char const* file, int line) {
@@ -2093,6 +2094,50 @@ static void test_phase5_final_compaction_normalizes_trim_options() {
   std::println("  PASS");
 }
 
+static larch::rank3_production_taxa_key phase5_key_from_signature(
+    larch::chart_spr_production_signature signature) {
+  larch::rank3_production_taxa_key key;
+  key.parent = std::move(signature.parent_taxa);
+  key.children = std::move(signature.child_taxa);
+  larch::rank3_detail::normalize_production_key(key);
+  return key;
+}
+
+static larch::production_id phase5_find_unique_production_by_signature(
+    larch::clade_grammar const& grammar,
+    larch::chart_spr_production_signature const& signature) {
+  auto key = phase5_key_from_signature(signature);
+  larch::production_id match = larch::no_production;
+  for (std::size_t i = 0; i < grammar.productions.size(); ++i) {
+    auto pid = static_cast<larch::production_id>(i);
+    if (larch::rank3_detail::production_key_from_id(grammar, pid) != key) {
+      continue;
+    }
+    CHECK(match == larch::no_production);
+    match = pid;
+  }
+  CHECK(match != larch::no_production);
+  return match;
+}
+
+static void phase5_assert_certificate_topology_present(
+    larch::clade_grammar const& grammar,
+    larch::chart_spr_topology_certificate const& certificate) {
+  CHECK(!certificate.after_signatures.empty());
+  std::vector<larch::production_id> pids;
+  pids.reserve(certificate.after_signatures.size());
+  for (auto const& signature : certificate.after_signatures) {
+    pids.push_back(
+        phase5_find_unique_production_by_signature(grammar, signature));
+  }
+  auto topology = larch::rank3_topology_from_productions(grammar, pids);
+  auto reachable = larch::rank3_detail::validate_topology(grammar, topology);
+  for (auto pid : pids) {
+    CHECK(pid < reachable.size());
+    CHECK(reachable[pid]);
+  }
+}
+
 static void test_phase5_overlay_chain_compaction_preserves_intended_keys() {
   std::println("test_phase5_overlay_chain_compaction_preserves_intended_keys");
 
@@ -2109,6 +2154,7 @@ static void test_phase5_overlay_chain_compaction_preserves_intended_keys() {
   auto compacted = larch::compact_overlay_chain_to_dag(fixture.dag, chain);
   CHECK(compacted.materialized_tree_count >= 1);
   CHECK(compacted.all_intended_productions_present());
+  CHECK(compacted.all_witness_topologies_present());
   for (auto const& key : intended) {
     CHECK(larch::rank3_detail::has_production_key(compacted.rebuilt.grammar,
                                                    key));
@@ -2488,12 +2534,24 @@ static void test_phase4_fixed_topology_exact_local_commit() {
   CHECK(search.summary.final_score <= search.summary.initial_score);
 
   // Compaction produced a valid DAG whose grammar-level exact B&B optimum
-  // matches the reported final score.
+  // matches the reported final score, and preserves every accepted fixed-
+  // topology certificate as a complete witness topology.
   CHECK(search.summary.final_compaction_rebuilds == 1);
   CHECK(search.summary.final_compaction_exactness_kind ==
         larch::multisite_keep_mask_kind::exact_optimal_production_union);
   CHECK(search.counters.overlay_materializations_for_final_compaction == 1);
   auto rebuilt = larch::build_clade_grammar(search.dag);
+  std::size_t accepted_certificate_count = 0;
+  for (auto const& it : search.iterations) {
+    if (!it.accepted_move_committed) continue;
+    CHECK(it.accepted.has_value());
+    CHECK(it.accepted->topology_selection.certificate.has_value());
+    phase5_assert_certificate_topology_present(
+        rebuilt, *it.accepted->topology_selection.certificate);
+    ++accepted_certificate_count;
+  }
+  CHECK(accepted_certificate_count ==
+        search.counters.local_commit_accepted_moves);
   auto rebuilt_state = larch::build_chart_spr_search_state(
       search.dag, rebuilt, options);
   CHECK(larch::chart_spr_state_exact_score_with_invariants(

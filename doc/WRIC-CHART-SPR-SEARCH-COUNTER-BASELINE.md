@@ -126,6 +126,12 @@ chart_spr_search_counters:
   overlay_materializations_for_accept_materialization:         0
   overlay_materializations_for_final_compaction:               0
   sidecar_rebuilds_after_accept:                               0
+  local_commit_accepted_moves:                                 0
+  local_commit_tombstone_scope_skips:                          0
+  inside_rows_recomputed_on_commit:                            0
+  outside_rows_recomputed_on_commit:                           0
+  local_commit_two_chart_oracle_runs:                          0
+  local_commit_tip_grammar_refreshes:                          0
   full_composite_rebuilds:                                     0
   local_candidate_scores:                                      89312
   local_rows_recomputed:                                       159379494

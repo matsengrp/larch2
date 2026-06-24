@@ -145,6 +145,18 @@ int main() {
                      c.overlay_materializations_for_final_compaction);
   print_counter_line("sidecar_rebuilds_after_accept",
                      c.sidecar_rebuilds_after_accept);
+  print_counter_line("local_commit_accepted_moves",
+                     c.local_commit_accepted_moves);
+  print_counter_line("local_commit_tombstone_scope_skips",
+                     c.local_commit_tombstone_scope_skips);
+  print_counter_line("inside_rows_recomputed_on_commit",
+                     c.inside_rows_recomputed_on_commit);
+  print_counter_line("outside_rows_recomputed_on_commit",
+                     c.outside_rows_recomputed_on_commit);
+  print_counter_line("local_commit_two_chart_oracle_runs",
+                     c.local_commit_two_chart_oracle_runs);
+  print_counter_line("local_commit_tip_grammar_refreshes",
+                     c.local_commit_tip_grammar_refreshes);
   print_counter_line("full_composite_rebuilds", c.full_composite_rebuilds);
   print_counter_line("local_candidate_scores", c.local_candidate_scores);
   print_counter_line("local_rows_recomputed", c.local_rows_recomputed);

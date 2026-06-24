@@ -510,6 +510,8 @@ struct chart_spr_search_summary {
   std::size_t local_commit_tombstone_scope_skips = 0;
   std::size_t inside_rows_recomputed_on_commit = 0;
   std::size_t outside_rows_recomputed_on_commit = 0;
+  std::size_t local_commit_two_chart_oracle_runs = 0;
+  std::size_t local_commit_tip_grammar_refreshes = 0;
   chart_spr_candidate_selection_mode candidate_selection =
       chart_spr_candidate_selection_mode::lower_bound_top_k;
   chart_spr_acceptance_mode acceptance_mode =
