@@ -2045,6 +2045,72 @@ static void test_phase4_conservative_mode_counters_unchanged() {
   std::println("  PASS");
 }
 
+static void test_phase4_local_commit_score_ua_edge_rejected() {
+  std::println("test_phase4_local_commit_score_ua_edge_rejected");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "ATGA", four_taxon_offset_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.chart.score_ua_edge = true;
+
+  std::string message;
+  bool threw = false;
+  try {
+    (void)larch::run_chart_spr_search(std::move(dag), grammar, options);
+  } catch (std::runtime_error const& e) {
+    threw = true;
+    message = e.what();
+  }
+  CHECK(threw);
+  CHECK(message.find("local commit") != std::string::npos);
+  CHECK(message.find("score_ua_edge=true") != std::string::npos);
+  CHECK(message.find("Phase 4 limitation") != std::string::npos);
+  CHECK(message.find("not a silent fallback") != std::string::npos);
+
+  std::println("  PASS");
+}
+
+static void test_phase4_local_commit_post_append_failure_is_hard_error() {
+  std::println("test_phase4_local_commit_post_append_failure_is_hard_error");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 8;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.force_local_commit_post_append_failure_for_tests = true;
+
+  std::string message;
+  bool threw = false;
+  try {
+    (void)larch::run_chart_spr_search(std::move(dag), grammar, options);
+  } catch (std::runtime_error const& e) {
+    threw = true;
+    message = e.what();
+  }
+  CHECK(threw);
+  CHECK(message.find("local commit") != std::string::npos);
+  CHECK(message.find("after the append committed") != std::string::npos);
+  CHECK(message.find("forced local commit post-append failure for tests") !=
+        std::string::npos);
+  CHECK(message.find("post-materialization rejection") != std::string::npos);
+
+  std::println("  PASS");
+}
+
 // Exact-trim cache invariant (WI3 lazy invalidation): across a local-commit
 // run, after each accept the state's exact_trim_active_only is either absent
 // (invalidated on commit) or, once recomputed, equals the from-scratch exact
@@ -2356,6 +2422,8 @@ int main() {
   test_exhaustive_exact_acceptance_matches_oracle();
   test_phase4_local_commit_counter_contract_and_oracle();
   test_phase4_conservative_mode_counters_unchanged();
+  test_phase4_local_commit_score_ua_edge_rejected();
+  test_phase4_local_commit_post_append_failure_is_hard_error();
   test_phase4_exact_trim_cache_never_stale();
   test_phase4_multi_worker_matches_serial();
   test_phase4_fixed_topology_exact_local_commit();

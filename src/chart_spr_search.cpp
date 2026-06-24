@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -34,8 +35,8 @@ void validate_chart_spr_search_loop_options(
       options.enumeration.source != chart_spr_candidate_source::grammar &&
       options.max_iterations > 1) {
     throw std::runtime_error(
-        "chart SPR search: Phase-9 local accepted-state updates currently "
-        "support multi-iteration search only with grammar-native candidate "
+        "chart SPR search: Phase-4 local commit currently supports "
+        "multi-iteration search only with grammar-native candidate "
         "generation; sampled-tree/hybrid sources need a rebuilt/materialized "
         "DAG before the next iteration");
   }
@@ -55,6 +56,14 @@ void validate_chart_spr_search_loop_options(
         "chain's recorded objective must be exact (fixed_topology_exact or "
         "exact_multisite).  The deferred-verification extension admitting "
         "heuristic-gated local commits is out of scope.");
+  }
+  if (!options.rebuild_after_accept && options.chart.score_ua_edge) {
+    throw std::runtime_error(
+        "chart SPR search: local commit (rebuild_after_accept = false) with "
+        "score_ua_edge=true is a Phase 4 limitation: the persistent outside "
+        "cache needs a documented per-pattern reference-state convention; use "
+        "rebuild_after_accept=true or score_ua_edge=false.  This is a labelled "
+        "unsupported-mode throw, not a silent fallback.");
   }
 }
 
@@ -386,7 +395,7 @@ phylo_dag chart_spr_materialize_local_update_state_to_dag(
     chart_spr_candidate_score const* last_accepted) {
   auto topology = chart_spr_choose_local_update_compaction_topology(
       state, options, preferred_keys, last_accepted);
-  // Current Phase-9 compaction is intentionally tree-valued: choose one
+  // Current Phase-4 compaction is intentionally tree-valued: choose one
   // concrete topology, materialize it, then rebuild/check the objective.  This
   // is score-safe but does not preserve all productions/topologies present in
   // the locally updated accepted-state grammar.
@@ -563,6 +572,17 @@ enum class chart_spr_local_commit_outcome {
   tombstone_scope_skipped,
 };
 
+// Local-commit failures after the committability gate are hard correctness
+// errors, not ordinary post-materialization rejections: they would indicate a
+// broken chain/cache transaction.  The search loop catches this type
+// separately and rethrows it so callers never receive a partially-updated
+// result disguised as a rejected move.
+class chart_spr_local_commit_hard_error : public std::runtime_error {
+ public:
+  explicit chart_spr_local_commit_hard_error(std::string message)
+      : std::runtime_error(std::move(message)) {}
+};
+
 struct chart_spr_local_commit_result {
   chart_spr_local_commit_outcome outcome =
       chart_spr_local_commit_outcome::committed;
@@ -633,14 +653,33 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
     chart_spr_search_state& state,
     overlay_materialization_result const& materialized,
     inside_chart_cache const& icache) {
+  auto old_strategy = state.cache_strategy;
   state.grammar = materialized.grammar;
 
+  state.estimated_full_pattern_cache_bytes =
+      estimate_chart_spr_full_pattern_cache_bytes(state);
+  state.effective_pattern_batch_size = choose_chart_spr_pattern_batch_size(
+      state.grammar, state.active_patterns, state.cache_opts);
+  auto new_strategy = choose_chart_spr_cache_strategy(
+      state.grammar, state.active_patterns, state.cache_opts);
+  // Preserve a caller-requested pattern-batch mode across commits: do not
+  // silently switch an explicitly batched run into
+  // all-active just because the grammar shrank.  If an all-active run grows or
+  // its budget is recalculated into pattern_batches, switch to the batched view
+  // before touching resident pattern_charts so stale full rows cannot remain
+  // resident or be reported in resident-byte accounting.
+  state.cache_strategy =
+      old_strategy == chart_spr_cache_strategy::pattern_batches
+          ? chart_spr_cache_strategy::pattern_batches
+          : new_strategy;
+
+  auto const& patterns = state.active_patterns.patterns.patterns;
+  if (patterns.size() != icache.patterns.size()) {
+    throw std::runtime_error(
+        "chart SPR local-commit tip refresh: active pattern count mismatch");
+  }
+
   if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
-    auto const& patterns = state.active_patterns.patterns.patterns;
-    if (patterns.size() != icache.patterns.size()) {
-      throw std::runtime_error(
-          "chart SPR local-commit tip refresh: active pattern count mismatch");
-    }
     std::vector<pattern_chart_cache_entry> refreshed;
     refreshed.reserve(patterns.size());
     for (std::size_t p = 0; p < patterns.size(); ++p) {
@@ -658,32 +697,20 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
     state.pattern_charts = std::move(refreshed);
     state.resident_pattern_cache_bytes =
         estimate_chart_spr_pattern_cache_bytes(state);
-  }
-  // pattern_batches strategy: there are no resident base rows to refresh; the
-  // next scoring batch rebuilds base rows once per pattern batch from the
-  // refreshed state.grammar.
-
-  state.estimated_full_pattern_cache_bytes =
-      estimate_chart_spr_full_pattern_cache_bytes(state);
-  state.effective_pattern_batch_size = choose_chart_spr_pattern_batch_size(
-      state.grammar, state.active_patterns, state.cache_opts);
-  auto new_strategy = choose_chart_spr_cache_strategy(
-      state.grammar, state.active_patterns, state.cache_opts);
-  // Preserve a caller-requested pattern-batch mode across commits (mirrors the
-  // Phase-9 path): do not silently switch an explicitly batched run into
-  // all-active just because the grammar shrank.
-  if (state.cache_strategy == chart_spr_cache_strategy::pattern_batches) {
-    state.cache_strategy = chart_spr_cache_strategy::pattern_batches;
+  } else {
+    // pattern_batches strategy: there are no resident base rows to refresh; the
+    // next scoring batch rebuilds base rows once per pattern batch from the
+    // refreshed state.grammar.  Clear any all-active rows left over from the
+    // previous strategy so resident-byte reporting matches the strategy switch.
+    std::vector<pattern_chart_cache_entry>{}.swap(state.pattern_charts);
     state.resident_pattern_cache_bytes =
         state.effective_pattern_batch_size *
         estimate_chart_spr_pattern_row_cache_bytes(state.grammar);
-  } else {
-    state.cache_strategy = new_strategy;
   }
 
-  // Composite lower bound from the authoritative icache root rows (handles
-  // score_ua_edge=true inside-root weighting and the invariant offset exactly
-  // once, identically to the cold build).
+  // Composite lower bound from the authoritative icache root rows (Phase 4
+  // local commit currently rejects score_ua_edge=true before substrate build;
+  // conservative mode continues to support the UA-edge convention).
   auto composite_with_invariants =
       inside_cache_composite_lower_bound_with_invariants(icache);
   if (icache.invariant_constant_offset > composite_with_invariants) {
@@ -711,28 +738,40 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     chart_spr_search_counters& counters) {
   // Defensive gate check (the loop validator already rejects this combo, but a
   // locally-committed chain's recorded objective must be exact -- never trust a
-  // caller to re-establish the invariant).
+  // caller to re-establish the invariant).  This is a hard configuration error,
+  // not an ordinary post-materialization rejection.
   if (options.acceptance_mode == chart_spr_acceptance_mode::lower_bound_heuristic) {
-    throw std::runtime_error(
+    throw chart_spr_local_commit_hard_error(
         "chart SPR local commit: refusing to commit a lower_bound_heuristic-"
         "gated accept; local commit requires an exact gate");
   }
 
+  chart_spr_local_commit_result result;
+
   // Build the single-candidate delta against the CURRENT tip (state.grammar is
   // the materialized chain tip the candidate was generated/scored against).
-  local_spr_score_options local_options;
-  local_options.verify_against_full_overlay = false;
-  local_options.validate_cached_chart_shapes = false;
-  auto delta =
-      build_spr_overlay_delta(state.grammar, accepted.candidate, local_options);
-
-  chart_spr_local_commit_result result;
+  // An accepted candidate that cannot be reconstructed here indicates a broken
+  // search invariant, so surface it as a hard local-commit error.
+  spr_overlay_delta delta;
+  try {
+    local_spr_score_options local_options;
+    local_options.verify_against_full_overlay = false;
+    local_options.validate_cached_chart_shapes = false;
+    delta = build_spr_overlay_delta(state.grammar, accepted.candidate,
+                                    local_options);
+  } catch (std::exception const& e) {
+    throw chart_spr_local_commit_hard_error(
+        std::string{"chart SPR local commit: failed to build accepted "
+                    "candidate delta before commit: "} +
+        e.what());
+  }
 
   // Committability gate (Phase 4 tombstone scope).  The overlay vocabulary has
   // no removed-temp-productions field, so only candidates whose tombstones all
   // resolve to frozen-base productions may commit.  The chain enforces this;
   // a rejection is a labelled, counted skip -- never a silent no-op (matches
-  // the no-silent-fallback discipline).
+  // the no-silent-fallback discipline).  This is the ONLY local-commit failure
+  // translated into a normal search outcome.
   //
   // Skip semantics: this skip is reported to the search loop, which TERMINATES
   // the run on it rather than trying the next-best candidate.  The plan's
@@ -747,51 +786,73 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
   try {
     sub.chain->append(delta);
   } catch (std::runtime_error const& e) {
-    if (!chart_spr_is_local_commit_tombstone_scope_rejection(e.what())) throw;
-    result.outcome = chart_spr_local_commit_outcome::tombstone_scope_skipped;
-    result.skip_reason = e.what();
-    return result;
+    if (chart_spr_is_local_commit_tombstone_scope_rejection(e.what())) {
+      result.outcome = chart_spr_local_commit_outcome::tombstone_scope_skipped;
+      result.skip_reason = e.what();
+      return result;
+    }
+    throw chart_spr_local_commit_hard_error(
+        std::string{"chart SPR local commit: overlay-chain append failed "
+                    "outside the tombstone-scope committability gate: "} +
+        e.what());
   }
 
-  // Paired cache commit: inside first (Phase 2), then outside (Phase 3).  Both
-  // are affected-set scoped -- no full chart rebuild per accept.  The exact-trim
-  // cache is invalidated by the inside commit (Phase 2 hook).
-  apply_commit_to_inside_cache(*sub.chain, *sub.icache);
-  apply_commit_to_outside_cache(*sub.chain, *sub.ocache, *sub.icache);
+  // From this point on the chain/cache/state update is an in-place commit.  Any
+  // exception is a hard correctness failure and MUST NOT be converted by the
+  // outer accept-path catch into a post-materialization rejection (there is no
+  // rollback path for a partially refreshed chain/cache snapshot).
+  try {
+    if (options.force_local_commit_post_append_failure_for_tests) {
+      throw std::runtime_error(
+          "forced local commit post-append failure for tests");
+    }
 
-  // Refresh the derived tip view (grammar + pattern_charts + bounds).  This is
-  // a grammar-only materialization (no chart rescoring); NOT counted under
-  // full_overlay_materializations.  Eliminating it entirely (direct in-place
-  // splice) is Phase 6/7 scope; the persistent caches already remove the
-  // expensive per-accept chart rescoring.
-  auto materialized = materialize_overlay_chain(*sub.chain);
-  ++counters.local_commit_tip_grammar_refreshes;
-  chart_spr_refresh_state_tip_view_after_local_commit(state, materialized,
-                                                       *sub.icache);
+    // Paired cache commit: inside first (Phase 2), then outside (Phase 3).  Both
+    // are affected-set scoped -- no full chart rebuild per accept.  The exact-
+    // trim cache is invalidated by the inside commit (Phase 2 hook).
+    apply_commit_to_inside_cache(*sub.chain, *sub.icache);
+    apply_commit_to_outside_cache(*sub.chain, *sub.ocache, *sub.icache);
 
-  // Record accepted temp-production taxon-set keys for final compaction
-  // (tree-valued compaction is retained for Phase 4; Phase 5 lands the
-  // grammar-valued compaction oracle).
-  for (auto dense_pid : materialized.temp_production_to_dense) {
-    if (dense_pid == no_production) continue;
-    rank3_detail::append_unique_key(
-        result.accepted_temp_production_keys,
-        rank3_detail::production_key_from_id(materialized.grammar, dense_pid));
-  }
+    // Refresh the derived tip view (grammar + pattern_charts + bounds).  This is
+    // a grammar-only materialization (no chart rescoring); NOT counted under
+    // full_overlay_materializations.  Eliminating it entirely (direct in-place
+    // splice) is Phase 6/7 scope; the persistent caches already remove the
+    // expensive per-accept chart rescoring.
+    auto materialized = materialize_overlay_chain(*sub.chain);
+    ++counters.local_commit_tip_grammar_refreshes;
+    chart_spr_refresh_state_tip_view_after_local_commit(state, materialized,
+                                                         *sub.icache);
 
-  // Mirror cumulative cache counters onto the running attempt-counters (the
-  // caches persist across accepts; their counters are cumulative).
-  counters.inside_rows_recomputed_on_commit =
-      sub.icache->inside_rows_recomputed_on_commit;
-  counters.outside_rows_recomputed_on_commit =
-      sub.ocache->outside_rows_recomputed_on_commit;
+    // Record accepted temp-production taxon-set keys for final compaction
+    // (tree-valued compaction is retained for Phase 4; Phase 5 lands the
+    // grammar-valued compaction oracle).
+    for (auto dense_pid : materialized.temp_production_to_dense) {
+      if (dense_pid == no_production) continue;
+      rank3_detail::append_unique_key(
+          result.accepted_temp_production_keys,
+          rank3_detail::production_key_from_id(materialized.grammar, dense_pid));
+    }
 
-  // Two-chart oracle self-check (Work item 3 correctness invariant).
-  if (options.verify_local_commit_two_chart_oracle_for_tests) {
-    chart_spr_assert_local_commit_two_chart_oracle(
-        *sub.chain, *sub.icache, *sub.ocache,
-        "after commit " + std::to_string(sub.chain->size()));
-    ++counters.local_commit_two_chart_oracle_runs;
+    // Mirror cumulative cache counters onto the running attempt-counters (the
+    // caches persist across accepts; their counters are cumulative).
+    counters.inside_rows_recomputed_on_commit =
+        sub.icache->inside_rows_recomputed_on_commit;
+    counters.outside_rows_recomputed_on_commit =
+        sub.ocache->outside_rows_recomputed_on_commit;
+
+    // Two-chart oracle self-check (Work item 3 correctness invariant).
+    if (options.verify_local_commit_two_chart_oracle_for_tests) {
+      chart_spr_assert_local_commit_two_chart_oracle(
+          *sub.chain, *sub.icache, *sub.ocache,
+          "after commit " + std::to_string(sub.chain->size()));
+      ++counters.local_commit_two_chart_oracle_runs;
+    }
+  } catch (std::exception const& e) {
+    throw chart_spr_local_commit_hard_error(
+        std::string{"chart SPR local commit: chain/cache update failed after "
+                    "the append committed; aborting rather than returning a "
+                    "post-materialization rejection with mutated state: "} +
+        e.what());
   }
 
   result.outcome = chart_spr_local_commit_outcome::committed;
@@ -920,6 +981,7 @@ chart_spr_search_result run_chart_spr_search(
 
     auto attempt_counters = state.counters;
     auto materialize_start = std::chrono::steady_clock::now();
+    bool local_commit_mutated_shared_state = false;
     try {
       if (options.rebuild_after_accept) {
         auto materialized = materialize_chart_spr_accepted_candidate(
@@ -1016,6 +1078,24 @@ chart_spr_search_result run_chart_spr_search(
           break;
         }
 
+        // The immediate-reversal skip key must be computed against the same
+        // PRE-COMMIT grammar that generated/scored the candidate.  The local
+        // commit refreshes state.grammar in place; using the refreshed grammar
+        // would interpret the candidate's dense production IDs in the wrong
+        // grammar (or throw) after the chain/cache mutation.
+        std::string accepted_immediate_reversal_key;
+        try {
+          accepted_immediate_reversal_key =
+              chart_spr_candidate_immediate_reverse_key(
+                  state.grammar, iteration.accepted->candidate);
+        } catch (std::exception const& e) {
+          throw chart_spr_local_commit_hard_error(
+              std::string{"chart SPR local commit: failed to compute "
+                          "pre-commit immediate-reversal key for accepted "
+                          "candidate: "} +
+              e.what());
+        }
+
         // Commit to the chain + caches.  Refreshes state.grammar /
         // state.pattern_charts in place (the derived tip view).  A
         // tombstone-scope skip leaves the chain, caches, and state pristine.
@@ -1052,9 +1132,8 @@ chart_spr_search_result run_chart_spr_search(
           break;
         }
 
-        immediate_reversal_key_to_skip =
-            chart_spr_candidate_immediate_reverse_key(
-                state.grammar, iteration.accepted->candidate);
+        local_commit_mutated_shared_state = true;
+        immediate_reversal_key_to_skip = accepted_immediate_reversal_key;
         for (auto const& key : commit.accepted_temp_production_keys) {
           rank3_detail::append_unique_key(local_update_preferred_keys, key);
         }
@@ -1070,7 +1149,17 @@ chart_spr_search_result run_chart_spr_search(
         result.summary.final_score = rebuilt_score;
         result.iterations.push_back(std::move(iteration));
       }
+    } catch (chart_spr_local_commit_hard_error const&) {
+      throw;
     } catch (std::exception const& e) {
+      if (local_commit_mutated_shared_state) {
+        throw chart_spr_local_commit_hard_error(
+            std::string{"chart SPR local commit: post-commit bookkeeping "
+                        "failed after the shared chain/cache/state was "
+                        "mutated; aborting rather than returning an ordinary "
+                        "post-materialization rejection: "} +
+            e.what());
+      }
       result.summary.accepted_rebuild_ms += chart_spr_elapsed_ms(
           materialize_start, std::chrono::steady_clock::now());
       ++attempt_counters.post_materialization_rejections;

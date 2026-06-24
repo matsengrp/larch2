@@ -92,8 +92,8 @@ struct chart_spr_search_counters {
   // shows up as `inside_rows_recomputed_on_commit` /
   // `outside_rows_recomputed_on_commit` recovers the whole grammar, while a
   // regression to "dense materialize per accept" shows up as a nonzero
-  // `overlay_materializations_for_accept_materialization` (the Phase-9 path's
-  // per-accept counter, which the Phase-4 path leaves at zero).
+  // `overlay_materializations_for_accept_materialization` (the conservative
+  // per-accept counter, which the Phase-4 local-commit path leaves at zero).
   //
   // Local commits performed (only exact-gate accepts may commit locally).
   std::size_t local_commit_accepted_moves = 0;
@@ -331,18 +331,19 @@ struct chart_spr_search_options {
       "first_reachable_overlay_topology";
 
   bool materialize_accepted_moves = true;
-  // true: conservative Phase-5 path materializes an accepted move and rebuilds
-  // the grammar/pattern/chart sidecar before the next iteration. false:
-  // optional Phase-9 mode locally commits the accepted overlay into the search
-  // grammar/cache and defers DAG compaction, avoiding sidecar rebuilds after
-  // ordinary accepted moves.
+  // true: conservative path materializes an accepted move and rebuilds the
+  // grammar/pattern/chart sidecar before the next iteration. false: Phase 4
+  // local-commit mode appends the accepted overlay to the base-plus-overlay
+  // chain and updates the persistent inside+outside chart caches, avoiding
+  // per-accept dense materialization and sidecar rebuilds.
   //
-  // Current Phase-9 scope: this is a safe local-cache-update mode, not the
-  // full base-plus-overlay-chain design. Each accepted move is still committed
-  // by dense overlay-grammar materialization, and final compaction emits one
-  // selected concrete tree whose rebuilt objective is checked against the
-  // local sidecar objective. It does not preserve every accepted overlay
-  // production/topology in the output DAG.
+  // Phase 4 limitations: local commit requires an exact acceptance gate
+  // (exact_multisite or fixed_topology_exact) and currently requires
+  // chart.score_ua_edge == false because the persistent outside cache needs a
+  // documented per-pattern reference-state convention.  Final compaction is
+  // still tree-valued until the Phase 5 grammar-valued compaction oracle lands,
+  // so not every accepted overlay production/topology is preserved in the
+  // output DAG yet.
   bool rebuild_after_accept = true;
 
   // Test/diagnostic hooks for validating expensive guardrails without needing
@@ -357,6 +358,10 @@ struct chart_spr_search_options {
   // the Phase 4 tests enable it to satisfy the "two-chart oracle green after
   // every accept" exit criterion without exposing the cache objects.
   bool verify_local_commit_two_chart_oracle_for_tests = false;
+  // Test-only injection point for the Phase 4 hard-error contract: after the
+  // overlay-chain append succeeds, force a post-append failure and verify the
+  // search propagates it instead of converting it into an ordinary rejection.
+  bool force_local_commit_post_append_failure_for_tests = false;
   std::optional<std::uint64_t>
       override_post_materialization_rebuilt_score_for_tests;
   std::optional<std::uint64_t>
@@ -482,9 +487,10 @@ struct chart_spr_search_summary {
   std::size_t sidecar_rebuilds_after_accept = 0;
   std::size_t initial_search_state_rebuilds = 0;
   std::size_t full_search_state_rebuilds = 0;
-  // Phase-9 local-update final compaction performs one safety rebuild from the
-  // output DAG.  Keep it separate from per-accepted-move sidecar rebuilds so
-  // benchmark reports can distinguish amortized final verification cost.
+  // Local-commit final compaction performs one safety rebuild from the output
+  // DAG (tree-valued in Phase 4; grammar-valued oracle lands in Phase 5). Keep
+  // it separate from per-accepted-move sidecar rebuilds so benchmark reports
+  // can distinguish amortized final verification cost.
   std::size_t final_compaction_rebuilds = 0;
   std::size_t candidate_accepts_attempted = 0;
   std::size_t post_materialization_rejections = 0;
