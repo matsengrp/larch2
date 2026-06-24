@@ -64,15 +64,17 @@ produce byte-identical counters and the splice is idempotent.
 Per the plan's cross-cutting counter contract:
 
 - **Phase 4** asserts that a local-commit run (`rebuild_after_accept = false`)
-  keeps `sidecar_rebuilds_after_accept == 0` and (during the P4->P5 window)
-  `full_overlay_materializations == 0`, both of which are nonzero here in the
-  conservative baseline whenever an accept occurs.
+  keeps `sidecar_rebuilds_after_accept == 0` and
+  `overlay_materializations_for_accept_materialization == 0`; the umbrella
+  `full_overlay_materializations` may still be nonzero because exact candidate
+  verification materializes overlays until the later chain-reuse phases land.
 - **Phase 4** also asserts conservative mode (`rebuild_after_accept = true`)
-  passes its existing tests unchanged and that its
-  `full_overlay_materializations` count is unchanged from this baseline.
-- **Phase 5** raises the local-commit `full_overlay_materializations` bound to
-  `<= 1` once the dense chain materialization lands in compaction; this
-  baseline pins the conservative-mode reference for that comparison.
+  passes its existing tests unchanged and that its per-accept materialization
+  count is unchanged from this baseline.
+- **Phase 5** adds one separately counted
+  `overlay_materializations_for_final_compaction` to local-commit runs when the
+  dense chain materialization lands in grammar-valued compaction; this baseline
+  pins the conservative-mode reference for that comparison.
 - **Phase 10** diffs a local-commit run's counters against this baseline in a
   CI-scale sanity table.
 
@@ -122,6 +124,7 @@ chart_spr_search_counters:
   overlay_materializations_for_local_scoring_bridge:           0
   overlay_materializations_for_exact_verification:             16
   overlay_materializations_for_accept_materialization:         0
+  overlay_materializations_for_final_compaction:               0
   sidecar_rebuilds_after_accept:                               0
   full_composite_rebuilds:                                     0
   local_candidate_scores:                                      89312

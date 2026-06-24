@@ -332,7 +332,7 @@ write_chart_curve() {
   ' "$report" >>"$curve"
 }
 
-printf 'benchmark_scope\tfixture\tmethod\tstatus\tvalidation_status\tinitial_validated_parsimony_min\tfinal_validated_parsimony_min\tbest_reported_objective\tbest_validated_parsimony_min\twall_clock_s\titerations\tseed\tacceptance\tcandidate_selection\tcandidate_source\tobjective\tcandidates_generated\tcandidates_scored\texact_verifications\taccepted_moves\tcandidate_accepts_attempted\tpost_materialization_rejections\tcommitted_attempt_ratio\tcache_build_ms\tlocal_scoring_ms\texact_verification_ms\taccepted_rebuild_ms\tfinal_compaction_ms\tpost_materialization_check_ms\ttotal_ms\tlocal_ms_per_candidate\tlocal_candidates_per_second\taffected_mean\taffected_p50\taffected_p95\taffected_max\tupward_path_iterator_steps\tpath_pairs_considered\tcandidates_pruned_before_construction\tcandidates_pruned_after_construction\tcandidates_generated_after_dedup\tcandidate_cap_cutoffs\tpath_budget_cutoffs\tfull_search_state_rebuilds\tfinal_compaction_rebuilds\tinitial_search_state_rebuilds\tsidecar_rebuilds_after_accept\toverlay_materializations_for_exact_verification\toverlay_materializations_for_accept_materialization\toverlay_materializations_for_oracle\tfull_overlay_materializations\treachable_clades_traversed\treachable_productions_traversed\treachability_full_grammar_like_passes\tgrammar_clades\tgrammar_productions\tactive_patterns\tchart_cache_resident_bytes\tfinal_dag_nodes\tfinal_dag_edges\tcurve_path\treport_path\n' >"$summary_tsv"
+printf 'benchmark_scope\tfixture\tmethod\tstatus\tvalidation_status\tinitial_validated_parsimony_min\tfinal_validated_parsimony_min\tbest_reported_objective\tbest_validated_parsimony_min\twall_clock_s\titerations\tseed\tacceptance\tcandidate_selection\tcandidate_source\tobjective\tcandidates_generated\tcandidates_scored\texact_verifications\taccepted_moves\tcandidate_accepts_attempted\tpost_materialization_rejections\tcommitted_attempt_ratio\tcache_build_ms\tlocal_scoring_ms\texact_verification_ms\taccepted_rebuild_ms\tfinal_compaction_ms\tfinal_compaction_exactness_kind\tpost_materialization_check_ms\ttotal_ms\tlocal_ms_per_candidate\tlocal_candidates_per_second\taffected_mean\taffected_p50\taffected_p95\taffected_max\tupward_path_iterator_steps\tpath_pairs_considered\tcandidates_pruned_before_construction\tcandidates_pruned_after_construction\tcandidates_generated_after_dedup\tcandidate_cap_cutoffs\tpath_budget_cutoffs\tfull_search_state_rebuilds\tfinal_compaction_rebuilds\tinitial_search_state_rebuilds\tsidecar_rebuilds_after_accept\toverlay_materializations_for_exact_verification\toverlay_materializations_for_accept_materialization\toverlay_materializations_for_final_compaction\toverlay_materializations_for_oracle\tfull_overlay_materializations\treachable_clades_traversed\treachable_productions_traversed\treachability_full_grammar_like_passes\tgrammar_clades\tgrammar_productions\tactive_patterns\tchart_cache_resident_bytes\tfinal_dag_nodes\tfinal_dag_edges\tcurve_path\treport_path\n' >"$summary_tsv"
 
 append_row() {
   printf '%s' "CHART_SPR_PHASE8_SEARCH_COMPARISON" >>"$summary_tsv"
@@ -412,6 +412,7 @@ for spec in "${fixture_specs[@]}"; do
     "NA" "NA" "NA" "NA" "NA" "NA" "NA" "NA" "NA" "NA" "NA" \
     "NA" "NA" "NA" "NA" "NA" "NA" "NA" "NA" "NA" "NA" "NA" \
     "NA" "NA" "NA" "NA" "NA" "NA" "NA" "NA" "NA" "NA" "NA" \
+    "NA" "NA" "NA" "NA" \
     "${final_nodes:-NA}" "${final_edges:-NA}" "$baseline_curve" "$baseline_stderr"
 
   for mode in $mode_list; do
@@ -538,6 +539,7 @@ for spec in "${fixture_specs[@]}"; do
       "$(extract_value "$report" exact_verification_ms)" \
       "$(extract_value "$report" accepted_rebuild_ms)" \
       "$(extract_value "$report" final_compaction_ms)" \
+      "$(extract_value "$report" final_compaction_exactness_kind)" \
       "$(extract_value "$report" post_materialization_check_ms)" \
       "$(extract_value "$report" total_ms)" \
       "$local_ms_per_candidate" \
@@ -559,6 +561,7 @@ for spec in "${fixture_specs[@]}"; do
       "$(extract_value "$report" sidecar_rebuilds_after_accept)" \
       "$(extract_value "$report" overlay_materializations_for_exact_verification)" \
       "$(extract_value "$report" overlay_materializations_for_accept_materialization)" \
+      "$(extract_value "$report" overlay_materializations_for_final_compaction)" \
       "$(extract_counter_value "$report" overlay_materializations_for_oracle)" \
       "$(extract_counter_value "$report" full_overlay_materializations)" \
       "$(extract_counter_value "$report" reachable_clades_traversed)" \
@@ -584,7 +587,7 @@ done
   awk -F '\t' 'NR == 1 { next } {
     attempted = $21; accepted = $20;
     aa = (accepted == "NA" || attempted == "NA") ? "NA" : accepted "/" attempted;
-    printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n", $2, $3, $4, $5, $6, $7, $8, $9, $10, $13, $15, $18, $19, aa, $29, $60;
+    printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n", $2, $3, $4, $5, $6, $7, $8, $9, $10, $13, $15, $18, $19, aa, $31, $64;
   }' "$summary_tsv"
   echo
   echo "Full TSV: $summary_tsv"

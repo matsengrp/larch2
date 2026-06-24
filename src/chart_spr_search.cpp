@@ -3,6 +3,7 @@
 #include <larch/inside_chart_cache.hpp>
 #include <larch/outside_chart_cache.hpp>
 #include <larch/overlay_chain.hpp>
+#include <larch/overlay_chain_compaction.hpp>
 #include <larch/rank3_rewrite.hpp>
 
 #include <algorithm>
@@ -361,7 +362,8 @@ rank3_topology chart_spr_choose_local_update_compaction_topology(
   if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite) {
     multisite_topology_trace_options trace_options;
     trace_options.max_optimal_topologies = 1;
-    trace_options.trim_options = options.exact_trim;
+    trace_options.trim_options =
+        overlay_chain_compaction_trace_trim_options(options.exact_trim);
     auto trace = build_multisite_optimal_topologies(
         state.grammar, state.active_patterns.patterns, state.chart_opts,
         trace_options);
@@ -388,25 +390,6 @@ rank3_topology chart_spr_choose_local_update_compaction_topology(
   return rank3_topology_preferring_productions(state.grammar, preferred_ids);
 }
 
-phylo_dag chart_spr_materialize_local_update_state_to_dag(
-    phylo_dag& source, chart_spr_search_state const& state,
-    chart_spr_search_options const& options,
-    std::vector<rank3_production_taxa_key> const& preferred_keys,
-    chart_spr_candidate_score const* last_accepted) {
-  auto topology = chart_spr_choose_local_update_compaction_topology(
-      state, options, preferred_keys, last_accepted);
-  // Current Phase-4 compaction is intentionally tree-valued: choose one
-  // concrete topology, materialize it, then rebuild/check the objective.  This
-  // is score-safe but does not preserve all productions/topologies present in
-  // the locally updated accepted-state grammar.
-  auto dag = materialize_rank3_tree_from_topology(
-      source, state.grammar, topology, true,
-      std::numeric_limits<float>::max());
-  validate_dag(dag, "chart SPR local accepted-state compacted DAG",
-               thread_pool::get_default());
-  return dag;
-}
-
 std::uint64_t chart_spr_local_update_final_expected_score(
     chart_spr_search_state const& state,
     chart_spr_search_options const& options,
@@ -428,65 +411,70 @@ std::uint64_t chart_spr_local_update_final_expected_score(
   return state.composite_lower_bound_with_invariants;
 }
 
-std::uint64_t chart_spr_local_update_final_rebuilt_score(
-    chart_spr_search_state const& rebuilt_state,
-    chart_spr_search_options const& options,
-    chart_spr_candidate_score const* last_accepted) {
-  switch (options.acceptance_mode) {
-    case chart_spr_acceptance_mode::exact_multisite:
-      return chart_spr_state_exact_score_with_invariants(rebuilt_state,
-                                                         options.exact_trim);
-    case chart_spr_acceptance_mode::lower_bound_heuristic:
-      return rebuilt_state.composite_lower_bound_with_invariants;
-    case chart_spr_acceptance_mode::fixed_topology_exact:
-      if (last_accepted == nullptr) {
-        throw std::runtime_error(
-            "chart SPR local accepted-state final compaction: fixed-topology "
-            "mode requires the last accepted candidate");
-      }
-      return chart_spr_rebuilt_fixed_topology_score_with_invariants(
-          rebuilt_state, *last_accepted);
-  }
-  return rebuilt_state.composite_lower_bound_with_invariants;
-}
-
 struct chart_spr_local_update_compaction_gate_result {
   phylo_dag dag;
   chart_spr_search_state rebuilt_state;
   std::uint64_t rebuilt_score = 0;
+  multisite_keep_mask_kind exactness_kind = multisite_keep_mask_kind::none;
   bool reused_patterns = false;
+  std::size_t materialized_tree_count = 0;
 };
 
 chart_spr_local_update_compaction_gate_result
 chart_spr_compact_and_verify_local_update_state(
-    phylo_dag& source, chart_spr_search_state const& local_state,
+    phylo_dag& source, overlay_chain const& chain,
+    chart_spr_search_state const& local_state,
     chart_spr_search_options const& options,
-    std::vector<rank3_production_taxa_key> const& preferred_keys,
-    chart_spr_candidate_score const* last_accepted) {
+    chart_spr_candidate_score const* last_accepted,
+    chart_spr_search_counters& counters) {
   auto expected_score = chart_spr_local_update_final_expected_score(
       local_state, options, last_accepted);
 
-  chart_spr_local_update_compaction_gate_result result;
-  result.dag = chart_spr_materialize_local_update_state_to_dag(
-      source, local_state, options, preferred_keys, last_accepted);
-  auto rebuilt_grammar = build_clade_grammar(result.dag);
-  result.rebuilt_state = rebuild_chart_spr_search_state_after_accept(
-      local_state, result.dag, std::move(rebuilt_grammar), options,
-      result.reused_patterns);
-  result.rebuilt_score = chart_spr_local_update_final_rebuilt_score(
-      result.rebuilt_state, options, last_accepted);
-  if (options.override_final_compaction_rebuilt_score_for_tests) {
-    result.rebuilt_score =
-        *options.override_final_compaction_rebuilt_score_for_tests;
-  }
+  overlay_chain_compaction_options compaction_options;
+  compaction_options.validate = true;
+  compaction_options.generated_edge_weight =
+      std::numeric_limits<float>::max();
+  compaction_options.witness_topologies.push_back(
+      chart_spr_choose_local_update_compaction_topology(
+          local_state, options, {}, last_accepted));
 
-  if (result.rebuilt_score != expected_score) {
+  ++counters.full_overlay_materializations;
+  ++counters.overlay_materializations_for_final_compaction;
+  auto compacted = compact_overlay_chain_to_dag(source, chain,
+                                                compaction_options);
+
+  auto oracle = grammar_level_exact_parsimony(
+      compacted.rebuilt.grammar, local_state.active_patterns,
+      local_state.chart_opts, local_state.invariant_constant_offset,
+      options.exact_trim);
+
+  chart_spr_local_update_compaction_gate_result result;
+  result.rebuilt_score = oracle.value;
+  result.exactness_kind = oracle.exactness_kind;
+  result.materialized_tree_count = compacted.materialized_tree_count;
+
+  if (result.rebuilt_score > expected_score) {
     throw std::runtime_error(
-        "chart SPR local accepted-state final compaction: rebuilt objective " +
+        "chart SPR local accepted-state final compaction: grammar-level "
+        "output DAG optimum " +
         std::to_string(result.rebuilt_score) +
-        " does not match local sidecar objective " +
+        " exceeds chain recorded objective " +
         std::to_string(expected_score));
   }
+  if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite &&
+      result.rebuilt_score != expected_score) {
+    throw std::runtime_error(
+        "chart SPR local accepted-state final compaction: grammar-level "
+        "output DAG optimum " +
+        std::to_string(result.rebuilt_score) +
+        " does not match exact chain objective " +
+        std::to_string(expected_score));
+  }
+
+  result.dag = std::move(compacted.dag);
+  result.rebuilt_state = rebuild_chart_spr_search_state_after_accept(
+      local_state, result.dag, std::move(compacted.rebuilt.grammar), options,
+      result.reused_patterns);
   return result;
 }
 
@@ -587,7 +575,6 @@ struct chart_spr_local_commit_result {
   chart_spr_local_commit_outcome outcome =
       chart_spr_local_commit_outcome::committed;
   std::string skip_reason;
-  std::vector<rank3_production_taxa_key> accepted_temp_production_keys;
 };
 
 // Phase 3 two-chart oracle self-check: recompute BOTH charts from scratch on
@@ -823,16 +810,6 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     chart_spr_refresh_state_tip_view_after_local_commit(state, materialized,
                                                          *sub.icache);
 
-    // Record accepted temp-production taxon-set keys for final compaction
-    // (tree-valued compaction is retained for Phase 4; Phase 5 lands the
-    // grammar-valued compaction oracle).
-    for (auto dense_pid : materialized.temp_production_to_dense) {
-      if (dense_pid == no_production) continue;
-      rank3_detail::append_unique_key(
-          result.accepted_temp_production_keys,
-          rank3_detail::production_key_from_id(materialized.grammar, dense_pid));
-    }
-
     // Mirror cumulative cache counters onto the running attempt-counters (the
     // caches persist across accepts; their counters are cumulative).
     counters.inside_rows_recomputed_on_commit =
@@ -872,6 +849,8 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.overlay_materializations_for_exact_verification;
   summary.overlay_materializations_for_accept_materialization =
       counters.overlay_materializations_for_accept_materialization;
+  summary.overlay_materializations_for_final_compaction =
+      counters.overlay_materializations_for_final_compaction;
   summary.sidecar_rebuilds_after_accept =
       counters.sidecar_rebuilds_after_accept;
   summary.candidate_accepts_attempted = counters.candidate_accepts_attempted;
@@ -931,7 +910,6 @@ chart_spr_search_result run_chart_spr_search(
       chart_spr_search_detail::normalize_chart_spr_worker_count(
           options.local_score_worker_count);
   std::vector<std::size_t> aggregate_affected_counts;
-  std::vector<rank3_production_taxa_key> local_update_preferred_keys;
   std::optional<chart_spr_candidate_score> last_local_update_accepted;
   bool used_local_accept_updates = false;
 
@@ -1134,9 +1112,6 @@ chart_spr_search_result run_chart_spr_search(
 
         local_commit_mutated_shared_state = true;
         immediate_reversal_key_to_skip = accepted_immediate_reversal_key;
-        for (auto const& key : commit.accepted_temp_production_keys) {
-          rank3_detail::append_unique_key(local_update_preferred_keys, key);
-        }
         ++attempt_counters.local_commit_accepted_moves;
         ++attempt_counters.accepted_moves;
         // state.grammar / pattern_charts / bounds were refreshed in place by
@@ -1180,14 +1155,16 @@ chart_spr_search_result run_chart_spr_search(
     auto compact_start = std::chrono::steady_clock::now();
     auto preserved_counters = state.counters;
     auto compacted = chart_spr_compact_and_verify_local_update_state(
-        result.dag, state, options, local_update_preferred_keys,
-        last_local_update_accepted ? &*last_local_update_accepted : nullptr);
+        result.dag, *local_commit_substrate->chain, state, options,
+        last_local_update_accepted ? &*last_local_update_accepted : nullptr,
+        preserved_counters);
     result.dag = std::move(compacted.dag);
     compacted.rebuilt_state.dag = &result.dag;
     compacted.rebuilt_state.counters = preserved_counters;
     state = std::move(compacted.rebuilt_state);
     result.summary.final_score = compacted.rebuilt_score;
     result.summary.final_compaction_rebuilds = 1;
+    result.summary.final_compaction_exactness_kind = compacted.exactness_kind;
     result.summary.final_compaction_ms += chart_spr_elapsed_ms(
         compact_start, std::chrono::steady_clock::now());
   }

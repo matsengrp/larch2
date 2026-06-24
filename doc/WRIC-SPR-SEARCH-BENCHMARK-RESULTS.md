@@ -4,13 +4,13 @@ Committed Phase-8 sanity tables from the harness in `tools/wric_spr_search_bench
 
 A strict final Phase-8 table should additionally run the exact chart-SPR modes (`sampled_tree_fixed`, `grammar_exact`, and `hybrid_exact`) on the chosen medium and real fixtures in an appropriate benchmark build. The ASAN tables below deliberately keep exact mode to the small fixture so they remain reproducible during development.
 
-## Phase-4 local-commit caveats
+## Phase-5 local-commit caveats
 
-`--chart-spr-local-accept-updates` now uses the Phase-4 base-plus-overlay-chain local-commit path: accepted moves append to the overlay chain and update the persistent inside/outside chart caches, avoiding per-accept dense `materialize_overlay_grammar()` plus sidecar rebuild. The per-accept dense-materialization counter is `overlay_materializations_for_accept_materialization`, which should remain zero for local-commit runs; the umbrella `full_overlay_materializations` can still be nonzero because exact candidate verification may materialize candidate overlays until the later transient-verification phases land.
+`--chart-spr-local-accept-updates` now uses the base-plus-overlay-chain local-commit path: accepted moves append to the overlay chain and update the persistent inside/outside chart caches, avoiding per-accept dense `materialize_overlay_grammar()` plus sidecar rebuild. The per-accept dense-materialization counter is `overlay_materializations_for_accept_materialization`, which should remain zero for local-commit runs; the umbrella `full_overlay_materializations` can still be nonzero because exact candidate verification may materialize candidate overlays until the later transient-verification phases land.
 
 Current limitations are explicit rather than silent fallbacks: local commit requires an exact gate (`exact_multisite` or `fixed_topology_exact`), rejects `lower_bound_heuristic`, and rejects `score_ua_edge=true` until the persistent outside-cache path has a documented per-pattern reference-state convention.
 
-Final local-commit compaction remains tree-valued until the Phase-5 grammar-valued compaction oracle lands: the code selects one concrete topology, materializes that tree, rebuilds the search state from the output DAG, and checks that the rebuilt objective equals the local sidecar objective. This is score-safe for the selected topology, but it does not preserve every accepted overlay production/topology in the output DAG. The final safety rebuild is reported separately as `final_compaction_rebuilds`/`final_compaction_ms`, not as a per-accepted-move sidecar rebuild. Use conservative rebuild mode when output DAG structural diversity must be preserved beyond the selected score-equivalent tree.
+Final local-commit compaction is grammar-valued: the chain is densely materialized once, the compacted output DAG preserves accepted overlay production witnesses by taxon-set key, and the reported final parsimony is the output DAG's exact B&B optimum labelled by `final_compaction_exactness_kind`. The final compaction materialization is counted separately as `overlay_materializations_for_final_compaction`; the final safety rebuild remains reported as `final_compaction_rebuilds`/`final_compaction_ms`, not as a per-accepted-move sidecar rebuild.
 
 ## Small/medium/repo-DAG lower-bound smoke comparison
 

@@ -1245,11 +1245,13 @@ Analysis:
                           selection exact-verification policy are separate and
                           reported separately.
   --chart-spr-local-accept-updates
-                          Use optional Phase-9 accepted-state local cache
-                          updates instead of rebuilding sidecar state after
-                          each accepted move; accepted overlays are still
-                          densely materialized, and final compaction emits one
-                          selected tree with a rebuild-equivalence check
+                          Use DAG-native local accepted-state updates: append
+                          accepted overlays to a base-plus-overlay chain and
+                          refresh persistent chart caches instead of doing a
+                          per-accept sidecar rebuild/materialization. Final
+                          compaction materializes the chain once into a
+                          grammar-valued output DAG and scores it with the
+                          exact B&B oracle (requires an exact accept gate)
   --chart-spr-max-candidates <N>
                           Candidate cap for chart-SPR diagnostics
                           (default 0, unlimited; post-dedup)
@@ -2851,6 +2853,8 @@ static void print_chart_spr_search_counter_fields(
       << counters.overlay_materializations_for_exact_verification << "\n";
   out << indent << "overlay_materializations_for_accept_materialization: "
       << counters.overlay_materializations_for_accept_materialization << "\n";
+  out << indent << "overlay_materializations_for_final_compaction: "
+      << counters.overlay_materializations_for_final_compaction << "\n";
   out << indent << "sidecar_rebuilds_after_accept: "
       << counters.sidecar_rebuilds_after_accept << "\n";
   out << indent << "full_composite_rebuilds: "
@@ -3454,11 +3458,18 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.full_search_state_rebuilds << "\n";
   out << "  final_compaction_rebuilds: "
       << search.summary.final_compaction_rebuilds << "\n";
+  out << "  final_compaction_exactness_kind: "
+      << multisite_keep_mask_kind_name(
+             search.summary.final_compaction_exactness_kind)
+      << "\n";
   out << "  overlay_materializations_for_exact_verification: "
       << search.summary.overlay_materializations_for_exact_verification
       << "\n";
   out << "  overlay_materializations_for_accept_materialization: "
       << search.summary.overlay_materializations_for_accept_materialization
+      << "\n";
+  out << "  overlay_materializations_for_final_compaction: "
+      << search.summary.overlay_materializations_for_final_compaction
       << "\n";
   out << "  cache_build_ms: " << std::fixed << std::setprecision(3)
       << search.summary.cache_build_ms << "\n";

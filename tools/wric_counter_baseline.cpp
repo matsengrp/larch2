@@ -141,6 +141,8 @@ int main() {
                      c.overlay_materializations_for_exact_verification);
   print_counter_line("overlay_materializations_for_accept_materialization",
                      c.overlay_materializations_for_accept_materialization);
+  print_counter_line("overlay_materializations_for_final_compaction",
+                     c.overlay_materializations_for_final_compaction);
   print_counter_line("sidecar_rebuilds_after_accept",
                      c.sidecar_rebuilds_after_accept);
   print_counter_line("full_composite_rebuilds", c.full_composite_rebuilds);

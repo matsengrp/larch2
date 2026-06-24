@@ -42,6 +42,10 @@ struct chart_spr_search_counters {
   std::size_t overlay_materializations_for_local_scoring_bridge = 0;
   std::size_t overlay_materializations_for_exact_verification = 0;
   std::size_t overlay_materializations_for_accept_materialization = 0;
+  // Phase 5 grammar-valued final compaction: one dense overlay-chain
+  // materialization at the end of a local-commit run, counted separately from
+  // per-accept materialization and per-candidate exact verification.
+  std::size_t overlay_materializations_for_final_compaction = 0;
   std::size_t sidecar_rebuilds_after_accept = 0;
   std::size_t full_composite_rebuilds = 0;
   std::size_t local_candidate_scores = 0;
@@ -337,13 +341,13 @@ struct chart_spr_search_options {
   // chain and updates the persistent inside+outside chart caches, avoiding
   // per-accept dense materialization and sidecar rebuilds.
   //
-  // Phase 4 limitations: local commit requires an exact acceptance gate
+  // Phase 4/5 limitations: local commit requires an exact acceptance gate
   // (exact_multisite or fixed_topology_exact) and currently requires
   // chart.score_ua_edge == false because the persistent outside cache needs a
   // documented per-pattern reference-state convention.  Final compaction is
-  // still tree-valued until the Phase 5 grammar-valued compaction oracle lands,
-  // so not every accepted overlay production/topology is preserved in the
-  // output DAG yet.
+  // grammar-valued: the materialized chain DAG is scored by exact B&B over the
+  // output grammar and every accepted overlay production key is checked as a
+  // witness in the compacted DAG.
   bool rebuild_after_accept = true;
 
   // Test/diagnostic hooks for validating expensive guardrails without needing
@@ -364,6 +368,10 @@ struct chart_spr_search_options {
   bool force_local_commit_post_append_failure_for_tests = false;
   std::optional<std::uint64_t>
       override_post_materialization_rebuilt_score_for_tests;
+  // Legacy Phase-4 tree-valued final-compaction override.  The Phase-5
+  // grammar-valued local-compaction oracle ignores this hook; it remains in
+  // the options struct so tests can assert the old tree-level score override no
+  // longer controls the reported output-DAG parsimony.
   std::optional<std::uint64_t>
       override_final_compaction_rebuilt_score_for_tests;
 
@@ -484,13 +492,14 @@ struct chart_spr_search_summary {
   std::size_t exact_verifications = 0;
   std::size_t overlay_materializations_for_exact_verification = 0;
   std::size_t overlay_materializations_for_accept_materialization = 0;
+  std::size_t overlay_materializations_for_final_compaction = 0;
   std::size_t sidecar_rebuilds_after_accept = 0;
   std::size_t initial_search_state_rebuilds = 0;
   std::size_t full_search_state_rebuilds = 0;
   // Local-commit final compaction performs one safety rebuild from the output
-  // DAG (tree-valued in Phase 4; grammar-valued oracle lands in Phase 5). Keep
-  // it separate from per-accepted-move sidecar rebuilds so benchmark reports
-  // can distinguish amortized final verification cost.
+  // DAG and scores it with the Phase-5 grammar-valued exact oracle. Keep it
+  // separate from per-accepted-move sidecar rebuilds so benchmark reports can
+  // distinguish amortized final verification cost.
   std::size_t final_compaction_rebuilds = 0;
   std::size_t candidate_accepts_attempted = 0;
   std::size_t post_materialization_rejections = 0;
@@ -515,6 +524,8 @@ struct chart_spr_search_summary {
   double exact_verification_ms = 0.0;
   double accepted_rebuild_ms = 0.0;
   double final_compaction_ms = 0.0;
+  multisite_keep_mask_kind final_compaction_exactness_kind =
+      multisite_keep_mask_kind::none;
   double post_materialization_check_ms = 0.0;
   std::size_t active_pattern_count = 0;
   std::size_t initial_grammar_clade_count = 0;
@@ -1971,6 +1982,8 @@ inline void add_chart_spr_search_counters(
       src.overlay_materializations_for_exact_verification;
   dst.overlay_materializations_for_accept_materialization +=
       src.overlay_materializations_for_accept_materialization;
+  dst.overlay_materializations_for_final_compaction +=
+      src.overlay_materializations_for_final_compaction;
   dst.sidecar_rebuilds_after_accept += src.sidecar_rebuilds_after_accept;
   dst.full_composite_rebuilds += src.full_composite_rebuilds;
   dst.local_candidate_scores += src.local_candidate_scores;
@@ -2023,6 +2036,17 @@ inline void add_chart_spr_search_counters(
       src.reachable_temp_productions_traversed;
   dst.reachability_full_grammar_like_passes +=
       src.reachability_full_grammar_like_passes;
+  dst.local_commit_accepted_moves += src.local_commit_accepted_moves;
+  dst.local_commit_tombstone_scope_skips +=
+      src.local_commit_tombstone_scope_skips;
+  dst.inside_rows_recomputed_on_commit +=
+      src.inside_rows_recomputed_on_commit;
+  dst.outside_rows_recomputed_on_commit +=
+      src.outside_rows_recomputed_on_commit;
+  dst.local_commit_two_chart_oracle_runs +=
+      src.local_commit_two_chart_oracle_runs;
+  dst.local_commit_tip_grammar_refreshes +=
+      src.local_commit_tip_grammar_refreshes;
 }
 
 struct chart_spr_local_score_scratch {
