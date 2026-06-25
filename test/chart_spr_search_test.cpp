@@ -1442,6 +1442,38 @@ static void test_phase5_final_compaction_uses_grammar_oracle_not_tree_override()
   std::println("  PASS");
 }
 
+static void test_phase5_final_compaction_checks_recorded_exact_objective() {
+  std::println("test_phase5_final_compaction_checks_recorded_exact_objective");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 8;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.override_local_commit_recorded_objective_for_tests =
+      std::numeric_limits<std::uint64_t>::max();
+
+  bool threw = false;
+  std::string message;
+  try {
+    (void)larch::run_chart_spr_search(std::move(dag), grammar, options);
+  } catch (std::runtime_error const& e) {
+    threw = true;
+    message = e.what();
+  }
+  CHECK(threw);
+  CHECK(message.find("recorded exact chain objective") != std::string::npos);
+  CHECK(message.find("fresh exact diagnostic") != std::string::npos);
+
+  std::println("  PASS");
+}
+
 static void test_phase9_pattern_batch_local_update_matches_output_dag() {
   std::println("test_phase9_pattern_batch_local_update_matches_output_dag");
 
@@ -2170,6 +2202,107 @@ static void test_phase5_overlay_chain_compaction_preserves_intended_keys() {
   std::println("  PASS");
 }
 
+static larch::test::tiny_tree_node phase5_history_tree_one() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("ABC", "A",
+                  {tiny_inner("AB", "A", {tiny_leaf("A", "A"),
+                                             tiny_leaf("B", "A")}),
+                   tiny_leaf("C", "A")}),
+       tiny_inner("DE", "A", {tiny_leaf("D", "A"),
+                                tiny_leaf("E", "A")})});
+}
+
+static larch::test::tiny_tree_node phase5_history_tree_two() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AC", "A", {tiny_leaf("A", "A"),
+                                tiny_leaf("C", "A")}),
+       tiny_inner("BDE", "A",
+                  {tiny_leaf("B", "A"),
+                   tiny_inner("DE", "A", {tiny_leaf("D", "A"),
+                                             tiny_leaf("E", "A")})})});
+}
+
+static larch::production_id phase5_find_production_by_key(
+    larch::clade_grammar const& grammar,
+    larch::rank3_production_taxa_key key) {
+  larch::rank3_detail::normalize_production_key(key);
+  for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
+    auto dense_pid = static_cast<larch::production_id>(pid);
+    if (larch::rank3_detail::production_key_from_id(grammar, dense_pid) ==
+        key) {
+      return dense_pid;
+    }
+  }
+  return larch::no_production;
+}
+
+static void test_phase5_compaction_augments_historical_intended_keys() {
+  std::println("test_phase5_compaction_augments_historical_intended_keys");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", phase5_history_tree_one()));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", phase5_history_tree_two()));
+  auto dag = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(dag);
+
+  auto a = clade_for(grammar, {"A"});
+  auto b = clade_for(grammar, {"B"});
+  auto c = clade_for(grammar, {"C"});
+  auto abc = clade_for(grammar, {"A", "B", "C"});
+
+  larch::overlay_chain chain(grammar);
+  larch::spr_overlay_delta delta1;
+  delta1.base = &grammar;
+  delta1.temp_clades.push_back(
+      larch::clade_key{taxa_for(grammar, {"B", "C"})});
+  delta1.temp_productions.push_back(temp_prod(
+      larch::temp_clade_ref(0),
+      {larch::base_clade_ref(b), larch::base_clade_ref(c)}));
+  delta1.temp_productions.push_back(temp_prod(
+      larch::base_clade_ref(abc),
+      {larch::base_clade_ref(a), larch::temp_clade_ref(0)}));
+  chain.append(delta1);
+
+  auto after_first = larch::materialize_overlay_chain(chain);
+  auto const& tip1 = after_first.grammar;
+  auto abc_after_pid = after_first.temp_production_to_dense.at(1);
+  CHECK(abc_after_pid != larch::no_production);
+  auto abc_after_key = larch::rank3_detail::production_key_from_id(
+      tip1, abc_after_pid);
+  auto root1 = clade_for(tip1, {"A", "B", "C", "D", "E"});
+  auto abc1 = clade_for(tip1, {"A", "B", "C"});
+  auto de1 = clade_for(tip1, {"D", "E"});
+  auto root_abc_de = production_id_for(tip1, root1, {abc1, de1});
+
+  larch::spr_overlay_delta delta2;
+  delta2.base = &tip1;
+  delta2.removed_base_productions.push_back(root_abc_de);
+  chain.append(delta2);
+
+  auto final_materialized = larch::materialize_overlay_chain(chain);
+  CHECK(phase5_find_production_by_key(final_materialized.grammar,
+                                      abc_after_key) == larch::no_production);
+
+  // Standalone compaction derives prefix witness topologies itself: callers do
+  // not need to provide the historical ancestor path for abc_after_key, even
+  // though that production's parent is unreachable in the final chain.
+  auto compacted = larch::compact_overlay_chain_to_dag(dag, chain);
+  CHECK(compacted.all_intended_productions_present());
+  CHECK(compacted.all_witness_topologies_present());
+  CHECK(larch::rank3_detail::has_production_key(compacted.rebuilt.grammar,
+                                                 abc_after_key));
+
+  std::println("  PASS");
+}
+
 static void test_phase4_local_commit_counter_contract_and_oracle() {
   std::println("test_phase4_local_commit_counter_contract_and_oracle");
 
@@ -2676,6 +2809,7 @@ int main() {
   test_phase5_known_improving_search_commits_once();
   test_phase9_known_improving_search_uses_local_accept_update();
   test_phase5_final_compaction_uses_grammar_oracle_not_tree_override();
+  test_phase5_final_compaction_checks_recorded_exact_objective();
   test_phase9_pattern_batch_local_update_matches_output_dag();
   test_phase9_fixed_topology_compaction_uses_certificate();
   test_phase9_lower_bound_compaction_matches_output_dag();
@@ -2689,6 +2823,7 @@ int main() {
   test_phase5_witness_topology_selects_required_ancestor_path();
   test_phase5_final_compaction_normalizes_trim_options();
   test_phase5_overlay_chain_compaction_preserves_intended_keys();
+  test_phase5_compaction_augments_historical_intended_keys();
   test_phase4_local_commit_counter_contract_and_oracle();
   test_phase4_conservative_mode_counters_unchanged();
   test_phase4_local_commit_score_ua_edge_rejected();

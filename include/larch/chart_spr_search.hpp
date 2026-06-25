@@ -374,6 +374,12 @@ struct chart_spr_search_options {
   // longer controls the reported output-DAG parsimony.
   std::optional<std::uint64_t>
       override_final_compaction_rebuilt_score_for_tests;
+  // Test-only corruption hook for the Phase-5 recorded-chain-objective check:
+  // local compaction must compare the output DAG oracle to the exact objective
+  // recorded at accept time, not to a fresh final-state recomputation that
+  // could mask a bad recorded score.
+  std::optional<std::uint64_t>
+      override_local_commit_recorded_objective_for_tests;
 
   std::uint32_t seed = 1;
 };

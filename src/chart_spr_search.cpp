@@ -435,11 +435,12 @@ chart_spr_collect_local_update_compaction_witness_topologies(
   // Keep the final exact-objective witness used by the grammar-valued safety
   // check.  For exact_multisite this is a deterministic B&B optimum of the
   // final chain tip; for fixed_topology_exact it is the last accepted
-  // certificate resolved in the final chain tip when possible.  Historical
-  // accepted fixed-topology certificates are passed separately as stable
-  // production-key sets because later deltas may tombstone base productions
-  // they used, making them intentionally unresolvable in the final chain
-  // grammar until compaction augments the materialization grammar.
+  // certificate resolved in the final chain tip when possible.  Every
+  // historical accepted topology (fixed-topology certificate or exact-multisite
+  // B&B witness captured at accept time) is passed separately as a stable
+  // production-key set because later deltas may tombstone productions it used,
+  // making it intentionally unresolvable in the final chain grammar until
+  // compaction augments the materialization grammar.
   auto final_witness = chart_spr_choose_local_update_compaction_topology(
       state, options, {}, last_accepted);
   overlay_chain_compaction_detail::append_unique_topology(
@@ -448,37 +449,178 @@ chart_spr_collect_local_update_compaction_witness_topologies(
   return witnesses;
 }
 
-std::vector<std::vector<rank3_production_taxa_key>>
-chart_spr_collect_local_update_compaction_witness_key_sets(
-    std::vector<chart_spr_topology_certificate> const& accepted_certificates) {
-  std::vector<std::vector<rank3_production_taxa_key>> key_sets;
-  key_sets.reserve(accepted_certificates.size());
-  for (auto const& certificate : accepted_certificates) {
-    key_sets.push_back(
-        chart_spr_topology_certificate_after_key_set(certificate));
+struct chart_spr_recorded_chain_objective {
+  std::uint64_t value = 0;
+  chart_spr_score_kind kind = chart_spr_score_kind::composite_lower_bound;
+  chart_spr_score_convention convention =
+      chart_spr_score_convention::full_with_invariants;
+  std::uint64_t invariant_offset_applied = 0;
+};
+
+void chart_spr_validate_recorded_chain_objective_kind(
+    chart_spr_search_options const& options,
+    chart_spr_recorded_chain_objective const& recorded,
+    std::string const& context) {
+  if (recorded.convention !=
+      chart_spr_score_convention::full_with_invariants) {
+    throw std::runtime_error(
+        context + ": recorded chain objective is not full_with_invariants");
   }
-  return key_sets;
+  switch (options.acceptance_mode) {
+    case chart_spr_acceptance_mode::exact_multisite:
+      if (recorded.kind != chart_spr_score_kind::grammar_exact) {
+        throw std::runtime_error(
+            context + ": exact_multisite recorded objective is not "
+                      "grammar_exact");
+      }
+      return;
+    case chart_spr_acceptance_mode::fixed_topology_exact:
+      if (recorded.kind != chart_spr_score_kind::fixed_topology_exact) {
+        throw std::runtime_error(
+            context + ": fixed_topology_exact recorded objective has the "
+                      "wrong exactness label");
+      }
+      return;
+    case chart_spr_acceptance_mode::lower_bound_heuristic:
+      if (recorded.kind != chart_spr_score_kind::composite_lower_bound) {
+        throw std::runtime_error(
+            context + ": lower_bound_heuristic recorded objective has the "
+                      "wrong label");
+      }
+      return;
+  }
+}
+
+chart_spr_recorded_chain_objective
+chart_spr_recorded_chain_objective_from_accept(
+    chart_spr_search_state const& state,
+    chart_spr_search_options const& options,
+    chart_spr_candidate_score const& accepted) {
+  if (!accepted.exact) {
+    throw std::runtime_error(
+        "chart SPR local commit: exact accepted score missing while recording "
+        "the chain objective");
+  }
+  chart_spr_recorded_chain_objective recorded;
+  recorded.value = accepted.exact->value.new_score;
+  recorded.kind = accepted.exact->kind;
+  recorded.convention = accepted.exact->convention;
+  recorded.invariant_offset_applied =
+      accepted.exact->invariant_offset_applied;
+  chart_spr_validate_recorded_chain_objective_kind(
+      options, recorded, "chart SPR local commit");
+  if (recorded.invariant_offset_applied != state.invariant_constant_offset) {
+    throw std::runtime_error(
+        "chart SPR local commit: recorded chain objective used a different "
+        "invariant offset than the committed state");
+  }
+  if (options.override_local_commit_recorded_objective_for_tests) {
+    recorded.value = *options.override_local_commit_recorded_objective_for_tests;
+  }
+  return recorded;
 }
 
 std::uint64_t chart_spr_local_update_final_expected_score(
     chart_spr_search_state const& state,
     chart_spr_search_options const& options,
-    chart_spr_candidate_score const* last_accepted) {
+    chart_spr_recorded_chain_objective const* recorded_objective) {
   switch (options.acceptance_mode) {
     case chart_spr_acceptance_mode::exact_multisite:
-      return chart_spr_state_exact_score_with_invariants(state,
-                                                         options.exact_trim);
+    case chart_spr_acceptance_mode::fixed_topology_exact:
+      if (recorded_objective == nullptr) {
+        throw std::runtime_error(
+            "chart SPR local accepted-state final compaction: exact local "
+            "commit requires the recorded chain objective from the last "
+            "accepted move");
+      }
+      chart_spr_validate_recorded_chain_objective_kind(
+          options, *recorded_objective,
+          "chart SPR local accepted-state final compaction");
+      (void)state;
+      return recorded_objective->value;
     case chart_spr_acceptance_mode::lower_bound_heuristic:
       return state.composite_lower_bound_with_invariants;
-    case chart_spr_acceptance_mode::fixed_topology_exact:
-      if (last_accepted == nullptr || !last_accepted->exact) {
-        throw std::runtime_error(
-            "chart SPR local accepted-state final compaction: fixed-topology "
-            "mode requires the last accepted exact score");
-      }
-      return last_accepted->exact->value.new_score;
   }
   return state.composite_lower_bound_with_invariants;
+}
+
+void chart_spr_check_exact_multisite_recorded_objective_diagnostic(
+    chart_spr_search_state const& state,
+    chart_spr_search_options const& options,
+    chart_spr_recorded_chain_objective const* recorded_objective) {
+  if (options.acceptance_mode != chart_spr_acceptance_mode::exact_multisite) {
+    return;
+  }
+  if (recorded_objective == nullptr) return;
+  auto fresh_score = chart_spr_state_exact_score_with_invariants(
+      state, options.exact_trim);
+  if (fresh_score != recorded_objective->value) {
+    throw std::runtime_error(
+        "chart SPR local accepted-state final compaction: recorded exact "
+        "chain objective " +
+        std::to_string(recorded_objective->value) +
+        " disagrees with a fresh exact diagnostic recomputation on the "
+        "chain tip " + std::to_string(fresh_score) +
+        "; the output-DAG oracle is checked against the recorded objective, "
+        "not this diagnostic value");
+  }
+}
+
+std::vector<rank3_production_taxa_key>
+chart_spr_collect_accepted_topology_key_set_after_local_commit(
+    chart_spr_search_state const& state,
+    chart_spr_search_options const& options,
+    chart_spr_candidate_score const& accepted) {
+  switch (options.acceptance_mode) {
+    case chart_spr_acceptance_mode::fixed_topology_exact:
+      if (!accepted.topology_selection.certificate) {
+        throw std::runtime_error(
+            "chart SPR local commit: fixed-topology accept is missing its "
+            "topology certificate witness");
+      }
+      return chart_spr_topology_certificate_after_key_set(
+          *accepted.topology_selection.certificate);
+    case chart_spr_acceptance_mode::exact_multisite: {
+      if (!accepted.exact ||
+          accepted.exact->kind != chart_spr_score_kind::grammar_exact) {
+        throw std::runtime_error(
+            "chart SPR local commit: exact_multisite accept is missing its "
+            "grammar_exact recorded score while collecting a topology "
+            "witness");
+      }
+      multisite_topology_trace_options trace_options;
+      trace_options.max_optimal_topologies = 1;
+      trace_options.trim_options =
+          overlay_chain_compaction_trace_trim_options(options.exact_trim);
+      auto trace = build_multisite_optimal_topologies(
+          state.grammar, state.active_patterns.patterns, state.chart_opts,
+          trace_options);
+      if (trace.topologies.empty()) {
+        throw std::runtime_error(
+            "chart SPR local commit: exact_multisite topology witness trace "
+            "produced no topology");
+      }
+      auto trace_full = chart_spr_add_invariant_offset(
+          trace.optimum, state,
+          "chart-SPR exact_multisite accepted topology witness invariant "
+          "offset");
+      if (trace_full != accepted.exact->value.new_score) {
+        throw std::runtime_error(
+            "chart SPR local commit: exact_multisite accepted topology "
+            "witness score " +
+            std::to_string(trace_full) +
+            " disagrees with the accepted recorded exact score " +
+            std::to_string(accepted.exact->value.new_score));
+      }
+      return overlay_chain_compaction_detail::topology_production_keys(
+          state.grammar, trace.topologies.front());
+    }
+    case chart_spr_acceptance_mode::lower_bound_heuristic:
+      throw std::runtime_error(
+          "chart SPR local commit: lower_bound_heuristic accepts do not have "
+          "an exact topology witness");
+  }
+  return {};
 }
 
 struct chart_spr_local_update_compaction_gate_result {
@@ -495,11 +637,15 @@ chart_spr_compact_and_verify_local_update_state(
     phylo_dag& source, overlay_chain const& chain,
     chart_spr_search_state const& local_state,
     chart_spr_search_options const& options,
-    std::vector<chart_spr_topology_certificate> const& accepted_certificates,
+    std::vector<std::vector<rank3_production_taxa_key>> const&
+        accepted_topology_key_sets,
     chart_spr_candidate_score const* last_accepted,
+    chart_spr_recorded_chain_objective const* recorded_objective,
     chart_spr_search_counters& counters) {
   auto expected_score = chart_spr_local_update_final_expected_score(
-      local_state, options, last_accepted);
+      local_state, options, recorded_objective);
+  chart_spr_check_exact_multisite_recorded_objective_diagnostic(
+      local_state, options, recorded_objective);
 
   overlay_chain_compaction_options compaction_options;
   compaction_options.validate = true;
@@ -509,8 +655,7 @@ chart_spr_compact_and_verify_local_update_state(
       chart_spr_collect_local_update_compaction_witness_topologies(
           local_state, options, last_accepted);
   compaction_options.witness_topology_key_sets =
-      chart_spr_collect_local_update_compaction_witness_key_sets(
-          accepted_certificates);
+      accepted_topology_key_sets;
 
   ++counters.full_overlay_materializations;
   ++counters.overlay_materializations_for_final_compaction;
@@ -994,8 +1139,10 @@ chart_spr_search_result run_chart_spr_search(
           options.local_score_worker_count);
   std::vector<std::size_t> aggregate_affected_counts;
   std::optional<chart_spr_candidate_score> last_local_update_accepted;
-  std::vector<chart_spr_topology_certificate>
-      local_update_accepted_topology_certificates;
+  std::optional<chart_spr_recorded_chain_objective>
+      last_local_update_recorded_objective;
+  std::vector<std::vector<rank3_production_taxa_key>>
+      local_update_accepted_topology_key_sets;
   bool used_local_accept_updates = false;
 
   // Phase 4 local-commit substrate: the overlay chain + persistent inside /
@@ -1202,10 +1349,12 @@ chart_spr_search_result run_chart_spr_search(
         // state.grammar / pattern_charts / bounds were refreshed in place by
         // the commit; sync the counters.
         state.counters = attempt_counters;
-        if (iteration.accepted->topology_selection.certificate) {
-          local_update_accepted_topology_certificates.push_back(
-              *iteration.accepted->topology_selection.certificate);
-        }
+        local_update_accepted_topology_key_sets.push_back(
+            chart_spr_collect_accepted_topology_key_set_after_local_commit(
+                state, options, *iteration.accepted));
+        last_local_update_recorded_objective =
+            chart_spr_recorded_chain_objective_from_accept(
+                state, options, *iteration.accepted);
         last_local_update_accepted = *iteration.accepted;
         used_local_accept_updates = true;
         iteration.accepted_move_committed = true;
@@ -1245,8 +1394,11 @@ chart_spr_search_result run_chart_spr_search(
     auto preserved_counters = state.counters;
     auto compacted = chart_spr_compact_and_verify_local_update_state(
         result.dag, *local_commit_substrate->chain, state, options,
-        local_update_accepted_topology_certificates,
+        local_update_accepted_topology_key_sets,
         last_local_update_accepted ? &*last_local_update_accepted : nullptr,
+        last_local_update_recorded_objective
+            ? &*last_local_update_recorded_objective
+            : nullptr,
         preserved_counters);
     result.dag = std::move(compacted.dag);
     compacted.rebuilt_state.dag = &result.dag;

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -36,13 +37,14 @@ struct overlay_chain_compaction_options {
   // adds per-production witness topologies for every accepted temp production.
   std::vector<rank3_topology> witness_topologies;
 
-  // Complete topology witnesses expressed as stable production taxon keys.
-  // These are used for accepted fixed-topology certificates: an earlier
-  // accepted certificate may include a base production that a later delta
-  // tombstones, so it cannot always be resolved in the final materialized chain
-  // grammar.  Phase-5 compaction augments the topology-materialization grammar
-  // with any missing witness productions and then verifies the rebuilt output
-  // DAG still represents each complete key-set topology.
+  // Optional complete topology witnesses expressed as stable production taxon
+  // keys.  Standalone compaction derives prefix topology witnesses for every
+  // accepted intended production on its own; callers can supply extra key-sets
+  // here when they also need to preserve a particular complete accepted
+  // topology (for example the exact topology selected by an acceptance gate).
+  // Phase-5 compaction augments the topology-materialization grammar with any
+  // missing witness productions and then verifies the rebuilt output DAG still
+  // represents each complete key-set topology.
   std::vector<std::vector<rank3_production_taxa_key>> witness_topology_key_sets;
 };
 
@@ -86,23 +88,30 @@ struct grammar_level_exact_parsimony_result {
 
 namespace overlay_chain_compaction_detail {
 
+inline rank3_production_taxa_key production_key_from_overlay_production(
+    overlay_clade_grammar const& overlay,
+    overlay_grammar_production const& prod, std::string const& context) {
+  rank3_production_taxa_key key;
+  key.parent = rank3_detail::overlay_taxa_for_ref(
+      overlay, prod.parent, context + " parent");
+  key.children.reserve(prod.children.size());
+  for (auto child : prod.children) {
+    key.children.push_back(rank3_detail::overlay_taxa_for_ref(
+        overlay, child, context + " child"));
+  }
+  rank3_detail::normalize_production_key(key);
+  return key;
+}
+
 inline rank3_production_taxa_key production_key_from_overlay_temp_production(
     overlay_clade_grammar const& overlay, std::size_t temp_pid) {
   if (temp_pid >= overlay.temp_productions.size()) {
     throw std::runtime_error(
         "overlay-chain compaction: temp production out of range");
   }
-  auto const& prod = overlay.temp_productions[temp_pid];
-  rank3_production_taxa_key key;
-  key.parent = rank3_detail::overlay_taxa_for_ref(
-      overlay, prod.parent, "overlay-chain compaction temp production parent");
-  key.children.reserve(prod.children.size());
-  for (auto child : prod.children) {
-    key.children.push_back(rank3_detail::overlay_taxa_for_ref(
-        overlay, child, "overlay-chain compaction temp production child"));
-  }
-  rank3_detail::normalize_production_key(key);
-  return key;
+  return production_key_from_overlay_production(
+      overlay, overlay.temp_productions[temp_pid],
+      "overlay-chain compaction temp production");
 }
 
 inline production_id find_dense_production_by_key(
@@ -204,7 +213,8 @@ inline production_id ensure_production_by_key(
 
 inline clade_grammar augment_grammar_with_topology_keys(
     clade_grammar grammar,
-    std::vector<std::vector<rank3_production_taxa_key>> const& topology_keys) {
+    std::vector<std::vector<rank3_production_taxa_key>> const& topology_keys,
+    std::vector<rank3_production_taxa_key> const& production_keys = {}) {
   for (std::size_t i = 0; i < topology_keys.size(); ++i) {
     for (auto key : topology_keys[i]) {
       (void)ensure_production_by_key(
@@ -213,6 +223,12 @@ inline clade_grammar augment_grammar_with_topology_keys(
           "topology " +
               std::to_string(i));
     }
+  }
+  for (auto key : production_keys) {
+    (void)ensure_production_by_key(
+        grammar, std::move(key),
+        "overlay-chain compaction: augmenting grammar for accepted intended "
+        "production");
   }
   parsimony_chart_detail::validate_chart_grammar(grammar);
   chart_trim_detail::validate_production_indices(grammar);
@@ -457,18 +473,113 @@ inline multisite_trim_options overlay_chain_compaction_trace_trim_options(
   return trim_options;
 }
 
+namespace overlay_chain_compaction_detail {
+
+inline overlay_clade_grammar overlay_chain_prefix_tip(
+    overlay_chain const& chain, std::size_t prefix_size) {
+  if (prefix_size > chain.size()) {
+    throw std::runtime_error(
+        "overlay-chain compaction: prefix size exceeds chain size");
+  }
+
+  overlay_clade_grammar overlay;
+  overlay.base = &chain.base();
+
+  for (std::size_t pos = 0; pos < prefix_size; ++pos) {
+    auto const& delta = chain.at(pos);
+    overlay.temp_clades.insert(overlay.temp_clades.end(),
+                               delta.temp_clades.begin(),
+                               delta.temp_clades.end());
+  }
+
+  std::set<std::pair<overlay_clade_ref, std::vector<overlay_clade_ref>>>
+      seen_productions;
+  for (std::size_t pos = 0; pos < prefix_size; ++pos) {
+    auto const& delta = chain.at(pos);
+    for (auto const& prod : delta.temp_productions) {
+      auto children_key = prod.children;
+      std::sort(children_key.begin(), children_key.end());
+      if (seen_productions
+              .insert(std::make_pair(prod.parent, children_key))
+              .second) {
+        overlay.temp_productions.push_back(prod);
+      }
+    }
+  }
+
+  std::set<production_id> tombstones;
+  for (std::size_t pos = 0; pos < prefix_size; ++pos) {
+    auto const& delta = chain.at(pos);
+    for (auto pid : delta.removed_base_productions) tombstones.insert(pid);
+  }
+  overlay.removed_base_productions.assign(tombstones.begin(),
+                                          tombstones.end());
+  return overlay;
+}
+
+}  // namespace overlay_chain_compaction_detail
+
+inline std::vector<std::vector<rank3_production_taxa_key>>
+overlay_chain_intended_production_key_sets(overlay_chain const& chain) {
+  auto overlay = chain.tip();
+  std::vector<std::vector<rank3_production_taxa_key>> key_sets;
+  key_sets.reserve(chain.size());
+  for (std::size_t pos = 0; pos < chain.size(); ++pos) {
+    auto const& delta = chain.at(pos);
+    std::vector<rank3_production_taxa_key> keys;
+    keys.reserve(delta.temp_productions.size());
+    for (auto const& prod : delta.temp_productions) {
+      rank3_detail::append_unique_key(
+          keys,
+          overlay_chain_compaction_detail::production_key_from_overlay_production(
+              overlay, prod,
+              "overlay-chain compaction accepted delta " +
+                  std::to_string(pos) + " intended production"));
+    }
+    if (!keys.empty()) key_sets.push_back(std::move(keys));
+  }
+  return key_sets;
+}
+
 inline std::vector<rank3_production_taxa_key>
 overlay_chain_intended_production_keys(overlay_chain const& chain) {
-  auto overlay = chain.tip();
   std::vector<rank3_production_taxa_key> keys;
-  for (std::size_t temp_pid = 0; temp_pid < overlay.temp_productions.size();
-       ++temp_pid) {
-    rank3_detail::append_unique_key(
-        keys,
-        overlay_chain_compaction_detail::
-            production_key_from_overlay_temp_production(overlay, temp_pid));
+  for (auto const& key_set : overlay_chain_intended_production_key_sets(chain)) {
+    for (auto key : key_set) {
+      rank3_detail::append_unique_key(keys, std::move(key));
+    }
   }
   return keys;
+}
+
+inline std::vector<std::vector<rank3_production_taxa_key>>
+overlay_chain_prefix_witness_topology_key_sets(overlay_chain const& chain) {
+  std::vector<std::vector<rank3_production_taxa_key>> key_sets;
+  for (std::size_t pos = 0; pos < chain.size(); ++pos) {
+    auto prefix_overlay =
+        overlay_chain_compaction_detail::overlay_chain_prefix_tip(chain,
+                                                                  pos + 1);
+    auto prefix_materialized = materialize_overlay_grammar(prefix_overlay);
+    auto const& grammar = prefix_materialized.grammar;
+    for (auto const& prod : chain.at(pos).temp_productions) {
+      auto key = overlay_chain_compaction_detail::
+          production_key_from_overlay_production(
+              prefix_overlay, prod,
+              "overlay-chain compaction accepted prefix " +
+                  std::to_string(pos) + " intended production");
+      auto pid = overlay_chain_compaction_detail::find_dense_production_by_key(
+          grammar, key,
+          "overlay-chain compaction: deriving prefix witness topology for "
+          "accepted production at chain position " +
+              std::to_string(pos));
+      auto topology = overlay_chain_compaction_detail::
+          concrete_topology_containing_production(grammar, pid);
+      key_sets.push_back(
+          overlay_chain_compaction_detail::topology_production_keys(grammar,
+                                                                    topology));
+    }
+  }
+  return key_sets;
 }
 
 inline overlay_chain_compaction_result compact_overlay_chain_to_dag(
@@ -483,18 +594,17 @@ inline overlay_chain_compaction_result compact_overlay_chain_to_dag(
   result.materialized = materialize_overlay_chain(chain);
   auto const& grammar = result.materialized.grammar;
 
-  for (auto const& key : result.intended_productions) {
-    if (!rank3_detail::has_production_key(grammar, key)) {
-      throw std::runtime_error(
-          "overlay-chain compaction: accepted intended production is not "
-          "reachable in the materialized chain grammar: " +
-          rank3_detail::production_key_to_string(key));
-    }
-  }
+  auto prefix_witness_topology_key_sets =
+      overlay_chain_prefix_witness_topology_key_sets(chain);
 
   std::vector<std::vector<rank3_production_taxa_key>> required_topology_keys;
-  required_topology_keys.reserve(options.witness_topologies.size() +
-                                 options.witness_topology_key_sets.size());
+  required_topology_keys.reserve(
+      prefix_witness_topology_key_sets.size() +
+      options.witness_topologies.size() +
+      options.witness_topology_key_sets.size());
+  for (auto key_set : prefix_witness_topology_key_sets) {
+    required_topology_keys.push_back(std::move(key_set));
+  }
   for (auto const& topology : options.witness_topologies) {
     required_topology_keys.push_back(
         overlay_chain_compaction_detail::topology_production_keys(grammar,
@@ -505,15 +615,16 @@ inline overlay_chain_compaction_result compact_overlay_chain_to_dag(
     required_topology_keys.push_back(std::move(key_set));
   }
 
-  // Accepted topology certificates are stable taxon-key sets.  Some historical
-  // certificates can contain base productions tombstoned by later deltas, so
-  // the topology-materialization grammar is the final chain grammar augmented
-  // with exactly those missing witness productions.  This preserves the full
-  // accepted witness tree set while leaving `result.materialized` as the final
-  // chain materialization used for intended-production checks.
+  // Accepted topology certificates and intended productions are stable
+  // taxon-key sets.  Some historical witnesses can contain productions that
+  // are unreachable in the final chain after later tombstones, so the
+  // topology-materialization grammar is the final chain grammar augmented with
+  // exactly those missing witness/intended productions.  The final output DAG,
+  // not the unaugmented dense chain grammar, is where intended-production
+  // presence is checked.
   auto topology_grammar =
       overlay_chain_compaction_detail::augment_grammar_with_topology_keys(
-          grammar, required_topology_keys);
+          grammar, required_topology_keys, result.intended_productions);
 
   std::vector<rank3_topology> topologies;
   for (std::size_t i = 0; i < required_topology_keys.size(); ++i) {
