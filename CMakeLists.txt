@@ -930,6 +930,10 @@ add_test(NAME no_chart_bnb_superset_topology_exact
          COMMAND bash test/no_chart_bnb_superset_topology_exact.sh
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+add_test(NAME no_overlay_chain_compaction_prefix_materialize
+         COMMAND bash test/no_overlay_chain_compaction_prefix_materialize.sh
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 add_test(NAME no_keep_production_without_exact_check
          COMMAND bash test/no_keep_production_without_exact_check.sh
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
