@@ -1460,35 +1460,16 @@ static void test_phase8_fixed_topology_rejects_bad_selected_partition() {
   auto grammar = larch::build_clade_grammar(dag);
   auto state = larch::build_chart_spr_search_state(dag, grammar);
 
-  auto find_clade = [&](std::vector<larch::taxon_id> taxa) {
-    std::sort(taxa.begin(), taxa.end());
-    for (std::size_t cid = 0; cid < grammar.clades.size(); ++cid) {
-      if (grammar.clades[cid].taxa == taxa) {
-        return static_cast<larch::clade_id>(cid);
-      }
-    }
-    throw std::runtime_error("missing clade in bad-partition test");
-  };
-  auto find_prod = [&](larch::clade_id parent,
-                       std::vector<larch::clade_id> children) {
-    std::sort(children.begin(), children.end());
-    for (auto pid : grammar.productions_by_parent[parent]) {
-      auto prod_children = grammar.productions[pid].children;
-      std::sort(prod_children.begin(), prod_children.end());
-      if (prod_children == children) return pid;
-    }
-    throw std::runtime_error("missing production in bad-partition test");
-  };
-
-  auto a = find_clade({0});
-  auto b = find_clade({1});
-  auto c = find_clade({2});
-  auto ab = find_clade({0, 1});
-  auto cd = find_clade({2, 3});
+  auto a = clade_for(grammar, {"A"});
+  auto b = clade_for(grammar, {"B"});
+  auto c = clade_for(grammar, {"C"});
+  auto d = clade_for(grammar, {"D"});
+  auto ab = clade_for(grammar, {"A", "B"});
+  auto cd = clade_for(grammar, {"C", "D"});
   auto root = grammar.root_clade;
-  auto root_prod = find_prod(root, {ab, cd});
-  auto ab_prod = find_prod(ab, {a, b});
-  auto cd_prod = find_prod(cd, {c, find_clade({3})});
+  auto root_prod = production_id_for(grammar, root, {ab, cd});
+  auto ab_prod = production_id_for(grammar, ab, {a, b});
+  auto cd_prod = production_id_for(grammar, cd, {c, d});
 
   larch::grammar_spr_candidate candidate;
   candidate.added_clades.push_back(larch::clade_key{{0, 2}});  // AC
@@ -1527,6 +1508,160 @@ static void test_phase8_fixed_topology_rejects_bad_selected_partition() {
   std::println("  PASS");
 }
 
+static void test_phase8_fixed_topology_rejects_unreachable_selected_after_ref() {
+  std::println(
+      "test_phase8_fixed_topology_rejects_unreachable_selected_after_ref");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_base_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto state = larch::build_chart_spr_search_state(dag, grammar);
+
+  auto a = clade_for(grammar, {"A"});
+  auto b = clade_for(grammar, {"B"});
+  auto c = clade_for(grammar, {"C"});
+  auto d = clade_for(grammar, {"D"});
+  auto ab = clade_for(grammar, {"A", "B"});
+  auto cd = clade_for(grammar, {"C", "D"});
+  auto root = grammar.root_clade;
+  auto root_prod = production_id_for(grammar, root, {ab, cd});
+  auto ab_prod = production_id_for(grammar, ab, {a, b});
+  auto cd_prod = production_id_for(grammar, cd, {c, d});
+
+  larch::grammar_spr_candidate candidate;
+  candidate.added_clades.push_back(larch::clade_key{{0, 2}});  // AC
+  candidate.added_productions.push_back(temp_prod(
+      larch::temp_clade_ref(0), {larch::base_clade_ref(a),
+                                 larch::base_clade_ref(c)}));
+
+  larch::chart_spr_candidate_score scored;
+  scored.candidate = candidate;
+  scored.topology_selection.kind =
+      larch::chart_spr_topology_selection_kind::explicit_certificate;
+  scored.topology_selection.certificate =
+      larch::make_chart_spr_topology_certificate(
+          grammar, candidate,
+          {larch::base_production_ref(root_prod),
+           larch::base_production_ref(ab_prod),
+           larch::base_production_ref(cd_prod)},
+          {larch::base_production_ref(root_prod),
+           larch::base_production_ref(ab_prod),
+           larch::base_production_ref(cd_prod),
+           larch::temp_production_ref(0)});
+
+  auto verified = larch::verify_candidate_fixed_topology_exact(state, scored);
+  CHECK(!verified.valid);
+  CHECK(verified.invalid_reason.find("unreachable selected production") !=
+        std::string::npos);
+
+  std::println("  PASS");
+}
+
+static void test_phase8_persistent_cache_local_commit_matches_materialized() {
+  std::println(
+      "test_phase8_persistent_cache_local_commit_matches_materialized");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto oracle_state = larch::build_chart_spr_search_state(dag, grammar);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.verify_fixed_topology_materialized_oracle_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar,
+                                            options);
+  CHECK(!search.iterations.empty());
+  auto const& iteration = search.iterations.front();
+  CHECK(iteration.accepted.has_value());
+  CHECK(iteration.accepted->exact.has_value());
+  CHECK(iteration.accepted->exact->kind ==
+        larch::chart_spr_score_kind::fixed_topology_exact);
+  CHECK(search.counters.fixed_topology_persistent_cache_verifications > 0);
+  CHECK(search.counters.fixed_topology_persistent_cache_fallbacks == 0);
+  CHECK(search.counters.fixed_topology_persistent_cache_oracle_mismatches == 0);
+  CHECK(search.summary.fixed_topology_persistent_cache_fallbacks == 0);
+  CHECK(search.counters.overlay_materializations_for_exact_verification == 0);
+  CHECK(search.counters.overlay_materializations_for_oracle ==
+        search.counters.fixed_topology_persistent_cache_verifications);
+
+  auto const& chosen = *iteration.accepted;
+  auto const& certificate = *chosen.topology_selection.certificate;
+  auto overlay = larch::overlay_from_candidate(oracle_state.grammar,
+                                               chosen.candidate);
+  auto materialized = larch::materialize_overlay_grammar(overlay);
+  std::vector<larch::production_id> after_ids;
+  after_ids.reserve(certificate.after_overlay_productions.size());
+  for (auto ref : certificate.after_overlay_productions) {
+    after_ids.push_back(
+        larch::chart_spr_dense_production_id_for_ref(materialized, ref));
+  }
+  auto after_topology = larch::grammar_topology_from_productions(
+      materialized.grammar, after_ids);
+  (void)larch::validate_grammar_topology(materialized.grammar,
+                                         after_topology);
+
+  auto direct_scores = larch::fixed_topology_direct_selected_pattern_scores(
+      oracle_state, chosen);
+  auto const& active = oracle_state.active_patterns.patterns.patterns;
+  std::uint64_t materialized_new_active = 0;
+  for (std::size_t p = 0; p < active.size(); ++p) {
+    auto materialized_row =
+        larch::chart_multisite_detail::restricted_topology_row(
+            materialized.grammar, active[p], after_topology);
+    auto materialized_score = larch::chart_spr_weighted_root_score_from_row(
+        materialized_row, active[p], oracle_state.chart_opts);
+    CHECK(direct_scores.new_pattern_scores[p] == materialized_score);
+    materialized_new_active = larch::chart_multisite_detail::checked_add_u64(
+        materialized_new_active, materialized_score,
+        "phase8 persistent local-commit materialized total");
+  }
+  auto materialized_new_full = larch::chart_spr_add_invariant_offset(
+      materialized_new_active, oracle_state,
+      "phase8 persistent local-commit materialized full");
+  CHECK(chosen.exact->value.new_score == materialized_new_full);
+
+  std::println("  PASS");
+}
+
+static void test_phase8_persistent_cache_dag_verification_has_no_fallback() {
+  std::println(
+      "test_phase8_persistent_cache_dag_verification_has_no_fallback");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", five_taxon_multiparent_tree_one()));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", five_taxon_multiparent_tree_two()));
+  auto dag = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.verify_fixed_topology_materialized_oracle_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+  CHECK(search.counters.fixed_topology_persistent_cache_verifications > 0);
+  CHECK(search.counters.fixed_topology_persistent_cache_fallbacks == 0);
+  CHECK(search.counters.fixed_topology_persistent_cache_oracle_mismatches == 0);
+  CHECK(search.counters.overlay_materializations_for_exact_verification == 0);
+  CHECK(search.counters.overlay_materializations_for_oracle ==
+        search.counters.fixed_topology_persistent_cache_verifications);
+
+  std::println("  PASS");
+}
+
 static void test_phase8_per_pattern_oracle_catches_independent_moved_state() {
   std::println(
       "test_phase8_per_pattern_oracle_catches_independent_moved_state");
@@ -1561,6 +1696,26 @@ static void test_phase8_per_pattern_oracle_catches_independent_moved_state() {
   std::vector<std::uint64_t> oracle_new{static_cast<std::uint64_t>(shared)};
   std::vector<std::uint64_t> bad_new{static_cast<std::uint64_t>(independent)};
   CHECK(bad_new != oracle_new);
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.force_fixed_topology_independent_sm_bug_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+  CHECK(search.counters.fixed_topology_persistent_cache_verifications > 0);
+  CHECK(search.counters.fixed_topology_persistent_cache_fallbacks ==
+        search.counters.fixed_topology_persistent_cache_verifications);
+  CHECK(search.counters.fixed_topology_persistent_cache_oracle_mismatches ==
+        search.counters.fixed_topology_persistent_cache_fallbacks);
+  CHECK(search.counters.overlay_materializations_for_exact_verification == 0);
 
   std::println("  PASS");
 }
@@ -2907,7 +3062,8 @@ static void test_phase4_fixed_topology_exact_local_commit() {
       "full_overlay_materializations={}, accept_materializations={}, "
       "exact_verification_materializations={}, "
       "selected_cache_hits={}, selected_cache_misses={}, "
-      "selected_rows_computed={}",
+      "selected_rows_computed={}, persistent_verifications={}, "
+      "persistent_fallbacks={}",
       search.counters.accepted_moves,
       search.counters.local_commit_accepted_moves,
       search.counters.local_commit_tombstone_scope_skips,
@@ -2917,7 +3073,9 @@ static void test_phase4_fixed_topology_exact_local_commit() {
       search.counters.overlay_materializations_for_exact_verification,
       search.counters.fixed_topology_selected_cache_hits,
       search.counters.fixed_topology_selected_cache_misses,
-      search.counters.fixed_topology_selected_rows_computed);
+      search.counters.fixed_topology_selected_rows_computed,
+      search.counters.fixed_topology_persistent_cache_verifications,
+      search.counters.fixed_topology_persistent_cache_fallbacks);
 
   // Every accepted move is fixed_topology_exact-gated (an exact gate; the
   // chain's recorded objective is exact for the one selected topology).
@@ -2946,6 +3104,13 @@ static void test_phase4_fixed_topology_exact_local_commit() {
   CHECK(search.counters.fixed_topology_selected_cache_hits > 0);
   CHECK(search.counters.fixed_topology_selected_cache_misses > 0);
   CHECK(search.counters.fixed_topology_selected_rows_computed > 0);
+  CHECK(search.counters.fixed_topology_persistent_cache_verifications ==
+        search.counters.exact_verifications);
+  CHECK(search.counters.fixed_topology_persistent_cache_fallbacks == 0);
+  CHECK(search.counters.fixed_topology_persistent_cache_oracle_mismatches == 0);
+  CHECK(search.summary.fixed_topology_persistent_cache_verifications ==
+        search.counters.fixed_topology_persistent_cache_verifications);
+  CHECK(search.summary.fixed_topology_persistent_cache_fallbacks == 0);
   auto naive_selected_oracle_rows =
       search.counters.exact_verifications * search.summary.active_pattern_count *
       search.summary.initial_grammar_clade_count;
@@ -3107,6 +3272,9 @@ int main() {
   test_fixed_topology_exact_certificate_scores_selected_topology();
   test_phase8_fixed_topology_cache_score_matches_materialized_per_pattern();
   test_phase8_fixed_topology_rejects_bad_selected_partition();
+  test_phase8_fixed_topology_rejects_unreachable_selected_after_ref();
+  test_phase8_persistent_cache_local_commit_matches_materialized();
+  test_phase8_persistent_cache_dag_verification_has_no_fallback();
   test_phase8_per_pattern_oracle_catches_independent_moved_state();
   test_enumeration_truncation_sets_unverified_flag_even_exhaustive();
   test_phase5_no_improvement_search_stops_without_commit();

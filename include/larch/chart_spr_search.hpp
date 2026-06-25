@@ -130,6 +130,14 @@ struct chart_spr_search_counters {
   std::size_t fixed_topology_selected_cache_hits = 0;
   std::size_t fixed_topology_selected_cache_misses = 0;
   std::size_t fixed_topology_selected_rows_computed = 0;
+  // Persistent-cache fixed_topology_exact verifier diagnostics.  A nonzero
+  // fallback count means the production path could not serve the selected
+  // topology from the persistent fixed-topology cache and had to use the
+  // conservative from-scratch direct scorer; Phase 8 tests assert this remains
+  // zero on the fixture matrix so fallback frequency cannot be silent.
+  std::size_t fixed_topology_persistent_cache_verifications = 0;
+  std::size_t fixed_topology_persistent_cache_fallbacks = 0;
+  std::size_t fixed_topology_persistent_cache_oracle_mismatches = 0;
 };
 
 // Acceptance modes describe the objective used to accept a candidate.  They
@@ -372,6 +380,16 @@ struct chart_spr_search_options {
   // the Phase 4 tests enable it to satisfy the "two-chart oracle green after
   // every accept" exit criterion without exposing the cache objects.
   bool verify_local_commit_two_chart_oracle_for_tests = false;
+  // Phase 8 self-check: during local-commit fixed_topology_exact verification,
+  // additionally materialize each candidate overlay and compare the persistent
+  // cache score against a from-scratch selected-topology score per active
+  // pattern.  Expensive and test/diagnostic-only; production correctness is
+  // guarded by the cheaper independent direct selected-topology oracle.
+  bool verify_fixed_topology_materialized_oracle_for_tests = false;
+  // Phase 8 corruption hook: make the persistent fixed-topology scorer return
+  // a test-only independent-s_M-style under-count before oracle comparison.
+  // The per-pattern oracle must catch this and route through the fallback.
+  bool force_fixed_topology_independent_sm_bug_for_tests = false;
   // Test-only injection point for the Phase 4 hard-error contract: after the
   // overlay-chain append succeeds, force a post-append failure and verify the
   // search propagates it instead of converting it into an ordinary rejection.
@@ -532,6 +550,9 @@ struct chart_spr_search_summary {
   std::size_t outside_rows_recomputed_on_commit = 0;
   std::size_t local_commit_two_chart_oracle_runs = 0;
   std::size_t local_commit_tip_grammar_refreshes = 0;
+  std::size_t fixed_topology_persistent_cache_verifications = 0;
+  std::size_t fixed_topology_persistent_cache_fallbacks = 0;
+  std::size_t fixed_topology_persistent_cache_oracle_mismatches = 0;
   chart_spr_candidate_selection_mode candidate_selection =
       chart_spr_candidate_selection_mode::lower_bound_top_k;
   chart_spr_acceptance_mode acceptance_mode =
@@ -2082,6 +2103,12 @@ inline void add_chart_spr_search_counters(
       src.fixed_topology_selected_cache_misses;
   dst.fixed_topology_selected_rows_computed +=
       src.fixed_topology_selected_rows_computed;
+  dst.fixed_topology_persistent_cache_verifications +=
+      src.fixed_topology_persistent_cache_verifications;
+  dst.fixed_topology_persistent_cache_fallbacks +=
+      src.fixed_topology_persistent_cache_fallbacks;
+  dst.fixed_topology_persistent_cache_oracle_mismatches +=
+      src.fixed_topology_persistent_cache_oracle_mismatches;
 }
 
 struct chart_spr_local_score_scratch {
@@ -3061,6 +3088,77 @@ inline void attach_fixed_topology_selection_for_acceptance(
   }
 }
 
+inline void chart_spr_collect_reachable_selected_overlay_topology(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    std::map<overlay_clade_ref, overlay_production_ref> const& selected,
+    overlay_clade_ref clade, std::vector<std::uint8_t>& base_state,
+    std::vector<std::uint8_t>& temp_state,
+    std::set<overlay_production_ref>& reached,
+    std::string const& context) {
+  auto state = chart_spr_overlay_clade_state(base_state, temp_state, clade);
+  if (state == 1) {
+    throw std::runtime_error(context + ": cycle in selected topology");
+  }
+  if (state == 2) {
+    throw std::runtime_error(
+        context + ": selected topology reuses a clade in multiple places");
+  }
+  chart_spr_set_overlay_clade_state(base_state, temp_state, clade, 1);
+
+  auto taxa = chart_spr_clade_taxa_for_ref(base, candidate, clade);
+  if (taxa.size() == 1) {
+    if (selected.find(clade) != selected.end()) {
+      throw std::runtime_error(context +
+                               ": selected leaf clade has a production");
+    }
+    chart_spr_set_overlay_clade_state(base_state, temp_state, clade, 2);
+    return;
+  }
+
+  auto it = selected.find(clade);
+  if (it == selected.end()) {
+    throw std::runtime_error(
+        context + ": selected topology missing production for non-singleton "
+                  "clade");
+  }
+  auto parent = chart_spr_overlay_production_parent(base, candidate,
+                                                    it->second);
+  if (parent != clade) {
+    throw std::runtime_error(context +
+                             ": selected production parent mismatch");
+  }
+  validate_chart_spr_selected_overlay_production_for_fixed_topology(
+      base, candidate, it->second, context);
+  reached.insert(it->second);
+  for (auto child : chart_spr_overlay_production_children(base, candidate,
+                                                          it->second)) {
+    chart_spr_collect_reachable_selected_overlay_topology(
+        base, candidate, selected, child, base_state, temp_state, reached,
+        context);
+  }
+  chart_spr_set_overlay_clade_state(base_state, temp_state, clade, 2);
+}
+
+inline void validate_chart_spr_selected_overlay_topology_complete(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    std::map<overlay_clade_ref, overlay_production_ref> const& selected,
+    std::string const& context) {
+  std::vector<std::uint8_t> base_state(base.clades.size(), 0);
+  std::vector<std::uint8_t> temp_state(candidate.added_clades.size(), 0);
+  std::set<overlay_production_ref> reached;
+  chart_spr_collect_reachable_selected_overlay_topology(
+      base, candidate, selected, base_clade_ref(base.root_clade), base_state,
+      temp_state, reached, context);
+  for (auto const& [parent, ref] : selected) {
+    (void)parent;
+    if (reached.find(ref) == reached.end()) {
+      throw std::runtime_error(
+          context + ": unreachable selected production in topology "
+                    "certificate");
+    }
+  }
+}
+
 inline std::map<overlay_clade_ref, overlay_production_ref>
 chart_spr_overlay_selected_production_by_parent(
     clade_grammar const& base, grammar_spr_candidate const& candidate,
@@ -3083,6 +3181,8 @@ chart_spr_overlay_selected_production_by_parent(
           "production choices for one clade");
     }
   }
+  validate_chart_spr_selected_overlay_topology_complete(
+      base, candidate, selected, "fixed_topology_exact certificate");
   return selected;
 }
 
@@ -3206,6 +3306,7 @@ fixed_topology_direct_selected_pattern_scores(
       certificate.before_overlay_productions);
   auto before_topology = grammar_topology_from_productions(state.grammar,
                                                           before_ids);
+  (void)validate_grammar_topology(state.grammar, before_topology);
   auto selected_after = chart_spr_overlay_selected_production_by_parent(
       state.grammar, candidate.candidate,
       certificate.after_overlay_productions);

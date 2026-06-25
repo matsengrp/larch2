@@ -157,6 +157,12 @@ int main() {
                      c.local_commit_two_chart_oracle_runs);
   print_counter_line("local_commit_tip_grammar_refreshes",
                      c.local_commit_tip_grammar_refreshes);
+  print_counter_line("fixed_topology_persistent_cache_verifications",
+                     c.fixed_topology_persistent_cache_verifications);
+  print_counter_line("fixed_topology_persistent_cache_fallbacks",
+                     c.fixed_topology_persistent_cache_fallbacks);
+  print_counter_line("fixed_topology_persistent_cache_oracle_mismatches",
+                     c.fixed_topology_persistent_cache_oracle_mismatches);
   print_counter_line("full_composite_rebuilds", c.full_composite_rebuilds);
   print_counter_line("local_candidate_scores", c.local_candidate_scores);
   print_counter_line("local_rows_recomputed", c.local_rows_recomputed);

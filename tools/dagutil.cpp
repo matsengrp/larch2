@@ -2869,6 +2869,12 @@ static void print_chart_spr_search_counter_fields(
       << counters.local_commit_two_chart_oracle_runs << "\n";
   out << indent << "local_commit_tip_grammar_refreshes: "
       << counters.local_commit_tip_grammar_refreshes << "\n";
+  out << indent << "fixed_topology_persistent_cache_verifications: "
+      << counters.fixed_topology_persistent_cache_verifications << "\n";
+  out << indent << "fixed_topology_persistent_cache_fallbacks: "
+      << counters.fixed_topology_persistent_cache_fallbacks << "\n";
+  out << indent << "fixed_topology_persistent_cache_oracle_mismatches: "
+      << counters.fixed_topology_persistent_cache_oracle_mismatches << "\n";
   out << indent << "full_composite_rebuilds: "
       << counters.full_composite_rebuilds << "\n";
   out << indent << "local_candidate_scores: "
@@ -3505,6 +3511,13 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.local_commit_two_chart_oracle_runs << "\n";
   out << "  local_commit_tip_grammar_refreshes: "
       << search.summary.local_commit_tip_grammar_refreshes << "\n";
+  out << "  fixed_topology_persistent_cache_verifications: "
+      << search.summary.fixed_topology_persistent_cache_verifications << "\n";
+  out << "  fixed_topology_persistent_cache_fallbacks: "
+      << search.summary.fixed_topology_persistent_cache_fallbacks << "\n";
+  out << "  fixed_topology_persistent_cache_oracle_mismatches: "
+      << search.summary.fixed_topology_persistent_cache_oracle_mismatches
+      << "\n";
   out << "  local_rows_recomputed_per_second: " << std::fixed
       << std::setprecision(3)
       << search.summary.local_rows_recomputed_per_second << "\n";

@@ -773,11 +773,13 @@ struct chart_spr_local_commit_substrate {
   std::vector<overlay_clade_ref> dense_clade_to_chain_ref;
   std::vector<overlay_production_ref> dense_production_to_chain_ref;
 
-  // Phase 8 per-pattern selected-topology oracle cache.  This is separate
+  // Phase 8 per-pattern selected-topology production cache.  This is separate
   // from the grammar-min inside/outside caches: it stores rows for one exact
   // structural selected subtree, so an unchanged fixed-topology subtree can be
-  // read instead of recomputed for every candidate oracle.
+  // read instead of recomputed for every candidate verification.
   chart_spr_selected_topology_row_cache selected_topology_cache;
+  bool verify_materialized_fixed_topology_oracle_for_tests = false;
+  bool force_independent_sm_bug_for_tests = false;
 };
 
 void chart_spr_set_identity_tip_maps(chart_spr_local_commit_substrate& sub) {
@@ -860,6 +862,9 @@ chart_spr_before_selected_production_by_parent(
           "before-topology production choices for one clade");
     }
   }
+  validate_chart_spr_selected_overlay_topology_complete(
+      base, candidate, selected,
+      "fixed_topology_exact selected-topology cache before");
   return selected;
 }
 
@@ -992,8 +997,13 @@ chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
   return insert_new_node(std::move(key), std::move(entry));
 }
 
-chart_spr_fixed_topology_pattern_scores
-chart_spr_fixed_topology_selected_pattern_scores_from_cache(
+struct chart_spr_selected_topology_root_entries {
+  chart_spr_selected_topology_cache_entry const* before = nullptr;
+  chart_spr_selected_topology_cache_entry const* after = nullptr;
+};
+
+chart_spr_selected_topology_root_entries
+chart_spr_selected_topology_root_entries_from_cache(
     chart_spr_selected_topology_row_cache& cache,
     chart_spr_search_state const& state,
     chart_spr_candidate_score const& candidate) {
@@ -1027,29 +1037,107 @@ chart_spr_fixed_topology_selected_pattern_scores_from_cache(
         "fixed_topology_exact selected-topology cache: root cache entry "
         "missing");
   }
+  return chart_spr_selected_topology_root_entries{before_root.entry,
+                                                 after_root.entry};
+}
+
+chart_spr_fixed_topology_pattern_scores
+chart_spr_fixed_topology_materialized_oracle_pattern_scores(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate) {
+  state.active_patterns.assert_no_skipped_invariant_metadata();
+  if (!candidate.topology_selection.certificate) {
+    throw std::runtime_error(
+        "fixed_topology_exact materialized oracle requires a complete "
+        "topology certificate");
+  }
+  auto const& certificate = *candidate.topology_selection.certificate;
+  validate_chart_spr_topology_certificate_signatures(
+      state.grammar, candidate.candidate, certificate);
+
+  auto before_ids = chart_spr_base_production_ids_from_refs(
+      certificate.before_overlay_productions);
+  auto before_topology = grammar_topology_from_productions(state.grammar,
+                                                          before_ids);
+  (void)validate_grammar_topology(state.grammar, before_topology);
+
+  auto overlay = overlay_from_candidate(state.grammar, candidate.candidate);
+  auto materialized = materialize_overlay_grammar(overlay);
+  ++state.counters.full_overlay_materializations;
+  ++state.counters.overlay_materializations_for_oracle;
+
+  std::vector<production_id> after_ids;
+  after_ids.reserve(certificate.after_overlay_productions.size());
+  for (auto ref : certificate.after_overlay_productions) {
+    after_ids.push_back(chart_spr_dense_production_id_for_ref(materialized,
+                                                              ref));
+  }
+  auto after_topology = grammar_topology_from_productions(
+      materialized.grammar, after_ids);
+  (void)validate_grammar_topology(materialized.grammar, after_topology);
 
   chart_spr_fixed_topology_pattern_scores scores;
   auto const& active = state.active_patterns.patterns.patterns;
   scores.old_pattern_scores.reserve(active.size());
   scores.new_pattern_scores.reserve(active.size());
-  for (std::size_t p = 0; p < active.size(); ++p) {
+  for (std::size_t pattern_index = 0; pattern_index < active.size();
+       ++pattern_index) {
+    auto const& pattern = active[pattern_index];
     if (state.chart_opts.score_ua_edge) {
-      chart_multisite_detail::validate_pattern_reference_counts(active[p], p);
+      chart_multisite_detail::validate_pattern_reference_counts(
+          pattern, pattern_index);
     }
+    auto old_row = chart_multisite_detail::restricted_topology_row(
+        state.grammar, pattern, before_topology);
+    auto new_row = chart_multisite_detail::restricted_topology_row(
+        materialized.grammar, pattern, after_topology);
     auto old_score = chart_spr_weighted_root_score_from_row(
-        before_root.entry->rows_by_pattern[p], active[p], state.chart_opts);
+        old_row, pattern, state.chart_opts);
     auto new_score = chart_spr_weighted_root_score_from_row(
-        after_root.entry->rows_by_pattern[p], active[p], state.chart_opts);
+        new_row, pattern, state.chart_opts);
     scores.old_pattern_scores.push_back(old_score);
     scores.new_pattern_scores.push_back(new_score);
     scores.old_active_total = chart_multisite_detail::checked_add_u64(
         scores.old_active_total, old_score,
-        "fixed_topology_exact selected-cache old active total");
+        "fixed_topology_exact materialized oracle old active total");
     scores.new_active_total = chart_multisite_detail::checked_add_u64(
         scores.new_active_total, new_score,
-        "fixed_topology_exact selected-cache new active total");
+        "fixed_topology_exact materialized oracle new active total");
   }
   return scores;
+}
+
+std::optional<std::string> chart_spr_fixed_topology_first_pattern_mismatch(
+    chart_spr_fixed_topology_pattern_scores const& lhs,
+    chart_spr_fixed_topology_pattern_scores const& rhs,
+    std::string const& lhs_label, std::string const& rhs_label) {
+  if (lhs.old_pattern_scores.size() != rhs.old_pattern_scores.size() ||
+      lhs.new_pattern_scores.size() != rhs.new_pattern_scores.size() ||
+      lhs.old_pattern_scores.size() != lhs.new_pattern_scores.size() ||
+      rhs.old_pattern_scores.size() != rhs.new_pattern_scores.size()) {
+    return "persistent-cache fixed-topology per-pattern oracle size mismatch "
+           "between " +
+           lhs_label + " and " + rhs_label;
+  }
+  for (std::size_t p = 0; p < lhs.old_pattern_scores.size(); ++p) {
+    if (lhs.old_pattern_scores[p] != rhs.old_pattern_scores[p] ||
+        lhs.new_pattern_scores[p] != rhs.new_pattern_scores[p]) {
+      return "persistent-cache fixed-topology per-pattern oracle mismatch at "
+             "pattern " +
+             std::to_string(p) + " (" + lhs_label + " old/new=" +
+             std::to_string(lhs.old_pattern_scores[p]) + "/" +
+             std::to_string(lhs.new_pattern_scores[p]) + ", " + rhs_label +
+             " old/new=" + std::to_string(rhs.old_pattern_scores[p]) + "/" +
+             std::to_string(rhs.new_pattern_scores[p]) + ")";
+    }
+  }
+  if (lhs.old_active_total != rhs.old_active_total ||
+      lhs.new_active_total != rhs.new_active_total) {
+    return "persistent-cache fixed-topology active-total oracle mismatch "
+           "between " +
+           lhs_label + " and " + rhs_label;
+  }
+  return std::nullopt;
 }
 
 struct chart_spr_fixed_topology_cache_pattern_scores {
@@ -1057,91 +1145,61 @@ struct chart_spr_fixed_topology_cache_pattern_scores {
   std::vector<std::uint64_t> new_pattern_scores;
   std::uint64_t old_active_total = 0;
   std::uint64_t new_active_total = 0;
-  chart_spr_fixed_topology_pattern_scores selected_oracle_scores;
+  chart_spr_fixed_topology_pattern_scores direct_oracle_scores;
+  std::optional<chart_spr_fixed_topology_pattern_scores>
+      materialized_oracle_scores;
   bool per_pattern_oracle_green = false;
   std::string oracle_mismatch_reason;
 };
 
-std::array<chart_cost, nuc_state_count> const&
-chart_spr_fixed_cache_inside_row(
-    chart_spr_local_commit_substrate const& sub, inside_chart_cache const& icache,
-    spr_overlay_delta const& delta,
-    std::vector<std::array<chart_cost, nuc_state_count>> const& scratch,
-    std::size_t pattern, overlay_clade_ref ref) {
-  auto slot = ref.space == overlay_id_space::base
-                  ? delta.affected_base_row_slot.at(ref.id)
-                  : delta.affected_temp_row_slot.at(ref.id);
-  if (slot != chart_spr_overlay_row_npos) {
-    if (slot >= scratch.size()) {
-      throw std::runtime_error(
-          "chart SPR fixed-topology cache verifier: affected row slot out "
-          "of range");
+void chart_spr_apply_independent_sm_bug_for_tests(
+    chart_spr_fixed_topology_cache_pattern_scores& scores) {
+  // Test-only corruptor for the Phase-8 shared-s_M guard.  The historical bug
+  // class is an under-count: detach and reattach terms choose different moved-
+  // subtree root states.  Model that in the actual persistent scorer by
+  // perturbing one per-pattern new score downward before oracle comparison;
+  // the independent direct/materialized selected-topology oracle must reject
+  // the candidate-cache result and force the fallback path.
+  for (std::size_t p = 0; p < scores.new_pattern_scores.size(); ++p) {
+    if (scores.new_pattern_scores[p] > 0) {
+      --scores.new_pattern_scores[p];
+      --scores.new_active_total;
+      return;
     }
-    return scratch[slot];
   }
-  if (ref.space != overlay_id_space::base) {
-    throw std::runtime_error(
-        "chart SPR fixed-topology cache verifier: selected topology reached "
-        "an unaffected temp clade (affected-set under-inclusion)");
+  if (!scores.new_pattern_scores.empty()) {
+    ++scores.new_pattern_scores.front();
+    ++scores.new_active_total;
   }
-  return icache.row(pattern, chart_spr_chain_ref_for_dense_clade(sub, ref.id));
 }
 
-// Phase-8 fixed-topology edge-term convention.  Binary SPR, SPR-with-
-// collapse, and the child-set rewrite shape all arrive here as selected binary
-// productions in overlay space.  The detach/reattach/split/merge transition
-// terms are therefore exactly the two parent->child transition terms added by
-// `combine_binary_rows` for each selected production.  A moved subtree M is
-// addressed by one overlay clade ref; every selected production that touches M
-// reads the same cached/scratch row for that ref, so its root state s_M is a
-// single shared minimization variable inside the row rather than two
-// independently minimized detach/reattach scalars.  The per-pattern oracle
-// below compares this grammar-cache calculation to the persistent structural
-// selected-topology row cache before the grammar-cache result may carry the
-// fixed_topology_exact label.
-std::array<chart_cost, nuc_state_count>
-chart_spr_recompute_selected_affected_row_from_cache(
-    chart_spr_local_commit_substrate const& sub, chart_spr_search_state const& state,
-    inside_chart_cache const& icache, spr_overlay_delta const& delta,
-    std::map<overlay_clade_ref, overlay_production_ref> const& selected,
-    std::vector<std::array<chart_cost, nuc_state_count>> const& scratch,
-    std::size_t pattern, overlay_clade_ref ref) {
-  auto taxa = chart_spr_clade_taxa_for_ref(state.grammar, *delta.candidate, ref);
-  if (taxa.size() == 1) {
-    auto taxon = taxa.front();
-    auto const& site = icache.patterns[pattern];
-    if (taxon >= site.state_by_taxon.size()) {
-      throw std::runtime_error(
-          "chart SPR fixed-topology cache verifier: leaf taxon out of state "
-          "range");
-    }
-    auto observed = site.state_by_taxon[taxon];
-    parsimony_chart_detail::validate_state(
-        observed, "fixed_topology_exact cache leaf state");
-    auto row = parsimony_chart_detail::make_inf_row();
-    row[observed] = 0;
-    return row;
-  }
-
-  auto it = selected.find(ref);
-  if (it == selected.end()) {
-    throw std::runtime_error(
-        "chart SPR fixed-topology cache verifier: selected topology missing "
-        "production for affected non-singleton clade");
-  }
-  validate_chart_spr_selected_overlay_production_for_fixed_topology(
-      state.grammar, *delta.candidate, it->second,
-      "chart SPR fixed-topology cache verifier");
-  auto children = chart_spr_overlay_production_children(state.grammar,
-                                                        *delta.candidate,
-                                                        it->second);
-  auto const& left = chart_spr_fixed_cache_inside_row(
-      sub, icache, delta, scratch, pattern, children[0]);
-  auto const& right = chart_spr_fixed_cache_inside_row(
-      sub, icache, delta, scratch, pattern, children[1]);
-  return chart_multisite_detail::combine_binary_rows(left, right);
-}
-
+// Phase-8 fixed-topology edge-term convention (per move class).
+//
+// * Binary SPR without collapse: the before certificate contains the old
+//   parent production P_old -> (M, S_old) and the ancestor path above P_old;
+//   the after certificate replaces it with the reattachment production
+//   P_new -> (M, S_new) plus the corresponding ancestor-path productions.
+//   The detach edge term is the transition on P_old -> M in the before row;
+//   the reattach edge term is the transition on P_new -> M in the after row.
+//
+// * SPR with collapse/split: the before certificate additionally contains the
+//   production that will be collapsed at the old parent and the after
+//   certificate contains the split production that introduces the new parent.
+//   The split/merge terms are exactly the parent->child transitions of those
+//   selected binary productions; there is no separate scalar edge term outside
+//   the selected-production recurrence.
+//
+// * Option-C child-set rewrite (when represented as an overlay delta): the
+//   before and after child-set productions are scored as the old and new
+//   selected binary productions at the rewritten parent; their two
+//   parent->child transitions are the complete edge-term enumeration.
+//
+// In all three cases a moved subtree M is one overlay clade ref.  Every
+// selected production that touches M reads the same fixed-topology row for that
+// ref, so the moved-subtree root state s_M is a single shared minimization
+// variable inside the row.  A scorer that minimized the detach and reattach
+// terms with independent s_M values would no longer match the materialized
+// selected-topology per-pattern oracle and would trip the Phase-8 tests.
 chart_spr_fixed_topology_cache_pattern_scores
 chart_spr_fixed_topology_pattern_scores_from_persistent_cache(
     chart_spr_local_commit_substrate& sub,
@@ -1187,37 +1245,31 @@ chart_spr_fixed_topology_pattern_scores_from_persistent_cache(
   validate_chart_spr_topology_certificate_signatures(
       state.grammar, candidate.candidate,
       *candidate.topology_selection.certificate);
-  auto selected = chart_spr_overlay_selected_production_by_parent(
-      state.grammar, candidate.candidate,
-      candidate.topology_selection.certificate->after_overlay_productions);
-  auto delta = build_spr_overlay_delta(state.grammar, candidate.candidate);
 
   chart_spr_fixed_topology_cache_pattern_scores scores;
   auto const& active = state.active_patterns.patterns.patterns;
   scores.old_pattern_scores.reserve(active.size());
   scores.new_pattern_scores.reserve(active.size());
-  auto root_ref = base_clade_ref(state.grammar.root_clade);
   auto root_chain_ref = chart_spr_chain_ref_for_dense_clade(
       sub, state.grammar.root_clade);
 
-  std::vector<std::array<chart_cost, nuc_state_count>> scratch;
+  // Phase 8 fixed-topology cache path.  The grammar-min inside cache cannot be
+  // read for a selected topology in a general DAG: an unchanged selected
+  // subtree may be locally suboptimal, so `icache.row(...)` would silently
+  // substitute a different production.  Instead the persistent selected-
+  // topology cache stores rows keyed by the structural rooted topology and is
+  // the production cache for fixed_topology_exact.  The outside cache still
+  // supplies the root outside row, keeping the score in the same inside +
+  // outside convention as the local-commit cache.  No dense overlay
+  // materialization or B&B is performed here.
+  auto roots = chart_spr_selected_topology_root_entries_from_cache(
+      sub.selected_topology_cache, state, candidate);
   for (std::size_t p = 0; p < active.size(); ++p) {
-    scratch.assign(delta.affected_order.size(),
-                   parsimony_chart_detail::make_inf_row());
-    for (std::size_t slot = 0; slot < delta.affected_order.size(); ++slot) {
-      scratch[slot] = chart_spr_recompute_selected_affected_row_from_cache(
-          sub, state, icache, delta, selected, scratch, p,
-          delta.affected_order[slot]);
-    }
-
-    auto const& old_root_inside = icache.row(p, root_chain_ref);
-    auto const& old_root_outside = ocache.row(p, root_chain_ref);
-    auto const& new_root_inside = chart_spr_fixed_cache_inside_row(
-        sub, icache, delta, scratch, p, root_ref);
-    auto old_min = chart_spr_min_inside_plus_outside(old_root_inside,
-                                                     old_root_outside);
-    auto new_min = chart_spr_min_inside_plus_outside(new_root_inside,
-                                                     old_root_outside);
+    auto const& root_outside = ocache.row(p, root_chain_ref);
+    auto old_min = chart_spr_min_inside_plus_outside(
+        roots.before->rows_by_pattern[p], root_outside);
+    auto new_min = chart_spr_min_inside_plus_outside(
+        roots.after->rows_by_pattern[p], root_outside);
     auto old_score = chart_multisite_detail::checked_mul_cost(
         active[p].weight, old_min,
         "fixed_topology_exact persistent-cache old pattern score");
@@ -1234,40 +1286,49 @@ chart_spr_fixed_topology_pattern_scores_from_persistent_cache(
         "fixed_topology_exact persistent-cache new active total");
   }
 
-  scores.selected_oracle_scores =
-      chart_spr_fixed_topology_selected_pattern_scores_from_cache(
-          sub.selected_topology_cache, state, candidate);
-  scores.per_pattern_oracle_green =
-      scores.old_pattern_scores ==
-          scores.selected_oracle_scores.old_pattern_scores &&
-      scores.new_pattern_scores ==
-          scores.selected_oracle_scores.new_pattern_scores;
-  if (!scores.per_pattern_oracle_green) {
-    for (std::size_t p = 0; p < active.size(); ++p) {
-      if (scores.old_pattern_scores[p] !=
-              scores.selected_oracle_scores.old_pattern_scores[p] ||
-          scores.new_pattern_scores[p] !=
-              scores.selected_oracle_scores.new_pattern_scores[p]) {
-        scores.oracle_mismatch_reason =
-            "persistent-cache fixed-topology per-pattern oracle mismatch at "
-            "pattern " + std::to_string(p) + " (grammar-cache old/new=" +
-            std::to_string(scores.old_pattern_scores[p]) + "/" +
-            std::to_string(scores.new_pattern_scores[p]) +
-            ", selected-cache old/new=" +
-            std::to_string(
-                scores.selected_oracle_scores.old_pattern_scores[p]) +
-            "/" +
-            std::to_string(
-                scores.selected_oracle_scores.new_pattern_scores[p]) +
-            ")";
-        break;
-      }
+  if (sub.force_independent_sm_bug_for_tests) {
+    chart_spr_apply_independent_sm_bug_for_tests(scores);
+  }
+
+  chart_spr_fixed_topology_pattern_scores cache_scores;
+  cache_scores.old_pattern_scores = scores.old_pattern_scores;
+  cache_scores.new_pattern_scores = scores.new_pattern_scores;
+  cache_scores.old_active_total = scores.old_active_total;
+  cache_scores.new_active_total = scores.new_active_total;
+
+  // Load-bearing Phase-8 oracle: recompute the selected before/after topology
+  // from scratch per pattern, without consulting the persistent selected-
+  // topology row cache.  This is intentionally independent of the production
+  // cache above; a cache/scorer bug (including an independent-s_M under-count)
+  // is a per-pattern mismatch and cannot certify a fixed_topology_exact score.
+  scores.direct_oracle_scores =
+      fixed_topology_direct_selected_pattern_scores(state, candidate);
+  if (auto mismatch = chart_spr_fixed_topology_first_pattern_mismatch(
+          cache_scores, scores.direct_oracle_scores, "persistent-cache",
+          "direct-selected-oracle")) {
+    scores.oracle_mismatch_reason = *mismatch;
+    return scores;
+  }
+
+  if (sub.verify_materialized_fixed_topology_oracle_for_tests) {
+    scores.materialized_oracle_scores =
+        chart_spr_fixed_topology_materialized_oracle_pattern_scores(state,
+                                                                   candidate);
+    if (auto mismatch = chart_spr_fixed_topology_first_pattern_mismatch(
+            cache_scores, *scores.materialized_oracle_scores,
+            "persistent-cache", "materialized-selected-oracle")) {
+      scores.oracle_mismatch_reason = *mismatch;
+      return scores;
     }
-    if (scores.oracle_mismatch_reason.empty()) {
-      scores.oracle_mismatch_reason =
-          "persistent-cache fixed-topology per-pattern oracle mismatch";
+    if (auto mismatch = chart_spr_fixed_topology_first_pattern_mismatch(
+            scores.direct_oracle_scores, *scores.materialized_oracle_scores,
+            "direct-selected-oracle", "materialized-selected-oracle")) {
+      scores.oracle_mismatch_reason = *mismatch;
+      return scores;
     }
   }
+
+  scores.per_pattern_oracle_green = true;
   return scores;
 }
 
@@ -1275,14 +1336,15 @@ chart_spr_candidate_score
 chart_spr_verify_fixed_topology_direct_fallback_after_counting(
     chart_spr_search_state const& state, chart_spr_candidate_score candidate,
     std::string const& reason) {
-  // Strict Phase-8 label discipline: if the persistent grammar-cache path and
-  // the persistent selected-topology cache disagree per pattern, do not label
-  // either cached value as exact.  Fall back to the conservative from-scratch
-  // selected-topology scorer (full selected rows recomputed, no cached
-  // selected-subtree rows consulted) and label only that independently
-  // recomputed result fixed_topology_exact.  This keeps full selected-topology
-  // recomputation off the green path while preserving the "oracle green or
-  // from-scratch fallback" contract.
+  ++state.counters.fixed_topology_persistent_cache_fallbacks;
+  ++state.counters.fixed_topology_persistent_cache_oracle_mismatches;
+  // Strict Phase-8 label discipline: if the persistent selected-topology
+  // production cache and the independent per-pattern oracle disagree, do not
+  // label the cached value as exact.  Fall back to the conservative
+  // from-scratch selected-topology scorer (full selected rows recomputed, no
+  // cached selected-subtree rows consulted) and label only that independently
+  // recomputed result fixed_topology_exact.  This preserves the "oracle green
+  // or from-scratch fallback" contract.
   try {
     auto delta = fixed_topology_delta_direct_selected_topology(state, candidate);
     candidate.exact = make_chart_spr_objective_score(
@@ -1322,6 +1384,7 @@ chart_spr_verify_candidate_fixed_topology_exact_from_persistent_cache(
   }
 
   ++state.counters.exact_verifications;
+  ++state.counters.fixed_topology_persistent_cache_verifications;
   try {
     auto scores = chart_spr_fixed_topology_pattern_scores_from_persistent_cache(
         sub, state, candidate);
@@ -1349,7 +1412,8 @@ chart_spr_verify_candidate_fixed_topology_exact_from_persistent_cache(
 }
 
 std::unique_ptr<chart_spr_local_commit_substrate>
-chart_spr_make_local_commit_substrate(chart_spr_search_state const& state) {
+chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
+                                      chart_spr_search_options const& options) {
   if (state.chart_opts.score_ua_edge) {
     throw std::runtime_error(
         "chart SPR local commit: score_ua_edge=true is not yet supported in "
@@ -1373,6 +1437,10 @@ chart_spr_make_local_commit_substrate(chart_spr_search_state const& state) {
                                            state.active_patterns,
                                            state.chart_opts);
   chart_spr_set_identity_tip_maps(*sub);
+  sub->verify_materialized_fixed_topology_oracle_for_tests =
+      options.verify_fixed_topology_materialized_oracle_for_tests;
+  sub->force_independent_sm_bug_for_tests =
+      options.force_fixed_topology_independent_sm_bug_for_tests;
   return sub;
 }
 
@@ -1689,6 +1757,12 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.local_commit_two_chart_oracle_runs;
   summary.local_commit_tip_grammar_refreshes =
       counters.local_commit_tip_grammar_refreshes;
+  summary.fixed_topology_persistent_cache_verifications =
+      counters.fixed_topology_persistent_cache_verifications;
+  summary.fixed_topology_persistent_cache_fallbacks =
+      counters.fixed_topology_persistent_cache_fallbacks;
+  summary.fixed_topology_persistent_cache_oracle_mismatches =
+      counters.fixed_topology_persistent_cache_oracle_mismatches;
   summary.full_search_state_rebuilds =
       summary.initial_search_state_rebuilds +
       summary.sidecar_rebuilds_after_accept;
@@ -1750,7 +1824,8 @@ chart_spr_search_result run_chart_spr_search(
   // derived view of the chain tip, refreshed on each commit.
   std::unique_ptr<chart_spr_local_commit_substrate> local_commit_substrate;
   if (!options.rebuild_after_accept) {
-    local_commit_substrate = chart_spr_make_local_commit_substrate(state);
+    local_commit_substrate = chart_spr_make_local_commit_substrate(state,
+                                                                   options);
     auto* substrate_ptr = local_commit_substrate.get();
     state.fixed_topology_exact_verifier =
         [substrate_ptr](chart_spr_search_state const& verifier_state,
