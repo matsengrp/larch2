@@ -9,8 +9,10 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -740,6 +742,18 @@ bool chart_spr_is_local_commit_tombstone_scope_rejection(
           msg.find("double tombstone") != std::string::npos);
 }
 
+struct chart_spr_selected_topology_cache_entry {
+  std::vector<std::array<chart_cost, nuc_state_count>> rows_by_pattern;
+};
+
+struct chart_spr_selected_topology_row_cache {
+  // Structural selected-subtree key -> all-active-pattern rows for that exact
+  // rooted topology.  Keys are taxon/topology based rather than dense-id based,
+  // so unchanged selected subtrees survive tip materialization and can be
+  // reused by later candidate certificates in the same local-commit run.
+  std::map<std::string, chart_spr_selected_topology_cache_entry> rows_by_key;
+};
+
 // The Phase 4 local-commit substrate: frozen base grammar + overlay chain +
 // persistent inside/outside caches.  Non-movable once the chain/caches are
 // emplaced: they hold pointers (`base`) into `base_grammar`, so moving the
@@ -750,7 +764,589 @@ struct chart_spr_local_commit_substrate {
   std::optional<overlay_chain> chain;
   std::optional<inside_chart_cache> icache;
   std::optional<outside_chart_cache> ocache;
+
+  // Current materialized-tip dense ids -> persistent chain overlay refs.  The
+  // search state's candidate generator names existing clades/productions in the
+  // dense tip grammar, while the persistent inside/outside caches are keyed in
+  // frozen-base + merged-temp overlay space.  Phase 8's fixed-topology scorer
+  // uses these maps to read cached rows instead of dense-rebuilding charts.
+  std::vector<overlay_clade_ref> dense_clade_to_chain_ref;
+  std::vector<overlay_production_ref> dense_production_to_chain_ref;
+
+  // Phase 8 per-pattern selected-topology oracle cache.  This is separate
+  // from the grammar-min inside/outside caches: it stores rows for one exact
+  // structural selected subtree, so an unchanged fixed-topology subtree can be
+  // read instead of recomputed for every candidate oracle.
+  chart_spr_selected_topology_row_cache selected_topology_cache;
 };
+
+void chart_spr_set_identity_tip_maps(chart_spr_local_commit_substrate& sub) {
+  sub.dense_clade_to_chain_ref.clear();
+  sub.dense_clade_to_chain_ref.reserve(sub.base_grammar.clades.size());
+  for (clade_id cid = 0; cid < sub.base_grammar.clades.size(); ++cid) {
+    sub.dense_clade_to_chain_ref.push_back(base_clade_ref(cid));
+  }
+  sub.dense_production_to_chain_ref.clear();
+  sub.dense_production_to_chain_ref.reserve(
+      sub.base_grammar.productions.size());
+  for (production_id pid = 0; pid < sub.base_grammar.productions.size(); ++pid) {
+    sub.dense_production_to_chain_ref.push_back(base_production_ref(pid));
+  }
+}
+
+void chart_spr_set_tip_maps_from_materialization(
+    chart_spr_local_commit_substrate& sub,
+    overlay_materialization_result const& materialized) {
+  sub.dense_clade_to_chain_ref = materialized.dense_clade_to_ref;
+  sub.dense_production_to_chain_ref = materialized.dense_production_to_ref;
+}
+
+overlay_clade_ref chart_spr_chain_ref_for_dense_clade(
+    chart_spr_local_commit_substrate const& sub, clade_id dense) {
+  if (dense == no_clade || dense >= sub.dense_clade_to_chain_ref.size()) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology cache verifier: dense clade ref out of "
+        "current tip map range");
+  }
+  auto ref = sub.dense_clade_to_chain_ref[dense];
+  if (ref.id == no_clade) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology cache verifier: dense clade maps to "
+        "no_clade");
+  }
+  return ref;
+}
+
+chart_cost chart_spr_min_inside_plus_outside(
+    std::array<chart_cost, nuc_state_count> const& inside,
+    std::array<chart_cost, nuc_state_count> const& outside) {
+  chart_cost best = chart_inf;
+  for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+    best = std::min(best, parsimony_chart_detail::saturated_add(
+                              inside[state], outside[state]));
+  }
+  return best;
+}
+
+std::string chart_spr_selected_topology_leaf_key(taxon_id taxon) {
+  return "L" + std::to_string(taxon) + ";";
+}
+
+std::string chart_spr_selected_topology_internal_key(std::string left,
+                                                     std::string right) {
+  if (right < left) std::swap(left, right);
+  return "I(" + left + ")(" + right + ")";
+}
+
+std::map<overlay_clade_ref, overlay_production_ref>
+chart_spr_before_selected_production_by_parent(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    std::vector<overlay_production_ref> const& production_refs) {
+  std::map<overlay_clade_ref, overlay_production_ref> selected;
+  for (auto ref : production_refs) {
+    if (ref.space != overlay_id_space::base) {
+      throw std::runtime_error(
+          "fixed_topology_exact selected-topology cache: before-topology "
+          "production must refer to the current base grammar");
+    }
+    validate_chart_spr_selected_overlay_production_for_fixed_topology(
+        base, candidate, ref,
+        "fixed_topology_exact selected-topology cache before");
+    auto parent = chart_spr_overlay_production_parent(base, candidate, ref);
+    auto [it, inserted] = selected.emplace(parent, ref);
+    if (!inserted && it->second != ref) {
+      throw std::runtime_error(
+          "fixed_topology_exact selected-topology cache: conflicting "
+          "before-topology production choices for one clade");
+    }
+  }
+  return selected;
+}
+
+struct chart_spr_selected_topology_node {
+  std::string key;
+  chart_spr_selected_topology_cache_entry const* entry = nullptr;
+};
+
+struct chart_spr_overlay_ref_active_guard {
+  std::set<overlay_clade_ref>& active;
+  overlay_clade_ref ref;
+
+  chart_spr_overlay_ref_active_guard(std::set<overlay_clade_ref>& active_refs,
+                                     overlay_clade_ref clade)
+      : active(active_refs), ref(clade) {
+    if (!active.insert(ref).second) {
+      throw std::runtime_error(
+          "fixed_topology_exact selected-topology cache: cycle in selected "
+          "topology");
+    }
+  }
+
+  ~chart_spr_overlay_ref_active_guard() { active.erase(ref); }
+
+  chart_spr_overlay_ref_active_guard(
+      chart_spr_overlay_ref_active_guard const&) = delete;
+  chart_spr_overlay_ref_active_guard& operator=(
+      chart_spr_overlay_ref_active_guard const&) = delete;
+};
+
+chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
+    chart_spr_selected_topology_row_cache& cache,
+    chart_spr_search_state const& state,
+    grammar_spr_candidate const& candidate,
+    std::map<overlay_clade_ref, overlay_production_ref> const& selected,
+    overlay_clade_ref clade, std::set<overlay_clade_ref>& active_refs) {
+  chart_spr_overlay_ref_active_guard guard(active_refs, clade);
+  auto const& active = state.active_patterns.patterns.patterns;
+  auto taxa = chart_spr_clade_taxa_for_ref(state.grammar, candidate, clade);
+  if (taxa.empty()) {
+    throw std::runtime_error(
+        "fixed_topology_exact selected-topology cache: selected clade has "
+        "no taxa");
+  }
+
+  auto try_cached_node = [&](std::string const& key)
+      -> std::optional<chart_spr_selected_topology_node> {
+    auto it = cache.rows_by_key.find(key);
+    if (it == cache.rows_by_key.end()) return std::nullopt;
+    if (it->second.rows_by_pattern.size() != active.size()) {
+      throw std::runtime_error(
+          "fixed_topology_exact selected-topology cache: cached row "
+          "pattern count mismatch");
+    }
+    ++state.counters.fixed_topology_selected_cache_hits;
+    return chart_spr_selected_topology_node{key, &it->second};
+  };
+  auto insert_new_node = [&](std::string key,
+                             chart_spr_selected_topology_cache_entry entry) {
+    if (entry.rows_by_pattern.size() != active.size()) {
+      throw std::runtime_error(
+          "fixed_topology_exact selected-topology cache: new row pattern "
+          "count mismatch");
+    }
+    ++state.counters.fixed_topology_selected_cache_misses;
+    state.counters.fixed_topology_selected_rows_computed +=
+        entry.rows_by_pattern.size();
+    auto [inserted, ok] = cache.rows_by_key.emplace(key, std::move(entry));
+    if (!ok) {
+      throw std::runtime_error(
+          "fixed_topology_exact selected-topology cache: duplicate insert");
+    }
+    return chart_spr_selected_topology_node{inserted->first,
+                                            &inserted->second};
+  };
+
+  if (taxa.size() == 1) {
+    auto taxon = taxa.front();
+    auto key = chart_spr_selected_topology_leaf_key(taxon);
+    if (auto cached = try_cached_node(key)) return *cached;
+    chart_spr_selected_topology_cache_entry entry;
+    entry.rows_by_pattern.reserve(active.size());
+    for (std::size_t p = 0; p < active.size(); ++p) {
+      if (taxon >= active[p].state_by_taxon.size()) {
+        throw std::runtime_error(
+            "fixed_topology_exact selected-topology cache: leaf taxon out "
+            "of state range");
+      }
+      auto observed = active[p].state_by_taxon[taxon];
+      parsimony_chart_detail::validate_state(
+          observed, "fixed_topology_exact selected-topology cache leaf state");
+      auto row = parsimony_chart_detail::make_inf_row();
+      row[observed] = 0;
+      entry.rows_by_pattern.push_back(row);
+    }
+    return insert_new_node(std::move(key), std::move(entry));
+  }
+
+  auto it = selected.find(clade);
+  if (it == selected.end()) {
+    throw std::runtime_error(
+        "fixed_topology_exact selected-topology cache: selected topology "
+        "missing production for non-singleton clade");
+  }
+  validate_chart_spr_selected_overlay_production_for_fixed_topology(
+      state.grammar, candidate, it->second,
+      "fixed_topology_exact selected-topology cache");
+  auto children = chart_spr_overlay_production_children(state.grammar,
+                                                        candidate,
+                                                        it->second);
+  auto left = chart_spr_selected_topology_rows_for_clade(
+      cache, state, candidate, selected, children[0], active_refs);
+  auto right = chart_spr_selected_topology_rows_for_clade(
+      cache, state, candidate, selected, children[1], active_refs);
+  if (left.entry == nullptr || right.entry == nullptr) {
+    throw std::runtime_error(
+        "fixed_topology_exact selected-topology cache: child cache entry "
+        "missing");
+  }
+
+  auto key = chart_spr_selected_topology_internal_key(left.key, right.key);
+  if (auto cached = try_cached_node(key)) return *cached;
+  chart_spr_selected_topology_cache_entry entry;
+  entry.rows_by_pattern.reserve(active.size());
+  for (std::size_t p = 0; p < active.size(); ++p) {
+    entry.rows_by_pattern.push_back(
+        chart_multisite_detail::combine_binary_rows(
+            left.entry->rows_by_pattern[p], right.entry->rows_by_pattern[p]));
+  }
+  return insert_new_node(std::move(key), std::move(entry));
+}
+
+chart_spr_fixed_topology_pattern_scores
+chart_spr_fixed_topology_selected_pattern_scores_from_cache(
+    chart_spr_selected_topology_row_cache& cache,
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate) {
+  state.active_patterns.assert_no_skipped_invariant_metadata();
+  if (!candidate.topology_selection.certificate) {
+    throw std::runtime_error(
+        "fixed_topology_exact selected-topology cache requires a complete "
+        "topology certificate");
+  }
+  auto const& certificate = *candidate.topology_selection.certificate;
+  validate_chart_spr_topology_certificate_signatures(
+      state.grammar, candidate.candidate, certificate);
+
+  auto before_selected = chart_spr_before_selected_production_by_parent(
+      state.grammar, candidate.candidate,
+      certificate.before_overlay_productions);
+  auto after_selected = chart_spr_overlay_selected_production_by_parent(
+      state.grammar, candidate.candidate,
+      certificate.after_overlay_productions);
+
+  std::set<overlay_clade_ref> active_refs;
+  auto before_root = chart_spr_selected_topology_rows_for_clade(
+      cache, state, candidate.candidate, before_selected,
+      base_clade_ref(state.grammar.root_clade), active_refs);
+  active_refs.clear();
+  auto after_root = chart_spr_selected_topology_rows_for_clade(
+      cache, state, candidate.candidate, after_selected,
+      base_clade_ref(state.grammar.root_clade), active_refs);
+  if (before_root.entry == nullptr || after_root.entry == nullptr) {
+    throw std::runtime_error(
+        "fixed_topology_exact selected-topology cache: root cache entry "
+        "missing");
+  }
+
+  chart_spr_fixed_topology_pattern_scores scores;
+  auto const& active = state.active_patterns.patterns.patterns;
+  scores.old_pattern_scores.reserve(active.size());
+  scores.new_pattern_scores.reserve(active.size());
+  for (std::size_t p = 0; p < active.size(); ++p) {
+    if (state.chart_opts.score_ua_edge) {
+      chart_multisite_detail::validate_pattern_reference_counts(active[p], p);
+    }
+    auto old_score = chart_spr_weighted_root_score_from_row(
+        before_root.entry->rows_by_pattern[p], active[p], state.chart_opts);
+    auto new_score = chart_spr_weighted_root_score_from_row(
+        after_root.entry->rows_by_pattern[p], active[p], state.chart_opts);
+    scores.old_pattern_scores.push_back(old_score);
+    scores.new_pattern_scores.push_back(new_score);
+    scores.old_active_total = chart_multisite_detail::checked_add_u64(
+        scores.old_active_total, old_score,
+        "fixed_topology_exact selected-cache old active total");
+    scores.new_active_total = chart_multisite_detail::checked_add_u64(
+        scores.new_active_total, new_score,
+        "fixed_topology_exact selected-cache new active total");
+  }
+  return scores;
+}
+
+struct chart_spr_fixed_topology_cache_pattern_scores {
+  std::vector<std::uint64_t> old_pattern_scores;
+  std::vector<std::uint64_t> new_pattern_scores;
+  std::uint64_t old_active_total = 0;
+  std::uint64_t new_active_total = 0;
+  chart_spr_fixed_topology_pattern_scores selected_oracle_scores;
+  bool per_pattern_oracle_green = false;
+  std::string oracle_mismatch_reason;
+};
+
+std::array<chart_cost, nuc_state_count> const&
+chart_spr_fixed_cache_inside_row(
+    chart_spr_local_commit_substrate const& sub, inside_chart_cache const& icache,
+    spr_overlay_delta const& delta,
+    std::vector<std::array<chart_cost, nuc_state_count>> const& scratch,
+    std::size_t pattern, overlay_clade_ref ref) {
+  auto slot = ref.space == overlay_id_space::base
+                  ? delta.affected_base_row_slot.at(ref.id)
+                  : delta.affected_temp_row_slot.at(ref.id);
+  if (slot != chart_spr_overlay_row_npos) {
+    if (slot >= scratch.size()) {
+      throw std::runtime_error(
+          "chart SPR fixed-topology cache verifier: affected row slot out "
+          "of range");
+    }
+    return scratch[slot];
+  }
+  if (ref.space != overlay_id_space::base) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology cache verifier: selected topology reached "
+        "an unaffected temp clade (affected-set under-inclusion)");
+  }
+  return icache.row(pattern, chart_spr_chain_ref_for_dense_clade(sub, ref.id));
+}
+
+// Phase-8 fixed-topology edge-term convention.  Binary SPR, SPR-with-
+// collapse, and the child-set rewrite shape all arrive here as selected binary
+// productions in overlay space.  The detach/reattach/split/merge transition
+// terms are therefore exactly the two parent->child transition terms added by
+// `combine_binary_rows` for each selected production.  A moved subtree M is
+// addressed by one overlay clade ref; every selected production that touches M
+// reads the same cached/scratch row for that ref, so its root state s_M is a
+// single shared minimization variable inside the row rather than two
+// independently minimized detach/reattach scalars.  The per-pattern oracle
+// below compares this grammar-cache calculation to the persistent structural
+// selected-topology row cache before the grammar-cache result may carry the
+// fixed_topology_exact label.
+std::array<chart_cost, nuc_state_count>
+chart_spr_recompute_selected_affected_row_from_cache(
+    chart_spr_local_commit_substrate const& sub, chart_spr_search_state const& state,
+    inside_chart_cache const& icache, spr_overlay_delta const& delta,
+    std::map<overlay_clade_ref, overlay_production_ref> const& selected,
+    std::vector<std::array<chart_cost, nuc_state_count>> const& scratch,
+    std::size_t pattern, overlay_clade_ref ref) {
+  auto taxa = chart_spr_clade_taxa_for_ref(state.grammar, *delta.candidate, ref);
+  if (taxa.size() == 1) {
+    auto taxon = taxa.front();
+    auto const& site = icache.patterns[pattern];
+    if (taxon >= site.state_by_taxon.size()) {
+      throw std::runtime_error(
+          "chart SPR fixed-topology cache verifier: leaf taxon out of state "
+          "range");
+    }
+    auto observed = site.state_by_taxon[taxon];
+    parsimony_chart_detail::validate_state(
+        observed, "fixed_topology_exact cache leaf state");
+    auto row = parsimony_chart_detail::make_inf_row();
+    row[observed] = 0;
+    return row;
+  }
+
+  auto it = selected.find(ref);
+  if (it == selected.end()) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology cache verifier: selected topology missing "
+        "production for affected non-singleton clade");
+  }
+  validate_chart_spr_selected_overlay_production_for_fixed_topology(
+      state.grammar, *delta.candidate, it->second,
+      "chart SPR fixed-topology cache verifier");
+  auto children = chart_spr_overlay_production_children(state.grammar,
+                                                        *delta.candidate,
+                                                        it->second);
+  auto const& left = chart_spr_fixed_cache_inside_row(
+      sub, icache, delta, scratch, pattern, children[0]);
+  auto const& right = chart_spr_fixed_cache_inside_row(
+      sub, icache, delta, scratch, pattern, children[1]);
+  return chart_multisite_detail::combine_binary_rows(left, right);
+}
+
+chart_spr_fixed_topology_cache_pattern_scores
+chart_spr_fixed_topology_pattern_scores_from_persistent_cache(
+    chart_spr_local_commit_substrate& sub,
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate) {
+  if (!sub.icache || !sub.ocache || !sub.chain) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology cache verifier: local-commit substrate is "
+        "not initialized");
+  }
+  auto const& icache = *sub.icache;
+  auto const& ocache = *sub.ocache;
+  if (state.chart_opts.score_ua_edge) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology cache verifier: score_ua_edge=true is not "
+        "supported by the persistent-cache verifier");
+  }
+  state.active_patterns.assert_no_skipped_invariant_metadata();
+  if (!candidate.topology_selection.certificate) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology cache verifier requires a complete topology "
+        "certificate");
+  }
+  if (icache.commit_epoch != sub.chain->size() ||
+      ocache.commit_epoch != sub.chain->size()) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology cache verifier: persistent cache epochs do "
+        "not match the chain tip");
+  }
+  if (icache.patterns.size() !=
+          state.active_patterns.patterns.patterns.size() ||
+      ocache.patterns.size() != icache.patterns.size()) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology cache verifier: active pattern cache size "
+        "mismatch");
+  }
+  if (sub.dense_clade_to_chain_ref.size() != state.grammar.clades.size()) {
+    throw std::runtime_error(
+        "chart SPR fixed-topology cache verifier: dense clade map does not "
+        "match current state grammar");
+  }
+
+  validate_chart_spr_topology_certificate_signatures(
+      state.grammar, candidate.candidate,
+      *candidate.topology_selection.certificate);
+  auto selected = chart_spr_overlay_selected_production_by_parent(
+      state.grammar, candidate.candidate,
+      candidate.topology_selection.certificate->after_overlay_productions);
+  auto delta = build_spr_overlay_delta(state.grammar, candidate.candidate);
+
+  chart_spr_fixed_topology_cache_pattern_scores scores;
+  auto const& active = state.active_patterns.patterns.patterns;
+  scores.old_pattern_scores.reserve(active.size());
+  scores.new_pattern_scores.reserve(active.size());
+  auto root_ref = base_clade_ref(state.grammar.root_clade);
+  auto root_chain_ref = chart_spr_chain_ref_for_dense_clade(
+      sub, state.grammar.root_clade);
+
+  std::vector<std::array<chart_cost, nuc_state_count>> scratch;
+  for (std::size_t p = 0; p < active.size(); ++p) {
+    scratch.assign(delta.affected_order.size(),
+                   parsimony_chart_detail::make_inf_row());
+    for (std::size_t slot = 0; slot < delta.affected_order.size(); ++slot) {
+      scratch[slot] = chart_spr_recompute_selected_affected_row_from_cache(
+          sub, state, icache, delta, selected, scratch, p,
+          delta.affected_order[slot]);
+    }
+
+    auto const& old_root_inside = icache.row(p, root_chain_ref);
+    auto const& old_root_outside = ocache.row(p, root_chain_ref);
+    auto const& new_root_inside = chart_spr_fixed_cache_inside_row(
+        sub, icache, delta, scratch, p, root_ref);
+    auto old_min = chart_spr_min_inside_plus_outside(old_root_inside,
+                                                     old_root_outside);
+    auto new_min = chart_spr_min_inside_plus_outside(new_root_inside,
+                                                     old_root_outside);
+    auto old_score = chart_multisite_detail::checked_mul_cost(
+        active[p].weight, old_min,
+        "fixed_topology_exact persistent-cache old pattern score");
+    auto new_score = chart_multisite_detail::checked_mul_cost(
+        active[p].weight, new_min,
+        "fixed_topology_exact persistent-cache new pattern score");
+    scores.old_pattern_scores.push_back(old_score);
+    scores.new_pattern_scores.push_back(new_score);
+    scores.old_active_total = chart_multisite_detail::checked_add_u64(
+        scores.old_active_total, old_score,
+        "fixed_topology_exact persistent-cache old active total");
+    scores.new_active_total = chart_multisite_detail::checked_add_u64(
+        scores.new_active_total, new_score,
+        "fixed_topology_exact persistent-cache new active total");
+  }
+
+  scores.selected_oracle_scores =
+      chart_spr_fixed_topology_selected_pattern_scores_from_cache(
+          sub.selected_topology_cache, state, candidate);
+  scores.per_pattern_oracle_green =
+      scores.old_pattern_scores ==
+          scores.selected_oracle_scores.old_pattern_scores &&
+      scores.new_pattern_scores ==
+          scores.selected_oracle_scores.new_pattern_scores;
+  if (!scores.per_pattern_oracle_green) {
+    for (std::size_t p = 0; p < active.size(); ++p) {
+      if (scores.old_pattern_scores[p] !=
+              scores.selected_oracle_scores.old_pattern_scores[p] ||
+          scores.new_pattern_scores[p] !=
+              scores.selected_oracle_scores.new_pattern_scores[p]) {
+        scores.oracle_mismatch_reason =
+            "persistent-cache fixed-topology per-pattern oracle mismatch at "
+            "pattern " + std::to_string(p) + " (grammar-cache old/new=" +
+            std::to_string(scores.old_pattern_scores[p]) + "/" +
+            std::to_string(scores.new_pattern_scores[p]) +
+            ", selected-cache old/new=" +
+            std::to_string(
+                scores.selected_oracle_scores.old_pattern_scores[p]) +
+            "/" +
+            std::to_string(
+                scores.selected_oracle_scores.new_pattern_scores[p]) +
+            ")";
+        break;
+      }
+    }
+    if (scores.oracle_mismatch_reason.empty()) {
+      scores.oracle_mismatch_reason =
+          "persistent-cache fixed-topology per-pattern oracle mismatch";
+    }
+  }
+  return scores;
+}
+
+chart_spr_candidate_score
+chart_spr_verify_fixed_topology_direct_fallback_after_counting(
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate,
+    std::string const& reason) {
+  // Strict Phase-8 label discipline: if the persistent grammar-cache path and
+  // the persistent selected-topology cache disagree per pattern, do not label
+  // either cached value as exact.  Fall back to the conservative from-scratch
+  // selected-topology scorer (full selected rows recomputed, no cached
+  // selected-subtree rows consulted) and label only that independently
+  // recomputed result fixed_topology_exact.  This keeps full selected-topology
+  // recomputation off the green path while preserving the "oracle green or
+  // from-scratch fallback" contract.
+  try {
+    auto delta = fixed_topology_delta_direct_selected_topology(state, candidate);
+    candidate.exact = make_chart_spr_objective_score(
+        delta, chart_spr_score_kind::fixed_topology_exact,
+        chart_spr_score_convention::full_with_invariants,
+        state.invariant_constant_offset);
+    return candidate;
+  } catch (std::exception const& e) {
+    throw std::runtime_error(
+        "fixed_topology_exact persistent-cache verifier: from-scratch "
+        "selected-topology fallback failed after cache-oracle mismatch (" +
+        reason + "): " + e.what());
+  }
+}
+
+chart_spr_candidate_score
+chart_spr_verify_candidate_fixed_topology_exact_from_persistent_cache(
+    chart_spr_local_commit_substrate& sub,
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score candidate) {
+  if (!candidate.valid) return candidate;
+  if (!chart_spr_topology_selection_has_certificate_or_selector(
+          candidate.topology_selection)) {
+    candidate.valid = false;
+    candidate.invalid_reason =
+        "fixed_topology_exact acceptance requires an explicit complete "
+        "topology certificate or a recorded deterministic topology selector; "
+        "a bare grammar_spr_candidate is not exact";
+    return candidate;
+  }
+  if (!candidate.topology_selection.certificate) {
+    candidate.valid = false;
+    candidate.invalid_reason =
+        "fixed_topology_exact deterministic selectors must be resolved to a "
+        "complete topology certificate before verification";
+    return candidate;
+  }
+
+  ++state.counters.exact_verifications;
+  try {
+    auto scores = chart_spr_fixed_topology_pattern_scores_from_persistent_cache(
+        sub, state, candidate);
+    if (!scores.per_pattern_oracle_green) {
+      return chart_spr_verify_fixed_topology_direct_fallback_after_counting(
+          state, std::move(candidate), scores.oracle_mismatch_reason);
+    }
+    auto old_full = chart_spr_add_invariant_offset(
+        scores.old_active_total, state,
+        "chart-SPR fixed-topology persistent-cache old invariant offset");
+    auto new_full = chart_spr_add_invariant_offset(
+        scores.new_active_total, state,
+        "chart-SPR fixed-topology persistent-cache new invariant offset");
+    candidate.exact = make_chart_spr_objective_score(
+        spr_score_result{chart_spr_detail::signed_delta(old_full, new_full),
+                         old_full, new_full, true},
+        chart_spr_score_kind::fixed_topology_exact,
+        chart_spr_score_convention::full_with_invariants,
+        state.invariant_constant_offset);
+  } catch (std::exception const& e) {
+    candidate.valid = false;
+    candidate.invalid_reason = e.what();
+  }
+  return candidate;
+}
 
 std::unique_ptr<chart_spr_local_commit_substrate>
 chart_spr_make_local_commit_substrate(chart_spr_search_state const& state) {
@@ -776,6 +1372,7 @@ chart_spr_make_local_commit_substrate(chart_spr_search_state const& state) {
   sub->ocache = build_outside_chart_cache(sub->base_grammar,
                                            state.active_patterns,
                                            state.chart_opts);
+  chart_spr_set_identity_tip_maps(*sub);
   return sub;
 }
 
@@ -1030,6 +1627,7 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     // splice) is Phase 6/7 scope; the persistent caches already remove the
     // expensive per-accept chart rescoring.
     auto materialized = materialize_overlay_chain(*sub.chain);
+    chart_spr_set_tip_maps_from_materialization(sub, materialized);
     ++counters.local_commit_tip_grammar_refreshes;
     chart_spr_refresh_state_tip_view_after_local_commit(state, materialized,
                                                          *sub.icache);
@@ -1153,6 +1751,13 @@ chart_spr_search_result run_chart_spr_search(
   std::unique_ptr<chart_spr_local_commit_substrate> local_commit_substrate;
   if (!options.rebuild_after_accept) {
     local_commit_substrate = chart_spr_make_local_commit_substrate(state);
+    auto* substrate_ptr = local_commit_substrate.get();
+    state.fixed_topology_exact_verifier =
+        [substrate_ptr](chart_spr_search_state const& verifier_state,
+                        chart_spr_candidate_score candidate) {
+          return chart_spr_verify_candidate_fixed_topology_exact_from_persistent_cache(
+              *substrate_ptr, verifier_state, std::move(candidate));
+        };
   }
 
   std::string immediate_reversal_key_to_skip;

@@ -1,4 +1,6 @@
+#include <larch/build_fasta_newick.hpp>
 #include <larch/chart_spr_search.hpp>
+#include <larch/load_proto_dag.hpp>
 #include <larch/overlay_chain_compaction.hpp>
 
 #include "test_util.hpp"
@@ -1147,6 +1149,8 @@ static void test_fixed_topology_iteration_uses_default_selector() {
   CHECK(iteration.accepted->topology_selection.selector_name ==
         "first_reachable_overlay_topology");
   CHECK(iteration.accepted->topology_selection.certificate.has_value());
+  CHECK(state.counters.overlay_materializations_for_exact_verification == 0);
+  CHECK(state.counters.full_overlay_materializations == 0);
   CHECK(state.counters.accepted_moves == 0);
   CHECK(state.counters.candidate_accepts_attempted == 1);
 
@@ -1188,6 +1192,8 @@ static void test_sampled_tree_fixed_topology_uses_source_certificate() {
   CHECK(iteration.accepted->topology_selection.certificate.has_value());
   CHECK(iteration.accepted->exact.has_value());
   CHECK(iteration.accepted->exact->value.improves());
+  CHECK(state.counters.overlay_materializations_for_exact_verification == 0);
+  CHECK(state.counters.full_overlay_materializations == 0);
 
   std::println("  PASS");
 }
@@ -1234,7 +1240,8 @@ static void test_fixed_topology_exact_certificate_scores_selected_topology() {
         larch::chart_spr_score_kind::fixed_topology_exact);
   CHECK(fixed.exact->value.improves());
   CHECK(state.counters.exact_verifications == 1);
-  CHECK(state.counters.overlay_materializations_for_exact_verification == 1);
+  CHECK(state.counters.overlay_materializations_for_exact_verification == 0);
+  CHECK(state.counters.full_overlay_materializations == 0);
 
   std::vector<larch::production_id> before_ids;
   for (auto ref : before_refs) before_ids.push_back(ref.id);
@@ -1252,6 +1259,308 @@ static void test_fixed_topology_exact_certificate_scores_selected_topology() {
       materialized.grammar, patterns, after_topology);
   CHECK(fixed.exact->value.old_score == old_score);
   CHECK(fixed.exact->value.new_score == new_score);
+
+  std::println("  PASS");
+}
+
+struct phase8_fixed_fixture {
+  std::string name;
+  larch::phylo_dag dag;
+  larch::clade_grammar grammar;
+};
+
+static phase8_fixed_fixture load_phase8_binary_four_fixture() {
+  phase8_fixed_fixture f;
+  f.name = "wric_binary_four";
+  f.dag = larch::build_from_fasta_newick(
+      larch::test::source_path_string("test/wric_binary_four.fa"),
+      larch::test::source_path_string("test/wric_binary_four.nwk"),
+      larch::test::source_path_string("test/wric_binary_four.ref"));
+  f.grammar = larch::build_clade_grammar(f.dag);
+  return f;
+}
+
+static phase8_fixed_fixture load_phase8_two_polytomy_fixture() {
+  phase8_fixed_fixture f;
+  f.name = "wric_two_polytomy";
+  f.dag = larch::build_from_fasta_newick(
+      larch::test::source_path_string("test/wric_two_polytomy.fa"),
+      larch::test::source_path_string("test/wric_two_polytomy.nwk"),
+      larch::test::source_path_string("test/wric_two_polytomy.ref"));
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_exact_or_fail;
+  auto refinement = larch::build_polytomy_refined_clade_grammar(
+      f.dag, larch::clade_grammar_options{}, opts);
+  larch::require_polytomy_refinement_binary_charting(
+      refinement.audit, "phase8 fixed-topology two-polytomy");
+  f.grammar = std::move(refinement.grammar);
+  return f;
+}
+
+static phase8_fixed_fixture load_phase8_test_5_trees_fixture() {
+  phase8_fixed_fixture f;
+  f.name = "data/test_5_trees";
+  constexpr std::array<char const*, 5> paths = {
+      "data/test_5_trees/tree_0.pb.gz", "data/test_5_trees/tree_1.pb.gz",
+      "data/test_5_trees/tree_2.pb.gz", "data/test_5_trees/tree_3.pb.gz",
+      "data/test_5_trees/tree_4.pb.gz",
+  };
+  std::vector<larch::phylo_dag> trees;
+  for (auto* path : paths) {
+    trees.emplace_back(larch::load_proto_dag(path));
+    larch::recompute_compact_genomes(trees.back());
+    larch::set_sample_ids_from_cg(trees.back());
+  }
+  larch::merge merger{larch::get_reference_sequence(trees.front())};
+  for (auto& tree : trees) merger.add_dag(tree);
+  f.dag = larch::phylo_dag{std::move(merger.get_result())};
+
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_bounded;
+  opts.max_shapes_per_polytomy = 1;
+  auto refinement = larch::build_polytomy_refined_clade_grammar(
+      f.dag, larch::clade_grammar_options{}, opts);
+  larch::require_polytomy_refinement_binary_charting(
+      refinement.audit, "phase8 fixed-topology test_5_trees");
+  f.grammar = std::move(refinement.grammar);
+  return f;
+}
+
+static bool phase8_candidate_matches_class(
+    larch::grammar_spr_candidate const& candidate, std::string const& klass) {
+  if (klass == "binary_spr") {
+    return !candidate.removed_productions.empty() &&
+           candidate.removed_productions.size() <= 2;
+  }
+  if (klass == "spr_with_collapse") {
+    return candidate.removed_productions.size() > 1;
+  }
+  if (klass == "child_set_change") {
+    return !candidate.removed_productions.empty() &&
+           !candidate.added_productions.empty();
+  }
+  return true;
+}
+
+static larch::chart_spr_candidate_score phase8_choose_fixed_candidate(
+    larch::chart_spr_search_state const& state, std::string const& klass,
+    std::size_t max_candidates = 0) {
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+
+  larch::grammar_spr_enumeration_options enumeration;
+  enumeration.max_candidates = max_candidates;
+  enumeration.max_candidates_is_post_dedup = true;
+
+  std::optional<larch::chart_spr_candidate_score> chosen;
+  (void)larch::for_each_grammar_spr_candidate(
+      state.grammar, enumeration,
+      [&](larch::grammar_spr_candidate const& candidate) {
+        if (!phase8_candidate_matches_class(candidate, klass)) return true;
+        auto local = larch::score_candidate_locally(state, candidate);
+        if (!local.valid) return true;
+        larch::attach_fixed_topology_selection_for_acceptance(state, local,
+                                                              options);
+        if (!local.valid || !local.topology_selection.certificate) return true;
+        chosen = std::move(local);
+        return false;
+      });
+  CHECK(chosen.has_value());
+  return *chosen;
+}
+
+static void phase8_assert_fixed_candidate_matches_materialized_per_pattern(
+    phase8_fixed_fixture& fixture, std::string const& klass) {
+  auto state = larch::build_chart_spr_search_state(fixture.dag,
+                                                    fixture.grammar);
+  auto chosen = phase8_choose_fixed_candidate(state, klass);
+
+  auto fixed = larch::verify_candidate_fixed_topology_exact(state, chosen);
+  CHECK(fixed.valid);
+  CHECK(fixed.exact.has_value());
+  CHECK(fixed.exact->kind ==
+        larch::chart_spr_score_kind::fixed_topology_exact);
+  CHECK(state.counters.overlay_materializations_for_exact_verification == 0);
+  CHECK(state.counters.full_overlay_materializations == 0);
+
+  auto const& certificate = *chosen.topology_selection.certificate;
+  auto overlay = larch::overlay_from_candidate(fixture.grammar,
+                                               chosen.candidate);
+  auto materialized = larch::materialize_overlay_grammar(overlay);
+
+  std::vector<larch::production_id> after_ids;
+  after_ids.reserve(certificate.after_overlay_productions.size());
+  for (auto ref : certificate.after_overlay_productions) {
+    after_ids.push_back(
+        larch::chart_spr_dense_production_id_for_ref(materialized, ref));
+  }
+  auto after_topology = larch::grammar_topology_from_productions(
+      materialized.grammar, after_ids);
+
+  auto selected = larch::chart_spr_overlay_selected_production_by_parent(
+      fixture.grammar, chosen.candidate,
+      certificate.after_overlay_productions);
+  auto direct_scores = larch::fixed_topology_direct_selected_pattern_scores(
+      state, chosen);
+  auto const& active = state.active_patterns.patterns.patterns;
+  CHECK(!active.empty());
+  CHECK(direct_scores.old_pattern_scores.size() == active.size());
+  CHECK(direct_scores.new_pattern_scores.size() == active.size());
+
+  std::uint64_t materialized_new_active = 0;
+  for (std::size_t p = 0; p < active.size(); ++p) {
+    auto direct_row = larch::chart_spr_restricted_overlay_topology_row(
+        fixture.grammar, chosen.candidate, active[p], selected);
+    auto materialized_row =
+        larch::chart_multisite_detail::restricted_topology_row(
+            materialized.grammar, active[p], after_topology);
+    CHECK(direct_row == materialized_row);
+    auto materialized_score = larch::chart_spr_weighted_root_score_from_row(
+        materialized_row, active[p], state.chart_opts);
+    CHECK(direct_scores.new_pattern_scores[p] == materialized_score);
+    materialized_new_active = larch::chart_multisite_detail::checked_add_u64(
+        materialized_new_active, materialized_score,
+        "phase8 materialized per-pattern total");
+  }
+
+  auto new_full = larch::chart_spr_add_invariant_offset(
+      materialized_new_active, state,
+      "phase8 fixed-topology per-pattern new oracle");
+  CHECK(fixed.exact->value.new_score == new_full);
+
+  std::println("    {} / {} PASS", fixture.name, klass);
+}
+
+static void
+    test_phase8_fixed_topology_cache_score_matches_materialized_per_pattern() {
+  std::println(
+      "test_phase8_fixed_topology_cache_score_matches_materialized_per_pattern");
+
+  auto binary = load_phase8_binary_four_fixture();
+  phase8_assert_fixed_candidate_matches_materialized_per_pattern(
+      binary, "binary_spr");
+
+  auto polytomy = load_phase8_two_polytomy_fixture();
+  phase8_assert_fixed_candidate_matches_materialized_per_pattern(
+      polytomy, "spr_with_collapse");
+
+  auto five = load_phase8_test_5_trees_fixture();
+  phase8_assert_fixed_candidate_matches_materialized_per_pattern(
+      five, "child_set_change");
+
+  std::println("  PASS");
+}
+
+static void test_phase8_fixed_topology_rejects_bad_selected_partition() {
+  std::println("test_phase8_fixed_topology_rejects_bad_selected_partition");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_base_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto state = larch::build_chart_spr_search_state(dag, grammar);
+
+  auto find_clade = [&](std::vector<larch::taxon_id> taxa) {
+    std::sort(taxa.begin(), taxa.end());
+    for (std::size_t cid = 0; cid < grammar.clades.size(); ++cid) {
+      if (grammar.clades[cid].taxa == taxa) {
+        return static_cast<larch::clade_id>(cid);
+      }
+    }
+    throw std::runtime_error("missing clade in bad-partition test");
+  };
+  auto find_prod = [&](larch::clade_id parent,
+                       std::vector<larch::clade_id> children) {
+    std::sort(children.begin(), children.end());
+    for (auto pid : grammar.productions_by_parent[parent]) {
+      auto prod_children = grammar.productions[pid].children;
+      std::sort(prod_children.begin(), prod_children.end());
+      if (prod_children == children) return pid;
+    }
+    throw std::runtime_error("missing production in bad-partition test");
+  };
+
+  auto a = find_clade({0});
+  auto b = find_clade({1});
+  auto c = find_clade({2});
+  auto ab = find_clade({0, 1});
+  auto cd = find_clade({2, 3});
+  auto root = grammar.root_clade;
+  auto root_prod = find_prod(root, {ab, cd});
+  auto ab_prod = find_prod(ab, {a, b});
+  auto cd_prod = find_prod(cd, {c, find_clade({3})});
+
+  larch::grammar_spr_candidate candidate;
+  candidate.added_clades.push_back(larch::clade_key{{0, 2}});  // AC
+  larch::overlay_grammar_production bad_root;
+  bad_root.parent = larch::base_clade_ref(root);
+  bad_root.children = {larch::base_clade_ref(ab), larch::temp_clade_ref(0)};
+  bad_root.multiplicity = 1;
+  candidate.added_productions.push_back(bad_root);
+  larch::overlay_grammar_production ac_prod;
+  ac_prod.parent = larch::temp_clade_ref(0);
+  ac_prod.children = {larch::base_clade_ref(a), larch::base_clade_ref(c)};
+  ac_prod.multiplicity = 1;
+  candidate.added_productions.push_back(ac_prod);
+
+  larch::chart_spr_candidate_score scored;
+  scored.candidate = candidate;
+  scored.topology_selection.kind =
+      larch::chart_spr_topology_selection_kind::explicit_certificate;
+  scored.topology_selection.certificate =
+      larch::make_chart_spr_topology_certificate(
+          grammar, candidate,
+          {larch::base_production_ref(root_prod),
+           larch::base_production_ref(ab_prod),
+           larch::base_production_ref(cd_prod)},
+          {larch::temp_production_ref(0),
+           larch::base_production_ref(ab_prod),
+           larch::temp_production_ref(1)});
+
+  auto verified = larch::verify_candidate_fixed_topology_exact(state, scored);
+  CHECK(!verified.valid);
+  CHECK(verified.invalid_reason.find("selected production children overlap") !=
+            std::string::npos ||
+        verified.invalid_reason.find("selected production children do not union") !=
+            std::string::npos);
+
+  std::println("  PASS");
+}
+
+static void test_phase8_per_pattern_oracle_catches_independent_moved_state() {
+  std::println(
+      "test_phase8_per_pattern_oracle_catches_independent_moved_state");
+
+  auto inf = larch::chart_inf;
+  std::array<larch::chart_cost, larch::nuc_state_count> moved{0, 0, inf, inf};
+  std::array<larch::chart_cost, larch::nuc_state_count> detach{0, 10, inf, inf};
+  std::array<larch::chart_cost, larch::nuc_state_count> reattach{10, 0, inf, inf};
+
+  auto shared = inf;
+  auto detach_only = inf;
+  auto reattach_only = inf;
+  for (std::uint8_t s = 0; s < larch::nuc_state_count; ++s) {
+    shared = std::min(
+        shared, larch::parsimony_chart_detail::saturated_add(
+                    moved[s], larch::parsimony_chart_detail::saturated_add(
+                                  detach[s], reattach[s])));
+    detach_only = std::min(
+        detach_only, larch::parsimony_chart_detail::saturated_add(moved[s],
+                                                                  detach[s]));
+    reattach_only = std::min(
+        reattach_only, larch::parsimony_chart_detail::saturated_add(moved[s],
+                                                                    reattach[s]));
+  }
+  auto independent = larch::parsimony_chart_detail::saturated_add(detach_only,
+                                                                  reattach_only);
+  CHECK(independent < shared);
+
+  // The Phase-8 oracle is per pattern, not aggregate-only: a scorer that lets
+  // the detach and reattach terms choose independent moved-subtree states would
+  // under-count this pattern and fail equality immediately.
+  std::vector<std::uint64_t> oracle_new{static_cast<std::uint64_t>(shared)};
+  std::vector<std::uint64_t> bad_new{static_cast<std::uint64_t>(independent)};
+  CHECK(bad_new != oracle_new);
 
   std::println("  PASS");
 }
@@ -1894,26 +2203,17 @@ static void test_exhaustive_exact_acceptance_matches_oracle() {
 //   * multi-worker local-commit run is TSAN-clean (the epoch barrier is
 //     load-bearing).
 //
-// Counter-granularity note (Phase 4 issue #1).  The plan's literal Phase-4
-// exit criterion reads `full_overlay_materializations == 0`, but that counter
-// is an UMBRELLA over every dense materialization in the run -- per-accept
-// (conservative path), per-candidate exact verification
-// (`verify_candidate_exact_against_state` / `verify_candidate_fixed_topology_exact`,
-// bumped once per verified candidate), and per-candidate oracle scoring.
-// In the current code EVERY exact gate materializes per verified candidate, so
-// any k >= 1 exact local-commit run has `full_overlay_materializations > 0`.
-// The per-accept dense materialization -- the quantity the plan's reasoning was
-// actually about -- is counted SEPARATELY by
-// `overlay_materializations_for_accept_materialization`, and THAT is the
-// counter the tests assert to be 0 for a local-commit run (it matches the
-// cross-cutting counter contract's intent: "a regression to full rebuild per
-// accept cannot hide behind a renamed counter").  Eliminating the per-candidate
-// verification materialization (so `full_overlay_materializations == 0` becomes
-// reachable) is Phase 8 (fixed-topology delta from cached rows) / Phase 9
-// (transient chain extension for verify) scope; until then the umbrella counter
-// is nonzero on any exact search.  The plan's Phase-4 exit criterion is
-// amended accordingly (option (b) of the known-issues note); the per-accept
-// counter is the load-bearing one.
+// Counter-granularity note (Phase 4 issue #1, updated after Phase 8).  The
+// plan's literal Phase-4 exit criterion reads `full_overlay_materializations ==
+// 0`, but that counter is an UMBRELLA over every dense materialization in the
+// run -- per-accept (conservative path), per-candidate exact_multisite
+// verification (`verify_candidate_exact_against_state`), per-candidate oracle
+// scoring, and final compaction.  Phase 8 removes per-candidate materialization
+// for the fixed_topology_exact gate; exact_multisite still materializes until
+// Phase 9's transient chain extension lands.  The per-accept dense
+// materialization -- the quantity Phase 4's reasoning was actually about -- is
+// counted separately by `overlay_materializations_for_accept_materialization`,
+// and that remains the load-bearing local-commit counter.
 
 // data/test_5_trees: five protobuf trees merged into one DAG, polytomy-
 // refined to a binary chart-compatible grammar the way the benchmark scripts
@@ -2575,18 +2875,12 @@ static void test_phase4_multi_worker_matches_serial() {
 }
 
 // fixed_topology_exact + local commit.  This is the second exact gate that
-// may commit locally (Work item 1 exactness contract); before this test no
-// Phase 4 run exercised it together with rebuild_after_accept = false.  It
-// also closes Phase 4 known-issue #1 directly: the plan's literal exit
-// criterion read `full_overlay_materializations == 0`, but that umbrella
-// counter is bumped once per verified candidate by
-// `verify_candidate_fixed_topology_exact` (every exact gate materializes per
-// candidate in the current code).  So on any k >= 1 exact local-commit run it
-// is nonzero; the load-bearing per-accept counter is
-// `overlay_materializations_for_accept_materialization`, which stays at 0 for
-// a local-commit run.  This test asserts the corrected contract and documents
-// the umbrella counter's nonzero value (Phase 8/9 will eliminate the
-// per-candidate verification materialization).
+// may commit locally (Work item 1 exactness contract).  Phase 8 serves this
+// gate from persistent caches: the grammar cache is checked per pattern
+// against a structural selected-topology row cache, so per-candidate fixed-
+// topology verification performs no dense overlay materialization and does not
+// recompute every selected-topology row; the only full materialization in this
+// local-commit run is Phase 5's final compaction.
 static void test_phase4_fixed_topology_exact_local_commit() {
   std::println("test_phase4_fixed_topology_exact_local_commit");
 
@@ -2597,8 +2891,7 @@ static void test_phase4_fixed_topology_exact_local_commit() {
       larch::chart_spr_acceptance_mode::fixed_topology_exact;
   // exhaustive_exact verifies every candidate through the fixed-topology gate
   // (default selector resolves a topology certificate for each), so this run
-  // exercises the per-candidate verification materialization path that makes
-  // full_overlay_materializations nonzero.
+  // exercises the Phase 8 no-materialization verification path repeatedly.
   options.candidate_selection =
       larch::chart_spr_candidate_selection_mode::exhaustive_exact;
   options.max_iterations = 12;
@@ -2612,14 +2905,19 @@ static void test_phase4_fixed_topology_exact_local_commit() {
       "  accepted_moves={} (local_commit_accepted={}), "
       "tombstone_scope_skips={}, exact_verifications={}, "
       "full_overlay_materializations={}, accept_materializations={}, "
-      "exact_verification_materializations={}",
+      "exact_verification_materializations={}, "
+      "selected_cache_hits={}, selected_cache_misses={}, "
+      "selected_rows_computed={}",
       search.counters.accepted_moves,
       search.counters.local_commit_accepted_moves,
       search.counters.local_commit_tombstone_scope_skips,
       search.counters.exact_verifications,
       search.counters.full_overlay_materializations,
       search.counters.overlay_materializations_for_accept_materialization,
-      search.counters.overlay_materializations_for_exact_verification);
+      search.counters.overlay_materializations_for_exact_verification,
+      search.counters.fixed_topology_selected_cache_hits,
+      search.counters.fixed_topology_selected_cache_misses,
+      search.counters.fixed_topology_selected_rows_computed);
 
   // Every accepted move is fixed_topology_exact-gated (an exact gate; the
   // chain's recorded objective is exact for the one selected topology).
@@ -2639,17 +2937,20 @@ static void test_phase4_fixed_topology_exact_local_commit() {
   CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
   CHECK(search.counters.overlay_materializations_for_accept_materialization ==
         0);
-  // The umbrella counter IS nonzero: every verified candidate materializes
-  // through the fixed-topology gate.  Phase 8 (fixed-topology delta from cached
-  // rows) will serve this gate without materialization, after which this
-  // assertion would flip to == 0; until then it documents the reality.
-  if (search.counters.exact_verifications > 0) {
-    CHECK(search.counters.full_overlay_materializations > 0);
-    // All umbrella materializations in this run are verification work (no
-    // per-accept and no diagnostic-oracle path fires here).
-    CHECK(search.counters.full_overlay_materializations >=
-          search.counters.overlay_materializations_for_exact_verification);
-  }
+  // Phase 8 counter contract: fixed-topology verification itself performs no
+  // dense overlay materialization.  The umbrella counter is exactly the single
+  // final-compaction materialization added after the local-commit run.
+  CHECK(search.counters.overlay_materializations_for_exact_verification == 0);
+  CHECK(search.counters.full_overlay_materializations ==
+        search.counters.overlay_materializations_for_final_compaction);
+  CHECK(search.counters.fixed_topology_selected_cache_hits > 0);
+  CHECK(search.counters.fixed_topology_selected_cache_misses > 0);
+  CHECK(search.counters.fixed_topology_selected_rows_computed > 0);
+  auto naive_selected_oracle_rows =
+      search.counters.exact_verifications * search.summary.active_pattern_count *
+      search.summary.initial_grammar_clade_count;
+  CHECK(search.counters.fixed_topology_selected_rows_computed <
+        naive_selected_oracle_rows);
   // The caches did real affected-set-scoped work and the two-chart oracle ran
   // after every commit without throwing.
   if (search.counters.accepted_moves > 0) {
@@ -2804,6 +3105,9 @@ int main() {
   test_fixed_topology_iteration_uses_default_selector();
   test_sampled_tree_fixed_topology_uses_source_certificate();
   test_fixed_topology_exact_certificate_scores_selected_topology();
+  test_phase8_fixed_topology_cache_score_matches_materialized_per_pattern();
+  test_phase8_fixed_topology_rejects_bad_selected_partition();
+  test_phase8_per_pattern_oracle_catches_independent_moved_state();
   test_enumeration_truncation_sets_unverified_flag_even_exhaustive();
   test_phase5_no_improvement_search_stops_without_commit();
   test_phase5_known_improving_search_commits_once();
