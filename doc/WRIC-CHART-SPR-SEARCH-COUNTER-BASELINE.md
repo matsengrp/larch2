@@ -132,6 +132,9 @@ chart_spr_search_counters:
   outside_rows_recomputed_on_commit:                           0
   local_commit_two_chart_oracle_runs:                          0
   local_commit_tip_grammar_refreshes:                          0
+  fixed_topology_selected_cache_hits:                          0
+  fixed_topology_selected_cache_misses:                        0
+  fixed_topology_selected_rows_computed:                       0
   full_composite_rebuilds:                                     0
   local_candidate_scores:                                      89312
   local_rows_recomputed:                                       159379494

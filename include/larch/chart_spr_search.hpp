@@ -125,8 +125,9 @@ struct chart_spr_search_counters {
   // Phase 8 selected-topology row cache used by the local-commit
   // fixed_topology_exact verifier.  Misses compute one structural selected
   // subtree for all active patterns; hits mean an unchanged selected subtree
-  // was read from the persistent topology cache instead of being recomputed by
-  // the per-pattern oracle.
+  // was read from the persistent topology cache.  These counters are reported
+  // separately from the persistent-cache verification counters so selected-
+  // topology work cannot hide behind the "cache path" label.
   std::size_t fixed_topology_selected_cache_hits = 0;
   std::size_t fixed_topology_selected_cache_misses = 0;
   std::size_t fixed_topology_selected_rows_computed = 0;
@@ -138,6 +139,12 @@ struct chart_spr_search_counters {
   std::size_t fixed_topology_persistent_cache_verifications = 0;
   std::size_t fixed_topology_persistent_cache_fallbacks = 0;
   std::size_t fixed_topology_persistent_cache_oracle_mismatches = 0;
+  // Test-only diagnostics for the Phase-8 independent-s_M corruption hook.
+  // The real-witness counter proves the hook exercised the actual bug class;
+  // the perturbation counter is retained as a regression guard and should stay
+  // zero (the hook must not rely on arbitrary score changes).
+  std::size_t fixed_topology_independent_sm_bug_witnesses_for_tests = 0;
+  std::size_t fixed_topology_independent_sm_bug_perturbations_for_tests = 0;
 };
 
 // Acceptance modes describe the objective used to accept a candidate.  They
@@ -381,15 +388,21 @@ struct chart_spr_search_options {
   // every accept" exit criterion without exposing the cache objects.
   bool verify_local_commit_two_chart_oracle_for_tests = false;
   // Phase 8 self-check: during local-commit fixed_topology_exact verification,
-  // additionally materialize each candidate overlay and compare the persistent
-  // cache score against a from-scratch selected-topology score per active
-  // pattern.  Expensive and test/diagnostic-only; production correctness is
-  // guarded by the cheaper independent direct selected-topology oracle.
+  // materialize each candidate overlay and compare the cache score against a
+  // from-scratch selected-topology score on the same extended grammar, per
+  // active pattern.  Expensive and test/diagnostic-only; the production path
+  // does not run a hidden from-scratch selected-topology oracle per candidate.
   bool verify_fixed_topology_materialized_oracle_for_tests = false;
-  // Phase 8 corruption hook: make the persistent fixed-topology scorer return
-  // a test-only independent-s_M-style under-count before oracle comparison.
-  // The per-pattern oracle must catch this and route through the fallback.
+  // Phase 8 corruption hook: when a candidate/pattern exposes the real
+  // independent-s_M bug class, make the persistent fixed-topology scorer return
+  // that test-only under-count before oracle comparison.  The per-pattern
+  // oracle must catch witnessed corruptions and route through the fallback.
   bool force_fixed_topology_independent_sm_bug_for_tests = false;
+  // Phase 8 hard-error hook: corrupt the local-commit fixed-topology cache
+  // epoch before verification.  Cache/substrate invariant failures must be
+  // rethrown as labelled correctness failures, not converted into invalid
+  // candidates / "no exact-improving verified candidate".
+  bool force_fixed_topology_cache_epoch_mismatch_for_tests = false;
   // Test-only injection point for the Phase 4 hard-error contract: after the
   // overlay-chain append succeeds, force a post-append failure and verify the
   // search propagates it instead of converting it into an ordinary rejection.
@@ -550,6 +563,9 @@ struct chart_spr_search_summary {
   std::size_t outside_rows_recomputed_on_commit = 0;
   std::size_t local_commit_two_chart_oracle_runs = 0;
   std::size_t local_commit_tip_grammar_refreshes = 0;
+  std::size_t fixed_topology_selected_cache_hits = 0;
+  std::size_t fixed_topology_selected_cache_misses = 0;
+  std::size_t fixed_topology_selected_rows_computed = 0;
   std::size_t fixed_topology_persistent_cache_verifications = 0;
   std::size_t fixed_topology_persistent_cache_fallbacks = 0;
   std::size_t fixed_topology_persistent_cache_oracle_mismatches = 0;
@@ -2109,6 +2125,10 @@ inline void add_chart_spr_search_counters(
       src.fixed_topology_persistent_cache_fallbacks;
   dst.fixed_topology_persistent_cache_oracle_mismatches +=
       src.fixed_topology_persistent_cache_oracle_mismatches;
+  dst.fixed_topology_independent_sm_bug_witnesses_for_tests +=
+      src.fixed_topology_independent_sm_bug_witnesses_for_tests;
+  dst.fixed_topology_independent_sm_bug_perturbations_for_tests +=
+      src.fixed_topology_independent_sm_bug_perturbations_for_tests;
 }
 
 struct chart_spr_local_score_scratch {

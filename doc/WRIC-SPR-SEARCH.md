@@ -106,6 +106,28 @@ Rules:
    per-reference-state count to the full root row.  Do not reimplement this
    arithmetic in local scorers.
 
+### Fixed-topology local-commit verifier
+
+The local-commit `fixed_topology_exact` verifier is exact for the selected
+before/after topology, but it intentionally uses a structural selected-topology
+row cache rather than the original plan sketch's pure affected-row delta over
+the grammar-min inside cache.  In a DAG, an unchanged selected subtree can be
+locally suboptimal; reading the grammar-min inside row for that clade could
+silently substitute a different production.  The production path therefore:
+
+- stores selected-subtree rows keyed by structural rooted topology and active
+  pattern;
+- combines those selected inside rows with the persistent outside root row to
+  stay in the same inside+outside scoring convention; and
+- exposes `fixed_topology_selected_cache_hits`,
+  `fixed_topology_selected_cache_misses`, and
+  `fixed_topology_selected_rows_computed` separately from the persistent-cache
+  verification counters.
+
+The materialized per-pattern selected-topology oracle is diagnostic/test-only
+unless explicitly enabled; production does not run a hidden from-scratch oracle
+per candidate.
+
 ## Polytomy and binary chart compatibility
 
 The chart recurrence requires a binary chart-compatible grammar.  `dagutil` uses

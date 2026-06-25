@@ -1697,8 +1697,31 @@ static void test_phase8_per_pattern_oracle_catches_independent_moved_state() {
   std::vector<std::uint64_t> bad_new{static_cast<std::uint64_t>(independent)};
   CHECK(bad_new != oracle_new);
 
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  auto same_state_pair = [](char const* name, char const* left,
+                            char const* right, char const* state) {
+    return tiny_inner(name, state,
+                      {tiny_leaf(left, state), tiny_leaf(right, state)});
+  };
+  auto four_a_context = [&] {
+    return tiny_inner("S", "A",
+                      {same_state_pair("S1", "B", "C", "A"),
+                       same_state_pair("S2", "D", "E", "A")});
+  };
+  auto four_c_context = [&] {
+    return tiny_inner("T", "C",
+                      {same_state_pair("T1", "F", "G", "C"),
+                       same_state_pair("T2", "H", "I", "C")});
+  };
   auto dag = larch::test::make_tiny_labelled_tree(
-      "A", four_taxon_misplaced_tree());
+      "A", tiny_inner("root", "A",
+                       {tiny_inner("P", "A",
+                                   {tiny_inner("M", "A",
+                                               {tiny_leaf("A", "A"),
+                                                tiny_leaf("J", "C")}),
+                                    four_a_context()}),
+                        four_c_context()}));
   auto grammar = larch::build_clade_grammar(dag);
   larch::chart_spr_search_options options;
   options.acceptance_mode =
@@ -1711,11 +1734,45 @@ static void test_phase8_per_pattern_oracle_catches_independent_moved_state() {
 
   auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
   CHECK(search.counters.fixed_topology_persistent_cache_verifications > 0);
+  CHECK(search.counters.fixed_topology_independent_sm_bug_witnesses_for_tests >
+        0);
   CHECK(search.counters.fixed_topology_persistent_cache_fallbacks ==
-        search.counters.fixed_topology_persistent_cache_verifications);
+        search.counters.fixed_topology_independent_sm_bug_witnesses_for_tests);
   CHECK(search.counters.fixed_topology_persistent_cache_oracle_mismatches ==
         search.counters.fixed_topology_persistent_cache_fallbacks);
+  auto perturbations =
+      search.counters.fixed_topology_independent_sm_bug_perturbations_for_tests;
+  CHECK(perturbations == 0);
   CHECK(search.counters.overlay_materializations_for_exact_verification == 0);
+
+  std::println("  PASS");
+}
+
+static void test_phase8_persistent_cache_invariant_failure_is_hard_error() {
+  std::println(
+      "test_phase8_persistent_cache_invariant_failure_is_hard_error");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.force_fixed_topology_cache_epoch_mismatch_for_tests = true;
+
+  bool threw = false;
+  try {
+    (void)larch::run_chart_spr_search(std::move(dag), grammar, options);
+  } catch (std::runtime_error const& e) {
+    threw = true;
+    CHECK(std::string(e.what()).find("persistent cache epochs") !=
+          std::string::npos);
+  }
+  CHECK(threw);
 
   std::println("  PASS");
 }
@@ -3031,11 +3088,10 @@ static void test_phase4_multi_worker_matches_serial() {
 
 // fixed_topology_exact + local commit.  This is the second exact gate that
 // may commit locally (Work item 1 exactness contract).  Phase 8 serves this
-// gate from persistent caches: the grammar cache is checked per pattern
-// against a structural selected-topology row cache, so per-candidate fixed-
-// topology verification performs no dense overlay materialization and does not
-// recompute every selected-topology row; the only full materialization in this
-// local-commit run is Phase 5's final compaction.
+// gate without hidden per-candidate materialization or a hidden full direct
+// selected-tree oracle: selected-subtree cache work is visible in its own
+// counters, and the only full materialization in this local-commit run is
+// Phase 5's final compaction.
 static void test_phase4_fixed_topology_exact_local_commit() {
   std::println("test_phase4_fixed_topology_exact_local_commit");
 
@@ -3108,6 +3164,12 @@ static void test_phase4_fixed_topology_exact_local_commit() {
         search.counters.exact_verifications);
   CHECK(search.counters.fixed_topology_persistent_cache_fallbacks == 0);
   CHECK(search.counters.fixed_topology_persistent_cache_oracle_mismatches == 0);
+  CHECK(search.summary.fixed_topology_selected_cache_hits ==
+        search.counters.fixed_topology_selected_cache_hits);
+  CHECK(search.summary.fixed_topology_selected_cache_misses ==
+        search.counters.fixed_topology_selected_cache_misses);
+  CHECK(search.summary.fixed_topology_selected_rows_computed ==
+        search.counters.fixed_topology_selected_rows_computed);
   CHECK(search.summary.fixed_topology_persistent_cache_verifications ==
         search.counters.fixed_topology_persistent_cache_verifications);
   CHECK(search.summary.fixed_topology_persistent_cache_fallbacks == 0);
@@ -3276,6 +3338,7 @@ int main() {
   test_phase8_persistent_cache_local_commit_matches_materialized();
   test_phase8_persistent_cache_dag_verification_has_no_fallback();
   test_phase8_per_pattern_oracle_catches_independent_moved_state();
+  test_phase8_persistent_cache_invariant_failure_is_hard_error();
   test_enumeration_truncation_sets_unverified_flag_even_exhaustive();
   test_phase5_no_improvement_search_stops_without_commit();
   test_phase5_known_improving_search_commits_once();
