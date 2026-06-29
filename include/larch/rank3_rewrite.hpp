@@ -2738,9 +2738,9 @@ inline option_c_splice_result option_c_splice_production(
 
   // Build the pre-splice grammar.  build_clade_grammar_with_audit rebuilds
   // clade offsets internally, so no explicit build_clade_offsets is needed
-  // here; and it performs no topology/annotation mutation, so the absent-before
-  // and polytomy-before throws below leave the caller's DAG topology
-  // unchanged.
+  // here; and it performs no topology or compact-genome mutation (it only
+  // refreshes derived clade offsets), so the absent-before and polytomy-before
+  // throws below leave the caller's DAG topology unchanged.
   auto pre =
       build_clade_grammar_with_audit(source, options.rebuild_grammar_options);
   auto& grammar = pre.grammar;

@@ -12,6 +12,7 @@
 // in-place splice and the materialize-and-merge path).
 
 #include <larch/rank3_rewrite.hpp>
+#include <larch/build_fasta_newick.hpp>
 
 #include "test_util.hpp"
 
@@ -120,6 +121,84 @@ static std::set<std::vector<larch::taxon_id>> clade_taxa_set(
   std::set<std::vector<larch::taxon_id>> s;
   for (auto const& c : g.clades) s.insert(c.taxa);
   return s;
+}
+
+// ---- committed-fixture oracle (exit criterion 1, literal fixture name) ----
+//
+// The other test cases build content-equivalent inline trees via
+// make_tiny_labelled_tree for speed and to cover multiple before/after pairs.
+// The Phase 6 exit criterion also names the committed fixture
+// `test/wric_binary_four.*` literally, so this helper loads it through the
+// shared fasta/newick/ref builder and the next test exercises the full
+// merge-equivalence oracle (including single-tree Fitch parsimony) on its
+// real multi-site leaf compact genomes.
+static larch::phylo_dag load_wric_binary_four_dag() {
+  auto dag = larch::build_from_fasta_newick(
+      larch::test::source_path_string("test/wric_binary_four.fa"),
+      larch::test::source_path_string("test/wric_binary_four.nwk"),
+      larch::test::source_path_string("test/wric_binary_four.ref"));
+  larch::validate_dag(dag, "wric_binary_four fixture");
+  return dag;
+}
+
+// Build the AC|BD Option-A reference tree ((A,C),(B,D)) from the fixture's
+// own leaf compact genomes, so the Fitch parsimony oracle compares like with
+// like on real multi-site data.  Inner compact genomes are left at the
+// reference default; score_tree_fitch_parsimony reassigns them optimally, so
+// their initial values do not affect the comparison.  Leaf compact genomes
+// are invariant under an Option C splice (leaves are reused, never mutated),
+// so extracting them from a fresh fixture load is equivalent to extracting
+// them from the spliced DAG.
+static larch::phylo_dag build_acbd_reference_from_fixture_leaves() {
+  auto fixture = load_wric_binary_four_dag();
+  auto grammar = larch::build_clade_grammar(fixture);
+  auto reference = larch::get_reference_sequence(fixture);
+
+  std::map<std::string, larch::compact_genome> leaf_cgs;
+  for (auto nv : fixture.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.sample_id(); node.cg(); }) {
+            std::string sid{node.sample_id()};
+            if (grammar.taxa.sample_id_to_id.count(sid) != 0) {
+              leaf_cgs.emplace(sid, node.cg());
+            }
+          }
+        },
+        nv);
+  }
+
+  auto add_leaf = [&](larch::phylo_dag& d, std::size_t parent_idx,
+                      std::size_t clade_index,
+                      std::string const& sid) -> std::size_t {
+    auto leaf = d.append_node<larch::node_kind::leaf>();
+    leaf.sample_id() = sid;
+    leaf.cg() = leaf_cgs.at(sid);
+    auto idx = leaf.index();
+    larch::test::add_clade_edge(d, parent_idx, idx, clade_index);
+    return idx;
+  };
+
+  larch::phylo_dag d;
+  auto ua = d.append_node<larch::node_kind::ua>();
+  ua.reference_sequence() = reference;
+  d.set_root(ua);
+
+  auto root = d.append_node<larch::node_kind::inner>();
+  larch::test::add_clade_edge(d, ua.index(), root.index(), 0);
+  auto ac = d.append_node<larch::node_kind::inner>();
+  auto bd = d.append_node<larch::node_kind::inner>();
+  larch::test::add_clade_edge(d, root.index(), ac.index(), 0);
+  larch::test::add_clade_edge(d, root.index(), bd.index(), 1);
+  add_leaf(d, ac.index(), 0, "A");
+  add_leaf(d, ac.index(), 1, "C");
+  add_leaf(d, bd.index(), 0, "B");
+  add_leaf(d, bd.index(), 1, "D");
+
+  larch::recompute_edge_mutations(d);
+  larch::build_clade_offsets(d);
+  larch::validate_dag(d, "wric_binary_four AC|BD reference");
+  return d;
 }
 
 // ---- Option C helpers ----
@@ -280,6 +359,54 @@ static void test_option_c_splice_root_abcd_to_adbc() {
   std::println("  PASS");
 }
 
+// Root production AB|CD -> AC|BD on the committed test/wric_binary_four.*
+// fixture (real multi-site leaf compact genomes), satisfying the literal
+// fixture-name part of exit criterion 1.  The Option A reference is built
+// from the fixture's own leaf compact genomes (see
+// build_acbd_reference_from_fixture_leaves), so both DAGs are single trees
+// and the Fitch parsimony half of the oracle runs on real data rather than
+// the single-site inline trees above.
+static void test_option_c_splice_wric_binary_four_fixture() {
+  std::println("test_option_c_splice_wric_binary_four_fixture");
+
+  auto dag = load_wric_binary_four_dag();
+  auto g = larch::build_clade_grammar(dag);
+
+  auto a = taxa_for(g, {"A"});
+  auto b = taxa_for(g, {"B"});
+  auto c = taxa_for(g, {"C"});
+  auto d = taxa_for(g, {"D"});
+  auto ab = taxa_for(g, {"A", "B"});
+  auto cd = taxa_for(g, {"C", "D"});
+  auto ac = taxa_for(g, {"A", "C"});
+  auto bd = taxa_for(g, {"B", "D"});
+  auto abcd = taxa_for(g, {"A", "B", "C", "D"});
+
+  auto before_key = make_split_key(abcd, {ab, cd});
+
+  larch::option_c_after_production after;
+  after.parent_taxa = abcd;
+  after.children.push_back(pair_after(ac, leaf_after(a), leaf_after(c)));
+  after.children.push_back(pair_after(bd, leaf_after(b), leaf_after(d)));
+
+  auto result = larch::option_c_splice_production(dag, before_key, after);
+  CHECK(result.witnesses_spliced == 1);
+
+  // Exit criterion 4: production-key set is exactly the after subtree keys.
+  std::set<larch::rank3_production_taxa_key> expected_after = {
+      make_split_key(abcd, {ac, bd}),
+      make_split_key(ac, {a, c}),
+      make_split_key(bd, {b, d}),
+  };
+  CHECK(larch::rank3_detail::production_key_set(result.rebuilt.grammar) ==
+        expected_after);
+
+  auto option_a_dag = build_acbd_reference_from_fixture_leaves();
+  check_option_c_merge_equivalent(dag, option_a_dag);
+
+  std::println("  PASS");
+}
+
 // Non-root production rewrite: on (((A,B),(C,D)),(E,F)) splice the non-root
 // clade {A,B,C,D}'s production AB|CD -> AC|BD.  Exercises edge surgery away
 // from the root and pruning of the old AB/CD internal nodes.
@@ -312,18 +439,21 @@ static void test_option_c_splice_non_root_production() {
   auto result = larch::option_c_splice_production(dag, before_key, after);
   CHECK(result.witnesses_spliced == 1);
 
-  // The root and EF productions are untouched; only the {ABCD} subtree changes.
+  // The root and EF productions are untouched; only the {ABCD} subtree
+  // changes.  Full-set equality (uniform with the root-splice tests) is the
+  // stronger check: the post-splice production-key set is EXACTLY the
+  // pre-splice set with the {ABCD} subtree's before keys ({ABCD}->{AB,CD},
+  // {AB}, {CD}) replaced by the after keys ({ABCD}->{AC,BD}, {AC}, {BD}).
+  std::set<larch::rank3_production_taxa_key> expected_after = {
+      make_split_key(abcdef, {abcd, ef}),
+      make_split_key(abcd, {ac, bd}),
+      make_split_key(ac, {a, c}),
+      make_split_key(bd, {b, d}),
+      make_split_key(ef, {taxa_for(g, {"E"}), taxa_for(g, {"F"})}),
+  };
   auto keys_after =
       larch::rank3_detail::production_key_set(result.rebuilt.grammar);
-  CHECK(keys_after.count(make_split_key(abcdef, {abcd, ef})));
-  CHECK(keys_after.count(make_split_key(ef, {taxa_for(g, {"E"}),
-                                             taxa_for(g, {"F"})})));
-  CHECK(!keys_after.count(before_key));
-  CHECK(!keys_after.count(make_split_key(ab, {a, b})));
-  CHECK(!keys_after.count(make_split_key(cd, {c, d})));
-  CHECK(keys_after.count(make_split_key(abcd, {ac, bd})));
-  CHECK(keys_after.count(make_split_key(ac, {a, c})));
-  CHECK(keys_after.count(make_split_key(bd, {b, d})));
+  CHECK(keys_after == expected_after);
 
   auto option_a_dag =
       larch::test::make_tiny_labelled_tree("A", six_taxon_acbd_tree());
@@ -718,6 +848,7 @@ static void test_option_c_multi_witness_splice() {
 int main() {
   test_option_c_splice_root_abcd_to_acbd();
   test_option_c_splice_root_abcd_to_adbc();
+  test_option_c_splice_wric_binary_four_fixture();
   test_option_c_splice_non_root_production();
   test_option_c_absent_before_throws_unchanged();
   test_option_c_after_parent_mismatch_throws();
