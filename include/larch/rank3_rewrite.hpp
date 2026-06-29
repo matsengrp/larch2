@@ -1,6 +1,7 @@
 #pragma once
 
 #include <larch/chart_spr.hpp>
+#include <larch/compute.hpp>
 #include <larch/grammar_topology.hpp>
 #include <larch/merge.hpp>
 #include <larch/overlay_spr.hpp>
@@ -2426,6 +2427,431 @@ inline rank3_option_b_result materialize_rank3_option_b(
   auto result = merge_rank3_overlay_tree_option_b(
       source, base_grammar, tree, std::move(intended), options);
   result.used_source_tree_move = true;
+  return result;
+}
+
+// ===========================================================================
+// Phase 6 — Rank-3 Option C: direct in-place production splice (Work item 2)
+// ---------------------------------------------------------------------------
+// Option C operates one level below Option A/B.  Instead of materializing a
+// concrete tree and feeding it through the trusted merge path, it splices a
+// "before" production into an "after" production directly at the DAG edge
+// level.  Every witness of the before production (every DAG node whose
+// collapsed-clade partition equals the before key) has its child edges
+// rewritten so that it now realizes the after production, reusing existing
+// leaf nodes and building fresh internal nodes only for clades the after
+// structure introduces.  The cost is proportional to the number of edges and
+// nodes spliced, never to the (potentially exponential) number of represented
+// trees containing the before production, and the merge path is never invoked.
+//
+// Scope (initial, binary chart-compatible): a before or after production of
+// arity != 2 is a synthetic-polytomy case and throws a labelled message that
+// routes the caller to Option A, reusing the throw vocabulary already in
+// polytomy_refinement.hpp.  The after production's parent taxon set must equal
+// the before production's parent taxon set (the rewrite boundary is fixed);
+// a rewrite that would change the represented parent clade is a hard error.
+//
+// Identity follows the same convention as Option A/B: before/after are
+// identified by taxon-set keys (rank3_production_taxa_key), so a splice
+// survives rebuilds and clade-id relabeling.  Standalone Option C is exercised
+// only through this library API and its tests in Phase 6; chart-search commit
+// integration is Phase 7 and CLI exposure is Phase 10.
+// ===========================================================================
+
+// A fully-resolved "after" production template expressed entirely in taxon
+// sets, so it survives clade-id relabeling exactly like the taxon-set keys
+// used by Option A/B.  A flat after-key alone is insufficient for Option C
+// because the after resolution may introduce clades that are not yet
+// represented in the DAG; the recursive template specifies how to build them.
+struct option_c_after_subtree {
+  // Sorted, unique taxa of the clade this subtree root realizes.
+  std::vector<taxon_id> taxa;
+  // Empty for a leaf (singleton) clade.  Exactly two entries (a binary
+  // partition of `taxa`) for an internal clade.
+  std::vector<option_c_after_subtree> children;
+};
+
+struct option_c_after_production {
+  // Must equal the before production's parent taxon set (the rewrite
+  // boundary is fixed).
+  std::vector<taxon_id> parent_taxa;
+  // Exactly two entries (binary); their taxa must partition parent_taxa.
+  std::vector<option_c_after_subtree> children;
+};
+
+enum class option_c_after_present_policy {
+  // Splice replaces every before-witness with the after structure, regardless
+  // of whether a production matching the after key already exists.  Structure
+  // is never silently duplicated: existing leaf nodes are reused and fresh
+  // internal nodes are built per the after template, so at the collapsed-clade
+  // grammar level the spliced witnesses join any pre-existing after-witnesses
+  // under the same production key.
+  merge,
+  // If a production matching the after key is already present in the DAG, the
+  // splice is a documented no-op: it returns immediately with
+  // witnesses_spliced == 0 and after_already_present_no_op == true, leaving
+  // the DAG unchanged.  This lets a caller express "only splice if it would
+  // introduce something new" without racing on a pre-check.
+  no_op_if_present,
+};
+
+struct option_c_splice_options {
+  // Conservative default mirrors Option A's generated_edge_weight: a spliced
+  // edge cannot lower an existing edge-weight objective by accident.
+  float generated_edge_weight = std::numeric_limits<float>::max();
+  option_c_after_present_policy after_present =
+      option_c_after_present_policy::merge;
+  bool validate = true;
+  clade_grammar_options rebuild_grammar_options = {};
+};
+
+struct option_c_splice_result {
+  // The spliced DAG is the caller's `source`, mutated in place (Option C is a
+  // direct in-place rewrite).  The rebuilt grammar reflects the post-splice
+  // source.
+  clade_grammar_build_result rebuilt;
+  rank3_production_taxa_key before_key;
+  rank3_production_taxa_key after_key;
+  std::size_t witnesses_spliced = 0;
+  std::size_t edges_removed = 0;
+  std::size_t edges_added = 0;
+  std::size_t nodes_created = 0;
+  std::size_t nodes_pruned = 0;
+  // Set when after_present == no_op_if_present short-circuited the splice
+  // because the after key was already present.
+  bool after_already_present_no_op = false;
+  // Performance-contract audit flags.  A standalone splice structurally never
+  // constructs a `merge` object and never enumerates represented trees, so
+  // these are constant-by-construction (false / absent).  They are fields
+  // rather than comments so the contract is visible in the result type and
+  // asserted in tests; the load-bearing upper-bound half of the contract (cost
+  // is linear in witnesses_spliced, not in represented trees) is checked via
+  // nodes_created / edges_added in the multi-witness test rather than here.
+  bool invoked_merge_path = false;
+  std::optional<std::size_t> represented_trees_enumerated;
+};
+
+namespace option_c_detail {
+
+inline std::vector<taxon_id> normalize_taxa(std::vector<taxon_id> taxa) {
+  std::sort(taxa.begin(), taxa.end());
+  taxa.erase(std::unique(taxa.begin(), taxa.end()), taxa.end());
+  return taxa;
+}
+
+inline void validate_after_subtree(option_c_after_subtree const& subtree,
+                                   std::string_view context) {
+  auto taxa = normalize_taxa(subtree.taxa);
+  if (subtree.children.empty()) {
+    if (taxa.size() != 1) {
+      throw std::runtime_error(
+          std::string{context} +
+          ": after subtree has no children but is not a singleton leaf");
+    }
+    return;
+  }
+  if (subtree.children.size() != 2) {
+    throw std::runtime_error(
+        polytomy_direct_mutation_not_implemented_message(
+            context, "non-binary (polytomy) after production"));
+  }
+  std::vector<taxon_id> covered;
+  for (auto const& child : subtree.children) {
+    auto child_taxa = normalize_taxa(child.taxa);
+    if (child_taxa.empty()) {
+      throw std::runtime_error(std::string{context} +
+                               ": after subtree has empty child clade");
+    }
+    std::vector<taxon_id> overlap;
+    std::set_intersection(covered.begin(), covered.end(), child_taxa.begin(),
+                          child_taxa.end(), std::back_inserter(overlap));
+    if (!overlap.empty()) {
+      throw std::runtime_error(std::string{context} +
+                               ": after subtree children overlap");
+    }
+    std::vector<taxon_id> next;
+    std::set_union(covered.begin(), covered.end(), child_taxa.begin(),
+                   child_taxa.end(), std::back_inserter(next));
+    covered = std::move(next);
+    validate_after_subtree(child, context);
+  }
+  if (covered != taxa) {
+    throw std::runtime_error(std::string{context} +
+                             ": after subtree children do not partition clade");
+  }
+}
+
+inline void validate_after_production(option_c_after_production const& after,
+                                      std::string_view context) {
+  auto parent = normalize_taxa(after.parent_taxa);
+  if (parent.empty()) {
+    throw std::runtime_error(std::string{context} +
+                             ": after production has empty parent clade");
+  }
+  if (after.children.size() != 2) {
+    throw std::runtime_error(
+        polytomy_direct_mutation_not_implemented_message(
+            context, "non-binary (polytomy) after production"));
+  }
+  std::vector<taxon_id> covered;
+  for (auto const& child : after.children) {
+    auto child_taxa = normalize_taxa(child.taxa);
+    if (child_taxa.empty()) {
+      throw std::runtime_error(std::string{context} +
+                               ": after production has empty child clade");
+    }
+    std::vector<taxon_id> overlap;
+    std::set_intersection(covered.begin(), covered.end(), child_taxa.begin(),
+                          child_taxa.end(), std::back_inserter(overlap));
+    if (!overlap.empty()) {
+      throw std::runtime_error(std::string{context} +
+                               ": after production children overlap");
+    }
+    std::vector<taxon_id> next;
+    std::set_union(covered.begin(), covered.end(), child_taxa.begin(),
+                   child_taxa.end(), std::back_inserter(next));
+    covered = std::move(next);
+    validate_after_subtree(child, context);
+  }
+  if (covered != parent) {
+    throw std::runtime_error(
+        std::string{context} +
+        ": after production children do not partition parent clade");
+  }
+}
+
+inline rank3_production_taxa_key after_key_from_production(
+    option_c_after_production const& after) {
+  rank3_production_taxa_key key;
+  key.parent = normalize_taxa(after.parent_taxa);
+  key.children.reserve(after.children.size());
+  for (auto const& child : after.children) {
+    key.children.push_back(normalize_taxa(child.taxa));
+  }
+  rank3_detail::normalize_production_key(key);
+  return key;
+}
+
+inline production_id find_production_by_key(
+    clade_grammar const& grammar, rank3_production_taxa_key before_key) {
+  rank3_detail::normalize_production_key(before_key);
+  for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
+    if (rank3_detail::production_key_from_id(
+            grammar, static_cast<production_id>(pid)) == before_key) {
+      return static_cast<production_id>(pid);
+    }
+  }
+  return no_production;
+}
+
+// Index of existing leaf nodes keyed by singleton clade, for leaf reuse.
+struct leaf_node_index {
+  std::map<std::vector<taxon_id>, std::size_t> singleton_to_leaf;
+};
+
+inline leaf_node_index build_leaf_node_index(phylo_dag& dag,
+                                             clade_grammar const& grammar) {
+  leaf_node_index idx;
+  auto reachable = larch::detail::collect_reachable(dag);
+  for (auto node_idx : reachable.nodes) {
+    auto cid = node_idx < grammar.node_to_clade.size()
+                   ? grammar.node_to_clade[node_idx]
+                   : no_clade;
+    if (cid == no_clade) continue;
+    auto const& taxa = grammar.clades[cid].taxa;
+    if (taxa.size() == 1) idx.singleton_to_leaf.emplace(taxa, node_idx);
+  }
+  return idx;
+}
+
+}  // namespace option_c_detail
+
+// Realize `subtree` as a DAG subtree hanging off `parent_node` at
+// `clade_index`, reusing the existing leaf node for a singleton clade and
+// building a fresh internal node (per the after template) for any
+// non-singleton clade.  Returns the root node index of the realized subtree.
+// Internal-node reuse is intentionally not performed: a fresh subtree per the
+// after template is always correct (and is merge-equivalent at the
+// taxon-set-key level to Option A's materialize-and-merge, which is the
+// Option C correctness oracle).  Maximizing structure sharing is a separate
+// compaction concern and out of scope here.
+inline std::size_t option_c_realize_subtree(
+    phylo_dag& dag, option_c_after_subtree const& subtree,
+    std::size_t parent_node, std::size_t clade_index,
+    option_c_splice_options const& options,
+    option_c_detail::leaf_node_index const& leaves,
+    option_c_splice_result& stats) {
+  auto taxa = option_c_detail::normalize_taxa(subtree.taxa);
+  std::size_t node_idx;
+
+  if (subtree.children.empty()) {
+    auto it = leaves.singleton_to_leaf.find(taxa);
+    if (it == leaves.singleton_to_leaf.end()) {
+      throw std::runtime_error(
+          "rank3 option C: after subtree references a leaf clade that is not "
+          "represented in the DAG");
+    }
+    node_idx = it->second;
+  } else {
+    auto inner = dag.append_node<node_kind::inner>();
+    node_idx = inner.index();
+    ++stats.nodes_created;
+    for (std::size_t ci = 0; ci < subtree.children.size(); ++ci) {
+      option_c_realize_subtree(dag, subtree.children[ci], node_idx, ci, options,
+                               leaves, stats);
+    }
+  }
+
+  auto edge = dag.append_edge<edge_kind::clade>();
+  edge.clade_index() = clade_index;
+  edge.edge_weight() = options.generated_edge_weight;
+  std::visit([&](auto parent) { edge.set_parent(parent); },
+             dag.get_node(parent_node));
+  std::visit([&](auto child) { edge.set_child(child); },
+             dag.get_node(node_idx));
+  ++stats.edges_added;
+  return node_idx;
+}
+
+// Direct in-place production splice.  `source` is mutated in place; on any
+// labelled throw (absent before, polytomy before/after, boundary mismatch) it
+// is left unchanged because every guard fires before edge surgery begins.
+inline option_c_splice_result option_c_splice_production(
+    phylo_dag& source, rank3_production_taxa_key before_key,
+    option_c_after_production after,
+    option_c_splice_options options = {}) {
+  constexpr std::string_view context = "rank3 option C";
+
+  option_c_splice_result result;
+  rank3_detail::normalize_production_key(before_key);
+  result.before_key = before_key;
+
+  option_c_detail::validate_after_production(after, context);
+  result.after_key = option_c_detail::after_key_from_production(after);
+
+  if (result.after_key.parent != before_key.parent) {
+    throw std::runtime_error(
+        std::string{context} +
+        ": after production parent taxon set does not match before; a rewrite "
+        "that changes the represented parent clade is a hard error");
+  }
+
+  // Build the pre-splice grammar.  build_clade_grammar_with_audit rebuilds
+  // clade offsets internally, so no explicit build_clade_offsets is needed
+  // here; and it performs no topology/annotation mutation, so the absent-before
+  // and polytomy-before throws below leave the caller's DAG topology
+  // unchanged.
+  auto pre =
+      build_clade_grammar_with_audit(source, options.rebuild_grammar_options);
+  auto& grammar = pre.grammar;
+
+  auto before_pid =
+      option_c_detail::find_production_by_key(grammar, before_key);
+  if (before_pid == no_production) {
+    throw std::runtime_error(
+        std::string{context} + ": before production " +
+        rank3_detail::production_key_to_string(before_key) +
+        " is absent from the DAG; nothing to splice");
+  }
+
+  if (grammar.productions[before_pid].children.size() != 2) {
+    throw std::runtime_error(
+        polytomy_direct_mutation_not_implemented_message(
+            context, "non-binary (polytomy) before production " +
+                         std::to_string(before_pid)));
+  }
+
+  // after_present == no_op_if_present: a documented no-op when the after key
+  // is already represented, leaving the DAG unchanged (never a silent splice).
+  if (options.after_present ==
+          option_c_after_present_policy::no_op_if_present &&
+      rank3_detail::has_production_key(grammar, result.after_key)) {
+    result.after_already_present_no_op = true;
+    result.rebuilt = std::move(pre);
+    return result;
+  }
+
+  // Snapshot witness edge indices before any mutation.
+  auto witnesses = grammar.productions[before_pid].witnesses;
+  auto leaves = option_c_detail::build_leaf_node_index(source, grammar);
+
+  // ---- Edge surgery begins ----------------------------------------------
+  // Edge-index stability: edge_view::remove() (dag.hpp) unlinks the edge from
+  // its parent/child neighbor sections and deallocates the edge's topology
+  // slot via the chain<> high-mark/tombstone store; it does NOT reindex other
+  // edges.  append_edge allocates a fresh slot.  Therefore snapshotted edge
+  // indices (witness.children[*].edge_alternatives) remain valid identifiers
+  // across remove/append calls within this loop, even when one witness's
+  // surgery runs before another's.  The multi-witness ASAN test exercises
+  // this cross-witness invariant.
+  for (auto const& witness : witnesses) {
+    auto W = witness.parent_node;
+    std::vector<std::size_t> edges_to_remove;
+    for (auto const& cw : witness.children) {
+      for (auto eidx : cw.edge_alternatives) edges_to_remove.push_back(eidx);
+    }
+    for (auto eidx : edges_to_remove) {
+      std::visit([&](auto edge) { edge.remove(); }, source.get_edge(eidx));
+      ++result.edges_removed;
+    }
+    for (std::size_t ci = 0; ci < after.children.size(); ++ci) {
+      option_c_realize_subtree(source, after.children[ci], W, ci, options,
+                               leaves, result);
+    }
+    ++result.witnesses_spliced;
+  }
+
+  // Prune nodes that became unreachable so validate_dag's reachability check
+  // passes; node_view::remove unlinks incident edges from surviving nodes.
+  // collect_reachable traverses the neighbors sections directly and does not
+  // need clade offsets, so no build_clade_offsets is needed here.
+  {
+    auto reachable = larch::detail::collect_reachable(source);
+    std::vector<std::size_t> to_remove;
+    for (auto nv : source.get_all_nodes()) {
+      auto idx = std::visit([](auto n) { return n.index(); }, nv);
+      if (idx < reachable.node_reachable.size() &&
+          !reachable.node_reachable[idx]) {
+        to_remove.push_back(idx);
+      }
+    }
+    for (auto idx : to_remove) {
+      std::visit([&](auto node) { node.remove(); }, source.get_node(idx));
+      ++result.nodes_pruned;
+    }
+  }
+
+  // Finalize annotations.  When the spliced DAG is a single tree, a full
+  // Fitch pass assigns parsimony-optimal compact genomes to every inner node
+  // (including freshly-appended ones), matching Option A's materialized-and-
+  // Fitch-assigned output.  In the multi-tree case fitch_assign_compact_genomes
+  // does not apply (it requires a tree), so freshly-appended inner nodes keep
+  // their default (reference) compact genomes and recompute_edge_mutations
+  // derives their incident edge mutations from those defaults.  Those stored
+  // edge annotations on fresh multi-tree inner nodes are therefore NOT
+  // parsimony-optimal; this is acceptable for Phase 6 because the correctness
+  // oracle is grammar-level (clade taxon sets, production keys, and the
+  // parsimony optimum recomputed from leaf compact genomes), not the stored
+  // edge mutations on fresh nodes.  A future phase that needs exact stored
+  // multi-tree annotations would add a DAG-aware Fitch assignment.
+  build_clade_offsets(source);
+  if (is_tree(source)) {
+    fitch_assign_compact_genomes(source);
+  }
+  recompute_edge_mutations(source);
+  build_clade_offsets(source);
+
+  if (options.validate) {
+    validate_dag(source, "rank3 option C spliced DAG",
+                 thread_pool::get_default());
+  }
+  // build_clade_grammar_with_audit rebuilds clade offsets internally, so the
+  // explicit build_clade_offsets above is the last one needed before this
+  // call's internal rebuild.
+  result.rebuilt =
+      build_clade_grammar_with_audit(source, options.rebuild_grammar_options);
+  rank3_detail::validate_same_taxa_for_rank3(context, grammar,
+                                             result.rebuilt.grammar);
   return result;
 }
 

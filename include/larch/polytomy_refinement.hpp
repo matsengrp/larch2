@@ -2121,6 +2121,21 @@ inline bool refined_production_has_synthetic_polytomy_provenance(
       refinement.production_info[production]);
 }
 
+// Shared vocabulary for the "direct in-place mutation is not implemented for
+// a polytomy" rejection.  Both the polytomy-refinement provenance guard below
+// and the rank-3 Option C arity guard build their messages through this helper
+// so the wording (and the Option-A routing instruction) has a single source.
+// `what` describes the rejected production, e.g.
+//   "synthetic polytomy-refinement production 7"
+//   "non-binary (polytomy) before production 3"
+inline std::string polytomy_direct_mutation_not_implemented_message(
+    std::string_view context, std::string_view what) {
+  return std::string{context} +
+         ": direct in-place DAG mutation is not implemented for " +
+         std::string{what} +
+         "; use Option-A materialization/generate-Fitch-merge instead";
+}
+
 inline void require_no_synthetic_polytomy_productions_for_direct_mutation(
     polytomy_refinement_result const& refinement,
     std::vector<production_id> const& productions, char const* context) {
@@ -2128,11 +2143,9 @@ inline void require_no_synthetic_polytomy_productions_for_direct_mutation(
     if (!refined_production_has_synthetic_polytomy_provenance(refinement, pid))
       continue;
     throw std::runtime_error(
-        std::string{context} +
-        ": direct in-place DAG mutation is not implemented for synthetic "
-        "polytomy-refinement production " +
-        std::to_string(pid) +
-        "; use Option-A materialization/generate-Fitch-merge instead");
+        polytomy_direct_mutation_not_implemented_message(
+            context, "synthetic polytomy-refinement production " +
+                         std::to_string(pid)));
   }
 }
 
