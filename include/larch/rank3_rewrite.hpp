@@ -2649,6 +2649,17 @@ struct leaf_node_index {
   std::map<std::vector<taxon_id>, std::size_t> singleton_to_leaf;
 };
 
+// Precondition (enforced upstream, not re-checked here): any two leaves that
+// resolve the same singleton clade -- equivalently, carry the same sample_id
+// -- have identical compact genomes.  The enforcer is build_taxon_registry
+// (clade_grammar.hpp), invoked by build_clade_grammar_with_audit, which
+// throws on a duplicate sample_id whose compact genome conflicts with the
+// earlier occurrence and coalesces identical-cg duplicates.  In the splice
+// path build_clade_grammar_with_audit runs on `dag` immediately before this
+// helper, so by the time we iterate reachable nodes the precondition holds:
+// emplace therefore keeps an arbitrary first leaf per singleton and that
+// choice is sound.  Re-checking here would be dead code shadowing the real
+// guard; the assumption is stated rather than re-asserted.
 inline leaf_node_index build_leaf_node_index(phylo_dag& dag,
                                              clade_grammar const& grammar) {
   leaf_node_index idx;
@@ -2829,25 +2840,29 @@ inline option_c_splice_result option_c_splice_production(
   // their default (reference) compact genomes and recompute_edge_mutations
   // derives their incident edge mutations from those defaults.  Those stored
   // edge annotations on fresh multi-tree inner nodes are therefore NOT
-  // parsimony-optimal; this is acceptable for Phase 6 because the correctness
-  // oracle is grammar-level (clade taxon sets, production keys, and the
-  // parsimony optimum recomputed from leaf compact genomes), not the stored
-  // edge mutations on fresh nodes.  A future phase that needs exact stored
-  // multi-tree annotations would add a DAG-aware Fitch assignment.
+  // parsimony-optimal; this is benign for the chart-search pipeline because
+  // extract_leaf_site_states (parsimony_chart.hpp) reads leaf compact genomes
+  // only and recomputes inner-node parsimony from them, so chart scoring does
+  // not consume the stored annotations on fresh inner nodes.  A future phase
+  // whose consumer reads stored edge mutations directly would add a
+  // DAG-aware Fitch assignment.
+  //
+  // fitch_assign_compact_genomes and recompute_edge_mutations change compact
+  // genomes / edge mutations only, never topology, so the single
+  // build_clade_offsets below (refreshing offsets made stale by the edge
+  // surgery) stays valid through both; no second rebuild is needed before
+  // validate_dag or build_clade_grammar_with_audit (the latter rebuilds
+  // offsets internally).
   build_clade_offsets(source);
   if (is_tree(source)) {
     fitch_assign_compact_genomes(source);
   }
   recompute_edge_mutations(source);
-  build_clade_offsets(source);
 
   if (options.validate) {
     validate_dag(source, "rank3 option C spliced DAG",
                  thread_pool::get_default());
   }
-  // build_clade_grammar_with_audit rebuilds clade offsets internally, so the
-  // explicit build_clade_offsets above is the last one needed before this
-  // call's internal rebuild.
   result.rebuilt =
       build_clade_grammar_with_audit(source, options.rebuild_grammar_options);
   rank3_detail::validate_same_taxa_for_rank3(context, grammar,

@@ -836,11 +836,39 @@ static void test_option_c_multi_witness_splice() {
   CHECK(!result.invoked_merge_path);
   CHECK(!result.represented_trees_enumerated.has_value());
 
-  // Grammar-level oracle (the spliced DAG is multi-tree / non-maximally
-  // shared, so grammar-level equivalence is the right check).
-  auto option_a_dag =
+  // Full merge-equivalence oracle (clade taxa sets, production keys, AND
+  // representable-tree count).  The true Option-A reference for a 2-witness
+  // before production is itself a 2-tree DAG: two AC|BD trees that differ
+  // only in the root inner compact genome (root "A" vs root "C"), merged.
+  // The merge keeps both roots distinct (different compact genomes) while
+  // sharing the AC/BD subtrees and the leaves, yielding exactly 2
+  // representable trees -- the same count as the spliced DAG, which keeps
+  // each witness's fresh AC/BD nodes distinct.  Building this reference
+  // (rather than a single-tree Option-A reference) exercises the
+  // representable-tree-count half of the oracle for the >=2-witness case,
+  // which the grammar-level-only check could not reach.
+  auto ref1 =
       larch::test::make_tiny_labelled_tree("A", four_taxon_alt_tree());
-  check_option_c_grammar_equivalent(dag, option_a_dag);
+  auto ref2 = larch::test::make_tiny_labelled_tree("A", [] {
+    using larch::test::tiny_inner;
+    using larch::test::tiny_leaf;
+    // Reference "A" (matches ref1); the ROOT inner node carries sequence
+    // "C" so its compact genome differs from ref1's root, while AC/BD and
+    // leaves are identical.  The merge therefore keeps both roots distinct
+    // (different compact genomes) and shares the AC/BD subtrees and leaves,
+    // giving the reference exactly two roots and therefore two
+    // representable trees.
+    return tiny_inner(
+        "root", "C",
+        {tiny_inner("AC", "A", {tiny_leaf("A", "A"), tiny_leaf("C", "C")}),
+         tiny_inner("BD", "A",
+                    {tiny_leaf("B", "A"), tiny_leaf("D", "C")})});
+  }());
+  std::vector<larch::phylo_dag> ref_trees;
+  ref_trees.push_back(std::move(ref1));
+  ref_trees.push_back(std::move(ref2));
+  auto option_a_dag = larch::test::merge_tiny_trees(std::move(ref_trees));
+  check_option_c_merge_equivalent(dag, option_a_dag);
 
   std::println("  PASS");
 }
