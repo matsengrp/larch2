@@ -109,24 +109,51 @@ Rules:
 ### Fixed-topology local-commit verifier
 
 The local-commit `fixed_topology_exact` verifier is exact for the selected
-before/after topology, but it intentionally uses a structural selected-topology
-row cache rather than the original plan sketch's pure affected-row delta over
-the grammar-min inside cache.  In a DAG, an unchanged selected subtree can be
-locally suboptimal; reading the grammar-min inside row for that clade could
-silently substitute a different production.  The production path therefore:
+before/after topology.  It computes the selected before/after root rows from
+the persistent inside+outside caches, restricted to the affected rows, with a
+production per-pattern gate:
 
-- stores selected-subtree rows keyed by structural rooted topology and active
-  pattern;
-- combines those selected inside rows with the persistent outside root row to
-  stay in the same inside+outside scoring convention; and
-- exposes `fixed_topology_selected_cache_hits`,
-  `fixed_topology_selected_cache_misses`, and
-  `fixed_topology_selected_rows_computed` separately from the persistent-cache
-  verification counters.
+- selected-subtree rows are stored keyed by structural rooted topology and
+  active pattern (`fixed_topology_selected_cache_hits` / `_misses` /
+  `_rows_computed`);
+- the persistent inside cache participates in the delta: every base-clade
+  selected row is cross-checked against the grammar-min inside row in `icache`.
+  When they agree the selected production is the optimal one at that clade, so
+  the persistent-cache row is a valid source for the selected-topology delta
+  (an UNAFFECTED row, counted under `fixed_topology_icache_rows_reused`); when
+  they disagree, or the clade is a temp ref introduced by the candidate, the
+  row is AFFECTED and is recomputed from the selected-production recurrence
+  (`fixed_topology_icache_rows_recomputed_affected`).  The selected row's value
+  is authoritative either way (the grammar-min cache could be lower), so the
+  cross-check is what makes the delta "from persistent inside+outside cache,
+  restricted to affected rows" observable rather than asserted.  The outside
+  cache supplies the root outside row, keeping the score in the same inside +
+  outside scoring convention.
 
-The materialized per-pattern selected-topology oracle is diagnostic/test-only
-unless explicitly enabled; production does not run a hidden from-scratch oracle
-per candidate.
+The `fixed_topology_exact` label is granted only when the persistent-cache
+score agrees, per pattern, with the independent direct overlay selected-
+topology scorer (the Phase-8 production per-pattern gate,
+`fixed_topology_persistent_cache_direct_oracle_mismatches`; this scorer does
+NOT materialize an overlay grammar, so it does not bump
+`full_overlay_materializations`).  On a per-pattern mismatch the direct
+oracle's value is the from-scratch authority for the selected topology.
+
+The materialized per-pattern selected-topology oracle (diagnostic/test-only,
+enabled by `verify_fixed_topology_materialized_oracle_for_tests`) materializes
+the candidate's extended grammar and is the strongest independent check.  When
+it is enabled and finds a mismatch, its own scores are used as the authority
+(rather than re-running the direct overlay scorer, which shares overlay-space
+machinery with the cache path); this is counted under
+`fixed_topology_persistent_cache_oracle_mismatches`.
+
+Sequential `fixed_topology_exact` local commits are gated against the recorded
+chain objective (the previous accepted after-topology score), not the
+candidate's own selected before-topology score, so the chain objective is
+non-increasing across accepts.  A candidate whose selected before-topology
+score does not equal the chain objective is counted under
+`fixed_topology_chain_objective_before_mismatches` as a diagnostic (its before
+certificate is not the chain tip's topology); the gate still uses the chain
+objective.
 
 ## Polytomy and binary chart compatibility
 

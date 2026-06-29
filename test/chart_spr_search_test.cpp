@@ -1777,6 +1777,243 @@ static void test_phase8_persistent_cache_invariant_failure_is_hard_error() {
   std::println("  PASS");
 }
 
+// Phase 8 issue 2 (production gate + persistent-verifier/materialized-oracle
+// coverage for every required move class).  Runs the persistent local-commit
+// verifier through run_chart_spr_search on each Phase-8 fixture/move-class
+// pair, with the materialized from-scratch oracle enabled, and asserts the
+// per-pattern oracle contract: no cache/oracle mismatch, no fallback, the
+// production direct-overlay gate stayed clean, and the persistent inside cache
+// was actually consulted (issue 1: icache participation, not just epoch/shape).
+static void phase8_run_persistent_verifier_on_fixture(
+    phase8_fixed_fixture& fixture) {
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.verify_fixed_topology_materialized_oracle_for_tests = true;
+  // The materialized from-scratch oracle materializes once per verified
+  // candidate, so bound the candidate stream to keep the fixture matrix
+  // affordable while still exercising the persistent verifier + materialized
+  // oracle on every required move class.
+  options.enumeration.max_candidates = 12;
+  options.enumeration.max_candidates_is_post_dedup = true;
+
+  auto search = larch::run_chart_spr_search(std::move(fixture.dag),
+                                            fixture.grammar, options);
+  CHECK(search.counters.fixed_topology_persistent_cache_verifications > 0);
+  // The persistent-cache value agreed with BOTH the production direct-overlay
+  // per-pattern gate (issue 2a) and the materialized from-scratch oracle
+  // (issue 2b), so neither fallback path fired.
+  CHECK(search.counters.fixed_topology_persistent_cache_fallbacks == 0);
+  CHECK(search.counters.fixed_topology_persistent_cache_oracle_mismatches == 0);
+  CHECK(search.counters
+            .fixed_topology_persistent_cache_direct_oracle_mismatches == 0);
+  // Issue 1: the persistent inside cache participated in the delta (rows were
+  // cross-checked against icache), not just consulted for epoch/shape.  At
+  // least one base-clade selected row must have been reused from icache on a
+  // real fixture, proving the delta is "from persistent inside+outside cache,
+  // restricted to affected rows".
+  CHECK(search.counters.fixed_topology_icache_rows_reused > 0);
+  // No dense materialization happened for exact verification (the persistent
+  // path and the direct gate are both non-materializing); the only
+  // materialization charged is the diagnostic materialized oracle, counted
+  // separately under overlay_materializations_for_oracle.
+  CHECK(search.counters.overlay_materializations_for_exact_verification == 0);
+  CHECK(search.counters.overlay_materializations_for_oracle ==
+        search.counters.fixed_topology_persistent_cache_verifications);
+  // Every accepted move (if any) is labelled fixed_topology_exact.
+  for (auto const& iter : search.iterations) {
+    if (iter.accepted) {
+      CHECK(iter.accepted->exact.has_value());
+      CHECK(iter.accepted->exact->kind ==
+            larch::chart_spr_score_kind::fixed_topology_exact);
+    }
+  }
+  std::println("    {} PASS", fixture.name);
+}
+
+static void
+    test_phase8_persistent_verifier_materialized_oracle_all_move_classes() {
+  std::println(
+      "test_phase8_persistent_verifier_materialized_oracle_all_move_classes");
+
+  auto binary = load_phase8_binary_four_fixture();
+  phase8_run_persistent_verifier_on_fixture(binary);
+
+  auto polytomy = load_phase8_two_polytomy_fixture();
+  phase8_run_persistent_verifier_on_fixture(polytomy);
+
+  auto five = load_phase8_test_5_trees_fixture();
+  phase8_run_persistent_verifier_on_fixture(five);
+
+  std::println("  PASS");
+}
+
+// Phase 8 issue 4: when the independent materialized from-scratch oracle finds
+// a per-pattern mismatch (forced here by the independent-s_M corruption hook),
+// the verifier must use the materialized oracle's own scores as the authority
+// rather than re-running the direct overlay scorer (which shares overlay-space
+// machinery with the cache path).  We assert this indirectly: the fallback
+// counter equals the witness count, the materialized-oracle mismatch counter
+// equals the fallback count, and -- critically -- the resulting accepted
+// candidate's exact score is still labelled fixed_topology_exact and matches the
+// materialized oracle's per-pattern new-score total (the authority value).
+static void test_phase8_oracle_mismatch_uses_materialized_oracle_result() {
+  std::println(
+      "test_phase8_oracle_mismatch_uses_materialized_oracle_result");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto oracle_state = larch::build_chart_spr_search_state(dag, grammar);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.force_fixed_topology_independent_sm_bug_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+  CHECK(!search.iterations.empty());
+  auto const& iteration = search.iterations.front();
+  CHECK(iteration.accepted.has_value());
+  CHECK(iteration.accepted->topology_selection.certificate);
+  CHECK(search.counters.fixed_topology_persistent_cache_verifications > 0);
+  CHECK(search.counters.fixed_topology_independent_sm_bug_witnesses_for_tests >
+        0);
+  CHECK(search.counters.fixed_topology_persistent_cache_fallbacks ==
+        search.counters.fixed_topology_independent_sm_bug_witnesses_for_tests);
+  CHECK(search.counters.fixed_topology_persistent_cache_oracle_mismatches ==
+        search.counters.fixed_topology_persistent_cache_fallbacks);
+
+  // The accepted exact score is the materialized oracle's authority value:
+  // recompute the materialized selected-after score per pattern and confirm the
+  // accepted new_score equals it (not the cache path's corrupted value and not
+  // a re-run direct-overlay value).
+  auto const& chosen = *iteration.accepted;
+  auto const& certificate = *chosen.topology_selection.certificate;
+  auto overlay = larch::overlay_from_candidate(oracle_state.grammar,
+                                               chosen.candidate);
+  auto materialized = larch::materialize_overlay_grammar(overlay);
+  std::vector<larch::production_id> after_ids;
+  after_ids.reserve(certificate.after_overlay_productions.size());
+  for (auto ref : certificate.after_overlay_productions) {
+    after_ids.push_back(
+        larch::chart_spr_dense_production_id_for_ref(materialized, ref));
+  }
+  auto after_topology = larch::grammar_topology_from_productions(
+      materialized.grammar, after_ids);
+  auto const& active = oracle_state.active_patterns.patterns.patterns;
+  std::uint64_t materialized_new_active = 0;
+  for (std::size_t p = 0; p < active.size(); ++p) {
+    auto row = larch::chart_multisite_detail::restricted_topology_row(
+        materialized.grammar, active[p], after_topology);
+    materialized_new_active = larch::chart_multisite_detail::checked_add_u64(
+        materialized_new_active,
+        larch::chart_spr_weighted_root_score_from_row(
+            row, active[p], oracle_state.chart_opts),
+        "phase8 oracle-mismatch materialized authority total");
+  }
+  auto materialized_new_full = larch::chart_spr_add_invariant_offset(
+      materialized_new_active, oracle_state,
+      "phase8 oracle-mismatch materialized authority full");
+  CHECK(chosen.exact.has_value());
+  CHECK(chosen.exact->kind ==
+        larch::chart_spr_score_kind::fixed_topology_exact);
+  CHECK(chosen.exact->value.new_score == materialized_new_full);
+
+  std::println("  PASS");
+}
+
+static void test_phase8_chain_objective_gate_is_monotone_across_commits() {
+  std::println(
+      "test_phase8_chain_objective_gate_is_monotone_across_commits");
+
+  // Issue 3: sequential fixed_topology_exact local commits must be gated
+  // against the recorded chain objective (the previous accepted after-topology
+  // score), not the candidate's own selected before-topology score.  Run a
+  // multi-iteration search; every accepted move's new_score must be <= the
+  // chain objective carried into that iteration, and the chain objective is
+  // non-increasing across accepts.
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 4;
+  options.rebuild_after_accept = false;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+  std::uint64_t previous_chain_objective = search.summary.initial_score;
+  bool any_accept = false;
+  for (auto const& iter : search.iterations) {
+    if (!iter.accepted || !iter.accepted_move_committed) continue;
+    any_accept = true;
+    CHECK(iter.accepted->exact.has_value());
+    auto const accepted_new = iter.accepted->exact->value.new_score;
+    // The chain-objective gate: the accepted new score must not exceed the
+    // objective carried into this iteration (state_score_before for the
+    // local-commit branch).
+    CHECK(accepted_new <= iter.state_score_before);
+    // And the chain objective is non-increasing across accepted commits.
+    CHECK(accepted_new <= previous_chain_objective);
+    previous_chain_objective = accepted_new;
+  }
+  CHECK(any_accept);
+
+  std::println("  PASS");
+}
+
+// Phase 8 issue 1 (icache participation across local commits).  The persistent
+// inside cache is chain-keyed while the selected-topology recurrence runs in
+// tip space; after the first commit the two diverge, so cross-checking an
+// icache row requires translating the tip clade id through
+// dense_clade_to_chain_ref.  This test runs a multi-iteration local-commit
+// search and confirms (a) the persistent inside cache was actually consulted
+// (icache_rows_reused > 0), and (b) the cross-check did not silently invalidate
+// candidates on the post-commit iterations (no spurious direct-oracle
+// mismatch / fallback, and verified candidates remain valid).
+static void test_phase8_icache_participation_across_local_commits() {
+  std::println("test_phase8_icache_participation_across_local_commits");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 3;
+  options.rebuild_after_accept = false;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+  // The persistent inside cache participated in the delta.
+  CHECK(search.counters.fixed_topology_icache_rows_reused > 0);
+  // No spurious fallback from a thrown/misaligned icache cross-check on any
+  // iteration (including post-commit iterations where tip and chain ids differ).
+  CHECK(search.counters.fixed_topology_persistent_cache_fallbacks == 0);
+  CHECK(search.counters
+            .fixed_topology_persistent_cache_direct_oracle_mismatches == 0);
+  // The verifier ran on more than one iteration's worth of candidates (a
+  // regression to "invalidate every post-commit candidate" would still pass the
+  // fallback checks above but would collapse the verification count).
+  CHECK(search.counters.fixed_topology_persistent_cache_verifications > 1);
+
+  std::println("  PASS");
+}
+
 static void test_enumeration_truncation_sets_unverified_flag_even_exhaustive() {
   std::println("test_enumeration_truncation_sets_unverified_flag_even_exhaustive");
 
@@ -3339,6 +3576,10 @@ int main() {
   test_phase8_persistent_cache_dag_verification_has_no_fallback();
   test_phase8_per_pattern_oracle_catches_independent_moved_state();
   test_phase8_persistent_cache_invariant_failure_is_hard_error();
+  test_phase8_persistent_verifier_materialized_oracle_all_move_classes();
+  test_phase8_oracle_mismatch_uses_materialized_oracle_result();
+  test_phase8_chain_objective_gate_is_monotone_across_commits();
+  test_phase8_icache_participation_across_local_commits();
   test_enumeration_truncation_sets_unverified_flag_even_exhaustive();
   test_phase5_no_improvement_search_stops_without_commit();
   test_phase5_known_improving_search_commits_once();

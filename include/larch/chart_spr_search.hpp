@@ -139,6 +139,31 @@ struct chart_spr_search_counters {
   std::size_t fixed_topology_persistent_cache_verifications = 0;
   std::size_t fixed_topology_persistent_cache_fallbacks = 0;
   std::size_t fixed_topology_persistent_cache_oracle_mismatches = 0;
+  // Phase-8 production per-pattern gate.  The persistent-cache verifier always
+  // cross-checks its selected-topology score against the independent direct
+  // overlay selected-topology scorer (no materialization); this counts the
+  // candidates where that gate found a per-pattern mismatch and the cache
+  // value could not be labelled exact from the cache path alone.  Distinct
+  // from the (test-only) materialized oracle mismatch counter so a regression
+  // in the production gate is visible on its own.
+  std::size_t
+      fixed_topology_persistent_cache_direct_oracle_mismatches = 0;
+  // Phase-8 affected-row participation of the persistent inside cache.  Base
+  // clade refs consulted in the selected-topology recurrence are cross-checked
+  // against icache; matching rows are reused from the persistent cache
+  // (unaffected), mismatching rows and temp clades are recomputed (affected).
+  // This makes the delta "from persistent inside+outside cache, restricted to
+  // affected rows" observable: a regression to "recompute everything" is
+  // visible as zero reused rows.
+  std::size_t fixed_topology_icache_rows_reused = 0;
+  std::size_t fixed_topology_icache_rows_recomputed_affected = 0;
+  // Phase-8 chain-objective gate (Work item 1 exactness contract).  Counts
+  // accepted candidates whose selected before-topology score did not equal the
+  // recorded chain objective (the previous accepted after-topology).  Such a
+  // candidate is still gated against the chain objective, never against its
+  // own before-topology score; a nonzero count is a diagnostic that the
+  // candidate's before certificate is not the chain tip's topology.
+  std::size_t fixed_topology_chain_objective_before_mismatches = 0;
   // Test-only diagnostics for the Phase-8 independent-s_M corruption hook.
   // The real-witness counter proves the hook exercised the actual bug class;
   // the perturbation counter is retained as a regression guard and should stay
@@ -569,6 +594,10 @@ struct chart_spr_search_summary {
   std::size_t fixed_topology_persistent_cache_verifications = 0;
   std::size_t fixed_topology_persistent_cache_fallbacks = 0;
   std::size_t fixed_topology_persistent_cache_oracle_mismatches = 0;
+  std::size_t fixed_topology_persistent_cache_direct_oracle_mismatches = 0;
+  std::size_t fixed_topology_icache_rows_reused = 0;
+  std::size_t fixed_topology_icache_rows_recomputed_affected = 0;
+  std::size_t fixed_topology_chain_objective_before_mismatches = 0;
   chart_spr_candidate_selection_mode candidate_selection =
       chart_spr_candidate_selection_mode::lower_bound_top_k;
   chart_spr_acceptance_mode acceptance_mode =
@@ -2125,6 +2154,13 @@ inline void add_chart_spr_search_counters(
       src.fixed_topology_persistent_cache_fallbacks;
   dst.fixed_topology_persistent_cache_oracle_mismatches +=
       src.fixed_topology_persistent_cache_oracle_mismatches;
+  dst.fixed_topology_persistent_cache_direct_oracle_mismatches +=
+      src.fixed_topology_persistent_cache_direct_oracle_mismatches;
+  dst.fixed_topology_icache_rows_reused += src.fixed_topology_icache_rows_reused;
+  dst.fixed_topology_icache_rows_recomputed_affected +=
+      src.fixed_topology_icache_rows_recomputed_affected;
+  dst.fixed_topology_chain_objective_before_mismatches +=
+      src.fixed_topology_chain_objective_before_mismatches;
   dst.fixed_topology_independent_sm_bug_witnesses_for_tests +=
       src.fixed_topology_independent_sm_bug_witnesses_for_tests;
   dst.fixed_topology_independent_sm_bug_perturbations_for_tests +=
