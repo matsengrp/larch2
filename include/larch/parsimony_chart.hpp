@@ -26,8 +26,8 @@ inline constexpr std::size_t nuc_state_count = 4;
 
 struct chart_choice {
   production_id production = no_production;
-  // Phase 2 supports binary productions only. The entry is aligned with
-  // grammar_production::children for the chosen production.
+  // The trace/choice layer is binary-gated. The entry is aligned with
+  // grammar_production::children for a binary chosen production.
   std::array<std::uint8_t, 2> child_states{0, 0};
   chart_cost cost = chart_inf;
 };
@@ -177,6 +177,48 @@ inline void validate_binary_production_partition(clade_grammar const& grammar,
   larch::detail::validate_production_partition(
       grammar, prod.parent, prod.children,
       "single-site chart: production " + std::to_string(pid));
+}
+
+inline void validate_production_inside_row_inputs(
+    clade_grammar const& grammar, grammar_production const& prod,
+    production_id pid, std::string_view context) {
+  auto prefix = std::string{context} + ": production " + std::to_string(pid);
+  if (prod.children.size() < 2) {
+    throw std::runtime_error(prefix + " has arity " +
+                             std::to_string(prod.children.size()) +
+                             "; expected at least 2 children");
+  }
+  larch::detail::validate_production_partition(grammar, prod.parent,
+                                               prod.children, prefix);
+
+  auto const parent_size = grammar.clades[prod.parent].taxa.size();
+  for (auto child : prod.children) {
+    if (grammar.clades[child].taxa.size() >= parent_size) {
+      throw std::runtime_error(prefix +
+                               " child is not smaller than parent");
+    }
+  }
+}
+
+template <class RowProvider>
+inline chart_cost combine_production_inside_row(
+    grammar_production const& prod, std::uint8_t parent_state,
+    RowProvider&& row_provider) {
+  validate_state(parent_state, "parent");
+  chart_cost total = 0;
+  for (auto child : prod.children) {
+    auto const& row = row_provider(child);
+    chart_cost best_child = chart_inf;
+    for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+         ++child_state) {
+      best_child = std::min(
+          best_child,
+          saturated_add(row[child_state],
+                        transition_cost(parent_state, child_state)));
+    }
+    total = saturated_add(total, best_child);
+  }
+  return total;
 }
 
 inline void validate_chart_grammar(clade_grammar const& grammar) {
@@ -408,26 +450,32 @@ inline single_site_chart build_single_site_chart(
         throw std::runtime_error(
             "single-site chart: productions_by_parent contains production "
             "with mismatched parent");
-      if (prod.children.size() != 2) {
-        throw std::runtime_error("single-site chart: production " +
-                                 std::to_string(pid) + " has arity " +
-                                 std::to_string(prod.children.size()) +
-                                 "; Phase 2 supports binary productions only");
+      validate_production_inside_row_inputs(grammar, prod, pid,
+                                            "single-site chart");
+      if (options.keep_trace && prod.children.size() != 2) {
+        throw std::runtime_error(
+            "single-site chart: keep_trace uses the binary choice layer; "
+            "production " +
+            std::to_string(pid) + " has arity " +
+            std::to_string(prod.children.size()));
       }
-
-      std::array<clade_id, 2> children{prod.children[0], prod.children[1]};
-      for (auto child : children) {
-        if (child == no_clade || child >= grammar.clades.size())
-          throw std::runtime_error(
-              "single-site chart: production child clade out of range");
-        if (grammar.clades[child].taxa.size() >= clade.taxa.size())
-          throw std::runtime_error(
-              "single-site chart: production child is not smaller than parent");
-      }
-      validate_binary_production_partition(grammar, prod, pid);
 
       for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
            ++parent_state) {
+        auto row_provider = [&](clade_id child) -> auto const& {
+          return chart.inside[child];
+        };
+        auto candidate =
+            combine_production_inside_row(prod, parent_state, row_provider);
+        if (candidate >= chart_inf) continue;
+
+        if (!options.keep_trace) {
+          auto& cell = chart.inside[cid][parent_state];
+          cell = std::min(cell, candidate);
+          continue;
+        }
+
+        std::array<clade_id, 2> children{prod.children[0], prod.children[1]};
         std::array<chart_cost, 2> best_child_cost{chart_inf, chart_inf};
         std::array<std::vector<std::uint8_t>, 2> best_child_states;
 
@@ -452,9 +500,6 @@ inline single_site_chart build_single_site_chart(
             }
           }
         }
-
-        auto candidate = saturated_add(best_child_cost[0], best_child_cost[1]);
-        if (candidate >= chart_inf) continue;
 
         auto& cell = chart.inside[cid][parent_state];
         if (candidate < cell) {

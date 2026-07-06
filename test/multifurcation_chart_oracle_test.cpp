@@ -1,3 +1,4 @@
+#include <larch/chart_spr.hpp>
 #include <larch/clade_grammar.hpp>
 #include <larch/parsimony_chart.hpp>
 
@@ -6,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <numeric>
 #include <optional>
 #include <print>
 #include <stdexcept>
@@ -137,11 +139,55 @@ static larch::chart_cost row_min(brute_row const& row) {
   return best;
 }
 
+static brute_row brute_min_row(std::vector<brute_row> const& rows) {
+  CHECK(!rows.empty());
+  auto result = brute_inf_row();
+  for (auto const& row : rows) {
+    for (std::uint8_t state = 0; state < larch::nuc_state_count; ++state)
+      result[state] = std::min(result[state], row[state]);
+  }
+  return result;
+}
+
 static std::size_t max_production_arity(larch::clade_grammar const& grammar) {
   std::size_t max_arity = 0;
   for (auto const& prod : grammar.productions)
     max_arity = std::max(max_arity, prod.children.size());
   return max_arity;
+}
+
+static std::vector<larch::clade_id> clades_by_increasing_size(
+    larch::clade_grammar const& grammar) {
+  std::vector<larch::clade_id> order(grammar.clades.size());
+  std::iota(order.begin(), order.end(), larch::clade_id{0});
+  std::stable_sort(order.begin(), order.end(), [&](auto lhs, auto rhs) {
+    auto lsize = grammar.clades[lhs].taxa.size();
+    auto rsize = grammar.clades[rhs].taxa.size();
+    if (lsize != rsize) return lsize < rsize;
+    return lhs < rhs;
+  });
+  return order;
+}
+
+static larch::single_site_chart build_and_check_dense_inside(
+    larch::clade_grammar const& grammar, larch::leaf_site_states const& states) {
+  auto chart = larch::build_single_site_chart(grammar, states);
+  std::vector<std::optional<std::vector<brute_row>>> memo(grammar.clades.size());
+  for (std::size_t cid = 0; cid < grammar.clades.size(); ++cid) {
+    auto rows = brute_enumerate_multifurcating_topologies(
+        grammar, states, static_cast<larch::clade_id>(cid), memo);
+    CHECK(chart.inside[cid] == brute_min_row(rows));
+  }
+
+  larch::single_site_chart recomputed;
+  recomputed.inside.assign(grammar.clades.size(),
+                           larch::parsimony_chart_detail::make_inf_row());
+  for (auto clade : clades_by_increasing_size(grammar)) {
+    larch::chart_spr_detail::recompute_single_inside_row(
+        grammar, states, recomputed, clade);
+  }
+  CHECK(recomputed.inside == chart.inside);
+  return chart;
 }
 
 static larch::clade_grammar_build_result build_allowing_polytomies(
@@ -240,6 +286,16 @@ static void test_trinary_fixture_and_allow_gate() {
   CHECK(rows.front()[larch::nuc_base::G] == 2);
   CHECK(rows.front()[larch::nuc_base::T] == 3);
   CHECK(row_min(rows.front()) == 2);
+  auto chart = build_and_check_dense_inside(grammar, states);
+  CHECK(chart.inside[grammar.root_clade] == rows.front());
+
+  larch::chart_options trace_opts;
+  trace_opts.keep_trace = true;
+  auto trace_message = runtime_error_message([&] {
+    (void)larch::build_single_site_chart(grammar, states, trace_opts);
+  });
+  CHECK(trace_message.find("keep_trace uses the binary choice layer") !=
+        std::string::npos);
 
   std::println("  PASS");
 }
@@ -263,6 +319,8 @@ static void test_four_ary_fixture() {
   CHECK(rows.front()[larch::nuc_base::G] == 4);
   CHECK(rows.front()[larch::nuc_base::T] == 4);
   CHECK(row_min(rows.front()) == 2);
+  auto chart = build_and_check_dense_inside(built.grammar, states);
+  CHECK(chart.inside[built.grammar.root_clade] == rows.front());
 
   std::println("  PASS");
 }
@@ -287,6 +345,8 @@ static void test_five_ary_fixture() {
   CHECK(rows.front()[larch::nuc_base::G] == 4);
   CHECK(rows.front()[larch::nuc_base::T] == 4);
   CHECK(row_min(rows.front()) == 3);
+  auto chart = build_and_check_dense_inside(built.grammar, states);
+  CHECK(chart.inside[built.grammar.root_clade] == rows.front());
 
   std::println("  PASS");
 }
@@ -316,6 +376,8 @@ static void test_mixed_arity_fixture() {
   CHECK(rows.front()[larch::nuc_base::G] == 3);
   CHECK(rows.front()[larch::nuc_base::T] == 3);
   CHECK(row_min(rows.front()) == 1);
+  auto chart = build_and_check_dense_inside(built.grammar, states);
+  CHECK(chart.inside[built.grammar.root_clade] == rows.front());
 
   std::println("  PASS");
 }

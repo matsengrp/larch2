@@ -465,8 +465,24 @@ static void test_strict_validation_errors() {
     opts.allow_polytomies = true;
     auto grammar = larch::build_clade_grammar(dag, opts);
     auto states = larch::extract_leaf_site_states(dag, grammar, 1);
-    (void)larch::build_single_site_chart(grammar, states);
+    larch::chart_options chart_opts;
+    chart_opts.keep_trace = true;
+    (void)larch::build_single_site_chart(grammar, states, chart_opts);
   }));
+
+  {
+    auto dag = larch::test::make_tiny_labelled_tree(
+        "A", larch::test::tiny_inner("root", "A",
+                                     {larch::test::tiny_leaf("A", "A"),
+                                      larch::test::tiny_leaf("B", "C"),
+                                      larch::test::tiny_leaf("C", "A")}));
+    larch::clade_grammar_options opts;
+    opts.allow_polytomies = true;
+    auto grammar = larch::build_clade_grammar(dag, opts);
+    auto states = larch::extract_leaf_site_states(dag, grammar, 1);
+    auto chart = larch::build_single_site_chart(grammar, states);
+    CHECK(chart.root_min_excluding_ua(grammar.root_clade) == 1);
+  }
 
   CHECK(throws_runtime_error([] {
     larch::clade_grammar grammar;

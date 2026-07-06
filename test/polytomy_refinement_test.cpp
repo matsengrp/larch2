@@ -741,8 +741,8 @@ static void test_audit_kary_returns_diagnostic_grammar() {
   std::println("  PASS");
 }
 
-static void test_binary_chart_rejects_audit_kary_grammar() {
-  std::println("test_binary_chart_rejects_audit_kary_grammar");
+static void test_dense_chart_accepts_audit_kary_grammar() {
+  std::println("test_dense_chart_accepts_audit_kary_grammar");
 
   auto dag = make_three_taxon_star();
   larch::polytomy_refinement_options opts;
@@ -751,8 +751,9 @@ static void test_binary_chart_rejects_audit_kary_grammar() {
       dag, larch::clade_grammar_options{}, opts);
   auto states = larch::extract_leaf_site_states(dag, result.grammar, 1);
 
-  CHECK(throws_runtime_error(
-      [&] { (void)larch::build_single_site_chart(result.grammar, states); }));
+  CHECK(!larch::grammar_is_binary_chart_compatible(result.grammar));
+  auto chart = larch::build_single_site_chart(result.grammar, states);
+  CHECK(chart.root_min_excluding_ua(result.grammar.root_clade) == 1);
 
   std::println("  PASS");
 }
@@ -1728,7 +1729,7 @@ int main() {
   test_reject_mode_accepts_binary_grammar();
   test_audit_kary_binary_grammar_remains_exact();
   test_audit_kary_returns_diagnostic_grammar();
-  test_binary_chart_rejects_audit_kary_grammar();
+  test_dense_chart_accepts_audit_kary_grammar();
   test_exact_expansion_three_taxon_star();
   test_exact_expansion_four_taxon_star_matches_bruteforce();
   test_exact_expansion_reuses_existing_observed_clade();

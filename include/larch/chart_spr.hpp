@@ -531,33 +531,19 @@ inline void recompute_single_inside_row(clade_grammar const& grammar,
     auto const& prod = grammar.productions[pid];
     if (prod.parent != clade)
       throw std::runtime_error("chart SPR: production parent mismatch");
-    if (prod.children.size() != 2) {
-      throw std::runtime_error("chart SPR: local recompute supports binary "
-                               "productions only");
-    }
-    parsimony_chart_detail::validate_binary_production_partition(grammar, prod,
-                                                                 pid);
+    parsimony_chart_detail::validate_production_inside_row_inputs(
+        grammar, prod, pid, "chart SPR");
 
     for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
          ++parent_state) {
-      chart_cost total = 0;
-      for (std::size_t child_i = 0; child_i < 2; ++child_i) {
-        auto child = prod.children[child_i];
+      auto row_provider = [&](clade_id child) -> auto const& {
         if (child == no_clade || child >= chart.inside.size()) {
           throw std::runtime_error("chart SPR: production child out of range");
         }
-        chart_cost best_child = chart_inf;
-        for (std::uint8_t child_state = 0; child_state < nuc_state_count;
-             ++child_state) {
-          best_child = std::min(
-              best_child,
-              parsimony_chart_detail::saturated_add(
-                  chart.inside[child][child_state],
-                  parsimony_chart_detail::transition_cost(parent_state,
-                                                          child_state)));
-        }
-        total = parsimony_chart_detail::saturated_add(total, best_child);
-      }
+        return chart.inside[child];
+      };
+      auto total = parsimony_chart_detail::combine_production_inside_row(
+          prod, parent_state, row_provider);
       row[parent_state] = std::min(row[parent_state], total);
     }
   }
