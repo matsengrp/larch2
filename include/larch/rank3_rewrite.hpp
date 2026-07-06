@@ -1,6 +1,7 @@
 #pragma once
 
 #include <larch/chart_spr.hpp>
+#include <larch/chart_spr_search.hpp>  // spr_overlay_delta, overlay-delta index helpers
 #include <larch/compute.hpp>
 #include <larch/grammar_topology.hpp>
 #include <larch/merge.hpp>
@@ -2675,6 +2676,131 @@ inline leaf_node_index build_leaf_node_index(phylo_dag& dag,
   return idx;
 }
 
+// ---- Phase 7: Option C as a committed overlay delta ---------------------
+//
+// `option_c_as_overlay_delta` (below the namespace) expresses a binary
+// production rewrite as an `spr_overlay_delta` in the existing overlay
+// vocabulary (tombstone the before production, add the after resolution as
+// temp productions + temp clades for genuinely-new clades).  These helpers
+// walk the recursive `option_c_after_subtree` template, resolving each clade
+// to an overlay ref against the tip grammar and adding temp productions only
+// for resolutions not already present (mirroring `maybe_add_candidate_
+// production`'s dedup so the delta is minimal and never duplicates a tip
+// production).
+
+// Does the tip grammar already carry a production matching `parent` +
+// `children` (both as base refs, children canonicalized)?  Used to suppress a
+// redundant temp production.  `ignore_base_pid` excludes one base production
+// (the before production being tombstoned) so the root after production is
+// re-added even when after == before's partition slot would otherwise match.
+inline bool tip_has_matching_production(
+    clade_grammar const& tip, overlay_clade_ref parent,
+    std::vector<overlay_clade_ref> const& children,
+    production_id ignore_base_pid = no_production) {
+  if (parent.space != overlay_id_space::base) return false;
+  std::vector<clade_id> base_children;
+  base_children.reserve(children.size());
+  for (auto c : children) {
+    if (c.space != overlay_id_space::base) return false;
+    base_children.push_back(c.id);
+  }
+  std::sort(base_children.begin(), base_children.end());
+  for (auto pid : tip.productions_by_parent[parent.id]) {
+    if (pid == ignore_base_pid) continue;
+    auto prod_children = tip.productions[pid].children;
+    std::sort(prod_children.begin(), prod_children.end());
+    if (prod_children == base_children) return true;
+  }
+  return false;
+}
+
+inline bool temp_already_has_production(
+    std::vector<overlay_grammar_production> const& temp_productions,
+    overlay_clade_ref parent,
+    std::vector<overlay_clade_ref> children) {
+  std::sort(children.begin(), children.end());
+  for (auto const& prod : temp_productions) {
+    if (prod.parent != parent) continue;
+    auto prod_children = prod.children;
+    std::sort(prod_children.begin(), prod_children.end());
+    if (prod_children == children) return true;
+  }
+  return false;
+}
+
+// Recursive walker producing overlay refs + temp productions for an after
+// subtree.  Leaves resolve to base refs (the singleton must exist in the tip);
+// internal clades resolve to base refs when present in the tip and to fresh
+// temp refs otherwise.  A temp production is recorded for each internal
+// clade's resolution unless that exact (parent, children) production is
+// already a tip production or already recorded.  `before_pid` is forwarded as
+// the ignore-base id only at the root, since only the root after production
+// could clash with the (about-to-be-tombstoned) before production.
+struct option_c_overlay_subtree_resolver {
+  clade_grammar const& tip;
+  std::map<std::vector<taxon_id>, clade_id> const& tip_lookup;
+  std::vector<clade_key>& temp_clades;
+  std::vector<overlay_grammar_production>& temp_productions;
+  std::map<std::vector<taxon_id>, overlay_clade_ref>& assigned_temp;
+  std::string_view context;
+
+  overlay_clade_ref resolve(option_c_after_subtree const& subtree) {
+    auto taxa = normalize_taxa(subtree.taxa);
+    if (subtree.children.empty()) {
+      // Leaf clade: must already be represented in the tip grammar (a valid
+      // chart grammar has one clade per taxon).  Option C reuses leaf nodes,
+      // never introduces a new taxon.
+      auto it = tip_lookup.find(taxa);
+      if (it == tip_lookup.end()) {
+        throw std::runtime_error(
+            std::string{context} +
+            ": after subtree references a leaf clade not present in the tip "
+            "grammar");
+      }
+      return base_clade_ref(it->second);
+    }
+
+    // Internal clade: resolve children first (bottom-up so child refs exist
+    // before the parent production is recorded).
+    std::vector<overlay_clade_ref> child_refs;
+    child_refs.reserve(subtree.children.size());
+    for (auto const& child : subtree.children) {
+      child_refs.push_back(resolve(child));
+    }
+
+    overlay_clade_ref parent_ref;
+    auto tip_it = tip_lookup.find(taxa);
+    if (tip_it != tip_lookup.end()) {
+      parent_ref = base_clade_ref(tip_it->second);
+    } else {
+      auto assigned_it = assigned_temp.find(taxa);
+      if (assigned_it != assigned_temp.end()) {
+        parent_ref = assigned_it->second;
+      } else {
+        clade_id tid = static_cast<clade_id>(temp_clades.size());
+        temp_clades.push_back(clade_key{taxa});
+        parent_ref = temp_clade_ref(tid);
+        assigned_temp.emplace(taxa, parent_ref);
+      }
+    }
+
+    // Record a temp production for this internal clade's resolution unless it
+    // duplicates a tip production or an already-recorded temp production.
+    // (before_pid does not apply to non-root subtrees: only the root after
+    // production can clash with the before production.)
+    if (!tip_has_matching_production(tip, parent_ref, child_refs) &&
+        !temp_already_has_production(temp_productions, parent_ref, child_refs)) {
+      overlay_grammar_production prod;
+      prod.parent = parent_ref;
+      prod.children = child_refs;
+      std::sort(prod.children.begin(), prod.children.end());
+      prod.multiplicity = 1;
+      temp_productions.push_back(std::move(prod));
+    }
+    return parent_ref;
+  }
+};
+
 }  // namespace option_c_detail
 
 // Realize `subtree` as a DAG subtree hanging off `parent_node` at
@@ -2867,6 +2993,165 @@ inline option_c_splice_result option_c_splice_production(
       build_clade_grammar_with_audit(source, options.rebuild_grammar_options);
   rank3_detail::validate_same_taxa_for_rank3(context, grammar,
                                              result.rebuilt.grammar);
+  return result;
+}
+
+// ===========================================================================
+// Phase 7 — Option C as a committed overlay delta (Work item 2 <-> 1+3)
+// ===========================================================================
+//
+// `option_c_as_overlay_delta` expresses a binary production rewrite (the same
+// before/after pair `option_c_splice_production` operates on) as an
+// `spr_overlay_delta` in the existing overlay vocabulary, so it is consumable
+// by `overlay_chain::append`.  In chart-search mode an Option C rewrite then
+// commits through the Phase 4 path (chain append + paired inside/outside
+// cache commits), recomputing only the affected rows instead of a full chart
+// rebuild; in standalone mode it remains a direct DAG splice (Phase 6).  The
+// two outputs are merge-equivalent at the taxon-set-key level (Phase 7 exit
+// criterion 2).
+//
+// Delta construction mirrors the standalone splice's semantics at the grammar
+// level:
+//   * tombstone the single before production (a base production of the tip);
+//   * add the after resolution as temp productions, plus temp clades for
+//     genuinely-new clades (clades whose taxon set is absent from the tip);
+//   * reuse existing tip clades (base refs) wherever the after structure names
+//     a clade already present, including singleton leaves -- matching Phase 6's
+//     leaf-node reuse.  Non-leaf clades present in the tip are referenced as
+//     base refs and a temp production is added only if their after child
+//     partition is not already a tip production.
+//
+// As in Phase 6, the after production's parent taxon set must equal the before
+// production's parent taxon set (the rewrite boundary is fixed); a rewrite
+// that would change the represented parent clade is a hard error, and a
+// non-binary (polytomy) before/after throws a labelled message that routes to
+// Option A.  Identity is by taxon-set key, identical to Phase 6 / Option A/B.
+//
+// The returned delta carries a fully-populated derived index (affected order,
+// reachability, temp indices) so it is a valid `spr_overlay_delta` usable by
+// any consumer of `build_spr_overlay_delta` -- in particular the transient
+// local scorer -- not only `overlay_chain::append`.  (The chain itself rebuilds
+// its tip indices from `chain.tip()` on commit, so those fields are not
+// load-bearing for the commit path, but populating them keeps the delta
+// faithful to the single-candidate substrate and lets Phase 8's fixed-topology
+// machinery reuse it.)
+
+struct option_c_overlay_delta_result {
+  // Delta consumable by `overlay_chain::append`.  `delta.base` aliases `tip`
+  // (the grammar the before/after were resolved against); the caller must keep
+  // `tip` alive until after the append.
+  spr_overlay_delta delta;
+  rank3_production_taxa_key before_key;
+  rank3_production_taxa_key after_key;
+  // The before production's id in the tip grammar (resolved by taxon-set key).
+  production_id before_tip_production = no_production;
+  // True when the after production's key is already represented in the tip
+  // grammar.  Under the `no_op_if_present` policy the commit caller treats this
+  // as a documented no-op (no append, no cache mutation).  Under `merge` the
+  // commit still proceeds (tombstoning the before production).
+  bool after_already_present = false;
+};
+
+inline option_c_overlay_delta_result option_c_as_overlay_delta(
+    clade_grammar const& tip, rank3_production_taxa_key before_key,
+    option_c_after_production const& after,
+    local_spr_score_options const& score_options = {}) {
+  constexpr std::string_view context = "rank3 option C overlay delta";
+
+  option_c_overlay_delta_result result;
+  rank3_detail::normalize_production_key(before_key);
+  result.before_key = before_key;
+  option_c_detail::validate_after_production(after, context);
+  result.after_key = option_c_detail::after_key_from_production(after);
+
+  if (result.after_key.parent != before_key.parent) {
+    throw std::runtime_error(
+        std::string{context} +
+        ": after production parent taxon set does not match before; a rewrite "
+        "that changes the represented parent clade is a hard error");
+  }
+
+  auto before_pid = option_c_detail::find_production_by_key(tip, before_key);
+  if (before_pid == no_production) {
+    throw std::runtime_error(
+        std::string{context} + ": before production " +
+        rank3_detail::production_key_to_string(before_key) +
+        " is absent from the tip grammar; nothing to rewrite");
+  }
+  result.before_tip_production = before_pid;
+
+  if (tip.productions[before_pid].children.size() != 2) {
+    throw std::runtime_error(
+        polytomy_direct_mutation_not_implemented_message(
+            context, "non-binary (polytomy) before production " +
+                         std::to_string(before_pid)));
+  }
+
+  result.after_already_present =
+      rank3_detail::has_production_key(tip, result.after_key);
+
+  auto tip_lookup = chart_spr_detail::build_clade_lookup(tip);
+
+  std::vector<clade_key> temp_clades;
+  std::vector<overlay_grammar_production> temp_productions;
+  std::map<std::vector<taxon_id>, overlay_clade_ref> assigned_temp;
+
+  option_c_detail::option_c_overlay_subtree_resolver resolver{
+      tip, tip_lookup, temp_clades, temp_productions, assigned_temp, context};
+
+  // Resolve the two top-level after subtrees; their roots are the after
+  // production's children.
+  std::vector<overlay_clade_ref> root_children;
+  root_children.reserve(after.children.size());
+  for (auto const& child : after.children) {
+    root_children.push_back(resolver.resolve(child));
+  }
+
+  // Root after production: parent is the before production's parent clade
+  // (present in the tip by definition).  `ignore_base_pid = before_pid` so the
+  // after production is re-added even if its partition matches the about-to-be-
+  // tombstoned before production's slot (it cannot match the before production
+  // itself unless after == before, which is degenerate but still correctly
+  // handled: tombstone before, add after-as-temp).
+  auto root_parent = base_clade_ref(tip.productions[before_pid].parent);
+  bool root_in_tip = option_c_detail::tip_has_matching_production(
+      tip, root_parent, root_children, before_pid);
+  bool root_in_temp = option_c_detail::temp_already_has_production(
+      temp_productions, root_parent, root_children);
+  if (!root_in_tip && !root_in_temp) {
+    overlay_grammar_production root_prod;
+    root_prod.parent = root_parent;
+    root_prod.children = root_children;
+    std::sort(root_prod.children.begin(), root_prod.children.end());
+    root_prod.multiplicity = 1;
+    temp_productions.push_back(std::move(root_prod));
+  }
+
+  // Assemble the delta and populate its derived index, mirroring
+  // `build_spr_overlay_delta` exactly so the result is a fully-valid
+  // spr_overlay_delta (not only committable through the chain).
+  spr_overlay_delta& delta = result.delta;
+  delta.base = &tip;
+  delta.candidate = nullptr;
+  delta.temp_clades = std::move(temp_clades);
+  delta.temp_productions = std::move(temp_productions);
+  delta.removed_base_productions = {before_pid};
+  delta.root = base_clade_ref(tip.root_clade);
+
+  auto taxon_count = tip.taxa.id_to_sample_id.size();
+  for (std::size_t i = 0; i < delta.temp_clades.size(); ++i) {
+    chart_spr_detail::validate_clade_key(
+        delta.temp_clades[i], taxon_count,
+        "option C overlay delta temp clade " + std::to_string(i));
+  }
+
+  delta.removed_base_production.assign(tip.productions.size(), false);
+  delta.removed_base_production[before_pid] = true;
+
+  chart_spr_search_detail::build_overlay_delta_temp_indices(delta);
+  chart_spr_search_detail::compute_overlay_delta_reachability(delta,
+                                                               score_options);
+  chart_spr_search_detail::compute_overlay_delta_affected_order(delta);
   return result;
 }
 
