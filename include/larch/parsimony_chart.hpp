@@ -168,45 +168,15 @@ inline std::array<chart_cost, nuc_state_count> make_inf_row() {
 inline void validate_binary_production_partition(clade_grammar const& grammar,
                                                  grammar_production const& prod,
                                                  production_id pid) {
-  if (prod.parent == no_clade || prod.parent >= grammar.clades.size())
+  if (prod.children.size() != 2) {
     throw std::runtime_error(
-        "single-site chart: production parent clade out of range");
-
-  auto const& parent_taxa = grammar.clades[prod.parent].taxa;
-  std::vector<taxon_id> covered;
-  for (auto child : prod.children) {
-    if (child == no_clade || child >= grammar.clades.size())
-      throw std::runtime_error(
-          "single-site chart: production child clade out of range");
-
-    auto const& child_taxa = grammar.clades[child].taxa;
-    if (!std::includes(parent_taxa.begin(), parent_taxa.end(),
-                       child_taxa.begin(), child_taxa.end())) {
-      throw std::runtime_error(
-          "single-site chart: production " + std::to_string(pid) +
-          " child clade is not a subset of its parent clade");
-    }
-
-    std::vector<taxon_id> overlap;
-    std::set_intersection(covered.begin(), covered.end(), child_taxa.begin(),
-                          child_taxa.end(), std::back_inserter(overlap));
-    if (!overlap.empty()) {
-      throw std::runtime_error("single-site chart: production " +
-                               std::to_string(pid) +
-                               " children are not pairwise disjoint");
-    }
-
-    std::vector<taxon_id> next;
-    std::set_union(covered.begin(), covered.end(), child_taxa.begin(),
-                   child_taxa.end(), std::back_inserter(next));
-    covered = std::move(next);
+        "single-site chart: production " + std::to_string(pid) +
+        " has arity " + std::to_string(prod.children.size()) +
+        "; binary partition validation requires arity 2");
   }
-
-  if (covered != parent_taxa) {
-    throw std::runtime_error("single-site chart: production " +
-                             std::to_string(pid) +
-                             " children do not union to the parent clade");
-  }
+  larch::detail::validate_production_partition(
+      grammar, prod.parent, prod.children,
+      "single-site chart: production " + std::to_string(pid));
 }
 
 inline void validate_chart_grammar(clade_grammar const& grammar) {

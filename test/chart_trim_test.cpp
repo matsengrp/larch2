@@ -316,22 +316,24 @@ static row_t brute_leaf_row(std::uint8_t observed) {
   return row;
 }
 
-static row_t brute_combine_binary(row_t const& left, row_t const& right) {
+static row_t brute_combine_multifurcation(std::vector<row_t> const& children) {
+  CHECK(!children.empty());
   auto row = brute_inf_row();
   for (std::uint8_t parent_state = 0; parent_state < larch::nuc_state_count;
        ++parent_state) {
-    larch::chart_cost best_left = larch::chart_inf;
-    larch::chart_cost best_right = larch::chart_inf;
-    for (std::uint8_t child_state = 0; child_state < larch::nuc_state_count;
-         ++child_state) {
-      best_left = std::min(
-          best_left,
-          brute_add(left[child_state], parent_state == child_state ? 0 : 1));
-      best_right = std::min(
-          best_right,
-          brute_add(right[child_state], parent_state == child_state ? 0 : 1));
+    larch::chart_cost total = 0;
+    for (auto const& child : children) {
+      larch::chart_cost best_child = larch::chart_inf;
+      for (std::uint8_t child_state = 0; child_state < larch::nuc_state_count;
+           ++child_state) {
+        best_child = std::min(
+            best_child,
+            brute_add(child[child_state],
+                      parent_state == child_state ? 0 : 1));
+      }
+      total = brute_add(total, best_child);
     }
-    row[parent_state] = brute_add(best_left, best_right);
+    row[parent_state] = total;
   }
   return row;
 }
@@ -361,42 +363,59 @@ static std::vector<brute_topology> brute_enumerate_topologies(
 
   for (auto pid : grammar.productions_by_parent[clade]) {
     auto const& prod = grammar.productions[pid];
-    CHECK(prod.children.size() == 2);
-    auto lefts = brute_enumerate_topologies(grammar, states, prod.children[0]);
-    auto rights = brute_enumerate_topologies(grammar, states, prod.children[1]);
-    for (auto const& left : lefts) {
-      for (auto const& right : rights) {
+    CHECK(prod.children.size() >= 2);
+
+    std::vector<std::vector<brute_topology>> child_topologies;
+    child_topologies.reserve(prod.children.size());
+    for (auto child : prod.children) {
+      child_topologies.push_back(
+          brute_enumerate_topologies(grammar, states, child));
+      CHECK(!child_topologies.back().empty());
+    }
+
+    std::vector<brute_topology const*> selected(prod.children.size(), nullptr);
+    auto enumerate_product = [&](auto&& self, std::size_t child_i) -> void {
+      if (child_i == child_topologies.size()) {
         brute_topology topo;
         topo.inside_by_clade.assign(grammar.clades.size(), brute_inf_row());
         topo.selected_prod_by_clade.assign(grammar.clades.size(),
                                            larch::no_production);
         topo.used_production.assign(grammar.productions.size(), false);
 
-        for (std::size_t cid = 0; cid < grammar.clades.size(); ++cid) {
-          if (left.inside_by_clade[cid] != brute_inf_row())
-            topo.inside_by_clade[cid] = left.inside_by_clade[cid];
-          if (right.inside_by_clade[cid] != brute_inf_row())
-            topo.inside_by_clade[cid] = right.inside_by_clade[cid];
-          if (left.selected_prod_by_clade[cid] != larch::no_production)
-            topo.selected_prod_by_clade[cid] = left.selected_prod_by_clade[cid];
-          if (right.selected_prod_by_clade[cid] != larch::no_production)
-            topo.selected_prod_by_clade[cid] =
-                right.selected_prod_by_clade[cid];
-        }
-        for (std::size_t i = 0; i < grammar.productions.size(); ++i) {
-          topo.used_production[i] =
-              left.used_production[i] || right.used_production[i];
+        for (auto const* child_topo : selected) {
+          CHECK(child_topo != nullptr);
+          for (std::size_t cid = 0; cid < grammar.clades.size(); ++cid) {
+            if (child_topo->inside_by_clade[cid] != brute_inf_row())
+              topo.inside_by_clade[cid] = child_topo->inside_by_clade[cid];
+            if (child_topo->selected_prod_by_clade[cid] !=
+                larch::no_production)
+              topo.selected_prod_by_clade[cid] =
+                  child_topo->selected_prod_by_clade[cid];
+          }
+          for (std::size_t i = 0; i < grammar.productions.size(); ++i)
+            topo.used_production[i] =
+                topo.used_production[i] || child_topo->used_production[i];
         }
 
         topo.selected_prod_by_clade[clade] = pid;
         topo.used_production[pid] = true;
+        std::vector<row_t> child_rows;
+        child_rows.reserve(prod.children.size());
+        for (auto child : prod.children)
+          child_rows.push_back(topo.inside_by_clade[child]);
         topo.inside_by_clade[clade] =
-            brute_combine_binary(topo.inside_by_clade[prod.children[0]],
-                                 topo.inside_by_clade[prod.children[1]]);
+            brute_combine_multifurcation(child_rows);
         result.push_back(std::move(topo));
         CHECK(result.size() < 10000);
+        return;
       }
-    }
+
+      for (auto const& child_topo : child_topologies[child_i]) {
+        selected[child_i] = &child_topo;
+        self(self, child_i + 1);
+      }
+    };
+    enumerate_product(enumerate_product, 0);
   }
   return result;
 }
@@ -429,28 +448,33 @@ static std::vector<row_t> brute_topology_outside(
     auto pid = topo.selected_prod_by_clade[parent];
     if (pid == larch::no_production) continue;
     auto const& prod = grammar.productions[pid];
-    CHECK(prod.children.size() == 2);
-    std::array<larch::clade_id, 2> children{prod.children[0], prod.children[1]};
+    CHECK(prod.children.size() >= 2);
 
     for (std::uint8_t parent_state = 0; parent_state < larch::nuc_state_count;
          ++parent_state) {
       auto base = outside[parent][parent_state];
       if (base >= larch::chart_inf) continue;
-      for (std::size_t child_i = 0; child_i < 2; ++child_i) {
-        auto child = children[child_i];
-        auto sibling = children[1 - child_i];
-        larch::chart_cost sibling_best = larch::chart_inf;
-        for (std::uint8_t sibling_state = 0;
-             sibling_state < larch::nuc_state_count; ++sibling_state) {
-          sibling_best =
-              std::min(sibling_best,
-                       brute_add(topo.inside_by_clade[sibling][sibling_state],
-                                 parent_state == sibling_state ? 0 : 1));
+      for (std::size_t child_i = 0; child_i < prod.children.size(); ++child_i) {
+        auto child = prod.children[child_i];
+        larch::chart_cost cochild_total = 0;
+        for (std::size_t sibling_i = 0; sibling_i < prod.children.size();
+             ++sibling_i) {
+          if (sibling_i == child_i) continue;
+          auto sibling = prod.children[sibling_i];
+          larch::chart_cost sibling_best = larch::chart_inf;
+          for (std::uint8_t sibling_state = 0;
+               sibling_state < larch::nuc_state_count; ++sibling_state) {
+            sibling_best =
+                std::min(sibling_best,
+                         brute_add(topo.inside_by_clade[sibling][sibling_state],
+                                   parent_state == sibling_state ? 0 : 1));
+          }
+          cochild_total = brute_add(cochild_total, sibling_best);
         }
         for (std::uint8_t child_state = 0; child_state < larch::nuc_state_count;
              ++child_state) {
           auto candidate =
-              brute_add(brute_add(base, sibling_best),
+              brute_add(brute_add(base, cochild_total),
                         parent_state == child_state ? larch::chart_cost{0}
                                                     : larch::chart_cost{1});
           outside[child][child_state] =

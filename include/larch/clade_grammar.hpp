@@ -514,27 +514,39 @@ inline std::string taxon_id_vector_to_string(std::vector<taxon_id> const& ids) {
   return out.str();
 }
 
-inline void validate_child_clade_partition(clade_grammar const& grammar,
-                                           clade_id parent,
-                                           std::vector<clade_id> const& children,
-                                           std::size_t node_idx) {
+inline void validate_production_partition(clade_grammar const& grammar,
+                                          clade_id parent,
+                                          std::vector<clade_id> const& children,
+                                          std::string_view context) {
+  auto prefix = std::string{context};
   if (parent == no_clade || parent >= grammar.clades.size())
-    throw std::runtime_error("clade grammar: partition check parent out of range");
+    throw std::runtime_error(prefix + ": partition parent out of range");
+  if (children.empty())
+    throw std::runtime_error(prefix + ": production has no children");
 
+  auto const& parent_taxa = grammar.clades[parent].taxa;
   std::vector<taxon_id> covered;
   for (auto child : children) {
     if (child == no_clade || child >= grammar.clades.size())
-      throw std::runtime_error("clade grammar: partition check child out of range");
+      throw std::runtime_error(prefix + ": partition child out of range");
 
     auto const& child_taxa = grammar.clades[child].taxa;
+    if (child_taxa.empty())
+      throw std::runtime_error(prefix + ": child clade is empty");
+    if (!std::includes(parent_taxa.begin(), parent_taxa.end(),
+                       child_taxa.begin(), child_taxa.end())) {
+      throw std::runtime_error(prefix +
+                               ": child clade is not a subset of the parent");
+    }
+
     std::vector<taxon_id> overlap;
     std::set_intersection(covered.begin(), covered.end(), child_taxa.begin(),
                           child_taxa.end(), std::back_inserter(overlap));
     if (!overlap.empty()) {
-      throw std::runtime_error(
-          "clade grammar: node " + std::to_string(node_idx) +
-          " production children are not pairwise disjoint; overlapping taxa " +
-          taxon_id_vector_to_string(overlap));
+      throw std::runtime_error(prefix +
+                               ": children are not pairwise disjoint; "
+                               "overlapping taxa " +
+                               taxon_id_vector_to_string(overlap));
     }
 
     std::vector<taxon_id> next;
@@ -543,14 +555,21 @@ inline void validate_child_clade_partition(clade_grammar const& grammar,
     covered = std::move(next);
   }
 
-  auto const& parent_taxa = grammar.clades[parent].taxa;
   if (covered != parent_taxa) {
     throw std::runtime_error(
-        "clade grammar: node " + std::to_string(node_idx) +
-        " production children do not union to parent clade; covered " +
+        prefix + ": children do not union to parent clade; covered " +
         taxon_id_vector_to_string(covered) + " parent " +
         taxon_id_vector_to_string(parent_taxa));
   }
+}
+
+inline void validate_child_clade_partition(clade_grammar const& grammar,
+                                           clade_id parent,
+                                           std::vector<clade_id> const& children,
+                                           std::size_t node_idx) {
+  validate_production_partition(
+      grammar, parent, children,
+      "clade grammar: node " + std::to_string(node_idx) + " production");
 }
 
 inline bool is_root_passthrough_node(phylo_dag& dag, std::size_t node_idx) {
@@ -945,4 +964,3 @@ inline std::ostream& print_clade_grammar_audit(
 }
 
 }  // namespace larch
-
