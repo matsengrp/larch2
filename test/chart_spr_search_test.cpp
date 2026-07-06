@@ -8,7 +8,10 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <map>
+#include <optional>
 #include <print>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -62,6 +65,24 @@ static larch::test::tiny_tree_node six_taxon_paired_misplaced_tree() {
                                              tiny_leaf("E", "C")}),
                    tiny_inner("CF", "A", {tiny_leaf("C", "A"),
                                              tiny_leaf("F", "C")})})});
+}
+
+static larch::test::tiny_tree_node phase5_arity3_selected_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "AA",
+      {tiny_leaf("A", "AA"), tiny_leaf("B", "AC"),
+       tiny_inner("CD", "CA", {tiny_leaf("C", "CA"),
+                                  tiny_leaf("D", "CC")})});
+}
+
+static larch::test::tiny_tree_node phase5_arity4_selected_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner("root", "AA",
+                    {tiny_leaf("A", "AA"), tiny_leaf("B", "AC"),
+                     tiny_leaf("C", "CA"), tiny_leaf("D", "CC")});
 }
 
 struct tiny_chart_spr_fixture {
@@ -217,6 +238,129 @@ static larch::overlay_grammar_production temp_prod(
   prod.children = std::move(children);
   prod.multiplicity = 1;
   return prod;
+}
+
+static std::vector<larch::overlay_production_ref> all_base_production_refs(
+    larch::clade_grammar const& grammar) {
+  std::vector<larch::overlay_production_ref> refs;
+  refs.reserve(grammar.productions.size());
+  for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
+    refs.push_back(larch::base_production_ref(
+        static_cast<larch::production_id>(pid)));
+  }
+  return refs;
+}
+
+static std::size_t max_production_arity(
+    larch::clade_grammar const& grammar) {
+  std::size_t max_arity = 0;
+  for (auto const& prod : grammar.productions) {
+    max_arity = std::max(max_arity, prod.children.size());
+  }
+  return max_arity;
+}
+
+static larch::chart_cost phase5_brute_add(larch::chart_cost lhs,
+                                           larch::chart_cost rhs) {
+  if (lhs >= larch::chart_inf || rhs >= larch::chart_inf) {
+    return larch::chart_inf;
+  }
+  if (lhs > larch::chart_inf - rhs) return larch::chart_inf;
+  return lhs + rhs;
+}
+
+static larch::chart_multisite_detail::chart_row phase5_brute_inf_row() {
+  auto row = larch::chart_multisite_detail::chart_row{};
+  row.fill(larch::chart_inf);
+  return row;
+}
+
+static larch::chart_multisite_detail::chart_row
+phase5_brute_combine_rows(
+    std::vector<larch::chart_multisite_detail::chart_row> const& children) {
+  CHECK(!children.empty());
+  auto row = phase5_brute_inf_row();
+  for (std::uint8_t parent_state = 0; parent_state < larch::nuc_state_count;
+       ++parent_state) {
+    larch::chart_cost total = 0;
+    for (auto const& child : children) {
+      larch::chart_cost best_child = larch::chart_inf;
+      for (std::uint8_t child_state = 0; child_state < larch::nuc_state_count;
+           ++child_state) {
+        auto term = phase5_brute_add(
+            child[child_state],
+            larch::parsimony_chart_detail::transition_cost(parent_state,
+                                                           child_state));
+        best_child = std::min(best_child, term);
+      }
+      total = phase5_brute_add(total, best_child);
+    }
+    row[parent_state] = total;
+  }
+  return row;
+}
+
+static larch::chart_multisite_detail::chart_row
+phase5_brute_selected_topology_row_impl(
+    larch::clade_grammar const& grammar, larch::site_pattern const& pattern,
+    larch::grammar_topology const& topology, larch::clade_id clade,
+    std::vector<std::optional<larch::chart_multisite_detail::chart_row>>&
+        memo) {
+  if (memo[clade].has_value()) return *memo[clade];
+
+  auto row = phase5_brute_inf_row();
+  auto const& key = grammar.clades[clade];
+  if (key.taxa.size() == 1) {
+    auto taxon = key.taxa.front();
+    CHECK(taxon < pattern.state_by_taxon.size());
+    auto observed = pattern.state_by_taxon[taxon];
+    larch::parsimony_chart_detail::validate_state(
+        observed, "phase5 brute selected topology leaf");
+    row[observed] = 0;
+  } else {
+    auto pid = topology.selected_production_by_clade[clade];
+    CHECK(pid != larch::no_production);
+    CHECK(pid < grammar.productions.size());
+    auto const& prod = grammar.productions[pid];
+    CHECK(prod.parent == clade);
+    CHECK(prod.children.size() >= 2);
+    std::vector<larch::chart_multisite_detail::chart_row> child_rows;
+    child_rows.reserve(prod.children.size());
+    for (auto child : prod.children) {
+      child_rows.push_back(phase5_brute_selected_topology_row_impl(
+          grammar, pattern, topology, child, memo));
+    }
+    row = phase5_brute_combine_rows(child_rows);
+  }
+
+  memo[clade] = row;
+  return row;
+}
+
+static larch::chart_multisite_detail::chart_row
+phase5_brute_selected_topology_row(
+    larch::clade_grammar const& grammar, larch::site_pattern const& pattern,
+    larch::grammar_topology const& topology) {
+  std::vector<std::optional<larch::chart_multisite_detail::chart_row>> memo(
+      grammar.clades.size());
+  return phase5_brute_selected_topology_row_impl(
+      grammar, pattern, topology, grammar.root_clade, memo);
+}
+
+static larch::chart_spr_search_state make_phase5_direct_state(
+    larch::phylo_dag& dag, larch::clade_grammar grammar) {
+  auto active_build = larch::make_active_search_patterns(dag, grammar);
+  CHECK(!active_build.active_patterns.patterns.patterns.empty());
+  larch::chart_spr_search_state state;
+  state.dag = &dag;
+  state.grammar = std::move(grammar);
+  state.active_patterns = std::move(active_build.active_patterns);
+  state.pattern_source_fingerprint =
+      std::move(active_build.pattern_source_fingerprint);
+  state.invariant_constant_offset = active_build.invariant_constant_offset;
+  state.skipped_invariant_site_count =
+      active_build.skipped_invariant_site_count;
+  return state;
 }
 
 static void clear_optional_candidate_metadata(
@@ -1757,6 +1901,159 @@ static void test_phase8_per_pattern_oracle_catches_independent_moved_state() {
       search.counters.fixed_topology_independent_sm_bug_perturbations_for_tests;
   CHECK(perturbations == 0);
   CHECK(search.counters.overlay_materializations_for_exact_verification == 0);
+
+  std::println("  PASS");
+}
+
+static void test_phase5_combine_rows_binary_regression() {
+  std::println("test_phase5_combine_rows_binary_regression");
+
+  larch::chart_multisite_detail::chart_row left{
+      larch::chart_cost{0}, larch::chart_cost{2}, larch::chart_cost{5},
+      larch::chart_inf};
+  larch::chart_multisite_detail::chart_row right{
+      larch::chart_cost{3}, larch::chart_cost{0}, larch::chart_cost{4},
+      larch::chart_cost{6}};
+  std::array<larch::chart_multisite_detail::chart_row, 2> children{left,
+                                                                   right};
+  auto variadic = larch::chart_multisite_detail::combine_rows(
+      std::span<larch::chart_multisite_detail::chart_row const>{
+          children.data(), children.size()});
+  auto binary = larch::chart_multisite_detail::combine_binary_rows(left,
+                                                                   right);
+  CHECK(variadic == binary);
+
+  std::println("  PASS");
+}
+
+static void phase5_check_selected_topology_fixture(
+    larch::test::tiny_tree_node const& tree, std::size_t expected_max_arity) {
+  auto dag = larch::test::make_tiny_labelled_tree("AA", tree);
+  larch::clade_grammar_options gopts;
+  gopts.allow_polytomies = true;
+  auto grammar = larch::build_clade_grammar(dag, gopts);
+  CHECK(max_production_arity(grammar) == expected_max_arity);
+
+  auto refs = all_base_production_refs(grammar);
+  larch::grammar_spr_candidate candidate;
+  auto topology_ids = std::vector<larch::production_id>{};
+  topology_ids.reserve(grammar.productions.size());
+  for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
+    topology_ids.push_back(static_cast<larch::production_id>(pid));
+  }
+  auto topology = larch::grammar_topology_from_productions(grammar,
+                                                           topology_ids);
+
+  auto state = make_phase5_direct_state(dag, grammar);
+  larch::chart_spr_candidate_score scored;
+  scored.candidate = candidate;
+  scored.topology_selection.kind =
+      larch::chart_spr_topology_selection_kind::explicit_certificate;
+  scored.topology_selection.certificate =
+      larch::make_chart_spr_topology_certificate(grammar, candidate, refs,
+                                                 refs);
+
+  auto selected = larch::chart_spr_overlay_selected_production_by_parent(
+      grammar, candidate, refs);
+  auto const& active = state.active_patterns.patterns.patterns;
+  std::vector<std::uint64_t> brute_scores;
+  brute_scores.reserve(active.size());
+  std::uint64_t brute_active_total = 0;
+  for (auto const& pattern : active) {
+    auto brute_row = phase5_brute_selected_topology_row(grammar, pattern,
+                                                        topology);
+    auto direct_row = larch::chart_spr_restricted_overlay_topology_row(
+        grammar, candidate, pattern, selected);
+    auto selected_row = larch::chart_multisite_detail::restricted_topology_row(
+        grammar, pattern, topology);
+    CHECK(direct_row == brute_row);
+    CHECK(selected_row == brute_row);
+    auto brute_score = larch::chart_spr_weighted_root_score_from_row(
+        brute_row, pattern, state.chart_opts);
+    brute_scores.push_back(brute_score);
+    brute_active_total = larch::chart_multisite_detail::checked_add_u64(
+        brute_active_total, brute_score, "phase5 brute active total");
+  }
+
+  auto cache_scores =
+      larch::fixed_topology_selected_cache_pattern_scores_for_tests(state,
+                                                                    scored);
+  CHECK(cache_scores.old_pattern_scores == brute_scores);
+  CHECK(cache_scores.new_pattern_scores == brute_scores);
+  CHECK(cache_scores.old_active_total == brute_active_total);
+  CHECK(cache_scores.new_active_total == brute_active_total);
+
+  auto verified = larch::verify_candidate_fixed_topology_exact(state, scored);
+  CHECK(verified.valid);
+  CHECK(verified.exact.has_value());
+  CHECK(verified.exact->kind ==
+        larch::chart_spr_score_kind::fixed_topology_exact);
+
+  auto selected_full = larch::chart_multisite_detail::checked_add_u64(
+      brute_active_total, state.invariant_constant_offset,
+      "phase5 selected topology invariant offset");
+  CHECK(verified.exact->value.old_score == selected_full);
+  CHECK(verified.exact->value.new_score == selected_full);
+  CHECK(state.counters.selected_topology_multifurcation_rows >=
+        active.size());
+}
+
+static void test_phase5_multifurcation_selected_topology_rows() {
+  std::println("test_phase5_multifurcation_selected_topology_rows");
+
+  phase5_check_selected_topology_fixture(phase5_arity3_selected_tree(), 3);
+  phase5_check_selected_topology_fixture(phase5_arity4_selected_tree(), 4);
+
+  std::println("  PASS");
+}
+
+static void
+test_phase5_multifurcation_outside_rows_exercise_shared_state_guard() {
+  std::println(
+      "test_phase5_multifurcation_outside_rows_exercise_shared_state_guard");
+
+  auto inf = larch::chart_inf;
+  larch::chart_multisite_detail::chart_row moved_context{1, 1, inf, inf};
+  larch::chart_multisite_detail::chart_row a_context{0, inf, inf, inf};
+  larch::chart_multisite_detail::chart_row c_context{inf, 0, inf, inf};
+  larch::chart_multisite_detail::chart_row parent_outside{};
+  parent_outside.fill(0);
+
+  auto detach_rows = larch::chart_spr_selected_overlay_child_outside_rows(
+      parent_outside, {moved_context, a_context, a_context});
+  auto reattach_rows = larch::chart_spr_selected_overlay_child_outside_rows(
+      parent_outside, {moved_context, c_context, c_context});
+  CHECK(detach_rows.size() == 3);
+  CHECK(reattach_rows.size() == 3);
+  CHECK(detach_rows[0][larch::nuc_base::A] == 0);
+  CHECK(detach_rows[0][larch::nuc_base::C] == 1);
+  CHECK(reattach_rows[0][larch::nuc_base::A] == 1);
+  CHECK(reattach_rows[0][larch::nuc_base::C] == 0);
+
+  // The rows above prove the selected-outside context builder accepts k-ary
+  // productions.  The adversarial context below is the shared-s_M guard: a
+  // scorer that minimizes detach and reattach states independently would
+  // under-count the same moved-subtree root state.
+  larch::chart_multisite_detail::chart_row moved{0, 0, inf, inf};
+  larch::chart_multisite_detail::chart_row detach{0, 10, inf, inf};
+  larch::chart_multisite_detail::chart_row reattach{10, 0, inf, inf};
+  auto shared = inf;
+  auto detach_only = inf;
+  auto reattach_only = inf;
+  for (std::uint8_t state = 0; state < larch::nuc_state_count; ++state) {
+    shared = std::min(
+        shared, larch::chart_trim_detail::add3(
+                    moved[state], detach[state], reattach[state]));
+    detach_only = std::min(
+        detach_only, larch::parsimony_chart_detail::saturated_add(
+                         moved[state], detach[state]));
+    reattach_only = std::min(
+        reattach_only, larch::parsimony_chart_detail::saturated_add(
+                           moved[state], reattach[state]));
+  }
+  auto independent = larch::parsimony_chart_detail::saturated_add(
+      detach_only, reattach_only);
+  CHECK(independent < shared);
 
   std::println("  PASS");
 }
@@ -3901,6 +4198,9 @@ int main() {
   test_phase8_persistent_cache_local_commit_matches_materialized();
   test_phase8_persistent_cache_dag_verification_has_no_fallback();
   test_phase8_per_pattern_oracle_catches_independent_moved_state();
+  test_phase5_combine_rows_binary_regression();
+  test_phase5_multifurcation_selected_topology_rows();
+  test_phase5_multifurcation_outside_rows_exercise_shared_state_guard();
   test_phase8_persistent_cache_invariant_failure_is_hard_error();
   test_phase8_persistent_verifier_materialized_oracle_all_move_classes();
   test_phase8_oracle_mismatch_uses_materialized_oracle_result();

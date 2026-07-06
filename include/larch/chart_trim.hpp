@@ -12,6 +12,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -997,30 +998,37 @@ inline chart_row make_inf_row() {
   return row;
 }
 
-inline chart_row combine_binary_rows(chart_row const& left,
-                                     chart_row const& right) {
+inline chart_row combine_rows(std::span<chart_row const> children) {
+  if (children.empty()) {
+    throw std::runtime_error(
+        "multi-site trim: selected topology row combine has no children");
+  }
   chart_row row = make_inf_row();
   for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
        ++parent_state) {
-    chart_cost best_left = chart_inf;
-    chart_cost best_right = chart_inf;
-    for (std::uint8_t child_state = 0; child_state < nuc_state_count;
-         ++child_state) {
-      best_left = std::min(
-          best_left,
-          parsimony_chart_detail::saturated_add(
-              left[child_state], parsimony_chart_detail::transition_cost(
-                                     parent_state, child_state)));
-      best_right = std::min(
-          best_right,
-          parsimony_chart_detail::saturated_add(
-              right[child_state], parsimony_chart_detail::transition_cost(
-                                      parent_state, child_state)));
+    chart_cost total = 0;
+    for (auto const& child : children) {
+      chart_cost best_child = chart_inf;
+      for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+           ++child_state) {
+        best_child = std::min(
+            best_child,
+            parsimony_chart_detail::saturated_add(
+                child[child_state], parsimony_chart_detail::transition_cost(
+                                        parent_state, child_state)));
+      }
+      total = parsimony_chart_detail::saturated_add(total, best_child);
     }
-    row[parent_state] =
-        parsimony_chart_detail::saturated_add(best_left, best_right);
+    row[parent_state] = total;
   }
   return row;
+}
+
+inline chart_row combine_binary_rows(chart_row const& left,
+                                     chart_row const& right) {
+  std::array<chart_row, 2> children{left, right};
+  return combine_rows(
+      std::span<chart_row const>{children.data(), children.size()});
 }
 
 inline void merge_used_productions(std::vector<bool>& dst,
@@ -1648,12 +1656,16 @@ inline chart_row restricted_topology_row_impl(
       throw std::runtime_error(
           "multi-site trim: selected production parent mismatch");
     }
-    chart_trim_detail::validate_binary_production_for_trim(grammar, prod, pid);
-    auto left = restricted_topology_row_impl(grammar, pattern, topo,
-                                             prod.children[0], memo);
-    auto right = restricted_topology_row_impl(grammar, pattern, topo,
-                                              prod.children[1], memo);
-    row = combine_binary_rows(left, right);
+    parsimony_chart_detail::validate_production_inside_row_inputs(
+        grammar, prod, pid, "multi-site trim selected topology");
+    std::vector<chart_row> child_rows;
+    child_rows.reserve(prod.children.size());
+    for (auto child : prod.children) {
+      child_rows.push_back(
+          restricted_topology_row_impl(grammar, pattern, topo, child, memo));
+    }
+    row = combine_rows(
+        std::span<chart_row const>{child_rows.data(), child_rows.size()});
   }
 
   memo[clade] = row;

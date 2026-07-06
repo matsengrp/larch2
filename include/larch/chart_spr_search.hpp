@@ -15,6 +15,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -131,6 +132,7 @@ struct chart_spr_search_counters {
   std::size_t fixed_topology_selected_cache_hits = 0;
   std::size_t fixed_topology_selected_cache_misses = 0;
   std::size_t fixed_topology_selected_rows_computed = 0;
+  std::size_t selected_topology_multifurcation_rows = 0;
   // Persistent-cache fixed_topology_exact verifier diagnostics.  A nonzero
   // fallback count means the production path could not serve the selected
   // topology from the persistent fixed-topology cache and had to use the
@@ -736,6 +738,7 @@ struct chart_spr_search_summary {
   std::size_t fixed_topology_selected_cache_hits = 0;
   std::size_t fixed_topology_selected_cache_misses = 0;
   std::size_t fixed_topology_selected_rows_computed = 0;
+  std::size_t selected_topology_multifurcation_rows = 0;
   std::size_t fixed_topology_persistent_cache_verifications = 0;
   std::size_t fixed_topology_persistent_cache_fallbacks = 0;
   std::size_t fixed_topology_persistent_cache_oracle_mismatches = 0;
@@ -2334,6 +2337,8 @@ inline void add_chart_spr_search_counters(
       src.fixed_topology_selected_cache_misses;
   dst.fixed_topology_selected_rows_computed +=
       src.fixed_topology_selected_rows_computed;
+  dst.selected_topology_multifurcation_rows +=
+      src.selected_topology_multifurcation_rows;
   dst.fixed_topology_persistent_cache_verifications +=
       src.fixed_topology_persistent_cache_verifications;
   dst.fixed_topology_persistent_cache_fallbacks +=
@@ -3014,8 +3019,10 @@ inline void validate_chart_spr_selected_overlay_production_for_fixed_topology(
     overlay_production_ref ref, std::string const& context) {
   auto parent = chart_spr_overlay_production_parent(base, candidate, ref);
   auto children = chart_spr_overlay_production_children(base, candidate, ref);
-  if (children.size() != 2) {
-    throw std::runtime_error(context + ": selected production is not binary");
+  if (children.size() < 2) {
+    throw std::runtime_error(context +
+                             ": selected production has fewer than 2 "
+                             "children");
   }
 
   auto parent_taxa = chart_spr_clade_taxa_for_ref(base, candidate, parent);
@@ -3447,7 +3454,8 @@ chart_spr_restricted_overlay_topology_row_impl(
     std::vector<std::optional<std::array<chart_cost, nuc_state_count>>>&
         temp_memo,
     std::vector<std::uint8_t>& base_state,
-    std::vector<std::uint8_t>& temp_state) {
+    std::vector<std::uint8_t>& temp_state,
+    chart_spr_search_counters* counters = nullptr) {
   auto& state_slot = clade.space == overlay_id_space::base
                          ? base_state.at(clade.id)
                          : temp_state.at(clade.id);
@@ -3501,13 +3509,19 @@ chart_spr_restricted_overlay_topology_row_impl(
         "fixed_topology_exact cache scorer");
     auto children = chart_spr_overlay_production_children(base, candidate,
                                                           it->second);
-    auto left = chart_spr_restricted_overlay_topology_row_impl(
-        base, candidate, pattern, selected, children[0], base_memo, temp_memo,
-        base_state, temp_state);
-    auto right = chart_spr_restricted_overlay_topology_row_impl(
-        base, candidate, pattern, selected, children[1], base_memo, temp_memo,
-        base_state, temp_state);
-    row = chart_multisite_detail::combine_binary_rows(left, right);
+    if (children.size() != 2 && counters != nullptr) {
+      ++counters->selected_topology_multifurcation_rows;
+    }
+    std::vector<chart_multisite_detail::chart_row> child_rows;
+    child_rows.reserve(children.size());
+    for (auto child : children) {
+      child_rows.push_back(chart_spr_restricted_overlay_topology_row_impl(
+          base, candidate, pattern, selected, child, base_memo, temp_memo,
+          base_state, temp_state, counters));
+    }
+    row = chart_multisite_detail::combine_rows(
+        std::span<chart_multisite_detail::chart_row const>{
+            child_rows.data(), child_rows.size()});
   }
 
   memo_slot = row;
@@ -3519,7 +3533,8 @@ inline std::array<chart_cost, nuc_state_count>
 chart_spr_restricted_overlay_topology_row(
     clade_grammar const& base, grammar_spr_candidate const& candidate,
     site_pattern const& pattern,
-    std::map<overlay_clade_ref, overlay_production_ref> const& selected) {
+    std::map<overlay_clade_ref, overlay_production_ref> const& selected,
+    chart_spr_search_counters* counters = nullptr) {
   std::vector<std::optional<std::array<chart_cost, nuc_state_count>>> base_memo(
       base.clades.size());
   std::vector<std::optional<std::array<chart_cost, nuc_state_count>>> temp_memo(
@@ -3528,7 +3543,7 @@ chart_spr_restricted_overlay_topology_row(
   std::vector<std::uint8_t> temp_state(candidate.added_clades.size(), 0);
   return chart_spr_restricted_overlay_topology_row_impl(
       base, candidate, pattern, selected, base_clade_ref(base.root_clade),
-      base_memo, temp_memo, base_state, temp_state);
+      base_memo, temp_memo, base_state, temp_state, counters);
 }
 
 struct chart_spr_fixed_topology_pattern_scores {
@@ -3575,7 +3590,8 @@ fixed_topology_direct_selected_pattern_scores(
     auto old_row = chart_multisite_detail::restricted_topology_row(
         state.grammar, pattern, before_topology);
     auto new_row = chart_spr_restricted_overlay_topology_row(
-        state.grammar, candidate.candidate, pattern, selected_after);
+        state.grammar, candidate.candidate, pattern, selected_after,
+        &state.counters);
     auto old_score = chart_spr_weighted_root_score_from_row(
         old_row, pattern, state.chart_opts);
     auto new_score = chart_spr_weighted_root_score_from_row(
@@ -3590,6 +3606,74 @@ fixed_topology_direct_selected_pattern_scores(
         "fixed_topology_exact direct new active total");
   }
   return scores;
+}
+
+inline std::vector<std::array<chart_cost, nuc_state_count>>
+chart_spr_selected_overlay_child_outside_rows(
+    std::array<chart_cost, nuc_state_count> const& parent_outside,
+    std::vector<std::array<chart_cost, nuc_state_count>> const&
+        child_inside_rows) {
+  if (child_inside_rows.empty()) {
+    throw std::runtime_error(
+        "fixed_topology_exact selected outside scorer: selected production "
+        "has no children");
+  }
+  std::vector<std::array<chart_cost, nuc_state_count>> result(
+      child_inside_rows.size(), parsimony_chart_detail::make_inf_row());
+
+  for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+       ++parent_state) {
+    auto base_cost = parent_outside[parent_state];
+    if (base_cost >= chart_inf) continue;
+
+    std::vector<chart_cost> child_best(child_inside_rows.size(), chart_inf);
+    for (std::size_t child_i = 0; child_i < child_inside_rows.size();
+         ++child_i) {
+      auto const& child_inside = child_inside_rows[child_i];
+      for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+           ++child_state) {
+        child_best[child_i] = std::min(
+            child_best[child_i],
+            parsimony_chart_detail::saturated_add(
+                child_inside[child_state],
+                parsimony_chart_detail::transition_cost(parent_state,
+                                                        child_state)));
+      }
+    }
+
+    std::vector<chart_cost> prefix(child_inside_rows.size() + 1,
+                                   chart_cost{0});
+    std::vector<chart_cost> suffix(child_inside_rows.size() + 1,
+                                   chart_cost{0});
+    for (std::size_t child_i = 0; child_i < child_inside_rows.size();
+         ++child_i) {
+      prefix[child_i + 1] = parsimony_chart_detail::saturated_add(
+          prefix[child_i], child_best[child_i]);
+    }
+    for (std::size_t child_i = child_inside_rows.size(); child_i-- > 0;) {
+      suffix[child_i] = parsimony_chart_detail::saturated_add(
+          child_best[child_i], suffix[child_i + 1]);
+    }
+
+    for (std::size_t child_i = 0; child_i < child_inside_rows.size();
+         ++child_i) {
+      auto sibling_context = parsimony_chart_detail::saturated_add(
+          base_cost, parsimony_chart_detail::saturated_add(
+                         prefix[child_i], suffix[child_i + 1]));
+      if (sibling_context >= chart_inf) continue;
+      for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+           ++child_state) {
+        auto candidate = parsimony_chart_detail::saturated_add(
+            sibling_context,
+            parsimony_chart_detail::transition_cost(parent_state,
+                                                    child_state));
+        if (candidate < result[child_i][child_state]) {
+          result[child_i][child_state] = candidate;
+        }
+      }
+    }
+  }
+  return result;
 }
 
 // Legacy/conservative fixed-topology exact path.  This is the from-scratch
@@ -3612,6 +3696,11 @@ inline spr_score_result fixed_topology_delta_direct_selected_topology(
   return spr_score_result{chart_spr_detail::signed_delta(old_full, new_full),
                           old_full, new_full, true};
 }
+
+chart_spr_fixed_topology_pattern_scores
+fixed_topology_selected_cache_pattern_scores_for_tests(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate);
 
 inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
     chart_spr_search_state const& state, chart_spr_candidate_score candidate) {

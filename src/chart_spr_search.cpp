@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -878,10 +879,21 @@ std::string chart_spr_selected_topology_leaf_key(taxon_id taxon) {
   return "L" + std::to_string(taxon) + ";";
 }
 
-std::string chart_spr_selected_topology_internal_key(std::string left,
-                                                     std::string right) {
-  if (right < left) std::swap(left, right);
-  return "I(" + left + ")(" + right + ")";
+std::string chart_spr_selected_topology_internal_key(
+    std::vector<std::string> child_keys) {
+  if (child_keys.empty()) {
+    throw std::runtime_error(
+        "fixed_topology_exact selected-topology cache: internal key has no "
+        "children");
+  }
+  std::sort(child_keys.begin(), child_keys.end());
+  std::string key = "I";
+  for (auto const& child_key : child_keys) {
+    key += "(";
+    key += child_key;
+    key += ")";
+  }
+  return key;
 }
 
 std::map<overlay_clade_ref, overlay_production_ref>
@@ -968,7 +980,8 @@ chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
     return chart_spr_selected_topology_node{key, &it->second};
   };
   auto insert_new_node = [&](std::string key,
-                             chart_spr_selected_topology_cache_entry entry) {
+                             chart_spr_selected_topology_cache_entry entry,
+                             bool multifurcation_row = false) {
     if (entry.rows_by_pattern.size() != active.size()) {
       throw chart_spr_fixed_topology_cache_invariant_error(
           "fixed_topology_exact selected-topology cache: new row pattern "
@@ -977,6 +990,10 @@ chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
     ++state.counters.fixed_topology_selected_cache_misses;
     state.counters.fixed_topology_selected_rows_computed +=
         entry.rows_by_pattern.size();
+    if (multifurcation_row) {
+      state.counters.selected_topology_multifurcation_rows +=
+          entry.rows_by_pattern.size();
+    }
     auto [inserted, ok] = cache.rows_by_key.emplace(key, std::move(entry));
     if (!ok) {
       throw chart_spr_fixed_topology_cache_invariant_error(
@@ -1086,29 +1103,39 @@ chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
   auto children = chart_spr_overlay_production_children(state.grammar,
                                                         candidate,
                                                         it->second);
-  auto left = chart_spr_selected_topology_rows_for_clade(
-      cache, state, candidate, selected, children[0], active_refs,
-      persistent_icache);
-  auto right = chart_spr_selected_topology_rows_for_clade(
-      cache, state, candidate, selected, children[1], active_refs,
-      persistent_icache);
-  if (left.entry == nullptr || right.entry == nullptr) {
-    throw chart_spr_fixed_topology_cache_invariant_error(
-        "fixed_topology_exact selected-topology cache: child cache entry "
-        "missing");
+  std::vector<chart_spr_selected_topology_node> child_nodes;
+  child_nodes.reserve(children.size());
+  std::vector<std::string> child_keys;
+  child_keys.reserve(children.size());
+  for (auto child : children) {
+    child_nodes.push_back(chart_spr_selected_topology_rows_for_clade(
+        cache, state, candidate, selected, child, active_refs,
+        persistent_icache));
+    if (child_nodes.back().entry == nullptr) {
+      throw chart_spr_fixed_topology_cache_invariant_error(
+          "fixed_topology_exact selected-topology cache: child cache entry "
+          "missing");
+    }
+    child_keys.push_back(child_nodes.back().key);
   }
 
-  auto key = chart_spr_selected_topology_internal_key(left.key, right.key);
+  auto key = chart_spr_selected_topology_internal_key(std::move(child_keys));
   if (auto cached = try_cached_node(key)) return *cached;
   chart_spr_selected_topology_cache_entry entry;
   entry.rows_by_pattern.reserve(active.size());
   for (std::size_t p = 0; p < active.size(); ++p) {
-    entry.rows_by_pattern.push_back(
-        chart_multisite_detail::combine_binary_rows(
-            left.entry->rows_by_pattern[p], right.entry->rows_by_pattern[p]));
+    std::vector<chart_multisite_detail::chart_row> child_rows;
+    child_rows.reserve(child_nodes.size());
+    for (auto const& child_node : child_nodes) {
+      child_rows.push_back(child_node.entry->rows_by_pattern[p]);
+    }
+    entry.rows_by_pattern.push_back(chart_multisite_detail::combine_rows(
+        std::span<chart_multisite_detail::chart_row const>{
+            child_rows.data(), child_rows.size()}));
   }
   cross_check_persistent_icache(entry);
-  return insert_new_node(std::move(key), std::move(entry));
+  return insert_new_node(std::move(key), std::move(entry),
+                         children.size() != 2);
 }
 
 struct chart_spr_selected_topology_root_entries {
@@ -1346,33 +1373,25 @@ bool chart_spr_selected_overlay_outside_row_dfs(
       "fixed_topology_exact selected outside scorer");
   auto children = chart_spr_overlay_production_children(base, candidate,
                                                         it->second);
-  if (children.size() != 2) {
-    throw std::runtime_error(
-        "fixed_topology_exact selected outside scorer: selected production "
-        "is not binary");
+  std::vector<std::array<chart_cost, nuc_state_count>> child_inside_rows;
+  child_inside_rows.reserve(children.size());
+  for (auto child : children) {
+    child_inside_rows.push_back(chart_spr_restricted_overlay_topology_row_impl(
+        base, candidate, pattern, selected, child, base_inside_memo,
+        temp_inside_memo, base_inside_state, temp_inside_state));
   }
+  auto child_outside_rows = chart_spr_selected_overlay_child_outside_rows(
+      clade_outside, child_inside_rows);
 
-  auto left_inside = chart_spr_restricted_overlay_topology_row_impl(
-      base, candidate, pattern, selected, children[0], base_inside_memo,
-      temp_inside_memo, base_inside_state, temp_inside_state);
-  auto right_inside = chart_spr_restricted_overlay_topology_row_impl(
-      base, candidate, pattern, selected, children[1], base_inside_memo,
-      temp_inside_memo, base_inside_state, temp_inside_state);
-
-  auto left_outside = chart_spr_selected_overlay_child_outside_row(
-      clade_outside, right_inside);
-  if (chart_spr_selected_overlay_outside_row_dfs(
-          base, candidate, pattern, selected, children[0], target,
-          left_outside, base_inside_memo, temp_inside_memo, base_inside_state,
-          temp_inside_state, active, result)) {
-    return true;
+  for (std::size_t child_i = 0; child_i < children.size(); ++child_i) {
+    if (chart_spr_selected_overlay_outside_row_dfs(
+            base, candidate, pattern, selected, children[child_i], target,
+            child_outside_rows[child_i], base_inside_memo, temp_inside_memo,
+            base_inside_state, temp_inside_state, active, result)) {
+      return true;
+    }
   }
-  auto right_outside = chart_spr_selected_overlay_child_outside_row(
-      clade_outside, left_inside);
-  return chart_spr_selected_overlay_outside_row_dfs(
-      base, candidate, pattern, selected, children[1], target, right_outside,
-      base_inside_memo, temp_inside_memo, base_inside_state,
-      temp_inside_state, active, result);
+  return false;
 }
 
 std::array<chart_cost, nuc_state_count>
@@ -2651,6 +2670,8 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.fixed_topology_selected_cache_misses;
   summary.fixed_topology_selected_rows_computed =
       counters.fixed_topology_selected_rows_computed;
+  summary.selected_topology_multifurcation_rows =
+      counters.selected_topology_multifurcation_rows;
   summary.fixed_topology_persistent_cache_verifications =
       counters.fixed_topology_persistent_cache_verifications;
   summary.fixed_topology_persistent_cache_fallbacks =
@@ -2677,6 +2698,51 @@ void chart_spr_refresh_search_summary_from_counters(
 }
 
 }  // namespace
+
+chart_spr_fixed_topology_pattern_scores
+fixed_topology_selected_cache_pattern_scores_for_tests(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate) {
+  state.active_patterns.assert_no_skipped_invariant_metadata();
+  if (!candidate.topology_selection.certificate) {
+    throw std::runtime_error(
+        "fixed_topology_exact selected-topology cache test helper requires a "
+        "complete topology certificate");
+  }
+  auto const& certificate = *candidate.topology_selection.certificate;
+  validate_chart_spr_topology_certificate_signatures(
+      state.grammar, candidate.candidate, certificate);
+
+  chart_spr_selected_topology_row_cache cache;
+  chart_spr_persistent_inside_cache_view icache_view;
+  auto roots = chart_spr_selected_topology_root_entries_from_cache(
+      cache, state, candidate, icache_view);
+  if (roots.before == nullptr || roots.after == nullptr) {
+    throw chart_spr_fixed_topology_cache_invariant_error(
+        "fixed_topology_exact selected-topology cache test helper: root cache "
+        "entry missing");
+  }
+
+  chart_spr_fixed_topology_pattern_scores scores;
+  auto const& active = state.active_patterns.patterns.patterns;
+  scores.old_pattern_scores.reserve(active.size());
+  scores.new_pattern_scores.reserve(active.size());
+  for (std::size_t p = 0; p < active.size(); ++p) {
+    auto old_score = chart_spr_weighted_root_score_from_row(
+        roots.before->rows_by_pattern[p], active[p], state.chart_opts);
+    auto new_score = chart_spr_weighted_root_score_from_row(
+        roots.after->rows_by_pattern[p], active[p], state.chart_opts);
+    scores.old_pattern_scores.push_back(old_score);
+    scores.new_pattern_scores.push_back(new_score);
+    scores.old_active_total = chart_multisite_detail::checked_add_u64(
+        scores.old_active_total, old_score,
+        "fixed_topology_exact selected cache test old active total");
+    scores.new_active_total = chart_multisite_detail::checked_add_u64(
+        scores.new_active_total, new_score,
+        "fixed_topology_exact selected cache test new active total");
+  }
+  return scores;
+}
 
 chart_spr_search_result run_chart_spr_search(
     phylo_dag initial_dag, clade_grammar initial_grammar,
