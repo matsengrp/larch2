@@ -478,6 +478,93 @@ set_tests_properties(dagutil_chart_spr_search
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "search_mode: phase5_accept_reject_materialize_rebuild")
 
+# Phase 10 (cross-cutting CLI / report / identity surface).  A local-commit
+# run's emitted report must carry every counter named in the cross-cutting
+# counter contract with the contracted values, plus the named commit /
+# verification mode labels and the chain's per-accept exactness label.
+add_test(NAME dagutil_chart_spr_search_local_commit_report
+         COMMAND dagutil
+                 --fasta test/wric_four_taxon_misplaced.fa
+                 --newick test/wric_four_taxon_misplaced.nwk
+                 --refseq test/wric_four_taxon_misplaced.ref
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-spr-search
+                 --chart-spr-max-candidates 1
+                 --chart-spr-local-accept-updates
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# Every listed regex must appear in the report (PASS_REGULAR_EXPRESSION is a
+# list: all entries must match).  This is the Phase-10 counter-contract /
+# mode-label check at the dagutil level.  Unlike the Phase-0 baseline fixture
+# (data/test_5_trees/tree_0, which accepts 0 moves under --chart-spr-max-
+# candidates 1 and made the per-accept contract vacuous), this fixture is known
+# to accept exactly one improving move, so local_commit_accepted_moves and the
+# Phase-3 affected-row counters are non-zero and the per-accept contract is
+# exercised for real (not vacuously).
+set_tests_properties(dagutil_chart_spr_search_local_commit_report
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "search_mode: phase5_accept_reject_overlay_chain_local_commit;commit_mode: overlay_delta;verification_mode: transient;chain_per_accept_exactness_label: exact_multisite;local_commit_accepted_moves: [1-9];sidecar_rebuilds_after_accept: 0;overlay_materializations_for_accept_materialization: 0;transient_chain_extensions_for_verification;inside_rows_recomputed_on_commit: [1-9];outside_rows_recomputed_on_commit: [1-9]")
+
+# The named verification-mode choice actually toggles the exact-verification
+# path: cold mode skips the transient extension and reports the cold label.
+add_test(NAME dagutil_chart_spr_search_verification_cold
+         COMMAND dagutil
+                 --fasta test/wric_four_taxon_misplaced.fa
+                 --newick test/wric_four_taxon_misplaced.nwk
+                 --refseq test/wric_four_taxon_misplaced.ref
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-spr-search
+                 --chart-spr-max-candidates 1
+                 --chart-spr-local-accept-updates
+                 --chart-spr-verification-mode cold
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_chart_spr_search_verification_cold
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "verification_mode: cold;transient_chain_extensions_for_verification: 0;local_commit_accepted_moves: [1-9]")
+
+# The chain identity JSON report is emitted to a file and is valid (version 1).
+add_test(NAME dagutil_chart_spr_search_identity_report_json
+         COMMAND dagutil
+                 --fasta test/wric_four_taxon_misplaced.fa
+                 --newick test/wric_four_taxon_misplaced.nwk
+                 --refseq test/wric_four_taxon_misplaced.ref
+                 --force-no-vcf
+                 --wric-polytomy-mode expand-bounded
+                 --wric-polytomy-max-shapes 1
+                 --chart-spr-search
+                 --chart-spr-max-candidates 1
+                 --chart-spr-local-accept-updates
+                 --chart-spr-identity-report-json
+                 ${CMAKE_BINARY_DIR}/phase10_identity_report.json
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_chart_spr_search_identity_report_json
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "commit_mode: overlay_delta;local_commit_accepted_moves: [1-9]")
+add_test(NAME dagutil_chart_spr_identity_report_json_valid
+         COMMAND bash -c
+         "grep -q '\"version\":1' ${CMAKE_BINARY_DIR}/phase10_identity_report.json && grep -q 'base_production_keys' ${CMAKE_BINARY_DIR}/phase10_identity_report.json"
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_chart_spr_identity_report_json_valid
+                     PROPERTIES DEPENDS
+                     dagutil_chart_spr_search_identity_report_json)
+
+# Phase 10 CI-scale sanity table: diffs a local-commit run's counters against
+# the conservative Phase-0 baseline and exits non-zero on a contract violation.
+# Smoke mode keeps CI fast (the cold-verification row is covered by the
+# dagutil_chart_spr_search_verification_cold ctest above).
+add_test(NAME wric_phase10_sanity_table_smoke
+         COMMAND doc/wric_phase10_sanity_table.sh
+                 --smoke
+                 --dagutil $<TARGET_FILE:dagutil>
+                 --out-doc ${CMAKE_BINARY_DIR}/wric_phase10_sanity_table.md
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(wric_phase10_sanity_table_smoke
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "Phase-10 sanity table: PASS")
+
 add_test(NAME wric_spr_search_benchmark_smoke
          COMMAND tools/wric_spr_search_benchmark.sh
                  --smoke
@@ -896,6 +983,12 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
     add_test(NAME ${test_name} COMMAND ${test_name}
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()
+
+# Phase 10 (cross-cutting CLI / report / identity surface) library-level tests.
+add_executable(chart_spr_phase10_test test/chart_spr_phase10_test.cpp)
+target_link_libraries(chart_spr_phase10_test PRIVATE larch)
+add_test(NAME chart_spr_phase10_test COMMAND chart_spr_phase10_test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Compile-only guard for the Phase 0 counter-baseline generator
 # (tools/wric_counter_baseline.cpp).  The generator is deliberately a one-shot

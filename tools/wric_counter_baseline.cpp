@@ -169,6 +169,20 @@ int main() {
                      c.fixed_topology_persistent_cache_fallbacks);
   print_counter_line("fixed_topology_persistent_cache_oracle_mismatches",
                      c.fixed_topology_persistent_cache_oracle_mismatches);
+  // Phase 10 counter-hygiene: the production per-pattern gate, icache
+  // participation, and chain-objective diagnostics are part of the contract
+  // surface, so they are pinned in the baseline (all zero in this conservative-
+  // mode snapshot; printed so a renamed field breaks regeneration before it
+  // breaks a CI table).
+  print_counter_line(
+      "fixed_topology_persistent_cache_direct_oracle_mismatches",
+      c.fixed_topology_persistent_cache_direct_oracle_mismatches);
+  print_counter_line("fixed_topology_icache_rows_reused",
+                     c.fixed_topology_icache_rows_reused);
+  print_counter_line("fixed_topology_icache_rows_recomputed_affected",
+                     c.fixed_topology_icache_rows_recomputed_affected);
+  print_counter_line("fixed_topology_chain_objective_before_mismatches",
+                     c.fixed_topology_chain_objective_before_mismatches);
   // Phase 9 (Work item 4a, technique 2): transient chain extension for
   // exact_multisite verification.  Zero in this conservative-mode baseline
   // (the transient verifier is installed only when a local-commit substrate

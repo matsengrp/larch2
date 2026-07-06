@@ -140,6 +140,10 @@ chart_spr_search_counters:
   fixed_topology_persistent_cache_verifications:               0
   fixed_topology_persistent_cache_fallbacks:                   0
   fixed_topology_persistent_cache_oracle_mismatches:           0
+  fixed_topology_persistent_cache_direct_oracle_mismatches:    0
+  fixed_topology_icache_rows_reused:                           0
+  fixed_topology_icache_rows_recomputed_affected:              0
+  fixed_topology_chain_objective_before_mismatches:            0
   transient_chain_extensions_for_verification:                 0
   transient_chain_extension_fallbacks:                         0
   transient_chain_extension_oracle_mismatches:                 0

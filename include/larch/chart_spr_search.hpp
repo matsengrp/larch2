@@ -293,6 +293,64 @@ inline char const* chart_spr_topology_selection_kind_name(
   return "unknown";
 }
 
+// Phase 10 (cross-cutting CLI / report / identity surface).  These two enums
+// name the accepted-state commit path and the exact-verification path a run
+// selects, so the Phase-10 report surfaces them as labelled, distinct modes
+// (defaults unchanged) and the counter contract can be read off the report.
+//
+// `chart_spr_commit_mode` names how an accepted move commits.  The default
+// `overlay_delta` is the Phase-4 local-commit path: append the accepted SPR
+// overlay to the base-plus-overlay chain and refresh the persistent inside /
+// outside caches.  `option_c` names a rank-3 Option-C rewrite committed through
+// `option_c_commit_via_chain` (Phase 6/7), which is reachable ONLY through that
+// library API: the search loop's candidate generator always produces SPR
+// overlay-delta commits, so it cannot honor `option_c`.  Selecting `option_c`
+// for `run_chart_spr_search` therefore throws a labelled error from
+// `validate_chart_spr_search_loop_options` rather than being silently reported
+// with a label the loop did not honor (no silent fallback).  The Option-C
+// commit machinery stays a library API, exercised by `option_c_chain_commit_test`.
+enum class chart_spr_commit_mode {
+  overlay_delta,
+  option_c,
+};
+
+inline char const* chart_spr_commit_mode_name(chart_spr_commit_mode mode) {
+  switch (mode) {
+    case chart_spr_commit_mode::overlay_delta:
+      return "overlay_delta";
+    case chart_spr_commit_mode::option_c:
+      return "option_c";
+  }
+  return "unknown";
+}
+
+// `chart_spr_verification_mode` names how an unaccepted candidate is exact-
+// verified.  The default `transient` is the Phase-9 path: transiently extend
+// the chain + caches in reader-local scratch (counted under
+// `transient_chain_extensions_for_verification`, never under
+// `full_overlay_materializations`).  `cold` skips installing the transient
+// verifier so the from-scratch `verify_candidate_exact_against_state` path
+// runs (a dense materialization per verified candidate, counted under
+// `overlay_materializations_for_exact_verification`).  This is the named
+// verification-mode choice the Phase-10 report surfaces; it is meaningful even
+// though the Phase-9 scratch caches are not yet consumed by the production B&B
+// scorer (see the Phase-9 caveat in doc/WRIC-SPR-SEARCH.md).
+enum class chart_spr_verification_mode {
+  transient,
+  cold,
+};
+
+inline char const* chart_spr_verification_mode_name(
+    chart_spr_verification_mode mode) {
+  switch (mode) {
+    case chart_spr_verification_mode::transient:
+      return "transient";
+    case chart_spr_verification_mode::cold:
+      return "cold";
+  }
+  return "unknown";
+}
+
 struct chart_spr_production_signature {
   // Stable across dense overlay materialization/rebuild.  In-process reports
   // use taxon IDs; cross-run reports can translate them to sample IDs.
@@ -437,6 +495,18 @@ struct chart_spr_search_options {
   // output grammar and every accepted overlay production key is checked as a
   // witness in the compacted DAG.
   bool rebuild_after_accept = true;
+
+  // Phase 10 cross-cutting surface.  `commit_mode` names the accepted-state
+  // commit path a run reports (overlay_delta default; option_c for rank-3
+  // Option-C commits via the library API).  `verification_mode` names the
+  // exact-verification path: `transient` (default) installs the Phase-9
+  // transient-extension exact_multisite verifier; `cold` skips it so the
+  // from-scratch `verify_candidate_exact_against_state` path runs.  Both are
+  // labelled distinctly in the report; defaults are unchanged.  See the enums
+  // above and the Phase-10 doc.
+  chart_spr_commit_mode commit_mode = chart_spr_commit_mode::overlay_delta;
+  chart_spr_verification_mode verification_mode =
+      chart_spr_verification_mode::transient;
 
   // Test/diagnostic hooks for validating expensive guardrails without needing
   // pathological input DAGs.
@@ -708,6 +778,22 @@ struct chart_spr_search_summary {
   std::size_t effective_candidate_batch_size = 0;
   std::size_t local_score_worker_count = 1;
   affected_clade_distribution affected_distribution;
+  // Phase 10 cross-cutting surface.  These mirror the selected commit /
+  // verification modes and the chain's per-accept exactness label so a run's
+  // emitted report carries the contracted mode labels and every accepted
+  // move's exactness kind (Work item 1 exactness contract).  The per-accept
+  // label equals the acceptance mode for local-commit runs (fixed_topology_exact
+  // / exact_multisite); for the conservative materialize-rebuild path it is the
+  // constant `none_conservative_materialize_rebuild` (there is no overlay chain,
+  // so there is no per-accept chain exactness to report).  Note this label is the
+  // CHAIN's per-accept label, not the objective's exactness kind: a
+  // lower_bound_heuristic acceptance gate still reports its score with kind
+  // `composite_lower_bound` (see `chart_spr_score_kind`); it is simply never
+  // admitted to local commit (see validate_chart_spr_search_loop_options).
+  chart_spr_commit_mode commit_mode = chart_spr_commit_mode::overlay_delta;
+  chart_spr_verification_mode verification_mode =
+      chart_spr_verification_mode::transient;
+  std::string chain_per_accept_exactness_label;
 };
 
 struct chart_spr_search_result {
@@ -715,6 +801,14 @@ struct chart_spr_search_result {
   std::vector<chart_spr_iteration_result> iterations;
   chart_spr_search_counters counters;
   chart_spr_search_summary summary;
+  // Phase 10 identity surface: the JSON identity report of the overlay chain
+  // (one entry per accepted delta, with taxon-set keys + commit-source label),
+  // emitted when the run used local-commit mode (`rebuild_after_accept =
+  // false`) so the chain existed.  Empty for conservative materialize-rebuild
+  // runs and for local-commit runs that accepted nothing.  Built from
+  // `build_phase10_chain_identity_report` (phase10_report.hpp); the keys are
+  // stable across materialize / rebuild / report round trips.
+  std::string chain_identity_report_json;
 };
 
 enum class chart_spr_cache_strategy {
@@ -1365,6 +1459,17 @@ struct spr_overlay_delta {
   std::vector<clade_key> temp_clades;
   std::vector<overlay_grammar_production> temp_productions;
   std::vector<production_id> removed_base_productions;
+
+  // Phase 10 (cross-cutting identity surface).  Optional commit-source label
+  // that names which commit path produced this delta.  Empty (the default)
+  // means an SPR overlay delta produced by `build_spr_overlay_delta` (the
+  // Phase-4 local-commit path / Option A/B materialize-and-merge);
+  // `"option_c_chain_commit"` means a rank-3 Option-C rewrite committed via
+  // `option_c_as_overlay_delta` (Phase 6/7).  This is the label the Phase-10
+  // JSON identity report carries per chain entry so Option-C rewrite
+  // identities survive materialize -> rebuild -> report round trips; it is
+  // not used by any chart/cache logic and carries no behavioral contract.
+  std::string commit_source;
 
   // Affected base clades plus temp clades, sorted bottom-up.
   std::vector<overlay_clade_ref> affected_order;

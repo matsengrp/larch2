@@ -4,6 +4,7 @@
 #include <larch/outside_chart_cache.hpp>
 #include <larch/overlay_chain.hpp>
 #include <larch/overlay_chain_compaction.hpp>
+#include <larch/phase10_report.hpp>
 #include <larch/rank3_rewrite.hpp>
 
 #include <algorithm>
@@ -59,6 +60,23 @@ void validate_chart_spr_search_loop_options(
         "chain's recorded objective must be exact (fixed_topology_exact or "
         "exact_multisite).  The deferred-verification extension admitting "
         "heuristic-gated local commits is out of scope.");
+  }
+  // Phase 10 commit-mode label enforcement (no silent fallback).  The search
+  // loop's candidate generator always produces SPR overlay-delta commits, so a
+  // run configured with commit_mode == option_c cannot be honored: accepting a
+  // move would append an SPR overlay delta while the report claims
+  // commit_mode: option_c, a direct contradiction.  Option-C commits are
+  // reachable only through the library API (option_c_commit_via_chain), which
+  // is the documented path and is exercised by option_c_chain_commit_test.
+  // Throwing here keeps `option_c` as a parseable, distinctly-labelled library
+  // mode without letting the search loop silently misreport it.
+  if (options.commit_mode == chart_spr_commit_mode::option_c) {
+    throw std::runtime_error(
+        "chart SPR search: commit_mode == option_c is not supported by the "
+        "search loop; the candidate generator always produces SPR overlay-delta "
+        "commits.  Option-C commits are reachable only through the library API "
+        "(option_c_commit_via_chain).  This is a labelled unsupported-mode "
+        "throw, not a silent fallback to overlay_delta.");
   }
   if (!options.rebuild_after_accept && options.chart.score_ua_edge) {
     throw std::runtime_error(
@@ -2670,6 +2688,25 @@ chart_spr_search_result run_chart_spr_search(
   result.dag = std::move(initial_dag);
   result.summary.acceptance_mode = options.acceptance_mode;
   result.summary.candidate_selection = options.candidate_selection;
+  // Phase 10 cross-cutting surface: mirror the selected commit / verification
+  // modes and the chain's per-accept exactness label into the summary so the
+  // report carries the contracted mode labels.  The per-accept label equals
+  // the acceptance mode for local-commit runs (fixed_topology_exact /
+  // exact_multisite); for the conservative materialize-rebuild path it is the
+  // constant `none_conservative_materialize_rebuild` regardless of acceptance
+  // mode, because there is no overlay chain and therefore no per-accept chain
+  // exactness to report.  (This label is the chain's per-accept label, not the
+  // objective's exactness kind: a lower_bound_heuristic gate still reports its
+  // score with kind composite_lower_bound via chart_spr_score_kind; it is
+  // simply never admitted to local commit -- see
+  // validate_chart_spr_search_loop_options.)  `chart_spr_acceptance_mode_name`
+  // is declared in the header this translation unit already includes.
+  result.summary.commit_mode = options.commit_mode;
+  result.summary.verification_mode = options.verification_mode;
+  result.summary.chain_per_accept_exactness_label =
+      options.rebuild_after_accept
+          ? std::string{"none_conservative_materialize_rebuild"}
+          : std::string{chart_spr_acceptance_mode_name(options.acceptance_mode)};
   result.summary.initial_search_state_rebuilds = 1;
 
   auto cache_start = std::chrono::steady_clock::now();
@@ -2735,14 +2772,26 @@ chart_spr_search_result run_chart_spr_search(
     // caches are unconsumed by the production B&B scorer (it rebuilds charts
     // from the grammar) and are forward-looking groundwork for Phase 12.
     // See the header comment on `chart_spr_transient_extension`.
-    state.exact_multisite_verifier =
-        [substrate_ptr](chart_spr_search_state const& verifier_state,
-                        chart_spr_candidate_score candidate,
-                        multisite_trim_options const& trim_options) {
-          return chart_spr_verify_candidate_exact_multisite_from_transient_extension(
-              *substrate_ptr, verifier_state, std::move(candidate),
-              trim_options);
-        };
+    //
+    // Phase 10 (verification-mode choice): the transient verifier is the
+    // default, but a caller may select `chart_spr_verification_mode::cold` to
+    // force the from-scratch `verify_candidate_exact_against_state` path
+    // (a dense materialization per verified candidate, counted under
+    // `overlay_materializations_for_exact_verification`).  This is the named
+    // verification-mode choice the Phase-10 report surfaces; it is meaningful
+    // even though the Phase-9 scratch caches are not yet consumed by the
+    // production B&B scorer.
+    if (options.verification_mode ==
+        chart_spr_verification_mode::transient) {
+      state.exact_multisite_verifier =
+          [substrate_ptr](chart_spr_search_state const& verifier_state,
+                          chart_spr_candidate_score candidate,
+                          multisite_trim_options const& trim_options) {
+            return chart_spr_verify_candidate_exact_multisite_from_transient_extension(
+                *substrate_ptr, verifier_state, std::move(candidate),
+                trim_options);
+          };
+    }
   }
 
   std::string immediate_reversal_key_to_skip;
@@ -3025,6 +3074,18 @@ chart_spr_search_result run_chart_spr_search(
     result.summary.final_compaction_exactness_kind = compacted.exactness_kind;
     result.summary.final_compaction_ms += chart_spr_elapsed_ms(
         compact_start, std::chrono::steady_clock::now());
+  }
+
+  // Phase 10 identity surface: emit the JSON identity report of the overlay
+  // chain when local-commit mode was used (so the chain existed).  The keys
+  // are stable across materialize / rebuild / report round trips; an empty
+  // chain (no accepts) yields an empty-entries report carrying just the base
+  // keys, which is still a faithful identity reference.
+  if (local_commit_substrate != nullptr) {
+    auto identity = build_phase10_chain_identity_report(
+        *local_commit_substrate->chain);
+    result.chain_identity_report_json =
+        emit_phase10_chain_identity_report_json(identity);
   }
 
   result.counters = state.counters;

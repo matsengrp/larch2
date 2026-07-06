@@ -1252,6 +1252,27 @@ Analysis:
                           compaction materializes the chain once into a
                           grammar-valued output DAG and scores it with the
                           exact B&B oracle (requires an exact accept gate)
+  --chart-spr-commit-mode <M>
+                          Named accepted-state commit path a run reports:
+                          overlay-delta (default, the Phase-4 local-commit
+                          SPR path / Option A/B materialize-and-merge) or
+                          option-c (rank-3 Option-C commits, reachable only
+                          via the library API option_c_commit_via_chain;
+                          selecting it for the search loop throws a labelled
+                          error since the candidate generator always produces
+                          SPR overlay-delta commits). Defaults unchanged
+  --chart-spr-verification-mode <M>
+                          Named exact-verification path: transient (default,
+                          the Phase-9 chain-extension verifier, counted under
+                          transient_chain_extensions_for_verification) or cold
+                          (the from-scratch materialize-per-candidate path,
+                          counted under
+                          overlay_materializations_for_exact_verification)
+  --chart-spr-identity-report-json <PATH>
+                          Write the overlay chain's JSON identity report
+                          (per-delta taxon-set keys + commit-source label) for
+                          a local-commit run. Stable across materialize /
+                          rebuild / report round trips
   --chart-spr-max-candidates <N>
                           Candidate cap for chart-SPR diagnostics
                           (default 0, unlimited; post-dedup)
@@ -1415,6 +1436,12 @@ struct args {
   chart_cache_options chart_spr_cache;
   std::size_t chart_spr_local_score_workers = 1;
   bool chart_spr_local_accept_updates = false;
+  // Phase 10 cross-cutting CLI surface.
+  chart_spr_commit_mode chart_spr_commit =
+      chart_spr_commit_mode::overlay_delta;
+  chart_spr_verification_mode chart_spr_verification =
+      chart_spr_verification_mode::transient;
+  std::string chart_spr_identity_report_json;
 };
 
 static bool has_any_model_arg(args const& a) {
@@ -1480,6 +1507,30 @@ parse_chart_spr_candidate_selection_mode(std::string_view text) {
   if (text == "randomized" || text == "sampled" ||
       text == "sampled-or-randomized" || text == "sampled_or_randomized") {
     return chart_spr_candidate_selection_mode::sampled_or_randomized;
+  }
+  return std::nullopt;
+}
+
+static std::optional<chart_spr_commit_mode>
+parse_chart_spr_commit_mode(std::string_view text) {
+  if (text == "overlay-delta" || text == "overlay_delta" ||
+      text == "spr" || text == "default") {
+    return chart_spr_commit_mode::overlay_delta;
+  }
+  if (text == "option-c" || text == "option_c" ||
+      text == "option_c_chain_commit") {
+    return chart_spr_commit_mode::option_c;
+  }
+  return std::nullopt;
+}
+
+static std::optional<chart_spr_verification_mode>
+parse_chart_spr_verification_mode(std::string_view text) {
+  if (text == "transient" || text == "default") {
+    return chart_spr_verification_mode::transient;
+  }
+  if (text == "cold" || text == "from-scratch" || text == "from_scratch") {
+    return chart_spr_verification_mode::cold;
   }
   return std::nullopt;
 }
@@ -1804,6 +1855,26 @@ static args parse_args(int argc, char** argv) {
     } else if (arg == "--chart-spr-local-accept-updates" ||
                arg == "--chart-spr-no-rebuild-after-accept") {
       a.chart_spr_local_accept_updates = true;
+    } else if (arg == "--chart-spr-commit-mode") {
+      auto value = next();
+      auto mode = parse_chart_spr_commit_mode(value);
+      if (!mode) {
+        std::cerr << "error: unknown --chart-spr-commit-mode '" << value
+                  << "'\n";
+        std::exit(1);
+      }
+      a.chart_spr_commit = *mode;
+    } else if (arg == "--chart-spr-verification-mode") {
+      auto value = next();
+      auto mode = parse_chart_spr_verification_mode(value);
+      if (!mode) {
+        std::cerr << "error: unknown --chart-spr-verification-mode '"
+                  << value << "'\n";
+        std::exit(1);
+      }
+      a.chart_spr_verification = *mode;
+    } else if (arg == "--chart-spr-identity-report-json") {
+      a.chart_spr_identity_report_json = next();
     } else if (arg == "--chart-spr-max-candidates") {
       a.chart_spr_enumeration.max_candidates = parse_size_token_strict(
           next(), "--chart-spr-max-candidates");
@@ -2881,6 +2952,32 @@ static void print_chart_spr_search_counter_fields(
       << counters.fixed_topology_persistent_cache_fallbacks << "\n";
   out << indent << "fixed_topology_persistent_cache_oracle_mismatches: "
       << counters.fixed_topology_persistent_cache_oracle_mismatches << "\n";
+  // Phase 8 production per-pattern gate + icache participation + chain-objective
+  // diagnostics.  Reported so a regression in the production gate or a
+  // regression to "recompute everything" (zero icache reuse) is visible in the
+  // counters dump, not hidden behind a renamed field.
+  out << indent
+      << "fixed_topology_persistent_cache_direct_oracle_mismatches: "
+      << counters.fixed_topology_persistent_cache_direct_oracle_mismatches
+      << "\n";
+  out << indent << "fixed_topology_icache_rows_reused: "
+      << counters.fixed_topology_icache_rows_reused << "\n";
+  out << indent << "fixed_topology_icache_rows_recomputed_affected: "
+      << counters.fixed_topology_icache_rows_recomputed_affected << "\n";
+  out << indent << "fixed_topology_chain_objective_before_mismatches: "
+      << counters.fixed_topology_chain_objective_before_mismatches << "\n";
+  // Phase 9 (Work item 4a, technique 2) transient chain extension for
+  // grammar-exact verification.  Separate from `full_overlay_materializations`
+  // per the cross-cutting counter contract: a regression to "dense materialize
+  // per candidate" shows up as `full_overlay_materializations > 0` on an exact
+  // local-commit run while these stay at zero (cold mode), or as these
+  // incrementing (transient mode).
+  out << indent << "transient_chain_extensions_for_verification: "
+      << counters.transient_chain_extensions_for_verification << "\n";
+  out << indent << "transient_chain_extension_fallbacks: "
+      << counters.transient_chain_extension_fallbacks << "\n";
+  out << indent << "transient_chain_extension_oracle_mismatches: "
+      << counters.transient_chain_extension_oracle_mismatches << "\n";
   out << indent << "full_composite_rebuilds: "
       << counters.full_composite_rebuilds << "\n";
   out << indent << "local_candidate_scores: "
@@ -3336,6 +3433,10 @@ static chart_spr_search_options make_chart_spr_search_options(
   options.cache = a.chart_spr_cache;
   options.local_score_worker_count = a.chart_spr_local_score_workers;
   options.rebuild_after_accept = !a.chart_spr_local_accept_updates;
+  // Phase 10 cross-cutting surface: mirror the selected commit / verification
+  // modes into the search options.  Defaults unchanged.
+  options.commit_mode = a.chart_spr_commit;
+  options.verification_mode = a.chart_spr_verification;
   options.seed = a.seed.value_or(options.seed);
   options.chart.score_ua_edge = a.chart_score_ua_edge;
   options.exact_trim = make_chart_bnb_trim_options(a);
@@ -3350,6 +3451,21 @@ static void run_chart_spr_search_diagnostic(
                                      options);
   dag = std::move(search.dag);
   build_clade_offsets(dag);
+
+  // Phase 10 identity surface: optionally write the overlay chain's JSON
+  // identity report (per-delta taxon-set keys + commit-source label) so it
+  // round-trips through reports / CI tooling.  Only meaningful for local-
+  // commit runs (`--chart-spr-local-accept-updates`); empty for conservative
+  // materialize-rebuild runs.
+  if (!a.chart_spr_identity_report_json.empty()) {
+    std::ofstream identity_out(a.chart_spr_identity_report_json);
+    if (!identity_out) {
+      std::cerr << "error: cannot write --chart-spr-identity-report-json to '"
+                << a.chart_spr_identity_report_json << "'\n";
+      std::exit(1);
+    }
+    identity_out << search.chain_identity_report_json;
+  }
 
   out << "chart_spr_search:\n";
   out << "  api: search_state_cached_active_pattern_charts\n";
@@ -3425,6 +3541,16 @@ static void run_chart_spr_search_diagnostic(
   } else {
     out << "grammar_exact\n";
   }
+  // Phase 10 cross-cutting surface: the commit / verification mode labels and
+  // the chain's per-accept exactness label (Work item 1 exactness contract).
+  // Defaults are overlay_delta / transient; the labels are reported so a run
+  // cannot silently fall back to a cheaper mode.
+  out << "  commit_mode: "
+      << chart_spr_commit_mode_name(options.commit_mode) << "\n";
+  out << "  verification_mode: "
+      << chart_spr_verification_mode_name(options.verification_mode) << "\n";
+  out << "  chain_per_accept_exactness_label: "
+      << search.summary.chain_per_accept_exactness_label << "\n";
   out << "  score_convention: active_cache_plus_single_invariant_offset\n";
   out << "  score_ua_edge: "
       << (a.chart_score_ua_edge ? "true" : "false") << "\n";
@@ -3530,6 +3656,21 @@ static void run_chart_spr_search_diagnostic(
   out << "  fixed_topology_persistent_cache_oracle_mismatches: "
       << search.summary.fixed_topology_persistent_cache_oracle_mismatches
       << "\n";
+  out << "  fixed_topology_persistent_cache_direct_oracle_mismatches: "
+      << search.summary.fixed_topology_persistent_cache_direct_oracle_mismatches
+      << "\n";
+  out << "  fixed_topology_icache_rows_reused: "
+      << search.summary.fixed_topology_icache_rows_reused << "\n";
+  out << "  fixed_topology_icache_rows_recomputed_affected: "
+      << search.summary.fixed_topology_icache_rows_recomputed_affected << "\n";
+  out << "  fixed_topology_chain_objective_before_mismatches: "
+      << search.summary.fixed_topology_chain_objective_before_mismatches << "\n";
+  out << "  transient_chain_extensions_for_verification: "
+      << search.summary.transient_chain_extensions_for_verification << "\n";
+  out << "  transient_chain_extension_fallbacks: "
+      << search.summary.transient_chain_extension_fallbacks << "\n";
+  out << "  transient_chain_extension_oracle_mismatches: "
+      << search.summary.transient_chain_extension_oracle_mismatches << "\n";
   out << "  local_rows_recomputed_per_second: " << std::fixed
       << std::setprecision(3)
       << search.summary.local_rows_recomputed_per_second << "\n";

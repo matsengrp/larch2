@@ -408,6 +408,11 @@ struct overlay_chain {
     stored.temp_clades = std::move(new_temp_clades);
     stored.temp_productions = std::move(rebased_productions);
     stored.removed_base_productions = std::move(rebased_tombstones);
+    // Phase 10 identity surface: carry the commit-source label through the
+    // rebase so the JSON identity report can distinguish Option-C entries
+    // from SPR overlay-delta entries.  The label carries no behavioral
+    // contract and is not used by any chart/cache logic.
+    stored.commit_source = delta.commit_source;
     // Derived index fields (affected_order, reachability, temp indices) are
     // intentionally left empty in Phase 1: they are not needed for the
     // materialization oracle and are recomputed against the merged space by

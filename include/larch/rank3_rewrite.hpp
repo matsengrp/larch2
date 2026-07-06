@@ -3148,6 +3148,14 @@ inline option_c_overlay_delta_result option_c_as_overlay_delta(
   delta.removed_base_production.assign(tip.productions.size(), false);
   delta.removed_base_production[before_pid] = true;
 
+  // Phase 10 identity surface: tag this delta as an Option-C commit so the
+  // JSON identity report can distinguish Option-C rewrite entries from SPR
+  // overlay-delta entries (taxon-set keys are identical in kind; only the
+  // label differs).  This literal must stay in sync with
+  // `option_c_chain_commit_result::commit_label` (option_c_chain_commit.hpp);
+  // `option_c_chain_commit_test` asserts the two match.
+  delta.commit_source = "option_c_chain_commit";
+
   chart_spr_search_detail::build_overlay_delta_temp_indices(delta);
   chart_spr_search_detail::compute_overlay_delta_reachability(delta,
                                                                score_options);
