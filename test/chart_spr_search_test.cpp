@@ -85,6 +85,26 @@ static larch::test::tiny_tree_node phase5_arity4_selected_tree() {
                      tiny_leaf("C", "CA"), tiny_leaf("D", "CC")});
 }
 
+static larch::test::tiny_tree_node phase6_arity3_misplaced_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AC", "A", {tiny_leaf("A", "A"), tiny_leaf("C", "C")}),
+       tiny_leaf("B", "A"), tiny_leaf("D", "C")});
+}
+
+static larch::test::tiny_tree_node phase6_internal_arity3_source_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("ABC", "A",
+                  {tiny_leaf("A", "A"), tiny_leaf("B", "A"),
+                   tiny_leaf("C", "C")}),
+       tiny_leaf("D", "C")});
+}
+
 struct tiny_chart_spr_fixture {
   larch::phylo_dag dag;
   larch::clade_grammar grammar;
@@ -2054,6 +2074,208 @@ test_phase5_multifurcation_outside_rows_exercise_shared_state_guard() {
   auto independent = larch::parsimony_chart_detail::saturated_add(
       detach_only, reattach_only);
   CHECK(independent < shared);
+
+  std::println("  PASS");
+}
+
+static larch::rank3_production_taxa_key phase6_key_from_signature(
+    larch::chart_spr_production_signature signature) {
+  larch::rank3_production_taxa_key key;
+  key.parent = std::move(signature.parent_taxa);
+  key.children = std::move(signature.child_taxa);
+  larch::rank3_detail::normalize_production_key(key);
+  return key;
+}
+
+static larch::production_id phase6_production_id_for_key(
+    larch::clade_grammar const& grammar,
+    larch::rank3_production_taxa_key key) {
+  larch::rank3_detail::normalize_production_key(key);
+  for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
+    auto id = static_cast<larch::production_id>(pid);
+    if (larch::rank3_detail::production_key_from_id(grammar, id) == key) {
+      return id;
+    }
+  }
+  return larch::no_production;
+}
+
+static std::uint64_t phase6_score_certificate_after_topology(
+    larch::phylo_dag& dag, larch::clade_grammar const& grammar,
+    larch::chart_spr_topology_certificate const& certificate) {
+  std::vector<larch::production_id> pids;
+  pids.reserve(certificate.after_signatures.size());
+  for (auto const& signature : certificate.after_signatures) {
+    auto pid = phase6_production_id_for_key(
+        grammar, phase6_key_from_signature(signature));
+    CHECK(pid != larch::no_production);
+    pids.push_back(pid);
+  }
+  auto topology = larch::rank3_topology_from_productions(grammar, pids);
+  auto patterns = larch::build_site_patterns(dag, grammar);
+  std::uint64_t total = 0;
+  for (auto const& pattern : patterns.patterns) {
+    auto row = larch::chart_multisite_detail::restricted_topology_row(
+        grammar, pattern, topology);
+    total = larch::chart_multisite_detail::checked_add_u64(
+        total,
+        larch::chart_spr_weighted_root_score_from_row(row, pattern, {}),
+        "phase6 rebuilt certificate score");
+  }
+  return total;
+}
+
+static void
+test_phase6_source_multifurcation_candidate_has_no_unreachable_helper() {
+  std::println(
+      "test_phase6_source_multifurcation_candidate_has_no_unreachable_helper");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", phase6_internal_arity3_source_tree());
+  larch::clade_grammar_options gopts;
+  gopts.allow_polytomies = true;
+  auto grammar = larch::build_clade_grammar(dag, gopts);
+  auto a_taxa = taxa_for(grammar, {"A"});
+  auto b_taxa = taxa_for(grammar, {"B"});
+  auto abc = clade_for(grammar, {"A", "B", "C"});
+  CHECK(max_production_arity(grammar) == 3);
+
+  bool found = false;
+  for (auto const& candidate :
+       larch::enumerate_grammar_spr_candidates(grammar)) {
+    auto moved_taxa = larch::chart_spr_clade_taxa_for_ref(
+        grammar, candidate, candidate.moved_clade);
+    auto target_taxa = larch::chart_spr_clade_taxa_for_ref(
+        grammar, candidate, candidate.new_sibling_or_target);
+    if (candidate.old_parent != larch::base_clade_ref(abc) ||
+        moved_taxa != a_taxa || target_taxa != b_taxa) {
+      continue;
+    }
+    auto materialized =
+        larch::materialize_overlay_grammar(larch::overlay_from_candidate(
+            grammar, candidate));
+    for (auto dense_pid : materialized.temp_production_to_dense) {
+      CHECK(dense_pid != larch::no_production);
+    }
+    found = true;
+  }
+  CHECK(found);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_multifurcation_fixed_topology_local_commit() {
+  std::println("test_phase6_multifurcation_fixed_topology_local_commit");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", phase6_arity3_misplaced_tree());
+  larch::clade_grammar_options gopts;
+  gopts.allow_polytomies = true;
+  auto grammar = larch::build_clade_grammar(dag, gopts);
+  CHECK(max_production_arity(grammar) == 3);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.verify_local_commit_two_chart_oracle_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar,
+                                            options);
+  CHECK(search.iterations.size() == 1);
+  auto const& iteration = search.iterations.front();
+  CHECK(iteration.accepted.has_value());
+  CHECK(iteration.accepted_move_committed);
+  CHECK(!iteration.post_materialization_rejected);
+  CHECK(iteration.state_score_after < iteration.state_score_before);
+  CHECK(search.summary.final_score < search.summary.initial_score);
+  CHECK(search.counters.local_commit_accepted_moves == 1);
+  CHECK(search.counters.accepted_moves == 1);
+  CHECK(search.counters.local_commit_two_chart_oracle_runs == 1);
+  CHECK(search.counters.spr_multifurcation_moves_generated > 0);
+  CHECK(search.summary.spr_multifurcation_moves_generated ==
+        search.counters.spr_multifurcation_moves_generated);
+  CHECK(search.summary.final_compaction_rebuilds == 1);
+  auto rebuilt = larch::build_clade_grammar(search.dag, gopts);
+  CHECK(max_production_arity(rebuilt) == 3);
+  CHECK(iteration.accepted->topology_selection.certificate.has_value());
+  CHECK(phase6_score_certificate_after_topology(
+            search.dag, rebuilt,
+            *iteration.accepted->topology_selection.certificate) ==
+        search.summary.final_score);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_multifurcation_lower_bound_conservative_commit() {
+  std::println(
+      "test_phase6_multifurcation_lower_bound_conservative_commit");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", phase6_arity3_misplaced_tree());
+  larch::clade_grammar_options gopts;
+  gopts.allow_polytomies = true;
+  auto grammar = larch::build_clade_grammar(dag, gopts);
+  CHECK(max_production_arity(grammar) == 3);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::lower_bound_heuristic;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = true;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar,
+                                            options);
+  CHECK(search.iterations.size() == 1);
+  auto const& iteration = search.iterations.front();
+  CHECK(iteration.accepted.has_value());
+  CHECK(iteration.accepted_move_committed);
+  CHECK(!iteration.post_materialization_rejected);
+  CHECK(iteration.state_score_after < iteration.state_score_before);
+  CHECK(search.summary.final_score < search.summary.initial_score);
+  CHECK(search.counters.accepted_moves == 1);
+  CHECK(search.counters.local_commit_accepted_moves == 0);
+  CHECK(search.counters.spr_multifurcation_moves_generated > 0);
+  CHECK(search.summary.spr_multifurcation_moves_generated ==
+        search.counters.spr_multifurcation_moves_generated);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_exact_multisite_multifurcation_gate() {
+  std::println("test_phase6_exact_multisite_multifurcation_gate");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", phase6_arity3_misplaced_tree());
+  larch::clade_grammar_options gopts;
+  gopts.allow_polytomies = true;
+  auto grammar = larch::build_clade_grammar(dag, gopts);
+  CHECK(max_production_arity(grammar) == 3);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = true;
+
+  bool threw = false;
+  std::string message;
+  try {
+    (void)larch::run_chart_spr_search(std::move(dag), grammar, options);
+  } catch (std::runtime_error const& e) {
+    threw = true;
+    message = e.what();
+  }
+  CHECK(threw);
+  CHECK(message.find("WI6") != std::string::npos);
+  CHECK(message.find("exact_multisite") != std::string::npos);
+  CHECK(message.find("multifurcating") != std::string::npos);
 
   std::println("  PASS");
 }
@@ -4201,6 +4423,10 @@ int main() {
   test_phase5_combine_rows_binary_regression();
   test_phase5_multifurcation_selected_topology_rows();
   test_phase5_multifurcation_outside_rows_exercise_shared_state_guard();
+  test_phase6_source_multifurcation_candidate_has_no_unreachable_helper();
+  test_phase6_multifurcation_fixed_topology_local_commit();
+  test_phase6_multifurcation_lower_bound_conservative_commit();
+  test_phase6_exact_multisite_multifurcation_gate();
   test_phase8_persistent_cache_invariant_failure_is_hard_error();
   test_phase8_persistent_verifier_materialized_oracle_all_move_classes();
   test_phase8_oracle_mismatch_uses_materialized_oracle_result();

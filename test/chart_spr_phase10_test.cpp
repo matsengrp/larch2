@@ -677,6 +677,7 @@ static void test_phase10_counter_contract_fields_exist() {
   (void)c.overlay_materializations_for_accept_materialization;
   (void)c.overlay_materializations_for_final_compaction;
   (void)c.transient_chain_extensions_for_verification;
+  (void)c.spr_multifurcation_moves_generated;
   (void)c.inside_rows_recomputed_on_commit;
   (void)c.outside_rows_recomputed_on_commit;
   (void)c.local_commit_accepted_moves;
@@ -685,6 +686,7 @@ static void test_phase10_counter_contract_fields_exist() {
   larch::chart_spr_search_summary s{};
   (void)s.sidecar_rebuilds_after_accept;
   (void)s.transient_chain_extensions_for_verification;
+  (void)s.spr_multifurcation_moves_generated;
   (void)s.inside_rows_recomputed_on_commit;
   (void)s.outside_rows_recomputed_on_commit;
   (void)s.commit_mode;

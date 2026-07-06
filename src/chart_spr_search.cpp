@@ -249,6 +249,12 @@ rank3_option_b_result materialize_chart_spr_accepted_candidate(
   }
 
   rank3_option_b_options option_b;
+  if (chart_spr_search_detail::chart_spr_grammar_has_multifurcation(
+          state.grammar) ||
+      chart_spr_detail::grammar_spr_candidate_involves_multifurcation(
+          state.grammar, accepted.candidate)) {
+    option_b.rebuild_grammar_options.allow_polytomies = true;
+  }
   try {
     return materialize_rank3_option_b(*state.dag, state.grammar,
                                       accepted.candidate, option_b);
@@ -408,6 +414,35 @@ chart_spr_topology_certificate_after_key_set(
         keys, chart_spr_key_from_production_signature(signature));
   }
   return keys;
+}
+
+std::uint64_t chart_spr_score_rebuilt_topology_key_set_with_invariants(
+    clade_grammar const& grammar, active_site_pattern_set const& active,
+    chart_options const& chart_opts, std::uint64_t invariant_offset,
+    std::vector<rank3_production_taxa_key> const& key_set,
+    std::string const& context) {
+  std::vector<production_id> pids;
+  pids.reserve(key_set.size());
+  for (auto key : key_set) {
+    pids.push_back(overlay_chain_compaction_detail::find_dense_production_by_key(
+        grammar, std::move(key), context));
+  }
+  auto topology = rank3_topology_from_productions(grammar, pids);
+  (void)rank3_detail::validate_topology(grammar, topology);
+
+  std::uint64_t active_total = 0;
+  for (auto const& pattern : active.patterns.patterns) {
+    auto row = chart_multisite_detail::restricted_topology_row(
+        grammar, pattern, topology);
+    auto score = chart_spr_weighted_root_score_from_row(row, pattern,
+                                                        chart_opts);
+    active_total = chart_multisite_detail::checked_add_u64(
+        active_total, score,
+        context + " selected-topology active score");
+  }
+  return chart_multisite_detail::checked_add_u64(
+      active_total, invariant_offset,
+      context + " selected-topology invariant offset");
 }
 
 rank3_topology chart_spr_choose_local_update_compaction_topology(
@@ -672,6 +707,10 @@ chart_spr_compact_and_verify_local_update_state(
   compaction_options.validate = true;
   compaction_options.generated_edge_weight =
       std::numeric_limits<float>::max();
+  if (chart_spr_search_detail::chart_spr_grammar_has_multifurcation(
+          local_state.grammar)) {
+    compaction_options.rebuild_grammar_options.allow_polytomies = true;
+  }
   compaction_options.witness_topologies =
       chart_spr_collect_local_update_compaction_witness_topologies(
           local_state, options, last_accepted);
@@ -688,32 +727,66 @@ chart_spr_compact_and_verify_local_update_state(
         "DAG failed to preserve every accepted topology witness");
   }
 
-  auto oracle = grammar_level_exact_parsimony(
-      compacted.rebuilt.grammar, local_state.active_patterns,
-      local_state.chart_opts, local_state.invariant_constant_offset,
-      options.exact_trim);
-
   chart_spr_local_update_compaction_gate_result result;
-  result.rebuilt_score = oracle.value;
-  result.exactness_kind = oracle.exactness_kind;
   result.materialized_tree_count = compacted.materialized_tree_count;
 
-  if (result.rebuilt_score > expected_score) {
-    throw std::runtime_error(
-        "chart SPR local accepted-state final compaction: grammar-level "
-        "output DAG optimum " +
-        std::to_string(result.rebuilt_score) +
-        " exceeds chain recorded objective " +
-        std::to_string(expected_score));
-  }
-  if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite &&
-      result.rebuilt_score != expected_score) {
-    throw std::runtime_error(
-        "chart SPR local accepted-state final compaction: grammar-level "
-        "output DAG optimum " +
-        std::to_string(result.rebuilt_score) +
-        " does not match exact chain objective " +
-        std::to_string(expected_score));
+  auto multifurcating_output =
+      chart_spr_search_detail::chart_spr_grammar_has_multifurcation(
+          compacted.rebuilt.grammar);
+  if (options.acceptance_mode ==
+          chart_spr_acceptance_mode::fixed_topology_exact &&
+      multifurcating_output) {
+    // WI6 gates grammar-exact multisite scoring on multifurcating grammars.
+    // For fixed_topology_exact local commits, the chain objective is already
+    // the verified selected-topology score and compaction above preserves that
+    // complete witness topology in the output DAG.  Do not route the final
+    // check through the binary-only grammar-exact trim path.
+    if (accepted_topology_key_sets.empty()) {
+      throw std::runtime_error(
+          "chart SPR local accepted-state final compaction: fixed-topology "
+          "multifurcation output is missing an accepted topology witness");
+    }
+    result.rebuilt_score =
+        chart_spr_score_rebuilt_topology_key_set_with_invariants(
+            compacted.rebuilt.grammar, local_state.active_patterns,
+            local_state.chart_opts, local_state.invariant_constant_offset,
+            accepted_topology_key_sets.back(),
+            "chart SPR local accepted-state final compaction");
+    if (result.rebuilt_score != expected_score) {
+      throw std::runtime_error(
+          "chart SPR local accepted-state final compaction: rebuilt "
+          "fixed-topology witness score " +
+          std::to_string(result.rebuilt_score) +
+          " does not match chain recorded objective " +
+          std::to_string(expected_score));
+    }
+    result.exactness_kind = multisite_keep_mask_kind::none;
+  } else {
+    auto oracle = grammar_level_exact_parsimony(
+        compacted.rebuilt.grammar, local_state.active_patterns,
+        local_state.chart_opts, local_state.invariant_constant_offset,
+        options.exact_trim);
+    result.rebuilt_score = oracle.value;
+    result.exactness_kind = oracle.exactness_kind;
+
+    if (result.rebuilt_score > expected_score) {
+      throw std::runtime_error(
+          "chart SPR local accepted-state final compaction: grammar-level "
+          "output DAG optimum " +
+          std::to_string(result.rebuilt_score) +
+          " exceeds chain recorded objective " +
+          std::to_string(expected_score));
+    }
+    if (options.acceptance_mode ==
+            chart_spr_acceptance_mode::exact_multisite &&
+        result.rebuilt_score != expected_score) {
+      throw std::runtime_error(
+          "chart SPR local accepted-state final compaction: grammar-level "
+          "output DAG optimum " +
+          std::to_string(result.rebuilt_score) +
+          " does not match exact chain objective " +
+          std::to_string(expected_score));
+    }
   }
 
   result.dag = std::move(compacted.dag);
@@ -2672,6 +2745,8 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.fixed_topology_selected_rows_computed;
   summary.selected_topology_multifurcation_rows =
       counters.selected_topology_multifurcation_rows;
+  summary.spr_multifurcation_moves_generated =
+      counters.spr_multifurcation_moves_generated;
   summary.fixed_topology_persistent_cache_verifications =
       counters.fixed_topology_persistent_cache_verifications;
   summary.fixed_topology_persistent_cache_fallbacks =

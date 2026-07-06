@@ -181,9 +181,10 @@ inline production_id ensure_production_by_key(
     clade_grammar& grammar, rank3_production_taxa_key key,
     std::string const& context) {
   rank3_detail::normalize_production_key(key);
-  if (key.children.size() != 2) {
+  if (key.children.size() < 2) {
     throw std::runtime_error(
-        context + ": witness topology production is not binary: " +
+        context +
+        ": witness topology production has fewer than 2 children: " +
         rank3_detail::production_key_to_string(key));
   }
   if (auto existing = find_production_by_key_or_none(grammar, key);

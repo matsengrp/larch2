@@ -80,6 +80,7 @@ struct chart_spr_search_counters {
   std::size_t candidates_pruned_immediate_reversal = 0;
   std::size_t candidates_pruned_duplicate = 0;
   std::size_t candidates_pruned_invalid = 0;
+  std::size_t spr_multifurcation_moves_generated = 0;
   std::size_t candidate_cap_cutoffs = 0;
   std::size_t path_budget_cutoffs = 0;
 
@@ -739,6 +740,7 @@ struct chart_spr_search_summary {
   std::size_t fixed_topology_selected_cache_misses = 0;
   std::size_t fixed_topology_selected_rows_computed = 0;
   std::size_t selected_topology_multifurcation_rows = 0;
+  std::size_t spr_multifurcation_moves_generated = 0;
   std::size_t fixed_topology_persistent_cache_verifications = 0;
   std::size_t fixed_topology_persistent_cache_fallbacks = 0;
   std::size_t fixed_topology_persistent_cache_oracle_mismatches = 0;
@@ -928,8 +930,25 @@ inline std::uint64_t hash_string_u64(std::string const& value) {
   return seed;
 }
 
-inline void validate_binary_chart_compatible_grammar(
+inline bool chart_spr_grammar_has_multifurcation(
     clade_grammar const& grammar) {
+  return std::any_of(grammar.productions.begin(), grammar.productions.end(),
+                     [](auto const& prod) {
+                       return prod.children.size() != 2;
+                     });
+}
+
+inline void validate_chart_spr_exact_multisite_multifurcation_gate(
+    clade_grammar const& grammar, std::string_view context) {
+  if (!chart_spr_grammar_has_multifurcation(grammar)) return;
+  throw std::runtime_error(
+      std::string{context} +
+      ": WI6 exact_multisite does not support multifurcating productions; "
+      "use fixed_topology_exact or lower_bound_heuristic for DAG-native "
+      "multifurcation SPR search");
+}
+
+inline void validate_chart_spr_search_grammar(clade_grammar const& grammar) {
   parsimony_chart_detail::validate_chart_grammar(grammar);
   chart_trim_detail::validate_production_indices(grammar);
   if (grammar.root_clade == no_clade ||
@@ -948,22 +967,16 @@ inline void validate_binary_chart_compatible_grammar(
     } else if (productions.empty()) {
       throw std::runtime_error(
           "chart SPR search: non-singleton clade " + std::to_string(cid) +
-          " has no productions; DAG-native chart-SPR requires a binary "
+          " has no productions; DAG-native chart-SPR requires a "
           "chart-compatible grammar");
     }
   }
 
   for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
     auto const& prod = grammar.productions[pid];
-    if (prod.children.size() != 2) {
-      throw std::runtime_error(
-          "chart SPR search: production " + std::to_string(pid) +
-          " has arity " + std::to_string(prod.children.size()) +
-          "; DAG-native chart-SPR requires a binary chart-compatible grammar "
-          "(run/refine polytomies first or choose reject mode)");
-    }
-    parsimony_chart_detail::validate_binary_production_partition(
-        grammar, prod, static_cast<production_id>(pid));
+    parsimony_chart_detail::validate_production_inside_row_inputs(
+        grammar, prod, static_cast<production_id>(pid),
+        "chart SPR search");
   }
 }
 
@@ -1332,7 +1345,11 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     multisite_trim_options const& trim_options = {},
     chart_cache_options cache = {}) {
   validate_supported_chart_cache_options(cache);
-  chart_spr_search_detail::validate_binary_chart_compatible_grammar(grammar);
+  chart_spr_search_detail::validate_chart_spr_search_grammar(grammar);
+  if (build_exact_trim) {
+    chart_spr_search_detail::validate_chart_spr_exact_multisite_multifurcation_gate(
+        grammar, "chart SPR search state");
+  }
   active_build.active_patterns.assert_no_skipped_invariant_metadata();
   chart_multisite_detail::validate_multisite_inputs(
       grammar, active_build.active_patterns.patterns, options);
@@ -2307,6 +2324,8 @@ inline void add_chart_spr_search_counters(
       src.candidates_pruned_immediate_reversal;
   dst.candidates_pruned_duplicate += src.candidates_pruned_duplicate;
   dst.candidates_pruned_invalid += src.candidates_pruned_invalid;
+  dst.spr_multifurcation_moves_generated +=
+      src.spr_multifurcation_moves_generated;
   dst.candidate_cap_cutoffs += src.candidate_cap_cutoffs;
   dst.path_budget_cutoffs += src.path_budget_cutoffs;
   dst.overlay_reachability_validations +=
@@ -2790,6 +2809,8 @@ inline void record_chart_spr_candidate_generation_stats(
       stats.candidates_pruned_immediate_reversal;
   counters.candidates_pruned_duplicate += stats.candidates_pruned_duplicate;
   counters.candidates_pruned_invalid += stats.candidates_pruned_invalid;
+  counters.spr_multifurcation_moves_generated +=
+      stats.spr_multifurcation_moves_generated;
   if (stats.stop_reason == chart_spr_candidate_stop_reason::candidate_cap) {
     ++counters.candidate_cap_cutoffs;
   }
@@ -3949,6 +3970,10 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     chart_spr_search_state const& state,
     chart_spr_search_options options = {}, std::size_t iteration = 0) {
   validate_supported_chart_cache_options(options.cache);
+  if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite) {
+    chart_spr_search_detail::validate_chart_spr_exact_multisite_multifurcation_gate(
+        state.grammar, "chart SPR acceptance iteration");
+  }
   if (options.candidate_selection ==
       chart_spr_candidate_selection_mode::sampled_or_randomized) {
     options.enumeration.randomize_order = true;
@@ -4277,15 +4302,19 @@ enumerate_grammar_spr_candidates_eager_diagnostic(
     auto source_pid = static_cast<production_id>(source_pid_raw);
     if (counters != nullptr) ++counters->candidate_source_productions_considered;
     auto const& source_prod = grammar.productions[source_pid];
-    if (source_prod.children.size() != 2) continue;
+    if (source_prod.children.size() < 2) continue;
 
-    for (std::size_t moved_i = 0; moved_i < 2; ++moved_i) {
+    for (std::size_t moved_i = 0; moved_i < source_prod.children.size();
+         ++moved_i) {
       auto moved = source_prod.children[moved_i];
-      auto old_sibling = source_prod.children[1 - moved_i];
+      auto source_cochildren = cochildren_of(grammar, source_pid, moved);
+      if (!source_cochildren) continue;
       auto const& moved_taxa = grammar.clades[moved].taxa;
 
       for (clade_id target = 0; target < grammar.clades.size(); ++target) {
-        if (target == moved || target == old_sibling ||
+        if (target == moved ||
+            (source_cochildren->size() == 1 &&
+             target == source_cochildren->front()) ||
             target == source_prod.parent) {
           note_pruned_before(result.stats, counters);
           continue;
@@ -4302,8 +4331,8 @@ enumerate_grammar_spr_candidates_eager_diagnostic(
             if (counters != nullptr) ++counters->path_pairs_considered;
 
             auto candidate = make_general_spr_candidate(
-                grammar, base_lookup, source_pid, moved, old_sibling, target,
-                source_path, dest_path);
+                grammar, base_lookup, source_pid, moved, target, source_path,
+                dest_path);
             if (!candidate) {
               note_pruned_after(result.stats, counters);
               continue;
@@ -4318,6 +4347,13 @@ enumerate_grammar_spr_candidates_eager_diagnostic(
               continue;
             }
 
+            if (grammar_spr_candidate_involves_multifurcation(grammar,
+                                                              *candidate)) {
+              ++result.stats.spr_multifurcation_moves_generated;
+              if (counters != nullptr) {
+                ++counters->spr_multifurcation_moves_generated;
+              }
+            }
             result.candidates.push_back(std::move(*candidate));
             ++result.stats.candidates_generated_after_dedup;
             if (counters != nullptr) ++counters->candidates_generated_after_dedup;

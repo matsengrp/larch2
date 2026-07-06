@@ -462,13 +462,15 @@ inline void collect_reachable_topology_productions(
         "rank3 option A: selected production parent mismatch at clade " +
         std::to_string(clade));
   }
-  if (prod.children.size() != 2) {
+  if (prod.children.size() < 2) {
     throw std::runtime_error(
         "rank3 option A: selected production " + std::to_string(pid) +
         " has arity " + std::to_string(prod.children.size()) +
-        "; Option A materializes binary concrete trees only");
+        "; Option A materializes concrete tree productions with at least 2 "
+        "children");
   }
-  chart_trim_detail::validate_binary_production_for_trim(grammar, prod, pid);
+  parsimony_chart_detail::validate_production_inside_row_inputs(
+      grammar, prod, pid, "rank3 option A");
   reachable_production[pid] = true;
 
   for (auto child : prod.children) {
@@ -610,10 +612,9 @@ inline std::size_t build_tree_subtree(
       throw std::runtime_error(
           "rank3 option A: selected production parent mismatch");
     }
-    if (prod.children.size() != 2) {
+    if (prod.children.size() < 2) {
       throw std::runtime_error(
-          "rank3 option A: selected production is not a binary concrete "
-          "branching");
+          "rank3 option A: selected production has fewer than 2 children");
     }
     auto inner = tree.append_node<node_kind::inner>();
     node_idx = inner.index();
@@ -766,12 +767,12 @@ inline void validate_temp_production_partition(
         "rank3 grammar-native materialization: temp production out of range");
   }
   auto const& prod = overlay.temp_productions[temp_pid];
-  if (prod.children.size() != 2) {
+  if (prod.children.size() < 2) {
     throw std::runtime_error(
         "rank3 grammar-native materialization: temp production " +
         std::to_string(temp_pid) + " has arity " +
         std::to_string(prod.children.size()) +
-        "; grammar-native materialization is binary-only");
+        "; grammar-native materialization requires at least 2 children");
   }
 
   auto parent_taxa = overlay_taxa_for_ref(

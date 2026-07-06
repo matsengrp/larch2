@@ -252,6 +252,7 @@ struct chart_spr_candidate_generation_stats {
   std::size_t candidates_pruned_immediate_reversal = 0;
   std::size_t candidates_pruned_duplicate = 0;
   std::size_t candidates_pruned_invalid = 0;
+  std::size_t spr_multifurcation_moves_generated = 0;
 
   chart_spr_candidate_stop_reason stop_reason =
       chart_spr_candidate_stop_reason::exhausted;
@@ -930,20 +931,28 @@ struct upward_path_step {
   production_id production = no_production;
   clade_id parent = no_clade;
   clade_id child = no_clade;
-  clade_id sibling = no_clade;
+  std::vector<clade_id> cochildren;
 };
 
 using upward_path = std::vector<upward_path_step>;
 
-inline std::optional<clade_id> binary_sibling_for_child(
+inline std::optional<std::vector<clade_id>> cochildren_of(
     clade_grammar const& grammar, production_id pid, clade_id child) {
   if (pid == no_production || pid >= grammar.productions.size())
     return std::nullopt;
   auto const& prod = grammar.productions[pid];
-  if (prod.children.size() != 2) return std::nullopt;
-  if (prod.children[0] == child) return prod.children[1];
-  if (prod.children[1] == child) return prod.children[0];
-  return std::nullopt;
+  std::vector<clade_id> cochildren;
+  cochildren.reserve(prod.children.size());
+  bool found = false;
+  for (auto candidate : prod.children) {
+    if (candidate == child) {
+      found = true;
+    } else {
+      cochildren.push_back(candidate);
+    }
+  }
+  if (!found || cochildren.empty()) return std::nullopt;
+  return cochildren;
 }
 
 inline std::vector<upward_path> enumerate_upward_paths_to_root(
@@ -960,13 +969,14 @@ inline std::vector<upward_path> enumerate_upward_paths_to_root(
     if (!active.insert(clade).second) return;
     for (auto pid : grammar.productions_by_child[clade]) {
       auto const& prod = grammar.productions[pid];
-      auto sibling = binary_sibling_for_child(grammar, pid, clade);
-      if (!sibling) continue;
+      auto cochildren = cochildren_of(grammar, pid, clade);
+      if (!cochildren) continue;
       if (grammar.clades[prod.parent].taxa.size() <=
           grammar.clades[clade].taxa.size()) {
         continue;
       }
-      current.push_back(upward_path_step{pid, prod.parent, clade, *sibling});
+      current.push_back(
+          upward_path_step{pid, prod.parent, clade, std::move(*cochildren)});
       self(self, prod.parent);
       current.pop_back();
     }
@@ -1007,18 +1017,114 @@ inline void append_removed_base_production(grammar_spr_candidate& candidate,
   }
 }
 
+inline std::vector<overlay_clade_ref> base_child_refs(
+    std::vector<clade_id> const& children) {
+  std::vector<overlay_clade_ref> refs;
+  refs.reserve(children.size());
+  for (auto child : children) refs.push_back(base_clade_ref(child));
+  return refs;
+}
+
+inline std::vector<taxon_id> candidate_ref_taxa_copy(
+    clade_grammar const& grammar, grammar_spr_candidate const& candidate,
+    overlay_clade_ref ref) {
+  if (ref.space == overlay_id_space::base) {
+    if (ref.id == no_clade || ref.id >= grammar.clades.size()) {
+      throw std::runtime_error("chart SPR: base clade ref out of range");
+    }
+    return grammar.clades[ref.id].taxa;
+  }
+  if (ref.id == no_clade || ref.id >= candidate.added_clades.size()) {
+    throw std::runtime_error("chart SPR: temp clade ref out of range");
+  }
+  return candidate.added_clades[ref.id].taxa;
+}
+
+struct candidate_child_group {
+  overlay_clade_ref ref;
+  std::vector<taxon_id> taxa;
+};
+
+inline std::optional<candidate_child_group> ensure_candidate_group_for_refs(
+    clade_grammar const& grammar, grammar_spr_candidate& candidate,
+    std::map<std::vector<taxon_id>, clade_id> const& base_lookup,
+    std::map<std::vector<taxon_id>, clade_id>& temp_lookup,
+    std::vector<overlay_clade_ref> children,
+    std::optional<production_id> ignore_base_pid = {},
+    bool add_production = true) {
+  if (children.empty()) return std::nullopt;
+
+  std::vector<taxon_id> covered;
+  for (auto child : children) {
+    auto child_taxa = candidate_ref_taxa_copy(grammar, candidate, child);
+    if (!disjoint_taxa(covered, child_taxa)) return std::nullopt;
+    covered = set_union_taxa(std::move(covered), child_taxa);
+  }
+
+  if (children.size() == 1) {
+    return candidate_child_group{children.front(), std::move(covered)};
+  }
+
+  auto parent_ref = add_or_get_candidate_clade(
+      grammar, candidate, base_lookup, temp_lookup, covered);
+  if (add_production) {
+    maybe_add_candidate_production(grammar, candidate, parent_ref,
+                                   std::move(children), ignore_base_pid);
+  }
+  return candidate_child_group{
+      parent_ref, candidate_ref_taxa_copy(grammar, candidate, parent_ref)};
+}
+
+inline std::optional<candidate_child_group> ensure_candidate_group_for_base_children(
+    clade_grammar const& grammar, grammar_spr_candidate& candidate,
+    std::map<std::vector<taxon_id>, clade_id> const& base_lookup,
+    std::map<std::vector<taxon_id>, clade_id>& temp_lookup,
+    std::vector<clade_id> const& children,
+    std::optional<production_id> ignore_base_pid = {},
+    bool add_production = true) {
+  return ensure_candidate_group_for_refs(
+      grammar, candidate, base_lookup, temp_lookup, base_child_refs(children),
+      ignore_base_pid, add_production);
+}
+
+inline bool append_lca_child_if_disjoint(
+    clade_grammar const& grammar, grammar_spr_candidate const& candidate,
+    std::vector<overlay_clade_ref>& children,
+    std::vector<std::vector<taxon_id>>& child_taxa, overlay_clade_ref ref) {
+  auto taxa = candidate_ref_taxa_copy(grammar, candidate, ref);
+  for (auto const& existing : child_taxa) {
+    if (!disjoint_taxa(existing, taxa)) return false;
+  }
+  children.push_back(ref);
+  child_taxa.push_back(std::move(taxa));
+  return true;
+}
+
+inline void append_lca_base_cochildren_if_disjoint(
+    clade_grammar const& grammar, grammar_spr_candidate const& candidate,
+    std::vector<overlay_clade_ref>& children,
+    std::vector<std::vector<taxon_id>>& child_taxa,
+    std::vector<clade_id> const& cochildren) {
+  for (auto cochild : cochildren) {
+    (void)append_lca_child_if_disjoint(
+        grammar, candidate, children, child_taxa, base_clade_ref(cochild));
+  }
+}
+
 inline std::optional<grammar_spr_candidate> make_general_spr_candidate(
     clade_grammar const& grammar,
     std::map<std::vector<taxon_id>, clade_id> const& base_lookup,
-    production_id source_pid, clade_id moved, clade_id old_sibling,
-    clade_id target, upward_path const& source_path,
-    upward_path const& dest_path) {
+    production_id source_pid, clade_id moved, clade_id target,
+    upward_path const& source_path, upward_path const& dest_path) {
   if (source_pid == no_production || source_pid >= grammar.productions.size())
     return std::nullopt;
   auto const& source_prod = grammar.productions[source_pid];
   auto old_parent = source_prod.parent;
-  if (source_prod.children.size() != 2) return std::nullopt;
-  if (target == moved || target == old_sibling) return std::nullopt;
+  auto source_cochildren = cochildren_of(grammar, source_pid, moved);
+  if (!source_cochildren) return std::nullopt;
+  if (target == moved || target == old_parent) return std::nullopt;
+  if (source_cochildren->size() == 1 && target == source_cochildren->front())
+    return std::nullopt;
 
   auto const& moved_taxa = grammar.clades[moved].taxa;
   auto const& target_taxa = grammar.clades[target].taxa;
@@ -1034,13 +1140,16 @@ inline std::optional<grammar_spr_candidate> make_general_spr_candidate(
   grammar_spr_candidate candidate;
   candidate.moved_clade = base_clade_ref(moved);
   candidate.old_parent = base_clade_ref(old_parent);
-  candidate.old_sibling = base_clade_ref(old_sibling);
   candidate.new_sibling_or_target = base_clade_ref(target);
   append_removed_base_production(candidate, source_pid);
 
   std::map<std::vector<taxon_id>, clade_id> temp_lookup;
-  auto source_current_taxa = grammar.clades[old_sibling].taxa;
-  auto source_current_ref = base_clade_ref(old_sibling);
+  auto source_remaining = ensure_candidate_group_for_base_children(
+      grammar, candidate, base_lookup, temp_lookup, *source_cochildren, {},
+      source_lca_index != 0);
+  if (!source_remaining) return std::nullopt;
+  candidate.old_sibling = source_remaining->ref;
+  auto source_current_ref = source_remaining->ref;
 
   // Transform the source branch up to, but not including, the LCA.  The final
   // LCA production is rebuilt after the destination branch has been expanded.
@@ -1050,23 +1159,24 @@ inline std::optional<grammar_spr_candidate> make_general_spr_candidate(
 
     auto parent_taxa = set_difference_taxa(
         grammar.clades[source_path[i].parent].taxa, moved_taxa);
-    auto sibling_taxa = grammar.clades[source_path[i].sibling].taxa;
-    if (!disjoint_taxa(source_current_taxa, sibling_taxa)) return std::nullopt;
-    auto parent_ref = add_or_get_candidate_clade(
-        grammar, candidate, base_lookup, temp_lookup, parent_taxa);
-    maybe_add_candidate_production(
-        grammar, candidate, parent_ref,
-        {source_current_ref, base_clade_ref(source_path[i].sibling)});
-    source_current_taxa = std::move(parent_taxa);
-    source_current_ref = parent_ref;
+    std::vector<overlay_clade_ref> children;
+    children.reserve(source_path[i].cochildren.size() + 1);
+    children.push_back(source_current_ref);
+    auto cochild_refs = base_child_refs(source_path[i].cochildren);
+    children.insert(children.end(), cochild_refs.begin(), cochild_refs.end());
+    auto parent_group = ensure_candidate_group_for_refs(
+        grammar, candidate, base_lookup, temp_lookup, std::move(children));
+    if (!parent_group || parent_group->taxa != parent_taxa)
+      return std::nullopt;
+    source_current_ref = parent_group->ref;
   }
 
-  auto dest_current_taxa = set_union_taxa(moved_taxa, target_taxa);
-  auto dest_current_ref = add_or_get_candidate_clade(
-      grammar, candidate, base_lookup, temp_lookup, dest_current_taxa);
-  maybe_add_candidate_production(
-      grammar, candidate, dest_current_ref,
+  auto dest_current = ensure_candidate_group_for_refs(
+      grammar, candidate, base_lookup, temp_lookup,
       {base_clade_ref(moved), base_clade_ref(target)});
+  if (!dest_current) return std::nullopt;
+  auto dest_current_taxa = dest_current->taxa;
+  auto dest_current_ref = dest_current->ref;
 
   bool destination_already_rebuilt_lca = (dest_current_taxa == grammar.clades[lca].taxa);
   for (std::size_t i = 0; i < dest_lca_index && !destination_already_rebuilt_lca;
@@ -1074,25 +1184,62 @@ inline std::optional<grammar_spr_candidate> make_general_spr_candidate(
     append_removed_base_production(candidate, dest_path[i].production);
     if (dest_path[i].parent == lca) break;
 
-    auto sibling_taxa = grammar.clades[dest_path[i].sibling].taxa;
-    if (!disjoint_taxa(moved_taxa, sibling_taxa)) return std::nullopt;
     auto parent_taxa = set_union_taxa(grammar.clades[dest_path[i].parent].taxa,
                                       moved_taxa);
-    auto parent_ref = add_or_get_candidate_clade(
-        grammar, candidate, base_lookup, temp_lookup, parent_taxa);
-    maybe_add_candidate_production(
-        grammar, candidate, parent_ref,
-        {dest_current_ref, base_clade_ref(dest_path[i].sibling)});
-    dest_current_taxa = std::move(parent_taxa);
-    dest_current_ref = parent_ref;
+    std::vector<overlay_clade_ref> children;
+    children.reserve(dest_path[i].cochildren.size() + 1);
+    children.push_back(dest_current_ref);
+    auto cochild_refs = base_child_refs(dest_path[i].cochildren);
+    children.insert(children.end(), cochild_refs.begin(), cochild_refs.end());
+    auto parent_group = ensure_candidate_group_for_refs(
+        grammar, candidate, base_lookup, temp_lookup, std::move(children));
+    if (!parent_group || parent_group->taxa != parent_taxa)
+      return std::nullopt;
+    dest_current_taxa = std::move(parent_group->taxa);
+    dest_current_ref = parent_group->ref;
     destination_already_rebuilt_lca =
         (dest_current_taxa == grammar.clades[lca].taxa);
   }
 
   if (!destination_already_rebuilt_lca) {
-    if (!disjoint_taxa(source_current_taxa, dest_current_taxa)) return std::nullopt;
-    maybe_add_candidate_production(grammar, candidate, base_clade_ref(lca),
-                                   {source_current_ref, dest_current_ref});
+    std::vector<overlay_clade_ref> lca_children;
+    std::vector<std::vector<taxon_id>> lca_child_taxa;
+    lca_children.reserve(source_prod.children.size() + dest_path.size() + 2);
+    lca_child_taxa.reserve(lca_children.capacity());
+
+    if (source_lca_index != 0) {
+      if (!append_lca_child_if_disjoint(
+              grammar, candidate, lca_children, lca_child_taxa,
+              source_current_ref)) {
+        return std::nullopt;
+      }
+    }
+    if (!append_lca_child_if_disjoint(
+            grammar, candidate, lca_children, lca_child_taxa,
+            dest_current_ref)) {
+      return std::nullopt;
+    }
+    if (source_lca_index == 0) {
+      append_lca_base_cochildren_if_disjoint(
+          grammar, candidate, lca_children, lca_child_taxa,
+          *source_cochildren);
+    } else {
+      append_lca_base_cochildren_if_disjoint(
+          grammar, candidate, lca_children, lca_child_taxa,
+          source_path[source_lca_index - 1].cochildren);
+    }
+    if (dest_lca_index > 0) {
+      append_lca_base_cochildren_if_disjoint(
+          grammar, candidate, lca_children, lca_child_taxa,
+          dest_path[dest_lca_index - 1].cochildren);
+    }
+
+    auto lca_group = ensure_candidate_group_for_refs(
+        grammar, candidate, base_lookup, temp_lookup, std::move(lca_children));
+    if (!lca_group || lca_group->ref != base_clade_ref(lca) ||
+        lca_group->taxa != grammar.clades[lca].taxa) {
+      return std::nullopt;
+    }
   }
 
   std::sort(candidate.removed_productions.begin(),
@@ -1165,6 +1312,21 @@ inline std::size_t estimate_candidate_affected_clades(
          candidate.removed_productions.size();
 }
 
+inline bool grammar_spr_candidate_involves_multifurcation(
+    clade_grammar const& grammar, grammar_spr_candidate const& candidate) {
+  for (auto ref : candidate.removed_productions) {
+    if (ref.space != overlay_id_space::base) continue;
+    if (ref.id == no_production || ref.id >= grammar.productions.size()) {
+      continue;
+    }
+    if (grammar.productions[ref.id].children.size() != 2) return true;
+  }
+  return std::any_of(candidate.added_productions.begin(),
+                     candidate.added_productions.end(), [](auto const& prod) {
+                       return prod.children.size() != 2;
+                     });
+}
+
 inline std::size_t estimate_candidate_affected_clades_before_construction(
     upward_path const& source_path, upward_path const& dest_path) {
   // Cheap path-length proxy used only as an early filter before
@@ -1214,8 +1376,8 @@ void for_each_upward_path_to_root_lazy(
     shuffle_if_requested(parent_productions, options, rng);
     for (auto pid : parent_productions) {
       auto const& prod = grammar.productions[pid];
-      auto sibling = binary_sibling_for_child(grammar, pid, clade);
-      if (!sibling) continue;
+      auto cochildren = cochildren_of(grammar, pid, clade);
+      if (!cochildren) continue;
       if (grammar.clades[prod.parent].taxa.size() <=
           grammar.clades[clade].taxa.size()) {
         continue;
@@ -1228,7 +1390,8 @@ void for_each_upward_path_to_root_lazy(
         return false;
       }
       ++stats.upward_path_iterator_steps;
-      current.push_back(upward_path_step{pid, prod.parent, clade, *sibling});
+      current.push_back(
+          upward_path_step{pid, prod.parent, clade, std::move(*cochildren)});
       if (!self(self, prod.parent)) {
         current.pop_back();
         active.erase(clade);
@@ -1591,7 +1754,7 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
       break;
     }
     auto const& source_prod = grammar.productions[source_pid];
-    if (source_prod.children.size() != 2) continue;
+    if (source_prod.children.size() < 2) continue;
     if (!options.include_root_moves &&
         source_prod.parent == grammar.root_clade) {
       note_pruned_before(stats,
@@ -1600,14 +1763,16 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
       continue;
     }
 
-    std::array<std::size_t, 2> moved_order{0, 1};
+    std::vector<std::size_t> moved_order(source_prod.children.size());
+    std::iota(moved_order.begin(), moved_order.end(), std::size_t{0});
     if (options.randomize_order) {
       std::shuffle(moved_order.begin(), moved_order.end(), rng);
     }
     for (auto moved_i : moved_order) {
       if (stopped()) break;
       auto moved = source_prod.children[moved_i];
-      auto old_sibling = source_prod.children[1 - moved_i];
+      auto source_cochildren = cochildren_of(grammar, source_pid, moved);
+      if (!source_cochildren) continue;
       auto const& moved_taxa = grammar.clades[moved].taxa;
       if (!clade_size_allowed(moved_taxa.size(),
                               options.min_moved_clade_size,
@@ -1624,7 +1789,9 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
           request_stop(chart_spr_candidate_stop_reason::candidate_cap);
           break;
         }
-        if (target == moved || target == old_sibling ||
+        if (target == moved ||
+            (source_cochildren->size() == 1 &&
+             target == source_cochildren->front()) ||
             target == source_prod.parent ||
             (!options.include_root_moves && target == grammar.root_clade)) {
           note_pruned_before(stats,
@@ -1688,8 +1855,8 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
                     }
 
                     auto candidate = make_general_spr_candidate(
-                        grammar, base_lookup, source_pid, moved, old_sibling,
-                        target, source_path, dest_path);
+                        grammar, base_lookup, source_pid, moved, target,
+                        source_path, dest_path);
                     if (!candidate) {
                       note_pruned_after(
                           stats,
@@ -1744,6 +1911,10 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
                     }
 
                     ++stats.candidates_generated_after_dedup;
+                    if (grammar_spr_candidate_involves_multifurcation(
+                            grammar, *candidate)) {
+                      ++stats.spr_multifurcation_moves_generated;
+                    }
                     if (!invoke_candidate_callback(callback, *candidate)) {
                       return request_stop(
                           chart_spr_candidate_stop_reason::callback_stop);
@@ -2643,6 +2814,9 @@ chart_spr_candidate_generation_stats for_each_sampled_tree_spr_candidate(
         return;
       }
       ++stats.candidates_generated_after_dedup;
+      if (grammar_spr_candidate_involves_multifurcation(grammar, *projected)) {
+        ++stats.spr_multifurcation_moves_generated;
+      }
       if (!invoke_candidate_callback(callback, *projected)) {
         request_stop(chart_spr_candidate_stop_reason::callback_stop);
         stop_now();
@@ -2698,6 +2872,9 @@ chart_spr_candidate_generation_stats for_each_hybrid_spr_candidate(
       return true;
     }
     ++combined.candidates_generated_after_dedup;
+    if (grammar_spr_candidate_involves_multifurcation(grammar, candidate)) {
+      ++combined.spr_multifurcation_moves_generated;
+    }
     if (!invoke_candidate_callback(callback, candidate)) {
       return request_stop(chart_spr_candidate_stop_reason::callback_stop);
     }
