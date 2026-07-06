@@ -102,6 +102,82 @@ struct active_fixture {
   larch::chart_options options;
 };
 
+static larch::test::tiny_tree_node tiny_leaf_state(std::string name,
+                                                   char state) {
+  return larch::test::tiny_leaf(std::move(name), std::string(1, state));
+}
+
+static active_fixture make_tiny_active_fixture(std::string name,
+                                               larch::phylo_dag dag,
+                                               bool allow_polytomies) {
+  active_fixture f;
+  f.name = std::move(name);
+  larch::clade_grammar_options grammar_opts;
+  grammar_opts.allow_polytomies = allow_polytomies;
+  f.grammar = larch::build_clade_grammar(dag, grammar_opts);
+  auto built = larch::make_active_search_patterns(dag, f.grammar, f.options);
+  f.active = std::move(built.active_patterns);
+  f.invariant_offset = built.invariant_constant_offset;
+  CHECK(!f.active.patterns.patterns.empty());
+  return f;
+}
+
+static larch::taxon_id taxon_for(larch::clade_grammar const& grammar,
+                                 std::string const& sample_id) {
+  auto found = grammar.taxa.sample_id_to_id.find(sample_id);
+  if (found == grammar.taxa.sample_id_to_id.end()) {
+    throw std::runtime_error("outside cache test: missing taxon " + sample_id);
+  }
+  return found->second;
+}
+
+static larch::clade_id clade_for(larch::clade_grammar const& grammar,
+                                 std::vector<std::string> sample_ids) {
+  std::vector<larch::taxon_id> taxa;
+  taxa.reserve(sample_ids.size());
+  for (auto const& sample_id : sample_ids) {
+    taxa.push_back(taxon_for(grammar, sample_id));
+  }
+  std::sort(taxa.begin(), taxa.end());
+  for (larch::clade_id cid = 0; cid < grammar.clades.size(); ++cid) {
+    if (grammar.clades[cid].taxa == taxa) return cid;
+  }
+  throw std::runtime_error("outside cache test: missing clade");
+}
+
+static larch::production_id production_for(
+    larch::clade_grammar const& grammar, larch::clade_id parent,
+    std::vector<larch::clade_id> children) {
+  std::sort(children.begin(), children.end());
+  for (auto pid : grammar.productions_by_parent[parent]) {
+    auto prod_children = grammar.productions[pid].children;
+    std::sort(prod_children.begin(), prod_children.end());
+    if (prod_children == children) return pid;
+  }
+  throw std::runtime_error("outside cache test: missing production");
+}
+
+static larch::clade_key clade_key_for_samples(
+    larch::clade_grammar const& grammar, std::vector<std::string> sample_ids) {
+  larch::clade_key key;
+  key.taxa.reserve(sample_ids.size());
+  for (auto const& sample_id : sample_ids) {
+    key.taxa.push_back(taxon_for(grammar, sample_id));
+  }
+  std::sort(key.taxa.begin(), key.taxa.end());
+  return key;
+}
+
+static larch::overlay_grammar_production overlay_prod(
+    larch::overlay_clade_ref parent,
+    std::vector<larch::overlay_clade_ref> children) {
+  larch::overlay_grammar_production prod;
+  prod.parent = parent;
+  prod.children = std::move(children);
+  prod.multiplicity = 1;
+  return prod;
+}
+
 static active_fixture load_binary_four_fixture() {
   active_fixture f;
   f.name = "wric_binary_four";
@@ -426,6 +502,58 @@ static void assert_cache_both_charts_match_from_scratch(
   }
 }
 
+static larch::spr_overlay_delta assert_local_overlay_delta_matches_materialized(
+    active_fixture const& f, larch::grammar_spr_candidate const& candidate,
+    std::string const& context) {
+  auto delta = larch::build_spr_overlay_delta(f.grammar, candidate);
+  auto overlay = larch::overlay_from_candidate(f.grammar, candidate);
+  auto materialized = larch::materialize_overlay_grammar(overlay);
+
+  for (std::size_t p = 0; p < f.active.patterns.patterns.size(); ++p) {
+    larch::leaf_site_states states;
+    states.state_by_taxon = f.active.patterns.patterns[p].state_by_taxon;
+    auto base_chart = larch::build_single_site_chart(f.grammar, states,
+                                                     f.options);
+    auto local_rows = larch::build_local_overlay_chart_rows(
+        delta, base_chart, states, f.options, true);
+    try {
+      larch::verify_local_overlay_rows_against_full(
+          delta, local_rows, base_chart, materialized, states, f.options);
+    } catch (std::runtime_error const& e) {
+      throw std::runtime_error("outside cache test: local overlay mismatch in " +
+                               context + " pattern " + std::to_string(p) +
+                               ": " + e.what());
+    }
+  }
+  return delta;
+}
+
+static void append_delta_and_check(active_fixture const& f,
+                                   larch::spr_overlay_delta const& delta,
+                                   std::string const& context) {
+  larch::overlay_chain chain(f.grammar);
+  larch::inside_chart_cache icache = larch::build_inside_chart_cache(
+      f.grammar, f.active, f.options, f.invariant_offset);
+  larch::outside_chart_cache ocache = larch::build_outside_chart_cache(
+      f.grammar, f.active, f.options);
+  assert_cache_both_charts_match_from_scratch(chain, icache, ocache,
+                                              context + " cold");
+
+  chain.append(delta);
+  larch::apply_commit_to_inside_cache(chain, icache);
+  larch::apply_commit_to_outside_cache(chain, ocache, icache);
+  assert_cache_both_charts_match_from_scratch(chain, icache, ocache,
+                                              context + " committed");
+}
+
+static void assert_candidate_local_and_cache_commit(
+    active_fixture const& f, larch::grammar_spr_candidate const& candidate,
+    std::string const& context) {
+  auto delta = assert_local_overlay_delta_matches_materialized(f, candidate,
+                                                              context);
+  append_delta_and_check(f, delta, context);
+}
+
 // ---------------------------------------------------------------------------
 // Sequential chain runner with per-accept two-chart oracle.  Appends deltas to
 // `chain`, applies each commit to BOTH caches (inside then outside), and
@@ -486,6 +614,100 @@ static std::size_t run_sequential_chain_with_caches(
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
+
+static void test_arity_changing_overlay_commits() {
+  using namespace larch::test;
+  std::println("test_arity_changing_overlay_commits");
+
+  {
+    auto dag = make_tiny_labelled_tree(
+        "A", tiny_inner("root", "A",
+                        {tiny_leaf_state("A", 'A'),
+                         tiny_inner("BC", "A",
+                                    {tiny_leaf_state("B", 'C'),
+                                     tiny_leaf_state("C", 'G')})}));
+    auto f = make_tiny_active_fixture("binary->trinary overlay", std::move(dag),
+                                      false);
+    CHECK(!larch::grammar_has_kary_productions(f.grammar));
+    CHECK(larch::grammar_is_binary_chart_compatible(f.grammar));
+
+    auto root = f.grammar.root_clade;
+    auto a = clade_for(f.grammar, {"A"});
+    auto b = clade_for(f.grammar, {"B"});
+    auto c = clade_for(f.grammar, {"C"});
+    auto bc = clade_for(f.grammar, {"B", "C"});
+    auto root_pid = production_for(f.grammar, root, {a, bc});
+
+    larch::grammar_spr_candidate candidate;
+    candidate.removed_productions.push_back(
+        larch::base_production_ref(root_pid));
+    candidate.added_productions.push_back(overlay_prod(
+        larch::base_clade_ref(root),
+        {larch::base_clade_ref(a), larch::base_clade_ref(b),
+         larch::base_clade_ref(c)}));
+    assert_candidate_local_and_cache_commit(f, candidate, f.name);
+  }
+
+  {
+    auto dag = make_tiny_labelled_tree(
+        "A", tiny_inner("root", "A",
+                        {tiny_leaf_state("A", 'A'), tiny_leaf_state("B", 'C'),
+                         tiny_leaf_state("C", 'G')}));
+    auto f = make_tiny_active_fixture("trinary->binary overlay", std::move(dag),
+                                      true);
+    CHECK(larch::grammar_has_kary_productions(f.grammar));
+
+    auto root = f.grammar.root_clade;
+    auto a = clade_for(f.grammar, {"A"});
+    auto b = clade_for(f.grammar, {"B"});
+    auto c = clade_for(f.grammar, {"C"});
+    auto root_pid = production_for(f.grammar, root, {a, b, c});
+
+    larch::grammar_spr_candidate candidate;
+    candidate.removed_productions.push_back(
+        larch::base_production_ref(root_pid));
+    candidate.added_clades.push_back(clade_key_for_samples(f.grammar, {"B", "C"}));
+    candidate.added_productions.push_back(overlay_prod(
+        larch::base_clade_ref(root),
+        {larch::base_clade_ref(a), larch::temp_clade_ref(0)}));
+    candidate.added_productions.push_back(overlay_prod(
+        larch::temp_clade_ref(0),
+        {larch::base_clade_ref(b), larch::base_clade_ref(c)}));
+    assert_candidate_local_and_cache_commit(f, candidate, f.name);
+  }
+
+  {
+    auto dag = make_tiny_labelled_tree(
+        "A", tiny_inner("root", "A",
+                        {tiny_inner("AB", "A",
+                                    {tiny_leaf_state("A", 'A'),
+                                     tiny_leaf_state("B", 'C')}),
+                         tiny_leaf_state("C", 'G'),
+                         tiny_leaf_state("D", 'T')}));
+    auto f = make_tiny_active_fixture("arity3->arity4 overlay",
+                                      std::move(dag), true);
+    CHECK(larch::grammar_has_kary_productions(f.grammar));
+
+    auto root = f.grammar.root_clade;
+    auto a = clade_for(f.grammar, {"A"});
+    auto b = clade_for(f.grammar, {"B"});
+    auto c = clade_for(f.grammar, {"C"});
+    auto d = clade_for(f.grammar, {"D"});
+    auto ab = clade_for(f.grammar, {"A", "B"});
+    auto root_pid = production_for(f.grammar, root, {ab, c, d});
+
+    larch::grammar_spr_candidate candidate;
+    candidate.removed_productions.push_back(
+        larch::base_production_ref(root_pid));
+    candidate.added_productions.push_back(overlay_prod(
+        larch::base_clade_ref(root),
+        {larch::base_clade_ref(a), larch::base_clade_ref(b),
+         larch::base_clade_ref(c), larch::base_clade_ref(d)}));
+    assert_candidate_local_and_cache_commit(f, candidate, f.name);
+  }
+
+  std::println("  PASS (binary->trinary, trinary->binary, arity3->arity4)");
+}
 
 static void test_single_commit_on_binary_four() {
   std::println("test_single_commit_on_binary_four");
@@ -1175,6 +1397,7 @@ static void test_pairing_guard() {
 }
 
 int main() {
+  test_arity_changing_overlay_commits();
   test_single_commit_on_binary_four();
   test_sequential_chain_two_on_rich();
   test_long_sequential_chain_on_rich();

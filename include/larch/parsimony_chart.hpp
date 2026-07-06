@@ -200,9 +200,9 @@ inline void validate_production_inside_row_inputs(
   }
 }
 
-template <class RowProvider>
+template <class Production, class RowProvider>
 inline chart_cost combine_production_inside_row(
-    grammar_production const& prod, std::uint8_t parent_state,
+    Production const& prod, std::uint8_t parent_state,
     RowProvider&& row_provider) {
   validate_state(parent_state, "parent");
   chart_cost total = 0;

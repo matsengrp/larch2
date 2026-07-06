@@ -202,9 +202,9 @@ inline chart_cost add3(chart_cost a, chart_cost b, chart_cost c) {
       parsimony_chart_detail::saturated_add(a, b), c);
 }
 
-template <class RowProvider>
+template <class Production, class RowProvider>
 inline std::vector<std::array<chart_cost, nuc_state_count>>
-combine_production_outside_rows(grammar_production const& prod,
+combine_production_outside_rows(Production const& prod,
                                 std::uint8_t parent_state,
                                 chart_cost parent_outside,
                                 RowProvider&& inside_provider) {

@@ -13,7 +13,7 @@
 //
 // The inside recurrence is UNCHANGED from `build_single_site_chart`: the row
 // for a clade X is the minimum, over the productions available at X in the
-// committed grammar, of the binary combine of the children's rows plus the
+// committed grammar, of the k-ary combine of the children's rows plus the
 // parent/child transition costs.  `recompute_tip_inside_row` below is a
 // faithful inlining of that recurrence (and of
 // `chart_spr_search_detail::recompute_overlay_delta_row`); it owns no new
@@ -46,6 +46,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -97,6 +98,52 @@ inline clade_key const& chain_tip_clade_key(chain_tip_index const& idx,
 inline std::size_t chain_tip_clade_size(chain_tip_index const& idx,
                                         overlay_clade_ref ref) {
   return chain_tip_clade_key(idx, ref).taxa.size();
+}
+
+inline void validate_tip_overlay_production_partition(
+    chain_tip_index const& idx, overlay_grammar_production const& prod,
+    std::size_t tpid, std::string const& context) {
+  if (prod.children.size() < 2) {
+    throw std::runtime_error(context + ": tip temp production " +
+                             std::to_string(tpid) + " has arity " +
+                             std::to_string(prod.children.size()) +
+                             "; expected at least 2 children");
+  }
+  auto const& parent_taxa = chain_tip_clade_key(idx, prod.parent).taxa;
+  std::vector<taxon_id> covered;
+  for (auto child : prod.children) {
+    auto const& child_taxa = chain_tip_clade_key(idx, child).taxa;
+    if (child_taxa.size() >= parent_taxa.size()) {
+      throw std::runtime_error(context +
+                               ": tip temp production child is not smaller "
+                               "than parent");
+    }
+    if (!std::includes(parent_taxa.begin(), parent_taxa.end(),
+                       child_taxa.begin(), child_taxa.end())) {
+      throw std::runtime_error(context +
+                               ": tip temp production child is not a subset "
+                               "of parent");
+    }
+
+    std::vector<taxon_id> overlap;
+    std::set_intersection(covered.begin(), covered.end(),
+                          child_taxa.begin(), child_taxa.end(),
+                          std::back_inserter(overlap));
+    if (!overlap.empty()) {
+      throw std::runtime_error(context +
+                               ": tip temp production children overlap");
+    }
+
+    std::vector<taxon_id> next;
+    std::set_union(covered.begin(), covered.end(), child_taxa.begin(),
+                   child_taxa.end(), std::back_inserter(next));
+    covered = std::move(next);
+  }
+  if (covered != parent_taxa) {
+    throw std::runtime_error(context +
+                             ": tip temp production children do not union to "
+                             "the parent clade");
+  }
 }
 
 inline std::vector<std::size_t> const& temp_prods_for_parent(
@@ -173,15 +220,10 @@ inline chain_tip_index build_chain_tip_index(overlay_chain const& chain) {
   for (std::size_t i = 0; i < idx.tip_overlay.temp_productions.size(); ++i) {
     auto tpid = i;
     auto const& prod = idx.tip_overlay.temp_productions[i];
-    if (prod.children.size() != 2) {
-      throw std::runtime_error(
-          "inside cache: tip temp production " + std::to_string(tpid) +
-          " has arity " + std::to_string(prod.children.size()) +
-          "; Phase 2 supports binary productions only");
-    }
+    validate_tip_overlay_production_partition(idx, prod, tpid, "inside cache");
     append_parent(prod.parent, tpid);
-    // Dedup children before indexing (a production may list the same clade
-    // twice, e.g. a symmetric split); matches the single-delta substrate.
+    // Dedup defensively before indexing; valid productions are already
+    // pairwise-disjoint by taxon set.
     auto children = prod.children;
     std::sort(children.begin(), children.end());
     children.erase(std::unique(children.begin(), children.end()),
@@ -451,7 +493,6 @@ inline inside_chart_cache build_inside_chart_cache(
     clade_grammar const& base, active_site_pattern_set const& active,
     chart_options options, std::uint64_t invariant_constant_offset) {
   active.assert_no_skipped_invariant_metadata();
-  chart_spr_search_detail::validate_binary_chart_compatible_grammar(base);
   chart_multisite_detail::validate_multisite_inputs(
       base, active.patterns, options);
 
@@ -515,34 +556,25 @@ inline std::array<chart_cost, nuc_state_count> recompute_tip_inside_row(
 
   auto row = parsimony_chart_detail::make_inf_row();
 
-  // Accumulate one binary production's contribution into `row`, reading the
-  // two children rows from the cache.  Matches
+  // Accumulate one production's contribution into `row`, reading the child rows
+  // from the cache. Matches
   // `accumulate_overlay_production_row` / build_single_site_chart exactly.
-  auto accumulate_binary = [&](overlay_clade_ref c0, overlay_clade_ref c1) {
-    if (c0.id == no_clade || c1.id == no_clade) {
-      throw std::runtime_error(
-          "inside cache: production child ref is no_clade");
-    }
-    auto const& left = cache.row(pattern, c0);
-    auto const& right = cache.row(pattern, c1);
+  auto accumulate_children =
+      [&](std::vector<overlay_clade_ref> const& children) {
+    struct production_view {
+      std::vector<overlay_clade_ref> const& children;
+    } prod{children};
     for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
          ++parent_state) {
-      chart_cost best[2] = {chart_inf, chart_inf};
-      std::array<chart_cost, nuc_state_count> const* children[2] = {&left,
-                                                                    &right};
-      for (std::size_t ci = 0; ci < 2; ++ci) {
-        for (std::uint8_t child_state = 0; child_state < nuc_state_count;
-             ++child_state) {
-          best[ci] = std::min(
-              best[ci],
-              parsimony_chart_detail::saturated_add(
-                  (*children[ci])[child_state],
-                  parsimony_chart_detail::transition_cost(parent_state,
-                                                          child_state)));
+      auto row_provider = [&](overlay_clade_ref child) -> auto const& {
+        if (child.id == no_clade) {
+          throw std::runtime_error(
+              "inside cache: production child ref is no_clade");
         }
-      }
-      auto total =
-          parsimony_chart_detail::saturated_add(best[0], best[1]);
+        return cache.row(pattern, child);
+      };
+      auto total = parsimony_chart_detail::combine_production_inside_row(
+          prod, parent_state, row_provider);
       if (total < row[parent_state]) row[parent_state] = total;
     }
   };
@@ -556,19 +588,18 @@ inline std::array<chart_cost, nuc_state_count> recompute_tip_inside_row(
             "inside cache: base production out of range");
       }
       auto const& prod = base.productions[pid];
-      if (prod.children.size() != 2) {
-        throw std::runtime_error(
-            "inside cache: base production arity != 2; binary chart required");
-      }
-      accumulate_binary(base_clade_ref(prod.children[0]),
-                        base_clade_ref(prod.children[1]));
+      parsimony_chart_detail::validate_production_inside_row_inputs(
+          base, prod, pid, "inside cache");
+      std::vector<overlay_clade_ref> children;
+      children.reserve(prod.children.size());
+      for (auto child : prod.children) children.push_back(base_clade_ref(child));
+      accumulate_children(children);
       saw_production = true;
     }
   }
   for (auto tpid : temp_prods_for_parent(idx, ref)) {
     auto const& prod = idx.tip_overlay.temp_productions[tpid];
-    // build_chain_tip_index already asserted arity 2.
-    accumulate_binary(prod.children[0], prod.children[1]);
+    accumulate_children(prod.children);
     saw_production = true;
   }
   if (!saw_production) {

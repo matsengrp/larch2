@@ -476,8 +476,8 @@ static void test_unreachable_dead_clades_ignored_reachable_dead_clades_fail() {
   std::println("  PASS");
 }
 
-static void test_nonbinary_overlay_production_rejected() {
-  std::println("test_nonbinary_overlay_production_rejected");
+static void test_nonbinary_overlay_production_scored_locally() {
+  std::println("test_nonbinary_overlay_production_scored_locally");
 
   auto fixture = make_fixture();
   auto state = larch::build_chart_spr_search_state(
@@ -493,9 +493,22 @@ static void test_nonbinary_overlay_production_rejected() {
        larch::base_clade_ref(cd)}));
 
   auto scored = larch::score_candidate_locally(state, candidate);
-  CHECK(!scored.valid);
-  CHECK(scored.invalid_reason.find("arity 3") != std::string::npos);
+  CHECK(scored.valid);
+  CHECK(scored.invalid_reason.empty());
   CHECK(state.counters.full_overlay_materializations == 0);
+
+  auto delta = larch::build_spr_overlay_delta(fixture.grammar, candidate);
+  auto overlay = larch::overlay_from_candidate(fixture.grammar, candidate);
+  auto materialized = larch::materialize_overlay_grammar(overlay);
+  for (auto const& pattern : fixture.patterns.patterns) {
+    larch::leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
+    auto base_chart = larch::build_single_site_chart(fixture.grammar, states);
+    auto local_rows = larch::build_local_overlay_chart_rows(
+        delta, base_chart, states);
+    larch::verify_local_overlay_rows_against_full(
+        delta, local_rows, base_chart, materialized, states,
+        larch::chart_options{});
+  }
 
   std::println("  PASS");
 }
@@ -3858,7 +3871,7 @@ int main() {
   test_production_delta_only_candidate_metadata_absent_matches_oracle();
   test_multiparent_dag_affected_closure_and_slot_maps();
   test_unreachable_dead_clades_ignored_reachable_dead_clades_fail();
-  test_nonbinary_overlay_production_rejected();
+  test_nonbinary_overlay_production_scored_locally();
   test_overlay_delta_rows_match_full_overlay_for_tiny_candidates();
   test_local_scoring_verify_option_counts_oracle_materialization();
   test_invalid_disconnected_overlay_returns_invalid_score();

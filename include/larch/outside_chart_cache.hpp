@@ -112,15 +112,13 @@ inline bool chain_tip_reachable(chain_tip_index const& idx,
   return ref.id < idx.reachable_temp.size() && idx.reachable_temp[ref.id];
 }
 
-// Invoke `fn(parent, c0, c1)` for every production (base non-tombstoned or
-// temp) in the committed tip grammar where `ref` appears as a child, with `c0`
-// and `c1` the production's two children.  A symmetric production (c0 == c1)
-// emits once; the caller's position scan handles both occurrences.  This is
-// the outside gather's production enumerator and mirrors the scatter loop in
+// Invoke `fn(parent, children)` for every production (base non-tombstoned or
+// temp) in the committed tip grammar where `ref` appears as a child. This is the
+// outside gather's production enumerator and mirrors the scatter loop in
 // `build_single_site_outside_chart` (which iterates productions_by_parent and
-// writes into outside[child]).  Only productions whose parent is reachable
-// are emitted, so the gather matches the dense materialized grammar exactly
-// (see `chain_tip_reachable`).
+// writes into outside[child]). Only productions whose parent is reachable are
+// emitted, so the gather matches the dense materialized grammar exactly (see
+// `chain_tip_reachable`).
 template <typename Fn>
 void for_each_tip_production_with_child(chain_tip_index const& idx,
                                         overlay_clade_ref ref, Fn&& fn) {
@@ -137,14 +135,14 @@ void for_each_tip_production_with_child(chain_tip_index const& idx,
             "outside cache: base production id out of range (by child)");
       }
       auto const& prod = base.productions[pid];
-      if (prod.children.size() != 2) {
-        throw std::runtime_error(
-            "outside cache: base production arity != 2; binary chart required");
-      }
+      parsimony_chart_detail::validate_production_inside_row_inputs(
+          base, prod, pid, "outside cache");
       auto parent_ref = base_clade_ref(prod.parent);
       if (!chain_tip_reachable(idx, parent_ref)) continue;
-      fn(parent_ref, base_clade_ref(prod.children[0]),
-         base_clade_ref(prod.children[1]));
+      std::vector<overlay_clade_ref> children;
+      children.reserve(prod.children.size());
+      for (auto child : prod.children) children.push_back(base_clade_ref(child));
+      fn(parent_ref, children);
     }
     if (ref.id >= idx.temp_prod_by_base_child.size()) {
       throw std::runtime_error(
@@ -156,9 +154,8 @@ void for_each_tip_production_with_child(chain_tip_index const& idx,
             "outside cache: temp production id out of range (by base child)");
       }
       auto const& prod = idx.tip_overlay.temp_productions[tpid];
-      // build_chain_tip_index already asserted arity 2.
       if (!chain_tip_reachable(idx, prod.parent)) continue;
-      fn(prod.parent, prod.children[0], prod.children[1]);
+      fn(prod.parent, prod.children);
     }
   } else {
     if (ref.id >= idx.temp_prod_by_temp_child.size()) {
@@ -172,7 +169,7 @@ void for_each_tip_production_with_child(chain_tip_index const& idx,
       }
       auto const& prod = idx.tip_overlay.temp_productions[tpid];
       if (!chain_tip_reachable(idx, prod.parent)) continue;
-      fn(prod.parent, prod.children[0], prod.children[1]);
+      fn(prod.parent, prod.children);
     }
   }
 }
@@ -391,41 +388,31 @@ inline std::array<chart_cost, nuc_state_count> recompute_tip_outside_row(
     return row;
   }
 
-  // Gather over every production where `ref` is a child.  For each occurrence
-  // (a production may list the same clade at both positions), the contribution
-  // to outside[ref][child_state] is the min over parent_state of
+  // Gather over every production where `ref` is a child. For each occurrence,
+  // the contribution to outside[ref][child_state] is the min over parent_state of
   //   outside[parent][parent_state]
-  // + min over sibling_state ( inside[sibling][sibling_state]
-  //                            + transition_cost(parent_state, sibling_state) )
+  // + sum over siblings of min_s (inside[sibling][s] + c(parent_state, s))
   // + transition_cost(parent_state, child_state).
   // This is `build_single_site_outside_chart`'s inner loop, gathered.
   auto accumulate = [&](overlay_clade_ref parent_ref,
-                        overlay_clade_ref c0, overlay_clade_ref c1) {
-    std::array<overlay_clade_ref, 2> children{c0, c1};
-    for (std::size_t ci = 0; ci < 2; ++ci) {
-      if (!(children[ci] == ref)) continue;
-      auto sibling = children[1 - ci];
-      auto const& parent_outside = ocache.row(pattern, parent_ref);
-      auto const& sibling_inside = icache.row(pattern, sibling);
-      for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
-           ++parent_state) {
-        auto base_cost = parent_outside[parent_state];
-        if (base_cost >= chart_inf) continue;
-        chart_cost sibling_best = chart_inf;
-        for (std::uint8_t sib_state = 0; sib_state < nuc_state_count;
-             ++sib_state) {
-          sibling_best =
-              std::min(sibling_best,
-                       saturated_add(sibling_inside[sib_state],
-                                     transition_cost(parent_state, sib_state)));
-        }
-        if (sibling_best >= chart_inf) continue;
+                        std::vector<overlay_clade_ref> const& children) {
+    struct production_view {
+      std::vector<overlay_clade_ref> const& children;
+    } prod{children};
+    auto const& parent_outside = ocache.row(pattern, parent_ref);
+    for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+         ++parent_state) {
+      auto row_provider = [&](overlay_clade_ref child) -> auto const& {
+        return icache.row(pattern, child);
+      };
+      auto child_rows = chart_trim_detail::combine_production_outside_rows(
+          prod, parent_state, parent_outside[parent_state], row_provider);
+      for (std::size_t ci = 0; ci < children.size(); ++ci) {
+        if (!(children[ci] == ref)) continue;
         for (std::uint8_t child_state = 0; child_state < nuc_state_count;
              ++child_state) {
-          auto candidate = chart_trim_detail::add3(
-              base_cost, sibling_best,
-              transition_cost(parent_state, child_state));
-          if (candidate < row[child_state]) row[child_state] = candidate;
+          row[child_state] = std::min(row[child_state],
+                                      child_rows[ci][child_state]);
         }
       }
     }
@@ -452,7 +439,8 @@ inline outside_chart_cache build_outside_chart_cache(
     chart_options options,
     std::vector<std::uint8_t> reference_state_by_pattern = {}) {
   active.assert_no_skipped_invariant_metadata();
-  chart_spr_search_detail::validate_binary_chart_compatible_grammar(base);
+  chart_multisite_detail::validate_multisite_inputs(base, active.patterns,
+                                                    options);
 
   if (options.score_ua_edge) {
     if (reference_state_by_pattern.size() != active.patterns.patterns.size()) {
@@ -583,15 +571,20 @@ inline descendant_closure_result compute_three_term_seeds_and_closure(
   }
 
   // Case a: siblings of inside-affected clades.  For each inside-affected
-  // clade S, for each production P where S is a child, the OTHER child of P
+  // clade S, for each production P where S is a child, every other child of P
   // has outside depending on inside[S], which changed.
   auto mark_siblings_of = [&](overlay_clade_ref s) {
     for_each_tip_production_with_child(
-        idx, s, [&](overlay_clade_ref /*parent*/, overlay_clade_ref c0,
-                   overlay_clade_ref c1) {
-          std::array<overlay_clade_ref, 2> children{c0, c1};
-          for (std::size_t ci = 0; ci < 2; ++ci) {
-            if (children[ci] == s) mark(children[1 - ci]);
+        idx, s,
+        [&](overlay_clade_ref /*parent*/,
+            std::vector<overlay_clade_ref> const& children) {
+          bool contains_s = false;
+          for (auto child : children) {
+            contains_s = contains_s || child == s;
+          }
+          if (!contains_s) return;
+          for (auto child : children) {
+            if (!(child == s)) mark(child);
           }
         });
   };

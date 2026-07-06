@@ -1613,15 +1613,15 @@ inline std::array<chart_cost, nuc_state_count> overlay_delta_leaf_row(
   return row;
 }
 
-inline void validate_overlay_delta_binary_partition(
+inline void validate_overlay_delta_production_partition(
     spr_overlay_delta const& delta, overlay_grammar_production const& prod,
     production_id pid) {
-  if (prod.children.size() != 2) {
+  if (prod.children.size() < 2) {
     throw std::runtime_error(
         "chart SPR overlay-delta: temp production " +
         std::to_string(pid) + " has arity " +
         std::to_string(prod.children.size()) +
-        "; local scoring requires binary productions");
+        "; local scoring requires at least 2 children");
   }
 
   auto const& parent_taxa = overlay_delta_clade_key(delta, prod.parent).taxa;
@@ -1723,15 +1723,8 @@ inline void validate_reachable_base_production(
         "chart SPR overlay-delta: reachable base production out of range");
   }
   auto const& prod = base.productions[pid];
-  if (prod.children.size() != 2) {
-    throw std::runtime_error(
-        "chart SPR overlay-delta: reachable base production " +
-        std::to_string(pid) + " has arity " +
-        std::to_string(prod.children.size()) +
-        "; local scoring requires binary productions");
-  }
-  parsimony_chart_detail::validate_binary_production_partition(base, prod,
-                                                               pid);
+  parsimony_chart_detail::validate_production_inside_row_inputs(
+      base, prod, pid, "chart SPR overlay-delta");
 }
 
 inline void mark_overlay_delta_affected(
@@ -1793,7 +1786,7 @@ inline void build_overlay_delta_temp_indices(spr_overlay_delta& delta) {
   for (std::size_t i = 0; i < delta.temp_productions.size(); ++i) {
     auto pid = static_cast<production_id>(i);
     auto const& prod = delta.temp_productions[i];
-    validate_overlay_delta_binary_partition(delta, prod, pid);
+    validate_overlay_delta_production_partition(delta, prod, pid);
     append_temp_production_index(delta.temp_productions_by_base_parent,
                                  delta.temp_productions_by_temp_parent,
                                  prod.parent, pid);
@@ -1863,7 +1856,7 @@ inline void compute_overlay_delta_reachability(
       }
       ++delta.reachability_stats.reachable_temp_productions;
       auto const& prod = delta.temp_productions[temp_pid];
-      validate_overlay_delta_binary_partition(delta, prod, temp_pid);
+      validate_overlay_delta_production_partition(delta, prod, temp_pid);
       for (auto child : prod.children) stack.push_back(child);
     }
   }
@@ -2086,29 +2079,22 @@ inline void accumulate_overlay_production_row(
     std::array<chart_cost, nuc_state_count>& row,
     std::vector<overlay_clade_ref> const& children,
     overlay_row_provider const& provider) {
-  if (children.size() != 2) {
+  if (children.size() < 2) {
     throw std::runtime_error(
-        "chart SPR overlay-delta: local row recompute requires binary "
-        "productions");
+        "chart SPR overlay-delta: local row recompute requires at least 2 "
+        "children");
   }
 
+  struct production_view {
+    std::vector<overlay_clade_ref> const& children;
+  } prod{children};
   for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
        ++parent_state) {
-    chart_cost total = 0;
-    for (std::size_t child_i = 0; child_i < 2; ++child_i) {
-      auto const& child_row = provider.row(children[child_i]);
-      chart_cost best_child = chart_inf;
-      for (std::uint8_t child_state = 0; child_state < nuc_state_count;
-           ++child_state) {
-        best_child = std::min(
-            best_child,
-            parsimony_chart_detail::saturated_add(
-                child_row[child_state],
-                parsimony_chart_detail::transition_cost(parent_state,
-                                                        child_state)));
-      }
-      total = parsimony_chart_detail::saturated_add(total, best_child);
-    }
+    auto row_provider = [&](overlay_clade_ref child) -> auto const& {
+      return provider.row(child);
+    };
+    auto total = parsimony_chart_detail::combine_production_inside_row(
+        prod, parent_state, row_provider);
     row[parent_state] = std::min(row[parent_state], total);
   }
 }
@@ -2151,7 +2137,7 @@ inline std::array<chart_cost, nuc_state_count> recompute_overlay_delta_row(
           "row recompute");
     }
     auto const& prod = delta.temp_productions[temp_pid];
-    validate_overlay_delta_binary_partition(delta, prod, temp_pid);
+    validate_overlay_delta_production_partition(delta, prod, temp_pid);
     accumulate_overlay_production_row(row, prod.children, provider);
     saw_production = true;
   }
