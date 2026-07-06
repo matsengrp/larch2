@@ -202,6 +202,60 @@ inline chart_cost add3(chart_cost a, chart_cost b, chart_cost c) {
       parsimony_chart_detail::saturated_add(a, b), c);
 }
 
+template <class RowProvider>
+inline std::vector<std::array<chart_cost, nuc_state_count>>
+combine_production_outside_rows(grammar_production const& prod,
+                                std::uint8_t parent_state,
+                                chart_cost parent_outside,
+                                RowProvider&& inside_provider) {
+  parsimony_chart_detail::validate_state(parent_state, "outside parent state");
+  std::vector<std::array<chart_cost, nuc_state_count>> result(
+      prod.children.size(), parsimony_chart_detail::make_inf_row());
+  if (parent_outside >= chart_inf) return result;
+
+  std::vector<chart_cost> child_best(prod.children.size(), chart_inf);
+  for (std::size_t child_i = 0; child_i < prod.children.size(); ++child_i) {
+    auto const& child_row = inside_provider(prod.children[child_i]);
+    for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+         ++child_state) {
+      child_best[child_i] = std::min(
+          child_best[child_i],
+          parsimony_chart_detail::saturated_add(
+              child_row[child_state],
+              parsimony_chart_detail::transition_cost(parent_state,
+                                                      child_state)));
+    }
+  }
+
+  std::vector<chart_cost> prefix(prod.children.size() + 1, chart_cost{0});
+  std::vector<chart_cost> suffix(prod.children.size() + 1, chart_cost{0});
+  for (std::size_t child_i = 0; child_i < prod.children.size(); ++child_i) {
+    prefix[child_i + 1] =
+        parsimony_chart_detail::saturated_add(prefix[child_i],
+                                              child_best[child_i]);
+  }
+  for (std::size_t child_i = prod.children.size(); child_i-- > 0;) {
+    suffix[child_i] =
+        parsimony_chart_detail::saturated_add(child_best[child_i],
+                                              suffix[child_i + 1]);
+  }
+
+  for (std::size_t child_i = 0; child_i < prod.children.size(); ++child_i) {
+    auto sibling_context = parsimony_chart_detail::saturated_add(
+        parent_outside,
+        parsimony_chart_detail::saturated_add(prefix[child_i],
+                                              suffix[child_i + 1]));
+    if (sibling_context >= chart_inf) continue;
+    for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+         ++child_state) {
+      result[child_i][child_state] = parsimony_chart_detail::saturated_add(
+          sibling_context,
+          parsimony_chart_detail::transition_cost(parent_state, child_state));
+    }
+  }
+  return result;
+}
+
 inline chart_cost production_choice_inside_cost(
     clade_grammar const& grammar, single_site_chart const& chart,
     grammar_production const& prod, std::uint8_t parent_state,
@@ -472,37 +526,29 @@ inline single_site_outside_chart build_single_site_outside_chart(
         throw std::runtime_error(
             "chart trim: productions_by_parent contains mismatched parent");
       }
-      chart_trim_detail::validate_binary_production_for_trim(grammar, prod,
-                                                             pid);
+      validate_production_inside_row_inputs(grammar, prod, pid, "chart trim");
 
-      std::array<clade_id, 2> children{prod.children[0], prod.children[1]};
       for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
            ++parent_state) {
         auto base = result.outside[parent][parent_state];
         if (base >= chart_inf) continue;
 
-        std::array<chart_cost, 2> sibling_best{chart_inf, chart_inf};
-        for (std::size_t child_i = 0; child_i < 2; ++child_i) {
-          auto sibling = children[1 - child_i];
-          for (std::uint8_t sibling_state = 0; sibling_state < nuc_state_count;
-               ++sibling_state) {
-            auto candidate =
-                saturated_add(chart.inside[sibling][sibling_state],
-                              transition_cost(parent_state, sibling_state));
-            sibling_best[child_i] = std::min(sibling_best[child_i], candidate);
+        auto inside_provider = [&](clade_id child) -> auto const& {
+          if (child == no_clade || child >= chart.inside.size()) {
+            throw std::runtime_error(
+                "chart trim: production child clade out of range");
           }
-        }
-
-        for (std::size_t child_i = 0; child_i < 2; ++child_i) {
-          auto child = children[child_i];
-          if (sibling_best[child_i] >= chart_inf) continue;
+          return chart.inside[child];
+        };
+        auto outside_rows = chart_trim_detail::combine_production_outside_rows(
+            prod, parent_state, base, inside_provider);
+        for (std::size_t child_i = 0; child_i < prod.children.size();
+             ++child_i) {
+          auto child = prod.children[child_i];
           for (std::uint8_t child_state = 0; child_state < nuc_state_count;
                ++child_state) {
-            auto candidate = chart_trim_detail::add3(
-                base, sibling_best[child_i],
-                transition_cost(parent_state, child_state));
             auto& cell = result.outside[child][child_state];
-            cell = std::min(cell, candidate);
+            cell = std::min(cell, outside_rows[child_i][child_state]);
           }
         }
       }
