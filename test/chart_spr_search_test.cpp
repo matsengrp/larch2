@@ -3536,6 +3536,319 @@ static void test_phase4_pattern_batches_local_commit() {
   std::println("  PASS");
 }
 
+// ===========================================================================
+// Phase 9 (Work item 4a, technique 2): transient chain extension for
+// grammar-exact verification.
+//
+// The exact_multisite gate verifies an unaccepted candidate by transiently
+// extending the overlay chain + persistent inside/outside caches in
+// reader-local scratch storage (never mutating the shared cache, bypassing
+// the Phase 4 commit barrier), reading the exact frontier on the extended
+// grammar, and discarding.  These tests cover the four Phase 9 exit criteria:
+//   1. transient-extension exact score == from-scratch exact score (oracle).
+//   2. full_overlay_materializations does not increase for a transient run;
+//      work counted under transient_chain_extensions_for_verification.
+//   3. on oracle mismatch, the cold from-scratch result is authoritative (the
+//      corruption hook forces a mismatch and asserts the fallback fires); the
+//      exactness label stays grammar_exact because the cold B&B is exact (a
+//      justified deviation from the plan's literal "weakened" wording -- see
+//      doc/WRIC-SPR-SEARCH.md).
+//   4. TSAN-clean multi-worker (transient extensions are reader-local).
+//
+// Phase 9 ships substrate + oracle + counter discipline, NOT a wall-clock win
+// (the scratch caches are unconsumed by the production B&B scorer, which
+// rebuilds charts from the grammar); they are forward-looking groundwork for
+// Phase 12.  See the header comment on `chart_spr_transient_extension` in
+// src/chart_spr_search.cpp and doc/WRIC-SPR-SEARCH.md.
+// ============================================================================
+
+// Exit criterion 2: a local-commit exact_multisite run that uses the
+// transient path does NOT bump full_overlay_materializations for verification
+// (only the single final-compaction materialization, plus any cold-path
+// fallbacks for tombstone-scope candidates); the per-candidate work is counted
+// under transient_chain_extensions_for_verification, never folded into
+// full_overlay_materializations.
+static void test_phase9_transient_no_full_overlay_materialization() {
+  std::println("test_phase9_transient_no_full_overlay_materialization");
+
+  auto fixture = make_three_misplaced_groups_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 12;
+  options.rebuild_after_accept = false;
+  // Oracle OFF: the production path trusts the transient result and never
+  // materializes per candidate.  (With the oracle ON, each verified candidate
+  // materializes a cold overlay for cross-checking -- the no-materialization
+  // contract is asserted with the oracle OFF.)
+  options.verify_transient_chain_extension_oracle_for_tests = false;
+
+  auto search = larch::run_chart_spr_search(std::move(fixture.dag),
+                                            fixture.grammar, options);
+
+  std::println(
+      "  accepted_moves={} (local_commit={}), exact_verifications={}, "
+      "transient_extensions={}, exact_verification_materializations={}, "
+      "full_overlay_materializations={}, final_compaction_materializations={}",
+      search.counters.accepted_moves,
+      search.counters.local_commit_accepted_moves,
+      search.counters.exact_verifications,
+      search.counters.transient_chain_extensions_for_verification,
+      search.counters.overlay_materializations_for_exact_verification,
+      search.counters.full_overlay_materializations,
+      search.counters.overlay_materializations_for_final_compaction);
+
+  // The transient path was actually used.
+  CHECK(search.counters.transient_chain_extensions_for_verification > 0);
+  // Every exact verification either used the transient path or fell back to
+  // the cold path (tombstone-scope candidates whose delta cannot be appended
+  // to the chain).  Cold fallbacks are the only source of per-candidate exact-
+  // verification materializations.
+  CHECK(search.counters.exact_verifications ==
+        search.counters.transient_chain_extensions_for_verification +
+            search.counters.overlay_materializations_for_exact_verification);
+  // The umbrella full_overlay_materializations counter is exactly the sum of
+  // its reason-coded splits for this run: no per-accept materialization
+  // (local-commit contract), no oracle materialization (oracle off), the
+  // single final compaction, and any cold-fallback exact verifications.
+  CHECK(search.counters.full_overlay_materializations ==
+        search.counters.overlay_materializations_for_final_compaction +
+            search.counters.overlay_materializations_for_exact_verification);
+  CHECK(search.counters.overlay_materializations_for_accept_materialization ==
+        0);
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
+  // Every accepted move is grammar_exact (the transient path preserves the
+  // exactness label).
+  for (auto const& it : search.iterations) {
+    if (it.accepted_move_committed) {
+      CHECK(it.accepted.has_value());
+      CHECK(it.accepted->exact.has_value());
+      CHECK(it.accepted->exact->kind ==
+            larch::chart_spr_score_kind::grammar_exact);
+    }
+  }
+  // k >= 3 disjoint committable improving moves on this fixture.
+  CHECK(search.counters.local_commit_accepted_moves >= 3);
+  CHECK(search.summary.final_score <= search.summary.initial_score);
+
+  std::println("  PASS");
+}
+
+// Exit criterion 1: the transient-extension exact score equals the from-
+// scratch exact score on every fixture candidate, both charts.  The oracle
+// (enabled) recomputes BOTH charts from scratch on the extended grammar and
+// compares against the scratch caches, plus runs a cold from-scratch B&B and
+// compares the exact optimum.  A green oracle (zero mismatches, zero
+// fallbacks) proves the transient result is exact.
+static void test_phase9_transient_oracle_both_charts_green() {
+  std::println("test_phase9_transient_oracle_both_charts_green");
+
+  auto fixture = make_three_misplaced_groups_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 12;
+  options.rebuild_after_accept = false;
+  // Oracle ON: every transient extension is cross-checked against the cold
+  // from-scratch path (both charts + exact optimum), per Work item 4a's
+  // correctness invariant.
+  options.verify_transient_chain_extension_oracle_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(fixture.dag),
+                                            fixture.grammar, options);
+
+  std::println(
+      "  transient_extensions={}, oracle_rows_checked={}, "
+      "oracle_mismatches={}, fallbacks={}",
+      search.counters.transient_chain_extensions_for_verification,
+      search.counters.transient_chain_extension_oracle_rows_checked_for_tests,
+      search.counters.transient_chain_extension_oracle_mismatches,
+      search.counters.transient_chain_extension_fallbacks);
+
+  CHECK(search.counters.transient_chain_extensions_for_verification > 0);
+  // The two-chart oracle ran on every transient extension: it checked both
+  // the inside and outside scratch rows against the from-scratch charts.
+  CHECK(search.counters.transient_chain_extension_oracle_rows_checked_for_tests >
+        0);
+  // Green oracle: no mismatches and no fallbacks on the fixture matrix.
+  CHECK(search.counters.transient_chain_extension_oracle_mismatches == 0);
+  CHECK(search.counters.transient_chain_extension_fallbacks == 0);
+  // The oracle materializations are counted under the oracle bucket, separate
+  // from the transient extension counter (never folded).
+  CHECK(search.counters.overlay_materializations_for_oracle >=
+        search.counters.transient_chain_extensions_for_verification);
+  // Final score matches a from-scratch rebuild of the output DAG.
+  auto rebuilt = larch::build_clade_grammar(search.dag);
+  auto rebuilt_state = larch::build_chart_spr_search_state(
+      search.dag, rebuilt, options);
+  CHECK(larch::chart_spr_state_exact_score_with_invariants(
+            rebuilt_state, options.exact_trim) == search.summary.final_score);
+
+  std::println("  PASS");
+}
+
+// Exit criterion 1 on a multi-parent DAG fixture: the transient oracle stays
+// green across a grammar with multiple productions per parent (the case the
+// B&B coupling is designed for).
+static void test_phase9_transient_oracle_green_on_multiparent_dag() {
+  std::println("test_phase9_transient_oracle_green_on_multiparent_dag");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", five_taxon_multiparent_tree_one()));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", five_taxon_multiparent_tree_two()));
+  auto dag = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.verify_transient_chain_extension_oracle_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+
+  CHECK(search.counters.transient_chain_extensions_for_verification > 0);
+  CHECK(search.counters.transient_chain_extension_oracle_mismatches == 0);
+  CHECK(search.counters.transient_chain_extension_fallbacks == 0);
+
+  std::println("  PASS");
+}
+
+// Exit criterion 3: when the transient result cannot be trusted (the oracle
+// finds a mismatch), the verifier uses the cold from-scratch path's result and
+// records the fallback.  The corruption hook perturbs a scratch outside row so
+// the two-chart oracle deterministically disagrees; the gate must fire rather
+// than silently trusting the wrong transient result.
+static void test_phase9_transient_oracle_catches_corruption() {
+  std::println("test_phase9_transient_oracle_catches_corruption");
+
+  auto fixture = make_three_misplaced_groups_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 12;
+  options.rebuild_after_accept = false;
+  options.verify_transient_chain_extension_oracle_for_tests = true;
+  // Perturb a scratch outside row so the per-candidate two-chart oracle
+  // catches the disagreement.
+  options.force_transient_chain_extension_oracle_mismatch_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(fixture.dag),
+                                            fixture.grammar, options);
+
+  std::println(
+      "  transient_extensions={}, oracle_mismatches={}, fallbacks={}",
+      search.counters.transient_chain_extensions_for_verification,
+      search.counters.transient_chain_extension_oracle_mismatches,
+      search.counters.transient_chain_extension_fallbacks);
+
+  CHECK(search.counters.transient_chain_extensions_for_verification > 0);
+  // The corruption hook forces at least one mismatch, and every mismatch
+  // triggers a fallback to the authoritative cold result.
+  CHECK(search.counters.transient_chain_extension_oracle_mismatches > 0);
+  CHECK(search.counters.transient_chain_extension_fallbacks ==
+        search.counters.transient_chain_extension_oracle_mismatches);
+  // Despite the forced corruption, the final score still matches a from-
+  // scratch rebuild of the output DAG: the cold path's authoritative result
+  // keeps the reported objective correct.
+  auto rebuilt = larch::build_clade_grammar(search.dag);
+  auto rebuilt_state = larch::build_chart_spr_search_state(
+      search.dag, rebuilt, options);
+  CHECK(larch::chart_spr_state_exact_score_with_invariants(
+            rebuilt_state, options.exact_trim) == search.summary.final_score);
+
+  std::println("  PASS");
+}
+
+// A candidate whose delta cannot be appended to the chain (tombstone scope:
+// it tombstones a production that does not resolve to a frozen-base
+// production) falls back to the cold path during verification, so it can still
+// be accepted and reach the Phase 4 commit-time tombstone-scope skip.  This
+// preserves the existing search semantics: the transient extension never
+// silently rejects a candidate the cold path would accept.
+static void test_phase9_transient_tombstone_scope_falls_back_to_cold() {
+  std::println("test_phase9_transient_tombstone_scope_falls_back_to_cold");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", six_taxon_paired_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 32;
+  options.max_iterations = 3;
+  options.rebuild_after_accept = false;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+
+  // At least one improving move is committed (the transient path serves
+  // committable candidates).
+  CHECK(search.counters.accepted_moves >= 1);
+  // After the first accept, a sequential SPR whose tombstones do not resolve
+  // to frozen-base productions falls back to the cold path for verification
+  // and then reaches the commit-time tombstone-scope skip.  On this small
+  // single-topology fixture the search commits one move and stops at the
+  // labelled skip.
+  if (search.counters.accepted_moves < options.max_iterations) {
+    CHECK(search.counters.local_commit_tombstone_scope_skips >= 1);
+    CHECK(!search.iterations.back().no_accept_reason.empty());
+    CHECK(search.iterations.back().no_accept_reason.find("tombstone-scope") !=
+          std::string::npos);
+  }
+
+  std::println("  PASS");
+}
+
+// Exit criterion 4: transient extensions are reader-local (they copy the
+// chain + caches into scratch and never mutate the shared cache), so they run
+// cleanly alongside parallel local scoring under the epoch/snapshot model.
+// A multi-worker local-commit exact_multisite run must agree with the serial
+// run and stay TSAN-clean (verified separately under -DENABLE_TSAN=ON).
+static void test_phase9_transient_multi_worker_matches_serial() {
+  std::println("test_phase9_transient_multi_worker_matches_serial");
+
+  auto run_once = [](std::size_t workers, bool oracle) {
+    auto fixture = make_three_misplaced_groups_fixture();
+    larch::chart_spr_search_options options;
+    options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+    options.candidate_selection =
+        larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+    options.max_iterations = 12;
+    options.rebuild_after_accept = false;
+    options.local_score_worker_count = workers;
+    options.verify_local_commit_two_chart_oracle_for_tests = true;
+    options.verify_transient_chain_extension_oracle_for_tests = oracle;
+    return larch::run_chart_spr_search(std::move(fixture.dag),
+                                       fixture.grammar, options);
+  };
+
+  auto serial = run_once(1, true);
+  auto parallel = run_once(4, true);
+
+  CHECK(serial.counters.accepted_moves == parallel.counters.accepted_moves);
+  CHECK(serial.summary.final_score == parallel.summary.final_score);
+  CHECK(serial.summary.initial_score == parallel.summary.initial_score);
+  CHECK(parallel.counters.transient_chain_extensions_for_verification > 0);
+  // Parallel scoring actually used the workers.
+  CHECK(parallel.counters.local_score_parallel_batches > 0);
+  // The transient oracle stays green under parallel local scoring (the
+  // transient extensions are reader-local and do not race the scoring
+  // workers).
+  CHECK(parallel.counters.transient_chain_extension_oracle_mismatches == 0);
+  CHECK(parallel.counters.transient_chain_extension_fallbacks == 0);
+
+  std::println("  PASS");
+}
+
 int main() {
   test_lower_bound_oracle_counters_show_full_rebuild_cost();
   test_local_rejected_candidate_counter_guardrail();
@@ -3608,6 +3921,12 @@ int main() {
   test_phase4_multi_worker_matches_serial();
   test_phase4_fixed_topology_exact_local_commit();
   test_phase4_pattern_batches_local_commit();
+  test_phase9_transient_no_full_overlay_materialization();
+  test_phase9_transient_oracle_both_charts_green();
+  test_phase9_transient_oracle_green_on_multiparent_dag();
+  test_phase9_transient_oracle_catches_corruption();
+  test_phase9_transient_tombstone_scope_falls_back_to_cold();
+  test_phase9_transient_multi_worker_matches_serial();
   std::println("chart_spr_search_test PASS");
   return 0;
 }

@@ -169,6 +169,20 @@ int main() {
                      c.fixed_topology_persistent_cache_fallbacks);
   print_counter_line("fixed_topology_persistent_cache_oracle_mismatches",
                      c.fixed_topology_persistent_cache_oracle_mismatches);
+  // Phase 9 (Work item 4a, technique 2): transient chain extension for
+  // exact_multisite verification.  Zero in this conservative-mode baseline
+  // (the transient verifier is installed only when a local-commit substrate
+  // is active, i.e. rebuild_after_accept = false); printed here so the counter
+  // contract is complete and a regression to "dense materialize per candidate"
+  // under a renamed counter stays visible.  See the Phase-9 caveat in
+  // doc/WRIC-SPR-SEARCH.md: as shipped these measure the transient-extension
+  // substrate, not a wall-clock win.
+  print_counter_line("transient_chain_extensions_for_verification",
+                     c.transient_chain_extensions_for_verification);
+  print_counter_line("transient_chain_extension_fallbacks",
+                     c.transient_chain_extension_fallbacks);
+  print_counter_line("transient_chain_extension_oracle_mismatches",
+                     c.transient_chain_extension_oracle_mismatches);
   print_counter_line("full_composite_rebuilds", c.full_composite_rebuilds);
   print_counter_line("local_candidate_scores", c.local_candidate_scores);
   print_counter_line("local_rows_recomputed", c.local_rows_recomputed);

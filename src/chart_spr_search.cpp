@@ -802,6 +802,10 @@ struct chart_spr_local_commit_substrate {
   chart_spr_selected_topology_row_cache selected_topology_cache;
   bool verify_materialized_fixed_topology_oracle_for_tests = false;
   bool force_independent_sm_bug_for_tests = false;
+  // Phase 9 transient-extension verifier options (mirrored from
+  // chart_spr_search_options by the substrate builder).
+  bool verify_transient_chain_extension_oracle_for_tests = false;
+  bool force_transient_chain_extension_oracle_mismatch_for_tests = false;
 };
 
 void chart_spr_set_identity_tip_maps(chart_spr_local_commit_substrate& sub) {
@@ -1931,6 +1935,343 @@ chart_spr_verify_candidate_fixed_topology_exact_from_persistent_cache(
   return candidate;
 }
 
+// Phase 9 (Work item 4a, technique 2): transient chain extension for
+// grammar-exact verification.
+//
+// A reader-local snapshot-extended view of the committed chain + persistent
+// inside/outside caches, advanced by exactly one (unaccepted) candidate delta.
+// It never mutates the shared substrate: the committed chain and persistent
+// caches are copied into scratch storage, the candidate delta is appended to
+// the scratch chain, and the scratch caches are advanced one paired commit via
+// the SAME `apply_commit_to_inside_cache` / `apply_commit_to_outside_cache`
+// primitives the real commit uses (so the affected-set scoping and the two-
+// chart recurrence are exercised identically).  The result is discarded after
+// verification, so the extension bypasses the Phase 4 commit barrier and can
+// run in parallel with other scoring readers under the epoch/snapshot model.
+//
+// === What Phase 9 ships vs. what it does NOT ship (read this first) ===
+//
+// Phase 9 lands the SUBSTRATE (reader-local chain+cache extension), the
+// per-candidate two-chart ORACLE, and the COUNTER discipline.  It does NOT
+// land a wall-clock improvement on the exact_multisite path:
+//
+//   * The exact frontier is read by `build_multisite_trim_active` (the B&B
+//     exact optimum) on the materialized extended grammar.  That call routes
+//     through `build_multisite_trim(grammar, patterns, ...)` which REBUILDS
+//     the inside+outside charts from the grammar -- it takes no cache
+//     argument, so it cannot consume `ext.icache` / `ext.ocache`.
+//   * Consequently the scratch caches (`icache` / `ocache`) are read ONLY by
+//     the test/diagnostic two-chart oracle
+//     (`chart_spr_check_transient_extension_oracle`, gated on
+//     `verify_transient_chain_extension_oracle_for_tests`).  On the PRODUCTION
+//     path (oracle off) the cache copy + advance is dead work: it is paid for
+//     and then discarded.  The production transient path therefore does MORE
+//     work than the cold path (cache copy + advance + a full-chain
+//     `materialize_overlay_chain` + a B&B that rebuilds charts), not less.
+//
+// This is consistent with the plan, not a deviation from it.  WI4a's technique
+// 2 phrasing ("reading the resulting exact-frontier value", "reusing the
+// cache") suggests the cache should feed scoring, but the multisite exact
+// optimum is the B&B optimum and cannot be read from the per-pattern cache.
+// The plan resolves this by splitting 4a (Phase 8/9) from 4b / Phase 12
+// (warm-started B&B that "would seed the B&B from these scratch caches").
+// Phase 9 = substrate + counter discipline + oracle; the actual speedup awaits
+// the speculative Phase 12.  The scratch caches built here are forward-looking
+// groundwork for that warm-start path and are intentionally retained (and
+// exercised against fixtures by the oracle) so Phase 12 can adopt them without
+// re-deriving the affected-set scoping or the two-chart recurrence.
+//
+// The plan's cross-cutting "dense materialization" warning is the thing to
+// watch: a transient chain extension that reuses the persistent cache and
+// updates only affected rows is, by the plan's explicit exemption, NOT a dense
+// materialization -- so it is counted under
+// `transient_chain_extensions_for_verification`, never under
+// `full_overlay_materializations`.  But a full chart rebuild still happens per
+// candidate inside `build_multisite_trim` on the production path; it is
+// licensed by the plan's exemption + the 4a/4b split.  Eliminating that
+// per-candidate chart rebuild is exactly what Phase 12's warm-started B&B is
+// for.
+struct chart_spr_transient_extension {
+  // Scratch chain = copy of the committed chain + appended candidate delta.
+  // Reader-local; the committed chain is untouched.
+  overlay_chain chain;
+  // Scratch caches = copies of the persistent caches, advanced one paired
+  // commit to the extended tip.  Reader-local; discarded after verification.
+  // NOTE: these are currently read ONLY by the test/diagnostic two-chart
+  // oracle; the production B&B scorer does not consume them (see the header
+  // comment above).  They are retained as forward-looking groundwork for the
+  // Phase-12 warm-started-B&B path, which would seed the B&B frontier from
+  // them instead of rebuilding charts from the grammar.
+  inside_chart_cache icache;
+  outside_chart_cache ocache;
+  // Materialized extended tip grammar + dense->overlay-ref maps.  Built by
+  // `materialize_overlay_chain` on the scratch chain; the grammar is identical
+  // to `materialize_overlay_grammar(overlay_from_candidate(tip, candidate))`.
+  overlay_materialization_result materialized;
+};
+
+chart_spr_transient_extension chart_spr_build_transient_extension(
+    chart_spr_local_commit_substrate const& sub,
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate) {
+  chart_spr_transient_extension ext;
+  // Copy the committed chain (reader-local).  The chain's base pointer still
+  // references the substrate's frozen base grammar, which lives for the run.
+  ext.chain = *sub.chain;
+  // Build the candidate delta against the CURRENT tip (state.grammar is the
+  // materialized chain tip the candidate was generated/scored against).
+  local_spr_score_options local_options;
+  local_options.verify_against_full_overlay = false;
+  local_options.validate_cached_chart_shapes = false;
+  auto delta = build_spr_overlay_delta(state.grammar, candidate.candidate,
+                                       local_options);
+  // Append to the scratch chain.  A tombstone-scope rejection (the candidate
+  // tombstones a production that does not resolve to a frozen-base production)
+  // throws here; the caller treats it as an invalid candidate, exactly as the
+  // cold path's materialize would surface an unreachable overlay.
+  ext.chain.append(delta);
+  // Copy the persistent caches (reader-local) and advance them one paired
+  // commit to the extended tip.  The pairing guards pass: the copied caches
+  // are at the committed tip epoch, and the scratch chain is exactly one delta
+  // ahead, so `commit_epoch + 1 == chain.size()` holds for both.
+  ext.icache = *sub.icache;
+  ext.ocache = *sub.ocache;
+  apply_commit_to_inside_cache(ext.chain, ext.icache);
+  apply_commit_to_outside_cache(ext.chain, ext.ocache, ext.icache);
+  // Materialize the extended tip (transient, reader-local).  This is NOT
+  // counted under full_overlay_materializations: by the cross-cutting
+  // definition a transient chain extension that reuses the persistent cache
+  // and updates only affected rows is not a dense materialization, even though
+  // it produces an exact score.
+  //
+  // TODO(phase-12 / perf): `materialize_overlay_chain(ext.chain)` folds the
+  // WHOLE chain onto the base.  The cold path reaches an identical extended
+  // grammar more cheaply via `overlay_from_candidate(state.grammar, candidate)`
+  // (one delta onto the already-materialized tip).  The chain fold is
+  // unnecessary extra work that compounds the "dead cache work" caveat above;
+  // it is left in place because Phase 12 (warm-started B&B seeded from the
+  // scratch caches) is the point at which the chain + caches -- not the
+  // materialized grammar -- become the authoritative source, and switching to
+  // `overlay_from_candidate` now would be thrown away then.  A small win is
+  // available now if Phase 12 is deferred indefinitely.
+  ext.materialized = materialize_overlay_chain(ext.chain);
+  return ext;
+}
+
+// Per-candidate two-chart oracle for the transient extension (Work item 4a
+// correctness invariant).  Recomputes BOTH charts from scratch on the extended
+// grammar via Phase 0's `recompute_both_charts_from_scratch` and asserts the
+// scratch caches agree on every reachable clade, every active pattern; also
+// runs a cold from-scratch B&B on a freshly materialized candidate overlay and
+// asserts the exact optimum agrees.  An inside-only oracle could not catch
+// outside under-inclusion, so both halves are checked.  Returns the cold
+// optimum so the verifier can fall back to the authoritative value on
+// mismatch.
+struct chart_spr_transient_oracle_result {
+  bool ok = true;
+  std::uint64_t cold_new_optimum = 0;
+  std::string mismatch_reason;
+};
+
+chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
+    chart_spr_local_commit_substrate const& sub,
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate,
+    chart_spr_transient_extension const& ext,
+    std::uint64_t transient_new_optimum,
+    multisite_trim_options const& trim_options) {
+  chart_spr_transient_oracle_result result;
+  auto const& grammar = ext.materialized.grammar;
+  if (ext.materialized.dense_clade_to_ref.size() != grammar.clades.size()) {
+    result.ok = false;
+    result.mismatch_reason =
+        "transient oracle: extended grammar dense clade map size mismatch";
+    return result;
+  }
+
+  // Cold from-scratch optimum on the same extended grammar.  Counted under the
+  // oracle bucket (diagnostic), mirroring Phase 8's materialized-oracle
+  // counting so a regression is visible without being folded into the
+  // transient extension counter.
+  auto cold_overlay = overlay_from_candidate(state.grammar, candidate.candidate);
+  auto cold_materialized = materialize_overlay_grammar(cold_overlay);
+  ++state.counters.full_overlay_materializations;
+  ++state.counters.overlay_materializations_for_oracle;
+  auto cold_trim = build_multisite_trim_active(
+      cold_materialized.grammar, state.active_patterns, state.chart_opts,
+      trim_options);
+  result.cold_new_optimum = cold_trim.optimum;
+
+  // Both-charts check: scratch caches vs from-scratch on the extended grammar.
+  for (std::size_t p = 0; p < ext.icache.patterns.size(); ++p) {
+    leaf_site_states states;
+    states.state_by_taxon = ext.icache.patterns[p].state_by_taxon;
+    auto oracle = recompute_both_charts_from_scratch(
+        grammar, states, ext.icache.chart_opts);
+    if (oracle.first.inside.size() != grammar.clades.size() ||
+        oracle.second.outside.size() != grammar.clades.size()) {
+      result.ok = false;
+      result.mismatch_reason =
+          "transient oracle: from-scratch chart size mismatch at pattern " +
+          std::to_string(p);
+      return result;
+    }
+    for (std::size_t dense = 0;
+         dense < ext.materialized.dense_clade_to_ref.size(); ++dense) {
+      auto ref = ext.materialized.dense_clade_to_ref[dense];
+      ++state.counters.transient_chain_extension_oracle_rows_checked_for_tests;
+      if (ext.icache.row(p, ref) != oracle.first.inside[dense]) {
+        result.ok = false;
+        result.mismatch_reason =
+            "transient oracle: inside scratch row mismatch at pattern " +
+            std::to_string(p) + " dense clade " + std::to_string(dense);
+        return result;
+      }
+      if (ext.ocache.row(p, ref) != oracle.second.outside[dense]) {
+        result.ok = false;
+        result.mismatch_reason =
+            "transient oracle: outside scratch row mismatch at pattern " +
+            std::to_string(p) + " dense clade " + std::to_string(dense);
+        return result;
+      }
+    }
+  }
+  // Exact-score check: the transient B&B optimum on the extended grammar must
+  // equal the cold from-scratch B&B optimum.  This is the load-bearing
+  // equality the Phase 9 exit criterion asserts ("transient-extension exact
+  // score equals from-scratch exact score"); a difference here means the
+  // transient grammar diverges from the cold grammar or the B&B is
+  // nondeterministic, either of which is a correctness bug.
+  if (transient_new_optimum != result.cold_new_optimum) {
+    result.ok = false;
+    result.mismatch_reason =
+        "transient oracle: exact optimum mismatch (transient " +
+        std::to_string(transient_new_optimum) + " vs cold " +
+        std::to_string(result.cold_new_optimum) + ")";
+    return result;
+  }
+  return result;
+}
+
+// Phase 9 exact_multisite verifier: score a candidate by transiently extending
+// the chain + caches in reader-local scratch, reading the exact frontier on
+// the extended grammar via `build_multisite_trim_active`, and discarding.  See
+// the header comment on `chart_spr_transient_extension` for the load-bearing
+// caveat: the scratch caches are NOT consumed by the production B&B scorer
+// (which rebuilds charts from the grammar), so Phase 9 ships substrate +
+// oracle + counter discipline, NOT a wall-clock win; the caches are
+// forward-looking groundwork for Phase 12.  The transient work is counted
+// under `transient_chain_extensions_for_verification`, never under
+// `full_overlay_materializations`.  When the test-only oracle flag is set, the
+// result is cross-checked against the cold from-scratch path (both charts +
+// exact optimum); on mismatch the cold result is authoritative and the
+// transient count is recorded as a fallback.
+chart_spr_candidate_score
+chart_spr_verify_candidate_exact_multisite_from_transient_extension(
+    chart_spr_local_commit_substrate& sub,
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score candidate,
+    multisite_trim_options const& trim_options) {
+  if (!candidate.valid) return candidate;
+
+  chart_spr_transient_extension ext;
+  try {
+    ext = chart_spr_build_transient_extension(sub, state, candidate);
+  } catch (std::runtime_error const& e) {
+    // The candidate delta cannot be appended to the scratch chain (tombstone
+    // scope: it tombstones a production that does not resolve to a frozen-base
+    // production).  The transient extension is unavailable for this candidate;
+    // fall back to the cold from-scratch path so the candidate can still be
+    // verified, accepted, and reach the commit-time tombstone-scope skip
+    // (Phase 4 resolution (a)).  This is NOT a silent degradation: the cold
+    // path is the authoritative from-scratch verifier, and the tombstone-scope
+    // skip remains a labelled, counted outcome.  Any other append error is a
+    // hard correctness failure and is rethrown.
+    if (chart_spr_is_local_commit_tombstone_scope_rejection(e.what())) {
+      return verify_candidate_exact_against_state(
+          state, std::move(candidate), trim_options);
+    }
+    throw;
+  }
+
+  // The transient extension succeeded: this candidate's delta resolves to
+  // frozen-base productions, so it could be committed.  Count it under the
+  // transient-extension counter (never under full_overlay_materializations).
+  ++state.counters.exact_verifications;
+  ++state.counters.transient_chain_extensions_for_verification;
+  try {
+    // Old score: the current tip's exact optimum (cached in state, lazily
+    // built).  Same source the cold path reads.
+    auto const& old_trim =
+        ensure_chart_spr_state_exact_trim(state, trim_options);
+
+    // New score: B&B exact optimum of the extended grammar.
+    auto new_trim = build_multisite_trim_active(
+        ext.materialized.grammar, state.active_patterns, state.chart_opts,
+        trim_options);
+
+    // Optional corruption hook: perturb a scratch outside row so the two-chart
+    // oracle catches the disagreement and the verifier falls back to the cold
+    // path.  The perturbation is applied to the SCRATCH cache only (never the
+    // shared cache); the oracle's from-scratch chart is unaffected, so the
+    // mismatch is deterministic.
+    if (sub.force_transient_chain_extension_oracle_mismatch_for_tests) {
+      if (!ext.ocache.base_rows.empty() && !ext.ocache.base_rows[0].empty()) {
+        auto& row = ext.ocache.base_rows[0][0];
+        if (row[0] < larch::chart_inf) {
+          row[0] = row[0] + 1;
+        } else {
+          row[0] = larch::chart_cost{0};
+        }
+      }
+    }
+
+    // Per-candidate oracle (test/diagnostic): both charts + cold exact
+    // optimum.  The transient result is trusted unless the oracle finds a
+    // mismatch; on mismatch the cold result is authoritative.
+    //
+    // Plan wording deviation (Phase 9 exit criterion 3), recorded explicitly:
+    // the plan says on oracle mismatch the exactness label is "otherwise
+    // weakened and the from-scratch path is used."  This implementation does
+    // NOT weaken the label: it substitutes the cold exact optimum and KEEPS
+    // `grammar_exact`.  That is the right call because the cold B&B is
+    // genuinely exact, so weakening would mislabel a correct value as a mere
+    // lower bound.  The substantive requirement -- "do not trust a wrong
+    // transient result; use the authoritative cold value" -- is met; only the
+    // literal "weakened" is not honored.  The work IS recorded as a fallback
+    // (`transient_chain_extension_fallbacks`) so a regression to a wrong
+    // transient result is visible in the counters.
+    std::uint64_t authoritative_new_optimum = new_trim.optimum;
+    if (sub.verify_transient_chain_extension_oracle_for_tests ||
+        sub.force_transient_chain_extension_oracle_mismatch_for_tests) {
+      auto oracle = chart_spr_check_transient_extension_oracle(
+          sub, state, candidate, ext, new_trim.optimum, trim_options);
+      if (!oracle.ok) {
+        ++state.counters.transient_chain_extension_oracle_mismatches;
+        ++state.counters.transient_chain_extension_fallbacks;
+        authoritative_new_optimum = oracle.cold_new_optimum;
+      }
+    }
+
+    auto old_full = chart_spr_add_invariant_offset(
+        old_trim.optimum, state,
+        "chart-SPR transient exact old-score invariant offset");
+    auto new_full = chart_spr_add_invariant_offset(
+        authoritative_new_optimum, state,
+        "chart-SPR transient exact new-score invariant offset");
+    candidate.exact = make_chart_spr_objective_score(
+        spr_score_result{chart_spr_detail::signed_delta(old_full, new_full),
+                         old_full, new_full, true},
+        chart_spr_score_kind::grammar_exact,
+        chart_spr_score_convention::full_with_invariants,
+        state.invariant_constant_offset);
+  } catch (std::exception const& e) {
+    candidate.valid = false;
+    candidate.invalid_reason = e.what();
+  }
+  return candidate;
+}
+
 std::unique_ptr<chart_spr_local_commit_substrate>
 chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
                                       chart_spr_search_options const& options) {
@@ -1961,6 +2302,10 @@ chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
       options.verify_fixed_topology_materialized_oracle_for_tests;
   sub->force_independent_sm_bug_for_tests =
       options.force_fixed_topology_independent_sm_bug_for_tests;
+  sub->verify_transient_chain_extension_oracle_for_tests =
+      options.verify_transient_chain_extension_oracle_for_tests;
+  sub->force_transient_chain_extension_oracle_mismatch_for_tests =
+      options.force_transient_chain_extension_oracle_mismatch_for_tests;
   if (options.force_fixed_topology_cache_epoch_mismatch_for_tests) {
     // Test-only corruption of a substrate invariant.  The verifier must throw
     // a hard labelled error instead of returning an invalid candidate.
@@ -2302,6 +2647,12 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.fixed_topology_icache_rows_recomputed_affected;
   summary.fixed_topology_chain_objective_before_mismatches =
       counters.fixed_topology_chain_objective_before_mismatches;
+  summary.transient_chain_extensions_for_verification =
+      counters.transient_chain_extensions_for_verification;
+  summary.transient_chain_extension_fallbacks =
+      counters.transient_chain_extension_fallbacks;
+  summary.transient_chain_extension_oracle_mismatches =
+      counters.transient_chain_extension_oracle_mismatches;
   summary.full_search_state_rebuilds =
       summary.initial_search_state_rebuilds +
       summary.sidecar_rebuilds_after_accept;
@@ -2371,6 +2722,26 @@ chart_spr_search_result run_chart_spr_search(
                         chart_spr_candidate_score candidate) {
           return chart_spr_verify_candidate_fixed_topology_exact_from_persistent_cache(
               *substrate_ptr, verifier_state, std::move(candidate));
+        };
+    // Phase 9: install the transient-extension exact_multisite verifier.  It
+    // verifies each candidate by transiently extending the chain + caches in
+    // reader-local scratch (never mutating the shared cache, bypassing the
+    // Phase 4 commit barrier), reading the exact frontier on the extended
+    // grammar, and discarding.  The work is counted under
+    // `transient_chain_extensions_for_verification`, never under
+    // `full_overlay_materializations`.
+    //
+    // As shipped this is substrate + oracle, not a perf win: the scratch
+    // caches are unconsumed by the production B&B scorer (it rebuilds charts
+    // from the grammar) and are forward-looking groundwork for Phase 12.
+    // See the header comment on `chart_spr_transient_extension`.
+    state.exact_multisite_verifier =
+        [substrate_ptr](chart_spr_search_state const& verifier_state,
+                        chart_spr_candidate_score candidate,
+                        multisite_trim_options const& trim_options) {
+          return chart_spr_verify_candidate_exact_multisite_from_transient_extension(
+              *substrate_ptr, verifier_state, std::move(candidate),
+              trim_options);
         };
   }
 

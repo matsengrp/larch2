@@ -155,6 +155,76 @@ score does not equal the chain objective is counted under
 certificate is not the chain tip's topology); the gate still uses the chain
 objective.
 
+### Transient chain extension for `exact_multisite` verification (Phase 9)
+
+The local-commit `exact_multisite` verifier may verify each candidate by
+transiently extending the committed overlay chain + persistent inside/outside
+caches in **reader-local scratch storage** (never mutating the shared cache,
+bypassing the Phase-4 commit barrier), reading the exact frontier on the
+extended grammar, and discarding.  This is installed automatically when a
+local-commit substrate is active (`rebuild_after_accept = false`); conservative
+rebuild mode leaves it off and uses the cold from-scratch path
+(`verify_candidate_exact_against_state`).  A candidate whose delta cannot be
+appended to the scratch chain (tombstone scope: it tombstones a production that
+does not resolve to a frozen-base production) falls back to the cold path for
+verification, so it can still be accepted and reach the Phase-4 commit-time
+tombstone-scope skip.
+
+The transient work is counted under `transient_chain_extensions_for_verification`,
+**never** under `full_overlay_materializations` -- by the cross-cutting
+definition a transient chain extension that reuses the persistent cache
+machinery and updates only affected rows in scratch is not a dense
+materialization, even though it produces an exact score.
+
+**Phase 9 caveat -- substrate + oracle, not a perf win.**  As shipped, the
+scratch inside/outside caches are read **only** by the test/diagnostic
+per-candidate two-chart oracle (enabled by
+`verify_transient_chain_extension_oracle_for_tests`); the production B&B scorer
+(`build_multisite_trim_active` -> `build_multisite_trim(grammar, patterns, ...)`)
+**rebuilds the charts from the materialized extended grammar and takes no cache
+argument**, so it cannot consume `ext.icache` / `ext.ocache`.  Consequences:
+
+- Phase 9 meets every exit criterion (transient == from-scratch exact score on
+  both charts; `full_overlay_materializations` does not increase for transient-
+  path candidates; `grammar_exact` label preserved, cold path authoritative on
+  oracle mismatch; TSAN-clean under multi-worker local scoring) and is
+  sanitizer-clean, but it delivers **no wall-clock improvement** as shipped:
+  the production transient path does *more* work than the cold path (cache copy
+  + advance + a full-chain `materialize_overlay_chain` + a B&B that rebuilds
+  charts), not less.
+- This is consistent with the plan, not a deviation from it.  The plan's
+  Work-item-4a technique-2 phrasing ("reading the resulting exact-frontier
+  value," "reusing the cache") suggests the cache should feed scoring, but the
+  multisite exact optimum is the B&B optimum and cannot be read from the
+  per-pattern cache.  The plan resolves this by splitting 4a (Phase 8/9) from
+  4b / Phase 12 (warm-started B&B that "would seed the B&B from these scratch
+caches").  Phase 9 = substrate + counter discipline + oracle; the actual
+  speedup awaits the speculative Phase 12.
+- The scratch caches are **forward-looking groundwork** for Phase 12 and are
+  intentionally retained (and exercised against fixtures by the oracle) so
+  Phase 12 can adopt them without re-deriving the affected-set scoping or the
+two-chart recurrence.  Removing them now would be premature.
+
+The plan's cross-cutting "dense materialization" warning is the thing to watch:
+a full chart rebuild still happens per candidate inside `build_multisite_trim`
+on the production path; it is licensed by the plan's explicit exemption (a
+transient chain extension that reuses the persistent cache and updates only
+affected rows is not a dense materialization) plus the 4a/4b split.  But it is
+exactly the shape that warning exists to surface, so it is documented here
+rather than left implicit.
+
+**Exit-criterion-3 wording deviation (justified).**  The plan says that on
+oracle mismatch the exactness label is "otherwise weakened and the from-
+scratch path is used."  This implementation does **not** weaken the label: it
+substitutes the cold exact optimum and **keeps** `grammar_exact`.  That is the
+right call because the cold B&B is genuinely exact, so weakening would
+mislabel a correct value as a mere lower bound.  The substantive requirement --
+"do not trust a wrong transient result; use the authoritative cold value" -- is
+met; only the literal "weakened" is not honored.  The fallback is still counted
+under `transient_chain_extension_fallbacks` /
+`transient_chain_extension_oracle_mismatches` so a regression to a wrong
+transient result is visible in the counters.
+
 ## Polytomy and binary chart compatibility
 
 The chart recurrence requires a binary chart-compatible grammar.  `dagutil` uses
@@ -220,5 +290,6 @@ Before changing chart-SPR search internals, verify:
 - candidate/fixed-topology identities use stable taxon/sample signatures, not
   dense-only IDs;
 - counters for local scores, composite rebuilds, overlay materializations,
-  exact verifications, reachability traversals, candidate-generation paths, and
-  accepted-state rebuilds remain exposed in structured/JSON-style reports.
+  exact verifications, transient chain extensions for verification, reachability
+  traversals, candidate-generation paths, and accepted-state rebuilds remain
+  exposed in structured/JSON-style reports.

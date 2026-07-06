@@ -67,7 +67,9 @@ Per the plan's cross-cutting counter contract:
   keeps `sidecar_rebuilds_after_accept == 0` and
   `overlay_materializations_for_accept_materialization == 0`; the umbrella
   `full_overlay_materializations` may still be nonzero because exact candidate
-  verification materializes overlays until the later chain-reuse phases land.
+  verification materializes overlays (Phase 9's transient path reduces this for
+  committable candidates but tombstone-scope cold fallbacks still materialize;
+  see the Phase-9 caveat in `WRIC-SPR-SEARCH.md`).
 - **Phase 4** also asserts conservative mode (`rebuild_after_accept = true`)
   passes its existing tests unchanged and that its per-accept materialization
   count is unchanged from this baseline.
@@ -135,6 +137,12 @@ chart_spr_search_counters:
   fixed_topology_selected_cache_hits:                          0
   fixed_topology_selected_cache_misses:                        0
   fixed_topology_selected_rows_computed:                       0
+  fixed_topology_persistent_cache_verifications:               0
+  fixed_topology_persistent_cache_fallbacks:                   0
+  fixed_topology_persistent_cache_oracle_mismatches:           0
+  transient_chain_extensions_for_verification:                 0
+  transient_chain_extension_fallbacks:                         0
+  transient_chain_extension_oracle_mismatches:                 0
   full_composite_rebuilds:                                     0
   local_candidate_scores:                                      89312
   local_rows_recomputed:                                       159379494

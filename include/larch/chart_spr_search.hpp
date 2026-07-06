@@ -170,6 +170,44 @@ struct chart_spr_search_counters {
   // zero (the hook must not rely on arbitrary score changes).
   std::size_t fixed_topology_independent_sm_bug_witnesses_for_tests = 0;
   std::size_t fixed_topology_independent_sm_bug_perturbations_for_tests = 0;
+
+  // Phase 9 (Work item 4a, technique 2) transient chain extension for
+  // grammar-exact verification.  The exact_multisite gate verifies an
+  // unaccepted candidate by transiently extending the overlay chain +
+  // persistent inside/outside caches in reader-local scratch storage (never
+  // mutating the shared cache, bypassing the Phase 4 commit barrier), reading
+  // the exact frontier on the extended grammar, and discarding.  By the
+  // cross-cutting definition this is NOT a dense materialization: the
+  // transient extension reuses the persistent cache machinery and updates only
+  // affected rows in scratch.  It is counted here, never folded into
+  // `full_overlay_materializations` (a regression to "dense materialize per
+  // candidate" must be visible, not hidden behind a renamed counter).
+  //
+  // CAVEAT: as shipped, the transient scratch caches are read ONLY by the
+  // test/diagnostic two-chart oracle; the production B&B scorer rebuilds the
+  // charts from the materialized extended grammar and does not consume them.
+  // So this counter measures the transient-extension SUBSTRATE being
+  // exercised, not a wall-clock win over the cold path -- Phase 9 lands
+  // substrate + oracle + counter discipline; the perf win awaits Phase 12
+  // (warm-started B&B seeded from these scratch caches).  See the header
+  // comment on `chart_spr_transient_extension` (chart_spr_search.cpp) and the
+  // Phase-9 caveat in doc/WRIC-SPR-SEARCH.md.
+  std::size_t transient_chain_extensions_for_verification = 0;
+  // Test-only diagnostic: transient extensions that fell back to the
+  // from-scratch cold path because the per-candidate oracle found a mismatch.
+  // A nonzero count means the transient result could not be trusted from the
+  // transient path alone; the cold-path result is authoritative.  Should stay
+  // zero on the fixture matrix (a nonzero count without a forced corruption
+  // hook is a correctness regression).
+  std::size_t transient_chain_extension_fallbacks = 0;
+  // Test-only diagnostic: transient extensions whose per-candidate
+  // from-scratch oracle (both charts + exact optimum) disagreed with the
+  // transient result.  Should stay zero on the fixture matrix.
+  std::size_t transient_chain_extension_oracle_mismatches = 0;
+  // Test-only diagnostic: number of (pattern, clade) scratch rows checked by
+  // the per-candidate two-chart oracle when the oracle flag is on.  Reported
+  // separately so a regression to "no oracle" is visible.
+  std::size_t transient_chain_extension_oracle_rows_checked_for_tests = 0;
 };
 
 // Acceptance modes describe the objective used to accept a candidate.  They
@@ -428,6 +466,19 @@ struct chart_spr_search_options {
   // rethrown as labelled correctness failures, not converted into invalid
   // candidates / "no exact-improving verified candidate".
   bool force_fixed_topology_cache_epoch_mismatch_for_tests = false;
+  // Phase 9 self-check: during local-commit exact_multisite verification,
+  // materialize each candidate overlay via the cold from-scratch path and
+  // compare the transient-extension result against it (both charts + exact
+  // optimum), per Work item 4a's correctness oracle.  Expensive and
+  // test/diagnostic-only; the production path trusts the transient result and
+  // never runs a hidden from-scratch oracle per candidate.
+  bool verify_transient_chain_extension_oracle_for_tests = false;
+  // Phase 9 corruption hook: perturb the transient extension's scratch
+  // outside cache so the per-candidate two-chart oracle catches the
+  // disagreement and the verifier falls back to the cold path.  The oracle
+  // must catch witnessed corruptions; a nonzero fallback count proves the
+  // gate fires rather than silently trusting a wrong transient result.
+  bool force_transient_chain_extension_oracle_mismatch_for_tests = false;
   // Test-only injection point for the Phase 4 hard-error contract: after the
   // overlay-chain append succeeds, force a post-append failure and verify the
   // search propagates it instead of converting it into an ordinary rejection.
@@ -521,6 +572,30 @@ using chart_spr_fixed_topology_verifier = std::function<
     chart_spr_candidate_score(chart_spr_search_state const&,
                               chart_spr_candidate_score)>;
 
+// Phase 9 (Work item 4a, technique 2) hook: when installed on the search
+// state (by the local-commit substrate builder), the exact_multisite
+// acceptance gate verifies each candidate by transiently extending the
+// overlay chain + persistent inside/outside caches in reader-local scratch
+// storage, reading the exact frontier on the extended grammar, and discarding.
+// The hook is reader-local (never mutates the shared cache) and therefore
+// bypasses the Phase 4 commit barrier, so transient extensions can run in
+// parallel with other scoring readers under the epoch/snapshot model.  When
+// absent, the exact_multisite gate falls back to the cold from-scratch path
+// (`verify_candidate_exact_against_state`).
+//
+// CAVEAT: as shipped this lands the transient-extension SUBSTRATE and the
+// per-candidate two-chart ORACLE, not a wall-clock improvement -- the scratch
+// caches are not consumed by the production B&B scorer (it rebuilds charts
+// from the grammar), so they are dead work on the production path and read
+// only by the test/diagnostic oracle.  The caches are forward-looking
+// groundwork for Phase 12 (warm-started B&B seeded from them).  See the header
+// comment on `chart_spr_transient_extension` in chart_spr_search.cpp and the
+// Phase-9 caveat in doc/WRIC-SPR-SEARCH.md.
+using chart_spr_exact_multisite_verifier = std::function<
+    chart_spr_candidate_score(chart_spr_search_state const&,
+                              chart_spr_candidate_score,
+                              multisite_trim_options const&)>;
+
 struct affected_clade_distribution {
   double mean = 0.0;
   std::size_t p50 = 0;
@@ -598,6 +673,13 @@ struct chart_spr_search_summary {
   std::size_t fixed_topology_icache_rows_reused = 0;
   std::size_t fixed_topology_icache_rows_recomputed_affected = 0;
   std::size_t fixed_topology_chain_objective_before_mismatches = 0;
+  // Phase 9 transient chain extension for grammar-exact verification.
+  // Mirrored from the counters so a regression to "dense materialize per
+  // candidate" (full_overlay_materializations > 0 on an exact local-commit
+  // run) is visible in CI/benchmark tables without drilling into counters.
+  std::size_t transient_chain_extensions_for_verification = 0;
+  std::size_t transient_chain_extension_fallbacks = 0;
+  std::size_t transient_chain_extension_oracle_mismatches = 0;
   chart_spr_candidate_selection_mode candidate_selection =
       chart_spr_candidate_selection_mode::lower_bound_top_k;
   chart_spr_acceptance_mode acceptance_mode =
@@ -1111,6 +1193,19 @@ struct chart_spr_search_state {
   // rebuild mode leaves this empty and uses the legacy direct selected-topology
   // fallback below.
   chart_spr_fixed_topology_verifier fixed_topology_exact_verifier;
+
+  // Optional Phase-9 transient-extension verifier supplied by the local-commit
+  // substrate.  When present, exact_multisite verification transiently extends
+  // the chain + caches in reader-local scratch (never mutating the shared
+  // cache) and reads the exact frontier on the extended grammar.  Conservative
+  // rebuild mode leaves this empty and uses the cold from-scratch path
+  // (`verify_candidate_exact_against_state`).
+  //
+  // As shipped this is substrate + oracle, not a perf win (see the typedef
+  // comment on `chart_spr_exact_multisite_verifier` and the Phase-9 caveat in
+  // doc/WRIC-SPR-SEARCH.md): the scratch caches are forward-looking groundwork
+  // for Phase 12 and are unconsumed by the production B&B scorer.
+  chart_spr_exact_multisite_verifier exact_multisite_verifier;
 
   mutable chart_spr_search_counters counters;
 };
@@ -2165,6 +2260,14 @@ inline void add_chart_spr_search_counters(
       src.fixed_topology_independent_sm_bug_witnesses_for_tests;
   dst.fixed_topology_independent_sm_bug_perturbations_for_tests +=
       src.fixed_topology_independent_sm_bug_perturbations_for_tests;
+  dst.transient_chain_extensions_for_verification +=
+      src.transient_chain_extensions_for_verification;
+  dst.transient_chain_extension_fallbacks +=
+      src.transient_chain_extension_fallbacks;
+  dst.transient_chain_extension_oracle_mismatches +=
+      src.transient_chain_extension_oracle_mismatches;
+  dst.transient_chain_extension_oracle_rows_checked_for_tests +=
+      src.transient_chain_extension_oracle_rows_checked_for_tests;
 }
 
 struct chart_spr_local_score_scratch {
@@ -2638,10 +2741,10 @@ inline std::uint64_t chart_spr_state_exact_score_with_invariants(
       trim.optimum, state, "chart-SPR exact state invariant offset");
 }
 
-// Phase-4 exact verification gate.  This intentionally does not call the
-// legacy diagnostic exact multisite helper: the current state's
-// old exact active-pattern score is read from (or lazily built into)
-// state.exact_trim_active_only, and only the candidate's new materialized
+// Phase-4 exact verification gate (the COLD / from-scratch path).  This
+// intentionally does not call the legacy diagnostic exact multisite helper: the
+// current state's old exact active-pattern score is read from (or lazily built
+// into) state.exact_trim_active_only, and only the candidate's new materialized
 // overlay grammar is trimmed here.  Overlay materialization is counted in the
 // exact-verification bucket, not as local scoring and not as accepted-state
 // sidecar rebuilding.
@@ -3465,6 +3568,18 @@ inline chart_spr_candidate_score verify_candidate_for_acceptance(
     case chart_spr_acceptance_mode::lower_bound_heuristic:
       return candidate;
     case chart_spr_acceptance_mode::exact_multisite:
+      // Phase 9: when a local-commit substrate is active it installs
+      // `state.exact_multisite_verifier`, which verifies the candidate by
+      // transiently extending the chain + caches in reader-local scratch
+      // (avoiding a fresh materialize_overlay_grammar, never mutating the
+      // shared cache).  When absent (conservative rebuild mode, or a bare
+      // state built without a substrate), the cold from-scratch path below is
+      // used.  The cold path is also the correctness oracle the transient
+      // verifier cross-checks when its test-only oracle flag is set.
+      if (state.exact_multisite_verifier) {
+        return state.exact_multisite_verifier(state, std::move(candidate),
+                                              options.exact_trim);
+      }
       return verify_candidate_exact_against_state(
           state, std::move(candidate), options.exact_trim);
     case chart_spr_acceptance_mode::fixed_topology_exact:
