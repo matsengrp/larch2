@@ -286,7 +286,8 @@ Post-processing:
   --chart-bnb-max-exact-topologies <N>
                           Cap optimal topology materialization; 0 = unlimited
   --wric-polytomy-mode <M>
-                          reject, audit-kary, expand-exact, or expand-bounded
+                          reject, audit-kary, allow, expand-exact, or
+                          expand-bounded
                           (chart-bnb default: expand-bounded)
   --wric-polytomy-max-shapes <N>
                           Bounded soft-polytomy shape cap for chart-bnb trim
@@ -413,6 +414,8 @@ static char const* larch2_polytomy_mode_name(polytomy_mode mode) {
       return "reject";
     case polytomy_mode::audit_kary:
       return "audit-kary";
+    case polytomy_mode::allow:
+      return "allow";
     case polytomy_mode::expand_soft_exact_or_fail:
       return "expand-exact";
     case polytomy_mode::expand_soft_bounded:
@@ -435,6 +438,7 @@ static std::optional<polytomy_mode> parse_larch2_polytomy_mode(
   if (text == "audit-kary" || text == "audit_kary") {
     return polytomy_mode::audit_kary;
   }
+  if (text == "allow") return polytomy_mode::allow;
   if (text == "expand-exact" || text == "expand_exact" ||
       text == "expand_soft_exact_or_fail") {
     return polytomy_mode::expand_soft_exact_or_fail;
@@ -2641,10 +2645,6 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
   auto grammar_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - grammar_start)
                         .count();
-  require_polytomy_refinement_binary_charting(
-      refinement.audit,
-      "larch2 --trim-mode chart-bnb (use --wric-polytomy-mode "
-      "expand-exact or expand-bounded for soft polytomies)");
 
   auto pattern_start = std::chrono::steady_clock::now();
   site_pattern_options pattern_opts;

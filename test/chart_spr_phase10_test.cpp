@@ -65,6 +65,15 @@ static larch::phylo_dag make_four_taxon_dag() {
   return larch::test::make_tiny_labelled_tree("A", four_taxon_misplaced_tree());
 }
 
+static larch::test::tiny_tree_node phase7_arity3_misplaced_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner("AC", "A", {tiny_leaf("A", "A"), tiny_leaf("C", "C")}),
+       tiny_leaf("B", "A"), tiny_leaf("D", "C")});
+}
+
 // =====================================================================
 // Criterion 1: a local-commit run's report carries every contract counter
 // with the contracted values.
@@ -246,6 +255,13 @@ static std::vector<larch::rank3_production_taxa_key> grammar_keys(
         grammar, static_cast<larch::production_id>(pid)));
   }
   return sorted_unique_keys(std::move(keys));
+}
+
+static bool contains_multifurcation_key(
+    std::vector<larch::rank3_production_taxa_key> const& keys) {
+  return std::any_of(keys.begin(), keys.end(), [](auto const& key) {
+    return key.children.size() > 2;
+  });
 }
 
 // ---- Option-C after-structure helpers (mirror option_c_chain_commit_test) ----
@@ -434,6 +450,50 @@ static void test_phase10_search_loop_chain_identity_round_trip() {
   for (auto const& key :
        report.entries.front().tombstoned_production_keys) {
     CHECK(rebuilt_set.count(key) == 0);
+  }
+
+  std::println("  PASS");
+}
+
+static void test_phase7_multifurcation_chain_identity_round_trip() {
+  std::println("test_phase7_multifurcation_chain_identity_round_trip");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", phase7_arity3_misplaced_tree());
+  larch::clade_grammar_options gopts;
+  gopts.allow_polytomies = true;
+  auto grammar = larch::build_clade_grammar(dag, gopts);
+  CHECK(larch::clade_grammar_max_production_arity(grammar) == 3);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+  CHECK(search.counters.local_commit_accepted_moves == 1);
+  CHECK(search.counters.spr_multifurcation_moves_generated > 0);
+  CHECK(!search.chain_identity_report_json.empty());
+
+  auto report = larch::parse_phase10_chain_identity_report_json(
+      search.chain_identity_report_json);
+  CHECK(report.entries.size() == 1);
+  CHECK(report.entries.front().commit_source == "spr_overlay_delta");
+  CHECK(contains_multifurcation_key(report.base_production_keys));
+
+  auto net = larch::phase10_chain_net_production_keys(report);
+  CHECK(contains_multifurcation_key(net));
+
+  auto rebuilt = larch::build_clade_grammar(search.dag, gopts);
+  CHECK(larch::clade_grammar_max_production_arity(rebuilt) == 3);
+  auto rebuilt_keys = grammar_keys(rebuilt);
+  std::set<larch::rank3_production_taxa_key> rebuilt_set{
+      rebuilt_keys.begin(), rebuilt_keys.end()};
+  for (auto const& key : net) {
+    CHECK(rebuilt_set.count(key) != 0);
   }
 
   std::println("  PASS");
@@ -677,6 +737,7 @@ static void test_phase10_counter_contract_fields_exist() {
   (void)c.overlay_materializations_for_accept_materialization;
   (void)c.overlay_materializations_for_final_compaction;
   (void)c.transient_chain_extensions_for_verification;
+  (void)c.selected_topology_multifurcation_rows;
   (void)c.spr_multifurcation_moves_generated;
   (void)c.inside_rows_recomputed_on_commit;
   (void)c.outside_rows_recomputed_on_commit;
@@ -686,6 +747,7 @@ static void test_phase10_counter_contract_fields_exist() {
   larch::chart_spr_search_summary s{};
   (void)s.sidecar_rebuilds_after_accept;
   (void)s.transient_chain_extensions_for_verification;
+  (void)s.selected_topology_multifurcation_rows;
   (void)s.spr_multifurcation_moves_generated;
   (void)s.inside_rows_recomputed_on_commit;
   (void)s.outside_rows_recomputed_on_commit;
@@ -706,6 +768,7 @@ int main() {
   test_phase10_chain_identity_json_round_trip();
   test_phase10_chain_identity_report_two_delta();
   test_phase10_search_loop_chain_identity_round_trip();
+  test_phase7_multifurcation_chain_identity_round_trip();
   std::println("chart_spr_phase10_test PASS");
   return 0;
 }

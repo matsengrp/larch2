@@ -11,6 +11,7 @@
 #include <iterator>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -74,6 +75,25 @@ struct chart_options {
   std::size_t max_trace_choices = 0;
 };
 
+inline std::size_t clade_grammar_max_production_arity(
+    clade_grammar const& grammar) {
+  std::size_t max_arity = 0;
+  for (auto const& prod : grammar.productions) {
+    max_arity = std::max(max_arity, prod.children.size());
+  }
+  return max_arity;
+}
+
+inline std::optional<production_id> first_multifurcating_production(
+    clade_grammar const& grammar) {
+  for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
+    if (grammar.productions[pid].children.size() > 2) {
+      return static_cast<production_id>(pid);
+    }
+  }
+  return std::nullopt;
+}
+
 namespace parsimony_chart_detail {
 
 inline std::uint8_t strict_decode_acgt_state(char c) {
@@ -95,6 +115,22 @@ inline std::uint8_t strict_decode_acgt_state(char c) {
                                            "reference nucleotide '"} +
                                c + "'");
   }
+}
+
+inline void require_no_multifurcating_productions_for_consumer(
+    clade_grammar const& grammar, std::string_view context,
+    std::string_view layer, std::string_view resolution) {
+  auto first = first_multifurcating_production(grammar);
+  if (!first) return;
+  auto const& prod = grammar.productions[*first];
+  throw std::runtime_error(
+      std::string{context} +
+      ": WI6 arity gate: the chart supports multifurcations; this consumer's " +
+      std::string{layer} + " does not (production " +
+      std::to_string(*first) + " has arity " +
+      std::to_string(prod.children.size()) + ", grammar max arity " +
+      std::to_string(clade_grammar_max_production_arity(grammar)) + "); " +
+      std::string{resolution});
 }
 
 inline std::uint8_t strict_decode_acgt_state(nuc_base base) {
@@ -369,6 +405,12 @@ inline single_site_chart build_single_site_chart(
   using namespace parsimony_chart_detail;
 
   validate_chart_grammar(grammar);
+  if (options.keep_trace) {
+    require_no_multifurcating_productions_for_consumer(
+        grammar, "single-site chart keep_trace", "trace",
+        "build without keep_trace, or expand polytomies before using the "
+        "binary trace layer");
+  }
   if (leaf_states.state_by_taxon.size() !=
       grammar.taxa.id_to_sample_id.size()) {
     throw std::runtime_error(

@@ -2,6 +2,7 @@
 #include <larch/chart_trim.hpp>
 #include <larch/clade_grammar.hpp>
 #include <larch/parsimony_chart.hpp>
+#include <larch/plateau.hpp>
 
 #include "test_util.hpp"
 
@@ -36,6 +37,15 @@ static std::string runtime_error_message(auto&& f) {
     return e.what();
   }
   return {};
+}
+
+static void check_arity_gate_message(std::string const& message,
+                                     std::string const& layer) {
+  CHECK(message.find("WI6 arity gate") != std::string::npos);
+  CHECK(message.find("the chart supports multifurcations") !=
+        std::string::npos);
+  CHECK(message.find(layer) != std::string::npos);
+  CHECK(message.find("grammar max arity 3") != std::string::npos);
 }
 
 static larch::chart_cost brute_add(larch::chart_cost lhs,
@@ -371,8 +381,24 @@ static void test_trinary_fixture_and_allow_gate() {
   auto trim_message = runtime_error_message([&] {
     (void)larch::build_single_site_trim_mask(grammar, chart, outside);
   });
-  CHECK(trim_message.find("Phase 4 supports binary productions only") !=
-        std::string::npos);
+  check_arity_gate_message(trim_message, "choice layer");
+
+  auto patterns = larch::build_site_patterns(dag, grammar);
+  auto multisite_trim_message = runtime_error_message([&] {
+    (void)larch::build_multisite_trim(grammar, patterns);
+  });
+  check_arity_gate_message(multisite_trim_message, "B&B frontier");
+
+  auto fluidity_message = runtime_error_message([&] {
+    (void)larch::build_single_site_fluidity_report(grammar, chart, outside);
+  });
+  check_arity_gate_message(fluidity_message, "choice layer");
+
+  auto plateau_message = runtime_error_message([&] {
+    (void)larch::build_multisite_plateau_report(grammar, patterns);
+  });
+  check_arity_gate_message(plateau_message, "choice layer");
+
   auto traceback_message = runtime_error_message([&] {
     (void)larch::deterministic_optimal_single_site_traceback(grammar, chart,
                                                              outside);
@@ -385,8 +411,7 @@ static void test_trinary_fixture_and_allow_gate() {
   auto trace_message = runtime_error_message([&] {
     (void)larch::build_single_site_chart(grammar, states, trace_opts);
   });
-  CHECK(trace_message.find("keep_trace uses the binary choice layer") !=
-        std::string::npos);
+  check_arity_gate_message(trace_message, "trace");
 
   std::println("  PASS");
 }

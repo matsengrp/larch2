@@ -21,6 +21,7 @@ namespace larch {
 enum class polytomy_mode : std::uint8_t {
   reject,
   audit_kary,
+  allow,
   expand_soft_exact_or_fail,
   expand_soft_bounded,
 };
@@ -262,7 +263,8 @@ inline polytomy_refinement_result make_phase0_result(
       info.origin = refined_production_origin::observed_binary;
       info.exact_refinement_component = true;
     } else if (prod.children.size() > 2 &&
-               options.mode == polytomy_mode::audit_kary) {
+               (options.mode == polytomy_mode::audit_kary ||
+                options.mode == polytomy_mode::allow)) {
       info.origin = refined_production_origin::observed_kary_unexpanded;
       info.exact_refinement_component = false;
 
@@ -2041,6 +2043,12 @@ inline polytomy_refinement_result build_polytomy_refined_clade_grammar(
           std::move(built), refinement_opts);
     }
     case polytomy_mode::audit_kary: {
+      grammar_opts.allow_polytomies = true;
+      auto built = build_clade_grammar_with_audit(dag, grammar_opts);
+      return polytomy_refinement_detail::make_phase0_result(
+          std::move(built), refinement_opts);
+    }
+    case polytomy_mode::allow: {
       grammar_opts.allow_polytomies = true;
       auto built = build_clade_grammar_with_audit(dag, grammar_opts);
       return polytomy_refinement_detail::make_phase0_result(

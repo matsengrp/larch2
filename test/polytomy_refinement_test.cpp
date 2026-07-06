@@ -741,6 +741,33 @@ static void test_audit_kary_returns_diagnostic_grammar() {
   std::println("  PASS");
 }
 
+static void test_allow_returns_unexpanded_kary_grammar() {
+  std::println("test_allow_returns_unexpanded_kary_grammar");
+
+  auto dag = make_three_taxon_star();
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::allow;
+  auto result = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, opts);
+
+  CHECK(result.options.mode == larch::polytomy_mode::allow);
+  CHECK(result.grammar.productions.size() == 1);
+  CHECK(result.grammar.productions.front().children.size() == 3);
+  CHECK(result.audit.contains_kary_productions);
+  CHECK(!result.audit.binary_chart_compatible);
+  CHECK(!result.audit.exact_for_soft_polytomies);
+  CHECK(result.audit.synthetic_clade_count == 0);
+  CHECK(result.audit.synthetic_production_count == 0);
+  CHECK(result.production_info.front().origin ==
+        larch::refined_production_origin::observed_kary_unexpanded);
+
+  auto states = larch::extract_leaf_site_states(dag, result.grammar, 1);
+  auto chart = larch::build_single_site_chart(result.grammar, states);
+  CHECK(chart.root_min_excluding_ua(result.grammar.root_clade) == 1);
+
+  std::println("  PASS");
+}
+
 static void test_dense_chart_accepts_audit_kary_grammar() {
   std::println("test_dense_chart_accepts_audit_kary_grammar");
 
@@ -1729,6 +1756,7 @@ int main() {
   test_reject_mode_accepts_binary_grammar();
   test_audit_kary_binary_grammar_remains_exact();
   test_audit_kary_returns_diagnostic_grammar();
+  test_allow_returns_unexpanded_kary_grammar();
   test_dense_chart_accepts_audit_kary_grammar();
   test_exact_expansion_three_taxon_star();
   test_exact_expansion_four_taxon_star_matches_bruteforce();

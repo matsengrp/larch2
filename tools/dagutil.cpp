@@ -321,6 +321,8 @@ static char const* wric_polytomy_mode_name(polytomy_mode mode) {
       return "reject";
     case polytomy_mode::audit_kary:
       return "audit-kary";
+    case polytomy_mode::allow:
+      return "allow";
     case polytomy_mode::expand_soft_exact_or_fail:
       return "expand-exact";
     case polytomy_mode::expand_soft_bounded:
@@ -869,6 +871,8 @@ static void print_wric_polytomy_summary_fields(
   out << "  polytomy_mode: " << wric_polytomy_mode_name(mode) << "\n";
   out << "  polytomy_refinement_label: "
       << polytomy_refinement_status_label(audit) << "\n";
+  out << "  grammar_max_arity: "
+      << clade_grammar_max_production_arity(refinement.grammar) << "\n";
   out << "  source_kary_productions: "
       << audit.source_kary_production_count << "\n";
   out << "  contains_kary_productions: "
@@ -1020,7 +1024,10 @@ static void print_wric_polytomy_audit_fields(
               : "false")
       << "\n";
   out << "  kary_grammar_diagnostic_only: "
-      << (audit.contains_kary_productions ? "true" : "false") << "\n";
+      << (mode == polytomy_mode::audit_kary && audit.contains_kary_productions
+              ? "true"
+              : "false")
+      << "\n";
   print_wric_polytomy_event_details(out, refinement);
 }
 
@@ -1031,10 +1038,15 @@ static void print_wric_polytomy_score_fields(
   print_wric_polytomy_summary_fields(out, refinement, mode);
   out << "  exact_for_full_soft_polytomy_space: "
       << (audit.exact_for_soft_polytomies ? "true" : "false") << "\n";
-  if (!audit.exact_for_soft_polytomies) {
-    out << "  score_scope: BOUNDED_REFINED_GRAMMAR\n";
-  } else {
+  if (audit.exact_for_soft_polytomies) {
     out << "  score_scope: FULL_SOFT_POLYTOMY_SPACE\n";
+  } else if (mode == polytomy_mode::allow && audit.contains_kary_productions) {
+    out << "  score_scope: DAG_NATIVE_KARY_GRAMMAR\n";
+  } else if (mode == polytomy_mode::audit_kary &&
+             audit.contains_kary_productions) {
+    out << "  score_scope: KARY_GRAMMAR_DIAGNOSTIC\n";
+  } else {
+    out << "  score_scope: BOUNDED_REFINED_GRAMMAR\n";
   }
   if (detailed_report) print_wric_polytomy_event_details(out, refinement);
 }
@@ -1151,11 +1163,11 @@ Analysis:
   --wric-benchmark        Run the Phase-9 WRIC grammar/chart/pattern benchmark
                           (polytomy-aware alias of --wric-polytomy-benchmark)
   --wric-polytomy-mode <M>
-                          reject (default), audit-kary, expand-exact,
-                          or expand-bounded for WRIC chart diagnostics;
-                          chart-SPR search also uses this mode and requires a
-                          binary chart-compatible grammar (reject fails fast on
-                          unresolved high-arity productions)
+                          reject (default), audit-kary, allow, expand-exact,
+                          or expand-bounded for WRIC chart diagnostics.
+                          allow keeps multifurcating productions for
+                          arity-aware chart/SPR paths; binary-only consumers
+                          throw a labelled arity gate.
   --wric-polytomy-max-exact-arity <N>
                           Exact expansion arity cap (default 6)
   --wric-polytomy-max-shapes <N>
@@ -1462,6 +1474,7 @@ static std::optional<polytomy_mode> parse_wric_polytomy_mode(
   if (text == "reject") return polytomy_mode::reject;
   if (text == "audit-kary" || text == "audit_kary")
     return polytomy_mode::audit_kary;
+  if (text == "allow") return polytomy_mode::allow;
   if (text == "expand-exact" || text == "expand_exact" ||
       text == "expand_soft_exact_or_fail")
     return polytomy_mode::expand_soft_exact_or_fail;
@@ -2946,6 +2959,8 @@ static void print_chart_spr_search_counter_fields(
       << counters.fixed_topology_selected_cache_misses << "\n";
   out << indent << "fixed_topology_selected_rows_computed: "
       << counters.fixed_topology_selected_rows_computed << "\n";
+  out << indent << "selected_topology_multifurcation_rows: "
+      << counters.selected_topology_multifurcation_rows << "\n";
   out << indent << "fixed_topology_persistent_cache_verifications: "
       << counters.fixed_topology_persistent_cache_verifications << "\n";
   out << indent << "fixed_topology_persistent_cache_fallbacks: "
@@ -3012,6 +3027,8 @@ static void print_chart_spr_search_counter_fields(
       << counters.path_pairs_considered << "\n";
   out << indent << "candidates_constructed: "
       << counters.candidates_constructed << "\n";
+  out << indent << "spr_multifurcation_moves_generated: "
+      << counters.spr_multifurcation_moves_generated << "\n";
   out << indent << "candidates_pruned_before_construction: "
       << counters.candidates_pruned_before_construction << "\n";
   out << indent << "candidates_pruned_after_construction: "
@@ -3079,7 +3096,9 @@ static void run_chart_spr_candidate_diagnostic(
   out << "  api: streaming\n";
   out << "  polytomy_mode: "
       << wric_polytomy_mode_name(a.wric_polytomy_opts.mode) << "\n";
-  out << "  binary_chart_compatibility: required_checked\n";
+  out << "  grammar_max_arity: " << clade_grammar_max_production_arity(grammar)
+      << "\n";
+  out << "  arity_support: arity_agnostic_candidate_generation\n";
   out << "  source: " << chart_spr_candidate_source_name(opts.source)
       << "\n";
   out << "  candidate_signature_identity: "
@@ -3123,6 +3142,8 @@ static void run_chart_spr_candidate_diagnostic(
       << "\n";
   out << "    candidates_constructed: " << stats.candidates_constructed
       << "\n";
+  out << "    spr_multifurcation_moves_generated: "
+      << stats.spr_multifurcation_moves_generated << "\n";
   out << "    candidates_pruned_before_construction: "
       << stats.candidates_pruned_before_construction << "\n";
   out << "    candidates_pruned_after_construction: "
@@ -3170,6 +3191,8 @@ static void add_candidate_generation_stats_to_counters(
       stats.candidates_pruned_after_construction;
   counters.candidates_generated_after_dedup +=
       stats.candidates_generated_after_dedup;
+  counters.spr_multifurcation_moves_generated +=
+      stats.spr_multifurcation_moves_generated;
   counters.candidates_pruned_root_or_trivial +=
       stats.candidates_pruned_root_or_trivial;
   counters.candidates_pruned_moved_size += stats.candidates_pruned_moved_size;
@@ -3200,6 +3223,8 @@ static void print_chart_spr_generation_stats(
       << stats.path_pairs_considered << "\n";
   out << indent << "candidates_constructed: "
       << stats.candidates_constructed << "\n";
+  out << indent << "spr_multifurcation_moves_generated: "
+      << stats.spr_multifurcation_moves_generated << "\n";
   out << indent << "candidates_pruned_before_construction: "
       << stats.candidates_pruned_before_construction << "\n";
   out << indent << "candidates_pruned_after_construction: "
@@ -3295,7 +3320,9 @@ static void run_chart_spr_local_scoring_diagnostic(
   out << "  api: search_state_cached_active_pattern_charts\n";
   out << "  polytomy_mode: "
       << wric_polytomy_mode_name(a.wric_polytomy_opts.mode) << "\n";
-  out << "  binary_chart_compatibility: required_checked\n";
+  out << "  grammar_max_arity: "
+      << clade_grammar_max_production_arity(refinement.grammar) << "\n";
+  out << "  arity_support: arity_agnostic_chart_spr\n";
   out << "  score_kind: composite_lower_bound\n";
   out << "  score_convention: active_cache_plus_single_invariant_offset\n";
   out << "  phase1_materialized_overlay_local_recompute: false\n";
@@ -3471,7 +3498,9 @@ static void run_chart_spr_search_diagnostic(
   out << "  api: search_state_cached_active_pattern_charts\n";
   out << "  polytomy_mode: "
       << wric_polytomy_mode_name(a.wric_polytomy_opts.mode) << "\n";
-  out << "  binary_chart_compatibility: required_checked\n";
+  out << "  grammar_max_arity: "
+      << clade_grammar_max_production_arity(refinement.grammar) << "\n";
+  out << "  arity_support: arity_agnostic_chart_spr\n";
   out << "  search_mode: "
       << (options.rebuild_after_accept
               ? "phase5_accept_reject_materialize_rebuild"
@@ -3649,6 +3678,8 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.fixed_topology_selected_cache_misses << "\n";
   out << "  fixed_topology_selected_rows_computed: "
       << search.summary.fixed_topology_selected_rows_computed << "\n";
+  out << "  selected_topology_multifurcation_rows: "
+      << search.summary.selected_topology_multifurcation_rows << "\n";
   out << "  fixed_topology_persistent_cache_verifications: "
       << search.summary.fixed_topology_persistent_cache_verifications << "\n";
   out << "  fixed_topology_persistent_cache_fallbacks: "
@@ -3943,6 +3974,8 @@ static void run_chart_spr_helper_benchmark(
       << enumeration.stats.path_pairs_considered << "\n";
   out << "    candidates_constructed: "
       << enumeration.stats.candidates_constructed << "\n";
+  out << "    spr_multifurcation_moves_generated: "
+      << enumeration.stats.spr_multifurcation_moves_generated << "\n";
   out << "    candidates_pruned_before_construction: "
       << enumeration.stats.candidates_pruned_before_construction << "\n";
   out << "    candidates_pruned_after_construction: "
@@ -4035,10 +4068,6 @@ int main(int argc, char** argv) try {
           result, grammar_opts, a.wric_polytomy_opts);
       chart_grammar_build_ms =
           elapsed_ms(start, std::chrono::steady_clock::now());
-      require_polytomy_refinement_binary_charting(
-          chart_refinement_cache->audit,
-          "WRIC chart diagnostics (use --wric-polytomy-mode expand-exact "
-          "or expand-bounded for soft polytomies)");
     }
     return *chart_refinement_cache;
   };

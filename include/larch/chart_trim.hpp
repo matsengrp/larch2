@@ -586,6 +586,11 @@ inline chart_trim_mask build_single_site_trim_mask(
     single_site_outside_chart const& outside,
     chart_trim_options const& trim_options = {}) {
   chart_trim_detail::validate_outside_shapes(grammar, chart, outside);
+  parsimony_chart_detail::require_no_multifurcating_productions_for_consumer(
+      grammar, "single-site trim mask", "choice layer",
+      "use dense inside/outside chart rows or selected-topology/SPR paths on "
+      "the multifurcating grammar, or expand polytomies before building a "
+      "trim mask");
   if (chart_trim_detail::compute_global_min(grammar, chart, outside) !=
       outside.global_min) {
     throw std::runtime_error("chart trim: outside global optimum is stale");
@@ -2446,6 +2451,10 @@ inline multisite_trim_result build_multisite_trim(
   validate_multisite_inputs(grammar, patterns, options);
   validate_multisite_trim_options_supported(trim_options, "multi-site trim",
                                             true);
+  parsimony_chart_detail::require_no_multifurcating_productions_for_consumer(
+      grammar, "multi-site trim", "B&B frontier",
+      "use --wric-polytomy-mode expand-exact or expand-bounded before B&B "
+      "trim, or use an arity-agnostic SPR/fixed-topology path");
 
   auto keep_mask_kind = keep_mask_kind_for_options(trim_options);
   auto keep_production_exact =
