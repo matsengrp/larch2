@@ -2445,12 +2445,10 @@ inline rank3_option_b_result materialize_rank3_option_b(
 // nodes spliced, never to the (potentially exponential) number of represented
 // trees containing the before production, and the merge path is never invoked.
 //
-// Scope (initial, binary chart-compatible): a before or after production of
-// arity != 2 is a synthetic-polytomy case and throws a labelled message that
-// routes the caller to Option A, reusing the throw vocabulary already in
-// polytomy_refinement.hpp.  The after production's parent taxon set must equal
-// the before production's parent taxon set (the rewrite boundary is fixed);
-// a rewrite that would change the represented parent clade is a hard error.
+// Scope: standalone Option C accepts any before/after production arity >= 2.
+// The after production's parent taxon set must equal the before production's
+// parent taxon set (the rewrite boundary is fixed); a rewrite that would
+// change the represented parent clade is a hard error.
 //
 // Identity follows the same convention as Option A/B: before/after are
 // identified by taxon-set keys (rank3_production_taxa_key), so a splice
@@ -2467,8 +2465,8 @@ inline rank3_option_b_result materialize_rank3_option_b(
 struct option_c_after_subtree {
   // Sorted, unique taxa of the clade this subtree root realizes.
   std::vector<taxon_id> taxa;
-  // Empty for a leaf (singleton) clade.  Exactly two entries (a binary
-  // partition of `taxa`) for an internal clade.
+  // Empty for a leaf (singleton) clade.  Two or more entries (a partition of
+  // `taxa`) for an internal clade.
   std::vector<option_c_after_subtree> children;
 };
 
@@ -2476,7 +2474,7 @@ struct option_c_after_production {
   // Must equal the before production's parent taxon set (the rewrite
   // boundary is fixed).
   std::vector<taxon_id> parent_taxa;
-  // Exactly two entries (binary); their taxa must partition parent_taxa.
+  // Two or more entries; their taxa must partition parent_taxa.
   std::vector<option_c_after_subtree> children;
 };
 
@@ -2518,6 +2516,7 @@ struct option_c_splice_result {
   std::size_t edges_added = 0;
   std::size_t nodes_created = 0;
   std::size_t nodes_pruned = 0;
+  std::size_t option_c_polytomy_splices = 0;
   // Set when after_present == no_op_if_present short-circuited the splice
   // because the after key was already present.
   bool after_already_present_no_op = false;
@@ -2551,10 +2550,10 @@ inline void validate_after_subtree(option_c_after_subtree const& subtree,
     }
     return;
   }
-  if (subtree.children.size() != 2) {
-    throw std::runtime_error(
-        polytomy_direct_mutation_not_implemented_message(
-            context, "non-binary (polytomy) after production"));
+  if (subtree.children.size() < 2) {
+    throw std::runtime_error(std::string{context} +
+                             ": after subtree internal clade has fewer than "
+                             "2 children");
   }
   std::vector<taxon_id> covered;
   for (auto const& child : subtree.children) {
@@ -2582,6 +2581,14 @@ inline void validate_after_subtree(option_c_after_subtree const& subtree,
   }
 }
 
+inline bool after_subtree_has_polytomy(option_c_after_subtree const& subtree) {
+  if (!subtree.children.empty() && subtree.children.size() != 2) return true;
+  for (auto const& child : subtree.children) {
+    if (after_subtree_has_polytomy(child)) return true;
+  }
+  return false;
+}
+
 inline void validate_after_production(option_c_after_production const& after,
                                       std::string_view context) {
   auto parent = normalize_taxa(after.parent_taxa);
@@ -2589,10 +2596,9 @@ inline void validate_after_production(option_c_after_production const& after,
     throw std::runtime_error(std::string{context} +
                              ": after production has empty parent clade");
   }
-  if (after.children.size() != 2) {
-    throw std::runtime_error(
-        polytomy_direct_mutation_not_implemented_message(
-            context, "non-binary (polytomy) after production"));
+  if (after.children.size() < 2) {
+    throw std::runtime_error(std::string{context} +
+                             ": after production has fewer than 2 children");
   }
   std::vector<taxon_id> covered;
   for (auto const& child : after.children) {
@@ -2619,6 +2625,15 @@ inline void validate_after_production(option_c_after_production const& after,
         std::string{context} +
         ": after production children do not partition parent clade");
   }
+}
+
+inline bool after_production_has_polytomy(
+    option_c_after_production const& after) {
+  if (after.children.size() != 2) return true;
+  for (auto const& child : after.children) {
+    if (after_subtree_has_polytomy(child)) return true;
+  }
+  return false;
 }
 
 inline rank3_production_taxa_key after_key_from_production(
@@ -2674,6 +2689,32 @@ inline leaf_node_index build_leaf_node_index(phylo_dag& dag,
     if (taxa.size() == 1) idx.singleton_to_leaf.emplace(taxa, node_idx);
   }
   return idx;
+}
+
+inline void validate_after_subtree_leaves_present(
+    option_c_after_subtree const& subtree, leaf_node_index const& leaves,
+    std::string_view context) {
+  auto taxa = normalize_taxa(subtree.taxa);
+  if (subtree.children.empty()) {
+    if (leaves.singleton_to_leaf.find(taxa) == leaves.singleton_to_leaf.end()) {
+      throw std::runtime_error(
+          std::string{context} +
+          ": after subtree references a leaf clade that is not represented in "
+          "the DAG");
+    }
+    return;
+  }
+  for (auto const& child : subtree.children) {
+    validate_after_subtree_leaves_present(child, leaves, context);
+  }
+}
+
+inline void validate_after_production_leaves_present(
+    option_c_after_production const& after, leaf_node_index const& leaves,
+    std::string_view context) {
+  for (auto const& child : after.children) {
+    validate_after_subtree_leaves_present(child, leaves, context);
+  }
 }
 
 // ---- Phase 7: Option C as a committed overlay delta ---------------------
@@ -2851,8 +2892,9 @@ inline std::size_t option_c_realize_subtree(
 }
 
 // Direct in-place production splice.  `source` is mutated in place; on any
-// labelled throw (absent before, polytomy before/after, boundary mismatch) it
-// is left unchanged because every guard fires before edge surgery begins.
+// labelled throw (absent before, boundary mismatch, invalid after partition,
+// missing after leaf) it is left unchanged because every guard fires before
+// edge surgery begins.
 inline option_c_splice_result option_c_splice_production(
     phylo_dag& source, rank3_production_taxa_key before_key,
     option_c_after_production after,
@@ -2873,13 +2915,18 @@ inline option_c_splice_result option_c_splice_production(
         "that changes the represented parent clade is a hard error");
   }
 
+  auto grammar_options = options.rebuild_grammar_options;
+  bool requested_polytomy =
+      before_key.children.size() != 2 ||
+      option_c_detail::after_production_has_polytomy(after);
+  if (requested_polytomy) grammar_options.allow_polytomies = true;
+
   // Build the pre-splice grammar.  build_clade_grammar_with_audit rebuilds
   // clade offsets internally, so no explicit build_clade_offsets is needed
   // here; and it performs no topology or compact-genome mutation (it only
-  // refreshes derived clade offsets), so the absent-before and polytomy-before
-  // throws below leave the caller's DAG topology unchanged.
-  auto pre =
-      build_clade_grammar_with_audit(source, options.rebuild_grammar_options);
+  // refreshes derived clade offsets), so the absent-before guards below leave
+  // the caller's DAG topology unchanged.
+  auto pre = build_clade_grammar_with_audit(source, grammar_options);
   auto& grammar = pre.grammar;
 
   auto before_pid =
@@ -2889,13 +2936,6 @@ inline option_c_splice_result option_c_splice_production(
         std::string{context} + ": before production " +
         rank3_detail::production_key_to_string(before_key) +
         " is absent from the DAG; nothing to splice");
-  }
-
-  if (grammar.productions[before_pid].children.size() != 2) {
-    throw std::runtime_error(
-        polytomy_direct_mutation_not_implemented_message(
-            context, "non-binary (polytomy) before production " +
-                         std::to_string(before_pid)));
   }
 
   // after_present == no_op_if_present: a documented no-op when the after key
@@ -2911,6 +2951,11 @@ inline option_c_splice_result option_c_splice_production(
   // Snapshot witness edge indices before any mutation.
   auto witnesses = grammar.productions[before_pid].witnesses;
   auto leaves = option_c_detail::build_leaf_node_index(source, grammar);
+  option_c_detail::validate_after_production_leaves_present(after, leaves,
+                                                            context);
+  bool polytomy_splice =
+      grammar.productions[before_pid].children.size() != 2 ||
+      option_c_detail::after_production_has_polytomy(after);
 
   // ---- Edge surgery begins ----------------------------------------------
   // Edge-index stability: edge_view::remove() (dag.hpp) unlinks the edge from
@@ -2936,6 +2981,7 @@ inline option_c_splice_result option_c_splice_production(
                                leaves, result);
     }
     ++result.witnesses_spliced;
+    if (polytomy_splice) ++result.option_c_polytomy_splices;
   }
 
   // Prune nodes that became unreachable so validate_dag's reachability check
@@ -2989,8 +3035,7 @@ inline option_c_splice_result option_c_splice_production(
     validate_dag(source, "rank3 option C spliced DAG",
                  thread_pool::get_default());
   }
-  result.rebuilt =
-      build_clade_grammar_with_audit(source, options.rebuild_grammar_options);
+  result.rebuilt = build_clade_grammar_with_audit(source, grammar_options);
   rank3_detail::validate_same_taxa_for_rank3(context, grammar,
                                              result.rebuilt.grammar);
   return result;
@@ -3024,8 +3069,10 @@ inline option_c_splice_result option_c_splice_production(
 // As in Phase 6, the after production's parent taxon set must equal the before
 // production's parent taxon set (the rewrite boundary is fixed); a rewrite
 // that would change the represented parent clade is a hard error, and a
-// non-binary (polytomy) before/after throws a labelled message that routes to
-// Option A.  Identity is by taxon-set key, identical to Phase 6 / Option A/B.
+// non-binary (polytomy) before production still throws a labelled message that
+// routes to Option A in the overlay path.  After templates share standalone
+// Option C's arity-general validation.  Identity is by taxon-set key,
+// identical to Phase 6 / Option A/B.
 //
 // The returned delta carries a fully-populated derived index (affected order,
 // reachability, temp indices) so it is a valid `spr_overlay_delta` usable by

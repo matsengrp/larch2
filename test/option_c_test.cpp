@@ -225,12 +225,21 @@ static larch::option_c_after_subtree pair_after(
                                        {std::move(c0), std::move(c1)}};
 }
 
+static larch::option_c_after_subtree node_after(
+    std::vector<larch::taxon_id> taxa,
+    std::vector<larch::option_c_after_subtree> children) {
+  return larch::option_c_after_subtree{std::move(taxa), std::move(children)};
+}
+
 // Full merge-equivalence oracle (clade taxa sets, production keys,
 // representable tree count, and Fitch parsimony when both are single trees).
 static void check_option_c_merge_equivalent(larch::phylo_dag& c_dag,
-                                             larch::phylo_dag& a_dag) {
-  auto cg = larch::build_clade_grammar(c_dag);
-  auto ag = larch::build_clade_grammar(a_dag);
+                                             larch::phylo_dag& a_dag,
+                                             bool allow_polytomies = false) {
+  larch::clade_grammar_options opts;
+  opts.allow_polytomies = allow_polytomies;
+  auto cg = larch::build_clade_grammar(c_dag, opts);
+  auto ag = larch::build_clade_grammar(a_dag, opts);
   CHECK(clade_taxa_set(cg) == clade_taxa_set(ag));
   CHECK(larch::rank3_detail::production_key_set(cg) ==
         larch::rank3_detail::production_key_set(ag));
@@ -250,9 +259,12 @@ static void check_option_c_merge_equivalent(larch::phylo_dag& c_dag,
 // The parsimony optimum still agrees because it is recomputed from leaf
 // compact genomes at the grammar level.
 static void check_option_c_grammar_equivalent(larch::phylo_dag& c_dag,
-                                               larch::phylo_dag& a_dag) {
-  auto cg = larch::build_clade_grammar(c_dag);
-  auto ag = larch::build_clade_grammar(a_dag);
+                                               larch::phylo_dag& a_dag,
+                                               bool allow_polytomies = false) {
+  larch::clade_grammar_options opts;
+  opts.allow_polytomies = allow_polytomies;
+  auto cg = larch::build_clade_grammar(c_dag, opts);
+  auto ag = larch::build_clade_grammar(a_dag, opts);
   CHECK(clade_taxa_set(cg) == clade_taxa_set(ag));
   CHECK(larch::rank3_detail::production_key_set(cg) ==
         larch::rank3_detail::production_key_set(ag));
@@ -292,6 +304,7 @@ static void test_option_c_splice_root_abcd_to_acbd() {
   auto result = larch::option_c_splice_production(dag, before_key, after);
 
   CHECK(result.witnesses_spliced == 1);
+  CHECK(result.option_c_polytomy_splices == 0);
   CHECK(result.after_key == make_split_key(abcd, {ac, bd}));
 
   // Exit criterion 4: the post-splice production-key set is EXACTLY the
@@ -342,6 +355,7 @@ static void test_option_c_splice_root_abcd_to_adbc() {
 
   auto result = larch::option_c_splice_production(dag, before_key, after);
   CHECK(result.witnesses_spliced == 1);
+  CHECK(result.option_c_polytomy_splices == 0);
 
   std::set<larch::rank3_production_taxa_key> expected_after = {
       make_split_key(abcd, {ad, bc}),
@@ -391,6 +405,7 @@ static void test_option_c_splice_wric_binary_four_fixture() {
 
   auto result = larch::option_c_splice_production(dag, before_key, after);
   CHECK(result.witnesses_spliced == 1);
+  CHECK(result.option_c_polytomy_splices == 0);
 
   // Exit criterion 4: production-key set is exactly the after subtree keys.
   std::set<larch::rank3_production_taxa_key> expected_after = {
@@ -438,6 +453,7 @@ static void test_option_c_splice_non_root_production() {
 
   auto result = larch::option_c_splice_production(dag, before_key, after);
   CHECK(result.witnesses_spliced == 1);
+  CHECK(result.option_c_polytomy_splices == 0);
 
   // The root and EF productions are untouched; only the {ABCD} subtree
   // changes.  Full-set equality (uniform with the root-splice tests) is the
@@ -555,13 +571,11 @@ static void test_option_c_after_parent_mismatch_throws() {
 }
 
 // =====================================================================
-// Exit criterion 3: polytomy before/after throw labelled, route to Option A.
+// Exit criterion 3: standalone Option C splices polytomy before/after.
 // =====================================================================
 
-// Non-binary (polytomy) before production: arity-3 production throws a message
-// built from the shared polytomy_refinement vocabulary.
-static void test_option_c_polytomy_before_throws_labelled() {
-  std::println("test_option_c_polytomy_before_throws_labelled");
+static void test_option_c_polytomy_before_splice_to_binary() {
+  std::println("test_option_c_polytomy_before_splice_to_binary");
 
   // Build ((A,B,C),(D,E,F)) with arity-3 productions under each side.
   std::vector<larch::test::tiny_dag_node> nodes{
@@ -585,6 +599,8 @@ static void test_option_c_polytomy_before_throws_labelled() {
   auto c = taxa_for(g, {"C"});
   auto bc = taxa_for(g, {"B", "C"});
   auto abc = taxa_for(g, {"A", "B", "C"});
+  auto def = taxa_for(g, {"D", "E", "F"});
+  auto abcdef = taxa_for(g, {"A", "B", "C", "D", "E", "F"});
 
   // before = {ABC} -> [{A},{B},{C}], an arity-3 (polytomy) production.
   auto before_key = make_split_key(abc, {a, b, c});
@@ -592,31 +608,47 @@ static void test_option_c_polytomy_before_throws_labelled() {
   larch::option_c_after_production after;
   after.parent_taxa = abc;
   after.children.push_back(leaf_after(a));
-  after.children.push_back(pair_after(bc, leaf_after(b), leaf_after(c)));
+  after.children.push_back(node_after(bc, {leaf_after(b), leaf_after(c)}));
 
-  larch::option_c_splice_options opts;
-  opts.rebuild_grammar_options.allow_polytomies = true;
+  auto result = larch::option_c_splice_production(dag, before_key, after);
+  CHECK(result.witnesses_spliced == 1);
+  CHECK(result.option_c_polytomy_splices == 1);
+  CHECK(!result.invoked_merge_path);
+  CHECK(!result.represented_trees_enumerated.has_value());
 
-  bool threw = false;
-  std::string msg;
-  try {
-    larch::option_c_splice_production(dag, before_key, after, opts);
-  } catch (std::runtime_error const& e) {
-    threw = true;
-    msg = e.what();
-  }
-  CHECK(threw);
-  CHECK(msg.find("polytomy") != std::string::npos);
-  CHECK(msg.find("Option-A") != std::string::npos);
+  auto option_a_dag = larch::test::make_tiny_labelled_tree(
+      "A", larch::test::tiny_inner(
+               "root", "A",
+               {larch::test::tiny_inner(
+                    "ABC", "A",
+                    {larch::test::tiny_leaf("A", "A"),
+                     larch::test::tiny_inner(
+                         "BC", "A",
+                         {larch::test::tiny_leaf("B", "A"),
+                          larch::test::tiny_leaf("C", "A")})}),
+                larch::test::tiny_inner(
+                    "DEF", "C",
+                    {larch::test::tiny_leaf("D", "C"),
+                     larch::test::tiny_leaf("E", "C"),
+                     larch::test::tiny_leaf("F", "C")})}));
+
+  larch::validate_dag(dag, "option C polytomy-before splice");
+  auto rebuilt = larch::build_clade_grammar(dag, gopts);
+  std::set<larch::rank3_production_taxa_key> expected_after = {
+      make_split_key(abcdef, {abc, def}),
+      make_split_key(abc, {a, bc}),
+      make_split_key(bc, {b, c}),
+      make_split_key(def, {taxa_for(g, {"D"}), taxa_for(g, {"E"}),
+                           taxa_for(g, {"F"})}),
+  };
+  CHECK(larch::rank3_detail::production_key_set(rebuilt) == expected_after);
+  check_option_c_merge_equivalent(dag, option_a_dag, true);
 
   std::println("  PASS");
 }
 
-// Non-binary (polytomy) after production: an after with arity != 2 throws the
-// same labelled vocabulary before any edge surgery (the guard is in
-// validate_after_production, which runs first).
-static void test_option_c_polytomy_after_throws_labelled() {
-  std::println("test_option_c_polytomy_after_throws_labelled");
+static void test_option_c_polytomy_after_splice_from_binary() {
+  std::println("test_option_c_polytomy_after_splice_from_binary");
 
   auto dag = larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
   auto g = larch::build_clade_grammar(dag);
@@ -625,29 +657,140 @@ static void test_option_c_polytomy_after_throws_labelled() {
   auto b = taxa_for(g, {"B"});
   auto c = taxa_for(g, {"C"});
   auto d = taxa_for(g, {"D"});
+  auto ab = taxa_for(g, {"A", "B"});
+  auto cd = taxa_for(g, {"C", "D"});
   auto abcd = taxa_for(g, {"A", "B", "C", "D"});
 
-  // A 3-way (polytomy) after: {ABCD} -> [{A},{B},{C,D}] has arity 3.
+  auto before_key = make_split_key(abcd, {ab, cd});
+
+  // A 3-way after: {ABCD} -> [{A},{B},{C,D}].
   larch::option_c_after_production after;
   after.parent_taxa = abcd;
   after.children.push_back(leaf_after(a));
   after.children.push_back(leaf_after(b));
-  after.children.push_back(
-      pair_after(taxa_for(g, {"C", "D"}), leaf_after(c), leaf_after(d)));
+  after.children.push_back(pair_after(cd, leaf_after(c), leaf_after(d)));
+
+  auto result = larch::option_c_splice_production(dag, before_key, after);
+  CHECK(result.witnesses_spliced == 1);
+  CHECK(result.option_c_polytomy_splices == 1);
+  CHECK(!result.invoked_merge_path);
+  CHECK(!result.represented_trees_enumerated.has_value());
+
+  std::set<larch::rank3_production_taxa_key> expected_after = {
+      make_split_key(abcd, {a, b, cd}),
+      make_split_key(cd, {c, d}),
+  };
+  CHECK(larch::rank3_detail::production_key_set(result.rebuilt.grammar) ==
+        expected_after);
+
+  auto option_a_dag = larch::test::make_tiny_labelled_tree(
+      "A", larch::test::tiny_inner(
+               "root", "A",
+               {larch::test::tiny_leaf("A", "A"),
+                larch::test::tiny_leaf("B", "A"),
+                larch::test::tiny_inner(
+                    "CD", "C",
+                    {larch::test::tiny_leaf("C", "C"),
+                     larch::test::tiny_leaf("D", "C")})}));
+  check_option_c_merge_equivalent(dag, option_a_dag, true);
+
+  std::println("  PASS");
+}
+
+static void test_option_c_arity3_to_arity4_splice() {
+  std::println("test_option_c_arity3_to_arity4_splice");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", larch::test::tiny_inner(
+               "root", "A",
+               {larch::test::tiny_inner(
+                    "AB", "A",
+                    {larch::test::tiny_leaf("A", "A"),
+                     larch::test::tiny_leaf("B", "A")}),
+                larch::test::tiny_leaf("C", "C"),
+                larch::test::tiny_leaf("D", "C")}));
+  larch::clade_grammar_options gopts;
+  gopts.allow_polytomies = true;
+  auto g = larch::build_clade_grammar(dag, gopts);
+
+  auto a = taxa_for(g, {"A"});
+  auto b = taxa_for(g, {"B"});
+  auto c = taxa_for(g, {"C"});
+  auto d = taxa_for(g, {"D"});
+  auto ab = taxa_for(g, {"A", "B"});
+  auto abcd = taxa_for(g, {"A", "B", "C", "D"});
+
+  auto before_key = make_split_key(abcd, {ab, c, d});
+
+  larch::option_c_after_production after;
+  after.parent_taxa = abcd;
+  after.children.push_back(leaf_after(a));
+  after.children.push_back(leaf_after(b));
+  after.children.push_back(leaf_after(c));
+  after.children.push_back(leaf_after(d));
+
+  auto result = larch::option_c_splice_production(dag, before_key, after);
+  CHECK(result.witnesses_spliced == 1);
+  CHECK(result.option_c_polytomy_splices == 1);
+  CHECK(!result.invoked_merge_path);
+  CHECK(!result.represented_trees_enumerated.has_value());
+
+  std::set<larch::rank3_production_taxa_key> expected_after = {
+      make_split_key(abcd, {a, b, c, d}),
+  };
+  CHECK(larch::rank3_detail::production_key_set(result.rebuilt.grammar) ==
+        expected_after);
+
+  auto option_a_dag = larch::test::make_tiny_labelled_tree(
+      "A", larch::test::tiny_inner(
+               "root", "A",
+               {larch::test::tiny_leaf("A", "A"),
+                larch::test::tiny_leaf("B", "A"),
+                larch::test::tiny_leaf("C", "C"),
+                larch::test::tiny_leaf("D", "C")}));
+  check_option_c_merge_equivalent(dag, option_a_dag, true);
+
+  std::println("  PASS");
+}
+
+static void test_option_c_invalid_partition_throws_unchanged() {
+  std::println("test_option_c_invalid_partition_throws_unchanged");
+
+  auto dag = larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
+  auto g = larch::build_clade_grammar(dag);
+
+  auto a = taxa_for(g, {"A"});
+  auto b = taxa_for(g, {"B"});
+  auto c = taxa_for(g, {"C"});
+  auto d = taxa_for(g, {"D"});
+  auto ab = taxa_for(g, {"A", "B"});
+  auto cd = taxa_for(g, {"C", "D"});
+  auto abcd = taxa_for(g, {"A", "B", "C", "D"});
+
+  auto before_key = make_split_key(abcd, {ab, cd});
+
+  larch::option_c_after_production after;
+  after.parent_taxa = abcd;
+  after.children.push_back(leaf_after(a));
+  after.children.push_back(pair_after(ab, leaf_after(a), leaf_after(b)));
+  after.children.push_back(pair_after(cd, leaf_after(c), leaf_after(d)));
+
+  auto keys_before = larch::rank3_detail::production_key_set(g);
 
   bool threw = false;
   std::string msg;
   try {
-    auto before_caller = make_split_key(
-        abcd, {taxa_for(g, {"A", "B"}), taxa_for(g, {"C", "D"})});
-    larch::option_c_splice_production(dag, before_caller, after);
+    larch::option_c_splice_production(dag, before_key, after);
   } catch (std::runtime_error const& e) {
     threw = true;
     msg = e.what();
   }
   CHECK(threw);
-  CHECK(msg.find("polytomy") != std::string::npos);
-  CHECK(msg.find("Option-A") != std::string::npos);
+  CHECK(msg.find("overlap") != std::string::npos);
+
+  larch::validate_dag(dag, "unchanged after invalid-partition throw");
+  auto g_after = larch::build_clade_grammar(dag);
+  CHECK(larch::rank3_detail::production_key_set(g_after) == keys_before);
 
   std::println("  PASS");
 }
@@ -697,6 +840,7 @@ static void test_option_c_no_op_if_present_policy() {
                                                        noop_opts);
   CHECK(noop_result.after_already_present_no_op);
   CHECK(noop_result.witnesses_spliced == 0);
+  CHECK(noop_result.option_c_polytomy_splices == 0);
   CHECK(noop_result.nodes_created == 0);
   CHECK(noop_result.edges_added == 0);
   // DAG unchanged.
@@ -707,6 +851,7 @@ static void test_option_c_no_op_if_present_policy() {
   auto merge_result = larch::option_c_splice_production(dag, before_key, after);
   CHECK(!merge_result.after_already_present_no_op);
   CHECK(merge_result.witnesses_spliced == 1);
+  CHECK(merge_result.option_c_polytomy_splices == 0);
 
   std::println("  PASS");
 }
@@ -748,6 +893,7 @@ static void test_option_c_after_already_present_merge() {
 
   auto result = larch::option_c_splice_production(dag, before_key, after);
   CHECK(result.witnesses_spliced == 1);
+  CHECK(result.option_c_polytomy_splices == 0);
 
   // Grammar-level oracle (clade taxa sets + production keys).  The edge-level
   // representable-tree count is intentionally higher than a single-tree
@@ -823,6 +969,7 @@ static void test_option_c_multi_witness_splice() {
   // Cross-witness edge-index stability held (we reached here without UB; ASAN
   // validates the memory side in the ASAN build).
   CHECK(result.witnesses_spliced == 2);
+  CHECK(result.option_c_polytomy_splices == 0);
 
   // Performance contract — the upper-bound half: cost is LINEAR in the number
   // of witnesses, not in the number of represented trees containing the before
@@ -880,8 +1027,10 @@ int main() {
   test_option_c_splice_non_root_production();
   test_option_c_absent_before_throws_unchanged();
   test_option_c_after_parent_mismatch_throws();
-  test_option_c_polytomy_before_throws_labelled();
-  test_option_c_polytomy_after_throws_labelled();
+  test_option_c_polytomy_before_splice_to_binary();
+  test_option_c_polytomy_after_splice_from_binary();
+  test_option_c_arity3_to_arity4_splice();
+  test_option_c_invalid_partition_throws_unchanged();
   test_option_c_no_op_if_present_policy();
   test_option_c_after_already_present_merge();
   test_option_c_multi_witness_splice();
