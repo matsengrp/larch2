@@ -450,6 +450,7 @@ struct inside_chart_cache {
   // recomputations across all commits; the Phase 3 counterpart
   // `outside_rows_recomputed_on_commit` lands there.
   std::size_t inside_rows_recomputed_on_commit = 0;
+  std::size_t multifurcation_productions_scored = 0;
 
   // Read a cached inside row.  Throws on out-of-range or absent rows; callers
   // (the recompute loop, the root scorer) only read rows that are present.
@@ -518,6 +519,8 @@ inline inside_chart_cache build_inside_chart_cache(
       throw std::runtime_error(
           "inside cache: base chart clade count mismatch");
     }
+    cache.multifurcation_productions_scored +=
+        chart.multifurcation_productions_scored;
     // Each inner vector starts empty (resize above), so assign allocates it
     // exactly once rather than zero-initializing then reallocating.
     cache.base_rows[p].assign(chart.inside.begin(), chart.inside.end());
@@ -609,6 +612,30 @@ inline std::array<chart_cost, nuc_state_count> recompute_tip_inside_row(
   return row;
 }
 
+inline std::size_t count_multifurcating_inside_productions(
+    chain_tip_index const& idx, overlay_clade_ref ref) {
+  auto const& base = *idx.tip_overlay.base;
+  std::size_t count = 0;
+  if (ref.space == overlay_id_space::base) {
+    for (auto pid : base.productions_by_parent[ref.id]) {
+      if (chain_tip_base_production_removed(idx, pid)) continue;
+      if (pid >= base.productions.size()) {
+        throw std::runtime_error(
+            "inside cache: base production out of range while counting");
+      }
+      if (base.productions[pid].children.size() != 2) ++count;
+    }
+  }
+  for (auto tpid : temp_prods_for_parent(idx, ref)) {
+    if (tpid >= idx.tip_overlay.temp_productions.size()) {
+      throw std::runtime_error(
+          "inside cache: temp production out of range while counting");
+    }
+    if (idx.tip_overlay.temp_productions[tpid].children.size() != 2) ++count;
+  }
+  return count;
+}
+
 }  // namespace inside_chart_cache_detail
 
 // The inside-affected set for the chain's last-appended delta (touched clades
@@ -689,6 +716,9 @@ inline void apply_commit_to_inside_cache(overlay_chain const& chain,
   // cached row is still valid for the new tip.
   for (std::size_t p = 0; p < cache.patterns.size(); ++p) {
     for (auto ref : affected) {
+      cache.multifurcation_productions_scored +=
+          inside_chart_cache_detail::count_multifurcating_inside_productions(
+              idx, ref);
       auto fresh = inside_chart_cache_detail::recompute_tip_inside_row(
           cache, idx, p, ref);
       if (ref.space == overlay_id_space::base) {

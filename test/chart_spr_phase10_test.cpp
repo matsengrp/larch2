@@ -476,6 +476,7 @@ static void test_phase7_multifurcation_chain_identity_round_trip() {
   auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
   CHECK(search.counters.local_commit_accepted_moves == 1);
   CHECK(search.counters.spr_multifurcation_moves_generated > 0);
+  CHECK(search.counters.multifurcation_productions_scored > 0);
   CHECK(!search.chain_identity_report_json.empty());
 
   auto report = larch::parse_phase10_chain_identity_report_json(
@@ -737,6 +738,7 @@ static void test_phase10_counter_contract_fields_exist() {
   (void)c.overlay_materializations_for_accept_materialization;
   (void)c.overlay_materializations_for_final_compaction;
   (void)c.transient_chain_extensions_for_verification;
+  (void)c.multifurcation_productions_scored;
   (void)c.selected_topology_multifurcation_rows;
   (void)c.spr_multifurcation_moves_generated;
   (void)c.inside_rows_recomputed_on_commit;
@@ -747,6 +749,7 @@ static void test_phase10_counter_contract_fields_exist() {
   larch::chart_spr_search_summary s{};
   (void)s.sidecar_rebuilds_after_accept;
   (void)s.transient_chain_extensions_for_verification;
+  (void)s.multifurcation_productions_scored;
   (void)s.selected_topology_multifurcation_rows;
   (void)s.spr_multifurcation_moves_generated;
   (void)s.inside_rows_recomputed_on_commit;

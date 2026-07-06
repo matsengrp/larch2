@@ -2728,6 +2728,23 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
 // Main
 // ---------------------------------------------------------------------------
 
+static void print_arity_gate_throw_counters(std::ostream& out) {
+  auto snapshot = parsimony_chart_detail::arity_gate_throws_snapshot();
+  if (snapshot.total == 0) return;
+  out << "arity_gate_throws:\n";
+  out << "  total: " << snapshot.total << "\n";
+  for (std::size_t i = 0; i < arity_gate_consumer_count; ++i) {
+    auto count = snapshot.by_consumer[i];
+    if (count == 0) continue;
+    auto consumer = static_cast<arity_gate_consumer>(i);
+    out << "  - consumer: "
+        << parsimony_chart_detail::arity_gate_consumer_name(consumer) << "\n";
+    out << "    reason: "
+        << parsimony_chart_detail::arity_gate_consumer_reason(consumer) << "\n";
+    out << "    throws: " << count << "\n";
+  }
+}
+
 int main(int argc, char** argv) {
   auto a = parse_args(argc, argv);
 
@@ -2898,6 +2915,7 @@ int main(int argc, char** argv) {
       save_proto_dag(apply.dag, a.output);
     } catch (std::exception const& e) {
       std::cerr << "error: chart B&B trim failed: " << e.what() << "\n";
+      print_arity_gate_throw_counters(std::cerr);
       return 1;
     }
   } else if (a.trim) {

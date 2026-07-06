@@ -14,6 +14,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -2198,6 +2199,9 @@ static void test_phase6_multifurcation_fixed_topology_local_commit() {
   CHECK(search.counters.spr_multifurcation_moves_generated > 0);
   CHECK(search.summary.spr_multifurcation_moves_generated ==
         search.counters.spr_multifurcation_moves_generated);
+  CHECK(search.counters.multifurcation_productions_scored > 0);
+  CHECK(search.summary.multifurcation_productions_scored ==
+        search.counters.multifurcation_productions_scored);
   CHECK(search.summary.final_compaction_rebuilds == 1);
   auto rebuilt = larch::build_clade_grammar(search.dag, gopts);
   CHECK(max_production_arity(rebuilt) == 3);
@@ -2243,6 +2247,9 @@ static void test_phase6_multifurcation_lower_bound_conservative_commit() {
   CHECK(search.counters.spr_multifurcation_moves_generated > 0);
   CHECK(search.summary.spr_multifurcation_moves_generated ==
         search.counters.spr_multifurcation_moves_generated);
+  CHECK(search.counters.multifurcation_productions_scored > 0);
+  CHECK(search.summary.multifurcation_productions_scored ==
+        search.counters.multifurcation_productions_scored);
 
   std::println("  PASS");
 }
@@ -2264,6 +2271,7 @@ static void test_phase6_exact_multisite_multifurcation_gate() {
   options.max_iterations = 1;
   options.rebuild_after_accept = true;
 
+  larch::parsimony_chart_detail::reset_arity_gate_throw_counters_for_tests();
   bool threw = false;
   std::string message;
   try {
@@ -2276,6 +2284,14 @@ static void test_phase6_exact_multisite_multifurcation_gate() {
   CHECK(message.find("WI6") != std::string::npos);
   CHECK(message.find("exact_multisite") != std::string::npos);
   CHECK(message.find("multifurcating") != std::string::npos);
+  auto arity_gate_throws =
+      larch::parsimony_chart_detail::arity_gate_throws_snapshot();
+  CHECK(arity_gate_throws.total == 1);
+  CHECK(arity_gate_throws.count(
+            larch::arity_gate_consumer::chart_spr_exact_multisite) == 1);
+  CHECK(larch::parsimony_chart_detail::arity_gate_consumer_reason(
+            larch::arity_gate_consumer::chart_spr_exact_multisite)
+            .find("exact_multisite") != std::string_view::npos);
 
   std::println("  PASS");
 }

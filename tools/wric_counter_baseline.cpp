@@ -153,6 +153,8 @@ int main() {
                      c.inside_rows_recomputed_on_commit);
   print_counter_line("outside_rows_recomputed_on_commit",
                      c.outside_rows_recomputed_on_commit);
+  print_counter_line("multifurcation_productions_scored",
+                     c.multifurcation_productions_scored);
   print_counter_line("local_commit_two_chart_oracle_runs",
                      c.local_commit_two_chart_oracle_runs);
   print_counter_line("local_commit_tip_grammar_refreshes",

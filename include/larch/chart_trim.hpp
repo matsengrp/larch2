@@ -30,6 +30,9 @@ struct single_site_outside_chart {
   // inside[clade][state].
   std::vector<std::array<chart_cost, nuc_state_count>> outside;
   chart_cost global_min = chart_inf;
+
+  // Number of non-binary production rows evaluated by this outside chart build.
+  std::size_t multifurcation_productions_scored = 0;
 };
 
 struct chart_production_choice {
@@ -528,6 +531,9 @@ inline single_site_outside_chart build_single_site_outside_chart(
             "chart trim: productions_by_parent contains mismatched parent");
       }
       validate_production_inside_row_inputs(grammar, prod, pid, "chart trim");
+      if (prod.children.size() != 2) {
+        ++result.multifurcation_productions_scored;
+      }
 
       for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
            ++parent_state) {
@@ -587,7 +593,8 @@ inline chart_trim_mask build_single_site_trim_mask(
     chart_trim_options const& trim_options = {}) {
   chart_trim_detail::validate_outside_shapes(grammar, chart, outside);
   parsimony_chart_detail::require_no_multifurcating_productions_for_consumer(
-      grammar, "single-site trim mask", "choice layer",
+      grammar, arity_gate_consumer::single_site_trim_mask,
+      "single-site trim mask", "choice layer",
       "use dense inside/outside chart rows or selected-topology/SPR paths on "
       "the multifurcating grammar, or expand polytomies before building a "
       "trim mask");
@@ -739,6 +746,8 @@ struct composite_chart_score {
   // optimum for convenience.
   std::vector<std::array<chart_cost, nuc_state_count>>
       per_pattern_root_min_by_reference_state;
+
+  std::size_t multifurcation_productions_scored = 0;
 };
 
 struct multisite_cost_function {
@@ -2171,6 +2180,8 @@ inline composite_chart_score build_composite_chart_score(
     leaf_site_states states;
     states.state_by_taxon = pattern.state_by_taxon;
     auto chart = build_single_site_chart(grammar, states, chart_build_options);
+    result.multifurcation_productions_scored +=
+        chart.multifurcation_productions_scored;
 
     std::array<chart_cost, nuc_state_count> by_reference{};
     by_reference.fill(chart_inf);
@@ -2452,7 +2463,8 @@ inline multisite_trim_result build_multisite_trim(
   validate_multisite_trim_options_supported(trim_options, "multi-site trim",
                                             true);
   parsimony_chart_detail::require_no_multifurcating_productions_for_consumer(
-      grammar, "multi-site trim", "B&B frontier",
+      grammar, arity_gate_consumer::multisite_trim, "multi-site trim",
+      "B&B frontier",
       "use --wric-polytomy-mode expand-exact or expand-bounded before B&B "
       "trim, or use an arity-agnostic SPR/fixed-topology path");
 

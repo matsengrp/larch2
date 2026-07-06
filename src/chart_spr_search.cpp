@@ -103,6 +103,8 @@ void chart_spr_add_search_state_rebuild_counters(
   accumulated.pattern_rebuilds += rebuild_counters.pattern_rebuilds;
   accumulated.base_chart_cache_rebuilds +=
       rebuild_counters.base_chart_cache_rebuilds;
+  accumulated.multifurcation_productions_scored +=
+      rebuild_counters.multifurcation_productions_scored;
   accumulated.pattern_batch_cache_builds +=
       rebuild_counters.pattern_batch_cache_builds;
   if (update_current_skipped_invariant_sites) {
@@ -898,6 +900,7 @@ struct chart_spr_local_commit_substrate {
   // chart_spr_search_options by the substrate builder).
   bool verify_transient_chain_extension_oracle_for_tests = false;
   bool force_transient_chain_extension_oracle_mismatch_for_tests = false;
+  std::size_t cache_multifurcation_productions_scored_reported = 0;
 };
 
 void chart_spr_set_identity_tip_maps(chart_spr_local_commit_substrate& sub) {
@@ -2407,6 +2410,11 @@ chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
   sub->ocache = build_outside_chart_cache(sub->base_grammar,
                                            state.active_patterns,
                                            state.chart_opts);
+  sub->cache_multifurcation_productions_scored_reported =
+      sub->icache->multifurcation_productions_scored +
+      sub->ocache->multifurcation_productions_scored;
+  state.counters.multifurcation_productions_scored +=
+      sub->cache_multifurcation_productions_scored_reported;
   chart_spr_set_identity_tip_maps(*sub);
   sub->verify_materialized_fixed_topology_oracle_for_tests =
       options.verify_fixed_topology_materialized_oracle_for_tests;
@@ -2686,6 +2694,20 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
         sub.icache->inside_rows_recomputed_on_commit;
     counters.outside_rows_recomputed_on_commit =
         sub.ocache->outside_rows_recomputed_on_commit;
+    auto cache_multifurcation_productions_scored =
+        sub.icache->multifurcation_productions_scored +
+        sub.ocache->multifurcation_productions_scored;
+    if (cache_multifurcation_productions_scored <
+        sub.cache_multifurcation_productions_scored_reported) {
+      throw std::runtime_error(
+          "chart SPR local commit: cache multifurcation production counter "
+          "moved backwards");
+    }
+    counters.multifurcation_productions_scored +=
+        cache_multifurcation_productions_scored -
+        sub.cache_multifurcation_productions_scored_reported;
+    sub.cache_multifurcation_productions_scored_reported =
+        cache_multifurcation_productions_scored;
 
     // Two-chart oracle self-check (Work item 3 correctness invariant).
     if (options.verify_local_commit_two_chart_oracle_for_tests) {
@@ -2712,6 +2734,8 @@ void chart_spr_refresh_search_summary_from_counters(
   summary.accepted_moves = counters.accepted_moves;
   summary.candidates_locally_scored = counters.local_candidate_scores;
   summary.local_rows_recomputed = counters.local_rows_recomputed;
+  summary.multifurcation_productions_scored =
+      counters.multifurcation_productions_scored;
   summary.candidate_batches_scored = counters.candidate_batches_scored;
   summary.pattern_batch_cache_builds = counters.pattern_batch_cache_builds;
   summary.exact_verifications = counters.exact_verifications;

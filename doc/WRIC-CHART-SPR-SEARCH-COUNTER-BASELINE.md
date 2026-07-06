@@ -132,6 +132,7 @@ chart_spr_search_counters:
   local_commit_tombstone_scope_skips:                          0
   inside_rows_recomputed_on_commit:                            0
   outside_rows_recomputed_on_commit:                           0
+  multifurcation_productions_scored:                           0
   local_commit_two_chart_oracle_runs:                          0
   local_commit_tip_grammar_refreshes:                          0
   fixed_topology_selected_cache_hits:                          0
@@ -148,26 +149,26 @@ chart_spr_search_counters:
   transient_chain_extension_fallbacks:                         0
   transient_chain_extension_oracle_mismatches:                 0
   full_composite_rebuilds:                                     0
-  local_candidate_scores:                                      89312
+  local_candidate_scores:                                      88026
   local_rows_recomputed:                                       159379494
   local_score_parallel_batches:                                0
   local_score_worker_tasks:                                    0
-  candidate_batches_scored:                                    89312
+  candidate_batches_scored:                                    88026
   pattern_batch_cache_builds:                                  0
   exact_verifications:                                         16
   accepted_moves:                                              0
   candidate_accepts_attempted:                                 0
-  rejected_moves:                                              89312
+  rejected_moves:                                              88026
   post_materialization_rejections:                             0
   skipped_invariant_sites:                                     536
   candidate_source_productions_considered:                     0
   upward_path_iterator_steps:                                  1908063
   upward_paths_completed:                                      185735
   path_pairs_considered:                                       123836
-  candidates_constructed:                                      94029
+  candidates_constructed:                                      92743
   candidates_pruned_before_construction:                       7584
-  candidates_pruned_after_construction:                        34524
-  candidates_generated_after_dedup:                            89312
+  candidates_pruned_after_construction:                        35810
+  candidates_generated_after_dedup:                            88026
   candidates_pruned_root_or_trivial:                           1041
   candidates_pruned_moved_size:                                0
   candidates_pruned_target_size:                               0
@@ -175,7 +176,7 @@ chart_spr_search_counters:
   candidates_pruned_affected_estimate:                         0
   candidates_pruned_immediate_reversal:                        0
   candidates_pruned_duplicate:                                 4717
-  candidates_pruned_invalid:                                   29807
+  candidates_pruned_invalid:                                   31093
   candidate_cap_cutoffs:                                       0
   path_budget_cutoffs:                                         0
   overlay_reachability_validations:                            80909

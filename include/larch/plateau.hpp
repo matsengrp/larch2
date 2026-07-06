@@ -516,7 +516,8 @@ inline fluidity_report build_single_site_fluidity_report(
     single_site_outside_chart const& outside) {
   chart_trim_detail::validate_outside_shapes(grammar, chart, outside);
   parsimony_chart_detail::require_no_multifurcating_productions_for_consumer(
-      grammar, "single-site fluidity report", "choice layer",
+      grammar, arity_gate_consumer::single_site_fluidity_report,
+      "single-site fluidity report", "choice layer",
       "use dense chart diagnostics or selected-topology/SPR paths on the "
       "multifurcating grammar, or expand polytomies before fluidity analysis");
   if (chart_trim_detail::compute_global_min(grammar, chart, outside) !=
@@ -816,7 +817,8 @@ inline multisite_plateau_report build_multisite_plateau_report(
     clade_grammar const& grammar, site_pattern_set const&,
     chart_options const& = {}) {
   parsimony_chart_detail::require_no_multifurcating_productions_for_consumer(
-      grammar, "multi-site plateau report", "choice layer",
+      grammar, arity_gate_consumer::multisite_plateau_report,
+      "multi-site plateau report", "choice layer",
       "expand polytomies before using the binary plateau consumer");
   throw std::runtime_error(
       "plateau: exact multi-site plateau detection requires coupled Phase-5 "

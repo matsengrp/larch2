@@ -2706,6 +2706,8 @@ static void print_binary_refinement_performance_benchmark(
       << std::setprecision(6) << composite_ms_per_pattern << "\n";
   out << child << "composite_lower_bound: "
       << composite.weighted_lower_bound << "\n";
+  out << child << "multifurcation_productions_scored: "
+      << composite.multifurcation_productions_scored << "\n";
 
   out << indent << "bnb_frontier_benchmark:\n";
   if (!a.wric_polytomy_benchmark_bnb) {
@@ -2999,6 +3001,8 @@ static void print_chart_spr_search_counter_fields(
       << counters.local_candidate_scores << "\n";
   out << indent << "local_rows_recomputed: "
       << counters.local_rows_recomputed << "\n";
+  out << indent << "multifurcation_productions_scored: "
+      << counters.multifurcation_productions_scored << "\n";
   out << indent << "local_score_parallel_batches: "
       << counters.local_score_parallel_batches << "\n";
   out << indent << "local_score_worker_tasks: "
@@ -3672,6 +3676,8 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.local_commit_two_chart_oracle_runs << "\n";
   out << "  local_commit_tip_grammar_refreshes: "
       << search.summary.local_commit_tip_grammar_refreshes << "\n";
+  out << "  multifurcation_productions_scored: "
+      << search.summary.multifurcation_productions_scored << "\n";
   out << "  fixed_topology_selected_cache_hits: "
       << search.summary.fixed_topology_selected_cache_hits << "\n";
   out << "  fixed_topology_selected_cache_misses: "
@@ -3929,6 +3935,10 @@ static void run_chart_spr_helper_benchmark(
       << composite_ms << "\n";
   out << "  baseline_composite_lower_bound: "
       << composite.weighted_lower_bound << "\n";
+  counters.multifurcation_productions_scored +=
+      composite.multifurcation_productions_scored;
+  out << "  baseline_multifurcation_productions_scored: "
+      << composite.multifurcation_productions_scored << "\n";
   out << "  baseline_full_composite_rebuilds: 1\n";
   out << "  candidate_generation_ms: " << std::fixed << std::setprecision(3)
       << generation_ms << "\n";
@@ -3987,6 +3997,23 @@ static void run_chart_spr_helper_benchmark(
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+
+static void print_arity_gate_throw_counters(std::ostream& out) {
+  auto snapshot = parsimony_chart_detail::arity_gate_throws_snapshot();
+  if (snapshot.total == 0) return;
+  out << "arity_gate_throws:\n";
+  out << "  total: " << snapshot.total << "\n";
+  for (std::size_t i = 0; i < arity_gate_consumer_count; ++i) {
+    auto count = snapshot.by_consumer[i];
+    if (count == 0) continue;
+    auto consumer = static_cast<arity_gate_consumer>(i);
+    out << "  - consumer: "
+        << parsimony_chart_detail::arity_gate_consumer_name(consumer) << "\n";
+    out << "    reason: "
+        << parsimony_chart_detail::arity_gate_consumer_reason(consumer) << "\n";
+    out << "    throws: " << count << "\n";
+  }
+}
 
 int main(int argc, char** argv) try {
   auto a = parse_args(argc, argv);
@@ -4296,6 +4323,8 @@ int main(int argc, char** argv) try {
                                       a.wric_polytomy_report);
     std::cout << "  weighted_lower_bound: "
               << composite.weighted_lower_bound << "\n";
+    std::cout << "  multifurcation_productions_scored: "
+              << composite.multifurcation_productions_scored << "\n";
     std::cout << "  score_ua_edge: "
               << (a.chart_score_ua_edge ? "true" : "false") << "\n";
     std::cout << "  exact_patterns: " << patterns.patterns.size() << "\n";
@@ -4771,5 +4800,6 @@ int main(int argc, char** argv) try {
   return EXIT_SUCCESS;
 } catch (std::exception& e) {
   std::cerr << "error: " << e.what() << "\n";
+  print_arity_gate_throw_counters(std::cerr);
   return EXIT_FAILURE;
 }

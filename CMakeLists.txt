@@ -356,9 +356,9 @@ set_tests_properties(dagutil_wric_phase9_chart_composite_score
                      "score_kind: LOWER_BOUND")
 
 add_test(NAME dagutil_wric_allow_chart_composite_score
-         COMMAND bash -c
-                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --chart-composite-score > \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -q 'polytomy_mode: allow' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -Eq 'grammar_max_arity: [3-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -q 'score_kind: LOWER_BOUND' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -q 'score_scope: DAG_NATIVE_KARY_GRAMMAR' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\""
-         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --chart-composite-score > \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -q 'polytomy_mode: allow' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -Eq 'grammar_max_arity: [3-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -q 'score_kind: LOWER_BOUND' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -q 'score_scope: DAG_NATIVE_KARY_GRAMMAR' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -Eq 'multifurcation_productions_scored: [1-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_wric_allow_audit_labels
          COMMAND bash -c
@@ -366,9 +366,9 @@ add_test(NAME dagutil_wric_allow_audit_labels
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_wric_allow_chart_bnb_gate
-         COMMAND bash -c
-                 "! \"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --chart-bnb-trim > \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_bnb_gate.out\" 2> \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_bnb_gate.err\" && grep -q 'WI6 arity gate' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_bnb_gate.err\" && grep -q 'B&B frontier does not' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_bnb_gate.err\""
-         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+	         COMMAND bash -c
+	                 "! \"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --chart-bnb-trim > \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_bnb_gate.out\" 2> \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_bnb_gate.err\" && grep -q 'WI6 arity gate' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_bnb_gate.err\" && grep -q 'B&B frontier does not' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_bnb_gate.err\" && grep -q 'arity_gate_throws:' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_bnb_gate.err\" && grep -q 'consumer: multisite_trim' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_bnb_gate.err\" && grep -q 'reason: binary B&B frontier' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_bnb_gate.err\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_wric_phase9_chart_bnb_trim
          COMMAND dagutil
@@ -968,9 +968,9 @@ add_test(NAME larch2_chart_bnb_trim_mode_writes_dag
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME larch2_chart_bnb_allow_gate
-         COMMAND bash -c
-                 "! \"$<TARGET_FILE:larch2>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref -n 0 --trim-mode chart-bnb --wric-polytomy-mode allow -o \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.pb.gz\" > \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.stdout\" 2> \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.stderr\" && grep -q 'WI6 arity gate' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.stderr\" && grep -q 'B&B frontier does not' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.stderr\""
-         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+	         COMMAND bash -c
+	                 "! \"$<TARGET_FILE:larch2>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref -n 0 --trim-mode chart-bnb --wric-polytomy-mode allow -o \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.pb.gz\" > \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.stdout\" 2> \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.stderr\" && grep -q 'WI6 arity gate' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.stderr\" && grep -q 'B&B frontier does not' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.stderr\" && grep -q 'arity_gate_throws:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.stderr\" && grep -q 'consumer: multisite_trim' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.stderr\" && grep -q 'reason: binary B&B frontier' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_allow_gate.stderr\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME larch2_chart_bnb_diverse_sample_rejected
          COMMAND bash -c

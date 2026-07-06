@@ -331,6 +331,7 @@ struct outside_chart_cache {
   // mirroring inside_chart_cache::inside_rows_recomputed_on_commit so a
   // regression to "recompute everything" is visible in both directions.
   std::size_t outside_rows_recomputed_on_commit = 0;
+  std::size_t multifurcation_productions_scored = 0;
 
   [[nodiscard]] std::array<chart_cost, nuc_state_count> const& row(
       std::size_t pattern, overlay_clade_ref ref) const {
@@ -422,6 +423,18 @@ inline std::array<chart_cost, nuc_state_count> recompute_tip_outside_row(
   return row;
 }
 
+inline std::size_t count_multifurcating_outside_productions(
+    chain_tip_index const& idx, overlay_clade_ref ref) {
+  std::size_t count = 0;
+  for_each_tip_production_with_child(
+      idx, ref,
+      [&](overlay_clade_ref /*parent_ref*/,
+          std::vector<overlay_clade_ref> const& children) {
+        if (children.size() != 2) ++count;
+      });
+  return count;
+}
+
 }  // namespace outside_chart_cache_detail
 
 // Build a cold outside cache from the frozen base grammar: every active
@@ -482,6 +495,9 @@ inline outside_chart_cache build_outside_chart_cache(
       throw std::runtime_error(
           "outside cache: base outside chart clade count mismatch");
     }
+    cache.multifurcation_productions_scored +=
+        inside.multifurcation_productions_scored +
+        outside.multifurcation_productions_scored;
     cache.base_rows[p].assign(outside.outside.begin(), outside.outside.end());
   }
   return cache;
@@ -789,6 +805,9 @@ inline void apply_commit_to_outside_cache(
   // (if unaffected, because the affected set is a superset of changed rows).
   for (std::size_t p = 0; p < cache.patterns.size(); ++p) {
     for (auto ref : affected) {
+      cache.multifurcation_productions_scored +=
+          outside_chart_cache_detail::count_multifurcating_outside_productions(
+              idx, ref);
       auto fresh = outside_chart_cache_detail::recompute_tip_outside_row(
           cache, icache, idx, p, ref);
       if (ref.space == overlay_id_space::base) {

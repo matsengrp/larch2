@@ -534,6 +534,9 @@ inline void recompute_single_inside_row(clade_grammar const& grammar,
       throw std::runtime_error("chart SPR: production parent mismatch");
     parsimony_chart_detail::validate_production_inside_row_inputs(
         grammar, prod, pid, "chart SPR");
+    if (prod.children.size() != 2) {
+      ++chart.multifurcation_productions_scored;
+    }
 
     for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
          ++parent_state) {

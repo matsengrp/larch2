@@ -52,6 +52,9 @@ struct chart_spr_search_counters {
   std::size_t full_composite_rebuilds = 0;
   std::size_t local_candidate_scores = 0;
   std::size_t local_rows_recomputed = 0;
+  // Cross-cutting WRIC arity counter: non-binary production rows scored by dense
+  // chart builds, overlay-delta local rows, and persistent cache recomputes.
+  std::size_t multifurcation_productions_scored = 0;
   std::size_t local_score_parallel_batches = 0;
   std::size_t local_score_worker_tasks = 0;
   std::size_t candidate_batches_scored = 0;
@@ -711,6 +714,7 @@ struct chart_spr_search_summary {
   std::size_t candidates_generated = 0;
   std::size_t candidates_locally_scored = 0;
   std::size_t local_rows_recomputed = 0;
+  std::size_t multifurcation_productions_scored = 0;
   std::size_t candidate_batches_scored = 0;
   std::size_t pattern_batch_cache_builds = 0;
   std::size_t exact_verifications = 0;
@@ -941,6 +945,8 @@ inline bool chart_spr_grammar_has_multifurcation(
 inline void validate_chart_spr_exact_multisite_multifurcation_gate(
     clade_grammar const& grammar, std::string_view context) {
   if (!chart_spr_grammar_has_multifurcation(grammar)) return;
+  parsimony_chart_detail::record_arity_gate_throw(
+      arity_gate_consumer::chart_spr_exact_multisite);
   throw std::runtime_error(
       std::string{context} +
       ": WI6 exact_multisite does not support multifurcating productions; "
@@ -1050,6 +1056,15 @@ inline pattern_chart_cache_entry build_pattern_chart_cache_entry(
   entry.weighted_root_score = chart_spr_weighted_root_score_from_row(
       entry.root_row, pattern, chart_opts);
   return entry;
+}
+
+inline std::size_t multifurcation_productions_scored_for_entries(
+    std::vector<pattern_chart_cache_entry> const& entries) {
+  std::size_t total = 0;
+  for (auto const& entry : entries) {
+    total += entry.chart.multifurcation_productions_scored;
+  }
+  return total;
 }
 
 }  // namespace chart_spr_search_detail
@@ -1391,6 +1406,8 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
       active_total = chart_multisite_detail::checked_add_u64(
           active_total, entry.weighted_root_score,
           "chart-SPR cached active-pattern lower bound");
+      state.counters.multifurcation_productions_scored +=
+          entry.chart.multifurcation_productions_scored;
       state.pattern_charts.push_back(std::move(entry));
     }
     state.resident_pattern_cache_bytes =
@@ -1408,6 +1425,8 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
         active_total = chart_multisite_detail::checked_add_u64(
             active_total, entry.weighted_root_score,
             "chart-SPR batched active-pattern lower bound");
+        state.counters.multifurcation_productions_scored +=
+            entry.chart.multifurcation_productions_scored;
       }
     }
     state.resident_pattern_cache_bytes =
@@ -2098,11 +2117,15 @@ namespace chart_spr_search_detail {
 inline void accumulate_overlay_production_row(
     std::array<chart_cost, nuc_state_count>& row,
     std::vector<overlay_clade_ref> const& children,
-    overlay_row_provider const& provider) {
+    overlay_row_provider const& provider,
+    chart_spr_search_counters* counters = nullptr) {
   if (children.size() < 2) {
     throw std::runtime_error(
         "chart SPR overlay-delta: local row recompute requires at least 2 "
         "children");
+  }
+  if (children.size() != 2 && counters != nullptr) {
+    ++counters->multifurcation_productions_scored;
   }
 
   struct production_view {
@@ -2121,7 +2144,8 @@ inline void accumulate_overlay_production_row(
 
 inline std::array<chart_cost, nuc_state_count> recompute_overlay_delta_row(
     spr_overlay_delta const& delta, leaf_site_states const& leaf_states,
-    overlay_row_provider const& provider, overlay_clade_ref ref) {
+    overlay_row_provider const& provider, overlay_clade_ref ref,
+    chart_spr_search_counters* counters = nullptr) {
   auto const& base = *delta.base;
   auto const& key = overlay_delta_clade_key(delta, ref);
   if (key.taxa.size() == 1) {
@@ -2144,7 +2168,7 @@ inline std::array<chart_cost, nuc_state_count> recompute_overlay_delta_row(
       for (auto child : base.productions[pid].children) {
         children.push_back(base_clade_ref(child));
       }
-      accumulate_overlay_production_row(row, children, provider);
+      accumulate_overlay_production_row(row, children, provider, counters);
       saw_production = true;
     }
   }
@@ -2158,7 +2182,7 @@ inline std::array<chart_cost, nuc_state_count> recompute_overlay_delta_row(
     }
     auto const& prod = delta.temp_productions[temp_pid];
     validate_overlay_delta_production_partition(delta, prod, temp_pid);
-    accumulate_overlay_production_row(row, prod.children, provider);
+    accumulate_overlay_production_row(row, prod.children, provider, counters);
     saw_production = true;
   }
 
@@ -2176,7 +2200,8 @@ inline void build_local_overlay_chart_rows_into(
     spr_overlay_delta const& delta, single_site_chart const& base_chart,
     leaf_site_states const& leaf_states, local_overlay_chart_rows& rows,
     chart_options const& options = {},
-    bool validate_base_chart_shapes = false) {
+    bool validate_base_chart_shapes = false,
+    chart_spr_search_counters* counters = nullptr) {
   if (options.keep_trace) {
     throw std::runtime_error(
         "chart SPR overlay-delta: local row scorer does not support trace "
@@ -2212,7 +2237,7 @@ inline void build_local_overlay_chart_rows_into(
   for (std::size_t i = 0; i < delta.affected_order.size(); ++i) {
     auto ref = delta.affected_order[i];
     rows.rows[i] = chart_spr_search_detail::recompute_overlay_delta_row(
-        delta, leaf_states, provider, ref);
+        delta, leaf_states, provider, ref, counters);
   }
 }
 
@@ -2289,6 +2314,8 @@ inline void add_chart_spr_search_counters(
   dst.full_composite_rebuilds += src.full_composite_rebuilds;
   dst.local_candidate_scores += src.local_candidate_scores;
   dst.local_rows_recomputed += src.local_rows_recomputed;
+  dst.multifurcation_productions_scored +=
+      src.multifurcation_productions_scored;
   dst.local_score_parallel_batches += src.local_score_parallel_batches;
   dst.local_score_worker_tasks += src.local_score_worker_tasks;
   dst.candidate_batches_scored += src.candidate_batches_scored;
@@ -2477,7 +2504,7 @@ inline void accumulate_prepared_local_candidate_patterns(
       leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
       build_local_overlay_chart_rows_into(
           prepared.delta, cache_entry.chart, states, scratch.rows,
-          chart_build_options, options.validate_cached_chart_shapes);
+          chart_build_options, options.validate_cached_chart_shapes, counters);
       if (counters != nullptr) {
         counters->local_rows_recomputed +=
             prepared.delta.affected_order.size();
@@ -2575,6 +2602,10 @@ inline chart_spr_candidate_score score_candidate_locally_counted(
     auto entries = build_pattern_chart_cache_entries_for_range(state, begin,
                                                                count);
     if (counters != nullptr) ++counters->pattern_batch_cache_builds;
+    if (counters != nullptr) {
+      counters->multifurcation_productions_scored +=
+          multifurcation_productions_scored_for_entries(entries);
+    }
     accumulate_prepared_local_candidate_patterns(
         state, prepared, begin, entries, options, counters, scratch);
     if (!prepared.valid_for_accumulation) break;
@@ -2684,6 +2715,8 @@ score_candidates_locally_pattern_batches(
     auto entries = build_pattern_chart_cache_entries_for_range(state, begin,
                                                                count);
     ++aggregate.pattern_batch_cache_builds;
+    aggregate.multifurcation_productions_scored +=
+        multifurcation_productions_scored_for_entries(entries);
 
     if (worker_count <= 1) {
       chart_spr_local_score_scratch scratch;
@@ -4185,12 +4218,20 @@ inline spr_score_result score_multisite_spr_candidate_lower_bound_oracle(
     ++counters->overlay_materializations_for_oracle;
   }
 
-  auto old_score =
-      build_composite_chart_score(base, patterns, options).weighted_lower_bound;
+  auto old_composite = build_composite_chart_score(base, patterns, options);
+  if (counters != nullptr) {
+    counters->multifurcation_productions_scored +=
+        old_composite.multifurcation_productions_scored;
+  }
+  auto old_score = old_composite.weighted_lower_bound;
   if (counters != nullptr) ++counters->full_composite_rebuilds;
-  auto new_score = build_composite_chart_score(materialized.grammar, patterns,
-                                               options)
-                       .weighted_lower_bound;
+  auto new_composite =
+      build_composite_chart_score(materialized.grammar, patterns, options);
+  if (counters != nullptr) {
+    counters->multifurcation_productions_scored +=
+        new_composite.multifurcation_productions_scored;
+  }
+  auto new_score = new_composite.weighted_lower_bound;
   if (counters != nullptr) ++counters->full_composite_rebuilds;
   return spr_score_result{
       chart_spr_detail::signed_delta(old_score, new_score), old_score,
@@ -4237,6 +4278,8 @@ score_rejected_candidate_with_local_recompute_oracle(
     ++counters->local_candidate_scores;
     ++counters->full_overlay_materializations;
     ++counters->overlay_materializations_for_oracle;
+    counters->multifurcation_productions_scored +=
+        result.chart.multifurcation_productions_scored;
   }
   return result;
 }

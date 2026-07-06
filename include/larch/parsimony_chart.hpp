@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <iterator>
 #include <limits>
@@ -45,6 +46,9 @@ struct single_site_chart {
   // Number of stored chart_choice records. Zero on the no-trace fast path.
   std::size_t trace_choice_count = 0;
 
+  // Number of non-binary production rows evaluated by this chart build.
+  std::size_t multifurcation_productions_scored = 0;
+
   [[nodiscard]] bool has_trace() const { return !optimal_choices.empty(); }
 
   [[nodiscard]] chart_cost root_min_excluding_ua(clade_id root) const {
@@ -75,6 +79,28 @@ struct chart_options {
   std::size_t max_trace_choices = 0;
 };
 
+enum class arity_gate_consumer : std::size_t {
+  single_site_chart_trace,
+  single_site_trim_mask,
+  multisite_trim,
+  single_site_fluidity_report,
+  multisite_plateau_report,
+  chart_spr_exact_multisite,
+  count,
+};
+
+inline constexpr std::size_t arity_gate_consumer_count =
+    static_cast<std::size_t>(arity_gate_consumer::count);
+
+struct arity_gate_throw_snapshot {
+  std::size_t total = 0;
+  std::array<std::size_t, arity_gate_consumer_count> by_consumer{};
+
+  [[nodiscard]] std::size_t count(arity_gate_consumer consumer) const {
+    return by_consumer[static_cast<std::size_t>(consumer)];
+  }
+};
+
 inline std::size_t clade_grammar_max_production_arity(
     clade_grammar const& grammar) {
   std::size_t max_arity = 0;
@@ -95,6 +121,73 @@ inline std::optional<production_id> first_multifurcating_production(
 }
 
 namespace parsimony_chart_detail {
+
+inline std::array<std::atomic<std::size_t>, arity_gate_consumer_count>
+    arity_gate_throw_counts{};
+
+inline std::string_view arity_gate_consumer_name(
+    arity_gate_consumer consumer) {
+  switch (consumer) {
+    case arity_gate_consumer::single_site_chart_trace:
+      return "single_site_chart_trace";
+    case arity_gate_consumer::single_site_trim_mask:
+      return "single_site_trim_mask";
+    case arity_gate_consumer::multisite_trim:
+      return "multisite_trim";
+    case arity_gate_consumer::single_site_fluidity_report:
+      return "single_site_fluidity_report";
+    case arity_gate_consumer::multisite_plateau_report:
+      return "multisite_plateau_report";
+    case arity_gate_consumer::chart_spr_exact_multisite:
+      return "chart_spr_exact_multisite";
+    case arity_gate_consumer::count:
+      break;
+  }
+  return "unknown";
+}
+
+inline std::string_view arity_gate_consumer_reason(
+    arity_gate_consumer consumer) {
+  switch (consumer) {
+    case arity_gate_consumer::single_site_chart_trace:
+      return "binary trace layer";
+    case arity_gate_consumer::single_site_trim_mask:
+      return "binary choice-layer trim mask";
+    case arity_gate_consumer::multisite_trim:
+      return "binary B&B frontier";
+    case arity_gate_consumer::single_site_fluidity_report:
+      return "binary choice-layer fluidity report";
+    case arity_gate_consumer::multisite_plateau_report:
+      return "binary choice-layer plateau report";
+    case arity_gate_consumer::chart_spr_exact_multisite:
+      return "exact_multisite verifier";
+    case arity_gate_consumer::count:
+      break;
+  }
+  return "unknown";
+}
+
+inline void record_arity_gate_throw(arity_gate_consumer consumer) {
+  auto index = static_cast<std::size_t>(consumer);
+  if (index >= arity_gate_throw_counts.size()) return;
+  arity_gate_throw_counts[index].fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void reset_arity_gate_throw_counters_for_tests() {
+  for (auto& count : arity_gate_throw_counts) {
+    count.store(0, std::memory_order_relaxed);
+  }
+}
+
+inline arity_gate_throw_snapshot arity_gate_throws_snapshot() {
+  arity_gate_throw_snapshot snapshot;
+  for (std::size_t i = 0; i < arity_gate_throw_counts.size(); ++i) {
+    snapshot.by_consumer[i] =
+        arity_gate_throw_counts[i].load(std::memory_order_relaxed);
+    snapshot.total += snapshot.by_consumer[i];
+  }
+  return snapshot;
+}
 
 inline std::uint8_t strict_decode_acgt_state(char c) {
   switch (c) {
@@ -118,10 +211,12 @@ inline std::uint8_t strict_decode_acgt_state(char c) {
 }
 
 inline void require_no_multifurcating_productions_for_consumer(
-    clade_grammar const& grammar, std::string_view context,
-    std::string_view layer, std::string_view resolution) {
+    clade_grammar const& grammar, arity_gate_consumer consumer,
+    std::string_view context, std::string_view layer,
+    std::string_view resolution) {
   auto first = first_multifurcating_production(grammar);
   if (!first) return;
+  record_arity_gate_throw(consumer);
   auto const& prod = grammar.productions[*first];
   throw std::runtime_error(
       std::string{context} +
@@ -407,7 +502,8 @@ inline single_site_chart build_single_site_chart(
   validate_chart_grammar(grammar);
   if (options.keep_trace) {
     require_no_multifurcating_productions_for_consumer(
-        grammar, "single-site chart keep_trace", "trace",
+        grammar, arity_gate_consumer::single_site_chart_trace,
+        "single-site chart keep_trace", "trace",
         "build without keep_trace, or expand polytomies before using the "
         "binary trace layer");
   }
@@ -494,6 +590,9 @@ inline single_site_chart build_single_site_chart(
             "with mismatched parent");
       validate_production_inside_row_inputs(grammar, prod, pid,
                                             "single-site chart");
+      if (prod.children.size() != 2) {
+        ++chart.multifurcation_productions_scored;
+      }
       if (options.keep_trace && prod.children.size() != 2) {
         throw std::runtime_error(
             "single-site chart: keep_trace uses the binary choice layer; "

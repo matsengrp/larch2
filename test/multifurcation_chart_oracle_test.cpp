@@ -14,6 +14,7 @@
 #include <print>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -245,6 +246,7 @@ static std::vector<brute_row> brute_dense_outside(
 static larch::single_site_chart build_and_check_dense_inside(
     larch::clade_grammar const& grammar, larch::leaf_site_states const& states) {
   auto chart = larch::build_single_site_chart(grammar, states);
+  CHECK(chart.multifurcation_productions_scored > 0);
   std::vector<std::optional<std::vector<brute_row>>> memo(grammar.clades.size());
   for (std::size_t cid = 0; cid < grammar.clades.size(); ++cid) {
     auto rows = brute_enumerate_multifurcating_topologies(
@@ -260,9 +262,12 @@ static larch::single_site_chart build_and_check_dense_inside(
         grammar, states, recomputed, clade);
   }
   CHECK(recomputed.inside == chart.inside);
+  CHECK(recomputed.multifurcation_productions_scored ==
+        chart.multifurcation_productions_scored);
 
   larch::chart_options ua_free;
   auto outside = larch::build_single_site_outside_chart(grammar, chart, ua_free);
+  CHECK(outside.multifurcation_productions_scored > 0);
   CHECK(outside.outside ==
         brute_dense_outside(grammar, chart, ua_free, larch::nuc_base::A));
   CHECK(outside.global_min == chart.root_min_excluding_ua(grammar.root_clade));
@@ -271,6 +276,7 @@ static larch::single_site_chart build_and_check_dense_inside(
   ua_edge.score_ua_edge = true;
   auto outside_ua = larch::build_single_site_outside_chart(
       grammar, chart, ua_edge, larch::nuc_base::A);
+  CHECK(outside_ua.multifurcation_productions_scored > 0);
   CHECK(outside_ua.outside ==
         brute_dense_outside(grammar, chart, ua_edge, larch::nuc_base::A));
   CHECK(outside_ua.global_min ==
@@ -378,6 +384,7 @@ static void test_trinary_fixture_and_allow_gate() {
   auto chart = build_and_check_dense_inside(grammar, states);
   CHECK(chart.inside[grammar.root_clade] == rows.front());
   auto outside = larch::build_single_site_outside_chart(grammar, chart);
+  larch::parsimony_chart_detail::reset_arity_gate_throw_counters_for_tests();
   auto trim_message = runtime_error_message([&] {
     (void)larch::build_single_site_trim_mask(grammar, chart, outside);
   });
@@ -412,6 +419,26 @@ static void test_trinary_fixture_and_allow_gate() {
     (void)larch::build_single_site_chart(grammar, states, trace_opts);
   });
   check_arity_gate_message(trace_message, "trace");
+
+  auto arity_gate_throws =
+      larch::parsimony_chart_detail::arity_gate_throws_snapshot();
+  CHECK(arity_gate_throws.total == 5);
+  CHECK(arity_gate_throws.count(
+            larch::arity_gate_consumer::single_site_trim_mask) == 1);
+  CHECK(arity_gate_throws.count(larch::arity_gate_consumer::multisite_trim) ==
+        1);
+  CHECK(arity_gate_throws.count(
+            larch::arity_gate_consumer::single_site_fluidity_report) == 1);
+  CHECK(arity_gate_throws.count(
+            larch::arity_gate_consumer::multisite_plateau_report) == 1);
+  CHECK(arity_gate_throws.count(
+            larch::arity_gate_consumer::single_site_chart_trace) == 1);
+  CHECK(larch::parsimony_chart_detail::arity_gate_consumer_name(
+            larch::arity_gate_consumer::single_site_trim_mask) ==
+        std::string_view{"single_site_trim_mask"});
+  CHECK(larch::parsimony_chart_detail::arity_gate_consumer_reason(
+            larch::arity_gate_consumer::multisite_trim)
+            .find("B&B frontier") != std::string_view::npos);
 
   std::println("  PASS");
 }
