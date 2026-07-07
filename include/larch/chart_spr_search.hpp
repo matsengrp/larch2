@@ -1,6 +1,7 @@
 #pragma once
 
 #include <larch/chart_spr.hpp>
+#include <larch/lazy_chart.hpp>
 #include <larch/thread_pool.hpp>
 
 #include <algorithm>
@@ -450,6 +451,7 @@ struct chart_cache_options {
   std::size_t memory_budget_bytes = 0;  // 0 = no explicit budget
   std::size_t candidate_batch_size = 0; // 0 = choose from memory budget
   std::size_t pattern_batch_size = 0;   // 0 = derive from cache budget
+  bool use_lazy_multisite_chart = false;
 };
 
 struct chart_spr_search_state;
@@ -697,6 +699,25 @@ struct chart_spr_iteration_result {
   double exact_verification_ms = 0.0;
 };
 
+enum class chart_spr_cache_strategy {
+  all_active_patterns,
+  pattern_batches,
+  lazy_multisite_chart,
+};
+
+inline char const* chart_spr_cache_strategy_name(
+    chart_spr_cache_strategy strategy) {
+  switch (strategy) {
+    case chart_spr_cache_strategy::all_active_patterns:
+      return "all_active_patterns";
+    case chart_spr_cache_strategy::pattern_batches:
+      return "pattern_batches";
+    case chart_spr_cache_strategy::lazy_multisite_chart:
+      return "lazy_multisite_chart";
+  }
+  return "unknown";
+}
+
 struct chart_spr_search_summary {
   std::size_t iterations = 0;
   std::size_t accepted_moves = 0;
@@ -772,6 +793,8 @@ struct chart_spr_search_summary {
   std::size_t final_grammar_production_count = 0;
   std::size_t chart_cache_estimated_full_bytes = 0;
   std::size_t chart_cache_resident_bytes = 0;
+  chart_spr_cache_strategy cache_strategy =
+      chart_spr_cache_strategy::all_active_patterns;
   std::size_t effective_pattern_batch_size = 0;
   std::size_t effective_candidate_batch_size = 0;
   std::size_t local_score_worker_count = 1;
@@ -808,22 +831,6 @@ struct chart_spr_search_result {
   // stable across materialize / rebuild / report round trips.
   std::string chain_identity_report_json;
 };
-
-enum class chart_spr_cache_strategy {
-  all_active_patterns,
-  pattern_batches,
-};
-
-inline char const* chart_spr_cache_strategy_name(
-    chart_spr_cache_strategy strategy) {
-  switch (strategy) {
-    case chart_spr_cache_strategy::all_active_patterns:
-      return "all_active_patterns";
-    case chart_spr_cache_strategy::pattern_batches:
-      return "pattern_batches";
-  }
-  return "unknown";
-}
 
 // Search-cache objective convention:
 //
@@ -1262,6 +1269,9 @@ inline std::size_t choose_chart_spr_pattern_batch_size(
 inline chart_spr_cache_strategy choose_chart_spr_cache_strategy(
     clade_grammar const& grammar, active_site_pattern_set const& patterns,
     chart_cache_options const& cache) {
+  if (cache.use_lazy_multisite_chart) {
+    return chart_spr_cache_strategy::lazy_multisite_chart;
+  }
   auto active_count = patterns.patterns.patterns.size();
   if (active_count == 0) return chart_spr_cache_strategy::all_active_patterns;
   auto batch_size = choose_chart_spr_pattern_batch_size(grammar, patterns,
@@ -1292,6 +1302,7 @@ struct chart_spr_search_state {
   std::size_t effective_pattern_batch_size = 0;
   mutable std::size_t effective_candidate_batch_size = 0;
   std::vector<pattern_chart_cache_entry> pattern_charts;
+  std::optional<lazy_multisite_chart> lazy_chart;
   std::uint64_t composite_lower_bound_without_invariants = 0;
   std::uint64_t composite_lower_bound_with_invariants = 0;
 
@@ -1326,6 +1337,26 @@ struct chart_spr_search_state {
 
 inline std::size_t estimate_chart_spr_pattern_cache_bytes(
     chart_spr_search_state const& state) {
+  if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+    if (!state.lazy_chart) return 0;
+    std::size_t total = sizeof(lazy_multisite_chart);
+    for (auto const& rows : state.lazy_chart->inside_rows_by_clade) {
+      total += rows.size() * sizeof(lazy_multisite_chart::row_type);
+    }
+    for (auto const& map : state.lazy_chart->class_index_by_pattern_by_clade) {
+      if (map) total += map->size() * sizeof(std::size_t);
+    }
+    for (auto const& map :
+         state.lazy_chart->structural_class_index_by_pattern_by_clade) {
+      if (map) total += map->size() * sizeof(std::size_t);
+    }
+    for (auto const& weights : state.lazy_chart->class_weight_by_clade) {
+      total += weights.size() * sizeof(std::uint32_t);
+    }
+    total += state.lazy_chart->structural_class_count_by_clade.size() *
+             sizeof(std::size_t);
+    return total;
+  }
   std::size_t total = state.pattern_charts.size() *
                       sizeof(pattern_chart_cache_entry);
   for (auto const& entry : state.pattern_charts) {
@@ -1399,6 +1430,20 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
           entry.chart.multifurcation_productions_scored;
       state.pattern_charts.push_back(std::move(entry));
     }
+    state.resident_pattern_cache_bytes =
+        estimate_chart_spr_pattern_cache_bytes(state);
+  } else if (state.cache_strategy ==
+             chart_spr_cache_strategy::lazy_multisite_chart) {
+    lazy_chart_options lazy_options;
+    lazy_options.chart = chart_build_options;
+    lazy_options.retain_all_inside_class_maps = true;
+    state.lazy_chart = build_lazy_inside_chart(
+        state.grammar, state.active_patterns.patterns, lazy_options);
+    active_total = lazy_composite_lower_bound(
+        state.grammar, state.active_patterns.patterns, *state.lazy_chart,
+        options);
+    state.counters.multifurcation_productions_scored +=
+        state.lazy_chart->multifurcation_productions_scored;
     state.resident_pattern_cache_bytes =
         estimate_chart_spr_pattern_cache_bytes(state);
   } else {
@@ -2103,10 +2148,11 @@ struct overlay_row_provider {
 
 namespace chart_spr_search_detail {
 
+template <class RowProvider>
 inline void accumulate_overlay_production_row(
     std::array<chart_cost, nuc_state_count>& row,
     std::vector<overlay_clade_ref> const& children,
-    overlay_row_provider const& provider,
+    RowProvider const& provider,
     chart_spr_search_counters* counters = nullptr) {
   if (children.size() < 2) {
     throw std::runtime_error(
@@ -2131,9 +2177,10 @@ inline void accumulate_overlay_production_row(
   }
 }
 
+template <class RowProvider>
 inline std::array<chart_cost, nuc_state_count> recompute_overlay_delta_row(
     spr_overlay_delta const& delta, leaf_site_states const& leaf_states,
-    overlay_row_provider const& provider, overlay_clade_ref ref,
+    RowProvider const& provider, overlay_clade_ref ref,
     chart_spr_search_counters* counters = nullptr) {
   auto const& base = *delta.base;
   auto const& key = overlay_delta_clade_key(delta, ref);
@@ -2562,6 +2609,253 @@ build_pattern_chart_cache_entries_for_range(
   return entries;
 }
 
+inline std::size_t lazy_overlay_inside_class_index(
+    lazy_multisite_chart const& lazy, clade_id clade, std::size_t pattern) {
+  if (clade == no_clade || clade >= lazy.class_index_by_pattern_by_clade.size()) {
+    throw std::runtime_error(
+        "chart SPR lazy local score: base clade class map out of range");
+  }
+  if (pattern >= lazy.pattern_count) {
+    throw std::runtime_error(
+        "chart SPR lazy local score: pattern index out of range");
+  }
+  auto const& map = lazy.class_index_by_pattern_by_clade[clade];
+  if (!map) {
+    throw std::runtime_error(
+        "chart SPR lazy local score: inside class map was not retained");
+  }
+  auto class_index = (*map)[pattern];
+  if (clade >= lazy.inside_rows_by_clade.size() ||
+      class_index >= lazy.inside_rows_by_clade[clade].size()) {
+    throw std::runtime_error(
+        "chart SPR lazy local score: inside class index out of range");
+  }
+  return class_index;
+}
+
+inline void append_lazy_overlay_leaf_state(
+    spr_overlay_delta const& delta,
+    std::vector<site_pattern> const& patterns, overlay_clade_ref ref,
+    std::size_t pattern, std::vector<std::size_t>& key) {
+  auto const& clade_key = overlay_delta_clade_key(delta, ref);
+  if (clade_key.taxa.size() != 1) return;
+  auto taxon = clade_key.taxa.front();
+  if (pattern >= patterns.size() ||
+      taxon >= patterns[pattern].state_by_taxon.size()) {
+    throw std::runtime_error(
+        "chart SPR lazy local score: leaf state key out of range");
+  }
+  key.push_back(patterns[pattern].state_by_taxon[taxon]);
+}
+
+inline void append_lazy_overlay_base_class(
+    lazy_multisite_chart const& lazy, overlay_clade_ref ref,
+    std::size_t pattern, std::vector<std::size_t>& key) {
+  if (ref.space != overlay_id_space::base) return;
+  key.push_back(lazy_overlay_inside_class_index(lazy, ref.id, pattern));
+}
+
+inline std::vector<std::size_t> lazy_overlay_context_key(
+    chart_spr_search_state const& state, spr_overlay_delta const& delta,
+    std::size_t pattern) {
+  if (!state.lazy_chart) {
+    throw std::runtime_error("chart SPR lazy local score: missing lazy chart");
+  }
+  auto const& lazy = *state.lazy_chart;
+  auto const& patterns = state.active_patterns.patterns.patterns;
+  std::vector<std::size_t> key;
+  key.reserve(delta.affected_order.size() * 4 + 1);
+  key.push_back(lazy_overlay_inside_class_index(
+      lazy, state.grammar.root_clade, pattern));
+
+  auto append_children = [&](std::vector<overlay_clade_ref> const& children) {
+    for (auto child : children) {
+      append_lazy_overlay_base_class(lazy, child, pattern, key);
+      append_lazy_overlay_leaf_state(delta, patterns, child, pattern, key);
+    }
+  };
+
+  for (auto ref : delta.affected_order) {
+    append_lazy_overlay_base_class(lazy, ref, pattern, key);
+    append_lazy_overlay_leaf_state(delta, patterns, ref, pattern, key);
+    if (overlay_delta_clade_key(delta, ref).taxa.size() == 1) continue;
+
+    if (ref.space == overlay_id_space::base) {
+      auto const& base = *delta.base;
+      for (auto pid : base.productions_by_parent[ref.id]) {
+        if (overlay_delta_base_production_removed(delta, pid)) continue;
+        validate_reachable_base_production(delta, pid);
+        std::vector<overlay_clade_ref> children;
+        children.reserve(base.productions[pid].children.size());
+        for (auto child : base.productions[pid].children) {
+          children.push_back(base_clade_ref(child));
+        }
+        append_children(children);
+      }
+    }
+
+    for (auto temp_pid : temp_productions_for_parent(delta, ref)) {
+      if (temp_pid == no_production ||
+          temp_pid >= delta.temp_productions.size()) {
+        throw std::runtime_error(
+            "chart SPR lazy local score: temp production id out of range");
+      }
+      auto const& prod = delta.temp_productions[temp_pid];
+      validate_overlay_delta_production_partition(delta, prod, temp_pid);
+      append_children(prod.children);
+    }
+  }
+  return key;
+}
+
+struct lazy_overlay_row_provider {
+  spr_overlay_delta const& delta;
+  lazy_multisite_chart const& lazy;
+  std::size_t pattern = no_site_pattern;
+  local_overlay_chart_rows const& local_rows;
+
+  [[nodiscard]] std::array<chart_cost, nuc_state_count> const& row(
+      overlay_clade_ref ref) const {
+    auto slot = local_rows.slot_for(ref);
+    if (slot != local_overlay_chart_rows::npos) {
+      if (slot >= local_rows.rows.size()) {
+        throw std::runtime_error(
+            "chart SPR lazy local score: local row slot out of range");
+      }
+      return local_rows.rows[slot];
+    }
+    if (ref.space != overlay_id_space::base) {
+      throw std::runtime_error(
+          "chart SPR lazy local score: reachable temp clade has no local row");
+    }
+    auto class_index = lazy_overlay_inside_class_index(lazy, ref.id, pattern);
+    return lazy.inside_rows_by_clade[ref.id][class_index];
+  }
+};
+
+struct lazy_overlay_context_accumulator {
+  std::size_t representative = no_site_pattern;
+  std::uint64_t weight = 0;
+  std::array<std::uint64_t, nuc_state_count> reference_state_counts{};
+};
+
+inline std::uint64_t lazy_overlay_weighted_root_score(
+    std::array<chart_cost, nuc_state_count> const& root_row,
+    lazy_overlay_context_accumulator const& context,
+    chart_options const& options) {
+  if (!options.score_ua_edge) {
+    return chart_multisite_detail::checked_mul_cost(
+        context.weight, chart_multisite_detail::row_min(root_row),
+        "chart SPR lazy local score root cost");
+  }
+  std::uint64_t total = 0;
+  for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+       ++reference_state) {
+    auto count = context.reference_state_counts[reference_state];
+    if (count == 0) continue;
+    chart_cost best = chart_inf;
+    for (std::uint8_t root_state = 0; root_state < nuc_state_count;
+         ++root_state) {
+      best = std::min(
+          best, parsimony_chart_detail::saturated_add(
+                    root_row[root_state],
+                    parsimony_chart_detail::transition_cost(reference_state,
+                                                            root_state)));
+    }
+    total = chart_multisite_detail::checked_add_u64(
+        total,
+        chart_multisite_detail::checked_mul_cost(
+            count, best, "chart SPR lazy local score root-edge cost"),
+        "chart SPR lazy local score root-edge total");
+  }
+  return total;
+}
+
+inline void accumulate_prepared_local_candidate_lazy(
+    chart_spr_search_state const& state,
+    prepared_local_candidate_score& prepared,
+    local_spr_score_options const& options,
+    chart_spr_search_counters* counters,
+    chart_spr_local_score_scratch& scratch) {
+  (void)scratch;
+  if (!prepared.valid_for_accumulation) return;
+  if (!state.lazy_chart) {
+    invalidate_prepared_local_candidate(
+        state, prepared, "chart SPR lazy local score: missing lazy chart");
+    return;
+  }
+
+  auto const& patterns = state.active_patterns.patterns.patterns;
+  std::map<std::vector<std::size_t>, lazy_overlay_context_accumulator>
+      contexts;
+  try {
+    for (std::size_t pattern_index = 0; pattern_index < patterns.size();
+         ++pattern_index) {
+      auto key = lazy_overlay_context_key(state, prepared.delta, pattern_index);
+      auto [it, inserted] = contexts.emplace(
+          std::move(key), lazy_overlay_context_accumulator{});
+      auto& context = it->second;
+      if (inserted) context.representative = pattern_index;
+      auto const& pattern = patterns[pattern_index];
+      context.weight = chart_multisite_detail::checked_add_u64(
+          context.weight, pattern.weight,
+          "chart SPR lazy local score context weight");
+      for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+           ++reference_state) {
+        context.reference_state_counts[reference_state] =
+            chart_multisite_detail::checked_add_u64(
+                context.reference_state_counts[reference_state],
+                pattern.reference_state_counts[reference_state],
+                "chart SPR lazy local score context reference count");
+      }
+    }
+
+    for (auto const& [key, context] : contexts) {
+      (void)key;
+      if (context.representative >= patterns.size()) {
+        throw std::runtime_error(
+            "chart SPR lazy local score: context representative out of range");
+      }
+      local_overlay_chart_rows rows;
+      rows.base_row_slot = &prepared.delta.affected_base_row_slot;
+      rows.temp_row_slot = &prepared.delta.affected_temp_row_slot;
+      rows.rows.assign(prepared.delta.affected_order.size(),
+                       parsimony_chart_detail::make_inf_row());
+
+      lazy_overlay_row_provider provider{prepared.delta, *state.lazy_chart,
+                                         context.representative, rows};
+      leaf_site_states states{
+          .state_by_taxon = patterns[context.representative].state_by_taxon};
+      for (std::size_t i = 0; i < prepared.delta.affected_order.size(); ++i) {
+        auto ref = prepared.delta.affected_order[i];
+        rows.rows[i] = recompute_overlay_delta_row(
+            prepared.delta, states, provider, ref, counters);
+      }
+      if (counters != nullptr) {
+        counters->local_rows_recomputed += prepared.delta.affected_order.size();
+      }
+      if (prepared.verification_materialized) {
+        auto chart_build_options = state.chart_opts;
+        chart_build_options.keep_trace = false;
+        chart_build_options.max_trace_choices = 0;
+        auto base_chart = build_single_site_chart(state.grammar, states,
+                                                  chart_build_options);
+        verify_local_overlay_rows_against_full(
+            prepared.delta, rows, base_chart, *prepared.verification_materialized,
+            states, state.chart_opts);
+      }
+      auto const& root_row = provider.row(prepared.delta.root);
+      auto contribution = lazy_overlay_weighted_root_score(
+          root_row, context, state.chart_opts);
+      prepared.new_active_score = chart_multisite_detail::checked_add_u64(
+          prepared.new_active_score, contribution,
+          "chart SPR lazy local candidate active lower bound");
+    }
+  } catch (std::exception const& e) {
+    invalidate_prepared_local_candidate(state, prepared, e.what());
+  }
+}
+
 inline chart_spr_candidate_score score_candidate_locally_counted(
     chart_spr_search_state const& state,
     grammar_spr_candidate const& candidate,
@@ -2571,6 +2865,12 @@ inline chart_spr_candidate_score score_candidate_locally_counted(
   auto prepared = prepare_local_candidate_score(state, candidate, options,
                                                 counters);
   if (!prepared.valid_for_accumulation) return prepared.scored;
+
+  if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+    accumulate_prepared_local_candidate_lazy(
+        state, prepared, options, counters, scratch);
+    return finish_prepared_local_candidate_score(state, prepared);
+  }
 
   if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
     if (state.pattern_charts.size() !=
@@ -2763,7 +3063,8 @@ inline std::vector<chart_spr_candidate_score> score_candidates_locally(
     std::vector<grammar_spr_candidate> const& candidates,
     local_spr_score_options const& options = {},
     std::size_t worker_count = 1) {
-  if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
+  if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns ||
+      state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
     return chart_spr_search_detail::score_candidates_locally_all_cache(
         state, candidates, options, worker_count);
   }
@@ -3486,6 +3787,34 @@ chart_spr_overlay_selected_production_by_parent(
   return selected;
 }
 
+inline std::map<overlay_clade_ref, overlay_production_ref>
+chart_spr_before_selected_production_by_parent(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    std::vector<overlay_production_ref> const& production_refs) {
+  std::map<overlay_clade_ref, overlay_production_ref> selected;
+  for (auto ref : production_refs) {
+    if (ref.space != overlay_id_space::base) {
+      throw std::runtime_error(
+          "fixed_topology_exact selected-topology cache: before-topology "
+          "production must refer to the current base grammar");
+    }
+    validate_chart_spr_selected_overlay_production_for_fixed_topology(
+        base, candidate, ref,
+        "fixed_topology_exact selected-topology cache before");
+    auto parent = chart_spr_overlay_production_parent(base, candidate, ref);
+    auto [it, inserted] = selected.emplace(parent, ref);
+    if (!inserted && it->second != ref) {
+      throw std::runtime_error(
+          "fixed_topology_exact selected-topology cache: conflicting "
+          "before-topology production choices for one clade");
+    }
+  }
+  validate_chart_spr_selected_overlay_topology_complete(
+      base, candidate, selected,
+      "fixed_topology_exact selected-topology cache before");
+  return selected;
+}
+
 inline std::array<chart_cost, nuc_state_count>
 chart_spr_restricted_overlay_topology_row_impl(
     clade_grammar const& base, grammar_spr_candidate const& candidate,
@@ -3589,6 +3918,157 @@ chart_spr_restricted_overlay_topology_row(
       base_memo, temp_memo, base_state, temp_state, counters);
 }
 
+struct chart_spr_lazy_selected_topology_entry {
+  std::vector<std::array<chart_cost, nuc_state_count>> rows;
+  std::vector<std::size_t> class_index_by_pattern;
+};
+
+inline chart_spr_lazy_selected_topology_entry const&
+chart_spr_lazy_selected_topology_rows_for_clade(
+    chart_spr_search_state const& state,
+    grammar_spr_candidate const& candidate,
+    std::map<overlay_clade_ref, overlay_production_ref> const& selected,
+    overlay_clade_ref clade,
+    std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>&
+        base_memo,
+    std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>&
+        temp_memo,
+    std::vector<std::uint8_t>& base_state,
+    std::vector<std::uint8_t>& temp_state) {
+  auto& state_slot = clade.space == overlay_id_space::base
+                         ? base_state.at(clade.id)
+                         : temp_state.at(clade.id);
+  auto& memo_slot = clade.space == overlay_id_space::base
+                        ? base_memo.at(clade.id)
+                        : temp_memo.at(clade.id);
+  if (state_slot == 1) {
+    throw std::runtime_error(
+        "fixed_topology_exact lazy selected-topology scorer: cycle in "
+        "selected topology");
+  }
+  if (state_slot == 2) {
+    if (!memo_slot) {
+      throw std::runtime_error(
+          "fixed_topology_exact lazy selected-topology scorer: completed "
+          "clade missing memo");
+    }
+    return *memo_slot;
+  }
+  state_slot = 1;
+
+  auto const& active = state.active_patterns.patterns.patterns;
+  chart_spr_lazy_selected_topology_entry entry;
+  entry.class_index_by_pattern.assign(active.size(), 0);
+  auto taxa = chart_spr_clade_taxa_for_ref(state.grammar, candidate, clade);
+  if (taxa.empty()) {
+    throw std::runtime_error(
+        "fixed_topology_exact lazy selected-topology scorer: selected clade "
+        "has no taxa");
+  }
+
+  if (taxa.size() == 1) {
+    auto taxon = taxa.front();
+    std::map<std::uint8_t, std::size_t> class_by_state;
+    for (std::size_t p = 0; p < active.size(); ++p) {
+      if (taxon >= active[p].state_by_taxon.size()) {
+        throw std::runtime_error(
+            "fixed_topology_exact lazy selected-topology scorer: leaf taxon "
+            "out of state range");
+      }
+      auto observed = active[p].state_by_taxon[taxon];
+      parsimony_chart_detail::validate_state(
+          observed, "fixed_topology_exact lazy selected-topology leaf state");
+      auto [it, inserted] =
+          class_by_state.emplace(observed, class_by_state.size());
+      if (inserted) {
+        auto row = parsimony_chart_detail::make_inf_row();
+        row[observed] = 0;
+        entry.rows.push_back(row);
+      }
+      entry.class_index_by_pattern[p] = it->second;
+    }
+  } else {
+    auto it = selected.find(clade);
+    if (it == selected.end()) {
+      throw std::runtime_error(
+          "fixed_topology_exact lazy selected-topology scorer: selected "
+          "topology missing production for non-singleton clade");
+    }
+    validate_chart_spr_selected_overlay_production_for_fixed_topology(
+        state.grammar, candidate, it->second,
+        "fixed_topology_exact lazy selected-topology scorer");
+    auto children = chart_spr_overlay_production_children(state.grammar,
+                                                          candidate,
+                                                          it->second);
+    std::vector<chart_spr_lazy_selected_topology_entry const*> child_entries;
+    child_entries.reserve(children.size());
+    for (auto child : children) {
+      child_entries.push_back(&chart_spr_lazy_selected_topology_rows_for_clade(
+          state, candidate, selected, child, base_memo, temp_memo,
+          base_state, temp_state));
+    }
+
+    std::map<std::vector<std::size_t>, std::vector<std::size_t>>
+        patterns_by_context;
+    for (std::size_t p = 0; p < active.size(); ++p) {
+      std::vector<std::size_t> key;
+      key.reserve(child_entries.size());
+      for (auto const* child_entry : child_entries) {
+        key.push_back(child_entry->class_index_by_pattern[p]);
+      }
+      patterns_by_context[std::move(key)].push_back(p);
+    }
+
+    std::map<std::array<chart_cost, nuc_state_count>, std::size_t>
+        class_by_row;
+    for (auto const& [key, members] : patterns_by_context) {
+      std::vector<chart_multisite_detail::chart_row> child_rows;
+      child_rows.reserve(child_entries.size());
+      for (std::size_t child_i = 0; child_i < child_entries.size(); ++child_i) {
+        auto const* child_entry = child_entries[child_i];
+        auto class_index = key[child_i];
+        if (class_index >= child_entry->rows.size()) {
+          throw std::runtime_error(
+              "fixed_topology_exact lazy selected-topology scorer: child "
+              "class index out of range");
+        }
+        child_rows.push_back(child_entry->rows[class_index]);
+      }
+      auto row = chart_multisite_detail::combine_rows(
+          std::span<chart_multisite_detail::chart_row const>{
+              child_rows.data(), child_rows.size()});
+      auto [row_it, inserted] = class_by_row.emplace(row, class_by_row.size());
+      if (inserted) entry.rows.push_back(row);
+      for (auto p : members) entry.class_index_by_pattern[p] = row_it->second;
+    }
+    if (children.size() != 2) {
+      state.counters.selected_topology_multifurcation_rows +=
+          patterns_by_context.size();
+    }
+  }
+
+  state.counters.fixed_topology_selected_rows_computed += entry.rows.size();
+  memo_slot = std::move(entry);
+  state_slot = 2;
+  return *memo_slot;
+}
+
+inline chart_spr_lazy_selected_topology_entry const&
+chart_spr_lazy_selected_topology_root_rows(
+    chart_spr_search_state const& state,
+    grammar_spr_candidate const& candidate,
+    std::map<overlay_clade_ref, overlay_production_ref> const& selected,
+    std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>&
+        base_memo,
+    std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>&
+        temp_memo) {
+  std::vector<std::uint8_t> base_state(state.grammar.clades.size(), 0);
+  std::vector<std::uint8_t> temp_state(candidate.added_clades.size(), 0);
+  return chart_spr_lazy_selected_topology_rows_for_clade(
+      state, candidate, selected, base_clade_ref(state.grammar.root_clade),
+      base_memo, temp_memo, base_state, temp_state);
+}
+
 struct chart_spr_fixed_topology_pattern_scores {
   std::vector<std::uint64_t> old_pattern_scores;
   std::vector<std::uint64_t> new_pattern_scores;
@@ -3597,9 +4077,82 @@ struct chart_spr_fixed_topology_pattern_scores {
 };
 
 inline chart_spr_fixed_topology_pattern_scores
+fixed_topology_lazy_selected_pattern_scores(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate) {
+  state.active_patterns.assert_no_skipped_invariant_metadata();
+  if (!state.lazy_chart) {
+    throw std::runtime_error(
+        "fixed_topology_exact lazy selected-topology scorer: missing lazy "
+        "chart");
+  }
+  if (!candidate.topology_selection.certificate) {
+    throw std::runtime_error(
+        "fixed_topology_exact lazy selected-topology scorer requires a "
+        "complete topology certificate");
+  }
+  auto const& certificate = *candidate.topology_selection.certificate;
+  validate_chart_spr_topology_certificate_signatures(
+      state.grammar, candidate.candidate, certificate);
+
+  auto before_selected = chart_spr_before_selected_production_by_parent(
+      state.grammar, candidate.candidate,
+      certificate.before_overlay_productions);
+  auto after_selected = chart_spr_overlay_selected_production_by_parent(
+      state.grammar, candidate.candidate,
+      certificate.after_overlay_productions);
+
+  std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>
+      before_base_memo(state.grammar.clades.size());
+  std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>
+      before_temp_memo(candidate.candidate.added_clades.size());
+  std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>
+      after_base_memo(state.grammar.clades.size());
+  std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>
+      after_temp_memo(candidate.candidate.added_clades.size());
+  auto const& before_root = chart_spr_lazy_selected_topology_root_rows(
+      state, candidate.candidate, before_selected, before_base_memo,
+      before_temp_memo);
+  auto const& after_root = chart_spr_lazy_selected_topology_root_rows(
+      state, candidate.candidate, after_selected, after_base_memo,
+      after_temp_memo);
+
+  chart_spr_fixed_topology_pattern_scores scores;
+  auto const& active = state.active_patterns.patterns.patterns;
+  scores.old_pattern_scores.reserve(active.size());
+  scores.new_pattern_scores.reserve(active.size());
+  for (std::size_t p = 0; p < active.size(); ++p) {
+    auto old_class = before_root.class_index_by_pattern[p];
+    auto new_class = after_root.class_index_by_pattern[p];
+    if (old_class >= before_root.rows.size() ||
+        new_class >= after_root.rows.size()) {
+      throw std::runtime_error(
+          "fixed_topology_exact lazy selected-topology scorer: root class "
+          "index out of range");
+    }
+    auto old_score = chart_spr_weighted_root_score_from_row(
+        before_root.rows[old_class], active[p], state.chart_opts);
+    auto new_score = chart_spr_weighted_root_score_from_row(
+        after_root.rows[new_class], active[p], state.chart_opts);
+    scores.old_pattern_scores.push_back(old_score);
+    scores.new_pattern_scores.push_back(new_score);
+    scores.old_active_total = chart_multisite_detail::checked_add_u64(
+        scores.old_active_total, old_score,
+        "fixed_topology_exact lazy selected old active total");
+    scores.new_active_total = chart_multisite_detail::checked_add_u64(
+        scores.new_active_total, new_score,
+        "fixed_topology_exact lazy selected new active total");
+  }
+  return scores;
+}
+
+inline chart_spr_fixed_topology_pattern_scores
 fixed_topology_direct_selected_pattern_scores(
     chart_spr_search_state const& state,
     chart_spr_candidate_score const& candidate) {
+  if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+    return fixed_topology_lazy_selected_pattern_scores(state, candidate);
+  }
   state.active_patterns.assert_no_skipped_invariant_metadata();
   if (!candidate.topology_selection.certificate) {
     throw std::runtime_error(

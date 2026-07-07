@@ -533,6 +533,24 @@ static void test_local_score_with_ua_edge_and_invariant_offset_matches_oracle() 
   CHECK(state.counters.full_overlay_materializations == 0);
   CHECK(state.counters.full_composite_rebuilds == 0);
 
+  larch::chart_spr_search_options lazy_options;
+  lazy_options.chart = opts;
+  lazy_options.cache.use_lazy_multisite_chart = true;
+  auto lazy_state = larch::build_chart_spr_search_state(
+      dag, grammar, lazy_options);
+  auto lazy_scored =
+      larch::score_candidate_locally(lazy_state, candidates.front());
+  CHECK(lazy_state.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  CHECK(lazy_scored.valid);
+  CHECK(lazy_scored.lower_bound.value.old_score == oracle.old_score);
+  CHECK(lazy_scored.lower_bound.value.new_score == oracle.new_score);
+  CHECK(lazy_scored.lower_bound.value.delta == oracle.delta);
+  CHECK(lazy_scored.lower_bound.invariant_offset_applied ==
+        lazy_state.invariant_constant_offset);
+  CHECK(lazy_state.invariant_constant_offset == 2);
+  CHECK(lazy_state.counters.local_rows_recomputed > 0);
+
   std::println("  PASS");
 }
 
@@ -907,7 +925,19 @@ static void test_pattern_batch_cache_options_match_all_cache() {
   auto all_scores = larch::score_candidates_locally(all_state, subset, {}, 1);
   auto batched_scores = larch::score_candidates_locally(
       batched_state, subset, {}, 1);
+  larch::chart_spr_search_options lazy_options;
+  lazy_options.cache.use_lazy_multisite_chart = true;
+  auto lazy_state = larch::build_chart_spr_search_state(
+      dag, grammar, lazy_options);
+  CHECK(lazy_state.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  CHECK(lazy_state.pattern_charts.empty());
+  CHECK(lazy_state.lazy_chart.has_value());
+  CHECK(lazy_state.composite_lower_bound_with_invariants ==
+        all_state.composite_lower_bound_with_invariants);
+  auto lazy_scores = larch::score_candidates_locally(lazy_state, subset, {}, 1);
   CHECK(all_scores.size() == batched_scores.size());
+  CHECK(all_scores.size() == lazy_scores.size());
   for (std::size_t i = 0; i < all_scores.size(); ++i) {
     CHECK(all_scores[i].valid == batched_scores[i].valid);
     CHECK(all_scores[i].lower_bound.value.old_score ==
@@ -918,11 +948,23 @@ static void test_pattern_batch_cache_options_match_all_cache() {
           batched_scores[i].lower_bound.value.delta);
     CHECK(all_scores[i].affected_clade_count ==
           batched_scores[i].affected_clade_count);
+    CHECK(all_scores[i].valid == lazy_scores[i].valid);
+    CHECK(all_scores[i].lower_bound.value.old_score ==
+          lazy_scores[i].lower_bound.value.old_score);
+    CHECK(all_scores[i].lower_bound.value.new_score ==
+          lazy_scores[i].lower_bound.value.new_score);
+    CHECK(all_scores[i].lower_bound.value.delta ==
+          lazy_scores[i].lower_bound.value.delta);
+    CHECK(all_scores[i].affected_clade_count ==
+          lazy_scores[i].affected_clade_count);
   }
   CHECK(batched_state.counters.local_candidate_scores == subset.size());
   CHECK(batched_state.counters.pattern_batch_cache_builds >=
         batched_state.active_patterns.patterns.patterns.size());
   CHECK(batched_scores.front().local_score_ms > 0.0);
+  CHECK(lazy_state.counters.local_candidate_scores == subset.size());
+  CHECK(lazy_state.counters.local_rows_recomputed > 0);
+  CHECK(lazy_scores.front().local_score_ms > 0.0);
 
   bool single_threw = false;
   try {
@@ -950,6 +992,86 @@ static void test_pattern_batch_cache_options_match_all_cache() {
     CHECK(memory_scores[i].lower_bound.value.delta ==
           all_scores[i].lower_bound.value.delta);
   }
+
+  std::println("  PASS");
+}
+
+static void test_lazy_cache_fixed_topology_conservative_search() {
+  std::println("test_lazy_cache_fixed_topology_conservative_search");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", phase6_arity3_misplaced_tree());
+  larch::clade_grammar_options gopts;
+  gopts.allow_polytomies = true;
+  auto grammar = larch::build_clade_grammar(dag, gopts);
+  CHECK(max_production_arity(grammar) == 3);
+  auto dense_state = larch::build_chart_spr_search_state(dag, grammar);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = true;
+  options.cache.use_lazy_multisite_chart = true;
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+  CHECK(search.summary.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  CHECK(search.iterations.size() == 1);
+  auto const& iteration = search.iterations.front();
+  CHECK(iteration.accepted.has_value());
+  CHECK(iteration.accepted_move_committed);
+  CHECK(!iteration.post_materialization_rejected);
+  CHECK(iteration.accepted->exact.has_value());
+  CHECK(iteration.accepted->exact->kind ==
+        larch::chart_spr_score_kind::fixed_topology_exact);
+  auto dense_scores = larch::fixed_topology_direct_selected_pattern_scores(
+      dense_state, *iteration.accepted);
+  auto dense_old_full = larch::chart_spr_add_invariant_offset(
+      dense_scores.old_active_total, dense_state,
+      "lazy fixed-topology dense oracle old score");
+  auto dense_new_full = larch::chart_spr_add_invariant_offset(
+      dense_scores.new_active_total, dense_state,
+      "lazy fixed-topology dense oracle new score");
+  CHECK(iteration.accepted->exact->value.old_score == dense_old_full);
+  CHECK(iteration.accepted->exact->value.new_score == dense_new_full);
+  CHECK(search.counters.local_candidate_scores > 0);
+  CHECK(search.counters.local_rows_recomputed > 0);
+  CHECK(search.counters.fixed_topology_selected_rows_computed > 0);
+  CHECK(search.counters.selected_topology_multifurcation_rows > 0);
+  CHECK(search.counters.spr_multifurcation_moves_generated > 0);
+  CHECK(search.counters.multifurcation_productions_scored > 0);
+  CHECK(search.summary.final_score < search.summary.initial_score);
+  auto rebuilt = larch::build_clade_grammar(search.dag, gopts);
+  CHECK(max_production_arity(rebuilt) == 3);
+
+  std::println("  PASS");
+}
+
+static void test_lazy_cache_local_commit_gate() {
+  std::println("test_lazy_cache_local_commit_gate");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.rebuild_after_accept = false;
+  options.cache.use_lazy_multisite_chart = true;
+
+  bool threw = false;
+  try {
+    (void)larch::run_chart_spr_search(std::move(dag), grammar, options);
+  } catch (std::runtime_error const& e) {
+    threw = true;
+    CHECK(std::string{e.what()}.find("WI5 lazy incremental") !=
+          std::string::npos);
+  }
+  CHECK(threw);
 
   std::println("  PASS");
 }
@@ -2003,6 +2125,24 @@ static void phase5_check_selected_topology_fixture(
   CHECK(cache_scores.new_pattern_scores == brute_scores);
   CHECK(cache_scores.old_active_total == brute_active_total);
   CHECK(cache_scores.new_active_total == brute_active_total);
+
+  larch::chart_spr_search_options lazy_options;
+  lazy_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  lazy_options.cache.use_lazy_multisite_chart = true;
+  auto lazy_state = larch::build_chart_spr_search_state(
+      dag, grammar, lazy_options);
+  CHECK(lazy_state.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  CHECK(lazy_state.active_patterns.patterns.patterns.size() == active.size());
+  auto lazy_scores =
+      larch::fixed_topology_direct_selected_pattern_scores(lazy_state, scored);
+  CHECK(lazy_scores.old_pattern_scores == brute_scores);
+  CHECK(lazy_scores.new_pattern_scores == brute_scores);
+  CHECK(lazy_scores.old_active_total == brute_active_total);
+  CHECK(lazy_scores.new_active_total == brute_active_total);
+  CHECK(lazy_state.counters.fixed_topology_selected_rows_computed > 0);
+  CHECK(lazy_state.counters.selected_topology_multifurcation_rows > 0);
 
   auto verified = larch::verify_candidate_fixed_topology_exact(state, scored);
   CHECK(verified.valid);
@@ -4415,6 +4555,8 @@ int main() {
   test_active_pattern_assertions_reject_skipped_metadata();
   test_state_builder_from_dag_rebuilds_patterns_once();
   test_pattern_batch_cache_options_match_all_cache();
+  test_lazy_cache_fixed_topology_conservative_search();
+  test_lazy_cache_local_commit_gate();
   test_parallel_local_scores_match_serial();
   test_pattern_batch_nonreplayable_uses_automatic_candidate_batch();
   test_unchartable_grammar_rejected_with_empty_active_patterns();

@@ -3590,14 +3590,8 @@ static void run_chart_spr_search_diagnostic(
   out << "  root_row_scoring_api: chart_spr_weighted_root_score_from_row\n";
   out << "  local_score_workers: "
       << search.summary.local_score_worker_count << "\n";
-  out << "  cache_strategy: ";
-  if (search.summary.effective_pattern_batch_size != 0 &&
-      search.summary.effective_pattern_batch_size <
-          search.summary.active_pattern_count) {
-    out << "pattern_batches\n";
-  } else {
-    out << "all_active_patterns\n";
-  }
+  out << "  cache_strategy: "
+      << chart_spr_cache_strategy_name(search.summary.cache_strategy) << "\n";
   out << "  active_patterns: "
       << search.summary.active_pattern_count << "\n";
   out << "  initial_grammar_clades: "

@@ -87,6 +87,14 @@ void validate_chart_spr_search_loop_options(
         "rebuild_after_accept=true or score_ua_edge=false.  This is a labelled "
         "unsupported-mode throw, not a silent fallback.");
   }
+  if (!options.rebuild_after_accept &&
+      options.cache.use_lazy_multisite_chart) {
+    throw std::runtime_error(
+        "chart SPR search: local commit (rebuild_after_accept = false) with "
+        "lazy_multisite_chart cache strategy requires WI5 lazy incremental "
+        "commit support; use rebuild_after_accept=true.  This is a labelled "
+        "unsupported-mode throw, not a silent fallback.");
+  }
 }
 
 bool chart_spr_rebuild_after_accept_needs_exact_trim(
@@ -970,34 +978,6 @@ std::string chart_spr_selected_topology_internal_key(
     key += ")";
   }
   return key;
-}
-
-std::map<overlay_clade_ref, overlay_production_ref>
-chart_spr_before_selected_production_by_parent(
-    clade_grammar const& base, grammar_spr_candidate const& candidate,
-    std::vector<overlay_production_ref> const& production_refs) {
-  std::map<overlay_clade_ref, overlay_production_ref> selected;
-  for (auto ref : production_refs) {
-    if (ref.space != overlay_id_space::base) {
-      throw std::runtime_error(
-          "fixed_topology_exact selected-topology cache: before-topology "
-          "production must refer to the current base grammar");
-    }
-    validate_chart_spr_selected_overlay_production_for_fixed_topology(
-        base, candidate, ref,
-        "fixed_topology_exact selected-topology cache before");
-    auto parent = chart_spr_overlay_production_parent(base, candidate, ref);
-    auto [it, inserted] = selected.emplace(parent, ref);
-    if (!inserted && it->second != ref) {
-      throw std::runtime_error(
-          "fixed_topology_exact selected-topology cache: conflicting "
-          "before-topology production choices for one clade");
-    }
-  }
-  validate_chart_spr_selected_overlay_topology_complete(
-      base, candidate, selected,
-      "fixed_topology_exact selected-topology cache before");
-  return selected;
 }
 
 struct chart_spr_selected_topology_node {
@@ -2896,6 +2876,7 @@ chart_spr_search_result run_chart_spr_search(
       state.estimated_full_pattern_cache_bytes;
   result.summary.chart_cache_resident_bytes =
       state.resident_pattern_cache_bytes;
+  result.summary.cache_strategy = state.cache_strategy;
   result.summary.effective_pattern_batch_size =
       state.effective_pattern_batch_size;
   result.summary.local_score_worker_count =
@@ -3266,6 +3247,7 @@ chart_spr_search_result run_chart_spr_search(
       state.estimated_full_pattern_cache_bytes;
   result.summary.chart_cache_resident_bytes =
       state.resident_pattern_cache_bytes;
+  result.summary.cache_strategy = state.cache_strategy;
   result.summary.effective_pattern_batch_size =
       state.effective_pattern_batch_size;
   result.summary.total_ms = chart_spr_elapsed_ms(
