@@ -1344,9 +1344,24 @@ static void test_exact_verification_reuses_state_old_score() {
       fixture.dag, fixture.grammar, options);
   CHECK(state.exact_trim_active_only.has_value());
 
+  auto lazy_options = options;
+  lazy_options.cache.use_lazy_multisite_chart = true;
+  auto lazy_state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, lazy_options);
+  CHECK(lazy_state.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  CHECK(lazy_state.exact_trim_active_only.has_value());
+  CHECK(lazy_state.exact_trim_active_only->lazy_chart_used);
+  CHECK(lazy_state.exact_trim_active_only->optimum ==
+        state.exact_trim_active_only->optimum);
+
   auto local = larch::score_candidate_locally(state, fixture.candidates.front());
   auto exact = larch::verify_candidate_exact_against_state(
       state, local, options.exact_trim);
+  auto lazy_local = larch::score_candidate_locally(
+      lazy_state, fixture.candidates.front());
+  auto lazy_exact = larch::verify_candidate_exact_against_state(
+      lazy_state, lazy_local, lazy_options.exact_trim);
   auto oracle = larch::score_multisite_spr_candidate_exact_oracle(
       fixture.grammar, fixture.patterns, fixture.candidates.front());
 
@@ -1355,6 +1370,15 @@ static void test_exact_verification_reuses_state_old_score() {
   CHECK(exact.exact->kind == larch::chart_spr_score_kind::grammar_exact);
   CHECK(exact.exact->convention ==
         larch::chart_spr_score_convention::full_with_invariants);
+  CHECK(lazy_exact.valid);
+  CHECK(lazy_exact.exact.has_value());
+  CHECK(lazy_exact.exact->kind ==
+        larch::chart_spr_score_kind::grammar_exact);
+  CHECK(lazy_exact.exact->convention ==
+        larch::chart_spr_score_convention::full_with_invariants);
+  CHECK(lazy_exact.exact->value.old_score == exact.exact->value.old_score);
+  CHECK(lazy_exact.exact->value.new_score == exact.exact->value.new_score);
+  CHECK(lazy_exact.exact->value.delta == exact.exact->value.delta);
   CHECK(exact.exact->value.old_score == oracle.old_score);
   CHECK(exact.exact->value.new_score == oracle.new_score);
   CHECK(exact.exact->value.delta == oracle.delta);

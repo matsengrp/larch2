@@ -2291,9 +2291,14 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
         ensure_chart_spr_state_exact_trim(state, trim_options);
 
     // New score: B&B exact optimum of the extended grammar.
-    auto new_trim = build_multisite_trim_active(
-        ext.materialized.grammar, state.active_patterns, state.chart_opts,
-        trim_options);
+    auto new_trim =
+        state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart
+            ? build_lazy_multisite_trim_active_from_scratch(
+                  ext.materialized.grammar, state.active_patterns,
+                  state.chart_opts, trim_options)
+            : build_multisite_trim_active(ext.materialized.grammar,
+                                          state.active_patterns,
+                                          state.chart_opts, trim_options);
 
     // Optional corruption hook: perturb a scratch outside row so the two-chart
     // oracle catches the disagreement and the verifier falls back to the cold

@@ -851,6 +851,13 @@ struct multisite_trim_result {
   std::size_t equality_deduplicated = 0;
   std::size_t active_pattern_count = 0;
   std::uint64_t invariant_constant_offset = 0;
+  bool lazy_chart_used = false;
+  std::size_t lazy_inside_rows_computed = 0;
+  std::size_t lazy_outside_rows_computed = 0;
+  std::size_t lazy_patterns_merged_max = 0;
+  std::size_t lazy_remerge_collisions = 0;
+  std::size_t lazy_structural_class_count_max = 0;
+  std::vector<std::size_t> lazy_structural_class_count_by_clade;
 };
 
 struct multisite_topology_trace_options {
@@ -2249,12 +2256,9 @@ struct multisite_frontier_build_result {
   std::size_t active_pattern_count = 0;
 };
 
-inline multisite_frontier_build_result build_multisite_frontiers(
-    clade_grammar const& grammar, site_pattern_set const& patterns,
-    chart_options const& options,
+inline void validate_multisite_frontier_build_options(
     multisite_frontier_build_options const& build_options,
     std::string const& context) {
-  validate_multisite_inputs(grammar, patterns, options);
   if (build_options.keep_provenance &&
       build_options.dominance_mode == multisite_dominance_mode::score_only) {
     throw std::runtime_error(
@@ -2270,16 +2274,24 @@ inline multisite_frontier_build_result build_multisite_frontiers(
         multisite_dominance_mode_name(build_options.dominance_mode) +
         "' is not implemented in frontier construction");
   }
+}
 
+inline multisite_frontier_build_result build_multisite_frontiers_from_active(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options,
+    multisite_frontier_build_options const& build_options,
+    std::string const& context,
+    std::vector<active_pattern_info> active_patterns,
+    std::uint64_t composite_lower_bound) {
+  validate_multisite_inputs(grammar, patterns, options);
+  validate_multisite_frontier_build_options(build_options, context);
   multisite_frontier_build_result result;
-  auto composite = build_composite_chart_score(grammar, patterns, options);
-  result.composite_lower_bound = composite.weighted_lower_bound;
+  result.composite_lower_bound = composite_lower_bound;
   result.frontier_sizes_by_clade.assign(grammar.clades.size(), 0);
   result.invariant_constant_offset =
       invariant_constant_offset(patterns, options);
 
-  result.active_patterns =
-      build_active_pattern_info(grammar, patterns, options);
+  result.active_patterns = std::move(active_patterns);
   result.active_pattern_count = result.active_patterns.size();
   result.initial_upper_bound =
       initial_upper_bound(grammar, patterns, result.active_patterns, options);
@@ -2393,6 +2405,18 @@ inline multisite_frontier_build_result build_multisite_frontiers(
   return result;
 }
 
+inline multisite_frontier_build_result build_multisite_frontiers(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options,
+    multisite_frontier_build_options const& build_options,
+    std::string const& context) {
+  auto composite = build_composite_chart_score(grammar, patterns, options);
+  auto active = build_active_pattern_info(grammar, patterns, options);
+  return build_multisite_frontiers_from_active(
+      grammar, patterns, options, build_options, context, std::move(active),
+      composite.weighted_lower_bound);
+}
+
 inline std::uint64_t compute_root_frontier_optimum_and_update_mask(
     clade_grammar const& grammar, chart_options const& options,
     multisite_frontier_build_result const& build, bool merge_exact_keep_mask,
@@ -2454,11 +2478,14 @@ inline multisite_bruteforce_result brute_force_multisite_topologies(
   return result;
 }
 
-inline multisite_trim_result build_multisite_trim(
+namespace chart_multisite_detail {
+
+template <class BuildFrontiers>
+inline multisite_trim_result build_multisite_trim_impl(
     clade_grammar const& grammar, site_pattern_set const& patterns,
-    chart_options const& options = {},
-    multisite_trim_options const& trim_options = {}) {
-  using namespace chart_multisite_detail;
+    chart_options const& options,
+    multisite_trim_options const& trim_options,
+    BuildFrontiers&& build_frontiers) {
   validate_multisite_inputs(grammar, patterns, options);
   validate_multisite_trim_options_supported(trim_options, "multi-site trim",
                                             true);
@@ -2493,9 +2520,8 @@ inline multisite_trim_result build_multisite_trim(
         trim_options.upper_bound_override;
     score_build_options.max_frontier_entries_per_clade =
         trim_options.max_frontier_entries_per_clade;
-    auto score_build = build_multisite_frontiers(grammar, patterns, options,
-                                                 score_build_options,
-                                                 "multi-site trim score pass");
+    auto score_build =
+        build_frontiers(score_build_options, "multi-site trim score pass");
 
     result.optimum = compute_root_frontier_optimum_and_update_mask(
         grammar, options, score_build, false, result.keep_production,
@@ -2513,9 +2539,8 @@ inline multisite_trim_result build_multisite_trim(
     mask_build_options.upper_bound_override = result.optimum;
     mask_build_options.max_frontier_entries_per_clade =
         trim_options.max_frontier_entries_per_clade;
-    auto mask_build = build_multisite_frontiers(
-        grammar, patterns, options, mask_build_options,
-        "multi-site trim exact mask recovery pass");
+    auto mask_build = build_frontiers(
+        mask_build_options, "multi-site trim exact mask recovery pass");
 
     auto recovered_optimum = compute_root_frontier_optimum_and_update_mask(
         grammar, options, mask_build, true, result.keep_production,
@@ -2551,8 +2576,7 @@ inline multisite_trim_result build_multisite_trim(
   build_options.upper_bound_override = trim_options.upper_bound_override;
   build_options.max_frontier_entries_per_clade =
       trim_options.max_frontier_entries_per_clade;
-  auto build = build_multisite_frontiers(grammar, patterns, options,
-                                         build_options, "multi-site trim");
+  auto build = build_frontiers(build_options, "multi-site trim");
 
   result.composite_lower_bound = build.composite_lower_bound;
   result.initial_upper_bound = build.initial_upper_bound;
@@ -2580,6 +2604,22 @@ inline multisite_trim_result build_multisite_trim(
   result.dominance_pruned =
       result.dominance_pruned_score_pass + result.dominance_pruned_mask_pass;
   return result;
+}
+
+}  // namespace chart_multisite_detail
+
+inline multisite_trim_result build_multisite_trim(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options = {},
+    multisite_trim_options const& trim_options = {}) {
+  return chart_multisite_detail::build_multisite_trim_impl(
+      grammar, patterns, options, trim_options,
+      [&](chart_multisite_detail::multisite_frontier_build_options const&
+              build_options,
+          std::string const& context) {
+        return chart_multisite_detail::build_multisite_frontiers(
+            grammar, patterns, options, build_options, context);
+      });
 }
 
 inline std::uint64_t score_selected_topology(

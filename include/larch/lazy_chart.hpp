@@ -1383,4 +1383,176 @@ inline lazy_multisite_chart build_lazy_outside_chart(
   return chart;
 }
 
+inline composite_chart_score build_composite_chart_score(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    lazy_multisite_chart const& chart, chart_options const& options = {}) {
+  return lazy_composite_chart_score(grammar, patterns, chart, options);
+}
+
+namespace lazy_chart_detail {
+
+inline lazy_multisite_chart prepare_lazy_chart_for_multisite_frontiers(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    lazy_multisite_chart const& source, chart_options const& options) {
+  validate_lazy_inside_score_inputs(grammar, patterns, source, options,
+                                    "lazy multi-site trim");
+  lazy_multisite_chart prepared = source;
+  materialize_inside_class_maps(prepared, grammar, patterns);
+  if (!options.score_ua_edge) {
+    build_lazy_outside_chart_in_place(grammar, patterns, prepared, options);
+  }
+  return prepared;
+}
+
+inline single_site_chart single_site_chart_from_lazy(
+    clade_grammar const& grammar, lazy_multisite_chart const& chart,
+    std::size_t pattern_index) {
+  single_site_chart result;
+  result.inside.assign(grammar.clades.size(),
+                       parsimony_chart_detail::make_inf_row());
+  for (clade_id clade = 0; clade < grammar.clades.size(); ++clade) {
+    result.inside[clade] = chart.inside_row(clade, pattern_index);
+  }
+  return result;
+}
+
+inline single_site_outside_chart single_site_outside_chart_from_lazy(
+    clade_grammar const& grammar, lazy_multisite_chart const& chart,
+    std::size_t pattern_index) {
+  single_site_outside_chart result;
+  result.outside.assign(grammar.clades.size(),
+                        parsimony_chart_detail::make_inf_row());
+  for (clade_id clade = 0; clade < grammar.clades.size(); ++clade) {
+    result.outside[clade] = chart.outside_row(clade, pattern_index);
+  }
+  result.global_min = chart.outside_global_min(pattern_index);
+  return result;
+}
+
+inline std::vector<chart_multisite_detail::active_pattern_info>
+build_active_pattern_info_from_lazy(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    lazy_multisite_chart const& prepared, chart_options const& options) {
+  chart_multisite_detail::validate_multisite_inputs(grammar, patterns,
+                                                    options);
+  std::vector<chart_multisite_detail::active_pattern_info> active;
+  std::array<lazy_multisite_chart, nuc_state_count> outside_by_reference;
+  std::array<bool, nuc_state_count> outside_reference_built{};
+  outside_reference_built.fill(false);
+
+  auto outside_for_reference = [&](std::uint8_t reference_state)
+      -> lazy_multisite_chart const& {
+    if (!outside_reference_built[reference_state]) {
+      outside_by_reference[reference_state] = prepared;
+      build_lazy_outside_chart_in_place(
+          grammar, patterns, outside_by_reference[reference_state], options,
+          reference_state);
+      outside_reference_built[reference_state] = true;
+    }
+    return outside_by_reference[reference_state];
+  };
+
+  for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+       ++pattern_index) {
+    auto const& pattern = patterns.patterns[pattern_index];
+    if (options.score_ua_edge) {
+      chart_multisite_detail::validate_pattern_reference_counts(pattern,
+                                                                pattern_index);
+    }
+    if (!chart_multisite_detail::is_active_pattern(pattern)) continue;
+
+    chart_multisite_detail::active_pattern_info info;
+    info.pattern_index = pattern_index;
+    info.weight = pattern.weight;
+    info.reference_state_counts = pattern.reference_state_counts;
+    info.state_by_taxon = pattern.state_by_taxon;
+    info.chart = single_site_chart_from_lazy(grammar, prepared, pattern_index);
+    if (options.score_ua_edge) {
+      for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+           ++reference_state) {
+        if (info.reference_state_counts[reference_state] == 0) continue;
+        info.outside_by_reference[reference_state] =
+            single_site_outside_chart_from_lazy(
+                grammar, outside_for_reference(reference_state),
+                pattern_index);
+      }
+    } else {
+      info.outside_ua_free =
+          single_site_outside_chart_from_lazy(grammar, prepared, pattern_index);
+    }
+    active.push_back(std::move(info));
+  }
+  return active;
+}
+
+inline std::size_t lazy_outside_rows_computed_for_trim_diagnostic(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    lazy_multisite_chart const& prepared, chart_options const& options) {
+  if (!options.score_ua_edge) return prepared.lazy_outside_rows_computed;
+
+  std::size_t total = 0;
+  for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+       ++reference_state) {
+    bool used = false;
+    for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+         ++pattern_index) {
+      auto const& pattern = patterns.patterns[pattern_index];
+      if (!chart_multisite_detail::is_active_pattern(pattern)) continue;
+      if (pattern.reference_state_counts[reference_state] != 0) {
+        used = true;
+        break;
+      }
+    }
+    if (!used) continue;
+    auto outside_chart = prepared;
+    build_lazy_outside_chart_in_place(grammar, patterns, outside_chart, options,
+                                      reference_state);
+    total += outside_chart.lazy_outside_rows_computed;
+  }
+  return total;
+}
+
+inline void copy_lazy_trim_diagnostics(multisite_trim_result& result,
+                                       lazy_multisite_chart const& chart,
+                                       std::size_t outside_rows_computed) {
+  result.lazy_chart_used = true;
+  result.lazy_inside_rows_computed = chart.lazy_inside_rows_computed;
+  result.lazy_outside_rows_computed = outside_rows_computed;
+  result.lazy_patterns_merged_max = chart.lazy_patterns_merged_max;
+  result.lazy_remerge_collisions = chart.lazy_remerge_collisions;
+  result.lazy_structural_class_count_max =
+      chart.lazy_structural_class_count_max;
+  result.lazy_structural_class_count_by_clade =
+      chart.structural_class_count_by_clade;
+}
+
+}  // namespace lazy_chart_detail
+
+inline multisite_trim_result build_multisite_trim(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    lazy_multisite_chart const& chart, chart_options const& options = {},
+    multisite_trim_options const& trim_options = {}) {
+  auto prepared = lazy_chart_detail::prepare_lazy_chart_for_multisite_frontiers(
+      grammar, patterns, chart, options);
+  auto composite =
+      lazy_composite_chart_score(grammar, patterns, prepared, options);
+  auto result = chart_multisite_detail::build_multisite_trim_impl(
+      grammar, patterns, options, trim_options,
+      [&](chart_multisite_detail::multisite_frontier_build_options const&
+              build_options,
+          std::string const& context) {
+        auto active = lazy_chart_detail::build_active_pattern_info_from_lazy(
+            grammar, patterns, prepared, options);
+        return chart_multisite_detail::build_multisite_frontiers_from_active(
+            grammar, patterns, options, build_options, context,
+            std::move(active), composite.weighted_lower_bound);
+      });
+  auto outside_rows_computed =
+      lazy_chart_detail::lazy_outside_rows_computed_for_trim_diagnostic(
+          grammar, patterns, prepared, options);
+  lazy_chart_detail::copy_lazy_trim_diagnostics(result, prepared,
+                                                outside_rows_computed);
+  return result;
+}
+
 }  // namespace larch

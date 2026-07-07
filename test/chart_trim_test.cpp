@@ -1,5 +1,6 @@
 #include <larch/chart_trim.hpp>
 #include <larch/clade_grammar.hpp>
+#include <larch/lazy_chart.hpp>
 #include <larch/parsimony_chart.hpp>
 
 #include "test_util.hpp"
@@ -766,6 +767,212 @@ static void test_multisite_composite_counterexample() {
   std::println("  PASS");
 }
 
+static void test_lazy_multisite_bnb_feeding_matches_dense() {
+  std::println("test_lazy_multisite_bnb_feeding_matches_dense");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", paper_tree1_spec()));
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", paper_tree2_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto patterns = larch::build_site_patterns(merged, grammar);
+  auto lazy = larch::build_lazy_inside_chart(grammar, patterns);
+  larch::lazy_chart_options retained_options;
+  retained_options.retain_all_inside_class_maps = true;
+  auto retained_lazy =
+      larch::build_lazy_inside_chart(grammar, patterns, retained_options);
+
+  auto dense_composite = larch::build_composite_chart_score(grammar, patterns);
+  auto lazy_composite =
+      larch::build_composite_chart_score(grammar, patterns, lazy);
+  CHECK(lazy_composite.weighted_lower_bound ==
+        dense_composite.weighted_lower_bound);
+  CHECK(lazy_composite.per_pattern_root_min ==
+        dense_composite.per_pattern_root_min);
+  CHECK(lazy_composite.per_pattern_root_min_by_reference_state ==
+        dense_composite.per_pattern_root_min_by_reference_state);
+
+  auto check_trim = [&](larch::multisite_trim_options const& options) {
+    auto dense_trim = larch::build_multisite_trim(grammar, patterns, {},
+                                                  options);
+    auto lazy_trim = larch::build_multisite_trim(grammar, patterns, lazy, {},
+                                                 options);
+    CHECK(lazy_trim.lazy_chart_used);
+    CHECK(lazy_trim.optimum == dense_trim.optimum);
+    CHECK(lazy_trim.composite_lower_bound ==
+          dense_trim.composite_lower_bound);
+    CHECK(lazy_trim.initial_upper_bound == dense_trim.initial_upper_bound);
+    CHECK(lazy_trim.keep_production == dense_trim.keep_production);
+    CHECK(lazy_trim.frontier_sizes_by_clade ==
+          dense_trim.frontier_sizes_by_clade);
+    CHECK(lazy_trim.dominance_candidates_considered ==
+          dense_trim.dominance_candidates_considered);
+    CHECK(lazy_trim.dominance_pruned == dense_trim.dominance_pruned);
+    CHECK(lazy_trim.dominance_pruned_score_pass ==
+          dense_trim.dominance_pruned_score_pass);
+    CHECK(lazy_trim.dominance_pruned_mask_pass ==
+          dense_trim.dominance_pruned_mask_pass);
+    CHECK(lazy_trim.bound_pruned == dense_trim.bound_pruned);
+    CHECK(lazy_trim.equality_deduplicated ==
+          dense_trim.equality_deduplicated);
+    CHECK(lazy_trim.exact_mask_recovery_passes ==
+          dense_trim.exact_mask_recovery_passes);
+    CHECK(lazy_trim.active_pattern_count == dense_trim.active_pattern_count);
+    CHECK(lazy_trim.lazy_inside_rows_computed > 0);
+    CHECK(lazy_trim.lazy_outside_rows_computed > 0);
+    CHECK(lazy_trim.lazy_structural_class_count_max <=
+          patterns.patterns.size());
+    CHECK(lazy_trim.lazy_structural_class_count_by_clade ==
+          retained_lazy.structural_class_count_by_clade);
+    CHECK(lazy_trim.lazy_structural_class_count_by_clade.size() ==
+          grammar.clades.size());
+    for (auto count : lazy_trim.lazy_structural_class_count_by_clade) {
+      CHECK(count <= patterns.patterns.size());
+    }
+  };
+
+  check_trim({});
+
+  larch::multisite_trim_options score_only;
+  score_only.dominance_mode = larch::multisite_dominance_mode::score_only;
+  score_only.require_exact_keep_mask = false;
+  check_trim(score_only);
+
+  larch::multisite_trim_options strict;
+  strict.dominance_mode =
+      larch::multisite_dominance_mode::strict_mask_safe;
+  check_trim(strict);
+
+  larch::multisite_trim_options two_pass;
+  two_pass.dominance_mode =
+      larch::multisite_dominance_mode::two_pass_exact_mask;
+  check_trim(two_pass);
+
+  std::println("  PASS");
+}
+
+static larch::site_pattern_set make_pandemic_ratio_patterns(
+    larch::clade_grammar const& grammar) {
+  auto const group_configs = std::array<std::array<std::uint8_t, 4>, 10>{{
+      {larch::nuc_base::C, larch::nuc_base::A, larch::nuc_base::A,
+       larch::nuc_base::A},
+      {larch::nuc_base::A, larch::nuc_base::C, larch::nuc_base::A,
+       larch::nuc_base::A},
+      {larch::nuc_base::A, larch::nuc_base::A, larch::nuc_base::C,
+       larch::nuc_base::A},
+      {larch::nuc_base::A, larch::nuc_base::A, larch::nuc_base::A,
+       larch::nuc_base::C},
+      {larch::nuc_base::C, larch::nuc_base::C, larch::nuc_base::A,
+       larch::nuc_base::A},
+      {larch::nuc_base::C, larch::nuc_base::A, larch::nuc_base::C,
+       larch::nuc_base::A},
+      {larch::nuc_base::C, larch::nuc_base::A, larch::nuc_base::A,
+       larch::nuc_base::C},
+      {larch::nuc_base::A, larch::nuc_base::C, larch::nuc_base::C,
+       larch::nuc_base::A},
+      {larch::nuc_base::A, larch::nuc_base::C, larch::nuc_base::A,
+       larch::nuc_base::C},
+      {larch::nuc_base::A, larch::nuc_base::A, larch::nuc_base::C,
+       larch::nuc_base::C},
+  }};
+  auto const left_taxa =
+      std::array<larch::taxon_id, 4>{taxon_for(grammar, "L0"),
+                                     taxon_for(grammar, "L1"),
+                                     taxon_for(grammar, "L2"),
+                                     taxon_for(grammar, "L3")};
+  auto const right_taxa =
+      std::array<larch::taxon_id, 4>{taxon_for(grammar, "R0"),
+                                     taxon_for(grammar, "R1"),
+                                     taxon_for(grammar, "R2"),
+                                     taxon_for(grammar, "R3")};
+
+  auto apply_group = [](std::vector<std::uint8_t>& states,
+                        std::array<larch::taxon_id, 4> const& taxa,
+                        std::array<std::uint8_t, 4> const& config) {
+    for (std::size_t i = 0; i < taxa.size(); ++i) {
+      states[taxa[i]] = config[i];
+    }
+  };
+
+  larch::site_pattern_set patterns;
+  patterns.taxon_count = grammar.taxa.id_to_sample_id.size();
+  patterns.patterns.reserve(group_configs.size() * group_configs.size());
+  patterns.original_site_to_pattern.reserve(group_configs.size() *
+                                            group_configs.size());
+  for (auto const& left : group_configs) {
+    for (auto const& right : group_configs) {
+      auto states =
+          std::vector<std::uint8_t>(patterns.taxon_count, larch::nuc_base::A);
+      apply_group(states, left_taxa, left);
+      apply_group(states, right_taxa, right);
+
+      larch::site_pattern pattern;
+      pattern.state_by_taxon = std::move(states);
+      pattern.weight = 1;
+      pattern.reference_state_counts[larch::nuc_base::A] = 1;
+      patterns.patterns.push_back(std::move(pattern));
+      patterns.original_site_to_pattern.push_back(patterns.patterns.size() - 1);
+    }
+  }
+  patterns.total_site_count = patterns.patterns.size();
+  patterns.variable_site_count = patterns.patterns.size();
+  patterns.binary_variable_site_count = patterns.patterns.size();
+  patterns.exact_pattern_to_normalized_binary_pattern.assign(
+      patterns.patterns.size(), larch::no_site_pattern);
+  patterns.exact_pattern_to_normalized_binary_state_map.assign(
+      patterns.patterns.size(), larch::normalized_binary_state_map{});
+  return patterns;
+}
+
+static void test_lazy_structural_pandemic_ratio_on_binary_tree() {
+  std::println("test_lazy_structural_pandemic_ratio_on_binary_tree");
+
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  auto tree = tiny_inner(
+      "root", "A",
+      {tiny_inner("left", "A",
+                  {tiny_inner("L01", "A",
+                              {tiny_leaf("L0", "A"), tiny_leaf("L1", "A")}),
+                   tiny_inner("L23", "A",
+                              {tiny_leaf("L2", "A"), tiny_leaf("L3", "A")})}),
+       tiny_inner("right", "A",
+                  {tiny_inner("R01", "A",
+                              {tiny_leaf("R0", "A"), tiny_leaf("R1", "A")}),
+                   tiny_inner("R23", "A",
+                              {tiny_leaf("R2", "A"), tiny_leaf("R3", "A")})})});
+  auto dag = larch::test::make_tiny_labelled_tree("A", tree);
+  auto grammar = larch::build_clade_grammar(dag);
+  auto patterns = make_pandemic_ratio_patterns(grammar);
+  CHECK(patterns.patterns.size() == 100);
+
+  auto dense_trim = larch::build_multisite_trim(grammar, patterns);
+  auto lazy = larch::build_lazy_inside_chart(grammar, patterns);
+  auto lazy_trim = larch::build_multisite_trim(grammar, patterns, lazy);
+
+  CHECK(lazy_trim.lazy_chart_used);
+  CHECK(lazy_trim.optimum == dense_trim.optimum);
+  CHECK(lazy_trim.keep_production == dense_trim.keep_production);
+  CHECK(lazy_trim.lazy_structural_class_count_by_clade ==
+        lazy.structural_class_count_by_clade);
+
+  std::size_t nonroot_internal_max = 0;
+  for (larch::clade_id clade = 0; clade < grammar.clades.size(); ++clade) {
+    auto const taxon_count = grammar.clades[clade].taxa.size();
+    if (clade == grammar.root_clade || taxon_count <= 1) continue;
+    nonroot_internal_max = std::max(
+        nonroot_internal_max,
+        lazy_trim.lazy_structural_class_count_by_clade[clade]);
+  }
+  CHECK(nonroot_internal_max > 0);
+  CHECK(nonroot_internal_max * 10 <= patterns.patterns.size());
+  CHECK(lazy_trim.lazy_structural_class_count_max == patterns.patterns.size());
+
+  std::println("  PASS");
+}
+
 static void test_multisite_phase0_diagnostics_and_exactness_labels() {
   std::println("test_multisite_phase0_diagnostics_and_exactness_labels");
 
@@ -1417,7 +1624,14 @@ static void test_composite_reference_state_diagnostics() {
   with_reference_edge.score_ua_edge = true;
   auto composite = larch::build_composite_chart_score(grammar, patterns,
                                                       with_reference_edge);
+  auto lazy = larch::build_lazy_inside_chart(grammar, patterns);
+  auto lazy_composite = larch::build_composite_chart_score(
+      grammar, patterns, lazy, with_reference_edge);
   CHECK(composite.weighted_lower_bound == 3);
+  CHECK(lazy_composite.weighted_lower_bound == composite.weighted_lower_bound);
+  CHECK(lazy_composite.per_pattern_root_min == composite.per_pattern_root_min);
+  CHECK(lazy_composite.per_pattern_root_min_by_reference_state ==
+        composite.per_pattern_root_min_by_reference_state);
   CHECK(composite.per_pattern_root_min.size() == 1);
   CHECK(composite.per_pattern_root_min.front() == 1);
   CHECK(composite.per_pattern_root_min_by_reference_state.size() == 1);
@@ -1427,6 +1641,18 @@ static void test_composite_reference_state_diagnostics() {
   CHECK(by_reference[larch::nuc_base::G] == 2);
   CHECK(by_reference[larch::nuc_base::C] == larch::chart_inf);
   CHECK(by_reference[larch::nuc_base::T] == larch::chart_inf);
+
+  auto dense_trim = larch::build_multisite_trim(grammar, patterns,
+                                                with_reference_edge);
+  auto lazy_trim = larch::build_multisite_trim(grammar, patterns, lazy,
+                                               with_reference_edge);
+  CHECK(lazy_trim.lazy_chart_used);
+  CHECK(lazy_trim.lazy_outside_rows_computed > 0);
+  CHECK(lazy_trim.optimum == dense_trim.optimum);
+  CHECK(lazy_trim.composite_lower_bound == dense_trim.composite_lower_bound);
+  CHECK(lazy_trim.keep_production == dense_trim.keep_production);
+  CHECK(lazy_trim.frontier_sizes_by_clade ==
+        dense_trim.frontier_sizes_by_clade);
 
   std::println("  PASS");
 }
@@ -1737,6 +1963,8 @@ int main() {
   test_single_tree_keeps_all_productions();
   test_reference_edge_outside_boundary();
   test_multisite_composite_counterexample();
+  test_lazy_multisite_bnb_feeding_matches_dense();
+  test_lazy_structural_pandemic_ratio_on_binary_tree();
   test_multisite_phase0_diagnostics_and_exactness_labels();
   test_multisite_coupled_frontier_annotation_exact();
   test_multisite_strict_mask_safe_dominance_matches_bruteforce();

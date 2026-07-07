@@ -1237,6 +1237,30 @@ inline multisite_trim_result build_multisite_trim_active(
                               trim_options);
 }
 
+inline multisite_trim_result build_multisite_trim_active(
+    clade_grammar const& grammar, active_site_pattern_set const& patterns,
+    lazy_multisite_chart const& lazy_chart, chart_options const& options = {},
+    multisite_trim_options const& trim_options = {}) {
+  patterns.assert_no_skipped_invariant_metadata();
+  return build_multisite_trim(grammar, patterns.patterns, lazy_chart, options,
+                              trim_options);
+}
+
+inline multisite_trim_result build_lazy_multisite_trim_active_from_scratch(
+    clade_grammar const& grammar, active_site_pattern_set const& patterns,
+    chart_options const& options = {},
+    multisite_trim_options const& trim_options = {}) {
+  patterns.assert_no_skipped_invariant_metadata();
+  lazy_chart_options lazy_options;
+  lazy_options.chart = options;
+  lazy_options.chart.keep_trace = false;
+  lazy_options.chart.max_trace_choices = 0;
+  auto lazy_chart =
+      build_lazy_inside_chart(grammar, patterns.patterns, lazy_options);
+  return build_multisite_trim_active(grammar, patterns, lazy_chart, options,
+                                     trim_options);
+}
+
 inline std::size_t estimate_chart_spr_pattern_row_cache_bytes(
     clade_grammar const& grammar) {
   return grammar.clades.size() * nuc_state_count * sizeof(chart_cost);
@@ -1501,8 +1525,20 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
           "chart-SPR cached lower bound invariant offset");
 
   if (build_exact_trim) {
-    state.exact_trim_active_only = build_multisite_trim_active(
-        state.grammar, state.active_patterns, options, trim_options);
+    if (state.cache_strategy ==
+        chart_spr_cache_strategy::lazy_multisite_chart) {
+      if (!state.lazy_chart) {
+        throw std::runtime_error(
+            "chart SPR search state: lazy exact trim requested without lazy "
+            "chart");
+      }
+      state.exact_trim_active_only = build_multisite_trim_active(
+          state.grammar, state.active_patterns, *state.lazy_chart, options,
+          trim_options);
+    } else {
+      state.exact_trim_active_only = build_multisite_trim_active(
+          state.grammar, state.active_patterns, options, trim_options);
+    }
   }
   return state;
 }
@@ -3196,9 +3232,20 @@ inline multisite_trim_result const& ensure_chart_spr_state_exact_trim(
     multisite_trim_options const& trim_options = {}) {
   state.active_patterns.assert_no_skipped_invariant_metadata();
   if (!state.exact_trim_active_only) {
-    state.exact_trim_active_only = build_multisite_trim_active(
-        state.grammar, state.active_patterns, state.chart_opts,
-        trim_options);
+    if (state.cache_strategy ==
+        chart_spr_cache_strategy::lazy_multisite_chart) {
+      if (!state.lazy_chart) {
+        throw std::runtime_error(
+            "chart SPR exact trim: lazy cache strategy without lazy chart");
+      }
+      state.exact_trim_active_only = build_multisite_trim_active(
+          state.grammar, state.active_patterns, *state.lazy_chart,
+          state.chart_opts, trim_options);
+    } else {
+      state.exact_trim_active_only = build_multisite_trim_active(
+          state.grammar, state.active_patterns, state.chart_opts,
+          trim_options);
+    }
   }
   return *state.exact_trim_active_only;
 }
@@ -3232,9 +3279,14 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state(
     ++state.counters.full_overlay_materializations;
     ++state.counters.overlay_materializations_for_exact_verification;
 
-    auto new_trim = build_multisite_trim_active(
-        materialized.grammar, state.active_patterns, state.chart_opts,
-        trim_options);
+    auto new_trim =
+        state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart
+            ? build_lazy_multisite_trim_active_from_scratch(
+                  materialized.grammar, state.active_patterns,
+                  state.chart_opts, trim_options)
+            : build_multisite_trim_active(materialized.grammar,
+                                          state.active_patterns,
+                                          state.chart_opts, trim_options);
 
     auto old_full = chart_spr_add_invariant_offset(
         old_trim.optimum, state,
