@@ -107,6 +107,18 @@ void chart_spr_add_search_state_rebuild_counters(
       rebuild_counters.multifurcation_productions_scored;
   accumulated.pattern_batch_cache_builds +=
       rebuild_counters.pattern_batch_cache_builds;
+  accumulated.lazy_inside_rows_computed +=
+      rebuild_counters.lazy_inside_rows_computed;
+  accumulated.lazy_outside_rows_computed +=
+      rebuild_counters.lazy_outside_rows_computed;
+  accumulated.lazy_patterns_merged_max = std::max(
+      accumulated.lazy_patterns_merged_max,
+      rebuild_counters.lazy_patterns_merged_max);
+  accumulated.lazy_remerge_collisions +=
+      rebuild_counters.lazy_remerge_collisions;
+  accumulated.lazy_structural_class_count_max = std::max(
+      accumulated.lazy_structural_class_count_max,
+      rebuild_counters.lazy_structural_class_count_max);
   if (update_current_skipped_invariant_sites) {
     accumulated.skipped_invariant_sites =
         rebuild_counters.skipped_invariant_sites;
@@ -1037,6 +1049,8 @@ chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
     }
     ++state.counters.fixed_topology_selected_cache_misses;
     state.counters.fixed_topology_selected_rows_computed +=
+        entry.rows_by_pattern.size();
+    state.counters.selected_topology_class_rows_computed +=
         entry.rows_by_pattern.size();
     if (multifurcation_row) {
       state.counters.selected_topology_multifurcation_rows +=
@@ -2957,6 +2971,8 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
         lazy_stats.inside_rows_recomputed;
     counters.lazy_outside_rows_recomputed_on_commit +=
         lazy_stats.outside_rows_recomputed;
+    counters.lazy_incremental_rows_recomputed +=
+        lazy_stats.inside_rows_recomputed + lazy_stats.outside_rows_recomputed;
     auto cache_multifurcation_productions_scored =
         sub.icache->multifurcation_productions_scored +
         sub.ocache->multifurcation_productions_scored;
@@ -3022,10 +3038,18 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.inside_rows_recomputed_on_commit;
   summary.outside_rows_recomputed_on_commit =
       counters.outside_rows_recomputed_on_commit;
+  summary.lazy_inside_rows_computed = counters.lazy_inside_rows_computed;
+  summary.lazy_outside_rows_computed = counters.lazy_outside_rows_computed;
+  summary.lazy_patterns_merged_max = counters.lazy_patterns_merged_max;
+  summary.lazy_remerge_collisions = counters.lazy_remerge_collisions;
   summary.lazy_inside_rows_recomputed_on_commit =
       counters.lazy_inside_rows_recomputed_on_commit;
   summary.lazy_outside_rows_recomputed_on_commit =
       counters.lazy_outside_rows_recomputed_on_commit;
+  summary.lazy_incremental_rows_recomputed =
+      counters.lazy_incremental_rows_recomputed;
+  summary.lazy_structural_class_count_max =
+      counters.lazy_structural_class_count_max;
   summary.local_commit_two_chart_oracle_runs =
       counters.local_commit_two_chart_oracle_runs;
   summary.local_commit_tip_grammar_refreshes =
@@ -3036,6 +3060,8 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.fixed_topology_selected_cache_misses;
   summary.fixed_topology_selected_rows_computed =
       counters.fixed_topology_selected_rows_computed;
+  summary.selected_topology_class_rows_computed =
+      counters.selected_topology_class_rows_computed;
   summary.selected_topology_multifurcation_rows =
       counters.selected_topology_multifurcation_rows;
   summary.spr_multifurcation_moves_generated =
@@ -3063,6 +3089,53 @@ void chart_spr_refresh_search_summary_from_counters(
   summary.full_search_state_rebuilds =
       summary.initial_search_state_rebuilds +
       summary.sidecar_rebuilds_after_accept;
+}
+
+void chart_spr_refresh_search_summary_from_current_lazy_chart(
+    chart_spr_search_summary& summary, chart_spr_search_state const& state) {
+  auto pattern_count = state.active_patterns.patterns.patterns.size();
+  auto clade_count = state.grammar.clades.size();
+  summary.lazy_merge_ratio = 0.0;
+  summary.lazy_internal_structural_class_ratio = 0.0;
+  summary.lazy_internal_structural_class_count_max = 0;
+  if (state.cache_strategy != chart_spr_cache_strategy::lazy_multisite_chart ||
+      !state.lazy_chart) {
+    summary.lazy_inside_rows_computed = 0;
+    summary.lazy_outside_rows_computed = 0;
+    summary.lazy_patterns_merged_max = 0;
+    summary.lazy_remerge_collisions = 0;
+    summary.lazy_structural_class_count_max = 0;
+    return;
+  }
+
+  auto const& lazy = *state.lazy_chart;
+  summary.lazy_inside_rows_computed = lazy.lazy_inside_rows_computed;
+  summary.lazy_outside_rows_computed = lazy.lazy_outside_rows_computed;
+  summary.lazy_patterns_merged_max = lazy.lazy_patterns_merged_max;
+  summary.lazy_remerge_collisions = lazy.lazy_remerge_collisions;
+  summary.lazy_structural_class_count_max =
+      lazy.lazy_structural_class_count_max;
+  for (std::size_t clade = 0;
+       clade < lazy.structural_class_count_by_clade.size() &&
+       clade < state.grammar.clades.size();
+       ++clade) {
+    auto taxon_count = state.grammar.clades[clade].taxa.size();
+    if (clade == state.grammar.root_clade || taxon_count <= 1) continue;
+    summary.lazy_internal_structural_class_count_max =
+        std::max(summary.lazy_internal_structural_class_count_max,
+                 lazy.structural_class_count_by_clade[clade]);
+  }
+  auto denominator =
+      static_cast<double>(pattern_count) * static_cast<double>(clade_count);
+  if (denominator != 0.0) {
+    summary.lazy_merge_ratio =
+        static_cast<double>(summary.lazy_inside_rows_computed) / denominator;
+  }
+  if (pattern_count != 0) {
+    summary.lazy_internal_structural_class_ratio =
+        static_cast<double>(summary.lazy_internal_structural_class_count_max) /
+        static_cast<double>(pattern_count);
+  }
 }
 
 }  // namespace
@@ -3171,6 +3244,8 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.local_score_worker_count =
       chart_spr_search_detail::normalize_chart_spr_worker_count(
           options.local_score_worker_count);
+  chart_spr_refresh_search_summary_from_current_lazy_chart(result.summary,
+                                                          state);
   std::vector<std::size_t> aggregate_affected_counts;
   std::optional<chart_spr_candidate_score> last_local_update_accepted;
   std::optional<chart_spr_recorded_chain_objective>
@@ -3543,6 +3618,8 @@ chart_spr_search_result run_chart_spr_search(
       total_start, std::chrono::steady_clock::now());
   result.summary.effective_candidate_batch_size =
       state.effective_candidate_batch_size;
+  chart_spr_refresh_search_summary_from_current_lazy_chart(result.summary,
+                                                          state);
   if (result.summary.local_scoring_ms > 0.0) {
     auto seconds = result.summary.local_scoring_ms / 1000.0;
     result.summary.local_candidates_per_second =

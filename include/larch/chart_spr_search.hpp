@@ -121,8 +121,14 @@ struct chart_spr_search_counters {
   // Lazy local-commit recomputations count class rows, not dense
   // (pattern, clade) rows.  They are kept separate so a lazy run can report
   // the affected persistent-cache rows and the smaller lazy work surface.
+  std::size_t lazy_inside_rows_computed = 0;
+  std::size_t lazy_outside_rows_computed = 0;
+  std::size_t lazy_patterns_merged_max = 0;
+  std::size_t lazy_remerge_collisions = 0;
   std::size_t lazy_inside_rows_recomputed_on_commit = 0;
   std::size_t lazy_outside_rows_recomputed_on_commit = 0;
+  std::size_t lazy_incremental_rows_recomputed = 0;
+  std::size_t lazy_structural_class_count_max = 0;
   // Number of times the Phase-4 self-check two-chart oracle ran after a local
   // commit (only when verify_local_commit_two_chart_oracle_for_tests is set).
   std::size_t local_commit_two_chart_oracle_runs = 0;
@@ -142,6 +148,7 @@ struct chart_spr_search_counters {
   std::size_t fixed_topology_selected_cache_hits = 0;
   std::size_t fixed_topology_selected_cache_misses = 0;
   std::size_t fixed_topology_selected_rows_computed = 0;
+  std::size_t selected_topology_class_rows_computed = 0;
   std::size_t selected_topology_multifurcation_rows = 0;
   // Persistent-cache fixed_topology_exact verifier diagnostics.  A nonzero
   // fallback count means the production path could not serve the selected
@@ -753,13 +760,23 @@ struct chart_spr_search_summary {
   std::size_t local_commit_tombstone_scope_skips = 0;
   std::size_t inside_rows_recomputed_on_commit = 0;
   std::size_t outside_rows_recomputed_on_commit = 0;
+  std::size_t lazy_inside_rows_computed = 0;
+  std::size_t lazy_outside_rows_computed = 0;
+  std::size_t lazy_patterns_merged_max = 0;
+  std::size_t lazy_remerge_collisions = 0;
   std::size_t lazy_inside_rows_recomputed_on_commit = 0;
   std::size_t lazy_outside_rows_recomputed_on_commit = 0;
+  std::size_t lazy_incremental_rows_recomputed = 0;
+  std::size_t lazy_structural_class_count_max = 0;
+  std::size_t lazy_internal_structural_class_count_max = 0;
+  double lazy_merge_ratio = 0.0;
+  double lazy_internal_structural_class_ratio = 0.0;
   std::size_t local_commit_two_chart_oracle_runs = 0;
   std::size_t local_commit_tip_grammar_refreshes = 0;
   std::size_t fixed_topology_selected_cache_hits = 0;
   std::size_t fixed_topology_selected_cache_misses = 0;
   std::size_t fixed_topology_selected_rows_computed = 0;
+  std::size_t selected_topology_class_rows_computed = 0;
   std::size_t selected_topology_multifurcation_rows = 0;
   std::size_t spr_multifurcation_moves_generated = 0;
   std::size_t fixed_topology_persistent_cache_verifications = 0;
@@ -1411,6 +1428,19 @@ inline std::size_t estimate_chart_spr_pattern_cache_bytes(
   return total;
 }
 
+inline void add_lazy_chart_build_counters(chart_spr_search_counters& counters,
+                                          lazy_multisite_chart const& chart) {
+  counters.lazy_inside_rows_computed += chart.lazy_inside_rows_computed;
+  counters.lazy_outside_rows_computed += chart.lazy_outside_rows_computed;
+  counters.lazy_patterns_merged_max =
+      std::max(counters.lazy_patterns_merged_max,
+               chart.lazy_patterns_merged_max);
+  counters.lazy_remerge_collisions += chart.lazy_remerge_collisions;
+  counters.lazy_structural_class_count_max =
+      std::max(counters.lazy_structural_class_count_max,
+               chart.lazy_structural_class_count_max);
+}
+
 inline std::size_t estimate_chart_spr_full_pattern_cache_bytes(
     chart_spr_search_state const& state) {
   return estimate_chart_spr_full_pattern_cache_bytes(state.grammar,
@@ -1494,6 +1524,7 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     state.counters.multifurcation_productions_scored +=
         state.lazy_chart->multifurcation_productions_scored +
         state.lazy_chart->outside_multifurcation_productions_scored;
+    add_lazy_chart_build_counters(state.counters, *state.lazy_chart);
     state.resident_pattern_cache_bytes =
         estimate_chart_spr_pattern_cache_bytes(state);
   } else {
@@ -2475,6 +2506,16 @@ inline void add_chart_spr_search_counters(
       src.lazy_inside_rows_recomputed_on_commit;
   dst.lazy_outside_rows_recomputed_on_commit +=
       src.lazy_outside_rows_recomputed_on_commit;
+  dst.lazy_incremental_rows_recomputed +=
+      src.lazy_incremental_rows_recomputed;
+  dst.lazy_inside_rows_computed += src.lazy_inside_rows_computed;
+  dst.lazy_outside_rows_computed += src.lazy_outside_rows_computed;
+  dst.lazy_patterns_merged_max =
+      std::max(dst.lazy_patterns_merged_max, src.lazy_patterns_merged_max);
+  dst.lazy_remerge_collisions += src.lazy_remerge_collisions;
+  dst.lazy_structural_class_count_max =
+      std::max(dst.lazy_structural_class_count_max,
+               src.lazy_structural_class_count_max);
   dst.local_commit_two_chart_oracle_runs +=
       src.local_commit_two_chart_oracle_runs;
   dst.local_commit_tip_grammar_refreshes +=
@@ -2485,6 +2526,8 @@ inline void add_chart_spr_search_counters(
       src.fixed_topology_selected_cache_misses;
   dst.fixed_topology_selected_rows_computed +=
       src.fixed_topology_selected_rows_computed;
+  dst.selected_topology_class_rows_computed +=
+      src.selected_topology_class_rows_computed;
   dst.selected_topology_multifurcation_rows +=
       src.selected_topology_multifurcation_rows;
   dst.fixed_topology_persistent_cache_verifications +=
@@ -4130,6 +4173,7 @@ chart_spr_lazy_selected_topology_rows_for_clade(
   }
 
   state.counters.fixed_topology_selected_rows_computed += entry.rows.size();
+  state.counters.selected_topology_class_rows_computed += entry.rows.size();
   memo_slot = std::move(entry);
   state_slot = 2;
   return *memo_slot;

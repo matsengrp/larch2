@@ -542,6 +542,7 @@ static void test_local_score_with_ua_edge_and_invariant_offset_matches_oracle() 
       larch::score_candidate_locally(lazy_state, candidates.front());
   CHECK(lazy_state.cache_strategy ==
         larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  CHECK(lazy_state.counters.lazy_inside_rows_computed > 0);
   CHECK(lazy_scored.valid);
   CHECK(lazy_scored.lower_bound.value.old_score == oracle.old_score);
   CHECK(lazy_scored.lower_bound.value.new_score == oracle.new_score);
@@ -1040,9 +1041,15 @@ static void test_lazy_cache_fixed_topology_conservative_search() {
   CHECK(search.counters.local_candidate_scores > 0);
   CHECK(search.counters.local_rows_recomputed > 0);
   CHECK(search.counters.fixed_topology_selected_rows_computed > 0);
+  CHECK(search.counters.selected_topology_class_rows_computed ==
+        search.counters.fixed_topology_selected_rows_computed);
   CHECK(search.counters.selected_topology_multifurcation_rows > 0);
   CHECK(search.counters.spr_multifurcation_moves_generated > 0);
   CHECK(search.counters.multifurcation_productions_scored > 0);
+  CHECK(search.summary.lazy_inside_rows_computed > 0);
+  CHECK(search.summary.lazy_merge_ratio > 0.0);
+  CHECK(search.summary.selected_topology_class_rows_computed ==
+        search.counters.selected_topology_class_rows_computed);
   CHECK(search.summary.final_score < search.summary.initial_score);
   auto rebuilt = larch::build_clade_grammar(search.dag, gopts);
   CHECK(max_production_arity(rebuilt) == 3);
@@ -1087,6 +1094,9 @@ static void test_lazy_cache_local_commit_updates_lazy_chart() {
   CHECK(search.counters.outside_rows_recomputed_on_commit > 0);
   CHECK(search.counters.lazy_inside_rows_recomputed_on_commit > 0);
   CHECK(search.counters.lazy_outside_rows_recomputed_on_commit > 0);
+  CHECK(search.counters.lazy_incremental_rows_recomputed ==
+        search.counters.lazy_inside_rows_recomputed_on_commit +
+            search.counters.lazy_outside_rows_recomputed_on_commit);
   CHECK(search.counters.lazy_inside_rows_recomputed_on_commit <=
         search.counters.inside_rows_recomputed_on_commit);
   CHECK(search.counters.lazy_outside_rows_recomputed_on_commit <=
@@ -1095,6 +1105,10 @@ static void test_lazy_cache_local_commit_updates_lazy_chart() {
         search.counters.lazy_inside_rows_recomputed_on_commit);
   CHECK(search.summary.lazy_outside_rows_recomputed_on_commit ==
         search.counters.lazy_outside_rows_recomputed_on_commit);
+  CHECK(search.summary.lazy_incremental_rows_recomputed ==
+        search.counters.lazy_incremental_rows_recomputed);
+  CHECK(search.summary.lazy_inside_rows_computed > 0);
+  CHECK(search.summary.lazy_merge_ratio > 0.0);
 
   std::println("  PASS");
 }
@@ -4227,10 +4241,17 @@ static void test_lazy_cache_local_commit_sequence_projects_lazy_chart() {
   CHECK(search.counters.outside_rows_recomputed_on_commit > 0);
   CHECK(search.counters.lazy_inside_rows_recomputed_on_commit > 0);
   CHECK(search.counters.lazy_outside_rows_recomputed_on_commit > 0);
+  CHECK(search.counters.lazy_incremental_rows_recomputed ==
+        search.counters.lazy_inside_rows_recomputed_on_commit +
+            search.counters.lazy_outside_rows_recomputed_on_commit);
   CHECK(search.summary.lazy_inside_rows_recomputed_on_commit ==
         search.counters.lazy_inside_rows_recomputed_on_commit);
   CHECK(search.summary.lazy_outside_rows_recomputed_on_commit ==
         search.counters.lazy_outside_rows_recomputed_on_commit);
+  CHECK(search.summary.lazy_incremental_rows_recomputed ==
+        search.counters.lazy_incremental_rows_recomputed);
+  CHECK(search.summary.lazy_inside_rows_computed > 0);
+  CHECK(search.summary.lazy_merge_ratio > 0.0);
 
   std::println("  PASS");
 }

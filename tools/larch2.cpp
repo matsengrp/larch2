@@ -22,6 +22,7 @@
 #include <larch/polytomy_refinement.hpp>
 #include <larch/site_patterns.hpp>
 #include <larch/chart_trim.hpp>
+#include <larch/lazy_chart.hpp>
 #include <larch/chart_bnb_trim_apply.hpp>
 
 #include <algorithm>
@@ -289,6 +290,8 @@ Post-processing:
                           reject, audit-kary, allow, expand-exact, or
                           expand-bounded
                           (chart-bnb default: expand-bounded)
+  --wric-lazy-chart <M>   off (default) or on. Enables the lazy multisite chart
+                          substrate for chart-B&B trim.
   --wric-polytomy-max-shapes <N>
                           Bounded soft-polytomy shape cap for chart-bnb trim
                           (chart-bnb default: 1; raise for broader bounded
@@ -335,6 +338,7 @@ struct args {
       chart_bnb_trim_application_mode::production_mask_superset;
   std::size_t chart_bnb_max_frontier = 0;
   std::optional<std::size_t> chart_bnb_max_exact_topologies;
+  bool wric_lazy_chart = false;
   polytomy_refinement_options chart_bnb_polytomy_opts = [] {
     polytomy_refinement_options opts;
     opts.mode = polytomy_mode::expand_soft_bounded;
@@ -462,6 +466,12 @@ parse_larch2_chart_bnb_application_mode(std::string_view text) {
       text == "topology-materialize" || text == "topology_materialize") {
     return chart_bnb_trim_application_mode::optimal_topology_materialize;
   }
+  return std::nullopt;
+}
+
+static std::optional<bool> parse_larch2_on_off(std::string_view text) {
+  if (text == "on") return true;
+  if (text == "off") return false;
   return std::nullopt;
 }
 
@@ -683,6 +693,14 @@ static args parse_args(int argc, char** argv) {
         std::exit(1);
       }
       a.chart_bnb_polytomy_opts.mode = *mode;
+    } else if (arg == "--wric-lazy-chart") {
+      auto value = next();
+      auto enabled = parse_larch2_on_off(value);
+      if (!enabled) {
+        std::cerr << "error: --wric-lazy-chart must be off|on\n";
+        std::exit(1);
+      }
+      a.wric_lazy_chart = *enabled;
     } else if (arg == "--wric-polytomy-max-shapes") {
       a.chart_bnb_polytomy_opts.max_shapes_per_polytomy =
           parse_size_arg(next(), arg);
@@ -2549,12 +2567,66 @@ static char const* chart_bnb_application_exactness_label(
   return "unknown";
 }
 
+static double larch2_ratio_or_zero(std::size_t numerator, double denominator) {
+  if (denominator == 0.0) return 0.0;
+  return static_cast<double>(numerator) / denominator;
+}
+
+static std::size_t larch2_lazy_internal_structural_class_count_max(
+    clade_grammar const& grammar, std::vector<std::size_t> const& counts) {
+  std::size_t max_count = 0;
+  for (std::size_t clade = 0; clade < counts.size() &&
+                              clade < grammar.clades.size();
+       ++clade) {
+    auto taxon_count = grammar.clades[clade].taxa.size();
+    if (clade == grammar.root_clade || taxon_count <= 1) continue;
+    max_count = std::max(max_count, counts[clade]);
+  }
+  return max_count;
+}
+
+static void print_larch2_lazy_trim_report(
+    multisite_trim_result const& trim, clade_grammar const& grammar,
+    site_pattern_set const& patterns) {
+  auto pattern_count = patterns.patterns.size();
+  auto internal_max = larch2_lazy_internal_structural_class_count_max(
+      grammar, trim.lazy_structural_class_count_by_clade);
+  auto merge_denominator =
+      static_cast<double>(pattern_count) *
+      static_cast<double>(grammar.clades.size());
+  std::cerr << "  lazy_chart_used: "
+            << (trim.lazy_chart_used ? "true" : "false") << "\n";
+  std::cerr << "  lazy_inside_rows_computed: "
+            << trim.lazy_inside_rows_computed << "\n";
+  std::cerr << "  lazy_outside_rows_computed: "
+            << trim.lazy_outside_rows_computed << "\n";
+  std::cerr << "  lazy_patterns_merged_max: "
+            << trim.lazy_patterns_merged_max << "\n";
+  std::cerr << "  lazy_remerge_collisions: "
+            << trim.lazy_remerge_collisions << "\n";
+  std::cerr << "  lazy_structural_class_count_max: "
+            << trim.lazy_structural_class_count_max << "\n";
+  std::cerr << "  lazy_internal_structural_class_count_max: "
+            << internal_max << "\n";
+  std::cerr << "  lazy_merge_ratio: " << std::fixed << std::setprecision(6)
+            << larch2_ratio_or_zero(trim.lazy_inside_rows_computed,
+                                    merge_denominator)
+            << "\n";
+  std::cerr << "  lazy_internal_structural_class_ratio: " << std::fixed
+            << std::setprecision(6)
+            << larch2_ratio_or_zero(internal_max,
+                                    static_cast<double>(pattern_count))
+            << "\n";
+}
+
 static void print_chart_bnb_trim_report(
     multisite_trim_result const& trim,
     chart_bnb_trim_apply_result const& apply,
     polytomy_refinement_result const& refinement,
+    site_pattern_set const& patterns,
     polytomy_refinement_options const& polytomy_opts,
     chart_options const& chart_opts,
+    bool wric_lazy_chart,
     chart_bnb_trim_application_mode requested_mode, bool auto_fallback) {
   if (!trim.keep_production_exact) {
     throw std::runtime_error(
@@ -2582,9 +2654,15 @@ static void print_chart_bnb_trim_report(
             << "\n";
   std::cerr << "  score_ua_edge: "
             << (chart_opts.score_ua_edge ? "true" : "false") << "\n";
+  if (wric_lazy_chart) {
+    std::cerr << "  wric_lazy_chart: on\n";
+  }
   std::cerr << "  active_patterns: " << trim.active_pattern_count << "\n";
   std::cerr << "  invariant_constant_offset: "
             << trim.invariant_constant_offset << "\n";
+  if (wric_lazy_chart) {
+    print_larch2_lazy_trim_report(trim, refinement.grammar, patterns);
+  }
   std::cerr << "  kept_productions: " << kept << "\n";
   std::cerr << "  keep_mask_kind: "
             << multisite_keep_mask_kind_name(trim.keep_mask_kind) << "\n";
@@ -2664,9 +2742,16 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
   trim_opts.require_exact_keep_mask = true;
   trim_opts.max_frontier_entries_per_clade = a.chart_bnb_max_frontier;
 
+  std::optional<lazy_multisite_chart> lazy_chart;
+  if (a.wric_lazy_chart) {
+    lazy_chart = build_lazy_inside_chart(refinement.grammar, patterns);
+  }
   auto bnb_start = std::chrono::steady_clock::now();
-  auto trim = build_multisite_trim(refinement.grammar, patterns, chart_opts,
-                                   trim_opts);
+  auto trim = lazy_chart
+                  ? build_multisite_trim(refinement.grammar, patterns,
+                                         *lazy_chart, chart_opts, trim_opts)
+                  : build_multisite_trim(refinement.grammar, patterns,
+                                         chart_opts, trim_opts);
   auto bnb_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - bnb_start)
                     .count();
@@ -2709,8 +2794,9 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
                       std::chrono::steady_clock::now() - apply_start)
                       .count();
 
-  print_chart_bnb_trim_report(trim, apply, refinement, a.chart_bnb_polytomy_opts,
-                              chart_opts, a.chart_bnb_application_mode,
+  print_chart_bnb_trim_report(trim, apply, refinement, patterns,
+                              a.chart_bnb_polytomy_opts, chart_opts,
+                              a.wric_lazy_chart, a.chart_bnb_application_mode,
                               auto_fallback);
   std::cerr << "  chart_grammar_build_ms: " << std::fixed
             << std::setprecision(3) << grammar_ms << "\n";

@@ -1168,6 +1168,9 @@ Analysis:
                           allow keeps multifurcating productions for
                           arity-aware chart/SPR paths; binary-only consumers
                           throw a labelled arity gate.
+  --wric-lazy-chart <M>   off (default) or on. Enables the lazy multisite chart
+                          substrate for chart-SPR, composite-score, benchmark,
+                          and chart-B&B diagnostics.
   --wric-polytomy-max-exact-arity <N>
                           Exact expansion arity cap (default 6)
   --wric-polytomy-max-shapes <N>
@@ -1405,6 +1408,7 @@ struct args {
   bool wric_benchmark = false;
   polytomy_refinement_options wric_polytomy_opts;
   bool wric_polytomy_mode_explicit = false;
+  bool wric_lazy_chart = false;
   bool wric_polytomy_report = false;
   bool wric_polytomy_benchmark = false;
   std::vector<std::size_t> wric_polytomy_benchmark_shape_caps{1, 4, 16};
@@ -1499,6 +1503,12 @@ parse_chart_spr_acceptance_mode(std::string_view text) {
       text == "lower_bound_heuristic") {
     return chart_spr_acceptance_mode::lower_bound_heuristic;
   }
+  return std::nullopt;
+}
+
+static std::optional<bool> parse_on_off(std::string_view text) {
+  if (text == "on") return true;
+  if (text == "off") return false;
   return std::nullopt;
 }
 
@@ -1753,6 +1763,14 @@ static args parse_args(int argc, char** argv) {
       }
       a.wric_polytomy_opts.mode = *mode;
       a.wric_polytomy_mode_explicit = true;
+    } else if (arg == "--wric-lazy-chart") {
+      auto value = next();
+      auto enabled = parse_on_off(value);
+      if (!enabled) {
+        std::cerr << "error: --wric-lazy-chart must be off|on\n";
+        std::exit(1);
+      }
+      a.wric_lazy_chart = *enabled;
     } else if (arg == "--wric-polytomy-max-exact-arity") {
       a.wric_polytomy_opts.max_exact_arity = static_cast<std::size_t>(
           std::stoull(std::string{next()}));
@@ -2373,7 +2391,7 @@ static void write_coupled_frontier_annotation_json(
 
 static void write_chart_bnb_apply_json(
     std::string const& path, multisite_trim_result const& trim,
-    chart_bnb_trim_apply_result const& apply) {
+    chart_bnb_trim_apply_result const& apply, bool include_lazy_fields) {
   std::ofstream out(path);
   if (!out) throw std::runtime_error("failed to open JSON report: " + path);
   out << "{\n";
@@ -2414,6 +2432,20 @@ static void write_chart_bnb_apply_json(
   out << "  \"refinement_exactness\": \""
       << json_escape(apply.refinement_exactness) << "\",\n";
   out << "  \"bnb_optimum\": " << apply.bnb_optimum << ",\n";
+  if (include_lazy_fields) {
+    out << "  \"lazy_chart_used\": "
+        << (trim.lazy_chart_used ? "true" : "false") << ",\n";
+    out << "  \"lazy_inside_rows_computed\": "
+        << trim.lazy_inside_rows_computed << ",\n";
+    out << "  \"lazy_outside_rows_computed\": "
+        << trim.lazy_outside_rows_computed << ",\n";
+    out << "  \"lazy_patterns_merged_max\": "
+        << trim.lazy_patterns_merged_max << ",\n";
+    out << "  \"lazy_remerge_collisions\": "
+        << trim.lazy_remerge_collisions << ",\n";
+    out << "  \"lazy_structural_class_count_max\": "
+        << trim.lazy_structural_class_count_max << ",\n";
+  }
   out << "  \"validated_output_parsimony_min\": "
       << apply.validated_output_parsimony_min << ",\n";
   out << "  \"validated_output_parsimony_min_exact\": "
@@ -2547,6 +2579,115 @@ static void print_named_frontier_summary(std::ostream& out,
   }
 }
 
+static double ratio_or_zero(std::size_t numerator, double denominator) {
+  if (denominator == 0.0) return 0.0;
+  return static_cast<double>(numerator) / denominator;
+}
+
+static double lazy_merge_ratio(std::size_t lazy_inside_rows,
+                               std::size_t pattern_count,
+                               std::size_t clade_count) {
+  return ratio_or_zero(lazy_inside_rows,
+                       static_cast<double>(pattern_count) *
+                           static_cast<double>(clade_count));
+}
+
+static std::size_t lazy_internal_structural_class_count_max(
+    clade_grammar const& grammar, std::vector<std::size_t> const& counts) {
+  std::size_t max_count = 0;
+  for (std::size_t clade = 0; clade < counts.size() &&
+                              clade < grammar.clades.size();
+       ++clade) {
+    auto taxon_count = grammar.clades[clade].taxa.size();
+    if (clade == grammar.root_clade || taxon_count <= 1) continue;
+    max_count = std::max(max_count, counts[clade]);
+  }
+  return max_count;
+}
+
+static void print_lazy_trim_fields(std::ostream& out,
+                                   clade_grammar const& grammar,
+                                   site_pattern_set const& patterns,
+                                   multisite_trim_result const& trim,
+                                   std::string const& indent) {
+  auto pattern_count = patterns.patterns.size();
+  auto internal_max = lazy_internal_structural_class_count_max(
+      grammar, trim.lazy_structural_class_count_by_clade);
+  out << indent << "lazy_chart_used: "
+      << (trim.lazy_chart_used ? "true" : "false") << "\n";
+  out << indent << "lazy_inside_rows_computed: "
+      << trim.lazy_inside_rows_computed << "\n";
+  out << indent << "lazy_outside_rows_computed: "
+      << trim.lazy_outside_rows_computed << "\n";
+  out << indent << "lazy_patterns_merged_max: "
+      << trim.lazy_patterns_merged_max << "\n";
+  out << indent << "lazy_remerge_collisions: "
+      << trim.lazy_remerge_collisions << "\n";
+  out << indent << "lazy_structural_class_count_max: "
+      << trim.lazy_structural_class_count_max << "\n";
+  out << indent << "lazy_internal_structural_class_count_max: "
+      << internal_max << "\n";
+  out << indent << "lazy_merge_ratio: " << std::fixed
+      << std::setprecision(6)
+      << lazy_merge_ratio(trim.lazy_inside_rows_computed, pattern_count,
+                          grammar.clades.size())
+      << "\n";
+  out << indent << "lazy_internal_structural_class_ratio: " << std::fixed
+      << std::setprecision(6)
+      << ratio_or_zero(internal_max, static_cast<double>(pattern_count))
+      << "\n";
+}
+
+static void print_lazy_chart_snapshot_fields(std::ostream& out,
+                                             clade_grammar const& grammar,
+                                             site_pattern_set const& patterns,
+                                             lazy_multisite_chart const* lazy,
+                                             std::string const& indent) {
+  auto pattern_count = patterns.patterns.size();
+  std::vector<std::size_t> empty_counts;
+  auto const& counts =
+      lazy == nullptr ? empty_counts : lazy->structural_class_count_by_clade;
+  auto internal_max =
+      lazy_internal_structural_class_count_max(grammar, counts);
+  out << indent << "lazy_inside_rows_computed: "
+      << (lazy == nullptr ? 0 : lazy->lazy_inside_rows_computed) << "\n";
+  out << indent << "lazy_outside_rows_computed: "
+      << (lazy == nullptr ? 0 : lazy->lazy_outside_rows_computed) << "\n";
+  out << indent << "lazy_patterns_merged_max: "
+      << (lazy == nullptr ? 0 : lazy->lazy_patterns_merged_max) << "\n";
+  out << indent << "lazy_remerge_collisions: "
+      << (lazy == nullptr ? 0 : lazy->lazy_remerge_collisions) << "\n";
+  out << indent << "lazy_structural_class_count_max: "
+      << (lazy == nullptr ? 0 : lazy->lazy_structural_class_count_max) << "\n";
+  out << indent << "lazy_internal_structural_class_count_max: "
+      << internal_max << "\n";
+  out << indent << "lazy_merge_ratio: " << std::fixed
+      << std::setprecision(6)
+      << lazy_merge_ratio(lazy == nullptr ? 0 : lazy->lazy_inside_rows_computed,
+                          pattern_count, grammar.clades.size())
+      << "\n";
+  out << indent << "lazy_internal_structural_class_ratio: " << std::fixed
+      << std::setprecision(6)
+      << ratio_or_zero(internal_max, static_cast<double>(pattern_count))
+      << "\n";
+}
+
+static void print_chart_spr_lazy_state_fields(
+    std::ostream& out, chart_spr_search_state const& state,
+    std::string const& indent) {
+  auto const* lazy = state.lazy_chart ? &*state.lazy_chart : nullptr;
+  out << indent << "wric_lazy_chart: "
+      << (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart
+              ? "on"
+              : "off")
+      << "\n";
+  out << indent << "lazy_chart_used: " << (lazy == nullptr ? "false" : "true")
+      << "\n";
+  print_lazy_chart_snapshot_fields(out, state.grammar,
+                                   state.active_patterns.patterns, lazy,
+                                   indent);
+}
+
 static void print_refinement_benchmark_summary(
     std::ostream& out, polytomy_refinement_result const& refinement,
     std::string const& indent) {
@@ -2633,14 +2774,25 @@ static void print_binary_refinement_performance_benchmark(
   auto patterns = build_site_patterns(dag, grammar, pattern_opts);
   auto pattern_ms = elapsed_ms(pattern_start, std::chrono::steady_clock::now());
 
+  std::optional<lazy_multisite_chart> lazy_chart;
   auto composite_start = std::chrono::steady_clock::now();
-  auto composite = build_composite_chart_score(grammar, patterns, chart_opts);
-  auto composite_ms = elapsed_ms(composite_start,
-                                 std::chrono::steady_clock::now());
+  composite_chart_score composite;
+  if (a.wric_lazy_chart) {
+    lazy_chart = build_lazy_inside_chart(grammar, patterns);
+    composite =
+        build_composite_chart_score(grammar, patterns, *lazy_chart, chart_opts);
+  } else {
+    composite = build_composite_chart_score(grammar, patterns, chart_opts);
+  }
+  auto composite_ms =
+      elapsed_ms(composite_start, std::chrono::steady_clock::now());
 
   out << child << "site: " << site << "\n";
   out << child << "score_ua_edge: "
       << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+  if (a.wric_lazy_chart) {
+    out << child << "wric_lazy_chart: on\n";
+  }
   out << child << "reference_state: " << chart_state_label(reference_state)
       << "\n";
   out << child << "root_min: ";
@@ -2708,6 +2860,10 @@ static void print_binary_refinement_performance_benchmark(
       << composite.weighted_lower_bound << "\n";
   out << child << "multifurcation_productions_scored: "
       << composite.multifurcation_productions_scored << "\n";
+  if (a.wric_lazy_chart) {
+    print_lazy_chart_snapshot_fields(
+        out, grammar, patterns, lazy_chart ? &*lazy_chart : nullptr, child);
+  }
 
   out << indent << "bnb_frontier_benchmark:\n";
   if (!a.wric_polytomy_benchmark_bnb) {
@@ -2720,13 +2876,20 @@ static void print_binary_refinement_performance_benchmark(
   auto trim_opts = make_chart_bnb_trim_options(a);
   try {
     auto bnb_start = std::chrono::steady_clock::now();
-    auto trim = build_multisite_trim(grammar, patterns, chart_opts, trim_opts);
+    auto trim = lazy_chart
+                    ? build_multisite_trim(grammar, patterns, *lazy_chart,
+                                           chart_opts, trim_opts)
+                    : build_multisite_trim(grammar, patterns, chart_opts,
+                                           trim_opts);
     auto bnb_ms = elapsed_ms(bnb_start, std::chrono::steady_clock::now());
     out << child << "success: true\n";
     out << child << "bnb_trim_ms: " << std::fixed << std::setprecision(3)
         << bnb_ms << "\n";
     out << child << "optimum: " << trim.optimum << "\n";
     out << child << "active_patterns: " << trim.active_pattern_count << "\n";
+    if (a.wric_lazy_chart) {
+      print_lazy_trim_fields(out, grammar, patterns, trim, child);
+    }
     out << child << "equality_deduplicated: "
         << trim.equality_deduplicated << "\n";
     out << child << "dominance_mode: "
@@ -2924,7 +3087,7 @@ static void run_wric_polytomy_benchmark(std::ostream& out, phylo_dag& dag,
 
 static void print_chart_spr_search_counter_fields(
     std::ostream& out, chart_spr_search_counters const& counters,
-    std::string const& indent) {
+    std::string const& indent, bool include_wi7_lazy_fields = false) {
   out << indent << "grammar_rebuilds: " << counters.grammar_rebuilds << "\n";
   out << indent << "pattern_rebuilds: " << counters.pattern_rebuilds << "\n";
   out << indent << "base_chart_cache_rebuilds: "
@@ -2951,10 +3114,26 @@ static void print_chart_spr_search_counter_fields(
       << counters.inside_rows_recomputed_on_commit << "\n";
   out << indent << "outside_rows_recomputed_on_commit: "
       << counters.outside_rows_recomputed_on_commit << "\n";
+  if (include_wi7_lazy_fields) {
+    out << indent << "lazy_inside_rows_computed: "
+        << counters.lazy_inside_rows_computed << "\n";
+    out << indent << "lazy_outside_rows_computed: "
+        << counters.lazy_outside_rows_computed << "\n";
+    out << indent << "lazy_patterns_merged_max: "
+        << counters.lazy_patterns_merged_max << "\n";
+    out << indent << "lazy_remerge_collisions: "
+        << counters.lazy_remerge_collisions << "\n";
+  }
   out << indent << "lazy_inside_rows_recomputed_on_commit: "
       << counters.lazy_inside_rows_recomputed_on_commit << "\n";
   out << indent << "lazy_outside_rows_recomputed_on_commit: "
       << counters.lazy_outside_rows_recomputed_on_commit << "\n";
+  if (include_wi7_lazy_fields) {
+    out << indent << "lazy_incremental_rows_recomputed: "
+        << counters.lazy_incremental_rows_recomputed << "\n";
+    out << indent << "lazy_structural_class_count_max: "
+        << counters.lazy_structural_class_count_max << "\n";
+  }
   out << indent << "local_commit_two_chart_oracle_runs: "
       << counters.local_commit_two_chart_oracle_runs << "\n";
   out << indent << "local_commit_tip_grammar_refreshes: "
@@ -2965,6 +3144,10 @@ static void print_chart_spr_search_counter_fields(
       << counters.fixed_topology_selected_cache_misses << "\n";
   out << indent << "fixed_topology_selected_rows_computed: "
       << counters.fixed_topology_selected_rows_computed << "\n";
+  if (include_wi7_lazy_fields) {
+    out << indent << "selected_topology_class_rows_computed: "
+        << counters.selected_topology_class_rows_computed << "\n";
+  }
   out << indent << "selected_topology_multifurcation_rows: "
       << counters.selected_topology_multifurcation_rows << "\n";
   out << indent << "fixed_topology_persistent_cache_verifications: "
@@ -3355,6 +3538,9 @@ static void run_chart_spr_local_scoring_diagnostic(
       << state.invariant_constant_offset << "\n";
   out << "  cache_strategy: "
       << chart_spr_cache_strategy_name(state.cache_strategy) << "\n";
+  if (a.wric_lazy_chart) {
+    print_chart_spr_lazy_state_fields(out, state, "  ");
+  }
   out << "  chart_cache_estimated_full_bytes: "
       << state.estimated_full_pattern_cache_bytes << "\n";
   out << "  chart_cache_resident_bytes: "
@@ -3441,7 +3627,8 @@ static void run_chart_spr_local_scoring_diagnostic(
   out << "  candidate_generation:\n";
   print_chart_spr_generation_stats(out, generation, "    ");
   out << "  counters:\n";
-  print_chart_spr_search_counter_fields(out, state.counters, "    ");
+  print_chart_spr_search_counter_fields(out, state.counters, "    ",
+                                        a.wric_lazy_chart);
 }
 
 static std::string chart_spr_topology_selection_label(
@@ -3466,6 +3653,7 @@ static chart_spr_search_options make_chart_spr_search_options(
   options.fixed_topology_selector_name = a.chart_spr_topology_selector;
   options.enumeration = a.chart_spr_enumeration;
   options.cache = a.chart_spr_cache;
+  options.cache.use_lazy_multisite_chart = a.wric_lazy_chart;
   options.local_score_worker_count = a.chart_spr_local_score_workers;
   options.rebuild_after_accept = !a.chart_spr_local_accept_updates;
   // Phase 10 cross-cutting surface: mirror the selected commit / verification
@@ -3594,8 +3782,15 @@ static void run_chart_spr_search_diagnostic(
   out << "  root_row_scoring_api: chart_spr_weighted_root_score_from_row\n";
   out << "  local_score_workers: "
       << search.summary.local_score_worker_count << "\n";
+  bool const search_used_lazy_chart =
+      search.summary.cache_strategy ==
+      chart_spr_cache_strategy::lazy_multisite_chart;
   out << "  cache_strategy: "
       << chart_spr_cache_strategy_name(search.summary.cache_strategy) << "\n";
+  if (search_used_lazy_chart) {
+    out << "  wric_lazy_chart: on\n";
+    out << "  lazy_chart_used: true\n";
+  }
   out << "  active_patterns: "
       << search.summary.active_pattern_count << "\n";
   out << "  initial_grammar_clades: "
@@ -3674,6 +3869,27 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.lazy_inside_rows_recomputed_on_commit << "\n";
   out << "  lazy_outside_rows_recomputed_on_commit: "
       << search.summary.lazy_outside_rows_recomputed_on_commit << "\n";
+  if (search_used_lazy_chart) {
+    out << "  lazy_inside_rows_computed: "
+        << search.summary.lazy_inside_rows_computed << "\n";
+    out << "  lazy_outside_rows_computed: "
+        << search.summary.lazy_outside_rows_computed << "\n";
+    out << "  lazy_patterns_merged_max: "
+        << search.summary.lazy_patterns_merged_max << "\n";
+    out << "  lazy_remerge_collisions: "
+        << search.summary.lazy_remerge_collisions << "\n";
+    out << "  lazy_incremental_rows_recomputed: "
+        << search.summary.lazy_incremental_rows_recomputed << "\n";
+    out << "  lazy_structural_class_count_max: "
+        << search.summary.lazy_structural_class_count_max << "\n";
+    out << "  lazy_internal_structural_class_count_max: "
+        << search.summary.lazy_internal_structural_class_count_max << "\n";
+    out << "  lazy_merge_ratio: " << std::fixed << std::setprecision(6)
+        << search.summary.lazy_merge_ratio << "\n";
+    out << "  lazy_internal_structural_class_ratio: " << std::fixed
+        << std::setprecision(6)
+        << search.summary.lazy_internal_structural_class_ratio << "\n";
+  }
   out << "  local_commit_two_chart_oracle_runs: "
       << search.summary.local_commit_two_chart_oracle_runs << "\n";
   out << "  local_commit_tip_grammar_refreshes: "
@@ -3686,6 +3902,10 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.fixed_topology_selected_cache_misses << "\n";
   out << "  fixed_topology_selected_rows_computed: "
       << search.summary.fixed_topology_selected_rows_computed << "\n";
+  if (search_used_lazy_chart) {
+    out << "  selected_topology_class_rows_computed: "
+        << search.summary.selected_topology_class_rows_computed << "\n";
+  }
   out << "  selected_topology_multifurcation_rows: "
       << search.summary.selected_topology_multifurcation_rows << "\n";
   out << "  fixed_topology_persistent_cache_verifications: "
@@ -3833,7 +4053,8 @@ static void run_chart_spr_search_diagnostic(
     }
   }
   out << "  counters:\n";
-  print_chart_spr_search_counter_fields(out, search.counters, "    ");
+  print_chart_spr_search_counter_fields(out, search.counters, "    ",
+                                        search_used_lazy_chart);
 }
 
 static void run_chart_spr_helper_benchmark(
@@ -4313,10 +4534,18 @@ int main(int argc, char** argv) try {
     chart_options chart_opts;
     chart_opts.score_ua_edge = a.chart_score_ua_edge;
 
+    std::optional<lazy_multisite_chart> lazy_chart;
     auto composite_start = std::chrono::steady_clock::now();
-    auto composite = build_composite_chart_score(grammar, patterns, chart_opts);
-    auto composite_ms = elapsed_ms(composite_start,
-                                   std::chrono::steady_clock::now());
+    composite_chart_score composite;
+    if (a.wric_lazy_chart) {
+      lazy_chart = build_lazy_inside_chart(grammar, patterns);
+      composite = build_composite_chart_score(grammar, patterns, *lazy_chart,
+                                              chart_opts);
+    } else {
+      composite = build_composite_chart_score(grammar, patterns, chart_opts);
+    }
+    auto composite_ms =
+        elapsed_ms(composite_start, std::chrono::steady_clock::now());
 
     std::cout << "chart_composite_score:\n";
     std::cout << "  score_kind: LOWER_BOUND\n";
@@ -4329,6 +4558,9 @@ int main(int argc, char** argv) try {
               << composite.multifurcation_productions_scored << "\n";
     std::cout << "  score_ua_edge: "
               << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+    if (a.wric_lazy_chart) {
+      std::cout << "  wric_lazy_chart: on\n";
+    }
     std::cout << "  exact_patterns: " << patterns.patterns.size() << "\n";
     std::cout << "  total_sites: " << patterns.total_site_count << "\n";
     std::cout << "  invariant_sites: " << patterns.invariant_site_count
@@ -4341,6 +4573,11 @@ int main(int argc, char** argv) try {
               << std::setprecision(3) << exact_pattern_build_ms << "\n";
     std::cout << "  composite_chart_ms: " << std::fixed
               << std::setprecision(3) << composite_ms << "\n";
+    if (a.wric_lazy_chart) {
+      print_lazy_chart_snapshot_fields(
+          std::cout, grammar, patterns, lazy_chart ? &*lazy_chart : nullptr,
+          "  ");
+    }
     print_limited_per_pattern_roots(std::cout, patterns, composite,
                                     a.chart_entry_limit);
   }
@@ -4353,8 +4590,14 @@ int main(int argc, char** argv) try {
     chart_opts.score_ua_edge = a.chart_score_ua_edge;
     auto trim_opts = make_chart_bnb_trim_options(a);
 
+    std::optional<lazy_multisite_chart> lazy_chart;
+    if (a.wric_lazy_chart) lazy_chart = build_lazy_inside_chart(grammar, patterns);
     auto bnb_start = std::chrono::steady_clock::now();
-    auto trim = build_multisite_trim(grammar, patterns, chart_opts, trim_opts);
+    auto trim = lazy_chart
+                    ? build_multisite_trim(grammar, patterns, *lazy_chart,
+                                           chart_opts, trim_opts)
+                    : build_multisite_trim(grammar, patterns, chart_opts,
+                                           trim_opts);
     auto bnb_ms = elapsed_ms(bnb_start, std::chrono::steady_clock::now());
 
     std::cout << "chart_bnb_trim:\n";
@@ -4371,6 +4614,9 @@ int main(int argc, char** argv) try {
               << "\n";
     std::cout << "  score_ua_edge: "
               << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+    if (a.wric_lazy_chart) {
+      std::cout << "  wric_lazy_chart: on\n";
+    }
     std::cout << "  active_patterns: " << trim.active_pattern_count << "\n";
     std::cout << "  exact_patterns: " << patterns.patterns.size() << "\n";
     std::cout << "  invariant_constant_offset: "
@@ -4411,6 +4657,9 @@ int main(int argc, char** argv) try {
     std::cout << "  upper_bound_override_kind: PRUNING_ONLY\n";
     std::cout << "  max_frontier_entries_per_clade: "
               << trim_opts.max_frontier_entries_per_clade << "\n";
+    if (a.wric_lazy_chart) {
+      print_lazy_trim_fields(std::cout, grammar, patterns, trim, "  ");
+    }
     std::cout << "  grammar_build_ms: " << std::fixed
               << std::setprecision(3) << chart_grammar_build_ms << "\n";
     std::cout << "  pattern_build_ms: " << std::fixed
@@ -4471,7 +4720,8 @@ int main(int argc, char** argv) try {
           std::cout << "  output_dag: " << output_path << "\n";
         } else if (apply.mode ==
                    chart_bnb_trim_application_mode::annotated_optimal_trim) {
-          write_chart_bnb_apply_json(output_path, trim, apply);
+          write_chart_bnb_apply_json(output_path, trim, apply,
+                                     a.wric_lazy_chart);
           std::cout << "  output_artifact: " << output_path << "\n";
         } else {
           throw std::runtime_error(
@@ -4484,7 +4734,8 @@ int main(int argc, char** argv) try {
         }
       }
       if (!a.chart_bnb_report_json.empty()) {
-        write_chart_bnb_apply_json(a.chart_bnb_report_json, trim, apply);
+        write_chart_bnb_apply_json(a.chart_bnb_report_json, trim, apply,
+                                   a.wric_lazy_chart);
         std::cout << "  report_json: " << a.chart_bnb_report_json << "\n";
       }
     }

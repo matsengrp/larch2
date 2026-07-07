@@ -356,14 +356,24 @@ set_tests_properties(dagutil_wric_phase9_chart_composite_score
                      "score_kind: LOWER_BOUND")
 
 add_test(NAME dagutil_wric_allow_chart_composite_score
+		         COMMAND bash -c
+		                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --chart-composite-score > \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -q 'polytomy_mode: allow' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -Eq 'grammar_max_arity: [3-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -q 'score_kind: LOWER_BOUND' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -q 'score_scope: DAG_NATIVE_KARY_GRAMMAR' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -Eq 'multifurcation_productions_scored: [1-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && ! grep -q 'wric_lazy_chart:' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && ! grep -q 'lazy_chart_used:' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && ! grep -q 'lazy_inside_rows_computed:' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\""
+		         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_wric_lazy_chart_composite_score
 	         COMMAND bash -c
-	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --chart-composite-score > \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -q 'polytomy_mode: allow' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -Eq 'grammar_max_arity: [3-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -q 'score_kind: LOWER_BOUND' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -q 'score_scope: DAG_NATIVE_KARY_GRAMMAR' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\" && grep -Eq 'multifurcation_productions_scored: [1-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_composite_score.out\""
+	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --wric-lazy-chart on --chart-composite-score > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_composite_score.out\" && grep -q 'wric_lazy_chart: on' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_composite_score.out\" && grep -Eq 'lazy_inside_rows_computed: [1-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_composite_score.out\" && grep -q 'lazy_merge_ratio:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_composite_score.out\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_wric_lazy_chart_composite_score_off_report_contract
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --wric-lazy-chart off --chart-composite-score > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_composite_score_off.out\" && ! grep -q 'wric_lazy_chart:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_composite_score_off.out\" && ! grep -q 'lazy_chart_used:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_composite_score_off.out\" && ! grep -q 'lazy_inside_rows_computed:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_composite_score_off.out\""
 	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_wric_allow_audit_labels
-         COMMAND bash -c
-                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --wric-polytomy-report > \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_audit_labels.out\" && grep -q 'polytomy_mode: allow' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_audit_labels.out\" && grep -Eq 'grammar_max_arity: [3-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_audit_labels.out\" && grep -q 'kary_grammar_diagnostic_only: false' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_audit_labels.out\""
-         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --wric-polytomy-report > \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_audit_labels.out\" && grep -q 'polytomy_mode: allow' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_audit_labels.out\" && grep -Eq 'grammar_max_arity: [3-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_audit_labels.out\" && grep -q 'kary_grammar_diagnostic_only: false' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_audit_labels.out\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_wric_allow_chart_bnb_gate
 	         COMMAND bash -c
@@ -381,13 +391,23 @@ add_test(NAME dagutil_wric_phase9_chart_bnb_trim
                  --chart-bnb-max-frontier 1000
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(dagutil_wric_phase9_chart_bnb_trim
-                     PROPERTIES PASS_REGULAR_EXPRESSION
-                     "keep_mask_kind: exact_optimal_production_union")
+	                     PROPERTIES PASS_REGULAR_EXPRESSION
+	                     "keep_mask_kind: exact_optimal_production_union")
+
+add_test(NAME dagutil_wric_lazy_chart_bnb_trim
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --wric-lazy-chart on --chart-bnb-trim --chart-bnb-dominance off --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim.out\" && grep -q 'wric_lazy_chart: on' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim.out\" && grep -q 'lazy_chart_used: true' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim.out\" && grep -q 'lazy_merge_ratio:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim.out\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_wric_lazy_chart_bnb_trim_off_report_contract
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --wric-lazy-chart off --chart-bnb-trim --chart-bnb-dominance off --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim_off.out\" && ! grep -q 'wric_lazy_chart:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim_off.out\" && ! grep -q 'lazy_chart_used:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim_off.out\" && ! grep -q 'lazy_inside_rows_computed:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim_off.out\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_wric_phase9_chart_bnb_phase0_labels
-         COMMAND bash -c
-                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-dominance off --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_mode: off' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'keep_mask_kind: exact_optimal_production_union' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'keep_production_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'kept_productions_count_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_candidates_considered: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_pruned_score_pass: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_pruned_mask_pass: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_pruned: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'exact_mask_recovery_passes: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && \"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-dominance off --chart-bnb-score-only --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\" && grep -q 'keep_mask_kind: score_only_not_exact' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\" && grep -q 'keep_production_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\" && grep -q 'kept_productions_count_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\""
-         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-dominance off --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_mode: off' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'keep_mask_kind: exact_optimal_production_union' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'keep_production_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'kept_productions_count_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_candidates_considered: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_pruned_score_pass: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_pruned_mask_pass: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'dominance_pruned: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && grep -q 'exact_mask_recovery_passes: 0' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && ! grep -q 'wric_lazy_chart:' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && ! grep -q 'lazy_chart_used:' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && ! grep -q 'lazy_inside_rows_computed:' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_default.out\" && \"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-dominance off --chart-bnb-score-only --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\" && grep -q 'keep_mask_kind: score_only_not_exact' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\" && grep -q 'keep_production_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\" && grep -q 'kept_productions_count_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_bnb_phase0_score_only.out\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_wric_phase9_chart_bnb_score_only_dominance
          COMMAND bash -c
@@ -411,6 +431,15 @@ add_test(NAME dagutil_wric_phase9_chart_bnb_apply_default_writes_dag
                  "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-bnb-trim --chart-bnb-apply-trim --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 -o \"${DAGUTIL_CHART_BNB_APPLY_DEFAULT_OUT}\" > \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && test -s \"${DAGUTIL_CHART_BNB_APPLY_DEFAULT_OUT}\" && grep -q 'trim_application_requested_mode: production_mask_superset' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && grep -q 'trim_application_auto_fallback: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && grep -q 'trim_application_mode: optimal_topology_materialize' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && grep -q 'composite_lower_bound_kind: LOWER_BOUND' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && grep -q 'validated_output_parsimony_min:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && grep -q 'validation_strength:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_default.out\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${DAGUTIL_CHART_BNB_APPLY_DEFAULT_OUT}\" --force-no-vcf --validate > /dev/null"
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+set(DAGUTIL_CHART_BNB_LAZY_APPLY_OUT
+    "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_lazy_apply.pb.gz")
+set(DAGUTIL_CHART_BNB_LAZY_APPLY_JSON
+    "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_lazy_apply.json")
+add_test(NAME dagutil_wric_lazy_chart_bnb_apply_report_json
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --wric-lazy-chart on --chart-bnb-trim --chart-bnb-apply-trim --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 --chart-bnb-report-json \"${DAGUTIL_CHART_BNB_LAZY_APPLY_JSON}\" -o \"${DAGUTIL_CHART_BNB_LAZY_APPLY_OUT}\" > \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_lazy_apply.out\" && test -s \"${DAGUTIL_CHART_BNB_LAZY_APPLY_OUT}\" && grep -q 'wric_lazy_chart: on' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_lazy_apply.out\" && grep -q '\"lazy_chart_used\": true' \"${DAGUTIL_CHART_BNB_LAZY_APPLY_JSON}\" && grep -Eq '\"lazy_inside_rows_computed\": [1-9]' \"${DAGUTIL_CHART_BNB_LAZY_APPLY_JSON}\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${DAGUTIL_CHART_BNB_LAZY_APPLY_OUT}\" --force-no-vcf --validate > /dev/null"
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 set(DAGUTIL_CHART_BNB_DIAGNOSTIC_OUTPUT_OUT
     "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_diagnostic_without_apply.pb.gz")
 add_test(NAME dagutil_chart_bnb_output_without_apply_retains_current_output
@@ -424,7 +453,7 @@ set(DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON
     "${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.json")
 add_test(NAME dagutil_wric_phase9_chart_bnb_apply_production_mask_labels
          COMMAND bash -c
-                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_binary_four.fa --newick test/wric_binary_four.nwk --refseq test/wric_binary_four.ref --force-no-vcf --wric-polytomy-mode reject --chart-bnb-trim --chart-bnb-apply-trim --chart-bnb-trim-application production-mask --chart-bnb-max-frontier 1000 --chart-bnb-report-json \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" -o \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_OUT}\" > \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && test -s \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_OUT}\" && grep -q 'trim_application_mode: production_mask_superset' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'trim_application_auto_fallback: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'keep_production_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'production_mask_superset: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'topology_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'grammar_topology_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'source_history_topology_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'identity_preserving_tree_set: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'validation_oracle:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'validation_strength:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q '\"production_mask_superset\": true' \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" && grep -q '\"topology_exact\": false' \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" && ! grep -q '\"topology_exact\": true' \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_OUT}\" --force-no-vcf --validate > /dev/null"
+                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_binary_four.fa --newick test/wric_binary_four.nwk --refseq test/wric_binary_four.ref --force-no-vcf --wric-polytomy-mode reject --chart-bnb-trim --chart-bnb-apply-trim --chart-bnb-trim-application production-mask --chart-bnb-max-frontier 1000 --chart-bnb-report-json \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" -o \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_OUT}\" > \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && test -s \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_OUT}\" && grep -q 'trim_application_mode: production_mask_superset' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'trim_application_auto_fallback: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'keep_production_exact: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'production_mask_superset: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'topology_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'grammar_topology_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'source_history_topology_exact: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'identity_preserving_tree_set: false' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'validation_oracle:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q 'validation_strength:' \"${CMAKE_BINARY_DIR}/dagutil_chart_bnb_apply_production_mask.out\" && grep -q '\"production_mask_superset\": true' \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" && grep -q '\"topology_exact\": false' \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" && ! grep -q '\"topology_exact\": true' \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" && ! grep -q '\"lazy_chart_used\"' \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_JSON}\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${DAGUTIL_CHART_BNB_PRODUCTION_MASK_OUT}\" --force-no-vcf --validate > /dev/null"
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 set(DAGUTIL_CHART_BNB_APPLY_OUT
@@ -477,8 +506,18 @@ add_test(NAME dagutil_chart_spr_score_local
                  --chart-spr-max-candidates 1
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(dagutil_chart_spr_score_local
-                     PROPERTIES PASS_REGULAR_EXPRESSION
-                     "chart_spr_score_local:")
+	                     PROPERTIES PASS_REGULAR_EXPRESSION
+	                     "chart_spr_score_local:")
+
+add_test(NAME dagutil_chart_spr_lazy_score_local
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --wric-lazy-chart on --chart-spr-score-local --chart-spr-max-candidates 1 > \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_lazy_score_local.out\" && grep -q 'cache_strategy: lazy_multisite_chart' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_lazy_score_local.out\" && grep -q 'wric_lazy_chart: on' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_lazy_score_local.out\" && grep -q 'lazy_chart_used: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_lazy_score_local.out\" && grep -Eq 'lazy_inside_rows_computed: [1-9]' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_lazy_score_local.out\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_chart_spr_lazy_score_local_off_report_contract
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --wric-lazy-chart off --chart-spr-score-local --chart-spr-max-candidates 1 > \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_lazy_score_local_off.out\" && ! grep -q 'wric_lazy_chart:' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_lazy_score_local_off.out\" && ! grep -q 'lazy_chart_used:' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_lazy_score_local_off.out\" && ! grep -q 'lazy_inside_rows_computed:' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_lazy_score_local_off.out\" && ! grep -q 'selected_topology_class_rows_computed:' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_lazy_score_local_off.out\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_chart_spr_search
          COMMAND dagutil
@@ -492,6 +531,16 @@ add_test(NAME dagutil_chart_spr_search
 set_tests_properties(dagutil_chart_spr_search
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "search_mode: phase5_accept_reject_materialize_rebuild")
+
+add_test(NAME dagutil_chart_spr_search_lazy_default_report_contract
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --chart-spr-search --chart-spr-max-candidates 1 > \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_default.out\" && ! grep -q 'wric_lazy_chart:' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_default.out\" && ! grep -q 'lazy_chart_used:' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_default.out\" && ! grep -q 'lazy_inside_rows_computed:' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_default.out\" && ! grep -q 'selected_topology_class_rows_computed:' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_default.out\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_chart_spr_search_lazy_off_report_contract
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --wric-lazy-chart off --chart-spr-search --chart-spr-max-candidates 1 > \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_off.out\" && ! grep -q 'wric_lazy_chart:' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_off.out\" && ! grep -q 'lazy_chart_used:' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_off.out\" && ! grep -q 'lazy_inside_rows_computed:' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_off.out\" && ! grep -q 'selected_topology_class_rows_computed:' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_off.out\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Phase 10 (cross-cutting CLI / report / identity surface).  A local-commit
 # run's emitted report must carry every counter named in the cross-cutting
@@ -537,8 +586,15 @@ add_test(NAME dagutil_chart_spr_search_verification_cold
                  --chart-spr-verification-mode cold
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(dagutil_chart_spr_search_verification_cold
-                     PROPERTIES PASS_REGULAR_EXPRESSION
-                     "verification_mode: cold;transient_chain_extensions_for_verification: 0;local_commit_accepted_moves: [1-9]")
+	                     PROPERTIES PASS_REGULAR_EXPRESSION
+	                     "verification_mode: cold;transient_chain_extensions_for_verification: 0;local_commit_accepted_moves: [1-9]")
+
+set(DAGUTIL_LAZY_POLYTOMY_IDENTITY_JSON
+    "${CMAKE_BINARY_DIR}/lazy_polytomy_identity_report.json")
+add_test(NAME dagutil_wric_lazy_polytomy_fixed_topology_search
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --wric-lazy-chart on --chart-spr-search --chart-spr-acceptance fixed-topology-exact --chart-spr-candidate-selection exhaustive-exact --chart-spr-local-accept-updates --chart-spr-max-candidates 8 --chart-spr-max-iterations 1 --chart-spr-identity-report-json \"${DAGUTIL_LAZY_POLYTOMY_IDENTITY_JSON}\" > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_polytomy_fixed_topology_search.out\" && grep -q 'polytomy_mode: allow' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_polytomy_fixed_topology_search.out\" && grep -q 'wric_lazy_chart: on' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_polytomy_fixed_topology_search.out\" && grep -q 'cache_strategy: lazy_multisite_chart' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_polytomy_fixed_topology_search.out\" && grep -q 'accepted_moves: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_polytomy_fixed_topology_search.out\" && grep -Eq 'spr_multifurcation_moves_generated: [1-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_polytomy_fixed_topology_search.out\" && grep -Eq 'selected_topology_class_rows_computed: [1-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_polytomy_fixed_topology_search.out\" && grep -Eq 'local_commit_accepted_moves: [1-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_polytomy_fixed_topology_search.out\" && grep -q '\"version\":1' \"${DAGUTIL_LAZY_POLYTOMY_IDENTITY_JSON}\" && grep -q 'base_production_keys' \"${DAGUTIL_LAZY_POLYTOMY_IDENTITY_JSON}\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # The chain identity JSON report is emitted to a file and is valid (version 1).
 add_test(NAME dagutil_chart_spr_search_identity_report_json
@@ -963,9 +1019,21 @@ set_tests_properties(larch2_ua_flag_without_ml_warns
 set(LARCH2_CHART_BNB_TRIM_OUT
     "${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.pb.gz")
 add_test(NAME larch2_chart_bnb_trim_mode_writes_dag
-         COMMAND bash -c
-                 "\"$<TARGET_FILE:larch2>\" --dag-pb data/test_5_trees/tree_0.pb.gz -n 0 --trim-mode chart-bnb --wric-polytomy-mode expand-bounded --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 -o \"${LARCH2_CHART_BNB_TRIM_OUT}\" > \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stdout\" 2> \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && test -s \"${LARCH2_CHART_BNB_TRIM_OUT}\" && grep -q 'chart_bnb_trim:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'polytomy_max_shapes_per_polytomy: 1' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'exact_bnb_objective:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'composite_lower_bound_kind: LOWER_BOUND' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'validated_output_parsimony_min:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'validation_strength:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'trim_application_auto_fallback: true' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'refinement_exactness: BOUNDED_REFINED_GRAMMAR' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${LARCH2_CHART_BNB_TRIM_OUT}\" --force-no-vcf --validate > /dev/null"
-         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:larch2>\" --dag-pb data/test_5_trees/tree_0.pb.gz -n 0 --trim-mode chart-bnb --wric-polytomy-mode expand-bounded --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 -o \"${LARCH2_CHART_BNB_TRIM_OUT}\" > \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stdout\" 2> \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && test -s \"${LARCH2_CHART_BNB_TRIM_OUT}\" && grep -q 'chart_bnb_trim:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'polytomy_max_shapes_per_polytomy: 1' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'exact_bnb_objective:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'composite_lower_bound_kind: LOWER_BOUND' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'validated_output_parsimony_min:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'validation_strength:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'trim_application_auto_fallback: true' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && grep -q 'refinement_exactness: BOUNDED_REFINED_GRAMMAR' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && ! grep -q 'wric_lazy_chart:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && ! grep -q 'lazy_chart_used:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && ! grep -q 'lazy_inside_rows_computed:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_trim.stderr\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${LARCH2_CHART_BNB_TRIM_OUT}\" --force-no-vcf --validate > /dev/null"
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+set(LARCH2_CHART_BNB_LAZY_TRIM_OUT
+    "${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim.pb.gz")
+add_test(NAME larch2_chart_bnb_lazy_trim_mode_writes_dag
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:larch2>\" --dag-pb data/test_5_trees/tree_0.pb.gz -n 0 --trim-mode chart-bnb --wric-polytomy-mode expand-bounded --wric-lazy-chart on --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 -o \"${LARCH2_CHART_BNB_LAZY_TRIM_OUT}\" > \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim.stdout\" 2> \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim.stderr\" && test -s \"${LARCH2_CHART_BNB_LAZY_TRIM_OUT}\" && grep -q 'wric_lazy_chart: on' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim.stderr\" && grep -q 'lazy_chart_used: true' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim.stderr\" && grep -q 'lazy_merge_ratio:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim.stderr\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${LARCH2_CHART_BNB_LAZY_TRIM_OUT}\" --force-no-vcf --validate > /dev/null"
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME larch2_chart_bnb_lazy_trim_off_report_contract
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:larch2>\" --dag-pb data/test_5_trees/tree_0.pb.gz -n 0 --trim-mode chart-bnb --wric-polytomy-mode expand-bounded --wric-lazy-chart off --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 -o \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim_off.pb.gz\" > \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim_off.stdout\" 2> \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim_off.stderr\" && test -s \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim_off.pb.gz\" && ! grep -q 'wric_lazy_chart:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim_off.stderr\" && ! grep -q 'lazy_chart_used:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim_off.stderr\" && ! grep -q 'lazy_inside_rows_computed:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim_off.stderr\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME larch2_chart_bnb_allow_gate
 	         COMMAND bash -c

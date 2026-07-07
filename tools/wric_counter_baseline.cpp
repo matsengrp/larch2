@@ -153,10 +153,22 @@ int main() {
                      c.inside_rows_recomputed_on_commit);
   print_counter_line("outside_rows_recomputed_on_commit",
                      c.outside_rows_recomputed_on_commit);
+  print_counter_line("lazy_inside_rows_computed",
+                     c.lazy_inside_rows_computed);
+  print_counter_line("lazy_outside_rows_computed",
+                     c.lazy_outside_rows_computed);
+  print_counter_line("lazy_patterns_merged_max",
+                     c.lazy_patterns_merged_max);
+  print_counter_line("lazy_remerge_collisions",
+                     c.lazy_remerge_collisions);
   print_counter_line("lazy_inside_rows_recomputed_on_commit",
                      c.lazy_inside_rows_recomputed_on_commit);
   print_counter_line("lazy_outside_rows_recomputed_on_commit",
                      c.lazy_outside_rows_recomputed_on_commit);
+  print_counter_line("lazy_incremental_rows_recomputed",
+                     c.lazy_incremental_rows_recomputed);
+  print_counter_line("lazy_structural_class_count_max",
+                     c.lazy_structural_class_count_max);
   print_counter_line("multifurcation_productions_scored",
                      c.multifurcation_productions_scored);
   print_counter_line("local_commit_two_chart_oracle_runs",
@@ -169,6 +181,8 @@ int main() {
                      c.fixed_topology_selected_cache_misses);
   print_counter_line("fixed_topology_selected_rows_computed",
                      c.fixed_topology_selected_rows_computed);
+  print_counter_line("selected_topology_class_rows_computed",
+                     c.selected_topology_class_rows_computed);
   print_counter_line("fixed_topology_persistent_cache_verifications",
                      c.fixed_topology_persistent_cache_verifications);
   print_counter_line("fixed_topology_persistent_cache_fallbacks",
