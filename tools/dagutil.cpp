@@ -2951,6 +2951,10 @@ static void print_chart_spr_search_counter_fields(
       << counters.inside_rows_recomputed_on_commit << "\n";
   out << indent << "outside_rows_recomputed_on_commit: "
       << counters.outside_rows_recomputed_on_commit << "\n";
+  out << indent << "lazy_inside_rows_recomputed_on_commit: "
+      << counters.lazy_inside_rows_recomputed_on_commit << "\n";
+  out << indent << "lazy_outside_rows_recomputed_on_commit: "
+      << counters.lazy_outside_rows_recomputed_on_commit << "\n";
   out << indent << "local_commit_two_chart_oracle_runs: "
       << counters.local_commit_two_chart_oracle_runs << "\n";
   out << indent << "local_commit_tip_grammar_refreshes: "
@@ -3666,6 +3670,10 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.inside_rows_recomputed_on_commit << "\n";
   out << "  outside_rows_recomputed_on_commit: "
       << search.summary.outside_rows_recomputed_on_commit << "\n";
+  out << "  lazy_inside_rows_recomputed_on_commit: "
+      << search.summary.lazy_inside_rows_recomputed_on_commit << "\n";
+  out << "  lazy_outside_rows_recomputed_on_commit: "
+      << search.summary.lazy_outside_rows_recomputed_on_commit << "\n";
   out << "  local_commit_two_chart_oracle_runs: "
       << search.summary.local_commit_two_chart_oracle_runs << "\n";
   out << "  local_commit_tip_grammar_refreshes: "

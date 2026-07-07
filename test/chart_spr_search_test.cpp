@@ -1050,28 +1050,51 @@ static void test_lazy_cache_fixed_topology_conservative_search() {
   std::println("  PASS");
 }
 
-static void test_lazy_cache_local_commit_gate() {
-  std::println("test_lazy_cache_local_commit_gate");
+static void test_lazy_cache_local_commit_updates_lazy_chart() {
+  std::println("test_lazy_cache_local_commit_updates_lazy_chart");
 
   auto dag = larch::test::make_tiny_labelled_tree(
-      "A", four_taxon_misplaced_tree());
-  auto grammar = larch::build_clade_grammar(dag);
+      "A", phase6_arity3_misplaced_tree());
+  larch::clade_grammar_options gopts;
+  gopts.allow_polytomies = true;
+  auto grammar = larch::build_clade_grammar(dag, gopts);
+  CHECK(max_production_arity(grammar) == 3);
 
   larch::chart_spr_search_options options;
   options.acceptance_mode =
       larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 1;
   options.rebuild_after_accept = false;
   options.cache.use_lazy_multisite_chart = true;
+  options.verify_local_commit_two_chart_oracle_for_tests = true;
 
-  bool threw = false;
-  try {
-    (void)larch::run_chart_spr_search(std::move(dag), grammar, options);
-  } catch (std::runtime_error const& e) {
-    threw = true;
-    CHECK(std::string{e.what()}.find("WI5 lazy incremental") !=
-          std::string::npos);
-  }
-  CHECK(threw);
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+  CHECK(search.summary.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  CHECK(search.iterations.size() == 1);
+  auto const& iteration = search.iterations.front();
+  CHECK(iteration.accepted.has_value());
+  CHECK(iteration.accepted_move_committed);
+  CHECK(!iteration.post_materialization_rejected);
+  CHECK(search.counters.local_commit_accepted_moves == 1);
+  CHECK(search.counters.local_commit_two_chart_oracle_runs == 1);
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
+  CHECK(search.counters.overlay_materializations_for_accept_materialization ==
+        0);
+  CHECK(search.counters.inside_rows_recomputed_on_commit > 0);
+  CHECK(search.counters.outside_rows_recomputed_on_commit > 0);
+  CHECK(search.counters.lazy_inside_rows_recomputed_on_commit > 0);
+  CHECK(search.counters.lazy_outside_rows_recomputed_on_commit > 0);
+  CHECK(search.counters.lazy_inside_rows_recomputed_on_commit <=
+        search.counters.inside_rows_recomputed_on_commit);
+  CHECK(search.counters.lazy_outside_rows_recomputed_on_commit <=
+        search.counters.outside_rows_recomputed_on_commit);
+  CHECK(search.summary.lazy_inside_rows_recomputed_on_commit ==
+        search.counters.lazy_inside_rows_recomputed_on_commit);
+  CHECK(search.summary.lazy_outside_rows_recomputed_on_commit ==
+        search.counters.lazy_outside_rows_recomputed_on_commit);
 
   std::println("  PASS");
 }
@@ -4146,6 +4169,48 @@ static void test_phase4_fixed_topology_exact_local_commit() {
   std::println("  PASS");
 }
 
+static void test_lazy_cache_local_commit_sequence_projects_lazy_chart() {
+  std::println("test_lazy_cache_local_commit_sequence_projects_lazy_chart");
+
+  auto fixture = make_three_misplaced_groups_fixture();
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+  options.max_iterations = 12;
+  options.rebuild_after_accept = false;
+  options.cache.use_lazy_multisite_chart = true;
+  options.verify_local_commit_two_chart_oracle_for_tests = true;
+
+  auto search = larch::run_chart_spr_search(std::move(fixture.dag),
+                                            fixture.grammar, options);
+
+  CHECK(search.summary.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  CHECK(search.counters.local_commit_accepted_moves >= 3);
+  CHECK(search.counters.accepted_moves ==
+        search.counters.local_commit_accepted_moves);
+  CHECK(search.counters.local_commit_two_chart_oracle_runs ==
+        search.counters.local_commit_accepted_moves);
+  CHECK(search.counters.local_commit_tip_grammar_refreshes ==
+        search.counters.local_commit_accepted_moves);
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
+  CHECK(search.counters.overlay_materializations_for_accept_materialization ==
+        0);
+  CHECK(search.counters.inside_rows_recomputed_on_commit > 0);
+  CHECK(search.counters.outside_rows_recomputed_on_commit > 0);
+  CHECK(search.counters.lazy_inside_rows_recomputed_on_commit > 0);
+  CHECK(search.counters.lazy_outside_rows_recomputed_on_commit > 0);
+  CHECK(search.summary.lazy_inside_rows_recomputed_on_commit ==
+        search.counters.lazy_inside_rows_recomputed_on_commit);
+  CHECK(search.summary.lazy_outside_rows_recomputed_on_commit ==
+        search.counters.lazy_outside_rows_recomputed_on_commit);
+
+  std::println("  PASS");
+}
+
 // pattern_batches cache strategy + local commit (Phase 4 known-issue #3).
 // chart_spr_refresh_state_tip_view_after_local_commit has a distinct branch
 // for pattern_batches mode (it leaves state.pattern_charts alone and refreshes
@@ -4556,7 +4621,7 @@ int main() {
   test_state_builder_from_dag_rebuilds_patterns_once();
   test_pattern_batch_cache_options_match_all_cache();
   test_lazy_cache_fixed_topology_conservative_search();
-  test_lazy_cache_local_commit_gate();
+  test_lazy_cache_local_commit_updates_lazy_chart();
   test_parallel_local_scores_match_serial();
   test_pattern_batch_nonreplayable_uses_automatic_candidate_batch();
   test_unchartable_grammar_rejected_with_empty_active_patterns();
@@ -4617,6 +4682,7 @@ int main() {
   test_phase4_exact_trim_cache_never_stale();
   test_phase4_multi_worker_matches_serial();
   test_phase4_fixed_topology_exact_local_commit();
+  test_lazy_cache_local_commit_sequence_projects_lazy_chart();
   test_phase4_pattern_batches_local_commit();
   test_phase9_transient_no_full_overlay_materialization();
   test_phase9_transient_oracle_both_charts_green();

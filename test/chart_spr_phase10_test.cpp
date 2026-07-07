@@ -743,6 +743,8 @@ static void test_phase10_counter_contract_fields_exist() {
   (void)c.spr_multifurcation_moves_generated;
   (void)c.inside_rows_recomputed_on_commit;
   (void)c.outside_rows_recomputed_on_commit;
+  (void)c.lazy_inside_rows_recomputed_on_commit;
+  (void)c.lazy_outside_rows_recomputed_on_commit;
   (void)c.local_commit_accepted_moves;
   (void)c.local_commit_tombstone_scope_skips;
   // Summary mirrors.
@@ -754,6 +756,8 @@ static void test_phase10_counter_contract_fields_exist() {
   (void)s.spr_multifurcation_moves_generated;
   (void)s.inside_rows_recomputed_on_commit;
   (void)s.outside_rows_recomputed_on_commit;
+  (void)s.lazy_inside_rows_recomputed_on_commit;
+  (void)s.lazy_outside_rows_recomputed_on_commit;
   (void)s.commit_mode;
   (void)s.verification_mode;
   (void)s.chain_per_accept_exactness_label;

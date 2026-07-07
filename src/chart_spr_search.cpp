@@ -87,14 +87,6 @@ void validate_chart_spr_search_loop_options(
         "rebuild_after_accept=true or score_ua_edge=false.  This is a labelled "
         "unsupported-mode throw, not a silent fallback.");
   }
-  if (!options.rebuild_after_accept &&
-      options.cache.use_lazy_multisite_chart) {
-    throw std::runtime_error(
-        "chart SPR search: local commit (rebuild_after_accept = false) with "
-        "lazy_multisite_chart cache strategy requires WI5 lazy incremental "
-        "commit support; use rebuild_after_accept=true.  This is a labelled "
-        "unsupported-mode throw, not a silent fallback.");
-  }
 }
 
 bool chart_spr_rebuild_after_accept_needs_exact_trim(
@@ -2434,6 +2426,239 @@ struct chart_spr_local_commit_result {
   std::string skip_reason;
 };
 
+struct chart_spr_lazy_commit_stats {
+  std::size_t inside_rows_recomputed = 0;
+  std::size_t outside_rows_recomputed = 0;
+  std::size_t multifurcation_productions_scored = 0;
+};
+
+void chart_spr_recompute_lazy_inside_summary_counters(
+    lazy_multisite_chart& chart) {
+  chart.lazy_inside_rows_computed = 0;
+  chart.lazy_patterns_merged_max = 0;
+  chart.lazy_remerge_collisions = 0;
+  chart.lazy_structural_class_count_max = 0;
+  for (std::size_t clade = 0; clade < chart.inside_rows_by_clade.size();
+       ++clade) {
+    auto const class_count = chart.inside_rows_by_clade[clade].size();
+    chart.lazy_inside_rows_computed += class_count;
+    if (class_count <= chart.pattern_count) {
+      chart.lazy_patterns_merged_max =
+          std::max(chart.lazy_patterns_merged_max,
+                   chart.pattern_count - class_count);
+    }
+    auto structural_count =
+        clade < chart.structural_class_count_by_clade.size()
+            ? chart.structural_class_count_by_clade[clade]
+            : std::size_t{0};
+    chart.lazy_structural_class_count_max =
+        std::max(chart.lazy_structural_class_count_max, structural_count);
+    if (structural_count > class_count) {
+      chart.lazy_remerge_collisions += structural_count - class_count;
+    }
+  }
+}
+
+void chart_spr_recompute_lazy_outside_summary_counters(
+    lazy_multisite_chart& chart) {
+  chart.lazy_outside_rows_computed = 0;
+  for (auto const& rows : chart.outside_rows_by_clade) {
+    chart.lazy_outside_rows_computed += rows.size();
+  }
+}
+
+lazy_multisite_chart chart_spr_project_lazy_chart_to_materialized(
+    lazy_multisite_chart const& previous,
+    overlay_materialization_result const& materialized,
+    std::vector<overlay_clade_ref> const& previous_dense_clade_to_ref) {
+  if (previous_dense_clade_to_ref.size() !=
+      previous.inside_rows_by_clade.size()) {
+    throw std::runtime_error(
+        "chart SPR lazy local commit: previous dense clade map size mismatch");
+  }
+
+  lazy_multisite_chart next;
+  auto clade_count = materialized.grammar.clades.size();
+  next.inside_rows_by_clade.resize(clade_count);
+  next.outside_rows_by_clade.resize(clade_count);
+  next.class_index_by_pattern_by_clade.resize(clade_count);
+  next.structural_class_index_by_pattern_by_clade.resize(clade_count);
+  next.outside_class_index_by_pattern_by_clade.resize(clade_count);
+  next.structural_class_count_by_clade.assign(clade_count, 0);
+  next.class_weight_by_clade.resize(clade_count);
+  next.outside_class_weight_by_clade.resize(clade_count);
+  next.outside_global_min_by_pattern = previous.outside_global_min_by_pattern;
+  next.pattern_count = previous.pattern_count;
+  next.total_pattern_weight = previous.total_pattern_weight;
+  next.multifurcation_productions_scored =
+      previous.multifurcation_productions_scored;
+  next.outside_multifurcation_productions_scored =
+      previous.outside_multifurcation_productions_scored;
+
+  std::map<overlay_clade_ref, clade_id> previous_dense_by_ref;
+  for (clade_id dense = 0; dense < previous_dense_clade_to_ref.size();
+       ++dense) {
+    previous_dense_by_ref.emplace(previous_dense_clade_to_ref[dense], dense);
+  }
+
+  auto copy_slot = [](auto const& from, auto& to, clade_id old_dense,
+                      clade_id new_dense) {
+    if (old_dense < from.size() && new_dense < to.size()) {
+      to[new_dense] = from[old_dense];
+    }
+  };
+
+  for (clade_id dense = 0; dense < materialized.dense_clade_to_ref.size();
+       ++dense) {
+    auto it = previous_dense_by_ref.find(materialized.dense_clade_to_ref[dense]);
+    if (it == previous_dense_by_ref.end()) continue;
+    auto old_dense = it->second;
+    copy_slot(previous.inside_rows_by_clade, next.inside_rows_by_clade,
+              old_dense, dense);
+    copy_slot(previous.outside_rows_by_clade, next.outside_rows_by_clade,
+              old_dense, dense);
+    copy_slot(previous.class_index_by_pattern_by_clade,
+              next.class_index_by_pattern_by_clade, old_dense, dense);
+    copy_slot(previous.structural_class_index_by_pattern_by_clade,
+              next.structural_class_index_by_pattern_by_clade, old_dense,
+              dense);
+    copy_slot(previous.outside_class_index_by_pattern_by_clade,
+              next.outside_class_index_by_pattern_by_clade, old_dense, dense);
+    copy_slot(previous.structural_class_count_by_clade,
+              next.structural_class_count_by_clade, old_dense, dense);
+    copy_slot(previous.class_weight_by_clade, next.class_weight_by_clade,
+              old_dense, dense);
+    copy_slot(previous.outside_class_weight_by_clade,
+              next.outside_class_weight_by_clade, old_dense, dense);
+  }
+
+  return next;
+}
+
+void chart_spr_clear_lazy_inside_clade(lazy_multisite_chart& chart,
+                                       clade_id clade) {
+  chart.inside_rows_by_clade[clade].clear();
+  chart.class_index_by_pattern_by_clade[clade] = std::nullopt;
+  chart.structural_class_index_by_pattern_by_clade[clade] = std::nullopt;
+  chart.structural_class_count_by_clade[clade] = 0;
+  chart.class_weight_by_clade[clade].clear();
+}
+
+void chart_spr_clear_lazy_outside_clade(lazy_multisite_chart& chart,
+                                        clade_id clade) {
+  chart.outside_rows_by_clade[clade].clear();
+  chart.outside_class_index_by_pattern_by_clade[clade] = std::nullopt;
+  chart.outside_class_weight_by_clade[clade].clear();
+}
+
+void chart_spr_initialize_lazy_root_outside(
+    lazy_multisite_chart& chart, clade_grammar const& grammar,
+    site_pattern_set const& patterns, chart_options const& options) {
+  if (options.score_ua_edge) {
+    throw std::runtime_error(
+        "chart SPR lazy local commit: score_ua_edge=true outside refresh "
+        "requires a reference-state convention");
+  }
+  auto root = grammar.root_clade;
+  if (root == no_clade || root >= grammar.clades.size()) {
+    throw std::runtime_error(
+        "chart SPR lazy local commit: root clade out of range");
+  }
+  auto root_row = parsimony_chart_detail::make_inf_row();
+  for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+    root_row[state] = 0;
+  }
+  chart.outside_rows_by_clade[root].push_back(root_row);
+  chart.outside_class_index_by_pattern_by_clade[root] =
+      std::vector<std::size_t>(chart.pattern_count, 0);
+  chart.outside_class_weight_by_clade[root].push_back(0);
+  chart.outside_global_min_by_pattern.assign(chart.pattern_count, chart_inf);
+  for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
+    lazy_chart_detail::checked_add_weight(
+        chart.outside_class_weight_by_clade[root].front(),
+        patterns.patterns[pattern].weight, "root outside class");
+    auto const& inside_root = chart.inside_row(root, pattern);
+    chart_cost best = chart_inf;
+    for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+      best = std::min(best, parsimony_chart_detail::saturated_add(
+                                inside_root[state], root_row[state]));
+    }
+    chart.outside_global_min_by_pattern[pattern] = best;
+  }
+}
+
+chart_spr_lazy_commit_stats chart_spr_refresh_lazy_chart_after_local_commit(
+    chart_spr_search_state& state, overlay_chain const& chain,
+    overlay_materialization_result const& materialized,
+    std::vector<overlay_clade_ref> const& previous_dense_clade_to_ref) {
+  if (state.cache_strategy != chart_spr_cache_strategy::lazy_multisite_chart) {
+    return {};
+  }
+  if (!state.lazy_chart) {
+    throw std::runtime_error(
+        "chart SPR lazy local commit: missing lazy chart");
+  }
+  if (state.chart_opts.score_ua_edge) {
+    throw std::runtime_error(
+        "chart SPR lazy local commit: score_ua_edge=true is not supported");
+  }
+
+  chart_spr_lazy_commit_stats stats;
+  auto next = chart_spr_project_lazy_chart_to_materialized(
+      *state.lazy_chart, materialized, previous_dense_clade_to_ref);
+  auto const& patterns = state.active_patterns.patterns;
+
+  lazy_chart_options lazy_options;
+  lazy_options.chart = state.chart_opts;
+  lazy_options.chart.keep_trace = false;
+  lazy_options.chart.max_trace_choices = 0;
+  lazy_options.retain_all_inside_class_maps = true;
+
+  auto inside_multifurcation_before =
+      next.multifurcation_productions_scored;
+  auto inside_affected = compute_chain_inside_affected_set(chain);
+  for (auto ref : inside_affected) {
+    auto dense = chart_spr_detail::dense_clade_id(materialized, ref);
+    chart_spr_clear_lazy_inside_clade(next, dense);
+    if (materialized.grammar.clades[dense].taxa.size() == 1) {
+      lazy_chart_detail::assign_leaf_classes(next, materialized.grammar,
+                                             patterns, dense, lazy_options);
+    } else {
+      lazy_chart_detail::assign_internal_classes(next, materialized.grammar,
+                                                 patterns, dense);
+    }
+    stats.inside_rows_recomputed += next.inside_rows_by_clade[dense].size();
+  }
+  stats.multifurcation_productions_scored +=
+      next.multifurcation_productions_scored -
+      inside_multifurcation_before;
+  chart_spr_recompute_lazy_inside_summary_counters(next);
+
+  auto outside_multifurcation_before =
+      next.outside_multifurcation_productions_scored;
+  auto outside_affected = compute_chain_outside_affected_set(chain);
+  for (auto ref : outside_affected) {
+    auto dense = chart_spr_detail::dense_clade_id(materialized, ref);
+    chart_spr_clear_lazy_outside_clade(next, dense);
+    if (dense == materialized.grammar.root_clade) {
+      chart_spr_initialize_lazy_root_outside(
+          next, materialized.grammar, patterns, state.chart_opts);
+    } else {
+      lazy_chart_detail::assign_outside_classes_for_clade(
+          next, materialized.grammar, patterns, dense);
+    }
+    stats.outside_rows_recomputed +=
+        next.outside_rows_by_clade[dense].size();
+  }
+  stats.multifurcation_productions_scored +=
+      next.outside_multifurcation_productions_scored -
+      outside_multifurcation_before;
+  chart_spr_recompute_lazy_outside_summary_counters(next);
+
+  state.lazy_chart = std::move(next);
+  return stats;
+}
+
 // Phase 3 two-chart oracle self-check: recompute BOTH charts from scratch on
 // the materialized chain and assert the persistent caches agree on every
 // reachable clade, every active pattern.  This is the load-bearing guard
@@ -2442,7 +2667,8 @@ struct chart_spr_local_commit_result {
 // test; kept in the .cpp so enabling it is a test-only flag.
 void chart_spr_assert_local_commit_two_chart_oracle(
     overlay_chain const& chain, inside_chart_cache const& icache,
-    outside_chart_cache const& ocache, std::string const& context) {
+    outside_chart_cache const& ocache, std::string const& context,
+    lazy_multisite_chart const* lazy = nullptr) {
   auto materialized = materialize_overlay_chain(chain);
   auto const& grammar = materialized.grammar;
   if (materialized.dense_clade_to_ref.size() != grammar.clades.size()) {
@@ -2477,12 +2703,32 @@ void chart_spr_assert_local_commit_two_chart_oracle(
             "]: outside row mismatch at pattern " + std::to_string(p) +
             " dense clade " + std::to_string(dense));
       }
+      if (lazy != nullptr &&
+          lazy->inside_row(dense, p) != oracle.first.inside[dense]) {
+        throw std::runtime_error(
+            "chart SPR local-commit two-chart oracle [" + context +
+            "]: lazy inside row mismatch at pattern " + std::to_string(p) +
+            " dense clade " + std::to_string(dense));
+      }
+      if (lazy != nullptr &&
+          lazy->outside_row(dense, p) != oracle.second.outside[dense]) {
+        throw std::runtime_error(
+            "chart SPR local-commit two-chart oracle [" + context +
+            "]: lazy outside row mismatch at pattern " + std::to_string(p) +
+            " dense clade " + std::to_string(dense));
+      }
     }
     if (outside_cache_global_min(ocache, icache, p) !=
         oracle.second.global_min) {
       throw std::runtime_error(
           "chart SPR local-commit two-chart oracle [" + context +
           "]: global_min mismatch at pattern " + std::to_string(p));
+    }
+    if (lazy != nullptr &&
+        lazy->outside_global_min(p) != oracle.second.global_min) {
+      throw std::runtime_error(
+          "chart SPR local-commit two-chart oracle [" + context +
+          "]: lazy global_min mismatch at pattern " + std::to_string(p));
     }
   }
 }
@@ -2541,6 +2787,21 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
     state.pattern_charts = std::move(refreshed);
     state.resident_pattern_cache_bytes =
         estimate_chart_spr_pattern_cache_bytes(state);
+  } else if (state.cache_strategy ==
+             chart_spr_cache_strategy::lazy_multisite_chart) {
+    if (!state.lazy_chart) {
+      throw std::runtime_error(
+          "chart SPR local-commit tip refresh: missing lazy chart");
+    }
+    if (state.lazy_chart->inside_rows_by_clade.size() !=
+        materialized.grammar.clades.size()) {
+      throw std::runtime_error(
+          "chart SPR local-commit tip refresh: lazy chart clade count "
+          "mismatch");
+    }
+    std::vector<pattern_chart_cache_entry>{}.swap(state.pattern_charts);
+    state.resident_pattern_cache_bytes =
+        estimate_chart_spr_pattern_cache_bytes(state);
   } else {
     // pattern_batches strategy: there are no resident base rows to refresh; the
     // next scoring batch rebuilds base rows once per pattern batch from the
@@ -2552,18 +2813,28 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
         estimate_chart_spr_pattern_row_cache_bytes(state.grammar);
   }
 
-  // Composite lower bound from the authoritative icache root rows (Phase 4
-  // local commit currently rejects score_ua_edge=true before substrate build;
-  // conservative mode continues to support the UA-edge convention).
-  auto composite_with_invariants =
-      inside_cache_composite_lower_bound_with_invariants(icache);
-  if (icache.invariant_constant_offset > composite_with_invariants) {
-    throw std::runtime_error(
-        "chart SPR local-commit tip refresh: composite below invariant offset");
+  std::uint64_t composite_without_invariants = 0;
+  if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+    composite_without_invariants = lazy_composite_lower_bound(
+        state.grammar, state.active_patterns.patterns, *state.lazy_chart,
+        state.chart_opts);
+  } else {
+    auto composite_with_invariants =
+        inside_cache_composite_lower_bound_with_invariants(icache);
+    if (icache.invariant_constant_offset > composite_with_invariants) {
+      throw std::runtime_error(
+          "chart SPR local-commit tip refresh: composite below invariant "
+          "offset");
+    }
+    composite_without_invariants =
+        composite_with_invariants - state.invariant_constant_offset;
   }
-  state.composite_lower_bound_with_invariants = composite_with_invariants;
   state.composite_lower_bound_without_invariants =
-      composite_with_invariants - state.invariant_constant_offset;
+      composite_without_invariants;
+  state.composite_lower_bound_with_invariants =
+      chart_multisite_detail::checked_add_u64(
+          composite_without_invariants, state.invariant_constant_offset,
+          "chart-SPR local commit lazy lower bound invariant offset");
 
   // Exact-trim cache: invalidated by the commit (Phase 2 hook); recomputed
   // lazily by the next exact gate.  Leaving it absent here is the WI3
@@ -2662,7 +2933,10 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     // full_overlay_materializations.  Eliminating it entirely (direct in-place
     // splice) is Phase 6/7 scope; the persistent caches already remove the
     // expensive per-accept chart rescoring.
+    auto previous_dense_clade_to_chain_ref = sub.dense_clade_to_chain_ref;
     auto materialized = materialize_overlay_chain(*sub.chain);
+    auto lazy_stats = chart_spr_refresh_lazy_chart_after_local_commit(
+        state, *sub.chain, materialized, previous_dense_clade_to_chain_ref);
     chart_spr_set_tip_maps_from_materialization(sub, materialized);
     ++counters.local_commit_tip_grammar_refreshes;
     chart_spr_refresh_state_tip_view_after_local_commit(state, materialized,
@@ -2674,6 +2948,10 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
         sub.icache->inside_rows_recomputed_on_commit;
     counters.outside_rows_recomputed_on_commit =
         sub.ocache->outside_rows_recomputed_on_commit;
+    counters.lazy_inside_rows_recomputed_on_commit +=
+        lazy_stats.inside_rows_recomputed;
+    counters.lazy_outside_rows_recomputed_on_commit +=
+        lazy_stats.outside_rows_recomputed;
     auto cache_multifurcation_productions_scored =
         sub.icache->multifurcation_productions_scored +
         sub.ocache->multifurcation_productions_scored;
@@ -2685,7 +2963,8 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     }
     counters.multifurcation_productions_scored +=
         cache_multifurcation_productions_scored -
-        sub.cache_multifurcation_productions_scored_reported;
+        sub.cache_multifurcation_productions_scored_reported +
+        lazy_stats.multifurcation_productions_scored;
     sub.cache_multifurcation_productions_scored_reported =
         cache_multifurcation_productions_scored;
 
@@ -2693,7 +2972,8 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     if (options.verify_local_commit_two_chart_oracle_for_tests) {
       chart_spr_assert_local_commit_two_chart_oracle(
           *sub.chain, *sub.icache, *sub.ocache,
-          "after commit " + std::to_string(sub.chain->size()));
+          "after commit " + std::to_string(sub.chain->size()),
+          state.lazy_chart ? &*state.lazy_chart : nullptr);
       ++counters.local_commit_two_chart_oracle_runs;
     }
   } catch (std::exception const& e) {
@@ -2737,6 +3017,10 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.inside_rows_recomputed_on_commit;
   summary.outside_rows_recomputed_on_commit =
       counters.outside_rows_recomputed_on_commit;
+  summary.lazy_inside_rows_recomputed_on_commit =
+      counters.lazy_inside_rows_recomputed_on_commit;
+  summary.lazy_outside_rows_recomputed_on_commit =
+      counters.lazy_outside_rows_recomputed_on_commit;
   summary.local_commit_two_chart_oracle_runs =
       counters.local_commit_two_chart_oracle_runs;
   summary.local_commit_tip_grammar_refreshes =

@@ -118,6 +118,11 @@ struct chart_spr_search_counters {
   // in the search counters / summary without exposing the cache objects.
   std::size_t inside_rows_recomputed_on_commit = 0;
   std::size_t outside_rows_recomputed_on_commit = 0;
+  // Lazy local-commit recomputations count class rows, not dense
+  // (pattern, clade) rows.  They are kept separate so a lazy run can report
+  // the affected persistent-cache rows and the smaller lazy work surface.
+  std::size_t lazy_inside_rows_recomputed_on_commit = 0;
+  std::size_t lazy_outside_rows_recomputed_on_commit = 0;
   // Number of times the Phase-4 self-check two-chart oracle ran after a local
   // commit (only when verify_local_commit_two_chart_oracle_for_tests is set).
   std::size_t local_commit_two_chart_oracle_runs = 0;
@@ -748,6 +753,8 @@ struct chart_spr_search_summary {
   std::size_t local_commit_tombstone_scope_skips = 0;
   std::size_t inside_rows_recomputed_on_commit = 0;
   std::size_t outside_rows_recomputed_on_commit = 0;
+  std::size_t lazy_inside_rows_recomputed_on_commit = 0;
+  std::size_t lazy_outside_rows_recomputed_on_commit = 0;
   std::size_t local_commit_two_chart_oracle_runs = 0;
   std::size_t local_commit_tip_grammar_refreshes = 0;
   std::size_t fixed_topology_selected_cache_hits = 0;
@@ -1343,6 +1350,9 @@ inline std::size_t estimate_chart_spr_pattern_cache_bytes(
     for (auto const& rows : state.lazy_chart->inside_rows_by_clade) {
       total += rows.size() * sizeof(lazy_multisite_chart::row_type);
     }
+    for (auto const& rows : state.lazy_chart->outside_rows_by_clade) {
+      total += rows.size() * sizeof(lazy_multisite_chart::row_type);
+    }
     for (auto const& map : state.lazy_chart->class_index_by_pattern_by_clade) {
       if (map) total += map->size() * sizeof(std::size_t);
     }
@@ -1350,11 +1360,21 @@ inline std::size_t estimate_chart_spr_pattern_cache_bytes(
          state.lazy_chart->structural_class_index_by_pattern_by_clade) {
       if (map) total += map->size() * sizeof(std::size_t);
     }
+    for (auto const& map :
+         state.lazy_chart->outside_class_index_by_pattern_by_clade) {
+      if (map) total += map->size() * sizeof(std::size_t);
+    }
     for (auto const& weights : state.lazy_chart->class_weight_by_clade) {
+      total += weights.size() * sizeof(std::uint32_t);
+    }
+    for (auto const& weights :
+         state.lazy_chart->outside_class_weight_by_clade) {
       total += weights.size() * sizeof(std::uint32_t);
     }
     total += state.lazy_chart->structural_class_count_by_clade.size() *
              sizeof(std::size_t);
+    total += state.lazy_chart->outside_global_min_by_pattern.size() *
+             sizeof(chart_cost);
     return total;
   }
   std::size_t total = state.pattern_charts.size() *
@@ -1439,11 +1459,17 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     lazy_options.retain_all_inside_class_maps = true;
     state.lazy_chart = build_lazy_inside_chart(
         state.grammar, state.active_patterns.patterns, lazy_options);
+    if (!options.score_ua_edge) {
+      build_lazy_outside_chart_in_place(
+          state.grammar, state.active_patterns.patterns, *state.lazy_chart,
+          options);
+    }
     active_total = lazy_composite_lower_bound(
         state.grammar, state.active_patterns.patterns, *state.lazy_chart,
         options);
     state.counters.multifurcation_productions_scored +=
-        state.lazy_chart->multifurcation_productions_scored;
+        state.lazy_chart->multifurcation_productions_scored +
+        state.lazy_chart->outside_multifurcation_productions_scored;
     state.resident_pattern_cache_bytes =
         estimate_chart_spr_pattern_cache_bytes(state);
   } else {
@@ -2409,6 +2435,10 @@ inline void add_chart_spr_search_counters(
       src.inside_rows_recomputed_on_commit;
   dst.outside_rows_recomputed_on_commit +=
       src.outside_rows_recomputed_on_commit;
+  dst.lazy_inside_rows_recomputed_on_commit +=
+      src.lazy_inside_rows_recomputed_on_commit;
+  dst.lazy_outside_rows_recomputed_on_commit +=
+      src.lazy_outside_rows_recomputed_on_commit;
   dst.local_commit_two_chart_oracle_runs +=
       src.local_commit_two_chart_oracle_runs;
   dst.local_commit_tip_grammar_refreshes +=
