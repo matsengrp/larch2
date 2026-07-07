@@ -7,7 +7,7 @@ set -euo pipefail
 # The only permitted direct reference to the chart_multisite_detail helper is
 # the single call inside chart_spr_weighted_root_score_from_row().
 pattern='chart_multisite_detail::weighted_root_score_from_row'
-wrapper_file='include/larch/chart_spr_search.hpp'
+wrapper_file='include/larch/chart_spr.hpp'
 wrapper_name='chart_spr_weighted_root_score_from_row'
 
 is_wrapper_occurrence() {

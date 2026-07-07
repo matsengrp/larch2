@@ -611,17 +611,6 @@ inline char const* chart_spr_score_convention_name(
   return "unknown";
 }
 
-// Single chart-SPR root-row scoring entry point.  It delegates to the checked
-// multi-site chart helper so every search cache/local scorer handles
-// score_ua_edge=true compressed patterns the same way: reference-state counts
-// are applied to the full root row, not to a pre-collapsed scalar root minimum.
-inline std::uint64_t chart_spr_weighted_root_score_from_row(
-    std::array<chart_cost, nuc_state_count> const& root_row,
-    site_pattern const& pattern, chart_options const& options) {
-  return chart_multisite_detail::weighted_root_score_from_row(root_row, pattern,
-                                                              options);
-}
-
 struct chart_spr_objective_score {
   spr_score_result value;
   chart_spr_score_kind kind = chart_spr_score_kind::composite_lower_bound;

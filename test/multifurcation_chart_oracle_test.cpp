@@ -358,6 +358,21 @@ static larch::site_pattern_set make_pattern_set_from_strings(
   return make_pattern_set(std::move(states_by_pattern));
 }
 
+static larch::site_pattern_set with_cycling_reference_counts(
+    larch::site_pattern_set patterns) {
+  for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+       ++pattern_index) {
+    auto& pattern = patterns.patterns[pattern_index];
+    pattern.reference_state_counts.fill(0);
+    for (std::uint32_t copy = 0; copy < pattern.weight; ++copy) {
+      auto state = static_cast<std::uint8_t>(
+          (pattern_index + copy) % larch::nuc_state_count);
+      ++pattern.reference_state_counts[state];
+    }
+  }
+  return patterns;
+}
+
 static larch::site_pattern_set lazy_oracle_patterns(std::size_t taxon_count) {
   std::vector<std::vector<std::uint8_t>> states_by_pattern;
   auto all_a = std::vector<std::uint8_t>(taxon_count, larch::nuc_base::A);
@@ -487,6 +502,37 @@ static void check_lazy_inside_default_keeps_root_maps_only(
     if (cid == grammar.root_clade) continue;
     CHECK(!lazy.class_index_by_pattern_by_clade[cid]);
     CHECK(!lazy.structural_class_index_by_pattern_by_clade[cid]);
+  }
+}
+
+static void check_lazy_composite_matches_dense(
+    larch::clade_grammar const& grammar,
+    larch::site_pattern_set const& patterns,
+    larch::chart_options options = {}) {
+  auto lazy = larch::build_lazy_inside_chart(grammar, patterns);
+  auto dense = larch::build_composite_chart_score(grammar, patterns, options);
+  auto lazy_score =
+      larch::lazy_composite_chart_score(grammar, patterns, lazy, options);
+
+  CHECK(larch::lazy_composite_lower_bound(grammar, patterns, lazy, options) ==
+        dense.weighted_lower_bound);
+  CHECK(lazy_score.weighted_lower_bound == dense.weighted_lower_bound);
+  CHECK(lazy_score.per_pattern_root_min == dense.per_pattern_root_min);
+  CHECK(lazy_score.per_pattern_root_min_by_reference_state ==
+        dense.per_pattern_root_min_by_reference_state);
+  CHECK(lazy_score.multifurcation_productions_scored ==
+        lazy.multifurcation_productions_scored);
+
+  for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+       ++pattern_index) {
+    larch::leaf_site_states states;
+    states.state_by_taxon = patterns.patterns[pattern_index].state_by_taxon;
+    auto dense_chart = larch::build_single_site_chart(grammar, states);
+    auto dense_score = larch::chart_multisite_detail::weighted_root_score_from_row(
+        dense_chart.inside[grammar.root_clade], patterns.patterns[pattern_index],
+        options);
+    CHECK(larch::lazy_weighted_root_score_from_row(
+              grammar, patterns, lazy, pattern_index, options) == dense_score);
   }
 }
 
@@ -766,6 +812,8 @@ static void test_alternative_multifurcating_productions() {
   CHECK(chart.inside[grammar.root_clade] == brute_min_row(rows));
   check_lazy_inside_matches_dense(
       grammar, exhaustive_ac_mask_patterns(grammar.taxa.id_to_sample_id.size()));
+  check_lazy_composite_matches_dense(
+      grammar, exhaustive_ac_mask_patterns(grammar.taxa.id_to_sample_id.size()));
   check_lazy_outside_matches_dense(
       grammar, exhaustive_ac_mask_patterns(grammar.taxa.id_to_sample_id.size()));
   check_lazy_inside_matches_dense(
@@ -877,9 +925,13 @@ static void test_lazy_inside_binary_fixture() {
       built, make_pattern_set_from_strings({"AAAA", "AACC", "ACGT", "CCAA",
                                             "TTTT", "AGAG"}));
   check_lazy_inside_matches_dense(built, exhaustive_ac_mask_patterns(4));
+  check_lazy_composite_matches_dense(built, exhaustive_ac_mask_patterns(4));
   check_lazy_outside_matches_dense(built, exhaustive_ac_mask_patterns(4));
   larch::chart_options ua_edge;
   ua_edge.score_ua_edge = true;
+  check_lazy_composite_matches_dense(
+      built, with_cycling_reference_counts(exhaustive_ac_mask_patterns(4)),
+      ua_edge);
   check_lazy_outside_matches_dense(built, exhaustive_ac_mask_patterns(4),
                                    ua_edge, larch::nuc_base::G);
   check_lazy_inside_matches_dense(built, random_lazy_oracle_patterns(4, 24, 17));
@@ -902,9 +954,19 @@ static void test_lazy_inside_multifurcation_fixtures() {
     check_lazy_inside_matches_dense(
         built.grammar,
         exhaustive_ac_mask_patterns(built.grammar.taxa.id_to_sample_id.size()));
+    check_lazy_composite_matches_dense(
+        built.grammar,
+        exhaustive_ac_mask_patterns(built.grammar.taxa.id_to_sample_id.size()));
     check_lazy_outside_matches_dense(
         built.grammar,
         exhaustive_ac_mask_patterns(built.grammar.taxa.id_to_sample_id.size()));
+    larch::chart_options ua_edge;
+    ua_edge.score_ua_edge = true;
+    check_lazy_composite_matches_dense(
+        built.grammar,
+        with_cycling_reference_counts(
+            exhaustive_ac_mask_patterns(built.grammar.taxa.id_to_sample_id.size())),
+        ua_edge);
     check_lazy_inside_matches_dense(
         built.grammar, lazy_oracle_patterns(built.grammar.taxa.id_to_sample_id.size()));
     check_lazy_inside_matches_dense(
@@ -923,6 +985,9 @@ static void test_lazy_inside_multifurcation_fixtures() {
     check_lazy_inside_matches_dense(
         built.grammar,
         exhaustive_ac_mask_patterns(built.grammar.taxa.id_to_sample_id.size()));
+    check_lazy_composite_matches_dense(
+        built.grammar,
+        exhaustive_ac_mask_patterns(built.grammar.taxa.id_to_sample_id.size()));
     check_lazy_outside_matches_dense(
         built.grammar,
         exhaustive_ac_mask_patterns(built.grammar.taxa.id_to_sample_id.size()));
@@ -939,6 +1004,9 @@ static void test_lazy_inside_multifurcation_fixtures() {
     auto built = build_allowing_polytomies(dag);
     CHECK(max_production_arity(built.grammar) == 5);
     check_lazy_inside_matches_dense(
+        built.grammar,
+        exhaustive_ac_mask_patterns(built.grammar.taxa.id_to_sample_id.size()));
+    check_lazy_composite_matches_dense(
         built.grammar,
         exhaustive_ac_mask_patterns(built.grammar.taxa.id_to_sample_id.size()));
     check_lazy_outside_matches_dense(
@@ -962,6 +1030,9 @@ static void test_lazy_inside_multifurcation_fixtures() {
     auto built = build_allowing_polytomies(dag);
     CHECK(max_production_arity(built.grammar) == 3);
     check_lazy_inside_matches_dense(
+        built.grammar,
+        exhaustive_ac_mask_patterns(built.grammar.taxa.id_to_sample_id.size()));
+    check_lazy_composite_matches_dense(
         built.grammar,
         exhaustive_ac_mask_patterns(built.grammar.taxa.id_to_sample_id.size()));
     check_lazy_outside_matches_dense(

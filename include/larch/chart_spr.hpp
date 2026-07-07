@@ -25,6 +25,17 @@
 
 namespace larch {
 
+// Single chart-SPR root-row scoring entry point.  It delegates to the checked
+// multi-site chart helper so every search cache/local scorer handles
+// score_ua_edge=true compressed patterns the same way: reference-state counts
+// are applied to the full root row, not to a pre-collapsed scalar root minimum.
+inline std::uint64_t chart_spr_weighted_root_score_from_row(
+    std::array<chart_cost, nuc_state_count> const& root_row,
+    site_pattern const& pattern, chart_options const& options) {
+  return chart_multisite_detail::weighted_root_score_from_row(root_row, pattern,
+                                                              options);
+}
+
 // Sidecar SPR / rewrite overlay IDs deliberately keep base and temporary ID
 // spaces distinct at API boundaries.  Dense integer remaps are built only as an
 // implementation detail when a chart over an overlay grammar is required.

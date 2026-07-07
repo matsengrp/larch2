@@ -1,5 +1,6 @@
 #pragma once
 
+#include <larch/chart_spr.hpp>
 #include <larch/parsimony_chart.hpp>
 #include <larch/site_patterns.hpp>
 #include <larch/chart_trim.hpp>
@@ -974,6 +975,119 @@ inline void finalize_outside_counters(lazy_multisite_chart& chart) {
   }
 }
 
+inline void validate_lazy_inside_score_inputs(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    lazy_multisite_chart const& chart, chart_options const& options,
+    std::string_view context) {
+  chart_multisite_detail::validate_multisite_inputs(grammar, patterns, options);
+  if (chart.pattern_count != patterns.patterns.size()) {
+    throw std::runtime_error(std::string{context} +
+                             ": pattern count does not match lazy chart");
+  }
+  if (chart.inside_rows_by_clade.size() != grammar.clades.size() ||
+      chart.class_weight_by_clade.size() != grammar.clades.size() ||
+      chart.class_index_by_pattern_by_clade.size() != grammar.clades.size()) {
+    throw std::runtime_error(std::string{context} +
+                             ": lazy inside chart clade count mismatch");
+  }
+}
+
+inline lazy_multisite_chart::row_type const& root_inside_row_for_pattern(
+    lazy_multisite_chart const& chart, clade_id root, std::size_t pattern) {
+  if (root == no_clade || root >= chart.inside_rows_by_clade.size()) {
+    throw std::runtime_error("lazy root score: root clade out of range");
+  }
+  if (pattern >= chart.pattern_count) {
+    throw std::runtime_error("lazy root score: pattern index out of range");
+  }
+  auto const& map = chart.class_index_by_pattern_by_clade[root];
+  if (!map) {
+    throw std::runtime_error(
+        "lazy root score: root inside class map was not retained");
+  }
+  auto class_index = (*map)[pattern];
+  auto const& rows = chart.inside_rows_by_clade[root];
+  if (class_index >= rows.size()) {
+    throw std::runtime_error("lazy root score: root class index out of range");
+  }
+  return rows[class_index];
+}
+
+inline std::uint64_t lazy_root_class_score_total(
+    site_pattern_set const& patterns, lazy_multisite_chart const& chart,
+    clade_id root, chart_options const& options, std::string_view context) {
+  auto const& root_rows = chart.inside_rows_by_clade[root];
+  if (root >= chart.class_weight_by_clade.size() ||
+      chart.class_weight_by_clade[root].size() != root_rows.size()) {
+    throw std::runtime_error(std::string{context} +
+                             ": root class weights mismatch");
+  }
+
+  std::uint64_t total = 0;
+  if (!options.score_ua_edge) {
+    for (std::size_t class_index = 0; class_index < root_rows.size();
+         ++class_index) {
+      auto contribution = chart_multisite_detail::checked_mul_cost(
+          chart.class_weight_by_clade[root][class_index],
+          chart_multisite_detail::row_min(root_rows[class_index]),
+          "lazy composite weighted root cost");
+      total = chart_multisite_detail::checked_add_u64(
+          total, contribution, "lazy composite lower bound");
+    }
+    return total;
+  }
+
+  auto const& root_map = chart.class_index_by_pattern_by_clade[root];
+  if (!root_map) {
+    throw std::runtime_error(std::string{context} +
+                             ": root inside class map was not retained");
+  }
+  std::vector<std::array<std::uint64_t, nuc_state_count>> counts_by_class(
+      root_rows.size());
+  for (auto& counts : counts_by_class) counts.fill(0);
+  for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+       ++pattern_index) {
+    auto class_index = (*root_map)[pattern_index];
+    if (class_index >= root_rows.size()) {
+      throw std::runtime_error(std::string{context} +
+                               ": root class index out of range");
+    }
+    auto const& pattern = patterns.patterns[pattern_index];
+    for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+         ++reference_state) {
+      counts_by_class[class_index][reference_state] =
+          chart_multisite_detail::checked_add_u64(
+              counts_by_class[class_index][reference_state],
+              pattern.reference_state_counts[reference_state],
+              "lazy composite reference-state count");
+    }
+  }
+  for (std::size_t class_index = 0; class_index < root_rows.size();
+       ++class_index) {
+    auto const& row = root_rows[class_index];
+    for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+         ++reference_state) {
+      auto count = counts_by_class[class_index][reference_state];
+      if (count == 0) continue;
+      chart_cost best = chart_inf;
+      for (std::uint8_t root_state = 0; root_state < nuc_state_count;
+           ++root_state) {
+        best = std::min(
+            best, parsimony_chart_detail::saturated_add(
+                      row[root_state],
+                      parsimony_chart_detail::transition_cost(reference_state,
+                                                              root_state)));
+      }
+      total = chart_multisite_detail::checked_add_u64(
+          total,
+          chart_multisite_detail::checked_mul_cost(
+              count, best, "lazy composite weighted root-edge cost"),
+          "lazy composite root-edge lower bound");
+    }
+  }
+  return total;
+}
+
 }  // namespace lazy_chart_detail
 
 inline lazy_multisite_chart build_lazy_inside_chart(
@@ -1059,6 +1173,118 @@ inline lazy_multisite_chart build_lazy_inside_chart_active(
     lazy_chart_options const& options = {}) {
   active_patterns.assert_no_skipped_invariant_metadata();
   return build_lazy_inside_chart(grammar, active_patterns.patterns, options);
+}
+
+inline std::uint64_t lazy_weighted_root_score_from_row(
+    lazy_multisite_chart const& chart, clade_id root, std::size_t pattern_index,
+    site_pattern const& pattern, chart_options const& options = {}) {
+  if (options.score_ua_edge) {
+    chart_multisite_detail::validate_pattern_reference_counts(pattern,
+                                                              pattern_index);
+  }
+  auto const& row = lazy_chart_detail::root_inside_row_for_pattern(
+      chart, root, pattern_index);
+  return chart_spr_weighted_root_score_from_row(row, pattern, options);
+}
+
+inline std::uint64_t lazy_weighted_root_score_from_row(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    lazy_multisite_chart const& chart, std::size_t pattern_index,
+    chart_options const& options = {}) {
+  lazy_chart_detail::validate_lazy_inside_score_inputs(
+      grammar, patterns, chart, options, "lazy weighted root score");
+  if (pattern_index >= patterns.patterns.size()) {
+    throw std::runtime_error(
+        "lazy weighted root score: pattern index out of range");
+  }
+  return lazy_weighted_root_score_from_row(
+      chart, grammar.root_clade, pattern_index, patterns.patterns[pattern_index],
+      options);
+}
+
+inline composite_chart_score lazy_composite_chart_score(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    lazy_multisite_chart const& chart, chart_options const& options = {}) {
+  lazy_chart_detail::validate_lazy_inside_score_inputs(
+      grammar, patterns, chart, options, "lazy composite chart score");
+
+  auto root = grammar.root_clade;
+  auto const& root_rows = chart.inside_rows_by_clade[root];
+
+  composite_chart_score result;
+  result.multifurcation_productions_scored =
+      chart.multifurcation_productions_scored;
+  result.per_pattern_root_min.reserve(patterns.patterns.size());
+  result.per_pattern_root_min_by_reference_state.reserve(
+      patterns.patterns.size());
+
+  std::uint64_t total = lazy_chart_detail::lazy_root_class_score_total(
+      patterns, chart, root, options, "lazy composite chart score");
+
+  for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+       ++pattern_index) {
+    auto const& row = lazy_chart_detail::root_inside_row_for_pattern(
+        chart, root, pattern_index);
+    auto const& pattern = patterns.patterns[pattern_index];
+    std::array<chart_cost, nuc_state_count> by_reference{};
+    by_reference.fill(chart_inf);
+    chart_cost diagnostic_min = chart_inf;
+    if (!options.score_ua_edge) {
+      diagnostic_min = chart_multisite_detail::row_min(row);
+      by_reference.fill(diagnostic_min);
+    } else {
+      for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+           ++reference_state) {
+        if (pattern.reference_state_counts[reference_state] == 0) continue;
+        chart_cost best = chart_inf;
+        for (std::uint8_t root_state = 0; root_state < nuc_state_count;
+             ++root_state) {
+          best = std::min(
+              best, parsimony_chart_detail::saturated_add(
+                        row[root_state],
+                        parsimony_chart_detail::transition_cost(
+                            reference_state, root_state)));
+        }
+        by_reference[reference_state] = best;
+        diagnostic_min = std::min(diagnostic_min, best);
+      }
+    }
+    result.per_pattern_root_min.push_back(diagnostic_min);
+    result.per_pattern_root_min_by_reference_state.push_back(by_reference);
+  }
+
+  if (options.score_ua_edge) {
+    total = chart_multisite_detail::checked_add_u64(
+        total, patterns.skipped_invariant_constant_score_with_reference_edge,
+        "lazy composite skipped invariant UA-edge offset");
+  }
+  result.weighted_lower_bound = total;
+  return result;
+}
+
+inline std::uint64_t lazy_composite_lower_bound(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    lazy_multisite_chart const& chart, chart_options const& options = {}) {
+  lazy_chart_detail::validate_lazy_inside_score_inputs(
+      grammar, patterns, chart, options, "lazy composite lower bound");
+  auto total = lazy_chart_detail::lazy_root_class_score_total(
+      patterns, chart, grammar.root_clade, options,
+      "lazy composite lower bound");
+  if (options.score_ua_edge) {
+    total = chart_multisite_detail::checked_add_u64(
+        total, patterns.skipped_invariant_constant_score_with_reference_edge,
+        "lazy composite skipped invariant UA-edge offset");
+  }
+  return total;
+}
+
+template <class ActivePatternSet>
+inline std::uint64_t lazy_composite_lower_bound_active(
+    clade_grammar const& grammar, ActivePatternSet const& active_patterns,
+    lazy_multisite_chart const& chart, chart_options const& options = {}) {
+  active_patterns.assert_no_skipped_invariant_metadata();
+  return lazy_composite_lower_bound(grammar, active_patterns.patterns, chart,
+                                    options);
 }
 
 inline void build_lazy_outside_chart_in_place(
