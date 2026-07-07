@@ -683,6 +683,16 @@ add_test(NAME dagutil_wric_phase9_chart_fluidity_site
 set_tests_properties(dagutil_wric_phase9_chart_fluidity_site
                      PROPERTIES PASS_REGULAR_EXPRESSION "fluidity:")
 
+add_test(NAME dagutil_wric_allow_chart_row_fluidity_site
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --chart-fluidity-site 1 > \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'polytomy_mode: allow' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'chart_fluidity_row_source: dense_chart_rows' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'chart_row_fluidity_runs: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'externally_fluid_clades: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'externally_fluid: true' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_wric_lazy_chart_row_fluidity_site
+	         COMMAND bash -c
+	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --wric-lazy-chart on --chart-fluidity-site 1 > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'wric_lazy_chart: on' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'chart_fluidity_row_source: lazy_chart_rows' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'chart_row_fluidity_runs: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'externally_fluid_clades: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'externally_fluid: true' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\""
+	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 add_test(NAME dagutil_wric_polytomy_benchmark_bad_shape_cap_suffix
          COMMAND bash -c
                  "\"$<TARGET_FILE:dagutil>\" --wric-polytomy-benchmark-shape-caps 1x 2>&1 | grep -q 'unsigned decimal integer'"

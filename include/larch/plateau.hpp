@@ -1,6 +1,7 @@
 #pragma once
 
 #include <larch/chart_trim.hpp>
+#include <larch/lazy_chart.hpp>
 #include <larch/site_patterns.hpp>
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <ostream>
 #include <set>
 #include <stdexcept>
@@ -22,6 +24,15 @@ namespace larch {
 inline constexpr std::uint8_t no_child_slot =
     std::numeric_limits<std::uint8_t>::max();
 
+struct plateau_row_resolution_choice {
+  production_id production = no_production;
+  std::uint8_t parent_state = no_chart_state;
+  std::vector<std::uint8_t> child_states;
+  chart_cost cost = chart_inf;
+
+  bool operator==(plateau_row_resolution_choice const&) const = default;
+};
+
 struct plateau_parent_compatibility {
   // Root-boundary compatibility is represented with parent == no_clade and
   // production == no_production.  For non-root clades, parent/production name a
@@ -33,6 +44,10 @@ struct plateau_parent_compatibility {
   std::uint8_t child_state = no_chart_state;
   std::uint8_t child_slot = no_child_slot;
   std::uint8_t sibling_state = no_chart_state;
+  // Filled only for non-binary parent productions.  The vector is aligned with
+  // grammar_production::children and records the complete parent-resolution
+  // child-state context.
+  std::vector<std::uint8_t> production_child_states;
   bool root_boundary = false;
 
   bool operator==(plateau_parent_compatibility const&) const = default;
@@ -44,6 +59,7 @@ struct fluidity_group {
   std::uint8_t state = no_chart_state;
   std::vector<production_id> productions;
   std::vector<chart_production_choice> choices;
+  std::vector<plateau_row_resolution_choice> row_choices;
   std::vector<plateau_parent_compatibility> parent_compatibilities;
   std::size_t choice_count = 0;
   bool fluid = false;
@@ -91,6 +107,12 @@ struct fluidity_report {
   std::vector<std::array<std::vector<chart_production_choice>,
                          nuc_state_count>>
       globally_optimal_choices_by_clade_state;
+  std::vector<std::array<std::vector<plateau_row_resolution_choice>,
+                         nuc_state_count>>
+      row_optimal_choices_by_clade_state;
+  std::vector<std::array<std::vector<plateau_row_resolution_choice>,
+                         nuc_state_count>>
+      row_globally_optimal_choices_by_clade_state;
   std::vector<std::array<std::vector<plateau_parent_compatibility>,
                          nuc_state_count>>
       parent_compatibilities;
@@ -101,6 +123,7 @@ struct fluidity_report {
   std::size_t globally_fluid_clade_state_count = 0;
   std::size_t externally_fluid_clade_count = 0;
   std::size_t externally_fluid_group_count = 0;
+  std::size_t chart_row_fluidity_runs = 0;
 };
 
 struct plateau_graph_node {
@@ -173,7 +196,9 @@ inline bool compatibility_less(plateau_parent_compatibility const& lhs,
   if (lhs.child_state != rhs.child_state)
     return lhs.child_state < rhs.child_state;
   if (lhs.child_slot != rhs.child_slot) return lhs.child_slot < rhs.child_slot;
-  return lhs.sibling_state < rhs.sibling_state;
+  if (lhs.sibling_state != rhs.sibling_state)
+    return lhs.sibling_state < rhs.sibling_state;
+  return lhs.production_child_states < rhs.production_child_states;
 }
 
 inline void append_unique_compatibility(
@@ -264,6 +289,17 @@ inline std::vector<production_id> unique_productions(
   return productions;
 }
 
+inline std::vector<production_id> unique_row_productions(
+    std::vector<plateau_row_resolution_choice> const& choices) {
+  std::vector<production_id> productions;
+  productions.reserve(choices.size());
+  for (auto const& choice : choices) productions.push_back(choice.production);
+  std::sort(productions.begin(), productions.end());
+  productions.erase(std::unique(productions.begin(), productions.end()),
+                    productions.end());
+  return productions;
+}
+
 struct resolution_signature {
   production_id production = no_production;
   std::array<std::uint8_t, 2> child_states{no_chart_state, no_chart_state};
@@ -278,17 +314,26 @@ struct resolution_signature {
 
 struct choice_signature {
   production_id production = no_production;
-  std::uint8_t parent_state = no_chart_state;
   std::array<std::uint8_t, 2> child_states{no_chart_state, no_chart_state};
 
   bool operator<(choice_signature const& other) const {
     if (production != other.production) return production < other.production;
-    if (parent_state != other.parent_state)
-      return parent_state < other.parent_state;
     return child_states < other.child_states;
   }
 
   bool operator==(choice_signature const&) const = default;
+};
+
+struct row_resolution_signature {
+  production_id production = no_production;
+  std::vector<std::uint8_t> child_states;
+
+  bool operator<(row_resolution_signature const& other) const {
+    if (production != other.production) return production < other.production;
+    return child_states < other.child_states;
+  }
+
+  bool operator==(row_resolution_signature const&) const = default;
 };
 
 inline resolution_signature resolution_from_choice(
@@ -297,10 +342,15 @@ inline resolution_signature resolution_from_choice(
                               .child_states = choice.child_states};
 }
 
+inline row_resolution_signature row_resolution_from_choice(
+    plateau_row_resolution_choice const& choice) {
+  return row_resolution_signature{.production = choice.production,
+                                  .child_states = choice.child_states};
+}
+
 inline choice_signature signature_from_choice(
     chart_production_choice const& choice) {
   return choice_signature{.production = choice.production,
-                          .parent_state = choice.parent_state,
                           .child_states = choice.child_states};
 }
 
@@ -310,6 +360,18 @@ inline std::vector<choice_signature> choice_signatures(
   signatures.reserve(choices.size());
   for (auto const& choice : choices)
     signatures.push_back(signature_from_choice(choice));
+  std::sort(signatures.begin(), signatures.end());
+  signatures.erase(std::unique(signatures.begin(), signatures.end()),
+                   signatures.end());
+  return signatures;
+}
+
+inline std::vector<row_resolution_signature> row_resolution_signatures(
+    std::vector<plateau_row_resolution_choice> const& choices) {
+  std::vector<row_resolution_signature> signatures;
+  signatures.reserve(choices.size());
+  for (auto const& choice : choices)
+    signatures.push_back(row_resolution_from_choice(choice));
   std::sort(signatures.begin(), signatures.end());
   signatures.erase(std::unique(signatures.begin(), signatures.end()),
                    signatures.end());
@@ -330,6 +392,63 @@ inline void sort_choices(std::vector<chart_production_choice>& choices) {
                 return lhs.child_states[1] < rhs.child_states[1];
               return lhs.cost < rhs.cost;
             });
+}
+
+inline void sort_row_choices(
+    std::vector<plateau_row_resolution_choice>& choices) {
+  std::sort(choices.begin(), choices.end(),
+            [](plateau_row_resolution_choice const& lhs,
+               plateau_row_resolution_choice const& rhs) {
+              if (lhs.production != rhs.production)
+                return lhs.production < rhs.production;
+              if (lhs.parent_state != rhs.parent_state)
+                return lhs.parent_state < rhs.parent_state;
+              if (lhs.child_states != rhs.child_states)
+                return lhs.child_states < rhs.child_states;
+              return lhs.cost < rhs.cost;
+            });
+}
+
+inline void append_unique_row_choice(
+    std::vector<plateau_row_resolution_choice>& choices,
+    plateau_row_resolution_choice choice) {
+  if (std::none_of(choices.begin(), choices.end(), [&](auto const& existing) {
+        return existing == choice;
+      })) {
+    choices.push_back(std::move(choice));
+  }
+}
+
+inline std::optional<chart_production_choice> binary_choice_from_row_choice(
+    clade_grammar const& grammar, plateau_row_resolution_choice const& choice) {
+  if (choice.production == no_production ||
+      choice.production >= grammar.productions.size()) {
+    throw std::runtime_error("plateau: row choice production id out of range");
+  }
+  auto const& prod = grammar.productions[choice.production];
+  if (prod.children.size() != 2) return std::nullopt;
+  if (choice.child_states.size() != 2) {
+    throw std::runtime_error(
+        "plateau: binary row choice child-state count mismatch");
+  }
+  return chart_production_choice{
+      .production = choice.production,
+      .parent_state = choice.parent_state,
+      .child_states = {choice.child_states[0], choice.child_states[1]},
+      .cost = choice.cost};
+}
+
+inline std::vector<chart_production_choice> binary_choices_from_row_choices(
+    clade_grammar const& grammar,
+    std::vector<plateau_row_resolution_choice> const& row_choices) {
+  std::vector<chart_production_choice> choices;
+  choices.reserve(row_choices.size());
+  for (auto const& row_choice : row_choices) {
+    auto binary = binary_choice_from_row_choice(grammar, row_choice);
+    if (binary) chart_trim_detail::append_unique_choice(choices, *binary);
+  }
+  sort_choices(choices);
+  return choices;
 }
 
 inline std::vector<std::size_t> child_slots(grammar_production const& prod,
@@ -425,6 +544,299 @@ parent_compatibilities_for_state(clade_grammar const& grammar,
   return result;
 }
 
+inline chart_cost child_term(single_site_chart const& chart, clade_id child,
+                             std::uint8_t parent_state,
+                             std::uint8_t child_state) {
+  if (child == no_clade || child >= chart.inside.size()) {
+    throw std::runtime_error("plateau: production child clade out of range");
+  }
+  parsimony_chart_detail::validate_state(child_state,
+                                         "plateau row child state");
+  return parsimony_chart_detail::saturated_add(
+      chart.inside[child][child_state],
+      parsimony_chart_detail::transition_cost(parent_state, child_state));
+}
+
+inline std::pair<chart_cost, std::vector<std::uint8_t>>
+optimal_child_states_for_parent_state(single_site_chart const& chart,
+                                      clade_id child,
+                                      std::uint8_t parent_state) {
+  chart_cost best = chart_inf;
+  std::vector<std::uint8_t> states;
+  for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+       ++child_state) {
+    auto term = child_term(chart, child, parent_state, child_state);
+    if (term < best) {
+      best = term;
+      states.clear();
+      states.push_back(child_state);
+    } else if (term == best) {
+      states.push_back(child_state);
+    }
+  }
+  if (best >= chart_inf) states.clear();
+  return {best, states};
+}
+
+template <typename Callback>
+inline void enumerate_state_product(
+    std::vector<std::vector<std::uint8_t>> const& states_by_child,
+    Callback&& callback) {
+  std::vector<std::uint8_t> selected(states_by_child.size(), no_chart_state);
+  auto recur = [&](auto&& self, std::size_t child_i) -> void {
+    if (child_i == states_by_child.size()) {
+      callback(selected);
+      return;
+    }
+    for (auto state : states_by_child[child_i]) {
+      selected[child_i] = state;
+      self(self, child_i + 1);
+    }
+  };
+  recur(recur, 0);
+}
+
+inline chart_cost production_inside_cost_from_child_states(
+    single_site_chart const& chart, grammar_production const& prod,
+    std::uint8_t parent_state,
+    std::vector<std::uint8_t> const& child_states) {
+  if (child_states.size() != prod.children.size()) {
+    throw std::runtime_error(
+        "plateau: row resolution child-state count mismatch");
+  }
+  chart_cost total = 0;
+  for (std::size_t child_i = 0; child_i < prod.children.size(); ++child_i) {
+    total = parsimony_chart_detail::saturated_add(
+        total, child_term(chart, prod.children[child_i], parent_state,
+                          child_states[child_i]));
+  }
+  return total;
+}
+
+inline std::vector<plateau_row_resolution_choice>
+row_local_optimal_choices_for_state(clade_grammar const& grammar,
+                                    single_site_chart const& chart,
+                                    clade_id clade, std::uint8_t state) {
+  parsimony_chart_detail::validate_state(state, "plateau clade state");
+  if (clade == no_clade || clade >= grammar.clades.size()) {
+    throw std::runtime_error("plateau: clade id out of range");
+  }
+  if (grammar.clades[clade].taxa.size() == 1 ||
+      chart.inside[clade][state] >= chart_inf) {
+    return {};
+  }
+
+  std::vector<plateau_row_resolution_choice> choices;
+  for (auto pid : grammar.productions_by_parent[clade]) {
+    if (pid == no_production || pid >= grammar.productions.size()) {
+      throw std::runtime_error("plateau: production id out of range");
+    }
+    auto const& prod = grammar.productions[pid];
+    if (prod.parent != clade) {
+      throw std::runtime_error(
+          "plateau: production parent does not match requested clade");
+    }
+
+    chart_cost local = 0;
+    std::vector<std::vector<std::uint8_t>> states_by_child;
+    states_by_child.reserve(prod.children.size());
+    bool finite = true;
+    for (auto child : prod.children) {
+      auto [best, states] =
+          optimal_child_states_for_parent_state(chart, child, state);
+      if (best >= chart_inf || states.empty()) {
+        finite = false;
+        break;
+      }
+      local = parsimony_chart_detail::saturated_add(local, best);
+      states_by_child.push_back(std::move(states));
+    }
+    if (!finite || local >= chart_inf || local != chart.inside[clade][state])
+      continue;
+
+    enumerate_state_product(states_by_child, [&](auto const& child_states) {
+      append_unique_row_choice(
+          choices, plateau_row_resolution_choice{.production = pid,
+                                                 .parent_state = state,
+                                                 .child_states = child_states,
+                                                 .cost = local});
+    });
+  }
+
+  sort_row_choices(choices);
+  choices.erase(std::unique(choices.begin(), choices.end()), choices.end());
+  return choices;
+}
+
+inline std::vector<plateau_row_resolution_choice>
+row_globally_optimal_choices_for_state(clade_grammar const& grammar,
+                                       single_site_chart const& chart,
+                                       single_site_outside_chart const& outside,
+                                       clade_id clade,
+                                       std::uint8_t state) {
+  parsimony_chart_detail::validate_state(state, "plateau clade state");
+  if (clade == no_clade || clade >= grammar.clades.size()) {
+    throw std::runtime_error("plateau: clade id out of range");
+  }
+  if (grammar.clades[clade].taxa.size() == 1) return {};
+  if (!chart_trim_detail::is_globally_optimal_state(grammar, chart, outside,
+                                                    clade, state)) {
+    return {};
+  }
+
+  std::vector<plateau_row_resolution_choice> choices;
+  for (auto pid : grammar.productions_by_parent[clade]) {
+    if (pid == no_production || pid >= grammar.productions.size()) {
+      throw std::runtime_error("plateau: production id out of range");
+    }
+    auto const& prod = grammar.productions[pid];
+    if (prod.parent != clade) {
+      throw std::runtime_error(
+          "plateau: production parent does not match requested clade");
+    }
+
+    chart_cost local = 0;
+    std::vector<std::vector<std::uint8_t>> states_by_child;
+    states_by_child.reserve(prod.children.size());
+    bool finite = true;
+    for (auto child : prod.children) {
+      auto [best, states] =
+          optimal_child_states_for_parent_state(chart, child, state);
+      if (best >= chart_inf || states.empty()) {
+        finite = false;
+        break;
+      }
+      local = parsimony_chart_detail::saturated_add(local, best);
+      states.erase(std::remove_if(states.begin(), states.end(),
+                                  [&](std::uint8_t child_state) {
+                                    return !chart_trim_detail::
+                                        is_globally_optimal_state(
+                                            grammar, chart, outside, child,
+                                            child_state);
+                                  }),
+                   states.end());
+      if (states.empty()) {
+        finite = false;
+        break;
+      }
+      states_by_child.push_back(std::move(states));
+    }
+    if (!finite || local >= chart_inf || local != chart.inside[clade][state])
+      continue;
+
+    auto complete = parsimony_chart_detail::saturated_add(
+        outside.outside[clade][state], local);
+    if (complete >= chart_inf || complete != outside.global_min) continue;
+
+    enumerate_state_product(states_by_child, [&](auto const& child_states) {
+      append_unique_row_choice(
+          choices, plateau_row_resolution_choice{.production = pid,
+                                                 .parent_state = state,
+                                                 .child_states = child_states,
+                                                 .cost = complete});
+    });
+  }
+
+  sort_row_choices(choices);
+  choices.erase(std::unique(choices.begin(), choices.end()), choices.end());
+  return choices;
+}
+
+inline std::vector<plateau_parent_compatibility>
+row_parent_compatibilities_for_state(clade_grammar const& grammar,
+                                     single_site_chart const& chart,
+                                     single_site_outside_chart const& outside,
+                                     clade_id clade, std::uint8_t state) {
+  parsimony_chart_detail::validate_state(state, "plateau child state");
+  if (!chart_trim_detail::is_globally_optimal_state(grammar, chart, outside,
+                                                    clade, state)) {
+    return {};
+  }
+
+  std::vector<plateau_parent_compatibility> result;
+  if (clade == grammar.root_clade) {
+    append_unique_compatibility(
+        result, plateau_parent_compatibility{.parent = no_clade,
+                                             .production = no_production,
+                                             .parent_state = state,
+                                             .child_state = state,
+                                             .child_slot = no_child_slot,
+                                             .sibling_state = no_chart_state,
+                                             .production_child_states = {},
+                                             .root_boundary = true});
+    return result;
+  }
+
+  for (auto pid : grammar.productions_by_child[clade]) {
+    if (pid == no_production || pid >= grammar.productions.size()) {
+      throw std::runtime_error(
+          "plateau: productions_by_child contains invalid production id");
+    }
+    auto const& prod = grammar.productions[pid];
+    auto parent = prod.parent;
+    if (parent == no_clade || parent >= grammar.clades.size()) {
+      throw std::runtime_error("plateau: production parent out of range");
+    }
+
+    for (auto slot : child_slots(prod, clade)) {
+      for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+           ++parent_state) {
+        if (!chart_trim_detail::is_globally_optimal_state(
+                grammar, chart, outside, parent, parent_state)) {
+          continue;
+        }
+
+        std::vector<std::vector<std::uint8_t>> states_by_child(
+            prod.children.size());
+        for (std::size_t child_i = 0; child_i < prod.children.size();
+             ++child_i) {
+          if (child_i == slot) {
+            states_by_child[child_i] = {state};
+          } else {
+            states_by_child[child_i] = {0, 1, 2, 3};
+          }
+        }
+
+        enumerate_state_product(states_by_child, [&](auto const& child_states) {
+          auto local = production_inside_cost_from_child_states(
+              chart, prod, parent_state, child_states);
+          if (local >= chart_inf ||
+              local != chart.inside[parent][parent_state]) {
+            return;
+          }
+          auto complete = parsimony_chart_detail::saturated_add(
+              outside.outside[parent][parent_state], local);
+          if (complete >= chart_inf || complete != outside.global_min) return;
+
+          std::uint8_t sibling_state = no_chart_state;
+          std::vector<std::uint8_t> production_child_states;
+          if (prod.children.size() == 2) {
+            auto sibling_slot = slot == 0 ? 1 : 0;
+            sibling_state = child_states[sibling_slot];
+          } else {
+            production_child_states = child_states;
+          }
+
+          append_unique_compatibility(
+              result,
+              plateau_parent_compatibility{
+                  .parent = parent,
+                  .production = pid,
+                  .parent_state = parent_state,
+                  .child_state = state,
+                  .child_slot = static_cast<std::uint8_t>(slot),
+                  .sibling_state = sibling_state,
+                  .production_child_states = std::move(production_child_states),
+                  .root_boundary = false});
+        });
+      }
+    }
+  }
+
+  std::sort(result.begin(), result.end(), compatibility_less);
+  return result;
+}
+
 struct external_signature {
   bool root_boundary = false;
   clade_id parent = no_clade;
@@ -433,6 +845,7 @@ struct external_signature {
   std::uint8_t child_state = no_chart_state;
   std::uint8_t child_slot = no_child_slot;
   std::uint8_t sibling_state = no_chart_state;
+  std::vector<std::uint8_t> production_child_states;
 
   bool operator<(external_signature const& other) const {
     if (root_boundary != other.root_boundary)
@@ -443,7 +856,9 @@ struct external_signature {
       return parent_state < other.parent_state;
     if (child_state != other.child_state) return child_state < other.child_state;
     if (child_slot != other.child_slot) return child_slot < other.child_slot;
-    return sibling_state < other.sibling_state;
+    if (sibling_state != other.sibling_state)
+      return sibling_state < other.sibling_state;
+    return production_child_states < other.production_child_states;
   }
 };
 
@@ -455,7 +870,9 @@ inline external_signature signature_from_compatibility(
                             .parent_state = compatibility.parent_state,
                             .child_state = compatibility.child_state,
                             .child_slot = compatibility.child_slot,
-                            .sibling_state = compatibility.sibling_state};
+                            .sibling_state = compatibility.sibling_state,
+                            .production_child_states =
+                                compatibility.production_child_states};
 }
 
 inline std::vector<std::size_t> connected_component_from(
@@ -509,9 +926,34 @@ inline std::string state_list(
   return result.empty() ? std::string{"-"} : result;
 }
 
+inline fluidity_report make_empty_fluidity_report(
+    clade_grammar const& grammar, chart_cost global_min) {
+  fluidity_report report;
+  report.global_min = global_min;
+  report.fluid_clade_state.assign(grammar.clades.size(), false_state_mask());
+  report.locally_fluid_clade_state.assign(grammar.clades.size(),
+                                          false_state_mask());
+  report.globally_optimal_clade_state.assign(grammar.clades.size(),
+                                             false_state_mask());
+  report.globally_fluid_clade_state.assign(grammar.clades.size(),
+                                           false_state_mask());
+  report.externally_fluid_clade.assign(grammar.clades.size(), false);
+  report.optimal_choice_count.assign(grammar.clades.size(),
+                                     zero_state_counts());
+  report.globally_optimal_choice_count.assign(grammar.clades.size(),
+                                             zero_state_counts());
+  report.optimal_choices_by_clade_state.resize(grammar.clades.size());
+  report.globally_optimal_choices_by_clade_state.resize(grammar.clades.size());
+  report.row_optimal_choices_by_clade_state.resize(grammar.clades.size());
+  report.row_globally_optimal_choices_by_clade_state.resize(
+      grammar.clades.size());
+  report.parent_compatibilities.resize(grammar.clades.size());
+  return report;
+}
+
 }  // namespace plateau_detail
 
-inline fluidity_report build_single_site_fluidity_report(
+inline fluidity_report build_single_site_fluidity_report_from_choice_layer(
     clade_grammar const& grammar, single_site_chart const& chart,
     single_site_outside_chart const& outside) {
   chart_trim_detail::validate_outside_shapes(grammar, chart, outside);
@@ -525,24 +967,8 @@ inline fluidity_report build_single_site_fluidity_report(
     throw std::runtime_error("plateau: outside global optimum is stale");
   }
 
-  fluidity_report report;
-  report.global_min = outside.global_min;
-  report.fluid_clade_state.assign(grammar.clades.size(),
-                                  plateau_detail::false_state_mask());
-  report.locally_fluid_clade_state.assign(
-      grammar.clades.size(), plateau_detail::false_state_mask());
-  report.globally_optimal_clade_state.assign(
-      grammar.clades.size(), plateau_detail::false_state_mask());
-  report.globally_fluid_clade_state.assign(
-      grammar.clades.size(), plateau_detail::false_state_mask());
-  report.externally_fluid_clade.assign(grammar.clades.size(), false);
-  report.optimal_choice_count.assign(grammar.clades.size(),
-                                     plateau_detail::zero_state_counts());
-  report.globally_optimal_choice_count.assign(
-      grammar.clades.size(), plateau_detail::zero_state_counts());
-  report.optimal_choices_by_clade_state.resize(grammar.clades.size());
-  report.globally_optimal_choices_by_clade_state.resize(grammar.clades.size());
-  report.parent_compatibilities.resize(grammar.clades.size());
+  auto report =
+      plateau_detail::make_empty_fluidity_report(grammar, outside.global_min);
 
   std::vector<std::vector<std::size_t>> group_indices_by_clade(
       grammar.clades.size());
@@ -675,6 +1101,181 @@ inline fluidity_report build_single_site_fluidity_report(
   return report;
 }
 
+inline fluidity_report build_single_site_fluidity_report_from_rows(
+    clade_grammar const& grammar, single_site_chart const& chart,
+    single_site_outside_chart const& outside) {
+  chart_trim_detail::validate_outside_shapes(grammar, chart, outside);
+  if (chart_trim_detail::compute_global_min(grammar, chart, outside) !=
+      outside.global_min) {
+    throw std::runtime_error("plateau: outside global optimum is stale");
+  }
+
+  auto report =
+      plateau_detail::make_empty_fluidity_report(grammar, outside.global_min);
+  report.chart_row_fluidity_runs = 1;
+
+  std::vector<std::vector<std::size_t>> group_indices_by_clade(
+      grammar.clades.size());
+
+  for (clade_id clade = 0; clade < grammar.clades.size(); ++clade) {
+    std::map<plateau_detail::external_signature, std::size_t>
+        group_by_signature;
+    std::set<plateau_detail::row_resolution_signature>
+        clade_resolution_signatures;
+
+    for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+      auto row_local_choices = plateau_detail::row_local_optimal_choices_for_state(
+          grammar, chart, clade, state);
+      auto row_global_choices =
+          plateau_detail::row_globally_optimal_choices_for_state(
+              grammar, chart, outside, clade, state);
+      auto local_choices = plateau_detail::binary_choices_from_row_choices(
+          grammar, row_local_choices);
+      auto global_choices = plateau_detail::binary_choices_from_row_choices(
+          grammar, row_global_choices);
+      auto compatibilities =
+          plateau_detail::row_parent_compatibilities_for_state(
+              grammar, chart, outside, clade, state);
+      auto globally_optimal_state =
+          chart_trim_detail::is_globally_optimal_state(grammar, chart, outside,
+                                                       clade, state);
+
+      report.optimal_choice_count[clade][state] = row_local_choices.size();
+      report.globally_optimal_choice_count[clade][state] =
+          row_global_choices.size();
+      report.locally_fluid_clade_state[clade][state] =
+          row_local_choices.size() > 1;
+      report.fluid_clade_state[clade][state] = row_global_choices.size() > 1;
+      report.globally_optimal_clade_state[clade][state] =
+          globally_optimal_state;
+      report.globally_fluid_clade_state[clade][state] =
+          report.fluid_clade_state[clade][state];
+
+      if (report.locally_fluid_clade_state[clade][state])
+        ++report.locally_fluid_clade_state_count;
+      if (report.fluid_clade_state[clade][state])
+        ++report.fluid_clade_state_count;
+      if (report.globally_fluid_clade_state[clade][state])
+        ++report.globally_fluid_clade_state_count;
+
+      report.optimal_choices_by_clade_state[clade][state] =
+          std::move(local_choices);
+      report.globally_optimal_choices_by_clade_state[clade][state] =
+          std::move(global_choices);
+      report.row_optimal_choices_by_clade_state[clade][state] =
+          std::move(row_local_choices);
+      report.row_globally_optimal_choices_by_clade_state[clade][state] =
+          std::move(row_global_choices);
+      report.parent_compatibilities[clade][state] =
+          std::move(compatibilities);
+
+      auto const& stored_global_row_choices =
+          report.row_globally_optimal_choices_by_clade_state[clade][state];
+      if (stored_global_row_choices.empty()) continue;
+
+      for (auto const& choice : stored_global_row_choices) {
+        clade_resolution_signatures.insert(
+            plateau_detail::row_resolution_from_choice(choice));
+      }
+
+      auto group_compatibilities = report.parent_compatibilities[clade][state];
+      if (group_compatibilities.empty()) {
+        group_compatibilities.push_back(
+            plateau_parent_compatibility{.parent = no_clade,
+                                         .production = no_production,
+                                         .parent_state = state,
+                                         .child_state = state,
+                                         .child_slot = no_child_slot,
+                                         .sibling_state = no_chart_state,
+                                         .production_child_states = {},
+                                         .root_boundary =
+                                             clade == grammar.root_clade});
+      }
+
+      auto const& stored_global_choices =
+          report.globally_optimal_choices_by_clade_state[clade][state];
+      for (auto const& compatibility : group_compatibilities) {
+        auto signature =
+            plateau_detail::signature_from_compatibility(compatibility);
+        auto [it, inserted] = group_by_signature.emplace(
+            signature, report.optimal_group_descriptors.size());
+        if (inserted) {
+          fluidity_group group;
+          group.clade = clade;
+          group.state = signature.child_state;
+          group.globally_optimal = globally_optimal_state;
+          group.parent_compatibilities.push_back(compatibility);
+          report.optimal_groups.emplace_back();
+          report.optimal_group_descriptors.push_back(std::move(group));
+          group_indices_by_clade[clade].push_back(it->second);
+        }
+
+        auto& group = report.optimal_group_descriptors[it->second];
+        for (auto const& choice : stored_global_row_choices) {
+          plateau_detail::append_unique_row_choice(group.row_choices, choice);
+        }
+        for (auto const& choice : stored_global_choices) {
+          chart_trim_detail::append_unique_choice(group.choices, choice);
+        }
+      }
+    }
+
+    std::set<std::vector<plateau_detail::row_resolution_signature>>
+        distinct_group_choice_sets;
+    for (auto group_index : group_indices_by_clade[clade]) {
+      auto& group = report.optimal_group_descriptors[group_index];
+      plateau_detail::sort_row_choices(group.row_choices);
+      plateau_detail::sort_choices(group.choices);
+      group.productions =
+          plateau_detail::unique_row_productions(group.row_choices);
+      group.choice_count = group.row_choices.size();
+      group.fluid = group.choice_count > 1;
+      group.globally_fluid = group.fluid;
+      report.optimal_groups[group_index] = group.productions;
+      distinct_group_choice_sets.insert(
+          plateau_detail::row_resolution_signatures(group.row_choices));
+    }
+
+    auto externally_fluid = grammar.clades[clade].taxa.size() > 1 &&
+                            clade_resolution_signatures.size() > 1 &&
+                            distinct_group_choice_sets.size() > 1;
+    report.externally_fluid_clade[clade] = externally_fluid;
+    if (externally_fluid) {
+      ++report.externally_fluid_clade_count;
+      report.externally_fluid_group_count +=
+          group_indices_by_clade[clade].size();
+    }
+    for (auto group_index : group_indices_by_clade[clade]) {
+      report.optimal_group_descriptors[group_index].externally_fluid =
+          externally_fluid;
+    }
+  }
+
+  return report;
+}
+
+inline fluidity_report build_single_site_fluidity_report_from_rows(
+    clade_grammar const& grammar, lazy_multisite_chart const& lazy_chart,
+    std::size_t pattern_index) {
+  auto chart = lazy_chart_detail::single_site_chart_from_lazy(
+      grammar, lazy_chart, pattern_index);
+  auto outside =
+      lazy_chart_detail::single_site_outside_chart_from_lazy(grammar,
+                                                             lazy_chart,
+                                                             pattern_index);
+  return build_single_site_fluidity_report_from_rows(grammar, chart, outside);
+}
+
+inline fluidity_report build_single_site_fluidity_report(
+    clade_grammar const& grammar, single_site_chart const& chart,
+    single_site_outside_chart const& outside) {
+  if (first_multifurcating_production(grammar)) {
+    return build_single_site_fluidity_report_from_rows(grammar, chart, outside);
+  }
+  return build_single_site_fluidity_report_from_choice_layer(grammar, chart,
+                                                            outside);
+}
+
 inline fluidity_report build_single_site_fluidity_report(
     clade_grammar const& grammar, single_site_chart const& chart,
     chart_options const& options = {}) {
@@ -701,7 +1302,7 @@ inline fluidity_report build_single_site_fluidity_report(
 inline fluidity_report build_single_site_fluidity_report(
     clade_grammar const& grammar, leaf_site_states const& states,
     chart_options options = {}) {
-  options.keep_trace = true;
+  options.keep_trace = !first_multifurcating_production(grammar).has_value();
   auto chart = build_single_site_chart(grammar, states, options);
   auto outside = build_single_site_outside_chart(grammar, chart, options);
   return build_single_site_fluidity_report(grammar, chart, outside);
@@ -710,7 +1311,7 @@ inline fluidity_report build_single_site_fluidity_report(
 inline fluidity_report build_single_site_fluidity_report(
     clade_grammar const& grammar, leaf_site_states const& states,
     chart_options options, std::uint8_t reference_state) {
-  options.keep_trace = true;
+  options.keep_trace = !first_multifurcating_production(grammar).has_value();
   auto chart = build_single_site_chart(grammar, states, options);
   auto outside =
       build_single_site_outside_chart(grammar, chart, options, reference_state);
@@ -856,6 +1457,8 @@ inline std::ostream& print_fluidity_report(std::ostream& out,
   out << "  externally_fluid_groups: "
       << report.externally_fluid_group_count << "\n";
   out << "  optimal_groups: " << report.optimal_groups.size() << "\n";
+  out << "  chart_row_fluidity_runs: "
+      << report.chart_row_fluidity_runs << "\n";
 
   std::size_t printed = 0;
   for (clade_id clade = 0; clade < grammar.clades.size(); ++clade) {

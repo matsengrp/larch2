@@ -4746,16 +4746,49 @@ int main(int argc, char** argv) try {
     auto& grammar = refinement.grammar;
     auto states =
         extract_leaf_site_states(result, grammar, *a.chart_fluidity_site);
+    auto reference_state =
+        extract_reference_site_state(result, *a.chart_fluidity_site);
     chart_options chart_opts;
-    chart_opts.keep_trace = true;
+    chart_opts.keep_trace =
+        !first_multifurcating_production(grammar).has_value();
     chart_opts.score_ua_edge = a.chart_score_ua_edge;
-    auto chart = build_single_site_chart(grammar, states, chart_opts);
-    auto outside = build_single_site_outside_chart(
-        grammar, chart, chart_opts, result, *a.chart_fluidity_site);
-    auto report = build_single_site_fluidity_report(grammar, chart, outside);
+    fluidity_report report;
+    std::string fluidity_row_source = "dense_chart_rows";
+    if (a.wric_lazy_chart) {
+      auto patterns = build_site_patterns(result, grammar);
+      auto site_offset = static_cast<std::size_t>(*a.chart_fluidity_site - 1);
+      if (site_offset >= patterns.original_site_to_pattern.size()) {
+        throw std::runtime_error("chart fluidity site outside reference length");
+      }
+      auto pattern_index = patterns.original_site_to_pattern[site_offset];
+      if (pattern_index == no_site_pattern) {
+        throw std::runtime_error(
+            "chart fluidity site was skipped by site-pattern compression");
+      }
+      lazy_chart_options lazy_opts;
+      lazy_opts.chart = chart_opts;
+      lazy_opts.retain_all_inside_class_maps = true;
+      auto lazy_chart = build_lazy_inside_chart(grammar, patterns, lazy_opts);
+      lazy_chart = build_lazy_outside_chart(grammar, patterns,
+                                            std::move(lazy_chart), chart_opts,
+                                            reference_state);
+      report = build_single_site_fluidity_report_from_rows(
+          grammar, lazy_chart, pattern_index);
+      fluidity_row_source = "lazy_chart_rows";
+    } else {
+      auto chart = build_single_site_chart(grammar, states, chart_opts);
+      auto outside =
+          build_single_site_outside_chart(grammar, chart, chart_opts,
+                                          reference_state);
+      report = build_single_site_fluidity_report(grammar, chart, outside);
+    }
     std::cout << "chart_fluidity_site: " << *a.chart_fluidity_site << "\n";
     std::cout << "chart_fluidity_score_ua_edge: "
               << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+    std::cout << "chart_fluidity_row_source: " << fluidity_row_source << "\n";
+    if (a.wric_lazy_chart) {
+      std::cout << "wric_lazy_chart: on\n";
+    }
     print_wric_polytomy_score_fields(std::cout, refinement,
                                       a.wric_polytomy_opts.mode,
                                       a.wric_polytomy_report);

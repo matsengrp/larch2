@@ -536,6 +536,27 @@ static void check_lazy_composite_matches_dense(
   }
 }
 
+static void check_row_fluidity_reports_equal(
+    larch::fluidity_report const& lhs, larch::fluidity_report const& rhs) {
+  CHECK(lhs.global_min == rhs.global_min);
+  CHECK(lhs.fluid_clade_state == rhs.fluid_clade_state);
+  CHECK(lhs.locally_fluid_clade_state == rhs.locally_fluid_clade_state);
+  CHECK(lhs.globally_optimal_clade_state == rhs.globally_optimal_clade_state);
+  CHECK(lhs.globally_fluid_clade_state == rhs.globally_fluid_clade_state);
+  CHECK(lhs.externally_fluid_clade == rhs.externally_fluid_clade);
+  CHECK(lhs.optimal_choice_count == rhs.optimal_choice_count);
+  CHECK(lhs.globally_optimal_choice_count == rhs.globally_optimal_choice_count);
+  CHECK(lhs.fluid_clade_state_count == rhs.fluid_clade_state_count);
+  CHECK(lhs.locally_fluid_clade_state_count ==
+        rhs.locally_fluid_clade_state_count);
+  CHECK(lhs.globally_fluid_clade_state_count ==
+        rhs.globally_fluid_clade_state_count);
+  CHECK(lhs.externally_fluid_clade_count == rhs.externally_fluid_clade_count);
+  CHECK(lhs.externally_fluid_group_count == rhs.externally_fluid_group_count);
+  CHECK(lhs.chart_row_fluidity_runs == 1);
+  CHECK(rhs.chart_row_fluidity_runs == 1);
+}
+
 static void check_lazy_outside_matches_dense(
     larch::clade_grammar const& grammar,
     larch::site_pattern_set const& patterns,
@@ -595,6 +616,11 @@ static void check_lazy_outside_matches_dense(
       CHECK(lazy.outside_row(static_cast<larch::clade_id>(cid),
                              pattern_index) == dense_outside.outside[cid]);
     }
+    auto dense_fluidity = larch::build_single_site_fluidity_report_from_rows(
+        grammar, dense_inside, dense_outside);
+    auto lazy_fluidity = larch::build_single_site_fluidity_report_from_rows(
+        grammar, lazy, pattern_index);
+    check_row_fluidity_reports_equal(dense_fluidity, lazy_fluidity);
   }
 }
 
@@ -728,8 +754,21 @@ static void test_trinary_fixture_and_allow_gate() {
   });
   check_arity_gate_message(multisite_trim_message, "B&B frontier");
 
+  auto fluidity =
+      larch::build_single_site_fluidity_report(grammar, chart, outside);
+  CHECK(fluidity.chart_row_fluidity_runs == 1);
+  CHECK(fluidity.global_min == outside.global_min);
+  CHECK(fluidity.globally_optimal_clade_state[grammar.root_clade]
+                                              [larch::nuc_base::A]);
+  CHECK(fluidity.globally_optimal_choice_count[grammar.root_clade]
+                                               [larch::nuc_base::A] == 1);
+  CHECK(fluidity.row_globally_optimal_choices_by_clade_state[grammar.root_clade]
+                                                          [larch::nuc_base::A]
+                                                              .size() == 1);
+
   auto fluidity_message = runtime_error_message([&] {
-    (void)larch::build_single_site_fluidity_report(grammar, chart, outside);
+    (void)larch::build_single_site_fluidity_report_from_choice_layer(
+        grammar, chart, outside);
   });
   check_arity_gate_message(fluidity_message, "choice layer");
 
