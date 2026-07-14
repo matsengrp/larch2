@@ -341,12 +341,16 @@ write_tsv_header
 extract_value() {
   local file=$1
   local key=$2
-  sed -n "s/^[[:space:]]*${key}:[[:space:]]*//p" "$file" | head -n 1
+  # Per-level diagnostics legitimately repeat aggregate field names.  Select
+  # the first report value in one process: under `set -o pipefail`, piping a
+  # multi-match sed into `head` makes sed receive SIGPIPE and aborts the
+  # benchmark with status 141.
+  sed -n "/^[[:space:]]*${key}:[[:space:]]*/ { s/^[[:space:]]*${key}:[[:space:]]*//; p; q; }" "$file"
 }
 
 extract_parsimony_min() {
   local file=$1
-  sed -n 's/.*parsimony_min: score:\([0-9][0-9]*\).*/\1/p' "$file" | head -n 1
+  sed -n '/parsimony_min: score:[0-9]/ { s/.*parsimony_min: score:\([0-9][0-9]*\).*/\1/; p; q; }' "$file"
 }
 
 extract_frontier_histogram() {
