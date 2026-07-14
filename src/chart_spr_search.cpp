@@ -136,6 +136,31 @@ void chart_spr_add_search_state_rebuild_counters(
       rebuild_counters.multifurcation_productions_scored;
   accumulated.pattern_batch_cache_builds +=
       rebuild_counters.pattern_batch_cache_builds;
+  accumulated.exact_setup_builds += rebuild_counters.exact_setup_builds;
+  accumulated.exact_setup_inside_charts_built +=
+      rebuild_counters.exact_setup_inside_charts_built;
+  accumulated.exact_setup_resident_inside_charts_consumed +=
+      rebuild_counters.exact_setup_resident_inside_charts_consumed;
+  accumulated.exact_setup_active_leaf_state_vectors_copied +=
+      rebuild_counters.exact_setup_active_leaf_state_vectors_copied;
+  accumulated.exact_setup_active_leaf_states_copied +=
+      rebuild_counters.exact_setup_active_leaf_states_copied;
+  accumulated.exact_setup_outside_boundary_charts_built +=
+      rebuild_counters.exact_setup_outside_boundary_charts_built;
+  accumulated.exact_setup_upper_bound_topologies_generated +=
+      rebuild_counters.exact_setup_upper_bound_topologies_generated;
+  accumulated.exact_setup_upper_bound_topologies_unique +=
+      rebuild_counters.exact_setup_upper_bound_topologies_unique;
+  accumulated.exact_setup_frontier_passes +=
+      rebuild_counters.exact_setup_frontier_passes;
+  accumulated.exact_trim_lazy_chart_uses +=
+      rebuild_counters.exact_trim_lazy_chart_uses;
+  accumulated.outside_cache_inside_charts_built +=
+      rebuild_counters.outside_cache_inside_charts_built;
+  accumulated.outside_cache_inside_charts_reused +=
+      rebuild_counters.outside_cache_inside_charts_reused;
+  accumulated.outside_cache_outside_charts_built +=
+      rebuild_counters.outside_cache_outside_charts_built;
   accumulated.lazy_inside_rows_computed +=
       rebuild_counters.lazy_inside_rows_computed;
   accumulated.lazy_outside_rows_computed +=
@@ -815,6 +840,7 @@ chart_spr_compact_and_verify_local_update_state(
         compacted.rebuilt.grammar, local_state.active_patterns,
         local_state.chart_opts, local_state.invariant_constant_offset,
         options.exact_trim);
+    record_multisite_exact_trim_work(counters, oracle.trim);
     result.rebuilt_score = oracle.value;
     result.exactness_kind = oracle.exactness_kind;
 
@@ -2091,72 +2117,34 @@ chart_spr_verify_candidate_fixed_topology_exact_from_persistent_cache(
 // Phase 9 (Work item 4a, technique 2): transient chain extension for
 // grammar-exact verification.
 //
-// A reader-local snapshot-extended view of the committed chain + persistent
-// inside/outside caches, advanced by exactly one (unaccepted) candidate delta.
-// It never mutates the shared substrate: the committed chain and persistent
-// caches are copied into scratch storage, the candidate delta is appended to
-// the scratch chain, and the scratch caches are advanced one paired commit via
-// the SAME `apply_commit_to_inside_cache` / `apply_commit_to_outside_cache`
-// primitives the real commit uses (so the affected-set scoping and the two-
-// chart recurrence are exercised identically).  The result is discarded after
-// verification, so the extension bypasses the Phase 4 commit barrier and can
-// run in parallel with other scoring readers under the epoch/snapshot model.
+// A reader-local snapshot-extended view of the committed chain, advanced by
+// exactly one unaccepted candidate delta.  It never mutates the shared
+// substrate, so the extension bypasses the Phase 4 commit barrier and can run
+// alongside other scoring readers under the epoch/snapshot model.
 //
-// === What Phase 9 ships vs. what it does NOT ship (read this first) ===
+// The exact B&B consumes the materialized extended grammar, not the persistent
+// per-pattern caches.  Consequently, production verification copies and
+// advances only the chain.  Scratch inside/outside caches are copied and
+// advanced only when the opt-in two-chart oracle (or its corruption hook) needs
+// them.  That diagnostic path deliberately uses the same paired commit
+// primitives as a real commit, preserving its affected-set oracle coverage
+// without charging the dead cache work to production candidates.
 //
-// Phase 9 lands the SUBSTRATE (reader-local chain+cache extension), the
-// per-candidate two-chart ORACLE, and the COUNTER discipline.  It does NOT
-// land a wall-clock improvement on the exact_multisite path:
-//
-//   * The exact frontier is read by `build_multisite_trim_active` (the B&B
-//     exact optimum) on the materialized extended grammar.  That call routes
-//     through `build_multisite_trim(grammar, patterns, ...)` which REBUILDS
-//     the inside+outside charts from the grammar -- it takes no cache
-//     argument, so it cannot consume `ext.icache` / `ext.ocache`.
-//   * Consequently the scratch caches (`icache` / `ocache`) are read ONLY by
-//     the test/diagnostic two-chart oracle
-//     (`chart_spr_check_transient_extension_oracle`, gated on
-//     `verify_transient_chain_extension_oracle_for_tests`).  On the PRODUCTION
-//     path (oracle off) the cache copy + advance is dead work: it is paid for
-//     and then discarded.  The production transient path therefore does MORE
-//     work than the cold path (cache copy + advance + a full-chain
-//     `materialize_overlay_chain` + a B&B that rebuilds charts), not less.
-//
-// This is consistent with the plan, not a deviation from it.  WI4a's technique
-// 2 phrasing ("reading the resulting exact-frontier value", "reusing the
-// cache") suggests the cache should feed scoring, but the multisite exact
-// optimum is the B&B optimum and cannot be read from the per-pattern cache.
-// The plan resolves this by splitting 4a (Phase 8/9) from 4b / Phase 12
-// (warm-started B&B that "would seed the B&B from these scratch caches").
-// Phase 9 = substrate + counter discipline + oracle; the actual speedup awaits
-// the speculative Phase 12.  The scratch caches built here are forward-looking
-// groundwork for that warm-start path and are intentionally retained (and
-// exercised against fixtures by the oracle) so Phase 12 can adopt them without
-// re-deriving the affected-set scoping or the two-chart recurrence.
-//
-// The plan's cross-cutting "dense materialization" warning is the thing to
-// watch: a transient chain extension that reuses the persistent cache and
-// updates only affected rows is, by the plan's explicit exemption, NOT a dense
-// materialization -- so it is counted under
+// The materialized-grammar B&B still rebuilds its own exact setup; feeding the
+// persistent caches into that frontier is separate warm-started-B&B work.  The
+// transient chain work remains counted under
 // `transient_chain_extensions_for_verification`, never under
-// `full_overlay_materializations`.  But a full chart rebuild still happens per
-// candidate inside `build_multisite_trim` on the production path; it is
-// licensed by the plan's exemption + the 4a/4b split.  Eliminating that
-// per-candidate chart rebuild is exactly what Phase 12's warm-started B&B is
-// for.
+// `full_overlay_materializations`; diagnostic cache work has its own
+// `transient_chain_diagnostic_cache_extensions` counter.
 struct chart_spr_transient_extension {
   // Scratch chain = copy of the committed chain + appended candidate delta.
   // Reader-local; the committed chain is untouched.
   overlay_chain chain;
-  // Scratch caches = copies of the persistent caches, advanced one paired
-  // commit to the extended tip.  Reader-local; discarded after verification.
-  // NOTE: these are currently read ONLY by the test/diagnostic two-chart
-  // oracle; the production B&B scorer does not consume them (see the header
-  // comment above).  They are retained as forward-looking groundwork for the
-  // Phase-12 warm-started-B&B path, which would seed the B&B frontier from
-  // them instead of rebuilding charts from the grammar.
-  inside_chart_cache icache;
-  outside_chart_cache ocache;
+  // Diagnostic-only copies of the persistent caches, advanced one paired
+  // commit to the extended tip.  Absent on the production path because exact
+  // B&B does not consume them.
+  std::optional<inside_chart_cache> icache;
+  std::optional<outside_chart_cache> ocache;
   // Materialized extended tip grammar + dense->overlay-ref maps.  Built by
   // `materialize_overlay_chain` on the scratch chain; the grammar is identical
   // to `materialize_overlay_grammar(overlay_from_candidate(tip, candidate))`.
@@ -2222,30 +2210,35 @@ chart_spr_transient_extension chart_spr_build_transient_extension(
   // throws here; the caller treats it as an invalid candidate, exactly as the
   // cold path's materialize would surface an unreachable overlay.
   ext.chain.append(delta);
-  // Copy the persistent caches (reader-local) and advance them one paired
-  // commit to the extended tip.  The pairing guards pass: the copied caches
-  // are at the committed tip epoch, and the scratch chain is exactly one delta
-  // ahead, so `commit_epoch + 1 == chain.size()` holds for both.
-  ext.icache = *sub.icache;
-  ext.ocache = *sub.ocache;
-  apply_commit_to_inside_cache(ext.chain, ext.icache);
-  apply_commit_to_outside_cache(ext.chain, ext.ocache, ext.icache);
-  // Materialize the extended tip (transient, reader-local).  This is NOT
-  // counted under full_overlay_materializations: by the cross-cutting
-  // definition a transient chain extension that reuses the persistent cache
-  // and updates only affected rows is not a dense materialization, even though
-  // it produces an exact score.
+  // The production B&B below cannot consume persistent cache rows.  Copy and
+  // advance them only for diagnostics that actually inspect both charts.  The
+  // pairing guards pass because the source caches are at the committed epoch
+  // and the scratch chain is exactly one delta ahead.
+  auto const build_diagnostic_caches =
+      sub.verify_transient_chain_extension_oracle_for_tests ||
+      sub.force_transient_chain_extension_oracle_mismatch_for_tests;
+  if (build_diagnostic_caches) {
+    if (!sub.icache || !sub.ocache) {
+      throw std::runtime_error(
+          "chart SPR transient extension: diagnostic cache source missing");
+    }
+    ext.icache.emplace(*sub.icache);
+    ext.ocache.emplace(*sub.ocache);
+    apply_commit_to_inside_cache(ext.chain, *ext.icache);
+    apply_commit_to_outside_cache(ext.chain, *ext.ocache, *ext.icache);
+  }
+  // Materialize the extended tip (transient, reader-local).  This is accounted
+  // by the historical transient-extension counter, not the umbrella
+  // full_overlay_materializations counter, even though it publishes the exact
+  // grammar consumed by B&B.
   //
   // TODO(phase-12 / perf): `materialize_overlay_chain(ext.chain)` folds the
   // WHOLE chain onto the base.  The cold path reaches an identical extended
   // grammar more cheaply via `overlay_from_candidate(state.grammar, candidate)`
   // (one delta onto the already-materialized tip).  The chain fold is
-  // unnecessary extra work that compounds the "dead cache work" caveat above;
-  // it is left in place because Phase 12 (warm-started B&B seeded from the
-  // scratch caches) is the point at which the chain + caches -- not the
-  // materialized grammar -- become the authoritative source, and switching to
-  // `overlay_from_candidate` now would be thrown away then.  A small win is
-  // available now if Phase 12 is deferred indefinitely.
+  // unnecessary extra work.  Diagnostic cache copies are now gated above; a
+  // future warm-started B&B can make the chain + caches authoritative instead
+  // of keeping this materialized-grammar bridge.
   overlay_payload_validation_stats completed_payload_validation_stats;
   try {
     chart_spr_elapsed_accumulator materialization_timer{
@@ -2266,6 +2259,9 @@ chart_spr_transient_extension chart_spr_build_transient_extension(
   }
   record_planned_overlay_materialization_stats(state.counters,
                                                ext.planned);
+  if (build_diagnostic_caches) {
+    ++state.counters.transient_chain_diagnostic_cache_extensions;
+  }
   return ext;
 }
 
@@ -2292,6 +2288,12 @@ chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
     std::uint64_t transient_new_optimum,
     multisite_trim_options const& trim_options) {
   chart_spr_transient_oracle_result result;
+  if (!ext.icache || !ext.ocache) {
+    throw std::runtime_error(
+        "transient oracle: diagnostic scratch caches were not constructed");
+  }
+  auto const& icache = *ext.icache;
+  auto const& ocache = *ext.ocache;
   auto const& grammar = ext.planned.materialized.grammar;
   if (ext.planned.materialized.dense_clade_to_ref.size() !=
       grammar.clades.size()) {
@@ -2317,14 +2319,15 @@ chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
   auto cold_trim = build_multisite_trim_active(
       cold_materialized.grammar, state.active_patterns, state.chart_opts,
       trim_options);
+  record_multisite_exact_trim_work(state.counters, cold_trim);
   result.cold_new_optimum = cold_trim.optimum;
 
   // Both-charts check: scratch caches vs from-scratch on the extended grammar.
-  for (std::size_t p = 0; p < ext.icache.patterns.size(); ++p) {
+  for (std::size_t p = 0; p < icache.patterns.size(); ++p) {
     leaf_site_states states;
-    states.state_by_taxon = ext.icache.patterns[p].state_by_taxon;
+    states.state_by_taxon = icache.patterns[p].state_by_taxon;
     auto oracle = recompute_both_charts_from_scratch(
-        grammar, states, ext.icache.chart_opts);
+        grammar, states, icache.chart_opts);
     if (oracle.first.inside.size() != grammar.clades.size() ||
         oracle.second.outside.size() != grammar.clades.size()) {
       result.ok = false;
@@ -2337,14 +2340,14 @@ chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
          dense < ext.planned.materialized.dense_clade_to_ref.size(); ++dense) {
       auto ref = ext.planned.materialized.dense_clade_to_ref[dense];
       ++state.counters.transient_chain_extension_oracle_rows_checked_for_tests;
-      if (ext.icache.row(p, ref) != oracle.first.inside[dense]) {
+      if (icache.row(p, ref) != oracle.first.inside[dense]) {
         result.ok = false;
         result.mismatch_reason =
             "transient oracle: inside scratch row mismatch at pattern " +
             std::to_string(p) + " dense clade " + std::to_string(dense);
         return result;
       }
-      if (ext.ocache.row(p, ref) != oracle.second.outside[dense]) {
+      if (ocache.row(p, ref) != oracle.second.outside[dense]) {
         result.ok = false;
         result.mismatch_reason =
             "transient oracle: outside scratch row mismatch at pattern " +
@@ -2371,13 +2374,11 @@ chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
 }
 
 // Phase 9 exact_multisite verifier: score a candidate by transiently extending
-// the chain + caches in reader-local scratch, reading the exact frontier on
-// the extended grammar via `build_multisite_trim_active`, and discarding.  See
-// the header comment on `chart_spr_transient_extension` for the load-bearing
-// caveat: the scratch caches are NOT consumed by the production B&B scorer
-// (which rebuilds charts from the grammar), so Phase 9 ships substrate +
-// oracle + counter discipline, NOT a wall-clock win; the caches are
-// forward-looking groundwork for Phase 12.  The transient work is counted
+// the chain in reader-local scratch, reading the exact frontier on the extended
+// grammar via `build_multisite_trim_active`, and discarding.  Production does
+// not copy the persistent caches because B&B cannot consume them; the opt-in
+// two-chart oracle constructs its diagnostic cache extension explicitly.  The
+// transient work is counted
 // under `transient_chain_extensions_for_verification`, never under
 // `full_overlay_materializations`.  When the test-only oracle flag is set, the
 // result is cross-checked against the cold from-scratch path (both charts +
@@ -2435,6 +2436,10 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
             : build_multisite_trim_active(ext.planned.execution_plan,
                                           state.active_patterns,
                                           state.chart_opts, trim_options);
+    if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+      ++state.counters.exact_trim_lazy_chart_uses;
+    }
+    record_multisite_exact_trim_work(state.counters, new_trim);
     ++state.counters.chart_execution_plan_cache_hits;
 
     // Optional corruption hook: perturb a scratch outside row so the two-chart
@@ -2443,8 +2448,14 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
     // shared cache); the oracle's from-scratch chart is unaffected, so the
     // mismatch is deterministic.
     if (sub.force_transient_chain_extension_oracle_mismatch_for_tests) {
-      if (!ext.ocache.base_rows.empty() && !ext.ocache.base_rows[0].empty()) {
-        auto& row = ext.ocache.base_rows[0][0];
+      if (!ext.ocache) {
+        throw std::runtime_error(
+            "chart SPR transient extension: forced mismatch missing diagnostic "
+            "outside cache");
+      }
+      if (!ext.ocache->base_rows.empty() &&
+          !ext.ocache->base_rows[0].empty()) {
+        auto& row = ext.ocache->base_rows[0][0];
         if (row[0] < larch::chart_inf) {
           row[0] = row[0] + 1;
         } else {
@@ -2557,9 +2568,24 @@ chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
   ++state.counters.chart_execution_plan_cache_hits;
   sub->ocache = build_outside_chart_cache(
       sub->base_grammar, *sub->checked_base_execution_plan,
-      state.active_patterns,
-      state.chart_opts);
+      *sub->icache, state.chart_opts);
   ++state.counters.chart_execution_plan_cache_hits;
+  auto const& outside_build = sub->ocache->build_stats;
+  auto const active_pattern_count =
+      state.active_patterns.patterns.patterns.size();
+  if (outside_build.inside_charts_built != 0 ||
+      outside_build.inside_charts_reused != active_pattern_count ||
+      outside_build.outside_charts_built != active_pattern_count) {
+    throw std::runtime_error(
+        "chart SPR local commit: resident-inside outside-cache build violated "
+        "the Phase-2B reuse contract");
+  }
+  state.counters.outside_cache_inside_charts_built +=
+      outside_build.inside_charts_built;
+  state.counters.outside_cache_inside_charts_reused +=
+      outside_build.inside_charts_reused;
+  state.counters.outside_cache_outside_charts_built +=
+      outside_build.outside_charts_built;
   sub->cache_multifurcation_productions_scored_reported =
       sub->icache->multifurcation_productions_scored +
       sub->ocache->multifurcation_productions_scored;
@@ -3239,6 +3265,30 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.multifurcation_productions_scored;
   summary.candidate_batches_scored = counters.candidate_batches_scored;
   summary.pattern_batch_cache_builds = counters.pattern_batch_cache_builds;
+  summary.exact_setup_builds = counters.exact_setup_builds;
+  summary.exact_setup_inside_charts_built =
+      counters.exact_setup_inside_charts_built;
+  summary.exact_setup_resident_inside_charts_consumed =
+      counters.exact_setup_resident_inside_charts_consumed;
+  summary.exact_setup_active_leaf_state_vectors_copied =
+      counters.exact_setup_active_leaf_state_vectors_copied;
+  summary.exact_setup_active_leaf_states_copied =
+      counters.exact_setup_active_leaf_states_copied;
+  summary.exact_setup_outside_boundary_charts_built =
+      counters.exact_setup_outside_boundary_charts_built;
+  summary.exact_setup_upper_bound_topologies_generated =
+      counters.exact_setup_upper_bound_topologies_generated;
+  summary.exact_setup_upper_bound_topologies_unique =
+      counters.exact_setup_upper_bound_topologies_unique;
+  summary.exact_setup_frontier_passes =
+      counters.exact_setup_frontier_passes;
+  summary.exact_trim_lazy_chart_uses = counters.exact_trim_lazy_chart_uses;
+  summary.outside_cache_inside_charts_built =
+      counters.outside_cache_inside_charts_built;
+  summary.outside_cache_inside_charts_reused =
+      counters.outside_cache_inside_charts_reused;
+  summary.outside_cache_outside_charts_built =
+      counters.outside_cache_outside_charts_built;
   summary.chart_execution_plan_builds = counters.chart_execution_plan_builds;
   summary.chart_execution_plan_cache_hits =
       counters.chart_execution_plan_cache_hits;
@@ -3337,6 +3387,8 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.fixed_topology_chain_objective_before_mismatches;
   summary.transient_chain_extensions_for_verification =
       counters.transient_chain_extensions_for_verification;
+  summary.transient_chain_diagnostic_cache_extensions =
+      counters.transient_chain_diagnostic_cache_extensions;
   summary.transient_chain_extension_fallbacks =
       counters.transient_chain_extension_fallbacks;
   summary.transient_chain_extension_oracle_mismatches =
@@ -3634,26 +3686,22 @@ chart_spr_search_result run_chart_spr_search(
               *substrate_ptr, verifier_state, std::move(candidate));
         };
     // Phase 9: install the transient-extension exact_multisite verifier.  It
-    // verifies each candidate by transiently extending the chain + caches in
+    // verifies each candidate by transiently extending the chain in
     // reader-local scratch (never mutating the shared cache, bypassing the
     // Phase 4 commit barrier), reading the exact frontier on the extended
     // grammar, and discarding.  The work is counted under
     // `transient_chain_extensions_for_verification`, never under
     // `full_overlay_materializations`.
     //
-    // As shipped this is substrate + oracle, not a perf win: the scratch
-    // caches are unconsumed by the production B&B scorer (it rebuilds charts
-    // from the grammar) and are forward-looking groundwork for Phase 12.
-    // See the header comment on `chart_spr_transient_extension`.
+    // Scratch caches are constructed only for the opt-in two-chart diagnostic;
+    // production B&B consumes the materialized extended grammar alone.
     //
     // Phase 10 (verification-mode choice): the transient verifier is the
     // default, but a caller may select `chart_spr_verification_mode::cold` to
     // force the from-scratch `verify_candidate_exact_against_state` path
     // (a dense materialization per verified candidate, counted under
     // `overlay_materializations_for_exact_verification`).  This is the named
-    // verification-mode choice the Phase-10 report surfaces; it is meaningful
-    // even though the Phase-9 scratch caches are not yet consumed by the
-    // production B&B scorer.
+    // verification-mode choice the Phase-10 report surfaces.
     if (options.verification_mode ==
         chart_spr_verification_mode::transient) {
       state.exact_multisite_verifier =

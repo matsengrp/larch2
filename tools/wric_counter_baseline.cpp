@@ -213,6 +213,8 @@ int main() {
   // substrate, not a wall-clock win.
   print_counter_line("transient_chain_extensions_for_verification",
                      c.transient_chain_extensions_for_verification);
+  print_counter_line("transient_chain_diagnostic_cache_extensions",
+                     c.transient_chain_diagnostic_cache_extensions);
   print_counter_line("transient_chain_extension_fallbacks",
                      c.transient_chain_extension_fallbacks);
   print_counter_line("transient_chain_extension_oracle_mismatches",
@@ -232,6 +234,31 @@ int main() {
   print_counter_line("candidate_batches_scored", c.candidate_batches_scored);
   print_counter_line("pattern_batch_cache_builds",
                      c.pattern_batch_cache_builds);
+  print_counter_line("exact_setup_builds", c.exact_setup_builds);
+  print_counter_line("exact_setup_inside_charts_built",
+                     c.exact_setup_inside_charts_built);
+  print_counter_line("exact_setup_resident_inside_charts_consumed",
+                     c.exact_setup_resident_inside_charts_consumed);
+  print_counter_line("exact_setup_active_leaf_state_vectors_copied",
+                     c.exact_setup_active_leaf_state_vectors_copied);
+  print_counter_line("exact_setup_active_leaf_states_copied",
+                     c.exact_setup_active_leaf_states_copied);
+  print_counter_line("exact_setup_outside_boundary_charts_built",
+                     c.exact_setup_outside_boundary_charts_built);
+  print_counter_line("exact_setup_upper_bound_topologies_generated",
+                     c.exact_setup_upper_bound_topologies_generated);
+  print_counter_line("exact_setup_upper_bound_topologies_unique",
+                     c.exact_setup_upper_bound_topologies_unique);
+  print_counter_line("exact_setup_frontier_passes",
+                     c.exact_setup_frontier_passes);
+  print_counter_line("exact_trim_lazy_chart_uses",
+                     c.exact_trim_lazy_chart_uses);
+  print_counter_line("outside_cache_inside_charts_built",
+                     c.outside_cache_inside_charts_built);
+  print_counter_line("outside_cache_inside_charts_reused",
+                     c.outside_cache_inside_charts_reused);
+  print_counter_line("outside_cache_outside_charts_built",
+                     c.outside_cache_outside_charts_built);
   print_counter_line("exact_verifications", c.exact_verifications);
   print_counter_line("accepted_moves", c.accepted_moves);
   print_counter_line("candidate_accepts_attempted",

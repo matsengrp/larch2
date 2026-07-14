@@ -772,6 +772,137 @@ static void test_reference_edge_outside_boundary() {
   std::println("  PASS");
 }
 
+static void test_binary_outside_stack_recurrence_matches_generic() {
+  std::println("test_binary_outside_stack_recurrence_matches_generic");
+
+  larch::grammar_production binary;
+  binary.children = {0, 1};
+  std::array<larch::chart_trim_detail::outside_chart_row, 3> inside_rows;
+  inside_rows[0].fill(larch::chart_inf - 2);
+  inside_rows[1].fill(10);
+  inside_rows[2].fill(3);
+  auto inside_provider = [&](larch::clade_id child) -> auto const& {
+    return inside_rows[child];
+  };
+
+  // The sum of the two child terms saturates.  A total-minus-child shortcut
+  // would recover 2 for child 0's sibling context instead of the correct 10.
+  // Both the fixed-array path and the generic prefix/suffix oracle must retain
+  // the direct saturated-add semantics.
+  auto const stack_rows =
+      larch::chart_trim_detail::combine_binary_production_outside_rows(
+          binary, larch::nuc_base::A, 0, inside_provider);
+  auto const generic_rows =
+      larch::chart_trim_detail::combine_production_outside_rows(
+          binary, larch::nuc_base::A, 0, inside_provider);
+  CHECK(generic_rows.size() == 2);
+  CHECK(stack_rows[0] == generic_rows[0]);
+  CHECK(stack_rows[1] == generic_rows[1]);
+  CHECK(stack_rows[0][larch::nuc_base::A] == 10);
+  CHECK(stack_rows[1][larch::nuc_base::A] == larch::chart_inf - 2);
+
+  larch::chart_trim_detail::outside_chart_row parent_outside{};
+  parent_outside.fill(larch::chart_inf);
+  parent_outside[larch::nuc_base::A] = 0;
+  std::array<larch::chart_trim_detail::outside_chart_row, 2> scattered{
+      larch::parsimony_chart_detail::make_inf_row(),
+      larch::parsimony_chart_detail::make_inf_row()};
+  larch::outside_recurrence_work_stats work;
+  auto consume_binary = [&](std::size_t child_i, auto const& row) {
+    for (std::size_t state = 0; state < row.size(); ++state) {
+      scattered[child_i][state] =
+          std::min(scattered[child_i][state], row[state]);
+    }
+  };
+  larch::chart_trim_detail::scatter_production_outside_rows(
+      binary, parent_outside, inside_provider, consume_binary, work);
+  CHECK(scattered == stack_rows);
+  CHECK(work.binary_stack_productions_scored == 1);
+  CHECK(work.generic_reusable_productions_scored == 0);
+
+  larch::grammar_production ternary;
+  ternary.children = {0, 1, 2};
+  auto ignore_row = [](std::size_t, auto const&) {};
+  larch::chart_trim_detail::scatter_production_outside_rows(
+      ternary, parent_outside, inside_provider, ignore_row, work);
+  CHECK(work.binary_stack_productions_scored == 1);
+  CHECK(work.generic_reusable_productions_scored == 1);
+
+  // Broad deterministic equivalence matrix.  This includes every parent
+  // state, unreachable parents, costs on both sides of the saturation edge,
+  // and arbitrary child-row mixtures.  The generic prefix/suffix recurrence
+  // remains the arithmetic oracle for the fixed-array specialization.
+  auto plan_tree = larch::test::make_tiny_labelled_tree(
+      "A", larch::test::tiny_inner(
+               "root", "A",
+               {larch::test::tiny_leaf("L", "A"),
+                larch::test::tiny_leaf("R", "C")}));
+  auto plan_grammar = larch::build_clade_grammar(plan_tree);
+  auto plan = larch::build_chart_execution_plan(plan_grammar);
+  auto const plan_productions = plan.productions();
+  auto binary_descriptor = std::find_if(
+      plan_productions.begin(), plan_productions.end(),
+      [](auto const& production) { return production.is_binary(); });
+  CHECK(binary_descriptor != plan_productions.end());
+  auto const plan_children = plan.children(binary_descriptor->source_id);
+  CHECK(plan_children.size() == 2);
+  std::vector<larch::chart_trim_detail::outside_chart_row> plan_inside_rows(
+      plan.clades().size(), larch::parsimony_chart_detail::make_inf_row());
+  auto plan_inside_provider = [&](larch::clade_id child) -> auto const& {
+    return plan_inside_rows[child];
+  };
+
+  std::array<larch::chart_cost, 8> cost_pool{
+      0,
+      1,
+      2,
+      11,
+      larch::chart_inf - 20,
+      larch::chart_inf - 2,
+      larch::chart_inf - 1,
+      larch::chart_inf};
+  std::mt19937 rng(0x5a17u);
+  std::uniform_int_distribution<std::size_t> pick_cost(
+      0, cost_pool.size() - 1);
+  for (std::size_t sample = 0; sample < 64; ++sample) {
+    for (auto& child_row : inside_rows) {
+      for (auto& cost : child_row) cost = cost_pool[pick_cost(rng)];
+    }
+    plan_inside_rows[plan_children[0]] = inside_rows[0];
+    plan_inside_rows[plan_children[1]] = inside_rows[1];
+
+    for (std::uint8_t parent_state = 0;
+         parent_state < larch::nuc_state_count; ++parent_state) {
+      for (auto parent_cost : cost_pool) {
+        auto const fixed =
+            larch::chart_trim_detail::combine_binary_production_outside_rows(
+                binary, parent_state, parent_cost, inside_provider);
+        auto const generic =
+            larch::chart_trim_detail::combine_production_outside_rows(
+                binary, parent_state, parent_cost, inside_provider);
+        CHECK(generic.size() == fixed.size());
+        CHECK(generic[0] == fixed[0]);
+        CHECK(generic[1] == fixed[1]);
+
+        auto const planned_fixed =
+            larch::chart_trim_detail::combine_binary_production_outside_rows(
+                plan, plan_children, parent_state, parent_cost,
+                plan_inside_provider);
+        auto const planned_generic =
+            larch::chart_trim_detail::combine_production_outside_rows(
+                plan, plan_children, parent_state, parent_cost,
+                plan_inside_provider);
+        CHECK(planned_generic.size() == planned_fixed.size());
+        CHECK(planned_generic[0] == planned_fixed[0]);
+        CHECK(planned_generic[1] == planned_fixed[1]);
+        CHECK(planned_fixed == fixed);
+      }
+    }
+  }
+
+  std::println("  PASS");
+}
+
 static void test_multisite_composite_counterexample() {
   std::println("test_multisite_composite_counterexample");
 
@@ -850,6 +981,12 @@ static void test_lazy_multisite_bnb_feeding_matches_dense() {
   retained_options.retain_all_inside_class_maps = true;
   auto retained_lazy =
       larch::build_lazy_inside_chart(grammar, patterns, retained_options);
+  auto retained_lazy_outside =
+      larch::build_lazy_outside_chart(grammar, patterns, retained_lazy);
+  CHECK(retained_lazy_outside.outside_recurrence_work
+            .binary_stack_productions_scored > 0);
+  CHECK(retained_lazy_outside.outside_recurrence_work
+            .generic_reusable_productions_scored == 0);
 
   auto dense_composite = larch::build_composite_chart_score(grammar, patterns);
   auto lazy_composite =
@@ -1752,6 +1889,13 @@ static void test_multisite_exact_setup_cold_resident_and_lifetime() {
         return !larch::is_invariant_site_pattern(pattern);
       }));
   CHECK(active_pattern_count != 0);
+  auto const binary_production_count =
+      static_cast<std::size_t>(std::count_if(
+          grammar.productions.begin(), grammar.productions.end(),
+          [](auto const& production) {
+            return production.children.size() == 2;
+          }));
+  CHECK(binary_production_count == grammar.productions.size());
 
   for (bool score_ua_edge : {false, true}) {
     larch::chart_options chart_options;
@@ -1781,6 +1925,11 @@ static void test_multisite_exact_setup_cold_resident_and_lifetime() {
           active_pattern_count * patterns.taxon_count);
     CHECK(cold_setup.work.outside_boundary_charts_built ==
           expected_outside_builds);
+    CHECK(cold_setup.work.outside_recurrence_work
+              .binary_stack_productions_scored ==
+          expected_outside_builds * binary_production_count);
+    CHECK(cold_setup.work.outside_recurrence_work
+              .generic_reusable_productions_scored == 0);
     CHECK(cold_setup.work.upper_bound_topologies_generated ==
           active_pattern_count + 1);
     CHECK(cold_setup.work.upper_bound_topologies_unique != 0);
@@ -1889,6 +2038,13 @@ static void test_multisite_exact_setup_cold_resident_and_lifetime() {
           active_pattern_count * patterns.taxon_count);
     CHECK(resident_setup.work.outside_boundary_charts_built ==
           expected_outside_builds);
+    CHECK(resident_setup.work.outside_recurrence_work ==
+          cold_setup.work.outside_recurrence_work);
+    CHECK(resident_setup.work.outside_recurrence_work
+              .binary_stack_productions_scored ==
+          expected_outside_builds * binary_production_count);
+    CHECK(resident_setup.work.outside_recurrence_work
+              .generic_reusable_productions_scored == 0);
     CHECK(resident_setup.work.upper_bound_topologies_generated ==
           active_pattern_count + 1);
     CHECK(resident_setup.work.upper_bound_topologies_unique ==
@@ -2347,6 +2503,7 @@ int main() {
   test_paper_counterexample_outside_trim_and_traceback();
   test_single_tree_keeps_all_productions();
   test_reference_edge_outside_boundary();
+  test_binary_outside_stack_recurrence_matches_generic();
   test_multisite_composite_counterexample();
   test_lazy_multisite_bnb_feeding_matches_dense();
   test_lazy_structural_pandemic_ratio_on_binary_tree();

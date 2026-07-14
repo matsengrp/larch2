@@ -105,6 +105,28 @@ struct chart_spr_search_counters {
   std::size_t local_score_worker_tasks = 0;
   std::size_t candidate_batches_scored = 0;
   std::size_t pattern_batch_cache_builds = 0;
+  // Phase-2B finalized exact-setup accounting.  These are logical work counts
+  // copied from each successful multisite trim.  In particular, an all-active
+  // search-state trim must consume the resident single-site charts and leave
+  // `exact_setup_inside_charts_built` at zero; pattern-batched cold trims make
+  // their unavoidable rebuilds explicit.  The lazy multisite representation
+  // has its own counter because it does not construct a multisite_exact_setup.
+  std::size_t exact_setup_builds = 0;
+  std::size_t exact_setup_inside_charts_built = 0;
+  std::size_t exact_setup_resident_inside_charts_consumed = 0;
+  std::size_t exact_setup_active_leaf_state_vectors_copied = 0;
+  std::size_t exact_setup_active_leaf_states_copied = 0;
+  std::size_t exact_setup_outside_boundary_charts_built = 0;
+  std::size_t exact_setup_upper_bound_topologies_generated = 0;
+  std::size_t exact_setup_upper_bound_topologies_unique = 0;
+  std::size_t exact_setup_frontier_passes = 0;
+  std::size_t exact_trim_lazy_chart_uses = 0;
+  // Phase-2B local-commit cold outside-cache construction.  The production
+  // path must build the inside cache once, then report zero additional inside
+  // builds and one inside reuse/outside build per active pattern here.
+  std::size_t outside_cache_inside_charts_built = 0;
+  std::size_t outside_cache_inside_charts_reused = 0;
+  std::size_t outside_cache_outside_charts_built = 0;
   std::size_t exact_verifications = 0;
   std::size_t accepted_moves = 0;
   std::size_t candidate_accepts_attempted = 0;
@@ -237,26 +259,21 @@ struct chart_spr_search_counters {
 
   // Phase 9 (Work item 4a, technique 2) transient chain extension for
   // grammar-exact verification.  The exact_multisite gate verifies an
-  // unaccepted candidate by transiently extending the overlay chain +
-  // persistent inside/outside caches in reader-local scratch storage (never
-  // mutating the shared cache, bypassing the Phase 4 commit barrier), reading
-  // the exact frontier on the extended grammar, and discarding.  By the
-  // cross-cutting definition this is NOT a dense materialization: the
-  // transient extension reuses the persistent cache machinery and updates only
-  // affected rows in scratch.  It is counted here, never folded into
+  // unaccepted candidate by transiently extending the overlay chain in
+  // reader-local scratch storage (never mutating the shared cache, bypassing
+  // the Phase 4 commit barrier), reading the exact frontier on the extended
+  // grammar, and discarding.  It is counted here, never folded into
   // `full_overlay_materializations` (a regression to "dense materialize per
   // candidate" must be visible, not hidden behind a renamed counter).
   //
-  // CAVEAT: as shipped, the transient scratch caches are read ONLY by the
-  // test/diagnostic two-chart oracle; the production B&B scorer rebuilds the
-  // charts from the materialized extended grammar and does not consume them.
-  // So this counter measures the transient-extension SUBSTRATE being
-  // exercised, not a wall-clock win over the cold path -- Phase 9 lands
-  // substrate + oracle + counter discipline; the perf win awaits Phase 12
-  // (warm-started B&B seeded from these scratch caches).  See the header
-  // comment on `chart_spr_transient_extension` (chart_spr_search.cpp) and the
-  // Phase-9 caveat in doc/WRIC-SPR-SEARCH.md.
+  // Scratch caches are constructed only for the test/diagnostic two-chart
+  // oracle and are counted separately below; production B&B rebuilds its exact
+  // setup from the materialized extended grammar.
   std::size_t transient_chain_extensions_for_verification = 0;
+  // Scratch inside/outside caches are useful only for the opt-in two-chart
+  // diagnostic.  Production transient verification materializes the extended
+  // chain and runs exact B&B without copying or advancing those unused caches.
+  std::size_t transient_chain_diagnostic_cache_extensions = 0;
   // Test-only diagnostic: transient extensions that fell back to the
   // from-scratch cold path because the per-candidate oracle found a mismatch.
   // A nonzero count means the transient result could not be trusted from the
@@ -301,6 +318,32 @@ inline void record_overlay_payload_validation_stats(
     overlay_payload_validation_stats const& stats) {
   counters.dynamic_overlay_payload_partition_validations +=
       stats.production_partition_validations;
+}
+
+inline void record_multisite_exact_setup_work_stats(
+    chart_spr_search_counters& counters,
+    multisite_exact_setup_work_stats const& stats) {
+  counters.exact_setup_builds += stats.setup_builds;
+  counters.exact_setup_inside_charts_built += stats.inside_charts_built;
+  counters.exact_setup_resident_inside_charts_consumed +=
+      stats.resident_inside_charts_consumed;
+  counters.exact_setup_active_leaf_state_vectors_copied +=
+      stats.active_leaf_state_vectors_copied;
+  counters.exact_setup_active_leaf_states_copied +=
+      stats.active_leaf_states_copied;
+  counters.exact_setup_outside_boundary_charts_built +=
+      stats.outside_boundary_charts_built;
+  counters.exact_setup_upper_bound_topologies_generated +=
+      stats.upper_bound_topologies_generated;
+  counters.exact_setup_upper_bound_topologies_unique +=
+      stats.upper_bound_topologies_unique;
+  counters.exact_setup_frontier_passes += stats.frontier_passes;
+}
+
+inline void record_multisite_exact_trim_work(
+    chart_spr_search_counters& counters,
+    multisite_trim_result const& trim) {
+  record_multisite_exact_setup_work_stats(counters, trim.exact_setup_work);
 }
 
 // Acceptance modes describe the objective used to accept a candidate.  They
@@ -419,15 +462,14 @@ inline char const* chart_spr_commit_mode_name(chart_spr_commit_mode mode) {
 
 // `chart_spr_verification_mode` names how an unaccepted candidate is exact-
 // verified.  The default `transient` is the Phase-9 path: transiently extend
-// the chain + caches in reader-local scratch (counted under
+// the chain in reader-local scratch (counted under
 // `transient_chain_extensions_for_verification`, never under
 // `full_overlay_materializations`).  `cold` skips installing the transient
 // verifier so the from-scratch `verify_candidate_exact_against_state` path
 // runs (a dense materialization per verified candidate, counted under
 // `overlay_materializations_for_exact_verification`).  This is the named
-// verification-mode choice the Phase-10 report surfaces; it is meaningful even
-// though the Phase-9 scratch caches are not yet consumed by the production B&B
-// scorer (see the Phase-9 caveat in doc/WRIC-SPR-SEARCH.md).
+// verification-mode choice the Phase-10 report surfaces.  Diagnostic scratch
+// caches are built only when the opt-in two-chart oracle requests them.
 enum class chart_spr_verification_mode {
   transient,
   cold,
@@ -873,22 +915,17 @@ using chart_spr_fixed_topology_verifier = std::function<
 // Phase 9 (Work item 4a, technique 2) hook: when installed on the search
 // state (by the local-commit substrate builder), the exact_multisite
 // acceptance gate verifies each candidate by transiently extending the
-// overlay chain + persistent inside/outside caches in reader-local scratch
-// storage, reading the exact frontier on the extended grammar, and discarding.
+// overlay chain in reader-local scratch storage, reading the exact frontier on
+// the extended grammar, and discarding.
 // The hook is reader-local (never mutates the shared cache) and therefore
 // bypasses the Phase 4 commit barrier, so transient extensions can run in
 // parallel with other scoring readers under the epoch/snapshot model.  When
 // absent, the exact_multisite gate falls back to the cold from-scratch path
 // (`verify_candidate_exact_against_state`).
 //
-// CAVEAT: as shipped this lands the transient-extension SUBSTRATE and the
-// per-candidate two-chart ORACLE, not a wall-clock improvement -- the scratch
-// caches are not consumed by the production B&B scorer (it rebuilds charts
-// from the grammar), so they are dead work on the production path and read
-// only by the test/diagnostic oracle.  The caches are forward-looking
-// groundwork for Phase 12 (warm-started B&B seeded from them).  See the header
-// comment on `chart_spr_transient_extension` in chart_spr_search.cpp and the
-// Phase-9 caveat in doc/WRIC-SPR-SEARCH.md.
+// The production B&B rebuilds its exact setup from the materialized grammar;
+// scratch inside/outside caches are therefore constructed only when the
+// test/diagnostic two-chart oracle requests them.
 using chart_spr_exact_multisite_verifier = std::function<
     chart_spr_candidate_score(chart_spr_search_state const&,
                               chart_spr_candidate_score,
@@ -977,6 +1014,19 @@ struct chart_spr_search_summary {
   std::size_t multifurcation_productions_scored = 0;
   std::size_t candidate_batches_scored = 0;
   std::size_t pattern_batch_cache_builds = 0;
+  std::size_t exact_setup_builds = 0;
+  std::size_t exact_setup_inside_charts_built = 0;
+  std::size_t exact_setup_resident_inside_charts_consumed = 0;
+  std::size_t exact_setup_active_leaf_state_vectors_copied = 0;
+  std::size_t exact_setup_active_leaf_states_copied = 0;
+  std::size_t exact_setup_outside_boundary_charts_built = 0;
+  std::size_t exact_setup_upper_bound_topologies_generated = 0;
+  std::size_t exact_setup_upper_bound_topologies_unique = 0;
+  std::size_t exact_setup_frontier_passes = 0;
+  std::size_t exact_trim_lazy_chart_uses = 0;
+  std::size_t outside_cache_inside_charts_built = 0;
+  std::size_t outside_cache_inside_charts_reused = 0;
+  std::size_t outside_cache_outside_charts_built = 0;
   std::size_t chart_execution_plan_builds = 0;
   std::size_t chart_execution_plan_cache_hits = 0;
   std::size_t candidate_execution_plan_builds = 0;
@@ -1044,6 +1094,7 @@ struct chart_spr_search_summary {
   // candidate" (full_overlay_materializations > 0 on an exact local-commit
   // run) is visible in CI/benchmark tables without drilling into counters.
   std::size_t transient_chain_extensions_for_verification = 0;
+  std::size_t transient_chain_diagnostic_cache_extensions = 0;
   std::size_t transient_chain_extension_fallbacks = 0;
   std::size_t transient_chain_extension_oracle_mismatches = 0;
   chart_spr_candidate_selection_mode candidate_selection =
@@ -1989,15 +2040,13 @@ struct chart_spr_search_state {
 
   // Optional Phase-9 transient-extension verifier supplied by the local-commit
   // substrate.  When present, exact_multisite verification transiently extends
-  // the chain + caches in reader-local scratch (never mutating the shared
-  // cache) and reads the exact frontier on the extended grammar.  Conservative
+  // the chain in reader-local scratch (never mutating the shared cache) and
+  // reads the exact frontier on the extended grammar.  Conservative
   // rebuild mode leaves this empty and uses the cold from-scratch path
   // (`verify_candidate_exact_against_state`).
   //
-  // As shipped this is substrate + oracle, not a perf win (see the typedef
-  // comment on `chart_spr_exact_multisite_verifier` and the Phase-9 caveat in
-  // doc/WRIC-SPR-SEARCH.md): the scratch caches are forward-looking groundwork
-  // for Phase 12 and are unconsumed by the production B&B scorer.
+  // Diagnostic scratch caches are gated to the optional two-chart oracle; the
+  // production B&B consumes only the materialized extended grammar.
   chart_spr_exact_multisite_verifier exact_multisite_verifier;
 
   mutable chart_spr_search_counters counters;
@@ -2065,6 +2114,58 @@ inline std::size_t estimate_chart_spr_full_pattern_cache_bytes(
     chart_spr_search_state const& state) {
   return estimate_chart_spr_full_pattern_cache_bytes(state.grammar,
                                                     state.active_patterns);
+}
+
+// Build the current state's active-pattern exact trim using the representation
+// already selected for local scoring.  The all-active path is the Phase-2B hot
+// path: its immutable single-site inside charts are consumed once to finalize
+// one owning exact setup, and both frontier passes (when requested) reuse that
+// setup.  Pattern batches intentionally retain the cold exact path because they
+// own no compatible resident rows; the lazy multisite path intentionally
+// retains its class-compressed frontier bridge.
+inline multisite_trim_result build_chart_spr_state_exact_trim(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options = {}) {
+  state.active_patterns.assert_no_skipped_invariant_metadata();
+
+  multisite_trim_result trim;
+  if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
+    auto const pattern_count =
+        state.active_patterns.patterns.patterns.size();
+    if (state.pattern_charts.size() != pattern_count) {
+      throw std::runtime_error(
+          "chart SPR exact trim: all-active resident chart count mismatch");
+    }
+    auto setup = build_multisite_exact_setup_from_resident_inside(
+        state.execution_plan, state.active_patterns.patterns,
+        [&](std::size_t pattern_index,
+            site_pattern const&) -> single_site_chart const& {
+          if (pattern_index >= state.pattern_charts.size()) {
+            throw std::runtime_error(
+                "chart SPR exact trim: resident pattern index out of range");
+          }
+          return state.pattern_charts[pattern_index].chart;
+        },
+        state.chart_opts);
+    trim = build_multisite_trim_from_exact_setup(
+        state.execution_plan, setup, state.chart_opts, trim_options);
+  } else if (state.cache_strategy ==
+             chart_spr_cache_strategy::lazy_multisite_chart) {
+    if (!state.lazy_chart) {
+      throw std::runtime_error(
+          "chart SPR exact trim: lazy cache strategy without lazy chart");
+    }
+    trim = build_multisite_trim_active(
+        state.execution_plan, state.active_patterns, *state.lazy_chart,
+        state.chart_opts, trim_options);
+    ++state.counters.exact_trim_lazy_chart_uses;
+  } else {
+    trim = build_multisite_trim_active(
+        state.execution_plan, state.active_patterns, state.chart_opts,
+        trim_options);
+  }
+  record_multisite_exact_trim_work(state.counters, trim);
+  return trim;
 }
 
 inline chart_spr_search_state build_chart_spr_search_state_from_active(
@@ -2204,21 +2305,8 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
   if (build_exact_trim) {
     auto const exact_initialization_start =
         std::chrono::steady_clock::now();
-    if (state.cache_strategy ==
-        chart_spr_cache_strategy::lazy_multisite_chart) {
-      if (!state.lazy_chart) {
-        throw std::runtime_error(
-            "chart SPR search state: lazy exact trim requested without lazy "
-            "chart");
-      }
-      state.exact_trim_active_only = build_multisite_trim_active(
-          state.execution_plan, state.active_patterns, *state.lazy_chart,
-          options,
-          trim_options);
-    } else {
-      state.exact_trim_active_only = build_multisite_trim_active(
-          state.execution_plan, state.active_patterns, options, trim_options);
-    }
+    state.exact_trim_active_only =
+        build_chart_spr_state_exact_trim(state, trim_options);
     ++state.counters.chart_execution_plan_cache_hits;
     state.exact_initialization_ms =
         std::chrono::duration<double, std::milli>(
@@ -3568,6 +3656,29 @@ inline void add_chart_spr_search_counters(
   dst.local_score_worker_tasks += src.local_score_worker_tasks;
   dst.candidate_batches_scored += src.candidate_batches_scored;
   dst.pattern_batch_cache_builds += src.pattern_batch_cache_builds;
+  dst.exact_setup_builds += src.exact_setup_builds;
+  dst.exact_setup_inside_charts_built +=
+      src.exact_setup_inside_charts_built;
+  dst.exact_setup_resident_inside_charts_consumed +=
+      src.exact_setup_resident_inside_charts_consumed;
+  dst.exact_setup_active_leaf_state_vectors_copied +=
+      src.exact_setup_active_leaf_state_vectors_copied;
+  dst.exact_setup_active_leaf_states_copied +=
+      src.exact_setup_active_leaf_states_copied;
+  dst.exact_setup_outside_boundary_charts_built +=
+      src.exact_setup_outside_boundary_charts_built;
+  dst.exact_setup_upper_bound_topologies_generated +=
+      src.exact_setup_upper_bound_topologies_generated;
+  dst.exact_setup_upper_bound_topologies_unique +=
+      src.exact_setup_upper_bound_topologies_unique;
+  dst.exact_setup_frontier_passes += src.exact_setup_frontier_passes;
+  dst.exact_trim_lazy_chart_uses += src.exact_trim_lazy_chart_uses;
+  dst.outside_cache_inside_charts_built +=
+      src.outside_cache_inside_charts_built;
+  dst.outside_cache_inside_charts_reused +=
+      src.outside_cache_inside_charts_reused;
+  dst.outside_cache_outside_charts_built +=
+      src.outside_cache_outside_charts_built;
   dst.exact_verifications += src.exact_verifications;
   dst.accepted_moves += src.accepted_moves;
   dst.candidate_accepts_attempted += src.candidate_accepts_attempted;
@@ -3668,6 +3779,8 @@ inline void add_chart_spr_search_counters(
       src.fixed_topology_independent_sm_bug_perturbations_for_tests;
   dst.transient_chain_extensions_for_verification +=
       src.transient_chain_extensions_for_verification;
+  dst.transient_chain_diagnostic_cache_extensions +=
+      src.transient_chain_diagnostic_cache_extensions;
   dst.transient_chain_extension_fallbacks +=
       src.transient_chain_extension_fallbacks;
   dst.transient_chain_extension_oracle_mismatches +=
@@ -4648,20 +4761,8 @@ inline multisite_trim_result const& ensure_chart_spr_state_exact_trim(
   state.active_patterns.assert_no_skipped_invariant_metadata();
   checked_state.assert_same(state.grammar, state.execution_plan);
   if (!state.exact_trim_active_only) {
-    if (state.cache_strategy ==
-        chart_spr_cache_strategy::lazy_multisite_chart) {
-      if (!state.lazy_chart) {
-        throw std::runtime_error(
-            "chart SPR exact trim: lazy cache strategy without lazy chart");
-      }
-      state.exact_trim_active_only = build_multisite_trim_active(
-          state.execution_plan, state.active_patterns, *state.lazy_chart,
-          state.chart_opts, trim_options);
-    } else {
-      state.exact_trim_active_only = build_multisite_trim_active(
-          state.execution_plan, state.active_patterns, state.chart_opts,
-          trim_options);
-    }
+    state.exact_trim_active_only =
+        build_chart_spr_state_exact_trim(state, trim_options);
     ++state.counters.chart_execution_plan_cache_hits;
   }
   return *state.exact_trim_active_only;
@@ -4748,6 +4849,10 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state(
             : build_multisite_trim_active(planned.execution_plan,
                                           state.active_patterns,
                                           state.chart_opts, trim_options);
+    if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+      ++state.counters.exact_trim_lazy_chart_uses;
+    }
+    record_multisite_exact_trim_work(state.counters, new_trim);
     ++state.counters.chart_execution_plan_cache_hits;
 
     auto old_full = chart_spr_add_invariant_offset(
@@ -5949,8 +6054,8 @@ inline chart_spr_candidate_score verify_candidate_for_acceptance(
     case chart_spr_acceptance_mode::exact_multisite:
       // Phase 9: when a local-commit substrate is active it installs
       // `state.exact_multisite_verifier`, which verifies the candidate by
-      // transiently extending the chain + caches in reader-local scratch
-      // (avoiding a fresh materialize_overlay_grammar, never mutating the
+      // transiently extending the chain in reader-local scratch (avoiding a
+      // fresh materialize_overlay_grammar, never mutating the
       // shared cache).  When absent (conservative rebuild mode, or a bare
       // state built without a substrate), the cold from-scratch path below is
       // used.  The cold path is also the correctness oracle the transient
@@ -6558,11 +6663,15 @@ inline spr_score_result score_multisite_spr_candidate_exact_oracle(
     ++counters->overlay_materializations_for_oracle;
   }
 
-  auto old_score = build_multisite_trim(base, patterns, options, trim_options)
-                       .optimum;
-  auto new_score = build_multisite_trim(materialized.grammar, patterns, options,
-                                        trim_options)
-                       .optimum;
+  auto old_trim = build_multisite_trim(base, patterns, options, trim_options);
+  auto new_trim = build_multisite_trim(materialized.grammar, patterns, options,
+                                       trim_options);
+  if (counters != nullptr) {
+    record_multisite_exact_trim_work(*counters, old_trim);
+    record_multisite_exact_trim_work(*counters, new_trim);
+  }
+  auto old_score = old_trim.optimum;
+  auto new_score = new_trim.optimum;
   return spr_score_result{
       chart_spr_detail::signed_delta(old_score, new_score), old_score,
       new_score, true};

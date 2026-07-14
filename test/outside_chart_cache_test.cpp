@@ -803,6 +803,13 @@ static void test_plan_cold_caches_match_checked_oracle() {
       f.grammar, f.active, f.options, f.invariant_offset);
   auto checked_outside =
       larch::build_outside_chart_cache(f.grammar, f.active, f.options);
+  auto const binary_production_count =
+      static_cast<std::size_t>(std::count_if(
+          f.grammar.productions.begin(), f.grammar.productions.end(),
+          [](auto const& production) {
+            return production.children.size() == 2;
+          }));
+  CHECK(binary_production_count == f.grammar.productions.size());
 
   std::size_t full_validations = 0;
   std::size_t partition_validations = 0;
@@ -825,6 +832,13 @@ static void test_plan_cold_caches_match_checked_oracle() {
         checked_inside.multifurcation_productions_scored);
   CHECK(planned_outside.multifurcation_productions_scored ==
         checked_outside.multifurcation_productions_scored);
+  CHECK(planned_outside.outside_recurrence_work ==
+        checked_outside.outside_recurrence_work);
+  CHECK(planned_outside.outside_recurrence_work
+            .binary_stack_productions_scored ==
+        planned_inside.patterns.size() * binary_production_count);
+  CHECK(planned_outside.outside_recurrence_work
+            .generic_reusable_productions_scored == 0);
   CHECK(full_validations == 0);
   CHECK(partition_validations == 0);
   CHECK(clade_sorts == 0);
@@ -840,6 +854,8 @@ static void test_plan_cold_caches_match_checked_oracle() {
   CHECK(reused_outside.commit_epoch == 0);
   CHECK(reused_outside.multifurcation_productions_scored ==
         planned_outside.multifurcation_productions_scored);
+  CHECK(reused_outside.outside_recurrence_work ==
+        planned_outside.outside_recurrence_work);
   CHECK(reused_outside.invariant_constant_offset == f.invariant_offset);
   CHECK(reused_outside.build_stats.inside_charts_built == 0);
   CHECK(reused_outside.build_stats.inside_charts_reused ==
@@ -879,11 +895,23 @@ static void test_cold_outside_reuse_ua_and_multifurcation_equivalence() {
         f.grammar, checked, f.active, options, reference_states);
     auto reused = larch::build_outside_chart_cache(f.grammar, checked, inside,
                                                    options, reference_states);
+    auto const binary_production_count =
+        static_cast<std::size_t>(std::count_if(
+            f.grammar.productions.begin(), f.grammar.productions.end(),
+            [](auto const& production) {
+              return production.children.size() == 2;
+            }));
 
     CHECK(reused.base_rows == rebuilt.base_rows);
     CHECK(reused.reference_state_by_pattern == reference_states);
     CHECK(reused.multifurcation_productions_scored ==
           rebuilt.multifurcation_productions_scored);
+    CHECK(reused.outside_recurrence_work ==
+          rebuilt.outside_recurrence_work);
+    CHECK(reused.outside_recurrence_work.binary_stack_productions_scored ==
+          inside.patterns.size() * binary_production_count);
+    CHECK(reused.outside_recurrence_work
+              .generic_reusable_productions_scored == 0);
     CHECK(reused.build_stats.inside_charts_built == 0);
     CHECK(reused.build_stats.inside_charts_reused == inside.patterns.size());
     CHECK(reused.build_stats.outside_charts_built == inside.patterns.size());
@@ -909,11 +937,28 @@ static void test_cold_outside_reuse_ua_and_multifurcation_equivalence() {
                                                     f.active, f.options);
     auto reused =
         larch::build_outside_chart_cache(f.grammar, checked, inside, f.options);
+    auto const binary_production_count =
+        static_cast<std::size_t>(std::count_if(
+            f.grammar.productions.begin(), f.grammar.productions.end(),
+            [](auto const& production) {
+              return production.children.size() == 2;
+            }));
+    auto const generic_production_count =
+        f.grammar.productions.size() - binary_production_count;
 
     CHECK(reused.base_rows == rebuilt.base_rows);
     CHECK(rebuilt.multifurcation_productions_scored > 0);
     CHECK(reused.multifurcation_productions_scored ==
           rebuilt.multifurcation_productions_scored);
+    CHECK(reused.outside_recurrence_work ==
+          rebuilt.outside_recurrence_work);
+    CHECK(reused.outside_recurrence_work.binary_stack_productions_scored ==
+          inside.patterns.size() * binary_production_count);
+    CHECK(reused.outside_recurrence_work
+              .generic_reusable_productions_scored ==
+          inside.patterns.size() * generic_production_count);
+    CHECK(reused.outside_recurrence_work
+              .generic_reusable_productions_scored > 0);
     CHECK(reused.build_stats.inside_charts_built == 0);
     CHECK(reused.build_stats.inside_charts_reused == inside.patterns.size());
     CHECK(reused.build_stats.outside_charts_built == inside.patterns.size());

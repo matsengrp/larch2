@@ -1155,6 +1155,17 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()
 
+# Phase-2A test-only global allocation observer.  The replacement operators
+# are linked only into this dedicated executable; production binaries retain
+# their normal allocation functions.  The test validates the observer itself
+# and deliberately does not measure the current allocating public scorer.
+add_executable(chart_spr_allocation_test
+               test/chart_spr_allocation_test.cpp
+               test/chart_spr_allocation_overrides.cpp)
+target_link_libraries(chart_spr_allocation_test PRIVATE larch)
+add_test(NAME chart_spr_allocation_test COMMAND chart_spr_allocation_test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 # Phase 10 (cross-cutting CLI / report / identity surface) library-level tests.
 add_executable(chart_spr_phase10_test test/chart_spr_phase10_test.cpp)
 target_link_libraries(chart_spr_phase10_test PRIVATE larch)

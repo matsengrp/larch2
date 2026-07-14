@@ -3259,6 +3259,8 @@ static void print_chart_spr_search_counter_fields(
   // incrementing (transient mode).
   out << indent << "transient_chain_extensions_for_verification: "
       << counters.transient_chain_extensions_for_verification << "\n";
+  out << indent << "transient_chain_diagnostic_cache_extensions: "
+      << counters.transient_chain_diagnostic_cache_extensions << "\n";
   out << indent << "transient_chain_extension_fallbacks: "
       << counters.transient_chain_extension_fallbacks << "\n";
   out << indent << "transient_chain_extension_oracle_mismatches: "
@@ -3285,6 +3287,32 @@ static void print_chart_spr_search_counter_fields(
       << counters.candidate_batches_scored << "\n";
   out << indent << "pattern_batch_cache_builds: "
       << counters.pattern_batch_cache_builds << "\n";
+  out << indent << "exact_setup_builds: " << counters.exact_setup_builds
+      << "\n";
+  out << indent << "exact_setup_inside_charts_built: "
+      << counters.exact_setup_inside_charts_built << "\n";
+  out << indent << "exact_setup_resident_inside_charts_consumed: "
+      << counters.exact_setup_resident_inside_charts_consumed << "\n";
+  out << indent << "exact_setup_active_leaf_state_vectors_copied: "
+      << counters.exact_setup_active_leaf_state_vectors_copied << "\n";
+  out << indent << "exact_setup_active_leaf_states_copied: "
+      << counters.exact_setup_active_leaf_states_copied << "\n";
+  out << indent << "exact_setup_outside_boundary_charts_built: "
+      << counters.exact_setup_outside_boundary_charts_built << "\n";
+  out << indent << "exact_setup_upper_bound_topologies_generated: "
+      << counters.exact_setup_upper_bound_topologies_generated << "\n";
+  out << indent << "exact_setup_upper_bound_topologies_unique: "
+      << counters.exact_setup_upper_bound_topologies_unique << "\n";
+  out << indent << "exact_setup_frontier_passes: "
+      << counters.exact_setup_frontier_passes << "\n";
+  out << indent << "exact_trim_lazy_chart_uses: "
+      << counters.exact_trim_lazy_chart_uses << "\n";
+  out << indent << "outside_cache_inside_charts_built: "
+      << counters.outside_cache_inside_charts_built << "\n";
+  out << indent << "outside_cache_inside_charts_reused: "
+      << counters.outside_cache_inside_charts_reused << "\n";
+  out << indent << "outside_cache_outside_charts_built: "
+      << counters.outside_cache_outside_charts_built << "\n";
   out << indent << "exact_verifications: " << counters.exact_verifications
       << "\n";
   out << indent << "accepted_moves: " << counters.accepted_moves << "\n";
@@ -4192,6 +4220,8 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.fixed_topology_chain_objective_before_mismatches << "\n";
   out << "  transient_chain_extensions_for_verification: "
       << search.summary.transient_chain_extensions_for_verification << "\n";
+  out << "  transient_chain_diagnostic_cache_extensions: "
+      << search.summary.transient_chain_diagnostic_cache_extensions << "\n";
   out << "  transient_chain_extension_fallbacks: "
       << search.summary.transient_chain_extension_fallbacks << "\n";
   out << "  transient_chain_extension_oracle_mismatches: "
@@ -4203,6 +4233,32 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.candidate_batches_scored << "\n";
   out << "  pattern_batch_cache_builds: "
       << search.summary.pattern_batch_cache_builds << "\n";
+  out << "  exact_setup_builds: " << search.summary.exact_setup_builds
+      << "\n";
+  out << "  exact_setup_inside_charts_built: "
+      << search.summary.exact_setup_inside_charts_built << "\n";
+  out << "  exact_setup_resident_inside_charts_consumed: "
+      << search.summary.exact_setup_resident_inside_charts_consumed << "\n";
+  out << "  exact_setup_active_leaf_state_vectors_copied: "
+      << search.summary.exact_setup_active_leaf_state_vectors_copied << "\n";
+  out << "  exact_setup_active_leaf_states_copied: "
+      << search.summary.exact_setup_active_leaf_states_copied << "\n";
+  out << "  exact_setup_outside_boundary_charts_built: "
+      << search.summary.exact_setup_outside_boundary_charts_built << "\n";
+  out << "  exact_setup_upper_bound_topologies_generated: "
+      << search.summary.exact_setup_upper_bound_topologies_generated << "\n";
+  out << "  exact_setup_upper_bound_topologies_unique: "
+      << search.summary.exact_setup_upper_bound_topologies_unique << "\n";
+  out << "  exact_setup_frontier_passes: "
+      << search.summary.exact_setup_frontier_passes << "\n";
+  out << "  exact_trim_lazy_chart_uses: "
+      << search.summary.exact_trim_lazy_chart_uses << "\n";
+  out << "  outside_cache_inside_charts_built: "
+      << search.summary.outside_cache_inside_charts_built << "\n";
+  out << "  outside_cache_inside_charts_reused: "
+      << search.summary.outside_cache_inside_charts_reused << "\n";
+  out << "  outside_cache_outside_charts_built: "
+      << search.summary.outside_cache_outside_charts_built << "\n";
   out << "  chart_execution_plan_builds: "
       << search.summary.chart_execution_plan_builds << "\n";
   out << "  chart_execution_plan_cache_hits: "

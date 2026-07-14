@@ -34,7 +34,30 @@ struct single_site_outside_chart {
 
   // Number of non-binary production rows evaluated by this outside chart build.
   std::size_t multifurcation_productions_scored = 0;
+
+  // The binary recurrence uses only fixed-size stack rows.  The checked
+  // generic-arity recurrence owns reusable vector scratch for one production
+  // dispatch.  These counters are incremented by the dispatch itself (not by
+  // its callers), so tests can distinguish the two paths without allocator-
+  // implementation-dependent instrumentation.
+  struct recurrence_work_stats {
+    std::size_t binary_stack_productions_scored = 0;
+    std::size_t generic_reusable_productions_scored = 0;
+
+    recurrence_work_stats& operator+=(recurrence_work_stats const& other) {
+      binary_stack_productions_scored +=
+          other.binary_stack_productions_scored;
+      generic_reusable_productions_scored +=
+          other.generic_reusable_productions_scored;
+      return *this;
+    }
+
+    bool operator==(recurrence_work_stats const&) const = default;
+  } recurrence_work;
 };
+
+using outside_recurrence_work_stats =
+    single_site_outside_chart::recurrence_work_stats;
 
 struct chart_production_choice {
   production_id production = no_production;
@@ -246,112 +269,233 @@ inline chart_cost add3(chart_cost a, chart_cost b, chart_cost c) {
       parsimony_chart_detail::saturated_add(a, b), c);
 }
 
-template <class Production, class RowProvider>
-inline std::vector<std::array<chart_cost, nuc_state_count>>
-combine_production_outside_rows(Production const& prod,
-                                std::uint8_t parent_state,
-                                chart_cost parent_outside,
-                                RowProvider&& inside_provider) {
+using outside_chart_row = std::array<chart_cost, nuc_state_count>;
+using binary_outside_rows = std::array<outside_chart_row, 2>;
+
+struct generic_outside_recurrence_scratch {
+  std::vector<outside_chart_row> result;
+  std::vector<chart_cost> child_best;
+  std::vector<chart_cost> prefix;
+  std::vector<chart_cost> suffix;
+};
+
+template <class Children, class RowProvider, class TransitionCost>
+inline binary_outside_rows combine_binary_production_outside_rows_impl(
+    Children const& children, std::uint8_t parent_state,
+    chart_cost parent_outside, RowProvider&& inside_provider,
+    TransitionCost&& transition_cost) {
   parsimony_chart_detail::validate_state(parent_state, "outside parent state");
-  std::vector<std::array<chart_cost, nuc_state_count>> result(
-      prod.children.size(), parsimony_chart_detail::make_inf_row());
+  if (children.size() != 2) {
+    throw std::runtime_error(
+        "outside recurrence: binary path requires exactly two children");
+  }
+
+  binary_outside_rows result{
+      parsimony_chart_detail::make_inf_row(),
+      parsimony_chart_detail::make_inf_row()};
   if (parent_outside >= chart_inf) return result;
 
-  std::vector<chart_cost> child_best(prod.children.size(), chart_inf);
-  for (std::size_t child_i = 0; child_i < prod.children.size(); ++child_i) {
-    auto const& child_row = inside_provider(prod.children[child_i]);
-    for (std::uint8_t child_state = 0; child_state < nuc_state_count;
-         ++child_state) {
-      child_best[child_i] = std::min(
-          child_best[child_i],
-          parsimony_chart_detail::saturated_add(
-              child_row[child_state],
-              parsimony_chart_detail::transition_cost(parent_state,
-                                                      child_state)));
-    }
-  }
-
-  std::vector<chart_cost> prefix(prod.children.size() + 1, chart_cost{0});
-  std::vector<chart_cost> suffix(prod.children.size() + 1, chart_cost{0});
-  for (std::size_t child_i = 0; child_i < prod.children.size(); ++child_i) {
-    prefix[child_i + 1] =
-        parsimony_chart_detail::saturated_add(prefix[child_i],
-                                              child_best[child_i]);
-  }
-  for (std::size_t child_i = prod.children.size(); child_i-- > 0;) {
-    suffix[child_i] =
-        parsimony_chart_detail::saturated_add(child_best[child_i],
-                                              suffix[child_i + 1]);
-  }
-
-  for (std::size_t child_i = 0; child_i < prod.children.size(); ++child_i) {
-    auto sibling_context = parsimony_chart_detail::saturated_add(
-        parent_outside,
-        parsimony_chart_detail::saturated_add(prefix[child_i],
-                                              suffix[child_i + 1]));
-    if (sibling_context >= chart_inf) continue;
-    for (std::uint8_t child_state = 0; child_state < nuc_state_count;
-         ++child_state) {
-      result[child_i][child_state] = parsimony_chart_detail::saturated_add(
-          sibling_context,
-          parsimony_chart_detail::transition_cost(parent_state, child_state));
-    }
-  }
-  return result;
-}
-
-template <class RowProvider>
-inline std::vector<std::array<chart_cost, nuc_state_count>>
-combine_production_outside_rows(
-    chart_execution_plan const& plan, std::span<clade_id const> children,
-    std::uint8_t parent_state, chart_cost parent_outside,
-    RowProvider&& inside_provider) {
-  parsimony_chart_detail::validate_state(parent_state, "outside parent state");
-  std::vector<std::array<chart_cost, nuc_state_count>> result(
-      children.size(), parsimony_chart_detail::make_inf_row());
-  if (parent_outside >= chart_inf) return result;
-
-  std::vector<chart_cost> child_best(children.size(), chart_inf);
-  for (std::size_t child_i = 0; child_i < children.size(); ++child_i) {
+  std::array<chart_cost, 2> child_best{chart_inf, chart_inf};
+  for (std::size_t child_i = 0; child_i < 2; ++child_i) {
     auto const& child_row = inside_provider(children[child_i]);
     for (std::uint8_t child_state = 0; child_state < nuc_state_count;
          ++child_state) {
       child_best[child_i] = std::min(
           child_best[child_i],
           parsimony_chart_detail::saturated_add(
-              child_row[child_state],
-              static_cast<chart_cost>(
-                  plan.transition_cost(parent_state, child_state))));
+              child_row[child_state], transition_cost(parent_state,
+                                                       child_state)));
     }
   }
 
-  std::vector<chart_cost> prefix(children.size() + 1, chart_cost{0});
-  std::vector<chart_cost> suffix(children.size() + 1, chart_cost{0});
+  for (std::size_t child_i = 0; child_i < 2; ++child_i) {
+    // Compute the sibling term directly.  Never derive it by subtracting this
+    // child's contribution from a possibly saturated production total.
+    auto const sibling_i = std::size_t{1} - child_i;
+    auto sibling_context = parsimony_chart_detail::saturated_add(
+        parent_outside, child_best[sibling_i]);
+    if (sibling_context >= chart_inf) continue;
+    for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+         ++child_state) {
+      result[child_i][child_state] = parsimony_chart_detail::saturated_add(
+          sibling_context, transition_cost(parent_state, child_state));
+    }
+  }
+  return result;
+}
+
+template <class Children, class RowProvider, class TransitionCost>
+inline std::span<outside_chart_row const>
+combine_generic_production_outside_rows_into(
+    Children const& children, std::uint8_t parent_state,
+    chart_cost parent_outside, RowProvider&& inside_provider,
+    TransitionCost&& transition_cost,
+    generic_outside_recurrence_scratch& scratch) {
+  parsimony_chart_detail::validate_state(parent_state, "outside parent state");
+  scratch.result.assign(children.size(),
+                        parsimony_chart_detail::make_inf_row());
+  if (parent_outside >= chart_inf) {
+    return std::span<outside_chart_row const>{scratch.result};
+  }
+
+  scratch.child_best.assign(children.size(), chart_inf);
   for (std::size_t child_i = 0; child_i < children.size(); ++child_i) {
-    prefix[child_i + 1] = parsimony_chart_detail::saturated_add(
-        prefix[child_i], child_best[child_i]);
+    auto const& child_row = inside_provider(children[child_i]);
+    for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+         ++child_state) {
+      scratch.child_best[child_i] = std::min(
+          scratch.child_best[child_i],
+          parsimony_chart_detail::saturated_add(
+              child_row[child_state], transition_cost(parent_state,
+                                                       child_state)));
+    }
+  }
+
+  scratch.prefix.assign(children.size() + 1, chart_cost{0});
+  scratch.suffix.assign(children.size() + 1, chart_cost{0});
+  for (std::size_t child_i = 0; child_i < children.size(); ++child_i) {
+    scratch.prefix[child_i + 1] =
+        parsimony_chart_detail::saturated_add(
+            scratch.prefix[child_i], scratch.child_best[child_i]);
   }
   for (std::size_t child_i = children.size(); child_i-- > 0;) {
-    suffix[child_i] = parsimony_chart_detail::saturated_add(
-        child_best[child_i], suffix[child_i + 1]);
+    scratch.suffix[child_i] =
+        parsimony_chart_detail::saturated_add(
+            scratch.child_best[child_i], scratch.suffix[child_i + 1]);
   }
 
   for (std::size_t child_i = 0; child_i < children.size(); ++child_i) {
     auto sibling_context = parsimony_chart_detail::saturated_add(
         parent_outside,
-        parsimony_chart_detail::saturated_add(prefix[child_i],
-                                              suffix[child_i + 1]));
+        parsimony_chart_detail::saturated_add(scratch.prefix[child_i],
+                                              scratch.suffix[child_i + 1]));
     if (sibling_context >= chart_inf) continue;
     for (std::uint8_t child_state = 0; child_state < nuc_state_count;
          ++child_state) {
-      result[child_i][child_state] =
+      scratch.result[child_i][child_state] =
           parsimony_chart_detail::saturated_add(
-              sibling_context,
-              static_cast<chart_cost>(
-                  plan.transition_cost(parent_state, child_state)));
+              sibling_context, transition_cost(parent_state, child_state));
     }
   }
-  return result;
+  return std::span<outside_chart_row const>{scratch.result};
+}
+
+template <class Production, class RowProvider>
+inline binary_outside_rows combine_binary_production_outside_rows(
+    Production const& prod, std::uint8_t parent_state,
+    chart_cost parent_outside, RowProvider&& inside_provider) {
+  auto transition_cost = [](std::uint8_t from, std::uint8_t to) {
+    return parsimony_chart_detail::transition_cost(from, to);
+  };
+  return combine_binary_production_outside_rows_impl(
+      prod.children, parent_state, parent_outside,
+      std::forward<RowProvider>(inside_provider), transition_cost);
+}
+
+template <class RowProvider>
+inline binary_outside_rows combine_binary_production_outside_rows(
+    chart_execution_plan const& plan, std::span<clade_id const> children,
+    std::uint8_t parent_state, chart_cost parent_outside,
+    RowProvider&& inside_provider) {
+  auto transition_cost = [&](std::uint8_t from, std::uint8_t to) {
+    return static_cast<chart_cost>(plan.transition_cost(from, to));
+  };
+  return combine_binary_production_outside_rows_impl(
+      children, parent_state, parent_outside,
+      std::forward<RowProvider>(inside_provider), transition_cost);
+}
+
+template <class Production, class RowProvider>
+inline std::vector<outside_chart_row> combine_production_outside_rows(
+    Production const& prod, std::uint8_t parent_state,
+    chart_cost parent_outside, RowProvider&& inside_provider) {
+  auto transition_cost = [](std::uint8_t from, std::uint8_t to) {
+    return parsimony_chart_detail::transition_cost(from, to);
+  };
+  generic_outside_recurrence_scratch scratch;
+  (void)combine_generic_production_outside_rows_into(
+      prod.children, parent_state, parent_outside,
+      std::forward<RowProvider>(inside_provider), transition_cost, scratch);
+  return std::move(scratch.result);
+}
+
+template <class RowProvider>
+inline std::vector<outside_chart_row> combine_production_outside_rows(
+    chart_execution_plan const& plan, std::span<clade_id const> children,
+    std::uint8_t parent_state, chart_cost parent_outside,
+    RowProvider&& inside_provider) {
+  auto transition_cost = [&](std::uint8_t from, std::uint8_t to) {
+    return static_cast<chart_cost>(plan.transition_cost(from, to));
+  };
+  generic_outside_recurrence_scratch scratch;
+  (void)combine_generic_production_outside_rows_into(
+      children, parent_state, parent_outside,
+      std::forward<RowProvider>(inside_provider), transition_cost, scratch);
+  return std::move(scratch.result);
+}
+
+template <class Children, class RowProvider, class TransitionCost,
+          class RowConsumer>
+inline void scatter_production_outside_rows_impl(
+    Children const& children, outside_chart_row const& parent_outside,
+    RowProvider&& inside_provider, TransitionCost&& transition_cost,
+    RowConsumer&& consume_row, outside_recurrence_work_stats& work) {
+  // consume_row must consume each row synchronously.  Binary rows live on this
+  // stack frame and generic rows live in the local scratch below; no result or
+  // cache stores a view into either lifetime.
+  if (children.size() == 2) {
+    ++work.binary_stack_productions_scored;
+    for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+         ++parent_state) {
+      auto const base = parent_outside[parent_state];
+      if (base >= chart_inf) continue;
+      auto const rows = combine_binary_production_outside_rows_impl(
+          children, parent_state, base, inside_provider, transition_cost);
+      consume_row(std::size_t{0}, rows[0]);
+      consume_row(std::size_t{1}, rows[1]);
+    }
+    return;
+  }
+
+  ++work.generic_reusable_productions_scored;
+  generic_outside_recurrence_scratch scratch;
+  for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+       ++parent_state) {
+    auto const base = parent_outside[parent_state];
+    if (base >= chart_inf) continue;
+    auto const rows = combine_generic_production_outside_rows_into(
+        children, parent_state, base, inside_provider, transition_cost,
+        scratch);
+    for (std::size_t child_i = 0; child_i < rows.size(); ++child_i) {
+      consume_row(child_i, rows[child_i]);
+    }
+  }
+}
+
+template <class Production, class RowProvider, class RowConsumer>
+inline void scatter_production_outside_rows(
+    Production const& prod, outside_chart_row const& parent_outside,
+    RowProvider&& inside_provider, RowConsumer&& consume_row,
+    outside_recurrence_work_stats& work) {
+  auto transition_cost = [](std::uint8_t from, std::uint8_t to) {
+    return parsimony_chart_detail::transition_cost(from, to);
+  };
+  scatter_production_outside_rows_impl(
+      prod.children, parent_outside, std::forward<RowProvider>(inside_provider),
+      transition_cost, std::forward<RowConsumer>(consume_row), work);
+}
+
+template <class RowProvider, class RowConsumer>
+inline void scatter_production_outside_rows(
+    chart_execution_plan const& plan, std::span<clade_id const> children,
+    outside_chart_row const& parent_outside, RowProvider&& inside_provider,
+    RowConsumer&& consume_row, outside_recurrence_work_stats& work) {
+  auto transition_cost = [&](std::uint8_t from, std::uint8_t to) {
+    return static_cast<chart_cost>(plan.transition_cost(from, to));
+  };
+  scatter_production_outside_rows_impl(
+      children, parent_outside, std::forward<RowProvider>(inside_provider),
+      transition_cost, std::forward<RowConsumer>(consume_row), work);
 }
 
 inline chart_cost production_choice_inside_cost(
@@ -845,30 +989,25 @@ inline single_site_outside_chart build_single_site_outside_chart(
         ++result.multifurcation_productions_scored;
       }
 
-      for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
-           ++parent_state) {
-        auto base = result.outside[parent][parent_state];
-        if (base >= chart_inf) continue;
-
-        auto inside_provider = [&](clade_id child) -> auto const& {
-          if (child == no_clade || child >= chart.inside.size()) {
-            throw std::runtime_error(
-                "chart trim: production child clade out of range");
-          }
-          return chart.inside[child];
-        };
-        auto outside_rows = chart_trim_detail::combine_production_outside_rows(
-            prod, parent_state, base, inside_provider);
-        for (std::size_t child_i = 0; child_i < prod.children.size();
-             ++child_i) {
-          auto child = prod.children[child_i];
-          for (std::uint8_t child_state = 0; child_state < nuc_state_count;
-               ++child_state) {
-            auto& cell = result.outside[child][child_state];
-            cell = std::min(cell, outside_rows[child_i][child_state]);
-          }
+      auto inside_provider = [&](clade_id child) -> auto const& {
+        if (child == no_clade || child >= chart.inside.size()) {
+          throw std::runtime_error(
+              "chart trim: production child clade out of range");
         }
-      }
+        return chart.inside[child];
+      };
+      auto consume_row = [&](std::size_t child_i,
+                             chart_trim_detail::outside_chart_row const& row) {
+        auto const child = prod.children[child_i];
+        for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+             ++child_state) {
+          auto& cell = result.outside[child][child_state];
+          cell = std::min(cell, row[child_state]);
+        }
+      };
+      chart_trim_detail::scatter_production_outside_rows(
+          prod, result.outside[parent], inside_provider, consume_row,
+          result.recurrence_work);
     }
   }
 
@@ -901,28 +1040,25 @@ inline single_site_outside_chart build_single_site_outside_chart(
       auto children = plan.children(pid);
       if (!prod.is_binary()) ++result.multifurcation_productions_scored;
 
-      for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
-           ++parent_state) {
-        auto base = result.outside[parent][parent_state];
-        if (base >= chart_inf) continue;
-        auto inside_provider = [&](clade_id child) -> auto const& {
-          if (child == no_clade || child >= chart.inside.size()) {
-            throw std::runtime_error(
-                "chart trim: production child clade out of range");
-          }
-          return chart.inside[child];
-        };
-        auto outside_rows = chart_trim_detail::combine_production_outside_rows(
-            plan, children, parent_state, base, inside_provider);
-        for (std::size_t child_i = 0; child_i < children.size(); ++child_i) {
-          auto child = children[child_i];
-          for (std::uint8_t child_state = 0; child_state < nuc_state_count;
-               ++child_state) {
-            auto& cell = result.outside[child][child_state];
-            cell = std::min(cell, outside_rows[child_i][child_state]);
-          }
+      auto inside_provider = [&](clade_id child) -> auto const& {
+        if (child == no_clade || child >= chart.inside.size()) {
+          throw std::runtime_error(
+              "chart trim: production child clade out of range");
         }
-      }
+        return chart.inside[child];
+      };
+      auto consume_row = [&](std::size_t child_i,
+                             chart_trim_detail::outside_chart_row const& row) {
+        auto const child = children[child_i];
+        for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+             ++child_state) {
+          auto& cell = result.outside[child][child_state];
+          cell = std::min(cell, row[child_state]);
+        }
+      };
+      chart_trim_detail::scatter_production_outside_rows(
+          plan, children, result.outside[parent], inside_provider, consume_row,
+          result.recurrence_work);
     }
   }
   return result;
@@ -1257,6 +1393,7 @@ struct multisite_exact_setup_work_stats {
   std::size_t active_leaf_state_vectors_copied = 0;
   std::size_t active_leaf_states_copied = 0;
   std::size_t outside_boundary_charts_built = 0;
+  outside_recurrence_work_stats outside_recurrence_work;
   std::size_t upper_bound_topologies_generated = 0;
   std::size_t upper_bound_topologies_unique = 0;
   std::size_t frontier_passes = 0;
@@ -3210,6 +3347,8 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside(
         info.outside_by_reference[reference_state] =
             build_single_site_outside_chart(structural, chart, options,
                                             reference_state);
+        setup.work.outside_recurrence_work +=
+            info.outside_by_reference[reference_state].recurrence_work;
         ++setup.work.outside_boundary_charts_built;
         if (traceback_outside == nullptr) {
           traceback_outside = &info.outside_by_reference[reference_state];
@@ -3218,6 +3357,8 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside(
     } else {
       info.outside_ua_free =
           build_single_site_outside_chart(structural, chart, options);
+      setup.work.outside_recurrence_work +=
+          info.outside_ua_free.recurrence_work;
       ++setup.work.outside_boundary_charts_built;
       traceback_outside = &info.outside_ua_free;
     }

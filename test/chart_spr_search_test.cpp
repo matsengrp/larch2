@@ -2021,6 +2021,201 @@ static void test_eager_diagnostic_enumeration_exposes_cap_after_path_precompute(
   std::println("  PASS");
 }
 
+static std::array<std::size_t, 10> phase2b_exact_counter_snapshot(
+    larch::chart_spr_search_counters const& counters) {
+  return {
+      counters.exact_setup_builds,
+      counters.exact_setup_inside_charts_built,
+      counters.exact_setup_resident_inside_charts_consumed,
+      counters.exact_setup_active_leaf_state_vectors_copied,
+      counters.exact_setup_active_leaf_states_copied,
+      counters.exact_setup_outside_boundary_charts_built,
+      counters.exact_setup_upper_bound_topologies_generated,
+      counters.exact_setup_upper_bound_topologies_unique,
+      counters.exact_setup_frontier_passes,
+      counters.exact_trim_lazy_chart_uses,
+  };
+}
+
+static void check_phase2b_trim_semantic_parity(
+    larch::multisite_trim_result const& expected,
+    larch::multisite_trim_result const& actual) {
+  CHECK(actual.optimum == expected.optimum);
+  CHECK(actual.composite_lower_bound == expected.composite_lower_bound);
+  CHECK(actual.initial_upper_bound == expected.initial_upper_bound);
+  CHECK(actual.keep_production == expected.keep_production);
+  CHECK(actual.frontier_sizes_by_clade == expected.frontier_sizes_by_clade);
+  CHECK(actual.dominance_mode == expected.dominance_mode);
+  CHECK(actual.keep_mask_kind == expected.keep_mask_kind);
+  CHECK(actual.keep_production_exact == expected.keep_production_exact);
+  CHECK(actual.dominance_candidates_considered ==
+        expected.dominance_candidates_considered);
+  CHECK(actual.dominance_pruned == expected.dominance_pruned);
+  CHECK(actual.bound_pruned == expected.bound_pruned);
+  CHECK(actual.equality_deduplicated == expected.equality_deduplicated);
+  CHECK(actual.active_pattern_count == expected.active_pattern_count);
+  CHECK(actual.invariant_constant_offset == expected.invariant_constant_offset);
+}
+
+static void test_phase2b_exact_setup_reuses_resident_state_charts() {
+  std::println("test_phase2b_exact_setup_reuses_resident_state_charts");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AAA", four_taxon_two_pattern_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, grammar);
+
+  // Lazy initialization of an ordinary all-active state: exact setup consumes
+  // the already-resident inside chart for every active pattern and builds no
+  // replacement inside chart.  The direct cold trim is the semantic oracle.
+  auto state = larch::build_chart_spr_search_state(dag, grammar, patterns);
+  CHECK(state.cache_strategy ==
+        larch::chart_spr_cache_strategy::all_active_patterns);
+  auto const pattern_count =
+      state.active_patterns.patterns.patterns.size();
+  CHECK(pattern_count >= 2);
+  auto cold = larch::build_multisite_trim_active(
+      state.execution_plan, state.active_patterns, state.chart_opts);
+  CHECK(cold.exact_setup_work.setup_builds == 1);
+  CHECK(cold.exact_setup_work.inside_charts_built == pattern_count);
+  CHECK(cold.exact_setup_work.resident_inside_charts_consumed == 0);
+
+  auto const before_lazy_ensure = phase2b_exact_counter_snapshot(state.counters);
+  auto const zero_exact_counters = std::array<std::size_t, 10>{};
+  CHECK(before_lazy_ensure == zero_exact_counters);
+  auto const& resident = larch::ensure_chart_spr_state_exact_trim(state);
+  check_phase2b_trim_semantic_parity(cold, resident);
+  CHECK(resident.exact_setup_work.setup_builds == 1);
+  CHECK(resident.exact_setup_work.inside_charts_built == 0);
+  CHECK(resident.exact_setup_work.resident_inside_charts_consumed ==
+        pattern_count);
+  CHECK(resident.exact_setup_work.active_leaf_state_vectors_copied ==
+        pattern_count);
+  CHECK(resident.exact_setup_work.active_leaf_states_copied ==
+        pattern_count * state.active_patterns.patterns.taxon_count);
+  CHECK(resident.exact_setup_work.outside_boundary_charts_built ==
+        pattern_count);
+  CHECK(resident.exact_setup_work.upper_bound_topologies_generated ==
+        pattern_count + 1);
+  CHECK(resident.exact_setup_work.upper_bound_topologies_unique > 0);
+  CHECK(resident.exact_setup_work.upper_bound_topologies_unique <=
+        resident.exact_setup_work.upper_bound_topologies_generated);
+  CHECK(resident.exact_setup_work.frontier_passes > 0);
+  CHECK(state.counters.exact_setup_builds == 1);
+  CHECK(state.counters.exact_setup_inside_charts_built == 0);
+  CHECK(state.counters.exact_setup_resident_inside_charts_consumed ==
+        pattern_count);
+  CHECK(state.counters.exact_setup_active_leaf_state_vectors_copied ==
+        pattern_count);
+  CHECK(state.counters.exact_setup_active_leaf_states_copied ==
+        pattern_count * state.active_patterns.patterns.taxon_count);
+  CHECK(state.counters.exact_setup_outside_boundary_charts_built ==
+        pattern_count);
+  CHECK(state.counters.exact_setup_upper_bound_topologies_generated ==
+        pattern_count + 1);
+  CHECK(state.counters.exact_setup_upper_bound_topologies_unique ==
+        resident.exact_setup_work.upper_bound_topologies_unique);
+  CHECK(state.counters.exact_setup_frontier_passes ==
+        resident.exact_setup_work.frontier_passes);
+  CHECK(state.counters.exact_trim_lazy_chart_uses == 0);
+
+  auto const after_first_ensure = phase2b_exact_counter_snapshot(state.counters);
+  auto const* resident_address = &resident;
+  auto const& repeated = larch::ensure_chart_spr_state_exact_trim(state);
+  CHECK(&repeated == resident_address);
+  CHECK(phase2b_exact_counter_snapshot(state.counters) == after_first_ensure);
+
+  // Eager exact initialization takes the same resident path, and a repeated
+  // ensure neither rebuilds the finalized setup nor advances its work counters.
+  larch::chart_spr_search_options eager_options;
+  eager_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::exact_multisite;
+  auto eager =
+      larch::build_chart_spr_search_state(dag, grammar, eager_options);
+  CHECK(eager.exact_trim_active_only.has_value());
+  check_phase2b_trim_semantic_parity(resident,
+                                    *eager.exact_trim_active_only);
+  CHECK(eager.counters.exact_setup_builds == 1);
+  CHECK(eager.counters.exact_setup_inside_charts_built == 0);
+  CHECK(eager.counters.exact_setup_resident_inside_charts_consumed ==
+        pattern_count);
+  auto const eager_before_repeat =
+      phase2b_exact_counter_snapshot(eager.counters);
+  (void)larch::ensure_chart_spr_state_exact_trim(eager,
+                                                 eager_options.exact_trim);
+  CHECK(phase2b_exact_counter_snapshot(eager.counters) ==
+        eager_before_repeat);
+
+  // Pattern batches own no compatible resident single-site charts.  Their
+  // exact path remains explicitly cold and reports one inside build per active
+  // pattern, while preserving the exact result.
+  auto batched_options = eager_options;
+  batched_options.cache.max_cached_patterns = 1;
+  auto batched =
+      larch::build_chart_spr_search_state(dag, grammar, batched_options);
+  CHECK(batched.cache_strategy ==
+        larch::chart_spr_cache_strategy::pattern_batches);
+  CHECK(batched.pattern_charts.empty());
+  CHECK(batched.exact_trim_active_only.has_value());
+  check_phase2b_trim_semantic_parity(resident,
+                                    *batched.exact_trim_active_only);
+  CHECK(batched.counters.exact_setup_builds == 1);
+  CHECK(batched.counters.exact_setup_inside_charts_built == pattern_count);
+  CHECK(batched.counters.exact_setup_resident_inside_charts_consumed == 0);
+  CHECK(batched.counters.exact_setup_outside_boundary_charts_built ==
+        pattern_count);
+  CHECK(batched.counters.exact_trim_lazy_chart_uses == 0);
+
+  // The class-compressed lazy chart remains its own semantically-identical
+  // representation; it does not pretend to have built/consumed a dense exact
+  // setup, and its successful use is counted separately.
+  auto lazy_options = eager_options;
+  lazy_options.cache.use_lazy_multisite_chart = true;
+  auto lazy = larch::build_chart_spr_search_state(dag, grammar, lazy_options);
+  CHECK(lazy.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  CHECK(lazy.exact_trim_active_only.has_value());
+  CHECK(lazy.exact_trim_active_only->lazy_chart_used);
+  check_phase2b_trim_semantic_parity(resident, *lazy.exact_trim_active_only);
+  CHECK(lazy.counters.exact_setup_builds == 0);
+  CHECK(lazy.counters.exact_setup_inside_charts_built == 0);
+  CHECK(lazy.counters.exact_setup_resident_inside_charts_consumed == 0);
+  CHECK(lazy.counters.exact_setup_active_leaf_state_vectors_copied == 0);
+  CHECK(lazy.counters.exact_setup_active_leaf_states_copied == 0);
+  CHECK(lazy.counters.exact_setup_outside_boundary_charts_built == 0);
+  CHECK(lazy.counters.exact_setup_upper_bound_topologies_generated == 0);
+  CHECK(lazy.counters.exact_setup_upper_bound_topologies_unique == 0);
+  CHECK(lazy.counters.exact_setup_frontier_passes == 0);
+  CHECK(lazy.counters.exact_trim_lazy_chart_uses == 1);
+  auto const lazy_before_repeat =
+      phase2b_exact_counter_snapshot(lazy.counters);
+  (void)larch::ensure_chart_spr_state_exact_trim(lazy,
+                                                 lazy_options.exact_trim);
+  CHECK(phase2b_exact_counter_snapshot(lazy.counters) == lazy_before_repeat);
+
+  // Identity is checked before any resident chart/setup work.  A same-generation
+  // in-place mutation must reject the stale execution plan and leave every
+  // exact-setup counter untouched.
+  auto stale = larch::build_chart_spr_search_state(dag, grammar, patterns);
+  CHECK(!stale.grammar.productions.empty());
+  CHECK(stale.grammar.productions.front().children.size() >= 2);
+  std::swap(stale.grammar.productions.front().children[0],
+            stale.grammar.productions.front().children[1]);
+  auto const stale_before = phase2b_exact_counter_snapshot(stale.counters);
+  auto const mismatch_before = stale.counters.plan_mismatch_rejections;
+  bool stale_threw = false;
+  try {
+    (void)larch::ensure_chart_spr_state_exact_trim(stale);
+  } catch (larch::chart_execution_plan_mismatch const&) {
+    stale_threw = true;
+  }
+  CHECK(stale_threw);
+  CHECK(stale.counters.plan_mismatch_rejections == mismatch_before + 1);
+  CHECK(phase2b_exact_counter_snapshot(stale.counters) == stale_before);
+
+  std::println("  PASS");
+}
+
 static void test_exact_verification_reuses_state_old_score() {
   std::println("test_exact_verification_reuses_state_old_score");
 
@@ -2030,6 +2225,13 @@ static void test_exact_verification_reuses_state_old_score() {
   auto state = larch::build_chart_spr_search_state(
       fixture.dag, fixture.grammar, options);
   CHECK(state.exact_trim_active_only.has_value());
+  auto const active_pattern_count =
+      state.active_patterns.patterns.patterns.size();
+  CHECK(active_pattern_count > 0);
+  CHECK(state.counters.exact_setup_builds == 1);
+  CHECK(state.counters.exact_setup_inside_charts_built == 0);
+  CHECK(state.counters.exact_setup_resident_inside_charts_consumed ==
+        active_pattern_count);
 
   auto lazy_options = options;
   lazy_options.cache.use_lazy_multisite_chart = true;
@@ -2074,6 +2276,17 @@ static void test_exact_verification_reuses_state_old_score() {
   CHECK(state.counters.overlay_materializations_for_exact_verification == 1);
   CHECK(state.counters.overlay_materializations_for_oracle == 0);
   CHECK(state.counters.full_composite_rebuilds == 0);
+  // The old state setup used resident charts; only the materialized candidate
+  // grammar takes the explicit cold path.
+  CHECK(state.counters.exact_setup_builds == 2);
+  CHECK(state.counters.exact_setup_inside_charts_built ==
+        active_pattern_count);
+  CHECK(state.counters.exact_setup_resident_inside_charts_consumed ==
+        active_pattern_count);
+  CHECK(state.counters.exact_setup_outside_boundary_charts_built ==
+        2 * active_pattern_count);
+  CHECK(lazy_state.counters.exact_setup_builds == 0);
+  CHECK(lazy_state.counters.exact_trim_lazy_chart_uses == 2);
 
   std::println("  PASS");
 }
@@ -3103,6 +3316,17 @@ static void test_phase6_multifurcation_fixed_topology_local_commit() {
   CHECK(search.counters.local_commit_accepted_moves == 1);
   CHECK(search.counters.accepted_moves == 1);
   CHECK(search.counters.local_commit_two_chart_oracle_runs == 1);
+  CHECK(search.summary.active_pattern_count > 0);
+  CHECK(search.counters.outside_cache_inside_charts_built == 0);
+  CHECK(search.counters.outside_cache_inside_charts_reused ==
+        search.summary.active_pattern_count);
+  CHECK(search.counters.outside_cache_outside_charts_built ==
+        search.summary.active_pattern_count);
+  CHECK(search.summary.outside_cache_inside_charts_built == 0);
+  CHECK(search.summary.outside_cache_inside_charts_reused ==
+        search.counters.outside_cache_inside_charts_reused);
+  CHECK(search.summary.outside_cache_outside_charts_built ==
+        search.counters.outside_cache_outside_charts_built);
   CHECK(search.counters.spr_multifurcation_moves_generated > 0);
   CHECK(search.summary.spr_multifurcation_moves_generated ==
         search.counters.spr_multifurcation_moves_generated);
@@ -4597,6 +4821,54 @@ static void test_phase4_local_commit_counter_contract_and_oracle() {
   CHECK(search.counters.accepted_moves ==
         search.counters.local_commit_accepted_moves);
 
+  // Phase-2B cold local-commit cache construction builds inside rows once in
+  // icache, then derives every outside chart from those resident rows.  The
+  // binary production path reports the exact one-per-active-pattern contract.
+  CHECK(search.summary.active_pattern_count > 0);
+  CHECK(search.counters.outside_cache_inside_charts_built == 0);
+  CHECK(search.counters.outside_cache_inside_charts_reused ==
+        search.summary.active_pattern_count);
+  CHECK(search.counters.outside_cache_outside_charts_built ==
+        search.summary.active_pattern_count);
+  CHECK(search.summary.outside_cache_inside_charts_built == 0);
+  CHECK(search.summary.outside_cache_inside_charts_reused ==
+        search.counters.outside_cache_inside_charts_reused);
+  CHECK(search.summary.outside_cache_outside_charts_built ==
+        search.counters.outside_cache_outside_charts_built);
+
+  // Exact setup work is cumulative across the resident current-state setup and
+  // cold candidate/oracle setups, and every allocation-relevant field reaches
+  // the public summary without being lost during final-compaction rebuild.
+  CHECK(search.counters.exact_setup_builds > 0);
+  CHECK(search.counters.exact_setup_resident_inside_charts_consumed >=
+        search.summary.active_pattern_count);
+  CHECK(search.counters.exact_setup_inside_charts_built > 0);
+  CHECK(search.counters.exact_setup_active_leaf_state_vectors_copied > 0);
+  CHECK(search.counters.exact_setup_active_leaf_states_copied > 0);
+  CHECK(search.counters.exact_setup_outside_boundary_charts_built > 0);
+  CHECK(search.counters.exact_setup_upper_bound_topologies_generated >=
+        search.counters.exact_setup_upper_bound_topologies_unique);
+  CHECK(search.counters.exact_setup_upper_bound_topologies_unique > 0);
+  CHECK(search.counters.exact_setup_frontier_passes > 0);
+  CHECK(search.summary.exact_setup_builds ==
+        search.counters.exact_setup_builds);
+  CHECK(search.summary.exact_setup_inside_charts_built ==
+        search.counters.exact_setup_inside_charts_built);
+  CHECK(search.summary.exact_setup_resident_inside_charts_consumed ==
+        search.counters.exact_setup_resident_inside_charts_consumed);
+  CHECK(search.summary.exact_setup_active_leaf_state_vectors_copied ==
+        search.counters.exact_setup_active_leaf_state_vectors_copied);
+  CHECK(search.summary.exact_setup_active_leaf_states_copied ==
+        search.counters.exact_setup_active_leaf_states_copied);
+  CHECK(search.summary.exact_setup_outside_boundary_charts_built ==
+        search.counters.exact_setup_outside_boundary_charts_built);
+  CHECK(search.summary.exact_setup_upper_bound_topologies_generated ==
+        search.counters.exact_setup_upper_bound_topologies_generated);
+  CHECK(search.summary.exact_setup_upper_bound_topologies_unique ==
+        search.counters.exact_setup_upper_bound_topologies_unique);
+  CHECK(search.summary.exact_setup_frontier_passes ==
+        search.counters.exact_setup_frontier_passes);
+
   // Counter contract (cross-cutting): no per-accept sidecar rebuilds and no
   // per-accept dense accept-materializations.
   CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
@@ -4640,6 +4912,13 @@ static void test_phase4_local_commit_counter_contract_and_oracle() {
   // The Phase 4 exit criterion: a k >= 3 local-commit run on a fixture with
   // three disjoint committable improving moves.
   CHECK(search.counters.local_commit_accepted_moves >= 3);
+  // Exactly one resident setup is built for the initial committed state and
+  // each accepted chain tip; final compaction contributes one more eagerly
+  // initialized rebuilt state.  Repeated exact gates on any one state reuse
+  // its cached setup, so no other resident-chart consumption is permitted.
+  CHECK(search.counters.exact_setup_resident_inside_charts_consumed ==
+        (search.counters.local_commit_accepted_moves + 2) *
+            search.summary.active_pattern_count);
   // Final score is non-increasing (every committed move improved or held).
   CHECK(search.summary.final_score <= search.summary.initial_score);
 
@@ -5089,6 +5368,15 @@ static void test_phase4_pattern_batches_local_commit() {
   // pattern_charts is resident).
   CHECK(search.counters.local_commit_two_chart_oracle_runs ==
         search.counters.local_commit_accepted_moves);
+  CHECK(search.summary.active_pattern_count > 1);
+  CHECK(search.counters.outside_cache_inside_charts_built == 0);
+  CHECK(search.counters.outside_cache_inside_charts_reused ==
+        search.summary.active_pattern_count);
+  CHECK(search.counters.outside_cache_outside_charts_built ==
+        search.summary.active_pattern_count);
+  CHECK(search.counters.exact_setup_builds > 0);
+  CHECK(search.counters.exact_setup_inside_charts_built > 0);
+  CHECK(search.counters.exact_setup_resident_inside_charts_consumed == 0);
   // Pattern-batch scoring actually rebuilt base rows per batch across the run.
   CHECK(search.counters.pattern_batch_cache_builds > 0);
   CHECK(search.summary.final_score <= search.summary.initial_score);
@@ -5112,10 +5400,11 @@ static void test_phase4_pattern_batches_local_commit() {
 // grammar-exact verification.
 //
 // The exact_multisite gate verifies an unaccepted candidate by transiently
-// extending the overlay chain + persistent inside/outside caches in
-// reader-local scratch storage (never mutating the shared cache, bypassing
-// the Phase 4 commit barrier), reading the exact frontier on the extended
-// grammar, and discarding.  These tests cover the four Phase 9 exit criteria:
+// extending the overlay chain in reader-local scratch storage (never mutating
+// shared state), reading the exact frontier on the extended grammar, and
+// discarding.  Inside/outside scratch caches are constructed only for the
+// opt-in two-chart diagnostic.  These tests cover the four Phase 9 exit
+// criteria plus Phase-2B's dead-work gate:
 //   1. transient-extension exact score == from-scratch exact score (oracle).
 //   2. full_overlay_materializations does not increase for a transient run;
 //      work counted under transient_chain_extensions_for_verification.
@@ -5126,11 +5415,8 @@ static void test_phase4_pattern_batches_local_commit() {
 //      doc/WRIC-SPR-SEARCH.md).
 //   4. TSAN-clean multi-worker (transient extensions are reader-local).
 //
-// Phase 9 ships substrate + oracle + counter discipline, NOT a wall-clock win
-// (the scratch caches are unconsumed by the production B&B scorer, which
-// rebuilds charts from the grammar); they are forward-looking groundwork for
-// Phase 12.  See the header comment on `chart_spr_transient_extension` in
-// src/chart_spr_search.cpp and doc/WRIC-SPR-SEARCH.md.
+// Production B&B still rebuilds its exact setup from the materialized grammar,
+// but it no longer pays to copy/advance caches that only the diagnostic reads.
 // ============================================================================
 
 // Exit criterion 2: a local-commit exact_multisite run that uses the
@@ -5160,18 +5446,24 @@ static void test_phase9_transient_no_full_overlay_materialization() {
 
   std::println(
       "  accepted_moves={} (local_commit={}), exact_verifications={}, "
-      "transient_extensions={}, exact_verification_materializations={}, "
+      "transient_extensions={}, diagnostic_cache_extensions={}, "
+      "exact_verification_materializations={}, "
       "full_overlay_materializations={}, final_compaction_materializations={}",
       search.counters.accepted_moves,
       search.counters.local_commit_accepted_moves,
       search.counters.exact_verifications,
       search.counters.transient_chain_extensions_for_verification,
+      search.counters.transient_chain_diagnostic_cache_extensions,
       search.counters.overlay_materializations_for_exact_verification,
       search.counters.full_overlay_materializations,
       search.counters.overlay_materializations_for_final_compaction);
 
   // The transient path was actually used.
   CHECK(search.counters.transient_chain_extensions_for_verification > 0);
+  // Production exact B&B never consumes the persistent row caches, so no
+  // diagnostic cache snapshot may be copied or advanced with the oracle off.
+  CHECK(search.counters.transient_chain_diagnostic_cache_extensions == 0);
+  CHECK(search.summary.transient_chain_diagnostic_cache_extensions == 0);
   // Every exact verification either used the transient path or fell back to
   // the cold path (tombstone-scope candidates whose delta cannot be appended
   // to the chain).  Cold fallbacks are the only source of per-candidate exact-
@@ -5239,6 +5531,10 @@ static void test_phase9_transient_oracle_both_charts_green() {
       search.counters.transient_chain_extension_fallbacks);
 
   CHECK(search.counters.transient_chain_extensions_for_verification > 0);
+  CHECK(search.counters.transient_chain_diagnostic_cache_extensions ==
+        search.counters.transient_chain_extensions_for_verification);
+  CHECK(search.summary.transient_chain_diagnostic_cache_extensions ==
+        search.counters.transient_chain_diagnostic_cache_extensions);
   // The two-chart oracle ran on every transient extension: it checked both
   // the inside and outside scratch rows against the from-scratch charts.
   CHECK(search.counters.transient_chain_extension_oracle_rows_checked_for_tests >
@@ -5285,6 +5581,8 @@ static void test_phase9_transient_oracle_green_on_multiparent_dag() {
   auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
 
   CHECK(search.counters.transient_chain_extensions_for_verification > 0);
+  CHECK(search.counters.transient_chain_diagnostic_cache_extensions ==
+        search.counters.transient_chain_extensions_for_verification);
   CHECK(search.counters.transient_chain_extension_oracle_mismatches == 0);
   CHECK(search.counters.transient_chain_extension_fallbacks == 0);
 
@@ -5321,6 +5619,8 @@ static void test_phase9_transient_oracle_catches_corruption() {
       search.counters.transient_chain_extension_fallbacks);
 
   CHECK(search.counters.transient_chain_extensions_for_verification > 0);
+  CHECK(search.counters.transient_chain_diagnostic_cache_extensions ==
+        search.counters.transient_chain_extensions_for_verification);
   // The corruption hook forces at least one mismatch, and every mismatch
   // triggers a fallback to the authoritative cold result.
   CHECK(search.counters.transient_chain_extension_oracle_mismatches > 0);
@@ -5379,9 +5679,10 @@ static void test_phase9_transient_tombstone_scope_falls_back_to_cold() {
   std::println("  PASS");
 }
 
-// Exit criterion 4: transient extensions are reader-local (they copy the
-// chain + caches into scratch and never mutate the shared cache), so they run
-// cleanly alongside parallel local scoring under the epoch/snapshot model.
+// Exit criterion 4: transient extensions are reader-local (the chain and, for
+// diagnostics, optional caches are copied into scratch and never mutate the
+// shared cache), so they run cleanly alongside parallel local scoring under the
+// epoch/snapshot model.
 // A multi-worker local-commit exact_multisite run must agree with the serial
 // run and stay TSAN-clean (verified separately under -DENABLE_TSAN=ON).
 static void test_phase9_transient_multi_worker_matches_serial() {
@@ -5409,6 +5710,8 @@ static void test_phase9_transient_multi_worker_matches_serial() {
   CHECK(serial.summary.final_score == parallel.summary.final_score);
   CHECK(serial.summary.initial_score == parallel.summary.initial_score);
   CHECK(parallel.counters.transient_chain_extensions_for_verification > 0);
+  CHECK(parallel.counters.transient_chain_diagnostic_cache_extensions ==
+        parallel.counters.transient_chain_extensions_for_verification);
   // Parallel scoring actually used the workers.
   CHECK(parallel.counters.local_score_parallel_batches > 0);
   // The transient oracle stays green under parallel local scoring (the
@@ -5472,6 +5775,7 @@ int main() {
   test_streaming_candidate_cap_stops_before_eager_path_precompute();
   test_streaming_path_pair_budget_stops_early();
   test_eager_diagnostic_enumeration_exposes_cap_after_path_precompute();
+  test_phase2b_exact_setup_reuses_resident_state_charts();
   test_exact_verification_reuses_state_old_score();
   test_failed_exact_materialization_is_timed();
   test_top_k_exact_verification_count_is_bounded();

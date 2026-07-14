@@ -55,6 +55,7 @@ struct lazy_multisite_chart {
   std::size_t lazy_structural_class_count_max = 0;
   std::size_t multifurcation_productions_scored = 0;
   std::size_t outside_multifurcation_productions_scored = 0;
+  outside_recurrence_work_stats outside_recurrence_work;
 
   [[nodiscard]] row_type const& inside_row(clade_id clade,
                                            std::size_t pattern) const {
@@ -1282,7 +1283,8 @@ inline row_type compute_child_outside_contribution(
     lazy_multisite_chart const& chart, clade_grammar const& grammar,
     site_pattern_set const& patterns, grammar_production const& prod,
     std::size_t child_slot, std::size_t representative_pattern,
-    std::size_t parent_outside_class) {
+    std::size_t parent_outside_class,
+    outside_recurrence_work_stats& recurrence_work) {
   if (child_slot >= prod.children.size()) {
     throw std::runtime_error("lazy chart: child slot out of range");
   }
@@ -1294,28 +1296,27 @@ inline row_type compute_child_outside_contribution(
   auto const& parent_outside = parent_outside_rows[parent_outside_class];
   auto result = parsimony_chart_detail::make_inf_row();
 
-  for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
-       ++parent_state) {
-    auto base = parent_outside[parent_state];
-    if (base >= chart_inf) continue;
-    auto inside_provider = [&](clade_id child) -> row_type const& {
-      auto class_index = inside_class_index_for_pattern(
-          chart, grammar, patterns, child, representative_pattern);
-      auto const& child_rows = chart.inside_rows_by_clade[child];
-      if (class_index >= child_rows.size()) {
-        throw std::runtime_error(
-            "lazy chart: child inside class index out of range");
-      }
-      return child_rows[class_index];
-    };
-    auto outside_rows = chart_trim_detail::combine_production_outside_rows(
-        prod, parent_state, base, inside_provider);
+  auto inside_provider = [&](clade_id child) -> row_type const& {
+    auto class_index = inside_class_index_for_pattern(
+        chart, grammar, patterns, child, representative_pattern);
+    auto const& child_rows = chart.inside_rows_by_clade[child];
+    if (class_index >= child_rows.size()) {
+      throw std::runtime_error(
+          "lazy chart: child inside class index out of range");
+    }
+    return child_rows[class_index];
+  };
+  auto consume_row = [&](std::size_t candidate_slot,
+                         row_type const& contribution) {
+    if (candidate_slot != child_slot) return;
     for (std::uint8_t child_state = 0; child_state < nuc_state_count;
          ++child_state) {
       result[child_state] =
-          std::min(result[child_state], outside_rows[child_slot][child_state]);
+          std::min(result[child_state], contribution[child_state]);
     }
-  }
+  };
+  chart_trim_detail::scatter_production_outside_rows(
+      prod, parent_outside, inside_provider, consume_row, recurrence_work);
 
   return result;
 }
@@ -1375,7 +1376,7 @@ inline void assign_outside_classes_for_clade(
       }
       auto contribution = compute_child_outside_contribution(
           chart, grammar, patterns, prod, child_slot, representative,
-          parent_outside_class);
+          parent_outside_class, chart.outside_recurrence_work);
       for (auto pattern : members) {
         auto& row = outside_by_pattern[pattern];
         for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
@@ -1412,7 +1413,8 @@ inline row_type compute_child_outside_contribution(
     lazy_multisite_chart const& chart, chart_execution_plan const& plan,
     site_pattern_set const& patterns, production_id pid,
     std::size_t child_slot, std::size_t representative_pattern,
-    std::size_t parent_outside_class) {
+    std::size_t parent_outside_class,
+    outside_recurrence_work_stats& recurrence_work) {
   auto const& production = plan.production(pid);
   auto const children = plan.children(pid);
   if (child_slot >= children.size()) {
@@ -1426,29 +1428,28 @@ inline row_type compute_child_outside_contribution(
   auto const& parent_outside = parent_outside_rows[parent_outside_class];
   auto result = parsimony_chart_detail::make_inf_row();
 
-  for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
-       ++parent_state) {
-    auto const base = parent_outside[parent_state];
-    if (base >= chart_inf) continue;
-    auto inside_provider = [&](clade_id child) -> row_type const& {
-      auto const class_index = plan_inside_class_index_for_pattern(
-          chart, plan, patterns, child, representative_pattern);
-      auto const& child_rows = chart.inside_rows_by_clade[child];
-      if (class_index >= child_rows.size()) {
-        throw std::runtime_error(
-            "lazy chart: child inside class index out of range");
-      }
-      return child_rows[class_index];
-    };
-    auto const outside_rows =
-        chart_trim_detail::combine_production_outside_rows(
-            plan, children, parent_state, base, inside_provider);
+  auto inside_provider = [&](clade_id child) -> row_type const& {
+    auto const class_index = plan_inside_class_index_for_pattern(
+        chart, plan, patterns, child, representative_pattern);
+    auto const& child_rows = chart.inside_rows_by_clade[child];
+    if (class_index >= child_rows.size()) {
+      throw std::runtime_error(
+          "lazy chart: child inside class index out of range");
+    }
+    return child_rows[class_index];
+  };
+  auto consume_row = [&](std::size_t candidate_slot,
+                         row_type const& contribution) {
+    if (candidate_slot != child_slot) return;
     for (std::uint8_t child_state = 0; child_state < nuc_state_count;
          ++child_state) {
-      result[child_state] = std::min(
-          result[child_state], outside_rows[child_slot][child_state]);
+      result[child_state] =
+          std::min(result[child_state], contribution[child_state]);
     }
-  }
+  };
+  chart_trim_detail::scatter_production_outside_rows(
+      plan, children, parent_outside, inside_provider, consume_row,
+      recurrence_work);
 
   return result;
 }
@@ -1499,7 +1500,7 @@ inline void assign_outside_classes_for_clade(
       }
       auto const contribution = compute_child_outside_contribution(
           chart, plan, patterns, pid, child_slot, representative,
-          parent_outside_class);
+          parent_outside_class, chart.outside_recurrence_work);
       for (auto pattern : members) {
         auto& row = outside_by_pattern[pattern];
         for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
@@ -2076,6 +2077,7 @@ inline void build_lazy_outside_chart_in_place(
   chart.outside_global_min_by_pattern.assign(chart.pattern_count, chart_inf);
   chart.lazy_outside_rows_computed = 0;
   chart.outside_multifurcation_productions_scored = 0;
+  chart.outside_recurrence_work = {};
 
   auto root = grammar.root_clade;
   auto root_row = parsimony_chart_detail::make_inf_row();
@@ -2168,6 +2170,7 @@ inline void build_lazy_outside_chart_in_place(
   chart.outside_global_min_by_pattern.assign(chart.pattern_count, chart_inf);
   chart.lazy_outside_rows_computed = 0;
   chart.outside_multifurcation_productions_scored = 0;
+  chart.outside_recurrence_work = {};
 
   auto const root = plan.root_clade();
   auto root_row = parsimony_chart_detail::make_inf_row();

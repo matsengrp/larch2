@@ -342,6 +342,7 @@ struct outside_chart_cache {
   // regression to "recompute everything" is visible in both directions.
   std::size_t outside_rows_recomputed_on_commit = 0;
   std::size_t multifurcation_productions_scored = 0;
+  outside_recurrence_work_stats outside_recurrence_work;
   outside_chart_cache_build_stats build_stats;
 
   [[nodiscard]] std::array<chart_cost, nuc_state_count> const& row(
@@ -379,7 +380,8 @@ namespace outside_chart_cache_detail {
 
 inline std::array<chart_cost, nuc_state_count> recompute_tip_outside_row(
     outside_chart_cache const& ocache, inside_chart_cache const& icache,
-    chain_tip_index const& idx, std::size_t pattern, overlay_clade_ref ref) {
+    chain_tip_index const& idx, std::size_t pattern, overlay_clade_ref ref,
+    outside_recurrence_work_stats& recurrence_work) {
   auto const& base = *ocache.base;
   auto root_ref = base_clade_ref(base.root_clade);
   using namespace parsimony_chart_detail;
@@ -412,22 +414,20 @@ inline std::array<chart_cost, nuc_state_count> recompute_tip_outside_row(
       std::vector<overlay_clade_ref> const& children;
     } prod{children};
     auto const& parent_outside = ocache.row(pattern, parent_ref);
-    for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
-         ++parent_state) {
-      auto row_provider = [&](overlay_clade_ref child) -> auto const& {
-        return icache.row(pattern, child);
-      };
-      auto child_rows = chart_trim_detail::combine_production_outside_rows(
-          prod, parent_state, parent_outside[parent_state], row_provider);
-      for (std::size_t ci = 0; ci < children.size(); ++ci) {
-        if (!(children[ci] == ref)) continue;
-        for (std::uint8_t child_state = 0; child_state < nuc_state_count;
-             ++child_state) {
-          row[child_state] = std::min(row[child_state],
-                                      child_rows[ci][child_state]);
-        }
+    auto row_provider = [&](overlay_clade_ref child) -> auto const& {
+      return icache.row(pattern, child);
+    };
+    auto consume_row =
+        [&](std::size_t child_i,
+            chart_trim_detail::outside_chart_row const& child_row) {
+      if (!(children[child_i] == ref)) return;
+      for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+           ++child_state) {
+        row[child_state] = std::min(row[child_state], child_row[child_state]);
       }
-    }
+    };
+    chart_trim_detail::scatter_production_outside_rows(
+        prod, parent_outside, row_provider, consume_row, recurrence_work);
   };
 
   for_each_tip_production_with_child(idx, ref, accumulate);
@@ -524,7 +524,8 @@ inline std::size_t build_cold_outside_rows_from_inside_cache(
     chart_execution_plan const& plan, inside_chart_cache const& inside,
     std::size_t pattern, chart_options const& options,
     std::uint8_t reference_state,
-    std::vector<std::array<chart_cost, nuc_state_count>>& outside_rows) {
+    std::vector<std::array<chart_cost, nuc_state_count>>& outside_rows,
+    outside_recurrence_work_stats& recurrence_work) {
   using namespace parsimony_chart_detail;
 
   outside_rows.assign(plan.clades().size(), make_inf_row());
@@ -544,25 +545,21 @@ inline std::size_t build_cold_outside_rows_from_inside_cache(
       if (!production.is_binary()) {
         ++multifurcation_productions_scored;
       }
-      for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
-           ++parent_state) {
-        auto const parent_outside = outside_rows[parent][parent_state];
-        if (parent_outside >= chart_inf) continue;
-        auto inside_provider = [&](clade_id child) -> auto const& {
-          return inside.base_rows[pattern][child];
-        };
-        auto child_rows = chart_trim_detail::combine_production_outside_rows(
-            plan, children, parent_state, parent_outside, inside_provider);
-        for (std::size_t child_i = 0; child_i < children.size(); ++child_i) {
-          auto const child = children[child_i];
-          for (std::uint8_t child_state = 0; child_state < nuc_state_count;
-               ++child_state) {
-            outside_rows[child][child_state] =
-                std::min(outside_rows[child][child_state],
-                         child_rows[child_i][child_state]);
-          }
+      auto inside_provider = [&](clade_id child) -> auto const& {
+        return inside.base_rows[pattern][child];
+      };
+      auto consume_row = [&](std::size_t child_i,
+                             chart_trim_detail::outside_chart_row const& row) {
+        auto const child = children[child_i];
+        for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+             ++child_state) {
+          outside_rows[child][child_state] =
+              std::min(outside_rows[child][child_state], row[child_state]);
         }
-      }
+      };
+      chart_trim_detail::scatter_production_outside_rows(
+          plan, children, outside_rows[parent], inside_provider, consume_row,
+          recurrence_work);
     }
   }
   return multifurcation_productions_scored;
@@ -631,6 +628,7 @@ inline outside_chart_cache build_outside_chart_cache(
     cache.multifurcation_productions_scored +=
         inside.multifurcation_productions_scored +
         outside.multifurcation_productions_scored;
+    cache.outside_recurrence_work += outside.recurrence_work;
     cache.base_rows[p].assign(outside.outside.begin(), outside.outside.end());
     ++cache.build_stats.inside_charts_built;
     ++cache.build_stats.outside_charts_built;
@@ -695,6 +693,7 @@ inline outside_chart_cache build_outside_chart_cache(
     cache.multifurcation_productions_scored +=
         inside.multifurcation_productions_scored +
         outside.multifurcation_productions_scored;
+    cache.outside_recurrence_work += outside.recurrence_work;
     cache.base_rows[p].assign(outside.outside.begin(), outside.outside.end());
     ++cache.build_stats.inside_charts_built;
     ++cache.build_stats.outside_charts_built;
@@ -743,7 +742,8 @@ inline outside_chart_cache build_outside_chart_cache(
                                      : std::uint8_t{0};
     cache.multifurcation_productions_scored +=
         outside_chart_cache_detail::build_cold_outside_rows_from_inside_cache(
-            plan, inside, p, options, reference_state, cache.base_rows[p]);
+            plan, inside, p, options, reference_state, cache.base_rows[p],
+            cache.outside_recurrence_work);
     ++cache.build_stats.inside_charts_reused;
     ++cache.build_stats.outside_charts_built;
   }
@@ -1074,7 +1074,7 @@ inline void apply_commit_to_outside_cache(
           outside_chart_cache_detail::count_multifurcating_outside_productions(
               idx, ref);
       auto fresh = outside_chart_cache_detail::recompute_tip_outside_row(
-          cache, icache, idx, p, ref);
+          cache, icache, idx, p, ref, cache.outside_recurrence_work);
       if (ref.space == overlay_id_space::base) {
         cache.base_rows[p][ref.id] = fresh;
       } else {
