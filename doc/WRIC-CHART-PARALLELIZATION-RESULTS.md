@@ -28,7 +28,7 @@ committed. Phase-0 artifacts use the non-overwriting directory
 |---|---|---|
 | 0. Repair and freeze measurement | in progress (timing deferred) | native/oracle/runner bytes frozen and functional gates independently audited; passing calibration, capture, finalization, and seal pending |
 | 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | code checkpoint `208ce23`; focused and full RelWithDebInfo correctness/counter gates pass; canonical baseline and timing gates remain pending |
-| 2. Remove allocations and duplicate work | implementation in progress | three reuse/kernel checkpoints pass focused/full gates; caller-owned scoring workspace, scoped allocation gate, post-workspace full CTest, ASAN, and Phase-0-relative acceptance remain |
+| 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | code checkpoint `0c4623b`; same-profiler allocation reduction, warmed-zero allocation, frozen semantic/counter, focused/full RelWithDebInfo, and targeted ASAN gates pass; serial timing, exact-small timing, RSS, and sealed canonical comparison remain pending |
 | 3--10 | pending | may follow in plan order under the same acceptance gate |
 
 ## Phase 0 — immutable provenance
@@ -837,6 +837,158 @@ all-active/lazy one-build relationships, local-provider negative identity
 tests, a post-workspace full CTest, targeted ASAN, and every Phase-0-relative
 allocation/timing/RSS/canonical gate remain pending. No busy-host timing is
 acceptance evidence.
+
+### Phase 2 — caller-owned in-place scoring checkpoint
+
+Checkpoint `0c4623b` (`Reuse chart SPR scoring storage in place`) closes the
+Phase-2 implementation work. The worktree was clean immediately after the
+commit. It adds a caller-owned `score_candidates_locally_into` boundary and a
+search-lifetime acceptance workspace, then retains high-water storage for
+candidate payloads, overlay deltas, compiled candidate rows, reachability and
+affected queues, result rows, and per-worker recurrence scratch. Resident
+all-active and lazy scoring keep one full descriptor per effective worker,
+not per candidate; pattern-batch scoring keeps one prepared descriptor per
+candidate because those descriptors must survive all pattern batches. This
+keeps the reuse optimization bounded by the selected parallel width on the
+resident-cache paths.
+
+The in-place delta builder is fail-closed. A failed rebuild invalidates every
+row-map validity surface before the object can be consumed again. Candidate
+copy reuse preserves nested clade, production, witness, child-witness, and
+optional topology-provenance capacity across rich--plain--shallow--identity
+cycles. Production partition validation, index reset, reachability, affected
+ordering, and candidate-row compilation reuse caller-owned buffers. Rank-3
+and Option-C callers use the same in-place delta scratch rather than creating
+an owning intermediate.
+
+The owning compatibility API remains available, but ownership promotion is
+outside the allocation-sensitive `_into` region. Its elapsed time is added
+back to both aggregate and per-candidate timing, preserving the old timing
+scope. Parallel submission accounting advances only after a successful
+non-empty submission. Submission failure and worker failure both join every
+accepted future before unwinding; in particular, pattern-batch cache entries
+cannot die while a worker still borrows them. Deterministic test barriers make
+those exceptional paths non-racy and prove clean recovery. Boundary tests also
+cover the checked multisite arithmetic and its labelled `string_view`
+diagnostics.
+
+#### Same-profiler allocation gate
+
+The frozen reference is under
+`build/wric-chart-parallelization/phase2-allocation-reference-7ddb1fca-diagnostic/`.
+`tools/wric_dhat_allocation_reference.py` validates the exact command, binary,
+fixture, product counters, DHAT schema, scorer frames, allocation-owner lines,
+and exclusions. The immutable identities are:
+
+| Item | SHA-256 |
+|---|---|
+| Frozen allocation-reference executable | `7ddb1fca7b15d1057912d6775b5e5fb32218390f13b3a10f6622581f21a5a38c` |
+| Frozen fixture | `e8dcd803ba2cd82ed594dbe66433934a62b3711ea7ddb0d349de35ef86030dd6` |
+| Frozen semantic sidecar | `b8d55c73220a7025b8d977ac4bb083f1e4e76dee5bf007e8754b1f79d42b8442` |
+| Frozen ordered candidate signature | `6fcd6f69962abb67e91a3236c5043787c86c33bbd4c135fa67c37b53a6e37168` |
+| Frozen local-score tuple digest | `86f0f046744ba8dfe2d6f33668f9c47a3e0c56646bb58fce9ada71a5bb18ead7` |
+
+Three frozen Valgrind 3.27.0 DHAT runs were exactly identical by allocation
+owner and count. The scorer stack made 578,849 allocation calls for 64
+candidates. The frozen region contract excludes 64 output-vector calls, 1,696
+prepared-candidate ownership copies, and 1,696 returned-candidate ownership
+copies. The included reference is therefore 575,393 calls, or
+8,990,515.625 calls per 1,000 candidates.
+The frozen parser's deterministic report is copied beside the optimized
+profile as `frozen-reference.json`; its SHA-256 is
+`d54bc1fc4879c1c97321dd582cbfc2773c2b0343a672d093bc7706a1074c0522`.
+
+The optimized same-command profile is under
+`build/wric-chart-parallelization/phase2-wave4-20260714-0c4623b/current-dhat-exact/`.
+Its copied executable reports `dagutil 2.2.0 (0c4623b)` and has SHA-256
+`e729f5c59d98298694460487839abac13f9e36639bb272fa798a29bd61804998`.
+The DHAT file SHA-256 is
+`7c12a62dfff020fd4399aa41abb8b9b169331ff735b3f0a4a67ef38c435a1854`.
+`tools/wric_dhat_scoring_region.py` independently validates that file's v2
+schema, hashes, exact command, product counters, complete scorer symbol and
+source lines, unique scorer-frame occurrence, expected allocation totals, and
+widened-integer threshold. The analyzer hard-pins the frozen report, frozen
+binary, frozen/current fixture identity, three-run consensus, and required 80%
+threshold; its denominator is not a caller-supplied number. Its deterministic
+`current-region.json` has SHA-256
+`887029bc8dd82d028886424882494075fcd2a6c2f7a3f09ba901cadc2461b05d`.
+The optimized process made 67,780 allocation calls in total, of which exactly
+338 calls at 41 allocation points had a
+`score_candidates_locally_into` frame. The `_into` boundary structurally owns
+neither output results nor promoted candidates, so all 338 are included cold
+high-water growth. That is 5,281.25 calls per 1,000 candidates and a
+99.941257540% same-profiler reduction. The analyzer's non-normalized,
+widened-integer 80% test is
+`338 * 64 * 100 <= 575393 * 64 * 20`, or
+`2,163,200 <= 736,503,040`. Even treating every
+allocation in the optimized process as scorer work gives an 88.220225133%
+conservative reduction. The optimized protobuf SHA-256 is
+`e51855d97a671a6d1af85f4e32c742939ab2a28e641a1cb74eca08ee5265fe1b`,
+byte-identical to all three frozen-reference outputs.
+
+The executable-local observer adds a stronger steady-state regression gate.
+After one complete unobserved high-water pass, each of three observed
+1,000-candidate passes makes exactly zero calls through any replaceable C++
+allocation form. Each pass still executes the frozen non-vacuity workload:
+1,610,815 local row visits, 1,497,815 unit-Fitch production visits, 12,239
+candidate partition validations, 13,255 production descriptors, 139,000 base
+clade and 69,000 base production reachability visits, 11,239 temporary-clade
+and 12,239 temporary-production visits, and 1,000 full-grammar-like
+reachability passes. Separate observed rich-shape delta-build and acceptance
+candidate-copy cycles are also allocation-free. All scores match the 64-row
+frozen tuple oracle and its digest; wrapper equivalence is only a secondary
+check, not the oracle.
+
+#### Correctness and sanitizer evidence
+
+The post-commit focused command ran `chart_trim_test`,
+`chart_spr_search_test`, and `chart_spr_allocation_test`. It passed 3/3 in
+5.50 seconds. Its copied `LastTest.log` SHA-256 is
+`acdf80a415cd15656240f12a95f9671772c624f4b3afd75570c67b43a92fd6e2`.
+The complete RelWithDebInfo suite then passed all 157 registered tests in
+206.79 seconds. The established optional `merge_consistency_test` and
+`rotaA_diagnostic_test` skips were unchanged. The full log SHA-256 is
+`f4af3a6333b5906cc8597d0c2126d1ea2338c4ff1d731f1bfdaffa89e5455312`.
+The analyzer's deterministic in-tree adversarial self-test is registered as
+`wric_dhat_scoring_region_test`. It covers the valid contract and rejects
+schema, command, counter, every input hash, frozen-report hash, duplicate,
+foreign-source, truncated-frame, exact-symbol, source-line, three expected
+total, malformed-consensus, and failed-threshold mutations.
+A post-analyzer parallel rerun passed all 158 registered tests in 86.60
+seconds, with only the same two established optional skips. Its
+`full-evidence.LastTest.log` SHA-256 is
+`60947017f40f03b4eb34c8901ba680b863a93308a26bea923ff0e65f150af499`.
+
+The targeted ASAN build used the required GCC trunk, C++26,
+`RelWithDebInfo`, `ENABLE_ASAN=ON`, and `ENABLE_TSAN=OFF`. The host loader's
+default GCC-15 `libasan.so.8` lacked a GCC-trunk sanitizer symbol; the preserved
+minimal loader failure has SHA-256
+`7afbdb213492ee32e8a60fe248a2136a8387accc171ad2bab0e43624b6a9b95d`.
+Rerunning with
+`LD_LIBRARY_PATH=/home/ogi-agent/install/gcc-trunk/lib64` selected the matching
+GCC-trunk runtime. `chart_trim_test`, `chart_spr_test`,
+`chart_spr_search_test`, `rank3_rewrite_test`, and
+`chart_spr_allocation_test` then passed 5/5 in 40.36 seconds with
+`ASAN_OPTIONS=halt_on_error=1:detect_leaks=1`; that log's SHA-256 is
+`b03c281e3e540c2b14de205954e4c700bc059723bc184a90f1c8354462972d8d`.
+`option_c_test` and `option_c_chain_commit_test` passed 2/2 in 0.08 seconds
+under the same runtime and options; that log's SHA-256 is
+`435186c4410732f3e3acc051f179fb7ab80821836b59da57c8f0159f7c05b3ed`.
+There were no address or leak diagnostics.
+
+| Phase-2 exit criterion | Decision |
+|---|---|
+| At least 80% fewer scoped allocations per 1,000 candidates | pass: 99.941257540% same-profiler reduction; warmed result is zero |
+| One unchanged active-pattern inside build per committed state | pass: disjoint build/reuse counters and one-owner assertions cover all-active, lazy, and pattern-batch modes |
+| Medium one-worker local scoring at least 30% faster than Phase 0 and no more than 5% slower than Phase 1 | pending sealed Phase-0 capture |
+| Small one-candidate exact at least 25% faster than Phase 1 | pending sealed Phase-0 capture |
+| Peak RSS no more than 25% above every reference | pending sealed Phase-0 capture; per-worker resident descriptor ownership is mechanically bounded |
+| Canonical output | in-tree frozen tuple/digest and byte-identical profiled output pass; final sealed Phase-0 comparison pending |
+| Full CTest and targeted ASAN | pass |
+
+Phase 2 is therefore **implementation complete; acceptance pending Phase 0**
+under the deadline-overlap rule. No busy-host wall time or RSS observation in
+this section is acceptance evidence.
 
 ## Later-phase evidence template
 

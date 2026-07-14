@@ -1166,6 +1166,9 @@ add_executable(chart_spr_allocation_test
 target_link_libraries(chart_spr_allocation_test PRIVATE larch)
 add_test(NAME chart_spr_allocation_test COMMAND chart_spr_allocation_test
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME wric_dhat_scoring_region_test
+         COMMAND python3 tools/wric_dhat_scoring_region.py self-test
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Phase 10 (cross-cutting CLI / report / identity surface) library-level tests.
 add_executable(chart_spr_phase10_test test/chart_spr_phase10_test.cpp)
