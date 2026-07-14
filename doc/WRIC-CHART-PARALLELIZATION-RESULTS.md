@@ -1074,6 +1074,112 @@ Phase 3 is therefore **implementation complete; acceptance pending Phase 0**
 under the deadline-overlap rule. No busy-host timing observation is accepted
 as evidence for the outstanding small-case wall-time gate.
 
+## Phase 4 — pattern construction and local scoring
+
+Checkpoint `cbf92b6` (`Parallelize chart pattern and local scoring`) closes
+the Phase-4 implementation work under the deadline-overlap rule. It routes
+initial-chart construction, active-pattern exact setup, resident inside and
+outside cache construction, fixed-topology direct scoring, coarse candidate
+scoring, and narrow candidate-by-pattern tiles through the one search-lifetime
+scheduler. Pattern work writes pre-sized indexed slots; candidate work uses
+stable result slots, affected-set-weighted ordering, bounded dynamic ranges,
+and coordinator-ordered integer reduction. One/few-candidate batches tile the
+pattern axis, while pattern-batch mode fuses one bounded cold-cache build with
+scoring instead of retaining or rebuilding an unbounded cache.
+
+Worker failures are captured per stable range, all launched work is joined,
+and the lowest stable failure is rethrown only after the operation boundary is
+clean. Scheduler-infrastructure failures retain their distinct taxonomy and
+the same scheduler is exercised successfully after caught worker and
+submission failures. Per-axis operation, item, range, task, grain, parallel
+operation, and active-worker-high-water counters reconcile exactly with the
+global scheduler report; shutdown reports zero pending tasks and zero live
+pool threads.
+
+The local-commit admission check now covers persistent inside/outside storage,
+capacity rather than size for allocator-owned vectors, lazy class maps and
+weights, the old and conservatively projected new lazy state, pattern-cache
+entry objects as well as rows, selected-topology cache admission, and the
+maximum frozen-plus-temporary dense clade surface. Overflow and inconsistency
+fail before mutation with the hard local-commit taxonomy. Selected-topology
+state is bounded to one candidate. A regression fixture also exercises a
+previously unreachable frozen clade becoming reachable after append/rebase;
+newly reachable clades are unioned into the affected set and recomputed in
+bottom-up/top-down dependency order before comparison with a cold oracle.
+
+The new strict postprocessor, `tools/wric_phase4_acceptance.py`, consumes raw
+trials rather than summary rows. It rejects incomplete or overlapping worker
+matrices, identity/hash mismatches, malformed or duplicated report fields,
+nonzero swap, unresolved scheduler work, missing parallel high-water evidence,
+and disagreement between global and semantic-axis accounting. It enforces the
+local and construction W8/W1 limits of 0.50, both W8/W4 limits of 1.10, the
+Phase-3 W1 limit of 1.05, system/user CPU profiling threshold of 0.25, and both
+the relative and global RSS limits. Deferring the Phase-3 comparison must be
+explicit. Its deterministic adversarial suite passes 26/26, including exact
+threshold boundaries and just-over-threshold failures for every timing ratio.
+
+### Correctness and sanitizer evidence
+
+After formatting only the lines introduced in this checkpoint, the focused
+command
+
+```text
+ctest --test-dir build --output-on-failure -j 4 \
+  -R '^(chart_parallel_test|chart_trim_test|chart_spr_search_test|inside_chart_cache_test|outside_chart_cache_test|wric_phase4_acceptance_test)$'
+```
+
+passed 6/6 in 19.33 seconds. The finalized complete RelWithDebInfo command
+`ctest --test-dir build --output-on-failure -j 8` passed all 160 registered
+tests in 95.19 seconds. The established optional `merge_consistency_test` and
+`rotaA_diagnostic_test` skips were unchanged. The preserved log is
+`build/wric-chart-parallelization/phase4-cbf92b6/full-relwithdebinfo.LastTest.log`;
+its SHA-256 is
+`3241e83706e73ec87800e31fa3588b19f9543fc4ce1c592fb4c29708256efe59`.
+
+The targeted GCC-trunk TSan build exercised `chart_parallel_test`,
+`chart_spr_search_test`, `inside_chart_cache_test`, and
+`outside_chart_cache_test` separately with
+
+```text
+LD_LIBRARY_PATH="$PWD/build/wric-chart-parallelization/phase4-tsan-runtime:/home/ogi-agent/install/gcc-trunk/lib64" \
+TSAN_OPTIONS=halt_on_error=1 \
+./build-tsan-phase3-7d294d6/<test>
+```
+
+All four exited zero with no TSan diagnostic, including deterministic real
+worker overlap, local-commit cache barriers, failure joining and recovery, and
+the long inside/outside cache chains. The build-local runtime link selects the
+preserved Phase-3 validation runtime whose SHA-256 remains
+`58725dae226e91ea96bebbdf54f84820638404a691528570ec1dab595ed08842`;
+the default system runtime was again rejected because it lacks the required
+GCC-trunk symbol. The subsequent checkpoint changes were formatter-only C++
+whitespace plus the Python acceptance-gate correction; the normal binaries
+were rebuilt from the final checkpoint tree.
+
+A non-acceptance W1/W4 CLI smoke under
+`build/phase4-report-smoke.ax9Nz9/` produced byte-identical canonical JSON
+(SHA-256
+`0506f22bd4190c647af96c6ea90cc1f9e91045a6c4de61f6e1b8b41b3c59c4c7`).
+The W4 report resolved four workers, reached an active-worker high water of
+four, recorded two genuinely parallel operations, and reconciled 30 ranges
+and eight submitted/completed/joined tasks across the initial-chart and
+candidate-pattern axes. Pending and live counts were zero at shutdown. These
+busy-host observations prove path activation only and are not performance
+acceptance evidence.
+
+| Phase-4 exit criterion | Decision |
+|---|---|
+| W1/W2/W4/W8 canonical matrix for seeds 1, 7, and 19 across dense, fixed-topology, and grammar-exact modes | pending sealed Phase-0 capture; in-tree serial/parallel oracle, W1/W4 pattern-axis, W1/W8 multi-accept, and CLI identity tests pass |
+| Medium 64-candidate local W8/W1 at most 0.50 and Phase-4 W1/Phase-3 W1 at most 1.05 | pending sealed Phase-0 capture |
+| Medium construction W8/W1 at most 0.50 | pending sealed Phase-0 capture |
+| Local and construction W8/W4 at most 1.10; CPU contention investigated above 0.25 | pending sealed Phase-0 capture; strict postprocessor and boundary tests pass |
+| W8 peak RSS within the global final bound | pending sealed Phase-0 capture; fail-closed admission and postprocessor gates pass |
+| Full CTest and targeted TSan | pass |
+
+Phase 4 is therefore **implementation complete; acceptance pending Phase 0**.
+No timing or RSS value in this section satisfies an outstanding performance
+gate.
+
 ## Later-phase evidence template
 
 Before the Phase-0 seal, every later-phase measurement is labelled

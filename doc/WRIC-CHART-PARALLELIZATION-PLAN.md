@@ -32,7 +32,7 @@ in this document.
 | 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | Functional/counter gates pass at `208ce23`; canonical Phase-0 comparison and serial speed/no-regression gates await the sealed baseline |
 | 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | `0c4623b` passes the allocation/build/canonical/full-CTest/targeted-ASAN gates; serial timing and RSS comparisons await the sealed baseline |
 | 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | Safe one-pool orchestration, full CTest, and targeted TSAN pass at `7d294d6`; small-case timing awaits the sealed baseline |
-| 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | Deterministic pattern/cache/local/fixed-topology scheduling, bounded-memory admission, caught-failure accounting, full CTest, and targeted TSAN pass; scaling, Phase-3 serial comparison, and RSS gates await the sealed baseline |
+| 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | `cbf92b6` passes deterministic pattern/cache/local/fixed-topology scheduling, bounded-memory admission, caught-failure accounting, full CTest, and targeted TSAN; scaling, Phase-3 serial comparison, and RSS gates await the sealed baseline |
 | 5. Parallelize a single exact B&B | pending | Medium one-candidate completion and scaling |
 | 6. Parallelize exact top-K candidates | pending | Bounded-memory exact candidate scaling |
 | 7. Make lazy charts scalable and adaptive | pending | Dense/lazy equivalence and auto-policy gate |
