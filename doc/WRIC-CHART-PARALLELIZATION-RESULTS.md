@@ -30,7 +30,9 @@ committed. Phase-0 artifacts use the non-overwriting directory
 | 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | code checkpoint `208ce23`; focused and full RelWithDebInfo correctness/counter gates pass; canonical baseline and timing gates remain pending |
 | 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | code checkpoint `0c4623b`; same-profiler allocation reduction, warmed-zero allocation, frozen semantic/counter, focused/full RelWithDebInfo, and targeted ASAN gates pass; serial timing, exact-small timing, RSS, and sealed canonical comparison remain pending |
 | 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | code checkpoint `7d294d6`; scheduler contract, canonical worker matrix, full RelWithDebInfo, and targeted TSan gates pass; small-case timing remains pending |
-| 4--10 | pending | may follow in plan order under the same acceptance gate |
+| 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | code checkpoint `cbf92b6` and evidence checkpoint `1be6ffe`; full RelWithDebInfo and targeted TSan gates pass; sealed scaling/RSS gates pending |
+| 5. Parallelize a single exact B&B | implementation in progress | dependency wavefront and proven-single-topology setup exceed same-revision scaling targets diagnostically; measured-0% heavy split omitted; post-omission correctness, sanitizer, and final evidence pending |
+| 6--10 | pending | may follow in plan order under the same acceptance gate |
 
 ## Phase 0 — immutable provenance
 
@@ -1179,6 +1181,67 @@ acceptance evidence.
 Phase 4 is therefore **implementation complete; acceptance pending Phase 0**.
 No timing or RSS value in this section satisfies an outstanding performance
 gate.
+
+## Phase 5 profile-guided checkpoint (diagnostic, acceptance pending Phase 0)
+
+This checkpoint was measured from the dirty Phase-5 tree after the dependency
+wavefront and proven-single-topology setup path were added, but before the
+measured-zero heavy-product implementation was removed. It is diagnostic
+evidence for the profile decision, not final Phase-5 or Phase-0 acceptance.
+The frozen binaries, workload, candidate/exact limits, validation, and
+`Baseline measure` checkpoint `7ca527b8906d018124756182274335cbff936d72`
+were not changed.
+
+The initial frozen-medium diagnostic at
+`build/wric-chart-parallelization/phase5-medium-exact1-w8/` completed the
+one-candidate exact search in 0.900777 seconds at W8, versus 118.227425
+seconds for its paired frozen native sample--explore--merge run. Its exact
+frontier performed 1,192 product combinations over 138 dependency levels:
+the ordinary clade wavefront took 32.740 ms at W8 versus 96.815 ms in the W1
+semantic companion (2.96x), while the heavy-product axis performed exactly
+zero operations, ranges, tasks, combinations, and milliseconds. Heavy
+splitting therefore represented 0% of the post-wavefront profile. Under the
+Phase-5 conditional-action rule, it must be omitted rather than retained as
+ineffective complexity.
+
+Callgrind output at
+`build/wric-chart-parallelization/phase5-callgrind-w1.out` (SHA-256
+`5ea2f5cca0566efda1fba991e52183dee06c071440b5978e565c1f7736ed4dd5`)
+then identified deterministic per-pattern traceback and recursive selected-
+topology scoring as the dominant exact-setup work. The medium structure has
+597 taxa, 1,193 clades, and 596 productions. Every reachable internal clade
+has exactly one production, but each setup had generated 1,107 topology
+candidates and deduplicated them to one before rescoring that sole feasible
+topology across all 1,106 active patterns. The replacement proves uniqueness
+by a root-reachable structural traversal; only in that exact case the
+per-pattern chart lower-bound sum is itself feasible, so it is also the upper
+bound. General multi-topology trace, deduplication, and scoring remain the
+oracle path.
+
+Three alternating W1/W8 runs used the unchanged seedtree one-candidate,
+top-K-one exact command, taskset `0,2,4,6,8,10,12,14`, the frozen process
+metrics runner, validation, and a 12 GiB chart-memory option. Raw stems are
+`build/wric-chart-parallelization/phase5-unique-fast-w{1,8}-*`; every process
+exited zero, timed out zero times, and sampled zero swap. The median results
+were:
+
+| Metric | W1 median | W8 median | W1/W8 |
+|---|---:|---:|---:|
+| exact initialization | 143.601 ms | 34.071 ms | 4.22x |
+| exact verification | 179.173 ms | 41.995 ms | 4.27x |
+| exact B&B frontier | 83.170 ms | 27.795 ms | 2.99x |
+| whole-process wall | 0.575261 s | 0.272354 s | 2.11x |
+| user CPU | 0.482216 s | 0.533513 s | -- |
+| system CPU | 0.090317 s | 0.122608 s | -- |
+| maximum RSS | 86,708 KiB | 86,628 KiB | -- |
+
+The W8 median system/user ratio is 22.98%, below the plan's mandatory 25%
+contention-investigation threshold and far below the pre-change W8 ratios.
+Each exact setup now reports one scheduler operation and one structurally
+established feasible topology; across current and candidate trims the search
+report therefore records two setup operations and two topology candidates.
+Focused correctness, full-suite, sanitizer, final same-revision measurement,
+and RSS gates remain pending on the post-omission tree.
 
 ## Later-phase evidence template
 

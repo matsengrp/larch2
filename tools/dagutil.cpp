@@ -1324,7 +1324,8 @@ Analysis:
   --chart-spr-candidate-source <M>
                           grammar (default), sampled-tree, or hybrid
   --chart-spr-workers <N>
-                          Unified chart-search worker budget (default 1; 0
+                          Unified dense-chart/B&B and chart-search worker
+                          budget (default 1; 0
                           chooses affinity-restricted physical cores when
                           available, then affinity logical CPUs, hardware
                           concurrency, or the serial portable fallback)
@@ -3315,6 +3316,15 @@ static void print_chart_spr_search_counter_fields(
       << counters.exact_setup_upper_bound_topologies_unique << "\n";
   out << indent << "exact_setup_frontier_passes: "
       << counters.exact_setup_frontier_passes << "\n";
+  out << indent << "exact_bnb_levels: " << counters.exact_bnb_levels << "\n";
+  out << indent << "exact_bnb_clades: " << counters.exact_bnb_clades << "\n";
+  out << indent << "exact_bnb_product_combinations: "
+      << counters.exact_bnb_product_combinations << "\n";
+  out << indent
+      << "exact_bnb_frontier_entries: " << counters.exact_bnb_frontier_entries
+      << "\n";
+  out << indent << "exact_bnb_ms: " << std::fixed << std::setprecision(3)
+      << counters.exact_bnb_ms << "\n";
   out << indent << "exact_trim_lazy_chart_uses: "
       << counters.exact_trim_lazy_chart_uses << "\n";
   out << indent << "outside_cache_inside_charts_built: "
@@ -3815,6 +3825,58 @@ static chart_spr_search_options make_chart_spr_search_options(
   return options;
 }
 
+static void print_chart_scheduler_axis_fields(
+    std::ostream& out, std::string_view name,
+    chart_spr_scheduler_axis_metrics const& axis,
+    std::string_view indent = {}) {
+  out << indent << "chart_axis_" << name << "_operations: " << axis.operations
+      << "\n";
+  out << indent << "chart_axis_" << name
+      << "_parallel_operations: " << axis.parallel_operations << "\n";
+  out << indent << "chart_axis_" << name << "_items: " << axis.items << "\n";
+  out << indent << "chart_axis_" << name << "_ranges: " << axis.ranges << "\n";
+  out << indent << "chart_axis_" << name << "_tasks: " << axis.worker_tasks
+      << "\n";
+  out << indent << "chart_axis_" << name
+      << "_active_worker_high_water: " << axis.active_worker_high_water << "\n";
+  out << indent << "chart_axis_" << name
+      << "_minimum_effective_grain: " << axis.minimum_effective_grain << "\n";
+  out << indent << "chart_axis_" << name
+      << "_maximum_effective_grain: " << axis.maximum_effective_grain << "\n";
+}
+
+static void print_multisite_frontier_level_diagnostics(
+    std::ostream& out,
+    std::vector<multisite_frontier_level_diagnostic> const& diagnostics,
+    std::string_view indent = {}) {
+  out << indent << "frontier_level_diagnostics:\n";
+  for (auto const& level : diagnostics) {
+    out << indent << "  - pass_kind: "
+        << multisite_frontier_pass_kind_name(level.pass_kind) << "\n";
+    out << indent << "    pass_index: " << level.pass_index << "\n";
+    out << indent << "    dependency_level: " << level.dependency_level << "\n";
+    out << indent << "    clades_processed: " << level.clades_processed << "\n";
+    out << indent
+        << "    internal_clades_processed: " << level.internal_clades_processed
+        << "\n";
+    out << indent << "    product_combinations: " << level.product_combinations
+        << "\n";
+    out << indent
+        << "    output_frontier_entries: " << level.output_frontier_entries
+        << "\n";
+    out << indent << "    maximum_clade_frontier_entries: "
+        << level.maximum_clade_frontier_entries << "\n";
+    out << indent
+        << "    equality_deduplicated: " << level.equality_deduplicated << "\n";
+    out << indent << "    bound_pruned: " << level.bound_pruned << "\n";
+    out << indent << "    dominance_candidates_considered: "
+        << level.dominance_candidates_considered << "\n";
+    out << indent << "    dominance_pruned: " << level.dominance_pruned << "\n";
+    out << indent << "    wave_ms: " << std::fixed << std::setprecision(3)
+        << level.wave_ms << "\n";
+  }
+}
+
 static void run_chart_spr_search_diagnostic(
     std::ostream& out, phylo_dag& dag,
     polytomy_refinement_result& refinement, args const& a) {
@@ -4123,35 +4185,26 @@ static void run_chart_spr_search_diagnostic(
       << scheduler.live_pool_threads << "\n";
   out << "  chart_scheduler_shutdown: "
       << (scheduler.shutdown ? "true" : "false") << "\n";
-  auto emit_scheduler_axis = [&out](
-                                 char const* name,
-                                 chart_spr_scheduler_axis_metrics const& axis) {
-    out << "  chart_axis_" << name << "_operations: " << axis.operations
-        << "\n";
-    out << "  chart_axis_" << name
-        << "_parallel_operations: " << axis.parallel_operations << "\n";
-    out << "  chart_axis_" << name << "_items: " << axis.items << "\n";
-    out << "  chart_axis_" << name << "_ranges: " << axis.ranges << "\n";
-    out << "  chart_axis_" << name << "_tasks: " << axis.worker_tasks << "\n";
-    out << "  chart_axis_" << name
-        << "_active_worker_high_water: " << axis.active_worker_high_water
-        << "\n";
-    out << "  chart_axis_" << name
-        << "_minimum_effective_grain: " << axis.minimum_effective_grain << "\n";
-    out << "  chart_axis_" << name
-        << "_maximum_effective_grain: " << axis.maximum_effective_grain << "\n";
-  };
   auto const& scheduler_axes = search.summary.scheduler_axes;
-  emit_scheduler_axis("initial_chart", scheduler_axes.initial_chart_patterns);
-  emit_scheduler_axis("exact_setup", scheduler_axes.exact_setup_patterns);
-  emit_scheduler_axis("inside_cache", scheduler_axes.inside_cache_patterns);
-  emit_scheduler_axis("outside_cache", scheduler_axes.outside_cache_patterns);
-  emit_scheduler_axis("fixed_topology_oracle",
-                      scheduler_axes.fixed_topology_patterns);
-  emit_scheduler_axis("local_candidate", scheduler_axes.local_score_candidates);
-  emit_scheduler_axis("local_candidate_pattern",
-                      scheduler_axes.local_score_candidate_patterns);
-  emit_scheduler_axis("other", scheduler_axes.other);
+  print_chart_scheduler_axis_fields(
+      out, "initial_chart", scheduler_axes.initial_chart_patterns, "  ");
+  print_chart_scheduler_axis_fields(out, "exact_setup",
+                                    scheduler_axes.exact_setup_patterns, "  ");
+  print_chart_scheduler_axis_fields(out, "exact_frontier_clade",
+                                    scheduler_axes.exact_frontier_clades, "  ");
+  print_chart_scheduler_axis_fields(out, "inside_cache",
+                                    scheduler_axes.inside_cache_patterns, "  ");
+  print_chart_scheduler_axis_fields(
+      out, "outside_cache", scheduler_axes.outside_cache_patterns, "  ");
+  print_chart_scheduler_axis_fields(out, "fixed_topology_oracle",
+                                    scheduler_axes.fixed_topology_patterns,
+                                    "  ");
+  print_chart_scheduler_axis_fields(
+      out, "local_candidate", scheduler_axes.local_score_candidates, "  ");
+  print_chart_scheduler_axis_fields(
+      out, "local_candidate_pattern",
+      scheduler_axes.local_score_candidate_patterns, "  ");
+  print_chart_scheduler_axis_fields(out, "other", scheduler_axes.other, "  ");
   bool const search_used_lazy_chart =
       search.summary.cache_strategy ==
       chart_spr_cache_strategy::lazy_multisite_chart;
@@ -4356,6 +4409,14 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.exact_setup_upper_bound_topologies_unique << "\n";
   out << "  exact_setup_frontier_passes: "
       << search.summary.exact_setup_frontier_passes << "\n";
+  out << "  exact_bnb_levels: " << search.summary.exact_bnb_levels << "\n";
+  out << "  exact_bnb_clades: " << search.summary.exact_bnb_clades << "\n";
+  out << "  exact_bnb_product_combinations: "
+      << search.summary.exact_bnb_product_combinations << "\n";
+  out << "  exact_bnb_frontier_entries: "
+      << search.summary.exact_bnb_frontier_entries << "\n";
+  out << "  exact_bnb_ms: " << std::fixed << std::setprecision(3)
+      << search.summary.exact_bnb_ms << "\n";
   out << "  exact_trim_lazy_chart_uses: "
       << search.summary.exact_trim_lazy_chart_uses << "\n";
   out << "  outside_cache_inside_charts_built: "
@@ -5082,14 +5143,87 @@ int main(int argc, char** argv) try {
     auto trim_opts = make_chart_bnb_trim_options(a);
 
     std::optional<lazy_multisite_chart> lazy_chart;
-    if (a.wric_lazy_chart) lazy_chart = build_lazy_inside_chart(grammar, patterns);
+    if (a.wric_lazy_chart)
+      lazy_chart = build_lazy_inside_chart(grammar, patterns);
+    multisite_trim_result trim;
+    bool chart_scheduler_used = false;
+    chart_scheduler_metrics bnb_scheduler_metrics;
+    multisite_trim_scheduler_run_summaries bnb_scheduler_runs;
+    chart_spr_scheduler_axis_metrics exact_setup_axis;
+    chart_spr_scheduler_axis_metrics exact_frontier_clade_axis;
+    auto const requested_workers = a.chart_spr_workers.value_or(
+        a.chart_spr_local_score_workers.value_or(1));
     auto bnb_start = std::chrono::steady_clock::now();
-    auto trim = lazy_chart
-                    ? build_multisite_trim(grammar, patterns, *lazy_chart,
-                                           chart_opts, trim_opts)
-                    : build_multisite_trim(grammar, patterns, chart_opts,
-                                           trim_opts);
-    auto bnb_ms = elapsed_ms(bnb_start, std::chrono::steady_clock::now());
+    std::chrono::steady_clock::time_point bnb_end;
+    if (lazy_chart) {
+      trim = build_multisite_trim(grammar, patterns, *lazy_chart, chart_opts,
+                                  trim_opts);
+      bnb_end = std::chrono::steady_clock::now();
+    } else {
+      auto plan = build_chart_execution_plan(grammar);
+      chart_scheduler scheduler{chart_scheduler_options{
+          .requested_workers = requested_workers,
+      }};
+      chart_scheduler_used = true;
+      trim = build_multisite_trim(plan, patterns, scheduler, chart_opts,
+                                  trim_opts, &bnb_scheduler_runs);
+      bnb_end = std::chrono::steady_clock::now();
+      scheduler.shutdown();
+      bnb_scheduler_metrics = scheduler.metrics();
+      for (auto const& run : bnb_scheduler_runs.exact_setup) {
+        record_chart_spr_scheduler_axis_run(exact_setup_axis, run);
+      }
+      for (auto const& run : bnb_scheduler_runs.frontier_clades) {
+        record_chart_spr_scheduler_axis_run(exact_frontier_clade_axis, run);
+      }
+      auto const recorded_operations =
+          exact_setup_axis.operations + exact_frontier_clade_axis.operations;
+      auto const recorded_parallel_operations =
+          exact_setup_axis.parallel_operations +
+          exact_frontier_clade_axis.parallel_operations;
+      auto const recorded_ranges =
+          exact_setup_axis.ranges + exact_frontier_clade_axis.ranges;
+      auto const recorded_tasks = exact_setup_axis.worker_tasks +
+                                  exact_frontier_clade_axis.worker_tasks;
+      auto const recorded_active_worker_high_water =
+          std::max(exact_setup_axis.active_worker_high_water,
+                   exact_frontier_clade_axis.active_worker_high_water);
+      auto const recorded_minimum_effective_grain = [&] {
+        auto const setup = exact_setup_axis.minimum_effective_grain;
+        auto const frontier = exact_frontier_clade_axis.minimum_effective_grain;
+        if (setup == 0) return frontier;
+        if (frontier == 0) return setup;
+        return std::min(setup, frontier);
+      }();
+      auto const recorded_maximum_effective_grain =
+          std::max(exact_setup_axis.maximum_effective_grain,
+                   exact_frontier_clade_axis.maximum_effective_grain);
+      if (recorded_operations != bnb_scheduler_metrics.operations ||
+          recorded_parallel_operations !=
+              bnb_scheduler_metrics.parallel_operations ||
+          recorded_ranges != bnb_scheduler_metrics.ranges_created ||
+          recorded_ranges != bnb_scheduler_metrics.ranges_completed ||
+          bnb_scheduler_metrics.ranges_cancelled != 0 ||
+          recorded_tasks != bnb_scheduler_metrics.tasks_submitted ||
+          recorded_tasks != bnb_scheduler_metrics.tasks_completed ||
+          recorded_tasks != bnb_scheduler_metrics.tasks_joined ||
+          recorded_active_worker_high_water !=
+              bnb_scheduler_metrics.active_worker_high_water ||
+          recorded_minimum_effective_grain !=
+              bnb_scheduler_metrics.minimum_effective_grain ||
+          recorded_maximum_effective_grain !=
+              bnb_scheduler_metrics.maximum_effective_grain ||
+          bnb_scheduler_metrics.pending_tasks != 0 ||
+          bnb_scheduler_metrics.pending_tasks_at_shutdown != 0 ||
+          bnb_scheduler_metrics.pool_lifetimes !=
+              bnb_scheduler_metrics.pool_lifetimes_stopped ||
+          bnb_scheduler_metrics.live_pool_threads != 0 ||
+          !bnb_scheduler_metrics.shutdown) {
+        throw std::logic_error(
+            "standalone chart B&B scheduler axis accounting mismatch");
+      }
+    }
+    auto bnb_ms = elapsed_ms(bnb_start, bnb_end);
 
     std::cout << "chart_bnb_trim:\n";
     std::cout << "  score_kind: "
@@ -5105,6 +5239,58 @@ int main(int argc, char** argv) try {
               << "\n";
     std::cout << "  score_ua_edge: "
               << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+    std::cout << "  chart_scheduler_used: "
+              << (chart_scheduler_used ? "true" : "false") << "\n";
+    if (chart_scheduler_used) {
+      std::cout << "  chart_workers_requested: "
+                << bnb_scheduler_metrics.requested_workers << "\n";
+      std::cout << "  chart_workers_resolved: "
+                << bnb_scheduler_metrics.resolved_workers << "\n";
+      std::cout << "  chart_worker_resolution_policy: "
+                << chart_worker_resolution_policy_name(
+                       bnb_scheduler_metrics.worker_policy)
+                << "\n";
+      std::cout << "  chart_scheduler_operations: "
+                << bnb_scheduler_metrics.operations << "\n";
+      std::cout << "  chart_scheduler_parallel_operations: "
+                << bnb_scheduler_metrics.parallel_operations << "\n";
+      std::cout << "  chart_scheduler_ranges_created: "
+                << bnb_scheduler_metrics.ranges_created << "\n";
+      std::cout << "  chart_scheduler_ranges_completed: "
+                << bnb_scheduler_metrics.ranges_completed << "\n";
+      std::cout << "  chart_scheduler_ranges_cancelled: "
+                << bnb_scheduler_metrics.ranges_cancelled << "\n";
+      std::cout << "  chart_scheduler_tasks_submitted: "
+                << bnb_scheduler_metrics.tasks_submitted << "\n";
+      std::cout << "  chart_scheduler_tasks_completed: "
+                << bnb_scheduler_metrics.tasks_completed << "\n";
+      std::cout << "  chart_scheduler_tasks_joined: "
+                << bnb_scheduler_metrics.tasks_joined << "\n";
+      std::cout << "  chart_scheduler_active_worker_high_water: "
+                << bnb_scheduler_metrics.active_worker_high_water << "\n";
+      std::cout << "  chart_scheduler_minimum_effective_grain: "
+                << bnb_scheduler_metrics.minimum_effective_grain << "\n";
+      std::cout << "  chart_scheduler_maximum_effective_grain: "
+                << bnb_scheduler_metrics.maximum_effective_grain << "\n";
+      std::cout << "  chart_scheduler_pending_tasks: "
+                << bnb_scheduler_metrics.pending_tasks << "\n";
+      std::cout << "  chart_scheduler_pending_tasks_at_shutdown: "
+                << bnb_scheduler_metrics.pending_tasks_at_shutdown << "\n";
+      std::cout << "  chart_scheduler_pool_lifetimes: "
+                << bnb_scheduler_metrics.pool_lifetimes << "\n";
+      std::cout << "  chart_scheduler_pool_lifetimes_stopped: "
+                << bnb_scheduler_metrics.pool_lifetimes_stopped << "\n";
+      std::cout << "  chart_scheduler_live_pool_threads: "
+                << bnb_scheduler_metrics.live_pool_threads << "\n";
+      std::cout << "  chart_scheduler_shutdown: "
+                << (bnb_scheduler_metrics.shutdown ? "true" : "false") << "\n";
+      print_chart_scheduler_axis_fields(std::cout, "exact_setup",
+                                        exact_setup_axis, "  ");
+      print_chart_scheduler_axis_fields(std::cout, "exact_frontier_clade",
+                                        exact_frontier_clade_axis, "  ");
+    } else {
+      std::cout << "  chart_scheduler_mode: lazy_serial\n";
+    }
     if (a.wric_lazy_chart) {
       std::cout << "  wric_lazy_chart: on\n";
     }
@@ -5157,7 +5343,35 @@ int main(int argc, char** argv) try {
               << std::setprecision(3) << exact_pattern_build_ms << "\n";
     std::cout << "  bnb_trim_ms: " << std::fixed << std::setprecision(3)
               << bnb_ms << "\n";
+    std::cout << "  exact_setup_builds: " << trim.exact_setup_work.setup_builds
+              << "\n";
+    std::cout << "  exact_setup_inside_charts_built: "
+              << trim.exact_setup_work.inside_charts_built << "\n";
+    std::cout << "  exact_setup_resident_inside_charts_consumed: "
+              << trim.exact_setup_work.resident_inside_charts_consumed << "\n";
+    std::cout << "  exact_setup_active_leaf_state_vectors_copied: "
+              << trim.exact_setup_work.active_leaf_state_vectors_copied << "\n";
+    std::cout << "  exact_setup_active_leaf_states_copied: "
+              << trim.exact_setup_work.active_leaf_states_copied << "\n";
+    std::cout << "  exact_setup_outside_boundary_charts_built: "
+              << trim.exact_setup_work.outside_boundary_charts_built << "\n";
+    std::cout << "  exact_setup_upper_bound_topologies_generated: "
+              << trim.exact_setup_work.upper_bound_topologies_generated << "\n";
+    std::cout << "  exact_setup_upper_bound_topologies_unique: "
+              << trim.exact_setup_work.upper_bound_topologies_unique << "\n";
+    std::cout << "  exact_setup_frontier_passes: "
+              << trim.exact_setup_work.frontier_passes << "\n";
+    std::cout << "  exact_bnb_levels: " << trim.exact_bnb_levels << "\n";
+    std::cout << "  exact_bnb_clades: " << trim.exact_bnb_clades << "\n";
+    std::cout << "  exact_bnb_product_combinations: "
+              << trim.exact_bnb_product_combinations << "\n";
+    std::cout << "  exact_bnb_frontier_entries: "
+              << trim.exact_bnb_frontier_entries << "\n";
+    std::cout << "  exact_bnb_ms: " << std::fixed << std::setprecision(3)
+              << trim.exact_bnb_ms << "\n";
     print_frontier_size_stats(std::cout, trim.frontier_sizes_by_clade);
+    print_multisite_frontier_level_diagnostics(
+        std::cout, trim.frontier_level_diagnostics, "  ");
 
     if (a.chart_bnb_apply_trim) {
       auto apply_opts = make_chart_bnb_trim_apply_options(a);

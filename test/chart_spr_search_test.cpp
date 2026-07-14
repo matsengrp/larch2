@@ -156,12 +156,13 @@ static larch::site_pattern_set make_phase4_wide_patterns(
   return patterns;
 }
 
-static std::array<larch::chart_spr_scheduler_axis_metrics const*, 8>
+static std::array<larch::chart_spr_scheduler_axis_metrics const*, 9>
 phase4_scheduler_axes(
     larch::chart_spr_scheduler_axis_counters const& counters) {
   return {
       &counters.initial_chart_patterns,
       &counters.exact_setup_patterns,
+      &counters.exact_frontier_clades,
       &counters.inside_cache_patterns,
       &counters.outside_cache_patterns,
       &counters.fixed_topology_patterns,
@@ -1372,6 +1373,136 @@ static void test_state_builder_from_dag_rebuilds_patterns_once() {
   CHECK(larch::chart_spr_pattern_source_fingerprint_matches(
       dag, grammar, state.pattern_source_fingerprint));
   state.active_patterns.assert_no_skipped_invariant_metadata();
+
+  std::println("  PASS");
+}
+
+static void test_semantic_capture_reuses_primary_exact_provenance() {
+  std::println("test_semantic_capture_reuses_primary_exact_provenance");
+
+  auto fixture = make_fixture();
+  auto plan = larch::build_chart_execution_plan(fixture.grammar);
+  auto active_build = larch::make_active_search_patterns(fixture.patterns);
+  auto const& active = active_build.active_patterns;
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.semantic_capture = larch::chart_spr_semantic_capture_mode::digest;
+  CHECK(!options.exact_trim.capture_optimal_root_provenance);
+  larch::configure_chart_spr_primary_exact_provenance(options);
+  CHECK(options.exact_trim.capture_optimal_root_provenance);
+
+  auto primary = larch::build_multisite_trim_active(plan, active, options.chart,
+                                                    options.exact_trim);
+  CHECK(primary.keep_production_exact);
+  CHECK(!primary.optimal_root_provenance_classes.empty());
+  auto primary_evidence = larch::chart_spr_canonicalize_search_trim_evidence(
+      fixture.grammar, plan, active, options.chart, options.exact_trim, primary,
+      active_build.invariant_constant_offset);
+
+  // Preserve the frozen canonical bytes: the primary-capture path must emit
+  // the exact evidence formerly produced by the checked companion fallback.
+  auto fallback_options = options.exact_trim;
+  fallback_options.capture_optimal_root_provenance = false;
+  auto fallback = larch::build_multisite_trim_active(
+      plan, active, options.chart, fallback_options);
+  CHECK(fallback.optimal_root_provenance_classes.empty());
+  auto fallback_evidence = larch::chart_spr_canonicalize_search_trim_evidence(
+      fixture.grammar, plan, active, options.chart, fallback_options, fallback,
+      active_build.invariant_constant_offset);
+  CHECK(primary_evidence.evidence_kind == fallback_evidence.evidence_kind);
+  CHECK(primary_evidence.keep_mask_kind == fallback_evidence.keep_mask_kind);
+  CHECK(primary_evidence.keep_production_exact ==
+        fallback_evidence.keep_production_exact);
+  CHECK(primary_evidence.optimum_active == fallback_evidence.optimum_active);
+  CHECK(primary_evidence.invariant_offset ==
+        fallback_evidence.invariant_offset);
+  CHECK(primary_evidence.kept_production_keys ==
+        fallback_evidence.kept_production_keys);
+  CHECK(primary_evidence.frontier_sizes == fallback_evidence.frontier_sizes);
+  CHECK(primary_evidence.optimal_root_provenance_classes.size() ==
+        fallback_evidence.optimal_root_provenance_classes.size());
+  for (std::size_t index = 0;
+       index < primary_evidence.optimal_root_provenance_classes.size();
+       ++index) {
+    CHECK(primary_evidence.optimal_root_provenance_classes[index].cost ==
+          fallback_evidence.optimal_root_provenance_classes[index].cost);
+    CHECK(primary_evidence.optimal_root_provenance_classes[index]
+              .production_keys ==
+          fallback_evidence.optimal_root_provenance_classes[index]
+              .production_keys);
+  }
+
+  larch::chart_spr_search_options score_only;
+  score_only.acceptance_mode =
+      larch::chart_spr_acceptance_mode::exact_multisite;
+  score_only.semantic_capture = larch::chart_spr_semantic_capture_mode::digest;
+  score_only.exact_trim.require_exact_keep_mask = false;
+  score_only.exact_trim.dominance_mode =
+      larch::multisite_dominance_mode::score_only;
+  larch::configure_chart_spr_primary_exact_provenance(score_only);
+  CHECK(!score_only.exact_trim.capture_optimal_root_provenance);
+
+  std::println("  PASS");
+}
+
+static void test_primary_provenance_capture_failure_is_hard_error() {
+  std::println("test_primary_provenance_capture_failure_is_hard_error");
+
+  auto fixture = make_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  auto state = larch::build_chart_spr_search_state(fixture.dag, fixture.grammar,
+                                                   options);
+  CHECK(state.exact_trim_active_only.has_value());
+  CHECK(state.exact_trim_active_only->optimal_root_provenance_classes.empty());
+
+  // Cache the ordinary old-state trim first, then fail only while the
+  // candidate's primary B&B copies its already-established optimal root
+  // classes.  This reaches the verifier catch boundary that must not convert a
+  // report-only failure into candidate invalidity.
+  auto trim_options = options.exact_trim;
+  trim_options.capture_optimal_root_provenance = true;
+  trim_options.force_optimal_root_provenance_capture_failure_for_tests = true;
+  auto checked =
+      larch::check_chart_execution_plan(state.grammar, state.execution_plan);
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  auto candidate =
+      larch::score_candidate_locally(state, fixture.candidates.front());
+  CHECK(candidate.valid);
+
+  bool hard_failure_escaped = false;
+  try {
+    (void)larch::verify_candidate_exact_against_state(
+        state, std::move(candidate), checked, scheduler, trim_options);
+  } catch (
+      larch::multisite_optimal_root_provenance_capture_error const& error) {
+    hard_failure_escaped = true;
+    CHECK(std::string_view{error.what()}.find(
+              "forced optimal-root provenance capture failure for test") !=
+          std::string_view::npos);
+  }
+  CHECK(hard_failure_escaped);
+  CHECK(state.counters.exact_verifications == 1);
+  CHECK(scheduler.metrics().pending_tasks == 0);
+
+  // The joined scheduler and state remain reusable after the hard exception.
+  trim_options.force_optimal_root_provenance_capture_failure_for_tests = false;
+  auto recovery_candidate =
+      larch::score_candidate_locally(state, fixture.candidates.front());
+  auto recovered = larch::verify_candidate_exact_against_state(
+      state, std::move(recovery_candidate), checked, scheduler, trim_options);
+  CHECK(recovered.valid);
+  CHECK(recovered.exact.has_value());
+  CHECK(state.counters.exact_verifications == 2);
+  CHECK(state.counters.scheduler_axes.exact_frontier_clades.operations > 0);
+  scheduler.shutdown();
+  check_phase4_scheduler_axis_reconciliation(scheduler.metrics(),
+                                             state.counters.scheduler_axes);
 
   std::println("  PASS");
 }
@@ -3333,9 +3464,13 @@ static void test_phase2b_exact_setup_reuses_resident_state_charts() {
         pattern_count * state.active_patterns.patterns.taxon_count);
   CHECK(resident.exact_setup_work.outside_boundary_charts_built ==
         pattern_count);
-  CHECK(resident.exact_setup_work.upper_bound_topologies_generated ==
-        pattern_count + 1);
-  CHECK(resident.exact_setup_work.upper_bound_topologies_unique > 0);
+  // This tree has one production at every reachable internal clade.  Exact
+  // setup proves the sole feasible topology structurally, so the composite
+  // lower bound is already a feasible upper bound and no per-pattern
+  // traceback/topology-rescore candidates are materialized.
+  CHECK(resident.composite_lower_bound == resident.initial_upper_bound);
+  CHECK(resident.exact_setup_work.upper_bound_topologies_generated == 1);
+  CHECK(resident.exact_setup_work.upper_bound_topologies_unique == 1);
   CHECK(resident.exact_setup_work.upper_bound_topologies_unique <=
         resident.exact_setup_work.upper_bound_topologies_generated);
   CHECK(resident.exact_setup_work.frontier_passes > 0);
@@ -3349,8 +3484,7 @@ static void test_phase2b_exact_setup_reuses_resident_state_charts() {
         pattern_count * state.active_patterns.patterns.taxon_count);
   CHECK(state.counters.exact_setup_outside_boundary_charts_built ==
         pattern_count);
-  CHECK(state.counters.exact_setup_upper_bound_topologies_generated ==
-        pattern_count + 1);
+  CHECK(state.counters.exact_setup_upper_bound_topologies_generated == 1);
   CHECK(state.counters.exact_setup_upper_bound_topologies_unique ==
         resident.exact_setup_work.upper_bound_topologies_unique);
   CHECK(state.counters.exact_setup_frontier_passes ==
@@ -5716,6 +5850,39 @@ static void test_canonical_evidence_failure_is_hard_error() {
   std::println("  PASS");
 }
 
+static void test_candidate_exact_bnb_overflow_is_hard_error() {
+  std::println("test_candidate_exact_bnb_overflow_is_hard_error");
+
+  for (auto const verification_mode :
+       {larch::chart_spr_verification_mode::cold,
+        larch::chart_spr_verification_mode::transient}) {
+    auto dag =
+        larch::test::make_tiny_labelled_tree("A", four_taxon_misplaced_tree());
+    auto grammar = larch::build_clade_grammar(dag);
+    larch::chart_spr_search_options options;
+    options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+    options.candidate_selection =
+        larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+    options.top_k_exact_verify = 1;
+    options.max_iterations = 1;
+    options.rebuild_after_accept = false;
+    options.verification_mode = verification_mode;
+    options.force_candidate_exact_bnb_overflow_for_tests = true;
+
+    bool threw = false;
+    try {
+      (void)larch::run_chart_spr_search(std::move(dag), grammar, options);
+    } catch (std::overflow_error const& error) {
+      threw = true;
+      CHECK(std::string{error.what()} ==
+            "forced candidate exact B&B arithmetic overflow for tests");
+    }
+    CHECK(threw);
+  }
+
+  std::println("  PASS");
+}
+
 static void test_exhaustive_exact_acceptance_matches_oracle() {
   std::println("test_exhaustive_exact_acceptance_matches_oracle");
 
@@ -6263,6 +6430,18 @@ static void test_phase4_local_commit_counter_contract_and_oracle() {
         search.counters.exact_setup_upper_bound_topologies_unique);
   CHECK(search.summary.exact_setup_frontier_passes ==
         search.counters.exact_setup_frontier_passes);
+  CHECK(search.counters.exact_bnb_levels > 0);
+  CHECK(search.counters.exact_bnb_clades > 0);
+  CHECK(search.counters.exact_bnb_product_combinations > 0);
+  CHECK(search.counters.exact_bnb_frontier_entries > 0);
+  CHECK(search.counters.exact_bnb_ms >= 0.0);
+  CHECK(search.summary.exact_bnb_levels == search.counters.exact_bnb_levels);
+  CHECK(search.summary.exact_bnb_clades == search.counters.exact_bnb_clades);
+  CHECK(search.summary.exact_bnb_product_combinations ==
+        search.counters.exact_bnb_product_combinations);
+  CHECK(search.summary.exact_bnb_frontier_entries ==
+        search.counters.exact_bnb_frontier_entries);
+  CHECK(search.summary.exact_bnb_ms == search.counters.exact_bnb_ms);
 
   // Counter contract (cross-cutting): no per-accept sidecar rebuilds and no
   // per-accept dense accept-materializations.
@@ -7380,6 +7559,8 @@ int main() {
   test_root_reference_counts_preserved_in_cache();
   test_active_pattern_assertions_reject_skipped_metadata();
   test_state_builder_from_dag_rebuilds_patterns_once();
+  test_semantic_capture_reuses_primary_exact_provenance();
+  test_primary_provenance_capture_failure_is_hard_error();
   test_pattern_batch_cache_options_match_all_cache();
   test_local_score_into_workspace_contract();
   test_pattern_batch_into_parallel_scratch_plateau();
@@ -7443,6 +7624,7 @@ int main() {
   test_phase5_pattern_fingerprint_mismatch_rebuilds_patterns();
   test_phase5_seeded_multi_iteration_is_deterministic();
   test_canonical_evidence_failure_is_hard_error();
+  test_candidate_exact_bnb_overflow_is_hard_error();
   test_exhaustive_exact_acceptance_matches_oracle();
   test_phase5_witness_topology_selects_required_ancestor_path();
   test_phase5_final_compaction_normalizes_trim_options();

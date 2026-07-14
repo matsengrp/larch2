@@ -7,10 +7,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <limits>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -863,6 +865,89 @@ inline std::vector<chart_production_choice> globally_optimal_choices_for_state(
   return choices;
 }
 
+// The deterministic traceback consumes only the lexicographically first
+// globally optimal choice.  Building, deduplicating, and sorting the complete
+// choice vector at every visited clade is needlessly expensive for that
+// contract (and creates substantial allocator contention when exact setups
+// trace many patterns concurrently).  Keep the exhaustive routine above for
+// callers that need every choice and select the same first element here with a
+// constant-space min reduction.
+inline std::optional<chart_production_choice>
+first_globally_optimal_choice_for_state(
+    chart_execution_plan const& plan, single_site_chart const& chart,
+    single_site_outside_chart const& outside, clade_id clade,
+    std::uint8_t parent_state) {
+  parsimony_chart_detail::validate_state(parent_state, "parent state");
+  if (clade == no_clade || clade >= plan.clades().size()) {
+    throw std::runtime_error("chart trim: clade id out of range");
+  }
+  if (plan.clade(clade).is_leaf() ||
+      !is_globally_optimal_state(plan, chart, outside, clade, parent_state)) {
+    return std::nullopt;
+  }
+
+  auto choice_less = [](chart_production_choice const& lhs,
+                        chart_production_choice const& rhs) {
+    if (lhs.production != rhs.production)
+      return lhs.production < rhs.production;
+    if (lhs.child_states[0] != rhs.child_states[0])
+      return lhs.child_states[0] < rhs.child_states[0];
+    if (lhs.child_states[1] != rhs.child_states[1])
+      return lhs.child_states[1] < rhs.child_states[1];
+    return lhs.parent_state < rhs.parent_state;
+  };
+
+  std::optional<chart_production_choice> first;
+  auto consider = [&](production_id pid,
+                      std::array<std::uint8_t, 2> child_states) {
+    auto const& prod = plan.production(pid);
+    if (prod.parent != clade) {
+      throw std::runtime_error(
+          "chart trim: production parent does not match requested clade");
+    }
+    validate_binary_production_for_trim(plan, prod, pid);
+
+    auto const local = production_choice_inside_cost(
+        plan, chart, prod, parent_state, child_states);
+    if (local >= chart_inf || local != chart.inside[clade][parent_state]) {
+      return;
+    }
+    auto const complete = parsimony_chart_detail::saturated_add(
+        outside.outside[clade][parent_state], local);
+    if (complete >= chart_inf || complete != outside.global_min) return;
+    for (std::size_t child_i = 0; child_i < 2; ++child_i) {
+      if (!is_globally_optimal_state(plan, chart, outside,
+                                     prod.binary_children[child_i],
+                                     child_states[child_i])) {
+        return;
+      }
+    }
+
+    chart_production_choice candidate{pid, parent_state, child_states,
+                                      complete};
+    if (!first || choice_less(candidate, *first)) first = candidate;
+  };
+
+  if (chart.has_trace()) {
+    for (auto const& choice : chart.optimal_choices[clade][parent_state]) {
+      consider(choice.production, choice.child_states);
+    }
+  } else {
+    for (auto pid : plan.productions_for_parent(clade)) {
+      auto const& prod = plan.production(pid);
+      validate_binary_production_for_trim(plan, prod, pid);
+      for (std::uint8_t left_state = 0; left_state < nuc_state_count;
+           ++left_state) {
+        for (std::uint8_t right_state = 0; right_state < nuc_state_count;
+             ++right_state) {
+          consider(pid, {left_state, right_state});
+        }
+      }
+    }
+  }
+  return first;
+}
+
 inline std::vector<std::uint8_t> globally_optimal_root_states(
     chart_execution_plan const& plan, single_site_chart const& chart,
     single_site_outside_chart const& outside) {
@@ -946,6 +1031,71 @@ chart_traceback_result optimal_single_site_traceback_impl(
         "chart trim: traceback root choice index out of range");
   }
   trace_clade(trace_clade, plan.root_clade(), root_states[root_choice_index]);
+  return result;
+}
+
+inline chart_traceback_result deterministic_optimal_single_site_traceback_impl(
+    chart_execution_plan const& plan, single_site_chart const& chart,
+    single_site_outside_chart const& outside) {
+  validate_outside_shapes(plan, chart, outside);
+  if (compute_global_min(plan, chart, outside) != outside.global_min) {
+    throw std::runtime_error("chart trim: outside global optimum is stale");
+  }
+
+  std::optional<std::uint8_t> first_root_state;
+  if (outside.global_min < chart_inf) {
+    auto const root = plan.root_clade();
+    for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+      auto const total = parsimony_chart_detail::saturated_add(
+          chart.inside[root][state], outside.outside[root][state]);
+      if (total < chart_inf && total == outside.global_min) {
+        first_root_state = state;
+        break;
+      }
+    }
+  }
+  if (!first_root_state) {
+    throw std::runtime_error("chart trim: no finite optimal root state");
+  }
+
+  chart_traceback_result result;
+  result.root_state_by_clade.assign(plan.clades().size(), no_chart_state);
+  result.score = outside.global_min;
+  std::vector<bool> expanded(plan.clades().size(), false);
+
+  auto trace_clade = [&](auto&& self, clade_id clade,
+                         std::uint8_t state) -> void {
+    if (clade == no_clade || clade >= plan.clades().size()) {
+      throw std::runtime_error("chart trim: traceback clade out of range");
+    }
+    parsimony_chart_detail::validate_state(state, "traceback state");
+    if (result.root_state_by_clade[clade] != no_chart_state) {
+      if (result.root_state_by_clade[clade] != state) {
+        throw std::runtime_error(
+            "chart trim: traceback encountered conflicting states for clade");
+      }
+      return;
+    }
+    result.root_state_by_clade[clade] = state;
+    if (plan.clade(clade).is_leaf() || expanded[clade]) return;
+    expanded[clade] = true;
+
+    auto const choice = first_globally_optimal_choice_for_state(
+        plan, chart, outside, clade, state);
+    if (!choice) {
+      throw std::runtime_error(
+          "chart trim: non-leaf optimal state has no optimal production "
+          "choice");
+    }
+    result.productions.push_back(choice->production);
+    auto const& prod = plan.production(choice->production);
+    validate_binary_production_for_trim(plan, prod, choice->production);
+    for (std::size_t child_i = 0; child_i < 2; ++child_i) {
+      self(self, prod.binary_children[child_i], choice->child_states[child_i]);
+    }
+  };
+
+  trace_clade(trace_clade, plan.root_clade(), *first_root_state);
   return result;
 }
 
@@ -1195,12 +1345,8 @@ inline chart_traceback_result deterministic_optimal_single_site_traceback(
 inline chart_traceback_result deterministic_optimal_single_site_traceback(
     chart_execution_plan const& plan, single_site_chart const& chart,
     single_site_outside_chart const& outside) {
-  auto choose_first = [](std::size_t size) -> std::size_t {
-    if (size == 0) throw std::runtime_error("chart trim: empty choice set");
-    return 0;
-  };
-  return chart_trim_detail::optimal_single_site_traceback_impl(
-      plan, chart, outside, choose_first);
+  return chart_trim_detail::deterministic_optimal_single_site_traceback_impl(
+      plan, chart, outside);
 }
 
 inline chart_traceback_result deterministic_optimal_single_site_traceback(
@@ -1375,6 +1521,19 @@ struct multisite_trim_options {
   // disabled by default: ordinary trimming needs only the aggregate keep mask
   // and must not pay to copy root-frontier vectors or masks.
   bool capture_optimal_root_provenance = false;
+
+  // Test-only hard-error seam.  This fires inside the primary trim's
+  // report-only root-provenance capture, after the exact frontier and optimum
+  // have been established.  Search tests use it to prove that moving capture
+  // into the primary B&B cannot turn a report failure into candidate
+  // invalidation or an accepted-rebuild rejection.
+  bool force_optimal_root_provenance_capture_failure_for_tests = false;
+};
+
+class multisite_optimal_root_provenance_capture_error
+    : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
 };
 
 struct multisite_optimal_root_provenance_class {
@@ -1401,6 +1560,45 @@ struct multisite_exact_setup_work_stats {
   std::size_t frontier_passes = 0;
 
   bool operator==(multisite_exact_setup_work_stats const&) const = default;
+};
+
+enum class multisite_frontier_pass_kind {
+  exact,
+  score_only,
+  exact_mask_recovery,
+};
+
+inline char const* multisite_frontier_pass_kind_name(
+    multisite_frontier_pass_kind kind) noexcept {
+  switch (kind) {
+    case multisite_frontier_pass_kind::exact:
+      return "exact";
+    case multisite_frontier_pass_kind::score_only:
+      return "score_only";
+    case multisite_frontier_pass_kind::exact_mask_recovery:
+      return "exact_mask_recovery";
+  }
+  return "unknown";
+}
+
+// Non-semantic diagnostics for one dependency-level frontier wave.  Timing,
+// scheduling choices, and scratch estimates are deliberately excluded from
+// canonical trim/search serialization; the deterministic logical-work fields
+// make serial/parallel accounting independently auditable.
+struct multisite_frontier_level_diagnostic {
+  multisite_frontier_pass_kind pass_kind = multisite_frontier_pass_kind::exact;
+  std::size_t pass_index = 0;
+  std::size_t dependency_level = 0;
+  std::size_t clades_processed = 0;
+  std::size_t internal_clades_processed = 0;
+  std::size_t product_combinations = 0;
+  std::size_t output_frontier_entries = 0;
+  std::size_t maximum_clade_frontier_entries = 0;
+  std::size_t equality_deduplicated = 0;
+  std::size_t bound_pruned = 0;
+  std::size_t dominance_candidates_considered = 0;
+  std::size_t dominance_pruned = 0;
+  double wave_ms = 0.0;
 };
 
 struct multisite_trim_result {
@@ -1433,6 +1631,12 @@ struct multisite_trim_result {
   std::vector<multisite_optimal_root_provenance_class>
       optimal_root_provenance_classes;
   multisite_exact_setup_work_stats exact_setup_work;
+  std::vector<multisite_frontier_level_diagnostic> frontier_level_diagnostics;
+  std::size_t exact_bnb_levels = 0;
+  std::size_t exact_bnb_clades = 0;
+  std::size_t exact_bnb_product_combinations = 0;
+  std::size_t exact_bnb_frontier_entries = 0;
+  double exact_bnb_ms = 0.0;
 };
 
 struct multisite_topology_trace_options {
@@ -2134,11 +2338,11 @@ inline frontier_entry combine_frontier_entries(
   return candidate;
 }
 
-inline frontier_entry combine_frontier_entries(
+inline void combine_frontier_costs_into(
     chart_execution_plan const& plan,
     chart_plan_production_descriptor const& prod, production_id pid,
     frontier_entry const& left, frontier_entry const& right,
-    std::size_t active_pattern_count, bool keep_used_production = true) {
+    std::size_t active_pattern_count, multisite_cost_function& out) {
   if (!prod.is_binary()) {
     throw std::runtime_error(
         "multi-site trim: parent combine supports binary productions only");
@@ -2149,30 +2353,12 @@ inline frontier_entry combine_frontier_entries(
     throw std::runtime_error(
         "multi-site trim: child frontier cost vector has wrong size");
   }
-  if (keep_used_production) {
-    if (left.used_production.size() != plan.productions().size() ||
-        right.used_production.size() != plan.productions().size()) {
-      throw std::runtime_error(
-          "multi-site trim: child provenance vector has wrong size");
-    }
-  } else if (!left.used_production.empty() || !right.used_production.empty()) {
-    throw std::runtime_error(
-        "multi-site trim: score-only frontier unexpectedly carries provenance "
-        "bitsets");
-  }
-
-  frontier_entry candidate;
-  candidate.f.cost.assign(expected_size, chart_inf);
-  candidate.f.topology_hash =
+  out.cost.resize(expected_size);
+  out.topology_hash =
       mix_hash(mix_hash(mix_hash(0x70726f64ULL, pid), left.f.topology_hash),
                right.f.topology_hash);
   if (prod.source_id != pid) {
     throw std::runtime_error("multi-site trim: production id out of range");
-  }
-  if (keep_used_production) {
-    candidate.used_production = left.used_production;
-    merge_used_productions(candidate.used_production, right.used_production);
-    candidate.used_production[pid] = true;
   }
 
   for (std::size_t active_index = 0; active_index < active_pattern_count;
@@ -2194,9 +2380,33 @@ inline frontier_entry combine_frontier_entries(
                             right.f.cost[cost_index(active_index, child_state)],
                             transition));
       }
-      candidate.f.cost[cost_index(active_index, parent_state)] =
+      out.cost[cost_index(active_index, parent_state)] =
           parsimony_chart_detail::saturated_add(best_left, best_right);
     }
+  }
+}
+
+inline frontier_entry combine_frontier_entries(
+    chart_execution_plan const& plan,
+    chart_plan_production_descriptor const& prod, production_id pid,
+    frontier_entry const& left, frontier_entry const& right,
+    std::size_t active_pattern_count, bool keep_used_production = true) {
+  frontier_entry candidate;
+  combine_frontier_costs_into(plan, prod, pid, left, right,
+                              active_pattern_count, candidate.f);
+  if (keep_used_production) {
+    if (left.used_production.size() != plan.productions().size() ||
+        right.used_production.size() != plan.productions().size()) {
+      throw std::runtime_error(
+          "multi-site trim: child provenance vector has wrong size");
+    }
+    candidate.used_production = left.used_production;
+    merge_used_productions(candidate.used_production, right.used_production);
+    candidate.used_production[pid] = true;
+  } else if (!left.used_production.empty() || !right.used_production.empty()) {
+    throw std::runtime_error(
+        "multi-site trim: score-only frontier unexpectedly carries provenance "
+        "bitsets");
   }
   return candidate;
 }
@@ -2393,7 +2603,9 @@ inline void insert_or_merge_frontier_entry(
     merge_provenance_choices(entries[found->second].provenance,
                              candidate.provenance,
                              max_provenance_choices_per_entry);
-    entries[found->second].f.topology_hash = mix_hash(
+    // Diagnostic-only, but use an associative representative so equality-class
+    // identity does not depend on merge grouping.
+    entries[found->second].f.topology_hash = std::min(
         entries[found->second].f.topology_hash, candidate.f.topology_hash);
     ++equality_deduplicated;
     return;
@@ -2402,6 +2614,95 @@ inline void insert_or_merge_frontier_entry(
       candidate.provenance.size() > max_provenance_choices_per_entry) {
     throw std::runtime_error(
         "multi-site topology trace: provenance-choice cap exceeded");
+  }
+  auto entry_index = entries.size();
+  auto [_, inserted] = index_by_cost.emplace(candidate.f.cost, entry_index);
+  (void)_;
+  (void)inserted;
+  entries.push_back(std::move(candidate));
+}
+
+inline void insert_frontier_provenance_choice(
+    std::vector<frontier_provenance_choice>& choices,
+    frontier_provenance_choice choice,
+    std::size_t max_provenance_choices_per_entry) {
+  auto less = [](frontier_provenance_choice const& lhs,
+                 frontier_provenance_choice const& rhs) {
+    if (lhs.production != rhs.production)
+      return lhs.production < rhs.production;
+    if (lhs.left_entry != rhs.left_entry)
+      return lhs.left_entry < rhs.left_entry;
+    return lhs.right_entry < rhs.right_entry;
+  };
+  auto where = std::lower_bound(choices.begin(), choices.end(), choice, less);
+  if (where != choices.end() && same_provenance_choice(*where, choice)) return;
+  if (max_provenance_choices_per_entry != 0 &&
+      choices.size() >= max_provenance_choices_per_entry) {
+    throw std::runtime_error(
+        "multi-site topology trace: provenance-choice cap exceeded");
+  }
+  choices.insert(where, choice);
+}
+
+// Insert one Cartesian-product result while retaining a reusable cost-vector
+// scratch allocation.  Full production masks and provenance are materialized
+// only after bound pruning and only for a surviving equality class; duplicates
+// merge their child masks directly into the resident entry.
+inline void insert_or_merge_combined_frontier_entry(
+    chart_execution_plan const& plan, production_id pid,
+    frontier_entry const& left, frontier_entry const& right,
+    std::size_t left_index, std::size_t right_index,
+    multisite_cost_function const& combined, bool keep_used_production,
+    bool keep_provenance, std::vector<frontier_entry>& entries,
+    std::unordered_map<std::vector<chart_cost>, std::size_t,
+                       chart_cost_vector_hash>& index_by_cost,
+    std::size_t& equality_deduplicated,
+    std::size_t max_provenance_choices_per_entry = 0) {
+  if (pid == no_production || pid >= plan.productions().size()) {
+    throw std::runtime_error("multi-site trim: production id out of range");
+  }
+  if (keep_used_production) {
+    if (left.used_production.size() != plan.productions().size() ||
+        right.used_production.size() != plan.productions().size()) {
+      throw std::runtime_error(
+          "multi-site trim: child provenance vector has wrong size");
+    }
+  } else if (!left.used_production.empty() || !right.used_production.empty()) {
+    throw std::runtime_error(
+        "multi-site trim: score-only frontier unexpectedly carries provenance "
+        "bitsets");
+  }
+
+  auto found = index_by_cost.find(combined.cost);
+  if (found != index_by_cost.end()) {
+    auto& resident = entries[found->second];
+    if (keep_used_production) {
+      merge_used_productions(resident.used_production, left.used_production);
+      merge_used_productions(resident.used_production, right.used_production);
+      resident.used_production[pid] = true;
+    }
+    if (keep_provenance) {
+      insert_frontier_provenance_choice(
+          resident.provenance,
+          frontier_provenance_choice{pid, left_index, right_index},
+          max_provenance_choices_per_entry);
+    }
+    resident.f.topology_hash =
+        std::min(resident.f.topology_hash, combined.topology_hash);
+    ++equality_deduplicated;
+    return;
+  }
+
+  frontier_entry candidate;
+  candidate.f = combined;
+  if (keep_used_production) {
+    candidate.used_production = left.used_production;
+    merge_used_productions(candidate.used_production, right.used_production);
+    candidate.used_production[pid] = true;
+  }
+  if (keep_provenance) {
+    candidate.provenance.push_back(
+        frontier_provenance_choice{pid, left_index, right_index});
   }
   auto entry_index = entries.size();
   auto [_, inserted] = index_by_cost.emplace(candidate.f.cost, entry_index);
@@ -3300,6 +3601,83 @@ inline void require_exact_setup_binary(chart_execution_plan const& plan) {
       "trim, or use an arity-agnostic SPR/fixed-topology path");
 }
 
+inline bool exact_setup_has_unique_reachable_topology(
+    clade_grammar const& grammar) {
+  std::vector<bool> visited(grammar.clades.size(), false);
+  std::vector<clade_id> pending{grammar.root_clade};
+  while (!pending.empty()) {
+    auto const clade = pending.back();
+    pending.pop_back();
+    if (clade == no_clade || clade >= grammar.clades.size()) {
+      throw std::runtime_error(
+          "multi-site exact setup: reachable clade out of range");
+    }
+    if (visited[clade]) continue;
+    visited[clade] = true;
+    auto const& key = grammar.clades[clade];
+    auto const& productions = grammar.productions_by_parent[clade];
+    if (key.taxa.size() == 1) {
+      if (!productions.empty()) {
+        throw std::runtime_error(
+            "multi-site exact setup: reachable leaf has productions");
+      }
+      continue;
+    }
+    if (productions.size() != 1) return false;
+    auto const pid = productions.front();
+    if (pid == no_production || pid >= grammar.productions.size()) {
+      throw std::runtime_error(
+          "multi-site exact setup: reachable production out of range");
+    }
+    auto const& production = grammar.productions[pid];
+    if (production.parent != clade) {
+      throw std::runtime_error(
+          "multi-site exact setup: reachable production parent mismatch");
+    }
+    chart_trim_detail::validate_binary_production_for_trim(grammar, production,
+                                                           pid);
+    pending.insert(pending.end(), production.children.begin(),
+                   production.children.end());
+  }
+  return true;
+}
+
+inline bool exact_setup_has_unique_reachable_topology(
+    chart_execution_plan const& plan) {
+  std::vector<bool> visited(plan.clades().size(), false);
+  std::vector<clade_id> pending{plan.root_clade()};
+  while (!pending.empty()) {
+    auto const clade = pending.back();
+    pending.pop_back();
+    if (clade == no_clade || clade >= plan.clades().size()) {
+      throw std::runtime_error(
+          "multi-site exact setup: reachable clade out of range");
+    }
+    if (visited[clade]) continue;
+    visited[clade] = true;
+    auto const productions = plan.productions_for_parent(clade);
+    if (plan.clade(clade).is_leaf()) {
+      if (!productions.empty()) {
+        throw std::runtime_error(
+            "multi-site exact setup: reachable leaf has productions");
+      }
+      continue;
+    }
+    if (productions.size() != 1) return false;
+    auto const pid = productions.front();
+    auto const& production = plan.production(pid);
+    if (production.parent != clade) {
+      throw std::runtime_error(
+          "multi-site exact setup: reachable production parent mismatch");
+    }
+    chart_trim_detail::validate_binary_production_for_trim(plan, production,
+                                                           pid);
+    auto const children = plan.children(pid);
+    pending.insert(pending.end(), children.begin(), children.end());
+  }
+  return true;
+}
+
 template <class Structural, class InsideProvider>
 inline multisite_exact_setup build_multisite_exact_setup_from_inside(
     Structural const& structural, site_pattern_set const& patterns,
@@ -3323,9 +3701,19 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside(
   setup.work.setup_builds = 1;
   setup.active_patterns.reserve(patterns.patterns.size());
 
+  // With exactly one production at every reachable internal clade there is
+  // exactly one feasible topology.  The sum of per-pattern chart optima is
+  // therefore also a feasible coupled score, so no per-pattern traceback,
+  // topology materialization/deduplication, or full topology rescore is
+  // needed to establish the initial upper bound.
+  auto const unique_reachable_topology =
+      exact_setup_has_unique_reachable_topology(structural);
+
   std::vector<selected_topology> upper_bound_topologies;
-  upper_bound_topologies.reserve(patterns.patterns.size() + 1);
-  upper_bound_topologies.push_back(first_topology(structural));
+  if (!unique_reachable_topology) {
+    upper_bound_topologies.reserve(patterns.patterns.size() + 1);
+    upper_bound_topologies.push_back(first_topology(structural));
+  }
 
   for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
        ++pattern_index) {
@@ -3384,7 +3772,7 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside(
     // A zero-weight active pattern can have no used reference state.  It still
     // participates in frontier vector shape, but (as in the legacy path) does
     // not contribute a traceback-derived feasible topology.
-    if (traceback_outside != nullptr) {
+    if (!unique_reachable_topology && traceback_outside != nullptr) {
       auto trace = deterministic_optimal_single_site_traceback(
           structural, chart, *traceback_outside);
       upper_bound_topologies.push_back(
@@ -3395,6 +3783,17 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside(
     // outside boundaries, and traceback topology are finalized, no frontier
     // operation needs an inside chart.
     setup.active_patterns.push_back(std::move(info));
+  }
+
+  if (unique_reachable_topology) {
+    // Count the one topology established by the structural proof even though
+    // the fast path deliberately does not materialize a selected_topology
+    // object.  These counters describe feasible topology candidates
+    // established for the upper bound, not allocation events.
+    setup.work.upper_bound_topologies_generated = 1;
+    setup.work.upper_bound_topologies_unique = 1;
+    setup.initial_upper_bound = setup.composite_lower_bound;
+    return setup;
   }
 
   setup.work.upper_bound_topologies_generated =
@@ -3434,7 +3833,7 @@ inline void build_scheduled_multisite_exact_pattern_slot(
     Structural const& structural, site_pattern_set const& patterns,
     std::size_t pattern_index, chart_options const& options,
     InsideProvider& inside_provider, bool resident_inside,
-    std::size_t stable_slot_id,
+    bool collect_traceback_topology, std::size_t stable_slot_id,
     scheduled_multisite_exact_pattern_slot& result) {
   auto const& pattern = patterns.patterns[pattern_index];
 
@@ -3486,7 +3885,7 @@ inline void build_scheduled_multisite_exact_pattern_slot(
     traceback_outside = &info.outside_ua_free;
   }
 
-  if (traceback_outside != nullptr) {
+  if (collect_traceback_topology && traceback_outside != nullptr) {
     auto trace = deterministic_optimal_single_site_traceback(
         structural, chart, *traceback_outside);
     result.traceback_topology.emplace(
@@ -3538,6 +3937,8 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside_scheduled(
       exact_setup_invariant_constant_offset(structural, patterns, options);
   setup.composite_lower_bound = setup.invariant_constant_offset;
   setup.work.setup_builds = 1;
+  auto const unique_reachable_topology =
+      exact_setup_has_unique_reachable_topology(structural);
 
   // The coordinator fixes the active-pattern order before launching work.
   // Workers write only their pre-sized slot; publication and all reductions
@@ -3564,7 +3965,8 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside_scheduled(
           try {
             build_scheduled_multisite_exact_pattern_slot(
                 structural, patterns, pattern_index, options, inside_provider,
-                resident_inside, stable_slot_id, pattern_slots[active_index]);
+                resident_inside, !unique_reachable_topology, stable_slot_id,
+                pattern_slots[active_index]);
           } catch (...) {
             pattern_errors[active_index] = std::current_exception();
             break;
@@ -3578,8 +3980,10 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside_scheduled(
 
   setup.active_patterns.reserve(pattern_slots.size());
   std::vector<selected_topology> upper_bound_topologies;
-  upper_bound_topologies.reserve(pattern_slots.size() + 1);
-  upper_bound_topologies.push_back(first_topology(structural));
+  if (!unique_reachable_topology) {
+    upper_bound_topologies.reserve(pattern_slots.size() + 1);
+    upper_bound_topologies.push_back(first_topology(structural));
+  }
   for (auto& slot : pattern_slots) {
     setup.composite_lower_bound =
         checked_add_u64(setup.composite_lower_bound, slot.weighted_root_score,
@@ -3589,6 +3993,15 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside_scheduled(
     if (slot.traceback_topology.has_value()) {
       upper_bound_topologies.push_back(std::move(*slot.traceback_topology));
     }
+  }
+
+  if (unique_reachable_topology) {
+    // The sole feasible topology is established structurally rather than
+    // materialized. See the serial builder's counter contract above.
+    setup.work.upper_bound_topologies_generated = 1;
+    setup.work.upper_bound_topologies_unique = 1;
+    setup.initial_upper_bound = setup.composite_lower_bound;
+    return setup;
   }
 
   // Topology identity and deduplication remain coordinator-only and therefore
@@ -3825,6 +4238,10 @@ inline multisite_exact_setup build_multisite_exact_setup(
       plan, patterns, scheduler, options, run_summaries);
 }
 
+// A resident provider is a trusted recurrence source: for each requested
+// index it must return the inside chart computed from that exact pattern and
+// structural object. Shape validation catches stale structure, but deliberately
+// does not recompute every inside row merely to verify provider contents.
 template <class InsideProvider>
 inline multisite_exact_setup
 build_multisite_exact_setup_from_resident_inside(
@@ -4034,12 +4451,40 @@ struct multisite_frontier_build_result {
   std::size_t dominance_candidates_considered = 0;
   std::size_t dominance_pruned = 0;
   std::size_t active_pattern_count = 0;
+  std::vector<multisite_frontier_level_diagnostic> level_diagnostics;
 
   [[nodiscard]] std::vector<active_pattern_info> const&
   active_pattern_view() const noexcept {
     return setup_active_patterns == nullptr ? active_patterns
                                             : *setup_active_patterns;
   }
+};
+
+// Scheduler operations used by one exact trim remain separated by semantic
+// stage, so callers never infer a semantic axis from completion order.
+struct multisite_trim_scheduler_run_summaries {
+  std::vector<chart_scheduler_run_summary> exact_setup;
+  std::vector<chart_scheduler_run_summary> frontier_clades;
+};
+
+struct multisite_frontier_clade_work_stats {
+  std::size_t product_combinations = 0;
+  std::size_t equality_deduplicated = 0;
+  std::size_t bound_pruned = 0;
+  std::size_t dominance_candidates_considered = 0;
+  std::size_t dominance_pruned = 0;
+
+  bool operator==(multisite_frontier_clade_work_stats const&) const = default;
+};
+
+// Narrow test seam for proving dependency publication and real overlap.  The
+// hooks are invoked by scheduler workers immediately before and after one
+// clade kernel.  Production callers use the null default and pay only the two
+// predictable null checks.  The object is borrowed synchronously for the
+// scheduler operation and therefore needs no shared ownership.
+struct multisite_frontier_scheduler_test_hooks {
+  std::function<void(clade_id, std::size_t, std::size_t)> before_clade;
+  std::function<void(clade_id, std::size_t, std::size_t)> after_clade;
 };
 
 inline void validate_multisite_frontier_build_options(
@@ -4254,9 +4699,8 @@ inline multisite_frontier_build_result build_multisite_frontiers_from_setup(
       setup.initial_upper_bound);
 }
 
-inline multisite_frontier_build_result
-build_multisite_frontiers_from_prepared_active(
-    chart_execution_plan const& plan, chart_options const& options,
+inline multisite_frontier_build_result initialize_multisite_frontier_build(
+    chart_execution_plan const& plan,
     multisite_frontier_build_options const& build_options,
     std::string const& context,
     std::vector<active_pattern_info> const* setup_active_patterns,
@@ -4275,97 +4719,281 @@ build_multisite_frontiers_from_prepared_active(
   auto const& active_patterns = result.active_pattern_view();
   result.active_pattern_count = active_patterns.size();
   result.initial_upper_bound = initial_upper_bound_value;
-  auto pruning_upper_bound = build_options.upper_bound_override
-                                 ? *build_options.upper_bound_override
-                                 : result.initial_upper_bound;
-
   result.frontiers.assign(plan.clades().size(), {});
-  for (auto clade : plan.bottom_up_order()) {
-    auto const& key = plan.clade(clade);
-    if (key.is_leaf()) {
-      result.frontiers[clade].push_back(
-          make_leaf_frontier_entry(plan, clade, active_patterns,
-                                   build_options.keep_used_production));
-      result.frontier_sizes_by_clade[clade] = result.frontiers[clade].size();
-      continue;
-    }
+  return result;
+}
 
-    std::unordered_map<std::vector<chart_cost>, std::size_t,
-                       chart_cost_vector_hash>
-        index_by_cost;
-    auto& entries = result.frontiers[clade];
-    for (auto pid : plan.productions_for_parent(clade)) {
-      auto const& prod = plan.production(pid);
-      if (prod.parent != clade) {
-        throw std::runtime_error(
-            context +
-            ": production parent mismatch during frontier construction");
-      }
-      chart_trim_detail::validate_binary_production_for_trim(plan, prod, pid);
-      auto left_child = prod.binary_children[0];
-      auto right_child = prod.binary_children[1];
-      if (left_child >= result.frontiers.size() ||
-          right_child >= result.frontiers.size()) {
-        throw std::runtime_error(context +
-                                 ": production child out of frontier range");
-      }
-      for (std::size_t left_index = 0;
-           left_index < result.frontiers[left_child].size(); ++left_index) {
-        auto const& left = result.frontiers[left_child][left_index];
-        for (std::size_t right_index = 0;
-             right_index < result.frontiers[right_child].size();
-             ++right_index) {
-          auto const& right = result.frontiers[right_child][right_index];
-          auto candidate = combine_frontier_entries(
-              plan, prod, pid, left, right, active_patterns.size(),
-              build_options.keep_used_production);
-          if (build_options.keep_provenance) {
-            candidate.provenance.push_back(
-                frontier_provenance_choice{pid, left_index, right_index});
+inline multisite_frontier_clade_work_stats build_multisite_frontier_clade(
+    chart_execution_plan const& plan, chart_options const& options,
+    multisite_frontier_build_options const& build_options,
+    std::string const& context,
+    std::vector<active_pattern_info> const& active_patterns,
+    std::uint64_t invariant_constant_offset_value,
+    std::uint64_t pruning_upper_bound, clade_id clade,
+    std::vector<std::vector<frontier_entry>>& frontiers) {
+  multisite_frontier_clade_work_stats work;
+  auto const& key = plan.clade(clade);
+  auto& entries = frontiers[clade];
+  if (key.is_leaf()) {
+    entries.push_back(make_leaf_frontier_entry(
+        plan, clade, active_patterns, build_options.keep_used_production));
+    return work;
+  }
+
+  std::unordered_map<std::vector<chart_cost>, std::size_t,
+                     chart_cost_vector_hash>
+      index_by_cost;
+  frontier_entry combined_scratch;
+  for (auto pid : plan.productions_for_parent(clade)) {
+    auto const& prod = plan.production(pid);
+    if (prod.parent != clade) {
+      throw std::runtime_error(
+          context +
+          ": production parent mismatch during frontier construction");
+    }
+    chart_trim_detail::validate_binary_production_for_trim(plan, prod, pid);
+    auto left_child = prod.binary_children[0];
+    auto right_child = prod.binary_children[1];
+    if (left_child >= frontiers.size() || right_child >= frontiers.size()) {
+      throw std::runtime_error(context +
+                               ": production child out of frontier range");
+    }
+    for (std::size_t left_index = 0; left_index < frontiers[left_child].size();
+         ++left_index) {
+      auto const& left = frontiers[left_child][left_index];
+      for (std::size_t right_index = 0;
+           right_index < frontiers[right_child].size(); ++right_index) {
+        auto const& right = frontiers[right_child][right_index];
+        ++work.product_combinations;
+        combine_frontier_costs_into(plan, prod, pid, left, right,
+                                    active_patterns.size(), combined_scratch.f);
+        if (build_options.use_bound_pruning &&
+            pruning_upper_bound < multisite_score_inf) {
+          auto lb =
+              lower_bound_for_entry(combined_scratch, clade, active_patterns,
+                                    invariant_constant_offset_value, options);
+          if (lb > pruning_upper_bound) {
+            ++work.bound_pruned;
+            continue;
           }
-          if (build_options.use_bound_pruning &&
-              pruning_upper_bound < multisite_score_inf) {
-            auto lb = lower_bound_for_entry(
-                candidate, clade, active_patterns,
-                result.invariant_constant_offset, options);
-            if (lb > pruning_upper_bound) {
-              ++result.bound_pruned;
-              continue;
+        }
+        insert_or_merge_combined_frontier_entry(
+            plan, pid, left, right, left_index, right_index, combined_scratch.f,
+            build_options.keep_used_production, build_options.keep_provenance,
+            entries, index_by_cost, work.equality_deduplicated,
+            build_options.max_provenance_choices_per_entry);
+      }
+    }
+  }
+
+  if (build_options.dominance_mode == multisite_dominance_mode::score_only) {
+    apply_score_only_dominance_pruning(
+        entries, work.dominance_candidates_considered, work.dominance_pruned);
+  } else if (build_options.dominance_mode ==
+             multisite_dominance_mode::strict_mask_safe) {
+    apply_strict_mask_safe_dominance_pruning(
+        entries, clade, active_patterns, options,
+        work.dominance_candidates_considered, work.dominance_pruned);
+  }
+
+  if (build_options.max_frontier_entries_per_clade != 0 &&
+      entries.size() > build_options.max_frontier_entries_per_clade) {
+    std::string message = context + ": frontier entry cap exceeded for clade " +
+                          std::to_string(clade);
+    if (context.find("exact mask recovery pass") != std::string::npos) {
+      message +=
+          "; exact mask recovery pass exceeded the frontier cap; rerun "
+          "with a larger cap or use score-only mode if an exact mask is "
+          "not required";
+    }
+    throw std::runtime_error(message);
+  }
+  return work;
+}
+
+inline void add_multisite_frontier_clade_work(
+    multisite_frontier_build_result& result,
+    multisite_frontier_clade_work_stats const& work) {
+  result.equality_deduplicated += work.equality_deduplicated;
+  result.bound_pruned += work.bound_pruned;
+  result.dominance_candidates_considered +=
+      work.dominance_candidates_considered;
+  result.dominance_pruned += work.dominance_pruned;
+}
+
+inline multisite_frontier_build_result
+build_multisite_frontiers_from_prepared_active(
+    chart_execution_plan const& plan, chart_options const& options,
+    multisite_frontier_build_options const& build_options,
+    std::string const& context,
+    std::vector<active_pattern_info> const* setup_active_patterns,
+    std::vector<active_pattern_info> owned_active_patterns,
+    std::uint64_t composite_lower_bound,
+    std::uint64_t invariant_constant_offset_value,
+    std::uint64_t initial_upper_bound_value) {
+  auto result = initialize_multisite_frontier_build(
+      plan, build_options, context, setup_active_patterns,
+      std::move(owned_active_patterns), composite_lower_bound,
+      invariant_constant_offset_value, initial_upper_bound_value);
+  auto const& active_patterns = result.active_pattern_view();
+  auto const pruning_upper_bound = build_options.upper_bound_override
+                                       ? *build_options.upper_bound_override
+                                       : result.initial_upper_bound;
+  auto const level_order = plan.bottom_up_level_order();
+  auto const level_offsets = plan.bottom_up_level_offsets();
+  for (std::size_t level = 0; level + 1 < level_offsets.size(); ++level) {
+    auto const started = std::chrono::steady_clock::now();
+    multisite_frontier_level_diagnostic diagnostic;
+    diagnostic.dependency_level = level;
+    for (std::size_t item = level_offsets[level];
+         item < level_offsets[level + 1]; ++item) {
+      auto const clade = level_order[item];
+      auto work = build_multisite_frontier_clade(
+          plan, options, build_options, context, active_patterns,
+          result.invariant_constant_offset, pruning_upper_bound, clade,
+          result.frontiers);
+      add_multisite_frontier_clade_work(result, work);
+      auto const frontier_size = result.frontiers[clade].size();
+      result.frontier_sizes_by_clade[clade] = frontier_size;
+      ++diagnostic.clades_processed;
+      if (!plan.clade(clade).is_leaf()) {
+        ++diagnostic.internal_clades_processed;
+      }
+      diagnostic.product_combinations += work.product_combinations;
+      diagnostic.output_frontier_entries += frontier_size;
+      diagnostic.maximum_clade_frontier_entries =
+          std::max(diagnostic.maximum_clade_frontier_entries, frontier_size);
+      diagnostic.equality_deduplicated += work.equality_deduplicated;
+      diagnostic.bound_pruned += work.bound_pruned;
+      diagnostic.dominance_candidates_considered +=
+          work.dominance_candidates_considered;
+      diagnostic.dominance_pruned += work.dominance_pruned;
+    }
+    diagnostic.wave_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    result.level_diagnostics.push_back(std::move(diagnostic));
+  }
+  return result;
+}
+
+inline chart_indexed_range_options multisite_frontier_clade_range_options() {
+  return chart_indexed_range_options{
+      .minimum_grain = 1,
+      .target_ranges_per_worker = 4,
+  };
+}
+
+inline multisite_frontier_build_result
+build_multisite_frontiers_from_prepared_active_scheduled(
+    chart_execution_plan const& plan, chart_options const& options,
+    multisite_frontier_build_options const& build_options,
+    std::string const& context,
+    std::vector<active_pattern_info> const* setup_active_patterns,
+    std::vector<active_pattern_info> owned_active_patterns,
+    std::uint64_t composite_lower_bound,
+    std::uint64_t invariant_constant_offset_value,
+    std::uint64_t initial_upper_bound_value, chart_scheduler& scheduler,
+    std::vector<chart_scheduler_run_summary>* clade_run_summaries = nullptr,
+    multisite_frontier_scheduler_test_hooks const* test_hooks = nullptr) {
+  auto result = initialize_multisite_frontier_build(
+      plan, build_options, context, setup_active_patterns,
+      std::move(owned_active_patterns), composite_lower_bound,
+      invariant_constant_offset_value, initial_upper_bound_value);
+  auto const& active_patterns = result.active_pattern_view();
+  auto const pruning_upper_bound = build_options.upper_bound_override
+                                       ? *build_options.upper_bound_override
+                                       : result.initial_upper_bound;
+  auto const level_order = plan.bottom_up_level_order();
+  auto const level_offsets = plan.bottom_up_level_offsets();
+  if (level_offsets.empty() || level_offsets.front() != 0 ||
+      level_offsets.back() != level_order.size()) {
+    throw std::runtime_error(context +
+                             ": invalid dependency-level execution plan");
+  }
+  auto const level_count = level_offsets.size() - 1;
+  if (clade_run_summaries != nullptr) {
+    if (level_count >
+        clade_run_summaries->max_size() - clade_run_summaries->size()) {
+      throw std::length_error("exact frontier scheduler summary overflow");
+    }
+    // Reserve before the first level.  Once a scheduler operation completes,
+    // publishing its summary cannot fail before a stable semantic exception is
+    // rethrown to the caller.
+    clade_run_summaries->reserve(clade_run_summaries->size() + level_count);
+  }
+  result.level_diagnostics.reserve(level_count);
+
+  std::vector<multisite_frontier_clade_work_stats> work_by_clade(
+      plan.clades().size());
+  std::vector<std::exception_ptr> errors_by_clade(plan.clades().size());
+  for (std::size_t level = 0; level < level_count; ++level) {
+    auto const wave_started = std::chrono::steady_clock::now();
+    auto const begin = level_offsets[level];
+    auto const end = level_offsets[level + 1];
+    auto const item_count = end - begin;
+    multisite_frontier_level_diagnostic diagnostic;
+    diagnostic.dependency_level = level;
+    auto run = scheduler.for_each_indexed_range(
+        item_count, multisite_frontier_clade_range_options(),
+        [&](chart_indexed_range const& range, std::size_t stable_slot,
+            chart_scheduler_cancellation_token const&) {
+          for (std::size_t item = range.begin; item < range.end; ++item) {
+            auto const clade = level_order[begin + item];
+            try {
+              if (test_hooks != nullptr && test_hooks->before_clade) {
+                test_hooks->before_clade(clade, level, stable_slot);
+              }
+              work_by_clade[clade] = build_multisite_frontier_clade(
+                  plan, options, build_options, context, active_patterns,
+                  result.invariant_constant_offset, pruning_upper_bound, clade,
+                  result.frontiers);
+              if (test_hooks != nullptr && test_hooks->after_clade) {
+                test_hooks->after_clade(clade, level, stable_slot);
+              }
+            } catch (...) {
+              errors_by_clade[clade] = std::current_exception();
+              break;
             }
           }
-          insert_or_merge_frontier_entry(
-              entries, index_by_cost, std::move(candidate),
-              result.equality_deduplicated,
-              build_options.max_provenance_choices_per_entry);
-        }
+        });
+    if (clade_run_summaries != nullptr) clade_run_summaries->push_back(run);
+
+    // The join above forms the complete dependency-level publication barrier.
+    // Select semantic failures exactly as W1 does: original bottom-up level
+    // order. Completion order can never select the reported exception.
+    for (std::size_t item = 0; item < item_count; ++item) {
+      auto const clade = level_order[begin + item];
+      if (errors_by_clade[clade]) {
+        std::rethrow_exception(errors_by_clade[clade]);
       }
     }
 
-    if (build_options.dominance_mode == multisite_dominance_mode::score_only) {
-      apply_score_only_dominance_pruning(entries,
-                                         result.dominance_candidates_considered,
-                                         result.dominance_pruned);
-    } else if (build_options.dominance_mode ==
-               multisite_dominance_mode::strict_mask_safe) {
-      apply_strict_mask_safe_dominance_pruning(
-          entries, clade, active_patterns, options,
-          result.dominance_candidates_considered, result.dominance_pruned);
-    }
-
-    if (build_options.max_frontier_entries_per_clade != 0 &&
-        entries.size() > build_options.max_frontier_entries_per_clade) {
-      std::string message = context +
-                            ": frontier entry cap exceeded for clade " +
-                            std::to_string(clade);
-      if (context.find("exact mask recovery pass") != std::string::npos) {
-        message +=
-            "; exact mask recovery pass exceeded the frontier cap; rerun "
-            "with a larger cap or use score-only mode if an exact mask is "
-            "not required";
+    // Publish/fold the complete level only after the clade wave has joined.
+    for (std::size_t item = 0; item < item_count; ++item) {
+      auto const clade = level_order[begin + item];
+      auto const& work = work_by_clade[clade];
+      add_multisite_frontier_clade_work(result, work);
+      auto const frontier_size = result.frontiers[clade].size();
+      result.frontier_sizes_by_clade[clade] = frontier_size;
+      ++diagnostic.clades_processed;
+      if (!plan.clade(clade).is_leaf()) {
+        ++diagnostic.internal_clades_processed;
       }
-      throw std::runtime_error(message);
+      diagnostic.product_combinations += work.product_combinations;
+      diagnostic.output_frontier_entries += frontier_size;
+      diagnostic.maximum_clade_frontier_entries =
+          std::max(diagnostic.maximum_clade_frontier_entries, frontier_size);
+      diagnostic.equality_deduplicated += work.equality_deduplicated;
+      diagnostic.bound_pruned += work.bound_pruned;
+      diagnostic.dominance_candidates_considered +=
+          work.dominance_candidates_considered;
+      diagnostic.dominance_pruned += work.dominance_pruned;
     }
-    result.frontier_sizes_by_clade[clade] = entries.size();
+    diagnostic.wave_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - wave_started)
+                             .count();
+    result.level_diagnostics.push_back(std::move(diagnostic));
   }
   return result;
 }
@@ -4430,6 +5058,20 @@ inline multisite_frontier_build_result build_multisite_frontiers_from_setup(
       plan, options, build_options, context, &setup.active_patterns, {},
       setup.composite_lower_bound, setup.invariant_constant_offset,
       setup.initial_upper_bound);
+}
+
+inline multisite_frontier_build_result build_multisite_frontiers_from_setup(
+    chart_execution_plan const& plan, multisite_exact_setup const& setup,
+    chart_options const& options,
+    multisite_frontier_build_options const& build_options,
+    std::string const& context, chart_scheduler& scheduler,
+    std::vector<chart_scheduler_run_summary>* clade_run_summaries = nullptr,
+    multisite_frontier_scheduler_test_hooks const* test_hooks = nullptr) {
+  validate_multisite_exact_setup(plan, setup, options, context);
+  return build_multisite_frontiers_from_prepared_active_scheduled(
+      plan, options, build_options, context, &setup.active_patterns, {},
+      setup.composite_lower_bound, setup.invariant_constant_offset,
+      setup.initial_upper_bound, scheduler, clade_run_summaries, test_hooks);
 }
 
 inline multisite_frontier_build_result build_multisite_frontiers(
@@ -4574,6 +5216,29 @@ inline void capture_optimal_root_provenance_classes(
   out.erase(std::unique(out.begin(), out.end()), out.end());
 }
 
+template <class Capture>
+inline void capture_optimal_root_provenance_for_trim(
+    multisite_trim_options const& trim_options, std::string const& context,
+    Capture&& capture) {
+  if (trim_options.force_optimal_root_provenance_capture_failure_for_tests) {
+    throw multisite_optimal_root_provenance_capture_error(
+        context + ": forced optimal-root provenance capture failure for test");
+  }
+  try {
+    std::invoke(std::forward<Capture>(capture));
+  } catch (std::bad_alloc const&) {
+    // Allocation failure is process/infrastructure failure, not a biological
+    // property of one candidate.  Preserve its standard type for the search's
+    // hard-error boundary.
+    throw;
+  } catch (multisite_optimal_root_provenance_capture_error const&) {
+    throw;
+  } catch (std::exception const& error) {
+    throw multisite_optimal_root_provenance_capture_error(
+        context + ": optimal-root provenance capture failed: " + error.what());
+  }
+}
+
 }  // namespace chart_multisite_detail
 
 inline multisite_bruteforce_result brute_force_multisite_topologies(
@@ -4605,6 +5270,29 @@ inline multisite_bruteforce_result brute_force_multisite_topologies(
 }
 
 namespace chart_multisite_detail {
+
+inline void append_multisite_frontier_diagnostics(
+    multisite_trim_result& result, multisite_frontier_build_result const& build,
+    multisite_frontier_pass_kind pass_kind, std::size_t pass_index) {
+  if (build.level_diagnostics.size() >
+      result.frontier_level_diagnostics.max_size() -
+          result.frontier_level_diagnostics.size()) {
+    throw std::length_error("multi-site frontier diagnostic overflow");
+  }
+  result.frontier_level_diagnostics.reserve(
+      result.frontier_level_diagnostics.size() +
+      build.level_diagnostics.size());
+  for (auto diagnostic : build.level_diagnostics) {
+    diagnostic.pass_kind = pass_kind;
+    diagnostic.pass_index = pass_index;
+    ++result.exact_bnb_levels;
+    result.exact_bnb_clades += diagnostic.clades_processed;
+    result.exact_bnb_product_combinations += diagnostic.product_combinations;
+    result.exact_bnb_frontier_entries += diagnostic.output_frontier_entries;
+    result.exact_bnb_ms += diagnostic.wave_ms;
+    result.frontier_level_diagnostics.push_back(std::move(diagnostic));
+  }
+}
 
 template <class BuildFrontiers>
 inline multisite_trim_result build_multisite_trim_impl(
@@ -4673,6 +5361,11 @@ inline multisite_trim_result build_multisite_trim_impl(
         trim_options.max_frontier_entries_per_clade;
     auto mask_build = build_frontiers(
         mask_build_options, "multi-site trim exact mask recovery pass");
+    append_multisite_frontier_diagnostics(
+        result, score_build, multisite_frontier_pass_kind::score_only, 0);
+    append_multisite_frontier_diagnostics(
+        result, mask_build, multisite_frontier_pass_kind::exact_mask_recovery,
+        1);
 
     auto recovered_optimum = compute_root_frontier_optimum_and_update_mask(
         grammar, options, mask_build, true, result.keep_production,
@@ -4682,10 +5375,13 @@ inline multisite_trim_result build_multisite_trim_impl(
     validate_known_exact_optimum(recovered_optimum, recovery_validation_options,
                                  "multi-site trim exact mask recovery pass");
     if (trim_options.capture_optimal_root_provenance) {
-      capture_optimal_root_provenance_classes(
-          grammar, options, mask_build, recovered_optimum,
-          result.optimal_root_provenance_classes,
-          "multi-site trim exact mask recovery pass");
+      capture_optimal_root_provenance_for_trim(
+          trim_options, "multi-site trim exact mask recovery pass", [&] {
+            capture_optimal_root_provenance_classes(
+                grammar, options, mask_build, recovered_optimum,
+                result.optimal_root_provenance_classes,
+                "multi-site trim exact mask recovery pass");
+          });
     }
 
     result.composite_lower_bound = score_build.composite_lower_bound;
@@ -4715,6 +5411,8 @@ inline multisite_trim_result build_multisite_trim_impl(
   build_options.max_frontier_entries_per_clade =
       trim_options.max_frontier_entries_per_clade;
   auto build = build_frontiers(build_options, "multi-site trim");
+  append_multisite_frontier_diagnostics(result, build,
+                                        multisite_frontier_pass_kind::exact, 0);
 
   result.composite_lower_bound = build.composite_lower_bound;
   result.initial_upper_bound = build.initial_upper_bound;
@@ -4740,9 +5438,12 @@ inline multisite_trim_result build_multisite_trim_impl(
       result.keep_production, "multi-site trim");
   validate_known_exact_optimum(result.optimum, trim_options, "multi-site trim");
   if (trim_options.capture_optimal_root_provenance) {
-    capture_optimal_root_provenance_classes(
-        grammar, options, build, result.optimum,
-        result.optimal_root_provenance_classes, "multi-site trim");
+    capture_optimal_root_provenance_for_trim(
+        trim_options, "multi-site trim", [&] {
+          capture_optimal_root_provenance_classes(
+              grammar, options, build, result.optimum,
+              result.optimal_root_provenance_classes, "multi-site trim");
+        });
   }
   result.dominance_pruned =
       result.dominance_pruned_score_pass + result.dominance_pruned_mask_pass;
@@ -4811,6 +5512,11 @@ inline multisite_trim_result build_multisite_trim_impl(
         trim_options.max_frontier_entries_per_clade;
     auto mask_build = build_frontiers(
         mask_build_options, "multi-site trim exact mask recovery pass");
+    append_multisite_frontier_diagnostics(
+        result, score_build, multisite_frontier_pass_kind::score_only, 0);
+    append_multisite_frontier_diagnostics(
+        result, mask_build, multisite_frontier_pass_kind::exact_mask_recovery,
+        1);
 
     auto recovered_optimum = compute_root_frontier_optimum_and_update_mask(
         plan, options, mask_build, true, result.keep_production,
@@ -4820,10 +5526,13 @@ inline multisite_trim_result build_multisite_trim_impl(
     validate_known_exact_optimum(recovered_optimum, recovery_validation_options,
                                  "multi-site trim exact mask recovery pass");
     if (trim_options.capture_optimal_root_provenance) {
-      capture_optimal_root_provenance_classes(
-          plan, options, mask_build, recovered_optimum,
-          result.optimal_root_provenance_classes,
-          "multi-site trim exact mask recovery pass");
+      capture_optimal_root_provenance_for_trim(
+          trim_options, "multi-site trim exact mask recovery pass", [&] {
+            capture_optimal_root_provenance_classes(
+                plan, options, mask_build, recovered_optimum,
+                result.optimal_root_provenance_classes,
+                "multi-site trim exact mask recovery pass");
+          });
     }
 
     result.composite_lower_bound = score_build.composite_lower_bound;
@@ -4853,6 +5562,8 @@ inline multisite_trim_result build_multisite_trim_impl(
   build_options.max_frontier_entries_per_clade =
       trim_options.max_frontier_entries_per_clade;
   auto build = build_frontiers(build_options, "multi-site trim");
+  append_multisite_frontier_diagnostics(result, build,
+                                        multisite_frontier_pass_kind::exact, 0);
 
   result.composite_lower_bound = build.composite_lower_bound;
   result.initial_upper_bound = build.initial_upper_bound;
@@ -4878,9 +5589,12 @@ inline multisite_trim_result build_multisite_trim_impl(
       result.keep_production, "multi-site trim");
   validate_known_exact_optimum(result.optimum, trim_options, "multi-site trim");
   if (trim_options.capture_optimal_root_provenance) {
-    capture_optimal_root_provenance_classes(
-        plan, options, build, result.optimum,
-        result.optimal_root_provenance_classes, "multi-site trim");
+    capture_optimal_root_provenance_for_trim(
+        trim_options, "multi-site trim", [&] {
+          capture_optimal_root_provenance_classes(
+              plan, options, build, result.optimum,
+              result.optimal_root_provenance_classes, "multi-site trim");
+        });
   }
   result.dominance_pruned =
       result.dominance_pruned_score_pass + result.dominance_pruned_mask_pass;
@@ -4888,6 +5602,9 @@ inline multisite_trim_result build_multisite_trim_impl(
 }
 
 }  // namespace chart_multisite_detail
+
+using multisite_trim_scheduler_run_summaries =
+    chart_multisite_detail::multisite_trim_scheduler_run_summaries;
 
 inline multisite_trim_result build_multisite_trim_from_exact_setup(
     clade_grammar const& grammar, multisite_exact_setup const& setup,
@@ -4906,6 +5623,32 @@ inline multisite_trim_result build_multisite_trim_from_exact_setup(
         ++frontier_passes;
         return chart_multisite_detail::build_multisite_frontiers_from_setup(
             grammar, setup, options, build_options, context);
+      });
+  result.exact_setup_work = setup.work;
+  result.exact_setup_work.frontier_passes = frontier_passes;
+  return result;
+}
+
+inline multisite_trim_result build_multisite_trim_from_exact_setup(
+    chart_execution_plan const& plan, multisite_exact_setup const& setup,
+    chart_scheduler& scheduler, chart_options const& options = {},
+    multisite_trim_options const& trim_options = {},
+    multisite_trim_scheduler_run_summaries* run_summaries = nullptr) {
+  chart_multisite_detail::validate_multisite_exact_setup(plan, setup, options,
+                                                         "multi-site trim");
+  site_pattern_set validation_shell;
+  validation_shell.taxon_count = setup.taxon_count;
+  std::size_t frontier_passes = 0;
+  auto result = chart_multisite_detail::build_multisite_trim_impl(
+      plan, validation_shell, options, trim_options,
+      [&](chart_multisite_detail::multisite_frontier_build_options const&
+              build_options,
+          std::string const& context) {
+        ++frontier_passes;
+        return chart_multisite_detail::build_multisite_frontiers_from_setup(
+            plan, setup, options, build_options, context, scheduler,
+            run_summaries == nullptr ? nullptr
+                                     : &run_summaries->frontier_clades);
       });
   result.exact_setup_work = setup.work;
   result.exact_setup_work.frontier_passes = frontier_passes;
@@ -4957,6 +5700,21 @@ inline multisite_trim_result build_multisite_trim(
   auto setup = build_multisite_exact_setup(plan, patterns, options);
   return build_multisite_trim_from_exact_setup(plan, setup, options,
                                                trim_options);
+}
+
+inline multisite_trim_result build_multisite_trim(
+    chart_execution_plan const& plan, site_pattern_set const& patterns,
+    chart_scheduler& scheduler, chart_options const& options = {},
+    multisite_trim_options const& trim_options = {},
+    multisite_trim_scheduler_run_summaries* run_summaries = nullptr) {
+  chart_multisite_detail::validate_multisite_inputs(plan, patterns, options);
+  chart_multisite_detail::validate_multisite_trim_options_supported(
+      trim_options, "multi-site trim", true);
+  auto setup = build_multisite_exact_setup(
+      plan, patterns, scheduler, options,
+      run_summaries == nullptr ? nullptr : &run_summaries->exact_setup);
+  return build_multisite_trim_from_exact_setup(plan, setup, scheduler, options,
+                                               trim_options, run_summaries);
 }
 
 inline std::uint64_t score_selected_topology(

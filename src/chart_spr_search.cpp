@@ -585,6 +585,13 @@ void chart_spr_add_search_state_rebuild_counters(
       rebuild_counters.exact_setup_upper_bound_topologies_unique;
   accumulated.exact_setup_frontier_passes +=
       rebuild_counters.exact_setup_frontier_passes;
+  accumulated.exact_bnb_levels += rebuild_counters.exact_bnb_levels;
+  accumulated.exact_bnb_clades += rebuild_counters.exact_bnb_clades;
+  accumulated.exact_bnb_product_combinations +=
+      rebuild_counters.exact_bnb_product_combinations;
+  accumulated.exact_bnb_frontier_entries +=
+      rebuild_counters.exact_bnb_frontier_entries;
+  accumulated.exact_bnb_ms += rebuild_counters.exact_bnb_ms;
   accumulated.exact_trim_lazy_chart_uses +=
       rebuild_counters.exact_trim_lazy_chart_uses;
   accumulated.outside_cache_inside_charts_built +=
@@ -3042,11 +3049,10 @@ chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
 // transient count is recorded as a fallback.
 chart_spr_candidate_score
 chart_spr_verify_candidate_exact_multisite_from_transient_extension(
-    chart_spr_local_commit_substrate& sub,
-    chart_spr_search_state const& state,
+    chart_spr_local_commit_substrate& sub, chart_spr_search_state const& state,
     chart_spr_candidate_score candidate,
     checked_chart_execution_plan_ref const& checked_state,
-    multisite_trim_options const& trim_options) {
+    chart_scheduler& scheduler, multisite_trim_options const& trim_options) {
   if (!candidate.valid) return candidate;
 
   chart_spr_transient_extension ext;
@@ -3065,7 +3071,7 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
     // hard correctness failure and is rethrown.
     if (chart_spr_is_local_commit_tombstone_scope_rejection(e.what())) {
       return verify_candidate_exact_against_state(
-          state, std::move(candidate), checked_state, trim_options);
+          state, std::move(candidate), checked_state, scheduler, trim_options);
     }
     throw;
   }
@@ -3076,22 +3082,33 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
   ++state.counters.exact_verifications;
   ++state.counters.transient_chain_extensions_for_verification;
   multisite_trim_result new_trim;
+  multisite_trim_scheduler_run_summaries scheduler_runs;
+  chart_spr_scheduler_run_axis_publisher publish_setup_runs{
+      state.counters.scheduler_axes.exact_setup_patterns,
+      scheduler_runs.exact_setup};
+  chart_spr_scheduler_run_axis_publisher publish_frontier_runs{
+      state.counters.scheduler_axes.exact_frontier_clades,
+      scheduler_runs.frontier_clades};
   std::uint64_t authoritative_new_optimum = multisite_score_inf;
   try {
     // Old score: the current tip's exact optimum (cached in state, lazily
     // built).  Same source the cold path reads.
-    auto const& old_trim =
-        ensure_chart_spr_state_exact_trim(state, checked_state, trim_options);
+    auto const& old_trim = ensure_chart_spr_state_exact_trim(
+        state, checked_state, scheduler, trim_options);
 
     // New score: B&B exact optimum of the extended grammar.
-    new_trim =
-        state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart
-            ? build_lazy_multisite_trim_active_from_scratch(
-                  ext.planned, state.active_patterns, state.chart_opts,
-                  trim_options)
-            : build_multisite_trim_active(ext.planned.execution_plan,
-                                          state.active_patterns,
-                                          state.chart_opts, trim_options);
+    if (state.cache_strategy ==
+        chart_spr_cache_strategy::lazy_multisite_chart) {
+      chart_spr_force_candidate_exact_bnb_overflow_for_tests(candidate);
+      new_trim = build_lazy_multisite_trim_active_from_scratch(
+          ext.planned, state.active_patterns, state.chart_opts, trim_options);
+    } else {
+      state.active_patterns.assert_no_skipped_invariant_metadata();
+      chart_spr_force_candidate_exact_bnb_overflow_for_tests(candidate);
+      new_trim = build_multisite_trim(
+          ext.planned.execution_plan, state.active_patterns.patterns, scheduler,
+          state.chart_opts, trim_options, &scheduler_runs);
+    }
     if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
       ++state.counters.exact_trim_lazy_chart_uses;
     }
@@ -3159,6 +3176,20 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
         chart_spr_score_kind::grammar_exact,
         chart_spr_score_convention::full_with_invariants,
         state.invariant_constant_offset);
+  } catch (chart_scheduler_submit_error const&) {
+    throw;
+  } catch (multisite_optimal_root_provenance_capture_error const&) {
+    throw;
+  } catch (std::bad_alloc const&) {
+    throw;
+  } catch (std::overflow_error const&) {
+    // Score/size arithmetic overflow invalidates the computation, not one
+    // candidate.  Never turn it into an ordinary invalid-candidate outcome.
+    throw;
+  } catch (std::logic_error const&) {
+    // Scheduler lifecycle/concurrent-use and other invariant failures are hard
+    // errors, not properties that can invalidate one biological candidate.
+    throw;
   } catch (std::exception const& e) {
     candidate.valid = false;
     candidate.invalid_reason = e.what();
@@ -4172,6 +4203,12 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.exact_setup_upper_bound_topologies_unique;
   summary.exact_setup_frontier_passes =
       counters.exact_setup_frontier_passes;
+  summary.exact_bnb_levels = counters.exact_bnb_levels;
+  summary.exact_bnb_clades = counters.exact_bnb_clades;
+  summary.exact_bnb_product_combinations =
+      counters.exact_bnb_product_combinations;
+  summary.exact_bnb_frontier_entries = counters.exact_bnb_frontier_entries;
+  summary.exact_bnb_ms = counters.exact_bnb_ms;
   summary.exact_trim_lazy_chart_uses = counters.exact_trim_lazy_chart_uses;
   summary.outside_cache_inside_charts_built =
       counters.outside_cache_inside_charts_built;
@@ -4394,6 +4431,7 @@ fixed_topology_selected_cache_pattern_scores_for_tests(
 chart_spr_search_result run_chart_spr_search(
     phylo_dag initial_dag, clade_grammar initial_grammar,
     chart_spr_search_options options) {
+  configure_chart_spr_primary_exact_provenance(options);
   validate_chart_spr_search_loop_options(options);
 
   auto total_start = std::chrono::steady_clock::now();
@@ -4677,15 +4715,20 @@ chart_spr_search_result run_chart_spr_search(
     // verification-mode choice the Phase-10 report surfaces.
     if (options.verification_mode ==
         chart_spr_verification_mode::transient) {
-      state.exact_multisite_verifier =
-          [substrate_ptr](chart_spr_search_state const& verifier_state,
-                          chart_spr_candidate_score candidate,
-                          checked_chart_execution_plan_ref const& checked_state,
-                          multisite_trim_options const& trim_options) {
-            return chart_spr_verify_candidate_exact_multisite_from_transient_extension(
-                *substrate_ptr, verifier_state, std::move(candidate),
-                checked_state, trim_options);
-          };
+      state
+          .exact_multisite_verifier = [substrate_ptr](
+                                          chart_spr_search_state const&
+                                              verifier_state,
+                                          chart_spr_candidate_score candidate,
+                                          checked_chart_execution_plan_ref const&
+                                              checked_state,
+                                          chart_scheduler& verifier_scheduler,
+                                          multisite_trim_options const&
+                                              trim_options) {
+        return chart_spr_verify_candidate_exact_multisite_from_transient_extension(
+            *substrate_ptr, verifier_state, std::move(candidate), checked_state,
+            verifier_scheduler, trim_options);
+      };
     }
   }
 
@@ -4961,6 +5004,20 @@ chart_spr_search_result run_chart_spr_search(
       // must not be converted into a nominally successful search whose global
       // metrics cannot be classified by semantic axis.
       throw;
+    } catch (multisite_optimal_root_provenance_capture_error const&) {
+      // Primary-trim root provenance remains report-only.  A capture failure
+      // cannot reject an otherwise accepted candidate during state rebuild.
+      throw;
+    } catch (std::bad_alloc const&) {
+      throw;
+    } catch (std::overflow_error const&) {
+      // Rebuilding an accepted exact state is an integrity computation.  An
+      // arithmetic overflow cannot be downgraded to an ordinary biological
+      // post-materialization rejection.
+      throw;
+    } catch (std::logic_error const&) {
+      // Scheduler lifecycle/concurrent-use and invariant failures are hard.
+      throw;
     } catch (chart_spr_cache_budget_error const&) {
       throw;
     } catch (chart_spr_local_commit_hard_error const&) {
@@ -5220,11 +5277,16 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.scheduler = scheduler.metrics();
   auto const& scheduler_metrics = result.summary.scheduler;
   auto const& axes = state.counters.scheduler_axes;
-  std::array<chart_spr_scheduler_axis_metrics const*, 8> axis_list{
-      &axes.initial_chart_patterns,         &axes.exact_setup_patterns,
-      &axes.inside_cache_patterns,          &axes.outside_cache_patterns,
-      &axes.fixed_topology_patterns,        &axes.local_score_candidates,
-      &axes.local_score_candidate_patterns, &axes.other,
+  std::array<chart_spr_scheduler_axis_metrics const*, 9> axis_list{
+      &axes.initial_chart_patterns,
+      &axes.exact_setup_patterns,
+      &axes.exact_frontier_clades,
+      &axes.inside_cache_patterns,
+      &axes.outside_cache_patterns,
+      &axes.fixed_topology_patterns,
+      &axes.local_score_candidates,
+      &axes.local_score_candidate_patterns,
+      &axes.other,
   };
   std::uint64_t axis_operations = 0;
   std::uint64_t axis_parallel_operations = 0;

@@ -8,7 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <barrier>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -35,6 +36,43 @@
   do {                                                 \
     if (!(expr)) test_fail(#expr, __FILE__, __LINE__); \
   } while (false)
+
+// A cyclic rendezvous for overlap/failure tests that turns lost concurrency
+// into a bounded diagnostic instead of hanging the test process forever.
+class timed_test_rendezvous {
+ public:
+  explicit timed_test_rendezvous(std::size_t parties) : parties_(parties) {
+    CHECK(parties_ != 0);
+  }
+
+  void arrive_and_wait() {
+    std::unique_lock lock{mutex_};
+    if (failed_) throw std::runtime_error("timed test rendezvous failed");
+    auto const generation = generation_;
+    if (++arrived_ == parties_) {
+      arrived_ = 0;
+      ++generation_;
+      condition_.notify_all();
+      return;
+    }
+    if (!condition_.wait_for(lock, std::chrono::seconds{10}, [&] {
+          return failed_ || generation_ != generation;
+        })) {
+      failed_ = true;
+      condition_.notify_all();
+      throw std::runtime_error("timed test rendezvous timeout");
+    }
+    if (failed_) throw std::runtime_error("timed test rendezvous failed");
+  }
+
+ private:
+  std::size_t parties_ = 0;
+  std::size_t arrived_ = 0;
+  std::size_t generation_ = 0;
+  bool failed_ = false;
+  std::mutex mutex_;
+  std::condition_variable condition_;
+};
 
 static larch::test::tiny_tree_node paper_tree1_spec() {
   using larch::test::tiny_inner;
@@ -342,6 +380,36 @@ static void check_multisite_trim_results_equal(
         checked.optimal_root_provenance_classes);
   if (compare_exact_setup_work) {
     CHECK(planned.exact_setup_work == checked.exact_setup_work);
+  }
+  if (!checked.frontier_level_diagnostics.empty() &&
+      !planned.frontier_level_diagnostics.empty()) {
+    CHECK(planned.exact_bnb_levels == checked.exact_bnb_levels);
+    CHECK(planned.exact_bnb_clades == checked.exact_bnb_clades);
+    CHECK(planned.exact_bnb_product_combinations ==
+          checked.exact_bnb_product_combinations);
+    CHECK(planned.exact_bnb_frontier_entries ==
+          checked.exact_bnb_frontier_entries);
+    CHECK(planned.frontier_level_diagnostics.size() ==
+          checked.frontier_level_diagnostics.size());
+    for (std::size_t index = 0;
+         index < checked.frontier_level_diagnostics.size(); ++index) {
+      auto const& lhs = checked.frontier_level_diagnostics[index];
+      auto const& rhs = planned.frontier_level_diagnostics[index];
+      CHECK(rhs.pass_kind == lhs.pass_kind);
+      CHECK(rhs.pass_index == lhs.pass_index);
+      CHECK(rhs.dependency_level == lhs.dependency_level);
+      CHECK(rhs.clades_processed == lhs.clades_processed);
+      CHECK(rhs.internal_clades_processed == lhs.internal_clades_processed);
+      CHECK(rhs.product_combinations == lhs.product_combinations);
+      CHECK(rhs.output_frontier_entries == lhs.output_frontier_entries);
+      CHECK(rhs.maximum_clade_frontier_entries ==
+            lhs.maximum_clade_frontier_entries);
+      CHECK(rhs.equality_deduplicated == lhs.equality_deduplicated);
+      CHECK(rhs.bound_pruned == lhs.bound_pruned);
+      CHECK(rhs.dominance_candidates_considered ==
+            lhs.dominance_candidates_considered);
+      CHECK(rhs.dominance_pruned == lhs.dominance_pruned);
+    }
   }
 }
 
@@ -684,6 +752,82 @@ static void test_paper_counterexample_outside_trim_and_traceback() {
 
   compare_outside_and_mask_to_bruteforce(grammar, states2, chart2, outside2,
                                          mask2);
+
+  std::println("  PASS");
+}
+
+static void test_plan_deterministic_traceback_fast_path_matches_exhaustive() {
+  std::println(
+      "test_plan_deterministic_traceback_fast_path_matches_exhaustive");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", paper_tree1_spec()));
+  trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", paper_tree2_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto plan = larch::build_chart_execution_plan(grammar);
+
+  auto check_equal = [](larch::chart_traceback_result const& expected,
+                        larch::chart_traceback_result const& actual) {
+    CHECK(actual.score == expected.score);
+    CHECK(actual.root_state_by_clade == expected.root_state_by_clade);
+    CHECK(actual.productions == expected.productions);
+  };
+  auto choose_first = [](std::size_t size) -> std::size_t {
+    if (size == 0) throw std::runtime_error("test empty choice set");
+    return 0;
+  };
+
+  for (auto position :
+       {larch::mutation_position{1}, larch::mutation_position{2}}) {
+    auto states = larch::extract_leaf_site_states(merged, grammar, position);
+    for (bool keep_trace : {false, true}) {
+      for (bool score_ua_edge : {false, true}) {
+        larch::chart_options options;
+        options.keep_trace = keep_trace;
+        options.score_ua_edge = score_ua_edge;
+        auto grammar_chart =
+            larch::build_single_site_chart(grammar, states, options);
+        auto plan_chart = larch::build_single_site_chart(
+            plan, larch::view_leaf_site_states(states), options);
+
+        auto check_boundary = [&](std::uint8_t reference_state) {
+          auto grammar_outside =
+              score_ua_edge
+                  ? larch::build_single_site_outside_chart(
+                        grammar, grammar_chart, options, reference_state)
+                  : larch::build_single_site_outside_chart(
+                        grammar, grammar_chart, options);
+          auto plan_outside =
+              score_ua_edge ? larch::build_single_site_outside_chart(
+                                  plan, plan_chart, options, reference_state)
+                            : larch::build_single_site_outside_chart(
+                                  plan, plan_chart, options);
+          auto grammar_oracle =
+              larch::deterministic_optimal_single_site_traceback(
+                  grammar, grammar_chart, grammar_outside);
+          auto exhaustive_plan =
+              larch::chart_trim_detail::optimal_single_site_traceback_impl(
+                  plan, plan_chart, plan_outside, choose_first);
+          auto fast_plan = larch::deterministic_optimal_single_site_traceback(
+              plan, plan_chart, plan_outside);
+          check_equal(grammar_oracle, exhaustive_plan);
+          check_equal(exhaustive_plan, fast_plan);
+        };
+
+        if (score_ua_edge) {
+          for (std::uint8_t reference_state = 0;
+               reference_state < larch::nuc_state_count; ++reference_state) {
+            check_boundary(reference_state);
+          }
+        } else {
+          check_boundary(0);
+        }
+      }
+    }
+  }
 
   std::println("  PASS");
 }
@@ -2178,6 +2322,72 @@ static void test_multisite_exact_setup_cold_resident_and_lifetime() {
   std::println("  PASS");
 }
 
+static void test_unique_topology_exact_setup_fast_path() {
+  std::println("test_unique_topology_exact_setup_fast_path");
+
+  auto tree = larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree1_with_invariant_spec());
+  auto grammar = larch::build_clade_grammar(tree);
+  auto plan = larch::build_chart_execution_plan(grammar);
+  auto patterns = larch::build_site_patterns(tree, grammar);
+  CHECK(patterns.patterns.size() >= 2);
+  CHECK(
+      larch::chart_multisite_detail::exact_setup_has_unique_reachable_topology(
+          grammar));
+  CHECK(
+      larch::chart_multisite_detail::exact_setup_has_unique_reachable_topology(
+          plan));
+
+  for (bool score_ua_edge : {false, true}) {
+    larch::chart_options options;
+    options.score_ua_edge = score_ua_edge;
+    auto serial = larch::build_multisite_exact_setup(plan, patterns, options);
+    CHECK(serial.work.setup_builds == 1);
+    CHECK(serial.work.upper_bound_topologies_generated == 1);
+    CHECK(serial.work.upper_bound_topologies_unique == 1);
+    CHECK(serial.initial_upper_bound == serial.composite_lower_bound);
+
+    auto sole_topology = larch::chart_multisite_detail::first_topology(plan);
+    auto direct_score = larch::chart_multisite_detail::score_selected_topology(
+        plan, patterns, sole_topology, options);
+    CHECK(direct_score == serial.initial_upper_bound);
+    auto brute =
+        larch::brute_force_multisite_topologies(grammar, patterns, options);
+    CHECK(brute.topology_count == 1);
+    CHECK(brute.optimum == serial.initial_upper_bound);
+
+    larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+        .requested_workers = 4,
+        .default_minimum_grain = 1,
+        .default_target_ranges_per_worker = 4,
+    }};
+    std::vector<larch::chart_scheduler_run_summary> setup_runs;
+    auto scheduled = larch::build_multisite_exact_setup(
+        plan, patterns, scheduler, options, &setup_runs);
+    CHECK(scheduled.composite_lower_bound == serial.composite_lower_bound);
+    CHECK(scheduled.initial_upper_bound == serial.initial_upper_bound);
+    CHECK(scheduled.work == serial.work);
+    CHECK(scheduled.active_patterns.size() == serial.active_patterns.size());
+    CHECK(setup_runs.size() == 1);
+    CHECK(setup_runs.front().item_count == scheduled.active_patterns.size());
+    CHECK(scheduler.metrics().operations == 1);
+
+    auto serial_trim =
+        larch::build_multisite_trim_from_exact_setup(plan, serial, options);
+    larch::multisite_trim_scheduler_run_summaries frontier_runs;
+    auto scheduled_trim = larch::build_multisite_trim_from_exact_setup(
+        plan, scheduled, scheduler, options, {}, &frontier_runs);
+    check_multisite_trim_results_equal(serial_trim, scheduled_trim);
+    CHECK(serial_trim.optimum == brute.optimum);
+    CHECK(serial_trim.keep_production == brute.keep_production);
+    scheduler.shutdown();
+    CHECK(scheduler.metrics().pending_tasks == 0);
+    CHECK(scheduler.metrics().live_pool_threads == 0);
+  }
+
+  std::println("  PASS");
+}
+
 static void test_scheduled_multisite_exact_setup_and_topology_scoring() {
   std::println("test_scheduled_multisite_exact_setup_and_topology_scoring");
 
@@ -2307,7 +2517,7 @@ static void test_scheduled_multisite_exact_setup_and_topology_scoring() {
       patterns.patterns.size());
   std::array<std::atomic<std::size_t>, 4> first_call_by_slot{};
   std::vector<larch::single_site_chart> scratch_by_slot(4);
-  std::barrier overlap{4};
+  timed_test_rendezvous overlap{4};
   std::mutex overlap_mutex;
   std::set<std::thread::id> overlap_threads;
   auto scheduled_four = larch::build_multisite_exact_setup_from_resident_inside(
@@ -2345,7 +2555,7 @@ static void test_scheduled_multisite_exact_setup_and_topology_scoring() {
 
   auto metrics_before_failure = four_workers.metrics();
   std::array<std::atomic<std::size_t>, 4> failure_first_by_slot{};
-  std::barrier failure_overlap{4};
+  timed_test_rendezvous failure_overlap{4};
   bool failed = false;
   try {
     (void)larch::build_multisite_exact_setup_from_resident_inside(
@@ -2399,6 +2609,252 @@ static void test_scheduled_multisite_exact_setup_and_topology_scoring() {
   four_workers.shutdown();
   CHECK(four_workers.metrics().pool_lifetimes_stopped == 1);
   CHECK(four_workers.metrics().live_pool_threads == 0);
+
+  std::println("  PASS");
+}
+
+static void test_scheduled_multisite_frontier_wavefronts() {
+  std::println("test_scheduled_multisite_frontier_wavefronts");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree1_with_invariant_spec()));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree2_with_invariant_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto plan = larch::build_chart_execution_plan(grammar);
+  larch::site_pattern_options pattern_options;
+  pattern_options.skip_invariant_sites = true;
+  auto patterns = larch::build_site_patterns(merged, grammar, pattern_options);
+  auto const level_offsets = plan.bottom_up_level_offsets();
+  auto const level_order = plan.bottom_up_level_order();
+  CHECK(level_offsets.size() >= 3);
+  CHECK(level_offsets.front() == 0);
+  CHECK(level_offsets.back() == level_order.size());
+  auto const level_count = level_offsets.size() - 1;
+  CHECK(level_offsets[1] - level_offsets[0] >= 4);
+
+  for (bool score_ua_edge : {false, true}) {
+    larch::chart_options chart_options;
+    chart_options.score_ua_edge = score_ua_edge;
+    for (auto dominance_mode :
+         {larch::multisite_dominance_mode::off,
+          larch::multisite_dominance_mode::score_only,
+          larch::multisite_dominance_mode::strict_mask_safe,
+          larch::multisite_dominance_mode::two_pass_exact_mask}) {
+      for (bool use_bound_pruning : {false, true}) {
+        larch::multisite_trim_options trim_options;
+        trim_options.dominance_mode = dominance_mode;
+        trim_options.use_bound_pruning = use_bound_pruning;
+        trim_options.require_exact_keep_mask =
+            dominance_mode != larch::multisite_dominance_mode::score_only;
+        trim_options.capture_optimal_root_provenance =
+            trim_options.require_exact_keep_mask;
+        auto const frontier_passes =
+            dominance_mode ==
+                    larch::multisite_dominance_mode::two_pass_exact_mask
+                ? std::size_t{2}
+                : std::size_t{1};
+
+        auto oracle = larch::build_multisite_trim(grammar, patterns,
+                                                  chart_options, trim_options);
+
+        larch::chart_scheduler one_worker{larch::chart_scheduler_options{
+            .requested_workers = 1,
+            .default_minimum_grain = 1,
+            .default_target_ranges_per_worker = 4,
+        }};
+        larch::multisite_trim_scheduler_run_summaries one_runs;
+        auto scheduled_one = larch::build_multisite_trim(
+            plan, patterns, one_worker, chart_options, trim_options, &one_runs);
+        check_multisite_trim_results_equal(oracle, scheduled_one);
+        CHECK(one_runs.frontier_clades.size() == frontier_passes * level_count);
+        CHECK(std::all_of(one_runs.frontier_clades.begin(),
+                          one_runs.frontier_clades.end(), [](auto const& run) {
+                            return !run.used_parallel_workers() &&
+                                   run.ranges_completed == run.range_count;
+                          }));
+        CHECK(one_worker.metrics().pending_tasks == 0);
+        one_worker.shutdown();
+
+        larch::chart_scheduler eight_workers{larch::chart_scheduler_options{
+            .requested_workers = 8,
+            .default_minimum_grain = 1,
+            .default_target_ranges_per_worker = 4,
+        }};
+        larch::multisite_trim_scheduler_run_summaries eight_runs;
+        auto scheduled_eight = larch::build_multisite_trim(
+            plan, patterns, eight_workers, chart_options, trim_options,
+            &eight_runs);
+        check_multisite_trim_results_equal(oracle, scheduled_eight);
+        check_multisite_trim_results_equal(scheduled_one, scheduled_eight);
+        CHECK(eight_runs.frontier_clades.size() ==
+              frontier_passes * level_count);
+        CHECK(std::all_of(eight_runs.frontier_clades.begin(),
+                          eight_runs.frontier_clades.end(),
+                          [](auto const& run) {
+                            return run.ranges_completed == run.range_count;
+                          }));
+        CHECK(eight_workers.metrics().pending_tasks == 0);
+        eight_workers.shutdown();
+      }
+    }
+  }
+
+  // Exercise the actual level barrier with four overlapping leaf tasks.  Every
+  // later clade checks that all of its children were published by an earlier
+  // completed scheduler operation before its kernel starts.
+  larch::chart_options chart_options;
+  auto setup =
+      larch::build_multisite_exact_setup(plan, patterns, chart_options);
+  larch::chart_scheduler overlap_scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  std::vector<std::atomic<bool>> published(plan.clades().size());
+  std::array<std::atomic<std::size_t>, 4> calls_by_slot{};
+  timed_test_rendezvous overlap{4};
+  std::mutex overlap_mutex;
+  std::set<std::thread::id> overlap_threads;
+  larch::chart_multisite_detail::multisite_frontier_scheduler_test_hooks hooks;
+  hooks.before_clade = [&](larch::clade_id clade, std::size_t level,
+                           std::size_t stable_slot) {
+    CHECK(level == plan.clade(clade).dependency_level);
+    for (auto pid : plan.productions_for_parent(clade)) {
+      for (auto child : plan.children(pid)) {
+        CHECK(published[child].load(std::memory_order_acquire));
+      }
+    }
+    CHECK(stable_slot < calls_by_slot.size());
+    if (level == 0 && calls_by_slot[stable_slot].fetch_add(
+                          1, std::memory_order_relaxed) == 0) {
+      {
+        std::lock_guard lock{overlap_mutex};
+        overlap_threads.insert(std::this_thread::get_id());
+      }
+      overlap.arrive_and_wait();
+    }
+  };
+  hooks.after_clade = [&](larch::clade_id clade, std::size_t, std::size_t) {
+    published[clade].store(true, std::memory_order_release);
+  };
+  larch::chart_multisite_detail::multisite_frontier_build_options build_options;
+  std::vector<larch::chart_scheduler_run_summary> overlap_runs;
+  auto overlap_build =
+      larch::chart_multisite_detail::build_multisite_frontiers_from_setup(
+          plan, setup, chart_options, build_options,
+          "scheduled frontier dependency test", overlap_scheduler,
+          &overlap_runs, &hooks);
+  CHECK(overlap_build.frontier_sizes_by_clade.size() == plan.clades().size());
+  CHECK(std::all_of(published.begin(), published.end(), [](auto const& value) {
+    return value.load(std::memory_order_acquire);
+  }));
+  CHECK(overlap_threads.size() == 4);
+  CHECK(overlap_runs.size() == level_count);
+  CHECK(overlap_scheduler.metrics().active_worker_high_water == 4);
+  CHECK(overlap_scheduler.metrics().pending_tasks == 0);
+  overlap_scheduler.shutdown();
+
+  // Two workers fail after a real overlap.  The caller observes the first
+  // failure in stable level/clade order only after every launched task joins,
+  // and the same scheduler remains reusable afterward.
+  larch::chart_scheduler failure_scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  auto const first_clade = level_order[level_offsets[0]];
+  auto const second_clade = level_order[level_offsets[0] + 1];
+  std::array<std::atomic<std::size_t>, 4> failure_calls_by_slot{};
+  timed_test_rendezvous failure_overlap{4};
+  larch::chart_multisite_detail::multisite_frontier_scheduler_test_hooks
+      failure_hooks;
+  failure_hooks.before_clade = [&](larch::clade_id clade, std::size_t level,
+                                   std::size_t stable_slot) {
+    if (level == 0 && failure_calls_by_slot[stable_slot].fetch_add(
+                          1, std::memory_order_relaxed) == 0) {
+      failure_overlap.arrive_and_wait();
+    }
+    if (clade == first_clade) {
+      throw std::runtime_error("stable first frontier failure");
+    }
+    if (clade == second_clade) {
+      throw std::runtime_error("later frontier failure");
+    }
+  };
+  std::vector<larch::chart_scheduler_run_summary> failure_runs;
+  auto failure_message = runtime_error_message([&] {
+    (void)larch::chart_multisite_detail::build_multisite_frontiers_from_setup(
+        plan, setup, chart_options, build_options,
+        "scheduled frontier failure test", failure_scheduler, &failure_runs,
+        &failure_hooks);
+  });
+  CHECK(failure_message == "stable first frontier failure");
+  CHECK(failure_runs.size() == 1);
+  CHECK(failure_runs.front().ranges_completed ==
+        failure_runs.front().range_count);
+  CHECK(failure_scheduler.metrics().tasks_completed ==
+        failure_scheduler.metrics().tasks_joined);
+  CHECK(failure_scheduler.metrics().pending_tasks == 0);
+
+  larch::multisite_trim_scheduler_run_summaries recovery_runs;
+  auto recovered = larch::build_multisite_trim_from_exact_setup(
+      plan, setup, failure_scheduler, chart_options, {}, &recovery_runs);
+  auto oracle =
+      larch::build_multisite_trim_from_exact_setup(plan, setup, chart_options);
+  check_multisite_trim_results_equal(oracle, recovered);
+  CHECK(recovery_runs.frontier_clades.size() == level_count);
+  CHECK(failure_scheduler.metrics().pending_tasks == 0);
+  failure_scheduler.shutdown();
+  CHECK(failure_scheduler.metrics().live_pool_threads == 0);
+
+  // A partial task-submission failure is scheduler infrastructure failure,
+  // never a biological empty frontier. The one accepted task is joined, the
+  // hard error escapes, and the same scheduler remains reusable for an exact
+  // replay with no pending work.
+  larch::chart_scheduler submit_scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  larch::chart_scheduler_test_detail::access::fail_submission_after(
+      submit_scheduler, 1);
+  auto const metrics_before_submit_failure = submit_scheduler.metrics();
+  bool submit_failure_escaped = false;
+  try {
+    (void)larch::chart_multisite_detail::build_multisite_frontiers_from_setup(
+        plan, setup, chart_options, build_options,
+        "scheduled frontier partial-submit test", submit_scheduler);
+  } catch (larch::chart_scheduler_submit_error const&) {
+    submit_failure_escaped = true;
+  }
+  CHECK(submit_failure_escaped);
+  auto const metrics_after_submit_failure = submit_scheduler.metrics();
+  CHECK(metrics_after_submit_failure.tasks_submitted -
+            metrics_before_submit_failure.tasks_submitted ==
+        1);
+  CHECK(metrics_after_submit_failure.tasks_completed -
+            metrics_before_submit_failure.tasks_completed ==
+        1);
+  CHECK(metrics_after_submit_failure.tasks_joined -
+            metrics_before_submit_failure.tasks_joined ==
+        1);
+  CHECK(metrics_after_submit_failure.pending_tasks == 0);
+
+  std::vector<larch::chart_scheduler_run_summary> submit_recovery_runs;
+  auto submit_recovered =
+      larch::chart_multisite_detail::build_multisite_frontiers_from_setup(
+          plan, setup, chart_options, build_options,
+          "scheduled frontier partial-submit recovery", submit_scheduler,
+          &submit_recovery_runs);
+  CHECK(submit_recovered.frontier_sizes_by_clade ==
+        overlap_build.frontier_sizes_by_clade);
+  CHECK(submit_recovery_runs.size() == level_count);
+  CHECK(submit_scheduler.metrics().pending_tasks == 0);
+  submit_scheduler.shutdown();
+  CHECK(submit_scheduler.metrics().live_pool_threads == 0);
 
   std::println("  PASS");
 }
@@ -2803,6 +3259,7 @@ static void test_exhaustive_binary_assignments() {
 
 int main() {
   test_paper_counterexample_outside_trim_and_traceback();
+  test_plan_deterministic_traceback_fast_path_matches_exhaustive();
   test_single_tree_keeps_all_productions();
   test_reference_edge_outside_boundary();
   test_checked_multisite_arithmetic_boundaries();
@@ -2821,7 +3278,9 @@ int main() {
   test_multisite_invariant_sites_and_reference_edge_constant();
   test_plan_multisite_trim_strict_semantic_equivalence();
   test_multisite_exact_setup_cold_resident_and_lifetime();
+  test_unique_topology_exact_setup_fast_path();
   test_scheduled_multisite_exact_setup_and_topology_scoring();
+  test_scheduled_multisite_frontier_wavefronts();
   test_composite_reference_state_diagnostics();
   test_multisite_rejects_pattern_taxon_count_mismatch();
   test_multisite_equal_dedup_merges_provenance();
