@@ -648,6 +648,40 @@ Phase 1 is therefore **implementation complete; acceptance pending Phase 0**.
 No timing, scaling, RSS, or final parity claim is made from the deadline-overlap
 worktree.
 
+## Phase 2 — first allocation/reuse checkpoint
+
+Checkpoint `a7b810b` (`Reuse immutable inputs across chart scoring`) records a
+bounded, functionally verified first wave. It is not the Phase-2 exit point.
+The checkpoint:
+
+- borrows immutable leaf-state spans in dense candidate-by-pattern scoring and
+  retains serial row-scratch capacity across candidates and pattern batches;
+- finalizes one owning exact setup from cold or resident inside charts, reuses
+  it across both exact frontier passes, retains no inside chart or borrowed
+  pattern pointer, and deduplicates initial-upper-bound topologies;
+- builds cold outside rows directly from a compatible resident inside cache,
+  with zero inside recurrence builds on that path; and
+- stamps exact setups and inside caches with generation plus full structural
+  fingerprint, rejecting stale same-address/same-shape inputs before row work.
+
+Deterministic counters cover leaf-view use, scratch-capacity growth, exact
+setup/inside/outside/topology/frontier work, and cold outside-cache reuse. The
+new local-kernel fields are mirrored into the search summary and CLI counter
+reports. The separate scoped allocation observer and the production search
+wiring needed for the strict 80% allocation gate remain Phase-2 work.
+
+The focused RelWithDebInfo build compiled the five affected test binaries plus
+`dagutil` and `wric_counter_baseline_compile_check`. A combined rerun passed all
+14 focused semantic, cache-identity, exact-setup, canonical-report, CLI-report,
+and counter-compile registrations in 41.10 seconds. The copied log is
+`build/wric-chart-parallelization/phase2-wave1-20260714-a7b810b/focused-and-report-contract.LastTest.log`;
+its SHA-256 is
+`c7d55635eaed195268df7cd7d83ec5a08f2bea5e83910c5bc85279322b97422f`.
+
+The Phase-2 allocation-reduction, serial-speed, exact-small-speed, RSS, ASAN,
+full-CTest, and Phase-0-relative timing criteria are still open. No timing from
+this busy-host functional run is acceptance evidence.
+
 ## Later-phase evidence template
 
 Before the Phase-0 seal, every later-phase measurement is labelled
