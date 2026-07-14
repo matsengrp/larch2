@@ -682,6 +682,72 @@ The Phase-2 allocation-reduction, serial-speed, exact-small-speed, RSS, ASAN,
 full-CTest, and Phase-0-relative timing criteria are still open. No timing from
 this busy-host functional run is acceptance evidence.
 
+### Phase 2 — exact/outside reuse and outside-stack checkpoint
+
+Checkpoint `0232cb2` (`Reuse exact charts and remove outside scratch`) records
+the second bounded Phase-2 wave. The worktree was clean immediately after the
+commit. This is not the Phase-2 exit point.
+
+The checkpoint:
+
+- consumes all-active resident inside charts when finalizing the current
+  state's exact setup, caches the resulting trim across repeated exact gates,
+  and keeps explicit cold and lazy accounting for representations that cannot
+  use that dense setup;
+- builds the local-commit outside cache from the just-built inside cache, with
+  a checked `0 built / P reused / P outside built` contract;
+- avoids copying and advancing persistent inside/outside caches for production
+  transient verification, while retaining that work behind the two-chart
+  diagnostic oracle and reporting it separately;
+- dispatches binary outside recurrences through fixed stack arrays and reuses
+  one checked vector scratch bundle per generic-arity production; and
+- adds an executable-local allocation observer covering all eight replaceable
+  C++ allocation forms and twelve corresponding deletion forms. The observer
+  is self-tested only at this checkpoint; it does not yet satisfy the scoped
+  scorer allocation gate.
+
+Exact-setup, leaf-copy, outside-cache, upper-bound-deduplication, frontier,
+binary/generic outside-recurrence, and diagnostic-cache counters are asserted
+in the focused tests and exposed through the search summary, `dagutil`, and the
+counter-baseline compile surface. The recurrence tests include a saturated-add
+witness plus deterministic grammar/compiled-plan equivalence across every
+parent state, unreachable and near-saturated parent costs, varied child rows,
+and a multifurcating generic path.
+
+The coordinated RelWithDebInfo build used:
+
+```text
+cmake --build build --target chart_parallel_test chart_spr_search_test \
+  chart_trim_test inside_chart_cache_test outside_chart_cache_test \
+  chart_spr_allocation_test dagutil wric_counter_baseline_compile_check \
+  --parallel 4
+cmake --build build --target parsimony_chart_test \
+  chart_spr_semantic_report_test --parallel 4
+```
+
+The initial focused run found one observer self-test defect: GCC legally
+elided same-translation-unit new/delete expressions. The pointer sink was
+moved across a translation-unit boundary, the observer test passed in
+isolation, and the complete focused command was rerun. The final 29-test
+semantic, cache, CLI/report, observer, and architectural-guard set passed
+29/29 in 18.97 seconds. Its copied log is
+`build/wric-chart-parallelization/phase2-wave2-20260714-0232cb2/focused-semantic-and-report.LastTest.log`;
+the SHA-256 is
+`7d0d8b6da0a8840e5ba70720891c7f0f454f6fd56aec21c5c8d78e878088d511`.
+
+A strict post-checkpoint audit keeps Phase 2 open. The returning scorer still
+owns output vectors and creates row scratch per public call; default
+one-candidate acceptance batches therefore need a caller-owned `_into` seam
+and search-lifetime workspace before the allocation region can be measured.
+The profiled local unit-Fitch recurrence still needs its all-state
+specialization. Two literal duplicate-inside-build paths also remain:
+pattern-batch exact initialization first computes discarded composite charts,
+and all-active local-commit setup rebuilds inside-cache rows after resident
+pattern charts were created. A non-vacuous upper-bound topology-deduplication
+witness, the 80% allocation comparison, timing/RSS gates, targeted ASAN, full
+CTest, and deferred Phase-0-relative acceptance remain pending. No timing from
+this busy-host checkpoint is acceptance evidence.
+
 ## Later-phase evidence template
 
 Before the Phase-0 seal, every later-phase measurement is labelled
