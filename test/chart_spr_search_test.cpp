@@ -1,6 +1,7 @@
 #include <larch/build_fasta_newick.hpp>
 #include <larch/chart_spr_search.hpp>
 #include <larch/load_proto_dag.hpp>
+#include <larch/option_c_chain_commit.hpp>
 #include <larch/overlay_chain_compaction.hpp>
 
 #include "test_util.hpp"
@@ -13,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <print>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -123,6 +125,77 @@ static tiny_chart_spr_fixture make_fixture() {
   fixture.candidates = larch::enumerate_grammar_spr_candidates(fixture.grammar);
   CHECK(!fixture.candidates.empty());
   return fixture;
+}
+
+// A deterministic, deliberately wide pattern axis for Phase-4 scheduler
+// tests.  site_pattern_set is already the compressed input boundary, so
+// repeated state vectors with distinct weights are legitimate independent
+// entries here; every generated vector is non-invariant.
+static larch::site_pattern_set make_phase4_wide_patterns(
+    std::size_t pattern_count = 48) {
+  larch::site_pattern_set patterns;
+  patterns.taxon_count = 4;
+  patterns.patterns.reserve(pattern_count);
+  for (std::size_t index = 0; index < pattern_count; ++index) {
+    auto a = static_cast<std::uint8_t>(index % larch::nuc_state_count);
+    auto b = static_cast<std::uint8_t>((index / larch::nuc_state_count) %
+                                       larch::nuc_state_count);
+    auto c = static_cast<std::uint8_t>(
+        (index / (larch::nuc_state_count * larch::nuc_state_count)) %
+        larch::nuc_state_count);
+    auto d =
+        static_cast<std::uint8_t>((index * 3 + 1) % larch::nuc_state_count);
+    if (a == b && b == c && c == d) {
+      d = static_cast<std::uint8_t>((d + 1) % larch::nuc_state_count);
+    }
+    patterns.patterns.push_back(larch::site_pattern{
+        .state_by_taxon = {a, b, c, d},
+        .weight = static_cast<std::uint32_t>(index % 5 + 1),
+    });
+  }
+  return patterns;
+}
+
+static std::array<larch::chart_spr_scheduler_axis_metrics const*, 8>
+phase4_scheduler_axes(
+    larch::chart_spr_scheduler_axis_counters const& counters) {
+  return {
+      &counters.initial_chart_patterns,
+      &counters.exact_setup_patterns,
+      &counters.inside_cache_patterns,
+      &counters.outside_cache_patterns,
+      &counters.fixed_topology_patterns,
+      &counters.local_score_candidates,
+      &counters.local_score_candidate_patterns,
+      &counters.other,
+  };
+}
+
+static void check_phase4_scheduler_axis_reconciliation(
+    larch::chart_scheduler_metrics const& scheduler,
+    larch::chart_spr_scheduler_axis_counters const& counters) {
+  std::uint64_t operations = 0;
+  std::uint64_t ranges = 0;
+  std::uint64_t tasks = 0;
+  std::size_t active_worker_high_water = 0;
+  for (auto const* axis : phase4_scheduler_axes(counters)) {
+    operations += axis->operations;
+    ranges += axis->ranges;
+    tasks += axis->worker_tasks;
+    active_worker_high_water =
+        std::max(active_worker_high_water, axis->active_worker_high_water);
+  }
+  CHECK(operations == scheduler.operations);
+  CHECK(ranges == scheduler.ranges_created);
+  CHECK(tasks == scheduler.tasks_submitted);
+  CHECK(active_worker_high_water == scheduler.active_worker_high_water);
+}
+
+static void check_phase4_scheduler_axis_reconciliation(
+    larch::chart_spr_search_result const& search) {
+  CHECK(search.summary.scheduler_axes == search.counters.scheduler_axes);
+  check_phase4_scheduler_axis_reconciliation(search.summary.scheduler,
+                                             search.summary.scheduler_axes);
 }
 
 static larch::test::tiny_tree_node four_taxon_offset_tree() {
@@ -1627,16 +1700,16 @@ static void test_local_score_into_workspace_contract() {
   CHECK(state.counters.local_row_scratch_capacity_growths ==
         parallel_growths_after_warm);
 
-  // Ceil chunking for four candidates and three requested workers produces
-  // two nonempty tasks, not three.  Counters describe actual successful
-  // submissions and the same workspace remains reusable after a forced
-  // partial-submission failure.
+  // Phase-4 candidate-axis scoring exposes four unit-grain ranges to three
+  // requested workers, producing three persistent-scheduler runner tasks.
+  // Counters describe actual successful submissions and the same workspace
+  // remains reusable after a forced partial-submission failure.
   auto tasks_before = state.counters.local_score_worker_tasks;
   auto parallel_batches_before = state.counters.local_score_parallel_batches;
   larch::score_candidates_locally_into(state, candidates, parallel,
                                        parallel_workspace, {}, 3, checked);
   CHECK(parallel_workspace.operation_boundary_clean());
-  CHECK(state.counters.local_score_worker_tasks - tasks_before == 2);
+  CHECK(state.counters.local_score_worker_tasks - tasks_before == 3);
   CHECK(state.counters.local_score_parallel_batches - parallel_batches_before ==
         1);
   for (std::size_t i = 0; i < candidates.size(); ++i) {
@@ -1679,7 +1752,7 @@ static void test_local_score_into_workspace_contract() {
           std::string::npos);
   }
   CHECK(worker_threw);
-  CHECK(worker_barrier.started.load() == 2);
+  CHECK(worker_barrier.started.load() >= 3);
   CHECK(worker_barrier.release.load());
   CHECK(state.counters.local_score_worker_tasks == failed_tasks_before);
   CHECK(parallel_workspace.operation_boundary_clean());
@@ -1864,7 +1937,7 @@ static void test_pattern_batch_into_parallel_scratch_plateau() {
       state.counters.pattern_batch_cache_builds - batches_before;
   CHECK(scored_pattern_batches > 0);
   CHECK(state.counters.local_score_worker_tasks - tasks_before ==
-        2 * scored_pattern_batches);
+        3 * scored_pattern_batches);
 
   // Fail after one queued task.  The scorer must join that task while the
   // loop-local pattern-cache entries it references are still alive, then
@@ -1905,7 +1978,7 @@ static void test_pattern_batch_into_parallel_scratch_plateau() {
           std::string::npos);
   }
   CHECK(worker_threw);
-  CHECK(worker_barrier.started.load() == 2);
+  CHECK(worker_barrier.started.load() >= 3);
   CHECK(worker_barrier.release.load());
   CHECK(state.counters.local_score_worker_tasks == failed_tasks_before);
   CHECK(workspace.operation_boundary_clean());
@@ -2645,8 +2718,144 @@ static void test_parallel_local_scores_match_serial() {
   std::println("  PASS");
 }
 
-static void test_phase3_small_search_uses_serial_grain_and_quiesces() {
-  std::println("test_phase3_small_search_uses_serial_grain_and_quiesces");
+// Phase 4 switches adaptively between coarse candidate tasks and
+// candidate-by-pattern tiles.  Barriers make real worker overlap deterministic
+// in both branches, while stable result slots preserve exact W1 ordering and
+// reductions.  The same scheduler must remain reusable after a tile worker
+// throws and every launched peer has joined.
+static void test_phase4_candidate_and_pattern_tile_axes() {
+  std::println("test_phase4_candidate_and_pattern_tile_axes");
+
+  auto fixture = make_fixture();
+  auto patterns = make_phase4_wide_patterns();
+  auto serial_state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, patterns);
+  auto parallel_state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, patterns);
+  CHECK(serial_state.cache_strategy ==
+        larch::chart_spr_cache_strategy::all_active_patterns);
+  CHECK(fixture.candidates.size() >= 4);
+  std::vector<larch::grammar_spr_candidate> candidates(
+      fixture.candidates.begin(), fixture.candidates.begin() + 4);
+
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  auto checked = larch::check_chart_execution_plan(
+      parallel_state.grammar, parallel_state.execution_plan);
+
+  std::vector<larch::chart_spr_local_score_result> serial_candidates(
+      candidates.size());
+  std::vector<larch::chart_spr_local_score_result> parallel_candidates(
+      candidates.size());
+  larch::chart_spr_local_score_workspace serial_workspace;
+  larch::chart_spr_local_score_workspace parallel_workspace;
+  larch::score_candidates_locally_into(
+      serial_state, candidates, serial_candidates, serial_workspace, {}, 1);
+  larch::local_score_worker_barrier_for_tests candidate_barrier;
+  larch::local_spr_score_options candidate_options;
+  candidate_options.worker_barrier_for_tests = &candidate_barrier;
+  larch::score_candidates_locally_into(parallel_state, candidates,
+                                       parallel_candidates, parallel_workspace,
+                                       candidate_options, scheduler, checked);
+  CHECK(candidate_barrier.release.load());
+  CHECK(candidate_barrier.started.load() >= 4);
+  CHECK(parallel_workspace.operation_boundary_clean());
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    check_local_result_matches_owned_score(
+        parallel_candidates[index],
+        larch::promote_chart_spr_local_score(candidates[index],
+                                             serial_candidates[index]));
+  }
+  auto const& candidate_axis =
+      parallel_state.counters.scheduler_axes.local_score_candidates;
+  CHECK(candidate_axis.operations == 1);
+  CHECK(candidate_axis.parallel_operations == 1);
+  CHECK(candidate_axis.items == candidates.size());
+  CHECK(candidate_axis.worker_tasks == 4);
+  CHECK(candidate_axis.active_worker_high_water >= 2);
+  CHECK(parallel_state.counters.scheduler_axes.local_score_candidate_patterns
+            .operations == 0);
+
+  auto one_candidate =
+      std::span<larch::grammar_spr_candidate const>{&candidates.front(), 1};
+  larch::chart_spr_local_score_result serial_tile;
+  larch::chart_spr_local_score_result parallel_tile;
+  larch::score_candidates_locally_into(
+      serial_state, one_candidate,
+      std::span<larch::chart_spr_local_score_result>{&serial_tile, 1},
+      serial_workspace, {}, 1);
+  larch::local_score_worker_barrier_for_tests tile_barrier;
+  larch::local_spr_score_options tile_options;
+  tile_options.worker_barrier_for_tests = &tile_barrier;
+  larch::score_candidates_locally_into(
+      parallel_state, one_candidate,
+      std::span<larch::chart_spr_local_score_result>{&parallel_tile, 1},
+      parallel_workspace, tile_options, scheduler, checked);
+  CHECK(tile_barrier.release.load());
+  CHECK(tile_barrier.started.load() >= 4);
+  CHECK(parallel_workspace.operation_boundary_clean());
+  check_local_result_matches_owned_score(
+      parallel_tile,
+      larch::promote_chart_spr_local_score(candidates.front(), serial_tile));
+  auto const& tile_axis =
+      parallel_state.counters.scheduler_axes.local_score_candidate_patterns;
+  CHECK(tile_axis.operations == 1);
+  CHECK(tile_axis.parallel_operations == 1);
+  CHECK(tile_axis.items > 1);
+  CHECK(tile_axis.worker_tasks == 4);
+  CHECK(tile_axis.active_worker_high_water >= 2);
+
+  larch::local_score_worker_barrier_for_tests failure_barrier;
+  larch::local_spr_score_options failure_options;
+  failure_options.worker_barrier_for_tests = &failure_barrier;
+  failure_options.force_worker_failure_for_tests = 0;
+  bool worker_threw = false;
+  try {
+    larch::score_candidates_locally_into(
+        parallel_state, one_candidate,
+        std::span<larch::chart_spr_local_score_result>{&parallel_tile, 1},
+        parallel_workspace, failure_options, scheduler, checked);
+  } catch (std::runtime_error const& error) {
+    worker_threw = true;
+    CHECK(std::string{error.what()}.find("forced worker task failure") !=
+          std::string::npos);
+  }
+  CHECK(worker_threw);
+  CHECK(failure_barrier.release.load());
+  CHECK(failure_barrier.started.load() >= 4);
+  CHECK(parallel_workspace.operation_boundary_clean());
+
+  // Recovery is semantic, not merely scheduler liveness: replay the same tile
+  // operation and require the exact serial result.
+  larch::score_candidates_locally_into(
+      parallel_state, one_candidate,
+      std::span<larch::chart_spr_local_score_result>{&parallel_tile, 1},
+      parallel_workspace, {}, scheduler, checked);
+  CHECK(parallel_workspace.operation_boundary_clean());
+  check_local_result_matches_owned_score(
+      parallel_tile,
+      larch::promote_chart_spr_local_score(candidates.front(), serial_tile));
+  CHECK(parallel_state.counters.scheduler_axes.local_score_candidate_patterns
+            .operations == 2);
+
+  scheduler.shutdown();
+  auto metrics = scheduler.metrics();
+  CHECK(metrics.pending_tasks == 0);
+  CHECK(metrics.tasks_submitted == metrics.tasks_completed);
+  CHECK(metrics.tasks_submitted == metrics.tasks_joined);
+  CHECK(metrics.live_pool_threads == 0);
+  CHECK(metrics.pool_lifetimes == 1);
+  CHECK(metrics.pool_lifetimes_stopped == 1);
+  CHECK(metrics.shutdown);
+
+  std::println("  PASS");
+}
+
+static void test_phase4_small_search_uses_one_scheduler_and_quiesces() {
+  std::println("test_phase4_small_search_uses_one_scheduler_and_quiesces");
 
   auto const live_before =
       larch::chart_scheduler::global_live_pool_threads();
@@ -2667,25 +2876,30 @@ static void test_phase3_small_search_uses_serial_grain_and_quiesces() {
   CHECK(search.summary.candidates_locally_scored > 0);
   CHECK(scheduler.requested_workers == 8);
   CHECK(scheduler.resolved_workers == 8);
-  CHECK(scheduler.operations == 1);
-  CHECK(scheduler.parallel_operations == 0);
-  CHECK(scheduler.serial_fallbacks == 1);
-  CHECK(scheduler.ranges_created == 1);
-  CHECK(scheduler.ranges_completed == 1);
+  CHECK(scheduler.operations > 1);
+  CHECK(scheduler.parallel_operations > 0);
+  CHECK(scheduler.operations ==
+        scheduler.parallel_operations + scheduler.serial_fallbacks);
+  CHECK(scheduler.ranges_created == scheduler.ranges_completed);
   CHECK(scheduler.ranges_cancelled == 0);
-  CHECK(scheduler.minimum_effective_grain == 64);
-  CHECK(scheduler.maximum_effective_grain == 64);
-  CHECK(scheduler.last_effective_grain == 64);
-  CHECK(scheduler.active_worker_high_water == 1);
-  CHECK(scheduler.tasks_submitted == 0);
-  CHECK(scheduler.tasks_completed == 0);
-  CHECK(scheduler.tasks_joined == 0);
-  CHECK(scheduler.pool_lifetimes == 0);
-  CHECK(scheduler.pool_lifetimes_stopped == 0);
+  CHECK(scheduler.minimum_effective_grain > 0);
+  CHECK(scheduler.maximum_effective_grain >= scheduler.minimum_effective_grain);
+  CHECK(scheduler.active_worker_high_water > 0);
+  CHECK(scheduler.tasks_submitted > 0);
+  CHECK(scheduler.tasks_completed == scheduler.tasks_submitted);
+  CHECK(scheduler.tasks_joined == scheduler.tasks_submitted);
+  CHECK(scheduler.pool_lifetimes == 1);
+  CHECK(scheduler.pool_lifetimes_stopped == 1);
   CHECK(scheduler.pending_tasks == 0);
   CHECK(scheduler.pending_tasks_at_shutdown == 0);
   CHECK(scheduler.live_pool_threads == 0);
   CHECK(scheduler.shutdown);
+  CHECK(search.summary.scheduler_axes.initial_chart_patterns.operations > 0);
+  CHECK(search.summary.scheduler_axes.local_score_candidates.operations +
+            search.summary.scheduler_axes.local_score_candidate_patterns
+                .operations >
+        0);
+  check_phase4_scheduler_axis_reconciliation(search);
   CHECK(larch::chart_scheduler::global_live_pool_threads() == live_before);
 
   std::println("  PASS");
@@ -2897,6 +3111,187 @@ static void check_phase2b_trim_semantic_parity(
   CHECK(actual.equality_deduplicated == expected.equality_deduplicated);
   CHECK(actual.active_pattern_count == expected.active_pattern_count);
   CHECK(actual.invariant_constant_offset == expected.invariant_constant_offset);
+}
+
+static void check_phase4_pattern_cache_parity(
+    larch::chart_spr_search_state const& expected,
+    larch::chart_spr_search_state const& actual) {
+  CHECK(actual.cache_strategy == expected.cache_strategy);
+  CHECK(actual.composite_lower_bound_without_invariants ==
+        expected.composite_lower_bound_without_invariants);
+  CHECK(actual.composite_lower_bound_with_invariants ==
+        expected.composite_lower_bound_with_invariants);
+  CHECK(actual.pattern_charts.size() == expected.pattern_charts.size());
+  for (std::size_t index = 0; index < expected.pattern_charts.size(); ++index) {
+    auto const& lhs = expected.pattern_charts[index];
+    auto const& rhs = actual.pattern_charts[index];
+    CHECK(rhs.chart.inside == lhs.chart.inside);
+    CHECK(rhs.chart.optimal_choices.empty() ==
+          lhs.chart.optimal_choices.empty());
+    CHECK(rhs.chart.trace_choice_count == lhs.chart.trace_choice_count);
+    CHECK(rhs.chart.multifurcation_productions_scored ==
+          lhs.chart.multifurcation_productions_scored);
+    CHECK(rhs.root_row == lhs.root_row);
+    CHECK(rhs.root_min_excluding_ua == lhs.root_min_excluding_ua);
+    CHECK(rhs.root_min_by_reference_state == lhs.root_min_by_reference_state);
+    CHECK(rhs.reference_state_counts == lhs.reference_state_counts);
+    CHECK(rhs.weighted_root_score == lhs.weighted_root_score);
+  }
+}
+
+// The Phase-4 state path owns three independent pattern axes: initial dense
+// charts, exact active-pattern setup, and the fixed-topology direct oracle.
+// Exercise all three through the same persistent scheduler and compare W1/W4
+// against the legacy serial state.  Axis totals are reduced only after each
+// join, so their accounting must exactly reconcile with scheduler totals.
+static void test_phase4_scheduled_pattern_axes_match_w1() {
+  std::println("test_phase4_scheduled_pattern_axes_match_w1");
+
+  auto fixture = make_fixture();
+  auto patterns = make_phase4_wide_patterns();
+  auto serial = larch::build_chart_spr_search_state(fixture.dag,
+                                                    fixture.grammar, patterns);
+  CHECK(serial.cache_strategy ==
+        larch::chart_spr_cache_strategy::all_active_patterns);
+  CHECK(serial.active_patterns.patterns.patterns.size() ==
+        patterns.patterns.size());
+
+  auto make_scheduler = [](std::size_t workers) {
+    return std::make_unique<larch::chart_scheduler>(
+        larch::chart_scheduler_options{
+            .requested_workers = workers,
+            .default_minimum_grain = 1,
+            .default_target_ranges_per_worker = 4,
+        });
+  };
+  auto w1_scheduler = make_scheduler(1);
+  auto w4_scheduler = make_scheduler(4);
+
+  auto build_scheduled = [&](larch::chart_scheduler& scheduler) {
+    auto active = larch::make_active_search_patterns(patterns);
+    return larch::build_chart_spr_search_state_from_active(
+        fixture.dag, fixture.grammar, std::move(active), {}, false, {}, {}, {},
+        &scheduler);
+  };
+  auto w1 = build_scheduled(*w1_scheduler);
+  auto w4 = build_scheduled(*w4_scheduler);
+  check_phase4_pattern_cache_parity(serial, w1);
+  check_phase4_pattern_cache_parity(serial, w4);
+  CHECK(w1.counters.scheduler_axes.initial_chart_patterns.operations == 1);
+  CHECK(w4.counters.scheduler_axes.initial_chart_patterns.operations == 1);
+  CHECK(w4.counters.scheduler_axes.initial_chart_patterns.parallel_operations ==
+        1);
+  CHECK(w4.counters.scheduler_axes.initial_chart_patterns.items ==
+        patterns.patterns.size());
+  CHECK(w4.counters.scheduler_axes.initial_chart_patterns.worker_tasks > 1);
+
+  auto serial_trim = larch::build_chart_spr_state_exact_trim(serial);
+  auto w1_checked =
+      larch::check_chart_execution_plan(w1.grammar, w1.execution_plan);
+  auto w4_checked =
+      larch::check_chart_execution_plan(w4.grammar, w4.execution_plan);
+  auto w1_trim =
+      larch::build_chart_spr_state_exact_trim(w1, w1_checked, *w1_scheduler);
+  auto w4_trim =
+      larch::build_chart_spr_state_exact_trim(w4, w4_checked, *w4_scheduler);
+  check_phase2b_trim_semantic_parity(serial_trim, w1_trim);
+  check_phase2b_trim_semantic_parity(serial_trim, w4_trim);
+  CHECK(w1.counters.scheduler_axes.exact_setup_patterns.operations > 0);
+  CHECK(w4.counters.scheduler_axes.exact_setup_patterns.operations ==
+        w1.counters.scheduler_axes.exact_setup_patterns.operations);
+  CHECK(w4.counters.scheduler_axes.exact_setup_patterns.parallel_operations >
+        0);
+
+  larch::chart_spr_search_options fixed_options;
+  fixed_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  std::optional<larch::chart_spr_candidate_score> selected;
+  for (auto const& candidate : fixture.candidates) {
+    auto scored = larch::score_candidate_locally(serial, candidate);
+    larch::attach_fixed_topology_selection_for_acceptance(serial, scored,
+                                                          fixed_options);
+    if (scored.valid && scored.topology_selection.certificate.has_value()) {
+      selected = std::move(scored);
+      break;
+    }
+  }
+  CHECK(selected.has_value());
+  auto fixed_serial =
+      larch::fixed_topology_direct_selected_pattern_scores(serial, *selected);
+  auto fixed_w1 = larch::fixed_topology_direct_selected_pattern_scores(
+      w1, *selected, *w1_scheduler);
+  auto fixed_w4 = larch::fixed_topology_direct_selected_pattern_scores(
+      w4, *selected, *w4_scheduler);
+  CHECK(fixed_w1.old_pattern_scores == fixed_serial.old_pattern_scores);
+  CHECK(fixed_w1.new_pattern_scores == fixed_serial.new_pattern_scores);
+  CHECK(fixed_w1.old_active_total == fixed_serial.old_active_total);
+  CHECK(fixed_w1.new_active_total == fixed_serial.new_active_total);
+  CHECK(fixed_w4.old_pattern_scores == fixed_serial.old_pattern_scores);
+  CHECK(fixed_w4.new_pattern_scores == fixed_serial.new_pattern_scores);
+  CHECK(fixed_w4.old_active_total == fixed_serial.old_active_total);
+  CHECK(fixed_w4.new_active_total == fixed_serial.new_active_total);
+  CHECK(w4.counters.scheduler_axes.fixed_topology_patterns.operations == 1);
+  CHECK(
+      w4.counters.scheduler_axes.fixed_topology_patterns.parallel_operations ==
+      1);
+  CHECK(w4.counters.scheduler_axes.fixed_topology_patterns.items ==
+        patterns.patterns.size());
+
+  // A partial scheduler submission is infrastructure failure, never an
+  // invalid biological candidate. The one accepted runner is joined, the
+  // exception escapes with its scheduler type, and the scheduler remains
+  // reusable for an exact replay.
+  auto failing_scheduler = make_scheduler(4);
+  auto failure_state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, patterns);
+  larch::chart_scheduler_test_detail::access::fail_submission_after(
+      *failing_scheduler, 1);
+  auto metrics_before_failure = failing_scheduler->metrics();
+  bool submit_failure_escaped = false;
+  try {
+    (void)larch::verify_candidate_fixed_topology_exact(failure_state, *selected,
+                                                       *failing_scheduler);
+  } catch (larch::chart_scheduler_submit_error const&) {
+    submit_failure_escaped = true;
+  }
+  CHECK(submit_failure_escaped);
+  auto metrics_after_failure = failing_scheduler->metrics();
+  CHECK(metrics_after_failure.tasks_submitted -
+            metrics_before_failure.tasks_submitted ==
+        1);
+  CHECK(metrics_after_failure.tasks_completed -
+            metrics_before_failure.tasks_completed ==
+        1);
+  CHECK(metrics_after_failure.tasks_joined -
+            metrics_before_failure.tasks_joined ==
+        1);
+  CHECK(metrics_after_failure.pending_tasks == 0);
+  auto recovered_fixed = larch::verify_candidate_fixed_topology_exact(
+      failure_state, *selected, *failing_scheduler);
+  CHECK(recovered_fixed.valid);
+  CHECK(recovered_fixed.exact.has_value());
+  CHECK(recovered_fixed.exact->kind ==
+        larch::chart_spr_score_kind::fixed_topology_exact);
+  failing_scheduler->shutdown();
+
+  w1_scheduler->shutdown();
+  w4_scheduler->shutdown();
+  auto w1_metrics = w1_scheduler->metrics();
+  auto w4_metrics = w4_scheduler->metrics();
+  check_phase4_scheduler_axis_reconciliation(w1_metrics,
+                                             w1.counters.scheduler_axes);
+  check_phase4_scheduler_axis_reconciliation(w4_metrics,
+                                             w4.counters.scheduler_axes);
+  CHECK(w1_metrics.parallel_operations == 0);
+  CHECK(w1_metrics.tasks_submitted == 0);
+  CHECK(w4_metrics.parallel_operations > 0);
+  CHECK(w4_metrics.pool_lifetimes == 1);
+  CHECK(w4_metrics.pool_lifetimes_stopped == 1);
+  CHECK(w4_metrics.pending_tasks == 0);
+  CHECK(w4_metrics.live_pool_threads == 0);
+  CHECK(w4_metrics.shutdown);
+
+  std::println("  PASS");
 }
 
 static void test_phase2b_exact_setup_reuses_resident_state_charts() {
@@ -6160,6 +6555,17 @@ static void test_phase4_multi_worker_matches_serial() {
     CHECK(scheduler->live_pool_threads == 0);
     CHECK(scheduler->shutdown);
   }
+  check_phase4_scheduler_axis_reconciliation(serial);
+  check_phase4_scheduler_axis_reconciliation(parallel);
+  CHECK(parallel.summary.scheduler_axes.initial_chart_patterns.operations > 0);
+  CHECK(parallel.summary.scheduler_axes.exact_setup_patterns.operations > 0);
+  CHECK(parallel.summary.scheduler_axes.inside_cache_patterns.operations > 0);
+  CHECK(parallel.summary.scheduler_axes.outside_cache_patterns.operations > 0);
+  CHECK(parallel.summary.scheduler_axes.local_score_candidates.operations +
+            parallel.summary.scheduler_axes.local_score_candidate_patterns
+                .operations >
+        0);
+  CHECK(parallel.summary.scheduler_axes.other.operations == 0);
   // Parallel scoring actually used the workers.
   CHECK(parallel.counters.local_score_parallel_batches > 0);
 
@@ -6187,6 +6593,8 @@ static void test_phase4_fixed_topology_exact_local_commit() {
       larch::chart_spr_candidate_selection_mode::exhaustive_exact;
   options.max_iterations = 12;
   options.rebuild_after_accept = false;
+  options.worker_count = 4;
+  options.cache.memory_budget_bytes = std::size_t{1} << 30;
   options.verify_local_commit_two_chart_oracle_for_tests = true;
 
   auto search = larch::run_chart_spr_search(std::move(fixture.dag),
@@ -6244,6 +6652,8 @@ static void test_phase4_fixed_topology_exact_local_commit() {
         search.counters.exact_verifications);
   CHECK(search.counters.fixed_topology_persistent_cache_fallbacks == 0);
   CHECK(search.counters.fixed_topology_persistent_cache_oracle_mismatches == 0);
+  check_phase4_scheduler_axis_reconciliation(search);
+  CHECK(search.summary.scheduler_axes.fixed_topology_patterns.operations > 0);
   CHECK(search.summary.fixed_topology_selected_cache_hits ==
         search.counters.fixed_topology_selected_cache_hits);
   CHECK(search.summary.fixed_topology_selected_cache_misses ==
@@ -6253,11 +6663,15 @@ static void test_phase4_fixed_topology_exact_local_commit() {
   CHECK(search.summary.fixed_topology_persistent_cache_verifications ==
         search.counters.fixed_topology_persistent_cache_verifications);
   CHECK(search.summary.fixed_topology_persistent_cache_fallbacks == 0);
-  auto naive_selected_oracle_rows =
-      search.counters.exact_verifications * search.summary.active_pattern_count *
-      search.summary.initial_grammar_clade_count;
-  CHECK(search.counters.fixed_topology_selected_rows_computed <
-        naive_selected_oracle_rows);
+  // The selected-topology map is deliberately cleared at each candidate
+  // boundary to make retention bounded.  Every miss publishes one full
+  // active-pattern row vector, while hits now prove reuse only within that
+  // candidate (not unbounded cross-candidate retention).
+  CHECK(search.counters.fixed_topology_selected_rows_computed ==
+        search.counters.fixed_topology_selected_cache_misses *
+            search.summary.active_pattern_count);
+  CHECK(search.summary.chart_cache_resident_bytes <=
+        options.cache.memory_budget_bytes);
   // The caches did real affected-set-scoped work and the two-chart oracle ran
   // after every commit without throwing.
   if (search.counters.accepted_moves > 0) {
@@ -6350,6 +6764,137 @@ static void test_lazy_cache_local_commit_sequence_projects_lazy_chart() {
   std::println("  PASS");
 }
 
+static larch::option_c_after_subtree phase4_reactivation_leaf(
+    std::vector<larch::taxon_id> taxa) {
+  return {std::move(taxa), {}};
+}
+
+static larch::option_c_after_subtree phase4_reactivation_pair(
+    std::vector<larch::taxon_id> taxa, larch::option_c_after_subtree left,
+    larch::option_c_after_subtree right) {
+  return {std::move(taxa), {std::move(left), std::move(right)}};
+}
+
+static larch::rank3_production_taxa_key phase4_reactivation_key(
+    std::vector<larch::taxon_id> parent,
+    std::vector<std::vector<larch::taxon_id>> children) {
+  larch::rank3_production_taxa_key result{std::move(parent),
+                                          std::move(children)};
+  larch::rank3_detail::normalize_production_key(result);
+  return result;
+}
+
+static void test_lazy_local_commit_recomputes_reactivated_clades() {
+  std::println("test_lazy_local_commit_recomputes_reactivated_clades");
+
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  auto a_leaf = [] { return tiny_leaf("A", "A"); };
+  auto b_leaf = [] { return tiny_leaf("B", "A"); };
+  auto c_leaf = [] { return tiny_leaf("C", "C"); };
+  auto d_leaf = [] { return tiny_leaf("D", "C"); };
+  auto tree_ab = tiny_inner(
+      "R", "A",
+      {tiny_inner("ABC", "A",
+                  {tiny_inner("AB", "A", {a_leaf(), b_leaf()}), c_leaf()}),
+       d_leaf()});
+  auto tree_ac = tiny_inner(
+      "R", "A",
+      {tiny_inner("ABC", "A",
+                  {tiny_inner("AC", "A", {a_leaf(), c_leaf()}), b_leaf()}),
+       d_leaf()});
+  auto tree_ad_bc = tiny_inner("R", "A",
+                               {tiny_inner("AD", "A", {a_leaf(), d_leaf()}),
+                                tiny_inner("BC", "A", {b_leaf(), c_leaf()})});
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree("A", tree_ab));
+  trees.push_back(larch::test::make_tiny_labelled_tree("A", tree_ac));
+  trees.push_back(larch::test::make_tiny_labelled_tree("A", tree_ad_bc));
+  auto dag = larch::test::merge_tiny_trees(std::move(trees));
+  auto base = larch::build_clade_grammar(dag);
+
+  auto a = taxa_for(base, {"A"});
+  auto b = taxa_for(base, {"B"});
+  auto c = taxa_for(base, {"C"});
+  auto d = taxa_for(base, {"D"});
+  auto ab = taxa_for(base, {"A", "B"});
+  auto ac = taxa_for(base, {"A", "C"});
+  auto ad = taxa_for(base, {"A", "D"});
+  auto bc = taxa_for(base, {"B", "C"});
+  auto abc = taxa_for(base, {"A", "B", "C"});
+  auto abcd = taxa_for(base, {"A", "B", "C", "D"});
+
+  larch::overlay_chain chain(base);
+  larch::option_c_after_production select_ad_bc;
+  select_ad_bc.parent_taxa = abcd;
+  select_ad_bc.children.push_back(phase4_reactivation_pair(
+      ad, phase4_reactivation_leaf(a), phase4_reactivation_leaf(d)));
+  select_ad_bc.children.push_back(phase4_reactivation_pair(
+      bc, phase4_reactivation_leaf(b), phase4_reactivation_leaf(c)));
+  auto first = larch::option_c_as_overlay_delta(
+      base, phase4_reactivation_key(abcd, {abc, d}), select_ad_bc);
+  chain.append(first.delta);
+  auto tip_one = larch::materialize_overlay_chain(chain);
+
+  larch::chart_spr_search_options state_options;
+  state_options.cache.use_lazy_multisite_chart = true;
+  auto state =
+      larch::build_chart_spr_search_state(dag, tip_one.grammar, state_options);
+  CHECK(state.lazy_chart.has_value());
+
+  larch::option_c_after_production select_ab_c;
+  select_ab_c.parent_taxa = abcd;
+  select_ab_c.children.push_back(larch::option_c_after_subtree{
+      abc,
+      {phase4_reactivation_pair(ab, phase4_reactivation_leaf(a),
+                                phase4_reactivation_leaf(b)),
+       phase4_reactivation_leaf(c)}});
+  select_ab_c.children.push_back(phase4_reactivation_leaf(d));
+  auto second = larch::option_c_as_overlay_delta(
+      tip_one.grammar, phase4_reactivation_key(abcd, {ad, bc}), select_ab_c);
+  chain.append(second.delta);
+  auto tip_two = larch::materialize_overlay_chain(chain);
+  auto plan_two = larch::build_chart_execution_plan(tip_two.grammar);
+
+  auto ac_ref = larch::base_clade_ref(clade_for(base, {"A", "C"}));
+  CHECK(std::find(tip_one.dense_clade_to_ref.begin(),
+                  tip_one.dense_clade_to_ref.end(),
+                  ac_ref) == tip_one.dense_clade_to_ref.end());
+  CHECK(std::find(tip_two.dense_clade_to_ref.begin(),
+                  tip_two.dense_clade_to_ref.end(),
+                  ac_ref) != tip_two.dense_clade_to_ref.end());
+  auto ordinary_inside_affected =
+      larch::compute_chain_inside_affected_set(chain);
+  CHECK(std::find(ordinary_inside_affected.begin(),
+                  ordinary_inside_affected.end(),
+                  ac_ref) == ordinary_inside_affected.end());
+
+  larch::refresh_chart_spr_lazy_chart_after_local_commit_for_tests(
+      state, chain, tip_two, plan_two, tip_one.dense_clade_to_ref);
+
+  larch::lazy_chart_options lazy_options;
+  lazy_options.chart = state.chart_opts;
+  lazy_options.retain_all_inside_class_maps = true;
+  auto oracle = larch::build_lazy_inside_chart_active(
+      plan_two, state.active_patterns, lazy_options);
+  larch::build_lazy_outside_chart_in_place(
+      plan_two, state.active_patterns.patterns, oracle, state.chart_opts);
+  CHECK(state.lazy_chart->pattern_count == oracle.pattern_count);
+  for (std::size_t dense = 0; dense < tip_two.grammar.clades.size(); ++dense) {
+    for (std::size_t pattern = 0; pattern < oracle.pattern_count; ++pattern) {
+      CHECK(state.lazy_chart->inside_row(dense, pattern) ==
+            oracle.inside_row(dense, pattern));
+      CHECK(state.lazy_chart->outside_row(dense, pattern) ==
+            oracle.outside_row(dense, pattern));
+    }
+  }
+  CHECK(state.lazy_chart->outside_global_min_by_pattern ==
+        oracle.outside_global_min_by_pattern);
+
+  std::println("  PASS");
+}
+
 // pattern_batches cache strategy + local commit (Phase 4 known-issue #3).
 // chart_spr_refresh_state_tip_view_after_local_commit has a distinct branch
 // for pattern_batches mode (it leaves state.pattern_charts alone and refreshes
@@ -6369,6 +6914,7 @@ static void test_phase4_pattern_batches_local_commit() {
       larch::chart_spr_candidate_selection_mode::exhaustive_exact;
   options.max_iterations = 12;
   options.rebuild_after_accept = false;
+  options.worker_count = 4;
   options.verify_local_commit_two_chart_oracle_for_tests = true;
   // Force pattern_batches: cap the resident pattern cache below the fixture's
   // active-pattern count so choose_chart_spr_cache_strategy selects batching.
@@ -6423,9 +6969,16 @@ static void test_phase4_pattern_batches_local_commit() {
   CHECK(search.counters.exact_setup_builds > 0);
   CHECK(search.counters.exact_setup_resident_inside_charts_consumed >=
         search.summary.active_pattern_count);
+  check_phase4_scheduler_axis_reconciliation(search);
+  CHECK(search.summary.scheduler_axes.inside_cache_patterns.operations > 0);
+  CHECK(search.summary.scheduler_axes.outside_cache_patterns.operations > 0);
+  CHECK(search.summary.scheduler_axes.exact_setup_patterns.operations > 0);
+  CHECK(search.summary.scheduler_axes.local_score_candidates.operations > 0);
   // Pattern-batch scoring actually rebuilt base rows per batch across the run.
   CHECK(search.counters.pattern_batch_cache_builds > 0);
   CHECK(search.summary.final_score <= search.summary.initial_score);
+  CHECK(search.summary.chart_cache_resident_bytes >
+        2 * search.summary.chart_cache_estimated_full_bytes);
 
   // Compaction produced a valid DAG whose grammar-level exact B&B optimum
   // matches the reported final score.
@@ -6437,6 +6990,24 @@ static void test_phase4_pattern_batches_local_commit() {
       search.dag, rebuilt, options);
   CHECK(larch::chart_spr_state_exact_score_with_invariants(
             rebuilt_state, options.exact_trim) == search.summary.final_score);
+
+  // Pattern batching bounds the scoring batch, but local commit additionally
+  // requires complete persistent inside and outside caches. A budget too small
+  // for that pair is rejected explicitly instead of silently allocating it or
+  // reporting only the one-pattern scoring batch.
+  auto budget_fixture = make_three_misplaced_groups_fixture();
+  auto budget_options = options;
+  budget_options.cache.memory_budget_bytes = 1;
+  bool budget_rejected = false;
+  try {
+    (void)larch::run_chart_spr_search(std::move(budget_fixture.dag),
+                                      budget_fixture.grammar, budget_options);
+  } catch (std::runtime_error const& error) {
+    budget_rejected = true;
+    CHECK(std::string{error.what()}.find(
+              "mandatory full inside/outside caches") != std::string::npos);
+  }
+  CHECK(budget_rejected);
 
   std::println("  PASS");
 }
@@ -6818,7 +7389,8 @@ int main() {
   test_lazy_cache_fixed_topology_conservative_search();
   test_lazy_cache_local_commit_updates_lazy_chart();
   test_parallel_local_scores_match_serial();
-  test_phase3_small_search_uses_serial_grain_and_quiesces();
+  test_phase4_candidate_and_pattern_tile_axes();
+  test_phase4_small_search_uses_one_scheduler_and_quiesces();
   test_pattern_batch_nonreplayable_uses_automatic_candidate_batch();
   test_unchartable_grammar_rejected_with_empty_active_patterns();
   test_unsupported_enumeration_options_fail_explicitly();
@@ -6826,6 +7398,7 @@ int main() {
   test_streaming_candidate_cap_stops_before_eager_path_precompute();
   test_streaming_path_pair_budget_stops_early();
   test_eager_diagnostic_enumeration_exposes_cap_after_path_precompute();
+  test_phase4_scheduled_pattern_axes_match_w1();
   test_phase2b_exact_setup_reuses_resident_state_charts();
   test_phase2b_deferred_pattern_batch_uses_owning_setup_provider();
   test_exact_verification_reuses_state_old_score();
@@ -6883,6 +7456,7 @@ int main() {
   test_phase4_multi_worker_matches_serial();
   test_phase4_fixed_topology_exact_local_commit();
   test_lazy_cache_local_commit_sequence_projects_lazy_chart();
+  test_lazy_local_commit_recomputes_reactivated_clades();
   test_phase4_pattern_batches_local_commit();
   test_phase9_transient_no_full_overlay_materialization();
   test_phase9_transient_oracle_both_charts_green();

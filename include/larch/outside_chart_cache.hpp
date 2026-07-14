@@ -49,6 +49,7 @@
 // be the default.
 
 #include <larch/chart_spr.hpp>          // overlay vocabulary
+#include <larch/chart_scheduler.hpp>    // persistent pattern-axis scheduling
 #include <larch/chart_spr_search.hpp>   // active_site_pattern_set,
                                         // chart_spr_weighted_root_score_from_row
 #include <larch/chart_trim.hpp>         // single_site_outside_chart recurrence,
@@ -752,6 +753,81 @@ inline outside_chart_cache build_outside_chart_cache(
   return cache;
 }
 
+// Scheduler-aware Phase-2B construction from immutable resident inside rows.
+// Workers own disjoint output pattern rows and pattern-indexed accounting
+// slots.  The caller folds accounting in increasing pattern order only after
+// every scheduled task has joined, so completion order cannot affect the
+// cache.  If any worker throws, no cache or partial accounting is returned.
+//
+// `run_summary`, when non-null, receives this operation's summary (not a
+// lifetime scheduler snapshot) after a successful join.  Completion of this
+// call is also the publication barrier: consumers may read the returned rows
+// only after the function returns.
+inline outside_chart_cache build_outside_chart_cache(
+    clade_grammar const& base, checked_chart_execution_plan_ref const& checked,
+    inside_chart_cache const& inside, chart_options options,
+    std::vector<std::uint8_t> reference_state_by_pattern,
+    chart_scheduler& scheduler, chart_indexed_range_options range_options = {},
+    chart_scheduler_run_summary* run_summary = nullptr) {
+  checked.assert_same(base, checked.plan());
+  auto const& plan = checked.plan();
+  auto active = outside_chart_cache_detail::validate_cold_inside_cache_pairing(
+      base, plan, inside, options);
+
+  if (options.score_ua_edge) {
+    if (reference_state_by_pattern.size() != inside.patterns.size()) {
+      throw std::runtime_error(
+          "build_outside_chart_cache: score_ua_edge=true requires a reference "
+          "state per active pattern");
+    }
+    for (auto rs : reference_state_by_pattern) {
+      parsimony_chart_detail::validate_state(rs, "outside cache reference");
+    }
+  }
+
+  outside_chart_cache cache;
+  cache.base = &base;
+  cache.chart_opts = options;
+  cache.patterns = std::move(active.patterns.patterns);
+  cache.invariant_constant_offset = inside.invariant_constant_offset;
+  cache.reference_state_by_pattern = std::move(reference_state_by_pattern);
+  cache.temp_clade_count = 0;
+  cache.base_rows.resize(cache.patterns.size());
+  cache.temp_rows.resize(cache.patterns.size());
+
+  struct pattern_build_stats {
+    std::size_t multifurcation_productions_scored = 0;
+    outside_recurrence_work_stats recurrence_work;
+  };
+  std::vector<pattern_build_stats> stats_by_pattern(cache.patterns.size());
+
+  auto summary = scheduler.for_each_indexed_range(
+      cache.patterns.size(), range_options,
+      [&](chart_indexed_range const& range, std::size_t,
+          chart_scheduler_cancellation_token const&) {
+        for (std::size_t p = range.begin; p < range.end; ++p) {
+          auto const reference_state = options.score_ua_edge
+                                           ? cache.reference_state_by_pattern[p]
+                                           : std::uint8_t{0};
+          auto& stats = stats_by_pattern[p];
+          stats.multifurcation_productions_scored = outside_chart_cache_detail::
+              build_cold_outside_rows_from_inside_cache(
+                  plan, inside, p, options, reference_state, cache.base_rows[p],
+                  stats.recurrence_work);
+        }
+      });
+
+  for (std::size_t p = 0; p < cache.patterns.size(); ++p) {
+    cache.multifurcation_productions_scored +=
+        stats_by_pattern[p].multifurcation_productions_scored;
+    cache.outside_recurrence_work += stats_by_pattern[p].recurrence_work;
+    ++cache.build_stats.inside_charts_reused;
+    ++cache.build_stats.outside_charts_built;
+  }
+  if (run_summary != nullptr) *run_summary = summary;
+  return cache;
+}
+
 inline outside_chart_cache build_outside_chart_cache(
     clade_grammar const& base, chart_execution_plan const& plan,
     active_site_pattern_set const& active, chart_options options,
@@ -768,6 +844,18 @@ inline outside_chart_cache build_outside_chart_cache(
   auto checked = check_chart_execution_plan(base, plan);
   return build_outside_chart_cache(base, checked, inside, options,
                                    std::move(reference_state_by_pattern));
+}
+
+inline outside_chart_cache build_outside_chart_cache(
+    clade_grammar const& base, chart_execution_plan const& plan,
+    inside_chart_cache const& inside, chart_options options,
+    std::vector<std::uint8_t> reference_state_by_pattern,
+    chart_scheduler& scheduler, chart_indexed_range_options range_options = {},
+    chart_scheduler_run_summary* run_summary = nullptr) {
+  auto checked = check_chart_execution_plan(base, plan);
+  return build_outside_chart_cache(base, checked, inside, options,
+                                   std::move(reference_state_by_pattern),
+                                   scheduler, range_options, run_summary);
 }
 
 namespace outside_chart_cache_detail {

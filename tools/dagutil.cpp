@@ -4123,6 +4123,35 @@ static void run_chart_spr_search_diagnostic(
       << scheduler.live_pool_threads << "\n";
   out << "  chart_scheduler_shutdown: "
       << (scheduler.shutdown ? "true" : "false") << "\n";
+  auto emit_scheduler_axis = [&out](
+                                 char const* name,
+                                 chart_spr_scheduler_axis_metrics const& axis) {
+    out << "  chart_axis_" << name << "_operations: " << axis.operations
+        << "\n";
+    out << "  chart_axis_" << name
+        << "_parallel_operations: " << axis.parallel_operations << "\n";
+    out << "  chart_axis_" << name << "_items: " << axis.items << "\n";
+    out << "  chart_axis_" << name << "_ranges: " << axis.ranges << "\n";
+    out << "  chart_axis_" << name << "_tasks: " << axis.worker_tasks << "\n";
+    out << "  chart_axis_" << name
+        << "_active_worker_high_water: " << axis.active_worker_high_water
+        << "\n";
+    out << "  chart_axis_" << name
+        << "_minimum_effective_grain: " << axis.minimum_effective_grain << "\n";
+    out << "  chart_axis_" << name
+        << "_maximum_effective_grain: " << axis.maximum_effective_grain << "\n";
+  };
+  auto const& scheduler_axes = search.summary.scheduler_axes;
+  emit_scheduler_axis("initial_chart", scheduler_axes.initial_chart_patterns);
+  emit_scheduler_axis("exact_setup", scheduler_axes.exact_setup_patterns);
+  emit_scheduler_axis("inside_cache", scheduler_axes.inside_cache_patterns);
+  emit_scheduler_axis("outside_cache", scheduler_axes.outside_cache_patterns);
+  emit_scheduler_axis("fixed_topology_oracle",
+                      scheduler_axes.fixed_topology_patterns);
+  emit_scheduler_axis("local_candidate", scheduler_axes.local_score_candidates);
+  emit_scheduler_axis("local_candidate_pattern",
+                      scheduler_axes.local_score_candidate_patterns);
+  emit_scheduler_axis("other", scheduler_axes.other);
   bool const search_used_lazy_chart =
       search.summary.cache_strategy ==
       chart_spr_cache_strategy::lazy_multisite_chart;

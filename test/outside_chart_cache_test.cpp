@@ -102,6 +102,38 @@ struct active_fixture {
   larch::chart_options options;
 };
 
+static larch::active_site_pattern_set repeat_active_patterns(
+    larch::active_site_pattern_set const& source, std::size_t count) {
+  CHECK(!source.patterns.patterns.empty());
+  larch::active_site_pattern_set result;
+  result.patterns.taxon_count = source.patterns.taxon_count;
+  result.patterns.patterns.reserve(count);
+  for (std::size_t p = 0; p < count; ++p) {
+    larch::chart_spr_search_detail::append_active_pattern_metadata(
+        result.patterns,
+        source.patterns.patterns[p % source.patterns.patterns.size()]);
+  }
+  result.patterns.exact_pattern_to_normalized_binary_pattern.assign(
+      count, larch::no_site_pattern);
+  result.patterns.exact_pattern_to_normalized_binary_state_map.assign(
+      count, larch::normalized_binary_state_map{});
+  result.assert_no_skipped_invariant_metadata();
+  return result;
+}
+
+static larch::chart_scheduler make_pattern_scheduler(std::size_t workers) {
+  return larch::chart_scheduler{larch::chart_scheduler_options{
+                                    .requested_workers = workers,
+                                    .default_minimum_grain = 1,
+                                    .default_target_ranges_per_worker = 1,
+                                },
+                                larch::chart_worker_topology_snapshot{
+                                    .affinity_logical_cpu_count = 4,
+                                    .affinity_physical_core_count = 4,
+                                    .hardware_thread_count = 4,
+                                }};
+}
+
 // Apply one global taxon permutation to every clade key.  Production IDs,
 // child lists, and all vector dimensions stay fixed, while leaf descriptors
 // (and therefore inside rows for asymmetric patterns) change.  This creates a
@@ -868,6 +900,127 @@ static void test_plan_cold_caches_match_checked_oracle() {
   CHECK(planned_outside.build_stats.outside_charts_built ==
         planned_inside.patterns.size());
   std::println("  PASS");
+}
+
+static void assert_scheduled_outside_caches_equal(
+    larch::outside_chart_cache const& lhs,
+    larch::outside_chart_cache const& rhs) {
+  CHECK(lhs.base == rhs.base);
+  CHECK(lhs.chart_opts.keep_trace == rhs.chart_opts.keep_trace);
+  CHECK(lhs.chart_opts.score_ua_edge == rhs.chart_opts.score_ua_edge);
+  CHECK(lhs.chart_opts.max_trace_choices == rhs.chart_opts.max_trace_choices);
+  CHECK(lhs.patterns.size() == rhs.patterns.size());
+  for (std::size_t p = 0; p < lhs.patterns.size(); ++p) {
+    CHECK(lhs.patterns[p].state_by_taxon == rhs.patterns[p].state_by_taxon);
+    CHECK(lhs.patterns[p].positions == rhs.patterns[p].positions);
+    CHECK(lhs.patterns[p].weight == rhs.patterns[p].weight);
+    CHECK(lhs.patterns[p].reference_state_counts ==
+          rhs.patterns[p].reference_state_counts);
+  }
+  CHECK(lhs.reference_state_by_pattern == rhs.reference_state_by_pattern);
+  CHECK(lhs.invariant_constant_offset == rhs.invariant_constant_offset);
+  CHECK(lhs.base_rows == rhs.base_rows);
+  CHECK(lhs.temp_rows == rhs.temp_rows);
+  CHECK(lhs.temp_clade_count == rhs.temp_clade_count);
+  CHECK(lhs.commit_epoch == rhs.commit_epoch);
+  CHECK(lhs.outside_rows_recomputed_on_commit ==
+        rhs.outside_rows_recomputed_on_commit);
+  CHECK(lhs.multifurcation_productions_scored ==
+        rhs.multifurcation_productions_scored);
+  CHECK(lhs.outside_recurrence_work == rhs.outside_recurrence_work);
+  CHECK(lhs.build_stats.inside_charts_built ==
+        rhs.build_stats.inside_charts_built);
+  CHECK(lhs.build_stats.inside_charts_reused ==
+        rhs.build_stats.inside_charts_reused);
+  CHECK(lhs.build_stats.outside_charts_built ==
+        rhs.build_stats.outside_charts_built);
+}
+
+static void test_scheduled_resident_inside_outside_w1_w4_and_recovery() {
+  std::println("test_scheduled_resident_inside_outside_w1_w4_and_recovery");
+
+  using namespace larch::test;
+  auto dag = make_tiny_labelled_tree(
+      "A", tiny_inner("root", "A",
+                      {tiny_leaf_state("A", 'A'), tiny_leaf_state("B", 'C'),
+                       tiny_leaf_state("C", 'G')}));
+  auto f = make_tiny_active_fixture("scheduled trinary outside", std::move(dag),
+                                    true);
+  f.active = repeat_active_patterns(f.active, 4096);
+  f.options.score_ua_edge = true;
+  std::vector<std::uint8_t> reference_states(f.active.patterns.patterns.size());
+  for (std::size_t p = 0; p < reference_states.size(); ++p) {
+    reference_states[p] = static_cast<std::uint8_t>(p % larch::nuc_state_count);
+  }
+
+  auto plan = larch::build_chart_execution_plan(f.grammar);
+  auto checked = larch::check_chart_execution_plan(f.grammar, plan);
+  auto inside = larch::build_inside_chart_cache(f.grammar, checked, f.active,
+                                                f.options, f.invariant_offset);
+  auto legacy = larch::build_outside_chart_cache(f.grammar, checked, inside,
+                                                 f.options, reference_states);
+
+  auto scheduler_w1 = make_pattern_scheduler(1);
+  larch::chart_scheduler_run_summary summary_w1;
+  auto scheduled_w1 = larch::build_outside_chart_cache(
+      f.grammar, checked, inside, f.options, reference_states, scheduler_w1,
+      {.minimum_grain = 1, .target_ranges_per_worker = 1}, &summary_w1);
+
+  auto scheduler_w4 = make_pattern_scheduler(4);
+  larch::chart_scheduler_run_summary summary_w4;
+  auto scheduled_w4 = larch::build_outside_chart_cache(
+      f.grammar, checked, inside, f.options, reference_states, scheduler_w4,
+      {.minimum_grain = 1, .target_ranges_per_worker = 1}, &summary_w4);
+
+  assert_scheduled_outside_caches_equal(legacy, scheduled_w1);
+  assert_scheduled_outside_caches_equal(scheduled_w1, scheduled_w4);
+  CHECK(summary_w1.item_count == f.active.patterns.patterns.size());
+  CHECK(summary_w1.worker_tasks_submitted == 0);
+  CHECK(summary_w1.serial_reason ==
+        larch::chart_scheduler_serial_reason::one_resolved_worker);
+  CHECK(scheduler_w1.metrics().pool_lifetimes == 0);
+  CHECK(summary_w4.item_count == f.active.patterns.patterns.size());
+  CHECK(summary_w4.range_count == 4);
+  CHECK(summary_w4.worker_tasks_submitted == 4);
+  CHECK(summary_w4.active_workers > 1);
+  CHECK(summary_w4.ranges_completed == summary_w4.range_count);
+  CHECK(scheduler_w4.metrics().tasks_submitted ==
+        scheduler_w4.metrics().tasks_joined);
+  CHECK(scheduler_w4.metrics().pending_tasks == 0);
+  CHECK(
+      scheduled_w4.outside_recurrence_work.generic_reusable_productions_scored >
+      0);
+
+  auto failing_scheduler = make_pattern_scheduler(4);
+  larch::chart_scheduler_test_detail::access::fail_submission_after(
+      failing_scheduler, 1);
+  auto before_failure = failing_scheduler.metrics();
+  bool submission_failed = false;
+  try {
+    (void)larch::build_outside_chart_cache(
+        f.grammar, checked, inside, f.options, reference_states,
+        failing_scheduler, {.minimum_grain = 1, .target_ranges_per_worker = 1});
+  } catch (larch::chart_scheduler_submit_error const&) {
+    submission_failed = true;
+  }
+  CHECK(submission_failed);
+  auto after_failure = failing_scheduler.metrics();
+  CHECK(after_failure.tasks_submitted - before_failure.tasks_submitted == 1);
+  CHECK(after_failure.tasks_completed - before_failure.tasks_completed == 1);
+  CHECK(after_failure.tasks_joined - before_failure.tasks_joined == 1);
+  CHECK(after_failure.pending_tasks == 0);
+
+  larch::chart_scheduler_run_summary recovery_summary;
+  auto recovered = larch::build_outside_chart_cache(
+      f.grammar, checked, inside, f.options, reference_states,
+      failing_scheduler, {.minimum_grain = 1, .target_ranges_per_worker = 1},
+      &recovery_summary);
+  assert_scheduled_outside_caches_equal(scheduled_w1, recovered);
+  CHECK(recovery_summary.ranges_completed == recovery_summary.range_count);
+  CHECK(failing_scheduler.metrics().pending_tasks == 0);
+
+  std::println("  PASS ({} patterns, joined failure and recovery)",
+               summary_w4.item_count);
 }
 
 static void test_cold_outside_reuse_ua_and_multifurcation_equivalence() {
@@ -1695,6 +1848,7 @@ static void test_pairing_guard() {
 int main() {
   test_arity_changing_overlay_commits();
   test_plan_cold_caches_match_checked_oracle();
+  test_scheduled_resident_inside_outside_w1_w4_and_recovery();
   test_cold_outside_reuse_ua_and_multifurcation_equivalence();
   test_cold_outside_reuse_pairing_rejections();
   test_single_commit_on_binary_four();

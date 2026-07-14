@@ -1,5 +1,6 @@
 #pragma once
 
+#include <larch/chart_scheduler.hpp>
 #include <larch/grammar_topology.hpp>
 #include <larch/parsimony_chart.hpp>
 #include <larch/site_patterns.hpp>
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <numeric>
@@ -3258,6 +3260,18 @@ inline std::uint64_t exact_setup_weighted_root_score(
       plan, chart.inside[plan.root_clade()], pattern, options);
 }
 
+inline std::uint64_t exact_setup_weighted_topology_root_score(
+    clade_grammar const&, chart_row const& row, site_pattern const& pattern,
+    chart_options const& options) {
+  return weighted_root_score_from_row(row, pattern, options);
+}
+
+inline std::uint64_t exact_setup_weighted_topology_root_score(
+    chart_execution_plan const& plan, chart_row const& row,
+    site_pattern const& pattern, chart_options const& options) {
+  return weighted_root_score_from_row(plan, row, pattern, options);
+}
+
 inline std::uint64_t exact_setup_invariant_constant_offset(
     clade_grammar const&, site_pattern_set const& patterns,
     chart_options const& options) {
@@ -3396,6 +3410,321 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside(
   return setup;
 }
 
+// Exact setup has enough work per active pattern that even a small pattern set
+// can profitably use the search-lifetime scheduler.  Keeping this policy local
+// also avoids inheriting the candidate-oriented scheduler's coarser default
+// grain.  The task fan-out remains bounded by the scheduler's adaptive range
+// planner.
+inline chart_indexed_range_options multisite_exact_setup_range_options() {
+  return chart_indexed_range_options{
+      .minimum_grain = 1,
+      .target_ranges_per_worker = 4,
+  };
+}
+
+struct scheduled_multisite_exact_pattern_slot {
+  active_pattern_info info;
+  std::optional<selected_topology> traceback_topology;
+  std::uint64_t weighted_root_score = 0;
+  multisite_exact_setup_work_stats work;
+};
+
+template <class Structural, class InsideProvider>
+inline void build_scheduled_multisite_exact_pattern_slot(
+    Structural const& structural, site_pattern_set const& patterns,
+    std::size_t pattern_index, chart_options const& options,
+    InsideProvider& inside_provider, bool resident_inside,
+    std::size_t stable_slot_id,
+    scheduled_multisite_exact_pattern_slot& result) {
+  auto const& pattern = patterns.patterns[pattern_index];
+
+  // A scheduled provider receives the scheduler's stable slot ID.  Providers
+  // that materialize a transient chart (for example from a persistent row
+  // cache) must own one scratch chart per resolved scheduler slot.  The
+  // returned chart is consumed completely before this function returns.
+  decltype(auto) provided_chart =
+      std::invoke(inside_provider, pattern_index, pattern, stable_slot_id);
+  single_site_chart const& chart = provided_chart;
+  chart_trim_detail::validate_chart_shapes(structural, chart);
+  if (resident_inside) {
+    ++result.work.resident_inside_charts_consumed;
+  } else {
+    ++result.work.inside_charts_built;
+  }
+
+  result.weighted_root_score =
+      exact_setup_weighted_root_score(structural, chart, pattern, options);
+
+  active_pattern_info info;
+  info.pattern_index = pattern_index;
+  info.weight = pattern.weight;
+  info.reference_state_counts = pattern.reference_state_counts;
+  info.state_by_taxon = pattern.state_by_taxon;
+  ++result.work.active_leaf_state_vectors_copied;
+  result.work.active_leaf_states_copied += info.state_by_taxon.size();
+
+  single_site_outside_chart const* traceback_outside = nullptr;
+  if (options.score_ua_edge) {
+    for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+         ++reference_state) {
+      if (info.reference_state_counts[reference_state] == 0) continue;
+      info.outside_by_reference[reference_state] =
+          build_single_site_outside_chart(structural, chart, options,
+                                          reference_state);
+      result.work.outside_recurrence_work +=
+          info.outside_by_reference[reference_state].recurrence_work;
+      ++result.work.outside_boundary_charts_built;
+      if (traceback_outside == nullptr) {
+        traceback_outside = &info.outside_by_reference[reference_state];
+      }
+    }
+  } else {
+    info.outside_ua_free =
+        build_single_site_outside_chart(structural, chart, options);
+    result.work.outside_recurrence_work += info.outside_ua_free.recurrence_work;
+    ++result.work.outside_boundary_charts_built;
+    traceback_outside = &info.outside_ua_free;
+  }
+
+  if (traceback_outside != nullptr) {
+    auto trace = deterministic_optimal_single_site_traceback(
+        structural, chart, *traceback_outside);
+    result.traceback_topology.emplace(
+        topology_from_traceback(structural, trace));
+  }
+  // Publish into this stable active-pattern slot only after every computation
+  // that borrows the provider's chart has completed.
+  result.info = std::move(info);
+}
+
+inline void add_scheduled_multisite_exact_pattern_work(
+    multisite_exact_setup_work_stats& total,
+    multisite_exact_setup_work_stats const& pattern) {
+  total.inside_charts_built += pattern.inside_charts_built;
+  total.resident_inside_charts_consumed +=
+      pattern.resident_inside_charts_consumed;
+  total.active_leaf_state_vectors_copied +=
+      pattern.active_leaf_state_vectors_copied;
+  total.active_leaf_states_copied += pattern.active_leaf_states_copied;
+  total.outside_boundary_charts_built += pattern.outside_boundary_charts_built;
+  total.outside_recurrence_work += pattern.outside_recurrence_work;
+}
+
+template <class Structural, class InsideProvider>
+inline multisite_exact_setup build_multisite_exact_setup_from_inside_scheduled(
+    Structural const& structural, site_pattern_set const& patterns,
+    chart_options const& options, chart_scheduler& scheduler,
+    InsideProvider&& inside_provider, bool resident_inside,
+    std::vector<chart_scheduler_run_summary>* run_summaries = nullptr) {
+  validate_multisite_inputs(structural, patterns, options);
+  require_exact_setup_binary(structural);
+  if (run_summaries != nullptr) {
+    if (run_summaries->size() > run_summaries->max_size() - 2) {
+      throw std::length_error("exact setup scheduler summary overflow");
+    }
+    // Reserve before either scheduler operation. Once an operation completes,
+    // publishing its summary cannot then fail and lose axis accounting.
+    run_summaries->reserve(run_summaries->size() + 2);
+  }
+
+  multisite_exact_setup setup;
+  setup.clade_count = exact_setup_clade_count(structural);
+  setup.production_count = exact_setup_production_count(structural);
+  setup.taxon_count = patterns.taxon_count;
+  setup.structural_generation = exact_setup_structural_generation(structural);
+  setup.structural_fingerprint = exact_setup_structural_fingerprint(structural);
+  setup.score_ua_edge = options.score_ua_edge;
+  setup.invariant_constant_offset =
+      exact_setup_invariant_constant_offset(structural, patterns, options);
+  setup.composite_lower_bound = setup.invariant_constant_offset;
+  setup.work.setup_builds = 1;
+
+  // The coordinator fixes the active-pattern order before launching work.
+  // Workers write only their pre-sized slot; publication and all reductions
+  // happen below in this stable order.
+  std::vector<std::size_t> active_pattern_indices;
+  active_pattern_indices.reserve(patterns.patterns.size());
+  for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+       ++pattern_index) {
+    if (is_active_pattern(patterns.patterns[pattern_index])) {
+      active_pattern_indices.push_back(pattern_index);
+    }
+  }
+  std::vector<scheduled_multisite_exact_pattern_slot> pattern_slots(
+      active_pattern_indices.size());
+  std::vector<std::exception_ptr> pattern_errors(active_pattern_indices.size());
+
+  auto pattern_run = scheduler.for_each_indexed_range(
+      active_pattern_indices.size(), multisite_exact_setup_range_options(),
+      [&](chart_indexed_range const& range, std::size_t stable_slot_id,
+          chart_scheduler_cancellation_token const&) {
+        for (std::size_t active_index = range.begin; active_index < range.end;
+             ++active_index) {
+          auto const pattern_index = active_pattern_indices[active_index];
+          try {
+            build_scheduled_multisite_exact_pattern_slot(
+                structural, patterns, pattern_index, options, inside_provider,
+                resident_inside, stable_slot_id, pattern_slots[active_index]);
+          } catch (...) {
+            pattern_errors[active_index] = std::current_exception();
+            break;
+          }
+        }
+      });
+  if (run_summaries != nullptr) run_summaries->push_back(pattern_run);
+  for (auto const& error : pattern_errors) {
+    if (error) std::rethrow_exception(error);
+  }
+
+  setup.active_patterns.reserve(pattern_slots.size());
+  std::vector<selected_topology> upper_bound_topologies;
+  upper_bound_topologies.reserve(pattern_slots.size() + 1);
+  upper_bound_topologies.push_back(first_topology(structural));
+  for (auto& slot : pattern_slots) {
+    setup.composite_lower_bound =
+        checked_add_u64(setup.composite_lower_bound, slot.weighted_root_score,
+                        "exact setup composite lower bound");
+    add_scheduled_multisite_exact_pattern_work(setup.work, slot.work);
+    setup.active_patterns.push_back(std::move(slot.info));
+    if (slot.traceback_topology.has_value()) {
+      upper_bound_topologies.push_back(std::move(*slot.traceback_topology));
+    }
+  }
+
+  // Topology identity and deduplication remain coordinator-only and therefore
+  // byte-for-byte independent of completion order.
+  setup.work.upper_bound_topologies_generated = upper_bound_topologies.size();
+  sort_and_unique_topologies(upper_bound_topologies);
+  setup.work.upper_bound_topologies_unique = upper_bound_topologies.size();
+
+  // Prefer one topology per dynamic range when that axis is wide. If it is
+  // narrower than the worker set, flatten topology x pattern instead; this
+  // keeps a one-topology exact setup parallel without nesting scheduler work.
+  // Both variants publish pattern/topology-indexed slots and fold in the same
+  // topology-major, increasing-pattern order.
+  std::vector<std::uint64_t> topology_scores(upper_bound_topologies.size(),
+                                             multisite_score_inf);
+  auto const topology_count = upper_bound_topologies.size();
+  auto const pattern_count = patterns.patterns.size();
+  auto const workers = scheduler.worker_resolution().resolved_workers;
+  bool const flatten_topology_patterns =
+      topology_count < workers && pattern_count > 1;
+  chart_scheduler_run_summary topology_run;
+  if (flatten_topology_patterns) {
+    if (topology_count >
+        (std::numeric_limits<std::size_t>::max)() / pattern_count) {
+      throw std::overflow_error("exact setup topology-pattern size overflow");
+    }
+    auto const item_count = topology_count * pattern_count;
+    std::vector<std::uint64_t> contributions(item_count, 0);
+    std::vector<std::exception_ptr> errors(item_count);
+    topology_run = scheduler.for_each_indexed_range(
+        item_count, multisite_exact_setup_range_options(),
+        [&](chart_indexed_range const& range, std::size_t,
+            chart_scheduler_cancellation_token const&) {
+          for (std::size_t flat = range.begin; flat < range.end; ++flat) {
+            auto const topology_index = flat / pattern_count;
+            auto const pattern_index = flat % pattern_count;
+            try {
+              auto const& pattern = patterns.patterns[pattern_index];
+              if (!is_active_pattern(pattern)) continue;
+              auto row = restricted_topology_row(
+                  structural, pattern, upper_bound_topologies[topology_index]);
+              contributions[flat] = exact_setup_weighted_topology_root_score(
+                  structural, row, pattern, options);
+            } catch (...) {
+              errors[flat] = std::current_exception();
+              break;
+            }
+          }
+        });
+    if (run_summaries != nullptr) run_summaries->push_back(topology_run);
+    for (auto const& error : errors) {
+      if (error) std::rethrow_exception(error);
+    }
+    for (std::size_t topology_index = 0; topology_index < topology_count;
+         ++topology_index) {
+      auto total =
+          exact_setup_invariant_constant_offset(structural, patterns, options);
+      for (std::size_t pattern_index = 0; pattern_index < pattern_count;
+           ++pattern_index) {
+        total = checked_add_u64(
+            total,
+            contributions[topology_index * pattern_count + pattern_index],
+            "selected topology score");
+      }
+      topology_scores[topology_index] = total;
+    }
+  } else {
+    std::vector<std::exception_ptr> errors(topology_count);
+    topology_run = scheduler.for_each_indexed_range(
+        topology_count, multisite_exact_setup_range_options(),
+        [&](chart_indexed_range const& range, std::size_t,
+            chart_scheduler_cancellation_token const&) {
+          for (std::size_t topology_index = range.begin;
+               topology_index < range.end; ++topology_index) {
+            try {
+              topology_scores[topology_index] =
+                  ::larch::chart_multisite_detail::score_selected_topology(
+                      structural, patterns,
+                      upper_bound_topologies[topology_index], options);
+            } catch (...) {
+              errors[topology_index] = std::current_exception();
+              break;
+            }
+          }
+        });
+    if (run_summaries != nullptr) run_summaries->push_back(topology_run);
+    for (auto const& error : errors) {
+      if (error) std::rethrow_exception(error);
+    }
+  }
+  for (auto score : topology_scores) {
+    setup.initial_upper_bound = std::min(setup.initial_upper_bound, score);
+  }
+  return setup;
+}
+
+template <class Structural>
+inline std::uint64_t score_selected_topology_scheduled(
+    Structural const& structural, site_pattern_set const& patterns,
+    selected_topology const& topology, chart_options const& options,
+    chart_scheduler& scheduler,
+    chart_scheduler_run_summary* run_summary = nullptr) {
+  std::vector<std::uint64_t> pattern_scores(patterns.patterns.size(), 0);
+  std::vector<std::exception_ptr> errors(patterns.patterns.size());
+  auto run = scheduler.for_each_indexed_range(
+      patterns.patterns.size(), multisite_exact_setup_range_options(),
+      [&](chart_indexed_range const& range, std::size_t,
+          chart_scheduler_cancellation_token const&) {
+        for (std::size_t pattern_index = range.begin; pattern_index < range.end;
+             ++pattern_index) {
+          try {
+            auto const& pattern = patterns.patterns[pattern_index];
+            if (!is_active_pattern(pattern)) continue;
+            auto row = restricted_topology_row(structural, pattern, topology);
+            pattern_scores[pattern_index] =
+                exact_setup_weighted_topology_root_score(structural, row,
+                                                         pattern, options);
+          } catch (...) {
+            errors[pattern_index] = std::current_exception();
+            break;
+          }
+        }
+      });
+  if (run_summary != nullptr) *run_summary = run;
+  for (auto const& error : errors) {
+    if (error) std::rethrow_exception(error);
+  }
+
+  auto total =
+      exact_setup_invariant_constant_offset(structural, patterns, options);
+  for (auto score : pattern_scores) {
+    total = checked_add_u64(total, score, "selected topology score");
+  }
+  return total;
+}
+
 inline multisite_exact_setup build_multisite_exact_setup_cold(
     clade_grammar const& grammar, site_pattern_set const& patterns,
     chart_options const& options) {
@@ -3413,6 +3742,23 @@ inline multisite_exact_setup build_multisite_exact_setup_cold(
 }
 
 inline multisite_exact_setup build_multisite_exact_setup_cold(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_scheduler& scheduler, chart_options const& options,
+    std::vector<chart_scheduler_run_summary>* run_summaries = nullptr) {
+  chart_options build_options = options;
+  build_options.keep_trace = false;
+  build_options.max_trace_choices = 0;
+  return build_multisite_exact_setup_from_inside_scheduled(
+      grammar, patterns, options, scheduler,
+      [&](std::size_t, site_pattern const& pattern, std::size_t) {
+        return build_single_site_chart(
+            grammar, view_leaf_site_states(pattern.state_by_taxon),
+            build_options);
+      },
+      false, run_summaries);
+}
+
+inline multisite_exact_setup build_multisite_exact_setup_cold(
     chart_execution_plan const& plan, site_pattern_set const& patterns,
     chart_options const& options) {
   chart_options build_options = options;
@@ -3425,6 +3771,22 @@ inline multisite_exact_setup build_multisite_exact_setup_cold(
             plan, view_leaf_site_states(pattern.state_by_taxon), build_options);
       },
       false);
+}
+
+inline multisite_exact_setup build_multisite_exact_setup_cold(
+    chart_execution_plan const& plan, site_pattern_set const& patterns,
+    chart_scheduler& scheduler, chart_options const& options,
+    std::vector<chart_scheduler_run_summary>* run_summaries = nullptr) {
+  chart_options build_options = options;
+  build_options.keep_trace = false;
+  build_options.max_trace_choices = 0;
+  return build_multisite_exact_setup_from_inside_scheduled(
+      plan, patterns, options, scheduler,
+      [&](std::size_t, site_pattern const& pattern, std::size_t) {
+        return build_single_site_chart(
+            plan, view_leaf_site_states(pattern.state_by_taxon), build_options);
+      },
+      false, run_summaries);
 }
 
 }  // namespace chart_multisite_detail
@@ -3445,6 +3807,24 @@ inline multisite_exact_setup build_multisite_exact_setup(
       plan, patterns, options);
 }
 
+// Scheduler-taking exact-setup boundaries use the scheduler's stable slot ID
+// throughout active-pattern work and retain the caller's one pool lifetime.
+inline multisite_exact_setup build_multisite_exact_setup(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_scheduler& scheduler, chart_options const& options = {},
+    std::vector<chart_scheduler_run_summary>* run_summaries = nullptr) {
+  return chart_multisite_detail::build_multisite_exact_setup_cold(
+      grammar, patterns, scheduler, options, run_summaries);
+}
+
+inline multisite_exact_setup build_multisite_exact_setup(
+    chart_execution_plan const& plan, site_pattern_set const& patterns,
+    chart_scheduler& scheduler, chart_options const& options = {},
+    std::vector<chart_scheduler_run_summary>* run_summaries = nullptr) {
+  return chart_multisite_detail::build_multisite_exact_setup_cold(
+      plan, patterns, scheduler, options, run_summaries);
+}
+
 template <class InsideProvider>
 inline multisite_exact_setup
 build_multisite_exact_setup_from_resident_inside(
@@ -3463,6 +3843,34 @@ build_multisite_exact_setup_from_resident_inside(
   return chart_multisite_detail::build_multisite_exact_setup_from_inside(
       plan, patterns, options, std::forward<InsideProvider>(inside_provider),
       true);
+}
+
+// Scheduled resident providers must be safe for concurrent invocation and have
+// signature (pattern_index, pattern, stable_slot_id).  A provider that needs a
+// mutable materialization buffer owns one buffer per resolved scheduler slot.
+// The legacy two-argument provider overloads above remain strictly serial.
+template <class InsideProvider>
+inline multisite_exact_setup build_multisite_exact_setup_from_resident_inside(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_scheduler& scheduler, InsideProvider&& inside_provider,
+    chart_options const& options = {},
+    std::vector<chart_scheduler_run_summary>* run_summaries = nullptr) {
+  return chart_multisite_detail::
+      build_multisite_exact_setup_from_inside_scheduled(
+          grammar, patterns, options, scheduler,
+          std::forward<InsideProvider>(inside_provider), true, run_summaries);
+}
+
+template <class InsideProvider>
+inline multisite_exact_setup build_multisite_exact_setup_from_resident_inside(
+    chart_execution_plan const& plan, site_pattern_set const& patterns,
+    chart_scheduler& scheduler, InsideProvider&& inside_provider,
+    chart_options const& options = {},
+    std::vector<chart_scheduler_run_summary>* run_summaries = nullptr) {
+  return chart_multisite_detail::
+      build_multisite_exact_setup_from_inside_scheduled(
+          plan, patterns, options, scheduler,
+          std::forward<InsideProvider>(inside_provider), true, run_summaries);
 }
 
 inline composite_chart_score build_composite_chart_score(
@@ -4558,6 +4966,17 @@ inline std::uint64_t score_selected_topology(
   (void)validate_grammar_topology(grammar, topology);
   return chart_multisite_detail::score_selected_topology(grammar, patterns,
                                                          topology, options);
+}
+
+inline std::uint64_t score_selected_topology(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    grammar_topology const& topology, chart_scheduler& scheduler,
+    chart_options const& options = {},
+    chart_scheduler_run_summary* run_summary = nullptr) {
+  chart_multisite_detail::validate_multisite_inputs(grammar, patterns, options);
+  (void)validate_grammar_topology(grammar, topology);
+  return chart_multisite_detail::score_selected_topology_scheduled(
+      grammar, patterns, topology, options, scheduler, run_summary);
 }
 
 inline multisite_topology_trace_result build_multisite_optimal_topologies(

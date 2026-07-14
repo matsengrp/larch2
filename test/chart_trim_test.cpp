@@ -7,15 +7,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <barrier>
 #include <cstdint>
+#include <exception>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <print>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2172,6 +2178,231 @@ static void test_multisite_exact_setup_cold_resident_and_lifetime() {
   std::println("  PASS");
 }
 
+static void test_scheduled_multisite_exact_setup_and_topology_scoring() {
+  std::println("test_scheduled_multisite_exact_setup_and_topology_scoring");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree1_with_invariant_spec()));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree2_with_invariant_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto plan = larch::build_chart_execution_plan(grammar);
+  larch::site_pattern_options pattern_options;
+  pattern_options.skip_invariant_sites = true;
+  auto base_patterns =
+      larch::build_site_patterns(merged, grammar, pattern_options);
+
+  larch::site_pattern_set patterns = base_patterns;
+  patterns.patterns.clear();
+  for (std::size_t repetition = 0; repetition < 16; ++repetition) {
+    for (auto const& pattern : base_patterns.patterns) {
+      if (!larch::is_invariant_site_pattern(pattern)) {
+        patterns.patterns.push_back(pattern);
+      }
+    }
+  }
+  CHECK(patterns.patterns.size() == 32);
+  CHECK(std::all_of(patterns.patterns.begin(), patterns.patterns.end(),
+                    [](auto const& pattern) {
+                      return !larch::is_invariant_site_pattern(pattern);
+                    }));
+
+  larch::chart_options options;
+  options.keep_trace = false;
+  options.max_trace_choices = 0;
+  std::vector<larch::single_site_chart> resident_charts;
+  resident_charts.reserve(patterns.patterns.size());
+  for (auto const& pattern : patterns.patterns) {
+    resident_charts.push_back(larch::build_single_site_chart(
+        plan, larch::view_leaf_site_states(pattern.state_by_taxon), options));
+  }
+
+  std::size_t serial_provider_calls = 0;
+  auto serial_setup = larch::build_multisite_exact_setup_from_resident_inside(
+      plan, patterns,
+      [&](std::size_t pattern_index,
+          larch::site_pattern const&) -> larch::single_site_chart const& {
+        CHECK(pattern_index == serial_provider_calls);
+        ++serial_provider_calls;
+        return resident_charts[pattern_index];
+      },
+      options);
+  CHECK(serial_provider_calls == patterns.patterns.size());
+
+  auto check_outside_equal = [](larch::single_site_outside_chart const& lhs,
+                                larch::single_site_outside_chart const& rhs) {
+    CHECK(lhs.outside == rhs.outside);
+    CHECK(lhs.global_min == rhs.global_min);
+    CHECK(lhs.multifurcation_productions_scored ==
+          rhs.multifurcation_productions_scored);
+    CHECK(lhs.recurrence_work == rhs.recurrence_work);
+  };
+  auto check_setup_equal = [&](larch::multisite_exact_setup const& expected,
+                               larch::multisite_exact_setup const& actual) {
+    CHECK(actual.composite_lower_bound == expected.composite_lower_bound);
+    CHECK(actual.initial_upper_bound == expected.initial_upper_bound);
+    CHECK(actual.invariant_constant_offset ==
+          expected.invariant_constant_offset);
+    CHECK(actual.clade_count == expected.clade_count);
+    CHECK(actual.production_count == expected.production_count);
+    CHECK(actual.taxon_count == expected.taxon_count);
+    CHECK(actual.structural_generation == expected.structural_generation);
+    CHECK(actual.structural_fingerprint == expected.structural_fingerprint);
+    CHECK(actual.score_ua_edge == expected.score_ua_edge);
+    CHECK(actual.work == expected.work);
+    CHECK(actual.active_patterns.size() == expected.active_patterns.size());
+    for (std::size_t index = 0; index < actual.active_patterns.size();
+         ++index) {
+      auto const& lhs = expected.active_patterns[index];
+      auto const& rhs = actual.active_patterns[index];
+      CHECK(rhs.pattern_index == lhs.pattern_index);
+      CHECK(rhs.pattern_index == index);
+      CHECK(rhs.weight == lhs.weight);
+      CHECK(rhs.reference_state_counts == lhs.reference_state_counts);
+      CHECK(rhs.state_by_taxon == lhs.state_by_taxon);
+      CHECK(rhs.chart.inside.empty());
+      check_outside_equal(lhs.outside_ua_free, rhs.outside_ua_free);
+      for (std::size_t state = 0; state < larch::nuc_state_count; ++state) {
+        check_outside_equal(lhs.outside_by_reference[state],
+                            rhs.outside_by_reference[state]);
+      }
+    }
+    auto expected_trim =
+        larch::build_multisite_trim_from_exact_setup(plan, expected, options);
+    auto actual_trim =
+        larch::build_multisite_trim_from_exact_setup(plan, actual, options);
+    check_multisite_trim_results_equal(expected_trim, actual_trim);
+  };
+
+  larch::chart_scheduler one_worker{larch::chart_scheduler_options{
+      .requested_workers = 1,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  std::vector<std::size_t> one_worker_visits(patterns.patterns.size(), 0);
+  auto scheduled_one = larch::build_multisite_exact_setup_from_resident_inside(
+      plan, patterns, one_worker,
+      [&](std::size_t pattern_index, larch::site_pattern const&,
+          std::size_t stable_slot) -> larch::single_site_chart const& {
+        CHECK(stable_slot == 0);
+        ++one_worker_visits[pattern_index];
+        return resident_charts[pattern_index];
+      },
+      options);
+  CHECK(std::all_of(one_worker_visits.begin(), one_worker_visits.end(),
+                    [](std::size_t visits) { return visits == 1; }));
+  check_setup_equal(serial_setup, scheduled_one);
+  CHECK(one_worker.metrics().pool_lifetimes == 0);
+  CHECK(one_worker.metrics().pending_tasks == 0);
+  one_worker.shutdown();
+
+  larch::chart_scheduler four_workers{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  std::vector<std::atomic<std::size_t>> parallel_visits(
+      patterns.patterns.size());
+  std::array<std::atomic<std::size_t>, 4> first_call_by_slot{};
+  std::vector<larch::single_site_chart> scratch_by_slot(4);
+  std::barrier overlap{4};
+  std::mutex overlap_mutex;
+  std::set<std::thread::id> overlap_threads;
+  auto scheduled_four = larch::build_multisite_exact_setup_from_resident_inside(
+      plan, patterns, four_workers,
+      [&](std::size_t pattern_index, larch::site_pattern const&,
+          std::size_t stable_slot) -> larch::single_site_chart const& {
+        CHECK(stable_slot < scratch_by_slot.size());
+        parallel_visits[pattern_index].fetch_add(1, std::memory_order_relaxed);
+        scratch_by_slot[stable_slot] = resident_charts[pattern_index];
+        if (first_call_by_slot[stable_slot].fetch_add(
+                1, std::memory_order_relaxed) == 0) {
+          {
+            std::lock_guard lock{overlap_mutex};
+            overlap_threads.insert(std::this_thread::get_id());
+          }
+          overlap.arrive_and_wait();
+        }
+        return scratch_by_slot[stable_slot];
+      },
+      options);
+  for (auto const& visits : parallel_visits) {
+    CHECK(visits.load(std::memory_order_relaxed) == 1);
+  }
+  CHECK(overlap_threads.size() == 4);
+  CHECK(four_workers.metrics().active_worker_high_water == 4);
+  CHECK(four_workers.metrics().pending_tasks == 0);
+  check_setup_equal(serial_setup, scheduled_four);
+
+  auto topology = larch::chart_multisite_detail::first_topology(grammar);
+  auto serial_topology_score =
+      larch::score_selected_topology(grammar, patterns, topology, options);
+  auto scheduled_topology_score = larch::score_selected_topology(
+      grammar, patterns, topology, four_workers, options);
+  CHECK(scheduled_topology_score == serial_topology_score);
+
+  auto metrics_before_failure = four_workers.metrics();
+  std::array<std::atomic<std::size_t>, 4> failure_first_by_slot{};
+  std::barrier failure_overlap{4};
+  bool failed = false;
+  try {
+    (void)larch::build_multisite_exact_setup_from_resident_inside(
+        plan, patterns, four_workers,
+        [&](std::size_t pattern_index, larch::site_pattern const&,
+            std::size_t stable_slot) -> larch::single_site_chart const& {
+          if (failure_first_by_slot[stable_slot].fetch_add(
+                  1, std::memory_order_relaxed) == 0) {
+            failure_overlap.arrive_and_wait();
+          }
+          if (pattern_index == 0) {
+            throw std::runtime_error("scheduled exact setup test failure");
+          }
+          return resident_charts[pattern_index];
+        },
+        options);
+  } catch (std::runtime_error const& error) {
+    failed = true;
+    CHECK(std::string_view{error.what()} ==
+          "scheduled exact setup test failure");
+  }
+  CHECK(failed);
+  auto metrics_after_failure = four_workers.metrics();
+  CHECK(metrics_after_failure.tasks_submitted -
+            metrics_before_failure.tasks_submitted ==
+        4);
+  CHECK(metrics_after_failure.tasks_completed -
+            metrics_before_failure.tasks_completed ==
+        4);
+  CHECK(metrics_after_failure.tasks_joined -
+            metrics_before_failure.tasks_joined ==
+        4);
+  CHECK(metrics_after_failure.pending_tasks == 0);
+
+  std::vector<std::atomic<std::size_t>> recovery_visits(
+      patterns.patterns.size());
+  auto recovered = larch::build_multisite_exact_setup_from_resident_inside(
+      plan, patterns, four_workers,
+      [&](std::size_t pattern_index, larch::site_pattern const&,
+          std::size_t) -> larch::single_site_chart const& {
+        recovery_visits[pattern_index].fetch_add(1, std::memory_order_relaxed);
+        return resident_charts[pattern_index];
+      },
+      options);
+  for (auto const& visits : recovery_visits) {
+    CHECK(visits.load(std::memory_order_relaxed) == 1);
+  }
+  check_setup_equal(serial_setup, recovered);
+  CHECK(four_workers.metrics().pool_lifetimes == 1);
+  CHECK(four_workers.metrics().pending_tasks == 0);
+  four_workers.shutdown();
+  CHECK(four_workers.metrics().pool_lifetimes_stopped == 1);
+  CHECK(four_workers.metrics().live_pool_threads == 0);
+
+  std::println("  PASS");
+}
+
 static void test_composite_reference_state_diagnostics() {
   std::println("test_composite_reference_state_diagnostics");
 
@@ -2590,6 +2821,7 @@ int main() {
   test_multisite_invariant_sites_and_reference_edge_constant();
   test_plan_multisite_trim_strict_semantic_equivalence();
   test_multisite_exact_setup_cold_resident_and_lifetime();
+  test_scheduled_multisite_exact_setup_and_topology_scoring();
   test_composite_reference_state_diagnostics();
   test_multisite_rejects_pattern_taxon_count_mismatch();
   test_multisite_equal_dedup_merges_provenance();

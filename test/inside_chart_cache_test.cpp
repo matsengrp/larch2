@@ -38,6 +38,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <barrier>
 #include <cstdint>
 #include <optional>
 #include <print>
@@ -439,6 +441,38 @@ static std::vector<larch::single_site_chart> build_resident_inside_charts(
   return charts;
 }
 
+static larch::active_site_pattern_set repeat_active_patterns(
+    larch::active_site_pattern_set const& source, std::size_t count) {
+  CHECK(!source.patterns.patterns.empty());
+  larch::active_site_pattern_set result;
+  result.patterns.taxon_count = source.patterns.taxon_count;
+  result.patterns.patterns.reserve(count);
+  for (std::size_t p = 0; p < count; ++p) {
+    larch::chart_spr_search_detail::append_active_pattern_metadata(
+        result.patterns,
+        source.patterns.patterns[p % source.patterns.patterns.size()]);
+  }
+  result.patterns.exact_pattern_to_normalized_binary_pattern.assign(
+      count, larch::no_site_pattern);
+  result.patterns.exact_pattern_to_normalized_binary_state_map.assign(
+      count, larch::normalized_binary_state_map{});
+  result.assert_no_skipped_invariant_metadata();
+  return result;
+}
+
+static larch::chart_scheduler make_pattern_scheduler(std::size_t workers) {
+  return larch::chart_scheduler{larch::chart_scheduler_options{
+                                    .requested_workers = workers,
+                                    .default_minimum_grain = 1,
+                                    .default_target_ranges_per_worker = 1,
+                                },
+                                larch::chart_worker_topology_snapshot{
+                                    .affinity_logical_cpu_count = 4,
+                                    .affinity_physical_core_count = 4,
+                                    .hardware_thread_count = 4,
+                                }};
+}
+
 static void assert_pattern_metadata_equal(larch::site_pattern const& lhs,
                                           larch::site_pattern const& rhs) {
   CHECK(lhs.state_by_taxon == rhs.state_by_taxon);
@@ -474,6 +508,151 @@ static void assert_cold_and_resident_caches_equal(
         cold.inside_rows_recomputed_on_commit);
   CHECK(larch::inside_cache_composite_lower_bound_with_invariants(resident) ==
         larch::inside_cache_composite_lower_bound_with_invariants(cold));
+}
+
+static void assert_scheduled_inside_caches_equal(
+    larch::inside_chart_cache const& lhs,
+    larch::inside_chart_cache const& rhs) {
+  assert_cold_and_resident_caches_equal(lhs, rhs);
+  CHECK(lhs.multifurcation_productions_scored ==
+        rhs.multifurcation_productions_scored);
+  CHECK(lhs.build_stats == rhs.build_stats);
+}
+
+static void test_scheduled_cold_cache_w1_w4_determinism() {
+  std::println("test_scheduled_cold_cache_w1_w4_determinism");
+
+  auto f = load_trinary_fixture(true);
+  f.active = repeat_active_patterns(f.active, 64);
+  auto plan = larch::build_chart_execution_plan(f.grammar);
+  auto checked = larch::check_chart_execution_plan(f.grammar, plan);
+  auto legacy = larch::build_inside_chart_cache(f.grammar, checked, f.active,
+                                                f.options, f.invariant_offset);
+
+  auto scheduler_w1 = make_pattern_scheduler(1);
+  larch::chart_scheduler_run_summary summary_w1;
+  auto scheduled_w1 = larch::build_inside_chart_cache(
+      f.grammar, checked, f.active, f.options, f.invariant_offset, scheduler_w1,
+      {.minimum_grain = 1, .target_ranges_per_worker = 1}, &summary_w1);
+
+  auto scheduler_w4 = make_pattern_scheduler(4);
+  larch::chart_scheduler_run_summary summary_w4;
+  auto scheduled_w4 = larch::build_inside_chart_cache(
+      f.grammar, checked, f.active, f.options, f.invariant_offset, scheduler_w4,
+      {.minimum_grain = 1, .target_ranges_per_worker = 1}, &summary_w4);
+
+  assert_scheduled_inside_caches_equal(legacy, scheduled_w1);
+  assert_scheduled_inside_caches_equal(scheduled_w1, scheduled_w4);
+  CHECK(summary_w1.item_count == f.active.patterns.patterns.size());
+  CHECK(summary_w1.worker_tasks_submitted == 0);
+  CHECK(summary_w1.serial_reason ==
+        larch::chart_scheduler_serial_reason::one_resolved_worker);
+  CHECK(scheduler_w1.metrics().pool_lifetimes == 0);
+  CHECK(summary_w4.item_count == f.active.patterns.patterns.size());
+  CHECK(summary_w4.range_count == 4);
+  CHECK(summary_w4.worker_tasks_submitted == 4);
+  CHECK(summary_w4.used_parallel_workers());
+  CHECK(summary_w4.ranges_completed == summary_w4.range_count);
+  CHECK(scheduler_w4.metrics().tasks_submitted ==
+        scheduler_w4.metrics().tasks_joined);
+  CHECK(scheduler_w4.metrics().pending_tasks == 0);
+
+  std::println("  PASS ({} patterns, {} W4 ranges)", summary_w4.item_count,
+               summary_w4.range_count);
+}
+
+static void test_scheduled_resident_cache_slots_join_and_recovery() {
+  std::println("test_scheduled_resident_cache_slots_join_and_recovery");
+
+  auto f = load_binary_four_fixture(true);
+  // Two patterns per claimed W4 range make the failure test below exercise
+  // cancellation between items in a range. A claimed lower range must finish
+  // and publish its lower-index failure even if a higher range fails first.
+  f.active = repeat_active_patterns(f.active, 8);
+  auto plan = larch::build_chart_execution_plan(f.grammar);
+  auto checked = larch::check_chart_execution_plan(f.grammar, plan);
+  auto charts = build_resident_inside_charts(f, plan);
+  auto source = larch::make_inside_chart_cache_resident_source_identity(
+      f.grammar, checked, f.active);
+
+  auto scheduler_w1 = make_pattern_scheduler(1);
+  larch::chart_scheduler_run_summary summary_w1;
+  auto resident_w1 = larch::build_inside_chart_cache_from_resident_inside(
+      f.grammar, checked, source, f.active, f.options, f.invariant_offset,
+      [&](std::size_t p, larch::site_pattern const&,
+          std::size_t stable_slot) -> larch::single_site_chart const& {
+        CHECK(stable_slot == 0);
+        return charts[p];
+      },
+      scheduler_w1, {.minimum_grain = 1, .target_ranges_per_worker = 1},
+      &summary_w1);
+  CHECK(summary_w1.worker_tasks_submitted == 0);
+  CHECK(scheduler_w1.metrics().pool_lifetimes == 0);
+
+  auto scheduler_w4 = make_pattern_scheduler(4);
+  std::barrier all_providers_started{4};
+  std::array<std::atomic<std::size_t>, 4> calls_by_slot{};
+  larch::chart_scheduler_run_summary summary_w4;
+  auto resident_w4 = larch::build_inside_chart_cache_from_resident_inside(
+      f.grammar, checked, source, f.active, f.options, f.invariant_offset,
+      [&](std::size_t p, larch::site_pattern const&,
+          std::size_t stable_slot) -> larch::single_site_chart const& {
+        calls_by_slot[stable_slot].fetch_add(1, std::memory_order_relaxed);
+        all_providers_started.arrive_and_wait();
+        return charts[p];
+      },
+      scheduler_w4, {.minimum_grain = 1, .target_ranges_per_worker = 1},
+      &summary_w4);
+
+  assert_scheduled_inside_caches_equal(resident_w1, resident_w4);
+  CHECK(summary_w4.range_count == 4);
+  CHECK(summary_w4.worker_tasks_submitted == 4);
+  CHECK(summary_w4.active_workers == 4);
+  for (auto const& calls : calls_by_slot) {
+    CHECK(calls.load(std::memory_order_relaxed) == 2);
+  }
+
+  auto before_failure = scheduler_w4.metrics();
+  std::barrier failing_providers_started{4};
+  std::string failure;
+  CHECK(throws_runtime_error([&] {
+    try {
+      (void)larch::build_inside_chart_cache_from_resident_inside(
+          f.grammar, checked, source, f.active, f.options, f.invariant_offset,
+          [&](std::size_t p, larch::site_pattern const&,
+              std::size_t) -> larch::single_site_chart const& {
+            failing_providers_started.arrive_and_wait();
+            if (p == 1 || p == 3) {
+              throw std::runtime_error("resident provider pattern " +
+                                       std::to_string(p));
+            }
+            return charts[p];
+          },
+          scheduler_w4, {.minimum_grain = 1, .target_ranges_per_worker = 1});
+    } catch (std::runtime_error const& e) {
+      failure = e.what();
+      throw;
+    }
+  }));
+  CHECK(failure == "resident provider pattern 1");
+  auto after_failure = scheduler_w4.metrics();
+  CHECK(after_failure.tasks_submitted - before_failure.tasks_submitted == 4);
+  CHECK(after_failure.tasks_completed - before_failure.tasks_completed == 4);
+  CHECK(after_failure.tasks_joined - before_failure.tasks_joined == 4);
+  CHECK(after_failure.pending_tasks == 0);
+
+  larch::chart_scheduler_run_summary recovery_summary;
+  auto recovered = larch::build_inside_chart_cache_from_resident_inside(
+      f.grammar, checked, source, f.active, f.options, f.invariant_offset,
+      [&](std::size_t p, larch::site_pattern const&,
+          std::size_t) -> larch::single_site_chart const& { return charts[p]; },
+      scheduler_w4, {.minimum_grain = 1, .target_ranges_per_worker = 1},
+      &recovery_summary);
+  assert_scheduled_inside_caches_equal(resident_w1, recovered);
+  CHECK(recovery_summary.ranges_completed == recovery_summary.range_count);
+  CHECK(scheduler_w4.metrics().pending_tasks == 0);
+
+  std::println("  PASS (stable slots, deterministic failure, joined recovery)");
 }
 
 static void assert_resident_cache_equivalence(active_fixture f) {
@@ -1193,6 +1372,8 @@ static void test_empty_chain_throws() {
 }
 
 int main() {
+  test_scheduled_cold_cache_w1_w4_determinism();
+  test_scheduled_resident_cache_slots_join_and_recovery();
   test_resident_cache_binary_multifurcating_ua_equivalence();
   test_resident_cache_owns_rows_and_pattern_metadata();
   test_resident_cache_compatible_frozen_destination();

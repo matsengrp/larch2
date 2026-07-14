@@ -36,6 +36,7 @@
 // second reset.
 
 #include <larch/chart_spr.hpp>          // overlay vocabulary, materialize_overlay_grammar
+#include <larch/chart_scheduler.hpp>    // persistent pattern-axis scheduling
 #include <larch/chart_spr_search.hpp>   // spr_overlay_delta, active_site_pattern_set,
                                         // chart_spr_weighted_root_score_from_row
 #include <larch/chart_trim.hpp>         // multisite_trim_result, chart_multisite_detail
@@ -828,6 +829,73 @@ inline inside_chart_cache build_inside_chart_cache(
   return cache;
 }
 
+// Scheduler-aware trusted cold construction.  All validation and cache-shape
+// publication remains on the caller.  Workers own disjoint pattern rows and
+// publish only pattern-indexed recurrence counters; the caller folds those
+// counters in increasing pattern order after every task has joined.  If a
+// worker throws, the scheduler joins the operation and this function publishes
+// no cache or partial accounting to its caller.
+//
+// `run_summary`, when non-null, receives this operation's summary (not a
+// lifetime scheduler snapshot) after a successful join.
+inline inside_chart_cache build_inside_chart_cache(
+    clade_grammar const& base, checked_chart_execution_plan_ref const& checked,
+    active_site_pattern_set const& active, chart_options options,
+    std::uint64_t invariant_constant_offset, chart_scheduler& scheduler,
+    chart_indexed_range_options range_options = {},
+    chart_scheduler_run_summary* run_summary = nullptr) {
+  active.assert_no_skipped_invariant_metadata();
+  checked.assert_same(base, checked.plan());
+  auto const& plan = checked.plan();
+  chart_multisite_detail::validate_multisite_inputs(plan, active.patterns,
+                                                    options);
+
+  inside_chart_cache cache;
+  cache.base = &base;
+  cache.base_execution_generation = plan.grammar_generation();
+  cache.base_execution_fingerprint = plan.fingerprint();
+  cache.chart_opts = options;
+  cache.patterns = active.patterns.patterns;
+  cache.taxon_count = active.patterns.taxon_count;
+  cache.active_pattern_fingerprint =
+      inside_chart_cache_detail::fingerprint_active_pattern_set(active);
+  cache.invariant_constant_offset = invariant_constant_offset;
+  cache.temp_clade_count = 0;
+
+  chart_options build_opts = options;
+  build_opts.keep_trace = false;
+  build_opts.max_trace_choices = 0;
+
+  cache.base_rows.resize(cache.patterns.size());
+  cache.temp_rows.resize(cache.patterns.size());
+  std::vector<std::size_t> multifurcation_by_pattern(cache.patterns.size(), 0);
+
+  auto summary = scheduler.for_each_indexed_range(
+      cache.patterns.size(), range_options,
+      [&](chart_indexed_range const& range, std::size_t,
+          chart_scheduler_cancellation_token const&) {
+        for (std::size_t p = range.begin; p < range.end; ++p) {
+          leaf_site_states states;
+          states.state_by_taxon = cache.patterns[p].state_by_taxon;
+          auto chart = build_single_site_chart(plan, states, build_opts);
+          if (chart.inside.size() != plan.clades().size()) {
+            throw std::runtime_error(
+                "inside cache: base chart clade count mismatch");
+          }
+          multifurcation_by_pattern[p] =
+              chart.multifurcation_productions_scored;
+          cache.base_rows[p].assign(chart.inside.begin(), chart.inside.end());
+        }
+      });
+
+  for (std::size_t p = 0; p < cache.patterns.size(); ++p) {
+    cache.multifurcation_productions_scored += multifurcation_by_pattern[p];
+    ++cache.build_stats.inside_charts_built;
+  }
+  if (run_summary != nullptr) *run_summary = summary;
+  return cache;
+}
+
 inline inside_chart_cache build_inside_chart_cache(
     clade_grammar const& base, chart_execution_plan const& plan,
     active_site_pattern_set const& active, chart_options options,
@@ -835,6 +903,18 @@ inline inside_chart_cache build_inside_chart_cache(
   auto checked = check_chart_execution_plan(base, plan);
   return build_inside_chart_cache(base, checked, active, options,
                                   invariant_constant_offset);
+}
+
+inline inside_chart_cache build_inside_chart_cache(
+    clade_grammar const& base, chart_execution_plan const& plan,
+    active_site_pattern_set const& active, chart_options options,
+    std::uint64_t invariant_constant_offset, chart_scheduler& scheduler,
+    chart_indexed_range_options range_options = {},
+    chart_scheduler_run_summary* run_summary = nullptr) {
+  auto checked = check_chart_execution_plan(base, plan);
+  return build_inside_chart_cache(base, checked, active, options,
+                                  invariant_constant_offset, scheduler,
+                                  range_options, run_summary);
 }
 
 // Build a cold cache by copying compatible, immutable resident inside charts.
@@ -898,6 +978,75 @@ inline inside_chart_cache build_inside_chart_cache_from_resident_inside(
   return cache;
 }
 
+// Scheduler-aware resident construction.  The provider is invoked as
+// `provider(pattern_index, active_pattern, stable_slot_id)`.  Calls for
+// different slots may overlap; calls carrying the same stable slot never do.
+// A provider that needs mutable scratch must therefore bind one scratch object
+// to each scheduler slot.  The returned chart is copied before the provider is
+// called again on that slot.
+template <class ResidentChartProvider>
+  requires requires(ResidentChartProvider& provider, std::size_t index,
+                    site_pattern const& pattern, std::size_t stable_slot) {
+    {
+      std::invoke(provider, index, pattern, stable_slot)
+    } -> std::same_as<single_site_chart const&>;
+  }
+inline inside_chart_cache build_inside_chart_cache_from_resident_inside(
+    clade_grammar const& destination_base,
+    checked_chart_execution_plan_ref const& destination_checked,
+    clade_grammar const& source_base,
+    checked_chart_execution_plan_ref const& source_checked,
+    inside_chart_cache_resident_source_identity const& source_identity,
+    active_site_pattern_set const& active, chart_options options,
+    std::uint64_t invariant_constant_offset,
+    ResidentChartProvider&& resident_chart_provider, chart_scheduler& scheduler,
+    chart_indexed_range_options range_options = {},
+    chart_scheduler_run_summary* run_summary = nullptr) {
+  source_checked.assert_same(source_base, source_checked.plan());
+  source_identity.assert_same(source_base, source_checked.plan(), active);
+  destination_checked.assert_same(destination_base, destination_checked.plan());
+  auto const& destination_plan = destination_checked.plan();
+  source_identity.assert_compatible_destination(destination_plan);
+
+  active.assert_no_skipped_invariant_metadata();
+  chart_multisite_detail::validate_multisite_inputs(destination_plan,
+                                                    active.patterns, options);
+
+  inside_chart_cache cache;
+  cache.base = &destination_base;
+  cache.base_execution_generation = destination_plan.grammar_generation();
+  cache.base_execution_fingerprint = destination_plan.fingerprint();
+  cache.chart_opts = options;
+  cache.patterns = active.patterns.patterns;
+  cache.taxon_count = active.patterns.taxon_count;
+  cache.active_pattern_fingerprint =
+      inside_chart_cache_detail::fingerprint_active_pattern_set(active);
+  cache.invariant_constant_offset = invariant_constant_offset;
+  cache.temp_clade_count = 0;
+  cache.base_rows.resize(cache.patterns.size());
+  cache.temp_rows.resize(cache.patterns.size());
+
+  auto summary = scheduler.for_each_indexed_range(
+      cache.patterns.size(), range_options,
+      [&](chart_indexed_range const& range, std::size_t stable_slot,
+          chart_scheduler_cancellation_token const&) {
+        for (std::size_t p = range.begin; p < range.end; ++p) {
+          single_site_chart const& chart =
+              std::invoke(resident_chart_provider, p,
+                          active.patterns.patterns[p], stable_slot);
+          if (chart.inside.size() != destination_plan.clades().size()) {
+            throw std::runtime_error(
+                "inside cache resident source: chart clade count mismatch");
+          }
+          cache.base_rows[p].assign(chart.inside.begin(), chart.inside.end());
+        }
+      });
+
+  cache.build_stats.resident_inside_charts_consumed = cache.patterns.size();
+  if (run_summary != nullptr) *run_summary = summary;
+  return cache;
+}
+
 // Convenience overload for the historical/same-source case. It deliberately
 // routes through the stronger source-to-destination boundary so both paths
 // share exactly the same provenance and shape checks.
@@ -918,6 +1067,28 @@ inline inside_chart_cache build_inside_chart_cache_from_resident_inside(
       base, checked, base, checked, source_identity, active, options,
       invariant_constant_offset,
       std::forward<ResidentChartProvider>(resident_chart_provider));
+}
+
+template <class ResidentChartProvider>
+  requires requires(ResidentChartProvider& provider, std::size_t index,
+                    site_pattern const& pattern, std::size_t stable_slot) {
+    {
+      std::invoke(provider, index, pattern, stable_slot)
+    } -> std::same_as<single_site_chart const&>;
+  }
+inline inside_chart_cache build_inside_chart_cache_from_resident_inside(
+    clade_grammar const& base, checked_chart_execution_plan_ref const& checked,
+    inside_chart_cache_resident_source_identity const& source_identity,
+    active_site_pattern_set const& active, chart_options options,
+    std::uint64_t invariant_constant_offset,
+    ResidentChartProvider&& resident_chart_provider, chart_scheduler& scheduler,
+    chart_indexed_range_options range_options = {},
+    chart_scheduler_run_summary* run_summary = nullptr) {
+  return build_inside_chart_cache_from_resident_inside(
+      base, checked, base, checked, source_identity, active, options,
+      invariant_constant_offset,
+      std::forward<ResidentChartProvider>(resident_chart_provider), scheduler,
+      range_options, run_summary);
 }
 
 namespace inside_chart_cache_detail {

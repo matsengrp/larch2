@@ -18,23 +18,192 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
 namespace larch {
 
+class overlay_chain;
+
+struct chart_spr_scheduler_axis_metrics {
+  std::uint64_t operations = 0;
+  std::uint64_t parallel_operations = 0;
+  std::uint64_t items = 0;
+  std::uint64_t ranges = 0;
+  std::uint64_t worker_tasks = 0;
+  std::size_t active_worker_high_water = 0;
+  std::size_t minimum_effective_grain = 0;
+  std::size_t maximum_effective_grain = 0;
+
+  bool operator==(chart_spr_scheduler_axis_metrics const&) const = default;
+};
+
+struct chart_spr_scheduler_axis_counters {
+  chart_spr_scheduler_axis_metrics initial_chart_patterns;
+  chart_spr_scheduler_axis_metrics exact_setup_patterns;
+  chart_spr_scheduler_axis_metrics inside_cache_patterns;
+  chart_spr_scheduler_axis_metrics outside_cache_patterns;
+  chart_spr_scheduler_axis_metrics fixed_topology_patterns;
+  chart_spr_scheduler_axis_metrics local_score_candidates;
+  chart_spr_scheduler_axis_metrics local_score_candidate_patterns;
+  chart_spr_scheduler_axis_metrics other;
+
+  bool operator==(chart_spr_scheduler_axis_counters const&) const = default;
+};
+
+inline void record_chart_spr_scheduler_axis_run(
+    chart_spr_scheduler_axis_metrics& axis,
+    chart_scheduler_run_summary const& run) {
+  ++axis.operations;
+  if (run.used_parallel_workers()) ++axis.parallel_operations;
+  axis.items += run.item_count;
+  axis.ranges += run.range_count;
+  axis.worker_tasks += run.worker_tasks_submitted;
+  axis.active_worker_high_water =
+      std::max(axis.active_worker_high_water, run.active_workers);
+  // The scheduler deliberately excludes empty operations from its lifetime
+  // grain extrema.  Axis accounting must use the identical convention so the
+  // two surfaces reconcile exactly.
+  if (run.range_count != 0) {
+    if (axis.minimum_effective_grain == 0) {
+      axis.minimum_effective_grain = run.effective_grain;
+    } else {
+      axis.minimum_effective_grain =
+          std::min(axis.minimum_effective_grain, run.effective_grain);
+    }
+    axis.maximum_effective_grain =
+        std::max(axis.maximum_effective_grain, run.effective_grain);
+  }
+}
+
+inline chart_indexed_range_options chart_spr_phase4_pattern_range_options(
+    std::size_t item_count, std::size_t resolved_workers) noexcept {
+  if (resolved_workers <= 1) {
+    return chart_indexed_range_options{
+        .minimum_grain = std::max<std::size_t>(1, item_count),
+        .target_ranges_per_worker = 1,
+    };
+  }
+  return chart_indexed_range_options{
+      .minimum_grain = 1,
+      .target_ranges_per_worker = 4,
+  };
+}
+
+// Accepted-candidate rebuild failures are ordinary rejections. If such a
+// rebuild throws after completing scheduler work, retain the completed axes
+// so the eventual successful search report still reconciles with the one
+// search-lifetime scheduler. Normal returns publish through the returned
+// state's counters and therefore leave this destination untouched.
+class chart_spr_failed_scheduler_axes_publisher {
+ public:
+  chart_spr_failed_scheduler_axes_publisher(
+      chart_spr_scheduler_axis_counters const& source,
+      chart_spr_scheduler_axis_counters* destination) noexcept
+      : source_(&source),
+        destination_(destination),
+        uncaught_on_entry_(std::uncaught_exceptions()) {}
+
+  ~chart_spr_failed_scheduler_axes_publisher() noexcept {
+    if (destination_ != nullptr &&
+        std::uncaught_exceptions() > uncaught_on_entry_) {
+      *destination_ = *source_;
+    }
+  }
+
+ private:
+  chart_spr_scheduler_axis_counters const* source_;
+  chart_spr_scheduler_axis_counters* destination_;
+  int uncaught_on_entry_;
+};
+
+class chart_spr_scheduler_run_axis_publisher {
+ public:
+  chart_spr_scheduler_run_axis_publisher(
+      chart_spr_scheduler_axis_metrics& axis,
+      std::vector<chart_scheduler_run_summary> const& runs) noexcept
+      : axis_(&axis), runs_(&runs) {}
+
+  ~chart_spr_scheduler_run_axis_publisher() noexcept {
+    for (auto const& run : *runs_) {
+      record_chart_spr_scheduler_axis_run(*axis_, run);
+    }
+  }
+
+ private:
+  chart_spr_scheduler_axis_metrics* axis_;
+  std::vector<chart_scheduler_run_summary> const* runs_;
+};
+
+inline void add_chart_spr_scheduler_axis_metrics(
+    chart_spr_scheduler_axis_metrics& dst,
+    chart_spr_scheduler_axis_metrics const& src) {
+  dst.operations += src.operations;
+  dst.parallel_operations += src.parallel_operations;
+  dst.items += src.items;
+  dst.ranges += src.ranges;
+  dst.worker_tasks += src.worker_tasks;
+  dst.active_worker_high_water =
+      std::max(dst.active_worker_high_water, src.active_worker_high_water);
+  if (src.minimum_effective_grain != 0) {
+    dst.minimum_effective_grain = dst.minimum_effective_grain == 0
+                                      ? src.minimum_effective_grain
+                                      : std::min(dst.minimum_effective_grain,
+                                                 src.minimum_effective_grain);
+  }
+  dst.maximum_effective_grain =
+      std::max(dst.maximum_effective_grain, src.maximum_effective_grain);
+}
+
+inline void add_chart_spr_scheduler_axis_counters(
+    chart_spr_scheduler_axis_counters& dst,
+    chart_spr_scheduler_axis_counters const& src) {
+  add_chart_spr_scheduler_axis_metrics(dst.initial_chart_patterns,
+                                       src.initial_chart_patterns);
+  add_chart_spr_scheduler_axis_metrics(dst.exact_setup_patterns,
+                                       src.exact_setup_patterns);
+  add_chart_spr_scheduler_axis_metrics(dst.inside_cache_patterns,
+                                       src.inside_cache_patterns);
+  add_chart_spr_scheduler_axis_metrics(dst.outside_cache_patterns,
+                                       src.outside_cache_patterns);
+  add_chart_spr_scheduler_axis_metrics(dst.fixed_topology_patterns,
+                                       src.fixed_topology_patterns);
+  add_chart_spr_scheduler_axis_metrics(dst.local_score_candidates,
+                                       src.local_score_candidates);
+  add_chart_spr_scheduler_axis_metrics(dst.local_score_candidate_patterns,
+                                       src.local_score_candidate_patterns);
+  add_chart_spr_scheduler_axis_metrics(dst.other, src.other);
+}
+
+inline std::uint64_t chart_spr_scheduler_axis_operation_count(
+    chart_spr_scheduler_axis_counters const& axes) noexcept {
+  return axes.initial_chart_patterns.operations +
+         axes.exact_setup_patterns.operations +
+         axes.inside_cache_patterns.operations +
+         axes.outside_cache_patterns.operations +
+         axes.fixed_topology_patterns.operations +
+         axes.local_score_candidates.operations +
+         axes.local_score_candidate_patterns.operations + axes.other.operations;
+}
+
 // Phase-0 instrumentation for the DAG-native chart-SPR search path.  These
 // counters deliberately separate accepted-state rebuilds from diagnostic/oracle
 // overlay materializations and exact-verification materializations so benchmark
 // output can detect accidental "full rebuild per rejected candidate" behavior.
 struct chart_spr_search_counters {
+  // Phase-4 scheduler work is classified by semantic axis. The sum of axis
+  // operation/range/task counts must reconcile with the search-lifetime
+  // scheduler totals; no parallel work is hidden behind a generic bucket.
+  chart_spr_scheduler_axis_counters scheduler_axes;
   std::size_t grammar_rebuilds = 0;
   std::size_t pattern_rebuilds = 0;
   std::size_t base_chart_cache_rebuilds = 0;
@@ -965,6 +1134,10 @@ using chart_spr_exact_multisite_verifier = std::function<
 // and work-counter recording remain authoritative at the call site.
 using chart_spr_exact_setup_provider = std::function<multisite_exact_setup(
     chart_spr_search_state const&, checked_chart_execution_plan_ref const&)>;
+using chart_spr_scheduled_exact_setup_provider =
+    std::function<multisite_exact_setup(
+        chart_spr_search_state const&, checked_chart_execution_plan_ref const&,
+        chart_scheduler&, std::vector<chart_scheduler_run_summary>*)>;
 
 struct affected_clade_distribution {
   double mean = 0.0;
@@ -1210,6 +1383,7 @@ struct chart_spr_search_summary {
   // is shut down before this snapshot is published, so pending tasks and live
   // pool threads must both be zero in every returned result.
   chart_scheduler_metrics scheduler;
+  chart_spr_scheduler_axis_counters scheduler_axes;
   affected_clade_distribution affected_distribution;
   // Phase 10 cross-cutting surface.  These mirror the selected commit /
   // verification modes and the chain's per-accept exactness label so a run's
@@ -1927,14 +2101,45 @@ inline multisite_trim_result build_lazy_multisite_trim_active_from_scratch(
 
 inline std::size_t estimate_chart_spr_pattern_row_cache_bytes(
     clade_grammar const& grammar) {
-  return grammar.clades.size() * nuc_state_count * sizeof(chart_cost);
+  constexpr auto bytes_per_row = nuc_state_count * sizeof(chart_cost);
+  if (grammar.clades.size() >
+      (std::numeric_limits<std::size_t>::max)() / bytes_per_row) {
+    throw std::overflow_error("chart SPR pattern-cache row byte overflow");
+  }
+  return grammar.clades.size() * bytes_per_row;
+}
+
+inline std::size_t estimate_chart_spr_pattern_entry_cache_bytes(
+    clade_grammar const& grammar) {
+  auto const row_bytes = estimate_chart_spr_pattern_row_cache_bytes(grammar);
+  if (row_bytes > (std::numeric_limits<std::size_t>::max)() -
+                      sizeof(pattern_chart_cache_entry)) {
+    throw std::overflow_error("chart SPR pattern-cache entry byte overflow");
+  }
+  return row_bytes + sizeof(pattern_chart_cache_entry);
+}
+
+inline std::size_t estimate_chart_spr_pattern_batch_cache_bytes(
+    clade_grammar const& grammar, std::size_t pattern_count) {
+  auto const entry_bytes =
+      estimate_chart_spr_pattern_entry_cache_bytes(grammar);
+  if (entry_bytes != 0 &&
+      pattern_count > (std::numeric_limits<std::size_t>::max)() / entry_bytes) {
+    throw std::overflow_error("chart SPR pattern-cache batch byte overflow");
+  }
+  return pattern_count * entry_bytes;
 }
 
 inline std::size_t estimate_chart_spr_full_pattern_cache_bytes(
     clade_grammar const& grammar, active_site_pattern_set const& patterns) {
   patterns.assert_no_skipped_invariant_metadata();
-  return patterns.patterns.patterns.size() *
-         estimate_chart_spr_pattern_row_cache_bytes(grammar);
+  auto const row_bytes = estimate_chart_spr_pattern_row_cache_bytes(grammar);
+  auto const pattern_count = patterns.patterns.patterns.size();
+  if (row_bytes != 0 &&
+      pattern_count > (std::numeric_limits<std::size_t>::max)() / row_bytes) {
+    throw std::overflow_error("chart SPR full pattern-cache byte overflow");
+  }
+  return pattern_count * row_bytes;
 }
 
 inline std::size_t choose_chart_spr_pattern_batch_size(
@@ -1952,9 +2157,9 @@ inline std::size_t choose_chart_spr_pattern_batch_size(
   if (cache.max_cached_patterns != 0) {
     limit = std::min(limit, cache.max_cached_patterns);
   }
-  auto row_bytes = estimate_chart_spr_pattern_row_cache_bytes(grammar);
-  if (cache.memory_budget_bytes != 0 && row_bytes != 0) {
-    auto by_budget = cache.memory_budget_bytes / row_bytes;
+  auto entry_bytes = estimate_chart_spr_pattern_entry_cache_bytes(grammar);
+  if (cache.memory_budget_bytes != 0 && entry_bytes != 0) {
+    auto by_budget = cache.memory_budget_bytes / entry_bytes;
     if (by_budget == 0) by_budget = 1;
     limit = std::min(limit, by_budget);
   }
@@ -2075,6 +2280,15 @@ struct chart_spr_search_state {
       chart_spr_cache_strategy::all_active_patterns;
   std::size_t estimated_full_pattern_cache_bytes = 0;
   std::size_t resident_pattern_cache_bytes = 0;
+  // Persistent local-commit inside+outside row caches are additional to the
+  // scoring representation above. Keep their contribution separate so tip
+  // refreshes can replace the scoring estimate without under-reporting the
+  // two full cache surfaces.
+  std::size_t local_commit_persistent_cache_bytes = 0;
+  // Fixed-topology local verification bounds its per-candidate structural row
+  // cache, clears it at the operation boundary, and retains only this admitted
+  // high-water estimate for budget/report reconciliation.
+  mutable std::size_t selected_topology_cache_admitted_bytes = 0;
   std::size_t effective_pattern_batch_size = 0;
   mutable std::size_t effective_candidate_batch_size = 0;
   std::vector<pattern_chart_cache_entry> pattern_charts;
@@ -2103,6 +2317,7 @@ struct chart_spr_search_state {
   // bounded public representation intentionally owns no full pattern charts.
   // Lazy and all-active paths retain their selected representations.
   chart_spr_exact_setup_provider exact_setup_provider;
+  chart_spr_scheduled_exact_setup_provider scheduled_exact_setup_provider;
 
   // Optional Phase-8 fixed-topology verifier supplied by the local-commit
   // substrate.  When present, fixed_topology_exact verification reads the
@@ -2172,45 +2387,65 @@ inline void finalize_deferred_pattern_batch_bootstrap(
 
 inline std::size_t estimate_chart_spr_pattern_cache_bytes(
     chart_spr_search_state const& state) {
+  auto checked_add = [](std::size_t lhs, std::size_t rhs) {
+    if (lhs > (std::numeric_limits<std::size_t>::max)() - rhs) {
+      throw std::overflow_error("chart SPR pattern-cache byte overflow");
+    }
+    return lhs + rhs;
+  };
+  auto capacity_bytes = [](auto const& values) {
+    using vector_type = std::remove_cvref_t<decltype(values)>;
+    if (values.capacity() != 0 &&
+        sizeof(typename vector_type::value_type) >
+            (std::numeric_limits<std::size_t>::max)() / values.capacity()) {
+      throw std::overflow_error("chart SPR pattern-cache byte overflow");
+    }
+    return values.capacity() * sizeof(typename vector_type::value_type);
+  };
+  auto add_nested_capacity = [&](std::size_t total, auto const& nested) {
+    total = checked_add(total, capacity_bytes(nested));
+    for (auto const& values : nested) {
+      total = checked_add(total, capacity_bytes(values));
+    }
+    return total;
+  };
+  auto add_optional_map_capacity = [&](std::size_t total, auto const& maps) {
+    total = checked_add(total, capacity_bytes(maps));
+    for (auto const& map : maps) {
+      if (map) total = checked_add(total, capacity_bytes(*map));
+    }
+    return total;
+  };
+
   if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
     if (!state.lazy_chart) return 0;
+    auto const& chart = *state.lazy_chart;
     std::size_t total = sizeof(lazy_multisite_chart);
-    for (auto const& rows : state.lazy_chart->inside_rows_by_clade) {
-      total += rows.size() * sizeof(lazy_multisite_chart::row_type);
-    }
-    for (auto const& rows : state.lazy_chart->outside_rows_by_clade) {
-      total += rows.size() * sizeof(lazy_multisite_chart::row_type);
-    }
-    for (auto const& map : state.lazy_chart->class_index_by_pattern_by_clade) {
-      if (map) total += map->size() * sizeof(std::size_t);
-    }
-    for (auto const& map :
-         state.lazy_chart->structural_class_index_by_pattern_by_clade) {
-      if (map) total += map->size() * sizeof(std::size_t);
-    }
-    for (auto const& map :
-         state.lazy_chart->outside_class_index_by_pattern_by_clade) {
-      if (map) total += map->size() * sizeof(std::size_t);
-    }
-    for (auto const& weights : state.lazy_chart->class_weight_by_clade) {
-      total += weights.size() * sizeof(std::uint32_t);
-    }
-    for (auto const& weights :
-         state.lazy_chart->outside_class_weight_by_clade) {
-      total += weights.size() * sizeof(std::uint32_t);
-    }
-    total += state.lazy_chart->structural_class_count_by_clade.size() *
-             sizeof(std::size_t);
-    total += state.lazy_chart->outside_global_min_by_pattern.size() *
-             sizeof(chart_cost);
+    total = add_nested_capacity(total, chart.inside_rows_by_clade);
+    total = add_nested_capacity(total, chart.outside_rows_by_clade);
+    total =
+        add_optional_map_capacity(total, chart.class_index_by_pattern_by_clade);
+    total = add_optional_map_capacity(
+        total, chart.structural_class_index_by_pattern_by_clade);
+    total = add_optional_map_capacity(
+        total, chart.outside_class_index_by_pattern_by_clade);
+    total = checked_add(total,
+                        capacity_bytes(chart.structural_class_count_by_clade));
+    total = add_nested_capacity(total, chart.class_weight_by_clade);
+    total = add_nested_capacity(total, chart.outside_class_weight_by_clade);
+    total =
+        checked_add(total, capacity_bytes(chart.outside_global_min_by_pattern));
     return total;
   }
-  std::size_t total = state.pattern_charts.size() *
-                      sizeof(pattern_chart_cache_entry);
+  std::size_t total = capacity_bytes(state.pattern_charts);
   for (auto const& entry : state.pattern_charts) {
-    total += entry.chart.inside.size() * sizeof(entry.chart.inside.front());
-    total += entry.chart.optimal_choices.size() *
-             sizeof(decltype(entry.chart.optimal_choices)::value_type);
+    total = checked_add(total, capacity_bytes(entry.chart.inside));
+    total = checked_add(total, capacity_bytes(entry.chart.optimal_choices));
+    for (auto const& choices_by_state : entry.chart.optimal_choices) {
+      for (auto const& choices : choices_by_state) {
+        total = checked_add(total, capacity_bytes(choices));
+      }
+    }
   }
   return total;
 }
@@ -2302,17 +2537,88 @@ inline multisite_trim_result build_chart_spr_state_exact_trim(
   return build_chart_spr_state_exact_trim(state, checked, trim_options);
 }
 
+inline multisite_trim_result build_chart_spr_state_exact_trim(
+    chart_spr_search_state const& state,
+    checked_chart_execution_plan_ref const& checked_state,
+    chart_scheduler& scheduler,
+    multisite_trim_options const& trim_options = {}) {
+  chart_spr_search_detail::require_completed_chart_spr_state_bootstrap(
+      state, "chart SPR exact trim");
+  state.active_patterns.assert_no_skipped_invariant_metadata();
+  checked_state.assert_same(state.grammar, state.execution_plan);
+
+  std::vector<chart_scheduler_run_summary> runs;
+  // Both current scheduled setup providers issue at most the active-pattern
+  // and upper-bound-topology operations. Reserve before either can run so an
+  // allocation failure cannot lose an already completed run summary.
+  runs.reserve(2);
+  chart_spr_scheduler_run_axis_publisher publish_runs{
+      state.counters.scheduler_axes.exact_setup_patterns, runs};
+  multisite_trim_result trim;
+  if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
+    auto const pattern_count = state.active_patterns.patterns.patterns.size();
+    if (state.pattern_charts.size() != pattern_count) {
+      throw std::runtime_error(
+          "chart SPR exact trim: all-active resident chart count mismatch");
+    }
+    auto setup = build_multisite_exact_setup_from_resident_inside(
+        state.execution_plan, state.active_patterns.patterns, scheduler,
+        [&](std::size_t pattern_index, site_pattern const&,
+            std::size_t) -> single_site_chart const& {
+          if (pattern_index >= state.pattern_charts.size()) {
+            throw std::runtime_error(
+                "chart SPR exact trim: resident pattern index out of range");
+          }
+          return state.pattern_charts[pattern_index].chart;
+        },
+        state.chart_opts, &runs);
+    trim = build_multisite_trim_from_exact_setup(
+        state.execution_plan, setup, state.chart_opts, trim_options);
+  } else if (state.cache_strategy ==
+             chart_spr_cache_strategy::lazy_multisite_chart) {
+    if (!state.lazy_chart) {
+      throw std::runtime_error(
+          "chart SPR exact trim: lazy cache strategy without lazy chart");
+    }
+    trim = build_multisite_trim_active(state.execution_plan,
+                                       state.active_patterns, *state.lazy_chart,
+                                       state.chart_opts, trim_options);
+    ++state.counters.exact_trim_lazy_chart_uses;
+  } else if (state.scheduled_exact_setup_provider) {
+    auto setup = state.scheduled_exact_setup_provider(state, checked_state,
+                                                      scheduler, &runs);
+    trim = build_multisite_trim_from_exact_setup(
+        state.execution_plan, setup, state.chart_opts, trim_options);
+  } else if (state.exact_setup_provider) {
+    auto setup = state.exact_setup_provider(state, checked_state);
+    trim = build_multisite_trim_from_exact_setup(
+        state.execution_plan, setup, state.chart_opts, trim_options);
+  } else {
+    auto setup = build_multisite_exact_setup(
+        state.execution_plan, state.active_patterns.patterns, scheduler,
+        state.chart_opts, &runs);
+    trim = build_multisite_trim_from_exact_setup(
+        state.execution_plan, setup, state.chart_opts, trim_options);
+  }
+  record_multisite_exact_trim_work(state.counters, trim);
+  return trim;
+}
+
 inline chart_spr_search_state build_chart_spr_search_state_from_active(
     phylo_dag& dag, clade_grammar grammar,
     chart_spr_active_pattern_build_result active_build,
     chart_options options = {}, bool build_exact_trim = false,
     multisite_trim_options const& trim_options = {},
     chart_cache_options cache = {},
-    chart_spr_search_detail::chart_spr_state_build_policy build_policy = {}) {
+    chart_spr_search_detail::chart_spr_state_build_policy build_policy = {},
+    chart_scheduler* scheduler = nullptr,
+    chart_spr_scheduler_axis_counters* failed_scheduler_axes = nullptr) {
   validate_supported_chart_cache_options(cache);
   active_build.active_patterns.assert_no_skipped_invariant_metadata();
 
   chart_spr_search_state state;
+  chart_spr_failed_scheduler_axes_publisher failed_axes_publisher{
+      state.counters.scheduler_axes, failed_scheduler_axes};
   state.dag = &dag;
   state.grammar = std::move(grammar);
   if (state.grammar.execution_generation == 0) {
@@ -2339,10 +2645,34 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
   state.cache_opts = cache;
   state.estimated_full_pattern_cache_bytes =
       estimate_chart_spr_full_pattern_cache_bytes(state);
+  auto cache_selection_options = cache;
+  if (build_policy.defer_pattern_batch_bootstrap_to_local_cache &&
+      cache.memory_budget_bytes != 0) {
+    auto const full_bytes = state.estimated_full_pattern_cache_bytes;
+    auto const scoring_pattern_bytes =
+        estimate_chart_spr_pattern_entry_cache_bytes(state.grammar);
+    if (full_bytes > (std::numeric_limits<std::size_t>::max)() / 2) {
+      throw std::overflow_error(
+          "chart SPR local-commit mandatory cache byte overflow");
+    }
+    auto const mandatory_pair_bytes = full_bytes * 2;
+    if (mandatory_pair_bytes > cache.memory_budget_bytes ||
+        scoring_pattern_bytes >
+            cache.memory_budget_bytes - mandatory_pair_bytes) {
+      throw std::runtime_error(
+          "chart SPR local commit: configured cache budget cannot hold the "
+          "mandatory full inside/outside caches plus one scoring pattern");
+    }
+    // The strategy selector owns only the remainder. It may retain all active
+    // scoring charts when three full surfaces fit, or shrink to a bounded
+    // pattern batch while reserving the two local-commit cache surfaces.
+    cache_selection_options.memory_budget_bytes =
+        cache.memory_budget_bytes - mandatory_pair_bytes;
+  }
   state.effective_pattern_batch_size = choose_chart_spr_pattern_batch_size(
-      state.grammar, state.active_patterns, cache);
+      state.grammar, state.active_patterns, cache_selection_options);
   state.cache_strategy = choose_chart_spr_cache_strategy(
-      state.grammar, state.active_patterns, cache);
+      state.grammar, state.active_patterns, cache_selection_options);
   auto const defer_pattern_batch_bootstrap =
       state.cache_strategy == chart_spr_cache_strategy::pattern_batches &&
       build_policy.defer_pattern_batch_bootstrap_to_local_cache;
@@ -2368,19 +2698,57 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
   auto const chart_construction_start = std::chrono::steady_clock::now();
   if (state.cache_strategy ==
       chart_spr_cache_strategy::all_active_patterns) {
-    state.pattern_charts.reserve(
-        state.active_patterns.patterns.patterns.size());
-    for (auto const& pattern : state.active_patterns.patterns.patterns) {
-      auto entry = chart_spr_search_detail::build_pattern_chart_cache_entry(
-          state.execution_plan, pattern, options, chart_build_options);
-      ++state.counters.chart_execution_plan_cache_hits;
-      active_total = chart_multisite_detail::checked_add_u64(
-          active_total, entry.weighted_root_score,
-          "chart-SPR cached active-pattern lower bound");
-      state.counters.multifurcation_productions_scored +=
-          entry.chart.multifurcation_productions_scored;
-      state.pattern_charts.push_back(std::move(entry));
-      ++state.counters.initial_state_inside_charts_built;
+    auto const& patterns = state.active_patterns.patterns.patterns;
+    if (scheduler == nullptr) {
+      state.pattern_charts.reserve(patterns.size());
+      for (auto const& pattern : patterns) {
+        auto entry = chart_spr_search_detail::build_pattern_chart_cache_entry(
+            state.execution_plan, pattern, options, chart_build_options);
+        ++state.counters.chart_execution_plan_cache_hits;
+        active_total = chart_multisite_detail::checked_add_u64(
+            active_total, entry.weighted_root_score,
+            "chart-SPR cached active-pattern lower bound");
+        state.counters.multifurcation_productions_scored +=
+            entry.chart.multifurcation_productions_scored;
+        state.pattern_charts.push_back(std::move(entry));
+        ++state.counters.initial_state_inside_charts_built;
+      }
+    } else {
+      state.pattern_charts.resize(patterns.size());
+      std::vector<std::exception_ptr> errors(patterns.size());
+      auto range_options = chart_spr_phase4_pattern_range_options(
+          patterns.size(), scheduler->worker_resolution().resolved_workers);
+      auto run = scheduler->for_each_indexed_range(
+          patterns.size(), range_options,
+          [&](chart_indexed_range const& range, std::size_t,
+              chart_scheduler_cancellation_token const&) {
+            for (std::size_t pattern_index = range.begin;
+                 pattern_index < range.end; ++pattern_index) {
+              try {
+                state.pattern_charts[pattern_index] =
+                    chart_spr_search_detail::build_pattern_chart_cache_entry(
+                        state.execution_plan, patterns[pattern_index], options,
+                        chart_build_options);
+              } catch (...) {
+                errors[pattern_index] = std::current_exception();
+                break;
+              }
+            }
+          });
+      record_chart_spr_scheduler_axis_run(
+          state.counters.scheduler_axes.initial_chart_patterns, run);
+      for (auto const& error : errors) {
+        if (error) std::rethrow_exception(error);
+      }
+      for (auto const& entry : state.pattern_charts) {
+        ++state.counters.chart_execution_plan_cache_hits;
+        active_total = chart_multisite_detail::checked_add_u64(
+            active_total, entry.weighted_root_score,
+            "chart-SPR cached active-pattern lower bound");
+        state.counters.multifurcation_productions_scored +=
+            entry.chart.multifurcation_productions_scored;
+        ++state.counters.initial_state_inside_charts_built;
+      }
     }
     state.chart_construction_ms =
         std::chrono::duration<double, std::milli>(
@@ -2427,20 +2795,70 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     // deferred local state similarly leaves this recurrence to its persistent
     // inside cache.
     if (!exact_owns_pattern_batch_bootstrap && !defer_pattern_batch_bootstrap) {
-      for (std::size_t begin = 0; begin < patterns.size();
-           begin += batch_size) {
-        ++state.counters.pattern_batch_cache_builds;
-        auto end = std::min(patterns.size(), begin + batch_size);
-        for (std::size_t i = begin; i < end; ++i) {
-          auto entry = chart_spr_search_detail::build_pattern_chart_cache_entry(
-              state.execution_plan, patterns[i], options, chart_build_options);
-          ++state.counters.chart_execution_plan_cache_hits;
-          active_total = chart_multisite_detail::checked_add_u64(
-              active_total, entry.weighted_root_score,
-              "chart-SPR batched active-pattern lower bound");
-          state.counters.multifurcation_productions_scored +=
-              entry.chart.multifurcation_productions_scored;
-          ++state.counters.initial_state_inside_charts_built;
+      if (scheduler == nullptr) {
+        for (std::size_t begin = 0; begin < patterns.size();
+             begin += batch_size) {
+          ++state.counters.pattern_batch_cache_builds;
+          auto end = std::min(patterns.size(), begin + batch_size);
+          for (std::size_t i = begin; i < end; ++i) {
+            auto entry =
+                chart_spr_search_detail::build_pattern_chart_cache_entry(
+                    state.execution_plan, patterns[i], options,
+                    chart_build_options);
+            ++state.counters.chart_execution_plan_cache_hits;
+            active_total = chart_multisite_detail::checked_add_u64(
+                active_total, entry.weighted_root_score,
+                "chart-SPR batched active-pattern lower bound");
+            state.counters.multifurcation_productions_scored +=
+                entry.chart.multifurcation_productions_scored;
+            ++state.counters.initial_state_inside_charts_built;
+          }
+        }
+      } else {
+        // Pattern-batch mode is an RSS contract, not only a scoring policy.
+        // Construct and release exactly one configured batch at a time; the
+        // coordinator folds its pre-sized slots in increasing pattern order.
+        for (std::size_t begin = 0; begin < patterns.size();
+             begin += batch_size) {
+          auto const count = std::min(batch_size, patterns.size() - begin);
+          auto const range_options = chart_spr_phase4_pattern_range_options(
+              count, scheduler->worker_resolution().resolved_workers);
+          std::vector<pattern_chart_cache_entry> pattern_slots(count);
+          std::vector<std::exception_ptr> pattern_errors(count);
+          auto run = scheduler->for_each_indexed_range(
+              count, range_options,
+              [&](chart_indexed_range const& range, std::size_t,
+                  chart_scheduler_cancellation_token const&) {
+                for (std::size_t local = range.begin; local < range.end;
+                     ++local) {
+                  try {
+                    pattern_slots[local] = chart_spr_search_detail::
+                        build_pattern_chart_cache_entry(
+                            state.execution_plan, patterns[begin + local],
+                            options, chart_build_options);
+                  } catch (...) {
+                    pattern_errors[local] = std::current_exception();
+                  }
+                }
+              });
+          record_chart_spr_scheduler_axis_run(
+              state.counters.scheduler_axes.initial_chart_patterns, run);
+          for (std::size_t local = 0; local < count; ++local) {
+            if (pattern_errors[local]) {
+              std::rethrow_exception(pattern_errors[local]);
+            }
+          }
+          ++state.counters.pattern_batch_cache_builds;
+          for (std::size_t local = 0; local < count; ++local) {
+            auto const& entry = pattern_slots[local];
+            ++state.counters.chart_execution_plan_cache_hits;
+            active_total = chart_multisite_detail::checked_add_u64(
+                active_total, entry.weighted_root_score,
+                "chart-SPR batched active-pattern lower bound");
+            state.counters.multifurcation_productions_scored +=
+                entry.chart.multifurcation_productions_scored;
+            ++state.counters.initial_state_inside_charts_built;
+          }
         }
       }
     }
@@ -2451,15 +2869,22 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
               .count();
     }
     state.resident_pattern_cache_bytes =
-        state.effective_pattern_batch_size *
-        estimate_chart_spr_pattern_row_cache_bytes(state.grammar);
+        estimate_chart_spr_pattern_batch_cache_bytes(
+            state.grammar, state.effective_pattern_batch_size);
   }
 
   if (build_exact_trim) {
     auto const exact_initialization_start =
         std::chrono::steady_clock::now();
-    state.exact_trim_active_only =
-        build_chart_spr_state_exact_trim(state, trim_options);
+    if (scheduler != nullptr) {
+      auto checked =
+          check_chart_execution_plan(state.grammar, state.execution_plan);
+      state.exact_trim_active_only = build_chart_spr_state_exact_trim(
+          state, checked, *scheduler, trim_options);
+    } else {
+      state.exact_trim_active_only =
+          build_chart_spr_state_exact_trim(state, trim_options);
+    }
     ++state.counters.chart_execution_plan_cache_hits;
     if (exact_owns_pattern_batch_bootstrap) {
       if (state.exact_trim_active_only->invariant_constant_offset != 0) {
@@ -4025,6 +4450,7 @@ inline void verify_local_overlay_rows_against_full(
 
 inline void add_chart_spr_search_counters(
     chart_spr_search_counters& dst, chart_spr_search_counters const& src) {
+  add_chart_spr_scheduler_axis_counters(dst.scheduler_axes, src.scheduler_axes);
   dst.grammar_rebuilds += src.grammar_rebuilds;
   dst.pattern_rebuilds += src.pattern_rebuilds;
   dst.base_chart_cache_rebuilds += src.base_chart_cache_rebuilds;
@@ -4373,6 +4799,23 @@ struct local_score_worker_workspace {
   }
 };
 
+// One deterministic candidate x pattern tile.  Workers publish only to the
+// tile's stable slot; the coordinator folds slots in candidate-major,
+// increasing-pattern order after the scheduler joins.  Candidate-level input
+// failures remain ordinary invalid candidates rather than cancelling unrelated
+// tiles.
+struct local_score_tile_result {
+  std::uint64_t active_score = 0;
+  bool valid = true;
+  std::string invalid_reason;
+
+  void reset_for_operation() noexcept {
+    active_score = 0;
+    valid = true;
+    invalid_reason.clear();
+  }
+};
+
 struct local_score_workspace_access;
 
 }  // namespace chart_spr_search_detail
@@ -4387,7 +4830,7 @@ class chart_spr_local_score_workspace {
  public:
   [[nodiscard]] bool operation_boundary_clean() const noexcept {
     if (operation_active_ || prepared_active_ != 0 || worker_active_ != 0 ||
-        !serial_scratch_.operation_boundary_clean()) {
+        tile_active_ != 0 || !serial_scratch_.operation_boundary_clean()) {
       return false;
     }
     for (auto const& prepared : prepared_) {
@@ -4405,9 +4848,11 @@ class chart_spr_local_score_workspace {
   std::vector<chart_spr_search_detail::prepared_local_candidate_score>
       prepared_;
   std::vector<chart_spr_search_detail::local_score_worker_workspace> workers_;
+  std::vector<chart_spr_search_detail::local_score_tile_result> tile_results_;
   chart_spr_local_score_scratch serial_scratch_;
   std::size_t prepared_active_ = 0;
   std::size_t worker_active_ = 0;
+  std::size_t tile_active_ = 0;
   bool operation_active_ = false;
 };
 
@@ -4415,7 +4860,8 @@ namespace chart_spr_search_detail {
 
 struct local_score_workspace_access {
   static void begin(chart_spr_local_score_workspace& workspace,
-                    std::size_t prepared_count, std::size_t worker_count) {
+                    std::size_t prepared_count, std::size_t worker_count,
+                    std::size_t tile_count = 0) {
     if (!workspace.operation_boundary_clean()) {
       throw std::logic_error(
           "chart SPR local score workspace: overlapping operation or stale "
@@ -4429,8 +4875,12 @@ struct local_score_workspace_access {
     if (workspace.workers_.size() < worker_count) {
       workspace.workers_.resize(worker_count);
     }
+    if (workspace.tile_results_.size() < tile_count) {
+      workspace.tile_results_.resize(tile_count);
+    }
     workspace.prepared_active_ = prepared_count;
     workspace.worker_active_ = worker_count;
+    workspace.tile_active_ = tile_count;
     workspace.operation_active_ = true;
     workspace.serial_scratch_.clear_borrows();
     for (std::size_t i = 0; i < prepared_count; ++i) {
@@ -4438,6 +4888,9 @@ struct local_score_workspace_access {
     }
     for (std::size_t i = 0; i < worker_count; ++i) {
       workspace.workers_[i].reset_for_operation();
+    }
+    for (std::size_t i = 0; i < tile_count; ++i) {
+      workspace.tile_results_[i].reset_for_operation();
     }
   }
 
@@ -4451,6 +4904,7 @@ struct local_score_workspace_access {
     workspace.serial_scratch_.clear_borrows();
     workspace.prepared_active_ = 0;
     workspace.worker_active_ = 0;
+    workspace.tile_active_ = 0;
     workspace.operation_active_ = false;
   }
 
@@ -4467,6 +4921,11 @@ struct local_score_workspace_access {
   static chart_spr_local_score_scratch& serial_scratch(
       chart_spr_local_score_workspace& workspace) {
     return workspace.serial_scratch_;
+  }
+
+  static local_score_tile_result& tile_result(
+      chart_spr_local_score_workspace& workspace, std::size_t index) {
+    return workspace.tile_results_[index];
   }
 };
 
@@ -4721,6 +5180,161 @@ inline void accumulate_prepared_local_candidate_patterns(
     if (counters != nullptr) ++counters->plan_mismatch_rejections;
     invalidate_prepared_local_candidate(state, prepared, e.what());
   }
+}
+
+inline void score_prepared_local_candidate_pattern_tile(
+    chart_spr_search_state const& state,
+    prepared_local_candidate_score const& prepared, std::size_t pattern_begin,
+    std::size_t pattern_end, local_spr_score_options const& options,
+    chart_spr_search_counters* counters, chart_spr_local_score_scratch& scratch,
+    checked_chart_execution_plan_ref const& checked_state,
+    local_score_tile_result& tile) {
+  tile.reset_for_operation();
+  scratch.clear_borrows();
+  if (!prepared.valid_for_accumulation) return;
+
+  try {
+    checked_state.assert_same(state.grammar, state.execution_plan);
+    auto const& delta = prepared.delta();
+    assert_overlay_delta_execution_plan_compatible(delta, state.execution_plan);
+    auto const& patterns = state.active_patterns.patterns.patterns;
+    if (pattern_begin > pattern_end || pattern_end > patterns.size() ||
+        state.pattern_charts.size() != patterns.size()) {
+      throw std::runtime_error(
+          "chart SPR local score: candidate-pattern tile out of range");
+    }
+
+    parsimony_chart_detail::structural_work_observer hot_work_observer{
+        .full_grammar_validations =
+            counters != nullptr
+                ? &counters->candidate_pattern_full_grammar_validations
+                : nullptr,
+        .production_partition_validations =
+            counters != nullptr
+                ? &counters->candidate_pattern_partition_validations
+                : nullptr,
+        .clade_order_sorts =
+            counters != nullptr ? &counters->candidate_pattern_clade_order_sorts
+                                : nullptr};
+    parsimony_chart_detail::structural_work_observer_scope hot_work_scope{
+        counters != nullptr ? &hot_work_observer : nullptr};
+    auto chart_build_options = state.chart_opts;
+    chart_build_options.keep_trace = false;
+    chart_build_options.max_trace_choices = 0;
+
+    for (std::size_t pattern_index = pattern_begin; pattern_index < pattern_end;
+         ++pattern_index) {
+      if (counters != nullptr) {
+        ++counters->candidate_execution_plan_cache_hits;
+        ++counters->local_leaf_state_view_uses;
+      }
+      auto const& pattern = patterns[pattern_index];
+      auto const& cache_entry = state.pattern_charts[pattern_index];
+      auto states = view_leaf_site_states(pattern.state_by_taxon);
+      build_local_overlay_chart_rows_into(
+          state.grammar, delta, cache_entry.chart, states, scratch.rows,
+          chart_build_options, options.validate_cached_chart_shapes, counters);
+      if (counters != nullptr) {
+        counters->local_rows_recomputed += delta.affected_order.size();
+      }
+      if (prepared.verification_materialized) {
+        verify_local_overlay_rows_against_full(
+            delta, scratch.rows, cache_entry.chart,
+            *prepared.verification_materialized, states, state.chart_opts);
+      }
+      auto const& root_row =
+          local_overlay_chart_row(scratch.rows, cache_entry.chart, delta.root);
+      tile.active_score = chart_multisite_detail::checked_add_u64(
+          tile.active_score,
+          chart_spr_weighted_root_score_from_row(root_row, pattern,
+                                                 state.chart_opts),
+          "chart-SPR local candidate active lower bound");
+    }
+  } catch (std::exception const& e) {
+    tile.valid = false;
+    tile.invalid_reason = e.what();
+  }
+  scratch.clear_borrows();
+}
+
+inline void score_prepared_local_candidate_pattern_cache_tile(
+    chart_spr_search_state const& state,
+    prepared_local_candidate_score const& prepared, std::size_t pattern_offset,
+    std::vector<pattern_chart_cache_entry> const& entries,
+    std::size_t entry_begin, std::size_t entry_end,
+    local_spr_score_options const& options, chart_spr_search_counters* counters,
+    chart_spr_local_score_scratch& scratch,
+    checked_chart_execution_plan_ref const& checked_state,
+    local_score_tile_result& tile) {
+  tile.reset_for_operation();
+  scratch.clear_borrows();
+  if (!prepared.valid_for_accumulation) return;
+
+  try {
+    checked_state.assert_same(state.grammar, state.execution_plan);
+    auto const& delta = prepared.delta();
+    assert_overlay_delta_execution_plan_compatible(delta, state.execution_plan);
+    auto const& patterns = state.active_patterns.patterns.patterns;
+    if (entry_begin > entry_end || entry_end > entries.size() ||
+        pattern_offset > patterns.size() ||
+        entries.size() > patterns.size() - pattern_offset) {
+      throw std::runtime_error(
+          "chart SPR local score: cached candidate-pattern tile out of "
+          "range");
+    }
+
+    parsimony_chart_detail::structural_work_observer hot_work_observer{
+        .full_grammar_validations =
+            counters != nullptr
+                ? &counters->candidate_pattern_full_grammar_validations
+                : nullptr,
+        .production_partition_validations =
+            counters != nullptr
+                ? &counters->candidate_pattern_partition_validations
+                : nullptr,
+        .clade_order_sorts =
+            counters != nullptr ? &counters->candidate_pattern_clade_order_sorts
+                                : nullptr};
+    parsimony_chart_detail::structural_work_observer_scope hot_work_scope{
+        counters != nullptr ? &hot_work_observer : nullptr};
+    auto chart_build_options = state.chart_opts;
+    chart_build_options.keep_trace = false;
+    chart_build_options.max_trace_choices = 0;
+
+    for (std::size_t entry_index = entry_begin; entry_index < entry_end;
+         ++entry_index) {
+      if (counters != nullptr) {
+        ++counters->candidate_execution_plan_cache_hits;
+        ++counters->local_leaf_state_view_uses;
+      }
+      auto const pattern_index = pattern_offset + entry_index;
+      auto const& pattern = patterns[pattern_index];
+      auto const& cache_entry = entries[entry_index];
+      auto states = view_leaf_site_states(pattern.state_by_taxon);
+      build_local_overlay_chart_rows_into(
+          state.grammar, delta, cache_entry.chart, states, scratch.rows,
+          chart_build_options, options.validate_cached_chart_shapes, counters);
+      if (counters != nullptr) {
+        counters->local_rows_recomputed += delta.affected_order.size();
+      }
+      if (prepared.verification_materialized) {
+        verify_local_overlay_rows_against_full(
+            delta, scratch.rows, cache_entry.chart,
+            *prepared.verification_materialized, states, state.chart_opts);
+      }
+      auto const& root_row =
+          local_overlay_chart_row(scratch.rows, cache_entry.chart, delta.root);
+      tile.active_score = chart_multisite_detail::checked_add_u64(
+          tile.active_score,
+          chart_spr_weighted_root_score_from_row(root_row, pattern,
+                                                 state.chart_opts),
+          "chart-SPR local candidate active lower bound");
+    }
+  } catch (std::exception const& e) {
+    tile.valid = false;
+    tile.invalid_reason = e.what();
+  }
+  scratch.clear_borrows();
 }
 
 inline void finish_prepared_local_candidate_score_into(
@@ -5215,6 +5829,148 @@ inline void release_local_score_workers_for_tests(
   barrier->release.store(true, std::memory_order_release);
 }
 
+struct local_candidate_pattern_tile_plan {
+  std::size_t pattern_count = 0;
+  std::size_t pattern_grain = 0;
+  std::size_t tiles_per_candidate = 0;
+  std::size_t total_tiles = 0;
+
+  [[nodiscard]] bool enabled() const noexcept { return total_tiles > 1; }
+};
+
+inline local_candidate_pattern_tile_plan plan_local_candidate_pattern_tiles(
+    chart_spr_search_state const& state,
+    std::span<grammar_spr_candidate const> candidates,
+    chart_scheduler const* scheduler) {
+  local_candidate_pattern_tile_plan plan;
+  auto const candidate_count = candidates.size();
+  if (scheduler == nullptr || candidate_count == 0 ||
+      state.cache_strategy != chart_spr_cache_strategy::all_active_patterns) {
+    return plan;
+  }
+  auto const workers = scheduler->worker_resolution().resolved_workers;
+  auto const patterns = state.active_patterns.patterns.patterns.size();
+  if (workers <= 1 || patterns <= 1 || candidate_count >= workers) return plan;
+  if (patterns > (std::numeric_limits<std::size_t>::max)() / candidate_count) {
+    throw std::overflow_error(
+        "chart SPR local score: candidate-pattern work size overflow");
+  }
+  auto const work_items = patterns * candidate_count;
+  std::size_t affected_units = 0;
+  for (auto const& candidate : candidates) {
+    auto const weight = std::max<std::size_t>(
+        1, chart_spr_detail::estimate_candidate_affected_clades(candidate));
+    if (weight > (std::numeric_limits<std::size_t>::max)() / patterns ||
+        affected_units >
+            (std::numeric_limits<std::size_t>::max)() - weight * patterns) {
+      affected_units = (std::numeric_limits<std::size_t>::max)();
+      break;
+    }
+    affected_units += weight * patterns;
+  }
+  auto const worthwhile_units =
+      workers > (std::numeric_limits<std::size_t>::max)() / 2
+          ? (std::numeric_limits<std::size_t>::max)()
+          : workers * 2;
+  if (work_items < workers && affected_units < worthwhile_units) return plan;
+
+  auto const target_total =
+      workers > (std::numeric_limits<std::size_t>::max)() / 4
+          ? (std::numeric_limits<std::size_t>::max)()
+          : workers * 4;
+  auto const target_per_candidate =
+      std::max<std::size_t>(1, target_total / candidate_count);
+  plan.pattern_count = patterns;
+  plan.pattern_grain = std::max<std::size_t>(
+      1, (patterns + target_per_candidate - 1) / target_per_candidate);
+  plan.tiles_per_candidate =
+      (patterns + plan.pattern_grain - 1) / plan.pattern_grain;
+  if (plan.tiles_per_candidate >
+      (std::numeric_limits<std::size_t>::max)() / candidate_count) {
+    throw std::overflow_error(
+        "chart SPR local score: candidate-pattern tile count overflow");
+  }
+  plan.total_tiles = plan.tiles_per_candidate * candidate_count;
+  return plan;
+}
+
+inline std::vector<std::size_t> local_score_weighted_candidate_order(
+    std::span<grammar_spr_candidate const> candidates,
+    std::size_t resolved_workers) {
+  std::vector<std::size_t> order(candidates.size());
+  std::iota(order.begin(), order.end(), std::size_t{0});
+  if (resolved_workers <= 1 || candidates.size() <= 1) return order;
+  std::sort(order.begin(), order.end(), [&](std::size_t lhs, std::size_t rhs) {
+    auto const lhs_weight =
+        chart_spr_detail::estimate_candidate_affected_clades(candidates[lhs]);
+    auto const rhs_weight =
+        chart_spr_detail::estimate_candidate_affected_clades(candidates[rhs]);
+    return lhs_weight != rhs_weight ? lhs_weight > rhs_weight : lhs < rhs;
+  });
+  return order;
+}
+
+inline chart_indexed_range_options local_score_candidate_range_options(
+    std::size_t candidate_count, std::size_t resolved_workers) noexcept {
+  if (resolved_workers <= 1) {
+    return chart_spr_phase4_pattern_range_options(candidate_count,
+                                                  resolved_workers);
+  }
+  auto const ranges_per_worker =
+      candidate_count / resolved_workers +
+      static_cast<std::size_t>(candidate_count % resolved_workers != 0);
+  return chart_indexed_range_options{
+      .minimum_grain = 1,
+      // Unit candidate ranges through the frozen 64-candidate workload keep
+      // dynamic claiming responsive to affected-set skew without creating
+      // one owning pool task per range (the scheduler submits only workers).
+      .target_ranges_per_worker =
+          std::clamp<std::size_t>(ranges_per_worker, 1, 32),
+  };
+}
+
+struct local_pattern_batch_fusion_plan {
+  std::size_t pattern_stride = 0;
+  std::size_t total_tiles = 0;
+
+  [[nodiscard]] bool enabled() const noexcept {
+    return pattern_stride != 0 && total_tiles != 0;
+  }
+};
+
+inline local_pattern_batch_fusion_plan plan_local_pattern_batch_fusion(
+    chart_spr_search_state const& state, std::size_t candidate_count,
+    chart_scheduler const* scheduler) {
+  local_pattern_batch_fusion_plan plan;
+  if (scheduler == nullptr || candidate_count == 0 ||
+      state.cache_strategy != chart_spr_cache_strategy::pattern_batches) {
+    return plan;
+  }
+  auto const workers = scheduler->worker_resolution().resolved_workers;
+  auto const pattern_count = state.active_patterns.patterns.patterns.size();
+  auto const batch_size =
+      std::max<std::size_t>(1, state.effective_pattern_batch_size);
+  auto const max_batch_patterns = std::min(pattern_count, batch_size);
+  // Candidate ranges already fill the pool when there are at least as many
+  // candidates as stable slots.  Fuse cold chart construction with pattern
+  // scoring only for the one/few-candidate shape that otherwise collapses.
+  if (workers <= 1 || candidate_count >= workers || max_batch_patterns <= 1) {
+    return plan;
+  }
+  auto const range_plan = scheduler->plan_indexed_ranges(
+      max_batch_patterns,
+      chart_spr_phase4_pattern_range_options(max_batch_patterns, workers));
+  if (range_plan.range_count <= 1) return plan;
+  if (max_batch_patterns >
+      (std::numeric_limits<std::size_t>::max)() / candidate_count) {
+    throw std::overflow_error(
+        "chart SPR local score: pattern-batch tile count overflow");
+  }
+  plan.pattern_stride = max_batch_patterns;
+  plan.total_tiles = max_batch_patterns * candidate_count;
+  return plan;
+}
+
 template <typename Operation>
 chart_scheduler_run_summary run_local_score_scheduler_operation(
     chart_scheduler& scheduler, local_spr_score_options const& options,
@@ -5245,6 +6001,63 @@ chart_scheduler_run_summary run_local_score_scheduler_operation(
   }
 }
 
+inline std::vector<pattern_chart_cache_entry>
+build_pattern_chart_cache_entries_for_range(
+    chart_spr_search_state const& state, std::size_t begin, std::size_t count,
+    chart_spr_search_counters* counters, chart_scheduler& scheduler,
+    local_spr_score_options const& options) {
+  auto const& patterns = state.active_patterns.patterns.patterns;
+  if (begin > patterns.size() || count > patterns.size() - begin) {
+    throw std::runtime_error(
+        "chart SPR local score: pattern cache batch range out of range");
+  }
+  auto chart_build_options = state.chart_opts;
+  chart_build_options.keep_trace = false;
+  chart_build_options.max_trace_choices = 0;
+  std::vector<pattern_chart_cache_entry> entries(count);
+  std::vector<std::exception_ptr> errors(count);
+  std::vector<std::uint8_t> built(count, 0);
+  auto const range_options = chart_spr_phase4_pattern_range_options(
+      count, scheduler.worker_resolution().resolved_workers);
+  auto const range_plan = scheduler.plan_indexed_ranges(count, range_options);
+  auto const parallel_cold_build =
+      scheduler.worker_resolution().resolved_workers > 1 &&
+      range_plan.range_count > 1 && !range_plan.force_serial;
+  auto run = run_local_score_scheduler_operation(scheduler, options, [&] {
+    return scheduler.for_each_indexed_range(
+        count, range_options,
+        [&](chart_indexed_range const& range, std::size_t worker,
+            chart_scheduler_cancellation_token const&) {
+          // A one-range scheduler fallback runs on the coordinator and
+          // has no after-submissions hook to release the test barrier.
+          // Leave hooks for the following genuinely parallel score axis.
+          if (parallel_cold_build) {
+            local_score_worker_arrive_and_wait_for_tests(options, worker);
+          }
+          for (std::size_t local = range.begin; local < range.end; ++local) {
+            try {
+              entries[local] = build_pattern_chart_cache_entry(
+                  state.execution_plan, patterns[begin + local],
+                  state.chart_opts, chart_build_options);
+              built[local] = 1;
+            } catch (...) {
+              errors[local] = std::current_exception();
+            }
+          }
+        });
+  });
+  if (counters != nullptr) {
+    record_chart_spr_scheduler_axis_run(
+        counters->scheduler_axes.local_score_candidate_patterns, run);
+    counters->chart_execution_plan_cache_hits += static_cast<std::size_t>(
+        std::count(built.begin(), built.end(), std::uint8_t{1}));
+  }
+  for (auto const& error : errors) {
+    if (error) std::rethrow_exception(error);
+  }
+  return entries;
+}
+
 inline void score_candidates_locally_all_cache_into(
     chart_spr_search_state const& state,
     std::span<grammar_spr_candidate const> candidates,
@@ -5252,7 +6065,8 @@ inline void score_candidates_locally_all_cache_into(
     chart_spr_local_score_workspace& workspace,
     local_spr_score_options const& options, chart_scheduler* scheduler,
     std::size_t worker_count,
-    checked_chart_execution_plan_ref const& checked_state) {
+    checked_chart_execution_plan_ref const& checked_state,
+    local_candidate_pattern_tile_plan const& tile_plan) {
   chart_spr_search_counters aggregate;
   if (candidates.empty()) return;
   ++aggregate.candidate_batches_scored;
@@ -5275,16 +6089,116 @@ inline void score_candidates_locally_all_cache_into(
     return;
   }
 
-  auto run = run_local_score_scheduler_operation(
-      *scheduler, options, [&] {
+  auto const candidate_order =
+      local_score_weighted_candidate_order(candidates, worker_count);
+
+  if (tile_plan.enabled()) {
+    auto const batch_start = std::chrono::steady_clock::now();
+    for (std::size_t candidate = 0; candidate < candidates.size();
+         ++candidate) {
+      prepare_local_candidate_score_into(
+          state, candidates[candidate], options, &aggregate, checked_state,
+          local_score_workspace_access::prepared(workspace, candidate));
+    }
+
+    auto const range_options = chart_spr_phase4_pattern_range_options(
+        tile_plan.total_tiles, worker_count);
+    auto run = run_local_score_scheduler_operation(*scheduler, options, [&] {
+      return scheduler->for_each_indexed_range(
+          tile_plan.total_tiles, range_options,
+          [&](chart_indexed_range const& range, std::size_t worker,
+              chart_scheduler_cancellation_token const&) {
+            local_score_worker_arrive_and_wait_for_tests(options, worker);
+            auto& worker_workspace =
+                local_score_workspace_access::worker(workspace, worker);
+            for (std::size_t work_index = range.begin; work_index < range.end;
+                 ++work_index) {
+              auto const candidate_rank = work_index % candidates.size();
+              auto const candidate = candidate_order[candidate_rank];
+              auto const candidate_tile = work_index / candidates.size();
+              auto const tile_index =
+                  candidate * tile_plan.tiles_per_candidate + candidate_tile;
+              auto const pattern_begin =
+                  candidate_tile * tile_plan.pattern_grain;
+              auto const pattern_end =
+                  std::min(tile_plan.pattern_count,
+                           pattern_begin + tile_plan.pattern_grain);
+              score_prepared_local_candidate_pattern_tile(
+                  state,
+                  local_score_workspace_access::prepared(workspace, candidate),
+                  pattern_begin, pattern_end, options,
+                  &worker_workspace.counters, worker_workspace.scratch,
+                  checked_state,
+                  local_score_workspace_access::tile_result(workspace,
+                                                            tile_index));
+            }
+          });
+    });
+    record_chart_spr_scheduler_axis_run(
+        aggregate.scheduler_axes.local_score_candidate_patterns, run);
+    if (run.used_parallel_workers()) {
+      ++aggregate.local_score_parallel_batches;
+      aggregate.local_score_worker_tasks += run.worker_tasks_submitted;
+    }
+    for (std::size_t worker = 0; worker < worker_count; ++worker) {
+      add_chart_spr_search_counters(
+          aggregate,
+          local_score_workspace_access::worker(workspace, worker).counters);
+    }
+
+    auto const batch_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - batch_start)
+                              .count();
+    auto const per_candidate_ms =
+        batch_ms / static_cast<double>(candidates.size());
+    for (std::size_t candidate = 0; candidate < candidates.size();
+         ++candidate) {
+      auto& prepared =
+          local_score_workspace_access::prepared(workspace, candidate);
+      if (prepared.valid_for_accumulation) {
+        try {
+          for (std::size_t candidate_tile = 0;
+               candidate_tile < tile_plan.tiles_per_candidate;
+               ++candidate_tile) {
+            auto const tile_index =
+                candidate * tile_plan.tiles_per_candidate + candidate_tile;
+            auto const& tile = local_score_workspace_access::tile_result(
+                workspace, tile_index);
+            if (!tile.valid) {
+              invalidate_prepared_local_candidate(state, prepared,
+                                                  tile.invalid_reason);
+              break;
+            }
+            prepared.new_active_score = chart_multisite_detail::checked_add_u64(
+                prepared.new_active_score, tile.active_score,
+                "chart-SPR local candidate active lower bound");
+          }
+        } catch (std::exception const& e) {
+          invalidate_prepared_local_candidate(state, prepared, e.what());
+        }
+      }
+      finish_prepared_local_candidate_score_into(state, prepared,
+                                                 results[candidate]);
+      results[candidate].local_score_ms = per_candidate_ms;
+    }
+    add_chart_spr_search_counters(state.counters, aggregate);
+    return;
+  }
+
+  auto const range_options =
+      local_score_candidate_range_options(candidates.size(), worker_count);
+  auto run =
+      run_local_score_scheduler_operation(*scheduler, options, [&] {
         return scheduler->for_each_indexed_range(
-            candidates.size(),
+            candidates.size(), range_options,
             [&](chart_indexed_range const& range, std::size_t worker,
                 chart_scheduler_cancellation_token const&) {
               local_score_worker_arrive_and_wait_for_tests(options, worker);
               auto& worker_workspace =
                   local_score_workspace_access::worker(workspace, worker);
-              for (std::size_t i = range.begin; i < range.end; ++i) {
+              for (std::size_t work_index = range.begin; work_index < range.end;
+                   ++work_index) {
+                auto const i = candidate_order[work_index];
                 auto start = std::chrono::steady_clock::now();
                 score_candidate_locally_counted_into(
                     state, candidates[i], options, &worker_workspace.counters,
@@ -5297,6 +6211,8 @@ inline void score_candidates_locally_all_cache_into(
               }
             });
       });
+  record_chart_spr_scheduler_axis_run(
+      aggregate.scheduler_axes.local_score_candidates, run);
   if (run.used_parallel_workers()) {
     ++aggregate.local_score_parallel_batches;
     aggregate.local_score_worker_tasks += run.worker_tasks_submitted;
@@ -5316,7 +6232,8 @@ inline void score_candidates_locally_pattern_batches_into(
     chart_spr_local_score_workspace& workspace,
     local_spr_score_options const& options, chart_scheduler* scheduler,
     std::size_t worker_count,
-    checked_chart_execution_plan_ref const& checked_state) {
+    checked_chart_execution_plan_ref const& checked_state,
+    local_pattern_batch_fusion_plan const& fusion_plan) {
   chart_spr_search_counters aggregate;
   if (candidates.empty()) return;
   auto batch_start = std::chrono::steady_clock::now();
@@ -5327,6 +6244,10 @@ inline void score_candidates_locally_pattern_batches_into(
         state, candidates[i], options, &aggregate, checked_state,
         local_score_workspace_access::prepared(workspace, i));
   }
+  auto const candidate_order =
+      scheduler == nullptr
+          ? std::vector<std::size_t>{}
+          : local_score_weighted_candidate_order(candidates, worker_count);
 
   auto const& patterns = state.active_patterns.patterns.patterns;
   auto batch_size = std::max<std::size_t>(
@@ -5337,57 +6258,184 @@ inline void score_candidates_locally_pattern_batches_into(
   auto& serial_scratch =
       local_score_workspace_access::serial_scratch(workspace);
   bool used_parallel_workers = false;
-  for (std::size_t begin = 0; begin < patterns.size(); begin += batch_size) {
-    auto count = std::min(batch_size, patterns.size() - begin);
-    auto entries = build_pattern_chart_cache_entries_for_range(state, begin,
-                                                               count, &aggregate);
-    ++aggregate.pattern_batch_cache_builds;
-    aggregate.multifurcation_productions_scored +=
-        multifurcation_productions_scored_for_entries(entries);
-
-    if (scheduler == nullptr) {
-      for (std::size_t i = 0; i < candidates.size(); ++i) {
-        accumulate_prepared_local_candidate_patterns(
-            state, local_score_workspace_access::prepared(workspace, i), begin,
-            entries, options, &aggregate, serial_scratch, checked_state);
-      }
-    } else {
-      // `entries` is loop-local while the scheduler outlives the whole search.
-      // The range operation remains synchronous and joins every accepted task
-      // before a submission/worker failure can unwind and destroy the rows.
-      auto run = run_local_score_scheduler_operation(
-          *scheduler, options, [&] {
-            return scheduler->for_each_indexed_range(
-                candidates.size(),
-                [&](chart_indexed_range const& range, std::size_t worker,
-                    chart_scheduler_cancellation_token const&) {
-                  local_score_worker_arrive_and_wait_for_tests(options, worker);
-                  auto& worker_workspace =
-                      local_score_workspace_access::worker(workspace, worker);
-                  for (std::size_t i = range.begin; i < range.end; ++i) {
-                    accumulate_prepared_local_candidate_patterns(
-                        state,
-                        local_score_workspace_access::prepared(workspace, i),
-                        begin, entries, options, &worker_workspace.counters,
-                        worker_workspace.scratch, checked_state);
-                  }
-                });
-          });
-      if (run.used_parallel_workers()) {
-        used_parallel_workers = true;
-        aggregate.local_score_worker_tasks += run.worker_tasks_submitted;
-      }
-    }
-  }
-
-  if (used_parallel_workers) ++aggregate.local_score_parallel_batches;
-  if (scheduler != nullptr) {
+  bool worker_counters_folded = false;
+  auto fold_worker_counters = [&] {
+    if (scheduler == nullptr || worker_counters_folded) return;
     for (std::size_t worker = 0; worker < worker_count; ++worker) {
       add_chart_spr_search_counters(
           aggregate,
           local_score_workspace_access::worker(workspace, worker).counters);
     }
+    worker_counters_folded = true;
+  };
+
+  try {
+    for (std::size_t begin = 0; begin < patterns.size(); begin += batch_size) {
+      auto const count = std::min(batch_size, patterns.size() - begin);
+
+      if (fusion_plan.enabled()) {
+        // One synchronous pattern-axis operation owns this cold batch from
+        // construction through candidate scoring.  Chart entries and tile
+        // results are pre-sized disjoint slots; no worker performs a nested
+        // scheduler wait, and the next batch is not retained concurrently.
+        std::vector<pattern_chart_cache_entry> entries(count);
+        std::vector<std::exception_ptr> build_errors(count);
+        std::vector<std::uint8_t> built(count, 0);
+        auto chart_build_options = state.chart_opts;
+        chart_build_options.keep_trace = false;
+        chart_build_options.max_trace_choices = 0;
+        auto const range_options = chart_spr_phase4_pattern_range_options(
+            count, scheduler->worker_resolution().resolved_workers);
+        auto const range_plan =
+            scheduler->plan_indexed_ranges(count, range_options);
+        auto const parallel_fused_batch =
+            scheduler->worker_resolution().resolved_workers > 1 &&
+            range_plan.range_count > 1 && !range_plan.force_serial;
+        auto run =
+            run_local_score_scheduler_operation(*scheduler, options, [&] {
+              return scheduler->for_each_indexed_range(
+                  count, range_options,
+                  [&](chart_indexed_range const& range, std::size_t worker,
+                      chart_scheduler_cancellation_token const&) {
+                    if (parallel_fused_batch) {
+                      local_score_worker_arrive_and_wait_for_tests(options,
+                                                                   worker);
+                    }
+                    auto& worker_workspace =
+                        local_score_workspace_access::worker(workspace, worker);
+                    for (std::size_t local = range.begin; local < range.end;
+                         ++local) {
+                      try {
+                        entries[local] = build_pattern_chart_cache_entry(
+                            state.execution_plan, patterns[begin + local],
+                            state.chart_opts, chart_build_options);
+                        built[local] = 1;
+                      } catch (...) {
+                        build_errors[local] = std::current_exception();
+                        continue;
+                      }
+                      for (std::size_t candidate = 0;
+                           candidate < candidates.size(); ++candidate) {
+                        auto const tile_index =
+                            candidate * fusion_plan.pattern_stride + local;
+                        score_prepared_local_candidate_pattern_cache_tile(
+                            state,
+                            local_score_workspace_access::prepared(workspace,
+                                                                   candidate),
+                            begin, entries, local, local + 1, options,
+                            &worker_workspace.counters,
+                            worker_workspace.scratch, checked_state,
+                            local_score_workspace_access::tile_result(
+                                workspace, tile_index));
+                      }
+                    }
+                  });
+            });
+        record_chart_spr_scheduler_axis_run(
+            aggregate.scheduler_axes.local_score_candidate_patterns, run);
+        if (run.used_parallel_workers()) {
+          used_parallel_workers = true;
+          aggregate.local_score_worker_tasks += run.worker_tasks_submitted;
+        }
+        aggregate.chart_execution_plan_cache_hits += static_cast<std::size_t>(
+            std::count(built.begin(), built.end(), std::uint8_t{1}));
+        for (auto const& error : build_errors) {
+          if (error) std::rethrow_exception(error);
+        }
+        ++aggregate.pattern_batch_cache_builds;
+        aggregate.multifurcation_productions_scored +=
+            multifurcation_productions_scored_for_entries(entries);
+
+        // Publish candidate totals only after the operation joins, in the same
+        // candidate-major and increasing-pattern order as the serial loop.
+        for (std::size_t candidate = 0; candidate < candidates.size();
+             ++candidate) {
+          auto& prepared =
+              local_score_workspace_access::prepared(workspace, candidate);
+          if (!prepared.valid_for_accumulation) continue;
+          try {
+            for (std::size_t local = 0; local < count; ++local) {
+              auto const tile_index =
+                  candidate * fusion_plan.pattern_stride + local;
+              auto const& tile = local_score_workspace_access::tile_result(
+                  workspace, tile_index);
+              if (!tile.valid) {
+                invalidate_prepared_local_candidate(state, prepared,
+                                                    tile.invalid_reason);
+                break;
+              }
+              prepared.new_active_score =
+                  chart_multisite_detail::checked_add_u64(
+                      prepared.new_active_score, tile.active_score,
+                      "chart-SPR local candidate active lower bound");
+            }
+          } catch (std::exception const& e) {
+            invalidate_prepared_local_candidate(state, prepared, e.what());
+          }
+        }
+        continue;
+      }
+
+      auto entries =
+          scheduler == nullptr
+              ? build_pattern_chart_cache_entries_for_range(state, begin, count,
+                                                            &aggregate)
+              : build_pattern_chart_cache_entries_for_range(
+                    state, begin, count, &aggregate, *scheduler, options);
+      ++aggregate.pattern_batch_cache_builds;
+      aggregate.multifurcation_productions_scored +=
+          multifurcation_productions_scored_for_entries(entries);
+
+      if (scheduler == nullptr) {
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+          accumulate_prepared_local_candidate_patterns(
+              state, local_score_workspace_access::prepared(workspace, i),
+              begin, entries, options, &aggregate, serial_scratch,
+              checked_state);
+        }
+      } else {
+        // `entries` is loop-local while the scheduler outlives the search.  A
+        // synchronous join keeps its borrow valid through failure recovery.
+        auto const range_options = local_score_candidate_range_options(
+            candidates.size(), scheduler->worker_resolution().resolved_workers);
+        auto run =
+            run_local_score_scheduler_operation(*scheduler, options, [&] {
+              return scheduler->for_each_indexed_range(
+                  candidates.size(), range_options,
+                  [&](chart_indexed_range const& range, std::size_t worker,
+                      chart_scheduler_cancellation_token const&) {
+                    local_score_worker_arrive_and_wait_for_tests(options,
+                                                                 worker);
+                    auto& worker_workspace =
+                        local_score_workspace_access::worker(workspace, worker);
+                    for (std::size_t work_index = range.begin;
+                         work_index < range.end; ++work_index) {
+                      auto const i = candidate_order[work_index];
+                      accumulate_prepared_local_candidate_patterns(
+                          state,
+                          local_score_workspace_access::prepared(workspace, i),
+                          begin, entries, options, &worker_workspace.counters,
+                          worker_workspace.scratch, checked_state);
+                    }
+                  });
+            });
+        record_chart_spr_scheduler_axis_run(
+            aggregate.scheduler_axes.local_score_candidates, run);
+        if (run.used_parallel_workers()) {
+          used_parallel_workers = true;
+          aggregate.local_score_worker_tasks += run.worker_tasks_submitted;
+        }
+      }
+    }
+  } catch (...) {
+    fold_worker_counters();
+    if (used_parallel_workers) ++aggregate.local_score_parallel_batches;
+    add_chart_spr_search_counters(state.counters, aggregate);
+    throw;
   }
+
+  if (used_parallel_workers) ++aggregate.local_score_parallel_batches;
+  fold_worker_counters();
 
   auto batch_ms = std::chrono::duration<double, std::milli>(
                       std::chrono::steady_clock::now() - batch_start)
@@ -5432,10 +6480,17 @@ inline void score_candidates_locally_into_impl(
   auto const resident_cache =
       state.cache_strategy == chart_spr_cache_strategy::all_active_patterns ||
       state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart;
+  auto const tile_plan =
+      plan_local_candidate_pattern_tiles(state, candidates, scheduler);
+  auto const pattern_batch_fusion =
+      plan_local_pattern_batch_fusion(state, candidates.size(), scheduler);
   auto const prepared_count =
-      resident_cache ? effective_worker_count : candidates.size();
+      resident_cache
+          ? (tile_plan.enabled() ? candidates.size() : effective_worker_count)
+          : candidates.size();
   local_score_workspace_access::begin(
-      workspace, prepared_count, effective_worker_count);
+      workspace, prepared_count, effective_worker_count,
+      std::max(tile_plan.total_tiles, pattern_batch_fusion.total_tiles));
   try {
     for (auto& result : results) {
       result.lower_bound = {};
@@ -5447,11 +6502,11 @@ inline void score_candidates_locally_into_impl(
     if (resident_cache) {
       score_candidates_locally_all_cache_into(
           state, candidates, results, workspace, options, scheduler,
-          effective_worker_count, checked_state);
+          effective_worker_count, checked_state, tile_plan);
     } else {
       score_candidates_locally_pattern_batches_into(
           state, candidates, results, workspace, options, scheduler,
-          effective_worker_count, checked_state);
+          effective_worker_count, checked_state, pattern_batch_fusion);
     }
   } catch (...) {
     local_score_workspace_access::finish(workspace);
@@ -5734,6 +6789,21 @@ inline multisite_trim_result const& ensure_chart_spr_state_exact_trim(
     ++state.counters.plan_mismatch_rejections;
     throw;
   }
+}
+
+inline multisite_trim_result const& ensure_chart_spr_state_exact_trim(
+    chart_spr_search_state const& state,
+    checked_chart_execution_plan_ref const& checked_state,
+    chart_scheduler& scheduler,
+    multisite_trim_options const& trim_options = {}) {
+  state.active_patterns.assert_no_skipped_invariant_metadata();
+  checked_state.assert_same(state.grammar, state.execution_plan);
+  if (!state.exact_trim_active_only) {
+    state.exact_trim_active_only = build_chart_spr_state_exact_trim(
+        state, checked_state, scheduler, trim_options);
+    ++state.counters.chart_execution_plan_cache_hits;
+  }
+  return *state.exact_trim_active_only;
 }
 
 inline std::uint64_t chart_spr_state_exact_score_with_invariants(
@@ -6855,6 +7925,108 @@ fixed_topology_direct_selected_pattern_scores(
   return scores;
 }
 
+inline chart_spr_fixed_topology_pattern_scores
+fixed_topology_direct_selected_pattern_scores(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate, chart_scheduler& scheduler) {
+  if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+    return fixed_topology_lazy_selected_pattern_scores(state, candidate);
+  }
+  state.active_patterns.assert_no_skipped_invariant_metadata();
+  if (!candidate.topology_selection.certificate) {
+    throw std::runtime_error(
+        "fixed_topology_exact direct scorer requires a complete topology "
+        "certificate");
+  }
+  auto const& certificate = *candidate.topology_selection.certificate;
+  validate_chart_spr_topology_certificate_signatures(
+      state.grammar, candidate.candidate, certificate);
+  auto before_ids = chart_spr_base_production_ids_from_refs(
+      certificate.before_overlay_productions);
+  auto before_topology =
+      grammar_topology_from_productions(state.grammar, before_ids);
+  (void)validate_grammar_topology(state.grammar, before_topology);
+  auto selected_after = chart_spr_overlay_selected_production_by_parent(
+      state.grammar, candidate.candidate,
+      certificate.after_overlay_productions);
+
+  auto const& active = state.active_patterns.patterns.patterns;
+  if (state.chart_opts.score_ua_edge) {
+    for (std::size_t pattern_index = 0; pattern_index < active.size();
+         ++pattern_index) {
+      chart_multisite_detail::validate_pattern_reference_counts(
+          active[pattern_index], pattern_index);
+    }
+  }
+  chart_spr_fixed_topology_pattern_scores scores;
+  scores.old_pattern_scores.resize(active.size());
+  scores.new_pattern_scores.resize(active.size());
+  auto const resolved_workers = scheduler.worker_resolution().resolved_workers;
+  std::vector<chart_spr_search_counters> counters_by_slot(resolved_workers);
+  std::vector<std::exception_ptr> errors(active.size());
+  auto range_options =
+      chart_spr_phase4_pattern_range_options(active.size(), resolved_workers);
+  chart_scheduler_run_summary run;
+  try {
+    run = scheduler.for_each_indexed_range(
+        active.size(), range_options,
+        [&](chart_indexed_range const& range, std::size_t stable_slot,
+            chart_scheduler_cancellation_token const&) {
+          for (std::size_t pattern_index = range.begin;
+               pattern_index < range.end; ++pattern_index) {
+            try {
+              auto const& pattern = active[pattern_index];
+              auto old_row = chart_multisite_detail::restricted_topology_row(
+                  state.grammar, pattern, before_topology);
+              auto new_row = chart_spr_restricted_overlay_topology_row(
+                  state.grammar, candidate.candidate, pattern, selected_after,
+                  &counters_by_slot[stable_slot]);
+              scores.old_pattern_scores[pattern_index] =
+                  chart_spr_weighted_root_score_from_row(old_row, pattern,
+                                                         state.chart_opts);
+              scores.new_pattern_scores[pattern_index] =
+                  chart_spr_weighted_root_score_from_row(new_row, pattern,
+                                                         state.chart_opts);
+            } catch (...) {
+              errors[pattern_index] = std::current_exception();
+              break;
+            }
+          }
+        });
+  } catch (chart_scheduler_submit_error const&) {
+    throw;
+  } catch (std::exception const& error) {
+    // Every pattern callback captures its own failure above. Any exception
+    // escaping the scheduler therefore occurred before a run summary could be
+    // returned (pool construction, submission, or scheduler bookkeeping).
+    throw chart_scheduler_submit_error(
+        std::string{"fixed_topology_exact scheduler operation failed: "} +
+        error.what());
+  } catch (...) {
+    throw chart_scheduler_submit_error(
+        "fixed_topology_exact scheduler operation failed with a non-standard "
+        "exception");
+  }
+  record_chart_spr_scheduler_axis_run(
+      state.counters.scheduler_axes.fixed_topology_patterns, run);
+  for (auto const& counters : counters_by_slot) {
+    add_chart_spr_search_counters(state.counters, counters);
+  }
+  for (auto const& error : errors) {
+    if (error) std::rethrow_exception(error);
+  }
+  for (std::size_t pattern_index = 0; pattern_index < active.size();
+       ++pattern_index) {
+    scores.old_active_total = chart_multisite_detail::checked_add_u64(
+        scores.old_active_total, scores.old_pattern_scores[pattern_index],
+        "fixed_topology_exact direct old active total");
+    scores.new_active_total = chart_multisite_detail::checked_add_u64(
+        scores.new_active_total, scores.new_pattern_scores[pattern_index],
+        "fixed_topology_exact direct new active total");
+  }
+  return scores;
+}
+
 inline std::vector<std::array<chart_cost, nuc_state_count>>
 chart_spr_selected_overlay_child_outside_rows(
     std::array<chart_cost, nuc_state_count> const& parent_outside,
@@ -6944,10 +8116,35 @@ inline spr_score_result fixed_topology_delta_direct_selected_topology(
                           old_full, new_full, true};
 }
 
+inline spr_score_result fixed_topology_delta_direct_selected_topology(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate, chart_scheduler& scheduler) {
+  auto scores = fixed_topology_direct_selected_pattern_scores(state, candidate,
+                                                              scheduler);
+  auto old_full = chart_spr_add_invariant_offset(
+      scores.old_active_total, state,
+      "chart-SPR fixed-topology old-score invariant offset");
+  auto new_full = chart_spr_add_invariant_offset(
+      scores.new_active_total, state,
+      "chart-SPR fixed-topology new-score invariant offset");
+  return spr_score_result{chart_spr_detail::signed_delta(old_full, new_full),
+                          old_full, new_full, true};
+}
+
 chart_spr_fixed_topology_pattern_scores
 fixed_topology_selected_cache_pattern_scores_for_tests(
     chart_spr_search_state const& state,
     chart_spr_candidate_score const& candidate);
+
+// Exercises the production lazy local-commit projection/refresh path without
+// running candidate selection.  This is intentionally narrow: regression
+// tests use it to construct rebasing/reactivation chains whose exact commit
+// order is otherwise difficult to force through the public search policy.
+void refresh_chart_spr_lazy_chart_after_local_commit_for_tests(
+    chart_spr_search_state& state, overlay_chain const& chain,
+    overlay_materialization_result const& materialized,
+    chart_execution_plan const& execution_plan,
+    std::vector<overlay_clade_ref> const& previous_dense_clade_to_ref);
 
 inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
     chart_spr_search_state const& state, chart_spr_candidate_score candidate) {
@@ -6998,10 +8195,61 @@ inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
   return candidate;
 }
 
+inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate,
+    chart_scheduler& scheduler) {
+  if (!candidate.valid) return candidate;
+  if (!chart_spr_topology_selection_has_certificate_or_selector(
+          candidate.topology_selection)) {
+    candidate.valid = false;
+    candidate.invalid_reason =
+        "fixed_topology_exact acceptance requires an explicit complete "
+        "topology certificate or a recorded deterministic topology selector; "
+        "a bare grammar_spr_candidate is not exact";
+    return candidate;
+  }
+  if (!candidate.topology_selection.certificate) {
+    candidate.valid = false;
+    candidate.invalid_reason =
+        "fixed_topology_exact deterministic selectors must be resolved to a "
+        "complete topology certificate before verification";
+    return candidate;
+  }
+  ++state.counters.exact_verifications;
+  try {
+    auto delta = fixed_topology_delta_direct_selected_topology(state, candidate,
+                                                               scheduler);
+    candidate.exact = make_chart_spr_objective_score(
+        delta, chart_spr_score_kind::fixed_topology_exact,
+        chart_spr_score_convention::full_with_invariants,
+        state.invariant_constant_offset);
+  } catch (chart_scheduler_submit_error const&) {
+    // Infrastructure failures return no run summary. They must abort the
+    // search rather than masquerade as a biologically invalid candidate and
+    // leave semantic-axis accounting unable to reconcile with the scheduler.
+    throw;
+  } catch (std::exception const& e) {
+    candidate.valid = false;
+    candidate.invalid_reason = e.what();
+  }
+  if (candidate.valid && candidate.exact &&
+      candidate.canonical_stream_index !=
+          (std::numeric_limits<std::size_t>::max)()) {
+    chart_spr_force_canonical_evidence_failure_for_tests(candidate);
+    candidate.canonical_exact_evidence =
+        std::make_shared<chart_spr_canonical_exact_evidence>(
+            chart_spr_canonicalize_fixed_topology_evidence(
+                state.grammar, candidate.topology_selection,
+                state.invariant_constant_offset));
+  }
+  return candidate;
+}
+
 inline chart_spr_candidate_score verify_candidate_for_acceptance(
     chart_spr_search_state const& state, chart_spr_candidate_score candidate,
     checked_chart_execution_plan_ref const& checked_state,
-    chart_spr_search_options const& options) {
+    chart_spr_search_options const& options,
+    chart_scheduler* scheduler = nullptr) {
   checked_state.assert_same(state.grammar, state.execution_plan);
   switch (options.acceptance_mode) {
     case chart_spr_acceptance_mode::lower_bound_heuristic:
@@ -7029,8 +8277,11 @@ inline chart_spr_candidate_score verify_candidate_for_acceptance(
         verified = state.fixed_topology_exact_verifier(state,
                                                        std::move(candidate));
       } else {
-        verified = verify_candidate_fixed_topology_exact(
-            state, std::move(candidate));
+        verified = scheduler != nullptr
+                       ? verify_candidate_fixed_topology_exact(
+                             state, std::move(candidate), *scheduler)
+                       : verify_candidate_fixed_topology_exact(
+                             state, std::move(candidate));
       }
       if (verified.canonical_stream_index !=
               (std::numeric_limits<std::size_t>::max)() &&
@@ -7236,6 +8487,22 @@ inline std::uint64_t chart_spr_iteration_state_score_before(
 
 inline std::uint64_t chart_spr_iteration_state_score_before(
     chart_spr_search_state const& state,
+    checked_chart_execution_plan_ref const& checked_state,
+    chart_spr_search_options const& options, chart_scheduler& scheduler) {
+  chart_spr_search_detail::require_completed_chart_spr_state_bootstrap(
+      state, "chart SPR iteration state score");
+  checked_state.assert_same(state.grammar, state.execution_plan);
+  if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite) {
+    auto const& trim = ensure_chart_spr_state_exact_trim(
+        state, checked_state, scheduler, options.exact_trim);
+    return chart_spr_add_invariant_offset(
+        trim.optimum, state, "chart-SPR exact state invariant offset");
+  }
+  return state.composite_lower_bound_with_invariants;
+}
+
+inline std::uint64_t chart_spr_iteration_state_score_before(
+    chart_spr_search_state const& state,
     chart_spr_search_options const& options) {
   chart_spr_search_detail::require_completed_chart_spr_state_bootstrap(
       state, "chart SPR iteration state score");
@@ -7410,8 +8677,8 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   result.iteration = iteration;
   result.acceptance_mode = options.acceptance_mode;
   result.candidate_selection = options.candidate_selection;
-  result.state_score_before =
-      chart_spr_iteration_state_score_before(state, checked_state, options);
+  result.state_score_before = chart_spr_iteration_state_score_before(
+      state, checked_state, options, scheduler);
   result.state_score_after = result.state_score_before;
   bool const capture_semantics =
       options.semantic_capture != chart_spr_semantic_capture_mode::off;
@@ -7419,9 +8686,8 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     result.canonical_seed = options.seed;
     if (options.acceptance_mode ==
         chart_spr_acceptance_mode::exact_multisite) {
-      auto const& old_trim =
-          ensure_chart_spr_state_exact_trim(state, checked_state,
-                                            options.exact_trim);
+      auto const& old_trim = ensure_chart_spr_state_exact_trim(
+          state, checked_state, scheduler, options.exact_trim);
       result.canonical_state_exact_before =
           chart_spr_canonicalize_search_trim_evidence(
               state.grammar, checked_state, state.active_patterns,
@@ -7603,7 +8869,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         chart_spr_exact_verifier_activity verifier_activity{
             state.exact_verifier_concurrency};
         verified_candidate = verify_candidate_for_acceptance(
-            state, std::move(candidate), checked_state, options);
+            state, std::move(candidate), checked_state, options, &scheduler);
       } else {
         // Selection/certificate attachment can invalidate a candidate before
         // verifier entry.  Such a candidate has timing diagnostics but must
