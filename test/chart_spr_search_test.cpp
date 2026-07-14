@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <future>
 #include <limits>
 #include <map>
 #include <memory>
@@ -902,6 +903,7 @@ static void test_pattern_batch_cache_options_match_all_cache() {
   auto dag = larch::test::make_tiny_labelled_tree(
       "AAA", four_taxon_two_pattern_tree());
   auto grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, grammar);
   auto candidates = larch::enumerate_grammar_spr_candidates(grammar);
   CHECK(candidates.size() >= 2);
 
@@ -924,7 +926,28 @@ static void test_pattern_batch_cache_options_match_all_cache() {
 
   std::vector<larch::grammar_spr_candidate> subset{
       candidates[0], candidates[1]};
+  auto expected_candidate_partitions = std::size_t{0};
+  auto expected_candidate_descriptors = std::size_t{0};
+  for (auto const& candidate : subset) {
+    auto delta = larch::build_spr_overlay_delta(
+        all_state.grammar, all_state.execution_plan, candidate);
+    CHECK(delta.base == &all_state.grammar);
+    CHECK(delta.base_plan_generation ==
+          all_state.execution_plan.grammar_generation());
+    CHECK(delta.base_plan_fingerprint == all_state.execution_plan.fingerprint());
+    CHECK(delta.compiled_rows.size() == delta.affected_order.size());
+    CHECK(delta.candidate_plan_build_stats.candidate_partition_validations ==
+          candidate.added_productions.size());
+    CHECK(delta.candidate_plan_build_stats.clade_order_sorts == 1);
+    CHECK(delta.candidate_plan_build_stats.production_descriptors_compiled ==
+          delta.compiled_productions.size());
+    expected_candidate_partitions += candidate.added_productions.size();
+    expected_candidate_descriptors += delta.compiled_productions.size();
+  }
+
+  auto all_counters_before = all_state.counters;
   auto all_scores = larch::score_candidates_locally(all_state, subset, {}, 1);
+  auto batched_counters_before = batched_state.counters;
   auto batched_scores = larch::score_candidates_locally(
       batched_state, subset, {}, 1);
   larch::chart_spr_search_options lazy_options;
@@ -937,10 +960,16 @@ static void test_pattern_batch_cache_options_match_all_cache() {
   CHECK(lazy_state.lazy_chart.has_value());
   CHECK(lazy_state.composite_lower_bound_with_invariants ==
         all_state.composite_lower_bound_with_invariants);
+  auto lazy_counters_before = lazy_state.counters;
   auto lazy_scores = larch::score_candidates_locally(lazy_state, subset, {}, 1);
   CHECK(all_scores.size() == batched_scores.size());
   CHECK(all_scores.size() == lazy_scores.size());
   for (std::size_t i = 0; i < all_scores.size(); ++i) {
+    auto oracle = larch::score_multisite_spr_candidate_lower_bound_oracle(
+        grammar, patterns, subset[i]);
+    CHECK(all_scores[i].valid);
+    CHECK(batched_scores[i].valid);
+    CHECK(lazy_scores[i].valid);
     CHECK(all_scores[i].valid == batched_scores[i].valid);
     CHECK(all_scores[i].lower_bound.value.old_score ==
           batched_scores[i].lower_bound.value.old_score);
@@ -959,7 +988,60 @@ static void test_pattern_batch_cache_options_match_all_cache() {
           lazy_scores[i].lower_bound.value.delta);
     CHECK(all_scores[i].affected_clade_count ==
           lazy_scores[i].affected_clade_count);
+    CHECK(all_scores[i].lower_bound.value.old_score == oracle.old_score);
+    CHECK(all_scores[i].lower_bound.value.new_score == oracle.new_score);
+    CHECK(all_scores[i].lower_bound.value.delta == oracle.delta);
   }
+
+  auto const active_pattern_count =
+      all_state.active_patterns.patterns.patterns.size();
+  auto check_candidate_plan_counters =
+      [&](auto const& state, auto const& before,
+          std::size_t pattern_chart_plan_hits_during_scoring) {
+    CHECK(state.active_patterns.patterns.patterns.size() ==
+          active_pattern_count);
+    CHECK(state.counters.chart_execution_plan_builds ==
+          before.chart_execution_plan_builds);
+    CHECK(state.counters.chart_execution_plan_cache_hits ==
+          before.chart_execution_plan_cache_hits + subset.size() +
+              pattern_chart_plan_hits_during_scoring);
+    CHECK(state.counters.candidate_execution_plan_builds ==
+          before.candidate_execution_plan_builds + subset.size());
+    CHECK(state.counters.candidate_execution_plan_cache_hits ==
+          before.candidate_execution_plan_cache_hits +
+              subset.size() * active_pattern_count);
+    CHECK(state.counters.candidate_partition_validations ==
+          before.candidate_partition_validations +
+              expected_candidate_partitions);
+    CHECK(state.counters.clade_order_sorts ==
+          before.clade_order_sorts + subset.size());
+    CHECK(state.counters.production_descriptors_compiled ==
+          before.production_descriptors_compiled +
+              expected_candidate_descriptors);
+    CHECK(state.counters.plan_mismatch_rejections ==
+          before.plan_mismatch_rejections);
+    CHECK(state.counters.candidate_pattern_full_grammar_validations ==
+          before.candidate_pattern_full_grammar_validations);
+    CHECK(state.counters.candidate_pattern_partition_validations ==
+          before.candidate_pattern_partition_validations);
+    CHECK(state.counters.candidate_pattern_clade_order_sorts ==
+          before.candidate_pattern_clade_order_sorts);
+    CHECK(state.counters.full_grammar_validations ==
+          before.full_grammar_validations);
+    CHECK(state.counters.production_partition_validations ==
+          before.production_partition_validations);
+    CHECK(state.counters.dynamic_overlay_payload_partition_validations ==
+          before.dynamic_overlay_payload_partition_validations);
+    CHECK(state.counters.local_candidate_scores ==
+          before.local_candidate_scores + subset.size());
+    CHECK(active_pattern_count >= 2);
+    CHECK(state.counters.local_rows_recomputed >
+          before.local_rows_recomputed);
+  };
+  check_candidate_plan_counters(all_state, all_counters_before, 0);
+  check_candidate_plan_counters(batched_state, batched_counters_before,
+                                active_pattern_count);
+  check_candidate_plan_counters(lazy_state, lazy_counters_before, 0);
   CHECK(batched_state.counters.local_candidate_scores == subset.size());
   CHECK(batched_state.counters.pattern_batch_cache_builds >=
         batched_state.active_patterns.patterns.patterns.size());
@@ -993,6 +1075,547 @@ static void test_pattern_batch_cache_options_match_all_cache() {
           all_scores[i].lower_bound.value.new_score);
     CHECK(memory_scores[i].lower_bound.value.delta ==
           all_scores[i].lower_bound.value.delta);
+  }
+
+  std::println("  PASS");
+}
+
+static void test_candidate_execution_plan_lifetime_and_mismatch_guards() {
+  std::println(
+      "test_candidate_execution_plan_lifetime_and_mismatch_guards");
+
+  {
+    auto fixture = make_fixture();
+    auto state = larch::build_chart_spr_search_state(
+        fixture.dag, fixture.grammar, fixture.patterns);
+    auto source = std::make_unique<larch::grammar_spr_candidate>(
+        fixture.candidates.front());
+    auto signature = larch::chart_spr_candidate_taxon_signature(
+        state.grammar, *source);
+    larch::chart_spr_search_counters counters;
+    auto prepared =
+        larch::chart_spr_search_detail::prepare_local_candidate_score(
+            state, *source, {}, &counters);
+    CHECK(prepared.valid_for_accumulation);
+    CHECK(counters.candidate_execution_plan_builds == 1);
+    CHECK(counters.chart_execution_plan_cache_hits == 1);
+    CHECK(counters.plan_mismatch_rejections == 0);
+    source.reset();
+
+    auto broken_entries = state.pattern_charts;
+    CHECK(!broken_entries.empty());
+    broken_entries.front().chart.inside.clear();
+    auto builds_before = counters.candidate_execution_plan_builds;
+    auto plan_hits_before = counters.chart_execution_plan_cache_hits;
+    larch::chart_spr_local_score_scratch scratch;
+    larch::chart_spr_search_detail::accumulate_prepared_local_candidate_patterns(
+        state, prepared, 0, broken_entries, {}, &counters, scratch);
+    CHECK(!prepared.valid_for_accumulation);
+    CHECK(larch::chart_spr_candidate_taxon_signature(
+              state.grammar, prepared.scored.candidate) == signature);
+    CHECK(counters.candidate_execution_plan_builds == builds_before);
+    CHECK(counters.chart_execution_plan_cache_hits == plan_hits_before);
+  }
+
+  {
+    auto fixture = make_fixture();
+    auto resident = larch::build_chart_spr_search_state(
+        fixture.dag, fixture.grammar, fixture.patterns);
+    std::optional<
+        larch::chart_spr_search_detail::prepared_local_candidate_score>
+        prepared;
+    larch::chart_spr_search_counters counters;
+    {
+      auto source = larch::build_chart_spr_search_state(
+          fixture.dag, fixture.grammar, fixture.patterns);
+      CHECK(source.grammar.execution_generation ==
+            resident.grammar.execution_generation);
+      CHECK(source.execution_plan.fingerprint() ==
+            resident.execution_plan.fingerprint());
+      prepared.emplace(
+          larch::chart_spr_search_detail::prepare_local_candidate_score(
+              source, fixture.candidates.front(), {}, &counters));
+      CHECK(prepared->valid_for_accumulation);
+      CHECK(prepared->delta().base == nullptr);
+    }
+
+    // The source state is now dead.  The published descriptor owns its raw and
+    // compiled arrays, retains no grammar pointer, and consumes the separately
+    // checked equivalent resident snapshot without rebinding shared state.
+    auto rows_before = counters.local_rows_recomputed;
+    larch::chart_spr_local_score_scratch scratch;
+    larch::chart_spr_search_detail::accumulate_prepared_local_candidate_patterns(
+        resident, *prepared, 0, resident.pattern_charts, {}, &counters,
+        scratch);
+    CHECK(prepared->valid_for_accumulation);
+    CHECK(prepared->delta().base == nullptr);
+    CHECK(counters.plan_mismatch_rejections == 0);
+    CHECK(counters.local_rows_recomputed > rows_before);
+    CHECK(counters.candidate_execution_plan_builds == 1);
+    CHECK(counters.chart_execution_plan_cache_hits == 1);
+    CHECK(counters.candidate_execution_plan_cache_hits ==
+          resident.active_patterns.patterns.patterns.size());
+    auto scored =
+        larch::chart_spr_search_detail::finish_prepared_local_candidate_score(
+            resident, *prepared);
+    CHECK(scored.valid);
+
+    // A published descriptor is a shared, const recurrence input.  Exercise
+    // the intended future pattern-axis use directly: several workers consume
+    // the same descriptor and resident base while owning all row scratch.
+    CHECK(!resident.pattern_charts.empty());
+    auto const& shared_descriptor = prepared->delta();
+    auto descriptor_snapshot = shared_descriptor;
+    larch::leaf_site_states leaf_states{
+        .state_by_taxon = resident.active_patterns.patterns.patterns.front()
+                              .state_by_taxon};
+    auto serial_rows = larch::build_local_overlay_chart_rows(
+        resident.grammar, shared_descriptor,
+        resident.pattern_charts.front().chart, leaf_states);
+    std::vector<std::future<larch::local_overlay_chart_rows>> futures;
+    for (std::size_t worker = 0; worker < 4; ++worker) {
+      futures.push_back(std::async(std::launch::async, [&] {
+        return larch::build_local_overlay_chart_rows(
+            resident.grammar, shared_descriptor,
+            resident.pattern_charts.front().chart, leaf_states);
+      }));
+    }
+    for (auto& future : futures) {
+      auto rows = future.get();
+      CHECK(rows.rows == serial_rows.rows);
+      CHECK(rows.base_row_slot.size() == serial_rows.base_row_slot.size());
+      CHECK(rows.temp_row_slot.size() == serial_rows.temp_row_slot.size());
+    }
+    CHECK(shared_descriptor.base == nullptr);
+    CHECK(shared_descriptor.temp_clades == descriptor_snapshot.temp_clades);
+    CHECK(shared_descriptor.temp_productions.size() ==
+          descriptor_snapshot.temp_productions.size());
+    for (std::size_t i = 0; i < shared_descriptor.temp_productions.size();
+         ++i) {
+      CHECK(shared_descriptor.temp_productions[i].parent ==
+            descriptor_snapshot.temp_productions[i].parent);
+      CHECK(shared_descriptor.temp_productions[i].children ==
+            descriptor_snapshot.temp_productions[i].children);
+      CHECK(shared_descriptor.temp_productions[i].multiplicity ==
+            descriptor_snapshot.temp_productions[i].multiplicity);
+    }
+    CHECK(shared_descriptor.affected_order ==
+          descriptor_snapshot.affected_order);
+    CHECK(shared_descriptor.affected_base_row_slot ==
+          descriptor_snapshot.affected_base_row_slot);
+    CHECK(shared_descriptor.affected_temp_row_slot ==
+          descriptor_snapshot.affected_temp_row_slot);
+    CHECK(shared_descriptor.reachability_stats ==
+          descriptor_snapshot.reachability_stats);
+    CHECK(shared_descriptor.base_plan_generation ==
+          descriptor_snapshot.base_plan_generation);
+    CHECK(shared_descriptor.base_plan_fingerprint ==
+          descriptor_snapshot.base_plan_fingerprint);
+    CHECK(shared_descriptor.candidate_plan_build_stats ==
+          descriptor_snapshot.candidate_plan_build_stats);
+    CHECK(shared_descriptor.compiled_rows ==
+          descriptor_snapshot.compiled_rows);
+    CHECK(shared_descriptor.compiled_productions ==
+          descriptor_snapshot.compiled_productions);
+    CHECK(shared_descriptor.compiled_children ==
+          descriptor_snapshot.compiled_children);
+    CHECK(shared_descriptor.removed_base_production ==
+          descriptor_snapshot.removed_base_production);
+    CHECK(shared_descriptor.reachable_base_clade ==
+          descriptor_snapshot.reachable_base_clade);
+    CHECK(shared_descriptor.reachable_temp_clade ==
+          descriptor_snapshot.reachable_temp_clade);
+    CHECK(shared_descriptor.temp_productions_by_base_parent ==
+          descriptor_snapshot.temp_productions_by_base_parent);
+    CHECK(shared_descriptor.temp_productions_by_temp_parent ==
+          descriptor_snapshot.temp_productions_by_temp_parent);
+    CHECK(shared_descriptor.temp_productions_by_base_child ==
+          descriptor_snapshot.temp_productions_by_base_child);
+    CHECK(shared_descriptor.temp_productions_by_temp_child ==
+          descriptor_snapshot.temp_productions_by_temp_child);
+  }
+
+  {
+    auto fixture = make_fixture();
+    auto state = larch::build_chart_spr_search_state(
+        fixture.dag, fixture.grammar, fixture.patterns);
+    auto const generation_before = state.grammar.execution_generation;
+    CHECK(!state.grammar.productions.empty());
+    CHECK(state.grammar.productions.front().children.size() >= 2);
+    std::swap(state.grammar.productions.front().children[0],
+              state.grammar.productions.front().children[1]);
+    CHECK(state.grammar.execution_generation == generation_before);
+
+    auto const counters_before = state.counters;
+    bool threw = false;
+    std::string message;
+    try {
+      (void)larch::score_candidates_locally(
+          state, {fixture.candidates.front()}, {}, 1);
+    } catch (larch::chart_execution_plan_mismatch const& e) {
+      threw = true;
+      message = e.what();
+    }
+    CHECK(threw);
+    CHECK(message.find("stale grammar fingerprint mismatch") !=
+          std::string::npos);
+    CHECK(state.counters.plan_mismatch_rejections ==
+          counters_before.plan_mismatch_rejections + 1);
+    CHECK(state.counters.local_rows_recomputed ==
+          counters_before.local_rows_recomputed);
+    CHECK(state.counters.local_candidate_scores ==
+          counters_before.local_candidate_scores);
+    CHECK(state.counters.candidate_execution_plan_builds ==
+          counters_before.candidate_execution_plan_builds);
+    CHECK(state.counters.chart_execution_plan_cache_hits ==
+          counters_before.chart_execution_plan_cache_hits);
+    CHECK(state.counters.candidate_execution_plan_cache_hits ==
+          counters_before.candidate_execution_plan_cache_hits);
+  }
+
+  {
+    auto fixture = make_fixture();
+    auto state = larch::build_chart_spr_search_state(
+        fixture.dag, fixture.grammar, fixture.patterns);
+    larch::chart_spr_search_counters counters;
+    auto prepared =
+        larch::chart_spr_search_detail::prepare_local_candidate_score(
+            state, fixture.candidates.front(), {}, &counters);
+    CHECK(prepared.valid_for_accumulation);
+    CHECK(counters.candidate_execution_plan_builds == 1);
+    CHECK(counters.chart_execution_plan_cache_hits == 1);
+
+    auto overlay = larch::overlay_from_candidate(
+        state.grammar, fixture.candidates.front());
+    auto materialized = larch::materialize_overlay_grammar(overlay);
+    CHECK(materialized.grammar.execution_generation != 0);
+    CHECK(materialized.grammar.execution_generation !=
+          state.grammar.execution_generation);
+    auto accepted_state = larch::build_chart_spr_search_state(
+        fixture.dag, materialized.grammar, fixture.patterns);
+    CHECK(accepted_state.grammar.execution_generation ==
+          materialized.grammar.execution_generation);
+    CHECK(accepted_state.execution_plan.grammar_generation() ==
+          accepted_state.grammar.execution_generation);
+    accepted_state.execution_plan.assert_compatible(accepted_state.grammar);
+
+    auto rows_before = counters.local_rows_recomputed;
+    auto candidate_hits_before = counters.candidate_execution_plan_cache_hits;
+    larch::chart_spr_local_score_scratch scratch;
+    larch::chart_spr_search_detail::accumulate_prepared_local_candidate_patterns(
+        accepted_state, prepared, 0, accepted_state.pattern_charts, {},
+        &counters, scratch);
+    CHECK(!prepared.valid_for_accumulation);
+    CHECK(counters.plan_mismatch_rejections == 1);
+    CHECK(counters.local_rows_recomputed == rows_before);
+    CHECK(counters.candidate_execution_plan_cache_hits ==
+          candidate_hits_before);
+    CHECK(counters.candidate_execution_plan_builds == 1);
+    CHECK(counters.chart_execution_plan_cache_hits == 1);
+    CHECK(counters.candidate_pattern_full_grammar_validations == 0);
+    CHECK(counters.candidate_pattern_partition_validations == 0);
+    CHECK(counters.candidate_pattern_clade_order_sorts == 0);
+  }
+
+  std::println("  PASS");
+}
+
+static void test_checked_candidate_sources_and_planned_materialization() {
+  std::println(
+      "test_checked_candidate_sources_and_planned_materialization");
+
+  auto fixture = make_fixture();
+  auto state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, fixture.patterns);
+  auto checked = larch::check_chart_execution_plan(state.grammar,
+                                                    state.execution_plan);
+
+  std::size_t full_validations = 0;
+  std::size_t partition_validations = 0;
+  std::size_t clade_sorts = 0;
+  larch::parsimony_chart_detail::structural_work_observer structural_observer{
+      &full_validations, &partition_validations, &clade_sorts};
+  std::size_t compatibility_checks = 0;
+  std::size_t fingerprint_scans = 0;
+  std::size_t legacy_index_validations = 0;
+  std::size_t dynamic_overlay_partition_validations = 0;
+  larch::chart_execution_plan_detail::compatibility_work_observer
+      compatibility_observer{&compatibility_checks, &fingerprint_scans,
+                             &legacy_index_validations,
+                             &dynamic_overlay_partition_validations};
+
+  auto enumerate = [&](larch::chart_spr_candidate_source source,
+                       bool trusted) {
+    larch::grammar_spr_enumeration_options options;
+    options.source = source;
+    options.max_candidates = 2;
+    options.max_candidates_is_post_dedup = true;
+    if (source != larch::chart_spr_candidate_source::grammar) {
+      options.sampled_tree_source_dag = &fixture.dag;
+      options.sampled_tree_count = 1;
+    }
+    std::size_t emitted = 0;
+    if (trusted) {
+      (void)larch::for_each_grammar_spr_candidate(
+          state.grammar, checked, options,
+          [&](larch::grammar_spr_candidate const&) {
+            ++emitted;
+            return true;
+          });
+    } else if (source == larch::chart_spr_candidate_source::sampled_tree) {
+      (void)larch::for_each_sampled_tree_spr_candidate(
+          state.grammar, options,
+          [&](larch::grammar_spr_candidate const&) {
+            ++emitted;
+            return true;
+          });
+    } else if (source == larch::chart_spr_candidate_source::hybrid) {
+      (void)larch::for_each_hybrid_spr_candidate(
+          state.grammar, options,
+          [&](larch::grammar_spr_candidate const&) {
+            ++emitted;
+            return true;
+          });
+    } else {
+      (void)larch::for_each_grammar_spr_candidate(
+          state.grammar, options,
+          [&](larch::grammar_spr_candidate const&) {
+            ++emitted;
+            return true;
+          });
+    }
+    return emitted;
+  };
+
+  {
+    larch::parsimony_chart_detail::structural_work_observer_scope structural{
+        &structural_observer};
+    larch::chart_execution_plan_detail::compatibility_work_observer_scope
+        compatibility{&compatibility_observer};
+    (void)enumerate(larch::chart_spr_candidate_source::grammar, true);
+    (void)enumerate(larch::chart_spr_candidate_source::sampled_tree, true);
+    (void)enumerate(larch::chart_spr_candidate_source::hybrid, true);
+  }
+  CHECK(full_validations == 0);
+  CHECK(partition_validations == 0);
+  CHECK(clade_sorts == 0);
+  CHECK(compatibility_checks == 0);
+  CHECK(fingerprint_scans == 0);
+  CHECK(legacy_index_validations == 0);
+  CHECK(dynamic_overlay_partition_validations == 0);
+
+  {
+    larch::parsimony_chart_detail::structural_work_observer_scope structural{
+        &structural_observer};
+    larch::chart_execution_plan_detail::compatibility_work_observer_scope
+        compatibility{&compatibility_observer};
+    (void)enumerate(larch::chart_spr_candidate_source::grammar, false);
+    (void)enumerate(larch::chart_spr_candidate_source::sampled_tree, false);
+    (void)enumerate(larch::chart_spr_candidate_source::hybrid, false);
+  }
+  CHECK(full_validations == 3);
+  CHECK(legacy_index_validations == 3);
+  // The recurrence observer is intentionally independent of the legacy
+  // whole-grammar/index boundary observer used by candidate enumeration.
+  CHECK(partition_validations == 0);
+  CHECK(compatibility_checks == 0);
+  CHECK(fingerprint_scans == 0);
+  CHECK(dynamic_overlay_partition_validations == 0);
+
+  full_validations = 0;
+  partition_validations = 0;
+  clade_sorts = 0;
+  legacy_index_validations = 0;
+  dynamic_overlay_partition_validations = 0;
+  larch::planned_overlay_materialization_result planned;
+  {
+    larch::parsimony_chart_detail::structural_work_observer_scope structural{
+        &structural_observer};
+    larch::chart_execution_plan_detail::compatibility_work_observer_scope
+        compatibility{&compatibility_observer};
+    planned = larch::materialize_candidate_overlay_grammar_with_plan(
+        state.grammar, checked, fixture.candidates.front());
+  }
+  CHECK(full_validations == 0);
+  CHECK(partition_validations == 0);
+  CHECK(clade_sorts == 0);
+  CHECK(legacy_index_validations == 0);
+  CHECK(compatibility_checks == 0);
+  CHECK(fingerprint_scans == 0);
+  CHECK(dynamic_overlay_partition_validations ==
+        fixture.candidates.front().added_productions.size());
+  CHECK(planned.payload_validation_stats.production_partition_validations ==
+        fixture.candidates.front().added_productions.size());
+  CHECK(planned.execution_plan.build_stats().plan_builds == 1);
+  CHECK(planned.execution_plan.build_stats().full_grammar_validations == 1);
+  CHECK(planned.execution_plan.build_stats().clade_order_sorts == 2);
+  CHECK(planned.execution_plan.grammar_generation() ==
+        planned.materialized.grammar.execution_generation);
+  CHECK(planned.materialized.grammar.execution_generation !=
+        state.grammar.execution_generation);
+
+  // A valid but unreachable dynamic production is deliberately absent from
+  // the dense grammar/plan while remaining visible in the planned-build and
+  // search-level boundary counters.
+  auto unreachable = larch::overlay_from_candidate(
+      state.grammar, checked, fixture.candidates.front());
+  unreachable.temp_clades.push_back(larch::clade_key{{0, 1}});
+  larch::clade_id leaf_zero = larch::no_clade;
+  larch::clade_id leaf_one = larch::no_clade;
+  for (larch::clade_id cid = 0; cid < state.grammar.clades.size(); ++cid) {
+    if (state.grammar.clades[cid].taxa == std::vector<larch::taxon_id>{0}) {
+      leaf_zero = cid;
+    } else if (state.grammar.clades[cid].taxa ==
+               std::vector<larch::taxon_id>{1}) {
+      leaf_one = cid;
+    }
+  }
+  CHECK(leaf_zero != larch::no_clade);
+  CHECK(leaf_one != larch::no_clade);
+  larch::overlay_grammar_production unreachable_production;
+  unreachable_production.parent = larch::temp_clade_ref(
+      static_cast<larch::clade_id>(unreachable.temp_clades.size() - 1));
+  unreachable_production.children = {larch::base_clade_ref(leaf_zero),
+                                     larch::base_clade_ref(leaf_one)};
+  unreachable.temp_productions.push_back(
+      std::move(unreachable_production));
+  dynamic_overlay_partition_validations = 0;
+  larch::planned_overlay_materialization_result unreachable_planned;
+  {
+    larch::chart_execution_plan_detail::compatibility_work_observer_scope
+        compatibility{&compatibility_observer};
+    unreachable_planned = larch::materialize_overlay_grammar_with_plan(
+        unreachable, checked);
+  }
+  CHECK(unreachable_planned.materialized.temp_clade_to_dense.back() ==
+        larch::no_clade);
+  CHECK(unreachable_planned.materialized.temp_production_to_dense.back() ==
+        larch::no_production);
+  CHECK(dynamic_overlay_partition_validations ==
+        unreachable.temp_productions.size());
+  CHECK(unreachable_planned.payload_validation_stats
+            .production_partition_validations ==
+        unreachable.temp_productions.size());
+  larch::chart_spr_search_counters boundary_counters;
+  larch::record_planned_overlay_materialization_stats(
+      boundary_counters, unreachable_planned);
+  CHECK(boundary_counters.dynamic_overlay_payload_partition_validations ==
+        unreachable.temp_productions.size());
+  CHECK(boundary_counters.candidate_pattern_partition_validations == 0);
+
+  // The callback overload is constrained: a literal null selects the
+  // no-callback stats-pointer shape for overlay, candidate, and chain APIs.
+  // A typed stats pointer remains available on both success and failure.
+  bool typed_dense_completed = false;
+  larch::overlay_payload_validation_stats typed_payload_stats;
+  auto typed_stats_planned = larch::materialize_overlay_grammar_with_plan(
+      unreachable, checked, &typed_dense_completed, &typed_payload_stats);
+  CHECK(typed_dense_completed);
+  CHECK(typed_payload_stats.production_partition_validations ==
+        unreachable.temp_productions.size());
+  CHECK(typed_stats_planned.payload_validation_stats
+            .production_partition_validations ==
+        typed_payload_stats.production_partition_validations);
+
+  auto literal_null_overlay = larch::materialize_overlay_grammar_with_plan(
+      unreachable, checked, nullptr, nullptr);
+  CHECK(literal_null_overlay.payload_validation_stats
+            .production_partition_validations ==
+        unreachable.temp_productions.size());
+  auto literal_null_candidate =
+      larch::materialize_candidate_overlay_grammar_with_plan(
+          state.grammar, checked, fixture.candidates.front(), nullptr,
+          nullptr);
+  CHECK(literal_null_candidate.payload_validation_stats
+            .production_partition_validations ==
+        fixture.candidates.front().added_productions.size());
+  larch::overlay_chain empty_chain{state.grammar};
+  auto literal_null_chain = larch::materialize_overlay_chain_with_plan(
+      empty_chain, checked, nullptr, nullptr);
+  CHECK(literal_null_chain.payload_validation_stats
+            .production_partition_validations == 0);
+  CHECK(literal_null_chain.materialized.grammar.productions.size() ==
+        state.grammar.productions.size());
+
+  // An invalid dynamic production must likewise be rejected even though it is
+  // unreachable and therefore absent from the dense output plan.
+  auto malformed = unreachable;
+  malformed.temp_productions.back().children = {
+      larch::base_clade_ref(leaf_zero), larch::base_clade_ref(leaf_zero)};
+  bool dense_completed = false;
+  bool threw = false;
+  larch::overlay_payload_validation_stats failed_payload_stats;
+  dynamic_overlay_partition_validations = 0;
+  {
+    larch::chart_execution_plan_detail::compatibility_work_observer_scope
+        compatibility{&compatibility_observer};
+    try {
+      (void)larch::materialize_overlay_grammar_with_plan(
+          malformed, checked, &dense_completed, &failed_payload_stats);
+    } catch (std::runtime_error const& e) {
+      threw = true;
+      CHECK(std::string{e.what()}.find("children overlap") !=
+            std::string::npos);
+    }
+  }
+  CHECK(threw);
+  CHECK(!dense_completed);
+  CHECK(dynamic_overlay_partition_validations ==
+        malformed.temp_productions.size());
+  CHECK(failed_payload_stats.production_partition_validations ==
+        malformed.temp_productions.size());
+
+  std::println("  PASS");
+}
+
+static void test_acceptance_iteration_checks_resident_plan_once() {
+  std::println("test_acceptance_iteration_checks_resident_plan_once");
+
+  for (std::size_t candidate_batch_size : {std::size_t{1}, std::size_t{4}}) {
+    auto dag = larch::test::make_tiny_labelled_tree(
+        "A", four_taxon_misplaced_tree());
+    auto grammar = larch::build_clade_grammar(dag);
+    auto state = larch::build_chart_spr_search_state(dag, grammar);
+
+    larch::chart_spr_search_options options;
+    options.acceptance_mode =
+        larch::chart_spr_acceptance_mode::exact_multisite;
+    options.candidate_selection =
+        larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+    options.top_k_exact_verify = 3;
+    options.enumeration.max_candidates = 6;
+    options.enumeration.max_candidates_is_post_dedup = true;
+    options.cache.candidate_batch_size = candidate_batch_size;
+    options.semantic_capture =
+        larch::chart_spr_semantic_capture_mode::digest;
+
+    std::size_t compatibility_checks = 0;
+    std::size_t fingerprint_scans = 0;
+    std::size_t legacy_index_validations = 0;
+    std::size_t dynamic_overlay_partition_validations = 0;
+    larch::chart_execution_plan_detail::compatibility_work_observer observer{
+        &compatibility_checks, &fingerprint_scans,
+        &legacy_index_validations,
+        &dynamic_overlay_partition_validations};
+    auto dynamic_counter_before =
+        state.counters.dynamic_overlay_payload_partition_validations;
+    larch::chart_spr_iteration_result iteration;
+    {
+      larch::chart_execution_plan_detail::compatibility_work_observer_scope
+          scope{&observer};
+      iteration =
+          larch::run_chart_spr_acceptance_iteration(state, options);
+    }
+    CHECK(iteration.candidates_scored > 0);
+    CHECK(iteration.candidates_exact_verified > 0);
+    CHECK(compatibility_checks == 1);
+    CHECK(fingerprint_scans == 1);
+    CHECK(legacy_index_validations == 0);
+    CHECK(dynamic_overlay_partition_validations > 0);
+    CHECK(state.counters.dynamic_overlay_payload_partition_validations -
+              dynamic_counter_before ==
+          dynamic_overlay_partition_validations);
+    CHECK(state.counters.candidate_pattern_partition_validations == 0);
   }
 
   std::println("  PASS");
@@ -1077,6 +1700,7 @@ static void test_lazy_cache_local_commit_updates_lazy_chart() {
   options.rebuild_after_accept = false;
   options.cache.use_lazy_multisite_chart = true;
   options.verify_local_commit_two_chart_oracle_for_tests = true;
+  options.semantic_capture = larch::chart_spr_semantic_capture_mode::digest;
 
   auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
   CHECK(search.summary.cache_strategy ==
@@ -1110,6 +1734,14 @@ static void test_lazy_cache_local_commit_updates_lazy_chart() {
         search.counters.lazy_incremental_rows_recomputed);
   CHECK(search.summary.lazy_inside_rows_computed > 0);
   CHECK(search.summary.lazy_merge_ratio > 0.0);
+  auto lazy_denominator =
+      static_cast<double>(search.summary.active_pattern_count) *
+      static_cast<double>(search.summary.final_grammar_clade_count);
+  CHECK(lazy_denominator > 0.0);
+  CHECK(search.summary.lazy_merge_ratio ==
+        static_cast<double>(search.summary.lazy_inside_rows_computed) /
+            lazy_denominator);
+  CHECK(search.canonical_digest.has_value());
 
   std::println("  PASS");
 }
@@ -3933,10 +4565,18 @@ static void test_phase4_local_commit_counter_contract_and_oracle() {
     // (the run completed), so the caches agreed with the from-scratch charts.
     CHECK(search.counters.local_commit_two_chart_oracle_runs ==
           search.counters.local_commit_accepted_moves);
-    // Tip grammar was refreshed once per commit (grammar-only, not counted
-    // under full_overlay_materializations).
+    // Tip grammar was refreshed once per commit.  Exact candidate,
+    // accepted-tip, and final-compaction grammars each publish their own plan.
     CHECK(search.counters.local_commit_tip_grammar_refreshes ==
           search.counters.local_commit_accepted_moves);
+    CHECK(search.counters.chart_execution_plan_builds ==
+          1 + search.counters.local_commit_tip_grammar_refreshes +
+              search.summary.final_compaction_rebuilds +
+              search.counters.transient_chain_extensions_for_verification +
+              search.counters
+                  .overlay_materializations_for_exact_verification);
+    CHECK(search.counters.base_chart_cache_rebuilds ==
+          1 + search.summary.final_compaction_rebuilds);
   }
   // Every accepted move is exact-gated: a locally committed chain's recorded
   // objective is exact.  The exact_multisite gate records grammar_exact; the
@@ -3997,6 +4637,12 @@ static void test_phase4_conservative_mode_counters_unchanged() {
   CHECK(search.counters.sidecar_rebuilds_after_accept == 1);
   CHECK(search.counters.overlay_materializations_for_accept_materialization ==
         1);
+  CHECK(search.counters.chart_execution_plan_builds ==
+        2 + search.counters.overlay_materializations_for_exact_verification);
+  CHECK(search.counters.full_grammar_validations ==
+        search.counters.chart_execution_plan_builds);
+  CHECK(search.counters.production_partition_validations >
+        grammar.productions.size());
   // Conservative mode never uses the local-commit caches.
   CHECK(search.counters.local_commit_accepted_moves == 0);
   CHECK(search.counters.inside_rows_recomputed_on_commit == 0);
@@ -4766,6 +5412,9 @@ int main() {
   test_active_pattern_assertions_reject_skipped_metadata();
   test_state_builder_from_dag_rebuilds_patterns_once();
   test_pattern_batch_cache_options_match_all_cache();
+  test_candidate_execution_plan_lifetime_and_mismatch_guards();
+  test_checked_candidate_sources_and_planned_materialization();
+  test_acceptance_iteration_checks_resident_plan_once();
   test_lazy_cache_fixed_topology_conservative_search();
   test_lazy_cache_local_commit_updates_lazy_chart();
   test_parallel_local_scores_match_serial();

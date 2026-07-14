@@ -1,5 +1,6 @@
 #pragma once
 
+#include <larch/chart_execution_plan.hpp>
 #include <larch/clade_grammar.hpp>
 #include <larch/compute.hpp>
 #include <larch/compact_genome.hpp>
@@ -121,6 +122,60 @@ inline std::optional<production_id> first_multifurcating_production(
 }
 
 namespace parsimony_chart_detail {
+
+// Optional thread-local instrumentation for proving that trusted candidate
+// pattern recurrences perform no structural validation or ordering work.  The
+// observer is installed only around that hot region; ordinary chart callers
+// pay one predictable null branch at validation/sort boundaries, never in the
+// arithmetic recurrence.
+struct structural_work_observer {
+  std::size_t* full_grammar_validations = nullptr;
+  std::size_t* production_partition_validations = nullptr;
+  std::size_t* clade_order_sorts = nullptr;
+};
+
+inline thread_local structural_work_observer* active_structural_work_observer =
+    nullptr;
+
+class structural_work_observer_scope {
+ public:
+  explicit structural_work_observer_scope(structural_work_observer* observer)
+      : previous_(active_structural_work_observer) {
+    active_structural_work_observer = observer;
+  }
+  structural_work_observer_scope(structural_work_observer_scope const&) =
+      delete;
+  structural_work_observer_scope& operator=(
+      structural_work_observer_scope const&) = delete;
+  ~structural_work_observer_scope() {
+    active_structural_work_observer = previous_;
+  }
+
+ private:
+  structural_work_observer* previous_ = nullptr;
+};
+
+inline void record_full_grammar_validation() {
+  if (active_structural_work_observer != nullptr &&
+      active_structural_work_observer->full_grammar_validations != nullptr) {
+    ++*active_structural_work_observer->full_grammar_validations;
+  }
+}
+
+inline void record_production_partition_validation() {
+  if (active_structural_work_observer != nullptr &&
+      active_structural_work_observer->production_partition_validations !=
+          nullptr) {
+    ++*active_structural_work_observer->production_partition_validations;
+  }
+}
+
+inline void record_clade_order_sort() {
+  if (active_structural_work_observer != nullptr &&
+      active_structural_work_observer->clade_order_sorts != nullptr) {
+    ++*active_structural_work_observer->clade_order_sorts;
+  }
+}
 
 inline std::array<std::atomic<std::size_t>, arity_gate_consumer_count>
     arity_gate_throw_counts{};
@@ -313,6 +368,7 @@ inline void validate_binary_production_partition(clade_grammar const& grammar,
 inline void validate_production_inside_row_inputs(
     clade_grammar const& grammar, grammar_production const& prod,
     production_id pid, std::string_view context) {
+  record_production_partition_validation();
   auto prefix = std::string{context} + ": production " + std::to_string(pid);
   if (prod.children.size() < 2) {
     throw std::runtime_error(prefix + " has arity " +
@@ -353,6 +409,7 @@ inline chart_cost combine_production_inside_row(
 }
 
 inline void validate_chart_grammar(clade_grammar const& grammar) {
+  record_full_grammar_validation();
   if (grammar.clades.size() >= static_cast<std::size_t>(no_clade))
     throw std::runtime_error("single-site chart: too many clades");
   if (grammar.productions.size() >= static_cast<std::size_t>(no_production))
@@ -522,6 +579,7 @@ inline single_site_chart build_single_site_chart(
 
   std::vector<clade_id> order(grammar.clades.size());
   std::iota(order.begin(), order.end(), clade_id{0});
+  record_clade_order_sort();
   std::stable_sort(order.begin(), order.end(), [&](clade_id lhs, clade_id rhs) {
     auto const& ltaxa = grammar.clades[lhs].taxa;
     auto const& rtaxa = grammar.clades[rhs].taxa;
@@ -661,6 +719,160 @@ inline single_site_chart build_single_site_chart(
   }
 
   return chart;
+}
+
+// Trusted recurrence over a checked, immutable structural plan.  The plan
+// owns every ID/order/production descriptor used below, so pattern builds do
+// not rescan the grammar, sort clades, or revalidate partitions.
+inline single_site_chart build_single_site_chart(
+    chart_execution_plan const& plan, leaf_site_states const& leaf_states,
+    chart_options const& options) {
+  using namespace parsimony_chart_detail;
+  plan.assert_valid();
+
+  if (options.keep_trace && !plan.all_binary()) {
+    auto first =
+        std::find_if(plan.productions().begin(), plan.productions().end(),
+                     [](chart_plan_production_descriptor const& production) {
+                       return !production.is_binary();
+                     });
+    record_arity_gate_throw(arity_gate_consumer::single_site_chart_trace);
+    auto const production_id =
+        first == plan.productions().end() ? no_production : first->source_id;
+    auto const arity = first == plan.productions().end() ? plan.max_arity()
+                                                         : first->child_count;
+    throw std::runtime_error(
+        "single-site chart keep_trace: WI6 arity gate: the chart supports "
+        "multifurcations; this consumer's trace does not (production " +
+        std::to_string(production_id) + " has arity " + std::to_string(arity) +
+        ", grammar max arity " + std::to_string(plan.max_arity()) +
+        "); build without keep_trace, or expand polytomies before using the "
+        "binary trace layer");
+  }
+  if (leaf_states.state_by_taxon.size() != plan.taxon_count()) {
+    throw std::runtime_error(
+        "single-site chart: leaf state count does not match taxon count");
+  }
+  for (std::size_t tid = 0; tid < leaf_states.state_by_taxon.size(); ++tid) {
+    validate_state(leaf_states.state_by_taxon[tid],
+                   "taxon " + std::to_string(tid));
+  }
+
+  single_site_chart chart;
+  chart.inside.assign(plan.clades().size(), make_inf_row());
+  if (options.keep_trace) chart.optimal_choices.resize(plan.clades().size());
+
+  auto append_choice = [&](clade_id cid, std::uint8_t state,
+                           chart_choice choice) {
+    if (!options.keep_trace) return;
+    if (options.max_trace_choices != 0 &&
+        chart.trace_choice_count >= options.max_trace_choices) {
+      throw std::runtime_error(
+          "single-site chart: trace choice cap exceeded (cap=" +
+          std::to_string(options.max_trace_choices) + ")");
+    }
+    chart.optimal_choices[cid][state].push_back(choice);
+    ++chart.trace_choice_count;
+  };
+
+  auto clear_choices = [&](clade_id cid, std::uint8_t state) {
+    if (!options.keep_trace) return;
+    auto& choices = chart.optimal_choices[cid][state];
+    chart.trace_choice_count -= choices.size();
+    choices.clear();
+  };
+
+  for (auto cid : plan.bottom_up_order()) {
+    auto const& clade = plan.clade(cid);
+    if (clade.is_leaf()) {
+      auto observed = leaf_states.state_by_taxon[clade.leaf_taxon];
+      for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+        chart.inside[cid][state] =
+            state == observed ? chart_cost{0} : chart_inf;
+      }
+      continue;
+    }
+
+    for (auto pid : plan.productions_for_parent(cid)) {
+      auto const& production = plan.production(pid);
+      auto const children = plan.children(pid);
+      if (!production.is_binary()) {
+        ++chart.multifurcation_productions_scored;
+      }
+
+      for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+           ++parent_state) {
+        chart_cost candidate = 0;
+        for (auto child : children) {
+          auto const& child_row = chart.inside[child];
+          chart_cost best_child = chart_inf;
+          for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+               ++child_state) {
+            best_child = std::min(
+                best_child,
+                saturated_add(child_row[child_state],
+                              static_cast<chart_cost>(plan.transition_cost(
+                                  parent_state, child_state))));
+          }
+          candidate = saturated_add(candidate, best_child);
+        }
+        if (candidate >= chart_inf) continue;
+
+        if (!options.keep_trace) {
+          auto& cell = chart.inside[cid][parent_state];
+          cell = std::min(cell, candidate);
+          continue;
+        }
+
+        std::array<chart_cost, 2> best_child_cost{chart_inf, chart_inf};
+        std::array<std::vector<std::uint8_t>, 2> best_child_states;
+        for (std::size_t child_i = 0; child_i < 2; ++child_i) {
+          auto child = production.binary_children[child_i];
+          for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+               ++child_state) {
+            auto child_candidate =
+                saturated_add(chart.inside[child][child_state],
+                              static_cast<chart_cost>(plan.transition_cost(
+                                  parent_state, child_state)));
+            if (child_candidate < best_child_cost[child_i]) {
+              best_child_cost[child_i] = child_candidate;
+              best_child_states[child_i].clear();
+              if (child_candidate < chart_inf) {
+                best_child_states[child_i].push_back(child_state);
+              }
+            } else if (child_candidate == best_child_cost[child_i] &&
+                       child_candidate < chart_inf) {
+              best_child_states[child_i].push_back(child_state);
+            }
+          }
+        }
+
+        auto& cell = chart.inside[cid][parent_state];
+        if (candidate < cell) {
+          cell = candidate;
+          clear_choices(cid, parent_state);
+        }
+        if (candidate == cell) {
+          for (auto left_state : best_child_states[0]) {
+            for (auto right_state : best_child_states[1]) {
+              append_choice(
+                  cid, parent_state,
+                  chart_choice{pid, {left_state, right_state}, candidate});
+            }
+          }
+        }
+      }
+    }
+  }
+  return chart;
+}
+
+inline single_site_chart build_single_site_chart(
+    chart_execution_plan const& plan, leaf_site_states const& leaf_states,
+    bool keep_trace = false) {
+  chart_options options;
+  options.keep_trace = keep_trace;
+  return build_single_site_chart(plan, leaf_states, options);
 }
 
 inline single_site_chart build_single_site_chart(

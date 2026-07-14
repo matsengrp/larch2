@@ -1940,6 +1940,8 @@ inline polytomy_refinement_result finalize_exact_expansion(
         "polytomy refinement: exact expansion did not produce a binary "
         "chart-compatible grammar");
   }
+  result.grammar.execution_generation =
+      detail::allocate_clade_grammar_execution_generation();
   return result;
 }
 

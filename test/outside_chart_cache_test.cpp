@@ -773,6 +773,42 @@ static void test_single_commit_on_binary_four() {
                affected.size(), ocache.patterns.size(), rows_after - rows_before);
 }
 
+static void test_plan_cold_caches_match_checked_oracle() {
+  std::println("test_plan_cold_caches_match_checked_oracle");
+  auto f = load_binary_four_fixture();
+  auto plan = larch::build_chart_execution_plan(f.grammar);
+  auto checked_inside = larch::build_inside_chart_cache(
+      f.grammar, f.active, f.options, f.invariant_offset);
+  auto checked_outside =
+      larch::build_outside_chart_cache(f.grammar, f.active, f.options);
+
+  std::size_t full_validations = 0;
+  std::size_t partition_validations = 0;
+  std::size_t clade_sorts = 0;
+  larch::parsimony_chart_detail::structural_work_observer observer{
+      &full_validations, &partition_validations, &clade_sorts};
+  larch::inside_chart_cache planned_inside;
+  larch::outside_chart_cache planned_outside;
+  {
+    larch::parsimony_chart_detail::structural_work_observer_scope scope{
+        &observer};
+    planned_inside = larch::build_inside_chart_cache(
+        f.grammar, plan, f.active, f.options, f.invariant_offset);
+    planned_outside = larch::build_outside_chart_cache(
+        f.grammar, plan, f.active, f.options);
+  }
+  CHECK(planned_inside.base_rows == checked_inside.base_rows);
+  CHECK(planned_outside.base_rows == checked_outside.base_rows);
+  CHECK(planned_inside.multifurcation_productions_scored ==
+        checked_inside.multifurcation_productions_scored);
+  CHECK(planned_outside.multifurcation_productions_scored ==
+        checked_outside.multifurcation_productions_scored);
+  CHECK(full_validations == 0);
+  CHECK(partition_validations == 0);
+  CHECK(clade_sorts == 0);
+  std::println("  PASS");
+}
+
 static void test_sequential_chain_two_on_rich() {
   std::println("test_sequential_chain_two_on_rich");
 
@@ -1398,6 +1434,7 @@ static void test_pairing_guard() {
 
 int main() {
   test_arity_changing_overlay_commits();
+  test_plan_cold_caches_match_checked_oracle();
   test_single_commit_on_binary_four();
   test_sequential_chain_two_on_rich();
   test_long_sequential_chain_on_rich();

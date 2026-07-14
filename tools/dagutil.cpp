@@ -3142,6 +3142,37 @@ static void print_chart_spr_search_counter_fields(
   out << indent << "pattern_rebuilds: " << counters.pattern_rebuilds << "\n";
   out << indent << "base_chart_cache_rebuilds: "
       << counters.base_chart_cache_rebuilds << "\n";
+  out << indent << "chart_execution_plan_builds: "
+      << counters.chart_execution_plan_builds << "\n";
+  out << indent << "chart_execution_plan_cache_hits: "
+      << counters.chart_execution_plan_cache_hits << "\n";
+  out << indent << "candidate_execution_plan_builds: "
+      << counters.candidate_execution_plan_builds << "\n";
+  out << indent << "candidate_execution_plan_cache_hits: "
+      << counters.candidate_execution_plan_cache_hits << "\n";
+  out << indent
+      << "full_grammar_validations: " << counters.full_grammar_validations
+      << "\n";
+  out << indent << "production_index_validations: "
+      << counters.production_index_validations << "\n";
+  out << indent << "production_partition_validations: "
+      << counters.production_partition_validations << "\n";
+  out << indent << "dynamic_overlay_payload_partition_validations: "
+      << counters.dynamic_overlay_payload_partition_validations << "\n";
+  out << indent << "candidate_partition_validations: "
+      << counters.candidate_partition_validations << "\n";
+  out << indent << "clade_order_sorts: " << counters.clade_order_sorts << "\n";
+  out << indent << "production_descriptors_compiled: "
+      << counters.production_descriptors_compiled << "\n";
+  out << indent
+      << "plan_mismatch_rejections: " << counters.plan_mismatch_rejections
+      << "\n";
+  out << indent << "candidate_pattern_full_grammar_validations: "
+      << counters.candidate_pattern_full_grammar_validations << "\n";
+  out << indent << "candidate_pattern_partition_validations: "
+      << counters.candidate_pattern_partition_validations << "\n";
+  out << indent << "candidate_pattern_clade_order_sorts: "
+      << counters.candidate_pattern_clade_order_sorts << "\n";
   out << indent << "full_overlay_materializations: "
       << counters.full_overlay_materializations << "\n";
   out << indent << "overlay_materializations_for_oracle: "
@@ -4160,6 +4191,35 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.candidate_batches_scored << "\n";
   out << "  pattern_batch_cache_builds: "
       << search.summary.pattern_batch_cache_builds << "\n";
+  out << "  chart_execution_plan_builds: "
+      << search.summary.chart_execution_plan_builds << "\n";
+  out << "  chart_execution_plan_cache_hits: "
+      << search.summary.chart_execution_plan_cache_hits << "\n";
+  out << "  candidate_execution_plan_builds: "
+      << search.summary.candidate_execution_plan_builds << "\n";
+  out << "  candidate_execution_plan_cache_hits: "
+      << search.summary.candidate_execution_plan_cache_hits << "\n";
+  out << "  full_grammar_validations: "
+      << search.summary.full_grammar_validations << "\n";
+  out << "  production_index_validations: "
+      << search.summary.production_index_validations << "\n";
+  out << "  production_partition_validations: "
+      << search.summary.production_partition_validations << "\n";
+  out << "  dynamic_overlay_payload_partition_validations: "
+      << search.summary.dynamic_overlay_payload_partition_validations << "\n";
+  out << "  candidate_partition_validations: "
+      << search.summary.candidate_partition_validations << "\n";
+  out << "  clade_order_sorts: " << search.summary.clade_order_sorts << "\n";
+  out << "  production_descriptors_compiled: "
+      << search.summary.production_descriptors_compiled << "\n";
+  out << "  plan_mismatch_rejections: "
+      << search.summary.plan_mismatch_rejections << "\n";
+  out << "  candidate_pattern_full_grammar_validations: "
+      << search.summary.candidate_pattern_full_grammar_validations << "\n";
+  out << "  candidate_pattern_partition_validations: "
+      << search.summary.candidate_pattern_partition_validations << "\n";
+  out << "  candidate_pattern_clade_order_sorts: "
+      << search.summary.candidate_pattern_clade_order_sorts << "\n";
   out << "  exact_verification_ms: " << std::fixed << std::setprecision(3)
       << search.summary.exact_verification_ms << "\n";
   out << "  materialization_ms: " << std::fixed << std::setprecision(3)

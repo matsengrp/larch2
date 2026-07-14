@@ -37,6 +37,26 @@ struct chart_spr_search_counters {
   std::size_t grammar_rebuilds = 0;
   std::size_t pattern_rebuilds = 0;
   std::size_t base_chart_cache_rebuilds = 0;
+  // Phase-1 immutable structural-plan accounting.  Validation and ordering
+  // happen at the checked generation boundary; the candidate-pattern region
+  // must leave its three scoped counters at zero.
+  std::size_t chart_execution_plan_builds = 0;
+  std::size_t chart_execution_plan_cache_hits = 0;
+  std::size_t candidate_execution_plan_builds = 0;
+  std::size_t candidate_execution_plan_cache_hits = 0;
+  std::size_t full_grammar_validations = 0;
+  std::size_t production_index_validations = 0;
+  std::size_t production_partition_validations = 0;
+  // Candidate/chain temp productions validated before dense reachability
+  // filtering.  Kept distinct from output-plan and candidate-pattern work.
+  std::size_t dynamic_overlay_payload_partition_validations = 0;
+  std::size_t candidate_partition_validations = 0;
+  std::size_t clade_order_sorts = 0;
+  std::size_t production_descriptors_compiled = 0;
+  std::size_t plan_mismatch_rejections = 0;
+  std::size_t candidate_pattern_full_grammar_validations = 0;
+  std::size_t candidate_pattern_partition_validations = 0;
+  std::size_t candidate_pattern_clade_order_sorts = 0;
   // Total overlay materializations plus reason-coded splits.  Exact
   // verification materializations are expensive, but they are not accepted-
   // state sidecar rebuilds and must be reported separately.
@@ -243,6 +263,35 @@ struct chart_spr_search_counters {
   // separately so a regression to "no oracle" is visible.
   std::size_t transient_chain_extension_oracle_rows_checked_for_tests = 0;
 };
+
+inline void record_chart_execution_plan_build_stats(
+    chart_spr_search_counters& counters,
+    chart_execution_plan_build_stats const& stats) {
+  counters.chart_execution_plan_builds += stats.plan_builds;
+  counters.full_grammar_validations += stats.full_grammar_validations;
+  counters.production_index_validations += stats.production_index_validations;
+  counters.production_partition_validations +=
+      stats.production_partition_validations;
+  counters.clade_order_sorts += stats.clade_order_sorts;
+  counters.production_descriptors_compiled +=
+      stats.production_descriptors_compiled;
+}
+
+inline void record_planned_overlay_materialization_stats(
+    chart_spr_search_counters& counters,
+    planned_overlay_materialization_result const& planned) {
+  record_chart_execution_plan_build_stats(counters,
+                                          planned.execution_plan.build_stats());
+  counters.dynamic_overlay_payload_partition_validations +=
+      planned.payload_validation_stats.production_partition_validations;
+}
+
+inline void record_overlay_payload_validation_stats(
+    chart_spr_search_counters& counters,
+    overlay_payload_validation_stats const& stats) {
+  counters.dynamic_overlay_payload_partition_validations +=
+      stats.production_partition_validations;
+}
 
 // Acceptance modes describe the objective used to accept a candidate.  They
 // are intentionally independent from chart_spr_candidate_selection_mode below,
@@ -833,6 +882,7 @@ using chart_spr_fixed_topology_verifier = std::function<
 using chart_spr_exact_multisite_verifier = std::function<
     chart_spr_candidate_score(chart_spr_search_state const&,
                               chart_spr_candidate_score,
+                              checked_chart_execution_plan_ref const&,
                               multisite_trim_options const&)>;
 
 struct affected_clade_distribution {
@@ -914,6 +964,21 @@ struct chart_spr_search_summary {
   std::size_t multifurcation_productions_scored = 0;
   std::size_t candidate_batches_scored = 0;
   std::size_t pattern_batch_cache_builds = 0;
+  std::size_t chart_execution_plan_builds = 0;
+  std::size_t chart_execution_plan_cache_hits = 0;
+  std::size_t candidate_execution_plan_builds = 0;
+  std::size_t candidate_execution_plan_cache_hits = 0;
+  std::size_t full_grammar_validations = 0;
+  std::size_t production_index_validations = 0;
+  std::size_t production_partition_validations = 0;
+  std::size_t dynamic_overlay_payload_partition_validations = 0;
+  std::size_t candidate_partition_validations = 0;
+  std::size_t clade_order_sorts = 0;
+  std::size_t production_descriptors_compiled = 0;
+  std::size_t plan_mismatch_rejections = 0;
+  std::size_t candidate_pattern_full_grammar_validations = 0;
+  std::size_t candidate_pattern_partition_validations = 0;
+  std::size_t candidate_pattern_clade_order_sorts = 0;
   std::size_t exact_verifications = 0;
   std::size_t overlay_materializations_for_exact_verification = 0;
   std::size_t overlay_materializations_for_accept_materialization = 0;
@@ -1205,6 +1270,31 @@ inline void validate_chart_spr_search_grammar(clade_grammar const& grammar) {
   }
 }
 
+inline void validate_active_patterns_for_execution_plan(
+    chart_execution_plan const& plan, site_pattern_set const& patterns,
+    chart_options const& options) {
+  plan.assert_valid();
+  if (patterns.taxon_count != plan.taxon_count()) {
+    throw std::runtime_error(
+        "chart SPR search state: site-pattern set taxon count mismatch");
+  }
+  for (std::size_t pattern_index = 0; pattern_index < patterns.patterns.size();
+       ++pattern_index) {
+    auto const& pattern = patterns.patterns[pattern_index];
+    if (pattern.state_by_taxon.size() != plan.taxon_count()) {
+      throw std::runtime_error(
+          "chart SPR search state: site-pattern taxon count mismatch");
+    }
+    for (auto state : pattern.state_by_taxon) {
+      parsimony_chart_detail::validate_state(state, "site-pattern state");
+    }
+    if (options.score_ua_edge) {
+      chart_multisite_detail::validate_pattern_reference_counts(pattern,
+                                                                pattern_index);
+    }
+  }
+}
+
 inline std::uint64_t invariant_pattern_reference_edge_offset(
     site_pattern const& pattern) {
   if (pattern.state_by_taxon.empty()) {
@@ -1268,6 +1358,32 @@ inline pattern_chart_cache_entry build_pattern_chart_cache_entry(
        ++reference_state) {
     entry.root_min_by_reference_state[reference_state] =
         entry.chart.root_min_with_reference_edge(grammar.root_clade,
+                                                 reference_state);
+    entry.reference_state_counts[reference_state] =
+        pattern.reference_state_counts[reference_state];
+  }
+  entry.weighted_root_score = chart_spr_weighted_root_score_from_row(
+      entry.root_row, pattern, chart_opts);
+  return entry;
+}
+
+inline pattern_chart_cache_entry build_pattern_chart_cache_entry(
+    chart_execution_plan const& plan, site_pattern const& pattern,
+    chart_options const& chart_opts, chart_options const& chart_build_opts) {
+  leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
+  pattern_chart_cache_entry entry;
+  entry.chart = build_single_site_chart(plan, states, chart_build_opts);
+  auto const root = plan.root_clade();
+  if (root == no_clade || root >= entry.chart.inside.size()) {
+    throw std::runtime_error(
+        "chart SPR search state: root clade out of chart range");
+  }
+  entry.root_row = entry.chart.inside[root];
+  entry.root_min_excluding_ua = entry.chart.root_min_excluding_ua(root);
+  for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+       ++reference_state) {
+    entry.root_min_by_reference_state[reference_state] =
+        entry.chart.root_min_with_reference_edge(root,
                                                  reference_state);
     entry.reference_state_counts[reference_state] =
         pattern.reference_state_counts[reference_state];
@@ -1444,6 +1560,13 @@ inline composite_chart_score build_composite_chart_score_active(
   return build_composite_chart_score(grammar, patterns.patterns, options);
 }
 
+inline composite_chart_score build_composite_chart_score_active(
+    chart_execution_plan const& plan, active_site_pattern_set const& patterns,
+    chart_options const& options = {}) {
+  patterns.assert_no_skipped_invariant_metadata();
+  return build_composite_chart_score(plan, patterns.patterns, options);
+}
+
 inline multisite_trim_result build_multisite_trim_active(
     clade_grammar const& grammar, active_site_pattern_set const& patterns,
     chart_options const& options = {},
@@ -1454,12 +1577,41 @@ inline multisite_trim_result build_multisite_trim_active(
 }
 
 inline multisite_trim_result build_multisite_trim_active(
+    chart_execution_plan const& plan, active_site_pattern_set const& patterns,
+    chart_options const& options = {},
+    multisite_trim_options const& trim_options = {}) {
+  patterns.assert_no_skipped_invariant_metadata();
+  return build_multisite_trim(plan, patterns.patterns, options, trim_options);
+}
+
+inline multisite_trim_result build_multisite_trim_active(
     clade_grammar const& grammar, active_site_pattern_set const& patterns,
     lazy_multisite_chart const& lazy_chart, chart_options const& options = {},
     multisite_trim_options const& trim_options = {}) {
   patterns.assert_no_skipped_invariant_metadata();
   return build_multisite_trim(grammar, patterns.patterns, lazy_chart, options,
                               trim_options);
+}
+
+inline multisite_trim_result build_multisite_trim_active(
+    chart_execution_plan const& plan, active_site_pattern_set const& patterns,
+    lazy_multisite_chart const& lazy_chart,
+    chart_options const& options = {},
+    multisite_trim_options const& trim_options = {}) {
+  patterns.assert_no_skipped_invariant_metadata();
+  return build_multisite_trim(plan, patterns.patterns, lazy_chart, options,
+                              trim_options);
+}
+
+inline multisite_trim_result build_multisite_trim_active(
+    clade_grammar const& grammar, chart_execution_plan const& plan,
+    active_site_pattern_set const& patterns,
+    lazy_multisite_chart const& lazy_chart,
+    chart_options const& options = {},
+    multisite_trim_options const& trim_options = {}) {
+  patterns.assert_no_skipped_invariant_metadata();
+  return build_multisite_trim(grammar, plan, patterns.patterns, lazy_chart,
+                              options, trim_options);
 }
 
 // Build report-only tied-root provenance without changing the trim options
@@ -1512,6 +1664,93 @@ chart_spr_canonicalize_search_trim_evidence(
       grammar, algorithm_trim, invariant_offset);
 }
 
+namespace chart_spr_search_detail {
+
+inline chart_spr_canonical_exact_evidence
+canonicalize_search_trim_evidence_with_plan(
+    clade_grammar const& grammar, chart_execution_plan const& plan,
+    active_site_pattern_set const& patterns,
+    chart_options const& chart_opts,
+    multisite_trim_options const& algorithm_trim_options,
+    multisite_trim_result const& algorithm_trim,
+    std::uint64_t invariant_offset) {
+  if (algorithm_trim.keep_production_exact) {
+    auto companion_options = algorithm_trim_options;
+    companion_options.capture_optimal_root_provenance = true;
+    auto companion_trim = build_multisite_trim_active(
+        plan, patterns, chart_opts, companion_options);
+    if (companion_trim.optimum != algorithm_trim.optimum ||
+        companion_trim.keep_mask_kind != algorithm_trim.keep_mask_kind ||
+        companion_trim.keep_production_exact !=
+            algorithm_trim.keep_production_exact ||
+        companion_trim.keep_production != algorithm_trim.keep_production ||
+        companion_trim.frontier_sizes_by_clade !=
+            algorithm_trim.frontier_sizes_by_clade ||
+        companion_trim.active_pattern_count !=
+            algorithm_trim.active_pattern_count ||
+        companion_trim.invariant_constant_offset !=
+            algorithm_trim.invariant_constant_offset) {
+      throw std::runtime_error(
+          "chart-SPR canonical report: provenance companion disagrees with "
+          "algorithmic exact trim optimum, keep mask, frontier sizes, or "
+          "pattern metadata");
+    }
+
+    auto evidence = chart_spr_canonicalize_trim_evidence(
+        grammar, companion_trim, invariant_offset);
+    evidence.evidence_kind =
+        "grammar_exact_frontier_provenance_companion";
+    return evidence;
+  }
+
+  return chart_spr_canonicalize_trim_evidence(
+      grammar, algorithm_trim, invariant_offset);
+}
+
+}  // namespace chart_spr_search_detail
+
+inline chart_spr_canonical_exact_evidence
+chart_spr_canonicalize_search_trim_evidence(
+    clade_grammar const& grammar, chart_execution_plan const& plan,
+    active_site_pattern_set const& patterns,
+    chart_options const& chart_opts,
+    multisite_trim_options const& algorithm_trim_options,
+    multisite_trim_result const& algorithm_trim,
+    std::uint64_t invariant_offset) {
+  auto checked = check_chart_execution_plan(grammar, plan);
+  return chart_spr_search_detail::canonicalize_search_trim_evidence_with_plan(
+      grammar, checked.plan(), patterns, chart_opts, algorithm_trim_options,
+      algorithm_trim, invariant_offset);
+}
+
+inline chart_spr_canonical_exact_evidence
+chart_spr_canonicalize_search_trim_evidence(
+    clade_grammar const& grammar,
+    checked_chart_execution_plan_ref const& checked,
+    active_site_pattern_set const& patterns,
+    chart_options const& chart_opts,
+    multisite_trim_options const& algorithm_trim_options,
+    multisite_trim_result const& algorithm_trim,
+    std::uint64_t invariant_offset) {
+  checked.assert_same(grammar, checked.plan());
+  return chart_spr_search_detail::canonicalize_search_trim_evidence_with_plan(
+      grammar, checked.plan(), patterns, chart_opts, algorithm_trim_options,
+      algorithm_trim, invariant_offset);
+}
+
+inline chart_spr_canonical_exact_evidence
+chart_spr_canonicalize_search_trim_evidence(
+    planned_overlay_materialization_result const& planned,
+    active_site_pattern_set const& patterns,
+    chart_options const& chart_opts,
+    multisite_trim_options const& algorithm_trim_options,
+    multisite_trim_result const& algorithm_trim,
+    std::uint64_t invariant_offset) {
+  return chart_spr_search_detail::canonicalize_search_trim_evidence_with_plan(
+      planned.materialized.grammar, planned.execution_plan, patterns,
+      chart_opts, algorithm_trim_options, algorithm_trim, invariant_offset);
+}
+
 inline multisite_trim_result build_lazy_multisite_trim_active_from_scratch(
     clade_grammar const& grammar, active_site_pattern_set const& patterns,
     chart_options const& options = {},
@@ -1525,6 +1764,39 @@ inline multisite_trim_result build_lazy_multisite_trim_active_from_scratch(
       build_lazy_inside_chart(grammar, patterns.patterns, lazy_options);
   return build_multisite_trim_active(grammar, patterns, lazy_chart, options,
                                      trim_options);
+}
+
+inline multisite_trim_result build_lazy_multisite_trim_active_from_scratch(
+    clade_grammar const& grammar, chart_execution_plan const& plan,
+    active_site_pattern_set const& patterns,
+    chart_options const& options = {},
+    multisite_trim_options const& trim_options = {}) {
+  auto checked = check_chart_execution_plan(grammar, plan);
+  patterns.assert_no_skipped_invariant_metadata();
+  lazy_chart_options lazy_options;
+  lazy_options.chart = options;
+  lazy_options.chart.keep_trace = false;
+  lazy_options.chart.max_trace_choices = 0;
+  auto lazy_chart =
+      build_lazy_inside_chart(checked.plan(), patterns.patterns, lazy_options);
+  return build_multisite_trim_active(checked.plan(), patterns, lazy_chart, options,
+                                     trim_options);
+}
+
+inline multisite_trim_result build_lazy_multisite_trim_active_from_scratch(
+    planned_overlay_materialization_result const& planned,
+    active_site_pattern_set const& patterns,
+    chart_options const& options = {},
+    multisite_trim_options const& trim_options = {}) {
+  patterns.assert_no_skipped_invariant_metadata();
+  lazy_chart_options lazy_options;
+  lazy_options.chart = options;
+  lazy_options.chart.keep_trace = false;
+  lazy_options.chart.max_trace_choices = 0;
+  auto lazy_chart = build_lazy_inside_chart(
+      planned.execution_plan, patterns.patterns, lazy_options);
+  return build_multisite_trim_active(planned.execution_plan, patterns,
+                                     lazy_chart, options, trim_options);
 }
 
 inline std::size_t estimate_chart_spr_pattern_row_cache_bytes(
@@ -1643,11 +1915,15 @@ class chart_spr_elapsed_accumulator {
   chart_spr_elapsed_accumulator& operator=(
       chart_spr_elapsed_accumulator const&) = delete;
 
-  ~chart_spr_elapsed_accumulator() noexcept {
+  void finish() noexcept {
+    if (destination_ == nullptr) return;
     *destination_ += std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - start_)
                          .count();
+    destination_ = nullptr;
   }
+
+  ~chart_spr_elapsed_accumulator() noexcept { finish(); }
 
  private:
   double* destination_;
@@ -1657,6 +1933,7 @@ class chart_spr_elapsed_accumulator {
 struct chart_spr_search_state {
   phylo_dag* dag = nullptr;
   clade_grammar grammar;
+  chart_execution_plan execution_plan;
 
   // Active/topology-informative patterns only.  Invariant-site metadata is
   // stored as invariant_constant_offset/skipped_invariant_site_count below and
@@ -1784,18 +2061,25 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     multisite_trim_options const& trim_options = {},
     chart_cache_options cache = {}) {
   validate_supported_chart_cache_options(cache);
-  chart_spr_search_detail::validate_chart_spr_search_grammar(grammar);
-  if (build_exact_trim) {
-    chart_spr_search_detail::validate_chart_spr_exact_multisite_multifurcation_gate(
-        grammar, "chart SPR search state");
-  }
   active_build.active_patterns.assert_no_skipped_invariant_metadata();
-  chart_multisite_detail::validate_multisite_inputs(
-      grammar, active_build.active_patterns.patterns, options);
 
   chart_spr_search_state state;
   state.dag = &dag;
   state.grammar = std::move(grammar);
+  if (state.grammar.execution_generation == 0) {
+    state.grammar.execution_generation =
+        detail::allocate_clade_grammar_execution_generation();
+  }
+  state.execution_plan = build_chart_execution_plan(state.grammar);
+  record_chart_execution_plan_build_stats(state.counters,
+                                          state.execution_plan.build_stats());
+  if (build_exact_trim) {
+    chart_spr_search_detail::
+        validate_chart_spr_exact_multisite_multifurcation_gate(
+            state.grammar, "chart SPR search state");
+  }
+  chart_spr_search_detail::validate_active_patterns_for_execution_plan(
+      state.execution_plan, active_build.active_patterns.patterns, options);
   state.active_patterns = std::move(active_build.active_patterns);
   state.pattern_source_fingerprint =
       active_build.pattern_source_fingerprint;
@@ -1827,7 +2111,8 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
         state.active_patterns.patterns.patterns.size());
     for (auto const& pattern : state.active_patterns.patterns.patterns) {
       auto entry = chart_spr_search_detail::build_pattern_chart_cache_entry(
-          state.grammar, pattern, options, chart_build_options);
+          state.execution_plan, pattern, options, chart_build_options);
+      ++state.counters.chart_execution_plan_cache_hits;
       active_total = chart_multisite_detail::checked_add_u64(
           active_total, entry.weighted_root_score,
           "chart-SPR cached active-pattern lower bound");
@@ -1847,19 +2132,23 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     lazy_options.chart = chart_build_options;
     lazy_options.retain_all_inside_class_maps = true;
     state.lazy_chart = build_lazy_inside_chart(
-        state.grammar, state.active_patterns.patterns, lazy_options);
+        state.execution_plan, state.active_patterns.patterns, lazy_options);
+    ++state.counters.chart_execution_plan_cache_hits;
     if (!options.score_ua_edge) {
       build_lazy_outside_chart_in_place(
-          state.grammar, state.active_patterns.patterns, *state.lazy_chart,
+          state.execution_plan, state.active_patterns.patterns,
+          *state.lazy_chart,
           options);
+      ++state.counters.chart_execution_plan_cache_hits;
     }
     state.chart_construction_ms =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - chart_construction_start)
             .count();
     active_total = lazy_composite_lower_bound(
-        state.grammar, state.active_patterns.patterns, *state.lazy_chart,
+        state.execution_plan, state.active_patterns.patterns, *state.lazy_chart,
         options);
+    ++state.counters.chart_execution_plan_cache_hits;
     state.counters.multifurcation_productions_scored +=
         state.lazy_chart->multifurcation_productions_scored +
         state.lazy_chart->outside_multifurcation_productions_scored;
@@ -1875,7 +2164,8 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
       auto end = std::min(patterns.size(), begin + batch_size);
       for (std::size_t i = begin; i < end; ++i) {
         auto entry = chart_spr_search_detail::build_pattern_chart_cache_entry(
-            state.grammar, patterns[i], options, chart_build_options);
+            state.execution_plan, patterns[i], options, chart_build_options);
+        ++state.counters.chart_execution_plan_cache_hits;
         active_total = chart_multisite_detail::checked_add_u64(
             active_total, entry.weighted_root_score,
             "chart-SPR batched active-pattern lower bound");
@@ -1909,12 +2199,14 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
             "chart");
       }
       state.exact_trim_active_only = build_multisite_trim_active(
-          state.grammar, state.active_patterns, *state.lazy_chart, options,
+          state.execution_plan, state.active_patterns, *state.lazy_chart,
+          options,
           trim_options);
     } else {
       state.exact_trim_active_only = build_multisite_trim_active(
-          state.grammar, state.active_patterns, options, trim_options);
+          state.execution_plan, state.active_patterns, options, trim_options);
     }
+    ++state.counters.chart_execution_plan_cache_hits;
     state.exact_initialization_ms =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - exact_initialization_start)
@@ -1965,11 +2257,65 @@ struct overlay_reachability_stats {
   std::size_t reachable_temp_clades = 0;
   std::size_t reachable_temp_productions = 0;
   bool full_grammar_like = false;
+
+  bool operator==(overlay_reachability_stats const&) const = default;
+};
+
+struct candidate_chart_execution_plan_build_stats {
+  std::size_t candidate_partition_validations = 0;
+  std::size_t clade_order_sorts = 0;
+  std::size_t production_descriptors_compiled = 0;
+
+  bool operator==(
+      candidate_chart_execution_plan_build_stats const&) const = default;
+};
+
+struct candidate_chart_production_descriptor {
+  overlay_production_ref source;
+  std::size_t child_begin = 0;
+  std::size_t child_count = 0;
+
+  [[nodiscard]] bool is_binary() const noexcept { return child_count == 2; }
+
+  bool operator==(
+      candidate_chart_production_descriptor const&) const = default;
+};
+
+struct candidate_chart_child_descriptor {
+  overlay_clade_ref clade;
+  std::size_t local_row_slot = chart_spr_overlay_row_npos;
+  clade_id base_clade = no_clade;
+  taxon_id leaf_taxon = chart_plan_no_taxon;
+
+  [[nodiscard]] bool has_local_row() const noexcept {
+    return local_row_slot != chart_spr_overlay_row_npos;
+  }
+
+  bool operator==(candidate_chart_child_descriptor const&) const = default;
+};
+
+struct candidate_chart_row_descriptor {
+  overlay_clade_ref clade;
+  taxon_id leaf_taxon = chart_plan_no_taxon;
+  std::size_t production_begin = 0;
+  std::size_t production_count = 0;
+
+  [[nodiscard]] bool is_leaf() const noexcept {
+    return leaf_taxon != chart_plan_no_taxon;
+  }
+
+  bool operator==(candidate_chart_row_descriptor const&) const = default;
 };
 
 struct spr_overlay_delta {
   clade_grammar const* base = nullptr;
-  grammar_spr_candidate const* candidate = nullptr;
+
+  // Candidate seeds are copied because prepared candidates can be moved or
+  // retained after the caller-owned grammar_spr_candidate has gone out of
+  // scope.  The old implementation borrowed a candidate pointer solely for
+  // these two affected-closure seeds.
+  overlay_clade_ref candidate_old_parent;
+  overlay_clade_ref candidate_new_sibling_or_target;
 
   std::vector<clade_key> temp_clades;
   std::vector<overlay_grammar_production> temp_productions;
@@ -1996,6 +2342,21 @@ struct spr_overlay_delta {
   overlay_clade_ref root;
   overlay_reachability_stats reachability_stats;
 
+  // Identity of the immutable base plan used to compile the candidate-local
+  // descriptor.  Legacy callers that do not supply a plan leave generation at
+  // zero; production search always supplies its resident plan.
+  std::uint64_t base_plan_generation = 0;
+  chart_plan_fingerprint base_plan_fingerprint;
+
+  // Flat, self-contained recurrence descriptors compiled once per candidate.
+  // Rows are aligned with affected_order.  Base productions precede temp
+  // productions exactly as in the legacy recurrence, and both production and
+  // child order are preserved.
+  candidate_chart_execution_plan_build_stats candidate_plan_build_stats;
+  std::vector<candidate_chart_row_descriptor> compiled_rows;
+  std::vector<candidate_chart_production_descriptor> compiled_productions;
+  std::vector<candidate_chart_child_descriptor> compiled_children;
+
   // Candidate-local indices built once and reused across all active patterns.
   std::vector<bool> removed_base_production;
   std::vector<bool> reachable_base_clade;
@@ -2012,27 +2373,27 @@ struct local_overlay_chart_rows {
   // Rows only for affected base clades and reachable temp clades.  Slot maps
   // are candidate-delta owned, not rebuilt for every active pattern.
   std::vector<std::array<chart_cost, nuc_state_count>> rows;
-  std::vector<std::size_t> const* base_row_slot = nullptr;
-  std::vector<std::size_t> const* temp_row_slot = nullptr;
+  std::span<std::size_t const> base_row_slot;
+  std::span<std::size_t const> temp_row_slot;
 
   [[nodiscard]] std::size_t slot_for(overlay_clade_ref ref) const {
     if (ref.space == overlay_id_space::base) {
-      if (base_row_slot == nullptr) {
+      if (base_row_slot.empty()) {
         throw std::runtime_error(
             "chart SPR overlay-delta row: missing base row slot map");
       }
-      auto const& slots = *base_row_slot;
+      auto const slots = base_row_slot;
       if (ref.id == no_clade || ref.id >= slots.size()) {
         throw std::runtime_error(
             "chart SPR overlay-delta row: base clade ref out of range");
       }
       return slots[ref.id];
     }
-    if (temp_row_slot == nullptr) {
+    if (temp_row_slot.empty()) {
       throw std::runtime_error(
           "chart SPR overlay-delta row: missing temp row slot map");
     }
-    auto const& slots = *temp_row_slot;
+    auto const slots = temp_row_slot;
     if (ref.id == no_clade || ref.id >= slots.size()) {
       throw std::runtime_error(
           "chart SPR overlay-delta row: temp clade ref out of range");
@@ -2108,14 +2469,12 @@ inline bool overlay_delta_ref_is_reachable(spr_overlay_delta const& delta,
 }
 
 inline std::array<chart_cost, nuc_state_count> overlay_delta_leaf_row(
-    spr_overlay_delta const& delta, overlay_clade_ref ref,
+    taxon_id taxon,
     leaf_site_states const& leaf_states) {
-  auto const& key = overlay_delta_clade_key(delta, ref);
-  if (key.taxa.size() != 1) {
+  if (taxon == chart_plan_no_taxon) {
     throw std::runtime_error(
-        "chart SPR overlay-delta: leaf row requested for non-leaf clade");
+        "chart SPR overlay-delta: missing compiled leaf taxon");
   }
-  auto taxon = key.taxa.front();
   if (taxon >= leaf_states.state_by_taxon.size()) {
     throw std::runtime_error(
         "chart SPR overlay-delta: leaf taxon out of state range");
@@ -2131,6 +2490,7 @@ inline std::array<chart_cost, nuc_state_count> overlay_delta_leaf_row(
 inline void validate_overlay_delta_production_partition(
     spr_overlay_delta const& delta, overlay_grammar_production const& prod,
     production_id pid) {
+  parsimony_chart_detail::record_production_partition_validation();
   if (prod.children.size() < 2) {
     throw std::runtime_error(
         "chart SPR overlay-delta: temp production " +
@@ -2291,7 +2651,9 @@ inline void validate_reachable_overlay_clade(
   }
 }
 
-inline void build_overlay_delta_temp_indices(spr_overlay_delta& delta) {
+inline void build_overlay_delta_temp_indices(
+    spr_overlay_delta& delta,
+    candidate_chart_execution_plan_build_stats* external_stats = nullptr) {
   auto const& base = *delta.base;
   delta.temp_productions_by_base_parent.assign(base.clades.size(), {});
   delta.temp_productions_by_temp_parent.assign(delta.temp_clades.size(), {});
@@ -2301,6 +2663,10 @@ inline void build_overlay_delta_temp_indices(spr_overlay_delta& delta) {
   for (std::size_t i = 0; i < delta.temp_productions.size(); ++i) {
     auto pid = static_cast<production_id>(i);
     auto const& prod = delta.temp_productions[i];
+    ++delta.candidate_plan_build_stats.candidate_partition_validations;
+    if (external_stats != nullptr) {
+      ++external_stats->candidate_partition_validations;
+    }
     validate_overlay_delta_production_partition(delta, prod, pid);
     append_temp_production_index(delta.temp_productions_by_base_parent,
                                  delta.temp_productions_by_temp_parent,
@@ -2320,7 +2686,8 @@ inline void build_overlay_delta_temp_indices(spr_overlay_delta& delta) {
 
 inline void compute_overlay_delta_reachability(
     spr_overlay_delta& delta,
-    local_spr_score_options const& options) {
+    local_spr_score_options const& options,
+    bool base_productions_already_validated = false) {
   auto const& base = *delta.base;
   delta.reachable_base_clade.assign(base.clades.size(), false);
   delta.reachable_temp_clade.assign(delta.temp_clades.size(), false);
@@ -2355,7 +2722,9 @@ inline void compute_overlay_delta_reachability(
     if (ref.space == overlay_id_space::base) {
       for (auto pid : base.productions_by_parent[ref.id]) {
         if (overlay_delta_base_production_removed(delta, pid)) continue;
-        validate_reachable_base_production(delta, pid);
+        if (!base_productions_already_validated) {
+          validate_reachable_base_production(delta, pid);
+        }
         ++reachable_base_productions;
         for (auto child : base.productions[pid].children) {
           stack.push_back(base_clade_ref(child));
@@ -2371,7 +2740,6 @@ inline void compute_overlay_delta_reachability(
       }
       ++delta.reachability_stats.reachable_temp_productions;
       auto const& prod = delta.temp_productions[temp_pid];
-      validate_overlay_delta_production_partition(delta, prod, temp_pid);
       for (auto child : prod.children) stack.push_back(child);
     }
   }
@@ -2399,7 +2767,9 @@ inline void compute_overlay_delta_reachability(
   }
 }
 
-inline void compute_overlay_delta_affected_order(spr_overlay_delta& delta) {
+inline void compute_overlay_delta_affected_order(
+    spr_overlay_delta& delta,
+    candidate_chart_execution_plan_build_stats* external_stats = nullptr) {
   auto const& base = *delta.base;
   std::vector<bool> affected_base(base.clades.size(), false);
   std::vector<bool> affected_temp(delta.temp_clades.size(), false);
@@ -2421,14 +2791,12 @@ inline void compute_overlay_delta_affected_order(spr_overlay_delta& delta) {
     mark_overlay_delta_affected(delta, affected_base, affected_temp, queue,
                                 delta.temp_productions[i].parent);
   }
-  if (delta.candidate != nullptr) {
-    mark_overlay_delta_affected_if_present(delta, affected_base,
-                                           affected_temp, queue,
-                                           delta.candidate->old_parent);
-    mark_overlay_delta_affected_if_present(
-        delta, affected_base, affected_temp, queue,
-        delta.candidate->new_sibling_or_target);
-  }
+  mark_overlay_delta_affected_if_present(delta, affected_base,
+                                         affected_temp, queue,
+                                         delta.candidate_old_parent);
+  mark_overlay_delta_affected_if_present(
+      delta, affected_base, affected_temp, queue,
+      delta.candidate_new_sibling_or_target);
 
   for (std::size_t head = 0; head < queue.size(); ++head) {
     auto child = queue[head];
@@ -2467,6 +2835,9 @@ inline void compute_overlay_delta_affected_order(spr_overlay_delta& delta) {
     delta.affected_order.push_back(temp_clade_ref(cid));
   }
 
+  parsimony_chart_detail::record_clade_order_sort();
+  ++delta.candidate_plan_build_stats.clade_order_sorts;
+  if (external_stats != nullptr) ++external_stats->clade_order_sorts;
   std::stable_sort(delta.affected_order.begin(), delta.affected_order.end(),
                    [&](overlay_clade_ref lhs, overlay_clade_ref rhs) {
                      auto lsize = overlay_delta_clade_size(delta, lhs);
@@ -2487,6 +2858,204 @@ inline void compute_overlay_delta_affected_order(spr_overlay_delta& delta) {
   }
 }
 
+inline candidate_chart_child_descriptor compile_candidate_chart_child(
+    spr_overlay_delta const& delta, overlay_clade_ref child,
+    std::size_t parent_row_slot, chart_execution_plan const* base_plan) {
+  candidate_chart_child_descriptor descriptor;
+  descriptor.clade = child;
+  if (child.space == overlay_id_space::base) {
+    if (child.id == no_clade ||
+        child.id >= delta.affected_base_row_slot.size()) {
+      throw std::runtime_error(
+          "chart SPR candidate execution plan: base child out of range");
+    }
+    descriptor.base_clade = child.id;
+    descriptor.local_row_slot = delta.affected_base_row_slot[child.id];
+    if (base_plan != nullptr) {
+      descriptor.leaf_taxon = base_plan->clade(child.id).leaf_taxon;
+    } else {
+      auto const& key = overlay_delta_clade_key(delta, child);
+      if (key.taxa.size() == 1) descriptor.leaf_taxon = key.taxa.front();
+    }
+  } else {
+    if (child.id == no_clade ||
+        child.id >= delta.affected_temp_row_slot.size()) {
+      throw std::runtime_error(
+          "chart SPR candidate execution plan: temp child out of range");
+    }
+    descriptor.local_row_slot = delta.affected_temp_row_slot[child.id];
+    auto const& key = overlay_delta_clade_key(delta, child);
+    if (key.taxa.size() == 1) descriptor.leaf_taxon = key.taxa.front();
+    if (!descriptor.has_local_row()) {
+      throw std::runtime_error(
+          "chart SPR candidate execution plan: reachable temp child has no "
+          "local row");
+    }
+  }
+  if (descriptor.has_local_row() &&
+      descriptor.local_row_slot >= parent_row_slot) {
+    throw std::runtime_error(
+        "chart SPR candidate execution plan: child row is not before parent "
+        "row");
+  }
+  return descriptor;
+}
+
+inline void append_candidate_chart_production_descriptor(
+    spr_overlay_delta& delta, overlay_production_ref source,
+    std::span<overlay_clade_ref const> children, std::size_t parent_row_slot,
+    chart_execution_plan const* base_plan,
+    candidate_chart_execution_plan_build_stats* external_stats) {
+  if (children.size() < 2) {
+    throw std::runtime_error(
+        "chart SPR candidate execution plan: production has fewer than 2 "
+        "children");
+  }
+  candidate_chart_production_descriptor descriptor;
+  descriptor.source = source;
+  descriptor.child_begin = delta.compiled_children.size();
+  descriptor.child_count = children.size();
+  for (auto child : children) {
+    delta.compiled_children.push_back(compile_candidate_chart_child(
+        delta, child, parent_row_slot, base_plan));
+  }
+  delta.compiled_productions.push_back(descriptor);
+  ++delta.candidate_plan_build_stats.production_descriptors_compiled;
+  if (external_stats != nullptr) {
+    ++external_stats->production_descriptors_compiled;
+  }
+}
+
+inline void compile_overlay_delta_execution_rows(
+    spr_overlay_delta& delta, chart_execution_plan const* base_plan = nullptr,
+    candidate_chart_execution_plan_build_stats* external_stats = nullptr) {
+  auto const& base = *delta.base;
+  delta.compiled_rows.clear();
+  delta.compiled_productions.clear();
+  delta.compiled_children.clear();
+  delta.compiled_rows.reserve(delta.affected_order.size());
+
+  for (std::size_t row_slot = 0; row_slot < delta.affected_order.size();
+       ++row_slot) {
+    auto ref = delta.affected_order[row_slot];
+    candidate_chart_row_descriptor row;
+    row.clade = ref;
+    row.production_begin = delta.compiled_productions.size();
+    auto const& key = overlay_delta_clade_key(delta, ref);
+    if (key.taxa.size() == 1) {
+      row.leaf_taxon = key.taxa.front();
+    }
+
+    if (ref.space == overlay_id_space::base) {
+      auto production_ids = base_plan != nullptr
+                                ? base_plan->productions_for_parent(ref.id)
+                                : std::span<production_id const>{
+                                      base.productions_by_parent[ref.id]};
+      for (auto pid : production_ids) {
+        if (overlay_delta_base_production_removed(delta, pid)) continue;
+        auto base_children =
+            base_plan != nullptr
+                ? base_plan->children(pid)
+                : std::span<clade_id const>{base.productions[pid].children};
+        std::size_t begin = delta.compiled_children.size();
+        for (auto child : base_children) {
+          delta.compiled_children.push_back(compile_candidate_chart_child(
+              delta, base_clade_ref(child), row_slot, base_plan));
+        }
+        candidate_chart_production_descriptor descriptor;
+        descriptor.source = base_production_ref(pid);
+        descriptor.child_begin = begin;
+        descriptor.child_count = base_children.size();
+        delta.compiled_productions.push_back(descriptor);
+        ++delta.candidate_plan_build_stats.production_descriptors_compiled;
+        if (external_stats != nullptr) {
+          ++external_stats->production_descriptors_compiled;
+        }
+      }
+    }
+
+    for (auto temp_pid : temp_productions_for_parent(delta, ref)) {
+      if (temp_pid == no_production ||
+          temp_pid >= delta.temp_productions.size()) {
+        throw std::runtime_error(
+            "chart SPR candidate execution plan: temp production id out of "
+            "range");
+      }
+      auto const& production = delta.temp_productions[temp_pid];
+      append_candidate_chart_production_descriptor(
+          delta, temp_production_ref(temp_pid), production.children, row_slot,
+          base_plan, external_stats);
+    }
+
+    row.production_count =
+        delta.compiled_productions.size() - row.production_begin;
+    if (row.is_leaf()) {
+      if (row.production_count != 0) {
+        throw std::runtime_error(
+            "chart SPR candidate execution plan: singleton clade has "
+            "productions");
+      }
+    } else if (row.production_count == 0) {
+      throw std::runtime_error(
+          "chart SPR candidate execution plan: non-singleton clade has no "
+          "productions");
+    }
+    delta.compiled_rows.push_back(row);
+  }
+}
+
+inline candidate_chart_row_descriptor const& candidate_chart_row_for_ref(
+    spr_overlay_delta const& delta, overlay_clade_ref ref) {
+  std::size_t slot = chart_spr_overlay_row_npos;
+  if (ref.space == overlay_id_space::base) {
+    if (ref.id == no_clade || ref.id >= delta.affected_base_row_slot.size()) {
+      throw std::runtime_error(
+          "chart SPR candidate execution plan: base row ref out of range");
+    }
+    slot = delta.affected_base_row_slot[ref.id];
+  } else {
+    if (ref.id == no_clade || ref.id >= delta.affected_temp_row_slot.size()) {
+      throw std::runtime_error(
+          "chart SPR candidate execution plan: temp row ref out of range");
+    }
+    slot = delta.affected_temp_row_slot[ref.id];
+  }
+  if (slot == chart_spr_overlay_row_npos ||
+      slot >= delta.compiled_rows.size() ||
+      delta.compiled_rows[slot].clade != ref) {
+    throw std::runtime_error(
+        "chart SPR candidate execution plan: missing compiled row");
+  }
+  return delta.compiled_rows[slot];
+}
+
+inline std::span<candidate_chart_production_descriptor const>
+candidate_chart_productions_for_row(spr_overlay_delta const& delta,
+                                    candidate_chart_row_descriptor const& row) {
+  return std::span<candidate_chart_production_descriptor const>{
+      delta.compiled_productions}
+      .subspan(row.production_begin, row.production_count);
+}
+
+inline std::span<candidate_chart_child_descriptor const>
+candidate_chart_children(
+    spr_overlay_delta const& delta,
+    candidate_chart_production_descriptor const& production) {
+  return std::span<candidate_chart_child_descriptor const>{
+      delta.compiled_children}
+      .subspan(production.child_begin, production.child_count);
+}
+
+inline void assert_overlay_delta_execution_plan_compatible(
+    spr_overlay_delta const& delta, chart_execution_plan const& plan) {
+  if (delta.base_plan_generation == 0 ||
+      delta.base_plan_generation != plan.grammar_generation() ||
+      delta.base_plan_fingerprint != plan.fingerprint()) {
+    throw chart_execution_plan_mismatch(
+        "chart SPR candidate execution plan: base plan mismatch");
+  }
+}
+
 inline void record_overlay_delta_reachability_counters(
     chart_spr_search_counters& counters,
     overlay_reachability_stats const& stats) {
@@ -2501,19 +3070,36 @@ inline void record_overlay_delta_reachability_counters(
 
 }  // namespace chart_spr_search_detail
 
-inline spr_overlay_delta build_spr_overlay_delta(
-    clade_grammar const& base, grammar_spr_candidate const& candidate,
-    local_spr_score_options const& options = {}) {
+namespace chart_spr_search_detail {
+
+inline spr_overlay_delta build_spr_overlay_delta_impl(
+    clade_grammar const& base, chart_execution_plan const* base_plan,
+    grammar_spr_candidate const& candidate,
+    local_spr_score_options const& options,
+    checked_chart_execution_plan_ref const* checked_base,
+    candidate_chart_execution_plan_build_stats* external_stats = nullptr) {
   if (base.root_clade == no_clade || base.root_clade >= base.clades.size()) {
     throw std::runtime_error("chart SPR overlay-delta: root clade out of range");
+  }
+  if (base_plan != nullptr) {
+    if (checked_base == nullptr) {
+      throw chart_execution_plan_mismatch(
+          "chart SPR candidate execution plan: missing checked base token");
+    }
+    checked_base->assert_same(base, *base_plan);
   }
 
   spr_overlay_delta delta;
   delta.base = &base;
-  delta.candidate = &candidate;
+  delta.candidate_old_parent = candidate.old_parent;
+  delta.candidate_new_sibling_or_target = candidate.new_sibling_or_target;
   delta.temp_clades = candidate.added_clades;
   delta.temp_productions = candidate.added_productions;
   delta.root = base_clade_ref(base.root_clade);
+  if (base_plan != nullptr) {
+    delta.base_plan_generation = base_plan->grammar_generation();
+    delta.base_plan_fingerprint = base_plan->fingerprint();
+  }
 
   auto taxon_count = base.taxa.id_to_sample_id.size();
   for (std::size_t i = 0; i < delta.temp_clades.size(); ++i) {
@@ -2547,10 +3133,44 @@ inline spr_overlay_delta build_spr_overlay_delta(
     delta.removed_base_production[pid] = true;
   }
 
-  chart_spr_search_detail::build_overlay_delta_temp_indices(delta);
-  chart_spr_search_detail::compute_overlay_delta_reachability(delta, options);
-  chart_spr_search_detail::compute_overlay_delta_affected_order(delta);
+  build_overlay_delta_temp_indices(delta, external_stats);
+  compute_overlay_delta_reachability(delta, options, base_plan != nullptr);
+  compute_overlay_delta_affected_order(delta, external_stats);
+  compile_overlay_delta_execution_rows(delta, base_plan, external_stats);
   return delta;
+}
+
+}  // namespace chart_spr_search_detail
+
+inline spr_overlay_delta build_spr_overlay_delta(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    local_spr_score_options const& options = {}) {
+  return chart_spr_search_detail::build_spr_overlay_delta_impl(
+      base, nullptr, candidate, options, nullptr);
+}
+
+inline spr_overlay_delta build_spr_overlay_delta(
+    clade_grammar const& base, chart_execution_plan const& base_plan,
+    grammar_spr_candidate const& candidate,
+    local_spr_score_options const& options = {}) {
+  auto checked = check_chart_execution_plan(base, base_plan);
+  return chart_spr_search_detail::build_spr_overlay_delta_impl(
+      base, &base_plan, candidate, options, &checked);
+}
+
+// Production search owns grammar and plan as one immutable published state.
+// Publication performs the full structural fingerprint check exactly once;
+// candidate preparation then uses this O(1) generation/shape check.  Callers
+// outside that ownership contract must use the checked overload above.
+inline spr_overlay_delta build_spr_overlay_delta_from_resident_plan(
+    clade_grammar const& base,
+    checked_chart_execution_plan_ref const& checked_base,
+    grammar_spr_candidate const& candidate,
+    local_spr_score_options const& options = {},
+    candidate_chart_execution_plan_build_stats* build_stats = nullptr) {
+  auto const& base_plan = checked_base.plan();
+  return chart_spr_search_detail::build_spr_overlay_delta_impl(
+      base, &base_plan, candidate, options, &checked_base, build_stats);
 }
 
 inline std::array<chart_cost, nuc_state_count> const&
@@ -2586,6 +3206,24 @@ struct overlay_row_provider {
     (void)delta;
     return local_overlay_chart_row(local_rows, base_chart, ref);
   }
+
+  [[nodiscard]] std::array<chart_cost, nuc_state_count> const& row(
+      candidate_chart_child_descriptor const& child) const {
+    if (child.has_local_row()) {
+      if (child.local_row_slot >= local_rows.rows.size()) {
+        throw std::runtime_error(
+            "chart SPR overlay-delta row: compiled local child slot out of "
+            "range");
+      }
+      return local_rows.rows[child.local_row_slot];
+    }
+    if (child.base_clade == no_clade ||
+        child.base_clade >= base_chart.inside.size()) {
+      throw std::runtime_error(
+          "chart SPR overlay-delta row: compiled base child out of range");
+    }
+    return base_chart.inside[child.base_clade];
+  }
 };
 
 namespace chart_spr_search_detail {
@@ -2593,7 +3231,7 @@ namespace chart_spr_search_detail {
 template <class RowProvider>
 inline void accumulate_overlay_production_row(
     std::array<chart_cost, nuc_state_count>& row,
-    std::vector<overlay_clade_ref> const& children,
+    std::span<candidate_chart_child_descriptor const> children,
     RowProvider const& provider,
     chart_spr_search_counters* counters = nullptr) {
   if (children.size() < 2) {
@@ -2606,11 +3244,12 @@ inline void accumulate_overlay_production_row(
   }
 
   struct production_view {
-    std::vector<overlay_clade_ref> const& children;
+    std::span<candidate_chart_child_descriptor const> children;
   } prod{children};
   for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
        ++parent_state) {
-    auto row_provider = [&](overlay_clade_ref child) -> auto const& {
+    auto row_provider =
+        [&](candidate_chart_child_descriptor const& child) -> auto const& {
       return provider.row(child);
     };
     auto total = parsimony_chart_detail::combine_production_inside_row(
@@ -2622,52 +3261,23 @@ inline void accumulate_overlay_production_row(
 template <class RowProvider>
 inline std::array<chart_cost, nuc_state_count> recompute_overlay_delta_row(
     spr_overlay_delta const& delta, leaf_site_states const& leaf_states,
-    RowProvider const& provider, overlay_clade_ref ref,
+    RowProvider const& provider,
+    candidate_chart_row_descriptor const& compiled_row,
     chart_spr_search_counters* counters = nullptr) {
-  auto const& base = *delta.base;
-  auto const& key = overlay_delta_clade_key(delta, ref);
-  if (key.taxa.size() == 1) {
-    if (available_production_count_for_parent(delta, ref) != 0) {
-      throw std::runtime_error(
-          "chart SPR overlay-delta: singleton clade has productions during "
-          "local row recompute");
-    }
-    return overlay_delta_leaf_row(delta, ref, leaf_states);
+  if (compiled_row.is_leaf()) {
+    return overlay_delta_leaf_row(compiled_row.leaf_taxon, leaf_states);
   }
 
   auto row = parsimony_chart_detail::make_inf_row();
-  bool saw_production = false;
-  if (ref.space == overlay_id_space::base) {
-    for (auto pid : base.productions_by_parent[ref.id]) {
-      if (overlay_delta_base_production_removed(delta, pid)) continue;
-      validate_reachable_base_production(delta, pid);
-      std::vector<overlay_clade_ref> children;
-      children.reserve(base.productions[pid].children.size());
-      for (auto child : base.productions[pid].children) {
-        children.push_back(base_clade_ref(child));
-      }
-      accumulate_overlay_production_row(row, children, provider, counters);
-      saw_production = true;
-    }
-  }
-
-  for (auto temp_pid : temp_productions_for_parent(delta, ref)) {
-    if (temp_pid == no_production ||
-        temp_pid >= delta.temp_productions.size()) {
-      throw std::runtime_error(
-          "chart SPR overlay-delta: temp production id out of range during "
-          "row recompute");
-    }
-    auto const& prod = delta.temp_productions[temp_pid];
-    validate_overlay_delta_production_partition(delta, prod, temp_pid);
-    accumulate_overlay_production_row(row, prod.children, provider, counters);
-    saw_production = true;
-  }
-
-  if (!saw_production) {
+  auto productions = candidate_chart_productions_for_row(delta, compiled_row);
+  if (productions.empty()) {
     throw std::runtime_error(
         "chart SPR overlay-delta: non-singleton clade has no productions "
         "during local row recompute");
+  }
+  for (auto const& production : productions) {
+    accumulate_overlay_production_row(
+        row, candidate_chart_children(delta, production), provider, counters);
   }
   return row;
 }
@@ -2675,7 +3285,8 @@ inline std::array<chart_cost, nuc_state_count> recompute_overlay_delta_row(
 }  // namespace chart_spr_search_detail
 
 inline void build_local_overlay_chart_rows_into(
-    spr_overlay_delta const& delta, single_site_chart const& base_chart,
+    clade_grammar const& base, spr_overlay_delta const& delta,
+    single_site_chart const& base_chart,
     leaf_site_states const& leaf_states, local_overlay_chart_rows& rows,
     chart_options const& options = {},
     bool validate_base_chart_shapes = false,
@@ -2685,10 +3296,6 @@ inline void build_local_overlay_chart_rows_into(
         "chart SPR overlay-delta: local row scorer does not support trace "
         "storage");
   }
-  if (delta.base == nullptr) {
-    throw std::runtime_error("chart SPR overlay-delta: missing base grammar");
-  }
-  auto const& base = *delta.base;
   if (validate_base_chart_shapes) {
     chart_trim_detail::validate_chart_shapes(base, base_chart);
   }
@@ -2705,18 +3312,50 @@ inline void build_local_overlay_chart_rows_into(
     throw std::runtime_error(
         "chart SPR overlay-delta: affected row slot map size mismatch");
   }
+  if (delta.compiled_rows.size() != delta.affected_order.size()) {
+    throw std::runtime_error(
+        "chart SPR overlay-delta: compiled row count mismatch");
+  }
 
-  rows.base_row_slot = &delta.affected_base_row_slot;
-  rows.temp_row_slot = &delta.affected_temp_row_slot;
+  rows.base_row_slot = delta.affected_base_row_slot;
+  rows.temp_row_slot = delta.affected_temp_row_slot;
   rows.rows.assign(delta.affected_order.size(),
                    parsimony_chart_detail::make_inf_row());
 
   overlay_row_provider provider{delta, base_chart, rows};
-  for (std::size_t i = 0; i < delta.affected_order.size(); ++i) {
-    auto ref = delta.affected_order[i];
+  for (std::size_t i = 0; i < delta.compiled_rows.size(); ++i) {
     rows.rows[i] = chart_spr_search_detail::recompute_overlay_delta_row(
-        delta, leaf_states, provider, ref, counters);
+        delta, leaf_states, provider, delta.compiled_rows[i], counters);
   }
+}
+
+// Legacy/direct wrapper.  Prepared production scoring uses the overload above
+// with its checked resident grammar, so its immutable descriptor carries no
+// borrowed grammar pointer.
+inline void build_local_overlay_chart_rows_into(
+    spr_overlay_delta const& delta, single_site_chart const& base_chart,
+    leaf_site_states const& leaf_states, local_overlay_chart_rows& rows,
+    chart_options const& options = {},
+    bool validate_base_chart_shapes = false,
+    chart_spr_search_counters* counters = nullptr) {
+  if (delta.base == nullptr) {
+    throw std::runtime_error("chart SPR overlay-delta: missing base grammar");
+  }
+  build_local_overlay_chart_rows_into(
+      *delta.base, delta, base_chart, leaf_states, rows, options,
+      validate_base_chart_shapes, counters);
+}
+
+inline local_overlay_chart_rows build_local_overlay_chart_rows(
+    clade_grammar const& base, spr_overlay_delta const& delta,
+    single_site_chart const& base_chart,
+    leaf_site_states const& leaf_states, chart_options const& options = {},
+    bool validate_base_chart_shapes = false) {
+  local_overlay_chart_rows rows;
+  build_local_overlay_chart_rows_into(base, delta, base_chart, leaf_states,
+                                      rows, options,
+                                      validate_base_chart_shapes);
+  return rows;
 }
 
 inline local_overlay_chart_rows build_local_overlay_chart_rows(
@@ -2777,6 +3416,26 @@ inline void add_chart_spr_search_counters(
   dst.grammar_rebuilds += src.grammar_rebuilds;
   dst.pattern_rebuilds += src.pattern_rebuilds;
   dst.base_chart_cache_rebuilds += src.base_chart_cache_rebuilds;
+  dst.chart_execution_plan_builds += src.chart_execution_plan_builds;
+  dst.chart_execution_plan_cache_hits += src.chart_execution_plan_cache_hits;
+  dst.candidate_execution_plan_builds += src.candidate_execution_plan_builds;
+  dst.candidate_execution_plan_cache_hits +=
+      src.candidate_execution_plan_cache_hits;
+  dst.full_grammar_validations += src.full_grammar_validations;
+  dst.production_index_validations += src.production_index_validations;
+  dst.production_partition_validations += src.production_partition_validations;
+  dst.dynamic_overlay_payload_partition_validations +=
+      src.dynamic_overlay_payload_partition_validations;
+  dst.candidate_partition_validations += src.candidate_partition_validations;
+  dst.clade_order_sorts += src.clade_order_sorts;
+  dst.production_descriptors_compiled += src.production_descriptors_compiled;
+  dst.plan_mismatch_rejections += src.plan_mismatch_rejections;
+  dst.candidate_pattern_full_grammar_validations +=
+      src.candidate_pattern_full_grammar_validations;
+  dst.candidate_pattern_partition_validations +=
+      src.candidate_pattern_partition_validations;
+  dst.candidate_pattern_clade_order_sorts +=
+      src.candidate_pattern_clade_order_sorts;
   dst.full_overlay_materializations += src.full_overlay_materializations;
   dst.overlay_materializations_for_oracle +=
       src.overlay_materializations_for_oracle;
@@ -2918,42 +3577,109 @@ struct chart_spr_local_score_scratch {
 
 namespace chart_spr_search_detail {
 
-struct prepared_local_candidate_score {
-  grammar_spr_candidate const* candidate = nullptr;
-  spr_overlay_delta delta;
+// Published candidate-local execution descriptor.  Construction consumes the
+// mutable build aggregate, clears its now-unneeded borrowed base pointer, and
+// exposes only a const view thereafter.  Raw overlay payload and compiled rows
+// therefore cannot diverge while pattern workers share the descriptor.
+class compiled_spr_candidate_execution {
+ public:
+  explicit compiled_spr_candidate_execution(spr_overlay_delta descriptor)
+      : descriptor_(std::move(descriptor)) {
+    descriptor_.base = nullptr;
+  }
+
+  [[nodiscard]] spr_overlay_delta const& descriptor() const noexcept {
+    return descriptor_;
+  }
+
+ private:
+  spr_overlay_delta descriptor_;
+};
+
+class prepared_local_candidate_score {
+ public:
   std::optional<overlay_materialization_result> verification_materialized;
   std::uint64_t new_active_score = 0;
   chart_spr_candidate_score scored;
   bool valid_for_accumulation = false;
+
+  [[nodiscard]] spr_overlay_delta const& delta() const {
+    if (!execution) {
+      throw std::runtime_error(
+          "chart SPR local score: missing compiled candidate execution");
+    }
+    return execution->descriptor();
+  }
+
+ private:
+  std::optional<compiled_spr_candidate_execution> execution;
+
+  void publish_execution(spr_overlay_delta descriptor) {
+    execution.emplace(std::move(descriptor));
+  }
+
+  friend prepared_local_candidate_score prepare_local_candidate_score(
+      chart_spr_search_state const& state,
+      grammar_spr_candidate const& candidate,
+      local_spr_score_options const& options,
+      chart_spr_search_counters* counters,
+      checked_chart_execution_plan_ref const& checked_state);
 };
 
 inline prepared_local_candidate_score prepare_local_candidate_score(
     chart_spr_search_state const& state,
     grammar_spr_candidate const& candidate,
     local_spr_score_options const& options,
-    chart_spr_search_counters* counters) {
+    chart_spr_search_counters* counters,
+    checked_chart_execution_plan_ref const& checked_state) {
   if (options.exact_multisite) {
     throw std::runtime_error(
         "chart SPR local score: exact_multisite belongs to the Phase-4 "
         "verification gate, not the Phase-3 composite local scorer");
   }
 
-  if (counters != nullptr) ++counters->local_candidate_scores;
+  if (counters != nullptr) {
+    ++counters->local_candidate_scores;
+  }
 
   prepared_local_candidate_score prepared;
-  prepared.candidate = &candidate;
   prepared.scored.candidate = candidate;
+  candidate_chart_execution_plan_build_stats candidate_plan_stats;
+  auto record_candidate_plan_stats = [&] {
+    if (counters == nullptr) return;
+    counters->candidate_partition_validations +=
+        candidate_plan_stats.candidate_partition_validations;
+    counters->clade_order_sorts += candidate_plan_stats.clade_order_sorts;
+    counters->production_descriptors_compiled +=
+        candidate_plan_stats.production_descriptors_compiled;
+  };
   try {
-    prepared.delta = build_spr_overlay_delta(state.grammar, candidate,
-                                             options);
-  } catch (std::exception const& e) {
+    checked_state.assert_same(state.grammar, state.execution_plan);
+    auto mutable_delta = build_spr_overlay_delta_from_resident_plan(
+        state.grammar, checked_state, candidate, options,
+        &candidate_plan_stats);
+    prepared.publish_execution(std::move(mutable_delta));
+  } catch (chart_execution_plan_mismatch const& e) {
+    record_candidate_plan_stats();
+    if (counters != nullptr) ++counters->plan_mismatch_rejections;
     prepared.scored = make_invalid_local_candidate_score(state, candidate,
                                                          e.what());
     return prepared;
+  } catch (std::exception const& e) {
+    record_candidate_plan_stats();
+    prepared.scored =
+        make_invalid_local_candidate_score(state, candidate, e.what());
+    return prepared;
   }
+  record_candidate_plan_stats();
   if (counters != nullptr) {
+    // These are successful-build/use counters, not attempt counters.  Invalid
+    // candidate descriptors and stale resident plans must not masquerade as a
+    // completed build or cache hit.
+    ++counters->chart_execution_plan_cache_hits;
+    ++counters->candidate_execution_plan_builds;
     record_overlay_delta_reachability_counters(
-        *counters, prepared.delta.reachability_stats);
+        *counters, prepared.delta().reachability_stats);
   }
 
   if (options.verify_against_full_overlay) {
@@ -2971,12 +3697,142 @@ inline prepared_local_candidate_score prepare_local_candidate_score(
   return prepared;
 }
 
+// Direct/detail callers retain a checked standalone boundary.  Production
+// acceptance batches call the capability overload above so every candidate in
+// the immutable epoch shares the same one fingerprint scan.
+inline prepared_local_candidate_score prepare_local_candidate_score(
+    chart_spr_search_state const& state,
+    grammar_spr_candidate const& candidate,
+    local_spr_score_options const& options,
+    chart_spr_search_counters* counters) {
+  try {
+    auto checked =
+        check_chart_execution_plan(state.grammar, state.execution_plan);
+    return prepare_local_candidate_score(state, candidate, options, counters,
+                                         checked);
+  } catch (chart_execution_plan_mismatch const& e) {
+    if (counters != nullptr) {
+      ++counters->local_candidate_scores;
+      ++counters->plan_mismatch_rejections;
+    }
+    prepared_local_candidate_score prepared;
+    prepared.scored =
+        make_invalid_local_candidate_score(state, candidate, e.what());
+    return prepared;
+  }
+}
+
 inline void invalidate_prepared_local_candidate(
     chart_spr_search_state const& state,
     prepared_local_candidate_score& prepared, std::string reason) {
   prepared.scored = make_invalid_local_candidate_score(
-      state, *prepared.candidate, std::move(reason));
+      state, prepared.scored.candidate, std::move(reason));
   prepared.valid_for_accumulation = false;
+}
+
+inline bool validate_prepared_candidate_plan_identity(
+    chart_spr_search_state const& state,
+    prepared_local_candidate_score& prepared,
+    chart_spr_search_counters* counters,
+    checked_chart_execution_plan_ref const& checked_state) {
+  try {
+    checked_state.assert_same(state.grammar, state.execution_plan);
+    assert_overlay_delta_execution_plan_compatible(prepared.delta(),
+                                                   state.execution_plan);
+    return true;
+  } catch (std::exception const& e) {
+    if (counters != nullptr) ++counters->plan_mismatch_rejections;
+    invalidate_prepared_local_candidate(state, prepared, e.what());
+    return false;
+  }
+}
+
+
+inline bool validate_prepared_candidate_plan_identity(
+    chart_spr_search_state const& state,
+    prepared_local_candidate_score& prepared,
+    chart_spr_search_counters* counters) {
+  try {
+    auto checked =
+        check_chart_execution_plan(state.grammar, state.execution_plan);
+    return validate_prepared_candidate_plan_identity(
+        state, prepared, counters, checked);
+  } catch (std::exception const& e) {
+    if (counters != nullptr) ++counters->plan_mismatch_rejections;
+    invalidate_prepared_local_candidate(state, prepared, e.what());
+    return false;
+  }
+}
+
+inline void accumulate_prepared_local_candidate_patterns(
+    chart_spr_search_state const& state,
+    prepared_local_candidate_score& prepared,
+    std::size_t pattern_offset,
+    std::vector<pattern_chart_cache_entry> const& entries,
+    local_spr_score_options const& options,
+    chart_spr_search_counters* counters,
+    chart_spr_local_score_scratch& scratch,
+    checked_chart_execution_plan_ref const& checked_state) {
+  if (!prepared.valid_for_accumulation) return;
+  if (!validate_prepared_candidate_plan_identity(
+          state, prepared, counters, checked_state)) {
+    return;
+  }
+  auto const& delta = prepared.delta();
+  parsimony_chart_detail::structural_work_observer hot_work_observer{
+      .full_grammar_validations =
+          counters != nullptr
+              ? &counters->candidate_pattern_full_grammar_validations
+              : nullptr,
+      .production_partition_validations =
+          counters != nullptr
+              ? &counters->candidate_pattern_partition_validations
+              : nullptr,
+      .clade_order_sorts = counters != nullptr
+                               ? &counters->candidate_pattern_clade_order_sorts
+                               : nullptr};
+  parsimony_chart_detail::structural_work_observer_scope hot_work_scope{
+      counters != nullptr ? &hot_work_observer : nullptr};
+  auto const& patterns = state.active_patterns.patterns.patterns;
+  auto chart_build_options = state.chart_opts;
+  chart_build_options.keep_trace = false;
+  chart_build_options.max_trace_choices = 0;
+  try {
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+      if (counters != nullptr) {
+        ++counters->candidate_execution_plan_cache_hits;
+      }
+      auto pattern_index = pattern_offset + i;
+      if (pattern_index >= patterns.size()) {
+        throw std::runtime_error(
+            "chart SPR local score: pattern batch offset out of range");
+      }
+      auto const& pattern = patterns[pattern_index];
+      auto const& cache_entry = entries[i];
+      leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
+      build_local_overlay_chart_rows_into(
+          state.grammar, delta, cache_entry.chart, states, scratch.rows,
+          chart_build_options, options.validate_cached_chart_shapes, counters);
+      if (counters != nullptr) {
+        counters->local_rows_recomputed +=
+            delta.affected_order.size();
+      }
+      if (prepared.verification_materialized) {
+        verify_local_overlay_rows_against_full(
+            delta, scratch.rows, cache_entry.chart,
+            *prepared.verification_materialized, states, state.chart_opts);
+      }
+      auto const& root_row = local_overlay_chart_row(
+          scratch.rows, cache_entry.chart, delta.root);
+      prepared.new_active_score = chart_multisite_detail::checked_add_u64(
+          prepared.new_active_score,
+          chart_spr_weighted_root_score_from_row(root_row, pattern,
+                                                 state.chart_opts),
+          "chart-SPR local candidate active lower bound");
+    }
+  } catch (std::exception const& e) {
+    invalidate_prepared_local_candidate(state, prepared, e.what());
+  }
 }
 
 inline void accumulate_prepared_local_candidate_patterns(
@@ -2988,41 +3844,14 @@ inline void accumulate_prepared_local_candidate_patterns(
     chart_spr_search_counters* counters,
     chart_spr_local_score_scratch& scratch) {
   if (!prepared.valid_for_accumulation) return;
-  auto const& patterns = state.active_patterns.patterns.patterns;
-  auto chart_build_options = state.chart_opts;
-  chart_build_options.keep_trace = false;
-  chart_build_options.max_trace_choices = 0;
   try {
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-      auto pattern_index = pattern_offset + i;
-      if (pattern_index >= patterns.size()) {
-        throw std::runtime_error(
-            "chart SPR local score: pattern batch offset out of range");
-      }
-      auto const& pattern = patterns[pattern_index];
-      auto const& cache_entry = entries[i];
-      leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
-      build_local_overlay_chart_rows_into(
-          prepared.delta, cache_entry.chart, states, scratch.rows,
-          chart_build_options, options.validate_cached_chart_shapes, counters);
-      if (counters != nullptr) {
-        counters->local_rows_recomputed +=
-            prepared.delta.affected_order.size();
-      }
-      if (prepared.verification_materialized) {
-        verify_local_overlay_rows_against_full(
-            prepared.delta, scratch.rows, cache_entry.chart,
-            *prepared.verification_materialized, states, state.chart_opts);
-      }
-      auto const& root_row = local_overlay_chart_row(
-          scratch.rows, cache_entry.chart, prepared.delta.root);
-      prepared.new_active_score = chart_multisite_detail::checked_add_u64(
-          prepared.new_active_score,
-          chart_spr_weighted_root_score_from_row(root_row, pattern,
-                                                 state.chart_opts),
-          "chart-SPR local candidate active lower bound");
-    }
+    auto checked =
+        check_chart_execution_plan(state.grammar, state.execution_plan);
+    accumulate_prepared_local_candidate_patterns(
+        state, prepared, pattern_offset, entries, options, counters, scratch,
+        checked);
   } catch (std::exception const& e) {
+    if (counters != nullptr) ++counters->plan_mismatch_rejections;
     invalidate_prepared_local_candidate(state, prepared, e.what());
   }
 }
@@ -3045,7 +3874,7 @@ inline chart_spr_candidate_score finish_prepared_local_candidate_score(
       chart_spr_score_convention::full_with_invariants;
   scored.lower_bound.invariant_offset_applied =
       state.invariant_constant_offset;
-  scored.affected_clade_count = prepared.delta.affected_order.size();
+  scored.affected_clade_count = prepared.delta().affected_order.size();
   scored.valid = true;
   scored.invalid_reason.clear();
   return scored;
@@ -3054,7 +3883,8 @@ inline chart_spr_candidate_score finish_prepared_local_candidate_score(
 inline std::vector<pattern_chart_cache_entry>
 build_pattern_chart_cache_entries_for_range(
     chart_spr_search_state const& state, std::size_t begin,
-    std::size_t count) {
+    std::size_t count,
+    chart_spr_search_counters* counters) {
   auto const& patterns = state.active_patterns.patterns.patterns;
   if (begin > patterns.size() || count > patterns.size() - begin) {
     throw std::runtime_error(
@@ -3067,8 +3897,9 @@ build_pattern_chart_cache_entries_for_range(
   entries.reserve(count);
   for (std::size_t i = 0; i < count; ++i) {
     entries.push_back(build_pattern_chart_cache_entry(
-        state.grammar, patterns[begin + i], state.chart_opts,
+        state.execution_plan, patterns[begin + i], state.chart_opts,
         chart_build_options));
+    if (counters != nullptr) ++counters->chart_execution_plan_cache_hits;
   }
   return entries;
 }
@@ -3098,12 +3929,9 @@ inline std::size_t lazy_overlay_inside_class_index(
 }
 
 inline void append_lazy_overlay_leaf_state(
-    spr_overlay_delta const& delta,
-    std::vector<site_pattern> const& patterns, overlay_clade_ref ref,
+    std::vector<site_pattern> const& patterns, taxon_id taxon,
     std::size_t pattern, std::vector<std::size_t>& key) {
-  auto const& clade_key = overlay_delta_clade_key(delta, ref);
-  if (clade_key.taxa.size() != 1) return;
-  auto taxon = clade_key.taxa.front();
+  if (taxon == chart_plan_no_taxon) return;
   if (pattern >= patterns.size() ||
       taxon >= patterns[pattern].state_by_taxon.size()) {
     throw std::runtime_error(
@@ -3132,41 +3960,21 @@ inline std::vector<std::size_t> lazy_overlay_context_key(
   key.push_back(lazy_overlay_inside_class_index(
       lazy, state.grammar.root_clade, pattern));
 
-  auto append_children = [&](std::vector<overlay_clade_ref> const& children) {
-    for (auto child : children) {
-      append_lazy_overlay_base_class(lazy, child, pattern, key);
-      append_lazy_overlay_leaf_state(delta, patterns, child, pattern, key);
+  auto append_children =
+      [&](std::span<candidate_chart_child_descriptor const> children) {
+    for (auto const& child : children) {
+      append_lazy_overlay_base_class(lazy, child.clade, pattern, key);
+      append_lazy_overlay_leaf_state(patterns, child.leaf_taxon, pattern, key);
     }
   };
 
-  for (auto ref : delta.affected_order) {
+  for (auto const& row : delta.compiled_rows) {
+    auto ref = row.clade;
     append_lazy_overlay_base_class(lazy, ref, pattern, key);
-    append_lazy_overlay_leaf_state(delta, patterns, ref, pattern, key);
-    if (overlay_delta_clade_key(delta, ref).taxa.size() == 1) continue;
-
-    if (ref.space == overlay_id_space::base) {
-      auto const& base = *delta.base;
-      for (auto pid : base.productions_by_parent[ref.id]) {
-        if (overlay_delta_base_production_removed(delta, pid)) continue;
-        validate_reachable_base_production(delta, pid);
-        std::vector<overlay_clade_ref> children;
-        children.reserve(base.productions[pid].children.size());
-        for (auto child : base.productions[pid].children) {
-          children.push_back(base_clade_ref(child));
-        }
-        append_children(children);
-      }
-    }
-
-    for (auto temp_pid : temp_productions_for_parent(delta, ref)) {
-      if (temp_pid == no_production ||
-          temp_pid >= delta.temp_productions.size()) {
-        throw std::runtime_error(
-            "chart SPR lazy local score: temp production id out of range");
-      }
-      auto const& prod = delta.temp_productions[temp_pid];
-      validate_overlay_delta_production_partition(delta, prod, temp_pid);
-      append_children(prod.children);
+    append_lazy_overlay_leaf_state(patterns, row.leaf_taxon, pattern, key);
+    for (auto const& production :
+         candidate_chart_productions_for_row(delta, row)) {
+      append_children(candidate_chart_children(delta, production));
     }
   }
   return key;
@@ -3194,6 +4002,25 @@ struct lazy_overlay_row_provider {
     }
     auto class_index = lazy_overlay_inside_class_index(lazy, ref.id, pattern);
     return lazy.inside_rows_by_clade[ref.id][class_index];
+  }
+
+  [[nodiscard]] std::array<chart_cost, nuc_state_count> const& row(
+      candidate_chart_child_descriptor const& child) const {
+    if (child.has_local_row()) {
+      if (child.local_row_slot >= local_rows.rows.size()) {
+        throw std::runtime_error(
+            "chart SPR lazy local score: compiled local child slot out of "
+            "range");
+      }
+      return local_rows.rows[child.local_row_slot];
+    }
+    if (child.base_clade == no_clade) {
+      throw std::runtime_error(
+          "chart SPR lazy local score: compiled child has no base row");
+    }
+    auto class_index =
+        lazy_overlay_inside_class_index(lazy, child.base_clade, pattern);
+    return lazy.inside_rows_by_clade[child.base_clade][class_index];
   }
 };
 
@@ -3240,9 +4067,29 @@ inline void accumulate_prepared_local_candidate_lazy(
     prepared_local_candidate_score& prepared,
     local_spr_score_options const& options,
     chart_spr_search_counters* counters,
-    chart_spr_local_score_scratch& scratch) {
+    chart_spr_local_score_scratch& scratch,
+    checked_chart_execution_plan_ref const& checked_state) {
   (void)scratch;
   if (!prepared.valid_for_accumulation) return;
+  if (!validate_prepared_candidate_plan_identity(
+          state, prepared, counters, checked_state)) {
+    return;
+  }
+  auto const& delta = prepared.delta();
+  parsimony_chart_detail::structural_work_observer hot_work_observer{
+      .full_grammar_validations =
+          counters != nullptr
+              ? &counters->candidate_pattern_full_grammar_validations
+              : nullptr,
+      .production_partition_validations =
+          counters != nullptr
+              ? &counters->candidate_pattern_partition_validations
+              : nullptr,
+      .clade_order_sorts = counters != nullptr
+                               ? &counters->candidate_pattern_clade_order_sorts
+                               : nullptr};
+  parsimony_chart_detail::structural_work_observer_scope hot_work_scope{
+      counters != nullptr ? &hot_work_observer : nullptr};
   if (!state.lazy_chart) {
     invalidate_prepared_local_candidate(
         state, prepared, "chart SPR lazy local score: missing lazy chart");
@@ -3255,7 +4102,10 @@ inline void accumulate_prepared_local_candidate_lazy(
   try {
     for (std::size_t pattern_index = 0; pattern_index < patterns.size();
          ++pattern_index) {
-      auto key = lazy_overlay_context_key(state, prepared.delta, pattern_index);
+      if (counters != nullptr) {
+        ++counters->candidate_execution_plan_cache_hits;
+      }
+      auto key = lazy_overlay_context_key(state, delta, pattern_index);
       auto [it, inserted] = contexts.emplace(
           std::move(key), lazy_overlay_context_accumulator{});
       auto& context = it->second;
@@ -3281,22 +4131,22 @@ inline void accumulate_prepared_local_candidate_lazy(
             "chart SPR lazy local score: context representative out of range");
       }
       local_overlay_chart_rows rows;
-      rows.base_row_slot = &prepared.delta.affected_base_row_slot;
-      rows.temp_row_slot = &prepared.delta.affected_temp_row_slot;
-      rows.rows.assign(prepared.delta.affected_order.size(),
+      rows.base_row_slot = delta.affected_base_row_slot;
+      rows.temp_row_slot = delta.affected_temp_row_slot;
+      rows.rows.assign(delta.affected_order.size(),
                        parsimony_chart_detail::make_inf_row());
 
-      lazy_overlay_row_provider provider{prepared.delta, *state.lazy_chart,
+      lazy_overlay_row_provider provider{delta, *state.lazy_chart,
                                          context.representative, rows};
       leaf_site_states states{
           .state_by_taxon = patterns[context.representative].state_by_taxon};
-      for (std::size_t i = 0; i < prepared.delta.affected_order.size(); ++i) {
-        auto ref = prepared.delta.affected_order[i];
+      for (std::size_t i = 0; i < delta.compiled_rows.size(); ++i) {
         rows.rows[i] = recompute_overlay_delta_row(
-            prepared.delta, states, provider, ref, counters);
+            delta, states, provider, delta.compiled_rows[i],
+            counters);
       }
       if (counters != nullptr) {
-        counters->local_rows_recomputed += prepared.delta.affected_order.size();
+        counters->local_rows_recomputed += delta.affected_order.size();
       }
       if (prepared.verification_materialized) {
         auto chart_build_options = state.chart_opts;
@@ -3305,10 +4155,10 @@ inline void accumulate_prepared_local_candidate_lazy(
         auto base_chart = build_single_site_chart(state.grammar, states,
                                                   chart_build_options);
         verify_local_overlay_rows_against_full(
-            prepared.delta, rows, base_chart, *prepared.verification_materialized,
+            delta, rows, base_chart, *prepared.verification_materialized,
             states, state.chart_opts);
       }
-      auto const& root_row = provider.row(prepared.delta.root);
+      auto const& root_row = provider.row(delta.root);
       auto contribution = lazy_overlay_weighted_root_score(
           root_row, context, state.chart_opts);
       prepared.new_active_score = chart_multisite_detail::checked_add_u64(
@@ -3320,19 +4170,38 @@ inline void accumulate_prepared_local_candidate_lazy(
   }
 }
 
+inline void accumulate_prepared_local_candidate_lazy(
+    chart_spr_search_state const& state,
+    prepared_local_candidate_score& prepared,
+    local_spr_score_options const& options,
+    chart_spr_search_counters* counters,
+    chart_spr_local_score_scratch& scratch) {
+  if (!prepared.valid_for_accumulation) return;
+  try {
+    auto checked =
+        check_chart_execution_plan(state.grammar, state.execution_plan);
+    accumulate_prepared_local_candidate_lazy(
+        state, prepared, options, counters, scratch, checked);
+  } catch (std::exception const& e) {
+    if (counters != nullptr) ++counters->plan_mismatch_rejections;
+    invalidate_prepared_local_candidate(state, prepared, e.what());
+  }
+}
+
 inline chart_spr_candidate_score score_candidate_locally_counted(
     chart_spr_search_state const& state,
     grammar_spr_candidate const& candidate,
     local_spr_score_options const& options,
     chart_spr_search_counters* counters,
-    chart_spr_local_score_scratch& scratch) {
+    chart_spr_local_score_scratch& scratch,
+    checked_chart_execution_plan_ref const& checked_state) {
   auto prepared = prepare_local_candidate_score(state, candidate, options,
-                                                counters);
+                                                counters, checked_state);
   if (!prepared.valid_for_accumulation) return prepared.scored;
 
   if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
     accumulate_prepared_local_candidate_lazy(
-        state, prepared, options, counters, scratch);
+        state, prepared, options, counters, scratch, checked_state);
     return finish_prepared_local_candidate_score(state, prepared);
   }
 
@@ -3343,7 +4212,8 @@ inline chart_spr_candidate_score score_candidate_locally_counted(
           "chart SPR local score: pattern chart cache size mismatch");
     }
     accumulate_prepared_local_candidate_patterns(
-        state, prepared, 0, state.pattern_charts, options, counters, scratch);
+        state, prepared, 0, state.pattern_charts, options, counters, scratch,
+        checked_state);
     return finish_prepared_local_candidate_score(state, prepared);
   }
 
@@ -3353,14 +4223,15 @@ inline chart_spr_candidate_score score_candidate_locally_counted(
   for (std::size_t begin = 0; begin < patterns.size(); begin += batch_size) {
     auto count = std::min(batch_size, patterns.size() - begin);
     auto entries = build_pattern_chart_cache_entries_for_range(state, begin,
-                                                               count);
+                                                               count, counters);
     if (counters != nullptr) ++counters->pattern_batch_cache_builds;
     if (counters != nullptr) {
       counters->multifurcation_productions_scored +=
           multifurcation_productions_scored_for_entries(entries);
     }
     accumulate_prepared_local_candidate_patterns(
-        state, prepared, begin, entries, options, counters, scratch);
+        state, prepared, begin, entries, options, counters, scratch,
+        checked_state);
     if (!prepared.valid_for_accumulation) break;
   }
   return finish_prepared_local_candidate_score(state, prepared);
@@ -3387,7 +4258,8 @@ inline std::vector<chart_spr_candidate_score> score_candidates_locally_all_cache
     chart_spr_search_state const& state,
     std::vector<grammar_spr_candidate> const& candidates,
     local_spr_score_options const& options,
-    std::size_t worker_count) {
+    std::size_t worker_count,
+    checked_chart_execution_plan_ref const& checked_state) {
   std::vector<chart_spr_candidate_score> scores(candidates.size());
   chart_spr_search_counters aggregate;
   if (candidates.empty()) return scores;
@@ -3400,7 +4272,7 @@ inline std::vector<chart_spr_candidate_score> score_candidates_locally_all_cache
     for (std::size_t i = 0; i < candidates.size(); ++i) {
       auto start = std::chrono::steady_clock::now();
       scores[i] = score_candidate_locally_counted(
-          state, candidates[i], options, &aggregate, scratch);
+          state, candidates[i], options, &aggregate, scratch, checked_state);
       scores[i].local_score_ms = std::chrono::duration<double, std::milli>(
                                      std::chrono::steady_clock::now() - start)
                                      .count();
@@ -3426,7 +4298,7 @@ inline std::vector<chart_spr_candidate_score> score_candidates_locally_all_cache
         auto start = std::chrono::steady_clock::now();
         scores[i] = score_candidate_locally_counted(
             state, candidates[i], options, &worker_counters[worker],
-            scratch);
+            scratch, checked_state);
         scores[i].local_score_ms =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start)
@@ -3447,7 +4319,8 @@ score_candidates_locally_pattern_batches(
     chart_spr_search_state const& state,
     std::vector<grammar_spr_candidate> const& candidates,
     local_spr_score_options const& options,
-    std::size_t worker_count) {
+    std::size_t worker_count,
+    checked_chart_execution_plan_ref const& checked_state) {
   std::vector<chart_spr_candidate_score> scores(candidates.size());
   chart_spr_search_counters aggregate;
   if (candidates.empty()) return scores;
@@ -3458,7 +4331,8 @@ score_candidates_locally_pattern_batches(
   prepared.reserve(candidates.size());
   for (auto const& candidate : candidates) {
     prepared.push_back(prepare_local_candidate_score(state, candidate,
-                                                     options, &aggregate));
+                                                     options, &aggregate,
+                                                     checked_state));
   }
 
   worker_count = std::min(normalize_chart_spr_worker_count(worker_count),
@@ -3475,7 +4349,7 @@ score_candidates_locally_pattern_batches(
   for (std::size_t begin = 0; begin < patterns.size(); begin += batch_size) {
     auto count = std::min(batch_size, patterns.size() - begin);
     auto entries = build_pattern_chart_cache_entries_for_range(state, begin,
-                                                               count);
+                                                               count, &aggregate);
     ++aggregate.pattern_batch_cache_builds;
     aggregate.multifurcation_productions_scored +=
         multifurcation_productions_scored_for_entries(entries);
@@ -3484,7 +4358,8 @@ score_candidates_locally_pattern_batches(
       chart_spr_local_score_scratch scratch;
       for (auto& item : prepared) {
         accumulate_prepared_local_candidate_patterns(
-            state, item, begin, entries, options, &aggregate, scratch);
+            state, item, begin, entries, options, &aggregate, scratch,
+            checked_state);
       }
     } else {
       aggregate.local_score_worker_tasks += worker_count;
@@ -3501,7 +4376,7 @@ score_candidates_locally_pattern_batches(
           for (std::size_t i = item_begin; i < item_end; ++i) {
             accumulate_prepared_local_candidate_patterns(
                 state, prepared[i], begin, entries, options,
-                &worker_counters[worker], scratch);
+                &worker_counters[worker], scratch, checked_state);
           }
         }));
       }
@@ -3534,15 +4409,33 @@ score_candidates_locally_pattern_batches(
 inline std::vector<chart_spr_candidate_score> score_candidates_locally(
     chart_spr_search_state const& state,
     std::vector<grammar_spr_candidate> const& candidates,
-    local_spr_score_options const& options = {},
-    std::size_t worker_count = 1) {
+    local_spr_score_options const& options,
+    std::size_t worker_count,
+    checked_chart_execution_plan_ref const& checked_state) {
+  checked_state.assert_same(state.grammar, state.execution_plan);
   if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns ||
       state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
     return chart_spr_search_detail::score_candidates_locally_all_cache(
-        state, candidates, options, worker_count);
+        state, candidates, options, worker_count, checked_state);
   }
   return chart_spr_search_detail::score_candidates_locally_pattern_batches(
-      state, candidates, options, worker_count);
+      state, candidates, options, worker_count, checked_state);
+}
+
+inline std::vector<chart_spr_candidate_score> score_candidates_locally(
+    chart_spr_search_state const& state,
+    std::vector<grammar_spr_candidate> const& candidates,
+    local_spr_score_options const& options = {},
+    std::size_t worker_count = 1) {
+  try {
+    auto checked =
+        check_chart_execution_plan(state.grammar, state.execution_plan);
+    return score_candidates_locally(state, candidates, options, worker_count,
+                                    checked);
+  } catch (chart_execution_plan_mismatch const&) {
+    ++state.counters.plan_mismatch_rejections;
+    throw;
+  }
 }
 
 // Phase-3 local scoring entry point for one candidate.  Pattern-batch cache
@@ -3636,8 +4529,10 @@ inline chart_spr_objective_score make_chart_spr_objective_score(
 
 inline multisite_trim_result const& ensure_chart_spr_state_exact_trim(
     chart_spr_search_state const& state,
+    checked_chart_execution_plan_ref const& checked_state,
     multisite_trim_options const& trim_options = {}) {
   state.active_patterns.assert_no_skipped_invariant_metadata();
+  checked_state.assert_same(state.grammar, state.execution_plan);
   if (!state.exact_trim_active_only) {
     if (state.cache_strategy ==
         chart_spr_cache_strategy::lazy_multisite_chart) {
@@ -3646,15 +4541,39 @@ inline multisite_trim_result const& ensure_chart_spr_state_exact_trim(
             "chart SPR exact trim: lazy cache strategy without lazy chart");
       }
       state.exact_trim_active_only = build_multisite_trim_active(
-          state.grammar, state.active_patterns, *state.lazy_chart,
+          state.execution_plan, state.active_patterns, *state.lazy_chart,
           state.chart_opts, trim_options);
     } else {
       state.exact_trim_active_only = build_multisite_trim_active(
-          state.grammar, state.active_patterns, state.chart_opts,
+          state.execution_plan, state.active_patterns, state.chart_opts,
           trim_options);
     }
+    ++state.counters.chart_execution_plan_cache_hits;
   }
   return *state.exact_trim_active_only;
+}
+
+inline multisite_trim_result const& ensure_chart_spr_state_exact_trim(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options = {}) {
+  try {
+    auto checked =
+        check_chart_execution_plan(state.grammar, state.execution_plan);
+    return ensure_chart_spr_state_exact_trim(state, checked, trim_options);
+  } catch (chart_execution_plan_mismatch const&) {
+    ++state.counters.plan_mismatch_rejections;
+    throw;
+  }
+}
+
+inline std::uint64_t chart_spr_state_exact_score_with_invariants(
+    chart_spr_search_state const& state,
+    checked_chart_execution_plan_ref const& checked_state,
+    multisite_trim_options const& trim_options = {}) {
+  auto const& trim =
+      ensure_chart_spr_state_exact_trim(state, checked_state, trim_options);
+  return chart_spr_add_invariant_offset(
+      trim.optimum, state, "chart-SPR exact state invariant offset");
 }
 
 inline std::uint64_t chart_spr_state_exact_score_with_invariants(
@@ -3674,16 +4593,20 @@ inline std::uint64_t chart_spr_state_exact_score_with_invariants(
 // sidecar rebuilding.
 inline chart_spr_candidate_score verify_candidate_exact_against_state(
     chart_spr_search_state const& state, chart_spr_candidate_score candidate,
+    checked_chart_execution_plan_ref const& checked_state,
     multisite_trim_options const& trim_options = {}) {
   if (!candidate.valid) return candidate;
   ++state.counters.exact_verifications;
 
-  overlay_materialization_result materialized;
+  planned_overlay_materialization_result planned;
   multisite_trim_result new_trim;
+  bool dense_materialization_completed = false;
+  bool materialization_counted = false;
+  bool payload_validation_counted = false;
+  overlay_payload_validation_stats completed_payload_validation_stats;
   try {
     auto const& old_trim =
-        ensure_chart_spr_state_exact_trim(state, trim_options);
-    auto overlay = overlay_from_candidate(state.grammar, candidate.candidate);
+        ensure_chart_spr_state_exact_trim(state, checked_state, trim_options);
     {
       chart_spr_elapsed_accumulator materialization_timer{
           state.counters.materialization_exact_verification_ms};
@@ -3691,19 +4614,27 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state(
         throw std::runtime_error(
             "forced exact materializer failure for tests");
       }
-      materialized = materialize_overlay_grammar(overlay);
+      planned = materialize_candidate_overlay_grammar_with_plan(
+          state.grammar, checked_state, candidate.candidate,
+          &dense_materialization_completed,
+          [&] { materialization_timer.finish(); },
+          &completed_payload_validation_stats);
     }
     ++state.counters.full_overlay_materializations;
     ++state.counters.overlay_materializations_for_exact_verification;
+    materialization_counted = true;
+    record_planned_overlay_materialization_stats(state.counters, planned);
+    payload_validation_counted = true;
 
     new_trim =
         state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart
             ? build_lazy_multisite_trim_active_from_scratch(
-                  materialized.grammar, state.active_patterns,
-                  state.chart_opts, trim_options)
-            : build_multisite_trim_active(materialized.grammar,
+                  planned, state.active_patterns, state.chart_opts,
+                  trim_options)
+            : build_multisite_trim_active(planned.execution_plan,
                                           state.active_patterns,
                                           state.chart_opts, trim_options);
+    ++state.counters.chart_execution_plan_cache_hits;
 
     auto old_full = chart_spr_add_invariant_offset(
         old_trim.optimum, state,
@@ -3718,6 +4649,17 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state(
         chart_spr_score_convention::full_with_invariants,
         state.invariant_constant_offset);
   } catch (std::exception const& e) {
+    // Before this refactor the dense materializer returned (and its success
+    // counters advanced) before the separately built plan could reject the
+    // output.  Preserve that reason-coded accounting for the combined call.
+    if (dense_materialization_completed && !materialization_counted) {
+      ++state.counters.full_overlay_materializations;
+      ++state.counters.overlay_materializations_for_exact_verification;
+    }
+    if (!payload_validation_counted) {
+      record_overlay_payload_validation_stats(
+          state.counters, completed_payload_validation_stats);
+    }
     candidate.valid = false;
     candidate.invalid_reason = e.what();
   }
@@ -3731,11 +4673,32 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state(
     candidate.canonical_exact_evidence =
         std::make_shared<chart_spr_canonical_exact_evidence>(
             chart_spr_canonicalize_search_trim_evidence(
-                materialized.grammar, state.active_patterns,
-                state.chart_opts, trim_options, new_trim,
+                planned, state.active_patterns, state.chart_opts,
+                trim_options, new_trim,
                 state.invariant_constant_offset));
+    if (new_trim.keep_production_exact) {
+      ++state.counters.chart_execution_plan_cache_hits;
+    }
   }
   return candidate;
+}
+
+inline chart_spr_candidate_score verify_candidate_exact_against_state(
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate,
+    multisite_trim_options const& trim_options = {}) {
+  if (!candidate.valid) return candidate;
+  try {
+    auto checked =
+        check_chart_execution_plan(state.grammar, state.execution_plan);
+    return verify_candidate_exact_against_state(
+        state, std::move(candidate), checked, trim_options);
+  } catch (chart_execution_plan_mismatch const& e) {
+    ++state.counters.exact_verifications;
+    ++state.counters.plan_mismatch_rejections;
+    candidate.valid = false;
+    candidate.invalid_reason = e.what();
+    return candidate;
+  }
 }
 
 inline bool chart_spr_topology_selection_has_certificate_or_selector(
@@ -4863,7 +5826,9 @@ inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
 
 inline chart_spr_candidate_score verify_candidate_for_acceptance(
     chart_spr_search_state const& state, chart_spr_candidate_score candidate,
+    checked_chart_execution_plan_ref const& checked_state,
     chart_spr_search_options const& options) {
+  checked_state.assert_same(state.grammar, state.execution_plan);
   switch (options.acceptance_mode) {
     case chart_spr_acceptance_mode::lower_bound_heuristic:
       return candidate;
@@ -4878,10 +5843,11 @@ inline chart_spr_candidate_score verify_candidate_for_acceptance(
       // verifier cross-checks when its test-only oracle flag is set.
       if (state.exact_multisite_verifier) {
         return state.exact_multisite_verifier(state, std::move(candidate),
+                                              checked_state,
                                               options.exact_trim);
       }
       return verify_candidate_exact_against_state(
-          state, std::move(candidate), options.exact_trim);
+          state, std::move(candidate), checked_state, options.exact_trim);
     case chart_spr_acceptance_mode::fixed_topology_exact:
       {
       chart_spr_candidate_score verified;
@@ -4907,6 +5873,15 @@ inline chart_spr_candidate_score verify_candidate_for_acceptance(
       }
   }
   return candidate;
+}
+
+inline chart_spr_candidate_score verify_candidate_for_acceptance(
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate,
+    chart_spr_search_options const& options) {
+  auto checked = check_chart_execution_plan(state.grammar,
+                                            state.execution_plan);
+  return verify_candidate_for_acceptance(state, std::move(candidate), checked,
+                                         options);
 }
 
 inline bool chart_spr_candidate_has_accepting_improvement(
@@ -5069,6 +6044,18 @@ inline void validate_chart_spr_pattern_batch_replay_strategy(
 
 inline std::uint64_t chart_spr_iteration_state_score_before(
     chart_spr_search_state const& state,
+    checked_chart_execution_plan_ref const& checked_state,
+    chart_spr_search_options const& options) {
+  checked_state.assert_same(state.grammar, state.execution_plan);
+  if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite) {
+    return chart_spr_state_exact_score_with_invariants(
+        state, checked_state, options.exact_trim);
+  }
+  return state.composite_lower_bound_with_invariants;
+}
+
+inline std::uint64_t chart_spr_iteration_state_score_before(
+    chart_spr_search_state const& state,
     chart_spr_search_options const& options) {
   if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite) {
     return chart_spr_state_exact_score_with_invariants(state,
@@ -5087,6 +6074,14 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     chart_spr_search_state const& state,
     chart_spr_search_options options = {}, std::size_t iteration = 0) {
   validate_supported_chart_cache_options(options.cache);
+  auto checked_state = [&] {
+    try {
+      return check_chart_execution_plan(state.grammar, state.execution_plan);
+    } catch (chart_execution_plan_mismatch const&) {
+      ++state.counters.plan_mismatch_rejections;
+      throw;
+    }
+  }();
   if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite) {
     chart_spr_search_detail::validate_chart_spr_exact_multisite_multifurcation_gate(
         state.grammar, "chart SPR acceptance iteration");
@@ -5102,7 +6097,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   result.acceptance_mode = options.acceptance_mode;
   result.candidate_selection = options.candidate_selection;
   result.state_score_before =
-      chart_spr_iteration_state_score_before(state, options);
+      chart_spr_iteration_state_score_before(state, checked_state, options);
   result.state_score_after = result.state_score_before;
   bool const capture_semantics =
       options.semantic_capture != chart_spr_semantic_capture_mode::off;
@@ -5111,12 +6106,17 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     if (options.acceptance_mode ==
         chart_spr_acceptance_mode::exact_multisite) {
       auto const& old_trim =
-          ensure_chart_spr_state_exact_trim(state, options.exact_trim);
+          ensure_chart_spr_state_exact_trim(state, checked_state,
+                                            options.exact_trim);
       result.canonical_state_exact_before =
           chart_spr_canonicalize_search_trim_evidence(
-              state.grammar, state.active_patterns, state.chart_opts,
+              state.grammar, checked_state, state.active_patterns,
+              state.chart_opts,
               options.exact_trim, old_trim,
               state.invariant_constant_offset);
+      if (old_trim.keep_production_exact) {
+        ++state.counters.chart_execution_plan_cache_hits;
+      }
     }
   }
 
@@ -5151,7 +6151,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     if (candidate_batch.empty()) return;
     auto local_start = std::chrono::steady_clock::now();
     auto scored_batch = score_candidates_locally(
-        state, candidate_batch, local_options, worker_count);
+        state, candidate_batch, local_options, worker_count, checked_state);
     result.local_scoring_ms += std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() -
                                    local_start)
@@ -5191,7 +6191,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   double generation_callback_ms = 0.0;
   auto const generation_start = std::chrono::steady_clock::now();
   auto generation = for_each_grammar_spr_candidate(
-      state.grammar, enumeration,
+      state.grammar, checked_state, enumeration,
       [&](grammar_spr_candidate const& candidate) {
         auto const callback_start = std::chrono::steady_clock::now();
         candidate_batch.push_back(candidate);
@@ -5273,7 +6273,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         chart_spr_exact_verifier_activity verifier_activity{
             state.exact_verifier_concurrency};
         verified_candidate = verify_candidate_for_acceptance(
-            state, std::move(candidate), options);
+            state, std::move(candidate), checked_state, options);
       } else {
         // Selection/certificate attachment can invalidate a candidate before
         // verifier entry.  Such a candidate has timing diagnostics but must

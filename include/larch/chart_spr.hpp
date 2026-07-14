@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <compare>
+#include <concepts>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -148,6 +149,22 @@ struct overlay_materialization_result {
   std::vector<clade_id> temp_clade_to_dense;
   std::vector<production_id> base_production_to_dense;
   std::vector<production_id> temp_production_to_dense;
+};
+
+struct overlay_payload_validation_stats {
+  // Dynamic temp productions checked before reachability filtering.  This
+  // includes unreachable payload that the dense output plan cannot observe.
+  std::size_t production_partition_validations = 0;
+};
+
+// A dense overlay grammar and the immutable plan compiled at the same
+// publication boundary.  Trusted search paths use this paired result so the
+// freshly produced grammar is validated exactly once (by plan construction)
+// before either object can escape to a recurrence consumer.
+struct planned_overlay_materialization_result {
+  overlay_materialization_result materialized;
+  chart_execution_plan execution_plan;
+  overlay_payload_validation_stats payload_validation_stats;
 };
 
 struct single_site_overlay_recompute_result {
@@ -391,11 +408,20 @@ inline std::vector<production_id> normalized_removed_base_productions(
   return removed;
 }
 
-inline void validate_overlay(overlay_clade_grammar const& overlay) {
+inline void validate_overlay_payload(
+    overlay_clade_grammar const& overlay,
+    overlay_payload_validation_stats* stats = nullptr) {
   if (overlay.base == nullptr)
     throw std::runtime_error("chart SPR: overlay has no base grammar");
-  parsimony_chart_detail::validate_chart_grammar(*overlay.base);
-  chart_trim_detail::validate_production_indices(*overlay.base);
+
+  if (overlay.temp_clades.size() >= static_cast<std::size_t>(no_clade)) {
+    throw std::runtime_error("chart SPR: too many temporary overlay clades");
+  }
+  if (overlay.temp_productions.size() >=
+      static_cast<std::size_t>(no_production)) {
+    throw std::runtime_error(
+        "chart SPR: too many temporary overlay productions");
+  }
 
   auto taxon_count = overlay.base->taxa.id_to_sample_id.size();
   for (std::size_t i = 0; i < overlay.temp_clades.size(); ++i) {
@@ -408,16 +434,58 @@ inline void validate_overlay(overlay_clade_grammar const& overlay) {
     auto const& prod = overlay.temp_productions[i];
     validate_clade_ref(overlay, prod.parent,
                        "temp production " + std::to_string(i) + " parent");
-    if (prod.children.empty()) {
+    if (prod.children.size() < 2) {
       throw std::runtime_error("chart SPR: temp production " +
-                               std::to_string(i) + " has no children");
+                               std::to_string(i) +
+                               " has fewer than two children");
     }
     for (std::size_t child_i = 0; child_i < prod.children.size(); ++child_i) {
       validate_clade_ref(overlay, prod.children[child_i],
                          "temp production " + std::to_string(i) +
                              " child " + std::to_string(child_i));
     }
+
+    // Validate every dynamic production, including unreachable payload that
+    // will not appear in the dense result and therefore cannot be checked by
+    // the freshly built output plan.
+    if (stats != nullptr) ++stats->production_partition_validations;
+    chart_execution_plan_detail::
+        record_dynamic_overlay_partition_validation();
+    auto const& parent_taxa = clade_key_for_ref(overlay, prod.parent).taxa;
+    std::vector<taxon_id> union_taxa;
+    for (auto child_ref : prod.children) {
+      auto const& child_taxa = clade_key_for_ref(overlay, child_ref).taxa;
+      std::vector<taxon_id> overlap;
+      std::set_intersection(union_taxa.begin(), union_taxa.end(),
+                            child_taxa.begin(), child_taxa.end(),
+                            std::back_inserter(overlap));
+      if (!overlap.empty()) {
+        throw std::runtime_error(
+            "chart SPR: temp production " + std::to_string(i) +
+            " children overlap");
+      }
+      std::vector<taxon_id> next;
+      next.reserve(union_taxa.size() + child_taxa.size());
+      std::set_union(union_taxa.begin(), union_taxa.end(),
+                     child_taxa.begin(), child_taxa.end(),
+                     std::back_inserter(next));
+      union_taxa = std::move(next);
+    }
+    if (union_taxa != parent_taxa) {
+      throw std::runtime_error(
+          "chart SPR: temp production " + std::to_string(i) +
+          " children do not partition the parent clade");
+    }
   }
+}
+
+inline void validate_overlay(overlay_clade_grammar const& overlay) {
+  if (overlay.base == nullptr)
+    throw std::runtime_error("chart SPR: overlay has no base grammar");
+  parsimony_chart_detail::validate_chart_grammar(*overlay.base);
+  chart_execution_plan_detail::record_legacy_production_index_validation();
+  chart_trim_detail::validate_production_indices(*overlay.base);
+  validate_overlay_payload(overlay);
 }
 
 inline bool has_overlay_temp_production(
@@ -1719,6 +1787,17 @@ chart_spr_candidate_generation_stats for_each_hybrid_spr_candidate(
 namespace chart_spr_detail {
 
 template <typename F>
+chart_spr_candidate_generation_stats
+for_each_sampled_tree_spr_candidate_stream(
+    clade_grammar const& grammar,
+    grammar_spr_enumeration_options const& options, F&& callback);
+
+template <typename F>
+chart_spr_candidate_generation_stats for_each_hybrid_spr_candidate_stream(
+    clade_grammar const& grammar,
+    grammar_spr_enumeration_options const& options, F&& callback);
+
+template <typename F>
 chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
     clade_grammar const& grammar,
     grammar_spr_enumeration_options const& options, F&& callback) {
@@ -1961,18 +2040,28 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
 
 }  // namespace chart_spr_detail
 
-// Streaming grammar-native SPR candidate enumeration.  Unlike the legacy eager
-// vector helper, this enumerates upward paths lazily for the source/target pair
-// currently under consideration and honors candidate/path budgets before
-// exploring unrelated clades.
+namespace chart_spr_detail {
+
 template <typename F>
-chart_spr_candidate_generation_stats for_each_grammar_spr_candidate(
+chart_spr_candidate_generation_stats for_each_candidate_source_stream(
     clade_grammar const& grammar,
     grammar_spr_enumeration_options const& options, F&& callback) {
-  using namespace chart_spr_detail;
-  parsimony_chart_detail::validate_chart_grammar(grammar);
-  chart_trim_detail::validate_production_indices(grammar);
+  if (options.source == chart_spr_candidate_source::sampled_tree) {
+    return for_each_sampled_tree_spr_candidate_stream(
+        grammar, options, std::forward<F>(callback));
+  }
+  if (options.source == chart_spr_candidate_source::hybrid) {
+    return for_each_hybrid_spr_candidate_stream(
+        grammar, options, std::forward<F>(callback));
+  }
+  return for_each_grammar_spr_candidate_stream(
+      grammar, options, std::forward<F>(callback));
+}
 
+template <typename F>
+chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_checked(
+    clade_grammar const& grammar,
+    grammar_spr_enumeration_options const& options, F&& callback) {
   if (options.source == chart_spr_candidate_source::grammar &&
       options.include_neutral_or_reversal_candidates) {
     throw std::runtime_error(
@@ -2000,18 +2089,8 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate(
       }
       return true;
     };
-    chart_spr_candidate_generation_stats stats;
-    if (stream_options.source == chart_spr_candidate_source::grammar) {
-      stats = chart_spr_detail::for_each_grammar_spr_candidate_stream(
-          grammar, stream_options, reservoir_callback);
-    } else if (stream_options.source ==
-               chart_spr_candidate_source::sampled_tree) {
-      stats = for_each_sampled_tree_spr_candidate(
-          grammar, stream_options, reservoir_callback);
-    } else {
-      stats = for_each_hybrid_spr_candidate(
-          grammar, stream_options, reservoir_callback);
-    }
+    auto stats = for_each_candidate_source_stream(
+        grammar, stream_options, reservoir_callback);
     if (options.randomize_order && reservoir.size() > 1) {
       std::shuffle(reservoir.begin(), reservoir.end(), reservoir_rng);
     }
@@ -2026,19 +2105,45 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate(
     return stats;
   }
 
-  if (options.source == chart_spr_candidate_source::sampled_tree) {
-    return for_each_sampled_tree_spr_candidate(grammar, options,
-                                               std::forward<F>(callback));
-  }
-  if (options.source == chart_spr_candidate_source::hybrid) {
-    return for_each_hybrid_spr_candidate(grammar, options,
-                                         std::forward<F>(callback));
-  }
-  return chart_spr_detail::for_each_grammar_spr_candidate_stream(
+  return for_each_candidate_source_stream(
       grammar, options, std::forward<F>(callback));
 }
 
-inline overlay_clade_grammar overlay_from_candidate(
+}  // namespace chart_spr_detail
+
+// Streaming grammar-native SPR candidate enumeration.  Unlike the legacy eager
+// vector helper, this enumerates upward paths lazily for the source/target pair
+// currently under consideration and honors candidate/path budgets before
+// exploring unrelated clades.
+template <typename F>
+chart_spr_candidate_generation_stats for_each_grammar_spr_candidate(
+    clade_grammar const& grammar,
+    grammar_spr_enumeration_options const& options, F&& callback) {
+  using namespace chart_spr_detail;
+  parsimony_chart_detail::validate_chart_grammar(grammar);
+  chart_execution_plan_detail::record_legacy_production_index_validation();
+  chart_trim_detail::validate_production_indices(grammar);
+  return chart_spr_detail::for_each_grammar_spr_candidate_checked(
+      grammar, options, std::forward<F>(callback));
+}
+
+// Search-internal overload.  The capability proves that this exact grammar
+// and resident plan were fingerprint-checked at the acceptance-iteration
+// publication boundary; source dispatch (including reservoir and hybrid
+// children) therefore performs no additional grammar-wide validation.
+template <typename F>
+chart_spr_candidate_generation_stats for_each_grammar_spr_candidate(
+    clade_grammar const& grammar,
+    checked_chart_execution_plan_ref const& checked,
+    grammar_spr_enumeration_options const& options, F&& callback) {
+  checked.assert_same(grammar, checked.plan());
+  return chart_spr_detail::for_each_grammar_spr_candidate_checked(
+      grammar, options, std::forward<F>(callback));
+}
+
+namespace chart_spr_detail {
+
+inline overlay_clade_grammar overlay_from_candidate_payload(
     clade_grammar const& base, grammar_spr_candidate const& candidate) {
   overlay_clade_grammar overlay;
   overlay.base = &base;
@@ -2062,22 +2167,43 @@ inline overlay_clade_grammar overlay_from_candidate(
       std::unique(overlay.removed_base_productions.begin(),
                   overlay.removed_base_productions.end()),
       overlay.removed_base_productions.end());
+  return overlay;
+}
+
+inline overlay_materialization_result materialize_overlay_grammar_core(
+    overlay_clade_grammar const& overlay);
+
+}  // namespace chart_spr_detail
+
+inline overlay_clade_grammar overlay_from_candidate(
+    clade_grammar const& base, grammar_spr_candidate const& candidate) {
+  auto overlay =
+      chart_spr_detail::overlay_from_candidate_payload(base, candidate);
   chart_spr_detail::validate_overlay(overlay);
   return overlay;
 }
 
-inline overlay_materialization_result materialize_overlay_grammar(
-    overlay_clade_grammar const& overlay) {
-  using namespace chart_spr_detail;
-  validate_overlay(overlay);
+inline overlay_clade_grammar overlay_from_candidate(
+    clade_grammar const& base,
+    checked_chart_execution_plan_ref const& checked,
+    grammar_spr_candidate const& candidate) {
+  checked.assert_same(base, checked.plan());
+  auto overlay =
+      chart_spr_detail::overlay_from_candidate_payload(base, candidate);
+  chart_spr_detail::validate_overlay_payload(overlay);
+  return overlay;
+}
 
+inline overlay_materialization_result
+chart_spr_detail::materialize_overlay_grammar_core(
+    overlay_clade_grammar const& overlay) {
   overlay_materialization_result result;
   auto const& base = *overlay.base;
   auto& grammar = result.grammar;
 
   grammar.taxa = base.taxa;
 
-  auto removed = normalized_removed_base_productions(overlay);
+  auto removed = chart_spr_detail::normalized_removed_base_productions(overlay);
   result.base_clade_to_dense.assign(base.clades.size(), no_clade);
   result.temp_clade_to_dense.assign(overlay.temp_clades.size(), no_clade);
   result.base_production_to_dense.assign(base.productions.size(), no_production);
@@ -2140,7 +2266,9 @@ inline overlay_materialization_result materialize_overlay_grammar(
     result.dense_clade_to_ref.push_back(ref);
   }
 
-  grammar.root_clade = dense_clade_id(result, base_clade_ref(base.root_clade));
+  grammar.root_clade =
+      chart_spr_detail::dense_clade_id(result,
+                                       base_clade_ref(base.root_clade));
   grammar.node_to_clade.assign(base.node_to_clade.size(), no_clade);
   for (std::size_t node = 0; node < base.node_to_clade.size(); ++node) {
     auto cid = base.node_to_clade[node];
@@ -2156,9 +2284,10 @@ inline overlay_materialization_result materialize_overlay_grammar(
     }
     auto const& base_prod = base.productions[pid];
     grammar_production prod = base_prod;
-    prod.parent = dense_clade_id(result, base_clade_ref(base_prod.parent));
+    prod.parent = chart_spr_detail::dense_clade_id(
+        result, base_clade_ref(base_prod.parent));
     for (auto& child : prod.children)
-      child = dense_clade_id(result, base_clade_ref(child));
+      child = chart_spr_detail::dense_clade_id(result, base_clade_ref(child));
 
     auto dense_pid = static_cast<production_id>(grammar.productions.size());
     result.base_production_to_dense[pid] = dense_pid;
@@ -2174,10 +2303,12 @@ inline overlay_materialization_result materialize_overlay_grammar(
     }
     auto const& overlay_prod = overlay.temp_productions[i];
     grammar_production prod;
-    prod.parent = dense_clade_id(result, overlay_prod.parent);
+    prod.parent = chart_spr_detail::dense_clade_id(result,
+                                                   overlay_prod.parent);
     prod.children.reserve(overlay_prod.children.size());
     for (auto child_ref : overlay_prod.children)
-      prod.children.push_back(dense_clade_id(result, child_ref));
+      prod.children.push_back(
+          chart_spr_detail::dense_clade_id(result, child_ref));
     prod.witnesses = overlay_prod.witnesses;
     prod.multiplicity = overlay_prod.multiplicity;
 
@@ -2210,9 +2341,150 @@ inline overlay_materialization_result materialize_overlay_grammar(
     }
   }
 
-  parsimony_chart_detail::validate_chart_grammar(grammar);
-  chart_trim_detail::validate_production_indices(grammar);
   return result;
+}
+
+inline overlay_materialization_result materialize_overlay_grammar(
+    overlay_clade_grammar const& overlay) {
+  chart_spr_detail::validate_overlay(overlay);
+  auto result = chart_spr_detail::materialize_overlay_grammar_core(overlay);
+  parsimony_chart_detail::validate_chart_grammar(result.grammar);
+  chart_execution_plan_detail::record_legacy_production_index_validation();
+  chart_trim_detail::validate_production_indices(result.grammar);
+  result.grammar.execution_generation =
+      detail::allocate_clade_grammar_execution_generation();
+  return result;
+}
+
+template <typename DenseMaterializationFinished>
+inline planned_overlay_materialization_result
+materialize_overlay_grammar_with_plan_impl(
+    overlay_clade_grammar const& overlay,
+    checked_chart_execution_plan_ref const& checked_base,
+    bool* dense_materialization_completed,
+    overlay_payload_validation_stats* completed_payload_validation_stats,
+    DenseMaterializationFinished&& dense_materialization_finished) {
+  if (dense_materialization_completed != nullptr) {
+    *dense_materialization_completed = false;
+  }
+  if (completed_payload_validation_stats != nullptr) {
+    *completed_payload_validation_stats = {};
+  }
+  planned_overlay_materialization_result result;
+  auto* payload_validation_stats =
+      completed_payload_validation_stats != nullptr
+          ? completed_payload_validation_stats
+          : &result.payload_validation_stats;
+  try {
+    if (overlay.base == nullptr) {
+      throw std::runtime_error("chart SPR: overlay has no base grammar");
+    }
+    checked_base.assert_same(*overlay.base, checked_base.plan());
+    chart_spr_detail::validate_overlay_payload(overlay,
+                                               payload_validation_stats);
+
+    result.materialized =
+        chart_spr_detail::materialize_overlay_grammar_core(overlay);
+    result.materialized.grammar.execution_generation =
+        detail::allocate_clade_grammar_execution_generation();
+    if (dense_materialization_completed != nullptr) {
+      *dense_materialization_completed = true;
+    }
+  } catch (...) {
+    std::forward<DenseMaterializationFinished>(
+        dense_materialization_finished)();
+    throw;
+  }
+  std::forward<DenseMaterializationFinished>(
+      dense_materialization_finished)();
+  if (completed_payload_validation_stats != nullptr) {
+    result.payload_validation_stats = *completed_payload_validation_stats;
+  }
+  // This is the sole full validation of the output grammar.  No unplanned
+  // dense grammar escapes if construction rejects it.
+  result.execution_plan =
+      build_chart_execution_plan(result.materialized.grammar);
+  return result;
+}
+
+
+inline planned_overlay_materialization_result
+materialize_overlay_grammar_with_plan(
+    overlay_clade_grammar const& overlay,
+    checked_chart_execution_plan_ref const& checked_base,
+    bool* dense_materialization_completed = nullptr,
+    overlay_payload_validation_stats* completed_payload_validation_stats =
+        nullptr) {
+  return materialize_overlay_grammar_with_plan_impl(
+      overlay, checked_base, dense_materialization_completed,
+      completed_payload_validation_stats, [] {});
+}
+
+template <typename DenseMaterializationFinished>
+  requires std::invocable<DenseMaterializationFinished&>
+inline planned_overlay_materialization_result
+materialize_overlay_grammar_with_plan(
+    overlay_clade_grammar const& overlay,
+    checked_chart_execution_plan_ref const& checked_base,
+    bool* dense_materialization_completed,
+    DenseMaterializationFinished&& dense_materialization_finished,
+    overlay_payload_validation_stats* completed_payload_validation_stats =
+        nullptr) {
+  return materialize_overlay_grammar_with_plan_impl(
+      overlay, checked_base, dense_materialization_completed,
+      completed_payload_validation_stats,
+      std::forward<DenseMaterializationFinished>(
+          dense_materialization_finished));
+}
+
+inline planned_overlay_materialization_result
+materialize_candidate_overlay_grammar_with_plan(
+    clade_grammar const& base,
+    checked_chart_execution_plan_ref const& checked_base,
+    grammar_spr_candidate const& candidate,
+    bool* dense_materialization_completed = nullptr,
+    overlay_payload_validation_stats* completed_payload_validation_stats =
+        nullptr) {
+  if (dense_materialization_completed != nullptr) {
+    *dense_materialization_completed = false;
+  }
+  if (completed_payload_validation_stats != nullptr) {
+    *completed_payload_validation_stats = {};
+  }
+  checked_base.assert_same(base, checked_base.plan());
+  auto overlay =
+      chart_spr_detail::overlay_from_candidate_payload(base, candidate);
+  return materialize_overlay_grammar_with_plan(
+      overlay, checked_base, dense_materialization_completed,
+      completed_payload_validation_stats);
+}
+
+
+template <typename DenseMaterializationFinished>
+  requires std::invocable<DenseMaterializationFinished&>
+inline planned_overlay_materialization_result
+materialize_candidate_overlay_grammar_with_plan(
+    clade_grammar const& base,
+    checked_chart_execution_plan_ref const& checked_base,
+    grammar_spr_candidate const& candidate,
+    bool* dense_materialization_completed,
+    DenseMaterializationFinished&& dense_materialization_finished,
+    overlay_payload_validation_stats* completed_payload_validation_stats =
+        nullptr) {
+  if (dense_materialization_completed != nullptr) {
+    *dense_materialization_completed = false;
+  }
+  if (completed_payload_validation_stats != nullptr) {
+    *completed_payload_validation_stats = {};
+  }
+  checked_base.assert_same(base, checked_base.plan());
+  auto overlay =
+      chart_spr_detail::overlay_from_candidate_payload(base, candidate);
+  return materialize_overlay_grammar_with_plan(
+      overlay, checked_base, dense_materialization_completed,
+      std::forward<DenseMaterializationFinished>(
+          dense_materialization_finished),
+      completed_payload_validation_stats);
 }
 
 inline single_site_chart build_single_site_overlay_chart(
@@ -2752,12 +3024,11 @@ inline void add_generation_count_stats(
 }  // namespace chart_spr_detail
 
 template <typename F>
-chart_spr_candidate_generation_stats for_each_sampled_tree_spr_candidate(
+chart_spr_candidate_generation_stats
+chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
     clade_grammar const& grammar,
     grammar_spr_enumeration_options const& options, F&& callback) {
   using namespace chart_spr_detail;
-  parsimony_chart_detail::validate_chart_grammar(grammar);
-  chart_trim_detail::validate_production_indices(grammar);
 
   chart_spr_candidate_generation_stats stats;
   std::set<std::string> seen;
@@ -2858,12 +3129,11 @@ chart_spr_candidate_generation_stats for_each_sampled_tree_spr_candidate(
 }
 
 template <typename F>
-chart_spr_candidate_generation_stats for_each_hybrid_spr_candidate(
+chart_spr_candidate_generation_stats
+chart_spr_detail::for_each_hybrid_spr_candidate_stream(
     clade_grammar const& grammar,
     grammar_spr_enumeration_options const& options, F&& callback) {
   using namespace chart_spr_detail;
-  parsimony_chart_detail::validate_chart_grammar(grammar);
-  chart_trim_detail::validate_production_indices(grammar);
 
   chart_spr_candidate_generation_stats combined;
   std::set<std::string> emitted;
@@ -2936,7 +3206,7 @@ chart_spr_candidate_generation_stats for_each_hybrid_spr_candidate(
   auto sampled_options = child_options_for(
       chart_spr_candidate_source::sampled_tree);
   if (!stopped()) {
-    auto sampled_stats = for_each_sampled_tree_spr_candidate(
+    auto sampled_stats = for_each_sampled_tree_spr_candidate_stream(
         grammar, sampled_options,
         [&](grammar_spr_candidate const& candidate) {
           return emit_unique(candidate) && !stopped();
@@ -2957,6 +3227,28 @@ chart_spr_candidate_generation_stats for_each_hybrid_spr_candidate(
     propagate_child_stop(grammar_stats);
   }
   return combined;
+}
+
+template <typename F>
+chart_spr_candidate_generation_stats for_each_sampled_tree_spr_candidate(
+    clade_grammar const& grammar,
+    grammar_spr_enumeration_options const& options, F&& callback) {
+  parsimony_chart_detail::validate_chart_grammar(grammar);
+  chart_execution_plan_detail::record_legacy_production_index_validation();
+  chart_trim_detail::validate_production_indices(grammar);
+  return chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
+      grammar, options, std::forward<F>(callback));
+}
+
+template <typename F>
+chart_spr_candidate_generation_stats for_each_hybrid_spr_candidate(
+    clade_grammar const& grammar,
+    grammar_spr_enumeration_options const& options, F&& callback) {
+  parsimony_chart_detail::validate_chart_grammar(grammar);
+  chart_execution_plan_detail::record_legacy_production_index_validation();
+  chart_trim_detail::validate_production_indices(grammar);
+  return chart_spr_detail::for_each_hybrid_spr_candidate_stream(
+      grammar, options, std::forward<F>(callback));
 }
 
 }  // namespace larch

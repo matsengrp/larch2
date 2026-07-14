@@ -1141,6 +1141,7 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   nn_ml_spr_test nn_blended_spr_test
                   inplace_spr_test wric_phase0_test clade_grammar_test
                   polytomy_refinement_test parsimony_chart_test
+                  chart_parallel_test
                   site_patterns_test chart_trim_test chart_bnb_trim_apply_test
                   chart_spr_test chart_spr_search_test plateau_test
                   rank3_rewrite_test chart_two_chart_oracle_test

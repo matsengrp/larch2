@@ -103,6 +103,35 @@ void chart_spr_add_search_state_rebuild_counters(
   accumulated.pattern_rebuilds += rebuild_counters.pattern_rebuilds;
   accumulated.base_chart_cache_rebuilds +=
       rebuild_counters.base_chart_cache_rebuilds;
+  accumulated.chart_execution_plan_builds +=
+      rebuild_counters.chart_execution_plan_builds;
+  accumulated.chart_execution_plan_cache_hits +=
+      rebuild_counters.chart_execution_plan_cache_hits;
+  accumulated.candidate_execution_plan_builds +=
+      rebuild_counters.candidate_execution_plan_builds;
+  accumulated.candidate_execution_plan_cache_hits +=
+      rebuild_counters.candidate_execution_plan_cache_hits;
+  accumulated.full_grammar_validations +=
+      rebuild_counters.full_grammar_validations;
+  accumulated.production_index_validations +=
+      rebuild_counters.production_index_validations;
+  accumulated.production_partition_validations +=
+      rebuild_counters.production_partition_validations;
+  accumulated.dynamic_overlay_payload_partition_validations +=
+      rebuild_counters.dynamic_overlay_payload_partition_validations;
+  accumulated.candidate_partition_validations +=
+      rebuild_counters.candidate_partition_validations;
+  accumulated.clade_order_sorts += rebuild_counters.clade_order_sorts;
+  accumulated.production_descriptors_compiled +=
+      rebuild_counters.production_descriptors_compiled;
+  accumulated.plan_mismatch_rejections +=
+      rebuild_counters.plan_mismatch_rejections;
+  accumulated.candidate_pattern_full_grammar_validations +=
+      rebuild_counters.candidate_pattern_full_grammar_validations;
+  accumulated.candidate_pattern_partition_validations +=
+      rebuild_counters.candidate_pattern_partition_validations;
+  accumulated.candidate_pattern_clade_order_sorts +=
+      rebuild_counters.candidate_pattern_clade_order_sorts;
   accumulated.multifurcation_productions_scored +=
       rebuild_counters.multifurcation_productions_scored;
   accumulated.pattern_batch_cache_builds +=
@@ -813,6 +842,14 @@ chart_spr_compact_and_verify_local_update_state(
   result.rebuilt_state = rebuild_chart_spr_search_state_after_accept(
       local_state, result.dag, std::move(compacted.rebuilt.grammar), options,
       result.reused_patterns);
+  // The rebuilt state is moved into the result after this gate, but its local
+  // plan/chart-cache construction counters must first be folded into the
+  // cumulative snapshot.  The caller subsequently installs that cumulative
+  // snapshot on rebuilt_state; assigning it without this merge would erase the
+  // final-compaction plan build and cache work.
+  chart_spr_add_search_state_rebuild_counters(
+      counters, result.rebuilt_state.counters,
+      /*update_current_skipped_invariant_sites=*/false);
   return result;
 }
 
@@ -893,6 +930,12 @@ struct chart_spr_selected_topology_row_cache {
 // address is stable for the search run.
 struct chart_spr_local_commit_substrate {
   clade_grammar base_grammar;
+  // Immutable plan compiled for the frozen grammar before the chain and
+  // caches are created.  The frozen grammar is a generation-preserving copy
+  // of the initial search tip, so this is a copy of the resident state plan,
+  // not a second plan build.
+  chart_execution_plan base_execution_plan;
+  std::optional<checked_chart_execution_plan_ref> checked_base_execution_plan;
   std::optional<overlay_chain> chain;
   std::optional<inside_chart_cache> icache;
   std::optional<outside_chart_cache> ocache;
@@ -2117,12 +2160,53 @@ struct chart_spr_transient_extension {
   // Materialized extended tip grammar + dense->overlay-ref maps.  Built by
   // `materialize_overlay_chain` on the scratch chain; the grammar is identical
   // to `materialize_overlay_grammar(overlay_from_candidate(tip, candidate))`.
-  overlay_materialization_result materialized;
+  // Built as one checked publication: the dynamic chain payload is validated,
+  // then the dense grammar receives a fresh generation and exactly one output
+  // plan.  Keeping the pair intact is the capability used by fresh-plan trim
+  // and provenance helpers without a redundant fingerprint scan.
+  planned_overlay_materialization_result planned;
 };
+
+// Exact verification and commit need only the append vocabulary.  The
+// candidate was already fully validated and descriptor-compiled during local
+// scoring, so rebuilding reachability, affected order, indices, and recurrence
+// descriptors here would multiply candidate-plan construction up to threefold.
+spr_overlay_delta chart_spr_build_validated_append_payload(
+    chart_spr_search_state const& state,
+    checked_chart_execution_plan_ref const& checked_state,
+    grammar_spr_candidate const& candidate) {
+  // Exact verification and commit are checked state boundaries, not
+  // candidate-pattern hot loops.  Check the fingerprint as well as the token
+  // so a same-generation in-place mutation cannot be appended through a stale
+  // resident plan.
+  checked_state.assert_same(state.grammar, state.execution_plan);
+
+  spr_overlay_delta delta;
+  delta.base = &state.grammar;
+  delta.temp_clades = candidate.added_clades;
+  delta.temp_productions = candidate.added_productions;
+  delta.removed_base_productions.reserve(candidate.removed_productions.size());
+  for (auto ref : candidate.removed_productions) {
+    if (ref.space != overlay_id_space::base || ref.id == no_production ||
+        ref.id >= state.grammar.productions.size()) {
+      throw std::runtime_error(
+          "chart SPR append payload: invalid removed base production");
+    }
+    delta.removed_base_productions.push_back(ref.id);
+  }
+  std::sort(delta.removed_base_productions.begin(),
+            delta.removed_base_productions.end());
+  delta.removed_base_productions.erase(
+      std::unique(delta.removed_base_productions.begin(),
+                  delta.removed_base_productions.end()),
+      delta.removed_base_productions.end());
+  return delta;
+}
 
 chart_spr_transient_extension chart_spr_build_transient_extension(
     chart_spr_local_commit_substrate const& sub,
     chart_spr_search_state const& state,
+    checked_chart_execution_plan_ref const& checked_state,
     chart_spr_candidate_score const& candidate) {
   chart_spr_transient_extension ext;
   // Copy the committed chain (reader-local).  The chain's base pointer still
@@ -2130,11 +2214,9 @@ chart_spr_transient_extension chart_spr_build_transient_extension(
   ext.chain = *sub.chain;
   // Build the candidate delta against the CURRENT tip (state.grammar is the
   // materialized chain tip the candidate was generated/scored against).
-  local_spr_score_options local_options;
-  local_options.verify_against_full_overlay = false;
-  local_options.validate_cached_chart_shapes = false;
-  auto delta = build_spr_overlay_delta(state.grammar, candidate.candidate,
-                                       local_options);
+  auto delta =
+      chart_spr_build_validated_append_payload(
+          state, checked_state, candidate.candidate);
   // Append to the scratch chain.  A tombstone-scope rejection (the candidate
   // tombstones a production that does not resolve to a frozen-base production)
   // throws here; the caller treats it as an invalid candidate, exactly as the
@@ -2164,11 +2246,26 @@ chart_spr_transient_extension chart_spr_build_transient_extension(
   // materialized grammar -- become the authoritative source, and switching to
   // `overlay_from_candidate` now would be thrown away then.  A small win is
   // available now if Phase 12 is deferred indefinitely.
-  {
+  overlay_payload_validation_stats completed_payload_validation_stats;
+  try {
     chart_spr_elapsed_accumulator materialization_timer{
         state.counters.materialization_exact_verification_ms};
-    ext.materialized = materialize_overlay_chain(ext.chain);
+    if (!sub.checked_base_execution_plan) {
+      throw std::runtime_error(
+          "chart SPR transient extension: missing checked frozen-base plan");
+    }
+    auto planned = materialize_overlay_chain_with_plan(
+        ext.chain, *sub.checked_base_execution_plan, nullptr,
+        [&] { materialization_timer.finish(); },
+        &completed_payload_validation_stats);
+    ext.planned = std::move(planned);
+  } catch (...) {
+    record_overlay_payload_validation_stats(
+        state.counters, completed_payload_validation_stats);
+    throw;
   }
+  record_planned_overlay_materialization_stats(state.counters,
+                                               ext.planned);
   return ext;
 }
 
@@ -2195,8 +2292,9 @@ chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
     std::uint64_t transient_new_optimum,
     multisite_trim_options const& trim_options) {
   chart_spr_transient_oracle_result result;
-  auto const& grammar = ext.materialized.grammar;
-  if (ext.materialized.dense_clade_to_ref.size() != grammar.clades.size()) {
+  auto const& grammar = ext.planned.materialized.grammar;
+  if (ext.planned.materialized.dense_clade_to_ref.size() !=
+      grammar.clades.size()) {
     result.ok = false;
     result.mismatch_reason =
         "transient oracle: extended grammar dense clade map size mismatch";
@@ -2236,8 +2334,8 @@ chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
       return result;
     }
     for (std::size_t dense = 0;
-         dense < ext.materialized.dense_clade_to_ref.size(); ++dense) {
-      auto ref = ext.materialized.dense_clade_to_ref[dense];
+         dense < ext.planned.materialized.dense_clade_to_ref.size(); ++dense) {
+      auto ref = ext.planned.materialized.dense_clade_to_ref[dense];
       ++state.counters.transient_chain_extension_oracle_rows_checked_for_tests;
       if (ext.icache.row(p, ref) != oracle.first.inside[dense]) {
         result.ok = false;
@@ -2290,12 +2388,14 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
     chart_spr_local_commit_substrate& sub,
     chart_spr_search_state const& state,
     chart_spr_candidate_score candidate,
+    checked_chart_execution_plan_ref const& checked_state,
     multisite_trim_options const& trim_options) {
   if (!candidate.valid) return candidate;
 
   chart_spr_transient_extension ext;
   try {
-    ext = chart_spr_build_transient_extension(sub, state, candidate);
+    ext = chart_spr_build_transient_extension(
+        sub, state, checked_state, candidate);
   } catch (std::runtime_error const& e) {
     // The candidate delta cannot be appended to the scratch chain (tombstone
     // scope: it tombstones a production that does not resolve to a frozen-base
@@ -2308,7 +2408,7 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
     // hard correctness failure and is rethrown.
     if (chart_spr_is_local_commit_tombstone_scope_rejection(e.what())) {
       return verify_candidate_exact_against_state(
-          state, std::move(candidate), trim_options);
+          state, std::move(candidate), checked_state, trim_options);
     }
     throw;
   }
@@ -2324,17 +2424,18 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
     // Old score: the current tip's exact optimum (cached in state, lazily
     // built).  Same source the cold path reads.
     auto const& old_trim =
-        ensure_chart_spr_state_exact_trim(state, trim_options);
+        ensure_chart_spr_state_exact_trim(state, checked_state, trim_options);
 
     // New score: B&B exact optimum of the extended grammar.
     new_trim =
         state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart
             ? build_lazy_multisite_trim_active_from_scratch(
-                  ext.materialized.grammar, state.active_patterns,
-                  state.chart_opts, trim_options)
-            : build_multisite_trim_active(ext.materialized.grammar,
+                  ext.planned, state.active_patterns, state.chart_opts,
+                  trim_options)
+            : build_multisite_trim_active(ext.planned.execution_plan,
                                           state.active_patterns,
                                           state.chart_opts, trim_options);
+    ++state.counters.chart_execution_plan_cache_hits;
 
     // Optional corruption hook: perturb a scratch outside row so the two-chart
     // oracle catches the disagreement and the verifier falls back to the cold
@@ -2406,9 +2507,12 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
       candidate.canonical_exact_evidence =
           std::make_shared<chart_spr_canonical_exact_evidence>(
               chart_spr_canonicalize_search_trim_evidence(
-                  ext.materialized.grammar, state.active_patterns,
-                  state.chart_opts, trim_options, new_trim,
+                  ext.planned, state.active_patterns, state.chart_opts,
+                  trim_options, new_trim,
                   state.invariant_constant_offset));
+      if (new_trim.keep_production_exact) {
+        ++state.counters.chart_execution_plan_cache_hits;
+      }
     } else {
       chart_spr_canonical_exact_evidence evidence;
       evidence.evidence_kind =
@@ -2439,16 +2543,23 @@ chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
   // Frozen copy of the initial grammar; the chain and caches reference it for
   // the whole run.
   sub->base_grammar = state.grammar;
+  sub->base_execution_plan = state.execution_plan;
+  sub->checked_base_execution_plan.emplace(check_chart_execution_plan(
+      sub->base_grammar, sub->base_execution_plan));
   sub->chain.emplace(sub->base_grammar);
   // build_*_chart_cache return by value; their `base` pointer points at the
   // grammar passed in (&sub->base_grammar), which is stable for the run.  The
   // move into the optional copies the pointer, still valid.
-  sub->icache = build_inside_chart_cache(sub->base_grammar, state.active_patterns,
-                                          state.chart_opts,
-                                          state.invariant_constant_offset);
-  sub->ocache = build_outside_chart_cache(sub->base_grammar,
-                                           state.active_patterns,
-                                           state.chart_opts);
+  sub->icache = build_inside_chart_cache(
+      sub->base_grammar, *sub->checked_base_execution_plan,
+      state.active_patterns,
+      state.chart_opts, state.invariant_constant_offset);
+  ++state.counters.chart_execution_plan_cache_hits;
+  sub->ocache = build_outside_chart_cache(
+      sub->base_grammar, *sub->checked_base_execution_plan,
+      state.active_patterns,
+      state.chart_opts);
+  ++state.counters.chart_execution_plan_cache_hits;
   sub->cache_multifurcation_productions_scored_reported =
       sub->icache->multifurcation_productions_scored +
       sub->ocache->multifurcation_productions_scored;
@@ -2619,15 +2730,15 @@ void chart_spr_clear_lazy_outside_clade(lazy_multisite_chart& chart,
 }
 
 void chart_spr_initialize_lazy_root_outside(
-    lazy_multisite_chart& chart, clade_grammar const& grammar,
+    lazy_multisite_chart& chart, chart_execution_plan const& plan,
     site_pattern_set const& patterns, chart_options const& options) {
   if (options.score_ua_edge) {
     throw std::runtime_error(
         "chart SPR lazy local commit: score_ua_edge=true outside refresh "
         "requires a reference-state convention");
   }
-  auto root = grammar.root_clade;
-  if (root == no_clade || root >= grammar.clades.size()) {
+  auto root = plan.root_clade();
+  if (root == no_clade || root >= plan.clades().size()) {
     throw std::runtime_error(
         "chart SPR lazy local commit: root clade out of range");
   }
@@ -2657,6 +2768,7 @@ void chart_spr_initialize_lazy_root_outside(
 chart_spr_lazy_commit_stats chart_spr_refresh_lazy_chart_after_local_commit(
     chart_spr_search_state& state, overlay_chain const& chain,
     overlay_materialization_result const& materialized,
+    chart_execution_plan const& execution_plan,
     std::vector<overlay_clade_ref> const& previous_dense_clade_to_ref) {
   if (state.cache_strategy != chart_spr_cache_strategy::lazy_multisite_chart) {
     return {};
@@ -2687,12 +2799,14 @@ chart_spr_lazy_commit_stats chart_spr_refresh_lazy_chart_after_local_commit(
   for (auto ref : inside_affected) {
     auto dense = chart_spr_detail::dense_clade_id(materialized, ref);
     chart_spr_clear_lazy_inside_clade(next, dense);
-    if (materialized.grammar.clades[dense].taxa.size() == 1) {
-      lazy_chart_detail::assign_leaf_classes(next, materialized.grammar,
-                                             patterns, dense, lazy_options);
+    if (execution_plan.clade(dense).is_leaf()) {
+      lazy_chart_detail::assign_plan_leaf_classes(
+          next, execution_plan, patterns, dense, lazy_options);
     } else {
-      lazy_chart_detail::assign_internal_classes(next, materialized.grammar,
-                                                 patterns, dense);
+      auto keys = lazy_chart_detail::collect_plan_parent_keys(
+          next, execution_plan, patterns, dense, nullptr);
+      lazy_chart_detail::assign_plan_internal_classes(
+          next, execution_plan, patterns, dense, keys);
     }
     stats.inside_rows_recomputed += next.inside_rows_by_clade[dense].size();
   }
@@ -2707,12 +2821,12 @@ chart_spr_lazy_commit_stats chart_spr_refresh_lazy_chart_after_local_commit(
   for (auto ref : outside_affected) {
     auto dense = chart_spr_detail::dense_clade_id(materialized, ref);
     chart_spr_clear_lazy_outside_clade(next, dense);
-    if (dense == materialized.grammar.root_clade) {
+    if (dense == execution_plan.root_clade()) {
       chart_spr_initialize_lazy_root_outside(
-          next, materialized.grammar, patterns, state.chart_opts);
+          next, execution_plan, patterns, state.chart_opts);
     } else {
       lazy_chart_detail::assign_outside_classes_for_clade(
-          next, materialized.grammar, patterns, dense);
+          next, execution_plan, patterns, dense);
     }
     stats.outside_rows_recomputed +=
         next.outside_rows_by_clade[dense].size();
@@ -2809,9 +2923,20 @@ void chart_spr_assert_local_commit_two_chart_oracle(
 void chart_spr_refresh_state_tip_view_after_local_commit(
     chart_spr_search_state& state,
     overlay_materialization_result const& materialized,
-    inside_chart_cache const& icache) {
+    chart_execution_plan next_execution_plan,
+    inside_chart_cache const& icache,
+    chart_spr_search_counters& counters) {
   auto old_strategy = state.cache_strategy;
-  state.grammar = materialized.grammar;
+  auto const old_execution_generation = state.grammar.execution_generation;
+  auto next_grammar = materialized.grammar;
+  if (next_grammar.execution_generation == 0 ||
+      next_grammar.execution_generation == old_execution_generation) {
+    throw std::runtime_error(
+        "chart SPR local commit: accepted tip grammar did not publish a fresh "
+        "execution generation");
+  }
+  state.grammar = std::move(next_grammar);
+  state.execution_plan = std::move(next_execution_plan);
 
   state.estimated_full_pattern_cache_bytes =
       estimate_chart_spr_full_pattern_cache_bytes(state);
@@ -2883,8 +3008,9 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
   std::uint64_t composite_without_invariants = 0;
   if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
     composite_without_invariants = lazy_composite_lower_bound(
-        state.grammar, state.active_patterns.patterns, *state.lazy_chart,
+        state.execution_plan, state.active_patterns.patterns, *state.lazy_chart,
         state.chart_opts);
+    ++counters.chart_execution_plan_cache_hits;
   } else {
     auto composite_with_invariants =
         inside_cache_composite_lower_bound_with_invariants(icache);
@@ -2933,20 +3059,31 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
   // Build the single-candidate delta against the CURRENT tip (state.grammar is
   // the materialized chain tip the candidate was generated/scored against).
   // An accepted candidate that cannot be reconstructed here indicates a broken
-  // search invariant, so surface it as a hard local-commit error.
-  spr_overlay_delta delta;
-  try {
-    local_spr_score_options local_options;
-    local_options.verify_against_full_overlay = false;
-    local_options.validate_cached_chart_shapes = false;
-    delta = build_spr_overlay_delta(state.grammar, accepted.candidate,
-                                    local_options);
-  } catch (std::exception const& e) {
-    throw chart_spr_local_commit_hard_error(
-        std::string{"chart SPR local commit: failed to build accepted "
-                    "candidate delta before commit: "} +
-        e.what());
-  }
+  // search invariant, so surface it as a hard local-commit error.  The checked
+  // capability is deliberately scoped to this immutable append-payload build;
+  // it cannot accidentally authorize work after the chain starts mutating.
+  spr_overlay_delta delta = [&]() -> spr_overlay_delta {
+    auto checked_state = [&] {
+      try {
+        return check_chart_execution_plan(state.grammar,
+                                          state.execution_plan);
+      } catch (std::exception const& e) {
+        throw chart_spr_local_commit_hard_error(
+            std::string{"chart SPR local commit: stale resident state before "
+                        "append: "} +
+            e.what());
+      }
+    }();
+    try {
+      return chart_spr_build_validated_append_payload(
+          state, checked_state, accepted.candidate);
+    } catch (std::exception const& e) {
+      throw chart_spr_local_commit_hard_error(
+          std::string{"chart SPR local commit: failed to build accepted "
+                      "candidate delta before commit: "} +
+          e.what());
+    }
+  }();
 
   // Committability gate (Phase 4 tombstone scope).  The overlay vocabulary has
   // no removed-temp-productions field, so only candidates whose tombstones all
@@ -3001,18 +3138,43 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     // splice) is Phase 6/7 scope; the persistent caches already remove the
     // expensive per-accept chart rescoring.
     auto previous_dense_clade_to_chain_ref = sub.dense_clade_to_chain_ref;
-    overlay_materialization_result materialized;
-    {
+    planned_overlay_materialization_result planned;
+    overlay_payload_validation_stats completed_payload_validation_stats;
+    try {
       chart_spr_elapsed_accumulator materialization_timer{
           counters.materialization_accepted_update_ms};
-      materialized = materialize_overlay_chain(*sub.chain);
+      if (!sub.checked_base_execution_plan) {
+        throw std::runtime_error(
+            "chart SPR local commit: missing checked frozen-base plan");
+      }
+      planned = materialize_overlay_chain_with_plan(
+          *sub.chain, *sub.checked_base_execution_plan, nullptr,
+          [&] { materialization_timer.finish(); },
+          &completed_payload_validation_stats);
+    } catch (...) {
+      record_overlay_payload_validation_stats(
+          counters, completed_payload_validation_stats);
+      throw;
     }
+    record_planned_overlay_materialization_stats(counters, planned);
+    auto materialized = std::move(planned.materialized);
+    auto next_execution_plan = std::move(planned.execution_plan);
+    // The caller's attempt counter is the authoritative snapshot and is
+    // copied back onto state after commit.  Record this distinct materialized
+    // grammar plan exactly once here, before any consumer reuses it.
+    auto const refreshed_lazy_plan =
+        state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart;
     auto lazy_stats = chart_spr_refresh_lazy_chart_after_local_commit(
-        state, *sub.chain, materialized, previous_dense_clade_to_chain_ref);
+        state, *sub.chain, materialized, next_execution_plan,
+        previous_dense_clade_to_chain_ref);
+    if (refreshed_lazy_plan) {
+      ++counters.chart_execution_plan_cache_hits;
+    }
     chart_spr_set_tip_maps_from_materialization(sub, materialized);
     ++counters.local_commit_tip_grammar_refreshes;
-    chart_spr_refresh_state_tip_view_after_local_commit(state, materialized,
-                                                         *sub.icache);
+    chart_spr_refresh_state_tip_view_after_local_commit(
+        state, materialized, std::move(next_execution_plan), *sub.icache,
+        counters);
 
     // Mirror cumulative cache counters onto the running attempt-counters (the
     // caches persist across accepts; their counters are cumulative).
@@ -3072,6 +3234,31 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.multifurcation_productions_scored;
   summary.candidate_batches_scored = counters.candidate_batches_scored;
   summary.pattern_batch_cache_builds = counters.pattern_batch_cache_builds;
+  summary.chart_execution_plan_builds = counters.chart_execution_plan_builds;
+  summary.chart_execution_plan_cache_hits =
+      counters.chart_execution_plan_cache_hits;
+  summary.candidate_execution_plan_builds =
+      counters.candidate_execution_plan_builds;
+  summary.candidate_execution_plan_cache_hits =
+      counters.candidate_execution_plan_cache_hits;
+  summary.full_grammar_validations = counters.full_grammar_validations;
+  summary.production_index_validations = counters.production_index_validations;
+  summary.production_partition_validations =
+      counters.production_partition_validations;
+  summary.dynamic_overlay_payload_partition_validations =
+      counters.dynamic_overlay_payload_partition_validations;
+  summary.candidate_partition_validations =
+      counters.candidate_partition_validations;
+  summary.clade_order_sorts = counters.clade_order_sorts;
+  summary.production_descriptors_compiled =
+      counters.production_descriptors_compiled;
+  summary.plan_mismatch_rejections = counters.plan_mismatch_rejections;
+  summary.candidate_pattern_full_grammar_validations =
+      counters.candidate_pattern_full_grammar_validations;
+  summary.candidate_pattern_partition_validations =
+      counters.candidate_pattern_partition_validations;
+  summary.candidate_pattern_clade_order_sorts =
+      counters.candidate_pattern_clade_order_sorts;
   summary.exact_verifications = counters.exact_verifications;
   summary.overlay_materializations_for_exact_verification =
       counters.overlay_materializations_for_exact_verification;
@@ -3467,10 +3654,11 @@ chart_spr_search_result run_chart_spr_search(
       state.exact_multisite_verifier =
           [substrate_ptr](chart_spr_search_state const& verifier_state,
                           chart_spr_candidate_score candidate,
+                          checked_chart_execution_plan_ref const& checked_state,
                           multisite_trim_options const& trim_options) {
             return chart_spr_verify_candidate_exact_multisite_from_transient_extension(
                 *substrate_ptr, verifier_state, std::move(candidate),
-                trim_options);
+                checked_state, trim_options);
           };
     }
   }
@@ -3916,12 +4104,18 @@ chart_spr_search_result run_chart_spr_search(
         chart_spr_canonical_grammar_production_keys(state.grammar);
     if (options.acceptance_mode ==
         chart_spr_acceptance_mode::exact_multisite) {
+      auto checked_final =
+          check_chart_execution_plan(state.grammar, state.execution_plan);
       auto const& final_trim =
-          ensure_chart_spr_state_exact_trim(state, options.exact_trim);
+          ensure_chart_spr_state_exact_trim(state, checked_final,
+                                            options.exact_trim);
       canonical.final_exact = chart_spr_canonicalize_search_trim_evidence(
-          state.grammar, state.active_patterns, state.chart_opts,
-          options.exact_trim, final_trim,
+          state.grammar, checked_final, state.active_patterns,
+          state.chart_opts, options.exact_trim, final_trim,
           state.invariant_constant_offset);
+      if (final_trim.keep_production_exact) {
+        ++state.counters.chart_execution_plan_cache_hits;
+      }
     } else if (options.acceptance_mode ==
                    chart_spr_acceptance_mode::fixed_topology_exact &&
                last_local_update_accepted &&
@@ -3938,6 +4132,19 @@ chart_spr_search_result run_chart_spr_search(
     result.canonical_digest =
         build_chart_spr_semantic_digest_report(canonical);
   }
+  // Canonical provenance is constructed after the ordinary end-of-run
+  // counter snapshot.  It can reuse the resident plan for one companion trim
+  // (and a previously absent final exact trim can be built here), so resnapshot
+  // to expose every successful plan use in the returned full-run counters.
+  result.counters = state.counters;
+  chart_spr_refresh_search_summary_from_counters(result.summary,
+                                                 result.counters);
+  // The counter refresh above intentionally restores cumulative accounting,
+  // but the public lazy summary fields describe the final resident chart.
+  // Reapply that current-state view so its raw fields and derived ratios stay
+  // mutually consistent after canonical post-processing.
+  chart_spr_refresh_search_summary_from_current_lazy_chart(result.summary,
+                                                          state);
   return result;
 }
 

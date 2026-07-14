@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <compare>
 #include <cstdint>
 #include <iomanip>
@@ -106,6 +107,12 @@ struct clade_grammar {
   std::vector<std::vector<production_id>> productions_by_child;
   std::vector<clade_id> node_to_clade;  // indexed by DAG node, no_clade absent
   clade_id root_clade = no_clade;
+
+  // Process-local identity for recurrence plans compiled from this grammar.
+  // Copies intentionally preserve the token; an independently constructed or
+  // accepted-state grammar receives a new token.  Structural fingerprints
+  // separately catch mutation within one generation.
+  std::uint64_t execution_generation = 0;
 };
 
 struct clade_grammar_audit {
@@ -155,6 +162,24 @@ struct clade_grammar_build_result {
 };
 
 namespace detail {
+
+inline std::atomic<std::uint64_t> next_clade_grammar_execution_generation{1};
+
+inline std::uint64_t allocate_clade_grammar_execution_generation() {
+  auto generation =
+      next_clade_grammar_execution_generation.load(std::memory_order_relaxed);
+  for (;;) {
+    if (generation == 0 ||
+        generation == std::numeric_limits<std::uint64_t>::max()) {
+      throw std::runtime_error("clade grammar: execution generation exhausted");
+    }
+    if (next_clade_grammar_execution_generation.compare_exchange_weak(
+            generation, generation + 1, std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+      return generation;
+    }
+  }
+}
 
 inline bool is_acgt_char(char c) {
   switch (c) {
@@ -692,6 +717,8 @@ inline clade_grammar_build_result build_clade_grammar_with_audit(
   clade_grammar_build_result result;
   auto& grammar = result.grammar;
   auto& audit = result.audit;
+  grammar.execution_generation =
+      detail::allocate_clade_grammar_execution_generation();
 
   auto reachable = detail::collect_reachable(dag);
   detail::update_strict_nucleotide_counts(dag, reachable, audit);

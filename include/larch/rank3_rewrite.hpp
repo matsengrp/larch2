@@ -3180,7 +3180,6 @@ inline option_c_overlay_delta_result option_c_as_overlay_delta(
   // spr_overlay_delta (not only committable through the chain).
   spr_overlay_delta& delta = result.delta;
   delta.base = &tip;
-  delta.candidate = nullptr;
   delta.temp_clades = std::move(temp_clades);
   delta.temp_productions = std::move(temp_productions);
   delta.removed_base_productions = {before_pid};
@@ -3208,6 +3207,7 @@ inline option_c_overlay_delta_result option_c_as_overlay_delta(
   chart_spr_search_detail::compute_overlay_delta_reachability(delta,
                                                                score_options);
   chart_spr_search_detail::compute_overlay_delta_affected_order(delta);
+  chart_spr_search_detail::compile_overlay_delta_execution_rows(delta);
   return result;
 }
 

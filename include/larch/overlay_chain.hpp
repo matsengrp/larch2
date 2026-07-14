@@ -56,6 +56,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <concepts>
 #include <cstddef>
 #include <map>
 #include <set>
@@ -403,8 +404,6 @@ struct overlay_chain {
     // mutated, and only after all validation has passed.
     spr_overlay_delta stored;
     stored.base = base_;
-    stored.candidate = nullptr;  // not retained; delta is self-contained for
-                                 // the materialization-relevant fields.
     stored.temp_clades = std::move(new_temp_clades);
     stored.temp_productions = std::move(rebased_productions);
     stored.removed_base_productions = std::move(rebased_tombstones);
@@ -479,6 +478,64 @@ struct overlay_chain {
 inline overlay_materialization_result materialize_overlay_chain(
     overlay_chain const& chain) {
   return materialize_overlay_grammar(chain.tip());
+}
+
+// Search-internal checked form.  The token is for the chain's frozen base;
+// append/rebase/tombstone validation remains owned by overlay_chain, while the
+// combined materializer validates the complete dynamic tip payload and builds
+// exactly one plan for the fresh dense generation.
+inline planned_overlay_materialization_result
+materialize_overlay_chain_with_plan(
+    overlay_chain const& chain,
+    checked_chart_execution_plan_ref const& checked_base,
+    bool* dense_materialization_completed = nullptr,
+    overlay_payload_validation_stats* completed_payload_validation_stats =
+        nullptr) {
+  if (dense_materialization_completed != nullptr) {
+    *dense_materialization_completed = false;
+  }
+  if (completed_payload_validation_stats != nullptr) {
+    *completed_payload_validation_stats = {};
+  }
+  checked_base.assert_same(chain.base(), checked_base.plan());
+  auto overlay = chain.tip();
+  if (overlay.base != &chain.base()) {
+    throw chart_execution_plan_mismatch(
+        "overlay_chain: checked materialization base identity mismatch");
+  }
+  return materialize_overlay_grammar_with_plan(
+      overlay, checked_base, dense_materialization_completed,
+      completed_payload_validation_stats);
+}
+
+
+template <typename DenseMaterializationFinished>
+  requires std::invocable<DenseMaterializationFinished&>
+inline planned_overlay_materialization_result
+materialize_overlay_chain_with_plan(
+    overlay_chain const& chain,
+    checked_chart_execution_plan_ref const& checked_base,
+    bool* dense_materialization_completed,
+    DenseMaterializationFinished&& dense_materialization_finished,
+    overlay_payload_validation_stats* completed_payload_validation_stats =
+        nullptr) {
+  if (dense_materialization_completed != nullptr) {
+    *dense_materialization_completed = false;
+  }
+  if (completed_payload_validation_stats != nullptr) {
+    *completed_payload_validation_stats = {};
+  }
+  checked_base.assert_same(chain.base(), checked_base.plan());
+  auto overlay = chain.tip();
+  if (overlay.base != &chain.base()) {
+    throw chart_execution_plan_mismatch(
+        "overlay_chain: checked materialization base identity mismatch");
+  }
+  return materialize_overlay_grammar_with_plan(
+      overlay, checked_base, dense_materialization_completed,
+      std::forward<DenseMaterializationFinished>(
+          dense_materialization_finished),
+      completed_payload_validation_stats);
 }
 
 }  // namespace larch

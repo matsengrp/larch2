@@ -232,6 +232,8 @@ inline clade_grammar augment_grammar_with_topology_keys(
   }
   parsimony_chart_detail::validate_chart_grammar(grammar);
   chart_trim_detail::validate_production_indices(grammar);
+  grammar.execution_generation =
+      detail::allocate_clade_grammar_execution_generation();
   return grammar;
 }
 

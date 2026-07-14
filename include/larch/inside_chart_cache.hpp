@@ -528,6 +528,58 @@ inline inside_chart_cache build_inside_chart_cache(
   return cache;
 }
 
+// Trusted cold-cache construction for a grammar that has already published a
+// checked immutable execution plan.  Compatibility is checked once at this
+// boundary; every pattern then reuses the plan's validated order and
+// production descriptors.
+inline inside_chart_cache build_inside_chart_cache(
+    clade_grammar const& base,
+    checked_chart_execution_plan_ref const& checked,
+    active_site_pattern_set const& active, chart_options options,
+    std::uint64_t invariant_constant_offset) {
+  active.assert_no_skipped_invariant_metadata();
+  checked.assert_same(base, checked.plan());
+  auto const& plan = checked.plan();
+  chart_multisite_detail::validate_multisite_inputs(plan, active.patterns,
+                                                    options);
+
+  inside_chart_cache cache;
+  cache.base = &base;
+  cache.chart_opts = options;
+  cache.patterns = active.patterns.patterns;
+  cache.invariant_constant_offset = invariant_constant_offset;
+  cache.temp_clade_count = 0;
+
+  chart_options build_opts = options;
+  build_opts.keep_trace = false;
+  build_opts.max_trace_choices = 0;
+
+  cache.base_rows.resize(cache.patterns.size());
+  cache.temp_rows.resize(cache.patterns.size());
+  for (std::size_t p = 0; p < cache.patterns.size(); ++p) {
+    leaf_site_states states;
+    states.state_by_taxon = cache.patterns[p].state_by_taxon;
+    auto chart = build_single_site_chart(plan, states, build_opts);
+    if (chart.inside.size() != plan.clades().size()) {
+      throw std::runtime_error(
+          "inside cache: base chart clade count mismatch");
+    }
+    cache.multifurcation_productions_scored +=
+        chart.multifurcation_productions_scored;
+    cache.base_rows[p].assign(chart.inside.begin(), chart.inside.end());
+  }
+  return cache;
+}
+
+inline inside_chart_cache build_inside_chart_cache(
+    clade_grammar const& base, chart_execution_plan const& plan,
+    active_site_pattern_set const& active, chart_options options,
+    std::uint64_t invariant_constant_offset) {
+  auto checked = check_chart_execution_plan(base, plan);
+  return build_inside_chart_cache(base, checked, active, options,
+                                  invariant_constant_offset);
+}
+
 namespace inside_chart_cache_detail {
 
 // Recompute the inside row for a single clade of the committed (tip) grammar,

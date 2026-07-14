@@ -503,6 +503,77 @@ inline outside_chart_cache build_outside_chart_cache(
   return cache;
 }
 
+// Trusted cold-cache construction paired with a checked resident execution
+// plan.  The grammar/plan relationship and multisite metadata are checked once
+// before the pattern loop; inside and outside recurrences then consume the
+// immutable plan directly.
+inline outside_chart_cache build_outside_chart_cache(
+    clade_grammar const& base,
+    checked_chart_execution_plan_ref const& checked,
+    active_site_pattern_set const& active, chart_options options,
+    std::vector<std::uint8_t> reference_state_by_pattern = {}) {
+  active.assert_no_skipped_invariant_metadata();
+  checked.assert_same(base, checked.plan());
+  auto const& plan = checked.plan();
+  chart_multisite_detail::validate_multisite_inputs(plan, active.patterns,
+                                                    options);
+
+  if (options.score_ua_edge) {
+    if (reference_state_by_pattern.size() != active.patterns.patterns.size()) {
+      throw std::runtime_error(
+          "build_outside_chart_cache: score_ua_edge=true requires a reference "
+          "state per active pattern");
+    }
+    for (auto rs : reference_state_by_pattern) {
+      parsimony_chart_detail::validate_state(rs, "outside cache reference");
+    }
+  }
+
+  outside_chart_cache cache;
+  cache.base = &base;
+  cache.chart_opts = options;
+  cache.patterns = active.patterns.patterns;
+  cache.reference_state_by_pattern = std::move(reference_state_by_pattern);
+  cache.temp_clade_count = 0;
+
+  chart_options build_opts = options;
+  build_opts.keep_trace = false;
+  build_opts.max_trace_choices = 0;
+
+  cache.base_rows.resize(cache.patterns.size());
+  cache.temp_rows.resize(cache.patterns.size());
+  for (std::size_t p = 0; p < cache.patterns.size(); ++p) {
+    leaf_site_states states;
+    states.state_by_taxon = cache.patterns[p].state_by_taxon;
+    auto inside = build_single_site_chart(plan, states, build_opts);
+    single_site_outside_chart outside;
+    if (options.score_ua_edge) {
+      outside = build_single_site_outside_chart(
+          plan, inside, build_opts, cache.reference_state_by_pattern[p]);
+    } else {
+      outside = build_single_site_outside_chart(plan, inside, build_opts);
+    }
+    if (outside.outside.size() != plan.clades().size()) {
+      throw std::runtime_error(
+          "outside cache: base outside chart clade count mismatch");
+    }
+    cache.multifurcation_productions_scored +=
+        inside.multifurcation_productions_scored +
+        outside.multifurcation_productions_scored;
+    cache.base_rows[p].assign(outside.outside.begin(), outside.outside.end());
+  }
+  return cache;
+}
+
+inline outside_chart_cache build_outside_chart_cache(
+    clade_grammar const& base, chart_execution_plan const& plan,
+    active_site_pattern_set const& active, chart_options options,
+    std::vector<std::uint8_t> reference_state_by_pattern = {}) {
+  auto checked = check_chart_execution_plan(base, plan);
+  return build_outside_chart_cache(base, checked, active, options,
+                                   std::move(reference_state_by_pattern));
+}
+
 namespace outside_chart_cache_detail {
 
 // Helper to append a reachable-clade superset bitset pair (every reachable

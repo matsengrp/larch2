@@ -376,6 +376,46 @@ static std::size_t run_sequential_chain_with_cache(
 // Tests.
 // ---------------------------------------------------------------------------
 
+static void test_plan_cold_cache_matches_checked_oracle() {
+  std::println("test_plan_cold_cache_matches_checked_oracle");
+  auto f = load_binary_four_fixture();
+  auto plan = larch::build_chart_execution_plan(f.grammar);
+  auto checked = larch::build_inside_chart_cache(
+      f.grammar, f.active, f.options, f.invariant_offset);
+
+  std::size_t full_validations = 0;
+  std::size_t partition_validations = 0;
+  std::size_t clade_sorts = 0;
+  larch::parsimony_chart_detail::structural_work_observer observer{
+      &full_validations, &partition_validations, &clade_sorts};
+  larch::inside_chart_cache planned;
+  {
+    larch::parsimony_chart_detail::structural_work_observer_scope scope{
+        &observer};
+    planned = larch::build_inside_chart_cache(
+        f.grammar, plan, f.active, f.options, f.invariant_offset);
+  }
+  CHECK(planned.base_rows == checked.base_rows);
+  CHECK(planned.temp_rows == checked.temp_rows);
+  CHECK(planned.patterns.size() == checked.patterns.size());
+  for (std::size_t i = 0; i < planned.patterns.size(); ++i) {
+    CHECK(planned.patterns[i].state_by_taxon ==
+          checked.patterns[i].state_by_taxon);
+    CHECK(planned.patterns[i].positions == checked.patterns[i].positions);
+    CHECK(planned.patterns[i].weight == checked.patterns[i].weight);
+    CHECK(planned.patterns[i].reference_state_counts ==
+          checked.patterns[i].reference_state_counts);
+  }
+  CHECK(planned.invariant_constant_offset ==
+        checked.invariant_constant_offset);
+  CHECK(planned.multifurcation_productions_scored ==
+        checked.multifurcation_productions_scored);
+  CHECK(full_validations == 0);
+  CHECK(partition_validations == 0);
+  CHECK(clade_sorts == 0);
+  std::println("  PASS");
+}
+
 static void test_single_commit_on_binary_four() {
   std::println("test_single_commit_on_binary_four");
 
@@ -667,6 +707,7 @@ static void test_empty_chain_throws() {
 }
 
 int main() {
+  test_plan_cold_cache_matches_checked_oracle();
   test_single_commit_on_binary_four();
   test_affected_set_single_delta_relation();
   test_sequential_chain_two_on_rich();
