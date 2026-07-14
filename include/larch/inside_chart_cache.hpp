@@ -421,6 +421,15 @@ inline std::vector<overlay_clade_ref> compute_inside_affected_set(
 // deltas are appended to the chain.
 struct inside_chart_cache {
   clade_grammar const* base = nullptr;
+
+  // Immutable identity of the frozen grammar snapshot whose rows populate
+  // `base_rows`.  A base pointer and row dimensions are insufficient: the same
+  // grammar object can publish a new generation (or a new same-generation
+  // fingerprint) without changing either.  Consumers with a checked plan
+  // compare this stamp in O(1) before reading resident rows.
+  std::uint64_t base_execution_generation = 0;
+  chart_plan_fingerprint base_execution_fingerprint;
+
   chart_options chart_opts;
   std::vector<site_pattern> patterns;  // active/topology-informative only
   std::uint64_t invariant_constant_offset = 0;
@@ -499,6 +508,10 @@ inline inside_chart_cache build_inside_chart_cache(
 
   inside_chart_cache cache;
   cache.base = &base;
+  cache.base_execution_generation = base.execution_generation;
+  chart_execution_plan_detail::record_full_grammar_fingerprint_scan();
+  cache.base_execution_fingerprint =
+      chart_execution_plan_detail::fingerprint_chart_grammar(base);
   cache.chart_opts = options;
   cache.patterns = active.patterns.patterns;
   cache.invariant_constant_offset = invariant_constant_offset;
@@ -545,6 +558,8 @@ inline inside_chart_cache build_inside_chart_cache(
 
   inside_chart_cache cache;
   cache.base = &base;
+  cache.base_execution_generation = plan.grammar_generation();
+  cache.base_execution_fingerprint = plan.fingerprint();
   cache.chart_opts = options;
   cache.patterns = active.patterns.patterns;
   cache.invariant_constant_offset = invariant_constant_offset;
@@ -729,6 +744,11 @@ inline void apply_commit_to_inside_cache(overlay_chain const& chain,
   if (cache.base != &chain.base()) {
     throw std::runtime_error(
         "apply_commit_to_inside_cache: cache base does not match chain base");
+  }
+  if (cache.base_execution_generation != chain.base().execution_generation) {
+    throw std::runtime_error(
+        "apply_commit_to_inside_cache: cache base execution generation does "
+        "not match chain base");
   }
 
   // Pairing guard: the cache must be exactly one commit behind the tip.  This

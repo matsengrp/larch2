@@ -3230,6 +3230,11 @@ void chart_spr_refresh_search_summary_from_counters(
   summary.accepted_moves = counters.accepted_moves;
   summary.candidates_locally_scored = counters.local_candidate_scores;
   summary.local_rows_recomputed = counters.local_rows_recomputed;
+  summary.local_leaf_state_view_uses = counters.local_leaf_state_view_uses;
+  summary.local_leaf_state_owned_copies =
+      counters.local_leaf_state_owned_copies;
+  summary.local_row_scratch_capacity_growths =
+      counters.local_row_scratch_capacity_growths;
   summary.multifurcation_productions_scored =
       counters.multifurcation_productions_scored;
   summary.candidate_batches_scored = counters.candidate_batches_scored;

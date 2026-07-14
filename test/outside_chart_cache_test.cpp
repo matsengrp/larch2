@@ -102,6 +102,27 @@ struct active_fixture {
   larch::chart_options options;
 };
 
+// Apply one global taxon permutation to every clade key.  Production IDs,
+// child lists, and all vector dimensions stay fixed, while leaf descriptors
+// (and therefore inside rows for asymmetric patterns) change.  This creates a
+// valid same-address grammar snapshot for cache-identity regressions.
+static void swap_grammar_taxa(larch::clade_grammar& grammar,
+                              larch::taxon_id lhs, larch::taxon_id rhs) {
+  CHECK(lhs != rhs);
+  CHECK(lhs < grammar.taxa.id_to_sample_id.size());
+  CHECK(rhs < grammar.taxa.id_to_sample_id.size());
+  for (auto& clade : grammar.clades) {
+    for (auto& taxon : clade.taxa) {
+      if (taxon == lhs) {
+        taxon = rhs;
+      } else if (taxon == rhs) {
+        taxon = lhs;
+      }
+    }
+    std::sort(clade.taxa.begin(), clade.taxa.end());
+  }
+}
+
 static larch::test::tiny_tree_node tiny_leaf_state(std::string name,
                                                    char state) {
   return larch::test::tiny_leaf(std::move(name), std::string(1, state));
@@ -777,6 +798,7 @@ static void test_plan_cold_caches_match_checked_oracle() {
   std::println("test_plan_cold_caches_match_checked_oracle");
   auto f = load_binary_four_fixture();
   auto plan = larch::build_chart_execution_plan(f.grammar);
+  auto checked = larch::check_chart_execution_plan(f.grammar, plan);
   auto checked_inside = larch::build_inside_chart_cache(
       f.grammar, f.active, f.options, f.invariant_offset);
   auto checked_outside =
@@ -793,9 +815,9 @@ static void test_plan_cold_caches_match_checked_oracle() {
     larch::parsimony_chart_detail::structural_work_observer_scope scope{
         &observer};
     planned_inside = larch::build_inside_chart_cache(
-        f.grammar, plan, f.active, f.options, f.invariant_offset);
-    planned_outside = larch::build_outside_chart_cache(
-        f.grammar, plan, f.active, f.options);
+        f.grammar, checked, f.active, f.options, f.invariant_offset);
+    planned_outside = larch::build_outside_chart_cache(f.grammar, checked,
+                                                       f.active, f.options);
   }
   CHECK(planned_inside.base_rows == checked_inside.base_rows);
   CHECK(planned_outside.base_rows == checked_outside.base_rows);
@@ -806,6 +828,197 @@ static void test_plan_cold_caches_match_checked_oracle() {
   CHECK(full_validations == 0);
   CHECK(partition_validations == 0);
   CHECK(clade_sorts == 0);
+
+  // Phase 2B: build the same outside payload from the already-resident inside
+  // rows.  The deterministic counters are the load-bearing proof that this
+  // path did not invoke an inside build for any unchanged pattern.
+  auto reused_outside = larch::build_outside_chart_cache(
+      f.grammar, checked, planned_inside, f.options);
+  CHECK(reused_outside.base_rows == planned_outside.base_rows);
+  CHECK(reused_outside.temp_rows == planned_outside.temp_rows);
+  CHECK(reused_outside.temp_clade_count == 0);
+  CHECK(reused_outside.commit_epoch == 0);
+  CHECK(reused_outside.multifurcation_productions_scored ==
+        planned_outside.multifurcation_productions_scored);
+  CHECK(reused_outside.invariant_constant_offset == f.invariant_offset);
+  CHECK(reused_outside.build_stats.inside_charts_built == 0);
+  CHECK(reused_outside.build_stats.inside_charts_reused ==
+        planned_inside.patterns.size());
+  CHECK(reused_outside.build_stats.outside_charts_built ==
+        planned_inside.patterns.size());
+  CHECK(planned_outside.build_stats.inside_charts_built ==
+        planned_inside.patterns.size());
+  CHECK(planned_outside.build_stats.inside_charts_reused == 0);
+  CHECK(planned_outside.build_stats.outside_charts_built ==
+        planned_inside.patterns.size());
+  std::println("  PASS");
+}
+
+static void test_cold_outside_reuse_ua_and_multifurcation_equivalence() {
+  std::println("test_cold_outside_reuse_ua_and_multifurcation_equivalence");
+
+  // UA/reference-edge root rows use the supplied state exactly as the legacy
+  // plan builder does.  Cycle the states so equality covers all four entries
+  // of the plan-local transition table when the fixture has enough patterns.
+  {
+    auto f = load_binary_four_fixture();
+    larch::chart_options options;
+    options.score_ua_edge = true;
+    std::vector<std::uint8_t> reference_states(
+        f.active.patterns.patterns.size());
+    for (std::size_t p = 0; p < reference_states.size(); ++p) {
+      reference_states[p] =
+          static_cast<std::uint8_t>(p % larch::nuc_state_count);
+    }
+
+    auto plan = larch::build_chart_execution_plan(f.grammar);
+    auto checked = larch::check_chart_execution_plan(f.grammar, plan);
+    auto inside = larch::build_inside_chart_cache(f.grammar, checked, f.active,
+                                                  options, f.invariant_offset);
+    auto rebuilt = larch::build_outside_chart_cache(
+        f.grammar, checked, f.active, options, reference_states);
+    auto reused = larch::build_outside_chart_cache(f.grammar, checked, inside,
+                                                   options, reference_states);
+
+    CHECK(reused.base_rows == rebuilt.base_rows);
+    CHECK(reused.reference_state_by_pattern == reference_states);
+    CHECK(reused.multifurcation_productions_scored ==
+          rebuilt.multifurcation_productions_scored);
+    CHECK(reused.build_stats.inside_charts_built == 0);
+    CHECK(reused.build_stats.inside_charts_reused == inside.patterns.size());
+    CHECK(reused.build_stats.outside_charts_built == inside.patterns.size());
+  }
+
+  // Generic arity must retain both the exact rows and the established
+  // inside+outside multifurcation accounting when the inside half is reused.
+  {
+    using namespace larch::test;
+    auto dag = make_tiny_labelled_tree(
+        "A", tiny_inner("root", "A",
+                        {tiny_leaf_state("A", 'A'), tiny_leaf_state("B", 'C'),
+                         tiny_leaf_state("C", 'G')}));
+    auto f =
+        make_tiny_active_fixture("cold trinary reuse", std::move(dag), true);
+    CHECK(larch::grammar_has_kary_productions(f.grammar));
+
+    auto plan = larch::build_chart_execution_plan(f.grammar);
+    auto checked = larch::check_chart_execution_plan(f.grammar, plan);
+    auto inside = larch::build_inside_chart_cache(
+        f.grammar, checked, f.active, f.options, f.invariant_offset);
+    auto rebuilt = larch::build_outside_chart_cache(f.grammar, checked,
+                                                    f.active, f.options);
+    auto reused =
+        larch::build_outside_chart_cache(f.grammar, checked, inside, f.options);
+
+    CHECK(reused.base_rows == rebuilt.base_rows);
+    CHECK(rebuilt.multifurcation_productions_scored > 0);
+    CHECK(reused.multifurcation_productions_scored ==
+          rebuilt.multifurcation_productions_scored);
+    CHECK(reused.build_stats.inside_charts_built == 0);
+    CHECK(reused.build_stats.inside_charts_reused == inside.patterns.size());
+    CHECK(reused.build_stats.outside_charts_built == inside.patterns.size());
+  }
+
+  std::println("  PASS");
+}
+
+static void test_cold_outside_reuse_pairing_rejections() {
+  std::println("test_cold_outside_reuse_pairing_rejections");
+
+  // A checked plan for an equivalent but distinct grammar object cannot be
+  // paired with an inside cache owned by the original object.
+  {
+    auto f = load_binary_four_fixture();
+    auto inside_plan = larch::build_chart_execution_plan(f.grammar);
+    auto inside_checked =
+        larch::check_chart_execution_plan(f.grammar, inside_plan);
+    auto inside = larch::build_inside_chart_cache(
+        f.grammar, inside_checked, f.active, f.options, f.invariant_offset);
+
+    auto other = f.grammar;
+    auto other_plan = larch::build_chart_execution_plan(other);
+    auto other_checked = larch::check_chart_execution_plan(other, other_plan);
+    CHECK(throws_runtime_error([&] {
+      (void)larch::build_outside_chart_cache(other, other_checked, inside,
+                                             f.options);
+    }));
+
+    auto noncold = inside;
+    noncold.commit_epoch = 1;
+    CHECK(throws_runtime_error([&] {
+      (void)larch::build_outside_chart_cache(f.grammar, inside_checked, noncold,
+                                             f.options);
+    }));
+  }
+
+  // Exact stale-row regression: mutate the SAME base object without changing
+  // any row dimensions, publish a new generation and a plan compatible with
+  // that new snapshot, then prove the old-generation cache is rejected before
+  // its now-stale rows can be consumed.
+  {
+    auto f = load_binary_four_fixture();
+    auto old_plan = larch::build_chart_execution_plan(f.grammar);
+    auto inside = larch::build_inside_chart_cache(
+        f.grammar, old_plan, f.active, f.options, f.invariant_offset);
+    auto const old_fingerprint = old_plan.fingerprint();
+    swap_grammar_taxa(f.grammar, 0, 2);
+    ++f.grammar.execution_generation;
+    auto new_plan = larch::build_chart_execution_plan(f.grammar);
+    auto new_checked = larch::check_chart_execution_plan(f.grammar, new_plan);
+    auto fresh_inside = larch::build_inside_chart_cache(
+        f.grammar, new_checked, f.active, f.options, f.invariant_offset);
+    CHECK(inside.base == &f.grammar);
+    CHECK(inside.base_rows.size() == fresh_inside.base_rows.size());
+    CHECK(inside.base_rows.front().size() == new_plan.clades().size());
+    CHECK(inside.base_rows != fresh_inside.base_rows);
+    CHECK(inside.base_execution_generation != new_plan.grammar_generation());
+    CHECK(old_fingerprint != new_plan.fingerprint());
+    std::string rejection;
+    CHECK(throws_runtime_error([&] {
+      try {
+        (void)larch::build_outside_chart_cache(f.grammar, new_checked, inside,
+                                               f.options);
+      } catch (std::runtime_error const& e) {
+        rejection = e.what();
+        throw;
+      }
+    }));
+    CHECK(rejection.find("inside cache execution generation") !=
+          std::string::npos);
+  }
+
+  // Same-generation mutation is caught independently by the stored full
+  // fingerprint.  The newly built plan is compatible with the current base;
+  // only the resident cache identity is stale.
+  {
+    auto f = load_binary_four_fixture();
+    auto old_plan = larch::build_chart_execution_plan(f.grammar);
+    auto inside = larch::build_inside_chart_cache(
+        f.grammar, old_plan, f.active, f.options, f.invariant_offset);
+    swap_grammar_taxa(f.grammar, 0, 2);
+    auto new_plan = larch::build_chart_execution_plan(f.grammar);
+    auto new_checked = larch::check_chart_execution_plan(f.grammar, new_plan);
+    auto fresh_inside = larch::build_inside_chart_cache(
+        f.grammar, new_checked, f.active, f.options, f.invariant_offset);
+    CHECK(inside.base == &f.grammar);
+    CHECK(inside.base_rows.front().size() == new_plan.clades().size());
+    CHECK(inside.base_rows != fresh_inside.base_rows);
+    CHECK(inside.base_execution_generation == new_plan.grammar_generation());
+    CHECK(inside.base_execution_fingerprint != new_plan.fingerprint());
+    std::string rejection;
+    CHECK(throws_runtime_error([&] {
+      try {
+        (void)larch::build_outside_chart_cache(f.grammar, new_checked, inside,
+                                               f.options);
+      } catch (std::runtime_error const& e) {
+        rejection = e.what();
+        throw;
+      }
+    }));
+    CHECK(rejection.find("inside cache execution fingerprint") !=
+          std::string::npos);
+  }
+
   std::println("  PASS");
 }
 
@@ -1435,6 +1648,8 @@ static void test_pairing_guard() {
 int main() {
   test_arity_changing_overlay_commits();
   test_plan_cold_caches_match_checked_oracle();
+  test_cold_outside_reuse_ua_and_multifurcation_equivalence();
+  test_cold_outside_reuse_pairing_rejections();
   test_single_commit_on_binary_four();
   test_sequential_chain_two_on_rich();
   test_long_sequential_chain_on_rich();

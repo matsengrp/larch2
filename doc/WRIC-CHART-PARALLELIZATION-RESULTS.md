@@ -28,7 +28,8 @@ committed. Phase-0 artifacts use the non-overwriting directory
 |---|---|---|
 | 0. Repair and freeze measurement | in progress (timing deferred) | native/oracle/runner bytes frozen and functional gates independently audited; passing calibration, capture, finalization, and seal pending |
 | 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | code checkpoint `208ce23`; focused and full RelWithDebInfo correctness/counter gates pass; canonical baseline and timing gates remain pending |
-| 2--10 | pending | may follow in plan order under the same acceptance gate |
+| 2. Remove allocations and duplicate work | implementation in progress | exact-setup reuse and allocation-free local-kernel slices started after Phase-1 checkpoint |
+| 3--10 | pending | may follow in plan order under the same acceptance gate |
 
 ## Phase 0 — immutable provenance
 

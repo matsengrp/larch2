@@ -14,6 +14,7 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -69,6 +70,31 @@ struct leaf_site_states {
   // taxon_id -> 0..3 (A,C,G,T)
   std::vector<std::uint8_t> state_by_taxon;
 };
+
+// Immutable, non-owning leaf-state input for allocation-sensitive chart
+// kernels.  The owning leaf_site_states API remains the standalone/public
+// default; callers use this view only while the backing pattern/state vector is
+// alive and immutable.
+struct leaf_site_states_view {
+  std::span<std::uint8_t const> state_by_taxon;
+};
+
+inline leaf_site_states_view view_leaf_site_states(
+    leaf_site_states const& states) noexcept {
+  return {std::span<std::uint8_t const>{states.state_by_taxon}};
+}
+
+inline leaf_site_states_view view_leaf_site_states(
+    std::vector<std::uint8_t> const& states) noexcept {
+  return {std::span<std::uint8_t const>{states}};
+}
+
+leaf_site_states_view view_leaf_site_states(leaf_site_states&&) = delete;
+leaf_site_states_view view_leaf_site_states(std::vector<std::uint8_t>&&) =
+    delete;
+leaf_site_states_view view_leaf_site_states(leaf_site_states const&&) = delete;
+leaf_site_states_view view_leaf_site_states(
+    std::vector<std::uint8_t> const&&) = delete;
 
 struct chart_options {
   bool keep_trace = false;
@@ -552,7 +578,7 @@ inline leaf_site_states extract_leaf_site_states(phylo_dag& dag,
 }
 
 inline single_site_chart build_single_site_chart(
-    clade_grammar const& grammar, leaf_site_states const& leaf_states,
+    clade_grammar const& grammar, leaf_site_states_view leaf_states,
     chart_options const& options) {
   using namespace parsimony_chart_detail;
 
@@ -721,11 +747,18 @@ inline single_site_chart build_single_site_chart(
   return chart;
 }
 
+inline single_site_chart build_single_site_chart(
+    clade_grammar const& grammar, leaf_site_states const& leaf_states,
+    chart_options const& options) {
+  return build_single_site_chart(grammar, view_leaf_site_states(leaf_states),
+                                 options);
+}
+
 // Trusted recurrence over a checked, immutable structural plan.  The plan
 // owns every ID/order/production descriptor used below, so pattern builds do
 // not rescan the grammar, sort clades, or revalidate partitions.
 inline single_site_chart build_single_site_chart(
-    chart_execution_plan const& plan, leaf_site_states const& leaf_states,
+    chart_execution_plan const& plan, leaf_site_states_view leaf_states,
     chart_options const& options) {
   using namespace parsimony_chart_detail;
   plan.assert_valid();
@@ -865,6 +898,29 @@ inline single_site_chart build_single_site_chart(
     }
   }
   return chart;
+}
+
+inline single_site_chart build_single_site_chart(
+    chart_execution_plan const& plan, leaf_site_states const& leaf_states,
+    chart_options const& options) {
+  return build_single_site_chart(plan, view_leaf_site_states(leaf_states),
+                                 options);
+}
+
+inline single_site_chart build_single_site_chart(
+    chart_execution_plan const& plan, leaf_site_states_view leaf_states,
+    bool keep_trace = false) {
+  chart_options options;
+  options.keep_trace = keep_trace;
+  return build_single_site_chart(plan, leaf_states, options);
+}
+
+inline single_site_chart build_single_site_chart(
+    clade_grammar const& grammar, leaf_site_states_view leaf_states,
+    bool keep_trace = false) {
+  chart_options options;
+  options.keep_trace = keep_trace;
+  return build_single_site_chart(grammar, leaf_states, options);
 }
 
 inline single_site_chart build_single_site_chart(

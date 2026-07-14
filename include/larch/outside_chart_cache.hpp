@@ -81,6 +81,16 @@ enum class outside_affected_policy {
   three_term_tight,
 };
 
+// Deterministic cold-build accounting.  In particular, a cache constructed
+// from a resident inside cache must report zero inside builds: this makes the
+// Phase-2B "do not rebuild unchanged inside charts" contract mechanically
+// testable without relying on timings.
+struct outside_chart_cache_build_stats {
+  std::size_t inside_charts_built = 0;
+  std::size_t inside_charts_reused = 0;
+  std::size_t outside_charts_built = 0;
+};
+
 namespace outside_chart_cache_detail {
 
 // Reuse Phase 2's merged-tip index verbatim: a single source of truth for the
@@ -332,6 +342,7 @@ struct outside_chart_cache {
   // regression to "recompute everything" is visible in both directions.
   std::size_t outside_rows_recomputed_on_commit = 0;
   std::size_t multifurcation_productions_scored = 0;
+  outside_chart_cache_build_stats build_stats;
 
   [[nodiscard]] std::array<chart_cost, nuc_state_count> const& row(
       std::size_t pattern, overlay_clade_ref ref) const {
@@ -435,6 +446,128 @@ inline std::size_t count_multifurcating_outside_productions(
   return count;
 }
 
+// Validate that `inside` is the cold, resident cache for the same immutable
+// grammar snapshot consumed by `plan`.  The checked-plan capability proves the
+// grammar/plan generation and fingerprint relationship before this helper is
+// entered; these checks complete the plan/cache pairing contract without
+// recomputing an inside recurrence.
+inline active_site_pattern_set validate_cold_inside_cache_pairing(
+    clade_grammar const& base, chart_execution_plan const& plan,
+    inside_chart_cache const& inside, chart_options const& options) {
+  if (inside.base == nullptr) {
+    throw std::runtime_error(
+        "build_outside_chart_cache: inside cache has no base grammar");
+  }
+  if (inside.base != &base) {
+    throw std::runtime_error(
+        "build_outside_chart_cache: inside cache base does not match the "
+        "checked grammar");
+  }
+  if (inside.base_execution_generation != plan.grammar_generation()) {
+    throw std::runtime_error(
+        "build_outside_chart_cache: inside cache execution generation does "
+        "not match the checked plan");
+  }
+  if (inside.base_execution_fingerprint != plan.fingerprint()) {
+    throw std::runtime_error(
+        "build_outside_chart_cache: inside cache execution fingerprint does "
+        "not match the checked plan");
+  }
+  if (inside.commit_epoch != 0 || inside.temp_clade_count != 0) {
+    throw std::runtime_error(
+        "build_outside_chart_cache: resident inside cache is not cold");
+  }
+  // Trace options are normalized away by both cold cache builders.  The UA
+  // convention is the only persisted chart option that affects validation and
+  // the outside root row, so it must agree across the paired caches.
+  if (inside.chart_opts.score_ua_edge != options.score_ua_edge) {
+    throw std::runtime_error(
+        "build_outside_chart_cache: inside/outside score_ua_edge mismatch");
+  }
+  if (inside.base_rows.size() != inside.patterns.size() ||
+      inside.temp_rows.size() != inside.patterns.size()) {
+    throw std::runtime_error(
+        "build_outside_chart_cache: inside cache pattern-row count mismatch");
+  }
+  for (std::size_t p = 0; p < inside.patterns.size(); ++p) {
+    if (inside.base_rows[p].size() != plan.clades().size()) {
+      throw std::runtime_error(
+          "build_outside_chart_cache: inside cache base-row clade count "
+          "mismatch");
+    }
+    if (!inside.temp_rows[p].empty()) {
+      throw std::runtime_error(
+          "build_outside_chart_cache: cold inside cache has temp rows");
+    }
+  }
+
+  // Reconstruct only the lightweight active-pattern wrapper needed by the
+  // existing validation boundary.  The pattern payload is moved into the
+  // result cache by the caller, so this is the sole pattern copy.  No chart
+  // rows or recurrence state are copied or rebuilt here.
+  active_site_pattern_set active;
+  active.patterns.patterns = inside.patterns;
+  active.patterns.taxon_count = plan.taxon_count();
+  active.assert_no_skipped_invariant_metadata();
+  chart_multisite_detail::validate_multisite_inputs(plan, active.patterns,
+                                                    options);
+  return active;
+}
+
+// Populate one cold outside chart directly from the resident inside rows.
+// This is the plan-based outside recurrence from
+// `build_single_site_outside_chart`, with the inside row provider bound to
+// `inside.base_rows[pattern]`.  Deliberately accepting no leaf states and
+// constructing no `single_site_chart` makes an accidental inside rebuild
+// impossible in this path.
+inline std::size_t build_cold_outside_rows_from_inside_cache(
+    chart_execution_plan const& plan, inside_chart_cache const& inside,
+    std::size_t pattern, chart_options const& options,
+    std::uint8_t reference_state,
+    std::vector<std::array<chart_cost, nuc_state_count>>& outside_rows) {
+  using namespace parsimony_chart_detail;
+
+  outside_rows.assign(plan.clades().size(), make_inf_row());
+  auto const root = plan.root_clade();
+  for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+    outside_rows[root][state] =
+        options.score_ua_edge ? static_cast<chart_cost>(plan.transition_cost(
+                                    reference_state, state))
+                              : chart_cost{0};
+  }
+
+  std::size_t multifurcation_productions_scored = 0;
+  for (auto parent : plan.top_down_order()) {
+    for (auto pid : plan.productions_for_parent(parent)) {
+      auto const& production = plan.production(pid);
+      auto const children = plan.children(pid);
+      if (!production.is_binary()) {
+        ++multifurcation_productions_scored;
+      }
+      for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+           ++parent_state) {
+        auto const parent_outside = outside_rows[parent][parent_state];
+        if (parent_outside >= chart_inf) continue;
+        auto inside_provider = [&](clade_id child) -> auto const& {
+          return inside.base_rows[pattern][child];
+        };
+        auto child_rows = chart_trim_detail::combine_production_outside_rows(
+            plan, children, parent_state, parent_outside, inside_provider);
+        for (std::size_t child_i = 0; child_i < children.size(); ++child_i) {
+          auto const child = children[child_i];
+          for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+               ++child_state) {
+            outside_rows[child][child_state] =
+                std::min(outside_rows[child][child_state],
+                         child_rows[child_i][child_state]);
+          }
+        }
+      }
+    }
+  }
+  return multifurcation_productions_scored;
+}
+
 }  // namespace outside_chart_cache_detail
 
 // Build a cold outside cache from the frozen base grammar: every active
@@ -499,6 +632,8 @@ inline outside_chart_cache build_outside_chart_cache(
         inside.multifurcation_productions_scored +
         outside.multifurcation_productions_scored;
     cache.base_rows[p].assign(outside.outside.begin(), outside.outside.end());
+    ++cache.build_stats.inside_charts_built;
+    ++cache.build_stats.outside_charts_built;
   }
   return cache;
 }
@@ -561,6 +696,56 @@ inline outside_chart_cache build_outside_chart_cache(
         inside.multifurcation_productions_scored +
         outside.multifurcation_productions_scored;
     cache.base_rows[p].assign(outside.outside.begin(), outside.outside.end());
+    ++cache.build_stats.inside_charts_built;
+    ++cache.build_stats.outside_charts_built;
+  }
+  return cache;
+}
+
+// Trusted Phase-2B cold-cache construction from a resident, compatible inside
+// cache.  Unlike the legacy builders above, this overload performs no inside
+// recurrence: each outside chart reads the already-populated inside rows.
+inline outside_chart_cache build_outside_chart_cache(
+    clade_grammar const& base, checked_chart_execution_plan_ref const& checked,
+    inside_chart_cache const& inside, chart_options options,
+    std::vector<std::uint8_t> reference_state_by_pattern = {}) {
+  checked.assert_same(base, checked.plan());
+  auto const& plan = checked.plan();
+  auto active = outside_chart_cache_detail::validate_cold_inside_cache_pairing(
+      base, plan, inside, options);
+
+  if (options.score_ua_edge) {
+    if (reference_state_by_pattern.size() != inside.patterns.size()) {
+      throw std::runtime_error(
+          "build_outside_chart_cache: score_ua_edge=true requires a reference "
+          "state per active pattern");
+    }
+    for (auto rs : reference_state_by_pattern) {
+      parsimony_chart_detail::validate_state(rs, "outside cache reference");
+    }
+  }
+
+  outside_chart_cache cache;
+  cache.base = &base;
+  cache.chart_opts = options;
+  cache.patterns = std::move(active.patterns.patterns);
+  cache.invariant_constant_offset = inside.invariant_constant_offset;
+  cache.reference_state_by_pattern = std::move(reference_state_by_pattern);
+  cache.temp_clade_count = 0;
+  cache.multifurcation_productions_scored =
+      inside.multifurcation_productions_scored;
+  cache.base_rows.resize(cache.patterns.size());
+  cache.temp_rows.resize(cache.patterns.size());
+
+  for (std::size_t p = 0; p < cache.patterns.size(); ++p) {
+    auto const reference_state = options.score_ua_edge
+                                     ? cache.reference_state_by_pattern[p]
+                                     : std::uint8_t{0};
+    cache.multifurcation_productions_scored +=
+        outside_chart_cache_detail::build_cold_outside_rows_from_inside_cache(
+            plan, inside, p, options, reference_state, cache.base_rows[p]);
+    ++cache.build_stats.inside_charts_reused;
+    ++cache.build_stats.outside_charts_built;
   }
   return cache;
 }
@@ -571,6 +756,15 @@ inline outside_chart_cache build_outside_chart_cache(
     std::vector<std::uint8_t> reference_state_by_pattern = {}) {
   auto checked = check_chart_execution_plan(base, plan);
   return build_outside_chart_cache(base, checked, active, options,
+                                   std::move(reference_state_by_pattern));
+}
+
+inline outside_chart_cache build_outside_chart_cache(
+    clade_grammar const& base, chart_execution_plan const& plan,
+    inside_chart_cache const& inside, chart_options options,
+    std::vector<std::uint8_t> reference_state_by_pattern = {}) {
+  auto checked = check_chart_execution_plan(base, plan);
+  return build_outside_chart_cache(base, checked, inside, options,
                                    std::move(reference_state_by_pattern));
 }
 

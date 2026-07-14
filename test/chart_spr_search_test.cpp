@@ -678,9 +678,22 @@ static void test_nonbinary_overlay_production_scored_locally() {
       {larch::base_clade_ref(a), larch::base_clade_ref(b),
        larch::base_clade_ref(cd)}));
 
+  auto const counters_before = state.counters;
   auto scored = larch::score_candidate_locally(state, candidate);
   CHECK(scored.valid);
   CHECK(scored.invalid_reason.empty());
+  CHECK(scored.affected_clade_count > 0);
+  auto const active_pattern_count =
+      state.active_patterns.patterns.patterns.size();
+  CHECK(active_pattern_count > 0);
+  CHECK(state.counters.local_leaf_state_view_uses ==
+        counters_before.local_leaf_state_view_uses + active_pattern_count);
+  CHECK(state.counters.local_leaf_state_owned_copies ==
+        counters_before.local_leaf_state_owned_copies);
+  CHECK(state.counters.local_row_scratch_capacity_growths ==
+        counters_before.local_row_scratch_capacity_growths + 1);
+  CHECK(state.counters.multifurcation_productions_scored >
+        counters_before.multifurcation_productions_scored);
   CHECK(state.counters.full_overlay_materializations == 0);
 
   auto delta = larch::build_spr_overlay_delta(fixture.grammar, candidate);
@@ -995,9 +1008,25 @@ static void test_pattern_batch_cache_options_match_all_cache() {
 
   auto const active_pattern_count =
       all_state.active_patterns.patterns.patterns.size();
+  for (auto const& score : all_scores) {
+    CHECK(score.valid);
+    CHECK(score.affected_clade_count > 0);
+  }
+  auto const observed_row_scratch_growths =
+      all_state.counters.local_row_scratch_capacity_growths -
+      all_counters_before.local_row_scratch_capacity_growths;
+  // reserve(n) may allocate more than n, so the number of capacity changes is
+  // deliberately observed rather than inferred from record-high row counts.
+  CHECK(observed_row_scratch_growths > 0);
+  CHECK(observed_row_scratch_growths <= subset.size());
+  auto const expected_leaf_state_views =
+      subset.size() * active_pattern_count;
+  CHECK(expected_leaf_state_views > 0);
   auto check_candidate_plan_counters =
       [&](auto const& state, auto const& before,
-          std::size_t pattern_chart_plan_hits_during_scoring) {
+          std::size_t pattern_chart_plan_hits_during_scoring,
+          std::size_t expected_leaf_views,
+          std::size_t expected_scratch_growths) {
     CHECK(state.active_patterns.patterns.patterns.size() ==
           active_pattern_count);
     CHECK(state.counters.chart_execution_plan_builds ==
@@ -1037,11 +1066,22 @@ static void test_pattern_batch_cache_options_match_all_cache() {
     CHECK(active_pattern_count >= 2);
     CHECK(state.counters.local_rows_recomputed >
           before.local_rows_recomputed);
+    CHECK(state.counters.local_leaf_state_view_uses ==
+          before.local_leaf_state_view_uses + expected_leaf_views);
+    CHECK(state.counters.local_leaf_state_owned_copies ==
+          before.local_leaf_state_owned_copies);
+    CHECK(state.counters.local_row_scratch_capacity_growths ==
+          before.local_row_scratch_capacity_growths +
+              expected_scratch_growths);
   };
-  check_candidate_plan_counters(all_state, all_counters_before, 0);
+  check_candidate_plan_counters(
+      all_state, all_counters_before, 0, expected_leaf_state_views,
+      observed_row_scratch_growths);
   check_candidate_plan_counters(batched_state, batched_counters_before,
-                                active_pattern_count);
-  check_candidate_plan_counters(lazy_state, lazy_counters_before, 0);
+                                active_pattern_count,
+                                expected_leaf_state_views,
+                                observed_row_scratch_growths);
+  check_candidate_plan_counters(lazy_state, lazy_counters_before, 0, 0, 0);
   CHECK(batched_state.counters.local_candidate_scores == subset.size());
   CHECK(batched_state.counters.pattern_batch_cache_builds >=
         batched_state.active_patterns.patterns.patterns.size());
@@ -3069,6 +3109,13 @@ static void test_phase6_multifurcation_fixed_topology_local_commit() {
   CHECK(search.counters.multifurcation_productions_scored > 0);
   CHECK(search.summary.multifurcation_productions_scored ==
         search.counters.multifurcation_productions_scored);
+  CHECK(search.summary.local_leaf_state_view_uses ==
+        search.counters.local_leaf_state_view_uses);
+  CHECK(search.summary.local_leaf_state_view_uses > 0);
+  CHECK(search.summary.local_leaf_state_owned_copies == 0);
+  CHECK(search.summary.local_row_scratch_capacity_growths ==
+        search.counters.local_row_scratch_capacity_growths);
+  CHECK(search.summary.local_row_scratch_capacity_growths > 0);
   CHECK(search.summary.final_compaction_rebuilds == 1);
   auto rebuilt = larch::build_clade_grammar(search.dag, gopts);
   CHECK(max_production_arity(rebuilt) == 3);

@@ -342,12 +342,20 @@ static void test_checked_and_plan_dense_equivalence() {
     }
     auto checked = larch::build_single_site_chart(binary, states, false);
     larch::single_site_chart planned;
+    larch::single_site_chart planned_from_view;
+    auto const* state_storage = states.state_by_taxon.data();
+    auto state_view = larch::view_leaf_site_states(states);
+    CHECK(state_view.state_by_taxon.data() == state_storage);
     {
       larch::parsimony_chart_detail::structural_work_observer_scope scope{
           &observer};
       planned = larch::build_single_site_chart(binary_plan, states, false);
+      planned_from_view =
+          larch::build_single_site_chart(binary_plan, state_view, false);
     }
     check_charts_equal(checked, planned);
+    check_charts_equal(checked, planned_from_view);
+    CHECK(states.state_by_taxon.data() == state_storage);
 
     auto checked_outside =
         larch::build_single_site_outside_chart(binary, checked);
@@ -401,12 +409,20 @@ static void test_checked_and_plan_dense_equivalence() {
     }
     auto checked = larch::build_single_site_chart(trinary, states, false);
     larch::single_site_chart planned;
+    larch::single_site_chart planned_from_view;
+    auto const* state_storage = states.state_by_taxon.data();
+    auto state_view = larch::view_leaf_site_states(states);
+    CHECK(state_view.state_by_taxon.data() == state_storage);
     {
       larch::parsimony_chart_detail::structural_work_observer_scope scope{
           &observer};
       planned = larch::build_single_site_chart(trinary_plan, states, false);
+      planned_from_view =
+          larch::build_single_site_chart(trinary_plan, state_view, false);
     }
     check_charts_equal(checked, planned);
+    check_charts_equal(checked, planned_from_view);
+    CHECK(states.state_by_taxon.data() == state_storage);
     auto checked_outside =
         larch::build_single_site_outside_chart(trinary, checked);
     larch::single_site_outside_chart planned_outside;

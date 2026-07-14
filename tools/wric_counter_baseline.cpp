@@ -220,6 +220,12 @@ int main() {
   print_counter_line("full_composite_rebuilds", c.full_composite_rebuilds);
   print_counter_line("local_candidate_scores", c.local_candidate_scores);
   print_counter_line("local_rows_recomputed", c.local_rows_recomputed);
+  print_counter_line("local_leaf_state_view_uses",
+                     c.local_leaf_state_view_uses);
+  print_counter_line("local_leaf_state_owned_copies",
+                     c.local_leaf_state_owned_copies);
+  print_counter_line("local_row_scratch_capacity_growths",
+                     c.local_row_scratch_capacity_growths);
   print_counter_line("local_score_parallel_batches",
                      c.local_score_parallel_batches);
   print_counter_line("local_score_worker_tasks", c.local_score_worker_tasks);

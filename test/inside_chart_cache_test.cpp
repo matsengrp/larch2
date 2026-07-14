@@ -408,6 +408,10 @@ static void test_plan_cold_cache_matches_checked_oracle() {
   }
   CHECK(planned.invariant_constant_offset ==
         checked.invariant_constant_offset);
+  CHECK(planned.base_execution_generation == plan.grammar_generation());
+  CHECK(planned.base_execution_fingerprint == plan.fingerprint());
+  CHECK(checked.base_execution_generation == plan.grammar_generation());
+  CHECK(checked.base_execution_fingerprint == plan.fingerprint());
   CHECK(planned.multifurcation_productions_scored ==
         checked.multifurcation_productions_scored);
   CHECK(full_validations == 0);
@@ -423,6 +427,8 @@ static void test_single_commit_on_binary_four() {
   larch::overlay_chain chain(f.grammar);
   larch::inside_chart_cache cache = larch::build_inside_chart_cache(
       f.grammar, f.active, f.options, f.invariant_offset);
+  auto const cold_generation = cache.base_execution_generation;
+  auto const cold_fingerprint = cache.base_execution_fingerprint;
 
   // Cold-cache oracle: the cache's inside chart matches from-scratch on the
   // base before any commit.
@@ -458,6 +464,8 @@ static void test_single_commit_on_binary_four() {
   }
   CHECK(committed);
   CHECK(chain.size() == 1);
+  CHECK(cache.base_execution_generation == cold_generation);
+  CHECK(cache.base_execution_fingerprint == cold_fingerprint);
 
   // Oracle after the single commit.
   assert_cache_inside_matches_from_scratch(chain, cache, "after length-1 commit");

@@ -3269,6 +3269,12 @@ static void print_chart_spr_search_counter_fields(
       << counters.local_candidate_scores << "\n";
   out << indent << "local_rows_recomputed: "
       << counters.local_rows_recomputed << "\n";
+  out << indent << "local_leaf_state_view_uses: "
+      << counters.local_leaf_state_view_uses << "\n";
+  out << indent << "local_leaf_state_owned_copies: "
+      << counters.local_leaf_state_owned_copies << "\n";
+  out << indent << "local_row_scratch_capacity_growths: "
+      << counters.local_row_scratch_capacity_growths << "\n";
   out << indent << "multifurcation_productions_scored: "
       << counters.multifurcation_productions_scored << "\n";
   out << indent << "local_score_parallel_batches: "
@@ -4115,6 +4121,12 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.local_candidates_per_second << "\n";
   out << "  local_rows_recomputed: "
       << search.summary.local_rows_recomputed << "\n";
+  out << "  local_leaf_state_view_uses: "
+      << search.summary.local_leaf_state_view_uses << "\n";
+  out << "  local_leaf_state_owned_copies: "
+      << search.summary.local_leaf_state_owned_copies << "\n";
+  out << "  local_row_scratch_capacity_growths: "
+      << search.summary.local_row_scratch_capacity_growths << "\n";
   out << "  inside_rows_recomputed_on_commit: "
       << search.summary.inside_rows_recomputed_on_commit << "\n";
   out << "  outside_rows_recomputed_on_commit: "

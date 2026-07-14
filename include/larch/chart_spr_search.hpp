@@ -88,6 +88,16 @@ struct chart_spr_search_counters {
   std::size_t full_composite_rebuilds = 0;
   std::size_t local_candidate_scores = 0;
   std::size_t local_rows_recomputed = 0;
+  // Allocation-sensitive local-kernel contract.  Every dense
+  // candidate-pattern visit borrows the resident pattern's immutable leaf
+  // states.  The owned-copy counter is a regression sentinel: production
+  // local scoring must leave it at zero, while exact candidate x pattern
+  // view-use assertions make that zero non-vacuous.  Row scratch records only
+  // explicit capacity growth, not ordinary resize/fill resets within retained
+  // capacity.
+  std::size_t local_leaf_state_view_uses = 0;
+  std::size_t local_leaf_state_owned_copies = 0;
+  std::size_t local_row_scratch_capacity_growths = 0;
   // Cross-cutting WRIC arity counter: non-binary production rows scored by dense
   // chart builds, overlay-delta local rows, and persistent cache recomputes.
   std::size_t multifurcation_productions_scored = 0;
@@ -961,6 +971,9 @@ struct chart_spr_search_summary {
   std::size_t candidates_generated = 0;
   std::size_t candidates_locally_scored = 0;
   std::size_t local_rows_recomputed = 0;
+  std::size_t local_leaf_state_view_uses = 0;
+  std::size_t local_leaf_state_owned_copies = 0;
+  std::size_t local_row_scratch_capacity_growths = 0;
   std::size_t multifurcation_productions_scored = 0;
   std::size_t candidate_batches_scored = 0;
   std::size_t pattern_batch_cache_builds = 0;
@@ -1343,7 +1356,7 @@ inline void append_active_pattern_metadata(site_pattern_set& active,
 inline pattern_chart_cache_entry build_pattern_chart_cache_entry(
     clade_grammar const& grammar, site_pattern const& pattern,
     chart_options const& chart_opts, chart_options const& chart_build_opts) {
-  leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
+  auto states = view_leaf_site_states(pattern.state_by_taxon);
   pattern_chart_cache_entry entry;
   entry.chart = build_single_site_chart(grammar, states, chart_build_opts);
   if (grammar.root_clade == no_clade ||
@@ -1370,7 +1383,7 @@ inline pattern_chart_cache_entry build_pattern_chart_cache_entry(
 inline pattern_chart_cache_entry build_pattern_chart_cache_entry(
     chart_execution_plan const& plan, site_pattern const& pattern,
     chart_options const& chart_opts, chart_options const& chart_build_opts) {
-  leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
+  auto states = view_leaf_site_states(pattern.state_by_taxon);
   pattern_chart_cache_entry entry;
   entry.chart = build_single_site_chart(plan, states, chart_build_opts);
   auto const root = plan.root_clade();
@@ -2469,8 +2482,7 @@ inline bool overlay_delta_ref_is_reachable(spr_overlay_delta const& delta,
 }
 
 inline std::array<chart_cost, nuc_state_count> overlay_delta_leaf_row(
-    taxon_id taxon,
-    leaf_site_states const& leaf_states) {
+    taxon_id taxon, leaf_site_states_view leaf_states) {
   if (taxon == chart_plan_no_taxon) {
     throw std::runtime_error(
         "chart SPR overlay-delta: missing compiled leaf taxon");
@@ -2485,6 +2497,11 @@ inline std::array<chart_cost, nuc_state_count> overlay_delta_leaf_row(
   auto row = parsimony_chart_detail::make_inf_row();
   row[observed] = 0;
   return row;
+}
+
+inline std::array<chart_cost, nuc_state_count> overlay_delta_leaf_row(
+    taxon_id taxon, leaf_site_states const& leaf_states) {
+  return overlay_delta_leaf_row(taxon, view_leaf_site_states(leaf_states));
 }
 
 inline void validate_overlay_delta_production_partition(
@@ -3260,7 +3277,7 @@ inline void accumulate_overlay_production_row(
 
 template <class RowProvider>
 inline std::array<chart_cost, nuc_state_count> recompute_overlay_delta_row(
-    spr_overlay_delta const& delta, leaf_site_states const& leaf_states,
+    spr_overlay_delta const& delta, leaf_site_states_view leaf_states,
     RowProvider const& provider,
     candidate_chart_row_descriptor const& compiled_row,
     chart_spr_search_counters* counters = nullptr) {
@@ -3287,7 +3304,7 @@ inline std::array<chart_cost, nuc_state_count> recompute_overlay_delta_row(
 inline void build_local_overlay_chart_rows_into(
     clade_grammar const& base, spr_overlay_delta const& delta,
     single_site_chart const& base_chart,
-    leaf_site_states const& leaf_states, local_overlay_chart_rows& rows,
+    leaf_site_states_view leaf_states, local_overlay_chart_rows& rows,
     chart_options const& options = {},
     bool validate_base_chart_shapes = false,
     chart_spr_search_counters* counters = nullptr) {
@@ -3319,8 +3336,14 @@ inline void build_local_overlay_chart_rows_into(
 
   rows.base_row_slot = delta.affected_base_row_slot;
   rows.temp_row_slot = delta.affected_temp_row_slot;
-  rows.rows.assign(delta.affected_order.size(),
-                   parsimony_chart_detail::make_inf_row());
+  auto const required_rows = delta.affected_order.size();
+  if (rows.rows.capacity() < required_rows) {
+    rows.rows.reserve(required_rows);
+    if (counters != nullptr) {
+      ++counters->local_row_scratch_capacity_growths;
+    }
+  }
+  rows.rows.resize(required_rows);
 
   overlay_row_provider provider{delta, base_chart, rows};
   for (std::size_t i = 0; i < delta.compiled_rows.size(); ++i) {
@@ -3329,12 +3352,24 @@ inline void build_local_overlay_chart_rows_into(
   }
 }
 
+inline void build_local_overlay_chart_rows_into(
+    clade_grammar const& base, spr_overlay_delta const& delta,
+    single_site_chart const& base_chart,
+    leaf_site_states const& leaf_states, local_overlay_chart_rows& rows,
+    chart_options const& options = {},
+    bool validate_base_chart_shapes = false,
+    chart_spr_search_counters* counters = nullptr) {
+  build_local_overlay_chart_rows_into(
+      base, delta, base_chart, view_leaf_site_states(leaf_states), rows,
+      options, validate_base_chart_shapes, counters);
+}
+
 // Legacy/direct wrapper.  Prepared production scoring uses the overload above
 // with its checked resident grammar, so its immutable descriptor carries no
 // borrowed grammar pointer.
 inline void build_local_overlay_chart_rows_into(
     spr_overlay_delta const& delta, single_site_chart const& base_chart,
-    leaf_site_states const& leaf_states, local_overlay_chart_rows& rows,
+    leaf_site_states_view leaf_states, local_overlay_chart_rows& rows,
     chart_options const& options = {},
     bool validate_base_chart_shapes = false,
     chart_spr_search_counters* counters = nullptr) {
@@ -3346,10 +3381,21 @@ inline void build_local_overlay_chart_rows_into(
       validate_base_chart_shapes, counters);
 }
 
+inline void build_local_overlay_chart_rows_into(
+    spr_overlay_delta const& delta, single_site_chart const& base_chart,
+    leaf_site_states const& leaf_states, local_overlay_chart_rows& rows,
+    chart_options const& options = {},
+    bool validate_base_chart_shapes = false,
+    chart_spr_search_counters* counters = nullptr) {
+  build_local_overlay_chart_rows_into(
+      delta, base_chart, view_leaf_site_states(leaf_states), rows, options,
+      validate_base_chart_shapes, counters);
+}
+
 inline local_overlay_chart_rows build_local_overlay_chart_rows(
     clade_grammar const& base, spr_overlay_delta const& delta,
     single_site_chart const& base_chart,
-    leaf_site_states const& leaf_states, chart_options const& options = {},
+    leaf_site_states_view leaf_states, chart_options const& options = {},
     bool validate_base_chart_shapes = false) {
   local_overlay_chart_rows rows;
   build_local_overlay_chart_rows_into(base, delta, base_chart, leaf_states,
@@ -3359,14 +3405,59 @@ inline local_overlay_chart_rows build_local_overlay_chart_rows(
 }
 
 inline local_overlay_chart_rows build_local_overlay_chart_rows(
-    spr_overlay_delta const& delta, single_site_chart const& base_chart,
+    clade_grammar const& base, spr_overlay_delta const& delta,
+    single_site_chart const& base_chart,
     leaf_site_states const& leaf_states, chart_options const& options = {},
+    bool validate_base_chart_shapes = false) {
+  return build_local_overlay_chart_rows(
+      base, delta, base_chart, view_leaf_site_states(leaf_states), options,
+      validate_base_chart_shapes);
+}
+
+inline local_overlay_chart_rows build_local_overlay_chart_rows(
+    clade_grammar const&, spr_overlay_delta&&, single_site_chart const&,
+    leaf_site_states_view, chart_options const& = {}, bool = false) = delete;
+inline local_overlay_chart_rows build_local_overlay_chart_rows(
+    clade_grammar const&, spr_overlay_delta&&, single_site_chart const&,
+    leaf_site_states const&, chart_options const& = {}, bool = false) = delete;
+inline local_overlay_chart_rows build_local_overlay_chart_rows(
+    clade_grammar const&, spr_overlay_delta const&&, single_site_chart const&,
+    leaf_site_states_view, chart_options const& = {}, bool = false) = delete;
+inline local_overlay_chart_rows build_local_overlay_chart_rows(
+    clade_grammar const&, spr_overlay_delta const&&, single_site_chart const&,
+    leaf_site_states const&, chart_options const& = {}, bool = false) = delete;
+
+inline local_overlay_chart_rows build_local_overlay_chart_rows(
+    spr_overlay_delta const& delta, single_site_chart const& base_chart,
+    leaf_site_states_view leaf_states, chart_options const& options = {},
     bool validate_base_chart_shapes = false) {
   local_overlay_chart_rows rows;
   build_local_overlay_chart_rows_into(delta, base_chart, leaf_states, rows,
                                       options, validate_base_chart_shapes);
   return rows;
 }
+
+inline local_overlay_chart_rows build_local_overlay_chart_rows(
+    spr_overlay_delta const& delta, single_site_chart const& base_chart,
+    leaf_site_states const& leaf_states, chart_options const& options = {},
+    bool validate_base_chart_shapes = false) {
+  return build_local_overlay_chart_rows(
+      delta, base_chart, view_leaf_site_states(leaf_states), options,
+      validate_base_chart_shapes);
+}
+
+inline local_overlay_chart_rows build_local_overlay_chart_rows(
+    spr_overlay_delta&&, single_site_chart const&, leaf_site_states_view,
+    chart_options const& = {}, bool = false) = delete;
+inline local_overlay_chart_rows build_local_overlay_chart_rows(
+    spr_overlay_delta&&, single_site_chart const&, leaf_site_states const&,
+    chart_options const& = {}, bool = false) = delete;
+inline local_overlay_chart_rows build_local_overlay_chart_rows(
+    spr_overlay_delta const&&, single_site_chart const&, leaf_site_states_view,
+    chart_options const& = {}, bool = false) = delete;
+inline local_overlay_chart_rows build_local_overlay_chart_rows(
+    spr_overlay_delta const&&, single_site_chart const&,
+    leaf_site_states const&, chart_options const& = {}, bool = false) = delete;
 
 inline chart_spr_candidate_score make_invalid_local_candidate_score(
     chart_spr_search_state const& state, grammar_spr_candidate const& candidate,
@@ -3389,7 +3480,7 @@ inline void verify_local_overlay_rows_against_full(
     spr_overlay_delta const& delta, local_overlay_chart_rows const& local_rows,
     single_site_chart const& base_chart,
     overlay_materialization_result const& materialized,
-    leaf_site_states const& leaf_states, chart_options options) {
+    leaf_site_states_view leaf_states, chart_options options) {
   (void)delta;
   options.keep_trace = false;
   options.max_trace_choices = 0;
@@ -3409,6 +3500,16 @@ inline void verify_local_overlay_rows_against_full(
           "full overlay chart");
     }
   }
+}
+
+inline void verify_local_overlay_rows_against_full(
+    spr_overlay_delta const& delta, local_overlay_chart_rows const& local_rows,
+    single_site_chart const& base_chart,
+    overlay_materialization_result const& materialized,
+    leaf_site_states const& leaf_states, chart_options options) {
+  verify_local_overlay_rows_against_full(
+      delta, local_rows, base_chart, materialized,
+      view_leaf_site_states(leaf_states), options);
 }
 
 inline void add_chart_spr_search_counters(
@@ -3457,6 +3558,10 @@ inline void add_chart_spr_search_counters(
   dst.full_composite_rebuilds += src.full_composite_rebuilds;
   dst.local_candidate_scores += src.local_candidate_scores;
   dst.local_rows_recomputed += src.local_rows_recomputed;
+  dst.local_leaf_state_view_uses += src.local_leaf_state_view_uses;
+  dst.local_leaf_state_owned_copies += src.local_leaf_state_owned_copies;
+  dst.local_row_scratch_capacity_growths +=
+      src.local_row_scratch_capacity_growths;
   dst.multifurcation_productions_scored +=
       src.multifurcation_productions_scored;
   dst.local_score_parallel_batches += src.local_score_parallel_batches;
@@ -3809,7 +3914,13 @@ inline void accumulate_prepared_local_candidate_patterns(
       }
       auto const& pattern = patterns[pattern_index];
       auto const& cache_entry = entries[i];
-      leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
+      // The pattern set is immutable for the whole scoring epoch.  Borrow its
+      // leaf row directly; constructing leaf_site_states here would allocate
+      // and copy once for every candidate x pattern visit.
+      auto states = view_leaf_site_states(pattern.state_by_taxon);
+      if (counters != nullptr) {
+        ++counters->local_leaf_state_view_uses;
+      }
       build_local_overlay_chart_rows_into(
           state.grammar, delta, cache_entry.chart, states, scratch.rows,
           chart_build_options, options.validate_cached_chart_shapes, counters);
@@ -4138,8 +4249,8 @@ inline void accumulate_prepared_local_candidate_lazy(
 
       lazy_overlay_row_provider provider{delta, *state.lazy_chart,
                                          context.representative, rows};
-      leaf_site_states states{
-          .state_by_taxon = patterns[context.representative].state_by_taxon};
+      auto states = view_leaf_site_states(
+          patterns[context.representative].state_by_taxon);
       for (std::size_t i = 0; i < delta.compiled_rows.size(); ++i) {
         rows.rows[i] = recompute_overlay_delta_row(
             delta, states, provider, delta.compiled_rows[i],
@@ -4346,6 +4457,10 @@ score_candidates_locally_pattern_batches(
   auto const& patterns = state.active_patterns.patterns.patterns;
   auto batch_size = std::max<std::size_t>(
       1, state.effective_pattern_batch_size);
+  // Serial pattern batches share one row buffer for the whole candidate batch.
+  // Keeping this outside the pattern loop retains the high-water capacity
+  // instead of allocating the first affected row again for every batch.
+  chart_spr_local_score_scratch serial_scratch;
   for (std::size_t begin = 0; begin < patterns.size(); begin += batch_size) {
     auto count = std::min(batch_size, patterns.size() - begin);
     auto entries = build_pattern_chart_cache_entries_for_range(state, begin,
@@ -4355,10 +4470,9 @@ score_candidates_locally_pattern_batches(
         multifurcation_productions_scored_for_entries(entries);
 
     if (worker_count <= 1) {
-      chart_spr_local_score_scratch scratch;
       for (auto& item : prepared) {
         accumulate_prepared_local_candidate_patterns(
-            state, item, begin, entries, options, &aggregate, scratch,
+            state, item, begin, entries, options, &aggregate, serial_scratch,
             checked_state);
       }
     } else {

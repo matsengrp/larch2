@@ -297,7 +297,8 @@ static std::string runtime_error_message(auto&& f) {
 
 static void check_multisite_trim_results_equal(
     larch::multisite_trim_result const& checked,
-    larch::multisite_trim_result const& planned) {
+    larch::multisite_trim_result const& planned,
+    bool compare_exact_setup_work = true) {
   CHECK(planned.optimum == checked.optimum);
   CHECK(planned.composite_lower_bound == checked.composite_lower_bound);
   CHECK(planned.initial_upper_bound == checked.initial_upper_bound);
@@ -331,6 +332,9 @@ static void check_multisite_trim_results_equal(
         checked.lazy_structural_class_count_by_clade);
   CHECK(planned.optimal_root_provenance_classes ==
         checked.optimal_root_provenance_classes);
+  if (compare_exact_setup_work) {
+    CHECK(planned.exact_setup_work == checked.exact_setup_work);
+  }
 }
 
 static larch::multisite_trim_result build_plan_trim_without_structural_work(
@@ -1726,6 +1730,221 @@ static void test_plan_multisite_trim_strict_semantic_equivalence() {
   std::println("  PASS");
 }
 
+static void test_multisite_exact_setup_cold_resident_and_lifetime() {
+  std::println("test_multisite_exact_setup_cold_resident_and_lifetime");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree1_with_invariant_spec()));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree2_with_invariant_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto plan = larch::build_chart_execution_plan(grammar);
+  larch::site_pattern_options pattern_options;
+  pattern_options.skip_invariant_sites = true;
+  auto patterns =
+      larch::build_site_patterns(merged, grammar, pattern_options);
+
+  auto const active_pattern_count = static_cast<std::size_t>(std::count_if(
+      patterns.patterns.begin(), patterns.patterns.end(),
+      [](auto const& pattern) {
+        return !larch::is_invariant_site_pattern(pattern);
+      }));
+  CHECK(active_pattern_count != 0);
+
+  for (bool score_ua_edge : {false, true}) {
+    larch::chart_options chart_options;
+    chart_options.score_ua_edge = score_ua_edge;
+
+    std::size_t expected_outside_builds = 0;
+    for (auto const& pattern : patterns.patterns) {
+      if (larch::is_invariant_site_pattern(pattern)) continue;
+      if (!score_ua_edge) {
+        ++expected_outside_builds;
+        continue;
+      }
+      expected_outside_builds += static_cast<std::size_t>(std::count_if(
+          pattern.reference_state_counts.begin(),
+          pattern.reference_state_counts.end(),
+          [](std::uint32_t count) { return count != 0; }));
+    }
+
+    auto cold_setup =
+        larch::build_multisite_exact_setup(plan, patterns, chart_options);
+    CHECK(cold_setup.work.setup_builds == 1);
+    CHECK(cold_setup.work.inside_charts_built == active_pattern_count);
+    CHECK(cold_setup.work.resident_inside_charts_consumed == 0);
+    CHECK(cold_setup.work.active_leaf_state_vectors_copied ==
+          active_pattern_count);
+    CHECK(cold_setup.work.active_leaf_states_copied ==
+          active_pattern_count * patterns.taxon_count);
+    CHECK(cold_setup.work.outside_boundary_charts_built ==
+          expected_outside_builds);
+    CHECK(cold_setup.work.upper_bound_topologies_generated ==
+          active_pattern_count + 1);
+    CHECK(cold_setup.work.upper_bound_topologies_unique != 0);
+    CHECK(cold_setup.work.upper_bound_topologies_unique <=
+          cold_setup.work.upper_bound_topologies_generated);
+    CHECK(cold_setup.work.frontier_passes == 0);
+    for (auto const& info : cold_setup.active_patterns) {
+      CHECK(info.chart.inside.empty());
+      CHECK(info.chart.optimal_choices.empty());
+    }
+
+    if (!score_ua_edge) {
+      // Shape is not identity: a same-generation structure change must be
+      // caught by the full fingerprint, and a generation change must be
+      // caught even when the full structure remains byte-for-byte equivalent.
+      auto same_shape_distinct = grammar;
+      auto reordered = std::find_if(
+          same_shape_distinct.productions_by_parent.begin(),
+          same_shape_distinct.productions_by_parent.end(),
+          [](auto const& productions) { return productions.size() > 1; });
+      CHECK(reordered != same_shape_distinct.productions_by_parent.end());
+      std::swap((*reordered)[0], (*reordered)[1]);
+      auto distinct_plan =
+          larch::build_chart_execution_plan(same_shape_distinct);
+      CHECK(distinct_plan.clades().size() == plan.clades().size());
+      CHECK(distinct_plan.productions().size() == plan.productions().size());
+      CHECK(distinct_plan.grammar_generation() == plan.grammar_generation());
+      CHECK(distinct_plan.fingerprint() != plan.fingerprint());
+      CHECK(throws_runtime_error([&] {
+        (void)larch::build_multisite_trim_from_exact_setup(
+            distinct_plan, cold_setup, chart_options);
+      }));
+      CHECK(throws_runtime_error([&] {
+        (void)larch::build_multisite_trim_from_exact_setup(
+            same_shape_distinct, cold_setup, chart_options);
+      }));
+
+      auto next_generation = grammar;
+      ++next_generation.execution_generation;
+      auto next_generation_plan =
+          larch::build_chart_execution_plan(next_generation);
+      CHECK(next_generation_plan.fingerprint() == plan.fingerprint());
+      CHECK(next_generation_plan.grammar_generation() !=
+            plan.grammar_generation());
+      CHECK(throws_runtime_error([&] {
+        (void)larch::build_multisite_trim_from_exact_setup(
+            next_generation_plan, cold_setup, chart_options);
+      }));
+      CHECK(throws_runtime_error([&] {
+        (void)larch::build_multisite_trim_from_exact_setup(
+            next_generation, cold_setup, chart_options);
+      }));
+    }
+
+    std::size_t resident_provider_calls = 0;
+    larch::multisite_exact_setup resident_setup;
+    {
+      auto local_patterns = patterns;
+      std::vector<std::optional<larch::single_site_chart>> resident_charts(
+          local_patterns.patterns.size());
+      larch::chart_options inside_options = chart_options;
+      inside_options.keep_trace = false;
+      inside_options.max_trace_choices = 0;
+      for (std::size_t pattern_index = 0;
+           pattern_index < local_patterns.patterns.size(); ++pattern_index) {
+        auto const& pattern = local_patterns.patterns[pattern_index];
+        if (larch::is_invariant_site_pattern(pattern)) continue;
+        resident_charts[pattern_index].emplace(larch::build_single_site_chart(
+            plan, larch::view_leaf_site_states(pattern.state_by_taxon),
+            inside_options));
+      }
+
+      resident_setup = larch::build_multisite_exact_setup_from_resident_inside(
+          plan, local_patterns,
+          [&](std::size_t pattern_index,
+              larch::site_pattern const&) -> larch::single_site_chart const& {
+            ++resident_provider_calls;
+            CHECK(resident_charts[pattern_index].has_value());
+            return *resident_charts[pattern_index];
+          },
+          chart_options);
+
+      // Poison and release both possible borrow sources before the setup is
+      // consumed below.  A dangling pattern/chart view would fail this test.
+      for (auto& chart : resident_charts) chart.reset();
+      resident_charts.clear();
+      resident_charts.shrink_to_fit();
+      for (auto& pattern : local_patterns.patterns) {
+        std::fill(pattern.state_by_taxon.begin(), pattern.state_by_taxon.end(),
+                  larch::no_nuc_state);
+        pattern.state_by_taxon.clear();
+        pattern.state_by_taxon.shrink_to_fit();
+      }
+      local_patterns.patterns.clear();
+      local_patterns.patterns.shrink_to_fit();
+    }
+
+    CHECK(resident_provider_calls == active_pattern_count);
+    CHECK(resident_setup.work.setup_builds == 1);
+    CHECK(resident_setup.work.inside_charts_built == 0);
+    CHECK(resident_setup.work.resident_inside_charts_consumed ==
+          active_pattern_count);
+    CHECK(resident_setup.work.active_leaf_state_vectors_copied ==
+          active_pattern_count);
+    CHECK(resident_setup.work.active_leaf_states_copied ==
+          active_pattern_count * patterns.taxon_count);
+    CHECK(resident_setup.work.outside_boundary_charts_built ==
+          expected_outside_builds);
+    CHECK(resident_setup.work.upper_bound_topologies_generated ==
+          active_pattern_count + 1);
+    CHECK(resident_setup.work.upper_bound_topologies_unique ==
+          cold_setup.work.upper_bound_topologies_unique);
+    for (auto const& info : resident_setup.active_patterns) {
+      CHECK(info.chart.inside.empty());
+      CHECK(info.chart.optimal_choices.empty());
+    }
+
+    auto brute = larch::brute_force_multisite_topologies(
+        grammar, patterns, chart_options);
+    for (auto dominance_mode :
+         {larch::multisite_dominance_mode::off,
+          larch::multisite_dominance_mode::two_pass_exact_mask}) {
+      larch::multisite_trim_options trim_options;
+      trim_options.dominance_mode = dominance_mode;
+      trim_options.capture_optimal_root_provenance = true;
+      auto const expected_frontier_passes =
+          dominance_mode ==
+                  larch::multisite_dominance_mode::two_pass_exact_mask
+              ? std::size_t{2}
+              : std::size_t{1};
+
+      auto checked = larch::build_multisite_trim(
+          grammar, patterns, chart_options, trim_options);
+      auto integrated = larch::build_multisite_trim(
+          plan, patterns, chart_options, trim_options);
+      auto cold = larch::build_multisite_trim_from_exact_setup(
+          plan, cold_setup, chart_options, trim_options);
+      auto resident = larch::build_multisite_trim_from_exact_setup(
+          plan, resident_setup, chart_options, trim_options);
+
+      check_multisite_trim_results_equal(checked, integrated);
+      check_multisite_trim_results_equal(integrated, cold);
+      check_multisite_trim_results_equal(cold, resident, false);
+      CHECK(resident.optimum == brute.optimum);
+      CHECK(resident.keep_production == brute.keep_production);
+      CHECK(resident.keep_production_exact);
+      CHECK(!resident.optimal_root_provenance_classes.empty());
+      CHECK(integrated.exact_setup_work.frontier_passes ==
+            expected_frontier_passes);
+      CHECK(cold.exact_setup_work.frontier_passes ==
+            expected_frontier_passes);
+      CHECK(resident.exact_setup_work.frontier_passes ==
+            expected_frontier_passes);
+      CHECK(cold.exact_setup_work.inside_charts_built ==
+            active_pattern_count);
+      CHECK(resident.exact_setup_work.resident_inside_charts_consumed ==
+            active_pattern_count);
+      CHECK(resident_provider_calls == active_pattern_count);
+    }
+  }
+
+  std::println("  PASS");
+}
+
 static void test_composite_reference_state_diagnostics() {
   std::println("test_composite_reference_state_diagnostics");
 
@@ -2141,6 +2360,7 @@ int main() {
   test_multisite_concordant_sites_equal_lower_bound();
   test_multisite_invariant_sites_and_reference_edge_constant();
   test_plan_multisite_trim_strict_semantic_equivalence();
+  test_multisite_exact_setup_cold_resident_and_lifetime();
   test_composite_reference_state_diagnostics();
   test_multisite_rejects_pattern_taxon_count_mismatch();
   test_multisite_equal_dedup_merges_provenance();
