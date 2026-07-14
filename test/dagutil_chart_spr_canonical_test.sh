@@ -36,15 +36,19 @@ run() {
     >"$tmp/run-$workers.out" 2>"$tmp/run-$workers.err"
 }
 
-run 1
-run 2
+workers=(1 2 4 8 16 0)
+for worker_count in "${workers[@]}"; do
+  run "$worker_count"
+done
 
 # Worker count, batching, timings, and memory/counter diagnostics are excluded
 # from the semantic bytes.  The search and external-output oracles must match
 # exactly across worker counts.
-cmp "$tmp/search-1.json" "$tmp/search-2.json"
-cmp "$tmp/search-1.ndjson" "$tmp/search-2.ndjson"
-cmp "$tmp/dag-1.json" "$tmp/dag-2.json"
+for worker_count in "${workers[@]:1}"; do
+  cmp "$tmp/search-1.json" "$tmp/search-$worker_count.json"
+  cmp "$tmp/search-1.ndjson" "$tmp/search-$worker_count.ndjson"
+  cmp "$tmp/dag-1.json" "$tmp/dag-$worker_count.json"
+done
 
 grep -q '"schema":"larch.chart_spr.semantic_digest"' "$tmp/search-1.json"
 grep -q '"schema":"larch.dag.semantic_digest"' "$tmp/dag-1.json"

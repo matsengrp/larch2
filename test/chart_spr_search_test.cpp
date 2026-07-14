@@ -2645,6 +2645,52 @@ static void test_parallel_local_scores_match_serial() {
   std::println("  PASS");
 }
 
+static void test_phase3_small_search_uses_serial_grain_and_quiesces() {
+  std::println("test_phase3_small_search_uses_serial_grain_and_quiesces");
+
+  auto const live_before =
+      larch::chart_scheduler::global_live_pool_threads();
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AAA", four_taxon_two_pattern_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::lower_bound_heuristic;
+  options.max_iterations = 1;
+  options.max_candidates_per_iteration = 64;
+  options.cache.candidate_batch_size = 64;
+  options.worker_count = 8;
+
+  auto search =
+      larch::run_chart_spr_search(std::move(dag), grammar, options);
+  auto const& scheduler = search.summary.scheduler;
+  CHECK(search.summary.candidates_locally_scored > 0);
+  CHECK(scheduler.requested_workers == 8);
+  CHECK(scheduler.resolved_workers == 8);
+  CHECK(scheduler.operations == 1);
+  CHECK(scheduler.parallel_operations == 0);
+  CHECK(scheduler.serial_fallbacks == 1);
+  CHECK(scheduler.ranges_created == 1);
+  CHECK(scheduler.ranges_completed == 1);
+  CHECK(scheduler.ranges_cancelled == 0);
+  CHECK(scheduler.minimum_effective_grain == 64);
+  CHECK(scheduler.maximum_effective_grain == 64);
+  CHECK(scheduler.last_effective_grain == 64);
+  CHECK(scheduler.active_worker_high_water == 1);
+  CHECK(scheduler.tasks_submitted == 0);
+  CHECK(scheduler.tasks_completed == 0);
+  CHECK(scheduler.tasks_joined == 0);
+  CHECK(scheduler.pool_lifetimes == 0);
+  CHECK(scheduler.pool_lifetimes_stopped == 0);
+  CHECK(scheduler.pending_tasks == 0);
+  CHECK(scheduler.pending_tasks_at_shutdown == 0);
+  CHECK(scheduler.live_pool_threads == 0);
+  CHECK(scheduler.shutdown);
+  CHECK(larch::chart_scheduler::global_live_pool_threads() == live_before);
+
+  std::println("  PASS");
+}
+
 static void test_pattern_batch_nonreplayable_uses_automatic_candidate_batch() {
   std::println(
       "test_pattern_batch_nonreplayable_uses_automatic_candidate_batch");
@@ -6057,14 +6103,21 @@ static void test_phase4_multi_worker_matches_serial() {
         larch::chart_spr_candidate_selection_mode::exhaustive_exact;
     options.max_iterations = 12;
     options.rebuild_after_accept = false;
-    options.local_score_worker_count = workers;
+    options.worker_count = workers;
+    options.cache.candidate_batch_size = 128;
+    options.semantic_capture =
+        larch::chart_spr_semantic_capture_mode::digest;
     options.verify_local_commit_two_chart_oracle_for_tests = true;
     return larch::run_chart_spr_search(std::move(fixture.dag),
                                        fixture.grammar, options);
   };
 
+  auto const live_before =
+      larch::chart_scheduler::global_live_pool_threads();
   auto serial = run_once(1);
-  auto parallel = run_once(4);
+  CHECK(larch::chart_scheduler::global_live_pool_threads() == live_before);
+  auto parallel = run_once(8);
+  CHECK(larch::chart_scheduler::global_live_pool_threads() == live_before);
 
   CHECK(serial.counters.accepted_moves == parallel.counters.accepted_moves);
   CHECK(serial.summary.final_score == parallel.summary.final_score);
@@ -6072,6 +6125,41 @@ static void test_phase4_multi_worker_matches_serial() {
   CHECK(parallel.counters.sidecar_rebuilds_after_accept == 0);
   CHECK(parallel.counters.overlay_materializations_for_accept_materialization ==
         0);
+  CHECK(serial.canonical_digest.has_value());
+  CHECK(parallel.canonical_digest.has_value());
+  CHECK(larch::emit_chart_spr_semantic_digest_json(*serial.canonical_digest) ==
+        larch::emit_chart_spr_semantic_digest_json(
+            *parallel.canonical_digest));
+  CHECK(serial.iterations.size() > 1);
+  CHECK(serial.summary.scheduler.operations > 1);
+  CHECK(parallel.summary.scheduler.operations ==
+        serial.summary.scheduler.operations);
+  CHECK(serial.summary.scheduler.requested_workers == 1);
+  CHECK(serial.summary.scheduler.resolved_workers == 1);
+  CHECK(serial.summary.scheduler.parallel_operations == 0);
+  CHECK(serial.summary.scheduler.tasks_submitted == 0);
+  CHECK(serial.summary.scheduler.pool_lifetimes == 0);
+  CHECK(serial.summary.scheduler.pool_lifetimes_stopped == 0);
+  CHECK(parallel.summary.scheduler.requested_workers == 8);
+  CHECK(parallel.summary.scheduler.resolved_workers == 8);
+  CHECK(parallel.summary.scheduler.parallel_operations > 0);
+  CHECK(parallel.summary.scheduler.pool_lifetimes == 1);
+  CHECK(parallel.summary.scheduler.pool_lifetimes_stopped == 1);
+  for (auto const* scheduler : {&serial.summary.scheduler,
+                                &parallel.summary.scheduler}) {
+    CHECK(scheduler->operations ==
+          scheduler->parallel_operations + scheduler->serial_fallbacks);
+    CHECK(scheduler->ranges_created ==
+          scheduler->ranges_completed + scheduler->ranges_cancelled);
+    CHECK(scheduler->ranges_cancelled == 0);
+    CHECK(scheduler->tasks_submitted == scheduler->tasks_completed);
+    CHECK(scheduler->tasks_submitted == scheduler->tasks_joined);
+    CHECK(scheduler->tasks_submitted == scheduler->queue_wait_samples);
+    CHECK(scheduler->pending_tasks == 0);
+    CHECK(scheduler->pending_tasks_at_shutdown == 0);
+    CHECK(scheduler->live_pool_threads == 0);
+    CHECK(scheduler->shutdown);
+  }
   // Parallel scoring actually used the workers.
   CHECK(parallel.counters.local_score_parallel_batches > 0);
 
@@ -6655,6 +6743,7 @@ static void test_phase9_transient_multi_worker_matches_serial() {
     options.max_iterations = 12;
     options.rebuild_after_accept = false;
     options.local_score_worker_count = workers;
+    options.cache.candidate_batch_size = 128;
     options.verify_local_commit_two_chart_oracle_for_tests = true;
     options.verify_transient_chain_extension_oracle_for_tests = oracle;
     return larch::run_chart_spr_search(std::move(fixture.dag),
@@ -6729,6 +6818,7 @@ int main() {
   test_lazy_cache_fixed_topology_conservative_search();
   test_lazy_cache_local_commit_updates_lazy_chart();
   test_parallel_local_scores_match_serial();
+  test_phase3_small_search_uses_serial_grain_and_quiesces();
   test_pattern_batch_nonreplayable_uses_automatic_candidate_batch();
   test_unchartable_grammar_rejected_with_empty_active_patterns();
   test_unsupported_enumeration_options_fail_explicitly();

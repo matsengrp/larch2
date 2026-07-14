@@ -1,9 +1,9 @@
 #pragma once
 
 #include <larch/chart_spr.hpp>
+#include <larch/chart_scheduler.hpp>
 #include <larch/chart_spr_semantic_report.hpp>
 #include <larch/lazy_chart.hpp>
-#include <larch/thread_pool.hpp>
 
 #include <algorithm>
 #include <array>
@@ -642,11 +642,13 @@ struct chart_spr_search_options {
   // Unified chart-search worker budget.  This is the forward-looking budget
   // for every parallel chart phase.  Phase 0 maps it to the already-parallel
   // local scorer; later phases consume the same budget without adding
-  // phase-specific CLI knobs.  Zero chooses hardware concurrency.
+  // phase-specific CLI knobs.  Zero chooses the affinity-restricted physical
+  // core count when available, then affinity logical CPUs, then the portable
+  // hardware-concurrency/serial fallback reported by chart_scheduler.
   std::size_t worker_count = 1;
 
   // Parallel local lower-bound scoring.  1 is deterministic serial scoring;
-  // 0 chooses std::thread::hardware_concurrency() for the local scoring batch.
+  // 0 chooses the same topology-aware automatic policy as worker_count.
   // Kept as a source-compatible library alias.  Command-line callers set this
   // from worker_count; direct callers that set only this field retain the
   // historical behavior.
@@ -1203,6 +1205,11 @@ struct chart_spr_search_summary {
   std::size_t requested_worker_count = 1;
   std::size_t resolved_worker_count = 1;
   std::size_t local_score_worker_count = 1;
+  // Search-lifetime orchestration metrics are kept out of the mutable search
+  // state because accepted-state rebuilds replace that state.  The scheduler
+  // is shut down before this snapshot is published, so pending tasks and live
+  // pool threads must both be zero in every returned result.
+  chart_scheduler_metrics scheduler;
   affected_clade_distribution affected_distribution;
   // Phase 10 cross-cutting surface.  These mirror the selected commit /
   // verification modes and the chain's per-accept exactness label so a run's
@@ -5127,10 +5134,10 @@ inline void score_candidate_locally_counted_into(
 
 inline std::size_t normalize_chart_spr_worker_count(
     std::size_t requested) {
-  if (requested == 0) {
-    requested = std::thread::hardware_concurrency();
-  }
-  return std::max<std::size_t>(1, requested);
+  // Keep the explicit path allocation- and probe-free.  Automatic requests
+  // share the scheduler's affinity/topology-aware resolver.
+  if (requested != 0) return requested;
+  return resolve_chart_worker_count(0).resolved_workers;
 }
 
 inline std::size_t requested_chart_spr_worker_count(
@@ -5140,6 +5147,29 @@ inline std::size_t requested_chart_spr_worker_count(
   // The CLI rejects conflicting aliases before constructing options.
   return options.worker_count != 1 ? options.worker_count
                                    : options.local_score_worker_count;
+}
+
+inline chart_scheduler_options chart_spr_search_scheduler_options(
+    std::size_t requested_workers) {
+  chart_scheduler_options scheduler_options;
+  scheduler_options.requested_workers = requested_workers;
+  // Phase 3 deliberately leaves the frozen 64-candidate case serial.  Phases
+  // 4--6 replace this orchestration-only grain with work-axis estimates.
+  scheduler_options.default_minimum_grain = 64;
+  scheduler_options.default_target_ranges_per_worker = 4;
+  return scheduler_options;
+}
+
+inline chart_scheduler_options chart_spr_compatibility_scheduler_options(
+    std::size_t requested_workers) {
+  chart_scheduler_options scheduler_options;
+  scheduler_options.requested_workers = requested_workers;
+  // Preserve direct library callers' historical eager parallel behavior and
+  // static ceil partition task count.  The production search uses the adaptive
+  // Phase-3 policy above and retains its scheduler across every batch.
+  scheduler_options.default_minimum_grain = 1;
+  scheduler_options.default_target_ranges_per_worker = 1;
+  return scheduler_options;
 }
 
 inline void maybe_force_local_score_submit_failure_for_tests(
@@ -5185,17 +5215,34 @@ inline void release_local_score_workers_for_tests(
   barrier->release.store(true, std::memory_order_release);
 }
 
-inline std::exception_ptr join_local_score_worker_futures(
-    std::vector<std::future<void>>& futures) noexcept {
-  std::exception_ptr worker_failure;
-  for (auto& future : futures) {
-    try {
-      future.get();
-    } catch (...) {
-      if (!worker_failure) worker_failure = std::current_exception();
-    }
+template <typename Operation>
+chart_scheduler_run_summary run_local_score_scheduler_operation(
+    chart_scheduler& scheduler, local_spr_score_options const& options,
+    Operation&& operation) {
+  bool const needs_hooks =
+      options.force_worker_submit_failure_after_for_tests.has_value() ||
+      options.worker_barrier_for_tests != nullptr;
+  if (!needs_hooks) return std::forward<Operation>(operation)();
+
+  chart_scheduler_test_detail::access::set_submission_hooks(
+      scheduler,
+      [&options](std::size_t successful_submissions) {
+        maybe_force_local_score_submit_failure_for_tests(
+            options, successful_submissions);
+      },
+      [&options](std::size_t successful_submissions, std::size_t,
+                 bool) noexcept {
+        release_local_score_workers_for_tests(options,
+                                              successful_submissions);
+      });
+  try {
+    auto summary = std::forward<Operation>(operation)();
+    chart_scheduler_test_detail::access::clear_submission_hooks(scheduler);
+    return summary;
+  } catch (...) {
+    chart_scheduler_test_detail::access::clear_submission_hooks(scheduler);
+    throw;
   }
-  return worker_failure;
 }
 
 inline void score_candidates_locally_all_cache_into(
@@ -5203,13 +5250,16 @@ inline void score_candidates_locally_all_cache_into(
     std::span<grammar_spr_candidate const> candidates,
     std::span<chart_spr_local_score_result> results,
     chart_spr_local_score_workspace& workspace,
-    local_spr_score_options const& options, std::size_t worker_count,
+    local_spr_score_options const& options, chart_scheduler* scheduler,
+    std::size_t worker_count,
     checked_chart_execution_plan_ref const& checked_state) {
   chart_spr_search_counters aggregate;
   if (candidates.empty()) return;
   ++aggregate.candidate_batches_scored;
 
-  if (worker_count <= 1) {
+  // The source-compatible direct W1 seam bypasses scheduler type erasure and
+  // construction so the Phase-2 warmed allocation gate remains exactly zero.
+  if (scheduler == nullptr) {
     auto& worker = local_score_workspace_access::worker(workspace, 0);
     for (std::size_t i = 0; i < candidates.size(); ++i) {
       auto start = std::chrono::steady_clock::now();
@@ -5225,44 +5275,32 @@ inline void score_candidates_locally_all_cache_into(
     return;
   }
 
-  ++aggregate.local_score_parallel_batches;
-  std::vector<std::future<void>> futures;
-  futures.reserve(worker_count);
-  thread_pool pool(worker_count);
-  auto chunk = (candidates.size() + worker_count - 1) / worker_count;
-  std::exception_ptr submit_failure;
-  for (std::size_t worker = 0; worker < worker_count; ++worker) {
-    auto begin = worker * chunk;
-    auto end = std::min(candidates.size(), begin + chunk);
-    if (begin >= end) continue;
-    try {
-      maybe_force_local_score_submit_failure_for_tests(options, futures.size());
-      futures.push_back(pool.submit([&, worker, begin, end] {
-        local_score_worker_arrive_and_wait_for_tests(options, worker);
-        auto& worker_workspace =
-            local_score_workspace_access::worker(workspace, worker);
-        for (std::size_t i = begin; i < end; ++i) {
-          auto start = std::chrono::steady_clock::now();
-          score_candidate_locally_counted_into(
-              state, candidates[i], options, &worker_workspace.counters,
-              local_score_workspace_access::prepared(workspace, worker),
-              worker_workspace.scratch, checked_state, results[i]);
-          results[i].local_score_ms =
-              std::chrono::duration<double, std::milli>(
-                  std::chrono::steady_clock::now() - start)
-                  .count();
-        }
-      }));
-      ++aggregate.local_score_worker_tasks;
-    } catch (...) {
-      submit_failure = std::current_exception();
-      break;
-    }
+  auto run = run_local_score_scheduler_operation(
+      *scheduler, options, [&] {
+        return scheduler->for_each_indexed_range(
+            candidates.size(),
+            [&](chart_indexed_range const& range, std::size_t worker,
+                chart_scheduler_cancellation_token const&) {
+              local_score_worker_arrive_and_wait_for_tests(options, worker);
+              auto& worker_workspace =
+                  local_score_workspace_access::worker(workspace, worker);
+              for (std::size_t i = range.begin; i < range.end; ++i) {
+                auto start = std::chrono::steady_clock::now();
+                score_candidate_locally_counted_into(
+                    state, candidates[i], options, &worker_workspace.counters,
+                    local_score_workspace_access::prepared(workspace, worker),
+                    worker_workspace.scratch, checked_state, results[i]);
+                results[i].local_score_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+              }
+            });
+      });
+  if (run.used_parallel_workers()) {
+    ++aggregate.local_score_parallel_batches;
+    aggregate.local_score_worker_tasks += run.worker_tasks_submitted;
   }
-  release_local_score_workers_for_tests(options, futures.size());
-  auto worker_failure = join_local_score_worker_futures(futures);
-  if (submit_failure) std::rethrow_exception(submit_failure);
-  if (worker_failure) std::rethrow_exception(worker_failure);
   for (std::size_t worker = 0; worker < worker_count; ++worker) {
     add_chart_spr_search_counters(
         aggregate,
@@ -5276,7 +5314,8 @@ inline void score_candidates_locally_pattern_batches_into(
     std::span<grammar_spr_candidate const> candidates,
     std::span<chart_spr_local_score_result> results,
     chart_spr_local_score_workspace& workspace,
-    local_spr_score_options const& options, std::size_t worker_count,
+    local_spr_score_options const& options, chart_scheduler* scheduler,
+    std::size_t worker_count,
     checked_chart_execution_plan_ref const& checked_state) {
   chart_spr_search_counters aggregate;
   if (candidates.empty()) return;
@@ -5289,12 +5328,6 @@ inline void score_candidates_locally_pattern_batches_into(
         local_score_workspace_access::prepared(workspace, i));
   }
 
-  std::optional<thread_pool> pool;
-  if (worker_count > 1) {
-    ++aggregate.local_score_parallel_batches;
-    pool.emplace(worker_count);
-  }
-
   auto const& patterns = state.active_patterns.patterns.patterns;
   auto batch_size = std::max<std::size_t>(
       1, state.effective_pattern_batch_size);
@@ -5303,6 +5336,7 @@ inline void score_candidates_locally_pattern_batches_into(
   // instead of allocating the first affected row again for every batch.
   auto& serial_scratch =
       local_score_workspace_access::serial_scratch(workspace);
+  bool used_parallel_workers = false;
   for (std::size_t begin = 0; begin < patterns.size(); begin += batch_size) {
     auto count = std::min(batch_size, patterns.size() - begin);
     auto entries = build_pattern_chart_cache_entries_for_range(state, begin,
@@ -5311,52 +5345,43 @@ inline void score_candidates_locally_pattern_batches_into(
     aggregate.multifurcation_productions_scored +=
         multifurcation_productions_scored_for_entries(entries);
 
-    if (worker_count <= 1) {
+    if (scheduler == nullptr) {
       for (std::size_t i = 0; i < candidates.size(); ++i) {
         accumulate_prepared_local_candidate_patterns(
             state, local_score_workspace_access::prepared(workspace, i), begin,
             entries, options, &aggregate, serial_scratch, checked_state);
       }
     } else {
-      std::vector<std::future<void>> futures;
-      futures.reserve(worker_count);
-      auto chunk = (candidates.size() + worker_count - 1) / worker_count;
-      std::exception_ptr submit_failure;
-      for (std::size_t worker = 0; worker < worker_count; ++worker) {
-        auto item_begin = worker * chunk;
-        auto item_end = std::min(candidates.size(), item_begin + chunk);
-        if (item_begin >= item_end) continue;
-        try {
-          maybe_force_local_score_submit_failure_for_tests(options,
-                                                           futures.size());
-          futures.push_back(pool->submit([&, worker, item_begin, item_end] {
-            local_score_worker_arrive_and_wait_for_tests(options, worker);
-            auto& worker_workspace =
-                local_score_workspace_access::worker(workspace, worker);
-            for (std::size_t i = item_begin; i < item_end; ++i) {
-              accumulate_prepared_local_candidate_patterns(
-                  state, local_score_workspace_access::prepared(workspace, i),
-                  begin, entries, options, &worker_workspace.counters,
-                  worker_workspace.scratch, checked_state);
-            }
-          }));
-          ++aggregate.local_score_worker_tasks;
-        } catch (...) {
-          submit_failure = std::current_exception();
-          break;
-        }
+      // `entries` is loop-local while the scheduler outlives the whole search.
+      // The range operation remains synchronous and joins every accepted task
+      // before a submission/worker failure can unwind and destroy the rows.
+      auto run = run_local_score_scheduler_operation(
+          *scheduler, options, [&] {
+            return scheduler->for_each_indexed_range(
+                candidates.size(),
+                [&](chart_indexed_range const& range, std::size_t worker,
+                    chart_scheduler_cancellation_token const&) {
+                  local_score_worker_arrive_and_wait_for_tests(options, worker);
+                  auto& worker_workspace =
+                      local_score_workspace_access::worker(workspace, worker);
+                  for (std::size_t i = range.begin; i < range.end; ++i) {
+                    accumulate_prepared_local_candidate_patterns(
+                        state,
+                        local_score_workspace_access::prepared(workspace, i),
+                        begin, entries, options, &worker_workspace.counters,
+                        worker_workspace.scratch, checked_state);
+                  }
+                });
+          });
+      if (run.used_parallel_workers()) {
+        used_parallel_workers = true;
+        aggregate.local_score_worker_tasks += run.worker_tasks_submitted;
       }
-      release_local_score_workers_for_tests(options, futures.size());
-      // `entries` is loop-local while the pool outlives this loop.  Join every
-      // successfully submitted task before a submission failure can unwind
-      // and destroy the cache rows captured by reference.
-      auto worker_failure = join_local_score_worker_futures(futures);
-      if (submit_failure) std::rethrow_exception(submit_failure);
-      if (worker_failure) std::rethrow_exception(worker_failure);
     }
   }
 
-  if (worker_count > 1) {
+  if (used_parallel_workers) ++aggregate.local_score_parallel_batches;
+  if (scheduler != nullptr) {
     for (std::size_t worker = 0; worker < worker_count; ++worker) {
       add_chart_spr_search_counters(
           aggregate,
@@ -5377,19 +5402,14 @@ inline void score_candidates_locally_pattern_batches_into(
   add_chart_spr_search_counters(state.counters, aggregate);
 }
 
-}  // namespace chart_spr_search_detail
-
-// Caller-owned Phase-3 scoring boundary.  The candidate and result spans are
-// borrowed only for the duration of this call; the reusable workspace is clean
-// both before entry and after every normal or exceptional exit.
-inline void score_candidates_locally_into(
+inline void score_candidates_locally_into_impl(
     chart_spr_search_state const& state,
     std::span<grammar_spr_candidate const> candidates,
     std::span<chart_spr_local_score_result> results,
     chart_spr_local_score_workspace& workspace,
-    local_spr_score_options const& options, std::size_t worker_count,
+    local_spr_score_options const& options, chart_scheduler* scheduler,
     checked_chart_execution_plan_ref const& checked_state) {
-  chart_spr_search_detail::require_completed_chart_spr_state_bootstrap(
+  require_completed_chart_spr_state_bootstrap(
       state, "chart SPR local score");
   checked_state.assert_same(state.grammar, state.execution_plan);
   if (candidates.size() != results.size()) {
@@ -5397,18 +5417,24 @@ inline void score_candidates_locally_into(
         "chart SPR local score: candidate/result span size mismatch");
   }
 
+  auto const resolved_workers =
+      scheduler == nullptr
+          ? std::size_t{1}
+          : scheduler->worker_resolution().resolved_workers;
+  // A same-scheduler nested operation inherits its outer stable slot, which
+  // can exceed this operation's range/candidate count.  Keep one workspace per
+  // resolved slot so the advertised nested fallback can never index past the
+  // scratch array.  The source-compatible worker-count wrapper caps its
+  // temporary scheduler to candidates.size(), while the persistent search is
+  // bounded by its explicit/auto worker budget.
   auto const effective_worker_count =
-      candidates.empty()
-          ? 0
-          : std::min(chart_spr_search_detail::normalize_chart_spr_worker_count(
-                         worker_count),
-                     candidates.size());
+      candidates.empty() ? 0 : resolved_workers;
   auto const resident_cache =
       state.cache_strategy == chart_spr_cache_strategy::all_active_patterns ||
       state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart;
   auto const prepared_count =
       resident_cache ? effective_worker_count : candidates.size();
-  chart_spr_search_detail::local_score_workspace_access::begin(
+  local_score_workspace_access::begin(
       workspace, prepared_count, effective_worker_count);
   try {
     for (auto& result : results) {
@@ -5419,19 +5445,100 @@ inline void score_candidates_locally_into(
       result.invalid_reason.clear();
     }
     if (resident_cache) {
-      chart_spr_search_detail::score_candidates_locally_all_cache_into(
-          state, candidates, results, workspace, options,
+      score_candidates_locally_all_cache_into(
+          state, candidates, results, workspace, options, scheduler,
           effective_worker_count, checked_state);
     } else {
-      chart_spr_search_detail::score_candidates_locally_pattern_batches_into(
-          state, candidates, results, workspace, options,
+      score_candidates_locally_pattern_batches_into(
+          state, candidates, results, workspace, options, scheduler,
           effective_worker_count, checked_state);
     }
   } catch (...) {
-    chart_spr_search_detail::local_score_workspace_access::finish(workspace);
+    local_score_workspace_access::finish(workspace);
     throw;
   }
-  chart_spr_search_detail::local_score_workspace_access::finish(workspace);
+  local_score_workspace_access::finish(workspace);
+}
+
+}  // namespace chart_spr_search_detail
+
+// Caller-owned Phase-3 scoring boundary.  The candidate and result spans are
+// borrowed only for the duration of this call; the reusable workspace is clean
+// both before entry and after every normal or exceptional exit.  Production
+// search callers pass their one search-lifetime scheduler here.
+inline void score_candidates_locally_into(
+    chart_spr_search_state const& state,
+    std::span<grammar_spr_candidate const> candidates,
+    std::span<chart_spr_local_score_result> results,
+    chart_spr_local_score_workspace& workspace,
+    local_spr_score_options const& options, chart_scheduler& scheduler,
+    checked_chart_execution_plan_ref const& checked_state) {
+  chart_spr_search_detail::score_candidates_locally_into_impl(
+      state, candidates, results, workspace, options, &scheduler,
+      checked_state);
+}
+
+// Source-compatible worker-count boundary.  Explicit W1 deliberately executes
+// the Phase-2 serial implementation directly: constructing/type-erasing a
+// temporary scheduler here would violate the warmed zero-allocation contract.
+// Other direct calls receive one temporary scheduler for this public operation;
+// the full search overload above retains one scheduler across all batches.
+inline void score_candidates_locally_into(
+    chart_spr_search_state const& state,
+    std::span<grammar_spr_candidate const> candidates,
+    std::span<chart_spr_local_score_result> results,
+    chart_spr_local_score_workspace& workspace,
+    local_spr_score_options const& options, std::size_t worker_count,
+    checked_chart_execution_plan_ref const& checked_state) {
+  if (candidates.empty() || worker_count == 1) {
+    chart_spr_search_detail::score_candidates_locally_into_impl(
+        state, candidates, results, workspace, options, nullptr,
+        checked_state);
+    return;
+  }
+  // Preserve the legacy checked boundary's exception ordering: invalid state,
+  // plan identity, or span sizes fail before scheduler allocation/thread
+  // setup.  The implementation repeats these O(1) guards after construction
+  // so scheduler-taking callers retain one self-contained checked boundary.
+  chart_spr_search_detail::require_completed_chart_spr_state_bootstrap(
+      state, "chart SPR local score");
+  checked_state.assert_same(state.grammar, state.execution_plan);
+  if (candidates.size() != results.size()) {
+    throw std::invalid_argument(
+        "chart SPR local score: candidate/result span size mismatch");
+  }
+  auto const resolved =
+      chart_spr_search_detail::normalize_chart_spr_worker_count(worker_count);
+  auto const effective = std::min(resolved, candidates.size());
+  if (effective <= 1) {
+    chart_spr_search_detail::score_candidates_locally_into_impl(
+        state, candidates, results, workspace, options, nullptr,
+        checked_state);
+    return;
+  }
+  chart_scheduler scheduler{
+      chart_spr_search_detail::chart_spr_compatibility_scheduler_options(
+          effective)};
+  score_candidates_locally_into(state, candidates, results, workspace, options,
+                                scheduler, checked_state);
+  scheduler.shutdown();
+}
+
+inline void score_candidates_locally_into(
+    chart_spr_search_state const& state,
+    std::span<grammar_spr_candidate const> candidates,
+    std::span<chart_spr_local_score_result> results,
+    chart_spr_local_score_workspace& workspace,
+    local_spr_score_options const& options, chart_scheduler& scheduler) {
+  try {
+    auto checked =
+        check_chart_execution_plan(state.grammar, state.execution_plan);
+    score_candidates_locally_into(state, candidates, results, workspace,
+                                  options, scheduler, checked);
+  } catch (chart_execution_plan_mismatch const&) {
+    ++state.counters.plan_mismatch_rejections;
+    throw;
+  }
 }
 
 inline void score_candidates_locally_into(
@@ -7069,7 +7176,8 @@ inline bool chart_spr_enumeration_replayable_without_candidate_batch(
 
 inline std::size_t chart_spr_effective_candidate_batch_size(
     chart_spr_search_state const& state,
-    chart_spr_search_options const& options) {
+    chart_spr_search_options const& options,
+    std::size_t already_resolved_workers = 0) {
   if (options.candidate_selection ==
       chart_spr_candidate_selection_mode::lower_bound_first_improvement) {
     return 1;
@@ -7077,8 +7185,11 @@ inline std::size_t chart_spr_effective_candidate_batch_size(
   if (options.cache.candidate_batch_size != 0) {
     return std::max<std::size_t>(1, options.cache.candidate_batch_size);
   }
-  auto workers = chart_spr_search_detail::normalize_chart_spr_worker_count(
-      chart_spr_search_detail::requested_chart_spr_worker_count(options));
+  auto workers = already_resolved_workers;
+  if (workers == 0) {
+    workers = chart_spr_search_detail::normalize_chart_spr_worker_count(
+        chart_spr_search_detail::requested_chart_spr_worker_count(options));
+  }
   if (state.cache_strategy == chart_spr_cache_strategy::pattern_batches) {
     return std::max<std::size_t>(1, workers * 4);
   }
@@ -7273,7 +7384,8 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     chart_spr_search_state const& state, chart_spr_search_options options,
     std::size_t iteration,
     chart_spr_search_detail::chart_spr_acceptance_iteration_workspace&
-        workspace) {
+        workspace,
+    chart_scheduler& scheduler) {
   workspace.begin_iteration();
   validate_supported_chart_cache_options(options.cache);
   auto checked_state = [&] {
@@ -7334,10 +7446,9 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   }
   std::vector<std::size_t> affected_counts;
 
-  auto worker_count = chart_spr_search_detail::normalize_chart_spr_worker_count(
-      chart_spr_search_detail::requested_chart_spr_worker_count(options));
+  auto const worker_count = scheduler.worker_resolution().resolved_workers;
   auto candidate_batch_size = chart_spr_effective_candidate_batch_size(
-      state, options);
+      state, options, worker_count);
   workspace.reserve_batch(candidate_batch_size);
   state.effective_candidate_batch_size = candidate_batch_size;
   validate_chart_spr_pattern_batch_replay_strategy(
@@ -7356,7 +7467,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     auto local_start = std::chrono::steady_clock::now();
     score_candidates_locally_into(state, candidate_batch, local_results,
                                   workspace.local_score, local_options,
-                                  worker_count, checked_state);
+                                  scheduler, checked_state);
     result.local_scoring_ms += std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() -
                                    local_start)
@@ -7590,6 +7701,22 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     state.counters.rejected_moves +=
         result.candidates_scored - (result.accepted ? 1U : 0U);
   }
+  return result;
+}
+
+inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
+    chart_spr_search_state const& state, chart_spr_search_options options,
+    std::size_t iteration,
+    chart_spr_search_detail::chart_spr_acceptance_iteration_workspace&
+        workspace) {
+  auto const requested =
+      chart_spr_search_detail::requested_chart_spr_worker_count(options);
+  chart_scheduler scheduler{
+      chart_spr_search_detail::chart_spr_compatibility_scheduler_options(
+          requested)};
+  auto result = run_chart_spr_acceptance_iteration(
+      state, std::move(options), iteration, workspace, scheduler);
+  scheduler.shutdown();
   return result;
 }
 

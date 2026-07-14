@@ -3697,6 +3697,11 @@ chart_spr_search_result run_chart_spr_search(
   validate_chart_spr_search_loop_options(options);
 
   auto total_start = std::chrono::steady_clock::now();
+  auto const requested_workers =
+      chart_spr_search_detail::requested_chart_spr_worker_count(options);
+  chart_scheduler scheduler{
+      chart_spr_search_detail::chart_spr_search_scheduler_options(
+          requested_workers)};
   chart_spr_search_result result;
   result.dag = std::move(initial_dag);
   result.summary.acceptance_mode = options.acceptance_mode;
@@ -3809,11 +3814,9 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.cache_strategy = state.cache_strategy;
   result.summary.effective_pattern_batch_size =
       state.effective_pattern_batch_size;
-  result.summary.requested_worker_count =
-      chart_spr_search_detail::requested_chart_spr_worker_count(options);
+  result.summary.requested_worker_count = requested_workers;
   result.summary.resolved_worker_count =
-      chart_spr_search_detail::normalize_chart_spr_worker_count(
-          result.summary.requested_worker_count);
+      scheduler.worker_resolution().resolved_workers;
   result.summary.local_score_worker_count =
       result.summary.resolved_worker_count;
   chart_spr_refresh_search_summary_from_current_lazy_chart(result.summary,
@@ -3981,7 +3984,7 @@ chart_spr_search_result run_chart_spr_search(
     iteration_options.seed = iteration_seed;
     iteration_options.enumeration.seed = iteration_seed;
     auto iteration = run_chart_spr_acceptance_iteration(
-        state, iteration_options, iter, acceptance_workspace);
+        state, iteration_options, iter, acceptance_workspace, scheduler);
     result.summary.candidates_generated += iteration.candidates_generated;
     result.summary.candidate_generation_ms +=
         iteration.candidate_generation_ms;
@@ -4310,6 +4313,34 @@ chart_spr_search_result run_chart_spr_search(
         result.canonical_report->chain_entries.push_back(std::move(entry));
       }
     }
+  }
+
+  // The scheduler is a search-lifetime resource, but returned results must own
+  // no live worker threads or pending work.  Explicit shutdown also makes its
+  // complete lifecycle observable and keeps shutdown time inside total_ms.
+  scheduler.shutdown();
+  result.summary.scheduler = scheduler.metrics();
+  auto const& scheduler_metrics = result.summary.scheduler;
+  if (scheduler_metrics.requested_workers !=
+          result.summary.requested_worker_count ||
+      scheduler_metrics.resolved_workers !=
+          result.summary.resolved_worker_count ||
+      scheduler_metrics.operations != scheduler_metrics.parallel_operations +
+                                          scheduler_metrics.serial_fallbacks ||
+      scheduler_metrics.ranges_created !=
+          scheduler_metrics.ranges_completed +
+              scheduler_metrics.ranges_cancelled ||
+      scheduler_metrics.tasks_submitted != scheduler_metrics.tasks_completed ||
+      scheduler_metrics.tasks_submitted != scheduler_metrics.tasks_joined ||
+      scheduler_metrics.pending_tasks != 0 ||
+      scheduler_metrics.pending_tasks_at_shutdown != 0 ||
+      scheduler_metrics.live_pool_threads != 0 ||
+      scheduler_metrics.pool_lifetimes > 1 ||
+      scheduler_metrics.pool_lifetimes !=
+          scheduler_metrics.pool_lifetimes_stopped ||
+      !scheduler_metrics.shutdown) {
+    throw std::logic_error(
+        "chart SPR search: scheduler returned incomplete shutdown metrics");
   }
 
   result.counters = state.counters;

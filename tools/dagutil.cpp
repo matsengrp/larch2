@@ -1325,7 +1325,9 @@ Analysis:
                           grammar (default), sampled-tree, or hybrid
   --chart-spr-workers <N>
                           Unified chart-search worker budget (default 1; 0
-                          chooses hardware concurrency)
+                          chooses affinity-restricted physical cores when
+                          available, then affinity logical CPUs, hardware
+                          concurrency, or the serial portable fallback)
   --chart-spr-local-score-workers <N>
                           Compatibility alias for --chart-spr-workers; the two
                           options may not be supplied together
@@ -4069,6 +4071,58 @@ static void run_chart_spr_search_diagnostic(
   out << "\n";
   out << "  local_score_workers: "
       << search.summary.local_score_worker_count << "\n";
+  auto const& scheduler = search.summary.scheduler;
+  out << "  chart_worker_resolution_policy: "
+      << chart_worker_resolution_policy_name(scheduler.worker_policy) << "\n";
+  out << "  chart_workers_actually_active_high_water: "
+      << scheduler.active_worker_high_water << "\n";
+  out << "  chart_scheduler_operations: " << scheduler.operations << "\n";
+  out << "  chart_scheduler_parallel_operations: "
+      << scheduler.parallel_operations << "\n";
+  out << "  chart_scheduler_ranges_created: "
+      << scheduler.ranges_created << "\n";
+  out << "  chart_scheduler_ranges_completed: "
+      << scheduler.ranges_completed << "\n";
+  out << "  chart_scheduler_ranges_cancelled: "
+      << scheduler.ranges_cancelled << "\n";
+  out << "  chart_scheduler_tasks_submitted: "
+      << scheduler.tasks_submitted << "\n";
+  out << "  chart_scheduler_tasks_completed: "
+      << scheduler.tasks_completed << "\n";
+  out << "  chart_scheduler_tasks_joined: "
+      << scheduler.tasks_joined << "\n";
+  out << "  chart_scheduler_pending_tasks: "
+      << scheduler.pending_tasks << "\n";
+  out << "  chart_scheduler_pending_tasks_at_shutdown: "
+      << scheduler.pending_tasks_at_shutdown << "\n";
+  out << "  chart_scheduler_minimum_effective_grain: "
+      << scheduler.minimum_effective_grain << "\n";
+  out << "  chart_scheduler_maximum_effective_grain: "
+      << scheduler.maximum_effective_grain << "\n";
+  out << "  chart_scheduler_last_effective_grain: "
+      << scheduler.last_effective_grain << "\n";
+  out << "  chart_scheduler_queue_wait_nanoseconds: "
+      << scheduler.queue_wait_nanoseconds << "\n";
+  out << "  chart_scheduler_queue_wait_nanoseconds_max: "
+      << scheduler.queue_wait_nanoseconds_max << "\n";
+  out << "  chart_scheduler_queue_wait_samples: "
+      << scheduler.queue_wait_samples << "\n";
+  out << "  chart_scheduler_last_active_workers: "
+      << scheduler.last_active_workers << "\n";
+  out << "  chart_scheduler_serial_fallbacks: "
+      << scheduler.serial_fallbacks << "\n";
+  out << "  chart_scheduler_nested_serial_fallbacks: "
+      << scheduler.nested_serial_fallbacks << "\n";
+  out << "  chart_scheduler_rejected_concurrent_operations: "
+      << scheduler.rejected_concurrent_operations << "\n";
+  out << "  chart_scheduler_pool_lifetimes: "
+      << scheduler.pool_lifetimes << "\n";
+  out << "  chart_scheduler_pool_lifetimes_stopped: "
+      << scheduler.pool_lifetimes_stopped << "\n";
+  out << "  chart_scheduler_live_pool_threads: "
+      << scheduler.live_pool_threads << "\n";
+  out << "  chart_scheduler_shutdown: "
+      << (scheduler.shutdown ? "true" : "false") << "\n";
   bool const search_used_lazy_chart =
       search.summary.cache_strategy ==
       chart_spr_cache_strategy::lazy_multisite_chart;

@@ -121,12 +121,101 @@ require_nonnegative_integer() {
   fi
 }
 
+require_scheduler_contract() {
+  local file=$1
+  local key
+  for key in chart_workers_actually_active_high_water \
+             chart_scheduler_operations \
+             chart_scheduler_parallel_operations \
+             chart_scheduler_ranges_created \
+             chart_scheduler_ranges_completed \
+             chart_scheduler_ranges_cancelled \
+             chart_scheduler_tasks_submitted \
+             chart_scheduler_tasks_completed \
+             chart_scheduler_tasks_joined \
+             chart_scheduler_pending_tasks \
+             chart_scheduler_pending_tasks_at_shutdown \
+             chart_scheduler_minimum_effective_grain \
+             chart_scheduler_maximum_effective_grain \
+             chart_scheduler_last_effective_grain \
+             chart_scheduler_queue_wait_nanoseconds \
+             chart_scheduler_queue_wait_nanoseconds_max \
+             chart_scheduler_queue_wait_samples \
+             chart_scheduler_last_active_workers \
+             chart_scheduler_serial_fallbacks \
+             chart_scheduler_nested_serial_fallbacks \
+             chart_scheduler_rejected_concurrent_operations \
+             chart_scheduler_pool_lifetimes \
+             chart_scheduler_pool_lifetimes_stopped \
+             chart_scheduler_live_pool_threads; do
+    require_nonnegative_integer "$file" "$key"
+  done
+
+  local operations parallel serial
+  local ranges completed cancelled
+  local submitted tasks_completed joined wait_samples
+  local wait_total wait_max
+  local pools stopped
+  local minimum_grain maximum_grain last_grain
+  operations=$(top_value "$file" chart_scheduler_operations)
+  parallel=$(top_value "$file" chart_scheduler_parallel_operations)
+  serial=$(top_value "$file" chart_scheduler_serial_fallbacks)
+  ranges=$(top_value "$file" chart_scheduler_ranges_created)
+  completed=$(top_value "$file" chart_scheduler_ranges_completed)
+  cancelled=$(top_value "$file" chart_scheduler_ranges_cancelled)
+  submitted=$(top_value "$file" chart_scheduler_tasks_submitted)
+  tasks_completed=$(top_value "$file" chart_scheduler_tasks_completed)
+  joined=$(top_value "$file" chart_scheduler_tasks_joined)
+  wait_samples=$(top_value "$file" chart_scheduler_queue_wait_samples)
+  wait_total=$(top_value "$file" chart_scheduler_queue_wait_nanoseconds)
+  wait_max=$(top_value "$file" chart_scheduler_queue_wait_nanoseconds_max)
+  pools=$(top_value "$file" chart_scheduler_pool_lifetimes)
+  stopped=$(top_value "$file" chart_scheduler_pool_lifetimes_stopped)
+  minimum_grain=$(top_value "$file" chart_scheduler_minimum_effective_grain)
+  maximum_grain=$(top_value "$file" chart_scheduler_maximum_effective_grain)
+  last_grain=$(top_value "$file" chart_scheduler_last_effective_grain)
+
+  if (( operations != parallel + serial )); then
+    echo "scheduler operation accounting mismatch in $file" >&2
+    return 1
+  fi
+  if (( ranges != completed + cancelled )); then
+    echo "scheduler range accounting mismatch in $file" >&2
+    return 1
+  fi
+  if (( submitted != tasks_completed || submitted != joined ||
+        submitted != wait_samples )); then
+    echo "scheduler task accounting mismatch in $file" >&2
+    return 1
+  fi
+  if (( wait_total < wait_max )); then
+    echo "scheduler queue-wait accounting mismatch in $file" >&2
+    return 1
+  fi
+  if (( pools != stopped )); then
+    echo "scheduler pool lifetime mismatch in $file" >&2
+    return 1
+  fi
+  if (( ranges > 0 &&
+        (minimum_grain == 0 || minimum_grain > last_grain ||
+         last_grain > maximum_grain) )); then
+    echo "scheduler grain accounting mismatch in $file" >&2
+    return 1
+  fi
+  require_top_value "$file" chart_scheduler_pending_tasks 0
+  require_top_value "$file" chart_scheduler_pending_tasks_at_shutdown 0
+  require_top_value "$file" chart_scheduler_live_pool_threads 0
+  require_top_value "$file" chart_scheduler_shutdown true
+}
+
 default_out=$tmp/default.out
 run_search default
 require_top_value "$default_out" chart_workers_requested 1
 require_top_value "$default_out" chart_workers_resolved 1
 require_top_value "$default_out" chart_worker_policy default_serial
 require_top_value "$default_out" local_score_workers 1
+require_top_value "$default_out" chart_worker_resolution_policy explicit
+require_scheduler_contract "$default_out"
 
 # Every workload-defining manifest field is repeated by the real product
 # report.  These checks complement the synthetic manifest test: a fake CLI
@@ -188,6 +277,8 @@ require_top_value "$unified_out" chart_workers_requested 2
 require_top_value "$unified_out" chart_workers_resolved 2
 require_top_value "$unified_out" chart_worker_policy explicit
 require_top_value "$unified_out" local_score_workers 2
+require_top_value "$unified_out" chart_worker_resolution_policy explicit
+require_scheduler_contract "$unified_out"
 
 # The old local-score option remains a labelled compatibility alias.
 legacy_out=$tmp/legacy.out
@@ -196,6 +287,8 @@ require_top_value "$legacy_out" chart_workers_requested 2
 require_top_value "$legacy_out" chart_workers_resolved 2
 require_top_value "$legacy_out" chart_worker_policy legacy_explicit
 require_top_value "$legacy_out" local_score_workers 2
+require_top_value "$legacy_out" chart_worker_resolution_policy explicit
+require_scheduler_contract "$legacy_out"
 
 # Numeric zero means automatic resolution, and the resolved value is both
 # positive and the budget seen by the currently parallel local-score phase.
@@ -209,6 +302,16 @@ if [[ ! $auto_resolved =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 require_top_value "$auto_out" local_score_workers "$auto_resolved"
+auto_resolution_policy=$(top_value "$auto_out" chart_worker_resolution_policy)
+case "$auto_resolution_policy" in
+  affinity_physical_cores|affinity_logical_cpus|hardware_concurrency|serial_fallback)
+    ;;
+  *)
+    echo "unexpected automatic chart worker resolution policy: '$auto_resolution_policy'" >&2
+    exit 1
+    ;;
+esac
+require_scheduler_contract "$auto_out"
 
 # Supplying both spellings is never silently order-dependent.
 set +e

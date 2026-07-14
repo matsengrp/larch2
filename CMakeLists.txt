@@ -104,7 +104,9 @@ endif()
 
 # --- Library ------------------------------------------------------------------
 
-add_library(larch src/protobuf.cpp src/protobuf_encode.cpp src/pickle_reader.cpp src/chart_spr_search.cpp src/chart_bnb_trim_apply.cpp)
+add_library(larch src/protobuf.cpp src/protobuf_encode.cpp src/pickle_reader.cpp
+                  src/chart_scheduler.cpp src/chart_spr_search.cpp
+                  src/chart_bnb_trim_apply.cpp)
 target_include_directories(larch PUBLIC include ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(larch PUBLIC ZLIB::ZLIB Threads::Threads)
 
@@ -1142,6 +1144,7 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   inplace_spr_test wric_phase0_test clade_grammar_test
                   polytomy_refinement_test parsimony_chart_test
                   chart_parallel_test
+                  chart_scheduler_test
                   site_patterns_test chart_trim_test chart_bnb_trim_apply_test
                   chart_spr_test chart_spr_search_test plateau_test
                   rank3_rewrite_test chart_two_chart_oracle_test
@@ -1154,6 +1157,7 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
     add_test(NAME ${test_name} COMMAND ${test_name}
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()
+set_tests_properties(chart_scheduler_test PROPERTIES TIMEOUT 30)
 
 # Phase-2A test-only global allocation observer and dense local-score gate.
 # The replacement operators are linked only into this dedicated executable;
