@@ -28,7 +28,7 @@ committed. Phase-0 artifacts use the non-overwriting directory
 |---|---|---|
 | 0. Repair and freeze measurement | in progress (timing deferred) | native/oracle/runner bytes frozen and functional gates independently audited; passing calibration, capture, finalization, and seal pending |
 | 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | code checkpoint `208ce23`; focused and full RelWithDebInfo correctness/counter gates pass; canonical baseline and timing gates remain pending |
-| 2. Remove allocations and duplicate work | implementation in progress | exact-setup reuse and allocation-free local-kernel slices started after Phase-1 checkpoint |
+| 2. Remove allocations and duplicate work | implementation in progress | three reuse/kernel checkpoints pass focused gates; caller-owned scoring workspace, scoped allocation gate, full CTest, ASAN, and Phase-0-relative acceptance remain |
 | 3--10 | pending | may follow in plan order under the same acceptance gate |
 
 ## Phase 0 — immutable provenance
@@ -747,6 +747,90 @@ pattern charts were created. A non-vacuous upper-bound topology-deduplication
 witness, the 80% allocation comparison, timing/RSS gates, targeted ASAN, full
 CTest, and deferred Phase-0-relative acceptance remain pending. No timing from
 this busy-host checkpoint is acceptance evidence.
+
+### Phase 2 — recurrence-ownership and unit-Fitch checkpoint
+
+Checkpoint `a6d3c02` (`Reuse resident charts across local exact setup`) records
+the third bounded Phase-2 wave. The worktree was clean immediately after the
+commit. This is not the Phase-2 exit point.
+
+The checkpoint closes the remaining profile-supported duplicate-recurrence
+work:
+
+- a production local-row kernel uses the all-parent-state unit-Fitch
+  recurrence directly, retaining generic provider order and saturated-cost
+  behavior and reporting every fast-path production;
+- all-active local-commit initialization projects the already-resident state
+  charts into its persistent inside cache, while the lazy representation
+  projects its resident class rows, so neither path repeats an unchanged dense
+  recurrence;
+- pattern-batch local-commit initialization defers its initial composite until
+  the persistent inside cache has built the one authoritative chart per active
+  pattern, then exposes those rows through an owning exact-setup provider;
+- conservative pattern-batch exact initialization lets its one cold exact
+  setup own the initial composite rather than first scanning and discarding an
+  equivalent set of batches;
+- initial-state, persistent-inside-cache, and exact-setup chart ownership have
+  disjoint build/reuse counters. Before candidate verification begins, local
+  orchestration asserts that the three recurrence owners sum to exactly the
+  active-pattern count; and
+- resident-cache compatibility includes the full active-pattern identity,
+  distinct frozen destination support, lifetime/mutation rejection, and a
+  fail-closed deferred-bootstrap boundary. Outside-cache construction reports
+  only the recurrence it actually executes rather than inheriting historical
+  inside work.
+
+The earlier dense Callgrind profile under
+`build/wric-chart-parallelization/phase2-profile-a7b810b/` attributed 50.20%
+of sampled local-scoring work to the recurrence and 87.5% to
+candidate-by-pattern accumulation. That evidence motivated the all-state
+unit-Fitch specialization. Equality-key replacement was not applied to this
+dense kernel: the same profile did not identify a material dense/local
+equality-key hotspot; lazy structural keys remain Phase 7 work and exact
+frontier/provenance keys remain Phase 5 work. The scoped allocation profile is
+repeated after the caller-owned workspace lands, and this decision must be
+revisited if a key path becomes material there.
+
+The exact-setup upper-bound deduplication test is non-vacuous: it generates
+three starting topologies, proves that only two are unique, and checks the
+same optimum/keep result for cold and resident setup with and without the UA
+edge convention. Exhaustive, boundary, randomized, and provider-order tests
+cover the unit-Fitch helper. Binary and multifurcating resident-cache tests
+cover destination ownership, source destruction, same-shape mutation, stale
+generation/fingerprint, and active-pattern mismatch.
+
+The coordinated RelWithDebInfo build used:
+
+```text
+cmake --build build --parallel 4 --target parsimony_chart_test \
+  chart_trim_test inside_chart_cache_test outside_chart_cache_test \
+  chart_spr_search_test chart_spr_phase10_test dagutil \
+  wric_counter_baseline_compile_check
+```
+
+After a token-preserving cleanup of accidental whole-file formatter churn,
+`git clang-format --diff HEAD` and `git diff --check` were clean. The final
+focused command covered the recurrence, trim, inside/outside cache, search,
+Phase-10 counter surface, semantic report, and CLI local-commit report:
+
+```text
+ctest --test-dir build --output-on-failure \
+  -R '^(parsimony_chart_test|chart_trim_test|inside_chart_cache_test|outside_chart_cache_test|chart_spr_search_test|chart_spr_phase10_test|chart_parallel_test|chart_spr_semantic_report_test|dagutil_chart_spr_search_local_commit_report)$'
+```
+
+It passed 9/9 in 37.17 seconds. The copied log is
+`build/wric-chart-parallelization/phase2-wave3-20260714-a6d3c02/focused-wave3.LastTest.log`;
+its SHA-256 is
+`b2c632f66de667768fb39d40e03dc95d87c0f4916ddc51c535d135de1c8da6df`.
+
+A strict post-checkpoint audit keeps Phase 2 open. The public scorer still
+returns an owning vector, candidate preparation still constructs fresh
+descriptors, and default one-candidate acceptance batches do not retain a
+search-lifetime workspace. The real 1,000-score allocation gate, integrated
+all-active/lazy one-build relationships, local-provider negative identity
+tests, current full CTest, targeted ASAN, and every Phase-0-relative
+allocation/timing/RSS/canonical gate remain pending. No busy-host timing is
+acceptance evidence.
 
 ## Later-phase evidence template
 
