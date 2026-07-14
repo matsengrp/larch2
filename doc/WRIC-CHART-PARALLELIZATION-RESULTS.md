@@ -31,8 +31,9 @@ committed. Phase-0 artifacts use the non-overwriting directory
 | 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | code checkpoint `0c4623b`; same-profiler allocation reduction, warmed-zero allocation, frozen semantic/counter, focused/full RelWithDebInfo, and targeted ASAN gates pass; serial timing, exact-small timing, RSS, and sealed canonical comparison remain pending |
 | 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | code checkpoint `7d294d6`; scheduler contract, canonical worker matrix, full RelWithDebInfo, and targeted TSan gates pass; small-case timing remains pending |
 | 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | code checkpoint `cbf92b6` and evidence checkpoint `1be6ffe`; full RelWithDebInfo and targeted TSan gates pass; sealed scaling/RSS gates pending |
-| 5. Parallelize a single exact B&B | implementation in progress | dependency wavefront and proven-single-topology setup exceed same-revision scaling targets diagnostically; measured-0% heavy split omitted; post-omission correctness, sanitizer, and final evidence pending |
-| 6--10 | pending | may follow in plan order under the same acceptance gate |
+| 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass post-omission semantics, full CTest, and targeted TSAN; diagnostic exact-phase scaling exceeds 2x; unified frontier/candidate admission and sealed timing/RSS remain pending |
+| 6. Parallelize exact top-K candidates | in progress | unified exact-memory admission and stable candidate-parallel execution are the next dependency |
+| 7--10 | pending | may follow in plan order under the same acceptance gate |
 
 ## Phase 0 — immutable provenance
 
@@ -1242,6 +1243,102 @@ established feasible topology; across current and candidate trims the search
 report therefore records two setup operations and two topology candidates.
 Focused correctness, full-suite, sanitizer, final same-revision measurement,
 and RSS gates remain pending on the post-omission tree.
+
+## Phase 5 post-omission checkpoint (functional pass; timing diagnostic)
+
+Checkpoint `bb29300` (`Parallelize exact chart B&B wavefronts`) is the
+post-omission product implementation. Commit `3a10e9c` fixes the benchmark
+reader exposed by per-level diagnostics: `extract_value` now selects its first
+match in one `sed` process, rather than allowing a multi-match producer to
+receive SIGPIPE through `head` under `pipefail`. The product binary is
+unchanged by that follow-up. Frozen Phase-0 executables, workloads, validation,
+candidate/exact budgets, and the `Baseline measure` checkpoint remain
+unchanged.
+
+The exact path now uses dependency-level clade wavefronts, stable per-clade
+slots, coordinator-ordered folding, delayed mask/provenance materialization,
+and deterministic equality merging. Exact setup consumes the existing
+pattern-parallel builder. A root-reachable structural proof selects the
+single-topology setup fast path only when every reachable internal clade has
+exactly one valid binary production. Primary exact trims retain canonical root
+provenance directly, so semantic capture no longer launches a companion B&B.
+Arithmetic overflow, scheduler failures, allocation failures, provenance
+capture failures, and invariant failures remain hard errors through cold,
+transient, and accepted-state rebuild boundaries.
+
+The focused post-omission command passed 11/11. It covers the W1/W8 matrix for
+every dominance mode, bound pruning on/off, and UA scoring on/off; dependency
+publication, real overlap, partial submission, full join, stable failure, and
+scheduler reuse; unique-topology and deterministic traceback oracles;
+cold/transient overflow propagation; canonical capture; dense/lazy standalone
+contracts; and exact-counter/report reconciliation. Its log is
+`build/wric-chart-parallelization/phase5-3a10e9c/focused.ctest.log`, SHA-256
+`074b100cc78e5ca76a467ddaf0ac9cdd8bb950e40e7b01cce166fe4a0e64619b`.
+
+The complete RelWithDebInfo rerun passed all 161 registered tests in 69.43
+seconds, with only the established optional `merge_consistency_test` and
+`rotaA_diagnostic_test` skips. The log SHA-256 is
+`6b1f6963fbd2ae7f8c64c8055fb4979235842e1e7ef56e5f194e191b174318c0`.
+The first full run found the benchmark-reader SIGPIPE above; its failure was
+reproduced in isolation, corrected without changing the product, and the full
+suite was rerun from the beginning.
+
+The GCC-trunk targeted TSan build ran `chart_scheduler_test`,
+`chart_parallel_test`, `chart_trim_test`, and `chart_spr_search_test` serially
+under `TSAN_OPTIONS=halt_on_error=1`. All 4/4 passed with no race report. The
+preserved runtime SHA-256 remains
+`58725dae226e91ea96bebbdf54f84820638404a691528570ec1dab595ed08842`;
+the test-log SHA-256 is
+`7a88ec8d79833ab3d8dbc538845e4faed08e4fe54faa82eef2ef7e269c204038`.
+
+An untimed explicit-W1/explicit-W8 semantic run produced byte-identical digest
+JSON, full NDJSON, output protobuf validation, and external canonical-DAG JSON.
+The common semantic SHA-256 is
+`efa7b4541180d7b0242392045834c72e650b5fcfba00671f5a0c95ae0a209257`;
+the exact-evidence SHA-256 is
+`a5772604932e235ed71fc40b5dfb6798518f77ffc0b4078edd4daee975194fc6`;
+the final-topology SHA-256 is
+`0b7ac7731066e2c6f6150207a4ce763257638f6be438b43bc45b9e4cbf7ad5ec`;
+and the external canonical-DAG file SHA-256 is
+`38659ef32cd697484fedc7c05993abb23dd0a608449bb164cbc943cc97e3e9d9`.
+This comparison includes exact keep masks, frontier sizes, optimal-root
+provenance classes, retained topology identity, candidate records, and the
+accepted/final topology. All six timed outputs independently validate to the
+same external canonical DAG.
+
+Three alternating W1/W8 measurements used the frozen process runner, physical
+CPU list `0,2,4,6,8,10,12,14`, seedtree, validation, one grammar candidate,
+top-K one, exact acceptance, and the 12 GiB chart-memory option. Before/after
+hash manifests are byte-identical. Every process exited zero, respected the
+600-second W1 and 180-second W8 limits, sampled zero swap, remained below the
+global RSS limit, and reported 1,192 logical products over 138 level waves,
+2,386 clade visits, and 2,386 frontier entries. W8 reached eight active workers
+on both retained exact axes; all submitted/completed/joined and
+created/completed counts reconcile, with no cancellation or pending/live work.
+Removed heavy/product/scratch report fields are absent.
+
+| Metric | W1 median/max | W8 median/max | W1/W8 or W8/W1 |
+|---|---:|---:|---:|
+| exact initialization median | 150.474 ms | 43.637 ms | 3.45x |
+| exact B&B median | 91.280 ms | 32.307 ms | 2.83x |
+| exact verification median | 189.792 ms | 50.077 ms | 3.79x |
+| whole-process wall median | 0.615352 s | 0.316089 s | 1.95x |
+| peak sampled RSS max | 85,276 KiB | 83,660 KiB | 0.981x W8/W1 |
+
+The W8 median system/user ratio is 24.84%, below the 25% investigation
+threshold despite one unrelated busy host core. Raw evidence and the computed
+summary are under
+`build/wric-chart-parallelization/phase5-3a10e9c/`; the summary SHA-256 is
+`b34119b0bc26b393759b9bbd5031a5bfc18eba54b97bad4efdd0079a1cc7f34c`.
+These timing/RSS observations are diagnostic only until Phase 0 is calibrated,
+captured, finalized, audited, and sealed.
+
+Phase 5 therefore has a **functionally passing implementation checkpoint**,
+but is not accepted. Phase 6 must first close the global bounded-memory
+invariant by releasing score-pass frontiers before exact-mask recovery and by
+admitting candidate/frontier scratch under the unified budget. Phase 0 must
+then supply sealed timeout, scaling, and RSS evidence. Under the authorized
+deadline-overlap rule, implementation proceeds to Phase 6 now.
 
 ## Later-phase evidence template
 

@@ -33,8 +33,8 @@ in this document.
 | 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | `0c4623b` passes the allocation/build/canonical/full-CTest/targeted-ASAN gates; serial timing and RSS comparisons await the sealed baseline |
 | 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | Safe one-pool orchestration, full CTest, and targeted TSAN pass at `7d294d6`; small-case timing awaits the sealed baseline |
 | 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | `cbf92b6` passes deterministic pattern/cache/local/fixed-topology scheduling, bounded-memory admission, caught-failure accounting, full CTest, and targeted TSAN; scaling, Phase-3 serial comparison, and RSS gates await the sealed baseline |
-| 5. Parallelize a single exact B&B | implementation in progress | Primary semantic capture reuses the timed B&B; dependency wavefront and proven-single-topology setup exceed the scaling target; measured-0% heavy splitting is omitted; correctness/sanitizer/final post-omission gates pending |
-| 6. Parallelize exact top-K candidates | pending | Bounded-memory exact candidate scaling |
+| 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass W1/W8 exact semantics, full CTest, and targeted TSAN; same-revision diagnostics exceed the 2x exact-phase target; measured-0% heavy splitting is omitted; unified frontier/candidate admission and sealed timing/RSS remain pending |
+| 6. Parallelize exact top-K candidates | in progress | Bounded-memory exact candidate scaling, including the unified scratch/admission obligation carried from Phase 5 |
 | 7. Make lazy charts scalable and adaptive | pending | Dense/lazy equivalence and auto-policy gate |
 | 8. Parallelize and pipeline candidate generation | pending | Stable candidate stream and generation speedup |
 | 9. Parallelize accepted-state cache updates | pending | Non-vacuous multi-accept correctness and scaling |
