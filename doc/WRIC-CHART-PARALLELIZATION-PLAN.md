@@ -31,7 +31,7 @@ in this document.
 | 0. Repair and freeze measurement | in progress (timing deferred) | Native/oracle/runner frozen and functional gates audited; quiet-host calibration, capture, finalization, and seal pending |
 | 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | Functional/counter gates pass at `208ce23`; canonical Phase-0 comparison and serial speed/no-regression gates await the sealed baseline |
 | 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | `0c4623b` passes the allocation/build/canonical/full-CTest/targeted-ASAN gates; serial timing and RSS comparisons await the sealed baseline |
-| 3. Add one persistent adaptive scheduler | pending | Safe one-pool orchestration and TSAN gate |
+| 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | Safe one-pool orchestration, full CTest, and targeted TSAN pass at `7d294d6`; small-case timing awaits the sealed baseline |
 | 4. Parallelize patterns and local scoring | pending | Deterministic positive scaling |
 | 5. Parallelize a single exact B&B | pending | Medium one-candidate completion and scaling |
 | 6. Parallelize exact top-K candidates | pending | Bounded-memory exact candidate scaling |

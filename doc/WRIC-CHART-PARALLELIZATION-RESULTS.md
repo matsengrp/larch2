@@ -29,7 +29,8 @@ committed. Phase-0 artifacts use the non-overwriting directory
 | 0. Repair and freeze measurement | in progress (timing deferred) | native/oracle/runner bytes frozen and functional gates independently audited; passing calibration, capture, finalization, and seal pending |
 | 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | code checkpoint `208ce23`; focused and full RelWithDebInfo correctness/counter gates pass; canonical baseline and timing gates remain pending |
 | 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | code checkpoint `0c4623b`; same-profiler allocation reduction, warmed-zero allocation, frozen semantic/counter, focused/full RelWithDebInfo, and targeted ASAN gates pass; serial timing, exact-small timing, RSS, and sealed canonical comparison remain pending |
-| 3--10 | pending | may follow in plan order under the same acceptance gate |
+| 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | code checkpoint `7d294d6`; scheduler contract, canonical worker matrix, full RelWithDebInfo, and targeted TSan gates pass; small-case timing remains pending |
+| 4--10 | pending | may follow in plan order under the same acceptance gate |
 
 ## Phase 0 — immutable provenance
 
@@ -989,6 +990,89 @@ There were no address or leak diagnostics.
 Phase 2 is therefore **implementation complete; acceptance pending Phase 0**
 under the deadline-overlap rule. No busy-host wall time or RSS observation in
 this section is acceptance evidence.
+
+## Phase 3 — persistent adaptive chart scheduler
+
+Checkpoint `7d294d6` (`Add persistent adaptive chart scheduler`) closes the
+Phase-3 implementation work. It adds one lazily started scheduler whose
+lifetime spans the whole chart search, threads it through every local-scoring
+acceptance batch, and shuts it down synchronously before publishing its final
+metrics. Explicit requests `1,2,4,8,16` are exact. Automatic resolution uses
+the process affinity's physical-core count when every CPU topology record is
+available, then affinity logical CPUs, `hardware_concurrency()`, and finally a
+serial fallback. The selected policy and topology inputs are reported.
+
+The indexed-range primitive uses monotonic operation/task IDs, bounded dynamic
+ranges, stable scratch slots, adaptive grain, and fixed-order coordinator
+reduction. Every accepted runner completes its stable first range; cancellation
+stops later claims, joins all launched runners, and suppresses partial
+map-reduce publication. Exceptions are selected by lowest stable range. Nested
+use of the same scheduler executes serially in the inherited scratch slot,
+while unrelated concurrent top-level use is rejected. Pool start/stop, live
+threads, pending work, queue waits, range/task accounting, active-worker high
+water, grain, and serial-fallback reasons are all observable. Direct explicit
+W1 scoring retains the Phase-2 allocation-free seam and does not construct or
+type-erase a scheduler.
+
+The standalone scheduler suite covers explicit and automatic resolution;
+empty, one-item, and fewer-items-than-workers calls; exact-once non-divisible
+ranges; stable move-only reduction despite out-of-order completion; repeated
+operations on one lazy pool; deterministic exception selection; cooperative
+cancellation and recovery; no partial reduction; nested fallback; concurrent
+top-level rejection; partial submission failure; shutdown; and zero pending or
+live threads. Fifty consecutive standalone repetitions passed, as did a
+warning-clean GCC-trunk standalone build. Integration tests prove one pool
+lifetime over multiple search iterations, byte-identical W1/W8 semantics,
+actual parallel operations above the threshold, canonical CLI identity for
+requests `1,2,4,8,16,0`, and exact scheduler accounting in the emitted report.
+
+The complete RelWithDebInfo suite passed all 159 registered tests in 84.28
+seconds, with only the established optional external-data skips
+`merge_consistency_test` and `rotaA_diagnostic_test`. The preserved log is
+`build/wric-chart-parallelization/phase3-7d294d6/full-relwithdebinfo.LastTest.log`;
+its SHA-256 is
+`a1cf5f9157c073930bb2b66464654436a33b3a94064a03e58d0e393d695baa2e`.
+
+The GCC-trunk TSan build initially selected an incompatible system runtime;
+pinning `/home/ogi-agent/install/gcc-trunk/lib64` exposed a separate musl 1.2.6
+runtime abort before threaded tests could execute. Its assertion and source
+line exactly matched LLVM compiler-rt change
+`b917156f9bdf0b7f9bb88e056da32409f5d71630` (`[TSan] Fix determining static
+TLS blocks`,
+https://chromium.googlesource.com/external/github.com/llvm/llvm-project/compiler-rt/+/b917156f9bdf0b7f9bb88e056da32409f5d71630).
+Applying that runtime-only inclusive-boundary fix exposed one
+additional executable layout: debugger inspection showed a 16-byte gap between
+an align-64 libtsan TLS block and the align-8 executable TLS block. The private
+validation runtime therefore uses the upstream inclusive comparison and the
+larger adjacent alignment when identifying contiguous static TLS blocks. This
+changes neither larch2 code nor compiler instrumentation. The external GCC
+source tree was restored clean immediately after copying the runtime.
+
+The exact runtime patch, source identity, loader order, and diagnosis are under
+`build/wric-chart-parallelization/phase3-7d294d6/patched-tsan-runtime/`.
+`libtsan.so.2.0.0` has SHA-256
+`58725dae226e91ea96bebbdf54f84820638404a691528570ec1dab595ed08842`.
+With that runtime first in `LD_LIBRARY_PATH`, the serial targeted TSan set
+passed 52/52 in 296.65 seconds. It includes the scheduler, thread pool, local
+scorer/search, exact trim, persistent inside/outside caches, fixed-topology and
+multifurcation oracles, overlay chain, CLI search/trim paths, and the long cache
+tests. The copied `targeted-tsan.LastTest.log` SHA-256 is
+`a181bb59a227edadaa75b025137b360f63a7cd2d6a6f81530fc94413ff8ee242`.
+There were no TSan race reports.
+
+| Phase-3 exit criterion | Decision |
+|---|---|
+| One pool lifetime across multiple iterations | pass |
+| Explicit W1 matches the Phase-2 canonical oracle | pass; direct and CLI worker matrices are byte-identical |
+| Empty/small/repeated/exception/cancellation coverage | pass |
+| All submitted work joined; zero pending/live work at shutdown | pass |
+| Small 64-candidate W8 no more than 5% slower than W1 | pending sealed Phase-0 capture |
+| Non-vacuous parallel execution above threshold | pass |
+| Targeted TSan and full CTest | pass: 52/52 and 159/159 |
+
+Phase 3 is therefore **implementation complete; acceptance pending Phase 0**
+under the deadline-overlap rule. No busy-host timing observation is accepted
+as evidence for the outstanding small-case wall-time gate.
 
 ## Later-phase evidence template
 
