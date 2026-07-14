@@ -28,7 +28,7 @@ committed. Phase-0 artifacts use the non-overwriting directory
 |---|---|---|
 | 0. Repair and freeze measurement | in progress (timing deferred) | native/oracle/runner bytes frozen and functional gates independently audited; passing calibration, capture, finalization, and seal pending |
 | 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | code checkpoint `208ce23`; focused and full RelWithDebInfo correctness/counter gates pass; canonical baseline and timing gates remain pending |
-| 2. Remove allocations and duplicate work | implementation in progress | three reuse/kernel checkpoints pass focused gates; caller-owned scoring workspace, scoped allocation gate, full CTest, ASAN, and Phase-0-relative acceptance remain |
+| 2. Remove allocations and duplicate work | implementation in progress | three reuse/kernel checkpoints pass focused/full gates; caller-owned scoring workspace, scoped allocation gate, post-workspace full CTest, ASAN, and Phase-0-relative acceptance remain |
 | 3--10 | pending | may follow in plan order under the same acceptance gate |
 
 ## Phase 0 — immutable provenance
@@ -823,12 +823,18 @@ It passed 9/9 in 37.17 seconds. The copied log is
 its SHA-256 is
 `b2c632f66de667768fb39d40e03dc95d87c0f4916ddc51c535d135de1c8da6df`.
 
+The complete RelWithDebInfo suite then passed all 157 registered tests in
+124.49 seconds with zero failures. The two established optional external-data
+diagnostics, `merge_consistency_test` and `rotaA_diagnostic_test`, retained
+their skip status. The copied full `LastTest.log` SHA-256 is
+`8763573fd2c52eeac5e393a78f5359a5f0ab65ddeb2db6002e8429bebc7440d1`.
+
 A strict post-checkpoint audit keeps Phase 2 open. The public scorer still
 returns an owning vector, candidate preparation still constructs fresh
 descriptors, and default one-candidate acceptance batches do not retain a
 search-lifetime workspace. The real 1,000-score allocation gate, integrated
 all-active/lazy one-build relationships, local-provider negative identity
-tests, current full CTest, targeted ASAN, and every Phase-0-relative
+tests, a post-workspace full CTest, targeted ASAN, and every Phase-0-relative
 allocation/timing/RSS/canonical gate remain pending. No busy-host timing is
 acceptance evidence.
 
