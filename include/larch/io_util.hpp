@@ -93,10 +93,14 @@ inline std::vector<char> read_file(std::string_view path) {
     gzFile gz = gzopen(std::string{path}.c_str(), "rb");
     if (!gz) throw std::runtime_error{"cannot open " + std::string{path}};
     std::vector<char> result;
-    char buf[262144];
+    // The process-wide loader dispatches independent inputs through worker
+    // threads.  musl's default worker stack can be smaller than this chunk,
+    // so a 256-KiB automatic buffer overflows before gzread is entered.
+    // Keep the I/O chunk size but store it on the heap.
+    std::vector<char> buf(262144);
     int n;
-    while ((n = gzread(gz, buf, sizeof(buf))) > 0) {
-      result.insert(result.end(), buf, buf + n);
+    while ((n = gzread(gz, buf.data(), static_cast<unsigned>(buf.size()))) > 0) {
+      result.insert(result.end(), buf.data(), buf.data() + n);
     }
     gzclose(gz);
     return result;

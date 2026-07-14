@@ -1288,6 +1288,17 @@ Analysis:
                           (per-delta taxon-set keys + commit-source label) for
                           a local-commit run. Stable across materialize /
                           rebuild / report round trips
+  --chart-spr-canonical-result <PATH>
+                          Write compact canonical chart-search semantic JSON
+                          (SHA-256 section digests; correctness-only companion,
+                          not a timed benchmark run)
+  --chart-spr-canonical-sidecar <PATH>
+                          Also write the complete canonical semantic NDJSON;
+                          requires --chart-spr-canonical-result and retains
+                          extra evidence, so timings include capture overhead
+  --canonical-dag-result <PATH>
+                          Write an external-output canonical DAG JSON digest:
+                          sample-ID clades/productions plus exact parsimony min
   --chart-spr-max-candidates <N>
                           Candidate cap for chart-SPR diagnostics
                           (default 0, unlimited; post-dedup)
@@ -1312,9 +1323,12 @@ Analysis:
                           unverified improvements in the candidate stream.
   --chart-spr-candidate-source <M>
                           grammar (default), sampled-tree, or hybrid
+  --chart-spr-workers <N>
+                          Unified chart-search worker budget (default 1; 0
+                          chooses hardware concurrency)
   --chart-spr-local-score-workers <N>
-                          Worker count for parallel local candidate scoring
-                          (default 1; 0 chooses hardware concurrency)
+                          Compatibility alias for --chart-spr-workers; the two
+                          options may not be supplied together
   --chart-spr-candidate-batch-size <N>
                           Bounded candidate batch size for local scoring
                           (default 0, choose automatically when needed)
@@ -1450,7 +1464,8 @@ struct args {
       "first_reachable_overlay_topology";
   grammar_spr_enumeration_options chart_spr_enumeration;
   chart_cache_options chart_spr_cache;
-  std::size_t chart_spr_local_score_workers = 1;
+  std::optional<std::size_t> chart_spr_workers;
+  std::optional<std::size_t> chart_spr_local_score_workers;
   bool chart_spr_local_accept_updates = false;
   // Phase 10 cross-cutting CLI surface.
   chart_spr_commit_mode chart_spr_commit =
@@ -1458,6 +1473,9 @@ struct args {
   chart_spr_verification_mode chart_spr_verification =
       chart_spr_verification_mode::transient;
   std::string chart_spr_identity_report_json;
+  std::string chart_spr_canonical_result;
+  std::string chart_spr_canonical_sidecar;
+  std::string canonical_dag_result;
 };
 
 static bool has_any_model_arg(args const& a) {
@@ -1906,6 +1924,12 @@ static args parse_args(int argc, char** argv) {
       a.chart_spr_verification = *mode;
     } else if (arg == "--chart-spr-identity-report-json") {
       a.chart_spr_identity_report_json = next();
+    } else if (arg == "--chart-spr-canonical-result") {
+      a.chart_spr_canonical_result = next();
+    } else if (arg == "--chart-spr-canonical-sidecar") {
+      a.chart_spr_canonical_sidecar = next();
+    } else if (arg == "--canonical-dag-result") {
+      a.canonical_dag_result = next();
     } else if (arg == "--chart-spr-max-candidates") {
       a.chart_spr_enumeration.max_candidates = parse_size_token_strict(
           next(), "--chart-spr-max-candidates");
@@ -1942,7 +1966,20 @@ static args parse_args(int argc, char** argv) {
         std::exit(1);
       }
       a.chart_spr_enumeration.source = *source;
+    } else if (arg == "--chart-spr-workers") {
+      if (a.chart_spr_local_score_workers) {
+        throw std::runtime_error(
+            "--chart-spr-workers conflicts with compatibility alias "
+            "--chart-spr-local-score-workers");
+      }
+      a.chart_spr_workers =
+          parse_size_token_strict(next(), "--chart-spr-workers");
     } else if (arg == "--chart-spr-local-score-workers") {
+      if (a.chart_spr_workers) {
+        throw std::runtime_error(
+            "--chart-spr-local-score-workers conflicts with unified option "
+            "--chart-spr-workers");
+      }
       a.chart_spr_local_score_workers = parse_size_token_strict(
           next(), "--chart-spr-local-score-workers");
     } else if (arg == "--chart-spr-candidate-batch-size") {
@@ -2142,6 +2179,19 @@ static args parse_args(int argc, char** argv) {
   if (!a.chart_bnb_report_json.empty() && !a.chart_bnb_apply_trim) {
     std::cerr << "error: --chart-bnb-report-json requires "
                  "--chart-bnb-apply-trim\n";
+    std::exit(1);
+  }
+  if ((!a.chart_spr_canonical_result.empty() ||
+       !a.chart_spr_canonical_sidecar.empty()) &&
+      !a.chart_spr_search) {
+    std::cerr << "error: --chart-spr-canonical-result/sidecar require "
+                 "--chart-spr-search\n";
+    std::exit(1);
+  }
+  if (!a.chart_spr_canonical_sidecar.empty() &&
+      a.chart_spr_canonical_result.empty()) {
+    std::cerr << "error: --chart-spr-canonical-sidecar requires "
+                 "--chart-spr-canonical-result\n";
     std::exit(1);
   }
   if (a.seed) a.chart_spr_enumeration.seed = *a.seed;
@@ -3481,7 +3531,9 @@ static void run_chart_spr_local_scoring_diagnostic(
   double local_ms_total = 0.0;
   auto scoring_start = std::chrono::steady_clock::now();
   auto scored_candidates = score_candidates_locally(
-      state, candidates, {}, a.chart_spr_local_score_workers);
+      state, candidates, {},
+      a.chart_spr_workers.value_or(
+          a.chart_spr_local_score_workers.value_or(1)));
   auto local_scoring_wall_ms = elapsed_ms(scoring_start,
                                           std::chrono::steady_clock::now());
   for (auto& scored : scored_candidates) {
@@ -3550,7 +3602,10 @@ static void run_chart_spr_local_scoring_diagnostic(
   out << "  candidate_batch_size: "
       << search_options.cache.candidate_batch_size << "\n";
   out << "  local_score_workers: "
-      << a.chart_spr_local_score_workers << "\n";
+      << chart_spr_search_detail::normalize_chart_spr_worker_count(
+             a.chart_spr_workers.value_or(
+                 a.chart_spr_local_score_workers.value_or(1)))
+      << "\n";
   out << "  cache_build_ms: " << std::fixed << std::setprecision(3)
       << cache_ms << "\n";
   out << "  candidate_source: "
@@ -3654,7 +3709,11 @@ static chart_spr_search_options make_chart_spr_search_options(
   options.enumeration = a.chart_spr_enumeration;
   options.cache = a.chart_spr_cache;
   options.cache.use_lazy_multisite_chart = a.wric_lazy_chart;
-  options.local_score_worker_count = a.chart_spr_local_score_workers;
+  auto const requested_workers =
+      a.chart_spr_workers.value_or(
+          a.chart_spr_local_score_workers.value_or(1));
+  options.worker_count = requested_workers;
+  options.local_score_worker_count = requested_workers;
   options.rebuild_after_accept = !a.chart_spr_local_accept_updates;
   // Phase 10 cross-cutting surface: mirror the selected commit / verification
   // modes into the search options.  Defaults unchanged.
@@ -3663,6 +3722,21 @@ static chart_spr_search_options make_chart_spr_search_options(
   options.seed = a.seed.value_or(options.seed);
   options.chart.score_ua_edge = a.chart_score_ua_edge;
   options.exact_trim = make_chart_bnb_trim_options(a);
+  if (!a.chart_spr_canonical_result.empty()) {
+    options.semantic_capture = a.chart_spr_canonical_sidecar.empty()
+                                   ? chart_spr_semantic_capture_mode::digest
+                                   : chart_spr_semantic_capture_mode::full;
+    options.semantic_polytomy_mode =
+        wric_polytomy_mode_name(a.wric_polytomy_opts.mode);
+    options.semantic_polytomy_max_exact_arity =
+        a.wric_polytomy_opts.max_exact_arity;
+    options.semantic_polytomy_max_shapes =
+        a.wric_polytomy_opts.max_shapes_per_polytomy;
+    options.semantic_polytomy_max_productions =
+        a.wric_polytomy_opts.max_new_productions_per_polytomy;
+    options.semantic_polytomy_max_clades =
+        a.wric_polytomy_opts.max_new_clades_per_polytomy;
+  }
   return options;
 }
 
@@ -3670,6 +3744,12 @@ static void run_chart_spr_search_diagnostic(
     std::ostream& out, phylo_dag& dag,
     polytomy_refinement_result& refinement, args const& a) {
   auto options = make_chart_spr_search_options(a);
+  if (options.semantic_capture != chart_spr_semantic_capture_mode::off) {
+    options.semantic_refinement_exactness =
+        refinement.audit.exact_for_soft_polytomies
+            ? "EXACT"
+            : "BOUNDED_REFINED_GRAMMAR";
+  }
   auto search = run_chart_spr_search(std::move(dag), refinement.grammar,
                                      options);
   dag = std::move(search.dag);
@@ -3688,6 +3768,46 @@ static void run_chart_spr_search_diagnostic(
       std::exit(1);
     }
     identity_out << search.chain_identity_report_json;
+  }
+  if (!a.chart_spr_canonical_result.empty()) {
+    if (!search.canonical_digest) {
+      throw std::runtime_error(
+          "chart-SPR canonical result requested but search returned no "
+          "semantic digest");
+    }
+    std::ofstream compact_out(a.chart_spr_canonical_result,
+                              std::ios::binary | std::ios::trunc);
+    if (!compact_out) {
+      throw std::runtime_error(
+          "cannot write --chart-spr-canonical-result to '" +
+          a.chart_spr_canonical_result + "'");
+    }
+    compact_out << emit_chart_spr_semantic_digest_json(
+        *search.canonical_digest);
+    compact_out.close();
+    if (!compact_out) {
+      throw std::runtime_error(
+          "failed writing --chart-spr-canonical-result to '" +
+          a.chart_spr_canonical_result + "'");
+    }
+    if (!a.chart_spr_canonical_sidecar.empty()) {
+      std::ofstream sidecar_out(a.chart_spr_canonical_sidecar,
+                                std::ios::binary | std::ios::trunc);
+      if (!sidecar_out) {
+        throw std::runtime_error(
+            "cannot write --chart-spr-canonical-sidecar to '" +
+            a.chart_spr_canonical_sidecar + "'");
+      }
+      sidecar_out << search.canonical_digest->full_sidecar;
+      sidecar_out.close();
+      if (!sidecar_out) {
+        throw std::runtime_error(
+            "failed writing --chart-spr-canonical-sidecar to '" +
+            a.chart_spr_canonical_sidecar + "'");
+      }
+    }
+    out << "  canonical_semantic_sha256: "
+        << search.canonical_digest->semantic_sha256 << "\n";
   }
 
   out << "chart_spr_search:\n";
@@ -3728,6 +3848,10 @@ static void run_chart_spr_search_diagnostic(
       << "\n";
   out << "  candidate_source: "
       << chart_spr_candidate_source_name(options.enumeration.source) << "\n";
+  out << "  candidate_cap_semantics: "
+      << (options.enumeration.max_candidates_is_post_dedup ? "post-dedup"
+                                                           : "pre-dedup")
+      << "\n";
   out << "  candidate_signature_identity: "
       << "stable_sample_taxa_and_production_keys\n";
   out << "  randomize_order: "
@@ -3740,7 +3864,42 @@ static void run_chart_spr_search_diagnostic(
       << "\n";
   out << "  sampled_tree_spr_radius: "
       << options.enumeration.sampled_tree_spr_radius << "\n";
+  out << "  sampled_tree_radius: "
+      << options.enumeration.sampled_tree_spr_radius << "\n";
+  out << "  sampled_tree_score_threshold: "
+      << options.enumeration.sampled_tree_score_threshold << "\n";
+  out << "  include_immediate_reversals: "
+      << (options.enumeration.include_immediate_reversal_candidates ? "true"
+                                                                    : "false")
+      << "\n";
+  out << "  max_upward_path_expansions: "
+      << options.enumeration.max_upward_path_expansions << "\n";
+  out << "  max_path_pairs: "
+      << options.enumeration.max_path_pairs_considered << "\n";
+  out << "  min_moved_clade_size: "
+      << options.enumeration.min_moved_clade_size << "\n";
+  out << "  max_moved_clade_size: "
+      << options.enumeration.max_moved_clade_size << "\n";
+  out << "  min_target_clade_size: "
+      << options.enumeration.min_target_clade_size << "\n";
+  out << "  max_target_clade_size: "
+      << options.enumeration.max_target_clade_size << "\n";
+  out << "  max_affected_clades: "
+      << options.enumeration.max_estimated_affected_clades << "\n";
   out << "  top_k_exact_verify: " << options.top_k_exact_verify << "\n";
+  out << "  configured_max_candidates: "
+      << (options.max_candidates_per_iteration != 0
+              ? options.max_candidates_per_iteration
+              : options.enumeration.max_candidates)
+      << "\n";
+  out << "  seed: " << options.seed << "\n";
+  out << "  topology_selector: ";
+  if (options.acceptance_mode ==
+      chart_spr_acceptance_mode::fixed_topology_exact) {
+    out << options.fixed_topology_selector_name << "\n";
+  } else {
+    out << "none\n";
+  }
   out << "  topology_selection: ";
   if (options.acceptance_mode ==
       chart_spr_acceptance_mode::fixed_topology_exact) {
@@ -3774,12 +3933,67 @@ static void run_chart_spr_search_diagnostic(
       << chart_spr_commit_mode_name(options.commit_mode) << "\n";
   out << "  verification_mode: "
       << chart_spr_verification_mode_name(options.verification_mode) << "\n";
+  out << "  local_accept_updates: "
+      << (options.rebuild_after_accept ? "false" : "true") << "\n";
   out << "  chain_per_accept_exactness_label: "
       << search.summary.chain_per_accept_exactness_label << "\n";
   out << "  score_convention: active_cache_plus_single_invariant_offset\n";
   out << "  score_ua_edge: "
       << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+  out << "  dominance_mode: "
+      << multisite_dominance_mode_name(options.exact_trim.dominance_mode)
+      << "\n";
+  out << "  bound_pruning: "
+      << (options.exact_trim.use_bound_pruning ? "true" : "false") << "\n";
+  out << "  require_exact_keep_mask: "
+      << (options.exact_trim.require_exact_keep_mask ? "true" : "false")
+      << "\n";
+  out << "  max_frontier_entries: "
+      << options.exact_trim.max_frontier_entries_per_clade << "\n";
+  out << "  keep_mask_contract: "
+      << (options.exact_trim.require_exact_keep_mask ? "exact_required"
+                                                     : "score_only_allowed")
+      << "\n";
+  out << "  refinement_exactness: "
+      << (refinement.audit.exact_for_soft_polytomies
+              ? "EXACT"
+              : "BOUNDED_REFINED_GRAMMAR")
+      << "\n";
+  out << "  polytomy_max_exact_arity: "
+      << a.wric_polytomy_opts.max_exact_arity << "\n";
+  out << "  polytomy_max_shapes: "
+      << a.wric_polytomy_opts.max_shapes_per_polytomy << "\n";
+  out << "  polytomy_max_productions: "
+      << a.wric_polytomy_opts.max_new_productions_per_polytomy << "\n";
+  out << "  polytomy_max_clades: "
+      << a.wric_polytomy_opts.max_new_clades_per_polytomy << "\n";
+  out << "  lazy_policy: " << (a.wric_lazy_chart ? "on" : "off") << "\n";
+  out << "  max_cached_patterns: "
+      << options.cache.max_cached_patterns << "\n";
+  out << "  configured_pattern_batch_size: "
+      << options.cache.pattern_batch_size << "\n";
+  out << "  configured_candidate_batch_size: "
+      << options.cache.candidate_batch_size << "\n";
+  out << "  memory_budget_bytes: "
+      << options.cache.memory_budget_bytes << "\n";
+  out << "  validate: " << (a.validate ? "true" : "false") << "\n";
+  out << "  force_no_vcf: " << (a.force_no_vcf ? "true" : "false")
+      << "\n";
   out << "  root_row_scoring_api: chart_spr_weighted_root_score_from_row\n";
+  out << "  chart_workers_requested: "
+      << search.summary.requested_worker_count << "\n";
+  out << "  chart_workers_resolved: "
+      << search.summary.resolved_worker_count << "\n";
+  out << "  chart_worker_policy: ";
+  if (a.chart_spr_workers) {
+    out << (*a.chart_spr_workers == 0 ? "automatic" : "explicit");
+  } else if (a.chart_spr_local_score_workers) {
+    out << (*a.chart_spr_local_score_workers == 0 ? "legacy_automatic"
+                                                  : "legacy_explicit");
+  } else {
+    out << "default_serial";
+  }
+  out << "\n";
   out << "  local_score_workers: "
       << search.summary.local_score_worker_count << "\n";
   bool const search_used_lazy_chart =
@@ -3854,6 +4068,15 @@ static void run_chart_spr_search_diagnostic(
       << "\n";
   out << "  cache_build_ms: " << std::fixed << std::setprecision(3)
       << search.summary.cache_build_ms << "\n";
+  out << "  initial_chart_construction_ms: " << std::fixed
+      << std::setprecision(3)
+      << search.summary.initial_chart_construction_ms << "\n";
+  out << "  candidate_generation_ms: " << std::fixed
+      << std::setprecision(3) << search.summary.candidate_generation_ms
+      << "\n";
+  out << "  exact_initialization_ms: " << std::fixed
+      << std::setprecision(3) << search.summary.exact_initialization_ms
+      << "\n";
   out << "  local_scoring_ms: " << std::fixed << std::setprecision(3)
       << search.summary.local_scoring_ms << "\n";
   out << "  local_candidates_per_second: " << std::fixed
@@ -3939,6 +4162,30 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.pattern_batch_cache_builds << "\n";
   out << "  exact_verification_ms: " << std::fixed << std::setprecision(3)
       << search.summary.exact_verification_ms << "\n";
+  out << "  materialization_ms: " << std::fixed << std::setprecision(3)
+      << search.summary.materialization_ms << "\n";
+  out << "  materialization_exact_verification_ms: " << std::fixed
+      << std::setprecision(3)
+      << search.summary.materialization_exact_verification_ms << "\n";
+  out << "  materialization_accepted_update_ms: " << std::fixed
+      << std::setprecision(3)
+      << search.summary.materialization_accepted_update_ms << "\n";
+  out << "  materialization_final_compaction_ms: " << std::fixed
+      << std::setprecision(3)
+      << search.summary.materialization_final_compaction_ms << "\n";
+  out << "  peak_concurrent_exact_verifiers: "
+      << search.summary.peak_concurrent_exact_verifiers << "\n";
+  out << "  exact_candidate_timing_count: "
+      << search.summary.exact_candidate_timing_count << "\n";
+  out << "  exact_candidate_verification_ms_min: " << std::fixed
+      << std::setprecision(3)
+      << search.summary.exact_candidate_verification_ms_min << "\n";
+  out << "  exact_candidate_verification_ms_mean: " << std::fixed
+      << std::setprecision(3)
+      << search.summary.exact_candidate_verification_ms_mean << "\n";
+  out << "  exact_candidate_verification_ms_max: " << std::fixed
+      << std::setprecision(3)
+      << search.summary.exact_candidate_verification_ms_max << "\n";
   out << "  accepted_rebuild_ms: " << std::fixed << std::setprecision(3)
       << search.summary.accepted_rebuild_ms << "\n";
   out << "  final_compaction_ms: " << std::fixed << std::setprecision(3)
@@ -3976,11 +4223,22 @@ static void run_chart_spr_search_diagnostic(
           << iteration.locally_ranked_candidates_retained << "\n";
       out << "      candidates_exact_verified: "
           << iteration.candidates_exact_verified << "\n";
+      out << "      candidate_generation_ms: " << std::fixed
+          << std::setprecision(3) << iteration.candidate_generation_ms
+          << "\n";
       out << "      local_scoring_ms: " << std::fixed << std::setprecision(3)
           << iteration.local_scoring_ms << "\n";
       out << "      exact_verification_ms: " << std::fixed
           << std::setprecision(3) << iteration.exact_verification_ms
           << "\n";
+      out << "      exact_candidate_verification_ms: [";
+      for (std::size_t i = 0;
+           i < iteration.exact_candidate_verification_ms.size(); ++i) {
+        if (i != 0) out << ", ";
+        out << std::fixed << std::setprecision(3)
+            << iteration.exact_candidate_verification_ms[i];
+      }
+      out << "]\n";
       out << "      unverified_candidates_may_contain_improvements: "
           << (iteration.unverified_candidates_may_contain_improvements
                   ? "true"
@@ -4850,6 +5108,36 @@ int main(int argc, char** argv) try {
                   << ", count:" << max_it->second << "\n";
       }
     }
+  }
+
+  if (!a.canonical_dag_result.empty()) {
+    clade_grammar_options grammar_options;
+    grammar_options.allow_polytomies = true;
+    auto canonical_grammar = build_clade_grammar(result, grammar_options);
+    parsimony_score_ops parsimony_ops;
+    subtree_weight<parsimony_score_ops> scorer(result, a.seed);
+    auto parsimony_min = scorer.compute_weight_below(root_idx,
+                                                     parsimony_ops);
+    auto canonical = build_canonical_dag_digest_report(
+        canonical_grammar, static_cast<std::uint64_t>(parsimony_min));
+    std::ofstream canonical_out(a.canonical_dag_result,
+                                std::ios::binary | std::ios::trunc);
+    if (!canonical_out) {
+      throw std::runtime_error(
+          "cannot write --canonical-dag-result to '" +
+          a.canonical_dag_result + "'");
+    }
+    canonical_out << emit_canonical_dag_digest_json(canonical);
+    canonical_out.close();
+    if (!canonical_out) {
+      throw std::runtime_error(
+          "failed writing --canonical-dag-result to '" +
+          a.canonical_dag_result + "'");
+    }
+    std::cout << "canonical_dag_semantic_sha256: "
+              << canonical.semantic_sha256 << "\n";
+    std::cout << "canonical_dag_parsimony_min: "
+              << canonical.parsimony_min << "\n";
   }
 
   // ---- Per-edge global penalties ----

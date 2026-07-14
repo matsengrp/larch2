@@ -14,6 +14,7 @@
 #include <larch/rank3_rewrite.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -51,6 +52,10 @@ struct overlay_chain_compaction_options {
 
 struct overlay_chain_compaction_result {
   overlay_materialization_result materialized;
+  // Wall time of the one dense materialize_overlay_chain() call below.  This
+  // excludes witness derivation, DAG merging, grammar rebuilding, and exact
+  // final validation performed by the rest of compaction.
+  double materialization_ms = 0.0;
   phylo_dag dag;
   clade_grammar_build_result rebuilt;
   std::vector<rank3_topology> materialized_topologies;
@@ -843,7 +848,12 @@ inline overlay_chain_compaction_result compact_overlay_chain_to_dag(
   // The single dense overlay materialization for Phase-5 compaction.  Search
   // counters are bumped at the call site so this helper remains side-effect
   // free with respect to instrumentation.
+  auto const materialization_start = std::chrono::steady_clock::now();
   result.materialized = materialize_overlay_chain(chain);
+  result.materialization_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - materialization_start)
+          .count();
   auto const& grammar = result.materialized.grammar;
 
   auto prefix_witness_topology_key_sets =

@@ -141,8 +141,28 @@ target_link_libraries(dagutil PRIVATE larch)
 add_executable(larch2-bcr tools/larch2-bcr.cpp)
 target_link_libraries(larch2-bcr PRIVATE larch)
 
+# Linux process accounting helper used by the reproducible WRIC benchmark
+# harness. It intentionally has no dependency on larch product code.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(wric_process_metrics tools/wric_process_metrics.cpp)
+    set_target_properties(wric_process_metrics PROPERTIES
+        OUTPUT_NAME "wric-process-metrics")
+    add_executable(wric_wrapper_calibration_workload
+                   tools/wric_wrapper_calibration_workload.cpp)
+    set_target_properties(wric_wrapper_calibration_workload PROPERTIES
+        OUTPUT_NAME "wric-wrapper-calibration-workload")
+endif()
+
 set_target_properties(larch2 dagutil larch2-bcr PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+if(TARGET wric_process_metrics)
+    set_target_properties(wric_process_metrics PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
+if(TARGET wric_wrapper_calibration_workload)
+    set_target_properties(wric_wrapper_calibration_workload PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
 
 # --- Tests --------------------------------------------------------------------
 
@@ -152,6 +172,41 @@ add_test(NAME larch2_bcr_non_treefile_suffix
          COMMAND bash test/larch2_bcr_non_treefile_suffix.sh
                  $<TARGET_FILE:larch2-bcr>
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+if(TARGET wric_process_metrics)
+    add_test(NAME wric_process_metrics_test
+             COMMAND bash test/wric_process_metrics_test.sh
+                     $<TARGET_FILE:wric_process_metrics>
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+if(TARGET wric_wrapper_calibration_workload)
+    add_test(NAME wric_wrapper_calibration_workload_version
+             COMMAND $<TARGET_FILE:wric_wrapper_calibration_workload> --version)
+    set_tests_properties(wric_wrapper_calibration_workload_version PROPERTIES
+        PASS_REGULAR_EXPRESSION "^wric-wrapper-calibration-workload-v1")
+    add_test(NAME wric_wrapper_calibration_controller_test
+             COMMAND python3 tools/wric_wrapper_calibration.py self-test
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+
+add_test(NAME dagutil_chart_spr_phase0_observability
+         COMMAND bash test/dagutil_chart_spr_phase0_observability.sh
+                 $<TARGET_FILE:dagutil>
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_chart_spr_phase0_observability PROPERTIES
+                     TIMEOUT 30)
+
+add_test(NAME dagutil_chart_spr_canonical
+         COMMAND bash test/dagutil_chart_spr_canonical_test.sh
+                 $<TARGET_FILE:dagutil>
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_chart_spr_canonical PROPERTIES TIMEOUT 60)
+
+add_executable(chart_spr_semantic_report_test
+               test/chart_spr_semantic_report_test.cpp)
+target_include_directories(chart_spr_semantic_report_test PRIVATE include)
+add_test(NAME chart_spr_semantic_report_test
+         COMMAND chart_spr_semantic_report_test)
 
 # Header-only tests (no library link needed beyond include path)
 foreach(test_name chain_test dag_test hash_chain_test extend_dag_test
@@ -636,16 +691,32 @@ set_tests_properties(wric_phase10_sanity_table_smoke
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "Phase-10 sanity table: PASS")
 
+if(TARGET wric_process_metrics)
 add_test(NAME wric_spr_search_benchmark_smoke
          COMMAND tools/wric_spr_search_benchmark.sh
                  --smoke
                  --dagutil $<TARGET_FILE:dagutil>
                  --larch2 $<TARGET_FILE:larch2>
+                 --process-metrics $<TARGET_FILE:wric_process_metrics>
                  --out-dir ${CMAKE_BINARY_DIR}/wric_spr_search_benchmark_smoke
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(wric_spr_search_benchmark_smoke
-                     PROPERTIES PASS_REGULAR_EXPRESSION
-                     "benchmark_scope: CHART_SPR_PHASE8_SEARCH_COMPARISON")
+                     PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "benchmark_scope: CHART_SPR_PHASE0_SEARCH_COMPARISON"
+                     TIMEOUT 120)
+
+add_test(NAME wric_spr_search_benchmark_harness_test
+         COMMAND bash test/wric_spr_search_benchmark_harness_test.sh
+                 $<TARGET_FILE:wric_process_metrics>
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(wric_spr_search_benchmark_harness_test PROPERTIES TIMEOUT 90)
+
+add_test(NAME wric_phase0_manifest_bootstrap_test
+         COMMAND bash test/wric_phase0_manifest_bootstrap_test.sh
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(wric_phase0_manifest_bootstrap_test PROPERTIES TIMEOUT 15)
+endif()
 
 add_test(NAME wric_bnb_trim_benchmark_smoke
          COMMAND tools/wric_bnb_trim_benchmark.sh

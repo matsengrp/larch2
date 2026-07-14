@@ -1,11 +1,13 @@
 #pragma once
 
 #include <larch/chart_spr.hpp>
+#include <larch/chart_spr_semantic_report.hpp>
 #include <larch/lazy_chart.hpp>
 #include <larch/thread_pool.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +16,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
@@ -49,6 +52,18 @@ struct chart_spr_search_counters {
   // materialization at the end of a local-commit run, counted separately from
   // per-accept materialization and per-candidate exact verification.
   std::size_t overlay_materializations_for_final_compaction = 0;
+  // Wall time spent in the materialization call spans made by the production
+  // search loop.  The three buckets are disjoint and their sum is reported as
+  // `materialization_ms`; a call span is charged even when the call throws and
+  // the search catches that failure to report an invalid candidate/rejected
+  // accept.  Diagnostic materialization performed only by the local-scoring
+  // oracle is intentionally excluded.  The accepted-update bucket deliberately
+  // measures the whole accepted Option A/B materializer call (which also
+  // merges, validates, and audits the resulting grammar), or just the local-
+  // commit tip materialization call in local-commit mode.
+  double materialization_exact_verification_ms = 0.0;
+  double materialization_accepted_update_ms = 0.0;
+  double materialization_final_compaction_ms = 0.0;
   std::size_t sidecar_rebuilds_after_accept = 0;
   std::size_t full_composite_rebuilds = 0;
   std::size_t local_candidate_scores = 0;
@@ -486,8 +501,30 @@ struct chart_spr_search_options {
   multisite_trim_options exact_trim = {};
   chart_cache_options cache = {};
 
+  // Opt-in canonical semantic oracle.  `off` preserves the historical
+  // retention and performance behavior.  `digest` captures semantic records
+  // long enough to hash them; `full` also retains the exact NDJSON byte stream
+  // whose SHA-256 is reported by the compact result.
+  chart_spr_semantic_capture_mode semantic_capture =
+      chart_spr_semantic_capture_mode::off;
+  std::string semantic_polytomy_mode;
+  std::string semantic_refinement_exactness;
+  std::size_t semantic_polytomy_max_exact_arity = 0;
+  std::size_t semantic_polytomy_max_shapes = 0;
+  std::size_t semantic_polytomy_max_productions = 0;
+  std::size_t semantic_polytomy_max_clades = 0;
+
+  // Unified chart-search worker budget.  This is the forward-looking budget
+  // for every parallel chart phase.  Phase 0 maps it to the already-parallel
+  // local scorer; later phases consume the same budget without adding
+  // phase-specific CLI knobs.  Zero chooses hardware concurrency.
+  std::size_t worker_count = 1;
+
   // Parallel local lower-bound scoring.  1 is deterministic serial scoring;
   // 0 chooses std::thread::hardware_concurrency() for the local scoring batch.
+  // Kept as a source-compatible library alias.  Command-line callers set this
+  // from worker_count; direct callers that set only this field retain the
+  // historical behavior.
   std::size_t local_score_worker_count = 1;
 
   // Optional hook for fixed_topology_exact callers that already have a
@@ -569,6 +606,11 @@ struct chart_spr_search_options {
   // must catch witnessed corruptions; a nonzero fallback count proves the
   // gate fires rather than silently trusting a wrong transient result.
   bool force_transient_chain_extension_oracle_mismatch_for_tests = false;
+  // Semantic-oracle isolation hook.  When capture is enabled, fail while
+  // constructing exact evidence *after* the verifier has established its
+  // algorithmic outcome.  Tests use this to prove report failures propagate
+  // as hard errors instead of being converted into invalid candidates.
+  bool force_canonical_evidence_failure_for_tests = false;
   // Test-only injection point for the Phase 4 hard-error contract: after the
   // overlay-chain append succeeds, force a post-append failure and verify the
   // search propagates it instead of converting it into an ordinary rejection.
@@ -636,6 +678,104 @@ struct chart_spr_objective_score {
   std::uint64_t invariant_offset_applied = 0;
 };
 
+inline chart_spr_canonical_score chart_spr_canonicalize_objective_score(
+    chart_spr_objective_score const& score) {
+  return {
+      .kind = chart_spr_score_kind_name(score.kind),
+      .convention = chart_spr_score_convention_name(score.convention),
+      .delta = score.value.delta,
+      .old_score = score.value.old_score,
+      .new_score = score.value.new_score,
+      .invariant_offset = score.invariant_offset_applied,
+      .exact_multisite = score.value.exact_multisite,
+  };
+}
+
+inline chart_spr_canonical_exact_evidence
+chart_spr_canonicalize_trim_evidence(
+    clade_grammar const& grammar, multisite_trim_result const& trim,
+    std::uint64_t invariant_offset) {
+  chart_spr_canonical_exact_evidence evidence;
+  evidence.evidence_kind =
+      trim.keep_production_exact
+          ? "grammar_exact_frontier"
+          : "grammar_exact_score_only_frontier_statistics";
+  evidence.keep_mask_kind =
+      multisite_keep_mask_kind_name(trim.keep_mask_kind);
+  evidence.keep_production_exact = trim.keep_production_exact;
+  evidence.optimum_active = trim.optimum;
+  evidence.invariant_offset = invariant_offset;
+  if (trim.keep_production_exact) {
+    if (trim.keep_production.size() != grammar.productions.size()) {
+      throw std::runtime_error(
+          "chart-SPR canonical report: exact keep mask size mismatch");
+    }
+    for (std::size_t pid = 0; pid < trim.keep_production.size(); ++pid) {
+      if (!trim.keep_production[pid]) continue;
+      evidence.kept_production_keys.push_back(
+          chart_spr_canonical_production_sample_key(
+              grammar, static_cast<production_id>(pid)));
+    }
+  }
+  if (trim.frontier_sizes_by_clade.size() != grammar.clades.size()) {
+    throw std::runtime_error(
+        "chart-SPR canonical report: frontier-size vector size mismatch");
+  }
+  for (std::size_t cid = 0; cid < grammar.clades.size(); ++cid) {
+    if (grammar.clades[cid].taxa.empty()) continue;
+    evidence.frontier_sizes.emplace_back(
+        chart_spr_canonical_clade_sample_key(grammar,
+                                             grammar.clades[cid].taxa),
+        trim.frontier_sizes_by_clade[cid]);
+  }
+  for (auto const& source : trim.optimal_root_provenance_classes) {
+    if (source.used_production.size() != grammar.productions.size()) {
+      throw std::runtime_error(
+          "chart-SPR canonical report: root provenance mask size mismatch");
+    }
+    chart_spr_canonical_root_provenance_class canonical;
+    canonical.cost.reserve(source.cost.size());
+    for (auto value : source.cost) canonical.cost.push_back(value);
+    for (std::size_t pid = 0; pid < source.used_production.size(); ++pid) {
+      if (!source.used_production[pid]) continue;
+      canonical.production_keys.push_back(
+          chart_spr_canonical_production_sample_key(
+              grammar, static_cast<production_id>(pid)));
+    }
+    evidence.optimal_root_provenance_classes.push_back(
+        std::move(canonical));
+  }
+  chart_spr_semantic_detail::sort_exact_evidence(evidence);
+  return evidence;
+}
+
+inline chart_spr_canonical_exact_evidence
+chart_spr_canonicalize_fixed_topology_evidence(
+    clade_grammar const& grammar, chart_spr_topology_selection const& selection,
+    std::uint64_t invariant_offset) {
+  chart_spr_canonical_exact_evidence evidence;
+  evidence.evidence_kind = "fixed_topology_certificate";
+  evidence.keep_mask_kind = "not_applicable_fixed_topology";
+  evidence.invariant_offset = invariant_offset;
+  evidence.topology_selection_kind =
+      chart_spr_topology_selection_kind_name(selection.kind);
+  evidence.topology_selector = selection.selector_name;
+  if (!selection.certificate) return evidence;
+  auto append = [&](std::vector<chart_spr_production_signature> const& source,
+                    std::vector<std::string>& destination) {
+    for (auto const& signature : source) {
+      destination.push_back(chart_spr_canonical_production_sample_key(
+          grammar, signature.parent_taxa, signature.child_taxa));
+    }
+  };
+  append(selection.certificate->before_signatures,
+         evidence.before_topology_production_keys);
+  append(selection.certificate->after_signatures,
+         evidence.after_topology_production_keys);
+  chart_spr_semantic_detail::sort_exact_evidence(evidence);
+  return evidence;
+}
+
 struct chart_spr_candidate_score {
   grammar_spr_candidate candidate;
   chart_spr_objective_score lower_bound;
@@ -645,7 +785,27 @@ struct chart_spr_candidate_score {
   double local_score_ms = 0.0;
   bool valid = true;
   std::string invalid_reason;
+  std::size_t canonical_stream_index =
+      (std::numeric_limits<std::size_t>::max)();
+  // A pointer keeps the off-mode candidate footprint small and preserves the
+  // value type's existing copy semantics.  It is allocated only for the small
+  // exact-verified subset when semantic capture is enabled.
+  std::shared_ptr<chart_spr_canonical_exact_evidence>
+      canonical_exact_evidence;
+  // Forces a throw at the exact materializer call boundary.  This exists only
+  // to exercise exception-safe production accounting without relying on an
+  // allocation failure or an impractically oversized overlay.
+  bool force_exact_materializer_failure_for_tests = false;
+  bool force_canonical_evidence_failure_for_tests = false;
 };
+
+inline void chart_spr_force_canonical_evidence_failure_for_tests(
+    chart_spr_candidate_score const& candidate) {
+  if (candidate.force_canonical_evidence_failure_for_tests) {
+    throw std::runtime_error(
+        "chart-SPR canonical report: forced exact-evidence failure for test");
+  }
+}
 
 using chart_spr_fixed_topology_verifier = std::function<
     chart_spr_candidate_score(chart_spr_search_state const&,
@@ -707,8 +867,23 @@ struct chart_spr_iteration_result {
   std::uint64_t post_materialization_rebuilt_score = 0;
   std::uint64_t state_score_before = 0;
   std::uint64_t state_score_after = 0;
+  double candidate_generation_ms = 0.0;
   double local_scoring_ms = 0.0;
   double exact_verification_ms = 0.0;
+  // One entry per exact-verification attempt, in stable ranked-candidate
+  // order.  This is diagnostic accounting and is excluded from canonical
+  // semantic comparisons.
+  std::vector<double> exact_candidate_verification_ms;
+
+  // Populated only when chart_spr_search_options::semantic_capture is not
+  // off.  The stream includes invalid and non-retained candidates; the normal
+  // search result historically retains only the accepted candidate.
+  std::uint32_t canonical_seed = 0;
+  std::vector<chart_spr_canonical_candidate_record> canonical_candidates;
+  std::vector<std::size_t> canonical_ranked_stream_indices;
+  std::vector<std::size_t> canonical_exact_verified_stream_indices;
+  std::optional<chart_spr_canonical_exact_evidence>
+      canonical_state_exact_before;
 };
 
 enum class chart_spr_cache_strategy {
@@ -801,10 +976,30 @@ struct chart_spr_search_summary {
   std::uint64_t final_score = 0;
   double total_ms = 0.0;
   double cache_build_ms = 0.0;
+  // The actual initial dense (all-active or pattern-batched) or lazy
+  // inside+outside chart construction span.  Unlike cache_build_ms this does
+  // not include pattern extraction, grammar validation, cache sizing, or
+  // exact-trim initialization.
+  double initial_chart_construction_ms = 0.0;
+  double candidate_generation_ms = 0.0;
+  double exact_initialization_ms = 0.0;
   double local_scoring_ms = 0.0;
   double local_candidates_per_second = 0.0;
   double local_rows_recomputed_per_second = 0.0;
   double exact_verification_ms = 0.0;
+  // Disjoint materialization spans.  materialization_ms is exactly their sum;
+  // see the counter fields above for the inclusion/exclusion contract.
+  double materialization_ms = 0.0;
+  double materialization_exact_verification_ms = 0.0;
+  double materialization_accepted_update_ms = 0.0;
+  double materialization_final_compaction_ms = 0.0;
+  // Observed high-water mark from real verifier entry/exit tracking.  It is
+  // zero when no verifier runs and one for today's serial verifier loop.
+  std::size_t peak_concurrent_exact_verifiers = 0;
+  std::size_t exact_candidate_timing_count = 0;
+  double exact_candidate_verification_ms_min = 0.0;
+  double exact_candidate_verification_ms_mean = 0.0;
+  double exact_candidate_verification_ms_max = 0.0;
   double accepted_rebuild_ms = 0.0;
   double final_compaction_ms = 0.0;
   multisite_keep_mask_kind final_compaction_exactness_kind =
@@ -821,6 +1016,8 @@ struct chart_spr_search_summary {
       chart_spr_cache_strategy::all_active_patterns;
   std::size_t effective_pattern_batch_size = 0;
   std::size_t effective_candidate_batch_size = 0;
+  std::size_t requested_worker_count = 1;
+  std::size_t resolved_worker_count = 1;
   std::size_t local_score_worker_count = 1;
   affected_clade_distribution affected_distribution;
   // Phase 10 cross-cutting surface.  These mirror the selected commit /
@@ -854,6 +1051,8 @@ struct chart_spr_search_result {
   // `build_phase10_chain_identity_report` (phase10_report.hpp); the keys are
   // stable across materialize / rebuild / report round trips.
   std::string chain_identity_report_json;
+  std::optional<chart_spr_canonical_report> canonical_report;
+  std::optional<chart_spr_semantic_digest_report> canonical_digest;
 };
 
 // Search-cache objective convention:
@@ -1263,6 +1462,56 @@ inline multisite_trim_result build_multisite_trim_active(
                               trim_options);
 }
 
+// Build report-only tied-root provenance without changing the trim options
+// used by the search itself.  This companion runs only after the algorithmic
+// trim has succeeded, and callers deliberately invoke it outside semantic
+// verifier / commit catches.  A report failure therefore aborts a canonical
+// correctness run instead of changing candidate validity or acceptance.
+//
+// Score-only trims intentionally have no exact keep mask.  Their scalar and
+// frontier statistics are already the strongest honest evidence available,
+// so they must not be upgraded to a different algorithmic mode merely for the
+// report.
+inline chart_spr_canonical_exact_evidence
+chart_spr_canonicalize_search_trim_evidence(
+    clade_grammar const& grammar, active_site_pattern_set const& patterns,
+    chart_options const& chart_opts,
+    multisite_trim_options const& algorithm_trim_options,
+    multisite_trim_result const& algorithm_trim,
+    std::uint64_t invariant_offset) {
+  if (algorithm_trim.keep_production_exact) {
+    auto companion_options = algorithm_trim_options;
+    companion_options.capture_optimal_root_provenance = true;
+    auto companion_trim = build_multisite_trim_active(
+        grammar, patterns, chart_opts, companion_options);
+    if (companion_trim.optimum != algorithm_trim.optimum ||
+        companion_trim.keep_mask_kind != algorithm_trim.keep_mask_kind ||
+        companion_trim.keep_production_exact !=
+            algorithm_trim.keep_production_exact ||
+        companion_trim.keep_production != algorithm_trim.keep_production ||
+        companion_trim.frontier_sizes_by_clade !=
+            algorithm_trim.frontier_sizes_by_clade ||
+        companion_trim.active_pattern_count !=
+            algorithm_trim.active_pattern_count ||
+        companion_trim.invariant_constant_offset !=
+            algorithm_trim.invariant_constant_offset) {
+      throw std::runtime_error(
+          "chart-SPR canonical report: provenance companion disagrees with "
+          "algorithmic exact trim optimum, keep mask, frontier sizes, or "
+          "pattern metadata");
+    }
+
+    auto evidence = chart_spr_canonicalize_trim_evidence(
+        grammar, companion_trim, invariant_offset);
+    evidence.evidence_kind =
+        "grammar_exact_frontier_provenance_companion";
+    return evidence;
+  }
+
+  return chart_spr_canonicalize_trim_evidence(
+      grammar, algorithm_trim, invariant_offset);
+}
+
 inline multisite_trim_result build_lazy_multisite_trim_active_from_scratch(
     clade_grammar const& grammar, active_site_pattern_set const& patterns,
     chart_options const& options = {},
@@ -1329,6 +1578,82 @@ inline chart_spr_cache_strategy choose_chart_spr_cache_strategy(
              : chart_spr_cache_strategy::pattern_batches;
 }
 
+// One high-water domain is shared by every search-state rebuild in a run.
+// Atomics make this measurement truthful once exact verification is
+// parallelized; today the observed peak is one because the verifier loop is
+// serial.  The guard provides exception-safe entry/exit accounting.
+class chart_spr_exact_verifier_concurrency_tracker {
+ public:
+  void enter() noexcept {
+    auto const now = active_.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto previous = peak_.load(std::memory_order_relaxed);
+    while (previous < now &&
+           !peak_.compare_exchange_weak(previous, now,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+    }
+  }
+
+  void leave() noexcept {
+    active_.fetch_sub(1, std::memory_order_relaxed);
+  }
+
+  [[nodiscard]] std::size_t peak() const noexcept {
+    return peak_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<std::size_t> active_{0};
+  std::atomic<std::size_t> peak_{0};
+};
+
+class chart_spr_exact_verifier_activity {
+ public:
+  explicit chart_spr_exact_verifier_activity(
+      std::shared_ptr<chart_spr_exact_verifier_concurrency_tracker> tracker)
+      : tracker_(std::move(tracker)) {
+    if (tracker_) tracker_->enter();
+  }
+
+  chart_spr_exact_verifier_activity(
+      chart_spr_exact_verifier_activity const&) = delete;
+  chart_spr_exact_verifier_activity& operator=(
+      chart_spr_exact_verifier_activity const&) = delete;
+
+  ~chart_spr_exact_verifier_activity() {
+    if (tracker_) tracker_->leave();
+  }
+
+ private:
+  std::shared_ptr<chart_spr_exact_verifier_concurrency_tracker> tracker_;
+};
+
+// Adds one precisely scoped wall-time span to an instrumentation bucket on
+// every exit path.  In particular, verifier and accepted-update materializers
+// deliberately convert some exceptions into reportable candidate/accept
+// failures; those calls still consumed materialization time and must not vanish
+// from the Phase-0 profile.  This guard changes accounting only, never control
+// flow.
+class chart_spr_elapsed_accumulator {
+ public:
+  explicit chart_spr_elapsed_accumulator(double& destination) noexcept
+      : destination_(&destination), start_(std::chrono::steady_clock::now()) {}
+
+  chart_spr_elapsed_accumulator(chart_spr_elapsed_accumulator const&) = delete;
+  chart_spr_elapsed_accumulator& operator=(
+      chart_spr_elapsed_accumulator const&) = delete;
+
+  ~chart_spr_elapsed_accumulator() noexcept {
+    *destination_ += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - start_)
+                         .count();
+  }
+
+ private:
+  double* destination_;
+  std::chrono::steady_clock::time_point start_;
+};
+
 struct chart_spr_search_state {
   phylo_dag* dag = nullptr;
   clade_grammar grammar;
@@ -1353,6 +1678,11 @@ struct chart_spr_search_state {
   std::optional<lazy_multisite_chart> lazy_chart;
   std::uint64_t composite_lower_bound_without_invariants = 0;
   std::uint64_t composite_lower_bound_with_invariants = 0;
+  double chart_construction_ms = 0.0;
+  double exact_initialization_ms = 0.0;
+  std::shared_ptr<chart_spr_exact_verifier_concurrency_tracker>
+      exact_verifier_concurrency =
+          std::make_shared<chart_spr_exact_verifier_concurrency_tracker>();
 
   // Active-pattern-only exact result.  Add invariant_constant_offset exactly
   // once when comparing/reporting the full objective.  This is mutable so the
@@ -1490,6 +1820,7 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
   chart_build_options.max_trace_choices = 0;
 
   std::uint64_t active_total = 0;
+  auto const chart_construction_start = std::chrono::steady_clock::now();
   if (state.cache_strategy ==
       chart_spr_cache_strategy::all_active_patterns) {
     state.pattern_charts.reserve(
@@ -1504,6 +1835,10 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
           entry.chart.multifurcation_productions_scored;
       state.pattern_charts.push_back(std::move(entry));
     }
+    state.chart_construction_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - chart_construction_start)
+            .count();
     state.resident_pattern_cache_bytes =
         estimate_chart_spr_pattern_cache_bytes(state);
   } else if (state.cache_strategy ==
@@ -1518,6 +1853,10 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
           state.grammar, state.active_patterns.patterns, *state.lazy_chart,
           options);
     }
+    state.chart_construction_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - chart_construction_start)
+            .count();
     active_total = lazy_composite_lower_bound(
         state.grammar, state.active_patterns.patterns, *state.lazy_chart,
         options);
@@ -1544,6 +1883,10 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
             entry.chart.multifurcation_productions_scored;
       }
     }
+    state.chart_construction_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - chart_construction_start)
+            .count();
     state.resident_pattern_cache_bytes =
         state.effective_pattern_batch_size *
         estimate_chart_spr_pattern_row_cache_bytes(state.grammar);
@@ -1556,6 +1899,8 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
           "chart-SPR cached lower bound invariant offset");
 
   if (build_exact_trim) {
+    auto const exact_initialization_start =
+        std::chrono::steady_clock::now();
     if (state.cache_strategy ==
         chart_spr_cache_strategy::lazy_multisite_chart) {
       if (!state.lazy_chart) {
@@ -1570,6 +1915,10 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
       state.exact_trim_active_only = build_multisite_trim_active(
           state.grammar, state.active_patterns, options, trim_options);
     }
+    state.exact_initialization_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - exact_initialization_start)
+            .count();
   }
   return state;
 }
@@ -2439,6 +2788,12 @@ inline void add_chart_spr_search_counters(
       src.overlay_materializations_for_accept_materialization;
   dst.overlay_materializations_for_final_compaction +=
       src.overlay_materializations_for_final_compaction;
+  dst.materialization_exact_verification_ms +=
+      src.materialization_exact_verification_ms;
+  dst.materialization_accepted_update_ms +=
+      src.materialization_accepted_update_ms;
+  dst.materialization_final_compaction_ms +=
+      src.materialization_final_compaction_ms;
   dst.sidecar_rebuilds_after_accept += src.sidecar_rebuilds_after_accept;
   dst.full_composite_rebuilds += src.full_composite_rebuilds;
   dst.local_candidate_scores += src.local_candidate_scores;
@@ -3019,6 +3374,15 @@ inline std::size_t normalize_chart_spr_worker_count(
   return std::max<std::size_t>(1, requested);
 }
 
+inline std::size_t requested_chart_spr_worker_count(
+    chart_spr_search_options const& options) {
+  // Preserve direct library callers of the legacy field.  A non-default
+  // unified value wins; otherwise a non-default legacy value is the request.
+  // The CLI rejects conflicting aliases before constructing options.
+  return options.worker_count != 1 ? options.worker_count
+                                   : options.local_score_worker_count;
+}
+
 inline std::vector<chart_spr_candidate_score> score_candidates_locally_all_cache(
     chart_spr_search_state const& state,
     std::vector<grammar_spr_candidate> const& candidates,
@@ -3314,15 +3678,25 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state(
   if (!candidate.valid) return candidate;
   ++state.counters.exact_verifications;
 
+  overlay_materialization_result materialized;
+  multisite_trim_result new_trim;
   try {
     auto const& old_trim =
         ensure_chart_spr_state_exact_trim(state, trim_options);
     auto overlay = overlay_from_candidate(state.grammar, candidate.candidate);
-    auto materialized = materialize_overlay_grammar(overlay);
+    {
+      chart_spr_elapsed_accumulator materialization_timer{
+          state.counters.materialization_exact_verification_ms};
+      if (candidate.force_exact_materializer_failure_for_tests) {
+        throw std::runtime_error(
+            "forced exact materializer failure for tests");
+      }
+      materialized = materialize_overlay_grammar(overlay);
+    }
     ++state.counters.full_overlay_materializations;
     ++state.counters.overlay_materializations_for_exact_verification;
 
-    auto new_trim =
+    new_trim =
         state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart
             ? build_lazy_multisite_trim_active_from_scratch(
                   materialized.grammar, state.active_patterns,
@@ -3346,6 +3720,20 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state(
   } catch (std::exception const& e) {
     candidate.valid = false;
     candidate.invalid_reason = e.what();
+  }
+  // Canonical evidence is report-only.  Construct it outside the verifier's
+  // semantic catch so a report bug cannot silently invalidate a candidate or
+  // change acceptance; it must abort the correctness-only canonical run.
+  if (candidate.valid && candidate.exact &&
+      candidate.canonical_stream_index !=
+          (std::numeric_limits<std::size_t>::max)()) {
+    chart_spr_force_canonical_evidence_failure_for_tests(candidate);
+    candidate.canonical_exact_evidence =
+        std::make_shared<chart_spr_canonical_exact_evidence>(
+            chart_spr_canonicalize_search_trim_evidence(
+                materialized.grammar, state.active_patterns,
+                state.chart_opts, trim_options, new_trim,
+                state.invariant_constant_offset));
   }
   return candidate;
 }
@@ -4460,6 +4848,16 @@ inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
     candidate.valid = false;
     candidate.invalid_reason = e.what();
   }
+  if (candidate.valid && candidate.exact &&
+      candidate.canonical_stream_index !=
+          (std::numeric_limits<std::size_t>::max)()) {
+    chart_spr_force_canonical_evidence_failure_for_tests(candidate);
+    candidate.canonical_exact_evidence =
+        std::make_shared<chart_spr_canonical_exact_evidence>(
+            chart_spr_canonicalize_fixed_topology_evidence(
+                state.grammar, candidate.topology_selection,
+                state.invariant_constant_offset));
+  }
   return candidate;
 }
 
@@ -4485,10 +4883,28 @@ inline chart_spr_candidate_score verify_candidate_for_acceptance(
       return verify_candidate_exact_against_state(
           state, std::move(candidate), options.exact_trim);
     case chart_spr_acceptance_mode::fixed_topology_exact:
+      {
+      chart_spr_candidate_score verified;
       if (state.fixed_topology_exact_verifier) {
-        return state.fixed_topology_exact_verifier(state, std::move(candidate));
+        verified = state.fixed_topology_exact_verifier(state,
+                                                       std::move(candidate));
+      } else {
+        verified = verify_candidate_fixed_topology_exact(
+            state, std::move(candidate));
       }
-      return verify_candidate_fixed_topology_exact(state, std::move(candidate));
+      if (verified.canonical_stream_index !=
+              (std::numeric_limits<std::size_t>::max)() &&
+          verified.exact &&
+          !verified.canonical_exact_evidence) {
+        chart_spr_force_canonical_evidence_failure_for_tests(verified);
+        verified.canonical_exact_evidence =
+            std::make_shared<chart_spr_canonical_exact_evidence>(
+                chart_spr_canonicalize_fixed_topology_evidence(
+                    state.grammar, verified.topology_selection,
+                    state.invariant_constant_offset));
+      }
+      return verified;
+      }
   }
   return candidate;
 }
@@ -4620,7 +5036,7 @@ inline std::size_t chart_spr_effective_candidate_batch_size(
     return std::max<std::size_t>(1, options.cache.candidate_batch_size);
   }
   auto workers = chart_spr_search_detail::normalize_chart_spr_worker_count(
-      options.local_score_worker_count);
+      chart_spr_search_detail::requested_chart_spr_worker_count(options));
   if (state.cache_strategy == chart_spr_cache_strategy::pattern_batches) {
     return std::max<std::size_t>(1, workers * 4);
   }
@@ -4688,6 +5104,21 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   result.state_score_before =
       chart_spr_iteration_state_score_before(state, options);
   result.state_score_after = result.state_score_before;
+  bool const capture_semantics =
+      options.semantic_capture != chart_spr_semantic_capture_mode::off;
+  if (capture_semantics) {
+    result.canonical_seed = options.seed;
+    if (options.acceptance_mode ==
+        chart_spr_acceptance_mode::exact_multisite) {
+      auto const& old_trim =
+          ensure_chart_spr_state_exact_trim(state, options.exact_trim);
+      result.canonical_state_exact_before =
+          chart_spr_canonicalize_search_trim_evidence(
+              state.grammar, state.active_patterns, state.chart_opts,
+              options.exact_trim, old_trim,
+              state.invariant_constant_offset);
+    }
+  }
 
   auto enumeration = chart_spr_iteration_enumeration_options(options);
   if (enumeration.source != chart_spr_candidate_source::grammar &&
@@ -4702,7 +5133,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   std::vector<std::size_t> affected_counts;
 
   auto worker_count = chart_spr_search_detail::normalize_chart_spr_worker_count(
-      options.local_score_worker_count);
+      chart_spr_search_detail::requested_chart_spr_worker_count(options));
   auto candidate_batch_size = chart_spr_effective_candidate_batch_size(
       state, options);
   state.effective_candidate_batch_size = candidate_batch_size;
@@ -4727,6 +5158,22 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
                                    .count();
     for (auto& scored : scored_batch) {
       ++result.candidates_scored;
+      if (capture_semantics) {
+        auto const stream_index = result.canonical_candidates.size();
+        scored.canonical_stream_index = stream_index;
+        scored.force_canonical_evidence_failure_for_tests =
+            options.force_canonical_evidence_failure_for_tests;
+        chart_spr_canonical_candidate_record record;
+        record.stream_index = stream_index;
+        record.signature = chart_spr_candidate_sample_signature(
+            state.grammar, scored.candidate);
+        record.valid = scored.valid;
+        record.invalid_reason = scored.invalid_reason;
+        record.affected_clade_count = scored.affected_clade_count;
+        record.lower_bound =
+            chart_spr_canonicalize_objective_score(scored.lower_bound);
+        result.canonical_candidates.push_back(std::move(record));
+      }
       if (!scored.valid) {
         ++result.candidate_score_failures;
         continue;
@@ -4741,9 +5188,12 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     candidate_batch.clear();
   };
 
+  double generation_callback_ms = 0.0;
+  auto const generation_start = std::chrono::steady_clock::now();
   auto generation = for_each_grammar_spr_candidate(
       state.grammar, enumeration,
       [&](grammar_spr_candidate const& candidate) {
+        auto const callback_start = std::chrono::steady_clock::now();
         candidate_batch.push_back(candidate);
         if (candidate_batch.size() >= candidate_batch_size) {
           process_candidate_batch();
@@ -4751,11 +5201,25 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
                   chart_spr_candidate_selection_mode::lower_bound_first_improvement &&
               result.local_improving_candidates > 0) {
             stop_after_batch = true;
+            generation_callback_ms +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - callback_start)
+                    .count();
             return false;
           }
         }
+        generation_callback_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - callback_start)
+                .count();
         return true;
       });
+  auto const generation_total_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - generation_start)
+          .count();
+  result.candidate_generation_ms =
+      std::max(0.0, generation_total_ms - generation_callback_ms);
   if (!stop_after_batch) process_candidate_batch();
 
   result.candidate_generation = generation;
@@ -4765,6 +5229,25 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       summarize_affected_clade_counts(affected_counts);
   result.affected_clade_counts = std::move(affected_counts);
   record_chart_spr_candidate_generation_stats(generation, state.counters);
+
+  if (capture_semantics) {
+    result.canonical_ranked_stream_indices.reserve(ranked.size());
+    for (std::size_t rank = 0; rank < ranked.size(); ++rank) {
+      if (ranked[rank].canonical_stream_index ==
+          (std::numeric_limits<std::size_t>::max)()) {
+        throw std::logic_error(
+            "chart-SPR canonical report: retained candidate missing stream "
+            "index");
+      }
+      auto stream_index = ranked[rank].canonical_stream_index;
+      if (stream_index >= result.canonical_candidates.size()) {
+        throw std::logic_error(
+            "chart-SPR canonical report: ranked stream index out of range");
+      }
+      result.canonical_ranked_stream_indices.push_back(stream_index);
+      result.canonical_candidates[stream_index].ranked_index = rank;
+    }
+  }
 
   if (options.acceptance_mode ==
       chart_spr_acceptance_mode::lower_bound_heuristic) {
@@ -4785,15 +5268,55 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       attach_fixed_topology_selection_for_acceptance(state, candidate, options);
       auto exact_verifications_before = state.counters.exact_verifications;
       auto exact_start = std::chrono::steady_clock::now();
-      auto verified_candidate = verify_candidate_for_acceptance(
-          state, std::move(candidate), options);
-      result.exact_verification_ms +=
+      chart_spr_candidate_score verified_candidate;
+      if (candidate.valid) {
+        chart_spr_exact_verifier_activity verifier_activity{
+            state.exact_verifier_concurrency};
+        verified_candidate = verify_candidate_for_acceptance(
+            state, std::move(candidate), options);
+      } else {
+        // Selection/certificate attachment can invalidate a candidate before
+        // verifier entry.  Such a candidate has timing diagnostics but must
+        // not inflate the observed verifier-concurrency high-water mark.
+        verified_candidate = std::move(candidate);
+      }
+      auto const exact_candidate_ms =
           std::chrono::duration<double, std::milli>(
               std::chrono::steady_clock::now() - exact_start)
               .count();
+      result.exact_verification_ms += exact_candidate_ms;
+      result.exact_candidate_verification_ms.push_back(exact_candidate_ms);
       if (state.counters.exact_verifications > exact_verifications_before ||
           verified_candidate.exact) {
         ++result.candidates_exact_verified;
+      }
+      if (capture_semantics) {
+        if (verified_candidate.canonical_stream_index ==
+            (std::numeric_limits<std::size_t>::max)()) {
+          throw std::logic_error(
+              "chart-SPR canonical report: verified candidate missing "
+              "stream index");
+        }
+        auto stream_index = verified_candidate.canonical_stream_index;
+        if (stream_index >= result.canonical_candidates.size()) {
+          throw std::logic_error(
+              "chart-SPR canonical report: verified stream index out of "
+              "range");
+        }
+        auto& record = result.canonical_candidates[stream_index];
+        record.exact_verification_index =
+            result.canonical_exact_verified_stream_indices.size();
+        result.canonical_exact_verified_stream_indices.push_back(stream_index);
+        record.valid = verified_candidate.valid;
+        record.invalid_reason = verified_candidate.invalid_reason;
+        if (verified_candidate.exact) {
+          record.exact = chart_spr_canonicalize_objective_score(
+              *verified_candidate.exact);
+        }
+        if (verified_candidate.canonical_exact_evidence) {
+          record.exact_evidence =
+              *verified_candidate.canonical_exact_evidence;
+        }
       }
       verified.push_back(std::move(verified_candidate));
     }

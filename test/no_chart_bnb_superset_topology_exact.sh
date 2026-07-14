@@ -53,7 +53,7 @@ awk '
 # Benchmark guardrail: lower-bound chart-SPR must be labelled as a heuristic
 # objective, with validated parsimony kept in separate columns.
 spr_bench=tools/wric_spr_search_benchmark.sh
-if ! grep -q 'objective="composite_lower_bound_heuristic"' "$spr_bench"; then
+if ! grep -Eq '(objective|OBJECTIVE)="?composite_lower_bound_heuristic"?' "$spr_bench"; then
   echo "grammar_lower_bound benchmark mode is not labelled composite_lower_bound_heuristic" >&2
   status=1
 fi
@@ -65,7 +65,7 @@ fi
 if awk '
   /grammar_lower_bound\)/ { in_block = 1 }
   in_block && /;;/ { in_block = 0 }
-  in_block && /objective="(grammar_exact|fixed_topology_exact|exact)/ { bad = 1 }
+  in_block && /(objective|OBJECTIVE)="?(grammar_exact|fixed_topology_exact|exact)/ { bad = 1 }
   END { exit bad ? 1 : 0 }
 ' "$spr_bench"; then
   :

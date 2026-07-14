@@ -146,9 +146,12 @@ chart_spr_search_state rebuild_chart_spr_search_state_after_accept(
         previous_state.invariant_constant_offset;
     active_build.skipped_invariant_site_count =
         previous_state.skipped_invariant_site_count;
-    return build_chart_spr_search_state_from_active(
+    auto state = build_chart_spr_search_state_from_active(
         rebuilt_dag, std::move(rebuilt_grammar), std::move(active_build),
         options.chart, build_exact, options.exact_trim, options.cache);
+    state.exact_verifier_concurrency =
+        previous_state.exact_verifier_concurrency;
+    return state;
   }
 
   auto active_build = make_active_search_patterns(
@@ -156,6 +159,7 @@ chart_spr_search_state rebuild_chart_spr_search_state_after_accept(
   auto state = build_chart_spr_search_state_from_active(
       rebuilt_dag, std::move(rebuilt_grammar), std::move(active_build),
       options.chart, build_exact, options.exact_trim, options.cache);
+  state.exact_verifier_concurrency = previous_state.exact_verifier_concurrency;
   ++state.counters.pattern_rebuilds;
   return state;
 }
@@ -735,6 +739,8 @@ chart_spr_compact_and_verify_local_update_state(
   ++counters.overlay_materializations_for_final_compaction;
   auto compacted = compact_overlay_chain_to_dag(source, chain,
                                                 compaction_options);
+  counters.materialization_final_compaction_ms +=
+      compacted.materialization_ms;
   if (!compacted.all_witness_topologies_present()) {
     throw std::runtime_error(
         "chart SPR local accepted-state final compaction: compacted output "
@@ -1268,7 +1274,12 @@ chart_spr_fixed_topology_materialized_oracle_pattern_scores(
   (void)validate_grammar_topology(state.grammar, before_topology);
 
   auto overlay = overlay_from_candidate(state.grammar, candidate.candidate);
-  auto materialized = materialize_overlay_grammar(overlay);
+  overlay_materialization_result materialized;
+  {
+    chart_spr_elapsed_accumulator materialization_timer{
+        state.counters.materialization_exact_verification_ms};
+    materialized = materialize_overlay_grammar(overlay);
+  }
   ++state.counters.full_overlay_materializations;
   ++state.counters.overlay_materializations_for_oracle;
 
@@ -2153,7 +2164,11 @@ chart_spr_transient_extension chart_spr_build_transient_extension(
   // materialized grammar -- become the authoritative source, and switching to
   // `overlay_from_candidate` now would be thrown away then.  A small win is
   // available now if Phase 12 is deferred indefinitely.
-  ext.materialized = materialize_overlay_chain(ext.chain);
+  {
+    chart_spr_elapsed_accumulator materialization_timer{
+        state.counters.materialization_exact_verification_ms};
+    ext.materialized = materialize_overlay_chain(ext.chain);
+  }
   return ext;
 }
 
@@ -2193,7 +2208,12 @@ chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
   // counting so a regression is visible without being folded into the
   // transient extension counter.
   auto cold_overlay = overlay_from_candidate(state.grammar, candidate.candidate);
-  auto cold_materialized = materialize_overlay_grammar(cold_overlay);
+  overlay_materialization_result cold_materialized;
+  {
+    chart_spr_elapsed_accumulator materialization_timer{
+        state.counters.materialization_exact_verification_ms};
+    cold_materialized = materialize_overlay_grammar(cold_overlay);
+  }
   ++state.counters.full_overlay_materializations;
   ++state.counters.overlay_materializations_for_oracle;
   auto cold_trim = build_multisite_trim_active(
@@ -2298,6 +2318,8 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
   // transient-extension counter (never under full_overlay_materializations).
   ++state.counters.exact_verifications;
   ++state.counters.transient_chain_extensions_for_verification;
+  multisite_trim_result new_trim;
+  std::uint64_t authoritative_new_optimum = multisite_score_inf;
   try {
     // Old score: the current tip's exact optimum (cached in state, lazily
     // built).  Same source the cold path reads.
@@ -2305,7 +2327,7 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
         ensure_chart_spr_state_exact_trim(state, trim_options);
 
     // New score: B&B exact optimum of the extended grammar.
-    auto new_trim =
+    new_trim =
         state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart
             ? build_lazy_multisite_trim_active_from_scratch(
                   ext.materialized.grammar, state.active_patterns,
@@ -2345,7 +2367,7 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
     // literal "weakened" is not honored.  The work IS recorded as a fallback
     // (`transient_chain_extension_fallbacks`) so a regression to a wrong
     // transient result is visible in the counters.
-    std::uint64_t authoritative_new_optimum = new_trim.optimum;
+    authoritative_new_optimum = new_trim.optimum;
     if (sub.verify_transient_chain_extension_oracle_for_tests ||
         sub.force_transient_chain_extension_oracle_mismatch_for_tests) {
       auto oracle = chart_spr_check_transient_extension_oracle(
@@ -2372,6 +2394,32 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
   } catch (std::exception const& e) {
     candidate.valid = false;
     candidate.invalid_reason = e.what();
+  }
+  // Report construction is deliberately outside the verifier catch.  A
+  // canonicalization failure is a hard oracle failure, never an algorithmic
+  // invalid-candidate outcome.
+  if (candidate.valid && candidate.exact &&
+      candidate.canonical_stream_index !=
+          (std::numeric_limits<std::size_t>::max)()) {
+    chart_spr_force_canonical_evidence_failure_for_tests(candidate);
+    if (authoritative_new_optimum == new_trim.optimum) {
+      candidate.canonical_exact_evidence =
+          std::make_shared<chart_spr_canonical_exact_evidence>(
+              chart_spr_canonicalize_search_trim_evidence(
+                  ext.materialized.grammar, state.active_patterns,
+                  state.chart_opts, trim_options, new_trim,
+                  state.invariant_constant_offset));
+    } else {
+      chart_spr_canonical_exact_evidence evidence;
+      evidence.evidence_kind =
+          "grammar_exact_oracle_fallback_frontier_unavailable";
+      evidence.keep_mask_kind = "unavailable_after_oracle_fallback";
+      evidence.optimum_active = authoritative_new_optimum;
+      evidence.invariant_offset = state.invariant_constant_offset;
+      candidate.canonical_exact_evidence =
+          std::make_shared<chart_spr_canonical_exact_evidence>(
+              std::move(evidence));
+    }
   }
   return candidate;
 }
@@ -2953,7 +3001,12 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     // splice) is Phase 6/7 scope; the persistent caches already remove the
     // expensive per-accept chart rescoring.
     auto previous_dense_clade_to_chain_ref = sub.dense_clade_to_chain_ref;
-    auto materialized = materialize_overlay_chain(*sub.chain);
+    overlay_materialization_result materialized;
+    {
+      chart_spr_elapsed_accumulator materialization_timer{
+          counters.materialization_accepted_update_ms};
+      materialized = materialize_overlay_chain(*sub.chain);
+    }
     auto lazy_stats = chart_spr_refresh_lazy_chart_after_local_commit(
         state, *sub.chain, materialized, previous_dense_clade_to_chain_ref);
     chart_spr_set_tip_maps_from_materialization(sub, materialized);
@@ -3026,6 +3079,16 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.overlay_materializations_for_accept_materialization;
   summary.overlay_materializations_for_final_compaction =
       counters.overlay_materializations_for_final_compaction;
+  summary.materialization_exact_verification_ms =
+      counters.materialization_exact_verification_ms;
+  summary.materialization_accepted_update_ms =
+      counters.materialization_accepted_update_ms;
+  summary.materialization_final_compaction_ms =
+      counters.materialization_final_compaction_ms;
+  summary.materialization_ms =
+      summary.materialization_exact_verification_ms +
+      summary.materialization_accepted_update_ms +
+      summary.materialization_final_compaction_ms;
   summary.sidecar_rebuilds_after_accept =
       counters.sidecar_rebuilds_after_accept;
   summary.candidate_accepts_attempted = counters.candidate_accepts_attempted;
@@ -3222,6 +3285,9 @@ chart_spr_search_result run_chart_spr_search(
   ++state.counters.grammar_rebuilds;
   result.summary.cache_build_ms = chart_spr_elapsed_ms(
       cache_start, std::chrono::steady_clock::now());
+  result.summary.initial_chart_construction_ms =
+      state.chart_construction_ms;
+  result.summary.exact_initialization_ms = state.exact_initialization_ms;
   result.summary.initial_score =
       chart_spr_iteration_state_score_before(state, options);
   result.summary.final_score = result.summary.initial_score;
@@ -3241,11 +3307,116 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.cache_strategy = state.cache_strategy;
   result.summary.effective_pattern_batch_size =
       state.effective_pattern_batch_size;
-  result.summary.local_score_worker_count =
+  result.summary.requested_worker_count =
+      chart_spr_search_detail::requested_chart_spr_worker_count(options);
+  result.summary.resolved_worker_count =
       chart_spr_search_detail::normalize_chart_spr_worker_count(
-          options.local_score_worker_count);
+          result.summary.requested_worker_count);
+  result.summary.local_score_worker_count =
+      result.summary.resolved_worker_count;
   chart_spr_refresh_search_summary_from_current_lazy_chart(result.summary,
                                                           state);
+  if (options.semantic_capture != chart_spr_semantic_capture_mode::off) {
+    chart_spr_canonical_report canonical;
+    canonical.capture_mode = options.semantic_capture;
+    auto& contract = canonical.contract;
+    contract.acceptance =
+        chart_spr_acceptance_mode_name(options.acceptance_mode);
+    switch (options.acceptance_mode) {
+      case chart_spr_acceptance_mode::exact_multisite:
+        contract.objective = "grammar_exact";
+        break;
+      case chart_spr_acceptance_mode::fixed_topology_exact:
+        contract.objective = "fixed_topology_exact";
+        break;
+      case chart_spr_acceptance_mode::lower_bound_heuristic:
+        contract.objective = "composite_lower_bound_heuristic";
+        break;
+    }
+    contract.candidate_selection =
+        chart_spr_candidate_selection_mode_name(options.candidate_selection);
+    contract.candidate_source =
+        chart_spr_candidate_source_name(options.enumeration.source);
+    contract.topology_selection =
+        options.acceptance_mode ==
+                chart_spr_acceptance_mode::fixed_topology_exact
+            ? "deterministic_selector:" +
+                  options.fixed_topology_selector_name
+            : "none";
+    contract.commit_mode = chart_spr_commit_mode_name(options.commit_mode);
+    contract.accepted_state_update =
+        options.rebuild_after_accept ? "materialize_rebuild"
+                                     : "overlay_chain_local_commit";
+    contract.verification_mode =
+        chart_spr_verification_mode_name(options.verification_mode);
+    contract.chain_per_accept_exactness =
+        result.summary.chain_per_accept_exactness_label;
+    contract.score_convention =
+        "active_cache_plus_single_invariant_offset";
+    contract.dominance_mode =
+        multisite_dominance_mode_name(options.exact_trim.dominance_mode);
+    contract.keep_mask_contract = options.exact_trim.require_exact_keep_mask
+                                      ? "exact_required"
+                                      : "score_only_allowed";
+    contract.polytomy_mode = options.semantic_polytomy_mode;
+    contract.refinement_exactness = options.semantic_refinement_exactness;
+    contract.candidate_cap_semantics =
+        options.enumeration.max_candidates_is_post_dedup ? "post_dedup"
+                                                         : "pre_dedup";
+    contract.max_iterations = options.max_iterations;
+    contract.max_candidates = options.max_candidates_per_iteration != 0
+                                  ? options.max_candidates_per_iteration
+                                  : options.enumeration.max_candidates;
+    contract.top_k_exact = options.top_k_exact_verify;
+    contract.seed = options.seed;
+    contract.score_ua_edge = options.chart.score_ua_edge;
+    contract.use_bound_pruning = options.exact_trim.use_bound_pruning;
+    contract.require_exact_keep_mask =
+        options.exact_trim.require_exact_keep_mask;
+    contract.randomize_order = options.enumeration.randomize_order;
+    contract.reservoir_sample = options.enumeration.reservoir_sample;
+    contract.include_immediate_reversals =
+        options.enumeration.include_immediate_reversal_candidates;
+    contract.include_root_moves = options.enumeration.include_root_moves;
+    contract.include_neutral_or_reversal_candidates =
+        options.enumeration.include_neutral_or_reversal_candidates;
+    contract.sampled_tree_count = options.enumeration.sampled_tree_count;
+    contract.sampled_tree_radius =
+        options.enumeration.sampled_tree_spr_radius;
+    contract.sampled_tree_score_threshold =
+        options.enumeration.sampled_tree_score_threshold;
+    contract.max_upward_path_expansions =
+        options.enumeration.max_upward_path_expansions;
+    contract.max_path_pairs =
+        options.enumeration.max_path_pairs_considered;
+    contract.min_moved_clade_size =
+        options.enumeration.min_moved_clade_size;
+    contract.max_moved_clade_size =
+        options.enumeration.max_moved_clade_size;
+    contract.min_target_clade_size =
+        options.enumeration.min_target_clade_size;
+    contract.max_target_clade_size =
+        options.enumeration.max_target_clade_size;
+    contract.max_affected_clades =
+        options.enumeration.max_estimated_affected_clades;
+    contract.max_frontier_entries =
+        options.exact_trim.max_frontier_entries_per_clade;
+    contract.polytomy_max_exact_arity =
+        options.semantic_polytomy_max_exact_arity;
+    contract.polytomy_max_shapes = options.semantic_polytomy_max_shapes;
+    contract.polytomy_max_productions =
+        options.semantic_polytomy_max_productions;
+    contract.polytomy_max_clades = options.semantic_polytomy_max_clades;
+    canonical.active_pattern_count =
+        state.active_patterns.patterns.patterns.size();
+    canonical.skipped_invariant_site_count =
+        state.skipped_invariant_site_count;
+    canonical.invariant_constant_offset = state.invariant_constant_offset;
+    canonical.initial_score = result.summary.initial_score;
+    canonical.chain_base_production_keys =
+        chart_spr_canonical_grammar_production_keys(state.grammar);
+    result.canonical_report = std::move(canonical);
+  }
   std::vector<std::size_t> aggregate_affected_counts;
   std::optional<chart_spr_candidate_score> last_local_update_accepted;
   std::optional<chart_spr_recorded_chain_objective>
@@ -3316,8 +3487,25 @@ chart_spr_search_result run_chart_spr_search(
                                                         iteration_options,
                                                         iter);
     result.summary.candidates_generated += iteration.candidates_generated;
+    result.summary.candidate_generation_ms +=
+        iteration.candidate_generation_ms;
     result.summary.local_scoring_ms += iteration.local_scoring_ms;
     result.summary.exact_verification_ms += iteration.exact_verification_ms;
+    for (double candidate_ms :
+         iteration.exact_candidate_verification_ms) {
+      if (result.summary.exact_candidate_timing_count == 0) {
+        result.summary.exact_candidate_verification_ms_min = candidate_ms;
+        result.summary.exact_candidate_verification_ms_max = candidate_ms;
+      } else {
+        result.summary.exact_candidate_verification_ms_min = std::min(
+            result.summary.exact_candidate_verification_ms_min,
+            candidate_ms);
+        result.summary.exact_candidate_verification_ms_max = std::max(
+            result.summary.exact_candidate_verification_ms_max,
+            candidate_ms);
+      }
+      ++result.summary.exact_candidate_timing_count;
+    }
     aggregate_affected_counts.insert(
         aggregate_affected_counts.end(), iteration.affected_clade_counts.begin(),
         iteration.affected_clade_counts.end());
@@ -3343,8 +3531,13 @@ chart_spr_search_result run_chart_spr_search(
     bool local_commit_mutated_shared_state = false;
     try {
       if (options.rebuild_after_accept) {
-        auto materialized = materialize_chart_spr_accepted_candidate(
-            state, *iteration.accepted);
+        rank3_option_b_result materialized;
+        {
+          chart_spr_elapsed_accumulator materialization_timer{
+              attempt_counters.materialization_accepted_update_ms};
+          materialized = materialize_chart_spr_accepted_candidate(
+              state, *iteration.accepted);
+        }
         ++attempt_counters.full_overlay_materializations;
         ++attempt_counters.overlay_materializations_for_accept_materialization;
         ++attempt_counters.grammar_rebuilds;
@@ -3354,6 +3547,8 @@ chart_spr_search_result run_chart_spr_search(
         auto tentative_state = rebuild_chart_spr_search_state_after_accept(
             state, materialized.dag, std::move(materialized.rebuilt.grammar),
             options, reused_patterns);
+        result.summary.exact_initialization_ms +=
+            tentative_state.exact_initialization_ms;
         chart_spr_add_search_state_rebuild_counters(
             attempt_counters, tentative_state.counters, true);
         tentative_state.counters = attempt_counters;
@@ -3596,6 +3791,29 @@ chart_spr_search_result run_chart_spr_search(
         *local_commit_substrate->chain);
     result.chain_identity_report_json =
         emit_phase10_chain_identity_report_json(identity);
+    if (result.canonical_report) {
+      auto canonical_key = [&](rank3_production_taxa_key const& key) {
+        return chart_spr_canonical_production_sample_key(
+            state.grammar, key.parent, key.children);
+      };
+      result.canonical_report->chain_base_production_keys.clear();
+      for (auto const& key : identity.base_production_keys) {
+        result.canonical_report->chain_base_production_keys.push_back(
+            canonical_key(key));
+      }
+      for (auto const& source : identity.entries) {
+        chart_spr_canonical_chain_entry entry;
+        entry.position = source.position;
+        entry.commit_source = source.commit_source;
+        for (auto const& key : source.added_production_keys) {
+          entry.added_production_keys.push_back(canonical_key(key));
+        }
+        for (auto const& key : source.tombstoned_production_keys) {
+          entry.tombstoned_production_keys.push_back(canonical_key(key));
+        }
+        result.canonical_report->chain_entries.push_back(std::move(entry));
+      }
+    }
   }
 
   result.counters = state.counters;
@@ -3616,6 +3834,10 @@ chart_spr_search_result run_chart_spr_search(
       state.effective_pattern_batch_size;
   result.summary.total_ms = chart_spr_elapsed_ms(
       total_start, std::chrono::steady_clock::now());
+  result.summary.peak_concurrent_exact_verifiers =
+      state.exact_verifier_concurrency
+          ? state.exact_verifier_concurrency->peak()
+          : 0;
   result.summary.effective_candidate_batch_size =
       state.effective_candidate_batch_size;
   chart_spr_refresh_search_summary_from_current_lazy_chart(result.summary,
@@ -3628,8 +3850,94 @@ chart_spr_search_result run_chart_spr_search(
     result.summary.local_rows_recomputed_per_second =
         static_cast<double>(result.summary.local_rows_recomputed) / seconds;
   }
+  if (result.summary.exact_candidate_timing_count != 0) {
+    result.summary.exact_candidate_verification_ms_mean =
+        result.summary.exact_verification_ms /
+        static_cast<double>(result.summary.exact_candidate_timing_count);
+  }
   result.summary.affected_distribution =
       summarize_affected_clade_counts(std::move(aggregate_affected_counts));
+  if (result.canonical_report) {
+    auto& canonical = *result.canonical_report;
+    canonical.initial_score = result.summary.initial_score;
+    canonical.iterations.reserve(result.iterations.size());
+    for (auto const& source : result.iterations) {
+      chart_spr_canonical_iteration_record iteration;
+      iteration.iteration = source.iteration;
+      iteration.seed = source.canonical_seed;
+      iteration.state_score_before = source.state_score_before;
+      iteration.state_score_after = source.state_score_after;
+      iteration.generation_stop_reason =
+          chart_spr_candidate_stop_reason_name(
+              source.candidate_generation.stop_reason);
+      iteration.candidates_generated = source.candidates_generated;
+      iteration.candidates_scored = source.candidates_scored;
+      iteration.candidates_exact_verified =
+          source.candidates_exact_verified;
+      iteration.unverified_candidates_may_contain_improvements =
+          source.unverified_candidates_may_contain_improvements;
+      iteration.candidates = source.canonical_candidates;
+      iteration.ranked_stream_indices =
+          source.canonical_ranked_stream_indices;
+      iteration.exact_verified_stream_indices =
+          source.canonical_exact_verified_stream_indices;
+      iteration.accepted_move_present = source.accepted.has_value();
+      iteration.accepted_move_committed = source.accepted_move_committed;
+      iteration.post_materialization_rejected =
+          source.post_materialization_rejected;
+      iteration.no_accept_reason = source.no_accept_reason;
+      iteration.post_materialization_rejection_reason =
+          source.post_materialization_rejection_reason;
+      iteration.state_exact_before = source.canonical_state_exact_before;
+      if (source.accepted) {
+        if (source.accepted->canonical_stream_index ==
+            (std::numeric_limits<std::size_t>::max)()) {
+          throw std::logic_error(
+              "chart-SPR canonical report: accepted candidate missing "
+              "stream index");
+        }
+        auto stream_index = source.accepted->canonical_stream_index;
+        if (stream_index >= iteration.candidates.size()) {
+          throw std::logic_error(
+              "chart-SPR canonical report: accepted stream index out of "
+              "range");
+        }
+        iteration.selected_stream_index = stream_index;
+        iteration.selected_signature =
+            iteration.candidates[stream_index].signature;
+      }
+      canonical.iterations.push_back(std::move(iteration));
+    }
+    canonical.final_score = result.summary.final_score;
+    canonical.accepted_moves = result.summary.accepted_moves;
+    canonical.final_clade_keys =
+        chart_spr_canonical_grammar_clade_keys(state.grammar);
+    canonical.final_production_keys =
+        chart_spr_canonical_grammar_production_keys(state.grammar);
+    if (options.acceptance_mode ==
+        chart_spr_acceptance_mode::exact_multisite) {
+      auto const& final_trim =
+          ensure_chart_spr_state_exact_trim(state, options.exact_trim);
+      canonical.final_exact = chart_spr_canonicalize_search_trim_evidence(
+          state.grammar, state.active_patterns, state.chart_opts,
+          options.exact_trim, final_trim,
+          state.invariant_constant_offset);
+    } else if (options.acceptance_mode ==
+                   chart_spr_acceptance_mode::fixed_topology_exact &&
+               last_local_update_accepted &&
+               last_local_update_accepted->exact) {
+      canonical.final_exact =
+          chart_spr_canonicalize_fixed_topology_evidence(
+              state.grammar,
+              last_local_update_accepted->topology_selection,
+              state.invariant_constant_offset);
+      canonical.final_exact->optimum_active =
+          last_local_update_accepted->exact->value.new_score -
+          state.invariant_constant_offset;
+    }
+    result.canonical_digest =
+        build_chart_spr_semantic_digest_report(canonical);
+  }
   return result;
 }
 

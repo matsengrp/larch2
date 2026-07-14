@@ -829,6 +829,21 @@ struct multisite_trim_options {
 
   // 0 means unlimited.
   std::size_t max_frontier_entries_per_clade = 0;
+
+  // Opt-in semantic-oracle evidence.  When enabled, retain the equality-
+  // deduplicated optimal root cost vectors together with the union of
+  // production provenance represented by each vector.  This is deliberately
+  // disabled by default: ordinary trimming needs only the aggregate keep mask
+  // and must not pay to copy root-frontier vectors or masks.
+  bool capture_optimal_root_provenance = false;
+};
+
+struct multisite_optimal_root_provenance_class {
+  std::vector<chart_cost> cost;
+  std::vector<bool> used_production;
+
+  bool operator==(multisite_optimal_root_provenance_class const&) const =
+      default;
 };
 
 struct multisite_trim_result {
@@ -858,6 +873,8 @@ struct multisite_trim_result {
   std::size_t lazy_remerge_collisions = 0;
   std::size_t lazy_structural_class_count_max = 0;
   std::vector<std::size_t> lazy_structural_class_count_by_clade;
+  std::vector<multisite_optimal_root_provenance_class>
+      optimal_root_provenance_classes;
 };
 
 struct multisite_topology_trace_options {
@@ -2448,6 +2465,33 @@ inline std::uint64_t compute_root_frontier_optimum_and_update_mask(
   return optimum;
 }
 
+inline void capture_optimal_root_provenance_classes(
+    clade_grammar const& grammar, chart_options const& options,
+    multisite_frontier_build_result const& build, std::uint64_t optimum,
+    std::vector<multisite_optimal_root_provenance_class>& out,
+    std::string const& context) {
+  auto const& root_frontier = build.frontiers[grammar.root_clade];
+  out.clear();
+  for (auto const& entry : root_frontier) {
+    auto score =
+        lower_bound_for_entry(entry, grammar.root_clade, build.active_patterns,
+                              build.invariant_constant_offset, options);
+    if (score != optimum) continue;
+    if (entry.used_production.size() != grammar.productions.size()) {
+      throw std::runtime_error(
+          context +
+          ": optimal-root provenance requested without an exact production "
+          "mask");
+    }
+    out.push_back({entry.f.cost, entry.used_production});
+  }
+  std::sort(out.begin(), out.end(), [](auto const& lhs, auto const& rhs) {
+    if (lhs.cost != rhs.cost) return lhs.cost < rhs.cost;
+    return lhs.used_production < rhs.used_production;
+  });
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+}
+
 }  // namespace chart_multisite_detail
 
 inline multisite_bruteforce_result brute_force_multisite_topologies(
@@ -2499,6 +2543,12 @@ inline multisite_trim_result build_multisite_trim_impl(
   auto keep_production_exact =
       keep_mask_kind ==
       multisite_keep_mask_kind::exact_optimal_production_union;
+  if (trim_options.capture_optimal_root_provenance &&
+      !keep_production_exact) {
+    throw std::runtime_error(
+        "multi-site trim: optimal-root provenance requires an exact "
+        "keep-production mask");
+  }
 
   multisite_trim_result result;
   result.dominance_mode = trim_options.dominance_mode;
@@ -2549,6 +2599,12 @@ inline multisite_trim_result build_multisite_trim_impl(
     recovery_validation_options.known_exact_optimum = result.optimum;
     validate_known_exact_optimum(recovered_optimum, recovery_validation_options,
                                  "multi-site trim exact mask recovery pass");
+    if (trim_options.capture_optimal_root_provenance) {
+      capture_optimal_root_provenance_classes(
+          grammar, options, mask_build, recovered_optimum,
+          result.optimal_root_provenance_classes,
+          "multi-site trim exact mask recovery pass");
+    }
 
     result.composite_lower_bound = score_build.composite_lower_bound;
     result.initial_upper_bound = score_build.initial_upper_bound;
@@ -2601,6 +2657,11 @@ inline multisite_trim_result build_multisite_trim_impl(
       grammar, options, build, result.keep_production_exact,
       result.keep_production, "multi-site trim");
   validate_known_exact_optimum(result.optimum, trim_options, "multi-site trim");
+  if (trim_options.capture_optimal_root_provenance) {
+    capture_optimal_root_provenance_classes(
+        grammar, options, build, result.optimum,
+        result.optimal_root_provenance_classes, "multi-site trim");
+  }
   result.dominance_pruned =
       result.dominance_pruned_score_pass + result.dominance_pruned_mask_pass;
   return result;

@@ -9,6 +9,7 @@
 #include <array>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <print>
 #include <span>
@@ -1401,6 +1402,39 @@ static void test_exact_verification_reuses_state_old_score() {
   CHECK(state.counters.overlay_materializations_for_exact_verification == 1);
   CHECK(state.counters.overlay_materializations_for_oracle == 0);
   CHECK(state.counters.full_composite_rebuilds == 0);
+
+  std::println("  PASS");
+}
+
+static void test_failed_exact_materialization_is_timed() {
+  std::println("test_failed_exact_materialization_is_timed");
+
+  auto fixture = make_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  auto state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, options);
+
+  // The verifier converts exact-materializer exceptions into invalid
+  // candidates.  Force that call boundary to throw so the failed span must be
+  // charged even though the success-only materialization counters stay zero.
+  auto candidate =
+      larch::score_candidate_locally(state, fixture.candidates.front());
+  CHECK(candidate.valid);
+  candidate.force_exact_materializer_failure_for_tests = true;
+
+  auto const before =
+      state.counters.materialization_exact_verification_ms;
+  auto verified = larch::verify_candidate_exact_against_state(
+      state, std::move(candidate), options.exact_trim);
+
+  CHECK(!verified.valid);
+  CHECK(verified.invalid_reason ==
+        "forced exact materializer failure for tests");
+  CHECK(state.counters.exact_verifications == 1);
+  CHECK(state.counters.full_overlay_materializations == 0);
+  CHECK(state.counters.overlay_materializations_for_exact_verification == 0);
+  CHECK(state.counters.materialization_exact_verification_ms > before);
 
   std::println("  PASS");
 }
@@ -2852,6 +2886,17 @@ static void test_phase5_known_improving_search_commits_once() {
         search.iterations.front().local_scoring_ms);
   CHECK(search.summary.exact_verification_ms >=
         search.iterations.front().exact_verification_ms);
+  CHECK(search.summary.initial_chart_construction_ms >= 0.0);
+  CHECK(search.summary.initial_chart_construction_ms <=
+        search.summary.cache_build_ms);
+  CHECK(search.summary.materialization_exact_verification_ms >= 0.0);
+  CHECK(search.summary.materialization_accepted_update_ms >= 0.0);
+  CHECK(search.summary.materialization_final_compaction_ms >= 0.0);
+  CHECK(search.summary.materialization_ms ==
+        search.summary.materialization_exact_verification_ms +
+            search.summary.materialization_accepted_update_ms +
+            search.summary.materialization_final_compaction_ms);
+  CHECK(search.summary.peak_concurrent_exact_verifiers >= 1);
   auto rebuilt = larch::build_clade_grammar(search.dag);
   CHECK(rebuilt.taxa.id_to_sample_id.size() == taxon_count);
   auto const& accepted = *search.iterations.front().accepted;
@@ -3156,6 +3201,12 @@ static void test_phase5_rejected_candidates_do_not_rebuild_sidecar() {
   CHECK(search.counters.full_composite_rebuilds == 0);
   CHECK(search.counters.sidecar_rebuilds_after_accept ==
         search.counters.accepted_moves);
+  CHECK(search.summary.initial_chart_construction_ms >= 0.0);
+  CHECK(search.summary.materialization_ms ==
+        search.summary.materialization_exact_verification_ms +
+            search.summary.materialization_accepted_update_ms +
+            search.summary.materialization_final_compaction_ms);
+  CHECK(search.summary.peak_concurrent_exact_verifiers == 0);
   if (!search.iterations.front().accepted_move_committed) {
     CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
   }
@@ -3334,6 +3385,35 @@ static void test_phase5_seeded_multi_iteration_is_deterministic() {
   CHECK(first.summary.affected_distribution.max == aggregate_affected.max);
   CHECK(first.summary.local_scoring_ms >= 0.0);
   CHECK(first.summary.exact_verification_ms >= 0.0);
+
+  std::println("  PASS");
+}
+
+static void test_canonical_evidence_failure_is_hard_error() {
+  std::println("test_canonical_evidence_failure_is_hard_error");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 1;
+  options.max_iterations = 1;
+  options.semantic_capture = larch::chart_spr_semantic_capture_mode::digest;
+  options.force_canonical_evidence_failure_for_tests = true;
+
+  bool threw = false;
+  try {
+    (void)larch::run_chart_spr_search(std::move(dag), grammar, options);
+  } catch (std::runtime_error const& error) {
+    threw = true;
+    CHECK(std::string{error.what()}.find(
+              "forced exact-evidence failure for test") !=
+          std::string::npos);
+  }
+  CHECK(threw);
 
   std::println("  PASS");
 }
@@ -4647,7 +4727,28 @@ static void test_phase9_transient_multi_worker_matches_serial() {
   std::println("  PASS");
 }
 
+static void test_exact_verifier_activity_is_exception_safe() {
+  std::println("test_exact_verifier_activity_is_exception_safe");
+
+  auto tracker = std::make_shared<
+      larch::chart_spr_exact_verifier_concurrency_tracker>();
+  try {
+    larch::chart_spr_exact_verifier_activity activity{tracker};
+    throw std::runtime_error("expected verifier failure");
+  } catch (std::runtime_error const&) {
+  }
+  {
+    larch::chart_spr_exact_verifier_activity activity{tracker};
+  }
+  // A leaked active count from the throwing scope would make this second,
+  // sequential entry observe a peak of two.
+  CHECK(tracker->peak() == 1);
+
+  std::println("  PASS");
+}
+
 int main() {
+  test_exact_verifier_activity_is_exception_safe();
   test_lower_bound_oracle_counters_show_full_rebuild_cost();
   test_local_rejected_candidate_counter_guardrail();
   test_streaming_and_eager_candidate_apis_match();
@@ -4676,6 +4777,7 @@ int main() {
   test_streaming_path_pair_budget_stops_early();
   test_eager_diagnostic_enumeration_exposes_cap_after_path_precompute();
   test_exact_verification_reuses_state_old_score();
+  test_failed_exact_materialization_is_timed();
   test_top_k_exact_verification_count_is_bounded();
   test_lower_bound_heuristic_acceptance_is_explicit();
   test_fixed_topology_exact_rejects_bare_candidate();
@@ -4715,6 +4817,7 @@ int main() {
   test_phase5_fixed_topology_mode_commits_with_rebuilt_certificate_gate();
   test_phase5_pattern_fingerprint_mismatch_rebuilds_patterns();
   test_phase5_seeded_multi_iteration_is_deterministic();
+  test_canonical_evidence_failure_is_hard_error();
   test_exhaustive_exact_acceptance_matches_oracle();
   test_phase5_witness_topology_selects_required_ancestor_path();
   test_phase5_final_compaction_normalizes_trim_options();
