@@ -1,21 +1,35 @@
-// Phase-2A test-only allocator instrumentation self-test.
+// Phase-2A test-only allocator instrumentation and dense local-score gate.
 //
-// This intentionally does not call or measure the current public chart-SPR
-// scorer: the eventual allocation gate belongs around the frozen
-// score_candidates_locally_into scoring seam only.  These tests establish that
-// the observer used by that future seam is complete and trustworthy.
+// The observer self-tests establish complete replaceable-new coverage.  The
+// final test then places that observer around only the caller-owned
+// score_candidates_locally_into scoring seam on the frozen small dense
+// workload.  Fixture/state/candidate construction, workspace warmup, owning
+// compatibility results, and semantic comparisons deliberately stay outside
+// the measured region.
 
 #include "chart_spr_allocation_observer.hpp"
 
+#include <larch/chart_spr_search.hpp>
+#include <larch/load_proto_dag.hpp>
+#include <larch/polytomy_refinement.hpp>
+#include <larch/sha256.hpp>
+
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
+#include <limits>
 #include <new>
 #include <print>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace allocation_test = larch::test::chart_spr_allocation;
 
@@ -29,6 +43,143 @@ namespace allocation_test = larch::test::chart_spr_allocation;
   do {                                                             \
     if (!(expression)) test_fail(#expression, __FILE__, __LINE__); \
   } while (false)
+
+namespace {
+
+constexpr std::string_view k_dense_fixture_path =
+    "data/test_5_trees/tree_0.pb.gz";
+constexpr std::string_view k_dense_fixture_sha256 =
+    "e8dcd803ba2cd82ed594dbe66433934a62b3711ea7ddb0d349de35ef86030dd6";
+constexpr std::string_view k_dense_candidate_signature_sha256 =
+    "6fcd6f69962abb67e91a3236c5043787c86c33bbd4c135fa67c37b53a6e37168";
+constexpr std::string_view k_dense_local_score_tuple_sha256 =
+    "86f0f046744ba8dfe2d6f33668f9c47a3e0c56646bb58fce9ada71a5bb18ead7";
+constexpr std::size_t k_frozen_candidate_count = 64;
+constexpr std::size_t k_scored_candidate_count = 1000;
+constexpr std::size_t k_active_pattern_count = 113;
+constexpr std::size_t k_observed_repetitions = 3;
+constexpr std::size_t k_chart_memory_budget_bytes = 12884901888ULL;
+
+// Frozen-binary semantic provenance lives beside the Phase-2 DHAT reference:
+//   binary 7ddb1fca7b15d1057912d6775b5e5fb32218390f13b3a10f6622581f21a5a38c
+//   fixture e8dcd803ba2cd82ed594dbe66433934a62b3711ea7ddb0d349de35ef86030dd6
+//   sidecar b8d55c73220a7025b8d977ac4bb083f1e4e76dee5bf007e8754b1f79d42b8442
+//   candidate section
+//                3bb4a595b15d42e4e326fab5f54ca0befb93e3c998535182f30afb1876766dff
+// Two independent frozen executions produced the same sidecar and output DAG.
+// The compact rows below are the ordered candidate/candidate_lower_bound pairs
+// extracted from that sidecar.  Every omitted field is frozen once immediately
+// below and is asserted for every row; no value comes from the scorer under
+// test.
+struct frozen_local_score_tuple {
+  std::size_t affected_clade_count;
+  std::int64_t delta;
+  std::uint64_t new_score;
+};
+
+constexpr bool k_frozen_local_score_valid = true;
+constexpr std::string_view k_frozen_local_score_invalid_reason = "";
+constexpr std::uint64_t k_frozen_local_score_old_score = 174;
+constexpr auto k_frozen_local_score_kind =
+    larch::chart_spr_score_kind::composite_lower_bound;
+constexpr auto k_frozen_local_score_convention =
+    larch::chart_spr_score_convention::full_with_invariants;
+constexpr std::uint64_t k_frozen_local_score_invariant_offset = 0;
+constexpr bool k_frozen_local_score_exact_multisite = false;
+
+constexpr std::array<frozen_local_score_tuple, k_frozen_candidate_count>
+    k_frozen_local_score_tuples = {{
+        {5, 0, 174},   {8, 6, 180},   {11, 9, 183},  {11, 9, 183},
+        {12, 8, 182},  {12, 8, 182},  {15, 10, 184}, {15, 10, 184},
+        {14, 8, 182},  {13, 8, 182},  {15, 9, 183},  {16, 9, 183},
+        {17, 8, 182},  {20, 8, 182},  {20, 8, 182},  {20, 8, 182},
+        {20, 8, 182},  {18, 9, 183},  {14, 8, 182},  {14, 8, 182},
+        {15, 9, 183},  {7, 7, 181},   {16, 11, 185}, {19, 12, 186},
+        {19, 13, 187}, {18, 12, 186}, {17, 11, 185}, {10, 11, 185},
+        {10, 11, 185}, {9, 7, 181},   {13, 8, 182},  {14, 8, 182},
+        {9, 9, 183},   {14, 8, 182},  {12, 9, 183},  {13, 10, 184},
+        {13, 10, 184}, {12, 9, 183},  {15, 11, 185}, {15, 11, 185},
+        {15, 11, 185}, {15, 11, 185}, {15, 11, 185}, {9, 9, 183},
+        {15, 11, 185}, {16, 10, 184}, {17, 10, 184}, {17, 10, 184},
+        {16, 12, 186}, {16, 12, 186}, {12, 12, 186}, {14, 10, 184},
+        {14, 10, 184}, {14, 10, 184}, {8, 7, 181},   {18, 12, 186},
+        {18, 11, 185}, {16, 11, 185}, {17, 11, 185}, {14, 10, 184},
+        {14, 10, 184}, {14, 10, 184}, {14, 10, 184}, {15, 10, 184},
+    }};
+
+static std::string raw_file_sha256(std::string_view path) {
+  std::ifstream input{std::string{path}, std::ios::binary};
+  CHECK(input.is_open());
+
+  larch::sha256 digest;
+  std::array<char, 64 * 1024> buffer{};
+  while (input) {
+    input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    auto count = input.gcount();
+    if (count > 0) {
+      digest.update(
+          std::string_view{buffer.data(), static_cast<std::size_t>(count)});
+    }
+  }
+  CHECK(input.eof());
+  return digest.hex_digest();
+}
+
+static std::string candidate_signature_sha256(
+    larch::clade_grammar const& grammar,
+    std::span<larch::grammar_spr_candidate const> candidates) {
+  larch::sha256 digest;
+  for (auto const& candidate : candidates) {
+    auto signature =
+        larch::chart_spr_candidate_sample_signature(grammar, candidate);
+    digest.update(signature);
+    digest.update("\n");
+  }
+  return digest.hex_digest();
+}
+
+struct dense_scoring_expectations {
+  std::size_t affected_clade_visits = 0;
+  std::size_t row_visits = 0;
+  std::size_t candidate_partition_validations = 0;
+  std::size_t production_descriptors = 0;
+  std::size_t fast_path_productions = 0;
+  std::size_t reachable_clades = 0;
+  std::size_t reachable_productions = 0;
+  std::size_t reachable_temp_clades = 0;
+  std::size_t reachable_temp_productions = 0;
+  std::size_t full_grammar_like_reachability_passes = 0;
+};
+
+// Literal workload totals prevent the allocation/counter oracle from calling
+// the same overlay builder under test to manufacture its expectations.  The
+// affected and reachability totals come from the sealed 7ddb1fca report and
+// its frozen 64-candidate tuple projection; the 1,000-candidate values repeat
+// those 64 ordered candidates fifteen times plus the first forty.  Descriptor
+// totals were frozen from the pre-in-place value-builder checkpoint before
+// this `_into` gate was observed.  The candidate and fixture hashes above make
+// every literal workload-specific and fail closed if enumeration changes.
+constexpr dense_scoring_expectations k_frozen_dense_scoring_expectations{
+    .affected_clade_visits = 14255,
+    .row_visits = 1610815,
+    .candidate_partition_validations = 12239,
+    .production_descriptors = 13255,
+    .fast_path_productions = 1497815,
+    .reachable_clades = 139000,
+    .reachable_productions = 69000,
+    .reachable_temp_clades = 11239,
+    .reachable_temp_productions = 12239,
+    .full_grammar_like_reachability_passes = 1000,
+};
+
+static_assert(k_frozen_dense_scoring_expectations.row_visits ==
+              k_frozen_dense_scoring_expectations.affected_clade_visits *
+                  k_active_pattern_count);
+static_assert(k_frozen_dense_scoring_expectations.fast_path_productions ==
+              k_frozen_dense_scoring_expectations.production_descriptors *
+                  k_active_pattern_count);
+
+}  // namespace
 
 static void check_statistics(allocation_test::allocation_observer const& obs,
                              std::uint64_t calls, std::uint64_t successes,
@@ -487,14 +638,482 @@ static void test_thread_local_isolation() {
              1, 1, 0, 67, 1);
 }
 
+template <typename Score>
+static void check_score_against_frozen(Score const& actual,
+                                       std::size_t frozen_index) {
+  CHECK(frozen_index < k_frozen_local_score_tuples.size());
+  auto const& frozen = k_frozen_local_score_tuples[frozen_index];
+  CHECK(actual.valid == k_frozen_local_score_valid);
+  CHECK(actual.invalid_reason == k_frozen_local_score_invalid_reason);
+  CHECK(actual.affected_clade_count == frozen.affected_clade_count);
+  CHECK(actual.lower_bound.kind == k_frozen_local_score_kind);
+  CHECK(actual.lower_bound.convention == k_frozen_local_score_convention);
+  CHECK(actual.lower_bound.value.delta == frozen.delta);
+  CHECK(actual.lower_bound.value.old_score == k_frozen_local_score_old_score);
+  CHECK(actual.lower_bound.value.new_score == frozen.new_score);
+  CHECK(actual.lower_bound.invariant_offset_applied ==
+        k_frozen_local_score_invariant_offset);
+  CHECK(actual.lower_bound.value.exact_multisite ==
+        k_frozen_local_score_exact_multisite);
+  CHECK(std::isfinite(actual.local_score_ms));
+  CHECK(actual.local_score_ms >= 0.0);
+}
+
+// Canonical bytes, deliberately excluding the non-semantic timing field:
+//   larch.chart_spr.local_score_tuple.v1\n
+// followed by one ordered, tab-separated row per score:
+//   index, valid, lowercase-hex(invalid_reason), affected count, kind,
+//   convention, delta, old, new, invariant offset, exact-multisite, \n.
+// This is the test-owned projection of the frozen canonical sidecar, so both
+// scorer entry points are checked against an oracle produced by the sealed
+// binary rather than against one another.
+template <typename Score>
+static std::string local_score_tuple_sha256(std::span<Score const> scores) {
+  CHECK(scores.size() == k_frozen_candidate_count);
+
+  larch::sha256 digest;
+  digest.update("larch.chart_spr.local_score_tuple.v1\n");
+  auto append_decimal = [&](auto value) {
+    auto text = std::to_string(value);
+    digest.update(text);
+  };
+  auto append_tab = [&] { digest.update("\t"); };
+  constexpr std::string_view hex = "0123456789abcdef";
+
+  for (std::size_t index = 0; index < scores.size(); ++index) {
+    auto const& score = scores[index];
+    append_decimal(index);
+    append_tab();
+    digest.update(score.valid ? "1" : "0");
+    append_tab();
+    for (char raw : score.invalid_reason) {
+      auto byte = static_cast<unsigned char>(raw);
+      std::array<char, 2> encoded = {hex[(byte >> 4U) & 0x0fU],
+                                     hex[byte & 0x0fU]};
+      digest.update(std::string_view{encoded.data(), encoded.size()});
+    }
+    append_tab();
+    append_decimal(score.affected_clade_count);
+    append_tab();
+    digest.update(larch::chart_spr_score_kind_name(score.lower_bound.kind));
+    append_tab();
+    digest.update(
+        larch::chart_spr_score_convention_name(score.lower_bound.convention));
+    append_tab();
+    append_decimal(score.lower_bound.value.delta);
+    append_tab();
+    append_decimal(score.lower_bound.value.old_score);
+    append_tab();
+    append_decimal(score.lower_bound.value.new_score);
+    append_tab();
+    append_decimal(score.lower_bound.invariant_offset_applied);
+    append_tab();
+    digest.update(score.lower_bound.value.exact_multisite ? "1" : "0");
+    digest.update("\n");
+  }
+  return digest.hex_digest();
+}
+
+// Compatibility-wrapper equivalence is intentionally only a secondary check;
+// the frozen tuples above are the primary semantic oracle.
+static void check_local_result_equivalent(
+    larch::chart_spr_local_score_result const& actual,
+    larch::chart_spr_candidate_score const& owning_secondary) {
+  CHECK(actual.valid == owning_secondary.valid);
+  CHECK(actual.invalid_reason == owning_secondary.invalid_reason);
+  CHECK(actual.affected_clade_count == owning_secondary.affected_clade_count);
+  CHECK(actual.lower_bound.kind == owning_secondary.lower_bound.kind);
+  CHECK(actual.lower_bound.convention ==
+        owning_secondary.lower_bound.convention);
+  CHECK(actual.lower_bound.invariant_offset_applied ==
+        owning_secondary.lower_bound.invariant_offset_applied);
+  CHECK(actual.lower_bound.value.delta ==
+        owning_secondary.lower_bound.value.delta);
+  CHECK(actual.lower_bound.value.old_score ==
+        owning_secondary.lower_bound.value.old_score);
+  CHECK(actual.lower_bound.value.new_score ==
+        owning_secondary.lower_bound.value.new_score);
+  CHECK(actual.lower_bound.value.exact_multisite ==
+        owning_secondary.lower_bound.value.exact_multisite);
+}
+
+static void check_all_local_results(
+    std::span<larch::chart_spr_local_score_result const> actual,
+    std::span<larch::chart_spr_candidate_score const> owning_secondary) {
+  CHECK(actual.size() == k_scored_candidate_count);
+  CHECK(owning_secondary.size() == k_frozen_candidate_count);
+  for (std::size_t i = 0; i < actual.size(); ++i) {
+    auto frozen_index = i % k_frozen_candidate_count;
+    check_score_against_frozen(actual[i], frozen_index);
+    check_local_result_equivalent(actual[i], owning_secondary[frozen_index]);
+  }
+  CHECK(local_score_tuple_sha256(actual.first(k_frozen_candidate_count)) ==
+        k_dense_local_score_tuple_sha256);
+}
+
+static void poison_local_results(
+    std::span<larch::chart_spr_local_score_result> results) {
+  for (auto& result : results) {
+    result.lower_bound.value.delta = (std::numeric_limits<std::int64_t>::max)();
+    result.lower_bound.value.old_score =
+        (std::numeric_limits<std::uint64_t>::max)();
+    result.lower_bound.value.new_score =
+        (std::numeric_limits<std::uint64_t>::max)();
+    result.lower_bound.value.exact_multisite = true;
+    result.lower_bound.kind = larch::chart_spr_score_kind::grammar_exact;
+    result.lower_bound.convention =
+        larch::chart_spr_score_convention::active_only;
+    result.lower_bound.invariant_offset_applied =
+        (std::numeric_limits<std::uint64_t>::max)();
+    result.affected_clade_count = (std::numeric_limits<std::size_t>::max)();
+    result.local_score_ms = -1.0;
+    result.valid = false;
+    result.invalid_reason.clear();
+  }
+}
+
+static void check_dense_scoring_counter_delta(
+    larch::chart_spr_search_counters const& before,
+    larch::chart_spr_search_counters const& after,
+    dense_scoring_expectations const& expected,
+    std::size_t expected_row_scratch_growths) {
+#define CHECK_COUNTER_DELTA(field, value)         \
+  do {                                            \
+    CHECK(after.field >= before.field);           \
+    CHECK(after.field - before.field == (value)); \
+  } while (false)
+
+  CHECK_COUNTER_DELTA(candidate_batches_scored, 1);
+  CHECK_COUNTER_DELTA(local_candidate_scores, k_scored_candidate_count);
+  CHECK_COUNTER_DELTA(local_rows_recomputed, expected.row_visits);
+  CHECK_COUNTER_DELTA(local_unit_fitch_fast_path_productions_scored,
+                      expected.fast_path_productions);
+  CHECK_COUNTER_DELTA(local_leaf_state_view_uses,
+                      k_scored_candidate_count * k_active_pattern_count);
+  CHECK_COUNTER_DELTA(local_leaf_state_owned_copies, 0);
+  CHECK_COUNTER_DELTA(local_row_scratch_capacity_growths,
+                      expected_row_scratch_growths);
+
+  // Reusable storage must not turn into reusable semantics: every candidate
+  // still compiles and validates its candidate-local descriptor, and every
+  // candidate x pattern visit still consumes that descriptor.
+  CHECK_COUNTER_DELTA(chart_execution_plan_builds, 0);
+  CHECK_COUNTER_DELTA(chart_execution_plan_cache_hits,
+                      k_scored_candidate_count);
+  CHECK_COUNTER_DELTA(candidate_execution_plan_builds,
+                      k_scored_candidate_count);
+  CHECK_COUNTER_DELTA(candidate_execution_plan_cache_hits,
+                      k_scored_candidate_count * k_active_pattern_count);
+  CHECK_COUNTER_DELTA(candidate_partition_validations,
+                      expected.candidate_partition_validations);
+  CHECK_COUNTER_DELTA(clade_order_sorts, k_scored_candidate_count);
+  CHECK_COUNTER_DELTA(production_descriptors_compiled,
+                      expected.production_descriptors);
+  CHECK_COUNTER_DELTA(plan_mismatch_rejections, 0);
+
+  CHECK_COUNTER_DELTA(overlay_reachability_validations,
+                      k_scored_candidate_count);
+  CHECK_COUNTER_DELTA(reachable_clades_traversed, expected.reachable_clades);
+  CHECK_COUNTER_DELTA(reachable_productions_traversed,
+                      expected.reachable_productions);
+  CHECK_COUNTER_DELTA(reachable_temp_clades_traversed,
+                      expected.reachable_temp_clades);
+  CHECK_COUNTER_DELTA(reachable_temp_productions_traversed,
+                      expected.reachable_temp_productions);
+  CHECK_COUNTER_DELTA(reachability_full_grammar_like_passes,
+                      expected.full_grammar_like_reachability_passes);
+
+  // These counters make the zero-allocation result non-vacuous: it must be the
+  // dense local recurrence, not a hidden full validation, materializer,
+  // diagnostic oracle, pattern-batch path, or parallel dispatch.
+  CHECK_COUNTER_DELTA(full_grammar_validations, 0);
+  CHECK_COUNTER_DELTA(production_index_validations, 0);
+  CHECK_COUNTER_DELTA(production_partition_validations, 0);
+  CHECK_COUNTER_DELTA(dynamic_overlay_payload_partition_validations, 0);
+  CHECK_COUNTER_DELTA(candidate_pattern_full_grammar_validations, 0);
+  CHECK_COUNTER_DELTA(candidate_pattern_partition_validations, 0);
+  CHECK_COUNTER_DELTA(candidate_pattern_clade_order_sorts, 0);
+  CHECK_COUNTER_DELTA(full_overlay_materializations, 0);
+  CHECK_COUNTER_DELTA(overlay_materializations_for_oracle, 0);
+  CHECK_COUNTER_DELTA(overlay_materializations_for_local_scoring_bridge, 0);
+  CHECK_COUNTER_DELTA(overlay_materializations_for_exact_verification, 0);
+  CHECK_COUNTER_DELTA(overlay_materializations_for_accept_materialization, 0);
+  CHECK_COUNTER_DELTA(overlay_materializations_for_final_compaction, 0);
+  CHECK_COUNTER_DELTA(full_composite_rebuilds, 0);
+  CHECK_COUNTER_DELTA(pattern_batch_cache_builds, 0);
+  CHECK_COUNTER_DELTA(multifurcation_productions_scored, 0);
+  CHECK_COUNTER_DELTA(local_score_parallel_batches, 0);
+  CHECK_COUNTER_DELTA(local_score_worker_tasks, 0);
+  CHECK_COUNTER_DELTA(exact_verifications, 0);
+
+#undef CHECK_COUNTER_DELTA
+}
+
+static void check_warmed_high_water_storage_is_allocation_free(
+    larch::chart_spr_search_state const& state,
+    std::span<larch::grammar_spr_candidate const> frozen_candidates,
+    larch::checked_chart_execution_plan_ref const& checked) {
+  CHECK(!frozen_candidates.empty());
+  auto plain = frozen_candidates.front();
+  CHECK(!plain.added_clades.empty());
+  CHECK(!plain.added_productions.empty());
+
+  // Give every nested family a non-vacuous high-water shape. Grammar-local
+  // scoring does not consume witness provenance, but both the resident delta
+  // and acceptance candidate copy must preserve it without reallocating.
+  auto rich = plain;
+  std::size_t witness_children = 0;
+  std::size_t witness_edges = 0;
+  for (std::size_t production_index = 0;
+       production_index < rich.added_productions.size(); ++production_index) {
+    auto& production = rich.added_productions[production_index];
+    CHECK(!production.children.empty());
+    production.witnesses.clear();
+    for (std::size_t witness_index = 0; witness_index < 2; ++witness_index) {
+      larch::production_witness witness;
+      witness.parent_node = 1000 + 10 * production_index + witness_index;
+      for (std::size_t child_index = 0;
+           child_index < production.children.size(); ++child_index) {
+        larch::production_child_witness child;
+        child.child = production.children[child_index].id;
+        child.edge_alternatives = {
+            10000 + 100 * production_index + 10 * witness_index + child_index,
+            20000 + 100 * production_index + 10 * witness_index + child_index,
+        };
+        witness_edges += child.edge_alternatives.size();
+        witness.children.push_back(std::move(child));
+        ++witness_children;
+      }
+      production.witnesses.push_back(std::move(witness));
+    }
+  }
+  CHECK(witness_children > 0);
+  CHECK(witness_edges > 0);
+  rich.source_tree_move = larch::spr_move{.src = 1, .dst = 2, .lca = 3};
+  rich.source_before_topology_productions = rich.removed_productions;
+  rich.source_after_topology_productions.emplace();
+  for (std::size_t i = 0; i < rich.added_productions.size(); ++i) {
+    rich.source_after_topology_productions->push_back(
+        larch::temp_production_ref(static_cast<larch::production_id>(i)));
+  }
+  CHECK(rich.source_before_topology_productions.has_value());
+  CHECK(rich.source_after_topology_productions.has_value());
+
+  auto shallow = rich;
+  for (auto& production : shallow.added_productions) {
+    for (auto& witness : production.witnesses) witness.children.clear();
+  }
+  larch::grammar_spr_candidate identity;
+
+  larch::spr_overlay_delta delta;
+  larch::spr_overlay_delta_build_scratch build_scratch;
+  auto build = [&](larch::grammar_spr_candidate const& candidate) {
+    larch::build_spr_overlay_delta_from_resident_plan_into(
+        state.grammar, checked, candidate, delta, build_scratch);
+    CHECK(build_scratch.operation_boundary_clean());
+  };
+  auto build_cycle = [&] {
+    build(rich);
+    build(plain);
+    build(rich);
+    build(shallow);
+    build(rich);
+    build(identity);
+    build(rich);
+  };
+  build_cycle();
+  allocation_test::allocation_observer build_observer;
+  {
+    allocation_test::scoped_allocation_observation observation{build_observer};
+    build_cycle();
+  }
+  CHECK(build_observer.statistics == allocation_test::allocation_statistics{});
+  check_statistics(build_observer, 0, 0, 0, 0, 0);
+  CHECK(delta.temp_productions.size() == rich.added_productions.size());
+  CHECK(delta.temp_productions.front().witnesses.size() == 2);
+  CHECK(!delta.temp_productions.front().witnesses.front().children.empty());
+
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      acceptance_workspace;
+  acceptance_workspace.reserve_batch(1);
+  auto copy = [&](larch::grammar_spr_candidate const& candidate) {
+    acceptance_workspace.begin_iteration();
+    acceptance_workspace.append_candidate(candidate);
+    CHECK(acceptance_workspace.candidates().size() == 1);
+    acceptance_workspace.finish_batch();
+  };
+  auto copy_cycle = [&] {
+    copy(rich);
+    copy(plain);
+    copy(rich);
+    copy(shallow);
+    copy(rich);
+    copy(identity);
+    copy(rich);
+  };
+  copy_cycle();
+  allocation_test::allocation_observer copy_observer;
+  {
+    allocation_test::scoped_allocation_observation observation{copy_observer};
+    copy_cycle();
+  }
+  CHECK(copy_observer.statistics == allocation_test::allocation_statistics{});
+  check_statistics(copy_observer, 0, 0, 0, 0, 0);
+  auto const& copied = acceptance_workspace.candidate_slots.front();
+  CHECK(copied.added_productions.size() == rich.added_productions.size());
+  CHECK(copied.added_productions.front().witnesses.size() == 2);
+  CHECK(copied.source_tree_move.has_value());
+  CHECK(copied.source_tree_move->src == rich.source_tree_move->src);
+  CHECK(copied.source_tree_move->dst == rich.source_tree_move->dst);
+  CHECK(copied.source_tree_move->lca == rich.source_tree_move->lca);
+  CHECK(copied.source_tree_move->score_change ==
+        rich.source_tree_move->score_change);
+  CHECK(copied.source_before_topology_productions ==
+        rich.source_before_topology_productions);
+  CHECK(copied.source_after_topology_productions ==
+        rich.source_after_topology_productions);
+}
+
+static void test_warmed_dense_local_scoring_is_allocation_free() {
+  std::println("test_warmed_dense_local_scoring_is_allocation_free");
+
+  CHECK(raw_file_sha256(k_dense_fixture_path) == k_dense_fixture_sha256);
+  auto dag = larch::load_proto_dag(k_dense_fixture_path);
+  larch::recompute_compact_genomes(dag);
+  larch::set_sample_ids_from_cg(dag);
+
+  larch::polytomy_refinement_options refinement_options;
+  refinement_options.mode = larch::polytomy_mode::expand_soft_bounded;
+  refinement_options.max_shapes_per_polytomy = 1;
+  auto refinement = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, refinement_options);
+  larch::require_polytomy_refinement_binary_charting(
+      refinement.audit, "chart SPR allocation gate");
+
+  larch::chart_spr_search_options search_options;
+  search_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::lower_bound_heuristic;
+  search_options.cache.memory_budget_bytes = k_chart_memory_budget_bytes;
+  search_options.cache.use_lazy_multisite_chart = false;
+  auto state = larch::build_chart_spr_search_state(
+      dag, std::move(refinement.grammar), search_options);
+  CHECK(state.cache_strategy ==
+        larch::chart_spr_cache_strategy::all_active_patterns);
+  CHECK(state.grammar.clades.size() == 139);
+  CHECK(state.grammar.productions.size() == 69);
+  CHECK(state.active_patterns.patterns.patterns.size() ==
+        k_active_pattern_count);
+  CHECK(state.pattern_charts.size() == k_active_pattern_count);
+  CHECK(state.effective_pattern_batch_size == k_active_pattern_count);
+  CHECK(state.skipped_invariant_site_count == 536);
+  CHECK(state.composite_lower_bound_with_invariants == 174);
+
+  larch::grammar_spr_enumeration_options enumeration;
+  enumeration.max_candidates = k_frozen_candidate_count;
+  enumeration.max_candidates_is_post_dedup = true;
+  std::vector<larch::grammar_spr_candidate> frozen_candidates;
+  frozen_candidates.reserve(k_frozen_candidate_count);
+  auto generation = larch::for_each_grammar_spr_candidate(
+      state.grammar, enumeration,
+      [&](larch::grammar_spr_candidate const& candidate) {
+        frozen_candidates.push_back(candidate);
+        return true;
+      });
+  CHECK(generation.stop_reason ==
+        larch::chart_spr_candidate_stop_reason::candidate_cap);
+  CHECK(generation.candidates_generated_after_dedup ==
+        k_frozen_candidate_count);
+  CHECK(frozen_candidates.size() == k_frozen_candidate_count);
+  CHECK(candidate_signature_sha256(state.grammar, frozen_candidates) ==
+        k_dense_candidate_signature_sha256);
+
+  auto const expected = k_frozen_dense_scoring_expectations;
+  auto checked =
+      larch::check_chart_execution_plan(state.grammar, state.execution_plan);
+  check_warmed_high_water_storage_is_allocation_free(state, frozen_candidates,
+                                                     checked);
+  auto owning_scores =
+      larch::score_candidates_locally(state, frozen_candidates, {}, 1, checked);
+  CHECK(owning_scores.size() == k_frozen_candidate_count);
+  auto owning_score_span =
+      std::span<larch::chart_spr_candidate_score const>{owning_scores};
+  for (std::size_t i = 0; i < owning_scores.size(); ++i) {
+    check_score_against_frozen(owning_scores[i], i);
+  }
+  CHECK(local_score_tuple_sha256(owning_score_span) ==
+        k_dense_local_score_tuple_sha256);
+
+  std::vector<larch::grammar_spr_candidate> candidates;
+  candidates.reserve(k_scored_candidate_count);
+  for (std::size_t i = 0; i < k_scored_candidate_count; ++i) {
+    candidates.push_back(frozen_candidates[i % frozen_candidates.size()]);
+  }
+  CHECK(candidates.size() == k_scored_candidate_count);
+
+  std::vector<larch::chart_spr_local_score_result> results(
+      k_scored_candidate_count);
+  larch::chart_spr_local_score_workspace workspace;
+  larch::local_spr_score_options local_options;
+  auto candidate_span =
+      std::span<larch::grammar_spr_candidate const>{candidates};
+  auto result_span = std::span<larch::chart_spr_local_score_result>{results};
+
+  // One complete, unobserved pass reaches the maximum capacity required by
+  // every candidate shape in the frozen cyclic order.  Its full counter and
+  // semantic contract is checked before allocations become the gate.
+  CHECK(workspace.operation_boundary_clean());
+  auto warm_before = state.counters;
+  larch::score_candidates_locally_into(state, candidate_span, result_span,
+                                       workspace, local_options, 1, checked);
+  auto warm_after = state.counters;
+  CHECK(workspace.operation_boundary_clean());
+  auto warm_row_scratch_growths =
+      warm_after.local_row_scratch_capacity_growths -
+      warm_before.local_row_scratch_capacity_growths;
+  CHECK(warm_row_scratch_growths > 0);
+  CHECK(warm_row_scratch_growths <= k_scored_candidate_count);
+  check_dense_scoring_counter_delta(warm_before, warm_after, expected,
+                                    warm_row_scratch_growths);
+  check_all_local_results(results, owning_score_span);
+
+  allocation_test::allocation_observer observer;
+  for (std::size_t repetition = 0; repetition < k_observed_repetitions;
+       ++repetition) {
+    poison_local_results(results);
+    CHECK(workspace.operation_boundary_clean());
+    observer.reset();
+    auto before = state.counters;
+    {
+      allocation_test::scoped_allocation_observation observation{observer};
+      larch::score_candidates_locally_into(state, candidate_span, result_span,
+                                           workspace, local_options, 1,
+                                           checked);
+    }
+    auto after = state.counters;
+    CHECK(workspace.operation_boundary_clean());
+
+    // This is deliberately stronger than the Phase-2 historical 80% gate:
+    // the reusable steady-state seam must make no dynamic allocation call of
+    // any replaceable kind.  The separately sealed frozen-binary DHAT result
+    // supplies the Phase-0 denominator for the historical comparison.
+    CHECK(observer.statistics == allocation_test::allocation_statistics{});
+    check_statistics(observer, 0, 0, 0, 0, 0);
+    check_dense_scoring_counter_delta(before, after, expected, 0);
+    check_all_local_results(results, owning_score_span);
+  }
+
+  std::println("  PASS");
+}
+
 int main() {
   test_complete_replaceable_overload_matrix();
   test_new_expressions_and_over_alignment();
   test_scoped_unscoped_nested_and_output_exclusion();
   test_forced_failure_and_new_handler_semantics();
   test_thread_local_isolation();
+  test_warmed_dense_local_scoring_is_allocation_free();
 
   std::println(
-      "All chart-SPR test-only allocation observer self-tests passed!");
+      "All chart-SPR allocation observer and dense scoring tests passed!");
   return 0;
 }

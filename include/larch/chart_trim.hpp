@@ -1557,24 +1557,28 @@ inline std::size_t cost_index(std::size_t active_pattern, std::uint8_t state) {
 }
 
 inline std::uint64_t checked_add_u64(std::uint64_t lhs, std::uint64_t rhs,
-                                     std::string const& label) {
+                                     std::string_view label) {
   if (lhs >= multisite_score_inf || rhs >= multisite_score_inf)
     return multisite_score_inf;
   if (lhs > std::numeric_limits<std::uint64_t>::max() - rhs) {
-    throw std::runtime_error("multi-site trim: uint64 overflow while adding " +
-                             label);
+    auto message =
+        std::string{"multi-site trim: uint64 overflow while adding "};
+    message.append(label);
+    throw std::runtime_error(message);
   }
   auto result = lhs + rhs;
   return result >= multisite_score_inf ? multisite_score_inf : result;
 }
 
 inline std::uint64_t checked_mul_cost(std::uint64_t weight, chart_cost cost,
-                                      std::string const& label) {
+                                      std::string_view label) {
   if (weight == 0) return 0;
   if (cost >= chart_inf) return multisite_score_inf;
   if (cost > std::numeric_limits<std::uint64_t>::max() / weight) {
-    throw std::runtime_error(
-        "multi-site trim: uint64 overflow while multiplying " + label);
+    auto message =
+        std::string{"multi-site trim: uint64 overflow while multiplying "};
+    message.append(label);
+    throw std::runtime_error(message);
   }
   auto result = weight * static_cast<std::uint64_t>(cost);
   return result >= multisite_score_inf ? multisite_score_inf : result;

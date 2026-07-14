@@ -1155,10 +1155,11 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()
 
-# Phase-2A test-only global allocation observer.  The replacement operators
-# are linked only into this dedicated executable; production binaries retain
-# their normal allocation functions.  The test validates the observer itself
-# and deliberately does not measure the current allocating public scorer.
+# Phase-2A test-only global allocation observer and dense local-score gate.
+# The replacement operators are linked only into this dedicated executable;
+# production binaries retain their normal allocation functions.  After
+# validating the observer, the test requires the warmed caller-owned `_into`
+# scoring seam to allocate nothing on the frozen 1,000-candidate workload.
 add_executable(chart_spr_allocation_test
                test/chart_spr_allocation_test.cpp
                test/chart_spr_allocation_overrides.cpp)

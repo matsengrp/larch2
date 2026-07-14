@@ -8,12 +8,14 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <print>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -768,6 +770,44 @@ static void test_reference_edge_outside_boundary() {
     (void)larch::deterministic_optimal_single_site_traceback(
         grammar, impossible_chart, impossible_outside);
   }));
+
+  std::println("  PASS");
+}
+
+static void test_checked_multisite_arithmetic_boundaries() {
+  std::println("test_checked_multisite_arithmetic_boundaries");
+
+  using larch::chart_multisite_detail::checked_add_u64;
+  using larch::chart_multisite_detail::checked_mul_cost;
+  CHECK(checked_add_u64(7, 11, "normal add") == 18);
+  CHECK(checked_add_u64(larch::multisite_score_inf, 0, "saturated lhs") ==
+        larch::multisite_score_inf);
+  CHECK(checked_add_u64(0, larch::multisite_score_inf, "saturated rhs") ==
+        larch::multisite_score_inf);
+  CHECK(checked_add_u64(larch::multisite_score_inf - 1, 1,
+                        "result saturation") == larch::multisite_score_inf);
+
+  CHECK(checked_mul_cost(0, larch::chart_inf, "zero wins") == 0);
+  CHECK(checked_mul_cost(1, larch::chart_inf, "infinite cost") ==
+        larch::multisite_score_inf);
+  CHECK(checked_mul_cost(7, larch::chart_cost{3}, "normal multiply") == 21);
+  CHECK(checked_mul_cost(larch::multisite_score_inf - 1, larch::chart_cost{2},
+                         "result saturation") == larch::multisite_score_inf);
+
+  std::string expected_label = "checked arithmetic label";
+  std::string label_storage = "xx" + expected_label + "yy";
+  std::string_view label{label_storage.data() + 2, expected_label.size()};
+  bool overflow_threw = false;
+  try {
+    (void)checked_mul_cost((std::numeric_limits<std::uint64_t>::max)(),
+                           larch::chart_cost{2}, label);
+  } catch (std::runtime_error const& e) {
+    overflow_threw = true;
+    auto message = std::string{e.what()};
+    CHECK(message.find(expected_label) != std::string::npos);
+    CHECK(message.find(expected_label + "yy") == std::string::npos);
+  }
+  CHECK(overflow_threw);
 
   std::println("  PASS");
 }
@@ -2534,6 +2574,7 @@ int main() {
   test_paper_counterexample_outside_trim_and_traceback();
   test_single_tree_keeps_all_productions();
   test_reference_edge_outside_boundary();
+  test_checked_multisite_arithmetic_boundaries();
   test_binary_outside_stack_recurrence_matches_generic();
   test_multisite_composite_counterexample();
   test_lazy_multisite_bnb_feeding_matches_dense();

@@ -263,6 +263,223 @@ static larch::overlay_grammar_production temp_prod(
   return prod;
 }
 
+static void check_production_witness_equal(
+    larch::production_witness const& actual,
+    larch::production_witness const& expected) {
+  CHECK(actual.parent_node == expected.parent_node);
+  CHECK(actual.children.size() == expected.children.size());
+  for (std::size_t i = 0; i < actual.children.size(); ++i) {
+    CHECK(actual.children[i].child == expected.children[i].child);
+    CHECK(actual.children[i].edge_alternatives ==
+          expected.children[i].edge_alternatives);
+  }
+}
+
+static void check_overlay_production_equal(
+    larch::overlay_grammar_production const& actual,
+    larch::overlay_grammar_production const& expected) {
+  CHECK(actual.parent == expected.parent);
+  CHECK(actual.children == expected.children);
+  CHECK(actual.multiplicity == expected.multiplicity);
+  CHECK(actual.witnesses.size() == expected.witnesses.size());
+  for (std::size_t i = 0; i < actual.witnesses.size(); ++i) {
+    check_production_witness_equal(actual.witnesses[i], expected.witnesses[i]);
+  }
+}
+
+static void check_spr_overlay_delta_equal(
+    larch::spr_overlay_delta const& actual,
+    larch::spr_overlay_delta const& expected) {
+  CHECK(actual.base == expected.base);
+  CHECK(actual.candidate_old_parent == expected.candidate_old_parent);
+  CHECK(actual.candidate_new_sibling_or_target ==
+        expected.candidate_new_sibling_or_target);
+  CHECK(actual.temp_clades == expected.temp_clades);
+  CHECK(actual.temp_productions.size() == expected.temp_productions.size());
+  for (std::size_t i = 0; i < actual.temp_productions.size(); ++i) {
+    check_overlay_production_equal(actual.temp_productions[i],
+                                   expected.temp_productions[i]);
+  }
+  CHECK(actual.removed_base_productions == expected.removed_base_productions);
+  CHECK(actual.commit_source == expected.commit_source);
+  CHECK(actual.affected_order == expected.affected_order);
+  CHECK(actual.affected_base_clade == expected.affected_base_clade);
+  CHECK(actual.affected_temp_clade == expected.affected_temp_clade);
+  CHECK(actual.affected_base_row_slot == expected.affected_base_row_slot);
+  CHECK(actual.affected_temp_row_slot == expected.affected_temp_row_slot);
+  CHECK(actual.root == expected.root);
+  CHECK(actual.reachability_stats == expected.reachability_stats);
+  CHECK(actual.base_plan_generation == expected.base_plan_generation);
+  CHECK(actual.base_plan_fingerprint == expected.base_plan_fingerprint);
+  CHECK(actual.candidate_plan_build_stats ==
+        expected.candidate_plan_build_stats);
+  CHECK(actual.compiled_rows == expected.compiled_rows);
+  CHECK(actual.compiled_productions == expected.compiled_productions);
+  CHECK(actual.compiled_children == expected.compiled_children);
+  CHECK(actual.removed_base_production == expected.removed_base_production);
+  CHECK(actual.reachable_base_clade == expected.reachable_base_clade);
+  CHECK(actual.reachable_temp_clade == expected.reachable_temp_clade);
+  CHECK(actual.temp_productions_by_base_parent ==
+        expected.temp_productions_by_base_parent);
+  CHECK(actual.temp_productions_by_temp_parent ==
+        expected.temp_productions_by_temp_parent);
+  CHECK(actual.temp_productions_by_base_child ==
+        expected.temp_productions_by_base_child);
+  CHECK(actual.temp_productions_by_temp_child ==
+        expected.temp_productions_by_temp_child);
+}
+
+struct spr_overlay_delta_capacity_snapshot {
+  std::size_t temp_clades = 0;
+  std::size_t temp_productions = 0;
+  std::size_t removed_base_productions = 0;
+  std::size_t commit_source = 0;
+  std::size_t affected_order = 0;
+  std::size_t affected_base_clade = 0;
+  std::size_t affected_temp_clade = 0;
+  std::size_t affected_base_row_slot = 0;
+  std::size_t affected_temp_row_slot = 0;
+  std::size_t compiled_rows = 0;
+  std::size_t compiled_productions = 0;
+  std::size_t compiled_children = 0;
+  std::size_t removed_base_production = 0;
+  std::size_t reachable_base_clade = 0;
+  std::size_t reachable_temp_clade = 0;
+  std::size_t temp_productions_by_base_parent = 0;
+  std::size_t temp_productions_by_temp_parent = 0;
+  std::size_t temp_productions_by_base_child = 0;
+  std::size_t temp_productions_by_temp_child = 0;
+  std::vector<std::size_t> temp_clade_taxa;
+  std::vector<std::size_t> temp_production_children;
+  std::vector<std::size_t> temp_production_witnesses;
+  std::vector<std::vector<std::size_t>> witness_children;
+  std::vector<std::vector<std::vector<std::size_t>>> witness_edges;
+  std::vector<std::size_t> base_parent_rows;
+  std::vector<std::size_t> temp_parent_rows;
+  std::vector<std::size_t> base_child_rows;
+  std::vector<std::size_t> temp_child_rows;
+};
+
+static std::vector<std::size_t> index_row_capacities(
+    std::vector<std::vector<larch::production_id>> const& index) {
+  std::vector<std::size_t> capacities;
+  capacities.reserve(index.size());
+  for (auto const& row : index) capacities.push_back(row.capacity());
+  return capacities;
+}
+
+static spr_overlay_delta_capacity_snapshot snapshot_delta_capacities(
+    larch::spr_overlay_delta const& delta) {
+  spr_overlay_delta_capacity_snapshot snapshot;
+#define SNAPSHOT_CAPACITY(field) snapshot.field = delta.field.capacity()
+  SNAPSHOT_CAPACITY(temp_clades);
+  SNAPSHOT_CAPACITY(temp_productions);
+  SNAPSHOT_CAPACITY(removed_base_productions);
+  SNAPSHOT_CAPACITY(commit_source);
+  SNAPSHOT_CAPACITY(affected_order);
+  SNAPSHOT_CAPACITY(affected_base_clade);
+  SNAPSHOT_CAPACITY(affected_temp_clade);
+  SNAPSHOT_CAPACITY(affected_base_row_slot);
+  SNAPSHOT_CAPACITY(affected_temp_row_slot);
+  SNAPSHOT_CAPACITY(compiled_rows);
+  SNAPSHOT_CAPACITY(compiled_productions);
+  SNAPSHOT_CAPACITY(compiled_children);
+  SNAPSHOT_CAPACITY(removed_base_production);
+  SNAPSHOT_CAPACITY(reachable_base_clade);
+  SNAPSHOT_CAPACITY(reachable_temp_clade);
+  SNAPSHOT_CAPACITY(temp_productions_by_base_parent);
+  SNAPSHOT_CAPACITY(temp_productions_by_temp_parent);
+  SNAPSHOT_CAPACITY(temp_productions_by_base_child);
+  SNAPSHOT_CAPACITY(temp_productions_by_temp_child);
+#undef SNAPSHOT_CAPACITY
+  for (auto const& clade : delta.temp_clades) {
+    snapshot.temp_clade_taxa.push_back(clade.taxa.capacity());
+  }
+  for (auto const& production : delta.temp_productions) {
+    snapshot.temp_production_children.push_back(production.children.capacity());
+    snapshot.temp_production_witnesses.push_back(
+        production.witnesses.capacity());
+    std::vector<std::size_t> child_capacities;
+    std::vector<std::vector<std::size_t>> edge_capacities;
+    for (auto const& witness : production.witnesses) {
+      child_capacities.push_back(witness.children.capacity());
+      std::vector<std::size_t> witness_edge_capacities;
+      for (auto const& child : witness.children) {
+        witness_edge_capacities.push_back(child.edge_alternatives.capacity());
+      }
+      edge_capacities.push_back(std::move(witness_edge_capacities));
+    }
+    snapshot.witness_children.push_back(std::move(child_capacities));
+    snapshot.witness_edges.push_back(std::move(edge_capacities));
+  }
+  snapshot.base_parent_rows =
+      index_row_capacities(delta.temp_productions_by_base_parent);
+  snapshot.temp_parent_rows =
+      index_row_capacities(delta.temp_productions_by_temp_parent);
+  snapshot.base_child_rows =
+      index_row_capacities(delta.temp_productions_by_base_child);
+  snapshot.temp_child_rows =
+      index_row_capacities(delta.temp_productions_by_temp_child);
+  return snapshot;
+}
+
+static void check_capacity_vector_floor(std::vector<std::size_t> const& actual,
+                                        std::vector<std::size_t> const& floor) {
+  CHECK(actual.size() == floor.size());
+  for (std::size_t i = 0; i < actual.size(); ++i) {
+    CHECK(actual[i] >= floor[i]);
+  }
+}
+
+static void check_delta_capacity_floor(
+    larch::spr_overlay_delta const& delta,
+    spr_overlay_delta_capacity_snapshot const& floor) {
+#define CHECK_CAPACITY_FLOOR(field) CHECK(delta.field.capacity() >= floor.field)
+  CHECK_CAPACITY_FLOOR(temp_clades);
+  CHECK_CAPACITY_FLOOR(temp_productions);
+  CHECK_CAPACITY_FLOOR(removed_base_productions);
+  CHECK_CAPACITY_FLOOR(commit_source);
+  CHECK_CAPACITY_FLOOR(affected_order);
+  CHECK_CAPACITY_FLOOR(affected_base_clade);
+  CHECK_CAPACITY_FLOOR(affected_temp_clade);
+  CHECK_CAPACITY_FLOOR(affected_base_row_slot);
+  CHECK_CAPACITY_FLOOR(affected_temp_row_slot);
+  CHECK_CAPACITY_FLOOR(compiled_rows);
+  CHECK_CAPACITY_FLOOR(compiled_productions);
+  CHECK_CAPACITY_FLOOR(compiled_children);
+  CHECK_CAPACITY_FLOOR(removed_base_production);
+  CHECK_CAPACITY_FLOOR(reachable_base_clade);
+  CHECK_CAPACITY_FLOOR(reachable_temp_clade);
+  CHECK_CAPACITY_FLOOR(temp_productions_by_base_parent);
+  CHECK_CAPACITY_FLOOR(temp_productions_by_temp_parent);
+  CHECK_CAPACITY_FLOOR(temp_productions_by_base_child);
+  CHECK_CAPACITY_FLOOR(temp_productions_by_temp_child);
+#undef CHECK_CAPACITY_FLOOR
+  auto snapshot = snapshot_delta_capacities(delta);
+  check_capacity_vector_floor(snapshot.temp_clade_taxa, floor.temp_clade_taxa);
+  check_capacity_vector_floor(snapshot.temp_production_children,
+                              floor.temp_production_children);
+  check_capacity_vector_floor(snapshot.temp_production_witnesses,
+                              floor.temp_production_witnesses);
+  CHECK(snapshot.witness_children.size() == floor.witness_children.size());
+  CHECK(snapshot.witness_edges.size() == floor.witness_edges.size());
+  for (std::size_t i = 0; i < snapshot.witness_children.size(); ++i) {
+    check_capacity_vector_floor(snapshot.witness_children[i],
+                                floor.witness_children[i]);
+    CHECK(snapshot.witness_edges[i].size() == floor.witness_edges[i].size());
+    for (std::size_t j = 0; j < snapshot.witness_edges[i].size(); ++j) {
+      check_capacity_vector_floor(snapshot.witness_edges[i][j],
+                                  floor.witness_edges[i][j]);
+    }
+  }
+  check_capacity_vector_floor(snapshot.base_parent_rows,
+                              floor.base_parent_rows);
+  check_capacity_vector_floor(snapshot.temp_parent_rows,
+                              floor.temp_parent_rows);
+  check_capacity_vector_floor(snapshot.base_child_rows, floor.base_child_rows);
+  check_capacity_vector_floor(snapshot.temp_child_rows, floor.temp_child_rows);
+}
+
 static std::vector<larch::overlay_production_ref> all_base_production_refs(
     larch::clade_grammar const& grammar) {
   std::vector<larch::overlay_production_ref> refs;
@@ -696,7 +913,22 @@ static void test_nonbinary_overlay_production_scored_locally() {
         counters_before.multifurcation_productions_scored);
   CHECK(state.counters.full_overlay_materializations == 0);
 
-  auto delta = larch::build_spr_overlay_delta(fixture.grammar, candidate);
+  auto plan = larch::build_chart_execution_plan(fixture.grammar);
+  auto checked = larch::check_chart_execution_plan(fixture.grammar, plan);
+  auto delta = larch::build_spr_overlay_delta(fixture.grammar, plan, candidate);
+  larch::spr_overlay_delta into_delta;
+  larch::spr_overlay_delta_build_scratch build_scratch;
+  larch::candidate_chart_execution_plan_build_stats into_stats;
+  larch::build_spr_overlay_delta_from_resident_plan_into(
+      fixture.grammar, checked, candidate, into_delta, build_scratch, {},
+      &into_stats);
+  CHECK(build_scratch.operation_boundary_clean());
+  CHECK(into_stats == into_delta.candidate_plan_build_stats);
+  check_spr_overlay_delta_equal(into_delta, delta);
+  CHECK(std::any_of(
+      into_delta.compiled_productions.begin(),
+      into_delta.compiled_productions.end(),
+      [](auto const& production) { return production.child_count == 3; }));
   auto overlay = larch::overlay_from_candidate(fixture.grammar, candidate);
   auto materialized = larch::materialize_overlay_grammar(overlay);
   for (auto const& pattern : fixture.patterns.patterns) {
@@ -743,6 +975,167 @@ static void test_overlay_delta_rows_match_full_overlay_for_tiny_candidates() {
     }
   }
   CHECK(saw_strictly_local_candidate);
+
+  std::println("  PASS");
+}
+
+static std::size_t candidate_storage_demand(
+    larch::grammar_spr_candidate const& candidate) {
+  std::size_t demand = candidate.removed_productions.size() +
+                       candidate.added_clades.size() +
+                       candidate.added_productions.size();
+  for (auto const& clade : candidate.added_clades) {
+    demand += clade.taxa.size();
+  }
+  for (auto const& production : candidate.added_productions) {
+    demand += production.children.size() + production.witnesses.size();
+    for (auto const& witness : production.witnesses) {
+      demand += witness.children.size();
+      for (auto const& child : witness.children) {
+        demand += child.edge_alternatives.size();
+      }
+    }
+  }
+  return demand;
+}
+
+static void test_overlay_delta_into_reuse_and_fail_closed_contract() {
+  std::println("test_overlay_delta_into_reuse_and_fail_closed_contract");
+
+  auto fixture = make_fixture();
+  auto plan = larch::build_chart_execution_plan(fixture.grammar);
+  auto checked = larch::check_chart_execution_plan(fixture.grammar, plan);
+  auto const& pattern = fixture.patterns.patterns.front();
+  larch::leaf_site_states states{.state_by_taxon = pattern.state_by_taxon};
+  auto base_chart = larch::build_single_site_chart(fixture.grammar, states);
+
+  larch::spr_overlay_delta delta;
+  larch::spr_overlay_delta_build_scratch scratch;
+  CHECK(scratch.operation_boundary_clean());
+  for (auto const& candidate : fixture.candidates) {
+    auto expected =
+        larch::build_spr_overlay_delta(fixture.grammar, plan, candidate);
+    larch::candidate_chart_execution_plan_build_stats external_stats;
+    larch::build_spr_overlay_delta_from_resident_plan_into(
+        fixture.grammar, checked, candidate, delta, scratch, {},
+        &external_stats);
+    CHECK(scratch.operation_boundary_clean());
+    CHECK(external_stats == expected.candidate_plan_build_stats);
+    check_spr_overlay_delta_equal(delta, expected);
+
+    // Value-vs-into parity is backed by the independent materialized-grammar
+    // row oracle, so delegation cannot make this test tautological.
+    auto overlay = larch::overlay_from_candidate(fixture.grammar, candidate);
+    auto materialized = larch::materialize_overlay_grammar(overlay);
+    auto local_rows =
+        larch::build_local_overlay_chart_rows(delta, base_chart, states);
+    larch::verify_local_overlay_rows_against_full(delta, local_rows, base_chart,
+                                                  materialized, states,
+                                                  larch::chart_options{});
+  }
+
+  auto largest = std::max_element(
+      fixture.candidates.begin(), fixture.candidates.end(),
+      [](auto const& lhs, auto const& rhs) {
+        return candidate_storage_demand(lhs) < candidate_storage_demand(rhs);
+      });
+  CHECK(largest != fixture.candidates.end());
+  CHECK(candidate_storage_demand(*largest) > 0);
+  auto expected_large =
+      larch::build_spr_overlay_delta(fixture.grammar, plan, *largest);
+  larch::build_spr_overlay_delta_from_resident_plan_into(
+      fixture.grammar, checked, *largest, delta, scratch);
+  check_spr_overlay_delta_equal(delta, expected_large);
+  auto high_water = snapshot_delta_capacities(delta);
+
+  // A valid identity candidate shrinks every candidate-local payload. Building
+  // the large descriptor again must recover every visible outer and nested
+  // capacity, while all semantic/build counters reset to the fresh value.
+  larch::grammar_spr_candidate identity;
+  auto expected_identity =
+      larch::build_spr_overlay_delta(fixture.grammar, plan, identity);
+  larch::build_spr_overlay_delta_from_resident_plan_into(
+      fixture.grammar, checked, identity, delta, scratch);
+  CHECK(scratch.operation_boundary_clean());
+  check_spr_overlay_delta_equal(delta, expected_identity);
+  CHECK(delta.candidate_plan_build_stats.candidate_partition_validations == 0);
+  CHECK(delta.candidate_plan_build_stats.production_descriptors_compiled == 0);
+
+  larch::build_spr_overlay_delta_from_resident_plan_into(
+      fixture.grammar, checked, *largest, delta, scratch);
+  CHECK(scratch.operation_boundary_clean());
+  check_spr_overlay_delta_equal(delta, expected_large);
+  check_delta_capacity_floor(delta, high_water);
+
+  // Force a failure after payload copy and candidate-partition accounting.
+  // The previous successful descriptor must not remain consumable, and the
+  // same destination/scratch must recover on the next valid build.
+  auto malformed = *largest;
+  auto leaf = clade_for(fixture.grammar, {"A"});
+  malformed.added_productions.push_back(
+      temp_prod(larch::base_clade_ref(fixture.grammar.root_clade),
+                {larch::base_clade_ref(leaf)}));
+  bool invalid_threw = false;
+  try {
+    larch::build_spr_overlay_delta_from_resident_plan_into(
+        fixture.grammar, checked, malformed, delta, scratch);
+  } catch (std::runtime_error const& e) {
+    invalid_threw = true;
+    CHECK(std::string{e.what()}.find("at least 2 children") !=
+          std::string::npos);
+  }
+  CHECK(invalid_threw);
+  CHECK(delta.base == nullptr);
+  CHECK(delta.base_plan_generation == 0);
+  CHECK(delta.affected_order.empty());
+  CHECK(delta.affected_base_row_slot.empty());
+  CHECK(delta.affected_temp_row_slot.empty());
+  CHECK(delta.compiled_rows.empty());
+  CHECK(delta.compiled_productions.empty());
+  CHECK(delta.compiled_children.empty());
+  CHECK(scratch.operation_boundary_clean());
+
+  larch::local_overlay_chart_rows failed_rows;
+  bool failed_delta_rejected = false;
+  try {
+    larch::build_local_overlay_chart_rows_into(fixture.grammar, delta,
+                                               base_chart, states, failed_rows);
+  } catch (std::runtime_error const& e) {
+    failed_delta_rejected = true;
+    CHECK(std::string{e.what()}.find("row slot map size mismatch") !=
+          std::string::npos);
+  }
+  CHECK(failed_delta_rejected);
+
+  larch::build_spr_overlay_delta_from_resident_plan_into(
+      fixture.grammar, checked, *largest, delta, scratch);
+  check_spr_overlay_delta_equal(delta, expected_large);
+  check_delta_capacity_floor(delta, high_water);
+  CHECK(scratch.operation_boundary_clean());
+
+  // A stale checked capability also fails closed before candidate work. Once
+  // the immutable generation is restored, the same capability and storage are
+  // usable again.
+  auto generation = fixture.grammar.execution_generation;
+  ++fixture.grammar.execution_generation;
+  bool stale_threw = false;
+  try {
+    larch::build_spr_overlay_delta_from_resident_plan_into(
+        fixture.grammar, checked, *largest, delta, scratch);
+  } catch (larch::chart_execution_plan_mismatch const&) {
+    stale_threw = true;
+  }
+  CHECK(stale_threw);
+  CHECK(delta.base == nullptr);
+  CHECK(delta.base_plan_generation == 0);
+  CHECK(scratch.operation_boundary_clean());
+  fixture.grammar.execution_generation = generation;
+
+  larch::build_spr_overlay_delta_from_resident_plan_into(
+      fixture.grammar, checked, *largest, delta, scratch);
+  CHECK(scratch.operation_boundary_clean());
+  check_spr_overlay_delta_equal(delta, expected_large);
+  check_delta_capacity_floor(delta, high_water);
 
   std::println("  PASS");
 }
@@ -1019,6 +1412,11 @@ static void test_pattern_batch_cache_options_match_all_cache() {
   // deliberately observed rather than inferred from record-high row counts.
   CHECK(observed_row_scratch_growths > 0);
   CHECK(observed_row_scratch_growths <= subset.size());
+  auto const observed_lazy_row_scratch_growths =
+      lazy_state.counters.local_row_scratch_capacity_growths -
+      lazy_counters_before.local_row_scratch_capacity_growths;
+  CHECK(observed_lazy_row_scratch_growths > 0);
+  CHECK(observed_lazy_row_scratch_growths <= subset.size());
   auto const expected_leaf_state_views =
       subset.size() * active_pattern_count;
   CHECK(expected_leaf_state_views > 0);
@@ -1084,7 +1482,8 @@ static void test_pattern_batch_cache_options_match_all_cache() {
                                 active_pattern_count,
                                 expected_leaf_state_views,
                                 observed_row_scratch_growths);
-  check_candidate_plan_counters(lazy_state, lazy_counters_before, 0, 0, 0);
+  check_candidate_plan_counters(lazy_state, lazy_counters_before, 0, 0,
+                                observed_lazy_row_scratch_growths);
   CHECK(batched_state.counters.local_candidate_scores == subset.size());
   CHECK(batched_state.counters.pattern_batch_cache_builds >=
         batched_state.active_patterns.patterns.patterns.size());
@@ -1125,6 +1524,402 @@ static void test_pattern_batch_cache_options_match_all_cache() {
   std::println("  PASS");
 }
 
+static void check_local_result_matches_owned_score(
+    larch::chart_spr_local_score_result const& local,
+    larch::chart_spr_candidate_score const& owned) {
+  CHECK(local.lower_bound.value.delta == owned.lower_bound.value.delta);
+  CHECK(local.lower_bound.value.old_score == owned.lower_bound.value.old_score);
+  CHECK(local.lower_bound.value.new_score == owned.lower_bound.value.new_score);
+  CHECK(local.lower_bound.value.exact_multisite ==
+        owned.lower_bound.value.exact_multisite);
+  CHECK(local.lower_bound.kind == owned.lower_bound.kind);
+  CHECK(local.lower_bound.convention == owned.lower_bound.convention);
+  CHECK(local.lower_bound.invariant_offset_applied ==
+        owned.lower_bound.invariant_offset_applied);
+  CHECK(local.affected_clade_count == owned.affected_clade_count);
+  CHECK(local.valid == owned.valid);
+  CHECK(local.invalid_reason == owned.invalid_reason);
+  CHECK(local.local_score_ms >= 0.0);
+}
+
+static void test_local_score_into_workspace_contract() {
+  std::println("test_local_score_into_workspace_contract");
+
+  auto fixture = make_fixture();
+  auto state = larch::build_chart_spr_search_state(fixture.dag, fixture.grammar,
+                                                   fixture.patterns);
+  CHECK(fixture.candidates.size() >= 4);
+  constexpr std::size_t candidate_count = 4;
+  std::vector<larch::grammar_spr_candidate> candidates(
+      fixture.candidates.begin(), fixture.candidates.begin() + candidate_count);
+
+  // The old owning API remains the semantic oracle, but now promotes its
+  // candidate payload only after delegating to `_into`.
+  auto owning = larch::score_candidates_locally(state, candidates, {}, 1);
+  CHECK(owning.size() == candidates.size());
+  larch::chart_spr_local_score_workspace workspace;
+  CHECK(workspace.operation_boundary_clean());
+  std::vector<larch::chart_spr_local_score_result> local(candidates.size());
+  auto growths_before = state.counters.local_row_scratch_capacity_growths;
+  larch::score_candidates_locally_into(state, candidates, local, workspace, {},
+                                       1);
+  CHECK(workspace.operation_boundary_clean());
+  auto growths_after_warm = state.counters.local_row_scratch_capacity_growths;
+  CHECK(growths_after_warm > growths_before);
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    check_local_result_matches_owned_score(local[i], owning[i]);
+    auto promoted =
+        larch::promote_chart_spr_local_score(candidates[i], local[i]);
+    CHECK(larch::chart_spr_candidate_taxon_signature(state.grammar,
+                                                     promoted.candidate) ==
+          larch::chart_spr_candidate_taxon_signature(state.grammar,
+                                                     candidates[i]));
+    CHECK(!promoted.exact.has_value());
+    CHECK(promoted.topology_selection.kind ==
+          larch::chart_spr_topology_selection_kind::none);
+    CHECK(promoted.canonical_exact_evidence == nullptr);
+  }
+
+  // Grow -> shrink -> reorder uses only the active span and retains the serial
+  // row high-water mark.  Stale inactive result and prepared slots are never
+  // observed.
+  std::vector<larch::grammar_spr_candidate> reordered(candidates.rbegin(),
+                                                      candidates.rend());
+  reordered.pop_back();
+  std::vector<larch::chart_spr_local_score_result> reordered_local(
+      reordered.size());
+  larch::score_candidates_locally_into(state, reordered, reordered_local,
+                                       workspace, {}, 1);
+  CHECK(workspace.operation_boundary_clean());
+  CHECK(state.counters.local_row_scratch_capacity_growths ==
+        growths_after_warm);
+  for (std::size_t i = 0; i < reordered.size(); ++i) {
+    check_local_result_matches_owned_score(reordered_local[i],
+                                           owning[candidates.size() - 1 - i]);
+  }
+
+  std::reverse(reordered.begin(), reordered.end());
+  reordered.push_back(candidates.back());
+  reordered_local.resize(reordered.size());
+  larch::score_candidates_locally_into(state, reordered, reordered_local,
+                                       workspace, {}, 1);
+  CHECK(workspace.operation_boundary_clean());
+  CHECK(state.counters.local_row_scratch_capacity_growths ==
+        growths_after_warm);
+
+  // Checked and unchecked calls agree, and two-worker scratch reaches a stable
+  // high-water mark when the same partition is replayed.
+  auto checked =
+      larch::check_chart_execution_plan(state.grammar, state.execution_plan);
+  larch::chart_spr_local_score_workspace parallel_workspace;
+  std::vector<larch::chart_spr_local_score_result> parallel(candidates.size());
+  larch::score_candidates_locally_into(state, candidates, parallel,
+                                       parallel_workspace, {}, 2, checked);
+  CHECK(parallel_workspace.operation_boundary_clean());
+  auto parallel_growths_after_warm =
+      state.counters.local_row_scratch_capacity_growths;
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    check_local_result_matches_owned_score(parallel[i], owning[i]);
+  }
+  larch::score_candidates_locally_into(state, candidates, parallel,
+                                       parallel_workspace, {}, 2);
+  CHECK(parallel_workspace.operation_boundary_clean());
+  CHECK(state.counters.local_row_scratch_capacity_growths ==
+        parallel_growths_after_warm);
+
+  // Ceil chunking for four candidates and three requested workers produces
+  // two nonempty tasks, not three.  Counters describe actual successful
+  // submissions and the same workspace remains reusable after a forced
+  // partial-submission failure.
+  auto tasks_before = state.counters.local_score_worker_tasks;
+  auto parallel_batches_before = state.counters.local_score_parallel_batches;
+  larch::score_candidates_locally_into(state, candidates, parallel,
+                                       parallel_workspace, {}, 3, checked);
+  CHECK(parallel_workspace.operation_boundary_clean());
+  CHECK(state.counters.local_score_worker_tasks - tasks_before == 2);
+  CHECK(state.counters.local_score_parallel_batches - parallel_batches_before ==
+        1);
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    check_local_result_matches_owned_score(parallel[i], owning[i]);
+  }
+
+  larch::local_spr_score_options forced_submit_failure;
+  larch::local_score_worker_barrier_for_tests submit_barrier;
+  forced_submit_failure.force_worker_submit_failure_after_for_tests = 1;
+  forced_submit_failure.worker_barrier_for_tests = &submit_barrier;
+  auto failed_tasks_before = state.counters.local_score_worker_tasks;
+  bool submit_threw = false;
+  try {
+    larch::score_candidates_locally_into(state, candidates, parallel,
+                                         parallel_workspace,
+                                         forced_submit_failure, 3, checked);
+  } catch (std::runtime_error const& e) {
+    submit_threw = true;
+    CHECK(std::string{e.what()}.find("forced worker submission failure") !=
+          std::string::npos);
+  }
+  CHECK(submit_threw);
+  CHECK(submit_barrier.started.load() == 1);
+  CHECK(submit_barrier.release.load());
+  CHECK(state.counters.local_score_worker_tasks == failed_tasks_before);
+  CHECK(parallel_workspace.operation_boundary_clean());
+
+  larch::local_spr_score_options forced_worker_failure;
+  larch::local_score_worker_barrier_for_tests worker_barrier;
+  forced_worker_failure.worker_barrier_for_tests = &worker_barrier;
+  forced_worker_failure.force_worker_failure_for_tests = 0;
+  bool worker_threw = false;
+  try {
+    larch::score_candidates_locally_into(state, candidates, parallel,
+                                         parallel_workspace,
+                                         forced_worker_failure, 3, checked);
+  } catch (std::runtime_error const& e) {
+    worker_threw = true;
+    CHECK(std::string{e.what()}.find("forced worker task failure") !=
+          std::string::npos);
+  }
+  CHECK(worker_threw);
+  CHECK(worker_barrier.started.load() == 2);
+  CHECK(worker_barrier.release.load());
+  CHECK(state.counters.local_score_worker_tasks == failed_tasks_before);
+  CHECK(parallel_workspace.operation_boundary_clean());
+
+  larch::score_candidates_locally_into(state, candidates, parallel,
+                                       parallel_workspace, {}, 3, checked);
+  CHECK(parallel_workspace.operation_boundary_clean());
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    check_local_result_matches_owned_score(parallel[i], owning[i]);
+  }
+
+  // A candidate-local failure does not poison either adjacent result or the
+  // next operation.  In particular, valid output clears an old invalid reason.
+  larch::grammar_spr_candidate bad;
+  bad.removed_productions.push_back(larch::base_production_ref(
+      state.grammar.productions_by_parent[state.grammar.root_clade].front()));
+  std::vector<larch::grammar_spr_candidate> mixed{candidates.front(), bad,
+                                                  candidates.back()};
+  std::vector<larch::chart_spr_local_score_result> mixed_results(mixed.size());
+  larch::score_candidates_locally_into(state, mixed, mixed_results, workspace,
+                                       {}, 1);
+  CHECK(workspace.operation_boundary_clean());
+  CHECK(mixed_results[0].valid);
+  CHECK(!mixed_results[1].valid);
+  CHECK(!mixed_results[1].invalid_reason.empty());
+  CHECK(mixed_results[2].valid);
+  CHECK(mixed_results[2].invalid_reason.empty());
+
+  larch::chart_spr_local_score_result one_result;
+  one_result.valid = false;
+  one_result.invalid_reason = "stale result sentinel";
+  larch::score_candidates_locally_into(
+      state,
+      std::span<larch::grammar_spr_candidate const>{&candidates.front(), 1},
+      std::span<larch::chart_spr_local_score_result>{&one_result, 1}, workspace,
+      {}, 1);
+  CHECK(workspace.operation_boundary_clean());
+  CHECK(one_result.valid);
+  CHECK(one_result.invalid_reason.empty());
+
+  // Candidate and result owners may die immediately at the operation boundary;
+  // the next operation cannot observe either address.
+  {
+    std::vector<larch::grammar_spr_candidate> ephemeral{candidates.back()};
+    std::vector<larch::chart_spr_local_score_result> ephemeral_results(1);
+    larch::score_candidates_locally_into(state, ephemeral, ephemeral_results,
+                                         workspace, {}, 1);
+    CHECK(ephemeral_results.front().valid);
+  }
+  CHECK(workspace.operation_boundary_clean());
+  larch::score_candidates_locally_into(
+      state,
+      std::span<larch::grammar_spr_candidate const>{&candidates.front(), 1},
+      std::span<larch::chart_spr_local_score_result>{&one_result, 1}, workspace,
+      {}, 1);
+  CHECK(workspace.operation_boundary_clean());
+  CHECK(one_result.valid);
+
+  // Empty batches are no-ops.  Size mismatch and exceptional scorer options
+  // fail without publishing an operation-boundary borrow.
+  larch::score_candidates_locally_into(
+      state, std::span<larch::grammar_spr_candidate const>{},
+      std::span<larch::chart_spr_local_score_result>{}, workspace, {}, 2);
+  CHECK(workspace.operation_boundary_clean());
+  bool mismatch_threw = false;
+  try {
+    larch::score_candidates_locally_into(
+        state,
+        std::span<larch::grammar_spr_candidate const>{&candidates.front(), 1},
+        std::span<larch::chart_spr_local_score_result>{}, workspace, {}, 1);
+  } catch (std::invalid_argument const& e) {
+    mismatch_threw = true;
+    CHECK(std::string{e.what()}.find("span size mismatch") !=
+          std::string::npos);
+  }
+  CHECK(mismatch_threw);
+  CHECK(workspace.operation_boundary_clean());
+
+  larch::local_spr_score_options invalid_options;
+  invalid_options.exact_multisite = true;
+  bool option_threw = false;
+  try {
+    larch::score_candidates_locally_into(
+        state,
+        std::span<larch::grammar_spr_candidate const>{&candidates.front(), 1},
+        std::span<larch::chart_spr_local_score_result>{&one_result, 1},
+        workspace, invalid_options, 1);
+  } catch (std::runtime_error const&) {
+    option_threw = true;
+  }
+  CHECK(option_threw);
+  CHECK(workspace.operation_boundary_clean());
+
+  // A capability from another state and a same-generation grammar mutation
+  // are both rejected before the workspace begins an operation.
+  auto other_fixture = make_fixture();
+  auto other_state = larch::build_chart_spr_search_state(
+      other_fixture.dag, other_fixture.grammar, other_fixture.patterns);
+  bool capability_threw = false;
+  try {
+    larch::score_candidates_locally_into(
+        other_state,
+        std::span<larch::grammar_spr_candidate const>{
+            &other_fixture.candidates.front(), 1},
+        std::span<larch::chart_spr_local_score_result>{&one_result, 1},
+        workspace, {}, 1, checked);
+  } catch (larch::chart_execution_plan_mismatch const&) {
+    capability_threw = true;
+  }
+  CHECK(capability_threw);
+  CHECK(workspace.operation_boundary_clean());
+
+  auto stale_fixture = make_fixture();
+  auto stale_state = larch::build_chart_spr_search_state(
+      stale_fixture.dag, stale_fixture.grammar, stale_fixture.patterns);
+  auto generation_before = stale_state.grammar.execution_generation;
+  std::swap(stale_state.grammar.productions.front().children[0],
+            stale_state.grammar.productions.front().children[1]);
+  CHECK(stale_state.grammar.execution_generation == generation_before);
+  auto mismatch_rejections_before =
+      stale_state.counters.plan_mismatch_rejections;
+  bool generation_threw = false;
+  try {
+    larch::score_candidates_locally_into(
+        stale_state,
+        std::span<larch::grammar_spr_candidate const>{
+            &stale_fixture.candidates.front(), 1},
+        std::span<larch::chart_spr_local_score_result>{&one_result, 1},
+        workspace, {}, 1);
+  } catch (larch::chart_execution_plan_mismatch const&) {
+    generation_threw = true;
+  }
+  CHECK(generation_threw);
+  CHECK(stale_state.counters.plan_mismatch_rejections ==
+        mismatch_rejections_before + 1);
+  CHECK(workspace.operation_boundary_clean());
+
+  std::println("  PASS");
+}
+
+static void test_pattern_batch_into_parallel_scratch_plateau() {
+  std::println("test_pattern_batch_into_parallel_scratch_plateau");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AAA", four_taxon_two_pattern_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto candidates = larch::enumerate_grammar_spr_candidates(grammar);
+  CHECK(candidates.size() >= 4);
+  candidates.resize(4);
+  larch::chart_spr_search_options options;
+  options.cache.max_cached_patterns = 1;
+  options.cache.candidate_batch_size = candidates.size();
+  auto state = larch::build_chart_spr_search_state(dag, grammar, options);
+  CHECK(state.cache_strategy ==
+        larch::chart_spr_cache_strategy::pattern_batches);
+
+  auto owning = larch::score_candidates_locally(state, candidates, {}, 2);
+  larch::chart_spr_local_score_workspace workspace;
+  std::vector<larch::chart_spr_local_score_result> results(candidates.size());
+  auto growths_before = state.counters.local_row_scratch_capacity_growths;
+  larch::score_candidates_locally_into(state, candidates, results, workspace,
+                                       {}, 2);
+  CHECK(workspace.operation_boundary_clean());
+  auto growths_after_warm = state.counters.local_row_scratch_capacity_growths;
+  CHECK(growths_after_warm > growths_before);
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    check_local_result_matches_owned_score(results[i], owning[i]);
+  }
+
+  larch::score_candidates_locally_into(state, candidates, results, workspace,
+                                       {}, 2);
+  CHECK(workspace.operation_boundary_clean());
+  CHECK(state.counters.local_row_scratch_capacity_growths ==
+        growths_after_warm);
+
+  auto tasks_before = state.counters.local_score_worker_tasks;
+  auto batches_before = state.counters.pattern_batch_cache_builds;
+  larch::score_candidates_locally_into(state, candidates, results, workspace,
+                                       {}, 3);
+  CHECK(workspace.operation_boundary_clean());
+  auto scored_pattern_batches =
+      state.counters.pattern_batch_cache_builds - batches_before;
+  CHECK(scored_pattern_batches > 0);
+  CHECK(state.counters.local_score_worker_tasks - tasks_before ==
+        2 * scored_pattern_batches);
+
+  // Fail after one queued task.  The scorer must join that task while the
+  // loop-local pattern-cache entries it references are still alive, then
+  // return a clean, reusable operation boundary.
+  larch::local_spr_score_options forced_submit_failure;
+  larch::local_score_worker_barrier_for_tests submit_barrier;
+  forced_submit_failure.force_worker_submit_failure_after_for_tests = 1;
+  forced_submit_failure.worker_barrier_for_tests = &submit_barrier;
+  auto failed_tasks_before = state.counters.local_score_worker_tasks;
+  bool submit_threw = false;
+  try {
+    larch::score_candidates_locally_into(state, candidates, results, workspace,
+                                         forced_submit_failure, 3);
+  } catch (std::runtime_error const& e) {
+    submit_threw = true;
+    CHECK(std::string{e.what()}.find("forced worker submission failure") !=
+          std::string::npos);
+  }
+  CHECK(submit_threw);
+  CHECK(submit_barrier.started.load() == 1);
+  CHECK(submit_barrier.release.load());
+  CHECK(state.counters.local_score_worker_tasks == failed_tasks_before);
+  CHECK(workspace.operation_boundary_clean());
+
+  // A task-side exception is also selected deterministically only after every
+  // submitted peer has reached the barrier and all futures have joined.
+  larch::local_spr_score_options forced_worker_failure;
+  larch::local_score_worker_barrier_for_tests worker_barrier;
+  forced_worker_failure.worker_barrier_for_tests = &worker_barrier;
+  forced_worker_failure.force_worker_failure_for_tests = 0;
+  bool worker_threw = false;
+  try {
+    larch::score_candidates_locally_into(state, candidates, results, workspace,
+                                         forced_worker_failure, 3);
+  } catch (std::runtime_error const& e) {
+    worker_threw = true;
+    CHECK(std::string{e.what()}.find("forced worker task failure") !=
+          std::string::npos);
+  }
+  CHECK(worker_threw);
+  CHECK(worker_barrier.started.load() == 2);
+  CHECK(worker_barrier.release.load());
+  CHECK(state.counters.local_score_worker_tasks == failed_tasks_before);
+  CHECK(workspace.operation_boundary_clean());
+
+  larch::score_candidates_locally_into(state, candidates, results, workspace,
+                                       {}, 3);
+  CHECK(workspace.operation_boundary_clean());
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    check_local_result_matches_owned_score(results[i], owning[i]);
+  }
+
+  std::println("  PASS");
+}
+
 static void test_candidate_execution_plan_lifetime_and_mismatch_guards() {
   std::println(
       "test_candidate_execution_plan_lifetime_and_mismatch_guards");
@@ -1135,8 +1930,6 @@ static void test_candidate_execution_plan_lifetime_and_mismatch_guards() {
         fixture.dag, fixture.grammar, fixture.patterns);
     auto source = std::make_unique<larch::grammar_spr_candidate>(
         fixture.candidates.front());
-    auto signature = larch::chart_spr_candidate_taxon_signature(
-        state.grammar, *source);
     larch::chart_spr_search_counters counters;
     auto prepared =
         larch::chart_spr_search_detail::prepare_local_candidate_score(
@@ -1156,8 +1949,6 @@ static void test_candidate_execution_plan_lifetime_and_mismatch_guards() {
     larch::chart_spr_search_detail::accumulate_prepared_local_candidate_patterns(
         state, prepared, 0, broken_entries, {}, &counters, scratch);
     CHECK(!prepared.valid_for_accumulation);
-    CHECK(larch::chart_spr_candidate_taxon_signature(
-              state.grammar, prepared.scored.candidate) == signature);
     CHECK(counters.candidate_execution_plan_builds == builds_before);
     CHECK(counters.chart_execution_plan_cache_hits == plan_hits_before);
   }
@@ -5922,6 +6713,7 @@ int main() {
   test_unreachable_dead_clades_ignored_reachable_dead_clades_fail();
   test_nonbinary_overlay_production_scored_locally();
   test_overlay_delta_rows_match_full_overlay_for_tiny_candidates();
+  test_overlay_delta_into_reuse_and_fail_closed_contract();
   test_local_scoring_verify_option_counts_oracle_materialization();
   test_invalid_disconnected_overlay_returns_invalid_score();
   test_persistent_active_pattern_cache_matches_full_composite();
@@ -5929,6 +6721,8 @@ int main() {
   test_active_pattern_assertions_reject_skipped_metadata();
   test_state_builder_from_dag_rebuilds_patterns_once();
   test_pattern_batch_cache_options_match_all_cache();
+  test_local_score_into_workspace_contract();
+  test_pattern_batch_into_parallel_scratch_plateau();
   test_candidate_execution_plan_lifetime_and_mismatch_guards();
   test_checked_candidate_sources_and_planned_materialization();
   test_acceptance_iteration_checks_resident_plan_once();

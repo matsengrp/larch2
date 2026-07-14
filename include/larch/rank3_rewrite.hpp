@@ -3203,10 +3203,13 @@ inline option_c_overlay_delta_result option_c_as_overlay_delta(
   // `option_c_chain_commit_test` asserts the two match.
   delta.commit_source = "option_c_chain_commit";
 
-  chart_spr_search_detail::build_overlay_delta_temp_indices(delta);
-  chart_spr_search_detail::compute_overlay_delta_reachability(delta,
-                                                               score_options);
-  chart_spr_search_detail::compute_overlay_delta_affected_order(delta);
+  spr_overlay_delta_build_scratch build_scratch;
+  chart_spr_search_detail::build_overlay_delta_temp_indices(delta,
+                                                            build_scratch);
+  chart_spr_search_detail::compute_overlay_delta_reachability(
+      delta, build_scratch, score_options);
+  chart_spr_search_detail::compute_overlay_delta_affected_order(delta,
+                                                                build_scratch);
   chart_spr_search_detail::compile_overlay_delta_execution_rows(delta);
   return result;
 }

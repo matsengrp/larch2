@@ -3970,6 +3970,8 @@ chart_spr_search_result run_chart_spr_search(
     }
   }
 
+  chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      acceptance_workspace;
   std::string immediate_reversal_key_to_skip;
   for (std::size_t iter = 0; iter < options.max_iterations; ++iter) {
     auto iteration_options = options;
@@ -3978,9 +3980,8 @@ chart_spr_search_result run_chart_spr_search(
     auto iteration_seed = options.seed + static_cast<std::uint32_t>(iter);
     iteration_options.seed = iteration_seed;
     iteration_options.enumeration.seed = iteration_seed;
-    auto iteration = run_chart_spr_acceptance_iteration(state,
-                                                        iteration_options,
-                                                        iter);
+    auto iteration = run_chart_spr_acceptance_iteration(
+        state, iteration_options, iter, acceptance_workspace);
     result.summary.candidates_generated += iteration.candidates_generated;
     result.summary.candidate_generation_ms +=
         iteration.candidate_generation_ms;
