@@ -1878,6 +1878,13 @@ static void test_multisite_exact_setup_cold_resident_and_lifetime() {
   auto merged = larch::test::merge_tiny_trees(std::move(trees));
   auto grammar = larch::build_clade_grammar(merged);
   auto plan = larch::build_chart_execution_plan(grammar);
+  auto c = clade_for(grammar, {"C"});
+  auto d = clade_for(grammar, {"D"});
+  auto de = clade_for(grammar, {"D", "E"});
+  auto ce = clade_for(grammar, {"C", "E"});
+  auto cde = clade_for(grammar, {"C", "D", "E"});
+  auto prod_c_de = production_id_for(grammar, cde, {c, de});
+  auto prod_d_ce = production_id_for(grammar, cde, {d, ce});
   larch::site_pattern_options pattern_options;
   pattern_options.skip_invariant_sites = true;
   auto patterns =
@@ -1888,7 +1895,7 @@ static void test_multisite_exact_setup_cold_resident_and_lifetime() {
       [](auto const& pattern) {
         return !larch::is_invariant_site_pattern(pattern);
       }));
-  CHECK(active_pattern_count != 0);
+  CHECK(active_pattern_count == 2);
   auto const binary_production_count =
       static_cast<std::size_t>(std::count_if(
           grammar.productions.begin(), grammar.productions.end(),
@@ -1932,6 +1939,14 @@ static void test_multisite_exact_setup_cold_resident_and_lifetime() {
               .generic_reusable_productions_scored == 0);
     CHECK(cold_setup.work.upper_bound_topologies_generated ==
           active_pattern_count + 1);
+    // The two active paper-counterexample patterns have opposite uniquely
+    // preferred CDE topologies.  The deterministic seed topology duplicates
+    // one of those per-pattern tracebacks, so this exercises actual setup-time
+    // topology deduplication rather than only its accounting surface.
+    CHECK(cold_setup.work.upper_bound_topologies_generated == 3);
+    CHECK(cold_setup.work.upper_bound_topologies_unique == 2);
+    CHECK(cold_setup.work.upper_bound_topologies_generated >
+          cold_setup.work.upper_bound_topologies_unique);
     CHECK(cold_setup.work.upper_bound_topologies_unique != 0);
     CHECK(cold_setup.work.upper_bound_topologies_unique <=
           cold_setup.work.upper_bound_topologies_generated);
@@ -2047,6 +2062,10 @@ static void test_multisite_exact_setup_cold_resident_and_lifetime() {
               .generic_reusable_productions_scored == 0);
     CHECK(resident_setup.work.upper_bound_topologies_generated ==
           active_pattern_count + 1);
+    CHECK(resident_setup.work.upper_bound_topologies_generated == 3);
+    CHECK(resident_setup.work.upper_bound_topologies_unique == 2);
+    CHECK(resident_setup.work.upper_bound_topologies_generated >
+          resident_setup.work.upper_bound_topologies_unique);
     CHECK(resident_setup.work.upper_bound_topologies_unique ==
           cold_setup.work.upper_bound_topologies_unique);
     for (auto const& info : resident_setup.active_patterns) {
@@ -2056,6 +2075,10 @@ static void test_multisite_exact_setup_cold_resident_and_lifetime() {
 
     auto brute = larch::brute_force_multisite_topologies(
         grammar, patterns, chart_options);
+    CHECK(brute.topology_count == 2);
+    CHECK(brute.optimum == (score_ua_edge ? 4 : 3));
+    CHECK(brute.keep_production[prod_c_de]);
+    CHECK(brute.keep_production[prod_d_ce]);
     for (auto dominance_mode :
          {larch::multisite_dominance_mode::off,
           larch::multisite_dominance_mode::two_pass_exact_mask}) {
@@ -2080,6 +2103,14 @@ static void test_multisite_exact_setup_cold_resident_and_lifetime() {
       check_multisite_trim_results_equal(checked, integrated);
       check_multisite_trim_results_equal(integrated, cold);
       check_multisite_trim_results_equal(cold, resident, false);
+      CHECK(cold.optimum == checked.optimum);
+      CHECK(cold.keep_production == checked.keep_production);
+      CHECK(cold.optimal_root_provenance_classes ==
+            checked.optimal_root_provenance_classes);
+      CHECK(resident.optimum == checked.optimum);
+      CHECK(resident.keep_production == checked.keep_production);
+      CHECK(resident.optimal_root_provenance_classes ==
+            checked.optimal_root_provenance_classes);
       CHECK(resident.optimum == brute.optimum);
       CHECK(resident.keep_production == brute.keep_production);
       CHECK(resident.keep_production_exact);

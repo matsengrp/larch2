@@ -136,6 +136,12 @@ void chart_spr_add_search_state_rebuild_counters(
       rebuild_counters.multifurcation_productions_scored;
   accumulated.pattern_batch_cache_builds +=
       rebuild_counters.pattern_batch_cache_builds;
+  accumulated.initial_state_inside_charts_built +=
+      rebuild_counters.initial_state_inside_charts_built;
+  accumulated.inside_cache_inside_charts_built +=
+      rebuild_counters.inside_cache_inside_charts_built;
+  accumulated.inside_cache_resident_inside_charts_consumed +=
+      rebuild_counters.inside_cache_resident_inside_charts_consumed;
   accumulated.exact_setup_builds += rebuild_counters.exact_setup_builds;
   accumulated.exact_setup_inside_charts_built +=
       rebuild_counters.exact_setup_inside_charts_built;
@@ -974,6 +980,19 @@ struct chart_spr_local_commit_substrate {
   std::vector<overlay_clade_ref> dense_clade_to_chain_ref;
   std::vector<overlay_production_ref> dense_production_to_chain_ref;
 
+  // Publication stamp for current-tip row projection.  The frozen cache base
+  // keeps its initial generation, while these fields identify the dense tip
+  // whose clade ids are mapped by dense_clade_to_chain_ref.  Exact-setup and
+  // pattern-cache providers validate the complete stamp before reading rows.
+  std::size_t published_tip_epoch = 0;
+  std::uint64_t published_tip_execution_generation = 0;
+  chart_plan_fingerprint published_tip_execution_fingerprint;
+  inside_chart_cache_active_pattern_fingerprint
+      published_active_pattern_fingerprint;
+
+  double inside_cache_initialization_ms = 0.0;
+  double outside_cache_initialization_ms = 0.0;
+
   // Phase 8 per-pattern selected-topology production cache.  This is separate
   // from the grammar-min inside/outside caches: it stores rows for one exact
   // structural selected subtree, so an unchanged fixed-topology subtree can be
@@ -1009,6 +1028,83 @@ void chart_spr_set_tip_maps_from_materialization(
     overlay_materialization_result const& materialized) {
   sub.dense_clade_to_chain_ref = materialized.dense_clade_to_ref;
   sub.dense_production_to_chain_ref = materialized.dense_production_to_ref;
+}
+
+void chart_spr_publish_local_commit_tip_identity(
+    chart_spr_local_commit_substrate& sub,
+    chart_spr_search_state const& state) {
+  if (!sub.chain || !sub.icache || !sub.ocache) {
+    throw std::runtime_error(
+        "chart SPR local commit: cannot publish an incomplete cache tip");
+  }
+  if (sub.icache->commit_epoch != sub.chain->size() ||
+      sub.ocache->commit_epoch != sub.chain->size()) {
+    throw std::runtime_error(
+        "chart SPR local commit: cannot publish mismatched cache epochs");
+  }
+  if (sub.dense_clade_to_chain_ref.size() != state.grammar.clades.size() ||
+      sub.dense_production_to_chain_ref.size() !=
+          state.grammar.productions.size()) {
+    throw std::runtime_error(
+        "chart SPR local commit: cannot publish mismatched dense tip maps");
+  }
+  auto const active_fingerprint =
+      inside_chart_cache_detail::fingerprint_active_pattern_set(
+          state.active_patterns);
+  if (sub.icache->active_pattern_fingerprint != active_fingerprint ||
+      sub.icache->patterns.size() !=
+          state.active_patterns.patterns.patterns.size() ||
+      sub.icache->taxon_count != state.active_patterns.patterns.taxon_count) {
+    throw std::runtime_error(
+        "chart SPR local commit: cannot publish mismatched active patterns");
+  }
+  sub.published_tip_epoch = sub.chain->size();
+  sub.published_tip_execution_generation =
+      state.execution_plan.grammar_generation();
+  sub.published_tip_execution_fingerprint = state.execution_plan.fingerprint();
+  sub.published_active_pattern_fingerprint = active_fingerprint;
+}
+
+void chart_spr_assert_local_commit_tip_identity(
+    chart_spr_local_commit_substrate const& sub,
+    chart_spr_search_state const& state,
+    checked_chart_execution_plan_ref const& checked_state,
+    std::string_view consumer) {
+  checked_state.assert_same(state.grammar, state.execution_plan);
+  if (!sub.chain || !sub.icache || !sub.ocache) {
+    throw std::runtime_error(std::string{consumer} +
+                             ": local substrate is incomplete");
+  }
+  if (sub.published_tip_epoch != sub.chain->size() ||
+      sub.icache->commit_epoch != sub.published_tip_epoch ||
+      sub.ocache->commit_epoch != sub.published_tip_epoch) {
+    throw std::runtime_error(std::string{consumer} +
+                             ": chain/cache epoch mismatch");
+  }
+  if (sub.published_tip_execution_generation !=
+          state.execution_plan.grammar_generation() ||
+      sub.published_tip_execution_fingerprint !=
+          state.execution_plan.fingerprint()) {
+    throw std::runtime_error(std::string{consumer} +
+                             ": published tip execution mismatch");
+  }
+  auto const active_fingerprint =
+      inside_chart_cache_detail::fingerprint_active_pattern_set(
+          state.active_patterns);
+  if (sub.published_active_pattern_fingerprint != active_fingerprint ||
+      sub.icache->active_pattern_fingerprint != active_fingerprint ||
+      sub.icache->patterns.size() !=
+          state.active_patterns.patterns.patterns.size() ||
+      sub.icache->taxon_count != state.active_patterns.patterns.taxon_count) {
+    throw std::runtime_error(std::string{consumer} +
+                             ": active-pattern identity mismatch");
+  }
+  if (sub.dense_clade_to_chain_ref.size() != state.grammar.clades.size() ||
+      sub.dense_production_to_chain_ref.size() !=
+          state.grammar.productions.size()) {
+    throw std::runtime_error(std::string{consumer} +
+                             ": dense tip map shape mismatch");
+  }
 }
 
 overlay_clade_ref chart_spr_chain_ref_for_dense_clade(
@@ -2539,6 +2635,39 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
   return candidate;
 }
 
+multisite_exact_setup chart_spr_build_exact_setup_from_persistent_inside_cache(
+    chart_spr_local_commit_substrate const& sub,
+    chart_spr_search_state const& state,
+    checked_chart_execution_plan_ref const& checked_state) {
+  chart_spr_assert_local_commit_tip_identity(
+      sub, state, checked_state, "chart SPR persistent-inside exact setup");
+  if (!sub.icache) {
+    throw std::runtime_error(
+        "chart SPR persistent-inside exact setup: missing inside cache");
+  }
+
+  single_site_chart scratch;
+  scratch.inside.resize(state.execution_plan.clades().size());
+  return build_multisite_exact_setup_from_resident_inside(
+      state.execution_plan, state.active_patterns.patterns,
+      [&](std::size_t pattern_index,
+          site_pattern const&) -> single_site_chart const& {
+        if (pattern_index >= sub.icache->patterns.size()) {
+          throw std::runtime_error(
+              "chart SPR persistent-inside exact setup: pattern index out of "
+              "range");
+        }
+        for (std::size_t dense = 0; dense < sub.dense_clade_to_chain_ref.size();
+             ++dense) {
+          scratch.inside[dense] = sub.icache->row(
+              pattern_index, sub.dense_clade_to_chain_ref[dense]);
+        }
+        scratch.multifurcation_productions_scored = 0;
+        return scratch;
+      },
+      state.chart_opts);
+}
+
 std::unique_ptr<chart_spr_local_commit_substrate>
 chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
                                       chart_spr_search_options const& options) {
@@ -2558,21 +2687,81 @@ chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
   sub->checked_base_execution_plan.emplace(check_chart_execution_plan(
       sub->base_grammar, sub->base_execution_plan));
   sub->chain.emplace(sub->base_grammar);
+  auto checked_source =
+      check_chart_execution_plan(state.grammar, state.execution_plan);
+  auto resident_source = make_inside_chart_cache_resident_source_identity(
+      state.grammar, checked_source, state.active_patterns);
   // build_*_chart_cache return by value; their `base` pointer points at the
   // grammar passed in (&sub->base_grammar), which is stable for the run.  The
   // move into the optional copies the pointer, still valid.
-  sub->icache = build_inside_chart_cache(
-      sub->base_grammar, *sub->checked_base_execution_plan,
-      state.active_patterns,
-      state.chart_opts, state.invariant_constant_offset);
+  auto const inside_start = std::chrono::steady_clock::now();
+  if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
+    auto const pattern_count = state.active_patterns.patterns.patterns.size();
+    if (state.pattern_charts.size() != pattern_count) {
+      throw std::runtime_error(
+          "chart SPR local commit: resident pattern chart count mismatch");
+    }
+    sub->icache = build_inside_chart_cache_from_resident_inside(
+        sub->base_grammar, *sub->checked_base_execution_plan, state.grammar,
+        checked_source, resident_source, state.active_patterns,
+        state.chart_opts, state.invariant_constant_offset,
+        [&](std::size_t pattern_index,
+            site_pattern const&) -> single_site_chart const& {
+          return state.pattern_charts.at(pattern_index).chart;
+        });
+  } else if (state.cache_strategy ==
+             chart_spr_cache_strategy::lazy_multisite_chart) {
+    if (!state.lazy_chart) {
+      throw std::runtime_error(
+          "chart SPR local commit: lazy strategy has no resident lazy chart");
+    }
+    single_site_chart scratch;
+    scratch.inside.resize(state.execution_plan.clades().size());
+    sub->icache = build_inside_chart_cache_from_resident_inside(
+        sub->base_grammar, *sub->checked_base_execution_plan, state.grammar,
+        checked_source, resident_source, state.active_patterns,
+        state.chart_opts, state.invariant_constant_offset,
+        [&](std::size_t pattern_index,
+            site_pattern const&) -> single_site_chart const& {
+          for (clade_id clade = 0; clade < state.execution_plan.clades().size();
+               ++clade) {
+            scratch.inside[clade] =
+                state.lazy_chart->inside_row(clade, pattern_index);
+          }
+          scratch.multifurcation_productions_scored = 0;
+          return scratch;
+        });
+  } else {
+    sub->icache = build_inside_chart_cache(
+        sub->base_grammar, *sub->checked_base_execution_plan,
+        state.active_patterns, state.chart_opts,
+        state.invariant_constant_offset);
+  }
+  sub->inside_cache_initialization_ms =
+      chart_spr_elapsed_ms(inside_start, std::chrono::steady_clock::now());
   ++state.counters.chart_execution_plan_cache_hits;
+  auto const& inside_build = sub->icache->build_stats;
+  auto const active_pattern_count =
+      state.active_patterns.patterns.patterns.size();
+  if (inside_build.inside_charts_built +
+          inside_build.resident_inside_charts_consumed !=
+      active_pattern_count) {
+    throw std::runtime_error(
+        "chart SPR local commit: inside-cache build accounting does not match "
+        "the active pattern count");
+  }
+  record_inside_chart_cache_build_work(
+      state.counters, inside_build.inside_charts_built,
+      inside_build.resident_inside_charts_consumed);
+
+  auto const outside_start = std::chrono::steady_clock::now();
   sub->ocache = build_outside_chart_cache(
       sub->base_grammar, *sub->checked_base_execution_plan,
       *sub->icache, state.chart_opts);
+  sub->outside_cache_initialization_ms =
+      chart_spr_elapsed_ms(outside_start, std::chrono::steady_clock::now());
   ++state.counters.chart_execution_plan_cache_hits;
   auto const& outside_build = sub->ocache->build_stats;
-  auto const active_pattern_count =
-      state.active_patterns.patterns.patterns.size();
   if (outside_build.inside_charts_built != 0 ||
       outside_build.inside_charts_reused != active_pattern_count ||
       outside_build.outside_charts_built != active_pattern_count) {
@@ -2592,6 +2781,7 @@ chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
   state.counters.multifurcation_productions_scored +=
       sub->cache_multifurcation_productions_scored_reported;
   chart_spr_set_identity_tip_maps(*sub);
+  chart_spr_publish_local_commit_tip_identity(*sub, state);
   sub->verify_materialized_fixed_topology_oracle_for_tests =
       options.verify_fixed_topology_materialized_oracle_for_tests;
   sub->force_independent_sm_bug_for_tests =
@@ -3201,6 +3391,7 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     chart_spr_refresh_state_tip_view_after_local_commit(
         state, materialized, std::move(next_execution_plan), *sub.icache,
         counters);
+    chart_spr_publish_local_commit_tip_identity(sub, state);
 
     // Mirror cumulative cache counters onto the running attempt-counters (the
     // caches persist across accepts; their counters are cumulative).
@@ -3256,6 +3447,8 @@ void chart_spr_refresh_search_summary_from_counters(
   summary.accepted_moves = counters.accepted_moves;
   summary.candidates_locally_scored = counters.local_candidate_scores;
   summary.local_rows_recomputed = counters.local_rows_recomputed;
+  summary.local_unit_fitch_fast_path_productions_scored =
+      counters.local_unit_fitch_fast_path_productions_scored;
   summary.local_leaf_state_view_uses = counters.local_leaf_state_view_uses;
   summary.local_leaf_state_owned_copies =
       counters.local_leaf_state_owned_copies;
@@ -3265,6 +3458,12 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.multifurcation_productions_scored;
   summary.candidate_batches_scored = counters.candidate_batches_scored;
   summary.pattern_batch_cache_builds = counters.pattern_batch_cache_builds;
+  summary.initial_state_inside_charts_built =
+      counters.initial_state_inside_charts_built;
+  summary.inside_cache_inside_charts_built =
+      counters.inside_cache_inside_charts_built;
+  summary.inside_cache_resident_inside_charts_consumed =
+      counters.inside_cache_resident_inside_charts_consumed;
   summary.exact_setup_builds = counters.exact_setup_builds;
   summary.exact_setup_inside_charts_built =
       counters.exact_setup_inside_charts_built;
@@ -3524,11 +3723,70 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.initial_search_state_rebuilds = 1;
 
   auto cache_start = std::chrono::steady_clock::now();
-  auto state = build_chart_spr_search_state(
-      result.dag, std::move(initial_grammar), options);
+  auto active_build =
+      make_active_search_patterns(result.dag, initial_grammar, options.chart);
+  chart_spr_search_detail::chart_spr_state_build_policy state_build_policy;
+  state_build_policy.defer_pattern_batch_bootstrap_to_local_cache =
+      !options.rebuild_after_accept;
+  auto const build_exact_during_state_publication =
+      options.rebuild_after_accept &&
+      options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite;
+  auto state = build_chart_spr_search_state_from_active(
+      result.dag, std::move(initial_grammar), std::move(active_build),
+      options.chart, build_exact_during_state_publication, options.exact_trim,
+      options.cache, state_build_policy);
+  ++state.counters.pattern_rebuilds;
   ++state.counters.grammar_rebuilds;
   result.summary.cache_build_ms = chart_spr_elapsed_ms(
       cache_start, std::chrono::steady_clock::now());
+
+  // Build the local substrate before the first exact score. Pattern-batch
+  // local mode deliberately publishes a two-stage state so this inside cache
+  // is the sole owner of the initial dense recurrence. The installed provider
+  // projects current-tip rows into an owning exact setup after validating the
+  // chain/cache/plan publication stamp.
+  std::unique_ptr<chart_spr_local_commit_substrate> local_commit_substrate;
+  if (!options.rebuild_after_accept) {
+    local_commit_substrate =
+        chart_spr_make_local_commit_substrate(state, options);
+    auto* substrate_ptr = local_commit_substrate.get();
+    state.exact_setup_provider =
+        [substrate_ptr](chart_spr_search_state const& provider_state,
+                        checked_chart_execution_plan_ref const& checked_state) {
+          return chart_spr_build_exact_setup_from_persistent_inside_cache(
+              *substrate_ptr, provider_state, checked_state);
+        };
+    if (state.pattern_batch_bootstrap_deferred) {
+      chart_spr_search_detail::finalize_deferred_pattern_batch_bootstrap(
+          state, inside_cache_composite_lower_bound_with_invariants(
+                     *local_commit_substrate->icache));
+    }
+    result.summary.local_inside_cache_initialization_ms =
+        local_commit_substrate->inside_cache_initialization_ms;
+    result.summary.local_outside_cache_initialization_ms =
+        local_commit_substrate->outside_cache_initialization_ms;
+
+    if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite) {
+      auto const exact_start = std::chrono::steady_clock::now();
+      (void)ensure_chart_spr_state_exact_trim(state, options.exact_trim);
+      state.exact_initialization_ms +=
+          chart_spr_elapsed_ms(exact_start, std::chrono::steady_clock::now());
+    }
+
+    if (state.cache_strategy !=
+        chart_spr_cache_strategy::lazy_multisite_chart) {
+      auto const pattern_count = state.active_patterns.patterns.patterns.size();
+      auto const recurrence_builds =
+          state.counters.initial_state_inside_charts_built +
+          state.counters.exact_setup_inside_charts_built +
+          state.counters.inside_cache_inside_charts_built;
+      if (recurrence_builds != pattern_count) {
+        throw std::runtime_error(
+            "chart SPR local commit: initial dense inside charts were not "
+            "built exactly once per active pattern");
+      }
+    }
+  }
   result.summary.initial_chart_construction_ms =
       state.chart_construction_ms;
   result.summary.exact_initialization_ms = state.exact_initialization_ms;
@@ -3669,15 +3927,11 @@ chart_spr_search_result run_chart_spr_search(
       local_update_accepted_topology_key_sets;
   bool used_local_accept_updates = false;
 
-  // Phase 4 local-commit substrate: the overlay chain + persistent inside /
-  // outside caches.  Built once from the frozen initial grammar when
-  // rebuild_after_accept = false; the accept path commits to it instead of
-  // dense-materializing per accept.  State.grammar / state.pattern_charts are a
-  // derived view of the chain tip, refreshed on each commit.
-  std::unique_ptr<chart_spr_local_commit_substrate> local_commit_substrate;
-  if (!options.rebuild_after_accept) {
-    local_commit_substrate = chart_spr_make_local_commit_substrate(state,
-                                                                   options);
+  // Finish installing candidate verifiers on the substrate built before the
+  // initial exact score. The accept path commits to it instead of
+  // dense-materializing per accept; state.grammar/pattern_charts remain a
+  // derived current-tip view.
+  if (local_commit_substrate != nullptr) {
     auto* substrate_ptr = local_commit_substrate.get();
     state.fixed_topology_exact_verifier =
         [substrate_ptr](chart_spr_search_state const& verifier_state,

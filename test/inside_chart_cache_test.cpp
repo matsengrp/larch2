@@ -91,9 +91,10 @@ struct active_fixture {
   larch::chart_options options;
 };
 
-static active_fixture load_binary_four_fixture() {
+static active_fixture load_binary_four_fixture(bool score_ua_edge = false) {
   active_fixture f;
   f.name = "wric_binary_four";
+  f.options.score_ua_edge = score_ua_edge;
   auto dag = larch::build_from_fasta_newick(
       larch::test::source_path_string("test/wric_binary_four.fa"),
       larch::test::source_path_string("test/wric_binary_four.nwk"),
@@ -106,6 +107,52 @@ static active_fixture load_binary_four_fixture() {
   CHECK(larch::grammar_is_binary_chart_compatible(f.grammar));
   CHECK(!f.active.patterns.patterns.empty());
   return f;
+}
+
+static larch::test::tiny_tree_node tiny_leaf_state(std::string name,
+                                                   char state) {
+  return larch::test::tiny_leaf(std::move(name), std::string(1, state));
+}
+
+static active_fixture load_trinary_fixture(bool score_ua_edge) {
+  using namespace larch::test;
+  active_fixture f;
+  f.name = score_ua_edge ? "trinary_ua" : "trinary_no_ua";
+  f.options.score_ua_edge = score_ua_edge;
+  auto dag = make_tiny_labelled_tree(
+      "A", tiny_inner("root", "A",
+                      {tiny_leaf_state("A", 'A'), tiny_leaf_state("B", 'C'),
+                       tiny_leaf_state("C", 'G')}));
+  larch::clade_grammar_options grammar_options;
+  grammar_options.allow_polytomies = true;
+  f.grammar = larch::build_clade_grammar(dag, grammar_options);
+  auto built = larch::make_active_search_patterns(dag, f.grammar, f.options);
+  f.active = std::move(built.active_patterns);
+  f.invariant_offset = built.invariant_constant_offset;
+  CHECK(larch::grammar_has_kary_productions(f.grammar));
+  CHECK(!f.active.patterns.patterns.empty());
+  return f;
+}
+
+// Apply a global taxon permutation without changing vector dimensions. This
+// leaves a valid grammar while changing leaf identities and the full execution
+// fingerprint: exactly the same-address stale-row case the resident boundary
+// must reject.
+static void swap_grammar_taxa(larch::clade_grammar& grammar,
+                              larch::taxon_id lhs, larch::taxon_id rhs) {
+  CHECK(lhs != rhs);
+  CHECK(lhs < grammar.taxa.id_to_sample_id.size());
+  CHECK(rhs < grammar.taxa.id_to_sample_id.size());
+  for (auto& clade : grammar.clades) {
+    for (auto& taxon : clade.taxa) {
+      if (taxon == lhs) {
+        taxon = rhs;
+      } else if (taxon == rhs) {
+        taxon = lhs;
+      }
+    }
+    std::sort(clade.taxa.begin(), clade.taxa.end());
+  }
 }
 
 // Six-taxon topologies (one per tree) with leaf sequences carrying distinct
@@ -375,6 +422,437 @@ static std::size_t run_sequential_chain_with_cache(
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
+
+static std::vector<larch::single_site_chart> build_resident_inside_charts(
+    active_fixture const& f, larch::chart_execution_plan const& plan) {
+  larch::chart_options build_options = f.options;
+  build_options.keep_trace = false;
+  build_options.max_trace_choices = 0;
+
+  std::vector<larch::single_site_chart> charts;
+  charts.reserve(f.active.patterns.patterns.size());
+  for (auto const& pattern : f.active.patterns.patterns) {
+    charts.push_back(larch::build_single_site_chart(
+        plan, larch::view_leaf_site_states(pattern.state_by_taxon),
+        build_options));
+  }
+  return charts;
+}
+
+static void assert_pattern_metadata_equal(larch::site_pattern const& lhs,
+                                          larch::site_pattern const& rhs) {
+  CHECK(lhs.state_by_taxon == rhs.state_by_taxon);
+  CHECK(lhs.positions == rhs.positions);
+  CHECK(lhs.weight == rhs.weight);
+  CHECK(lhs.reference_state_counts == rhs.reference_state_counts);
+}
+
+static void assert_cold_and_resident_caches_equal(
+    larch::inside_chart_cache const& cold,
+    larch::inside_chart_cache const& resident) {
+  CHECK(resident.base == cold.base);
+  CHECK(resident.base_execution_generation == cold.base_execution_generation);
+  CHECK(resident.base_execution_fingerprint == cold.base_execution_fingerprint);
+  CHECK(resident.chart_opts.keep_trace == cold.chart_opts.keep_trace);
+  CHECK(resident.chart_opts.score_ua_edge == cold.chart_opts.score_ua_edge);
+  CHECK(resident.chart_opts.max_trace_choices ==
+        cold.chart_opts.max_trace_choices);
+  CHECK(resident.taxon_count == cold.taxon_count);
+  CHECK(resident.active_pattern_fingerprint == cold.active_pattern_fingerprint);
+  CHECK(resident.invariant_constant_offset == cold.invariant_constant_offset);
+  CHECK(resident.patterns.size() == cold.patterns.size());
+  for (std::size_t p = 0; p < resident.patterns.size(); ++p) {
+    assert_pattern_metadata_equal(resident.patterns[p], cold.patterns[p]);
+  }
+  CHECK(resident.base_rows == cold.base_rows);
+  CHECK(resident.temp_rows == cold.temp_rows);
+  CHECK(resident.temp_clade_count == cold.temp_clade_count);
+  CHECK(resident.commit_epoch == cold.commit_epoch);
+  CHECK(resident.exact_trim_active_only.has_value() ==
+        cold.exact_trim_active_only.has_value());
+  CHECK(resident.inside_rows_recomputed_on_commit ==
+        cold.inside_rows_recomputed_on_commit);
+  CHECK(larch::inside_cache_composite_lower_bound_with_invariants(resident) ==
+        larch::inside_cache_composite_lower_bound_with_invariants(cold));
+}
+
+static void assert_resident_cache_equivalence(active_fixture f) {
+  auto plan = larch::build_chart_execution_plan(f.grammar);
+  auto checked = larch::check_chart_execution_plan(f.grammar, plan);
+  auto cold = larch::build_inside_chart_cache(f.grammar, checked, f.active,
+                                              f.options, f.invariant_offset);
+  auto charts = build_resident_inside_charts(f, plan);
+  auto source = larch::make_inside_chart_cache_resident_source_identity(
+      f.grammar, checked, f.active);
+
+  std::size_t provider_calls = 0;
+  auto resident = larch::build_inside_chart_cache_from_resident_inside(
+      f.grammar, checked, source, f.active, f.options, f.invariant_offset,
+      [&](std::size_t p, larch::site_pattern const& pattern)
+          -> larch::single_site_chart const& {
+        CHECK(p == provider_calls);
+        CHECK(&pattern == &f.active.patterns.patterns[p]);
+        assert_pattern_metadata_equal(pattern, f.active.patterns.patterns[p]);
+        ++provider_calls;
+        return charts[p];
+      });
+
+  assert_cold_and_resident_caches_equal(cold, resident);
+  CHECK(provider_calls == f.active.patterns.patterns.size());
+  CHECK(cold.build_stats.inside_charts_built == cold.patterns.size());
+  CHECK(cold.build_stats.resident_inside_charts_consumed == 0);
+  CHECK(resident.build_stats.inside_charts_built == 0);
+  CHECK(resident.build_stats.resident_inside_charts_consumed ==
+        resident.patterns.size());
+  CHECK(resident.multifurcation_productions_scored == 0);
+  if (larch::grammar_has_kary_productions(f.grammar)) {
+    CHECK(cold.multifurcation_productions_scored > 0);
+  }
+}
+
+static void test_resident_cache_binary_multifurcating_ua_equivalence() {
+  std::println("test_resident_cache_binary_multifurcating_ua_equivalence");
+
+  assert_resident_cache_equivalence(load_binary_four_fixture(false));
+  assert_resident_cache_equivalence(load_binary_four_fixture(true));
+  assert_resident_cache_equivalence(load_trinary_fixture(false));
+  assert_resident_cache_equivalence(load_trinary_fixture(true));
+  auto nonzero_invariant_offset = load_binary_four_fixture(true);
+  nonzero_invariant_offset.invariant_offset = 37;
+  assert_resident_cache_equivalence(std::move(nonzero_invariant_offset));
+
+  std::println("  PASS (binary/multifurcating x UA/no-UA; invariant offset)");
+}
+
+static void test_resident_cache_owns_rows_and_pattern_metadata() {
+  std::println("test_resident_cache_owns_rows_and_pattern_metadata");
+  auto f = load_binary_four_fixture(true);
+  auto plan = larch::build_chart_execution_plan(f.grammar);
+  auto checked = larch::check_chart_execution_plan(f.grammar, plan);
+  auto cold = larch::build_inside_chart_cache(f.grammar, checked, f.active,
+                                              f.options, f.invariant_offset);
+
+  larch::inside_chart_cache resident;
+  {
+    auto source_active = f.active;
+    auto source_charts = build_resident_inside_charts(f, plan);
+    auto source = larch::make_inside_chart_cache_resident_source_identity(
+        f.grammar, checked, source_active);
+    resident = larch::build_inside_chart_cache_from_resident_inside(
+        f.grammar, checked, source, source_active, f.options,
+        f.invariant_offset,
+        [&](std::size_t p, larch::site_pattern const&)
+            -> larch::single_site_chart const& { return source_charts[p]; });
+
+    // Mutating and then destroying every source payload must not alter the
+    // cache. The frozen grammar reference is its documented owner relationship
+    // and remains alive.
+    for (auto& chart : source_charts) {
+      for (auto& row : chart.inside) row.fill(larch::chart_inf);
+      chart.inside.clear();
+    }
+    for (auto& pattern : source_active.patterns.patterns) {
+      std::fill(pattern.state_by_taxon.begin(), pattern.state_by_taxon.end(),
+                std::uint8_t{3});
+      pattern.positions.clear();
+      pattern.reference_state_counts.fill(0);
+    }
+  }
+
+  assert_cold_and_resident_caches_equal(cold, resident);
+  CHECK(resident.build_stats.inside_charts_built == 0);
+  CHECK(resident.build_stats.resident_inside_charts_consumed ==
+        resident.patterns.size());
+  std::println("  PASS");
+}
+
+static void test_resident_cache_compatible_frozen_destination() {
+  std::println("test_resident_cache_compatible_frozen_destination");
+
+  larch::clade_grammar frozen_destination;
+  larch::inside_chart_cache resident;
+  larch::inside_chart_cache cold_destination;
+  std::size_t provider_calls = 0;
+  {
+    auto source = load_binary_four_fixture(true);
+    frozen_destination = source.grammar;
+    CHECK(&frozen_destination != &source.grammar);
+
+    auto source_plan = larch::build_chart_execution_plan(source.grammar);
+    auto source_checked =
+        larch::check_chart_execution_plan(source.grammar, source_plan);
+    auto destination_plan =
+        larch::build_chart_execution_plan(frozen_destination);
+    auto destination_checked =
+        larch::check_chart_execution_plan(frozen_destination, destination_plan);
+    auto charts = build_resident_inside_charts(source, source_plan);
+    auto source_identity =
+        larch::make_inside_chart_cache_resident_source_identity(
+            source.grammar, source_checked, source.active);
+
+    cold_destination = larch::build_inside_chart_cache(
+        frozen_destination, destination_checked, source.active, source.options,
+        source.invariant_offset);
+    resident = larch::build_inside_chart_cache_from_resident_inside(
+        frozen_destination, destination_checked, source.grammar, source_checked,
+        source_identity, source.active, source.options, source.invariant_offset,
+        [&](std::size_t p, larch::site_pattern const& pattern)
+            -> larch::single_site_chart const& {
+          CHECK(&pattern == &source.active.patterns.patterns[p]);
+          ++provider_calls;
+          return charts[p];
+        });
+
+    // Prove source rows and metadata are copied, not retained. The source
+    // grammar, plan, checked capability, identity token, charts, and active
+    // patterns all die at the end of this scope.
+    for (auto& chart : charts) {
+      for (auto& row : chart.inside) row.fill(larch::chart_inf);
+      chart.inside.clear();
+    }
+    for (auto& pattern : source.active.patterns.patterns) {
+      pattern.state_by_taxon.clear();
+      pattern.positions.clear();
+      pattern.reference_state_counts.fill(0);
+    }
+  }
+
+  CHECK(resident.base == &frozen_destination);
+  CHECK(cold_destination.base == &frozen_destination);
+  CHECK(provider_calls == resident.patterns.size());
+  CHECK(resident.build_stats.inside_charts_built == 0);
+  CHECK(resident.build_stats.resident_inside_charts_consumed ==
+        resident.patterns.size());
+  assert_cold_and_resident_caches_equal(cold_destination, resident);
+  std::println("  PASS");
+}
+
+static void test_resident_cache_rejects_incompatible_frozen_destination() {
+  std::println("test_resident_cache_rejects_incompatible_frozen_destination");
+
+  // Freeze the destination, then publish the otherwise-identical source as a
+  // newer generation. Both checked plans are individually valid, but the old
+  // frozen destination cannot own the newer resident rows.
+  {
+    auto source = load_binary_four_fixture();
+    auto stale_destination = source.grammar;
+    ++source.grammar.execution_generation;
+    auto source_plan = larch::build_chart_execution_plan(source.grammar);
+    auto source_checked =
+        larch::check_chart_execution_plan(source.grammar, source_plan);
+    auto destination_plan =
+        larch::build_chart_execution_plan(stale_destination);
+    auto destination_checked =
+        larch::check_chart_execution_plan(stale_destination, destination_plan);
+    auto charts = build_resident_inside_charts(source, source_plan);
+    auto source_identity =
+        larch::make_inside_chart_cache_resident_source_identity(
+            source.grammar, source_checked, source.active);
+
+    std::size_t provider_calls = 0;
+    std::string rejection;
+    CHECK(throws_runtime_error([&] {
+      try {
+        (void)larch::build_inside_chart_cache_from_resident_inside(
+            stale_destination, destination_checked, source.grammar,
+            source_checked, source_identity, source.active, source.options,
+            source.invariant_offset,
+            [&](std::size_t p,
+                larch::site_pattern const&) -> larch::single_site_chart const& {
+              ++provider_calls;
+              return charts[p];
+            });
+      } catch (std::runtime_error const& e) {
+        rejection = e.what();
+        throw;
+      }
+    }));
+    CHECK(provider_calls == 0);
+    CHECK(rejection.find("resident destination: grammar generation mismatch") !=
+          std::string::npos);
+  }
+
+  // Same generation and shape but a different full grammar fingerprint must
+  // be rejected independently, again before the provider is touched.
+  {
+    auto source = load_binary_four_fixture();
+    auto stale_destination = source.grammar;
+    swap_grammar_taxa(stale_destination, 0, 2);
+    auto source_plan = larch::build_chart_execution_plan(source.grammar);
+    auto source_checked =
+        larch::check_chart_execution_plan(source.grammar, source_plan);
+    auto destination_plan =
+        larch::build_chart_execution_plan(stale_destination);
+    auto destination_checked =
+        larch::check_chart_execution_plan(stale_destination, destination_plan);
+    auto charts = build_resident_inside_charts(source, source_plan);
+    auto source_identity =
+        larch::make_inside_chart_cache_resident_source_identity(
+            source.grammar, source_checked, source.active);
+
+    std::size_t provider_calls = 0;
+    std::string rejection;
+    CHECK(throws_runtime_error([&] {
+      try {
+        (void)larch::build_inside_chart_cache_from_resident_inside(
+            stale_destination, destination_checked, source.grammar,
+            source_checked, source_identity, source.active, source.options,
+            source.invariant_offset,
+            [&](std::size_t p,
+                larch::site_pattern const&) -> larch::single_site_chart const& {
+              ++provider_calls;
+              return charts[p];
+            });
+      } catch (std::runtime_error const& e) {
+        rejection = e.what();
+        throw;
+      }
+    }));
+    CHECK(provider_calls == 0);
+    CHECK(
+        rejection.find("resident destination: grammar fingerprint mismatch") !=
+        std::string::npos);
+  }
+
+  std::println("  PASS");
+}
+
+static void test_resident_cache_rejects_stale_same_address_sources() {
+  std::println("test_resident_cache_rejects_stale_same_address_sources");
+
+  // New generation, same object and dimensions: reject before consulting a
+  // resident row.
+  {
+    auto f = load_binary_four_fixture();
+    auto old_plan = larch::build_chart_execution_plan(f.grammar);
+    auto old_checked = larch::check_chart_execution_plan(f.grammar, old_plan);
+    auto old_charts = build_resident_inside_charts(f, old_plan);
+    auto old_source = larch::make_inside_chart_cache_resident_source_identity(
+        f.grammar, old_checked, f.active);
+    swap_grammar_taxa(f.grammar, 0, 2);
+    ++f.grammar.execution_generation;
+    auto new_plan = larch::build_chart_execution_plan(f.grammar);
+    auto new_checked = larch::check_chart_execution_plan(f.grammar, new_plan);
+
+    std::size_t provider_calls = 0;
+    std::string rejection;
+    CHECK(throws_runtime_error([&] {
+      try {
+        (void)larch::build_inside_chart_cache_from_resident_inside(
+            f.grammar, new_checked, old_source, f.active, f.options,
+            f.invariant_offset,
+            [&](std::size_t p,
+                larch::site_pattern const&) -> larch::single_site_chart const& {
+              ++provider_calls;
+              return old_charts[p];
+            });
+      } catch (std::runtime_error const& e) {
+        rejection = e.what();
+        throw;
+      }
+    }));
+    CHECK(provider_calls == 0);
+    CHECK(rejection.find("grammar generation mismatch") != std::string::npos);
+  }
+
+  // Same generation, same object and dimensions: the full fingerprint is an
+  // independent guard and must reject before the provider is called.
+  {
+    auto f = load_binary_four_fixture();
+    auto old_plan = larch::build_chart_execution_plan(f.grammar);
+    auto old_checked = larch::check_chart_execution_plan(f.grammar, old_plan);
+    auto old_charts = build_resident_inside_charts(f, old_plan);
+    auto old_source = larch::make_inside_chart_cache_resident_source_identity(
+        f.grammar, old_checked, f.active);
+    swap_grammar_taxa(f.grammar, 0, 2);
+    auto new_plan = larch::build_chart_execution_plan(f.grammar);
+    auto new_checked = larch::check_chart_execution_plan(f.grammar, new_plan);
+    CHECK(old_source.grammar_generation() == new_plan.grammar_generation());
+    CHECK(old_source.fingerprint() != new_plan.fingerprint());
+
+    std::size_t provider_calls = 0;
+    std::string rejection;
+    CHECK(throws_runtime_error([&] {
+      try {
+        (void)larch::build_inside_chart_cache_from_resident_inside(
+            f.grammar, new_checked, old_source, f.active, f.options,
+            f.invariant_offset,
+            [&](std::size_t p,
+                larch::site_pattern const&) -> larch::single_site_chart const& {
+              ++provider_calls;
+              return old_charts[p];
+            });
+      } catch (std::runtime_error const& e) {
+        rejection = e.what();
+        throw;
+      }
+    }));
+    CHECK(provider_calls == 0);
+    CHECK(rejection.find("grammar fingerprint mismatch") != std::string::npos);
+  }
+
+  // The active-pattern source itself is also an immutable publication. Every
+  // semantic field is fingerprinted, so same-object, same-pattern-count edits
+  // are rejected before even asking the provider for its first row.
+  auto assert_active_mutation_rejected = [](auto&& mutate) {
+    auto f = load_binary_four_fixture(true);
+    auto plan = larch::build_chart_execution_plan(f.grammar);
+    auto checked = larch::check_chart_execution_plan(f.grammar, plan);
+    auto source = larch::make_inside_chart_cache_resident_source_identity(
+        f.grammar, checked, f.active);
+    auto const* active_address = &f.active;
+    auto const pattern_count = f.active.patterns.patterns.size();
+    mutate(f.active);
+    CHECK(&f.active == active_address);
+    CHECK(f.active.patterns.patterns.size() == pattern_count);
+    CHECK(source.active_pattern_fingerprint() !=
+          larch::inside_chart_cache_detail::fingerprint_active_pattern_set(
+              f.active));
+
+    larch::single_site_chart unreachable_chart;
+    std::size_t provider_calls = 0;
+    std::string rejection;
+    CHECK(throws_runtime_error([&] {
+      try {
+        (void)larch::build_inside_chart_cache_from_resident_inside(
+            f.grammar, checked, source, f.active, f.options, f.invariant_offset,
+            [&](std::size_t,
+                larch::site_pattern const&) -> larch::single_site_chart const& {
+              ++provider_calls;
+              return unreachable_chart;
+            });
+      } catch (std::runtime_error const& e) {
+        rejection = e.what();
+        throw;
+      }
+    }));
+    CHECK(provider_calls == 0);
+    CHECK(rejection.find("active pattern fingerprint mismatch") !=
+          std::string::npos);
+  };
+
+  assert_active_mutation_rejected([](larch::active_site_pattern_set& active) {
+    auto& state = active.patterns.patterns.front().state_by_taxon.front();
+    state = static_cast<std::uint8_t>((state + 1) % larch::nuc_state_count);
+  });
+  assert_active_mutation_rejected([](larch::active_site_pattern_set& active) {
+    ++active.patterns.patterns.front().weight;
+  });
+  assert_active_mutation_rejected([](larch::active_site_pattern_set& active) {
+    ++active.patterns.patterns.front().reference_state_counts.front();
+  });
+  assert_active_mutation_rejected([](larch::active_site_pattern_set& active) {
+    ++active.patterns.taxon_count;
+  });
+  assert_active_mutation_rejected([](larch::active_site_pattern_set& active) {
+    active.patterns.patterns.front().positions.push_back(1234567);
+  });
+  assert_active_mutation_rejected([](larch::active_site_pattern_set& active) {
+    ++active.patterns.total_site_count;
+  });
+
+  std::println("  PASS");
+}
 
 static void test_plan_cold_cache_matches_checked_oracle() {
   std::println("test_plan_cold_cache_matches_checked_oracle");
@@ -715,6 +1193,11 @@ static void test_empty_chain_throws() {
 }
 
 int main() {
+  test_resident_cache_binary_multifurcating_ua_equivalence();
+  test_resident_cache_owns_rows_and_pattern_metadata();
+  test_resident_cache_compatible_frozen_destination();
+  test_resident_cache_rejects_incompatible_frozen_destination();
+  test_resident_cache_rejects_stale_same_address_sources();
   test_plan_cold_cache_matches_checked_oracle();
   test_single_commit_on_binary_four();
   test_affected_set_single_delta_relation();

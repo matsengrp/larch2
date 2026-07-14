@@ -434,6 +434,40 @@ inline chart_cost combine_production_inside_row(
   return total;
 }
 
+// Specialized all-parent-state recurrence for the fixed four-state, unit-cost
+// Fitch transition model.  For parent state p and one child row r,
+//
+//   min_s(r[s] + [s != p]) = min(r[p], min_s(r[s]) + 1).
+//
+// Keep the generic transition recurrence above for consumers whose transition
+// model is not known to be unit Fitch.  This specialization deliberately
+// obtains each child row once, then accumulates that child's contribution into
+// all four parent states before moving to the next child.  The child loop order
+// and saturated_add calls therefore match the generic recurrence, including
+// normalization of row values at or above chart_inf.
+template <class Production, class RowProvider>
+inline std::array<chart_cost, nuc_state_count>
+combine_production_inside_rows_unit_fitch(Production const& prod,
+                                          RowProvider&& row_provider) {
+  static_assert(nuc_state_count == 4);
+
+  std::array<chart_cost, nuc_state_count> totals{};
+  for (auto child : prod.children) {
+    auto const& row = row_provider(child);
+    auto const row_min =
+        std::min(std::min(row[0], row[1]), std::min(row[2], row[3]));
+    auto const best_mismatch = saturated_add(row_min, chart_cost{1});
+
+    for (std::size_t parent_state = 0; parent_state < nuc_state_count;
+         ++parent_state) {
+      auto const best_child = std::min(
+          saturated_add(row[parent_state], chart_cost{0}), best_mismatch);
+      totals[parent_state] = saturated_add(totals[parent_state], best_child);
+    }
+  }
+  return totals;
+}
+
 inline void validate_chart_grammar(clade_grammar const& grammar) {
   record_full_grammar_validation();
   if (grammar.clades.size() >= static_cast<std::size_t>(no_clade))

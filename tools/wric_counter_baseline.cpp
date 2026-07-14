@@ -222,6 +222,8 @@ int main() {
   print_counter_line("full_composite_rebuilds", c.full_composite_rebuilds);
   print_counter_line("local_candidate_scores", c.local_candidate_scores);
   print_counter_line("local_rows_recomputed", c.local_rows_recomputed);
+  print_counter_line("local_unit_fitch_fast_path_productions_scored",
+                     c.local_unit_fitch_fast_path_productions_scored);
   print_counter_line("local_leaf_state_view_uses",
                      c.local_leaf_state_view_uses);
   print_counter_line("local_leaf_state_owned_copies",
@@ -234,6 +236,12 @@ int main() {
   print_counter_line("candidate_batches_scored", c.candidate_batches_scored);
   print_counter_line("pattern_batch_cache_builds",
                      c.pattern_batch_cache_builds);
+  print_counter_line("initial_state_inside_charts_built",
+                     c.initial_state_inside_charts_built);
+  print_counter_line("inside_cache_inside_charts_built",
+                     c.inside_cache_inside_charts_built);
+  print_counter_line("inside_cache_resident_inside_charts_consumed",
+                     c.inside_cache_resident_inside_charts_consumed);
   print_counter_line("exact_setup_builds", c.exact_setup_builds);
   print_counter_line("exact_setup_inside_charts_built",
                      c.exact_setup_inside_charts_built);

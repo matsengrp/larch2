@@ -158,10 +158,10 @@ objective.
 ### Transient chain extension for `exact_multisite` verification (Phase 9)
 
 The local-commit `exact_multisite` verifier may verify each candidate by
-transiently extending the committed overlay chain + persistent inside/outside
-caches in **reader-local scratch storage** (never mutating the shared cache,
-bypassing the Phase-4 commit barrier), reading the exact frontier on the
-extended grammar, and discarding.  This is installed automatically when a
+transiently extending the committed overlay chain in **reader-local scratch
+storage** (never mutating the shared chain or caches, bypassing the Phase-4
+commit barrier), reading the exact frontier on the extended grammar, and
+discarding. This is installed automatically when a
 local-commit substrate is active (`rebuild_after_accept = false`); conservative
 rebuild mode leaves it off and uses the cold from-scratch path
 (`verify_candidate_exact_against_state`).  A candidate whose delta cannot be
@@ -170,48 +170,40 @@ does not resolve to a frozen-base production) falls back to the cold path for
 verification, so it can still be accepted and reach the Phase-4 commit-time
 tombstone-scope skip.
 
-The transient work is counted under `transient_chain_extensions_for_verification`,
-**never** under `full_overlay_materializations` -- by the cross-cutting
-definition a transient chain extension that reuses the persistent cache
-machinery and updates only affected rows in scratch is not a dense
-materialization, even though it produces an exact score.
+The transient work is counted under
+`transient_chain_extensions_for_verification`, **never** under
+`full_overlay_materializations`. The exact B&B still consumes a materialized
+extended grammar, but this historical counter distinction keeps transient
+verification separate from the explicit cold materialize-per-candidate path.
 
-**Phase 9 caveat -- substrate + oracle, not a perf win.**  As shipped, the
-scratch inside/outside caches are read **only** by the test/diagnostic
-per-candidate two-chart oracle (enabled by
-`verify_transient_chain_extension_oracle_for_tests`); the production B&B scorer
-(`build_multisite_trim_active` -> `build_multisite_trim(grammar, patterns, ...)`)
-**rebuilds the charts from the materialized extended grammar and takes no cache
-argument**, so it cannot consume `ext.icache` / `ext.ocache`.  Consequences:
+**Phase 9 caveat -- the persistent rows do not feed B&B.** The production B&B
+scorer (`build_multisite_trim_active` ->
+`build_multisite_trim(grammar, patterns, ...)`) rebuilds its exact setup from
+the materialized extended grammar and takes no persistent-cache argument.
+Copying and advancing the inside/outside caches on every production candidate
+was therefore dead work and has been removed. Consequences:
 
-- Phase 9 meets every exit criterion (transient == from-scratch exact score on
-  both charts; `full_overlay_materializations` does not increase for transient-
-  path candidates; `grammar_exact` label preserved, cold path authoritative on
-  oracle mismatch; TSAN-clean under multi-worker local scoring) and is
-  sanitizer-clean, but it delivers **no wall-clock improvement** as shipped:
-  the production transient path does *more* work than the cold path (cache copy
-  + advance + a full-chain `materialize_overlay_chain` + a B&B that rebuilds
-  charts), not less.
-- This is consistent with the plan, not a deviation from it.  The plan's
-  Work-item-4a technique-2 phrasing ("reading the resulting exact-frontier
-  value," "reusing the cache") suggests the cache should feed scoring, but the
-  multisite exact optimum is the B&B optimum and cannot be read from the
-  per-pattern cache.  The plan resolves this by splitting 4a (Phase 8/9) from
-  4b / Phase 12 (warm-started B&B that "would seed the B&B from these scratch
-caches").  Phase 9 = substrate + counter discipline + oracle; the actual
-  speedup awaits the speculative Phase 12.
-- The scratch caches are **forward-looking groundwork** for Phase 12 and are
-  intentionally retained (and exercised against fixtures by the oracle) so
-  Phase 12 can adopt them without re-deriving the affected-set scoping or the
-two-chart recurrence.  Removing them now would be premature.
+- With the two-chart oracle disabled, production transient verification copies
+  and advances no inside/outside cache. The separate
+  `transient_chain_diagnostic_cache_extensions` counter must remain zero.
+- Enabling `verify_transient_chain_extension_oracle_for_tests` constructs the
+  reader-local cache copies, advances them with the same paired commit
+  primitives as a real commit, and compares both charts with a cold oracle.
+  That diagnostic work is reported only by
+  `transient_chain_diagnostic_cache_extensions`.
+- A forced diagnostic mismatch still discards the transient answer, runs the
+  authoritative cold B&B, and preserves the truthful `grammar_exact` label.
+- A future warm-started B&B may consume persistent rows directly. The
+  diagnostic path preserves the affected-set and two-chart oracle needed to
+  validate such work without charging its cache copies to current production
+  candidates.
 
 The plan's cross-cutting "dense materialization" warning is the thing to watch:
-a full chart rebuild still happens per candidate inside `build_multisite_trim`
-on the production path; it is licensed by the plan's explicit exemption (a
-transient chain extension that reuses the persistent cache and updates only
-affected rows is not a dense materialization) plus the 4a/4b split.  But it is
-exactly the shape that warning exists to surface, so it is documented here
-rather than left implicit.
+a full exact-setup rebuild still happens per candidate inside
+`build_multisite_trim` on the production path. Removing the unused diagnostic
+cache copy avoids compounding that cost, but feeding persistent rows into B&B
+remains separate work and the rebuild stays visible in the exact-setup
+counters.
 
 **Exit-criterion-3 wording deviation (justified).**  The plan says that on
 oracle mismatch the exactness label is "otherwise weakened and the from-

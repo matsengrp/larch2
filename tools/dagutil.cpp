@@ -3271,6 +3271,8 @@ static void print_chart_spr_search_counter_fields(
       << counters.local_candidate_scores << "\n";
   out << indent << "local_rows_recomputed: "
       << counters.local_rows_recomputed << "\n";
+  out << indent << "local_unit_fitch_fast_path_productions_scored: "
+      << counters.local_unit_fitch_fast_path_productions_scored << "\n";
   out << indent << "local_leaf_state_view_uses: "
       << counters.local_leaf_state_view_uses << "\n";
   out << indent << "local_leaf_state_owned_copies: "
@@ -3287,6 +3289,12 @@ static void print_chart_spr_search_counter_fields(
       << counters.candidate_batches_scored << "\n";
   out << indent << "pattern_batch_cache_builds: "
       << counters.pattern_batch_cache_builds << "\n";
+  out << indent << "initial_state_inside_charts_built: "
+      << counters.initial_state_inside_charts_built << "\n";
+  out << indent << "inside_cache_inside_charts_built: "
+      << counters.inside_cache_inside_charts_built << "\n";
+  out << indent << "inside_cache_resident_inside_charts_consumed: "
+      << counters.inside_cache_resident_inside_charts_consumed << "\n";
   out << indent << "exact_setup_builds: " << counters.exact_setup_builds
       << "\n";
   out << indent << "exact_setup_inside_charts_built: "
@@ -4133,6 +4141,12 @@ static void run_chart_spr_search_diagnostic(
       << "\n";
   out << "  cache_build_ms: " << std::fixed << std::setprecision(3)
       << search.summary.cache_build_ms << "\n";
+  out << "  local_inside_cache_initialization_ms: " << std::fixed
+      << std::setprecision(3)
+      << search.summary.local_inside_cache_initialization_ms << "\n";
+  out << "  local_outside_cache_initialization_ms: " << std::fixed
+      << std::setprecision(3)
+      << search.summary.local_outside_cache_initialization_ms << "\n";
   out << "  initial_chart_construction_ms: " << std::fixed
       << std::setprecision(3)
       << search.summary.initial_chart_construction_ms << "\n";
@@ -4229,10 +4243,18 @@ static void run_chart_spr_search_diagnostic(
   out << "  local_rows_recomputed_per_second: " << std::fixed
       << std::setprecision(3)
       << search.summary.local_rows_recomputed_per_second << "\n";
+  out << "  local_unit_fitch_fast_path_productions_scored: "
+      << search.summary.local_unit_fitch_fast_path_productions_scored << "\n";
   out << "  candidate_batches_scored: "
       << search.summary.candidate_batches_scored << "\n";
   out << "  pattern_batch_cache_builds: "
       << search.summary.pattern_batch_cache_builds << "\n";
+  out << "  initial_state_inside_charts_built: "
+      << search.summary.initial_state_inside_charts_built << "\n";
+  out << "  inside_cache_inside_charts_built: "
+      << search.summary.inside_cache_inside_charts_built << "\n";
+  out << "  inside_cache_resident_inside_charts_consumed: "
+      << search.summary.inside_cache_resident_inside_charts_consumed << "\n";
   out << "  exact_setup_builds: " << search.summary.exact_setup_builds
       << "\n";
   out << "  exact_setup_inside_charts_built: "

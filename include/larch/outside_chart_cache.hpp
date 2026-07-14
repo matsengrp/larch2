@@ -731,8 +731,10 @@ inline outside_chart_cache build_outside_chart_cache(
   cache.invariant_constant_offset = inside.invariant_constant_offset;
   cache.reference_state_by_pattern = std::move(reference_state_by_pattern);
   cache.temp_clade_count = 0;
-  cache.multifurcation_productions_scored =
-      inside.multifurcation_productions_scored;
+  // This constructor reuses every inside row. Count only multifurcating
+  // outside recurrences actually executed here; the inside cache reports the
+  // recurrence work that originally produced its resident rows.
+  cache.multifurcation_productions_scored = 0;
   cache.base_rows.resize(cache.patterns.size());
   cache.temp_rows.resize(cache.patterns.size());
 

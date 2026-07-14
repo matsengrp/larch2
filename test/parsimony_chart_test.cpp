@@ -6,10 +6,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <print>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -189,6 +191,195 @@ static brute_chart_row brute_combine_binary(brute_chart_row const& left,
     row[parent_state] = brute_add(best_left, best_right);
   }
   return row;
+}
+
+struct recurrence_test_production {
+  std::span<std::size_t const> children;
+};
+
+static constexpr std::array<std::size_t, 8> recurrence_test_child_ids{
+    0, 1, 2, 3, 4, 5, 6, 7};
+
+static recurrence_test_production recurrence_production_for(
+    std::span<brute_chart_row const> rows) {
+  CHECK(rows.size() <= recurrence_test_child_ids.size());
+  return {std::span<std::size_t const>{recurrence_test_child_ids}.first(
+      rows.size())};
+}
+
+static void check_unit_fitch_recurrence_equivalence(
+    std::span<brute_chart_row const> rows) {
+  auto production = recurrence_production_for(rows);
+
+  std::size_t specialized_provider_calls = 0;
+  auto specialized =
+      larch::parsimony_chart_detail::combine_production_inside_rows_unit_fitch(
+          production, [&](std::size_t child) -> brute_chart_row const& {
+            ++specialized_provider_calls;
+            return rows[child];
+          });
+  CHECK(specialized_provider_calls == rows.size());
+
+  brute_chart_row generic{};
+  std::size_t generic_provider_calls = 0;
+  for (std::uint8_t parent_state = 0; parent_state < larch::nuc_state_count;
+       ++parent_state) {
+    generic[parent_state] =
+        larch::parsimony_chart_detail::combine_production_inside_row(
+            production, parent_state,
+            [&](std::size_t child) -> brute_chart_row const& {
+              ++generic_provider_calls;
+              return rows[child];
+            });
+  }
+  CHECK(generic_provider_calls == rows.size() * larch::nuc_state_count);
+  CHECK(specialized == generic);
+}
+
+static std::vector<brute_chart_row> exhaustive_boundary_rows() {
+  constexpr std::array<larch::chart_cost, 5> values{
+      0, larch::chart_inf - 1, larch::chart_inf, larch::chart_inf + 1,
+      std::numeric_limits<larch::chart_cost>::max()};
+  std::vector<brute_chart_row> rows;
+  rows.reserve(values.size() * values.size() * values.size() * values.size());
+  for (auto a : values) {
+    for (auto c : values) {
+      for (auto g : values) {
+        for (auto t : values) rows.push_back({a, c, g, t});
+      }
+    }
+  }
+  return rows;
+}
+
+static void test_unit_fitch_all_state_recurrence_boundary_equivalence() {
+  std::println("test_unit_fitch_all_state_recurrence_boundary_equivalence");
+
+  std::array<brute_chart_row, 0> no_rows{};
+  check_unit_fitch_recurrence_equivalence(no_rows);
+
+  auto boundary_rows = exhaustive_boundary_rows();
+  for (auto const& row : boundary_rows) {
+    std::array<brute_chart_row, 1> rows{row};
+    check_unit_fitch_recurrence_equivalence(rows);
+  }
+
+  // Exhaust every binary pairing of the boundary-row corpus.  This includes
+  // exact chart_inf, values above it, and UINT32_MAX in every state position.
+  for (auto const& left : boundary_rows) {
+    for (auto const& right : boundary_rows) {
+      std::array rows{left, right};
+      check_unit_fitch_recurrence_equivalence(rows);
+    }
+  }
+
+  constexpr std::array<brute_chart_row, 8> focused_rows{
+      brute_chart_row{0, 1, larch::chart_inf - 2, larch::chart_inf - 1},
+      brute_chart_row{1, 0, larch::chart_inf - 1, larch::chart_inf - 2},
+      brute_chart_row{larch::chart_inf - 2, larch::chart_inf - 1, 0, 1},
+      brute_chart_row{larch::chart_inf - 1, larch::chart_inf - 2, 1, 0},
+      brute_chart_row{larch::chart_inf, larch::chart_inf + 1,
+                      larch::chart_inf - 1, larch::chart_inf - 2},
+      brute_chart_row{larch::chart_inf + 1, larch::chart_inf,
+                      std::numeric_limits<larch::chart_cost>::max(), 0},
+      brute_chart_row{std::numeric_limits<larch::chart_cost>::max(),
+                      larch::chart_inf + 1, larch::chart_inf,
+                      larch::chart_inf - 1},
+      brute_chart_row{0, 0, 0, 0}};
+
+  // Cover trinary recurrence exhaustively over a smaller focused corpus, then
+  // exercise larger arities with deliberately mixed finite/saturated rows.
+  for (auto const& first : focused_rows) {
+    for (auto const& second : focused_rows) {
+      for (auto const& third : focused_rows) {
+        std::array rows{first, second, third};
+        check_unit_fitch_recurrence_equivalence(rows);
+      }
+    }
+  }
+  check_unit_fitch_recurrence_equivalence(std::span{focused_rows}.first<4>());
+  check_unit_fitch_recurrence_equivalence(std::span{focused_rows}.first<5>());
+  check_unit_fitch_recurrence_equivalence(focused_rows);
+
+  std::println("  PASS");
+}
+
+static void test_unit_fitch_all_state_recurrence_randomized_equivalence() {
+  std::println("test_unit_fitch_all_state_recurrence_randomized_equivalence");
+
+  std::mt19937 rng{0xc001d00du};
+  for (std::size_t iter = 0; iter < 4000; ++iter) {
+    auto const arity = iter % (recurrence_test_child_ids.size() + 1);
+    std::vector<brute_chart_row> rows(arity);
+    for (std::size_t child = 0; child < rows.size(); ++child) {
+      for (std::size_t state = 0; state < larch::nuc_state_count; ++state) {
+        auto value = static_cast<larch::chart_cost>(rng());
+        switch ((iter + child + state) % 17) {
+          case 0:
+            value = larch::chart_inf - 1;
+            break;
+          case 1:
+            value = larch::chart_inf;
+            break;
+          case 2:
+            value = larch::chart_inf + 1;
+            break;
+          default:
+            break;
+        }
+        rows[child][state] = value;
+      }
+    }
+    check_unit_fitch_recurrence_equivalence(rows);
+  }
+
+  std::println("  PASS");
+}
+
+static void test_unit_fitch_all_state_recurrence_provider_contract() {
+  std::println("test_unit_fitch_all_state_recurrence_provider_contract");
+
+  constexpr std::array<std::size_t, 6> child_order{4, 1, 3, 1, 0, 2};
+  recurrence_test_production production{child_order};
+  constexpr std::array<brute_chart_row, 5> rows{
+      brute_chart_row{0, 1, 2, 3}, brute_chart_row{1, 2, 3, 4},
+      brute_chart_row{2, 3, 4, 5}, brute_chart_row{3, 4, 5, 6},
+      brute_chart_row{larch::chart_inf + 1, larch::chart_inf + 1,
+                      larch::chart_inf + 1, larch::chart_inf + 1}};
+  std::vector<std::size_t> observed_order;
+  observed_order.reserve(child_order.size());
+  (void)
+      larch::parsimony_chart_detail::combine_production_inside_rows_unit_fitch(
+          production, [&](std::size_t child) -> brute_chart_row const& {
+            observed_order.push_back(child);
+            return rows[child];
+          });
+  CHECK(observed_order ==
+        std::vector<std::size_t>(child_order.begin(), child_order.end()));
+
+  constexpr std::array<std::size_t, 3> throwing_order{2, 0, 1};
+  recurrence_test_production throwing_production{throwing_order};
+  observed_order.clear();
+  bool saw_expected_error = false;
+  try {
+    (void)larch::parsimony_chart_detail::
+        combine_production_inside_rows_unit_fitch(
+            throwing_production,
+            [&](std::size_t child) -> brute_chart_row const& {
+              observed_order.push_back(child);
+              if (child == 0) throw std::runtime_error("provider failure");
+              return rows[child];
+            });
+  } catch (std::runtime_error const& error) {
+    saw_expected_error = std::string{error.what()} == "provider failure";
+  }
+  CHECK(saw_expected_error);
+  constexpr std::array<std::size_t, 2> expected_before_throw{2, 0};
+  CHECK(observed_order ==
+        std::vector<std::size_t>(expected_before_throw.begin(),
+                                 expected_before_throw.end()));
+
+  std::println("  PASS");
 }
 
 static std::vector<brute_chart_row> brute_enumerate_rows(
@@ -505,6 +696,9 @@ static void test_strict_validation_errors() {
 }
 
 int main() {
+  test_unit_fitch_all_state_recurrence_boundary_equivalence();
+  test_unit_fitch_all_state_recurrence_randomized_equivalence();
+  test_unit_fitch_all_state_recurrence_provider_contract();
   test_paper_counterexample_single_sites();
   test_leaf_clade_and_reference_edge_conventions();
   test_exhaustive_two_tree_single_site_equivalence();

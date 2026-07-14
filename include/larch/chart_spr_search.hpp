@@ -88,6 +88,10 @@ struct chart_spr_search_counters {
   std::size_t full_composite_rebuilds = 0;
   std::size_t local_candidate_scores = 0;
   std::size_t local_rows_recomputed = 0;
+  // Candidate-local production rows completed by the specialized
+  // all-four-parent-state unit-Fitch recurrence. The provider is read once per
+  // child, and this advances only after all four contributions are available.
+  std::size_t local_unit_fitch_fast_path_productions_scored = 0;
   // Allocation-sensitive local-kernel contract.  Every dense
   // candidate-pattern visit borrows the resident pattern's immutable leaf
   // states.  The owned-copy counter is a regression sentinel: production
@@ -105,6 +109,17 @@ struct chart_spr_search_counters {
   std::size_t local_score_worker_tasks = 0;
   std::size_t candidate_batches_scored = 0;
   std::size_t pattern_batch_cache_builds = 0;
+  // Dense single-site inside charts built by the state's ordinary cache
+  // representation.  Exact-setup and persistent-inside-cache recurrence
+  // owners have distinct counters below, so their sum can enforce the
+  // one-build contract without double counting.  Lazy structural classes and
+  // resident chart copies do not advance this field.
+  std::size_t initial_state_inside_charts_built = 0;
+  // Cold construction of the persistent local-commit inside cache.  A
+  // resident construction must report zero builds and one consume per active
+  // pattern; these counters are populated by the substrate wiring.
+  std::size_t inside_cache_inside_charts_built = 0;
+  std::size_t inside_cache_resident_inside_charts_consumed = 0;
   // Phase-2B finalized exact-setup accounting.  These are logical work counts
   // copied from each successful multisite trim.  In particular, an all-active
   // search-state trim must consume the resident single-site charts and leave
@@ -344,6 +359,14 @@ inline void record_multisite_exact_trim_work(
     chart_spr_search_counters& counters,
     multisite_trim_result const& trim) {
   record_multisite_exact_setup_work_stats(counters, trim.exact_setup_work);
+}
+
+inline void record_inside_chart_cache_build_work(
+    chart_spr_search_counters& counters, std::size_t inside_charts_built,
+    std::size_t resident_inside_charts_consumed) {
+  counters.inside_cache_inside_charts_built += inside_charts_built;
+  counters.inside_cache_resident_inside_charts_consumed +=
+      resident_inside_charts_consumed;
 }
 
 // Acceptance modes describe the objective used to accept a candidate.  They
@@ -932,6 +955,14 @@ using chart_spr_exact_multisite_verifier = std::function<
                               checked_chart_execution_plan_ref const&,
                               multisite_trim_options const&)>;
 
+// Owner-neutral source for a finalized current-state exact setup.  A
+// local-commit substrate can project its immutable persistent inside rows into
+// an owning setup without exposing cache types in this header.  The returned
+// setup must retain no state/cache/provider borrow; common trim construction
+// and work-counter recording remain authoritative at the call site.
+using chart_spr_exact_setup_provider = std::function<multisite_exact_setup(
+    chart_spr_search_state const&, checked_chart_execution_plan_ref const&)>;
+
 struct affected_clade_distribution {
   double mean = 0.0;
   std::size_t p50 = 0;
@@ -989,6 +1020,19 @@ enum class chart_spr_cache_strategy {
   lazy_multisite_chart,
 };
 
+namespace chart_spr_search_detail {
+
+// Internal two-stage publication policy used by local-commit orchestration.
+// Public builders retain the completed-state default.  When a resolved
+// pattern-batch state is deferred, the local substrate becomes the sole owner
+// of the initial dense recurrence and must finalize the state before any score
+// or exact-trim consumer is called.
+struct chart_spr_state_build_policy {
+  bool defer_pattern_batch_bootstrap_to_local_cache = false;
+};
+
+}  // namespace chart_spr_search_detail
+
 inline char const* chart_spr_cache_strategy_name(
     chart_spr_cache_strategy strategy) {
   switch (strategy) {
@@ -1008,12 +1052,16 @@ struct chart_spr_search_summary {
   std::size_t candidates_generated = 0;
   std::size_t candidates_locally_scored = 0;
   std::size_t local_rows_recomputed = 0;
+  std::size_t local_unit_fitch_fast_path_productions_scored = 0;
   std::size_t local_leaf_state_view_uses = 0;
   std::size_t local_leaf_state_owned_copies = 0;
   std::size_t local_row_scratch_capacity_growths = 0;
   std::size_t multifurcation_productions_scored = 0;
   std::size_t candidate_batches_scored = 0;
   std::size_t pattern_batch_cache_builds = 0;
+  std::size_t initial_state_inside_charts_built = 0;
+  std::size_t inside_cache_inside_charts_built = 0;
+  std::size_t inside_cache_resident_inside_charts_consumed = 0;
   std::size_t exact_setup_builds = 0;
   std::size_t exact_setup_inside_charts_built = 0;
   std::size_t exact_setup_resident_inside_charts_consumed = 0;
@@ -1105,6 +1153,12 @@ struct chart_spr_search_summary {
   std::uint64_t final_score = 0;
   double total_ms = 0.0;
   double cache_build_ms = 0.0;
+  // Local-commit substrate construction is reported separately from the
+  // search-state representation and exact frontier.  These spans are
+  // disjoint: the inside span owns any deferred pattern-batch recurrence, and
+  // the outside span consumes the completed inside cache.
+  double local_inside_cache_initialization_ms = 0.0;
+  double local_outside_cache_initialization_ms = 0.0;
   // The actual initial dense (all-active or pattern-batched) or lazy
   // inside+outside chart construction span.  Unlike cache_build_ms this does
   // not include pattern extraction, grammar validation, cache sizing, or
@@ -2017,6 +2071,11 @@ struct chart_spr_search_state {
   mutable std::size_t effective_candidate_batch_size = 0;
   std::vector<pattern_chart_cache_entry> pattern_charts;
   std::optional<lazy_multisite_chart> lazy_chart;
+  // A deferred pattern-batch state is an internal, two-stage publication: its
+  // grammar/plan/pattern identity is complete, but its initial composite must
+  // be supplied by the local persistent inside cache before the state can be
+  // scored or exactly trimmed.  Public builders never return this state.
+  bool pattern_batch_bootstrap_deferred = false;
   std::uint64_t composite_lower_bound_without_invariants = 0;
   std::uint64_t composite_lower_bound_with_invariants = 0;
   double chart_construction_ms = 0.0;
@@ -2030,6 +2089,12 @@ struct chart_spr_search_state {
   // Phase-4 exact acceptance gate can lazily build and then reuse the current
   // state's old exact score even when verification APIs take a const state.
   mutable std::optional<multisite_trim_result> exact_trim_active_only;
+
+  // Optional owning exact-setup source installed by local-commit
+  // orchestration.  It is consulted only for pattern-batch states, whose
+  // bounded public representation intentionally owns no full pattern charts.
+  // Lazy and all-active paths retain their selected representations.
+  chart_spr_exact_setup_provider exact_setup_provider;
 
   // Optional Phase-8 fixed-topology verifier supplied by the local-commit
   // substrate.  When present, fixed_topology_exact verification reads the
@@ -2051,6 +2116,51 @@ struct chart_spr_search_state {
 
   mutable chart_spr_search_counters counters;
 };
+
+namespace chart_spr_search_detail {
+
+inline void require_completed_chart_spr_state_bootstrap(
+    chart_spr_search_state const& state, std::string_view consumer) {
+  if (state.pattern_batch_bootstrap_deferred) {
+    throw std::runtime_error(
+        std::string{consumer} +
+        ": deferred pattern-batch bootstrap has not been finalized by the "
+        "local persistent inside cache");
+  }
+}
+
+// Complete the private pattern-batch publication after the local persistent
+// cache has built the one authoritative set of dense inside charts.  The cache
+// composite includes the state's invariant constant exactly once.
+inline void finalize_deferred_pattern_batch_bootstrap(
+    chart_spr_search_state& state,
+    std::uint64_t composite_lower_bound_with_invariants,
+    double chart_construction_ms = 0.0) {
+  if (state.cache_strategy != chart_spr_cache_strategy::pattern_batches ||
+      !state.pattern_batch_bootstrap_deferred) {
+    throw std::runtime_error(
+        "chart SPR search state: no deferred pattern-batch bootstrap to "
+        "finalize");
+  }
+  if (!state.pattern_charts.empty() || state.lazy_chart) {
+    throw std::runtime_error(
+        "chart SPR search state: deferred pattern-batch bootstrap acquired an "
+        "unexpected resident chart representation");
+  }
+  if (composite_lower_bound_with_invariants < state.invariant_constant_offset) {
+    throw std::runtime_error(
+        "chart SPR search state: deferred pattern-batch composite is below "
+        "the invariant offset");
+  }
+  state.composite_lower_bound_with_invariants =
+      composite_lower_bound_with_invariants;
+  state.composite_lower_bound_without_invariants =
+      composite_lower_bound_with_invariants - state.invariant_constant_offset;
+  state.chart_construction_ms = chart_construction_ms;
+  state.pattern_batch_bootstrap_deferred = false;
+}
+
+}  // namespace chart_spr_search_detail
 
 inline std::size_t estimate_chart_spr_pattern_cache_bytes(
     chart_spr_search_state const& state) {
@@ -2117,16 +2227,20 @@ inline std::size_t estimate_chart_spr_full_pattern_cache_bytes(
 }
 
 // Build the current state's active-pattern exact trim using the representation
-// already selected for local scoring.  The all-active path is the Phase-2B hot
-// path: its immutable single-site inside charts are consumed once to finalize
-// one owning exact setup, and both frontier passes (when requested) reuse that
-// setup.  Pattern batches intentionally retain the cold exact path because they
-// own no compatible resident rows; the lazy multisite path intentionally
-// retains its class-compressed frontier bridge.
+// already selected for local scoring.  All setup sources return one owning
+// finalized setup, and common trim construction/counter recording stays here.
+// All-active states consume resident pattern charts, lazy states retain their
+// class-compressed bridge, and pattern-batch states consume an installed
+// persistent-cache setup provider when available (otherwise they use the cold
+// conservative path).
 inline multisite_trim_result build_chart_spr_state_exact_trim(
     chart_spr_search_state const& state,
+    checked_chart_execution_plan_ref const& checked_state,
     multisite_trim_options const& trim_options = {}) {
+  chart_spr_search_detail::require_completed_chart_spr_state_bootstrap(
+      state, "chart SPR exact trim");
   state.active_patterns.assert_no_skipped_invariant_metadata();
+  checked_state.assert_same(state.grammar, state.execution_plan);
 
   multisite_trim_result trim;
   if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
@@ -2159,6 +2273,10 @@ inline multisite_trim_result build_chart_spr_state_exact_trim(
         state.execution_plan, state.active_patterns, *state.lazy_chart,
         state.chart_opts, trim_options);
     ++state.counters.exact_trim_lazy_chart_uses;
+  } else if (state.exact_setup_provider) {
+    auto setup = state.exact_setup_provider(state, checked_state);
+    trim = build_multisite_trim_from_exact_setup(
+        state.execution_plan, setup, state.chart_opts, trim_options);
   } else {
     trim = build_multisite_trim_active(
         state.execution_plan, state.active_patterns, state.chart_opts,
@@ -2168,12 +2286,21 @@ inline multisite_trim_result build_chart_spr_state_exact_trim(
   return trim;
 }
 
+inline multisite_trim_result build_chart_spr_state_exact_trim(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options = {}) {
+  auto checked =
+      check_chart_execution_plan(state.grammar, state.execution_plan);
+  return build_chart_spr_state_exact_trim(state, checked, trim_options);
+}
+
 inline chart_spr_search_state build_chart_spr_search_state_from_active(
     phylo_dag& dag, clade_grammar grammar,
     chart_spr_active_pattern_build_result active_build,
     chart_options options = {}, bool build_exact_trim = false,
     multisite_trim_options const& trim_options = {},
-    chart_cache_options cache = {}) {
+    chart_cache_options cache = {},
+    chart_spr_search_detail::chart_spr_state_build_policy build_policy = {}) {
   validate_supported_chart_cache_options(cache);
   active_build.active_patterns.assert_no_skipped_invariant_metadata();
 
@@ -2208,6 +2335,18 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
       state.grammar, state.active_patterns, cache);
   state.cache_strategy = choose_chart_spr_cache_strategy(
       state.grammar, state.active_patterns, cache);
+  auto const defer_pattern_batch_bootstrap =
+      state.cache_strategy == chart_spr_cache_strategy::pattern_batches &&
+      build_policy.defer_pattern_batch_bootstrap_to_local_cache;
+  if (defer_pattern_batch_bootstrap && build_exact_trim) {
+    throw std::runtime_error(
+        "chart SPR search state: deferred pattern-batch bootstrap requires "
+        "deferred exact initialization");
+  }
+  state.pattern_batch_bootstrap_deferred = defer_pattern_batch_bootstrap;
+  auto const exact_owns_pattern_batch_bootstrap =
+      state.cache_strategy == chart_spr_cache_strategy::pattern_batches &&
+      build_exact_trim;
   state.effective_candidate_batch_size = cache.candidate_batch_size;
   ++state.counters.base_chart_cache_rebuilds;
   state.counters.skipped_invariant_sites =
@@ -2233,6 +2372,7 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
       state.counters.multifurcation_productions_scored +=
           entry.chart.multifurcation_productions_scored;
       state.pattern_charts.push_back(std::move(entry));
+      ++state.counters.initial_state_inside_charts_built;
     }
     state.chart_construction_ms =
         std::chrono::duration<double, std::milli>(
@@ -2273,34 +2413,39 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     auto const& patterns = state.active_patterns.patterns.patterns;
     auto batch_size = std::max<std::size_t>(
         1, state.effective_pattern_batch_size);
-    for (std::size_t begin = 0; begin < patterns.size(); begin += batch_size) {
-      ++state.counters.pattern_batch_cache_builds;
-      auto end = std::min(patterns.size(), begin + batch_size);
-      for (std::size_t i = begin; i < end; ++i) {
-        auto entry = chart_spr_search_detail::build_pattern_chart_cache_entry(
-            state.execution_plan, patterns[i], options, chart_build_options);
-        ++state.counters.chart_execution_plan_cache_hits;
-        active_total = chart_multisite_detail::checked_add_u64(
-            active_total, entry.weighted_root_score,
-            "chart-SPR batched active-pattern lower bound");
-        state.counters.multifurcation_productions_scored +=
-            entry.chart.multifurcation_productions_scored;
+    // Exact conservative initialization already has to build one cold inside
+    // chart per active pattern.  Let that setup own the initial composite too,
+    // rather than first constructing and discarding an identical batch.  A
+    // deferred local state similarly leaves this recurrence to its persistent
+    // inside cache.
+    if (!exact_owns_pattern_batch_bootstrap && !defer_pattern_batch_bootstrap) {
+      for (std::size_t begin = 0; begin < patterns.size();
+           begin += batch_size) {
+        ++state.counters.pattern_batch_cache_builds;
+        auto end = std::min(patterns.size(), begin + batch_size);
+        for (std::size_t i = begin; i < end; ++i) {
+          auto entry = chart_spr_search_detail::build_pattern_chart_cache_entry(
+              state.execution_plan, patterns[i], options, chart_build_options);
+          ++state.counters.chart_execution_plan_cache_hits;
+          active_total = chart_multisite_detail::checked_add_u64(
+              active_total, entry.weighted_root_score,
+              "chart-SPR batched active-pattern lower bound");
+          state.counters.multifurcation_productions_scored +=
+              entry.chart.multifurcation_productions_scored;
+          ++state.counters.initial_state_inside_charts_built;
+        }
       }
     }
-    state.chart_construction_ms =
-        std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - chart_construction_start)
-            .count();
+    if (!exact_owns_pattern_batch_bootstrap && !defer_pattern_batch_bootstrap) {
+      state.chart_construction_ms =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - chart_construction_start)
+              .count();
+    }
     state.resident_pattern_cache_bytes =
         state.effective_pattern_batch_size *
         estimate_chart_spr_pattern_row_cache_bytes(state.grammar);
   }
-
-  state.composite_lower_bound_without_invariants = active_total;
-  state.composite_lower_bound_with_invariants =
-      chart_multisite_detail::checked_add_u64(
-          active_total, state.invariant_constant_offset,
-          "chart-SPR cached lower bound invariant offset");
 
   if (build_exact_trim) {
     auto const exact_initialization_start =
@@ -2308,10 +2453,25 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     state.exact_trim_active_only =
         build_chart_spr_state_exact_trim(state, trim_options);
     ++state.counters.chart_execution_plan_cache_hits;
+    if (exact_owns_pattern_batch_bootstrap) {
+      if (state.exact_trim_active_only->invariant_constant_offset != 0) {
+        throw std::runtime_error(
+            "chart SPR search state: active-only exact setup unexpectedly "
+            "carried an invariant offset");
+      }
+      active_total = state.exact_trim_active_only->composite_lower_bound;
+    }
     state.exact_initialization_ms =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - exact_initialization_start)
             .count();
+  }
+  if (!state.pattern_batch_bootstrap_deferred) {
+    state.composite_lower_bound_without_invariants = active_total;
+    state.composite_lower_bound_with_invariants =
+        chart_multisite_detail::checked_add_u64(
+            active_total, state.invariant_constant_offset,
+            "chart-SPR cached lower bound invariant offset");
   }
   return state;
 }
@@ -3351,16 +3511,20 @@ inline void accumulate_overlay_production_row(
   struct production_view {
     std::span<candidate_chart_child_descriptor const> children;
   } prod{children};
-  for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
-       ++parent_state) {
     auto row_provider =
         [&](candidate_chart_child_descriptor const& child) -> auto const& {
       return provider.row(child);
     };
-    auto total = parsimony_chart_detail::combine_production_inside_row(
-        prod, parent_state, row_provider);
-    row[parent_state] = std::min(row[parent_state], total);
-  }
+    auto const totals =
+        parsimony_chart_detail::combine_production_inside_rows_unit_fitch(
+            prod, row_provider);
+    for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+         ++parent_state) {
+      row[parent_state] = std::min(row[parent_state], totals[parent_state]);
+    }
+    if (counters != nullptr) {
+      ++counters->local_unit_fitch_fast_path_productions_scored;
+    }
 }
 
 template <class RowProvider>
@@ -3646,6 +3810,8 @@ inline void add_chart_spr_search_counters(
   dst.full_composite_rebuilds += src.full_composite_rebuilds;
   dst.local_candidate_scores += src.local_candidate_scores;
   dst.local_rows_recomputed += src.local_rows_recomputed;
+  dst.local_unit_fitch_fast_path_productions_scored +=
+      src.local_unit_fitch_fast_path_productions_scored;
   dst.local_leaf_state_view_uses += src.local_leaf_state_view_uses;
   dst.local_leaf_state_owned_copies += src.local_leaf_state_owned_copies;
   dst.local_row_scratch_capacity_growths +=
@@ -3656,6 +3822,11 @@ inline void add_chart_spr_search_counters(
   dst.local_score_worker_tasks += src.local_score_worker_tasks;
   dst.candidate_batches_scored += src.candidate_batches_scored;
   dst.pattern_batch_cache_builds += src.pattern_batch_cache_builds;
+  dst.initial_state_inside_charts_built +=
+      src.initial_state_inside_charts_built;
+  dst.inside_cache_inside_charts_built += src.inside_cache_inside_charts_built;
+  dst.inside_cache_resident_inside_charts_consumed +=
+      src.inside_cache_resident_inside_charts_consumed;
   dst.exact_setup_builds += src.exact_setup_builds;
   dst.exact_setup_inside_charts_built +=
       src.exact_setup_inside_charts_built;
@@ -4639,6 +4810,8 @@ inline std::vector<chart_spr_candidate_score> score_candidates_locally(
     local_spr_score_options const& options,
     std::size_t worker_count,
     checked_chart_execution_plan_ref const& checked_state) {
+  chart_spr_search_detail::require_completed_chart_spr_state_bootstrap(
+      state, "chart SPR local score");
   checked_state.assert_same(state.grammar, state.execution_plan);
   if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns ||
       state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
@@ -4762,7 +4935,7 @@ inline multisite_trim_result const& ensure_chart_spr_state_exact_trim(
   checked_state.assert_same(state.grammar, state.execution_plan);
   if (!state.exact_trim_active_only) {
     state.exact_trim_active_only =
-        build_chart_spr_state_exact_trim(state, trim_options);
+        build_chart_spr_state_exact_trim(state, checked_state, trim_options);
     ++state.counters.chart_execution_plan_cache_hits;
   }
   return *state.exact_trim_active_only;
@@ -6265,6 +6438,8 @@ inline std::uint64_t chart_spr_iteration_state_score_before(
     chart_spr_search_state const& state,
     checked_chart_execution_plan_ref const& checked_state,
     chart_spr_search_options const& options) {
+  chart_spr_search_detail::require_completed_chart_spr_state_bootstrap(
+      state, "chart SPR iteration state score");
   checked_state.assert_same(state.grammar, state.execution_plan);
   if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite) {
     return chart_spr_state_exact_score_with_invariants(
@@ -6276,6 +6451,8 @@ inline std::uint64_t chart_spr_iteration_state_score_before(
 inline std::uint64_t chart_spr_iteration_state_score_before(
     chart_spr_search_state const& state,
     chart_spr_search_options const& options) {
+  chart_spr_search_detail::require_completed_chart_spr_state_bootstrap(
+      state, "chart SPR iteration state score");
   if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite) {
     return chart_spr_state_exact_score_with_invariants(state,
                                                        options.exact_trim);

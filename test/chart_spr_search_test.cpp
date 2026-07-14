@@ -1066,6 +1066,9 @@ static void test_pattern_batch_cache_options_match_all_cache() {
     CHECK(active_pattern_count >= 2);
     CHECK(state.counters.local_rows_recomputed >
           before.local_rows_recomputed);
+    CHECK(state.counters.local_unit_fitch_fast_path_productions_scored ==
+          before.local_unit_fitch_fast_path_productions_scored +
+              expected_candidate_descriptors * active_pattern_count);
     CHECK(state.counters.local_leaf_state_view_uses ==
           before.local_leaf_state_view_uses + expected_leaf_views);
     CHECK(state.counters.local_leaf_state_owned_copies ==
@@ -1088,6 +1091,8 @@ static void test_pattern_batch_cache_options_match_all_cache() {
   CHECK(batched_scores.front().local_score_ms > 0.0);
   CHECK(lazy_state.counters.local_candidate_scores == subset.size());
   CHECK(lazy_state.counters.local_rows_recomputed > 0);
+  CHECK(lazy_state.counters.local_unit_fitch_fast_path_productions_scored >
+        lazy_counters_before.local_unit_fitch_fast_path_productions_scored);
   CHECK(lazy_scores.front().local_score_ms > 0.0);
 
   bool single_threw = false;
@@ -2074,6 +2079,7 @@ static void test_phase2b_exact_setup_reuses_resident_state_charts() {
   auto const pattern_count =
       state.active_patterns.patterns.patterns.size();
   CHECK(pattern_count >= 2);
+  CHECK(state.counters.initial_state_inside_charts_built == pattern_count);
   auto cold = larch::build_multisite_trim_active(
       state.execution_plan, state.active_patterns, state.chart_opts);
   CHECK(cold.exact_setup_work.setup_builds == 1);
@@ -2139,6 +2145,7 @@ static void test_phase2b_exact_setup_reuses_resident_state_charts() {
   CHECK(eager.counters.exact_setup_inside_charts_built == 0);
   CHECK(eager.counters.exact_setup_resident_inside_charts_consumed ==
         pattern_count);
+  CHECK(eager.counters.initial_state_inside_charts_built == pattern_count);
   auto const eager_before_repeat =
       phase2b_exact_counter_snapshot(eager.counters);
   (void)larch::ensure_chart_spr_state_exact_trim(eager,
@@ -2146,9 +2153,10 @@ static void test_phase2b_exact_setup_reuses_resident_state_charts() {
   CHECK(phase2b_exact_counter_snapshot(eager.counters) ==
         eager_before_repeat);
 
-  // Pattern batches own no compatible resident single-site charts.  Their
-  // exact path remains explicitly cold and reports one inside build per active
-  // pattern, while preserving the exact result.
+  // Pattern batches own no compatible resident single-site charts.  Exact
+  // initialization therefore makes one cold setup the sole owner of both the
+  // initial composite and exact frontier: there is no throwaway batch scan
+  // before it.
   auto batched_options = eager_options;
   batched_options.cache.max_cached_patterns = 1;
   auto batched =
@@ -2162,9 +2170,17 @@ static void test_phase2b_exact_setup_reuses_resident_state_charts() {
   CHECK(batched.counters.exact_setup_builds == 1);
   CHECK(batched.counters.exact_setup_inside_charts_built == pattern_count);
   CHECK(batched.counters.exact_setup_resident_inside_charts_consumed == 0);
+  CHECK(batched.counters.initial_state_inside_charts_built == 0);
+  CHECK(batched.counters.pattern_batch_cache_builds == 0);
   CHECK(batched.counters.exact_setup_outside_boundary_charts_built ==
         pattern_count);
   CHECK(batched.counters.exact_trim_lazy_chart_uses == 0);
+  auto const batched_before_repeat =
+      phase2b_exact_counter_snapshot(batched.counters);
+  (void)larch::ensure_chart_spr_state_exact_trim(batched,
+                                                 batched_options.exact_trim);
+  CHECK(phase2b_exact_counter_snapshot(batched.counters) ==
+        batched_before_repeat);
 
   // The class-compressed lazy chart remains its own semantically-identical
   // representation; it does not pretend to have built/consumed a dense exact
@@ -2187,6 +2203,7 @@ static void test_phase2b_exact_setup_reuses_resident_state_charts() {
   CHECK(lazy.counters.exact_setup_upper_bound_topologies_unique == 0);
   CHECK(lazy.counters.exact_setup_frontier_passes == 0);
   CHECK(lazy.counters.exact_trim_lazy_chart_uses == 1);
+  CHECK(lazy.counters.initial_state_inside_charts_built == 0);
   auto const lazy_before_repeat =
       phase2b_exact_counter_snapshot(lazy.counters);
   (void)larch::ensure_chart_spr_state_exact_trim(lazy,
@@ -2212,6 +2229,139 @@ static void test_phase2b_exact_setup_reuses_resident_state_charts() {
   CHECK(stale_threw);
   CHECK(stale.counters.plan_mismatch_rejections == mismatch_before + 1);
   CHECK(phase2b_exact_counter_snapshot(stale.counters) == stale_before);
+
+  std::println("  PASS");
+}
+
+static void test_phase2b_deferred_pattern_batch_uses_owning_setup_provider() {
+  std::println(
+      "test_phase2b_deferred_pattern_batch_uses_owning_setup_provider");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AAA", four_taxon_two_pattern_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, grammar);
+  auto active_build = larch::make_active_search_patterns(patterns, {});
+
+  larch::chart_cache_options cache;
+  cache.max_cached_patterns = 1;
+  larch::chart_spr_search_detail::chart_spr_state_build_policy policy;
+  policy.defer_pattern_batch_bootstrap_to_local_cache = true;
+  auto state = larch::build_chart_spr_search_state_from_active(
+      dag, grammar, std::move(active_build), {}, false, {}, cache, policy);
+  auto const pattern_count = state.active_patterns.patterns.patterns.size();
+  CHECK(pattern_count >= 2);
+  CHECK(state.cache_strategy ==
+        larch::chart_spr_cache_strategy::pattern_batches);
+  CHECK(state.pattern_batch_bootstrap_deferred);
+  CHECK(state.pattern_charts.empty());
+  CHECK(!state.lazy_chart.has_value());
+  CHECK(!state.exact_trim_active_only.has_value());
+  CHECK(state.counters.pattern_batch_cache_builds == 0);
+  CHECK(state.counters.initial_state_inside_charts_built == 0);
+
+  // A two-stage internal state fails closed: even an installed provider must
+  // not be called before the local cache publishes the initial composite.
+  std::size_t provider_calls = 0;
+  state.exact_setup_provider =
+      [&](larch::chart_spr_search_state const&,
+          larch::checked_chart_execution_plan_ref const&)
+      -> larch::multisite_exact_setup {
+    ++provider_calls;
+    throw std::runtime_error("provider called before setup installation");
+  };
+  std::string deferred_rejection;
+  try {
+    (void)larch::ensure_chart_spr_state_exact_trim(state);
+  } catch (std::runtime_error const& e) {
+    deferred_rejection = e.what();
+  }
+  CHECK(deferred_rejection.find("deferred pattern-batch bootstrap") !=
+        std::string::npos);
+  CHECK(provider_calls == 0);
+  CHECK(state.counters.exact_setup_builds == 0);
+
+  // Model the local cache publication with ordinary resident charts, then
+  // finalize one owning setup from them.  Destroying every source chart before
+  // `ensure` proves the hook result retains no chart/provider borrow.
+  larch::chart_options build_options = state.chart_opts;
+  build_options.keep_trace = false;
+  build_options.max_trace_choices = 0;
+  std::vector<larch::single_site_chart> source_charts;
+  source_charts.reserve(pattern_count);
+  for (auto const& pattern : state.active_patterns.patterns.patterns) {
+    source_charts.push_back(larch::build_single_site_chart(
+        state.execution_plan,
+        larch::view_leaf_site_states(pattern.state_by_taxon), build_options));
+  }
+  auto owning_setup = larch::build_multisite_exact_setup_from_resident_inside(
+      state.execution_plan, state.active_patterns.patterns,
+      [&](std::size_t pattern_index,
+          larch::site_pattern const&) -> larch::single_site_chart const& {
+        return source_charts.at(pattern_index);
+      },
+      state.chart_opts);
+  CHECK(owning_setup.work.inside_charts_built == 0);
+  CHECK(owning_setup.work.resident_inside_charts_consumed == pattern_count);
+  auto cold = larch::build_multisite_trim_active(
+      state.execution_plan, state.active_patterns, state.chart_opts);
+  source_charts.clear();
+  source_charts.shrink_to_fit();
+
+  provider_calls = 0;
+  state.exact_setup_provider =
+      [owning_setup = std::move(owning_setup), &provider_calls](
+          larch::chart_spr_search_state const& provided_state,
+          larch::checked_chart_execution_plan_ref const& checked) {
+        ++provider_calls;
+        checked.assert_same(provided_state.grammar,
+                            provided_state.execution_plan);
+        return owning_setup;
+      };
+  larch::record_inside_chart_cache_build_work(state.counters, pattern_count, 0);
+  auto const composite_with_invariants =
+      cold.composite_lower_bound + state.invariant_constant_offset;
+  larch::chart_spr_search_detail::finalize_deferred_pattern_batch_bootstrap(
+      state, composite_with_invariants, 1.25);
+  CHECK(!state.pattern_batch_bootstrap_deferred);
+  CHECK(state.composite_lower_bound_without_invariants ==
+        cold.composite_lower_bound);
+  CHECK(state.composite_lower_bound_with_invariants ==
+        composite_with_invariants);
+  CHECK(state.chart_construction_ms == 1.25);
+  CHECK(state.counters.initial_state_inside_charts_built == 0);
+  CHECK(state.counters.inside_cache_inside_charts_built == pattern_count);
+  CHECK(state.counters.inside_cache_resident_inside_charts_consumed == 0);
+
+  bool duplicate_finalize_threw = false;
+  try {
+    larch::chart_spr_search_detail::finalize_deferred_pattern_batch_bootstrap(
+        state, composite_with_invariants);
+  } catch (std::runtime_error const&) {
+    duplicate_finalize_threw = true;
+  }
+  CHECK(duplicate_finalize_threw);
+
+  auto const& provided = larch::ensure_chart_spr_state_exact_trim(state);
+  CHECK(provider_calls == 1);
+  check_phase2b_trim_semantic_parity(cold, provided);
+  CHECK(provided.exact_setup_work.inside_charts_built == 0);
+  CHECK(provided.exact_setup_work.resident_inside_charts_consumed ==
+        pattern_count);
+  CHECK(state.counters.exact_setup_inside_charts_built == 0);
+  CHECK(state.counters.exact_setup_resident_inside_charts_consumed ==
+        pattern_count);
+  CHECK(state.counters.initial_state_inside_charts_built +
+            state.counters.exact_setup_inside_charts_built +
+            state.counters.inside_cache_inside_charts_built ==
+        pattern_count);
+
+  auto const before_repeat = phase2b_exact_counter_snapshot(state.counters);
+  auto const* provided_address = &provided;
+  auto const& repeated = larch::ensure_chart_spr_state_exact_trim(state);
+  CHECK(&repeated == provided_address);
+  CHECK(provider_calls == 1);
+  CHECK(phase2b_exact_counter_snapshot(state.counters) == before_repeat);
 
   std::println("  PASS");
 }
@@ -3340,6 +3490,9 @@ static void test_phase6_multifurcation_fixed_topology_local_commit() {
   CHECK(search.summary.local_row_scratch_capacity_growths ==
         search.counters.local_row_scratch_capacity_growths);
   CHECK(search.summary.local_row_scratch_capacity_growths > 0);
+  CHECK(search.summary.local_unit_fitch_fast_path_productions_scored ==
+        search.counters.local_unit_fitch_fast_path_productions_scored);
+  CHECK(search.summary.local_unit_fitch_fast_path_productions_scored > 0);
   CHECK(search.summary.final_compaction_rebuilds == 1);
   auto rebuilt = larch::build_clade_grammar(search.dag, gopts);
   CHECK(max_production_arity(rebuilt) == 3);
@@ -3957,6 +4110,16 @@ static void test_phase9_pattern_batch_local_update_matches_output_dag() {
         larch::multisite_keep_mask_kind::exact_optimal_production_union);
   CHECK(search.summary.effective_pattern_batch_size == 1);
   CHECK(search.counters.pattern_batch_cache_builds > 0);
+  CHECK(search.counters.initial_state_inside_charts_built == 0);
+  CHECK(search.counters.inside_cache_inside_charts_built ==
+        search.summary.active_pattern_count);
+  CHECK(search.counters.inside_cache_resident_inside_charts_consumed == 0);
+  // Candidate verification still builds exact setups for each transient
+  // candidate grammar. The production initialization gate runs before that
+  // work and proves state+cache recurrence ownership sums to P; the resident
+  // count below proves the current-state exact setup consumed the cache.
+  CHECK(search.counters.exact_setup_resident_inside_charts_consumed >=
+        search.summary.active_pattern_count);
   auto rebuilt = larch::build_clade_grammar(search.dag);
   auto rebuilt_state = larch::build_chart_spr_search_state(
       search.dag, rebuilt, options);
@@ -5374,9 +5537,13 @@ static void test_phase4_pattern_batches_local_commit() {
         search.summary.active_pattern_count);
   CHECK(search.counters.outside_cache_outside_charts_built ==
         search.summary.active_pattern_count);
+  CHECK(search.counters.initial_state_inside_charts_built == 0);
+  CHECK(search.counters.inside_cache_inside_charts_built ==
+        search.summary.active_pattern_count);
+  CHECK(search.counters.inside_cache_resident_inside_charts_consumed == 0);
   CHECK(search.counters.exact_setup_builds > 0);
-  CHECK(search.counters.exact_setup_inside_charts_built > 0);
-  CHECK(search.counters.exact_setup_resident_inside_charts_consumed == 0);
+  CHECK(search.counters.exact_setup_resident_inside_charts_consumed >=
+        search.summary.active_pattern_count);
   // Pattern-batch scoring actually rebuilt base rows per batch across the run.
   CHECK(search.counters.pattern_batch_cache_builds > 0);
   CHECK(search.summary.final_score <= search.summary.initial_score);
@@ -5776,6 +5943,7 @@ int main() {
   test_streaming_path_pair_budget_stops_early();
   test_eager_diagnostic_enumeration_exposes_cap_after_path_precompute();
   test_phase2b_exact_setup_reuses_resident_state_charts();
+  test_phase2b_deferred_pattern_batch_uses_owning_setup_provider();
   test_exact_verification_reuses_state_old_score();
   test_failed_exact_materialization_is_timed();
   test_top_k_exact_verification_count_is_bounded();

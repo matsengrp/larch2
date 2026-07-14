@@ -917,8 +917,8 @@ static void test_cold_outside_reuse_ua_and_multifurcation_equivalence() {
     CHECK(reused.build_stats.outside_charts_built == inside.patterns.size());
   }
 
-  // Generic arity must retain both the exact rows and the established
-  // inside+outside multifurcation accounting when the inside half is reused.
+  // Generic arity must retain exact rows while separating the reused inside
+  // work from the outside recurrence actually executed by this constructor.
   {
     using namespace larch::test;
     auto dag = make_tiny_labelled_tree(
@@ -948,7 +948,9 @@ static void test_cold_outside_reuse_ua_and_multifurcation_equivalence() {
 
     CHECK(reused.base_rows == rebuilt.base_rows);
     CHECK(rebuilt.multifurcation_productions_scored > 0);
-    CHECK(reused.multifurcation_productions_scored ==
+    CHECK(reused.multifurcation_productions_scored > 0);
+    CHECK(reused.multifurcation_productions_scored +
+              inside.multifurcation_productions_scored ==
           rebuilt.multifurcation_productions_scored);
     CHECK(reused.outside_recurrence_work ==
           rebuilt.outside_recurrence_work);

@@ -44,8 +44,10 @@
 
 #include <algorithm>
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <set>
 #include <stdexcept>
@@ -410,6 +412,235 @@ inline std::vector<overlay_clade_ref> compute_inside_affected_set(
 
 }  // namespace inside_chart_cache_detail
 
+// Deterministic cold-construction accounting. A cache built from immutable
+// resident charts must report no inside recurrence builds and exactly one
+// resident consume per active pattern.
+struct inside_chart_cache_build_stats {
+  std::size_t inside_charts_built = 0;
+  std::size_t resident_inside_charts_consumed = 0;
+
+  bool operator==(inside_chart_cache_build_stats const&) const = default;
+};
+
+struct inside_chart_cache_active_pattern_fingerprint {
+  static constexpr std::uint32_t current_schema_version = 1;
+
+  std::array<std::uint64_t, 2> structure{};
+  std::uint32_t schema_version = current_schema_version;
+
+  bool operator==(inside_chart_cache_active_pattern_fingerprint const&) const =
+      default;
+};
+
+namespace inside_chart_cache_detail {
+
+// Fingerprint the complete semantic payload of an active pattern set. The
+// chart rows depend on ordered leaf states, while scoring and reporting also
+// depend on positions, weights, reference-state counts, normalization maps,
+// and aggregate site metadata. Include every field so same-address in-place
+// mutation cannot make stale resident rows appear compatible.
+inline inside_chart_cache_active_pattern_fingerprint
+fingerprint_active_pattern_set(active_site_pattern_set const& active) {
+  inside_chart_cache_active_pattern_fingerprint result;
+  auto& first = result.structure[0];
+  auto& second = result.structure[1];
+  first = 0x6a09e667f3bcc909ULL;
+  second = 0xbb67ae8584caa73bULL;
+
+  auto mix = [&](std::uint64_t value) {
+    chart_execution_plan_detail::fingerprint_mix(first, value);
+    chart_execution_plan_detail::fingerprint_mix(second,
+                                                 value ^ 0xd6e8feb86659fd93ULL);
+  };
+  auto mix_state_map = [&](normalized_binary_state_map const& map) {
+    mix(map.exact_pattern);
+    mix(map.normalized_binary_pattern);
+    for (auto state : map.normalized_to_original) mix(state);
+    for (auto state : map.original_to_normalized) mix(state);
+  };
+  auto const& patterns = active.patterns;
+
+  mix(result.schema_version);
+  mix(patterns.taxon_count);
+  mix(patterns.patterns.size());
+  for (auto const& pattern : patterns.patterns) {
+    mix(pattern.state_by_taxon.size());
+    for (auto state : pattern.state_by_taxon) mix(state);
+    mix(pattern.positions.size());
+    for (auto position : pattern.positions) mix(position);
+    mix(pattern.weight);
+    for (auto count : pattern.reference_state_counts) mix(count);
+  }
+
+  mix(patterns.original_site_to_pattern.size());
+  for (auto pattern : patterns.original_site_to_pattern) mix(pattern);
+
+  mix(patterns.normalized_binary_patterns.size());
+  for (auto const& pattern : patterns.normalized_binary_patterns) {
+    mix(pattern.state_by_taxon.size());
+    for (auto state : pattern.state_by_taxon) mix(state);
+    mix(pattern.positions.size());
+    for (auto position : pattern.positions) mix(position);
+    mix(pattern.weight);
+    mix(pattern.exact_pattern_indices.size());
+    for (auto pattern_index : pattern.exact_pattern_indices) {
+      mix(pattern_index);
+    }
+    mix(pattern.exact_state_maps.size());
+    for (auto const& map : pattern.exact_state_maps) mix_state_map(map);
+  }
+
+  mix(patterns.exact_pattern_to_normalized_binary_pattern.size());
+  for (auto pattern : patterns.exact_pattern_to_normalized_binary_pattern) {
+    mix(pattern);
+  }
+  mix(patterns.exact_pattern_to_normalized_binary_state_map.size());
+  for (auto const& map :
+       patterns.exact_pattern_to_normalized_binary_state_map) {
+    mix_state_map(map);
+  }
+
+  mix(patterns.total_site_count);
+  mix(patterns.invariant_site_count);
+  mix(patterns.variable_site_count);
+  mix(patterns.binary_variable_site_count);
+  mix(patterns.nonbinary_variable_site_count);
+  mix(patterns.skipped_invariant_site_count);
+  mix(patterns.invariant_constant_score_excluding_ua);
+  mix(patterns.invariant_constant_score_with_reference_edge);
+  mix(patterns.skipped_invariant_constant_score_with_reference_edge);
+  return result;
+}
+
+}  // namespace inside_chart_cache_detail
+
+// Provenance for an immutable resident set of single-site charts. The token is
+// minted only from a checked grammar/plan publication boundary and records
+// generation, full grammar fingerprint, and full active-pattern fingerprint.
+// Keeping the token separate from the row provider lets callers adapt resident
+// layouts without copying pointer tables.
+//
+// The token is consulted only during construction. The resulting cache copies
+// every row and pattern and retains no token, provider, chart, or pattern
+// borrow.
+class inside_chart_cache_resident_source_identity {
+ public:
+  inside_chart_cache_resident_source_identity(
+      inside_chart_cache_resident_source_identity const&) = default;
+  inside_chart_cache_resident_source_identity& operator=(
+      inside_chart_cache_resident_source_identity const&) = default;
+
+  [[nodiscard]] std::uint64_t grammar_generation() const noexcept {
+    return grammar_generation_;
+  }
+  [[nodiscard]] chart_plan_fingerprint const& fingerprint() const noexcept {
+    return fingerprint_;
+  }
+  [[nodiscard]] std::size_t pattern_count() const noexcept {
+    return pattern_count_;
+  }
+  [[nodiscard]] inside_chart_cache_active_pattern_fingerprint const&
+  active_pattern_fingerprint() const noexcept {
+    return active_pattern_fingerprint_;
+  }
+
+  void assert_same(clade_grammar const& grammar,
+                   chart_execution_plan const& plan,
+                   active_site_pattern_set const& active) const {
+    if (grammar_ != &grammar) {
+      throw std::runtime_error(
+          "inside cache resident source: grammar identity mismatch");
+    }
+    if (grammar_generation_ != plan.grammar_generation()) {
+      throw std::runtime_error(
+          "inside cache resident source: grammar generation mismatch");
+    }
+    if (fingerprint_ != plan.fingerprint()) {
+      throw std::runtime_error(
+          "inside cache resident source: grammar fingerprint mismatch");
+    }
+    if (pattern_count_ != active.patterns.patterns.size()) {
+      throw std::runtime_error(
+          "inside cache resident source: active pattern count mismatch");
+    }
+    if (active_pattern_fingerprint_ !=
+        inside_chart_cache_detail::fingerprint_active_pattern_set(active)) {
+      throw std::runtime_error(
+          "inside cache resident source: active pattern fingerprint "
+          "mismatch");
+    }
+  }
+
+  // A frozen destination may be a distinct grammar object, but it must carry
+  // the exact immutable execution identity and shape that produced the
+  // resident rows. Check generation and full fingerprint before the explicit
+  // shape guard so each stale-snapshot failure is labelled deterministically.
+  void assert_compatible_destination(chart_execution_plan const& plan) const {
+    if (grammar_generation_ != plan.grammar_generation()) {
+      throw std::runtime_error(
+          "inside cache resident destination: grammar generation mismatch");
+    }
+    if (fingerprint_ != plan.fingerprint()) {
+      throw std::runtime_error(
+          "inside cache resident destination: grammar fingerprint mismatch");
+    }
+    if (taxon_count_ != plan.taxon_count() ||
+        clade_count_ != plan.clades().size() ||
+        production_count_ != plan.productions().size() ||
+        root_clade_ != plan.root_clade() || all_binary_ != plan.all_binary() ||
+        max_arity_ != plan.max_arity()) {
+      throw std::runtime_error(
+          "inside cache resident destination: execution shape mismatch");
+    }
+  }
+
+ private:
+  friend inside_chart_cache_resident_source_identity
+  make_inside_chart_cache_resident_source_identity(
+      clade_grammar const&, checked_chart_execution_plan_ref const&,
+      active_site_pattern_set const&);
+
+  inside_chart_cache_resident_source_identity(
+      clade_grammar const& grammar, chart_execution_plan const& plan,
+      active_site_pattern_set const& active)
+      : grammar_(&grammar),
+        grammar_generation_(plan.grammar_generation()),
+        fingerprint_(plan.fingerprint()),
+        pattern_count_(active.patterns.patterns.size()),
+        taxon_count_(plan.taxon_count()),
+        clade_count_(plan.clades().size()),
+        production_count_(plan.productions().size()),
+        root_clade_(plan.root_clade()),
+        all_binary_(plan.all_binary()),
+        max_arity_(plan.max_arity()),
+        active_pattern_fingerprint_(
+            inside_chart_cache_detail::fingerprint_active_pattern_set(active)) {
+  }
+
+  clade_grammar const* grammar_ = nullptr;
+  std::uint64_t grammar_generation_ = 0;
+  chart_plan_fingerprint fingerprint_{};
+  std::size_t pattern_count_ = 0;
+  std::size_t taxon_count_ = 0;
+  std::size_t clade_count_ = 0;
+  std::size_t production_count_ = 0;
+  clade_id root_clade_ = no_clade;
+  bool all_binary_ = false;
+  std::size_t max_arity_ = 0;
+  inside_chart_cache_active_pattern_fingerprint active_pattern_fingerprint_{};
+};
+
+inline inside_chart_cache_resident_source_identity
+make_inside_chart_cache_resident_source_identity(
+    clade_grammar const& base, checked_chart_execution_plan_ref const& checked,
+    active_site_pattern_set const& active) {
+  checked.assert_same(base, checked.plan());
+  active.assert_no_skipped_invariant_metadata();
+  chart_multisite_detail::validate_multisite_inputs(
+      checked.plan(), active.patterns, chart_options{});
+  return {base, checked.plan(), active};
+}
+
 // Persistent inside-chart cache keyed by (active pattern, overlay-clade-ref).
 // `base_rows[p][cid]` holds the inside row for frozen-base clade `cid` under
 // active pattern `p`; `temp_rows[p][tid]` holds the row for merged-temp clade
@@ -432,6 +663,8 @@ struct inside_chart_cache {
 
   chart_options chart_opts;
   std::vector<site_pattern> patterns;  // active/topology-informative only
+  std::size_t taxon_count = 0;
+  inside_chart_cache_active_pattern_fingerprint active_pattern_fingerprint;
   std::uint64_t invariant_constant_offset = 0;
 
   std::vector<std::vector<std::array<chart_cost, nuc_state_count>>> base_rows;
@@ -460,6 +693,7 @@ struct inside_chart_cache {
   // `outside_rows_recomputed_on_commit` lands there.
   std::size_t inside_rows_recomputed_on_commit = 0;
   std::size_t multifurcation_productions_scored = 0;
+  inside_chart_cache_build_stats build_stats;
 
   // Read a cached inside row.  Throws on out-of-range or absent rows; callers
   // (the recompute loop, the root scorer) only read rows that are present.
@@ -514,6 +748,9 @@ inline inside_chart_cache build_inside_chart_cache(
       chart_execution_plan_detail::fingerprint_chart_grammar(base);
   cache.chart_opts = options;
   cache.patterns = active.patterns.patterns;
+  cache.taxon_count = active.patterns.taxon_count;
+  cache.active_pattern_fingerprint =
+      inside_chart_cache_detail::fingerprint_active_pattern_set(active);
   cache.invariant_constant_offset = invariant_constant_offset;
   cache.temp_clade_count = 0;
 
@@ -534,6 +771,7 @@ inline inside_chart_cache build_inside_chart_cache(
     }
     cache.multifurcation_productions_scored +=
         chart.multifurcation_productions_scored;
+    ++cache.build_stats.inside_charts_built;
     // Each inner vector starts empty (resize above), so assign allocates it
     // exactly once rather than zero-initializing then reallocating.
     cache.base_rows[p].assign(chart.inside.begin(), chart.inside.end());
@@ -562,6 +800,9 @@ inline inside_chart_cache build_inside_chart_cache(
   cache.base_execution_fingerprint = plan.fingerprint();
   cache.chart_opts = options;
   cache.patterns = active.patterns.patterns;
+  cache.taxon_count = active.patterns.taxon_count;
+  cache.active_pattern_fingerprint =
+      inside_chart_cache_detail::fingerprint_active_pattern_set(active);
   cache.invariant_constant_offset = invariant_constant_offset;
   cache.temp_clade_count = 0;
 
@@ -581,6 +822,7 @@ inline inside_chart_cache build_inside_chart_cache(
     }
     cache.multifurcation_productions_scored +=
         chart.multifurcation_productions_scored;
+    ++cache.build_stats.inside_charts_built;
     cache.base_rows[p].assign(chart.inside.begin(), chart.inside.end());
   }
   return cache;
@@ -593,6 +835,89 @@ inline inside_chart_cache build_inside_chart_cache(
   auto checked = check_chart_execution_plan(base, plan);
   return build_inside_chart_cache(base, checked, active, options,
                                   invariant_constant_offset);
+}
+
+// Build a cold cache by copying compatible, immutable resident inside charts.
+// No inside recurrence runs on this path. `source_identity` must have been
+// minted for the exact grammar snapshot and active-pattern payload that
+// produced the charts; all provenance checks happen before the provider is
+// invoked.
+//
+// The provider must return `single_site_chart const&`. It is invoked once per
+// pattern as `provider(pattern_index, active_pattern)`.
+template <class ResidentChartProvider>
+  requires requires(ResidentChartProvider& provider, std::size_t index,
+                    site_pattern const& pattern) {
+    {
+      std::invoke(provider, index, pattern)
+    } -> std::same_as<single_site_chart const&>;
+  }
+inline inside_chart_cache build_inside_chart_cache_from_resident_inside(
+    clade_grammar const& destination_base,
+    checked_chart_execution_plan_ref const& destination_checked,
+    clade_grammar const& source_base,
+    checked_chart_execution_plan_ref const& source_checked,
+    inside_chart_cache_resident_source_identity const& source_identity,
+    active_site_pattern_set const& active, chart_options options,
+    std::uint64_t invariant_constant_offset,
+    ResidentChartProvider&& resident_chart_provider) {
+  source_checked.assert_same(source_base, source_checked.plan());
+  source_identity.assert_same(source_base, source_checked.plan(), active);
+  destination_checked.assert_same(destination_base, destination_checked.plan());
+  auto const& destination_plan = destination_checked.plan();
+  source_identity.assert_compatible_destination(destination_plan);
+
+  active.assert_no_skipped_invariant_metadata();
+  chart_multisite_detail::validate_multisite_inputs(destination_plan,
+                                                    active.patterns, options);
+
+  inside_chart_cache cache;
+  cache.base = &destination_base;
+  cache.base_execution_generation = destination_plan.grammar_generation();
+  cache.base_execution_fingerprint = destination_plan.fingerprint();
+  cache.chart_opts = options;
+  cache.patterns = active.patterns.patterns;
+  cache.taxon_count = active.patterns.taxon_count;
+  cache.active_pattern_fingerprint =
+      inside_chart_cache_detail::fingerprint_active_pattern_set(active);
+  cache.invariant_constant_offset = invariant_constant_offset;
+  cache.temp_clade_count = 0;
+  cache.base_rows.resize(cache.patterns.size());
+  cache.temp_rows.resize(cache.patterns.size());
+
+  for (std::size_t p = 0; p < cache.patterns.size(); ++p) {
+    single_site_chart const& chart =
+        std::invoke(resident_chart_provider, p, active.patterns.patterns[p]);
+    if (chart.inside.size() != destination_plan.clades().size()) {
+      throw std::runtime_error(
+          "inside cache resident source: chart clade count mismatch");
+    }
+    cache.base_rows[p].assign(chart.inside.begin(), chart.inside.end());
+    ++cache.build_stats.resident_inside_charts_consumed;
+  }
+  return cache;
+}
+
+// Convenience overload for the historical/same-source case. It deliberately
+// routes through the stronger source-to-destination boundary so both paths
+// share exactly the same provenance and shape checks.
+template <class ResidentChartProvider>
+  requires requires(ResidentChartProvider& provider, std::size_t index,
+                    site_pattern const& pattern) {
+    {
+      std::invoke(provider, index, pattern)
+    } -> std::same_as<single_site_chart const&>;
+  }
+inline inside_chart_cache build_inside_chart_cache_from_resident_inside(
+    clade_grammar const& base, checked_chart_execution_plan_ref const& checked,
+    inside_chart_cache_resident_source_identity const& source_identity,
+    active_site_pattern_set const& active, chart_options options,
+    std::uint64_t invariant_constant_offset,
+    ResidentChartProvider&& resident_chart_provider) {
+  return build_inside_chart_cache_from_resident_inside(
+      base, checked, base, checked, source_identity, active, options,
+      invariant_constant_offset,
+      std::forward<ResidentChartProvider>(resident_chart_provider));
 }
 
 namespace inside_chart_cache_detail {
