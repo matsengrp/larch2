@@ -29,7 +29,7 @@ in this document.
 | Phase | Status | Required evidence |
 |---|---|---|
 | 0. Repair and freeze measurement | in progress (timing deferred) | Native/oracle/runner frozen and functional gates audited; quiet-host calibration, capture, finalization, and seal pending |
-| 1. Compile an immutable chart plan | authorized after Phase-0 checkpoint | No hot-loop validation/sorting; serial speed gate remains pending until Phase-0 capture |
+| 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | Functional/counter gates pass at `208ce23`; canonical Phase-0 comparison and serial speed/no-regression gates await the sealed baseline |
 | 2. Remove allocations and duplicate work | pending | Allocation/build counters and serial speed gates |
 | 3. Add one persistent adaptive scheduler | pending | Safe one-pool orchestration and TSAN gate |
 | 4. Parallelize patterns and local scoring | pending | Deterministic positive scaling |

@@ -27,7 +27,7 @@ committed. Phase-0 artifacts use the non-overwriting directory
 | Phase | Evidence status | Result |
 |---|---|---|
 | 0. Repair and freeze measurement | in progress (timing deferred) | native/oracle/runner bytes frozen and functional gates independently audited; passing calibration, capture, finalization, and seal pending |
-| 1. Compile an immutable chart plan | authorized; not started | deadline-overlap implementation may begin; performance acceptance is blocked on the Phase-0 seal |
+| 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | code checkpoint `208ce23`; focused and full RelWithDebInfo correctness/counter gates pass; canonical baseline and timing gates remain pending |
 | 2--10 | pending | may follow in plan order under the same acceptance gate |
 
 ## Phase 0 — immutable provenance
@@ -547,6 +547,105 @@ worker-scaling ratio. Medians alone cannot hide a paired-ratio failure.
 - [x] Frozen Phase-0 capture inputs and artifacts contain no product
   performance optimization; deadline-overlap Phase-1+ working-tree changes are
   segregated and excluded from every Phase-0 executable role.
+
+## Phase 1 — immutable chart execution plan
+
+### Implementation checkpoint
+
+| Field | Value |
+|---|---|
+| Code revision | `208ce23f0c005d3702d114f535fe21564b3b79b6` (`Compile immutable chart execution plan`) |
+| Baseline parent | `7ca527b8906d018124756182274335cbff936d72` (`Baseline measure`) |
+| Build directory/type | `build/`; `RelWithDebInfo` |
+| Compiler | `/home/ogi-agent/install/gcc-trunk/bin/g++-trunk`; `g++-trunk (GCC) 17.0.0 20260530 (experimental)` |
+| Optimization flags | `-O2 -g -DNDEBUG` |
+| Functional-run dirty state | product, test, and tool tree exactly at `208ce23`; only this plan/results documentation was unstaged |
+| Raw functional evidence | `build/wric-chart-parallelization/phase1-functional-20260714-208ce23/` |
+
+The checkpoint adds an immutable generation/fingerprint-bound chart execution
+plan with canonical inside/outside orders, dependency levels, flat production
+and child descriptors, binary metadata, a checked generic-arity path, and the
+shared four-state transition table. Dense, lazy, exact-trim, local-score, and
+inside/outside cache paths consume the plan. Search states own the resident
+plan; fresh exact, transient, accepted-tip, and final-compaction grammars are
+published with a fresh generation and their plan as one checked result.
+
+Candidate preparation publishes a private, base-pointer-free, const execution
+descriptor. Its raw and compiled arrays cannot diverge after publication, and
+four simultaneous readers were tested with independent row scratch. Standalone
+public APIs retain their full checked boundary. Inside an immutable acceptance
+epoch an opaque grammar/plan capability is minted once and then propagated
+through candidate generation, local scoring, exact verification, cache
+construction, transient extension, and commit preparation.
+
+Validation accounting distinguishes resident fingerprint scans, legacy index
+checks, output-plan partition checks, candidate-plan checks, dynamic overlay
+payload checks, and the candidate-by-pattern recurrence region. Dynamic
+payload validation includes unreachable temporary productions and is preserved
+on exceptional materialization exits. The planned materializer callback
+overloads are constrained, so literal-null stats arguments select the intended
+non-callback API.
+
+### Mechanical counter and semantic evidence
+
+The focused tests establish all of the following without timing inference:
+
+- one full compatibility/fingerprint scan per resident acceptance iteration,
+  independent of candidate batch size and exact top-K work;
+- zero full grammar validations, production-partition validations, and
+  clade-order sorts in candidate-by-pattern scoring;
+- one candidate execution-plan build per prepared candidate and reuse across
+  its patterns;
+- fresh grammar generations and exactly one output plan for planned
+  candidate/chain materialization;
+- stale same-generation grammar mutation, wrong generation, wrong fingerprint,
+  moved-from plan, and wrong resident identity rejection before recurrence
+  work;
+- validation of every dynamic temporary production, including invalid
+  unreachable payload, with success and failure counts retained separately;
+- dense/lazy, binary/multifurcating, exact optimum, keep-mask, fluidity, tied
+  provenance, cache, chain, and canonical-report equivalence on the existing
+  oracle fixtures.
+
+### Reproducible functional commands
+
+```sh
+cmake --build build --target \
+  parsimony_chart_test chart_parallel_test chart_trim_test chart_spr_test \
+  chart_spr_search_test overlay_chain_test chart_two_chart_oracle_test \
+  multifurcation_chart_oracle_test inside_chart_cache_test \
+  outside_chart_cache_test chart_spr_semantic_report_test dagutil --parallel 4
+
+ctest --test-dir build \
+  -R '^(parsimony_chart_test|chart_parallel_test|chart_trim_test|chart_spr_test|chart_spr_search_test|overlay_chain_test|chart_two_chart_oracle_test|multifurcation_chart_oracle_test|inside_chart_cache_test|outside_chart_cache_test|chart_spr_semantic_report_test)$' \
+  --output-on-failure
+
+cmake --build build --parallel 4
+ctest --test-dir build --output-on-failure --parallel 4
+```
+
+The final targeted rerun passed 11/11 tests with zero failures in 45.70
+seconds. Its copied `LastTest.log` SHA-256 is
+`200b719bc488ce390f88bf12cda546ff1dcefe2ac3cdab56bfe2e32c00bfe20c`.
+
+The final full RelWithDebInfo run passed all 156 registered tests with zero
+failures in 114.90 seconds. The two pre-existing optional external-data
+diagnostics, `merge_consistency_test` and `rotaA_diagnostic_test`, returned
+their established skip status. The copied full `LastTest.log` SHA-256 is
+`71f1168c4165fa2bc1e51459f786a37169f6f920eb0f71eeea377eeb0883bfa6`.
+
+### Phase-1 exit decision
+
+| Exit criterion | Decision |
+|---|---|
+| Zero candidate-by-pattern full validation and clade sorting | pass, mechanically asserted |
+| Targeted and full RelWithDebInfo CTest | pass |
+| Canonical semantic equality to sealed Phase 0 | pending Phase-0 capture/seal; in-tree independent semantic oracles pass |
+| Medium one-worker local-score target and <=5% chart-phase regressions | pending Phase-0 capture/seal |
+
+Phase 1 is therefore **implementation complete; acceptance pending Phase 0**.
+No timing, scaling, RSS, or final parity claim is made from the deadline-overlap
+worktree.
 
 ## Later-phase evidence template
 
