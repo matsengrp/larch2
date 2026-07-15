@@ -1470,11 +1470,44 @@ contracts, dense/lazy and materialized per-pattern oracles, multifurcations,
 local SPR scoring, and fixed-topology selected-row behavior. `git diff --check`
 and changed-line `git clang-format --diff` are clean.
 
-This is not a Phase-7 exit decision. Dependency-level lazy inside/outside
-wavefronts, bounded transient scratch admission, allocation-free admitted
-candidate kernels, within-clade staging where required by scaling, explicit
-`off|on|auto` policy/reporting, complete dense/lazy canonical equivalence,
-ASAN/TSAN/full-CTest, and every sealed performance/RSS gate remain pending.
+This is not a Phase-7 exit decision. At that packed-grouping checkpoint,
+dependency-level lazy inside/outside wavefronts, bounded transient scratch
+admission, allocation-free admitted candidate kernels, within-clade staging
+where required by scaling, explicit `off|on|auto` policy/reporting, complete
+dense/lazy canonical equivalence, ASAN/TSAN/full-CTest, and every sealed
+performance/RSS gate remained pending. The next subsection records the first
+of those later implementation units without changing the exit decision.
+
+### Dependency-wavefront checkpoint
+
+Commit `a8abc49` (`Schedule lazy chart dependency wavefronts`) replaces the
+trusted-plan lazy inside and outside serial traversals used by chart-SPR state
+construction with dependency-level operations on the one persistent chart
+scheduler. Inside tasks publish disjoint clades from immutable child levels;
+outside root initialization remains serial and non-root tasks publish disjoint
+clades in top-down levels. Sparse child-map dependency consumption and all
+global recurrence/collision counter folds remain coordinator-only after the
+complete level joins. State construction releases retained inside grouping
+scratch before preparing outside scratch and releases outside scratch after
+the build.
+
+The focused semantic matrix covers workers `1,2,4,8`, a repeated W8 run,
+at-least-four-worker simultaneous progress, reference-edge outside scoring,
+multifurcations, a root-only grammar, stable dual inside and outside failures,
+partial scheduler submission followed by same-scheduler retry, and a shared
+internal child whose sparse maps remain readable through both same-level
+parents and are reclaimed only at the level barrier. Lazy inside/outside clade
+axes are included in scheduler reconciliation and the dagutil report.
+
+On the clean current main worktree, the GCC-trunk RelWithDebInfo command
+`ctest --test-dir build --output-on-failure -R
+'^(chart_parallel_test|chart_spr_search_test|multifurcation_chart_oracle_test|lazy_key_grouping_test)$'`
+passed 4/4 tests in 7.71 seconds; `dagutil` compiled, `git diff --check` was
+clean, and changed-line clang-format reported no edits. This is an unsealed
+functional checkpoint, not a timing or Phase-7 exit claim. Finite state-build
+transient admission, allocation-free candidate-local admission, within-clade
+staging/profile evidence, automatic policy, sanitizer gates, full CTest, RSS,
+and all deferred Phase-0-dependent measurements remain pending.
 
 ## Later-phase evidence template
 
