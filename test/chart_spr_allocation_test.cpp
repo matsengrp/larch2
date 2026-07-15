@@ -23,6 +23,7 @@
 #include <limits>
 #include <new>
 #include <print>
+#include <random>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -1185,6 +1186,146 @@ static void test_warmed_dense_local_scoring_is_allocation_free() {
   std::println("  PASS");
 }
 
+static std::size_t
+test_sampled_tree_projection_nested_witness_capacity_walkers() {
+  std::println("test_sampled_tree_projection_nested_witness_capacity_walkers");
+  larch::grammar_spr_candidate candidate;
+  candidate.added_productions.emplace_back();
+  auto& production = candidate.added_productions.back();
+  production.children.reserve(3);
+  production.witnesses.resize(2);
+  for (auto& witness : production.witnesses) {
+    witness.children.resize(2);
+    for (auto& child : witness.children) {
+      child.edge_alternatives.reserve(3);
+    }
+  }
+
+  auto production_capacity =
+      production.children.capacity() * sizeof(larch::overlay_clade_ref) +
+      production.witnesses.capacity() * sizeof(larch::production_witness);
+  for (auto const& witness : production.witnesses) {
+    production_capacity +=
+        witness.children.capacity() * sizeof(larch::production_child_witness);
+    for (auto const& child : witness.children) {
+      production_capacity +=
+          child.edge_alternatives.capacity() * sizeof(std::size_t);
+    }
+  }
+  CHECK(production_capacity >
+        production.witnesses.capacity() * sizeof(larch::production_witness));
+
+  auto const expected_candidate_capacity =
+      candidate.added_productions.capacity() *
+          sizeof(larch::overlay_grammar_production) +
+      production_capacity;
+  bool candidate_safely_bounded = true;
+  CHECK(
+      larch::chart_spr_detail::sampled_tree_projection_candidate_capacity_bytes(
+          candidate, candidate_safely_bounded) == expected_candidate_capacity);
+  CHECK(candidate_safely_bounded);
+
+  larch::chart_spr_detail::sampled_tree_projection_output_slot output;
+  output.spare_added_productions.push_back(
+      std::move(candidate.added_productions.back()));
+  auto const expected_output_capacity =
+      output.spare_added_productions.capacity() *
+          sizeof(larch::overlay_grammar_production) +
+      production_capacity;
+  bool output_safely_bounded = true;
+  CHECK(larch::chart_spr_detail::sampled_tree_projection_output_capacity_bytes(
+            output, output_safely_bounded) == expected_output_capacity);
+  CHECK(output_safely_bounded);
+  std::println("  PASS ({} nested retained bytes)", production_capacity);
+  return expected_output_capacity;
+}
+
+static void test_warmed_direct_projection_reuses_dominant_storage(
+    std::size_t nested_witness_output_capacity) {
+  std::println("test_warmed_direct_projection_reuses_dominant_storage");
+  auto dag = larch::load_proto_dag(k_dense_fixture_path);
+  larch::recompute_compact_genomes(dag);
+  larch::set_sample_ids_from_cg(dag);
+  larch::polytomy_refinement_options refinement_options;
+  refinement_options.mode = larch::polytomy_mode::expand_soft_bounded;
+  refinement_options.max_shapes_per_polytomy = 1;
+  auto refinement = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, refinement_options);
+  larch::require_polytomy_refinement_binary_charting(
+      refinement.audit, "chart SPR direct allocation gate");
+
+  larch::grammar_spr_enumeration_options options;
+  options.source = larch::chart_spr_candidate_source::sampled_tree;
+  options.sampled_tree_source_dag = &dag;
+  options.sampled_tree_count = 1;
+  options.sampled_tree_spr_radius = 0;
+  options.seed = 1;
+  std::mt19937 rng(options.seed);
+  auto tree = larch::chart_spr_detail::build_sampled_tree_from_grammar(
+      refinement.grammar, options, 0, rng);
+  auto radius = larch::compute_tree_max_depth(tree) * 2;
+  if (radius == 0) radius = 1;
+  auto projection = larch::chart_spr_detail::prepare_sampled_tree_projection(
+      refinement.grammar, tree);
+  auto preassignment =
+      larch::chart_spr_detail::preassign_sampled_tree_projection_jobs(
+          projection, options, radius, rng);
+  constexpr std::size_t observed_move_count = 416;
+  CHECK(preassignment.jobs.size() >= observed_move_count);
+  auto const jobs = std::span{preassignment.jobs}.first(observed_move_count);
+
+  larch::chart_spr_detail::sampled_tree_direct_workspace workspace;
+  larch::chart_spr_detail::sampled_tree_projection_output_slot output;
+  std::size_t warm_candidates = 0;
+  for (auto const& job : jobs) {
+    larch::chart_spr_detail::project_sampled_tree_move_with_path_into(
+        projection, job.move, workspace, output);
+    CHECK(output.path ==
+          larch::chart_spr_detail::sampled_tree_projection_path::direct);
+    warm_candidates += output.engaged ? 1 : 0;
+  }
+  CHECK(warm_candidates == 411);
+
+  bool capacity_safely_bounded = true;
+  auto const workspace_capacity =
+      larch::chart_spr_detail::sampled_tree_projection_workspace_capacity_bytes(
+          workspace, capacity_safely_bounded);
+  auto const output_capacity =
+      larch::chart_spr_detail::sampled_tree_projection_output_capacity_bytes(
+          output, capacity_safely_bounded);
+  auto const estimate =
+      larch::chart_spr_detail::estimate_sampled_tree_projection_memory(
+          projection, nullptr, jobs.size(), 1, 0);
+  CHECK(capacity_safely_bounded);
+  CHECK(workspace_capacity > 0);
+  CHECK(output_capacity > 0);
+  CHECK(workspace_capacity <= estimate.stable_slot_scratch_bytes);
+  CHECK(output_capacity <= estimate.retained_output_bytes);
+  CHECK(nested_witness_output_capacity <= estimate.retained_output_bytes);
+
+  allocation_test::allocation_observer observer;
+  std::size_t observed_candidates = 0;
+  {
+    allocation_test::scoped_allocation_observation observation{observer};
+    for (auto const& job : jobs) {
+      larch::chart_spr_detail::project_sampled_tree_move_with_path_into(
+          projection, job.move, workspace, output);
+      CHECK(output.path ==
+            larch::chart_spr_detail::sampled_tree_projection_path::direct);
+      observed_candidates += output.engaged ? 1 : 0;
+    }
+  }
+  CHECK(observed_candidates == warm_candidates);
+  // The retained path intentionally leaves general-candidate validation as a
+  // later optimization.  These strict bounds reject regressions to the former
+  // 1,512 calls / 82 KiB per move while allowing allocator implementation
+  // details in that remaining validation stage.
+  CHECK(observer.statistics.calls <= jobs.size() * 220);
+  CHECK(observer.statistics.requested_bytes <= jobs.size() * 17 * 1024);
+  std::println("  PASS ({} calls, {} requested bytes)",
+               observer.statistics.calls, observer.statistics.requested_bytes);
+}
+
 static void test_published_state_estimators_are_allocation_free() {
   std::println("test_published_state_estimators_are_allocation_free");
 
@@ -1557,6 +1698,10 @@ int main() {
   test_published_state_estimators_are_allocation_free();
   test_prepared_lazy_local_core_is_allocation_free();
   test_warmed_dense_local_scoring_is_allocation_free();
+  auto const nested_witness_output_capacity =
+      test_sampled_tree_projection_nested_witness_capacity_walkers();
+  test_warmed_direct_projection_reuses_dominant_storage(
+      nested_witness_output_capacity);
 
   std::println(
       "All chart-SPR allocation observer and dense scoring tests passed!");

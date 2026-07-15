@@ -1100,8 +1100,31 @@ static void test_phase8_projection_budget_and_failure_atomicity() {
       larch::chart_spr_detail::estimate_sampled_tree_projection_memory(
           prepared, &exact_scheduler, baseline_preassignment.jobs.size(), 1, 0);
   CHECK(exact_estimate.safely_bounded);
+  bool retained_witness_safely_bounded = true;
+  auto const retained_witness_bytes = larch::chart_spr_detail::
+      estimate_sampled_tree_projection_retained_witness_bytes(
+          prepared, retained_witness_safely_bounded);
+  CHECK(retained_witness_safely_bounded);
+  CHECK(retained_witness_bytes > 0);
+  // One ordinal retains both the active candidate and its spare high-water
+  // pool.  This seam makes the exact E/E-1 admission boundary below depend on
+  // nested witness-child and edge-alternative storage.
+  CHECK(exact_estimate.retained_output_bytes >= 2 * retained_witness_bytes);
   auto const exact_budget = exact_estimate.required_peak_bytes;
   CHECK(exact_budget > 0);
+  auto const nested_retained_charge = 2 * retained_witness_bytes;
+  CHECK(exact_budget > nested_retained_charge);
+  bool nested_backstop_rejected = false;
+  try {
+    (void)larch::chart_spr_detail::admit_sampled_tree_projection_memory(
+        prepared, &exact_scheduler, baseline_preassignment.jobs.size(), 0,
+        exact_budget - nested_retained_charge);
+  } catch (larch::sampled_tree_projection_budget_error const& error) {
+    nested_backstop_rejected = true;
+    CHECK(error.required_bytes() == exact_budget);
+    CHECK(error.budget_bytes() == exact_budget - nested_retained_charge);
+  }
+  CHECK(nested_backstop_rejected);
   std::size_t exact_workspace_hooks = 0;
   exact_options.sampled_tree_projection_memory_budget_bytes = exact_budget;
   exact_options.before_sampled_tree_projection_workspace_allocation_for_tests =
