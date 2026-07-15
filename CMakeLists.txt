@@ -218,6 +218,9 @@ foreach(test_name chain_test dag_test hash_chain_test extend_dag_test
     target_include_directories(${test_name} PRIVATE include)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
+target_sources(lazy_key_grouping_test
+               PRIVATE test/chart_spr_allocation_overrides.cpp)
+target_include_directories(lazy_key_grouping_test PRIVATE test)
 
 # Tests that need Threads::Threads only
 foreach(test_name rf_distance_test thread_pool_test validate_dag_test)
