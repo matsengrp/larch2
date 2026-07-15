@@ -3,8 +3,8 @@
 # doc/WRIC-CHART-SPR-SEARCH-COUNTER-BASELINE.md from
 # tools/wric_counter_baseline.cpp, WITHOUT touching the surrounding prose.
 #
-# Why a splice and not a plain redirect: the generator emits only the ~70-line
-# snapshot block; the checked-in doc is ~150 lines of hand-written prose
+# Why a splice and not a plain redirect: the generator emits only the counter
+# snapshot block; the checked-in doc also has hand-written prose
 # (How to regenerate / Configuration / What later phases check / Note) wrapping
 # that block.  Redirecting the generator over the doc (`> doc/...md`) would
 # silently delete all of that prose.  This script instead replaces ONLY the

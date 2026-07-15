@@ -609,6 +609,39 @@ void chart_spr_add_search_state_rebuild_counters(
   accumulated.lazy_structural_class_count_max = std::max(
       accumulated.lazy_structural_class_count_max,
       rebuild_counters.lazy_structural_class_count_max);
+  accumulated.lazy_chart_memory_budget_bytes =
+      std::max(accumulated.lazy_chart_memory_budget_bytes,
+               rebuild_counters.lazy_chart_memory_budget_bytes);
+  accumulated.lazy_chart_inside_max_admitted_slots =
+      std::max(accumulated.lazy_chart_inside_max_admitted_slots,
+               rebuild_counters.lazy_chart_inside_max_admitted_slots);
+  accumulated.lazy_chart_outside_max_admitted_slots =
+      std::max(accumulated.lazy_chart_outside_max_admitted_slots,
+               rebuild_counters.lazy_chart_outside_max_admitted_slots);
+  accumulated.lazy_chart_inside_admission_waves +=
+      rebuild_counters.lazy_chart_inside_admission_waves;
+  accumulated.lazy_chart_outside_admission_waves +=
+      rebuild_counters.lazy_chart_outside_admission_waves;
+  accumulated.lazy_chart_inside_memory_limited_levels +=
+      rebuild_counters.lazy_chart_inside_memory_limited_levels;
+  accumulated.lazy_chart_outside_memory_limited_levels +=
+      rebuild_counters.lazy_chart_outside_memory_limited_levels;
+  accumulated.lazy_chart_inside_reused_slot_waves +=
+      rebuild_counters.lazy_chart_inside_reused_slot_waves;
+  accumulated.lazy_chart_outside_reused_slot_waves +=
+      rebuild_counters.lazy_chart_outside_reused_slot_waves;
+  accumulated.lazy_chart_inside_workspace_evictions +=
+      rebuild_counters.lazy_chart_inside_workspace_evictions;
+  accumulated.lazy_chart_outside_workspace_evictions +=
+      rebuild_counters.lazy_chart_outside_workspace_evictions;
+  accumulated.lazy_chart_preflight_peak_bytes =
+      std::max(accumulated.lazy_chart_preflight_peak_bytes,
+               rebuild_counters.lazy_chart_preflight_peak_bytes);
+  accumulated.lazy_chart_actual_peak_bytes =
+      std::max(accumulated.lazy_chart_actual_peak_bytes,
+               rebuild_counters.lazy_chart_actual_peak_bytes);
+  accumulated.lazy_chart_pre_submit_rejections +=
+      rebuild_counters.lazy_chart_pre_submit_rejections;
   if (update_current_skipped_invariant_sites) {
     accumulated.skipped_invariant_sites =
         rebuild_counters.skipped_invariant_sites;
@@ -4434,6 +4467,33 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.lazy_incremental_rows_recomputed;
   summary.lazy_structural_class_count_max =
       counters.lazy_structural_class_count_max;
+  summary.lazy_chart_memory_budget_bytes =
+      counters.lazy_chart_memory_budget_bytes;
+  summary.lazy_chart_inside_max_admitted_slots =
+      counters.lazy_chart_inside_max_admitted_slots;
+  summary.lazy_chart_outside_max_admitted_slots =
+      counters.lazy_chart_outside_max_admitted_slots;
+  summary.lazy_chart_inside_admission_waves =
+      counters.lazy_chart_inside_admission_waves;
+  summary.lazy_chart_outside_admission_waves =
+      counters.lazy_chart_outside_admission_waves;
+  summary.lazy_chart_inside_memory_limited_levels =
+      counters.lazy_chart_inside_memory_limited_levels;
+  summary.lazy_chart_outside_memory_limited_levels =
+      counters.lazy_chart_outside_memory_limited_levels;
+  summary.lazy_chart_inside_reused_slot_waves =
+      counters.lazy_chart_inside_reused_slot_waves;
+  summary.lazy_chart_outside_reused_slot_waves =
+      counters.lazy_chart_outside_reused_slot_waves;
+  summary.lazy_chart_inside_workspace_evictions =
+      counters.lazy_chart_inside_workspace_evictions;
+  summary.lazy_chart_outside_workspace_evictions =
+      counters.lazy_chart_outside_workspace_evictions;
+  summary.lazy_chart_preflight_peak_bytes =
+      counters.lazy_chart_preflight_peak_bytes;
+  summary.lazy_chart_actual_peak_bytes = counters.lazy_chart_actual_peak_bytes;
+  summary.lazy_chart_pre_submit_rejections =
+      counters.lazy_chart_pre_submit_rejections;
   summary.local_commit_two_chart_oracle_runs =
       counters.local_commit_two_chart_oracle_runs;
   summary.local_commit_tip_grammar_refreshes =

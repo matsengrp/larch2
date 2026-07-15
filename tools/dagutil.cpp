@@ -3219,6 +3219,34 @@ static void print_chart_spr_search_counter_fields(
         << counters.lazy_incremental_rows_recomputed << "\n";
     out << indent << "lazy_structural_class_count_max: "
         << counters.lazy_structural_class_count_max << "\n";
+    out << indent << "lazy_chart_memory_budget_bytes: "
+        << counters.lazy_chart_memory_budget_bytes << "\n";
+    out << indent << "lazy_chart_inside_max_admitted_slots: "
+        << counters.lazy_chart_inside_max_admitted_slots << "\n";
+    out << indent << "lazy_chart_outside_max_admitted_slots: "
+        << counters.lazy_chart_outside_max_admitted_slots << "\n";
+    out << indent << "lazy_chart_inside_admission_waves: "
+        << counters.lazy_chart_inside_admission_waves << "\n";
+    out << indent << "lazy_chart_outside_admission_waves: "
+        << counters.lazy_chart_outside_admission_waves << "\n";
+    out << indent << "lazy_chart_inside_memory_limited_levels: "
+        << counters.lazy_chart_inside_memory_limited_levels << "\n";
+    out << indent << "lazy_chart_outside_memory_limited_levels: "
+        << counters.lazy_chart_outside_memory_limited_levels << "\n";
+    out << indent << "lazy_chart_inside_reused_slot_waves: "
+        << counters.lazy_chart_inside_reused_slot_waves << "\n";
+    out << indent << "lazy_chart_outside_reused_slot_waves: "
+        << counters.lazy_chart_outside_reused_slot_waves << "\n";
+    out << indent << "lazy_chart_inside_workspace_evictions: "
+        << counters.lazy_chart_inside_workspace_evictions << "\n";
+    out << indent << "lazy_chart_outside_workspace_evictions: "
+        << counters.lazy_chart_outside_workspace_evictions << "\n";
+    out << indent << "lazy_chart_preflight_peak_bytes: "
+        << counters.lazy_chart_preflight_peak_bytes << "\n";
+    out << indent << "lazy_chart_actual_peak_bytes: "
+        << counters.lazy_chart_actual_peak_bytes << "\n";
+    out << indent << "lazy_chart_pre_submit_rejections: "
+        << counters.lazy_chart_pre_submit_rejections << "\n";
   }
   out << indent << "local_commit_two_chart_oracle_runs: "
       << counters.local_commit_two_chart_oracle_runs << "\n";
@@ -4334,6 +4362,34 @@ static void run_chart_spr_search_diagnostic(
         << search.summary.lazy_incremental_rows_recomputed << "\n";
     out << "  lazy_structural_class_count_max: "
         << search.summary.lazy_structural_class_count_max << "\n";
+    out << "  lazy_chart_memory_budget_bytes: "
+        << search.summary.lazy_chart_memory_budget_bytes << "\n";
+    out << "  lazy_chart_inside_max_admitted_slots: "
+        << search.summary.lazy_chart_inside_max_admitted_slots << "\n";
+    out << "  lazy_chart_outside_max_admitted_slots: "
+        << search.summary.lazy_chart_outside_max_admitted_slots << "\n";
+    out << "  lazy_chart_inside_admission_waves: "
+        << search.summary.lazy_chart_inside_admission_waves << "\n";
+    out << "  lazy_chart_outside_admission_waves: "
+        << search.summary.lazy_chart_outside_admission_waves << "\n";
+    out << "  lazy_chart_inside_memory_limited_levels: "
+        << search.summary.lazy_chart_inside_memory_limited_levels << "\n";
+    out << "  lazy_chart_outside_memory_limited_levels: "
+        << search.summary.lazy_chart_outside_memory_limited_levels << "\n";
+    out << "  lazy_chart_inside_reused_slot_waves: "
+        << search.summary.lazy_chart_inside_reused_slot_waves << "\n";
+    out << "  lazy_chart_outside_reused_slot_waves: "
+        << search.summary.lazy_chart_outside_reused_slot_waves << "\n";
+    out << "  lazy_chart_inside_workspace_evictions: "
+        << search.summary.lazy_chart_inside_workspace_evictions << "\n";
+    out << "  lazy_chart_outside_workspace_evictions: "
+        << search.summary.lazy_chart_outside_workspace_evictions << "\n";
+    out << "  lazy_chart_preflight_peak_bytes: "
+        << search.summary.lazy_chart_preflight_peak_bytes << "\n";
+    out << "  lazy_chart_actual_peak_bytes: "
+        << search.summary.lazy_chart_actual_peak_bytes << "\n";
+    out << "  lazy_chart_pre_submit_rejections: "
+        << search.summary.lazy_chart_pre_submit_rejections << "\n";
     out << "  lazy_internal_structural_class_count_max: "
         << search.summary.lazy_internal_structural_class_count_max << "\n";
     out << "  lazy_merge_ratio: " << std::fixed << std::setprecision(6)

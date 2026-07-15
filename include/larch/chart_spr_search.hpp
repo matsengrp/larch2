@@ -461,6 +461,24 @@ struct chart_spr_search_counters {
   std::size_t lazy_outside_rows_recomputed_on_commit = 0;
   std::size_t lazy_incremental_rows_recomputed = 0;
   std::size_t lazy_structural_class_count_max = 0;
+  // Phase-7 finite state-build admission. The inside/outside maxima expose the
+  // actual scratch-slot concurrency selected under the unified live envelope;
+  // peaks include retained state, resident chart/output, coordinator arrays,
+  // and measured scratch capacities.
+  std::size_t lazy_chart_memory_budget_bytes = 0;
+  std::size_t lazy_chart_inside_max_admitted_slots = 0;
+  std::size_t lazy_chart_outside_max_admitted_slots = 0;
+  std::size_t lazy_chart_inside_admission_waves = 0;
+  std::size_t lazy_chart_outside_admission_waves = 0;
+  std::size_t lazy_chart_inside_memory_limited_levels = 0;
+  std::size_t lazy_chart_outside_memory_limited_levels = 0;
+  std::size_t lazy_chart_inside_reused_slot_waves = 0;
+  std::size_t lazy_chart_outside_reused_slot_waves = 0;
+  std::size_t lazy_chart_inside_workspace_evictions = 0;
+  std::size_t lazy_chart_outside_workspace_evictions = 0;
+  std::size_t lazy_chart_preflight_peak_bytes = 0;
+  std::size_t lazy_chart_actual_peak_bytes = 0;
+  std::size_t lazy_chart_pre_submit_rejections = 0;
   // Number of times the Phase-4 self-check two-chart oracle ran after a local
   // commit (only when verify_local_commit_two_chart_oracle_for_tests is set).
   std::size_t local_commit_two_chart_oracle_runs = 0;
@@ -1670,6 +1688,20 @@ struct chart_spr_search_summary {
   std::size_t lazy_outside_rows_recomputed_on_commit = 0;
   std::size_t lazy_incremental_rows_recomputed = 0;
   std::size_t lazy_structural_class_count_max = 0;
+  std::size_t lazy_chart_memory_budget_bytes = 0;
+  std::size_t lazy_chart_inside_max_admitted_slots = 0;
+  std::size_t lazy_chart_outside_max_admitted_slots = 0;
+  std::size_t lazy_chart_inside_admission_waves = 0;
+  std::size_t lazy_chart_outside_admission_waves = 0;
+  std::size_t lazy_chart_inside_memory_limited_levels = 0;
+  std::size_t lazy_chart_outside_memory_limited_levels = 0;
+  std::size_t lazy_chart_inside_reused_slot_waves = 0;
+  std::size_t lazy_chart_outside_reused_slot_waves = 0;
+  std::size_t lazy_chart_inside_workspace_evictions = 0;
+  std::size_t lazy_chart_outside_workspace_evictions = 0;
+  std::size_t lazy_chart_preflight_peak_bytes = 0;
+  std::size_t lazy_chart_actual_peak_bytes = 0;
+  std::size_t lazy_chart_pre_submit_rejections = 0;
   std::size_t lazy_internal_structural_class_count_max = 0;
   double lazy_merge_ratio = 0.0;
   double lazy_internal_structural_class_ratio = 0.0;
@@ -2963,6 +2995,19 @@ inline void finalize_deferred_pattern_batch_bootstrap(
 
 }  // namespace chart_spr_search_detail
 
+namespace chart_spr_search_detail {
+
+inline std::size_t estimate_owned_string_capacity_bytes(
+    std::string const& value, std::string_view context) {
+  // The terminating null is owned storage too. Charging cap+1 is also a
+  // conservative allowance for SSO strings whose inline object bytes are
+  // already present in the surrounding vector/node capacity.
+  return chart_spr_exact_candidate_checked_bytes_add(value.capacity(), 1,
+                                                     context);
+}
+
+}  // namespace chart_spr_search_detail
+
 inline std::size_t estimate_chart_spr_pattern_cache_bytes(
     chart_spr_search_state const& state) {
   auto checked_add = [](std::size_t lhs, std::size_t rhs) {
@@ -3028,6 +3073,150 @@ inline std::size_t estimate_chart_spr_pattern_cache_bytes(
   return total;
 }
 
+// Resident storage already owned by a partially constructed search state and
+// overlapping lazy inside/outside construction.  The DAG is non-owning here;
+// all owning grammar, immutable-plan, active-pattern, and state buffers are
+// charged from allocator-selected capacities.
+inline std::size_t estimate_chart_spr_lazy_state_build_retained_bytes(
+    chart_spr_search_state const& state) {
+  auto add = [](std::size_t lhs, std::size_t rhs, std::string_view context) {
+    return chart_spr_exact_candidate_checked_bytes_add(lhs, rhs, context);
+  };
+  auto capacity_bytes = [](auto const& values, std::string_view context) {
+    using vector_type = std::remove_cvref_t<decltype(values)>;
+    return chart_spr_exact_candidate_checked_bytes_multiply(
+        values.capacity(), sizeof(typename vector_type::value_type), context);
+  };
+  std::size_t total = sizeof(state);
+  auto add_vector = [&](auto const& values, std::string_view context) {
+    total = add(total, capacity_bytes(values, context),
+                "chart SPR lazy retained state");
+  };
+
+  auto const& grammar = state.grammar;
+  add_vector(grammar.taxa.id_to_sample_id, "chart SPR retained taxon names");
+  for (auto const& name : grammar.taxa.id_to_sample_id) {
+    total = add(total,
+                chart_spr_search_detail::estimate_owned_string_capacity_bytes(
+                    name, "chart SPR retained taxon strings"),
+                "chart SPR retained taxon strings");
+  }
+  // unordered_map node/bucket allocation is not exposed directly by the
+  // standard library.  Charge the observable bucket array plus a conservative
+  // node envelope and each stored key's selected capacity.
+  total = add(total,
+              chart_spr_exact_candidate_checked_bytes_multiply(
+                  grammar.taxa.sample_id_to_id.bucket_count(), sizeof(void*),
+                  "chart SPR retained taxon hash buckets"),
+              "chart SPR lazy retained state");
+  total = add(
+      total,
+      chart_spr_exact_candidate_checked_bytes_multiply(
+          grammar.taxa.sample_id_to_id.size(),
+          sizeof(std::pair<std::string const, taxon_id>) + 2 * sizeof(void*),
+          "chart SPR retained taxon hash nodes"),
+      "chart SPR lazy retained state");
+  for (auto const& [name, unused_taxon] : grammar.taxa.sample_id_to_id) {
+    (void)unused_taxon;
+    total = add(total,
+                chart_spr_search_detail::estimate_owned_string_capacity_bytes(
+                    name, "chart SPR retained taxon hash strings"),
+                "chart SPR retained taxon hash strings");
+  }
+  add_vector(grammar.clades, "chart SPR retained clades");
+  for (auto const& clade : grammar.clades) {
+    total =
+        add(total, capacity_bytes(clade.taxa, "chart SPR retained clade taxa"),
+            "chart SPR lazy retained state");
+  }
+  add_vector(grammar.productions, "chart SPR retained productions");
+  for (auto const& production : grammar.productions) {
+    total = add(total,
+                capacity_bytes(production.children,
+                               "chart SPR retained production children"),
+                "chart SPR lazy retained state");
+    total = add(total,
+                capacity_bytes(production.witnesses,
+                               "chart SPR retained production witnesses"),
+                "chart SPR lazy retained state");
+    for (auto const& witness : production.witnesses) {
+      total = add(total,
+                  capacity_bytes(witness.children,
+                                 "chart SPR retained witness children"),
+                  "chart SPR lazy retained state");
+      for (auto const& child : witness.children) {
+        total = add(total,
+                    capacity_bytes(child.edge_alternatives,
+                                   "chart SPR retained witness edges"),
+                    "chart SPR lazy retained state");
+      }
+    }
+  }
+  auto add_nested = [&](auto const& nested, std::string_view context) {
+    add_vector(nested, context);
+    for (auto const& values : nested) {
+      total = add(total, capacity_bytes(values, context),
+                  "chart SPR lazy retained state");
+    }
+  };
+  add_nested(grammar.productions_by_parent,
+             "chart SPR retained productions by parent");
+  add_nested(grammar.productions_by_child,
+             "chart SPR retained productions by child");
+  add_vector(grammar.node_to_clade, "chart SPR retained node map");
+  total = add(total, state.execution_plan.dynamic_capacity_bytes(),
+              "chart SPR retained execution plan");
+
+  auto const& patterns = state.active_patterns.patterns;
+  add_vector(patterns.patterns, "chart SPR retained patterns");
+  for (auto const& pattern : patterns.patterns) {
+    total = add(total,
+                capacity_bytes(pattern.state_by_taxon,
+                               "chart SPR retained pattern states"),
+                "chart SPR lazy retained state");
+    total = add(total,
+                capacity_bytes(pattern.positions,
+                               "chart SPR retained pattern positions"),
+                "chart SPR lazy retained state");
+  }
+  add_vector(patterns.original_site_to_pattern,
+             "chart SPR retained site-pattern map");
+  add_vector(patterns.normalized_binary_patterns,
+             "chart SPR retained normalized patterns");
+  for (auto const& pattern : patterns.normalized_binary_patterns) {
+    total = add(total,
+                capacity_bytes(pattern.state_by_taxon,
+                               "chart SPR retained normalized states"),
+                "chart SPR lazy retained state");
+    total = add(total,
+                capacity_bytes(pattern.positions,
+                               "chart SPR retained normalized positions"),
+                "chart SPR lazy retained state");
+    total = add(total,
+                capacity_bytes(pattern.exact_pattern_indices,
+                               "chart SPR retained normalized indices"),
+                "chart SPR lazy retained state");
+    total = add(total,
+                capacity_bytes(pattern.exact_state_maps,
+                               "chart SPR retained normalized state maps"),
+                "chart SPR lazy retained state");
+  }
+  add_vector(patterns.exact_pattern_to_normalized_binary_pattern,
+             "chart SPR retained normalized-pattern map");
+  add_vector(patterns.exact_pattern_to_normalized_binary_state_map,
+             "chart SPR retained normalized-state map");
+  add_vector(state.pattern_charts, "chart SPR retained pattern-chart slots");
+  // make_shared co-allocates the tracker with a frozen-libstdc++ control
+  // block. The shared_ptr object itself is already inside sizeof(state); this
+  // allowance covers the tracker, strong/weak atomics, vptr/control metadata,
+  // and allocator alignment/header.
+  total = add(total,
+              sizeof(chart_spr_exact_verifier_concurrency_tracker) +
+                  4 * sizeof(void*) + 2 * sizeof(std::size_t),
+              "chart SPR retained verifier tracker/control block");
+  return total;
+}
+
 inline void add_lazy_chart_build_counters(chart_spr_search_counters& counters,
                                           lazy_multisite_chart const& chart) {
   counters.lazy_inside_rows_computed += chart.lazy_inside_rows_computed;
@@ -3039,6 +3228,35 @@ inline void add_lazy_chart_build_counters(chart_spr_search_counters& counters,
   counters.lazy_structural_class_count_max =
       std::max(counters.lazy_structural_class_count_max,
                chart.lazy_structural_class_count_max);
+}
+
+inline void add_lazy_chart_memory_report(
+    chart_spr_search_counters& counters,
+    lazy_chart_detail::plan_lazy_chart_memory_report const& report) {
+  counters.lazy_chart_memory_budget_bytes = report.memory_budget_bytes;
+  counters.lazy_chart_inside_max_admitted_slots =
+      report.inside_max_admitted_slots;
+  counters.lazy_chart_outside_max_admitted_slots =
+      report.outside_max_admitted_slots;
+  counters.lazy_chart_inside_admission_waves = report.inside_admission_waves;
+  counters.lazy_chart_outside_admission_waves = report.outside_admission_waves;
+  counters.lazy_chart_inside_memory_limited_levels =
+      report.inside_memory_limited_levels;
+  counters.lazy_chart_outside_memory_limited_levels =
+      report.outside_memory_limited_levels;
+  counters.lazy_chart_inside_reused_slot_waves =
+      report.inside_reused_slot_waves;
+  counters.lazy_chart_outside_reused_slot_waves =
+      report.outside_reused_slot_waves;
+  counters.lazy_chart_inside_workspace_evictions =
+      report.inside_workspace_evictions;
+  counters.lazy_chart_outside_workspace_evictions =
+      report.outside_workspace_evictions;
+  counters.lazy_chart_preflight_peak_bytes =
+      report.preflight_peak_capacity_resident_bytes;
+  counters.lazy_chart_actual_peak_bytes =
+      report.actual_peak_capacity_resident_bytes;
+  counters.lazy_chart_pre_submit_rejections = report.pre_submit_rejections;
 }
 
 inline std::size_t estimate_chart_spr_full_pattern_cache_bytes(
@@ -3294,15 +3512,113 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
       chart_spr_exact_candidate_checked_bytes_add(
           projected_scoring_cache_bytes, reserved_local_commit_cache_bytes,
           "chart SPR initial resident-cache admission");
+  std::size_t lazy_state_build_retained_bytes = 0;
+  auto projected_initial_live_bytes = projected_initial_resident_bytes;
+  if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart &&
+      cache.memory_budget_bytes != 0) {
+    lazy_state_build_retained_bytes =
+        estimate_chart_spr_lazy_state_build_retained_bytes(state);
+    auto const clade_count = state.execution_plan.clades().size();
+    auto maximum_inside_width = std::size_t{0};
+    for (auto clade : state.execution_plan.bottom_up_order()) {
+      if (!state.execution_plan.clade(clade).is_leaf()) {
+        maximum_inside_width =
+            std::max(maximum_inside_width,
+                     lazy_chart_detail::plan_inside_clade_row_key_width(
+                         state.execution_plan, clade));
+      }
+    }
+    auto const pattern_count = state.active_patterns.patterns.patterns.size();
+    auto inside_transient =
+        lazy_chart_detail::logical_plan_inside_coordinator_bytes(
+            clade_count, false,
+            static_cast<std::vector<chart_scheduler_run_summary> const*>(
+                nullptr));
+    inside_transient = chart_spr_exact_candidate_checked_bytes_add(
+        inside_transient,
+        lazy_chart_detail::logical_plan_inside_slot_resident_bytes(
+            pattern_count, maximum_inside_width),
+        "chart SPR lazy inside singleton preflight");
+    inside_transient = chart_spr_exact_candidate_checked_bytes_add(
+        inside_transient,
+        lazy_chart_detail::logical_plan_inside_slot_preparation_extra_bytes(
+            pattern_count),
+        "chart SPR lazy inside preparation preflight");
+    inside_transient = chart_spr_exact_candidate_checked_bytes_add(
+        inside_transient,
+        lazy_chart_detail::logical_plan_output_preparation_extra_bytes(),
+        "chart SPR lazy inside output preparation preflight");
+    inside_transient = chart_spr_exact_candidate_checked_bytes_add(
+        inside_transient,
+        sizeof(lazy_chart_detail::plan_lazy_chart_scheduler_workspace),
+        "chart SPR lazy inside workspace preflight");
+    inside_transient = chart_spr_exact_candidate_checked_bytes_add(
+        inside_transient,
+        chart_spr_exact_candidate_checked_bytes_multiply(
+            clade_count, sizeof(chart_scheduler_run_summary),
+            "chart SPR lazy inside run-summary preflight"),
+        "chart SPR lazy inside run-summary preflight");
+    auto outside_transient =
+        lazy_chart_detail::logical_plan_outside_coordinator_bytes(
+            clade_count,
+            state.execution_plan.top_down_level_offsets().size() - 1,
+            static_cast<std::vector<chart_scheduler_run_summary> const*>(
+                nullptr));
+    outside_transient = chart_spr_exact_candidate_checked_bytes_add(
+        outside_transient,
+        lazy_chart_detail::logical_plan_outside_slot_resident_bytes(
+            pattern_count, state.execution_plan.max_arity() + 1,
+            state.execution_plan.max_arity()),
+        "chart SPR lazy outside singleton preflight");
+    outside_transient = chart_spr_exact_candidate_checked_bytes_add(
+        outside_transient,
+        lazy_chart_detail::logical_plan_outside_slot_preparation_extra_bytes(),
+        "chart SPR lazy outside preparation preflight");
+    outside_transient = chart_spr_exact_candidate_checked_bytes_add(
+        outside_transient,
+        lazy_chart_detail::logical_plan_output_preparation_extra_bytes(),
+        "chart SPR lazy outside output preparation preflight");
+    outside_transient = chart_spr_exact_candidate_checked_bytes_add(
+        outside_transient,
+        sizeof(lazy_chart_detail::plan_lazy_chart_scheduler_workspace),
+        "chart SPR lazy outside workspace preflight");
+    // Outside construction overlaps both its own run-summary array and the
+    // retained inside summaries published after the preceding phase.
+    outside_transient = chart_spr_exact_candidate_checked_bytes_add(
+        outside_transient,
+        chart_spr_exact_candidate_checked_bytes_multiply(
+            clade_count, 2 * sizeof(chart_scheduler_run_summary),
+            "chart SPR lazy outside run-summary overlap preflight"),
+        "chart SPR lazy outside run-summary overlap preflight");
+    auto transient = options.score_ua_edge
+                         ? inside_transient
+                         : std::max(inside_transient, outside_transient);
+    auto const lazy_worker_count =
+        scheduler != nullptr ? scheduler->worker_resolution().resolved_workers
+                             : std::size_t{1};
+    transient = chart_spr_exact_candidate_checked_bytes_add(
+        transient,
+        chart_spr_exact_candidate_checked_bytes_add(
+            estimate_chart_scheduler_implementation_resident_bytes(),
+            estimate_chart_scheduler_pool_owning_heap_bytes(lazy_worker_count),
+            "chart SPR lazy scheduler ownership preflight"),
+        "chart SPR lazy scheduler ownership preflight");
+    projected_initial_live_bytes = chart_spr_exact_candidate_checked_bytes_add(
+        lazy_state_build_retained_bytes,
+        chart_spr_exact_candidate_checked_bytes_add(
+            projected_initial_resident_bytes, transient,
+            "chart SPR lazy state-build preflight"),
+        "chart SPR lazy state-build preflight");
+  }
   if (cache.memory_budget_bytes != 0 &&
-      projected_initial_resident_bytes > cache.memory_budget_bytes) {
+      projected_initial_live_bytes > cache.memory_budget_bytes) {
     if (build_exact_trim) {
-      throw chart_spr_exact_state_budget_error(
-          projected_initial_resident_bytes, cache.memory_budget_bytes);
+      throw chart_spr_exact_state_budget_error(projected_initial_live_bytes,
+                                               cache.memory_budget_bytes);
     }
     throw std::runtime_error(
-        "chart SPR search state: estimated resident chart caches require " +
-        std::to_string(projected_initial_resident_bytes) +
+        "chart SPR search state: estimated live chart state build requires " +
+        std::to_string(projected_initial_live_bytes) +
         " bytes, exceeding configured budget " +
         std::to_string(cache.memory_budget_bytes));
   }
@@ -3399,30 +3715,57 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     std::vector<chart_scheduler_run_summary> lazy_outside_runs;
     lazy_chart_detail::plan_lazy_chart_scheduler_workspace
         lazy_scheduler_workspace;
+    lazy_chart_detail::plan_lazy_chart_memory_options lazy_memory_options{
+        .memory_budget_bytes = cache.memory_budget_bytes,
+        .retained_resident_bytes = lazy_state_build_retained_bytes,
+    };
+    lazy_chart_detail::plan_lazy_chart_memory_report lazy_memory_report;
     chart_spr_scheduler_run_axis_publisher lazy_inside_axis_publisher{
         state.counters.scheduler_axes.lazy_inside_clades, lazy_inside_runs};
     chart_spr_scheduler_run_axis_publisher lazy_outside_axis_publisher{
         state.counters.scheduler_axes.lazy_outside_clades, lazy_outside_runs};
-    if (scheduler == nullptr) {
+    std::optional<chart_scheduler> finite_w1_scheduler;
+    auto* lazy_scheduler = scheduler;
+    if (lazy_scheduler == nullptr && cache.memory_budget_bytes != 0) {
+      finite_w1_scheduler.emplace(
+          chart_scheduler_options{.requested_workers = 1,
+                                  .default_minimum_grain = 1,
+                                  .default_target_ranges_per_worker = 4});
+      lazy_scheduler = &*finite_w1_scheduler;
+    }
+    if (lazy_scheduler == nullptr) {
       state.lazy_chart = build_lazy_inside_chart(
           state.execution_plan, state.active_patterns.patterns, lazy_options);
     } else {
       state.lazy_chart = build_lazy_inside_chart_scheduled(
           state.execution_plan, state.active_patterns.patterns, lazy_options,
-          *scheduler, &lazy_inside_runs, nullptr, &lazy_scheduler_workspace);
+          *lazy_scheduler, &lazy_inside_runs, nullptr,
+          &lazy_scheduler_workspace, lazy_memory_options, &lazy_memory_report);
       lazy_scheduler_workspace.release_inside();
     }
     ++state.counters.chart_execution_plan_cache_hits;
     if (!options.score_ua_edge) {
-      if (scheduler == nullptr) {
+      if (lazy_scheduler == nullptr) {
         build_lazy_outside_chart_in_place(state.execution_plan,
                                           state.active_patterns.patterns,
                                           *state.lazy_chart, options);
       } else {
+        auto outside_memory_options = lazy_memory_options;
+        if (outside_memory_options.memory_budget_bytes != 0) {
+          outside_memory_options.retained_resident_bytes =
+              chart_spr_exact_candidate_checked_bytes_add(
+                  outside_memory_options.retained_resident_bytes,
+                  chart_spr_exact_candidate_checked_bytes_multiply(
+                      lazy_inside_runs.capacity(),
+                      sizeof(chart_scheduler_run_summary),
+                      "chart SPR retained lazy-inside run summaries"),
+                  "chart SPR retained lazy-inside run summaries");
+        }
         build_lazy_outside_chart_in_place_scheduled(
             state.execution_plan, state.active_patterns.patterns,
-            *state.lazy_chart, options, *scheduler, &lazy_outside_runs, nullptr,
-            &lazy_scheduler_workspace);
+            *state.lazy_chart, options, *lazy_scheduler, &lazy_outside_runs,
+            nullptr, &lazy_scheduler_workspace, outside_memory_options,
+            &lazy_memory_report);
         lazy_scheduler_workspace.release_outside();
       }
       ++state.counters.chart_execution_plan_cache_hits;
@@ -3439,6 +3782,7 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
         state.lazy_chart->multifurcation_productions_scored +
         state.lazy_chart->outside_multifurcation_productions_scored;
     add_lazy_chart_build_counters(state.counters, *state.lazy_chart);
+    add_lazy_chart_memory_report(state.counters, lazy_memory_report);
     state.resident_pattern_cache_bytes =
         estimate_chart_spr_pattern_cache_bytes(state);
   } else {
@@ -5309,6 +5653,35 @@ inline void add_chart_spr_search_counters(
   dst.lazy_structural_class_count_max =
       std::max(dst.lazy_structural_class_count_max,
                src.lazy_structural_class_count_max);
+  dst.lazy_chart_memory_budget_bytes = std::max(
+      dst.lazy_chart_memory_budget_bytes, src.lazy_chart_memory_budget_bytes);
+  dst.lazy_chart_inside_max_admitted_slots =
+      std::max(dst.lazy_chart_inside_max_admitted_slots,
+               src.lazy_chart_inside_max_admitted_slots);
+  dst.lazy_chart_outside_max_admitted_slots =
+      std::max(dst.lazy_chart_outside_max_admitted_slots,
+               src.lazy_chart_outside_max_admitted_slots);
+  dst.lazy_chart_inside_admission_waves +=
+      src.lazy_chart_inside_admission_waves;
+  dst.lazy_chart_outside_admission_waves +=
+      src.lazy_chart_outside_admission_waves;
+  dst.lazy_chart_inside_memory_limited_levels +=
+      src.lazy_chart_inside_memory_limited_levels;
+  dst.lazy_chart_outside_memory_limited_levels +=
+      src.lazy_chart_outside_memory_limited_levels;
+  dst.lazy_chart_inside_reused_slot_waves +=
+      src.lazy_chart_inside_reused_slot_waves;
+  dst.lazy_chart_outside_reused_slot_waves +=
+      src.lazy_chart_outside_reused_slot_waves;
+  dst.lazy_chart_inside_workspace_evictions +=
+      src.lazy_chart_inside_workspace_evictions;
+  dst.lazy_chart_outside_workspace_evictions +=
+      src.lazy_chart_outside_workspace_evictions;
+  dst.lazy_chart_preflight_peak_bytes = std::max(
+      dst.lazy_chart_preflight_peak_bytes, src.lazy_chart_preflight_peak_bytes);
+  dst.lazy_chart_actual_peak_bytes = std::max(dst.lazy_chart_actual_peak_bytes,
+                                              src.lazy_chart_actual_peak_bytes);
+  dst.lazy_chart_pre_submit_rejections += src.lazy_chart_pre_submit_rejections;
   dst.local_commit_two_chart_oracle_runs +=
       src.local_commit_two_chart_oracle_runs;
   dst.local_commit_tip_grammar_refreshes +=

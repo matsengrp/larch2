@@ -1165,6 +1165,9 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
     add_test(NAME ${test_name} COMMAND ${test_name}
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()
+target_sources(chart_parallel_test
+               PRIVATE test/chart_spr_allocation_overrides.cpp)
+target_include_directories(chart_parallel_test PRIVATE test)
 set_tests_properties(chart_scheduler_test PROPERTIES TIMEOUT 30)
 
 # Phase-2A test-only global allocation observer and dense local-score gate.

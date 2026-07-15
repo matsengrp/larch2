@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace larch {
@@ -451,6 +452,46 @@ class chart_execution_plan {
   [[nodiscard]] clade_id root_clade() const noexcept { return root_clade_; }
   [[nodiscard]] bool all_binary() const noexcept { return all_binary_; }
   [[nodiscard]] std::size_t max_arity() const noexcept { return max_arity_; }
+
+  [[nodiscard]] std::size_t dynamic_capacity_bytes() const {
+    std::size_t total = 0;
+    auto add = [&](auto const& values) {
+      using vector_type = std::remove_cvref_t<decltype(values)>;
+      auto const capacity = values.capacity();
+      if (capacity != 0 &&
+          sizeof(typename vector_type::value_type) >
+              (std::numeric_limits<std::size_t>::max)() / capacity) {
+        throw std::overflow_error(
+            "chart execution plan capacity byte overflow");
+      }
+      auto const bytes = capacity * sizeof(typename vector_type::value_type);
+      if (total > (std::numeric_limits<std::size_t>::max)() - bytes) {
+        throw std::overflow_error(
+            "chart execution plan capacity byte overflow");
+      }
+      total += bytes;
+    };
+    add(clades_);
+    add(productions_);
+    add(children_);
+    add(productions_by_parent_);
+    add(child_occurrences_);
+    add(bottom_up_order_);
+    add(top_down_order_);
+    add(bottom_up_level_order_);
+    add(bottom_up_level_offsets_);
+    add(top_down_level_order_);
+    add(top_down_level_offsets_);
+    return total;
+  }
+
+  [[nodiscard]] std::size_t resident_bytes() const {
+    auto const dynamic = dynamic_capacity_bytes();
+    if (dynamic > (std::numeric_limits<std::size_t>::max)() - sizeof(*this)) {
+      throw std::overflow_error("chart execution plan resident byte overflow");
+    }
+    return sizeof(*this) + dynamic;
+  }
 
   [[nodiscard]] std::span<chart_plan_clade_descriptor const> clades() const {
     return clades_;

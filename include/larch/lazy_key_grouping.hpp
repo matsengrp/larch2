@@ -67,6 +67,48 @@ inline std::size_t checked_packed_key_count_multiply(std::size_t lhs,
   return lhs * rhs;
 }
 
+// This project is frozen to GCC 17/libstdc++. Its allocate_at_least
+// implementation rounds allocations of sub-default-alignment element types
+// toward the next default-new-alignment byte boundary and reports the extra
+// whole elements as vector capacity. Keep logical admission estimates in the
+// same capacity coordinate; measured preparation remains the final guard.
+template <class Element>
+inline std::size_t frozen_libstdcxx_allocate_at_least_capacity(
+    std::size_t requested_count, std::string_view context) {
+  if (requested_count == 0) return 0;
+  constexpr auto allocation_alignment =
+      std::size_t{__STDCPP_DEFAULT_NEW_ALIGNMENT__};
+  static_assert((allocation_alignment & (allocation_alignment - 1)) == 0);
+  if constexpr (alignof(Element) > allocation_alignment ||
+                sizeof(Element) >= allocation_alignment) {
+    return requested_count;
+  } else {
+    auto const requested_bytes = checked_packed_key_bytes_multiply(
+        requested_count, sizeof(Element), context);
+    auto const rounded_bytes =
+        checked_packed_key_bytes_add(requested_bytes, allocation_alignment - 1,
+                                     context) &
+        ~(allocation_alignment - 1);
+    auto const spare_bytes = rounded_bytes - requested_bytes;
+    std::size_t bonus_count = 0;
+    if constexpr (sizeof(Element) < allocation_alignment / 2) {
+      bonus_count = spare_bytes / sizeof(Element);
+    } else if (sizeof(Element) <= spare_bytes) {
+      bonus_count = 1;
+    }
+    return checked_packed_key_count_add(requested_count, bonus_count, context);
+  }
+}
+
+template <class Element>
+inline std::size_t frozen_libstdcxx_allocate_at_least_capacity_bytes(
+    std::size_t requested_count, std::string_view context) {
+  return checked_packed_key_bytes_multiply(
+      frozen_libstdcxx_allocate_at_least_capacity<Element>(requested_count,
+                                                           context),
+      sizeof(Element), context);
+}
+
 struct packed_key_matrix_view {
   std::size_t key_count = 0;
   std::size_t key_width = 0;
@@ -479,8 +521,11 @@ inline packed_key_grouping_memory_estimate estimate_packed_key_grouping_memory(
 class packed_key_grouping_budget_error : public std::exception {
  public:
   packed_key_grouping_budget_error(std::size_t required_bytes,
-                                   std::size_t budget_bytes) noexcept
-      : required_bytes_(required_bytes), budget_bytes_(budget_bytes) {}
+                                   std::size_t budget_bytes,
+                                   std::size_t observed_peak_bytes = 0) noexcept
+      : required_bytes_(required_bytes),
+        budget_bytes_(budget_bytes),
+        observed_peak_bytes_(observed_peak_bytes) {}
 
   [[nodiscard]] std::size_t required_bytes() const noexcept {
     return required_bytes_;
@@ -489,6 +534,14 @@ class packed_key_grouping_budget_error : public std::exception {
   [[nodiscard]] std::size_t budget_bytes() const noexcept {
     return budget_bytes_;
   }
+
+  // Zero means no unpublished staging peak is carried; callers can measure
+  // their still-published live storage. Otherwise this is the measured
+  // transient peak, expressed in the same resident-byte coordinate as
+  // required_bytes().
+  [[nodiscard]] std::size_t observed_peak_bytes() const noexcept {
+    return observed_peak_bytes_;
+  }
   [[nodiscard]] char const* what() const noexcept override {
     return "packed lazy-key grouping capacity exceeds its admitted limit";
   }
@@ -496,6 +549,7 @@ class packed_key_grouping_budget_error : public std::exception {
  private:
   std::size_t required_bytes_;
   std::size_t budget_bytes_;
+  std::size_t observed_peak_bytes_;
 };
 
 inline bool try_packed_key_grouping_owned_resident_bytes(
@@ -646,7 +700,7 @@ inline packed_key_word_buffer_preparation_report prepare_packed_key_word_buffer(
       "packed lazy-key word-buffer measured preparation peak");
   if (actual_peak > measured_capacity_acceptance_limit_bytes) {
     throw packed_key_grouping_budget_error(
-        actual_peak, measured_capacity_acceptance_limit_bytes);
+        actual_peak, measured_capacity_acceptance_limit_bytes, actual_peak);
   }
   auto const newly_allocated =
       packed_key_word_buffer_dynamic_capacity_bytes(staged);
@@ -715,7 +769,7 @@ prepare_packed_key_grouping_storage(
       previous, prepared, "packed lazy-key preparation measured peak");
   if (actual_peak > measured_capacity_acceptance_limit_bytes) {
     throw packed_key_grouping_budget_error(
-        actual_peak, measured_capacity_acceptance_limit_bytes);
+        actual_peak, measured_capacity_acceptance_limit_bytes, actual_peak);
   }
   auto const newly_allocated = checked_packed_key_bytes_add(
       staged_workspace.dynamic_capacity_bytes(),

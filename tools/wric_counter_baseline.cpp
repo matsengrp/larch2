@@ -2,8 +2,8 @@
 // chart_spr_search_counters for one search run on data/test_5_trees/ in the
 // conservative rebuild_after_accept = true mode.
 //
-// IMPORTANT: this program emits ONLY the fenced snapshot block (the 70-line
-// counter block, not the surrounding prose).  It must NOT be piped directly
+// IMPORTANT: this program emits ONLY the fenced snapshot block (the counter
+// block, not the surrounding prose).  It must NOT be piped directly
 // over doc/WRIC-CHART-SPR-SEARCH-COUNTER-BASELINE.md: doing so would delete
 // the hand-written prose in that file.  Instead, regenerate via
 // tools/regen_counter_baseline.sh, which splices this program's stdout between
@@ -169,6 +169,34 @@ int main() {
                      c.lazy_incremental_rows_recomputed);
   print_counter_line("lazy_structural_class_count_max",
                      c.lazy_structural_class_count_max);
+  print_counter_line("lazy_chart_memory_budget_bytes",
+                     c.lazy_chart_memory_budget_bytes);
+  print_counter_line("lazy_chart_inside_max_admitted_slots",
+                     c.lazy_chart_inside_max_admitted_slots);
+  print_counter_line("lazy_chart_outside_max_admitted_slots",
+                     c.lazy_chart_outside_max_admitted_slots);
+  print_counter_line("lazy_chart_inside_admission_waves",
+                     c.lazy_chart_inside_admission_waves);
+  print_counter_line("lazy_chart_outside_admission_waves",
+                     c.lazy_chart_outside_admission_waves);
+  print_counter_line("lazy_chart_inside_memory_limited_levels",
+                     c.lazy_chart_inside_memory_limited_levels);
+  print_counter_line("lazy_chart_outside_memory_limited_levels",
+                     c.lazy_chart_outside_memory_limited_levels);
+  print_counter_line("lazy_chart_inside_reused_slot_waves",
+                     c.lazy_chart_inside_reused_slot_waves);
+  print_counter_line("lazy_chart_outside_reused_slot_waves",
+                     c.lazy_chart_outside_reused_slot_waves);
+  print_counter_line("lazy_chart_inside_workspace_evictions",
+                     c.lazy_chart_inside_workspace_evictions);
+  print_counter_line("lazy_chart_outside_workspace_evictions",
+                     c.lazy_chart_outside_workspace_evictions);
+  print_counter_line("lazy_chart_preflight_peak_bytes",
+                     c.lazy_chart_preflight_peak_bytes);
+  print_counter_line("lazy_chart_actual_peak_bytes",
+                     c.lazy_chart_actual_peak_bytes);
+  print_counter_line("lazy_chart_pre_submit_rejections",
+                     c.lazy_chart_pre_submit_rejections);
   print_counter_line("multifurcation_productions_scored",
                      c.multifurcation_productions_scored);
   print_counter_line("local_commit_two_chart_oracle_runs",

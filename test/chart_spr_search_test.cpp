@@ -4165,12 +4165,186 @@ static void test_phase7_scheduled_lazy_chart_axes_match_w1() {
   CHECK(w4.counters.scheduler_axes.lazy_outside_clades.parallel_operations > 0);
   CHECK(w1.counters.scheduler_axes.initial_chart_patterns.operations == 0);
   CHECK(w4.counters.scheduler_axes.initial_chart_patterns.operations == 0);
+
+  // A real finite lazy search-state build publishes both halves of the
+  // admission report through the public counter contract.
+  constexpr auto finite_budget = std::size_t{1} << 40;
+  auto finite_cache = cache;
+  finite_cache.memory_budget_bytes = finite_budget;
+  // The tiny balanced fixture has level widths 4/2/1. W1 deliberately creates
+  // repeated same-shape waves, so both reuse counters are nonzero and their
+  // propagation through the public state contract is observable. The focused
+  // finite-admission suite exercises genuinely parallel W4 admission.
+  auto finite_scheduler = make_scheduler(1);
+  auto finite_active = larch::make_active_search_patterns(patterns);
+  auto finite = larch::build_chart_spr_search_state_from_active(
+      fixture.dag, fixture.grammar, std::move(finite_active), {}, false, {},
+      finite_cache, {}, finite_scheduler.get());
+  CHECK(finite.counters.lazy_chart_memory_budget_bytes == finite_budget);
+  CHECK(finite.counters.lazy_chart_inside_max_admitted_slots > 0);
+  CHECK(finite.counters.lazy_chart_outside_max_admitted_slots > 0);
+  CHECK(finite.counters.lazy_chart_inside_admission_waves > 0);
+  CHECK(finite.counters.lazy_chart_outside_admission_waves > 0);
+  CHECK(finite.counters.lazy_chart_inside_reused_slot_waves > 0);
+  CHECK(finite.counters.lazy_chart_outside_reused_slot_waves > 0);
+  CHECK(finite.counters.lazy_chart_preflight_peak_bytes <= finite_budget);
+  CHECK(finite.counters.lazy_chart_actual_peak_bytes <= finite_budget);
+  CHECK(finite.counters.lazy_chart_pre_submit_rejections == 0);
+  CHECK(finite.counters.scheduler_axes.lazy_inside_clades.operations ==
+        finite.counters.lazy_chart_inside_admission_waves);
+  CHECK(finite.counters.scheduler_axes.lazy_outside_clades.operations ==
+        finite.counters.lazy_chart_outside_admission_waves);
+  finite_scheduler->shutdown();
   check_phase4_scheduler_axis_reconciliation(w1_scheduler->metrics(),
                                              w1.counters.scheduler_axes);
   check_phase4_scheduler_axis_reconciliation(w4_scheduler->metrics(),
                                              w4.counters.scheduler_axes);
   w1_scheduler->shutdown();
   w4_scheduler->shutdown();
+
+  std::println("  PASS");
+}
+
+static void test_phase7_lazy_state_retained_long_taxon_name_accounting() {
+  std::println("test_phase7_lazy_state_retained_long_taxon_name_accounting");
+
+  auto fixture = make_fixture();
+  auto patterns = make_phase4_wide_patterns();
+  larch::chart_spr_search_state retained_state;
+  retained_state.grammar = fixture.grammar;
+  retained_state.execution_plan =
+      larch::build_chart_execution_plan(retained_state.grammar);
+  auto active_build = larch::make_active_search_patterns(patterns);
+  retained_state.active_patterns = std::move(active_build.active_patterns);
+
+  auto const taxon = larch::taxon_id{0};
+  auto const old_name = retained_state.grammar.taxa.id_to_sample_id[taxon];
+  auto const old_map =
+      retained_state.grammar.taxa.sample_id_to_id.find(old_name);
+  CHECK(old_map != retained_state.grammar.taxa.sample_id_to_id.end());
+  CHECK(old_map->second == taxon);
+  auto const old_vector_name_bytes =
+      larch::chart_spr_search_detail::estimate_owned_string_capacity_bytes(
+          retained_state.grammar.taxa.id_to_sample_id[taxon],
+          "test retained vector name");
+  auto const old_map_name_bytes =
+      larch::chart_spr_search_detail::estimate_owned_string_capacity_bytes(
+          old_map->first, "test retained map name");
+  auto const retained_before =
+      larch::estimate_chart_spr_lazy_state_build_retained_bytes(retained_state);
+  auto const plan_bytes_before =
+      retained_state.execution_plan.dynamic_capacity_bytes();
+  auto const bucket_count_before =
+      retained_state.grammar.taxa.sample_id_to_id.bucket_count();
+
+  std::string long_name(513, 'x');
+  long_name.front() = 'A';
+  long_name.shrink_to_fit();
+  CHECK(long_name.capacity() >= long_name.size());
+  CHECK(long_name.capacity() > 64);
+  retained_state.grammar.taxa.sample_id_to_id.erase(old_name);
+  retained_state.grammar.taxa.id_to_sample_id[taxon] = long_name;
+  auto const [inserted, unique] =
+      retained_state.grammar.taxa.sample_id_to_id.emplace(long_name, taxon);
+  CHECK(unique);
+  CHECK(inserted->second == taxon);
+  CHECK(retained_state.grammar.taxa.sample_id_to_id.bucket_count() ==
+        bucket_count_before);
+  retained_state.execution_plan =
+      larch::build_chart_execution_plan(retained_state.grammar);
+  CHECK(retained_state.execution_plan.dynamic_capacity_bytes() ==
+        plan_bytes_before);
+
+  auto const& retained_vector_name =
+      retained_state.grammar.taxa.id_to_sample_id[taxon];
+  auto const& retained_map_name = inserted->first;
+  CHECK(retained_vector_name.capacity() > 64);
+  CHECK(retained_map_name.capacity() > 64);
+  auto const vector_name_bytes =
+      larch::chart_spr_search_detail::estimate_owned_string_capacity_bytes(
+          retained_vector_name, "test retained vector name");
+  auto const map_name_bytes =
+      larch::chart_spr_search_detail::estimate_owned_string_capacity_bytes(
+          retained_map_name, "test retained map name");
+  CHECK(vector_name_bytes == retained_vector_name.capacity() + 1);
+  CHECK(map_name_bytes == retained_map_name.capacity() + 1);
+  auto const retained_bytes =
+      larch::estimate_chart_spr_lazy_state_build_retained_bytes(retained_state);
+  CHECK(retained_before >= old_vector_name_bytes + old_map_name_bytes);
+  CHECK(retained_bytes == retained_before - old_vector_name_bytes -
+                              old_map_name_bytes + vector_name_bytes +
+                              map_name_bytes);
+
+  auto const& plan = retained_state.execution_plan;
+  auto const& active_patterns = retained_state.active_patterns.patterns;
+  larch::lazy_chart_options lazy_options;
+  lazy_options.retain_all_inside_class_maps = true;
+  auto const oracle =
+      larch::build_lazy_inside_chart(plan, active_patterns, lazy_options);
+  auto make_scheduler = [] {
+    return std::make_unique<larch::chart_scheduler>(
+        larch::chart_scheduler_options{
+            .requested_workers = 1,
+            .default_minimum_grain = 1,
+            .default_target_ranges_per_worker = 4,
+        });
+  };
+  constexpr auto huge_budget = std::size_t{1} << 40;
+  auto calibration_scheduler = make_scheduler();
+  larch::lazy_chart_detail::plan_lazy_chart_memory_report calibration_report;
+  auto calibration = larch::build_lazy_inside_chart_scheduled(
+      plan, active_patterns, lazy_options, *calibration_scheduler, nullptr,
+      nullptr, nullptr,
+      larch::lazy_chart_detail::plan_lazy_chart_memory_options{
+          .memory_budget_bytes = huge_budget,
+          .retained_resident_bytes = retained_bytes,
+      },
+      &calibration_report);
+  CHECK(calibration.inside_rows_by_clade == oracle.inside_rows_by_clade);
+  auto const exact_budget =
+      std::max(calibration_report.preflight_peak_capacity_resident_bytes,
+               calibration_report.actual_peak_capacity_resident_bytes);
+  CHECK(exact_budget ==
+        calibration_report.preflight_peak_capacity_resident_bytes);
+  CHECK(exact_budget > retained_bytes);
+
+  auto exact_scheduler = make_scheduler();
+  larch::lazy_chart_detail::plan_lazy_chart_memory_report exact_report;
+  auto exact = larch::build_lazy_inside_chart_scheduled(
+      plan, active_patterns, lazy_options, *exact_scheduler, nullptr, nullptr,
+      nullptr,
+      larch::lazy_chart_detail::plan_lazy_chart_memory_options{
+          .memory_budget_bytes = exact_budget,
+          .retained_resident_bytes = retained_bytes,
+      },
+      &exact_report);
+  CHECK(exact.inside_rows_by_clade == oracle.inside_rows_by_clade);
+  CHECK(exact_report.preflight_peak_capacity_resident_bytes <= exact_budget);
+  CHECK(exact_report.actual_peak_capacity_resident_bytes <= exact_budget);
+
+  auto one_under_scheduler = make_scheduler();
+  auto const operations_before = one_under_scheduler->metrics().operations;
+  larch::lazy_chart_detail::plan_lazy_chart_memory_report one_under_report;
+  bool rejected = false;
+  try {
+    (void)larch::build_lazy_inside_chart_scheduled(
+        plan, active_patterns, lazy_options, *one_under_scheduler, nullptr,
+        nullptr, nullptr,
+        larch::lazy_chart_detail::plan_lazy_chart_memory_options{
+            .memory_budget_bytes = exact_budget - 1,
+            .retained_resident_bytes = retained_bytes,
+        },
+        &one_under_report);
+  } catch (larch::lazy_chart_detail::plan_lazy_chart_memory_budget_error const&
+               error) {
+    rejected = true;
+    CHECK(error.required_bytes() == exact_budget);
+    CHECK(error.budget_bytes() == exact_budget - 1);
+  }
+  CHECK(rejected);
+  CHECK(one_under_report.pre_submit_rejections == 1);
+  CHECK(one_under_report.inside_admission_waves == 0);
+  CHECK(one_under_scheduler->metrics().operations == operations_before);
 
   std::println("  PASS");
 }
@@ -9808,6 +9982,7 @@ int main() {
   test_eager_diagnostic_enumeration_exposes_cap_after_path_precompute();
   test_phase4_scheduled_pattern_axes_match_w1();
   test_phase7_scheduled_lazy_chart_axes_match_w1();
+  test_phase7_lazy_state_retained_long_taxon_name_accounting();
   test_phase2b_exact_setup_reuses_resident_state_charts();
   test_phase2b_deferred_pattern_batch_uses_owning_setup_provider();
   test_exact_verification_reuses_state_old_score();

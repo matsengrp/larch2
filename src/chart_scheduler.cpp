@@ -327,6 +327,51 @@ struct chart_scheduler::implementation {
   chart_scheduler_test_detail::after_submissions_hook after_submissions;
 };
 
+std::size_t estimate_chart_scheduler_implementation_resident_bytes() {
+  // One make_unique allocation owns the implementation. Two pointer widths
+  // cover the frozen allocator's allocation header/alignment allowance.
+  return sizeof(chart_scheduler) + sizeof(chart_scheduler::implementation) +
+         2 * sizeof(void*);
+}
+
+std::size_t estimate_chart_scheduler_pool_owning_heap_bytes(
+    std::size_t resolved_workers) {
+  if (resolved_workers <= 1) return 0;
+
+  auto checked_multiply = [](std::size_t lhs, std::size_t rhs,
+                             std::string_view context) {
+    if (lhs != 0 && rhs > (std::numeric_limits<std::size_t>::max)() / lhs) {
+      throw std::overflow_error(std::string{context} + " byte overflow");
+    }
+    return lhs * rhs;
+  };
+  auto checked_add = [](std::size_t lhs, std::size_t rhs,
+                        std::string_view context) {
+    if (lhs > (std::numeric_limits<std::size_t>::max)() - rhs) {
+      throw std::overflow_error(std::string{context} + " byte overflow");
+    }
+    return lhs + rhs;
+  };
+
+  // std::vector::reserve owns one jthread array. Every libstdc++ jthread also
+  // owns stop-state and std::thread invocation-state allocations; eight
+  // pointer widths per worker are a frozen conservative envelope for those
+  // control blocks and their allocator metadata.
+  auto total = checked_multiply(resolved_workers,
+                                sizeof(std::jthread) + 8 * sizeof(void*),
+                                "chart scheduler pool worker ownership");
+  // The frozen deque uses an initial pointer map and a 512-byte element block.
+  // Four pointer widths cover the two allocator allocation headers/alignment.
+  constexpr auto deque_map_pointer_count = std::size_t{8};
+  auto const queue_storage =
+      512 + (deque_map_pointer_count + 4) * sizeof(void*);
+  total =
+      checked_add(total, queue_storage, "chart scheduler pool queue ownership");
+  // The worker array itself is a third allocation.
+  return checked_add(total, 2 * sizeof(void*),
+                     "chart scheduler pool owning heap");
+}
+
 chart_scheduler::chart_scheduler(chart_scheduler_options options)
     : chart_scheduler(options, options.requested_workers == 0
                                    ? detect_chart_worker_topology()
@@ -394,6 +439,48 @@ chart_indexed_range chart_scheduler::indexed_range_at(
       .begin = begin,
       .end = end,
   };
+}
+
+std::size_t estimate_chart_scheduler_operation_peak_bytes(
+    chart_indexed_range_plan const& plan) {
+  if (plan.force_serial || plan.range_count <= 1 ||
+      plan.worker_task_limit <= 1) {
+    return 0;
+  }
+  auto checked_multiply = [](std::size_t lhs, std::size_t rhs,
+                             std::string_view context) {
+    if (lhs != 0 && rhs > (std::numeric_limits<std::size_t>::max)() / lhs) {
+      throw std::overflow_error(std::string{context} + " byte overflow");
+    }
+    return lhs * rhs;
+  };
+  auto checked_add = [](std::size_t lhs, std::size_t rhs,
+                        std::string_view context) {
+    if (lhs > (std::numeric_limits<std::size_t>::max)() - rhs) {
+      throw std::overflow_error(std::string{context} + " byte overflow");
+    }
+    return lhs + rhs;
+  };
+  std::size_t total = sizeof(std::vector<std::exception_ptr>) +
+                      sizeof(std::vector<std::future<void>>);
+  total =
+      checked_add(total,
+                  checked_multiply(plan.range_count, sizeof(std::exception_ptr),
+                                   "chart scheduler exception slots"),
+                  "chart scheduler operation");
+  total = checked_add(
+      total,
+      checked_multiply(plan.worker_task_limit, sizeof(std::future<void>),
+                       "chart scheduler future slots"),
+      "chart scheduler operation");
+  auto const runner_bytes = sizeof(std::packaged_task<void()>) +
+                            sizeof(std::move_only_function<void()>) +
+                            sizeof(chart_indexed_range) + 32 * sizeof(void*) +
+                            1024;
+  return checked_add(total,
+                     checked_multiply(plan.worker_task_limit, runner_bytes,
+                                      "chart scheduler runner storage"),
+                     "chart scheduler operation");
 }
 
 chart_scheduler_run_summary chart_scheduler::run_indexed_ranges(

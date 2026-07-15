@@ -116,6 +116,26 @@ struct chart_indexed_range_plan {
   bool force_serial = false;
 };
 
+// Frozen-libstdc++ capacity envelope for one genuinely parallel scheduler
+// operation: exception slots, futures, packaged-task shared state, and queue
+// runner bookkeeping. Serial plans allocate none of this storage.
+[[nodiscard]] std::size_t estimate_chart_scheduler_operation_peak_bytes(
+    chart_indexed_range_plan const& plan);
+// Owning heap retained by one scheduler independently of any operation.  The
+// scheduler object itself and its make_unique implementation allocation are
+// included; worker-pool storage is reported separately because W1 never
+// constructs it.
+[[nodiscard]] std::size_t
+estimate_chart_scheduler_implementation_resident_bytes();
+
+// Conservative frozen-libstdc++ envelope for the heap owned when the lazy
+// thread pool is first constructed: jthread elements and stop-state ownership,
+// plus the deque map/block used by its task queue.  Native thread stacks and
+// implementation-owned pthread/TLS allocations are deliberately outside the
+// chart byte budget and are documented as such at this boundary.
+[[nodiscard]] std::size_t estimate_chart_scheduler_pool_owning_heap_bytes(
+    std::size_t resolved_workers);
+
 struct chart_indexed_range {
   // IDs are allocated monotonically by one scheduler and never depend on which
   // worker happens to claim the range.
@@ -367,6 +387,7 @@ class chart_scheduler {
       chart_scheduler_test_detail::after_submissions_hook after);
 
   friend struct chart_scheduler_test_detail::access;
+  friend std::size_t estimate_chart_scheduler_implementation_resident_bytes();
 };
 
 namespace chart_scheduler_test_detail {
