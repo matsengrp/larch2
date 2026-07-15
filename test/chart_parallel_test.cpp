@@ -3,8 +3,10 @@
 #include <larch/lazy_chart.hpp>
 #include <larch/parsimony_chart.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <print>
 #include <stdexcept>
 #include <string>
@@ -98,6 +100,131 @@ static larch::clade_grammar make_trinary_grammar() {
   grammar.execution_generation =
       larch::detail::allocate_clade_grammar_execution_generation();
   return grammar;
+}
+
+// Two alternative binary root productions make the complete row key wider
+// than the structural key selected by the canonical first production.
+static larch::clade_grammar make_nonlex_binary_dag_grammar() {
+  using larch::clade_id;
+  using larch::production_id;
+  using larch::taxon_id;
+
+  larch::clade_grammar grammar;
+  grammar.taxa.id_to_sample_id = {"A", "B", "C", "D"};
+  grammar.taxa.sample_id_to_id = {{"A", taxon_id{0}},
+                                  {"B", taxon_id{1}},
+                                  {"C", taxon_id{2}},
+                                  {"D", taxon_id{3}}};
+  grammar.clades = {{{taxon_id{0}}},
+                    {{taxon_id{1}}},
+                    {{taxon_id{2}}},
+                    {{taxon_id{3}}},
+                    {{taxon_id{0}, taxon_id{1}}},
+                    {{taxon_id{2}, taxon_id{3}}},
+                    {{taxon_id{0}, taxon_id{2}}},
+                    {{taxon_id{1}, taxon_id{3}}},
+                    {{taxon_id{0}, taxon_id{1}, taxon_id{2}, taxon_id{3}}}};
+  grammar.productions = {
+      larch::grammar_production{clade_id{4}, {clade_id{0}, clade_id{1}}, {}, 1},
+      larch::grammar_production{clade_id{5}, {clade_id{2}, clade_id{3}}, {}, 1},
+      larch::grammar_production{clade_id{6}, {clade_id{0}, clade_id{2}}, {}, 1},
+      larch::grammar_production{clade_id{7}, {clade_id{1}, clade_id{3}}, {}, 1},
+      larch::grammar_production{clade_id{8}, {clade_id{4}, clade_id{5}}, {}, 1},
+      larch::grammar_production{clade_id{8}, {clade_id{6}, clade_id{7}}, {}, 1},
+  };
+  grammar.productions_by_parent = {
+      {},
+      {},
+      {},
+      {},
+      {production_id{0}},
+      {production_id{1}},
+      {production_id{2}},
+      {production_id{3}},
+      {production_id{4}, production_id{5}},
+  };
+  grammar.productions_by_child = {
+      {production_id{0}, production_id{2}},
+      {production_id{0}, production_id{3}},
+      {production_id{1}, production_id{2}},
+      {production_id{1}, production_id{3}},
+      {production_id{4}},
+      {production_id{4}},
+      {production_id{5}},
+      {production_id{5}},
+      {},
+  };
+  grammar.root_clade = clade_id{8};
+  grammar.execution_generation =
+      larch::detail::allocate_clade_grammar_execution_generation();
+  return grammar;
+}
+
+static larch::clade_grammar make_nonlex_multifurcating_grammar() {
+  using larch::clade_id;
+  using larch::production_id;
+  using larch::taxon_id;
+
+  larch::clade_grammar grammar;
+  grammar.taxa.id_to_sample_id = {"A", "B", "C", "D"};
+  grammar.taxa.sample_id_to_id = {{"A", taxon_id{0}},
+                                  {"B", taxon_id{1}},
+                                  {"C", taxon_id{2}},
+                                  {"D", taxon_id{3}}};
+  grammar.clades = {{{taxon_id{0}}},
+                    {{taxon_id{1}}},
+                    {{taxon_id{2}}},
+                    {{taxon_id{3}}},
+                    {{taxon_id{2}, taxon_id{3}}},
+                    {{taxon_id{0}, taxon_id{1}, taxon_id{2}, taxon_id{3}}}};
+  grammar.productions = {
+      larch::grammar_production{clade_id{4}, {clade_id{2}, clade_id{3}}, {}, 1},
+      larch::grammar_production{
+          clade_id{5}, {clade_id{0}, clade_id{1}, clade_id{4}}, {}, 1},
+  };
+  grammar.productions_by_parent = {
+      {}, {}, {}, {}, {production_id{0}}, {production_id{1}},
+  };
+  grammar.productions_by_child = {
+      {production_id{1}}, {production_id{1}}, {production_id{0}},
+      {production_id{0}}, {production_id{1}}, {},
+  };
+  grammar.root_clade = clade_id{5};
+  grammar.execution_generation =
+      larch::detail::allocate_clade_grammar_execution_generation();
+  return grammar;
+}
+
+static larch::site_pattern_set make_nonlex_four_taxon_patterns() {
+  larch::site_pattern_set patterns;
+  patterns.taxon_count = 4;
+  patterns.patterns = {
+      larch::site_pattern{.state_by_taxon = {3, 3, 3, 3},
+                          .positions = {},
+                          .weight = 1,
+                          .reference_state_counts = {}},
+      larch::site_pattern{.state_by_taxon = {0, 0, 3, 3},
+                          .positions = {},
+                          .weight = 2,
+                          .reference_state_counts = {}},
+      larch::site_pattern{.state_by_taxon = {3, 3, 0, 0},
+                          .positions = {},
+                          .weight = 3,
+                          .reference_state_counts = {}},
+      larch::site_pattern{.state_by_taxon = {0, 3, 0, 3},
+                          .positions = {},
+                          .weight = 4,
+                          .reference_state_counts = {}},
+      larch::site_pattern{.state_by_taxon = {3, 0, 3, 0},
+                          .positions = {},
+                          .weight = 5,
+                          .reference_state_counts = {}},
+      larch::site_pattern{.state_by_taxon = {1, 2, 3, 0},
+                          .positions = {},
+                          .weight = 6,
+                          .reference_state_counts = {}},
+  };
+  return patterns;
 }
 
 static larch::site_pattern_set make_weighted_patterns(
@@ -204,6 +331,7 @@ static void check_lazy_charts_equal(
         actual.multifurcation_productions_scored);
   CHECK(expected.outside_multifurcation_productions_scored ==
         actual.outside_multifurcation_productions_scored);
+  CHECK(expected.outside_recurrence_work == actual.outside_recurrence_work);
 }
 
 static void check_multisite_trim_equal(
@@ -719,6 +847,141 @@ static void test_checked_and_plan_lazy_multifurcation_equivalence() {
   CHECK(clade_sorts == 0);
 }
 
+static void check_deliberately_nonlex_root_classes(
+    larch::chart_execution_plan const& plan,
+    larch::lazy_multisite_chart const& chart) {
+  auto const root = plan.root_clade();
+  auto const production_ids = plan.productions_for_parent(root);
+  CHECK(!production_ids.empty());
+  auto const structural_children = plan.children(production_ids.front());
+  CHECK(!structural_children.empty());
+
+  std::vector<std::size_t> first_seen_key;
+  std::vector<std::size_t> lexicographically_earlier_key;
+  for (auto child : structural_children) {
+    auto const& child_map =
+        chart.structural_class_index_by_pattern_by_clade[child];
+    CHECK(child_map.has_value());
+    first_seen_key.push_back((*child_map)[1]);
+    lexicographically_earlier_key.push_back((*child_map)[2]);
+  }
+  CHECK(std::lexicographical_compare(lexicographically_earlier_key.begin(),
+                                     lexicographically_earlier_key.end(),
+                                     first_seen_key.begin(),
+                                     first_seen_key.end()));
+
+  auto const& root_map = chart.structural_class_index_by_pattern_by_clade[root];
+  CHECK(root_map.has_value());
+  CHECK((*root_map)[1] == 1);
+  CHECK((*root_map)[2] == 2);
+  CHECK((*root_map)[1] < (*root_map)[2]);
+}
+
+static void check_nonlex_packed_plan_against_grammar_oracle(
+    larch::clade_grammar grammar, bool expect_multifurcation) {
+  auto const plan = larch::build_chart_execution_plan(grammar);
+  auto const patterns = make_nonlex_four_taxon_patterns();
+
+  for (bool retain_all : {false, true}) {
+    larch::lazy_chart_options options;
+    options.retain_all_inside_class_maps = retain_all;
+    auto const oracle_inside =
+        larch::build_lazy_inside_chart(grammar, patterns, options);
+    auto const packed_inside =
+        larch::build_lazy_inside_chart(plan, patterns, options);
+    check_lazy_charts_equal(oracle_inside, packed_inside);
+    CHECK((packed_inside.multifurcation_productions_scored > 0) ==
+          expect_multifurcation);
+    if (retain_all) {
+      check_deliberately_nonlex_root_classes(plan, packed_inside);
+    }
+
+    auto const oracle_outside = larch::build_lazy_outside_chart(
+        grammar, patterns, oracle_inside, larch::chart_options{});
+    auto const packed_outside = larch::build_lazy_outside_chart(
+        plan, patterns, packed_inside, larch::chart_options{});
+    check_lazy_charts_equal(oracle_outside, packed_outside);
+    check_deliberately_nonlex_root_classes(plan, packed_outside);
+    CHECK((packed_outside.outside_multifurcation_productions_scored > 0) ==
+          expect_multifurcation);
+  }
+}
+
+static void test_nonlex_packed_plan_lazy_grouping_equivalence() {
+  std::println("test_nonlex_packed_plan_lazy_grouping_equivalence");
+  check_nonlex_packed_plan_against_grammar_oracle(
+      make_nonlex_binary_dag_grammar(), false);
+  check_nonlex_packed_plan_against_grammar_oracle(
+      make_nonlex_multifurcating_grammar(), true);
+}
+
+static void test_plan_packed_key_narrowing_and_accounting() {
+  std::println("test_plan_packed_key_narrowing_and_accounting");
+  using larch::lazy_key_grouping_detail::checked_packed_key_word;
+  using larch::lazy_key_grouping_detail::packed_key_word;
+  auto const word_max =
+      static_cast<std::size_t>((std::numeric_limits<packed_key_word>::max)());
+  CHECK(checked_packed_key_word(word_max, "test plan class index") ==
+        (std::numeric_limits<packed_key_word>::max)());
+  if ((std::numeric_limits<std::size_t>::max)() > word_max) {
+    auto const message = runtime_error_message([&] {
+      (void)checked_packed_key_word(word_max + 1, "test plan class index");
+    });
+    CHECK(message.find("test plan class index") != std::string::npos);
+    CHECK(message.find("does not fit") != std::string::npos);
+  }
+
+  auto const logical = larch::lazy_chart_detail::
+      estimate_plan_parent_key_grouping_logical_resident_bytes(6, 2, 5, 4, 4);
+  CHECK(logical > sizeof(larch::lazy_chart_detail::plan_parent_key_workspace));
+  auto const overflow = runtime_error_message([&] {
+    (void)larch::lazy_chart_detail::
+        estimate_plan_parent_key_grouping_logical_resident_bytes(
+            (std::numeric_limits<std::size_t>::max)(), 2, 1, 1, 1);
+  });
+  CHECK(overflow.find("overflow") != std::string::npos);
+
+  auto grammar = make_nonlex_binary_dag_grammar();
+  auto const plan = larch::build_chart_execution_plan(grammar);
+  auto const patterns = make_nonlex_four_taxon_patterns();
+  larch::lazy_chart_options options;
+  options.retain_all_inside_class_maps = true;
+  auto chart = larch::build_lazy_inside_chart(plan, patterns, options);
+  larch::lazy_chart_detail::plan_parent_key_workspace workspace;
+  {
+    auto keys = larch::lazy_chart_detail::collect_plan_parent_keys(
+        chart, plan, patterns, larch::clade_id{4}, nullptr, workspace);
+    CHECK(keys.memory.structural_key_count == patterns.patterns.size());
+    CHECK(keys.memory.structural_key_width == 2);
+    CHECK(keys.memory.row_key_count == keys.structural_classes().class_count());
+    CHECK(keys.memory.row_key_count < keys.memory.structural_key_count);
+    CHECK(keys.memory.row_key_width == 2);
+    CHECK(keys.row_key_words().size() ==
+          keys.memory.row_key_count * keys.memory.row_key_width);
+    CHECK(keys.memory.actual_capacity_resident_bytes >=
+          keys.memory.logical_resident_bytes);
+    CHECK(keys.memory.observed_prepublication_peak_capacity_resident_bytes >=
+          keys.memory.actual_capacity_resident_bytes);
+  }
+  auto reused = larch::lazy_chart_detail::collect_plan_parent_keys(
+      chart, plan, patterns, larch::clade_id{4}, nullptr, workspace);
+  CHECK(reused.memory.structural_word_preparation.reused_existing_capacity);
+  CHECK(reused.memory.structural_grouping_preparation.reused_existing_capacity);
+  CHECK(reused.memory.row_word_preparation.reused_existing_capacity);
+  CHECK(reused.memory.row_grouping_preparation.reused_existing_capacity);
+
+  auto owned = larch::lazy_chart_detail::collect_plan_parent_keys(
+      chart, plan, patterns, larch::clade_id{4}, nullptr);
+  CHECK(owned.owned_storage != nullptr);
+  CHECK(owned.storage == owned.owned_storage.get());
+  std::size_t multifurcation_counter = 0;
+  auto const owned_row =
+      larch::lazy_chart_detail::compute_plan_internal_inside_row_from_keys(
+          chart, plan, larch::clade_id{4}, owned, 0, multifurcation_counter);
+  CHECK(owned_row == chart.inside_row(larch::clade_id{4}, 0));
+  CHECK(multifurcation_counter == 0);
+}
+
 static void test_checked_and_plan_exact_frontier_equivalence() {
   std::println("test_checked_and_plan_exact_frontier_equivalence");
   auto grammar = make_binary_grammar();
@@ -852,6 +1115,8 @@ int main() {
   test_checked_and_plan_lazy_inside_outside_equivalence();
   test_checked_and_plan_lazy_score_and_exact_trim_equivalence();
   test_checked_and_plan_lazy_multifurcation_equivalence();
+  test_nonlex_packed_plan_lazy_grouping_equivalence();
+  test_plan_packed_key_narrowing_and_accounting();
   test_checked_and_plan_exact_frontier_equivalence();
   test_stale_and_mismatched_plan_rejected();
   test_plan_lifetime_and_uninitialized_guards();

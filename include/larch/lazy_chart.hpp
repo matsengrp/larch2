@@ -2,6 +2,7 @@
 
 #include <larch/chart_execution_plan.hpp>
 #include <larch/chart_spr.hpp>
+#include <larch/lazy_key_grouping.hpp>
 #include <larch/parsimony_chart.hpp>
 #include <larch/site_patterns.hpp>
 #include <larch/chart_trim.hpp>
@@ -11,8 +12,10 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -949,40 +952,281 @@ inline void consume_plan_structural_child_map(
   }
 }
 
-inline sparse_parent_keys collect_plan_parent_keys(
+struct plan_parent_key_grouping_memory_accounting {
+  std::size_t structural_key_count = 0;
+  std::size_t structural_key_width = 0;
+  std::size_t row_key_count = 0;
+  std::size_t row_key_width = 0;
+  std::size_t row_key_class_count = 0;
+  std::size_t logical_resident_bytes = 0;
+  std::size_t actual_capacity_resident_bytes = 0;
+  std::size_t observed_prepublication_peak_capacity_resident_bytes = 0;
+  lazy_key_grouping_detail::packed_key_word_buffer_preparation_report
+      structural_word_preparation;
+  lazy_key_grouping_detail::packed_key_grouping_preparation_report
+      structural_grouping_preparation;
+  lazy_key_grouping_detail::packed_key_word_buffer_preparation_report
+      row_word_preparation;
+  lazy_key_grouping_detail::packed_key_grouping_preparation_report
+      row_grouping_preparation;
+};
+
+struct plan_parent_key_workspace {
+  std::vector<lazy_key_grouping_detail::packed_key_word> packed_words;
+  lazy_key_grouping_detail::packed_key_grouping_workspace grouping_workspace;
+  lazy_key_grouping_detail::packed_key_grouping_result structural_grouping;
+  lazy_key_grouping_detail::packed_key_grouping_result row_grouping;
+
+  [[nodiscard]] std::size_t dynamic_capacity_bytes() const {
+    using lazy_key_grouping_detail::checked_packed_key_bytes_add;
+    auto total =
+        lazy_key_grouping_detail::packed_key_word_buffer_dynamic_capacity_bytes(
+            packed_words);
+    total = checked_packed_key_bytes_add(
+        total, grouping_workspace.dynamic_capacity_bytes(),
+        "lazy plan parent-key workspace capacity");
+    total = checked_packed_key_bytes_add(
+        total, structural_grouping.dynamic_capacity_bytes(),
+        "lazy plan parent-key workspace capacity");
+    return checked_packed_key_bytes_add(
+        total, row_grouping.dynamic_capacity_bytes(),
+        "lazy plan parent-key workspace capacity");
+  }
+
+  [[nodiscard]] std::size_t resident_bytes() const {
+    return lazy_key_grouping_detail::checked_packed_key_bytes_add(
+        sizeof(*this), dynamic_capacity_bytes(),
+        "lazy plan parent-key workspace resident");
+  }
+};
+
+struct packed_plan_parent_keys {
+  plan_parent_key_workspace* storage = nullptr;
+  std::unique_ptr<plan_parent_key_workspace> owned_storage;
+  std::size_t structural_key_width = 0;
+  std::size_t row_key_width = 0;
+  plan_parent_key_grouping_memory_accounting memory;
+
+  packed_plan_parent_keys() = default;
+  packed_plan_parent_keys(packed_plan_parent_keys&&) noexcept = default;
+  packed_plan_parent_keys& operator=(packed_plan_parent_keys&&) noexcept =
+      default;
+  packed_plan_parent_keys(packed_plan_parent_keys const&) = delete;
+  packed_plan_parent_keys& operator=(packed_plan_parent_keys const&) = delete;
+
+  [[nodiscard]] plan_parent_key_workspace const& workspace() const {
+    if (storage == nullptr) {
+      throw std::logic_error("lazy chart: missing packed parent-key storage");
+    }
+    return *storage;
+  }
+
+  [[nodiscard]] lazy_key_grouping_detail::packed_key_grouping_result const&
+  structural_classes() const {
+    return workspace().structural_grouping;
+  }
+
+  [[nodiscard]] lazy_key_grouping_detail::packed_key_grouping_result const&
+  row_key_classes() const {
+    return workspace().row_grouping;
+  }
+
+  [[nodiscard]] std::span<lazy_key_grouping_detail::packed_key_word const>
+  row_key_words() const {
+    return workspace().packed_words;
+  }
+};
+
+inline std::size_t estimate_plan_parent_key_grouping_logical_resident_bytes(
+    std::size_t pattern_count, std::size_t structural_width,
+    std::size_t structural_class_count, std::size_t row_width,
+    std::size_t row_key_class_count) {
+  using namespace lazy_key_grouping_detail;
+  auto const structural =
+      estimate_packed_key_grouping_memory(pattern_count, structural_width);
+  auto const rows =
+      estimate_packed_key_grouping_memory(structural_class_count, row_width);
+
+  auto total = checked_packed_key_bytes_add(
+      sizeof(plan_parent_key_workspace), sizeof(packed_plan_parent_keys),
+      "lazy plan parent-key fixed resident estimate");
+  total = checked_packed_key_bytes_add(
+      total,
+      std::max(structural.packed_payload_logical_bytes,
+               rows.packed_payload_logical_bytes),
+      "lazy plan parent-key payload estimate");
+  total = checked_packed_key_bytes_add(
+      total,
+      std::max(structural.workspace_logical_dynamic_bytes,
+               rows.workspace_logical_dynamic_bytes),
+      "lazy plan parent-key grouping-workspace estimate");
+  total = checked_packed_key_bytes_add(
+      total,
+      estimate_packed_key_grouping_result_logical_dynamic_bytes(
+          pattern_count, structural_class_count),
+      "lazy plan structural-grouping result estimate");
+  return checked_packed_key_bytes_add(
+      total,
+      estimate_packed_key_grouping_result_logical_dynamic_bytes(
+          structural_class_count, row_key_class_count),
+      "lazy plan row-grouping result estimate");
+}
+
+inline void record_plan_parent_key_preparation_peak(
+    plan_parent_key_grouping_memory_accounting& accounting,
+    std::size_t current_workspace_resident_bytes,
+    std::size_t previous_component_resident_bytes,
+    std::size_t observed_component_peak_resident_bytes) {
+  if (observed_component_peak_resident_bytes <
+      previous_component_resident_bytes) {
+    throw std::logic_error(
+        "lazy chart: packed-key preparation peak is below prior resident");
+  }
+  auto const staged_extra = observed_component_peak_resident_bytes -
+                            previous_component_resident_bytes;
+  auto peak = lazy_key_grouping_detail::checked_packed_key_bytes_add(
+      sizeof(packed_plan_parent_keys), current_workspace_resident_bytes,
+      "lazy plan parent-key preparation peak");
+  peak = lazy_key_grouping_detail::checked_packed_key_bytes_add(
+      peak, staged_extra, "lazy plan parent-key preparation peak");
+  accounting.observed_prepublication_peak_capacity_resident_bytes = std::max(
+      accounting.observed_prepublication_peak_capacity_resident_bytes, peak);
+}
+
+inline void require_plan_parent_key_grouping_success(
+    lazy_key_grouping_detail::packed_key_grouping_prepared_status status) {
+  if (!status.succeeded()) {
+    lazy_key_grouping_detail::throw_packed_key_grouping_prepared_failure(
+        status);
+  }
+}
+
+inline packed_plan_parent_keys collect_plan_parent_keys(
     lazy_multisite_chart& chart, chart_execution_plan const& plan,
     site_pattern_set const& patterns, clade_id parent,
-    map_dependency_counts* remaining) {
+    map_dependency_counts* remaining, plan_parent_key_workspace& workspace) {
   auto const production_ids = plan.productions_for_parent(parent);
   if (production_ids.empty()) {
     throw std::runtime_error(
         "lazy chart: non-singleton clade has no productions");
   }
 
-  sparse_parent_keys keys;
-  keys.structural_key_by_pattern.resize(chart.pattern_count);
-  keys.row_key_by_pattern.resize(chart.pattern_count);
-  keys.row_key_offset_by_production_child.reserve(production_ids.size());
+  using namespace lazy_key_grouping_detail;
+  auto const structural_children = plan.children(production_ids.front());
+  auto const structural_width = structural_children.size();
+  std::size_t row_width = 0;
+  for (auto production : production_ids) {
+    row_width = checked_packed_key_count_add(row_width,
+                                             plan.children(production).size(),
+                                             "lazy plan parent row-key width");
+  }
 
-  std::size_t next_row_offset = 0;
-  for (std::size_t prod_i = 0; prod_i < production_ids.size(); ++prod_i) {
-    auto const children = plan.children(production_ids[prod_i]);
-    auto& offsets = keys.row_key_offset_by_production_child.emplace_back();
-    offsets.reserve(children.size());
-    for (auto child : children) {
-      offsets.push_back(next_row_offset++);
-      for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
-        keys.row_key_by_pattern[pattern].push_back(
+  packed_plan_parent_keys keys;
+  keys.storage = &workspace;
+  keys.structural_key_width = structural_width;
+  keys.row_key_width = row_width;
+  keys.memory.structural_key_count = chart.pattern_count;
+  keys.memory.structural_key_width = structural_width;
+
+  auto const structural_estimate = estimate_packed_key_grouping_memory(
+      chart.pattern_count, structural_width);
+  auto workspace_before = workspace.resident_bytes();
+  keys.memory.structural_word_preparation = prepare_packed_key_word_buffer(
+      structural_estimate.packed_word_count, workspace.packed_words);
+  record_plan_parent_key_preparation_peak(
+      keys.memory, workspace_before,
+      keys.memory.structural_word_preparation.previous_capacity_resident_bytes,
+      keys.memory.structural_word_preparation
+          .observed_prepublication_peak_capacity_resident_bytes);
+  workspace.packed_words.resize(structural_estimate.packed_word_count);
+  for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
+    auto output = pattern * structural_width;
+    for (auto child : structural_children) {
+      workspace.packed_words[output++] =
+          checked_packed_key_word(plan_structural_class_index_for_pattern(
+                                      chart, plan, patterns, child, pattern),
+                                  "lazy plan structural class index");
+    }
+  }
+
+  workspace_before = workspace.resident_bytes();
+  keys.memory.structural_grouping_preparation =
+      prepare_packed_key_grouping_storage(chart.pattern_count,
+                                          workspace.grouping_workspace,
+                                          workspace.structural_grouping);
+  record_plan_parent_key_preparation_peak(
+      keys.memory, workspace_before,
+      keys.memory.structural_grouping_preparation
+          .previous_owned_capacity_resident_bytes,
+      keys.memory.structural_grouping_preparation
+          .observed_prepublication_peak_owned_capacity_resident_bytes);
+  auto structural_view = packed_key_matrix_view{
+      .key_count = chart.pattern_count,
+      .key_width = structural_width,
+      .words = workspace.packed_words,
+  };
+  require_plan_parent_key_grouping_success(try_group_packed_keys_prepared(
+      structural_view, workspace.grouping_workspace,
+      workspace.structural_grouping,
+      keys.memory.structural_grouping_preparation
+          .prepared_owned_capacity_resident_bytes));
+
+  auto const structural_class_count =
+      workspace.structural_grouping.class_count();
+  keys.memory.row_key_count = structural_class_count;
+  keys.memory.row_key_width = row_width;
+  auto const row_estimate =
+      estimate_packed_key_grouping_memory(structural_class_count, row_width);
+  workspace_before = workspace.resident_bytes();
+  keys.memory.row_word_preparation = prepare_packed_key_word_buffer(
+      row_estimate.packed_word_count, workspace.packed_words);
+  record_plan_parent_key_preparation_peak(
+      keys.memory, workspace_before,
+      keys.memory.row_word_preparation.previous_capacity_resident_bytes,
+      keys.memory.row_word_preparation
+          .observed_prepublication_peak_capacity_resident_bytes);
+  workspace.packed_words.resize(row_estimate.packed_word_count);
+  for (std::size_t structural_class = 0;
+       structural_class < structural_class_count; ++structural_class) {
+    auto const representative =
+        workspace.structural_grouping.representative_by_class[structural_class];
+    auto output = structural_class * row_width;
+    for (auto production : production_ids) {
+      for (auto child : plan.children(production)) {
+        workspace.packed_words[output++] = checked_packed_key_word(
             plan_inside_class_index_for_pattern(chart, plan, patterns, child,
-                                                pattern));
-        if (prod_i == 0) {
-          keys.structural_key_by_pattern[pattern].push_back(
-              plan_structural_class_index_for_pattern(
-                  chart, plan, patterns, child, pattern));
-        }
+                                                representative),
+            "lazy plan inside-row class index");
       }
+    }
+  }
 
-      if (remaining != nullptr) {
+  workspace_before = workspace.resident_bytes();
+  keys.memory.row_grouping_preparation = prepare_packed_key_grouping_storage(
+      structural_class_count, workspace.grouping_workspace,
+      workspace.row_grouping);
+  record_plan_parent_key_preparation_peak(
+      keys.memory, workspace_before,
+      keys.memory.row_grouping_preparation
+          .previous_owned_capacity_resident_bytes,
+      keys.memory.row_grouping_preparation
+          .observed_prepublication_peak_owned_capacity_resident_bytes);
+  auto row_view = packed_key_matrix_view{
+      .key_count = structural_class_count,
+      .key_width = row_width,
+      .words = workspace.packed_words,
+  };
+  require_plan_parent_key_grouping_success(try_group_packed_keys_prepared(
+      row_view, workspace.grouping_workspace, workspace.row_grouping,
+      keys.memory.row_grouping_preparation
+          .prepared_owned_capacity_resident_bytes));
+  keys.memory.row_key_class_count = workspace.row_grouping.class_count();
+
+  // Sparse maps remain readable through both collection stages. Consume each
+  // dependency only after all packed keys and groupings are complete.
+  if (remaining != nullptr) {
+    for (std::size_t prod_i = 0; prod_i < production_ids.size(); ++prod_i) {
+      for (auto child : plan.children(production_ids[prod_i])) {
         consume_plan_inside_child_map(chart, plan, child, *remaining);
         if (prod_i == 0) {
           consume_plan_structural_child_map(chart, plan, child, *remaining);
@@ -990,16 +1234,56 @@ inline sparse_parent_keys collect_plan_parent_keys(
       }
     }
   }
+
+  keys.memory.logical_resident_bytes =
+      estimate_plan_parent_key_grouping_logical_resident_bytes(
+          chart.pattern_count, structural_width, structural_class_count,
+          row_width, keys.memory.row_key_class_count);
+  keys.memory.actual_capacity_resident_bytes = checked_packed_key_bytes_add(
+      sizeof(packed_plan_parent_keys), workspace.resident_bytes(),
+      "lazy plan parent-key actual resident");
+  keys.memory.observed_prepublication_peak_capacity_resident_bytes =
+      std::max(keys.memory.observed_prepublication_peak_capacity_resident_bytes,
+               keys.memory.actual_capacity_resident_bytes);
+  return keys;
+}
+
+// The local-commit compatibility boundary has no caller-owned scratch in its
+// current API. Keep that source-compatible call safe by making the returned
+// handle own its storage; ordinary full construction reuses an external
+// workspace across every clade.
+inline packed_plan_parent_keys collect_plan_parent_keys(
+    lazy_multisite_chart& chart, chart_execution_plan const& plan,
+    site_pattern_set const& patterns, clade_id parent,
+    map_dependency_counts* remaining) {
+  auto owned_storage = std::make_unique<plan_parent_key_workspace>();
+  auto keys = collect_plan_parent_keys(chart, plan, patterns, parent, remaining,
+                                       *owned_storage);
+  keys.owned_storage = std::move(owned_storage);
   return keys;
 }
 
 inline row_type compute_plan_internal_inside_row_from_keys(
     lazy_multisite_chart const& chart, chart_execution_plan const& plan,
-    clade_id clade, sparse_parent_keys const& keys,
-    std::size_t representative_pattern,
-    std::size_t& multifurcation_counter) {
+    clade_id clade, packed_plan_parent_keys const& keys,
+    std::size_t structural_class, std::size_t& multifurcation_counter) {
+  auto const& structural_classes = keys.structural_classes();
+  if (structural_class >= structural_classes.class_count()) {
+    throw std::runtime_error("lazy chart: structural class index out of range");
+  }
+  auto const words = keys.row_key_words();
+  auto const expected_word_count =
+      lazy_key_grouping_detail::checked_packed_key_count_multiply(
+          structural_classes.class_count(), keys.row_key_width,
+          "lazy plan row-key matrix");
+  if (words.size() != expected_word_count) {
+    throw std::runtime_error("lazy chart: packed row-key size mismatch");
+  }
+
   auto row = parsimony_chart_detail::make_inf_row();
   auto const production_ids = plan.productions_for_parent(clade);
+  auto const key_begin = structural_class * keys.row_key_width;
+  std::size_t row_key_offset = 0;
   for (std::size_t prod_i = 0; prod_i < production_ids.size(); ++prod_i) {
     auto const pid = production_ids[prod_i];
     auto const& production = plan.production(pid);
@@ -1011,10 +1295,8 @@ inline row_type compute_plan_internal_inside_row_from_keys(
       chart_cost candidate = 0;
       for (std::size_t child_i = 0; child_i < children.size(); ++child_i) {
         auto const child = children[child_i];
-        auto const offset =
-            keys.row_key_offset_by_production_child[prod_i][child_i];
-        auto const class_index =
-            keys.row_key_by_pattern[representative_pattern][offset];
+        auto const class_index = static_cast<std::size_t>(
+            words[key_begin + row_key_offset + child_i]);
         auto const& child_rows = chart.inside_rows_by_clade[child];
         if (class_index >= child_rows.size()) {
           throw std::runtime_error(
@@ -1037,6 +1319,10 @@ inline row_type compute_plan_internal_inside_row_from_keys(
       }
       row[parent_state] = std::min(row[parent_state], candidate);
     }
+    row_key_offset += children.size();
+  }
+  if (row_key_offset != keys.row_key_width) {
+    throw std::runtime_error("lazy chart: packed row-key width mismatch");
   }
   return row;
 }
@@ -1092,47 +1378,46 @@ inline void assign_plan_leaf_classes(lazy_multisite_chart& chart,
   chart.structural_class_count_by_clade[clade] = rows.size();
 }
 
-inline void assign_plan_internal_classes(
-    lazy_multisite_chart& chart, chart_execution_plan const& plan,
-    site_pattern_set const& patterns, clade_id clade,
-    sparse_parent_keys const& keys) {
-  std::map<std::vector<std::size_t>, std::size_t> structural_index_by_key;
-  std::vector<std::size_t> structural_representative_pattern;
-  std::vector<std::size_t> structural_map(chart.pattern_count, 0);
-
-  for (std::size_t pattern_index = 0; pattern_index < chart.pattern_count;
-       ++pattern_index) {
-    auto [it, inserted] = structural_index_by_key.emplace(
-        keys.structural_key_by_pattern[pattern_index],
-        structural_index_by_key.size());
-    if (inserted) structural_representative_pattern.push_back(pattern_index);
-    structural_map[pattern_index] = it->second;
+inline void assign_plan_internal_classes(lazy_multisite_chart& chart,
+                                         chart_execution_plan const& plan,
+                                         site_pattern_set const& patterns,
+                                         clade_id clade,
+                                         packed_plan_parent_keys const& keys) {
+  auto const& structural_classes = keys.structural_classes();
+  auto const& row_key_classes = keys.row_key_classes();
+  if (structural_classes.class_by_input.size() != chart.pattern_count ||
+      row_key_classes.class_by_input.size() !=
+          structural_classes.class_count()) {
+    throw std::runtime_error("lazy chart: packed parent-key count mismatch");
   }
-
-  std::map<std::vector<std::size_t>, row_type> candidate_row_by_key;
+  auto structural_map = structural_classes.class_by_input;
   std::vector<std::size_t> structural_to_row_class(
-      structural_representative_pattern.size(), 0);
+      structural_classes.class_count(), 0);
+  std::vector<std::size_t> row_key_to_row_class(row_key_classes.class_count(),
+                                                0);
   std::map<row_type, std::size_t> row_class_by_row;
   auto& rows = chart.inside_rows_by_clade[clade];
 
-  for (std::size_t structural_class = 0;
-       structural_class < structural_representative_pattern.size();
-       ++structural_class) {
-    auto const representative =
-        structural_representative_pattern[structural_class];
-    auto const& row_key = keys.row_key_by_pattern[representative];
-    auto row_it = candidate_row_by_key.find(row_key);
-    if (row_it == candidate_row_by_key.end()) {
-      auto row = compute_plan_internal_inside_row_from_keys(
-          chart, plan, clade, keys, representative,
-          chart.multifurcation_productions_scored);
-      row_it = candidate_row_by_key.emplace(row_key, row).first;
-    }
-
+  // Row-key class IDs are first-occurrence IDs over structural classes. This
+  // is exactly the former structural-class traversal with duplicate key
+  // computations skipped, without depending on lexicographic map order.
+  for (std::size_t row_key_class = 0;
+       row_key_class < row_key_classes.class_count(); ++row_key_class) {
+    auto const structural_class =
+        row_key_classes.representative_by_class[row_key_class];
+    auto const row = compute_plan_internal_inside_row_from_keys(
+        chart, plan, clade, keys, structural_class,
+        chart.multifurcation_productions_scored);
     auto [class_it, inserted] =
-        row_class_by_row.emplace(row_it->second, row_class_by_row.size());
-    if (inserted) rows.push_back(row_it->second);
-    structural_to_row_class[structural_class] = class_it->second;
+        row_class_by_row.emplace(row, row_class_by_row.size());
+    if (inserted) rows.push_back(row);
+    row_key_to_row_class[row_key_class] = class_it->second;
+  }
+  for (std::size_t structural_class = 0;
+       structural_class < structural_classes.class_count();
+       ++structural_class) {
+    structural_to_row_class[structural_class] =
+        row_key_to_row_class[row_key_classes.class_by_input[structural_class]];
   }
 
   std::vector<std::size_t> class_map(chart.pattern_count, 0);
@@ -1149,10 +1434,10 @@ inline void assign_plan_internal_classes(
   }
 
   chart.structural_class_count_by_clade[clade] =
-      structural_representative_pattern.size();
-  if (structural_representative_pattern.size() > rows.size()) {
+      structural_classes.class_count();
+  if (structural_classes.class_count() > rows.size()) {
     chart.lazy_remerge_collisions +=
-        structural_representative_pattern.size() - rows.size();
+        structural_classes.class_count() - rows.size();
   }
   chart.class_index_by_pattern_by_clade[clade] = std::move(class_map);
   chart.structural_class_index_by_pattern_by_clade[clade] =
@@ -1187,6 +1472,7 @@ inline void materialize_inside_class_maps(
     throw std::runtime_error("lazy chart: inside chart clade count mismatch");
   }
 
+  plan_parent_key_workspace key_workspace;
   for (auto clade : plan.bottom_up_order()) {
     auto const& descriptor = plan.clade(clade);
     if (descriptor.is_leaf()) {
@@ -1208,20 +1494,12 @@ inline void materialize_inside_class_maps(
       continue;
     }
 
-    auto const keys =
-        collect_plan_parent_keys(chart, plan, patterns, clade, nullptr);
-    std::map<std::vector<std::size_t>, std::size_t> structural_index_by_key;
-    std::vector<std::size_t> structural_representative_pattern;
-    std::vector<std::size_t> structural_map(chart.pattern_count, 0);
-    for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
-      auto [it, inserted] = structural_index_by_key.emplace(
-          keys.structural_key_by_pattern[pattern],
-          structural_index_by_key.size());
-      if (inserted) structural_representative_pattern.push_back(pattern);
-      structural_map[pattern] = it->second;
-    }
+    auto const keys = collect_plan_parent_keys(chart, plan, patterns, clade,
+                                               nullptr, key_workspace);
+    auto const& structural_classes = keys.structural_classes();
+    auto structural_map = structural_classes.class_by_input;
     if (chart.structural_class_count_by_clade[clade] !=
-        structural_representative_pattern.size()) {
+        structural_classes.class_count()) {
       throw std::runtime_error(
           "lazy chart: materialized structural class count mismatch");
     }
@@ -1233,15 +1511,13 @@ inline void materialize_inside_class_maps(
     }
 
     std::vector<std::size_t> structural_to_row_class(
-        structural_representative_pattern.size(), 0);
+        structural_classes.class_count(), 0);
     for (std::size_t structural_class = 0;
-         structural_class < structural_representative_pattern.size();
+         structural_class < structural_classes.class_count();
          ++structural_class) {
-      auto const representative =
-          structural_representative_pattern[structural_class];
       std::size_t ignored_multifurcation_counter = 0;
       auto const row = compute_plan_internal_inside_row_from_keys(
-          chart, plan, clade, keys, representative,
+          chart, plan, clade, keys, structural_class,
           ignored_multifurcation_counter);
       auto const row_it = row_class_by_row.find(row);
       if (row_it == row_class_by_row.end()) {
@@ -1788,6 +2064,7 @@ inline lazy_multisite_chart build_lazy_inside_chart(
     remaining_dependencies = count_map_dependencies(plan);
   }
 
+  plan_parent_key_workspace key_workspace;
   for (auto clade : plan.bottom_up_order()) {
     if (plan.clade(clade).is_leaf()) {
       assign_plan_leaf_classes(chart, plan, patterns, clade, options);
@@ -1795,7 +2072,8 @@ inline lazy_multisite_chart build_lazy_inside_chart(
     }
     auto keys = collect_plan_parent_keys(
         chart, plan, patterns, clade,
-        remaining_dependencies ? &*remaining_dependencies : nullptr);
+        remaining_dependencies ? &*remaining_dependencies : nullptr,
+        key_workspace);
     assign_plan_internal_classes(chart, plan, patterns, clade, keys);
   }
 
