@@ -259,78 +259,6 @@ inline std::size_t structural_class_index_for_pattern(
   return leaf_class_index_for_pattern(chart, grammar, patterns, clade, pattern);
 }
 
-inline std::vector<std::size_t> structural_key_for_production(
-    lazy_multisite_chart const& chart, clade_grammar const& grammar,
-    site_pattern_set const& patterns, grammar_production const& prod,
-    std::size_t pattern) {
-  std::vector<std::size_t> key;
-  key.reserve(prod.children.size());
-  for (auto child : prod.children) {
-    key.push_back(structural_class_index_for_pattern(chart, grammar, patterns,
-                                                     child, pattern));
-  }
-  return key;
-}
-
-inline std::vector<std::size_t> row_key_for_all_productions(
-    lazy_multisite_chart const& chart, clade_grammar const& grammar,
-    site_pattern_set const& patterns,
-    std::vector<production_id> const& production_ids, std::size_t pattern) {
-  std::vector<std::size_t> key;
-  for (auto pid : production_ids) {
-    if (pid == no_production || pid >= grammar.productions.size()) {
-      throw std::runtime_error("lazy chart: production id out of range");
-    }
-    auto const& prod = grammar.productions[pid];
-    key.reserve(key.size() + prod.children.size());
-    for (auto child : prod.children) {
-      key.push_back(
-          inside_class_index_for_pattern(chart, grammar, patterns, child,
-                                         pattern));
-    }
-  }
-  return key;
-}
-
-inline row_type compute_internal_inside_row(
-    lazy_multisite_chart const& chart, clade_grammar const& grammar,
-    site_pattern_set const& patterns, clade_id clade,
-    std::vector<production_id> const& production_ids,
-    std::size_t representative_pattern, std::size_t& multifurcation_counter) {
-  auto row = parsimony_chart_detail::make_inf_row();
-  for (auto pid : production_ids) {
-    if (pid == no_production || pid >= grammar.productions.size()) {
-      throw std::runtime_error("lazy chart: production id out of range");
-    }
-    auto const& prod = grammar.productions[pid];
-    if (prod.parent != clade) {
-      throw std::runtime_error(
-          "lazy chart: productions_by_parent contains mismatched parent");
-    }
-    parsimony_chart_detail::validate_production_inside_row_inputs(
-        grammar, prod, pid, "lazy inside chart");
-    if (prod.children.size() != 2) ++multifurcation_counter;
-
-    for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
-         ++parent_state) {
-      auto row_provider = [&](clade_id child) -> row_type const& {
-        auto class_index = inside_class_index_for_pattern(
-            chart, grammar, patterns, child, representative_pattern);
-        auto const& child_rows = chart.inside_rows_by_clade[child];
-        if (class_index >= child_rows.size()) {
-          throw std::runtime_error(
-              "lazy chart: child inside class index out of range");
-        }
-        return child_rows[class_index];
-      };
-      auto candidate = parsimony_chart_detail::combine_production_inside_row(
-          prod, parent_state, row_provider);
-      row[parent_state] = std::min(row[parent_state], candidate);
-    }
-  }
-  return row;
-}
-
 inline void assign_leaf_classes(lazy_multisite_chart& chart,
                                 clade_grammar const& grammar,
                                 site_pattern_set const& patterns,
@@ -388,96 +316,6 @@ inline void assign_leaf_classes(lazy_multisite_chart& chart,
   chart.structural_class_count_by_clade[clade] = rows.size();
 }
 
-inline void assign_internal_classes(lazy_multisite_chart& chart,
-                                    clade_grammar const& grammar,
-                                    site_pattern_set const& patterns,
-                                    clade_id clade) {
-  auto const& production_ids = grammar.productions_by_parent[clade];
-  if (production_ids.empty()) {
-    throw std::runtime_error("lazy chart: non-singleton clade has no productions");
-  }
-
-  for (auto pid : production_ids) {
-    if (pid == no_production || pid >= grammar.productions.size()) {
-      throw std::runtime_error("lazy chart: production id out of range");
-    }
-    auto const& prod = grammar.productions[pid];
-    if (prod.parent != clade) {
-      throw std::runtime_error(
-          "lazy chart: productions_by_parent contains mismatched parent");
-    }
-    parsimony_chart_detail::validate_production_inside_row_inputs(
-        grammar, prod, pid, "lazy inside chart");
-  }
-
-  auto const& structural_prod = grammar.productions[production_ids.front()];
-  std::map<std::vector<std::size_t>, std::size_t> structural_index_by_key;
-  std::vector<std::size_t> structural_representative_pattern;
-  std::vector<std::size_t> structural_map(chart.pattern_count, 0);
-
-  for (std::size_t pattern_index = 0; pattern_index < chart.pattern_count;
-       ++pattern_index) {
-    auto key = structural_key_for_production(chart, grammar, patterns,
-                                             structural_prod,
-                                             pattern_index);
-    auto [it, inserted] =
-        structural_index_by_key.emplace(std::move(key),
-                                        structural_index_by_key.size());
-    if (inserted) structural_representative_pattern.push_back(pattern_index);
-    structural_map[pattern_index] = it->second;
-  }
-
-  std::map<std::vector<std::size_t>, row_type> candidate_row_by_key;
-  std::vector<std::size_t> structural_to_row_class(
-      structural_representative_pattern.size(), 0);
-  std::map<row_type, std::size_t> row_class_by_row;
-  auto& rows = chart.inside_rows_by_clade[clade];
-
-  for (std::size_t structural_class = 0;
-       structural_class < structural_representative_pattern.size();
-       ++structural_class) {
-    auto representative = structural_representative_pattern[structural_class];
-    auto row_key =
-        row_key_for_all_productions(chart, grammar, patterns, production_ids,
-                                    representative);
-    auto row_it = candidate_row_by_key.find(row_key);
-    if (row_it == candidate_row_by_key.end()) {
-      auto row = compute_internal_inside_row(
-          chart, grammar, patterns, clade, production_ids, representative,
-          chart.multifurcation_productions_scored);
-      row_it = candidate_row_by_key.emplace(std::move(row_key), row).first;
-    }
-
-    auto [class_it, inserted] =
-        row_class_by_row.emplace(row_it->second, row_class_by_row.size());
-    if (inserted) rows.push_back(row_it->second);
-    structural_to_row_class[structural_class] = class_it->second;
-  }
-
-  std::vector<std::size_t> class_map(chart.pattern_count, 0);
-  auto& weights = chart.class_weight_by_clade[clade];
-  weights.assign(rows.size(), 0);
-  for (std::size_t pattern_index = 0; pattern_index < chart.pattern_count;
-       ++pattern_index) {
-    auto structural_class = structural_map[pattern_index];
-    auto row_class = structural_to_row_class[structural_class];
-    class_map[pattern_index] = row_class;
-    checked_add_weight(weights[row_class],
-                       patterns.patterns[pattern_index].weight,
-                       "internal class");
-  }
-
-  chart.structural_class_count_by_clade[clade] =
-      structural_representative_pattern.size();
-  if (structural_representative_pattern.size() > rows.size()) {
-    chart.lazy_remerge_collisions +=
-        structural_representative_pattern.size() - rows.size();
-  }
-  chart.class_index_by_pattern_by_clade[clade] = std::move(class_map);
-  chart.structural_class_index_by_pattern_by_clade[clade] =
-      std::move(structural_map);
-}
-
 inline void finalize_inside_counters(lazy_multisite_chart& chart) {
   chart.lazy_inside_rows_computed = 0;
   chart.lazy_patterns_merged_max = 0;
@@ -512,12 +350,6 @@ inline void maybe_discard_nonroot_maps(lazy_multisite_chart& chart,
 struct map_dependency_counts {
   std::vector<std::size_t> inside;
   std::vector<std::size_t> structural;
-};
-
-struct sparse_parent_keys {
-  std::vector<std::vector<std::size_t>> structural_key_by_pattern;
-  std::vector<std::vector<std::size_t>> row_key_by_pattern;
-  std::vector<std::vector<std::size_t>> row_key_offset_by_production_child;
 };
 
 inline map_dependency_counts count_map_dependencies(
@@ -583,276 +415,6 @@ inline void consume_structural_child_map(lazy_multisite_chart& chart,
   --remaining.structural[child];
   if (remaining.structural[child] == 0 && child != grammar.root_clade) {
     chart.structural_class_index_by_pattern_by_clade[child] = std::nullopt;
-  }
-}
-
-inline row_type compute_internal_inside_row_from_sparse_keys(
-    lazy_multisite_chart const& chart, clade_grammar const& grammar,
-    clade_id clade, std::vector<production_id> const& production_ids,
-    sparse_parent_keys const& keys, std::size_t representative_pattern,
-    std::size_t& multifurcation_counter) {
-  auto row = parsimony_chart_detail::make_inf_row();
-  for (std::size_t prod_i = 0; prod_i < production_ids.size(); ++prod_i) {
-    auto pid = production_ids[prod_i];
-    auto const& prod = grammar.productions[pid];
-    if (prod.parent != clade) {
-      throw std::runtime_error(
-          "lazy chart: productions_by_parent contains mismatched parent");
-    }
-    parsimony_chart_detail::validate_production_inside_row_inputs(
-        grammar, prod, pid, "lazy inside chart");
-    if (prod.children.size() != 2) ++multifurcation_counter;
-
-    for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
-         ++parent_state) {
-      std::size_t child_i = 0;
-      auto row_provider = [&](clade_id child) -> row_type const& {
-        if (child_i >= prod.children.size() || prod.children[child_i] != child) {
-          throw std::runtime_error(
-              "lazy chart: sparse row provider child order mismatch");
-        }
-        auto offset =
-            keys.row_key_offset_by_production_child[prod_i][child_i++];
-        auto class_index = keys.row_key_by_pattern[representative_pattern]
-                                                 [offset];
-        auto const& child_rows = chart.inside_rows_by_clade[child];
-        if (class_index >= child_rows.size()) {
-          throw std::runtime_error(
-              "lazy chart: child inside class index out of range");
-        }
-        return child_rows[class_index];
-      };
-      auto candidate = parsimony_chart_detail::combine_production_inside_row(
-          prod, parent_state, row_provider);
-      row[parent_state] = std::min(row[parent_state], candidate);
-    }
-  }
-  return row;
-}
-
-inline void assign_internal_classes_from_sparse_keys(
-    lazy_multisite_chart& chart, clade_grammar const& grammar,
-    site_pattern_set const& patterns, clade_id clade,
-    sparse_parent_keys const& keys) {
-  auto const& production_ids = grammar.productions_by_parent[clade];
-  if (production_ids.empty()) {
-    throw std::runtime_error("lazy chart: non-singleton clade has no productions");
-  }
-
-  std::map<std::vector<std::size_t>, std::size_t> structural_index_by_key;
-  std::vector<std::size_t> structural_representative_pattern;
-  std::vector<std::size_t> structural_map(chart.pattern_count, 0);
-
-  for (std::size_t pattern_index = 0; pattern_index < chart.pattern_count;
-       ++pattern_index) {
-    auto [it, inserted] = structural_index_by_key.emplace(
-        keys.structural_key_by_pattern[pattern_index],
-        structural_index_by_key.size());
-    if (inserted) structural_representative_pattern.push_back(pattern_index);
-    structural_map[pattern_index] = it->second;
-  }
-
-  std::map<std::vector<std::size_t>, row_type> candidate_row_by_key;
-  std::vector<std::size_t> structural_to_row_class(
-      structural_representative_pattern.size(), 0);
-  std::map<row_type, std::size_t> row_class_by_row;
-  auto& rows = chart.inside_rows_by_clade[clade];
-
-  for (std::size_t structural_class = 0;
-       structural_class < structural_representative_pattern.size();
-       ++structural_class) {
-    auto representative = structural_representative_pattern[structural_class];
-    auto const& row_key = keys.row_key_by_pattern[representative];
-    auto row_it = candidate_row_by_key.find(row_key);
-    if (row_it == candidate_row_by_key.end()) {
-      auto row = compute_internal_inside_row_from_sparse_keys(
-          chart, grammar, clade, production_ids, keys, representative,
-          chart.multifurcation_productions_scored);
-      row_it = candidate_row_by_key.emplace(row_key, row).first;
-    }
-
-    auto [class_it, inserted] =
-        row_class_by_row.emplace(row_it->second, row_class_by_row.size());
-    if (inserted) rows.push_back(row_it->second);
-    structural_to_row_class[structural_class] = class_it->second;
-  }
-
-  std::vector<std::size_t> class_map(chart.pattern_count, 0);
-  auto& weights = chart.class_weight_by_clade[clade];
-  weights.assign(rows.size(), 0);
-  for (std::size_t pattern_index = 0; pattern_index < chart.pattern_count;
-       ++pattern_index) {
-    auto structural_class = structural_map[pattern_index];
-    auto row_class = structural_to_row_class[structural_class];
-    class_map[pattern_index] = row_class;
-    checked_add_weight(weights[row_class],
-                       patterns.patterns[pattern_index].weight,
-                       "internal class");
-  }
-
-  chart.structural_class_count_by_clade[clade] =
-      structural_representative_pattern.size();
-  if (structural_representative_pattern.size() > rows.size()) {
-    chart.lazy_remerge_collisions +=
-        structural_representative_pattern.size() - rows.size();
-  }
-  chart.class_index_by_pattern_by_clade[clade] = std::move(class_map);
-  chart.structural_class_index_by_pattern_by_clade[clade] =
-      std::move(structural_map);
-}
-
-template <class BuildChild>
-inline sparse_parent_keys collect_sparse_parent_keys(
-    lazy_multisite_chart& chart, clade_grammar const& grammar,
-    site_pattern_set const& patterns, clade_id parent, BuildChild&& build_child,
-    map_dependency_counts& remaining) {
-  auto const& production_ids = grammar.productions_by_parent[parent];
-  if (production_ids.empty()) {
-    throw std::runtime_error("lazy chart: non-singleton clade has no productions");
-  }
-
-  sparse_parent_keys keys;
-  keys.structural_key_by_pattern.resize(chart.pattern_count);
-  keys.row_key_by_pattern.resize(chart.pattern_count);
-  keys.row_key_offset_by_production_child.reserve(production_ids.size());
-
-  std::size_t next_row_offset = 0;
-  for (std::size_t prod_i = 0; prod_i < production_ids.size(); ++prod_i) {
-    auto pid = production_ids[prod_i];
-    if (pid == no_production || pid >= grammar.productions.size()) {
-      throw std::runtime_error("lazy chart: production id out of range");
-    }
-    auto const& prod = grammar.productions[pid];
-    if (prod.parent != parent) {
-      throw std::runtime_error(
-          "lazy chart: productions_by_parent contains mismatched parent");
-    }
-    parsimony_chart_detail::validate_production_inside_row_inputs(
-        grammar, prod, pid, "lazy inside chart");
-
-    auto& offsets = keys.row_key_offset_by_production_child.emplace_back();
-    offsets.reserve(prod.children.size());
-    for (auto child : prod.children) {
-      build_child(child);
-      offsets.push_back(next_row_offset++);
-
-      for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
-        keys.row_key_by_pattern[pattern].push_back(
-            inside_class_index_for_pattern(chart, grammar, patterns, child,
-                                           pattern));
-        if (prod_i == 0) {
-          keys.structural_key_by_pattern[pattern].push_back(
-              structural_class_index_for_pattern(chart, grammar, patterns,
-                                                 child, pattern));
-        }
-      }
-
-      consume_inside_child_map(chart, grammar, child, remaining);
-      if (prod_i == 0) {
-        consume_structural_child_map(chart, grammar, child, remaining);
-      }
-    }
-  }
-  return keys;
-}
-
-inline void materialize_inside_class_maps(
-    lazy_multisite_chart& chart, clade_grammar const& grammar,
-    site_pattern_set const& patterns) {
-  for (auto clade : clades_by_increasing_size(grammar)) {
-    auto const& key = grammar.clades[clade];
-    if (key.taxa.empty()) {
-      throw std::runtime_error("lazy chart: empty clade is invalid");
-    }
-
-    if (key.taxa.size() == 1) {
-      if (!chart.class_index_by_pattern_by_clade[clade]) {
-        std::vector<std::size_t> class_map(chart.pattern_count, 0);
-        for (std::size_t pattern = 0; pattern < chart.pattern_count;
-             ++pattern) {
-          class_map[pattern] =
-              leaf_class_index_for_pattern(chart, grammar, patterns, clade,
-                                           pattern);
-        }
-        chart.class_index_by_pattern_by_clade[clade] = class_map;
-        chart.structural_class_index_by_pattern_by_clade[clade] =
-            std::move(class_map);
-      }
-      continue;
-    }
-
-    if (chart.class_index_by_pattern_by_clade[clade] &&
-        chart.structural_class_index_by_pattern_by_clade[clade]) {
-      continue;
-    }
-
-    auto const& production_ids = grammar.productions_by_parent[clade];
-    if (production_ids.empty()) {
-      throw std::runtime_error("lazy chart: non-singleton clade has no productions");
-    }
-    for (auto pid : production_ids) {
-      if (pid == no_production || pid >= grammar.productions.size()) {
-        throw std::runtime_error("lazy chart: production id out of range");
-      }
-      auto const& prod = grammar.productions[pid];
-      if (prod.parent != clade) {
-        throw std::runtime_error(
-            "lazy chart: productions_by_parent contains mismatched parent");
-      }
-      parsimony_chart_detail::validate_production_inside_row_inputs(
-          grammar, prod, pid, "lazy inside chart materialize maps");
-    }
-
-    auto const& structural_prod = grammar.productions[production_ids.front()];
-    std::map<std::vector<std::size_t>, std::size_t> structural_index_by_key;
-    std::vector<std::size_t> structural_representative_pattern;
-    std::vector<std::size_t> structural_map(chart.pattern_count, 0);
-    for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
-      auto key = structural_key_for_production(chart, grammar, patterns,
-                                               structural_prod, pattern);
-      auto [it, inserted] =
-          structural_index_by_key.emplace(std::move(key),
-                                          structural_index_by_key.size());
-      if (inserted) structural_representative_pattern.push_back(pattern);
-      structural_map[pattern] = it->second;
-    }
-    if (chart.structural_class_count_by_clade[clade] !=
-        structural_representative_pattern.size()) {
-      throw std::runtime_error(
-          "lazy chart: materialized structural class count mismatch");
-    }
-
-    std::map<row_type, std::size_t> row_class_by_row;
-    auto const& rows = chart.inside_rows_by_clade[clade];
-    for (std::size_t class_index = 0; class_index < rows.size(); ++class_index) {
-      row_class_by_row.emplace(rows[class_index], class_index);
-    }
-
-    std::vector<std::size_t> structural_to_row_class(
-        structural_representative_pattern.size(), 0);
-    for (std::size_t structural_class = 0;
-         structural_class < structural_representative_pattern.size();
-         ++structural_class) {
-      auto representative = structural_representative_pattern[structural_class];
-      std::size_t ignored_multifurcation_counter = 0;
-      auto row = compute_internal_inside_row(
-          chart, grammar, patterns, clade, production_ids, representative,
-          ignored_multifurcation_counter);
-      auto row_it = row_class_by_row.find(row);
-      if (row_it == row_class_by_row.end()) {
-        throw std::runtime_error(
-            "lazy chart: materialized inside row not found in stored classes");
-      }
-      structural_to_row_class[structural_class] = row_it->second;
-    }
-
-    std::vector<std::size_t> class_map(chart.pattern_count, 0);
-    for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
-      class_map[pattern] = structural_to_row_class[structural_map[pattern]];
-    }
-    chart.class_index_by_pattern_by_clade[clade] = std::move(class_map);
-    chart.structural_class_index_by_pattern_by_clade[clade] =
-        std::move(structural_map);
   }
 }
 
@@ -1261,6 +823,458 @@ inline packed_plan_parent_keys collect_plan_parent_keys(
                                        *owned_storage);
   keys.owned_storage = std::move(owned_storage);
   return keys;
+}
+
+// Grammar-backed and execution-plan-backed inside builders intentionally share
+// the same staged storage and accounting contract. A packed handle borrows its
+// workspace until the caller has consumed the class maps and row-key words.
+using grammar_parent_key_grouping_memory_accounting =
+    plan_parent_key_grouping_memory_accounting;
+using grammar_parent_key_workspace = plan_parent_key_workspace;
+using packed_grammar_parent_keys = packed_plan_parent_keys;
+
+inline std::size_t estimate_grammar_parent_key_grouping_logical_resident_bytes(
+    std::size_t pattern_count, std::size_t structural_width,
+    std::size_t structural_class_count, std::size_t row_width,
+    std::size_t row_key_class_count) {
+  return estimate_plan_parent_key_grouping_logical_resident_bytes(
+      pattern_count, structural_width, structural_class_count, row_width,
+      row_key_class_count);
+}
+
+// All productions and children must already have been validated and built.
+// Keeping recursion outside this function is important: its returned handle
+// borrows the one workspace reused by the recursive grammar builder.
+inline packed_grammar_parent_keys collect_ready_grammar_parent_keys(
+    lazy_multisite_chart& chart, clade_grammar const& grammar,
+    site_pattern_set const& patterns, clade_id parent,
+    map_dependency_counts* remaining, grammar_parent_key_workspace& workspace) {
+  auto const& production_ids = grammar.productions_by_parent[parent];
+  if (production_ids.empty()) {
+    throw std::runtime_error(
+        "lazy chart: non-singleton clade has no productions");
+  }
+
+  using namespace lazy_key_grouping_detail;
+  auto const& structural_children =
+      grammar.productions[production_ids.front()].children;
+  auto const structural_width = structural_children.size();
+  std::size_t row_width = 0;
+  for (auto production : production_ids) {
+    row_width = checked_packed_key_count_add(
+        row_width, grammar.productions[production].children.size(),
+        "lazy grammar parent row-key width");
+  }
+
+  packed_grammar_parent_keys keys;
+  keys.storage = &workspace;
+  keys.structural_key_width = structural_width;
+  keys.row_key_width = row_width;
+  keys.memory.structural_key_count = chart.pattern_count;
+  keys.memory.structural_key_width = structural_width;
+
+  auto const structural_estimate = estimate_packed_key_grouping_memory(
+      chart.pattern_count, structural_width);
+  auto workspace_before = workspace.resident_bytes();
+  keys.memory.structural_word_preparation = prepare_packed_key_word_buffer(
+      structural_estimate.packed_word_count, workspace.packed_words);
+  record_plan_parent_key_preparation_peak(
+      keys.memory, workspace_before,
+      keys.memory.structural_word_preparation.previous_capacity_resident_bytes,
+      keys.memory.structural_word_preparation
+          .observed_prepublication_peak_capacity_resident_bytes);
+  workspace.packed_words.resize(structural_estimate.packed_word_count);
+  for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
+    auto output = pattern * structural_width;
+    for (auto child : structural_children) {
+      workspace.packed_words[output++] =
+          checked_packed_key_word(structural_class_index_for_pattern(
+                                      chart, grammar, patterns, child, pattern),
+                                  "lazy grammar structural class index");
+    }
+  }
+
+  workspace_before = workspace.resident_bytes();
+  keys.memory.structural_grouping_preparation =
+      prepare_packed_key_grouping_storage(chart.pattern_count,
+                                          workspace.grouping_workspace,
+                                          workspace.structural_grouping);
+  record_plan_parent_key_preparation_peak(
+      keys.memory, workspace_before,
+      keys.memory.structural_grouping_preparation
+          .previous_owned_capacity_resident_bytes,
+      keys.memory.structural_grouping_preparation
+          .observed_prepublication_peak_owned_capacity_resident_bytes);
+  auto const structural_view = packed_key_matrix_view{
+      .key_count = chart.pattern_count,
+      .key_width = structural_width,
+      .words = workspace.packed_words,
+  };
+  require_plan_parent_key_grouping_success(try_group_packed_keys_prepared(
+      structural_view, workspace.grouping_workspace,
+      workspace.structural_grouping,
+      keys.memory.structural_grouping_preparation
+          .prepared_owned_capacity_resident_bytes));
+
+  auto const structural_class_count =
+      workspace.structural_grouping.class_count();
+  keys.memory.row_key_count = structural_class_count;
+  keys.memory.row_key_width = row_width;
+  auto const row_estimate =
+      estimate_packed_key_grouping_memory(structural_class_count, row_width);
+  workspace_before = workspace.resident_bytes();
+  keys.memory.row_word_preparation = prepare_packed_key_word_buffer(
+      row_estimate.packed_word_count, workspace.packed_words);
+  record_plan_parent_key_preparation_peak(
+      keys.memory, workspace_before,
+      keys.memory.row_word_preparation.previous_capacity_resident_bytes,
+      keys.memory.row_word_preparation
+          .observed_prepublication_peak_capacity_resident_bytes);
+  workspace.packed_words.resize(row_estimate.packed_word_count);
+  for (std::size_t structural_class = 0;
+       structural_class < structural_class_count; ++structural_class) {
+    auto const representative =
+        workspace.structural_grouping.representative_by_class[structural_class];
+    auto output = structural_class * row_width;
+    for (auto production : production_ids) {
+      for (auto child : grammar.productions[production].children) {
+        workspace.packed_words[output++] = checked_packed_key_word(
+            inside_class_index_for_pattern(chart, grammar, patterns, child,
+                                           representative),
+            "lazy grammar inside-row class index");
+      }
+    }
+  }
+
+  workspace_before = workspace.resident_bytes();
+  keys.memory.row_grouping_preparation = prepare_packed_key_grouping_storage(
+      structural_class_count, workspace.grouping_workspace,
+      workspace.row_grouping);
+  record_plan_parent_key_preparation_peak(
+      keys.memory, workspace_before,
+      keys.memory.row_grouping_preparation
+          .previous_owned_capacity_resident_bytes,
+      keys.memory.row_grouping_preparation
+          .observed_prepublication_peak_owned_capacity_resident_bytes);
+  auto const row_view = packed_key_matrix_view{
+      .key_count = structural_class_count,
+      .key_width = row_width,
+      .words = workspace.packed_words,
+  };
+  require_plan_parent_key_grouping_success(try_group_packed_keys_prepared(
+      row_view, workspace.grouping_workspace, workspace.row_grouping,
+      keys.memory.row_grouping_preparation
+          .prepared_owned_capacity_resident_bytes));
+  keys.memory.row_key_class_count = workspace.row_grouping.class_count();
+
+  // Sparse child maps stay live until both packed stages have published their
+  // results. Only then may the dependency counters release them.
+  if (remaining != nullptr) {
+    for (std::size_t prod_i = 0; prod_i < production_ids.size(); ++prod_i) {
+      for (auto child : grammar.productions[production_ids[prod_i]].children) {
+        consume_inside_child_map(chart, grammar, child, *remaining);
+        if (prod_i == 0) {
+          consume_structural_child_map(chart, grammar, child, *remaining);
+        }
+      }
+    }
+  }
+
+  keys.memory.logical_resident_bytes =
+      estimate_grammar_parent_key_grouping_logical_resident_bytes(
+          chart.pattern_count, structural_width, structural_class_count,
+          row_width, keys.memory.row_key_class_count);
+  keys.memory.actual_capacity_resident_bytes = checked_packed_key_bytes_add(
+      sizeof(packed_grammar_parent_keys), workspace.resident_bytes(),
+      "lazy grammar parent-key actual resident");
+  keys.memory.observed_prepublication_peak_capacity_resident_bytes =
+      std::max(keys.memory.observed_prepublication_peak_capacity_resident_bytes,
+               keys.memory.actual_capacity_resident_bytes);
+  return keys;
+}
+
+inline row_type compute_grammar_internal_inside_row_from_keys(
+    lazy_multisite_chart const& chart, clade_grammar const& grammar,
+    clade_id clade, packed_grammar_parent_keys const& keys,
+    std::size_t structural_class, std::size_t& multifurcation_counter) {
+  auto const& structural_classes = keys.structural_classes();
+  if (structural_class >= structural_classes.class_count()) {
+    throw std::runtime_error("lazy chart: structural class index out of range");
+  }
+  auto const words = keys.row_key_words();
+  auto const expected_word_count =
+      lazy_key_grouping_detail::checked_packed_key_count_multiply(
+          structural_classes.class_count(), keys.row_key_width,
+          "lazy grammar row-key matrix");
+  if (words.size() != expected_word_count) {
+    throw std::runtime_error("lazy chart: packed row-key size mismatch");
+  }
+
+  auto row = parsimony_chart_detail::make_inf_row();
+  auto const& production_ids = grammar.productions_by_parent[clade];
+  auto const key_begin = structural_class * keys.row_key_width;
+  std::size_t row_key_offset = 0;
+  for (auto pid : production_ids) {
+    if (pid == no_production || pid >= grammar.productions.size()) {
+      throw std::runtime_error("lazy chart: production id out of range");
+    }
+    auto const& prod = grammar.productions[pid];
+    if (prod.parent != clade) {
+      throw std::runtime_error(
+          "lazy chart: productions_by_parent contains mismatched parent");
+    }
+    parsimony_chart_detail::validate_production_inside_row_inputs(
+        grammar, prod, pid, "lazy inside chart");
+    if (prod.children.size() != 2) ++multifurcation_counter;
+
+    for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+         ++parent_state) {
+      std::size_t child_i = 0;
+      auto row_provider = [&](clade_id child) -> row_type const& {
+        if (child_i >= prod.children.size() ||
+            prod.children[child_i] != child) {
+          throw std::runtime_error(
+              "lazy chart: packed row provider child order mismatch");
+        }
+        auto const class_index = static_cast<std::size_t>(
+            words[key_begin + row_key_offset + child_i++]);
+        auto const& child_rows = chart.inside_rows_by_clade[child];
+        if (class_index >= child_rows.size()) {
+          throw std::runtime_error(
+              "lazy chart: child inside class index out of range");
+        }
+        return child_rows[class_index];
+      };
+      auto const candidate =
+          parsimony_chart_detail::combine_production_inside_row(
+              prod, parent_state, row_provider);
+      row[parent_state] = std::min(row[parent_state], candidate);
+    }
+    row_key_offset += prod.children.size();
+  }
+  if (row_key_offset != keys.row_key_width) {
+    throw std::runtime_error("lazy chart: packed row-key width mismatch");
+  }
+  return row;
+}
+
+inline void assign_grammar_internal_classes_from_keys(
+    lazy_multisite_chart& chart, clade_grammar const& grammar,
+    site_pattern_set const& patterns, clade_id clade,
+    packed_grammar_parent_keys const& keys) {
+  auto const& structural_classes = keys.structural_classes();
+  auto const& row_key_classes = keys.row_key_classes();
+  if (structural_classes.class_by_input.size() != chart.pattern_count ||
+      row_key_classes.class_by_input.size() !=
+          structural_classes.class_count()) {
+    throw std::runtime_error("lazy chart: packed parent-key count mismatch");
+  }
+
+  auto structural_map = structural_classes.class_by_input;
+  std::vector<std::size_t> structural_to_row_class(
+      structural_classes.class_count(), 0);
+  std::vector<std::size_t> row_key_to_row_class(row_key_classes.class_count(),
+                                                0);
+  std::map<row_type, std::size_t> row_class_by_row;
+  auto& rows = chart.inside_rows_by_clade[clade];
+
+  // Both grouping stages assign first-occurrence IDs. Iterating row-key class
+  // IDs therefore exactly matches the former structural-class traversal while
+  // computing a candidate row only once per distinct row key. No ordered-map
+  // traversal participated in the old grammar-inside numbering contract.
+  for (std::size_t row_key_class = 0;
+       row_key_class < row_key_classes.class_count(); ++row_key_class) {
+    auto const structural_class =
+        row_key_classes.representative_by_class[row_key_class];
+    auto const row = compute_grammar_internal_inside_row_from_keys(
+        chart, grammar, clade, keys, structural_class,
+        chart.multifurcation_productions_scored);
+    auto [class_it, inserted] =
+        row_class_by_row.emplace(row, row_class_by_row.size());
+    if (inserted) rows.push_back(row);
+    row_key_to_row_class[row_key_class] = class_it->second;
+  }
+  for (std::size_t structural_class = 0;
+       structural_class < structural_classes.class_count();
+       ++structural_class) {
+    structural_to_row_class[structural_class] =
+        row_key_to_row_class[row_key_classes.class_by_input[structural_class]];
+  }
+
+  std::vector<std::size_t> class_map(chart.pattern_count, 0);
+  auto& weights = chart.class_weight_by_clade[clade];
+  weights.assign(rows.size(), 0);
+  for (std::size_t pattern_index = 0; pattern_index < chart.pattern_count;
+       ++pattern_index) {
+    auto const structural_class = structural_map[pattern_index];
+    auto const row_class = structural_to_row_class[structural_class];
+    class_map[pattern_index] = row_class;
+    checked_add_weight(weights[row_class],
+                       patterns.patterns[pattern_index].weight,
+                       "internal class");
+  }
+
+  chart.structural_class_count_by_clade[clade] =
+      structural_classes.class_count();
+  if (structural_classes.class_count() > rows.size()) {
+    chart.lazy_remerge_collisions +=
+        structural_classes.class_count() - rows.size();
+  }
+  chart.class_index_by_pattern_by_clade[clade] = std::move(class_map);
+  chart.structural_class_index_by_pattern_by_clade[clade] =
+      std::move(structural_map);
+}
+
+inline void assign_internal_classes(lazy_multisite_chart& chart,
+                                    clade_grammar const& grammar,
+                                    site_pattern_set const& patterns,
+                                    clade_id clade,
+                                    grammar_parent_key_workspace& workspace) {
+  auto const& production_ids = grammar.productions_by_parent[clade];
+  if (production_ids.empty()) {
+    throw std::runtime_error(
+        "lazy chart: non-singleton clade has no productions");
+  }
+  for (auto pid : production_ids) {
+    if (pid == no_production || pid >= grammar.productions.size()) {
+      throw std::runtime_error("lazy chart: production id out of range");
+    }
+    auto const& prod = grammar.productions[pid];
+    if (prod.parent != clade) {
+      throw std::runtime_error(
+          "lazy chart: productions_by_parent contains mismatched parent");
+    }
+    parsimony_chart_detail::validate_production_inside_row_inputs(
+        grammar, prod, pid, "lazy inside chart");
+  }
+
+  auto const keys = collect_ready_grammar_parent_keys(
+      chart, grammar, patterns, clade, nullptr, workspace);
+  assign_grammar_internal_classes_from_keys(chart, grammar, patterns, clade,
+                                            keys);
+}
+
+template <class BuildChild>
+inline packed_grammar_parent_keys collect_sparse_grammar_parent_keys(
+    lazy_multisite_chart& chart, clade_grammar const& grammar,
+    site_pattern_set const& patterns, clade_id parent, BuildChild&& build_child,
+    map_dependency_counts& remaining, grammar_parent_key_workspace& workspace) {
+  auto const& production_ids = grammar.productions_by_parent[parent];
+  if (production_ids.empty()) {
+    throw std::runtime_error(
+        "lazy chart: non-singleton clade has no productions");
+  }
+
+  // Finish all recursive children before borrowing the shared workspace for
+  // this parent. Validation and child discovery retain production/child order.
+  for (auto pid : production_ids) {
+    if (pid == no_production || pid >= grammar.productions.size()) {
+      throw std::runtime_error("lazy chart: production id out of range");
+    }
+    auto const& prod = grammar.productions[pid];
+    if (prod.parent != parent) {
+      throw std::runtime_error(
+          "lazy chart: productions_by_parent contains mismatched parent");
+    }
+    parsimony_chart_detail::validate_production_inside_row_inputs(
+        grammar, prod, pid, "lazy inside chart");
+    for (auto child : prod.children) build_child(child);
+  }
+
+  return collect_ready_grammar_parent_keys(chart, grammar, patterns, parent,
+                                           &remaining, workspace);
+}
+
+inline void materialize_inside_class_maps(lazy_multisite_chart& chart,
+                                          clade_grammar const& grammar,
+                                          site_pattern_set const& patterns) {
+  grammar_parent_key_workspace key_workspace;
+  for (auto clade : clades_by_increasing_size(grammar)) {
+    auto const& key = grammar.clades[clade];
+    if (key.taxa.empty()) {
+      throw std::runtime_error("lazy chart: empty clade is invalid");
+    }
+
+    if (key.taxa.size() == 1) {
+      if (!chart.class_index_by_pattern_by_clade[clade]) {
+        std::vector<std::size_t> class_map(chart.pattern_count, 0);
+        for (std::size_t pattern = 0; pattern < chart.pattern_count;
+             ++pattern) {
+          class_map[pattern] = leaf_class_index_for_pattern(
+              chart, grammar, patterns, clade, pattern);
+        }
+        chart.class_index_by_pattern_by_clade[clade] = class_map;
+        chart.structural_class_index_by_pattern_by_clade[clade] =
+            std::move(class_map);
+      }
+      continue;
+    }
+
+    if (chart.class_index_by_pattern_by_clade[clade] &&
+        chart.structural_class_index_by_pattern_by_clade[clade]) {
+      continue;
+    }
+
+    auto const& production_ids = grammar.productions_by_parent[clade];
+    if (production_ids.empty()) {
+      throw std::runtime_error(
+          "lazy chart: non-singleton clade has no productions");
+    }
+    for (auto pid : production_ids) {
+      if (pid == no_production || pid >= grammar.productions.size()) {
+        throw std::runtime_error("lazy chart: production id out of range");
+      }
+      auto const& prod = grammar.productions[pid];
+      if (prod.parent != clade) {
+        throw std::runtime_error(
+            "lazy chart: productions_by_parent contains mismatched parent");
+      }
+      parsimony_chart_detail::validate_production_inside_row_inputs(
+          grammar, prod, pid, "lazy inside chart materialize maps");
+    }
+
+    auto const keys = collect_ready_grammar_parent_keys(
+        chart, grammar, patterns, clade, nullptr, key_workspace);
+    auto const& structural_classes = keys.structural_classes();
+    auto structural_map = structural_classes.class_by_input;
+    if (chart.structural_class_count_by_clade[clade] !=
+        structural_classes.class_count()) {
+      throw std::runtime_error(
+          "lazy chart: materialized structural class count mismatch");
+    }
+
+    std::map<row_type, std::size_t> row_class_by_row;
+    auto const& rows = chart.inside_rows_by_clade[clade];
+    for (std::size_t class_index = 0; class_index < rows.size();
+         ++class_index) {
+      row_class_by_row.emplace(rows[class_index], class_index);
+    }
+
+    std::vector<std::size_t> structural_to_row_class(
+        structural_classes.class_count(), 0);
+    for (std::size_t structural_class = 0;
+         structural_class < structural_classes.class_count();
+         ++structural_class) {
+      std::size_t ignored_multifurcation_counter = 0;
+      auto const row = compute_grammar_internal_inside_row_from_keys(
+          chart, grammar, clade, keys, structural_class,
+          ignored_multifurcation_counter);
+      auto const row_it = row_class_by_row.find(row);
+      if (row_it == row_class_by_row.end()) {
+        throw std::runtime_error(
+            "lazy chart: materialized inside row not found in stored classes");
+      }
+      structural_to_row_class[structural_class] = row_it->second;
+    }
+
+    std::vector<std::size_t> class_map(chart.pattern_count, 0);
+    for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
+      class_map[pattern] = structural_to_row_class[structural_map[pattern]];
+    }
+    chart.class_index_by_pattern_by_clade[clade] = std::move(class_map);
+    chart.structural_class_index_by_pattern_by_clade[clade] =
+        std::move(structural_map);
+  }
 }
 
 inline row_type compute_plan_internal_inside_row_from_keys(
@@ -1978,6 +1992,7 @@ inline lazy_multisite_chart build_lazy_inside_chart(
   chart.class_weight_by_clade.resize(grammar.clades.size());
 
   auto remaining_dependencies = count_map_dependencies(grammar);
+  grammar_parent_key_workspace key_workspace;
   std::vector<bool> built(grammar.clades.size(), false);
   auto build_clade = [&](auto&& self, clade_id clade) -> void {
     if (clade == no_clade || clade >= grammar.clades.size()) {
@@ -2007,14 +2022,15 @@ inline lazy_multisite_chart build_lazy_inside_chart(
               grammar, prod, pid, "lazy inside chart");
           for (auto child : prod.children) self(self, child);
         }
-        assign_internal_classes(chart, grammar, patterns, clade);
+        assign_internal_classes(chart, grammar, patterns, clade,
+                                key_workspace);
       } else {
         auto build_child = [&](clade_id child) { self(self, child); };
-        auto keys = collect_sparse_parent_keys(chart, grammar, patterns, clade,
-                                               build_child,
-                                               remaining_dependencies);
-        assign_internal_classes_from_sparse_keys(chart, grammar, patterns,
-                                                 clade, keys);
+        auto keys = collect_sparse_grammar_parent_keys(
+            chart, grammar, patterns, clade, build_child,
+            remaining_dependencies, key_workspace);
+        assign_grammar_internal_classes_from_keys(chart, grammar, patterns,
+                                                  clade, keys);
       }
     }
     built[clade] = true;
