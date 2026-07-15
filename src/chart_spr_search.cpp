@@ -21,6 +21,31 @@
 #include <vector>
 
 namespace larch {
+
+namespace chart_spr_search_detail {
+
+class chart_spr_lazy_policy_rebuild_token {
+ public:
+  explicit chart_spr_lazy_policy_rebuild_token(
+      chart_spr_lazy_policy_diagnostics diagnostics) noexcept
+      : diagnostics_(diagnostics) {}
+
+ private:
+  chart_spr_lazy_policy_diagnostics diagnostics_;
+
+  friend chart_spr_lazy_policy_diagnostics const&
+  chart_spr_lazy_policy_from_rebuild_token(
+      chart_spr_lazy_policy_rebuild_token const& token) noexcept;
+};
+
+chart_spr_lazy_policy_diagnostics const&
+chart_spr_lazy_policy_from_rebuild_token(
+    chart_spr_lazy_policy_rebuild_token const& token) noexcept {
+  return token.diagnostics_;
+}
+
+}  // namespace chart_spr_search_detail
+
 namespace {
 
 class chart_spr_cache_budget_error : public std::runtime_error {
@@ -667,6 +692,9 @@ void chart_spr_add_search_state_rebuild_counters(
                rebuild_counters.lazy_chart_actual_peak_bytes);
   accumulated.lazy_chart_pre_submit_rejections +=
       rebuild_counters.lazy_chart_pre_submit_rejections;
+  accumulated.lazy_policy_pilot_runs += rebuild_counters.lazy_policy_pilot_runs;
+  accumulated.lazy_policy_frozen_reuses +=
+      rebuild_counters.lazy_policy_frozen_reuses;
   if (update_current_skipped_invariant_sites) {
     accumulated.skipped_invariant_sites =
         rebuild_counters.skipped_invariant_sites;
@@ -685,6 +713,19 @@ chart_spr_search_state rebuild_chart_spr_search_state_after_accept(
       chart_spr_pattern_source_fingerprint_matches(
           rebuilt_dag, rebuilt_grammar,
           previous_state.pattern_source_fingerprint);
+  std::optional<chart_spr_search_detail::chart_spr_lazy_policy_rebuild_token>
+      lazy_policy_rebuild_token;
+  // Auto is a once-per-search representation decision. Carry only an actual
+  // automatic resolution through conservative accepted rebuilds and final
+  // compaction, including the pattern-fingerprint-mismatch path. Explicit
+  // off/on policies are cheap, immutable requests and do not count as frozen
+  // auto reuse.
+  if (previous_state.lazy_policy.requested ==
+      chart_spr_lazy_policy::automatic) {
+    lazy_policy_rebuild_token.emplace(previous_state.lazy_policy);
+  }
+  auto const overlapping_published_state_bytes =
+      estimate_chart_spr_published_state_resident_bytes(previous_state);
 
   if (reused_patterns) {
     chart_spr_active_pattern_build_result active_build;
@@ -698,7 +739,9 @@ chart_spr_search_state rebuild_chart_spr_search_state_after_accept(
     auto state = build_chart_spr_search_state_from_active(
         rebuilt_dag, std::move(rebuilt_grammar), std::move(active_build),
         options.chart, build_exact, options.exact_trim, options.cache, {},
-        &scheduler, failed_scheduler_axes);
+        &scheduler, failed_scheduler_axes,
+        lazy_policy_rebuild_token ? &*lazy_policy_rebuild_token : nullptr,
+        overlapping_published_state_bytes);
     state.exact_verifier_concurrency =
         previous_state.exact_verifier_concurrency;
     return state;
@@ -709,7 +752,9 @@ chart_spr_search_state rebuild_chart_spr_search_state_after_accept(
   auto state = build_chart_spr_search_state_from_active(
       rebuilt_dag, std::move(rebuilt_grammar), std::move(active_build),
       options.chart, build_exact, options.exact_trim, options.cache, {},
-      &scheduler, failed_scheduler_axes);
+      &scheduler, failed_scheduler_axes,
+      lazy_policy_rebuild_token ? &*lazy_policy_rebuild_token : nullptr,
+      overlapping_published_state_bytes);
   state.exact_verifier_concurrency = previous_state.exact_verifier_concurrency;
   ++state.counters.pattern_rebuilds;
   return state;
@@ -4017,6 +4062,11 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
   state.estimated_full_pattern_cache_bytes =
       estimate_chart_spr_full_pattern_cache_bytes(state);
   auto cache_selection_options = state.cache_opts;
+  // A local commit refreshes the already-published state in place. It must
+  // preserve that state's representation without repiloting or consulting an
+  // unresolved public auto request.
+  cache_selection_options.use_lazy_multisite_chart = false;
+  cache_selection_options.lazy_policy = state.lazy_policy.resolved;
   if (state.cache_opts.memory_budget_bytes != 0) {
     auto const mandatory_pair_bytes = chart_spr_checked_cache_bytes_multiply(
         state.estimated_full_pattern_cache_bytes, 2,
@@ -4553,6 +4603,8 @@ void chart_spr_refresh_search_summary_from_counters(
   summary.lazy_chart_actual_peak_bytes = counters.lazy_chart_actual_peak_bytes;
   summary.lazy_chart_pre_submit_rejections =
       counters.lazy_chart_pre_submit_rejections;
+  summary.lazy_policy_pilot_runs = counters.lazy_policy_pilot_runs;
+  summary.lazy_policy_frozen_reuses = counters.lazy_policy_frozen_reuses;
   summary.local_commit_two_chart_oracle_runs =
       counters.local_commit_two_chart_oracle_runs;
   summary.local_commit_tip_grammar_refreshes =
@@ -4644,6 +4696,17 @@ void chart_spr_refresh_search_summary_from_current_lazy_chart(
 }
 
 }  // namespace
+
+chart_spr_search_state
+chart_spr_search_detail::rebuild_chart_spr_search_state_after_accept_for_tests(
+    chart_spr_search_state const& previous_state, phylo_dag& rebuilt_dag,
+    clade_grammar rebuilt_grammar, chart_spr_search_options const& options,
+    chart_scheduler& scheduler) {
+  bool reused_patterns = false;
+  return rebuild_chart_spr_search_state_after_accept(
+      previous_state, rebuilt_dag, std::move(rebuilt_grammar), options,
+      reused_patterns, scheduler);
+}
 
 namespace chart_spr_search_detail {
 
@@ -7478,6 +7541,7 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.chart_cache_resident_bytes =
       state.resident_pattern_cache_bytes;
   result.summary.cache_strategy = state.cache_strategy;
+  result.summary.lazy_policy = state.lazy_policy;
   result.summary.effective_pattern_batch_size =
       state.effective_pattern_batch_size;
   result.summary.requested_worker_count = requested_workers;
@@ -8080,6 +8144,7 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.chart_cache_resident_bytes =
       state.resident_pattern_cache_bytes;
   result.summary.cache_strategy = state.cache_strategy;
+  result.summary.lazy_policy = state.lazy_policy;
   result.summary.effective_pattern_batch_size =
       state.effective_pattern_batch_size;
   result.summary.peak_concurrent_exact_verifiers =

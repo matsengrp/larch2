@@ -197,6 +197,8 @@ int main() {
                      c.lazy_chart_actual_peak_bytes);
   print_counter_line("lazy_chart_pre_submit_rejections",
                      c.lazy_chart_pre_submit_rejections);
+  print_counter_line("lazy_policy_pilot_runs", c.lazy_policy_pilot_runs);
+  print_counter_line("lazy_policy_frozen_reuses", c.lazy_policy_frozen_reuses);
   print_counter_line("multifurcation_productions_scored",
                      c.multifurcation_productions_scored);
   print_counter_line("local_commit_two_chart_oracle_runs",

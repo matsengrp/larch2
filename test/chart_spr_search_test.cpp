@@ -209,6 +209,53 @@ static larch::test::tiny_tree_node six_taxon_paired_misplaced_tree() {
                                              tiny_leaf("F", "C")})})});
 }
 
+struct phase7_auto_on_accepted_fixture_spec {
+  std::string reference;
+  larch::test::tiny_tree_node tree;
+};
+
+static phase7_auto_on_accepted_fixture_spec
+make_phase7_auto_on_accepted_fixture_spec() {
+  constexpr std::size_t distinct_binary_sites = 31;
+  constexpr std::size_t signal_repetitions = 96;
+  constexpr std::size_t site_count = distinct_binary_sites + signal_repetitions;
+  std::array<std::string, 6> sequences;
+  for (auto& sequence : sequences) sequence.assign(site_count, 'A');
+
+  // Thirty-one distinct binary columns keep every non-root structural class
+  // count at most nine.  The retained signal is then repeated without adding
+  // a pattern: A/B/C share A while D/E/F share C, so the crossed input tree
+  // has a strict improving SPR but the automatic pilot remains safely in its
+  // high-compression branch.
+  for (std::size_t pattern = 0; pattern < distinct_binary_sites; ++pattern) {
+    constexpr std::array<std::size_t, 5> taxon_by_bit = {0, 3, 1, 4, 2};
+    for (std::size_t bit = 0; bit < taxon_by_bit.size(); ++bit) {
+      if ((pattern >> bit) & 1U) sequences[taxon_by_bit[bit]][pattern] = 'C';
+    }
+  }
+  for (std::size_t site = distinct_binary_sites; site < site_count; ++site) {
+    sequences[3][site] = 'C';
+    sequences[4][site] = 'C';
+    sequences[5][site] = 'C';
+  }
+
+  auto reference = std::string(site_count, 'A');
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  auto tree = tiny_inner(
+      "root", reference,
+      {tiny_inner("AD", reference,
+                  {tiny_leaf("A", sequences[0]), tiny_leaf("D", sequences[3])}),
+       tiny_inner("rest", reference,
+                  {tiny_inner("BE", reference,
+                              {tiny_leaf("B", sequences[1]),
+                               tiny_leaf("E", sequences[4])}),
+                   tiny_inner("CF", reference,
+                              {tiny_leaf("C", sequences[2]),
+                               tiny_leaf("F", sequences[5])})})});
+  return {.reference = std::move(reference), .tree = std::move(tree)};
+}
+
 static larch::test::tiny_tree_node phase5_arity3_selected_tree() {
   using larch::test::tiny_inner;
   using larch::test::tiny_leaf;
@@ -298,6 +345,386 @@ static larch::site_pattern_set make_phase4_wide_patterns(
     });
   }
   return patterns;
+}
+
+static void check_phase4_scheduler_axis_reconciliation(
+    larch::chart_scheduler_metrics const& scheduler,
+    larch::chart_spr_scheduler_axis_counters const& counters);
+
+static larch::site_pattern_set make_phase7_compressed_patterns(
+    std::size_t pattern_count) {
+  larch::site_pattern_set patterns;
+  patterns.taxon_count = 4;
+  patterns.patterns.reserve(pattern_count);
+  for (std::size_t index = 0; index < pattern_count; ++index) {
+    patterns.patterns.push_back(larch::site_pattern{
+        .state_by_taxon = {0, 0, 1, 1},
+        .weight = static_cast<std::uint32_t>(index % 3 + 1),
+    });
+  }
+  return patterns;
+}
+
+static larch::site_pattern_set make_phase7_dense_favoring_patterns(
+    std::size_t pattern_count) {
+  larch::site_pattern_set patterns;
+  patterns.taxon_count = 4;
+  patterns.patterns.reserve(pattern_count);
+  for (std::size_t index = 0; index < pattern_count; ++index) {
+    auto const pair_code = index / 2;
+    auto a = static_cast<std::uint8_t>(pair_code % larch::nuc_state_count);
+    auto b = static_cast<std::uint8_t>((pair_code / larch::nuc_state_count) %
+                                       larch::nuc_state_count);
+    auto c =
+        static_cast<std::uint8_t>((index * 3 + 1) % larch::nuc_state_count);
+    auto d =
+        static_cast<std::uint8_t>((index * 5 + 2) % larch::nuc_state_count);
+    if (a == b && b == c && c == d) {
+      d = static_cast<std::uint8_t>((d + 1) % larch::nuc_state_count);
+    }
+    patterns.patterns.push_back(larch::site_pattern{
+        .state_by_taxon = {a, b, c, d},
+        .weight = 1,
+    });
+  }
+  return patterns;
+}
+
+static larch::chart_spr_lazy_policy_diagnostics resolve_phase7_policy(
+    larch::clade_grammar const& grammar,
+    larch::site_pattern_set const& patterns,
+    larch::chart_cache_options const& cache = {}) {
+  auto active = larch::make_active_search_patterns(patterns);
+  auto plan = larch::build_chart_execution_plan(grammar);
+  auto const dense_bytes = larch::estimate_chart_spr_full_pattern_cache_bytes(
+      grammar, active.active_patterns);
+  return larch::resolve_chart_spr_lazy_policy(plan, active.active_patterns, {},
+                                              cache, dense_bytes);
+}
+
+static void test_phase7_lazy_auto_policy_contract() {
+  std::println("test_phase7_lazy_auto_policy_contract");
+  auto fixture = make_fixture();
+
+  auto compressed = make_phase7_compressed_patterns(65);
+  larch::chart_cache_options automatic;
+  automatic.lazy_policy = larch::chart_spr_lazy_policy::automatic;
+  auto expected = resolve_phase7_policy(fixture.grammar, compressed, automatic);
+  CHECK(expected.requested == larch::chart_spr_lazy_policy::automatic);
+  CHECK(expected.resolved == larch::chart_spr_lazy_policy::on);
+  CHECK(expected.reason == larch::chart_spr_lazy_policy_reason::
+                               compression_thresholds_and_budget_safe);
+  CHECK(expected.active_pattern_count == 65);
+  CHECK(expected.pilot_pattern_count == 32);
+  CHECK(expected.pilot_inside_chart_builds == 1);
+  CHECK(expected.pilot_outside_chart_builds == 0);
+  CHECK(expected.pilot_exact_builds == 0);
+  CHECK(expected.pilot_scheduler_submissions == 0);
+  CHECK(expected.pilot_internal_structural_class_count_max <=
+        expected.pilot_pattern_count / 3);
+  CHECK(expected.pilot_inside_rows <= expected.pilot_dense_rows / 2);
+
+  std::uint64_t expected_index_hash = 1469598103934665603ULL;
+  for (std::size_t stratum = 0; stratum < 32; ++stratum) {
+    auto const index =
+        larch::chart_spr_search_detail::lazy_policy_stratum_midpoint(65, 32,
+                                                                     stratum);
+    expected_index_hash =
+        larch::chart_spr_search_detail::mix_u64(expected_index_hash, index);
+  }
+  CHECK(expected.pilot_pattern_index_hash == expected_index_hash);
+
+  // Exercise production state construction with a real persistent scheduler
+  // at every required count, not merely the direct resolver.
+  auto published_expected = expected;
+  published_expected.frozen = true;
+  for (auto workers :
+       {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+    auto active = larch::make_active_search_patterns(compressed);
+    larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+        .requested_workers = workers,
+        .default_minimum_grain = 1,
+        .default_target_ranges_per_worker = 4,
+    }};
+    auto state = larch::build_chart_spr_search_state_from_active(
+        fixture.dag, fixture.grammar, std::move(active), {}, false, {},
+        automatic, {}, &scheduler);
+    CHECK(state.lazy_policy == published_expected);
+    CHECK(state.cache_strategy ==
+          larch::chart_spr_cache_strategy::lazy_multisite_chart);
+    CHECK(state.counters.lazy_policy_pilot_runs == 1);
+    CHECK(state.counters.lazy_policy_frozen_reuses == 0);
+    CHECK(state.lazy_policy.pilot_pattern_index_hash == expected_index_hash);
+    CHECK(state.lazy_policy.pilot_inside_chart_builds == 1);
+    CHECK(state.lazy_policy.pilot_outside_chart_builds == 0);
+    CHECK(state.lazy_policy.pilot_exact_builds == 0);
+    CHECK(state.lazy_policy.pilot_scheduler_submissions == 0);
+    // The full production lazy chart does materialize both surfaces.  Its
+    // counters are deliberately distinct from the inside-only, unscheduled
+    // pilot diagnostics above; scheduler totals may be nonzero on the
+    // wavefront implementation.
+    CHECK(state.counters.lazy_inside_rows_computed > 0);
+    CHECK(state.counters.lazy_outside_rows_computed > 0);
+    CHECK(state.counters.lazy_inside_rows_computed >=
+          state.lazy_policy.pilot_inside_rows);
+    CHECK(state.counters.scheduler_axes.lazy_inside_clades.operations > 0);
+    CHECK(state.counters.scheduler_axes.lazy_outside_clades.operations > 0);
+    check_phase4_scheduler_axis_reconciliation(scheduler.metrics(),
+                                               state.counters.scheduler_axes);
+    CHECK(scheduler.worker_resolution().resolved_workers == workers);
+    scheduler.shutdown();
+  }
+
+  auto small = resolve_phase7_policy(
+      fixture.grammar, make_phase7_compressed_patterns(7), automatic);
+  CHECK(small.pilot_pattern_count == 7);
+  CHECK(small.resolved == larch::chart_spr_lazy_policy::on);
+
+  auto empty = resolve_phase7_policy(
+      fixture.grammar, make_phase7_compressed_patterns(0), automatic);
+  CHECK(empty.active_pattern_count == 0);
+  CHECK(empty.pilot_pattern_count == 0);
+  CHECK(empty.pilot_inside_chart_builds == 0);
+  CHECK(empty.resolved == larch::chart_spr_lazy_policy::off);
+  CHECK(empty.reason ==
+        larch::chart_spr_lazy_policy_reason::no_active_patterns);
+
+  auto dense_patterns = make_phase7_dense_favoring_patterns(65);
+  auto dense =
+      resolve_phase7_policy(fixture.grammar, dense_patterns, automatic);
+  CHECK(dense.pilot_pattern_count == 32);
+  CHECK(dense.resolved == larch::chart_spr_lazy_policy::off);
+  CHECK(dense.reason == larch::chart_spr_lazy_policy_reason::
+                            structural_and_strong_row_ratios_exceeded);
+
+  // Default off and both explicit-on spellings never allocate or execute a
+  // pilot.  The compatibility rule is unambiguous: legacy true wins over the
+  // enum, including an enum value of auto.
+  auto explicit_off = resolve_phase7_policy(fixture.grammar, compressed);
+  CHECK(explicit_off.requested == larch::chart_spr_lazy_policy::off);
+  CHECK(explicit_off.resolved == larch::chart_spr_lazy_policy::off);
+  CHECK(explicit_off.reason ==
+        larch::chart_spr_lazy_policy_reason::explicit_off);
+  CHECK(explicit_off.pilot_pattern_count == 0);
+  CHECK(explicit_off.pilot_inside_chart_builds == 0);
+  CHECK(explicit_off.measurements_available);
+  CHECK(explicit_off.estimated_lazy_cache_bytes > 0);
+  CHECK(explicit_off.estimated_dense_cache_bytes > 0);
+
+  larch::chart_cache_options explicit_on;
+  explicit_on.lazy_policy = larch::chart_spr_lazy_policy::on;
+  auto enum_on =
+      resolve_phase7_policy(fixture.grammar, compressed, explicit_on);
+  CHECK(enum_on.requested == larch::chart_spr_lazy_policy::on);
+  CHECK(enum_on.reason == larch::chart_spr_lazy_policy_reason::explicit_on);
+  CHECK(enum_on.pilot_pattern_count == 0);
+  CHECK(enum_on.measurements_available);
+  CHECK(enum_on.estimated_lazy_cache_bytes > 0);
+  CHECK(enum_on.estimated_dense_cache_bytes > 0);
+
+  larch::chart_cache_options legacy_on = automatic;
+  legacy_on.use_lazy_multisite_chart = true;
+  auto compatibility_on =
+      resolve_phase7_policy(fixture.grammar, compressed, legacy_on);
+  CHECK(compatibility_on.requested == larch::chart_spr_lazy_policy::on);
+  CHECK(compatibility_on.resolved == larch::chart_spr_lazy_policy::on);
+  CHECK(compatibility_on.reason ==
+        larch::chart_spr_lazy_policy_reason::explicit_on);
+  CHECK(compatibility_on.pilot_pattern_count == 0);
+
+  bool unresolved_threw = false;
+  try {
+    auto active = larch::make_active_search_patterns(compressed);
+    (void)larch::choose_chart_spr_cache_strategy(
+        fixture.grammar, active.active_patterns, automatic);
+  } catch (std::runtime_error const&) {
+    unresolved_threw = true;
+  }
+  CHECK(unresolved_threw);
+
+  // Every public entry point rejects an out-of-range enum value.  The legacy
+  // explicit-on alias must not hide a corrupt enum payload.
+  auto invalid = automatic;
+  invalid.lazy_policy = static_cast<larch::chart_spr_lazy_policy>(255);
+  invalid.use_lazy_multisite_chart = true;
+  bool invalid_resolver_threw = false;
+  try {
+    (void)resolve_phase7_policy(fixture.grammar, compressed, invalid);
+  } catch (std::invalid_argument const& e) {
+    invalid_resolver_threw = true;
+    CHECK(std::string{e.what()}.find("invalid lazy policy") !=
+          std::string::npos);
+  }
+  CHECK(invalid_resolver_threw);
+  bool invalid_selector_threw = false;
+  try {
+    auto active = larch::make_active_search_patterns(compressed);
+    (void)larch::choose_chart_spr_cache_strategy(
+        fixture.grammar, active.active_patterns, invalid);
+  } catch (std::invalid_argument const&) {
+    invalid_selector_threw = true;
+  }
+  CHECK(invalid_selector_threw);
+
+  std::println("  PASS");
+}
+
+static void test_phase7_lazy_auto_budget_and_freeze_contract() {
+  std::println("test_phase7_lazy_auto_budget_and_freeze_contract");
+  auto fixture = make_fixture();
+  auto compressed = make_phase7_compressed_patterns(256);
+  auto dense_patterns = make_phase7_dense_favoring_patterns(64);
+  larch::chart_cache_options automatic;
+  automatic.lazy_policy = larch::chart_spr_lazy_policy::automatic;
+  auto pilot = resolve_phase7_policy(fixture.grammar, compressed, automatic);
+  CHECK(pilot.pilot_estimated_allocation_bytes > 0);
+
+  auto make_scheduler = [] {
+    return std::make_unique<larch::chart_scheduler>(
+        larch::chart_scheduler_options{
+            .requested_workers = 4,
+            .default_minimum_grain = 1,
+            .default_target_ranges_per_worker = 4,
+        });
+  };
+  auto make_state = [&](std::size_t budget, larch::chart_scheduler& scheduler) {
+    auto cache = automatic;
+    cache.memory_budget_bytes = budget;
+    auto active = larch::make_active_search_patterns(compressed);
+    active.pattern_source_fingerprint =
+        larch::build_chart_spr_pattern_source_fingerprint(fixture.dag,
+                                                          fixture.grammar);
+    return larch::build_chart_spr_search_state_from_active(
+        fixture.dag, fixture.grammar, std::move(active), {}, false, {}, cache,
+        {}, &scheduler);
+  };
+
+  constexpr auto calibration_budget = std::size_t{1} << 40;
+  auto calibration_scheduler = make_scheduler();
+  auto calibration = make_state(calibration_budget, *calibration_scheduler);
+  CHECK(calibration.lazy_policy.resolved == larch::chart_spr_lazy_policy::on);
+  CHECK(calibration.counters.lazy_policy_pilot_runs == 1);
+  auto const pilot_required =
+      larch::estimate_chart_spr_lazy_policy_pilot_required_bytes(
+          calibration, calibration.lazy_policy.pilot_estimated_allocation_bytes,
+          calibration_scheduler.get());
+  auto const lazy_admission =
+      larch::estimate_chart_spr_lazy_cache_admission_bytes(
+          calibration.grammar.clades.size(),
+          calibration.active_patterns.patterns.patterns.size());
+  CHECK(lazy_admission >= sizeof(larch::lazy_multisite_chart));
+  auto const selected_required =
+      larch::estimate_chart_spr_lazy_state_build_required_bytes(
+          calibration, lazy_admission - sizeof(larch::lazy_multisite_chart),
+          calibration_scheduler.get());
+  CHECK(selected_required > pilot_required);
+  auto const exact_budget = std::max(pilot_required, selected_required);
+  CHECK(exact_budget == selected_required);
+  CHECK(exact_budget < pilot_required + selected_required);
+
+  auto fit_scheduler = make_scheduler();
+  auto fit = make_state(exact_budget, *fit_scheduler);
+  CHECK(fit.lazy_policy.resolved == larch::chart_spr_lazy_policy::on);
+  CHECK(fit.counters.lazy_policy_pilot_runs == 1);
+  CHECK(fit.counters.lazy_chart_preflight_peak_bytes <= exact_budget);
+  CHECK(fit.counters.lazy_chart_actual_peak_bytes <= exact_budget);
+  CHECK(fit.counters.scheduler_axes.lazy_inside_clades.operations > 0);
+  CHECK(fit.counters.scheduler_axes.lazy_outside_clades.operations > 0);
+
+  auto reject_scheduler = make_scheduler();
+  auto const reject_metrics_before = reject_scheduler->metrics();
+  bool rejected = false;
+  try {
+    (void)make_state(exact_budget - 1, *reject_scheduler);
+  } catch (std::runtime_error const& error) {
+    rejected = true;
+    CHECK(std::string{error.what()}.find("estimated live chart state build") !=
+          std::string::npos);
+  }
+  CHECK(rejected);
+  CHECK(reject_scheduler->metrics().operations ==
+        reject_metrics_before.operations);
+  CHECK(reject_scheduler->metrics().tasks_submitted ==
+        reject_metrics_before.tasks_submitted);
+
+  // Exercise the actual accepted-state frozen-token path at its strict
+  // old-published + new-build boundary.  The frozen decision skips the pilot,
+  // but current grammar/pattern capacities and the chosen lazy representation
+  // are projected again while the preceding state remains live.
+  auto const overlapping_published_state_bytes =
+      larch::estimate_chart_spr_published_state_resident_bytes(calibration);
+  auto frozen_scheduler = make_scheduler();
+  auto const frozen_required =
+      larch::estimate_chart_spr_lazy_state_build_required_bytes(
+          calibration, lazy_admission - sizeof(larch::lazy_multisite_chart),
+          frozen_scheduler.get(), overlapping_published_state_bytes);
+  CHECK(frozen_required ==
+        selected_required + overlapping_published_state_bytes);
+  larch::chart_spr_search_options frozen_options;
+  frozen_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::lower_bound_heuristic;
+  frozen_options.cache = automatic;
+  frozen_options.cache.memory_budget_bytes = frozen_required;
+  auto frozen = larch::chart_spr_search_detail::
+      rebuild_chart_spr_search_state_after_accept_for_tests(
+          calibration, fixture.dag, fixture.grammar, frozen_options,
+          *frozen_scheduler);
+  CHECK(frozen.lazy_policy == calibration.lazy_policy);
+  CHECK(frozen.counters.lazy_policy_pilot_runs == 0);
+  CHECK(frozen.counters.lazy_policy_frozen_reuses == 1);
+  CHECK(frozen.counters.scheduler_axes.lazy_inside_clades.operations > 0);
+  CHECK(frozen.counters.scheduler_axes.lazy_outside_clades.operations > 0);
+  check_phase4_scheduler_axis_reconciliation(frozen_scheduler->metrics(),
+                                             frozen.counters.scheduler_axes);
+
+  auto frozen_reject_scheduler = make_scheduler();
+  auto const frozen_reject_metrics_before = frozen_reject_scheduler->metrics();
+  frozen_options.cache.memory_budget_bytes = frozen_required - 1;
+  bool frozen_rejected = false;
+  try {
+    (void)larch::chart_spr_search_detail::
+        rebuild_chart_spr_search_state_after_accept_for_tests(
+            calibration, fixture.dag, fixture.grammar, frozen_options,
+            *frozen_reject_scheduler);
+  } catch (std::runtime_error const& error) {
+    frozen_rejected = true;
+    CHECK(std::string{error.what()}.find("estimated live chart state build") !=
+          std::string::npos);
+  }
+  CHECK(frozen_rejected);
+  CHECK(frozen_reject_scheduler->metrics().operations ==
+        frozen_reject_metrics_before.operations);
+  CHECK(frozen_reject_scheduler->metrics().tasks_submitted ==
+        frozen_reject_metrics_before.tasks_submitted);
+  calibration_scheduler->shutdown();
+  fit_scheduler->shutdown();
+  reject_scheduler->shutdown();
+  frozen_scheduler->shutdown();
+  frozen_reject_scheduler->shutdown();
+
+  // Public cache options never carry frozen diagnostics. Reusing them for an
+  // unrelated state runs a fresh pilot and cannot publish stale measurements.
+  // Accepted-state rebuilds use a private token and are exercised below by the
+  // non-vacuous accepted-move search tests.
+  auto compressed_active = larch::make_active_search_patterns(compressed);
+  auto state = larch::build_chart_spr_search_state_from_active(
+      fixture.dag, fixture.grammar, std::move(compressed_active), {}, false, {},
+      automatic);
+  CHECK(state.lazy_policy.frozen);
+  CHECK(state.counters.lazy_policy_pilot_runs == 1);
+  CHECK(state.counters.lazy_policy_frozen_reuses == 0);
+  CHECK(state.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  auto dense_active = larch::make_active_search_patterns(dense_patterns);
+  auto rebuilt = larch::build_chart_spr_search_state_from_active(
+      fixture.dag, fixture.grammar, std::move(dense_active), {}, false, {},
+      state.cache_opts);
+  CHECK(rebuilt.lazy_policy.resolved == larch::chart_spr_lazy_policy::off);
+  CHECK(rebuilt.cache_strategy != state.cache_strategy);
+  CHECK(rebuilt.counters.lazy_policy_pilot_runs == 1);
+  CHECK(rebuilt.counters.lazy_policy_frozen_reuses == 0);
+
+  std::println("  PASS");
 }
 
 static std::array<larch::chart_spr_scheduler_axis_metrics const*, 12>
@@ -5469,6 +5896,10 @@ static void test_lazy_cache_fixed_topology_conservative_search() {
         search.counters.lazy_local_iteration_task_stable_bytes_max);
   CHECK(search.summary.lazy_local_iteration_task_preparation_peak_bytes_max ==
         search.counters.lazy_local_iteration_task_preparation_peak_bytes_max);
+  // The explicit lazy-on request is rebuilt directly; only automatic
+  // decisions use the private frozen-policy handoff.
+  CHECK(search.counters.lazy_policy_pilot_runs == 0);
+  CHECK(search.counters.lazy_policy_frozen_reuses == 0);
   CHECK(search.summary.lazy_inside_rows_computed > 0);
   CHECK(search.summary.lazy_merge_ratio > 0.0);
   CHECK(search.summary.selected_topology_class_rows_computed ==
@@ -9458,6 +9889,7 @@ static void test_phase5_known_improving_search_commits_once() {
       larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
   options.top_k_exact_verify = 8;
   options.max_iterations = 1;
+  options.cache.lazy_policy = larch::chart_spr_lazy_policy::automatic;
 
   auto taxon_count = grammar.taxa.id_to_sample_id.size();
   auto search = larch::run_chart_spr_search(std::move(dag), grammar,
@@ -9471,6 +9903,10 @@ static void test_phase5_known_improving_search_commits_once() {
   CHECK(search.counters.candidate_accepts_attempted == 1);
   CHECK(search.counters.accepted_moves == 1);
   CHECK(search.counters.sidecar_rebuilds_after_accept == 1);
+  CHECK(search.counters.lazy_policy_pilot_runs == 1);
+  CHECK(search.counters.lazy_policy_frozen_reuses == 1);
+  CHECK(search.summary.lazy_policy.requested ==
+        larch::chart_spr_lazy_policy::automatic);
   CHECK(search.counters.overlay_materializations_for_accept_materialization == 1);
   CHECK(search.summary.initial_search_state_rebuilds == 1);
   CHECK(search.summary.full_search_state_rebuilds == 2);
@@ -9523,6 +9959,7 @@ static void test_phase9_known_improving_search_uses_local_accept_update() {
   options.max_iterations = 1;
   options.rebuild_after_accept = false;
   options.verify_local_against_full_for_tests = true;
+  options.cache.lazy_policy = larch::chart_spr_lazy_policy::automatic;
 
   auto search = larch::run_chart_spr_search(std::move(dag), grammar,
                                             options);
@@ -9538,6 +9975,8 @@ static void test_phase9_known_improving_search_uses_local_accept_update() {
   CHECK(search.summary.initial_search_state_rebuilds == 1);
   CHECK(search.summary.full_search_state_rebuilds == 1);
   CHECK(search.summary.final_compaction_rebuilds == 1);
+  CHECK(search.counters.lazy_policy_pilot_runs == 1);
+  CHECK(search.counters.lazy_policy_frozen_reuses == 1);
   CHECK(search.summary.final_compaction_ms > 0.0);
   CHECK(search.summary.final_compaction_exactness_kind ==
         larch::multisite_keep_mask_kind::exact_optimal_production_union);
@@ -9790,6 +10229,64 @@ static void test_phase9_multi_iteration_local_updates_match_output_dag() {
   std::println("  PASS");
 }
 
+static void test_phase7_auto_on_accepted_rebuild_preserves_frozen_policy() {
+  std::println("test_phase7_auto_on_accepted_rebuild_preserves_frozen_policy");
+
+  auto expected_spec = make_phase7_auto_on_accepted_fixture_spec();
+  auto expected_dag = larch::test::make_tiny_labelled_tree(
+      expected_spec.reference, expected_spec.tree);
+  auto expected_grammar = larch::build_clade_grammar(expected_dag);
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 16;
+  options.max_iterations = 1;
+  options.worker_count = 4;
+  options.cache.lazy_policy = larch::chart_spr_lazy_policy::automatic;
+  auto expected_state = larch::build_chart_spr_search_state(
+      expected_dag, expected_grammar, options);
+  CHECK(expected_state.active_patterns.patterns.patterns.size() == 31);
+  CHECK(expected_state.lazy_policy.requested ==
+        larch::chart_spr_lazy_policy::automatic);
+  CHECK(expected_state.lazy_policy.resolved ==
+        larch::chart_spr_lazy_policy::on);
+  CHECK(expected_state.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  auto const frozen_policy = expected_state.lazy_policy;
+
+  auto run_spec = make_phase7_auto_on_accepted_fixture_spec();
+  auto dag =
+      larch::test::make_tiny_labelled_tree(run_spec.reference, run_spec.tree);
+  auto grammar = larch::build_clade_grammar(dag);
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+
+  CHECK(search.iterations.size() == 1);
+  CHECK(search.iterations.front().accepted.has_value());
+  CHECK(search.iterations.front().accepted_move_committed);
+  CHECK(search.counters.accepted_moves == 1);
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 1);
+  CHECK(search.counters.lazy_policy_pilot_runs == 1);
+  CHECK(search.counters.lazy_policy_frozen_reuses == 1);
+  CHECK(search.summary.lazy_policy == frozen_policy);
+  CHECK(search.summary.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  CHECK(search.summary.scheduler_axes.lazy_inside_clades.operations >= 2);
+  CHECK(search.summary.scheduler_axes.lazy_outside_clades.operations >= 2);
+  check_phase4_scheduler_axis_reconciliation(search);
+
+  auto rebuilt_grammar = larch::build_clade_grammar(search.dag);
+  auto dense_options = options;
+  dense_options.cache.lazy_policy = larch::chart_spr_lazy_policy::off;
+  auto dense_state = larch::build_chart_spr_search_state(
+      search.dag, rebuilt_grammar, dense_options);
+  CHECK(larch::chart_spr_state_exact_score_with_invariants(
+            dense_state, dense_options.exact_trim) ==
+        search.summary.final_score);
+
+  std::println("  PASS");
+}
+
 static void test_phase5_rejected_candidates_do_not_rebuild_sidecar() {
   std::println("test_phase5_rejected_candidates_do_not_rebuild_sidecar");
 
@@ -9852,6 +10349,10 @@ static void test_phase5_post_materialization_worsening_rejects_commit() {
   CHECK(search.counters.accepted_moves == 0);
   CHECK(search.counters.post_materialization_rejections == 1);
   CHECK(search.counters.sidecar_rebuilds_after_accept == 1);
+  // The explicit default-off request is rebuilt directly; only automatic
+  // decisions use the private frozen-policy handoff.
+  CHECK(search.counters.lazy_policy_pilot_runs == 0);
+  CHECK(search.counters.lazy_policy_frozen_reuses == 0);
   CHECK(search.counters.overlay_materializations_for_accept_materialization == 1);
   CHECK(search.summary.full_search_state_rebuilds == 2);
   CHECK(search.summary.final_score == search.summary.initial_score);
@@ -9912,6 +10413,7 @@ static void test_phase5_pattern_fingerprint_mismatch_rebuilds_patterns() {
   options.top_k_exact_verify = 8;
   options.max_iterations = 1;
   options.force_pattern_fingerprint_mismatch_for_tests = true;
+  options.cache.lazy_policy = larch::chart_spr_lazy_policy::automatic;
 
   auto search = larch::run_chart_spr_search(std::move(dag), grammar,
                                             options);
@@ -9922,6 +10424,10 @@ static void test_phase5_pattern_fingerprint_mismatch_rebuilds_patterns() {
   CHECK(search.counters.accepted_moves == 1);
   CHECK(search.counters.sidecar_rebuilds_after_accept == 1);
   CHECK(search.counters.pattern_rebuilds == 2);
+  CHECK(search.counters.lazy_policy_pilot_runs == 1);
+  CHECK(search.counters.lazy_policy_frozen_reuses == 1);
+  CHECK(search.summary.lazy_policy.requested ==
+        larch::chart_spr_lazy_policy::automatic);
 
   std::println("  PASS");
 }
@@ -12140,6 +12646,8 @@ int main() {
   test_lazy_exact_semantic_dynamic_evidence_boundary();
   test_lazy_exact_w4_combined_envelope_boundary();
   test_scheduled_exact_state_w4_boundary();
+  test_phase7_lazy_auto_policy_contract();
+  test_phase7_lazy_auto_budget_and_freeze_contract();
   test_pattern_batch_cache_options_match_all_cache();
   test_lazy_local_admission_planner();
   test_lazy_local_packed_context_grouping_reuses_scratch();
@@ -12213,6 +12721,7 @@ int main() {
   test_enumeration_truncation_sets_unverified_flag_even_exhaustive();
   test_phase5_no_improvement_search_stops_without_commit();
   test_phase5_known_improving_search_commits_once();
+  test_phase7_auto_on_accepted_rebuild_preserves_frozen_policy();
   test_phase9_known_improving_search_uses_local_accept_update();
   test_phase5_final_compaction_uses_grammar_oracle_not_tree_override();
   test_phase5_final_compaction_checks_recorded_exact_objective();

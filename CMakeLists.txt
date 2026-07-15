@@ -430,6 +430,13 @@ add_test(NAME dagutil_wric_lazy_chart_composite_score_off_report_contract
 	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --wric-lazy-chart off --chart-composite-score > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_composite_score_off.out\" && ! grep -q 'wric_lazy_chart:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_composite_score_off.out\" && ! grep -q 'lazy_chart_used:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_composite_score_off.out\" && ! grep -q 'lazy_inside_rows_computed:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_composite_score_off.out\""
 	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+add_test(NAME dagutil_wric_lazy_auto_named_fixture_decisions
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --dag-pb test/wric_lazy_high_compression.pb.gz --force-no-vcf --wric-polytomy-mode reject --wric-lazy-chart auto --chart-spr-score-local --chart-spr-max-candidates 1 > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_high.out\" && grep -q 'lazy_policy_requested: auto' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_high.out\" && grep -q 'lazy_policy_resolved: on' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_high.out\" && grep -q 'cache_strategy: lazy_multisite_chart' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_high.out\" && grep -q 'wric_lazy_chart: on' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_high.out\" && \"$<TARGET_FILE:dagutil>\" --dag-pb test/wric_lazy_dense_favoring.pb.gz --force-no-vcf --wric-polytomy-mode allow --wric-lazy-chart auto --chart-spr-score-local --chart-spr-max-candidates 1 > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_dense.out\" && grep -q 'lazy_policy_requested: auto' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_dense.out\" && grep -q 'lazy_policy_resolved: off' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_dense.out\" && ! grep -q 'wric_lazy_chart:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_dense.out\"")
+set_tests_properties(dagutil_wric_lazy_auto_named_fixture_decisions
+                     PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                                TIMEOUT 120)
+
 add_test(NAME dagutil_wric_allow_audit_labels
 	         COMMAND bash -c
 	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --wric-polytomy-report > \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_audit_labels.out\" && grep -q 'polytomy_mode: allow' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_audit_labels.out\" && grep -Eq 'grammar_max_arity: [3-9]' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_audit_labels.out\" && grep -q 'kary_grammar_diagnostic_only: false' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_audit_labels.out\""
@@ -463,6 +470,13 @@ add_test(NAME dagutil_wric_lazy_chart_bnb_trim
 	         COMMAND bash -c
 	                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --wric-lazy-chart on --chart-bnb-trim --chart-bnb-dominance off --chart-bnb-max-frontier 1000 --chart-spr-workers 2 > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim.out\" && grep -q 'wric_lazy_chart: on' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim.out\" && grep -q 'lazy_chart_used: true' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim.out\" && grep -q 'lazy_merge_ratio:' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim.out\" && grep -q 'chart_scheduler_used: false' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim.out\" && grep -q 'chart_scheduler_mode: lazy_serial' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim.out\" && ! grep -q 'chart_axis_exact_' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_bnb_trim.out\""
 	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME dagutil_wric_lazy_auto_standalone_rejected
+         COMMAND bash -c
+                 "! \"$<TARGET_FILE:dagutil>\" --dag-pb \"${CMAKE_BINARY_DIR}/intentionally-missing-auto-input.pb.gz\" --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --wric-lazy-chart auto --chart-bnb-trim --chart-bnb-dominance off --chart-bnb-max-frontier 1000 > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_bnb.out\" 2> \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_bnb.err\" && test ! -s \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_bnb.out\" && grep -q 'auto is supported only by chart-SPR search/state modes' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_bnb.err\" && ! \"$<TARGET_FILE:dagutil>\" --dag-pb \"${CMAKE_BINARY_DIR}/intentionally-missing-auto-input.pb.gz\" --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --wric-lazy-chart auto --chart-spr-score-local --chart-spr-max-candidates 1 --chart-composite-score > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_mixed.out\" 2> \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_mixed.err\" && test ! -s \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_mixed.out\" && grep -q 'auto is supported only by chart-SPR search/state modes' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_auto_mixed.err\"")
+set_tests_properties(dagutil_wric_lazy_auto_standalone_rejected
+                     PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                                TIMEOUT 60)
 
 add_test(NAME dagutil_wric_lazy_chart_bnb_trim_off_report_contract
 	         COMMAND bash -c
@@ -596,6 +610,13 @@ add_test(NAME dagutil_chart_spr_search
 set_tests_properties(dagutil_chart_spr_search
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "search_mode: phase5_accept_reject_materialize_rebuild")
+
+add_test(NAME dagutil_chart_spr_search_lazy_auto_cli
+         COMMAND bash -c
+                 "\"$<TARGET_FILE:dagutil>\" --dag-pb data/test_5_trees/tree_0.pb.gz --force-no-vcf --wric-polytomy-mode expand-bounded --wric-polytomy-max-shapes 1 --wric-lazy-chart auto --chart-spr-search --chart-spr-max-candidates 1 > \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_auto.out\" && grep -q 'lazy_policy: auto' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_auto.out\" && grep -q 'lazy_policy_requested: auto' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_auto.out\" && grep -Eq 'lazy_policy_resolved: (off|on)' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_auto.out\" && grep -q 'lazy_policy_frozen: true' \"${CMAKE_BINARY_DIR}/dagutil_chart_spr_search_lazy_auto.out\"")
+set_tests_properties(dagutil_chart_spr_search_lazy_auto_cli
+                     PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                                TIMEOUT 60)
 
 add_test(NAME dagutil_chart_spr_search_lazy_default_report_contract
 	         COMMAND bash -c
@@ -766,12 +787,12 @@ set_tests_properties(dagutil_wric_phase9_chart_fluidity_site
 
 add_test(NAME dagutil_wric_allow_chart_row_fluidity_site
 	         COMMAND bash -c
-	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --chart-fluidity-site 1 > \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'polytomy_mode: allow' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'chart_fluidity_row_source: dense_chart_rows' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'chart_row_fluidity_runs: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'externally_fluid_clades: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'externally_fluid: true' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\""
+	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --chart-fluidity-site 1 > \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'polytomy_mode: allow' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'chart_fluidity_row_source: dense_chart_rows' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'lazy_policy_measurements_available: false' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'chart_row_fluidity_runs: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'externally_fluid_clades: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\" && grep -q 'externally_fluid: true' \"${CMAKE_BINARY_DIR}/dagutil_wric_allow_chart_row_fluidity_site.out\""
 	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_wric_lazy_chart_row_fluidity_site
 	         COMMAND bash -c
-	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --wric-lazy-chart on --chart-fluidity-site 1 > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'wric_lazy_chart: on' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'chart_fluidity_row_source: lazy_chart_rows' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'chart_row_fluidity_runs: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'externally_fluid_clades: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'externally_fluid: true' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\""
+	                 "\"$<TARGET_FILE:dagutil>\" --fasta test/wric_two_polytomy.fa --newick test/wric_two_polytomy.nwk --refseq test/wric_two_polytomy.ref --force-no-vcf --wric-polytomy-mode allow --wric-lazy-chart on --chart-fluidity-site 1 > \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'wric_lazy_chart: on' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'chart_fluidity_row_source: lazy_chart_rows' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'lazy_policy_measurements_available: true' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'chart_row_fluidity_runs: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'externally_fluid_clades: 1' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\" && grep -q 'externally_fluid: true' \"${CMAKE_BINARY_DIR}/dagutil_wric_lazy_chart_row_fluidity_site.out\""
 	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_test(NAME dagutil_wric_polytomy_benchmark_bad_shape_cap_suffix
@@ -1120,6 +1141,13 @@ add_test(NAME larch2_chart_bnb_lazy_trim_mode_writes_dag
 	         COMMAND bash -c
 	                 "\"$<TARGET_FILE:larch2>\" --dag-pb data/test_5_trees/tree_0.pb.gz -n 0 --trim-mode chart-bnb --wric-polytomy-mode expand-bounded --wric-lazy-chart on --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 -o \"${LARCH2_CHART_BNB_LAZY_TRIM_OUT}\" > \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim.stdout\" 2> \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim.stderr\" && test -s \"${LARCH2_CHART_BNB_LAZY_TRIM_OUT}\" && grep -q 'wric_lazy_chart: on' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim.stderr\" && grep -q 'lazy_chart_used: true' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim.stderr\" && grep -q 'lazy_merge_ratio:' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_trim.stderr\" && \"$<TARGET_FILE:dagutil>\" --dag-pb \"${LARCH2_CHART_BNB_LAZY_TRIM_OUT}\" --force-no-vcf --validate > /dev/null"
 	         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME larch2_chart_bnb_lazy_auto_rejected
+         COMMAND bash -c
+                 "! \"$<TARGET_FILE:larch2>\" --dag-pb data/test_5_trees/tree_0.pb.gz -n 0 --trim-mode chart-bnb --wric-polytomy-mode expand-bounded --wric-lazy-chart auto --chart-bnb-max-frontier 1000 --chart-bnb-max-exact-topologies 10 -o \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_auto.pb.gz\" > \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_auto.stdout\" 2> \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_auto.stderr\" && grep -q 'auto is supported only by chart-SPR search/state modes' \"${CMAKE_BINARY_DIR}/larch2_chart_bnb_lazy_auto.stderr\"")
+set_tests_properties(larch2_chart_bnb_lazy_auto_rejected
+                     PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                                TIMEOUT 60)
 
 add_test(NAME larch2_chart_bnb_lazy_trim_off_report_contract
 	         COMMAND bash -c

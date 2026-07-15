@@ -1168,9 +1168,10 @@ Analysis:
                           allow keeps multifurcating productions for
                           arity-aware chart/SPR paths; binary-only consumers
                           throw a labelled arity gate.
-  --wric-lazy-chart <M>   off (default) or on. Enables the lazy multisite chart
-                          substrate for chart-SPR, composite-score, benchmark,
-                          and chart-B&B diagnostics.
+  --wric-lazy-chart <M>   off (default), on, or auto. Auto is supported by
+                          chart-SPR search/state modes; standalone composite,
+                          B&B, benchmark, and fluidity modes require explicit
+                          off or on.
   --wric-polytomy-max-exact-arity <N>
                           Exact expansion arity cap (default 6)
   --wric-polytomy-max-shapes <N>
@@ -1428,6 +1429,7 @@ struct args {
   polytomy_refinement_options wric_polytomy_opts;
   bool wric_polytomy_mode_explicit = false;
   bool wric_lazy_chart = false;
+  chart_spr_lazy_policy wric_lazy_chart_policy = chart_spr_lazy_policy::off;
   bool wric_polytomy_report = false;
   bool wric_polytomy_benchmark = false;
   std::vector<std::size_t> wric_polytomy_benchmark_shape_caps{1, 4, 16};
@@ -1526,12 +1528,6 @@ parse_chart_spr_acceptance_mode(std::string_view text) {
       text == "lower_bound_heuristic") {
     return chart_spr_acceptance_mode::lower_bound_heuristic;
   }
-  return std::nullopt;
-}
-
-static std::optional<bool> parse_on_off(std::string_view text) {
-  if (text == "on") return true;
-  if (text == "off") return false;
   return std::nullopt;
 }
 
@@ -1788,12 +1784,19 @@ static args parse_args(int argc, char** argv) {
       a.wric_polytomy_mode_explicit = true;
     } else if (arg == "--wric-lazy-chart") {
       auto value = next();
-      auto enabled = parse_on_off(value);
-      if (!enabled) {
-        std::cerr << "error: --wric-lazy-chart must be off|on\n";
+      if (value == "off") {
+        a.wric_lazy_chart = false;
+        a.wric_lazy_chart_policy = chart_spr_lazy_policy::off;
+      } else if (value == "on") {
+        a.wric_lazy_chart = true;
+        a.wric_lazy_chart_policy = chart_spr_lazy_policy::on;
+      } else if (value == "auto") {
+        a.wric_lazy_chart = false;
+        a.wric_lazy_chart_policy = chart_spr_lazy_policy::automatic;
+      } else {
+        std::cerr << "error: --wric-lazy-chart must be off|on|auto\n";
         std::exit(1);
       }
-      a.wric_lazy_chart = *enabled;
     } else if (arg == "--wric-polytomy-max-exact-arity") {
       a.wric_polytomy_opts.max_exact_arity = static_cast<std::size_t>(
           std::stoull(std::string{next()}));
@@ -2198,6 +2201,21 @@ static args parse_args(int argc, char** argv) {
     std::cerr << "error: --chart-spr-canonical-sidecar requires "
                  "--chart-spr-canonical-result\n";
     std::exit(1);
+  }
+  if (a.wric_lazy_chart_policy == chart_spr_lazy_policy::automatic) {
+    auto const supported_state_mode =
+        a.chart_spr_score_local || a.chart_spr_search;
+    auto const standalone_consumer =
+        a.wric_benchmark || a.wric_polytomy_benchmark ||
+        a.chart_composite_score || a.chart_bnb_trim ||
+        a.chart_fluidity_site.has_value();
+    if (!supported_state_mode || standalone_consumer) {
+      std::cerr
+          << "error: --wric-lazy-chart auto is supported only by chart-SPR "
+             "search/state modes; standalone composite, B&B, benchmark, and "
+             "fluidity workloads require explicit off or on\n";
+      std::exit(1);
+    }
   }
   if (a.seed) a.chart_spr_enumeration.seed = *a.seed;
 
@@ -2727,15 +2745,118 @@ static void print_lazy_chart_snapshot_fields(std::ostream& out,
       << "\n";
 }
 
+static void print_chart_spr_lazy_policy_fields(
+    std::ostream& out, chart_spr_lazy_policy_diagnostics const& policy,
+    std::string const& indent) {
+  out << indent << "lazy_policy_version: " << policy.version << "\n";
+  out << indent << "lazy_policy_requested: "
+      << chart_spr_lazy_policy_name(policy.requested) << "\n";
+  out << indent
+      << "lazy_policy_resolved: " << chart_spr_lazy_policy_name(policy.resolved)
+      << "\n";
+  out << indent << "lazy_policy_reason: "
+      << chart_spr_lazy_policy_reason_name(policy.reason) << "\n";
+  out << indent << "lazy_policy_frozen: " << (policy.frozen ? "true" : "false")
+      << "\n";
+  out << indent << "lazy_policy_measurements_available: "
+      << (policy.measurements_available ? "true" : "false") << "\n";
+  out << indent
+      << "lazy_policy_active_patterns: " << policy.active_pattern_count << "\n";
+  out << indent << "lazy_policy_pilot_patterns: " << policy.pilot_pattern_count
+      << "\n";
+  out << indent << "lazy_policy_pilot_pattern_index_hash: "
+      << policy.pilot_pattern_index_hash << "\n";
+  out << indent << "lazy_policy_pilot_inside_chart_builds: "
+      << policy.pilot_inside_chart_builds << "\n";
+  out << indent << "lazy_policy_pilot_outside_chart_builds: "
+      << policy.pilot_outside_chart_builds << "\n";
+  out << indent
+      << "lazy_policy_pilot_exact_builds: " << policy.pilot_exact_builds
+      << "\n";
+  out << indent << "lazy_policy_pilot_scheduler_submissions: "
+      << policy.pilot_scheduler_submissions << "\n";
+  out << indent << "lazy_policy_pilot_internal_structural_classes_max: "
+      << policy.pilot_internal_structural_class_count_max << "\n";
+  out << indent << "lazy_policy_pilot_structural_ratio_numerator: "
+      << policy.pilot_structural_ratio_numerator << "\n";
+  out << indent << "lazy_policy_pilot_structural_ratio_denominator: "
+      << policy.pilot_structural_ratio_denominator << "\n";
+  out << indent << "lazy_policy_pilot_structural_ratio: " << std::fixed
+      << std::setprecision(6)
+      << ratio_or_zero(
+             policy.pilot_structural_ratio_numerator,
+             static_cast<double>(policy.pilot_structural_ratio_denominator))
+      << "\n";
+  out << indent << "lazy_policy_pilot_inside_rows: " << policy.pilot_inside_rows
+      << "\n";
+  out << indent << "lazy_policy_pilot_dense_rows: " << policy.pilot_dense_rows
+      << "\n";
+  out << indent << "lazy_policy_pilot_row_ratio_numerator: "
+      << policy.pilot_row_ratio_numerator << "\n";
+  out << indent << "lazy_policy_pilot_row_ratio_denominator: "
+      << policy.pilot_row_ratio_denominator << "\n";
+  out << indent << "lazy_policy_pilot_row_ratio: " << std::fixed
+      << std::setprecision(6)
+      << ratio_or_zero(policy.pilot_row_ratio_numerator,
+                       static_cast<double>(policy.pilot_row_ratio_denominator))
+      << "\n";
+  out << indent << "lazy_policy_pilot_estimated_allocation_bytes: "
+      << policy.pilot_estimated_allocation_bytes << "\n";
+  out << indent << "lazy_policy_estimated_lazy_cache_bytes: "
+      << policy.estimated_lazy_cache_bytes << "\n";
+  out << indent << "lazy_policy_estimated_dense_cache_bytes: "
+      << policy.estimated_dense_cache_bytes << "\n";
+  out << indent << "lazy_policy_pilot_key_words: " << policy.pilot_key_words
+      << "\n";
+  out << indent
+      << "lazy_policy_pilot_dense_row_work: " << policy.pilot_dense_row_work
+      << "\n";
+}
+
+static chart_spr_lazy_policy_diagnostics resolve_standalone_lazy_policy(
+    args const& a, clade_grammar const& grammar,
+    site_pattern_set const& patterns) {
+  chart_spr_lazy_policy_diagnostics result;
+  // Compatibility has exactly one precedence rule: the historical true bit
+  // is forced on; otherwise the explicit enum governs.
+  result.requested =
+      a.wric_lazy_chart ? chart_spr_lazy_policy::on : a.wric_lazy_chart_policy;
+  result.resolved = result.requested;
+  // Standalone composite/B&B/fluidity modes retain every pattern, including
+  // invariant patterns.  Report and estimate the surface they actually build;
+  // chart-SPR state modes separately report their invariant-filtered active
+  // pattern set.
+  result.active_pattern_count = patterns.patterns.size();
+  result.estimated_dense_cache_bytes =
+      chart_spr_exact_candidate_checked_bytes_multiply(
+          estimate_chart_spr_pattern_row_cache_bytes(grammar),
+          result.active_pattern_count,
+          "dagutil standalone lazy-policy full dense bytes");
+  result.estimated_lazy_cache_bytes =
+      estimate_chart_spr_lazy_cache_admission_bytes(
+          grammar.clades.size(), result.active_pattern_count);
+  if (result.requested == chart_spr_lazy_policy::automatic) {
+    throw std::runtime_error(
+        "--wric-lazy-chart auto is supported only by chart-SPR search/state "
+        "modes; standalone composite, B&B, and fluidity workloads require "
+        "explicit off or on");
+  }
+  result.reason = result.requested == chart_spr_lazy_policy::on
+                      ? chart_spr_lazy_policy_reason::explicit_on
+                      : chart_spr_lazy_policy_reason::explicit_off;
+  result.frozen = true;
+  return result;
+}
+
 static void print_chart_spr_lazy_state_fields(
     std::ostream& out, chart_spr_search_state const& state,
     std::string const& indent) {
+  print_chart_spr_lazy_policy_fields(out, state.lazy_policy, indent);
+  if (state.cache_strategy != chart_spr_cache_strategy::lazy_multisite_chart) {
+    return;
+  }
   auto const* lazy = state.lazy_chart ? &*state.lazy_chart : nullptr;
-  out << indent << "wric_lazy_chart: "
-      << (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart
-              ? "on"
-              : "off")
-      << "\n";
+  out << indent << "wric_lazy_chart: on\n";
   out << indent << "lazy_chart_used: " << (lazy == nullptr ? "false" : "true")
       << "\n";
   print_lazy_chart_snapshot_fields(out, state.grammar,
@@ -2829,10 +2950,12 @@ static void print_binary_refinement_performance_benchmark(
   auto patterns = build_site_patterns(dag, grammar, pattern_opts);
   auto pattern_ms = elapsed_ms(pattern_start, std::chrono::steady_clock::now());
 
+  auto lazy_policy = resolve_standalone_lazy_policy(a, grammar, patterns);
+  auto const use_lazy = lazy_policy.resolved == chart_spr_lazy_policy::on;
   std::optional<lazy_multisite_chart> lazy_chart;
   auto composite_start = std::chrono::steady_clock::now();
   composite_chart_score composite;
-  if (a.wric_lazy_chart) {
+  if (use_lazy) {
     lazy_chart = build_lazy_inside_chart(grammar, patterns);
     composite =
         build_composite_chart_score(grammar, patterns, *lazy_chart, chart_opts);
@@ -2845,7 +2968,8 @@ static void print_binary_refinement_performance_benchmark(
   out << child << "site: " << site << "\n";
   out << child << "score_ua_edge: "
       << (a.chart_score_ua_edge ? "true" : "false") << "\n";
-  if (a.wric_lazy_chart) {
+  print_chart_spr_lazy_policy_fields(out, lazy_policy, child);
+  if (use_lazy) {
     out << child << "wric_lazy_chart: on\n";
   }
   out << child << "reference_state: " << chart_state_label(reference_state)
@@ -2915,7 +3039,7 @@ static void print_binary_refinement_performance_benchmark(
       << composite.weighted_lower_bound << "\n";
   out << child << "multifurcation_productions_scored: "
       << composite.multifurcation_productions_scored << "\n";
-  if (a.wric_lazy_chart) {
+  if (use_lazy) {
     print_lazy_chart_snapshot_fields(
         out, grammar, patterns, lazy_chart ? &*lazy_chart : nullptr, child);
   }
@@ -2942,7 +3066,7 @@ static void print_binary_refinement_performance_benchmark(
         << bnb_ms << "\n";
     out << child << "optimum: " << trim.optimum << "\n";
     out << child << "active_patterns: " << trim.active_pattern_count << "\n";
-    if (a.wric_lazy_chart) {
+    if (use_lazy) {
       print_lazy_trim_fields(out, grammar, patterns, trim, child);
     }
     out << child << "equality_deduplicated: "
@@ -3248,6 +3372,11 @@ static void print_chart_spr_search_counter_fields(
     out << indent << "lazy_chart_pre_submit_rejections: "
         << counters.lazy_chart_pre_submit_rejections << "\n";
   }
+  out << indent << "lazy_policy_pilot_runs: " << counters.lazy_policy_pilot_runs
+      << "\n";
+  out << indent
+      << "lazy_policy_frozen_reuses: " << counters.lazy_policy_frozen_reuses
+      << "\n";
   out << indent << "local_commit_two_chart_oracle_runs: "
       << counters.local_commit_two_chart_oracle_runs << "\n";
   out << indent << "local_commit_tip_grammar_refreshes: "
@@ -3748,9 +3877,7 @@ static void run_chart_spr_local_scoring_diagnostic(
       << state.invariant_constant_offset << "\n";
   out << "  cache_strategy: "
       << chart_spr_cache_strategy_name(state.cache_strategy) << "\n";
-  if (a.wric_lazy_chart) {
-    print_chart_spr_lazy_state_fields(out, state, "  ");
-  }
+  print_chart_spr_lazy_state_fields(out, state, "  ");
   out << "  chart_cache_estimated_full_bytes: "
       << state.estimated_full_pattern_cache_bytes << "\n";
   out << "  chart_cache_resident_bytes: "
@@ -3840,8 +3967,9 @@ static void run_chart_spr_local_scoring_diagnostic(
   out << "  candidate_generation:\n";
   print_chart_spr_generation_stats(out, generation, "    ");
   out << "  counters:\n";
-  print_chart_spr_search_counter_fields(out, state.counters, "    ",
-                                        a.wric_lazy_chart);
+  print_chart_spr_search_counter_fields(
+      out, state.counters, "    ",
+      state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart);
 }
 
 static std::string chart_spr_topology_selection_label(
@@ -3867,6 +3995,7 @@ static chart_spr_search_options make_chart_spr_search_options(
   options.enumeration = a.chart_spr_enumeration;
   options.cache = a.chart_spr_cache;
   options.cache.use_lazy_multisite_chart = a.wric_lazy_chart;
+  options.cache.lazy_policy = a.wric_lazy_chart_policy;
   auto const requested_workers =
       a.chart_spr_workers.value_or(
           a.chart_spr_local_score_workers.value_or(1));
@@ -4177,7 +4306,10 @@ static void run_chart_spr_search_diagnostic(
       << a.wric_polytomy_opts.max_new_productions_per_polytomy << "\n";
   out << "  polytomy_max_clades: "
       << a.wric_polytomy_opts.max_new_clades_per_polytomy << "\n";
-  out << "  lazy_policy: " << (a.wric_lazy_chart ? "on" : "off") << "\n";
+  out << "  lazy_policy: "
+      << chart_spr_lazy_policy_name(search.summary.lazy_policy.requested)
+      << "\n";
+  print_chart_spr_lazy_policy_fields(out, search.summary.lazy_policy, "  ");
   out << "  max_cached_patterns: "
       << options.cache.max_cached_patterns << "\n";
   out << "  configured_pattern_batch_size: "
@@ -4392,6 +4524,10 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.lazy_inside_rows_recomputed_on_commit << "\n";
   out << "  lazy_outside_rows_recomputed_on_commit: "
       << search.summary.lazy_outside_rows_recomputed_on_commit << "\n";
+  out << "  lazy_policy_pilot_runs: " << search.summary.lazy_policy_pilot_runs
+      << "\n";
+  out << "  lazy_policy_frozen_reuses: "
+      << search.summary.lazy_policy_frozen_reuses << "\n";
   if (search_used_lazy_chart) {
     out << "  lazy_inside_rows_computed: "
         << search.summary.lazy_inside_rows_computed << "\n";
@@ -5249,10 +5385,12 @@ int main(int argc, char** argv) try {
     chart_options chart_opts;
     chart_opts.score_ua_edge = a.chart_score_ua_edge;
 
+    auto lazy_policy = resolve_standalone_lazy_policy(a, grammar, patterns);
+    auto const use_lazy = lazy_policy.resolved == chart_spr_lazy_policy::on;
     std::optional<lazy_multisite_chart> lazy_chart;
     auto composite_start = std::chrono::steady_clock::now();
     composite_chart_score composite;
-    if (a.wric_lazy_chart) {
+    if (use_lazy) {
       lazy_chart = build_lazy_inside_chart(grammar, patterns);
       composite = build_composite_chart_score(grammar, patterns, *lazy_chart,
                                               chart_opts);
@@ -5273,7 +5411,8 @@ int main(int argc, char** argv) try {
               << composite.multifurcation_productions_scored << "\n";
     std::cout << "  score_ua_edge: "
               << (a.chart_score_ua_edge ? "true" : "false") << "\n";
-    if (a.wric_lazy_chart) {
+    print_chart_spr_lazy_policy_fields(std::cout, lazy_policy, "  ");
+    if (use_lazy) {
       std::cout << "  wric_lazy_chart: on\n";
     }
     std::cout << "  exact_patterns: " << patterns.patterns.size() << "\n";
@@ -5288,7 +5427,7 @@ int main(int argc, char** argv) try {
               << std::setprecision(3) << exact_pattern_build_ms << "\n";
     std::cout << "  composite_chart_ms: " << std::fixed
               << std::setprecision(3) << composite_ms << "\n";
-    if (a.wric_lazy_chart) {
+    if (use_lazy) {
       print_lazy_chart_snapshot_fields(
           std::cout, grammar, patterns, lazy_chart ? &*lazy_chart : nullptr,
           "  ");
@@ -5305,9 +5444,10 @@ int main(int argc, char** argv) try {
     chart_opts.score_ua_edge = a.chart_score_ua_edge;
     auto trim_opts = make_chart_bnb_trim_options(a);
 
+    auto lazy_policy = resolve_standalone_lazy_policy(a, grammar, patterns);
+    auto const use_lazy = lazy_policy.resolved == chart_spr_lazy_policy::on;
     std::optional<lazy_multisite_chart> lazy_chart;
-    if (a.wric_lazy_chart)
-      lazy_chart = build_lazy_inside_chart(grammar, patterns);
+    if (use_lazy) lazy_chart = build_lazy_inside_chart(grammar, patterns);
     multisite_trim_result trim;
     bool chart_scheduler_used = false;
     chart_scheduler_metrics bnb_scheduler_metrics;
@@ -5454,7 +5594,8 @@ int main(int argc, char** argv) try {
     } else {
       std::cout << "  chart_scheduler_mode: lazy_serial\n";
     }
-    if (a.wric_lazy_chart) {
+    print_chart_spr_lazy_policy_fields(std::cout, lazy_policy, "  ");
+    if (use_lazy) {
       std::cout << "  wric_lazy_chart: on\n";
     }
     std::cout << "  active_patterns: " << trim.active_pattern_count << "\n";
@@ -5497,7 +5638,7 @@ int main(int argc, char** argv) try {
     std::cout << "  upper_bound_override_kind: PRUNING_ONLY\n";
     std::cout << "  max_frontier_entries_per_clade: "
               << trim_opts.max_frontier_entries_per_clade << "\n";
-    if (a.wric_lazy_chart) {
+    if (use_lazy) {
       print_lazy_trim_fields(std::cout, grammar, patterns, trim, "  ");
     }
     std::cout << "  grammar_build_ms: " << std::fixed
@@ -5588,8 +5729,7 @@ int main(int argc, char** argv) try {
           std::cout << "  output_dag: " << output_path << "\n";
         } else if (apply.mode ==
                    chart_bnb_trim_application_mode::annotated_optimal_trim) {
-          write_chart_bnb_apply_json(output_path, trim, apply,
-                                     a.wric_lazy_chart);
+          write_chart_bnb_apply_json(output_path, trim, apply, use_lazy);
           std::cout << "  output_artifact: " << output_path << "\n";
         } else {
           throw std::runtime_error(
@@ -5603,7 +5743,7 @@ int main(int argc, char** argv) try {
       }
       if (!a.chart_bnb_report_json.empty()) {
         write_chart_bnb_apply_json(a.chart_bnb_report_json, trim, apply,
-                                   a.wric_lazy_chart);
+                                   use_lazy);
         std::cout << "  report_json: " << a.chart_bnb_report_json << "\n";
       }
     }
@@ -5622,8 +5762,21 @@ int main(int argc, char** argv) try {
     chart_opts.score_ua_edge = a.chart_score_ua_edge;
     fluidity_report report;
     std::string fluidity_row_source = "dense_chart_rows";
-    if (a.wric_lazy_chart) {
-      auto patterns = build_site_patterns(result, grammar);
+    chart_spr_lazy_policy_diagnostics lazy_policy;
+    lazy_policy.requested = a.wric_lazy_chart ? chart_spr_lazy_policy::on
+                                              : a.wric_lazy_chart_policy;
+    lazy_policy.resolved = lazy_policy.requested;
+    lazy_policy.reason = chart_spr_lazy_policy_reason::explicit_off;
+    lazy_policy.frozen = true;
+    lazy_policy.measurements_available = false;
+    std::optional<site_pattern_set> lazy_patterns;
+    if (lazy_policy.requested != chart_spr_lazy_policy::off) {
+      lazy_patterns = build_site_patterns(result, grammar);
+      lazy_policy = resolve_standalone_lazy_policy(a, grammar, *lazy_patterns);
+    }
+    auto const use_lazy = lazy_policy.resolved == chart_spr_lazy_policy::on;
+    if (use_lazy) {
+      auto& patterns = *lazy_patterns;
       auto site_offset = static_cast<std::size_t>(*a.chart_fluidity_site - 1);
       if (site_offset >= patterns.original_site_to_pattern.size()) {
         throw std::runtime_error("chart fluidity site outside reference length");
@@ -5654,7 +5807,8 @@ int main(int argc, char** argv) try {
     std::cout << "chart_fluidity_score_ua_edge: "
               << (a.chart_score_ua_edge ? "true" : "false") << "\n";
     std::cout << "chart_fluidity_row_source: " << fluidity_row_source << "\n";
-    if (a.wric_lazy_chart) {
+    print_chart_spr_lazy_policy_fields(std::cout, lazy_policy, "");
+    if (use_lazy) {
       std::cout << "wric_lazy_chart: on\n";
     }
     print_wric_polytomy_score_fields(std::cout, refinement,

@@ -112,7 +112,7 @@ Scheduling and measurement:
                           non-manifest per-process RSS cap; positive bytes
   --chart-memory-budget B forward exactly to --chart-spr-memory-budget
   --local-accept-updates  forward exactly to --chart-spr-local-accept-updates
-  --chart-lazy-policy M   forward off|on to --wric-lazy-chart (default: off)
+  --chart-lazy-policy M   forward off|on|auto to --wric-lazy-chart (default: off)
   --full-canonical-correctness
                           run one separate untimed full-sidecar oracle per mode
   --native-only           run only the native timed row (non-manifest capture)
@@ -224,8 +224,9 @@ done
   fail "--capture-rss-limit-bytes requires a positive integer"
 (( capture_rss_limit_explicit == 0 )) || [[ -z "$workload_manifest" ]] || \
   fail "--capture-rss-limit-bytes cannot be combined with --workload-manifest"
-[[ "$chart_lazy_policy" == off || "$chart_lazy_policy" == on ]] || \
-  fail "--chart-lazy-policy requires off or on"
+[[ "$chart_lazy_policy" == off || "$chart_lazy_policy" == on ||
+   "$chart_lazy_policy" == auto ]] || \
+  fail "--chart-lazy-policy requires off, on, or auto"
 
 worker_option_count=$((local_workers_explicit + chart_workers_explicit + workers_list_explicit))
 (( worker_option_count <= 1 )) || \
@@ -424,7 +425,7 @@ validate_manifest_rows() {
         }
         if ($(h["native_max_moves"])!="-" || !isuint($(h["chart_max_candidates"])) || !isuint($(h["chart_top_k_exact"]))) bad("chart work budget is not canonical")
         if ($(h["candidate_cap_semantics"])!="post-dedup") bad("chart candidate cap must be post-dedup")
-        lazy=$(h["lazy_policy"]); if(lazy!="off" && lazy!="on") bad("lazy_policy must be off or on")
+        lazy=$(h["lazy_policy"]); if(lazy!="off" && lazy!="on" && lazy!="auto") bad("lazy_policy must be off, on, or auto")
         if ($(h["polytomy_mode"])!="reject" && $(h["polytomy_mode"])!="expand-exact" && $(h["polytomy_mode"])!="expand-bounded") bad("invalid polytomy_mode")
         if ($(h["candidate_selection"])!="lower_bound_top_k" && $(h["candidate_selection"])!="exhaustive_exact" && $(h["candidate_selection"])!="lower_bound_first_improvement" && $(h["candidate_selection"])!="sampled_or_randomized") bad("invalid candidate_selection")
         if ($(h["candidate_source"])!="grammar" && $(h["candidate_source"])!="sampled_tree" && $(h["candidate_source"])!="hybrid") bad("invalid candidate_source")

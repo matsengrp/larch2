@@ -769,6 +769,8 @@ static void test_phase10_counter_contract_fields_exist() {
   (void)c.lazy_outside_rows_recomputed_on_commit;
   (void)c.lazy_incremental_rows_recomputed;
   (void)c.lazy_structural_class_count_max;
+  (void)c.lazy_policy_pilot_runs;
+  (void)c.lazy_policy_frozen_reuses;
   (void)c.selected_topology_class_rows_computed;
   (void)c.local_commit_accepted_moves;
   (void)c.local_commit_tombstone_scope_skips;
@@ -809,6 +811,8 @@ static void test_phase10_counter_contract_fields_exist() {
   (void)s.lazy_outside_rows_recomputed_on_commit;
   (void)s.lazy_incremental_rows_recomputed;
   (void)s.lazy_structural_class_count_max;
+  (void)s.lazy_policy_pilot_runs;
+  (void)s.lazy_policy_frozen_reuses;
   (void)s.lazy_internal_structural_class_count_max;
   (void)s.lazy_merge_ratio;
   (void)s.lazy_internal_structural_class_ratio;

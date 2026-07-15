@@ -78,7 +78,12 @@ worker option is emitted. `--local-workers` forwards the legacy
 `--chart-spr-local-score-workers`; the other two controls forward the unified
 `--chart-spr-workers` option.
 
-`--chart-lazy-policy off|on` freezes and forwards `--wric-lazy-chart`.
+`--chart-lazy-policy off|on|auto` freezes and forwards
+`--wric-lazy-chart`. Automatic selection is a chart-SPR search/state policy;
+standalone composite, chart-B&B, benchmark, and fluidity consumers require an
+explicit `off` or `on`. Reports and manifests preserve the requested `auto`
+value, while `lazy_policy_resolved` and `cache_strategy` record the one
+deterministically frozen representation branch.
 Manifest-group execution obtains the fixture, work budgets, timeout, seed,
 cache/batch policy, polytomy caps, lazy mode, verification mode, and commit
 mode from every selected row. Conflicting global work/search options are

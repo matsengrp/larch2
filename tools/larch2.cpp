@@ -23,6 +23,7 @@
 #include <larch/site_patterns.hpp>
 #include <larch/chart_trim.hpp>
 #include <larch/lazy_chart.hpp>
+#include <larch/chart_spr_search.hpp>
 #include <larch/chart_bnb_trim_apply.hpp>
 
 #include <algorithm>
@@ -290,8 +291,8 @@ Post-processing:
                           reject, audit-kary, allow, expand-exact, or
                           expand-bounded
                           (chart-bnb default: expand-bounded)
-  --wric-lazy-chart <M>   off (default) or on. Enables the lazy multisite chart
-                          substrate for chart-B&B trim.
+  --wric-lazy-chart <M>   off (default) or on for standalone chart-B&B trim.
+                          Auto is reserved for chart-SPR search/state modes.
   --wric-polytomy-max-shapes <N>
                           Bounded soft-polytomy shape cap for chart-bnb trim
                           (chart-bnb default: 1; raise for broader bounded
@@ -339,6 +340,7 @@ struct args {
   std::size_t chart_bnb_max_frontier = 0;
   std::optional<std::size_t> chart_bnb_max_exact_topologies;
   bool wric_lazy_chart = false;
+  chart_spr_lazy_policy wric_lazy_chart_policy = chart_spr_lazy_policy::off;
   polytomy_refinement_options chart_bnb_polytomy_opts = [] {
     polytomy_refinement_options opts;
     opts.mode = polytomy_mode::expand_soft_bounded;
@@ -466,12 +468,6 @@ parse_larch2_chart_bnb_application_mode(std::string_view text) {
       text == "topology-materialize" || text == "topology_materialize") {
     return chart_bnb_trim_application_mode::optimal_topology_materialize;
   }
-  return std::nullopt;
-}
-
-static std::optional<bool> parse_larch2_on_off(std::string_view text) {
-  if (text == "on") return true;
-  if (text == "off") return false;
   return std::nullopt;
 }
 
@@ -695,12 +691,17 @@ static args parse_args(int argc, char** argv) {
       a.chart_bnb_polytomy_opts.mode = *mode;
     } else if (arg == "--wric-lazy-chart") {
       auto value = next();
-      auto enabled = parse_larch2_on_off(value);
-      if (!enabled) {
-        std::cerr << "error: --wric-lazy-chart must be off|on\n";
+      if (value == "off") {
+        a.wric_lazy_chart = false;
+        a.wric_lazy_chart_policy = chart_spr_lazy_policy::off;
+      } else if (value == "on") {
+        a.wric_lazy_chart = true;
+        a.wric_lazy_chart_policy = chart_spr_lazy_policy::on;
+      } else {
+        std::cerr << "error: --wric-lazy-chart must be off|on; auto is "
+                     "supported only by chart-SPR search/state modes\n";
         std::exit(1);
       }
-      a.wric_lazy_chart = *enabled;
     } else if (arg == "--wric-polytomy-max-shapes") {
       a.chart_bnb_polytomy_opts.max_shapes_per_polytomy =
           parse_size_arg(next(), arg);
@@ -2620,13 +2621,12 @@ static void print_larch2_lazy_trim_report(
 }
 
 static void print_chart_bnb_trim_report(
-    multisite_trim_result const& trim,
-    chart_bnb_trim_apply_result const& apply,
+    multisite_trim_result const& trim, chart_bnb_trim_apply_result const& apply,
     polytomy_refinement_result const& refinement,
     site_pattern_set const& patterns,
     polytomy_refinement_options const& polytomy_opts,
-    chart_options const& chart_opts,
-    bool wric_lazy_chart,
+    chart_options const& chart_opts, bool wric_lazy_chart,
+    chart_spr_lazy_policy_diagnostics const& lazy_policy,
     chart_bnb_trim_application_mode requested_mode, bool auto_fallback) {
   if (!trim.keep_production_exact) {
     throw std::runtime_error(
@@ -2654,6 +2654,55 @@ static void print_chart_bnb_trim_report(
             << "\n";
   std::cerr << "  score_ua_edge: "
             << (chart_opts.score_ua_edge ? "true" : "false") << "\n";
+  std::cerr << "  lazy_policy_version: " << lazy_policy.version << "\n";
+  std::cerr << "  lazy_policy_requested: "
+            << chart_spr_lazy_policy_name(lazy_policy.requested) << "\n";
+  std::cerr << "  lazy_policy_resolved: "
+            << chart_spr_lazy_policy_name(lazy_policy.resolved) << "\n";
+  std::cerr << "  lazy_policy_reason: "
+            << chart_spr_lazy_policy_reason_name(lazy_policy.reason) << "\n";
+  std::cerr << "  lazy_policy_frozen: "
+            << (lazy_policy.frozen ? "true" : "false") << "\n";
+  std::cerr << "  lazy_policy_measurements_available: "
+            << (lazy_policy.measurements_available ? "true" : "false") << "\n";
+  std::cerr << "  lazy_policy_active_patterns: "
+            << lazy_policy.active_pattern_count << "\n";
+  std::cerr << "  lazy_policy_pilot_patterns: "
+            << lazy_policy.pilot_pattern_count << "\n";
+  std::cerr << "  lazy_policy_pilot_pattern_index_hash: "
+            << lazy_policy.pilot_pattern_index_hash << "\n";
+  std::cerr << "  lazy_policy_pilot_inside_chart_builds: "
+            << lazy_policy.pilot_inside_chart_builds << "\n";
+  std::cerr << "  lazy_policy_pilot_outside_chart_builds: "
+            << lazy_policy.pilot_outside_chart_builds << "\n";
+  std::cerr << "  lazy_policy_pilot_exact_builds: "
+            << lazy_policy.pilot_exact_builds << "\n";
+  std::cerr << "  lazy_policy_pilot_scheduler_submissions: "
+            << lazy_policy.pilot_scheduler_submissions << "\n";
+  std::cerr << "  lazy_policy_pilot_internal_structural_classes_max: "
+            << lazy_policy.pilot_internal_structural_class_count_max << "\n";
+  std::cerr << "  lazy_policy_pilot_structural_ratio_numerator: "
+            << lazy_policy.pilot_structural_ratio_numerator << "\n";
+  std::cerr << "  lazy_policy_pilot_structural_ratio_denominator: "
+            << lazy_policy.pilot_structural_ratio_denominator << "\n";
+  std::cerr << "  lazy_policy_pilot_inside_rows: "
+            << lazy_policy.pilot_inside_rows << "\n";
+  std::cerr << "  lazy_policy_pilot_dense_rows: "
+            << lazy_policy.pilot_dense_rows << "\n";
+  std::cerr << "  lazy_policy_pilot_row_ratio_numerator: "
+            << lazy_policy.pilot_row_ratio_numerator << "\n";
+  std::cerr << "  lazy_policy_pilot_row_ratio_denominator: "
+            << lazy_policy.pilot_row_ratio_denominator << "\n";
+  std::cerr << "  lazy_policy_pilot_estimated_allocation_bytes: "
+            << lazy_policy.pilot_estimated_allocation_bytes << "\n";
+  std::cerr << "  lazy_policy_estimated_lazy_cache_bytes: "
+            << lazy_policy.estimated_lazy_cache_bytes << "\n";
+  std::cerr << "  lazy_policy_estimated_dense_cache_bytes: "
+            << lazy_policy.estimated_dense_cache_bytes << "\n";
+  std::cerr << "  lazy_policy_pilot_key_words: " << lazy_policy.pilot_key_words
+            << "\n";
+  std::cerr << "  lazy_policy_pilot_dense_row_work: "
+            << lazy_policy.pilot_dense_row_work << "\n";
   if (wric_lazy_chart) {
     std::cerr << "  wric_lazy_chart: on\n";
   }
@@ -2742,8 +2791,34 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
   trim_opts.require_exact_keep_mask = true;
   trim_opts.max_frontier_entries_per_clade = a.chart_bnb_max_frontier;
 
+  chart_spr_lazy_policy_diagnostics lazy_policy;
+  lazy_policy.requested =
+      a.wric_lazy_chart ? chart_spr_lazy_policy::on : a.wric_lazy_chart_policy;
+  lazy_policy.resolved = lazy_policy.requested;
+  if (lazy_policy.requested == chart_spr_lazy_policy::automatic) {
+    throw std::runtime_error(
+        "--wric-lazy-chart auto is supported only by chart-SPR search/state "
+        "modes; larch2 standalone chart-B&B requires explicit off or on");
+  }
+  lazy_policy.reason = lazy_policy.requested == chart_spr_lazy_policy::on
+                           ? chart_spr_lazy_policy_reason::explicit_on
+                           : chart_spr_lazy_policy_reason::explicit_off;
+  // Standalone chart-B&B retains every pattern, including invariants.  Its
+  // policy diagnostics must describe the allocation surface it actually
+  // builds rather than the chart-SPR invariant-filtered surface.
+  lazy_policy.active_pattern_count = patterns.patterns.size();
+  lazy_policy.estimated_dense_cache_bytes =
+      chart_spr_exact_candidate_checked_bytes_multiply(
+          estimate_chart_spr_pattern_row_cache_bytes(refinement.grammar),
+          lazy_policy.active_pattern_count,
+          "larch2 lazy-policy full dense bytes");
+  lazy_policy.estimated_lazy_cache_bytes =
+      estimate_chart_spr_lazy_cache_admission_bytes(
+          refinement.grammar.clades.size(), lazy_policy.active_pattern_count);
+  lazy_policy.frozen = true;
+  auto const use_lazy = lazy_policy.resolved == chart_spr_lazy_policy::on;
   std::optional<lazy_multisite_chart> lazy_chart;
-  if (a.wric_lazy_chart) {
+  if (use_lazy) {
     lazy_chart = build_lazy_inside_chart(refinement.grammar, patterns);
   }
   auto bnb_start = std::chrono::steady_clock::now();
@@ -2794,10 +2869,9 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
                       std::chrono::steady_clock::now() - apply_start)
                       .count();
 
-  print_chart_bnb_trim_report(trim, apply, refinement, patterns,
-                              a.chart_bnb_polytomy_opts, chart_opts,
-                              a.wric_lazy_chart, a.chart_bnb_application_mode,
-                              auto_fallback);
+  print_chart_bnb_trim_report(
+      trim, apply, refinement, patterns, a.chart_bnb_polytomy_opts, chart_opts,
+      use_lazy, lazy_policy, a.chart_bnb_application_mode, auto_fallback);
   std::cerr << "  chart_grammar_build_ms: " << std::fixed
             << std::setprecision(3) << grammar_ms << "\n";
   std::cerr << "  pattern_build_ms: " << std::fixed << std::setprecision(3)

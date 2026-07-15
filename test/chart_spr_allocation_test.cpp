@@ -1009,6 +1009,36 @@ static void test_warmed_dense_local_scoring_is_allocation_free() {
   CHECK(state.skipped_invariant_site_count == 536);
   CHECK(state.composite_lower_bound_with_invariants == 174);
 
+  // All grammar/plan/pattern inputs are constructed before observation.  A
+  // finite auto-policy budget of one byte must fail closed in the resolver's
+  // preflight, before copying even one pilot pattern or constructing any lazy
+  // chart/grouping payload.  The global replaceable-new observer makes that
+  // ordering non-tautological: the measured resolver region allocates zero
+  // bytes and reports zero pilot builds.
+  larch::chart_cache_options preflight_cache;
+  preflight_cache.lazy_policy = larch::chart_spr_lazy_policy::automatic;
+  preflight_cache.memory_budget_bytes = 1;
+  larch::chart_spr_lazy_policy_diagnostics preflight_rejected;
+  allocation_test::allocation_observer preflight_observer;
+  {
+    allocation_test::scoped_allocation_observation observation{
+        preflight_observer};
+    preflight_rejected = larch::resolve_chart_spr_lazy_policy(
+        state.execution_plan, state.active_patterns, state.chart_opts,
+        preflight_cache, state.estimated_full_pattern_cache_bytes);
+  }
+  CHECK(preflight_observer.statistics ==
+        allocation_test::allocation_statistics{});
+  check_statistics(preflight_observer, 0, 0, 0, 0, 0);
+  CHECK(preflight_rejected.resolved == larch::chart_spr_lazy_policy::off);
+  CHECK(preflight_rejected.reason ==
+        larch::chart_spr_lazy_policy_reason::full_lazy_budget_exceeded);
+  CHECK(preflight_rejected.pilot_pattern_count == 0);
+  CHECK(preflight_rejected.pilot_inside_chart_builds == 0);
+  CHECK(preflight_rejected.pilot_outside_chart_builds == 0);
+  CHECK(preflight_rejected.pilot_exact_builds == 0);
+  CHECK(preflight_rejected.pilot_scheduler_submissions == 0);
+
   larch::grammar_spr_enumeration_options enumeration;
   enumeration.max_candidates = k_frozen_candidate_count;
   enumeration.max_candidates_is_post_dedup = true;

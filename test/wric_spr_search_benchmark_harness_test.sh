@@ -532,6 +532,9 @@ awk -F '\t' -v cap="$capture_rss_limit" '
 
 "$harness" "${common[@]}" --out-dir "$tmp/lazy" --chart-lazy-policy on >/dev/null
 grep -q -- '--wric-lazy-chart on' "$tmp/lazy/commands.sh"
+"$harness" "${common[@]}" --out-dir "$tmp/lazy-auto" \
+  --chart-lazy-policy auto >/dev/null
+grep -q -- '--wric-lazy-chart auto' "$tmp/lazy-auto/commands.sh"
 
 set +e
 "$harness" "${common[@]}" --out-dir "$tmp/conflict" --chart-workers 2 \
@@ -1097,6 +1100,23 @@ success_manifest="$tmp/success.tsv"
 write_manifest "$success_manifest" success-test ok 2 on \
   chart_spr_grammar_lower_bound_heuristic lower_bound_heuristic composite_lower_bound_heuristic \
   "$success_argv" "$search_sha" "$output_sha" "$success_trial"
+
+# A sealed row may request the deterministic automatic representation policy;
+# manifest validation and canonical argv binding must preserve the literal
+# `auto` request instead of rejecting or rewriting it.
+auto_manifest_argv=$(chart_argv_sha 2 auto lower_bound_heuristic)
+auto_manifest_trial=$(trial_sha chart_spr_grammar_lower_bound_heuristic \
+  "$search_sha" "$output_sha" "$auto_manifest_argv")
+auto_manifest="$tmp/lazy-auto-manifest.tsv"
+write_manifest "$auto_manifest" lazy-auto-manifest-test ok 2 auto \
+  chart_spr_grammar_lower_bound_heuristic lower_bound_heuristic composite_lower_bound_heuristic \
+  "$auto_manifest_argv" "$search_sha" "$output_sha" "$auto_manifest_trial"
+"$harness" --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" --out-dir "$tmp/lazy-auto-manifest" \
+  --workload-manifest "$auto_manifest" \
+  --run-manifest-group lazy-auto-manifest-test >/dev/null
+grep -q -- '--wric-lazy-chart auto' \
+  "$tmp/lazy-auto-manifest/commands.sh"
 
 # Phase-6 evidence is cardinality-checked against the selected manifest.  A
 # valid K16 W1/W8 pair produces one RSS comparison while retaining one
