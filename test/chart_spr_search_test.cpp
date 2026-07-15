@@ -1738,6 +1738,7 @@ static void test_lazy_local_exact_semantic_evidence_envelope() {
     options.semantic_capture =
         larch::chart_spr_semantic_capture_mode::digest;
     larch::configure_chart_spr_primary_exact_provenance(options);
+    options.exact_trim.max_frontier_entries_per_clade = 1024;
     CHECK(options.exact_trim.capture_optimal_root_provenance);
 
     auto active = larch::make_active_search_patterns(fixture.patterns);
@@ -1754,11 +1755,23 @@ static void test_lazy_local_exact_semantic_evidence_envelope() {
     auto const evidence_memory =
         larch::estimate_chart_spr_canonical_exact_evidence_memory(
             state.grammar, *state.exact_trim_active_only);
+    larch::chart_scheduler scheduler{
+        larch::chart_scheduler_options{.requested_workers = 1}};
     auto const envelope = larch::chart_spr_search_detail::
         estimate_grammar_spr_finite_iteration_memory_envelope(
-            state, 1, 1, 1, true, 1);
+            state, 1, 1, 1, true, scheduler, 1);
     CHECK(envelope.planned_required_bytes >
           larch::estimate_chart_spr_published_state_resident_bytes(state));
+    CHECK(envelope.planned_required_bytes ==
+          std::max(envelope.planned_generation_phase_required_bytes,
+                   envelope.planned_evidence_phase_required_bytes));
+    CHECK(envelope.planned_generation_phase_required_bytes > 0);
+    CHECK(envelope.planned_evidence_phase_required_bytes > 0);
+    CHECK(envelope.planned_required_bytes <
+          larch::chart_spr_exact_candidate_checked_bytes_add(
+              envelope.planned_generation_phase_required_bytes,
+              envelope.planned_evidence_phase_required_bytes,
+              "test temporal phase sum"));
     CHECK(envelope
               .planned_canonical_state_exact_evidence_resident_bytes ==
           evidence_memory.retained_bytes);
@@ -1769,8 +1782,6 @@ static void test_lazy_local_exact_semantic_evidence_envelope() {
       CHECK(evidence_memory.retained_bytes > 4096);
     }
 
-    larch::chart_scheduler scheduler{
-        larch::chart_scheduler_options{.requested_workers = 1}};
     auto finite_options = options;
     finite_options.cache.memory_budget_bytes = envelope.planned_required_bytes;
     larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
@@ -1849,6 +1860,789 @@ static void test_lazy_local_exact_semantic_evidence_envelope() {
   CHECK(workspace.local_results.capacity() == 0);
   scheduler.shutdown();
 
+  std::println("  PASS");
+}
+
+static void test_published_state_admission_component_identity() {
+  std::println("test_published_state_admission_component_identity");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AAA", four_taxon_two_pattern_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto patterns = larch::build_site_patterns(dag, grammar);
+  auto make_state = [&](larch::chart_cache_options cache, bool build_trim) {
+    auto active = larch::make_active_search_patterns(patterns);
+    return larch::build_chart_spr_search_state_from_active(
+        dag, grammar, std::move(active), {}, build_trim, {}, cache);
+  };
+  auto check_identity = [](larch::chart_spr_search_state const& state) {
+    auto expected = larch::chart_spr_exact_candidate_checked_bytes_add(
+        larch::estimate_chart_spr_state_core_resident_bytes(state),
+        larch::estimate_chart_spr_selected_cache_dynamic_resident_bytes(state),
+        "test published-state core/cache identity");
+    if (state.exact_trim_active_only) {
+      auto const dynamic =
+          larch::estimate_chart_spr_trim_dynamic_resident_bytes(
+              *state.exact_trim_active_only);
+      expected = larch::chart_spr_exact_candidate_checked_bytes_add(
+          expected, dynamic, "test published-state trim identity");
+      CHECK(larch::estimate_chart_spr_trim_resident_bytes(
+                *state.exact_trim_active_only) ==
+            sizeof(larch::multisite_trim_result) + dynamic);
+    }
+    CHECK(larch::estimate_chart_spr_published_state_resident_bytes(state) ==
+          expected);
+  };
+
+  larch::chart_cache_options all_active;
+  larch::chart_cache_options lazy;
+  lazy.use_lazy_multisite_chart = true;
+  larch::chart_cache_options pattern_batch;
+  pattern_batch.max_cached_patterns = 1;
+  constexpr std::array expected_strategies{
+      larch::chart_spr_cache_strategy::all_active_patterns,
+      larch::chart_spr_cache_strategy::lazy_multisite_chart,
+      larch::chart_spr_cache_strategy::pattern_batches,
+  };
+  std::array const caches{all_active, lazy, pattern_batch};
+  for (std::size_t index = 0; index < caches.size(); ++index) {
+    auto const& cache = caches[index];
+    auto without_trim = make_state(cache, false);
+    auto with_trim = make_state(cache, true);
+    CHECK(without_trim.cache_strategy == expected_strategies[index]);
+    CHECK(with_trim.cache_strategy == expected_strategies[index]);
+    CHECK(!without_trim.exact_trim_active_only.has_value());
+    CHECK(with_trim.exact_trim_active_only.has_value());
+    check_identity(without_trim);
+    check_identity(with_trim);
+  }
+  // The pattern-batch term above is deliberately an admitted future batch
+  // reservation, not a claim that empty pattern_charts owns those bytes now.
+
+  // Heap-owned all-active entry slots belong to the selected cache, not the
+  // cache-independent state core, and therefore enter the sum exactly once.
+  larch::chart_spr_search_state dense_slots;
+  dense_slots.cache_strategy =
+      larch::chart_spr_cache_strategy::all_active_patterns;
+  auto const dense_core_before =
+      larch::estimate_chart_spr_state_core_resident_bytes(dense_slots);
+  auto const dense_published_before =
+      larch::estimate_chart_spr_published_state_resident_bytes(dense_slots);
+  dense_slots.pattern_charts.reserve(7);
+  dense_slots.resident_pattern_cache_bytes =
+      larch::estimate_chart_spr_pattern_cache_bytes(dense_slots);
+  auto const dense_slot_bytes = dense_slots.pattern_charts.capacity() *
+                                sizeof(larch::pattern_chart_cache_entry);
+  CHECK(larch::estimate_chart_spr_state_core_resident_bytes(dense_slots) ==
+        dense_core_before);
+  CHECK(larch::estimate_chart_spr_published_state_resident_bytes(dense_slots) -
+            dense_published_before ==
+        dense_slot_bytes);
+
+  // Fixed optional payload is already inline in sizeof(state). Engaging an
+  // empty lazy chart or trim changes no bytes; only their heap capacities do.
+  larch::chart_spr_search_state optionals;
+  auto const empty_state_bytes =
+      larch::estimate_chart_spr_published_state_resident_bytes(optionals);
+  optionals.cache_strategy =
+      larch::chart_spr_cache_strategy::lazy_multisite_chart;
+  optionals.lazy_chart.emplace();
+  optionals.resident_pattern_cache_bytes =
+      larch::estimate_chart_spr_pattern_cache_bytes(optionals);
+  CHECK(larch::estimate_chart_spr_published_state_resident_bytes(optionals) ==
+        empty_state_bytes);
+  optionals.lazy_chart->inside_rows_by_clade.reserve(5);
+  optionals.resident_pattern_cache_bytes =
+      larch::estimate_chart_spr_pattern_cache_bytes(optionals);
+  auto const lazy_dynamic =
+      optionals.lazy_chart->inside_rows_by_clade.capacity() *
+      sizeof(decltype(optionals.lazy_chart->inside_rows_by_clade)::value_type);
+  CHECK(larch::estimate_chart_spr_published_state_resident_bytes(optionals) -
+            empty_state_bytes ==
+        lazy_dynamic);
+  auto const before_empty_trim =
+      larch::estimate_chart_spr_published_state_resident_bytes(optionals);
+  optionals.exact_trim_active_only.emplace();
+  CHECK(larch::estimate_chart_spr_published_state_resident_bytes(optionals) ==
+        before_empty_trim);
+  optionals.exact_trim_active_only->frontier_sizes_by_clade.reserve(9);
+  auto const trim_dynamic =
+      larch::estimate_chart_spr_trim_dynamic_resident_bytes(
+          *optionals.exact_trim_active_only);
+  CHECK(trim_dynamic ==
+        optionals.exact_trim_active_only->frontier_sizes_by_clade.capacity() *
+            sizeof(std::size_t));
+  CHECK(larch::estimate_chart_spr_published_state_resident_bytes(optionals) -
+            before_empty_trim ==
+        trim_dynamic);
+
+  // Local-commit ownership is already folded into the resident-cache
+  // aggregate. Simulate its publication on a real lazy scoring state and
+  // prove the persistent contribution appears once, not once per field.
+  auto local_commit = make_state(lazy, false);
+  CHECK(local_commit.lazy_chart.has_value());
+  auto const cache_before =
+      larch::estimate_chart_spr_selected_cache_dynamic_resident_bytes(
+          local_commit);
+  auto const published_before =
+      larch::estimate_chart_spr_published_state_resident_bytes(local_commit);
+  constexpr auto persistent_bytes = std::size_t{16384};
+  local_commit.local_commit_persistent_cache_bytes = persistent_bytes;
+  local_commit.resident_pattern_cache_bytes =
+      larch::chart_spr_exact_candidate_checked_bytes_add(
+          local_commit.resident_pattern_cache_bytes, persistent_bytes,
+          "test local-commit published cache");
+  CHECK(larch::estimate_chart_spr_selected_cache_dynamic_resident_bytes(
+            local_commit) == cache_before + persistent_bytes);
+  CHECK(larch::estimate_chart_spr_selected_cache_dynamic_resident_bytes(
+            local_commit) == local_commit.resident_pattern_cache_bytes -
+                                 sizeof(larch::lazy_multisite_chart));
+  CHECK(larch::estimate_chart_spr_published_state_resident_bytes(local_commit) -
+            published_before ==
+        persistent_bytes);
+  check_identity(local_commit);
+
+  // Opaque callback targets are one persistent state component. An installed
+  // target without a declaration fails closed; declaration adds its aggregate
+  // exactly once, and a same-cardinality replacement invalidates the stale
+  // mutation-token snapshot until it is explicitly re-declared.
+  larch::chart_spr_search_state callbacks;
+  auto const callback_core_before =
+      larch::estimate_chart_spr_state_core_resident_bytes(callbacks);
+  auto callback_owner = std::make_shared<std::size_t>(7);
+  callbacks.exact_setup_provider =
+      [callback_owner](larch::chart_spr_search_state const&,
+                       larch::checked_chart_execution_plan_ref const&) {
+        (void)callback_owner;
+        return larch::multisite_exact_setup{};
+      };
+  bool missing_contract_rejected = false;
+  try {
+    (void)larch::estimate_chart_spr_state_core_resident_bytes(callbacks);
+  } catch (std::runtime_error const& error) {
+    missing_contract_rejected =
+        std::string_view{error.what()}.contains("callback targets");
+  }
+  CHECK(missing_contract_rejected);
+  constexpr auto callback_bytes = std::size_t{12345};
+  larch::declare_chart_spr_state_callback_target_resident_bytes(callbacks,
+                                                                callback_bytes);
+  CHECK(larch::estimate_chart_spr_state_core_resident_bytes(callbacks) ==
+        callback_core_before + callback_bytes);
+  CHECK(larch::estimate_chart_spr_published_state_resident_bytes(callbacks) ==
+        callback_core_before + callback_bytes);
+
+  callbacks.exact_setup_provider =
+      [](larch::chart_spr_search_state const&,
+         larch::checked_chart_execution_plan_ref const&) {
+        return larch::multisite_exact_setup{};
+      };
+  bool stale_replacement_rejected = false;
+  try {
+    (void)larch::estimate_chart_spr_state_core_resident_bytes(callbacks);
+  } catch (std::runtime_error const& error) {
+    stale_replacement_rejected =
+        std::string_view{error.what()}.contains("callback targets");
+  }
+  CHECK(stale_replacement_rejected);
+  constexpr auto replacement_bytes = std::size_t{321};
+  larch::declare_chart_spr_state_callback_target_resident_bytes(
+      callbacks, replacement_bytes);
+  auto const callback_boundary = callback_core_before + replacement_bytes;
+  CHECK(larch::estimate_chart_spr_published_state_resident_bytes(callbacks) ==
+        callback_boundary);
+  larch::multisite_trim_result empty_trim;
+  larch::require_chart_spr_retained_exact_state_memory_budget(
+      callbacks, empty_trim, callback_boundary);
+  bool callback_one_under_rejected = false;
+  try {
+    larch::require_chart_spr_retained_exact_state_memory_budget(
+        callbacks, empty_trim, callback_boundary - 1);
+  } catch (larch::chart_spr_exact_state_budget_error const& error) {
+    callback_one_under_rejected = true;
+    CHECK(error.required_bytes() == callback_boundary);
+  }
+  CHECK(callback_one_under_rejected);
+
+  std::println("  PASS");
+}
+
+static void test_lazy_exact_semantic_dynamic_evidence_boundary() {
+  std::println("test_lazy_exact_semantic_dynamic_evidence_boundary");
+
+  auto fixture = make_fixture();
+  for (std::size_t taxon = 0;
+       taxon < fixture.grammar.taxa.id_to_sample_id.size(); ++taxon) {
+    fixture.grammar.taxa.id_to_sample_id[taxon] =
+        std::string(10000, static_cast<char>('a' + taxon % 26)) + "-" +
+        std::to_string(taxon);
+  }
+  fixture.grammar.taxa.sample_id_to_id.clear();
+  fixture.grammar.taxa.sample_id_to_id.reserve(
+      fixture.grammar.taxa.id_to_sample_id.size());
+  for (std::size_t taxon = 0;
+       taxon < fixture.grammar.taxa.id_to_sample_id.size(); ++taxon) {
+    fixture.grammar.taxa.sample_id_to_id.emplace(
+        fixture.grammar.taxa.id_to_sample_id[taxon],
+        static_cast<larch::taxon_id>(taxon));
+  }
+
+  larch::chart_spr_search_options base_options;
+  base_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::exact_multisite;
+  base_options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  base_options.top_k_exact_verify = 1;
+  base_options.cache.use_lazy_multisite_chart = true;
+  base_options.cache.candidate_batch_size = 1;
+  base_options.enumeration.max_candidates = 1;
+  base_options.enumeration.max_candidates_is_post_dedup = true;
+  base_options.semantic_capture =
+      larch::chart_spr_semantic_capture_mode::digest;
+  base_options.verification_mode =
+      larch::chart_spr_verification_mode::transient;
+  larch::configure_chart_spr_primary_exact_provenance(base_options);
+  CHECK(base_options.exact_trim.max_frontier_entries_per_clade == 0);
+
+  auto make_scheduler = [] {
+    return std::make_unique<larch::chart_scheduler>(
+        larch::chart_scheduler_options{
+            .requested_workers = 4,
+            .default_minimum_grain = 1,
+            .default_target_ranges_per_worker = 1,
+        });
+  };
+  auto make_state = [&](std::size_t budget) {
+    auto options = base_options;
+    options.cache.memory_budget_bytes = budget;
+    auto active = larch::make_active_search_patterns(fixture.patterns);
+    auto state = larch::build_chart_spr_search_state_from_active(
+        fixture.dag, fixture.grammar, std::move(active), options.chart,
+        /*build_exact_trim=*/true, options.exact_trim, options.cache);
+    state.contextual_exact_multisite_verifier =
+        [](larch::chart_spr_search_state const& verifier_state,
+           larch::chart_spr_candidate_score candidate,
+           larch::checked_chart_execution_plan_ref const& checked,
+           larch::chart_spr_exact_verification_context& context,
+           larch::multisite_trim_options const& trim_options) {
+          return larch::verify_candidate_exact_against_state_impl(
+              verifier_state, std::move(candidate), checked, context,
+              trim_options);
+        };
+    state.exact_multisite_transient_memory_estimator =
+        [](larch::grammar_spr_candidate const&) { return std::size_t{0}; };
+    state.exact_multisite_transient_retained_memory_estimator =
+        [](larch::grammar_spr_candidate const&) {
+          // Make the post-ranking evidence phase unambiguously dominant while
+          // retaining the ordinary exact-evidence verifier result.
+          return std::size_t{128} << 20;
+        };
+    state.exact_multisite_verifier_parallel_safe = true;
+    larch::declare_chart_spr_state_callback_target_resident_bytes(state, 0);
+    return state;
+  };
+
+  constexpr auto calibration_budget = std::size_t{1} << 40;
+  auto calibration_state = make_state(calibration_budget);
+  auto calibration_scheduler = make_scheduler();
+  auto calibration_options = base_options;
+  calibration_options.cache.memory_budget_bytes = calibration_budget;
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      calibration_workspace;
+  auto calibration = larch::run_chart_spr_acceptance_iteration(
+      calibration_state, calibration_options, 0, calibration_workspace,
+      *calibration_scheduler);
+  CHECK(calibration.candidates_generated == 1);
+  CHECK(calibration.locally_ranked_candidates_retained == 1);
+  CHECK(calibration.candidates_exact_verified == 1);
+  auto const exact_boundary =
+      calibration_state.counters.lazy_local_iteration_envelope_bytes_max;
+  auto const generation_phase =
+      calibration_state.counters
+          .lazy_local_iteration_generation_phase_bytes_max;
+  auto const evidence_phase =
+      calibration_state.counters.lazy_local_iteration_evidence_phase_bytes_max;
+  CHECK(calibration_state.counters
+            .lazy_local_ranked_candidate_exact_evidence_bytes_max > 0);
+  CHECK(evidence_phase > generation_phase);
+  CHECK(exact_boundary == std::max(generation_phase, evidence_phase));
+  CHECK(exact_boundary < larch::chart_spr_exact_candidate_checked_bytes_add(
+                             generation_phase, evidence_phase,
+                             "test dynamic temporal phase sum"));
+  calibration_scheduler->shutdown();
+
+  auto fit_state = make_state(exact_boundary);
+  auto fit_scheduler = make_scheduler();
+  auto fit_options = base_options;
+  fit_options.cache.memory_budget_bytes = exact_boundary;
+  auto fit_calls = std::make_shared<std::atomic<std::size_t>>(0);
+  fit_options.before_exact_candidate_verification_for_tests =
+      [fit_calls](std::size_t) {
+        fit_calls->fetch_add(1, std::memory_order_relaxed);
+      };
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      fit_workspace;
+  auto fit = larch::run_chart_spr_acceptance_iteration(
+      fit_state, fit_options, 1, fit_workspace, *fit_scheduler);
+  CHECK(fit.candidates_exact_verified == 1);
+  CHECK(fit_calls->load(std::memory_order_relaxed) == 1);
+  CHECK(fit_state.counters.lazy_local_iteration_envelope_bytes_max ==
+        exact_boundary);
+  CHECK(
+      fit_state.counters.lazy_local_ranked_candidate_exact_evidence_bytes_max >
+      0);
+  fit_scheduler->shutdown();
+
+  auto reject_state = make_state(exact_boundary - 1);
+  auto reject_scheduler = make_scheduler();
+  auto reject_options = base_options;
+  reject_options.cache.memory_budget_bytes = exact_boundary - 1;
+  auto reject_calls = std::make_shared<std::atomic<std::size_t>>(0);
+  reject_options.before_exact_candidate_verification_for_tests =
+      [reject_calls](std::size_t) {
+        reject_calls->fetch_add(1, std::memory_order_relaxed);
+      };
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      reject_workspace;
+  auto const exact_verifications_before =
+      reject_state.counters.exact_verifications;
+  auto const exact_setup_axis_before =
+      reject_state.counters.scheduler_axes.exact_setup_patterns;
+  auto const exact_frontier_axis_before =
+      reject_state.counters.scheduler_axes.exact_frontier_clades;
+  bool rejected = false;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(
+        reject_state, reject_options, 2, reject_workspace, *reject_scheduler);
+  } catch (
+      larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+          error) {
+    rejected = true;
+    CHECK(error.required_bytes() == exact_boundary);
+    CHECK(error.available_bytes() == exact_boundary - 1);
+  }
+  CHECK(rejected);
+  CHECK(reject_state.counters.candidates_generated_after_dedup > 0);
+  CHECK(reject_state.counters
+            .lazy_local_ranked_candidate_exact_evidence_bytes_max > 0);
+  CHECK(reject_calls->load(std::memory_order_relaxed) == 0);
+  CHECK(reject_state.counters.exact_verifications ==
+        exact_verifications_before);
+  CHECK(reject_state.counters.scheduler_axes.exact_setup_patterns ==
+        exact_setup_axis_before);
+  CHECK(reject_state.counters.scheduler_axes.exact_frontier_clades ==
+        exact_frontier_axis_before);
+  CHECK(reject_state.counters
+            .lazy_local_canonical_exact_evidence_resident_bytes_max == 0);
+  reject_scheduler->shutdown();
+
+  std::println("  PASS");
+}
+
+static void test_lazy_exact_w4_combined_envelope_boundary() {
+  std::println("test_lazy_exact_w4_combined_envelope_boundary");
+
+  auto fixture = make_fixture();
+  CHECK(fixture.candidates.size() >= 4);
+  larch::chart_spr_search_options base_options;
+  base_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::exact_multisite;
+  base_options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  base_options.top_k_exact_verify = 1;
+  base_options.cache.use_lazy_multisite_chart = true;
+  base_options.cache.candidate_batch_size = 4;
+  base_options.enumeration.max_candidates = 4;
+  base_options.enumeration.max_candidates_is_post_dedup = true;
+
+  auto make_scheduler = [] {
+    return std::make_unique<larch::chart_scheduler>(
+        larch::chart_scheduler_options{
+            .requested_workers = 4,
+            .default_minimum_grain = 1,
+            .default_target_ranges_per_worker = 1,
+        });
+  };
+  auto make_state = [&](std::size_t budget, larch::chart_scheduler& scheduler) {
+    auto options = base_options;
+    options.cache.memory_budget_bytes = budget;
+    auto active = larch::make_active_search_patterns(
+        fixture.dag, fixture.grammar, options.chart);
+    auto state = larch::build_chart_spr_search_state_from_active(
+        fixture.dag, fixture.grammar, std::move(active), options.chart,
+        /*build_exact_trim=*/true, options.exact_trim, options.cache, {},
+        &scheduler);
+    CHECK(state.cache_strategy ==
+          larch::chart_spr_cache_strategy::lazy_multisite_chart);
+    CHECK(state.exact_trim_active_only.has_value());
+    CHECK(state.counters.lazy_chart_preflight_peak_bytes <= budget);
+    CHECK(state.counters.lazy_chart_actual_peak_bytes <= budget);
+    CHECK(larch::estimate_chart_spr_published_state_resident_bytes(state) <=
+          budget);
+    return state;
+  };
+  auto envelope_for = [&](larch::chart_spr_search_state const& state,
+                          larch::chart_scheduler const& scheduler) {
+    return larch::chart_spr_search_detail::
+        estimate_grammar_spr_finite_iteration_memory_envelope(
+            state, base_options.enumeration.max_candidates,
+            base_options.cache.candidate_batch_size,
+            base_options.top_k_exact_verify, false, scheduler, 4);
+  };
+
+  constexpr auto calibration_budget = std::size_t{1} << 40;
+  auto calibration_scheduler = make_scheduler();
+  auto calibration = make_state(calibration_budget, *calibration_scheduler);
+  auto const calibration_envelope =
+      envelope_for(calibration, *calibration_scheduler);
+  auto const exact_budget = calibration_envelope.planned_required_bytes;
+  CHECK(exact_budget > 1);
+  CHECK(
+      calibration_envelope.planned_scheduler_resident_bytes ==
+      larch::chart_spr_search_detail::
+          estimate_chart_spr_scheduler_resident_bytes(*calibration_scheduler));
+  auto const local_range_options = larch::chart_indexed_range_options{
+      .minimum_grain = 1, .target_ranges_per_worker = 1};
+  auto const local_range_plan =
+      calibration_scheduler->plan_indexed_ranges(4, local_range_options);
+  CHECK(calibration_envelope.planned_scheduler_operation_peak_bytes ==
+        larch::estimate_chart_scheduler_operation_peak_bytes(local_range_plan));
+  CHECK(calibration_envelope.planned_scheduler_operation_peak_bytes > 0);
+
+  auto fit_scheduler = make_scheduler();
+  auto fit_state = make_state(exact_budget, *fit_scheduler);
+  auto const fit_envelope = envelope_for(fit_state, *fit_scheduler);
+  CHECK(fit_envelope.planned_required_bytes == exact_budget);
+  auto fit_options = base_options;
+  fit_options.cache.memory_budget_bytes = exact_budget;
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      fit_workspace;
+  auto const prepared_before = fit_state.counters.lazy_local_prepared_tasks;
+  auto const fit_metrics_before = fit_scheduler->metrics();
+  auto const fit_local_axis_before =
+      fit_state.counters.scheduler_axes.local_score_candidates;
+  auto const fit_exact_verifications_before =
+      fit_state.counters.exact_verifications;
+  auto fit = larch::run_chart_spr_acceptance_iteration(
+      fit_state, fit_options, 0, fit_workspace, *fit_scheduler);
+  CHECK(fit.candidates_generated == 4);
+  CHECK(fit.candidates_scored == 4);
+  CHECK(fit.candidates_exact_verified == 1);
+  CHECK(fit_state.counters.lazy_local_prepared_tasks > prepared_before);
+  CHECK(fit_state.counters.scheduler_axes.local_score_candidates.operations >
+        fit_local_axis_before.operations);
+  CHECK(fit_state.counters.exact_verifications >
+        fit_exact_verifications_before);
+  CHECK(fit_scheduler->metrics().operations > fit_metrics_before.operations);
+  CHECK(fit_scheduler->metrics().tasks_submitted >
+        fit_metrics_before.tasks_submitted);
+  CHECK(fit_state.counters.lazy_local_pre_submit_budget_failures == 0);
+  CHECK(fit_state.counters.lazy_local_peak_projected_resident_bytes <=
+        exact_budget);
+  CHECK(fit_state.counters.lazy_local_preparation_peak_bytes <= exact_budget);
+  CHECK(fit_state.counters.exact_candidate_peak_projected_resident_bytes <=
+        exact_budget);
+  CHECK(fit_workspace.local_score.operation_boundary_clean());
+  fit_scheduler->shutdown();
+
+  // The state itself fits at E-1. The combined state+iteration gate then
+  // rejects with the exact E before candidate generation, local preparation,
+  // workspace reserve, any additional pool construction, or submission.
+  auto reject_scheduler = make_scheduler();
+  auto reject_state = make_state(exact_budget - 1, *reject_scheduler);
+  CHECK(reject_state.counters.lazy_chart_preflight_peak_bytes <=
+        exact_budget - 1);
+  CHECK(reject_state.counters.lazy_chart_actual_peak_bytes <= exact_budget - 1);
+  auto const reject_envelope = envelope_for(reject_state, *reject_scheduler);
+  CHECK(reject_envelope.planned_required_bytes == exact_budget);
+  auto reject_options = base_options;
+  reject_options.cache.memory_budget_bytes = exact_budget - 1;
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      reject_workspace;
+  auto const reject_prepared_before =
+      reject_state.counters.lazy_local_prepared_tasks;
+  auto const reject_batches_before =
+      reject_state.counters.candidate_batches_scored;
+  auto const reject_generated_before =
+      reject_state.counters.candidates_generated_after_dedup;
+  auto const reject_scheduler_axes_before =
+      larch::chart_spr_scheduler_axis_operation_count(
+          reject_state.counters.scheduler_axes);
+  auto const reject_metrics_before = reject_scheduler->metrics();
+  bool rejected = false;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(
+        reject_state, reject_options, 1, reject_workspace, *reject_scheduler);
+  } catch (
+      larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+          e) {
+    rejected = true;
+    CHECK(e.candidate_index() == 0);
+    CHECK(e.required_bytes() == exact_budget);
+    CHECK(e.available_bytes() == exact_budget - 1);
+  }
+  CHECK(rejected);
+  CHECK(reject_state.counters.lazy_local_prepared_tasks ==
+        reject_prepared_before);
+  CHECK(reject_state.counters.candidate_batches_scored ==
+        reject_batches_before);
+  CHECK(reject_state.counters.candidates_generated_after_dedup ==
+        reject_generated_before);
+  CHECK(larch::chart_spr_scheduler_axis_operation_count(
+            reject_state.counters.scheduler_axes) ==
+        reject_scheduler_axes_before);
+  auto const reject_metrics_after = reject_scheduler->metrics();
+  CHECK(reject_metrics_after.operations == reject_metrics_before.operations);
+  CHECK(reject_metrics_after.tasks_submitted ==
+        reject_metrics_before.tasks_submitted);
+  CHECK(reject_metrics_after.pool_lifetimes ==
+        reject_metrics_before.pool_lifetimes);
+  CHECK(reject_metrics_after.pending_tasks == 0);
+  CHECK(reject_workspace.candidate_slots.capacity() == 0);
+  CHECK(reject_workspace.candidate_copy_scratch.capacity() == 0);
+  CHECK(reject_workspace.local_results.capacity() == 0);
+  CHECK(reject_workspace.local_score.operation_boundary_clean());
+  reject_scheduler->shutdown();
+  calibration_scheduler->shutdown();
+
+  std::println("  PASS");
+}
+
+static void test_scheduled_exact_state_w4_boundary() {
+  std::println("test_scheduled_exact_state_w4_boundary");
+
+  auto fixture = larch::test::make_tiny_labelled_tree(
+      "AAA", four_taxon_two_pattern_tree());
+  auto grammar = larch::build_clade_grammar(fixture);
+  auto patterns = larch::build_site_patterns(fixture, grammar);
+  auto make_state = [&] {
+    auto active = larch::make_active_search_patterns(patterns);
+    return larch::build_chart_spr_search_state_from_active(
+        fixture, grammar, std::move(active), {},
+        /*build_exact_trim=*/false);
+  };
+  auto make_scheduler = [] {
+    return std::make_unique<larch::chart_scheduler>(
+        larch::chart_scheduler_options{
+            .requested_workers = 4,
+            .default_minimum_grain = 1,
+            .default_target_ranges_per_worker = 4,
+        });
+  };
+
+  auto calibration_state = make_state();
+  CHECK(calibration_state.cache_strategy ==
+        larch::chart_spr_cache_strategy::all_active_patterns);
+  CHECK(!calibration_state.exact_trim_active_only.has_value());
+  auto calibration_scheduler = make_scheduler();
+  auto const resident_base = larch::chart_spr_exact_candidate_checked_bytes_add(
+      larch::estimate_chart_spr_published_state_resident_bytes(
+          calibration_state),
+      larch::chart_spr_search_detail::
+          estimate_chart_spr_scheduler_resident_bytes(*calibration_scheduler),
+      "scheduled exact-state test resident base");
+  larch::chart_spr_candidate_score identity_candidate;
+  auto const estimator_scratch = larch::chart_spr_search_detail::
+      estimate_exact_loop_estimator_peak_scratch_bytes(
+          calibration_state, std::span<larch::chart_spr_candidate_score const>{
+                                 &identity_candidate, 1});
+  auto const exact_estimate = larch::estimate_chart_spr_state_exact_memory(
+      calibration_state, {}, 4, std::size_t{1} << 40);
+  CHECK(exact_estimate.safely_bounded);
+  auto construction_scratch =
+      larch::chart_spr_exact_candidate_checked_bytes_add(
+          exact_estimate.inner_parallel_scratch_bytes,
+          larch::chart_spr_search_detail::
+              estimate_chart_spr_state_exact_scheduler_operation_peak_bytes(
+                  calibration_state, *calibration_scheduler),
+          "scheduled exact-state test operation scratch");
+  construction_scratch = larch::chart_spr_exact_candidate_checked_bytes_add(
+      construction_scratch,
+      larch::chart_spr_search_detail::
+          estimate_chart_spr_state_exact_scheduler_summary_bytes(
+              calibration_state, {}),
+      "scheduled exact-state test summary scratch");
+  auto const exact_boundary =
+      larch::chart_spr_exact_candidate_checked_bytes_add(
+          resident_base, std::max(estimator_scratch, construction_scratch),
+          "scheduled exact-state test boundary");
+  CHECK(exact_boundary > 1);
+
+  // The construction envelope must also dominate the actual retained trim
+  // backstop, or S-1 could start scheduler work and fail only after building.
+  auto const calibration_checked = larch::check_chart_execution_plan(
+      calibration_state.grammar, calibration_state.execution_plan);
+  auto const& calibration_trim = larch::ensure_chart_spr_state_exact_trim(
+      calibration_state, calibration_checked, *calibration_scheduler, {});
+  auto retained_required = larch::chart_spr_exact_candidate_checked_bytes_add(
+      larch::estimate_chart_spr_state_core_resident_bytes(calibration_state),
+      larch::estimate_chart_spr_selected_cache_dynamic_resident_bytes(
+          calibration_state),
+      "scheduled exact-state test retained core/cache");
+  retained_required = larch::chart_spr_exact_candidate_checked_bytes_add(
+      retained_required,
+      larch::estimate_chart_spr_trim_dynamic_resident_bytes(calibration_trim),
+      "scheduled exact-state test retained trim");
+  retained_required = larch::chart_spr_exact_candidate_checked_bytes_add(
+      retained_required,
+      larch::chart_spr_search_detail::
+          estimate_chart_spr_scheduler_resident_bytes(*calibration_scheduler),
+      "scheduled exact-state test retained scheduler");
+  CHECK(retained_required <= exact_boundary);
+
+  auto fit_state = make_state();
+  fit_state.cache_opts.memory_budget_bytes = exact_boundary;
+  auto fit_scheduler = make_scheduler();
+  auto fit_checked = larch::check_chart_execution_plan(
+      fit_state.grammar, fit_state.execution_plan);
+  auto const fit_metrics_before = fit_scheduler->metrics();
+  auto const fit_axes_before = fit_state.counters.scheduler_axes;
+  (void)larch::ensure_chart_spr_state_exact_trim(fit_state, fit_checked,
+                                                 *fit_scheduler, {});
+  CHECK(fit_state.exact_trim_active_only.has_value());
+  CHECK(fit_scheduler->metrics().operations > fit_metrics_before.operations);
+  CHECK(fit_state.counters.scheduler_axes.exact_setup_patterns.operations >
+        fit_axes_before.exact_setup_patterns.operations);
+  CHECK(fit_state.counters.scheduler_axes.exact_frontier_clades.operations >
+        fit_axes_before.exact_frontier_clades.operations);
+
+  auto reject_state = make_state();
+  reject_state.cache_opts.memory_budget_bytes = exact_boundary - 1;
+  auto reject_scheduler = make_scheduler();
+  auto reject_checked = larch::check_chart_execution_plan(
+      reject_state.grammar, reject_state.execution_plan);
+  auto const reject_metrics_before = reject_scheduler->metrics();
+  auto const reject_axes_before = reject_state.counters.scheduler_axes;
+  bool rejected = false;
+  try {
+    (void)larch::ensure_chart_spr_state_exact_trim(reject_state, reject_checked,
+                                                   *reject_scheduler, {});
+  } catch (larch::chart_spr_exact_state_budget_error const& error) {
+    rejected = true;
+    CHECK(error.required_bytes() == exact_boundary);
+    CHECK(error.budget_bytes() == exact_boundary - 1);
+  }
+  CHECK(rejected);
+  CHECK(!reject_state.exact_trim_active_only.has_value());
+  CHECK(reject_scheduler->metrics().operations ==
+        reject_metrics_before.operations);
+  CHECK(reject_scheduler->metrics().tasks_submitted ==
+        reject_metrics_before.tasks_submitted);
+  CHECK(reject_state.counters.scheduler_axes == reject_axes_before);
+
+  larch::multisite_trim_options two_pass_options;
+  two_pass_options.dominance_mode =
+      larch::multisite_dominance_mode::two_pass_exact_mask;
+  auto const& level_offsets =
+      calibration_state.execution_plan.bottom_up_level_offsets();
+  auto const level_count = level_offsets.empty() ? 0 : level_offsets.size() - 1;
+  auto const one_pass_summaries = larch::chart_spr_search_detail::
+      estimate_chart_spr_state_exact_scheduler_summary_bytes(calibration_state,
+                                                             {});
+  auto const two_pass_summaries = larch::chart_spr_search_detail::
+      estimate_chart_spr_state_exact_scheduler_summary_bytes(calibration_state,
+                                                             two_pass_options);
+  CHECK(two_pass_summaries ==
+        (2 + 2 * level_count) * sizeof(larch::chart_scheduler_run_summary));
+  CHECK(two_pass_summaries - one_pass_summaries ==
+        level_count * sizeof(larch::chart_scheduler_run_summary));
+
+  auto const two_pass_estimate = larch::estimate_chart_spr_state_exact_memory(
+      make_state(), two_pass_options, 4, std::size_t{1} << 40);
+  CHECK(two_pass_estimate.safely_bounded);
+  auto const expected_diagnostic_delta =
+      calibration_state.grammar.clades.size() *
+      sizeof(larch::multisite_frontier_level_diagnostic);
+  CHECK(two_pass_estimate.serial_scratch_bytes -
+            exact_estimate.serial_scratch_bytes ==
+        expected_diagnostic_delta);
+  CHECK(two_pass_estimate.inner_parallel_scratch_bytes -
+            exact_estimate.inner_parallel_scratch_bytes ==
+        expected_diagnostic_delta);
+  auto two_pass_construction =
+      larch::chart_spr_exact_candidate_checked_bytes_add(
+          two_pass_estimate.inner_parallel_scratch_bytes,
+          larch::chart_spr_search_detail::
+              estimate_chart_spr_state_exact_scheduler_operation_peak_bytes(
+                  calibration_state, *calibration_scheduler),
+          "scheduled two-pass exact-state operation scratch");
+  two_pass_construction = larch::chart_spr_exact_candidate_checked_bytes_add(
+      two_pass_construction, two_pass_summaries,
+      "scheduled two-pass exact-state summary scratch");
+  auto const two_pass_boundary =
+      larch::chart_spr_exact_candidate_checked_bytes_add(
+          resident_base, std::max(estimator_scratch, two_pass_construction),
+          "scheduled two-pass exact-state boundary");
+  auto two_pass_fit_state = make_state();
+  two_pass_fit_state.cache_opts.memory_budget_bytes = two_pass_boundary;
+  auto two_pass_fit_scheduler = make_scheduler();
+  auto two_pass_fit_checked = larch::check_chart_execution_plan(
+      two_pass_fit_state.grammar, two_pass_fit_state.execution_plan);
+  (void)larch::ensure_chart_spr_state_exact_trim(
+      two_pass_fit_state, two_pass_fit_checked, *two_pass_fit_scheduler,
+      two_pass_options);
+  CHECK(two_pass_fit_state.exact_trim_active_only.has_value());
+  CHECK(two_pass_fit_state.counters.scheduler_axes.exact_frontier_clades
+            .operations >= 2 * level_count);
+
+  auto two_pass_reject_state = make_state();
+  two_pass_reject_state.cache_opts.memory_budget_bytes = two_pass_boundary - 1;
+  auto two_pass_reject_scheduler = make_scheduler();
+  auto two_pass_reject_checked = larch::check_chart_execution_plan(
+      two_pass_reject_state.grammar, two_pass_reject_state.execution_plan);
+  auto const two_pass_reject_metrics_before =
+      two_pass_reject_scheduler->metrics();
+  auto const two_pass_reject_axes_before =
+      two_pass_reject_state.counters.scheduler_axes;
+  bool two_pass_rejected = false;
+  try {
+    (void)larch::ensure_chart_spr_state_exact_trim(
+        two_pass_reject_state, two_pass_reject_checked,
+        *two_pass_reject_scheduler, two_pass_options);
+  } catch (larch::chart_spr_exact_state_budget_error const& error) {
+    two_pass_rejected = true;
+    CHECK(error.required_bytes() == two_pass_boundary);
+  }
+  CHECK(two_pass_rejected);
+  CHECK(!two_pass_reject_state.exact_trim_active_only.has_value());
+  CHECK(two_pass_reject_scheduler->metrics().operations ==
+        two_pass_reject_metrics_before.operations);
+  CHECK(two_pass_reject_state.counters.scheduler_axes ==
+        two_pass_reject_axes_before);
+
+  auto candidate_fixture = make_fixture();
+  auto candidate_state = larch::build_chart_spr_search_state(
+      candidate_fixture.dag, candidate_fixture.grammar,
+      candidate_fixture.patterns);
+  auto candidate_score = larch::score_candidate_locally(
+      candidate_state, candidate_fixture.candidates.front());
+  larch::chart_spr_search_options one_pass_candidate_options;
+  one_pass_candidate_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::exact_multisite;
+  auto two_pass_candidate_options = one_pass_candidate_options;
+  two_pass_candidate_options.exact_trim = two_pass_options;
+  auto const one_pass_candidate_scheduler_scratch =
+      larch::chart_spr_search_detail::
+          estimate_chart_spr_exact_candidate_inner_scheduler_scratch_bytes(
+              candidate_state, candidate_score, one_pass_candidate_options,
+              *calibration_scheduler);
+  auto const two_pass_candidate_scheduler_scratch =
+      larch::chart_spr_search_detail::
+          estimate_chart_spr_exact_candidate_inner_scheduler_scratch_bytes(
+              candidate_state, candidate_score, two_pass_candidate_options,
+              *calibration_scheduler);
+  auto const candidate_clade_count =
+      candidate_state.grammar.clades.size() +
+      candidate_score.candidate.added_clades.size();
+  CHECK(two_pass_candidate_scheduler_scratch -
+            one_pass_candidate_scheduler_scratch ==
+        candidate_clade_count * sizeof(larch::chart_scheduler_run_summary));
+
+  calibration_scheduler->shutdown();
+  fit_scheduler->shutdown();
+  reject_scheduler->shutdown();
+  two_pass_fit_scheduler->shutdown();
+  two_pass_reject_scheduler->shutdown();
   std::println("  PASS");
 }
 
@@ -2054,18 +2848,54 @@ static void test_pattern_batch_cache_options_match_all_cache() {
   CHECK(single_threw);
 
   larch::chart_spr_search_options memory_options;
-  // This case exercises the bounded local-score cache only.  The finite budget
-  // is exactly one conservative pattern entry: small enough to force replay,
-  // but large enough to satisfy the hard resident-cache contract.
+  // This case exercises one bounded local-score entry. The finite unified
+  // budget includes the cache-independent published state plus that entry:
+  // small enough to force replay, but large enough to satisfy the complete
+  // state contract.
   memory_options.acceptance_mode =
       larch::chart_spr_acceptance_mode::lower_bound_heuristic;
-  memory_options.cache.memory_budget_bytes =
+  auto const state_core_bytes =
+      larch::estimate_chart_spr_state_core_resident_bytes(all_state);
+  auto const one_entry_bytes =
       larch::estimate_chart_spr_pattern_entry_cache_bytes(grammar);
+  auto const minimum_pattern_batch_budget =
+      larch::chart_spr_exact_candidate_checked_bytes_add(
+          state_core_bytes, one_entry_bytes,
+          "test pattern-batch unified state budget");
+  memory_options.cache.memory_budget_bytes = minimum_pattern_batch_budget;
   memory_options.cache.candidate_batch_size = 2;
   auto memory_state = larch::build_chart_spr_search_state(
       dag, grammar, memory_options);
   CHECK(memory_state.cache_strategy ==
         larch::chart_spr_cache_strategy::pattern_batches);
+  CHECK(larch::estimate_chart_spr_published_state_resident_bytes(
+            memory_state) <= memory_options.cache.memory_budget_bytes);
+  auto one_under_options = memory_options;
+  one_under_options.cache.memory_budget_bytes =
+      minimum_pattern_batch_budget - 1;
+  bool one_under_rejected = false;
+  try {
+    (void)larch::build_chart_spr_search_state(dag, grammar, one_under_options);
+  } catch (std::runtime_error const& e) {
+    one_under_rejected = true;
+    CHECK(std::string_view{e.what()}.find(
+              "state core plus one scoring pattern") != std::string_view::npos);
+  }
+  CHECK(one_under_rejected);
+  CHECK(state_core_bytes > 1);
+  auto core_one_under_options = memory_options;
+  core_one_under_options.cache.memory_budget_bytes = state_core_bytes - 1;
+  bool core_one_under_rejected = false;
+  try {
+    (void)larch::build_chart_spr_search_state(dag, grammar,
+                                              core_one_under_options);
+  } catch (std::runtime_error const& e) {
+    core_one_under_rejected = true;
+    CHECK(std::string_view{e.what()}.find(
+              "cache-independent state core requires") !=
+          std::string_view::npos);
+  }
+  CHECK(core_one_under_rejected);
   auto memory_scores = larch::score_candidates_locally(
       memory_state, subset, {}, 1);
   CHECK(memory_scores.size() == all_scores.size());
@@ -3269,7 +4099,7 @@ static void test_lazy_local_production_multibatch_retained_budget() {
   auto const long_sample_envelope = larch::chart_spr_search_detail::
       estimate_grammar_spr_finite_iteration_memory_envelope(
           long_sample_state, base_options.enumeration.max_candidates, 1, 1,
-          true, 1);
+          true, scheduler, 1);
   auto long_sample_signature = larch::chart_spr_candidate_sample_signature(
       long_sample_state.grammar, fixture.candidates.front());
   CHECK(long_sample_envelope.planned_canonical_record_dynamic_bytes > 4096);
@@ -3338,15 +4168,16 @@ static void test_lazy_local_named_fixture_finite_production_gates() {
 
     auto const task_slots =
         std::max<std::size_t>(1, std::min(worker_count, candidate_batch_size));
+    larch::chart_scheduler scheduler{
+        larch::chart_scheduler_options{.requested_workers = worker_count}};
     auto const envelope = larch::chart_spr_search_detail::
         estimate_grammar_spr_finite_iteration_memory_envelope(
-            state, candidate_count, candidate_batch_size, 1, true, task_slots);
+            state, candidate_count, candidate_batch_size, 1, true, scheduler,
+            task_slots);
     CHECK(envelope.planned_required_bytes > 0);
     CHECK(envelope.planned_required_bytes < budget);
     options.cache.memory_budget_bytes = envelope.planned_required_bytes;
 
-    larch::chart_scheduler scheduler{
-        larch::chart_scheduler_options{.requested_workers = worker_count}};
     larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
         workspace;
     auto result = larch::run_chart_spr_acceptance_iteration(
@@ -5829,6 +6660,7 @@ static void test_phase2b_deferred_pattern_batch_uses_owning_setup_provider() {
     ++provider_calls;
     throw std::runtime_error("provider called before setup installation");
   };
+  larch::declare_chart_spr_state_callback_target_resident_bytes(state, 4096);
   std::string deferred_rejection;
   try {
     (void)larch::ensure_chart_spr_state_exact_trim(state);
@@ -5877,6 +6709,8 @@ static void test_phase2b_deferred_pattern_batch_uses_owning_setup_provider() {
                             provided_state.execution_plan);
         return owning_setup;
       };
+  larch::declare_chart_spr_state_callback_target_resident_bytes(
+      state, std::size_t{1} << 20);
   larch::record_inside_chart_cache_build_work(state.counters, pattern_count, 0);
   auto const composite_with_invariants =
       cold.composite_lower_bound + state.invariant_constant_offset;
@@ -6466,6 +7300,48 @@ static void test_phase6_exact_candidate_admission_singleton_policy() {
   CHECK(serial.admitted_bytes == 25);
   CHECK(!serial.use_inner_parallelism);
 
+  // Scheduler storage is phase-specific: a candidate-parallel wave pays its
+  // actual outer target=1 operation, while a memory-forced singleton pays the
+  // inner operation/summary contract and never outer+inner together.
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  auto const outer_options = larch::chart_indexed_range_options{
+      .minimum_grain = 1, .target_ranges_per_worker = 1};
+  auto const outer_two = larch::estimate_chart_scheduler_operation_peak_bytes(
+      scheduler.plan_indexed_ranges(2, outer_options));
+  CHECK(outer_two > 0);
+  std::array<estimate, 2> phase_estimates{
+      estimate{.serial_scratch_bytes = 20,
+               .inner_parallel_scratch_bytes = 40,
+               .inner_scheduler_scratch_bytes = 30,
+               .retained_result_bytes = 5},
+      estimate{.serial_scratch_bytes = 20,
+               .inner_parallel_scratch_bytes = 40,
+               .inner_scheduler_scratch_bytes = 30,
+               .retained_result_bytes = 5},
+  };
+  auto const parallel_budget = 50 + outer_two;
+  auto outer = larch::plan_chart_spr_exact_candidate_admission_wave(
+      phase_estimates, 0, 4, parallel_budget, true, &scheduler, outer_options);
+  CHECK(outer.end_rank == 2);
+  CHECK(outer.admitted_bytes == parallel_budget);
+  CHECK(!outer.use_inner_parallelism);
+
+  auto singleton = larch::plan_chart_spr_exact_candidate_admission_wave(
+      phase_estimates, 0, 4, 75, true, &scheduler, outer_options);
+  CHECK(singleton.end_rank == 1);
+  CHECK(singleton.admitted_bytes == 75);
+  CHECK(singleton.use_inner_parallelism);
+  auto singleton_serial = larch::plan_chart_spr_exact_candidate_admission_wave(
+      phase_estimates, 0, 4, 74, true, &scheduler, outer_options);
+  CHECK(singleton_serial.end_rank == 1);
+  CHECK(singleton_serial.admitted_bytes == 25);
+  CHECK(!singleton_serial.use_inner_parallelism);
+  scheduler.shutdown();
+
   std::println("  PASS");
 }
 
@@ -6851,10 +7727,11 @@ static void test_phase6_fixed_tightened_budget_rejects_before_generation() {
   auto fixture = make_fixture();
   auto state = larch::build_chart_spr_search_state(
       fixture.dag, fixture.grammar, options);
-  CHECK(state.resident_pattern_cache_bytes > 1);
+  auto const published_state_bytes =
+      larch::estimate_chart_spr_published_state_resident_bytes(state);
+  CHECK(published_state_bytes > 1);
   auto finite_options = options;
-  finite_options.cache.memory_budget_bytes =
-      state.resident_pattern_cache_bytes - 1;
+  finite_options.cache.memory_budget_bytes = published_state_bytes - 1;
 
   larch::chart_scheduler scheduler{larch::chart_scheduler_options{
       .requested_workers = 4,
@@ -6872,9 +7749,8 @@ static void test_phase6_fixed_tightened_budget_rejects_before_generation() {
         state, finite_options, 0, workspace, scheduler);
   } catch (larch::chart_spr_exact_state_budget_error const& error) {
     rejected = true;
-    CHECK(error.required_bytes() == state.resident_pattern_cache_bytes);
-    CHECK(error.budget_bytes() ==
-          state.resident_pattern_cache_bytes - 1);
+    CHECK(error.required_bytes() == published_state_bytes);
+    CHECK(error.budget_bytes() == published_state_bytes - 1);
   }
   CHECK(rejected);
   CHECK(state.counters.candidates_generated_after_dedup == generated_before);
@@ -6924,6 +7800,8 @@ static void test_phase6_custom_exact_contracts_fail_closed_and_serialize() {
             verifier_state, std::move(candidate), checked, context,
             trim_options);
       };
+  larch::declare_chart_spr_state_callback_target_resident_bytes(missing_state,
+                                                                4096);
   missing_state.exact_multisite_verifier_parallel_safe = true;
   larch::chart_scheduler missing_scheduler{larch::chart_scheduler_options{
       .requested_workers = 4,
@@ -6977,6 +7855,8 @@ static void test_phase6_custom_exact_contracts_fail_closed_and_serialize() {
       [](larch::grammar_spr_candidate const&) { return 0; };
   serialized_state.exact_multisite_transient_retained_memory_estimator =
       [](larch::grammar_spr_candidate const&) { return 0; };
+  larch::declare_chart_spr_state_callback_target_resident_bytes(
+      serialized_state, 4096);
   // Leave parallel_safe false: legacy/custom callbacks retain serial
   // candidate invocation while each singleton may use the inner scheduler.
   larch::chart_scheduler serialized_scheduler{
@@ -7016,6 +7896,8 @@ static void test_phase6_custom_exact_contracts_fail_closed_and_serialize() {
     provider_calls->fetch_add(1, std::memory_order_relaxed);
     throw std::runtime_error("custom exact setup must not run in estimator");
   };
+  larch::declare_chart_spr_state_callback_target_resident_bytes(provider_state,
+                                                                4096);
   auto unbounded_setup = larch::estimate_chart_spr_state_exact_memory(
       provider_state, {}, 4, std::size_t{1} << 40);
   CHECK(!unbounded_setup.safely_bounded);
@@ -7038,6 +7920,8 @@ static void test_phase6_custom_exact_contracts_fail_closed_and_serialize() {
   provider_scheduler.shutdown();
   provider_state.exact_setup_provider_additional_memory_estimator =
       [](larch::multisite_trim_options const&, std::size_t) { return 0; };
+  larch::declare_chart_spr_state_callback_target_resident_bytes(provider_state,
+                                                                4096);
   auto bounded_setup = larch::estimate_chart_spr_state_exact_memory(
       provider_state, {}, 4, std::size_t{1} << 40);
   CHECK(bounded_setup.safely_bounded);
@@ -7057,6 +7941,8 @@ static void test_phase6_custom_exact_contracts_fail_closed_and_serialize() {
       };
   retained_state.exact_multisite_transient_memory_estimator =
       [](larch::grammar_spr_candidate const&) { return 0; };
+  larch::declare_chart_spr_state_callback_target_resident_bytes(retained_state,
+                                                                0);
   auto retained_candidate = larch::score_candidate_locally(
       retained_state, retained_fixture.candidates.front());
   auto missing_retained = larch::estimate_chart_spr_exact_candidate_memory(
@@ -7064,6 +7950,8 @@ static void test_phase6_custom_exact_contracts_fail_closed_and_serialize() {
   CHECK(!missing_retained.safely_bounded);
   retained_state.exact_multisite_transient_retained_memory_estimator =
       [](larch::grammar_spr_candidate const&) { return 4096; };
+  larch::declare_chart_spr_state_callback_target_resident_bytes(retained_state,
+                                                                0);
   auto bounded_retained = larch::estimate_chart_spr_exact_candidate_memory(
       retained_state, retained_candidate, options, 4);
   CHECK(bounded_retained.safely_bounded);
@@ -7081,6 +7969,8 @@ static void test_phase6_custom_exact_contracts_fail_closed_and_serialize() {
       };
   fixed_contract_state.fixed_topology_exact_additional_memory_estimator =
       [](larch::grammar_spr_candidate const&) { return 0; };
+  larch::declare_chart_spr_state_callback_target_resident_bytes(
+      fixed_contract_state, 0);
   auto fixed_options = options;
   fixed_options.acceptance_mode =
       larch::chart_spr_acceptance_mode::fixed_topology_exact;
@@ -7093,6 +7983,8 @@ static void test_phase6_custom_exact_contracts_fail_closed_and_serialize() {
   fixed_contract_state
       .fixed_topology_exact_additional_retained_memory_estimator =
       [](larch::grammar_spr_candidate const&) { return 0; };
+  larch::declare_chart_spr_state_callback_target_resident_bytes(
+      fixed_contract_state, 0);
   auto fixed_bounded = larch::estimate_chart_spr_exact_candidate_memory(
       fixed_contract_state, fixed_candidate, fixed_options, 4);
   CHECK(fixed_bounded.safely_bounded);
@@ -10844,7 +11736,21 @@ static void test_phase4_pattern_batches_local_commit() {
   // reporting only the one-pattern scoring batch.
   auto budget_fixture = make_three_misplaced_groups_fixture();
   auto budget_options = options;
-  budget_options.cache.memory_budget_bytes = 1;
+  auto budget_calibration_state = larch::build_chart_spr_search_state(
+      budget_fixture.dag, budget_fixture.grammar, budget_options);
+  auto const mandatory_local_commit_bytes =
+      larch::chart_spr_exact_candidate_checked_bytes_add(
+          larch::estimate_chart_spr_state_core_resident_bytes(
+              budget_calibration_state),
+          larch::chart_spr_exact_candidate_checked_bytes_add(
+              2 * larch::estimate_chart_spr_full_pattern_cache_bytes(
+                      budget_calibration_state),
+              larch::estimate_chart_spr_pattern_entry_cache_bytes(
+                  budget_calibration_state.grammar),
+              "pattern-batch local-commit mandatory cache test"),
+          "pattern-batch local-commit mandatory state test");
+  CHECK(mandatory_local_commit_bytes > 1);
+  budget_options.cache.memory_budget_bytes = mandatory_local_commit_bytes - 1;
   bool budget_rejected = false;
   try {
     (void)larch::run_chart_spr_search(std::move(budget_fixture.dag),
@@ -11230,6 +12136,10 @@ int main() {
   test_semantic_capture_reuses_primary_exact_provenance();
   test_primary_provenance_capture_failure_is_hard_error();
   test_lazy_local_exact_semantic_evidence_envelope();
+  test_published_state_admission_component_identity();
+  test_lazy_exact_semantic_dynamic_evidence_boundary();
+  test_lazy_exact_w4_combined_envelope_boundary();
+  test_scheduled_exact_state_w4_boundary();
   test_pattern_batch_cache_options_match_all_cache();
   test_lazy_local_admission_planner();
   test_lazy_local_packed_context_grouping_reuses_scratch();

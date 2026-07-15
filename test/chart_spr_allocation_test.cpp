@@ -1155,6 +1155,79 @@ static void test_warmed_dense_local_scoring_is_allocation_free() {
   std::println("  PASS");
 }
 
+static void test_published_state_estimators_are_allocation_free() {
+  std::println("test_published_state_estimators_are_allocation_free");
+
+  larch::chart_spr_search_state all_active;
+  all_active.cache_strategy =
+      larch::chart_spr_cache_strategy::all_active_patterns;
+  all_active.pattern_charts.reserve(3);
+  all_active.resident_pattern_cache_bytes =
+      larch::estimate_chart_spr_pattern_cache_bytes(all_active);
+
+  larch::chart_spr_search_state lazy;
+  lazy.cache_strategy = larch::chart_spr_cache_strategy::lazy_multisite_chart;
+  lazy.lazy_chart.emplace();
+  lazy.lazy_chart->inside_rows_by_clade.reserve(5);
+  lazy.exact_trim_active_only.emplace();
+  lazy.exact_trim_active_only->frontier_sizes_by_clade.reserve(7);
+  lazy.resident_pattern_cache_bytes =
+      larch::estimate_chart_spr_pattern_cache_bytes(lazy);
+
+  larch::chart_spr_search_state pattern_batch;
+  pattern_batch.cache_strategy =
+      larch::chart_spr_cache_strategy::pattern_batches;
+  pattern_batch.resident_pattern_cache_bytes = 4096;
+
+  std::size_t checksum = 0;
+  allocation_test::allocation_observer observer;
+  {
+    allocation_test::scoped_allocation_observation observation{observer};
+    for (auto const* state : {&all_active, &lazy, &pattern_batch}) {
+      checksum += larch::estimate_chart_spr_state_core_resident_bytes(*state);
+      checksum +=
+          larch::estimate_chart_spr_selected_cache_dynamic_resident_bytes(
+              *state);
+      checksum +=
+          larch::estimate_chart_spr_published_state_resident_bytes(*state);
+    }
+    checksum += larch::estimate_chart_spr_trim_dynamic_resident_bytes(
+        *lazy.exact_trim_active_only);
+    checksum += larch::estimate_chart_spr_trim_resident_bytes(
+        *lazy.exact_trim_active_only);
+  }
+  CHECK(checksum > 0);
+  CHECK(observer.statistics == allocation_test::allocation_statistics{});
+  check_statistics(observer, 0, 0, 0, 0, 0);
+
+  // Production callbacks capture at most one raw pointer and pass the frozen
+  // SBO guard. Exercise the same target shape under the allocation observer,
+  // then publish its zero-byte persistent-target contract.
+  larch::chart_spr_search_state callback_state;
+  std::size_t callback_sentinel = 0;
+  allocation_test::allocation_observer callback_observer;
+  {
+    allocation_test::scoped_allocation_observation observation{
+        callback_observer};
+    auto* sentinel_ptr = &callback_sentinel;
+    callback_state.exact_setup_provider =
+        [sentinel_ptr](larch::chart_spr_search_state const&,
+                       larch::checked_chart_execution_plan_ref const&) {
+          (void)sentinel_ptr;
+          return larch::multisite_exact_setup{};
+        };
+    larch::declare_chart_spr_state_callback_target_resident_bytes(
+        callback_state, 0);
+    checksum +=
+        larch::estimate_chart_spr_state_core_resident_bytes(callback_state);
+  }
+  CHECK(callback_observer.statistics ==
+        allocation_test::allocation_statistics{});
+  check_statistics(callback_observer, 0, 0, 0, 0, 0);
+
+  std::println("  PASS");
+}
+
 static void test_prepared_lazy_local_core_is_allocation_free() {
   std::println("test_prepared_lazy_local_core_is_allocation_free");
   auto dag = larch::load_proto_dag(k_dense_fixture_path);
@@ -1451,6 +1524,7 @@ int main() {
   test_scoped_unscoped_nested_and_output_exclusion();
   test_forced_failure_and_new_handler_semantics();
   test_thread_local_isolation();
+  test_published_state_estimators_are_allocation_free();
   test_prepared_lazy_local_core_is_allocation_free();
   test_warmed_dense_local_scoring_is_allocation_free();
 

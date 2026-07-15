@@ -28,6 +28,31 @@ class chart_spr_cache_budget_error : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+// The authoritative state-core estimator counts std::function wrapper objects
+// inline in sizeof(chart_spr_search_state), but intentionally has no opaque
+// allowance for callable-target allocations. Production state callbacks are
+// stateless or capture one raw pointer. Frozen libstdc++ stores trivially
+// copyable callables of at most its two-pointer local buffer without
+// allocation; keep that implementation contract compile-time guarded at every
+// production installation site.
+template <class Function, class Callable>
+void chart_spr_install_state_callback(chart_spr_search_state& state,
+                                      Function& destination,
+                                      Callable callback) {
+  static_assert(sizeof(std::function<void()>) == 4 * sizeof(void*));
+  static_assert(std::is_trivially_copyable_v<Callable>);
+  static_assert(sizeof(Callable) <= 2 * sizeof(void*));
+  static_assert(alignof(Callable) <= alignof(void*));
+  destination = std::move(callback);
+  // Frozen-libstdc++ stores the guarded target in the wrapper's local buffer,
+  // so this installation contributes no opaque persistent allocation.
+  state.callback_target_resident_contract_function_count =
+      chart_spr_state_callback_function_count(state);
+  state.callback_target_resident_contract_revisions =
+      chart_spr_state_callback_revisions(state);
+  state.callback_target_resident_safely_bounded = true;
+}
+
 double chart_spr_elapsed_ms(std::chrono::steady_clock::time_point start,
                             std::chrono::steady_clock::time_point stop) {
   return std::chrono::duration<double, std::milli>(stop - start).count();
@@ -4906,6 +4931,13 @@ void score_candidates_locally_lazy_waves_into(
       resident_base,
       local_score_workspace_access::fixed_resident_capacity_bytes(workspace),
       "chart SPR lazy-local workspace resident capacity");
+  auto const range_options = chart_indexed_range_options{
+      .minimum_grain = 1, .target_ranges_per_worker = 1};
+  auto planned_scheduler_operation_peak = [&](std::size_t item_count) {
+    if (scheduler == nullptr) return std::size_t{0};
+    return estimate_chart_scheduler_operation_peak_bytes(
+        scheduler->plan_indexed_ranges(item_count, range_options));
+  };
 
   auto fail_budget = [&](std::size_t candidate, std::size_t required,
                          std::size_t available) -> void {
@@ -4941,10 +4973,7 @@ void score_candidates_locally_lazy_waves_into(
     while (admitted < task_limit && begin + admitted < candidates.size()) {
       auto const candidate_index = begin + admitted;
       auto const prospective_scheduler_peak =
-          scheduler != nullptr && admitted + 1 > 1
-              ? estimate_exact_loop_scheduler_operation_peak_bytes(admitted + 1,
-                                                                   true)
-              : 0;
+          planned_scheduler_operation_peak(admitted + 1);
       lazy_local_candidate_preflight preflight{
           .stable_dynamic_capacity_bytes =
               (std::numeric_limits<std::size_t>::max)(),
@@ -5166,9 +5195,7 @@ void score_candidates_locally_lazy_waves_into(
         aggregate.lazy_local_runtime_transient_reservation_bytes_max,
         wave_runtime_transient_reservation);
     auto const scheduler_operation_peak =
-        scheduler != nullptr && admitted > 1
-            ? estimate_exact_loop_scheduler_operation_peak_bytes(admitted, true)
-            : 0;
+        planned_scheduler_operation_peak(admitted);
     auto const retained_wave_dynamic = local_capacity_checked_add(
         slots_dynamic_capacity(task_limit), wave_runtime_transient_reservation,
         "chart SPR lazy-local retained wave and worker transients");
@@ -5209,9 +5236,6 @@ void score_candidates_locally_lazy_waves_into(
           throw std::logic_error(
               "chart SPR lazy-local wave: parallel wave without scheduler");
         }
-        auto const range_options =
-            chart_indexed_range_options{.minimum_grain = 1,
-                                        .target_ranges_per_worker = 1};
         auto const range_plan =
             scheduler->plan_indexed_ranges(admitted, range_options);
         auto const scheduler_before = scheduler->metrics();
@@ -5831,9 +5855,9 @@ std::size_t chart_spr_candidate_estimator_scratch_bytes(
 
 }  // namespace
 
-std::size_t estimate_chart_spr_trim_resident_bytes(
+std::size_t estimate_chart_spr_trim_dynamic_resident_bytes(
     multisite_trim_result const& trim) {
-  auto total = sizeof(trim);
+  std::size_t total = 0;
   total = chart_spr_checked_cache_bytes_add(
       total, chart_spr_bit_capacity_bytes(trim.keep_production.capacity()),
       "chart SPR resident exact trim byte overflow");
@@ -5862,6 +5886,13 @@ std::size_t estimate_chart_spr_trim_resident_bytes(
         "chart SPR resident exact trim byte overflow");
   }
   return total;
+}
+
+std::size_t estimate_chart_spr_trim_resident_bytes(
+    multisite_trim_result const& trim) {
+  return chart_spr_checked_cache_bytes_add(
+      sizeof(trim), estimate_chart_spr_trim_dynamic_resident_bytes(trim),
+      "chart SPR resident exact trim byte overflow");
 }
 
 std::size_t estimate_chart_spr_canonical_exact_evidence_resident_bytes(
@@ -6189,6 +6220,20 @@ std::size_t chart_spr_search_detail::estimate_exact_loop_resident_input_bytes(
 }
 
 std::size_t
+chart_spr_search_detail::estimate_exact_loop_accepted_candidate_dynamic_bytes(
+    std::span<chart_spr_candidate_score const> ranked) {
+  std::size_t peak = 0;
+  for (auto const& candidate : ranked) {
+    // Exact evidence is admitted separately from each candidate estimate.
+    // This bound covers the pre-existing overlay, topology certificate, keys,
+    // and strings copied into result.accepted after ranked is released.
+    peak = std::max(peak, chart_spr_candidate_score_dynamic_bytes(
+                              candidate, /*include_shared_evidence=*/false));
+  }
+  return peak;
+}
+
+std::size_t
 chart_spr_search_detail::estimate_grammar_spr_enumeration_fixed_live_bytes(
     clade_grammar const& grammar, chart_execution_plan const& plan) {
   auto add = [](std::size_t lhs, std::size_t rhs) {
@@ -6362,7 +6407,8 @@ chart_spr_search_detail::grammar_spr_finite_iteration_memory_envelope
 chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
     chart_spr_search_state const& state, std::size_t candidate_limit,
     std::size_t candidate_batch_size, std::size_t ranked_limit,
-    bool capture_semantics, std::size_t local_task_slots) {
+    bool capture_semantics, chart_scheduler const& scheduler,
+    std::size_t local_task_slots) {
   auto add = [](std::size_t lhs, std::size_t rhs) {
     return chart_spr_checked_cache_bytes_add(
         lhs, rhs, "chart SPR finite grammar iteration envelope overflow");
@@ -6530,6 +6576,7 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   future = add(future, no_accept_reason_capacity);
   chart_spr_canonical_exact_evidence_memory_estimate
       canonical_state_exact_evidence;
+  std::size_t ranked_candidate_exact_evidence_bytes = 0;
   if (capture_semantics) {
     future = add(future, multiply(candidate_limit, canonical_record_dynamic));
     if (state.exact_trim_active_only) {
@@ -6537,11 +6584,8 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
           estimate_chart_spr_canonical_exact_evidence_memory(
               grammar, *state.exact_trim_active_only);
       // Evidence publication is deferred until enumeration/local/exact
-      // scratch has been released. The complete construction peak therefore
-      // replaces the former topology-only grammar-capacity multiplier.
-      future = add(
-          future,
-          canonical_state_exact_evidence.construction_peak_bytes);
+      // scratch has been released. Its construction peak belongs to the
+      // post-release phase below, not this generation-phase future reserve.
     }
   }
 
@@ -6582,9 +6626,14 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
                              sizeof(prepared_local_candidate_score)),
               doubled_vector(local_task_slots,
                              sizeof(local_score_worker_workspace))));
+  auto const local_range_options = chart_indexed_range_options{
+      .minimum_grain = 1, .target_ranges_per_worker = 1};
+  auto const local_range_plan =
+      scheduler.plan_indexed_ranges(local_task_slots, local_range_options);
   auto const scheduler_operation =
-      estimate_exact_loop_scheduler_operation_peak_bytes(local_task_slots,
-                                                         local_task_slots > 1);
+      estimate_chart_scheduler_operation_peak_bytes(local_range_plan);
+  auto const scheduler_resident =
+      estimate_chart_spr_scheduler_resident_bytes(scheduler);
   auto const stable_wave =
       add(multiply(local_task_slots, local_task.stable_dynamic_capacity_bytes),
           scheduler_operation);
@@ -6596,15 +6645,60 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   }
   auto const local_task_peak = std::max(stable_wave, preparation_wave);
   future = add(future, local_task_peak);
-  auto planned =
+  auto generation_phase =
       add(estimate_chart_spr_published_state_resident_bytes(state),
           acceptance_outer);
-  planned = add(planned, exact_input_outer);
-  planned = add(planned, local_workspace);
-  planned = add(planned, future);
+  generation_phase = add(generation_phase, scheduler_resident);
+  generation_phase = add(generation_phase, exact_input_outer);
+  generation_phase = add(generation_phase, local_workspace);
+  generation_phase = add(generation_phase, future);
+
+  // After enumeration and exact aggregation, ranked/task/workspace storage is
+  // explicitly released. Keep only the result capacities that survive into
+  // canonical old-state evidence publication. Evidence construction includes
+  // its eventual retained payload and therefore composes with, rather than
+  // adds to, the earlier generation high-water phase.
+  auto post_release_result = sizeof(chart_spr_acceptance_iteration_workspace) +
+                             sizeof(std::vector<chart_spr_candidate_score>) +
+                             sizeof(chart_spr_iteration_result);
+  post_release_result =
+      add(post_release_result,
+          doubled_vector(candidate_limit, sizeof(std::size_t)));
+  post_release_result =
+      add(post_release_result, doubled_vector(ranked_limit, sizeof(double)));
+  post_release_result = add(post_release_result, candidate_record_dynamic);
+  post_release_result = add(post_release_result, no_accept_reason_capacity);
+  if (capture_semantics) {
+    post_release_result =
+        add(post_release_result,
+            doubled_vector(candidate_limit,
+                           sizeof(chart_spr_canonical_candidate_record)));
+    post_release_result =
+        add(post_release_result,
+            multiply(candidate_limit, canonical_record_dynamic));
+    // Ranked-stream indices and exact-verified stream indices are distinct
+    // owning result vectors retained through evidence publication.
+    post_release_result =
+        add(post_release_result,
+            doubled_vector(ranked_limit, 2 * sizeof(std::size_t)));
+    post_release_result =
+        add(post_release_result, ranked_candidate_exact_evidence_bytes);
+  }
+  auto evidence_phase =
+      add(estimate_chart_spr_published_state_resident_bytes(state),
+          scheduler_resident);
+  evidence_phase = add(evidence_phase, post_release_result);
+  evidence_phase = add(evidence_phase,
+                       canonical_state_exact_evidence.construction_peak_bytes);
+  auto const planned = std::max(generation_phase, evidence_phase);
   return grammar_spr_finite_iteration_memory_envelope{
       .planned_required_bytes = planned,
+      .planned_generation_phase_required_bytes = generation_phase,
+      .planned_evidence_phase_required_bytes = evidence_phase,
       .future_dynamic_bytes = future,
+      .planned_post_release_result_bytes = post_release_result,
+      .planned_ranked_candidate_exact_evidence_bytes =
+          ranked_candidate_exact_evidence_bytes,
       .planned_local_workspace_resident_bytes = local_workspace,
       .planned_signature_node_bytes = signature_node,
       .planned_candidate_live_bytes = candidate_live,
@@ -6615,6 +6709,7 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
       .planned_canonical_state_exact_evidence_construction_peak_bytes =
           canonical_state_exact_evidence.construction_peak_bytes,
       .planned_scheduler_operation_peak_bytes = scheduler_operation,
+      .planned_scheduler_resident_bytes = scheduler_resident,
       .planned_local_task_stable_bytes =
           local_task.stable_dynamic_capacity_bytes,
       .planned_local_task_preparation_peak_bytes =
@@ -6642,41 +6737,6 @@ chart_spr_search_detail::estimate_exact_loop_estimator_peak_scratch_bytes(
                   state, candidate, base_child_occurrence_count));
   }
   return peak;
-}
-
-std::size_t
-chart_spr_search_detail::estimate_exact_loop_scheduler_operation_peak_bytes(
-    std::size_t resolved_workers, bool operation_possible) {
-  if (!operation_possible) return 0;
-
-  auto const worker_count = std::max<std::size_t>(1, resolved_workers);
-  auto const range_count = chart_spr_checked_cache_bytes_multiply(
-      worker_count, 4,
-      "chart SPR exact scheduler range-count overflow");
-  std::size_t total = sizeof(std::vector<std::exception_ptr>) +
-                      sizeof(std::vector<std::future<void>>);
-  chart_spr_exact_resident_add(
-      total, chart_spr_checked_cache_bytes_multiply(
-                 range_count, sizeof(std::exception_ptr),
-                 "chart SPR exact scheduler exception-slot overflow"));
-  chart_spr_exact_resident_add(
-      total, chart_spr_checked_cache_bytes_multiply(
-                 worker_count, sizeof(std::future<void>),
-                 "chart SPR exact scheduler future-slot overflow"));
-
-  // Each submitted runner has one packaged-task shared state and one queued
-  // move-only function. The fixed per-runner allowance covers the frozen
-  // libstdc++ promise/control allocation, deque node/block, allocator headers,
-  // callable capture, and alignment while the futures and queue overlap.
-  auto const runner_bytes =
-      sizeof(std::packaged_task<void()>) +
-      sizeof(std::move_only_function<void()>) +
-      sizeof(chart_indexed_range) + 32 * sizeof(void*) + 1024;
-  chart_spr_exact_resident_add(
-      total, chart_spr_checked_cache_bytes_multiply(
-                 worker_count, runner_bytes,
-                 "chart SPR exact scheduler runner-storage overflow"));
-  return total;
 }
 
 chart_spr_topology_selection_memory_estimate
@@ -6896,12 +6956,22 @@ estimate_chart_spr_exact_candidate_memory(
       auto frontier = chart_spr_saturating_multiply(
           topology.total_frontier_entries, entry_bytes.value);
       frontier.saturated = frontier.saturated || entry_bytes.saturated;
+      // One frontier build owns up to C level diagnostics while the trim
+      // result pre-reserves one retained diagnostic per level/pass.  The plan
+      // overload reserves the complete result surface before pass one, so the
+      // explicit peak factor is 2C for one pass and 3C for two passes.
+      auto const diagnostic_peak_factor =
+          options.exact_trim.dominance_mode ==
+                  multisite_dominance_mode::two_pass_exact_mask
+              ? std::size_t{3}
+              : std::size_t{2};
       frontier = chart_spr_saturating_add(
           frontier,
           chart_spr_saturating_multiply(
               topology.clade_count,
               sizeof(std::vector<frontier_entry>) + sizeof(std::size_t) +
-                  sizeof(multisite_frontier_level_diagnostic) +
+                  diagnostic_peak_factor *
+                      sizeof(multisite_frontier_level_diagnostic) +
                   sizeof(std::exception_ptr)));
       auto combined_cost_scratch =
           chart_spr_saturating_multiply(cost_bytes, topology.clade_count);
@@ -7102,6 +7172,73 @@ estimate_chart_spr_exact_candidate_memory(
   return estimate;
 }
 
+std::size_t chart_spr_search_detail::
+    estimate_chart_spr_exact_candidate_inner_scheduler_scratch_bytes(
+        chart_spr_search_state const& state,
+        chart_spr_candidate_score const& candidate,
+        chart_spr_search_options const& options,
+        chart_scheduler const& scheduler) {
+  if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+    // Current lazy fixed and multisite verifiers are serial special cases.
+    return 0;
+  }
+  auto const pattern_count = state.active_patterns.patterns.patterns.size();
+  if (options.acceptance_mode ==
+      chart_spr_acceptance_mode::fixed_topology_exact) {
+    if (state.fixed_topology_exact_verifier &&
+        !state.contextual_fixed_topology_exact_verifier) {
+      // The legacy callback signature has no scheduler/context parameter.
+      return 0;
+    }
+    auto const range_options = chart_spr_phase4_pattern_range_options(
+        pattern_count, scheduler.worker_resolution().resolved_workers);
+    return estimate_chart_scheduler_operation_peak_bytes(
+        scheduler.plan_indexed_ranges(pattern_count, range_options));
+  }
+
+  auto const candidate_clade_count = chart_spr_checked_cache_bytes_add(
+      state.grammar.clades.size(), candidate.candidate.added_clades.size(),
+      "chart SPR candidate exact scheduler clade count overflow");
+  auto const range_options =
+      chart_multisite_detail::multisite_exact_setup_range_options();
+  auto peak = estimate_chart_scheduler_operation_peak_bytes(
+      scheduler.plan_indexed_ranges(pattern_count, range_options));
+  auto const topology_count_bound = chart_spr_checked_cache_bytes_add(
+      pattern_count, 1,
+      "chart SPR candidate exact upper-topology count overflow");
+  auto const upper_item_bound = chart_spr_checked_cache_bytes_multiply(
+      pattern_count, topology_count_bound,
+      "chart SPR candidate exact upper-topology item overflow");
+  peak =
+      std::max(peak, estimate_chart_spr_scheduler_operation_peak_for_any_items(
+                         scheduler, upper_item_bound, range_options));
+  peak = std::max(
+      peak,
+      estimate_chart_spr_scheduler_operation_peak_for_any_items(
+          scheduler, candidate_clade_count,
+          chart_multisite_detail::multisite_frontier_clade_range_options()));
+
+  // Exact setup retains up to two summaries while the frontier appends one
+  // summary per dependency level/pass. A candidate plan has at most C levels.
+  auto const frontier_pass_count =
+      options.exact_trim.dominance_mode ==
+              multisite_dominance_mode::two_pass_exact_mask
+          ? std::size_t{2}
+          : std::size_t{1};
+  auto const frontier_summary_count = chart_spr_checked_cache_bytes_multiply(
+      candidate_clade_count, frontier_pass_count,
+      "chart SPR candidate exact frontier summary count overflow");
+  auto const summary_count = chart_spr_checked_cache_bytes_add(
+      2, frontier_summary_count,
+      "chart SPR candidate exact scheduler summary count overflow");
+  auto const summary_bytes = chart_spr_checked_cache_bytes_multiply(
+      summary_count, sizeof(chart_scheduler_run_summary),
+      "chart SPR candidate exact scheduler summary bytes overflow");
+  return chart_spr_checked_cache_bytes_add(
+      peak, summary_bytes,
+      "chart SPR candidate exact inner scheduler scratch overflow");
+}
+
 chart_spr_exact_candidate_memory_estimate estimate_chart_spr_state_exact_memory(
     chart_spr_search_state const& state,
     multisite_trim_options const& trim_options,
@@ -7271,7 +7408,8 @@ chart_spr_search_result run_chart_spr_search(
         state.local_commit_persistent_cache_bytes,
         "chart SPR local-commit total resident byte overflow");
     auto* substrate_ptr = local_commit_substrate.get();
-    state.scheduled_exact_setup_provider =
+    chart_spr_install_state_callback(
+        state, state.scheduled_exact_setup_provider,
         [substrate_ptr](chart_spr_search_state const& provider_state,
                         checked_chart_execution_plan_ref const& checked_state,
                         chart_scheduler& provider_scheduler,
@@ -7279,12 +7417,13 @@ chart_spr_search_result run_chart_spr_search(
           return chart_spr_build_exact_setup_from_persistent_inside_cache(
               *substrate_ptr, provider_state, checked_state, provider_scheduler,
               runs);
-        };
+        });
     // The generic state-exact estimate already covers the finalized setup and
     // its construction scratch. This internal provider adds no independent
     // allocation surface beyond that bound.
-    state.exact_setup_provider_additional_memory_estimator =
-        [](multisite_trim_options const&, std::size_t) { return 0; };
+    chart_spr_install_state_callback(
+        state, state.exact_setup_provider_additional_memory_estimator,
+        [](multisite_trim_options const&, std::size_t) { return 0; });
     if (state.pattern_batch_bootstrap_deferred) {
       chart_spr_search_detail::finalize_deferred_pattern_batch_bootstrap(
           state, inside_cache_composite_lower_bound_with_invariants(
@@ -7464,24 +7603,23 @@ chart_spr_search_result run_chart_spr_search(
   // derived current-tip view.
   if (local_commit_substrate != nullptr) {
     auto* substrate_ptr = local_commit_substrate.get();
-    state
-        .contextual_fixed_topology_exact_verifier = [substrate_ptr](
-                                             chart_spr_search_state const&
-                                                 verifier_state,
-                                             chart_spr_candidate_score
-                                                 candidate,
-                                             chart_spr_exact_verification_context&
-                                                 context) {
-      return chart_spr_verify_candidate_fixed_topology_exact_from_persistent_cache(
-          *substrate_ptr, verifier_state, std::move(candidate), context);
-    };
+    chart_spr_install_state_callback(
+        state, state.contextual_fixed_topology_exact_verifier,
+        [substrate_ptr](chart_spr_search_state const& verifier_state,
+                        chart_spr_candidate_score candidate,
+                        chart_spr_exact_verification_context& context) {
+          return chart_spr_verify_candidate_fixed_topology_exact_from_persistent_cache(
+              *substrate_ptr, verifier_state, std::move(candidate), context);
+        });
     state.fixed_topology_exact_verifier_parallel_safe = true;
     // The generic fixed-topology estimate explicitly includes the persistent
     // selected-cache/direct-oracle phases used by this internal callback.
-    state.fixed_topology_exact_additional_memory_estimator =
-        [](grammar_spr_candidate const&) { return 0; };
-    state.fixed_topology_exact_additional_retained_memory_estimator =
-        [](grammar_spr_candidate const&) { return 0; };
+    chart_spr_install_state_callback(
+        state, state.fixed_topology_exact_additional_memory_estimator,
+        [](grammar_spr_candidate const&) { return 0; });
+    chart_spr_install_state_callback(
+        state, state.fixed_topology_exact_additional_retained_memory_estimator,
+        [](grammar_spr_candidate const&) { return 0; });
     // Phase 9: install the transient-extension exact_multisite verifier.  It
     // verifies each candidate by transiently extending the chain in
     // reader-local scratch (never mutating the shared cache, bypassing the
@@ -7500,28 +7638,26 @@ chart_spr_search_result run_chart_spr_search(
     // `overlay_materializations_for_exact_verification`).  This is the named
     // verification-mode choice the Phase-10 report surfaces.
     if (options.verification_mode == chart_spr_verification_mode::transient) {
-      state.exact_multisite_transient_memory_estimator =
+      chart_spr_install_state_callback(
+          state, state.exact_multisite_transient_memory_estimator,
           [substrate_ptr](grammar_spr_candidate const& candidate) {
             return chart_spr_transient_verifier_extra_memory_bound(
                 *substrate_ptr, candidate);
-          };
-      state.exact_multisite_transient_retained_memory_estimator =
-          [](grammar_spr_candidate const&) { return 0; };
-      state
-          .contextual_exact_multisite_verifier = [substrate_ptr](
-                                          chart_spr_search_state const&
-                                              verifier_state,
-                                          chart_spr_candidate_score candidate,
-                                          checked_chart_execution_plan_ref const&
-                                              checked_state,
-                                          chart_spr_exact_verification_context&
-                                              context,
-                                          multisite_trim_options const&
-                                              trim_options) {
-        return chart_spr_verify_candidate_exact_multisite_from_transient_extension(
-            *substrate_ptr, verifier_state, std::move(candidate), checked_state,
-            context, trim_options);
-      };
+          });
+      chart_spr_install_state_callback(
+          state, state.exact_multisite_transient_retained_memory_estimator,
+          [](grammar_spr_candidate const&) { return 0; });
+      chart_spr_install_state_callback(
+          state, state.contextual_exact_multisite_verifier,
+          [substrate_ptr](chart_spr_search_state const& verifier_state,
+                          chart_spr_candidate_score candidate,
+                          checked_chart_execution_plan_ref const& checked_state,
+                          chart_spr_exact_verification_context& context,
+                          multisite_trim_options const& trim_options) {
+            return chart_spr_verify_candidate_exact_multisite_from_transient_extension(
+                *substrate_ptr, verifier_state, std::move(candidate),
+                checked_state, context, trim_options);
+          });
       state.exact_multisite_verifier_parallel_safe = true;
     }
   }

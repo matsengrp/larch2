@@ -5547,6 +5547,27 @@ inline multisite_trim_result build_multisite_trim_impl(
   result.keep_production_exact = keep_production_exact;
   result.keep_production.assign(plan.productions().size(), false);
 
+  // The result retains one diagnostic per dependency level/pass while each
+  // frontier build owns its current pass diagnostics.  Reserve the complete
+  // result surface before the first pass: in two-pass mode this avoids the
+  // L -> 2L vector reallocation overlap during the second append and leaves a
+  // stable, directly estimable peak of source L plus retained result 2L.
+  auto const& level_offsets = plan.bottom_up_level_offsets();
+  auto const level_count = level_offsets.empty() ? 0 : level_offsets.size() - 1;
+  auto const frontier_pass_count =
+      trim_options.dominance_mode ==
+              multisite_dominance_mode::two_pass_exact_mask
+          ? std::size_t{2}
+          : std::size_t{1};
+  if (level_count != 0) {
+    if (frontier_pass_count >
+        result.frontier_level_diagnostics.max_size() / level_count) {
+      throw std::length_error("multi-site frontier diagnostic overflow");
+    }
+    result.frontier_level_diagnostics.reserve(frontier_pass_count *
+                                              level_count);
+  }
+
   if (trim_options.dominance_mode ==
       multisite_dominance_mode::two_pass_exact_mask) {
     multisite_frontier_build_options score_build_options;
@@ -5710,6 +5731,29 @@ inline multisite_trim_result build_multisite_trim_from_exact_setup(
                                                          "multi-site trim");
   site_pattern_set validation_shell;
   validation_shell.taxon_count = setup.taxon_count;
+  if (run_summaries != nullptr) {
+    auto const& level_offsets = plan.bottom_up_level_offsets();
+    auto const level_count =
+        level_offsets.empty() ? 0 : level_offsets.size() - 1;
+    auto const frontier_pass_count =
+        trim_options.dominance_mode ==
+                multisite_dominance_mode::two_pass_exact_mask
+            ? std::size_t{2}
+            : std::size_t{1};
+    if (level_count != 0) {
+      if (frontier_pass_count > (run_summaries->frontier_clades.max_size() -
+                                 run_summaries->frontier_clades.size()) /
+                                    level_count) {
+        throw std::length_error("exact frontier scheduler summary overflow");
+      }
+      // Reserve every pass before the first frontier operation.  The
+      // per-pass builder can then publish summaries without an L -> 2L
+      // reallocation whose old and new buffers would overlap.
+      run_summaries->frontier_clades.reserve(
+          run_summaries->frontier_clades.size() +
+          frontier_pass_count * level_count);
+    }
+  }
   std::size_t frontier_passes = 0;
   auto result = chart_multisite_detail::build_multisite_trim_impl(
       plan, validation_shell, options, trim_options,

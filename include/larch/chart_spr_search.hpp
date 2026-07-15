@@ -365,6 +365,9 @@ struct chart_spr_search_counters {
   // scheduler exception transport cannot escape the finite wave envelope.
   std::size_t lazy_local_runtime_transient_reservation_bytes_max = 0;
   std::size_t lazy_local_iteration_envelope_bytes_max = 0;
+  std::size_t lazy_local_iteration_generation_phase_bytes_max = 0;
+  std::size_t lazy_local_iteration_evidence_phase_bytes_max = 0;
+  std::size_t lazy_local_ranked_candidate_exact_evidence_bytes_max = 0;
   std::size_t lazy_local_iteration_task_stable_bytes_max = 0;
   std::size_t lazy_local_iteration_task_preparation_peak_bytes_max = 0;
   std::size_t candidate_batches_scored = 0;
@@ -1114,6 +1117,10 @@ struct chart_spr_exact_candidate_memory_estimate {
   // Peak task-local storage for a singleton candidate allowed to use the
   // Phase-5 inner scheduler. This includes serial_scratch_bytes.
   std::size_t inner_parallel_scratch_bytes = 0;
+  // Scheduler-owned operation/run-summary storage for that singleton inner
+  // path. It is temporally alternative to the candidate-parallel outer
+  // scheduler operation and is populated from the actual search scheduler.
+  std::size_t inner_scheduler_scratch_bytes = 0;
   // Storage that survives task completion until stable-rank aggregation.
   std::size_t retained_result_bytes = 0;
   // False means standard-container growth could not be bounded before the
@@ -1214,7 +1221,11 @@ inline chart_spr_exact_candidate_admission_wave
 plan_chart_spr_exact_candidate_admission_wave(
     std::span<chart_spr_exact_candidate_memory_estimate const> estimates,
     std::size_t begin_rank, std::size_t worker_limit,
-    std::size_t available_bytes, bool enforce_budget) {
+    std::size_t available_bytes, bool enforce_budget,
+    chart_scheduler const* outer_scheduler = nullptr,
+    chart_indexed_range_options outer_range_options =
+        chart_indexed_range_options{.minimum_grain = 1,
+                                    .target_ranges_per_worker = 1}) {
   if (begin_rank >= estimates.size()) {
     return chart_spr_exact_candidate_admission_wave{.begin_rank = begin_rank,
                                                     .end_rank = begin_rank};
@@ -1225,6 +1236,19 @@ plan_chart_spr_exact_candidate_admission_wave(
   auto const effective_available =
       enforce_budget ? available_bytes
                      : (std::numeric_limits<std::size_t>::max)();
+  auto outer_operation_bytes = [&](std::size_t count) {
+    if (count < 2 || outer_scheduler == nullptr) return std::size_t{0};
+    return estimate_chart_scheduler_operation_peak_bytes(
+        outer_scheduler->plan_indexed_ranges(count, outer_range_options));
+  };
+  auto singleton_inner_required =
+      [&](chart_spr_exact_candidate_memory_estimate const& estimate) {
+        auto required = chart_spr_exact_candidate_saturating_bytes_add(
+            estimate.inner_parallel_scratch_bytes,
+            estimate.inner_scheduler_scratch_bytes);
+        return chart_spr_exact_candidate_saturating_bytes_add(
+            required, estimate.retained_result_bytes);
+      };
 
   if (!enforce_budget) {
     std::size_t admitted = 0;
@@ -1232,7 +1256,9 @@ plan_chart_spr_exact_candidate_admission_wave(
       auto const& estimate = estimates[begin_rank + offset];
       auto required = estimate.serial_scratch_bytes;
       if (candidate_limit == 1) {
-        required = estimate.inner_parallel_scratch_bytes;
+        required = chart_spr_exact_candidate_saturating_bytes_add(
+            estimate.inner_parallel_scratch_bytes,
+            estimate.inner_scheduler_scratch_bytes);
       }
       if (required > (std::numeric_limits<std::size_t>::max)() -
                          estimate.retained_result_bytes) {
@@ -1243,6 +1269,10 @@ plan_chart_spr_exact_candidate_admission_wave(
       admitted = required > (std::numeric_limits<std::size_t>::max)() - admitted
                      ? (std::numeric_limits<std::size_t>::max)()
                      : admitted + required;
+    }
+    if (candidate_limit >= 2) {
+      admitted = chart_spr_exact_candidate_saturating_bytes_add(
+          admitted, outer_operation_bytes(candidate_limit));
     }
     return chart_spr_exact_candidate_admission_wave{
         .begin_rank = begin_rank,
@@ -1263,7 +1293,10 @@ plan_chart_spr_exact_candidate_admission_wave(
     auto const required = chart_spr_exact_candidate_saturating_bytes_add(
         estimate.serial_scratch_bytes, estimate.retained_result_bytes);
     if (serial_overflow || required > effective_available - admitted) break;
-    admitted += required;
+    auto const candidate_sum = admitted + required;
+    auto const operation = outer_operation_bytes(count + 1);
+    if (operation > effective_available - candidate_sum) break;
+    admitted = candidate_sum;
   }
   if (count == 0) {
     auto const& estimate = estimates[begin_rank];
@@ -1279,18 +1312,16 @@ plan_chart_spr_exact_candidate_admission_wave(
   chart_spr_exact_candidate_admission_wave wave{
       .begin_rank = begin_rank,
       .end_rank = begin_rank + count,
-      .admitted_bytes = admitted,
+      .admitted_bytes = chart_spr_exact_candidate_saturating_bytes_add(
+          admitted, outer_operation_bytes(count)),
       .memory_limited =
           count < candidate_limit && begin_rank + count < estimates.size(),
   };
   if (count == 1) {
     auto const& estimate = estimates[begin_rank];
-    auto const inner_overflow = estimate.inner_parallel_scratch_bytes >
-                                (std::numeric_limits<std::size_t>::max)() -
-                                    estimate.retained_result_bytes;
-    auto const inner_required = chart_spr_exact_candidate_saturating_bytes_add(
-        estimate.inner_parallel_scratch_bytes, estimate.retained_result_bytes);
-    if (!inner_overflow && inner_required <= effective_available) {
+    auto const inner_required = singleton_inner_required(estimate);
+    if (inner_required != (std::numeric_limits<std::size_t>::max)() &&
+        inner_required <= effective_available) {
       wave.admitted_bytes = inner_required;
       wave.use_inner_parallelism = true;
     } else {
@@ -3030,6 +3061,54 @@ class chart_spr_elapsed_accumulator {
   std::chrono::steady_clock::time_point start_;
 };
 
+// State-resident callbacks need mutation tracking in addition to
+// std::function's callable interface.  A public assignment receives a unique
+// mutation token while whole-state copy/move preserves it, allowing a declared
+// aggregate target-ownership contract to detect even same-count replacement.
+template <class Function>
+class chart_spr_tracked_state_callback {
+ public:
+  chart_spr_tracked_state_callback() = default;
+  chart_spr_tracked_state_callback(chart_spr_tracked_state_callback const&) =
+      default;
+  chart_spr_tracked_state_callback(chart_spr_tracked_state_callback&&) =
+      default;
+  chart_spr_tracked_state_callback& operator=(
+      chart_spr_tracked_state_callback const&) = default;
+  chart_spr_tracked_state_callback& operator=(
+      chart_spr_tracked_state_callback&&) = default;
+
+  template <class Callable>
+    requires(!std::same_as<std::remove_cvref_t<Callable>,
+                           chart_spr_tracked_state_callback> &&
+             std::is_assignable_v<Function&, Callable>)
+  chart_spr_tracked_state_callback& operator=(Callable&& callable) {
+    function_ = std::forward<Callable>(callable);
+    revision_ = next_revision_.fetch_add(1, std::memory_order_relaxed);
+    if (revision_ == 0) {
+      // Reserve zero for never-assigned wrappers across integer wraparound.
+      revision_ = next_revision_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return *this;
+  }
+
+  explicit operator bool() const noexcept {
+    return static_cast<bool>(function_);
+  }
+
+  template <class... Args>
+  decltype(auto) operator()(Args&&... args) const {
+    return std::invoke(function_, std::forward<Args>(args)...);
+  }
+
+  [[nodiscard]] std::uint64_t revision() const noexcept { return revision_; }
+
+ private:
+  inline static std::atomic<std::uint64_t> next_revision_{1};
+  Function function_;
+  std::uint64_t revision_ = 0;
+};
+
 struct chart_spr_search_state {
   phylo_dag* dag = nullptr;
   clade_grammar grammar;
@@ -3085,14 +3164,17 @@ struct chart_spr_search_state {
   // orchestration.  It is consulted only for pattern-batch states, whose
   // bounded public representation intentionally owns no full pattern charts.
   // Lazy and all-active paths retain their selected representations.
-  chart_spr_exact_setup_provider exact_setup_provider;
-  chart_spr_scheduled_exact_setup_provider scheduled_exact_setup_provider;
+  chart_spr_tracked_state_callback<chart_spr_exact_setup_provider>
+      exact_setup_provider;
+  chart_spr_tracked_state_callback<chart_spr_scheduled_exact_setup_provider>
+      scheduled_exact_setup_provider;
   // A custom setup provider may retain the ordinary finalized setup covered
   // by the generic estimator. Any provider-specific scratch must be returned
   // here. Finite-budget exact initialization fails closed when a provider is
   // installed without this matching contract. Like every admission metadata
   // callback, the estimator itself must not allocate material scratch.
-  std::function<std::size_t(multisite_trim_options const&, std::size_t)>
+  chart_spr_tracked_state_callback<
+      std::function<std::size_t(multisite_trim_options const&, std::size_t)>>
       exact_setup_provider_additional_memory_estimator;
 
   // Optional Phase-8 fixed-topology verifier supplied by the local-commit
@@ -3100,25 +3182,28 @@ struct chart_spr_search_state {
   // persistent inside/outside caches owned by the substrate.  Conservative
   // rebuild mode leaves this empty and uses the legacy direct selected-topology
   // fallback below.
-  chart_spr_fixed_topology_verifier fixed_topology_exact_verifier;
+  chart_spr_tracked_state_callback<chart_spr_fixed_topology_verifier>
+      fixed_topology_exact_verifier;
   // Context-aware callbacks can opt in to candidate-parallel invocation.
   // Legacy callbacks above remain singleton regardless of this flag because
   // their historical signature has no task-private counter sink.
-  chart_spr_contextual_fixed_topology_verifier
+  chart_spr_tracked_state_callback<chart_spr_contextual_fixed_topology_verifier>
       contextual_fixed_topology_exact_verifier;
   bool fixed_topology_exact_verifier_parallel_safe = false;
   // Provider-specific scratch beyond the generic fixed-topology verifier
   // estimate. A finite unified budget fails closed if a custom verifier is
   // installed without this matching estimator; the estimator itself must be
   // allocation-free apart from trivial stack/SSO state.
-  std::function<std::size_t(grammar_spr_candidate const&)>
+  chart_spr_tracked_state_callback<
+      std::function<std::size_t(grammar_spr_candidate const&)>>
       fixed_topology_exact_additional_memory_estimator;
   // Provider-created owning output (for example an enlarged invalid-reason or
   // evidence payload) survives task completion and every later wave until
   // stable aggregation.  It is distinct from scratch and must therefore be
   // carried in the admission planner.  Finite custom-verifier runs require
   // both estimators.
-  std::function<std::size_t(grammar_spr_candidate const&)>
+  chart_spr_tracked_state_callback<
+      std::function<std::size_t(grammar_spr_candidate const&)>>
       fixed_topology_exact_additional_retained_memory_estimator;
 
   // Optional Phase-9 transient-extension verifier supplied by the local-commit
@@ -3130,8 +3215,10 @@ struct chart_spr_search_state {
   //
   // Diagnostic scratch caches are gated to the optional two-chart oracle; the
   // production B&B consumes only the materialized extended grammar.
-  chart_spr_exact_multisite_verifier exact_multisite_verifier;
-  chart_spr_contextual_exact_multisite_verifier
+  chart_spr_tracked_state_callback<chart_spr_exact_multisite_verifier>
+      exact_multisite_verifier;
+  chart_spr_tracked_state_callback<
+      chart_spr_contextual_exact_multisite_verifier>
       contextual_exact_multisite_verifier;
   bool exact_multisite_verifier_parallel_safe = false;
 
@@ -3141,19 +3228,112 @@ struct chart_spr_search_state {
   // B&B storage separately. A finite budget fails closed when a transient
   // verifier is installed without this matching estimator. Both estimator
   // callbacks are admission metadata and must not allocate material scratch.
-  std::function<std::size_t(grammar_spr_candidate const&)>
+  chart_spr_tracked_state_callback<
+      std::function<std::size_t(grammar_spr_candidate const&)>>
       exact_multisite_transient_memory_estimator;
-  std::function<std::size_t(grammar_spr_candidate const&)>
+  chart_spr_tracked_state_callback<
+      std::function<std::size_t(grammar_spr_candidate const&)>>
       exact_multisite_transient_retained_memory_estimator;
+
+  // std::function stores its wrapper inline above, but a callable target may
+  // own an opaque heap allocation (and may itself retain further ownership).
+  // Public/custom callback installation must declare one aggregate bound for
+  // those persistent targets.  Internal production callbacks are frozen-
+  // toolchain SBO callables and declare zero through the guarded installer.
+  // The count and tracked assignment revisions prevent later additions,
+  // removals, or same-count replacements from silently inheriting a stale
+  // declaration made for an earlier set of targets.
+  std::size_t callback_target_resident_bytes = 0;
+  std::size_t callback_target_resident_contract_function_count = 0;
+  std::array<std::uint64_t, 11> callback_target_resident_contract_revisions{};
+  bool callback_target_resident_safely_bounded = false;
 
   mutable chart_spr_search_counters counters;
 };
+
+inline std::size_t chart_spr_state_callback_function_count(
+    chart_spr_search_state const& state) noexcept {
+  return static_cast<std::size_t>(
+             static_cast<bool>(state.exact_setup_provider)) +
+         static_cast<std::size_t>(
+             static_cast<bool>(state.scheduled_exact_setup_provider)) +
+         static_cast<std::size_t>(static_cast<bool>(
+             state.exact_setup_provider_additional_memory_estimator)) +
+         static_cast<std::size_t>(
+             static_cast<bool>(state.fixed_topology_exact_verifier)) +
+         static_cast<std::size_t>(static_cast<bool>(
+             state.contextual_fixed_topology_exact_verifier)) +
+         static_cast<std::size_t>(static_cast<bool>(
+             state.fixed_topology_exact_additional_memory_estimator)) +
+         static_cast<std::size_t>(static_cast<bool>(
+             state.fixed_topology_exact_additional_retained_memory_estimator)) +
+         static_cast<std::size_t>(
+             static_cast<bool>(state.exact_multisite_verifier)) +
+         static_cast<std::size_t>(
+             static_cast<bool>(state.contextual_exact_multisite_verifier)) +
+         static_cast<std::size_t>(static_cast<bool>(
+             state.exact_multisite_transient_memory_estimator)) +
+         static_cast<std::size_t>(static_cast<bool>(
+             state.exact_multisite_transient_retained_memory_estimator));
+}
+
+inline std::array<std::uint64_t, 11> chart_spr_state_callback_revisions(
+    chart_spr_search_state const& state) noexcept {
+  return {
+      state.exact_setup_provider.revision(),
+      state.scheduled_exact_setup_provider.revision(),
+      state.exact_setup_provider_additional_memory_estimator.revision(),
+      state.fixed_topology_exact_verifier.revision(),
+      state.contextual_fixed_topology_exact_verifier.revision(),
+      state.fixed_topology_exact_additional_memory_estimator.revision(),
+      state.fixed_topology_exact_additional_retained_memory_estimator
+          .revision(),
+      state.exact_multisite_verifier.revision(),
+      state.contextual_exact_multisite_verifier.revision(),
+      state.exact_multisite_transient_memory_estimator.revision(),
+      state.exact_multisite_transient_retained_memory_estimator.revision(),
+  };
+}
+
+// Declare the aggregate persistent ownership of every callable target
+// currently installed in the state.  Re-declare after adding/replacing a
+// custom callback.  The bound excludes std::function wrappers, which are
+// already inline in sizeof(chart_spr_search_state).
+inline void declare_chart_spr_state_callback_target_resident_bytes(
+    chart_spr_search_state& state, std::size_t resident_bytes) noexcept {
+  state.callback_target_resident_bytes = resident_bytes;
+  state.callback_target_resident_contract_function_count =
+      chart_spr_state_callback_function_count(state);
+  state.callback_target_resident_contract_revisions =
+      chart_spr_state_callback_revisions(state);
+  state.callback_target_resident_safely_bounded = true;
+}
 
 // Capacity-based resident accounting for the coordinator-published old trim,
 // plus a conservative preflight estimate for one candidate task. Definitions
 // live with the materialization/cache implementations in chart_spr_search.cpp.
 std::size_t estimate_chart_spr_trim_resident_bytes(
     multisite_trim_result const& trim);
+
+// Dynamic owning storage only.  The fixed trim object is already inline in
+// chart_spr_search_state::exact_trim_active_only.
+std::size_t estimate_chart_spr_trim_dynamic_resident_bytes(
+    multisite_trim_result const& trim);
+
+// Cache-independent owning state.  This includes sizeof(state), whose inline
+// optionals already contain the fixed lazy-chart and exact-trim objects, but
+// excludes every selected-cache allocation (including pattern_charts slots).
+inline std::size_t estimate_chart_spr_state_core_resident_bytes(
+    chart_spr_search_state const& state);
+
+// Selected scoring-cache admitted bound with fixed inline lazy-chart storage
+// removed. Lazy/all-active values describe capacity ownership; pattern-batch
+// deliberately contributes its configured future batch-workspace reservation
+// even while pattern_charts is empty. resident_pattern_cache_bytes already
+// includes the persistent local-commit cache when one is published; do not add
+// that field separately.
+inline std::size_t estimate_chart_spr_selected_cache_dynamic_resident_bytes(
+    chart_spr_search_state const& state);
 
 inline std::size_t estimate_chart_spr_retained_exact_trim_bytes(
     chart_spr_search_state const& state) {
@@ -3163,22 +3343,36 @@ inline std::size_t estimate_chart_spr_retained_exact_trim_bytes(
              : 0;
 }
 
+// Unified published-state admission bound. It is allocator-capacity exact for
+// the core, lazy/all-active selected cache, and trim components; pattern-batch
+// intentionally substitutes its reserved next-batch scoring envelope.
 inline std::size_t estimate_chart_spr_published_state_resident_bytes(
     chart_spr_search_state const& state) {
-  return chart_spr_exact_candidate_checked_bytes_add(
-      state.resident_pattern_cache_bytes,
-      estimate_chart_spr_retained_exact_trim_bytes(state),
-      "chart SPR published state resident bytes");
+  auto total = chart_spr_exact_candidate_checked_bytes_add(
+      estimate_chart_spr_state_core_resident_bytes(state),
+      estimate_chart_spr_selected_cache_dynamic_resident_bytes(state),
+      "chart SPR published state core/cache resident bytes");
+  if (state.exact_trim_active_only) {
+    total = chart_spr_exact_candidate_checked_bytes_add(
+        total,
+        estimate_chart_spr_trim_dynamic_resident_bytes(
+            *state.exact_trim_active_only),
+        "chart SPR published state exact-trim resident bytes");
+  }
+  return total;
 }
 
 inline void require_chart_spr_retained_exact_state_memory_budget(
     chart_spr_search_state const& state, multisite_trim_result const& trim,
     std::size_t memory_budget_bytes) {
   if (memory_budget_bytes == 0) return;
-  auto const required = chart_spr_exact_candidate_checked_bytes_add(
-      state.resident_pattern_cache_bytes,
-      estimate_chart_spr_trim_resident_bytes(trim),
-      "chart SPR retained exact-state resident bytes");
+  auto required = chart_spr_exact_candidate_checked_bytes_add(
+      estimate_chart_spr_state_core_resident_bytes(state),
+      estimate_chart_spr_selected_cache_dynamic_resident_bytes(state),
+      "chart SPR retained exact-state core/cache resident bytes");
+  required = chart_spr_exact_candidate_checked_bytes_add(
+      required, estimate_chart_spr_trim_dynamic_resident_bytes(trim),
+      "chart SPR retained exact-state exact-trim resident bytes");
   if (required > memory_budget_bytes) {
     throw chart_spr_exact_state_budget_error(required, memory_budget_bytes);
   }
@@ -3220,6 +3414,8 @@ namespace chart_spr_search_detail {
 std::size_t estimate_exact_loop_resident_input_bytes(
     std::vector<chart_spr_candidate_score> const& ranked,
     chart_spr_iteration_result const& iteration);
+std::size_t estimate_exact_loop_accepted_candidate_dynamic_bytes(
+    std::span<chart_spr_candidate_score const> ranked);
 
 // Conservative live envelope for the grammar-stream enumerator while it calls
 // a scoring-batch callback, plus the measured frozen-toolchain node/string
@@ -3231,7 +3427,12 @@ std::size_t estimate_grammar_spr_enumeration_signature_live_bytes(
 
 struct grammar_spr_finite_iteration_memory_envelope {
   std::size_t planned_required_bytes = 0;
+  std::size_t planned_generation_phase_required_bytes = 0;
+  std::size_t planned_evidence_phase_required_bytes = 0;
   std::size_t future_dynamic_bytes = 0;
+  std::size_t planned_post_release_result_bytes = 0;
+  std::size_t planned_ranked_candidate_exact_evidence_bytes = 0;
+  std::size_t planned_accepted_candidate_dynamic_bytes = 0;
   std::size_t planned_local_workspace_resident_bytes = 0;
   std::size_t planned_signature_node_bytes = 0;
   std::size_t planned_candidate_live_bytes = 0;
@@ -3240,19 +3441,22 @@ struct grammar_spr_finite_iteration_memory_envelope {
   std::size_t planned_canonical_state_exact_evidence_construction_peak_bytes =
       0;
   std::size_t planned_scheduler_operation_peak_bytes = 0;
+  std::size_t planned_scheduler_resident_bytes = 0;
   std::size_t planned_local_task_stable_bytes = 0;
   std::size_t planned_local_task_preparation_peak_bytes = 0;
 };
 
 // Allocation-free pre-enumeration envelope for a bounded grammar-native
-// stream. The planned surface covers every reserve performed before
-// enumeration; future_dynamic_bytes is reused with measured capacities for the
-// post-reserve backstop.
+// stream. The planned surface is the temporal maximum of generation/local/
+// exact preparation and post-release canonical-evidence construction.
+// future_dynamic_bytes is generation-only and is reused with measured
+// capacities for the pre-enumeration reserve backstop.
 grammar_spr_finite_iteration_memory_envelope
 estimate_grammar_spr_finite_iteration_memory_envelope(
     chart_spr_search_state const& state, std::size_t candidate_limit,
     std::size_t candidate_batch_size, std::size_t ranked_limit,
-    bool capture_semantics, std::size_t local_task_slots);
+    bool capture_semantics, chart_scheduler const& scheduler,
+    std::size_t local_task_slots);
 
 // Peak coordinator scratch used while producing the per-candidate admission
 // estimates. Estimation is serial, so only the largest candidate is charged.
@@ -3260,11 +3464,118 @@ std::size_t estimate_exact_loop_estimator_peak_scratch_bytes(
     chart_spr_search_state const& state,
     std::span<chart_spr_candidate_score const> ranked);
 
-// One frozen-libstdc++ scheduler operation: range exception slots, futures,
-// packaged-task shared state, and thread-pool queue bookkeeping. Exact-loop
-// operations create at most four ranges per resolved worker.
-std::size_t estimate_exact_loop_scheduler_operation_peak_bytes(
-    std::size_t resolved_workers, bool operation_possible);
+inline std::size_t estimate_chart_spr_scheduler_resident_bytes(
+    chart_scheduler const& scheduler) {
+  return chart_spr_exact_candidate_checked_bytes_add(
+      estimate_chart_scheduler_implementation_resident_bytes(),
+      estimate_chart_scheduler_pool_owning_heap_bytes(
+          scheduler.worker_resolution().resolved_workers),
+      "chart SPR scheduler resident bytes");
+}
+
+inline std::size_t estimate_chart_spr_scheduler_operation_peak_for_any_items(
+    chart_scheduler const& scheduler, std::size_t maximum_item_count,
+    chart_indexed_range_options options) {
+  if (maximum_item_count == 0) return 0;
+  if (options.minimum_grain != 1 || options.target_ranges_per_worker == 0) {
+    throw std::logic_error(
+        "chart SPR scheduler-operation bound requires unit grain and an "
+        "explicit range target");
+  }
+  // With unit minimum grain, the operation estimator is largest at the
+  // greatest attainable range count. Planning an arbitrarily large N can
+  // increase adaptive grain and make ceil(N/grain) fall, so plan the exact
+  // saturation pivot instead of assuming monotonicity in N.
+  auto const workers = scheduler.worker_resolution().resolved_workers;
+  auto const target =
+      std::max<std::size_t>(1, options.target_ranges_per_worker);
+  auto const range_saturation =
+      workers > (std::numeric_limits<std::size_t>::max)() / target
+          ? (std::numeric_limits<std::size_t>::max)()
+          : workers * target;
+  auto const pivot = std::min(maximum_item_count, range_saturation);
+  return estimate_chart_scheduler_operation_peak_bytes(
+      scheduler.plan_indexed_ranges(pivot, options));
+}
+
+inline std::size_t
+estimate_chart_spr_state_exact_scheduler_operation_peak_bytes(
+    chart_spr_search_state const& state, chart_scheduler const& scheduler) {
+  if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+    // Both lazy state-exact routes are deliberately serial.
+    return 0;
+  }
+  auto const pattern_count = state.active_patterns.patterns.patterns.size();
+  std::size_t peak = 0;
+  auto observe_actual = [&](std::size_t item_count,
+                            chart_indexed_range_options options) {
+    peak =
+        std::max(peak, estimate_chart_scheduler_operation_peak_bytes(
+                           scheduler.plan_indexed_ranges(item_count, options)));
+  };
+  auto observe_any = [&](std::size_t maximum_item_count,
+                         chart_indexed_range_options options) {
+    peak = std::max(peak,
+                    estimate_chart_spr_scheduler_operation_peak_for_any_items(
+                        scheduler, maximum_item_count, options));
+  };
+
+  auto const setup_options =
+      chart_multisite_detail::multisite_exact_setup_range_options();
+  auto const setup_is_scheduled =
+      state.cache_strategy == chart_spr_cache_strategy::all_active_patterns ||
+      static_cast<bool>(state.scheduled_exact_setup_provider) ||
+      !state.exact_setup_provider;
+  if (setup_is_scheduled) {
+    observe_actual(pattern_count, setup_options);
+    auto const topology_count_bound =
+        chart_spr_exact_candidate_checked_bytes_add(
+            pattern_count, 1, "chart SPR state exact upper-topology count");
+    auto const upper_bound_items =
+        chart_spr_exact_candidate_checked_bytes_multiply(
+            pattern_count, topology_count_bound,
+            "chart SPR state exact upper-topology scheduler items");
+    observe_any(upper_bound_items, setup_options);
+  }
+
+  auto const frontier_options =
+      chart_multisite_detail::multisite_frontier_clade_range_options();
+  auto const& offsets = state.execution_plan.bottom_up_level_offsets();
+  for (std::size_t level = 0; level + 1 < offsets.size(); ++level) {
+    observe_actual(offsets[level + 1] - offsets[level], frontier_options);
+  }
+  return peak;
+}
+
+inline std::size_t estimate_chart_spr_state_exact_scheduler_summary_bytes(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options) {
+  if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+    return 0;
+  }
+  auto const& offsets = state.execution_plan.bottom_up_level_offsets();
+  auto const level_count = offsets.empty() ? 0 : offsets.size() - 1;
+  auto const frontier_pass_count =
+      trim_options.dominance_mode ==
+              multisite_dominance_mode::two_pass_exact_mask
+          ? std::size_t{2}
+          : std::size_t{1};
+  auto const frontier_summary_count =
+      chart_spr_exact_candidate_checked_bytes_multiply(
+          level_count, frontier_pass_count,
+          "chart SPR state exact frontier summary count");
+  auto const summary_count = chart_spr_exact_candidate_checked_bytes_add(
+      2, frontier_summary_count,
+      "chart SPR state exact scheduler summary count");
+  return chart_spr_exact_candidate_checked_bytes_multiply(
+      summary_count, sizeof(chart_scheduler_run_summary),
+      "chart SPR state exact scheduler summary bytes");
+}
+
+std::size_t estimate_chart_spr_exact_candidate_inner_scheduler_scratch_bytes(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_options const& options, chart_scheduler const& scheduler);
 
 }  // namespace chart_spr_search_detail
 
@@ -3288,9 +3599,11 @@ inline void require_chart_spr_state_exact_memory_budget(
     multisite_trim_options const& trim_options, std::size_t resolved_workers,
     std::size_t memory_budget_bytes) {
   if (memory_budget_bytes == 0) return;
-  if (state.resident_pattern_cache_bytes > memory_budget_bytes) {
-    throw chart_spr_exact_state_budget_error(
-        state.resident_pattern_cache_bytes, memory_budget_bytes);
+  auto const resident_state =
+      estimate_chart_spr_published_state_resident_bytes(state);
+  if (resident_state > memory_budget_bytes) {
+    throw chart_spr_exact_state_budget_error(resident_state,
+                                             memory_budget_bytes);
   }
   // The state estimator uses the same virtual-topology memo/visit/removed
   // vectors as candidate admission. Pre-admit that allocation-free envelope
@@ -3303,7 +3616,7 @@ inline void require_chart_spr_state_exact_memory_budget(
               std::span<chart_spr_candidate_score const>{
                   &identity_candidate, 1});
   auto const estimator_required = chart_spr_exact_candidate_checked_bytes_add(
-      state.resident_pattern_cache_bytes, estimator_scratch,
+      resident_state, estimator_scratch,
       "chart SPR exact-state estimator preflight bytes");
   if (estimator_required > memory_budget_bytes) {
     throw chart_spr_exact_state_budget_error(estimator_required,
@@ -3315,11 +3628,10 @@ inline void require_chart_spr_state_exact_memory_budget(
                            ? estimate.inner_parallel_scratch_bytes
                            : estimate.serial_scratch_bytes;
   auto const overflow =
-      state.resident_pattern_cache_bytes >
-      (std::numeric_limits<std::size_t>::max)() - scratch;
+      resident_state > (std::numeric_limits<std::size_t>::max)() - scratch;
   auto const required = overflow || !estimate.safely_bounded
                             ? (std::numeric_limits<std::size_t>::max)()
-                            : state.resident_pattern_cache_bytes + scratch;
+                            : resident_state + scratch;
   if (required > memory_budget_bytes) {
     throw chart_spr_exact_state_budget_error(required, memory_budget_bytes);
   }
@@ -3331,6 +3643,102 @@ inline void require_chart_spr_state_exact_memory_budget(
   auto const budget = state.cache_opts.memory_budget_bytes;
   require_chart_spr_state_exact_memory_budget(state, trim_options,
                                               resolved_workers, budget);
+}
+
+inline void require_chart_spr_state_exact_memory_budget(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options,
+    chart_scheduler const& scheduler, std::size_t memory_budget_bytes) {
+  if (memory_budget_bytes == 0) return;
+  auto resident_base = estimate_chart_spr_published_state_resident_bytes(state);
+  resident_base = chart_spr_exact_candidate_checked_bytes_add(
+      resident_base,
+      chart_spr_search_detail::estimate_chart_spr_scheduler_resident_bytes(
+          scheduler),
+      "chart SPR exact-state scheduler ownership");
+  if (resident_base > memory_budget_bytes) {
+    throw chart_spr_exact_state_budget_error(resident_base,
+                                             memory_budget_bytes);
+  }
+
+  // Estimation and construction are sequential phases. Charge the
+  // allocation-heavy virtual-topology estimator against the same resident
+  // state/pool base, then release it before composing exact setup/frontier
+  // scratch with the largest actual scheduler operation.
+  chart_spr_candidate_score identity_candidate;
+  auto const estimator_scratch =
+      chart_spr_search_detail::estimate_exact_loop_estimator_peak_scratch_bytes(
+          state,
+          std::span<chart_spr_candidate_score const>{&identity_candidate, 1});
+  auto const estimator_required = chart_spr_exact_candidate_checked_bytes_add(
+      resident_base, estimator_scratch,
+      "chart SPR scheduled exact-state estimator preflight bytes");
+  if (estimator_required > memory_budget_bytes) {
+    throw chart_spr_exact_state_budget_error(estimator_required,
+                                             memory_budget_bytes);
+  }
+
+  auto const workers = scheduler.worker_resolution().resolved_workers;
+  auto const estimate = estimate_chart_spr_state_exact_memory(
+      state, trim_options, workers, memory_budget_bytes);
+  auto construction_scratch = estimate.inner_parallel_scratch_bytes;
+  construction_scratch = chart_spr_exact_candidate_checked_bytes_add(
+      construction_scratch,
+      chart_spr_search_detail::
+          estimate_chart_spr_state_exact_scheduler_operation_peak_bytes(
+              state, scheduler),
+      "chart SPR scheduled exact-state operation scratch");
+  construction_scratch = chart_spr_exact_candidate_checked_bytes_add(
+      construction_scratch,
+      chart_spr_search_detail::
+          estimate_chart_spr_state_exact_scheduler_summary_bytes(state,
+                                                                 trim_options),
+      "chart SPR scheduled exact-state run summaries");
+  auto const required =
+      estimate.safely_bounded
+          ? chart_spr_exact_candidate_checked_bytes_add(
+                resident_base, construction_scratch,
+                "chart SPR scheduled exact-state construction bytes")
+          : (std::numeric_limits<std::size_t>::max)();
+  if (required > memory_budget_bytes) {
+    throw chart_spr_exact_state_budget_error(required, memory_budget_bytes);
+  }
+}
+
+inline void require_chart_spr_state_exact_memory_budget(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options,
+    chart_scheduler const& scheduler) {
+  require_chart_spr_state_exact_memory_budget(
+      state, trim_options, scheduler, state.cache_opts.memory_budget_bytes);
+}
+
+inline void require_chart_spr_retained_exact_state_memory_budget(
+    chart_spr_search_state const& state, multisite_trim_result const& trim,
+    chart_scheduler const& scheduler, std::size_t memory_budget_bytes) {
+  if (memory_budget_bytes == 0) return;
+  auto required = chart_spr_exact_candidate_checked_bytes_add(
+      estimate_chart_spr_state_core_resident_bytes(state),
+      estimate_chart_spr_selected_cache_dynamic_resident_bytes(state),
+      "chart SPR retained scheduled exact-state core/cache bytes");
+  required = chart_spr_exact_candidate_checked_bytes_add(
+      required, estimate_chart_spr_trim_dynamic_resident_bytes(trim),
+      "chart SPR retained scheduled exact-state trim bytes");
+  required = chart_spr_exact_candidate_checked_bytes_add(
+      required,
+      chart_spr_search_detail::estimate_chart_spr_scheduler_resident_bytes(
+          scheduler),
+      "chart SPR retained scheduled exact-state scheduler ownership");
+  if (required > memory_budget_bytes) {
+    throw chart_spr_exact_state_budget_error(required, memory_budget_bytes);
+  }
+}
+
+inline void require_chart_spr_retained_exact_state_memory_budget(
+    chart_spr_search_state const& state, multisite_trim_result const& trim,
+    chart_scheduler const& scheduler) {
+  require_chart_spr_retained_exact_state_memory_budget(
+      state, trim, scheduler, state.cache_opts.memory_budget_bytes);
 }
 
 namespace chart_spr_search_detail {
@@ -3456,11 +3864,29 @@ inline std::size_t estimate_chart_spr_pattern_cache_bytes(
   return total;
 }
 
+inline std::size_t estimate_chart_spr_selected_cache_dynamic_resident_bytes(
+    chart_spr_search_state const& state) {
+  auto total = state.resident_pattern_cache_bytes;
+  if (state.cache_strategy != chart_spr_cache_strategy::lazy_multisite_chart ||
+      total == 0) {
+    return total;
+  }
+  // optional<lazy_multisite_chart>'s fixed object storage is already part of
+  // sizeof(chart_spr_search_state).  The resident cache aggregate may also
+  // contain local_commit_persistent_cache_bytes, so remove exactly the one
+  // overlapped fixed object rather than reconstructing or adding components.
+  if (total < sizeof(lazy_multisite_chart)) {
+    throw std::logic_error(
+        "chart SPR lazy resident cache is smaller than its fixed object");
+  }
+  return total - sizeof(lazy_multisite_chart);
+}
+
 // Resident storage already owned by a partially constructed search state and
 // overlapping lazy inside/outside construction.  The DAG is non-owning here;
 // all owning grammar, immutable-plan, active-pattern, and state buffers are
 // charged from allocator-selected capacities.
-inline std::size_t estimate_chart_spr_lazy_state_build_retained_bytes(
+inline std::size_t estimate_chart_spr_state_core_resident_bytes(
     chart_spr_search_state const& state) {
   auto add = [](std::size_t lhs, std::size_t rhs, std::string_view context) {
     return chart_spr_exact_candidate_checked_bytes_add(lhs, rhs, context);
@@ -3471,6 +3897,21 @@ inline std::size_t estimate_chart_spr_lazy_state_build_retained_bytes(
         values.capacity(), sizeof(typename vector_type::value_type), context);
   };
   std::size_t total = sizeof(state);
+  auto const callback_count = chart_spr_state_callback_function_count(state);
+  if (callback_count != 0 &&
+      (!state.callback_target_resident_safely_bounded ||
+       state.callback_target_resident_contract_function_count !=
+           callback_count ||
+       state.callback_target_resident_contract_revisions !=
+           chart_spr_state_callback_revisions(state))) {
+    throw std::runtime_error(
+        "chart SPR state resident estimate: installed callback targets lack "
+        "a complete persistent-resident contract");
+  }
+  if (callback_count != 0) {
+    total = add(total, state.callback_target_resident_bytes,
+                "chart SPR retained callback targets");
+  }
   auto add_vector = [&](auto const& values, std::string_view context) {
     total = add(total, capacity_bytes(values, context),
                 "chart SPR lazy retained state");
@@ -3588,7 +4029,6 @@ inline std::size_t estimate_chart_spr_lazy_state_build_retained_bytes(
              "chart SPR retained normalized-pattern map");
   add_vector(patterns.exact_pattern_to_normalized_binary_state_map,
              "chart SPR retained normalized-state map");
-  add_vector(state.pattern_charts, "chart SPR retained pattern-chart slots");
   // make_shared co-allocates the tracker with a frozen-libstdc++ control
   // block. The shared_ptr object itself is already inside sizeof(state); this
   // allowance covers the tracker, strong/weak atomics, vptr/control metadata,
@@ -3598,6 +4038,21 @@ inline std::size_t estimate_chart_spr_lazy_state_build_retained_bytes(
                   4 * sizeof(void*) + 2 * sizeof(std::size_t),
               "chart SPR retained verifier tracker/control block");
   return total;
+}
+
+// State construction can own a partially filled pattern_charts buffer before
+// resident_pattern_cache_bytes has been replaced by its post-build capacity
+// walk.  Keep that build-only surface outside the cache-independent published
+// state core.
+inline std::size_t estimate_chart_spr_lazy_state_build_retained_bytes(
+    chart_spr_search_state const& state) {
+  auto const pattern_chart_slots =
+      chart_spr_exact_candidate_checked_bytes_multiply(
+          state.pattern_charts.capacity(), sizeof(pattern_chart_cache_entry),
+          "chart SPR retained pattern-chart slots");
+  return chart_spr_exact_candidate_checked_bytes_add(
+      estimate_chart_spr_state_core_resident_bytes(state), pattern_chart_slots,
+      "chart SPR retained state build bytes");
 }
 
 inline void add_lazy_chart_build_counters(chart_spr_search_counters& counters,
@@ -3726,14 +4181,15 @@ inline multisite_trim_result build_chart_spr_state_exact_trim(
       state, "chart SPR exact trim");
   state.active_patterns.assert_no_skipped_invariant_metadata();
   checked_state.assert_same(state.grammar, state.execution_plan);
-  require_chart_spr_state_exact_memory_budget(
-      state, trim_options, scheduler.worker_resolution().resolved_workers);
+  require_chart_spr_state_exact_memory_budget(state, trim_options, scheduler);
 
   multisite_trim_scheduler_run_summaries runs;
   // Both current scheduled setup providers issue at most the active-pattern
   // and upper-bound-topology operations. Reserve before either can run so an
   // allocation failure cannot lose an already completed run summary.
-  runs.exact_setup.reserve(2);
+  if (state.cache_strategy != chart_spr_cache_strategy::lazy_multisite_chart) {
+    runs.exact_setup.reserve(2);
+  }
   chart_spr_scheduler_run_axis_publisher publish_setup_runs{
       state.counters.scheduler_axes.exact_setup_patterns, runs.exact_setup};
   chart_spr_scheduler_run_axis_publisher publish_frontier_runs{
@@ -3835,6 +4291,23 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
   state.estimated_full_pattern_cache_bytes =
       estimate_chart_spr_full_pattern_cache_bytes(state);
   auto cache_selection_options = cache;
+  auto const state_core_resident_bytes =
+      estimate_chart_spr_state_core_resident_bytes(state);
+  if (cache.memory_budget_bytes != 0) {
+    if (state_core_resident_bytes > cache.memory_budget_bytes) {
+      if (build_exact_trim) {
+        throw chart_spr_exact_state_budget_error(state_core_resident_bytes,
+                                                 cache.memory_budget_bytes);
+      }
+      throw std::runtime_error(
+          "chart SPR search state: cache-independent state core requires " +
+          std::to_string(state_core_resident_bytes) +
+          " bytes, exceeding configured budget " +
+          std::to_string(cache.memory_budget_bytes));
+    }
+    cache_selection_options.memory_budget_bytes =
+        cache.memory_budget_bytes - state_core_resident_bytes;
+  }
   std::size_t reserved_local_commit_cache_bytes = 0;
   if (build_policy.defer_pattern_batch_bootstrap_to_local_cache &&
       cache.memory_budget_bytes != 0) {
@@ -3847,18 +4320,41 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     }
     auto const mandatory_pair_bytes = full_bytes * 2;
     reserved_local_commit_cache_bytes = mandatory_pair_bytes;
-    if (mandatory_pair_bytes > cache.memory_budget_bytes ||
-        scoring_pattern_bytes >
-            cache.memory_budget_bytes - mandatory_pair_bytes) {
+    if (mandatory_pair_bytes > cache_selection_options.memory_budget_bytes ||
+        scoring_pattern_bytes > cache_selection_options.memory_budget_bytes -
+                                    mandatory_pair_bytes) {
       throw std::runtime_error(
           "chart SPR local commit: configured cache budget cannot hold the "
-          "mandatory full inside/outside caches plus one scoring pattern");
+          "state core, mandatory full inside/outside caches, and one scoring "
+          "pattern");
     }
     // The strategy selector owns only the remainder. It may retain all active
     // scoring charts when three full surfaces fit, or shrink to a bounded
     // pattern batch while reserving the two local-commit cache surfaces.
     cache_selection_options.memory_budget_bytes =
-        cache.memory_budget_bytes - mandatory_pair_bytes;
+        cache_selection_options.memory_budget_bytes - mandatory_pair_bytes;
+  }
+  if (cache.memory_budget_bytes != 0 && !cache.use_lazy_multisite_chart &&
+      !state.active_patterns.patterns.patterns.empty()) {
+    auto const minimum_scoring_bytes =
+        estimate_chart_spr_pattern_entry_cache_bytes(state.grammar);
+    if (cache_selection_options.memory_budget_bytes < minimum_scoring_bytes) {
+      auto const required = chart_spr_exact_candidate_checked_bytes_add(
+          state_core_resident_bytes,
+          chart_spr_exact_candidate_checked_bytes_add(
+              reserved_local_commit_cache_bytes, minimum_scoring_bytes,
+              "chart SPR minimum selected cache admission"),
+          "chart SPR minimum published state admission");
+      if (build_exact_trim) {
+        throw chart_spr_exact_state_budget_error(required,
+                                                 cache.memory_budget_bytes);
+      }
+      throw std::runtime_error(
+          "chart SPR search state: cache-independent state core plus one "
+          "scoring pattern requires " +
+          std::to_string(required) + " bytes, exceeding configured budget " +
+          std::to_string(cache.memory_budget_bytes));
+    }
   }
   state.effective_pattern_batch_size = choose_chart_spr_pattern_batch_size(
       state.grammar, state.active_patterns, cache_selection_options);
@@ -3891,12 +4387,30 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
                 state.active_patterns.patterns.patterns.size())
           : estimate_chart_spr_pattern_batch_cache_bytes(
                 state.grammar, state.effective_pattern_batch_size);
+  if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart &&
+      projected_scoring_cache_bytes < sizeof(lazy_multisite_chart)) {
+    throw std::logic_error(
+        "chart SPR lazy cache projection omitted its fixed object");
+  }
+  auto const projected_scoring_cache_dynamic_bytes =
+      state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart
+          ? projected_scoring_cache_bytes - sizeof(lazy_multisite_chart)
+          : projected_scoring_cache_bytes;
   auto const projected_initial_resident_bytes =
       chart_spr_exact_candidate_checked_bytes_add(
           projected_scoring_cache_bytes, reserved_local_commit_cache_bytes,
           "chart SPR initial resident-cache admission");
+  auto const projected_initial_dynamic_resident_bytes =
+      chart_spr_exact_candidate_checked_bytes_add(
+          projected_scoring_cache_dynamic_bytes,
+          reserved_local_commit_cache_bytes,
+          "chart SPR initial dynamic resident-cache admission");
   std::size_t lazy_state_build_retained_bytes = 0;
-  auto projected_initial_live_bytes = projected_initial_resident_bytes;
+  auto projected_initial_live_bytes =
+      chart_spr_exact_candidate_checked_bytes_add(
+          estimate_chart_spr_state_core_resident_bytes(state),
+          projected_initial_dynamic_resident_bytes,
+          "chart SPR initial published-state admission");
   if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart &&
       cache.memory_budget_bytes != 0) {
     lazy_state_build_retained_bytes =
@@ -3989,7 +4503,7 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     projected_initial_live_bytes = chart_spr_exact_candidate_checked_bytes_add(
         lazy_state_build_retained_bytes,
         chart_spr_exact_candidate_checked_bytes_add(
-            projected_initial_resident_bytes, transient,
+            projected_initial_dynamic_resident_bytes, transient,
             "chart SPR lazy state-build preflight"),
         "chart SPR lazy state-build preflight");
   }
@@ -4007,11 +4521,12 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
   }
   state.resident_pattern_cache_bytes = projected_initial_resident_bytes;
   if (build_exact_trim) {
-    require_chart_spr_state_exact_memory_budget(
-        state, trim_options,
-        scheduler != nullptr
-            ? scheduler->worker_resolution().resolved_workers
-            : std::size_t{1});
+    if (scheduler != nullptr) {
+      require_chart_spr_state_exact_memory_budget(state, trim_options,
+                                                  *scheduler);
+    } else {
+      require_chart_spr_state_exact_memory_budget(state, trim_options, 1);
+    }
   }
   // Only the scoring representation is resident at this point.  The reserved
   // local-commit surfaces are constructed later and added from their actual
@@ -4261,7 +4776,7 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
   // frozen allocator/toolchain retained more storage than the projection.
   auto const actual_initial_resident_bytes =
       chart_spr_exact_candidate_checked_bytes_add(
-          state.resident_pattern_cache_bytes,
+          estimate_chart_spr_published_state_resident_bytes(state),
           reserved_local_commit_cache_bytes,
           "chart SPR initial resident-cache capacity check");
   if (cache.memory_budget_bytes != 0 &&
@@ -4280,18 +4795,19 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
   if (build_exact_trim) {
     auto const exact_initialization_start =
         std::chrono::steady_clock::now();
-    require_chart_spr_state_exact_memory_budget(
-        state, trim_options,
-        scheduler != nullptr
-            ? scheduler->worker_resolution().resolved_workers
-            : std::size_t{1});
+    if (scheduler != nullptr) {
+      require_chart_spr_state_exact_memory_budget(state, trim_options,
+                                                  *scheduler);
+    } else {
+      require_chart_spr_state_exact_memory_budget(state, trim_options, 1);
+    }
     if (scheduler != nullptr) {
       auto checked =
           check_chart_execution_plan(state.grammar, state.execution_plan);
       auto built_trim = build_chart_spr_state_exact_trim(
           state, checked, *scheduler, trim_options);
       require_chart_spr_retained_exact_state_memory_budget(
-          state, built_trim, cache.memory_budget_bytes);
+          state, built_trim, *scheduler, cache.memory_budget_bytes);
       state.exact_trim_active_only = std::move(built_trim);
     } else {
       auto built_trim = build_chart_spr_state_exact_trim(state, trim_options);
@@ -4579,7 +5095,9 @@ struct local_spr_score_options {
   // the search state's cache budget (and is unlimited when that is also zero).
   // The additional resident value lets an orchestration owner charge storage
   // that remains live across this call without making the local workspace own
-  // or inspect it.
+  // or inspect it. A checked finite call with a supplied scheduler charges
+  // that scheduler's persistent ownership and each actual range operation
+  // internally; callers must not include either in this external value.
   std::size_t admission_memory_budget_bytes = 0;
   std::size_t admission_additional_resident_bytes = 0;
   // Production acceptance already charges the owning result-vector outer
@@ -6026,6 +6544,15 @@ inline void add_chart_spr_search_counters(
   dst.lazy_local_iteration_envelope_bytes_max =
       std::max(dst.lazy_local_iteration_envelope_bytes_max,
                src.lazy_local_iteration_envelope_bytes_max);
+  dst.lazy_local_iteration_generation_phase_bytes_max =
+      std::max(dst.lazy_local_iteration_generation_phase_bytes_max,
+               src.lazy_local_iteration_generation_phase_bytes_max);
+  dst.lazy_local_iteration_evidence_phase_bytes_max =
+      std::max(dst.lazy_local_iteration_evidence_phase_bytes_max,
+               src.lazy_local_iteration_evidence_phase_bytes_max);
+  dst.lazy_local_ranked_candidate_exact_evidence_bytes_max =
+      std::max(dst.lazy_local_ranked_candidate_exact_evidence_bytes_max,
+               src.lazy_local_ranked_candidate_exact_evidence_bytes_max);
   dst.lazy_local_iteration_task_stable_bytes_max =
       std::max(dst.lazy_local_iteration_task_stable_bytes_max,
                src.lazy_local_iteration_task_stable_bytes_max);
@@ -8742,6 +9269,13 @@ inline void score_candidates_locally_into_impl(
     auto const admission_budget =
         effective_lazy_local_admission_budget_bytes(state, options);
     if (admission_budget != 0) {
+      if (scheduler != nullptr) {
+        operation_options.admission_additional_resident_bytes =
+            local_capacity_checked_add(
+                operation_options.admission_additional_resident_bytes,
+                estimate_chart_spr_scheduler_resident_bytes(*scheduler),
+                "chart SPR lazy-local scheduler ownership");
+      }
       std::size_t candidate_input_resident = 0;
       if (!options
                .admission_additional_resident_includes_candidate_inputs) {
@@ -8773,7 +9307,7 @@ inline void score_candidates_locally_into_impl(
       }
       auto resident_before_begin = local_capacity_checked_add(
           estimate_chart_spr_published_state_resident_bytes(state),
-          options.admission_additional_resident_bytes,
+          operation_options.admission_additional_resident_bytes,
           "chart SPR lazy-local outer shared resident capacity");
       resident_before_begin = local_capacity_checked_add(
           resident_before_begin,
@@ -8819,11 +9353,10 @@ inline void score_candidates_locally_into_impl(
       operation_options.admission_additional_resident_bytes =
           local_capacity_checked_add(
               local_capacity_checked_add(
-                  options.admission_additional_resident_bytes,
+                  operation_options.admission_additional_resident_bytes,
                   candidate_input_resident,
                   "chart SPR lazy-local candidate input resident capacity"),
-              output_resident,
-              "chart SPR lazy-local output resident capacity");
+              output_resident, "chart SPR lazy-local output resident capacity");
     }
     local_score_workspace_access::bound_lazy_task_slots(
         workspace, lazy_task_count, admission_budget != 0);
@@ -9208,12 +9741,11 @@ inline multisite_trim_result const& ensure_chart_spr_state_exact_trim(
   state.active_patterns.assert_no_skipped_invariant_metadata();
   checked_state.assert_same(state.grammar, state.execution_plan);
   if (!state.exact_trim_active_only) {
-    require_chart_spr_state_exact_memory_budget(
-        state, trim_options,
-        scheduler.worker_resolution().resolved_workers);
+    require_chart_spr_state_exact_memory_budget(state, trim_options, scheduler);
     auto built_trim = build_chart_spr_state_exact_trim(
         state, checked_state, scheduler, trim_options);
-    require_chart_spr_retained_exact_state_memory_budget(state, built_trim);
+    require_chart_spr_retained_exact_state_memory_budget(state, built_trim,
+                                                         scheduler);
     state.exact_trim_active_only = std::move(built_trim);
     ++state.counters.chart_execution_plan_cache_hits;
   }
@@ -11364,6 +11896,11 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   std::optional<
       chart_spr_search_detail::grammar_spr_finite_iteration_memory_envelope>
       finite_iteration_envelope;
+  auto const finite_scheduler_resident =
+      finite_lazy_local_admission
+          ? chart_spr_search_detail::
+                estimate_chart_spr_scheduler_resident_bytes(scheduler)
+          : std::size_t{0};
   auto fail_finite_iteration_budget = [&](std::size_t candidate_index,
                                           std::size_t required_bytes,
                                           std::size_t available_bytes) -> void {
@@ -11407,16 +11944,14 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       // a cache+published-old-trim overrun before candidate generation grows
       // its workspace, even though no exact-state rebuild is needed.
       require_chart_spr_retained_exact_state_memory_budget(
-          state, *state.exact_trim_active_only, exact_memory_budget);
+          state, *state.exact_trim_active_only, scheduler, exact_memory_budget);
     } else {
       require_chart_spr_state_exact_memory_budget(
-          state, options.exact_trim,
-          scheduler.worker_resolution().resolved_workers,
-          exact_memory_budget);
+          state, options.exact_trim, scheduler, exact_memory_budget);
       (void)ensure_chart_spr_state_exact_trim(
           state, checked_state, scheduler, options.exact_trim);
       require_chart_spr_retained_exact_state_memory_budget(
-          state, *state.exact_trim_active_only, exact_memory_budget);
+          state, *state.exact_trim_active_only, scheduler, exact_memory_budget);
     }
     if (finite_lazy_local_admission && capture_semantics &&
         state.exact_trim_active_only->keep_production_exact &&
@@ -11445,10 +11980,17 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     finite_iteration_envelope = chart_spr_search_detail::
         estimate_grammar_spr_finite_iteration_memory_envelope(
             state, enumeration.max_candidates, candidate_batch_size,
-            ranked_reserve_limit, capture_semantics, local_task_slots);
+            ranked_reserve_limit, capture_semantics, scheduler,
+            local_task_slots);
     state.counters.lazy_local_iteration_envelope_bytes_max =
         std::max(state.counters.lazy_local_iteration_envelope_bytes_max,
                  finite_iteration_envelope->planned_required_bytes);
+    state.counters.lazy_local_iteration_generation_phase_bytes_max = std::max(
+        state.counters.lazy_local_iteration_generation_phase_bytes_max,
+        finite_iteration_envelope->planned_generation_phase_required_bytes);
+    state.counters.lazy_local_iteration_evidence_phase_bytes_max = std::max(
+        state.counters.lazy_local_iteration_evidence_phase_bytes_max,
+        finite_iteration_envelope->planned_evidence_phase_required_bytes);
     state.counters.lazy_local_iteration_task_stable_bytes_max =
         std::max(state.counters.lazy_local_iteration_task_stable_bytes_max,
                  finite_iteration_envelope->planned_local_task_stable_bytes);
@@ -11495,6 +12037,9 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   if (finite_lazy_local_admission) {
     auto actual_with_future =
         estimate_chart_spr_published_state_resident_bytes(state);
+    actual_with_future = chart_spr_search_detail::local_capacity_checked_add(
+        actual_with_future, finite_scheduler_resident,
+        "chart SPR finite grammar scheduler ownership");
     actual_with_future = chart_spr_search_detail::local_capacity_checked_add(
         actual_with_future,
         workspace.local_admission_additional_resident_bytes(),
@@ -11547,6 +12092,9 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
 
   auto finite_actual_live_bytes = [&]() {
     auto total = estimate_chart_spr_published_state_resident_bytes(state);
+    total = chart_spr_search_detail::local_capacity_checked_add(
+        total, finite_scheduler_resident,
+        "chart SPR finite grammar live scheduler ownership");
     total = chart_spr_search_detail::local_capacity_checked_add(
         total, workspace.local_admission_additional_resident_bytes(),
         "chart SPR finite grammar live acceptance capacity");
@@ -11877,6 +12425,23 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         options.verification_mode ==
             chart_spr_verification_mode::transient &&
         static_cast<bool>(state.exact_multisite_verifier);
+    auto exact_candidate_worker_limit = resolved_workers;
+    if ((options.acceptance_mode ==
+             chart_spr_acceptance_mode::fixed_topology_exact &&
+         (state.fixed_topology_exact_verifier ||
+          (state.contextual_fixed_topology_exact_verifier &&
+           !state.fixed_topology_exact_verifier_parallel_safe))) ||
+        (options.acceptance_mode ==
+             chart_spr_acceptance_mode::exact_multisite &&
+         options.verification_mode == chart_spr_verification_mode::transient &&
+         (state.exact_multisite_verifier ||
+          (state.contextual_exact_multisite_verifier &&
+           !state.exact_multisite_verifier_parallel_safe)))) {
+      exact_candidate_worker_limit = 1;
+    }
+    auto const scheduler_resident =
+        chart_spr_search_detail::estimate_chart_spr_scheduler_resident_bytes(
+            scheduler);
 
     // Topology selection precedes the ordinary candidate estimate because its
     // complete certificate becomes verifier input.  Under a finite budget,
@@ -11888,6 +12453,9 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         !ranked.empty()) {
       auto selector_resident =
           estimate_chart_spr_published_state_resident_bytes(state);
+      selector_resident = chart_spr_exact_candidate_checked_bytes_add(
+          selector_resident, scheduler_resident,
+          "chart SPR topology-selector scheduler ownership");
       selector_resident = chart_spr_exact_candidate_checked_bytes_add(
           selector_resident,
           chart_spr_search_detail::estimate_exact_loop_resident_input_bytes(
@@ -11944,6 +12512,9 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     auto resident_exact_base =
         estimate_chart_spr_published_state_resident_bytes(state);
     resident_exact_base = chart_spr_exact_candidate_checked_bytes_add(
+        resident_exact_base, scheduler_resident,
+        "chart SPR exact-candidate scheduler ownership");
+    resident_exact_base = chart_spr_exact_candidate_checked_bytes_add(
         resident_exact_base,
         chart_spr_search_detail::estimate_exact_loop_resident_input_bytes(
             ranked, result),
@@ -11993,12 +12564,8 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         chart_spr_search_detail::
             estimate_exact_loop_estimator_peak_scratch_bytes(state, ranked),
         "chart SPR exact-candidate estimator scratch");
-    exact_loop_fixed_bytes = chart_spr_exact_candidate_checked_bytes_add(
-        exact_loop_fixed_bytes,
-        chart_spr_search_detail::
-            estimate_exact_loop_scheduler_operation_peak_bytes(
-                resolved_workers, !ranked.empty()),
-        "chart SPR exact-candidate scheduler-operation scratch");
+    auto const exact_range_options = chart_indexed_range_options{
+        .minimum_grain = 1, .target_ranges_per_worker = 1};
     resident_exact_base = chart_spr_exact_candidate_checked_bytes_add(
         resident_exact_base, exact_loop_fixed_bytes,
         "chart SPR exact-candidate resident fixed storage");
@@ -12012,31 +12579,92 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     verified.reserve(ranked.size());
     std::vector<chart_spr_search_detail::chart_spr_exact_candidate_slot> slots(
         ranked.size());
-    auto exact_candidate_worker_limit = resolved_workers;
-    if ((options.acceptance_mode ==
-             chart_spr_acceptance_mode::fixed_topology_exact &&
-         (state.fixed_topology_exact_verifier ||
-          (state.contextual_fixed_topology_exact_verifier &&
-           !state.fixed_topology_exact_verifier_parallel_safe))) ||
-        (options.acceptance_mode ==
-             chart_spr_acceptance_mode::exact_multisite &&
-         options.verification_mode ==
-             chart_spr_verification_mode::transient &&
-         (state.exact_multisite_verifier ||
-          (state.contextual_exact_multisite_verifier &&
-           !state.exact_multisite_verifier_parallel_safe)))) {
-      exact_candidate_worker_limit = 1;
-    }
     std::vector<chart_spr_exact_candidate_memory_estimate> memory_estimates;
     memory_estimates.reserve(ranked.size());
     auto memory_options = options;
     memory_options.cache.memory_budget_bytes = exact_memory_budget;
     for (auto const& candidate : ranked) {
-      memory_estimates.push_back(
-          candidate.valid ? estimate_chart_spr_exact_candidate_memory(
-                                state, candidate, memory_options,
-                                resolved_workers)
-                          : chart_spr_exact_candidate_memory_estimate{});
+      auto estimate =
+          candidate.valid
+              ? estimate_chart_spr_exact_candidate_memory(
+                    state, candidate, memory_options, resolved_workers)
+              : chart_spr_exact_candidate_memory_estimate{};
+      if (candidate.valid) {
+        estimate.inner_scheduler_scratch_bytes = chart_spr_search_detail::
+            estimate_chart_spr_exact_candidate_inner_scheduler_scratch_bytes(
+                state, candidate, memory_options, scheduler);
+      }
+      memory_estimates.push_back(estimate);
+    }
+
+    if (finite_lazy_local_admission && capture_semantics) {
+      std::size_t ranked_evidence_bytes = 0;
+      for (auto const& estimate : memory_estimates) {
+        if (!estimate.safely_bounded) {
+          ranked_evidence_bytes = (std::numeric_limits<std::size_t>::max)();
+          break;
+        }
+        ranked_evidence_bytes = chart_spr_exact_candidate_checked_bytes_add(
+            ranked_evidence_bytes, estimate.retained_result_bytes,
+            "chart SPR finite ranked exact-evidence bytes");
+      }
+      auto post_release_result =
+          ranked_evidence_bytes == (std::numeric_limits<std::size_t>::max)()
+              ? ranked_evidence_bytes
+              : chart_spr_exact_candidate_checked_bytes_add(
+                    finite_iteration_envelope
+                        ->planned_post_release_result_bytes,
+                    ranked_evidence_bytes,
+                    "chart SPR finite post-release candidate evidence");
+      auto const accepted_candidate_bytes = chart_spr_search_detail::
+          estimate_exact_loop_accepted_candidate_dynamic_bytes(ranked);
+      if (post_release_result != (std::numeric_limits<std::size_t>::max)()) {
+        post_release_result = chart_spr_exact_candidate_checked_bytes_add(
+            post_release_result, accepted_candidate_bytes,
+            "chart SPR finite accepted candidate ownership");
+      }
+      auto evidence_phase = post_release_result;
+      if (evidence_phase != (std::numeric_limits<std::size_t>::max)()) {
+        evidence_phase = chart_spr_exact_candidate_checked_bytes_add(
+            estimate_chart_spr_published_state_resident_bytes(state),
+            finite_scheduler_resident,
+            "chart SPR finite evidence scheduler ownership");
+        evidence_phase = chart_spr_exact_candidate_checked_bytes_add(
+            evidence_phase, post_release_result,
+            "chart SPR finite evidence retained result");
+        evidence_phase = chart_spr_exact_candidate_checked_bytes_add(
+            evidence_phase,
+            finite_iteration_envelope
+                ->planned_canonical_state_exact_evidence_construction_peak_bytes,
+            "chart SPR finite state-evidence construction");
+      }
+      finite_iteration_envelope->planned_ranked_candidate_exact_evidence_bytes =
+          ranked_evidence_bytes;
+      finite_iteration_envelope->planned_accepted_candidate_dynamic_bytes =
+          accepted_candidate_bytes;
+      finite_iteration_envelope->planned_post_release_result_bytes =
+          post_release_result;
+      finite_iteration_envelope->planned_evidence_phase_required_bytes =
+          evidence_phase;
+      finite_iteration_envelope->planned_required_bytes = std::max(
+          finite_iteration_envelope->planned_generation_phase_required_bytes,
+          evidence_phase);
+      state.counters.lazy_local_iteration_envelope_bytes_max =
+          std::max(state.counters.lazy_local_iteration_envelope_bytes_max,
+                   finite_iteration_envelope->planned_required_bytes);
+      state.counters.lazy_local_iteration_evidence_phase_bytes_max =
+          std::max(state.counters.lazy_local_iteration_evidence_phase_bytes_max,
+                   evidence_phase);
+      state.counters
+          .lazy_local_ranked_candidate_exact_evidence_bytes_max = std::max(
+          state.counters.lazy_local_ranked_candidate_exact_evidence_bytes_max,
+          ranked_evidence_bytes);
+      if (finite_iteration_envelope->planned_required_bytes >
+          exact_memory_budget) {
+        fail_finite_iteration_budget(
+            0, finite_iteration_envelope->planned_required_bytes,
+            exact_memory_budget);
+      }
     }
 
     auto run_candidate = [&](std::size_t rank,
@@ -12089,8 +12717,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       }
       auto wave = plan_chart_spr_exact_candidate_admission_wave(
           memory_estimates, wave_begin, exact_candidate_worker_limit,
-          available_bytes,
-          finite_budget);
+          available_bytes, finite_budget, &scheduler, exact_range_options);
       // The historical transient callback receives a scheduler reference and
       // may use it. It therefore cannot take the serial-scratch fallback that
       // a context-aware callback can select under pressure. Its forced
@@ -12102,7 +12729,9 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
             !estimate.safely_bounded
                 ? (std::numeric_limits<std::size_t>::max)()
                 : chart_spr_exact_candidate_saturating_bytes_add(
-                      estimate.inner_parallel_scratch_bytes,
+                      chart_spr_exact_candidate_saturating_bytes_add(
+                          estimate.inner_parallel_scratch_bytes,
+                          estimate.inner_scheduler_scratch_bytes),
                       estimate.retained_result_bytes);
         throw chart_spr_exact_candidate_budget_error(
             wave_begin, required, available_bytes);
@@ -12138,11 +12767,8 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       auto const wave_start = std::chrono::steady_clock::now();
       if (wave_count >= 2) {
         ++state.counters.exact_candidate_parallel_batches;
-        auto const range_options =
-            chart_indexed_range_options{.minimum_grain = 1,
-                                        .target_ranges_per_worker = 1};
         auto const range_plan =
-            scheduler.plan_indexed_ranges(wave_count, range_options);
+            scheduler.plan_indexed_ranges(wave_count, exact_range_options);
         if (wave_begin == 0 &&
             options.force_exact_candidate_submit_failure_after_for_tests) {
           auto const fail_after =
@@ -12158,7 +12784,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         auto const scheduler_before = scheduler.metrics();
         try {
           auto run = scheduler.for_each_indexed_range(
-              wave_count, range_options,
+              wave_count, exact_range_options,
               [&](chart_indexed_range const& range, std::size_t,
                   chart_scheduler_cancellation_token const&) {
                 for (std::size_t offset = range.begin; offset < range.end;
@@ -12258,16 +12884,24 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       verified.push_back(std::move(verified_candidate));
     }
 
+    chart_spr_candidate_score const* accepted_candidate = nullptr;
     for (auto const& candidate : verified) {
       if (!chart_spr_candidate_has_accepting_improvement(
               candidate, options.acceptance_mode)) {
         continue;
       }
-      if (!result.accepted || chart_spr_acceptance_candidate_better(
-                                  options.acceptance_mode, state.grammar,
-                                  candidate, *result.accepted)) {
-        result.accepted = candidate;
+      if (accepted_candidate == nullptr ||
+          chart_spr_acceptance_candidate_better(options.acceptance_mode,
+                                                state.grammar, candidate,
+                                                *accepted_candidate)) {
+        accepted_candidate = &candidate;
       }
+    }
+    // Select by reference, then copy the winner once. Repeated assignment to
+    // an engaged optional could otherwise allocate a new owning payload while
+    // the previous winner's destination buffers were still live.
+    if (accepted_candidate != nullptr) {
+      result.accepted = *accepted_candidate;
     }
     if (result.accepted) {
       auto const& accepted_score = chart_spr_candidate_acceptance_score(
@@ -12290,6 +12924,22 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     // encoded sample-id occurrence and the retained trim remains charged in
     // the published-state base exactly once.
     auto const& old_trim = *state.exact_trim_active_only;
+    if (finite_lazy_local_admission) {
+      auto const actual_before_evidence = finite_actual_live_bytes();
+      auto const required_with_construction =
+          chart_spr_search_detail::local_capacity_checked_add(
+              actual_before_evidence,
+              finite_iteration_envelope
+                  ->planned_canonical_state_exact_evidence_construction_peak_bytes,
+              "chart SPR canonical exact-evidence preflight");
+      if (required_with_construction > exact_memory_budget ||
+          required_with_construction >
+              finite_iteration_envelope
+                  ->planned_evidence_phase_required_bytes) {
+        fail_finite_iteration_budget(0, required_with_construction,
+                                     exact_memory_budget);
+      }
+    }
     auto evidence = chart_spr_canonicalize_search_trim_evidence(
         state.grammar, checked_state, state.active_patterns, state.chart_opts,
         options.exact_trim, old_trim, state.invariant_constant_offset);
@@ -12330,8 +12980,9 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     }
   }
   if (finite_lazy_local_admission &&
-      options.acceptance_mode ==
-          chart_spr_acceptance_mode::lower_bound_heuristic) {
+      (capture_semantics ||
+       options.acceptance_mode ==
+           chart_spr_acceptance_mode::lower_bound_heuristic)) {
     check_finite_actual_live(
         enumeration_seen_count == 0 ? 0 : enumeration_seen_count - 1);
   }
