@@ -3715,6 +3715,10 @@ static void run_chart_spr_candidate_diagnostic(
       << stats.candidates_pruned_after_construction << "\n";
   out << "    candidates_generated_after_dedup: "
       << stats.candidates_generated_after_dedup << "\n";
+  out << "    sampled_tree_projection_direct: "
+      << stats.sampled_tree_projection_direct << "\n";
+  out << "    sampled_tree_projection_fallback: "
+      << stats.sampled_tree_projection_fallback << "\n";
   out << "    pruned_root_or_trivial: "
       << stats.candidates_pruned_root_or_trivial << "\n";
   out << "    pruned_moved_size: " << stats.candidates_pruned_moved_size
@@ -3796,6 +3800,10 @@ static void print_chart_spr_generation_stats(
       << stats.candidates_pruned_after_construction << "\n";
   out << indent << "candidates_generated_after_dedup: "
       << stats.candidates_generated_after_dedup << "\n";
+  out << indent << "sampled_tree_projection_direct: "
+      << stats.sampled_tree_projection_direct << "\n";
+  out << indent << "sampled_tree_projection_fallback: "
+      << stats.sampled_tree_projection_fallback << "\n";
   out << indent << "pruned_root_or_trivial: "
       << stats.candidates_pruned_root_or_trivial << "\n";
   out << indent << "pruned_moved_size: "

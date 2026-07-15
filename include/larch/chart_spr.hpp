@@ -376,6 +376,8 @@ struct chart_spr_candidate_generation_stats {
   std::size_t sampled_tree_projection_active_worker_high_water = 0;
   std::size_t sampled_tree_projection_peak_wave_size = 0;
   std::size_t sampled_tree_projection_speculative_discarded = 0;
+  std::size_t sampled_tree_projection_direct = 0;
+  std::size_t sampled_tree_projection_fallback = 0;
   std::size_t sampled_tree_projection_estimated_peak_bytes = 0;
   std::uint64_t sampled_tree_projection_scheduler_handoff_stall_nanoseconds = 0;
   std::size_t sampled_tree_projection_cancellations = 0;
@@ -1148,9 +1150,9 @@ source_after_topology_refs_from_tree_keys(
 // Immutable before-side state shared by every projected move from one sampled
 // tree.  Preparation is deliberately the only operation that mutates the
 // source tree (to publish clade offsets); projection itself only reads this
-// snapshot and edits a task-local clone.  The base and tree are pinned borrows:
-// both objects must remain alive, at the same addresses, and unmodified until
-// every projection task using the context has joined.
+// snapshot.  The base and tree are pinned borrows: both objects must remain
+// alive, at the same addresses, and unmodified until every projection task
+// using the context has joined.
 class sampled_tree_projection_context {
  public:
   sampled_tree_projection_context(sampled_tree_projection_context const&) =
@@ -1172,6 +1174,10 @@ class sampled_tree_projection_context {
       const noexcept {
     return node_to_base_clade_;
   }
+  [[nodiscard]] std::vector<production_id> const& node_to_base_production()
+      const noexcept {
+    return node_to_base_production_;
+  }
   [[nodiscard]] std::set<production_taxa_key> const& before_keys()
       const noexcept {
     return before_keys_;
@@ -1183,6 +1189,9 @@ class sampled_tree_projection_context {
   [[nodiscard]] std::optional<std::vector<overlay_production_ref>> const&
   source_before_topology_refs() const noexcept {
     return source_before_topology_refs_;
+  }
+  [[nodiscard]] bool direct_projection_ready() const noexcept {
+    return direct_projection_ready_;
   }
 
  private:
@@ -1197,6 +1206,8 @@ class sampled_tree_projection_context {
         index_{tree} {
     node_to_base_clade_.assign(before_tree_grammar.node_to_clade.size(),
                                no_clade);
+    node_to_base_production_.assign(before_tree_grammar.node_to_clade.size(),
+                                    no_production);
     for (std::size_t node = 0; node < before_tree_grammar.node_to_clade.size();
          ++node) {
       auto tree_clade = before_tree_grammar.node_to_clade[node];
@@ -1209,14 +1220,35 @@ class sampled_tree_projection_context {
     }
 
     ordered_before_keys_.reserve(before_tree_grammar.productions.size());
+    ordered_before_parent_nodes_.reserve(
+        before_tree_grammar.productions.size());
     for (auto const& prod : before_tree_grammar.productions) {
       auto key = production_key_from_tree_in_base_taxa(
           base, before_tree_grammar, prod);
+      auto base_pid = find_base_production_by_key(base, base_lookup_, key);
+      if (!base_pid || prod.witnesses.size() != 1) {
+        direct_projection_ready_ = false;
+        ordered_before_parent_nodes_.push_back(
+            (std::numeric_limits<std::size_t>::max)());
+      } else {
+        auto const parent_node = prod.witnesses.front().parent_node;
+        if (parent_node >= node_to_base_production_.size() ||
+            node_to_base_production_[parent_node] != no_production) {
+          direct_projection_ready_ = false;
+          ordered_before_parent_nodes_.push_back(
+              (std::numeric_limits<std::size_t>::max)());
+        } else {
+          node_to_base_production_[parent_node] = *base_pid;
+          ordered_before_parent_nodes_.push_back(parent_node);
+        }
+      }
       before_keys_.insert(key);
       ordered_before_keys_.push_back(std::move(key));
     }
     source_before_topology_refs_ = source_before_topology_refs_from_tree_keys(
         base, base_lookup_, ordered_before_keys_);
+    direct_projection_ready_ =
+        direct_projection_ready_ && source_before_topology_refs_.has_value();
   }
 
   friend sampled_tree_projection_context prepare_sampled_tree_projection(
@@ -1226,11 +1258,18 @@ class sampled_tree_projection_context {
   phylo_dag const* tree_ = nullptr;
   std::map<std::vector<taxon_id>, clade_id> base_lookup_;
   std::vector<clade_id> node_to_base_clade_;
+  std::vector<production_id> node_to_base_production_;
   std::set<production_taxa_key> before_keys_;
   std::vector<production_taxa_key> ordered_before_keys_;
+  std::vector<std::size_t> ordered_before_parent_nodes_;
   std::optional<std::vector<overlay_production_ref>>
       source_before_topology_refs_;
+  bool direct_projection_ready_ = true;
   tree_index index_;
+
+  friend std::optional<std::vector<production_taxa_key>>
+  sampled_tree_direct_after_keys(sampled_tree_projection_context const&,
+                                 spr_move const&);
 };
 
 inline sampled_tree_projection_context prepare_sampled_tree_projection(
@@ -1250,6 +1289,12 @@ struct sampled_tree_projection_job {
   profitable_move move{};
 };
 
+enum class sampled_tree_projection_path : std::uint8_t {
+  not_attempted,
+  direct,
+  clone_fallback,
+};
+
 struct sampled_tree_projection_execution_stats {
   std::size_t moves_preassigned = 0;
   std::size_t waves = 0;
@@ -1260,6 +1305,8 @@ struct sampled_tree_projection_execution_stats {
   std::size_t active_worker_high_water = 0;
   std::size_t peak_wave_size = 0;
   std::size_t speculative_discarded = 0;
+  std::size_t direct_projections = 0;
+  std::size_t fallback_projections = 0;
   std::uint64_t scheduler_handoff_stall_nanoseconds = 0;
   bool cancelled = false;
   sampled_tree_projection_memory_estimate memory;
@@ -1838,10 +1885,12 @@ estimate_sampled_tree_projection_memory(
   }
 
   result.wave_slot_and_payload_bytes =
-      sizeof(std::vector<std::optional<grammar_spr_candidate>>);
+      sizeof(std::vector<std::optional<grammar_spr_candidate>>) +
+      sizeof(std::vector<sampled_tree_projection_path>);
   auto const per_slot = sampled_tree_projection_saturating_add(
-      sizeof(std::optional<grammar_spr_candidate>), retained,
-      result.safely_bounded);
+      sizeof(std::optional<grammar_spr_candidate>) +
+          sizeof(sampled_tree_projection_path),
+      retained, result.safely_bounded);
   result.wave_slot_and_payload_bytes = sampled_tree_projection_saturating_add(
       result.wave_slot_and_payload_bytes,
       sampled_tree_projection_saturating_multiply(wave_size, per_slot,
@@ -2038,25 +2087,17 @@ inline std::optional<grammar_spr_candidate> make_candidate_from_tree_diff(
   return candidate;
 }
 
-// Prepared equivalent of make_candidate_from_tree_diff().  The before-side
-// production keys, base lookup, node mapping, and topology certificate were
-// computed once at the sampled-tree publication boundary.
 inline std::optional<grammar_spr_candidate>
-make_candidate_from_tree_diff_prepared(
+make_candidate_from_ordered_tree_keys_prepared(
     sampled_tree_projection_context const& prepared,
-    clade_grammar const& after_tree, grammar_spr_candidate candidate) {
+    std::vector<production_taxa_key> const& ordered_after_keys,
+    grammar_spr_candidate candidate) {
   auto const& base = prepared.base();
   auto const& base_lookup = prepared.base_lookup();
   std::map<std::vector<taxon_id>, clade_id> temp_lookup;
 
   std::set<production_taxa_key> after_keys;
-  std::vector<production_taxa_key> ordered_after_keys;
-  ordered_after_keys.reserve(after_tree.productions.size());
-  for (auto const& prod : after_tree.productions) {
-    auto key = production_key_from_tree_in_base_taxa(base, after_tree, prod);
-    after_keys.insert(key);
-    ordered_after_keys.push_back(std::move(key));
-  }
+  after_keys.insert(ordered_after_keys.begin(), ordered_after_keys.end());
 
   for (auto const& key : prepared.ordered_before_keys()) {
     if (after_keys.contains(key)) continue;
@@ -2095,6 +2136,23 @@ make_candidate_from_tree_diff_prepared(
     candidate.source_after_topology_productions = std::move(*source_after);
   }
   return candidate;
+}
+
+// Prepared equivalent of make_candidate_from_tree_diff().  The before-side
+// production keys, base lookup, node mapping, and topology certificate were
+// computed once at the sampled-tree publication boundary.
+inline std::optional<grammar_spr_candidate>
+make_candidate_from_tree_diff_prepared(
+    sampled_tree_projection_context const& prepared,
+    clade_grammar const& after_tree, grammar_spr_candidate candidate) {
+  std::vector<production_taxa_key> ordered_after_keys;
+  ordered_after_keys.reserve(after_tree.productions.size());
+  for (auto const& prod : after_tree.productions) {
+    ordered_after_keys.push_back(production_key_from_tree_in_base_taxa(
+        prepared.base(), after_tree, prod));
+  }
+  return make_candidate_from_ordered_tree_keys_prepared(
+      prepared, ordered_after_keys, std::move(candidate));
 }
 
 struct upward_path_step {
@@ -2424,6 +2482,363 @@ inline std::optional<grammar_spr_candidate> make_general_spr_candidate(
     return std::nullopt;
   }
   return candidate;
+}
+
+// Recover the one upward path selected by the sampled tree rather than
+// enumerating every parent production in the base grammar.  The prepared
+// node-to-production map was compiled from the before-tree witnesses, so a
+// missing entry is a direct-path prerequisite failure rather than an invalid
+// SPR move.
+inline std::optional<upward_path> sampled_tree_selected_upward_path(
+    sampled_tree_projection_context const& prepared, std::size_t start_node) {
+  auto const& grammar = prepared.base();
+  auto const& index = prepared.index();
+  auto const& node_to_clade = prepared.node_to_base_clade();
+  auto const& node_to_production = prepared.node_to_base_production();
+  if (!index.is_valid(start_node) || start_node >= node_to_clade.size()) {
+    return std::nullopt;
+  }
+
+  auto node = start_node;
+  auto child = node_to_clade[node];
+  if (child == no_clade) return std::nullopt;
+  upward_path path;
+  path.reserve(index.get_dfs_info(node).level);
+  for (std::size_t steps = 0; child != grammar.root_clade; ++steps) {
+    if (steps >= index.num_nodes() || node == index.get_tree_root()) {
+      return std::nullopt;
+    }
+    auto const parent_node = index.get_parent(node);
+    if (parent_node >= node_to_clade.size() ||
+        parent_node >= node_to_production.size()) {
+      return std::nullopt;
+    }
+    auto const parent = node_to_clade[parent_node];
+    auto const production = node_to_production[parent_node];
+    if (parent == no_clade || production == no_production ||
+        production >= grammar.productions.size() ||
+        grammar.productions[production].parent != parent) {
+      return std::nullopt;
+    }
+    auto cochildren = cochildren_of(grammar, production, child);
+    if (!cochildren) return std::nullopt;
+    path.push_back(
+        upward_path_step{production, parent, child, std::move(*cochildren)});
+    node = parent_node;
+    child = parent;
+  }
+  return path;
+}
+
+inline bool production_taxa_key_tree_order_less(
+    production_taxa_key const& lhs, production_taxa_key const& rhs) {
+  auto clade_less = [](std::vector<taxon_id> const& first,
+                       std::vector<taxon_id> const& second) {
+    if (first.size() != second.size()) return first.size() < second.size();
+    return first < second;
+  };
+  if (lhs.parent != rhs.parent) return clade_less(lhs.parent, rhs.parent);
+
+  // A selected tree has one production per non-leaf clade.  Retain the full
+  // grammar builder ordering for malformed/duplicate-parent prerequisites so
+  // that the caller can reject them deterministically below.
+  auto first_children = lhs.children;
+  auto second_children = rhs.children;
+  std::sort(first_children.begin(), first_children.end(), clade_less);
+  std::sort(second_children.begin(), second_children.end(), clade_less);
+  return std::lexicographical_compare(
+      first_children.begin(), first_children.end(), second_children.begin(),
+      second_children.end(), clade_less);
+}
+
+// Build the post-SPR selected-tree production keys without cloning a
+// phylo_dag.  Unaffected node keys are copied from the immutable prepared
+// snapshot; only the two ancestor chains are re-evaluated through a virtual
+// source-parent collapse and destination insertion.
+inline std::optional<std::vector<production_taxa_key>>
+sampled_tree_direct_after_keys(sampled_tree_projection_context const& prepared,
+                               spr_move const& move) {
+  auto const& base = prepared.base();
+  auto const& index = prepared.index();
+  auto const& node_to_clade = prepared.node_to_base_clade();
+  auto const node_count = index.num_nodes();
+  if (!index.is_valid(move.src) || !index.is_valid(move.dst) ||
+      move.src == move.dst || move.src == index.get_tree_root() ||
+      index.is_ancestor(move.src, move.dst)) {
+    return std::nullopt;
+  }
+
+  auto const source_parent = index.get_parent(move.src);
+  if (!index.is_valid(source_parent) ||
+      index.get_num_children(source_parent) != 2) {
+    return std::nullopt;
+  }
+  auto const& source_children = index.get_children(source_parent);
+  auto sibling_it = std::find_if(source_children.begin(), source_children.end(),
+                                 [&](auto child) { return child != move.src; });
+  if (sibling_it == source_children.end()) return std::nullopt;
+  auto const source_sibling = *sibling_it;
+  auto const source_grandparent = index.get_parent(source_parent);
+  auto const destination_parent = index.get_parent(move.dst);
+  if (destination_parent == source_parent) return std::nullopt;
+
+  auto const virtual_inner = node_count;
+  std::vector<std::uint8_t> affected(node_count, 0);
+  auto mark_ancestors = [&](std::size_t node) {
+    for (std::size_t steps = 0; steps < node_count && index.is_valid(node);
+         ++steps) {
+      affected[node] = 1;
+      if (node == index.get_tree_root()) return true;
+      node = index.get_parent(node);
+    }
+    return false;
+  };
+  if (!mark_ancestors(source_parent) || (index.is_valid(destination_parent) &&
+                                         !mark_ancestors(destination_parent))) {
+    return std::nullopt;
+  }
+
+  std::vector<std::optional<std::vector<taxon_id>>> taxa_cache(node_count + 1);
+  std::vector<std::uint8_t> visiting(node_count + 1, 0);
+  auto after_taxa =
+      [&](auto&& self,
+          std::size_t node) -> std::optional<std::vector<taxon_id>> {
+    if (node > virtual_inner) return std::nullopt;
+    if (taxa_cache[node]) return taxa_cache[node];
+    if (visiting[node]) return std::nullopt;
+    visiting[node] = 1;
+
+    if (node != virtual_inner && !affected[node]) {
+      if (node >= node_to_clade.size() || node_to_clade[node] == no_clade ||
+          node_to_clade[node] >= base.clades.size()) {
+        visiting[node] = 0;
+        return std::nullopt;
+      }
+      taxa_cache[node] = base.clades[node_to_clade[node]].taxa;
+      visiting[node] = 0;
+      return taxa_cache[node];
+    }
+
+    std::vector<std::size_t> children;
+    if (node == virtual_inner) {
+      children = {move.dst, move.src};
+    } else {
+      if (!index.is_valid(node) || node == source_parent) {
+        visiting[node] = 0;
+        return std::nullopt;
+      }
+      children = index.get_children(node);
+      if (node == source_grandparent) {
+        auto found = std::find(children.begin(), children.end(), source_parent);
+        if (found == children.end()) {
+          visiting[node] = 0;
+          return std::nullopt;
+        }
+        *found = source_sibling;
+      }
+      if (node == destination_parent) {
+        auto found = std::find(children.begin(), children.end(), move.dst);
+        if (found == children.end()) {
+          visiting[node] = 0;
+          return std::nullopt;
+        }
+        *found = virtual_inner;
+      }
+    }
+
+    std::vector<taxon_id> taxa;
+    for (auto child : children) {
+      auto child_taxa = self(self, child);
+      if (!child_taxa || !disjoint_taxa(taxa, *child_taxa)) {
+        visiting[node] = 0;
+        return std::nullopt;
+      }
+      taxa = set_union_taxa(std::move(taxa), *child_taxa);
+    }
+    if (taxa.empty()) {
+      visiting[node] = 0;
+      return std::nullopt;
+    }
+    taxa_cache[node] = std::move(taxa);
+    visiting[node] = 0;
+    return taxa_cache[node];
+  };
+
+  auto make_key = [&](std::size_t node) -> std::optional<production_taxa_key> {
+    auto parent_taxa = after_taxa(after_taxa, node);
+    if (!parent_taxa) return std::nullopt;
+    std::vector<std::size_t> children;
+    if (node == virtual_inner) {
+      children = {move.dst, move.src};
+    } else {
+      children = index.get_children(node);
+      if (node == source_grandparent) {
+        auto found = std::find(children.begin(), children.end(), source_parent);
+        if (found == children.end()) return std::nullopt;
+        *found = source_sibling;
+      }
+      if (node == destination_parent) {
+        auto found = std::find(children.begin(), children.end(), move.dst);
+        if (found == children.end()) return std::nullopt;
+        *found = virtual_inner;
+      }
+    }
+    production_taxa_key key;
+    key.parent = std::move(*parent_taxa);
+    key.children.reserve(children.size());
+    for (auto child : children) {
+      auto child_taxa = after_taxa(after_taxa, child);
+      if (!child_taxa) return std::nullopt;
+      key.children.push_back(std::move(*child_taxa));
+    }
+    normalize_production_taxa_key(key);
+    return key;
+  };
+
+  std::vector<production_taxa_key> keys;
+  keys.reserve(prepared.ordered_before_keys_.size());
+  for (std::size_t i = 0; i < prepared.ordered_before_keys_.size(); ++i) {
+    auto const parent_node = prepared.ordered_before_parent_nodes_[i];
+    if (parent_node == (std::numeric_limits<std::size_t>::max)()) {
+      return std::nullopt;
+    }
+    if (parent_node == source_parent) continue;
+    if (parent_node < affected.size() && affected[parent_node]) {
+      auto key = make_key(parent_node);
+      if (!key) return std::nullopt;
+      keys.push_back(std::move(*key));
+    } else {
+      keys.push_back(prepared.ordered_before_keys_[i]);
+    }
+  }
+  auto inserted = make_key(virtual_inner);
+  if (!inserted) return std::nullopt;
+  keys.push_back(std::move(*inserted));
+  if (keys.size() != prepared.ordered_before_keys_.size()) {
+    return std::nullopt;
+  }
+  std::sort(keys.begin(), keys.end(), production_taxa_key_tree_order_less);
+  for (std::size_t i = 1; i < keys.size(); ++i) {
+    if (keys[i - 1].parent == keys[i].parent) return std::nullopt;
+  }
+  return keys;
+}
+
+struct sampled_tree_direct_projection_result {
+  bool prerequisites_met = false;
+  std::optional<grammar_spr_candidate> candidate;
+};
+
+inline sampled_tree_direct_projection_result project_sampled_tree_move_direct(
+    sampled_tree_projection_context const& prepared, spr_move const& move) {
+  if (!prepared.direct_projection_ready()) return {};
+  auto const& grammar = prepared.base();
+  auto const& index = prepared.index();
+  auto const& node_to_clade = prepared.node_to_base_clade();
+  auto const& node_to_production = prepared.node_to_base_production();
+  if (!index.is_valid(move.src) || !index.is_valid(move.dst)) return {};
+  auto const source_parent_node = index.get_parent(move.src);
+  if (move.src >= node_to_clade.size() || move.dst >= node_to_clade.size() ||
+      source_parent_node >= node_to_production.size()) {
+    return {};
+  }
+  auto const moved = node_to_clade[move.src];
+  auto const target = node_to_clade[move.dst];
+  auto const source_production = node_to_production[source_parent_node];
+  if (moved == no_clade || target == no_clade ||
+      source_production == no_production) {
+    return {};
+  }
+  auto source_path =
+      sampled_tree_selected_upward_path(prepared, source_parent_node);
+  auto destination_path = sampled_tree_selected_upward_path(prepared, move.dst);
+  if (!source_path || !destination_path) return {};
+
+  auto candidate = make_general_spr_candidate(grammar, prepared.base_lookup(),
+                                              source_production, moved, target,
+                                              *source_path, *destination_path);
+  if (!candidate) return {true, std::nullopt};
+
+  auto after_keys = sampled_tree_direct_after_keys(prepared, move);
+  if (!after_keys) return {};
+  grammar_spr_candidate ordered_candidate;
+  ordered_candidate.moved_clade = candidate->moved_clade;
+  ordered_candidate.old_parent = candidate->old_parent;
+  ordered_candidate.old_sibling = candidate->old_sibling;
+  ordered_candidate.new_sibling_or_target = candidate->new_sibling_or_target;
+  ordered_candidate.source_tree_move = move;
+  return {true, make_candidate_from_ordered_tree_keys_prepared(
+                    prepared, *after_keys, std::move(ordered_candidate))};
+}
+
+struct sampled_tree_projected_candidate {
+  std::optional<grammar_spr_candidate> candidate;
+  sampled_tree_projection_path path =
+      sampled_tree_projection_path::not_attempted;
+};
+
+// The path tag is deliberately returned with the task-local result.  Parallel
+// callers reduce it only after their worker operation has joined, avoiding a
+// shared diagnostic counter in the projection hot path.
+inline sampled_tree_projected_candidate project_sampled_tree_move_with_path(
+    sampled_tree_projection_context const& prepared, spr_move const& move) {
+  auto const& base = prepared.base();
+  auto const& tree = prepared.source_tree();
+  auto const& index = prepared.index();
+  if (!index.is_valid(move.src) || !index.is_valid(move.dst) ||
+      move.src == move.dst || move.src == index.get_tree_root() ||
+      index.is_ancestor(move.src, move.dst)) {
+    return {};
+  }
+
+  auto const source_parent_node = index.get_parent(move.src);
+  if (index.get_num_children(source_parent_node) != 2) return {};
+  auto direct = project_sampled_tree_move_direct(prepared, move);
+  if (direct.prerequisites_met) {
+    return {std::move(direct.candidate), sampled_tree_projection_path::direct};
+  }
+
+  auto mapped_clade = [&](std::size_t node) -> std::optional<clade_id> {
+    if (node >= prepared.node_to_base_clade().size()) return std::nullopt;
+    auto const clade = prepared.node_to_base_clade()[node];
+    if (clade == no_clade) return std::nullopt;
+    return clade;
+  };
+  auto moved = mapped_clade(move.src);
+  auto old_parent = mapped_clade(source_parent_node);
+  auto target = mapped_clade(move.dst);
+  if (!moved || !old_parent || !target) return {};
+
+  std::optional<clade_id> old_sibling;
+  for (auto child : index.get_children(source_parent_node)) {
+    if (child == move.src) continue;
+    old_sibling = mapped_clade(child);
+  }
+  if (!old_sibling) return {};
+
+  grammar_spr_candidate candidate;
+  candidate.moved_clade = base_clade_ref(*moved);
+  candidate.old_parent = base_clade_ref(*old_parent);
+  candidate.old_sibling = base_clade_ref(*old_sibling);
+  candidate.new_sibling_or_target = base_clade_ref(*target);
+  candidate.source_tree_move = move;
+
+  auto after_tree = apply_spr_move_topology_only(tree, move.src, move.dst);
+  build_clade_offsets(after_tree);
+  auto after_tree_grammar = build_clade_grammar(after_tree);
+  return {make_candidate_from_tree_diff_prepared(prepared, after_tree_grammar,
+                                                 std::move(candidate)),
+          sampled_tree_projection_path::clone_fallback};
+}
+
+inline sampled_tree_projected_candidate project_sampled_tree_move_with_path(
+    sampled_tree_projection_context const& prepared,
+    profitable_move const& move) {
+  spr_move source{.src = move.src,
+                  .dst = move.dst,
+                  .lca = move.lca,
+                  .score_change = move.score_change};
+  return project_sampled_tree_move_with_path(prepared, source);
 }
 
 inline void append_deduplicated_candidate(
@@ -3790,52 +4205,8 @@ inline std::vector<grammar_spr_candidate> enumerate_grammar_spr_candidates(
 inline std::optional<grammar_spr_candidate> project_tree_spr_move_to_candidate(
     chart_spr_detail::sampled_tree_projection_context const& prepared,
     spr_move const& move) {
-  using namespace chart_spr_detail;
-  auto const& base = prepared.base();
-  auto& tree = prepared.source_tree();
-  auto const& index = prepared.index();
-
-  if (!index.is_valid(move.src) || !index.is_valid(move.dst)) return std::nullopt;
-  if (move.src == move.dst || move.src == index.get_tree_root())
-    return std::nullopt;
-  if (index.is_ancestor(move.src, move.dst)) return std::nullopt;
-
-  auto src_parent_node = index.get_parent(move.src);
-  if (index.get_num_children(src_parent_node) != 2) return std::nullopt;
-
-  auto mapped_clade = [&](std::size_t node) -> std::optional<clade_id> {
-    if (node >= prepared.node_to_base_clade().size()) return std::nullopt;
-    auto clade = prepared.node_to_base_clade()[node];
-    if (clade == no_clade) return std::nullopt;
-    return clade;
-  };
-  auto moved = mapped_clade(move.src);
-  auto old_parent = mapped_clade(src_parent_node);
-  auto target = mapped_clade(move.dst);
-  if (!moved || !old_parent || !target) return std::nullopt;
-
-  std::optional<clade_id> old_sibling;
-  for (auto child : index.get_children(src_parent_node)) {
-    if (child == move.src) continue;
-    old_sibling = mapped_clade(child);
-  }
-  if (!old_sibling) return std::nullopt;
-
-  grammar_spr_candidate candidate;
-  candidate.moved_clade = base_clade_ref(*moved);
-  candidate.old_parent = base_clade_ref(*old_parent);
-  candidate.old_sibling = base_clade_ref(*old_sibling);
-  candidate.new_sibling_or_target = base_clade_ref(*target);
-  candidate.source_tree_move = move;
-
-  auto after_tree = apply_spr_move_topology_only(tree, move.src, move.dst);
-  // The topology edit invalidates the clone's inherited CSR offsets.  Rebuild
-  // on this task-local object before deriving descendant-taxon clades.
-  build_clade_offsets(after_tree);
-  auto after_tree_grammar = build_clade_grammar(after_tree);
-
-  return make_candidate_from_tree_diff_prepared(prepared, after_tree_grammar,
-                                                std::move(candidate));
+  return chart_spr_detail::project_sampled_tree_move_with_path(prepared, move)
+      .candidate;
 }
 
 inline std::optional<grammar_spr_candidate> project_tree_spr_move_to_candidate(
@@ -4168,6 +4539,8 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
   // Admission was completed before the all-moves vector; it therefore also
   // precedes this owning result wave and scheduler operation storage.
   std::vector<std::optional<grammar_spr_candidate>> slots(wave_size);
+  std::vector<sampled_tree_projection_path> paths(
+      wave_size, sampled_tree_projection_path::not_attempted);
 
   if (scheduler != nullptr &&
       options.force_sampled_tree_projection_submit_failure_after_for_tests) {
@@ -4182,6 +4555,7 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
     auto const count = std::min(wave_size, jobs.size() - wave_begin);
     for (std::size_t local = 0; local < count; ++local) {
       slots[local].reset();
+      paths[local] = sampled_tree_projection_path::not_attempted;
     }
 
     if (scheduler == nullptr) {
@@ -4189,7 +4563,9 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
       if (options.before_sampled_tree_projection_for_tests) {
         options.before_sampled_tree_projection_for_tests(job.ordinal);
       }
-      slots[0] = project_tree_spr_move_to_candidate(prepared, job.move);
+      auto projected = project_sampled_tree_move_with_path(prepared, job.move);
+      slots[0] = std::move(projected.candidate);
+      paths[0] = projected.path;
     } else {
       chart_scheduler_run_summary failed_summary;
       std::unique_lock<std::mutex> scheduler_handoff;
@@ -4226,8 +4602,10 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
                 if (options.before_sampled_tree_projection_for_tests) {
                   options.before_sampled_tree_projection_for_tests(job.ordinal);
                 }
-                slots[local] =
-                    project_tree_spr_move_to_candidate(prepared, job.move);
+                auto projected =
+                    project_sampled_tree_move_with_path(prepared, job.move);
+                slots[local] = std::move(projected.candidate);
+                paths[local] = projected.path;
               }
             },
             &failed_summary);
@@ -4250,6 +4628,13 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
       result.worker_tasks += summary.worker_tasks_submitted;
       result.active_worker_high_water =
           std::max(result.active_worker_high_water, summary.active_workers);
+    }
+    for (std::size_t local = 0; local < count; ++local) {
+      if (paths[local] == sampled_tree_projection_path::direct) {
+        ++result.direct_projections;
+      } else if (paths[local] == sampled_tree_projection_path::clone_fallback) {
+        ++result.fallback_projections;
+      }
     }
     ++result.waves;
 
@@ -4986,6 +5371,8 @@ inline void add_generation_count_stats(
                src.sampled_tree_projection_peak_wave_size);
   dst.sampled_tree_projection_speculative_discarded +=
       src.sampled_tree_projection_speculative_discarded;
+  dst.sampled_tree_projection_direct += src.sampled_tree_projection_direct;
+  dst.sampled_tree_projection_fallback += src.sampled_tree_projection_fallback;
   dst.sampled_tree_projection_estimated_peak_bytes =
       std::max(dst.sampled_tree_projection_estimated_peak_bytes,
                src.sampled_tree_projection_estimated_peak_bytes);
@@ -5139,6 +5526,8 @@ chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
                  execution.peak_projection_wave_size);
     stats.sampled_tree_projection_speculative_discarded +=
         execution.projection_speculative_discarded;
+    stats.sampled_tree_projection_direct += execution.direct_projections;
+    stats.sampled_tree_projection_fallback += execution.fallback_projections;
     stats.sampled_tree_projection_scheduler_handoff_stall_nanoseconds +=
         execution.scheduler_handoff_stall_nanoseconds;
     stats.sampled_tree_source_waves += execution.source_waves;

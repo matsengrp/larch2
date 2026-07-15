@@ -88,6 +88,22 @@ static larch::test::tiny_tree_node four_taxon_cross_tree() {
        tiny_inner("BD", "A", {tiny_leaf("B", "A"), tiny_leaf("D", "C")})});
 }
 
+static larch::test::tiny_tree_node eight_taxon_balanced_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "A",
+      {tiny_inner(
+           "ABCD", "A",
+           {tiny_inner("AB", "A", {tiny_leaf("A", "A"), tiny_leaf("B", "A")}),
+            tiny_inner("CD", "C", {tiny_leaf("C", "C"), tiny_leaf("D", "C")})}),
+       tiny_inner(
+           "EFGH", "A",
+           {tiny_inner("EF", "A", {tiny_leaf("E", "A"), tiny_leaf("F", "A")}),
+            tiny_inner("GH", "C",
+                       {tiny_leaf("G", "C"), tiny_leaf("H", "C")})})});
+}
+
 static larch::taxon_id taxon_for(larch::clade_grammar const& grammar,
                                  std::string const& sample_id) {
   auto it = grammar.taxa.sample_id_to_id.find(sample_id);
@@ -717,7 +733,11 @@ static void check_prepared_projection_fixture(std::string const& label,
                          .score_change = emitted.score_change};
     auto expected =
         project_tree_spr_move_annotated_oracle(base, oracle_tree, move);
-    auto actual = larch::project_tree_spr_move_to_candidate(prepared, move);
+    auto direct = larch::chart_spr_detail::project_sampled_tree_move_with_path(
+        prepared, move);
+    CHECK(direct.path ==
+          larch::chart_spr_detail::sampled_tree_projection_path::direct);
+    auto actual = std::move(direct.candidate);
     auto profitable_actual =
         larch::project_tree_spr_move_to_candidate(prepared, emitted);
     auto legacy_actual =
@@ -784,6 +804,11 @@ static void test_phase8_prepared_projection_differential_all_emitted_moves() {
       larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
   auto binary_grammar = larch::build_clade_grammar(binary_tree);
   check_prepared_projection_fixture("binary", binary_grammar, binary_tree);
+
+  auto deeper_tree =
+      larch::test::make_tiny_labelled_tree("A", eight_taxon_balanced_tree());
+  auto deeper_grammar = larch::build_clade_grammar(deeper_tree);
+  check_prepared_projection_fixture("eight-taxon", deeper_grammar, deeper_tree);
 
   std::vector<larch::phylo_dag> source_trees;
   source_trees.push_back(
@@ -885,6 +910,8 @@ static void test_phase8_parallel_sampled_projection_is_deterministic() {
       CHECK(stats.sampled_tree_projection_peak_wave_size ==
             std::min(stats.sampled_tree_projection_moves_preassigned,
                      workers * 4));
+      CHECK(stats.sampled_tree_projection_direct > 0);
+      CHECK(stats.sampled_tree_projection_fallback == 0);
       CHECK(stats.sampled_tree_projection_estimated_peak_bytes > 0);
       CHECK(stats.sampled_tree_source_actual_peak_bytes >=
             stats.sampled_tree_projection_estimated_peak_bytes);
