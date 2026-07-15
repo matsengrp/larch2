@@ -727,11 +727,12 @@ static void test_phase7_lazy_auto_budget_and_freeze_contract() {
   std::println("  PASS");
 }
 
-static std::array<larch::chart_spr_scheduler_axis_metrics const*, 12>
+static std::array<larch::chart_spr_scheduler_axis_metrics const*, 13>
 phase4_scheduler_axes(
     larch::chart_spr_scheduler_axis_counters const& counters) {
   return {
       &counters.initial_chart_patterns,
+      &counters.candidate_generation,
       &counters.exact_setup_patterns,
       &counters.exact_frontier_clades,
       &counters.exact_candidates,

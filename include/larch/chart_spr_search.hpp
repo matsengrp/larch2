@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -19,6 +20,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <numeric>
 #include <optional>
@@ -52,6 +54,7 @@ struct chart_spr_scheduler_axis_metrics {
 
 struct chart_spr_scheduler_axis_counters {
   chart_spr_scheduler_axis_metrics initial_chart_patterns;
+  chart_spr_scheduler_axis_metrics candidate_generation;
   chart_spr_scheduler_axis_metrics exact_setup_patterns;
   chart_spr_scheduler_axis_metrics exact_frontier_clades;
   chart_spr_scheduler_axis_metrics exact_candidates;
@@ -223,6 +226,8 @@ inline void add_chart_spr_scheduler_axis_counters(
     chart_spr_scheduler_axis_counters const& src) {
   add_chart_spr_scheduler_axis_metrics(dst.initial_chart_patterns,
                                        src.initial_chart_patterns);
+  add_chart_spr_scheduler_axis_metrics(dst.candidate_generation,
+                                       src.candidate_generation);
   add_chart_spr_scheduler_axis_metrics(dst.exact_setup_patterns,
                                        src.exact_setup_patterns);
   add_chart_spr_scheduler_axis_metrics(dst.exact_frontier_clades,
@@ -249,6 +254,7 @@ inline void add_chart_spr_scheduler_axis_counters(
 inline std::uint64_t chart_spr_scheduler_axis_operation_count(
     chart_spr_scheduler_axis_counters const& axes) noexcept {
   return axes.initial_chart_patterns.operations +
+         axes.candidate_generation.operations +
          axes.exact_setup_patterns.operations +
          axes.exact_frontier_clades.operations +
          axes.exact_candidates.operations + axes.lazy_inside_clades.operations +
@@ -448,6 +454,20 @@ struct chart_spr_search_counters {
   std::size_t spr_multifurcation_moves_generated = 0;
   std::size_t candidate_cap_cutoffs = 0;
   std::size_t path_budget_cutoffs = 0;
+  std::size_t candidate_pipeline_batches_generated = 0;
+  std::size_t candidate_pipeline_batches_scored = 0;
+  std::size_t candidate_pipeline_serial_overlap_batches = 0;
+  std::size_t candidate_pipeline_scheduler_projection_overlap_batches = 0;
+  std::size_t candidate_pipeline_producer_stalls = 0;
+  std::size_t candidate_pipeline_consumer_stalls = 0;
+  std::uint64_t candidate_pipeline_producer_stall_nanoseconds = 0;
+  std::uint64_t candidate_pipeline_consumer_stall_nanoseconds = 0;
+  std::size_t candidate_pipeline_cancellations = 0;
+  std::size_t candidate_pipeline_stale_batches_discarded = 0;
+  std::size_t candidate_pipeline_stale_candidates_discarded = 0;
+  std::size_t candidate_pipeline_state_epoch_rejections = 0;
+  std::size_t candidate_pipeline_generation_errors = 0;
+  std::size_t candidate_pipeline_estimated_peak_bytes = 0;
 
   // Overlay validation/reachability counters.
   std::size_t overlay_reachability_validations = 0;
@@ -1232,6 +1252,22 @@ struct chart_spr_search_options {
   // precedence without perturbing earlier scheduler operations.
   std::optional<std::size_t>
       force_exact_candidate_submit_failure_after_for_tests;
+
+  // Phase-8 bounded candidate-generation pipeline.  Explicit W1 always keeps
+  // the historical serial generator/scorer order.  Multi-worker callers may
+  // opt out to retain that path for profiling or stop-rule fallback.
+  bool enable_candidate_generation_pipeline = true;
+  std::optional<std::size_t>
+      force_candidate_pipeline_generation_failure_after_for_tests;
+  std::optional<std::size_t>
+      force_candidate_pipeline_scoring_failure_after_batches_for_tests;
+  std::optional<std::size_t>
+      force_candidate_pipeline_cancel_after_scored_batches_for_tests;
+  std::optional<std::size_t>
+      force_candidate_pipeline_stale_buffer_after_batches_for_tests;
+  std::function<void()> before_candidate_pipeline_start_for_tests = {};
+  std::function<void(std::size_t)>
+      before_candidate_pipeline_score_batch_for_tests = {};
 };
 
 struct chart_spr_exact_candidate_memory_estimate {
@@ -1249,6 +1285,21 @@ struct chart_spr_exact_candidate_memory_estimate {
   // False means standard-container growth could not be bounded before the
   // finite-budget sentinel. Such a candidate is still runnable with the
   // historical unlimited budget, but finite admission fails closed.
+  bool safely_bounded = true;
+};
+
+struct chart_spr_candidate_pipeline_memory_estimate {
+  std::size_t published_state_bytes = 0;
+  std::size_t double_buffer_bytes = 0;
+  std::size_t simultaneous_local_scoring_bytes = 0;
+  std::size_t scheduler_resident_bytes = 0;
+  std::size_t scheduler_operation_bytes = 0;
+  std::size_t cancellation_error_and_handoff_bytes = 0;
+  // This is supplied as sampled-tree projection's external live envelope;
+  // projection adds its exact prepared tree/job/wave/scratch peak at the
+  // per-sample preflight.
+  std::size_t projection_external_resident_bytes = 0;
+  std::size_t required_peak_bytes = 0;
   bool safely_bounded = true;
 };
 
@@ -2098,6 +2149,20 @@ struct chart_spr_search_summary {
   std::size_t lazy_local_iteration_task_stable_bytes_max = 0;
   std::size_t lazy_local_iteration_task_preparation_peak_bytes_max = 0;
   std::size_t candidate_batches_scored = 0;
+  std::size_t candidate_pipeline_batches_generated = 0;
+  std::size_t candidate_pipeline_batches_scored = 0;
+  std::size_t candidate_pipeline_serial_overlap_batches = 0;
+  std::size_t candidate_pipeline_scheduler_projection_overlap_batches = 0;
+  std::size_t candidate_pipeline_producer_stalls = 0;
+  std::size_t candidate_pipeline_consumer_stalls = 0;
+  double candidate_pipeline_producer_stall_ms = 0.0;
+  double candidate_pipeline_consumer_stall_ms = 0.0;
+  std::size_t candidate_pipeline_cancellations = 0;
+  std::size_t candidate_pipeline_stale_batches_discarded = 0;
+  std::size_t candidate_pipeline_stale_candidates_discarded = 0;
+  std::size_t candidate_pipeline_state_epoch_rejections = 0;
+  std::size_t candidate_pipeline_generation_errors = 0;
+  std::size_t candidate_pipeline_estimated_peak_bytes = 0;
   std::size_t pattern_batch_cache_builds = 0;
   std::size_t initial_state_inside_charts_built = 0;
   std::size_t inside_cache_inside_charts_built = 0;
@@ -7229,6 +7294,34 @@ inline void add_chart_spr_search_counters(
       src.spr_multifurcation_moves_generated;
   dst.candidate_cap_cutoffs += src.candidate_cap_cutoffs;
   dst.path_budget_cutoffs += src.path_budget_cutoffs;
+  dst.candidate_pipeline_batches_generated +=
+      src.candidate_pipeline_batches_generated;
+  dst.candidate_pipeline_batches_scored +=
+      src.candidate_pipeline_batches_scored;
+  dst.candidate_pipeline_serial_overlap_batches +=
+      src.candidate_pipeline_serial_overlap_batches;
+  dst.candidate_pipeline_scheduler_projection_overlap_batches +=
+      src.candidate_pipeline_scheduler_projection_overlap_batches;
+  dst.candidate_pipeline_producer_stalls +=
+      src.candidate_pipeline_producer_stalls;
+  dst.candidate_pipeline_consumer_stalls +=
+      src.candidate_pipeline_consumer_stalls;
+  dst.candidate_pipeline_producer_stall_nanoseconds +=
+      src.candidate_pipeline_producer_stall_nanoseconds;
+  dst.candidate_pipeline_consumer_stall_nanoseconds +=
+      src.candidate_pipeline_consumer_stall_nanoseconds;
+  dst.candidate_pipeline_cancellations += src.candidate_pipeline_cancellations;
+  dst.candidate_pipeline_stale_batches_discarded +=
+      src.candidate_pipeline_stale_batches_discarded;
+  dst.candidate_pipeline_stale_candidates_discarded +=
+      src.candidate_pipeline_stale_candidates_discarded;
+  dst.candidate_pipeline_state_epoch_rejections +=
+      src.candidate_pipeline_state_epoch_rejections;
+  dst.candidate_pipeline_generation_errors +=
+      src.candidate_pipeline_generation_errors;
+  dst.candidate_pipeline_estimated_peak_bytes =
+      std::max(dst.candidate_pipeline_estimated_peak_bytes,
+               src.candidate_pipeline_estimated_peak_bytes);
   dst.overlay_reachability_validations +=
       src.overlay_reachability_validations;
   dst.reachable_clades_traversed += src.reachable_clades_traversed;
@@ -10269,6 +10362,35 @@ inline void record_chart_spr_candidate_generation_stats(
   if (stats.stop_reason == chart_spr_candidate_stop_reason::path_budget) {
     ++counters.path_budget_cutoffs;
   }
+  counters.candidate_pipeline_batches_generated +=
+      stats.candidate_pipeline_batches_generated;
+  counters.candidate_pipeline_batches_scored +=
+      stats.candidate_pipeline_batches_scored;
+  counters.candidate_pipeline_serial_overlap_batches +=
+      stats.candidate_pipeline_serial_overlap_batches;
+  counters.candidate_pipeline_scheduler_projection_overlap_batches +=
+      stats.candidate_pipeline_scheduler_projection_overlap_batches;
+  counters.candidate_pipeline_producer_stalls +=
+      stats.candidate_pipeline_producer_stalls;
+  counters.candidate_pipeline_consumer_stalls +=
+      stats.candidate_pipeline_consumer_stalls;
+  counters.candidate_pipeline_producer_stall_nanoseconds +=
+      stats.candidate_pipeline_producer_stall_nanoseconds;
+  counters.candidate_pipeline_consumer_stall_nanoseconds +=
+      stats.candidate_pipeline_consumer_stall_nanoseconds;
+  counters.candidate_pipeline_cancellations +=
+      stats.candidate_pipeline_cancellations;
+  counters.candidate_pipeline_stale_batches_discarded +=
+      stats.candidate_pipeline_stale_batches_discarded;
+  counters.candidate_pipeline_stale_candidates_discarded +=
+      stats.candidate_pipeline_stale_candidates_discarded;
+  counters.candidate_pipeline_state_epoch_rejections +=
+      stats.candidate_pipeline_state_epoch_rejections;
+  counters.candidate_pipeline_generation_errors +=
+      stats.candidate_pipeline_generation_errors;
+  counters.candidate_pipeline_estimated_peak_bytes =
+      std::max(counters.candidate_pipeline_estimated_peak_bytes,
+               stats.candidate_pipeline_estimated_peak_bytes);
 }
 
 inline std::uint64_t chart_spr_add_invariant_offset(
@@ -12224,6 +12346,130 @@ struct grammar_spr_candidate_copy_scratch {
   std::vector<overlay_production_ref> source_after_topology;
 };
 
+inline chart_spr_candidate_pipeline_memory_estimate
+estimate_chart_spr_candidate_pipeline_memory(
+    chart_spr_search_state const& state,
+    chart_spr_search_options const& options, std::size_t candidate_batch_size,
+    chart_scheduler const& scheduler) noexcept {
+  chart_spr_candidate_pipeline_memory_estimate result;
+  auto add = [&](std::size_t lhs, std::size_t rhs) noexcept {
+    if (lhs > (std::numeric_limits<std::size_t>::max)() - rhs) {
+      result.safely_bounded = false;
+      return (std::numeric_limits<std::size_t>::max)();
+    }
+    return lhs + rhs;
+  };
+  auto multiply = [&](std::size_t lhs, std::size_t rhs) noexcept {
+    if (lhs != 0 && rhs > (std::numeric_limits<std::size_t>::max)() / lhs) {
+      result.safely_bounded = false;
+      return (std::numeric_limits<std::size_t>::max)();
+    }
+    return lhs * rhs;
+  };
+
+  try {
+    // This frozen-capacity walk owns the grammar, immutable plan, active
+    // patterns, outer scoring slots, and verifier tracker.  Add the complete
+    // scoring representation/local-cache envelope and published trim.  The
+    // deliberate outer-vector over-count keeps this safe on the Phase-7
+    // branch and becomes a simple call-site replacement by
+    // estimate_chart_spr_published_state_resident_bytes() after rebase.
+    result.published_state_bytes =
+        estimate_chart_spr_lazy_state_build_retained_bytes(state);
+    result.published_state_bytes =
+        add(result.published_state_bytes,
+            std::max(state.resident_pattern_cache_bytes,
+                     estimate_chart_spr_pattern_cache_bytes(state)));
+    if (state.exact_trim_active_only) {
+      result.published_state_bytes = add(result.published_state_bytes,
+                                         estimate_chart_spr_trim_resident_bytes(
+                                             *state.exact_trim_active_only));
+    }
+
+    auto const clades = add(state.grammar.clades.size(), 1);
+    auto const taxa = state.grammar.taxa.id_to_sample_id.size();
+    auto const productions = std::max(clades, state.grammar.productions.size());
+    auto candidate_payload = sizeof(grammar_spr_candidate);
+    candidate_payload =
+        add(candidate_payload,
+            multiply(clades, sizeof(clade_key) + 4 * sizeof(void*)));
+    candidate_payload = add(candidate_payload,
+                            multiply(multiply(clades, taxa), sizeof(taxon_id)));
+    candidate_payload =
+        add(candidate_payload,
+            multiply(productions,
+                     sizeof(overlay_grammar_production) + 12 * sizeof(void*)));
+    candidate_payload =
+        add(candidate_payload,
+            multiply(productions, 4 * sizeof(overlay_production_ref)));
+    // High-water copy scratch may retain a second complete payload when a
+    // later, smaller candidate is copied into the slot.
+    auto per_slot = add(2 * sizeof(grammar_spr_candidate_copy_scratch),
+                        multiply(candidate_payload, 2));
+    per_slot = add(per_slot, sizeof(chart_spr_local_score_result) + 512);
+    auto one_buffer = add(2 * sizeof(std::vector<grammar_spr_candidate>),
+                          multiply(candidate_batch_size, per_slot));
+    result.double_buffer_bytes = multiply(one_buffer, 2);
+
+    auto const workers = scheduler.worker_resolution().resolved_workers;
+    auto const patterns = state.active_patterns.patterns.patterns.size();
+    auto local_slot = sizeof(prepared_local_candidate_score) +
+                      sizeof(local_score_worker_workspace) +
+                      sizeof(chart_spr_local_score_scratch);
+    local_slot =
+        add(local_slot, multiply(add(clades, productions), 32 * sizeof(void*)));
+    local_slot = add(local_slot, multiply(std::max<std::size_t>(1, patterns),
+                                          8 * sizeof(chart_cost)));
+    result.simultaneous_local_scoring_bytes =
+        multiply(std::max<std::size_t>(1, workers), local_slot);
+    result.simultaneous_local_scoring_bytes = add(
+        result.simultaneous_local_scoring_bytes,
+        multiply(candidate_batch_size, sizeof(prepared_local_candidate_score) +
+                                           sizeof(local_score_tile_result)));
+
+    result.scheduler_resident_bytes =
+        add(estimate_chart_scheduler_implementation_resident_bytes(),
+            estimate_chart_scheduler_pool_owning_heap_bytes(workers));
+    auto score_items = std::max(candidate_batch_size, patterns);
+    auto score_plan = scheduler.plan_indexed_ranges(
+        score_items, {.minimum_grain = 1, .target_ranges_per_worker = 4});
+    if (score_plan.range_count > 1 && score_plan.worker_task_limit > 1) {
+      result.scheduler_operation_bytes =
+          estimate_chart_scheduler_operation_peak_bytes(score_plan);
+    }
+
+    // The coordinator is an OS thread, never a second pool.  Its native stack
+    // and TLS are outside the chart byte budget exactly like scheduler worker
+    // stacks and remain subject to the RSS gate.  Everything controlled here
+    // is charged: jthread stop state, two slot states, mutex/CV, exception
+    // ownership, test callback target, and handoff bookkeeping.
+    result.cancellation_error_and_handoff_bytes =
+        sizeof(std::jthread) + sizeof(std::stop_source) +
+        2 * sizeof(std::exception_ptr) + sizeof(std::mutex) +
+        sizeof(std::condition_variable) + 2048;
+    if (options.before_candidate_pipeline_start_for_tests ||
+        options.before_candidate_pipeline_score_batch_for_tests) {
+      result.cancellation_error_and_handoff_bytes =
+          add(result.cancellation_error_and_handoff_bytes, 512);
+    }
+
+    result.projection_external_resident_bytes =
+        add(result.published_state_bytes,
+            add(result.double_buffer_bytes,
+                add(result.simultaneous_local_scoring_bytes,
+                    result.cancellation_error_and_handoff_bytes)));
+    result.required_peak_bytes = add(
+        result.projection_external_resident_bytes,
+        add(result.scheduler_resident_bytes, result.scheduler_operation_bytes));
+  } catch (...) {
+    result.safely_bounded = false;
+    result.required_peak_bytes = (std::numeric_limits<std::size_t>::max)();
+    result.projection_external_resident_bytes =
+        (std::numeric_limits<std::size_t>::max)();
+  }
+  return result;
+}
+
 inline void copy_optional_production_refs_reusing_storage(
     std::optional<std::vector<overlay_production_ref>>& destination,
     std::optional<std::vector<overlay_production_ref>> const& source,
@@ -12287,9 +12533,13 @@ inline void copy_grammar_spr_candidate_reusing_storage(
 struct chart_spr_acceptance_iteration_workspace {
   std::vector<grammar_spr_candidate> candidate_slots;
   std::vector<grammar_spr_candidate_copy_scratch> candidate_copy_scratch;
+  std::vector<grammar_spr_candidate> pipeline_candidate_slots;
+  std::vector<grammar_spr_candidate_copy_scratch>
+      pipeline_candidate_copy_scratch;
   std::vector<chart_spr_local_score_result> local_results;
   chart_spr_local_score_workspace local_score;
   std::size_t active_candidates = 0;
+  std::size_t pipeline_active_candidates = 0;
 
   void begin_iteration() {
     if (!local_score.operation_boundary_clean()) {
@@ -12298,9 +12548,11 @@ struct chart_spr_acceptance_iteration_workspace {
           "boundary with a stale borrow");
     }
     active_candidates = 0;
+    pipeline_active_candidates = 0;
   }
 
-  void reserve_batch(std::size_t candidate_count) {
+  void reserve_batch(std::size_t candidate_count,
+                     bool reserve_pipeline_buffer = false) {
     if (candidate_slots.capacity() < candidate_count) {
       candidate_slots.reserve(candidate_count);
     }
@@ -12310,33 +12562,54 @@ struct chart_spr_acceptance_iteration_workspace {
     if (local_results.capacity() < candidate_count) {
       local_results.reserve(candidate_count);
     }
+    if (reserve_pipeline_buffer) {
+      if (pipeline_candidate_slots.capacity() < candidate_count) {
+        pipeline_candidate_slots.reserve(candidate_count);
+      }
+      if (pipeline_candidate_copy_scratch.capacity() < candidate_count) {
+        pipeline_candidate_copy_scratch.reserve(candidate_count);
+      }
+    }
   }
 
-  void append_candidate(grammar_spr_candidate const& candidate) {
-    if (active_candidates == candidate_slots.size()) {
-      candidate_slots.emplace_back();
+  void append_candidate_to_buffer(std::size_t buffer,
+                                  grammar_spr_candidate const& candidate) {
+    auto& slots = buffer == 0 ? candidate_slots : pipeline_candidate_slots;
+    auto& scratch =
+        buffer == 0 ? candidate_copy_scratch : pipeline_candidate_copy_scratch;
+    auto& active = buffer == 0 ? active_candidates : pipeline_active_candidates;
+    if (buffer > 1) {
+      throw std::out_of_range(
+          "chart SPR acceptance workspace: pipeline buffer out of range");
+    }
+    if (active == slots.size()) {
+      slots.emplace_back();
       try {
-        candidate_copy_scratch.emplace_back();
+        scratch.emplace_back();
       } catch (...) {
-        candidate_slots.pop_back();
+        slots.pop_back();
         throw;
       }
     }
-    copy_grammar_spr_candidate_reusing_storage(
-        candidate_slots[active_candidates], candidate,
-        candidate_copy_scratch[active_candidates]);
-    ++active_candidates;
+    copy_grammar_spr_candidate_reusing_storage(slots[active], candidate,
+                                               scratch[active]);
+    ++active;
   }
 
-  [[nodiscard]] std::span<grammar_spr_candidate const> candidates() const {
-    return {candidate_slots.data(), active_candidates};
+  void append_candidate(grammar_spr_candidate const& candidate) {
+    append_candidate_to_buffer(0, candidate);
   }
 
-  [[nodiscard]] std::span<chart_spr_local_score_result> results() {
-    if (local_results.size() < active_candidates) {
-      local_results.resize(active_candidates);
+  [[nodiscard]] std::span<grammar_spr_candidate const> candidates(
+      std::size_t buffer = 0) const {
+    if (buffer > 1) {
+      throw std::out_of_range(
+          "chart SPR acceptance workspace: pipeline buffer out of range");
     }
-    return {local_results.data(), active_candidates};
+    auto const& slots =
+        buffer == 0 ? candidate_slots : pipeline_candidate_slots;
+    auto active = buffer == 0 ? active_candidates : pipeline_active_candidates;
+    return {slots.data(), active};
   }
 
   [[nodiscard]] std::size_t local_admission_additional_resident_bytes(
@@ -12378,20 +12651,136 @@ struct chart_spr_acceptance_iteration_workspace {
     return total;
   }
 
-  void finish_batch() noexcept { active_candidates = 0; }
+  [[nodiscard]] std::span<chart_spr_local_score_result> results(
+      std::size_t buffer = 0) {
+    if (buffer > 1) {
+      throw std::out_of_range(
+          "chart SPR acceptance workspace: pipeline buffer out of range");
+    }
+    auto active = buffer == 0 ? active_candidates : pipeline_active_candidates;
+    if (local_results.size() < active) {
+      local_results.resize(active);
+    }
+    return {local_results.data(), active};
+  }
+
+  [[nodiscard]] std::size_t active_candidate_count(
+      std::size_t buffer) const noexcept {
+    return buffer == 0 ? active_candidates : pipeline_active_candidates;
+  }
+
+  void finish_batch(std::size_t buffer = 0) noexcept {
+    if (buffer == 0) {
+      active_candidates = 0;
+    } else {
+      pipeline_active_candidates = 0;
+    }
+  }
 
   void release_retained_storage_before_exact() {
-    if (active_candidates != 0 || !local_score.operation_boundary_clean()) {
+    if (active_candidates != 0 || pipeline_active_candidates != 0 ||
+        !local_score.operation_boundary_clean()) {
       throw std::logic_error(
           "chart SPR acceptance workspace: cannot release active storage");
     }
     std::vector<grammar_spr_candidate>{}.swap(candidate_slots);
     std::vector<grammar_spr_candidate_copy_scratch>{}.swap(
         candidate_copy_scratch);
+    std::vector<grammar_spr_candidate>{}.swap(pipeline_candidate_slots);
+    std::vector<grammar_spr_candidate_copy_scratch>{}.swap(
+        pipeline_candidate_copy_scratch);
     std::vector<chart_spr_local_score_result>{}.swap(local_results);
     local_score.release_retained_storage();
   }
 };
+
+struct chart_spr_candidate_pipeline_snapshot {
+  std::uint64_t grammar_generation = 0;
+  std::uint64_t plan_generation = 0;
+  chart_plan_fingerprint plan_fingerprint;
+  chart_spr_pattern_source_fingerprint pattern_fingerprint;
+  std::size_t active_pattern_count = 0;
+  std::uint64_t state_score = 0;
+
+  bool operator==(chart_spr_candidate_pipeline_snapshot const&) const = default;
+};
+
+inline chart_spr_candidate_pipeline_snapshot
+capture_chart_spr_candidate_pipeline_snapshot(
+    chart_spr_search_state const& state) {
+  return chart_spr_candidate_pipeline_snapshot{
+      .grammar_generation = state.grammar.execution_generation,
+      .plan_generation = state.execution_plan.grammar_generation(),
+      .plan_fingerprint = state.execution_plan.fingerprint(),
+      .pattern_fingerprint = state.pattern_source_fingerprint,
+      .active_pattern_count = state.active_patterns.patterns.patterns.size(),
+      .state_score = state.composite_lower_bound_with_invariants,
+  };
+}
+
+inline void validate_chart_spr_candidate_pipeline_snapshot(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_pipeline_snapshot const& expected) {
+  auto const actual = capture_chart_spr_candidate_pipeline_snapshot(state);
+  if (actual != expected) {
+    throw chart_execution_plan_mismatch(
+        "chart SPR candidate pipeline: stale state generation/epoch");
+  }
+  auto checked =
+      check_chart_execution_plan(state.grammar, state.execution_plan);
+  checked.assert_same(state.grammar, state.execution_plan);
+}
+
+enum class chart_spr_candidate_pipeline_slot_status {
+  free,
+  filling,
+  ready,
+  scoring,
+};
+
+struct chart_spr_candidate_pipeline_slot_state {
+  chart_spr_candidate_pipeline_slot_status status =
+      chart_spr_candidate_pipeline_slot_status::free;
+  std::size_t sequence = 0;
+  chart_spr_candidate_pipeline_snapshot snapshot;
+};
+
+struct chart_spr_candidate_pipeline_controller {
+  std::mutex state_mutex;
+  std::condition_variable state_changed;
+  std::mutex scheduler_handoff;
+  std::array<chart_spr_candidate_pipeline_slot_state, 2> slots;
+  std::atomic<bool> cancel_requested{false};
+  bool producer_done = false;
+  bool scoring_active = false;
+  std::exception_ptr producer_failure;
+  chart_spr_candidate_generation_stats generation;
+  chart_spr_candidate_generation_stats pipeline_diagnostics;
+  sampled_tree_projection_scheduler_diagnostics projection_scheduler;
+  double candidate_generation_ms = 0.0;
+  std::size_t stale_multifurcation_candidates = 0;
+};
+
+inline void record_chart_spr_candidate_generation_scheduler_axis(
+    chart_spr_scheduler_axis_metrics& axis,
+    sampled_tree_projection_scheduler_diagnostics const& diagnostics) {
+  axis.operations += diagnostics.operations;
+  axis.parallel_operations += diagnostics.parallel_operations;
+  axis.items += diagnostics.items;
+  axis.ranges += diagnostics.ranges;
+  axis.worker_tasks += diagnostics.worker_tasks;
+  axis.active_worker_high_water = std::max(
+      axis.active_worker_high_water, diagnostics.active_worker_high_water);
+  if (diagnostics.minimum_effective_grain != 0) {
+    axis.minimum_effective_grain =
+        axis.minimum_effective_grain == 0
+            ? diagnostics.minimum_effective_grain
+            : std::min(axis.minimum_effective_grain,
+                       diagnostics.minimum_effective_grain);
+  }
+  axis.maximum_effective_grain = std::max(axis.maximum_effective_grain,
+                                          diagnostics.maximum_effective_grain);
+}
 
 struct chart_spr_exact_candidate_slot {
   std::optional<chart_spr_candidate_score> result;
@@ -12694,7 +13083,11 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         std::max(enumeration.sampled_tree_projection_external_resident_bytes,
                  projection_external_resident);
   }
-
+  auto reserve_ranked = [&] {
+    if (ranked.capacity() < ranked_reserve_limit) {
+      ranked.reserve(ranked_reserve_limit);
+    }
+  };
   state.effective_candidate_batch_size = candidate_batch_size;
   auto local_options = local_spr_score_options{};
   local_options.verify_against_full_overlay =
@@ -12760,11 +13153,11 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
 
   bool stop_after_batch = false;
 
-  auto process_candidate_batch = [&]() {
-    if (workspace.active_candidates == 0) return;
-    auto candidate_batch = workspace.candidates();
+  auto process_candidate_batch = [&](std::size_t buffer) {
+    if (workspace.active_candidate_count(buffer) == 0) return;
+    auto candidate_batch = workspace.candidates(buffer);
     // Grow caller-owned result storage before the timed `_into` region.
-    auto local_results = workspace.results();
+    auto local_results = workspace.results(buffer);
     auto local_start = std::chrono::steady_clock::now();
     auto batch_local_options = local_options;
     batch_local_options.admission_memory_budget_bytes = exact_memory_budget;
@@ -12804,11 +13197,10 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     score_candidates_locally_into(state, candidate_batch, local_results,
                                   workspace.local_score, batch_local_options,
                                   scheduler, checked_state);
-    result.local_scoring_ms += std::chrono::duration<double, std::milli>(
-                                   std::chrono::steady_clock::now() -
-                                   local_start)
-                                   .count();
-    workspace.finish_batch();
+    result.local_scoring_ms +=
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - local_start)
+            .count();
     // Candidate ownership is promoted only after the allocation-sensitive
     // `_into` region and after its workspace is clean.  Promotion was inside
     // the historical owning scorer's aggregate timer (and, for resident-cache
@@ -12870,82 +13262,485 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     }
   };
 
-  double generation_callback_ms = 0.0;
-  auto const generation_start = std::chrono::steady_clock::now();
-  auto generation = for_each_grammar_spr_candidate(
-      state.grammar, checked_state, enumeration,
-      [&](grammar_spr_candidate const& candidate) {
-        auto const callback_start = std::chrono::steady_clock::now();
-        if (finite_lazy_local_admission) {
-          if (enumeration_seen_count >= enumeration.max_candidates) {
-            fail_finite_iteration_budget(
-                enumeration_seen_count,
-                chart_spr_search_detail::local_capacity_checked_add(
-                    enumeration_seen_count, 1,
-                    "chart SPR finite grammar generated candidate count"),
-                enumeration.max_candidates);
-          }
-          auto const signature_live = chart_spr_search_detail::
-              estimate_grammar_spr_enumeration_signature_live_bytes(
-                  state.grammar, candidate);
-          if (signature_live >
-              finite_iteration_envelope->planned_signature_node_bytes) {
-            fail_finite_iteration_budget(
-                enumeration_seen_count, signature_live,
-                finite_iteration_envelope->planned_signature_node_bytes);
-          }
-          enumeration_seen_resident =
-              chart_spr_search_detail::local_capacity_checked_add(
-                  enumeration_seen_resident, signature_live,
-                  "chart SPR lazy-local live enumeration signatures");
-          ++enumeration_seen_count;
-          enumeration_current_candidate_resident =
-              chart_spr_search_detail::local_capacity_checked_add(
-                  sizeof(candidate),
-                  chart_spr_search_detail::local_owned_dynamic_capacity_bytes(
-                      candidate),
-                  "chart SPR lazy-local live enumeration candidate");
-          if (enumeration_current_candidate_resident >
-              finite_iteration_envelope->planned_candidate_live_bytes) {
-            fail_finite_iteration_budget(
-                enumeration_seen_count - 1,
-                enumeration_current_candidate_resident,
-                finite_iteration_envelope->planned_candidate_live_bytes);
-          }
-          check_finite_actual_live(enumeration_seen_count - 1);
-        }
-        workspace.append_candidate(candidate);
-        check_finite_actual_live(
-            enumeration_seen_count == 0 ? 0 : enumeration_seen_count - 1);
-        if (workspace.active_candidates >= candidate_batch_size) {
-          process_candidate_batch();
-          enumeration_current_candidate_resident = 0;
-          if (options.candidate_selection ==
-                  chart_spr_candidate_selection_mode::lower_bound_first_improvement &&
-              result.local_improving_candidates > 0) {
-            stop_after_batch = true;
+  chart_spr_candidate_generation_stats generation;
+  sampled_tree_projection_scheduler_diagnostics serial_projection_scheduler;
+  auto const finite_pipeline_cap = enumeration.max_candidates != 0;
+  auto const use_pipeline = options.enable_candidate_generation_pipeline &&
+                            worker_count > 1 && !finite_lazy_local_admission &&
+                            (exact_memory_budget == 0 || finite_pipeline_cap);
+  if (!use_pipeline) {
+    reserve_ranked();
+    workspace.reserve_batch(candidate_batch_size);
+    enumeration.sampled_tree_projection_scheduler_diagnostics_sink =
+        &serial_projection_scheduler;
+    double generation_callback_ms = 0.0;
+    auto const generation_start = std::chrono::steady_clock::now();
+    try {
+      generation = for_each_grammar_spr_candidate(
+          state.grammar, checked_state, enumeration,
+          [&](grammar_spr_candidate const& candidate) {
+            auto const callback_start = std::chrono::steady_clock::now();
+            if (finite_lazy_local_admission) {
+              if (enumeration_seen_count >= enumeration.max_candidates) {
+                fail_finite_iteration_budget(
+                    enumeration_seen_count,
+                    chart_spr_search_detail::local_capacity_checked_add(
+                        enumeration_seen_count, 1,
+                        "chart SPR finite grammar generated candidate count"),
+                    enumeration.max_candidates);
+              }
+              auto const signature_live = chart_spr_search_detail::
+                  estimate_grammar_spr_enumeration_signature_live_bytes(
+                      state.grammar, candidate);
+              if (signature_live >
+                  finite_iteration_envelope->planned_signature_node_bytes) {
+                fail_finite_iteration_budget(
+                    enumeration_seen_count, signature_live,
+                    finite_iteration_envelope->planned_signature_node_bytes);
+              }
+              enumeration_seen_resident =
+                  chart_spr_search_detail::local_capacity_checked_add(
+                      enumeration_seen_resident, signature_live,
+                      "chart SPR lazy-local live enumeration signatures");
+              ++enumeration_seen_count;
+              enumeration_current_candidate_resident =
+                  chart_spr_search_detail::local_capacity_checked_add(
+                      sizeof(candidate),
+                      chart_spr_search_detail::
+                          local_owned_dynamic_capacity_bytes(candidate),
+                      "chart SPR lazy-local live enumeration candidate");
+              if (enumeration_current_candidate_resident >
+                  finite_iteration_envelope->planned_candidate_live_bytes) {
+                fail_finite_iteration_budget(
+                    enumeration_seen_count - 1,
+                    enumeration_current_candidate_resident,
+                    finite_iteration_envelope->planned_candidate_live_bytes);
+              }
+              check_finite_actual_live(enumeration_seen_count - 1);
+            }
+            workspace.append_candidate(candidate);
+            check_finite_actual_live(
+                enumeration_seen_count == 0 ? 0 : enumeration_seen_count - 1);
+            if (workspace.active_candidates >= candidate_batch_size) {
+              process_candidate_batch(0);
+              workspace.finish_batch(0);
+              enumeration_current_candidate_resident = 0;
+              if (options.candidate_selection ==
+                      chart_spr_candidate_selection_mode::
+                          lower_bound_first_improvement &&
+                  result.local_improving_candidates > 0) {
+                stop_after_batch = true;
+                generation_callback_ms +=
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - callback_start)
+                        .count();
+                return false;
+              }
+            }
             generation_callback_ms +=
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - callback_start)
                     .count();
-            return false;
+            return true;
+          });
+    } catch (...) {
+      chart_spr_search_detail::
+          record_chart_spr_candidate_generation_scheduler_axis(
+              state.counters.scheduler_axes.candidate_generation,
+              serial_projection_scheduler);
+      workspace.finish_batch(0);
+      throw;
+    }
+    auto const generation_total_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - generation_start)
+            .count();
+    result.candidate_generation_ms =
+        std::max(0.0, generation_total_ms - generation_callback_ms);
+    if (!stop_after_batch) {
+      process_candidate_batch(0);
+      workspace.finish_batch(0);
+    }
+    chart_spr_search_detail::
+        record_chart_spr_candidate_generation_scheduler_axis(
+            state.counters.scheduler_axes.candidate_generation,
+            serial_projection_scheduler);
+  } else {
+    auto const pipeline_memory =
+        chart_spr_search_detail::estimate_chart_spr_candidate_pipeline_memory(
+            state, options, candidate_batch_size, scheduler);
+    if (exact_memory_budget != 0 &&
+        (!pipeline_memory.safely_bounded ||
+         pipeline_memory.required_peak_bytes > exact_memory_budget)) {
+      throw chart_spr_exact_state_budget_error(
+          pipeline_memory.required_peak_bytes, exact_memory_budget);
+    }
+    reserve_ranked();
+    workspace.reserve_batch(candidate_batch_size, true);
+    if (options.before_candidate_pipeline_start_for_tests) {
+      options.before_candidate_pipeline_start_for_tests();
+    }
+
+    chart_spr_search_detail::chart_spr_candidate_pipeline_controller pipeline;
+    auto const pipeline_snapshot =
+        chart_spr_search_detail::capture_chart_spr_candidate_pipeline_snapshot(
+            state);
+    enumeration.sampled_tree_projection_scheduler_handoff_mutex =
+        &pipeline.scheduler_handoff;
+    enumeration.sampled_tree_projection_cancel_requested =
+        &pipeline.cancel_requested;
+    enumeration.sampled_tree_projection_scheduler_diagnostics_sink =
+        &pipeline.projection_scheduler;
+    enumeration.sampled_tree_projection_external_resident_bytes =
+        std::max(enumeration.sampled_tree_projection_external_resident_bytes,
+                 pipeline_memory.projection_external_resident_bytes);
+
+    std::jthread producer{[&] {
+      std::optional<std::size_t> filling_buffer;
+      std::size_t next_sequence = 0;
+      std::size_t callbacks_seen = 0;
+      double callback_ms = 0.0;
+      auto const generation_start = std::chrono::steady_clock::now();
+      auto publish_filling_buffer = [&] {
+        if (!filling_buffer) return;
+        auto const buffer = *filling_buffer;
+        auto& slot = pipeline.slots[buffer];
+        slot.sequence = next_sequence;
+        slot.snapshot = pipeline_snapshot;
+        if (options
+                .force_candidate_pipeline_stale_buffer_after_batches_for_tests ==
+            next_sequence) {
+          ++slot.snapshot.grammar_generation;
+        }
+        {
+          std::lock_guard lock{pipeline.state_mutex};
+          slot.status = chart_spr_search_detail::
+              chart_spr_candidate_pipeline_slot_status::ready;
+          ++pipeline.pipeline_diagnostics.candidate_pipeline_batches_generated;
+          if (pipeline.scoring_active) {
+            ++pipeline.pipeline_diagnostics
+                  .candidate_pipeline_serial_overlap_batches;
           }
         }
-        enumeration_current_candidate_resident = 0;
-        generation_callback_ms +=
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - callback_start)
-                .count();
+        ++next_sequence;
+        filling_buffer.reset();
+        pipeline.state_changed.notify_all();
+      };
+      auto acquire_filling_buffer = [&]() -> bool {
+        if (filling_buffer) return true;
+        auto const buffer = next_sequence % 2;
+        auto const wait_start = std::chrono::steady_clock::now();
+        std::unique_lock lock{pipeline.state_mutex};
+        auto const stalled = pipeline.slots[buffer].status !=
+                             chart_spr_search_detail::
+                                 chart_spr_candidate_pipeline_slot_status::free;
+        pipeline.state_changed.wait(lock, [&] {
+          return pipeline.cancel_requested.load(std::memory_order_acquire) ||
+                 pipeline.slots[buffer].status ==
+                     chart_spr_search_detail::
+                         chart_spr_candidate_pipeline_slot_status::free;
+        });
+        if (stalled) {
+          ++pipeline.pipeline_diagnostics.candidate_pipeline_producer_stalls;
+          pipeline.pipeline_diagnostics
+              .candidate_pipeline_producer_stall_nanoseconds +=
+              static_cast<std::uint64_t>(
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - wait_start)
+                      .count());
+        }
+        if (pipeline.cancel_requested.load(std::memory_order_acquire)) {
+          return false;
+        }
+        pipeline.slots[buffer].status = chart_spr_search_detail::
+            chart_spr_candidate_pipeline_slot_status::filling;
+        workspace.finish_batch(buffer);
+        filling_buffer = buffer;
         return true;
-      });
+      };
+
+      try {
+        pipeline.generation = for_each_grammar_spr_candidate(
+            state.grammar, checked_state, enumeration,
+            [&](grammar_spr_candidate const& candidate) {
+              auto const callback_start = std::chrono::steady_clock::now();
+              if (pipeline.cancel_requested.load(std::memory_order_acquire) ||
+                  !acquire_filling_buffer()) {
+                ++pipeline.pipeline_diagnostics
+                      .candidate_pipeline_stale_candidates_discarded;
+                if (chart_spr_detail::
+                        grammar_spr_candidate_involves_multifurcation(
+                            state.grammar, candidate)) {
+                  ++pipeline.stale_multifurcation_candidates;
+                }
+                callback_ms +=
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - callback_start)
+                        .count();
+                return false;
+              }
+              if (options
+                      .force_candidate_pipeline_generation_failure_after_for_tests ==
+                  callbacks_seen) {
+                throw std::runtime_error(
+                    "chart SPR candidate pipeline: forced generation failure");
+              }
+              ++callbacks_seen;
+              workspace.append_candidate_to_buffer(*filling_buffer, candidate);
+              if (workspace.active_candidate_count(*filling_buffer) >=
+                  candidate_batch_size) {
+                publish_filling_buffer();
+              }
+              callback_ms +=
+                  std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - callback_start)
+                      .count();
+              return !pipeline.cancel_requested.load(std::memory_order_acquire);
+            });
+        if (!pipeline.cancel_requested.load(std::memory_order_acquire) &&
+            filling_buffer &&
+            workspace.active_candidate_count(*filling_buffer) != 0) {
+          publish_filling_buffer();
+        }
+      } catch (...) {
+        ++pipeline.pipeline_diagnostics.candidate_pipeline_generation_errors;
+        pipeline.producer_failure = std::current_exception();
+        pipeline.cancel_requested.store(true, std::memory_order_release);
+      }
+      pipeline.candidate_generation_ms =
+          std::max(0.0, std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - generation_start)
+                                .count() -
+                            callback_ms);
+      {
+        std::lock_guard lock{pipeline.state_mutex};
+        pipeline.producer_done = true;
+      }
+      pipeline.state_changed.notify_all();
+    }};
+
+    std::exception_ptr consumer_failure;
+    std::size_t next_sequence = 0;
+    std::size_t scored_batches = 0;
+    try {
+      for (;;) {
+        auto const buffer = next_sequence % 2;
+        auto const wait_start = std::chrono::steady_clock::now();
+        std::unique_lock state_lock{pipeline.state_mutex};
+        auto const stalled =
+            pipeline.slots[buffer].status !=
+            chart_spr_search_detail::chart_spr_candidate_pipeline_slot_status::
+                ready;
+        pipeline.state_changed.wait(state_lock, [&] {
+          return (pipeline.slots[buffer].status ==
+                      chart_spr_search_detail::
+                          chart_spr_candidate_pipeline_slot_status::ready &&
+                  pipeline.slots[buffer].sequence == next_sequence) ||
+                 pipeline.producer_done;
+        });
+        auto& slot = pipeline.slots[buffer];
+        if (slot.status !=
+                chart_spr_search_detail::
+                    chart_spr_candidate_pipeline_slot_status::ready ||
+            slot.sequence != next_sequence) {
+          break;
+        }
+        if (stalled) {
+          ++pipeline.pipeline_diagnostics.candidate_pipeline_consumer_stalls;
+          pipeline.pipeline_diagnostics
+              .candidate_pipeline_consumer_stall_nanoseconds +=
+              static_cast<std::uint64_t>(
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - wait_start)
+                      .count());
+        }
+        slot.status = chart_spr_search_detail::
+            chart_spr_candidate_pipeline_slot_status::scoring;
+        auto const buffer_snapshot = slot.snapshot;
+        state_lock.unlock();
+
+        auto const handoff_start = std::chrono::steady_clock::now();
+        std::unique_lock scheduler_handoff{pipeline.scheduler_handoff};
+        auto const handoff_wait = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - handoff_start)
+                .count());
+        if (handoff_wait != 0) {
+          ++pipeline.pipeline_diagnostics.candidate_pipeline_consumer_stalls;
+          pipeline.pipeline_diagnostics
+              .candidate_pipeline_consumer_stall_nanoseconds += handoff_wait;
+        }
+        {
+          std::lock_guard lock{pipeline.state_mutex};
+          pipeline.scoring_active = true;
+        }
+        try {
+          if (options.before_candidate_pipeline_score_batch_for_tests) {
+            options.before_candidate_pipeline_score_batch_for_tests(
+                scored_batches);
+          }
+          chart_spr_search_detail::
+              validate_chart_spr_candidate_pipeline_snapshot(state,
+                                                             buffer_snapshot);
+          if (options
+                  .force_candidate_pipeline_scoring_failure_after_batches_for_tests ==
+              scored_batches) {
+            throw std::runtime_error(
+                "chart SPR candidate pipeline: forced scoring failure");
+          }
+          process_candidate_batch(buffer);
+        } catch (chart_execution_plan_mismatch const&) {
+          ++pipeline.pipeline_diagnostics
+                .candidate_pipeline_state_epoch_rejections;
+          ++state.counters.plan_mismatch_rejections;
+          throw;
+        }
+        {
+          std::lock_guard lock{pipeline.state_mutex};
+          pipeline.scoring_active = false;
+        }
+        scheduler_handoff.unlock();
+
+        ++scored_batches;
+        ++pipeline.pipeline_diagnostics.candidate_pipeline_batches_scored;
+        auto const early_improvement = options.candidate_selection ==
+                                           chart_spr_candidate_selection_mode::
+                                               lower_bound_first_improvement &&
+                                       result.local_improving_candidates > 0;
+        auto const forced_cancel =
+            options
+                .force_candidate_pipeline_cancel_after_scored_batches_for_tests ==
+            scored_batches;
+        if (early_improvement || forced_cancel) {
+          stop_after_batch = true;
+          ++pipeline.pipeline_diagnostics.candidate_pipeline_cancellations;
+          pipeline.cancel_requested.store(true, std::memory_order_release);
+        }
+
+        workspace.finish_batch(buffer);
+        {
+          std::lock_guard lock{pipeline.state_mutex};
+          slot.status = chart_spr_search_detail::
+              chart_spr_candidate_pipeline_slot_status::free;
+        }
+        ++next_sequence;
+        pipeline.state_changed.notify_all();
+        if (stop_after_batch) break;
+      }
+    } catch (...) {
+      {
+        std::lock_guard lock{pipeline.state_mutex};
+        pipeline.scoring_active = false;
+      }
+      pipeline.cancel_requested.store(true, std::memory_order_release);
+      pipeline.state_changed.notify_all();
+      consumer_failure = std::current_exception();
+    }
+
+    if (stop_after_batch || consumer_failure) {
+      pipeline.cancel_requested.store(true, std::memory_order_release);
+      pipeline.state_changed.notify_all();
+    }
+    producer.join();
+
+    // No state publication or accepted commit can occur before this drain.
+    // Invalidate both buffers after the producer has stopped touching them.
+    for (std::size_t buffer = 0; buffer < 2; ++buffer) {
+      auto const active = workspace.active_candidate_count(buffer);
+      auto const status = pipeline.slots[buffer].status;
+      if (active != 0 &&
+          status != chart_spr_search_detail::
+                        chart_spr_candidate_pipeline_slot_status::free) {
+        ++pipeline.pipeline_diagnostics
+              .candidate_pipeline_stale_batches_discarded;
+        pipeline.pipeline_diagnostics
+            .candidate_pipeline_stale_candidates_discarded += active;
+        for (auto const& candidate : workspace.candidates(buffer)) {
+          if (chart_spr_detail::grammar_spr_candidate_involves_multifurcation(
+                  state.grammar, candidate)) {
+            ++pipeline.stale_multifurcation_candidates;
+          }
+        }
+      }
+      workspace.finish_batch(buffer);
+      pipeline.slots[buffer].status = chart_spr_search_detail::
+          chart_spr_candidate_pipeline_slot_status::free;
+    }
+    pipeline.pipeline_diagnostics
+        .candidate_pipeline_producer_stall_nanoseconds +=
+        pipeline.generation
+            .sampled_tree_projection_scheduler_handoff_stall_nanoseconds;
+    if (pipeline.generation
+            .sampled_tree_projection_scheduler_handoff_stall_nanoseconds != 0) {
+      ++pipeline.pipeline_diagnostics.candidate_pipeline_producer_stalls;
+    }
+    pipeline.pipeline_diagnostics.candidate_pipeline_estimated_peak_bytes =
+        std::max(
+            pipeline_memory.required_peak_bytes,
+            pipeline.generation.sampled_tree_projection_estimated_peak_bytes);
+    pipeline.generation.candidate_pipeline_batches_generated =
+        pipeline.pipeline_diagnostics.candidate_pipeline_batches_generated;
+    pipeline.generation.candidate_pipeline_batches_scored =
+        pipeline.pipeline_diagnostics.candidate_pipeline_batches_scored;
+    pipeline.generation.candidate_pipeline_serial_overlap_batches =
+        pipeline.pipeline_diagnostics.candidate_pipeline_serial_overlap_batches;
+    pipeline.generation
+        .candidate_pipeline_scheduler_projection_overlap_batches = 0;
+    pipeline.generation.candidate_pipeline_producer_stalls =
+        pipeline.pipeline_diagnostics.candidate_pipeline_producer_stalls;
+    pipeline.generation.candidate_pipeline_consumer_stalls =
+        pipeline.pipeline_diagnostics.candidate_pipeline_consumer_stalls;
+    pipeline.generation.candidate_pipeline_producer_stall_nanoseconds =
+        pipeline.pipeline_diagnostics
+            .candidate_pipeline_producer_stall_nanoseconds;
+    pipeline.generation.candidate_pipeline_consumer_stall_nanoseconds =
+        pipeline.pipeline_diagnostics
+            .candidate_pipeline_consumer_stall_nanoseconds;
+    pipeline.generation.candidate_pipeline_cancellations =
+        pipeline.pipeline_diagnostics.candidate_pipeline_cancellations;
+    pipeline.generation.candidate_pipeline_stale_batches_discarded =
+        pipeline.pipeline_diagnostics
+            .candidate_pipeline_stale_batches_discarded;
+    pipeline.generation.candidate_pipeline_stale_candidates_discarded =
+        pipeline.pipeline_diagnostics
+            .candidate_pipeline_stale_candidates_discarded;
+    pipeline.generation.candidate_pipeline_state_epoch_rejections =
+        pipeline.pipeline_diagnostics.candidate_pipeline_state_epoch_rejections;
+    pipeline.generation.candidate_pipeline_generation_errors =
+        pipeline.pipeline_diagnostics.candidate_pipeline_generation_errors;
+    pipeline.generation.candidate_pipeline_estimated_peak_bytes =
+        pipeline.pipeline_diagnostics.candidate_pipeline_estimated_peak_bytes;
+    // The legacy post-dedup count names candidates visible to scoring.  Work
+    // generated against this still-current snapshot but invalidated on an
+    // early stop is reported only by the stale-work diagnostics.
+    if (pipeline.generation.candidates_generated_after_dedup >=
+        pipeline.generation.candidate_pipeline_stale_candidates_discarded) {
+      pipeline.generation.candidates_generated_after_dedup -=
+          pipeline.generation.candidate_pipeline_stale_candidates_discarded;
+    }
+    if (pipeline.generation.spr_multifurcation_moves_generated >=
+        pipeline.stale_multifurcation_candidates) {
+      pipeline.generation.spr_multifurcation_moves_generated -=
+          pipeline.stale_multifurcation_candidates;
+    }
+    chart_spr_search_detail::
+        record_chart_spr_candidate_generation_scheduler_axis(
+            state.counters.scheduler_axes.candidate_generation,
+            pipeline.projection_scheduler);
+    result.candidate_generation_ms = pipeline.candidate_generation_ms;
+    generation = std::move(pipeline.generation);
+    if (consumer_failure) {
+      record_chart_spr_candidate_generation_stats(generation, state.counters);
+      std::rethrow_exception(consumer_failure);
+    }
+    if (pipeline.producer_failure) {
+      record_chart_spr_candidate_generation_stats(generation, state.counters);
+      std::rethrow_exception(pipeline.producer_failure);
+    }
+    chart_spr_search_detail::validate_chart_spr_candidate_pipeline_snapshot(
+        state, pipeline_snapshot);
+  }
   enumeration_active = false;
-  auto const generation_total_ms =
-      std::chrono::duration<double, std::milli>(
-          std::chrono::steady_clock::now() - generation_start)
-          .count();
-  result.candidate_generation_ms =
-      std::max(0.0, generation_total_ms - generation_callback_ms);
-  if (!stop_after_batch) process_candidate_batch();
 
   // No local descriptor/candidate-batch capacity is needed after the final
   // generation callback. Under a finite budget, release it before result

@@ -3583,6 +3583,43 @@ static void print_chart_spr_search_counter_fields(
       << counters.candidate_cap_cutoffs << "\n";
   out << indent << "path_budget_cutoffs: "
       << counters.path_budget_cutoffs << "\n";
+  out << indent << "candidate_pipeline_batches_generated: "
+      << counters.candidate_pipeline_batches_generated << "\n";
+  out << indent << "candidate_pipeline_batches_scored: "
+      << counters.candidate_pipeline_batches_scored << "\n";
+  out << indent << "candidate_pipeline_serial_overlap_batches: "
+      << counters.candidate_pipeline_serial_overlap_batches << "\n";
+  out << indent << "candidate_pipeline_scheduler_projection_overlap_batches: "
+      << counters.candidate_pipeline_scheduler_projection_overlap_batches
+      << "\n";
+  out << indent << "candidate_pipeline_producer_stalls: "
+      << counters.candidate_pipeline_producer_stalls << "\n";
+  out << indent << "candidate_pipeline_consumer_stalls: "
+      << counters.candidate_pipeline_consumer_stalls << "\n";
+  out << indent << "candidate_pipeline_producer_stall_ms: " << std::fixed
+      << std::setprecision(3)
+      << static_cast<double>(
+             counters.candidate_pipeline_producer_stall_nanoseconds) /
+             1'000'000.0
+      << "\n";
+  out << indent << "candidate_pipeline_consumer_stall_ms: " << std::fixed
+      << std::setprecision(3)
+      << static_cast<double>(
+             counters.candidate_pipeline_consumer_stall_nanoseconds) /
+             1'000'000.0
+      << "\n";
+  out << indent << "candidate_pipeline_cancellations: "
+      << counters.candidate_pipeline_cancellations << "\n";
+  out << indent << "candidate_pipeline_stale_batches_discarded: "
+      << counters.candidate_pipeline_stale_batches_discarded << "\n";
+  out << indent << "candidate_pipeline_stale_candidates_discarded: "
+      << counters.candidate_pipeline_stale_candidates_discarded << "\n";
+  out << indent << "candidate_pipeline_state_epoch_rejections: "
+      << counters.candidate_pipeline_state_epoch_rejections << "\n";
+  out << indent << "candidate_pipeline_generation_errors: "
+      << counters.candidate_pipeline_generation_errors << "\n";
+  out << indent << "candidate_pipeline_estimated_peak_bytes: "
+      << counters.candidate_pipeline_estimated_peak_bytes << "\n";
   out << indent << "overlay_reachability_validations: "
       << counters.overlay_reachability_validations << "\n";
   out << indent << "reachable_clades_traversed: "
@@ -4393,6 +4430,8 @@ static void run_chart_spr_search_diagnostic(
   auto const& scheduler_axes = search.summary.scheduler_axes;
   print_chart_scheduler_axis_fields(
       out, "initial_chart", scheduler_axes.initial_chart_patterns, "  ");
+  print_chart_scheduler_axis_fields(out, "candidate_generation",
+                                    scheduler_axes.candidate_generation, "  ");
   print_chart_scheduler_axis_fields(out, "exact_setup",
                                     scheduler_axes.exact_setup_patterns, "  ");
   print_chart_scheduler_axis_fields(out, "exact_frontier_clade",

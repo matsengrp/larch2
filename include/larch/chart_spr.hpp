@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <compare>
 #include <concepts>
 #include <cstdint>
@@ -14,6 +16,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -184,6 +187,40 @@ enum class chart_spr_candidate_source {
   hybrid,
 };
 
+// Allocation-free sink used when sampled-tree projection is part of a larger
+// scheduler orchestration.  Projection owns no search-counter type, so it
+// records the returned (or failed) scheduler summaries here and lets the
+// caller publish them to its semantic scheduler axis after the producer has
+// joined.  One producer is the sole writer for the lifetime of a call.
+struct sampled_tree_projection_scheduler_diagnostics {
+  std::uint64_t operations = 0;
+  std::uint64_t parallel_operations = 0;
+  std::uint64_t items = 0;
+  std::uint64_t ranges = 0;
+  std::uint64_t worker_tasks = 0;
+  std::size_t active_worker_high_water = 0;
+  std::size_t minimum_effective_grain = 0;
+  std::size_t maximum_effective_grain = 0;
+
+  void record(chart_scheduler_run_summary const& run) noexcept {
+    ++operations;
+    parallel_operations += run.parallel_branch_entered ? 1U : 0U;
+    items += run.item_count;
+    ranges += run.range_count;
+    worker_tasks += run.worker_tasks_submitted;
+    active_worker_high_water =
+        std::max(active_worker_high_water, run.active_workers);
+    if (run.range_count != 0) {
+      minimum_effective_grain =
+          minimum_effective_grain == 0
+              ? run.effective_grain
+              : std::min(minimum_effective_grain, run.effective_grain);
+      maximum_effective_grain =
+          std::max(maximum_effective_grain, run.effective_grain);
+    }
+  }
+};
+
 inline char const* chart_spr_candidate_source_name(
     chart_spr_candidate_source source) {
   switch (source) {
@@ -275,6 +312,18 @@ struct grammar_spr_enumeration_options {
   std::size_t sampled_tree_projection_memory_budget_bytes = 0;
   std::size_t sampled_tree_projection_external_resident_bytes = 0;
 
+  // A pipelined caller may perform serial enumeration/gather on a coordinator
+  // while the persistent scheduler scores the preceding buffer.  The one
+  // scheduler itself still rejects concurrent top-level operations, so every
+  // projection wave takes this caller-owned handoff before entering it.  The
+  // cancellation flag is checked after taking the handoff and prevents a
+  // stale projection wave from starting after an early acceptance/error.
+  // Neither pointer is retained after the call.
+  std::mutex* sampled_tree_projection_scheduler_handoff_mutex = nullptr;
+  std::atomic<bool> const* sampled_tree_projection_cancel_requested = nullptr;
+  sampled_tree_projection_scheduler_diagnostics*
+      sampled_tree_projection_scheduler_diagnostics_sink = nullptr;
+
   // Projection-only deterministic test hooks. They never alter production
   // ordering, and are invoked only after finite admission succeeds.
   std::function<void(std::size_t)> before_sampled_tree_projection_for_tests =
@@ -321,6 +370,28 @@ struct chart_spr_candidate_generation_stats {
   std::size_t sampled_tree_projection_peak_wave_size = 0;
   std::size_t sampled_tree_projection_speculative_discarded = 0;
   std::size_t sampled_tree_projection_estimated_peak_bytes = 0;
+  std::uint64_t sampled_tree_projection_scheduler_handoff_stall_nanoseconds = 0;
+  std::size_t sampled_tree_projection_cancellations = 0;
+
+  // Phase-8 bounded producer/consumer diagnostics.  "Serial overlap" means
+  // source enumeration, canonical gather, or candidate copying progressed on
+  // the coordinator while the preceding buffer was being scored.  Projection
+  // scheduler overlap is deliberately separate and must remain zero while the
+  // one persistent scheduler is protected by its top-level handoff.
+  std::size_t candidate_pipeline_batches_generated = 0;
+  std::size_t candidate_pipeline_batches_scored = 0;
+  std::size_t candidate_pipeline_serial_overlap_batches = 0;
+  std::size_t candidate_pipeline_scheduler_projection_overlap_batches = 0;
+  std::size_t candidate_pipeline_producer_stalls = 0;
+  std::size_t candidate_pipeline_consumer_stalls = 0;
+  std::uint64_t candidate_pipeline_producer_stall_nanoseconds = 0;
+  std::uint64_t candidate_pipeline_consumer_stall_nanoseconds = 0;
+  std::size_t candidate_pipeline_cancellations = 0;
+  std::size_t candidate_pipeline_stale_batches_discarded = 0;
+  std::size_t candidate_pipeline_stale_candidates_discarded = 0;
+  std::size_t candidate_pipeline_state_epoch_rejections = 0;
+  std::size_t candidate_pipeline_generation_errors = 0;
+  std::size_t candidate_pipeline_estimated_peak_bytes = 0;
 
   chart_spr_candidate_stop_reason stop_reason =
       chart_spr_candidate_stop_reason::exhausted;
@@ -1124,6 +1195,8 @@ struct sampled_tree_projection_execution_stats {
   std::size_t active_worker_high_water = 0;
   std::size_t peak_wave_size = 0;
   std::size_t speculative_discarded = 0;
+  std::uint64_t scheduler_handoff_stall_nanoseconds = 0;
+  bool cancelled = false;
   sampled_tree_projection_memory_estimate memory;
 };
 
@@ -3722,23 +3795,58 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
       slots[0] = project_tree_spr_move_to_candidate(prepared, job.move);
     } else {
       chart_scheduler_run_summary failed_summary;
-      auto summary = scheduler->for_each_indexed_range(
-          count, range_options,
-          [&](chart_indexed_range const& range, std::size_t,
-              chart_scheduler_cancellation_token const& cancellation) {
-            for (auto local = range.begin; local < range.end; ++local) {
-              // A submitted runner owns its first ordinal even when a later
-              // submit fails. Subsequent ordinals cooperate with cancellation.
-              if (local != range.begin && cancellation.stop_requested()) break;
-              auto const& job = jobs[wave_begin + local];
-              if (options.before_sampled_tree_projection_for_tests) {
-                options.before_sampled_tree_projection_for_tests(job.ordinal);
+      std::unique_lock<std::mutex> scheduler_handoff;
+      if (options.sampled_tree_projection_scheduler_handoff_mutex != nullptr) {
+        auto const wait_start = std::chrono::steady_clock::now();
+        scheduler_handoff = std::unique_lock<std::mutex>{
+            *options.sampled_tree_projection_scheduler_handoff_mutex};
+        result.scheduler_handoff_stall_nanoseconds +=
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start)
+                    .count());
+      }
+      if (options.sampled_tree_projection_cancel_requested != nullptr &&
+          options.sampled_tree_projection_cancel_requested->load(
+              std::memory_order_acquire)) {
+        result.cancelled = true;
+        return result;
+      }
+      chart_scheduler_run_summary summary;
+      try {
+        summary = scheduler->for_each_indexed_range(
+            count, range_options,
+            [&](chart_indexed_range const& range, std::size_t,
+                chart_scheduler_cancellation_token const& cancellation) {
+              for (auto local = range.begin; local < range.end; ++local) {
+                // A submitted runner owns its first ordinal even when a later
+                // submit fails. Subsequent ordinals cooperate with
+                // cancellation.
+                if (local != range.begin && cancellation.stop_requested()) {
+                  break;
+                }
+                auto const& job = jobs[wave_begin + local];
+                if (options.before_sampled_tree_projection_for_tests) {
+                  options.before_sampled_tree_projection_for_tests(job.ordinal);
+                }
+                slots[local] =
+                    project_tree_spr_move_to_candidate(prepared, job.move);
               }
-              slots[local] =
-                  project_tree_spr_move_to_candidate(prepared, job.move);
-            }
-          },
-          &failed_summary);
+            },
+            &failed_summary);
+      } catch (...) {
+        if (options.sampled_tree_projection_scheduler_diagnostics_sink !=
+            nullptr) {
+          options.sampled_tree_projection_scheduler_diagnostics_sink->record(
+              failed_summary);
+        }
+        throw;
+      }
+      if (options.sampled_tree_projection_scheduler_diagnostics_sink !=
+          nullptr) {
+        options.sampled_tree_projection_scheduler_diagnostics_sink->record(
+            summary);
+      }
       ++result.scheduler_operations;
       result.parallel_operations += summary.parallel_branch_entered ? 1 : 0;
       result.ranges += summary.range_count;
@@ -3885,6 +3993,10 @@ inline void add_generation_count_stats(
   dst.sampled_tree_projection_estimated_peak_bytes =
       std::max(dst.sampled_tree_projection_estimated_peak_bytes,
                src.sampled_tree_projection_estimated_peak_bytes);
+  dst.sampled_tree_projection_scheduler_handoff_stall_nanoseconds +=
+      src.sampled_tree_projection_scheduler_handoff_stall_nanoseconds;
+  dst.sampled_tree_projection_cancellations +=
+      src.sampled_tree_projection_cancellations;
 }
 
 }  // namespace chart_spr_detail
@@ -4000,9 +4112,16 @@ chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
         stats.sampled_tree_projection_peak_wave_size, execution.peak_wave_size);
     stats.sampled_tree_projection_speculative_discarded +=
         execution.speculative_discarded;
+    stats.sampled_tree_projection_scheduler_handoff_stall_nanoseconds +=
+        execution.scheduler_handoff_stall_nanoseconds;
+    if (execution.cancelled) {
+      ++stats.sampled_tree_projection_cancellations;
+      request_stop(chart_spr_candidate_stop_reason::callback_stop);
+    }
     stats.sampled_tree_projection_estimated_peak_bytes =
         std::max(stats.sampled_tree_projection_estimated_peak_bytes,
                  execution.memory.required_peak_bytes);
+    if (execution.cancelled) break;
   }
   return stats;
 }

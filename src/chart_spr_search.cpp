@@ -4459,6 +4459,38 @@ void chart_spr_refresh_search_summary_from_counters(
   summary.lazy_local_iteration_task_preparation_peak_bytes_max =
       counters.lazy_local_iteration_task_preparation_peak_bytes_max;
   summary.candidate_batches_scored = counters.candidate_batches_scored;
+  summary.candidate_pipeline_batches_generated =
+      counters.candidate_pipeline_batches_generated;
+  summary.candidate_pipeline_batches_scored =
+      counters.candidate_pipeline_batches_scored;
+  summary.candidate_pipeline_serial_overlap_batches =
+      counters.candidate_pipeline_serial_overlap_batches;
+  summary.candidate_pipeline_scheduler_projection_overlap_batches =
+      counters.candidate_pipeline_scheduler_projection_overlap_batches;
+  summary.candidate_pipeline_producer_stalls =
+      counters.candidate_pipeline_producer_stalls;
+  summary.candidate_pipeline_consumer_stalls =
+      counters.candidate_pipeline_consumer_stalls;
+  summary.candidate_pipeline_producer_stall_ms =
+      static_cast<double>(
+          counters.candidate_pipeline_producer_stall_nanoseconds) /
+      1'000'000.0;
+  summary.candidate_pipeline_consumer_stall_ms =
+      static_cast<double>(
+          counters.candidate_pipeline_consumer_stall_nanoseconds) /
+      1'000'000.0;
+  summary.candidate_pipeline_cancellations =
+      counters.candidate_pipeline_cancellations;
+  summary.candidate_pipeline_stale_batches_discarded =
+      counters.candidate_pipeline_stale_batches_discarded;
+  summary.candidate_pipeline_stale_candidates_discarded =
+      counters.candidate_pipeline_stale_candidates_discarded;
+  summary.candidate_pipeline_state_epoch_rejections =
+      counters.candidate_pipeline_state_epoch_rejections;
+  summary.candidate_pipeline_generation_errors =
+      counters.candidate_pipeline_generation_errors;
+  summary.candidate_pipeline_estimated_peak_bytes =
+      counters.candidate_pipeline_estimated_peak_bytes;
   summary.pattern_batch_cache_builds = counters.pattern_batch_cache_builds;
   summary.initial_state_inside_charts_built =
       counters.initial_state_inside_charts_built;
@@ -8263,8 +8295,9 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.scheduler = scheduler.metrics();
   auto const& scheduler_metrics = result.summary.scheduler;
   auto const& axes = state.counters.scheduler_axes;
-  std::array<chart_spr_scheduler_axis_metrics const*, 12> axis_list{
+  std::array<chart_spr_scheduler_axis_metrics const*, 13> axis_list{
       &axes.initial_chart_patterns,
+      &axes.candidate_generation,
       &axes.exact_setup_patterns,
       &axes.exact_frontier_clades,
       &axes.exact_candidates,
