@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -514,6 +516,20 @@ inline void consume_plan_structural_child_map(
   }
 }
 
+inline void consume_plan_parent_map_dependencies(
+    lazy_multisite_chart& chart, chart_execution_plan const& plan,
+    clade_id parent, map_dependency_counts& remaining) {
+  auto const production_ids = plan.productions_for_parent(parent);
+  for (std::size_t prod_i = 0; prod_i < production_ids.size(); ++prod_i) {
+    for (auto child : plan.children(production_ids[prod_i])) {
+      consume_plan_inside_child_map(chart, plan, child, remaining);
+      if (prod_i == 0) {
+        consume_plan_structural_child_map(chart, plan, child, remaining);
+      }
+    }
+  }
+}
+
 struct plan_parent_key_grouping_memory_accounting {
   std::size_t structural_key_count = 0;
   std::size_t structural_key_width = 0;
@@ -664,9 +680,9 @@ inline void require_plan_parent_key_grouping_success(
 }
 
 inline packed_plan_parent_keys collect_plan_parent_keys(
-    lazy_multisite_chart& chart, chart_execution_plan const& plan,
+    lazy_multisite_chart const& chart, chart_execution_plan const& plan,
     site_pattern_set const& patterns, clade_id parent,
-    map_dependency_counts* remaining, plan_parent_key_workspace& workspace) {
+    plan_parent_key_workspace& workspace) {
   auto const production_ids = plan.productions_for_parent(parent);
   if (production_ids.empty()) {
     throw std::runtime_error(
@@ -784,19 +800,6 @@ inline packed_plan_parent_keys collect_plan_parent_keys(
           .prepared_owned_capacity_resident_bytes));
   keys.memory.row_key_class_count = workspace.row_grouping.class_count();
 
-  // Sparse maps remain readable through both collection stages. Consume each
-  // dependency only after all packed keys and groupings are complete.
-  if (remaining != nullptr) {
-    for (std::size_t prod_i = 0; prod_i < production_ids.size(); ++prod_i) {
-      for (auto child : plan.children(production_ids[prod_i])) {
-        consume_plan_inside_child_map(chart, plan, child, *remaining);
-        if (prod_i == 0) {
-          consume_plan_structural_child_map(chart, plan, child, *remaining);
-        }
-      }
-    }
-  }
-
   keys.memory.logical_resident_bytes =
       estimate_plan_parent_key_grouping_logical_resident_bytes(
           chart.pattern_count, structural_width, structural_class_count,
@@ -815,12 +818,11 @@ inline packed_plan_parent_keys collect_plan_parent_keys(
 // handle own its storage; ordinary full construction reuses an external
 // workspace across every clade.
 inline packed_plan_parent_keys collect_plan_parent_keys(
-    lazy_multisite_chart& chart, chart_execution_plan const& plan,
-    site_pattern_set const& patterns, clade_id parent,
-    map_dependency_counts* remaining) {
+    lazy_multisite_chart const& chart, chart_execution_plan const& plan,
+    site_pattern_set const& patterns, clade_id parent) {
   auto owned_storage = std::make_unique<plan_parent_key_workspace>();
-  auto keys = collect_plan_parent_keys(chart, plan, patterns, parent, remaining,
-                                       *owned_storage);
+  auto keys =
+      collect_plan_parent_keys(chart, plan, patterns, parent, *owned_storage);
   keys.owned_storage = std::move(owned_storage);
   return keys;
 }
@@ -1392,11 +1394,15 @@ inline void assign_plan_leaf_classes(lazy_multisite_chart& chart,
   chart.structural_class_count_by_clade[clade] = rows.size();
 }
 
-inline void assign_plan_internal_classes(lazy_multisite_chart& chart,
-                                         chart_execution_plan const& plan,
-                                         site_pattern_set const& patterns,
-                                         clade_id clade,
-                                         packed_plan_parent_keys const& keys) {
+struct plan_inside_clade_work_stats {
+  std::size_t multifurcation_productions_scored = 0;
+  std::size_t lazy_remerge_collisions = 0;
+};
+
+inline void assign_plan_internal_classes_task_local(
+    lazy_multisite_chart& chart, chart_execution_plan const& plan,
+    site_pattern_set const& patterns, clade_id clade,
+    packed_plan_parent_keys const& keys, plan_inside_clade_work_stats& stats) {
   auto const& structural_classes = keys.structural_classes();
   auto const& row_key_classes = keys.row_key_classes();
   if (structural_classes.class_by_input.size() != chart.pattern_count ||
@@ -1421,7 +1427,7 @@ inline void assign_plan_internal_classes(lazy_multisite_chart& chart,
         row_key_classes.representative_by_class[row_key_class];
     auto const row = compute_plan_internal_inside_row_from_keys(
         chart, plan, clade, keys, structural_class,
-        chart.multifurcation_productions_scored);
+        stats.multifurcation_productions_scored);
     auto [class_it, inserted] =
         row_class_by_row.emplace(row, row_class_by_row.size());
     if (inserted) rows.push_back(row);
@@ -1450,12 +1456,35 @@ inline void assign_plan_internal_classes(lazy_multisite_chart& chart,
   chart.structural_class_count_by_clade[clade] =
       structural_classes.class_count();
   if (structural_classes.class_count() > rows.size()) {
-    chart.lazy_remerge_collisions +=
+    stats.lazy_remerge_collisions +=
         structural_classes.class_count() - rows.size();
   }
   chart.class_index_by_pattern_by_clade[clade] = std::move(class_map);
   chart.structural_class_index_by_pattern_by_clade[clade] =
       std::move(structural_map);
+}
+
+inline void add_plan_inside_clade_work_stats(
+    lazy_multisite_chart& chart, plan_inside_clade_work_stats const& stats) {
+  chart.multifurcation_productions_scored +=
+      stats.multifurcation_productions_scored;
+  chart.lazy_remerge_collisions += stats.lazy_remerge_collisions;
+}
+
+inline void assign_plan_internal_classes(lazy_multisite_chart& chart,
+                                         chart_execution_plan const& plan,
+                                         site_pattern_set const& patterns,
+                                         clade_id clade,
+                                         packed_plan_parent_keys const& keys) {
+  plan_inside_clade_work_stats stats;
+  try {
+    assign_plan_internal_classes_task_local(chart, plan, patterns, clade, keys,
+                                            stats);
+  } catch (...) {
+    add_plan_inside_clade_work_stats(chart, stats);
+    throw;
+  }
+  add_plan_inside_clade_work_stats(chart, stats);
 }
 
 inline void maybe_discard_nonroot_maps(lazy_multisite_chart& chart,
@@ -1508,8 +1537,8 @@ inline void materialize_inside_class_maps(
       continue;
     }
 
-    auto const keys = collect_plan_parent_keys(chart, plan, patterns, clade,
-                                               nullptr, key_workspace);
+    auto const keys =
+        collect_plan_parent_keys(chart, plan, patterns, clade, key_workspace);
     auto const& structural_classes = keys.structural_classes();
     auto structural_map = structural_classes.class_by_input;
     if (chart.structural_class_count_by_clade[clade] !=
@@ -1586,18 +1615,45 @@ struct outside_context_key_workspace {
   std::vector<lazy_key_grouping_detail::packed_key_word> packed_words;
   lazy_key_grouping_detail::packed_key_grouping_workspace grouping_workspace;
   lazy_key_grouping_detail::packed_key_grouping_result grouping;
+  std::vector<row_type> outside_by_pattern;
+  chart_trim_detail::generic_outside_recurrence_scratch recurrence_scratch;
+  std::size_t outside_pattern_capacity_growths = 0;
 
   [[nodiscard]] std::size_t dynamic_capacity_bytes() const {
     using lazy_key_grouping_detail::checked_packed_key_bytes_add;
+    using lazy_key_grouping_detail::checked_packed_key_bytes_multiply;
     auto total =
         lazy_key_grouping_detail::packed_key_word_buffer_dynamic_capacity_bytes(
             packed_words);
     total = checked_packed_key_bytes_add(
         total, grouping_workspace.dynamic_capacity_bytes(),
         "lazy outside context-key workspace capacity");
-    return checked_packed_key_bytes_add(
+    total = checked_packed_key_bytes_add(
         total, grouping.dynamic_capacity_bytes(),
         "lazy outside context-key workspace capacity");
+    total = checked_packed_key_bytes_add(
+        total,
+        checked_packed_key_bytes_multiply(
+            outside_by_pattern.capacity(), sizeof(row_type),
+            "lazy outside pattern-row scratch capacity"),
+        "lazy outside context-key workspace capacity");
+    total = checked_packed_key_bytes_add(
+        total,
+        checked_packed_key_bytes_multiply(
+            recurrence_scratch.result.capacity(), sizeof(row_type),
+            "lazy outside recurrence result capacity"),
+        "lazy outside context-key workspace capacity");
+    for (auto const capacity : {recurrence_scratch.child_best.capacity(),
+                                recurrence_scratch.prefix.capacity(),
+                                recurrence_scratch.suffix.capacity()}) {
+      total = checked_packed_key_bytes_add(
+          total,
+          checked_packed_key_bytes_multiply(
+              capacity, sizeof(chart_cost),
+              "lazy outside recurrence scalar capacity"),
+          "lazy outside context-key workspace capacity");
+    }
+    return total;
   }
 
   [[nodiscard]] std::size_t resident_bytes() const {
@@ -1896,10 +1952,10 @@ inline void assign_outside_classes_for_clade(
 // path never scans productions_by_child or searches a production's children.
 inline row_type compute_child_outside_contribution(
     lazy_multisite_chart const& chart, chart_execution_plan const& plan,
-    site_pattern_set const& patterns, production_id pid,
-    std::size_t child_slot, std::size_t representative_pattern,
-    std::size_t parent_outside_class,
-    outside_recurrence_work_stats& recurrence_work) {
+    site_pattern_set const& patterns, production_id pid, std::size_t child_slot,
+    std::size_t representative_pattern, std::size_t parent_outside_class,
+    outside_recurrence_work_stats& recurrence_work,
+    chart_trim_detail::generic_outside_recurrence_scratch& recurrence_scratch) {
   auto const& production = plan.production(pid);
   auto const children = plan.children(pid);
   if (child_slot >= children.size()) {
@@ -1934,7 +1990,7 @@ inline row_type compute_child_outside_contribution(
   };
   chart_trim_detail::scatter_production_outside_rows(
       plan, children, parent_outside, inside_provider, consume_row,
-      recurrence_work);
+      recurrence_work, recurrence_scratch);
 
   return result;
 }
@@ -1972,12 +2028,23 @@ inline packed_outside_context_keys collect_outside_context_keys(
       });
 }
 
-inline void assign_outside_classes_for_clade(
+struct plan_outside_clade_work_stats {
+  std::size_t multifurcation_productions_scored = 0;
+  outside_recurrence_work_stats recurrence_work;
+};
+
+inline void assign_plan_outside_classes_for_clade_task_local(
     lazy_multisite_chart& chart, chart_execution_plan const& plan,
     site_pattern_set const& patterns, clade_id clade,
-    outside_context_key_workspace& key_workspace) {
-  std::vector<row_type> outside_by_pattern(
-      chart.pattern_count, parsimony_chart_detail::make_inf_row());
+    outside_context_key_workspace& key_workspace,
+    plan_outside_clade_work_stats& stats) {
+  auto& outside_by_pattern = key_workspace.outside_by_pattern;
+  if (outside_by_pattern.capacity() < chart.pattern_count) {
+    outside_by_pattern.reserve(chart.pattern_count);
+    ++key_workspace.outside_pattern_capacity_growths;
+  }
+  outside_by_pattern.assign(chart.pattern_count,
+                            parsimony_chart_detail::make_inf_row());
 
   for (auto const occurrence : plan.child_occurrences_for_clade(clade)) {
     auto const pid = occurrence.production;
@@ -1994,11 +2061,12 @@ inline void assign_outside_classes_for_clade(
       auto const parent_outside_class = outside_class_index_for_pattern(
           chart, production.parent, representative);
       if (!production.is_binary()) {
-        ++chart.outside_multifurcation_productions_scored;
+        ++stats.multifurcation_productions_scored;
       }
       auto const contribution = compute_child_outside_contribution(
           chart, plan, patterns, pid, child_slot, representative,
-          parent_outside_class, chart.outside_recurrence_work);
+          parent_outside_class, stats.recurrence_work,
+          key_workspace.recurrence_scratch);
       for (auto pattern : context_classes.members_for_class(context_class)) {
         auto& row = outside_by_pattern[pattern];
         for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
@@ -2026,6 +2094,28 @@ inline void assign_outside_classes_for_clade(
   }
 
   chart.outside_class_index_by_pattern_by_clade[clade] = std::move(class_map);
+}
+
+inline void add_plan_outside_clade_work_stats(
+    lazy_multisite_chart& chart, plan_outside_clade_work_stats const& stats) {
+  chart.outside_multifurcation_productions_scored +=
+      stats.multifurcation_productions_scored;
+  chart.outside_recurrence_work += stats.recurrence_work;
+}
+
+inline void assign_outside_classes_for_clade(
+    lazy_multisite_chart& chart, chart_execution_plan const& plan,
+    site_pattern_set const& patterns, clade_id clade,
+    outside_context_key_workspace& key_workspace) {
+  plan_outside_clade_work_stats stats;
+  try {
+    assign_plan_outside_classes_for_clade_task_local(
+        chart, plan, patterns, clade, key_workspace, stats);
+  } catch (...) {
+    add_plan_outside_clade_work_stats(chart, stats);
+    throw;
+  }
+  add_plan_outside_clade_work_stats(chart, stats);
 }
 
 inline void assign_outside_classes_for_clade(
@@ -2181,6 +2271,118 @@ inline std::uint64_t lazy_root_class_score_total(
   return total;
 }
 
+struct plan_lazy_chart_scheduler_test_hooks {
+  std::function<void(clade_id, std::size_t, std::size_t)> before_inside_clade;
+  std::function<void(clade_id, std::size_t, std::size_t)> after_inside_clade;
+  std::function<void(lazy_multisite_chart const&, clade_id, std::size_t,
+                     std::size_t)>
+      observe_completed_inside_clade;
+  std::function<void(lazy_multisite_chart const&, std::size_t)>
+      observe_inside_level_join;
+  std::function<void(lazy_multisite_chart const&, std::size_t)>
+      observe_inside_level_reclamation;
+  std::function<void(clade_id, std::size_t, std::size_t)> before_outside_clade;
+  std::function<void(clade_id, std::size_t, std::size_t)> after_outside_clade;
+};
+
+struct plan_lazy_chart_scheduler_workspace {
+  std::vector<plan_parent_key_workspace> inside_by_slot;
+  std::vector<outside_context_key_workspace> outside_by_slot;
+
+  void prepare_inside_slots(std::size_t slot_count) {
+    if (inside_by_slot.size() < slot_count) inside_by_slot.resize(slot_count);
+  }
+
+  void prepare_outside_slots(std::size_t slot_count) {
+    if (outside_by_slot.size() < slot_count) {
+      outside_by_slot.resize(slot_count);
+    }
+  }
+
+  void release_inside() noexcept {
+    std::vector<plan_parent_key_workspace>{}.swap(inside_by_slot);
+  }
+
+  void release_outside() noexcept {
+    std::vector<outside_context_key_workspace>{}.swap(outside_by_slot);
+  }
+};
+
+inline chart_indexed_range_options plan_lazy_chart_clade_range_options() {
+  return chart_indexed_range_options{
+      .minimum_grain = 1,
+      .target_ranges_per_worker = 4,
+  };
+}
+
+inline void validate_plan_lazy_chart_levels(
+    std::span<clade_id const> order, std::span<std::size_t const> offsets,
+    std::size_t clade_count, std::string_view context) {
+  if (offsets.empty() || offsets.front() != 0 ||
+      offsets.back() != order.size() || order.size() != clade_count) {
+    throw std::runtime_error(std::string{context} +
+                             ": invalid dependency-level execution plan");
+  }
+  for (std::size_t level = 0; level + 1 < offsets.size(); ++level) {
+    if (offsets[level] > offsets[level + 1]) {
+      throw std::runtime_error(std::string{context} +
+                               ": invalid dependency-level offsets");
+    }
+  }
+}
+
+inline void reserve_plan_lazy_chart_run_summaries(
+    std::vector<chart_scheduler_run_summary>* runs, std::size_t count,
+    std::string_view context) {
+  if (runs == nullptr) return;
+  if (count > runs->max_size() - runs->size()) {
+    throw std::length_error(std::string{context} +
+                            ": scheduler summary overflow");
+  }
+  runs->reserve(runs->size() + count);
+}
+
+inline void clear_plan_inside_clade_output(lazy_multisite_chart& chart,
+                                           clade_id clade) noexcept {
+  chart.inside_rows_by_clade[clade].clear();
+  chart.class_index_by_pattern_by_clade[clade] = std::nullopt;
+  chart.structural_class_index_by_pattern_by_clade[clade] = std::nullopt;
+  chart.structural_class_count_by_clade[clade] = 0;
+  chart.class_weight_by_clade[clade].clear();
+}
+
+inline void clear_plan_outside_clade_output(lazy_multisite_chart& chart,
+                                            clade_id clade) noexcept {
+  chart.outside_rows_by_clade[clade].clear();
+  chart.outside_class_index_by_pattern_by_clade[clade] = std::nullopt;
+  chart.outside_class_weight_by_clade[clade].clear();
+}
+
+inline lazy_multisite_chart initialize_plan_lazy_inside_chart(
+    chart_execution_plan const& plan, site_pattern_set const& patterns,
+    lazy_chart_options const& options) {
+  plan.assert_valid();
+  if (options.chart.keep_trace) {
+    throw std::runtime_error(
+        "lazy inside chart: keep_trace uses the binary choice layer; lazy "
+        "inside rows are row-only");
+  }
+  validate_patterns(plan, patterns);
+
+  lazy_multisite_chart chart;
+  chart.pattern_count = patterns.patterns.size();
+  for (auto const& pattern : patterns.patterns) {
+    chart.total_pattern_weight += pattern.weight;
+  }
+  auto const clade_count = plan.clades().size();
+  chart.inside_rows_by_clade.resize(clade_count);
+  chart.class_index_by_pattern_by_clade.resize(clade_count);
+  chart.structural_class_index_by_pattern_by_clade.resize(clade_count);
+  chart.structural_class_count_by_clade.assign(clade_count, 0);
+  chart.class_weight_by_clade.resize(clade_count);
+  return chart;
+}
+
 }  // namespace lazy_chart_detail
 
 inline lazy_multisite_chart build_lazy_inside_chart(
@@ -2271,25 +2473,7 @@ inline lazy_multisite_chart build_lazy_inside_chart(
     lazy_chart_options const& options = {}) {
   using namespace lazy_chart_detail;
 
-  plan.assert_valid();
-  if (options.chart.keep_trace) {
-    throw std::runtime_error(
-        "lazy inside chart: keep_trace uses the binary choice layer; lazy "
-        "inside rows are row-only");
-  }
-  validate_patterns(plan, patterns);
-
-  lazy_multisite_chart chart;
-  chart.pattern_count = patterns.patterns.size();
-  for (auto const& pattern : patterns.patterns) {
-    chart.total_pattern_weight += pattern.weight;
-  }
-  auto const clade_count = plan.clades().size();
-  chart.inside_rows_by_clade.resize(clade_count);
-  chart.class_index_by_pattern_by_clade.resize(clade_count);
-  chart.structural_class_index_by_pattern_by_clade.resize(clade_count);
-  chart.structural_class_count_by_clade.assign(clade_count, 0);
-  chart.class_weight_by_clade.resize(clade_count);
+  auto chart = initialize_plan_lazy_inside_chart(plan, patterns, options);
 
   std::optional<map_dependency_counts> remaining_dependencies;
   if (!options.retain_all_inside_class_maps) {
@@ -2302,11 +2486,152 @@ inline lazy_multisite_chart build_lazy_inside_chart(
       assign_plan_leaf_classes(chart, plan, patterns, clade, options);
       continue;
     }
-    auto keys = collect_plan_parent_keys(
-        chart, plan, patterns, clade,
-        remaining_dependencies ? &*remaining_dependencies : nullptr,
-        key_workspace);
+    auto keys =
+        collect_plan_parent_keys(chart, plan, patterns, clade, key_workspace);
+    if (remaining_dependencies) {
+      consume_plan_parent_map_dependencies(chart, plan, clade,
+                                           *remaining_dependencies);
+    }
     assign_plan_internal_classes(chart, plan, patterns, clade, keys);
+  }
+
+  finalize_inside_counters(chart);
+  maybe_discard_nonroot_maps(chart, plan, options);
+  return chart;
+}
+
+// Dependency-level scheduled trusted-plan build. Each worker publishes only a
+// disjoint clade payload. Sparse child maps and global counters remain
+// coordinator-owned and are consumed/folded only after the whole level joins.
+inline lazy_multisite_chart build_lazy_inside_chart_scheduled(
+    chart_execution_plan const& plan, site_pattern_set const& patterns,
+    lazy_chart_options const& options, chart_scheduler& scheduler,
+    std::vector<chart_scheduler_run_summary>* level_runs = nullptr,
+    lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks const* test_hooks =
+        nullptr,
+    lazy_chart_detail::plan_lazy_chart_scheduler_workspace*
+        scheduler_workspace = nullptr) {
+  using namespace lazy_chart_detail;
+
+  auto chart = initialize_plan_lazy_inside_chart(plan, patterns, options);
+  auto const level_order = plan.bottom_up_level_order();
+  auto const level_offsets = plan.bottom_up_level_offsets();
+  auto const clade_count = plan.clades().size();
+  validate_plan_lazy_chart_levels(level_order, level_offsets, clade_count,
+                                  "lazy inside chart");
+  auto const level_count = level_offsets.size() - 1;
+  reserve_plan_lazy_chart_run_summaries(level_runs, level_count,
+                                        "lazy inside chart");
+
+  std::optional<map_dependency_counts> remaining_dependencies;
+  if (!options.retain_all_inside_class_maps) {
+    remaining_dependencies = count_map_dependencies(plan);
+  }
+
+  auto const slot_count = scheduler.worker_resolution().resolved_workers;
+  if (slot_count == 0) {
+    throw std::logic_error("lazy inside chart: scheduler has no worker slots");
+  }
+  plan_lazy_chart_scheduler_workspace local_scheduler_workspace;
+  auto& shared_scheduler_workspace = scheduler_workspace != nullptr
+                                         ? *scheduler_workspace
+                                         : local_scheduler_workspace;
+  shared_scheduler_workspace.prepare_inside_slots(slot_count);
+  auto& workspaces = shared_scheduler_workspace.inside_by_slot;
+  std::vector<plan_inside_clade_work_stats> stats_by_clade(clade_count);
+  std::vector<std::exception_ptr> errors_by_clade(clade_count);
+
+  for (std::size_t level = 0; level < level_count; ++level) {
+    auto const begin = level_offsets[level];
+    auto const end = level_offsets[level + 1];
+    auto const item_count = end - begin;
+    if (item_count == 0) continue;
+    chart_scheduler_run_summary failed_run;
+    chart_scheduler_run_summary run;
+    try {
+      run = scheduler.for_each_indexed_range(
+          item_count, plan_lazy_chart_clade_range_options(),
+          [&](chart_indexed_range const& range, std::size_t stable_slot,
+              chart_scheduler_cancellation_token const&) {
+            if (stable_slot >= workspaces.size()) {
+              throw std::logic_error(
+                  "lazy inside chart: scheduler slot out of range");
+            }
+            auto& workspace = workspaces[stable_slot];
+            for (std::size_t item = range.begin; item < range.end; ++item) {
+              auto const clade = level_order[begin + item];
+              try {
+                if (test_hooks != nullptr && test_hooks->before_inside_clade) {
+                  test_hooks->before_inside_clade(clade, level, stable_slot);
+                }
+                if (plan.clade(clade).is_leaf()) {
+                  assign_plan_leaf_classes(chart, plan, patterns, clade,
+                                           options);
+                } else {
+                  auto keys = collect_plan_parent_keys(chart, plan, patterns,
+                                                       clade, workspace);
+                  assign_plan_internal_classes_task_local(
+                      chart, plan, patterns, clade, keys,
+                      stats_by_clade[clade]);
+                }
+                if (test_hooks != nullptr &&
+                    test_hooks->observe_completed_inside_clade) {
+                  test_hooks->observe_completed_inside_clade(
+                      chart, clade, level, stable_slot);
+                }
+                if (test_hooks != nullptr && test_hooks->after_inside_clade) {
+                  test_hooks->after_inside_clade(clade, level, stable_slot);
+                }
+              } catch (...) {
+                errors_by_clade[clade] = std::current_exception();
+                break;
+              }
+            }
+          },
+          &failed_run);
+      if (level_runs != nullptr) level_runs->push_back(run);
+    } catch (...) {
+      for (std::size_t item = 0; item < item_count; ++item) {
+        clear_plan_inside_clade_output(chart, level_order[begin + item]);
+      }
+      if (level_runs != nullptr && failed_run.failed) {
+        level_runs->push_back(failed_run);
+      }
+      throw;
+    }
+
+    std::exception_ptr selected_error;
+    for (std::size_t item = 0; item < item_count; ++item) {
+      auto const clade = level_order[begin + item];
+      if (errors_by_clade[clade]) {
+        selected_error = errors_by_clade[clade];
+        break;
+      }
+    }
+    if (selected_error) {
+      for (std::size_t item = 0; item < item_count; ++item) {
+        clear_plan_inside_clade_output(chart, level_order[begin + item]);
+      }
+      std::rethrow_exception(selected_error);
+    }
+
+    // The level join above is the read barrier for every shared child map.
+    // Reclamation is stable and serial, so siblings that share one child can
+    // never invalidate one another's packed-key collection.
+    if (test_hooks != nullptr && test_hooks->observe_inside_level_join) {
+      test_hooks->observe_inside_level_join(chart, level);
+    }
+    for (std::size_t item = 0; item < item_count; ++item) {
+      auto const clade = level_order[begin + item];
+      if (remaining_dependencies && !plan.clade(clade).is_leaf()) {
+        consume_plan_parent_map_dependencies(chart, plan, clade,
+                                             *remaining_dependencies);
+      }
+      add_plan_inside_clade_work_stats(chart, stats_by_clade[clade]);
+    }
+    if (test_hooks != nullptr && test_hooks->observe_inside_level_reclamation) {
+      test_hooks->observe_inside_level_reclamation(chart, level);
+    }
   }
 
   finalize_inside_counters(chart);
@@ -2653,12 +2978,13 @@ inline lazy_multisite_chart build_lazy_outside_chart(
   return chart;
 }
 
-inline void build_lazy_outside_chart_in_place(
-    chart_execution_plan const& plan, site_pattern_set const& patterns,
-    lazy_multisite_chart& chart, chart_options const& options,
-    std::uint8_t reference_state) {
-  using namespace lazy_chart_detail;
+namespace lazy_chart_detail {
 
+inline void initialize_plan_lazy_outside_chart(chart_execution_plan const& plan,
+                                               site_pattern_set const& patterns,
+                                               lazy_multisite_chart& chart,
+                                               chart_options const& options,
+                                               std::uint8_t reference_state) {
   plan.assert_valid();
   validate_patterns(plan, patterns);
   if (options.score_ua_edge) {
@@ -2709,7 +3035,20 @@ inline void build_lazy_outside_chart_in_place(
     }
     chart.outside_global_min_by_pattern[pattern] = best;
   }
+}
 
+}  // namespace lazy_chart_detail
+
+inline void build_lazy_outside_chart_in_place(chart_execution_plan const& plan,
+                                              site_pattern_set const& patterns,
+                                              lazy_multisite_chart& chart,
+                                              chart_options const& options,
+                                              std::uint8_t reference_state) {
+  using namespace lazy_chart_detail;
+
+  initialize_plan_lazy_outside_chart(plan, patterns, chart, options,
+                                     reference_state);
+  auto const root = plan.root_clade();
   outside_context_key_workspace context_key_workspace;
   for (auto clade : plan.top_down_order()) {
     if (clade == root) continue;
@@ -2718,6 +3057,152 @@ inline void build_lazy_outside_chart_in_place(
   }
 
   finalize_outside_counters(chart);
+}
+
+// Root initialization remains serial. Every subsequent top-down dependency
+// level is one joined scheduler operation whose tasks write disjoint clades;
+// recurrence counters are folded only after the complete level succeeds.
+inline void build_lazy_outside_chart_in_place_scheduled(
+    chart_execution_plan const& plan, site_pattern_set const& patterns,
+    lazy_multisite_chart& chart, chart_options const& options,
+    std::uint8_t reference_state, chart_scheduler& scheduler,
+    std::vector<chart_scheduler_run_summary>* level_runs = nullptr,
+    lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks const* test_hooks =
+        nullptr,
+    lazy_chart_detail::plan_lazy_chart_scheduler_workspace*
+        scheduler_workspace = nullptr) {
+  using namespace lazy_chart_detail;
+
+  initialize_plan_lazy_outside_chart(plan, patterns, chart, options,
+                                     reference_state);
+  auto const level_order = plan.top_down_level_order();
+  auto const level_offsets = plan.top_down_level_offsets();
+  auto const clade_count = plan.clades().size();
+  validate_plan_lazy_chart_levels(level_order, level_offsets, clade_count,
+                                  "lazy outside chart");
+  auto const level_count = level_offsets.size() - 1;
+  reserve_plan_lazy_chart_run_summaries(level_runs, level_count,
+                                        "lazy outside chart");
+
+  auto const root = plan.root_clade();
+  std::vector<clade_id> nonroot_level_order;
+  nonroot_level_order.reserve(clade_count - 1);
+  std::vector<std::size_t> nonroot_level_offsets;
+  nonroot_level_offsets.reserve(level_count + 1);
+  nonroot_level_offsets.push_back(0);
+  for (std::size_t level = 0; level < level_count; ++level) {
+    for (std::size_t item = level_offsets[level];
+         item < level_offsets[level + 1]; ++item) {
+      auto const clade = level_order[item];
+      if (clade != root) nonroot_level_order.push_back(clade);
+    }
+    nonroot_level_offsets.push_back(nonroot_level_order.size());
+  }
+
+  auto const slot_count = scheduler.worker_resolution().resolved_workers;
+  if (slot_count == 0) {
+    throw std::logic_error("lazy outside chart: scheduler has no worker slots");
+  }
+  plan_lazy_chart_scheduler_workspace local_scheduler_workspace;
+  auto& shared_scheduler_workspace = scheduler_workspace != nullptr
+                                         ? *scheduler_workspace
+                                         : local_scheduler_workspace;
+  shared_scheduler_workspace.prepare_outside_slots(slot_count);
+  auto& workspaces = shared_scheduler_workspace.outside_by_slot;
+  std::vector<plan_outside_clade_work_stats> stats_by_clade(clade_count);
+  std::vector<std::exception_ptr> errors_by_clade(clade_count);
+
+  for (std::size_t level = 0; level < level_count; ++level) {
+    auto const begin = nonroot_level_offsets[level];
+    auto const end = nonroot_level_offsets[level + 1];
+    auto const item_count = end - begin;
+    if (item_count == 0) continue;
+
+    chart_scheduler_run_summary failed_run;
+    chart_scheduler_run_summary run;
+    try {
+      run = scheduler.for_each_indexed_range(
+          item_count, plan_lazy_chart_clade_range_options(),
+          [&](chart_indexed_range const& range, std::size_t stable_slot,
+              chart_scheduler_cancellation_token const&) {
+            if (stable_slot >= workspaces.size()) {
+              throw std::logic_error(
+                  "lazy outside chart: scheduler slot out of range");
+            }
+            auto& workspace = workspaces[stable_slot];
+            for (std::size_t item = range.begin; item < range.end; ++item) {
+              auto const clade = nonroot_level_order[begin + item];
+              try {
+                if (test_hooks != nullptr && test_hooks->before_outside_clade) {
+                  test_hooks->before_outside_clade(clade, level, stable_slot);
+                }
+                assign_plan_outside_classes_for_clade_task_local(
+                    chart, plan, patterns, clade, workspace,
+                    stats_by_clade[clade]);
+                if (test_hooks != nullptr && test_hooks->after_outside_clade) {
+                  test_hooks->after_outside_clade(clade, level, stable_slot);
+                }
+              } catch (...) {
+                errors_by_clade[clade] = std::current_exception();
+                break;
+              }
+            }
+          },
+          &failed_run);
+      if (level_runs != nullptr) level_runs->push_back(run);
+    } catch (...) {
+      for (std::size_t item = 0; item < item_count; ++item) {
+        clear_plan_outside_clade_output(chart,
+                                        nonroot_level_order[begin + item]);
+      }
+      if (level_runs != nullptr && failed_run.failed) {
+        level_runs->push_back(failed_run);
+      }
+      throw;
+    }
+
+    std::exception_ptr selected_error;
+    for (std::size_t item = 0; item < item_count; ++item) {
+      auto const clade = nonroot_level_order[begin + item];
+      if (errors_by_clade[clade]) {
+        selected_error = errors_by_clade[clade];
+        break;
+      }
+    }
+    if (selected_error) {
+      for (std::size_t item = 0; item < item_count; ++item) {
+        clear_plan_outside_clade_output(chart,
+                                        nonroot_level_order[begin + item]);
+      }
+      std::rethrow_exception(selected_error);
+    }
+
+    for (std::size_t item = 0; item < item_count; ++item) {
+      add_plan_outside_clade_work_stats(
+          chart, stats_by_clade[nonroot_level_order[begin + item]]);
+    }
+  }
+
+  finalize_outside_counters(chart);
+}
+
+inline void build_lazy_outside_chart_in_place_scheduled(
+    chart_execution_plan const& plan, site_pattern_set const& patterns,
+    lazy_multisite_chart& chart, chart_options const& options,
+    chart_scheduler& scheduler,
+    std::vector<chart_scheduler_run_summary>* level_runs = nullptr,
+    lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks const* test_hooks =
+        nullptr,
+    lazy_chart_detail::plan_lazy_chart_scheduler_workspace*
+        scheduler_workspace = nullptr) {
+  if (options.score_ua_edge) {
+    throw std::runtime_error(
+        "lazy outside chart: reference state is required when "
+        "chart_options::score_ua_edge is true");
+  }
+  build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, chart, options, std::uint8_t{0}, scheduler, level_runs,
+      test_hooks, scheduler_workspace);
 }
 
 inline void build_lazy_outside_chart_in_place(

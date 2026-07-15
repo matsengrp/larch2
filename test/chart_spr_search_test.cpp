@@ -298,7 +298,7 @@ static larch::site_pattern_set make_phase4_wide_patterns(
   return patterns;
 }
 
-static std::array<larch::chart_spr_scheduler_axis_metrics const*, 10>
+static std::array<larch::chart_spr_scheduler_axis_metrics const*, 12>
 phase4_scheduler_axes(
     larch::chart_spr_scheduler_axis_counters const& counters) {
   return {
@@ -306,6 +306,8 @@ phase4_scheduler_axes(
       &counters.exact_setup_patterns,
       &counters.exact_frontier_clades,
       &counters.exact_candidates,
+      &counters.lazy_inside_clades,
+      &counters.lazy_outside_clades,
       &counters.inside_cache_patterns,
       &counters.outside_cache_patterns,
       &counters.fixed_topology_patterns,
@@ -4078,6 +4080,97 @@ static void test_phase4_scheduled_pattern_axes_match_w1() {
   CHECK(w4_metrics.pending_tasks == 0);
   CHECK(w4_metrics.live_pool_threads == 0);
   CHECK(w4_metrics.shutdown);
+
+  std::println("  PASS");
+}
+
+static void test_phase7_scheduled_lazy_chart_axes_match_w1() {
+  std::println("test_phase7_scheduled_lazy_chart_axes_match_w1");
+
+  auto fixture = make_fixture();
+  auto patterns = make_phase4_wide_patterns();
+  larch::chart_cache_options cache;
+  cache.use_lazy_multisite_chart = true;
+  auto make_scheduler = [](std::size_t workers) {
+    return std::make_unique<larch::chart_scheduler>(
+        larch::chart_scheduler_options{
+            .requested_workers = workers,
+            .default_minimum_grain = 1,
+            .default_target_ranges_per_worker = 4,
+        });
+  };
+  auto w1_scheduler = make_scheduler(1);
+  auto w4_scheduler = make_scheduler(4);
+  auto build = [&](larch::chart_scheduler& scheduler) {
+    auto active = larch::make_active_search_patterns(patterns);
+    return larch::build_chart_spr_search_state_from_active(
+        fixture.dag, fixture.grammar, std::move(active), {}, false, {}, cache,
+        {}, &scheduler);
+  };
+  auto w1 = build(*w1_scheduler);
+  auto w4 = build(*w4_scheduler);
+  CHECK(w1.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  CHECK(w4.cache_strategy == w1.cache_strategy);
+  CHECK(w1.lazy_chart.has_value());
+  CHECK(w4.lazy_chart.has_value());
+  auto const& lhs = *w1.lazy_chart;
+  auto const& rhs = *w4.lazy_chart;
+  CHECK(lhs.inside_rows_by_clade == rhs.inside_rows_by_clade);
+  CHECK(lhs.outside_rows_by_clade == rhs.outside_rows_by_clade);
+  CHECK(lhs.class_index_by_pattern_by_clade ==
+        rhs.class_index_by_pattern_by_clade);
+  CHECK(lhs.structural_class_index_by_pattern_by_clade ==
+        rhs.structural_class_index_by_pattern_by_clade);
+  CHECK(lhs.outside_class_index_by_pattern_by_clade ==
+        rhs.outside_class_index_by_pattern_by_clade);
+  CHECK(lhs.structural_class_count_by_clade ==
+        rhs.structural_class_count_by_clade);
+  CHECK(lhs.class_weight_by_clade == rhs.class_weight_by_clade);
+  CHECK(lhs.outside_class_weight_by_clade == rhs.outside_class_weight_by_clade);
+  CHECK(lhs.outside_global_min_by_pattern == rhs.outside_global_min_by_pattern);
+  CHECK(lhs.lazy_inside_rows_computed == rhs.lazy_inside_rows_computed);
+  CHECK(lhs.lazy_outside_rows_computed == rhs.lazy_outside_rows_computed);
+  CHECK(lhs.lazy_remerge_collisions == rhs.lazy_remerge_collisions);
+  CHECK(lhs.multifurcation_productions_scored ==
+        rhs.multifurcation_productions_scored);
+  CHECK(lhs.outside_multifurcation_productions_scored ==
+        rhs.outside_multifurcation_productions_scored);
+  CHECK(lhs.outside_recurrence_work == rhs.outside_recurrence_work);
+  CHECK(w1.composite_lower_bound_with_invariants ==
+        w4.composite_lower_bound_with_invariants);
+  CHECK(w1.counters.lazy_inside_rows_computed ==
+        w4.counters.lazy_inside_rows_computed);
+  CHECK(w1.counters.lazy_outside_rows_computed ==
+        w4.counters.lazy_outside_rows_computed);
+
+  auto const level_count =
+      w1.execution_plan.bottom_up_level_offsets().size() - 1;
+  CHECK(w1.counters.scheduler_axes.lazy_inside_clades.operations ==
+        level_count);
+  CHECK(w4.counters.scheduler_axes.lazy_inside_clades.operations ==
+        level_count);
+  CHECK(w1.counters.scheduler_axes.lazy_inside_clades.items ==
+        w1.execution_plan.clades().size());
+  CHECK(w4.counters.scheduler_axes.lazy_inside_clades.items ==
+        w4.execution_plan.clades().size());
+  CHECK(w1.counters.scheduler_axes.lazy_outside_clades.items + 1 ==
+        w1.execution_plan.clades().size());
+  CHECK(w4.counters.scheduler_axes.lazy_outside_clades.items + 1 ==
+        w4.execution_plan.clades().size());
+  CHECK(w1.counters.scheduler_axes.lazy_inside_clades.parallel_operations == 0);
+  CHECK(w1.counters.scheduler_axes.lazy_outside_clades.parallel_operations ==
+        0);
+  CHECK(w4.counters.scheduler_axes.lazy_inside_clades.parallel_operations > 0);
+  CHECK(w4.counters.scheduler_axes.lazy_outside_clades.parallel_operations > 0);
+  CHECK(w1.counters.scheduler_axes.initial_chart_patterns.operations == 0);
+  CHECK(w4.counters.scheduler_axes.initial_chart_patterns.operations == 0);
+  check_phase4_scheduler_axis_reconciliation(w1_scheduler->metrics(),
+                                             w1.counters.scheduler_axes);
+  check_phase4_scheduler_axis_reconciliation(w4_scheduler->metrics(),
+                                             w4.counters.scheduler_axes);
+  w1_scheduler->shutdown();
+  w4_scheduler->shutdown();
 
   std::println("  PASS");
 }
@@ -9714,6 +9807,7 @@ int main() {
   test_streaming_path_pair_budget_stops_early();
   test_eager_diagnostic_enumeration_exposes_cap_after_path_precompute();
   test_phase4_scheduled_pattern_axes_match_w1();
+  test_phase7_scheduled_lazy_chart_axes_match_w1();
   test_phase2b_exact_setup_reuses_resident_state_charts();
   test_phase2b_deferred_pattern_batch_uses_owning_setup_provider();
   test_exact_verification_reuses_state_old_score();

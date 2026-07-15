@@ -54,6 +54,8 @@ struct chart_spr_scheduler_axis_counters {
   chart_spr_scheduler_axis_metrics exact_setup_patterns;
   chart_spr_scheduler_axis_metrics exact_frontier_clades;
   chart_spr_scheduler_axis_metrics exact_candidates;
+  chart_spr_scheduler_axis_metrics lazy_inside_clades;
+  chart_spr_scheduler_axis_metrics lazy_outside_clades;
   chart_spr_scheduler_axis_metrics inside_cache_patterns;
   chart_spr_scheduler_axis_metrics outside_cache_patterns;
   chart_spr_scheduler_axis_metrics fixed_topology_patterns;
@@ -226,6 +228,10 @@ inline void add_chart_spr_scheduler_axis_counters(
                                        src.exact_frontier_clades);
   add_chart_spr_scheduler_axis_metrics(dst.exact_candidates,
                                        src.exact_candidates);
+  add_chart_spr_scheduler_axis_metrics(dst.lazy_inside_clades,
+                                       src.lazy_inside_clades);
+  add_chart_spr_scheduler_axis_metrics(dst.lazy_outside_clades,
+                                       src.lazy_outside_clades);
   add_chart_spr_scheduler_axis_metrics(dst.inside_cache_patterns,
                                        src.inside_cache_patterns);
   add_chart_spr_scheduler_axis_metrics(dst.outside_cache_patterns,
@@ -244,7 +250,8 @@ inline std::uint64_t chart_spr_scheduler_axis_operation_count(
   return axes.initial_chart_patterns.operations +
          axes.exact_setup_patterns.operations +
          axes.exact_frontier_clades.operations +
-         axes.exact_candidates.operations +
+         axes.exact_candidates.operations + axes.lazy_inside_clades.operations +
+         axes.lazy_outside_clades.operations +
          axes.inside_cache_patterns.operations +
          axes.outside_cache_patterns.operations +
          axes.fixed_topology_patterns.operations +
@@ -3388,14 +3395,36 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     lazy_chart_options lazy_options;
     lazy_options.chart = chart_build_options;
     lazy_options.retain_all_inside_class_maps = true;
-    state.lazy_chart = build_lazy_inside_chart(
-        state.execution_plan, state.active_patterns.patterns, lazy_options);
+    std::vector<chart_scheduler_run_summary> lazy_inside_runs;
+    std::vector<chart_scheduler_run_summary> lazy_outside_runs;
+    lazy_chart_detail::plan_lazy_chart_scheduler_workspace
+        lazy_scheduler_workspace;
+    chart_spr_scheduler_run_axis_publisher lazy_inside_axis_publisher{
+        state.counters.scheduler_axes.lazy_inside_clades, lazy_inside_runs};
+    chart_spr_scheduler_run_axis_publisher lazy_outside_axis_publisher{
+        state.counters.scheduler_axes.lazy_outside_clades, lazy_outside_runs};
+    if (scheduler == nullptr) {
+      state.lazy_chart = build_lazy_inside_chart(
+          state.execution_plan, state.active_patterns.patterns, lazy_options);
+    } else {
+      state.lazy_chart = build_lazy_inside_chart_scheduled(
+          state.execution_plan, state.active_patterns.patterns, lazy_options,
+          *scheduler, &lazy_inside_runs, nullptr, &lazy_scheduler_workspace);
+      lazy_scheduler_workspace.release_inside();
+    }
     ++state.counters.chart_execution_plan_cache_hits;
     if (!options.score_ua_edge) {
-      build_lazy_outside_chart_in_place(
-          state.execution_plan, state.active_patterns.patterns,
-          *state.lazy_chart,
-          options);
+      if (scheduler == nullptr) {
+        build_lazy_outside_chart_in_place(state.execution_plan,
+                                          state.active_patterns.patterns,
+                                          *state.lazy_chart, options);
+      } else {
+        build_lazy_outside_chart_in_place_scheduled(
+            state.execution_plan, state.active_patterns.patterns,
+            *state.lazy_chart, options, *scheduler, &lazy_outside_runs, nullptr,
+            &lazy_scheduler_workspace);
+        lazy_scheduler_workspace.release_outside();
+      }
       ++state.counters.chart_execution_plan_cache_hits;
     }
     state.chart_construction_ms =

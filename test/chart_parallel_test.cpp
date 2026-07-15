@@ -5,12 +5,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <map>
 #include <print>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -196,6 +198,76 @@ static larch::clade_grammar make_nonlex_multifurcating_grammar() {
   return grammar;
 }
 
+// AB feeds two level-2 parents. A sparse scheduled build must keep AB's maps
+// readable until both ABC and ABD have completed their level, then reclaim the
+// shared dependency on the coordinator.
+static larch::clade_grammar make_shared_internal_child_grammar() {
+  using larch::clade_id;
+  using larch::production_id;
+  using larch::taxon_id;
+
+  larch::clade_grammar grammar;
+  grammar.taxa.id_to_sample_id = {"A", "B", "C", "D", "E"};
+  grammar.taxa.sample_id_to_id = {{"A", taxon_id{0}},
+                                  {"B", taxon_id{1}},
+                                  {"C", taxon_id{2}},
+                                  {"D", taxon_id{3}},
+                                  {"E", taxon_id{4}}};
+  grammar.clades = {
+      {{taxon_id{0}}},
+      {{taxon_id{1}}},
+      {{taxon_id{2}}},
+      {{taxon_id{3}}},
+      {{taxon_id{4}}},
+      {{taxon_id{0}, taxon_id{1}}},
+      {{taxon_id{3}, taxon_id{4}}},
+      {{taxon_id{2}, taxon_id{4}}},
+      {{taxon_id{0}, taxon_id{1}, taxon_id{2}}},
+      {{taxon_id{0}, taxon_id{1}, taxon_id{3}}},
+      {{taxon_id{0}, taxon_id{1}, taxon_id{2}, taxon_id{3}, taxon_id{4}}}};
+  grammar.productions = {
+      larch::grammar_production{clade_id{5}, {clade_id{0}, clade_id{1}}, {}, 1},
+      larch::grammar_production{clade_id{6}, {clade_id{3}, clade_id{4}}, {}, 1},
+      larch::grammar_production{clade_id{7}, {clade_id{2}, clade_id{4}}, {}, 1},
+      larch::grammar_production{clade_id{8}, {clade_id{5}, clade_id{2}}, {}, 1},
+      larch::grammar_production{clade_id{9}, {clade_id{5}, clade_id{3}}, {}, 1},
+      larch::grammar_production{
+          clade_id{10}, {clade_id{8}, clade_id{6}}, {}, 1},
+      larch::grammar_production{
+          clade_id{10}, {clade_id{9}, clade_id{7}}, {}, 1},
+  };
+  grammar.productions_by_parent = {
+      {},
+      {},
+      {},
+      {},
+      {},
+      {production_id{0}},
+      {production_id{1}},
+      {production_id{2}},
+      {production_id{3}},
+      {production_id{4}},
+      {production_id{5}, production_id{6}},
+  };
+  grammar.productions_by_child = {
+      {production_id{0}},
+      {production_id{0}},
+      {production_id{2}, production_id{3}},
+      {production_id{1}, production_id{4}},
+      {production_id{1}, production_id{2}},
+      {production_id{3}, production_id{4}},
+      {production_id{5}},
+      {production_id{6}},
+      {production_id{5}},
+      {production_id{6}},
+      {},
+  };
+  grammar.root_clade = clade_id{10};
+  grammar.execution_generation =
+      larch::detail::allocate_clade_grammar_execution_generation();
+  return grammar;
+}
+
 static larch::site_pattern_set make_nonlex_four_taxon_patterns() {
   larch::site_pattern_set patterns;
   patterns.taxon_count = 4;
@@ -232,7 +304,21 @@ static larch::site_pattern_set make_weighted_patterns(
     std::size_t taxon_count) {
   larch::site_pattern_set patterns;
   patterns.taxon_count = taxon_count;
-  if (taxon_count == 4) {
+  if (taxon_count == 5) {
+    patterns.patterns = {
+        larch::site_pattern{.state_by_taxon = {0, 0, 1, 2, 3},
+                            .weight = 2,
+                            .reference_state_counts = {1, 1, 0, 0}},
+        larch::site_pattern{.state_by_taxon = {0, 1, 0, 1, 2},
+                            .weight = 1,
+                            .reference_state_counts = {0, 0, 1, 0}},
+        larch::site_pattern{.state_by_taxon = {3, 2, 1, 0, 3},
+                            .weight = 3,
+                            .reference_state_counts = {0, 1, 0, 2}},
+        larch::site_pattern{.state_by_taxon = {1, 1, 1, 3, 3},
+                            .weight = 4,
+                            .reference_state_counts = {0, 4, 0, 0}}};
+  } else if (taxon_count == 4) {
     patterns.patterns = {
         larch::site_pattern{.state_by_taxon = {0, 0, 1, 1},
                             .weight = 2,
@@ -249,6 +335,14 @@ static larch::site_pattern_set make_weighted_patterns(
                             .weight = 2,
                             .reference_state_counts = {1, 0, 1, 0}},
         larch::site_pattern{.state_by_taxon = {3, 3, 0},
+                            .weight = 1,
+                            .reference_state_counts = {0, 0, 0, 1}}};
+  } else if (taxon_count == 1) {
+    patterns.patterns = {
+        larch::site_pattern{.state_by_taxon = {0},
+                            .weight = 2,
+                            .reference_state_counts = {2, 0, 0, 0}},
+        larch::site_pattern{.state_by_taxon = {3},
                             .weight = 1,
                             .reference_state_counts = {0, 0, 0, 1}}};
   } else {
@@ -918,6 +1012,442 @@ static void test_nonlex_packed_plan_lazy_grouping_equivalence() {
       make_nonlex_multifurcating_grammar(), true);
 }
 
+static void test_scheduled_plan_lazy_dependency_wavefronts() {
+  std::println("test_scheduled_plan_lazy_dependency_wavefronts");
+
+  auto const grammar = make_shared_internal_child_grammar();
+  auto const plan = larch::build_chart_execution_plan(grammar);
+  auto const patterns = make_weighted_patterns(plan.taxon_count());
+  larch::lazy_chart_options options;
+  options.retain_all_inside_class_maps = false;
+
+  auto serial = larch::build_lazy_inside_chart(plan, patterns, options);
+  larch::build_lazy_outside_chart_in_place(plan, patterns, serial,
+                                           larch::chart_options{});
+
+  larch::chart_scheduler w1{larch::chart_scheduler_options{
+      .requested_workers = 1,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_workspace w1_workspace;
+  std::vector<larch::chart_scheduler_run_summary> w1_inside_runs;
+  std::vector<larch::chart_scheduler_run_summary> w1_outside_runs;
+  auto w1_chart = larch::build_lazy_inside_chart_scheduled(
+      plan, patterns, options, w1, &w1_inside_runs, nullptr, &w1_workspace);
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, w1_chart, larch::chart_options{}, w1, &w1_outside_runs,
+      nullptr, &w1_workspace);
+  check_lazy_charts_equal(serial, w1_chart);
+  CHECK(w1_inside_runs.size() == plan.bottom_up_level_offsets().size() - 1);
+  CHECK(w1_outside_runs.size() + 1 == plan.top_down_level_offsets().size() - 1);
+  CHECK(std::ranges::none_of(w1_inside_runs, [](auto const& run) {
+    return run.used_parallel_workers();
+  }));
+  CHECK(std::ranges::none_of(w1_outside_runs, [](auto const& run) {
+    return run.used_parallel_workers();
+  }));
+
+  larch::chart_scheduler w4{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_workspace w4_workspace;
+  std::atomic<std::size_t> active_shared_parents = 0;
+  std::atomic<std::size_t> active_shared_parents_high_water = 0;
+  std::atomic<bool> abd_finished = false;
+  std::atomic<bool> abc_observed_abd_finished = false;
+  std::atomic<std::size_t> shared_reader_maps_seen = 0;
+  bool shared_map_present_at_level_join = false;
+  bool shared_map_reclaimed_after_level = false;
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks overlap_hooks;
+  overlap_hooks.before_inside_clade =
+      [&](larch::clade_id clade, std::size_t level, std::size_t stable_slot) {
+        CHECK(stable_slot < w4.worker_resolution().resolved_workers);
+        if (level != 2) return;
+        auto const active = active_shared_parents.fetch_add(1) + 1;
+        auto high = active_shared_parents_high_water.load();
+        while (active > high &&
+               !active_shared_parents_high_water.compare_exchange_weak(
+                   high, active)) {
+        }
+        if (clade != larch::clade_id{8}) return;
+        for (std::size_t attempt = 0;
+             attempt < 1'000'000 && !abd_finished.load(); ++attempt) {
+          std::this_thread::yield();
+        }
+        abc_observed_abd_finished = abd_finished.load();
+      };
+  overlap_hooks.after_inside_clade =
+      [&](larch::clade_id clade, std::size_t level, std::size_t stable_slot) {
+        CHECK(stable_slot < w4.worker_resolution().resolved_workers);
+        if (level != 2) return;
+        if (clade == larch::clade_id{9}) abd_finished = true;
+        active_shared_parents.fetch_sub(1);
+      };
+  overlap_hooks.observe_completed_inside_clade =
+      [&](larch::lazy_multisite_chart const& chart, larch::clade_id clade,
+          std::size_t level, std::size_t stable_slot) {
+        CHECK(stable_slot < w4.worker_resolution().resolved_workers);
+        if (level != 2 ||
+            (clade != larch::clade_id{8} && clade != larch::clade_id{9})) {
+          return;
+        }
+        CHECK(chart.class_index_by_pattern_by_clade[5].has_value());
+        CHECK(chart.structural_class_index_by_pattern_by_clade[5].has_value());
+        ++shared_reader_maps_seen;
+      };
+  overlap_hooks.observe_inside_level_join =
+      [&](larch::lazy_multisite_chart const& chart, std::size_t level) {
+        if (level != 2) return;
+        shared_map_present_at_level_join =
+            chart.class_index_by_pattern_by_clade[5].has_value() &&
+            chart.structural_class_index_by_pattern_by_clade[5].has_value();
+      };
+  overlap_hooks.observe_inside_level_reclamation =
+      [&](larch::lazy_multisite_chart const& chart, std::size_t level) {
+        if (level != 2) return;
+        shared_map_reclaimed_after_level =
+            !chart.class_index_by_pattern_by_clade[5].has_value() &&
+            !chart.structural_class_index_by_pattern_by_clade[5].has_value();
+      };
+  std::vector<larch::chart_scheduler_run_summary> w4_inside_runs;
+  std::vector<larch::chart_scheduler_run_summary> w4_outside_runs;
+  auto w4_chart = larch::build_lazy_inside_chart_scheduled(
+      plan, patterns, options, w4, &w4_inside_runs, &overlap_hooks,
+      &w4_workspace);
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, w4_chart, larch::chart_options{}, w4, &w4_outside_runs,
+      &overlap_hooks, &w4_workspace);
+  check_lazy_charts_equal(serial, w4_chart);
+  CHECK(abc_observed_abd_finished.load());
+  CHECK(active_shared_parents_high_water.load() >= 2);
+  CHECK(shared_reader_maps_seen.load() == 2);
+  CHECK(shared_map_present_at_level_join);
+  CHECK(shared_map_reclaimed_after_level);
+  CHECK(std::ranges::any_of(w4_inside_runs, [](auto const& run) {
+    return run.used_parallel_workers() && run.worker_tasks_submitted > 1;
+  }));
+  CHECK(std::ranges::any_of(w4_outside_runs, [](auto const& run) {
+    return run.used_parallel_workers() && run.worker_tasks_submitted > 1;
+  }));
+
+  larch::chart_scheduler w2{larch::chart_scheduler_options{
+      .requested_workers = 2,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_workspace w2_workspace;
+  auto w2_chart = larch::build_lazy_inside_chart_scheduled(
+      plan, patterns, options, w2, nullptr, nullptr, &w2_workspace);
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, w2_chart, larch::chart_options{}, w2, nullptr, nullptr,
+      &w2_workspace);
+  check_lazy_charts_equal(serial, w2_chart);
+
+  larch::chart_scheduler w8{larch::chart_scheduler_options{
+      .requested_workers = 8,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_workspace w8_workspace;
+  std::atomic<std::size_t> wide_active = 0;
+  std::atomic<std::size_t> wide_active_high_water = 0;
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks wide_hooks;
+  wide_hooks.before_inside_clade = [&](larch::clade_id, std::size_t level,
+                                       std::size_t stable_slot) {
+    CHECK(stable_slot < w8.worker_resolution().resolved_workers);
+    if (level != 0) return;
+    auto const active = wide_active.fetch_add(1) + 1;
+    auto high = wide_active_high_water.load();
+    while (active > high &&
+           !wide_active_high_water.compare_exchange_weak(high, active)) {
+    }
+    for (std::size_t attempt = 0;
+         attempt < 1'000'000 && wide_active_high_water.load() < 4; ++attempt) {
+      std::this_thread::yield();
+    }
+  };
+  wide_hooks.after_inside_clade = [&](larch::clade_id, std::size_t level,
+                                      std::size_t stable_slot) {
+    CHECK(stable_slot < w8.worker_resolution().resolved_workers);
+    if (level == 0) wide_active.fetch_sub(1);
+  };
+  std::vector<larch::chart_scheduler_run_summary> first_w8_inside_runs;
+  std::vector<larch::chart_scheduler_run_summary> first_w8_outside_runs;
+  auto first_w8_chart = larch::build_lazy_inside_chart_scheduled(
+      plan, patterns, options, w8, &first_w8_inside_runs, &wide_hooks,
+      &w8_workspace);
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, first_w8_chart, larch::chart_options{}, w8,
+      &first_w8_outside_runs, nullptr, &w8_workspace);
+  check_lazy_charts_equal(serial, first_w8_chart);
+  CHECK(wide_active_high_water.load() >= 4);
+
+  std::vector<larch::chart_scheduler_run_summary> second_w8_inside_runs;
+  std::vector<larch::chart_scheduler_run_summary> second_w8_outside_runs;
+  auto second_w8_chart = larch::build_lazy_inside_chart_scheduled(
+      plan, patterns, options, w8, &second_w8_inside_runs, nullptr,
+      &w8_workspace);
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, second_w8_chart, larch::chart_options{}, w8,
+      &second_w8_outside_runs, nullptr, &w8_workspace);
+  check_lazy_charts_equal(first_w8_chart, second_w8_chart);
+  CHECK(first_w8_inside_runs.size() == second_w8_inside_runs.size());
+  CHECK(first_w8_outside_runs.size() == second_w8_outside_runs.size());
+  auto check_repeated_run_shape = [](auto const& lhs, auto const& rhs) {
+    CHECK(lhs.item_count == rhs.item_count);
+    CHECK(lhs.range_count == rhs.range_count);
+    CHECK(lhs.effective_grain == rhs.effective_grain);
+    CHECK(lhs.worker_tasks_submitted == rhs.worker_tasks_submitted);
+    CHECK(lhs.serial_reason == rhs.serial_reason);
+    CHECK(lhs.cancelled == rhs.cancelled);
+    CHECK(lhs.failed == rhs.failed);
+  };
+  for (std::size_t i = 0; i < first_w8_inside_runs.size(); ++i) {
+    check_repeated_run_shape(first_w8_inside_runs[i], second_w8_inside_runs[i]);
+  }
+  for (std::size_t i = 0; i < first_w8_outside_runs.size(); ++i) {
+    check_repeated_run_shape(first_w8_outside_runs[i],
+                             second_w8_outside_runs[i]);
+  }
+
+  larch::chart_options reference_options;
+  reference_options.score_ua_edge = true;
+  auto reference_lazy_options = options;
+  reference_lazy_options.chart = reference_options;
+  auto reference_serial =
+      larch::build_lazy_inside_chart(plan, patterns, reference_lazy_options);
+  larch::build_lazy_outside_chart_in_place(
+      plan, patterns, reference_serial, reference_options, larch::nuc_base::G);
+  auto reference_scheduled = larch::build_lazy_inside_chart_scheduled(
+      plan, patterns, reference_lazy_options, w4);
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, reference_scheduled, reference_options,
+      larch::nuc_base::G, w4);
+  check_lazy_charts_equal(reference_serial, reference_scheduled);
+
+  // Semantic exceptions are selected in level order, independent of which
+  // worker reports first.
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks w1_error_hooks;
+  w1_error_hooks.before_inside_clade = [](larch::clade_id clade,
+                                          std::size_t level, std::size_t) {
+    if (level == 0 && clade == larch::clade_id{0}) {
+      throw std::runtime_error("stable first lazy-wave error");
+    }
+  };
+  auto const w1_error = runtime_error_message([&] {
+    (void)larch::build_lazy_inside_chart_scheduled(plan, patterns, options, w1,
+                                                   nullptr, &w1_error_hooks);
+  });
+  std::atomic<bool> later_error_started = false;
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks w4_error_hooks;
+  w4_error_hooks.before_inside_clade = [&](larch::clade_id clade,
+                                           std::size_t level, std::size_t) {
+    if (level != 0) return;
+    if (clade == larch::clade_id{1}) {
+      later_error_started = true;
+      throw std::runtime_error("later lazy-wave error");
+    }
+    if (clade != larch::clade_id{0}) return;
+    for (std::size_t attempt = 0;
+         attempt < 1'000'000 && !later_error_started.load(); ++attempt) {
+      std::this_thread::yield();
+    }
+    throw std::runtime_error("stable first lazy-wave error");
+  };
+  auto const w4_error = runtime_error_message([&] {
+    (void)larch::build_lazy_inside_chart_scheduled(plan, patterns, options, w4,
+                                                   nullptr, &w4_error_hooks);
+  });
+  CHECK(w4_error == w1_error);
+
+  auto outside_w1_error_chart =
+      larch::build_lazy_inside_chart(plan, patterns, options);
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks
+      outside_w1_error_hooks;
+  outside_w1_error_hooks.before_outside_clade =
+      [](larch::clade_id clade, std::size_t level, std::size_t) {
+        if (level == 1 && clade == larch::clade_id{8}) {
+          throw std::runtime_error("stable first lazy-outside error");
+        }
+      };
+  auto const outside_w1_error = runtime_error_message([&] {
+    larch::build_lazy_outside_chart_in_place_scheduled(
+        plan, patterns, outside_w1_error_chart, larch::chart_options{}, w1,
+        nullptr, &outside_w1_error_hooks);
+  });
+  CHECK(outside_w1_error_chart.outside_rows_by_clade[8].empty());
+  CHECK(outside_w1_error_chart.outside_rows_by_clade[9].empty());
+  CHECK(!outside_w1_error_chart.outside_class_index_by_pattern_by_clade[8]);
+  CHECK(!outside_w1_error_chart.outside_class_index_by_pattern_by_clade[9]);
+
+  auto outside_w4_error_chart =
+      larch::build_lazy_inside_chart(plan, patterns, options);
+  std::atomic<bool> later_outside_error_started = false;
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks
+      outside_w4_error_hooks;
+  outside_w4_error_hooks.before_outside_clade =
+      [&](larch::clade_id clade, std::size_t level, std::size_t) {
+        if (level != 1) return;
+        if (clade == larch::clade_id{9}) {
+          later_outside_error_started = true;
+          throw std::runtime_error("later lazy-outside error");
+        }
+        if (clade != larch::clade_id{8}) return;
+        for (std::size_t attempt = 0;
+             attempt < 1'000'000 && !later_outside_error_started.load();
+             ++attempt) {
+          std::this_thread::yield();
+        }
+        throw std::runtime_error("stable first lazy-outside error");
+      };
+  auto const outside_w4_error = runtime_error_message([&] {
+    larch::build_lazy_outside_chart_in_place_scheduled(
+        plan, patterns, outside_w4_error_chart, larch::chart_options{}, w4,
+        nullptr, &outside_w4_error_hooks);
+  });
+  CHECK(outside_w4_error == outside_w1_error);
+  CHECK(outside_w4_error_chart.outside_rows_by_clade[8].empty());
+  CHECK(outside_w4_error_chart.outside_rows_by_clade[9].empty());
+  CHECK(!outside_w4_error_chart.outside_class_index_by_pattern_by_clade[8]);
+  CHECK(!outside_w4_error_chart.outside_class_index_by_pattern_by_clade[9]);
+
+  // A partially submitted level joins its accepted runner, publishes the
+  // failed run, and leaves the same scheduler/workspace reusable.
+  larch::chart_scheduler retry_scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_workspace retry_workspace;
+  larch::chart_scheduler_test_detail::access::fail_submission_after(
+      retry_scheduler, 1);
+  std::vector<larch::chart_scheduler_run_summary> failed_runs;
+  bool submit_error_escaped = false;
+  try {
+    (void)larch::build_lazy_inside_chart_scheduled(
+        plan, patterns, options, retry_scheduler, &failed_runs, nullptr,
+        &retry_workspace);
+  } catch (larch::chart_scheduler_submit_error const&) {
+    submit_error_escaped = true;
+  }
+  CHECK(submit_error_escaped);
+  CHECK(failed_runs.size() == 1);
+  CHECK(failed_runs.front().failed);
+  CHECK(failed_runs.front().worker_tasks_submitted == 1);
+  CHECK(retry_scheduler.metrics().pending_tasks == 0);
+  auto recovered = larch::build_lazy_inside_chart_scheduled(
+      plan, patterns, options, retry_scheduler, nullptr, nullptr,
+      &retry_workspace);
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, recovered, larch::chart_options{}, retry_scheduler,
+      nullptr, nullptr, &retry_workspace);
+  check_lazy_charts_equal(serial, recovered);
+
+  larch::chart_scheduler outside_retry_scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  auto outside_retry_chart =
+      larch::build_lazy_inside_chart(plan, patterns, options);
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_workspace
+      outside_retry_workspace;
+  larch::chart_scheduler_test_detail::access::fail_submission_after(
+      outside_retry_scheduler, 1);
+  std::vector<larch::chart_scheduler_run_summary> outside_failed_runs;
+  bool outside_submit_error_escaped = false;
+  try {
+    larch::build_lazy_outside_chart_in_place_scheduled(
+        plan, patterns, outside_retry_chart, larch::chart_options{},
+        outside_retry_scheduler, &outside_failed_runs, nullptr,
+        &outside_retry_workspace);
+  } catch (larch::chart_scheduler_submit_error const&) {
+    outside_submit_error_escaped = true;
+  }
+  CHECK(outside_submit_error_escaped);
+  CHECK(outside_failed_runs.size() == 1);
+  CHECK(outside_failed_runs.front().failed);
+  CHECK(outside_failed_runs.front().worker_tasks_submitted == 1);
+  CHECK(outside_retry_scheduler.metrics().pending_tasks == 0);
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, outside_retry_chart, larch::chart_options{},
+      outside_retry_scheduler, nullptr, nullptr, &outside_retry_workspace);
+  check_lazy_charts_equal(serial, outside_retry_chart);
+
+  // Reusing one W1 scheduled workspace for a multifurcating build keeps both
+  // the per-pattern rows and generic recurrence buffers at their first-build
+  // capacities.
+  auto const multifurcating_grammar = make_nonlex_multifurcating_grammar();
+  auto const multifurcating_plan =
+      larch::build_chart_execution_plan(multifurcating_grammar);
+  auto const multifurcating_patterns = make_nonlex_four_taxon_patterns();
+  larch::lazy_chart_detail::plan_lazy_chart_scheduler_workspace reuse_workspace;
+  auto build_multifurcating = [&] {
+    auto chart = larch::build_lazy_inside_chart_scheduled(
+        multifurcating_plan, multifurcating_patterns, options, w1, nullptr,
+        nullptr, &reuse_workspace);
+    larch::build_lazy_outside_chart_in_place_scheduled(
+        multifurcating_plan, multifurcating_patterns, chart,
+        larch::chart_options{}, w1, nullptr, nullptr, &reuse_workspace);
+    return chart;
+  };
+  auto const multifurcating_oracle = larch::build_lazy_outside_chart(
+      multifurcating_plan, multifurcating_patterns,
+      larch::build_lazy_inside_chart(multifurcating_plan,
+                                     multifurcating_patterns, options));
+  auto first_multifurcating = build_multifurcating();
+  check_lazy_charts_equal(multifurcating_oracle, first_multifurcating);
+  auto const& reuse_slot = reuse_workspace.outside_by_slot.front();
+  auto const pattern_capacity = reuse_slot.outside_by_pattern.capacity();
+  auto const recurrence_result_capacity =
+      reuse_slot.recurrence_scratch.result.capacity();
+  auto const recurrence_child_capacity =
+      reuse_slot.recurrence_scratch.child_best.capacity();
+  auto const capacity_growths = reuse_slot.outside_pattern_capacity_growths;
+  CHECK(pattern_capacity >= multifurcating_patterns.patterns.size());
+  CHECK(recurrence_result_capacity >= 3);
+  CHECK(recurrence_child_capacity >= 3);
+  auto second_multifurcating = build_multifurcating();
+  check_lazy_charts_equal(multifurcating_oracle, second_multifurcating);
+  CHECK(reuse_slot.outside_by_pattern.capacity() == pattern_capacity);
+  CHECK(reuse_slot.recurrence_scratch.result.capacity() ==
+        recurrence_result_capacity);
+  CHECK(reuse_slot.recurrence_scratch.child_best.capacity() ==
+        recurrence_child_capacity);
+  CHECK(reuse_slot.outside_pattern_capacity_growths == capacity_growths);
+
+  // A leaf root has no scheduled outside levels. Root initialization remains
+  // serial and produces exactly the ordinary chart.
+  larch::clade_grammar root_only;
+  root_only.taxa.id_to_sample_id = {"A"};
+  root_only.taxa.sample_id_to_id = {{"A", larch::taxon_id{0}}};
+  root_only.clades = {{{larch::taxon_id{0}}}};
+  root_only.productions_by_parent = {{}};
+  root_only.productions_by_child = {{}};
+  root_only.root_clade = larch::clade_id{0};
+  root_only.execution_generation =
+      larch::detail::allocate_clade_grammar_execution_generation();
+  auto const root_plan = larch::build_chart_execution_plan(root_only);
+  auto const root_patterns = make_weighted_patterns(1);
+  std::vector<larch::chart_scheduler_run_summary> root_inside_runs;
+  std::vector<larch::chart_scheduler_run_summary> root_outside_runs;
+  auto root_scheduled = larch::build_lazy_inside_chart_scheduled(
+      root_plan, root_patterns, options, w4, &root_inside_runs);
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      root_plan, root_patterns, root_scheduled, larch::chart_options{}, w4,
+      &root_outside_runs);
+  auto root_serial =
+      larch::build_lazy_inside_chart(root_plan, root_patterns, options);
+  larch::build_lazy_outside_chart_in_place(root_plan, root_patterns,
+                                           root_serial, larch::chart_options{});
+  check_lazy_charts_equal(root_serial, root_scheduled);
+  CHECK(root_inside_runs.size() == 1);
+  CHECK(root_outside_runs.empty());
+}
+
 static void test_plan_packed_key_narrowing_and_accounting() {
   std::println("test_plan_packed_key_narrowing_and_accounting");
   using larch::lazy_key_grouping_detail::checked_packed_key_word;
@@ -953,7 +1483,7 @@ static void test_plan_packed_key_narrowing_and_accounting() {
   larch::lazy_chart_detail::plan_parent_key_workspace workspace;
   {
     auto keys = larch::lazy_chart_detail::collect_plan_parent_keys(
-        chart, plan, patterns, larch::clade_id{4}, nullptr, workspace);
+        chart, plan, patterns, larch::clade_id{4}, workspace);
     CHECK(keys.memory.structural_key_count == patterns.patterns.size());
     CHECK(keys.memory.structural_key_width == 2);
     CHECK(keys.memory.row_key_count == keys.structural_classes().class_count());
@@ -967,14 +1497,14 @@ static void test_plan_packed_key_narrowing_and_accounting() {
           keys.memory.actual_capacity_resident_bytes);
   }
   auto reused = larch::lazy_chart_detail::collect_plan_parent_keys(
-      chart, plan, patterns, larch::clade_id{4}, nullptr, workspace);
+      chart, plan, patterns, larch::clade_id{4}, workspace);
   CHECK(reused.memory.structural_word_preparation.reused_existing_capacity);
   CHECK(reused.memory.structural_grouping_preparation.reused_existing_capacity);
   CHECK(reused.memory.row_word_preparation.reused_existing_capacity);
   CHECK(reused.memory.row_grouping_preparation.reused_existing_capacity);
 
   auto owned = larch::lazy_chart_detail::collect_plan_parent_keys(
-      chart, plan, patterns, larch::clade_id{4}, nullptr);
+      chart, plan, patterns, larch::clade_id{4});
   CHECK(owned.owned_storage != nullptr);
   CHECK(owned.storage == owned.owned_storage.get());
   std::size_t multifurcation_counter = 0;
@@ -1473,6 +2003,7 @@ int main() {
   test_checked_and_plan_lazy_score_and_exact_trim_equivalence();
   test_checked_and_plan_lazy_multifurcation_equivalence();
   test_nonlex_packed_plan_lazy_grouping_equivalence();
+  test_scheduled_plan_lazy_dependency_wavefronts();
   test_plan_packed_key_narrowing_and_accounting();
   test_grammar_packed_key_first_occurrence_reuse_and_accounting();
   test_packed_outside_context_order_reuse_and_accounting();

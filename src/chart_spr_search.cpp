@@ -3817,7 +3817,7 @@ chart_spr_lazy_commit_stats chart_spr_refresh_lazy_chart_after_local_commit(
           next, execution_plan, patterns, dense, lazy_options);
     } else {
       auto keys = lazy_chart_detail::collect_plan_parent_keys(
-          next, execution_plan, patterns, dense, nullptr);
+          next, execution_plan, patterns, dense);
       lazy_chart_detail::assign_plan_internal_classes(
           next, execution_plan, patterns, dense, keys);
     }
@@ -6611,12 +6611,19 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.scheduler = scheduler.metrics();
   auto const& scheduler_metrics = result.summary.scheduler;
   auto const& axes = state.counters.scheduler_axes;
-  std::array<chart_spr_scheduler_axis_metrics const*, 10> axis_list{
-      &axes.initial_chart_patterns,         &axes.exact_setup_patterns,
-      &axes.exact_frontier_clades,          &axes.exact_candidates,
-      &axes.inside_cache_patterns,          &axes.outside_cache_patterns,
-      &axes.fixed_topology_patterns,        &axes.local_score_candidates,
-      &axes.local_score_candidate_patterns, &axes.other,
+  std::array<chart_spr_scheduler_axis_metrics const*, 12> axis_list{
+      &axes.initial_chart_patterns,
+      &axes.exact_setup_patterns,
+      &axes.exact_frontier_clades,
+      &axes.exact_candidates,
+      &axes.lazy_inside_clades,
+      &axes.lazy_outside_clades,
+      &axes.inside_cache_patterns,
+      &axes.outside_cache_patterns,
+      &axes.fixed_topology_patterns,
+      &axes.local_score_candidates,
+      &axes.local_score_candidate_patterns,
+      &axes.other,
   };
   std::uint64_t axis_operations = 0;
   std::uint64_t axis_parallel_operations = 0;

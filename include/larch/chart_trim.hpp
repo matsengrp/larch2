@@ -443,10 +443,11 @@ template <class Children, class RowProvider, class TransitionCost,
 inline void scatter_production_outside_rows_impl(
     Children const& children, outside_chart_row const& parent_outside,
     RowProvider&& inside_provider, TransitionCost&& transition_cost,
-    RowConsumer&& consume_row, outside_recurrence_work_stats& work) {
-  // consume_row must consume each row synchronously.  Binary rows live on this
-  // stack frame and generic rows live in the local scratch below; no result or
-  // cache stores a view into either lifetime.
+    RowConsumer&& consume_row, outside_recurrence_work_stats& work,
+    generic_outside_recurrence_scratch* reusable_scratch = nullptr) {
+  // consume_row must consume each row synchronously. Binary rows live on this
+  // stack frame and generic rows live in local or caller-owned reusable
+  // scratch; no result or cache stores a view into either lifetime.
   if (children.size() == 2) {
     ++work.binary_stack_productions_scored;
     for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
@@ -462,7 +463,9 @@ inline void scatter_production_outside_rows_impl(
   }
 
   ++work.generic_reusable_productions_scored;
-  generic_outside_recurrence_scratch scratch;
+  generic_outside_recurrence_scratch local_scratch;
+  auto& scratch =
+      reusable_scratch != nullptr ? *reusable_scratch : local_scratch;
   for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
        ++parent_state) {
     auto const base = parent_outside[parent_state];
@@ -500,6 +503,21 @@ inline void scatter_production_outside_rows(
   scatter_production_outside_rows_impl(
       children, parent_outside, std::forward<RowProvider>(inside_provider),
       transition_cost, std::forward<RowConsumer>(consume_row), work);
+}
+
+template <class RowProvider, class RowConsumer>
+inline void scatter_production_outside_rows(
+    chart_execution_plan const& plan, std::span<clade_id const> children,
+    outside_chart_row const& parent_outside, RowProvider&& inside_provider,
+    RowConsumer&& consume_row, outside_recurrence_work_stats& work,
+    generic_outside_recurrence_scratch& reusable_scratch) {
+  auto transition_cost = [&](std::uint8_t from, std::uint8_t to) {
+    return static_cast<chart_cost>(plan.transition_cost(from, to));
+  };
+  scatter_production_outside_rows_impl(
+      children, parent_outside, std::forward<RowProvider>(inside_provider),
+      transition_cost, std::forward<RowConsumer>(consume_row), work,
+      &reusable_scratch);
 }
 
 inline chart_cost production_choice_inside_cost(

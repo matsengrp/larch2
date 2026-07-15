@@ -4196,6 +4196,10 @@ static void run_chart_spr_search_diagnostic(
                                     scheduler_axes.exact_frontier_clades, "  ");
   print_chart_scheduler_axis_fields(out, "exact_candidate",
                                     scheduler_axes.exact_candidates, "  ");
+  print_chart_scheduler_axis_fields(out, "lazy_inside_clade",
+                                    scheduler_axes.lazy_inside_clades, "  ");
+  print_chart_scheduler_axis_fields(out, "lazy_outside_clade",
+                                    scheduler_axes.lazy_outside_clades, "  ");
   print_chart_scheduler_axis_fields(out, "inside_cache",
                                     scheduler_axes.inside_cache_patterns, "  ");
   print_chart_scheduler_axis_fields(
