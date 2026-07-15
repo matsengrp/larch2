@@ -926,6 +926,106 @@ source_after_topology_refs_from_tree_keys(
   return refs;
 }
 
+// Immutable before-side state shared by every projected move from one sampled
+// tree.  Preparation is deliberately the only operation that mutates the
+// source tree (to publish clade offsets); projection itself only reads this
+// snapshot and edits a task-local clone.  The base and tree are pinned borrows:
+// both objects must remain alive, at the same addresses, and unmodified until
+// every projection task using the context has joined.
+class sampled_tree_projection_context {
+ public:
+  sampled_tree_projection_context(sampled_tree_projection_context const&) =
+      delete;
+  sampled_tree_projection_context& operator=(
+      sampled_tree_projection_context const&) = delete;
+  sampled_tree_projection_context(sampled_tree_projection_context&&) = delete;
+  sampled_tree_projection_context& operator=(
+      sampled_tree_projection_context&&) = delete;
+
+  [[nodiscard]] clade_grammar const& base() const noexcept { return *base_; }
+  [[nodiscard]] phylo_dag const& source_tree() const noexcept { return *tree_; }
+  [[nodiscard]] tree_index const& index() const noexcept { return index_; }
+  [[nodiscard]] std::map<std::vector<taxon_id>, clade_id> const& base_lookup()
+      const noexcept {
+    return base_lookup_;
+  }
+  [[nodiscard]] std::vector<clade_id> const& node_to_base_clade()
+      const noexcept {
+    return node_to_base_clade_;
+  }
+  [[nodiscard]] std::set<production_taxa_key> const& before_keys()
+      const noexcept {
+    return before_keys_;
+  }
+  [[nodiscard]] std::vector<production_taxa_key> const& ordered_before_keys()
+      const noexcept {
+    return ordered_before_keys_;
+  }
+  [[nodiscard]] std::optional<std::vector<overlay_production_ref>> const&
+  source_before_topology_refs() const noexcept {
+    return source_before_topology_refs_;
+  }
+
+ private:
+  struct prepared_tag {};
+
+  sampled_tree_projection_context(prepared_tag, clade_grammar const& base,
+                                  phylo_dag& tree,
+                                  clade_grammar before_tree_grammar)
+      : base_{&base},
+        tree_{&tree},
+        base_lookup_{build_clade_lookup(base)},
+        index_{tree} {
+    node_to_base_clade_.assign(before_tree_grammar.node_to_clade.size(),
+                               no_clade);
+    for (std::size_t node = 0; node < before_tree_grammar.node_to_clade.size();
+         ++node) {
+      auto tree_clade = before_tree_grammar.node_to_clade[node];
+      if (tree_clade == no_clade) continue;
+      auto base_taxa = convert_tree_clade_taxa_to_base_taxa(
+          base, before_tree_grammar, tree_clade);
+      auto found = base_lookup_.find(base_taxa);
+      if (found != base_lookup_.end())
+        node_to_base_clade_[node] = found->second;
+    }
+
+    ordered_before_keys_.reserve(before_tree_grammar.productions.size());
+    for (auto const& prod : before_tree_grammar.productions) {
+      auto key = production_key_from_tree_in_base_taxa(
+          base, before_tree_grammar, prod);
+      before_keys_.insert(key);
+      ordered_before_keys_.push_back(std::move(key));
+    }
+    source_before_topology_refs_ = source_before_topology_refs_from_tree_keys(
+        base, base_lookup_, ordered_before_keys_);
+  }
+
+  friend sampled_tree_projection_context prepare_sampled_tree_projection(
+      clade_grammar const&, phylo_dag&);
+
+  clade_grammar const* base_ = nullptr;
+  phylo_dag const* tree_ = nullptr;
+  std::map<std::vector<taxon_id>, clade_id> base_lookup_;
+  std::vector<clade_id> node_to_base_clade_;
+  std::set<production_taxa_key> before_keys_;
+  std::vector<production_taxa_key> ordered_before_keys_;
+  std::optional<std::vector<overlay_production_ref>>
+      source_before_topology_refs_;
+  tree_index index_;
+};
+
+inline sampled_tree_projection_context prepare_sampled_tree_projection(
+    clade_grammar const& base, phylo_dag& tree) {
+  build_clade_offsets(tree);
+  auto before_tree_grammar = build_clade_grammar(tree);
+  return sampled_tree_projection_context{
+      sampled_tree_projection_context::prepared_tag{}, base, tree,
+      std::move(before_tree_grammar)};
+}
+
+inline sampled_tree_projection_context prepare_sampled_tree_projection(
+    clade_grammar const&&, phylo_dag&) = delete;
+
 inline void add_candidate_production_by_taxa(
     clade_grammar const& grammar, grammar_spr_candidate& candidate,
     std::map<std::vector<taxon_id>, clade_id> const& base_lookup,
@@ -1004,6 +1104,65 @@ inline std::optional<grammar_spr_candidate> make_candidate_from_tree_diff(
       base, candidate, base_lookup, ordered_after_keys);
   if (source_before && source_after) {
     candidate.source_before_topology_productions = std::move(*source_before);
+    candidate.source_after_topology_productions = std::move(*source_after);
+  }
+  return candidate;
+}
+
+// Prepared equivalent of make_candidate_from_tree_diff().  The before-side
+// production keys, base lookup, node mapping, and topology certificate were
+// computed once at the sampled-tree publication boundary.
+inline std::optional<grammar_spr_candidate>
+make_candidate_from_tree_diff_prepared(
+    sampled_tree_projection_context const& prepared,
+    clade_grammar const& after_tree, grammar_spr_candidate candidate) {
+  auto const& base = prepared.base();
+  auto const& base_lookup = prepared.base_lookup();
+  std::map<std::vector<taxon_id>, clade_id> temp_lookup;
+
+  std::set<production_taxa_key> after_keys;
+  std::vector<production_taxa_key> ordered_after_keys;
+  ordered_after_keys.reserve(after_tree.productions.size());
+  for (auto const& prod : after_tree.productions) {
+    auto key = production_key_from_tree_in_base_taxa(base, after_tree, prod);
+    after_keys.insert(key);
+    ordered_after_keys.push_back(std::move(key));
+  }
+
+  for (auto const& key : prepared.ordered_before_keys()) {
+    if (after_keys.contains(key)) continue;
+    auto base_pid = find_base_production_by_key(base, base_lookup, key);
+    if (!base_pid) return std::nullopt;
+    candidate.removed_productions.push_back(base_production_ref(*base_pid));
+  }
+  std::sort(candidate.removed_productions.begin(),
+            candidate.removed_productions.end());
+  candidate.removed_productions.erase(
+      std::unique(candidate.removed_productions.begin(),
+                  candidate.removed_productions.end()),
+      candidate.removed_productions.end());
+
+  for (auto const& key : ordered_after_keys) {
+    auto base_pid = find_base_production_by_key(base, base_lookup, key);
+    if (prepared.before_keys().contains(key) ||
+        (base_pid &&
+         !candidate_removes_base_production(candidate, *base_pid))) {
+      continue;
+    }
+    add_candidate_production_by_taxa(base, candidate, base_lookup, temp_lookup,
+                                     key.parent, key.children);
+  }
+
+  if (candidate.removed_productions.empty() &&
+      candidate.added_productions.empty()) {
+    return std::nullopt;
+  }
+
+  auto source_after = source_after_topology_refs_from_tree_keys(
+      base, candidate, base_lookup, ordered_after_keys);
+  if (prepared.source_before_topology_refs() && source_after) {
+    candidate.source_before_topology_productions =
+        *prepared.source_before_topology_refs();
     candidate.source_after_topology_productions = std::move(*source_after);
   }
   return candidate;
@@ -2700,13 +2859,13 @@ inline std::vector<grammar_spr_candidate> enumerate_grammar_spr_candidates(
 }
 
 inline std::optional<grammar_spr_candidate> project_tree_spr_move_to_candidate(
-    clade_grammar const& base, phylo_dag& tree, spr_move const& move) {
+    chart_spr_detail::sampled_tree_projection_context const& prepared,
+    spr_move const& move) {
   using namespace chart_spr_detail;
-  build_clade_offsets(tree);
-  auto before_tree_grammar = build_clade_grammar(tree);
-  auto base_lookup = build_clade_lookup(base);
+  auto const& base = prepared.base();
+  auto& tree = prepared.source_tree();
+  auto const& index = prepared.index();
 
-  tree_index index{tree};
   if (!index.is_valid(move.src) || !index.is_valid(move.dst)) return std::nullopt;
   if (move.src == move.dst || move.src == index.get_tree_root())
     return std::nullopt;
@@ -2715,19 +2874,21 @@ inline std::optional<grammar_spr_candidate> project_tree_spr_move_to_candidate(
   auto src_parent_node = index.get_parent(move.src);
   if (index.get_num_children(src_parent_node) != 2) return std::nullopt;
 
-  auto moved = tree_node_to_base_clade(base, before_tree_grammar, base_lookup,
-                                       move.src);
-  auto old_parent = tree_node_to_base_clade(base, before_tree_grammar,
-                                           base_lookup, src_parent_node);
-  auto target = tree_node_to_base_clade(base, before_tree_grammar, base_lookup,
-                                        move.dst);
+  auto mapped_clade = [&](std::size_t node) -> std::optional<clade_id> {
+    if (node >= prepared.node_to_base_clade().size()) return std::nullopt;
+    auto clade = prepared.node_to_base_clade()[node];
+    if (clade == no_clade) return std::nullopt;
+    return clade;
+  };
+  auto moved = mapped_clade(move.src);
+  auto old_parent = mapped_clade(src_parent_node);
+  auto target = mapped_clade(move.dst);
   if (!moved || !old_parent || !target) return std::nullopt;
 
   std::optional<clade_id> old_sibling;
   for (auto child : index.get_children(src_parent_node)) {
     if (child == move.src) continue;
-    old_sibling = tree_node_to_base_clade(base, before_tree_grammar,
-                                          base_lookup, child);
+    old_sibling = mapped_clade(child);
   }
   if (!old_sibling) return std::nullopt;
 
@@ -2738,13 +2899,30 @@ inline std::optional<grammar_spr_candidate> project_tree_spr_move_to_candidate(
   candidate.new_sibling_or_target = base_clade_ref(*target);
   candidate.source_tree_move = move;
 
-  auto after_tree = apply_spr_move(tree, move.src, move.dst);
+  auto after_tree = apply_spr_move_topology_only(tree, move.src, move.dst);
+  // The topology edit invalidates the clone's inherited CSR offsets.  Rebuild
+  // on this task-local object before deriving descendant-taxon clades.
   build_clade_offsets(after_tree);
   auto after_tree_grammar = build_clade_grammar(after_tree);
 
-  return make_candidate_from_tree_diff(base, before_tree_grammar,
-                                       after_tree_grammar,
-                                       std::move(candidate));
+  return make_candidate_from_tree_diff_prepared(prepared, after_tree_grammar,
+                                                std::move(candidate));
+}
+
+inline std::optional<grammar_spr_candidate> project_tree_spr_move_to_candidate(
+    clade_grammar const& base, phylo_dag& tree, spr_move const& move) {
+  auto prepared = chart_spr_detail::prepare_sampled_tree_projection(base, tree);
+  return project_tree_spr_move_to_candidate(prepared, move);
+}
+
+inline std::optional<grammar_spr_candidate> project_tree_spr_move_to_candidate(
+    chart_spr_detail::sampled_tree_projection_context const& prepared,
+    profitable_move const& move) {
+  spr_move source{.src = move.src,
+                  .dst = move.dst,
+                  .lca = move.lca,
+                  .score_change = move.score_change};
+  return project_tree_spr_move_to_candidate(prepared, source);
 }
 
 inline std::optional<grammar_spr_candidate> project_tree_spr_move_to_candidate(
@@ -2760,8 +2938,8 @@ inline std::vector<grammar_spr_candidate> bootstrap_spr_candidates_from_tree(
     clade_grammar const& base, phylo_dag& tree,
     tree_spr_bootstrap_options options = {}) {
   using namespace chart_spr_detail;
-  build_clade_offsets(tree);
-  tree_index index{tree};
+  auto projection = prepare_sampled_tree_projection(base, tree);
+  auto const& index = projection.index();
   move_enumerator enumerator{index, options.score_threshold};
   auto radius = options.radius > 0 ? options.radius
                                    : compute_tree_max_depth(tree) * 2;
@@ -2781,7 +2959,7 @@ inline std::vector<grammar_spr_candidate> bootstrap_spr_candidates_from_tree(
   std::vector<grammar_spr_candidate> candidates;
   std::set<std::string> seen;
   for (auto const& move : moves) {
-    auto projected = project_tree_spr_move_to_candidate(base, tree, move);
+    auto projected = project_tree_spr_move_to_candidate(projection, move);
     if (!projected) continue;
     append_deduplicated_candidate_by_taxa(base, candidates, seen,
                                           std::move(*projected),
@@ -3056,7 +3234,8 @@ chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
   for (std::size_t sample_i = 0;
        sample_i < options.sampled_tree_count && !stopped(); ++sample_i) {
     auto tree = build_sampled_tree_from_grammar(grammar, options, sample_i, rng);
-    tree_index index{tree};
+    auto projection = prepare_sampled_tree_projection(grammar, tree);
+    auto const& index = projection.index();
     move_enumerator enumerator{index, options.sampled_tree_score_threshold};
     auto radius = options.sampled_tree_spr_radius > 0
                       ? options.sampled_tree_spr_radius
@@ -3071,7 +3250,7 @@ chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
         request_stop(chart_spr_candidate_stop_reason::candidate_cap);
         stop_now();
       }
-      auto projected = project_tree_spr_move_to_candidate(grammar, tree, move);
+      auto projected = project_tree_spr_move_to_candidate(projection, move);
       if (!projected) {
         note_pruned_after(stats,
                           &chart_spr_candidate_generation_stats::

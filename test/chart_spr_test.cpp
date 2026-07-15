@@ -3,14 +3,17 @@
 #include "test_util.hpp"
 
 #include <algorithm>
+#include <future>
 #include <limits>
 #include <optional>
 #include <print>
 #include <random>
-#include <stdexcept>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -23,6 +26,24 @@
   do { \
     if (!(expr)) test_fail(#expr, __FILE__, __LINE__); \
   } while (false)
+
+template <typename Base>
+concept can_prepare_sampled_tree_projection =
+    requires(Base&& base, larch::phylo_dag& tree) {
+      larch::chart_spr_detail::prepare_sampled_tree_projection(
+          std::forward<Base>(base), tree);
+    };
+
+using sampled_tree_projection_context =
+    larch::chart_spr_detail::sampled_tree_projection_context;
+static_assert(!std::is_copy_constructible_v<sampled_tree_projection_context>);
+static_assert(!std::is_move_constructible_v<sampled_tree_projection_context>);
+static_assert(can_prepare_sampled_tree_projection<larch::clade_grammar&>);
+static_assert(!can_prepare_sampled_tree_projection<larch::clade_grammar>);
+static_assert(std::is_same_v<
+              decltype(std::declval<sampled_tree_projection_context const&>()
+                           .source_tree()),
+              larch::phylo_dag const&>);
 
 static larch::test::tiny_tree_node four_taxon_base_tree() {
   using larch::test::tiny_inner;
@@ -133,6 +154,230 @@ static std::set<std::string> production_shape(larch::clade_grammar const& gramma
     result.insert(out.str());
   }
   return result;
+}
+
+struct projection_source_node_snapshot {
+  std::size_t index = 0;
+  int kind = 0;
+  larch::compact_genome compact_genome;
+  std::string sample_id;
+
+  bool operator==(projection_source_node_snapshot const&) const = default;
+};
+
+struct projection_source_edge_snapshot {
+  std::size_t index = 0;
+  std::size_t parent = 0;
+  std::size_t child = 0;
+  std::size_t clade_index = 0;
+  float edge_weight = 0;
+  larch::edge_mutations mutations;
+
+  bool operator==(projection_source_edge_snapshot const&) const = default;
+};
+
+struct projection_source_snapshot {
+  std::size_t root = 0;
+  std::size_t node_high_mark = 0;
+  std::size_t edge_high_mark = 0;
+  std::string reference;
+  std::vector<projection_source_node_snapshot> nodes;
+  std::vector<projection_source_edge_snapshot> edges;
+
+  bool operator==(projection_source_snapshot const&) const = default;
+};
+
+static projection_source_snapshot snapshot_projection_source(
+    larch::phylo_dag& tree) {
+  projection_source_snapshot result;
+  result.root = larch::get_root_idx(tree);
+  result.node_high_mark = tree.node_high_mark();
+  result.edge_high_mark = tree.edge_high_mark();
+  result.reference = larch::get_reference_sequence(tree);
+  for (auto node_variant : tree.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          projection_source_node_snapshot snapshot;
+          snapshot.index = node.index();
+          if constexpr (requires { node.reference_sequence(); }) {
+            snapshot.kind = 0;
+          } else if constexpr (requires {
+                                 node.sample_id();
+                                 node.cg();
+                               }) {
+            snapshot.kind = 2;
+            snapshot.compact_genome = node.cg();
+            snapshot.sample_id = node.sample_id();
+          } else {
+            snapshot.kind = 1;
+            snapshot.compact_genome = node.cg();
+          }
+          result.nodes.push_back(std::move(snapshot));
+        },
+        node_variant);
+  }
+  for (auto edge_variant : tree.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          result.edges.push_back(projection_source_edge_snapshot{
+              .index = edge.index(),
+              .parent = larch::get_parent_idx(tree, edge.index()),
+              .child = larch::get_child_idx(tree, edge.index()),
+              .clade_index = edge.clade_index(),
+              .edge_weight = edge.edge_weight(),
+              .mutations = edge.mutations()});
+        },
+        edge_variant);
+  }
+  return result;
+}
+
+static void check_projection_clone_annotations_are_sparse(
+    larch::phylo_dag& tree) {
+  std::size_t edge_count = 0;
+  for (auto edge_variant : tree.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          ++edge_count;
+          CHECK(edge.mutations().empty());
+          CHECK(edge.edge_weight() == 0.0F);
+        },
+        edge_variant);
+  }
+  CHECK(edge_count > 0);
+
+  for (auto node_variant : tree.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (
+              requires { node.cg(); } && !requires { node.sample_id(); }) {
+            CHECK(node.cg() == larch::compact_genome{});
+          }
+        },
+        node_variant);
+  }
+}
+
+static void check_production_witness_equal(
+    larch::production_witness const& lhs,
+    larch::production_witness const& rhs) {
+  CHECK(lhs.parent_node == rhs.parent_node);
+  CHECK(lhs.children.size() == rhs.children.size());
+  for (std::size_t i = 0; i < lhs.children.size(); ++i) {
+    CHECK(lhs.children[i].child == rhs.children[i].child);
+    CHECK(lhs.children[i].edge_alternatives ==
+          rhs.children[i].edge_alternatives);
+  }
+}
+
+static void check_overlay_production_equal(
+    larch::overlay_grammar_production const& lhs,
+    larch::overlay_grammar_production const& rhs) {
+  CHECK(lhs.parent == rhs.parent);
+  CHECK(lhs.children == rhs.children);
+  CHECK(lhs.multiplicity == rhs.multiplicity);
+  CHECK(lhs.witnesses.size() == rhs.witnesses.size());
+  for (std::size_t i = 0; i < lhs.witnesses.size(); ++i) {
+    check_production_witness_equal(lhs.witnesses[i], rhs.witnesses[i]);
+  }
+}
+
+static void check_optional_source_move_equal(
+    std::optional<larch::spr_move> const& lhs,
+    std::optional<larch::spr_move> const& rhs) {
+  CHECK(lhs.has_value() == rhs.has_value());
+  if (!lhs) return;
+  CHECK(lhs->src == rhs->src);
+  CHECK(lhs->dst == rhs->dst);
+  CHECK(lhs->lca == rhs->lca);
+  CHECK(lhs->score_change == rhs->score_change);
+}
+
+static void check_candidate_payload_equal(
+    larch::clade_grammar const& base, larch::grammar_spr_candidate const& lhs,
+    larch::grammar_spr_candidate const& rhs) {
+  CHECK(lhs.moved_clade == rhs.moved_clade);
+  CHECK(lhs.old_parent == rhs.old_parent);
+  CHECK(lhs.old_sibling == rhs.old_sibling);
+  CHECK(lhs.new_sibling_or_target == rhs.new_sibling_or_target);
+  CHECK(lhs.removed_productions == rhs.removed_productions);
+  CHECK(lhs.added_clades == rhs.added_clades);
+  CHECK(lhs.added_productions.size() == rhs.added_productions.size());
+  for (std::size_t i = 0; i < lhs.added_productions.size(); ++i) {
+    check_overlay_production_equal(lhs.added_productions[i],
+                                   rhs.added_productions[i]);
+  }
+  check_optional_source_move_equal(lhs.source_tree_move, rhs.source_tree_move);
+  CHECK(lhs.source_before_topology_productions ==
+        rhs.source_before_topology_productions);
+  CHECK(lhs.source_after_topology_productions ==
+        rhs.source_after_topology_productions);
+  CHECK(larch::chart_spr_candidate_taxon_signature(base, lhs) ==
+        larch::chart_spr_candidate_taxon_signature(base, rhs));
+  CHECK(larch::chart_spr_candidate_sample_signature(base, lhs) ==
+        larch::chart_spr_candidate_sample_signature(base, rhs));
+
+  auto lhs_materialized = larch::materialize_overlay_grammar(
+      larch::overlay_from_candidate(base, lhs));
+  auto rhs_materialized = larch::materialize_overlay_grammar(
+      larch::overlay_from_candidate(base, rhs));
+  CHECK(clade_shape(lhs_materialized.grammar) ==
+        clade_shape(rhs_materialized.grammar));
+  CHECK(production_shape(lhs_materialized.grammar) ==
+        production_shape(rhs_materialized.grammar));
+}
+
+// Independent oracle for the pre-preparation projection algorithm.  It
+// intentionally performs the annotated legacy SPR edit and recomputes every
+// before-side lookup so differential tests can detect a bad prepared cache or
+// an annotation-dependent topology result.
+static std::optional<larch::grammar_spr_candidate>
+project_tree_spr_move_annotated_oracle(larch::clade_grammar const& base,
+                                       larch::phylo_dag& tree,
+                                       larch::spr_move const& move) {
+  using namespace larch;
+  using namespace larch::chart_spr_detail;
+
+  build_clade_offsets(tree);
+  auto before_tree_grammar = build_clade_grammar(tree);
+  auto base_lookup = build_clade_lookup(base);
+  tree_index index{tree};
+  if (!index.is_valid(move.src) || !index.is_valid(move.dst))
+    return std::nullopt;
+  if (move.src == move.dst || move.src == index.get_tree_root())
+    return std::nullopt;
+  if (index.is_ancestor(move.src, move.dst)) return std::nullopt;
+
+  auto src_parent_node = index.get_parent(move.src);
+  if (index.get_num_children(src_parent_node) != 2) return std::nullopt;
+  auto moved =
+      tree_node_to_base_clade(base, before_tree_grammar, base_lookup, move.src);
+  auto old_parent = tree_node_to_base_clade(base, before_tree_grammar,
+                                            base_lookup, src_parent_node);
+  auto target =
+      tree_node_to_base_clade(base, before_tree_grammar, base_lookup, move.dst);
+  if (!moved || !old_parent || !target) return std::nullopt;
+
+  std::optional<clade_id> old_sibling;
+  for (auto child : index.get_children(src_parent_node)) {
+    if (child == move.src) continue;
+    old_sibling =
+        tree_node_to_base_clade(base, before_tree_grammar, base_lookup, child);
+  }
+  if (!old_sibling) return std::nullopt;
+
+  grammar_spr_candidate candidate;
+  candidate.moved_clade = base_clade_ref(*moved);
+  candidate.old_parent = base_clade_ref(*old_parent);
+  candidate.old_sibling = base_clade_ref(*old_sibling);
+  candidate.new_sibling_or_target = base_clade_ref(*target);
+  candidate.source_tree_move = move;
+
+  auto after_tree = apply_spr_move(tree, move.src, move.dst);
+  build_clade_offsets(after_tree);
+  auto after_tree_grammar = build_clade_grammar(after_tree);
+  return make_candidate_from_tree_diff(
+      base, before_tree_grammar, after_tree_grammar, std::move(candidate));
 }
 
 static std::vector<larch::grammar_spr_candidate> collect_candidates(
@@ -370,6 +615,137 @@ static void test_bootstrap_projection_from_tree_validates_against_apply() {
   std::println("  PASS");
 }
 
+static void check_prepared_projection_fixture(std::string const& label,
+                                              larch::clade_grammar const& base,
+                                              larch::phylo_dag& tree) {
+  for (auto edge_variant : tree.get_all_edges()) {
+    std::visit(
+        [](auto edge) {
+          edge.edge_weight() = static_cast<float>(edge.index() + 1);
+        },
+        edge_variant);
+  }
+  auto [oracle_tree, oracle_node_map] = larch::clone_tree(tree);
+  auto [legacy_tree, legacy_node_map] = larch::clone_tree(tree);
+  (void)oracle_node_map;
+  (void)legacy_node_map;
+  auto prepared =
+      larch::chart_spr_detail::prepare_sampled_tree_projection(base, tree);
+  auto prepared_source_snapshot = snapshot_projection_source(tree);
+
+  auto radius = larch::compute_tree_max_depth(tree) * 2;
+  if (radius == 0) radius = 1;
+  larch::move_enumerator enumerator{prepared.index(),
+                                    std::numeric_limits<int>::max()};
+  std::vector<larch::profitable_move> moves;
+  enumerator.find_all_moves(radius, [&](larch::profitable_move const& move) {
+    moves.push_back(move);
+  });
+  CHECK(!moves.empty());
+
+  std::size_t projected_count = 0;
+  std::vector<std::optional<larch::grammar_spr_candidate>> sequential_results;
+  sequential_results.reserve(moves.size());
+  for (auto const& emitted : moves) {
+    larch::spr_move move{.src = emitted.src,
+                         .dst = emitted.dst,
+                         .lca = emitted.lca,
+                         .score_change = emitted.score_change};
+    auto expected =
+        project_tree_spr_move_annotated_oracle(base, oracle_tree, move);
+    auto actual = larch::project_tree_spr_move_to_candidate(prepared, move);
+    auto profitable_actual =
+        larch::project_tree_spr_move_to_candidate(prepared, emitted);
+    auto legacy_actual =
+        larch::project_tree_spr_move_to_candidate(base, legacy_tree, move);
+    CHECK(actual.has_value() == expected.has_value());
+    CHECK(profitable_actual.has_value() == actual.has_value());
+    CHECK(legacy_actual.has_value() == actual.has_value());
+
+    auto annotated_tree = larch::apply_spr_move(tree, move.src, move.dst);
+    auto topology_only_tree =
+        larch::apply_spr_move_topology_only(tree, move.src, move.dst);
+    check_projection_clone_annotations_are_sparse(topology_only_tree);
+    auto annotated_grammar = larch::build_clade_grammar(annotated_tree);
+    auto topology_only_grammar = larch::build_clade_grammar(topology_only_tree);
+    CHECK(clade_shape(annotated_grammar) == clade_shape(topology_only_grammar));
+    CHECK(production_shape(annotated_grammar) ==
+          production_shape(topology_only_grammar));
+
+    sequential_results.push_back(actual);
+    if (!actual) continue;
+    ++projected_count;
+    CHECK(actual->source_before_topology_productions.has_value());
+    CHECK(actual->source_after_topology_productions.has_value());
+    check_candidate_payload_equal(base, *expected, *actual);
+    check_candidate_payload_equal(base, *actual, *profitable_actual);
+    check_candidate_payload_equal(base, *actual, *legacy_actual);
+  }
+  CHECK(projected_count > 0);
+
+  auto project_all = [&]() {
+    std::vector<std::optional<larch::grammar_spr_candidate>> result;
+    result.reserve(moves.size());
+    for (auto const& move : moves) {
+      result.push_back(
+          larch::project_tree_spr_move_to_candidate(prepared, move));
+    }
+    return result;
+  };
+  auto first_future = std::async(std::launch::async, project_all);
+  auto second_future = std::async(std::launch::async, project_all);
+  auto first_parallel = first_future.get();
+  auto second_parallel = second_future.get();
+  CHECK(first_parallel.size() == sequential_results.size());
+  CHECK(second_parallel.size() == sequential_results.size());
+  for (std::size_t i = 0; i < sequential_results.size(); ++i) {
+    CHECK(first_parallel[i].has_value() == sequential_results[i].has_value());
+    CHECK(second_parallel[i].has_value() == sequential_results[i].has_value());
+    if (!sequential_results[i]) continue;
+    check_candidate_payload_equal(base, *sequential_results[i],
+                                  *first_parallel[i]);
+    check_candidate_payload_equal(base, *sequential_results[i],
+                                  *second_parallel[i]);
+  }
+  CHECK(snapshot_projection_source(tree) == prepared_source_snapshot);
+  std::println("  {}: {} emitted, {} projected", label, moves.size(),
+               projected_count);
+}
+
+static void test_phase8_prepared_projection_differential_all_emitted_moves() {
+  std::println(
+      "test_phase8_prepared_projection_differential_all_emitted_moves");
+
+  auto binary_tree =
+      larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
+  auto binary_grammar = larch::build_clade_grammar(binary_tree);
+  check_prepared_projection_fixture("binary", binary_grammar, binary_tree);
+
+  std::vector<larch::phylo_dag> source_trees;
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree()));
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_cross_tree()));
+  auto multiparent_base =
+      larch::test::merge_tiny_trees(std::move(source_trees));
+  auto multiparent_grammar = larch::build_clade_grammar(multiparent_base);
+
+  auto multiparent_member_tree =
+      larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
+  check_prepared_projection_fixture("multiparent-base", multiparent_grammar,
+                                    multiparent_member_tree);
+
+  larch::grammar_spr_enumeration_options sample_options;
+  sample_options.sampled_tree_source_dag = &multiparent_base;
+  std::mt19937 rng(19);
+  auto sampled_tree = larch::chart_spr_detail::build_sampled_tree_from_grammar(
+      multiparent_grammar, sample_options, 1, rng);
+  check_prepared_projection_fixture("sampled-tree", multiparent_grammar,
+                                    sampled_tree);
+
+  std::println("  PASS");
+}
+
 static void test_phase6_randomized_and_reservoir_enumeration() {
   std::println("test_phase6_randomized_and_reservoir_enumeration");
 
@@ -563,6 +939,7 @@ int main() {
   test_grammar_native_candidate_enumeration();
   test_projected_tree_spr_matches_apply_spr_move();
   test_bootstrap_projection_from_tree_validates_against_apply();
+  test_phase8_prepared_projection_differential_all_emitted_moves();
   test_phase6_randomized_and_reservoir_enumeration();
   test_phase6_stable_taxon_dedup_across_equivalent_builds();
   test_phase6_sampled_tree_and_hybrid_sources();

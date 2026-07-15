@@ -1789,12 +1789,70 @@ inline std::pair<phylo_dag, std::vector<std::size_t>> clone_tree(
 // fitch_assign_compact_genomes is now defined in compute.hpp
 // (moved there so dagutil can use it without pulling in the full optimizer)
 
-inline phylo_dag apply_spr_move(phylo_dag& tree, std::size_t src_idx,
-                                std::size_t dst_idx) {
-  auto [result, old_to_new] = clone_tree(tree);
-  auto new_src = old_to_new[src_idx];
-  auto new_dst = old_to_new[dst_idx];
+namespace native_optimize_detail {
 
+// Projection-specific clone.  Grammar construction needs the reference, leaf
+// compact genomes/sample IDs, edge endpoints, and clade indices.  It does not
+// consume inner compact genomes, edge mutations, or edge weights, so those
+// potentially large annotations are deliberately omitted from every
+// candidate-local clone.  The const source type makes concurrent cloning from
+// one prepared sampled tree a read-only operation by construction.
+inline std::pair<phylo_dag, std::vector<std::size_t>>
+clone_tree_for_spr_projection(phylo_dag const& src) {
+  phylo_dag dst;
+  std::vector<std::size_t> old_to_new(src.node_high_mark(), 0);
+
+  for (auto node_variant : src.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires { node.reference_sequence(); }) {
+            auto copy = dst.append_node<node_kind::ua>();
+            copy.reference_sequence() = node.reference_sequence();
+            old_to_new[node.index()] = copy.index();
+          } else if constexpr (requires {
+                                 node.sample_id();
+                                 node.cg();
+                               }) {
+            auto copy = dst.append_node<node_kind::leaf>();
+            copy.cg() = node.cg();
+            copy.sample_id() = node.sample_id();
+            old_to_new[node.index()] = copy.index();
+          } else {
+            auto copy = dst.append_node<node_kind::inner>();
+            old_to_new[node.index()] = copy.index();
+          }
+        },
+        node_variant);
+  }
+
+  for (auto edge_variant : src.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          auto copy = dst.append_edge<edge_kind::clade>();
+          copy.clade_index() = edge.clade_index();
+          auto parent_idx = std::visit(
+              [](auto parent) { return parent.index(); }, edge.get_parent());
+          auto child_idx = std::visit([](auto child) { return child.index(); },
+                                      edge.get_child());
+          auto parent = dst.get_node(old_to_new[parent_idx]);
+          std::visit([&](auto node) { copy.set_parent(node); }, parent);
+          auto child = dst.get_node(old_to_new[child_idx]);
+          std::visit([&](auto node) { copy.set_child(node); }, child);
+        },
+        edge_variant);
+  }
+
+  auto old_root_idx =
+      std::visit([](auto node) { return node.index(); }, src.get_root());
+  auto root = dst.get_node(old_to_new[old_root_idx]);
+  std::visit([&](auto node) { dst.set_root(node); }, root);
+  return {std::move(dst), std::move(old_to_new)};
+}
+
+// Apply the structural edit to an already cloned tree.  Both the legacy full
+// clone and the projection-specific sparse clone share this exact edit.
+inline phylo_dag apply_spr_topology_edit(phylo_dag result, std::size_t new_src,
+                                         std::size_t new_dst) {
   // Find src's parent edge and parent node
   auto src_pe = get_parent_edges(result, new_src);
   auto src_parent_edge = src_pe[0];
@@ -1886,11 +1944,45 @@ inline phylo_dag apply_spr_move(phylo_dag& tree, std::size_t src_idx,
     std::visit([&](auto c) { e.set_child(c); }, sv);
   }
 
-  // 8. Assign optimal CGs and recompute
+  return result;
+}
+
+inline phylo_dag apply_spr_move_topology_from_full_clone(phylo_dag& tree,
+                                                         std::size_t src_idx,
+                                                         std::size_t dst_idx) {
+  auto [result, old_to_new] = clone_tree(tree);
+  return apply_spr_topology_edit(std::move(result), old_to_new[src_idx],
+                                 old_to_new[dst_idx]);
+}
+
+inline phylo_dag apply_spr_move_topology_for_projection(phylo_dag const& tree,
+                                                        std::size_t src_idx,
+                                                        std::size_t dst_idx) {
+  auto [result, old_to_new] = clone_tree_for_spr_projection(tree);
+  return apply_spr_topology_edit(std::move(result), old_to_new[src_idx],
+                                 old_to_new[dst_idx]);
+}
+
+}  // namespace native_optimize_detail
+
+// Projection-only seam for consumers whose correctness is independent of
+// inner compact genomes and edge annotations.
+inline phylo_dag apply_spr_move_topology_only(phylo_dag const& tree,
+                                              std::size_t src_idx,
+                                              std::size_t dst_idx) {
+  return native_optimize_detail::apply_spr_move_topology_for_projection(
+      tree, src_idx, dst_idx);
+}
+
+// Legacy public behavior: delegate the structural edit, then refresh all
+// sequence annotations expected by tree-optimization callers.
+inline phylo_dag apply_spr_move(phylo_dag& tree, std::size_t src_idx,
+                                std::size_t dst_idx) {
+  auto result = native_optimize_detail::apply_spr_move_topology_from_full_clone(
+      tree, src_idx, dst_idx);
   fitch_assign_compact_genomes(result);
   recompute_edge_mutations(result);
   set_sample_ids_from_cg(result);
-
   return result;
 }
 
