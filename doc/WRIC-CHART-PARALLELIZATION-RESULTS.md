@@ -1509,6 +1509,75 @@ transient admission, allocation-free candidate-local admission, within-clade
 staging/profile evidence, automatic policy, sanitizer gates, full CTest, RSS,
 and all deferred Phase-0-dependent measurements remain pending.
 
+### Phase-7 implementation checkpoint
+
+Phase 7 is **implementation complete; acceptance pending Phase 0** at
+`38e9a281396e5263647ba68724414848841525d7` (`Select lazy chart policy
+automatically`). The immutable measurement checkpoint remains
+`7ca527b8906d018124756182274335cbff936d72` (`Baseline measure`) and is an
+ancestor of the implementation tip. The historical counter-baseline document
+is byte-identical at both revisions, with SHA-256
+`cdb3fd9f936cb335f8f93eafd5abbc4d31822bfe657f4f3fd343c85c1203a82e`.
+No baseline executable, runner, oracle, candidate/exact budget, validation, or
+search-exactness contract was replaced.
+
+After the packed grouping and dependency wavefront above, commits `1607fd9`,
+`be02001`, `3ff306d`, and `a9e74bb` remove successful lazy-pattern validation
+allocations and close state-build, candidate-scoring, and unified exact-memory
+admission. The builders pre-admit bounded coordinator, task-slot, scheduler,
+and old/new publication overlap, reduce concurrency under finite pressure,
+and retain measured-capacity backstops. Rejected E-1 boundaries occur before
+the corresponding scheduler submission; E succeeds. Temporal phases use a
+maximum rather than summing non-overlapping pilot, chart-build, local-score,
+and exact work.
+
+Commit `38e9a28` adds deterministic `off|on|auto` selection. The bounded,
+midpoint-stratified pilot constructs at most 32 inside-only patterns and uses
+integer structural-class, retained-row, estimated-byte, and packed-key-work
+comparisons; it does not use wall time or submit scheduler work. Accepted-state
+rebuilds carry a private frozen decision, skip repiloting, recompute admission
+for the current selected representation, and charge the complete preceding
+published state while the replacement is built. Explicit `off` and `on`
+retain their historical behavior. Reports expose the requested and resolved
+policy, reason, pilot counts, frozen reuse, and scheduler axes. `dagutil`
+accepts `auto` only for chart-SPR state/search modes; standalone consumers and
+`larch2` reject it explicitly rather than silently choosing a representation.
+
+The conditional additional within-clade staging action is omitted. The raw
+decision record is
+`build/wric-chart-parallelization/phase7-within-clade-profile/README.md`,
+SHA-256
+`1a941352c33a82720e6484c4e2c878acefd6d17ae5172da6e165719e9fe6c559`.
+After the allocation-free validation change, successful validation fell from
+3,161,872,940 to 25,288,668 Callgrind instructions, a 99.200% reduction. On
+the high-compression fixture the scheduled combined lazy stage measured
+190.041839 ms at W1 and 46.321395 ms at W8 (4.103x). Even deleting all work in
+underfilled W8 levels could save only 4.456%, below the plan's 10% threshold;
+the named small stage is only 2.979360 ms at W1 and already exposes parallel
+overhead in its inside half. A second nested pattern/representative staging
+axis is therefore not justified. These measurements support only that
+conditional omission and are not sealed Phase-7 performance acceptance.
+
+An independent post-merge RelWithDebInfo check ran
+`chart_spr_search_test`, `chart_spr_allocation_test`,
+`chart_spr_phase10_test`, the two `dagutil` auto-policy tests, the chart-SPR
+auto CLI test, and the `larch2` rejection test. All 7/7 passed in 11.21 seconds.
+The raw log is
+`build/wric-chart-parallelization/phase7-auto-review/focused.ctest.log`,
+SHA-256
+`c7706f1265090070e9b682a7ec479ab1cd9bb88e2925dd5189a25ec2bcabc9cc`.
+A separate clean-tip review also passed the benchmark-harness regression and
+found no branch-specific accounting, scheduler-axis, formatting, or CLI
+blocker. Changed-line clang-format and `git diff --check` are clean.
+
+This is not the Phase-7 exit decision. Quiet-host forced-off/forced-on/auto
+medians on both named fixtures, the `phase7-lazy.tsv` supplemental manifest,
+the required high-fixture and small-fixture scaling/overhead comparisons,
+paired RSS, sparse-reclamation TSan, full RelWithDebInfo CTest, and final
+sanitizer gates remain pending. Under the authorized deadline-overlap rule,
+implementation proceeds to Phase 8 without substituting the diagnostics above
+for those gates.
+
 ## Later-phase evidence template
 
 Before the Phase-0 seal, every later-phase measurement is labelled
