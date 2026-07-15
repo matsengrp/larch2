@@ -49,6 +49,7 @@ struct chart_plan_clade_descriptor {
   std::size_t child_occurrence_begin = 0;
   std::size_t child_occurrence_count = 0;
   std::size_t dependency_level = 0;
+  std::size_t upward_path_count = 0;
 
   [[nodiscard]] bool is_leaf() const noexcept {
     return leaf_taxon != chart_plan_no_taxon;
@@ -795,6 +796,26 @@ inline chart_execution_plan build_chart_execution_plan(
                                         it->begin(), it->end());
     result.top_down_level_offsets_.push_back(
         result.top_down_level_order_.size());
+  }
+
+  // Count production-distinct upward paths without retaining any path
+  // objects. The top-down order visits every parent before its children;
+  // saturation lets finite consumers fail closed if the exact count is not
+  // representable while keeping plan construction total.
+  result.clades_[result.root_clade_].upward_path_count = 1;
+  for (auto parent : result.top_down_order_) {
+    auto const parent_paths = result.clades_[parent].upward_path_count;
+    for (auto pid : result.productions_for_parent(parent)) {
+      for (auto child : result.children(pid)) {
+        auto& child_paths = result.clades_[child].upward_path_count;
+        if (child_paths >
+            (std::numeric_limits<std::size_t>::max)() - parent_paths) {
+          child_paths = (std::numeric_limits<std::size_t>::max)();
+        } else {
+          child_paths += parent_paths;
+        }
+      }
+    }
   }
 
   for (std::uint8_t parent = 0; parent < 4; ++parent) {

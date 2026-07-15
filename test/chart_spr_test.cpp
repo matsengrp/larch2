@@ -1556,6 +1556,36 @@ static void test_phase8_source_wave_admission_failure_and_cancellation() {
   CHECK(exact.move_enumeration_visits == exact.moves_enumerated);
   CHECK(exact.enumeration_passes == 1);
 
+  // The two admission dimensions are independent.  A budget at the complete
+  // source-width/one-projection boundary keeps all admitted source
+  // concurrency without accidentally admitting a second projection slot;
+  // adding exactly the second-slot delta changes only projection width.
+  auto const maximum_admission =
+      larch::chart_spr_detail::admit_sampled_tree_source_wave_memory(
+          prepared, &exact_scheduler, source_count, 0, 0);
+  CHECK(maximum_admission.source_wave_size > 1);
+  CHECK(maximum_admission.projection_wave_size > 1);
+  auto const source_only_estimate = estimate_sampled_tree_source_wave_memory(
+      prepared, &exact_scheduler, source_count,
+      maximum_admission.source_wave_size, 1, 0);
+  auto const source_only_admission =
+      larch::chart_spr_detail::admit_sampled_tree_source_wave_memory(
+          prepared, &exact_scheduler, source_count, 0,
+          source_only_estimate.required_peak_bytes);
+  CHECK(source_only_admission.source_wave_size ==
+        maximum_admission.source_wave_size);
+  CHECK(source_only_admission.projection_wave_size == 1);
+  auto const projection_two_estimate = estimate_sampled_tree_source_wave_memory(
+      prepared, &exact_scheduler, source_count,
+      maximum_admission.source_wave_size, 2, 0);
+  auto const projection_two_admission =
+      larch::chart_spr_detail::admit_sampled_tree_source_wave_memory(
+          prepared, &exact_scheduler, source_count, 0,
+          projection_two_estimate.required_peak_bytes);
+  CHECK(projection_two_admission.source_wave_size ==
+        maximum_admission.source_wave_size);
+  CHECK(projection_two_admission.projection_wave_size == 2);
+
   auto rejected_scheduler = make_projection_scheduler(4);
   auto rejected_options = sample_options;
   rejected_options.sampled_tree_projection_scheduler = &rejected_scheduler;

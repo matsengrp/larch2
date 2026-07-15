@@ -986,7 +986,7 @@ test deliberately returns code 77 and the reason is unchanged/documented.
 
 ```bash
 ctest --test-dir build --output-on-failure --parallel 8 \
-  -R '^(dagutil_chart_spr_.*|dagutil_wric_phase9_chart_bnb_.*|dagutil_wric_lazy_chart_.*|dagutil_wric_lazy_polytomy_fixed_topology_search|larch2_chart_bnb_.*|wric_phase10_sanity_table_smoke|wric_spr_search_benchmark_smoke|wric_bnb_trim_benchmark_smoke|thread_pool_test|parsimony_chart_test|chart_trim_test|chart_bnb_trim_apply_test|chart_spr_test|chart_spr_search_test|chart_parallel_test|chart_scheduler_test|chart_two_chart_oracle_test|multifurcation_chart_oracle_test|overlay_chain_test|inside_chart_cache_test|outside_chart_cache_test|chart_spr_phase10_test|no_direct_chart_spr_multisite_helpers|no_direct_chart_spr_root_score_detail|no_chart_bnb_superset_topology_exact|no_overlay_chain_compaction_prefix_materialize|no_keep_production_without_exact_check)$'
+  -R '^(dagutil_chart_spr_.*|dagutil_wric_phase9_chart_bnb_.*|dagutil_wric_lazy_chart_.*|dagutil_wric_lazy_polytomy_fixed_topology_search|larch2_chart_bnb_.*|wric_phase10_sanity_table_smoke|wric_spr_search_benchmark_smoke|wric_bnb_trim_benchmark_smoke|thread_pool_test|parsimony_chart_test|chart_trim_test|chart_bnb_trim_apply_test|chart_spr_test|chart_spr_search_test|chart_spr_pipeline_test|chart_parallel_test|chart_scheduler_test|chart_two_chart_oracle_test|multifurcation_chart_oracle_test|overlay_chain_test|inside_chart_cache_test|outside_chart_cache_test|chart_spr_phase10_test|no_direct_chart_spr_multisite_helpers|no_direct_chart_spr_root_score_detail|no_chart_bnb_superset_topology_exact|no_overlay_chain_compaction_prefix_materialize|no_keep_production_without_exact_check)$'
 ```
 
 Also run the dedicated target explicitly so a broad regex cannot hide a
@@ -1024,7 +1024,7 @@ cmake -S . -B build-tsan \
 cmake --build build-tsan --parallel 8
 TSAN_OPTIONS=halt_on_error=1 \
   ctest --test-dir build-tsan --output-on-failure --parallel 1 \
-  -R '^(thread_pool_test|chart_parallel_test|chart_scheduler_test|parsimony_chart_test|chart_trim_test|chart_bnb_trim_apply_test|chart_spr_test|chart_spr_search_test|chart_two_chart_oracle_test|multifurcation_chart_oracle_test|overlay_chain_test|inside_chart_cache_test|outside_chart_cache_test|chart_spr_phase10_test|dagutil_chart_spr_.*|dagutil_wric_phase9_chart_bnb_.*|dagutil_wric_lazy_chart_.*|dagutil_wric_lazy_polytomy_fixed_topology_search|larch2_chart_bnb_.*|wric_bnb_trim_benchmark_smoke)$'
+  -R '^(thread_pool_test|chart_parallel_test|chart_scheduler_test|parsimony_chart_test|chart_trim_test|chart_bnb_trim_apply_test|chart_spr_test|chart_spr_search_test|chart_spr_pipeline_test|chart_two_chart_oracle_test|multifurcation_chart_oracle_test|overlay_chain_test|inside_chart_cache_test|outside_chart_cache_test|chart_spr_phase10_test|dagutil_chart_spr_.*|dagutil_wric_phase9_chart_bnb_.*|dagutil_wric_lazy_chart_.*|dagutil_wric_lazy_polytomy_fixed_topology_search|larch2_chart_bnb_.*|wric_bnb_trim_benchmark_smoke)$'
 ```
 
 CTest is deliberately serial here so the relevant concurrency is inside the

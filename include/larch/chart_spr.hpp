@@ -311,6 +311,18 @@ struct grammar_spr_enumeration_options {
   // active projection scratch, and scheduler ownership/operation envelope.
   std::size_t sampled_tree_projection_memory_budget_bytes = 0;
   std::size_t sampled_tree_projection_external_resident_bytes = 0;
+  // Search-level unified admission may cap the projection wave before the
+  // representative tree/job count exists. Zero preserves the direct-library
+  // maximum; a finite value is an already-admitted upper bound.
+  std::size_t sampled_tree_source_maximum_wave_size = 0;
+  std::size_t sampled_tree_projection_maximum_wave_size = 0;
+  // A finite search-level admission records the allocation-free shape that
+  // was approved before a representative tree exists.  The product runner
+  // validates the realized shape and post-reserve capacity high-water against
+  // this contract before RNG, scheduler, or gather side effects.
+  std::size_t sampled_tree_source_admitted_source_count_bound = 0;
+  std::size_t sampled_tree_source_admitted_destination_bound = 0;
+  std::size_t sampled_tree_source_admitted_peak_bytes = 0;
 
   // A pipelined caller may perform serial enumeration/gather on a coordinator
   // while the persistent scheduler scores the preceding buffer.  The one
@@ -442,6 +454,12 @@ struct tree_spr_bootstrap_options {
 
 struct sampled_tree_projection_memory_estimate {
   std::size_t external_resident_bytes = 0;
+  // Search-level source admission may call the shape estimator before the
+  // representative tree and prepared projection context exist.  This field
+  // covers the temporary leaf-CG collection, synthetic-tree construction,
+  // clade-grammar preparation, and their replacement-growth overlap.  Direct
+  // projection callers that already own a prepared context leave it at zero.
+  std::size_t source_construction_scratch_bytes = 0;
   // The sampled tree is owned by the enclosing sample iteration even though
   // the prepared context only borrows it. The base grammar and the original
   // sampled-tree source DAG remain external borrows and are counted only by
@@ -457,9 +475,15 @@ struct sampled_tree_projection_memory_estimate {
   std::size_t stable_slot_scratch_bytes = 0;
   std::size_t wave_slot_and_payload_bytes = 0;
   std::size_t active_projection_scratch_bytes = 0;
+  std::size_t scheduler_resident_bytes = 0;
+  std::size_t scheduler_operation_bytes = 0;
+  // Compatibility aggregate for projection-only callers and diagnostics.
+  // Search-level admission consumes the two fields above separately so the
+  // persistent scheduler core is charged exactly once.
   std::size_t scheduler_bytes = 0;
   std::size_t error_and_exception_bytes = 0;
   std::size_t required_peak_bytes = 0;
+  std::size_t job_count = 0;
   std::size_t wave_size = 0;
   std::size_t active_projection_count = 0;
   bool safely_bounded = true;
@@ -471,6 +495,7 @@ struct sampled_tree_projection_memory_estimate {
 // peak charges their maximum instead of pretending they coexist.
 struct sampled_tree_source_wave_memory_estimate {
   std::size_t external_resident_bytes = 0;
+  std::size_t source_construction_scratch_bytes = 0;
   std::size_t sampled_tree_resident_bytes = 0;
   std::size_t prepared_owned_bytes = 0;
   std::size_t source_order_bytes = 0;
@@ -1604,13 +1629,45 @@ inline std::size_t sampled_tree_projection_output_capacity_bytes(
   return total;
 }
 
+struct sampled_tree_projection_memory_shape {
+  std::size_t node_count = 0;
+  std::size_t edge_count = 0;
+  std::size_t taxon_count = 0;
+  std::size_t production_count = 0;
+  std::size_t variable_site_count = 0;
+  std::size_t reference_and_sample_id_bytes = 0;
+  std::size_t job_count = 0;
+  bool safely_bounded = true;
+};
+
+inline sampled_tree_projection_memory_shape
+sampled_tree_projection_shape_from_prepared(
+    sampled_tree_projection_context const& prepared, std::size_t job_count) {
+  sampled_tree_projection_memory_shape shape;
+  shape.node_count = prepared.source_tree().node_high_mark();
+  shape.edge_count = prepared.source_tree().edge_high_mark();
+  shape.taxon_count = prepared.base().taxa.id_to_sample_id.size();
+  shape.production_count = prepared.base().productions.size();
+  shape.variable_site_count = prepared.index().num_variable_sites();
+  auto const& reference =
+      prepared.source_tree().get_root_as<node_kind::ua>().reference_sequence();
+  shape.reference_and_sample_id_bytes = sampled_tree_projection_saturating_add(
+      reference.size(), 1, shape.safely_bounded);
+  for (auto const& sample_id : prepared.base().taxa.id_to_sample_id) {
+    shape.reference_and_sample_id_bytes =
+        sampled_tree_projection_saturating_add(
+            shape.reference_and_sample_id_bytes,
+            sampled_tree_projection_saturating_add(sample_id.size(), 1,
+                                                   shape.safely_bounded),
+            shape.safely_bounded);
+  }
+  shape.job_count = job_count;
+  return shape;
+}
+
 inline std::size_t estimate_sampled_tree_projection_sampled_tree_bytes(
-    sampled_tree_projection_context const& prepared,
+    sampled_tree_projection_memory_shape const& shape,
     bool& safely_bounded) noexcept {
-  auto const node_count = prepared.source_tree().node_high_mark();
-  auto const edge_count = prepared.source_tree().edge_high_mark();
-  auto const taxon_count = prepared.base().taxa.id_to_sample_id.size();
-  auto const variable_sites = prepared.index().num_variable_sites();
   std::size_t total = sizeof(phylo_dag);
   auto add_product = [&](std::size_t count, std::size_t bytes) {
     total = sampled_tree_projection_saturating_add(
@@ -1622,37 +1679,29 @@ inline std::size_t estimate_sampled_tree_projection_sampled_tree_bytes(
   // Synthetic sampled-tree topology, leaf compact genomes/sample IDs, and UA
   // reference ownership. The original source DAG and base grammar are not
   // included: both are external borrows covered by external resident bytes.
-  add_product(node_count, 24 * sizeof(void*) + 256);
-  add_product(edge_count, 16 * sizeof(void*) + 128);
-  add_product(taxon_count, 4 * sizeof(void*) + 128);
-  add_product(taxon_count,
-              sampled_tree_projection_saturating_scale(
-                  variable_sites, 2, sizeof(std::uint32_t), safely_bounded));
-  auto const& reference =
-      prepared.source_tree().get_root_as<node_kind::ua>().reference_sequence();
+  add_product(shape.node_count, 24 * sizeof(void*) + 256);
+  add_product(shape.edge_count, 16 * sizeof(void*) + 128);
+  add_product(shape.taxon_count, 4 * sizeof(void*) + 128);
+  add_product(shape.taxon_count, sampled_tree_projection_saturating_scale(
+                                     shape.variable_site_count, 2,
+                                     sizeof(std::uint32_t), safely_bounded));
   total = sampled_tree_projection_saturating_add(
-      total,
-      sampled_tree_projection_saturating_add(reference.size(), 1,
-                                             safely_bounded),
-      safely_bounded);
-  for (auto const& sample_id : prepared.base().taxa.id_to_sample_id) {
-    total = sampled_tree_projection_saturating_add(
-        total,
-        sampled_tree_projection_saturating_add(sample_id.size(), 1,
-                                               safely_bounded),
-        safely_bounded);
-  }
+      total, shape.reference_and_sample_id_bytes, safely_bounded);
   return total;
 }
 
-inline std::size_t estimate_sampled_tree_projection_prepared_owned_bytes(
+inline std::size_t estimate_sampled_tree_projection_sampled_tree_bytes(
     sampled_tree_projection_context const& prepared,
     bool& safely_bounded) noexcept {
-  auto const node_count = prepared.source_tree().node_high_mark();
-  auto const taxon_count = prepared.base().taxa.id_to_sample_id.size();
-  auto const production_count = prepared.base().productions.size();
-  auto const variable_sites = prepared.index().num_variable_sites();
+  auto const shape = sampled_tree_projection_shape_from_prepared(prepared, 0);
+  safely_bounded = safely_bounded && shape.safely_bounded;
+  return estimate_sampled_tree_projection_sampled_tree_bytes(shape,
+                                                             safely_bounded);
+}
 
+inline std::size_t estimate_sampled_tree_projection_prepared_owned_bytes(
+    sampled_tree_projection_memory_shape const& shape,
+    bool& safely_bounded) noexcept {
   std::size_t total = sizeof(sampled_tree_projection_context);
   auto add_product = [&](std::size_t count, std::size_t bytes) {
     total = sampled_tree_projection_saturating_add(
@@ -1665,24 +1714,31 @@ inline std::size_t estimate_sampled_tree_projection_prepared_owned_bytes(
   // node mapping, before production keys/certificates, and tree-index
   // recurrence tables. The borrowed tree is charged separately and borrowed
   // base/source payload is part of external resident bytes.
-  add_product(taxon_count, 8 * sizeof(void*) + 128);
-  add_product(node_count, 20 * sizeof(void*) + 256);
-  add_product(node_count,
+  add_product(shape.taxon_count, 8 * sizeof(void*) + 128);
+  add_product(shape.node_count, 20 * sizeof(void*) + 256);
+  add_product(shape.node_count,
               sampled_tree_projection_saturating_scale(
-                  taxon_count, 8, sizeof(taxon_id), safely_bounded));
-  add_product(production_count, 16 * sizeof(void*) + 128);
-  add_product(node_count, sampled_tree_projection_saturating_multiply(
-                              variable_sites, 64, safely_bounded));
+                  shape.taxon_count, 8, sizeof(taxon_id), safely_bounded));
+  add_product(shape.production_count, 16 * sizeof(void*) + 128);
+  add_product(shape.node_count,
+              sampled_tree_projection_saturating_multiply(
+                  shape.variable_site_count, 64, safely_bounded));
   return total;
+}
+
+inline std::size_t estimate_sampled_tree_projection_prepared_owned_bytes(
+    sampled_tree_projection_context const& prepared,
+    bool& safely_bounded) noexcept {
+  return estimate_sampled_tree_projection_prepared_owned_bytes(
+      sampled_tree_projection_shape_from_prepared(prepared, 0), safely_bounded);
 }
 
 inline std::size_t
 estimate_sampled_tree_projection_prepared_owned_and_job_bytes(
-    sampled_tree_projection_context const& prepared, std::size_t job_count,
+    sampled_tree_projection_memory_shape const& shape,
     bool& safely_bounded) noexcept {
-  auto const node_count = prepared.source_tree().node_high_mark();
   auto total = sampled_tree_projection_saturating_add(
-      estimate_sampled_tree_projection_prepared_owned_bytes(prepared,
+      estimate_sampled_tree_projection_prepared_owned_bytes(shape,
                                                             safely_bounded),
       sizeof(std::vector<sampled_tree_projection_job>), safely_bounded);
   // One bounded searchable-node ordering remains live while the exact move
@@ -1691,24 +1747,30 @@ estimate_sampled_tree_projection_prepared_owned_and_job_bytes(
   total = sampled_tree_projection_saturating_add(
       total,
       sampled_tree_projection_saturating_multiply(
-          node_count, sizeof(std::size_t), safely_bounded),
+          shape.node_count, sizeof(std::size_t), safely_bounded),
       safely_bounded);
   total = sampled_tree_projection_saturating_add(
       total,
       sampled_tree_projection_saturating_multiply(
-          job_count, sizeof(sampled_tree_projection_job), safely_bounded),
+          shape.job_count, sizeof(sampled_tree_projection_job), safely_bounded),
       safely_bounded);
   return total;
 }
 
-inline std::size_t estimate_sampled_tree_projection_task_scratch_bytes(
-    sampled_tree_projection_context const& prepared,
+inline std::size_t
+estimate_sampled_tree_projection_prepared_owned_and_job_bytes(
+    sampled_tree_projection_context const& prepared, std::size_t job_count,
     bool& safely_bounded) noexcept {
-  auto const node_count = prepared.source_tree().node_high_mark();
-  auto const edge_count = prepared.source_tree().edge_high_mark();
-  auto const taxon_count = prepared.base().taxa.id_to_sample_id.size();
+  return estimate_sampled_tree_projection_prepared_owned_and_job_bytes(
+      sampled_tree_projection_shape_from_prepared(prepared, job_count),
+      safely_bounded);
+}
+
+inline std::size_t estimate_sampled_tree_projection_task_scratch_bytes(
+    sampled_tree_projection_memory_shape const& shape,
+    bool& safely_bounded) noexcept {
   auto const production_count =
-      std::max(node_count, prepared.base().productions.size());
+      std::max(shape.node_count, shape.production_count);
   std::size_t total =
       sizeof(phylo_dag) + sizeof(clade_grammar) + sizeof(grammar_spr_candidate);
   auto add_product = [&](std::size_t count, std::size_t bytes) {
@@ -1720,13 +1782,22 @@ inline std::size_t estimate_sampled_tree_projection_task_scratch_bytes(
   };
   // Sparse clone topology, old-to-new map, after-grammar construction, and
   // before/after production-key maps. The taxon matrix dominates the latter.
-  add_product(node_count, 20 * sizeof(void*) + 256);
-  add_product(edge_count, 12 * sizeof(void*) + 128);
+  add_product(shape.node_count, 20 * sizeof(void*) + 256);
+  add_product(shape.edge_count, 12 * sizeof(void*) + 128);
   add_product(production_count, 24 * sizeof(void*) + 256);
-  add_product(node_count,
+  add_product(shape.node_count,
               sampled_tree_projection_saturating_scale(
-                  taxon_count, 12, sizeof(taxon_id), safely_bounded));
+                  shape.taxon_count, 12, sizeof(taxon_id), safely_bounded));
   return total;
+}
+
+inline std::size_t estimate_sampled_tree_projection_task_scratch_bytes(
+    sampled_tree_projection_context const& prepared,
+    bool& safely_bounded) noexcept {
+  auto const shape = sampled_tree_projection_shape_from_prepared(prepared, 0);
+  safely_bounded = safely_bounded && shape.safely_bounded;
+  return estimate_sampled_tree_projection_task_scratch_bytes(shape,
+                                                             safely_bounded);
 }
 
 inline std::size_t sampled_tree_projection_byte_vector_capacity_bound(
@@ -1739,13 +1810,12 @@ inline std::size_t sampled_tree_projection_byte_vector_capacity_bound(
 }
 
 inline std::size_t estimate_sampled_tree_projection_direct_workspace_bytes(
-    sampled_tree_projection_context const& prepared,
+    sampled_tree_projection_memory_shape const& shape,
     bool& safely_bounded) noexcept {
   auto const node_count = sampled_tree_projection_saturating_add(
-      prepared.source_tree().node_high_mark(), 1, safely_bounded);
-  auto const taxon_count = prepared.base().taxa.id_to_sample_id.size();
-  auto const production_count =
-      std::max(node_count, prepared.ordered_before_keys().size());
+      shape.node_count, 1, safely_bounded);
+  auto const taxon_count = shape.taxon_count;
+  auto const production_count = std::max(node_count, shape.production_count);
   std::size_t total = sizeof(sampled_tree_direct_workspace);
   auto add_product = [&](std::size_t count, std::size_t bytes) {
     total = sampled_tree_projection_saturating_add(
@@ -1775,15 +1845,36 @@ inline std::size_t estimate_sampled_tree_projection_direct_workspace_bytes(
   return total;
 }
 
+inline std::size_t estimate_sampled_tree_projection_direct_workspace_bytes(
+    sampled_tree_projection_context const& prepared,
+    bool& safely_bounded) noexcept {
+  auto shape = sampled_tree_projection_shape_from_prepared(prepared, 0);
+  shape.production_count =
+      std::max(shape.production_count, prepared.ordered_before_keys().size());
+  safely_bounded = safely_bounded && shape.safely_bounded;
+  return estimate_sampled_tree_projection_direct_workspace_bytes(
+      shape, safely_bounded);
+}
+
+inline std::size_t
+estimate_sampled_tree_projection_enumeration_retained_dynamic_bytes(
+    sampled_tree_projection_memory_shape const& shape,
+    bool& safely_bounded) noexcept {
+  // find_moves_for_source owns five uint8_t site vectors in scratch_buffers.
+  return sampled_tree_projection_saturating_multiply(
+      sampled_tree_projection_byte_vector_capacity_bound(
+          shape.variable_site_count),
+      5 * sizeof(std::uint8_t), safely_bounded);
+}
+
 inline std::size_t
 estimate_sampled_tree_projection_enumeration_retained_dynamic_bytes(
     sampled_tree_projection_context const& prepared,
     bool& safely_bounded) noexcept {
-  auto const variable_sites = prepared.index().num_variable_sites();
-  // find_moves_for_source owns five uint8_t site vectors in scratch_buffers.
-  return sampled_tree_projection_saturating_multiply(
-      sampled_tree_projection_byte_vector_capacity_bound(variable_sites),
-      5 * sizeof(std::uint8_t), safely_bounded);
+  auto const shape = sampled_tree_projection_shape_from_prepared(prepared, 0);
+  safely_bounded = safely_bounded && shape.safely_bounded;
+  return estimate_sampled_tree_projection_enumeration_retained_dynamic_bytes(
+      shape, safely_bounded);
 }
 
 inline std::size_t estimate_sampled_tree_projection_active_enumerator_bytes(
@@ -1791,6 +1882,22 @@ inline std::size_t estimate_sampled_tree_projection_active_enumerator_bytes(
   return sampled_tree_projection_saturating_add(
       sizeof(move_enumerator) + sizeof(move_enumerator::callback_t), 512,
       safely_bounded);
+}
+
+inline std::size_t estimate_sampled_tree_projection_enumeration_scratch_bytes(
+    sampled_tree_projection_memory_shape const& shape,
+    bool& safely_bounded) noexcept {
+  auto total = sampled_tree_projection_saturating_add(
+      sizeof(move_enumerator) + sizeof(scratch_buffers) +
+          sizeof(move_enumerator::callback_t),
+      512, safely_bounded);
+  // find_moves_for_source owns five uint8_t site vectors in scratch_buffers.
+  total = sampled_tree_projection_saturating_add(
+      total,
+      sampled_tree_projection_saturating_multiply(
+          shape.variable_site_count, 5 * sizeof(std::uint8_t), safely_bounded),
+      safely_bounded);
+  return total;
 }
 
 inline std::size_t estimate_sampled_tree_projection_enumeration_scratch_bytes(
@@ -1808,32 +1915,16 @@ inline std::size_t estimate_sampled_tree_projection_enumeration_scratch_bytes(
 }
 
 inline std::size_t estimate_sampled_tree_projection_retained_witness_bytes(
-    sampled_tree_projection_context const& prepared,
+    sampled_tree_projection_memory_shape const& shape,
     bool& safely_bounded) noexcept {
   // A future provenance-preserving projection may retain either the complete
   // base-grammar witness partition or one selected-tree witness topology.  The
   // current direct and clone builders emit empty witness vectors, but charging
   // the larger high-water shape keeps admission fail-closed if that changes.
-  std::size_t base_capacity = 0;
-  for (auto const& production : prepared.base().productions) {
-    base_capacity = sampled_tree_projection_saturating_add(
-        base_capacity,
-        sampled_tree_projection_vector_capacity_bytes(production.witnesses,
-                                                      safely_bounded),
-        safely_bounded);
-    for (auto const& witness : production.witnesses) {
-      base_capacity = sampled_tree_projection_saturating_add(
-          base_capacity,
-          sampled_tree_projection_witness_capacity_bytes(witness,
-                                                         safely_bounded),
-          safely_bounded);
-    }
-  }
-
   auto const node_count = sampled_tree_projection_saturating_add(
-      prepared.source_tree().node_high_mark(), 1, safely_bounded);
+      shape.node_count, 1, safely_bounded);
   auto const edge_count = sampled_tree_projection_saturating_add(
-      prepared.source_tree().edge_high_mark(), 1, safely_bounded);
+      shape.edge_count, 1, safely_bounded);
   std::size_t selected_tree_capacity = 0;
   auto add_geometric_capacity = [&](std::size_t count, std::size_t bytes) {
     selected_tree_capacity = sampled_tree_projection_saturating_add(
@@ -1847,16 +1938,49 @@ inline std::size_t estimate_sampled_tree_projection_retained_witness_bytes(
   add_geometric_capacity(node_count, sizeof(production_witness));
   add_geometric_capacity(edge_count, sizeof(production_child_witness));
   add_geometric_capacity(edge_count, sizeof(std::size_t));
+  return selected_tree_capacity;
+}
+
+inline std::size_t estimate_sampled_tree_projection_retained_witness_bytes(
+    clade_grammar const& base,
+    bool& safely_bounded) noexcept {
+  std::size_t base_capacity = 0;
+  for (auto const& production : base.productions) {
+    base_capacity = sampled_tree_projection_saturating_add(
+        base_capacity,
+        sampled_tree_projection_vector_capacity_bytes(production.witnesses,
+                                                      safely_bounded),
+        safely_bounded);
+    for (auto const& witness : production.witnesses) {
+      base_capacity = sampled_tree_projection_saturating_add(
+          base_capacity,
+          sampled_tree_projection_witness_capacity_bytes(witness,
+                                                         safely_bounded),
+                                                         safely_bounded);
+    }
+  }
+  return base_capacity;
+}
+
+inline std::size_t estimate_sampled_tree_projection_retained_witness_bytes(
+    sampled_tree_projection_context const& prepared,
+    bool& safely_bounded) noexcept {
+  auto const shape = sampled_tree_projection_shape_from_prepared(prepared, 0);
+  safely_bounded = safely_bounded && shape.safely_bounded;
+  auto const selected_tree_capacity =
+      estimate_sampled_tree_projection_retained_witness_bytes(shape,
+                                                              safely_bounded);
+  auto const base_capacity =
+      estimate_sampled_tree_projection_retained_witness_bytes(
+          prepared.base(), safely_bounded);
   return std::max(base_capacity, selected_tree_capacity);
 }
 
 inline std::size_t estimate_sampled_tree_projection_retained_candidate_bytes(
-    sampled_tree_projection_context const& prepared,
+    sampled_tree_projection_memory_shape const& shape,
     bool& safely_bounded) noexcept {
-  auto const node_count = prepared.source_tree().node_high_mark();
-  auto const taxon_count = prepared.base().taxa.id_to_sample_id.size();
   auto const production_count =
-      std::max(node_count, prepared.base().productions.size());
+      std::max(shape.node_count, shape.production_count);
   std::size_t total = sizeof(grammar_spr_candidate);
   auto add_product = [&](std::size_t count, std::size_t bytes) {
     total = sampled_tree_projection_saturating_add(
@@ -1867,17 +1991,38 @@ inline std::size_t estimate_sampled_tree_projection_retained_candidate_bytes(
   };
   // Worst-case owning clade taxa, added productions, tombstones, and complete
   // before/after topology certificates retained in one ordinal slot.
-  add_product(node_count, sizeof(clade_key) + 4 * sizeof(void*));
-  add_product(node_count, sampled_tree_projection_saturating_multiply(
-                              taxon_count, sizeof(taxon_id), safely_bounded));
+  add_product(shape.node_count, sizeof(clade_key) + 4 * sizeof(void*));
+  add_product(shape.node_count,
+              sampled_tree_projection_saturating_multiply(
+                  shape.taxon_count, sizeof(taxon_id), safely_bounded));
   add_product(production_count,
               sizeof(overlay_grammar_production) + 12 * sizeof(void*));
   add_product(production_count, 4 * sizeof(overlay_production_ref));
   total = sampled_tree_projection_saturating_add(
       total,
-      estimate_sampled_tree_projection_retained_witness_bytes(prepared,
+      estimate_sampled_tree_projection_retained_witness_bytes(shape,
                                                               safely_bounded),
       safely_bounded);
+  return total;
+}
+
+inline std::size_t estimate_sampled_tree_projection_retained_candidate_bytes(
+    sampled_tree_projection_context const& prepared,
+    bool& safely_bounded) noexcept {
+  auto const shape = sampled_tree_projection_shape_from_prepared(prepared, 0);
+  safely_bounded = safely_bounded && shape.safely_bounded;
+  auto total = estimate_sampled_tree_projection_retained_candidate_bytes(
+      shape, safely_bounded);
+  auto const shape_witness =
+      estimate_sampled_tree_projection_retained_witness_bytes(shape,
+                                                              safely_bounded);
+  auto const prepared_witness =
+      estimate_sampled_tree_projection_retained_witness_bytes(prepared,
+                                                              safely_bounded);
+  if (prepared_witness > shape_witness) {
+    total = sampled_tree_projection_saturating_add(
+        total, prepared_witness - shape_witness, safely_bounded);
+  }
   return total;
 }
 
@@ -1907,17 +2052,20 @@ inline std::size_t bounded_sampled_tree_source_wave_size(
 
 inline sampled_tree_source_wave_memory_estimate
 estimate_sampled_tree_source_wave_memory(
-    sampled_tree_projection_context const& prepared,
+    sampled_tree_projection_memory_shape const& shape,
     chart_scheduler const* scheduler, std::size_t source_count,
     std::size_t source_wave_size, std::size_t projection_wave_size,
-    std::size_t external_resident_bytes) noexcept {
+    std::size_t external_resident_bytes,
+    std::size_t source_construction_scratch_bytes = 0) noexcept {
   sampled_tree_source_wave_memory_estimate result;
   result.external_resident_bytes = external_resident_bytes;
+  result.source_construction_scratch_bytes =
+      source_construction_scratch_bytes;
   result.source_count = source_count;
-  result.destination_bound_per_source = prepared.source_tree().node_high_mark();
+  result.destination_bound_per_source = shape.node_count;
   result.source_wave_size = source_wave_size;
   result.projection_wave_size = projection_wave_size;
-  result.safely_bounded = true;
+  result.safely_bounded = shape.safely_bounded;
 
   auto add = [&](std::size_t lhs, std::size_t rhs) {
     return sampled_tree_projection_saturating_add(lhs, rhs,
@@ -1930,10 +2078,10 @@ estimate_sampled_tree_source_wave_memory(
 
   result.sampled_tree_resident_bytes =
       estimate_sampled_tree_projection_sampled_tree_bytes(
-          prepared, result.safely_bounded);
+          shape, result.safely_bounded);
   result.prepared_owned_bytes =
       estimate_sampled_tree_projection_prepared_owned_bytes(
-          prepared, result.safely_bounded);
+          shape, result.safely_bounded);
   result.source_order_bytes = add(sizeof(std::vector<std::size_t>),
                                   multiply(source_count, sizeof(std::size_t)));
   result.source_slot_and_move_bytes =
@@ -1948,7 +2096,7 @@ estimate_sampled_tree_source_wave_memory(
       multiply(
           source_wave_size,
           estimate_sampled_tree_projection_enumeration_retained_dynamic_bytes(
-              prepared, result.safely_bounded)));
+              shape, result.safely_bounded)));
 
   chart_indexed_range_plan source_plan;
   if (scheduler != nullptr && source_wave_size != 0) {
@@ -1976,7 +2124,7 @@ estimate_sampled_tree_source_wave_memory(
                    sizeof(std::uint8_t)));
   auto const retained =
       estimate_sampled_tree_projection_retained_candidate_bytes(
-          prepared, result.safely_bounded);
+          shape, result.safely_bounded);
   result.projection_slot_and_payload_bytes =
       sizeof(std::vector<sampled_tree_projection_output_slot>);
   auto const retained_active_and_spare = multiply(retained, 2);
@@ -2001,7 +2149,7 @@ estimate_sampled_tree_source_wave_memory(
   }
   auto const direct_workspace =
       estimate_sampled_tree_projection_direct_workspace_bytes(
-          prepared, result.safely_bounded);
+          shape, result.safely_bounded);
   result.projection_stable_slot_workspace_bytes = add(
       sizeof(std::vector<sampled_tree_direct_workspace>),
       multiply(result.active_projection_count, direct_workspace));
@@ -2009,7 +2157,7 @@ estimate_sampled_tree_source_wave_memory(
       result.projection_stable_slot_workspace_bytes;
   auto const projection_fallback_scratch =
       estimate_sampled_tree_projection_task_scratch_bytes(
-          prepared, result.safely_bounded);
+          shape, result.safely_bounded);
   result.active_projection_scratch_bytes =
       multiply(result.active_projection_count, projection_fallback_scratch);
 
@@ -2056,6 +2204,8 @@ estimate_sampled_tree_source_wave_memory(
 
   result.required_peak_bytes = result.external_resident_bytes;
   result.required_peak_bytes =
+      add(result.required_peak_bytes, result.source_construction_scratch_bytes);
+  result.required_peak_bytes =
       add(result.required_peak_bytes, result.sampled_tree_resident_bytes);
   result.required_peak_bytes =
       add(result.required_peak_bytes, result.prepared_owned_bytes);
@@ -2083,12 +2233,64 @@ estimate_sampled_tree_source_wave_memory(
 }
 
 inline sampled_tree_source_wave_memory_estimate
+estimate_sampled_tree_source_wave_memory(
+    sampled_tree_projection_context const& prepared,
+    chart_scheduler const* scheduler, std::size_t source_count,
+    std::size_t source_wave_size, std::size_t projection_wave_size,
+    std::size_t external_resident_bytes) noexcept {
+  auto const shape = sampled_tree_projection_shape_from_prepared(prepared, 0);
+  auto result = estimate_sampled_tree_source_wave_memory(
+      shape, scheduler, source_count, source_wave_size, projection_wave_size,
+      external_resident_bytes);
+
+  // The allocation-free shape uses the selected-tree witness envelope.  A
+  // direct caller already has the exact base witness capacities available, so
+  // raise the retained active+spare allowance if that concrete high-water is
+  // larger.  This keeps both overloads fail-closed without charging the base
+  // witness twice.
+  bool safely_bounded = result.safely_bounded;
+  auto const shape_retained =
+      estimate_sampled_tree_projection_retained_candidate_bytes(
+          shape, safely_bounded);
+  auto const prepared_retained =
+      estimate_sampled_tree_projection_retained_candidate_bytes(
+          prepared, safely_bounded);
+  if (prepared_retained > shape_retained) {
+    auto const retained_delta = sampled_tree_projection_saturating_scale(
+        prepared_retained - shape_retained, projection_wave_size, 2,
+        safely_bounded);
+    result.projection_slot_and_payload_bytes =
+        sampled_tree_projection_saturating_add(
+            result.projection_slot_and_payload_bytes, retained_delta,
+            safely_bounded);
+    result.planned_retained_payload_bytes =
+        sampled_tree_projection_saturating_add(
+            result.planned_retained_payload_bytes, retained_delta,
+            safely_bounded);
+    result.required_peak_bytes = sampled_tree_projection_saturating_add(
+        result.required_peak_bytes, retained_delta, safely_bounded);
+    result.actual_peak_bytes = result.required_peak_bytes;
+  }
+  result.safely_bounded = safely_bounded;
+  if (!result.safely_bounded) {
+    result.required_peak_bytes = (std::numeric_limits<std::size_t>::max)();
+    result.actual_peak_bytes = result.required_peak_bytes;
+  }
+  return result;
+}
+
+inline sampled_tree_source_wave_memory_estimate
 admit_sampled_tree_source_wave_memory(
     sampled_tree_projection_context const& prepared,
     chart_scheduler const* scheduler, std::size_t source_count,
-    std::size_t external_resident_bytes, std::size_t budget_bytes) {
-  auto const maximum_source =
+    std::size_t external_resident_bytes, std::size_t budget_bytes,
+    std::size_t maximum_source_wave_size = 0,
+    std::size_t maximum_projection_wave_size = 0) {
+  auto maximum_source =
       bounded_sampled_tree_source_wave_size(scheduler, source_count);
+  if (maximum_source_wave_size != 0) {
+    maximum_source = std::min(maximum_source, maximum_source_wave_size);
+  }
   auto estimate = [&](std::size_t source_width, std::size_t projection_width) {
     return estimate_sampled_tree_source_wave_memory(
         prepared, scheduler, source_count, source_width, projection_width,
@@ -2105,7 +2307,12 @@ admit_sampled_tree_source_wave_memory(
     if (!safely_bounded) {
       return (std::numeric_limits<std::size_t>::max)();
     }
-    return bounded_sampled_tree_projection_wave_size(scheduler, move_bound);
+    auto maximum =
+        bounded_sampled_tree_projection_wave_size(scheduler, move_bound);
+    if (maximum_projection_wave_size != 0) {
+      maximum = std::min(maximum, maximum_projection_wave_size);
+    }
+    return maximum;
   };
 
   if (maximum_source == 0) {
@@ -2166,31 +2373,34 @@ admit_sampled_tree_source_wave_memory(
 
 inline sampled_tree_projection_memory_estimate
 estimate_sampled_tree_projection_memory(
-    sampled_tree_projection_context const& prepared,
+    sampled_tree_projection_memory_shape const& shape,
     chart_scheduler const* scheduler, std::size_t job_count,
-    std::size_t wave_size, std::size_t external_resident_bytes) noexcept {
+    std::size_t wave_size, std::size_t external_resident_bytes,
+    std::size_t source_construction_scratch_bytes = 0) noexcept {
   sampled_tree_projection_memory_estimate result;
   result.external_resident_bytes = external_resident_bytes;
+  result.source_construction_scratch_bytes = source_construction_scratch_bytes;
+  result.job_count = job_count;
   result.wave_size = wave_size;
-  result.safely_bounded = true;
+  result.safely_bounded = shape.safely_bounded;
 
   result.sampled_tree_resident_bytes =
       estimate_sampled_tree_projection_sampled_tree_bytes(
-          prepared, result.safely_bounded);
+          shape, result.safely_bounded);
   result.prepared_owned_and_job_bytes =
       estimate_sampled_tree_projection_prepared_owned_and_job_bytes(
-          prepared, job_count, result.safely_bounded);
+          shape, result.safely_bounded);
   result.serial_enumeration_scratch_bytes =
       estimate_sampled_tree_projection_enumeration_scratch_bytes(
-          prepared, result.safely_bounded);
+          shape, result.safely_bounded);
   auto const task_scratch = estimate_sampled_tree_projection_task_scratch_bytes(
-      prepared, result.safely_bounded);
+      shape, result.safely_bounded);
   auto const direct_workspace =
       estimate_sampled_tree_projection_direct_workspace_bytes(
-          prepared, result.safely_bounded);
+          shape, result.safely_bounded);
   auto const retained =
       estimate_sampled_tree_projection_retained_candidate_bytes(
-          prepared, result.safely_bounded);
+          shape, result.safely_bounded);
 
   chart_indexed_range_plan plan;
   if (scheduler != nullptr && wave_size != 0) {
@@ -2224,24 +2434,28 @@ estimate_sampled_tree_projection_memory(
   result.active_projection_scratch_bytes = result.stable_slot_scratch_bytes;
 
   if (scheduler != nullptr) {
-    result.scheduler_bytes =
+    result.scheduler_resident_bytes =
         estimate_chart_scheduler_implementation_resident_bytes();
     try {
-      result.scheduler_bytes = sampled_tree_projection_saturating_add(
-          result.scheduler_bytes,
+      result.scheduler_resident_bytes = sampled_tree_projection_saturating_add(
+          result.scheduler_resident_bytes,
           estimate_chart_scheduler_pool_owning_heap_bytes(
               scheduler->worker_resolution().resolved_workers),
           result.safely_bounded);
       if (plan.range_count > 1 && plan.worker_task_limit > 1) {
-        result.scheduler_bytes = sampled_tree_projection_saturating_add(
-            result.scheduler_bytes,
-            estimate_chart_scheduler_operation_peak_bytes(plan),
-            result.safely_bounded);
+        result.scheduler_operation_bytes =
+            estimate_chart_scheduler_operation_peak_bytes(plan);
       }
     } catch (std::overflow_error const&) {
-      result.scheduler_bytes = (std::numeric_limits<std::size_t>::max)();
+      result.scheduler_resident_bytes =
+          (std::numeric_limits<std::size_t>::max)();
+      result.scheduler_operation_bytes =
+          (std::numeric_limits<std::size_t>::max)();
       result.safely_bounded = false;
     }
+    result.scheduler_bytes = sampled_tree_projection_saturating_add(
+        result.scheduler_resident_bytes, result.scheduler_operation_bytes,
+        result.safely_bounded);
   }
 
   // The scheduler operation estimator includes its per-range exception slots.
@@ -2255,6 +2469,9 @@ estimate_sampled_tree_projection_memory(
       result.safely_bounded);
 
   result.required_peak_bytes = result.external_resident_bytes;
+  result.required_peak_bytes = sampled_tree_projection_saturating_add(
+      result.required_peak_bytes, result.source_construction_scratch_bytes,
+      result.safely_bounded);
   result.required_peak_bytes = sampled_tree_projection_saturating_add(
       result.required_peak_bytes, result.sampled_tree_resident_bytes,
       result.safely_bounded);
@@ -2280,12 +2497,210 @@ estimate_sampled_tree_projection_memory(
 }
 
 inline sampled_tree_projection_memory_estimate
+estimate_sampled_tree_projection_memory(
+    sampled_tree_projection_context const& prepared,
+    chart_scheduler const* scheduler, std::size_t job_count,
+    std::size_t wave_size, std::size_t external_resident_bytes) {
+  return estimate_sampled_tree_projection_memory(
+      sampled_tree_projection_shape_from_prepared(prepared, job_count),
+      scheduler, job_count, wave_size, external_resident_bytes);
+}
+
+// Allocation-free search-level shape bound used before a representative tree,
+// prepared context, job vector, result wave, or scheduler operation exists.
+// A selected binary tree has at most 2T nodes including UA, and one projected
+// move is identified by a source/destination node pair, so N^2 bounds the
+// preassigned job count independently of radius and score threshold.
+inline sampled_tree_projection_memory_estimate
+estimate_sampled_tree_projection_source_memory_bound(
+    clade_grammar const& base, phylo_dag const& source_dag,
+    chart_scheduler const* scheduler, std::size_t maximum_wave_size = 0) {
+  bool safely_bounded = true;
+  sampled_tree_projection_memory_shape shape;
+  shape.taxon_count = base.taxa.id_to_sample_id.size();
+  shape.node_count = sampled_tree_projection_saturating_add(
+      sampled_tree_projection_saturating_multiply(shape.taxon_count, 2,
+                                                  safely_bounded),
+      1, safely_bounded);
+  shape.edge_count = sampled_tree_projection_saturating_multiply(
+      shape.node_count, 2, safely_bounded);
+  shape.production_count = std::max(shape.node_count, base.productions.size());
+  auto const& reference =
+      source_dag.get_root_as<node_kind::ua>().reference_sequence();
+  shape.variable_site_count = reference.size();
+  shape.reference_and_sample_id_bytes = sampled_tree_projection_saturating_add(
+      reference.size(), 1, safely_bounded);
+  for (auto const& sample_id : base.taxa.id_to_sample_id) {
+    shape.reference_and_sample_id_bytes =
+        sampled_tree_projection_saturating_add(
+            shape.reference_and_sample_id_bytes,
+            sampled_tree_projection_saturating_add(sample_id.size(), 1,
+                                                   safely_bounded),
+            safely_bounded);
+  }
+  shape.job_count = sampled_tree_projection_saturating_multiply(
+      shape.node_count, shape.node_count, safely_bounded);
+  shape.safely_bounded = safely_bounded;
+
+  // Temporary source-DAG traversal, leaf compact-genome collection,
+  // synthetic-tree geometric growth, and the before-tree grammar coexist
+  // while the prepared context is published. The factors are deliberately
+  // frozen-toolchain ownership bounds; native coordinator stack/TLS is not a
+  // chart allocation and remains covered by the RSS gate.
+  std::size_t construction = sizeof(phylo_dag) + sizeof(clade_grammar);
+  auto add_product = [&](std::size_t count, std::size_t bytes) {
+    construction = sampled_tree_projection_saturating_add(
+        construction,
+        sampled_tree_projection_saturating_multiply(count, bytes,
+                                                    safely_bounded),
+        safely_bounded);
+  };
+  add_product(source_dag.node_high_mark(), 16 * sizeof(void*) + 256);
+  add_product(source_dag.edge_high_mark(), 8 * sizeof(void*) + 128);
+  add_product(shape.taxon_count, sizeof(compact_genome) + 8 * sizeof(void*));
+  add_product(shape.taxon_count, sampled_tree_projection_saturating_scale(
+                                     shape.variable_site_count, 4,
+                                     sizeof(std::uint32_t), safely_bounded));
+  add_product(shape.node_count, 24 * sizeof(void*) + 512);
+  add_product(shape.edge_count, 16 * sizeof(void*) + 256);
+  add_product(shape.production_count, 24 * sizeof(void*) + 512);
+  add_product(shape.node_count,
+              sampled_tree_projection_saturating_scale(
+                  shape.taxon_count, 8, sizeof(taxon_id), safely_bounded));
+
+  auto wave_size =
+      bounded_sampled_tree_projection_wave_size(scheduler, shape.job_count);
+  if (maximum_wave_size != 0) {
+    wave_size = std::min(wave_size, maximum_wave_size);
+  }
+  auto result = estimate_sampled_tree_projection_memory(
+      shape, scheduler, shape.job_count, wave_size, 0, construction);
+  result.safely_bounded = result.safely_bounded && safely_bounded;
+  if (!result.safely_bounded) {
+    result.required_peak_bytes = (std::numeric_limits<std::size_t>::max)();
+  }
+  return result;
+}
+
+// Allocation-free search-level bound for the bounded source-wave product
+// path.  Unlike the legacy preassigned-job estimator above, this models the
+// ownership that can really coexist: one representative sampled tree, its
+// prepared context, a bounded source wave, a bounded projection subwave, and
+// stable-slot direct workspaces.  Zero width arguments select the product
+// maximum for the supplied scheduler.
+inline sampled_tree_source_wave_memory_estimate
+estimate_sampled_tree_source_memory_bound(
+    clade_grammar const& base, phylo_dag const& source_dag,
+    chart_scheduler const* scheduler,
+    std::size_t maximum_source_wave_size = 0,
+    std::size_t maximum_projection_wave_size = 0) {
+  bool safely_bounded = true;
+  sampled_tree_projection_memory_shape shape;
+  shape.taxon_count = base.taxa.id_to_sample_id.size();
+  shape.node_count = sampled_tree_projection_saturating_add(
+      sampled_tree_projection_saturating_multiply(shape.taxon_count, 2,
+                                                  safely_bounded),
+      1, safely_bounded);
+  shape.edge_count = sampled_tree_projection_saturating_multiply(
+      shape.node_count, 2, safely_bounded);
+  shape.production_count = std::max(shape.node_count, base.productions.size());
+  auto const& reference =
+      source_dag.get_root_as<node_kind::ua>().reference_sequence();
+  shape.variable_site_count = reference.size();
+  shape.reference_and_sample_id_bytes = sampled_tree_projection_saturating_add(
+      reference.size(), 1, safely_bounded);
+  for (auto const& sample_id : base.taxa.id_to_sample_id) {
+    shape.reference_and_sample_id_bytes =
+        sampled_tree_projection_saturating_add(
+            shape.reference_and_sample_id_bytes,
+            sampled_tree_projection_saturating_add(sample_id.size(), 1,
+                                                   safely_bounded),
+            safely_bounded);
+  }
+  shape.safely_bounded = safely_bounded;
+
+  // Temporary source-DAG traversal, leaf compact-genome collection,
+  // synthetic-tree geometric growth, and before-tree grammar preparation can
+  // coexist before the persistent source-wave ownership graph is published.
+  std::size_t construction = sizeof(phylo_dag) + sizeof(clade_grammar);
+  auto add_product = [&](std::size_t count, std::size_t bytes) {
+    construction = sampled_tree_projection_saturating_add(
+        construction,
+        sampled_tree_projection_saturating_multiply(count, bytes,
+                                                    safely_bounded),
+        safely_bounded);
+  };
+  add_product(source_dag.node_high_mark(), 16 * sizeof(void*) + 256);
+  add_product(source_dag.edge_high_mark(), 8 * sizeof(void*) + 128);
+  add_product(shape.taxon_count, sizeof(compact_genome) + 8 * sizeof(void*));
+  add_product(shape.taxon_count, sampled_tree_projection_saturating_scale(
+                                     shape.variable_site_count, 4,
+                                     sizeof(std::uint32_t), safely_bounded));
+  add_product(shape.node_count, 24 * sizeof(void*) + 512);
+  add_product(shape.edge_count, 16 * sizeof(void*) + 256);
+  add_product(shape.production_count, 24 * sizeof(void*) + 512);
+  add_product(shape.node_count,
+              sampled_tree_projection_saturating_scale(
+                  shape.taxon_count, 8, sizeof(taxon_id), safely_bounded));
+
+  auto const source_count = shape.node_count;
+  auto source_wave =
+      bounded_sampled_tree_source_wave_size(scheduler, source_count);
+  if (maximum_source_wave_size != 0) {
+    source_wave = std::min(source_wave, maximum_source_wave_size);
+  }
+  auto const move_bound = sampled_tree_projection_saturating_multiply(
+      source_wave, shape.node_count, safely_bounded);
+  auto projection_wave =
+      bounded_sampled_tree_projection_wave_size(scheduler, move_bound);
+  if (maximum_projection_wave_size != 0) {
+    projection_wave =
+        std::min(projection_wave, maximum_projection_wave_size);
+  }
+  shape.safely_bounded = safely_bounded;
+  auto result = estimate_sampled_tree_source_wave_memory(
+      shape, scheduler, source_count, source_wave, projection_wave, 0,
+      construction);
+  auto const shape_witness =
+      estimate_sampled_tree_projection_retained_witness_bytes(
+          shape, safely_bounded);
+  auto const base_witness =
+      estimate_sampled_tree_projection_retained_witness_bytes(
+          base, safely_bounded);
+  if (base_witness > shape_witness) {
+    auto const retained_delta = sampled_tree_projection_saturating_scale(
+        base_witness - shape_witness, projection_wave, 2, safely_bounded);
+    result.projection_slot_and_payload_bytes =
+        sampled_tree_projection_saturating_add(
+            result.projection_slot_and_payload_bytes, retained_delta,
+            safely_bounded);
+    result.planned_retained_payload_bytes =
+        sampled_tree_projection_saturating_add(
+            result.planned_retained_payload_bytes, retained_delta,
+            safely_bounded);
+    result.required_peak_bytes = sampled_tree_projection_saturating_add(
+        result.required_peak_bytes, retained_delta, safely_bounded);
+    result.actual_peak_bytes = result.required_peak_bytes;
+  }
+  result.safely_bounded = result.safely_bounded && safely_bounded;
+  if (!result.safely_bounded) {
+    result.required_peak_bytes = (std::numeric_limits<std::size_t>::max)();
+    result.actual_peak_bytes = result.required_peak_bytes;
+  }
+  return result;
+}
+
+inline sampled_tree_projection_memory_estimate
 admit_sampled_tree_projection_memory(
     sampled_tree_projection_context const& prepared,
     chart_scheduler const* scheduler, std::size_t job_count,
-    std::size_t external_resident_bytes, std::size_t budget_bytes) {
-  auto const maximum_wave =
+    std::size_t external_resident_bytes, std::size_t budget_bytes,
+    std::size_t maximum_wave_size = 0) {
+  auto maximum_wave =
       bounded_sampled_tree_projection_wave_size(scheduler, job_count);
+  if (maximum_wave_size != 0) {
+    maximum_wave = std::min(maximum_wave, maximum_wave_size);
+  }
   auto estimate = [&](std::size_t wave_size) {
     return estimate_sampled_tree_projection_memory(
         prepared, scheduler, job_count, wave_size, external_resident_bytes);
@@ -5204,8 +5619,8 @@ preassign_sampled_tree_projection_jobs(
   result.memory = admit_sampled_tree_projection_memory(
       prepared, options.sampled_tree_projection_scheduler, job_count,
       options.sampled_tree_projection_external_resident_bytes,
-      options.sampled_tree_projection_memory_budget_bytes);
-
+      options.sampled_tree_projection_memory_budget_bytes,
+      options.sampled_tree_projection_maximum_wave_size);
   // Finite full admission precedes the all-moves vector, result slots, and
   // every scheduler-owned operation/pool allocation.
   if (job_count != 0 &&
@@ -5527,10 +5942,31 @@ project_sampled_tree_moves_in_source_waves(
 
   auto const& index = prepared.index();
   auto const source_count = index.get_searchable_nodes().size();
+  auto const destination_bound = prepared.source_tree().node_high_mark();
+  if ((options.sampled_tree_source_admitted_source_count_bound != 0 &&
+       source_count >
+           options.sampled_tree_source_admitted_source_count_bound) ||
+      (options.sampled_tree_source_admitted_destination_bound != 0 &&
+       destination_bound >
+           options.sampled_tree_source_admitted_destination_bound)) {
+    throw std::runtime_error(
+        "chart SPR sampled-tree realized source shape exceeded unified "
+        "admission");
+  }
   result.memory = admit_sampled_tree_source_wave_memory(
       prepared, scheduler, source_count,
       options.sampled_tree_projection_external_resident_bytes,
-      options.sampled_tree_projection_memory_budget_bytes);
+      options.sampled_tree_projection_memory_budget_bytes,
+      options.sampled_tree_source_maximum_wave_size,
+      options.sampled_tree_projection_maximum_wave_size);
+  if (options.sampled_tree_source_admitted_peak_bytes != 0 &&
+      (!result.memory.safely_bounded ||
+       result.memory.required_peak_bytes >
+           options.sampled_tree_source_admitted_peak_bytes)) {
+    throw sampled_tree_projection_budget_error{
+        result.memory.required_peak_bytes,
+        options.sampled_tree_source_admitted_peak_bytes};
+  }
   if (source_count == 0) return result;
   if (result.memory.source_wave_size == 0 ||
       result.memory.projection_wave_size == 0) {
@@ -5617,7 +6053,13 @@ project_sampled_tree_moves_in_source_waves(
         safely_bounded);
     result.memory.safely_bounded = safely_bounded;
   }
-  auto const budget = options.sampled_tree_projection_memory_budget_bytes;
+  auto budget = options.sampled_tree_projection_memory_budget_bytes;
+  if (options.sampled_tree_source_admitted_peak_bytes != 0) {
+    budget = budget == 0
+                 ? options.sampled_tree_source_admitted_peak_bytes
+                 : std::min(budget,
+                            options.sampled_tree_source_admitted_peak_bytes);
+  }
   if (!result.memory.safely_bounded ||
       (budget != 0 && result.memory.actual_peak_bytes > budget)) {
     throw sampled_tree_projection_budget_error{result.memory.actual_peak_bytes,

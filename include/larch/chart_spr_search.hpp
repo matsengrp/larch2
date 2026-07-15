@@ -1268,6 +1268,11 @@ struct chart_spr_search_options {
   std::function<void()> before_candidate_pipeline_start_for_tests = {};
   std::function<void(std::size_t)>
       before_candidate_pipeline_score_batch_for_tests = {};
+  std::function<void(std::size_t)>
+      after_candidate_pipeline_score_batch_for_tests = {};
+  // Non-owning oversized-diagnostic seam for finite dense-score admission
+  // tests. The view must outlive the synchronous acceptance iteration.
+  std::string_view force_dense_invalid_reason_for_tests = {};
 };
 
 struct chart_spr_exact_candidate_memory_estimate {
@@ -1285,21 +1290,6 @@ struct chart_spr_exact_candidate_memory_estimate {
   // False means standard-container growth could not be bounded before the
   // finite-budget sentinel. Such a candidate is still runnable with the
   // historical unlimited budget, but finite admission fails closed.
-  bool safely_bounded = true;
-};
-
-struct chart_spr_candidate_pipeline_memory_estimate {
-  std::size_t published_state_bytes = 0;
-  std::size_t double_buffer_bytes = 0;
-  std::size_t simultaneous_local_scoring_bytes = 0;
-  std::size_t scheduler_resident_bytes = 0;
-  std::size_t scheduler_operation_bytes = 0;
-  std::size_t cancellation_error_and_handoff_bytes = 0;
-  // This is supplied as sampled-tree projection's external live envelope;
-  // projection adds its exact prepared tree/job/wave/scratch peak at the
-  // per-sample preflight.
-  std::size_t projection_external_resident_bytes = 0;
-  std::size_t required_peak_bytes = 0;
   bool safely_bounded = true;
 };
 
@@ -3947,6 +3937,32 @@ struct grammar_spr_finite_iteration_memory_envelope {
   std::size_t planned_scheduler_resident_bytes = 0;
   std::size_t planned_local_task_stable_bytes = 0;
   std::size_t planned_local_task_preparation_peak_bytes = 0;
+  std::size_t planned_local_weighted_candidate_order_bytes = 0;
+  std::size_t planned_pattern_batch_construction_scratch_bytes = 0;
+  std::size_t planned_local_untiled_concurrent_preparation_peak_bytes = 0;
+  std::size_t planned_local_retained_stable_capacity_bytes = 0;
+  std::size_t planned_sampled_wave_with_retained_local_peak_bytes = 0;
+  chart_spr_cache_strategy planned_cache_strategy =
+      chart_spr_cache_strategy::all_active_patterns;
+  std::size_t planned_candidate_batch_size = 0;
+  std::size_t planned_local_prepared_slots = 0;
+  std::size_t planned_local_worker_slots = 0;
+  std::size_t planned_local_tile_result_slots = 0;
+  std::size_t planned_source_owned_bytes = 0;
+  std::size_t planned_enumeration_callback_concurrent_bytes = 0;
+  std::size_t planned_candidate_buffer_owned_bytes = 0;
+  std::size_t planned_pipeline_control_bytes = 0;
+  std::size_t planned_sampled_source_waiting_bytes = 0;
+  std::size_t planned_sampled_source_active_scratch_bytes = 0;
+  std::size_t planned_sampled_source_scheduler_operation_peak_bytes = 0;
+  std::size_t planned_sampled_projection_active_scratch_bytes = 0;
+  std::size_t planned_sampled_projection_scheduler_operation_peak_bytes = 0;
+  std::size_t planned_sampled_source_admitted_peak_bytes = 0;
+  std::size_t planned_sampled_source_count_bound = 0;
+  std::size_t planned_sampled_destination_bound_per_source = 0;
+  std::size_t planned_sampled_source_wave_size = 0;
+  std::size_t planned_sampled_projection_wave_size = 0;
+  std::size_t candidate_buffer_count = 1;
 };
 
 // Allocation-free pre-enumeration envelope for a bounded grammar-native
@@ -3959,7 +3975,12 @@ estimate_grammar_spr_finite_iteration_memory_envelope(
     chart_spr_search_state const& state, std::size_t candidate_limit,
     std::size_t candidate_batch_size, std::size_t ranked_limit,
     bool capture_semantics, chart_scheduler const& scheduler,
-    std::size_t local_task_slots);
+    std::size_t local_task_slots,
+    grammar_spr_enumeration_options const* source_options = nullptr,
+    std::size_t candidate_buffer_count = 1,
+    bool include_pipeline_control = false,
+    std::size_t source_wave_size = 0,
+    std::size_t projection_wave_size = 0);
 
 // Peak coordinator scratch used while producing the per-candidate admission
 // estimates. Estimation is serial, so only the largest candidate is charged.
@@ -5763,6 +5784,20 @@ struct local_spr_score_options {
   // value because a span cannot inspect its owner.
   bool admission_additional_resident_includes_candidate_inputs = false;
 
+  // The finite acceptance-iteration owner supplies the allocation-free
+  // frozen-toolchain bounds for dense scorer temporaries.  The scorer checks
+  // the actual vector capacities after allocation and before the first
+  // scheduler submission.  Zero keeps the historical unchecked direct-call
+  // contract; it never weakens the finite iteration envelope, which always
+  // supplies both applicable bounds.
+  std::size_t admission_weighted_candidate_order_capacity_bytes = 0;
+  std::size_t admission_pattern_batch_construction_scratch_bytes = 0;
+
+  // Non-owning test seam for exercising diagnostics produced after dense
+  // preparation.  Production callers leave it empty.  The view must outlive
+  // the synchronous local-score operation.
+  std::string_view force_dense_invalid_reason_for_tests = {};
+
   // Mark reachability validation as full-grammar-like when visited base
   // clades or productions exceed this fraction of the base grammar.  0
   // disables the flag.
@@ -5770,6 +5805,24 @@ struct local_spr_score_options {
 };
 
 namespace chart_spr_search_detail {
+
+inline bool use_finite_local_score_diagnostics(
+    chart_spr_search_state const& state,
+    local_spr_score_options const& options) noexcept {
+  return options.admission_memory_budget_bytes != 0 ||
+         state.cache_opts.memory_budget_bytes != 0;
+}
+
+inline void reserve_finite_local_score_invalid_reason(std::string& reason) {
+  reason.clear();
+  reason.reserve(lazy_local_invalid_reason_max_size);
+  if (local_owned_dynamic_capacity_bytes(reason) >
+      lazy_local_invalid_reason_owned_capacity_bound()) {
+    throw std::logic_error(
+        "chart SPR finite local score: diagnostic string capacity exceeded "
+        "the unified admission envelope");
+  }
+}
 
 inline std::size_t local_overlay_delta_dynamic_capacity_bytes(
     spr_overlay_delta const& delta) {
@@ -7632,7 +7685,16 @@ class prepared_local_candidate_score {
   }
 
   void reserve_finite_invalid_reason() {
-    result.invalid_reason.reserve(lazy_local_invalid_reason_max_size);
+    reserve_finite_local_score_invalid_reason(result.invalid_reason);
+  }
+
+  void configure_finite_invalid_reason(bool finite) {
+    finite_invalid_reason_ = finite;
+    if (finite) reserve_finite_invalid_reason();
+  }
+
+  [[nodiscard]] bool finite_invalid_reason() const noexcept {
+    return finite_invalid_reason_;
   }
 
   void release_operation_borrows() noexcept {
@@ -7667,6 +7729,7 @@ class prepared_local_candidate_score {
 
  private:
   compiled_spr_candidate_execution execution;
+  bool finite_invalid_reason_ = false;
 
   void build_and_publish_execution(
       clade_grammar const& base,
@@ -7724,6 +7787,10 @@ struct local_score_tile_result {
     active_score = 0;
     valid = true;
     invalid_reason.clear();
+  }
+
+  void configure_finite_invalid_reason(bool finite) {
+    if (finite) reserve_finite_local_score_invalid_reason(invalid_reason);
   }
 };
 
@@ -7948,7 +8015,8 @@ struct local_score_workspace_access {
 
   static void begin(chart_spr_local_score_workspace& workspace,
                     std::size_t prepared_count, std::size_t worker_count,
-                    std::size_t tile_count = 0) {
+                    std::size_t tile_count = 0,
+                    bool finite_invalid_reasons = false) {
     if (!workspace.operation_boundary_clean()) {
       throw std::logic_error(
           "chart SPR local score workspace: overlapping operation or stale "
@@ -7964,6 +8032,19 @@ struct local_score_workspace_access {
     }
     if (workspace.tile_results_.size() < tile_count) {
       workspace.tile_results_.resize(tile_count);
+    }
+    // Reserve every worker-published diagnostic before the operation becomes
+    // active and, critically, before any scheduler submission.  A retained
+    // oversized capacity from an earlier unlimited call fails closed here;
+    // the finite iteration's outer actual-capacity preflight normally rejects
+    // that reuse even earlier.
+    for (std::size_t i = 0; i < prepared_count; ++i) {
+      workspace.prepared_[i].configure_finite_invalid_reason(
+          finite_invalid_reasons);
+    }
+    for (std::size_t i = 0; i < tile_count; ++i) {
+      workspace.tile_results_[i].configure_finite_invalid_reason(
+          finite_invalid_reasons);
     }
     workspace.prepared_active_ = prepared_count;
     workspace.worker_active_ = worker_count;
@@ -8159,6 +8240,8 @@ inline void prepare_local_candidate_score_into(
     ++counters->local_candidate_scores;
   }
 
+  prepared.configure_finite_invalid_reason(
+      use_finite_local_score_diagnostics(state, options));
   prepared.reset_for_prepare();
   candidate_chart_execution_plan_build_stats candidate_plan_stats;
   auto record_candidate_plan_stats = [&] {
@@ -8272,6 +8355,9 @@ inline prepared_local_candidate_score prepare_local_candidate_score(
 inline void invalidate_prepared_local_candidate(
     chart_spr_search_state const& state,
     prepared_local_candidate_score& prepared, std::string_view reason) {
+  if (prepared.finite_invalid_reason()) {
+    reason = bounded_lazy_local_invalid_reason(reason);
+  }
   set_invalid_local_score_result(state, prepared.result, reason);
   prepared.valid_for_accumulation = false;
 }
@@ -8320,6 +8406,11 @@ inline void accumulate_prepared_local_candidate_patterns(
     chart_spr_local_score_scratch& scratch,
     checked_chart_execution_plan_ref const& checked_state) {
   if (!prepared.valid_for_accumulation) return;
+  if (!options.force_dense_invalid_reason_for_tests.empty()) {
+    invalidate_prepared_local_candidate(
+        state, prepared, options.force_dense_invalid_reason_for_tests);
+    return;
+  }
   if (!validate_prepared_candidate_plan_identity(
           state, prepared, counters, checked_state)) {
     return;
@@ -8418,6 +8509,15 @@ inline void score_prepared_local_candidate_pattern_tile(
   tile.reset_for_operation();
   scratch.clear_borrows();
   if (!prepared.valid_for_accumulation) return;
+  if (!options.force_dense_invalid_reason_for_tests.empty()) {
+    tile.valid = false;
+    auto reason = options.force_dense_invalid_reason_for_tests;
+    if (use_finite_local_score_diagnostics(state, options)) {
+      reason = bounded_lazy_local_invalid_reason(reason);
+    }
+    tile.invalid_reason.assign(reason);
+    return;
+  }
 
   try {
     checked_state.assert_same(state.grammar, state.execution_plan);
@@ -8478,7 +8578,11 @@ inline void score_prepared_local_candidate_pattern_tile(
     }
   } catch (std::exception const& e) {
     tile.valid = false;
-    tile.invalid_reason = e.what();
+    auto reason = std::string_view{e.what()};
+    if (use_finite_local_score_diagnostics(state, options)) {
+      reason = bounded_lazy_local_invalid_reason(reason);
+    }
+    tile.invalid_reason.assign(reason);
   }
   scratch.clear_borrows();
 }
@@ -8495,6 +8599,15 @@ inline void score_prepared_local_candidate_pattern_cache_tile(
   tile.reset_for_operation();
   scratch.clear_borrows();
   if (!prepared.valid_for_accumulation) return;
+  if (!options.force_dense_invalid_reason_for_tests.empty()) {
+    tile.valid = false;
+    auto reason = options.force_dense_invalid_reason_for_tests;
+    if (use_finite_local_score_diagnostics(state, options)) {
+      reason = bounded_lazy_local_invalid_reason(reason);
+    }
+    tile.invalid_reason.assign(reason);
+    return;
+  }
 
   try {
     checked_state.assert_same(state.grammar, state.execution_plan);
@@ -8558,7 +8671,11 @@ inline void score_prepared_local_candidate_pattern_cache_tile(
     }
   } catch (std::exception const& e) {
     tile.valid = false;
-    tile.invalid_reason = e.what();
+    auto reason = std::string_view{e.what()};
+    if (use_finite_local_score_diagnostics(state, options)) {
+      reason = bounded_lazy_local_invalid_reason(reason);
+    }
+    tile.invalid_reason.assign(reason);
   }
   scratch.clear_borrows();
 }
@@ -9345,6 +9462,15 @@ inline std::vector<std::size_t> local_score_weighted_candidate_order(
   return order;
 }
 
+inline void require_local_score_admitted_temporary_capacity(
+    std::size_t actual_bytes, std::size_t admitted_bytes,
+    std::string_view temporary_name) {
+  if (admitted_bytes == 0 || actual_bytes <= admitted_bytes) return;
+  throw std::logic_error("chart SPR finite local score: observed " +
+                         std::string{temporary_name} +
+                         " capacity exceeded the unified admission envelope");
+}
+
 inline chart_indexed_range_options local_score_candidate_range_options(
     std::size_t candidate_count, std::size_t resolved_workers) noexcept {
   if (resolved_workers <= 1) {
@@ -9452,6 +9578,14 @@ build_pattern_chart_cache_entries_for_range(
   std::vector<pattern_chart_cache_entry> entries(count);
   std::vector<std::exception_ptr> errors(count);
   std::vector<std::uint8_t> built(count, 0);
+  auto const construction_scratch_bytes = local_capacity_checked_add(
+      local_owned_dynamic_capacity_bytes(errors),
+      local_owned_dynamic_capacity_bytes(built),
+      "chart SPR pattern-batch construction scratch capacity");
+  require_local_score_admitted_temporary_capacity(
+      construction_scratch_bytes,
+      options.admission_pattern_batch_construction_scratch_bytes,
+      "pattern-batch construction scratch");
   auto const range_options = chart_spr_phase4_pattern_range_options(
       count, scheduler.worker_resolution().resolved_workers);
   auto const range_plan = scheduler.plan_indexed_ranges(count, range_options);
@@ -9539,6 +9673,10 @@ inline void score_candidates_locally_all_cache_into(
 
   auto const candidate_order =
       local_score_weighted_candidate_order(candidates, worker_count);
+  require_local_score_admitted_temporary_capacity(
+      local_owned_dynamic_capacity_bytes(candidate_order),
+      options.admission_weighted_candidate_order_capacity_bytes,
+      "weighted candidate order");
 
   if (tile_plan.enabled()) {
     auto const batch_start = std::chrono::steady_clock::now();
@@ -9696,6 +9834,10 @@ inline void score_candidates_locally_pattern_batches_into(
       scheduler == nullptr
           ? std::vector<std::size_t>{}
           : local_score_weighted_candidate_order(candidates, worker_count);
+  require_local_score_admitted_temporary_capacity(
+      local_owned_dynamic_capacity_bytes(candidate_order),
+      options.admission_weighted_candidate_order_capacity_bytes,
+      "weighted candidate order");
 
   auto const& patterns = state.active_patterns.patterns.patterns;
   auto batch_size = std::max<std::size_t>(
@@ -9729,6 +9871,14 @@ inline void score_candidates_locally_pattern_batches_into(
         std::vector<pattern_chart_cache_entry> entries(count);
         std::vector<std::exception_ptr> build_errors(count);
         std::vector<std::uint8_t> built(count, 0);
+        auto const construction_scratch_bytes = local_capacity_checked_add(
+            local_owned_dynamic_capacity_bytes(build_errors),
+            local_owned_dynamic_capacity_bytes(built),
+            "chart SPR fused pattern-batch construction scratch capacity");
+        require_local_score_admitted_temporary_capacity(
+            construction_scratch_bytes,
+            options.admission_pattern_batch_construction_scratch_bytes,
+            "fused pattern-batch construction scratch");
         auto chart_build_options = state.chart_opts;
         chart_build_options.keep_trace = false;
         chart_build_options.max_trace_choices = 0;
@@ -10056,11 +10206,19 @@ inline void score_candidates_locally_into_impl(
       }
     }
   }
+  auto const finite_invalid_reasons =
+      use_finite_local_score_diagnostics(state, operation_options);
+  if (finite_invalid_reasons) {
+    for (auto& result : results) {
+      reserve_finite_local_score_invalid_reason(result.invalid_reason);
+    }
+  }
   local_score_workspace_access::begin(
       workspace, prepared_count, workspace_worker_count,
       lazy_resident_cache
           ? 0
-          : std::max(tile_plan.total_tiles, pattern_batch_fusion.total_tiles));
+          : std::max(tile_plan.total_tiles, pattern_batch_fusion.total_tiles),
+      finite_invalid_reasons);
   try {
     for (auto& result : results) {
       result.lower_bound = {};
@@ -12346,130 +12504,6 @@ struct grammar_spr_candidate_copy_scratch {
   std::vector<overlay_production_ref> source_after_topology;
 };
 
-inline chart_spr_candidate_pipeline_memory_estimate
-estimate_chart_spr_candidate_pipeline_memory(
-    chart_spr_search_state const& state,
-    chart_spr_search_options const& options, std::size_t candidate_batch_size,
-    chart_scheduler const& scheduler) noexcept {
-  chart_spr_candidate_pipeline_memory_estimate result;
-  auto add = [&](std::size_t lhs, std::size_t rhs) noexcept {
-    if (lhs > (std::numeric_limits<std::size_t>::max)() - rhs) {
-      result.safely_bounded = false;
-      return (std::numeric_limits<std::size_t>::max)();
-    }
-    return lhs + rhs;
-  };
-  auto multiply = [&](std::size_t lhs, std::size_t rhs) noexcept {
-    if (lhs != 0 && rhs > (std::numeric_limits<std::size_t>::max)() / lhs) {
-      result.safely_bounded = false;
-      return (std::numeric_limits<std::size_t>::max)();
-    }
-    return lhs * rhs;
-  };
-
-  try {
-    // This frozen-capacity walk owns the grammar, immutable plan, active
-    // patterns, outer scoring slots, and verifier tracker.  Add the complete
-    // scoring representation/local-cache envelope and published trim.  The
-    // deliberate outer-vector over-count keeps this safe on the Phase-7
-    // branch and becomes a simple call-site replacement by
-    // estimate_chart_spr_published_state_resident_bytes() after rebase.
-    result.published_state_bytes =
-        estimate_chart_spr_lazy_state_build_retained_bytes(state);
-    result.published_state_bytes =
-        add(result.published_state_bytes,
-            std::max(state.resident_pattern_cache_bytes,
-                     estimate_chart_spr_pattern_cache_bytes(state)));
-    if (state.exact_trim_active_only) {
-      result.published_state_bytes = add(result.published_state_bytes,
-                                         estimate_chart_spr_trim_resident_bytes(
-                                             *state.exact_trim_active_only));
-    }
-
-    auto const clades = add(state.grammar.clades.size(), 1);
-    auto const taxa = state.grammar.taxa.id_to_sample_id.size();
-    auto const productions = std::max(clades, state.grammar.productions.size());
-    auto candidate_payload = sizeof(grammar_spr_candidate);
-    candidate_payload =
-        add(candidate_payload,
-            multiply(clades, sizeof(clade_key) + 4 * sizeof(void*)));
-    candidate_payload = add(candidate_payload,
-                            multiply(multiply(clades, taxa), sizeof(taxon_id)));
-    candidate_payload =
-        add(candidate_payload,
-            multiply(productions,
-                     sizeof(overlay_grammar_production) + 12 * sizeof(void*)));
-    candidate_payload =
-        add(candidate_payload,
-            multiply(productions, 4 * sizeof(overlay_production_ref)));
-    // High-water copy scratch may retain a second complete payload when a
-    // later, smaller candidate is copied into the slot.
-    auto per_slot = add(2 * sizeof(grammar_spr_candidate_copy_scratch),
-                        multiply(candidate_payload, 2));
-    per_slot = add(per_slot, sizeof(chart_spr_local_score_result) + 512);
-    auto one_buffer = add(2 * sizeof(std::vector<grammar_spr_candidate>),
-                          multiply(candidate_batch_size, per_slot));
-    result.double_buffer_bytes = multiply(one_buffer, 2);
-
-    auto const workers = scheduler.worker_resolution().resolved_workers;
-    auto const patterns = state.active_patterns.patterns.patterns.size();
-    auto local_slot = sizeof(prepared_local_candidate_score) +
-                      sizeof(local_score_worker_workspace) +
-                      sizeof(chart_spr_local_score_scratch);
-    local_slot =
-        add(local_slot, multiply(add(clades, productions), 32 * sizeof(void*)));
-    local_slot = add(local_slot, multiply(std::max<std::size_t>(1, patterns),
-                                          8 * sizeof(chart_cost)));
-    result.simultaneous_local_scoring_bytes =
-        multiply(std::max<std::size_t>(1, workers), local_slot);
-    result.simultaneous_local_scoring_bytes = add(
-        result.simultaneous_local_scoring_bytes,
-        multiply(candidate_batch_size, sizeof(prepared_local_candidate_score) +
-                                           sizeof(local_score_tile_result)));
-
-    result.scheduler_resident_bytes =
-        add(estimate_chart_scheduler_implementation_resident_bytes(),
-            estimate_chart_scheduler_pool_owning_heap_bytes(workers));
-    auto score_items = std::max(candidate_batch_size, patterns);
-    auto score_plan = scheduler.plan_indexed_ranges(
-        score_items, {.minimum_grain = 1, .target_ranges_per_worker = 4});
-    if (score_plan.range_count > 1 && score_plan.worker_task_limit > 1) {
-      result.scheduler_operation_bytes =
-          estimate_chart_scheduler_operation_peak_bytes(score_plan);
-    }
-
-    // The coordinator is an OS thread, never a second pool.  Its native stack
-    // and TLS are outside the chart byte budget exactly like scheduler worker
-    // stacks and remain subject to the RSS gate.  Everything controlled here
-    // is charged: jthread stop state, two slot states, mutex/CV, exception
-    // ownership, test callback target, and handoff bookkeeping.
-    result.cancellation_error_and_handoff_bytes =
-        sizeof(std::jthread) + sizeof(std::stop_source) +
-        2 * sizeof(std::exception_ptr) + sizeof(std::mutex) +
-        sizeof(std::condition_variable) + 2048;
-    if (options.before_candidate_pipeline_start_for_tests ||
-        options.before_candidate_pipeline_score_batch_for_tests) {
-      result.cancellation_error_and_handoff_bytes =
-          add(result.cancellation_error_and_handoff_bytes, 512);
-    }
-
-    result.projection_external_resident_bytes =
-        add(result.published_state_bytes,
-            add(result.double_buffer_bytes,
-                add(result.simultaneous_local_scoring_bytes,
-                    result.cancellation_error_and_handoff_bytes)));
-    result.required_peak_bytes = add(
-        result.projection_external_resident_bytes,
-        add(result.scheduler_resident_bytes, result.scheduler_operation_bytes));
-  } catch (...) {
-    result.safely_bounded = false;
-    result.required_peak_bytes = (std::numeric_limits<std::size_t>::max)();
-    result.projection_external_resident_bytes =
-        (std::numeric_limits<std::size_t>::max)();
-  }
-  return result;
-}
-
 inline void copy_optional_production_refs_reusing_storage(
     std::optional<std::vector<overlay_production_ref>>& destination,
     std::optional<std::vector<overlay_production_ref>> const& source,
@@ -12617,12 +12651,32 @@ struct chart_spr_acceptance_iteration_workspace {
     std::size_t total =
         sizeof(chart_spr_acceptance_iteration_workspace) - sizeof(local_score);
     total = local_capacity_checked_add(
-        total, local_owned_dynamic_capacity_bytes(candidate_slots),
-        "chart SPR lazy-local candidate batch capacity");
+        total, candidate_buffer_owned_capacity_bytes(0),
+        "chart SPR lazy-local candidate buffer 0 ownership");
     total = local_capacity_checked_add(
-        total, local_vector_dynamic_capacity_bytes(candidate_copy_scratch),
+        total, candidate_buffer_owned_capacity_bytes(1),
+        "chart SPR lazy-local candidate buffer 1 ownership");
+    total = local_capacity_checked_add(
+        total, local_result_owned_capacity_bytes(include_local_results),
+        "chart SPR lazy-local result ownership");
+    return total;
+  }
+
+  [[nodiscard]] std::size_t candidate_buffer_owned_capacity_bytes(
+      std::size_t buffer) const {
+    if (buffer > 1) {
+      throw std::out_of_range(
+          "chart SPR acceptance workspace: pipeline buffer out of range");
+    }
+    auto const& slots =
+        buffer == 0 ? candidate_slots : pipeline_candidate_slots;
+    auto const& copy_scratch =
+        buffer == 0 ? candidate_copy_scratch : pipeline_candidate_copy_scratch;
+    auto total = local_owned_dynamic_capacity_bytes(slots);
+    total = local_capacity_checked_add(
+        total, local_vector_dynamic_capacity_bytes(copy_scratch),
         "chart SPR lazy-local candidate-copy slots");
-    for (auto const& scratch : candidate_copy_scratch) {
+    for (auto const& scratch : copy_scratch) {
       total = local_capacity_checked_add(
           total,
           local_owned_dynamic_capacity_sum(
@@ -12638,16 +12692,29 @@ struct chart_spr_acceptance_iteration_workspace {
               scratch.source_before_topology, scratch.source_after_topology),
           "chart SPR lazy-local candidate-copy scratch");
     }
-    total = local_capacity_checked_add(
-        total, local_vector_dynamic_capacity_bytes(local_results),
-        "chart SPR lazy-local result slots");
-    if (include_local_results) {
+    return total;
+  }
+
+  [[nodiscard]] std::size_t local_result_owned_capacity_bytes(
+      bool include_elements = true) const {
+    auto total = local_vector_dynamic_capacity_bytes(local_results);
+    if (include_elements) {
       for (auto const& result : local_results) {
         total = local_capacity_checked_add(
             total, local_owned_dynamic_capacity_bytes(result.invalid_reason),
             "chart SPR lazy-local result reasons");
       }
     }
+    return total;
+  }
+
+  [[nodiscard]] std::size_t local_admission_non_candidate_buffer_resident_bytes(
+      bool include_local_results = true) const {
+    auto total =
+        sizeof(chart_spr_acceptance_iteration_workspace) - sizeof(local_score);
+    total = local_capacity_checked_add(
+        total, local_result_owned_capacity_bytes(include_local_results),
+        "chart SPR lazy-local result ownership");
     return total;
   }
 
@@ -12839,27 +12906,34 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   auto const finite_lazy_local_admission =
       state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart &&
       exact_memory_budget != 0;
-  if (finite_lazy_local_admission &&
-      (enumeration.source != chart_spr_candidate_source::grammar ||
-       enumeration.reservoir_sample || enumeration.max_candidates == 0)) {
-    // Sampled-tree/hybrid traversal and the reservoir wrapper retain storage
-    // with ownership graphs different from the grammar streaming envelope
-    // charged below.  Fail before rank, batch, or enumerator allocation until
-    // those sources have their own complete finite-budget estimators.
+  auto const worker_count = scheduler.worker_resolution().resolved_workers;
+  auto const pipeline_requested =
+      options.enable_candidate_generation_pipeline && worker_count > 1;
+  auto const finite_pipeline_admission =
+      pipeline_requested && exact_memory_budget != 0;
+  auto const finite_iteration_admission =
+      finite_lazy_local_admission || finite_pipeline_admission;
+  if (finite_iteration_admission &&
+      (enumeration.reservoir_sample || enumeration.max_candidates == 0)) {
+    // Reservoir retains the full underlying source visit graph as well as its
+    // candidate vector. Uncapped enumeration likewise has no finite signature
+    // bound. Both remain fail-closed before rank, buffer, or source allocation.
     throw chart_spr_search_detail::
         chart_spr_lazy_local_enumeration_budget_error(enumeration.source);
   }
-  auto const worker_count = scheduler.worker_resolution().resolved_workers;
+  auto const use_pipeline = pipeline_requested;
+  auto const candidate_buffer_count =
+      use_pipeline ? std::size_t{2} : std::size_t{1};
   auto candidate_batch_size =
       chart_spr_effective_candidate_batch_size(state, options, worker_count);
-  if (finite_lazy_local_admission) {
+  if (finite_iteration_admission) {
     candidate_batch_size =
         std::min(candidate_batch_size, enumeration.max_candidates);
   }
   candidate_batch_size = std::max<std::size_t>(1, candidate_batch_size);
   auto const rank_limit = chart_spr_rank_buffer_limit(options);
   auto const ranked_reserve_limit =
-      finite_lazy_local_admission
+      finite_iteration_admission
           ? std::min(enumeration.max_candidates,
                      rank_limit == chart_spr_rank_unlimited
                          ? enumeration.max_candidates
@@ -12873,7 +12947,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       chart_spr_search_detail::grammar_spr_finite_iteration_memory_envelope>
       finite_iteration_envelope;
   auto const finite_scheduler_resident =
-      finite_lazy_local_admission
+      finite_iteration_admission
           ? chart_spr_search_detail::
                 estimate_chart_spr_scheduler_resident_bytes(scheduler)
           : std::size_t{0};
@@ -12884,7 +12958,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     throw chart_spr_search_detail::chart_spr_lazy_local_budget_error(
         candidate_index, required_bytes, available_bytes);
   };
-  if (finite_lazy_local_admission) {
+  if (finite_iteration_admission) {
     // Establish an empty acceptance ownership graph before either a cold exact
     // trim or the iteration reserves are allowed to allocate.
     workspace.release_retained_storage_before_exact();
@@ -12901,7 +12975,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       throw;
     }
   }();
-  if (finite_lazy_local_admission && capture_semantics &&
+  if (finite_iteration_admission && capture_semantics &&
       options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite &&
       chart_multisite_detail::keep_mask_kind_for_options(options.exact_trim) ==
           multisite_keep_mask_kind::exact_optimal_production_union &&
@@ -12929,7 +13003,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       require_chart_spr_retained_exact_state_memory_budget(
           state, *state.exact_trim_active_only, scheduler, exact_memory_budget);
     }
-    if (finite_lazy_local_admission && capture_semantics &&
+    if (finite_iteration_admission && capture_semantics &&
         state.exact_trim_active_only->keep_production_exact &&
         state.exact_trim_active_only->optimal_root_provenance_classes.empty()) {
       throw chart_spr_search_detail::
@@ -12952,12 +13026,66 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       state.counters.lazy_local_retained_exact_trim_bytes_max,
       estimate_chart_spr_retained_exact_trim_bytes(state));
 
-  if (finite_lazy_local_admission) {
-    finite_iteration_envelope = chart_spr_search_detail::
-        estimate_grammar_spr_finite_iteration_memory_envelope(
-            state, enumeration.max_candidates, candidate_batch_size,
-            ranked_reserve_limit, capture_semantics, scheduler,
-            local_task_slots);
+  if (finite_iteration_admission) {
+    auto estimate_envelope = [&](std::size_t source_wave_size,
+                                 std::size_t projection_wave_size) {
+      return chart_spr_search_detail::
+          estimate_grammar_spr_finite_iteration_memory_envelope(
+              state, enumeration.max_candidates, candidate_batch_size,
+              ranked_reserve_limit, capture_semantics, scheduler,
+              local_task_slots, &enumeration, candidate_buffer_count,
+              use_pipeline, source_wave_size, projection_wave_size);
+    };
+    try {
+      auto selected = estimate_envelope(0, 0);
+      if (enumeration.source != chart_spr_candidate_source::grammar &&
+          selected.planned_required_bytes > exact_memory_budget) {
+        auto const maximum_source_wave =
+            selected.planned_sampled_source_wave_size;
+        auto minimum = estimate_envelope(1, 1);
+        selected = minimum;
+        if (minimum.planned_required_bytes <= exact_memory_budget) {
+          // First admit source concurrency at the irreducible one-projection
+          // working set. Then independently spend the remaining budget on
+          // projection concurrency for that selected source width.
+          std::size_t source_low = 1;
+          std::size_t source_high = maximum_source_wave;
+          while (source_low < source_high) {
+            auto const midpoint =
+                source_low + (source_high - source_low + 1) / 2;
+            auto candidate = estimate_envelope(midpoint, 1);
+            if (candidate.planned_required_bytes <= exact_memory_budget) {
+              source_low = midpoint;
+              selected = std::move(candidate);
+            } else {
+              source_high = midpoint - 1;
+            }
+          }
+
+          auto maximum_projection = estimate_envelope(source_low, 0);
+          auto const maximum_projection_wave =
+              maximum_projection.planned_sampled_projection_wave_size;
+          std::size_t projection_low = 1;
+          std::size_t projection_high = maximum_projection_wave;
+          selected = estimate_envelope(source_low, 1);
+          while (projection_low < projection_high) {
+            auto const midpoint =
+                projection_low + (projection_high - projection_low + 1) / 2;
+            auto candidate = estimate_envelope(source_low, midpoint);
+            if (candidate.planned_required_bytes <= exact_memory_budget) {
+              projection_low = midpoint;
+              selected = std::move(candidate);
+            } else {
+              projection_high = midpoint - 1;
+            }
+          }
+        }
+      }
+      finite_iteration_envelope = std::move(selected);
+    } catch (std::overflow_error const&) {
+      fail_finite_iteration_budget(0, (std::numeric_limits<std::size_t>::max)(),
+                                   exact_memory_budget);
+    }
     state.counters.lazy_local_iteration_envelope_bytes_max =
         std::max(state.counters.lazy_local_iteration_envelope_bytes_max,
                  finite_iteration_envelope->planned_required_bytes);
@@ -12987,6 +13115,20 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
           0, finite_iteration_envelope->planned_required_bytes,
           exact_memory_budget);
     }
+    if (enumeration.source != chart_spr_candidate_source::grammar) {
+      enumeration.sampled_tree_source_maximum_wave_size =
+          finite_iteration_envelope->planned_sampled_source_wave_size;
+      enumeration.sampled_tree_projection_maximum_wave_size =
+          finite_iteration_envelope->planned_sampled_projection_wave_size;
+      enumeration.sampled_tree_source_admitted_source_count_bound =
+          finite_iteration_envelope->planned_sampled_source_count_bound;
+      enumeration.sampled_tree_source_admitted_destination_bound =
+          finite_iteration_envelope
+              ->planned_sampled_destination_bound_per_source;
+      enumeration.sampled_tree_source_admitted_peak_bytes =
+          finite_iteration_envelope
+              ->planned_sampled_source_admitted_peak_bytes;
+    }
   }
   validate_chart_spr_pattern_batch_replay_strategy(state, options, enumeration,
                                                    candidate_batch_size);
@@ -13001,16 +13143,16 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   std::vector<chart_spr_candidate_score> ranked;
   if (ranked_reserve_limit != 0) ranked.reserve(ranked_reserve_limit);
   std::vector<std::size_t> affected_counts;
-  if (finite_lazy_local_admission) {
+  if (finite_iteration_admission) {
     affected_counts.reserve(enumeration.max_candidates);
     if (capture_semantics) {
       result.canonical_candidates.reserve(enumeration.max_candidates);
       result.canonical_ranked_stream_indices.reserve(ranked_reserve_limit);
     }
   }
-  workspace.reserve_batch(candidate_batch_size);
+  workspace.reserve_batch(candidate_batch_size, use_pipeline);
 
-  if (finite_lazy_local_admission) {
+  if (finite_iteration_admission) {
     auto actual_with_future =
         estimate_chart_spr_published_state_resident_bytes(state);
     actual_with_future = chart_spr_search_detail::local_capacity_checked_add(
@@ -13035,6 +13177,10 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         finite_iteration_envelope->planned_local_workspace_resident_bytes,
         "chart SPR finite grammar planned local workspace");
     actual_with_future = chart_spr_search_detail::local_capacity_checked_add(
+        actual_with_future,
+        finite_iteration_envelope->planned_pipeline_control_bytes,
+        "chart SPR finite source planned pipeline control");
+    actual_with_future = chart_spr_search_detail::local_capacity_checked_add(
         actual_with_future, finite_iteration_envelope->future_dynamic_bytes,
         "chart SPR finite grammar future live capacity");
     if (actual_with_future > exact_memory_budget ||
@@ -13055,53 +13201,85 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     // per-sample or per-wave scheduler/thread-pool may be constructed.
     enumeration.sampled_tree_projection_scheduler = &scheduler;
     if (exact_memory_budget != 0) {
-      enumeration.sampled_tree_projection_memory_budget_bytes =
-          enumeration.sampled_tree_projection_memory_budget_bytes == 0
-              ? exact_memory_budget
-              : std::min(
-                    exact_memory_budget,
-                    enumeration.sampled_tree_projection_memory_budget_bytes);
+      if (finite_iteration_admission) {
+        // The source-aware iteration envelope is the sole admission owner and
+        // has already selected/bound the projection wave. The direct-library
+        // wrapper must not re-add published state, buffers, scoring, or the
+        // scheduler core.
+        enumeration.sampled_tree_projection_memory_budget_bytes = 0;
+        enumeration.sampled_tree_projection_external_resident_bytes = 0;
+      } else {
+        enumeration.sampled_tree_projection_memory_budget_bytes =
+            enumeration.sampled_tree_projection_memory_budget_bytes == 0
+                ? exact_memory_budget
+                : std::min(
+                      exact_memory_budget,
+                      enumeration.sampled_tree_projection_memory_budget_bytes);
+        auto projection_external_resident =
+            estimate_chart_spr_published_state_resident_bytes(state);
+        projection_external_resident =
+            chart_spr_search_detail::local_capacity_checked_add(
+                projection_external_resident,
+                workspace.local_admission_additional_resident_bytes(),
+                "chart SPR sampled projection acceptance capacity");
+        projection_external_resident =
+            chart_spr_search_detail::local_capacity_checked_add(
+                projection_external_resident,
+                chart_spr_search_detail::
+                    estimate_exact_loop_resident_input_bytes(ranked, result),
+                "chart SPR sampled projection result capacity");
+        projection_external_resident =
+            chart_spr_search_detail::local_capacity_checked_add(
+                projection_external_resident,
+                chart_spr_search_detail::local_owned_dynamic_capacity_bytes(
+                    affected_counts),
+                "chart SPR sampled projection affected capacity");
+        enumeration.sampled_tree_projection_external_resident_bytes = std::max(
+            enumeration.sampled_tree_projection_external_resident_bytes,
+            projection_external_resident);
+      }
     }
-
-    // Temporary pre-Phase7 envelope. On the combined branch this must be
-    // replaced by the full published-state resident estimate plus every
-    // caller-owned acceptance/rank/result/source capacity already live here;
-    // scheduler/prepared/tree/job/wave ownership remains in the projection
-    // estimator and must not be counted twice.
-    auto projection_external_resident = state.resident_pattern_cache_bytes;
-    if (state.exact_trim_active_only) {
-      projection_external_resident =
-          chart_spr_exact_candidate_checked_bytes_add(
-              projection_external_resident,
-              estimate_chart_spr_trim_resident_bytes(
-                  *state.exact_trim_active_only),
-              "chart SPR sampled-tree projection external resident bytes");
-    }
-    // A direct caller may already provide a broader resident estimate. Treat
-    // that as a total envelope, not an additive copy of the same search state.
-    enumeration.sampled_tree_projection_external_resident_bytes =
-        std::max(enumeration.sampled_tree_projection_external_resident_bytes,
-                 projection_external_resident);
   }
-  auto reserve_ranked = [&] {
-    if (ranked.capacity() < ranked_reserve_limit) {
-      ranked.reserve(ranked_reserve_limit);
-    }
-  };
   state.effective_candidate_batch_size = candidate_batch_size;
   auto local_options = local_spr_score_options{};
   local_options.verify_against_full_overlay =
       options.verify_local_against_full_for_tests;
+  local_options.force_dense_invalid_reason_for_tests =
+      options.force_dense_invalid_reason_for_tests;
   auto const enumeration_fixed_resident =
-      finite_lazy_local_admission
-          ? chart_spr_search_detail::
-                estimate_grammar_spr_enumeration_fixed_live_bytes(
-                    state.grammar, state.execution_plan)
+      finite_iteration_admission
+          ? (enumeration.source == chart_spr_candidate_source::grammar &&
+                     !use_pipeline
+                 ? chart_spr_search_detail::
+                       estimate_grammar_spr_enumeration_fixed_live_bytes(
+                           state.grammar, state.execution_plan)
+                 : finite_iteration_envelope->planned_source_owned_bytes)
+          : std::size_t{0};
+  auto const pipeline_control_resident =
+      finite_iteration_admission
+          ? finite_iteration_envelope->planned_pipeline_control_bytes
           : std::size_t{0};
   std::size_t enumeration_seen_resident = 0;
   std::size_t enumeration_seen_count = 0;
   std::size_t enumeration_current_candidate_resident = 0;
   bool enumeration_active = true;
+
+  auto finite_workspace_resident = [&](bool include_local_results = true) {
+    if (!use_pipeline) {
+      return workspace.local_admission_additional_resident_bytes(
+          include_local_results);
+    }
+    auto total = workspace.local_admission_non_candidate_buffer_resident_bytes(
+        include_local_results);
+    total = chart_spr_search_detail::local_capacity_checked_add(
+        total,
+        chart_spr_search_detail::local_capacity_checked_multiply(
+            candidate_buffer_count,
+            finite_iteration_envelope->planned_candidate_buffer_owned_bytes,
+            "chart SPR finite pipeline admitted candidate buffers"),
+        "chart SPR finite pipeline workspace ownership");
+    return total;
+  };
 
   auto finite_actual_live_bytes = [&]() {
     auto total = estimate_chart_spr_published_state_resident_bytes(state);
@@ -13109,7 +13287,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         total, finite_scheduler_resident,
         "chart SPR finite grammar live scheduler ownership");
     total = chart_spr_search_detail::local_capacity_checked_add(
-        total, workspace.local_admission_additional_resident_bytes(),
+        total, finite_workspace_resident(),
         "chart SPR finite grammar live acceptance capacity");
     total = chart_spr_search_detail::local_capacity_checked_add(
         total,
@@ -13129,19 +13307,24 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     if (enumeration_active) {
       total = chart_spr_search_detail::local_capacity_checked_add(
           total, enumeration_fixed_resident,
-          "chart SPR finite grammar live enumerator capacity");
+          "chart SPR finite live source capacity");
+      total = chart_spr_search_detail::local_capacity_checked_add(
+          total, pipeline_control_resident,
+          "chart SPR finite live pipeline control capacity");
       total = chart_spr_search_detail::local_capacity_checked_add(
           total, enumeration_seen_resident,
           "chart SPR finite grammar live signature capacity");
       total = chart_spr_search_detail::local_capacity_checked_add(
-          total, enumeration_current_candidate_resident,
-          "chart SPR finite grammar live candidate capacity");
+          total,
+          finite_iteration_envelope
+              ->planned_enumeration_callback_concurrent_bytes,
+          "chart SPR finite live source callback scratch");
     }
     return total;
   };
 
   auto check_finite_actual_live = [&](std::size_t candidate_index) {
-    if (!finite_lazy_local_admission) return;
+    if (!finite_iteration_admission) return;
     auto const actual = finite_actual_live_bytes();
     if (actual > exact_memory_budget ||
         actual > finite_iteration_envelope->planned_required_bytes) {
@@ -13156,16 +13339,53 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   auto process_candidate_batch = [&](std::size_t buffer) {
     if (workspace.active_candidate_count(buffer) == 0) return;
     auto candidate_batch = workspace.candidates(buffer);
+    if (finite_iteration_admission) {
+      auto const tile_plan =
+          chart_spr_search_detail::plan_local_candidate_pattern_tiles(
+              state, candidate_batch, &scheduler);
+      auto const fusion_plan =
+          chart_spr_search_detail::plan_local_pattern_batch_fusion(
+              state, candidate_batch.size(), &scheduler);
+      auto const lazy_local = state.cache_strategy ==
+                              chart_spr_cache_strategy::lazy_multisite_chart;
+      auto const resident_local =
+          state.cache_strategy ==
+              chart_spr_cache_strategy::all_active_patterns ||
+          lazy_local;
+      auto const runtime_prepared_slots =
+          lazy_local ? std::min(worker_count, candidate_batch.size())
+          : resident_local
+              ? (tile_plan.enabled() ? candidate_batch.size() : worker_count)
+              : candidate_batch.size();
+      auto const runtime_worker_slots =
+          lazy_local ? std::min(worker_count, candidate_batch.size())
+                     : worker_count;
+      auto const runtime_tile_result_slots =
+          std::max(tile_plan.total_tiles, fusion_plan.total_tiles);
+      if (finite_iteration_envelope->planned_cache_strategy !=
+              state.cache_strategy ||
+          candidate_batch.size() >
+              finite_iteration_envelope->planned_candidate_batch_size ||
+          runtime_prepared_slots >
+              finite_iteration_envelope->planned_local_prepared_slots ||
+          runtime_worker_slots >
+              finite_iteration_envelope->planned_local_worker_slots ||
+          runtime_tile_result_slots >
+              finite_iteration_envelope->planned_local_tile_result_slots) {
+        throw std::logic_error(
+            "chart SPR finite pipeline: runtime local scoring plan exceeded "
+            "unified admission");
+      }
+    }
     // Grow caller-owned result storage before the timed `_into` region.
     auto local_results = workspace.results(buffer);
     auto local_start = std::chrono::steady_clock::now();
     auto batch_local_options = local_options;
     batch_local_options.admission_memory_budget_bytes = exact_memory_budget;
     std::size_t additional_resident = 0;
-    if (finite_lazy_local_admission) {
+    if (finite_iteration_admission) {
       additional_resident =
-          workspace.local_admission_additional_resident_bytes(
-              /*include_local_results=*/false);
+          finite_workspace_resident(/*include_local_results=*/false);
       additional_resident = chart_spr_search_detail::local_capacity_checked_add(
           additional_resident,
           chart_spr_search_detail::estimate_exact_loop_resident_input_bytes(
@@ -13177,16 +13397,21 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
               affected_counts),
           "chart SPR lazy-local retained affected counts");
     }
-    if (finite_lazy_local_admission && enumeration_active) {
+    if (finite_iteration_admission && enumeration_active) {
       additional_resident = chart_spr_search_detail::local_capacity_checked_add(
           additional_resident, enumeration_fixed_resident,
-          "chart SPR lazy-local live enumeration fixed storage");
+          "chart SPR lazy-local live source storage");
+      additional_resident = chart_spr_search_detail::local_capacity_checked_add(
+          additional_resident,
+          finite_iteration_envelope
+              ->planned_enumeration_callback_concurrent_bytes,
+          "chart SPR lazy-local live source callback scratch");
+      additional_resident = chart_spr_search_detail::local_capacity_checked_add(
+          additional_resident, pipeline_control_resident,
+          "chart SPR lazy-local live pipeline control storage");
       additional_resident = chart_spr_search_detail::local_capacity_checked_add(
           additional_resident, enumeration_seen_resident,
           "chart SPR lazy-local live enumeration signatures");
-      additional_resident = chart_spr_search_detail::local_capacity_checked_add(
-          additional_resident, enumeration_current_candidate_resident,
-          "chart SPR lazy-local live enumeration candidate");
     }
     batch_local_options.admission_additional_resident_bytes =
         additional_resident;
@@ -13194,6 +13419,14 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         .admission_additional_resident_includes_result_objects = true;
     batch_local_options
         .admission_additional_resident_includes_candidate_inputs = true;
+    if (finite_iteration_admission) {
+      batch_local_options.admission_weighted_candidate_order_capacity_bytes =
+          finite_iteration_envelope
+              ->planned_local_weighted_candidate_order_bytes;
+      batch_local_options.admission_pattern_batch_construction_scratch_bytes =
+          finite_iteration_envelope
+              ->planned_pattern_batch_construction_scratch_bytes;
+    }
     score_candidates_locally_into(state, candidate_batch, local_results,
                                   workspace.local_score, batch_local_options,
                                   scheduler, checked_state);
@@ -13233,7 +13466,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         record.affected_clade_count = scored.affected_clade_count;
         record.lower_bound =
             chart_spr_canonicalize_objective_score(scored.lower_bound);
-        if (finite_lazy_local_admission) {
+        if (finite_iteration_admission) {
           auto canonical_dynamic =
               chart_spr_search_detail::local_owned_dynamic_capacity_sum(
                   record.signature, record.invalid_reason,
@@ -13264,13 +13497,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
 
   chart_spr_candidate_generation_stats generation;
   sampled_tree_projection_scheduler_diagnostics serial_projection_scheduler;
-  auto const finite_pipeline_cap = enumeration.max_candidates != 0;
-  auto const use_pipeline = options.enable_candidate_generation_pipeline &&
-                            worker_count > 1 && !finite_lazy_local_admission &&
-                            (exact_memory_budget == 0 || finite_pipeline_cap);
   if (!use_pipeline) {
-    reserve_ranked();
-    workspace.reserve_batch(candidate_batch_size);
     enumeration.sampled_tree_projection_scheduler_diagnostics_sink =
         &serial_projection_scheduler;
     double generation_callback_ms = 0.0;
@@ -13280,7 +13507,8 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
           state.grammar, checked_state, enumeration,
           [&](grammar_spr_candidate const& candidate) {
             auto const callback_start = std::chrono::steady_clock::now();
-            if (finite_lazy_local_admission) {
+            if (finite_iteration_admission &&
+                enumeration.source == chart_spr_candidate_source::grammar) {
               if (enumeration_seen_count >= enumeration.max_candidates) {
                 fail_finite_iteration_budget(
                     enumeration_seen_count,
@@ -13317,6 +13545,8 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
                     finite_iteration_envelope->planned_candidate_live_bytes);
               }
               check_finite_actual_live(enumeration_seen_count - 1);
+            } else if (finite_iteration_admission) {
+              ++enumeration_seen_count;
             }
             workspace.append_candidate(candidate);
             check_finite_actual_live(
@@ -13366,17 +13596,6 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
             state.counters.scheduler_axes.candidate_generation,
             serial_projection_scheduler);
   } else {
-    auto const pipeline_memory =
-        chart_spr_search_detail::estimate_chart_spr_candidate_pipeline_memory(
-            state, options, candidate_batch_size, scheduler);
-    if (exact_memory_budget != 0 &&
-        (!pipeline_memory.safely_bounded ||
-         pipeline_memory.required_peak_bytes > exact_memory_budget)) {
-      throw chart_spr_exact_state_budget_error(
-          pipeline_memory.required_peak_bytes, exact_memory_budget);
-    }
-    reserve_ranked();
-    workspace.reserve_batch(candidate_batch_size, true);
     if (options.before_candidate_pipeline_start_for_tests) {
       options.before_candidate_pipeline_start_for_tests();
     }
@@ -13391,9 +13610,6 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         &pipeline.cancel_requested;
     enumeration.sampled_tree_projection_scheduler_diagnostics_sink =
         &pipeline.projection_scheduler;
-    enumeration.sampled_tree_projection_external_resident_bytes =
-        std::max(enumeration.sampled_tree_projection_external_resident_bytes,
-                 pipeline_memory.projection_external_resident_bytes);
 
     std::jthread producer{[&] {
       std::optional<std::size_t> filling_buffer;
@@ -13487,6 +13703,19 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
               }
               ++callbacks_seen;
               workspace.append_candidate_to_buffer(*filling_buffer, candidate);
+              if (finite_iteration_admission) {
+                auto const buffer_owned =
+                    workspace.candidate_buffer_owned_capacity_bytes(
+                        *filling_buffer);
+                if (buffer_owned > finite_iteration_envelope
+                                       ->planned_candidate_buffer_owned_bytes) {
+                  throw chart_spr_search_detail::
+                      chart_spr_lazy_local_budget_error(
+                          callbacks_seen - 1, buffer_owned,
+                          finite_iteration_envelope
+                              ->planned_candidate_buffer_owned_bytes);
+                }
+              }
               if (workspace.active_candidate_count(*filling_buffer) >=
                   candidate_batch_size) {
                 publish_filling_buffer();
@@ -13589,6 +13818,10 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
                 "chart SPR candidate pipeline: forced scoring failure");
           }
           process_candidate_batch(buffer);
+          if (options.after_candidate_pipeline_score_batch_for_tests) {
+            options.after_candidate_pipeline_score_batch_for_tests(
+                scored_batches);
+          }
         } catch (chart_execution_plan_mismatch const&) {
           ++pipeline.pipeline_diagnostics
                 .candidate_pipeline_state_epoch_rejections;
@@ -13676,7 +13909,9 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     }
     pipeline.pipeline_diagnostics.candidate_pipeline_estimated_peak_bytes =
         std::max(
-            pipeline_memory.required_peak_bytes,
+            finite_iteration_admission
+                ? finite_iteration_envelope->planned_required_bytes
+                : std::size_t{0},
             pipeline.generation.sampled_tree_projection_estimated_peak_bytes);
     pipeline.generation.candidate_pipeline_batches_generated =
         pipeline.pipeline_diagnostics.candidate_pipeline_batches_generated;
@@ -13735,7 +13970,13 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     }
     if (pipeline.producer_failure) {
       record_chart_spr_candidate_generation_stats(generation, state.counters);
-      std::rethrow_exception(pipeline.producer_failure);
+      try {
+        std::rethrow_exception(pipeline.producer_failure);
+      } catch (
+          chart_spr_search_detail::chart_spr_lazy_local_budget_error const&) {
+        ++state.counters.lazy_local_pre_submit_budget_failures;
+        throw;
+      }
     }
     chart_spr_search_detail::validate_chart_spr_candidate_pipeline_snapshot(
         state, pipeline_snapshot);
@@ -13746,7 +13987,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   // generation callback. Under a finite budget, release it before result
   // vector finalization and accepted-candidate copying so those later growth
   // surfaces do not silently overlap a retained local high-water mark.
-  if (finite_lazy_local_admission) {
+  if (finite_iteration_admission) {
     workspace.release_retained_storage_before_exact();
     check_finite_actual_live(
         enumeration_seen_count == 0 ? 0 : enumeration_seen_count - 1);
@@ -14012,7 +14253,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       memory_estimates.push_back(estimate);
     }
 
-    if (finite_lazy_local_admission && capture_semantics) {
+    if (finite_iteration_admission && capture_semantics) {
       std::size_t ranked_evidence_bytes = 0;
       for (auto const& estimate : memory_estimates) {
         if (!estimate.safely_bounded) {

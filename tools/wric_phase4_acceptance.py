@@ -38,7 +38,12 @@ DEFAULT_CONSTRUCTION_PREFIX = (
 
 AXES = (
     "initial_chart",
+    "candidate_generation",
     "exact_setup",
+    "exact_frontier_clade",
+    "exact_candidate",
+    "lazy_inside_clade",
+    "lazy_outside_clade",
     "inside_cache",
     "outside_cache",
     "fixed_topology_oracle",

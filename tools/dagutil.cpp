@@ -3880,6 +3880,34 @@ static void print_chart_spr_generation_stats(
       << stats.sampled_tree_projection_admitted_subwave_width << "\n";
   out << indent << "sampled_tree_source_actual_peak_bytes: "
       << stats.sampled_tree_source_actual_peak_bytes << "\n";
+  out << indent << "candidate_pipeline_batches_generated: "
+      << stats.candidate_pipeline_batches_generated << "\n";
+  out << indent << "candidate_pipeline_batches_scored: "
+      << stats.candidate_pipeline_batches_scored << "\n";
+  out << indent << "candidate_pipeline_serial_overlap_batches: "
+      << stats.candidate_pipeline_serial_overlap_batches << "\n";
+  out << indent << "candidate_pipeline_scheduler_projection_overlap_batches: "
+      << stats.candidate_pipeline_scheduler_projection_overlap_batches << "\n";
+  out << indent << "candidate_pipeline_producer_stalls: "
+      << stats.candidate_pipeline_producer_stalls << "\n";
+  out << indent << "candidate_pipeline_consumer_stalls: "
+      << stats.candidate_pipeline_consumer_stalls << "\n";
+  out << indent << "candidate_pipeline_producer_stall_nanoseconds: "
+      << stats.candidate_pipeline_producer_stall_nanoseconds << "\n";
+  out << indent << "candidate_pipeline_consumer_stall_nanoseconds: "
+      << stats.candidate_pipeline_consumer_stall_nanoseconds << "\n";
+  out << indent << "candidate_pipeline_cancellations: "
+      << stats.candidate_pipeline_cancellations << "\n";
+  out << indent << "candidate_pipeline_stale_batches_discarded: "
+      << stats.candidate_pipeline_stale_batches_discarded << "\n";
+  out << indent << "candidate_pipeline_stale_candidates_discarded: "
+      << stats.candidate_pipeline_stale_candidates_discarded << "\n";
+  out << indent << "candidate_pipeline_state_epoch_rejections: "
+      << stats.candidate_pipeline_state_epoch_rejections << "\n";
+  out << indent << "candidate_pipeline_generation_errors: "
+      << stats.candidate_pipeline_generation_errors << "\n";
+  out << indent << "candidate_pipeline_estimated_peak_bytes: "
+      << stats.candidate_pipeline_estimated_peak_bytes << "\n";
 }
 
 static chart_spr_search_options make_chart_spr_search_options(args const& a);

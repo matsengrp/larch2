@@ -657,6 +657,10 @@ static void test_execution_plan_binary_and_generic_invariants() {
   CHECK(std::vector<larch::clade_id>(plan.top_down_order().begin(),
                                      plan.top_down_order().end()) ==
         std::vector<larch::clade_id>({6, 4, 5, 0, 1, 2, 3}));
+  CHECK(plan.clade(plan.root_clade()).upward_path_count == 1);
+  for (auto const& clade : plan.clades()) {
+    CHECK(clade.upward_path_count == 1);
+  }
 
   std::vector<bool> seen(plan.clades().size(), false);
   for (auto cid : plan.bottom_up_level_order()) {
@@ -706,6 +710,20 @@ static void test_execution_plan_binary_and_generic_invariants() {
     CHECK(occurrences.size() == 1);
     CHECK(occurrences.front().production == 0);
     CHECK(occurrences.front().child_slot == child);
+  }
+}
+
+static void test_execution_plan_multiparent_upward_path_counts() {
+  std::println("test_execution_plan_multiparent_upward_path_counts");
+  auto const grammar = make_nonlex_binary_dag_grammar();
+  auto const plan = larch::build_chart_execution_plan(grammar);
+
+  CHECK(plan.clade(grammar.root_clade).upward_path_count == 1);
+  for (larch::clade_id clade = 4; clade <= 7; ++clade) {
+    CHECK(plan.clade(clade).upward_path_count == 1);
+  }
+  for (larch::clade_id leaf = 0; leaf <= 3; ++leaf) {
+    CHECK(plan.clade(leaf).upward_path_count == 2);
   }
 }
 
@@ -3682,6 +3700,7 @@ static void test_invalid_input_fails_at_plan_construction() {
 
 int main() {
   test_execution_plan_binary_and_generic_invariants();
+  test_execution_plan_multiparent_upward_path_counts();
   test_checked_and_plan_dense_equivalence();
   test_checked_and_plan_composite_equivalence();
   test_checked_and_plan_lazy_inside_outside_equivalence();

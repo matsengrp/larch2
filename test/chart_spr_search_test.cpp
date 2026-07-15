@@ -2715,7 +2715,10 @@ static void test_lazy_exact_w4_combined_envelope_boundary() {
         estimate_grammar_spr_finite_iteration_memory_envelope(
             state, base_options.enumeration.max_candidates,
             base_options.cache.candidate_batch_size,
-            base_options.top_k_exact_verify, false, scheduler, 4);
+            base_options.top_k_exact_verify, false, scheduler, 4,
+            &base_options.enumeration,
+            /*candidate_buffer_count=*/2,
+            /*include_pipeline_control=*/true);
   };
 
   constexpr auto calibration_budget = std::size_t{1} << 40;
@@ -4191,9 +4194,9 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
     CHECK(result.invalid_reason.empty());
   }
 
-  // Unsupported finite-budget enumeration ownership graphs fail closed before
-  // rank/batch/enumerator storage is allocated. Unlimited behavior remains on
-  // the existing source dispatch paths.
+  // Uncapped finite-budget enumeration ownership graphs fail closed before
+  // rank/batch/enumerator storage is allocated for every source. Bounded
+  // sampled/hybrid coverage lives in chart_spr_pipeline_test.
   for (auto source : {larch::chart_spr_candidate_source::sampled_tree,
                       larch::chart_spr_candidate_source::hybrid}) {
     larch::chart_spr_search_options source_options;
@@ -4598,10 +4601,13 @@ static void test_lazy_local_named_fixture_finite_production_gates() {
         std::max<std::size_t>(1, std::min(worker_count, candidate_batch_size));
     larch::chart_scheduler scheduler{
         larch::chart_scheduler_options{.requested_workers = worker_count}};
+    auto const use_pipeline =
+        options.enable_candidate_generation_pipeline && worker_count > 1;
     auto const envelope = larch::chart_spr_search_detail::
         estimate_grammar_spr_finite_iteration_memory_envelope(
             state, candidate_count, candidate_batch_size, 1, true, scheduler,
-            task_slots);
+            task_slots, &options.enumeration,
+            use_pipeline ? std::size_t{2} : std::size_t{1}, use_pipeline);
     CHECK(envelope.planned_required_bytes > 0);
     CHECK(envelope.planned_required_bytes < budget);
     options.cache.memory_budget_bytes = envelope.planned_required_bytes;
@@ -7954,6 +7960,9 @@ static void test_phase6_finite_budget_splits_exact_candidate_wave() {
   options.max_iterations = 1;
   options.worker_count = 16;
   options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
+  // Isolate the Phase-6 exact-candidate admission axis from the independent
+  // Phase-8 finite candidate-generation pipeline envelope.
+  options.enable_candidate_generation_pipeline = false;
 
   auto unlimited_fixture = make_three_misplaced_groups_fixture();
   auto unlimited = larch::run_chart_spr_search(
@@ -8037,6 +8046,9 @@ static void test_phase6_finite_budget_rejects_before_verifier_hook() {
       larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
   options.top_k_exact_verify = 1;
   options.worker_count = 4;
+  // Isolate the Phase-6 exact-candidate admission axis from the independent
+  // Phase-8 finite candidate-generation pipeline envelope.
+  options.enable_candidate_generation_pipeline = false;
 
   // Calibrate the coordinator-resident base from an otherwise identical
   // unlimited TopK-1 operation. Its single admitted amount is exactly the
@@ -8155,6 +8167,9 @@ static void test_phase6_fixed_tightened_budget_rejects_before_generation() {
       larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
   options.top_k_exact_verify = 1;
   options.worker_count = 4;
+  // Isolate the Phase-6 exact-state gate from the independent Phase-8 finite
+  // candidate-generation pipeline envelope.
+  options.enable_candidate_generation_pipeline = false;
 
   auto fixture = make_fixture();
   auto state = larch::build_chart_spr_search_state(
@@ -8216,6 +8231,9 @@ static void test_phase6_custom_exact_contracts_fail_closed_and_serialize() {
   options.top_k_exact_verify = 4;
   options.worker_count = 4;
   options.cache.memory_budget_bytes = std::size_t{1} << 40;
+  // Isolate the Phase-6 exact-provider contracts from the independent
+  // Phase-8 finite candidate-generation pipeline envelope.
+  options.enable_candidate_generation_pipeline = false;
 
   auto missing_fixture = make_fixture();
   auto missing_state = larch::build_chart_spr_search_state(
@@ -8430,6 +8448,7 @@ static void test_phase6_custom_exact_contracts_fail_closed_and_serialize() {
   selector_options.top_k_exact_verify = 1;
   selector_options.worker_count = 4;
   selector_options.cache.memory_budget_bytes = std::size_t{1} << 40;
+  selector_options.enable_candidate_generation_pipeline = false;
   auto selector_calls = std::make_shared<std::atomic<std::size_t>>(0);
   selector_options.topology_selection_provider =
       [selector_calls](larch::chart_spr_search_state const& selector_state,
@@ -11850,6 +11869,9 @@ static void test_phase4_fixed_topology_exact_local_commit() {
   options.rebuild_after_accept = false;
   options.worker_count = 4;
   options.cache.memory_budget_bytes = std::size_t{1} << 30;
+  // Isolate the fixed-topology/local-commit contract from the independent
+  // Phase-8 finite candidate-generation pipeline envelope.
+  options.enable_candidate_generation_pipeline = false;
   options.verify_local_commit_two_chart_oracle_for_tests = true;
 
   auto search = larch::run_chart_spr_search(std::move(fixture.dag),
@@ -12257,6 +12279,9 @@ static void test_phase4_pattern_batches_local_commit() {
   // reporting only the one-pattern scoring batch.
   auto budget_fixture = make_three_misplaced_groups_fixture();
   auto budget_options = options;
+  // This subcase isolates the mandatory persistent-cache admission gate; its
+  // finite budget is not a candidate-generation pipeline boundary.
+  budget_options.enable_candidate_generation_pipeline = false;
   auto budget_calibration_state = larch::build_chart_spr_search_state(
       budget_fixture.dag, budget_fixture.grammar, budget_options);
   auto const mandatory_local_commit_bytes =

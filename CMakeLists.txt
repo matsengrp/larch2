@@ -1198,6 +1198,7 @@ target_sources(chart_parallel_test
                PRIVATE test/chart_spr_allocation_overrides.cpp)
 target_include_directories(chart_parallel_test PRIVATE test)
 set_tests_properties(chart_scheduler_test PROPERTIES TIMEOUT 30)
+set_tests_properties(chart_spr_pipeline_test PROPERTIES TIMEOUT 120)
 
 # Phase-2A test-only global allocation observer and dense local-score gate.
 # The replacement operators are linked only into this dedicated executable;
