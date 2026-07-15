@@ -3812,6 +3812,66 @@ static void print_chart_spr_generation_stats(
       << stats.candidates_pruned_duplicate << "\n";
   out << indent << "pruned_invalid: "
       << stats.candidates_pruned_invalid << "\n";
+  out << indent << "sampled_tree_projection_moves_preassigned: "
+      << stats.sampled_tree_projection_moves_preassigned << "\n";
+  out << indent << "sampled_tree_projection_move_enumeration_visits: "
+      << stats.sampled_tree_projection_move_enumeration_visits << "\n";
+  out << indent << "sampled_tree_projection_enumeration_passes: "
+      << stats.sampled_tree_projection_enumeration_passes << "\n";
+  out << indent << "sampled_tree_projection_waves: "
+      << stats.sampled_tree_projection_waves << "\n";
+  out << indent << "sampled_tree_projection_scheduler_operations: "
+      << stats.sampled_tree_projection_scheduler_operations << "\n";
+  out << indent << "sampled_tree_projection_parallel_operations: "
+      << stats.sampled_tree_projection_parallel_operations << "\n";
+  out << indent << "sampled_tree_projection_ranges: "
+      << stats.sampled_tree_projection_ranges << "\n";
+  out << indent << "sampled_tree_projection_worker_tasks: "
+      << stats.sampled_tree_projection_worker_tasks << "\n";
+  out << indent << "sampled_tree_projection_active_worker_high_water: "
+      << stats.sampled_tree_projection_active_worker_high_water << "\n";
+  out << indent << "sampled_tree_projection_peak_wave_size: "
+      << stats.sampled_tree_projection_peak_wave_size << "\n";
+  out << indent << "sampled_tree_projection_speculative_discarded: "
+      << stats.sampled_tree_projection_speculative_discarded << "\n";
+  out << indent << "sampled_tree_projection_estimated_peak_bytes: "
+      << stats.sampled_tree_projection_estimated_peak_bytes << "\n";
+  out << indent
+      << "sampled_tree_projection_scheduler_handoff_stall_nanoseconds: "
+      << stats.sampled_tree_projection_scheduler_handoff_stall_nanoseconds
+      << "\n";
+  out << indent << "sampled_tree_projection_cancellations: "
+      << stats.sampled_tree_projection_cancellations << "\n";
+  out << indent << "sampled_tree_source_waves: "
+      << stats.sampled_tree_source_waves << "\n";
+  out << indent << "sampled_tree_sources_enumerated: "
+      << stats.sampled_tree_sources_enumerated << "\n";
+  out << indent << "sampled_tree_source_enumeration_operations: "
+      << stats.sampled_tree_source_enumeration_operations << "\n";
+  out << indent << "sampled_tree_source_enumeration_parallel_operations: "
+      << stats.sampled_tree_source_enumeration_parallel_operations << "\n";
+  out << indent << "sampled_tree_source_enumeration_ranges: "
+      << stats.sampled_tree_source_enumeration_ranges << "\n";
+  out << indent << "sampled_tree_source_enumeration_worker_tasks: "
+      << stats.sampled_tree_source_enumeration_worker_tasks << "\n";
+  out << indent
+      << "sampled_tree_source_enumeration_active_worker_high_water: "
+      << stats.sampled_tree_source_enumeration_active_worker_high_water
+      << "\n";
+  out << indent << "sampled_tree_source_peak_wave_size: "
+      << stats.sampled_tree_source_peak_wave_size << "\n";
+  out << indent << "sampled_tree_source_one_pass_move_visits: "
+      << stats.sampled_tree_source_one_pass_move_visits << "\n";
+  out << indent << "sampled_tree_source_speculative_moves_discarded: "
+      << stats.sampled_tree_source_speculative_moves_discarded << "\n";
+  out << indent << "sampled_tree_source_speculative_sources_discarded: "
+      << stats.sampled_tree_source_speculative_sources_discarded << "\n";
+  out << indent << "sampled_tree_source_admitted_wave_width: "
+      << stats.sampled_tree_source_admitted_wave_width << "\n";
+  out << indent << "sampled_tree_projection_admitted_subwave_width: "
+      << stats.sampled_tree_projection_admitted_subwave_width << "\n";
+  out << indent << "sampled_tree_source_actual_peak_bytes: "
+      << stats.sampled_tree_source_actual_peak_bytes << "\n";
 }
 
 static chart_spr_search_options make_chart_spr_search_options(args const& a);

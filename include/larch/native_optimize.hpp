@@ -1622,6 +1622,17 @@ class move_enumerator {
                              callback_t callback,
                              std::size_t* scored_count = nullptr) const {
     scratch_buffers scratch;
+    find_moves_for_source(src, radius, std::move(callback), scratch,
+                          scored_count);
+  }
+
+  // Stable-slot overload for persistent schedulers.  Callers may size one
+  // scratch object per non-concurrent slot once and reuse its retained vector
+  // capacity across source waves, avoiding five allocator round trips for
+  // every source node.
+  void find_moves_for_source(std::size_t src, std::size_t radius,
+                             callback_t callback, scratch_buffers& scratch,
+                             std::size_t* scored_count = nullptr) const {
     scratch.resize(index_.num_variable_sites());
     upward_traversal(src, radius, callback, scratch, scored_count);
   }

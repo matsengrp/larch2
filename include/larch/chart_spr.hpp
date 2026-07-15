@@ -328,10 +328,17 @@ struct grammar_spr_enumeration_options {
   // ordering, and are invoked only after finite admission succeeds.
   std::function<void(std::size_t)> before_sampled_tree_projection_for_tests =
       {};
+  std::function<void(std::size_t, std::size_t)>
+      before_sampled_tree_source_enumeration_for_tests = {};
   std::function<void()>
       before_sampled_tree_projection_workspace_allocation_for_tests = {};
   std::optional<std::size_t>
       force_sampled_tree_projection_submit_failure_after_for_tests;
+  // Added to measured source-wave container capacity after allocation.  This
+  // lets the exact-budget test exercise the runtime underestimation backstop
+  // without relying on an implementation-specific vector growth policy.
+  std::size_t sampled_tree_source_wave_actual_capacity_extra_bytes_for_tests =
+      0;
 };
 
 struct chart_spr_candidate_generation_stats {
@@ -372,6 +379,29 @@ struct chart_spr_candidate_generation_stats {
   std::size_t sampled_tree_projection_estimated_peak_bytes = 0;
   std::uint64_t sampled_tree_projection_scheduler_handoff_stall_nanoseconds = 0;
   std::size_t sampled_tree_projection_cancellations = 0;
+
+  // Bounded source-wave diagnostics are separate from the projection-wave
+  // compatibility counters above.  Every source contributes exactly one
+  // enumeration pass; moves from the drained tail of a stopped source wave
+  // are counted only as speculation and never enter legacy candidate/prune
+  // counters.
+  std::size_t sampled_tree_source_waves = 0;
+  std::size_t sampled_tree_sources_enumerated = 0;
+  std::size_t sampled_tree_source_enumeration_operations = 0;
+  std::size_t sampled_tree_source_enumeration_parallel_operations = 0;
+  std::size_t sampled_tree_source_enumeration_ranges = 0;
+  std::size_t sampled_tree_source_enumeration_worker_tasks = 0;
+  std::size_t sampled_tree_source_enumeration_active_worker_high_water = 0;
+  std::size_t sampled_tree_source_peak_wave_size = 0;
+  std::size_t sampled_tree_source_one_pass_move_visits = 0;
+  std::size_t sampled_tree_source_speculative_moves_discarded = 0;
+  // Nonempty sources only: the complete emitted move stream was unconsumed.
+  // Empty sources remain visible in sources_enumerated/operations but cannot
+  // be classified from move ordinals without inventing a false boundary.
+  std::size_t sampled_tree_source_speculative_sources_discarded = 0;
+  std::size_t sampled_tree_source_admitted_wave_width = 0;
+  std::size_t sampled_tree_projection_admitted_subwave_width = 0;
+  std::size_t sampled_tree_source_actual_peak_bytes = 0;
 
   // Phase-8 bounded producer/consumer diagnostics.  "Serial overlap" means
   // source enumeration, canonical gather, or candidate copying progressed on
@@ -423,6 +453,41 @@ struct sampled_tree_projection_memory_estimate {
   std::size_t error_and_exception_bytes = 0;
   std::size_t required_peak_bytes = 0;
   std::size_t wave_size = 0;
+  std::size_t active_projection_count = 0;
+  bool safely_bounded = true;
+};
+
+// Finite-memory envelope for the product bounded-source path.  Source
+// enumeration and projection are separated by a join, so their active scratch
+// and scheduler-operation envelopes are temporal alternatives; the required
+// peak charges their maximum instead of pretending they coexist.
+struct sampled_tree_source_wave_memory_estimate {
+  std::size_t external_resident_bytes = 0;
+  std::size_t sampled_tree_resident_bytes = 0;
+  std::size_t prepared_owned_bytes = 0;
+  std::size_t source_order_bytes = 0;
+  std::size_t source_slot_and_move_bytes = 0;
+  std::size_t active_enumeration_scratch_bytes = 0;
+  std::size_t projection_job_bytes = 0;
+  std::size_t projection_completion_bytes = 0;
+  std::size_t projection_slot_and_payload_bytes = 0;
+  std::size_t active_projection_scratch_bytes = 0;
+  std::size_t scheduler_resident_bytes = 0;
+  std::size_t source_scheduler_operation_bytes = 0;
+  std::size_t projection_scheduler_operation_bytes = 0;
+  std::size_t temporal_stage_peak_bytes = 0;
+  std::size_t error_and_exception_bytes = 0;
+  std::size_t required_peak_bytes = 0;
+  std::size_t actual_peak_bytes = 0;
+  std::size_t planned_container_capacity_bytes = 0;
+  std::size_t actual_container_capacity_bytes = 0;
+  std::size_t planned_retained_payload_bytes = 0;
+  std::size_t actual_retained_payload_bytes = 0;
+  std::size_t source_count = 0;
+  std::size_t destination_bound_per_source = 0;
+  std::size_t source_wave_size = 0;
+  std::size_t projection_wave_size = 0;
+  std::size_t active_enumeration_count = 0;
   std::size_t active_projection_count = 0;
   bool safely_bounded = true;
 };
@@ -1208,6 +1273,43 @@ struct sampled_tree_projection_preassignment {
   std::size_t enumeration_passes = 0;
 };
 
+struct sampled_tree_source_wave_slot {
+  std::size_t source_ordinal = 0;
+  std::size_t source_node = 0;
+  std::size_t first_move_ordinal = 0;
+  std::vector<profitable_move> moves;
+  scratch_buffers enumeration_scratch;
+  std::exception_ptr failure;
+  bool cancelled = false;
+};
+
+struct sampled_tree_source_wave_execution_stats {
+  std::size_t moves_enumerated = 0;
+  std::size_t move_enumeration_visits = 0;
+  std::size_t enumeration_passes = 0;
+  std::size_t source_waves = 0;
+  std::size_t sources_enumerated = 0;
+  std::size_t source_scheduler_operations = 0;
+  std::size_t source_parallel_operations = 0;
+  std::size_t source_ranges = 0;
+  std::size_t source_worker_tasks = 0;
+  std::size_t source_active_worker_high_water = 0;
+  std::size_t peak_source_wave_size = 0;
+  std::size_t projection_waves = 0;
+  std::size_t projection_scheduler_operations = 0;
+  std::size_t projection_parallel_operations = 0;
+  std::size_t projection_ranges = 0;
+  std::size_t projection_worker_tasks = 0;
+  std::size_t projection_active_worker_high_water = 0;
+  std::size_t peak_projection_wave_size = 0;
+  std::size_t projection_speculative_discarded = 0;
+  std::size_t source_speculative_moves_discarded = 0;
+  std::size_t source_speculative_sources_discarded = 0;
+  std::uint64_t scheduler_handoff_stall_nanoseconds = 0;
+  bool cancelled = false;
+  sampled_tree_source_wave_memory_estimate memory;
+};
+
 enum class sampled_tree_projection_gather_decision {
   continue_projection,
   stop_after_current,
@@ -1281,17 +1383,15 @@ inline std::size_t estimate_sampled_tree_projection_sampled_tree_bytes(
   return total;
 }
 
-inline std::size_t
-estimate_sampled_tree_projection_prepared_owned_and_job_bytes(
-    sampled_tree_projection_context const& prepared, std::size_t job_count,
+inline std::size_t estimate_sampled_tree_projection_prepared_owned_bytes(
+    sampled_tree_projection_context const& prepared,
     bool& safely_bounded) noexcept {
   auto const node_count = prepared.source_tree().node_high_mark();
   auto const taxon_count = prepared.base().taxa.id_to_sample_id.size();
   auto const production_count = prepared.base().productions.size();
   auto const variable_sites = prepared.index().num_variable_sites();
 
-  std::size_t total = sizeof(sampled_tree_projection_context) +
-                      sizeof(std::vector<sampled_tree_projection_job>);
+  std::size_t total = sizeof(sampled_tree_projection_context);
   auto add_product = [&](std::size_t count, std::size_t bytes) {
     total = sampled_tree_projection_saturating_add(
         total,
@@ -1311,11 +1411,31 @@ estimate_sampled_tree_projection_prepared_owned_and_job_bytes(
   add_product(production_count, 16 * sizeof(void*) + 128);
   add_product(node_count, sampled_tree_projection_saturating_multiply(
                               variable_sites, 64, safely_bounded));
+  return total;
+}
+
+inline std::size_t
+estimate_sampled_tree_projection_prepared_owned_and_job_bytes(
+    sampled_tree_projection_context const& prepared, std::size_t job_count,
+    bool& safely_bounded) noexcept {
+  auto const node_count = prepared.source_tree().node_high_mark();
+  auto total = sampled_tree_projection_saturating_add(
+      estimate_sampled_tree_projection_prepared_owned_bytes(prepared,
+                                                            safely_bounded),
+      sizeof(std::vector<sampled_tree_projection_job>), safely_bounded);
   // One bounded searchable-node ordering remains live while the exact move
   // count is replayed into the job vector. Its node-count envelope is included
   // in the allocation-free irreducible-base preflight.
-  add_product(node_count, sizeof(std::size_t));
-  add_product(job_count, sizeof(sampled_tree_projection_job));
+  total = sampled_tree_projection_saturating_add(
+      total,
+      sampled_tree_projection_saturating_multiply(
+          node_count, sizeof(std::size_t), safely_bounded),
+      safely_bounded);
+  total = sampled_tree_projection_saturating_add(
+      total,
+      sampled_tree_projection_saturating_multiply(
+          job_count, sizeof(sampled_tree_projection_job), safely_bounded),
+      safely_bounded);
   return total;
 }
 
@@ -1347,21 +1467,45 @@ inline std::size_t estimate_sampled_tree_projection_task_scratch_bytes(
   return total;
 }
 
-inline std::size_t estimate_sampled_tree_projection_enumeration_scratch_bytes(
+inline std::size_t sampled_tree_projection_byte_vector_capacity_bound(
+    std::size_t requested) noexcept {
+  // The required GCC-trunk/libstdc++ C++26 toolchain rounds non-empty byte
+  // vector storage to a 16-byte allocation quantum.  Explicitly reserving and
+  // charging that floor makes E exact on this toolchain and remains a
+  // conservative bound for implementations that allocate exactly requested.
+  return requested == 0 ? 0 : std::max<std::size_t>(requested, 16);
+}
+
+inline std::size_t
+estimate_sampled_tree_projection_enumeration_retained_dynamic_bytes(
     sampled_tree_projection_context const& prepared,
     bool& safely_bounded) noexcept {
   auto const variable_sites = prepared.index().num_variable_sites();
-  auto total = sampled_tree_projection_saturating_add(
-      sizeof(move_enumerator) + sizeof(scratch_buffers) +
-          sizeof(move_enumerator::callback_t),
-      512, safely_bounded);
   // find_moves_for_source owns five uint8_t site vectors in scratch_buffers.
-  total = sampled_tree_projection_saturating_add(
-      total,
-      sampled_tree_projection_saturating_multiply(
-          variable_sites, 5 * sizeof(std::uint8_t), safely_bounded),
+  return sampled_tree_projection_saturating_multiply(
+      sampled_tree_projection_byte_vector_capacity_bound(variable_sites),
+      5 * sizeof(std::uint8_t), safely_bounded);
+}
+
+inline std::size_t estimate_sampled_tree_projection_active_enumerator_bytes(
+    bool& safely_bounded) noexcept {
+  return sampled_tree_projection_saturating_add(
+      sizeof(move_enumerator) + sizeof(move_enumerator::callback_t), 512,
       safely_bounded);
-  return total;
+}
+
+inline std::size_t estimate_sampled_tree_projection_enumeration_scratch_bytes(
+    sampled_tree_projection_context const& prepared,
+    bool& safely_bounded) noexcept {
+  auto total = sampled_tree_projection_saturating_add(
+      sizeof(scratch_buffers),
+      estimate_sampled_tree_projection_active_enumerator_bytes(safely_bounded),
+      safely_bounded);
+  return sampled_tree_projection_saturating_add(
+      total,
+      estimate_sampled_tree_projection_enumeration_retained_dynamic_bytes(
+          prepared, safely_bounded),
+      safely_bounded);
 }
 
 inline std::size_t estimate_sampled_tree_projection_retained_candidate_bytes(
@@ -1403,6 +1547,259 @@ inline std::size_t bounded_sampled_tree_projection_wave_size(
           ? (std::numeric_limits<std::size_t>::max)()
           : bounded_workers * 4;
   return std::min(job_count, maximum);
+}
+
+inline std::size_t bounded_sampled_tree_source_wave_size(
+    chart_scheduler const* scheduler, std::size_t source_count) noexcept {
+  if (source_count == 0) return 0;
+  if (scheduler == nullptr) return 1;
+  return std::min(source_count,
+                  std::max<std::size_t>(
+                      1, scheduler->worker_resolution().resolved_workers));
+}
+
+inline sampled_tree_source_wave_memory_estimate
+estimate_sampled_tree_source_wave_memory(
+    sampled_tree_projection_context const& prepared,
+    chart_scheduler const* scheduler, std::size_t source_count,
+    std::size_t source_wave_size, std::size_t projection_wave_size,
+    std::size_t external_resident_bytes) noexcept {
+  sampled_tree_source_wave_memory_estimate result;
+  result.external_resident_bytes = external_resident_bytes;
+  result.source_count = source_count;
+  result.destination_bound_per_source = prepared.source_tree().node_high_mark();
+  result.source_wave_size = source_wave_size;
+  result.projection_wave_size = projection_wave_size;
+  result.safely_bounded = true;
+
+  auto add = [&](std::size_t lhs, std::size_t rhs) {
+    return sampled_tree_projection_saturating_add(lhs, rhs,
+                                                  result.safely_bounded);
+  };
+  auto multiply = [&](std::size_t lhs, std::size_t rhs) {
+    return sampled_tree_projection_saturating_multiply(lhs, rhs,
+                                                       result.safely_bounded);
+  };
+
+  result.sampled_tree_resident_bytes =
+      estimate_sampled_tree_projection_sampled_tree_bytes(
+          prepared, result.safely_bounded);
+  result.prepared_owned_bytes =
+      estimate_sampled_tree_projection_prepared_owned_bytes(
+          prepared, result.safely_bounded);
+  result.source_order_bytes = add(sizeof(std::vector<std::size_t>),
+                                  multiply(source_count, sizeof(std::size_t)));
+  result.source_slot_and_move_bytes =
+      add(sizeof(std::vector<sampled_tree_source_wave_slot>),
+          multiply(source_wave_size, sizeof(sampled_tree_source_wave_slot)));
+  result.source_slot_and_move_bytes = add(
+      result.source_slot_and_move_bytes,
+      multiply(multiply(source_wave_size, result.destination_bound_per_source),
+               sizeof(profitable_move)));
+  result.source_slot_and_move_bytes = add(
+      result.source_slot_and_move_bytes,
+      multiply(
+          source_wave_size,
+          estimate_sampled_tree_projection_enumeration_retained_dynamic_bytes(
+              prepared, result.safely_bounded)));
+
+  chart_indexed_range_plan source_plan;
+  if (scheduler != nullptr && source_wave_size != 0) {
+    source_plan = scheduler->plan_indexed_ranges(
+        source_wave_size, {.minimum_grain = 1, .target_ranges_per_worker = 1});
+    result.active_enumeration_count = source_plan.range_count <= 1
+                                          ? std::size_t{1}
+                                          : source_plan.worker_task_limit;
+  } else if (source_wave_size != 0) {
+    result.active_enumeration_count = 1;
+  }
+  auto const enumeration_scratch =
+      estimate_sampled_tree_projection_active_enumerator_bytes(
+          result.safely_bounded);
+  result.active_enumeration_scratch_bytes =
+      multiply(result.active_enumeration_count, enumeration_scratch);
+
+  result.projection_job_bytes =
+      add(sizeof(std::vector<sampled_tree_projection_job>),
+          multiply(projection_wave_size, sizeof(sampled_tree_projection_job)));
+  result.projection_completion_bytes =
+      add(sizeof(std::vector<std::uint8_t>),
+          multiply(sampled_tree_projection_byte_vector_capacity_bound(
+                       projection_wave_size),
+                   sizeof(std::uint8_t)));
+  auto const retained =
+      estimate_sampled_tree_projection_retained_candidate_bytes(
+          prepared, result.safely_bounded);
+  result.projection_slot_and_payload_bytes =
+      sizeof(std::vector<std::optional<grammar_spr_candidate>>);
+  result.projection_slot_and_payload_bytes = add(
+      result.projection_slot_and_payload_bytes,
+      multiply(projection_wave_size,
+               add(sizeof(std::optional<grammar_spr_candidate>), retained)));
+
+  chart_indexed_range_plan projection_plan;
+  if (scheduler != nullptr && projection_wave_size != 0) {
+    projection_plan = scheduler->plan_indexed_ranges(
+        projection_wave_size,
+        {.minimum_grain = 1, .target_ranges_per_worker = 1});
+    result.active_projection_count = projection_plan.range_count <= 1
+                                         ? std::size_t{1}
+                                         : projection_plan.worker_task_limit;
+  } else if (projection_wave_size != 0) {
+    result.active_projection_count = 1;
+  }
+  auto const projection_scratch =
+      estimate_sampled_tree_projection_task_scratch_bytes(
+          prepared, result.safely_bounded);
+  result.active_projection_scratch_bytes =
+      multiply(result.active_projection_count, projection_scratch);
+
+  if (scheduler != nullptr) {
+    result.scheduler_resident_bytes =
+        estimate_chart_scheduler_implementation_resident_bytes();
+    try {
+      result.scheduler_resident_bytes =
+          add(result.scheduler_resident_bytes,
+              estimate_chart_scheduler_pool_owning_heap_bytes(
+                  scheduler->worker_resolution().resolved_workers));
+      if (source_plan.range_count > 1 && source_plan.worker_task_limit > 1) {
+        result.source_scheduler_operation_bytes =
+            estimate_chart_scheduler_operation_peak_bytes(source_plan);
+      }
+      if (projection_plan.range_count > 1 &&
+          projection_plan.worker_task_limit > 1) {
+        result.projection_scheduler_operation_bytes =
+            estimate_chart_scheduler_operation_peak_bytes(projection_plan);
+      }
+    } catch (std::overflow_error const&) {
+      result.scheduler_resident_bytes =
+          (std::numeric_limits<std::size_t>::max)();
+      result.safely_bounded = false;
+    }
+  }
+
+  auto const source_stage = add(result.active_enumeration_scratch_bytes,
+                                result.source_scheduler_operation_bytes);
+  auto const projection_stage =
+      add(result.active_projection_scratch_bytes,
+          result.projection_scheduler_operation_bytes);
+  result.temporal_stage_peak_bytes = std::max(source_stage, projection_stage);
+  result.error_and_exception_bytes = sizeof(chart_scheduler_run_summary) + 512;
+  result.error_and_exception_bytes =
+      add(result.error_and_exception_bytes,
+          sizeof(std::function<void(std::size_t)>) +
+              sizeof(std::function<void(std::size_t, std::size_t)>) +
+              sizeof(std::function<void()>));
+  // Every source task catches independently, so failures from all stable
+  // source slots may coexist until the coordinator selects the lowest source.
+  result.error_and_exception_bytes =
+      add(result.error_and_exception_bytes, multiply(source_wave_size, 512));
+
+  result.required_peak_bytes = result.external_resident_bytes;
+  result.required_peak_bytes =
+      add(result.required_peak_bytes, result.sampled_tree_resident_bytes);
+  result.required_peak_bytes =
+      add(result.required_peak_bytes, result.prepared_owned_bytes);
+  result.required_peak_bytes =
+      add(result.required_peak_bytes, result.source_order_bytes);
+  result.required_peak_bytes =
+      add(result.required_peak_bytes, result.source_slot_and_move_bytes);
+  result.required_peak_bytes =
+      add(result.required_peak_bytes, result.projection_job_bytes);
+  result.required_peak_bytes =
+      add(result.required_peak_bytes, result.projection_completion_bytes);
+  result.required_peak_bytes =
+      add(result.required_peak_bytes, result.projection_slot_and_payload_bytes);
+  result.required_peak_bytes =
+      add(result.required_peak_bytes, result.scheduler_resident_bytes);
+  result.required_peak_bytes =
+      add(result.required_peak_bytes, result.temporal_stage_peak_bytes);
+  result.required_peak_bytes =
+      add(result.required_peak_bytes, result.error_and_exception_bytes);
+  result.actual_peak_bytes = result.required_peak_bytes;
+  return result;
+}
+
+inline sampled_tree_source_wave_memory_estimate
+admit_sampled_tree_source_wave_memory(
+    sampled_tree_projection_context const& prepared,
+    chart_scheduler const* scheduler, std::size_t source_count,
+    std::size_t external_resident_bytes, std::size_t budget_bytes) {
+  auto const maximum_source =
+      bounded_sampled_tree_source_wave_size(scheduler, source_count);
+  auto estimate = [&](std::size_t source_width, std::size_t projection_width) {
+    return estimate_sampled_tree_source_wave_memory(
+        prepared, scheduler, source_count, source_width, projection_width,
+        external_resident_bytes);
+  };
+  auto fits = [&](sampled_tree_source_wave_memory_estimate const& candidate) {
+    return candidate.safely_bounded &&
+           (budget_bytes == 0 || candidate.required_peak_bytes <= budget_bytes);
+  };
+  auto projection_maximum_for = [&](std::size_t source_width) {
+    bool safely_bounded = true;
+    auto const move_bound = sampled_tree_projection_saturating_multiply(
+        source_width, prepared.source_tree().node_high_mark(), safely_bounded);
+    if (!safely_bounded) {
+      return (std::numeric_limits<std::size_t>::max)();
+    }
+    return bounded_sampled_tree_projection_wave_size(scheduler, move_bound);
+  };
+
+  if (maximum_source == 0) {
+    auto empty = estimate(0, 0);
+    if (!fits(empty)) {
+      throw sampled_tree_projection_budget_error{empty.required_peak_bytes,
+                                                 budget_bytes};
+    }
+    return empty;
+  }
+
+  auto const minimum_projection =
+      projection_maximum_for(1) == 0 ? std::size_t{0} : std::size_t{1};
+  auto minimum = estimate(1, minimum_projection);
+  if (!fits(minimum)) {
+    throw sampled_tree_projection_budget_error{minimum.required_peak_bytes,
+                                               budget_bytes};
+  }
+
+  // Admit source concurrency independently at the irreducible one-projection
+  // working set. Both dimensions are monotone in their admitted widths.
+  std::size_t source_low = 1;
+  std::size_t source_high = maximum_source;
+  auto selected = minimum;
+  while (source_low < source_high) {
+    auto const midpoint = source_low + (source_high - source_low + 1) / 2;
+    auto candidate =
+        estimate(midpoint, projection_maximum_for(midpoint) == 0 ? 0 : 1);
+    if (fits(candidate)) {
+      source_low = midpoint;
+      selected = candidate;
+    } else {
+      source_high = midpoint - 1;
+    }
+  }
+
+  auto const maximum_projection = projection_maximum_for(source_low);
+  if (maximum_projection == 0) return estimate(source_low, 0);
+  std::size_t projection_low = 1;
+  std::size_t projection_high = maximum_projection;
+  selected = estimate(source_low, 1);
+  while (projection_low < projection_high) {
+    auto const midpoint =
+        projection_low + (projection_high - projection_low + 1) / 2;
+    auto candidate = estimate(source_low, midpoint);
+    if (fits(candidate)) {
+      projection_low = midpoint;
+      selected = candidate;
+    } else {
+      projection_high = midpoint - 1;
+    }
+  }
+  if (selected.projection_wave_size != projection_low) {
+    selected = estimate(source_low, projection_low);
+  }
+  return selected;
 }
 
 inline sampled_tree_projection_memory_estimate
@@ -3887,6 +4284,605 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
   return result;
 }
 
+inline std::size_t sampled_tree_source_wave_planned_container_bytes(
+    sampled_tree_projection_context const& prepared,
+    sampled_tree_source_wave_memory_estimate const& memory,
+    bool& safely_bounded) noexcept {
+  std::size_t total = sizeof(std::vector<std::size_t>) +
+                      sizeof(std::vector<sampled_tree_source_wave_slot>) +
+                      sizeof(std::vector<sampled_tree_projection_job>) +
+                      sizeof(std::vector<std::uint8_t>) +
+                      sizeof(std::vector<std::optional<grammar_spr_candidate>>);
+  auto add_product = [&](std::size_t count, std::size_t bytes) {
+    total = sampled_tree_projection_saturating_add(
+        total,
+        sampled_tree_projection_saturating_multiply(count, bytes,
+                                                    safely_bounded),
+        safely_bounded);
+  };
+  add_product(memory.source_count, sizeof(std::size_t));
+  add_product(memory.source_wave_size, sizeof(sampled_tree_source_wave_slot));
+  add_product(sampled_tree_projection_saturating_multiply(
+                  memory.source_wave_size, memory.destination_bound_per_source,
+                  safely_bounded),
+              sizeof(profitable_move));
+  add_product(
+      memory.source_wave_size,
+      estimate_sampled_tree_projection_enumeration_retained_dynamic_bytes(
+          prepared, safely_bounded));
+  add_product(memory.projection_wave_size, sizeof(sampled_tree_projection_job));
+  add_product(sampled_tree_projection_byte_vector_capacity_bound(
+                  memory.projection_wave_size),
+              sizeof(std::uint8_t));
+  add_product(memory.projection_wave_size,
+              sizeof(std::optional<grammar_spr_candidate>));
+  return total;
+}
+
+inline std::size_t sampled_tree_source_wave_actual_container_bytes(
+    std::vector<std::size_t> const& source_order,
+    std::vector<sampled_tree_source_wave_slot> const& source_slots,
+    std::vector<sampled_tree_projection_job> const& projection_jobs,
+    std::vector<std::uint8_t> const& projection_completed,
+    std::vector<std::optional<grammar_spr_candidate>> const& projection_slots,
+    bool& safely_bounded) noexcept {
+  std::size_t total = sizeof(source_order) + sizeof(source_slots) +
+                      sizeof(projection_jobs) + sizeof(projection_completed) +
+                      sizeof(projection_slots);
+  auto add_product = [&](std::size_t count, std::size_t bytes) {
+    total = sampled_tree_projection_saturating_add(
+        total,
+        sampled_tree_projection_saturating_multiply(count, bytes,
+                                                    safely_bounded),
+        safely_bounded);
+  };
+  add_product(source_order.capacity(), sizeof(std::size_t));
+  add_product(source_slots.capacity(), sizeof(sampled_tree_source_wave_slot));
+  for (auto const& slot : source_slots) {
+    add_product(slot.moves.capacity(), sizeof(profitable_move));
+    add_product(slot.enumeration_scratch.new_node_fitch.capacity(),
+                sizeof(std::uint8_t));
+    add_product(slot.enumeration_scratch.prev_old_fitch.capacity(),
+                sizeof(std::uint8_t));
+    add_product(slot.enumeration_scratch.prev_new_fitch.capacity(),
+                sizeof(std::uint8_t));
+    add_product(slot.enumeration_scratch.removal.new_fitch.capacity(),
+                sizeof(std::uint8_t));
+    add_product(slot.enumeration_scratch.removal.old_fitch.capacity(),
+                sizeof(std::uint8_t));
+  }
+  add_product(projection_jobs.capacity(), sizeof(sampled_tree_projection_job));
+  add_product(projection_completed.capacity(), sizeof(std::uint8_t));
+  add_product(projection_slots.capacity(),
+              sizeof(std::optional<grammar_spr_candidate>));
+  return total;
+}
+
+inline std::size_t sampled_tree_projected_candidate_actual_retained_bytes(
+    grammar_spr_candidate const& candidate, bool& safely_bounded) noexcept {
+  std::size_t total = sizeof(grammar_spr_candidate);
+  auto add_product = [&](std::size_t count, std::size_t bytes) {
+    total = sampled_tree_projection_saturating_add(
+        total,
+        sampled_tree_projection_saturating_multiply(count, bytes,
+                                                    safely_bounded),
+        safely_bounded);
+  };
+  add_product(candidate.removed_productions.capacity(),
+              sizeof(overlay_production_ref));
+  add_product(candidate.added_clades.capacity(), sizeof(clade_key));
+  for (auto const& clade : candidate.added_clades) {
+    add_product(clade.taxa.capacity(), sizeof(taxon_id));
+  }
+  add_product(candidate.added_productions.capacity(),
+              sizeof(overlay_grammar_production));
+  for (auto const& production : candidate.added_productions) {
+    add_product(production.children.capacity(), sizeof(overlay_clade_ref));
+    add_product(production.witnesses.capacity(), sizeof(production_witness));
+    for (auto const& witness : production.witnesses) {
+      add_product(witness.children.capacity(),
+                  sizeof(production_child_witness));
+      for (auto const& child : witness.children) {
+        add_product(child.edge_alternatives.capacity(), sizeof(std::size_t));
+      }
+    }
+  }
+  if (candidate.source_before_topology_productions) {
+    add_product(candidate.source_before_topology_productions->capacity(),
+                sizeof(overlay_production_ref));
+  }
+  if (candidate.source_after_topology_productions) {
+    add_product(candidate.source_after_topology_productions->capacity(),
+                sizeof(overlay_production_ref));
+  }
+  return total;
+}
+
+template <typename Gather>
+sampled_tree_source_wave_execution_stats
+project_sampled_tree_moves_in_source_waves(
+    sampled_tree_projection_context const& prepared,
+    grammar_spr_enumeration_options const& options, std::size_t radius,
+    std::mt19937& rng, Gather&& gather) {
+  sampled_tree_source_wave_execution_stats result;
+  auto* scheduler = options.sampled_tree_projection_scheduler;
+  auto cancellation_requested = [&]() noexcept {
+    return options.sampled_tree_projection_cancel_requested != nullptr &&
+           options.sampled_tree_projection_cancel_requested->load(
+               std::memory_order_acquire);
+  };
+  if (cancellation_requested()) {
+    result.cancelled = true;
+    return result;
+  }
+  if (radius == 0) radius = 1;
+
+  auto const& index = prepared.index();
+  auto const source_count = index.get_searchable_nodes().size();
+  result.memory = admit_sampled_tree_source_wave_memory(
+      prepared, scheduler, source_count,
+      options.sampled_tree_projection_external_resident_bytes,
+      options.sampled_tree_projection_memory_budget_bytes);
+  if (source_count == 0) return result;
+  if (result.memory.source_wave_size == 0 ||
+      result.memory.projection_wave_size == 0) {
+    throw std::logic_error(
+        "chart SPR sampled-tree source-wave admission produced an empty "
+        "working width for non-empty source work");
+  }
+
+  // Full finite admission precedes every source-order/buffer reserve and every
+  // scheduler operation.  These containers retain their capacity across all
+  // source and projection waves.
+  if (options.before_sampled_tree_projection_workspace_allocation_for_tests) {
+    options.before_sampled_tree_projection_workspace_allocation_for_tests();
+  }
+  auto source_order = index.get_searchable_nodes();
+  std::vector<sampled_tree_source_wave_slot> source_slots(
+      result.memory.source_wave_size);
+  auto const enumeration_byte_capacity =
+      sampled_tree_projection_byte_vector_capacity_bound(
+          index.num_variable_sites());
+  for (auto& slot : source_slots) {
+    slot.moves.reserve(result.memory.destination_bound_per_source);
+    slot.enumeration_scratch.new_node_fitch.reserve(enumeration_byte_capacity);
+    slot.enumeration_scratch.prev_old_fitch.reserve(enumeration_byte_capacity);
+    slot.enumeration_scratch.prev_new_fitch.reserve(enumeration_byte_capacity);
+    slot.enumeration_scratch.removal.new_fitch.reserve(
+        enumeration_byte_capacity);
+    slot.enumeration_scratch.removal.old_fitch.reserve(
+        enumeration_byte_capacity);
+    slot.enumeration_scratch.resize(index.num_variable_sites());
+  }
+  std::vector<sampled_tree_projection_job> projection_jobs;
+  projection_jobs.reserve(result.memory.projection_wave_size);
+  std::vector<std::uint8_t> projection_completed;
+  projection_completed.reserve(
+      sampled_tree_projection_byte_vector_capacity_bound(
+          result.memory.projection_wave_size));
+  projection_completed.resize(result.memory.projection_wave_size,
+                              std::uint8_t{0});
+  std::vector<std::optional<grammar_spr_candidate>> projection_slots(
+      result.memory.projection_wave_size);
+
+  bool actual_safely_bounded = true;
+  auto planned_container_bytes =
+      sampled_tree_source_wave_planned_container_bytes(prepared, result.memory,
+                                                       actual_safely_bounded);
+  auto actual_container_bytes = sampled_tree_source_wave_actual_container_bytes(
+      source_order, source_slots, projection_jobs, projection_completed,
+      projection_slots, actual_safely_bounded);
+  actual_container_bytes = sampled_tree_projection_saturating_add(
+      actual_container_bytes,
+      options.sampled_tree_source_wave_actual_capacity_extra_bytes_for_tests,
+      actual_safely_bounded);
+  result.memory.planned_container_capacity_bytes = planned_container_bytes;
+  result.memory.actual_container_capacity_bytes = actual_container_bytes;
+  result.memory.actual_peak_bytes = result.memory.required_peak_bytes;
+  std::size_t container_capacity_excess_bytes = 0;
+  if (!actual_safely_bounded) {
+    result.memory.actual_peak_bytes = (std::numeric_limits<std::size_t>::max)();
+  } else if (actual_container_bytes > planned_container_bytes) {
+    container_capacity_excess_bytes =
+        actual_container_bytes - planned_container_bytes;
+    bool safely_bounded = result.memory.safely_bounded;
+    result.memory.actual_peak_bytes = sampled_tree_projection_saturating_add(
+        result.memory.required_peak_bytes, container_capacity_excess_bytes,
+        safely_bounded);
+    result.memory.safely_bounded = safely_bounded;
+  }
+  auto const budget = options.sampled_tree_projection_memory_budget_bytes;
+  if (!result.memory.safely_bounded ||
+      (budget != 0 && result.memory.actual_peak_bytes > budget)) {
+    throw sampled_tree_projection_budget_error{result.memory.actual_peak_bytes,
+                                               budget};
+  }
+
+  // This is the one and only seeded source-order draw.  Worker scheduling and
+  // completion order never touch the RNG stream.
+  shuffle_if_requested(source_order, options, &rng);
+  result.enumeration_passes = 1;
+
+  if (scheduler != nullptr &&
+      options.force_sampled_tree_projection_submit_failure_after_for_tests) {
+    chart_scheduler_test_detail::access::fail_submission_after(
+        *scheduler,
+        *options.force_sampled_tree_projection_submit_failure_after_for_tests);
+  }
+
+  constexpr chart_indexed_range_options range_options{
+      .minimum_grain = 1, .target_ranges_per_worker = 1};
+  bool retained_bound_safely_bounded = true;
+  auto const retained_candidate_bound =
+      estimate_sampled_tree_projection_retained_candidate_bytes(
+          prepared, retained_bound_safely_bounded);
+  if (!retained_bound_safely_bounded) {
+    throw sampled_tree_projection_budget_error{
+        (std::numeric_limits<std::size_t>::max)(), budget};
+  }
+  struct source_enumeration_cancelled {};
+  auto enumerate_source = [&](sampled_tree_source_wave_slot& slot) noexcept {
+    try {
+      if (options.before_sampled_tree_source_enumeration_for_tests) {
+        options.before_sampled_tree_source_enumeration_for_tests(
+            slot.source_ordinal, slot.source_node);
+      }
+      move_enumerator enumerator{index, options.sampled_tree_score_threshold};
+      enumerator.find_moves_for_source(
+          slot.source_node, radius,
+          [&](profitable_move const& move) {
+            if (cancellation_requested()) {
+              throw source_enumeration_cancelled{};
+            }
+            if (slot.moves.size() >=
+                result.memory.destination_bound_per_source) {
+              throw std::logic_error(
+                  "chart SPR sampled-tree source emitted more moves than "
+                  "the admitted destination bound");
+            }
+            slot.moves.push_back(move);
+          },
+          slot.enumeration_scratch);
+    } catch (source_enumeration_cancelled const&) {
+      slot.cancelled = true;
+    } catch (...) {
+      slot.failure = std::current_exception();
+    }
+  };
+
+  auto acquire_scheduler_handoff = [&]() {
+    std::unique_lock<std::mutex> handoff;
+    if (options.sampled_tree_projection_scheduler_handoff_mutex != nullptr) {
+      auto const wait_start = std::chrono::steady_clock::now();
+      handoff = std::unique_lock<std::mutex>{
+          *options.sampled_tree_projection_scheduler_handoff_mutex};
+      result.scheduler_handoff_stall_nanoseconds += static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - wait_start)
+              .count());
+    }
+    return handoff;
+  };
+  auto record_source_summary = [&](chart_scheduler_run_summary const& summary) {
+    if (options.sampled_tree_projection_scheduler_diagnostics_sink != nullptr) {
+      options.sampled_tree_projection_scheduler_diagnostics_sink->record(
+          summary);
+    }
+    ++result.source_scheduler_operations;
+    result.source_parallel_operations +=
+        summary.parallel_branch_entered ? 1 : 0;
+    result.source_ranges += summary.range_count;
+    result.source_worker_tasks += summary.worker_tasks_submitted;
+    result.source_active_worker_high_water = std::max(
+        result.source_active_worker_high_water, summary.active_workers);
+  };
+  auto record_projection_summary =
+      [&](chart_scheduler_run_summary const& summary) {
+        if (options.sampled_tree_projection_scheduler_diagnostics_sink !=
+            nullptr) {
+          options.sampled_tree_projection_scheduler_diagnostics_sink->record(
+              summary);
+        }
+        ++result.projection_scheduler_operations;
+        result.projection_parallel_operations +=
+            summary.parallel_branch_entered ? 1 : 0;
+        result.projection_ranges += summary.range_count;
+        result.projection_worker_tasks += summary.worker_tasks_submitted;
+        result.projection_active_worker_high_water = std::max(
+            result.projection_active_worker_high_water, summary.active_workers);
+      };
+  auto record_failed_summary = [&](chart_scheduler_run_summary const& summary) {
+    if (options.sampled_tree_projection_scheduler_diagnostics_sink != nullptr) {
+      options.sampled_tree_projection_scheduler_diagnostics_sink->record(
+          summary);
+    }
+  };
+
+  std::size_t next_move_ordinal = 0;
+  for (std::size_t source_begin = 0; source_begin < source_order.size();) {
+    auto const source_wave_count = std::min(result.memory.source_wave_size,
+                                            source_order.size() - source_begin);
+    if (source_wave_count > result.memory.source_wave_size) {
+      throw std::logic_error(
+          "chart SPR sampled-tree source wave exceeded admission");
+    }
+    for (std::size_t local = 0; local < source_wave_count; ++local) {
+      auto& slot = source_slots[local];
+      slot.source_ordinal = source_begin + local;
+      slot.source_node = source_order[source_begin + local];
+      slot.first_move_ordinal = 0;
+      slot.moves.clear();
+      slot.failure = nullptr;
+      slot.cancelled = false;
+    }
+
+    if (scheduler == nullptr) {
+      enumerate_source(source_slots[0]);
+    } else {
+      auto scheduler_handoff = acquire_scheduler_handoff();
+      if (cancellation_requested()) {
+        result.cancelled = true;
+        return result;
+      }
+      chart_scheduler_run_summary failed_summary;
+      chart_scheduler_run_summary summary;
+      try {
+        summary = scheduler->for_each_indexed_range(
+            source_wave_count, range_options,
+            [&](chart_indexed_range const& range, std::size_t,
+                chart_scheduler_cancellation_token const& cancellation) {
+              for (auto local = range.begin; local < range.end; ++local) {
+                if (local != range.begin && cancellation.stop_requested()) {
+                  break;
+                }
+                enumerate_source(source_slots[local]);
+              }
+            },
+            &failed_summary);
+      } catch (...) {
+        record_failed_summary(failed_summary);
+        throw;
+      }
+      record_source_summary(summary);
+    }
+    ++result.source_waves;
+    result.sources_enumerated += source_wave_count;
+    result.peak_source_wave_size =
+        std::max(result.peak_source_wave_size, source_wave_count);
+
+    // Task exceptions are retained per stable source slot.  Scan only after
+    // every source task has joined so completion order cannot choose failure.
+    for (std::size_t local = 0; local < source_wave_count; ++local) {
+      if (source_slots[local].failure) {
+        std::rethrow_exception(source_slots[local].failure);
+      }
+    }
+
+    std::size_t source_wave_move_count = 0;
+    for (std::size_t local = 0; local < source_wave_count; ++local) {
+      auto& slot = source_slots[local];
+      slot.first_move_ordinal = next_move_ordinal;
+      if (slot.moves.size() >
+          (std::numeric_limits<std::size_t>::max)() - next_move_ordinal) {
+        throw std::overflow_error(
+            "chart SPR sampled-tree source-wave move ordinal overflow");
+      }
+      next_move_ordinal += slot.moves.size();
+      source_wave_move_count += slot.moves.size();
+      result.moves_enumerated += slot.moves.size();
+      result.move_enumeration_visits += slot.moves.size();
+    }
+    auto const source_wave_end_ordinal = next_move_ordinal;
+    auto count_fully_speculative_sources = [&](std::size_t boundary) {
+      std::size_t count = 0;
+      for (std::size_t local = 0; local < source_wave_count; ++local) {
+        auto const& slot = source_slots[local];
+        if (!slot.moves.empty() && slot.first_move_ordinal >= boundary) {
+          ++count;
+        }
+      }
+      return count;
+    };
+
+    bool source_cancelled = cancellation_requested();
+    for (std::size_t local = 0; local < source_wave_count; ++local) {
+      source_cancelled = source_cancelled || source_slots[local].cancelled;
+    }
+    if (source_cancelled) {
+      result.source_speculative_moves_discarded += source_wave_move_count;
+      result.source_speculative_sources_discarded +=
+          count_fully_speculative_sources(source_slots[0].first_move_ordinal);
+      result.cancelled = true;
+      return result;
+    }
+
+    std::size_t source_local = 0;
+    std::size_t move_local = 0;
+    auto advance_empty_sources = [&] {
+      while (source_local < source_wave_count &&
+             move_local >= source_slots[source_local].moves.size()) {
+        ++source_local;
+        move_local = 0;
+      }
+    };
+    advance_empty_sources();
+    while (source_local < source_wave_count) {
+      projection_jobs.clear();
+      while (projection_jobs.size() < result.memory.projection_wave_size &&
+             source_local < source_wave_count) {
+        auto const& source_slot = source_slots[source_local];
+        projection_jobs.push_back(sampled_tree_projection_job{
+            source_slot.first_move_ordinal + move_local,
+            source_slot.moves[move_local]});
+        ++move_local;
+        advance_empty_sources();
+      }
+      auto const projection_count = projection_jobs.size();
+      if (projection_count == 0) break;
+      if (projection_count > result.memory.projection_wave_size) {
+        throw std::logic_error(
+            "chart SPR sampled-tree projection subwave exceeded admission");
+      }
+      for (std::size_t local = 0; local < projection_count; ++local) {
+        projection_slots[local].reset();
+        projection_completed[local] = 0;
+      }
+
+      if (scheduler == nullptr) {
+        auto const& job = projection_jobs[0];
+        if (options.before_sampled_tree_projection_for_tests) {
+          options.before_sampled_tree_projection_for_tests(job.ordinal);
+        }
+        projection_slots[0] =
+            project_tree_spr_move_to_candidate(prepared, job.move);
+        projection_completed[0] = 1;
+      } else {
+        auto scheduler_handoff = acquire_scheduler_handoff();
+        if (cancellation_requested()) {
+          auto const boundary = projection_jobs.front().ordinal;
+          result.source_speculative_moves_discarded +=
+              source_wave_end_ordinal - boundary;
+          result.source_speculative_sources_discarded +=
+              count_fully_speculative_sources(boundary);
+          result.cancelled = true;
+          return result;
+        }
+        chart_scheduler_run_summary failed_summary;
+        chart_scheduler_run_summary summary;
+        try {
+          summary = scheduler->for_each_indexed_range(
+              projection_count, range_options,
+              [&](chart_indexed_range const& range, std::size_t,
+                  chart_scheduler_cancellation_token const& cancellation) {
+                for (auto local = range.begin; local < range.end; ++local) {
+                  if ((local != range.begin && cancellation.stop_requested()) ||
+                      cancellation_requested()) {
+                    break;
+                  }
+                  auto const& job = projection_jobs[local];
+                  if (options.before_sampled_tree_projection_for_tests) {
+                    options.before_sampled_tree_projection_for_tests(
+                        job.ordinal);
+                  }
+                  projection_slots[local] =
+                      project_tree_spr_move_to_candidate(prepared, job.move);
+                  projection_completed[local] = 1;
+                }
+              },
+              &failed_summary);
+        } catch (...) {
+          record_failed_summary(failed_summary);
+          throw;
+        }
+        record_projection_summary(summary);
+      }
+      ++result.projection_waves;
+      result.peak_projection_wave_size =
+          std::max(result.peak_projection_wave_size, projection_count);
+
+      // Projection owns nested vectors inside every retained candidate. Walk
+      // their actual capacities before cancellation/gather can publish a
+      // result, and fail closed if the conservative per-slot envelope was
+      // ever underestimated.
+      bool payload_safely_bounded = true;
+      std::size_t actual_payload_bytes = 0;
+      for (std::size_t local = 0; local < projection_count; ++local) {
+        if (!projection_slots[local]) continue;
+        actual_payload_bytes = sampled_tree_projection_saturating_add(
+            actual_payload_bytes,
+            sampled_tree_projected_candidate_actual_retained_bytes(
+                *projection_slots[local], payload_safely_bounded),
+            payload_safely_bounded);
+      }
+      auto const planned_payload_bytes =
+          sampled_tree_projection_saturating_multiply(projection_count,
+                                                      retained_candidate_bound,
+                                                      payload_safely_bounded);
+      result.memory.planned_retained_payload_bytes = std::max(
+          result.memory.planned_retained_payload_bytes, planned_payload_bytes);
+      result.memory.actual_retained_payload_bytes = std::max(
+          result.memory.actual_retained_payload_bytes, actual_payload_bytes);
+      std::size_t payload_excess_bytes = 0;
+      if (payload_safely_bounded &&
+          actual_payload_bytes > planned_payload_bytes) {
+        payload_excess_bytes = actual_payload_bytes - planned_payload_bytes;
+      }
+      bool actual_peak_safely_bounded = payload_safely_bounded;
+      auto actual_peak = sampled_tree_projection_saturating_add(
+          result.memory.required_peak_bytes, container_capacity_excess_bytes,
+          actual_peak_safely_bounded);
+      actual_peak = sampled_tree_projection_saturating_add(
+          actual_peak, payload_excess_bytes, actual_peak_safely_bounded);
+      if (!actual_peak_safely_bounded) {
+        actual_peak = (std::numeric_limits<std::size_t>::max)();
+      }
+      result.memory.actual_peak_bytes =
+          std::max(result.memory.actual_peak_bytes, actual_peak);
+      if (!actual_peak_safely_bounded ||
+          (budget != 0 && result.memory.actual_peak_bytes > budget)) {
+        throw sampled_tree_projection_budget_error{
+            result.memory.actual_peak_bytes, budget};
+      }
+
+      if (cancellation_requested()) {
+        auto const boundary = projection_jobs.front().ordinal;
+        result.projection_speculative_discarded += static_cast<std::size_t>(
+            std::count(projection_completed.begin(),
+                       projection_completed.begin() + projection_count,
+                       std::uint8_t{1}));
+        result.source_speculative_moves_discarded +=
+            source_wave_end_ordinal - boundary;
+        result.source_speculative_sources_discarded +=
+            count_fully_speculative_sources(boundary);
+        result.cancelled = true;
+        return result;
+      }
+
+      for (std::size_t local = 0; local < projection_count; ++local) {
+        if (projection_completed[local] == 0) {
+          throw std::logic_error(
+              "chart SPR sampled-tree projection subwave joined without "
+              "completing an ordinal");
+        }
+        auto gather_result =
+            std::invoke(gather, projection_jobs[local].ordinal,
+                        std::as_const(projection_slots[local]));
+        auto decision = [&] {
+          if constexpr (std::is_same_v<
+                            std::remove_cvref_t<decltype(gather_result)>,
+                            bool>) {
+            return gather_result ? sampled_tree_projection_gather_decision::
+                                       continue_projection
+                                 : sampled_tree_projection_gather_decision::
+                                       stop_after_current;
+          } else {
+            return gather_result;
+          }
+        }();
+        if (decision ==
+            sampled_tree_projection_gather_decision::continue_projection) {
+          continue;
+        }
+        auto boundary = projection_jobs[local].ordinal;
+        result.projection_speculative_discarded += projection_count - local - 1;
+        if (decision ==
+            sampled_tree_projection_gather_decision::stop_before_current) {
+          ++result.projection_speculative_discarded;
+        } else {
+          ++boundary;
+        }
+        result.source_speculative_moves_discarded +=
+            source_wave_end_ordinal - boundary;
+        result.source_speculative_sources_discarded +=
+            count_fully_speculative_sources(boundary);
+        return result;
+      }
+    }
+    source_begin += source_wave_count;
+  }
+  return result;
+}
+
 inline bool candidate_passes_postconstruction_filters(
     clade_grammar const& grammar, grammar_spr_candidate const& candidate,
     grammar_spr_enumeration_options const& options,
@@ -3997,6 +4993,37 @@ inline void add_generation_count_stats(
       src.sampled_tree_projection_scheduler_handoff_stall_nanoseconds;
   dst.sampled_tree_projection_cancellations +=
       src.sampled_tree_projection_cancellations;
+  dst.sampled_tree_source_waves += src.sampled_tree_source_waves;
+  dst.sampled_tree_sources_enumerated += src.sampled_tree_sources_enumerated;
+  dst.sampled_tree_source_enumeration_operations +=
+      src.sampled_tree_source_enumeration_operations;
+  dst.sampled_tree_source_enumeration_parallel_operations +=
+      src.sampled_tree_source_enumeration_parallel_operations;
+  dst.sampled_tree_source_enumeration_ranges +=
+      src.sampled_tree_source_enumeration_ranges;
+  dst.sampled_tree_source_enumeration_worker_tasks +=
+      src.sampled_tree_source_enumeration_worker_tasks;
+  dst.sampled_tree_source_enumeration_active_worker_high_water =
+      std::max(dst.sampled_tree_source_enumeration_active_worker_high_water,
+               src.sampled_tree_source_enumeration_active_worker_high_water);
+  dst.sampled_tree_source_peak_wave_size =
+      std::max(dst.sampled_tree_source_peak_wave_size,
+               src.sampled_tree_source_peak_wave_size);
+  dst.sampled_tree_source_one_pass_move_visits +=
+      src.sampled_tree_source_one_pass_move_visits;
+  dst.sampled_tree_source_speculative_moves_discarded +=
+      src.sampled_tree_source_speculative_moves_discarded;
+  dst.sampled_tree_source_speculative_sources_discarded +=
+      src.sampled_tree_source_speculative_sources_discarded;
+  dst.sampled_tree_source_admitted_wave_width =
+      std::max(dst.sampled_tree_source_admitted_wave_width,
+               src.sampled_tree_source_admitted_wave_width);
+  dst.sampled_tree_projection_admitted_subwave_width =
+      std::max(dst.sampled_tree_projection_admitted_subwave_width,
+               src.sampled_tree_projection_admitted_subwave_width);
+  dst.sampled_tree_source_actual_peak_bytes =
+      std::max(dst.sampled_tree_source_actual_peak_bytes,
+               src.sampled_tree_source_actual_peak_bytes);
 }
 
 }  // namespace chart_spr_detail
@@ -4040,10 +5067,8 @@ chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
                       : compute_tree_max_depth(tree) * 2;
     if (radius == 0) radius = 1;
     auto projection = prepare_sampled_tree_projection(grammar, tree);
-    auto preassignment = preassign_sampled_tree_projection_jobs(
-        projection, options, radius, rng);
-    auto execution = project_preassigned_sampled_tree_moves(
-        projection, preassignment, options,
+    auto execution = project_sampled_tree_moves_in_source_waves(
+        projection, options, radius, rng,
         [&](std::size_t, std::optional<grammar_spr_candidate> const& projected)
             -> sampled_tree_projection_gather_decision {
           using decision = sampled_tree_projection_gather_decision;
@@ -4093,27 +5118,59 @@ chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
           return decision::continue_projection;
         });
     stats.sampled_tree_projection_moves_preassigned +=
-        execution.moves_preassigned;
+        execution.moves_enumerated;
     stats.sampled_tree_projection_move_enumeration_visits +=
-        preassignment.move_enumeration_visits;
+        execution.move_enumeration_visits;
     stats.sampled_tree_projection_enumeration_passes +=
-        preassignment.enumeration_passes;
-    stats.sampled_tree_projection_waves += execution.waves;
+        execution.enumeration_passes;
+    stats.sampled_tree_projection_waves += execution.projection_waves;
     stats.sampled_tree_projection_scheduler_operations +=
-        execution.scheduler_operations;
+        execution.projection_scheduler_operations;
     stats.sampled_tree_projection_parallel_operations +=
-        execution.parallel_operations;
-    stats.sampled_tree_projection_ranges += execution.ranges;
-    stats.sampled_tree_projection_worker_tasks += execution.worker_tasks;
+        execution.projection_parallel_operations;
+    stats.sampled_tree_projection_ranges += execution.projection_ranges;
+    stats.sampled_tree_projection_worker_tasks +=
+        execution.projection_worker_tasks;
     stats.sampled_tree_projection_active_worker_high_water =
         std::max(stats.sampled_tree_projection_active_worker_high_water,
-                 execution.active_worker_high_water);
-    stats.sampled_tree_projection_peak_wave_size = std::max(
-        stats.sampled_tree_projection_peak_wave_size, execution.peak_wave_size);
+                 execution.projection_active_worker_high_water);
+    stats.sampled_tree_projection_peak_wave_size =
+        std::max(stats.sampled_tree_projection_peak_wave_size,
+                 execution.peak_projection_wave_size);
     stats.sampled_tree_projection_speculative_discarded +=
-        execution.speculative_discarded;
+        execution.projection_speculative_discarded;
     stats.sampled_tree_projection_scheduler_handoff_stall_nanoseconds +=
         execution.scheduler_handoff_stall_nanoseconds;
+    stats.sampled_tree_source_waves += execution.source_waves;
+    stats.sampled_tree_sources_enumerated += execution.sources_enumerated;
+    stats.sampled_tree_source_enumeration_operations +=
+        execution.source_scheduler_operations;
+    stats.sampled_tree_source_enumeration_parallel_operations +=
+        execution.source_parallel_operations;
+    stats.sampled_tree_source_enumeration_ranges += execution.source_ranges;
+    stats.sampled_tree_source_enumeration_worker_tasks +=
+        execution.source_worker_tasks;
+    stats.sampled_tree_source_enumeration_active_worker_high_water =
+        std::max(stats.sampled_tree_source_enumeration_active_worker_high_water,
+                 execution.source_active_worker_high_water);
+    stats.sampled_tree_source_peak_wave_size =
+        std::max(stats.sampled_tree_source_peak_wave_size,
+                 execution.peak_source_wave_size);
+    stats.sampled_tree_source_one_pass_move_visits +=
+        execution.move_enumeration_visits;
+    stats.sampled_tree_source_speculative_moves_discarded +=
+        execution.source_speculative_moves_discarded;
+    stats.sampled_tree_source_speculative_sources_discarded +=
+        execution.source_speculative_sources_discarded;
+    stats.sampled_tree_source_admitted_wave_width =
+        std::max(stats.sampled_tree_source_admitted_wave_width,
+                 execution.memory.source_wave_size);
+    stats.sampled_tree_projection_admitted_subwave_width =
+        std::max(stats.sampled_tree_projection_admitted_subwave_width,
+                 execution.memory.projection_wave_size);
+    stats.sampled_tree_source_actual_peak_bytes =
+        std::max(stats.sampled_tree_source_actual_peak_bytes,
+                 execution.memory.actual_peak_bytes);
     if (execution.cancelled) {
       ++stats.sampled_tree_projection_cancellations;
       request_stop(chart_spr_candidate_stop_reason::callback_stop);

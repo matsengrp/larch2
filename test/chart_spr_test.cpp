@@ -1,4 +1,6 @@
 #include <larch/chart_spr.hpp>
+#include <larch/load_proto_dag.hpp>
+#include <larch/polytomy_refinement.hpp>
 
 #include "test_util.hpp"
 
@@ -7,6 +9,7 @@
 #include <future>
 #include <latch>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <print>
 #include <random>
@@ -685,6 +688,25 @@ static void check_prepared_projection_fixture(std::string const& label,
   });
   CHECK(!moves.empty());
 
+  larch::scratch_buffers reusable_enumeration_scratch;
+  reusable_enumeration_scratch.resize(prepared.index().num_variable_sites());
+  std::vector<larch::profitable_move> reused_moves;
+  for (auto source_node : prepared.index().get_searchable_nodes()) {
+    enumerator.find_moves_for_source(
+        source_node, radius,
+        [&](larch::profitable_move const& move) {
+          reused_moves.push_back(move);
+        },
+        reusable_enumeration_scratch);
+  }
+  CHECK(reused_moves.size() == moves.size());
+  for (std::size_t i = 0; i < moves.size(); ++i) {
+    CHECK(reused_moves[i].src == moves[i].src);
+    CHECK(reused_moves[i].dst == moves[i].dst);
+    CHECK(reused_moves[i].lca == moves[i].lca);
+    CHECK(reused_moves[i].score_change == moves[i].score_change);
+  }
+
   std::size_t projected_count = 0;
   std::vector<std::optional<larch::grammar_spr_candidate>> sequential_results;
   sequential_results.reserve(moves.size());
@@ -819,8 +841,18 @@ static void test_phase8_parallel_sampled_projection_is_deterministic() {
       options.sampled_tree_projection_scheduler = &scheduler;
 
       std::atomic<std::size_t> hook_calls{0};
+      std::atomic<std::size_t> source_hook_calls{0};
       std::latch first_wave_started{2};
+      std::latch first_source_wave_started{2};
       if (workers > 1) {
+        options.before_sampled_tree_source_enumeration_for_tests =
+            [&](std::size_t, std::size_t) {
+              auto const call =
+                  source_hook_calls.fetch_add(1, std::memory_order_relaxed);
+              if (call >= 2) return;
+              first_source_wave_started.count_down();
+              first_source_wave_started.wait();
+            };
         options.before_sampled_tree_projection_for_tests = [&](std::size_t) {
           auto const call = hook_calls.fetch_add(1, std::memory_order_relaxed);
           if (call >= 2) return;
@@ -834,18 +866,40 @@ static void test_phase8_parallel_sampled_projection_is_deterministic() {
       CHECK(!candidates.empty());
       CHECK(stats.sampled_tree_projection_moves_preassigned >= workers);
       CHECK(stats.sampled_tree_projection_move_enumeration_visits ==
-            2 * stats.sampled_tree_projection_moves_preassigned);
-      CHECK(stats.sampled_tree_projection_enumeration_passes == 2);
+            stats.sampled_tree_projection_moves_preassigned);
+      CHECK(stats.sampled_tree_source_one_pass_move_visits ==
+            stats.sampled_tree_projection_moves_preassigned);
+      CHECK(stats.sampled_tree_projection_enumeration_passes == 1);
+      CHECK(stats.sampled_tree_source_waves > 0);
+      CHECK(stats.sampled_tree_sources_enumerated > 0);
+      auto const expected_source_width =
+          std::min(workers, stats.sampled_tree_sources_enumerated);
+      CHECK(stats.sampled_tree_source_admitted_wave_width ==
+            expected_source_width);
+      CHECK(stats.sampled_tree_source_peak_wave_size == expected_source_width);
+      CHECK(stats.sampled_tree_projection_admitted_subwave_width <=
+            workers * 4);
+      CHECK(stats.sampled_tree_projection_admitted_subwave_width >=
+            stats.sampled_tree_projection_peak_wave_size);
       CHECK(stats.sampled_tree_projection_scheduler_operations > 0);
       CHECK(stats.sampled_tree_projection_peak_wave_size ==
             std::min(stats.sampled_tree_projection_moves_preassigned,
                      workers * 4));
       CHECK(stats.sampled_tree_projection_estimated_peak_bytes > 0);
+      CHECK(stats.sampled_tree_source_actual_peak_bytes >=
+            stats.sampled_tree_projection_estimated_peak_bytes);
       if (workers == 1) {
         CHECK(stats.sampled_tree_projection_parallel_operations == 0);
+        CHECK(stats.sampled_tree_source_enumeration_parallel_operations == 0);
         baseline = candidates;
         baseline_stats = stats;
       } else {
+        CHECK(source_hook_calls.load(std::memory_order_relaxed) >= 2);
+        CHECK(stats.sampled_tree_source_enumeration_parallel_operations > 0);
+        CHECK(stats.sampled_tree_source_enumeration_ranges >= 2);
+        CHECK(stats.sampled_tree_source_enumeration_worker_tasks >= 2);
+        CHECK(stats.sampled_tree_source_enumeration_active_worker_high_water >=
+              2);
         CHECK(stats.sampled_tree_projection_parallel_operations > 0);
         CHECK(stats.sampled_tree_projection_ranges >= 2);
         CHECK(stats.sampled_tree_projection_worker_tasks >= 2);
@@ -909,7 +963,11 @@ static void test_phase8_grammar_and_hybrid_worker_seed_matrix() {
           CHECK(stats.sampled_tree_projection_moves_preassigned > 0);
           CHECK(stats.sampled_tree_projection_scheduler_operations > 0);
           CHECK(stats.sampled_tree_projection_move_enumeration_visits ==
-                2 * stats.sampled_tree_projection_moves_preassigned);
+                stats.sampled_tree_projection_moves_preassigned);
+          CHECK(stats.sampled_tree_projection_enumeration_passes == 1);
+          CHECK(stats.sampled_tree_source_one_pass_move_visits ==
+                stats.sampled_tree_projection_moves_preassigned);
+          CHECK(stats.sampled_tree_source_waves > 0);
         }
 
         if (workers == 1) {
@@ -1188,6 +1246,11 @@ static void test_phase8_midwave_stop_preserves_legacy_counters() {
   serial_options.sampled_tree_score_threshold = std::numeric_limits<int>::max();
   serial_options.randomize_order = true;
   serial_options.seed = 7;
+  std::vector<std::size_t> serial_source_ordinals;
+  serial_options.before_sampled_tree_source_enumeration_for_tests =
+      [&](std::size_t source_ordinal, std::size_t) {
+        serial_source_ordinals.push_back(source_ordinal);
+      };
 
   std::vector<larch::grammar_spr_candidate> serial_candidates;
   auto serial_stats = larch::for_each_grammar_spr_candidate(
@@ -1201,10 +1264,25 @@ static void test_phase8_midwave_stop_preserves_legacy_counters() {
         larch::chart_spr_candidate_stop_reason::callback_stop);
   CHECK(serial_stats.sampled_tree_projection_peak_wave_size == 1);
   CHECK(serial_stats.sampled_tree_projection_speculative_discarded == 0);
+  CHECK(serial_stats.sampled_tree_source_waves ==
+        serial_stats.sampled_tree_sources_enumerated);
+  CHECK(serial_source_ordinals.size() ==
+        serial_stats.sampled_tree_sources_enumerated);
+  CHECK(!serial_source_ordinals.empty());
+  for (std::size_t i = 0; i < serial_source_ordinals.size(); ++i) {
+    CHECK(serial_source_ordinals[i] == i);
+  }
 
   auto scheduler = make_projection_scheduler(4);
   auto parallel_options = serial_options;
   parallel_options.sampled_tree_projection_scheduler = &scheduler;
+  std::mutex parallel_source_mutex;
+  std::vector<std::size_t> parallel_source_ordinals;
+  parallel_options.before_sampled_tree_source_enumeration_for_tests =
+      [&](std::size_t source_ordinal, std::size_t) {
+        std::lock_guard lock{parallel_source_mutex};
+        parallel_source_ordinals.push_back(source_ordinal);
+      };
   std::vector<larch::grammar_spr_candidate> parallel_candidates;
   auto parallel_stats = larch::for_each_grammar_spr_candidate(
       grammar, parallel_options,
@@ -1218,6 +1296,371 @@ static void test_phase8_midwave_stop_preserves_legacy_counters() {
   check_legacy_generation_stats_equal(serial_stats, parallel_stats);
   CHECK(parallel_stats.sampled_tree_projection_parallel_operations > 0);
   CHECK(parallel_stats.sampled_tree_projection_speculative_discarded > 0);
+  CHECK(parallel_stats.sampled_tree_source_waves == 1);
+  CHECK(parallel_stats.sampled_tree_sources_enumerated == 4);
+  CHECK(parallel_stats.sampled_tree_source_speculative_moves_discarded > 0);
+  std::sort(parallel_source_ordinals.begin(), parallel_source_ordinals.end());
+  CHECK(parallel_source_ordinals == std::vector<std::size_t>({0, 1, 2, 3}));
+  CHECK(scheduler.metrics().pending_tasks == 0);
+
+  std::println("  PASS");
+}
+
+static void test_phase8_source_wave_admission_failure_and_cancellation() {
+  std::println("test_phase8_source_wave_admission_failure_and_cancellation");
+  using larch::chart_spr_detail::estimate_sampled_tree_source_wave_memory;
+  using larch::chart_spr_detail::project_sampled_tree_moves_in_source_waves;
+
+  std::vector<larch::phylo_dag> source_trees;
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree()));
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_cross_tree()));
+  auto source = larch::test::merge_tiny_trees(std::move(source_trees));
+  auto grammar = larch::build_clade_grammar(source);
+
+  larch::grammar_spr_enumeration_options sample_options;
+  sample_options.source = larch::chart_spr_candidate_source::sampled_tree;
+  sample_options.sampled_tree_source_dag = &source;
+  sample_options.sampled_tree_spr_radius = 8;
+  sample_options.sampled_tree_score_threshold = std::numeric_limits<int>::max();
+  sample_options.randomize_order = true;
+  sample_options.seed = 19;
+  std::mt19937 tree_rng(sample_options.seed);
+  auto tree = larch::chart_spr_detail::build_sampled_tree_from_grammar(
+      grammar, sample_options, 0, tree_rng);
+  auto const projection_rng_state = tree_rng;
+  auto prepared =
+      larch::chart_spr_detail::prepare_sampled_tree_projection(grammar, tree);
+  auto const source_count = prepared.index().get_searchable_nodes().size();
+  CHECK(source_count >= 4);
+
+  // E is the irreducible source-width-1/projection-width-1 peak.  E succeeds
+  // and exposes both admitted widths; E-1 rejects before any workspace hook or
+  // scheduler operation.
+  auto exact_scheduler = make_projection_scheduler(4);
+  auto exact_options = sample_options;
+  exact_options.sampled_tree_projection_scheduler = &exact_scheduler;
+  auto const exact_estimate = estimate_sampled_tree_source_wave_memory(
+      prepared, &exact_scheduler, source_count, 1, 1, 0);
+  CHECK(exact_estimate.safely_bounded);
+  auto const exact_budget = exact_estimate.required_peak_bytes;
+  CHECK(exact_budget > 0);
+  exact_options.sampled_tree_projection_memory_budget_bytes = exact_budget;
+  std::size_t exact_workspace_hooks = 0;
+  exact_options.before_sampled_tree_projection_workspace_allocation_for_tests =
+      [&] { ++exact_workspace_hooks; };
+  auto exact_rng = projection_rng_state;
+  std::size_t exact_gather_calls = 0;
+  auto exact = project_sampled_tree_moves_in_source_waves(
+      prepared, exact_options, sample_options.sampled_tree_spr_radius,
+      exact_rng,
+      [&](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+        ++exact_gather_calls;
+        return true;
+      });
+  CHECK(exact_workspace_hooks == 1);
+  CHECK(exact_gather_calls > 0);
+  CHECK(exact.memory.source_wave_size == 1);
+  CHECK(exact.memory.projection_wave_size == 1);
+  CHECK(exact.memory.required_peak_bytes == exact_budget);
+  CHECK(exact.memory.actual_peak_bytes <= exact_budget);
+  CHECK(exact.memory.planned_container_capacity_bytes >=
+        exact.memory.actual_container_capacity_bytes);
+  CHECK(exact.memory.planned_retained_payload_bytes >=
+        exact.memory.actual_retained_payload_bytes);
+  CHECK(exact.move_enumeration_visits == exact.moves_enumerated);
+  CHECK(exact.enumeration_passes == 1);
+
+  auto rejected_scheduler = make_projection_scheduler(4);
+  auto rejected_options = sample_options;
+  rejected_options.sampled_tree_projection_scheduler = &rejected_scheduler;
+  rejected_options.sampled_tree_projection_memory_budget_bytes =
+      exact_budget - 1;
+  std::size_t rejected_workspace_hooks = 0;
+  rejected_options
+      .before_sampled_tree_projection_workspace_allocation_for_tests = [&] {
+    ++rejected_workspace_hooks;
+  };
+  auto rejected_rng = projection_rng_state;
+  bool rejected = false;
+  try {
+    (void)project_sampled_tree_moves_in_source_waves(
+        prepared, rejected_options, sample_options.sampled_tree_spr_radius,
+        rejected_rng,
+        [](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+          return true;
+        });
+  } catch (larch::sampled_tree_projection_budget_error const& error) {
+    rejected = true;
+    CHECK(error.required_bytes() == exact_budget);
+    CHECK(error.budget_bytes() == exact_budget - 1);
+  }
+  CHECK(rejected);
+  CHECK(rejected_workspace_hooks == 0);
+  CHECK(rejected_scheduler.metrics().operations == 0);
+  CHECK(rejected_scheduler.metrics().pool_lifetimes == 0);
+
+  // Simulated actual-capacity underestimation is detected after reserve but
+  // before source shuffle/submission or projection publication.
+  auto backstop_scheduler = make_projection_scheduler(4);
+  auto backstop_options = sample_options;
+  backstop_options.sampled_tree_projection_scheduler = &backstop_scheduler;
+  backstop_options.sampled_tree_projection_memory_budget_bytes = exact_budget;
+  backstop_options
+      .sampled_tree_source_wave_actual_capacity_extra_bytes_for_tests = 1;
+  std::size_t backstop_workspace_hooks = 0;
+  std::atomic<std::size_t> backstop_projection_hooks{0};
+  backstop_options
+      .before_sampled_tree_projection_workspace_allocation_for_tests = [&] {
+    ++backstop_workspace_hooks;
+  };
+  backstop_options.before_sampled_tree_projection_for_tests = [&](std::size_t) {
+    backstop_projection_hooks.fetch_add(1, std::memory_order_relaxed);
+  };
+  auto backstop_rng = projection_rng_state;
+  bool backstop_rejected = false;
+  try {
+    (void)project_sampled_tree_moves_in_source_waves(
+        prepared, backstop_options, sample_options.sampled_tree_spr_radius,
+        backstop_rng,
+        [](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+          return true;
+        });
+  } catch (larch::sampled_tree_projection_budget_error const& error) {
+    backstop_rejected = true;
+    CHECK(error.required_bytes() > exact_budget);
+    CHECK(error.budget_bytes() == exact_budget);
+  }
+  CHECK(backstop_rejected);
+  CHECK(backstop_workspace_hooks == 1);
+  CHECK(backstop_projection_hooks.load(std::memory_order_relaxed) == 0);
+  CHECK(backstop_scheduler.metrics().operations == 0);
+  CHECK(backstop_scheduler.metrics().pool_lifetimes == 0);
+
+  // Per-source caught failures select the lowest canonical source after the
+  // complete wave joins, independent of worker count/completion order.
+  for (auto workers :
+       {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+    auto scheduler = make_projection_scheduler(workers);
+    auto failure_options = sample_options;
+    failure_options.sampled_tree_projection_scheduler = &scheduler;
+    std::latch later_source_started{1};
+    failure_options.before_sampled_tree_source_enumeration_for_tests =
+        [&](std::size_t source_ordinal, std::size_t) {
+          if (source_ordinal == 0) {
+            if (workers > 1) later_source_started.wait();
+            throw std::runtime_error("lowest source ordinal");
+          }
+          if (workers > 1 && source_ordinal == 1) {
+            later_source_started.count_down();
+            throw std::runtime_error("later source ordinal");
+          }
+        };
+    auto failure_rng = projection_rng_state;
+    std::size_t failure_gather_calls = 0;
+    bool stable_failure = false;
+    try {
+      (void)project_sampled_tree_moves_in_source_waves(
+          prepared, failure_options, sample_options.sampled_tree_spr_radius,
+          failure_rng,
+          [&](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+            ++failure_gather_calls;
+            return true;
+          });
+    } catch (std::runtime_error const& error) {
+      stable_failure = std::string{error.what()} == "lowest source ordinal";
+    }
+    CHECK(stable_failure);
+    CHECK(failure_gather_calls == 0);
+    auto metrics = scheduler.metrics();
+    CHECK(metrics.pending_tasks == 0);
+    CHECK(metrics.tasks_submitted == metrics.tasks_completed);
+    CHECK(metrics.tasks_submitted == metrics.tasks_joined);
+  }
+
+  // The product source-wave runner also preserves stable projection-ordinal
+  // failure selection. Invert completion of two projection ranges, publish no
+  // gather result, then reuse the same persistent scheduler successfully.
+  auto projection_failure_scheduler = make_projection_scheduler(4);
+  auto projection_failure_options = sample_options;
+  projection_failure_options.sampled_tree_projection_scheduler =
+      &projection_failure_scheduler;
+  auto const projection_memory =
+      larch::chart_spr_detail::admit_sampled_tree_source_wave_memory(
+          prepared, &projection_failure_scheduler, source_count, 0, 0);
+  auto const projection_plan = projection_failure_scheduler.plan_indexed_ranges(
+      projection_memory.projection_wave_size,
+      {.minimum_grain = 1, .target_ranges_per_worker = 1});
+  CHECK(projection_plan.range_count >= 2);
+  auto const later_projection_ordinal = projection_plan.effective_grain;
+  std::latch later_projection_started{1};
+  projection_failure_options.before_sampled_tree_projection_for_tests =
+      [&](std::size_t ordinal) {
+        if (ordinal == 0) {
+          later_projection_started.wait();
+          throw std::runtime_error("lowest source-wave projection ordinal");
+        }
+        if (ordinal == later_projection_ordinal) {
+          later_projection_started.count_down();
+          throw std::runtime_error("later source-wave projection ordinal");
+        }
+      };
+  auto projection_failure_rng = projection_rng_state;
+  std::size_t projection_failure_gather_calls = 0;
+  bool stable_projection_failure = false;
+  try {
+    (void)project_sampled_tree_moves_in_source_waves(
+        prepared, projection_failure_options,
+        sample_options.sampled_tree_spr_radius, projection_failure_rng,
+        [&](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+          ++projection_failure_gather_calls;
+          return true;
+        });
+  } catch (std::runtime_error const& error) {
+    stable_projection_failure =
+        std::string{error.what()} == "lowest source-wave projection ordinal";
+  }
+  CHECK(stable_projection_failure);
+  CHECK(projection_failure_gather_calls == 0);
+  auto projection_failure_metrics = projection_failure_scheduler.metrics();
+  CHECK(projection_failure_metrics.pending_tasks == 0);
+  CHECK(projection_failure_metrics.tasks_submitted ==
+        projection_failure_metrics.tasks_completed);
+  CHECK(projection_failure_metrics.tasks_submitted ==
+        projection_failure_metrics.tasks_joined);
+
+  projection_failure_options.before_sampled_tree_projection_for_tests = {};
+  auto projection_recovery_rng = projection_rng_state;
+  std::size_t projection_recovery_gather_calls = 0;
+  auto projection_recovery = project_sampled_tree_moves_in_source_waves(
+      prepared, projection_failure_options,
+      sample_options.sampled_tree_spr_radius, projection_recovery_rng,
+      [&](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+        ++projection_recovery_gather_calls;
+        return true;
+      });
+  CHECK(!projection_recovery.cancelled);
+  CHECK(projection_recovery_gather_calls > 0);
+  auto projection_recovery_metrics = projection_failure_scheduler.metrics();
+  CHECK(projection_recovery_metrics.pending_tasks == 0);
+  CHECK(projection_recovery_metrics.tasks_submitted ==
+        projection_recovery_metrics.tasks_completed);
+  CHECK(projection_recovery_metrics.tasks_submitted ==
+        projection_recovery_metrics.tasks_joined);
+
+  // External cancellation drains the launched source wave and publishes no
+  // partially projected ordinal.
+  auto cancel_scheduler = make_projection_scheduler(4);
+  auto cancel_options = sample_options;
+  cancel_options.sampled_tree_projection_scheduler = &cancel_scheduler;
+  std::atomic<bool> cancel_requested{false};
+  cancel_options.sampled_tree_projection_cancel_requested = &cancel_requested;
+  cancel_options.before_sampled_tree_source_enumeration_for_tests =
+      [&](std::size_t source_ordinal, std::size_t) {
+        if (source_ordinal == 0) {
+          cancel_requested.store(true, std::memory_order_release);
+        }
+      };
+  auto cancel_rng = projection_rng_state;
+  std::size_t cancel_gather_calls = 0;
+  auto cancelled = project_sampled_tree_moves_in_source_waves(
+      prepared, cancel_options, sample_options.sampled_tree_spr_radius,
+      cancel_rng,
+      [&](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+        ++cancel_gather_calls;
+        return true;
+      });
+  CHECK(cancelled.cancelled);
+  CHECK(cancel_gather_calls == 0);
+  CHECK(cancelled.source_waves == 1);
+  CHECK(cancelled.projection_waves == 0);
+  CHECK(cancel_scheduler.metrics().pending_tasks == 0);
+  CHECK(cancel_scheduler.metrics().tasks_submitted ==
+        cancel_scheduler.metrics().tasks_completed);
+  CHECK(cancel_scheduler.metrics().tasks_submitted ==
+        cancel_scheduler.metrics().tasks_joined);
+
+  // Submission failure is one-shot, joins the accepted runner, and gathers
+  // nothing from the failed source operation.
+  auto submit_scheduler = make_projection_scheduler(4);
+  auto submit_options = sample_options;
+  submit_options.sampled_tree_projection_scheduler = &submit_scheduler;
+  submit_options.force_sampled_tree_projection_submit_failure_after_for_tests =
+      1;
+  auto submit_before = submit_scheduler.metrics();
+  auto submit_rng = projection_rng_state;
+  std::size_t submit_gather_calls = 0;
+  bool submit_failed = false;
+  try {
+    (void)project_sampled_tree_moves_in_source_waves(
+        prepared, submit_options, sample_options.sampled_tree_spr_radius,
+        submit_rng,
+        [&](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+          ++submit_gather_calls;
+          return true;
+        });
+  } catch (larch::chart_scheduler_submit_error const&) {
+    submit_failed = true;
+  }
+  CHECK(submit_failed);
+  CHECK(submit_gather_calls == 0);
+  auto submit_after = submit_scheduler.metrics();
+  CHECK(submit_after.tasks_submitted - submit_before.tasks_submitted == 1);
+  CHECK(submit_after.tasks_completed - submit_before.tasks_completed == 1);
+  CHECK(submit_after.tasks_joined - submit_before.tasks_joined == 1);
+  CHECK(submit_after.pending_tasks == 0);
+
+  std::println("  PASS");
+}
+
+static void test_phase8_named_source_wave_stops_near_candidate_cap() {
+  std::println("test_phase8_named_source_wave_stops_near_candidate_cap");
+
+  auto dag = larch::load_proto_dag("data/test_5_trees/tree_0.pb.gz");
+  larch::polytomy_refinement_options refinement_options;
+  refinement_options.mode = larch::polytomy_mode::expand_soft_bounded;
+  refinement_options.max_shapes_per_polytomy = 1;
+  auto refinement = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, refinement_options);
+  larch::require_polytomy_refinement_binary_charting(
+      refinement.audit, "phase8 named sampled-generation-high fixture");
+  auto grammar = std::move(refinement.grammar);
+  auto scheduler = make_projection_scheduler(1);
+  larch::grammar_spr_enumeration_options options;
+  options.source = larch::chart_spr_candidate_source::sampled_tree;
+  options.sampled_tree_source_dag = &dag;
+  options.sampled_tree_count = 1;
+  options.sampled_tree_spr_radius = 0;
+  options.sampled_tree_score_threshold = std::numeric_limits<int>::max();
+  options.max_candidates = 256;
+  options.max_candidates_is_post_dedup = true;
+  options.seed = 1;
+  options.sampled_tree_projection_scheduler = &scheduler;
+
+  larch::chart_spr_candidate_generation_stats stats;
+  auto candidates = collect_candidates(grammar, options, &stats);
+  CHECK(candidates.size() == 256);
+  CHECK(stats.stop_reason ==
+        larch::chart_spr_candidate_stop_reason::candidate_cap);
+  CHECK(stats.sampled_tree_projection_enumeration_passes == 1);
+  CHECK(stats.sampled_tree_projection_move_enumeration_visits ==
+        stats.sampled_tree_projection_moves_preassigned);
+  CHECK(stats.sampled_tree_source_one_pass_move_visits ==
+        stats.sampled_tree_projection_moves_preassigned);
+  // The recorded unsealed diagnostic at 51702c7 globally preassigned 16,454
+  // moves and visited them twice. W1 now finishes the current source but never
+  // starts the next source after the cap, keeping work close to the 396
+  // projections historically consumed to emit these 256 candidates.
+  CHECK(stats.sampled_tree_projection_moves_preassigned < 4096);
+  CHECK(stats.sampled_tree_sources_enumerated < dag.node_high_mark());
+  CHECK(stats.sampled_tree_source_waves ==
+        stats.sampled_tree_sources_enumerated);
+  CHECK(stats.sampled_tree_source_admitted_wave_width == 1);
+  CHECK(stats.sampled_tree_source_peak_wave_size == 1);
+  CHECK(stats.sampled_tree_projection_admitted_subwave_width == 4);
+  CHECK(stats.sampled_tree_projection_peak_wave_size == 4);
+  CHECK(stats.sampled_tree_source_speculative_moves_discarded > 0);
   CHECK(scheduler.metrics().pending_tasks == 0);
 
   std::println("  PASS");
@@ -1421,6 +1864,8 @@ int main() {
   test_phase8_grammar_and_hybrid_worker_seed_matrix();
   test_phase8_projection_budget_and_failure_atomicity();
   test_phase8_midwave_stop_preserves_legacy_counters();
+  test_phase8_source_wave_admission_failure_and_cancellation();
+  test_phase8_named_source_wave_stops_near_candidate_cap();
   test_phase6_randomized_and_reservoir_enumeration();
   test_phase6_stable_taxon_dedup_across_equivalent_builds();
   test_phase6_sampled_tree_and_hybrid_sources();

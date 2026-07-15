@@ -8585,10 +8585,15 @@ static void test_sampled_tree_fixed_topology_uses_source_certificate() {
       0);
   CHECK(iteration.candidate_generation
             .sampled_tree_projection_scheduler_operations > 0);
+  CHECK(
+      iteration.candidate_generation
+          .sampled_tree_projection_move_enumeration_visits ==
+      iteration.candidate_generation.sampled_tree_projection_moves_preassigned);
   CHECK(iteration.candidate_generation
-            .sampled_tree_projection_move_enumeration_visits ==
-        2 * iteration.candidate_generation
-                .sampled_tree_projection_moves_preassigned);
+            .sampled_tree_projection_enumeration_passes == 1);
+  CHECK(
+      iteration.candidate_generation.sampled_tree_source_one_pass_move_visits ==
+      iteration.candidate_generation.sampled_tree_projection_moves_preassigned);
   CHECK(iteration.candidates_exact_verified > 0);
   CHECK(iteration.accepted.has_value());
   CHECK(iteration.accepted->candidate.source_tree_move.has_value());
