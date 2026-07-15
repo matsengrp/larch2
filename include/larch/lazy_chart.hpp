@@ -178,10 +178,12 @@ inline void validate_patterns(clade_grammar const& grammar,
           " leaf state count does not match grammar taxon count");
     }
     for (std::size_t tid = 0; tid < pattern.state_by_taxon.size(); ++tid) {
-      parsimony_chart_detail::validate_state(
-          pattern.state_by_taxon[tid],
-          "lazy chart pattern " + std::to_string(pattern_index) + " taxon " +
-              std::to_string(tid));
+      auto const state = pattern.state_by_taxon[tid];
+      if (state >= nuc_state_count) {
+        parsimony_chart_detail::validate_state(
+            state, "lazy chart pattern " + std::to_string(pattern_index) +
+                       " taxon " + std::to_string(tid));
+      }
     }
   }
 }
@@ -206,10 +208,12 @@ inline void validate_patterns(chart_execution_plan const& plan,
           " leaf state count does not match execution plan taxon count");
     }
     for (std::size_t tid = 0; tid < pattern.state_by_taxon.size(); ++tid) {
-      parsimony_chart_detail::validate_state(
-          pattern.state_by_taxon[tid],
-          "lazy chart pattern " + std::to_string(pattern_index) + " taxon " +
-              std::to_string(tid));
+      auto const state = pattern.state_by_taxon[tid];
+      if (state >= nuc_state_count) {
+        parsimony_chart_detail::validate_state(
+            state, "lazy chart pattern " + std::to_string(pattern_index) +
+                       " taxon " + std::to_string(tid));
+      }
     }
   }
 }
