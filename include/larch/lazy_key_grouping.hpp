@@ -367,6 +367,10 @@ class packed_key_grouping_workspace {
     merge_buffer_.clear();
   }
 
+  [[nodiscard]] bool sizes_empty() const noexcept {
+    return sort_order_.empty() && merge_buffer_.empty();
+  }
+
   void swap(packed_key_grouping_workspace& other) noexcept {
     sort_order_.swap(other.sort_order_);
     merge_buffer_.swap(other.merge_buffer_);

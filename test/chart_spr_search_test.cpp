@@ -1877,6 +1877,288 @@ static void test_pattern_batch_cache_options_match_all_cache() {
   std::println("  PASS");
 }
 
+static void test_lazy_local_packed_context_grouping_reuses_scratch() {
+  std::println("test_lazy_local_packed_context_grouping_reuses_scratch");
+
+  auto fixture = make_fixture();
+  larch::site_pattern_set patterns;
+  patterns.taxon_count = 4;
+  auto append_pattern = [&](std::array<std::uint8_t, 4> states,
+                            std::uint32_t weight,
+                            std::array<std::uint32_t, larch::nuc_state_count>
+                                reference_state_counts) {
+    patterns.patterns.push_back(larch::site_pattern{
+        .state_by_taxon = {states.begin(), states.end()},
+        .weight = weight,
+        .reference_state_counts = reference_state_counts,
+    });
+  };
+  // A full-rank modular permutation makes later patterns recombine class IDs
+  // first introduced by earlier patterns, so first-occurrence class numbering
+  // is observably different from lexicographic traversal.  Exact duplicates
+  // at the tail carry different weights/reference states and force merged
+  // context accumulation.
+  for (std::size_t input = 0; patterns.patterns.size() < 64; ++input) {
+    auto code = (input * 73 + 19) % 256;
+    std::array<std::uint8_t, 4> states{};
+    auto remaining = code;
+    for (auto& state : states) {
+      state = static_cast<std::uint8_t>(remaining % larch::nuc_state_count);
+      remaining /= larch::nuc_state_count;
+    }
+    if (std::ranges::all_of(states,
+                            [&](auto state) { return state == states[0]; })) {
+      continue;
+    }
+    auto const weight = static_cast<std::uint32_t>(input % 5 + 1);
+    std::array<std::uint32_t, larch::nuc_state_count> reference_counts{};
+    reference_counts[(code / 7) % larch::nuc_state_count] = weight;
+    append_pattern(states, weight, reference_counts);
+  }
+  for (std::size_t duplicate = 0; duplicate < 8; ++duplicate) {
+    std::array<std::uint8_t, 4> states{};
+    std::ranges::copy(patterns.patterns[duplicate].state_by_taxon,
+                      states.begin());
+    auto const weight = static_cast<std::uint32_t>(duplicate + 7);
+    std::array<std::uint32_t, larch::nuc_state_count> reference_counts{};
+    reference_counts[(duplicate + 1) % larch::nuc_state_count] = weight;
+    append_pattern(states, weight, reference_counts);
+  }
+
+  larch::chart_options chart_options;
+  chart_options.score_ua_edge = true;
+  auto active_build =
+      larch::make_active_search_patterns(patterns, chart_options);
+  larch::chart_cache_options cache_options;
+  cache_options.use_lazy_multisite_chart = true;
+  auto state = larch::build_chart_spr_search_state_from_active(
+      fixture.dag, fixture.grammar, std::move(active_build), chart_options,
+      false, {}, cache_options);
+  CHECK(state.cache_strategy ==
+        larch::chart_spr_cache_strategy::lazy_multisite_chart);
+  CHECK(state.active_patterns.patterns.patterns.size() ==
+        patterns.patterns.size());
+
+  auto const candidate_it = std::max_element(
+      fixture.candidates.begin(), fixture.candidates.end(),
+      [](auto const& lhs, auto const& rhs) {
+        return larch::chart_spr_detail::estimate_candidate_affected_clades(
+                   lhs) <
+               larch::chart_spr_detail::estimate_candidate_affected_clades(rhs);
+      });
+  CHECK(candidate_it != fixture.candidates.end());
+  auto const& candidate = *candidate_it;
+
+  larch::chart_spr_search_counters counters;
+  larch::chart_spr_local_score_scratch scratch;
+  auto run_once = [&] {
+    auto prepared =
+        larch::chart_spr_search_detail::prepare_local_candidate_score(
+            state, candidate, {}, &counters);
+    CHECK(prepared.valid_for_accumulation);
+    larch::chart_spr_search_detail::accumulate_prepared_local_candidate_lazy(
+        state, prepared, {}, &counters, scratch);
+    CHECK(prepared.valid_for_accumulation);
+    auto score =
+        larch::chart_spr_search_detail::finish_prepared_local_candidate_score(
+            state, prepared);
+    prepared.release_operation_borrows();
+    return score;
+  };
+
+  auto first = run_once();
+  CHECK(first.valid);
+  CHECK(!scratch.lazy_context_key_words.empty());
+  CHECK(!scratch.lazy_context_grouping_result.class_by_input.empty());
+  CHECK(scratch.lazy_context_grouping_result.class_count() ==
+        scratch.lazy_contexts.size());
+  CHECK(scratch.lazy_context_grouping_result.class_count() <
+        patterns.patterns.size());
+
+  // Reconstruct the former vector<size_t>-key ordered map independently from
+  // the packed adapter.  This covers component order, first representatives,
+  // input-order accumulation, and lexicographic class traversal together.
+  auto oracle_prepared =
+      larch::chart_spr_search_detail::prepare_local_candidate_score(
+          state, candidate, {}, nullptr);
+  CHECK(oracle_prepared.valid_for_accumulation);
+  auto const& delta = oracle_prepared.delta();
+  auto const& lazy = *state.lazy_chart;
+  auto const& active_patterns = state.active_patterns.patterns.patterns;
+  std::map<std::vector<std::size_t>, std::vector<std::size_t>> old_groups;
+  for (std::size_t pattern_index = 0; pattern_index < active_patterns.size();
+       ++pattern_index) {
+    std::vector<std::size_t> key;
+    key.push_back(
+        larch::chart_spr_search_detail::lazy_overlay_inside_class_index(
+            lazy, state.grammar.root_clade, pattern_index));
+    auto append_component = [&](larch::overlay_clade_ref clade,
+                                larch::taxon_id leaf_taxon) {
+      if (clade.space == larch::overlay_id_space::base) {
+        key.push_back(
+            larch::chart_spr_search_detail::lazy_overlay_inside_class_index(
+                lazy, clade.id, pattern_index));
+      }
+      if (leaf_taxon != larch::chart_plan_no_taxon) {
+        key.push_back(
+            active_patterns[pattern_index].state_by_taxon[leaf_taxon]);
+      }
+    };
+    for (auto const& row : delta.compiled_rows) {
+      append_component(row.clade, row.leaf_taxon);
+      for (auto const& production :
+           larch::chart_spr_search_detail::candidate_chart_productions_for_row(
+               delta, row)) {
+        for (auto const& child :
+             larch::chart_spr_search_detail::candidate_chart_children(
+                 delta, production)) {
+          append_component(child.clade, child.leaf_taxon);
+        }
+      }
+    }
+    CHECK(
+        key.size() ==
+        larch::chart_spr_search_detail::lazy_overlay_context_key_width(delta));
+    old_groups[std::move(key)].push_back(pattern_index);
+  }
+
+  auto const& grouping = scratch.lazy_context_grouping_result;
+  std::vector<std::size_t> expected_lexicographic_class_order;
+  expected_lexicographic_class_order.reserve(old_groups.size());
+  bool saw_merged_context = false;
+  for (auto const& [key, members] : old_groups) {
+    (void)key;
+    CHECK(!members.empty());
+    auto const class_id = grouping.class_by_input[members.front()];
+    CHECK(class_id < grouping.class_count());
+    expected_lexicographic_class_order.push_back(class_id);
+    CHECK(grouping.representative_by_class[class_id] == members.front());
+    CHECK(std::ranges::equal(grouping.members_for_class(class_id), members));
+    saw_merged_context = saw_merged_context || members.size() > 1;
+
+    larch::lazy_overlay_context_accumulator expected;
+    expected.representative = members.front();
+    for (auto pattern_index : members) {
+      auto const& pattern = active_patterns[pattern_index];
+      expected.weight += pattern.weight;
+      for (std::size_t state_index = 0; state_index < larch::nuc_state_count;
+           ++state_index) {
+        expected.reference_state_counts[state_index] +=
+            pattern.reference_state_counts[state_index];
+      }
+    }
+    CHECK(scratch.lazy_contexts[class_id].representative ==
+          expected.representative);
+    CHECK(scratch.lazy_contexts[class_id].weight == expected.weight);
+    CHECK(scratch.lazy_contexts[class_id].reference_state_counts ==
+          expected.reference_state_counts);
+  }
+  CHECK(saw_merged_context);
+  CHECK(grouping.lexicographic_class_order ==
+        expected_lexicographic_class_order);
+  bool lexicographic_order_differs_from_class_ids = false;
+  for (std::size_t index = 0; index < grouping.lexicographic_class_order.size();
+       ++index) {
+    lexicographic_order_differs_from_class_ids =
+        lexicographic_order_differs_from_class_ids ||
+        grouping.lexicographic_class_order[index] != index;
+  }
+  CHECK(lexicographic_order_differs_from_class_ids);
+  oracle_prepared.release_operation_borrows();
+
+  auto const first_grouping = scratch.lazy_context_grouping_result;
+  auto const key_capacity = scratch.lazy_context_key_words.capacity();
+  auto const grouping_workspace_capacities =
+      scratch.lazy_context_grouping_workspace.capacity_by_buffer();
+  auto const grouping_result_capacities =
+      scratch.lazy_context_grouping_result.capacity_by_buffer();
+  auto const context_capacity = scratch.lazy_contexts.capacity();
+
+  scratch.clear_borrows();
+  CHECK(scratch.operation_boundary_clean());
+  auto second = run_once();
+  CHECK(second.valid);
+  CHECK(scratch.lazy_context_grouping_result == first_grouping);
+  CHECK(scratch.lazy_context_key_words.capacity() == key_capacity);
+  CHECK(scratch.lazy_context_grouping_workspace.capacity_by_buffer() ==
+        grouping_workspace_capacities);
+  CHECK(scratch.lazy_context_grouping_result.capacity_by_buffer() ==
+        grouping_result_capacities);
+  CHECK(scratch.lazy_contexts.capacity() == context_capacity);
+  CHECK(second.lower_bound.value.old_score ==
+        first.lower_bound.value.old_score);
+  CHECK(second.lower_bound.value.new_score ==
+        first.lower_bound.value.new_score);
+  CHECK(second.lower_bound.value.delta == first.lower_bound.value.delta);
+
+  auto oracle = larch::score_multisite_spr_candidate_lower_bound_oracle(
+      fixture.grammar, patterns, candidate, chart_options);
+  CHECK(first.lower_bound.value.old_score == oracle.old_score);
+  CHECK(first.lower_bound.value.new_score == oracle.new_score);
+  CHECK(first.lower_bound.value.delta == oracle.delta);
+  scratch.clear_borrows();
+  CHECK(scratch.operation_boundary_clean());
+
+  CHECK(fixture.candidates.size() >= 4);
+  std::vector<larch::grammar_spr_candidate> candidates(
+      fixture.candidates.begin(), fixture.candidates.begin() + 4);
+  std::vector<larch::chart_spr_local_score_result> w1(candidates.size());
+  std::vector<larch::chart_spr_local_score_result> w4(candidates.size());
+  larch::chart_spr_local_score_workspace w1_workspace;
+  larch::chart_spr_local_score_workspace w4_workspace;
+  larch::score_candidates_locally_into(state, candidates, w1, w1_workspace, {},
+                                       1);
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 1,
+  }};
+  larch::local_score_worker_barrier_for_tests barrier;
+  larch::local_spr_score_options parallel_options;
+  parallel_options.worker_barrier_for_tests = &barrier;
+  auto checked =
+      larch::check_chart_execution_plan(state.grammar, state.execution_plan);
+  larch::score_candidates_locally_into(state, candidates, w4, w4_workspace,
+                                       parallel_options, scheduler, checked);
+  CHECK(barrier.release.load());
+  CHECK(barrier.started.load() >= 4);
+  CHECK(w1_workspace.operation_boundary_clean());
+  CHECK(w4_workspace.operation_boundary_clean());
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    CHECK(w4[index].valid == w1[index].valid);
+    CHECK(w4[index].lower_bound.value.old_score ==
+          w1[index].lower_bound.value.old_score);
+    CHECK(w4[index].lower_bound.value.new_score ==
+          w1[index].lower_bound.value.new_score);
+    CHECK(w4[index].lower_bound.value.delta ==
+          w1[index].lower_bound.value.delta);
+    auto candidate_oracle =
+        larch::score_multisite_spr_candidate_lower_bound_oracle(
+            fixture.grammar, patterns, candidates[index], chart_options);
+    CHECK(w4[index].lower_bound.value.old_score == candidate_oracle.old_score);
+    CHECK(w4[index].lower_bound.value.new_score == candidate_oracle.new_score);
+    CHECK(w4[index].lower_bound.value.delta == candidate_oracle.delta);
+  }
+  for (std::size_t worker = 0; worker < 4; ++worker) {
+    auto const& worker_scratch =
+        larch::chart_spr_search_detail::local_score_workspace_access::worker(
+            w4_workspace, worker)
+            .scratch;
+    CHECK(worker_scratch.operation_boundary_clean());
+    CHECK(worker_scratch.lazy_context_key_words.capacity() >=
+          patterns.patterns.size());
+    CHECK(worker_scratch.lazy_context_grouping_workspace.has_capacity_for(
+        patterns.patterns.size()));
+    CHECK(
+        worker_scratch.lazy_context_grouping_result.has_worst_case_capacity_for(
+            patterns.patterns.size()));
+    CHECK(worker_scratch.lazy_contexts.capacity() > 0);
+  }
+  scheduler.shutdown();
+
+  std::println("  PASS");
+}
+
 static void check_local_result_matches_owned_score(
     larch::chart_spr_local_score_result const& local,
     larch::chart_spr_candidate_score const& owned) {
@@ -9186,6 +9468,7 @@ int main() {
   test_semantic_capture_reuses_primary_exact_provenance();
   test_primary_provenance_capture_failure_is_hard_error();
   test_pattern_batch_cache_options_match_all_cache();
+  test_lazy_local_packed_context_grouping_reuses_scratch();
   test_local_score_into_workspace_contract();
   test_pattern_batch_into_parallel_scratch_plateau();
   test_candidate_execution_plan_lifetime_and_mismatch_guards();

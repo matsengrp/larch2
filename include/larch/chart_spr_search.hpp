@@ -4,6 +4,7 @@
 #include <larch/chart_scheduler.hpp>
 #include <larch/chart_spr_semantic_report.hpp>
 #include <larch/lazy_chart.hpp>
+#include <larch/lazy_key_grouping.hpp>
 
 #include <algorithm>
 #include <array>
@@ -5334,16 +5335,39 @@ struct chart_spr_local_score_result {
   std::string invalid_reason;
 };
 
+struct lazy_overlay_context_accumulator {
+  std::size_t representative = no_site_pattern;
+  std::uint64_t weight = 0;
+  std::array<std::uint64_t, nuc_state_count> reference_state_counts{};
+};
+
 struct chart_spr_local_score_scratch {
   local_overlay_chart_rows rows;
+  std::vector<lazy_key_grouping_detail::packed_key_word> lazy_context_key_words;
+  lazy_key_grouping_detail::packed_key_grouping_workspace
+      lazy_context_grouping_workspace;
+  lazy_key_grouping_detail::packed_key_grouping_result
+      lazy_context_grouping_result;
+  std::vector<lazy_overlay_context_accumulator> lazy_contexts;
 
   void clear_borrows() noexcept {
     rows.base_row_slot = {};
     rows.temp_row_slot = {};
+    lazy_context_key_words.clear();
+    lazy_context_grouping_workspace.clear_sizes();
+    lazy_context_grouping_result.clear_sizes();
+    lazy_contexts.clear();
   }
 
   [[nodiscard]] bool operation_boundary_clean() const noexcept {
-    return rows.base_row_slot.empty() && rows.temp_row_slot.empty();
+    return rows.base_row_slot.empty() && rows.temp_row_slot.empty() &&
+           lazy_context_key_words.empty() && lazy_contexts.empty() &&
+           lazy_context_grouping_workspace.sizes_empty() &&
+           lazy_context_grouping_result.class_by_input.empty() &&
+           lazy_context_grouping_result.representative_by_class.empty() &&
+           lazy_context_grouping_result.member_offsets_by_class.empty() &&
+           lazy_context_grouping_result.members_by_class.empty() &&
+           lazy_context_grouping_result.lexicographic_class_order.empty();
   }
 };
 
@@ -6113,54 +6137,88 @@ inline std::size_t lazy_overlay_inside_class_index(
 
 inline void append_lazy_overlay_leaf_state(
     std::vector<site_pattern> const& patterns, taxon_id taxon,
-    std::size_t pattern, std::vector<std::size_t>& key) {
+    std::size_t pattern,
+    std::vector<lazy_key_grouping_detail::packed_key_word>& key) {
   if (taxon == chart_plan_no_taxon) return;
   if (pattern >= patterns.size() ||
       taxon >= patterns[pattern].state_by_taxon.size()) {
     throw std::runtime_error(
         "chart SPR lazy local score: leaf state key out of range");
   }
-  key.push_back(patterns[pattern].state_by_taxon[taxon]);
+  key.push_back(lazy_key_grouping_detail::checked_packed_key_word(
+      patterns[pattern].state_by_taxon[taxon],
+      "chart SPR lazy local leaf-state key"));
 }
 
 inline void append_lazy_overlay_base_class(
     lazy_multisite_chart const& lazy, overlay_clade_ref ref,
-    std::size_t pattern, std::vector<std::size_t>& key) {
+    std::size_t pattern,
+    std::vector<lazy_key_grouping_detail::packed_key_word>& key) {
   if (ref.space != overlay_id_space::base) return;
-  key.push_back(lazy_overlay_inside_class_index(lazy, ref.id, pattern));
+  key.push_back(lazy_key_grouping_detail::checked_packed_key_word(
+      lazy_overlay_inside_class_index(lazy, ref.id, pattern),
+      "chart SPR lazy local inside-class key"));
 }
 
-inline std::vector<std::size_t> lazy_overlay_context_key(
+inline std::size_t lazy_overlay_context_key_width(
+    spr_overlay_delta const& delta) {
+  using lazy_key_grouping_detail::checked_packed_key_count_add;
+  std::size_t width = 1;  // Base root class.
+  auto add_optional_components = [&](overlay_clade_ref clade,
+                                     taxon_id leaf_taxon) {
+    if (clade.space == overlay_id_space::base) {
+      width = checked_packed_key_count_add(
+          width, 1, "chart SPR lazy local context-key width");
+    }
+    if (leaf_taxon != chart_plan_no_taxon) {
+      width = checked_packed_key_count_add(
+          width, 1, "chart SPR lazy local context-key width");
+    }
+  };
+  for (auto const& row : delta.compiled_rows) {
+    add_optional_components(row.clade, row.leaf_taxon);
+    for (auto const& production :
+         candidate_chart_productions_for_row(delta, row)) {
+      for (auto const& child : candidate_chart_children(delta, production)) {
+        add_optional_components(child.clade, child.leaf_taxon);
+      }
+    }
+  }
+  return width;
+}
+
+inline void append_lazy_overlay_context_key(
     chart_spr_search_state const& state, spr_overlay_delta const& delta,
-    std::size_t pattern) {
+    std::size_t pattern,
+    std::vector<lazy_key_grouping_detail::packed_key_word>& key_words) {
   if (!state.lazy_chart) {
     throw std::runtime_error("chart SPR lazy local score: missing lazy chart");
   }
   auto const& lazy = *state.lazy_chart;
   auto const& patterns = state.active_patterns.patterns.patterns;
-  std::vector<std::size_t> key;
-  key.reserve(delta.affected_order.size() * 4 + 1);
-  key.push_back(lazy_overlay_inside_class_index(
-      lazy, state.grammar.root_clade, pattern));
+  key_words.push_back(lazy_key_grouping_detail::checked_packed_key_word(
+      lazy_overlay_inside_class_index(lazy, state.grammar.root_clade, pattern),
+      "chart SPR lazy local root-class key"));
 
   auto append_children =
       [&](std::span<candidate_chart_child_descriptor const> children) {
-    for (auto const& child : children) {
-      append_lazy_overlay_base_class(lazy, child.clade, pattern, key);
-      append_lazy_overlay_leaf_state(patterns, child.leaf_taxon, pattern, key);
-    }
-  };
+        for (auto const& child : children) {
+          append_lazy_overlay_base_class(lazy, child.clade, pattern, key_words);
+          append_lazy_overlay_leaf_state(patterns, child.leaf_taxon, pattern,
+                                         key_words);
+        }
+      };
 
   for (auto const& row : delta.compiled_rows) {
     auto ref = row.clade;
-    append_lazy_overlay_base_class(lazy, ref, pattern, key);
-    append_lazy_overlay_leaf_state(patterns, row.leaf_taxon, pattern, key);
+    append_lazy_overlay_base_class(lazy, ref, pattern, key_words);
+    append_lazy_overlay_leaf_state(patterns, row.leaf_taxon, pattern,
+                                   key_words);
     for (auto const& production :
          candidate_chart_productions_for_row(delta, row)) {
       append_children(candidate_chart_children(delta, production));
     }
   }
-  return key;
 }
 
 struct lazy_overlay_row_provider {
@@ -6207,12 +6265,6 @@ struct lazy_overlay_row_provider {
   }
 };
 
-struct lazy_overlay_context_accumulator {
-  std::size_t representative = no_site_pattern;
-  std::uint64_t weight = 0;
-  std::array<std::uint64_t, nuc_state_count> reference_state_counts{};
-};
-
 inline std::uint64_t lazy_overlay_weighted_root_score(
     std::array<chart_cost, nuc_state_count> const& root_row,
     lazy_overlay_context_accumulator const& context,
@@ -6230,11 +6282,10 @@ inline std::uint64_t lazy_overlay_weighted_root_score(
     chart_cost best = chart_inf;
     for (std::uint8_t root_state = 0; root_state < nuc_state_count;
          ++root_state) {
-      best = std::min(
-          best, parsimony_chart_detail::saturated_add(
-                    root_row[root_state],
-                    parsimony_chart_detail::transition_cost(reference_state,
-                                                            root_state)));
+      best = std::min(best, parsimony_chart_detail::saturated_add(
+                                root_row[root_state],
+                                parsimony_chart_detail::transition_cost(
+                                    reference_state, root_state)));
     }
     total = chart_multisite_detail::checked_add_u64(
         total,
@@ -6252,8 +6303,8 @@ inline void accumulate_prepared_local_candidate_lazy(
     chart_spr_local_score_scratch& scratch,
     checked_chart_execution_plan_ref const& checked_state) {
   if (!prepared.valid_for_accumulation) return;
-  if (!validate_prepared_candidate_plan_identity(
-          state, prepared, counters, checked_state)) {
+  if (!validate_prepared_candidate_plan_identity(state, prepared, counters,
+                                                 checked_state)) {
     return;
   }
   auto const& delta = prepared.delta();
@@ -6278,19 +6329,62 @@ inline void accumulate_prepared_local_candidate_lazy(
   }
 
   auto const& patterns = state.active_patterns.patterns.patterns;
-  std::map<std::vector<std::size_t>, lazy_overlay_context_accumulator>
-      contexts;
   try {
+    auto const key_width = lazy_overlay_context_key_width(delta);
+    auto const word_count =
+        lazy_key_grouping_detail::checked_packed_key_count_multiply(
+            patterns.size(), key_width,
+            "chart SPR lazy local packed context keys");
+    (void)lazy_key_grouping_detail::prepare_packed_key_word_buffer(
+        word_count, scratch.lazy_context_key_words);
+    scratch.lazy_context_key_words.clear();
     for (std::size_t pattern_index = 0; pattern_index < patterns.size();
          ++pattern_index) {
       if (counters != nullptr) {
         ++counters->candidate_execution_plan_cache_hits;
       }
-      auto key = lazy_overlay_context_key(state, delta, pattern_index);
-      auto [it, inserted] = contexts.emplace(
-          std::move(key), lazy_overlay_context_accumulator{});
-      auto& context = it->second;
-      if (inserted) context.representative = pattern_index;
+      append_lazy_overlay_context_key(state, delta, pattern_index,
+                                      scratch.lazy_context_key_words);
+      auto const expected_words = (pattern_index + 1) * key_width;
+      if (scratch.lazy_context_key_words.size() != expected_words) {
+        throw std::logic_error(
+            "chart SPR lazy local score: inconsistent context-key width");
+      }
+    }
+
+    auto const grouping_preparation =
+        lazy_key_grouping_detail::prepare_packed_key_grouping_storage(
+            patterns.size(), scratch.lazy_context_grouping_workspace,
+            scratch.lazy_context_grouping_result);
+    auto const grouping_status =
+        lazy_key_grouping_detail::try_group_packed_keys_prepared(
+            lazy_key_grouping_detail::packed_key_matrix_view{
+                .key_count = patterns.size(),
+                .key_width = key_width,
+                .words = scratch.lazy_context_key_words,
+            },
+            scratch.lazy_context_grouping_workspace,
+            scratch.lazy_context_grouping_result,
+            grouping_preparation.prepared_owned_capacity_resident_bytes);
+    if (!grouping_status.succeeded()) {
+      lazy_key_grouping_detail::throw_packed_key_grouping_prepared_failure(
+          grouping_status);
+    }
+    auto const& grouping = scratch.lazy_context_grouping_result;
+    scratch.lazy_contexts.resize(grouping.class_count());
+    std::fill(scratch.lazy_contexts.begin(), scratch.lazy_contexts.end(),
+              lazy_overlay_context_accumulator{});
+    for (std::size_t pattern_index = 0; pattern_index < patterns.size();
+         ++pattern_index) {
+      auto const class_id = grouping.class_by_input[pattern_index];
+      if (class_id >= scratch.lazy_contexts.size()) {
+        throw std::logic_error(
+            "chart SPR lazy local score: context class out of range");
+      }
+      auto& context = scratch.lazy_contexts[class_id];
+      if (context.representative == no_site_pattern) {
+        context.representative = pattern_index;
+      }
       auto const& pattern = patterns[pattern_index];
       context.weight = chart_multisite_detail::checked_add_u64(
           context.weight, pattern.weight,
@@ -6305,8 +6399,12 @@ inline void accumulate_prepared_local_candidate_lazy(
       }
     }
 
-    for (auto const& [key, context] : contexts) {
-      (void)key;
+    for (auto class_id : grouping.lexicographic_class_order) {
+      if (class_id >= scratch.lazy_contexts.size()) {
+        throw std::logic_error(
+            "chart SPR lazy local score: lexicographic class out of range");
+      }
+      auto const& context = scratch.lazy_contexts[class_id];
       if (context.representative >= patterns.size()) {
         throw std::runtime_error(
             "chart SPR lazy local score: context representative out of range");
@@ -6331,8 +6429,7 @@ inline void accumulate_prepared_local_candidate_lazy(
           patterns[context.representative].state_by_taxon);
       for (std::size_t i = 0; i < delta.compiled_rows.size(); ++i) {
         rows.rows[i] = recompute_overlay_delta_row(
-            delta, states, provider, delta.compiled_rows[i],
-            counters);
+            delta, states, provider, delta.compiled_rows[i], counters);
       }
       if (counters != nullptr) {
         counters->local_rows_recomputed += delta.affected_order.size();
@@ -6341,15 +6438,15 @@ inline void accumulate_prepared_local_candidate_lazy(
         auto chart_build_options = state.chart_opts;
         chart_build_options.keep_trace = false;
         chart_build_options.max_trace_choices = 0;
-        auto base_chart = build_single_site_chart(state.grammar, states,
-                                                  chart_build_options);
+        auto base_chart =
+            build_single_site_chart(state.grammar, states, chart_build_options);
         verify_local_overlay_rows_against_full(
             delta, rows, base_chart, *prepared.verification_materialized,
             states, state.chart_opts);
       }
       auto const& root_row = provider.row(delta.root);
-      auto contribution = lazy_overlay_weighted_root_score(
-          root_row, context, state.chart_opts);
+      auto contribution =
+          lazy_overlay_weighted_root_score(root_row, context, state.chart_opts);
       prepared.new_active_score = chart_multisite_detail::checked_add_u64(
           prepared.new_active_score, contribution,
           "chart SPR lazy local candidate active lower bound");
