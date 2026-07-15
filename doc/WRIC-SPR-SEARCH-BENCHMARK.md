@@ -23,6 +23,17 @@ The smoke run uses `data/test_5_trees/tree_0.pb.gz`, one larch2 native iteration
   workers, execution order, wait4 CPU time, Linux KiB maximum RSS, sampled
   RSS/swap, timeout outcome, exact-phase timing, input hashes, and the compact
   canonical semantic digest;
+- `phase6_admission_evidence.tsv` - in manifest mode, one chart row per raw
+  trial with its top-K/worker identity, configured budget, sampled RSS, and the
+  seven exact-candidate admission fields used by the Phase-6 bounded-memory
+  gate (otherwise header-only);
+- `phase6_rss_comparisons.tsv` - complete comparable W1/W8 exact-row pairs,
+  their maximum sampled RSS values, and the W8/W1 ratio used by the Phase-6
+  RSS gate (header-only when no such pair is selected);
+- `phase6_exact_verification_speedup.tsv` - hash-bound fixed-point W1/W8
+  Top-K-4 exact-verification samples, exact median arithmetic, and the strict
+  Phase-6 2x speedup comparison (header-only unless the named medium workload
+  is selected);
 - `commands.sh` - exact commands used;
 - `logs/` - per-method stdout/stderr reports;
 - `curves/` - score-over-time TSV files (`iteration`, `elapsed_s`, `reported_objective`, `external_validated_parsimony_min`); elapsed time is method wall-clock apportioned across emitted iteration reports when the underlying tool does not emit per-iteration timestamps. For sample--explore--merge, larch2's iteration summary reports the sampled-tree objective rather than the merged output DAG minimum, so the baseline curve endpoint uses the externally validated final DAG parsimony when validation succeeds;
@@ -109,6 +120,74 @@ by up to one sampling interval. Timeouts retain a 250-ms TERM grace and status
 `rss_limit_observed` and trigger bytes still record the crossing. RSS
 termination is status 123. These outcomes are explicit raw rows, never missing
 rows.
+
+## Phase-6 exact-candidate evidence
+
+Every successful chart raw row carries these seven admission fields. Manifest
+runs also project them into `phase6_admission_evidence.tsv`:
+
+- `exact_candidate_admission_batches`: completed deterministic admission
+  waves;
+- `exact_candidate_parallel_batches`: waves that ran two or more candidates
+  on the outer exact-candidate scheduler axis;
+- `exact_candidate_inner_parallel_batches`: singleton waves that used the
+  Phase-5 inner exact axis;
+- `exact_candidate_memory_limited_batches`: waves shortened by the finite
+  budget, including a singleton forced to remain serial because its inner
+  estimate did not fit;
+- `exact_candidate_peak_admitted_bytes`: the largest admitted wave's task
+  scratch plus retained-result charge;
+- `exact_candidate_peak_projected_resident_bytes`: the largest projection of
+  shared resident exact state, prior-wave retained results, and the admitted
+  wave; and
+- `exact_candidate_queued_for_memory_ms`: completed-wave time charged only
+  when later candidates were deferred by memory admission, not ordinary
+  scheduler queue time.
+
+The harness requires the six count/byte fields to be unsigned integers and the
+queue timer to be a finite nonnegative decimal. For every successful chart
+trial it enforces
+
+```text
+parallel_batches <= admission_batches
+inner_parallel_batches <= admission_batches
+memory_limited_batches <= admission_batches
+parallel_batches + inner_parallel_batches <= admission_batches
+peak_admitted_bytes <= peak_projected_resident_bytes
+finite budget => peak_projected_resident_bytes <= configured budget
+```
+
+Zero admission batches require all six remaining admission values to be zero;
+positive batches require both peak-byte fields to be positive. Any positive
+exact-verification count requires a positive admission-batch count, and zero
+memory-limited batches require zero memory-queue time. A selected successful
+top-K-16 manifest row must produce exactly one evidence row per trial with
+positive exact, budget, batch, admitted-byte, and projected-byte values;
+missing or duplicate cardinality fails the gate.
+
+`phase6_rss_comparisons.tsv` joins successful exact W1 and W8 rows only when
+their comparison identity and sealed workload-contract identity match. It
+uses the maximum `peak_sampled_rss_kb` over the repetitions for each worker
+count and requires W8/W1 to be at most 2.0. If a selected manifest group
+contains both W1 and W8 exact contracts, every expected comparison must be a
+complete one-to-one manifest pair and must appear in the output; missing,
+duplicate, contract-drifted, or vacuous comparisons fail closed.
+The pair must also have identical `search_semantic_sha256` and
+`output_semantic_sha256`; both hashes are retained in the RSS evidence row.
+
+For the named `exact-medium-topk4` grammar-exact workload,
+`phase6_exact_verification_speedup.tsv` requires exactly one W1 and one W8
+manifest endpoint and every configured recorded trial at each endpoint. It
+converts the three-decimal millisecond fields to integer thousandths, computes
+the median without floating-point comparison, and requires the W8 median to be
+at most half the W1 median. The W8 rows must also report at least one outer
+candidate-parallel batch, a concurrent-verifier high-water mark of at least
+two, and an exact-candidate scheduler high-water mark of at least two; W1 must
+remain serial on that axis. Each arithmetic row records the workload and
+contract hashes, the identical W1/W8 search and output semantic hashes, and its
+own SHA-256 digest. Missing or duplicate trials, timeout/fallback outcomes,
+inconsistent exact timing counts, nonfinite values, inactive parallel
+execution, semantic drift, or contract drift fail the gate.
 
 ## Strict gates and immutable manifests
 

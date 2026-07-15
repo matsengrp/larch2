@@ -117,8 +117,29 @@ if [[ ${FAKE_DEFAULT_AUTOMATIC:-0} == 1 ]]; then
     sleep 0.03
   fi
 fi
+if [[ ( ${FAKE_PHASE6_RSS_PAD:-0} == 1 && $exact == 16 ) ||
+      ( ${FAKE_PHASE6_TIMING:-0} == 1 && $exact == 4 ) ]]; then
+  # The process-metrics sampler observes the whole process group. A common
+  # retained pad makes the W1/W8 RSS ratio deterministic instead of letting a
+  # few pages of shell-startup noise dominate this tiny fake workload.
+  python3 -c 'import time; pad = bytearray(32 * 1024 * 1024); time.sleep(0.05)'
+fi
+if [[ ${FAKE_PHASE6_TIMING:-0} == 1 && $exact == 4 &&
+      ( ( $worker_requested == 8 && ${FAKE_PHASE6_SPEED_MODE:-ok} == timeout_w8 ) ||
+        ( $worker_requested == 1 && ${FAKE_PHASE6_SPEED_MODE:-ok} == timeout_w1 ) ) ]]; then
+  sleep 5
+fi
+if [[ ${FAKE_PHASE6_K16_TIMEOUT:-0} == 1 && $exact == 16 &&
+      $worker_requested == 8 ]]; then
+  sleep 5
+fi
 [[ -z "$output" ]] || cp "$input" "$output"
 semantic_payload='{"record":"contract","topology_selection":"none","refinement_exactness":"BOUNDED_REFINED_GRAMMAR","keep_mask_contract":"exact_required"}'
+if [[ ${FAKE_PHASE6_W1_SEMANTIC_MISMATCH:-0} == 1 &&
+      ( $exact == 4 || $exact == 16 ) &&
+      $worker_requested == 1 ]]; then
+  semantic_payload='{"record":"contract","topology_selection":"none","refinement_exactness":"BOUNDED_REFINED_GRAMMAR","keep_mask_contract":"exact_required","phase6_w1_mismatch":true}'
+fi
 if [[ -n "$sidecar" && ${FAKE_FULL_MISMATCH:-0} == 1 ]]; then
   semantic_payload='{"record":"contract","topology_selection":"none","refinement_exactness":"BOUNDED_REFINED_GRAMMAR","keep_mask_contract":"exact_required","mismatch":true}'
 fi
@@ -142,6 +163,8 @@ if [[ ${FAKE_WRONG_SEMANTICS:-0} == 1 ]]; then
 fi
 if [[ ${FAKE_WRONG_COMMIT:-0} == 1 ]]; then commit=materialize_rebuild; fi
 if [[ ${FAKE_WRONG_WORKER_POLICY:-0} == 1 ]]; then worker_policy=automatic; fi
+fake_trial=0
+if [[ $output =~ _trial([0-9]+)_ ]]; then fake_trial=${BASH_REMATCH[1]}; fi
 peak_exact=0
 (( exact == 0 )) || peak_exact=1
 reported_exact=$exact
@@ -160,6 +183,104 @@ case ${FAKE_OBSERVABILITY_MODE:-ok} in
     peak_exact=2 ;;
   *) exit 65 ;;
 esac
+admission_batches=0
+parallel_batches=0
+inner_batches=0
+memory_limited_batches=0
+peak_admitted=0
+peak_projected=0
+queued_for_memory_ms=0.0
+timing_count=0
+exact_axis_high_water=0
+exact_verification_ms=0.0
+exact_timing_min=0.0
+exact_timing_mean=0.0
+exact_timing_max=0.0
+total_ms=10.0
+if (( reported_exact > 0 )); then
+  admission_batches=1
+  inner_batches=1
+  peak_admitted=1024
+  peak_projected=2048
+  timing_count=$reported_exact
+  exact_axis_high_water=1
+fi
+case ${FAKE_ADMISSION_MODE:-ok} in
+  ok) ;;
+  exact_without_batches)
+    admission_batches=0; inner_batches=0
+    peak_admitted=0; peak_projected=0 ;;
+  batches_without_bytes)
+    peak_admitted=0; peak_projected=0 ;;
+  queue_without_limit)
+    queued_for_memory_ms=1.0 ;;
+  k16_w8_missing)
+    if [[ $exact == 16 && $worker_requested == 8 ]]; then
+      reported_exact=0; peak_exact=0; timing_count=0
+      admission_batches=0; parallel_batches=0; inner_batches=0
+      memory_limited_batches=0; peak_admitted=0; peak_projected=0
+      queued_for_memory_ms=0.0
+    fi ;;
+  *) exit 66 ;;
+esac
+if [[ ${FAKE_PHASE6_TIMING:-0} == 1 && $reported_exact == 4 ]]; then
+  exact_verification_ms=100.000
+  exact_timing_min=20.000
+  exact_timing_mean=20.000
+  exact_timing_max=20.000
+  total_ms=110.000
+  if [[ ${FAKE_PHASE6_SPEED_MODE:-ok} == boundary_pass ||
+        ${FAKE_PHASE6_SPEED_MODE:-ok} == boundary_over ]]; then
+    if [[ $fake_trial == 1 ]]; then
+      exact_verification_ms=99.999
+    elif [[ $fake_trial == 2 ]]; then
+      exact_verification_ms=100.001
+    fi
+  fi
+  if [[ $worker_requested == 8 ]]; then
+    exact_verification_ms=40.000
+    total_ms=50.000
+    parallel_batches=1
+    inner_batches=0
+    peak_exact=4
+    exact_axis_high_water=4
+    case ${FAKE_PHASE6_SPEED_MODE:-ok} in
+      ok|timeout_w8|timeout_w1) ;;
+      boundary_pass)
+        total_ms=60.000
+        if [[ $fake_trial == 1 ]]; then
+          exact_verification_ms=49.999
+        elif [[ $fake_trial == 2 ]]; then
+          exact_verification_ms=50.001
+        fi ;;
+      boundary_over)
+        total_ms=60.000
+        if [[ $fake_trial == 1 ]]; then
+          exact_verification_ms=50.000
+        elif [[ $fake_trial == 2 ]]; then
+          exact_verification_ms=50.002
+        fi ;;
+      slow_w8)
+        exact_verification_ms=60.000; total_ms=70.000 ;;
+      serial_fallback)
+        parallel_batches=0; inner_batches=1
+        peak_exact=1; exact_axis_high_water=1 ;;
+      low_peak)
+        peak_exact=1 ;;
+      low_axis)
+        exact_axis_high_water=1 ;;
+      nonfinite)
+        exact_verification_ms=nan ;;
+      inconsistent_count)
+        timing_count=3 ;;
+      inconsistent_range)
+        exact_timing_min=30.000
+        exact_timing_mean=20.000
+        exact_timing_max=25.000 ;;
+      *) exit 67 ;;
+    esac
+  fi
+fi
 cat <<REPORT
 chart_spr_search:
   polytomy_mode: $polytomy_mode
@@ -240,7 +361,7 @@ $initial_chart_line
   candidate_generation_ms: 2.0
   exact_initialization_ms: 3.0
   local_scoring_ms: 4.0
-  exact_verification_ms: 0.0
+  exact_verification_ms: $exact_verification_ms
   accepted_rebuild_ms: 0.0
   final_compaction_ms: 0.0
   post_materialization_check_ms: 0.0
@@ -249,15 +370,23 @@ $initial_chart_line
   materialization_accepted_update_ms: 0.0
   materialization_final_compaction_ms: 0.0
   peak_concurrent_exact_verifiers: $peak_exact
+  chart_axis_exact_candidate_active_worker_high_water: $exact_axis_high_water
+  exact_candidate_admission_batches: $admission_batches
+  exact_candidate_parallel_batches: $parallel_batches
+  exact_candidate_inner_parallel_batches: $inner_batches
+  exact_candidate_memory_limited_batches: $memory_limited_batches
+  exact_candidate_peak_admitted_bytes: $peak_admitted
+  exact_candidate_peak_projected_resident_bytes: $peak_projected
+  exact_candidate_queued_for_memory_ms: $queued_for_memory_ms
   local_candidates_per_second: 0.0
   chart_cache_resident_bytes: 0
   final_grammar_clades: 3
   final_grammar_productions: 2
-  total_ms: 10.0
-  exact_candidate_timing_count: 0
-  exact_candidate_verification_ms_min: 0.0
-  exact_candidate_verification_ms_mean: 0.0
-  exact_candidate_verification_ms_max: 0.0
+  total_ms: $total_ms
+  exact_candidate_timing_count: $timing_count
+  exact_candidate_verification_ms_min: $exact_timing_min
+  exact_candidate_verification_ms_mean: $exact_timing_mean
+  exact_candidate_verification_ms_max: $exact_timing_max
   final_dag:
     leaves: 2
     nodes: 3
@@ -340,7 +469,10 @@ awk -F '\t' '
       $h["materialization_exact_verification_ms"]=="0.0" &&
       $h["materialization_accepted_update_ms"]=="0.0" &&
       $h["materialization_final_compaction_ms"]=="0.0" &&
-      $h["peak_concurrent_exact_verifiers"]=="0")
+      $h["peak_concurrent_exact_verifiers"]=="0" &&
+      $h["exact_candidate_admission_batches"]=="0" &&
+      $h["exact_candidate_peak_admitted_bytes"]=="0" &&
+      $h["exact_candidate_peak_projected_resident_bytes"]=="0")
   }
   END {if(!found)exit 1}' "$tmp/smoke/raw_trials.tsv"
 ! grep -Eq -- '--chart-spr-(workers|local-score-workers)' "$tmp/smoke/commands.sh"
@@ -451,12 +583,13 @@ trial_sha() {
 }
 chart_argv_sha() {
   local candidates=$1 lazy=$2 acceptance=$3 worker_option=${4:-none} requested=${5:-default}
+  local top_k=${6:-0} memory_budget=${7:-0}
   local argv=(@binary:working_chart --dag-pb "@primary:$input_sha"
     --validate --force-no-vcf --wric-polytomy-mode expand-bounded
     --wric-polytomy-max-exact-arity 6 --wric-polytomy-max-shapes 1
     --wric-polytomy-max-productions 1024 --wric-polytomy-max-clades 256
     --wric-lazy-chart "$lazy" --chart-spr-search --chart-spr-max-iterations 1
-    --chart-spr-max-candidates "$candidates" --chart-spr-top-k-exact 0
+    --chart-spr-max-candidates "$candidates" --chart-spr-top-k-exact "$top_k"
     --chart-spr-candidate-selection lower_bound_top_k --chart-spr-candidate-source grammar
     --chart-spr-acceptance "$acceptance" --chart-spr-sampled-tree-count 1
     --chart-spr-sampled-tree-radius 0 --chart-spr-max-upward-path-expansions 0
@@ -464,7 +597,7 @@ chart_argv_sha() {
     --chart-spr-max-moved-clade-size 0 --chart-spr-min-target-clade-size 1
     --chart-spr-max-target-clade-size 0 --chart-spr-max-cached-patterns 0
     --chart-spr-pattern-batch-size 0 --chart-spr-candidate-batch-size 0
-    --chart-spr-memory-budget 0 --chart-spr-commit-mode overlay_delta
+    --chart-spr-memory-budget "$memory_budget" --chart-spr-commit-mode overlay_delta
     --chart-spr-verification-mode transient --chart-bnb-dominance off --seed 1)
   case "$worker_option" in
     none) ;;
@@ -580,6 +713,21 @@ mutate_field() {
     $x["row_id"]==id{$x[field]=value}{print}' "$src" >"$dst"
   seal_manifest "$dst"
 }
+make_timeout_labeled_row() {
+  local src=$1 dst=$2 row=$3
+  awk -F '\t' -v OFS='\t' -v id="$row" '
+    /^#/{print;next}!h{for(i=1;i<=NF;i++)x[$i]=i;h=1;print;next}
+    $x["row_id"]==id {
+      $x["expected_outcome"]="timeout"
+      $x["expected_timeout_trials"]="1"
+      $x["expected_resolved_workers"]="-"
+      $x["expected_worker_policy"]="-"
+      split("oracle_search_semantic_sha256 oracle_output_semantic_sha256 oracle_trial_semantic_sha256 canonical_sidecar_uri canonical_sidecar_sha256 oracle_report_uri oracle_report_sha256", fields, " ")
+      for(i in fields)$x[fields[i]]="-"
+    }
+    {print}' "$src" >"$dst"
+  seal_manifest "$dst"
+}
 dash_fields() {
   local src=$1 dst=$2 row=$3; shift 3
   local fields; fields=$(IFS=,; echo "$*")
@@ -664,6 +812,19 @@ awk -F '\t' '
     if($h["initial_chart_construction_ms"]!="0.5") exit 1
   }
   END {if(!found)exit 1}' "$tmp/observability-nested-splice/raw_trials.tsv"
+
+# Successful chart rows obey the same exact-admission cross-field invariants
+# as the bootstrap finalizer.  These cases used to pass the harness and fail
+# only later when the sealed artifacts were finalized.
+admission_common=(--dagutil "$tmp/dagutil" --larch2 "$tmp/larch2"
+  --process-metrics "$runner" --dag "$tmp/input.pb.gz" --iterations 1
+  --max-moves 1 --max-candidates 1 --top-k-exact 1 --modes grammar_exact)
+for admission_mode in exact_without_batches batches_without_bytes queue_without_limit; do
+  expect_fail_reason "admission-$admission_mode" \
+    'invalid Phase-0 chart instrumentation' \
+    env FAKE_ADMISSION_MODE="$admission_mode" "$harness" \
+    "${admission_common[@]}" --out-dir "$tmp/admission-$admission_mode"
+done
 
 # Global totals are insufficient: every iteration item must own exactly one
 # candidate-generation mapping and exactly one stop reason within that map.
@@ -936,6 +1097,458 @@ success_manifest="$tmp/success.tsv"
 write_manifest "$success_manifest" success-test ok 2 on \
   chart_spr_grammar_lower_bound_heuristic lower_bound_heuristic composite_lower_bound_heuristic \
   "$success_argv" "$search_sha" "$output_sha" "$success_trial"
+
+# Phase-6 evidence is cardinality-checked against the selected manifest.  A
+# valid K16 W1/W8 pair produces one RSS comparison while retaining one
+# admission row per selected row and recorded trial.
+phase6_budget=1048576
+phase6_w1_argv=$(chart_argv_sha 16 off exact_multisite chart_spr_workers 1 16 "$phase6_budget")
+phase6_w8_argv=$(chart_argv_sha 16 off exact_multisite chart_spr_workers 8 16 "$phase6_budget")
+phase6_w1_trial=$(trial_sha chart_spr_grammar_exact "$search_sha" "$output_sha" "$phase6_w1_argv")
+phase6_w8_trial=$(trial_sha chart_spr_grammar_exact "$search_sha" "$output_sha" "$phase6_w8_argv")
+phase6_manifest="$tmp/phase6.tsv"
+awk -F '\t' -v OFS='\t' -v w1_argv="$phase6_w1_argv" \
+  -v w8_argv="$phase6_w8_argv" -v w1_trial="$phase6_w1_trial" \
+  -v w8_trial="$phase6_w8_trial" -v budget="$phase6_budget" '
+  /^#/ {print; next}
+  !h {for(i=1;i<=NF;i++)x[$i]=i;h=1;print;next}
+  {
+    $x["run_group"]="phase6-test"
+    $x["workload_name"]="phase6-paired"
+    if($x["row_id"]=="chart-row") {
+      $x["row_id"]="phase6-w1"
+      $x["method"]="chart_spr_grammar_exact"
+      $x["worker_option"]="chart_spr_workers"
+      $x["requested_workers"]="1"
+      $x["expected_resolved_workers"]="1"
+      $x["expected_worker_policy"]="explicit"
+      $x["chart_max_candidates"]="16"
+      $x["chart_top_k_exact"]="16"
+      $x["acceptance"]="exact_multisite"
+      $x["objective"]="grammar_exact"
+      $x["lazy_policy"]="off"
+      $x["memory_budget_bytes"]=budget
+      $x["expected_cache_strategy"]="all_active_patterns"
+      $x["expected_candidates_generated"]="16"
+      $x["expected_candidates_scored"]="16"
+      $x["expected_exact_verifications"]="16"
+      $x["canonical_argv_sha256"]=w1_argv
+      $x["oracle_trial_semantic_sha256"]=w1_trial
+      print
+      $x["row_id"]="phase6-w8"
+      $x["requested_workers"]="8"
+      $x["expected_resolved_workers"]="8"
+      $x["canonical_argv_sha256"]=w8_argv
+      $x["oracle_trial_semantic_sha256"]=w8_trial
+      print
+      next
+    }
+    print
+  }' "$success_manifest" >"$phase6_manifest"
+seal_manifest "$phase6_manifest"
+
+env FAKE_PHASE6_RSS_PAD=1 "$harness" \
+  --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" --out-dir "$tmp/phase6-positive" \
+  --workload-manifest "$phase6_manifest" --run-manifest-group phase6-test \
+  --workers-list 1,8 --repetitions 2 >/dev/null
+[[ $(awk 'END{print NR-1}' "$tmp/phase6-positive/phase6_admission_evidence.tsv") == 4 ]]
+[[ $(awk 'END{print NR-1}' "$tmp/phase6-positive/phase6_rss_comparisons.tsv") == 1 ]]
+awk -F '\t' '
+  NR==1 {for(i=1;i<=NF;i++)h[$i]=i; next}
+  {
+    rows++
+    if($h["chart_top_k_exact"]!="16" ||
+       $h["exact_candidate_admission_batches"]!="1" ||
+       $h["exact_candidate_peak_admitted_bytes"]!="1024" ||
+       $h["exact_candidate_peak_projected_resident_bytes"]!="2048") exit 1
+  }
+  END {if(rows!=4)exit 1}' "$tmp/phase6-positive/phase6_admission_evidence.tsv"
+
+# A frozen timeout label is provenance, not a permanent waiver. Without an
+# explicit record-only waiver, an optimized current K16 row must now complete
+# and contributes to both the expected admission cardinality and RSS pair.
+make_timeout_labeled_row "$phase6_manifest" \
+  "$tmp/phase6-k16-frozen-timeout.tsv" phase6-w8
+env FAKE_PHASE6_RSS_PAD=1 "$harness" \
+  --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" --out-dir "$tmp/phase6-k16-frozen-timeout" \
+  --workload-manifest "$tmp/phase6-k16-frozen-timeout.tsv" \
+  --run-manifest-group phase6-test --workers-list 1,8 >/dev/null
+[[ $(awk 'END{print NR-1}' \
+  "$tmp/phase6-k16-frozen-timeout/phase6_admission_evidence.tsv") == 2 ]]
+[[ $(awk 'END{print NR-1}' \
+  "$tmp/phase6-k16-frozen-timeout/phase6_rss_comparisons.tsv") == 1 ]]
+make_timeout_labeled_row "$phase6_manifest" \
+  "$tmp/phase6-k16-w1-timeout.tsv" phase6-w1
+expect_fail_reason phase6-k16-w1-semantic-drift \
+  'Phase-6 W1/W8 search/output semantic drift' \
+  env FAKE_PHASE6_RSS_PAD=1 FAKE_PHASE6_W1_SEMANTIC_MISMATCH=1 \
+  "$harness" --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" \
+  --workload-manifest "$tmp/phase6-k16-w1-timeout.tsv" \
+  --run-manifest-group phase6-test --workers-list 1,8 \
+  --out-dir "$tmp/phase6-k16-w1-semantic-drift"
+env FAKE_PHASE6_RSS_PAD=1 FAKE_PHASE6_K16_TIMEOUT=1 "$harness" \
+  --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" --out-dir "$tmp/phase6-k16-record-only" \
+  --workload-manifest "$tmp/phase6-k16-frozen-timeout.tsv" \
+  --run-manifest-group phase6-test --workers-list 8 \
+  --allow-expected-timeout phase6-w8 >/dev/null
+[[ $(awk -F '\t' '
+  NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+  $h["row_id"]=="phase6-w8"{print $h["status"]}
+' "$tmp/phase6-k16-record-only/raw_trials.tsv") == timeout ]]
+[[ $(awk 'END{print NR-1}' \
+  "$tmp/phase6-k16-record-only/phase6_rss_comparisons.tsv") == 0 ]]
+
+# A selected successful K16 row that loses its successful report must make the
+# K16 evidence cardinality fail, even though the remaining row is valid.
+expect_fail_reason phase6-k16-cardinality 'invalid K16 evidence cardinality' \
+  env FAKE_PHASE6_RSS_PAD=1 FAKE_ADMISSION_MODE=k16_w8_missing "$harness" \
+  --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" --out-dir "$tmp/phase6-k16-cardinality" \
+  --workload-manifest "$phase6_manifest" --run-manifest-group phase6-test \
+  --workers-list 1,8
+
+# A sealed W8 label drift used to split the comparison keys and leave a
+# header-only RSS artifact that passed.  Both successful workers now have to
+# form the exact one-to-one pair declared by the selected group.
+mutate_field "$phase6_manifest" "$tmp/phase6-unpaired.tsv" phase6-w8 \
+  workload_name phase6-unpaired
+expect_fail_reason phase6-rss-unpaired \
+  'selected Phase-6 RSS comparison' \
+  env FAKE_PHASE6_RSS_PAD=1 "$harness" \
+  --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" --out-dir "$tmp/phase6-rss-unpaired" \
+  --workload-manifest "$tmp/phase6-unpaired.tsv" \
+  --run-manifest-group phase6-test --workers-list 1,8
+
+# The named medium TopK4 pair has a stricter Phase-6 gate than the general
+# exact-row RSS evidence above. Its acceptance arithmetic is fixed-point and
+# hash-bound, and W8 must prove that candidate-parallel execution was observed.
+phase6_speed_w1_argv=$(chart_argv_sha 32 off exact_multisite chart_spr_workers 1 4 "$phase6_budget")
+phase6_speed_w8_argv=$(chart_argv_sha 32 off exact_multisite chart_spr_workers 8 4 "$phase6_budget")
+phase6_speed_w1_trial=$(trial_sha chart_spr_grammar_exact "$search_sha" "$output_sha" "$phase6_speed_w1_argv")
+phase6_speed_w8_trial=$(trial_sha chart_spr_grammar_exact "$search_sha" "$output_sha" "$phase6_speed_w8_argv")
+phase6_speed_manifest="$tmp/phase6-speed.tsv"
+awk -F '\t' -v OFS='\t' -v w1_argv="$phase6_speed_w1_argv" \
+  -v w8_argv="$phase6_speed_w8_argv" -v w1_trial="$phase6_speed_w1_trial" \
+  -v w8_trial="$phase6_speed_w8_trial" -v budget="$phase6_budget" '
+  /^#/ {print; next}
+  !h {for(i=1;i<=NF;i++)x[$i]=i;h=1;print;next}
+  {
+    $x["run_group"]="phase6-speed-test"
+    $x["workload_name"]="exact-medium-topk4"
+    if($x["row_id"]=="chart-row") {
+      $x["row_id"]="phase6-speed-w1"
+      $x["method"]="chart_spr_grammar_exact"
+      $x["worker_option"]="chart_spr_workers"
+      $x["requested_workers"]="1"
+      $x["expected_resolved_workers"]="1"
+      $x["expected_worker_policy"]="explicit"
+      $x["chart_max_candidates"]="32"
+      $x["chart_top_k_exact"]="4"
+      $x["acceptance"]="exact_multisite"
+      $x["objective"]="grammar_exact"
+      $x["lazy_policy"]="off"
+      $x["memory_budget_bytes"]=budget
+      $x["expected_cache_strategy"]="all_active_patterns"
+      $x["expected_candidates_generated"]="32"
+      $x["expected_candidates_scored"]="32"
+      $x["expected_exact_verifications"]="4"
+      $x["canonical_argv_sha256"]=w1_argv
+      $x["oracle_trial_semantic_sha256"]=w1_trial
+      print
+      $x["row_id"]="phase6-speed-w8"
+      $x["requested_workers"]="8"
+      $x["expected_resolved_workers"]="8"
+      $x["canonical_argv_sha256"]=w8_argv
+      $x["oracle_trial_semantic_sha256"]=w8_trial
+      print
+      next
+    }
+    print
+  }' "$success_manifest" >"$phase6_speed_manifest"
+seal_manifest "$phase6_speed_manifest"
+
+phase6_speed_common=(--dagutil "$tmp/dagutil" --larch2 "$tmp/larch2"
+  --process-metrics "$runner" --workload-manifest "$phase6_speed_manifest"
+  --run-manifest-group phase6-speed-test --workers-list 1,8)
+env FAKE_PHASE6_TIMING=1 FAKE_PHASE6_SPEED_MODE=boundary_pass \
+  "$harness" "${phase6_speed_common[@]}" \
+  --out-dir "$tmp/phase6-speed-positive" --repetitions 2 >/dev/null
+phase6_speed_artifact="$tmp/phase6-speed-positive/phase6_exact_verification_speedup.tsv"
+[[ $(awk 'END{print NR-1}' "$phase6_speed_artifact") == 1 ]]
+awk -F '\t' '
+  NR==1 {for(i=1;i<=NF;i++)h[$i]=i; next}
+  {
+    if($h["arithmetic_sha256"]!~/^[0-9a-f]{64}$/ ||
+       $h["comparison_sha256"]!~/^[0-9a-f]{64}$/ ||
+       $h["contract_sha256"]!~/^[0-9a-f]{64}$/ ||
+       $h["search_semantic_sha256"]!~/^[0-9a-f]{64}$/ ||
+       $h["output_semantic_sha256"]!~/^[0-9a-f]{64}$/ ||
+       $h["fixture"]!="exact-medium-topk4" ||
+       $h["method"]!="chart_spr_grammar_exact" ||
+       $h["chart_top_k_exact"]!="4" ||
+       $h["trial_count_per_worker"]!="2" ||
+       $h["w1_trial_millims_by_index"]!="1:99999,2:100001" ||
+       $h["w8_trial_millims_by_index"]!="1:49999,2:50001" ||
+       $h["w1_median_twice_millims"]!="200000" ||
+       $h["w8_median_twice_millims"]!="100000" ||
+       $h["gate_lhs_twice_millims"]!="200000" ||
+       $h["gate_rhs_twice_millims"]!="200000" ||
+       $h["w1_median_ms"]!="100.0000" ||
+       $h["w8_median_ms"]!="50.0000" ||
+       $h["w1_over_w8"]!="2.000000000") exit 1
+    rows++
+  }
+  END {if(rows!=1)exit 1}' "$phase6_speed_artifact"
+phase6_speed_body=$(tail -n +2 "$phase6_speed_artifact" | cut -f2-)
+phase6_speed_recorded_sha=$(tail -n +2 "$phase6_speed_artifact" | cut -f1)
+[[ $(printf '%s\n' "$phase6_speed_body" | sha256sum | awk '{print $1}') == \
+   "$phase6_speed_recorded_sha" ]]
+awk -F '\t' '
+  NR==1 {for(i=1;i<=NF;i++)h[$i]=i; next}
+  $h["chart_top_k_exact"]==4 && $h["requested_workers"]==8 {
+    rows++
+    if($h["exact_candidate_parallel_batches"]<1 ||
+       $h["peak_concurrent_exact_verifiers"]<2 ||
+       $h["chart_axis_exact_candidate_active_worker_high_water"]<2) exit 1
+  }
+  END {if(rows!=2)exit 1}' \
+  "$tmp/phase6-speed-positive/phase6_admission_evidence.tsv"
+
+# Frozen Phase-0 timeouts are valid inputs to a later acceptance run. Without
+# the explicit record-only waiver, the current row must succeed and is used in
+# the speed arithmetic. With the waiver, the historical timeout remains a
+# permitted characterization row and does not activate this acceptance gate.
+make_timeout_labeled_row "$phase6_speed_manifest" \
+  "$tmp/phase6-speed-frozen-timeout.tsv" phase6-speed-w8
+env FAKE_PHASE6_TIMING=1 "$harness" \
+  --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" \
+  --workload-manifest "$tmp/phase6-speed-frozen-timeout.tsv" \
+  --run-manifest-group phase6-speed-test --workers-list 1,8 \
+  --out-dir "$tmp/phase6-speed-frozen-timeout-success" >/dev/null
+[[ $(awk 'END{print NR-1}' \
+  "$tmp/phase6-speed-frozen-timeout-success/phase6_exact_verification_speedup.tsv") == 1 ]]
+env FAKE_PHASE6_TIMING=1 FAKE_PHASE6_SPEED_MODE=timeout_w8 \
+  "$harness" --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" \
+  --workload-manifest "$tmp/phase6-speed-frozen-timeout.tsv" \
+  --run-manifest-group phase6-speed-test --workers-list 8 \
+  --allow-expected-timeout phase6-speed-w8 \
+  --out-dir "$tmp/phase6-speed-record-only-timeout" >/dev/null
+[[ $(awk -F '\t' '
+  NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+  $h["row_id"]=="phase6-speed-w8"{print $h["status"]}
+' "$tmp/phase6-speed-record-only-timeout/raw_trials.tsv") == timeout ]]
+[[ $(awk 'END{print NR-1}' \
+  "$tmp/phase6-speed-record-only-timeout/phase6_exact_verification_speedup.tsv") == 0 ]]
+
+# A record-only exact key must be removed as a whole. In a mixed group the
+# other complete key still gates and produces exactly one RSS/speed row; its
+# W8 presence must not make the waived key's remaining W1 endpoint look
+# incomplete.
+cp "$phase6_speed_manifest" "$tmp/phase6-mixed-record-only.tsv"
+awk -F '\t' -v OFS='\t' '
+  /^#/ {next}
+  !h {for(i=1;i<=NF;i++)x[$i]=i;h=1;next}
+  $x["row_id"]=="phase6-w1" || $x["row_id"]=="phase6-w8" {
+    $x["run_group"]="phase6-speed-test"
+    print
+  }
+' "$tmp/phase6-k16-frozen-timeout.tsv" \
+  >>"$tmp/phase6-mixed-record-only.tsv"
+seal_manifest "$tmp/phase6-mixed-record-only.tsv"
+env FAKE_PHASE6_TIMING=1 FAKE_PHASE6_RSS_PAD=1 FAKE_PHASE6_K16_TIMEOUT=1 \
+  "$harness" --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" \
+  --workload-manifest "$tmp/phase6-mixed-record-only.tsv" \
+  --run-manifest-group phase6-speed-test --workers-list 1,8 \
+  --allow-expected-timeout phase6-w8 \
+  --out-dir "$tmp/phase6-mixed-record-only" >/dev/null
+[[ $(awk 'END{print NR-1}' \
+  "$tmp/phase6-mixed-record-only/phase6_rss_comparisons.tsv") == 1 ]]
+[[ $(awk -F '\t' '
+  NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+  {print $h["chart_top_k_exact"]}
+' "$tmp/phase6-mixed-record-only/phase6_rss_comparisons.tsv") == 4 ]]
+[[ $(awk 'END{print NR-1}' \
+  "$tmp/phase6-mixed-record-only/phase6_exact_verification_speedup.tsv") == 1 ]]
+
+# Complementary waivers can leave global W1 and W8 expected-row totals while
+# every comparison key is record-only. That is a valid header-only capture,
+# not evidence that the two endpoints belong to one comparison.
+make_timeout_labeled_row "$phase6_speed_manifest" \
+  "$tmp/phase6-speed-w1-timeout.tsv" phase6-speed-w1
+expect_fail_reason phase6-speed-w1-semantic-drift \
+  'Phase-6 exact-speed search/output semantic drift' \
+  env FAKE_PHASE6_TIMING=1 FAKE_PHASE6_W1_SEMANTIC_MISMATCH=1 \
+  "$harness" --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" \
+  --workload-manifest "$tmp/phase6-speed-w1-timeout.tsv" \
+  --run-manifest-group phase6-speed-test --workers-list 1,8 \
+  --out-dir "$tmp/phase6-speed-w1-semantic-drift"
+cp "$tmp/phase6-speed-w1-timeout.tsv" \
+  "$tmp/phase6-all-record-only.tsv"
+awk -F '\t' -v OFS='\t' '
+  /^#/ {next}
+  !h {for(i=1;i<=NF;i++)x[$i]=i;h=1;next}
+  $x["row_id"]=="phase6-w1" || $x["row_id"]=="phase6-w8" {
+    $x["run_group"]="phase6-speed-test"
+    print
+  }
+' "$tmp/phase6-k16-frozen-timeout.tsv" \
+  >>"$tmp/phase6-all-record-only.tsv"
+seal_manifest "$tmp/phase6-all-record-only.tsv"
+env FAKE_PHASE6_TIMING=1 FAKE_PHASE6_SPEED_MODE=timeout_w1 \
+  FAKE_PHASE6_RSS_PAD=1 FAKE_PHASE6_K16_TIMEOUT=1 \
+  "$harness" --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" \
+  --workload-manifest "$tmp/phase6-all-record-only.tsv" \
+  --run-manifest-group phase6-speed-test --workers-list 1,8 \
+  --allow-expected-timeout phase6-speed-w1 \
+  --allow-expected-timeout phase6-w8 \
+  --out-dir "$tmp/phase6-all-record-only" >/dev/null
+[[ $(awk 'END{print NR-1}' \
+  "$tmp/phase6-all-record-only/phase6_rss_comparisons.tsv") == 0 ]]
+[[ $(awk 'END{print NR-1}' \
+  "$tmp/phase6-all-record-only/phase6_exact_verification_speedup.tsv") == 0 ]]
+
+# With two repetitions the medians are the average of the two middle fixed-
+# point samples. The exact 2x boundary above passes; moving the W8 median only
+# one thousandth of a millisecond above that boundary must fail.
+expect_fail_reason phase6-speed-boundary-over \
+  'W8 exact_verification_ms median is not at least 2.0x faster' \
+  env FAKE_PHASE6_TIMING=1 FAKE_PHASE6_SPEED_MODE=boundary_over \
+  "$harness" "${phase6_speed_common[@]}" \
+  --out-dir "$tmp/phase6-speed-boundary-over" --repetitions 2
+
+expect_fail_reason phase6-speed-slow \
+  'W8 exact_verification_ms median is not at least 2.0x faster' \
+  env FAKE_PHASE6_TIMING=1 FAKE_PHASE6_SPEED_MODE=slow_w8 \
+  "$harness" "${phase6_speed_common[@]}" \
+  --out-dir "$tmp/phase6-speed-slow"
+for speed_mode in serial_fallback low_peak low_axis; do
+  expect_fail_reason "phase6-speed-$speed_mode" \
+    'W8 candidate-parallel path not activated' \
+    env FAKE_PHASE6_TIMING=1 FAKE_PHASE6_SPEED_MODE="$speed_mode" \
+    "$harness" "${phase6_speed_common[@]}" \
+    --out-dir "$tmp/phase6-speed-$speed_mode"
+done
+expect_fail_reason phase6-speed-nonfinite 'invalid Phase-6 exact_verification_ms' \
+  env FAKE_PHASE6_TIMING=1 FAKE_PHASE6_SPEED_MODE=nonfinite \
+  "$harness" "${phase6_speed_common[@]}" \
+  --out-dir "$tmp/phase6-speed-nonfinite"
+for speed_mode in inconsistent_count inconsistent_range; do
+  expect_fail_reason "phase6-speed-$speed_mode" \
+    'inconsistent Phase-6 exact-candidate timing evidence' \
+    env FAKE_PHASE6_TIMING=1 FAKE_PHASE6_SPEED_MODE="$speed_mode" \
+    "$harness" "${phase6_speed_common[@]}" \
+    --out-dir "$tmp/phase6-speed-$speed_mode"
+done
+expect_fail_reason phase6-speed-timeout \
+  'exact-speed row is not a successful non-timeout execution' \
+  env FAKE_PHASE6_TIMING=1 FAKE_PHASE6_SPEED_MODE=timeout_w8 \
+  "$harness" "${phase6_speed_common[@]}" \
+  --out-dir "$tmp/phase6-speed-timeout"
+
+awk -F '\t' -v OFS='\t' '
+  /^#/ {print; next}
+  !h {for(i=1;i<=NF;i++)x[$i]=i;h=1;print;next}
+  $x["row_id"]!="phase6-speed-w8" {print}
+' "$phase6_speed_manifest" >"$tmp/phase6-speed-missing.tsv"
+seal_manifest "$tmp/phase6-speed-missing.tsv"
+expect_fail_reason phase6-speed-missing 'exact-speed comparison' \
+  env FAKE_PHASE6_TIMING=1 "$harness" --dagutil "$tmp/dagutil" \
+  --larch2 "$tmp/larch2" --process-metrics "$runner" \
+  --workload-manifest "$tmp/phase6-speed-missing.tsv" \
+  --run-manifest-group phase6-speed-test --workers-list 1,8 \
+  --out-dir "$tmp/phase6-speed-missing"
+
+awk -F '\t' -v OFS='\t' '
+  /^#/ {print; next}
+  !h {for(i=1;i<=NF;i++)x[$i]=i;h=1;print;next}
+  {
+    print
+    if($x["row_id"]=="phase6-speed-w8") {
+      $x["row_id"]="phase6-speed-w8-duplicate"
+      print
+    }
+  }
+' "$phase6_speed_manifest" >"$tmp/phase6-speed-duplicate.tsv"
+seal_manifest "$tmp/phase6-speed-duplicate.tsv"
+expect_fail_reason phase6-speed-duplicate 'W1/W8 manifest cardinality 1/2' \
+  env FAKE_PHASE6_TIMING=1 "$harness" --dagutil "$tmp/dagutil" \
+  --larch2 "$tmp/larch2" --process-metrics "$runner" \
+  --workload-manifest "$tmp/phase6-speed-duplicate.tsv" \
+  --run-manifest-group phase6-speed-test --workers-list 1,8 \
+  --out-dir "$tmp/phase6-speed-duplicate"
+
+# Selecting only a named grammar-exact W2 row must activate the gate and fail
+# for absent endpoints instead of producing a header-only arithmetic artifact.
+phase6_speed_w2_argv=$(chart_argv_sha 32 off exact_multisite chart_spr_workers 2 4 "$phase6_budget")
+phase6_speed_w2_trial=$(trial_sha chart_spr_grammar_exact "$search_sha" "$output_sha" "$phase6_speed_w2_argv")
+awk -F '\t' -v OFS='\t' -v argv="$phase6_speed_w2_argv" \
+  -v trial="$phase6_speed_w2_trial" '
+  /^#/ {print; next}
+  !h {for(i=1;i<=NF;i++)x[$i]=i;h=1;print;next}
+  $x["row_id"]=="phase6-speed-w8" {next}
+  {
+    if($x["row_id"]=="phase6-speed-w1") {
+      $x["row_id"]="phase6-speed-w2"
+      $x["requested_workers"]="2"
+      $x["expected_resolved_workers"]="2"
+      $x["canonical_argv_sha256"]=argv
+      $x["oracle_trial_semantic_sha256"]=trial
+    }
+    print
+  }
+' "$phase6_speed_manifest" >"$tmp/phase6-speed-w2-only.tsv"
+seal_manifest "$tmp/phase6-speed-w2-only.tsv"
+expect_fail_reason phase6-speed-w2-only 'W1/W8 manifest cardinality 0/0' \
+  env FAKE_PHASE6_TIMING=1 "$harness" --dagutil "$tmp/dagutil" \
+  --larch2 "$tmp/larch2" --process-metrics "$runner" \
+  --workload-manifest "$tmp/phase6-speed-w2-only.tsv" \
+  --run-manifest-group phase6-speed-test --workers-list 2 \
+  --out-dir "$tmp/phase6-speed-w2-only"
+
+# The workload name closes the grammar-exact shape: changing TopK must fail
+# activation rather than silently disabling the Phase-6 performance gate.
+phase6_speed_k5_w1_argv=$(chart_argv_sha 32 off exact_multisite chart_spr_workers 1 5 "$phase6_budget")
+phase6_speed_k5_w8_argv=$(chart_argv_sha 32 off exact_multisite chart_spr_workers 8 5 "$phase6_budget")
+phase6_speed_k5_w1_trial=$(trial_sha chart_spr_grammar_exact "$search_sha" "$output_sha" "$phase6_speed_k5_w1_argv")
+phase6_speed_k5_w8_trial=$(trial_sha chart_spr_grammar_exact "$search_sha" "$output_sha" "$phase6_speed_k5_w8_argv")
+awk -F '\t' -v OFS='\t' -v w1_argv="$phase6_speed_k5_w1_argv" \
+  -v w8_argv="$phase6_speed_k5_w8_argv" -v w1_trial="$phase6_speed_k5_w1_trial" \
+  -v w8_trial="$phase6_speed_k5_w8_trial" '
+  /^#/ {print; next}
+  !h {for(i=1;i<=NF;i++)x[$i]=i;h=1;print;next}
+  {
+    if($x["row_id"]=="phase6-speed-w1" || $x["row_id"]=="phase6-speed-w8") {
+      $x["chart_top_k_exact"]="5"
+      $x["expected_exact_verifications"]="5"
+      if($x["row_id"]=="phase6-speed-w1") {
+        $x["canonical_argv_sha256"]=w1_argv
+        $x["oracle_trial_semantic_sha256"]=w1_trial
+      } else {
+        $x["canonical_argv_sha256"]=w8_argv
+        $x["oracle_trial_semantic_sha256"]=w8_trial
+      }
+    }
+    print
+  }
+' "$phase6_speed_manifest" >"$tmp/phase6-speed-topk-drift.tsv"
+seal_manifest "$tmp/phase6-speed-topk-drift.tsv"
+expect_fail_reason phase6-speed-topk-drift \
+  'exact-medium-topk4 grammar row has TopK drift' \
+  "$harness" --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
+  --process-metrics "$runner" \
+  --workload-manifest "$tmp/phase6-speed-topk-drift.tsv" \
+  --run-manifest-group phase6-speed-test --workers-list 1,8 \
+  --out-dir "$tmp/phase6-speed-topk-drift"
 
 # Supplements are append-only, base-bound manifests with their own exact
 # detached seal.  Exercise acceptance plus every identity/override rejection

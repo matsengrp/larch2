@@ -34,7 +34,7 @@ in this document.
 | 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | Safe one-pool orchestration, full CTest, and targeted TSAN pass at `7d294d6`; small-case timing awaits the sealed baseline |
 | 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | `cbf92b6` passes deterministic pattern/cache/local/fixed-topology scheduling, bounded-memory admission, caught-failure accounting, full CTest, and targeted TSAN; scaling, Phase-3 serial comparison, and RSS gates await the sealed baseline |
 | 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass W1/W8 exact semantics, full CTest, and targeted TSAN; same-revision diagnostics exceed the 2x exact-phase target; measured-0% heavy splitting is omitted; unified frontier/candidate admission and sealed timing/RSS remain pending |
-| 6. Parallelize exact top-K candidates | in progress | Bounded-memory exact candidate scaling, including the unified scratch/admission obligation carried from Phase 5 |
+| 6. Parallelize exact top-K candidates | implementation in validation; sealed performance acceptance pending deferred Phase 0 | Working validation tree is based on `1cc76dc`; Phase-6 checkpoint commit TBD. Functional, sanitizer, stable-semantics, admission, scaling, and RSS gates remain open until recorded, with performance gates requiring the quiet-host Phase-0 seal |
 | 7. Make lazy charts scalable and adaptive | pending | Dense/lazy equivalence and auto-policy gate |
 | 8. Parallelize and pipeline candidate generation | pending | Stable candidate stream and generation speedup |
 | 9. Parallelize accepted-state cache updates | pending | Non-vacuous multi-accept correctness and scaling |
@@ -724,6 +724,23 @@ If heavy-clade splitting accounts for less than 10% of the post-wavefront
 profile, document and omit it instead of adding ineffective complexity.
 
 ## Phase 6 — Parallelize exact top-K candidates
+
+### Implementation status (2026-07-15)
+
+The Phase-6 implementation is in validation on a worktree based on `1cc76dc`;
+the next Phase-6 checkpoint commit is TBD. It contains stable exact-candidate
+waves, task-local verification state, coordinator-ordered aggregation, and a
+unified hard memory-admission path, but this status does not assert that any
+Phase-6 exit criterion has passed. Raw validation and benchmark evidence stays
+uncommitted under `build/wric-chart-parallelization/`.
+
+The immutable measurement checkpoint remains
+`7ca527b8906d018124756182274335cbff936d72` (`Baseline measure`). Its frozen
+runner, oracle, workloads, and binaries are unchanged. Quiet-host Phase-0
+calibration, baseline capture, finalization, audit, and seal are deliberately
+deferred under the authorized deadline-overlap rule; therefore all Phase-6
+performance acceptance, including scaling and RSS, remains pending even if
+same-revision diagnostics are collected first.
 
 ### Goal
 

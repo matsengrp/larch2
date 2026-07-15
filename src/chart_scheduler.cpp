@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
+#include <exception>
 #include <fstream>
 #include <future>
 #include <limits>
@@ -397,7 +398,9 @@ chart_indexed_range chart_scheduler::indexed_range_at(
 
 chart_scheduler_run_summary chart_scheduler::run_indexed_ranges(
     chart_indexed_range_plan const& plan, range_work work,
-    deterministic_finish finish) {
+    deterministic_finish finish,
+    chart_scheduler_run_summary* failed_run_summary) {
+  if (failed_run_summary != nullptr) *failed_run_summary = {};
   auto const nested = current_scheduler_context.scheduler == this;
   bool owns_top_level = false;
   if (!nested) {
@@ -422,11 +425,33 @@ chart_scheduler_run_summary chart_scheduler::run_indexed_ranges(
   }
 
   chart_scheduler_run_summary summary;
-  summary.operation_id = allocate_monotonic_ids(impl_->next_operation_id, 1,
-                                                "chart scheduler operation");
   summary.item_count = plan.item_count;
   summary.range_count = plan.range_count;
   summary.effective_grain = plan.effective_grain;
+  bool operation_accounted = false;
+  struct failed_run_publisher {
+    chart_scheduler_run_summary& summary;
+    chart_scheduler_run_summary* destination;
+    bool& operation_accounted;
+    int uncaught_on_entry = std::uncaught_exceptions();
+
+    ~failed_run_publisher() noexcept {
+      if (destination == nullptr || !operation_accounted ||
+          std::uncaught_exceptions() <= uncaught_on_entry) {
+        return;
+      }
+      summary.failed = true;
+      if (summary.ranges_completed + summary.ranges_cancelled <
+          summary.range_count) {
+        summary.ranges_cancelled =
+            summary.range_count - summary.ranges_completed;
+      }
+      summary.cancelled = summary.ranges_cancelled != 0;
+      *destination = summary;
+    }
+  } publish_failed_run{summary, failed_run_summary, operation_accounted};
+  summary.operation_id = allocate_monotonic_ids(impl_->next_operation_id, 1,
+                                                "chart scheduler operation");
   if (plan.range_count != 0) {
     summary.first_task_id = allocate_monotonic_ids(
         impl_->next_task_id, plan.range_count, "chart scheduler task");
@@ -434,6 +459,7 @@ chart_scheduler_run_summary chart_scheduler::run_indexed_ranges(
 
   impl_->operations.fetch_add(1, std::memory_order_relaxed);
   impl_->ranges_created.fetch_add(plan.range_count, std::memory_order_relaxed);
+  operation_accounted = true;
   struct range_accounting_guard {
     std::atomic<std::uint64_t>* cancelled = nullptr;
     std::size_t range_count = 0;
@@ -516,6 +542,7 @@ chart_scheduler_run_summary chart_scheduler::run_indexed_ranges(
   }
 
   impl_->parallel_operations.fetch_add(1, std::memory_order_relaxed);
+  summary.parallel_branch_entered = true;
   if (!impl_->pool.has_value()) {
     impl_->pool.emplace(impl_->resolution.resolved_workers);
     impl_->live_pool_threads.store(impl_->resolution.resolved_workers,

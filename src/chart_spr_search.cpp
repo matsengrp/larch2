@@ -433,12 +433,9 @@ std::size_t chart_spr_projected_local_commit_bytes_after_delta(
           "chart SPR lazy local-commit scoring peak byte overflow");
       break;
   }
-  auto projected = chart_spr_checked_cache_bytes_add(
+  return chart_spr_checked_cache_bytes_add(
       projected_persistent, projected_scoring_bytes,
       "chart SPR local-commit projected cache byte overflow");
-  return chart_spr_checked_cache_bytes_add(
-      projected, state.selected_topology_cache_admitted_bytes,
-      "chart SPR local-commit projected admitted byte overflow");
 }
 
 void chart_spr_require_cache_budget(std::size_t bytes,
@@ -1386,8 +1383,8 @@ struct chart_spr_persistent_inside_cache_view {
 struct chart_spr_selected_topology_row_cache {
   // Structural selected-subtree key -> all-active-pattern rows for that exact
   // rooted topology.  Keys are taxon/topology based rather than dense-id based,
-  // so unchanged selected subtrees survive tip materialization and can be
-  // reused by later candidate certificates in the same local-commit run.
+  // so shared selected subtrees in the before/after certificates can be reused
+  // within one verifier invocation without depending on dense ids.
   std::map<std::string, chart_spr_selected_topology_cache_entry> rows_by_key;
 };
 
@@ -1470,27 +1467,6 @@ std::size_t chart_spr_selected_topology_cache_resident_bytes(
   return total;
 }
 
-class chart_spr_selected_topology_cache_operation_scope {
- public:
-  explicit chart_spr_selected_topology_cache_operation_scope(
-      chart_spr_selected_topology_row_cache& cache) noexcept
-      : cache_(&cache) {
-    cache_->rows_by_key.clear();
-  }
-
-  chart_spr_selected_topology_cache_operation_scope(
-      chart_spr_selected_topology_cache_operation_scope const&) = delete;
-  chart_spr_selected_topology_cache_operation_scope& operator=(
-      chart_spr_selected_topology_cache_operation_scope const&) = delete;
-
-  ~chart_spr_selected_topology_cache_operation_scope() noexcept {
-    cache_->rows_by_key.clear();
-  }
-
- private:
-  chart_spr_selected_topology_row_cache* cache_;
-};
-
 // The Phase 4 local-commit substrate: frozen base grammar + overlay chain +
 // persistent inside/outside caches.  Non-movable once the chain/caches are
 // emplaced: they hold pointers (`base`) into `base_grammar`, so moving the
@@ -1530,13 +1506,6 @@ struct chart_spr_local_commit_substrate {
   double outside_cache_initialization_ms = 0.0;
   std::size_t resident_cache_bytes = 0;
 
-  // Phase 8 per-pattern selected-topology production cache.  This is separate
-  // from the grammar-min inside/outside caches: it stores rows for one exact
-  // structural selected subtree, so an unchanged fixed-topology subtree can be
-  // read without recomputing that subtree.  Its counters are exposed alongside
-  // the persistent-cache counters; the verifier must not hide an additional
-  // full selected-tree oracle behind this cache path.
-  chart_spr_selected_topology_row_cache selected_topology_cache;
   bool verify_materialized_fixed_topology_oracle_for_tests = false;
   bool force_independent_sm_bug_for_tests = false;
   // Phase 9 transient-extension verifier options (mirrored from
@@ -1545,6 +1514,149 @@ struct chart_spr_local_commit_substrate {
   bool force_transient_chain_extension_oracle_mismatch_for_tests = false;
   std::size_t cache_multifurcation_productions_scored_reported = 0;
 };
+
+std::size_t chart_spr_copy_capacity_bytes(std::size_t count,
+                                          std::size_t element_bytes,
+                                          char const* context) {
+  if (count == 0) return 0;
+  auto capacity = chart_spr_checked_cache_bytes_multiply(count, 2, context);
+  capacity = std::max<std::size_t>(4, capacity);
+  return chart_spr_checked_cache_bytes_multiply(capacity, element_bytes,
+                                                context);
+}
+
+std::size_t chart_spr_transient_clade_copy_bytes(clade_key const& clade) {
+  return chart_spr_copy_capacity_bytes(
+      clade.taxa.size(), sizeof(taxon_id),
+      "chart SPR transient chain clade-copy overflow");
+}
+
+std::size_t chart_spr_transient_production_copy_bytes(
+    overlay_grammar_production const& production) {
+  auto total = chart_spr_copy_capacity_bytes(
+      production.children.size(), sizeof(overlay_clade_ref),
+      "chart SPR transient chain production-copy overflow");
+  total = chart_spr_checked_cache_bytes_add(
+      total,
+      chart_spr_copy_capacity_bytes(
+          production.witnesses.size(), sizeof(production_witness),
+          "chart SPR transient chain witness-copy overflow"),
+      "chart SPR transient chain production-copy overflow");
+  for (auto const& witness : production.witnesses) {
+    total = chart_spr_checked_cache_bytes_add(
+        total,
+        chart_spr_copy_capacity_bytes(
+            witness.children.size(), sizeof(production_child_witness),
+            "chart SPR transient chain witness-child-copy overflow"),
+        "chart SPR transient chain production-copy overflow");
+    for (auto const& child : witness.children) {
+      total = chart_spr_checked_cache_bytes_add(
+          total,
+          chart_spr_copy_capacity_bytes(
+              child.edge_alternatives.size(), sizeof(std::size_t),
+              "chart SPR transient chain witness-edge-copy overflow"),
+          "chart SPR transient chain production-copy overflow");
+    }
+  }
+  return total;
+}
+
+template <class Clades, class Productions, class Removed>
+std::size_t chart_spr_transient_delta_payload_copy_bytes(
+    Clades const& clades, Productions const& productions,
+    Removed const& removed, std::size_t commit_source_size = 0) {
+  auto total = chart_spr_copy_capacity_bytes(
+      clades.size(), sizeof(clade_key),
+      "chart SPR transient chain clade-vector-copy overflow");
+  for (auto const& clade : clades) {
+    total = chart_spr_checked_cache_bytes_add(
+        total, chart_spr_transient_clade_copy_bytes(clade),
+        "chart SPR transient chain delta-copy overflow");
+  }
+  total = chart_spr_checked_cache_bytes_add(
+      total,
+      chart_spr_copy_capacity_bytes(
+          productions.size(), sizeof(overlay_grammar_production),
+          "chart SPR transient chain production-vector-copy overflow"),
+      "chart SPR transient chain delta-copy overflow");
+  for (auto const& production : productions) {
+    total = chart_spr_checked_cache_bytes_add(
+        total, chart_spr_transient_production_copy_bytes(production),
+        "chart SPR transient chain delta-copy overflow");
+  }
+  total = chart_spr_checked_cache_bytes_add(
+      total,
+      chart_spr_copy_capacity_bytes(
+          removed.size(), sizeof(typename Removed::value_type),
+          "chart SPR transient chain tombstone-copy overflow"),
+      "chart SPR transient chain delta-copy overflow");
+  total = chart_spr_checked_cache_bytes_add(
+      total,
+      chart_spr_copy_capacity_bytes(
+          commit_source_size, sizeof(char),
+          "chart SPR transient chain label-copy overflow"),
+      "chart SPR transient chain delta-copy overflow");
+  return total;
+}
+
+std::size_t chart_spr_transient_verifier_extra_memory_bound(
+    chart_spr_local_commit_substrate const& sub,
+    grammar_spr_candidate const& candidate) {
+  if (!sub.chain) {
+    throw std::logic_error(
+        "chart SPR transient memory estimator: missing overlay chain");
+  }
+  auto chain_copy = sizeof(overlay_chain);
+  using base_lookup_value = std::pair<std::vector<taxon_id> const, clade_id>;
+  for (auto const& clade : sub.base_grammar.clades) {
+    chain_copy = chart_spr_checked_cache_bytes_add(
+        chain_copy, sizeof(base_lookup_value) + 4 * sizeof(void*),
+        "chart SPR transient base-lookup-copy overflow");
+    chain_copy = chart_spr_checked_cache_bytes_add(
+        chain_copy, chart_spr_transient_clade_copy_bytes(clade),
+        "chart SPR transient base-lookup-copy overflow");
+  }
+  chain_copy = chart_spr_checked_cache_bytes_add(
+      chain_copy,
+      chart_spr_copy_capacity_bytes(
+          sub.chain->size(), sizeof(spr_overlay_delta),
+          "chart SPR transient delta-vector-copy overflow"),
+      "chart SPR transient chain-copy overflow");
+  for (std::size_t position = 0; position < sub.chain->size(); ++position) {
+    auto const& delta = sub.chain->at(position);
+    chain_copy = chart_spr_checked_cache_bytes_add(
+        chain_copy,
+        chart_spr_transient_delta_payload_copy_bytes(
+            delta.temp_clades, delta.temp_productions,
+            delta.removed_base_productions, delta.commit_source.size()),
+        "chart SPR transient chain-copy overflow");
+  }
+  auto candidate_payload = chart_spr_transient_delta_payload_copy_bytes(
+      candidate.added_clades, candidate.added_productions,
+      candidate.removed_productions);
+  auto working_payload = chart_spr_checked_cache_bytes_add(
+      chain_copy, candidate_payload,
+      "chart SPR transient working-payload overflow");
+
+  // Four copies cover: the reader-local chain, append-time ordered maps/sets,
+  // the merged `tip()` overlay, and vector/string capacity rounding while the
+  // planned dense materialization is published. The latter's grammar/plan/B&B
+  // storage is charged by the generic estimator, not here.
+  auto extra = chart_spr_checked_cache_bytes_multiply(
+      working_payload, 4, "chart SPR transient chain working-set overflow");
+  if (sub.verify_transient_chain_extension_oracle_for_tests ||
+      sub.force_transient_chain_extension_oracle_mismatch_for_tests) {
+    // Diagnostic inside/outside cache copies are extended while the originals
+    // remain resident. Allow one full copy plus geometric growth.
+    extra = chart_spr_checked_cache_bytes_add(
+        extra,
+        chart_spr_checked_cache_bytes_multiply(
+            sub.resident_cache_bytes, 2,
+            "chart SPR transient diagnostic cache-copy overflow"),
+        "chart SPR transient verifier extra-memory overflow");
+  }
+  return extra;
+}
 
 void chart_spr_set_identity_tip_maps(chart_spr_local_commit_substrate& sub) {
   sub.dense_clade_to_chain_ref.clear();
@@ -1725,7 +1837,8 @@ chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
     grammar_spr_candidate const& candidate,
     std::map<overlay_clade_ref, overlay_production_ref> const& selected,
     overlay_clade_ref clade, std::set<overlay_clade_ref>& active_refs,
-    chart_spr_persistent_inside_cache_view persistent_icache) {
+    chart_spr_persistent_inside_cache_view persistent_icache,
+    chart_spr_search_counters& counters) {
   chart_spr_overlay_ref_active_guard guard(active_refs, clade);
   auto const& active = state.active_patterns.patterns.patterns;
   auto taxa = chart_spr_clade_taxa_for_ref(state.grammar, candidate, clade);
@@ -1744,7 +1857,7 @@ chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
           "fixed_topology_exact selected-topology cache: cached row "
           "pattern count mismatch");
     }
-    ++state.counters.fixed_topology_selected_cache_hits;
+    ++counters.fixed_topology_selected_cache_hits;
     return chart_spr_selected_topology_node{key, &it->second};
   };
   auto insert_new_node = [&](std::string key,
@@ -1755,13 +1868,13 @@ chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
           "fixed_topology_exact selected-topology cache: new row pattern "
           "count mismatch");
     }
-    ++state.counters.fixed_topology_selected_cache_misses;
-    state.counters.fixed_topology_selected_rows_computed +=
+    ++counters.fixed_topology_selected_cache_misses;
+    counters.fixed_topology_selected_rows_computed +=
         entry.rows_by_pattern.size();
-    state.counters.selected_topology_class_rows_computed +=
+    counters.selected_topology_class_rows_computed +=
         entry.rows_by_pattern.size();
     if (multifurcation_row) {
-      state.counters.selected_topology_multifurcation_rows +=
+      counters.selected_topology_multifurcation_rows +=
           entry.rows_by_pattern.size();
     }
     auto [inserted, ok] = cache.rows_by_key.emplace(key, std::move(entry));
@@ -1793,7 +1906,7 @@ chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
         // Temp clade refs are candidate-local additions, not present in the
         // persistent inside cache; they are always AFFECTED (recomputed).
         if (clade.space != overlay_id_space::base) {
-          state.counters.fixed_topology_icache_rows_recomputed_affected +=
+          counters.fixed_topology_icache_rows_recomputed_affected +=
               entry.rows_by_pattern.size();
           return;
         }
@@ -1805,13 +1918,13 @@ chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
             clade.id >= persistent_icache.dense_clade_to_chain_ref->size()) {
           // No mapping available (e.g. a clade the substrate does not track);
           // treat as affected rather than guessing the cache key.
-          state.counters.fixed_topology_icache_rows_recomputed_affected +=
+          counters.fixed_topology_icache_rows_recomputed_affected +=
               entry.rows_by_pattern.size();
           return;
         }
         chain_ref = (*persistent_icache.dense_clade_to_chain_ref)[clade.id];
         if (chain_ref.id == no_clade) {
-          state.counters.fixed_topology_icache_rows_recomputed_affected +=
+          counters.fixed_topology_icache_rows_recomputed_affected +=
               entry.rows_by_pattern.size();
           return;
         }
@@ -1827,13 +1940,13 @@ chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
           // The persistent cache row equals the selected row; it is a valid
           // source for the selected-topology delta (an UNAFFECTED row, reused
           // from the persistent inside cache).
-          state.counters.fixed_topology_icache_rows_reused +=
+          counters.fixed_topology_icache_rows_reused +=
               entry.rows_by_pattern.size();
         } else {
           // The selected production is locally suboptimal at this clade; this
           // is an AFFECTED row whose value must come from the selected
           // recurrence (the grammar-min cache could be lower).
-          state.counters.fixed_topology_icache_rows_recomputed_affected +=
+          counters.fixed_topology_icache_rows_recomputed_affected +=
               entry.rows_by_pattern.size();
         }
       };
@@ -1880,7 +1993,7 @@ chart_spr_selected_topology_node chart_spr_selected_topology_rows_for_clade(
   for (auto child : children) {
     child_nodes.push_back(chart_spr_selected_topology_rows_for_clade(
         cache, state, candidate, selected, child, active_refs,
-        persistent_icache));
+        persistent_icache, counters));
     if (child_nodes.back().entry == nullptr) {
       throw chart_spr_fixed_topology_cache_invariant_error(
           "fixed_topology_exact selected-topology cache: child cache entry "
@@ -1918,7 +2031,8 @@ chart_spr_selected_topology_root_entries_from_cache(
     chart_spr_selected_topology_row_cache& cache,
     chart_spr_search_state const& state,
     chart_spr_candidate_score const& candidate,
-    chart_spr_persistent_inside_cache_view persistent_icache) {
+    chart_spr_persistent_inside_cache_view persistent_icache,
+    chart_spr_search_counters& counters) {
   state.active_patterns.assert_no_skipped_invariant_metadata();
   if (!candidate.topology_selection.certificate) {
     throw std::runtime_error(
@@ -1939,13 +2053,13 @@ chart_spr_selected_topology_root_entries_from_cache(
   std::set<overlay_clade_ref> active_refs;
   auto before_root = chart_spr_selected_topology_rows_for_clade(
       cache, state, candidate.candidate, before_selected,
-      base_clade_ref(state.grammar.root_clade), active_refs,
-      persistent_icache);
+      base_clade_ref(state.grammar.root_clade), active_refs, persistent_icache,
+      counters);
   active_refs.clear();
   auto after_root = chart_spr_selected_topology_rows_for_clade(
       cache, state, candidate.candidate, after_selected,
-      base_clade_ref(state.grammar.root_clade), active_refs,
-      persistent_icache);
+      base_clade_ref(state.grammar.root_clade), active_refs, persistent_icache,
+      counters);
   if (before_root.entry == nullptr || after_root.entry == nullptr) {
     throw chart_spr_fixed_topology_cache_invariant_error(
         "fixed_topology_exact selected-topology cache: root cache entry "
@@ -1958,7 +2072,8 @@ chart_spr_selected_topology_root_entries_from_cache(
 chart_spr_fixed_topology_pattern_scores
 chart_spr_fixed_topology_materialized_oracle_pattern_scores(
     chart_spr_search_state const& state,
-    chart_spr_candidate_score const& candidate) {
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_counters& counters) {
   state.active_patterns.assert_no_skipped_invariant_metadata();
   if (!candidate.topology_selection.certificate) {
     throw std::runtime_error(
@@ -1979,11 +2094,11 @@ chart_spr_fixed_topology_materialized_oracle_pattern_scores(
   overlay_materialization_result materialized;
   {
     chart_spr_elapsed_accumulator materialization_timer{
-        state.counters.materialization_exact_verification_ms};
+        counters.materialization_exact_verification_ms};
     materialized = materialize_overlay_grammar(overlay);
   }
-  ++state.counters.full_overlay_materializations;
-  ++state.counters.overlay_materializations_for_oracle;
+  ++counters.full_overlay_materializations;
+  ++counters.overlay_materializations_for_oracle;
 
   std::vector<production_id> after_ids;
   after_ids.reserve(certificate.after_overlay_productions.size());
@@ -2232,7 +2347,8 @@ chart_cost chart_spr_min_row_over_state(
 bool chart_spr_apply_independent_sm_bug_for_tests(
     chart_spr_fixed_topology_cache_pattern_scores& scores,
     chart_spr_search_state const& state,
-    chart_spr_candidate_score const& candidate) {
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_counters& counters) {
   // Test-only buggy scorer for the Phase-8 shared-s_M guard.  This runs the
   // actual independent-state bug class rather than an arbitrary perturbation:
   // for the moved clade M, derive the selected before/after outside context
@@ -2295,7 +2411,7 @@ bool chart_spr_apply_independent_sm_bug_for_tests(
       if (applied_diff != 0) {
         scores.new_pattern_scores[p] -= applied_diff;
         scores.new_active_total -= applied_diff;
-        ++state.counters.fixed_topology_independent_sm_bug_witnesses_for_tests;
+        ++counters.fixed_topology_independent_sm_bug_witnesses_for_tests;
         return true;
       }
     }
@@ -2313,7 +2429,7 @@ bool chart_spr_apply_independent_sm_bug_for_tests(
       if (applied_diff != 0) {
         scores.new_pattern_scores[p] -= applied_diff;
         scores.new_active_total -= applied_diff;
-        ++state.counters.fixed_topology_independent_sm_bug_witnesses_for_tests;
+        ++counters.fixed_topology_independent_sm_bug_witnesses_for_tests;
         return true;
       }
     }
@@ -2368,7 +2484,7 @@ bool chart_spr_apply_independent_sm_bug_for_tests(
       if (applied_diff != 0) {
         scores.new_pattern_scores[p] -= applied_diff;
         scores.new_active_total -= applied_diff;
-        ++state.counters.fixed_topology_independent_sm_bug_witnesses_for_tests;
+        ++counters.fixed_topology_independent_sm_bug_witnesses_for_tests;
         return true;
       }
     }
@@ -2388,7 +2504,7 @@ bool chart_spr_apply_independent_sm_bug_for_tests(
       if (applied_diff != 0) {
         scores.new_pattern_scores[p] -= applied_diff;
         scores.new_active_total -= applied_diff;
-        ++state.counters.fixed_topology_independent_sm_bug_witnesses_for_tests;
+        ++counters.fixed_topology_independent_sm_bug_witnesses_for_tests;
         return true;
       }
     }
@@ -2428,8 +2544,11 @@ bool chart_spr_apply_independent_sm_bug_for_tests(
 // selected-topology per-pattern oracle and would trip the Phase-8 tests.
 chart_spr_fixed_topology_cache_pattern_scores
 chart_spr_fixed_topology_pattern_scores_from_persistent_cache(
-    chart_spr_local_commit_substrate& sub, chart_spr_search_state const& state,
-    chart_spr_candidate_score const& candidate, chart_scheduler& scheduler) {
+    chart_spr_local_commit_substrate const& sub,
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate,
+    chart_spr_exact_verification_context& context) {
+  auto& counters = context.counters;
   if (!sub.icache || !sub.ocache || !sub.chain) {
     throw chart_spr_fixed_topology_cache_invariant_error(
         "chart SPR fixed-topology cache verifier: local-commit substrate is "
@@ -2494,10 +2613,6 @@ chart_spr_fixed_topology_pattern_scores_from_persistent_cache(
   chart_spr_require_cache_budget(selected_cache_projected_resident,
                                  state.cache_opts,
                                  "chart SPR selected-topology cache");
-  state.selected_topology_cache_admitted_bytes = std::max(
-      state.selected_topology_cache_admitted_bytes, selected_cache_admission);
-  chart_spr_selected_topology_cache_operation_scope selected_cache_scope{
-      sub.selected_topology_cache};
 
   chart_spr_fixed_topology_cache_pattern_scores scores;
   auto const& active = state.active_patterns.patterns.patterns;
@@ -2509,80 +2624,85 @@ chart_spr_fixed_topology_pattern_scores_from_persistent_cache(
   // Phase 8 fixed-topology cache path.  The grammar-min inside cache cannot be
   // read for a selected topology in a general DAG: an unchanged selected
   // subtree may be locally suboptimal, so `icache.row(...)` would silently
-  // substitute a different production.  Instead the persistent selected-
+  // substitute a different production.  Instead an invocation-local selected-
   // topology cache stores rows keyed by the structural rooted topology and is
-  // the production cache for fixed_topology_exact.  The outside cache still
-  // supplies the root outside row, keeping the score in the same inside +
-  // outside convention as the local-commit cache.  No dense overlay
-  // materialization or B&B is performed here.
-  chart_spr_selected_topology_root_entries roots;
-  try {
-    chart_spr_persistent_inside_cache_view icache_view;
-    icache_view.icache = &*sub.icache;
-    icache_view.dense_clade_to_chain_ref = &sub.dense_clade_to_chain_ref;
-    roots = chart_spr_selected_topology_root_entries_from_cache(
-        sub.selected_topology_cache, state, candidate, icache_view);
-  } catch (chart_spr_fixed_topology_cache_invariant_error const&) {
-    throw;
-  } catch (std::exception const& e) {
-    throw chart_spr_fixed_topology_cache_invariant_error(
-        std::string{"chart SPR fixed-topology cache verifier: selected-"
-                    "topology cache access failed: "} +
-        e.what());
-  }
-  if (roots.before == nullptr || roots.after == nullptr) {
-    throw chart_spr_fixed_topology_cache_invariant_error(
-        "chart SPR fixed-topology cache verifier: selected-topology root "
-        "entry missing");
-  }
-  if (roots.before->rows_by_pattern.size() != active.size() ||
-      roots.after->rows_by_pattern.size() != active.size()) {
-    throw chart_spr_fixed_topology_cache_invariant_error(
-        "chart SPR fixed-topology cache verifier: selected-topology root "
-        "entry pattern count mismatch");
-  }
-  auto const selected_cache_resident =
-      chart_spr_selected_topology_cache_resident_bytes(
-          sub.selected_topology_cache);
-  if (selected_cache_resident > selected_cache_admission) {
-    throw chart_spr_fixed_topology_cache_invariant_error(
-        "chart SPR fixed-topology cache verifier: selected-topology cache "
-        "exceeded its conservative admission estimate");
-  }
-  for (std::size_t p = 0; p < active.size(); ++p) {
-    std::array<chart_cost, nuc_state_count> root_outside;
+  // the production cache for fixed_topology_exact.  Its lifetime ends after
+  // the root scores have been extracted, before either oracle runs.  The
+  // outside cache still supplies the root outside row, keeping the score in
+  // the same inside + outside convention as the local-commit cache.  No dense
+  // overlay materialization or B&B is performed here.
+  {
+    chart_spr_selected_topology_row_cache selected_topology_cache;
+    chart_spr_selected_topology_root_entries roots;
     try {
-      root_outside = ocache.row(p, root_chain_ref);
+      chart_spr_persistent_inside_cache_view icache_view;
+      icache_view.icache = &*sub.icache;
+      icache_view.dense_clade_to_chain_ref = &sub.dense_clade_to_chain_ref;
+      roots = chart_spr_selected_topology_root_entries_from_cache(
+          selected_topology_cache, state, candidate, icache_view, counters);
     } catch (chart_spr_fixed_topology_cache_invariant_error const&) {
       throw;
     } catch (std::exception const& e) {
       throw chart_spr_fixed_topology_cache_invariant_error(
-          std::string{"chart SPR fixed-topology cache verifier: outside root "
-                      "row access failed: "} +
+          std::string{"chart SPR fixed-topology cache verifier: selected-"
+                      "topology cache access failed: "} +
           e.what());
     }
-    auto old_min = chart_spr_min_inside_plus_outside(
-        roots.before->rows_by_pattern[p], root_outside);
-    auto new_min = chart_spr_min_inside_plus_outside(
-        roots.after->rows_by_pattern[p], root_outside);
-    auto old_score = chart_multisite_detail::checked_mul_cost(
-        active[p].weight, old_min,
-        "fixed_topology_exact persistent-cache old pattern score");
-    auto new_score = chart_multisite_detail::checked_mul_cost(
-        active[p].weight, new_min,
-        "fixed_topology_exact persistent-cache new pattern score");
-    scores.old_pattern_scores.push_back(old_score);
-    scores.new_pattern_scores.push_back(new_score);
-    scores.old_active_total = chart_multisite_detail::checked_add_u64(
-        scores.old_active_total, old_score,
-        "fixed_topology_exact persistent-cache old active total");
-    scores.new_active_total = chart_multisite_detail::checked_add_u64(
-        scores.new_active_total, new_score,
-        "fixed_topology_exact persistent-cache new active total");
+    if (roots.before == nullptr || roots.after == nullptr) {
+      throw chart_spr_fixed_topology_cache_invariant_error(
+          "chart SPR fixed-topology cache verifier: selected-topology root "
+          "entry missing");
+    }
+    if (roots.before->rows_by_pattern.size() != active.size() ||
+        roots.after->rows_by_pattern.size() != active.size()) {
+      throw chart_spr_fixed_topology_cache_invariant_error(
+          "chart SPR fixed-topology cache verifier: selected-topology root "
+          "entry pattern count mismatch");
+    }
+    auto const selected_cache_resident =
+        chart_spr_selected_topology_cache_resident_bytes(
+            selected_topology_cache);
+    if (selected_cache_resident > selected_cache_admission) {
+      throw chart_spr_fixed_topology_cache_invariant_error(
+          "chart SPR fixed-topology cache verifier: selected-topology cache "
+          "exceeded its conservative admission estimate");
+    }
+    for (std::size_t p = 0; p < active.size(); ++p) {
+      std::array<chart_cost, nuc_state_count> root_outside;
+      try {
+        root_outside = ocache.row(p, root_chain_ref);
+      } catch (chart_spr_fixed_topology_cache_invariant_error const&) {
+        throw;
+      } catch (std::exception const& e) {
+        throw chart_spr_fixed_topology_cache_invariant_error(
+            std::string{"chart SPR fixed-topology cache verifier: outside root "
+                        "row access failed: "} +
+            e.what());
+      }
+      auto old_min = chart_spr_min_inside_plus_outside(
+          roots.before->rows_by_pattern[p], root_outside);
+      auto new_min = chart_spr_min_inside_plus_outside(
+          roots.after->rows_by_pattern[p], root_outside);
+      auto old_score = chart_multisite_detail::checked_mul_cost(
+          active[p].weight, old_min,
+          "fixed_topology_exact persistent-cache old pattern score");
+      auto new_score = chart_multisite_detail::checked_mul_cost(
+          active[p].weight, new_min,
+          "fixed_topology_exact persistent-cache new pattern score");
+      scores.old_pattern_scores.push_back(old_score);
+      scores.new_pattern_scores.push_back(new_score);
+      scores.old_active_total = chart_multisite_detail::checked_add_u64(
+          scores.old_active_total, old_score,
+          "fixed_topology_exact persistent-cache old active total");
+      scores.new_active_total = chart_multisite_detail::checked_add_u64(
+          scores.new_active_total, new_score,
+          "fixed_topology_exact persistent-cache new active total");
+    }
   }
 
   if (sub.force_independent_sm_bug_for_tests) {
-    chart_spr_apply_independent_sm_bug_for_tests(scores, state, candidate);
+    chart_spr_apply_independent_sm_bug_for_tests(scores, state, candidate,
+                                                 counters);
   }
 
   chart_spr_fixed_topology_pattern_scores cache_scores;
@@ -2601,13 +2721,16 @@ chart_spr_fixed_topology_pattern_scores_from_persistent_cache(
   // path alone could not detect.  On per-pattern mismatch the direct oracle's
   // value is retained as the from-scratch authority for the selected topology
   // and the cache value is not trusted.
-  scores.direct_oracle_scores = fixed_topology_direct_selected_pattern_scores(
-      state, candidate, scheduler);
-  if (auto direct_mismatch =
-          chart_spr_fixed_topology_first_pattern_mismatch(
-              cache_scores, *scores.direct_oracle_scores,
-              "persistent-cache", "direct-overlay-selected-oracle")) {
-    ++state.counters.fixed_topology_persistent_cache_direct_oracle_mismatches;
+  scores.direct_oracle_scores =
+      context.inner_scheduler != nullptr
+          ? fixed_topology_direct_selected_pattern_scores(
+                state, candidate, counters, *context.inner_scheduler)
+          : fixed_topology_direct_selected_pattern_scores(state, candidate,
+                                                          counters);
+  if (auto direct_mismatch = chart_spr_fixed_topology_first_pattern_mismatch(
+          cache_scores, *scores.direct_oracle_scores, "persistent-cache",
+          "direct-overlay-selected-oracle")) {
+    ++counters.fixed_topology_persistent_cache_direct_oracle_mismatches;
     scores.oracle_mismatch_reason = *direct_mismatch;
     // Fall through to the optional materialized oracle so that, when the
     // stronger from-scratch oracle is requested, its value is the one used as
@@ -2627,8 +2750,8 @@ chart_spr_fixed_topology_pattern_scores_from_persistent_cache(
   if (sub.verify_materialized_fixed_topology_oracle_for_tests ||
       sub.force_independent_sm_bug_for_tests) {
     scores.materialized_oracle_scores =
-        chart_spr_fixed_topology_materialized_oracle_pattern_scores(state,
-                                                                   candidate);
+        chart_spr_fixed_topology_materialized_oracle_pattern_scores(
+            state, candidate, counters);
     if (auto mismatch = chart_spr_fixed_topology_first_pattern_mismatch(
             cache_scores, *scores.materialized_oracle_scores,
             "persistent-cache", "materialized-selected-oracle")) {
@@ -2680,9 +2803,10 @@ chart_spr_build_exact_from_oracle_pattern_scores(
 chart_spr_candidate_score
 chart_spr_verify_fixed_topology_direct_fallback_after_counting(
     chart_spr_search_state const& state, chart_spr_candidate_score candidate,
-    chart_spr_fixed_topology_cache_pattern_scores const& cache_scores) {
+    chart_spr_fixed_topology_cache_pattern_scores const& cache_scores,
+    chart_spr_search_counters& counters) {
   auto const& reason = cache_scores.oracle_mismatch_reason;
-  ++state.counters.fixed_topology_persistent_cache_fallbacks;
+  ++counters.fixed_topology_persistent_cache_fallbacks;
   // Issue 4: when the materialized from-scratch oracle ran and mismatched, its
   // value is the authority -- use it directly rather than re-running the
   // direct overlay scorer (which shares overlay-space row machinery with the
@@ -2691,7 +2815,7 @@ chart_spr_verify_fixed_topology_direct_fallback_after_counting(
   // the mismatch; its value is the authority for the selected topology.
   try {
     if (cache_scores.materialized_oracle_scores) {
-      ++state.counters.fixed_topology_persistent_cache_oracle_mismatches;
+      ++counters.fixed_topology_persistent_cache_oracle_mismatches;
       return chart_spr_build_exact_from_oracle_pattern_scores(
           state, std::move(candidate),
           *cache_scores.materialized_oracle_scores);
@@ -2702,7 +2826,8 @@ chart_spr_verify_fixed_topology_direct_fallback_after_counting(
     }
     // No oracle ran (e.g. the verifier failed before reaching the gate).  Use
     // the conservative from-scratch direct scorer as the last resort.
-    auto delta = fixed_topology_delta_direct_selected_topology(state, candidate);
+    auto delta = fixed_topology_delta_direct_selected_topology(state, candidate,
+                                                               counters);
     candidate.exact = make_chart_spr_objective_score(
         delta, chart_spr_score_kind::fixed_topology_exact,
         chart_spr_score_convention::full_with_invariants,
@@ -2718,8 +2843,9 @@ chart_spr_verify_fixed_topology_direct_fallback_after_counting(
 
 chart_spr_candidate_score
 chart_spr_verify_candidate_fixed_topology_exact_from_persistent_cache(
-    chart_spr_local_commit_substrate& sub, chart_spr_search_state const& state,
-    chart_spr_candidate_score candidate, chart_scheduler& scheduler) {
+    chart_spr_local_commit_substrate const& sub,
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate,
+    chart_spr_exact_verification_context& context) {
   if (!candidate.valid) return candidate;
   if (!chart_spr_topology_selection_has_certificate_or_selector(
           candidate.topology_selection)) {
@@ -2738,14 +2864,15 @@ chart_spr_verify_candidate_fixed_topology_exact_from_persistent_cache(
     return candidate;
   }
 
-  ++state.counters.exact_verifications;
-  ++state.counters.fixed_topology_persistent_cache_verifications;
+  auto& counters = context.counters;
+  ++counters.exact_verifications;
+  ++counters.fixed_topology_persistent_cache_verifications;
   try {
     auto scores = chart_spr_fixed_topology_pattern_scores_from_persistent_cache(
-        sub, state, candidate, scheduler);
+        sub, state, candidate, context);
     if (!scores.cache_score_ready_for_exact_label) {
       return chart_spr_verify_fixed_topology_direct_fallback_after_counting(
-          state, std::move(candidate), scores);
+          state, std::move(candidate), scores, counters);
     }
     auto old_full = chart_spr_add_invariant_offset(
         scores.old_active_total, state,
@@ -2858,7 +2985,8 @@ chart_spr_transient_extension chart_spr_build_transient_extension(
     chart_spr_local_commit_substrate const& sub,
     chart_spr_search_state const& state,
     checked_chart_execution_plan_ref const& checked_state,
-    chart_spr_candidate_score const& candidate) {
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_counters& counters) {
   chart_spr_transient_extension ext;
   // Copy the committed chain (reader-local).  The chain's base pointer still
   // references the substrate's frozen base grammar, which lives for the run.
@@ -2905,7 +3033,7 @@ chart_spr_transient_extension chart_spr_build_transient_extension(
   overlay_payload_validation_stats completed_payload_validation_stats;
   try {
     chart_spr_elapsed_accumulator materialization_timer{
-        state.counters.materialization_exact_verification_ms};
+        counters.materialization_exact_verification_ms};
     if (!sub.checked_base_execution_plan) {
       throw std::runtime_error(
           "chart SPR transient extension: missing checked frozen-base plan");
@@ -2916,14 +3044,13 @@ chart_spr_transient_extension chart_spr_build_transient_extension(
         &completed_payload_validation_stats);
     ext.planned = std::move(planned);
   } catch (...) {
-    record_overlay_payload_validation_stats(
-        state.counters, completed_payload_validation_stats);
+    record_overlay_payload_validation_stats(counters,
+                                            completed_payload_validation_stats);
     throw;
   }
-  record_planned_overlay_materialization_stats(state.counters,
-                                               ext.planned);
+  record_planned_overlay_materialization_stats(counters, ext.planned);
   if (build_diagnostic_caches) {
-    ++state.counters.transient_chain_diagnostic_cache_extensions;
+    ++counters.transient_chain_diagnostic_cache_extensions;
   }
   return ext;
 }
@@ -2949,7 +3076,8 @@ chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
     chart_spr_candidate_score const& candidate,
     chart_spr_transient_extension const& ext,
     std::uint64_t transient_new_optimum,
-    multisite_trim_options const& trim_options) {
+    multisite_trim_options const& trim_options,
+    chart_spr_search_counters& counters) {
   chart_spr_transient_oracle_result result;
   if (!ext.icache || !ext.ocache) {
     throw std::runtime_error(
@@ -2974,15 +3102,15 @@ chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
   overlay_materialization_result cold_materialized;
   {
     chart_spr_elapsed_accumulator materialization_timer{
-        state.counters.materialization_exact_verification_ms};
+        counters.materialization_exact_verification_ms};
     cold_materialized = materialize_overlay_grammar(cold_overlay);
   }
-  ++state.counters.full_overlay_materializations;
-  ++state.counters.overlay_materializations_for_oracle;
-  auto cold_trim = build_multisite_trim_active(
-      cold_materialized.grammar, state.active_patterns, state.chart_opts,
-      trim_options);
-  record_multisite_exact_trim_work(state.counters, cold_trim);
+  ++counters.full_overlay_materializations;
+  ++counters.overlay_materializations_for_oracle;
+  auto cold_trim = build_multisite_trim_active(cold_materialized.grammar,
+                                               state.active_patterns,
+                                               state.chart_opts, trim_options);
+  record_multisite_exact_trim_work(counters, cold_trim);
   result.cold_new_optimum = cold_trim.optimum;
 
   // Both-charts check: scratch caches vs from-scratch on the extended grammar.
@@ -3002,7 +3130,7 @@ chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
     for (std::size_t dense = 0;
          dense < ext.planned.materialized.dense_clade_to_ref.size(); ++dense) {
       auto ref = ext.planned.materialized.dense_clade_to_ref[dense];
-      ++state.counters.transient_chain_extension_oracle_rows_checked_for_tests;
+      ++counters.transient_chain_extension_oracle_rows_checked_for_tests;
       if (icache.row(p, ref) != oracle.first.inside[dense]) {
         result.ok = false;
         result.mismatch_reason =
@@ -3049,16 +3177,19 @@ chart_spr_transient_oracle_result chart_spr_check_transient_extension_oracle(
 // transient count is recorded as a fallback.
 chart_spr_candidate_score
 chart_spr_verify_candidate_exact_multisite_from_transient_extension(
-    chart_spr_local_commit_substrate& sub, chart_spr_search_state const& state,
-    chart_spr_candidate_score candidate,
+    chart_spr_local_commit_substrate const& sub,
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate,
     checked_chart_execution_plan_ref const& checked_state,
-    chart_scheduler& scheduler, multisite_trim_options const& trim_options) {
+    chart_spr_exact_verification_context& context,
+    multisite_trim_options const& trim_options) {
   if (!candidate.valid) return candidate;
+  auto& counters = context.counters;
+  auto* scheduler = context.inner_scheduler;
 
   chart_spr_transient_extension ext;
   try {
-    ext = chart_spr_build_transient_extension(
-        sub, state, checked_state, candidate);
+    ext = chart_spr_build_transient_extension(sub, state, checked_state,
+                                              candidate, counters);
   } catch (std::runtime_error const& e) {
     // The candidate delta cannot be appended to the scratch chain (tombstone
     // scope: it tombstones a production that does not resolve to a frozen-base
@@ -3070,8 +3201,8 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
     // skip remains a labelled, counted outcome.  Any other append error is a
     // hard correctness failure and is rethrown.
     if (chart_spr_is_local_commit_tombstone_scope_rejection(e.what())) {
-      return verify_candidate_exact_against_state(
-          state, std::move(candidate), checked_state, scheduler, trim_options);
+      return verify_candidate_exact_against_state_impl(
+          state, std::move(candidate), checked_state, context, trim_options);
     }
     throw;
   }
@@ -3079,22 +3210,26 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
   // The transient extension succeeded: this candidate's delta resolves to
   // frozen-base productions, so it could be committed.  Count it under the
   // transient-extension counter (never under full_overlay_materializations).
-  ++state.counters.exact_verifications;
-  ++state.counters.transient_chain_extensions_for_verification;
+  ++counters.exact_verifications;
+  ++counters.transient_chain_extensions_for_verification;
   multisite_trim_result new_trim;
   multisite_trim_scheduler_run_summaries scheduler_runs;
   chart_spr_scheduler_run_axis_publisher publish_setup_runs{
-      state.counters.scheduler_axes.exact_setup_patterns,
-      scheduler_runs.exact_setup};
+      counters.scheduler_axes.exact_setup_patterns, scheduler_runs.exact_setup};
   chart_spr_scheduler_run_axis_publisher publish_frontier_runs{
-      state.counters.scheduler_axes.exact_frontier_clades,
+      counters.scheduler_axes.exact_frontier_clades,
       scheduler_runs.frontier_clades};
   std::uint64_t authoritative_new_optimum = multisite_score_inf;
   try {
     // Old score: the current tip's exact optimum (cached in state, lazily
     // built).  Same source the cold path reads.
-    auto const& old_trim = ensure_chart_spr_state_exact_trim(
-        state, checked_state, scheduler, trim_options);
+    auto const& old_trim =
+        context.published_old_trim != nullptr ? *context.published_old_trim
+        : scheduler != nullptr
+            ? ensure_chart_spr_state_exact_trim(state, checked_state,
+                                                *scheduler, trim_options)
+            : ensure_chart_spr_state_exact_trim(state, checked_state,
+                                                trim_options);
 
     // New score: B&B exact optimum of the extended grammar.
     if (state.cache_strategy ==
@@ -3102,18 +3237,24 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
       chart_spr_force_candidate_exact_bnb_overflow_for_tests(candidate);
       new_trim = build_lazy_multisite_trim_active_from_scratch(
           ext.planned, state.active_patterns, state.chart_opts, trim_options);
-    } else {
+    } else if (scheduler != nullptr) {
       state.active_patterns.assert_no_skipped_invariant_metadata();
       chart_spr_force_candidate_exact_bnb_overflow_for_tests(candidate);
       new_trim = build_multisite_trim(
-          ext.planned.execution_plan, state.active_patterns.patterns, scheduler,
-          state.chart_opts, trim_options, &scheduler_runs);
+          ext.planned.execution_plan, state.active_patterns.patterns,
+          *scheduler, state.chart_opts, trim_options, &scheduler_runs);
+    } else {
+      chart_spr_force_candidate_exact_bnb_overflow_for_tests(candidate);
+      new_trim = build_multisite_trim_active(ext.planned.execution_plan,
+                                             state.active_patterns,
+                                             state.chart_opts, trim_options);
     }
-    if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
-      ++state.counters.exact_trim_lazy_chart_uses;
+    if (state.cache_strategy ==
+        chart_spr_cache_strategy::lazy_multisite_chart) {
+      ++counters.exact_trim_lazy_chart_uses;
     }
-    record_multisite_exact_trim_work(state.counters, new_trim);
-    ++state.counters.chart_execution_plan_cache_hits;
+    record_multisite_exact_trim_work(counters, new_trim);
+    ++counters.chart_execution_plan_cache_hits;
 
     // Optional corruption hook: perturb a scratch outside row so the two-chart
     // oracle catches the disagreement and the verifier falls back to the cold
@@ -3156,10 +3297,10 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
     if (sub.verify_transient_chain_extension_oracle_for_tests ||
         sub.force_transient_chain_extension_oracle_mismatch_for_tests) {
       auto oracle = chart_spr_check_transient_extension_oracle(
-          sub, state, candidate, ext, new_trim.optimum, trim_options);
+          sub, state, candidate, ext, new_trim.optimum, trim_options, counters);
       if (!oracle.ok) {
-        ++state.counters.transient_chain_extension_oracle_mismatches;
-        ++state.counters.transient_chain_extension_fallbacks;
+        ++counters.transient_chain_extension_oracle_mismatches;
+        ++counters.transient_chain_extension_fallbacks;
         authoritative_new_optimum = oracle.cold_new_optimum;
       }
     }
@@ -3209,7 +3350,7 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
                   trim_options, new_trim,
                   state.invariant_constant_offset));
       if (new_trim.keep_production_exact) {
-        ++state.counters.chart_execution_plan_cache_hits;
+        ++counters.chart_execution_plan_cache_hits;
       }
     } else {
       chart_spr_canonical_exact_evidence evidence;
@@ -3914,11 +4055,8 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
       state.resident_pattern_cache_bytes,
       state.local_commit_persistent_cache_bytes,
       "chart SPR local-commit refreshed resident byte overflow");
-  auto const admitted_resident_bytes = chart_spr_checked_cache_bytes_add(
-      state.resident_pattern_cache_bytes,
-      state.selected_topology_cache_admitted_bytes,
-      "chart SPR local-commit admitted resident byte overflow");
-  chart_spr_require_cache_budget(admitted_resident_bytes, state.cache_opts,
+  chart_spr_require_cache_budget(state.resident_pattern_cache_bytes,
+                                 state.cache_opts,
                                  "chart SPR local-commit tip refresh");
 
   std::uint64_t composite_without_invariants = 0;
@@ -4242,6 +4380,20 @@ void chart_spr_refresh_search_summary_from_counters(
   summary.candidate_pattern_clade_order_sorts =
       counters.candidate_pattern_clade_order_sorts;
   summary.exact_verifications = counters.exact_verifications;
+  summary.exact_candidate_admission_batches =
+      counters.exact_candidate_admission_batches;
+  summary.exact_candidate_parallel_batches =
+      counters.exact_candidate_parallel_batches;
+  summary.exact_candidate_inner_parallel_batches =
+      counters.exact_candidate_inner_parallel_batches;
+  summary.exact_candidate_memory_limited_batches =
+      counters.exact_candidate_memory_limited_batches;
+  summary.exact_candidate_peak_admitted_bytes =
+      counters.exact_candidate_peak_admitted_bytes;
+  summary.exact_candidate_peak_projected_resident_bytes =
+      counters.exact_candidate_peak_projected_resident_bytes;
+  summary.exact_candidate_queued_for_memory_ms =
+      counters.exact_candidate_queued_for_memory_ms;
   summary.overlay_materializations_for_exact_verification =
       counters.overlay_materializations_for_exact_verification;
   summary.overlay_materializations_for_accept_materialization =
@@ -4374,6 +4526,1175 @@ void chart_spr_refresh_search_summary_from_current_lazy_chart(
 
 }  // namespace
 
+std::size_t estimate_chart_spr_lazy_cache_admission_bytes(
+    std::size_t clade_count, std::size_t pattern_count) {
+  return chart_spr_conservative_lazy_cache_bytes(clade_count, pattern_count);
+}
+
+namespace {
+
+struct chart_spr_saturating_size {
+  std::size_t value = 0;
+  bool saturated = false;
+};
+
+chart_spr_saturating_size chart_spr_saturating_add(
+    chart_spr_saturating_size lhs, std::size_t rhs,
+    std::size_t limit = (std::numeric_limits<std::size_t>::max)()) {
+  if (lhs.saturated || rhs > limit || lhs.value > limit - rhs) {
+    return chart_spr_saturating_size{limit, true};
+  }
+  lhs.value += rhs;
+  return lhs;
+}
+
+chart_spr_saturating_size chart_spr_saturating_add(
+    chart_spr_saturating_size lhs, chart_spr_saturating_size rhs,
+    std::size_t limit = (std::numeric_limits<std::size_t>::max)()) {
+  auto result = chart_spr_saturating_add(lhs, rhs.value, limit);
+  result.saturated = result.saturated || rhs.saturated;
+  return result;
+}
+
+chart_spr_saturating_size chart_spr_saturating_multiply(
+    std::size_t lhs, std::size_t rhs,
+    std::size_t limit = (std::numeric_limits<std::size_t>::max)()) {
+  if (lhs != 0 && rhs > limit / lhs) {
+    return chart_spr_saturating_size{limit, true};
+  }
+  return chart_spr_saturating_size{lhs * rhs, false};
+}
+
+chart_spr_saturating_size chart_spr_saturating_multiply(
+    chart_spr_saturating_size lhs, std::size_t rhs,
+    std::size_t limit = (std::numeric_limits<std::size_t>::max)()) {
+  auto result = chart_spr_saturating_multiply(lhs.value, rhs, limit);
+  result.saturated = result.saturated || lhs.saturated;
+  return result;
+}
+
+chart_spr_saturating_size chart_spr_saturating_max(
+    chart_spr_saturating_size lhs, chart_spr_saturating_size rhs) noexcept {
+  return chart_spr_saturating_size{std::max(lhs.value, rhs.value),
+                                   lhs.saturated || rhs.saturated};
+}
+
+std::size_t chart_spr_bit_capacity_bytes(std::size_t bit_capacity) {
+  constexpr auto bits_per_word = sizeof(unsigned long) * 8;
+  auto words = bit_capacity / bits_per_word;
+  if (bit_capacity % bits_per_word != 0) ++words;
+  return chart_spr_checked_cache_bytes_multiply(
+      words, sizeof(unsigned long),
+      "chart SPR exact-candidate bit-capacity byte overflow");
+}
+
+template <class Vector>
+std::size_t chart_spr_vector_capacity_bytes(Vector const& values) {
+  return chart_spr_checked_cache_bytes_multiply(
+      values.capacity(), sizeof(typename Vector::value_type),
+      "chart SPR exact-candidate vector-capacity byte overflow");
+}
+
+struct chart_spr_virtual_topology_bound {
+  std::size_t clade_count = 0;
+  std::size_t production_count = 0;
+  std::size_t child_occurrence_count = 0;
+  std::size_t total_frontier_entries = 0;
+  std::size_t root_frontier_entries = 0;
+  bool saturated = false;
+};
+
+chart_spr_virtual_topology_bound chart_spr_candidate_topology_bound(
+    chart_spr_search_state const& state, grammar_spr_candidate const& candidate,
+    std::size_t entry_limit) {
+  auto const base_clades = state.grammar.clades.size();
+  auto const temp_clades = candidate.added_clades.size();
+  chart_spr_virtual_topology_bound result;
+  result.clade_count = chart_spr_checked_cache_bytes_add(
+      base_clades, temp_clades,
+      "chart SPR exact-candidate virtual clade-count overflow");
+
+  std::vector<bool> removed(state.grammar.productions.size(), false);
+  for (auto ref : candidate.removed_productions) {
+    if (ref.space != overlay_id_space::base || ref.id >= removed.size()) {
+      result.saturated = true;
+      continue;
+    }
+    removed[ref.id] = true;
+  }
+  result.production_count = candidate.added_productions.size();
+  for (std::size_t pid = 0; pid < state.grammar.productions.size(); ++pid) {
+    if (!removed[pid]) {
+      result.production_count = chart_spr_checked_cache_bytes_add(
+          result.production_count, 1,
+          "chart SPR exact-candidate virtual production-count overflow");
+    }
+  }
+  for (std::size_t pid = 0; pid < state.grammar.productions.size(); ++pid) {
+    if (!removed[pid]) {
+      result.child_occurrence_count = chart_spr_checked_cache_bytes_add(
+          result.child_occurrence_count,
+          state.grammar.productions[pid].children.size(),
+          "chart SPR exact-candidate child-occurrence overflow");
+    }
+  }
+  for (auto const& production : candidate.added_productions) {
+    result.child_occurrence_count = chart_spr_checked_cache_bytes_add(
+        result.child_occurrence_count, production.children.size(),
+        "chart SPR exact-candidate child-occurrence overflow");
+  }
+
+  auto dense_index = [&](overlay_clade_ref ref) -> std::optional<std::size_t> {
+    if (ref.space == overlay_id_space::base) {
+      if (ref.id >= base_clades) return std::nullopt;
+      return ref.id;
+    }
+    if (ref.id >= temp_clades) return std::nullopt;
+    return base_clades + ref.id;
+  };
+  auto ref_for_dense = [&](std::size_t dense) {
+    return dense < base_clades
+               ? base_clade_ref(static_cast<clade_id>(dense))
+               : temp_clade_ref(static_cast<clade_id>(dense - base_clades));
+  };
+  auto is_leaf = [&](overlay_clade_ref ref) {
+    return ref.space == overlay_id_space::base
+               ? ref.id < state.grammar.clades.size() &&
+                     state.grammar.clades[ref.id].taxa.size() == 1
+               : ref.id < candidate.added_clades.size() &&
+                     candidate.added_clades[ref.id].taxa.size() == 1;
+  };
+
+  std::vector<std::size_t> memo(result.clade_count, 0);
+  std::vector<std::uint8_t> visit(result.clade_count, 0);
+  auto count_ref = [&](auto&& self, overlay_clade_ref ref) -> std::size_t {
+    auto dense = dense_index(ref);
+    if (!dense) {
+      result.saturated = true;
+      return entry_limit;
+    }
+    if (visit[*dense] == 2) return memo[*dense];
+    if (visit[*dense] == 1) {
+      result.saturated = true;
+      return entry_limit;
+    }
+    visit[*dense] = 1;
+    if (is_leaf(ref)) {
+      memo[*dense] = 1;
+      visit[*dense] = 2;
+      return 1;
+    }
+
+    chart_spr_saturating_size total;
+    auto add_production = [&](auto const& children) {
+      chart_spr_saturating_size product{1, false};
+      for (auto child_ref : children) {
+        auto child_count = self(self, child_ref);
+        auto multiplied = chart_spr_saturating_multiply(
+            product.value, child_count, entry_limit);
+        product.value = multiplied.value;
+        product.saturated = product.saturated || multiplied.saturated;
+      }
+      total = chart_spr_saturating_add(total, product.value, entry_limit);
+      total.saturated = total.saturated || product.saturated;
+    };
+    if (ref.space == overlay_id_space::base) {
+      for (auto pid : state.grammar.productions_by_parent[ref.id]) {
+        if (pid >= state.grammar.productions.size() || removed[pid]) continue;
+        std::vector<overlay_clade_ref> children;
+        children.reserve(state.grammar.productions[pid].children.size());
+        for (auto child : state.grammar.productions[pid].children) {
+          children.push_back(base_clade_ref(child));
+        }
+        add_production(children);
+      }
+    }
+    for (auto const& production : candidate.added_productions) {
+      if (production.parent == ref) add_production(production.children);
+    }
+    if (total.value == 0) {
+      // Invalid/unreachable internal clades fail before a frontier can grow;
+      // retain one entry as a safe structural minimum for preflight.
+      total.value = 1;
+    }
+    result.saturated = result.saturated || total.saturated;
+    memo[*dense] = total.value;
+    visit[*dense] = 2;
+    return memo[*dense];
+  };
+
+  chart_spr_saturating_size all_entries;
+  for (std::size_t dense = 0; dense < result.clade_count; ++dense) {
+    all_entries = chart_spr_saturating_add(
+        all_entries, count_ref(count_ref, ref_for_dense(dense)), entry_limit);
+  }
+  result.total_frontier_entries = all_entries.value;
+  result.saturated = result.saturated || all_entries.saturated;
+  if (state.grammar.root_clade == no_clade ||
+      state.grammar.root_clade >= base_clades) {
+    result.saturated = true;
+    result.root_frontier_entries = entry_limit;
+  } else {
+    result.root_frontier_entries =
+        count_ref(count_ref, base_clade_ref(state.grammar.root_clade));
+  }
+  return result;
+}
+
+chart_spr_saturating_size chart_spr_estimate_candidate_structural_bytes(
+    chart_spr_search_state const& state, grammar_spr_candidate const& candidate,
+    chart_spr_virtual_topology_bound const& topology) {
+  chart_spr_saturating_size total{
+      sizeof(clade_grammar) + sizeof(chart_execution_plan), false};
+  auto add_product = [&](std::size_t count, std::size_t bytes) {
+    auto product = chart_spr_saturating_multiply(count, bytes);
+    total = chart_spr_saturating_add(total, product.value);
+    total.saturated = total.saturated || product.saturated;
+  };
+
+  // Frozen-libstdc++ operational upper bound for the materialized grammar,
+  // its dense maps, execution plan, and plan-builder scratch. Nested source
+  // witness/string payloads are walked below; the factor two covers geometric
+  // growth while building rather than copy-constructing the vectors.
+  add_product(topology.clade_count,
+              2 * (sizeof(clade_key) + sizeof(chart_plan_clade_descriptor) +
+                   8 * sizeof(void*)));
+  add_product(
+      topology.production_count,
+      2 * (sizeof(grammar_production) +
+           sizeof(chart_plan_production_descriptor) + 10 * sizeof(void*)));
+  add_product(topology.child_occurrence_count,
+              2 * (sizeof(clade_id) + sizeof(production_id) +
+                   sizeof(chart_plan_child_occurrence)));
+  add_product(topology.clade_count,
+              12 * (sizeof(clade_id) + sizeof(std::size_t)));
+  add_product(topology.production_count, 6 * sizeof(production_id));
+
+  for (auto const& sample : state.grammar.taxa.id_to_sample_id) {
+    auto sample_bytes = chart_spr_saturating_add({sample.size(), false}, 1);
+    total.saturated = total.saturated || sample_bytes.saturated;
+    add_product(sample_bytes.value, 4);
+  }
+  for (auto const& clade : state.grammar.clades) {
+    add_product(clade.taxa.size(), 4 * sizeof(taxon_id));
+  }
+  for (auto const& clade : candidate.added_clades) {
+    add_product(clade.taxa.size(), 4 * sizeof(taxon_id));
+  }
+  for (auto const& production : state.grammar.productions) {
+    add_product(production.children.size(), 4 * sizeof(clade_id));
+    for (auto const& witness : production.witnesses) {
+      add_product(1, 4 * sizeof(production_witness));
+      for (auto const& child : witness.children) {
+        add_product(1, 4 * sizeof(production_child_witness));
+        add_product(child.edge_alternatives.size(), 4 * sizeof(std::size_t));
+      }
+    }
+  }
+  for (auto const& production : candidate.added_productions) {
+    add_product(production.children.size(), 4 * sizeof(overlay_clade_ref));
+    for (auto const& witness : production.witnesses) {
+      add_product(1, 4 * sizeof(production_witness));
+      for (auto const& child : witness.children) {
+        add_product(1, 4 * sizeof(production_child_witness));
+        add_product(child.edge_alternatives.size(), 4 * sizeof(std::size_t));
+      }
+    }
+  }
+  return total;
+}
+
+chart_spr_saturating_size chart_spr_virtual_key_bytes(
+    chart_spr_search_state const& state,
+    chart_spr_virtual_topology_bound const& topology) {
+  chart_spr_saturating_size all_taxon_text_bytes;
+  for (auto const& sample_id : state.grammar.taxa.id_to_sample_id) {
+    all_taxon_text_bytes = chart_spr_saturating_add(
+        all_taxon_text_bytes,
+        chart_spr_saturating_add({sample_id.size(), false}, 16));
+  }
+  auto const clade_key_bytes = chart_spr_saturating_add(
+      {256, false}, chart_spr_saturating_multiply(all_taxon_text_bytes, 2));
+  auto clade_keys = chart_spr_saturating_multiply(topology.clade_count,
+                                                  clade_key_bytes.value);
+  clade_keys.saturated = clade_keys.saturated || clade_key_bytes.saturated;
+
+  // A production key renders its parent and every child clade key.  Bounding
+  // each rendered clade by the full taxon universe is deliberately loose but
+  // derives from the actual sample-id lengths instead of a fixed character
+  // guess.
+  auto production_key_occurrences = chart_spr_saturating_add(
+      {topology.production_count, false}, topology.child_occurrence_count);
+  auto production_keys = chart_spr_saturating_multiply(
+      production_key_occurrences, clade_key_bytes.value);
+  production_keys = chart_spr_saturating_add(
+      production_keys,
+      chart_spr_saturating_multiply(topology.production_count, 256));
+  return chart_spr_saturating_add(clade_keys, production_keys);
+}
+
+void chart_spr_exact_resident_add(std::size_t& total, std::size_t bytes) {
+  total = chart_spr_checked_cache_bytes_add(
+      total, bytes, "chart SPR exact-loop resident-input byte overflow");
+}
+
+template <class Vector>
+void chart_spr_exact_resident_add_vector(std::size_t& total,
+                                         Vector const& values) {
+  chart_spr_exact_resident_add(
+      total,
+      chart_spr_vector_capacity_bytes(
+          values, "chart SPR exact-loop vector-capacity byte overflow"));
+}
+
+void chart_spr_exact_resident_add_string(std::size_t& total,
+                                         std::string const& value) {
+  // basic_string::capacity excludes the terminating null. Charging it even
+  // for an SSO string is deliberately conservative because the containing
+  // object has already been charged by its owning vector/object surface.
+  auto const chars = chart_spr_checked_cache_bytes_add(
+      value.capacity(), 1,
+      "chart SPR exact-loop string-capacity byte overflow");
+  chart_spr_exact_resident_add(total, chars);
+}
+
+void chart_spr_exact_resident_add_string_vector(
+    std::size_t& total, std::vector<std::string> const& values) {
+  chart_spr_exact_resident_add_vector(total, values);
+  for (auto const& value : values) {
+    chart_spr_exact_resident_add_string(total, value);
+  }
+}
+
+std::size_t chart_spr_canonical_exact_evidence_dynamic_bytes(
+    chart_spr_canonical_exact_evidence const& evidence) {
+  std::size_t total = 0;
+  chart_spr_exact_resident_add_string(total, evidence.evidence_kind);
+  chart_spr_exact_resident_add_string(total, evidence.keep_mask_kind);
+  chart_spr_exact_resident_add_string(total,
+                                      evidence.topology_selection_kind);
+  chart_spr_exact_resident_add_string(total, evidence.topology_selector);
+  chart_spr_exact_resident_add_string_vector(
+      total, evidence.kept_production_keys);
+  chart_spr_exact_resident_add_vector(total, evidence.frontier_sizes);
+  for (auto const& [key, size] : evidence.frontier_sizes) {
+    (void)size;
+    chart_spr_exact_resident_add_string(total, key);
+  }
+  chart_spr_exact_resident_add_vector(
+      total, evidence.optimal_root_provenance_classes);
+  for (auto const& provenance : evidence.optimal_root_provenance_classes) {
+    chart_spr_exact_resident_add_vector(total, provenance.cost);
+    chart_spr_exact_resident_add_string_vector(total,
+                                                provenance.production_keys);
+  }
+  chart_spr_exact_resident_add_string_vector(
+      total, evidence.before_topology_production_keys);
+  chart_spr_exact_resident_add_string_vector(
+      total, evidence.after_topology_production_keys);
+  return total;
+}
+
+std::size_t chart_spr_grammar_candidate_dynamic_bytes(
+    grammar_spr_candidate const& candidate) {
+  std::size_t total = 0;
+  chart_spr_exact_resident_add_vector(total, candidate.removed_productions);
+  chart_spr_exact_resident_add_vector(total, candidate.added_clades);
+  for (auto const& clade : candidate.added_clades) {
+    chart_spr_exact_resident_add_vector(total, clade.taxa);
+  }
+  chart_spr_exact_resident_add_vector(total, candidate.added_productions);
+  for (auto const& production : candidate.added_productions) {
+    chart_spr_exact_resident_add_vector(total, production.children);
+    chart_spr_exact_resident_add_vector(total, production.witnesses);
+    for (auto const& witness : production.witnesses) {
+      chart_spr_exact_resident_add_vector(total, witness.children);
+      for (auto const& child : witness.children) {
+        chart_spr_exact_resident_add_vector(total, child.edge_alternatives);
+      }
+    }
+  }
+  if (candidate.source_before_topology_productions) {
+    chart_spr_exact_resident_add_vector(
+        total, *candidate.source_before_topology_productions);
+  }
+  if (candidate.source_after_topology_productions) {
+    chart_spr_exact_resident_add_vector(
+        total, *candidate.source_after_topology_productions);
+  }
+  return total;
+}
+
+void chart_spr_exact_resident_add_production_signature(
+    std::size_t& total, chart_spr_production_signature const& signature) {
+  chart_spr_exact_resident_add_vector(total, signature.parent_taxa);
+  chart_spr_exact_resident_add_vector(total, signature.child_taxa);
+  for (auto const& child : signature.child_taxa) {
+    chart_spr_exact_resident_add_vector(total, child);
+  }
+}
+
+std::size_t chart_spr_topology_selection_dynamic_bytes(
+    chart_spr_topology_selection const& selection) {
+  std::size_t total = 0;
+  chart_spr_exact_resident_add_string(total, selection.selector_name);
+  if (!selection.certificate) return total;
+  auto const& certificate = *selection.certificate;
+  chart_spr_exact_resident_add_vector(
+      total, certificate.before_overlay_productions);
+  chart_spr_exact_resident_add_vector(
+      total, certificate.after_overlay_productions);
+  chart_spr_exact_resident_add_vector(total, certificate.before_signatures);
+  for (auto const& signature : certificate.before_signatures) {
+    chart_spr_exact_resident_add_production_signature(total, signature);
+  }
+  chart_spr_exact_resident_add_vector(total, certificate.after_signatures);
+  for (auto const& signature : certificate.after_signatures) {
+    chart_spr_exact_resident_add_production_signature(total, signature);
+  }
+  return total;
+}
+
+std::size_t chart_spr_candidate_score_dynamic_bytes(
+    chart_spr_candidate_score const& candidate, bool include_shared_evidence) {
+  std::size_t total = chart_spr_grammar_candidate_dynamic_bytes(
+      candidate.candidate);
+  chart_spr_exact_resident_add(
+      total,
+      chart_spr_topology_selection_dynamic_bytes(candidate.topology_selection));
+  chart_spr_exact_resident_add_string(total, candidate.invalid_reason);
+  if (include_shared_evidence && candidate.canonical_exact_evidence) {
+    chart_spr_exact_resident_add(
+        total, sizeof(chart_spr_canonical_exact_evidence));
+    chart_spr_exact_resident_add(
+        total, chart_spr_canonical_exact_evidence_dynamic_bytes(
+                   *candidate.canonical_exact_evidence));
+    // Frozen-libstdc++ shared_ptr make_shared control block, allocator header,
+    // and alignment allowance. The evidence object itself is charged above.
+    chart_spr_exact_resident_add(total, 8 * sizeof(void*));
+  }
+  return total;
+}
+
+void chart_spr_exact_resident_add_canonical_score(
+    std::size_t& total, chart_spr_canonical_score const& score) {
+  chart_spr_exact_resident_add_string(total, score.kind);
+  chart_spr_exact_resident_add_string(total, score.convention);
+}
+
+std::size_t chart_spr_canonical_candidate_record_dynamic_bytes(
+    chart_spr_canonical_candidate_record const& record) {
+  std::size_t total = 0;
+  chart_spr_exact_resident_add_string(total, record.signature);
+  chart_spr_exact_resident_add_string(total, record.invalid_reason);
+  chart_spr_exact_resident_add_canonical_score(total, record.lower_bound);
+  if (record.exact) {
+    chart_spr_exact_resident_add_canonical_score(total, *record.exact);
+  }
+  if (record.exact_evidence) {
+    chart_spr_exact_resident_add(
+        total,
+        chart_spr_canonical_exact_evidence_dynamic_bytes(
+            *record.exact_evidence));
+  }
+  return total;
+}
+
+std::size_t chart_spr_candidate_estimator_scratch_bytes(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate,
+    std::size_t base_child_occurrence_count) {
+  auto const clade_count = chart_spr_checked_cache_bytes_add(
+      state.grammar.clades.size(), candidate.candidate.added_clades.size(),
+      "chart SPR exact estimator clade-count overflow");
+  std::size_t total =
+      3 * sizeof(std::vector<std::size_t>) +
+      sizeof(chart_spr_virtual_topology_bound);
+  chart_spr_exact_resident_add(
+      total,
+      chart_spr_bit_capacity_bytes(state.grammar.productions.size()));
+  chart_spr_exact_resident_add(
+      total, chart_spr_checked_cache_bytes_multiply(
+                 clade_count, sizeof(std::size_t),
+                 "chart SPR exact estimator memo byte overflow"));
+  chart_spr_exact_resident_add(
+      total, chart_spr_checked_cache_bytes_multiply(
+                 clade_count, sizeof(std::uint8_t),
+                 "chart SPR exact estimator visit byte overflow"));
+  // Base-production child vectors stay live along recursive calls. Charging
+  // every child occurrence bounds their aggregate retained capacities.
+  chart_spr_exact_resident_add(
+      total, chart_spr_checked_cache_bytes_multiply(
+                 base_child_occurrence_count, sizeof(overlay_clade_ref),
+                 "chart SPR exact estimator child scratch overflow"));
+  // The recursive generic-lambda frames and associative/string temporaries are
+  // stack/SSO on this toolchain. Include a per-clade envelope so the unified
+  // operational bound does not silently exclude them.
+  chart_spr_exact_resident_add(
+      total, chart_spr_checked_cache_bytes_multiply(
+                 clade_count, 12 * sizeof(void*) + 8 * sizeof(std::size_t),
+                 "chart SPR exact estimator frame scratch overflow"));
+  chart_spr_exact_resident_add(total, 256);
+  return total;
+}
+
+}  // namespace
+
+std::size_t estimate_chart_spr_trim_resident_bytes(
+    multisite_trim_result const& trim) {
+  auto total = sizeof(trim);
+  total = chart_spr_checked_cache_bytes_add(
+      total, chart_spr_bit_capacity_bytes(trim.keep_production.capacity()),
+      "chart SPR resident exact trim byte overflow");
+  total = chart_spr_checked_cache_bytes_add(
+      total, chart_spr_vector_capacity_bytes(trim.frontier_sizes_by_clade),
+      "chart SPR resident exact trim byte overflow");
+  total = chart_spr_checked_cache_bytes_add(
+      total,
+      chart_spr_vector_capacity_bytes(
+          trim.lazy_structural_class_count_by_clade),
+      "chart SPR resident exact trim byte overflow");
+  total = chart_spr_checked_cache_bytes_add(
+      total, chart_spr_vector_capacity_bytes(trim.frontier_level_diagnostics),
+      "chart SPR resident exact trim byte overflow");
+  total = chart_spr_checked_cache_bytes_add(
+      total,
+      chart_spr_vector_capacity_bytes(trim.optimal_root_provenance_classes),
+      "chart SPR resident exact trim byte overflow");
+  for (auto const& provenance : trim.optimal_root_provenance_classes) {
+    total = chart_spr_checked_cache_bytes_add(
+        total, chart_spr_vector_capacity_bytes(provenance.cost),
+        "chart SPR resident exact trim byte overflow");
+    total = chart_spr_checked_cache_bytes_add(
+        total,
+        chart_spr_bit_capacity_bytes(provenance.used_production.capacity()),
+        "chart SPR resident exact trim byte overflow");
+  }
+  return total;
+}
+
+std::size_t estimate_chart_spr_canonical_exact_evidence_resident_bytes(
+    chart_spr_canonical_exact_evidence const& evidence) {
+  auto total = sizeof(evidence);
+  auto add = [&](std::size_t bytes) {
+    total = chart_spr_checked_cache_bytes_add(
+        total, bytes, "chart SPR canonical exact-evidence resident overflow");
+  };
+  auto add_string = [&](std::string const& value) {
+    add(chart_spr_checked_cache_bytes_multiply(
+        chart_spr_checked_cache_bytes_add(
+            value.capacity(), 1,
+            "chart SPR canonical exact-evidence string overflow"),
+        sizeof(char),
+        "chart SPR canonical exact-evidence string overflow"));
+  };
+  auto add_string_vector = [&](std::vector<std::string> const& values) {
+    add(chart_spr_vector_capacity_bytes(values));
+    for (auto const& value : values) add_string(value);
+  };
+
+  add_string(evidence.evidence_kind);
+  add_string(evidence.keep_mask_kind);
+  add_string(evidence.topology_selection_kind);
+  add_string(evidence.topology_selector);
+  add_string_vector(evidence.kept_production_keys);
+  add(chart_spr_vector_capacity_bytes(evidence.frontier_sizes));
+  for (auto const& [key, size] : evidence.frontier_sizes) {
+    (void)size;
+    add_string(key);
+  }
+  add(chart_spr_vector_capacity_bytes(
+      evidence.optimal_root_provenance_classes));
+  for (auto const& provenance : evidence.optimal_root_provenance_classes) {
+    add(chart_spr_vector_capacity_bytes(provenance.cost));
+    add_string_vector(provenance.production_keys);
+  }
+  add_string_vector(evidence.before_topology_production_keys);
+  add_string_vector(evidence.after_topology_production_keys);
+  return total;
+}
+
+std::size_t chart_spr_search_detail::estimate_exact_loop_resident_input_bytes(
+    std::vector<chart_spr_candidate_score> const& ranked,
+    chart_spr_iteration_result const& iteration) {
+  // The vector/iteration objects themselves are live stack/result storage;
+  // their owning buffers are charged from actual frozen-toolchain capacity.
+  std::size_t total = sizeof(ranked) + sizeof(iteration);
+  chart_spr_exact_resident_add_vector(total, ranked);
+
+  std::size_t accepted_copy_dynamic_peak = 0;
+  for (auto const& candidate : ranked) {
+    chart_spr_exact_resident_add(
+        total, chart_spr_candidate_score_dynamic_bytes(
+                   candidate, /*include_shared_evidence=*/true));
+    // result.accepted contains its candidate object inline. Copying the
+    // winner duplicates every owning overlay/certificate/string allocation,
+    // while shared canonical evidence continues to alias the same allocation.
+    accepted_copy_dynamic_peak =
+        std::max(accepted_copy_dynamic_peak,
+                 chart_spr_candidate_score_dynamic_bytes(
+                     candidate, /*include_shared_evidence=*/false));
+  }
+  chart_spr_exact_resident_add(total, accepted_copy_dynamic_peak);
+
+  chart_spr_exact_resident_add_string(total, iteration.no_accept_reason);
+  chart_spr_exact_resident_add_vector(total,
+                                      iteration.affected_clade_counts);
+  chart_spr_exact_resident_add_string(
+      total, iteration.post_materialization_rejection_reason);
+  chart_spr_exact_resident_add_vector(
+      total, iteration.exact_candidate_verification_ms);
+
+  chart_spr_exact_resident_add_vector(total,
+                                      iteration.canonical_candidates);
+  for (auto const& record : iteration.canonical_candidates) {
+    chart_spr_exact_resident_add(
+        total, chart_spr_canonical_candidate_record_dynamic_bytes(record));
+  }
+  chart_spr_exact_resident_add_vector(
+      total, iteration.canonical_ranked_stream_indices);
+  chart_spr_exact_resident_add_vector(
+      total, iteration.canonical_exact_verified_stream_indices);
+  if (iteration.canonical_state_exact_before) {
+    // The optional evidence object is inline in sizeof(iteration).
+    chart_spr_exact_resident_add(
+        total, chart_spr_canonical_exact_evidence_dynamic_bytes(
+                   *iteration.canonical_state_exact_before));
+  }
+  if (iteration.accepted) {
+    // Normally disengaged at exact-loop entry, but keep the walker valid for
+    // direct/internal callers and future loop rearrangements.
+    chart_spr_exact_resident_add(
+        total, chart_spr_candidate_score_dynamic_bytes(
+                   *iteration.accepted, /*include_shared_evidence=*/true));
+  }
+  return total;
+}
+
+std::size_t
+chart_spr_search_detail::estimate_exact_loop_estimator_peak_scratch_bytes(
+    chart_spr_search_state const& state,
+    std::span<chart_spr_candidate_score const> ranked) {
+  std::size_t base_child_occurrence_count = 0;
+  for (auto const& production : state.grammar.productions) {
+    base_child_occurrence_count = chart_spr_checked_cache_bytes_add(
+        base_child_occurrence_count, production.children.size(),
+        "chart SPR exact estimator base-child count overflow");
+  }
+
+  std::size_t peak = 0;
+  for (auto const& candidate : ranked) {
+    // Invalid candidates bypass the estimator in the production loop.
+    if (!candidate.valid) continue;
+    peak = std::max(
+        peak, chart_spr_candidate_estimator_scratch_bytes(
+                  state, candidate, base_child_occurrence_count));
+  }
+  return peak;
+}
+
+std::size_t
+chart_spr_search_detail::estimate_exact_loop_scheduler_operation_peak_bytes(
+    std::size_t resolved_workers, bool operation_possible) {
+  if (!operation_possible) return 0;
+
+  auto const worker_count = std::max<std::size_t>(1, resolved_workers);
+  auto const range_count = chart_spr_checked_cache_bytes_multiply(
+      worker_count, 4,
+      "chart SPR exact scheduler range-count overflow");
+  std::size_t total = sizeof(std::vector<std::exception_ptr>) +
+                      sizeof(std::vector<std::future<void>>);
+  chart_spr_exact_resident_add(
+      total, chart_spr_checked_cache_bytes_multiply(
+                 range_count, sizeof(std::exception_ptr),
+                 "chart SPR exact scheduler exception-slot overflow"));
+  chart_spr_exact_resident_add(
+      total, chart_spr_checked_cache_bytes_multiply(
+                 worker_count, sizeof(std::future<void>),
+                 "chart SPR exact scheduler future-slot overflow"));
+
+  // Each submitted runner has one packaged-task shared state and one queued
+  // move-only function. The fixed per-runner allowance covers the frozen
+  // libstdc++ promise/control allocation, deque node/block, allocator headers,
+  // callable capture, and alignment while the futures and queue overlap.
+  auto const runner_bytes =
+      sizeof(std::packaged_task<void()>) +
+      sizeof(std::move_only_function<void()>) +
+      sizeof(chart_indexed_range) + 32 * sizeof(void*) + 1024;
+  chart_spr_exact_resident_add(
+      total, chart_spr_checked_cache_bytes_multiply(
+                 worker_count, runner_bytes,
+                 "chart SPR exact scheduler runner-storage overflow"));
+  return total;
+}
+
+chart_spr_topology_selection_memory_estimate
+estimate_chart_spr_topology_selection_memory(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_options const& options) {
+  chart_spr_topology_selection_memory_estimate estimate;
+  if (!candidate.valid || options.acceptance_mode !=
+                              chart_spr_acceptance_mode::fixed_topology_exact) {
+    return estimate;
+  }
+
+  try {
+    auto topology = chart_spr_candidate_topology_bound(
+        state, candidate.candidate,
+        (std::numeric_limits<std::size_t>::max)());
+    auto structural = chart_spr_estimate_candidate_structural_bytes(
+        state, candidate.candidate, topology);
+    auto key_bytes = chart_spr_virtual_key_bytes(state, topology);
+    auto taxon_slots = chart_spr_saturating_add(
+        chart_spr_saturating_multiply(topology.production_count, 2),
+        chart_spr_saturating_multiply(topology.child_occurrence_count, 2));
+    taxon_slots = chart_spr_saturating_multiply(
+        taxon_slots, state.grammar.taxa.id_to_sample_id.size());
+
+    auto retained = chart_spr_saturating_add(
+        {sizeof(chart_spr_topology_selection) +
+             sizeof(chart_spr_topology_certificate) + 256,
+         false},
+        key_bytes);
+    retained = chart_spr_saturating_add(
+        retained,
+        chart_spr_saturating_multiply(
+            topology.production_count,
+            2 * sizeof(overlay_production_ref) +
+                2 * sizeof(chart_spr_production_signature) +
+                8 * sizeof(void*)));
+    retained = chart_spr_saturating_add(
+        retained,
+        chart_spr_saturating_multiply(taxon_slots, 2 * sizeof(taxon_id)));
+
+    // Built-in selection owns recursive state arrays, ordered maps/sets and
+    // signature construction temporaries while the complete certificate is
+    // already resident.  The factors model frozen-libstdc++ node/control and
+    // geometric-growth overhead, not allocator-independent RSS.
+    auto scratch = chart_spr_saturating_multiply(structural, 2);
+    scratch = chart_spr_saturating_add(
+        scratch,
+        chart_spr_saturating_multiply(
+            topology.clade_count,
+            8 * sizeof(std::pair<overlay_clade_ref,
+                                 overlay_production_ref>) +
+                32 * sizeof(void*)));
+    scratch = chart_spr_saturating_add(
+        scratch,
+        chart_spr_saturating_multiply(
+            topology.production_count,
+            8 * sizeof(overlay_production_ref) + 32 * sizeof(void*)));
+
+    if (options.topology_selection_provider) {
+      if (!options.topology_selection_additional_memory_estimator) {
+        estimate.safely_bounded = false;
+      } else {
+        auto additional =
+            options.topology_selection_additional_memory_estimator(
+                state, candidate.candidate);
+        scratch = chart_spr_saturating_add(scratch,
+                                           additional.scratch_bytes);
+        retained = chart_spr_saturating_add(
+            retained, additional.retained_result_bytes);
+        estimate.safely_bounded = additional.safely_bounded;
+      }
+    }
+    estimate.scratch_bytes = scratch.value;
+    estimate.retained_result_bytes = retained.value;
+    estimate.safely_bounded = estimate.safely_bounded &&
+                              !topology.saturated && !structural.saturated &&
+                              !key_bytes.saturated && !taxon_slots.saturated &&
+                              !scratch.saturated && !retained.saturated;
+  } catch (std::overflow_error const&) {
+    estimate.scratch_bytes = (std::numeric_limits<std::size_t>::max)();
+    estimate.retained_result_bytes =
+        (std::numeric_limits<std::size_t>::max)();
+    estimate.safely_bounded = false;
+  }
+  return estimate;
+}
+
+chart_spr_exact_candidate_memory_estimate
+estimate_chart_spr_exact_candidate_memory(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_options const& options, std::size_t resolved_workers) {
+  chart_spr_exact_candidate_memory_estimate estimate;
+  try {
+    auto const pattern_count = state.active_patterns.patterns.patterns.size();
+    auto const taxon_count = state.grammar.taxa.id_to_sample_id.size();
+    bool safely_bounded = true;
+    chart_spr_saturating_size custom_retained;
+
+    auto cost_component_count =
+        chart_spr_saturating_multiply(pattern_count, nuc_state_count);
+    auto cost_bytes =
+        chart_spr_saturating_multiply(cost_component_count, sizeof(chart_cost));
+    auto minimum_entry_bytes =
+        chart_spr_saturating_add({sizeof(frontier_entry), false}, cost_bytes);
+    safely_bounded = safely_bounded && !minimum_entry_bytes.saturated;
+    minimum_entry_bytes.value =
+        std::max<std::size_t>(1, minimum_entry_bytes.value);
+    auto topology_limit =
+        options.cache.memory_budget_bytes == 0
+            ? (std::numeric_limits<std::size_t>::max)() /
+                  minimum_entry_bytes.value
+            : options.cache.memory_budget_bytes / minimum_entry_bytes.value;
+    if (topology_limit != (std::numeric_limits<std::size_t>::max)()) {
+      ++topology_limit;
+    }
+    topology_limit = std::max<std::size_t>(1, topology_limit);
+    auto topology = chart_spr_candidate_topology_bound(
+        state, candidate.candidate, topology_limit);
+    auto structural = chart_spr_estimate_candidate_structural_bytes(
+        state, candidate.candidate, topology);
+    auto const row_bytes = sizeof(chart_multisite_detail::chart_row);
+
+    if (options.acceptance_mode ==
+        chart_spr_acceptance_mode::fixed_topology_exact) {
+      auto selected = chart_spr_saturating_size{
+          chart_spr_estimate_selected_topology_cache_admission_bytes(
+              state, candidate.candidate),
+          false};
+      // The finalized selected-row cache is not the construction high-water:
+      // recursive selection simultaneously owns copied taxa, before/after
+      // maps and reached sets, signature/key vectors, and one active child-row
+      // chain.  Bound that frozen-libstdc++ transient surface separately and
+      // take the larger peak.
+      auto selected_construction = chart_spr_saturating_add(
+          selected, chart_spr_saturating_multiply(structural, 2));
+      selected_construction = chart_spr_saturating_add(
+          selected_construction, chart_spr_virtual_key_bytes(state, topology));
+      selected_construction = chart_spr_saturating_add(
+          selected_construction,
+          chart_spr_saturating_multiply(
+              topology.production_count,
+              8 * sizeof(std::pair<overlay_production_ref,
+                                   overlay_production_ref>) +
+                  32 * sizeof(void*)));
+      selected_construction = chart_spr_saturating_add(
+          selected_construction,
+          chart_spr_saturating_multiply(
+              topology.clade_count,
+              8 * sizeof(std::pair<overlay_clade_ref,
+                                   overlay_production_ref>) +
+                  32 * sizeof(void*)));
+      selected = chart_spr_saturating_max(selected, selected_construction);
+      auto per_worker_direct = chart_spr_saturating_multiply(
+          topology.clade_count,
+          2 * row_bytes + 4 * sizeof(std::size_t) + 8 * sizeof(void*));
+      auto direct_serial = per_worker_direct;
+      auto direct_inner = chart_spr_saturating_multiply(
+          per_worker_direct,
+          std::min(resolved_workers, std::max<std::size_t>(1, pattern_count)));
+      direct_inner = chart_spr_saturating_add(
+          direct_inner,
+          chart_spr_saturating_multiply(resolved_workers,
+                                        sizeof(chart_spr_search_counters)));
+
+      // Cache, cache-copy, direct-oracle and optional materialized-oracle
+      // results can retain eight old/new per-pattern score arrays at once.
+      auto score_arrays = chart_spr_saturating_multiply(
+          pattern_count, 8 * sizeof(std::uint64_t));
+      if (options.verify_fixed_topology_materialized_oracle_for_tests ||
+          options.force_fixed_topology_independent_sm_bug_for_tests) {
+        direct_serial = chart_spr_saturating_add(direct_serial, structural);
+        direct_inner = chart_spr_saturating_add(direct_inner, structural);
+      }
+      auto serial = chart_spr_saturating_add(
+          score_arrays, chart_spr_saturating_max(selected, direct_serial));
+      auto inner = chart_spr_saturating_add(
+          score_arrays, chart_spr_saturating_max(selected, direct_inner));
+      if (state.fixed_topology_exact_verifier ||
+          state.contextual_fixed_topology_exact_verifier) {
+        if (!state.fixed_topology_exact_additional_memory_estimator ||
+            !state
+                 .fixed_topology_exact_additional_retained_memory_estimator) {
+          safely_bounded = false;
+        } else {
+          auto additional = chart_spr_saturating_size{
+              state.fixed_topology_exact_additional_memory_estimator(
+                  candidate.candidate),
+              false};
+          serial = chart_spr_saturating_add(serial, additional);
+          inner = chart_spr_saturating_add(inner, additional);
+          custom_retained = chart_spr_saturating_size{
+              state
+                  .fixed_topology_exact_additional_retained_memory_estimator(
+                      candidate.candidate),
+              false};
+        }
+      }
+      estimate.serial_scratch_bytes = serial.value;
+      estimate.inner_parallel_scratch_bytes = inner.value;
+      safely_bounded = safely_bounded && !serial.saturated && !inner.saturated;
+      if (options.verify_fixed_topology_materialized_oracle_for_tests ||
+          options.force_fixed_topology_independent_sm_bug_for_tests) {
+        safely_bounded = safely_bounded && !structural.saturated;
+      }
+    } else {
+      auto const mask_bytes =
+          chart_spr_bit_capacity_bytes(topology.production_count);
+      auto entry_bytes = chart_spr_saturating_add(
+          chart_spr_saturating_multiply(sizeof(frontier_entry), 4),
+          chart_spr_saturating_multiply(cost_bytes, 2));
+      entry_bytes = chart_spr_saturating_add(entry_bytes, mask_bytes);
+      entry_bytes = chart_spr_saturating_add(
+          entry_bytes, sizeof(frontier_provenance_choice) + 16 * sizeof(void*));
+      auto frontier = chart_spr_saturating_multiply(
+          topology.total_frontier_entries, entry_bytes.value);
+      frontier.saturated = frontier.saturated || entry_bytes.saturated;
+      frontier = chart_spr_saturating_add(
+          frontier,
+          chart_spr_saturating_multiply(
+              topology.clade_count,
+              sizeof(std::vector<frontier_entry>) + sizeof(std::size_t) +
+                  sizeof(multisite_frontier_level_diagnostic) +
+                  sizeof(std::exception_ptr)));
+      auto combined_cost_scratch =
+          chart_spr_saturating_multiply(cost_bytes, topology.clade_count);
+      combined_cost_scratch =
+          chart_spr_saturating_multiply(combined_cost_scratch, 2);
+      frontier = chart_spr_saturating_add(frontier, combined_cost_scratch);
+      frontier = chart_spr_saturating_add(
+          frontier,
+          chart_spr_bit_capacity_bytes(topology.total_frontier_entries));
+
+      auto const outside_multiplier =
+          state.chart_opts.score_ua_edge ? nuc_state_count : 1;
+      auto outside_rows =
+          chart_spr_saturating_multiply(topology.clade_count, row_bytes);
+      outside_rows =
+          chart_spr_saturating_multiply(outside_rows, outside_multiplier);
+      auto per_pattern_setup = chart_spr_saturating_add(
+          {sizeof(chart_multisite_detail::active_pattern_info), false},
+          taxon_count);
+      // active_pattern_info always owns one dense inside chart reconstructed
+      // from the selected representation, including the lazy bridge.
+      per_pattern_setup = chart_spr_saturating_add(
+          per_pattern_setup,
+          chart_spr_saturating_multiply(topology.clade_count, row_bytes));
+      per_pattern_setup =
+          chart_spr_saturating_add(per_pattern_setup, outside_rows);
+      auto setup =
+          chart_spr_saturating_multiply(per_pattern_setup, pattern_count);
+      auto pattern_plus_one =
+          chart_spr_saturating_add({pattern_count, false}, 1);
+      auto upper_topologies =
+          chart_spr_saturating_multiply(pattern_plus_one, topology.clade_count);
+      upper_topologies = chart_spr_saturating_multiply(
+          upper_topologies, sizeof(production_id) + sizeof(std::size_t));
+      upper_topologies = chart_spr_saturating_add(
+          upper_topologies,
+          chart_spr_saturating_multiply(pattern_plus_one, mask_bytes));
+      setup = chart_spr_saturating_add(setup, upper_topologies);
+
+      auto setup_serial_scratch = chart_spr_saturating_multiply(
+          topology.clade_count,
+          8 * row_bytes +
+              4 * sizeof(std::optional<chart_multisite_detail::chart_row>));
+      auto inner_worker_count =
+          std::min(resolved_workers, std::max<std::size_t>(1, pattern_count));
+      auto setup_inner_extra =
+          chart_spr_saturating_multiply(topology.clade_count, 2 * row_bytes);
+      setup_inner_extra =
+          chart_spr_saturating_multiply(setup_inner_extra, inner_worker_count);
+      setup_inner_extra = chart_spr_saturating_add(
+          setup_inner_extra,
+          chart_spr_saturating_multiply(
+              pattern_count,
+              512 + sizeof(std::exception_ptr) + sizeof(std::size_t)));
+      auto upper_matrix =
+          chart_spr_saturating_multiply(pattern_plus_one, pattern_count);
+      upper_matrix = chart_spr_saturating_multiply(
+          upper_matrix, sizeof(std::uint64_t) + sizeof(std::exception_ptr));
+      setup_inner_extra =
+          chart_spr_saturating_add(setup_inner_extra, upper_matrix);
+
+      auto setup_peak = chart_spr_saturating_add(setup, setup_serial_scratch);
+      auto frontier_peak = chart_spr_saturating_add(setup, frontier);
+      auto verification_serial = chart_spr_saturating_add(
+          structural, chart_spr_saturating_max(setup_peak, frontier_peak));
+      auto verification_inner =
+          chart_spr_saturating_add(verification_serial, setup_inner_extra);
+
+      if (state.cache_strategy ==
+          chart_spr_cache_strategy::lazy_multisite_chart) {
+        auto lazy_cache =
+            chart_spr_saturating_size{chart_spr_conservative_lazy_cache_bytes(
+                                          topology.clade_count, pattern_count),
+                                      false};
+        auto lazy_build_peak = chart_spr_saturating_add(
+            structural,
+            chart_spr_saturating_multiply(
+                lazy_cache, state.chart_opts.score_ua_edge ? 6 : 2));
+        lazy_build_peak = chart_spr_saturating_add(lazy_build_peak, setup_peak);
+        auto lazy_frontier_peak = chart_spr_saturating_add(
+            structural, chart_spr_saturating_multiply(lazy_cache, 2));
+        lazy_frontier_peak =
+            chart_spr_saturating_add(lazy_frontier_peak, frontier_peak);
+        verification_serial =
+            chart_spr_saturating_max(lazy_build_peak, lazy_frontier_peak);
+        // The current lazy verifier does not submit inner exact work.
+        verification_inner = verification_serial;
+      }
+
+      auto serial = verification_serial;
+      auto inner = verification_inner;
+      if (options.verification_mode ==
+              chart_spr_verification_mode::transient &&
+          (state.exact_multisite_verifier ||
+           state.contextual_exact_multisite_verifier)) {
+        if (!state.exact_multisite_transient_memory_estimator ||
+            !state.exact_multisite_transient_retained_memory_estimator) {
+          safely_bounded = false;
+        } else {
+          auto transient_extra = chart_spr_saturating_size{
+              state.exact_multisite_transient_memory_estimator(
+                  candidate.candidate),
+              false};
+          serial = chart_spr_saturating_add(serial, transient_extra);
+          inner = chart_spr_saturating_add(inner, transient_extra);
+          custom_retained = chart_spr_saturating_size{
+              state.exact_multisite_transient_retained_memory_estimator(
+                  candidate.candidate),
+              false};
+          if (options.verify_transient_chain_extension_oracle_for_tests ||
+              options
+                  .force_transient_chain_extension_oracle_mismatch_for_tests) {
+            // The primary trim and extended materialization remain live while
+            // the diagnostic cold B&B is constructed.
+            serial = chart_spr_saturating_add(serial, verification_serial);
+            inner = chart_spr_saturating_add(inner, verification_serial);
+          }
+        }
+      }
+      estimate.serial_scratch_bytes = serial.value;
+      estimate.inner_parallel_scratch_bytes = inner.value;
+      safely_bounded = safely_bounded && !topology.saturated &&
+                       !structural.saturated && !frontier.saturated &&
+                       !setup.saturated && !serial.saturated &&
+                       !inner.saturated;
+    }
+
+    if (options.semantic_capture != chart_spr_semantic_capture_mode::off) {
+      auto key_bytes = chart_spr_virtual_key_bytes(state, topology);
+      auto retained = chart_spr_saturating_add(
+          {sizeof(chart_spr_canonical_exact_evidence) + 128, false},
+          key_bytes);
+      if (options.acceptance_mode ==
+          chart_spr_acceptance_mode::fixed_topology_exact) {
+        // Before/after selected-topology keys, with a full virtual-key set as
+        // a conservative bound for each side.
+        retained = chart_spr_saturating_add(retained, key_bytes);
+        retained = chart_spr_saturating_add(
+            retained,
+            chart_spr_saturating_multiply(
+                topology.production_count, 4 * sizeof(std::string)));
+      } else {
+        retained = chart_spr_saturating_add(
+            retained, chart_spr_saturating_multiply(
+                          topology.clade_count,
+                          2 * sizeof(std::pair<std::string, std::size_t>)));
+        retained = chart_spr_saturating_add(
+            retained,
+            chart_spr_saturating_multiply(
+                topology.production_count, 2 * sizeof(std::string)));
+        auto root_production_string_slots = chart_spr_saturating_multiply(
+            topology.production_count, 2 * sizeof(std::string));
+        auto root_class_bytes = chart_spr_saturating_add(
+            chart_spr_saturating_multiply(cost_bytes, 2), key_bytes);
+        root_class_bytes = chart_spr_saturating_add(
+            root_class_bytes, root_production_string_slots);
+        root_class_bytes = chart_spr_saturating_add(
+            root_class_bytes,
+            2 * sizeof(chart_spr_canonical_root_provenance_class));
+        retained = chart_spr_saturating_add(
+            retained,
+            chart_spr_saturating_multiply(topology.root_frontier_entries,
+                                          root_class_bytes.value));
+        retained.saturated = retained.saturated ||
+                             root_production_string_slots.saturated ||
+                             root_class_bytes.saturated;
+      }
+      // Aggregation copies task evidence into the canonical candidate record
+      // while the verifier result remains live in `verified`.
+      retained = chart_spr_saturating_multiply(retained, 2);
+      estimate.retained_result_bytes = retained.value;
+      safely_bounded = safely_bounded && !retained.saturated;
+    }
+    // A provider-created owning payload first lives in the stable result slot
+    // and can then be copy-constructed into result.accepted while the verified
+    // vector remains live. The pre-loop accepted-copy walker sees only the
+    // pre-verifier candidate, so charge two copies of provider output here.
+    auto custom_retained_with_accepted_copy =
+        chart_spr_saturating_multiply(custom_retained, 2);
+    auto retained_with_provider = chart_spr_saturating_add(
+        {estimate.retained_result_bytes, false},
+        custom_retained_with_accepted_copy);
+    estimate.retained_result_bytes = retained_with_provider.value;
+    safely_bounded = safely_bounded && !custom_retained.saturated &&
+                     !custom_retained_with_accepted_copy.saturated &&
+                     !retained_with_provider.saturated;
+    estimate.safely_bounded = safely_bounded;
+  } catch (std::overflow_error const&) {
+    estimate.serial_scratch_bytes = (std::numeric_limits<std::size_t>::max)();
+    estimate.inner_parallel_scratch_bytes =
+        (std::numeric_limits<std::size_t>::max)();
+    estimate.retained_result_bytes = (std::numeric_limits<std::size_t>::max)();
+    estimate.safely_bounded = false;
+  }
+  if (estimate.inner_parallel_scratch_bytes < estimate.serial_scratch_bytes) {
+    estimate.inner_parallel_scratch_bytes = estimate.serial_scratch_bytes;
+  }
+  return estimate;
+}
+
+chart_spr_exact_candidate_memory_estimate estimate_chart_spr_state_exact_memory(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options,
+    std::size_t resolved_workers, std::size_t memory_budget_bytes) {
+  chart_spr_search_options options;
+  options.acceptance_mode = chart_spr_acceptance_mode::exact_multisite;
+  options.cache = state.cache_opts;
+  options.cache.memory_budget_bytes = memory_budget_bytes;
+  options.chart = state.chart_opts;
+  options.exact_trim = trim_options;
+  options.verification_mode = chart_spr_verification_mode::cold;
+  options.semantic_capture = chart_spr_semantic_capture_mode::off;
+  chart_spr_candidate_score identity_candidate;
+  auto estimate = estimate_chart_spr_exact_candidate_memory(
+      state, identity_candidate, options, resolved_workers);
+  if (state.exact_setup_provider || state.scheduled_exact_setup_provider) {
+    if (!state.exact_setup_provider_additional_memory_estimator) {
+      estimate.safely_bounded = false;
+    } else {
+      auto const additional =
+          state.exact_setup_provider_additional_memory_estimator(
+              trim_options, resolved_workers);
+      auto serial = chart_spr_saturating_add(
+          {estimate.serial_scratch_bytes, false}, additional);
+      auto inner = chart_spr_saturating_add(
+          {estimate.inner_parallel_scratch_bytes, false}, additional);
+      estimate.serial_scratch_bytes = serial.value;
+      estimate.inner_parallel_scratch_bytes = inner.value;
+      estimate.safely_bounded = estimate.safely_bounded && !serial.saturated &&
+                                !inner.saturated;
+    }
+  }
+  return estimate;
+}
+
+chart_spr_exact_candidate_memory_estimate estimate_chart_spr_state_exact_memory(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options,
+    std::size_t resolved_workers) {
+  return estimate_chart_spr_state_exact_memory(
+      state, trim_options, resolved_workers,
+      state.cache_opts.memory_budget_bytes);
+}
+
 void refresh_chart_spr_lazy_chart_after_local_commit_for_tests(
     chart_spr_search_state& state, overlay_chain const& chain,
     overlay_materialization_result const& materialized,
@@ -4400,7 +5721,7 @@ fixed_topology_selected_cache_pattern_scores_for_tests(
   chart_spr_selected_topology_row_cache cache;
   chart_spr_persistent_inside_cache_view icache_view;
   auto roots = chart_spr_selected_topology_root_entries_from_cache(
-      cache, state, candidate, icache_view);
+      cache, state, candidate, icache_view, state.counters);
   if (roots.before == nullptr || roots.after == nullptr) {
     throw chart_spr_fixed_topology_cache_invariant_error(
         "fixed_topology_exact selected-topology cache test helper: root cache "
@@ -4508,6 +5829,11 @@ chart_spr_search_result run_chart_spr_search(
               *substrate_ptr, provider_state, checked_state, provider_scheduler,
               runs);
         };
+    // The generic state-exact estimate already covers the finalized setup and
+    // its construction scratch. This internal provider adds no independent
+    // allocation surface beyond that bound.
+    state.exact_setup_provider_additional_memory_estimator =
+        [](multisite_trim_options const&, std::size_t) { return 0; };
     if (state.pattern_batch_bootstrap_deferred) {
       chart_spr_search_detail::finalize_deferred_pattern_batch_bootstrap(
           state, inside_cache_composite_lower_bound_with_invariants(
@@ -4559,10 +5885,8 @@ chart_spr_search_result run_chart_spr_search(
       result.summary.initial_grammar_production_count;
   result.summary.chart_cache_estimated_full_bytes =
       state.estimated_full_pattern_cache_bytes;
-  result.summary.chart_cache_resident_bytes = chart_spr_checked_cache_bytes_add(
-      state.resident_pattern_cache_bytes,
-      state.selected_topology_cache_admitted_bytes,
-      "chart SPR initial resident cache report byte overflow");
+  result.summary.chart_cache_resident_bytes =
+      state.resident_pattern_cache_bytes;
   result.summary.cache_strategy = state.cache_strategy;
   result.summary.effective_pattern_batch_size =
       state.effective_pattern_batch_size;
@@ -4675,6 +5999,7 @@ chart_spr_search_result run_chart_spr_search(
     result.canonical_report = std::move(canonical);
   }
   std::vector<std::size_t> aggregate_affected_counts;
+  double exact_candidate_verification_ms_sum = 0.0;
   std::optional<chart_spr_candidate_score> last_local_update_accepted;
   std::optional<chart_spr_recorded_chain_objective>
       last_local_update_recorded_objective;
@@ -4688,14 +6013,24 @@ chart_spr_search_result run_chart_spr_search(
   // derived current-tip view.
   if (local_commit_substrate != nullptr) {
     auto* substrate_ptr = local_commit_substrate.get();
-    state.fixed_topology_exact_verifier = [substrate_ptr, &scheduler](
-                                              chart_spr_search_state const&
-                                                  verifier_state,
-                                              chart_spr_candidate_score
-                                                  candidate) {
+    state
+        .contextual_fixed_topology_exact_verifier = [substrate_ptr](
+                                             chart_spr_search_state const&
+                                                 verifier_state,
+                                             chart_spr_candidate_score
+                                                 candidate,
+                                             chart_spr_exact_verification_context&
+                                                 context) {
       return chart_spr_verify_candidate_fixed_topology_exact_from_persistent_cache(
-          *substrate_ptr, verifier_state, std::move(candidate), scheduler);
+          *substrate_ptr, verifier_state, std::move(candidate), context);
     };
+    state.fixed_topology_exact_verifier_parallel_safe = true;
+    // The generic fixed-topology estimate explicitly includes the persistent
+    // selected-cache/direct-oracle phases used by this internal callback.
+    state.fixed_topology_exact_additional_memory_estimator =
+        [](grammar_spr_candidate const&) { return 0; };
+    state.fixed_topology_exact_additional_retained_memory_estimator =
+        [](grammar_spr_candidate const&) { return 0; };
     // Phase 9: install the transient-extension exact_multisite verifier.  It
     // verifies each candidate by transiently extending the chain in
     // reader-local scratch (never mutating the shared cache, bypassing the
@@ -4713,22 +6048,30 @@ chart_spr_search_result run_chart_spr_search(
     // (a dense materialization per verified candidate, counted under
     // `overlay_materializations_for_exact_verification`).  This is the named
     // verification-mode choice the Phase-10 report surfaces.
-    if (options.verification_mode ==
-        chart_spr_verification_mode::transient) {
+    if (options.verification_mode == chart_spr_verification_mode::transient) {
+      state.exact_multisite_transient_memory_estimator =
+          [substrate_ptr](grammar_spr_candidate const& candidate) {
+            return chart_spr_transient_verifier_extra_memory_bound(
+                *substrate_ptr, candidate);
+          };
+      state.exact_multisite_transient_retained_memory_estimator =
+          [](grammar_spr_candidate const&) { return 0; };
       state
-          .exact_multisite_verifier = [substrate_ptr](
+          .contextual_exact_multisite_verifier = [substrate_ptr](
                                           chart_spr_search_state const&
                                               verifier_state,
                                           chart_spr_candidate_score candidate,
                                           checked_chart_execution_plan_ref const&
                                               checked_state,
-                                          chart_scheduler& verifier_scheduler,
+                                          chart_spr_exact_verification_context&
+                                              context,
                                           multisite_trim_options const&
                                               trim_options) {
         return chart_spr_verify_candidate_exact_multisite_from_transient_extension(
             *substrate_ptr, verifier_state, std::move(candidate), checked_state,
-            verifier_scheduler, trim_options);
+            context, trim_options);
       };
+      state.exact_multisite_verifier_parallel_safe = true;
     }
   }
 
@@ -4749,8 +6092,8 @@ chart_spr_search_result run_chart_spr_search(
         iteration.candidate_generation_ms;
     result.summary.local_scoring_ms += iteration.local_scoring_ms;
     result.summary.exact_verification_ms += iteration.exact_verification_ms;
-    for (double candidate_ms :
-         iteration.exact_candidate_verification_ms) {
+    for (double candidate_ms : iteration.exact_candidate_verification_ms) {
+      exact_candidate_verification_ms_sum += candidate_ms;
       if (result.summary.exact_candidate_timing_count == 0) {
         result.summary.exact_candidate_verification_ms_min = candidate_ms;
         result.summary.exact_candidate_verification_ms_max = candidate_ms;
@@ -5073,8 +6416,6 @@ chart_spr_search_result run_chart_spr_search(
     auto preserved_counters = state.counters;
     auto const preserved_local_commit_cache_bytes =
         local_commit_substrate->resident_cache_bytes;
-    auto const preserved_selected_cache_admission =
-        state.selected_topology_cache_admitted_bytes;
     auto compacted = chart_spr_compact_and_verify_local_update_state(
         result.dag, *local_commit_substrate->chain, state, options,
         local_update_accepted_topology_key_sets,
@@ -5089,18 +6430,13 @@ chart_spr_search_result run_chart_spr_search(
     state = std::move(compacted.rebuilt_state);
     state.local_commit_persistent_cache_bytes =
         preserved_local_commit_cache_bytes;
-    state.selected_topology_cache_admitted_bytes =
-        preserved_selected_cache_admission;
     state.resident_pattern_cache_bytes = chart_spr_checked_cache_bytes_add(
         state.resident_pattern_cache_bytes,
         state.local_commit_persistent_cache_bytes,
         "chart SPR final-compaction resident cache byte overflow");
-    chart_spr_require_cache_budget(
-        chart_spr_checked_cache_bytes_add(
-            state.resident_pattern_cache_bytes,
-            state.selected_topology_cache_admitted_bytes,
-            "chart SPR final-compaction admitted cache byte overflow"),
-        state.cache_opts, "chart SPR final compaction");
+    chart_spr_require_cache_budget(state.resident_pattern_cache_bytes,
+                                   state.cache_opts,
+                                   "chart SPR final compaction");
     result.summary.final_score = compacted.rebuilt_score;
     result.summary.final_compaction_rebuilds = 1;
     result.summary.final_compaction_exactness_kind = compacted.exactness_kind;
@@ -5154,10 +6490,8 @@ chart_spr_search_result run_chart_spr_search(
       state.grammar.productions.size();
   result.summary.chart_cache_estimated_full_bytes =
       state.estimated_full_pattern_cache_bytes;
-  result.summary.chart_cache_resident_bytes = chart_spr_checked_cache_bytes_add(
-      state.resident_pattern_cache_bytes,
-      state.selected_topology_cache_admitted_bytes,
-      "chart SPR final resident cache report byte overflow");
+  result.summary.chart_cache_resident_bytes =
+      state.resident_pattern_cache_bytes;
   result.summary.cache_strategy = state.cache_strategy;
   result.summary.effective_pattern_batch_size =
       state.effective_pattern_batch_size;
@@ -5179,7 +6513,7 @@ chart_spr_search_result run_chart_spr_search(
   }
   if (result.summary.exact_candidate_timing_count != 0) {
     result.summary.exact_candidate_verification_ms_mean =
-        result.summary.exact_verification_ms /
+        exact_candidate_verification_ms_sum /
         static_cast<double>(result.summary.exact_candidate_timing_count);
   }
   result.summary.affected_distribution =
@@ -5277,16 +6611,12 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.scheduler = scheduler.metrics();
   auto const& scheduler_metrics = result.summary.scheduler;
   auto const& axes = state.counters.scheduler_axes;
-  std::array<chart_spr_scheduler_axis_metrics const*, 9> axis_list{
-      &axes.initial_chart_patterns,
-      &axes.exact_setup_patterns,
-      &axes.exact_frontier_clades,
-      &axes.inside_cache_patterns,
-      &axes.outside_cache_patterns,
-      &axes.fixed_topology_patterns,
-      &axes.local_score_candidates,
-      &axes.local_score_candidate_patterns,
-      &axes.other,
+  std::array<chart_spr_scheduler_axis_metrics const*, 10> axis_list{
+      &axes.initial_chart_patterns,         &axes.exact_setup_patterns,
+      &axes.exact_frontier_clades,          &axes.exact_candidates,
+      &axes.inside_cache_patterns,          &axes.outside_cache_patterns,
+      &axes.fixed_topology_patterns,        &axes.local_score_candidates,
+      &axes.local_score_candidate_patterns, &axes.other,
   };
   std::uint64_t axis_operations = 0;
   std::uint64_t axis_parallel_operations = 0;

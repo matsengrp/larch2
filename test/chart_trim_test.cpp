@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -1861,6 +1862,124 @@ static void test_multisite_two_pass_exact_mask_matches_bruteforce() {
   std::println("  PASS");
 }
 
+static void
+test_multisite_two_pass_releases_score_frontiers_before_mask_pass() {
+  std::println(
+      "test_multisite_two_pass_releases_score_frontiers_before_mask_pass");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree1_with_invariant_spec()));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree2_with_invariant_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto plan = larch::build_chart_execution_plan(grammar);
+  larch::site_pattern_options pattern_options;
+  pattern_options.skip_invariant_sites = true;
+  auto patterns = larch::build_site_patterns(merged, grammar, pattern_options);
+  larch::chart_options chart_options;
+  larch::multisite_trim_options trim_options;
+  trim_options.dominance_mode =
+      larch::multisite_dominance_mode::two_pass_exact_mask;
+  trim_options.capture_optimal_root_provenance = true;
+
+  struct observed_frontier_build final
+      : larch::chart_multisite_detail::multisite_frontier_build_result {
+    std::shared_ptr<int> lifetime;
+
+    observed_frontier_build(
+        larch::chart_multisite_detail::multisite_frontier_build_result build,
+        std::shared_ptr<int> token)
+        : multisite_frontier_build_result(std::move(build)),
+          lifetime(std::move(token)) {}
+  };
+
+  // Wrap each real frontier build with its sole lifetime token. The second
+  // invocation must observe the score-pass token expired, proving that the
+  // nonempty score frontiers were destroyed before mask construction begins.
+  auto check_lifetime = [&](auto const& structure, auto const& setup,
+                            auto&& build_frontiers) {
+    std::size_t build_calls = 0;
+    std::size_t score_frontier_entries = 0;
+    std::weak_ptr<int> score_lifetime;
+    auto observed_builder =
+        [&](larch::chart_multisite_detail::
+                multisite_frontier_build_options const& build_options,
+            std::string const& context) -> observed_frontier_build {
+      auto const call_index = build_calls++;
+      CHECK(call_index < 2);
+      if (call_index == 0) {
+        CHECK(context == "multi-site trim score pass");
+      } else {
+        CHECK(context == "multi-site trim exact mask recovery pass");
+        CHECK(score_frontier_entries > 0);
+        CHECK(score_lifetime.expired());
+      }
+
+      auto build = build_frontiers(build_options, context);
+      auto token = std::make_shared<int>(static_cast<int>(call_index));
+      if (call_index == 0) {
+        score_frontier_entries = std::accumulate(
+            build.frontiers.begin(), build.frontiers.end(), std::size_t{0},
+            [](std::size_t count, auto const& frontier) {
+              return count + frontier.size();
+            });
+        CHECK(score_frontier_entries > 0);
+        score_lifetime = token;
+        CHECK(!score_lifetime.expired());
+      }
+      return {std::move(build), std::move(token)};
+    };
+
+    larch::site_pattern_set validation_shell;
+    validation_shell.taxon_count = setup.taxon_count;
+    auto observed = larch::chart_multisite_detail::build_multisite_trim_impl(
+        structure, validation_shell, chart_options, trim_options,
+        observed_builder);
+    CHECK(build_calls == 2);
+    CHECK(score_frontier_entries > 0);
+    CHECK(score_lifetime.expired());
+    return observed;
+  };
+
+  auto grammar_setup =
+      larch::build_multisite_exact_setup(grammar, patterns, chart_options);
+  auto grammar_expected = larch::build_multisite_trim_from_exact_setup(
+      grammar, grammar_setup, chart_options, trim_options);
+  auto grammar_observed = check_lifetime(
+      grammar, grammar_setup,
+      [&](auto const& build_options, std::string const& context) {
+        return larch::chart_multisite_detail::
+            build_multisite_frontiers_from_setup(
+                grammar, grammar_setup, chart_options, build_options, context);
+      });
+  check_multisite_trim_results_equal(grammar_expected, grammar_observed, false);
+
+  auto plan_setup =
+      larch::build_multisite_exact_setup(plan, patterns, chart_options);
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  auto plan_expected = larch::build_multisite_trim_from_exact_setup(
+      plan, plan_setup, chart_options, trim_options);
+  auto plan_observed = check_lifetime(
+      plan, plan_setup,
+      [&](auto const& build_options, std::string const& context) {
+        return larch::chart_multisite_detail::
+            build_multisite_frontiers_from_setup(plan, plan_setup,
+                                                 chart_options, build_options,
+                                                 context, scheduler);
+      });
+  check_multisite_trim_results_equal(plan_expected, plan_observed, false);
+  CHECK(scheduler.metrics().pending_tasks == 0);
+  scheduler.shutdown();
+
+  std::println("  PASS");
+}
+
 static void test_multisite_parent_combine_fixes_child_topology() {
   std::println("test_multisite_parent_combine_fixes_child_topology");
 
@@ -2822,15 +2941,25 @@ static void test_scheduled_multisite_frontier_wavefronts() {
   larch::chart_scheduler_test_detail::access::fail_submission_after(
       submit_scheduler, 1);
   auto const metrics_before_submit_failure = submit_scheduler.metrics();
+  std::vector<larch::chart_scheduler_run_summary> submit_failure_runs;
   bool submit_failure_escaped = false;
   try {
     (void)larch::chart_multisite_detail::build_multisite_frontiers_from_setup(
         plan, setup, chart_options, build_options,
-        "scheduled frontier partial-submit test", submit_scheduler);
+        "scheduled frontier partial-submit test", submit_scheduler,
+        &submit_failure_runs);
   } catch (larch::chart_scheduler_submit_error const&) {
     submit_failure_escaped = true;
   }
   CHECK(submit_failure_escaped);
+  CHECK(submit_failure_runs.size() == 1);
+  CHECK(submit_failure_runs.front().failed);
+  CHECK(submit_failure_runs.front().parallel_branch_entered);
+  CHECK(submit_failure_runs.front().used_parallel_workers());
+  CHECK(submit_failure_runs.front().worker_tasks_submitted == 1);
+  CHECK(submit_failure_runs.front().ranges_cancelled +
+            submit_failure_runs.front().ranges_completed ==
+        submit_failure_runs.front().range_count);
   auto const metrics_after_submit_failure = submit_scheduler.metrics();
   CHECK(metrics_after_submit_failure.tasks_submitted -
             metrics_before_submit_failure.tasks_submitted ==
@@ -2855,6 +2984,59 @@ static void test_scheduled_multisite_frontier_wavefronts() {
   CHECK(submit_scheduler.metrics().pending_tasks == 0);
   submit_scheduler.shutdown();
   CHECK(submit_scheduler.metrics().live_pool_threads == 0);
+
+  // The summary must also preserve a genuinely parallel operation that fails
+  // before its first runner is accepted.  This is the singleton-candidate
+  // inner-exact failure shape: the trim aborts, publishes its failed setup
+  // operation, joins zero pending tasks, and the same scheduler immediately
+  // replays the exact trim successfully.
+  larch::chart_scheduler zero_submit_scheduler{
+      larch::chart_scheduler_options{
+          .requested_workers = 4,
+          .default_minimum_grain = 1,
+          .default_target_ranges_per_worker = 4,
+      }};
+  larch::chart_scheduler_test_detail::access::fail_submission_after(
+      zero_submit_scheduler, 0);
+  larch::multisite_trim_scheduler_run_summaries zero_submit_runs;
+  bool zero_submit_failure_escaped = false;
+  try {
+    (void)larch::build_multisite_trim(plan, patterns, zero_submit_scheduler,
+                                      chart_options, {}, &zero_submit_runs);
+  } catch (larch::chart_scheduler_submit_error const&) {
+    zero_submit_failure_escaped = true;
+  }
+  CHECK(zero_submit_failure_escaped);
+  CHECK(zero_submit_runs.exact_setup.size() == 1);
+  CHECK(zero_submit_runs.frontier_clades.empty());
+  auto const& zero_submit = zero_submit_runs.exact_setup.front();
+  CHECK(zero_submit.failed);
+  CHECK(zero_submit.parallel_branch_entered);
+  CHECK(zero_submit.used_parallel_workers());
+  CHECK(zero_submit.worker_tasks_submitted == 0);
+  CHECK(zero_submit.ranges_completed == 0);
+  CHECK(zero_submit.ranges_cancelled == zero_submit.range_count);
+  CHECK(zero_submit_scheduler.metrics().parallel_operations == 1);
+  CHECK(zero_submit_scheduler.metrics().tasks_submitted == 0);
+  CHECK(zero_submit_scheduler.metrics().tasks_completed == 0);
+  CHECK(zero_submit_scheduler.metrics().tasks_joined == 0);
+  CHECK(zero_submit_scheduler.metrics().pending_tasks == 0);
+
+  larch::multisite_trim_scheduler_run_summaries zero_submit_recovery_runs;
+  auto zero_submit_recovered = larch::build_multisite_trim(
+      plan, patterns, zero_submit_scheduler, chart_options, {},
+      &zero_submit_recovery_runs);
+  auto zero_submit_oracle =
+      larch::build_multisite_trim(plan, patterns, chart_options, {});
+  check_multisite_trim_results_equal(zero_submit_oracle,
+                                     zero_submit_recovered);
+  CHECK(!zero_submit_recovery_runs.exact_setup.empty());
+  CHECK(std::none_of(zero_submit_recovery_runs.exact_setup.begin(),
+                     zero_submit_recovery_runs.exact_setup.end(),
+                     [](auto const& run) { return run.failed; }));
+  CHECK(zero_submit_scheduler.metrics().pending_tasks == 0);
+  zero_submit_scheduler.shutdown();
+  CHECK(zero_submit_scheduler.metrics().live_pool_threads == 0);
 
   std::println("  PASS");
 }
@@ -3273,6 +3455,7 @@ int main() {
   test_multisite_score_only_dominance_matches_bruteforce_and_labels();
   test_multisite_two_pass_dominated_suboptimal_does_not_overkeep();
   test_multisite_two_pass_exact_mask_matches_bruteforce();
+  test_multisite_two_pass_releases_score_frontiers_before_mask_pass();
   test_multisite_parent_combine_fixes_child_topology();
   test_multisite_concordant_sites_equal_lower_bound();
   test_multisite_invariant_sites_and_reference_edge_constant();

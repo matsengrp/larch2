@@ -172,9 +172,16 @@ struct chart_scheduler_run_summary {
   chart_scheduler_serial_reason serial_reason =
       chart_scheduler_serial_reason::none;
   bool cancelled = false;
+  // True once run_indexed_ranges selected the owning-pool path.  A failed
+  // submission can enter that path yet submit zero runners, so task count
+  // alone cannot reconcile the operation with parallel_operations.
+  bool parallel_branch_entered = false;
+  // Set only on the optional summary published while an operation unwinds.
+  // Successful returned summaries keep this false.
+  bool failed = false;
 
   [[nodiscard]] bool used_parallel_workers() const noexcept {
-    return worker_tasks_submitted > 0;
+    return parallel_branch_entered || worker_tasks_submitted > 0;
   }
 };
 
@@ -257,7 +264,8 @@ class chart_scheduler {
   template <typename Work>
   chart_scheduler_run_summary for_each_indexed_range(
       std::size_t item_count, chart_indexed_range_options options,
-      Work&& work) {
+      Work&& work,
+      chart_scheduler_run_summary* failed_run_summary = nullptr) {
     auto plan = plan_indexed_ranges(item_count, options);
     auto work_object = std::forward<Work>(work);
     auto erased_callable =
@@ -266,7 +274,7 @@ class chart_scheduler {
           std::invoke(work_object, range, slot_id, token);
         };
     range_work erased{erased_callable};
-    return run_indexed_ranges(plan, erased, {});
+    return run_indexed_ranges(plan, erased, {}, failed_run_summary);
   }
 
   template <typename Work>
@@ -348,7 +356,8 @@ class chart_scheduler {
 
   chart_scheduler_run_summary run_indexed_ranges(
       chart_indexed_range_plan const& plan, range_work work,
-      deterministic_finish finish);
+      deterministic_finish finish,
+      chart_scheduler_run_summary* failed_run_summary = nullptr);
   [[nodiscard]] static chart_indexed_range indexed_range_at(
       chart_indexed_range_plan const& plan, std::uint64_t first_task_id,
       std::size_t index) noexcept;

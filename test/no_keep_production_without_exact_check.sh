@@ -154,6 +154,10 @@ for my $path (@paths) {
     while ($text =~ /\b$q(?:\.|->)keep_production(?!_exact)\b/g) {
       my $pos = $-[0];
       next if in_any_span($pos, $allowed);
+      # Capacity-only resident-memory accounting does not inspect or summarize
+      # any mask bit, so it is safe regardless of the exactness label.
+      my $suffix = substr($text, $+[0], 80);
+      next if $suffix =~ /^\s*\.\s*capacity\s*\(/;
       next if exact_guard_before($text, $pos, $var);
       push @bad, "$path:" . line_no($text, $pos) . ": $var.keep_production consumed without a preceding keep_production_exact guard/assert";
     }

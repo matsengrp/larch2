@@ -1336,8 +1336,10 @@ Analysis:
                           Bounded candidate batch size for local scoring
                           (default 0, choose automatically when needed)
   --chart-spr-memory-budget <BYTES>
-                          Advisory resident chart-cache memory budget; if the
-                          active cache estimate exceeds it, use pattern batches
+                          Unified hard budget for resident chart state plus
+                          admitted exact scratch and overlays; cache selection
+                          may use pattern batches, and exact work fails closed
+                          before the configured bound would be exceeded
   --chart-spr-max-cached-patterns <N>
                           Maximum active patterns resident in the chart cache
                           before switching to pattern-batch scoring
@@ -4192,6 +4194,8 @@ static void run_chart_spr_search_diagnostic(
                                     scheduler_axes.exact_setup_patterns, "  ");
   print_chart_scheduler_axis_fields(out, "exact_frontier_clade",
                                     scheduler_axes.exact_frontier_clades, "  ");
+  print_chart_scheduler_axis_fields(out, "exact_candidate",
+                                    scheduler_axes.exact_candidates, "  ");
   print_chart_scheduler_axis_fields(out, "inside_cache",
                                     scheduler_axes.inside_cache_patterns, "  ");
   print_chart_scheduler_axis_fields(
@@ -4469,6 +4473,21 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.materialization_final_compaction_ms << "\n";
   out << "  peak_concurrent_exact_verifiers: "
       << search.summary.peak_concurrent_exact_verifiers << "\n";
+  out << "  exact_candidate_admission_batches: "
+      << search.summary.exact_candidate_admission_batches << "\n";
+  out << "  exact_candidate_parallel_batches: "
+      << search.summary.exact_candidate_parallel_batches << "\n";
+  out << "  exact_candidate_inner_parallel_batches: "
+      << search.summary.exact_candidate_inner_parallel_batches << "\n";
+  out << "  exact_candidate_memory_limited_batches: "
+      << search.summary.exact_candidate_memory_limited_batches << "\n";
+  out << "  exact_candidate_peak_admitted_bytes: "
+      << search.summary.exact_candidate_peak_admitted_bytes << "\n";
+  out << "  exact_candidate_peak_projected_resident_bytes: "
+      << search.summary.exact_candidate_peak_projected_resident_bytes << "\n";
+  out << "  exact_candidate_queued_for_memory_ms: " << std::fixed
+      << std::setprecision(3)
+      << search.summary.exact_candidate_queued_for_memory_ms << "\n";
   out << "  exact_candidate_timing_count: "
       << search.summary.exact_candidate_timing_count << "\n";
   out << "  exact_candidate_verification_ms_min: " << std::fixed

@@ -334,8 +334,10 @@ if ! grep -qi 'conflict' "$tmp/conflict.err" ||
 fi
 
 # Phase-0 timing fields are diagnostic, finite, nonnegative, and internally
-# consistent. This run has exactly one exact candidate so its aggregate and
-# per-candidate values should agree within report-rounding tolerance.
+# consistent. This run has exactly one exact candidate. Its per-candidate
+# verifier values agree, while the aggregate exact phase additionally includes
+# selection, estimation, admission, and post-join aggregation and therefore
+# must only envelope the verifier timing.
 for key in cache_build_ms initial_chart_construction_ms \
            candidate_generation_ms exact_initialization_ms \
            local_scoring_ms exact_verification_ms \
@@ -431,7 +433,7 @@ awk -v cache="$cache_ms" -v initial_chart="$initial_chart_ms" \
     if (abs(exact_min - candidate) > tolerance ||
         abs(exact_mean - candidate) > tolerance ||
         abs(exact_max - candidate) > tolerance ||
-        abs(exact_total - candidate) > tolerance) exit 5
+        candidate > exact_total + tolerance) exit 5
     if (materialization > total + tolerance) exit 7
     if (abs(materialization - (materialization_exact + materialization_accepted + materialization_final)) > tolerance) exit 8
   }

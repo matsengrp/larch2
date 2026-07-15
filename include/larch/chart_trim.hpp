@@ -3955,25 +3955,34 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside_scheduled(
       active_pattern_indices.size());
   std::vector<std::exception_ptr> pattern_errors(active_pattern_indices.size());
 
-  auto pattern_run = scheduler.for_each_indexed_range(
-      active_pattern_indices.size(), multisite_exact_setup_range_options(),
-      [&](chart_indexed_range const& range, std::size_t stable_slot_id,
-          chart_scheduler_cancellation_token const&) {
-        for (std::size_t active_index = range.begin; active_index < range.end;
-             ++active_index) {
-          auto const pattern_index = active_pattern_indices[active_index];
-          try {
-            build_scheduled_multisite_exact_pattern_slot(
-                structural, patterns, pattern_index, options, inside_provider,
-                resident_inside, !unique_reachable_topology, stable_slot_id,
-                pattern_slots[active_index]);
-          } catch (...) {
-            pattern_errors[active_index] = std::current_exception();
-            break;
+  chart_scheduler_run_summary failed_pattern_run;
+  try {
+    auto pattern_run = scheduler.for_each_indexed_range(
+        active_pattern_indices.size(), multisite_exact_setup_range_options(),
+        [&](chart_indexed_range const& range, std::size_t stable_slot_id,
+            chart_scheduler_cancellation_token const&) {
+          for (std::size_t active_index = range.begin; active_index < range.end;
+               ++active_index) {
+            auto const pattern_index = active_pattern_indices[active_index];
+            try {
+              build_scheduled_multisite_exact_pattern_slot(
+                  structural, patterns, pattern_index, options, inside_provider,
+                  resident_inside, !unique_reachable_topology, stable_slot_id,
+                  pattern_slots[active_index]);
+            } catch (...) {
+              pattern_errors[active_index] = std::current_exception();
+              break;
+            }
           }
-        }
-      });
-  if (run_summaries != nullptr) run_summaries->push_back(pattern_run);
+        },
+        &failed_pattern_run);
+    if (run_summaries != nullptr) run_summaries->push_back(pattern_run);
+  } catch (...) {
+    if (run_summaries != nullptr && failed_pattern_run.failed) {
+      run_summaries->push_back(failed_pattern_run);
+    }
+    throw;
+  }
   for (auto const& error : pattern_errors) {
     if (error) std::rethrow_exception(error);
   }
@@ -4031,27 +4040,37 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside_scheduled(
     auto const item_count = topology_count * pattern_count;
     std::vector<std::uint64_t> contributions(item_count, 0);
     std::vector<std::exception_ptr> errors(item_count);
-    topology_run = scheduler.for_each_indexed_range(
-        item_count, multisite_exact_setup_range_options(),
-        [&](chart_indexed_range const& range, std::size_t,
-            chart_scheduler_cancellation_token const&) {
-          for (std::size_t flat = range.begin; flat < range.end; ++flat) {
-            auto const topology_index = flat / pattern_count;
-            auto const pattern_index = flat % pattern_count;
-            try {
-              auto const& pattern = patterns.patterns[pattern_index];
-              if (!is_active_pattern(pattern)) continue;
-              auto row = restricted_topology_row(
-                  structural, pattern, upper_bound_topologies[topology_index]);
-              contributions[flat] = exact_setup_weighted_topology_root_score(
-                  structural, row, pattern, options);
-            } catch (...) {
-              errors[flat] = std::current_exception();
-              break;
+    chart_scheduler_run_summary failed_topology_run;
+    try {
+      topology_run = scheduler.for_each_indexed_range(
+          item_count, multisite_exact_setup_range_options(),
+          [&](chart_indexed_range const& range, std::size_t,
+              chart_scheduler_cancellation_token const&) {
+            for (std::size_t flat = range.begin; flat < range.end; ++flat) {
+              auto const topology_index = flat / pattern_count;
+              auto const pattern_index = flat % pattern_count;
+              try {
+                auto const& pattern = patterns.patterns[pattern_index];
+                if (!is_active_pattern(pattern)) continue;
+                auto row = restricted_topology_row(
+                    structural, pattern,
+                    upper_bound_topologies[topology_index]);
+                contributions[flat] = exact_setup_weighted_topology_root_score(
+                    structural, row, pattern, options);
+              } catch (...) {
+                errors[flat] = std::current_exception();
+                break;
+              }
             }
-          }
-        });
-    if (run_summaries != nullptr) run_summaries->push_back(topology_run);
+          },
+          &failed_topology_run);
+      if (run_summaries != nullptr) run_summaries->push_back(topology_run);
+    } catch (...) {
+      if (run_summaries != nullptr && failed_topology_run.failed) {
+        run_summaries->push_back(failed_topology_run);
+      }
+      throw;
+    }
     for (auto const& error : errors) {
       if (error) std::rethrow_exception(error);
     }
@@ -4070,24 +4089,33 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside_scheduled(
     }
   } else {
     std::vector<std::exception_ptr> errors(topology_count);
-    topology_run = scheduler.for_each_indexed_range(
-        topology_count, multisite_exact_setup_range_options(),
-        [&](chart_indexed_range const& range, std::size_t,
-            chart_scheduler_cancellation_token const&) {
-          for (std::size_t topology_index = range.begin;
-               topology_index < range.end; ++topology_index) {
-            try {
-              topology_scores[topology_index] =
-                  ::larch::chart_multisite_detail::score_selected_topology(
-                      structural, patterns,
-                      upper_bound_topologies[topology_index], options);
-            } catch (...) {
-              errors[topology_index] = std::current_exception();
-              break;
+    chart_scheduler_run_summary failed_topology_run;
+    try {
+      topology_run = scheduler.for_each_indexed_range(
+          topology_count, multisite_exact_setup_range_options(),
+          [&](chart_indexed_range const& range, std::size_t,
+              chart_scheduler_cancellation_token const&) {
+            for (std::size_t topology_index = range.begin;
+                 topology_index < range.end; ++topology_index) {
+              try {
+                topology_scores[topology_index] =
+                    ::larch::chart_multisite_detail::score_selected_topology(
+                        structural, patterns,
+                        upper_bound_topologies[topology_index], options);
+              } catch (...) {
+                errors[topology_index] = std::current_exception();
+                break;
+              }
             }
-          }
-        });
-    if (run_summaries != nullptr) run_summaries->push_back(topology_run);
+          },
+          &failed_topology_run);
+      if (run_summaries != nullptr) run_summaries->push_back(topology_run);
+    } catch (...) {
+      if (run_summaries != nullptr && failed_topology_run.failed) {
+        run_summaries->push_back(failed_topology_run);
+      }
+      throw;
+    }
     for (auto const& error : errors) {
       if (error) std::rethrow_exception(error);
     }
@@ -4934,30 +4962,42 @@ build_multisite_frontiers_from_prepared_active_scheduled(
     auto const item_count = end - begin;
     multisite_frontier_level_diagnostic diagnostic;
     diagnostic.dependency_level = level;
-    auto run = scheduler.for_each_indexed_range(
-        item_count, multisite_frontier_clade_range_options(),
-        [&](chart_indexed_range const& range, std::size_t stable_slot,
-            chart_scheduler_cancellation_token const&) {
-          for (std::size_t item = range.begin; item < range.end; ++item) {
-            auto const clade = level_order[begin + item];
-            try {
-              if (test_hooks != nullptr && test_hooks->before_clade) {
-                test_hooks->before_clade(clade, level, stable_slot);
+    chart_scheduler_run_summary failed_run;
+    chart_scheduler_run_summary run;
+    try {
+      run = scheduler.for_each_indexed_range(
+          item_count, multisite_frontier_clade_range_options(),
+          [&](chart_indexed_range const& range, std::size_t stable_slot,
+              chart_scheduler_cancellation_token const&) {
+            for (std::size_t item = range.begin; item < range.end; ++item) {
+              auto const clade = level_order[begin + item];
+              try {
+                if (test_hooks != nullptr && test_hooks->before_clade) {
+                  test_hooks->before_clade(clade, level, stable_slot);
+                }
+                work_by_clade[clade] = build_multisite_frontier_clade(
+                    plan, options, build_options, context, active_patterns,
+                    result.invariant_constant_offset, pruning_upper_bound,
+                    clade, result.frontiers);
+                if (test_hooks != nullptr && test_hooks->after_clade) {
+                  test_hooks->after_clade(clade, level, stable_slot);
+                }
+              } catch (...) {
+                errors_by_clade[clade] = std::current_exception();
+                break;
               }
-              work_by_clade[clade] = build_multisite_frontier_clade(
-                  plan, options, build_options, context, active_patterns,
-                  result.invariant_constant_offset, pruning_upper_bound, clade,
-                  result.frontiers);
-              if (test_hooks != nullptr && test_hooks->after_clade) {
-                test_hooks->after_clade(clade, level, stable_slot);
-              }
-            } catch (...) {
-              errors_by_clade[clade] = std::current_exception();
-              break;
             }
-          }
-        });
-    if (clade_run_summaries != nullptr) clade_run_summaries->push_back(run);
+          },
+          &failed_run);
+      if (clade_run_summaries != nullptr) {
+        clade_run_summaries->push_back(run);
+      }
+    } catch (...) {
+      if (clade_run_summaries != nullptr && failed_run.failed) {
+        clade_run_summaries->push_back(failed_run);
+      }
+      throw;
+    }
 
     // The join above forms the complete dependency-level publication barrier.
     // Select semantic failures exactly as W1 does: original bottom-up level
@@ -5340,14 +5380,31 @@ inline multisite_trim_result build_multisite_trim_impl(
         trim_options.upper_bound_override;
     score_build_options.max_frontier_entries_per_clade =
         trim_options.max_frontier_entries_per_clade;
-    auto score_build =
-        build_frontiers(score_build_options, "multi-site trim score pass");
+    {
+      auto score_build =
+          build_frontiers(score_build_options, "multi-site trim score pass");
 
-    result.optimum = compute_root_frontier_optimum_and_update_mask(
-        grammar, options, score_build, false, result.keep_production,
-        "multi-site trim score pass");
-    validate_known_exact_optimum(result.optimum, trim_options,
-                                 "multi-site trim score pass");
+      result.optimum = compute_root_frontier_optimum_and_update_mask(
+          grammar, options, score_build, false, result.keep_production,
+          "multi-site trim score pass");
+      validate_known_exact_optimum(result.optimum, trim_options,
+                                   "multi-site trim score pass");
+      append_multisite_frontier_diagnostics(
+          result, score_build, multisite_frontier_pass_kind::score_only, 0);
+
+      // Retain every score-pass scalar and diagnostic needed by the result,
+      // then release its full frontier vectors before allocating the exact
+      // mask-recovery pass.
+      result.composite_lower_bound = score_build.composite_lower_bound;
+      result.initial_upper_bound = score_build.initial_upper_bound;
+      result.dominance_candidates_considered =
+          score_build.dominance_candidates_considered;
+      result.dominance_pruned_score_pass = score_build.dominance_pruned;
+      result.bound_pruned = score_build.bound_pruned;
+      result.equality_deduplicated = score_build.equality_deduplicated;
+      result.active_pattern_count = score_build.active_pattern_count;
+      result.invariant_constant_offset = score_build.invariant_constant_offset;
+    }
 
     multisite_frontier_build_options mask_build_options;
     mask_build_options.keep_provenance = false;
@@ -5361,8 +5418,6 @@ inline multisite_trim_result build_multisite_trim_impl(
         trim_options.max_frontier_entries_per_clade;
     auto mask_build = build_frontiers(
         mask_build_options, "multi-site trim exact mask recovery pass");
-    append_multisite_frontier_diagnostics(
-        result, score_build, multisite_frontier_pass_kind::score_only, 0);
     append_multisite_frontier_diagnostics(
         result, mask_build, multisite_frontier_pass_kind::exact_mask_recovery,
         1);
@@ -5384,18 +5439,10 @@ inline multisite_trim_result build_multisite_trim_impl(
           });
     }
 
-    result.composite_lower_bound = score_build.composite_lower_bound;
-    result.initial_upper_bound = score_build.initial_upper_bound;
     result.frontier_sizes_by_clade = mask_build.frontier_sizes_by_clade;
-    result.dominance_candidates_considered =
-        score_build.dominance_candidates_considered;
-    result.dominance_pruned_score_pass = score_build.dominance_pruned;
     result.dominance_pruned_mask_pass = mask_build.dominance_pruned;
-    result.bound_pruned = score_build.bound_pruned + mask_build.bound_pruned;
-    result.equality_deduplicated =
-        score_build.equality_deduplicated + mask_build.equality_deduplicated;
-    result.active_pattern_count = score_build.active_pattern_count;
-    result.invariant_constant_offset = score_build.invariant_constant_offset;
+    result.bound_pruned += mask_build.bound_pruned;
+    result.equality_deduplicated += mask_build.equality_deduplicated;
     result.exact_mask_recovery_passes = 1;
     result.dominance_pruned =
         result.dominance_pruned_score_pass + result.dominance_pruned_mask_pass;
@@ -5493,14 +5540,31 @@ inline multisite_trim_result build_multisite_trim_impl(
         trim_options.upper_bound_override;
     score_build_options.max_frontier_entries_per_clade =
         trim_options.max_frontier_entries_per_clade;
-    auto score_build =
-        build_frontiers(score_build_options, "multi-site trim score pass");
+    {
+      auto score_build =
+          build_frontiers(score_build_options, "multi-site trim score pass");
 
-    result.optimum = compute_root_frontier_optimum_and_update_mask(
-        plan, options, score_build, false, result.keep_production,
-        "multi-site trim score pass");
-    validate_known_exact_optimum(result.optimum, trim_options,
-                                 "multi-site trim score pass");
+      result.optimum = compute_root_frontier_optimum_and_update_mask(
+          plan, options, score_build, false, result.keep_production,
+          "multi-site trim score pass");
+      validate_known_exact_optimum(result.optimum, trim_options,
+                                   "multi-site trim score pass");
+      append_multisite_frontier_diagnostics(
+          result, score_build, multisite_frontier_pass_kind::score_only, 0);
+
+      // Retain every score-pass scalar and diagnostic needed by the result,
+      // then release its full frontier vectors before allocating the exact
+      // mask-recovery pass.
+      result.composite_lower_bound = score_build.composite_lower_bound;
+      result.initial_upper_bound = score_build.initial_upper_bound;
+      result.dominance_candidates_considered =
+          score_build.dominance_candidates_considered;
+      result.dominance_pruned_score_pass = score_build.dominance_pruned;
+      result.bound_pruned = score_build.bound_pruned;
+      result.equality_deduplicated = score_build.equality_deduplicated;
+      result.active_pattern_count = score_build.active_pattern_count;
+      result.invariant_constant_offset = score_build.invariant_constant_offset;
+    }
 
     multisite_frontier_build_options mask_build_options;
     mask_build_options.keep_provenance = false;
@@ -5512,8 +5576,6 @@ inline multisite_trim_result build_multisite_trim_impl(
         trim_options.max_frontier_entries_per_clade;
     auto mask_build = build_frontiers(
         mask_build_options, "multi-site trim exact mask recovery pass");
-    append_multisite_frontier_diagnostics(
-        result, score_build, multisite_frontier_pass_kind::score_only, 0);
     append_multisite_frontier_diagnostics(
         result, mask_build, multisite_frontier_pass_kind::exact_mask_recovery,
         1);
@@ -5535,18 +5597,10 @@ inline multisite_trim_result build_multisite_trim_impl(
           });
     }
 
-    result.composite_lower_bound = score_build.composite_lower_bound;
-    result.initial_upper_bound = score_build.initial_upper_bound;
     result.frontier_sizes_by_clade = mask_build.frontier_sizes_by_clade;
-    result.dominance_candidates_considered =
-        score_build.dominance_candidates_considered;
-    result.dominance_pruned_score_pass = score_build.dominance_pruned;
     result.dominance_pruned_mask_pass = mask_build.dominance_pruned;
-    result.bound_pruned = score_build.bound_pruned + mask_build.bound_pruned;
-    result.equality_deduplicated =
-        score_build.equality_deduplicated + mask_build.equality_deduplicated;
-    result.active_pattern_count = score_build.active_pattern_count;
-    result.invariant_constant_offset = score_build.invariant_constant_offset;
+    result.bound_pruned += mask_build.bound_pruned;
+    result.equality_deduplicated += mask_build.equality_deduplicated;
     result.exact_mask_recovery_passes = 1;
     result.dominance_pruned =
         result.dominance_pruned_score_pass + result.dominance_pruned_mask_pass;

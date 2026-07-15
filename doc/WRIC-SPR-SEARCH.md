@@ -84,6 +84,54 @@ Candidate-selection modes:
   verification according to the configured policy.
 - `sampled_or_randomized`: record the sampling/randomization policy and seed.
 
+### Exact-candidate waves and unified memory admission
+
+Retained exact candidates are verified in deterministic waves keyed by stable
+lower-bound rank. The old exact trim, when required by `exact_multisite`, is
+built and published once before any candidate reader starts. Each admitted
+task owns its verifier counters, transient overlay/scratch, selected-topology
+cache, result, timing, and exception slot; it shares only immutable state and
+the published old trim.
+
+There is one scheduler and no nested pool. A wave containing two or more
+candidates uses exact-candidate parallelism and gives each B&B a null inner
+scheduler, so a pool worker never waits for work queued to its own pool. A
+singleton wave may instead use the existing Phase-5 inner exact scheduler when
+the inner-parallel memory estimate fits. Legacy verifier callbacks are
+serialized because they have no parallel-safety contract; contextual callbacks
+must explicitly opt into parallel safety. Fixed-topology selector callbacks
+run serially before the verifier wave because they likewise have no implicit
+thread-safety contract.
+
+After the wave joins, the coordinator merges task-local counters, chooses a
+hard failure, copies canonical evidence, and selects the winning candidate in
+stable-rank order. Completion order is never observable. An exact-wave
+scheduler failure joins every accepted runner before it escapes, and takes
+precedence over failures produced by a partially submitted wave. Winner
+selection and commit remain serial.
+
+`chart_cache_options::memory_budget_bytes` is a unified hard chart/exact
+budget; zero means no explicit limit. If both the state and one iteration name
+finite budgets, the smaller nonzero value applies, so an iteration may tighten
+but never loosen the state budget. Before candidate generation, exact-state
+preflight accounts for the resident pattern/chart cache and any retained old
+trim. Before exact verification, the local-scoring workspace is released and
+admission additionally covers ranked/canonical live inputs, selector output,
+coordinator vectors and scheduler-operation storage, per-candidate exact setup
+and frontier or fixed-topology scratch, custom-provider scratch, and all
+results retained until serial aggregation.
+
+Finite admission takes the maximal fitting stable prefix without skipping an
+earlier large candidate for a later small one. Retained results from completed
+waves remain charged to subsequent waves. Arithmetic overflow, an estimate
+that cannot be safely bounded, a resident-state overrun, or a custom callback
+without every matching scratch/retained-memory estimator is a fail-closed
+budget error before the unbounded callback or verifier is invoked. Published
+trim and selected-cache capacity checks provide allocation-time backstops to
+the estimates. This contract bounds the exact barrier's resident charts and
+admitted exact scratch/overlays; bounding the upstream candidate-generation
+buffer is a separate candidate-generation concern.
+
 ## Cache and scoring conventions
 
 Production search caches active/topology-informative patterns only.  Invariant

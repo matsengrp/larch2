@@ -34,8 +34,10 @@ import re
 import sys
 
 helper_path, harness_path, runner_path = map(Path, sys.argv[1:])
-module = ast.parse(helper_path.read_text(encoding="utf-8"))
+helper = helper_path.read_text(encoding="utf-8")
+module = ast.parse(helper)
 helper_fields = None
+admission_fields = None
 for statement in module.body:
     if not isinstance(statement, ast.Assign):
         continue
@@ -45,8 +47,14 @@ for statement in module.body:
         for target in statement.targets
     ):
         helper_fields = set(ast.literal_eval(statement.value))
-        break
+    if any(
+        isinstance(target, ast.Name)
+        and target.id == "EXACT_CANDIDATE_ADMISSION_FIELDS"
+        for target in statement.targets
+    ):
+        admission_fields = set(ast.literal_eval(statement.value))
 assert helper_fields is not None
+assert admission_fields is not None and len(admission_fields) == 7
 harness = harness_path.read_text(encoding="utf-8")
 match = re.search(
     r'required="(schema_version outcome exit_code[^\"]+)"', harness
@@ -61,6 +69,13 @@ runner_fields = set(
 )
 assert len(helper_fields) == 41
 assert helper_fields == harness_fields == runner_fields
+trial_start = harness.index("trial_columns=(")
+trial_end = harness.index("\n(", trial_start)
+harness_trial_fields = set(
+    re.findall(r"[A-Za-z_][A-Za-z0-9_]*", harness[trial_start:trial_end])
+)
+assert admission_fields <= harness_trial_fields
+assert '",".join(EXACT_CANDIDATE_ADMISSION_FIELDS)' in helper
 PY
 
 python3 "$tool" matrix --unpinned-affinity 0-15 >"$tmp/matrix.tsv"

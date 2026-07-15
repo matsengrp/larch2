@@ -32,7 +32,7 @@ committed. Phase-0 artifacts use the non-overwriting directory
 | 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | code checkpoint `7d294d6`; scheduler contract, canonical worker matrix, full RelWithDebInfo, and targeted TSan gates pass; small-case timing remains pending |
 | 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | code checkpoint `cbf92b6` and evidence checkpoint `1be6ffe`; full RelWithDebInfo and targeted TSan gates pass; sealed scaling/RSS gates pending |
 | 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass post-omission semantics, full CTest, and targeted TSAN; diagnostic exact-phase scaling exceeds 2x; unified frontier/candidate admission and sealed timing/RSS remain pending |
-| 6. Parallelize exact top-K candidates | in progress | unified exact-memory admission and stable candidate-parallel execution are the next dependency |
+| 6. Parallelize exact top-K candidates | implementation in validation; sealed performance acceptance pending deferred Phase 0 | working validation tree is based on `1cc76dc`; Phase-6 checkpoint commit TBD; no functional, sanitizer, scaling, admission, or RSS gate is claimed passed in this ledger yet |
 | 7--10 | pending | may follow in plan order under the same acceptance gate |
 
 ## Phase 0 — immutable provenance
@@ -1339,6 +1339,41 @@ invariant by releasing score-pass frontiers before exact-mask recovery and by
 admitting candidate/frontier scratch under the unified budget. Phase 0 must
 then supply sealed timeout, scaling, and RSS evidence. Under the authorized
 deadline-overlap rule, implementation proceeds to Phase 6 now.
+
+## Phase 6 implementation validation checkpoint (unsealed)
+
+Phase 6 is **implementation in validation; sealed performance acceptance
+pending deferred Phase 0**. The working validation tree is based on `1cc76dc`;
+the next Phase-6 checkpoint commit is TBD. The immutable parent measurement
+checkpoint remains `7ca527b8906d018124756182274335cbff936d72`
+(`Baseline measure`). No frozen Phase-0 executable, workload, runner, oracle,
+or search contract has been replaced.
+
+The worktree implementation under validation publishes one immutable old exact
+trim, admits retained candidates in deterministic stable-rank waves, gives
+each task private verifier counters/scratch/results, forbids nested-pool
+execution, and merges failures, counters, canonical evidence, and winner
+selection serially after each join. Its unified finite budget uses the tighter
+nonzero state/iteration value and charges resident charts and exact trim,
+coordinator/live-input storage, selector and estimator work, task-local exact
+setup/frontier or fixed-topology scratch, and retained results across waves.
+Unsafe or overflowing estimates and custom finite-budget callbacks without
+matching memory estimators fail closed.
+
+The benchmark worktree also emits `phase6_admission_evidence.tsv` and
+`phase6_rss_comparisons.tsv`, validates all seven admission fields on every
+successful chart trial, requires complete top-K-16 evidence cardinality, and
+constructs non-vacuous one-to-one W1/W8 RSS comparisons. These are evidence
+contracts, not recorded acceptance results. Any raw output remains uncommitted
+under `build/wric-chart-parallelization/`.
+
+At this checkpoint the full Top-K `1,4,16` by W `1,2,4,8` semantic and stable-
+failure matrix, repeated-W8 byte identity, full RelWithDebInfo CTest, targeted
+TSan, finite Top-K-16 admission, medium Top-K-4 scaling, W1/W8 RSS, and final
+same-revision diagnostic capture are still being validated or recorded. The
+quiet-host Phase-0 calibration, capture, finalization, audit, and detached seal
+also remain deferred. Consequently this section makes no claim that a Phase-6
+exit criterion, performance gate, or final acceptance gate has passed.
 
 ## Later-phase evidence template
 

@@ -52,6 +52,7 @@ struct chart_spr_scheduler_axis_counters {
   chart_spr_scheduler_axis_metrics initial_chart_patterns;
   chart_spr_scheduler_axis_metrics exact_setup_patterns;
   chart_spr_scheduler_axis_metrics exact_frontier_clades;
+  chart_spr_scheduler_axis_metrics exact_candidates;
   chart_spr_scheduler_axis_metrics inside_cache_patterns;
   chart_spr_scheduler_axis_metrics outside_cache_patterns;
   chart_spr_scheduler_axis_metrics fixed_topology_patterns;
@@ -84,6 +85,53 @@ inline void record_chart_spr_scheduler_axis_run(
     }
     axis.maximum_effective_grain =
         std::max(axis.maximum_effective_grain, run.effective_grain);
+  }
+}
+
+// A submission failure has no returned run summary, but the scheduler has
+// already joined every accepted runner and published the complete operation
+// delta. Preserve that delta on the semantic axis before propagating the
+// infrastructure error so a recovered search still reconciles exactly with
+// the search-lifetime scheduler.
+inline void record_chart_spr_scheduler_axis_failed_run(
+    chart_spr_scheduler_axis_metrics& axis,
+    chart_indexed_range_plan const& plan,
+    chart_scheduler_metrics const& before,
+    chart_scheduler_metrics const& after) {
+  if (after.operations < before.operations ||
+      after.parallel_operations < before.parallel_operations ||
+      after.ranges_created < before.ranges_created ||
+      after.tasks_submitted < before.tasks_submitted) {
+    throw std::logic_error(
+        "chart SPR scheduler-axis failure accounting regressed");
+  }
+  auto const operation_delta = after.operations - before.operations;
+  if (operation_delta == 0) {
+    // Rejection before operation publication (for example use after shutdown
+    // or unrelated concurrent use) has no semantic-axis work to classify.
+    return;
+  }
+  if (operation_delta != 1) {
+    throw std::logic_error(
+        "chart SPR scheduler-axis failure accounting saw multiple operations");
+  }
+  axis.operations += operation_delta;
+  axis.parallel_operations +=
+      after.parallel_operations - before.parallel_operations;
+  axis.items += plan.item_count;
+  axis.ranges += after.ranges_created - before.ranges_created;
+  axis.worker_tasks += after.tasks_submitted - before.tasks_submitted;
+  axis.active_worker_high_water =
+      std::max(axis.active_worker_high_water, after.last_active_workers);
+  if (plan.range_count != 0) {
+    if (axis.minimum_effective_grain == 0) {
+      axis.minimum_effective_grain = plan.effective_grain;
+    } else {
+      axis.minimum_effective_grain =
+          std::min(axis.minimum_effective_grain, plan.effective_grain);
+    }
+    axis.maximum_effective_grain =
+        std::max(axis.maximum_effective_grain, plan.effective_grain);
   }
 }
 
@@ -175,6 +223,8 @@ inline void add_chart_spr_scheduler_axis_counters(
                                        src.exact_setup_patterns);
   add_chart_spr_scheduler_axis_metrics(dst.exact_frontier_clades,
                                        src.exact_frontier_clades);
+  add_chart_spr_scheduler_axis_metrics(dst.exact_candidates,
+                                       src.exact_candidates);
   add_chart_spr_scheduler_axis_metrics(dst.inside_cache_patterns,
                                        src.inside_cache_patterns);
   add_chart_spr_scheduler_axis_metrics(dst.outside_cache_patterns,
@@ -193,6 +243,7 @@ inline std::uint64_t chart_spr_scheduler_axis_operation_count(
   return axes.initial_chart_patterns.operations +
          axes.exact_setup_patterns.operations +
          axes.exact_frontier_clades.operations +
+         axes.exact_candidates.operations +
          axes.inside_cache_patterns.operations +
          axes.outside_cache_patterns.operations +
          axes.fixed_topology_patterns.operations +
@@ -323,6 +374,17 @@ struct chart_spr_search_counters {
   std::size_t outside_cache_inside_charts_reused = 0;
   std::size_t outside_cache_outside_charts_built = 0;
   std::size_t exact_verifications = 0;
+  // Phase-6 stable-rank exact-candidate admission. Candidate-parallel waves
+  // disable every inner scheduler axis; singleton waves may instead use the
+  // existing exact-frontier or fixed-topology-pattern axis. These counters
+  // make that exclusivity and the unified-memory admission decision visible.
+  std::size_t exact_candidate_admission_batches = 0;
+  std::size_t exact_candidate_parallel_batches = 0;
+  std::size_t exact_candidate_inner_parallel_batches = 0;
+  std::size_t exact_candidate_memory_limited_batches = 0;
+  std::size_t exact_candidate_peak_admitted_bytes = 0;
+  std::size_t exact_candidate_peak_projected_resident_bytes = 0;
+  double exact_candidate_queued_for_memory_ms = 0.0;
   std::size_t accepted_moves = 0;
   std::size_t candidate_accepts_attempted = 0;
   std::size_t rejected_moves = 0;
@@ -484,6 +546,16 @@ struct chart_spr_search_counters {
   // the per-candidate two-chart oracle when the oracle flag is on.  Reported
   // separately so a regression to "no oracle" is visible.
   std::size_t transient_chain_extension_oracle_rows_checked_for_tests = 0;
+};
+
+// All mutable state owned by one exact-verification attempt. The search
+// coordinator supplies a private counter sink for candidate-parallel work and
+// publishes the immutable old exact trim before launching readers. A nullable
+// inner scheduler selects exactly one parallel axis per admission wave.
+struct chart_spr_exact_verification_context {
+  chart_spr_search_counters& counters;
+  multisite_trim_result const* published_old_trim = nullptr;
+  chart_scheduler* inner_scheduler = nullptr;
 };
 
 inline void record_chart_execution_plan_build_stats(
@@ -797,6 +869,19 @@ using chart_spr_topology_selection_provider = std::function<
     std::optional<chart_spr_topology_selection>(
         chart_spr_search_state const&, grammar_spr_candidate const&)>;
 
+struct chart_spr_topology_selection_memory_estimate {
+  std::size_t scratch_bytes = 0;
+  std::size_t retained_result_bytes = 0;
+  bool safely_bounded = true;
+};
+
+// Estimators are preflight metadata callbacks: they must not allocate material
+// scratch or invoke the selector itself. Their returned scratch covers the
+// subsequent provider invocation, not evaluation of this callback.
+using chart_spr_topology_selection_memory_estimator = std::function<
+    chart_spr_topology_selection_memory_estimate(
+        chart_spr_search_state const&, grammar_spr_candidate const&)>;
+
 struct chart_spr_search_options {
   std::size_t max_iterations = 1;
   std::size_t max_candidates_per_iteration = 0;  // 0 = unlimited
@@ -947,7 +1032,221 @@ struct chart_spr_search_options {
       override_local_commit_recorded_objective_for_tests;
 
   std::uint32_t seed = 1;
+
+  // Phase-6 additions deliberately follow the historical aggregate prefix so
+  // positional initializers compiled against the pre-Phase-6 options layout
+  // retain their source meaning.
+  // Additional provider-specific memory beyond the built-in certificate and
+  // selector envelope. A finite unified budget fails closed before invoking a
+  // custom provider unless this contract is supplied.
+  chart_spr_topology_selection_memory_estimator
+      topology_selection_additional_memory_estimator = {};
+  // Stable-rank hook invoked inside each admitted exact-candidate task after
+  // concurrency tracking begins and before verifier entry. Tests use it to
+  // force overlap and reverse completion/failure order without weakening
+  // production scheduling or exception semantics.
+  std::function<void(std::size_t)>
+      before_exact_candidate_verification_for_tests = {};
+  // Exact-axis-only infrastructure injection. The first candidate-parallel
+  // wave asks the shared scheduler to fail after this many successful runner
+  // submissions. This is deliberately separate from local scoring so tests
+  // can prove partial exact-wave join/accounting and deterministic failure
+  // precedence without perturbing earlier scheduler operations.
+  std::optional<std::size_t>
+      force_exact_candidate_submit_failure_after_for_tests;
 };
+
+struct chart_spr_exact_candidate_memory_estimate {
+  // Peak task-local storage when the candidate itself is the parallel axis.
+  std::size_t serial_scratch_bytes = 0;
+  // Peak task-local storage for a singleton candidate allowed to use the
+  // Phase-5 inner scheduler. This includes serial_scratch_bytes.
+  std::size_t inner_parallel_scratch_bytes = 0;
+  // Storage that survives task completion until stable-rank aggregation.
+  std::size_t retained_result_bytes = 0;
+  // False means standard-container growth could not be bounded before the
+  // finite-budget sentinel. Such a candidate is still runnable with the
+  // historical unlimited budget, but finite admission fails closed.
+  bool safely_bounded = true;
+};
+
+struct chart_spr_exact_candidate_admission_wave {
+  std::size_t begin_rank = 0;
+  std::size_t end_rank = 0;
+  std::size_t admitted_bytes = 0;
+  bool memory_limited = false;
+  bool use_inner_parallelism = false;
+};
+
+class chart_spr_exact_candidate_budget_error : public std::runtime_error {
+ public:
+  chart_spr_exact_candidate_budget_error(std::size_t stable_rank,
+                                         std::size_t required_bytes,
+                                         std::size_t available_bytes)
+      : std::runtime_error("chart SPR exact-candidate admission: stable rank " +
+                           std::to_string(stable_rank) + " requires " +
+                           std::to_string(required_bytes) + " bytes but only " +
+                           std::to_string(available_bytes) +
+                           " bytes are available"),
+        stable_rank_(stable_rank),
+        required_bytes_(required_bytes),
+        available_bytes_(available_bytes) {}
+
+  [[nodiscard]] std::size_t stable_rank() const noexcept {
+    return stable_rank_;
+  }
+  [[nodiscard]] std::size_t required_bytes() const noexcept {
+    return required_bytes_;
+  }
+  [[nodiscard]] std::size_t available_bytes() const noexcept {
+    return available_bytes_;
+  }
+
+ private:
+  std::size_t stable_rank_;
+  std::size_t required_bytes_;
+  std::size_t available_bytes_;
+};
+
+class chart_spr_exact_state_budget_error : public std::runtime_error {
+ public:
+  chart_spr_exact_state_budget_error(std::size_t required_bytes,
+                                     std::size_t budget_bytes)
+      : std::runtime_error(
+            "chart SPR exact-state admission requires " +
+            std::to_string(required_bytes) +
+            " bytes, exceeding configured unified chart/exact budget " +
+            std::to_string(budget_bytes)),
+        required_bytes_(required_bytes),
+        budget_bytes_(budget_bytes) {}
+
+  [[nodiscard]] std::size_t required_bytes() const noexcept {
+    return required_bytes_;
+  }
+  [[nodiscard]] std::size_t budget_bytes() const noexcept {
+    return budget_bytes_;
+  }
+
+ private:
+  std::size_t required_bytes_;
+  std::size_t budget_bytes_;
+};
+
+inline std::size_t chart_spr_exact_candidate_checked_bytes_add(
+    std::size_t lhs, std::size_t rhs, std::string_view context) {
+  if (lhs > (std::numeric_limits<std::size_t>::max)() - rhs) {
+    throw std::overflow_error(std::string{context} + " byte overflow");
+  }
+  return lhs + rhs;
+}
+
+inline std::size_t chart_spr_exact_candidate_checked_bytes_multiply(
+    std::size_t lhs, std::size_t rhs, std::string_view context) {
+  if (lhs != 0 && rhs > (std::numeric_limits<std::size_t>::max)() / lhs) {
+    throw std::overflow_error(std::string{context} + " byte overflow");
+  }
+  return lhs * rhs;
+}
+
+inline std::size_t chart_spr_exact_candidate_saturating_bytes_add(
+    std::size_t lhs, std::size_t rhs) noexcept {
+  return rhs > (std::numeric_limits<std::size_t>::max)() - lhs
+             ? (std::numeric_limits<std::size_t>::max)()
+             : lhs + rhs;
+}
+
+// Deterministic maximal stable-prefix planner. A finite budget never skips an
+// earlier large candidate to admit a later small one. The caller subtracts
+// shared resident storage and retained results from available_bytes first.
+inline chart_spr_exact_candidate_admission_wave
+plan_chart_spr_exact_candidate_admission_wave(
+    std::span<chart_spr_exact_candidate_memory_estimate const> estimates,
+    std::size_t begin_rank, std::size_t worker_limit,
+    std::size_t available_bytes, bool enforce_budget) {
+  if (begin_rank >= estimates.size()) {
+    return chart_spr_exact_candidate_admission_wave{.begin_rank = begin_rank,
+                                                    .end_rank = begin_rank};
+  }
+  worker_limit = std::max<std::size_t>(1, worker_limit);
+  auto const candidate_limit =
+      std::min(worker_limit, estimates.size() - begin_rank);
+  auto const effective_available =
+      enforce_budget ? available_bytes
+                     : (std::numeric_limits<std::size_t>::max)();
+
+  if (!enforce_budget) {
+    std::size_t admitted = 0;
+    for (std::size_t offset = 0; offset < candidate_limit; ++offset) {
+      auto const& estimate = estimates[begin_rank + offset];
+      auto required = estimate.serial_scratch_bytes;
+      if (candidate_limit == 1) {
+        required = estimate.inner_parallel_scratch_bytes;
+      }
+      if (required > (std::numeric_limits<std::size_t>::max)() -
+                         estimate.retained_result_bytes) {
+        admitted = (std::numeric_limits<std::size_t>::max)();
+        break;
+      }
+      required += estimate.retained_result_bytes;
+      admitted = required > (std::numeric_limits<std::size_t>::max)() - admitted
+                     ? (std::numeric_limits<std::size_t>::max)()
+                     : admitted + required;
+    }
+    return chart_spr_exact_candidate_admission_wave{
+        .begin_rank = begin_rank,
+        .end_rank = begin_rank + candidate_limit,
+        .admitted_bytes = admitted,
+        .use_inner_parallelism = candidate_limit == 1,
+    };
+  }
+
+  std::size_t admitted = 0;
+  std::size_t count = 0;
+  for (; count < candidate_limit; ++count) {
+    auto const& estimate = estimates[begin_rank + count];
+    if (!estimate.safely_bounded) break;
+    auto const serial_overflow = estimate.serial_scratch_bytes >
+                                 (std::numeric_limits<std::size_t>::max)() -
+                                     estimate.retained_result_bytes;
+    auto const required = chart_spr_exact_candidate_saturating_bytes_add(
+        estimate.serial_scratch_bytes, estimate.retained_result_bytes);
+    if (serial_overflow || required > effective_available - admitted) break;
+    admitted += required;
+  }
+  if (count == 0) {
+    auto const& estimate = estimates[begin_rank];
+    auto const required =
+        estimate.safely_bounded
+            ? chart_spr_exact_candidate_saturating_bytes_add(
+                  estimate.serial_scratch_bytes, estimate.retained_result_bytes)
+            : (std::numeric_limits<std::size_t>::max)();
+    throw chart_spr_exact_candidate_budget_error(begin_rank, required,
+                                                 effective_available);
+  }
+
+  chart_spr_exact_candidate_admission_wave wave{
+      .begin_rank = begin_rank,
+      .end_rank = begin_rank + count,
+      .admitted_bytes = admitted,
+      .memory_limited =
+          count < candidate_limit && begin_rank + count < estimates.size(),
+  };
+  if (count == 1) {
+    auto const& estimate = estimates[begin_rank];
+    auto const inner_overflow = estimate.inner_parallel_scratch_bytes >
+                                (std::numeric_limits<std::size_t>::max)() -
+                                    estimate.retained_result_bytes;
+    auto const inner_required = chart_spr_exact_candidate_saturating_bytes_add(
+        estimate.inner_parallel_scratch_bytes, estimate.retained_result_bytes);
+    if (!inner_overflow && inner_required <= effective_available) {
+      wave.admitted_bytes = inner_required;
+      wave.use_inner_parallelism = true;
+    } else {
+      wave.memory_limited = true;
+    }
+  }
+  return wave;
+}
 
 // Canonical exact evidence needs the equality-deduplicated optimal root
 // frontier classes.  Capture them in the algorithmic trim itself so a
@@ -1148,9 +1447,21 @@ inline void chart_spr_force_candidate_exact_bnb_overflow_for_tests(
   }
 }
 
+// Source-compatible custom-verifier surface retained from the pre-Phase-6
+// API. Legacy callbacks are always invoked as singleton candidate waves: they
+// have no task-local counter sink and therefore cannot safely participate in
+// candidate-parallel execution.
 using chart_spr_fixed_topology_verifier = std::function<
     chart_spr_candidate_score(chart_spr_search_state const&,
                               chart_spr_candidate_score)>;
+
+// Phase-6 internal/context-aware surface. The explicit context supplies the
+// task-private counter sink, immutable old trim, and optional inner scheduler
+// needed to make a declared-parallel-safe callback candidate-parallel.
+using chart_spr_contextual_fixed_topology_verifier =
+    std::function<chart_spr_candidate_score(
+        chart_spr_search_state const&, chart_spr_candidate_score,
+        chart_spr_exact_verification_context&)>;
 
 // Phase 9 (Work item 4a, technique 2) hook: when installed on the search
 // state (by the local-commit substrate builder), the exact_multisite
@@ -1171,6 +1482,12 @@ using chart_spr_exact_multisite_verifier =
         chart_spr_search_state const&, chart_spr_candidate_score,
         checked_chart_execution_plan_ref const&, chart_scheduler&,
         multisite_trim_options const&)>;
+
+using chart_spr_contextual_exact_multisite_verifier =
+    std::function<chart_spr_candidate_score(
+        chart_spr_search_state const&, chart_spr_candidate_score,
+        checked_chart_execution_plan_ref const&,
+        chart_spr_exact_verification_context&, multisite_trim_options const&)>;
 
 // Owner-neutral source for a finalized current-state exact setup.  A
 // local-commit substrate can project its immutable persistent inside rows into
@@ -1403,8 +1720,16 @@ struct chart_spr_search_summary {
   double materialization_accepted_update_ms = 0.0;
   double materialization_final_compaction_ms = 0.0;
   // Observed high-water mark from real verifier entry/exit tracking.  It is
-  // zero when no verifier runs and one for today's serial verifier loop.
+  // zero when no verifier runs and may exceed one for candidate-parallel
+  // admission waves.
   std::size_t peak_concurrent_exact_verifiers = 0;
+  std::size_t exact_candidate_admission_batches = 0;
+  std::size_t exact_candidate_parallel_batches = 0;
+  std::size_t exact_candidate_inner_parallel_batches = 0;
+  std::size_t exact_candidate_memory_limited_batches = 0;
+  std::size_t exact_candidate_peak_admitted_bytes = 0;
+  std::size_t exact_candidate_peak_projected_resident_bytes = 0;
+  double exact_candidate_queued_for_memory_ms = 0.0;
   std::size_t exact_candidate_timing_count = 0;
   double exact_candidate_verification_ms_min = 0.0;
   double exact_candidate_verification_ms_mean = 0.0;
@@ -2217,6 +2542,13 @@ inline std::size_t estimate_chart_spr_full_pattern_cache_bytes(
   return pattern_count * row_bytes;
 }
 
+// Conservative frozen-toolchain admission bound for a fully materialized
+// lazy inside/outside cache.  This is intentionally available to the inline
+// state builder so a finite unified budget can reject before any lazy rows or
+// class maps are allocated.
+std::size_t estimate_chart_spr_lazy_cache_admission_bytes(
+    std::size_t clade_count, std::size_t pattern_count);
+
 inline std::size_t choose_chart_spr_pattern_batch_size(
     clade_grammar const& grammar, active_site_pattern_set const& patterns,
     chart_cache_options const& cache) {
@@ -2360,9 +2692,9 @@ struct chart_spr_search_state {
   // refreshes can replace the scoring estimate without under-reporting the
   // two full cache surfaces.
   std::size_t local_commit_persistent_cache_bytes = 0;
-  // Fixed-topology local verification bounds its per-candidate structural row
-  // cache, clears it at the operation boundary, and retains only this admitted
-  // high-water estimate for budget/report reconciliation.
+  // Source-compatible diagnostic retained from the pre-Phase-6 shared
+  // selected-cache implementation. Selected caches are task-local now, so no
+  // bytes remain admitted after an operation and this value stays zero.
   mutable std::size_t selected_topology_cache_admitted_bytes = 0;
   std::size_t effective_pattern_batch_size = 0;
   mutable std::size_t effective_candidate_batch_size = 0;
@@ -2393,6 +2725,13 @@ struct chart_spr_search_state {
   // Lazy and all-active paths retain their selected representations.
   chart_spr_exact_setup_provider exact_setup_provider;
   chart_spr_scheduled_exact_setup_provider scheduled_exact_setup_provider;
+  // A custom setup provider may retain the ordinary finalized setup covered
+  // by the generic estimator. Any provider-specific scratch must be returned
+  // here. Finite-budget exact initialization fails closed when a provider is
+  // installed without this matching contract. Like every admission metadata
+  // callback, the estimator itself must not allocate material scratch.
+  std::function<std::size_t(multisite_trim_options const&, std::size_t)>
+      exact_setup_provider_additional_memory_estimator;
 
   // Optional Phase-8 fixed-topology verifier supplied by the local-commit
   // substrate.  When present, fixed_topology_exact verification reads the
@@ -2400,6 +2739,25 @@ struct chart_spr_search_state {
   // rebuild mode leaves this empty and uses the legacy direct selected-topology
   // fallback below.
   chart_spr_fixed_topology_verifier fixed_topology_exact_verifier;
+  // Context-aware callbacks can opt in to candidate-parallel invocation.
+  // Legacy callbacks above remain singleton regardless of this flag because
+  // their historical signature has no task-private counter sink.
+  chart_spr_contextual_fixed_topology_verifier
+      contextual_fixed_topology_exact_verifier;
+  bool fixed_topology_exact_verifier_parallel_safe = false;
+  // Provider-specific scratch beyond the generic fixed-topology verifier
+  // estimate. A finite unified budget fails closed if a custom verifier is
+  // installed without this matching estimator; the estimator itself must be
+  // allocation-free apart from trivial stack/SSO state.
+  std::function<std::size_t(grammar_spr_candidate const&)>
+      fixed_topology_exact_additional_memory_estimator;
+  // Provider-created owning output (for example an enlarged invalid-reason or
+  // evidence payload) survives task completion and every later wave until
+  // stable aggregation.  It is distinct from scratch and must therefore be
+  // carried in the admission planner.  Finite custom-verifier runs require
+  // both estimators.
+  std::function<std::size_t(grammar_spr_candidate const&)>
+      fixed_topology_exact_additional_retained_memory_estimator;
 
   // Optional Phase-9 transient-extension verifier supplied by the local-commit
   // substrate.  When present, exact_multisite verification transiently extends
@@ -2411,9 +2769,146 @@ struct chart_spr_search_state {
   // Diagnostic scratch caches are gated to the optional two-chart oracle; the
   // production B&B consumes only the materialized extended grammar.
   chart_spr_exact_multisite_verifier exact_multisite_verifier;
+  chart_spr_contextual_exact_multisite_verifier
+      contextual_exact_multisite_verifier;
+  bool exact_multisite_verifier_parallel_safe = false;
+
+  // Operational frozen-toolchain bound for scratch owned specifically by the
+  // transient verifier (chain copy, append/tip folding, and any diagnostic
+  // cache copies). The generic candidate estimator adds materialization and
+  // B&B storage separately. A finite budget fails closed when a transient
+  // verifier is installed without this matching estimator. Both estimator
+  // callbacks are admission metadata and must not allocate material scratch.
+  std::function<std::size_t(grammar_spr_candidate const&)>
+      exact_multisite_transient_memory_estimator;
+  std::function<std::size_t(grammar_spr_candidate const&)>
+      exact_multisite_transient_retained_memory_estimator;
 
   mutable chart_spr_search_counters counters;
 };
+
+// Capacity-based resident accounting for the coordinator-published old trim,
+// plus a conservative preflight estimate for one candidate task. Definitions
+// live with the materialization/cache implementations in chart_spr_search.cpp.
+std::size_t estimate_chart_spr_trim_resident_bytes(
+    multisite_trim_result const& trim);
+
+inline void require_chart_spr_retained_exact_state_memory_budget(
+    chart_spr_search_state const& state, multisite_trim_result const& trim,
+    std::size_t memory_budget_bytes) {
+  if (memory_budget_bytes == 0) return;
+  auto const required = chart_spr_exact_candidate_checked_bytes_add(
+      state.resident_pattern_cache_bytes,
+      estimate_chart_spr_trim_resident_bytes(trim),
+      "chart SPR retained exact-state resident bytes");
+  if (required > memory_budget_bytes) {
+    throw chart_spr_exact_state_budget_error(required, memory_budget_bytes);
+  }
+}
+
+inline void require_chart_spr_retained_exact_state_memory_budget(
+    chart_spr_search_state const& state, multisite_trim_result const& trim) {
+  require_chart_spr_retained_exact_state_memory_budget(
+      state, trim, state.cache_opts.memory_budget_bytes);
+}
+
+std::size_t estimate_chart_spr_canonical_exact_evidence_resident_bytes(
+    chart_spr_canonical_exact_evidence const& evidence);
+
+chart_spr_topology_selection_memory_estimate
+estimate_chart_spr_topology_selection_memory(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_options const& options);
+
+namespace chart_spr_search_detail {
+
+// Frozen-toolchain capacity walk for storage already live when the exact
+// candidate loop begins. This includes every ranked candidate's owning
+// overlay/certificate payload, current iteration canonical/affected storage,
+// and enough additional payload for one accepted-candidate copy.
+std::size_t estimate_exact_loop_resident_input_bytes(
+    std::vector<chart_spr_candidate_score> const& ranked,
+    chart_spr_iteration_result const& iteration);
+
+// Peak coordinator scratch used while producing the per-candidate admission
+// estimates. Estimation is serial, so only the largest candidate is charged.
+std::size_t estimate_exact_loop_estimator_peak_scratch_bytes(
+    chart_spr_search_state const& state,
+    std::span<chart_spr_candidate_score const> ranked);
+
+// One frozen-libstdc++ scheduler operation: range exception slots, futures,
+// packaged-task shared state, and thread-pool queue bookkeeping. Exact-loop
+// operations create at most four ranges per resolved worker.
+std::size_t estimate_exact_loop_scheduler_operation_peak_bytes(
+    std::size_t resolved_workers, bool operation_possible);
+
+}  // namespace chart_spr_search_detail
+
+chart_spr_exact_candidate_memory_estimate
+estimate_chart_spr_exact_candidate_memory(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_options const& options, std::size_t resolved_workers);
+
+chart_spr_exact_candidate_memory_estimate estimate_chart_spr_state_exact_memory(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options, std::size_t resolved_workers);
+
+chart_spr_exact_candidate_memory_estimate estimate_chart_spr_state_exact_memory(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options, std::size_t resolved_workers,
+    std::size_t memory_budget_bytes);
+
+inline void require_chart_spr_state_exact_memory_budget(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options, std::size_t resolved_workers,
+    std::size_t memory_budget_bytes) {
+  if (memory_budget_bytes == 0) return;
+  if (state.resident_pattern_cache_bytes > memory_budget_bytes) {
+    throw chart_spr_exact_state_budget_error(
+        state.resident_pattern_cache_bytes, memory_budget_bytes);
+  }
+  // The state estimator uses the same virtual-topology memo/visit/removed
+  // vectors as candidate admission. Pre-admit that allocation-free envelope
+  // before invoking the allocation-heavy estimator itself.
+  chart_spr_candidate_score identity_candidate;
+  auto const estimator_scratch =
+      chart_spr_search_detail::
+          estimate_exact_loop_estimator_peak_scratch_bytes(
+              state,
+              std::span<chart_spr_candidate_score const>{
+                  &identity_candidate, 1});
+  auto const estimator_required = chart_spr_exact_candidate_checked_bytes_add(
+      state.resident_pattern_cache_bytes, estimator_scratch,
+      "chart SPR exact-state estimator preflight bytes");
+  if (estimator_required > memory_budget_bytes) {
+    throw chart_spr_exact_state_budget_error(estimator_required,
+                                             memory_budget_bytes);
+  }
+  auto const estimate = estimate_chart_spr_state_exact_memory(
+      state, trim_options, resolved_workers, memory_budget_bytes);
+  auto const scratch = resolved_workers > 1
+                           ? estimate.inner_parallel_scratch_bytes
+                           : estimate.serial_scratch_bytes;
+  auto const overflow =
+      state.resident_pattern_cache_bytes >
+      (std::numeric_limits<std::size_t>::max)() - scratch;
+  auto const required = overflow || !estimate.safely_bounded
+                            ? (std::numeric_limits<std::size_t>::max)()
+                            : state.resident_pattern_cache_bytes + scratch;
+  if (required > memory_budget_bytes) {
+    throw chart_spr_exact_state_budget_error(required, memory_budget_bytes);
+  }
+}
+
+inline void require_chart_spr_state_exact_memory_budget(
+    chart_spr_search_state const& state,
+    multisite_trim_options const& trim_options, std::size_t resolved_workers) {
+  auto const budget = state.cache_opts.memory_budget_bytes;
+  require_chart_spr_state_exact_memory_budget(state, trim_options,
+                                              resolved_workers, budget);
+}
 
 namespace chart_spr_search_detail {
 
@@ -2559,6 +3054,7 @@ inline multisite_trim_result build_chart_spr_state_exact_trim(
       state, "chart SPR exact trim");
   state.active_patterns.assert_no_skipped_invariant_metadata();
   checked_state.assert_same(state.grammar, state.execution_plan);
+  require_chart_spr_state_exact_memory_budget(state, trim_options, 1);
 
   multisite_trim_result trim;
   if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
@@ -2621,6 +3117,8 @@ inline multisite_trim_result build_chart_spr_state_exact_trim(
       state, "chart SPR exact trim");
   state.active_patterns.assert_no_skipped_invariant_metadata();
   checked_state.assert_same(state.grammar, state.execution_plan);
+  require_chart_spr_state_exact_memory_budget(
+      state, trim_options, scheduler.worker_resolution().resolved_workers);
 
   multisite_trim_scheduler_run_summaries runs;
   // Both current scheduled setup providers issue at most the active-pattern
@@ -2728,6 +3226,7 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
   state.estimated_full_pattern_cache_bytes =
       estimate_chart_spr_full_pattern_cache_bytes(state);
   auto cache_selection_options = cache;
+  std::size_t reserved_local_commit_cache_bytes = 0;
   if (build_policy.defer_pattern_batch_bootstrap_to_local_cache &&
       cache.memory_budget_bytes != 0) {
     auto const full_bytes = state.estimated_full_pattern_cache_bytes;
@@ -2738,6 +3237,7 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
           "chart SPR local-commit mandatory cache byte overflow");
     }
     auto const mandatory_pair_bytes = full_bytes * 2;
+    reserved_local_commit_cache_bytes = mandatory_pair_bytes;
     if (mandatory_pair_bytes > cache.memory_budget_bytes ||
         scoring_pattern_bytes >
             cache.memory_budget_bytes - mandatory_pair_bytes) {
@@ -2767,6 +3267,50 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
   auto const exact_owns_pattern_batch_bootstrap =
       state.cache_strategy == chart_spr_cache_strategy::pattern_batches &&
       build_exact_trim;
+
+  // Selection deliberately rounds an undersized pattern budget up to one
+  // entry so the zero-budget compatibility policy remains useful.  Under an
+  // explicit finite budget, however, that must not turn into an allocate-then-
+  // reject path.  Charge the selected scoring representation (and the two
+  // mandatory local-commit row surfaces when applicable) before constructing
+  // any chart payload.  Exact-state admission uses the same projected resident
+  // bytes, so a cache-sized-but-not-exact-sized budget also fails here.
+  auto projected_scoring_cache_bytes =
+      state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart
+          ? estimate_chart_spr_lazy_cache_admission_bytes(
+                state.grammar.clades.size(),
+                state.active_patterns.patterns.patterns.size())
+          : estimate_chart_spr_pattern_batch_cache_bytes(
+                state.grammar, state.effective_pattern_batch_size);
+  auto const projected_initial_resident_bytes =
+      chart_spr_exact_candidate_checked_bytes_add(
+          projected_scoring_cache_bytes, reserved_local_commit_cache_bytes,
+          "chart SPR initial resident-cache admission");
+  if (cache.memory_budget_bytes != 0 &&
+      projected_initial_resident_bytes > cache.memory_budget_bytes) {
+    if (build_exact_trim) {
+      throw chart_spr_exact_state_budget_error(
+          projected_initial_resident_bytes, cache.memory_budget_bytes);
+    }
+    throw std::runtime_error(
+        "chart SPR search state: estimated resident chart caches require " +
+        std::to_string(projected_initial_resident_bytes) +
+        " bytes, exceeding configured budget " +
+        std::to_string(cache.memory_budget_bytes));
+  }
+  state.resident_pattern_cache_bytes = projected_initial_resident_bytes;
+  if (build_exact_trim) {
+    require_chart_spr_state_exact_memory_budget(
+        state, trim_options,
+        scheduler != nullptr
+            ? scheduler->worker_resolution().resolved_workers
+            : std::size_t{1});
+  }
+  // Only the scoring representation is resident at this point.  The reserved
+  // local-commit surfaces are constructed later and added from their actual
+  // capacities; keeping the reservation out of the durable state avoids
+  // counting them twice.
+  state.resident_pattern_cache_bytes = projected_scoring_cache_bytes;
   state.effective_candidate_batch_size = cache.candidate_batch_size;
   ++state.counters.base_chart_cache_rebuilds;
   state.counters.skipped_invariant_sites =
@@ -2955,17 +3499,48 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
             state.grammar, state.effective_pattern_batch_size);
   }
 
+  // Capacity-based post-build accounting is the backstop for the conservative
+  // preflight above.  It must still fail before exact construction if this
+  // frozen allocator/toolchain retained more storage than the projection.
+  auto const actual_initial_resident_bytes =
+      chart_spr_exact_candidate_checked_bytes_add(
+          state.resident_pattern_cache_bytes,
+          reserved_local_commit_cache_bytes,
+          "chart SPR initial resident-cache capacity check");
+  if (cache.memory_budget_bytes != 0 &&
+      actual_initial_resident_bytes > cache.memory_budget_bytes) {
+    if (build_exact_trim) {
+      throw chart_spr_exact_state_budget_error(
+          actual_initial_resident_bytes, cache.memory_budget_bytes);
+    }
+    throw std::runtime_error(
+        "chart SPR search state: resident chart-cache capacity requires " +
+        std::to_string(actual_initial_resident_bytes) +
+        " bytes, exceeding configured budget " +
+        std::to_string(cache.memory_budget_bytes));
+  }
+
   if (build_exact_trim) {
     auto const exact_initialization_start =
         std::chrono::steady_clock::now();
+    require_chart_spr_state_exact_memory_budget(
+        state, trim_options,
+        scheduler != nullptr
+            ? scheduler->worker_resolution().resolved_workers
+            : std::size_t{1});
     if (scheduler != nullptr) {
       auto checked =
           check_chart_execution_plan(state.grammar, state.execution_plan);
-      state.exact_trim_active_only = build_chart_spr_state_exact_trim(
+      auto built_trim = build_chart_spr_state_exact_trim(
           state, checked, *scheduler, trim_options);
+      require_chart_spr_retained_exact_state_memory_budget(
+          state, built_trim, cache.memory_budget_bytes);
+      state.exact_trim_active_only = std::move(built_trim);
     } else {
-      state.exact_trim_active_only =
-          build_chart_spr_state_exact_trim(state, trim_options);
+      auto built_trim = build_chart_spr_state_exact_trim(state, trim_options);
+      require_chart_spr_retained_exact_state_memory_budget(
+          state, built_trim, cache.memory_budget_bytes);
+      state.exact_trim_active_only = std::move(built_trim);
     }
     ++state.counters.chart_execution_plan_cache_hits;
     if (exact_owns_pattern_batch_bootstrap) {
@@ -4623,6 +5198,21 @@ inline void add_chart_spr_search_counters(
   dst.outside_cache_outside_charts_built +=
       src.outside_cache_outside_charts_built;
   dst.exact_verifications += src.exact_verifications;
+  dst.exact_candidate_admission_batches +=
+      src.exact_candidate_admission_batches;
+  dst.exact_candidate_parallel_batches += src.exact_candidate_parallel_batches;
+  dst.exact_candidate_inner_parallel_batches +=
+      src.exact_candidate_inner_parallel_batches;
+  dst.exact_candidate_memory_limited_batches +=
+      src.exact_candidate_memory_limited_batches;
+  dst.exact_candidate_peak_admitted_bytes =
+      std::max(dst.exact_candidate_peak_admitted_bytes,
+               src.exact_candidate_peak_admitted_bytes);
+  dst.exact_candidate_peak_projected_resident_bytes =
+      std::max(dst.exact_candidate_peak_projected_resident_bytes,
+               src.exact_candidate_peak_projected_resident_bytes);
+  dst.exact_candidate_queued_for_memory_ms +=
+      src.exact_candidate_queued_for_memory_ms;
   dst.accepted_moves += src.accepted_moves;
   dst.candidate_accepts_attempted += src.candidate_accepts_attempted;
   dst.rejected_moves += src.rejected_moves;
@@ -4927,6 +5517,20 @@ class chart_spr_local_score_workspace {
       if (!worker.operation_boundary_clean()) return false;
     }
     return true;
+  }
+
+  void release_retained_storage() {
+    if (!operation_boundary_clean()) {
+      throw std::logic_error(
+          "chart SPR local score workspace: cannot release active storage");
+    }
+    std::vector<chart_spr_search_detail::prepared_local_candidate_score>{}
+        .swap(prepared_);
+    std::vector<chart_spr_search_detail::local_score_worker_workspace>{}.swap(
+        workers_);
+    std::vector<chart_spr_search_detail::local_score_tile_result>{}.swap(
+        tile_results_);
+    serial_scratch_ = {};
   }
 
  private:
@@ -6858,8 +7462,11 @@ inline multisite_trim_result const& ensure_chart_spr_state_exact_trim(
   state.active_patterns.assert_no_skipped_invariant_metadata();
   checked_state.assert_same(state.grammar, state.execution_plan);
   if (!state.exact_trim_active_only) {
-    state.exact_trim_active_only =
+    require_chart_spr_state_exact_memory_budget(state, trim_options, 1);
+    auto built_trim =
         build_chart_spr_state_exact_trim(state, checked_state, trim_options);
+    require_chart_spr_retained_exact_state_memory_budget(state, built_trim);
+    state.exact_trim_active_only = std::move(built_trim);
     ++state.counters.chart_execution_plan_cache_hits;
   }
   return *state.exact_trim_active_only;
@@ -6886,8 +7493,13 @@ inline multisite_trim_result const& ensure_chart_spr_state_exact_trim(
   state.active_patterns.assert_no_skipped_invariant_metadata();
   checked_state.assert_same(state.grammar, state.execution_plan);
   if (!state.exact_trim_active_only) {
-    state.exact_trim_active_only = build_chart_spr_state_exact_trim(
+    require_chart_spr_state_exact_memory_budget(
+        state, trim_options,
+        scheduler.worker_resolution().resolved_workers);
+    auto built_trim = build_chart_spr_state_exact_trim(
         state, checked_state, scheduler, trim_options);
+    require_chart_spr_retained_exact_state_memory_budget(state, built_trim);
+    state.exact_trim_active_only = std::move(built_trim);
     ++state.counters.chart_execution_plan_cache_hits;
   }
   return *state.exact_trim_active_only;
@@ -6921,19 +7533,20 @@ inline std::uint64_t chart_spr_state_exact_score_with_invariants(
 inline chart_spr_candidate_score verify_candidate_exact_against_state_impl(
     chart_spr_search_state const& state, chart_spr_candidate_score candidate,
     checked_chart_execution_plan_ref const& checked_state,
-    chart_scheduler* scheduler,
+    chart_spr_exact_verification_context& context,
     multisite_trim_options const& trim_options = {}) {
   if (!candidate.valid) return candidate;
-  ++state.counters.exact_verifications;
+  auto& counters = context.counters;
+  auto* scheduler = context.inner_scheduler;
+  ++counters.exact_verifications;
 
   planned_overlay_materialization_result planned;
   multisite_trim_result new_trim;
   multisite_trim_scheduler_run_summaries scheduler_runs;
   chart_spr_scheduler_run_axis_publisher publish_setup_runs{
-      state.counters.scheduler_axes.exact_setup_patterns,
-      scheduler_runs.exact_setup};
+      counters.scheduler_axes.exact_setup_patterns, scheduler_runs.exact_setup};
   chart_spr_scheduler_run_axis_publisher publish_frontier_runs{
-      state.counters.scheduler_axes.exact_frontier_clades,
+      counters.scheduler_axes.exact_frontier_clades,
       scheduler_runs.frontier_clades};
   bool dense_materialization_completed = false;
   bool materialization_counted = false;
@@ -6941,14 +7554,15 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state_impl(
   overlay_payload_validation_stats completed_payload_validation_stats;
   try {
     auto const& old_trim =
-        scheduler != nullptr
+        context.published_old_trim != nullptr ? *context.published_old_trim
+        : scheduler != nullptr
             ? ensure_chart_spr_state_exact_trim(state, checked_state,
                                                 *scheduler, trim_options)
             : ensure_chart_spr_state_exact_trim(state, checked_state,
                                                 trim_options);
     {
       chart_spr_elapsed_accumulator materialization_timer{
-          state.counters.materialization_exact_verification_ms};
+          counters.materialization_exact_verification_ms};
       if (candidate.force_exact_materializer_failure_for_tests) {
         throw std::runtime_error(
             "forced exact materializer failure for tests");
@@ -6959,10 +7573,10 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state_impl(
           [&] { materialization_timer.finish(); },
           &completed_payload_validation_stats);
     }
-    ++state.counters.full_overlay_materializations;
-    ++state.counters.overlay_materializations_for_exact_verification;
+    ++counters.full_overlay_materializations;
+    ++counters.overlay_materializations_for_exact_verification;
     materialization_counted = true;
-    record_planned_overlay_materialization_stats(state.counters, planned);
+    record_planned_overlay_materialization_stats(counters, planned);
     payload_validation_counted = true;
 
     if (state.cache_strategy ==
@@ -6982,11 +7596,12 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state_impl(
                                              state.active_patterns,
                                              state.chart_opts, trim_options);
     }
-    if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
-      ++state.counters.exact_trim_lazy_chart_uses;
+    if (state.cache_strategy ==
+        chart_spr_cache_strategy::lazy_multisite_chart) {
+      ++counters.exact_trim_lazy_chart_uses;
     }
-    record_multisite_exact_trim_work(state.counters, new_trim);
-    ++state.counters.chart_execution_plan_cache_hits;
+    record_multisite_exact_trim_work(counters, new_trim);
+    ++counters.chart_execution_plan_cache_hits;
 
     auto old_full = chart_spr_add_invariant_offset(
         old_trim.optimum, state,
@@ -7025,12 +7640,12 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state_impl(
     // counters advanced) before the separately built plan could reject the
     // output.  Preserve that reason-coded accounting for the combined call.
     if (dense_materialization_completed && !materialization_counted) {
-      ++state.counters.full_overlay_materializations;
-      ++state.counters.overlay_materializations_for_exact_verification;
+      ++counters.full_overlay_materializations;
+      ++counters.overlay_materializations_for_exact_verification;
     }
     if (!payload_validation_counted) {
       record_overlay_payload_validation_stats(
-          state.counters, completed_payload_validation_stats);
+          counters, completed_payload_validation_stats);
     }
     candidate.valid = false;
     candidate.invalid_reason = e.what();
@@ -7049,7 +7664,7 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state_impl(
                 trim_options, new_trim,
                 state.invariant_constant_offset));
     if (new_trim.keep_production_exact) {
-      ++state.counters.chart_execution_plan_cache_hits;
+      ++counters.chart_execution_plan_cache_hits;
     }
   }
   return candidate;
@@ -7059,8 +7674,9 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state(
     chart_spr_search_state const& state, chart_spr_candidate_score candidate,
     checked_chart_execution_plan_ref const& checked_state,
     multisite_trim_options const& trim_options = {}) {
+  chart_spr_exact_verification_context context{state.counters};
   return verify_candidate_exact_against_state_impl(
-      state, std::move(candidate), checked_state, nullptr, trim_options);
+      state, std::move(candidate), checked_state, context, trim_options);
 }
 
 inline chart_spr_candidate_score verify_candidate_exact_against_state(
@@ -7068,8 +7684,10 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state(
     checked_chart_execution_plan_ref const& checked_state,
     chart_scheduler& scheduler,
     multisite_trim_options const& trim_options = {}) {
+  chart_spr_exact_verification_context context{state.counters, nullptr,
+                                               &scheduler};
   return verify_candidate_exact_against_state_impl(
-      state, std::move(candidate), checked_state, &scheduler, trim_options);
+      state, std::move(candidate), checked_state, context, trim_options);
 }
 
 inline chart_spr_candidate_score verify_candidate_exact_against_state(
@@ -7799,7 +8417,8 @@ chart_spr_lazy_selected_topology_rows_for_clade(
     std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>&
         temp_memo,
     std::vector<std::uint8_t>& base_state,
-    std::vector<std::uint8_t>& temp_state) {
+    std::vector<std::uint8_t>& temp_state,
+    chart_spr_search_counters& counters) {
   auto& state_slot = clade.space == overlay_id_space::base
                          ? base_state.at(clade.id)
                          : temp_state.at(clade.id);
@@ -7869,8 +8488,8 @@ chart_spr_lazy_selected_topology_rows_for_clade(
     child_entries.reserve(children.size());
     for (auto child : children) {
       child_entries.push_back(&chart_spr_lazy_selected_topology_rows_for_clade(
-          state, candidate, selected, child, base_memo, temp_memo,
-          base_state, temp_state));
+          state, candidate, selected, child, base_memo, temp_memo, base_state,
+          temp_state, counters));
     }
 
     std::map<std::vector<std::size_t>, std::vector<std::size_t>>
@@ -7907,13 +8526,13 @@ chart_spr_lazy_selected_topology_rows_for_clade(
       for (auto p : members) entry.class_index_by_pattern[p] = row_it->second;
     }
     if (children.size() != 2) {
-      state.counters.selected_topology_multifurcation_rows +=
+      counters.selected_topology_multifurcation_rows +=
           patterns_by_context.size();
     }
   }
 
-  state.counters.fixed_topology_selected_rows_computed += entry.rows.size();
-  state.counters.selected_topology_class_rows_computed += entry.rows.size();
+  counters.fixed_topology_selected_rows_computed += entry.rows.size();
+  counters.selected_topology_class_rows_computed += entry.rows.size();
   memo_slot = std::move(entry);
   state_slot = 2;
   return *memo_slot;
@@ -7927,12 +8546,13 @@ chart_spr_lazy_selected_topology_root_rows(
     std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>&
         base_memo,
     std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>&
-        temp_memo) {
+        temp_memo,
+    chart_spr_search_counters& counters) {
   std::vector<std::uint8_t> base_state(state.grammar.clades.size(), 0);
   std::vector<std::uint8_t> temp_state(candidate.added_clades.size(), 0);
   return chart_spr_lazy_selected_topology_rows_for_clade(
       state, candidate, selected, base_clade_ref(state.grammar.root_clade),
-      base_memo, temp_memo, base_state, temp_state);
+      base_memo, temp_memo, base_state, temp_state, counters);
 }
 
 struct chart_spr_fixed_topology_pattern_scores {
@@ -7945,7 +8565,8 @@ struct chart_spr_fixed_topology_pattern_scores {
 inline chart_spr_fixed_topology_pattern_scores
 fixed_topology_lazy_selected_pattern_scores(
     chart_spr_search_state const& state,
-    chart_spr_candidate_score const& candidate) {
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_counters& counters) {
   state.active_patterns.assert_no_skipped_invariant_metadata();
   if (!state.lazy_chart) {
     throw std::runtime_error(
@@ -7978,10 +8599,10 @@ fixed_topology_lazy_selected_pattern_scores(
       after_temp_memo(candidate.candidate.added_clades.size());
   auto const& before_root = chart_spr_lazy_selected_topology_root_rows(
       state, candidate.candidate, before_selected, before_base_memo,
-      before_temp_memo);
+      before_temp_memo, counters);
   auto const& after_root = chart_spr_lazy_selected_topology_root_rows(
       state, candidate.candidate, after_selected, after_base_memo,
-      after_temp_memo);
+      after_temp_memo, counters);
 
   chart_spr_fixed_topology_pattern_scores scores;
   auto const& active = state.active_patterns.patterns.patterns;
@@ -8015,9 +8636,11 @@ fixed_topology_lazy_selected_pattern_scores(
 inline chart_spr_fixed_topology_pattern_scores
 fixed_topology_direct_selected_pattern_scores(
     chart_spr_search_state const& state,
-    chart_spr_candidate_score const& candidate) {
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_counters& counters) {
   if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
-    return fixed_topology_lazy_selected_pattern_scores(state, candidate);
+    return fixed_topology_lazy_selected_pattern_scores(state, candidate,
+                                                       counters);
   }
   state.active_patterns.assert_no_skipped_invariant_metadata();
   if (!candidate.topology_selection.certificate) {
@@ -8052,12 +8675,11 @@ fixed_topology_direct_selected_pattern_scores(
     auto old_row = chart_multisite_detail::restricted_topology_row(
         state.grammar, pattern, before_topology);
     auto new_row = chart_spr_restricted_overlay_topology_row(
-        state.grammar, candidate.candidate, pattern, selected_after,
-        &state.counters);
-    auto old_score = chart_spr_weighted_root_score_from_row(
-        old_row, pattern, state.chart_opts);
-    auto new_score = chart_spr_weighted_root_score_from_row(
-        new_row, pattern, state.chart_opts);
+        state.grammar, candidate.candidate, pattern, selected_after, &counters);
+    auto old_score = chart_spr_weighted_root_score_from_row(old_row, pattern,
+                                                            state.chart_opts);
+    auto new_score = chart_spr_weighted_root_score_from_row(new_row, pattern,
+                                                            state.chart_opts);
     scores.old_pattern_scores.push_back(old_score);
     scores.new_pattern_scores.push_back(new_score);
     scores.old_active_total = chart_multisite_detail::checked_add_u64(
@@ -8073,9 +8695,11 @@ fixed_topology_direct_selected_pattern_scores(
 inline chart_spr_fixed_topology_pattern_scores
 fixed_topology_direct_selected_pattern_scores(
     chart_spr_search_state const& state,
-    chart_spr_candidate_score const& candidate, chart_scheduler& scheduler) {
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_counters& counters, chart_scheduler& scheduler) {
   if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
-    return fixed_topology_lazy_selected_pattern_scores(state, candidate);
+    return fixed_topology_lazy_selected_pattern_scores(state, candidate,
+                                                       counters);
   }
   state.active_patterns.assert_no_skipped_invariant_metadata();
   if (!candidate.topology_selection.certificate) {
@@ -8153,9 +8777,9 @@ fixed_topology_direct_selected_pattern_scores(
         "exception");
   }
   record_chart_spr_scheduler_axis_run(
-      state.counters.scheduler_axes.fixed_topology_patterns, run);
-  for (auto const& counters : counters_by_slot) {
-    add_chart_spr_search_counters(state.counters, counters);
+      counters.scheduler_axes.fixed_topology_patterns, run);
+  for (auto const& slot_counters : counters_by_slot) {
+    add_chart_spr_search_counters(counters, slot_counters);
   }
   for (auto const& error : errors) {
     if (error) std::rethrow_exception(error);
@@ -8170,6 +8794,22 @@ fixed_topology_direct_selected_pattern_scores(
         "fixed_topology_exact direct new active total");
   }
   return scores;
+}
+
+inline chart_spr_fixed_topology_pattern_scores
+fixed_topology_direct_selected_pattern_scores(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate) {
+  return fixed_topology_direct_selected_pattern_scores(state, candidate,
+                                                       state.counters);
+}
+
+inline chart_spr_fixed_topology_pattern_scores
+fixed_topology_direct_selected_pattern_scores(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate, chart_scheduler& scheduler) {
+  return fixed_topology_direct_selected_pattern_scores(
+      state, candidate, state.counters, scheduler);
 }
 
 inline std::vector<std::array<chart_cost, nuc_state_count>>
@@ -8243,14 +8883,16 @@ chart_spr_selected_overlay_child_outside_rows(
 // Legacy/conservative fixed-topology exact path.  This is the from-scratch
 // selected-topology fallback: it does not materialize an overlay grammar, but
 // it intentionally recomputes the selected before/after topology rows.  The
-// Phase-8 local-commit path installs `state.fixed_topology_exact_verifier`,
+// Phase-8 local-commit path installs
+// `state.contextual_fixed_topology_exact_verifier`,
 // which serves production verification from the persistent inside/outside
 // caches and uses this direct scorer only as a per-pattern oracle/fallback.
 inline spr_score_result fixed_topology_delta_direct_selected_topology(
     chart_spr_search_state const& state,
-    chart_spr_candidate_score const& candidate) {
-  auto scores = fixed_topology_direct_selected_pattern_scores(state,
-                                                             candidate);
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_counters& counters) {
+  auto scores =
+      fixed_topology_direct_selected_pattern_scores(state, candidate, counters);
   auto old_full = chart_spr_add_invariant_offset(
       scores.old_active_total, state,
       "chart-SPR fixed-topology old-score invariant offset");
@@ -8263,9 +8905,10 @@ inline spr_score_result fixed_topology_delta_direct_selected_topology(
 
 inline spr_score_result fixed_topology_delta_direct_selected_topology(
     chart_spr_search_state const& state,
-    chart_spr_candidate_score const& candidate, chart_scheduler& scheduler) {
-  auto scores = fixed_topology_direct_selected_pattern_scores(state, candidate,
-                                                              scheduler);
+    chart_spr_candidate_score const& candidate,
+    chart_spr_search_counters& counters, chart_scheduler& scheduler) {
+  auto scores = fixed_topology_direct_selected_pattern_scores(
+      state, candidate, counters, scheduler);
   auto old_full = chart_spr_add_invariant_offset(
       scores.old_active_total, state,
       "chart-SPR fixed-topology old-score invariant offset");
@@ -8274,6 +8917,20 @@ inline spr_score_result fixed_topology_delta_direct_selected_topology(
       "chart-SPR fixed-topology new-score invariant offset");
   return spr_score_result{chart_spr_detail::signed_delta(old_full, new_full),
                           old_full, new_full, true};
+}
+
+inline spr_score_result fixed_topology_delta_direct_selected_topology(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate) {
+  return fixed_topology_delta_direct_selected_topology(state, candidate,
+                                                       state.counters);
+}
+
+inline spr_score_result fixed_topology_delta_direct_selected_topology(
+    chart_spr_search_state const& state,
+    chart_spr_candidate_score const& candidate, chart_scheduler& scheduler) {
+  return fixed_topology_delta_direct_selected_topology(
+      state, candidate, state.counters, scheduler);
 }
 
 chart_spr_fixed_topology_pattern_scores
@@ -8291,8 +8948,9 @@ void refresh_chart_spr_lazy_chart_after_local_commit_for_tests(
     chart_execution_plan const& execution_plan,
     std::vector<overlay_clade_ref> const& previous_dense_clade_to_ref);
 
-inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
-    chart_spr_search_state const& state, chart_spr_candidate_score candidate) {
+inline chart_spr_candidate_score verify_candidate_fixed_topology_exact_impl(
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate,
+    chart_spr_exact_verification_context& context) {
   if (!candidate.valid) return candidate;
   if (!chart_spr_topology_selection_has_certificate_or_selector(
           candidate.topology_selection)) {
@@ -8311,59 +8969,19 @@ inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
     return candidate;
   }
 
-  ++state.counters.exact_verifications;
+  ++context.counters.exact_verifications;
   try {
     // Phase 8: score the complete fixed before/after topology certificate
     // directly in overlay space.  This is exact for the selected topology and
     // performs no dense overlay materialization; the exact-verification
     // materialization counters therefore remain unchanged for the
     // fixed_topology_exact gate.
-    auto delta = fixed_topology_delta_direct_selected_topology(state, candidate);
-    candidate.exact = make_chart_spr_objective_score(
-        delta, chart_spr_score_kind::fixed_topology_exact,
-        chart_spr_score_convention::full_with_invariants,
-        state.invariant_constant_offset);
-  } catch (std::exception const& e) {
-    candidate.valid = false;
-    candidate.invalid_reason = e.what();
-  }
-  if (candidate.valid && candidate.exact &&
-      candidate.canonical_stream_index !=
-          (std::numeric_limits<std::size_t>::max)()) {
-    chart_spr_force_canonical_evidence_failure_for_tests(candidate);
-    candidate.canonical_exact_evidence =
-        std::make_shared<chart_spr_canonical_exact_evidence>(
-            chart_spr_canonicalize_fixed_topology_evidence(
-                state.grammar, candidate.topology_selection,
-                state.invariant_constant_offset));
-  }
-  return candidate;
-}
-
-inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
-    chart_spr_search_state const& state, chart_spr_candidate_score candidate,
-    chart_scheduler& scheduler) {
-  if (!candidate.valid) return candidate;
-  if (!chart_spr_topology_selection_has_certificate_or_selector(
-          candidate.topology_selection)) {
-    candidate.valid = false;
-    candidate.invalid_reason =
-        "fixed_topology_exact acceptance requires an explicit complete "
-        "topology certificate or a recorded deterministic topology selector; "
-        "a bare grammar_spr_candidate is not exact";
-    return candidate;
-  }
-  if (!candidate.topology_selection.certificate) {
-    candidate.valid = false;
-    candidate.invalid_reason =
-        "fixed_topology_exact deterministic selectors must be resolved to a "
-        "complete topology certificate before verification";
-    return candidate;
-  }
-  ++state.counters.exact_verifications;
-  try {
-    auto delta = fixed_topology_delta_direct_selected_topology(state, candidate,
-                                                               scheduler);
+    auto delta =
+        context.inner_scheduler != nullptr
+            ? fixed_topology_delta_direct_selected_topology(
+                  state, candidate, context.counters, *context.inner_scheduler)
+            : fixed_topology_delta_direct_selected_topology(state, candidate,
+                                                            context.counters);
     candidate.exact = make_chart_spr_objective_score(
         delta, chart_spr_score_kind::fixed_topology_exact,
         chart_spr_score_convention::full_with_invariants,
@@ -8390,48 +9008,80 @@ inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
   return candidate;
 }
 
+inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate) {
+  chart_spr_exact_verification_context context{state.counters};
+  return verify_candidate_fixed_topology_exact_impl(state, std::move(candidate),
+                                                    context);
+}
+
+inline chart_spr_candidate_score verify_candidate_fixed_topology_exact(
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate,
+    chart_scheduler& scheduler) {
+  chart_spr_exact_verification_context context{state.counters, nullptr,
+                                               &scheduler};
+  return verify_candidate_fixed_topology_exact_impl(state, std::move(candidate),
+                                                    context);
+}
+
 inline chart_spr_candidate_score verify_candidate_for_acceptance(
     chart_spr_search_state const& state, chart_spr_candidate_score candidate,
     checked_chart_execution_plan_ref const& checked_state,
     chart_spr_search_options const& options,
-    chart_scheduler* scheduler = nullptr) {
+    chart_spr_exact_verification_context& context) {
   checked_state.assert_same(state.grammar, state.execution_plan);
   switch (options.acceptance_mode) {
     case chart_spr_acceptance_mode::lower_bound_heuristic:
       return candidate;
     case chart_spr_acceptance_mode::exact_multisite:
       // Phase 9: when a local-commit substrate is active it installs
-      // `state.exact_multisite_verifier`, which verifies the candidate by
+      // `state.contextual_exact_multisite_verifier`, which verifies the
+      // candidate by
       // transiently extending the chain in reader-local scratch (avoiding a
       // fresh materialize_overlay_grammar, never mutating the
       // shared cache).  When absent (conservative rebuild mode, or a bare
       // state built without a substrate), the cold from-scratch path below is
       // used.  The cold path is also the correctness oracle the transient
       // verifier cross-checks when its test-only oracle flag is set.
-      if (state.exact_multisite_verifier && scheduler != nullptr) {
-        return state.exact_multisite_verifier(state, std::move(candidate),
-                                              checked_state, *scheduler,
-                                              options.exact_trim);
+      if (options.verification_mode ==
+              chart_spr_verification_mode::transient &&
+          state.contextual_exact_multisite_verifier) {
+        if (state.exact_multisite_verifier) {
+          throw std::logic_error(
+              "chart SPR exact verification: both legacy and contextual "
+              "multisite verifiers are installed");
+        }
+        return state.contextual_exact_multisite_verifier(
+            state, std::move(candidate), checked_state, context,
+            options.exact_trim);
       }
-      return scheduler != nullptr
-                 ? verify_candidate_exact_against_state(
-                       state, std::move(candidate), checked_state, *scheduler,
-                       options.exact_trim)
-                 : verify_candidate_exact_against_state(
-                       state, std::move(candidate), checked_state,
-                       options.exact_trim);
-    case chart_spr_acceptance_mode::fixed_topology_exact:
-      {
+      if (options.verification_mode ==
+              chart_spr_verification_mode::transient &&
+          state.exact_multisite_verifier &&
+          context.inner_scheduler != nullptr) {
+        return state.exact_multisite_verifier(
+            state, std::move(candidate), checked_state,
+            *context.inner_scheduler, options.exact_trim);
+      }
+      return verify_candidate_exact_against_state_impl(
+          state, std::move(candidate), checked_state, context,
+          options.exact_trim);
+    case chart_spr_acceptance_mode::fixed_topology_exact: {
       chart_spr_candidate_score verified;
-      if (state.fixed_topology_exact_verifier) {
+      if (state.contextual_fixed_topology_exact_verifier) {
+        if (state.fixed_topology_exact_verifier) {
+          throw std::logic_error(
+              "chart SPR exact verification: both legacy and contextual "
+              "fixed-topology verifiers are installed");
+        }
+        verified = state.contextual_fixed_topology_exact_verifier(
+            state, std::move(candidate), context);
+      } else if (state.fixed_topology_exact_verifier) {
         verified = state.fixed_topology_exact_verifier(state,
                                                        std::move(candidate));
       } else {
-        verified = scheduler != nullptr
-                       ? verify_candidate_fixed_topology_exact(
-                             state, std::move(candidate), *scheduler)
-                       : verify_candidate_fixed_topology_exact(
-                             state, std::move(candidate));
+        verified = verify_candidate_fixed_topology_exact_impl(
+            state, std::move(candidate), context);
       }
       if (verified.canonical_stream_index !=
               (std::numeric_limits<std::size_t>::max)() &&
@@ -8448,6 +9098,17 @@ inline chart_spr_candidate_score verify_candidate_for_acceptance(
       }
   }
   return candidate;
+}
+
+inline chart_spr_candidate_score verify_candidate_for_acceptance(
+    chart_spr_search_state const& state, chart_spr_candidate_score candidate,
+    checked_chart_execution_plan_ref const& checked_state,
+    chart_spr_search_options const& options,
+    chart_scheduler* scheduler = nullptr) {
+  chart_spr_exact_verification_context context{state.counters, nullptr,
+                                               scheduler};
+  return verify_candidate_for_acceptance(state, std::move(candidate),
+                                         checked_state, options, context);
 }
 
 inline chart_spr_candidate_score verify_candidate_for_acceptance(
@@ -8787,6 +9448,25 @@ struct chart_spr_acceptance_iteration_workspace {
   }
 
   void finish_batch() noexcept { active_candidates = 0; }
+
+  void release_retained_storage_before_exact() {
+    if (active_candidates != 0 || !local_score.operation_boundary_clean()) {
+      throw std::logic_error(
+          "chart SPR acceptance workspace: cannot release active storage");
+    }
+    std::vector<grammar_spr_candidate>{}.swap(candidate_slots);
+    std::vector<grammar_spr_candidate_copy_scratch>{}.swap(
+        candidate_copy_scratch);
+    std::vector<chart_spr_local_score_result>{}.swap(local_results);
+    local_score.release_retained_storage();
+  }
+};
+
+struct chart_spr_exact_candidate_slot {
+  std::optional<chart_spr_candidate_score> result;
+  chart_spr_search_counters counters;
+  std::exception_ptr failure;
+  double elapsed_ms = 0.0;
 };
 
 }  // namespace chart_spr_search_detail
@@ -8805,6 +9485,14 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     chart_scheduler& scheduler) {
   workspace.begin_iteration();
   validate_supported_chart_cache_options(options.cache);
+  auto exact_memory_budget = options.cache.memory_budget_bytes;
+  if (state.cache_opts.memory_budget_bytes != 0) {
+    exact_memory_budget =
+        exact_memory_budget == 0
+            ? state.cache_opts.memory_budget_bytes
+            : std::min(exact_memory_budget,
+                       state.cache_opts.memory_budget_bytes);
+  }
   auto checked_state = [&] {
     try {
       return check_chart_execution_plan(state.grammar, state.execution_plan);
@@ -8816,6 +9504,28 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite) {
     chart_spr_search_detail::validate_chart_spr_exact_multisite_multifurcation_gate(
         state.grammar, "chart SPR acceptance iteration");
+    if (state.exact_trim_active_only) {
+      // An iteration may tighten (but never loosen) the state budget.  Reject
+      // a cache+published-old-trim overrun before candidate generation grows
+      // its workspace, even though no exact-state rebuild is needed.
+      require_chart_spr_retained_exact_state_memory_budget(
+          state, *state.exact_trim_active_only, exact_memory_budget);
+    } else {
+      require_chart_spr_state_exact_memory_budget(
+          state, options.exact_trim,
+          scheduler.worker_resolution().resolved_workers,
+          exact_memory_budget);
+    }
+  } else if (options.acceptance_mode ==
+                 chart_spr_acceptance_mode::fixed_topology_exact &&
+             exact_memory_budget != 0 &&
+             state.resident_pattern_cache_bytes > exact_memory_budget) {
+    // Fixed-topology verification needs no published exact trim, but a caller
+    // may tighten the iteration budget below the already-resident chart/cache
+    // generation. Reject that state before candidate generation allocates its
+    // batch/rank workspace.
+    throw chart_spr_exact_state_budget_error(
+        state.resident_pattern_cache_bytes, exact_memory_budget);
   }
   if (options.candidate_selection ==
       chart_spr_candidate_selection_mode::sampled_or_randomized) {
@@ -9010,32 +9720,406 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       }
     }
   } else {
-    std::vector<chart_spr_candidate_score> verified;
-    verified.reserve(ranked.size());
+    // Include serial selector resolution, memory estimation/admission, and
+    // coordinator aggregation in the exact-stage measurement. Otherwise new
+    // Phase-6 overhead could disappear from the advertised scaling metric.
+    auto const exact_stage_start = std::chrono::steady_clock::now();
+    // Candidate generation/local scoring retain high-water slot and scratch
+    // capacities for later iterations.  They are no longer useful while exact
+    // results are resident, so release them before admission instead of
+    // silently omitting a second large memory domain from the unified bound.
+    // A later iteration may rebuild this storage after the exact/commit
+    // barrier; no borrow crosses this boundary.
+    workspace.release_retained_storage_before_exact();
+
+    // Publish one immutable old trim before candidate readers.  If the state
+    // did not already own it, its own unified preflight and retained-capacity
+    // backstop run inside this call.
+    multisite_trim_result const* published_old_trim = nullptr;
+    if (options.acceptance_mode == chart_spr_acceptance_mode::exact_multisite &&
+        !ranked.empty()) {
+      published_old_trim = &ensure_chart_spr_state_exact_trim(
+          state, checked_state, scheduler, options.exact_trim);
+    }
+    auto const resolved_workers =
+        scheduler.worker_resolution().resolved_workers;
+    auto const finite_budget = exact_memory_budget != 0;
+    if (state.fixed_topology_exact_verifier &&
+        state.contextual_fixed_topology_exact_verifier) {
+      throw std::logic_error(
+          "chart SPR exact verification: both legacy and contextual "
+          "fixed-topology verifiers are installed");
+    }
+    if (state.exact_multisite_verifier &&
+        state.contextual_exact_multisite_verifier) {
+      throw std::logic_error(
+          "chart SPR exact verification: both legacy and contextual "
+          "multisite verifiers are installed");
+    }
+    auto const legacy_multisite_verifier_active =
+        options.acceptance_mode ==
+            chart_spr_acceptance_mode::exact_multisite &&
+        options.verification_mode ==
+            chart_spr_verification_mode::transient &&
+        static_cast<bool>(state.exact_multisite_verifier);
+
+    // Topology selection precedes the ordinary candidate estimate because its
+    // complete certificate becomes verifier input.  Under a finite budget,
+    // pre-admit every serial selector's scratch and cumulative output before
+    // invoking either the built-in selector or a user callback.  Custom
+    // providers without a matching estimator fail closed here.
+    if (finite_budget && options.acceptance_mode ==
+                             chart_spr_acceptance_mode::fixed_topology_exact &&
+        !ranked.empty()) {
+      auto selector_resident = state.resident_pattern_cache_bytes;
+      if (published_old_trim != nullptr) {
+        selector_resident = chart_spr_exact_candidate_checked_bytes_add(
+            selector_resident,
+            estimate_chart_spr_trim_resident_bytes(*published_old_trim),
+            "chart SPR topology-selector resident old trim");
+      }
+      selector_resident = chart_spr_exact_candidate_checked_bytes_add(
+          selector_resident,
+          chart_spr_search_detail::estimate_exact_loop_resident_input_bytes(
+              ranked, result),
+          "chart SPR topology-selector resident live inputs");
+      if (selector_resident > exact_memory_budget) {
+        throw chart_spr_exact_candidate_budget_error(
+            0, selector_resident, exact_memory_budget);
+      }
+      // Computing the structural selector estimate itself constructs the
+      // virtual-topology memo/visit/removed vectors. Its allocation-free
+      // envelope must fit before calling the allocation-heavy estimator; the
+      // returned scratch below instead covers the later selector invocation.
+      auto const selector_estimator_scratch =
+          chart_spr_search_detail::
+              estimate_exact_loop_estimator_peak_scratch_bytes(state,
+                                                                ranked);
+      std::size_t carried_selector_results = 0;
+      for (std::size_t rank = 0; rank < ranked.size(); ++rank) {
+        auto const already = chart_spr_exact_candidate_saturating_bytes_add(
+            selector_resident, carried_selector_results);
+        auto const available = already <= exact_memory_budget
+                                   ? exact_memory_budget - already
+                                   : std::size_t{0};
+        if (already > exact_memory_budget ||
+            selector_estimator_scratch > available) {
+          throw chart_spr_exact_candidate_budget_error(
+              rank, selector_estimator_scratch, available);
+        }
+        auto const estimate = estimate_chart_spr_topology_selection_memory(
+            state, ranked[rank], options);
+        auto const required =
+            !estimate.safely_bounded
+                ? (std::numeric_limits<std::size_t>::max)()
+                : chart_spr_exact_candidate_saturating_bytes_add(
+                      estimate.scratch_bytes,
+                      estimate.retained_result_bytes);
+        if (already > exact_memory_budget || required > available) {
+          throw chart_spr_exact_candidate_budget_error(rank, required,
+                                                       available);
+        }
+        carried_selector_results =
+            chart_spr_exact_candidate_saturating_bytes_add(
+                carried_selector_results, estimate.retained_result_bytes);
+      }
+    }
+    // User-provided topology selectors have no thread-safety contract. Resolve
+    // every certificate serially before publishing the ranked candidates to
+    // exact-verification readers.
     for (auto& candidate : ranked) {
       attach_fixed_topology_selection_for_acceptance(state, candidate, options);
-      auto exact_verifications_before = state.counters.exact_verifications;
-      auto exact_start = std::chrono::steady_clock::now();
-      chart_spr_candidate_score verified_candidate;
-      if (candidate.valid) {
-        chart_spr_exact_verifier_activity verifier_activity{
-            state.exact_verifier_concurrency};
-        verified_candidate = verify_candidate_for_acceptance(
-            state, std::move(candidate), checked_state, options, &scheduler);
-      } else {
-        // Selection/certificate attachment can invalidate a candidate before
-        // verifier entry.  Such a candidate has timing diagnostics but must
-        // not inflate the observed verifier-concurrency high-water mark.
-        verified_candidate = std::move(candidate);
+    }
+
+    auto resident_exact_base = state.resident_pattern_cache_bytes;
+    if (published_old_trim != nullptr) {
+      resident_exact_base = chart_spr_exact_candidate_checked_bytes_add(
+          resident_exact_base,
+          estimate_chart_spr_trim_resident_bytes(*published_old_trim),
+          "chart SPR exact-candidate resident old trim");
+    }
+    resident_exact_base = chart_spr_exact_candidate_checked_bytes_add(
+        resident_exact_base,
+        chart_spr_search_detail::estimate_exact_loop_resident_input_bytes(
+            ranked, result),
+        "chart SPR exact-candidate resident live inputs");
+
+    auto exact_loop_capacity = ranked.size();
+    if (!ranked.empty()) {
+      exact_loop_capacity = std::max<std::size_t>(
+          4, chart_spr_exact_candidate_checked_bytes_multiply(
+                 ranked.size(), 2,
+                 "chart SPR exact-candidate coordinator capacity"));
+    }
+    auto exact_loop_fixed_bytes =
+        chart_spr_exact_candidate_checked_bytes_multiply(
+            exact_loop_capacity,
+            sizeof(chart_spr_search_detail::chart_spr_exact_candidate_slot),
+            "chart SPR exact-candidate result-slot storage");
+    exact_loop_fixed_bytes = chart_spr_exact_candidate_checked_bytes_add(
+        exact_loop_fixed_bytes,
+        chart_spr_exact_candidate_checked_bytes_multiply(
+            exact_loop_capacity,
+            sizeof(chart_spr_exact_candidate_memory_estimate),
+            "chart SPR exact-candidate estimate-vector storage"),
+        "chart SPR exact-candidate fixed loop storage");
+    exact_loop_fixed_bytes = chart_spr_exact_candidate_checked_bytes_add(
+        exact_loop_fixed_bytes,
+        chart_spr_exact_candidate_checked_bytes_multiply(
+            exact_loop_capacity, sizeof(chart_spr_candidate_score),
+            "chart SPR exact-candidate verified-vector storage"),
+        "chart SPR exact-candidate fixed loop storage");
+    exact_loop_fixed_bytes = chart_spr_exact_candidate_checked_bytes_add(
+        exact_loop_fixed_bytes,
+        chart_spr_exact_candidate_checked_bytes_multiply(
+            exact_loop_capacity, sizeof(double),
+            "chart SPR exact-candidate timing-vector storage"),
+        "chart SPR exact-candidate fixed loop storage");
+    if (capture_semantics) {
+      exact_loop_fixed_bytes = chart_spr_exact_candidate_checked_bytes_add(
+          exact_loop_fixed_bytes,
+          chart_spr_exact_candidate_checked_bytes_multiply(
+              exact_loop_capacity, sizeof(std::size_t),
+              "chart SPR exact-candidate canonical-index storage"),
+          "chart SPR exact-candidate fixed loop storage");
+    }
+    exact_loop_fixed_bytes = chart_spr_exact_candidate_checked_bytes_add(
+        exact_loop_fixed_bytes,
+        chart_spr_search_detail::
+            estimate_exact_loop_estimator_peak_scratch_bytes(state, ranked),
+        "chart SPR exact-candidate estimator scratch");
+    exact_loop_fixed_bytes = chart_spr_exact_candidate_checked_bytes_add(
+        exact_loop_fixed_bytes,
+        chart_spr_search_detail::
+            estimate_exact_loop_scheduler_operation_peak_bytes(
+                resolved_workers, !ranked.empty()),
+        "chart SPR exact-candidate scheduler-operation scratch");
+    resident_exact_base = chart_spr_exact_candidate_checked_bytes_add(
+        resident_exact_base, exact_loop_fixed_bytes,
+        "chart SPR exact-candidate resident fixed storage");
+    if (finite_budget &&
+        resident_exact_base > exact_memory_budget) {
+      throw chart_spr_exact_candidate_budget_error(
+          0, resident_exact_base, exact_memory_budget);
+    }
+
+    std::vector<chart_spr_candidate_score> verified;
+    verified.reserve(ranked.size());
+    std::vector<chart_spr_search_detail::chart_spr_exact_candidate_slot> slots(
+        ranked.size());
+    auto exact_candidate_worker_limit = resolved_workers;
+    if ((options.acceptance_mode ==
+             chart_spr_acceptance_mode::fixed_topology_exact &&
+         (state.fixed_topology_exact_verifier ||
+          (state.contextual_fixed_topology_exact_verifier &&
+           !state.fixed_topology_exact_verifier_parallel_safe))) ||
+        (options.acceptance_mode ==
+             chart_spr_acceptance_mode::exact_multisite &&
+         options.verification_mode ==
+             chart_spr_verification_mode::transient &&
+         (state.exact_multisite_verifier ||
+          (state.contextual_exact_multisite_verifier &&
+           !state.exact_multisite_verifier_parallel_safe)))) {
+      exact_candidate_worker_limit = 1;
+    }
+    std::vector<chart_spr_exact_candidate_memory_estimate> memory_estimates;
+    memory_estimates.reserve(ranked.size());
+    auto memory_options = options;
+    memory_options.cache.memory_budget_bytes = exact_memory_budget;
+    for (auto const& candidate : ranked) {
+      memory_estimates.push_back(
+          candidate.valid ? estimate_chart_spr_exact_candidate_memory(
+                                state, candidate, memory_options,
+                                resolved_workers)
+                          : chart_spr_exact_candidate_memory_estimate{});
+    }
+
+    auto run_candidate = [&](std::size_t rank,
+                             chart_scheduler* inner_scheduler) noexcept {
+      auto& slot = slots[rank];
+      auto const exact_start = std::chrono::steady_clock::now();
+      try {
+        auto candidate = std::move(ranked[rank]);
+        if (candidate.valid) {
+          chart_spr_exact_verifier_activity verifier_activity{
+              state.exact_verifier_concurrency};
+          if (options.before_exact_candidate_verification_for_tests) {
+            options.before_exact_candidate_verification_for_tests(rank);
+          }
+          chart_spr_exact_verification_context context{
+              slot.counters, published_old_trim, inner_scheduler};
+          slot.result = verify_candidate_for_acceptance(
+              state, std::move(candidate), checked_state, options, context);
+        } else {
+          // Certificate attachment can invalidate a candidate before verifier
+          // entry. Keep its stable timing/result slot without inflating the
+          // real verifier-concurrency high-water mark.
+          slot.result = std::move(candidate);
+        }
+      } catch (...) {
+        slot.failure = std::current_exception();
       }
-      auto const exact_candidate_ms =
-          std::chrono::duration<double, std::milli>(
-              std::chrono::steady_clock::now() - exact_start)
-              .count();
-      result.exact_verification_ms += exact_candidate_ms;
-      result.exact_candidate_verification_ms.push_back(exact_candidate_ms);
-      if (state.counters.exact_verifications > exact_verifications_before ||
-          verified_candidate.exact) {
+      slot.elapsed_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - exact_start)
+                            .count();
+    };
+
+    std::size_t wave_begin = 0;
+    std::size_t carried_retained_bytes = 0;
+    while (wave_begin < ranked.size()) {
+      auto const already_resident_overflow =
+          resident_exact_base >
+          (std::numeric_limits<std::size_t>::max)() - carried_retained_bytes;
+      auto const already_resident =
+          chart_spr_exact_candidate_saturating_bytes_add(
+              resident_exact_base, carried_retained_bytes);
+      auto available_bytes = (std::numeric_limits<std::size_t>::max)();
+      if (finite_budget) {
+        if (already_resident_overflow ||
+            already_resident > exact_memory_budget) {
+          throw chart_spr_exact_candidate_budget_error(
+              wave_begin, already_resident, exact_memory_budget);
+        }
+        available_bytes = exact_memory_budget - already_resident;
+      }
+      auto wave = plan_chart_spr_exact_candidate_admission_wave(
+          memory_estimates, wave_begin, exact_candidate_worker_limit,
+          available_bytes,
+          finite_budget);
+      // The historical transient callback receives a scheduler reference and
+      // may use it. It therefore cannot take the serial-scratch fallback that
+      // a context-aware callback can select under pressure. Its forced
+      // singleton must fit the inner-memory estimate before invocation.
+      if (legacy_multisite_verifier_active &&
+          !wave.use_inner_parallelism) {
+        auto const& estimate = memory_estimates[wave_begin];
+        auto const required =
+            !estimate.safely_bounded
+                ? (std::numeric_limits<std::size_t>::max)()
+                : chart_spr_exact_candidate_saturating_bytes_add(
+                      estimate.inner_parallel_scratch_bytes,
+                      estimate.retained_result_bytes);
+        throw chart_spr_exact_candidate_budget_error(
+            wave_begin, required, available_bytes);
+      }
+      auto const wave_count = wave.end_rank - wave.begin_rank;
+      auto const projected_resident_overflow =
+          already_resident >
+          (std::numeric_limits<std::size_t>::max)() - wave.admitted_bytes;
+      auto const projected_resident =
+          chart_spr_exact_candidate_saturating_bytes_add(already_resident,
+                                                         wave.admitted_bytes);
+      if (finite_budget &&
+          (projected_resident_overflow ||
+           projected_resident > exact_memory_budget)) {
+        throw std::logic_error(
+            "chart SPR exact-candidate admission projected resident bytes "
+            "exceed the configured budget");
+      }
+      state.counters.exact_candidate_peak_admitted_bytes =
+          std::max(state.counters.exact_candidate_peak_admitted_bytes,
+                   wave.admitted_bytes);
+      state.counters.exact_candidate_peak_projected_resident_bytes =
+          std::max(state.counters.exact_candidate_peak_projected_resident_bytes,
+                   projected_resident);
+      ++state.counters.exact_candidate_admission_batches;
+      if (wave.memory_limited) {
+        ++state.counters.exact_candidate_memory_limited_batches;
+      }
+      auto const candidate_limit = std::min(
+          exact_candidate_worker_limit, ranked.size() - wave_begin);
+      auto const candidates_deferred_for_memory =
+          finite_budget && wave_count < candidate_limit;
+      auto const wave_start = std::chrono::steady_clock::now();
+      if (wave_count >= 2) {
+        ++state.counters.exact_candidate_parallel_batches;
+        auto const range_options =
+            chart_indexed_range_options{.minimum_grain = 1,
+                                        .target_ranges_per_worker = 1};
+        auto const range_plan =
+            scheduler.plan_indexed_ranges(wave_count, range_options);
+        if (wave_begin == 0 &&
+            options.force_exact_candidate_submit_failure_after_for_tests) {
+          auto const fail_after =
+              *options.force_exact_candidate_submit_failure_after_for_tests;
+          if (fail_after >= range_plan.worker_task_limit) {
+            throw std::logic_error(
+                "chart SPR exact-candidate submit-failure hook does not "
+                "select a submitted runner");
+          }
+          chart_scheduler_test_detail::access::fail_submission_after(
+              scheduler, fail_after);
+        }
+        auto const scheduler_before = scheduler.metrics();
+        try {
+          auto run = scheduler.for_each_indexed_range(
+              wave_count, range_options,
+              [&](chart_indexed_range const& range, std::size_t,
+                  chart_scheduler_cancellation_token const&) {
+                for (std::size_t offset = range.begin; offset < range.end;
+                     ++offset) {
+                  run_candidate(wave_begin + offset, nullptr);
+                }
+              });
+          record_chart_spr_scheduler_axis_run(
+              state.counters.scheduler_axes.exact_candidates, run);
+        } catch (...) {
+          record_chart_spr_scheduler_axis_failed_run(
+              state.counters.scheduler_axes.exact_candidates, range_plan,
+              scheduler_before, scheduler.metrics());
+          for (std::size_t rank = wave_begin;
+               rank < wave_begin + wave_count; ++rank) {
+            add_chart_spr_search_counters(state.counters,
+                                          slots[rank].counters);
+          }
+          // Scheduler infrastructure failure wins over failures from already
+          // accepted lower-rank runners because the intended stable wave was
+          // not returned as complete. The scheduler has joined every accepted
+          // runner here.
+          throw;
+        }
+      } else if (wave.use_inner_parallelism) {
+        ++state.counters.exact_candidate_inner_parallel_batches;
+        run_candidate(wave_begin, &scheduler);
+      } else {
+        run_candidate(wave_begin, nullptr);
+      }
+
+      // Join is complete here. Merge task-local diagnostics and select hard
+      // failures only in stable lower-bound rank order; completion order can
+      // affect neither counters nor which exception escapes.
+      for (std::size_t rank = wave_begin; rank < wave_begin + wave_count;
+           ++rank) {
+        add_chart_spr_search_counters(state.counters, slots[rank].counters);
+      }
+      for (std::size_t rank = wave_begin; rank < wave_begin + wave_count;
+           ++rank) {
+        if (slots[rank].failure) {
+          std::rethrow_exception(slots[rank].failure);
+        }
+      }
+      if (candidates_deferred_for_memory) {
+        state.counters.exact_candidate_queued_for_memory_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - wave_start)
+                .count();
+      }
+      for (std::size_t rank = wave_begin; rank < wave_begin + wave_count;
+           ++rank) {
+        carried_retained_bytes = chart_spr_exact_candidate_saturating_bytes_add(
+            carried_retained_bytes,
+            memory_estimates[rank].retained_result_bytes);
+      }
+      wave_begin += wave_count;
+    }
+    for (auto& slot : slots) {
+      if (!slot.result) {
+        throw std::logic_error(
+            "chart-SPR exact candidate task completed without a result");
+      }
+      auto verified_candidate = std::move(*slot.result);
+      result.exact_candidate_verification_ms.push_back(slot.elapsed_ms);
+      if (slot.counters.exact_verifications != 0 || verified_candidate.exact) {
         ++result.candidates_exact_verified;
       }
       if (capture_semantics) {
@@ -9087,6 +10171,10 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       result.state_score_after = accepted_score.new_score;
       ++state.counters.candidate_accepts_attempted;
     }
+    result.exact_verification_ms +=
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - exact_stage_start)
+            .count();
   }
 
   if (!result.accepted) {

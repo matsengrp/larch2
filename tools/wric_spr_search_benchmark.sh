@@ -1084,6 +1084,11 @@ trial_columns=(row_id requested_workers resolved_workers worker_policy trial_ind
   exact_initialization_ms initial_chart_construction_ms materialization_ms
   materialization_exact_verification_ms materialization_accepted_update_ms
   materialization_final_compaction_ms peak_concurrent_exact_verifiers
+  chart_axis_exact_candidate_active_worker_high_water
+  exact_candidate_admission_batches exact_candidate_parallel_batches
+  exact_candidate_inner_parallel_batches exact_candidate_memory_limited_batches
+  exact_candidate_peak_admitted_bytes exact_candidate_peak_projected_resident_bytes
+  exact_candidate_queued_for_memory_ms
   exact_candidate_timing_count
   exact_candidate_verification_ms_min exact_candidate_verification_ms_mean
   exact_candidate_verification_ms_max exact_ms_per_candidate
@@ -1380,6 +1385,39 @@ default_auto_contract_key() {
       row_id|worker_option|requested_workers|expected_resolved_workers|expected_worker_policy|oracle_trial_semantic_sha256|canonical_argv_sha256)
         continue ;;
     esac
+    printf '%s\037' "$(manifest_row_value "$row_id" "$field")"
+  done
+}
+# Worker-independent identity for Phase-6 admission and RSS comparisons.
+# Expected results and frozen report artifacts are deliberately excluded:
+# those are observations, whereas this key represents the input, algorithm,
+# work, and resource contract that explicit W1 and W8 rows must share.
+phase6_worker_contract_key() {
+  local row_id=$1 field
+  local fields=(run_group workload_name fixture_id method input_kind primary_sha256
+    secondary_sha256 refseq_sha256 binary_role worker_option affinity_cpus timeout_seconds
+    rss_limit_bytes iterations seed native_max_moves chart_max_candidates
+    chart_top_k_exact candidate_cap_semantics acceptance objective
+    candidate_selection candidate_source topology_selector randomize_order
+    reservoir_sample include_immediate_reversals sampled_tree_count
+    sampled_tree_radius sampled_tree_score_threshold max_upward_path_expansions
+    max_path_pairs min_moved_clade_size max_moved_clade_size
+    min_target_clade_size max_target_clade_size max_affected_clades
+    polytomy_mode polytomy_max_exact_arity polytomy_max_shapes
+    polytomy_max_productions polytomy_max_clades lazy_policy
+    max_cached_patterns pattern_batch_size candidate_batch_size
+    memory_budget_bytes commit_mode verification_mode local_accept_updates
+    dominance_mode bound_pruning require_exact_keep_mask max_frontier_entries
+    score_ua_edge validate force_no_vcf)
+  for field in "${fields[@]}"; do
+    printf '%s\037' "$(manifest_row_value "$row_id" "$field")"
+  done
+}
+phase6_worker_comparison_key() {
+  local row_id=$1 field
+  local fields=(run_group workload_name fixture_id method input_kind primary_sha256
+    secondary_sha256 refseq_sha256 worker_option chart_top_k_exact)
+  for field in "${fields[@]}"; do
     printf '%s\037' "$(manifest_row_value "$row_id" "$field")"
   done
 }
@@ -1874,6 +1912,11 @@ run_chart() {
     initial_chart_construction_ms materialization_ms \
     materialization_exact_verification_ms materialization_accepted_update_ms \
     materialization_final_compaction_ms peak_concurrent_exact_verifiers \
+    chart_axis_exact_candidate_active_worker_high_water \
+    exact_candidate_admission_batches exact_candidate_parallel_batches \
+    exact_candidate_inner_parallel_batches exact_candidate_memory_limited_batches \
+    exact_candidate_peak_admitted_bytes exact_candidate_peak_projected_resident_bytes \
+    exact_candidate_queued_for_memory_ms \
     exact_candidate_timing_count \
     exact_candidate_verification_ms_min exact_candidate_verification_ms_mean \
     exact_candidate_verification_ms_max; do ROW[$key]=$(extract_chart_top_value "$out" "$key"); ROW[$key]=${ROW[$key]:-NA}; done
@@ -1886,6 +1929,15 @@ run_chart() {
       [[ ${ROW[$key]} =~ ^[0-9]+([.][0-9]+)?$ ]] || instrumentation_ok=0
     done
     [[ ${ROW[peak_concurrent_exact_verifiers]} =~ ^[0-9]+$ ]] || \
+      instrumentation_ok=0
+    [[ ${ROW[chart_axis_exact_candidate_active_worker_high_water]} =~ ^[0-9]+$ ]] || \
+      instrumentation_ok=0
+    for key in exact_candidate_admission_batches exact_candidate_parallel_batches \
+      exact_candidate_inner_parallel_batches exact_candidate_memory_limited_batches \
+      exact_candidate_peak_admitted_bytes exact_candidate_peak_projected_resident_bytes; do
+      [[ ${ROW[$key]} =~ ^[0-9]+$ ]] || instrumentation_ok=0
+    done
+    [[ ${ROW[exact_candidate_queued_for_memory_ms]} =~ ^[0-9]+([.][0-9]+)?$ ]] || \
       instrumentation_ok=0
     if (( instrumentation_ok )); then
       awk -v initial="${ROW[initial_chart_construction_ms]}" \
@@ -1907,6 +1959,34 @@ run_chart() {
           instrumentation_ok=0
       else
         instrumentation_ok=0
+      fi
+      awk -v batches="${ROW[exact_candidate_admission_batches]}" \
+          -v parallel="${ROW[exact_candidate_parallel_batches]}" \
+          -v inner="${ROW[exact_candidate_inner_parallel_batches]}" \
+          -v limited="${ROW[exact_candidate_memory_limited_batches]}" \
+          -v admitted="${ROW[exact_candidate_peak_admitted_bytes]}" \
+          -v projected="${ROW[exact_candidate_peak_projected_resident_bytes]}" \
+          -v queued="${ROW[exact_candidate_queued_for_memory_ms]}" \
+          -v exact="${ROW[exact_verifications]}" \
+          'BEGIN {
+             exit !(parallel <= batches && inner <= batches && limited <= batches &&
+                    parallel + inner <= batches && admitted <= projected &&
+                    (batches != 0 || (parallel == 0 && inner == 0 && limited == 0 &&
+                                      admitted == 0 && projected == 0 && queued == 0)) &&
+                    (batches == 0 || (admitted > 0 && projected > 0)) &&
+                    (exact == 0 || batches > 0) &&
+                    (limited != 0 || queued == 0))
+           }' || instrumentation_ok=0
+      if [[ ${ROW[configured_chart_memory_budget]} =~ ^[0-9]+$ &&
+            ${ROW[configured_chart_memory_budget]} != 0 ]]; then
+        if ! awk -v projected="${ROW[exact_candidate_peak_projected_resident_bytes]}" \
+            -v budget="${ROW[configured_chart_memory_budget]}" \
+            'BEGIN { exit !(projected <= budget) }'; then
+          echo "chart admission projection exceeds configured budget: $RESOLVED_ROW_ID" \
+            "projected=${ROW[exact_candidate_peak_projected_resident_bytes]}" \
+            "budget=${ROW[configured_chart_memory_budget]}" >&2
+          instrumentation_ok=0
+        fi
       fi
     fi
     if (( ! instrumentation_ok )); then
@@ -2493,6 +2573,548 @@ awk -F '\t' -v OFS='\t' '
 gate_failures=0
 (( SEMANTIC_COMPANION_FAILURES == 0 )) || \
   gate_failures=$((gate_failures+SEMANTIC_COMPANION_FAILURES))
+
+phase6_admission_tsv="$out_dir/phase6_admission_evidence.tsv"
+phase6_rss_tsv="$out_dir/phase6_rss_comparisons.tsv"
+phase6_exact_speedup_tsv="$out_dir/phase6_exact_verification_speedup.tsv"
+printf '%s\n' $'comparison_sha256\tcontract_sha256\trow_id\tfixture\tmethod\tchart_top_k_exact\trequested_workers\ttrial_index\tstatus\tvalidation_status\texact_verifications\tconfigured_chart_memory_budget\tpeak_sampled_rss_kb\texact_candidate_admission_batches\texact_candidate_parallel_batches\texact_candidate_inner_parallel_batches\texact_candidate_memory_limited_batches\texact_candidate_peak_admitted_bytes\texact_candidate_peak_projected_resident_bytes\texact_candidate_queued_for_memory_ms\trunner_outcome\ttimed_out\texact_verification_ms\tpeak_concurrent_exact_verifiers\tchart_axis_exact_candidate_active_worker_high_water\texact_candidate_timing_count\texact_candidate_verification_ms_min\texact_candidate_verification_ms_mean\texact_candidate_verification_ms_max\tsearch_semantic_sha256\toutput_semantic_sha256' >"$phase6_admission_tsv"
+if [[ -n "$workload_manifest" ]]; then
+  declare -A phase6_top_k_by_row=()
+  declare -A phase6_comparison_by_row=()
+  declare -A phase6_contract_by_row=()
+  while IFS=$'\t' read -r row_id fixture method requested trial status validation \
+    exact budget rss admission parallel inner limited admitted projected queued \
+    runner_outcome timed_out exact_ms peak_concurrent exact_axis_high_water \
+    timing_count timing_min timing_mean timing_max search_semantic output_semantic; do
+    if [[ -z ${phase6_top_k_by_row[$row_id]+set} ]]; then
+      phase6_top_k_by_row[$row_id]=$(manifest_row_value "$row_id" chart_top_k_exact)
+    fi
+    top_k=${phase6_top_k_by_row[$row_id]}
+    comparison_sha=-
+    contract_sha=-
+    if [[ "$requested" == 1 || "$requested" == 8 ]]; then
+      if [[ -z ${phase6_comparison_by_row[$row_id]+set} ]]; then
+        phase6_comparison_by_row[$row_id]=$(phase6_worker_comparison_key "$row_id" | sha256sum | awk '{print $1}')
+        phase6_contract_by_row[$row_id]=$(phase6_worker_contract_key "$row_id" | sha256sum | awk '{print $1}')
+      fi
+      comparison_sha=${phase6_comparison_by_row[$row_id]}
+      contract_sha=${phase6_contract_by_row[$row_id]}
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$comparison_sha" "$contract_sha" "$row_id" "$fixture" "$method" \
+      "$top_k" "$requested" "$trial" "$status" "$validation" "$exact" \
+      "$budget" "$rss" "$admission" "$parallel" "$inner" "$limited" \
+      "$admitted" "$projected" "$queued" "$runner_outcome" "$timed_out" \
+      "$exact_ms" "$peak_concurrent" "$exact_axis_high_water" "$timing_count" \
+      "$timing_min" "$timing_mean" "$timing_max" "$search_semantic" \
+      "$output_semantic" >>"$phase6_admission_tsv"
+  done < <(awk -F '\t' -v OFS='\t' '
+    NR==1 {for(i=1;i<=NF;i++)h[$i]=i; next}
+    $h["method"]!="sample_explore_merge" {
+      print $h["row_id"],$h["fixture"],$h["method"],$h["requested_workers"],
+      $h["trial_index"],$h["status"],$h["validation_status"],
+      $h["exact_verifications"],$h["configured_chart_memory_budget"],
+      $h["peak_sampled_rss_kb"],$h["exact_candidate_admission_batches"],
+      $h["exact_candidate_parallel_batches"],
+      $h["exact_candidate_inner_parallel_batches"],
+      $h["exact_candidate_memory_limited_batches"],
+      $h["exact_candidate_peak_admitted_bytes"],
+      $h["exact_candidate_peak_projected_resident_bytes"],
+      $h["exact_candidate_queued_for_memory_ms"],$h["runner_outcome"],
+      $h["timed_out"],$h["exact_verification_ms"],
+      $h["peak_concurrent_exact_verifiers"],
+      $h["chart_axis_exact_candidate_active_worker_high_water"],
+      $h["exact_candidate_timing_count"],
+      $h["exact_candidate_verification_ms_min"],
+      $h["exact_candidate_verification_ms_mean"],
+      $h["exact_candidate_verification_ms_max"],
+      $h["search_semantic_sha256"],$h["output_semantic_sha256"]
+    }
+  ' "$raw_trials_tsv")
+fi
+
+phase6_expected_k16_rows=0
+phase6_require_k16_cardinality=0
+phase6_expected_k16_row_ids_csv=
+phase6_expected_rss_pair_count=0
+phase6_expected_rss_keys_csv=
+phase6_expected_exact_speed_pair_count=0
+phase6_expected_exact_speed_keys_csv=
+phase6_expected_exact_speed_contracts_csv=
+if [[ -n "$run_manifest_group" ]]; then
+  declare -A phase6_expected_rss_key_seen=()
+  declare -A phase6_expected_rss_worker_count=()
+  declare -A phase6_expected_rss_contract_by_key=()
+  declare -A phase6_record_only_rss_key=()
+  declare -A phase6_expected_exact_speed_key_seen=()
+  declare -A phase6_expected_exact_speed_worker_count=()
+  declare -A phase6_expected_exact_speed_contract_by_key=()
+  declare -A phase6_record_only_exact_speed_key=()
+  declare -A phase6_record_only_timeout_row=()
+  for row_id in "${expected_timeout_ids[@]}"; do
+    phase6_record_only_timeout_row[$row_id]=1
+  done
+  phase6_expected_rss_w1_rows=0
+  phase6_expected_rss_w8_rows=0
+  phase6_expected_exact_speed_rows=0
+  for row_id in "${selected_manifest_rows[@]}"; do
+    method=$(manifest_row_value "$row_id" method)
+    expected_outcome=$(manifest_row_value "$row_id" expected_outcome)
+    row_top_k=$(manifest_row_value "$row_id" chart_top_k_exact)
+    workload_name=$(manifest_row_value "$row_id" workload_name)
+    if [[ "$workload_name" == exact-medium-topk4 &&
+          "$method" == chart_spr_grammar_exact ]]; then
+      (( phase6_expected_exact_speed_rows += 1 ))
+      if [[ "$row_top_k" != 4 ]]; then
+        echo "gate failure: selected Phase-6 exact-medium-topk4 grammar row has TopK drift: $row_id" >&2
+        gate_failures=$((gate_failures+1))
+      fi
+      if [[ "$expected_outcome" != ok && "$expected_outcome" != timeout ]]; then
+        echo "gate failure: selected Phase-6 exact-speed row is manifest-labelled $expected_outcome: $row_id" >&2
+        gate_failures=$((gate_failures+1))
+      fi
+      requested=$(manifest_row_value "$row_id" requested_workers)
+      comparison_sha=$(phase6_worker_comparison_key "$row_id" | sha256sum | awk '{print $1}')
+      contract_sha=$(phase6_worker_contract_key "$row_id" | sha256sum | awk '{print $1}')
+      phase6_expected_exact_speed_key_seen[$comparison_sha]=1
+      if [[ ( "$requested" == 1 || "$requested" == 8 ) &&
+            "$expected_outcome" == timeout &&
+            -n ${phase6_record_only_timeout_row[$row_id]:-} ]]; then
+        phase6_record_only_exact_speed_key[$comparison_sha]=1
+      fi
+      if [[ "$requested" == 1 || "$requested" == 8 ]]; then
+        worker_key="$comparison_sha:$requested"
+        worker_rows=${phase6_expected_exact_speed_worker_count[$worker_key]:-0}
+        phase6_expected_exact_speed_worker_count[$worker_key]=$((worker_rows + 1))
+      fi
+      if [[ -n ${phase6_expected_exact_speed_contract_by_key[$comparison_sha]:-} &&
+            ${phase6_expected_exact_speed_contract_by_key[$comparison_sha]} != "$contract_sha" ]]; then
+        echo "gate failure: selected Phase-6 exact-speed rows have workload contract drift for $comparison_sha" >&2
+        gate_failures=$((gate_failures+1))
+      else
+        phase6_expected_exact_speed_contract_by_key[$comparison_sha]=$contract_sha
+      fi
+    fi
+    requested=$(manifest_row_value "$row_id" requested_workers)
+    if [[ "$method" != sample_explore_merge && "$row_top_k" =~ ^[1-9][0-9]*$ &&
+          ( "$requested" == 1 || "$requested" == 8 ) &&
+          "$expected_outcome" == timeout &&
+          -n ${phase6_record_only_timeout_row[$row_id]:-} ]]; then
+      comparison_sha=$(phase6_worker_comparison_key "$row_id" | sha256sum | awk '{print $1}')
+      phase6_record_only_rss_key[$comparison_sha]=1
+    fi
+    phase6_expect_current_success=0
+    if [[ "$expected_outcome" == ok ]] || \
+       [[ "$expected_outcome" == timeout &&
+          -z ${phase6_record_only_timeout_row[$row_id]:-} ]]; then
+      phase6_expect_current_success=1
+    fi
+    [[ "$method" != sample_explore_merge &&
+       "$phase6_expect_current_success" == 1 ]] || continue
+    if [[ "$row_top_k" == 16 ]]; then
+      (( phase6_expected_k16_rows += repetitions ))
+      [[ -z "$phase6_expected_k16_row_ids_csv" ]] || \
+        phase6_expected_k16_row_ids_csv+=,
+      phase6_expected_k16_row_ids_csv+=$row_id
+    fi
+    (( row_top_k > 0 )) || continue
+    requested=$(manifest_row_value "$row_id" requested_workers)
+    [[ "$requested" == 1 || "$requested" == 8 ]] || continue
+    comparison_sha=$(phase6_worker_comparison_key "$row_id" | sha256sum | awk '{print $1}')
+    contract_sha=$(phase6_worker_contract_key "$row_id" | sha256sum | awk '{print $1}')
+    phase6_expected_rss_key_seen[$comparison_sha]=1
+    worker_key="$comparison_sha:$requested"
+    worker_rows=${phase6_expected_rss_worker_count[$worker_key]:-0}
+    phase6_expected_rss_worker_count[$worker_key]=$((worker_rows + 1))
+    if [[ "$requested" == 1 ]]; then
+      (( phase6_expected_rss_w1_rows += 1 ))
+    else
+      (( phase6_expected_rss_w8_rows += 1 ))
+    fi
+    if [[ -n ${phase6_expected_rss_contract_by_key[$comparison_sha]:-} &&
+          ${phase6_expected_rss_contract_by_key[$comparison_sha]} != "$contract_sha" ]]; then
+      echo "gate failure: selected Phase-6 W1/W8 rows have workload contract drift for $comparison_sha" >&2
+      gate_failures=$((gate_failures+1))
+    else
+      phase6_expected_rss_contract_by_key[$comparison_sha]=$contract_sha
+    fi
+  done
+  (( phase6_expected_k16_rows == 0 )) || phase6_require_k16_cardinality=1
+
+  # A selected group that contains successful W1 and W8 exact rows must define
+  # complete one-to-one comparison pairs. Otherwise label/key drift could make
+  # the RSS gate produce only its header and pass vacuously.
+  if (( phase6_expected_rss_w1_rows > 0 && phase6_expected_rss_w8_rows > 0 )); then
+    phase6_rss_keys_requiring_gate=0
+    for comparison_sha in "${!phase6_expected_rss_key_seen[@]}"; do
+      [[ -z ${phase6_record_only_rss_key[$comparison_sha]:-} ]] || continue
+      (( phase6_rss_keys_requiring_gate += 1 ))
+      w1_rows=${phase6_expected_rss_worker_count[$comparison_sha:1]:-0}
+      w8_rows=${phase6_expected_rss_worker_count[$comparison_sha:8]:-0}
+      if (( w1_rows != 1 || w8_rows != 1 )); then
+        echo "gate failure: selected Phase-6 RSS comparison $comparison_sha has W1/W8 manifest cardinality $w1_rows/$w8_rows" >&2
+        gate_failures=$((gate_failures+1))
+        continue
+      fi
+      [[ -z "$phase6_expected_rss_keys_csv" ]] || phase6_expected_rss_keys_csv+=,
+      phase6_expected_rss_keys_csv+=$comparison_sha
+      (( phase6_expected_rss_pair_count += 1 ))
+    done
+    if (( phase6_rss_keys_requiring_gate > 0 &&
+          phase6_expected_rss_pair_count == 0 )); then
+      echo "gate failure: selected Phase-6 group has successful W1 and W8 exact rows but no RSS comparison pair" >&2
+      gate_failures=$((gate_failures+1))
+    fi
+  fi
+
+  # The named medium TopK4 workload is the strict Phase-6 performance gate.
+  # Selecting any part of it requires one and only one manifest row at each
+  # endpoint; a partial worker selection must not create a vacuous pass.
+  if (( phase6_expected_exact_speed_rows > 0 )); then
+    phase6_exact_speed_keys_requiring_gate=0
+    for comparison_sha in "${!phase6_expected_exact_speed_key_seen[@]}"; do
+      [[ -z ${phase6_record_only_exact_speed_key[$comparison_sha]:-} ]] || continue
+      (( phase6_exact_speed_keys_requiring_gate += 1 ))
+      w1_rows=${phase6_expected_exact_speed_worker_count[$comparison_sha:1]:-0}
+      w8_rows=${phase6_expected_exact_speed_worker_count[$comparison_sha:8]:-0}
+      if (( w1_rows != 1 || w8_rows != 1 )); then
+        echo "gate failure: selected Phase-6 exact-speed comparison $comparison_sha has W1/W8 manifest cardinality $w1_rows/$w8_rows" >&2
+        gate_failures=$((gate_failures+1))
+        continue
+      fi
+      [[ -z "$phase6_expected_exact_speed_keys_csv" ]] || \
+        phase6_expected_exact_speed_keys_csv+=,
+      phase6_expected_exact_speed_keys_csv+=$comparison_sha
+      [[ -z "$phase6_expected_exact_speed_contracts_csv" ]] || \
+        phase6_expected_exact_speed_contracts_csv+=,
+      phase6_expected_exact_speed_contracts_csv+="$comparison_sha:${phase6_expected_exact_speed_contract_by_key[$comparison_sha]}"
+      (( phase6_expected_exact_speed_pair_count += 1 ))
+    done
+    if (( phase6_exact_speed_keys_requiring_gate > 0 &&
+          phase6_expected_exact_speed_pair_count == 0 )); then
+      echo "gate failure: selected Phase-6 medium TopK4 rows define no complete exact-speed pair" >&2
+      gate_failures=$((gate_failures+1))
+    fi
+  fi
+fi
+
+if ! awk -F '\t' -v expected_rows="$phase6_expected_k16_rows" \
+    -v expected_ids_csv="$phase6_expected_k16_row_ids_csv" \
+    -v require_cardinality="$phase6_require_k16_cardinality" '
+  BEGIN {
+    n=split(expected_ids_csv,ids,",")
+    for(i=1;i<=n;i++) if(ids[i]!="") expected_id[ids[i]]=1
+  }
+  function uint(v) {return v ~ /^[0-9]+$/}
+  function positive(v) {return v ~ /^[1-9][0-9]*$/}
+  function decimal(v) {return v ~ /^[0-9]+([.][0-9]+)?$/}
+  NR==1 {for(i=1;i<=NF;i++)h[$i]=i; next}
+  $h["chart_top_k_exact"]==16 && $h["method"]!="sample_explore_merge" &&
+      $h["status"]=="ok" && $h["validation_status"]=="ok" {
+    if ($h["row_id"] in expected_id) observed++
+    row=$h["row_id"] " trial " $h["trial_index"]
+    exact=$h["exact_verifications"]
+    budget=$h["configured_chart_memory_budget"]
+    batches=$h["exact_candidate_admission_batches"]
+    parallel=$h["exact_candidate_parallel_batches"]
+    inner=$h["exact_candidate_inner_parallel_batches"]
+    limited=$h["exact_candidate_memory_limited_batches"]
+    admitted=$h["exact_candidate_peak_admitted_bytes"]
+    projected=$h["exact_candidate_peak_projected_resident_bytes"]
+    queued=$h["exact_candidate_queued_for_memory_ms"]
+    if (!positive(exact) || !positive(budget) || !positive(batches) ||
+        !uint(parallel) || !uint(inner) || !uint(limited) ||
+        !positive(admitted) || !positive(projected) || !decimal(queued) ||
+        parallel+inner>batches || limited>batches || admitted>projected ||
+        projected>budget) {
+      print "invalid K16 admission evidence: " row > "/dev/stderr"
+      bad=1
+    }
+  }
+  END {
+    if (require_cardinality && observed+0 != expected_rows+0) {
+      print "invalid K16 evidence cardinality: expected " expected_rows \
+            " successful rows, observed " (observed+0) > "/dev/stderr"
+      bad=1
+    }
+    exit bad
+  }
+' "$phase6_admission_tsv"; then
+  echo "gate failure: Phase-6 K16 concurrent-memory admission" >&2
+  gate_failures=$((gate_failures+1))
+fi
+
+phase6_exact_speedup_body="$out_dir/.phase6_exact_verification_speedup.body.tsv"
+if ! LC_ALL=C awk -F '\t' -v OFS='\t' \
+    -v expected_keys_csv="$phase6_expected_exact_speed_keys_csv" \
+    -v expected_contracts_csv="$phase6_expected_exact_speed_contracts_csv" \
+    -v expected_pair_count="$phase6_expected_exact_speed_pair_count" \
+    -v expected_trials="$repetitions" '
+  function uint(v) {return v ~ /^[0-9]+$/}
+  function positive(v) {return v ~ /^[1-9][0-9]*$/}
+  function hash(v) {return v ~ /^[0-9a-f][0-9a-f]*$/ && length(v)==64}
+  # Product timing fields are printed with three decimal places. Convert them
+  # to integer thousandths so the 2x gate never depends on rounded ratios or
+  # implementation-specific floating-point formatting.
+  function millims(v, parts,n,frac) {
+    if (v !~ /^[0-9]+([.][0-9][0-9]?[0-9]?)?$/) return -1
+    n=split(v,parts,".")
+    if (length(parts[1])>9) return -1
+    frac=(n==1 ? "" : parts[2])
+    while (length(frac)<3) frac=frac "0"
+    return (parts[1]+0)*1000+(frac+0)
+  }
+  function median_twice(g,w,n, values,i,j,x) {
+    for (i=1;i<=n;i++) values[i]=sample[g,w,i]
+    for (i=2;i<=n;i++) {
+      x=values[i]; j=i-1
+      while (j>=1 && values[j]>x) {values[j+1]=values[j]; j--}
+      values[j+1]=x
+    }
+    return n%2 ? 2*values[(n+1)/2] : values[n/2]+values[n/2+1]
+  }
+  function trial_values(g,w,n, value,i) {
+    value=""
+    for (i=1;i<=n;i++) {
+      if (!((g SUBSEP w SUBSEP i) in trial_sample)) {
+        bad=1
+        return "MISSING"
+      }
+      if (value!="") value=value ","
+      value=value i ":" sprintf("%.0f",trial_sample[g,w,i])
+    }
+    return value
+  }
+  BEGIN {
+    n=split(expected_keys_csv,keys,",")
+    for (i=1;i<=n;i++) if (keys[i]!="") expected[keys[i]]=1
+    n=split(expected_contracts_csv,contracts,",")
+    for (i=1;i<=n;i++) if (contracts[i]!="") {
+      split(contracts[i],pair,":")
+      expected_contract[pair[1]]=pair[2]
+    }
+  }
+  NR==1 {for(i=1;i<=NF;i++)h[$i]=i; next}
+  $h["comparison_sha256"] in expected {
+    g=$h["comparison_sha256"]
+    worker=$h["requested_workers"]
+    if (worker!=1 && worker!=8) next
+    row=$h["row_id"] " trial " $h["trial_index"]
+    if ($h["contract_sha256"]!=expected_contract[g]) {
+      print "Phase-6 exact-speed workload contract drift for " row > "/dev/stderr"
+      bad=1
+    }
+    if ($h["method"]!="chart_spr_grammar_exact" ||
+        $h["chart_top_k_exact"]!="4" || $h["exact_verifications"]!="4") {
+      print "inconsistent Phase-6 medium TopK4 row: " row > "/dev/stderr"
+      bad=1
+    }
+    if ($h["status"]!="ok" || $h["validation_status"]!="ok" ||
+        $h["runner_outcome"]!="exited" || $h["timed_out"]!="0") {
+      print "Phase-6 exact-speed row is not a successful non-timeout execution: " row > "/dev/stderr"
+      bad=1
+      next
+    }
+    row_search=$h["search_semantic_sha256"]
+    row_output=$h["output_semantic_sha256"]
+    if (!hash(row_search) || !hash(row_output)) {
+      print "invalid Phase-6 exact-speed semantic digest for " row > "/dev/stderr"
+      bad=1
+      next
+    }
+    if (!(g in semantic_seen)) {
+      semantic_seen[g]=1
+      search_semantic[g]=row_search
+      output_semantic[g]=row_output
+    } else if (search_semantic[g]!=row_search || output_semantic[g]!=row_output) {
+      print "Phase-6 exact-speed search/output semantic drift for " row > "/dev/stderr"
+      semantic_drift[g]=1
+      bad=1
+    }
+    trial=$h["trial_index"]
+    if (!positive(trial) || trial>expected_trials || seen_trial[g,worker,trial]++) {
+      print "duplicate or invalid Phase-6 exact-speed trial index: " row > "/dev/stderr"
+      bad=1
+      next
+    }
+    exact_ms=millims($h["exact_verification_ms"])
+    if (exact_ms<=0) {
+      print "invalid Phase-6 exact_verification_ms for " row > "/dev/stderr"
+      bad=1
+      next
+    }
+    timing_count=$h["exact_candidate_timing_count"]
+    timing_min=millims($h["exact_candidate_verification_ms_min"])
+    timing_mean=millims($h["exact_candidate_verification_ms_mean"])
+    timing_max=millims($h["exact_candidate_verification_ms_max"])
+    if (timing_count!="4" || timing_min<0 || timing_mean<0 || timing_max<0 ||
+        timing_min>timing_mean || timing_mean>timing_max ||
+        timing_max>exact_ms+1) {
+      print "inconsistent Phase-6 exact-candidate timing evidence for " row > "/dev/stderr"
+      bad=1
+      next
+    }
+    parallel=$h["exact_candidate_parallel_batches"]
+    peak=$h["peak_concurrent_exact_verifiers"]
+    axis=$h["chart_axis_exact_candidate_active_worker_high_water"]
+    if (!uint(parallel) || !uint(peak) || !uint(axis)) {
+      print "invalid Phase-6 exact-candidate scheduler evidence for " row > "/dev/stderr"
+      bad=1
+      next
+    }
+    if (worker==8 && (parallel<1 || peak<2 || axis<2)) {
+      print "Phase-6 W8 candidate-parallel path not activated for " row > "/dev/stderr"
+      bad=1
+    }
+    if (worker==1 && (parallel!=0 || peak!=1 || axis>1)) {
+      print "inconsistent Phase-6 W1 candidate scheduling evidence for " row > "/dev/stderr"
+      bad=1
+    }
+    count[g,worker]++
+    sample[g,worker,count[g,worker]]=exact_ms
+    trial_sample[g,worker,trial]=exact_ms
+    contract[g]=$h["contract_sha256"]
+    fixture[g]=$h["fixture"]
+    method[g]=$h["method"]
+  }
+  END {
+    for (g in expected) {
+      if (count[g,1]+0!=expected_trials || count[g,8]+0!=expected_trials) {
+        print "Phase-6 exact-speed evidence cardinality mismatch for " g \
+              ": expected " expected_trials "/" expected_trials \
+              ", observed " (count[g,1]+0) "/" (count[g,8]+0) > "/dev/stderr"
+        bad=1
+        continue
+      }
+      w1=median_twice(g,1,expected_trials)
+      w8=median_twice(g,8,expected_trials)
+      lhs=2*w8
+      rhs=w1
+      if (lhs>rhs) {
+        print "Phase-6 W8 exact_verification_ms median is not at least 2.0x faster for " \
+              fixture[g] > "/dev/stderr"
+        bad=1
+      }
+      print g,contract[g],fixture[g],method[g],search_semantic[g],
+            output_semantic[g],4,expected_trials,
+            trial_values(g,1,expected_trials),trial_values(g,8,expected_trials),
+            sprintf("%.0f",w1),sprintf("%.0f",w8),sprintf("%.0f",lhs),
+            sprintf("%.0f",rhs),sprintf("%.4f",w1/2000),
+            sprintf("%.4f",w8/2000),sprintf("%.9f",w1/w8)
+      observed_pairs++
+    }
+    if (observed_pairs+0!=expected_pair_count+0) {
+      print "Phase-6 exact-speed arithmetic cardinality mismatch: expected " \
+            expected_pair_count ", observed " (observed_pairs+0) > "/dev/stderr"
+      bad=1
+    }
+    exit bad
+  }
+' "$phase6_admission_tsv" >"$phase6_exact_speedup_body"; then
+  echo "gate failure: Phase-6 medium TopK4 exact-verification speedup" >&2
+  gate_failures=$((gate_failures+1))
+fi
+LC_ALL=C sort -t $'\t' -k1,1 "$phase6_exact_speedup_body" \
+  >"$phase6_exact_speedup_body.sorted"
+mv "$phase6_exact_speedup_body.sorted" "$phase6_exact_speedup_body"
+{
+  printf '%s\n' $'arithmetic_sha256\tcomparison_sha256\tcontract_sha256\tfixture\tmethod\tsearch_semantic_sha256\toutput_semantic_sha256\tchart_top_k_exact\ttrial_count_per_worker\tw1_trial_millims_by_index\tw8_trial_millims_by_index\tw1_median_twice_millims\tw8_median_twice_millims\tgate_lhs_twice_millims\tgate_rhs_twice_millims\tw1_median_ms\tw8_median_ms\tw1_over_w8'
+  while IFS= read -r arithmetic_row; do
+    [[ -n "$arithmetic_row" ]] || continue
+    arithmetic_sha=$(printf '%s\n' "$arithmetic_row" | sha256sum | awk '{print $1}')
+    printf '%s\t%s\n' "$arithmetic_sha" "$arithmetic_row"
+  done <"$phase6_exact_speedup_body"
+} >"$phase6_exact_speedup_tsv"
+rm -f "$phase6_exact_speedup_body"
+
+if ! awk -F '\t' -v OFS='\t' \
+    -v expected_keys_csv="$phase6_expected_rss_keys_csv" \
+    -v expected_pair_count="$phase6_expected_rss_pair_count" '
+  BEGIN {
+    print "comparison_sha256","fixture","method","chart_top_k_exact",
+               "search_semantic_sha256","output_semantic_sha256",
+               "w1_peak_sampled_rss_max_kb","w8_peak_sampled_rss_max_kb",
+               "w8_over_w1"
+    n=split(expected_keys_csv, keys, ",")
+    for (i=1; i<=n; ++i) if (keys[i] != "") expected[keys[i]]=1
+  }
+  NR==1 {for(i=1;i<=NF;i++)h[$i]=i; next}
+  $h["chart_top_k_exact"]+0>0 && $h["method"]!="sample_explore_merge" &&
+      $h["status"]=="ok" && $h["validation_status"]=="ok" &&
+      ($h["requested_workers"]==1 || $h["requested_workers"]==8) {
+    g=$h["comparison_sha256"]
+    if (!(g in expected)) next
+    worker=$h["requested_workers"]
+    rss=$h["peak_sampled_rss_kb"]
+    if (rss !~ /^[1-9][0-9]*$/) {
+      print "invalid Phase-6 peak RSS for " $h["row_id"] > "/dev/stderr"
+      bad=1
+      next
+    }
+    row_search=$h["search_semantic_sha256"]
+    row_output=$h["output_semantic_sha256"]
+    if (length(row_search)!=64 || row_search !~ /^[0-9a-f][0-9a-f]*$/ ||
+        length(row_output)!=64 || row_output !~ /^[0-9a-f][0-9a-f]*$/) {
+      print "invalid Phase-6 search/output semantic digest for " $h["row_id"] > "/dev/stderr"
+      bad=1
+      next
+    }
+    if (!(g in semantic_seen)) {
+      semantic_seen[g]=1
+      search_semantic[g]=row_search
+      output_semantic[g]=row_output
+    } else if (search_semantic[g]!=row_search || output_semantic[g]!=row_output) {
+      semantic_drift[g]=1
+    }
+    if (!(g in detail)) detail[g]=$h["contract_sha256"]
+    else if (detail[g]!=$h["contract_sha256"]) drift[g]=1
+    seen[g,worker]=1
+    if (rss+0>peak[g,worker]) peak[g,worker]=rss+0
+    fixture[g]=$h["fixture"]
+    method[g]=$h["method"]
+    topk[g]=$h["chart_top_k_exact"]
+  }
+  END {
+    for (g in expected) {
+      if (!seen[g,1] || !seen[g,8]) {
+        print "Phase-6 expected W1/W8 RSS pair is incomplete: " g > "/dev/stderr"
+        bad=1
+      }
+    }
+    for (g in fixture) {
+      if (!(g in expected)) continue
+      if (!seen[g,1] || !seen[g,8]) continue
+      if (drift[g]) {
+        print "Phase-6 W1/W8 workload contract drift for " fixture[g] "/" method[g] "/K" topk[g] > "/dev/stderr"
+        bad=1
+        continue
+      }
+      if (semantic_drift[g]) {
+        print "Phase-6 W1/W8 search/output semantic drift for " fixture[g] "/" method[g] "/K" topk[g] > "/dev/stderr"
+        bad=1
+        continue
+      }
+      observed_pairs++
+      ratio=peak[g,8]/peak[g,1]
+      print g,fixture[g],method[g],topk[g],search_semantic[g],
+            output_semantic[g],peak[g,1],peak[g,8],sprintf("%.9f",ratio)
+      if (peak[g,8]>2.0*peak[g,1]) {
+        print "Phase-6 W8/W1 peak RSS exceeds 2.0 for " fixture[g] "/" method[g] "/K" topk[g] > "/dev/stderr"
+        bad=1
+      }
+    }
+    if (observed_pairs+0 != expected_pair_count+0) {
+      print "Phase-6 RSS evidence cardinality mismatch: expected " \
+            expected_pair_count ", observed " (observed_pairs+0) > "/dev/stderr"
+      bad=1
+    }
+    exit bad
+  }
+' "$phase6_admission_tsv" >"$phase6_rss_tsv"; then
+  echo "gate failure: Phase-6 W8/W1 peak RSS" >&2
+  gate_failures=$((gate_failures+1))
+fi
+
 if [[ -n "$run_manifest_group" ]]; then
   for row_id in "${selected_manifest_rows[@]}"; do
     actual_rows=$(awk -F '\t' -v id="$row_id" 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}$h["row_id"]==id{n++}END{print n+0}' "$raw_trials_tsv")
@@ -2713,7 +3335,8 @@ done
 awk -F '\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}$h["canonical_digest"]=="MISMATCH"{print "gate failure: canonical mismatch for "$h["fixture"]"/"$h["method"]"@"$h["requested_workers"] > "/dev/stderr";bad=1}END{exit bad}' "$summary_tsv" || gate_failures=$((gate_failures+1))
 awk -F '\t' '
   NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
-  $h["method"]!="sample_explore_merge" {g=$h["fixture"] SUBSEP $h["method"];
+  $h["method"]!="sample_explore_merge" && $h["status"]=="ok" &&
+      $h["validation_status"]=="ok" {g=$h["fixture"] SUBSEP $h["method"];
     semantic=$h["search_semantic_sha256"] SUBSEP $h["output_semantic_sha256"];
     if(!(g in digest))digest[g]=semantic;
     else if(digest[g]!=semantic){print "gate failure: 1-vs-N search/output semantic mismatch for "$h["fixture"]"/"$h["method"] > "/dev/stderr";bad=1}}
@@ -2728,6 +3351,9 @@ awk -F '\t' '
   echo "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"
   awk -F '\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n",$h["fixture"],$h["method"],$h["requested_workers"],$h["status"],$h["validation_status"],$h["wall_clock_s"],$h["wall_clock_max_s"],$h["peak_sampled_rss_max_kb"],$h["candidates_scored"],$h["exact_verifications"],$h["canonical_digest"]}' "$summary_tsv"
   echo; echo "Raw trials: $raw_trials_tsv"; echo "Aggregates: $summary_tsv"
+  echo "Phase-6 admission evidence: $phase6_admission_tsv"
+  echo "Phase-6 RSS comparisons: $phase6_rss_tsv"
+  echo "Phase-6 exact-verification speedup: $phase6_exact_speedup_tsv"
   echo "Paired ratios: $paired_ratios_tsv"
   echo "Worker-policy comparisons: $worker_policy_tsv"; echo "Commands: $commands_log"
 } >"$summary_md"

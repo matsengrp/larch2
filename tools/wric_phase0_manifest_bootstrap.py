@@ -283,6 +283,17 @@ DEFINING_REPORT_FIELDS = {
 }
 
 
+EXACT_CANDIDATE_ADMISSION_FIELDS = (
+    "exact_candidate_admission_batches",
+    "exact_candidate_parallel_batches",
+    "exact_candidate_inner_parallel_batches",
+    "exact_candidate_memory_limited_batches",
+    "exact_candidate_peak_admitted_bytes",
+    "exact_candidate_peak_projected_resident_bytes",
+    "exact_candidate_queued_for_memory_ms",
+)
+
+
 # These immutable inputs determine the three chart-report fields that the
 # strict manifest schema requires even when the timed row itself expires
 # before it can write a report.  Method, candidate shape, worker count, and
@@ -2702,6 +2713,7 @@ def validate_successful_raw_domains(
         "reachable_productions_traversed",
         "reachability_full_grammar_like_passes",
         "peak_concurrent_exact_verifiers",
+        *EXACT_CANDIDATE_ADMISSION_FIELDS[:-1],
         "exact_candidate_timing_count",
     )
     counts = {
@@ -2772,6 +2784,7 @@ def validate_successful_raw_domains(
         "materialization_exact_verification_ms",
         "materialization_accepted_update_ms",
         "materialization_final_compaction_ms",
+        EXACT_CANDIDATE_ADMISSION_FIELDS[-1],
         "total_ms",
     )
     timers = {
@@ -2829,6 +2842,9 @@ def validate_successful_raw_domains(
         "peak_concurrent_exact_verifiers": "peak_concurrent_exact_verifiers",
         "total_ms": "total_ms",
     }
+    raw_to_report.update(
+        {field: field for field in EXACT_CANDIDATE_ADMISSION_FIELDS}
+    )
     for raw_field, report_field in raw_to_report.items():
         if row.get(raw_field) != report_value(report, report_field):
             fail(
@@ -2944,6 +2960,7 @@ REPEATED_UNANIMOUS_RAW_FIELDS = (
     "overlay_materializations_for_exact_verification",
     "overlay_materializations_for_accept_materialization",
     "overlay_materializations_for_final_compaction",
+    *EXACT_CANDIDATE_ADMISSION_FIELDS[:-1],
     "grammar_clades",
     "grammar_productions",
     "active_patterns",
@@ -2975,6 +2992,7 @@ REPEATED_UNANIMOUS_REPORT_FIELDS = tuple(
             "chain_per_accept_exactness_label",
             "effective_pattern_batch_size",
             "exact_verifications",
+            *EXACT_CANDIDATE_ADMISSION_FIELDS[:-1],
             "final_compaction_exactness_kind",
             "final_score",
             "initial_grammar_clades",
@@ -3055,6 +3073,49 @@ def validate_chart_phase0_instrumentation(
         fail(
             "peak exact-verifier concurrency contradicts the verification "
             f"count: {key}: peak={peak}, exact={exact_verifications}"
+        )
+
+    admission = {
+        field: require_unsigned_text(row.get(field, ""), f"{key} {field}")
+        for field in EXACT_CANDIDATE_ADMISSION_FIELDS[:-1]
+    }
+    queued_for_memory = decimal_value(
+        row.get(EXACT_CANDIDATE_ADMISSION_FIELDS[-1], ""),
+        f"{key} {EXACT_CANDIDATE_ADMISSION_FIELDS[-1]}",
+    )
+    budget = require_unsigned_text(
+        row.get("configured_chart_memory_budget", ""),
+        f"{key} configured_chart_memory_budget",
+    )
+    batches = admission["exact_candidate_admission_batches"]
+    parallel = admission["exact_candidate_parallel_batches"]
+    inner = admission["exact_candidate_inner_parallel_batches"]
+    memory_limited = admission["exact_candidate_memory_limited_batches"]
+    admitted = admission["exact_candidate_peak_admitted_bytes"]
+    projected = admission["exact_candidate_peak_projected_resident_bytes"]
+    if (
+        parallel > batches
+        or inner > batches
+        or memory_limited > batches
+        or parallel + inner > batches
+    ):
+        fail(f"exact-candidate admission batch accounting is inconsistent: {key}")
+    if admitted > projected:
+        fail(f"exact-candidate admitted bytes exceed projected resident bytes: {key}")
+    if batches == 0 and any(
+        (parallel, inner, memory_limited, admitted, projected, queued_for_memory)
+    ):
+        fail(f"zero exact-candidate batches reported nonzero admission evidence: {key}")
+    if batches > 0 and (admitted == 0 or projected == 0):
+        fail(f"exact-candidate batches lack peak byte evidence: {key}")
+    if exact_verifications > 0 and batches == 0:
+        fail(f"exact verifications lack an admission batch: {key}")
+    if memory_limited == 0 and queued_for_memory != 0:
+        fail(f"unlimited exact-candidate batches report memory-queue time: {key}")
+    if budget != 0 and projected > budget:
+        fail(
+            "exact-candidate projected resident bytes exceed the configured "
+            f"memory budget: {key}: projected={projected}, budget={budget}"
         )
 
 
@@ -4084,6 +4145,16 @@ PLAN_FIELD_COVERAGE_ROWS = (
     ("resident_chart_bytes", "successful_chart_trial", "raw_tsv", "raw_trials.tsv", "chart_cache_resident_bytes", "recorded", "-", "-"),
     ("configured_memory_budget", "timed_chart_trial", "raw_tsv", "raw_trials.tsv", "configured_chart_memory_budget,manifest_rss_limit_bytes", "recorded", "-", "-"),
     ("peak_concurrent_exact_verifiers", "successful_chart_trial", "raw_tsv", "raw_trials.tsv", "peak_concurrent_exact_verifiers", "recorded", "-", "required Phase-0 instrumentation; no unavailable waiver"),
+    (
+        "exact_candidate_admission",
+        "successful_chart_trial",
+        "raw_tsv",
+        "raw_trials.tsv",
+        ",".join(EXACT_CANDIDATE_ADMISSION_FIELDS),
+        "recorded",
+        "-",
+        "required Phase-6 batch-axis, memory-admission, and queue-time instrumentation; no unavailable waiver",
+    ),
     ("candidate_generation_time", "successful_chart_trial", "raw_tsv", "raw_trials.tsv", "candidate_generation_ms", "recorded", "-", "-"),
     ("chart_plan_time", "successful_chart_trial", "unavailable", "-", "-", "explicitly_unavailable", "-", "Phase-0 product has no distinct chart-plan timer"),
     ("initial_chart_time", "successful_chart_trial", "raw_tsv", "raw_trials.tsv", "initial_chart_construction_ms", "recorded", "-", "required Phase-0 instrumentation; distinct from cache build"),
@@ -9943,13 +10014,43 @@ def self_test(_: argparse.Namespace) -> None:
         "materialization_final_compaction_ms": "3.000",
         "exact_verifications": "2",
         "peak_concurrent_exact_verifiers": "1",
+        "configured_chart_memory_budget": str(MEMORY_BUDGET_BYTES),
+        "exact_candidate_admission_batches": "1",
+        "exact_candidate_parallel_batches": "1",
+        "exact_candidate_inner_parallel_batches": "0",
+        "exact_candidate_memory_limited_batches": "0",
+        "exact_candidate_peak_admitted_bytes": "4096",
+        "exact_candidate_peak_projected_resident_bytes": "8192",
+        "exact_candidate_queued_for_memory_ms": "0.000",
     }
     validate_chart_phase0_instrumentation(valid_instrumentation, ("chart", "1"))
+    validate_chart_phase0_instrumentation(
+        valid_instrumentation
+        | {
+            "exact_candidate_admission_batches": "2",
+            "exact_candidate_memory_limited_batches": "1",
+            "exact_candidate_queued_for_memory_ms": "0.125",
+        },
+        ("chart", "1"),
+    )
     for mutation in (
         {"materialization_ms": "7.000"},
         {"initial_chart_construction_ms": "11.000"},
         {"peak_concurrent_exact_verifiers": "3"},
         {"exact_verifications": "0", "peak_concurrent_exact_verifiers": "1"},
+        {"exact_candidate_admission_batches": ""},
+        {"exact_candidate_parallel_batches": "2"},
+        {"exact_candidate_inner_parallel_batches": "1"},
+        {"exact_candidate_memory_limited_batches": "2"},
+        {"exact_candidate_peak_admitted_bytes": "8193"},
+        {"exact_candidate_admission_batches": "0"},
+        {"exact_candidate_queued_for_memory_ms": "0.001"},
+        {"exact_candidate_queued_for_memory_ms": "NaN"},
+        {
+            "exact_candidate_peak_projected_resident_bytes": str(
+                MEMORY_BUDGET_BYTES + 1
+            )
+        },
     ):
         try:
             validate_chart_phase0_instrumentation(
@@ -10324,6 +10425,13 @@ def self_test(_: argparse.Namespace) -> None:
             "reachable_productions_traversed": "8",
             "reachability_full_grammar_like_passes": "0",
             "peak_concurrent_exact_verifiers": "2",
+            "exact_candidate_admission_batches": "1",
+            "exact_candidate_parallel_batches": "1",
+            "exact_candidate_inner_parallel_batches": "0",
+            "exact_candidate_memory_limited_batches": "0",
+            "exact_candidate_peak_admitted_bytes": "4096",
+            "exact_candidate_peak_projected_resident_bytes": "8192",
+            "exact_candidate_queued_for_memory_ms": "0.000",
             "exact_candidate_timing_count": "2",
             "candidate_generation_ms": "1.000",
             "cache_build_ms": "2.000",
@@ -10410,6 +10518,13 @@ def self_test(_: argparse.Namespace) -> None:
             "materialization_accepted_update_ms": "0.200",
             "materialization_final_compaction_ms": "0.000",
             "peak_concurrent_exact_verifiers": "2",
+            "exact_candidate_admission_batches": "1",
+            "exact_candidate_parallel_batches": "1",
+            "exact_candidate_inner_parallel_batches": "0",
+            "exact_candidate_memory_limited_batches": "0",
+            "exact_candidate_peak_admitted_bytes": "4096",
+            "exact_candidate_peak_projected_resident_bytes": "8192",
+            "exact_candidate_queued_for_memory_ms": "0.000",
             "total_ms": "20.000",
         }
         counter_fields = {
@@ -10461,6 +10576,8 @@ def self_test(_: argparse.Namespace) -> None:
             {"worker_policy": "automatic"},
             {"candidates_generated": "1"},
             {"exact_candidate_verification_ms_min": "7.000"},
+            {"exact_candidate_parallel_batches": "0"},
+            {"exact_candidate_queued_for_memory_ms": ""},
             {"final_compaction_exactness_kind": "unknown"},
             {"active_patterns": "3"},
         ):

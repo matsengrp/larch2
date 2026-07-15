@@ -8,10 +8,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <future>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <print>
 #include <set>
@@ -19,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -31,6 +36,136 @@
   do { \
     if (!(expr)) test_fail(#expr, __FILE__, __LINE__); \
   } while (false)
+
+class phase6_exact_candidate_pair_rendezvous {
+ public:
+  void arrive_and_wait(std::size_t rank) {
+    if (rank >= 2) return;
+    std::unique_lock lock{mutex_};
+    ++arrivals_;
+    cv_.notify_all();
+    if (!cv_.wait_for(lock, std::chrono::seconds{5},
+                      [&] { return arrivals_ >= 2; })) {
+      throw std::runtime_error(
+          "phase-6 exact-candidate pair rendezvous timed out");
+    }
+  }
+
+  [[nodiscard]] std::size_t arrivals() const {
+    std::lock_guard lock{mutex_};
+    return arrivals_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::condition_variable cv_;
+  std::size_t arrivals_ = 0;
+};
+
+// The exact-candidate runner catches task failures into stable rank-indexed
+// slots. Hold every other rank in the hook while rank 1 fails, then keep rank
+// 0 parked until the scheduler confirms that rank 1's worker task completed.
+// This makes reverse completion order deterministic rather than timing-based.
+class phase6_reverse_rank_failure_rendezvous {
+ public:
+  explicit phase6_reverse_rank_failure_rendezvous(
+      larch::chart_scheduler& scheduler)
+      : scheduler_(&scheduler) {}
+
+  void fail_in_reverse_completion_order(std::size_t rank) {
+    auto const deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    {
+      std::unique_lock lock{mutex_};
+      if (!completion_floor_) {
+        completion_floor_ = scheduler_->metrics().tasks_completed;
+      }
+      ++invocations_;
+      if (rank < seen_rank_.size()) seen_rank_[rank] = true;
+
+      if (rank >= 2) {
+        cv_.notify_all();
+        if (!cv_.wait_until(lock, deadline,
+                            [&] { return release_other_ranks_; })) {
+          release_other_ranks_ = true;
+          cv_.notify_all();
+          throw std::runtime_error("phase-6 reverse-rank rendezvous timed out");
+        }
+        return;
+      }
+
+      seen_failure_rank_[rank] = true;
+      cv_.notify_all();
+      if (!cv_.wait_until(lock, deadline, [&] {
+            return seen_failure_rank_[0] && seen_failure_rank_[1];
+          })) {
+        release_other_ranks_ = true;
+        cv_.notify_all();
+        throw std::runtime_error("phase-6 reverse-rank rendezvous timed out");
+      }
+
+      if (rank == 1) {
+        failure_order_.push_back(1);
+        lock.unlock();
+        throw std::runtime_error("phase-6 exact candidate rank 1 failure");
+      }
+    }
+
+    // Ranks >= 2 cannot complete while waiting for release, so the first
+    // completed worker task above the hook-entry floor is necessarily rank 1.
+    while (scheduler_->metrics().tasks_completed <= *completion_floor_) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        std::lock_guard lock{mutex_};
+        release_other_ranks_ = true;
+        cv_.notify_all();
+        throw std::runtime_error(
+            "phase-6 reverse-rank completion wait timed out");
+      }
+      std::this_thread::yield();
+    }
+
+    {
+      std::lock_guard lock{mutex_};
+      rank_one_completed_before_rank_zero_failure_ = true;
+      failure_order_.push_back(0);
+      release_other_ranks_ = true;
+      cv_.notify_all();
+    }
+    throw std::runtime_error("phase-6 exact candidate rank 0 failure");
+  }
+
+  [[nodiscard]] std::size_t invocations() const {
+    std::lock_guard lock{mutex_};
+    return invocations_;
+  }
+
+  [[nodiscard]] bool saw_ranks_zero_through_three() const {
+    std::lock_guard lock{mutex_};
+    return std::ranges::all_of(seen_rank_, [](bool seen) { return seen; });
+  }
+
+  [[nodiscard]] bool rank_one_completed_before_rank_zero_failure() const {
+    std::lock_guard lock{mutex_};
+    return rank_one_completed_before_rank_zero_failure_;
+  }
+
+  [[nodiscard]] std::vector<std::size_t> failure_order() const {
+    std::lock_guard lock{mutex_};
+    return failure_order_;
+  }
+
+ private:
+  larch::chart_scheduler* scheduler_;
+  mutable std::mutex mutex_;
+  std::condition_variable cv_;
+  std::optional<std::uint64_t> completion_floor_;
+  std::array<bool, 4> seen_rank_{};
+  std::array<bool, 2> seen_failure_rank_{};
+  std::size_t invocations_ = 0;
+  bool release_other_ranks_ = false;
+  bool rank_one_completed_before_rank_zero_failure_ = false;
+  std::vector<std::size_t> failure_order_;
+};
 
 static larch::test::tiny_tree_node four_taxon_base_tree() {
   using larch::test::tiny_inner;
@@ -117,6 +252,13 @@ struct tiny_chart_spr_fixture {
   std::vector<larch::grammar_spr_candidate> candidates;
 };
 
+struct phase4_fixture {
+  larch::phylo_dag dag;
+  larch::clade_grammar grammar;
+};
+
+static phase4_fixture make_three_misplaced_groups_fixture();
+
 static tiny_chart_spr_fixture make_fixture() {
   tiny_chart_spr_fixture fixture;
   fixture.dag = larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
@@ -156,13 +298,14 @@ static larch::site_pattern_set make_phase4_wide_patterns(
   return patterns;
 }
 
-static std::array<larch::chart_spr_scheduler_axis_metrics const*, 9>
+static std::array<larch::chart_spr_scheduler_axis_metrics const*, 10>
 phase4_scheduler_axes(
     larch::chart_spr_scheduler_axis_counters const& counters) {
   return {
       &counters.initial_chart_patterns,
       &counters.exact_setup_patterns,
       &counters.exact_frontier_clades,
+      &counters.exact_candidates,
       &counters.inside_cache_patterns,
       &counters.outside_cache_patterns,
       &counters.fixed_topology_patterns,
@@ -1709,7 +1852,13 @@ static void test_pattern_batch_cache_options_match_all_cache() {
   CHECK(single_threw);
 
   larch::chart_spr_search_options memory_options;
-  memory_options.cache.memory_budget_bytes = 1;
+  // This case exercises the bounded local-score cache only.  The finite budget
+  // is exactly one conservative pattern entry: small enough to force replay,
+  // but large enough to satisfy the hard resident-cache contract.
+  memory_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::lower_bound_heuristic;
+  memory_options.cache.memory_budget_bytes =
+      larch::estimate_chart_spr_pattern_entry_cache_bytes(grammar);
   memory_options.cache.candidate_batch_size = 2;
   auto memory_state = larch::build_chart_spr_search_state(
       dag, grammar, memory_options);
@@ -3869,6 +4018,1095 @@ static void test_top_k_exact_verification_count_is_bounded() {
   std::println("  PASS");
 }
 
+static void test_phase6_top_k_four_uses_exact_candidate_axis_only() {
+  std::println("test_phase6_top_k_four_uses_exact_candidate_axis_only");
+
+  auto fixture = make_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 4;
+  options.enumeration.max_candidates = 0;
+  options.worker_count = 4;
+
+  auto state = larch::build_chart_spr_search_state(fixture.dag, fixture.grammar,
+                                                   options);
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  CHECK(scheduler.worker_resolution().resolved_workers == 4);
+  auto checked =
+      larch::check_chart_execution_plan(state.grammar, state.execution_plan);
+  (void)larch::ensure_chart_spr_state_exact_trim(state, checked, scheduler,
+                                                 options.exact_trim);
+
+  auto const candidate_before = state.counters.scheduler_axes.exact_candidates;
+  auto const exact_setup_before =
+      state.counters.scheduler_axes.exact_setup_patterns;
+  auto const exact_frontier_before =
+      state.counters.scheduler_axes.exact_frontier_clades;
+  auto const fixed_before =
+      state.counters.scheduler_axes.fixed_topology_patterns;
+
+  auto rendezvous = std::make_shared<phase6_exact_candidate_pair_rendezvous>();
+  options.before_exact_candidate_verification_for_tests =
+      [rendezvous](std::size_t rank) { rendezvous->arrive_and_wait(rank); };
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      workspace;
+  auto iteration = larch::run_chart_spr_acceptance_iteration(
+      state, options, 0, workspace, scheduler);
+
+  CHECK(iteration.locally_ranked_candidates_retained == 4);
+  CHECK(iteration.candidates_exact_verified == 4);
+  CHECK(rendezvous->arrivals() == 2);
+  auto const& candidate_after = state.counters.scheduler_axes.exact_candidates;
+  CHECK(candidate_after.operations == candidate_before.operations + 1);
+  CHECK(candidate_after.parallel_operations ==
+        candidate_before.parallel_operations + 1);
+  CHECK(candidate_after.items == candidate_before.items + 4);
+  CHECK(candidate_after.worker_tasks == candidate_before.worker_tasks + 4);
+  CHECK(candidate_after.active_worker_high_water >= 2);
+  CHECK(state.exact_verifier_concurrency->peak() >= 2);
+  CHECK(state.counters.exact_candidate_admission_batches == 1);
+  CHECK(state.counters.exact_candidate_parallel_batches == 1);
+  CHECK(state.counters.exact_candidate_inner_parallel_batches == 0);
+  CHECK(state.counters.exact_candidate_memory_limited_batches == 0);
+  CHECK(state.counters.exact_candidate_peak_admitted_bytes > 0);
+  CHECK(state.counters.exact_candidate_peak_projected_resident_bytes >=
+        state.counters.exact_candidate_peak_admitted_bytes);
+  CHECK(state.counters.exact_candidate_queued_for_memory_ms == 0.0);
+
+  // The outer candidate wave owns the scheduler. Candidate-local exact work
+  // must therefore stay serial and publish no nested inner-axis operation.
+  CHECK(state.counters.scheduler_axes.exact_setup_patterns ==
+        exact_setup_before);
+  CHECK(state.counters.scheduler_axes.exact_frontier_clades ==
+        exact_frontier_before);
+  CHECK(state.counters.scheduler_axes.fixed_topology_patterns == fixed_before);
+
+  scheduler.shutdown();
+  check_phase4_scheduler_axis_reconciliation(scheduler.metrics(),
+                                             state.counters.scheduler_axes);
+  std::println("  PASS");
+}
+
+static void test_phase6_top_k_one_preserves_inner_exact_parallelism() {
+  std::println("test_phase6_top_k_one_preserves_inner_exact_parallelism");
+
+  auto fixture = make_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 1;
+  options.enumeration.max_candidates = 0;
+  options.worker_count = 4;
+
+  auto state = larch::build_chart_spr_search_state(fixture.dag, fixture.grammar,
+                                                   options);
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  CHECK(scheduler.worker_resolution().resolved_workers == 4);
+  auto checked =
+      larch::check_chart_execution_plan(state.grammar, state.execution_plan);
+  (void)larch::ensure_chart_spr_state_exact_trim(state, checked, scheduler,
+                                                 options.exact_trim);
+
+  auto const candidate_before = state.counters.scheduler_axes.exact_candidates;
+  auto const exact_setup_operations_before =
+      state.counters.scheduler_axes.exact_setup_patterns.operations;
+  auto const exact_frontier_operations_before =
+      state.counters.scheduler_axes.exact_frontier_clades.operations;
+
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      workspace;
+  auto iteration = larch::run_chart_spr_acceptance_iteration(
+      state, options, 0, workspace, scheduler);
+
+  CHECK(iteration.locally_ranked_candidates_retained == 1);
+  CHECK(iteration.candidates_exact_verified == 1);
+  CHECK(state.counters.scheduler_axes.exact_candidates == candidate_before);
+  auto const inner_exact_operation_delta =
+      state.counters.scheduler_axes.exact_setup_patterns.operations -
+      exact_setup_operations_before +
+      state.counters.scheduler_axes.exact_frontier_clades.operations -
+      exact_frontier_operations_before;
+  CHECK(inner_exact_operation_delta > 0);
+  CHECK(state.counters.exact_candidate_admission_batches == 1);
+  CHECK(state.counters.exact_candidate_parallel_batches == 0);
+  CHECK(state.counters.exact_candidate_inner_parallel_batches == 1);
+  CHECK(state.counters.exact_candidate_memory_limited_batches == 0);
+  CHECK(state.counters.exact_candidate_peak_admitted_bytes > 0);
+  CHECK(state.counters.exact_candidate_peak_projected_resident_bytes >=
+        state.counters.exact_candidate_peak_admitted_bytes);
+  CHECK(state.counters.exact_candidate_queued_for_memory_ms == 0.0);
+  CHECK(state.exact_verifier_concurrency->peak() == 1);
+
+  scheduler.shutdown();
+  check_phase4_scheduler_axis_reconciliation(scheduler.metrics(),
+                                             state.counters.scheduler_axes);
+  std::println("  PASS");
+}
+
+static void test_phase6_exact_candidate_failures_choose_stable_rank_and_join() {
+  std::println(
+      "test_phase6_exact_candidate_failures_choose_stable_rank_and_join");
+
+  auto fixture = make_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 4;
+  options.enumeration.max_candidates = 0;
+  options.worker_count = 4;
+
+  auto state = larch::build_chart_spr_search_state(fixture.dag, fixture.grammar,
+                                                   options);
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  CHECK(scheduler.worker_resolution().resolved_workers == 4);
+  auto checked =
+      larch::check_chart_execution_plan(state.grammar, state.execution_plan);
+  (void)larch::ensure_chart_spr_state_exact_trim(state, checked, scheduler,
+                                                 options.exact_trim);
+
+  auto rendezvous =
+      std::make_shared<phase6_reverse_rank_failure_rendezvous>(scheduler);
+  options.before_exact_candidate_verification_for_tests =
+      [rendezvous](std::size_t rank) {
+        rendezvous->fail_in_reverse_completion_order(rank);
+      };
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      workspace;
+
+  bool lower_rank_failure_selected = false;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(state, options, 0,
+                                                    workspace, scheduler);
+  } catch (std::runtime_error const& error) {
+    lower_rank_failure_selected =
+        std::string{error.what()} == "phase-6 exact candidate rank 0 failure";
+  }
+  CHECK(lower_rank_failure_selected);
+  CHECK(rendezvous->invocations() == 4);
+  CHECK(rendezvous->saw_ranks_zero_through_three());
+  CHECK(rendezvous->rank_one_completed_before_rank_zero_failure());
+  CHECK((rendezvous->failure_order() == std::vector<std::size_t>{1, 0}));
+  CHECK(state.counters.scheduler_axes.exact_candidates.operations == 1);
+  CHECK(state.counters.scheduler_axes.exact_candidates.parallel_operations ==
+        1);
+  CHECK(state.counters.scheduler_axes.exact_candidates.worker_tasks == 4);
+  CHECK(
+      state.counters.scheduler_axes.exact_candidates.active_worker_high_water >=
+      2);
+  auto failed_metrics = scheduler.metrics();
+  CHECK(failed_metrics.tasks_submitted == failed_metrics.tasks_completed);
+  CHECK(failed_metrics.tasks_submitted == failed_metrics.tasks_joined);
+  CHECK(failed_metrics.pending_tasks == 0);
+
+  // The failed operation joined every launched task before selecting rank 0.
+  // Reusing the same workspace and pool must therefore be safe immediately.
+  options.before_exact_candidate_verification_for_tests = {};
+  auto const operations_before_reuse = scheduler.metrics().operations;
+  auto recovered = larch::run_chart_spr_acceptance_iteration(
+      state, options, 1, workspace, scheduler);
+  CHECK(recovered.locally_ranked_candidates_retained == 4);
+  CHECK(recovered.candidates_exact_verified == 4);
+  CHECK(scheduler.metrics().operations > operations_before_reuse);
+  CHECK(state.counters.scheduler_axes.exact_candidates.operations == 2);
+  CHECK(scheduler.metrics().rejected_concurrent_operations == 0);
+
+  scheduler.shutdown();
+  auto const recovered_metrics = scheduler.metrics();
+  CHECK(recovered_metrics.tasks_submitted == recovered_metrics.tasks_completed);
+  CHECK(recovered_metrics.tasks_submitted == recovered_metrics.tasks_joined);
+  CHECK(recovered_metrics.pending_tasks == 0);
+  CHECK(recovered_metrics.live_pool_threads == 0);
+  check_phase4_scheduler_axis_reconciliation(recovered_metrics,
+                                             state.counters.scheduler_axes);
+  std::println("  PASS");
+}
+
+static void test_phase6_exact_candidate_partial_submit_joins_and_reconciles() {
+  std::println(
+      "test_phase6_exact_candidate_partial_submit_joins_and_reconciles");
+
+  auto fixture = make_fixture();
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 4;
+  options.enumeration.max_candidates = 0;
+  options.worker_count = 4;
+
+  auto state = larch::build_chart_spr_search_state(fixture.dag, fixture.grammar,
+                                                   options);
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  CHECK(scheduler.worker_resolution().resolved_workers == 4);
+  auto checked =
+      larch::check_chart_execution_plan(state.grammar, state.execution_plan);
+  (void)larch::ensure_chart_spr_state_exact_trim(state, checked, scheduler,
+                                                 options.exact_trim);
+
+  auto hook_calls = std::make_shared<std::atomic<std::size_t>>(0);
+  options.force_exact_candidate_submit_failure_after_for_tests = 1;
+  options.before_exact_candidate_verification_for_tests =
+      [hook_calls](std::size_t rank) {
+        hook_calls->fetch_add(1, std::memory_order_relaxed);
+        if (rank == 0) {
+          throw std::runtime_error(
+              "phase-6 accepted runner rank failure must lose to submit");
+        }
+      };
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      workspace;
+  auto const metrics_before = scheduler.metrics();
+  auto const accepts_before = state.counters.candidate_accepts_attempted;
+
+  bool submission_failure_selected = false;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(
+        state, options, 0, workspace, scheduler);
+  } catch (larch::chart_scheduler_submit_error const&) {
+    submission_failure_selected = true;
+  }
+  CHECK(submission_failure_selected);
+  CHECK(hook_calls->load(std::memory_order_relaxed) == 1);
+  CHECK(state.counters.candidate_accepts_attempted == accepts_before);
+  auto const failed_metrics = scheduler.metrics();
+  auto const submitted_delta =
+      failed_metrics.tasks_submitted - metrics_before.tasks_submitted;
+  CHECK(submitted_delta >= 1);
+  CHECK(failed_metrics.tasks_completed - metrics_before.tasks_completed ==
+        submitted_delta);
+  CHECK(failed_metrics.tasks_joined - metrics_before.tasks_joined ==
+        submitted_delta);
+  CHECK(failed_metrics.pending_tasks == 0);
+  CHECK(state.counters.scheduler_axes.exact_candidates.operations == 1);
+  CHECK(state.counters.scheduler_axes.exact_candidates.parallel_operations ==
+        1);
+  CHECK(state.counters.scheduler_axes.exact_candidates.items == 4);
+  CHECK(state.counters.scheduler_axes.exact_candidates.ranges == 4);
+  CHECK(state.counters.scheduler_axes.exact_candidates.worker_tasks == 1);
+  CHECK(state.counters.exact_candidate_admission_batches == 1);
+  CHECK(state.counters.exact_candidate_parallel_batches == 1);
+
+  // The failed wave left no published result and no live runner. Clearing the
+  // test hooks must make the same state/workspace/pool immediately reusable.
+  options.force_exact_candidate_submit_failure_after_for_tests.reset();
+  options.before_exact_candidate_verification_for_tests = {};
+  auto recovered = larch::run_chart_spr_acceptance_iteration(
+      state, options, 1, workspace, scheduler);
+  CHECK(recovered.locally_ranked_candidates_retained == 4);
+  CHECK(recovered.candidates_exact_verified == 4);
+  CHECK(state.counters.scheduler_axes.exact_candidates.operations == 2);
+  CHECK(state.counters.exact_candidate_admission_batches == 2);
+  CHECK(scheduler.metrics().rejected_concurrent_operations == 0);
+
+  scheduler.shutdown();
+  auto const recovered_metrics = scheduler.metrics();
+  CHECK(recovered_metrics.tasks_submitted == recovered_metrics.tasks_completed);
+  CHECK(recovered_metrics.tasks_submitted == recovered_metrics.tasks_joined);
+  CHECK(recovered_metrics.pending_tasks == 0);
+  CHECK(recovered_metrics.live_pool_threads == 0);
+  check_phase4_scheduler_axis_reconciliation(recovered_metrics,
+                                             state.counters.scheduler_axes);
+  std::println("  PASS");
+}
+
+static void test_phase6_exact_candidate_admission_stable_prefixes() {
+  std::println("test_phase6_exact_candidate_admission_stable_prefixes");
+
+  using estimate = larch::chart_spr_exact_candidate_memory_estimate;
+  std::array<estimate, 4> worker_limited{
+      estimate{.serial_scratch_bytes = 10,
+               .inner_parallel_scratch_bytes = 100,
+               .retained_result_bytes = 2},
+      estimate{.serial_scratch_bytes = 20,
+               .inner_parallel_scratch_bytes = 200,
+               .retained_result_bytes = 3},
+      estimate{.serial_scratch_bytes = 31,
+               .inner_parallel_scratch_bytes = 310,
+               .retained_result_bytes = 4,
+               .safely_bounded = false},
+      estimate{.serial_scratch_bytes = 1,
+               .inner_parallel_scratch_bytes = 10,
+               .retained_result_bytes = 1},
+  };
+
+  // Unlimited mode preserves the historical worker-limited stable prefix and
+  // deliberately ignores the finite-budget safety sentinel.
+  auto unlimited = larch::plan_chart_spr_exact_candidate_admission_wave(
+      worker_limited, 1, 2, 0, false);
+  CHECK(unlimited.begin_rank == 1);
+  CHECK(unlimited.end_rank == 3);
+  CHECK(unlimited.admitted_bytes == 58);
+  CHECK(!unlimited.memory_limited);
+  CHECK(!unlimited.use_inner_parallelism);
+
+  std::array<estimate, 3> exact_two_fit{
+      estimate{.serial_scratch_bytes = 20,
+               .inner_parallel_scratch_bytes = 90,
+               .retained_result_bytes = 5},
+      estimate{.serial_scratch_bytes = 30,
+               .inner_parallel_scratch_bytes = 90,
+               .retained_result_bytes = 7},
+      estimate{.serial_scratch_bytes = 1,
+               .inner_parallel_scratch_bytes = 90,
+               .retained_result_bytes = 1},
+  };
+  auto parallel = larch::plan_chart_spr_exact_candidate_admission_wave(
+      exact_two_fit, 0, 4, 62, true);
+  CHECK(parallel.begin_rank == 0);
+  CHECK(parallel.end_rank == 2);
+  CHECK(parallel.admitted_bytes == 62);
+  CHECK(parallel.memory_limited);
+  CHECK(!parallel.use_inner_parallelism);
+
+  // Rank 1 blocks the stable prefix even though the smaller rank 2 would fit.
+  std::array<estimate, 3> no_skip{
+      estimate{.serial_scratch_bytes = 20,
+               .inner_parallel_scratch_bytes = 80,
+               .retained_result_bytes = 5},
+      estimate{.serial_scratch_bytes = 100,
+               .inner_parallel_scratch_bytes = 100},
+      estimate{.serial_scratch_bytes = 1, .inner_parallel_scratch_bytes = 1},
+  };
+  auto one_fit = larch::plan_chart_spr_exact_candidate_admission_wave(
+      no_skip, 0, 3, 25, true);
+  CHECK(one_fit.begin_rank == 0);
+  CHECK(one_fit.end_rank == 1);
+  CHECK(one_fit.admitted_bytes == 25);
+  CHECK(one_fit.memory_limited);
+  CHECK(!one_fit.use_inner_parallelism);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_exact_candidate_admission_singleton_policy() {
+  std::println("test_phase6_exact_candidate_admission_singleton_policy");
+
+  using estimate = larch::chart_spr_exact_candidate_memory_estimate;
+  std::array<estimate, 1> estimates{
+      estimate{.serial_scratch_bytes = 20,
+               .inner_parallel_scratch_bytes = 40,
+               .retained_result_bytes = 5},
+  };
+
+  auto inner = larch::plan_chart_spr_exact_candidate_admission_wave(
+      estimates, 0, 4, 45, true);
+  CHECK(inner.begin_rank == 0);
+  CHECK(inner.end_rank == 1);
+  CHECK(inner.admitted_bytes == 45);
+  CHECK(inner.use_inner_parallelism);
+
+  auto serial = larch::plan_chart_spr_exact_candidate_admission_wave(
+      estimates, 0, 4, 25, true);
+  CHECK(serial.begin_rank == 0);
+  CHECK(serial.end_rank == 1);
+  CHECK(serial.admitted_bytes == 25);
+  CHECK(!serial.use_inner_parallelism);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_exact_candidate_admission_budget_fail_closed() {
+  std::println("test_phase6_exact_candidate_admission_budget_fail_closed");
+
+  using estimate = larch::chart_spr_exact_candidate_memory_estimate;
+  std::array<estimate, 1> too_large{
+      estimate{.serial_scratch_bytes = 51,
+               .inner_parallel_scratch_bytes = 80,
+               .retained_result_bytes = 4},
+  };
+  bool saw_too_large = false;
+  try {
+    (void)larch::plan_chart_spr_exact_candidate_admission_wave(too_large, 0, 4,
+                                                               54, true);
+  } catch (larch::chart_spr_exact_candidate_budget_error const& error) {
+    saw_too_large = true;
+    CHECK(error.stable_rank() == 0);
+    CHECK(error.required_bytes() == 55);
+    CHECK(error.available_bytes() == 54);
+    CHECK(std::string_view{error.what()}.contains("stable rank 0"));
+  }
+  CHECK(saw_too_large);
+
+  std::array<estimate, 1> unsafe{
+      estimate{.serial_scratch_bytes = 1,
+               .inner_parallel_scratch_bytes = 2,
+               .retained_result_bytes = 1,
+               .safely_bounded = false},
+  };
+  auto unlimited = larch::plan_chart_spr_exact_candidate_admission_wave(
+      unsafe, 0, 4, 0, false);
+  CHECK(unlimited.end_rank == 1);
+  CHECK(unlimited.admitted_bytes == 3);
+  CHECK(unlimited.use_inner_parallelism);
+
+  bool unsafe_failed_closed = false;
+  try {
+    (void)larch::plan_chart_spr_exact_candidate_admission_wave(
+        unsafe, 0, 4, (std::numeric_limits<std::size_t>::max)(), true);
+  } catch (larch::chart_spr_exact_candidate_budget_error const& error) {
+    unsafe_failed_closed = true;
+    CHECK(error.stable_rank() == 0);
+    CHECK(error.required_bytes() == (std::numeric_limits<std::size_t>::max)());
+    CHECK(error.available_bytes() == (std::numeric_limits<std::size_t>::max)());
+  }
+  CHECK(unsafe_failed_closed);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_exact_candidate_admission_retained_carryover() {
+  std::println("test_phase6_exact_candidate_admission_retained_carryover");
+
+  using estimate = larch::chart_spr_exact_candidate_memory_estimate;
+  std::array<estimate, 3> estimates{
+      estimate{.serial_scratch_bytes = 20,
+               .inner_parallel_scratch_bytes = 100,
+               .retained_result_bytes = 10},
+      estimate{.serial_scratch_bytes = 20,
+               .inner_parallel_scratch_bytes = 100,
+               .retained_result_bytes = 10},
+      estimate{.serial_scratch_bytes = 35,
+               .inner_parallel_scratch_bytes = 35,
+               .retained_result_bytes = 5},
+  };
+  constexpr std::size_t candidate_budget = 60;
+  auto first = larch::plan_chart_spr_exact_candidate_admission_wave(
+      estimates, 0, 2, candidate_budget, true);
+  CHECK(first.end_rank == 2);
+  CHECK(first.admitted_bytes == candidate_budget);
+
+  // Task scratch is released after the joined wave. Only the two retained
+  // results reduce the next wave's available memory.
+  auto const carried_retained =
+      estimates[0].retained_result_bytes + estimates[1].retained_result_bytes;
+  CHECK(carried_retained == 20);
+  auto second = larch::plan_chart_spr_exact_candidate_admission_wave(
+      estimates, first.end_rank, 2, candidate_budget - carried_retained, true);
+  CHECK(second.begin_rank == 2);
+  CHECK(second.end_rank == 3);
+  CHECK(second.admitted_bytes == 40);
+  CHECK(second.use_inner_parallelism);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_exact_candidate_admission_arithmetic_guards() {
+  std::println("test_phase6_exact_candidate_admission_arithmetic_guards");
+
+  auto const maximum = (std::numeric_limits<std::size_t>::max)();
+  CHECK(larch::chart_spr_exact_candidate_saturating_bytes_add(maximum - 3, 4) ==
+        maximum);
+  CHECK(larch::chart_spr_exact_candidate_saturating_bytes_add(8, 9) == 17);
+
+  bool checked_overflow = false;
+  try {
+    (void)larch::chart_spr_exact_candidate_checked_bytes_add(
+        maximum, 1, "phase-6 admission test");
+  } catch (std::overflow_error const& error) {
+    checked_overflow = true;
+    CHECK(std::string_view{error.what()}.contains("phase-6 admission test"));
+  }
+  CHECK(checked_overflow);
+
+  using estimate = larch::chart_spr_exact_candidate_memory_estimate;
+  std::array<estimate, 2> estimates{
+      estimate{.serial_scratch_bytes = maximum - 5,
+               .inner_parallel_scratch_bytes = maximum - 5,
+               .retained_result_bytes = 3},
+      estimate{.serial_scratch_bytes = 10, .inner_parallel_scratch_bytes = 10},
+  };
+  auto unlimited = larch::plan_chart_spr_exact_candidate_admission_wave(
+      estimates, 0, 2, 0, false);
+  CHECK(unlimited.end_rank == 2);
+  CHECK(unlimited.admitted_bytes == maximum);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_exact_state_fails_before_unified_budget_overrun() {
+  std::println(
+      "test_phase6_exact_state_fails_before_unified_budget_overrun");
+
+  auto fixture = make_fixture();
+  auto active_build =
+      larch::make_active_search_patterns(fixture.patterns, larch::chart_options{});
+  auto const active_pattern_count =
+      active_build.active_patterns.patterns.patterns.size();
+  auto const resident_cache_only_budget =
+      larch::estimate_chart_spr_pattern_batch_cache_bytes(
+          fixture.grammar, active_pattern_count);
+  CHECK(resident_cache_only_budget > 1);
+
+  larch::chart_cache_options cache;
+  cache.memory_budget_bytes = resident_cache_only_budget;
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  bool rejected = false;
+  try {
+    (void)larch::build_chart_spr_search_state_from_active(
+        fixture.dag, fixture.grammar, std::move(active_build),
+        larch::chart_options{}, /*build_exact_trim=*/true,
+        larch::multisite_trim_options{}, cache, {}, &scheduler);
+  } catch (larch::chart_spr_exact_state_budget_error const& error) {
+    rejected = true;
+    CHECK(error.budget_bytes() == resident_cache_only_budget);
+    CHECK(error.required_bytes() > error.budget_bytes());
+    CHECK(std::string{error.what()}.find("exact-state admission") !=
+          std::string::npos);
+  }
+  CHECK(rejected);
+  scheduler.shutdown();
+  auto const metrics = scheduler.metrics();
+  // The finite budget can hold the selected resident cache but not the exact
+  // setup.  Rejection must precede even the first scheduled chart allocation.
+  CHECK(metrics.operations == 0);
+  CHECK(metrics.tasks_submitted == 0);
+  CHECK(metrics.tasks_completed == 0);
+  CHECK(metrics.tasks_joined == 0);
+  CHECK(metrics.pending_tasks == 0);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_finite_budget_splits_exact_candidate_wave() {
+  std::println("test_phase6_finite_budget_splits_exact_candidate_wave");
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 16;
+  options.max_iterations = 1;
+  options.worker_count = 16;
+  options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
+
+  auto unlimited_fixture = make_three_misplaced_groups_fixture();
+  auto unlimited = larch::run_chart_spr_search(
+      std::move(unlimited_fixture.dag), unlimited_fixture.grammar, options);
+  CHECK(unlimited.iterations.size() == 1);
+  CHECK(unlimited.iterations.front().locally_ranked_candidates_retained == 16);
+  CHECK(unlimited.iterations.front().candidates_exact_verified == 16);
+  CHECK(unlimited.summary.exact_candidate_admission_batches == 1);
+  CHECK(unlimited.summary.exact_candidate_memory_limited_batches == 0);
+  CHECK(unlimited.summary.exact_candidate_peak_admitted_bytes > 0);
+  CHECK(unlimited.summary.exact_candidate_peak_projected_resident_bytes >
+        unlimited.summary.exact_candidate_peak_admitted_bytes);
+  CHECK(unlimited.canonical_digest.has_value());
+  CHECK(!unlimited.canonical_digest->full_sidecar.empty());
+
+  auto const finite_budget =
+      unlimited.summary.exact_candidate_peak_projected_resident_bytes - 1;
+  CHECK(finite_budget > 0);
+  auto finite_options = options;
+  finite_options.cache.memory_budget_bytes = finite_budget;
+  auto hook_count = std::make_shared<std::atomic<std::size_t>>(0);
+  finite_options.before_exact_candidate_verification_for_tests =
+      [hook_count](std::size_t) {
+        hook_count->fetch_add(1, std::memory_order_relaxed);
+      };
+
+  auto finite_fixture = make_three_misplaced_groups_fixture();
+  auto finite = larch::run_chart_spr_search(
+      std::move(finite_fixture.dag), finite_fixture.grammar, finite_options);
+  CHECK(finite.iterations.size() == 1);
+  CHECK(finite.iterations.front().locally_ranked_candidates_retained == 16);
+  CHECK(finite.iterations.front().candidates_exact_verified == 16);
+  CHECK(finite.iterations.front().exact_candidate_verification_ms.size() == 16);
+  CHECK(hook_count->load(std::memory_order_relaxed) == 16);
+
+  CHECK(finite.summary.exact_candidate_admission_batches > 1);
+  CHECK(finite.summary.exact_candidate_admission_batches >
+        unlimited.summary.exact_candidate_admission_batches);
+  CHECK(finite.summary.exact_candidate_parallel_batches >= 1);
+  CHECK(finite.summary.exact_candidate_memory_limited_batches >= 1);
+  CHECK(finite.summary.exact_candidate_queued_for_memory_ms > 0.0);
+  CHECK(finite.summary.exact_candidate_peak_admitted_bytes > 0);
+  CHECK(finite.summary.exact_candidate_peak_admitted_bytes <
+        unlimited.summary.exact_candidate_peak_admitted_bytes);
+  CHECK(finite.summary.exact_candidate_peak_projected_resident_bytes <=
+        finite_budget);
+  CHECK(finite.summary.exact_candidate_timing_count == 16);
+
+  CHECK(finite.summary.exact_candidate_admission_batches ==
+        finite.counters.exact_candidate_admission_batches);
+  CHECK(finite.summary.exact_candidate_parallel_batches ==
+        finite.counters.exact_candidate_parallel_batches);
+  CHECK(finite.summary.exact_candidate_inner_parallel_batches ==
+        finite.counters.exact_candidate_inner_parallel_batches);
+  CHECK(finite.summary.exact_candidate_memory_limited_batches ==
+        finite.counters.exact_candidate_memory_limited_batches);
+  CHECK(finite.summary.exact_candidate_peak_admitted_bytes ==
+        finite.counters.exact_candidate_peak_admitted_bytes);
+  CHECK(finite.summary.exact_candidate_peak_projected_resident_bytes ==
+        finite.counters.exact_candidate_peak_projected_resident_bytes);
+  CHECK(finite.summary.exact_candidate_queued_for_memory_ms ==
+        finite.counters.exact_candidate_queued_for_memory_ms);
+
+  CHECK(finite.canonical_digest.has_value());
+  CHECK(larch::emit_chart_spr_semantic_digest_json(
+            *finite.canonical_digest) ==
+        larch::emit_chart_spr_semantic_digest_json(
+            *unlimited.canonical_digest));
+  CHECK(finite.canonical_digest->full_sidecar ==
+        unlimited.canonical_digest->full_sidecar);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_finite_budget_rejects_before_verifier_hook() {
+  std::println("test_phase6_finite_budget_rejects_before_verifier_hook");
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 1;
+  options.worker_count = 4;
+
+  // Calibrate the coordinator-resident base from an otherwise identical
+  // unlimited TopK-1 operation. Its single admitted amount is exactly the
+  // candidate's inner-parallel scratch plus retained result.
+  auto probe_fixture = make_fixture();
+  auto probe_state = larch::build_chart_spr_search_state(
+      probe_fixture.dag, probe_fixture.grammar, options);
+  larch::chart_scheduler probe_scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  CHECK(probe_scheduler.worker_resolution().resolved_workers == 4);
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      probe_workspace;
+  auto probe = larch::run_chart_spr_acceptance_iteration(
+      probe_state, options, 0, probe_workspace, probe_scheduler);
+  CHECK(probe.locally_ranked_candidates_retained == 1);
+  CHECK(probe.candidates_exact_verified == 1);
+  CHECK(probe_state.counters.exact_candidate_peak_admitted_bytes > 0);
+  CHECK(probe_state.counters.exact_candidate_peak_projected_resident_bytes >
+        probe_state.counters.exact_candidate_peak_admitted_bytes);
+  auto const resident_base =
+      probe_state.counters.exact_candidate_peak_projected_resident_bytes -
+      probe_state.counters.exact_candidate_peak_admitted_bytes;
+  CHECK(resident_base > 0);
+  probe_scheduler.shutdown();
+  check_phase4_scheduler_axis_reconciliation(
+      probe_scheduler.metrics(), probe_state.counters.scheduler_axes);
+
+  // Build the fresh state under the unlimited cache policy, then constrain
+  // only this iteration to the calibrated resident base. This isolates the
+  // exact-candidate admission boundary from earlier cache-build preflights.
+  auto fixture = make_fixture();
+  auto state = larch::build_chart_spr_search_state(fixture.dag, fixture.grammar,
+                                                   options);
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  CHECK(scheduler.worker_resolution().resolved_workers == 4);
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      workspace;
+
+  auto finite_options = options;
+  finite_options.cache.memory_budget_bytes = resident_base;
+  auto hook_count = std::make_shared<std::atomic<std::size_t>>(0);
+  finite_options.before_exact_candidate_verification_for_tests =
+      [hook_count](std::size_t) {
+        hook_count->fetch_add(1, std::memory_order_relaxed);
+      };
+  auto const exact_verifications_before = state.counters.exact_verifications;
+  auto const admission_batches_before =
+      state.counters.exact_candidate_admission_batches;
+  auto const peak_admitted_before =
+      state.counters.exact_candidate_peak_admitted_bytes;
+  auto const peak_projected_before =
+      state.counters.exact_candidate_peak_projected_resident_bytes;
+
+  bool rejected = false;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(
+        state, finite_options, 0, workspace, scheduler);
+  } catch (larch::chart_spr_exact_candidate_budget_error const& error) {
+    rejected = true;
+    CHECK(error.stable_rank() == 0);
+    CHECK(error.required_bytes() > 0);
+    CHECK(error.available_bytes() == 0);
+  }
+  CHECK(rejected);
+  CHECK(hook_count->load(std::memory_order_relaxed) == 0);
+  CHECK(state.exact_verifier_concurrency->peak() == 0);
+  CHECK(state.counters.exact_verifications == exact_verifications_before);
+  CHECK(state.counters.exact_candidate_admission_batches ==
+        admission_batches_before);
+  CHECK(state.counters.exact_candidate_peak_admitted_bytes ==
+        peak_admitted_before);
+  CHECK(state.counters.exact_candidate_peak_projected_resident_bytes ==
+        peak_projected_before);
+
+  // Pre-admission failure must leave the same workspace, state, and scheduler
+  // immediately reusable once the explicit limit is removed.
+  finite_options.cache.memory_budget_bytes = 0;
+  auto recovered = larch::run_chart_spr_acceptance_iteration(
+      state, finite_options, 1, workspace, scheduler);
+  CHECK(recovered.locally_ranked_candidates_retained == 1);
+  CHECK(recovered.candidates_exact_verified == 1);
+  CHECK(hook_count->load(std::memory_order_relaxed) == 1);
+  CHECK(state.counters.exact_verifications == exact_verifications_before + 1);
+  CHECK(state.counters.exact_candidate_admission_batches ==
+        admission_batches_before + 1);
+  CHECK(state.counters.exact_candidate_peak_admitted_bytes > 0);
+  CHECK(state.counters.exact_candidate_peak_projected_resident_bytes > 0);
+
+  scheduler.shutdown();
+  auto const metrics = scheduler.metrics();
+  CHECK(metrics.tasks_submitted == metrics.tasks_completed);
+  CHECK(metrics.tasks_submitted == metrics.tasks_joined);
+  CHECK(metrics.pending_tasks == 0);
+  CHECK(metrics.live_pool_threads == 0);
+  check_phase4_scheduler_axis_reconciliation(
+      metrics, state.counters.scheduler_axes);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_fixed_tightened_budget_rejects_before_generation() {
+  std::println(
+      "test_phase6_fixed_tightened_budget_rejects_before_generation");
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 1;
+  options.worker_count = 4;
+
+  auto fixture = make_fixture();
+  auto state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, options);
+  CHECK(state.resident_pattern_cache_bytes > 1);
+  auto finite_options = options;
+  finite_options.cache.memory_budget_bytes =
+      state.resident_pattern_cache_bytes - 1;
+
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      workspace;
+  auto const generated_before =
+      state.counters.candidates_generated_after_dedup;
+  auto const operations_before = scheduler.metrics().operations;
+  bool rejected = false;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(
+        state, finite_options, 0, workspace, scheduler);
+  } catch (larch::chart_spr_exact_state_budget_error const& error) {
+    rejected = true;
+    CHECK(error.required_bytes() == state.resident_pattern_cache_bytes);
+    CHECK(error.budget_bytes() ==
+          state.resident_pattern_cache_bytes - 1);
+  }
+  CHECK(rejected);
+  CHECK(state.counters.candidates_generated_after_dedup == generated_before);
+  CHECK(state.counters.exact_candidate_admission_batches == 0);
+  CHECK(workspace.candidate_slots.capacity() == 0);
+  CHECK(workspace.candidate_copy_scratch.capacity() == 0);
+  CHECK(workspace.local_results.capacity() == 0);
+  CHECK(scheduler.metrics().operations == operations_before);
+
+  finite_options.cache.memory_budget_bytes = 0;
+  auto recovered = larch::run_chart_spr_acceptance_iteration(
+      state, finite_options, 1, workspace, scheduler);
+  CHECK(recovered.locally_ranked_candidates_retained == 1);
+  CHECK(recovered.candidates_exact_verified == 1);
+  CHECK(state.counters.exact_candidate_admission_batches == 1);
+  scheduler.shutdown();
+  check_phase4_scheduler_axis_reconciliation(
+      scheduler.metrics(), state.counters.scheduler_axes);
+
+  std::println("  PASS");
+}
+
+static void test_phase6_custom_exact_contracts_fail_closed_and_serialize() {
+  std::println(
+      "test_phase6_custom_exact_contracts_fail_closed_and_serialize");
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 4;
+  options.worker_count = 4;
+  options.cache.memory_budget_bytes = std::size_t{1} << 40;
+
+  auto missing_fixture = make_fixture();
+  auto missing_state = larch::build_chart_spr_search_state(
+      missing_fixture.dag, missing_fixture.grammar, options);
+  auto missing_calls = std::make_shared<std::atomic<std::size_t>>(0);
+  missing_state.contextual_exact_multisite_verifier =
+      [missing_calls](larch::chart_spr_search_state const& verifier_state,
+                      larch::chart_spr_candidate_score candidate,
+                      larch::checked_chart_execution_plan_ref const& checked,
+                      larch::chart_spr_exact_verification_context& context,
+                      larch::multisite_trim_options const& trim_options) {
+        missing_calls->fetch_add(1, std::memory_order_relaxed);
+        return larch::verify_candidate_exact_against_state_impl(
+            verifier_state, std::move(candidate), checked, context,
+            trim_options);
+      };
+  missing_state.exact_multisite_verifier_parallel_safe = true;
+  larch::chart_scheduler missing_scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      missing_workspace;
+  bool missing_estimator_rejected = false;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(
+        missing_state, options, 0, missing_workspace, missing_scheduler);
+  } catch (larch::chart_spr_exact_candidate_budget_error const&) {
+    missing_estimator_rejected = true;
+  }
+  CHECK(missing_estimator_rejected);
+  CHECK(missing_calls->load(std::memory_order_relaxed) == 0);
+
+  // Cold mode is an explicit generic-verifier choice. An installed transient
+  // hook must neither be called nor require its provider-specific estimator.
+  auto cold_options = options;
+  cold_options.verification_mode = larch::chart_spr_verification_mode::cold;
+  auto cold = larch::run_chart_spr_acceptance_iteration(
+      missing_state, cold_options, 1, missing_workspace, missing_scheduler);
+  CHECK(cold.candidates_exact_verified == 4);
+  CHECK(missing_calls->load(std::memory_order_relaxed) == 0);
+  missing_scheduler.shutdown();
+  check_phase4_scheduler_axis_reconciliation(
+      missing_scheduler.metrics(), missing_state.counters.scheduler_axes);
+
+  auto serialized_fixture = make_fixture();
+  auto serialized_state = larch::build_chart_spr_search_state(
+      serialized_fixture.dag, serialized_fixture.grammar, options);
+  auto serialized_calls = std::make_shared<std::atomic<std::size_t>>(0);
+  // Exercise the source-compatible pre-Phase-6 callback signature. The
+  // coordinator must keep it singleton and supply the admitted inner
+  // scheduler exactly as the historical API did.
+  serialized_state.exact_multisite_verifier =
+      [serialized_calls](
+          larch::chart_spr_search_state const& verifier_state,
+          larch::chart_spr_candidate_score candidate,
+          larch::checked_chart_execution_plan_ref const& checked,
+          larch::chart_scheduler& callback_scheduler,
+          larch::multisite_trim_options const& trim_options) {
+        serialized_calls->fetch_add(1, std::memory_order_relaxed);
+        return larch::verify_candidate_exact_against_state(
+            verifier_state, std::move(candidate), checked,
+            callback_scheduler, trim_options);
+      };
+  serialized_state.exact_multisite_transient_memory_estimator =
+      [](larch::grammar_spr_candidate const&) { return 0; };
+  serialized_state.exact_multisite_transient_retained_memory_estimator =
+      [](larch::grammar_spr_candidate const&) { return 0; };
+  // Leave parallel_safe false: legacy/custom callbacks retain serial
+  // candidate invocation while each singleton may use the inner scheduler.
+  larch::chart_scheduler serialized_scheduler{
+      larch::chart_scheduler_options{
+          .requested_workers = 4,
+          .default_minimum_grain = 1,
+          .default_target_ranges_per_worker = 4,
+      }};
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      serialized_workspace;
+  auto serialized = larch::run_chart_spr_acceptance_iteration(
+      serialized_state, options, 0, serialized_workspace,
+      serialized_scheduler);
+  CHECK(serialized.candidates_exact_verified == 4);
+  CHECK(serialized_calls->load(std::memory_order_relaxed) == 4);
+  CHECK(serialized_state.exact_verifier_concurrency->peak() == 1);
+  CHECK(serialized_state.counters.scheduler_axes.exact_candidates.operations ==
+        0);
+  CHECK(serialized_state.counters.exact_candidate_admission_batches == 4);
+  CHECK(serialized_state.counters.exact_candidate_parallel_batches == 0);
+  CHECK(serialized_state.counters.exact_candidate_inner_parallel_batches ==
+        4);
+  serialized_scheduler.shutdown();
+  check_phase4_scheduler_axis_reconciliation(
+      serialized_scheduler.metrics(),
+      serialized_state.counters.scheduler_axes);
+
+  auto provider_fixture = make_fixture();
+  auto provider_state = larch::build_chart_spr_search_state(
+      provider_fixture.dag, provider_fixture.grammar);
+  provider_state.cache_opts.memory_budget_bytes = std::size_t{1} << 40;
+  auto provider_calls = std::make_shared<std::atomic<std::size_t>>(0);
+  provider_state.exact_setup_provider =
+      [provider_calls](larch::chart_spr_search_state const&,
+                       larch::checked_chart_execution_plan_ref const&)
+      -> larch::multisite_exact_setup {
+    provider_calls->fetch_add(1, std::memory_order_relaxed);
+    throw std::runtime_error("custom exact setup must not run in estimator");
+  };
+  auto unbounded_setup = larch::estimate_chart_spr_state_exact_memory(
+      provider_state, {}, 4, std::size_t{1} << 40);
+  CHECK(!unbounded_setup.safely_bounded);
+  larch::chart_scheduler provider_scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  auto provider_checked = larch::check_chart_execution_plan(
+      provider_state.grammar, provider_state.execution_plan);
+  bool provider_preflight_rejected = false;
+  try {
+    (void)larch::ensure_chart_spr_state_exact_trim(
+        provider_state, provider_checked, provider_scheduler, {});
+  } catch (larch::chart_spr_exact_state_budget_error const&) {
+    provider_preflight_rejected = true;
+  }
+  CHECK(provider_preflight_rejected);
+  CHECK(provider_calls->load(std::memory_order_relaxed) == 0);
+  provider_scheduler.shutdown();
+  provider_state.exact_setup_provider_additional_memory_estimator =
+      [](larch::multisite_trim_options const&, std::size_t) { return 0; };
+  auto bounded_setup = larch::estimate_chart_spr_state_exact_memory(
+      provider_state, {}, 4, std::size_t{1} << 40);
+  CHECK(bounded_setup.safely_bounded);
+
+  auto retained_fixture = make_fixture();
+  auto retained_state = larch::build_chart_spr_search_state(
+      retained_fixture.dag, retained_fixture.grammar, options);
+  retained_state.contextual_exact_multisite_verifier =
+      [](larch::chart_spr_search_state const& verifier_state,
+         larch::chart_spr_candidate_score candidate,
+         larch::checked_chart_execution_plan_ref const& checked,
+         larch::chart_spr_exact_verification_context& context,
+         larch::multisite_trim_options const& trim_options) {
+        return larch::verify_candidate_exact_against_state_impl(
+            verifier_state, std::move(candidate), checked, context,
+            trim_options);
+      };
+  retained_state.exact_multisite_transient_memory_estimator =
+      [](larch::grammar_spr_candidate const&) { return 0; };
+  auto retained_candidate = larch::score_candidate_locally(
+      retained_state, retained_fixture.candidates.front());
+  auto missing_retained = larch::estimate_chart_spr_exact_candidate_memory(
+      retained_state, retained_candidate, options, 4);
+  CHECK(!missing_retained.safely_bounded);
+  retained_state.exact_multisite_transient_retained_memory_estimator =
+      [](larch::grammar_spr_candidate const&) { return 4096; };
+  auto bounded_retained = larch::estimate_chart_spr_exact_candidate_memory(
+      retained_state, retained_candidate, options, 4);
+  CHECK(bounded_retained.safely_bounded);
+  // One provider result remains in `verified` while an improving winner is
+  // copied into result.accepted, so admission must carry two owning copies.
+  CHECK(bounded_retained.retained_result_bytes >= 2 * 4096);
+
+  auto fixed_contract_fixture = make_fixture();
+  auto fixed_contract_state = larch::build_chart_spr_search_state(
+      fixed_contract_fixture.dag, fixed_contract_fixture.grammar);
+  fixed_contract_state.fixed_topology_exact_verifier =
+      [](larch::chart_spr_search_state const&,
+         larch::chart_spr_candidate_score candidate) {
+        return candidate;
+      };
+  fixed_contract_state.fixed_topology_exact_additional_memory_estimator =
+      [](larch::grammar_spr_candidate const&) { return 0; };
+  auto fixed_options = options;
+  fixed_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  auto fixed_candidate = larch::score_candidate_locally(
+      fixed_contract_state, fixed_contract_fixture.candidates.front());
+  auto fixed_missing_retained =
+      larch::estimate_chart_spr_exact_candidate_memory(
+          fixed_contract_state, fixed_candidate, fixed_options, 4);
+  CHECK(!fixed_missing_retained.safely_bounded);
+  fixed_contract_state
+      .fixed_topology_exact_additional_retained_memory_estimator =
+      [](larch::grammar_spr_candidate const&) { return 0; };
+  auto fixed_bounded = larch::estimate_chart_spr_exact_candidate_memory(
+      fixed_contract_state, fixed_candidate, fixed_options, 4);
+  CHECK(fixed_bounded.safely_bounded);
+
+  auto selector_fixture = make_fixture();
+  larch::chart_spr_search_options selector_options;
+  selector_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  selector_options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  selector_options.top_k_exact_verify = 1;
+  selector_options.worker_count = 4;
+  selector_options.cache.memory_budget_bytes = std::size_t{1} << 40;
+  auto selector_calls = std::make_shared<std::atomic<std::size_t>>(0);
+  selector_options.topology_selection_provider =
+      [selector_calls](larch::chart_spr_search_state const& selector_state,
+                       larch::grammar_spr_candidate const& candidate)
+      -> std::optional<larch::chart_spr_topology_selection> {
+    selector_calls->fetch_add(1, std::memory_order_relaxed);
+    return larch::make_chart_spr_builtin_fixed_topology_selection(
+        selector_state.grammar, candidate);
+  };
+  auto selector_state = larch::build_chart_spr_search_state(
+      selector_fixture.dag, selector_fixture.grammar, selector_options);
+  larch::chart_scheduler selector_scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      selector_workspace;
+  bool selector_rejected = false;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(
+        selector_state, selector_options, 0, selector_workspace,
+        selector_scheduler);
+  } catch (larch::chart_spr_exact_candidate_budget_error const&) {
+    selector_rejected = true;
+  }
+  CHECK(selector_rejected);
+  CHECK(selector_calls->load(std::memory_order_relaxed) == 0);
+  selector_options.topology_selection_additional_memory_estimator =
+      [](larch::chart_spr_search_state const&,
+         larch::grammar_spr_candidate const&) {
+        return larch::chart_spr_topology_selection_memory_estimate{};
+      };
+  auto selector_result = larch::run_chart_spr_acceptance_iteration(
+      selector_state, selector_options, 1, selector_workspace,
+      selector_scheduler);
+  CHECK(selector_result.candidates_exact_verified == 1);
+  CHECK(selector_calls->load(std::memory_order_relaxed) == 1);
+  selector_scheduler.shutdown();
+  check_phase4_scheduler_axis_reconciliation(
+      selector_scheduler.metrics(), selector_state.counters.scheduler_axes);
+
+  std::println("  PASS");
+}
+
 static void test_lower_bound_heuristic_acceptance_is_explicit() {
   std::println("test_lower_bound_heuristic_acceptance_is_explicit");
 
@@ -5963,11 +7201,6 @@ static void test_exhaustive_exact_acceptance_matches_oracle() {
 // do.  The merged DAG carries enough base productions that several sequential
 // SPR moves can tombstone only frozen-base productions and remain committable
 // under the Phase 4 tombstone-scope gate.
-struct phase4_fixture {
-  larch::phylo_dag dag;
-  larch::clade_grammar grammar;
-};
-
 // A single suboptimal tree over 12 taxa carrying THREE independent misplaced
 // cherry-pairs in DISJOINT subtrees (groups {A,B,C,D}, {E,F,G,H}, {I,J,K,L}),
 // each flagged by its own site.  The grammar optimum (the tree itself) is
@@ -6012,6 +7245,386 @@ static phase4_fixture make_three_misplaced_groups_fixture() {
   f.dag = make_three_misplaced_groups_tree();
   f.grammar = larch::build_clade_grammar(f.dag);
   return f;
+}
+
+enum class phase6_semantic_matrix_case {
+  dense_cold_ua_two_pass,
+  lazy_transient_exact,
+  pattern_batch_fixed_exact,
+};
+
+static std::string_view phase6_semantic_matrix_case_name(
+    phase6_semantic_matrix_case matrix_case) {
+  switch (matrix_case) {
+    case phase6_semantic_matrix_case::dense_cold_ua_two_pass:
+      return "dense-cold-ua-two-pass-conservative";
+    case phase6_semantic_matrix_case::lazy_transient_exact:
+      return "forced-lazy-transient-exact-local";
+    case phase6_semantic_matrix_case::pattern_batch_fixed_exact:
+      return "pattern-batch-fixed-exact-local";
+  }
+  return "unknown";
+}
+
+static larch::chart_spr_search_options phase6_semantic_matrix_options(
+    phase6_semantic_matrix_case matrix_case, std::size_t top_k,
+    std::size_t workers) {
+  larch::chart_spr_search_options options;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = top_k;
+  options.max_iterations = 1;
+  options.worker_count = workers;
+  options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
+  // Thirty-two post-dedup candidates exercise the largest requested rank
+  // buffer and include a strict improvement even with UA-edge scoring.  The
+  // first improving candidate in this fixture is outside the first sixteen in
+  // the canonical stream, so a 16-candidate cap would make the winner checks
+  // below vacuous for that semantic axis.
+  options.enumeration.max_candidates = 32;
+  options.enumeration.max_candidates_is_post_dedup = true;
+  options.cache.candidate_batch_size = 16;
+
+  switch (matrix_case) {
+    case phase6_semantic_matrix_case::dense_cold_ua_two_pass:
+      options.acceptance_mode =
+          larch::chart_spr_acceptance_mode::exact_multisite;
+      options.rebuild_after_accept = true;
+      options.verification_mode = larch::chart_spr_verification_mode::cold;
+      options.chart.score_ua_edge = true;
+      options.exact_trim.dominance_mode =
+          larch::multisite_dominance_mode::two_pass_exact_mask;
+      break;
+    case phase6_semantic_matrix_case::lazy_transient_exact:
+      options.acceptance_mode =
+          larch::chart_spr_acceptance_mode::exact_multisite;
+      options.rebuild_after_accept = false;
+      options.verification_mode =
+          larch::chart_spr_verification_mode::transient;
+      options.cache.use_lazy_multisite_chart = true;
+      break;
+    case phase6_semantic_matrix_case::pattern_batch_fixed_exact:
+      options.acceptance_mode =
+          larch::chart_spr_acceptance_mode::fixed_topology_exact;
+      options.rebuild_after_accept = false;
+      options.cache.max_cached_patterns = 1;
+      break;
+  }
+  return options;
+}
+
+static larch::chart_spr_search_result run_phase6_semantic_matrix_case(
+    phase6_semantic_matrix_case matrix_case, std::size_t top_k,
+    std::size_t workers) {
+  auto fixture = make_three_misplaced_groups_fixture();
+  auto options =
+      phase6_semantic_matrix_options(matrix_case, top_k, workers);
+  std::shared_ptr<phase6_exact_candidate_pair_rendezvous> rendezvous;
+  if (top_k > 1 && workers > 1) {
+    rendezvous = std::make_shared<phase6_exact_candidate_pair_rendezvous>();
+    options.before_exact_candidate_verification_for_tests =
+        [rendezvous](std::size_t rank) {
+          rendezvous->arrive_and_wait(rank);
+        };
+  }
+
+  auto search = larch::run_chart_spr_search(std::move(fixture.dag),
+                                            fixture.grammar, options);
+  CHECK(search.iterations.size() == 1);
+  auto const& iteration = search.iterations.front();
+  CHECK(iteration.candidates_scored == 32);
+  CHECK(iteration.locally_ranked_candidates_retained == top_k);
+  CHECK(iteration.candidates_exact_verified == top_k);
+  CHECK(iteration.exact_candidate_verification_ms.size() == top_k);
+  CHECK(search.counters.exact_verifications == top_k);
+  CHECK(search.summary.exact_candidate_timing_count == top_k);
+  CHECK(search.summary.requested_worker_count == workers);
+  CHECK(search.summary.resolved_worker_count == workers);
+  CHECK(search.summary.local_score_worker_count == workers);
+  CHECK(search.canonical_report.has_value());
+  CHECK(search.canonical_digest.has_value());
+  CHECK(!search.canonical_digest->full_sidecar.empty());
+  CHECK(search.canonical_digest->exact_candidate_count == top_k);
+
+  // Make the byte oracle below non-vacuous.  Every requested rank must carry
+  // an exact score and the mode-appropriate retained evidence, and this
+  // fixture must select and commit an improving winner.  The full canonical
+  // sidecar comparison then proves equality of these values rather than merely
+  // equality of an empty/default report surface.
+  CHECK(search.canonical_report->iterations.size() == 1);
+  auto const& canonical_iteration =
+      search.canonical_report->iterations.front();
+  CHECK(canonical_iteration.candidates.size() == 32);
+  CHECK(canonical_iteration.ranked_stream_indices.size() == top_k);
+  CHECK(canonical_iteration.exact_verified_stream_indices.size() == top_k);
+  CHECK(canonical_iteration.exact_verified_stream_indices ==
+        canonical_iteration.ranked_stream_indices);
+  CHECK(iteration.accepted.has_value());
+  CHECK(iteration.accepted_move_committed);
+  CHECK(canonical_iteration.accepted_move_present);
+  CHECK(canonical_iteration.accepted_move_committed);
+  CHECK(canonical_iteration.selected_stream_index.has_value());
+  CHECK(!canonical_iteration.selected_signature.empty());
+  CHECK(search.summary.accepted_moves == 1);
+
+  auto const selected_stream_index =
+      *canonical_iteration.selected_stream_index;
+  CHECK(selected_stream_index < canonical_iteration.candidates.size());
+  CHECK(canonical_iteration.candidates[selected_stream_index].signature ==
+        canonical_iteration.selected_signature);
+  CHECK(iteration.accepted->canonical_stream_index == selected_stream_index);
+  CHECK(std::ranges::find(
+            canonical_iteration.exact_verified_stream_indices,
+            selected_stream_index) !=
+        canonical_iteration.exact_verified_stream_indices.end());
+
+  for (std::size_t exact_rank = 0; exact_rank < top_k; ++exact_rank) {
+    auto const stream_index =
+        canonical_iteration.exact_verified_stream_indices[exact_rank];
+    CHECK(stream_index < canonical_iteration.candidates.size());
+    auto const& candidate = canonical_iteration.candidates[stream_index];
+    CHECK(candidate.valid);
+    CHECK(candidate.invalid_reason.empty());
+    CHECK(candidate.ranked_index == exact_rank);
+    CHECK(candidate.exact_verification_index == exact_rank);
+    CHECK(candidate.exact.has_value());
+    CHECK(candidate.exact_evidence.has_value());
+    CHECK(candidate.exact->convention == "full_with_invariants");
+    CHECK(candidate.exact->exact_multisite);
+
+    auto const& evidence = *candidate.exact_evidence;
+    if (matrix_case ==
+        phase6_semantic_matrix_case::pattern_batch_fixed_exact) {
+      CHECK(candidate.exact->kind == "fixed_topology_exact");
+      CHECK(evidence.evidence_kind == "fixed_topology_certificate");
+      CHECK(evidence.keep_mask_kind == "not_applicable_fixed_topology");
+      CHECK(!evidence.before_topology_production_keys.empty());
+      CHECK(!evidence.after_topology_production_keys.empty());
+    } else {
+      CHECK(candidate.exact->kind == "grammar_exact");
+      CHECK(evidence.keep_production_exact);
+      CHECK(evidence.keep_mask_kind ==
+            "exact_optimal_production_union");
+      CHECK(!evidence.kept_production_keys.empty());
+      CHECK(!evidence.frontier_sizes.empty());
+      CHECK(!evidence.optimal_root_provenance_classes.empty());
+      for (auto const& provenance :
+           evidence.optimal_root_provenance_classes) {
+        CHECK(!provenance.cost.empty());
+        CHECK(!provenance.production_keys.empty());
+      }
+    }
+  }
+
+  auto const expected_batches = (top_k + workers - 1) / workers;
+  auto const candidate_parallel = top_k > 1 && workers > 1;
+  auto const expected_parallel_batches =
+      candidate_parallel ? expected_batches : std::size_t{0};
+  auto const expected_inner_batches =
+      candidate_parallel ? std::size_t{0} : expected_batches;
+  CHECK(search.summary.exact_candidate_admission_batches == expected_batches);
+  CHECK(search.summary.exact_candidate_parallel_batches ==
+        expected_parallel_batches);
+  CHECK(search.summary.exact_candidate_inner_parallel_batches ==
+        expected_inner_batches);
+  CHECK(search.summary.exact_candidate_memory_limited_batches == 0);
+  CHECK(search.summary.exact_candidate_queued_for_memory_ms == 0.0);
+  CHECK(search.summary.exact_candidate_peak_admitted_bytes > 0);
+  CHECK(search.summary.exact_candidate_peak_projected_resident_bytes >=
+        search.summary.exact_candidate_peak_admitted_bytes);
+
+  CHECK(search.summary.exact_candidate_admission_batches ==
+        search.counters.exact_candidate_admission_batches);
+  CHECK(search.summary.exact_candidate_parallel_batches ==
+        search.counters.exact_candidate_parallel_batches);
+  CHECK(search.summary.exact_candidate_inner_parallel_batches ==
+        search.counters.exact_candidate_inner_parallel_batches);
+  CHECK(search.summary.exact_candidate_memory_limited_batches ==
+        search.counters.exact_candidate_memory_limited_batches);
+  CHECK(search.summary.exact_candidate_peak_admitted_bytes ==
+        search.counters.exact_candidate_peak_admitted_bytes);
+  CHECK(search.summary.exact_candidate_peak_projected_resident_bytes ==
+        search.counters.exact_candidate_peak_projected_resident_bytes);
+  CHECK(search.summary.exact_candidate_queued_for_memory_ms ==
+        search.counters.exact_candidate_queued_for_memory_ms);
+
+  auto const& exact_axis = search.summary.scheduler_axes.exact_candidates;
+  CHECK(exact_axis.operations == expected_parallel_batches);
+  CHECK(exact_axis.parallel_operations == expected_parallel_batches);
+  if (candidate_parallel) {
+    CHECK(rendezvous != nullptr);
+    CHECK(rendezvous->arrivals() == 2);
+    CHECK(exact_axis.items == top_k);
+    CHECK(exact_axis.ranges == top_k);
+    CHECK(exact_axis.worker_tasks == top_k);
+    CHECK(exact_axis.active_worker_high_water >= 2);
+    CHECK(search.summary.peak_concurrent_exact_verifiers >= 2);
+  } else {
+    CHECK(rendezvous == nullptr);
+    CHECK(exact_axis.items == 0);
+    CHECK(exact_axis.ranges == 0);
+    CHECK(exact_axis.worker_tasks == 0);
+    CHECK(exact_axis.active_worker_high_water == 0);
+    CHECK(search.summary.peak_concurrent_exact_verifiers == 1);
+  }
+  check_phase4_scheduler_axis_reconciliation(search);
+
+  auto const& contract = search.canonical_report->contract;
+  switch (matrix_case) {
+    case phase6_semantic_matrix_case::dense_cold_ua_two_pass:
+      CHECK(search.summary.cache_strategy ==
+            larch::chart_spr_cache_strategy::all_active_patterns);
+      CHECK(search.summary.acceptance_mode ==
+            larch::chart_spr_acceptance_mode::exact_multisite);
+      CHECK(search.summary.verification_mode ==
+            larch::chart_spr_verification_mode::cold);
+      CHECK(contract.accepted_state_update == "materialize_rebuild");
+      CHECK(contract.score_ua_edge);
+      CHECK(contract.dominance_mode == "two-pass-exact-mask");
+      break;
+    case phase6_semantic_matrix_case::lazy_transient_exact:
+      CHECK(search.summary.cache_strategy ==
+            larch::chart_spr_cache_strategy::lazy_multisite_chart);
+      CHECK(search.summary.acceptance_mode ==
+            larch::chart_spr_acceptance_mode::exact_multisite);
+      CHECK(search.summary.verification_mode ==
+            larch::chart_spr_verification_mode::transient);
+      CHECK(contract.accepted_state_update == "overlay_chain_local_commit");
+      CHECK(!contract.score_ua_edge);
+      break;
+    case phase6_semantic_matrix_case::pattern_batch_fixed_exact:
+      CHECK(search.summary.active_pattern_count > 1);
+      CHECK(search.summary.cache_strategy ==
+            larch::chart_spr_cache_strategy::pattern_batches);
+      CHECK(search.summary.acceptance_mode ==
+            larch::chart_spr_acceptance_mode::fixed_topology_exact);
+      CHECK(contract.accepted_state_update == "overlay_chain_local_commit");
+      CHECK(!contract.score_ua_edge);
+      break;
+  }
+  return search;
+}
+
+static void test_phase6_top_k_worker_semantic_matrix() {
+  std::println("test_phase6_top_k_worker_semantic_matrix");
+
+  constexpr std::array matrix_cases{
+      phase6_semantic_matrix_case::dense_cold_ua_two_pass,
+      phase6_semantic_matrix_case::lazy_transient_exact,
+      phase6_semantic_matrix_case::pattern_batch_fixed_exact,
+  };
+  constexpr std::array<std::size_t, 3> top_ks{1, 4, 16};
+  constexpr std::array<std::size_t, 4> worker_counts{1, 2, 4, 8};
+
+  for (auto matrix_case : matrix_cases) {
+    for (auto top_k : top_ks) {
+      std::optional<std::string> w1_digest_json;
+      std::optional<std::string> w1_full_sidecar;
+      for (auto workers : worker_counts) {
+        std::println("  case={} top_k={} workers={}",
+                     phase6_semantic_matrix_case_name(matrix_case), top_k,
+                     workers);
+        auto search =
+            run_phase6_semantic_matrix_case(matrix_case, top_k, workers);
+        auto digest_json = larch::emit_chart_spr_semantic_digest_json(
+            *search.canonical_digest);
+        if (workers == 1) {
+          w1_digest_json = std::move(digest_json);
+          w1_full_sidecar = search.canonical_digest->full_sidecar;
+        } else {
+          CHECK(w1_digest_json.has_value());
+          CHECK(w1_full_sidecar.has_value());
+          CHECK(digest_json == *w1_digest_json);
+          CHECK(search.canonical_digest->full_sidecar == *w1_full_sidecar);
+        }
+        if (workers == 8) {
+          auto repeated =
+              run_phase6_semantic_matrix_case(matrix_case, top_k, workers);
+          auto repeated_digest_json =
+              larch::emit_chart_spr_semantic_digest_json(
+                  *repeated.canonical_digest);
+          CHECK(repeated_digest_json == digest_json);
+          CHECK(repeated.canonical_digest->full_sidecar ==
+                search.canonical_digest->full_sidecar);
+        }
+      }
+    }
+  }
+
+  std::println("  PASS");
+}
+
+static void test_phase6_forced_exception_top_k_worker_parity_and_quiescence() {
+  std::println(
+      "test_phase6_forced_exception_top_k_worker_parity_and_quiescence");
+
+  constexpr std::array<std::size_t, 3> top_ks{1, 4, 16};
+  constexpr std::array<std::size_t, 4> worker_counts{1, 2, 4, 8};
+  constexpr std::string_view forced_failure =
+      "phase-6 forced stable-rank-zero exception";
+
+  for (auto top_k : top_ks) {
+    for (auto workers : worker_counts) {
+      auto fixture = make_three_misplaced_groups_fixture();
+      auto options = phase6_semantic_matrix_options(
+          phase6_semantic_matrix_case::dense_cold_ua_two_pass, top_k,
+          workers);
+      options.semantic_capture = larch::chart_spr_semantic_capture_mode::off;
+      auto hook_calls = std::make_shared<std::atomic<std::size_t>>(0);
+      options.before_exact_candidate_verification_for_tests =
+          [hook_calls](std::size_t rank) {
+            hook_calls->fetch_add(1, std::memory_order_relaxed);
+            if (rank == 0) {
+              throw std::runtime_error(
+                  "phase-6 forced stable-rank-zero exception");
+            }
+          };
+
+      auto state = larch::build_chart_spr_search_state(
+          fixture.dag, fixture.grammar, options);
+      larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+          .requested_workers = workers,
+          .default_minimum_grain = 1,
+          .default_target_ranges_per_worker = 4,
+      }};
+      CHECK(scheduler.worker_resolution().resolved_workers == workers);
+      larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+          workspace;
+
+      std::string observed_failure;
+      try {
+        (void)larch::run_chart_spr_acceptance_iteration(
+            state, options, 0, workspace, scheduler);
+      } catch (std::runtime_error const& error) {
+        observed_failure = error.what();
+      }
+      CHECK(observed_failure == forced_failure);
+      CHECK(hook_calls->load(std::memory_order_relaxed) ==
+            std::min(top_k, workers));
+      CHECK(state.counters.candidate_accepts_attempted == 0);
+      CHECK(state.counters.exact_candidate_admission_batches == 1);
+      CHECK(state.exact_verifier_concurrency->peak() >= 1);
+
+      auto const quiescent_metrics = scheduler.metrics();
+      CHECK(quiescent_metrics.tasks_submitted ==
+            quiescent_metrics.tasks_completed);
+      CHECK(quiescent_metrics.tasks_submitted ==
+            quiescent_metrics.tasks_joined);
+      CHECK(quiescent_metrics.pending_tasks == 0);
+
+      scheduler.shutdown();
+      auto const shutdown_metrics = scheduler.metrics();
+      CHECK(shutdown_metrics.tasks_submitted ==
+            shutdown_metrics.tasks_completed);
+      CHECK(shutdown_metrics.tasks_submitted == shutdown_metrics.tasks_joined);
+      CHECK(shutdown_metrics.pending_tasks == 0);
+      CHECK(shutdown_metrics.live_pool_threads == 0);
+      check_phase4_scheduler_axis_reconciliation(
+          shutdown_metrics, state.counters.scheduler_axes);
+    }
+  }
+
+  std::println("  PASS");
 }
 
 static bool is_chart_spr_expected_overlay_chain_rejection(
@@ -6706,8 +8319,14 @@ static void test_phase4_multi_worker_matches_serial() {
             *parallel.canonical_digest));
   CHECK(serial.iterations.size() > 1);
   CHECK(serial.summary.scheduler.operations > 1);
-  CHECK(parallel.summary.scheduler.operations ==
-        serial.summary.scheduler.operations);
+  // Phase 6 deliberately changes the scheduler decomposition at W>1: retained
+  // candidates run on the exact-candidate axis, whereas W1 preserves the
+  // inner exact-setup/frontier axes.  Total operation counts therefore need
+  // not match even though the canonical result must.
+  CHECK(serial.summary.scheduler_axes.exact_candidates.operations == 0);
+  CHECK(parallel.summary.scheduler_axes.exact_candidates.operations > 0);
+  CHECK(parallel.summary.scheduler_axes.exact_candidates
+            .parallel_operations > 0);
   CHECK(serial.summary.scheduler.requested_workers == 1);
   CHECK(serial.summary.scheduler.resolved_workers == 1);
   CHECK(serial.summary.scheduler.parallel_operations == 0);
@@ -6832,7 +8451,12 @@ static void test_phase4_fixed_topology_exact_local_commit() {
   CHECK(search.counters.fixed_topology_persistent_cache_fallbacks == 0);
   CHECK(search.counters.fixed_topology_persistent_cache_oracle_mismatches == 0);
   check_phase4_scheduler_axis_reconciliation(search);
-  CHECK(search.summary.scheduler_axes.fixed_topology_patterns.operations > 0);
+  // Phase 6 selects the outer candidate axis when multiple fixed-topology
+  // verifications are retained; those tasks deliberately keep their inner
+  // per-pattern recurrence serial to avoid nested waits on the same pool.
+  CHECK(search.summary.scheduler_axes.exact_candidates.operations > 0);
+  CHECK(search.summary.scheduler_axes.exact_candidates.parallel_operations >
+        0);
   CHECK(search.summary.fixed_topology_selected_cache_hits ==
         search.counters.fixed_topology_selected_cache_hits);
   CHECK(search.summary.fixed_topology_selected_cache_misses ==
@@ -7585,6 +9209,22 @@ int main() {
   test_exact_verification_reuses_state_old_score();
   test_failed_exact_materialization_is_timed();
   test_top_k_exact_verification_count_is_bounded();
+  test_phase6_top_k_four_uses_exact_candidate_axis_only();
+  test_phase6_top_k_one_preserves_inner_exact_parallelism();
+  test_phase6_exact_candidate_failures_choose_stable_rank_and_join();
+  test_phase6_exact_candidate_partial_submit_joins_and_reconciles();
+  test_phase6_exact_candidate_admission_stable_prefixes();
+  test_phase6_exact_candidate_admission_singleton_policy();
+  test_phase6_exact_candidate_admission_budget_fail_closed();
+  test_phase6_exact_candidate_admission_retained_carryover();
+  test_phase6_exact_candidate_admission_arithmetic_guards();
+  test_phase6_exact_state_fails_before_unified_budget_overrun();
+  test_phase6_finite_budget_splits_exact_candidate_wave();
+  test_phase6_finite_budget_rejects_before_verifier_hook();
+  test_phase6_fixed_tightened_budget_rejects_before_generation();
+  test_phase6_custom_exact_contracts_fail_closed_and_serialize();
+  test_phase6_top_k_worker_semantic_matrix();
+  test_phase6_forced_exception_top_k_worker_parity_and_quiescence();
   test_lower_bound_heuristic_acceptance_is_explicit();
   test_fixed_topology_exact_rejects_bare_candidate();
   test_fixed_topology_iteration_uses_default_selector();

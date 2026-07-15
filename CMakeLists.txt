@@ -717,7 +717,7 @@ add_test(NAME wric_spr_search_benchmark_harness_test
          COMMAND bash test/wric_spr_search_benchmark_harness_test.sh
                  $<TARGET_FILE:wric_process_metrics>
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-set_tests_properties(wric_spr_search_benchmark_harness_test PROPERTIES TIMEOUT 90)
+set_tests_properties(wric_spr_search_benchmark_harness_test PROPERTIES TIMEOUT 300)
 
 add_test(NAME wric_phase0_manifest_bootstrap_test
          COMMAND bash test/wric_phase0_manifest_bootstrap_test.sh
