@@ -3092,6 +3092,232 @@ static void test_acceptance_iteration_checks_resident_plan_once() {
   std::println("  PASS");
 }
 
+static larch::chart_spr_lazy_selected_topology_entry
+make_phase7_selected_topology_child(
+    std::vector<std::size_t> class_index_by_pattern, std::size_t row_count) {
+  larch::chart_spr_lazy_selected_topology_entry entry;
+  entry.class_index_by_pattern = std::move(class_index_by_pattern);
+  for (std::size_t state = 0; state < row_count; ++state) {
+    auto row = larch::parsimony_chart_detail::make_inf_row();
+    row[state] = 0;
+    entry.rows.push_back(row);
+  }
+  return entry;
+}
+
+// This is the removed implementation, retained only as a test oracle: ordered
+// vector keys define traversal order, and the first row seen in that order
+// defines each selected-topology row-class ID.
+static larch::chart_spr_lazy_selected_topology_entry
+phase7_ordered_selected_topology_entry_oracle(
+    std::size_t pattern_count,
+    std::vector<larch::chart_spr_lazy_selected_topology_entry const*> const&
+        child_entries) {
+  larch::chart_spr_lazy_selected_topology_entry entry;
+  entry.class_index_by_pattern.assign(pattern_count, 0);
+  std::map<std::vector<std::size_t>, std::vector<std::size_t>>
+      patterns_by_context;
+  for (std::size_t pattern = 0; pattern < pattern_count; ++pattern) {
+    std::vector<std::size_t> key;
+    key.reserve(child_entries.size());
+    for (auto const* child_entry : child_entries) {
+      key.push_back(child_entry->class_index_by_pattern[pattern]);
+    }
+    patterns_by_context[std::move(key)].push_back(pattern);
+  }
+
+  std::map<larch::chart_multisite_detail::chart_row, std::size_t> class_by_row;
+  for (auto const& [key, members] : patterns_by_context) {
+    std::vector<larch::chart_multisite_detail::chart_row> child_rows;
+    child_rows.reserve(child_entries.size());
+    for (std::size_t child = 0; child < child_entries.size(); ++child) {
+      child_rows.push_back(child_entries[child]->rows.at(key[child]));
+    }
+    auto const row = larch::chart_multisite_detail::combine_rows(
+        std::span<larch::chart_multisite_detail::chart_row const>{
+            child_rows.data(), child_rows.size()});
+    auto [row_it, inserted] = class_by_row.emplace(row, class_by_row.size());
+    if (inserted) entry.rows.push_back(row);
+    for (auto pattern : members) {
+      entry.class_index_by_pattern[pattern] = row_it->second;
+    }
+  }
+  return entry;
+}
+
+static void test_phase7_packed_lazy_selected_topology_grouping_contract() {
+  std::println("test_phase7_packed_lazy_selected_topology_grouping_contract");
+  using larch::lazy_key_grouping_detail::packed_key_word;
+  using selected_entry = larch::chart_spr_lazy_selected_topology_entry;
+  using selected_workspace =
+      larch::chart_spr_lazy_selected_topology_key_workspace;
+
+  auto binary_left = make_phase7_selected_topology_child({0, 1, 0, 2, 2, 3}, 4);
+  auto binary_right =
+      make_phase7_selected_topology_child({0, 0, 1, 2, 2, 2}, 3);
+  std::vector<selected_entry const*> binary_children{&binary_left,
+                                                     &binary_right};
+  selected_workspace binary_workspace;
+  {
+    auto const keys =
+        larch::chart_spr_collect_lazy_selected_topology_context_keys(
+            6, binary_children, binary_workspace);
+    CHECK(keys.key_width == 2);
+    CHECK((std::vector<packed_key_word>{keys.key_words().begin(),
+                                        keys.key_words().end()} ==
+           std::vector<packed_key_word>{0, 0, 1, 0, 0, 1, 2, 2, 2, 2, 3, 2}));
+    CHECK((keys.classes().class_by_input ==
+           std::vector<std::size_t>{0, 1, 2, 3, 3, 4}));
+    CHECK((keys.classes().representative_by_class ==
+           std::vector<std::size_t>{0, 1, 2, 3, 5}));
+    CHECK((keys.classes().lexicographic_class_order ==
+           std::vector<std::size_t>{0, 2, 1, 3, 4}));
+    CHECK(
+        (std::vector<std::size_t>{keys.classes().members_for_class(3).begin(),
+                                  keys.classes().members_for_class(3).end()} ==
+         std::vector<std::size_t>{3, 4}));
+    CHECK(keys.memory.key_count == 6);
+    CHECK(keys.memory.key_width == 2);
+    CHECK(keys.memory.class_count == 5);
+    CHECK(
+        keys.memory.logical_resident_bytes ==
+        larch::
+            estimate_chart_spr_lazy_selected_topology_key_grouping_logical_resident_bytes(
+                6, 2, 5));
+    CHECK(keys.memory.actual_capacity_resident_bytes ==
+          sizeof(larch::chart_spr_packed_lazy_selected_topology_keys) +
+              binary_workspace.resident_bytes());
+    CHECK(keys.memory.actual_capacity_resident_bytes >=
+          keys.memory.logical_resident_bytes);
+    CHECK(keys.memory.observed_prepublication_peak_capacity_resident_bytes >=
+          keys.memory.actual_capacity_resident_bytes);
+  }
+  {
+    auto const reused_binary =
+        larch::chart_spr_collect_lazy_selected_topology_context_keys(
+            6, binary_children, binary_workspace);
+    CHECK(reused_binary.memory.word_preparation.reused_existing_capacity);
+    CHECK(reused_binary.memory.grouping_preparation.reused_existing_capacity);
+  }
+
+  auto binary_oracle =
+      phase7_ordered_selected_topology_entry_oracle(6, binary_children);
+  selected_entry binary_actual;
+  larch::chart_spr_search_counters binary_counters;
+  larch::chart_spr_assign_lazy_selected_topology_internal_entry(
+      binary_actual, 6, binary_children, binary_workspace, binary_counters);
+  CHECK(binary_actual.rows == binary_oracle.rows);
+  CHECK(binary_actual.class_index_by_pattern ==
+        binary_oracle.class_index_by_pattern);
+  CHECK(binary_counters.selected_topology_multifurcation_rows == 0);
+
+  auto multifurc_first =
+      make_phase7_selected_topology_child({0, 1, 0, 1, 0, 2}, 3);
+  auto multifurc_second =
+      make_phase7_selected_topology_child({0, 1, 0, 0, 1, 2}, 3);
+  auto multifurc_third =
+      make_phase7_selected_topology_child({0, 0, 1, 2, 2, 2}, 3);
+  std::vector<selected_entry const*> multifurc_children{
+      &multifurc_first, &multifurc_second, &multifurc_third};
+  selected_workspace multifurc_workspace;
+  {
+    auto const keys =
+        larch::chart_spr_collect_lazy_selected_topology_context_keys(
+            6, multifurc_children, multifurc_workspace);
+    CHECK(keys.key_width == 3);
+    CHECK((keys.classes().class_by_input ==
+           std::vector<std::size_t>{0, 1, 2, 3, 4, 5}));
+    CHECK((keys.classes().representative_by_class ==
+           std::vector<std::size_t>{0, 1, 2, 3, 4, 5}));
+    CHECK((keys.classes().lexicographic_class_order ==
+           std::vector<std::size_t>{0, 2, 4, 3, 1, 5}));
+  }
+  auto multifurc_oracle =
+      phase7_ordered_selected_topology_entry_oracle(6, multifurc_children);
+  selected_entry multifurc_actual;
+  larch::chart_spr_search_counters multifurc_counters;
+  multifurc_counters.selected_topology_multifurcation_rows = 7;
+  larch::chart_spr_assign_lazy_selected_topology_internal_entry(
+      multifurc_actual, 6, multifurc_children, multifurc_workspace,
+      multifurc_counters);
+  CHECK(multifurc_actual.rows == multifurc_oracle.rows);
+  CHECK(multifurc_actual.class_index_by_pattern ==
+        multifurc_oracle.class_index_by_pattern);
+  CHECK(multifurc_counters.selected_topology_multifurcation_rows == 13);
+
+  auto const word_max =
+      static_cast<std::size_t>((std::numeric_limits<packed_key_word>::max)());
+  auto narrowing_child = make_phase7_selected_topology_child({word_max}, 0);
+  std::vector<selected_entry const*> narrowing_children{&narrowing_child};
+  selected_workspace narrowing_workspace;
+  {
+    auto const keys =
+        larch::chart_spr_collect_lazy_selected_topology_context_keys(
+            1, narrowing_children, narrowing_workspace);
+    CHECK(keys.key_words().front() ==
+          (std::numeric_limits<packed_key_word>::max)());
+  }
+  if ((std::numeric_limits<std::size_t>::max)() > word_max) {
+    narrowing_child.class_index_by_pattern[0] = word_max + 1;
+    bool threw = false;
+    try {
+      (void)larch::chart_spr_collect_lazy_selected_topology_context_keys(
+          1, narrowing_children, narrowing_workspace);
+    } catch (std::overflow_error const& e) {
+      threw = true;
+      auto const message = std::string{e.what()};
+      CHECK(message.find("selected-topology child class index") !=
+            std::string::npos);
+      CHECK(message.find("does not fit") != std::string::npos);
+    }
+    CHECK(threw);
+  }
+
+  CHECK(
+      larch::
+          estimate_chart_spr_lazy_selected_topology_key_grouping_logical_resident_bytes(
+              6, 3, 6) > sizeof(selected_workspace));
+  bool accounting_overflow = false;
+  try {
+    (void)larch::
+        estimate_chart_spr_lazy_selected_topology_key_grouping_logical_resident_bytes(
+            (std::numeric_limits<std::size_t>::max)(), 2, 1);
+  } catch (std::overflow_error const& e) {
+    accounting_overflow = true;
+    CHECK(std::string{e.what()}.find("overflow") != std::string::npos);
+  }
+  CHECK(accounting_overflow);
+
+  // Pattern zero is first-occurrence class zero but lexicographically second.
+  // Its middle-child class is invalid. The valid lexicographic predecessor
+  // must publish one row before the error, while the multifurcation counter
+  // remains delayed until the whole production succeeds.
+  auto failure_first = make_phase7_selected_topology_child({0, 0}, 1);
+  auto failure_middle = make_phase7_selected_topology_child({1, 0}, 1);
+  auto failure_last = make_phase7_selected_topology_child({0, 0}, 1);
+  std::vector<selected_entry const*> failure_children{
+      &failure_first, &failure_middle, &failure_last};
+  selected_entry partial_entry;
+  selected_workspace failure_workspace;
+  larch::chart_spr_search_counters failure_counters;
+  failure_counters.selected_topology_multifurcation_rows = 7;
+  bool failed_in_lex_order = false;
+  try {
+    larch::chart_spr_assign_lazy_selected_topology_internal_entry(
+        partial_entry, 2, failure_children, failure_workspace,
+        failure_counters);
+  } catch (std::runtime_error const& e) {
+    failed_in_lex_order = true;
+    CHECK(std::string{e.what()}.find("child class index out of range") !=
+          std::string::npos);
+  }
+  CHECK(failed_in_lex_order);
+  CHECK(partial_entry.rows.size() == 1);
+  CHECK(failure_counters.selected_topology_multifurcation_rows == 7);
+
+  std::println("  PASS");
+}
+
 static void test_lazy_cache_fixed_topology_conservative_search() {
   std::println("test_lazy_cache_fixed_topology_conservative_search");
 
@@ -9474,6 +9700,7 @@ int main() {
   test_candidate_execution_plan_lifetime_and_mismatch_guards();
   test_checked_candidate_sources_and_planned_materialization();
   test_acceptance_iteration_checks_resident_plan_once();
+  test_phase7_packed_lazy_selected_topology_grouping_contract();
   test_lazy_cache_fixed_topology_conservative_search();
   test_lazy_cache_local_commit_updates_lazy_chart();
   test_parallel_local_scores_match_serial();

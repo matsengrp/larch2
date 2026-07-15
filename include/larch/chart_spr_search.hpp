@@ -8503,10 +8503,103 @@ struct chart_spr_lazy_selected_topology_entry {
   std::vector<std::size_t> class_index_by_pattern;
 };
 
+// Selected-topology child-class contexts use the same one-stage prepared
+// packed storage contract as lazy outside contexts: one pattern-major word
+// buffer, one grouping workspace, and one grouping result. The alias makes the
+// scratch lifetime explicit while retaining a single audited accounting path.
+using chart_spr_lazy_selected_topology_key_workspace =
+    lazy_chart_detail::outside_context_key_workspace;
+using chart_spr_packed_lazy_selected_topology_keys =
+    lazy_chart_detail::packed_outside_context_keys;
+
+inline std::size_t
+estimate_chart_spr_lazy_selected_topology_key_grouping_logical_resident_bytes(
+    std::size_t pattern_count, std::size_t child_count,
+    std::size_t class_count) {
+  return lazy_chart_detail::
+      estimate_outside_context_key_grouping_logical_resident_bytes(
+          pattern_count, child_count, class_count);
+}
+
+inline chart_spr_packed_lazy_selected_topology_keys
+chart_spr_collect_lazy_selected_topology_context_keys(
+    std::size_t pattern_count,
+    std::vector<chart_spr_lazy_selected_topology_entry const*> const&
+        child_entries,
+    chart_spr_lazy_selected_topology_key_workspace& workspace) {
+  using namespace lazy_key_grouping_detail;
+  return lazy_chart_detail::collect_packed_outside_context_keys(
+      pattern_count, child_entries.size(), workspace,
+      [&](std::span<packed_key_word> words) {
+        auto output = words.begin();
+        for (std::size_t pattern = 0; pattern < pattern_count; ++pattern) {
+          for (auto const* child_entry : child_entries) {
+            *output++ = checked_packed_key_word(
+                child_entry->class_index_by_pattern[pattern],
+                "fixed_topology_exact lazy selected-topology child class "
+                "index");
+          }
+        }
+        if (output != words.end()) {
+          throw std::logic_error(
+              "fixed_topology_exact lazy selected-topology context-key width "
+              "mismatch");
+        }
+      });
+}
+
+inline void chart_spr_assign_lazy_selected_topology_internal_entry(
+    chart_spr_lazy_selected_topology_entry& entry, std::size_t pattern_count,
+    std::vector<chart_spr_lazy_selected_topology_entry const*> const&
+        child_entries,
+    chart_spr_lazy_selected_topology_key_workspace& workspace,
+    chart_spr_search_counters& counters) {
+  entry.class_index_by_pattern.assign(pattern_count, 0);
+  auto const context_keys =
+      chart_spr_collect_lazy_selected_topology_context_keys(
+          pattern_count, child_entries, workspace);
+  auto const& context_classes = context_keys.classes();
+  auto const words = context_keys.key_words();
+
+  std::map<std::array<chart_cost, nuc_state_count>, std::size_t> class_by_row;
+  // The former ordered vector-key map computed rows in lexicographic context
+  // order. Packed IDs are first-occurrence IDs, so the explicit lexicographic
+  // class order is required for row numbering and partial-failure semantics.
+  for (auto context_class : context_classes.lexicographic_class_order) {
+    auto const representative =
+        context_classes.representative_by_class[context_class];
+    auto const key_begin = representative * context_keys.key_width;
+    std::vector<chart_multisite_detail::chart_row> child_rows;
+    child_rows.reserve(child_entries.size());
+    for (std::size_t child_i = 0; child_i < child_entries.size(); ++child_i) {
+      auto const* child_entry = child_entries[child_i];
+      auto const class_index =
+          static_cast<std::size_t>(words[key_begin + child_i]);
+      if (class_index >= child_entry->rows.size()) {
+        throw std::runtime_error(
+            "fixed_topology_exact lazy selected-topology scorer: child "
+            "class index out of range");
+      }
+      child_rows.push_back(child_entry->rows[class_index]);
+    }
+    auto const row = chart_multisite_detail::combine_rows(
+        std::span<chart_multisite_detail::chart_row const>{child_rows.data(),
+                                                           child_rows.size()});
+    auto [row_it, inserted] = class_by_row.emplace(row, class_by_row.size());
+    if (inserted) entry.rows.push_back(row);
+    for (auto pattern : context_classes.members_for_class(context_class)) {
+      entry.class_index_by_pattern[pattern] = row_it->second;
+    }
+  }
+  if (child_entries.size() != 2) {
+    counters.selected_topology_multifurcation_rows +=
+        context_classes.class_count();
+  }
+}
+
 inline chart_spr_lazy_selected_topology_entry const&
 chart_spr_lazy_selected_topology_rows_for_clade(
-    chart_spr_search_state const& state,
-    grammar_spr_candidate const& candidate,
+    chart_spr_search_state const& state, grammar_spr_candidate const& candidate,
     std::map<overlay_clade_ref, overlay_production_ref> const& selected,
     overlay_clade_ref clade,
     std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>&
@@ -8514,8 +8607,8 @@ chart_spr_lazy_selected_topology_rows_for_clade(
     std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>&
         temp_memo,
     std::vector<std::uint8_t>& base_state,
-    std::vector<std::uint8_t>& temp_state,
-    chart_spr_search_counters& counters) {
+    std::vector<std::uint8_t>& temp_state, chart_spr_search_counters& counters,
+    chart_spr_lazy_selected_topology_key_workspace& key_workspace) {
   auto& state_slot = clade.space == overlay_id_space::base
                          ? base_state.at(clade.id)
                          : temp_state.at(clade.id);
@@ -8586,46 +8679,10 @@ chart_spr_lazy_selected_topology_rows_for_clade(
     for (auto child : children) {
       child_entries.push_back(&chart_spr_lazy_selected_topology_rows_for_clade(
           state, candidate, selected, child, base_memo, temp_memo, base_state,
-          temp_state, counters));
+          temp_state, counters, key_workspace));
     }
-
-    std::map<std::vector<std::size_t>, std::vector<std::size_t>>
-        patterns_by_context;
-    for (std::size_t p = 0; p < active.size(); ++p) {
-      std::vector<std::size_t> key;
-      key.reserve(child_entries.size());
-      for (auto const* child_entry : child_entries) {
-        key.push_back(child_entry->class_index_by_pattern[p]);
-      }
-      patterns_by_context[std::move(key)].push_back(p);
-    }
-
-    std::map<std::array<chart_cost, nuc_state_count>, std::size_t>
-        class_by_row;
-    for (auto const& [key, members] : patterns_by_context) {
-      std::vector<chart_multisite_detail::chart_row> child_rows;
-      child_rows.reserve(child_entries.size());
-      for (std::size_t child_i = 0; child_i < child_entries.size(); ++child_i) {
-        auto const* child_entry = child_entries[child_i];
-        auto class_index = key[child_i];
-        if (class_index >= child_entry->rows.size()) {
-          throw std::runtime_error(
-              "fixed_topology_exact lazy selected-topology scorer: child "
-              "class index out of range");
-        }
-        child_rows.push_back(child_entry->rows[class_index]);
-      }
-      auto row = chart_multisite_detail::combine_rows(
-          std::span<chart_multisite_detail::chart_row const>{
-              child_rows.data(), child_rows.size()});
-      auto [row_it, inserted] = class_by_row.emplace(row, class_by_row.size());
-      if (inserted) entry.rows.push_back(row);
-      for (auto p : members) entry.class_index_by_pattern[p] = row_it->second;
-    }
-    if (children.size() != 2) {
-      counters.selected_topology_multifurcation_rows +=
-          patterns_by_context.size();
-    }
+    chart_spr_assign_lazy_selected_topology_internal_entry(
+        entry, active.size(), child_entries, key_workspace, counters);
   }
 
   counters.fixed_topology_selected_rows_computed += entry.rows.size();
@@ -8637,19 +8694,19 @@ chart_spr_lazy_selected_topology_rows_for_clade(
 
 inline chart_spr_lazy_selected_topology_entry const&
 chart_spr_lazy_selected_topology_root_rows(
-    chart_spr_search_state const& state,
-    grammar_spr_candidate const& candidate,
+    chart_spr_search_state const& state, grammar_spr_candidate const& candidate,
     std::map<overlay_clade_ref, overlay_production_ref> const& selected,
     std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>&
         base_memo,
     std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>&
         temp_memo,
-    chart_spr_search_counters& counters) {
+    chart_spr_search_counters& counters,
+    chart_spr_lazy_selected_topology_key_workspace& key_workspace) {
   std::vector<std::uint8_t> base_state(state.grammar.clades.size(), 0);
   std::vector<std::uint8_t> temp_state(candidate.added_clades.size(), 0);
   return chart_spr_lazy_selected_topology_rows_for_clade(
       state, candidate, selected, base_clade_ref(state.grammar.root_clade),
-      base_memo, temp_memo, base_state, temp_state, counters);
+      base_memo, temp_memo, base_state, temp_state, counters, key_workspace);
 }
 
 struct chart_spr_fixed_topology_pattern_scores {
@@ -8694,12 +8751,13 @@ fixed_topology_lazy_selected_pattern_scores(
       after_base_memo(state.grammar.clades.size());
   std::vector<std::optional<chart_spr_lazy_selected_topology_entry>>
       after_temp_memo(candidate.candidate.added_clades.size());
+  chart_spr_lazy_selected_topology_key_workspace key_workspace;
   auto const& before_root = chart_spr_lazy_selected_topology_root_rows(
       state, candidate.candidate, before_selected, before_base_memo,
-      before_temp_memo, counters);
+      before_temp_memo, counters, key_workspace);
   auto const& after_root = chart_spr_lazy_selected_topology_root_rows(
       state, candidate.candidate, after_selected, after_base_memo,
-      after_temp_memo, counters);
+      after_temp_memo, counters, key_workspace);
 
   chart_spr_fixed_topology_pattern_scores scores;
   auto const& active = state.active_patterns.patterns.patterns;
