@@ -34,7 +34,7 @@ in this document.
 | 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | Safe one-pool orchestration, full CTest, and targeted TSAN pass at `7d294d6`; small-case timing awaits the sealed baseline |
 | 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | `cbf92b6` passes deterministic pattern/cache/local/fixed-topology scheduling, bounded-memory admission, caught-failure accounting, full CTest, and targeted TSAN; scaling, Phase-3 serial comparison, and RSS gates await the sealed baseline |
 | 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass W1/W8 exact semantics, full CTest, and targeted TSAN; same-revision diagnostics exceed the 2x exact-phase target; measured-0% heavy splitting is omitted; unified frontier/candidate admission and sealed timing/RSS remain pending |
-| 6. Parallelize exact top-K candidates | implementation in validation; sealed performance acceptance pending deferred Phase 0 | Working validation tree is based on `1cc76dc`; Phase-6 checkpoint commit TBD. Functional, sanitizer, stable-semantics, admission, scaling, and RSS gates remain open until recorded, with performance gates requiring the quiet-host Phase-0 seal |
+| 6. Parallelize exact top-K candidates | implementation complete; acceptance pending Phase 0 | `870c298` passes the in-tree Top-K/worker semantic and stable-failure matrix, deterministic scheduling, functional bounded-admission tests, full RelWithDebInfo CTest, and targeted TSan; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS gates await Phase 0 |
 | 7. Make lazy charts scalable and adaptive | pending | Dense/lazy equivalence and auto-policy gate |
 | 8. Parallelize and pipeline candidate generation | pending | Stable candidate stream and generation speedup |
 | 9. Parallelize accepted-state cache updates | pending | Non-vacuous multi-accept correctness and scaling |
@@ -727,20 +727,25 @@ profile, document and omit it instead of adding ineffective complexity.
 
 ### Implementation status (2026-07-15)
 
-The Phase-6 implementation is in validation on a worktree based on `1cc76dc`;
-the next Phase-6 checkpoint commit is TBD. It contains stable exact-candidate
-waves, task-local verification state, coordinator-ordered aggregation, and a
-unified hard memory-admission path, but this status does not assert that any
-Phase-6 exit criterion has passed. Raw validation and benchmark evidence stays
-uncommitted under `build/wric-chart-parallelization/`.
+The Phase-6 implementation is complete at
+`870c298ff1c0c21901bdf79d341bf97d121f389c`. Stable exact-candidate waves,
+task-local verification state, coordinator-ordered aggregation, and the
+unified hard memory-admission path pass the in-tree Top-K `{1,4,16}` by worker
+`{1,2,4,8}` semantic matrix, stable-failure and partial-submission tests,
+finite-budget admission tests, repeated-W8 identity test, full RelWithDebInfo
+CTest, and targeted TSan. Reproducible unsealed evidence is recorded under
+`build/wric-chart-parallelization/phase6-870c298/` and summarized in the
+results ledger.
 
 The immutable measurement checkpoint remains
 `7ca527b8906d018124756182274335cbff936d72` (`Baseline measure`). Its frozen
 runner, oracle, workloads, and binaries are unchanged. Quiet-host Phase-0
 calibration, baseline capture, finalization, audit, and seal are deliberately
 deferred under the authorized deadline-overlap rule; therefore all Phase-6
-performance acceptance, including scaling and RSS, remains pending even if
-same-revision diagnostics are collected first.
+performance acceptance remains pending. In particular, the frozen medium
+Top-K-4 scaling gate, real Top-K-16 admission gate, paired W1/W8 RSS gate, and
+frozen-workload repeated-output capture cannot be inferred from the passing
+in-tree functional contracts or benchmark-postprocessor regressions.
 
 ### Goal
 

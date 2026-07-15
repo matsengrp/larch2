@@ -32,7 +32,7 @@ committed. Phase-0 artifacts use the non-overwriting directory
 | 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | code checkpoint `7d294d6`; scheduler contract, canonical worker matrix, full RelWithDebInfo, and targeted TSan gates pass; small-case timing remains pending |
 | 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | code checkpoint `cbf92b6` and evidence checkpoint `1be6ffe`; full RelWithDebInfo and targeted TSan gates pass; sealed scaling/RSS gates pending |
 | 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass post-omission semantics, full CTest, and targeted TSAN; diagnostic exact-phase scaling exceeds 2x; unified frontier/candidate admission and sealed timing/RSS remain pending |
-| 6. Parallelize exact top-K candidates | implementation in validation; sealed performance acceptance pending deferred Phase 0 | working validation tree is based on `1cc76dc`; Phase-6 checkpoint commit TBD; no functional, sanitizer, scaling, admission, or RSS gate is claimed passed in this ledger yet |
+| 6. Parallelize exact top-K candidates | implementation complete; acceptance pending Phase 0 | code checkpoint `870c298`; in-tree Top-K/worker semantics, stable failures, deterministic scheduling, functional bounded admission, full RelWithDebInfo CTest, and targeted TSan pass; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS remain pending |
 | 7--10 | pending | may follow in plan order under the same acceptance gate |
 
 ## Phase 0 — immutable provenance
@@ -1340,40 +1340,89 @@ admitting candidate/frontier scratch under the unified budget. Phase 0 must
 then supply sealed timeout, scaling, and RSS evidence. Under the authorized
 deadline-overlap rule, implementation proceeds to Phase 6 now.
 
-## Phase 6 implementation validation checkpoint (unsealed)
+## Phase 6 implementation checkpoint (unsealed)
 
-Phase 6 is **implementation in validation; sealed performance acceptance
-pending deferred Phase 0**. The working validation tree is based on `1cc76dc`;
-the next Phase-6 checkpoint commit is TBD. The immutable parent measurement
+Phase 6 is **implementation complete; acceptance pending Phase 0** at
+`870c298ff1c0c21901bdf79d341bf97d121f389c` (tree
+`e98984f4f587546e5ef19ba08e2f1b1a4e8ce6b1`). The immutable measurement
 checkpoint remains `7ca527b8906d018124756182274335cbff936d72`
 (`Baseline measure`). No frozen Phase-0 executable, workload, runner, oracle,
-or search contract has been replaced.
+or search contract was replaced.
 
-The worktree implementation under validation publishes one immutable old exact
-trim, admits retained candidates in deterministic stable-rank waves, gives
-each task private verifier counters/scratch/results, forbids nested-pool
-execution, and merges failures, counters, canonical evidence, and winner
-selection serially after each join. Its unified finite budget uses the tighter
-nonzero state/iteration value and charges resident charts and exact trim,
-coordinator/live-input storage, selector and estimator work, task-local exact
-setup/frontier or fixed-topology scratch, and retained results across waves.
-Unsafe or overflowing estimates and custom finite-budget callbacks without
-matching memory estimators fail closed.
+The implementation publishes one immutable old exact trim, admits retained
+candidates in deterministic stable-rank waves, gives each task private
+verifier counters/scratch/results, forbids nested-pool execution, and merges
+failures, counters, canonical evidence, and winner selection serially after
+each join. Its unified finite budget uses the tighter nonzero state/iteration
+value and charges resident charts and exact trim, coordinator/live-input
+storage, selector and estimator work, task-local exact setup/frontier or
+fixed-topology scratch, retained results across waves, and actual-capacity
+backstops. Unsafe or overflowing estimates and custom finite-budget callbacks
+without matching memory estimators fail closed.
 
-The benchmark worktree also emits `phase6_admission_evidence.tsv` and
-`phase6_rss_comparisons.tsv`, validates all seven admission fields on every
-successful chart trial, requires complete top-K-16 evidence cardinality, and
-constructs non-vacuous one-to-one W1/W8 RSS comparisons. These are evidence
-contracts, not recorded acceptance results. Any raw output remains uncommitted
-under `build/wric-chart-parallelization/`.
+The standalone `chart_spr_search_test` exercises Top-K `{1,4,16}` by workers
+`{1,2,4,8}` across dense cold/unambiguous two-pass conservative, forced-lazy
+transient exact-local, and pattern-batch fixed exact-local paths. It compares
+non-vacuous per-candidate exact scores/evidence, exceptions, masks, fluidity
+provenance, winner, canonical digest, and full canonical sidecar to the W1
+oracle; it also repeats W8 and compares both canonical byte representations.
+Stable-rank failure selection, partial-submission joining/quiescence,
+candidate-versus-inner-axis choice, finite-budget Top-K-16 wave splitting,
+pre-verifier rejection, custom-callback serialization, and checked admission
+arithmetic have dedicated passing cases. The standalone log has SHA-256
+`f785c49a6afb8095f699f3fb3248a9c7cd11763d9e676b6c65ff0ab2023c7313`.
 
-At this checkpoint the full Top-K `1,4,16` by W `1,2,4,8` semantic and stable-
-failure matrix, repeated-W8 byte identity, full RelWithDebInfo CTest, targeted
-TSan, finite Top-K-16 admission, medium Top-K-4 scaling, W1/W8 RSS, and final
-same-revision diagnostic capture are still being validated or recorded. The
-quiet-host Phase-0 calibration, capture, finalization, audit, and detached seal
-also remain deferred. Consequently this section makes no claim that a Phase-6
-exit criterion, performance gate, or final acceptance gate has passed.
+The strict benchmark postprocessor now emits
+`phase6_exact_verification_speedup.tsv`, `phase6_admission_evidence.tsv`, and
+`phase6_rss_comparisons.tsv`; binds rows to workload, contract, search, and
+output-semantic hashes; uses exact fixed-point median arithmetic; requires a
+non-vacuous W1/W8 pair and Top-K-16 cardinality; and fails closed for timeout,
+fallback, nonfinite, incomplete, or boundary-failing input. Its adversarial
+shell regression and the Phase-0 bootstrap regression pass. This proves the
+evidence contract, not the still-unrecorded performance, RSS, or real-workload
+admission result.
+
+### Reproducible functional evidence
+
+Raw artifacts are uncommitted under
+`build/wric-chart-parallelization/phase6-870c298/`. The normal build uses
+RelWithDebInfo `-O2 -g -DNDEBUG`, GCC trunk
+`g++-trunk (GCC) 17.0.0 20260530 (experimental)`, and C++26 reflection. The
+TSan build uses the same configuration plus `-fsanitize=thread`; its runtime
+is the previously documented TLS-boundary-patched `libtsan.so.2.0.0`, SHA-256
+`58725dae226e91ea96bebbdf54f84820638404a691528570ec1dab595ed08842`.
+
+| Check | Exact command/result | Artifact SHA-256 |
+|---|---|---|
+| Focused RelWithDebInfo | `ctest --test-dir build --output-on-failure --parallel 4 -R '^(chart_scheduler_test|chart_parallel_test|chart_trim_test|chart_spr_search_test)$'`; 4/4 passed in 6.83 s | `475624e63b57748585e8f6f5f7c312bc3189bcbb47121470cc6bc7964bdab07a` |
+| Full RelWithDebInfo | `ctest --test-dir build --output-on-failure --parallel 8`; zero failures out of 161 in 176.96 s (159 passed and the two established optional tests skipped) | `b03850b288cd5e9237e38767bb3b1c5235f5190dcdf0cd31b8c7970be678e42b` |
+| Phase-0/bootstrap and adversarial benchmark harness | registered shell tests; both passed | `2a6f9fceba0a38cbdfa36474e8d03084d2211d7b044984bdbae38f9e8c57f84e` |
+| Targeted TSan | `LD_LIBRARY_PATH=.../patched-tsan-runtime:.../gcc-trunk/lib64 TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan-phase3-7d294d6 --output-on-failure --parallel 1 -R '^(chart_scheduler_test|chart_parallel_test|chart_trim_test|chart_spr_search_test)$'`; 4/4 passed in 32.33 s without a TSan report | `0f17116d44b07e4963a60483899621289da21d025a91de6d80cf1e050cf2ae7f` |
+
+The frozen inputs still hash as follows: runner
+`3dbf846e6aa05b007160d9b8d149a82f8e26c4e8099a4e4fc39fdbc63ab02104`,
+oracle
+`7ddb1fca7b15d1057912d6775b5e5fb32218390f13b3a10c6622581f21a5a38c`,
+seedtree
+`2a1059432188123629169118a3cf72ec4ad377f3c8479794990e10bb7da38153`,
+and reference sequence
+`088f7d8ebcf6277f1a971961ccaa9e797bd6e5269656e14bc782ba7fb4ec742c`.
+
+### Phase-6 exit decisions
+
+| Phase-6 exit criterion | Decision |
+|---|---|
+| Top-K `1,4,16` exact semantics and stable exceptions at W1/W2/W4/W8 | pass in the independent in-tree matrix; final frozen-workload capture remains a Phase-0-dependent final gate |
+| Medium Top-K-4 W8 `exact_verification_ms` at least 2.0x faster than same-revision W1 | pending sealed Phase-0 workload capture |
+| Real Top-K-16 stays within configured concurrent-memory admission bound | pending sealed real-workload run; synthetic/fixture admission, splitting, rejection, and estimator-backstop contracts pass |
+| W8 peak RSS no more than 2.0x W1 | pending paired sealed Phase-0 run |
+| Repeated W8 results byte-identical | pass in-tree for digest and full canonical sidecar; frozen-workload repetition remains pending |
+| Exact-search TSan and full CTest | pass at the code checkpoint; exact hashes are retained in the artifact manifest |
+
+Quiet-host Phase-0 calibration, capture, finalization, audit, and detached seal
+remain deferred under the authorized deadline-overlap rule. No same-revision
+diagnostic, unit fixture, or postprocessor regression is substituted for those
+performance gates.
 
 ## Later-phase evidence template
 
