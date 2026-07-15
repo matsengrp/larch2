@@ -213,7 +213,7 @@ add_test(NAME chart_spr_semantic_report_test
 # Header-only tests (no library link needed beyond include path)
 foreach(test_name chain_test dag_test hash_chain_test extend_dag_test
                   overlay_dag_test bigint_test weight_counter_test
-                  kmer_encoder_test likelihood_test)
+                  kmer_encoder_test likelihood_test lazy_key_grouping_test)
     add_executable(${test_name} test/${test_name}.cpp)
     target_include_directories(${test_name} PRIVATE include)
     add_test(NAME ${test_name} COMMAND ${test_name})
