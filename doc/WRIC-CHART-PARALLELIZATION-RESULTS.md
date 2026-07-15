@@ -1558,14 +1558,16 @@ overhead in its inside half. A second nested pattern/representative staging
 axis is therefore not justified. These measurements support only that
 conditional omission and are not sealed Phase-7 performance acceptance.
 
-An independent post-merge RelWithDebInfo check ran
-`chart_spr_search_test`, `chart_spr_allocation_test`,
-`chart_spr_phase10_test`, the two `dagutil` auto-policy tests, the chart-SPR
-auto CLI test, and the `larch2` rejection test. All 7/7 passed in 11.21 seconds.
-The raw log is
-`build/wric-chart-parallelization/phase7-auto-review/focused.ctest.log`,
+The current main worktree rebuilt `chart_spr_search_test`,
+`chart_spr_allocation_test`, `chart_spr_phase10_test`, `chart_parallel_test`,
+`dagutil`, `larch2`, and the counter compile check. The build log SHA-256 is
+`7521135fbfa6a5467afa63de43419baccdfd64c6ec509d5751f4c54323a8a4b5`.
+It then ran those four C++ tests, the two `dagutil` auto-policy tests, the
+chart-SPR auto CLI test, and the `larch2` rejection test. All 8/8 passed in
+11.38 seconds. The raw CTest log is
+`build/wric-chart-parallelization/phase7-38e9a28-main/focused.ctest.log`,
 SHA-256
-`c7706f1265090070e9b682a7ec479ab1cd9bb88e2925dd5189a25ec2bcabc9cc`.
+`4a7b9aeeba4ae6c3b1bd57e42f320efa099de39061dd004e333199635508a682`.
 A separate clean-tip review also passed the benchmark-harness regression and
 found no branch-specific accounting, scheduler-axis, formatting, or CLI
 blocker. Changed-line clang-format and `git diff --check` are clean.
