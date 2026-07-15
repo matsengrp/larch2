@@ -8579,6 +8579,15 @@ static void test_sampled_tree_fixed_topology_uses_source_certificate() {
   auto iteration = larch::run_chart_spr_acceptance_iteration(state, options);
 
   CHECK(iteration.candidates_scored > 0);
+  CHECK(
+      iteration.candidate_generation.sampled_tree_projection_moves_preassigned >
+      0);
+  CHECK(iteration.candidate_generation
+            .sampled_tree_projection_scheduler_operations > 0);
+  CHECK(iteration.candidate_generation
+            .sampled_tree_projection_move_enumeration_visits ==
+        2 * iteration.candidate_generation
+                .sampled_tree_projection_moves_preassigned);
   CHECK(iteration.candidates_exact_verified > 0);
   CHECK(iteration.accepted.has_value());
   CHECK(iteration.accepted->candidate.source_tree_move.has_value());

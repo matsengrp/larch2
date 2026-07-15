@@ -12661,6 +12661,39 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   if (capture_semantics) {
     result.canonical_seed = options.seed;
   }
+  if (enumeration.source != chart_spr_candidate_source::grammar) {
+    // Sampled-tree projection shares the one search-lifetime scheduler; no
+    // per-sample or per-wave scheduler/thread-pool may be constructed.
+    enumeration.sampled_tree_projection_scheduler = &scheduler;
+    if (exact_memory_budget != 0) {
+      enumeration.sampled_tree_projection_memory_budget_bytes =
+          enumeration.sampled_tree_projection_memory_budget_bytes == 0
+              ? exact_memory_budget
+              : std::min(
+                    exact_memory_budget,
+                    enumeration.sampled_tree_projection_memory_budget_bytes);
+    }
+
+    // Temporary pre-Phase7 envelope. On the combined branch this must be
+    // replaced by the full published-state resident estimate plus every
+    // caller-owned acceptance/rank/result/source capacity already live here;
+    // scheduler/prepared/tree/job/wave ownership remains in the projection
+    // estimator and must not be counted twice.
+    auto projection_external_resident = state.resident_pattern_cache_bytes;
+    if (state.exact_trim_active_only) {
+      projection_external_resident =
+          chart_spr_exact_candidate_checked_bytes_add(
+              projection_external_resident,
+              estimate_chart_spr_trim_resident_bytes(
+                  *state.exact_trim_active_only),
+              "chart SPR sampled-tree projection external resident bytes");
+    }
+    // A direct caller may already provide a broader resident estimate. Treat
+    // that as a total envelope, not an additive copy of the same search state.
+    enumeration.sampled_tree_projection_external_resident_bytes =
+        std::max(enumeration.sampled_tree_projection_external_resident_bytes,
+                 projection_external_resident);
+  }
 
   state.effective_candidate_batch_size = candidate_batch_size;
   auto local_options = local_spr_score_options{};

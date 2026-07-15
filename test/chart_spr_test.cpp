@@ -3,7 +3,9 @@
 #include "test_util.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <future>
+#include <latch>
 #include <limits>
 #include <optional>
 #include <print>
@@ -44,6 +46,17 @@ static_assert(std::is_same_v<
               decltype(std::declval<sampled_tree_projection_context const&>()
                            .source_tree()),
               larch::phylo_dag const&>);
+
+static larch::chart_scheduler make_projection_scheduler(std::size_t workers) {
+  return larch::chart_scheduler{
+      larch::chart_scheduler_options{.requested_workers = workers,
+                                     .default_minimum_grain = 1,
+                                     .default_target_ranges_per_worker = 1},
+      larch::chart_worker_topology_snapshot{
+          .affinity_logical_cpu_count = workers,
+          .affinity_physical_core_count = workers,
+          .hardware_thread_count = workers}};
+}
 
 static larch::test::tiny_tree_node four_taxon_base_tree() {
   using larch::test::tiny_inner;
@@ -325,6 +338,35 @@ static void check_candidate_payload_equal(
         clade_shape(rhs_materialized.grammar));
   CHECK(production_shape(lhs_materialized.grammar) ==
         production_shape(rhs_materialized.grammar));
+}
+
+static void check_legacy_generation_stats_equal(
+    larch::chart_spr_candidate_generation_stats const& lhs,
+    larch::chart_spr_candidate_generation_stats const& rhs) {
+  CHECK(lhs.candidates_generated_after_dedup ==
+        rhs.candidates_generated_after_dedup);
+  CHECK(lhs.upward_path_iterator_steps == rhs.upward_path_iterator_steps);
+  CHECK(lhs.upward_paths_completed == rhs.upward_paths_completed);
+  CHECK(lhs.path_pairs_considered == rhs.path_pairs_considered);
+  CHECK(lhs.candidates_constructed == rhs.candidates_constructed);
+  CHECK(lhs.candidates_pruned_before_construction ==
+        rhs.candidates_pruned_before_construction);
+  CHECK(lhs.candidates_pruned_after_construction ==
+        rhs.candidates_pruned_after_construction);
+  CHECK(lhs.candidates_pruned_root_or_trivial ==
+        rhs.candidates_pruned_root_or_trivial);
+  CHECK(lhs.candidates_pruned_moved_size == rhs.candidates_pruned_moved_size);
+  CHECK(lhs.candidates_pruned_target_size == rhs.candidates_pruned_target_size);
+  CHECK(lhs.candidates_pruned_overlap == rhs.candidates_pruned_overlap);
+  CHECK(lhs.candidates_pruned_affected_estimate ==
+        rhs.candidates_pruned_affected_estimate);
+  CHECK(lhs.candidates_pruned_immediate_reversal ==
+        rhs.candidates_pruned_immediate_reversal);
+  CHECK(lhs.candidates_pruned_duplicate == rhs.candidates_pruned_duplicate);
+  CHECK(lhs.candidates_pruned_invalid == rhs.candidates_pruned_invalid);
+  CHECK(lhs.spr_multifurcation_moves_generated ==
+        rhs.spr_multifurcation_moves_generated);
+  CHECK(lhs.stop_reason == rhs.stop_reason);
 }
 
 // Independent oracle for the pre-preparation projection algorithm.  It
@@ -746,6 +788,441 @@ static void test_phase8_prepared_projection_differential_all_emitted_moves() {
   std::println("  PASS");
 }
 
+static void test_phase8_parallel_sampled_projection_is_deterministic() {
+  std::println("test_phase8_parallel_sampled_projection_is_deterministic");
+
+  std::vector<larch::phylo_dag> source_trees;
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree()));
+  source_trees.push_back(larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_base_tree_root_swapped()));
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_cross_tree()));
+  auto dag = larch::test::merge_tiny_trees(std::move(source_trees));
+  auto grammar = larch::build_clade_grammar(dag);
+  auto source_before = snapshot_projection_source(dag);
+
+  for (auto seed : {std::uint32_t{1}, std::uint32_t{7}, std::uint32_t{19}}) {
+    std::vector<larch::grammar_spr_candidate> baseline;
+    larch::chart_spr_candidate_generation_stats baseline_stats;
+    for (auto workers :
+         {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+      auto scheduler = make_projection_scheduler(workers);
+      larch::grammar_spr_enumeration_options options;
+      options.source = larch::chart_spr_candidate_source::sampled_tree;
+      options.sampled_tree_source_dag = &dag;
+      options.sampled_tree_count = 1;
+      options.sampled_tree_spr_radius = 8;
+      options.sampled_tree_score_threshold = std::numeric_limits<int>::max();
+      options.randomize_order = true;
+      options.seed = seed;
+      options.sampled_tree_projection_scheduler = &scheduler;
+
+      std::atomic<std::size_t> hook_calls{0};
+      std::latch first_wave_started{2};
+      if (workers > 1) {
+        options.before_sampled_tree_projection_for_tests = [&](std::size_t) {
+          auto const call = hook_calls.fetch_add(1, std::memory_order_relaxed);
+          if (call >= 2) return;
+          first_wave_started.count_down();
+          first_wave_started.wait();
+        };
+      }
+
+      larch::chart_spr_candidate_generation_stats stats;
+      auto candidates = collect_candidates(grammar, options, &stats);
+      CHECK(!candidates.empty());
+      CHECK(stats.sampled_tree_projection_moves_preassigned >= workers);
+      CHECK(stats.sampled_tree_projection_move_enumeration_visits ==
+            2 * stats.sampled_tree_projection_moves_preassigned);
+      CHECK(stats.sampled_tree_projection_enumeration_passes == 2);
+      CHECK(stats.sampled_tree_projection_scheduler_operations > 0);
+      CHECK(stats.sampled_tree_projection_peak_wave_size ==
+            std::min(stats.sampled_tree_projection_moves_preassigned,
+                     workers * 4));
+      CHECK(stats.sampled_tree_projection_estimated_peak_bytes > 0);
+      if (workers == 1) {
+        CHECK(stats.sampled_tree_projection_parallel_operations == 0);
+        baseline = candidates;
+        baseline_stats = stats;
+      } else {
+        CHECK(stats.sampled_tree_projection_parallel_operations > 0);
+        CHECK(stats.sampled_tree_projection_ranges >= 2);
+        CHECK(stats.sampled_tree_projection_worker_tasks >= 2);
+        CHECK(stats.sampled_tree_projection_active_worker_high_water >= 2);
+        CHECK(candidates.size() == baseline.size());
+        check_legacy_generation_stats_equal(stats, baseline_stats);
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+          check_candidate_payload_equal(grammar, baseline[i], candidates[i]);
+        }
+      }
+      auto metrics = scheduler.metrics();
+      CHECK(metrics.pending_tasks == 0);
+      CHECK(metrics.tasks_submitted == metrics.tasks_completed);
+      CHECK(metrics.tasks_submitted == metrics.tasks_joined);
+      CHECK(snapshot_projection_source(dag) == source_before);
+    }
+  }
+
+  std::println("  PASS");
+}
+
+static void test_phase8_grammar_and_hybrid_worker_seed_matrix() {
+  std::println("test_phase8_grammar_and_hybrid_worker_seed_matrix");
+
+  std::vector<larch::phylo_dag> source_trees;
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree()));
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_cross_tree()));
+  auto dag = larch::test::merge_tiny_trees(std::move(source_trees));
+  auto grammar = larch::build_clade_grammar(dag);
+  auto source_before = snapshot_projection_source(dag);
+
+  for (auto source : {larch::chart_spr_candidate_source::grammar,
+                      larch::chart_spr_candidate_source::hybrid}) {
+    for (auto seed : {std::uint32_t{1}, std::uint32_t{7}, std::uint32_t{19}}) {
+      std::vector<larch::grammar_spr_candidate> baseline;
+      larch::chart_spr_candidate_generation_stats baseline_stats;
+      for (auto workers :
+           {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+        auto scheduler = make_projection_scheduler(workers);
+        larch::grammar_spr_enumeration_options options;
+        options.source = source;
+        options.sampled_tree_source_dag = &dag;
+        options.sampled_tree_count = 1;
+        options.sampled_tree_spr_radius = 8;
+        options.sampled_tree_score_threshold = std::numeric_limits<int>::max();
+        options.randomize_order = true;
+        options.seed = seed;
+        options.max_candidates = 8;
+        options.max_candidates_is_post_dedup = true;
+        options.sampled_tree_projection_scheduler = &scheduler;
+
+        larch::chart_spr_candidate_generation_stats stats;
+        auto candidates = collect_candidates(grammar, options, &stats);
+        CHECK(!candidates.empty());
+        if (source == larch::chart_spr_candidate_source::grammar) {
+          CHECK(stats.sampled_tree_projection_moves_preassigned == 0);
+          CHECK(stats.sampled_tree_projection_scheduler_operations == 0);
+        } else {
+          CHECK(stats.sampled_tree_projection_moves_preassigned > 0);
+          CHECK(stats.sampled_tree_projection_scheduler_operations > 0);
+          CHECK(stats.sampled_tree_projection_move_enumeration_visits ==
+                2 * stats.sampled_tree_projection_moves_preassigned);
+        }
+
+        if (workers == 1) {
+          baseline = candidates;
+          baseline_stats = stats;
+        } else {
+          CHECK(candidates.size() == baseline.size());
+          check_legacy_generation_stats_equal(stats, baseline_stats);
+          for (std::size_t i = 0; i < candidates.size(); ++i) {
+            check_candidate_payload_equal(grammar, baseline[i], candidates[i]);
+          }
+        }
+        CHECK(scheduler.metrics().pending_tasks == 0);
+        CHECK(snapshot_projection_source(dag) == source_before);
+      }
+    }
+  }
+
+  std::println("  PASS");
+}
+
+static void test_phase8_projection_budget_and_failure_atomicity() {
+  std::println("test_phase8_projection_budget_and_failure_atomicity");
+  using larch::chart_spr_detail::preassign_sampled_tree_projection_jobs;
+  using larch::chart_spr_detail::project_preassigned_sampled_tree_moves;
+
+  std::vector<larch::phylo_dag> source_trees;
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree()));
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_cross_tree()));
+  auto source = larch::test::merge_tiny_trees(std::move(source_trees));
+  auto grammar = larch::build_clade_grammar(source);
+
+  larch::grammar_spr_enumeration_options sample_options;
+  sample_options.sampled_tree_source_dag = &source;
+  sample_options.sampled_tree_spr_radius = 8;
+  sample_options.sampled_tree_score_threshold = std::numeric_limits<int>::max();
+  sample_options.randomize_order = true;
+  sample_options.seed = 19;
+  std::mt19937 tree_rng(sample_options.seed);
+  auto tree = larch::chart_spr_detail::build_sampled_tree_from_grammar(
+      grammar, sample_options, 0, tree_rng);
+  auto const projection_rng_state = tree_rng;
+  auto radius = sample_options.sampled_tree_spr_radius;
+  auto prepared =
+      larch::chart_spr_detail::prepare_sampled_tree_projection(grammar, tree);
+  auto source_before = snapshot_projection_source(tree);
+
+  auto collect_projection = [&](auto const& preassignment,
+                                auto const& options) {
+    std::vector<std::optional<larch::grammar_spr_candidate>> projected;
+    auto execution = project_preassigned_sampled_tree_moves(
+        prepared, preassignment, options,
+        [&](std::size_t ordinal,
+            std::optional<larch::grammar_spr_candidate> const& candidate) {
+          CHECK(ordinal == projected.size());
+          projected.push_back(candidate);
+          return true;
+        });
+    CHECK(execution.moves_preassigned == projected.size());
+    return projected;
+  };
+  auto check_projection_vectors =
+      [&](std::vector<std::optional<larch::grammar_spr_candidate>> const& lhs,
+          std::vector<std::optional<larch::grammar_spr_candidate>> const& rhs) {
+        CHECK(lhs.size() == rhs.size());
+        for (std::size_t i = 0; i < lhs.size(); ++i) {
+          CHECK(lhs[i].has_value() == rhs[i].has_value());
+          if (lhs[i]) check_candidate_payload_equal(grammar, *lhs[i], *rhs[i]);
+        }
+      };
+
+  auto baseline_scheduler = make_projection_scheduler(4);
+  auto baseline_options = sample_options;
+  baseline_options.sampled_tree_projection_scheduler = &baseline_scheduler;
+  auto baseline_rng = projection_rng_state;
+  auto baseline_preassignment = preassign_sampled_tree_projection_jobs(
+      prepared, baseline_options, radius, baseline_rng);
+  CHECK(baseline_preassignment.jobs.size() >= 8);
+  CHECK(baseline_preassignment.enumeration_passes == 2);
+  CHECK(baseline_preassignment.move_enumeration_visits ==
+        2 * baseline_preassignment.jobs.size());
+  auto baseline = collect_projection(baseline_preassignment, baseline_options);
+  std::size_t local_stop_calls = 0;
+  auto local_stop = project_preassigned_sampled_tree_moves(
+      prepared, baseline_preassignment, baseline_options,
+      [&](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+        ++local_stop_calls;
+        return false;
+      });
+  CHECK(local_stop_calls == 1);
+  CHECK(local_stop.speculative_discarded + 1 ==
+        baseline_preassignment.memory.wave_size);
+
+  // E is the irreducible one-slot projection peak. E succeeds exactly; E-1
+  // rejects before the all-moves vector, result wave, scheduler operation, or
+  // projection/callback hooks.
+  auto exact_scheduler = make_projection_scheduler(4);
+  auto exact_options = sample_options;
+  exact_options.sampled_tree_projection_scheduler = &exact_scheduler;
+  auto const exact_estimate =
+      larch::chart_spr_detail::estimate_sampled_tree_projection_memory(
+          prepared, &exact_scheduler, baseline_preassignment.jobs.size(), 1, 0);
+  CHECK(exact_estimate.safely_bounded);
+  auto const exact_budget = exact_estimate.required_peak_bytes;
+  CHECK(exact_budget > 0);
+  std::size_t exact_workspace_hooks = 0;
+  exact_options.sampled_tree_projection_memory_budget_bytes = exact_budget;
+  exact_options.before_sampled_tree_projection_workspace_allocation_for_tests =
+      [&] { ++exact_workspace_hooks; };
+  auto exact_rng = projection_rng_state;
+  auto exact_preassignment = preassign_sampled_tree_projection_jobs(
+      prepared, exact_options, radius, exact_rng);
+  CHECK(exact_workspace_hooks == 1);
+  CHECK(exact_preassignment.memory.required_peak_bytes == exact_budget);
+  CHECK(exact_preassignment.memory.wave_size == 1);
+  auto exact = collect_projection(exact_preassignment, exact_options);
+  check_projection_vectors(baseline, exact);
+
+  auto rejected_scheduler = make_projection_scheduler(4);
+  auto rejected_options = sample_options;
+  rejected_options.sampled_tree_projection_scheduler = &rejected_scheduler;
+  rejected_options.sampled_tree_projection_memory_budget_bytes =
+      exact_budget - 1;
+  std::size_t rejected_workspace_hooks = 0;
+  std::atomic<std::size_t> rejected_projection_hooks{0};
+  rejected_options
+      .before_sampled_tree_projection_workspace_allocation_for_tests = [&] {
+    ++rejected_workspace_hooks;
+  };
+  rejected_options.before_sampled_tree_projection_for_tests = [&](std::size_t) {
+    rejected_projection_hooks.fetch_add(1, std::memory_order_relaxed);
+  };
+  auto rejected_rng = projection_rng_state;
+  bool rejected = false;
+  try {
+    (void)preassign_sampled_tree_projection_jobs(prepared, rejected_options,
+                                                 radius, rejected_rng);
+  } catch (larch::sampled_tree_projection_budget_error const& error) {
+    rejected = true;
+    CHECK(error.required_bytes() == exact_budget);
+    CHECK(error.budget_bytes() == exact_budget - 1);
+  }
+  CHECK(rejected);
+  CHECK(rejected_workspace_hooks == 0);
+  CHECK(rejected_projection_hooks.load(std::memory_order_relaxed) == 0);
+  auto rejected_metrics = rejected_scheduler.metrics();
+  CHECK(rejected_metrics.operations == 0);
+  CHECK(rejected_metrics.pool_lifetimes == 0);
+  CHECK(rejected_metrics.pending_tasks == 0);
+
+  // A finite budget between the one-slot and maximum-wave peaks reduces wave
+  // concurrency instead of rejecting an otherwise admissible projection.
+  auto pressure_scheduler = make_projection_scheduler(4);
+  auto pressure_options = sample_options;
+  pressure_options.sampled_tree_projection_scheduler = &pressure_scheduler;
+  auto const two_slot_estimate =
+      larch::chart_spr_detail::estimate_sampled_tree_projection_memory(
+          prepared, &pressure_scheduler, baseline_preassignment.jobs.size(), 2,
+          0);
+  pressure_options.sampled_tree_projection_memory_budget_bytes =
+      two_slot_estimate.required_peak_bytes;
+  auto pressure_rng = projection_rng_state;
+  auto pressure_preassignment = preassign_sampled_tree_projection_jobs(
+      prepared, pressure_options, radius, pressure_rng);
+  CHECK(pressure_preassignment.memory.wave_size == 2);
+  CHECK(pressure_preassignment.memory.required_peak_bytes ==
+        two_slot_estimate.required_peak_bytes);
+
+  // Multiple task failures rethrow the lowest canonical range/ordinal and
+  // publish no gather result. Every submitted task joins before the throw, and
+  // the same scheduler/context recovers on the next operation.
+  auto failure_scheduler = make_projection_scheduler(4);
+  auto failure_options = sample_options;
+  failure_options.sampled_tree_projection_scheduler = &failure_scheduler;
+  auto failure_rng = projection_rng_state;
+  auto failure_preassignment = preassign_sampled_tree_projection_jobs(
+      prepared, failure_options, radius, failure_rng);
+  auto failure_plan = failure_scheduler.plan_indexed_ranges(
+      failure_preassignment.memory.wave_size,
+      {.minimum_grain = 1, .target_ranges_per_worker = 1});
+  CHECK(failure_plan.range_count >= 2);
+  auto const later_ordinal = failure_plan.effective_grain;
+  std::latch later_failure_started{1};
+  failure_options.before_sampled_tree_projection_for_tests =
+      [&](std::size_t ordinal) {
+        if (ordinal == 0) {
+          later_failure_started.wait();
+          throw std::runtime_error("lowest projection ordinal");
+        }
+        if (ordinal == later_ordinal) {
+          later_failure_started.count_down();
+          throw std::runtime_error("later projection ordinal");
+        }
+      };
+  std::size_t failed_gather_calls = 0;
+  bool stable_failure = false;
+  try {
+    (void)project_preassigned_sampled_tree_moves(
+        prepared, failure_preassignment, failure_options,
+        [&](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+          ++failed_gather_calls;
+          return true;
+        });
+  } catch (std::runtime_error const& error) {
+    stable_failure = std::string{error.what()} == "lowest projection ordinal";
+  }
+  CHECK(stable_failure);
+  CHECK(failed_gather_calls == 0);
+  auto failed_metrics = failure_scheduler.metrics();
+  CHECK(failed_metrics.pending_tasks == 0);
+  CHECK(failed_metrics.tasks_submitted == failed_metrics.tasks_completed);
+  CHECK(failed_metrics.tasks_submitted == failed_metrics.tasks_joined);
+  failure_options.before_sampled_tree_projection_for_tests = {};
+  auto recovered = collect_projection(failure_preassignment, failure_options);
+  check_projection_vectors(baseline, recovered);
+
+  // Inject failure after one accepted submit. Its stable first range may
+  // finish speculatively, but zero results are gathered and the one task is
+  // completed/joined before propagation. The one-shot hook then recovers.
+  auto submit_scheduler = make_projection_scheduler(4);
+  auto submit_options = sample_options;
+  submit_options.sampled_tree_projection_scheduler = &submit_scheduler;
+  auto submit_rng = projection_rng_state;
+  auto submit_preassignment = preassign_sampled_tree_projection_jobs(
+      prepared, submit_options, radius, submit_rng);
+  submit_options.force_sampled_tree_projection_submit_failure_after_for_tests =
+      1;
+  auto submit_before = submit_scheduler.metrics();
+  std::size_t submit_gather_calls = 0;
+  bool submit_failed = false;
+  try {
+    (void)project_preassigned_sampled_tree_moves(
+        prepared, submit_preassignment, submit_options,
+        [&](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+          ++submit_gather_calls;
+          return true;
+        });
+  } catch (larch::chart_scheduler_submit_error const&) {
+    submit_failed = true;
+  }
+  CHECK(submit_failed);
+  CHECK(submit_gather_calls == 0);
+  auto submit_after = submit_scheduler.metrics();
+  CHECK(submit_after.tasks_submitted - submit_before.tasks_submitted == 1);
+  CHECK(submit_after.tasks_completed - submit_before.tasks_completed == 1);
+  CHECK(submit_after.tasks_joined - submit_before.tasks_joined == 1);
+  CHECK(submit_after.pending_tasks == 0);
+  submit_options.force_sampled_tree_projection_submit_failure_after_for_tests
+      .reset();
+  auto submit_recovered =
+      collect_projection(submit_preassignment, submit_options);
+  check_projection_vectors(baseline, submit_recovered);
+
+  CHECK(snapshot_projection_source(tree) == source_before);
+  std::println("  PASS");
+}
+
+static void test_phase8_midwave_stop_preserves_legacy_counters() {
+  std::println("test_phase8_midwave_stop_preserves_legacy_counters");
+
+  std::vector<larch::phylo_dag> source_trees;
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree()));
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_cross_tree()));
+  auto source = larch::test::merge_tiny_trees(std::move(source_trees));
+  auto grammar = larch::build_clade_grammar(source);
+
+  larch::grammar_spr_enumeration_options serial_options;
+  serial_options.source = larch::chart_spr_candidate_source::sampled_tree;
+  serial_options.sampled_tree_source_dag = &source;
+  serial_options.sampled_tree_count = 1;
+  serial_options.sampled_tree_spr_radius = 8;
+  serial_options.sampled_tree_score_threshold = std::numeric_limits<int>::max();
+  serial_options.randomize_order = true;
+  serial_options.seed = 7;
+
+  std::vector<larch::grammar_spr_candidate> serial_candidates;
+  auto serial_stats = larch::for_each_grammar_spr_candidate(
+      grammar, serial_options,
+      [&](larch::grammar_spr_candidate const& candidate) {
+        serial_candidates.push_back(candidate);
+        return false;
+      });
+  CHECK(serial_candidates.size() == 1);
+  CHECK(serial_stats.stop_reason ==
+        larch::chart_spr_candidate_stop_reason::callback_stop);
+  CHECK(serial_stats.sampled_tree_projection_peak_wave_size == 1);
+  CHECK(serial_stats.sampled_tree_projection_speculative_discarded == 0);
+
+  auto scheduler = make_projection_scheduler(4);
+  auto parallel_options = serial_options;
+  parallel_options.sampled_tree_projection_scheduler = &scheduler;
+  std::vector<larch::grammar_spr_candidate> parallel_candidates;
+  auto parallel_stats = larch::for_each_grammar_spr_candidate(
+      grammar, parallel_options,
+      [&](larch::grammar_spr_candidate const& candidate) {
+        parallel_candidates.push_back(candidate);
+        return false;
+      });
+  CHECK(parallel_candidates.size() == 1);
+  check_candidate_payload_equal(grammar, serial_candidates.front(),
+                                parallel_candidates.front());
+  check_legacy_generation_stats_equal(serial_stats, parallel_stats);
+  CHECK(parallel_stats.sampled_tree_projection_parallel_operations > 0);
+  CHECK(parallel_stats.sampled_tree_projection_speculative_discarded > 0);
+  CHECK(scheduler.metrics().pending_tasks == 0);
+
+  std::println("  PASS");
+}
+
 static void test_phase6_randomized_and_reservoir_enumeration() {
   std::println("test_phase6_randomized_and_reservoir_enumeration");
 
@@ -940,6 +1417,10 @@ int main() {
   test_projected_tree_spr_matches_apply_spr_move();
   test_bootstrap_projection_from_tree_validates_against_apply();
   test_phase8_prepared_projection_differential_all_emitted_moves();
+  test_phase8_parallel_sampled_projection_is_deterministic();
+  test_phase8_grammar_and_hybrid_worker_seed_matrix();
+  test_phase8_projection_budget_and_failure_atomicity();
+  test_phase8_midwave_stop_preserves_legacy_counters();
   test_phase6_randomized_and_reservoir_enumeration();
   test_phase6_stable_taxon_dedup_across_equivalent_builds();
   test_phase6_sampled_tree_and_hybrid_sources();
