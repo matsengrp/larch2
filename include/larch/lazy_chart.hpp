@@ -1569,6 +1569,176 @@ inline std::size_t outside_class_index_for_pattern(
   return (*map)[pattern];
 }
 
+struct outside_context_key_grouping_memory_accounting {
+  std::size_t key_count = 0;
+  std::size_t key_width = 0;
+  std::size_t class_count = 0;
+  std::size_t logical_resident_bytes = 0;
+  std::size_t actual_capacity_resident_bytes = 0;
+  std::size_t observed_prepublication_peak_capacity_resident_bytes = 0;
+  lazy_key_grouping_detail::packed_key_word_buffer_preparation_report
+      word_preparation;
+  lazy_key_grouping_detail::packed_key_grouping_preparation_report
+      grouping_preparation;
+};
+
+struct outside_context_key_workspace {
+  std::vector<lazy_key_grouping_detail::packed_key_word> packed_words;
+  lazy_key_grouping_detail::packed_key_grouping_workspace grouping_workspace;
+  lazy_key_grouping_detail::packed_key_grouping_result grouping;
+
+  [[nodiscard]] std::size_t dynamic_capacity_bytes() const {
+    using lazy_key_grouping_detail::checked_packed_key_bytes_add;
+    auto total =
+        lazy_key_grouping_detail::packed_key_word_buffer_dynamic_capacity_bytes(
+            packed_words);
+    total = checked_packed_key_bytes_add(
+        total, grouping_workspace.dynamic_capacity_bytes(),
+        "lazy outside context-key workspace capacity");
+    return checked_packed_key_bytes_add(
+        total, grouping.dynamic_capacity_bytes(),
+        "lazy outside context-key workspace capacity");
+  }
+
+  [[nodiscard]] std::size_t resident_bytes() const {
+    return lazy_key_grouping_detail::checked_packed_key_bytes_add(
+        sizeof(*this), dynamic_capacity_bytes(),
+        "lazy outside context-key workspace resident");
+  }
+};
+
+struct packed_outside_context_keys {
+  outside_context_key_workspace* storage = nullptr;
+  std::size_t key_width = 0;
+  outside_context_key_grouping_memory_accounting memory;
+
+  [[nodiscard]] outside_context_key_workspace const& workspace() const {
+    if (storage == nullptr) {
+      throw std::logic_error(
+          "lazy chart: missing packed outside context-key storage");
+    }
+    return *storage;
+  }
+
+  [[nodiscard]] lazy_key_grouping_detail::packed_key_grouping_result const&
+  classes() const {
+    return workspace().grouping;
+  }
+
+  [[nodiscard]] std::span<lazy_key_grouping_detail::packed_key_word const>
+  key_words() const {
+    return workspace().packed_words;
+  }
+};
+
+inline std::size_t estimate_outside_context_key_grouping_logical_resident_bytes(
+    std::size_t key_count, std::size_t key_width,
+    std::size_t class_count) {
+  using namespace lazy_key_grouping_detail;
+  auto const estimate = estimate_packed_key_grouping_memory(key_count,
+                                                             key_width);
+  auto total = checked_packed_key_bytes_add(
+      sizeof(outside_context_key_workspace),
+      sizeof(packed_outside_context_keys),
+      "lazy outside context-key fixed resident estimate");
+  total = checked_packed_key_bytes_add(
+      total, estimate.packed_payload_logical_bytes,
+      "lazy outside context-key payload estimate");
+  total = checked_packed_key_bytes_add(
+      total, estimate.workspace_logical_dynamic_bytes,
+      "lazy outside context-key grouping-workspace estimate");
+  return checked_packed_key_bytes_add(
+      total,
+      estimate_packed_key_grouping_result_logical_dynamic_bytes(key_count,
+                                                                class_count),
+      "lazy outside context-key grouping-result estimate");
+}
+
+inline void record_outside_context_key_preparation_peak(
+    outside_context_key_grouping_memory_accounting& accounting,
+    std::size_t current_workspace_resident_bytes,
+    std::size_t previous_component_resident_bytes,
+    std::size_t observed_component_peak_resident_bytes) {
+  if (observed_component_peak_resident_bytes <
+      previous_component_resident_bytes) {
+    throw std::logic_error(
+        "lazy chart: packed-key preparation peak is below prior resident");
+  }
+  auto const staged_extra = observed_component_peak_resident_bytes -
+                            previous_component_resident_bytes;
+  auto peak = lazy_key_grouping_detail::checked_packed_key_bytes_add(
+      sizeof(packed_outside_context_keys), current_workspace_resident_bytes,
+      "lazy outside context-key preparation peak");
+  peak = lazy_key_grouping_detail::checked_packed_key_bytes_add(
+      peak, staged_extra, "lazy outside context-key preparation peak");
+  accounting.observed_prepublication_peak_capacity_resident_bytes = std::max(
+      accounting.observed_prepublication_peak_capacity_resident_bytes, peak);
+}
+
+inline void require_outside_context_key_grouping_success(
+    lazy_key_grouping_detail::packed_key_grouping_prepared_status status) {
+  if (!status.succeeded()) {
+    lazy_key_grouping_detail::throw_packed_key_grouping_prepared_failure(
+        status);
+  }
+}
+
+template <class PopulateWords>
+inline packed_outside_context_keys collect_packed_outside_context_keys(
+    std::size_t key_count, std::size_t key_width,
+    outside_context_key_workspace& workspace, PopulateWords&& populate_words) {
+  using namespace lazy_key_grouping_detail;
+  packed_outside_context_keys keys;
+  keys.storage = &workspace;
+  keys.key_width = key_width;
+  keys.memory.key_count = key_count;
+  keys.memory.key_width = key_width;
+
+  auto const estimate = estimate_packed_key_grouping_memory(key_count,
+                                                             key_width);
+  auto workspace_before = workspace.resident_bytes();
+  keys.memory.word_preparation = prepare_packed_key_word_buffer(
+      estimate.packed_word_count, workspace.packed_words);
+  record_outside_context_key_preparation_peak(
+      keys.memory, workspace_before,
+      keys.memory.word_preparation.previous_capacity_resident_bytes,
+      keys.memory.word_preparation
+          .observed_prepublication_peak_capacity_resident_bytes);
+  workspace.packed_words.resize(estimate.packed_word_count);
+  std::forward<PopulateWords>(populate_words)(
+      std::span<packed_key_word>{workspace.packed_words});
+
+  workspace_before = workspace.resident_bytes();
+  keys.memory.grouping_preparation = prepare_packed_key_grouping_storage(
+      key_count, workspace.grouping_workspace, workspace.grouping);
+  record_outside_context_key_preparation_peak(
+      keys.memory, workspace_before,
+      keys.memory.grouping_preparation.previous_owned_capacity_resident_bytes,
+      keys.memory.grouping_preparation
+          .observed_prepublication_peak_owned_capacity_resident_bytes);
+  auto const view = packed_key_matrix_view{
+      .key_count = key_count,
+      .key_width = key_width,
+      .words = workspace.packed_words,
+  };
+  require_outside_context_key_grouping_success(try_group_packed_keys_prepared(
+      view, workspace.grouping_workspace, workspace.grouping,
+      keys.memory.grouping_preparation
+          .prepared_owned_capacity_resident_bytes));
+  keys.memory.class_count = workspace.grouping.class_count();
+
+  keys.memory.logical_resident_bytes =
+      estimate_outside_context_key_grouping_logical_resident_bytes(
+          key_count, key_width, keys.memory.class_count);
+  keys.memory.actual_capacity_resident_bytes = checked_packed_key_bytes_add(
+      sizeof(packed_outside_context_keys), workspace.resident_bytes(),
+      "lazy outside context-key actual resident");
+  keys.memory.observed_prepublication_peak_capacity_resident_bytes = std::max(
+      keys.memory.observed_prepublication_peak_capacity_resident_bytes,
+      keys.memory.actual_capacity_resident_bytes);
+  return keys;
+}
+
 inline row_type compute_child_outside_contribution(
     lazy_multisite_chart const& chart, clade_grammar const& grammar,
     site_pattern_set const& patterns, grammar_production const& prod,
@@ -1611,24 +1781,40 @@ inline row_type compute_child_outside_contribution(
   return result;
 }
 
-inline std::vector<std::size_t> outside_context_key_for_pattern(
+inline packed_outside_context_keys collect_outside_context_keys(
     lazy_multisite_chart const& chart, clade_grammar const& grammar,
     site_pattern_set const& patterns, grammar_production const& prod,
-    std::size_t pattern) {
-  std::vector<std::size_t> key;
-  key.reserve(prod.children.size() + 1);
-  key.push_back(outside_class_index_for_pattern(chart, prod.parent, pattern));
-  for (auto child : prod.children) {
-    key.push_back(
-        inside_class_index_for_pattern(chart, grammar, patterns, child,
-                                       pattern));
-  }
-  return key;
+    outside_context_key_workspace& workspace) {
+  using namespace lazy_key_grouping_detail;
+  auto const key_width = checked_packed_key_count_add(
+      prod.children.size(), 1, "lazy grammar outside context-key width");
+  return collect_packed_outside_context_keys(
+      chart.pattern_count, key_width, workspace,
+      [&](std::span<packed_key_word> words) {
+        auto output = words.begin();
+        for (std::size_t pattern = 0; pattern < chart.pattern_count;
+             ++pattern) {
+          *output++ = checked_packed_key_word(
+              outside_class_index_for_pattern(chart, prod.parent, pattern),
+              "lazy grammar parent outside class index");
+          for (auto child : prod.children) {
+            *output++ = checked_packed_key_word(
+                inside_class_index_for_pattern(chart, grammar, patterns, child,
+                                               pattern),
+                "lazy grammar outside-context inside class index");
+          }
+        }
+        if (output != words.end()) {
+          throw std::logic_error(
+              "lazy chart: grammar outside context-key width mismatch");
+        }
+      });
 }
 
 inline void assign_outside_classes_for_clade(
     lazy_multisite_chart& chart, clade_grammar const& grammar,
-    site_pattern_set const& patterns, clade_id clade) {
+    site_pattern_set const& patterns, clade_id clade,
+    outside_context_key_workspace& key_workspace) {
   std::vector<row_type> outside_by_pattern(chart.pattern_count,
                                            parsimony_chart_detail::make_inf_row());
 
@@ -1647,18 +1833,16 @@ inline void assign_outside_classes_for_clade(
     parsimony_chart_detail::validate_production_inside_row_inputs(
         grammar, prod, pid, "lazy outside chart");
 
-    std::map<std::vector<std::size_t>, std::vector<std::size_t>>
-        patterns_by_context;
-    for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
-      auto key =
-          outside_context_key_for_pattern(chart, grammar, patterns, prod,
-                                          pattern);
-      patterns_by_context[std::move(key)].push_back(pattern);
-    }
+    auto const context_keys = collect_outside_context_keys(
+        chart, grammar, patterns, prod, key_workspace);
+    auto const& context_classes = context_keys.classes();
 
-    for (auto const& [key, members] : patterns_by_context) {
-      (void)key;
-      auto representative = members.front();
+    // The former ordered map traversed contexts lexicographically. Packed
+    // class IDs are first-occurrence IDs, so use the explicit lexicographic
+    // order to preserve contribution, counter, and exception order exactly.
+    for (auto context_class : context_classes.lexicographic_class_order) {
+      auto const representative =
+          context_classes.representative_by_class[context_class];
       auto parent_outside_class =
           outside_class_index_for_pattern(chart, prod.parent, representative);
       if (prod.children.size() != 2) {
@@ -1667,7 +1851,7 @@ inline void assign_outside_classes_for_clade(
       auto contribution = compute_child_outside_contribution(
           chart, grammar, patterns, prod, child_slot, representative,
           parent_outside_class, chart.outside_recurrence_work);
-      for (auto pattern : members) {
+      for (auto pattern : context_classes.members_for_class(context_class)) {
         auto& row = outside_by_pattern[pattern];
         for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
           row[state] = std::min(row[state], contribution[state]);
@@ -1694,6 +1878,17 @@ inline void assign_outside_classes_for_clade(
   }
 
   chart.outside_class_index_by_pattern_by_clade[clade] = std::move(class_map);
+}
+
+// Keep the existing single-clade boundary source compatible. Full outside
+// construction passes reusable scratch explicitly; isolated refresh callers
+// own scratch for the duration of this one assignment.
+inline void assign_outside_classes_for_clade(
+    lazy_multisite_chart& chart, clade_grammar const& grammar,
+    site_pattern_set const& patterns, clade_id clade) {
+  outside_context_key_workspace key_workspace;
+  assign_outside_classes_for_clade(chart, grammar, patterns, clade,
+                                   key_workspace);
 }
 
 // Trusted-plan counterparts of the lazy outside helpers above.  The compiled
@@ -1744,26 +1939,43 @@ inline row_type compute_child_outside_contribution(
   return result;
 }
 
-inline std::vector<std::size_t> outside_context_key_for_pattern(
+inline packed_outside_context_keys collect_outside_context_keys(
     lazy_multisite_chart const& chart, chart_execution_plan const& plan,
     site_pattern_set const& patterns, production_id pid,
-    std::size_t pattern) {
+    outside_context_key_workspace& workspace) {
+  using namespace lazy_key_grouping_detail;
   auto const& production = plan.production(pid);
   auto const children = plan.children(pid);
-  std::vector<std::size_t> key;
-  key.reserve(children.size() + 1);
-  key.push_back(
-      outside_class_index_for_pattern(chart, production.parent, pattern));
-  for (auto child : children) {
-    key.push_back(plan_inside_class_index_for_pattern(chart, plan, patterns,
-                                                      child, pattern));
-  }
-  return key;
+  auto const key_width = checked_packed_key_count_add(
+      children.size(), 1, "lazy plan outside context-key width");
+  return collect_packed_outside_context_keys(
+      chart.pattern_count, key_width, workspace,
+      [&](std::span<packed_key_word> words) {
+        auto output = words.begin();
+        for (std::size_t pattern = 0; pattern < chart.pattern_count;
+             ++pattern) {
+          *output++ = checked_packed_key_word(
+              outside_class_index_for_pattern(chart, production.parent,
+                                              pattern),
+              "lazy plan parent outside class index");
+          for (auto child : children) {
+            *output++ = checked_packed_key_word(
+                plan_inside_class_index_for_pattern(chart, plan, patterns,
+                                                    child, pattern),
+                "lazy plan outside-context inside class index");
+          }
+        }
+        if (output != words.end()) {
+          throw std::logic_error(
+              "lazy chart: plan outside context-key width mismatch");
+        }
+      });
 }
 
 inline void assign_outside_classes_for_clade(
     lazy_multisite_chart& chart, chart_execution_plan const& plan,
-    site_pattern_set const& patterns, clade_id clade) {
+    site_pattern_set const& patterns, clade_id clade,
+    outside_context_key_workspace& key_workspace) {
   std::vector<row_type> outside_by_pattern(
       chart.pattern_count, parsimony_chart_detail::make_inf_row());
 
@@ -1772,17 +1984,13 @@ inline void assign_outside_classes_for_clade(
     auto const child_slot = occurrence.child_slot;
     auto const& production = plan.production(pid);
 
-    std::map<std::vector<std::size_t>, std::vector<std::size_t>>
-        patterns_by_context;
-    for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
-      auto key = outside_context_key_for_pattern(chart, plan, patterns, pid,
-                                                 pattern);
-      patterns_by_context[std::move(key)].push_back(pattern);
-    }
+    auto const context_keys = collect_outside_context_keys(
+        chart, plan, patterns, pid, key_workspace);
+    auto const& context_classes = context_keys.classes();
 
-    for (auto const& [key, members] : patterns_by_context) {
-      (void)key;
-      auto const representative = members.front();
+    for (auto context_class : context_classes.lexicographic_class_order) {
+      auto const representative =
+          context_classes.representative_by_class[context_class];
       auto const parent_outside_class = outside_class_index_for_pattern(
           chart, production.parent, representative);
       if (!production.is_binary()) {
@@ -1791,7 +1999,7 @@ inline void assign_outside_classes_for_clade(
       auto const contribution = compute_child_outside_contribution(
           chart, plan, patterns, pid, child_slot, representative,
           parent_outside_class, chart.outside_recurrence_work);
-      for (auto pattern : members) {
+      for (auto pattern : context_classes.members_for_class(context_class)) {
         auto& row = outside_by_pattern[pattern];
         for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
           row[state] = std::min(row[state], contribution[state]);
@@ -1818,6 +2026,14 @@ inline void assign_outside_classes_for_clade(
   }
 
   chart.outside_class_index_by_pattern_by_clade[clade] = std::move(class_map);
+}
+
+inline void assign_outside_classes_for_clade(
+    lazy_multisite_chart& chart, chart_execution_plan const& plan,
+    site_pattern_set const& patterns, clade_id clade) {
+  outside_context_key_workspace key_workspace;
+  assign_outside_classes_for_clade(chart, plan, patterns, clade,
+                                   key_workspace);
 }
 
 inline void finalize_outside_counters(lazy_multisite_chart& chart) {
@@ -2398,10 +2614,12 @@ inline void build_lazy_outside_chart_in_place(
     chart.outside_global_min_by_pattern[pattern] = best;
   }
 
+  outside_context_key_workspace context_key_workspace;
   auto order = chart_trim_detail::clades_by_decreasing_size(grammar);
   for (auto clade : order) {
     if (clade == root) continue;
-    assign_outside_classes_for_clade(chart, grammar, patterns, clade);
+    assign_outside_classes_for_clade(chart, grammar, patterns, clade,
+                                     context_key_workspace);
   }
 
   finalize_outside_counters(chart);
@@ -2492,9 +2710,11 @@ inline void build_lazy_outside_chart_in_place(
     chart.outside_global_min_by_pattern[pattern] = best;
   }
 
+  outside_context_key_workspace context_key_workspace;
   for (auto clade : plan.top_down_order()) {
     if (clade == root) continue;
-    assign_outside_classes_for_clade(chart, plan, patterns, clade);
+    assign_outside_classes_for_clade(chart, plan, patterns, clade,
+                                     context_key_workspace);
   }
 
   finalize_outside_counters(chart);

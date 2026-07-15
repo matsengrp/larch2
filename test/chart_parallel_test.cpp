@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <print>
 #include <stdexcept>
 #include <string>
@@ -1064,6 +1065,280 @@ static void test_grammar_packed_key_first_occurrence_reuse_and_accounting() {
   CHECK(reused.memory.row_grouping_preparation.reused_existing_capacity);
 }
 
+static std::vector<std::size_t> outside_context_key_from_chart(
+    larch::lazy_multisite_chart const& chart,
+    larch::grammar_production const& production, std::size_t pattern) {
+  auto const& outside_map =
+      chart.outside_class_index_by_pattern_by_clade[production.parent];
+  CHECK(outside_map.has_value());
+  std::vector<std::size_t> key;
+  key.reserve(production.children.size() + 1);
+  key.push_back((*outside_map)[pattern]);
+  for (auto child : production.children) {
+    auto const& inside_map = chart.class_index_by_pattern_by_clade[child];
+    CHECK(inside_map.has_value());
+    key.push_back((*inside_map)[pattern]);
+  }
+  return key;
+}
+
+static void check_packed_outside_context_against_ordered_map(
+    larch::clade_grammar const& grammar,
+    larch::chart_execution_plan const& plan,
+    larch::site_pattern_set const& patterns,
+    larch::lazy_multisite_chart const& chart, larch::production_id pid,
+    std::size_t expected_arity,
+    std::vector<std::size_t> const& expected_class_by_input,
+    std::vector<std::size_t> const& expected_representatives,
+    std::vector<std::size_t> const& expected_lexicographic_order,
+    bool require_collision) {
+  auto const& production = grammar.productions[pid];
+  CHECK(production.children.size() == expected_arity);
+
+  std::map<std::vector<std::size_t>, std::vector<std::size_t>> ordered_oracle;
+  for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
+    ordered_oracle[outside_context_key_from_chart(chart, production, pattern)]
+        .push_back(pattern);
+  }
+
+  larch::lazy_chart_detail::outside_context_key_workspace grammar_workspace;
+  larch::lazy_chart_detail::outside_context_key_workspace plan_workspace;
+  {
+    auto const grammar_keys =
+        larch::lazy_chart_detail::collect_outside_context_keys(
+            chart, grammar, patterns, production, grammar_workspace);
+    auto const plan_keys =
+        larch::lazy_chart_detail::collect_outside_context_keys(
+            chart, plan, patterns, pid, plan_workspace);
+    auto const& classes = grammar_keys.classes();
+
+    CHECK(grammar_keys.key_width == expected_arity + 1);
+    CHECK(grammar_keys.memory.key_count == chart.pattern_count);
+    CHECK(grammar_keys.memory.key_width == grammar_keys.key_width);
+    CHECK(grammar_keys.memory.class_count == ordered_oracle.size());
+    CHECK(grammar_keys.key_words().size() ==
+          chart.pattern_count * grammar_keys.key_width);
+    CHECK(classes.class_by_input == expected_class_by_input);
+    CHECK(classes.representative_by_class == expected_representatives);
+    CHECK(classes.lexicographic_class_order ==
+          expected_lexicographic_order);
+    CHECK(grammar_keys.memory.actual_capacity_resident_bytes >=
+          grammar_keys.memory.logical_resident_bytes);
+    CHECK(
+        grammar_keys.memory
+            .observed_prepublication_peak_capacity_resident_bytes >=
+        grammar_keys.memory.actual_capacity_resident_bytes);
+    CHECK(plan_keys.memory.actual_capacity_resident_bytes >=
+          plan_keys.memory.logical_resident_bytes);
+    CHECK(plan_keys.memory.observed_prepublication_peak_capacity_resident_bytes >=
+          plan_keys.memory.actual_capacity_resident_bytes);
+    CHECK(std::ranges::equal(grammar_keys.key_words(), plan_keys.key_words()));
+    CHECK(grammar_keys.classes() == plan_keys.classes());
+
+    for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
+      auto const expected_key =
+          outside_context_key_from_chart(chart, production, pattern);
+      for (std::size_t word = 0; word < expected_key.size(); ++word) {
+        CHECK(grammar_keys.key_words()[pattern * grammar_keys.key_width + word] ==
+              larch::lazy_key_grouping_detail::checked_packed_key_word(
+                  expected_key[word], "test outside context key"));
+      }
+    }
+
+    std::vector<std::size_t> expected_lexicographic_class_order;
+    for (auto const& [key, members] : ordered_oracle) {
+      (void)key;
+      auto const context_class = classes.class_by_input[members.front()];
+      expected_lexicographic_class_order.push_back(context_class);
+      CHECK(classes.representative_by_class[context_class] == members.front());
+      CHECK(std::vector<std::size_t>(
+                classes.members_for_class(context_class).begin(),
+                classes.members_for_class(context_class).end()) == members);
+      for (auto member : members) {
+        CHECK(classes.class_by_input[member] == context_class);
+      }
+    }
+    CHECK(classes.lexicographic_class_order ==
+          expected_lexicographic_class_order);
+
+    {
+      bool has_nonlex_position = false;
+      for (std::size_t position = 0;
+           position < classes.lexicographic_class_order.size(); ++position) {
+        has_nonlex_position |=
+            classes.lexicographic_class_order[position] != position;
+      }
+      CHECK(has_nonlex_position);
+    }
+    if (require_collision) {
+      CHECK(classes.class_count() < chart.pattern_count);
+    }
+  }
+
+  auto const reused_grammar =
+      larch::lazy_chart_detail::collect_outside_context_keys(
+          chart, grammar, patterns, production, grammar_workspace);
+  CHECK(reused_grammar.memory.word_preparation.reused_existing_capacity);
+  CHECK(reused_grammar.memory.grouping_preparation.reused_existing_capacity);
+  auto const reused_plan =
+      larch::lazy_chart_detail::collect_outside_context_keys(
+          chart, plan, patterns, pid, plan_workspace);
+  CHECK(reused_plan.memory.word_preparation.reused_existing_capacity);
+  CHECK(reused_plan.memory.grouping_preparation.reused_existing_capacity);
+}
+
+static void test_packed_outside_context_order_reuse_and_accounting() {
+  std::println("test_packed_outside_context_order_reuse_and_accounting");
+  using larch::lazy_key_grouping_detail::checked_packed_key_word;
+  using larch::lazy_key_grouping_detail::packed_key_word;
+  auto const word_max =
+      static_cast<std::size_t>((std::numeric_limits<packed_key_word>::max)());
+  CHECK(checked_packed_key_word(word_max, "test outside context class index") ==
+        (std::numeric_limits<packed_key_word>::max)());
+  if ((std::numeric_limits<std::size_t>::max)() > word_max) {
+    auto const message = runtime_error_message([&] {
+      (void)checked_packed_key_word(word_max + 1,
+                                    "test outside context class index");
+    });
+    CHECK(message.find("test outside context class index") !=
+          std::string::npos);
+    CHECK(message.find("does not fit") != std::string::npos);
+  }
+
+  auto const logical = larch::lazy_chart_detail::
+      estimate_outside_context_key_grouping_logical_resident_bytes(6, 3, 5);
+  CHECK(logical >
+        sizeof(larch::lazy_chart_detail::outside_context_key_workspace));
+  auto const overflow = runtime_error_message([&] {
+    (void)larch::lazy_chart_detail::
+        estimate_outside_context_key_grouping_logical_resident_bytes(
+            (std::numeric_limits<std::size_t>::max)(), 2, 1);
+  });
+  CHECK(overflow.find("overflow") != std::string::npos);
+
+  {
+    larch::lazy_chart_detail::outside_context_key_workspace empty_workspace;
+    auto const empty =
+        larch::lazy_chart_detail::collect_packed_outside_context_keys(
+            0, 3, empty_workspace,
+            [&](std::span<packed_key_word> words) { CHECK(words.empty()); });
+    CHECK(empty.classes().class_count() == 0);
+    CHECK(empty.classes().class_by_input.empty());
+    CHECK(empty.classes().lexicographic_class_order.empty());
+    CHECK(empty.memory.actual_capacity_resident_bytes >=
+          empty.memory.logical_resident_bytes);
+  }
+
+  {
+    auto const grammar = make_nonlex_binary_dag_grammar();
+    auto const plan = larch::build_chart_execution_plan(grammar);
+    auto const patterns = make_nonlex_four_taxon_patterns();
+    auto chart = larch::build_lazy_inside_chart(grammar, patterns);
+    chart = larch::build_lazy_outside_chart(grammar, patterns,
+                                            std::move(chart));
+    CHECK(chart.lazy_outside_rows_computed == 28);
+    CHECK(chart.outside_multifurcation_productions_scored == 0);
+    CHECK(chart.outside_recurrence_work.binary_stack_productions_scored == 68);
+    CHECK(chart.outside_recurrence_work.generic_reusable_productions_scored ==
+          0);
+    auto const pid = grammar.productions_by_parent[grammar.root_clade].front();
+    check_packed_outside_context_against_ordered_map(
+        grammar, plan, patterns, chart, pid, 2,
+        std::vector<std::size_t>{0, 1, 2, 3, 3, 4},
+        std::vector<std::size_t>{0, 1, 2, 3, 5},
+        std::vector<std::size_t>{0, 2, 1, 3, 4}, true);
+  }
+
+  {
+    auto const grammar = make_nonlex_multifurcating_grammar();
+    auto const plan = larch::build_chart_execution_plan(grammar);
+    auto const patterns = make_nonlex_four_taxon_patterns();
+    auto chart = larch::build_lazy_inside_chart(grammar, patterns);
+    chart = larch::build_lazy_outside_chart(grammar, patterns,
+                                            std::move(chart));
+    CHECK(chart.lazy_outside_rows_computed == 25);
+    CHECK(chart.outside_multifurcation_productions_scored == 18);
+    CHECK(chart.outside_recurrence_work.binary_stack_productions_scored == 12);
+    CHECK(chart.outside_recurrence_work.generic_reusable_productions_scored ==
+          18);
+    auto const pid = grammar.productions_by_parent[grammar.root_clade].front();
+    check_packed_outside_context_against_ordered_map(
+        grammar, plan, patterns, chart, pid, 3,
+        std::vector<std::size_t>{0, 1, 2, 3, 4, 5},
+        std::vector<std::size_t>{0, 1, 2, 3, 4, 5},
+        std::vector<std::size_t>{0, 2, 4, 3, 1, 5}, false);
+  }
+}
+
+static void test_packed_outside_context_preserves_exception_order() {
+  std::println("test_packed_outside_context_preserves_exception_order");
+  auto const grammar = make_trinary_grammar();
+  auto const plan = larch::build_chart_execution_plan(grammar);
+  larch::site_pattern_set patterns;
+  patterns.taxon_count = 3;
+  patterns.patterns = {
+      larch::site_pattern{.state_by_taxon = {0, 0, 0}, .weight = 1},
+      larch::site_pattern{.state_by_taxon = {0, 0, 0}, .weight = 2},
+  };
+
+  auto corrupt_and_reset = [&](larch::lazy_multisite_chart& chart) {
+    auto& corrupted_map =
+        *chart.class_index_by_pattern_by_clade[larch::clade_id{1}];
+    CHECK(chart.inside_rows_by_clade[larch::clade_id{1}].size() == 1);
+    CHECK((corrupted_map == std::vector<std::size_t>{0, 0}));
+    corrupted_map[0] = 1;
+    chart.outside_rows_by_clade[larch::clade_id{0}].clear();
+    chart.outside_class_weight_by_clade[larch::clade_id{0}].clear();
+    chart.outside_class_index_by_pattern_by_clade[larch::clade_id{0}] =
+        std::nullopt;
+    chart.outside_multifurcation_productions_scored = 0;
+    chart.outside_recurrence_work = {};
+  };
+
+  auto grammar_chart = larch::build_lazy_inside_chart(grammar, patterns);
+  grammar_chart = larch::build_lazy_outside_chart(
+      grammar, patterns, std::move(grammar_chart));
+  corrupt_and_reset(grammar_chart);
+  larch::lazy_chart_detail::outside_context_key_workspace grammar_workspace;
+  {
+    auto const keys = larch::lazy_chart_detail::collect_outside_context_keys(
+        grammar_chart, grammar, patterns, grammar.productions.front(),
+        grammar_workspace);
+    CHECK((keys.classes().class_by_input ==
+           std::vector<std::size_t>{0, 1}));
+    CHECK((keys.classes().lexicographic_class_order ==
+           std::vector<std::size_t>{1, 0}));
+  }
+  auto const grammar_error = runtime_error_message([&] {
+    larch::lazy_chart_detail::assign_outside_classes_for_clade(
+        grammar_chart, grammar, patterns, larch::clade_id{0},
+        grammar_workspace);
+  });
+  CHECK(grammar_error.find("child inside class index out of range") !=
+        std::string::npos);
+  CHECK(grammar_chart.outside_multifurcation_productions_scored == 2);
+  CHECK(grammar_chart.outside_recurrence_work
+            .generic_reusable_productions_scored == 2);
+  CHECK(grammar_chart.outside_recurrence_work.binary_stack_productions_scored ==
+        0);
+
+  auto plan_chart = larch::build_lazy_inside_chart(plan, patterns);
+  plan_chart =
+      larch::build_lazy_outside_chart(plan, patterns, std::move(plan_chart));
+  corrupt_and_reset(plan_chart);
+  larch::lazy_chart_detail::outside_context_key_workspace plan_workspace;
+  auto const plan_error = runtime_error_message([&] {
+    larch::lazy_chart_detail::assign_outside_classes_for_clade(
+        plan_chart, plan, patterns, larch::clade_id{0}, plan_workspace);
+  });
+  CHECK(plan_error == grammar_error);
+  CHECK(plan_chart.outside_multifurcation_productions_scored == 2);
+  CHECK(plan_chart.outside_recurrence_work
+            .generic_reusable_productions_scored == 2);
+  CHECK(plan_chart.outside_recurrence_work.binary_stack_productions_scored ==
+        0);
+}
+
 static void test_checked_and_plan_exact_frontier_equivalence() {
   std::println("test_checked_and_plan_exact_frontier_equivalence");
   auto grammar = make_binary_grammar();
@@ -1200,6 +1475,8 @@ int main() {
   test_nonlex_packed_plan_lazy_grouping_equivalence();
   test_plan_packed_key_narrowing_and_accounting();
   test_grammar_packed_key_first_occurrence_reuse_and_accounting();
+  test_packed_outside_context_order_reuse_and_accounting();
+  test_packed_outside_context_preserves_exception_order();
   test_checked_and_plan_exact_frontier_equivalence();
   test_stale_and_mismatched_plan_rejected();
   test_plan_lifetime_and_uninitialized_guards();
