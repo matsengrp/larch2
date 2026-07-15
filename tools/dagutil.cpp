@@ -3318,6 +3318,49 @@ static void print_chart_spr_search_counter_fields(
       << counters.local_score_parallel_batches << "\n";
   out << indent << "local_score_worker_tasks: "
       << counters.local_score_worker_tasks << "\n";
+  out << indent
+      << "lazy_local_admission_waves: " << counters.lazy_local_admission_waves
+      << "\n";
+  out << indent
+      << "lazy_local_parallel_waves: " << counters.lazy_local_parallel_waves
+      << "\n";
+  out << indent << "lazy_local_memory_limited_waves: "
+      << counters.lazy_local_memory_limited_waves << "\n";
+  out << indent << "lazy_local_admitted_concurrency_max: "
+      << counters.lazy_local_admitted_concurrency_max << "\n";
+  out << indent
+      << "lazy_local_prepared_tasks: " << counters.lazy_local_prepared_tasks
+      << "\n";
+  out << indent << "lazy_local_reused_prepared_tasks: "
+      << counters.lazy_local_reused_prepared_tasks << "\n";
+  out << indent << "lazy_local_pre_submit_budget_failures: "
+      << counters.lazy_local_pre_submit_budget_failures << "\n";
+  out << indent << "lazy_local_peak_admitted_bytes: "
+      << counters.lazy_local_peak_admitted_bytes << "\n";
+  out << indent << "lazy_local_peak_projected_resident_bytes: "
+      << counters.lazy_local_peak_projected_resident_bytes << "\n";
+  out << indent << "lazy_local_preparation_peak_bytes: "
+      << counters.lazy_local_preparation_peak_bytes << "\n";
+  out << indent << "lazy_local_result_output_resident_bytes_max: "
+      << counters.lazy_local_result_output_resident_bytes_max << "\n";
+  out << indent << "lazy_local_retained_exact_trim_bytes_max: "
+      << counters.lazy_local_retained_exact_trim_bytes_max << "\n";
+  out << indent << "lazy_local_canonical_exact_evidence_resident_bytes_max: "
+      << counters.lazy_local_canonical_exact_evidence_resident_bytes_max
+      << "\n";
+  out << indent
+      << "lazy_local_canonical_exact_evidence_construction_peak_bytes_max: "
+      << counters
+             .lazy_local_canonical_exact_evidence_construction_peak_bytes_max
+      << "\n";
+  out << indent << "lazy_local_runtime_transient_reservation_bytes_max: "
+      << counters.lazy_local_runtime_transient_reservation_bytes_max << "\n";
+  out << indent << "lazy_local_iteration_envelope_bytes_max: "
+      << counters.lazy_local_iteration_envelope_bytes_max << "\n";
+  out << indent << "lazy_local_iteration_task_stable_bytes_max: "
+      << counters.lazy_local_iteration_task_stable_bytes_max << "\n";
+  out << indent << "lazy_local_iteration_task_preparation_peak_bytes_max: "
+      << counters.lazy_local_iteration_task_preparation_peak_bytes_max << "\n";
   out << indent << "candidate_batches_scored: "
       << counters.candidate_batches_scored << "\n";
   out << indent << "pattern_batch_cache_builds: "
@@ -4445,6 +4488,47 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.local_rows_recomputed_per_second << "\n";
   out << "  local_unit_fitch_fast_path_productions_scored: "
       << search.summary.local_unit_fitch_fast_path_productions_scored << "\n";
+  out << "  lazy_local_admission_waves: "
+      << search.summary.lazy_local_admission_waves << "\n";
+  out << "  lazy_local_parallel_waves: "
+      << search.summary.lazy_local_parallel_waves << "\n";
+  out << "  lazy_local_memory_limited_waves: "
+      << search.summary.lazy_local_memory_limited_waves << "\n";
+  out << "  lazy_local_admitted_concurrency_max: "
+      << search.summary.lazy_local_admitted_concurrency_max << "\n";
+  out << "  lazy_local_prepared_tasks: "
+      << search.summary.lazy_local_prepared_tasks << "\n";
+  out << "  lazy_local_reused_prepared_tasks: "
+      << search.summary.lazy_local_reused_prepared_tasks << "\n";
+  out << "  lazy_local_pre_submit_budget_failures: "
+      << search.summary.lazy_local_pre_submit_budget_failures << "\n";
+  out << "  lazy_local_peak_admitted_bytes: "
+      << search.summary.lazy_local_peak_admitted_bytes << "\n";
+  out << "  lazy_local_peak_projected_resident_bytes: "
+      << search.summary.lazy_local_peak_projected_resident_bytes << "\n";
+  out << "  lazy_local_preparation_peak_bytes: "
+      << search.summary.lazy_local_preparation_peak_bytes << "\n";
+  out << "  lazy_local_result_output_resident_bytes_max: "
+      << search.summary.lazy_local_result_output_resident_bytes_max << "\n";
+  out << "  lazy_local_retained_exact_trim_bytes_max: "
+      << search.summary.lazy_local_retained_exact_trim_bytes_max << "\n";
+  out << "  lazy_local_canonical_exact_evidence_resident_bytes_max: "
+      << search.summary.lazy_local_canonical_exact_evidence_resident_bytes_max
+      << "\n";
+  out << "  lazy_local_canonical_exact_evidence_construction_peak_bytes_max: "
+      << search.summary
+             .lazy_local_canonical_exact_evidence_construction_peak_bytes_max
+      << "\n";
+  out << "  lazy_local_runtime_transient_reservation_bytes_max: "
+      << search.summary.lazy_local_runtime_transient_reservation_bytes_max
+      << "\n";
+  out << "  lazy_local_iteration_envelope_bytes_max: "
+      << search.summary.lazy_local_iteration_envelope_bytes_max << "\n";
+  out << "  lazy_local_iteration_task_stable_bytes_max: "
+      << search.summary.lazy_local_iteration_task_stable_bytes_max << "\n";
+  out << "  lazy_local_iteration_task_preparation_peak_bytes_max: "
+      << search.summary.lazy_local_iteration_task_preparation_peak_bytes_max
+      << "\n";
   out << "  candidate_batches_scored: "
       << search.summary.candidate_batches_scored << "\n";
   out << "  pattern_batch_cache_builds: "

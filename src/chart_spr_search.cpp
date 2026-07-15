@@ -4349,6 +4349,40 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.local_row_scratch_capacity_growths;
   summary.multifurcation_productions_scored =
       counters.multifurcation_productions_scored;
+  summary.lazy_local_admission_waves = counters.lazy_local_admission_waves;
+  summary.lazy_local_parallel_waves = counters.lazy_local_parallel_waves;
+  summary.lazy_local_memory_limited_waves =
+      counters.lazy_local_memory_limited_waves;
+  summary.lazy_local_admitted_concurrency_max =
+      counters.lazy_local_admitted_concurrency_max;
+  summary.lazy_local_prepared_tasks = counters.lazy_local_prepared_tasks;
+  summary.lazy_local_reused_prepared_tasks =
+      counters.lazy_local_reused_prepared_tasks;
+  summary.lazy_local_pre_submit_budget_failures =
+      counters.lazy_local_pre_submit_budget_failures;
+  summary.lazy_local_peak_admitted_bytes =
+      counters.lazy_local_peak_admitted_bytes;
+  summary.lazy_local_peak_projected_resident_bytes =
+      counters.lazy_local_peak_projected_resident_bytes;
+  summary.lazy_local_preparation_peak_bytes =
+      counters.lazy_local_preparation_peak_bytes;
+  summary.lazy_local_result_output_resident_bytes_max =
+      counters.lazy_local_result_output_resident_bytes_max;
+  summary.lazy_local_retained_exact_trim_bytes_max =
+      counters.lazy_local_retained_exact_trim_bytes_max;
+  summary.lazy_local_canonical_exact_evidence_resident_bytes_max =
+      counters.lazy_local_canonical_exact_evidence_resident_bytes_max;
+  summary.lazy_local_canonical_exact_evidence_construction_peak_bytes_max =
+      counters
+          .lazy_local_canonical_exact_evidence_construction_peak_bytes_max;
+  summary.lazy_local_runtime_transient_reservation_bytes_max =
+      counters.lazy_local_runtime_transient_reservation_bytes_max;
+  summary.lazy_local_iteration_envelope_bytes_max =
+      counters.lazy_local_iteration_envelope_bytes_max;
+  summary.lazy_local_iteration_task_stable_bytes_max =
+      counters.lazy_local_iteration_task_stable_bytes_max;
+  summary.lazy_local_iteration_task_preparation_peak_bytes_max =
+      counters.lazy_local_iteration_task_preparation_peak_bytes_max;
   summary.candidate_batches_scored = counters.candidate_batches_scored;
   summary.pattern_batch_cache_builds = counters.pattern_batch_cache_builds;
   summary.initial_state_inside_charts_built =
@@ -4585,6 +4619,703 @@ void chart_spr_refresh_search_summary_from_current_lazy_chart(
 }
 
 }  // namespace
+
+namespace chart_spr_search_detail {
+
+std::size_t effective_lazy_local_admission_budget_bytes(
+    chart_spr_search_state const& state,
+    local_spr_score_options const& options) noexcept {
+  auto budget = options.admission_memory_budget_bytes;
+  if (state.cache_opts.memory_budget_bytes != 0) {
+    budget = budget == 0
+                 ? state.cache_opts.memory_budget_bytes
+                 : std::min(budget, state.cache_opts.memory_budget_bytes);
+  }
+  return budget;
+}
+
+namespace {
+
+struct lazy_local_candidate_preflight {
+  std::size_t stable_dynamic_capacity_bytes = 0;
+  std::size_t preparation_peak_dynamic_capacity_bytes = 0;
+};
+
+// Allocation-free upper envelope from a grammar-native candidate's structural
+// shape. A factor of two covers frozen libstdc++ vector growth for push-built
+// flat/nested arrays; the preparation envelope additionally covers old+new
+// reserve publication and the explicit packed-grouping staging reports.
+lazy_local_candidate_preflight estimate_lazy_local_candidate_shape_preflight(
+    chart_spr_search_state const& state, std::size_t temp_clades,
+    std::size_t temp_productions, std::size_t removed_productions,
+    std::size_t temp_children, std::size_t candidate_owned_dynamic_bytes) {
+  auto add = [](std::size_t lhs, std::size_t rhs, std::string_view context) {
+    return local_capacity_checked_add(lhs, rhs, context);
+  };
+  auto multiply = [](std::size_t lhs, std::size_t rhs,
+                     std::string_view context) {
+    return local_capacity_checked_multiply(lhs, rhs, context);
+  };
+  auto vector_growth_bytes = [&](std::size_t count, std::size_t width,
+                                 std::string_view context) {
+    return multiply(2, multiply(count, width, context), context);
+  };
+
+  auto const base_clades = state.grammar.clades.size();
+  auto const total_clades = add(base_clades, temp_clades,
+                                "chart SPR lazy-local preflight clade count");
+  auto const base_productions = state.grammar.productions.size();
+  auto const total_productions =
+      add(base_productions, temp_productions,
+          "chart SPR lazy-local preflight production count");
+
+  std::size_t base_children = 0;
+  for (auto const& production : state.grammar.productions) {
+    base_children = add(base_children, production.children.size(),
+                        "chart SPR lazy-local preflight base children");
+  }
+  auto const total_children = add(base_children, temp_children,
+                                  "chart SPR lazy-local preflight child count");
+
+  // Candidate payload copied into the descriptor, including every nested
+  // clade/production/witness vector. The source capacities dominate copied
+  // logical sizes; doubling covers destination outer-vector growth.
+  auto descriptor =
+      multiply(2, candidate_owned_dynamic_bytes,
+               "chart SPR lazy-local preflight copied candidate payload");
+
+  auto add_descriptor_vector = [&](std::size_t count, std::size_t width,
+                                   std::string_view context) {
+    descriptor =
+        add(descriptor, vector_growth_bytes(count, width, context), context);
+  };
+  add_descriptor_vector(removed_productions, sizeof(production_id),
+                        "chart SPR lazy-local preflight removed productions");
+  add_descriptor_vector(total_clades, sizeof(overlay_clade_ref),
+                        "chart SPR lazy-local preflight affected order");
+  // local_owned_dynamic_capacity_bytes(vector<bool>) intentionally measures
+  // its bit-capacity as bytes. Allow one allocator word of rounding per bool
+  // vector before applying the normal growth factor.
+  auto const rounded_base_bits =
+      add(base_clades, 64, "chart SPR lazy-local preflight base flags");
+  auto const rounded_temp_bits =
+      add(temp_clades, 64, "chart SPR lazy-local preflight temp flags");
+  auto const rounded_production_bits = add(
+      base_productions, 64, "chart SPR lazy-local preflight production flags");
+  add_descriptor_vector(multiply(2, rounded_base_bits,
+                                 "chart SPR lazy-local preflight base flags"),
+                        sizeof(bool),
+                        "chart SPR lazy-local preflight base flags");
+  add_descriptor_vector(multiply(2, rounded_temp_bits,
+                                 "chart SPR lazy-local preflight temp flags"),
+                        sizeof(bool),
+                        "chart SPR lazy-local preflight temp flags");
+  add_descriptor_vector(rounded_production_bits, sizeof(bool),
+                        "chart SPR lazy-local preflight production flags");
+  add_descriptor_vector(base_clades, sizeof(std::size_t),
+                        "chart SPR lazy-local preflight base row slots");
+  add_descriptor_vector(temp_clades, sizeof(std::size_t),
+                        "chart SPR lazy-local preflight temp row slots");
+  add_descriptor_vector(total_clades, sizeof(candidate_chart_row_descriptor),
+                        "chart SPR lazy-local preflight compiled rows");
+  add_descriptor_vector(total_productions,
+                        sizeof(candidate_chart_production_descriptor),
+                        "chart SPR lazy-local preflight compiled productions");
+  add_descriptor_vector(total_children,
+                        sizeof(candidate_chart_child_descriptor),
+                        "chart SPR lazy-local preflight compiled children");
+
+  // Four temporary-production indices own two base-sized and two temp-sized
+  // outer arrays. Across each parent/child pair a temporary production id is
+  // stored exactly once per parent and once per child.
+  auto const index_outer_rows =
+      multiply(2, total_clades, "chart SPR lazy-local preflight index rows");
+  add_descriptor_vector(index_outer_rows, sizeof(std::vector<production_id>),
+                        "chart SPR lazy-local preflight index rows");
+  auto const index_entries =
+      add(temp_productions, temp_children,
+          "chart SPR lazy-local preflight index entries");
+  add_descriptor_vector(index_entries, sizeof(production_id),
+                        "chart SPR lazy-local preflight index entries");
+
+  // Serial builder traversal buffers. The reachability stack can retain all
+  // pending child occurrences, while the affected queue contains at most one
+  // entry per clade.
+  add_descriptor_vector(total_children, sizeof(overlay_clade_ref),
+                        "chart SPR lazy-local preflight reachability stack");
+  add_descriptor_vector(total_clades, sizeof(overlay_clade_ref),
+                        "chart SPR lazy-local preflight affected queue");
+  descriptor = add(descriptor, lazy_local_invalid_reason_owned_capacity_bound(),
+                   "chart SPR lazy-local preflight invalid-reason capacity");
+
+  auto const patterns = state.active_patterns.patterns.patterns.size();
+  auto const key_components =
+      add(total_clades, total_children,
+          "chart SPR lazy-local preflight key components");
+  auto const key_width = add(
+      1,
+      multiply(2, key_components, "chart SPR lazy-local preflight key width"),
+      "chart SPR lazy-local preflight key width");
+  auto const grouping =
+      lazy_key_grouping_detail::estimate_packed_key_grouping_memory(patterns,
+                                                                    key_width);
+  auto scratch = multiply(2, grouping.worst_case_logical_total_resident_bytes,
+                          "chart SPR lazy-local preflight grouping capacity");
+  scratch = add(
+      scratch,
+      vector_growth_bytes(patterns, sizeof(lazy_overlay_context_accumulator),
+                          "chart SPR lazy-local preflight contexts"),
+      "chart SPR lazy-local preflight contexts");
+  scratch =
+      add(scratch,
+          vector_growth_bytes(total_clades,
+                              sizeof(std::array<chart_cost, nuc_state_count>),
+                              "chart SPR lazy-local preflight rows"),
+          "chart SPR lazy-local preflight rows");
+
+  auto stable = add(descriptor, scratch,
+                    "chart SPR lazy-local preflight stable capacity");
+  stable = add(stable, lazy_local_worker_error_transient_capacity_bound(),
+               "chart SPR lazy-local worker error-path transient");
+  auto preparation =
+      add(multiply(2, descriptor,
+                   "chart SPR lazy-local preflight descriptor preparation"),
+          multiply(4, scratch,
+                   "chart SPR lazy-local preflight scratch preparation"),
+          "chart SPR lazy-local preflight preparation peak");
+  preparation = add(preparation,
+                    lazy_local_worker_error_transient_capacity_bound(),
+                    "chart SPR lazy-local preparation error transient");
+  return lazy_local_candidate_preflight{
+      .stable_dynamic_capacity_bytes = stable,
+      .preparation_peak_dynamic_capacity_bytes = preparation,
+  };
+}
+
+lazy_local_candidate_preflight estimate_lazy_local_candidate_preflight(
+    chart_spr_search_state const& state, grammar_spr_candidate const& candidate,
+    local_spr_score_options const& options) {
+  if (options.verify_against_full_overlay) {
+    // The full-materialization oracle is test-only and has a separate dense
+    // grammar/chart allocation graph. It is deliberately unsupported under a
+    // finite local admission budget rather than guessed at here.
+    return lazy_local_candidate_preflight{
+        .stable_dynamic_capacity_bytes =
+            (std::numeric_limits<std::size_t>::max)(),
+        .preparation_peak_dynamic_capacity_bytes =
+            (std::numeric_limits<std::size_t>::max)(),
+    };
+  }
+  std::size_t temp_children = 0;
+  for (auto const& production : candidate.added_productions) {
+    temp_children = local_capacity_checked_add(
+        temp_children, production.children.size(),
+        "chart SPR lazy-local preflight temporary children");
+  }
+  return estimate_lazy_local_candidate_shape_preflight(
+      state, candidate.added_clades.size(), candidate.added_productions.size(),
+      candidate.removed_productions.size(), temp_children,
+      local_owned_dynamic_capacity_bytes(candidate));
+}
+
+// Own the public accounting and retained-task cleanup for the entire lazy
+// wave operation. Worker counters are drained before a slot is reused and
+// zeroed immediately, so this final sweep folds only payload that survived an
+// exceptional exit. Finite operations also shed every task high-water on all
+// exits; unlimited operations retain their historical reuse behavior.
+class lazy_local_wave_operation_guard {
+ public:
+  lazy_local_wave_operation_guard(
+      chart_spr_search_state const& state,
+      chart_spr_local_score_workspace& workspace, std::size_t task_count,
+      bool release_retained_storage,
+      chart_spr_search_counters& aggregate) noexcept
+      : state_(state),
+        workspace_(workspace),
+        task_count_(task_count),
+        release_retained_storage_(release_retained_storage),
+        aggregate_(aggregate) {}
+
+  lazy_local_wave_operation_guard(lazy_local_wave_operation_guard const&) =
+      delete;
+  lazy_local_wave_operation_guard& operator=(
+      lazy_local_wave_operation_guard const&) = delete;
+
+  ~lazy_local_wave_operation_guard() noexcept {
+    for (std::size_t slot = 0; slot < task_count_; ++slot) {
+      fold_worker(slot);
+      if (release_retained_storage_) {
+        local_score_workspace_access::release_task_retained_storage(workspace_,
+                                                                    slot);
+      }
+    }
+    add_chart_spr_search_counters(state_.counters, aggregate_);
+  }
+
+  void fold_worker(std::size_t slot) noexcept {
+    auto& counters =
+        local_score_workspace_access::worker(workspace_, slot).counters;
+    add_chart_spr_search_counters(aggregate_, counters);
+    counters = {};
+  }
+
+  void release_slot(std::size_t slot) noexcept {
+    fold_worker(slot);
+    local_score_workspace_access::release_task_retained_storage(workspace_,
+                                                                slot);
+  }
+
+  void release_slots(std::size_t count) noexcept {
+    for (std::size_t slot = 0; slot < count; ++slot) release_slot(slot);
+  }
+
+ private:
+  chart_spr_search_state const& state_;
+  chart_spr_local_score_workspace& workspace_;
+  std::size_t task_count_;
+  bool release_retained_storage_;
+  chart_spr_search_counters& aggregate_;
+};
+
+}  // namespace
+
+void score_candidates_locally_lazy_waves_into(
+    chart_spr_search_state const& state,
+    std::span<grammar_spr_candidate const> candidates,
+    std::span<chart_spr_local_score_result> results,
+    chart_spr_local_score_workspace& workspace,
+    local_spr_score_options const& options, chart_scheduler* scheduler,
+    std::size_t task_limit,
+    checked_chart_execution_plan_ref const& checked_state) {
+  chart_spr_search_counters aggregate;
+  if (candidates.empty()) return;
+  ++aggregate.candidate_batches_scored;
+  task_limit =
+      std::max<std::size_t>(1, std::min(task_limit, candidates.size()));
+
+  auto const budget =
+      effective_lazy_local_admission_budget_bytes(state, options);
+  auto const enforce_budget = budget != 0;
+  lazy_local_wave_operation_guard operation_guard{
+      state, workspace, task_limit, enforce_budget, aggregate};
+  auto resident_base = local_capacity_checked_add(
+      estimate_chart_spr_published_state_resident_bytes(state),
+      options.admission_additional_resident_bytes,
+      "chart SPR lazy-local shared resident capacity");
+  resident_base = local_capacity_checked_add(
+      resident_base,
+      local_score_workspace_access::fixed_resident_capacity_bytes(workspace),
+      "chart SPR lazy-local workspace resident capacity");
+
+  auto fail_budget = [&](std::size_t candidate, std::size_t required,
+                         std::size_t available) -> void {
+    ++aggregate.lazy_local_pre_submit_budget_failures;
+    throw chart_spr_lazy_local_budget_error(candidate, required, available);
+  };
+  if (enforce_budget && resident_base > budget) {
+    fail_budget(0, resident_base, budget);
+  }
+
+  auto slots_dynamic_capacity = [&](std::size_t count) {
+    std::size_t total = 0;
+    for (std::size_t slot = 0; slot < count; ++slot) {
+      total = local_capacity_checked_add(
+          total,
+          local_score_workspace_access::task_dynamic_capacity_bytes(workspace,
+                                                                    slot),
+          "chart SPR lazy-local retained task slots");
+    }
+    return total;
+  };
+  auto runtime_transient_reservation = [](std::size_t count) {
+    return local_capacity_checked_multiply(
+        count, lazy_local_worker_error_transient_capacity_bound(),
+        "chart SPR lazy-local simultaneous worker transient reservation");
+  };
+
+  for (std::size_t begin = 0; begin < candidates.size();) {
+    std::size_t admitted = 0;
+    std::size_t admitted_dynamic = 0;
+    bool memory_limited = false;
+
+    while (admitted < task_limit && begin + admitted < candidates.size()) {
+      auto const candidate_index = begin + admitted;
+      auto const prospective_scheduler_peak =
+          scheduler != nullptr && admitted + 1 > 1
+              ? estimate_exact_loop_scheduler_operation_peak_bytes(admitted + 1,
+                                                                   true)
+              : 0;
+      lazy_local_candidate_preflight preflight{
+          .stable_dynamic_capacity_bytes =
+              (std::numeric_limits<std::size_t>::max)(),
+          .preparation_peak_dynamic_capacity_bytes =
+              (std::numeric_limits<std::size_t>::max)(),
+      };
+      if (enforce_budget) {
+        preflight = estimate_lazy_local_candidate_preflight(
+            state, candidates[candidate_index], options);
+      }
+
+      struct candidate_preflight_fit {
+        bool preparation = true;
+        bool stable = true;
+        std::size_t preparation_available =
+            (std::numeric_limits<std::size_t>::max)();
+        std::size_t stable_available =
+            (std::numeric_limits<std::size_t>::max)();
+      };
+      auto check_preflight = [&]() {
+        candidate_preflight_fit fit;
+        if (!enforce_budget) return fit;
+        auto const slots_dynamic = slots_dynamic_capacity(task_limit);
+        auto const old_slot =
+            local_score_workspace_access::task_dynamic_capacity_bytes(workspace,
+                                                                      admitted);
+        auto const other_slots = slots_dynamic - old_slot;
+        auto const preparation_base = local_capacity_checked_add(
+            resident_base, slots_dynamic,
+            "chart SPR lazy-local retained preparation base");
+        fit.preparation_available =
+            preparation_base <= budget ? budget - preparation_base : 0;
+        fit.preparation = preparation_base <= budget &&
+                          preflight.preparation_peak_dynamic_capacity_bytes <=
+                              fit.preparation_available;
+
+        auto stable_base = local_capacity_checked_add(
+            resident_base, other_slots,
+            "chart SPR lazy-local retained stable base");
+        stable_base = local_capacity_checked_add(
+            stable_base, runtime_transient_reservation(admitted),
+            "chart SPR lazy-local prior worker transient reservations");
+        stable_base = local_capacity_checked_add(
+            stable_base, prospective_scheduler_peak,
+            "chart SPR lazy-local planned scheduler operation");
+        fit.stable_available = stable_base <= budget ? budget - stable_base : 0;
+        auto const old_slot_runtime = local_capacity_checked_add(
+            old_slot, runtime_transient_reservation(1),
+            "chart SPR lazy-local retained task runtime reservation");
+        fit.stable =
+            stable_base <= budget &&
+            std::max(old_slot_runtime,
+                     preflight.stable_dynamic_capacity_bytes) <=
+                fit.stable_available;
+        return fit;
+      };
+
+      auto preflight_fit = check_preflight();
+      if (enforce_budget &&
+          (!preflight_fit.preparation || !preflight_fit.stable)) {
+        // Retain already admitted slots, but shed the current and other
+        // not-yet-admitted high-water slots before falling back to a cold
+        // candidate preparation. This makes reuse the ordinary large-budget
+        // path without allowing stale capacity to squeeze a later wave.
+        for (std::size_t slot = admitted; slot < task_limit; ++slot) {
+          operation_guard.release_slot(slot);
+        }
+        preflight_fit = check_preflight();
+      }
+      if (enforce_budget &&
+          (!preflight_fit.preparation || !preflight_fit.stable)) {
+        if (admitted == 0) {
+          if (!preflight_fit.preparation) {
+            fail_budget(candidate_index,
+                        preflight.preparation_peak_dynamic_capacity_bytes,
+                        preflight_fit.preparation_available);
+          }
+          fail_budget(candidate_index, preflight.stable_dynamic_capacity_bytes,
+                      preflight_fit.stable_available);
+        }
+        memory_limited = true;
+        break;
+      }
+
+      auto& prepared =
+          local_score_workspace_access::prepared(workspace, admitted);
+      auto& worker = local_score_workspace_access::worker(workspace, admitted);
+      prepared.reset_for_prepare();
+      worker.reset_for_operation();
+      auto const prepare_start = std::chrono::steady_clock::now();
+      auto const before_dynamic =
+          local_score_workspace_access::task_dynamic_capacity_bytes(workspace,
+                                                                    admitted);
+      auto const before_slots_dynamic = slots_dynamic_capacity(task_limit);
+      auto const reused_prepared_storage = begin != 0 && before_dynamic != 0;
+      lazy_local_scratch_preparation_report scratch_report;
+      try {
+        if (enforce_budget) prepared.reserve_finite_invalid_reason();
+        prepare_local_candidate_score_into(state, candidates[candidate_index],
+                                           options, &aggregate, checked_state,
+                                           prepared);
+        if (prepared.valid_for_accumulation) {
+          try {
+            scratch_report = prepare_lazy_local_score_scratch_for_candidate(
+                state, prepared.delta(), worker.scratch, &aggregate);
+          } catch (chart_spr_lazy_local_budget_error const&) {
+            throw;
+          } catch (chart_spr_lazy_local_enumeration_budget_error const&) {
+            throw;
+          } catch (chart_spr_exact_candidate_budget_error const&) {
+            throw;
+          } catch (chart_spr_exact_state_budget_error const&) {
+            throw;
+          } catch (std::bad_alloc const&) {
+            throw;
+          } catch (std::overflow_error const&) {
+            throw;
+          } catch (std::length_error const&) {
+            throw;
+          }
+        }
+      } catch (...) {
+        throw;
+      }
+      prepared.result.local_score_ms =
+          chart_spr_elapsed_ms(prepare_start, std::chrono::steady_clock::now());
+      auto const task_dynamic =
+          local_score_workspace_access::task_dynamic_capacity_bytes(workspace,
+                                                                    admitted);
+      auto prep_peak = local_capacity_checked_add(
+          before_dynamic, task_dynamic,
+          "chart SPR lazy-local descriptor preparation peak");
+      if (scratch_report.observed_prepublication_peak_dynamic_capacity_bytes !=
+          0) {
+        prep_peak = std::max(
+            prep_peak,
+            local_capacity_checked_add(
+                task_dynamic - worker.dynamic_capacity_bytes(),
+                scratch_report
+                    .observed_prepublication_peak_dynamic_capacity_bytes,
+                "chart SPR lazy-local scratch preparation peak"));
+      }
+      auto const projected_prep_peak = local_capacity_checked_add(
+          resident_base,
+          local_capacity_checked_add(
+              before_slots_dynamic - before_dynamic, prep_peak,
+              "chart SPR lazy-local wave preparation peak"),
+          "chart SPR lazy-local projected preparation peak");
+      aggregate.lazy_local_preparation_peak_bytes = std::max(
+          aggregate.lazy_local_preparation_peak_bytes, projected_prep_peak);
+
+      bool fits = true;
+      std::size_t projected_stable = 0;
+      if (enforce_budget) {
+        // Measured capacities are the post-allocation enforcement backstop for
+        // the conservative preflight. Check both stable admission and the
+        // observed old+new preparation high-water before publishing the task.
+        // Also fail closed if a frozen-toolchain assumption in the preflight
+        // ever underestimates an observed capacity despite a looser budget.
+        auto const after_slots_dynamic = slots_dynamic_capacity(task_limit);
+        projected_stable = local_capacity_checked_add(
+            local_capacity_checked_add(
+                resident_base,
+                local_capacity_checked_add(
+                    after_slots_dynamic,
+                    runtime_transient_reservation(admitted + 1),
+                    "chart SPR lazy-local measured worker transients"),
+                "chart SPR lazy-local measured stable resident"),
+            prospective_scheduler_peak,
+            "chart SPR lazy-local measured operation resident");
+        auto const stable_assumption = std::max(
+            local_capacity_checked_add(
+                before_dynamic, runtime_transient_reservation(1),
+                "chart SPR lazy-local retained stable assumption"),
+            preflight.stable_dynamic_capacity_bytes);
+        auto const measured_task_runtime = local_capacity_checked_add(
+            task_dynamic, runtime_transient_reservation(1),
+            "chart SPR lazy-local measured task runtime reservation");
+        auto const preparation_assumption = local_capacity_checked_add(
+            before_dynamic, preflight.preparation_peak_dynamic_capacity_bytes,
+            "chart SPR lazy-local preparation assumption");
+        fits = projected_prep_peak <= budget && projected_stable <= budget &&
+               measured_task_runtime <= stable_assumption &&
+               prep_peak <= preparation_assumption;
+      }
+      if (!fits) {
+        // This is not an ordinary memory-limited prefix: allocation has
+        // already demonstrated that a frozen preflight assumption was wrong.
+        // Preserve the hard integrity failure and leave no retained task
+        // payload live at the public boundary.
+        fail_budget(candidate_index,
+                    std::max(projected_prep_peak, projected_stable), budget);
+      }
+      admitted_dynamic = local_capacity_checked_add(
+          admitted_dynamic,
+          local_capacity_checked_add(
+              task_dynamic, runtime_transient_reservation(1),
+              "chart SPR lazy-local admitted task and transient"),
+          "chart SPR lazy-local admitted capacity");
+      ++admitted;
+      ++aggregate.lazy_local_prepared_tasks;
+      if (reused_prepared_storage) {
+        ++aggregate.lazy_local_reused_prepared_tasks;
+      }
+    }
+
+    if (admitted == 0) {
+      throw std::logic_error(
+          "chart SPR lazy-local admission produced an empty wave");
+    }
+    ++aggregate.lazy_local_admission_waves;
+    aggregate.lazy_local_admitted_concurrency_max =
+        std::max(aggregate.lazy_local_admitted_concurrency_max, admitted);
+    aggregate.lazy_local_peak_admitted_bytes =
+        std::max(aggregate.lazy_local_peak_admitted_bytes, admitted_dynamic);
+    auto const wave_runtime_transient_reservation =
+        runtime_transient_reservation(admitted);
+    aggregate.lazy_local_runtime_transient_reservation_bytes_max = std::max(
+        aggregate.lazy_local_runtime_transient_reservation_bytes_max,
+        wave_runtime_transient_reservation);
+    auto const scheduler_operation_peak =
+        scheduler != nullptr && admitted > 1
+            ? estimate_exact_loop_scheduler_operation_peak_bytes(admitted, true)
+            : 0;
+    auto const retained_wave_dynamic = local_capacity_checked_add(
+        slots_dynamic_capacity(task_limit), wave_runtime_transient_reservation,
+        "chart SPR lazy-local retained wave and worker transients");
+    aggregate.lazy_local_peak_projected_resident_bytes =
+        std::max(aggregate.lazy_local_peak_projected_resident_bytes,
+                 local_capacity_checked_add(
+                     local_capacity_checked_add(
+                         resident_base, retained_wave_dynamic,
+                         "chart SPR lazy-local retained wave resident"),
+                     scheduler_operation_peak,
+                     "chart SPR lazy-local admitted projected resident"));
+    if (memory_limited) ++aggregate.lazy_local_memory_limited_waves;
+
+    auto run_one = [&](std::size_t slot) {
+      auto& prepared = local_score_workspace_access::prepared(workspace, slot);
+      if (!prepared.valid_for_accumulation) return;
+      auto& worker = local_score_workspace_access::worker(workspace, slot);
+      if (options.force_all_lazy_worker_invariant_failures_for_tests ||
+          options.force_lazy_worker_invariant_failure_for_tests == slot) {
+        worker.scratch.stage_lazy_worker_failure(
+            lazy_local_worker_failure_kind::forced_for_tests);
+        prepared.valid_for_accumulation = false;
+        return;
+      }
+      auto const start = std::chrono::steady_clock::now();
+      accumulate_prepared_local_candidate_lazy_prepared(
+          state, prepared, options, &worker.counters, worker.scratch,
+          checked_state);
+      prepared.result.local_score_ms +=
+          chart_spr_elapsed_ms(start, std::chrono::steady_clock::now());
+    };
+
+    try {
+      if (admitted == 1) {
+        run_one(0);
+      } else {
+        if (scheduler == nullptr) {
+          throw std::logic_error(
+              "chart SPR lazy-local wave: parallel wave without scheduler");
+        }
+        auto const range_options =
+            chart_indexed_range_options{.minimum_grain = 1,
+                                        .target_ranges_per_worker = 1};
+        auto const range_plan =
+            scheduler->plan_indexed_ranges(admitted, range_options);
+        auto const scheduler_before = scheduler->metrics();
+        try {
+          auto run =
+              run_local_score_scheduler_operation(*scheduler, options, [&] {
+                return scheduler->for_each_indexed_range(
+                    admitted, range_options,
+                    [&](chart_indexed_range const& range, std::size_t,
+                        chart_scheduler_cancellation_token const&) {
+                      if (range.end != range.begin + 1) {
+                        throw std::logic_error(
+                            "chart SPR lazy-local wave: non-unit task range");
+                      }
+                      local_score_worker_arrive_and_wait_for_tests(
+                          options, range.begin);
+                      run_one(range.begin);
+                    });
+              });
+          record_chart_spr_scheduler_axis_run(
+              aggregate.scheduler_axes.local_score_candidates, run);
+          if (run.used_parallel_workers()) {
+            ++aggregate.local_score_parallel_batches;
+            ++aggregate.lazy_local_parallel_waves;
+            aggregate.local_score_worker_tasks += run.worker_tasks_submitted;
+          }
+        } catch (...) {
+          record_chart_spr_scheduler_axis_failed_run(
+              aggregate.scheduler_axes.local_score_candidates, range_plan,
+              scheduler_before, scheduler->metrics());
+          // The scheduler has joined every accepted runner. The operation
+          // guard folds each worker payload once and publishes this failed-run
+          // axis delta before the infrastructure error escapes.
+          throw;
+        }
+      }
+    } catch (...) {
+      throw;
+    }
+
+    std::size_t observed_admitted_dynamic = 0;
+    for (std::size_t slot = 0; slot < admitted; ++slot) {
+      observed_admitted_dynamic = local_capacity_checked_add(
+          observed_admitted_dynamic,
+          local_capacity_checked_add(
+              local_score_workspace_access::task_dynamic_capacity_bytes(
+                  workspace, slot),
+              runtime_transient_reservation(1),
+              "chart SPR lazy-local observed task and worker transient"),
+          "chart SPR lazy-local observed wave capacity");
+    }
+    aggregate.lazy_local_peak_admitted_bytes = std::max(
+        aggregate.lazy_local_peak_admitted_bytes, observed_admitted_dynamic);
+    auto const observed_retained_dynamic = local_capacity_checked_add(
+        slots_dynamic_capacity(task_limit), wave_runtime_transient_reservation,
+        "chart SPR lazy-local observed retained worker transients");
+    auto const observed_projected = local_capacity_checked_add(
+        local_capacity_checked_add(resident_base, observed_retained_dynamic,
+                                   "chart SPR lazy-local observed resident"),
+        scheduler_operation_peak,
+        "chart SPR lazy-local observed projected resident");
+    aggregate.lazy_local_peak_projected_resident_bytes = std::max(
+        aggregate.lazy_local_peak_projected_resident_bytes, observed_projected);
+    if (enforce_budget && observed_projected > budget) {
+      fail_budget(begin,
+                  local_capacity_checked_add(
+                      observed_retained_dynamic, scheduler_operation_peak,
+                      "chart SPR lazy-local observed operation capacity"),
+                  budget - resident_base);
+    }
+
+    try {
+      for (std::size_t slot = 0; slot < admitted; ++slot) {
+        auto& prepared =
+            local_score_workspace_access::prepared(workspace, slot);
+        auto& worker = local_score_workspace_access::worker(workspace, slot);
+        finalize_lazy_local_grouping_status(state, prepared, worker.scratch,
+                                            slot);
+        if (options.force_lazy_finish_overflow_for_tests == slot) {
+          throw std::overflow_error(
+              "chart SPR lazy-local forced finish overflow");
+        }
+        if (options.force_lazy_finish_allocation_for_tests == slot) {
+          throw std::bad_alloc{};
+        }
+        finalize_prepared_local_candidate_score(state, prepared);
+      }
+    } catch (...) {
+      throw;
+    }
+
+    for (std::size_t slot = 0; slot < admitted; ++slot) {
+      auto& prepared = local_score_workspace_access::prepared(workspace, slot);
+      auto& worker = local_score_workspace_access::worker(workspace, slot);
+      results[begin + slot] = prepared.result;
+      operation_guard.fold_worker(slot);
+      worker.reset_for_operation();
+      prepared.release_operation_borrows();
+    }
+    begin += admitted;
+  }
+}
+
+}  // namespace chart_spr_search_detail
 
 std::size_t estimate_chart_spr_lazy_cache_admission_bytes(
     std::size_t clade_count, std::size_t pattern_count) {
@@ -5174,6 +5905,232 @@ std::size_t estimate_chart_spr_canonical_exact_evidence_resident_bytes(
   return total;
 }
 
+chart_spr_canonical_exact_evidence_memory_estimate
+estimate_chart_spr_canonical_exact_evidence_memory(
+    clade_grammar const& grammar, multisite_trim_result const& trim) {
+  auto add = [](std::size_t lhs, std::size_t rhs, char const* context) {
+    return chart_spr_checked_cache_bytes_add(lhs, rhs, context);
+  };
+  auto multiply = [](std::size_t lhs, std::size_t rhs,
+                     char const* context) {
+    return chart_spr_checked_cache_bytes_multiply(lhs, rhs, context);
+  };
+  auto string_capacity = [&](std::size_t encoded_size) {
+    auto const sso = std::string{}.capacity();
+    // Frozen libstdc++ `_M_create_plus` doubles the current SSO capacity when
+    // an explicit reserve just exceeds SSO. Its C++26 std::allocator<char>
+    // then exposes the default-new-alignment rounding returned by
+    // allocate_at_least through string::capacity(). Every canonical output
+    // string starts from its SSO representation.
+    auto const minimum_capacity =
+        encoded_size <= sso
+            ? sso
+            : std::max(encoded_size,
+                       multiply(2, sso,
+                                "chart SPR canonical string SSO growth"));
+    if (minimum_capacity == sso) return add(sso, 1, "chart SPR SSO bytes");
+    constexpr auto allocation_quantum = alignof(std::max_align_t);
+    auto const requested = add(
+        minimum_capacity, 1,
+        "chart SPR canonical exact-evidence string allocation");
+    auto const rounded = add(
+        requested, allocation_quantum - 1,
+        "chart SPR canonical exact-evidence string allocation rounding");
+    return multiply(
+        rounded / allocation_quantum, allocation_quantum,
+        "chart SPR canonical exact-evidence string allocation rounding");
+  };
+
+  std::size_t retained = sizeof(chart_spr_canonical_exact_evidence);
+  auto add_retained = [&](std::size_t bytes) {
+    retained = add(retained, bytes,
+                   "chart SPR canonical exact-evidence retained bytes");
+  };
+
+  auto const evidence_kind_size =
+      trim.keep_production_exact
+          ? std::string_view{
+                "grammar_exact_frontier_provenance_companion"}
+                .size()
+          : std::string_view{
+                "grammar_exact_score_only_frontier_statistics"}
+                .size();
+  add_retained(string_capacity(evidence_kind_size));
+  add_retained(string_capacity(
+      std::string_view{multisite_keep_mask_kind_name(trim.keep_mask_kind)}
+          .size()));
+  add_retained(string_capacity(std::string_view{"none"}.size()));
+  add_retained(string_capacity(0));
+
+  if (trim.keep_production_exact) {
+    if (trim.keep_production.size() != grammar.productions.size()) {
+      throw std::runtime_error(
+          "chart-SPR canonical evidence estimate: exact keep mask size "
+          "mismatch");
+    }
+    std::size_t kept_count = 0;
+    for (bool keep : trim.keep_production) {
+      if (keep) ++kept_count;
+    }
+    add_retained(multiply(kept_count, sizeof(std::string),
+                          "chart SPR canonical kept-key vector"));
+    for (std::size_t pid = 0; pid < trim.keep_production.size(); ++pid) {
+      if (!trim.keep_production[pid]) continue;
+      add_retained(string_capacity(
+          chart_spr_semantic_detail::production_key_size(
+              grammar, static_cast<production_id>(pid))));
+    }
+  }
+
+  if (trim.frontier_sizes_by_clade.size() != grammar.clades.size()) {
+    throw std::runtime_error(
+        "chart-SPR canonical evidence estimate: frontier-size vector size "
+        "mismatch");
+  }
+  std::size_t frontier_count = 0;
+  for (auto const& clade : grammar.clades) {
+    if (!clade.taxa.empty()) ++frontier_count;
+  }
+  add_retained(multiply(
+      frontier_count, sizeof(std::pair<std::string, std::size_t>),
+      "chart SPR canonical frontier vector"));
+  for (auto const& clade : grammar.clades) {
+    if (clade.taxa.empty()) continue;
+    add_retained(string_capacity(
+        chart_spr_semantic_detail::sample_set_key_size(grammar, clade.taxa)));
+  }
+
+  add_retained(multiply(
+      trim.optimal_root_provenance_classes.size(),
+      sizeof(chart_spr_canonical_root_provenance_class),
+      "chart SPR canonical provenance vector"));
+  for (auto const& provenance : trim.optimal_root_provenance_classes) {
+    if (provenance.used_production.size() != grammar.productions.size()) {
+      throw std::runtime_error(
+          "chart-SPR canonical evidence estimate: provenance mask size "
+          "mismatch");
+    }
+    add_retained(multiply(provenance.cost.size(), sizeof(std::uint64_t),
+                          "chart SPR canonical provenance cost vector"));
+    std::size_t used_count = 0;
+    for (bool used : provenance.used_production) {
+      if (used) ++used_count;
+    }
+    add_retained(multiply(used_count, sizeof(std::string),
+                          "chart SPR canonical provenance key vector"));
+    for (std::size_t pid = 0; pid < provenance.used_production.size(); ++pid) {
+      if (!provenance.used_production[pid]) continue;
+      add_retained(string_capacity(
+          chart_spr_semantic_detail::production_key_size(
+              grammar, static_cast<production_id>(pid))));
+    }
+  }
+
+  auto const decimal_scratch = string_capacity(
+      chart_spr_semantic_detail::decimal_digit_count(
+          (std::numeric_limits<std::size_t>::max)()));
+  auto clade_key_scratch = [&](std::span<taxon_id const> taxa) {
+    std::size_t scratch = multiply(
+        taxa.size(), sizeof(taxon_id),
+        "chart SPR canonical clade-key taxon scratch");
+    scratch = add(
+        scratch,
+        multiply(taxa.size(), sizeof(std::string),
+                 "chart SPR canonical clade-key sample vector"),
+        "chart SPR canonical clade-key scratch");
+    for (auto taxon : taxa) {
+      if (taxon >= grammar.taxa.id_to_sample_id.size()) {
+        throw std::runtime_error(
+            "chart-SPR canonical evidence estimate: taxon out of range");
+      }
+      scratch = add(scratch,
+                    string_capacity(
+                        grammar.taxa.id_to_sample_id[taxon].size()),
+                    "chart SPR canonical clade-key sample copies");
+    }
+    scratch = add(
+        scratch,
+        string_capacity(chart_spr_semantic_detail::sample_set_key_size(
+            grammar, taxa)),
+        "chart SPR canonical clade-key result");
+    return add(scratch, decimal_scratch,
+               "chart SPR canonical clade-key decimal scratch");
+  };
+
+  std::size_t maximum_key_scratch = 0;
+  for (auto const& clade : grammar.clades) {
+    if (clade.taxa.empty()) continue;
+    maximum_key_scratch =
+        std::max(maximum_key_scratch, clade_key_scratch(clade.taxa));
+  }
+  for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
+    auto const& production = grammar.productions[pid];
+    if (production.parent == no_clade ||
+        production.parent >= grammar.clades.size()) {
+      throw std::runtime_error(
+          "chart-SPR canonical evidence estimate: production parent out of "
+          "range");
+    }
+    auto const& parent = grammar.clades[production.parent].taxa;
+    std::size_t scratch = multiply(
+        multiply(2, parent.size(),
+                 "chart SPR canonical production parent copies"),
+        sizeof(taxon_id), "chart SPR canonical production parent copies");
+    scratch = add(
+        scratch,
+        multiply(production.children.size(), sizeof(std::vector<taxon_id>),
+                 "chart SPR canonical production child-taxa vector"),
+        "chart SPR canonical production scratch");
+    scratch = add(
+        scratch,
+        multiply(production.children.size(), sizeof(std::string),
+                 "chart SPR canonical production child-key vector"),
+        "chart SPR canonical production scratch");
+    auto maximum_sample_scratch = clade_key_scratch(parent);
+    auto const parent_key_size =
+        chart_spr_semantic_detail::sample_set_key_size(grammar, parent);
+    scratch = add(scratch, string_capacity(parent_key_size),
+                  "chart SPR canonical production parent key");
+    for (auto child : production.children) {
+      if (child == no_clade || child >= grammar.clades.size()) {
+        throw std::runtime_error(
+            "chart-SPR canonical evidence estimate: production child out of "
+            "range");
+      }
+      auto const& child_taxa = grammar.clades[child].taxa;
+      scratch = add(
+          scratch,
+          multiply(child_taxa.size(), sizeof(taxon_id),
+                   "chart SPR canonical production child-taxa copies"),
+          "chart SPR canonical production scratch");
+      scratch = add(
+          scratch,
+          string_capacity(chart_spr_semantic_detail::sample_set_key_size(
+              grammar, child_taxa)),
+          "chart SPR canonical production child keys");
+      maximum_sample_scratch =
+          std::max(maximum_sample_scratch, clade_key_scratch(child_taxa));
+    }
+    scratch = add(scratch, maximum_sample_scratch,
+                  "chart SPR canonical production sample scratch");
+    scratch = add(
+        scratch,
+        string_capacity(chart_spr_semantic_detail::production_key_size(
+            grammar, static_cast<production_id>(pid))),
+        "chart SPR canonical production result");
+    scratch = add(scratch, decimal_scratch,
+                  "chart SPR canonical production decimal scratch");
+    maximum_key_scratch = std::max(maximum_key_scratch, scratch);
+  }
+
+  return chart_spr_canonical_exact_evidence_memory_estimate{
+      .retained_bytes = retained,
+      .construction_peak_bytes = add(
+          retained, maximum_key_scratch,
+          "chart SPR canonical exact-evidence construction peak"),
+  };
+}
+
 std::size_t chart_spr_search_detail::estimate_exact_loop_resident_input_bytes(
     std::vector<chart_spr_candidate_score> const& ranked,
     chart_spr_iteration_result const& iteration) {
@@ -5229,6 +6186,440 @@ std::size_t chart_spr_search_detail::estimate_exact_loop_resident_input_bytes(
                    *iteration.accepted, /*include_shared_evidence=*/true));
   }
   return total;
+}
+
+std::size_t
+chart_spr_search_detail::estimate_grammar_spr_enumeration_fixed_live_bytes(
+    clade_grammar const& grammar, chart_execution_plan const& plan) {
+  auto add = [](std::size_t lhs, std::size_t rhs) {
+    return chart_spr_checked_cache_bytes_add(
+        lhs, rhs, "chart SPR enumeration live-envelope overflow");
+  };
+  auto multiply = [](std::size_t lhs, std::size_t rhs) {
+    return chart_spr_checked_cache_bytes_multiply(
+        lhs, rhs, "chart SPR enumeration live-envelope overflow");
+  };
+  using lookup_type = std::map<std::vector<taxon_id>, clade_id>;
+  using seen_type = std::set<std::string>;
+  std::size_t total = sizeof(lookup_type) + sizeof(seen_type);
+  for (auto const& clade : grammar.clades) {
+    total = add(total, sizeof(lookup_type::value_type) + 4 * sizeof(void*));
+    total = add(total, multiply(clade.taxa.size(), sizeof(taxon_id)));
+  }
+  total =
+      add(total, multiply(grammar.productions.size(), sizeof(production_id)));
+  total = add(total, multiply(grammar.clades.size(), sizeof(clade_id)));
+
+  std::size_t maximum_arity = 0;
+  std::size_t maximum_parent_productions = 0;
+  for (auto const& production : grammar.productions) {
+    maximum_arity = std::max(maximum_arity, production.children.size());
+  }
+  for (auto const& parent_row : grammar.productions_by_child) {
+    maximum_parent_productions =
+        std::max(maximum_parent_productions, parent_row.size());
+  }
+  std::size_t depth = 0;
+  for (auto const& clade : plan.clades()) {
+    depth = std::max(depth, clade.dependency_level);
+  }
+  // Two nested upward traversals retain their path/active sets and each stack
+  // frame's copied parent-production row until the callback returns. Vector
+  // growth is bounded by twice the logical size on frozen libstdc++.
+  total = add(total, multiply(multiply(4, depth),
+                              sizeof(chart_spr_detail::upward_path_step)));
+  total = add(total, multiply(multiply(multiply(4, depth), maximum_arity),
+                              sizeof(clade_id)));
+  total = add(total, multiply(multiply(2, depth),
+                              sizeof(clade_id) + 4 * sizeof(void*)));
+  total = add(total,
+              multiply(multiply(multiply(4, depth), maximum_parent_productions),
+                       sizeof(production_id)));
+  total = add(total, multiply(multiply(3, maximum_arity), sizeof(std::size_t)));
+  return total;
+}
+
+std::size_t
+chart_spr_search_detail::estimate_grammar_spr_enumeration_signature_live_bytes(
+    clade_grammar const& grammar, grammar_spr_candidate const& candidate) {
+  auto add = [](std::size_t lhs, std::size_t rhs) {
+    return chart_spr_checked_cache_bytes_add(
+        lhs, rhs, "chart SPR enumeration signature length overflow");
+  };
+  auto decimal_digits = [](taxon_id value) noexcept {
+    std::size_t digits = 1;
+    while (value >= 10) {
+      value /= 10;
+      ++digits;
+    }
+    return digits;
+  };
+  auto taxa_key_length = [&](std::vector<taxon_id> const& taxa) {
+    std::size_t length = 2;  // '{' and '}'
+    // Normalization changes ordering and removes duplicates, neither of which
+    // requires constructing the normalized vector to calculate encoded size.
+    for (std::size_t index = 0; index < taxa.size(); ++index) {
+      bool appeared_before = false;
+      for (std::size_t previous = 0; previous < index; ++previous) {
+        if (taxa[previous] == taxa[index]) {
+          appeared_before = true;
+          break;
+        }
+      }
+      if (appeared_before) continue;
+      length = add(length, decimal_digits(taxa[index]));
+      length = add(length, 1);  // trailing comma
+    }
+    return length;
+  };
+  auto required_ref_taxa =
+      [&](overlay_clade_ref ref) -> std::vector<taxon_id> const& {
+    return chart_spr_clade_taxa_for_ref(grammar, candidate, ref);
+  };
+  auto optional_ref_length = [&](overlay_clade_ref ref) {
+    return ref.id == no_clade ? std::size_t{2}
+                              : taxa_key_length(required_ref_taxa(ref));
+  };
+  auto production_length = [&](std::vector<taxon_id> const& parent,
+                               auto const& children, auto&& resolve_child) {
+    auto length = add(taxa_key_length(parent), 2);  // "->"
+    for (auto const& child : children) {
+      length = add(length, taxa_key_length(resolve_child(child)));
+    }
+    return length;
+  };
+
+  std::size_t encoded_length = 0;
+  auto add_literal = [&](std::string_view literal) {
+    encoded_length = add(encoded_length, literal.size());
+  };
+  add_literal("m=");
+  encoded_length =
+      add(encoded_length, optional_ref_length(candidate.moved_clade));
+  add_literal(";op=");
+  encoded_length =
+      add(encoded_length, optional_ref_length(candidate.old_parent));
+  add_literal(";os=");
+  encoded_length =
+      add(encoded_length, optional_ref_length(candidate.old_sibling));
+  add_literal(";nt=");
+  encoded_length =
+      add(encoded_length, optional_ref_length(candidate.new_sibling_or_target));
+  add_literal(";clades=");
+  for (auto const& clade : candidate.added_clades) {
+    encoded_length = add(encoded_length, taxa_key_length(clade.taxa));
+  }
+  add_literal(";rm=");
+  for (auto ref : candidate.removed_productions) {
+    if (ref.space != overlay_id_space::base || ref.id == no_production ||
+        ref.id >= grammar.productions.size()) {
+      throw std::runtime_error(
+          "chart SPR enumeration signature: removed production out of "
+          "range");
+    }
+    auto const& production = grammar.productions[ref.id];
+    if (production.parent == no_clade ||
+        production.parent >= grammar.clades.size()) {
+      throw std::runtime_error(
+          "chart SPR enumeration signature: production parent out of range");
+    }
+    auto const length = production_length(
+        grammar.clades[production.parent].taxa, production.children,
+        [&](clade_id child) -> std::vector<taxon_id> const& {
+          if (child == no_clade || child >= grammar.clades.size()) {
+            throw std::runtime_error(
+                "chart SPR enumeration signature: production child out of "
+                "range");
+          }
+          return grammar.clades[child].taxa;
+        });
+    encoded_length = add(encoded_length, add(length, 1));  // ';'
+  }
+  add_literal(";add=");
+  for (auto const& production : candidate.added_productions) {
+    auto const length = production_length(
+        required_ref_taxa(production.parent), production.children,
+        [&](overlay_clade_ref child) -> std::vector<taxon_id> const& {
+          return required_ref_taxa(child);
+        });
+    encoded_length = add(encoded_length, add(length, 1));  // ';'
+  }
+
+  // On the frozen libstdc++ toolchain a copied/moved signature owns either
+  // the SSO buffer or an allocation with capacity equal to its encoded size.
+  // Querying the empty-string SSO capacity is allocation-free.
+  auto const string_capacity =
+      std::max(encoded_length, std::string{}.capacity());
+  return chart_spr_checked_cache_bytes_add(
+      sizeof(std::set<std::string>::value_type) + 4 * sizeof(void*),
+      chart_spr_checked_cache_bytes_add(
+          string_capacity, 1,
+          "chart SPR enumeration signature capacity overflow"),
+      "chart SPR enumeration signature node overflow");
+}
+
+chart_spr_search_detail::grammar_spr_finite_iteration_memory_envelope
+chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
+    chart_spr_search_state const& state, std::size_t candidate_limit,
+    std::size_t candidate_batch_size, std::size_t ranked_limit,
+    bool capture_semantics, std::size_t local_task_slots) {
+  auto add = [](std::size_t lhs, std::size_t rhs) {
+    return chart_spr_checked_cache_bytes_add(
+        lhs, rhs, "chart SPR finite grammar iteration envelope overflow");
+  };
+  auto multiply = [](std::size_t lhs, std::size_t rhs) {
+    return chart_spr_checked_cache_bytes_multiply(
+        lhs, rhs, "chart SPR finite grammar iteration envelope overflow");
+  };
+  auto doubled_vector = [&](std::size_t count, std::size_t width) {
+    return multiply(2, multiply(count, width));
+  };
+  auto decimal_digits = [](std::size_t value) noexcept {
+    std::size_t digits = 1;
+    while (value >= 10) {
+      value /= 10;
+      ++digits;
+    }
+    return digits;
+  };
+
+  auto const& grammar = state.grammar;
+  auto const taxa = grammar.taxa.id_to_sample_id.size();
+  std::size_t maximum_arity = 0;
+  for (auto const& production : grammar.productions) {
+    maximum_arity = std::max(maximum_arity, production.children.size());
+  }
+
+  // A grammar-native candidate rebuilds at most one group per side/path step,
+  // plus the source, destination, and LCA groups. Along every legal upward
+  // edge the immutable plan dependency level increases by at least one, so
+  // its maximum level bounds either path without substituting total clades.
+  std::size_t maximum_dependency_depth = 0;
+  for (auto const& clade : state.execution_plan.clades()) {
+    maximum_dependency_depth =
+        std::max(maximum_dependency_depth, clade.dependency_level);
+  }
+  auto const candidate_clades = add(multiply(2, maximum_dependency_depth), 3);
+  auto const candidate_productions = candidate_clades;
+  auto const removed_productions =
+      add(multiply(2, maximum_dependency_depth), 1);
+  // Every ordinary rebuilt group replaces one child of a base production by
+  // the current rebuilt branch and keeps that production's cochildren, hence
+  // has at most A children. The sole LCA rebuild combines at most two rebuilt
+  // branches and the two traversed productions' cochild sets, bounded by 2A;
+  // the initial moved+target group has two. Thus max(2, 2A) is a complete
+  // per-added-production bound for make_general_spr_candidate().
+  auto const candidate_maximum_arity =
+      std::max<std::size_t>(2, multiply(2, maximum_arity));
+
+  std::size_t candidate_dynamic = 0;
+  candidate_dynamic =
+      add(candidate_dynamic,
+          doubled_vector(removed_productions, sizeof(overlay_production_ref)));
+  candidate_dynamic = add(candidate_dynamic,
+                          doubled_vector(candidate_clades, sizeof(clade_key)));
+  candidate_dynamic =
+      add(candidate_dynamic,
+          multiply(candidate_clades, doubled_vector(taxa, sizeof(taxon_id))));
+  candidate_dynamic = add(candidate_dynamic,
+                          doubled_vector(candidate_productions,
+                                         sizeof(overlay_grammar_production)));
+  candidate_dynamic = add(candidate_dynamic,
+                          multiply(candidate_productions,
+                                   doubled_vector(candidate_maximum_arity,
+                                                  sizeof(overlay_clade_ref))));
+  auto const maximum_temp_children =
+      multiply(candidate_productions, candidate_maximum_arity);
+  auto const local_task = estimate_lazy_local_candidate_shape_preflight(
+      state, candidate_clades, candidate_productions, removed_productions,
+      maximum_temp_children, candidate_dynamic);
+
+  auto numeric_taxa_key =
+      add(2, multiply(taxa, add(decimal_digits(taxa == 0 ? 0 : taxa - 1), 1)));
+  std::size_t sample_taxa_key = 2;
+  for (auto const& sample_id : grammar.taxa.id_to_sample_id) {
+    // Every byte may require one escape byte, followed by the delimiter.
+    sample_taxa_key =
+        add(sample_taxa_key, add(multiply(2, sample_id.size()), 1));
+  }
+  auto signature_bound = [&](std::size_t taxa_key_bytes) {
+    auto key_occurrences = add(4, candidate_clades);
+    key_occurrences = add(key_occurrences,
+                          multiply(removed_productions, add(1, maximum_arity)));
+    key_occurrences =
+        add(key_occurrences,
+            multiply(candidate_productions, add(1, candidate_maximum_arity)));
+    auto length = add(64, multiply(key_occurrences, taxa_key_bytes));
+    length = add(length,
+                 multiply(add(removed_productions, candidate_productions), 3));
+    return length;
+  };
+  auto const numeric_signature = signature_bound(numeric_taxa_key);
+  auto const sample_signature = signature_bound(sample_taxa_key);
+  auto const sso_capacity = std::string{}.capacity();
+  auto string_capacity_bound = [&](std::size_t maximum_size) {
+    return add(std::max(maximum_size, sso_capacity), 1);
+  };
+  auto const numeric_signature_capacity =
+      string_capacity_bound(numeric_signature);
+  auto const sample_signature_capacity =
+      string_capacity_bound(sample_signature);
+  auto const invalid_reason_capacity =
+      lazy_local_invalid_reason_owned_capacity_bound();
+  // Before exact verification, a ranked score owns the grammar candidate,
+  // its policy-bounded invalid reason, and the (normally empty) topology
+  // selector string. The numeric tie-break signature is transient and is
+  // charged separately below while two comparator operands overlap.
+  auto candidate_record_dynamic =
+      add(candidate_dynamic, invalid_reason_capacity);
+  candidate_record_dynamic =
+      add(candidate_record_dynamic, string_capacity_bound(0));
+  auto canonical_score_dynamic =
+      string_capacity_bound(std::string_view{"composite_lower_bound"}.size());
+  canonical_score_dynamic = add(
+      canonical_score_dynamic,
+      string_capacity_bound(std::string_view{"full_with_invariants"}.size()));
+  auto canonical_record_dynamic =
+      add(sample_signature_capacity, invalid_reason_capacity);
+  canonical_record_dynamic =
+      add(canonical_record_dynamic, canonical_score_dynamic);
+  auto const no_accept_reason_capacity = string_capacity_bound(std::max(
+      {std::string_view{"no candidates scored"}.size(),
+       std::string_view{"no lower-bound-improving candidate"}.size(),
+       std::string_view{"no valid locally scored candidates retained"}.size(),
+       std::string_view{"no exact-improving verified candidate"}.size()}));
+  auto const signature_node =
+      add(sizeof(std::set<std::string>::value_type) + 4 * sizeof(void*),
+          numeric_signature_capacity);
+  auto const candidate_live =
+      add(sizeof(grammar_spr_candidate), candidate_dynamic);
+
+  std::size_t future = estimate_grammar_spr_enumeration_fixed_live_bytes(
+      grammar, state.execution_plan);
+  future = add(future, multiply(candidate_limit, signature_node));
+
+  // One candidate is being assembled and signed before it can reach the batch
+  // callback. Four candidate payloads cover the published candidate, temp
+  // lookup keys, path/group temporaries, and vector old+new growth. Eight
+  // encoded strings cover ostringstream storage, normalized taxa/signature
+  // lists, and final-string publication on frozen libstdc++.
+  auto candidate_construction_peak =
+      add(sizeof(grammar_spr_candidate), multiply(4, candidate_dynamic));
+  candidate_construction_peak =
+      add(candidate_construction_peak,
+          multiply(candidate_clades,
+                   sizeof(std::pair<std::vector<taxon_id> const, clade_id>) +
+                       4 * sizeof(void*)));
+  auto signature_construction_peak = multiply(
+      8, std::max(numeric_signature_capacity, sample_signature_capacity));
+  signature_construction_peak =
+      add(signature_construction_peak,
+          doubled_vector(add(removed_productions, candidate_productions),
+                         sizeof(std::string)));
+  future = add(future,
+               add(candidate_construction_peak, signature_construction_peak));
+
+  // Candidate/copy slots retain high-water nested payload across one batch.
+  // Ranked and canonical records retain across every batch. The accepted-copy
+  // allowance mirrors the exact-loop resident walker used at each callback.
+  future = add(future,
+               multiply(multiply(2, candidate_batch_size), candidate_dynamic));
+  future = add(future, multiply(candidate_batch_size, invalid_reason_capacity));
+  future = add(future, multiply(ranked_limit, candidate_record_dynamic));
+  future = add(future, candidate_record_dynamic);
+  future = add(future, no_accept_reason_capacity);
+  chart_spr_canonical_exact_evidence_memory_estimate
+      canonical_state_exact_evidence;
+  if (capture_semantics) {
+    future = add(future, multiply(candidate_limit, canonical_record_dynamic));
+    if (state.exact_trim_active_only) {
+      canonical_state_exact_evidence =
+          estimate_chart_spr_canonical_exact_evidence_memory(
+              grammar, *state.exact_trim_active_only);
+      // Evidence publication is deferred until enumeration/local/exact
+      // scratch has been released. The complete construction peak therefore
+      // replaces the former topology-only grammar-capacity multiplier.
+      future = add(
+          future,
+          canonical_state_exact_evidence.construction_peak_bytes);
+    }
+  }
+
+  auto acceptance_outer = sizeof(chart_spr_acceptance_iteration_workspace) -
+                          sizeof(chart_spr_local_score_workspace);
+  acceptance_outer =
+      add(acceptance_outer,
+          doubled_vector(candidate_batch_size, sizeof(grammar_spr_candidate)));
+  acceptance_outer =
+      add(acceptance_outer,
+          doubled_vector(candidate_batch_size,
+                         sizeof(grammar_spr_candidate_copy_scratch)));
+  acceptance_outer = add(acceptance_outer,
+                         doubled_vector(candidate_batch_size,
+                                        sizeof(chart_spr_local_score_result)));
+
+  auto exact_input_outer = sizeof(std::vector<chart_spr_candidate_score>) +
+                           sizeof(chart_spr_iteration_result);
+  exact_input_outer =
+      add(exact_input_outer,
+          doubled_vector(ranked_limit, sizeof(chart_spr_candidate_score)));
+  exact_input_outer = add(exact_input_outer,
+                          doubled_vector(candidate_limit, sizeof(std::size_t)));
+  if (capture_semantics) {
+    exact_input_outer =
+        add(exact_input_outer,
+            doubled_vector(candidate_limit,
+                           sizeof(chart_spr_canonical_candidate_record)));
+    // Built after enumeration in ranked order. It is an independent owning
+    // result vector, not part of the canonical-candidate outer reserve.
+    exact_input_outer = add(exact_input_outer,
+                            doubled_vector(ranked_limit, sizeof(std::size_t)));
+  }
+
+  auto const local_workspace =
+      add(sizeof(chart_spr_local_score_workspace),
+          add(doubled_vector(local_task_slots,
+                             sizeof(prepared_local_candidate_score)),
+              doubled_vector(local_task_slots,
+                             sizeof(local_score_worker_workspace))));
+  auto const scheduler_operation =
+      estimate_exact_loop_scheduler_operation_peak_bytes(local_task_slots,
+                                                         local_task_slots > 1);
+  auto const stable_wave =
+      add(multiply(local_task_slots, local_task.stable_dynamic_capacity_bytes),
+          scheduler_operation);
+  auto preparation_wave = local_task.preparation_peak_dynamic_capacity_bytes;
+  if (local_task_slots > 1) {
+    preparation_wave = add(preparation_wave,
+                           multiply(local_task_slots - 1,
+                                    local_task.stable_dynamic_capacity_bytes));
+  }
+  auto const local_task_peak = std::max(stable_wave, preparation_wave);
+  future = add(future, local_task_peak);
+  auto planned =
+      add(estimate_chart_spr_published_state_resident_bytes(state),
+          acceptance_outer);
+  planned = add(planned, exact_input_outer);
+  planned = add(planned, local_workspace);
+  planned = add(planned, future);
+  return grammar_spr_finite_iteration_memory_envelope{
+      .planned_required_bytes = planned,
+      .future_dynamic_bytes = future,
+      .planned_local_workspace_resident_bytes = local_workspace,
+      .planned_signature_node_bytes = signature_node,
+      .planned_candidate_live_bytes = candidate_live,
+      .planned_canonical_record_dynamic_bytes =
+          capture_semantics ? canonical_record_dynamic : 0,
+      .planned_canonical_state_exact_evidence_resident_bytes =
+          canonical_state_exact_evidence.retained_bytes,
+      .planned_canonical_state_exact_evidence_construction_peak_bytes =
+          canonical_state_exact_evidence.construction_peak_bytes,
+      .planned_scheduler_operation_peak_bytes = scheduler_operation,
+      .planned_local_task_stable_bytes =
+          local_task.stable_dynamic_capacity_bytes,
+      .planned_local_task_preparation_peak_bytes =
+          local_task.preparation_peak_dynamic_capacity_bytes,
+  };
 }
 
 std::size_t

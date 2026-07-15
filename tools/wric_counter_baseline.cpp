@@ -261,6 +261,41 @@ int main() {
   print_counter_line("local_score_parallel_batches",
                      c.local_score_parallel_batches);
   print_counter_line("local_score_worker_tasks", c.local_score_worker_tasks);
+  print_counter_line("lazy_local_admission_waves",
+                     c.lazy_local_admission_waves);
+  print_counter_line("lazy_local_parallel_waves", c.lazy_local_parallel_waves);
+  print_counter_line("lazy_local_memory_limited_waves",
+                     c.lazy_local_memory_limited_waves);
+  print_counter_line("lazy_local_admitted_concurrency_max",
+                     c.lazy_local_admitted_concurrency_max);
+  print_counter_line("lazy_local_prepared_tasks", c.lazy_local_prepared_tasks);
+  print_counter_line("lazy_local_reused_prepared_tasks",
+                     c.lazy_local_reused_prepared_tasks);
+  print_counter_line("lazy_local_pre_submit_budget_failures",
+                     c.lazy_local_pre_submit_budget_failures);
+  print_counter_line("lazy_local_peak_admitted_bytes",
+                     c.lazy_local_peak_admitted_bytes);
+  print_counter_line("lazy_local_peak_projected_resident_bytes",
+                     c.lazy_local_peak_projected_resident_bytes);
+  print_counter_line("lazy_local_preparation_peak_bytes",
+                     c.lazy_local_preparation_peak_bytes);
+  print_counter_line("lazy_local_result_output_resident_bytes_max",
+                     c.lazy_local_result_output_resident_bytes_max);
+  print_counter_line("lazy_local_retained_exact_trim_bytes_max",
+                     c.lazy_local_retained_exact_trim_bytes_max);
+  print_counter_line("lazy_local_canonical_exact_evidence_resident_bytes_max",
+                     c.lazy_local_canonical_exact_evidence_resident_bytes_max);
+  print_counter_line(
+      "lazy_local_canonical_exact_evidence_construction_peak_bytes_max",
+      c.lazy_local_canonical_exact_evidence_construction_peak_bytes_max);
+  print_counter_line("lazy_local_runtime_transient_reservation_bytes_max",
+                     c.lazy_local_runtime_transient_reservation_bytes_max);
+  print_counter_line("lazy_local_iteration_envelope_bytes_max",
+                     c.lazy_local_iteration_envelope_bytes_max);
+  print_counter_line("lazy_local_iteration_task_stable_bytes_max",
+                     c.lazy_local_iteration_task_stable_bytes_max);
+  print_counter_line("lazy_local_iteration_task_preparation_peak_bytes_max",
+                     c.lazy_local_iteration_task_preparation_peak_bytes_max);
   print_counter_line("candidate_batches_scored", c.candidate_batches_scored);
   print_counter_line("pattern_batch_cache_builds",
                      c.pattern_batch_cache_builds);

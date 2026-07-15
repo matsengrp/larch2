@@ -844,13 +844,27 @@ static void test_stale_and_mismatched_plan_rejected() {
   CHECK(stale.find("chart execution plan") != std::string::npos);
   CHECK(stale.find("fingerprint mismatch") != std::string::npos);
 
-  auto reverse_registry = make_binary_grammar();
-  auto reverse_registry_plan =
-      larch::build_chart_execution_plan(reverse_registry);
-  reverse_registry.taxa.sample_id_to_id["A"] = 1;
-  auto reverse_stale = runtime_error_message(
-      [&] { reverse_registry_plan.assert_compatible(reverse_registry); });
-  CHECK(reverse_stale.find("fingerprint mismatch") != std::string::npos);
+  auto expect_reverse_registry_stale = [](auto mutate) {
+    auto grammar = make_binary_grammar();
+    auto plan = larch::build_chart_execution_plan(grammar);
+    mutate(grammar);
+    auto rejection =
+        runtime_error_message([&] { plan.assert_compatible(grammar); });
+    CHECK(rejection.find("fingerprint mismatch") != std::string::npos);
+  };
+  expect_reverse_registry_stale([](auto& grammar) {
+    grammar.taxa.sample_id_to_id[grammar.taxa.id_to_sample_id.front()] = 1;
+  });
+  expect_reverse_registry_stale([](auto& grammar) {
+    grammar.taxa.sample_id_to_id.erase(grammar.taxa.id_to_sample_id.front());
+  });
+  expect_reverse_registry_stale([](auto& grammar) {
+    grammar.taxa.sample_id_to_id.erase(grammar.taxa.id_to_sample_id.front());
+    grammar.taxa.sample_id_to_id.emplace("replacement-sample-id", 0);
+  });
+  expect_reverse_registry_stale([](auto& grammar) {
+    grammar.taxa.sample_id_to_id.emplace("surplus-sample-id", 0);
+  });
 }
 
 static void test_checked_and_plan_composite_equivalence() {

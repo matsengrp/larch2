@@ -21,7 +21,7 @@ inline constexpr taxon_id chart_plan_no_taxon =
     std::numeric_limits<taxon_id>::max();
 
 struct chart_plan_fingerprint {
-  static constexpr std::uint32_t current_schema_version = 1;
+  static constexpr std::uint32_t current_schema_version = 2;
   static constexpr std::uint32_t unit_fitch_cost_model_version = 1;
 
   std::array<std::uint64_t, 2> structure{};
@@ -184,16 +184,16 @@ inline chart_plan_fingerprint fingerprint_chart_grammar(
   for (auto const& sample_id : grammar.taxa.id_to_sample_id) {
     mix_string(sample_id);
   }
-  std::vector<std::pair<std::string, taxon_id>> reverse_taxa;
-  reverse_taxa.reserve(grammar.taxa.sample_id_to_id.size());
-  for (auto const& entry : grammar.taxa.sample_id_to_id) {
-    reverse_taxa.push_back(entry);
-  }
-  std::sort(reverse_taxa.begin(), reverse_taxa.end());
-  mix(reverse_taxa.size());
-  for (auto const& [sample_id, taxon] : reverse_taxa) {
-    mix_string(sample_id);
-    mix(taxon);
+  // Schema 2 fingerprints the reverse registry without copying or sorting its
+  // owned strings. The forward registry supplies a deterministic O(T) order;
+  // each reverse lookup contributes an explicit present/missing marker and
+  // the mapped id. Mixing the map size additionally detects surplus keys.
+  mix(grammar.taxa.sample_id_to_id.size());
+  for (auto const& sample_id : grammar.taxa.id_to_sample_id) {
+    auto const found = grammar.taxa.sample_id_to_id.find(sample_id);
+    auto const present = found != grammar.taxa.sample_id_to_id.end();
+    mix(present ? 0xb7f42a136d8ce901ULL : 0x498d3c6fe2157ab4ULL);
+    if (present) mix(found->second);
   }
   mix(grammar.clades.size());
   for (auto const& clade : grammar.clades) {

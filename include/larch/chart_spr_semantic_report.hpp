@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -180,6 +181,91 @@ struct chart_spr_semantic_digest_report {
 
 namespace chart_spr_semantic_detail {
 
+inline std::size_t decimal_digit_count(std::size_t value) noexcept {
+  std::size_t digits = 1;
+  while (value >= 10) {
+    value /= 10;
+    ++digits;
+  }
+  return digits;
+}
+
+inline std::size_t checked_key_size_add(std::size_t lhs, std::size_t rhs) {
+  if (lhs > (std::numeric_limits<std::size_t>::max)() - rhs) {
+    throw std::overflow_error(
+        "chart-SPR canonical report: encoded key size overflow");
+  }
+  return lhs + rhs;
+}
+
+inline std::size_t length_prefixed_size(std::size_t value_size) {
+  return checked_key_size_add(
+      checked_key_size_add(decimal_digit_count(value_size), 1), value_size);
+}
+
+// Allocation-free companions to the semantic key builders. Admission and
+// construction use the same byte grammar, preventing long sample IDs from
+// escaping a topology-count-only memory estimate.
+inline std::size_t sample_set_key_size(clade_grammar const& grammar,
+                                       std::span<taxon_id const> taxa) {
+  auto size = checked_key_size_add(
+      checked_key_size_add(std::size_t{1}, decimal_digit_count(taxa.size())),
+      1);  // "S<count>["
+  for (auto taxon : taxa) {
+    if (taxon >= grammar.taxa.id_to_sample_id.size()) {
+      throw std::runtime_error(
+          "chart-SPR canonical report: taxon out of sample registry range");
+    }
+    size = checked_key_size_add(
+        size,
+        length_prefixed_size(grammar.taxa.id_to_sample_id[taxon].size()));
+  }
+  return checked_key_size_add(size, 1);  // ']'
+}
+
+inline std::size_t production_key_size(
+    clade_grammar const& grammar, std::span<taxon_id const> parent_taxa,
+    std::span<std::vector<taxon_id> const> child_taxa) {
+  auto size = checked_key_size_add(
+      std::size_t{1}, length_prefixed_size(
+                          sample_set_key_size(grammar, parent_taxa)));
+  size = checked_key_size_add(size, 1);  // '['
+  for (auto const& child : child_taxa) {
+    size = checked_key_size_add(
+        size, length_prefixed_size(sample_set_key_size(grammar, child)));
+  }
+  return checked_key_size_add(size, 1);  // ']'
+}
+
+inline std::size_t production_key_size(clade_grammar const& grammar,
+                                       production_id pid) {
+  if (pid == no_production || pid >= grammar.productions.size()) {
+    throw std::runtime_error(
+        "chart-SPR canonical report: production ID out of range");
+  }
+  auto const& production = grammar.productions[pid];
+  if (production.parent == no_clade ||
+      production.parent >= grammar.clades.size()) {
+    throw std::runtime_error(
+        "chart-SPR canonical report: production parent out of range");
+  }
+  auto size = checked_key_size_add(
+      std::size_t{1},
+      length_prefixed_size(sample_set_key_size(
+          grammar, grammar.clades[production.parent].taxa)));
+  size = checked_key_size_add(size, 1);
+  for (auto child : production.children) {
+    if (child == no_clade || child >= grammar.clades.size()) {
+      throw std::runtime_error(
+          "chart-SPR canonical report: production child out of range");
+    }
+    size = checked_key_size_add(
+        size, length_prefixed_size(
+                  sample_set_key_size(grammar, grammar.clades[child].taxa)));
+  }
+  return checked_key_size_add(size, 1);
+}
+
 inline void append_length_prefixed(std::string& out, std::string_view value) {
   out += std::to_string(value.size());
   out += ":";
@@ -188,6 +274,7 @@ inline void append_length_prefixed(std::string& out, std::string_view value) {
 
 inline std::string sample_set_key(clade_grammar const& grammar,
                                   std::vector<taxon_id> taxa) {
+  auto const final_size = sample_set_key_size(grammar, taxa);
   std::vector<std::string> samples;
   samples.reserve(taxa.size());
   for (auto taxon : taxa) {
@@ -202,11 +289,17 @@ inline std::string sample_set_key(clade_grammar const& grammar,
     throw std::runtime_error(
         "chart-SPR canonical report: duplicate sample ID in clade key");
   }
-  std::string result{"S"};
+  std::string result;
+  result.reserve(final_size);
+  result = "S";
   result += std::to_string(samples.size());
   result += "[";
   for (auto const& sample : samples) append_length_prefixed(result, sample);
   result += "]";
+  if (result.size() != final_size) {
+    throw std::logic_error(
+        "chart-SPR canonical report: clade key size estimate mismatch");
+  }
   return result;
 }
 
@@ -248,12 +341,26 @@ inline std::string production_key(
     children.push_back(sample_set_key(grammar, std::move(child)));
   }
   std::sort(children.begin(), children.end());
-  std::string result{"P"};
-  append_length_prefixed(result,
-                         sample_set_key(grammar, std::move(parent_taxa)));
+  auto parent_key = sample_set_key(grammar, std::move(parent_taxa));
+  auto final_size = checked_key_size_add(
+      std::size_t{1}, length_prefixed_size(parent_key.size()));
+  final_size = checked_key_size_add(final_size, 1);
+  for (auto const& child : children) {
+    final_size = checked_key_size_add(final_size,
+                                      length_prefixed_size(child.size()));
+  }
+  final_size = checked_key_size_add(final_size, 1);
+  std::string result;
+  result.reserve(final_size);
+  result = "P";
+  append_length_prefixed(result, parent_key);
   result += "[";
   for (auto const& child : children) append_length_prefixed(result, child);
   result += "]";
+  if (result.size() != final_size) {
+    throw std::logic_error(
+        "chart-SPR canonical report: production key size estimate mismatch");
+  }
   return result;
 }
 

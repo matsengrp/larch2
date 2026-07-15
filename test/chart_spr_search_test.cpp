@@ -1,5 +1,6 @@
 #include <larch/build_fasta_newick.hpp>
 #include <larch/chart_spr_search.hpp>
+#include <larch/load_parsimony.hpp>
 #include <larch/load_proto_dag.hpp>
 #include <larch/option_c_chain_commit.hpp>
 #include <larch/overlay_chain_compaction.hpp>
@@ -10,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <condition_variable>
 #include <future>
 #include <limits>
@@ -1544,6 +1546,15 @@ static void test_semantic_capture_reuses_primary_exact_provenance() {
   auto primary_evidence = larch::chart_spr_canonicalize_search_trim_evidence(
       fixture.grammar, plan, active, options.chart, options.exact_trim, primary,
       active_build.invariant_constant_offset);
+  auto const primary_memory =
+      larch::estimate_chart_spr_canonical_exact_evidence_memory(
+          fixture.grammar, primary);
+  auto const primary_actual =
+      larch::estimate_chart_spr_canonical_exact_evidence_resident_bytes(
+          primary_evidence);
+  CHECK(primary_memory.retained_bytes >= primary_actual);
+  CHECK(primary_memory.construction_peak_bytes >=
+        primary_memory.retained_bytes);
 
   // Preserve the frozen canonical bytes: the primary-capture path must emit
   // the exact evidence formerly produced by the checked companion fallback.
@@ -1587,6 +1598,41 @@ static void test_semantic_capture_reuses_primary_exact_provenance() {
       larch::multisite_dominance_mode::score_only;
   larch::configure_chart_spr_primary_exact_provenance(score_only);
   CHECK(!score_only.exact_trim.capture_optimal_root_provenance);
+
+  // Sample text is repeated in clade, production, and provenance keys. A
+  // 5,000-byte registry exercises the encoded-length estimator rather than a
+  // topology-only grammar-capacity multiplier.
+  auto long_grammar = fixture.grammar;
+  for (std::size_t taxon = 0;
+       taxon < long_grammar.taxa.id_to_sample_id.size(); ++taxon) {
+    long_grammar.taxa.id_to_sample_id[taxon] =
+        std::string(5000, static_cast<char>('a' + taxon % 26)) + "-" +
+        std::to_string(taxon);
+  }
+  long_grammar.taxa.sample_id_to_id.clear();
+  long_grammar.taxa.sample_id_to_id.reserve(
+      long_grammar.taxa.id_to_sample_id.size());
+  for (std::size_t taxon = 0;
+       taxon < long_grammar.taxa.id_to_sample_id.size(); ++taxon) {
+    long_grammar.taxa.sample_id_to_id.emplace(
+        long_grammar.taxa.id_to_sample_id[taxon],
+        static_cast<larch::taxon_id>(taxon));
+  }
+  auto long_plan = larch::build_chart_execution_plan(long_grammar);
+  auto long_trim = larch::build_multisite_trim_active(
+      long_plan, active, options.chart, options.exact_trim);
+  auto const long_memory =
+      larch::estimate_chart_spr_canonical_exact_evidence_memory(long_grammar,
+                                                                 long_trim);
+  auto long_evidence = larch::chart_spr_canonicalize_search_trim_evidence(
+      long_grammar, long_plan, active, options.chart, options.exact_trim,
+      long_trim, active_build.invariant_constant_offset);
+  auto const long_actual =
+      larch::estimate_chart_spr_canonical_exact_evidence_resident_bytes(
+          long_evidence);
+  CHECK(long_memory.retained_bytes >= long_actual);
+  CHECK(long_memory.construction_peak_bytes >= long_memory.retained_bytes);
+  CHECK(long_memory.retained_bytes > primary_memory.retained_bytes + 4096);
 
   std::println("  PASS");
 }
@@ -1648,6 +1694,160 @@ static void test_primary_provenance_capture_failure_is_hard_error() {
   scheduler.shutdown();
   check_phase4_scheduler_axis_reconciliation(scheduler.metrics(),
                                              state.counters.scheduler_axes);
+
+  std::println("  PASS");
+}
+
+static void test_lazy_local_exact_semantic_evidence_envelope() {
+  std::println("test_lazy_local_exact_semantic_evidence_envelope");
+
+  auto run_case = [&](bool long_sample_ids) {
+    auto fixture = make_fixture();
+    if (long_sample_ids) {
+      for (std::size_t taxon = 0;
+           taxon < fixture.grammar.taxa.id_to_sample_id.size(); ++taxon) {
+        fixture.grammar.taxa.id_to_sample_id[taxon] =
+            std::string(5000, static_cast<char>('a' + taxon % 26)) + "-" +
+            std::to_string(taxon);
+      }
+      fixture.grammar.taxa.sample_id_to_id.clear();
+      fixture.grammar.taxa.sample_id_to_id.reserve(
+          fixture.grammar.taxa.id_to_sample_id.size());
+      for (std::size_t taxon = 0;
+           taxon < fixture.grammar.taxa.id_to_sample_id.size(); ++taxon) {
+        fixture.grammar.taxa.sample_id_to_id.emplace(
+            fixture.grammar.taxa.id_to_sample_id[taxon],
+            static_cast<larch::taxon_id>(taxon));
+      }
+    }
+
+    larch::chart_spr_search_options options;
+    options.acceptance_mode =
+        larch::chart_spr_acceptance_mode::exact_multisite;
+    options.candidate_selection =
+        larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+    options.top_k_exact_verify = 1;
+    options.cache.use_lazy_multisite_chart = true;
+    options.cache.candidate_batch_size = 1;
+    options.enumeration.max_candidates = 1;
+    options.enumeration.max_candidates_is_post_dedup = true;
+    // Keep this boundary test focused on the deferred state-evidence envelope:
+    // exact-candidate admission has its own independently tested finite
+    // envelope and can otherwise be the larger requirement on this fixture.
+    options.enumeration.max_estimated_affected_clades = 1;
+    options.semantic_capture =
+        larch::chart_spr_semantic_capture_mode::digest;
+    larch::configure_chart_spr_primary_exact_provenance(options);
+    CHECK(options.exact_trim.capture_optimal_root_provenance);
+
+    auto active = larch::make_active_search_patterns(fixture.patterns);
+    auto state = larch::build_chart_spr_search_state_from_active(
+        fixture.dag, fixture.grammar, std::move(active), options.chart,
+        /*build_exact_trim=*/true, options.exact_trim, options.cache);
+    CHECK(state.cache_strategy ==
+          larch::chart_spr_cache_strategy::lazy_multisite_chart);
+    CHECK(state.exact_trim_active_only.has_value());
+    CHECK(!state.exact_trim_active_only->optimal_root_provenance_classes.empty());
+    auto const trim_bytes =
+        larch::estimate_chart_spr_trim_resident_bytes(
+            *state.exact_trim_active_only);
+    auto const evidence_memory =
+        larch::estimate_chart_spr_canonical_exact_evidence_memory(
+            state.grammar, *state.exact_trim_active_only);
+    auto const envelope = larch::chart_spr_search_detail::
+        estimate_grammar_spr_finite_iteration_memory_envelope(
+            state, 1, 1, 1, true, 1);
+    CHECK(envelope.planned_required_bytes >
+          larch::estimate_chart_spr_published_state_resident_bytes(state));
+    CHECK(envelope
+              .planned_canonical_state_exact_evidence_resident_bytes ==
+          evidence_memory.retained_bytes);
+    CHECK(envelope
+              .planned_canonical_state_exact_evidence_construction_peak_bytes ==
+          evidence_memory.construction_peak_bytes);
+    if (long_sample_ids) {
+      CHECK(evidence_memory.retained_bytes > 4096);
+    }
+
+    larch::chart_scheduler scheduler{
+        larch::chart_scheduler_options{.requested_workers = 1}};
+    auto finite_options = options;
+    finite_options.cache.memory_budget_bytes = envelope.planned_required_bytes;
+    larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+        workspace;
+    {
+      auto result = larch::run_chart_spr_acceptance_iteration(
+          state, finite_options, 0, workspace, scheduler);
+      CHECK(result.candidates_generated == 0);
+      CHECK(result.candidates_scored == 0);
+      CHECK(result.canonical_state_exact_before.has_value());
+      auto const actual_evidence =
+          larch::estimate_chart_spr_canonical_exact_evidence_resident_bytes(
+              *result.canonical_state_exact_before);
+      CHECK(actual_evidence <= evidence_memory.retained_bytes);
+      CHECK(state.counters.lazy_local_retained_exact_trim_bytes_max ==
+            trim_bytes);
+      CHECK(state.counters
+                .lazy_local_canonical_exact_evidence_resident_bytes_max ==
+            actual_evidence);
+      CHECK(state.counters
+                .lazy_local_canonical_exact_evidence_construction_peak_bytes_max ==
+            evidence_memory.construction_peak_bytes);
+    }
+    CHECK(workspace.local_score.operation_boundary_clean());
+
+    finite_options.cache.memory_budget_bytes =
+        envelope.planned_required_bytes - 1;
+    bool rejected = false;
+    try {
+      (void)larch::run_chart_spr_acceptance_iteration(
+          state, finite_options, 1, workspace, scheduler);
+    } catch (larch::chart_spr_search_detail::
+                 chart_spr_lazy_local_budget_error const& e) {
+      rejected = true;
+      CHECK(e.required_bytes() == envelope.planned_required_bytes);
+    }
+    CHECK(rejected);
+    CHECK(workspace.candidate_slots.capacity() == 0);
+    CHECK(workspace.candidate_copy_scratch.capacity() == 0);
+    CHECK(workspace.local_results.capacity() == 0);
+    scheduler.shutdown();
+  };
+
+  run_case(false);
+  run_case(true);
+
+  // Direct finite acceptance cannot invoke the compatibility companion B&B;
+  // it must request primary provenance before rank/batch reserves.
+  auto fixture = make_fixture();
+  larch::chart_spr_search_options uncaptured;
+  uncaptured.acceptance_mode =
+      larch::chart_spr_acceptance_mode::exact_multisite;
+  uncaptured.semantic_capture =
+      larch::chart_spr_semantic_capture_mode::digest;
+  uncaptured.cache.use_lazy_multisite_chart = true;
+  uncaptured.enumeration.max_candidates = 1;
+  uncaptured.enumeration.max_candidates_is_post_dedup = true;
+  CHECK(!uncaptured.exact_trim.capture_optimal_root_provenance);
+  auto uncaptured_state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, uncaptured);
+  uncaptured.cache.memory_budget_bytes = std::size_t{1} << 30;
+  larch::chart_scheduler scheduler{
+      larch::chart_scheduler_options{.requested_workers = 1}};
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      workspace;
+  bool provenance_rejected = false;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(
+        uncaptured_state, uncaptured, 0, workspace, scheduler);
+  } catch (larch::chart_spr_search_detail::
+               chart_spr_canonical_exact_evidence_budget_error const&) {
+    provenance_rejected = true;
+  }
+  CHECK(provenance_rejected);
+  CHECK(workspace.candidate_slots.capacity() == 0);
+  CHECK(workspace.local_results.capacity() == 0);
+  scheduler.shutdown();
 
   std::println("  PASS");
 }
@@ -1879,6 +2079,47 @@ static void test_pattern_batch_cache_options_match_all_cache() {
   std::println("  PASS");
 }
 
+static void test_lazy_local_admission_planner() {
+  std::println("test_lazy_local_admission_planner");
+  constexpr std::array<std::size_t, 4> task_bytes{8, 5, 7, 3};
+
+  auto unlimited =
+      larch::chart_spr_search_detail::plan_lazy_local_admission_wave(
+          task_bytes, 4, 3, 0, false);
+  CHECK(unlimited.admitted_count == 3);
+  CHECK(unlimited.admitted_bytes == 20);
+  CHECK(!unlimited.memory_limited);
+
+  auto exact_prefix =
+      larch::chart_spr_search_detail::plan_lazy_local_admission_wave(
+          task_bytes, 9, 4, 13, true);
+  CHECK(exact_prefix.admitted_count == 2);
+  CHECK(exact_prefix.admitted_bytes == 13);
+  CHECK(exact_prefix.memory_limited);
+
+  auto shortened =
+      larch::chart_spr_search_detail::plan_lazy_local_admission_wave(
+          task_bytes, 9, 2, 100, true);
+  CHECK(shortened.admitted_count == 2);
+  CHECK(shortened.admitted_bytes == 13);
+  CHECK(!shortened.memory_limited);
+
+  bool failed = false;
+  try {
+    (void)larch::chart_spr_search_detail::plan_lazy_local_admission_wave(
+        task_bytes, 17, 4, 7, true);
+  } catch (
+      larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+          e) {
+    failed = true;
+    CHECK(e.candidate_index() == 17);
+    CHECK(e.required_bytes() == 8);
+    CHECK(e.available_bytes() == 7);
+  }
+  CHECK(failed);
+  std::println("  PASS");
+}
+
 static void test_lazy_local_packed_context_grouping_reuses_scratch() {
   std::println("test_lazy_local_packed_context_grouping_reuses_scratch");
 
@@ -2101,6 +2342,73 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
   scratch.clear_borrows();
   CHECK(scratch.operation_boundary_clean());
 
+  auto checked_for_corruption =
+      larch::check_chart_execution_plan(state.grammar, state.execution_plan);
+  auto expect_corrupt_scratch_hard_failure = [&](auto&& corrupt) {
+    auto prepared =
+        larch::chart_spr_search_detail::prepare_local_candidate_score(
+            state, candidate, {}, nullptr);
+    CHECK(prepared.valid_for_accumulation);
+    (void)larch::chart_spr_search_detail::
+        prepare_lazy_local_score_scratch_for_candidate(
+            state, prepared.delta(), scratch, nullptr);
+    corrupt(scratch);
+    larch::chart_spr_search_detail::
+        accumulate_prepared_local_candidate_lazy_prepared(
+            state, prepared, {}, nullptr, scratch, checked_for_corruption);
+    CHECK(!prepared.valid_for_accumulation);
+    bool failed = false;
+    try {
+      larch::chart_spr_search_detail::finalize_lazy_local_grouping_status(
+          state, prepared, scratch, 3);
+    } catch (larch::chart_spr_search_detail::
+                 lazy_local_worker_failure_error const& e) {
+      failed = true;
+      CHECK(e.slot() == 3);
+      CHECK(e.kind() == larch::chart_spr_search_detail::
+                            lazy_local_worker_failure_kind::scratch_invariant);
+    }
+    CHECK(failed);
+    scratch.clear_borrows();
+    prepared.release_operation_borrows();
+    CHECK(scratch.operation_boundary_clean());
+  };
+  expect_corrupt_scratch_hard_failure([](auto& value) {
+    ++value.lazy_prepared_key_width;
+  });
+  expect_corrupt_scratch_hard_failure([](auto& value) {
+    std::vector<larch::lazy_overlay_context_accumulator>{}.swap(
+        value.lazy_contexts);
+  });
+
+  auto missing_lazy_prepared =
+      larch::chart_spr_search_detail::prepare_local_candidate_score(
+          state, candidate, {}, nullptr);
+  (void)larch::chart_spr_search_detail::
+      prepare_lazy_local_score_scratch_for_candidate(
+          state, missing_lazy_prepared.delta(), scratch, nullptr);
+  auto saved_lazy_chart = std::exchange(state.lazy_chart, std::nullopt);
+  larch::chart_spr_search_detail::
+      accumulate_prepared_local_candidate_lazy_prepared(
+          state, missing_lazy_prepared, {}, nullptr, scratch,
+          checked_for_corruption);
+  state.lazy_chart = std::move(saved_lazy_chart);
+  bool missing_lazy_failed = false;
+  try {
+    larch::chart_spr_search_detail::finalize_lazy_local_grouping_status(
+        state, missing_lazy_prepared, scratch, 2);
+  } catch (larch::chart_spr_search_detail::lazy_local_worker_failure_error const&
+               e) {
+    missing_lazy_failed = true;
+    CHECK(e.slot() == 2);
+    CHECK(e.kind() == larch::chart_spr_search_detail::
+                          lazy_local_worker_failure_kind::missing_lazy_chart);
+  }
+  CHECK(missing_lazy_failed);
+  scratch.clear_borrows();
+  missing_lazy_prepared.release_operation_borrows();
+  CHECK(scratch.operation_boundary_clean());
+
   CHECK(fixture.candidates.size() >= 4);
   std::vector<larch::grammar_spr_candidate> candidates(
       fixture.candidates.begin(), fixture.candidates.begin() + 4);
@@ -2108,6 +2416,24 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
   std::vector<larch::chart_spr_local_score_result> w4(candidates.size());
   larch::chart_spr_local_score_workspace w1_workspace;
   larch::chart_spr_local_score_workspace w4_workspace;
+  constexpr std::size_t oversized_prior_slots = 64;
+  constexpr std::size_t oversized_nested_capacity = 4096;
+  larch::chart_spr_search_detail::local_score_workspace_access::begin(
+      w4_workspace, oversized_prior_slots, oversized_prior_slots);
+  for (std::size_t slot = 0; slot < oversized_prior_slots; ++slot) {
+    larch::chart_spr_search_detail::local_score_workspace_access::prepared(
+        w4_workspace, slot)
+        .result.invalid_reason.reserve(oversized_nested_capacity);
+    larch::chart_spr_search_detail::local_score_workspace_access::worker(
+        w4_workspace, slot)
+        .scratch.lazy_contexts.reserve(oversized_nested_capacity);
+  }
+  larch::chart_spr_search_detail::local_score_workspace_access::finish(
+      w4_workspace);
+  auto oversized_capacities = larch::chart_spr_search_detail::
+      local_score_workspace_access::task_slot_capacities(w4_workspace);
+  CHECK(oversized_capacities.first >= oversized_prior_slots);
+  CHECK(oversized_capacities.second >= oversized_prior_slots);
   larch::score_candidates_locally_into(state, candidates, w1, w1_workspace, {},
                                        1);
   larch::chart_scheduler scheduler{larch::chart_scheduler_options{
@@ -2120,12 +2446,25 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
   parallel_options.worker_barrier_for_tests = &barrier;
   auto checked =
       larch::check_chart_execution_plan(state.grammar, state.execution_plan);
+  auto const admission_waves_before = state.counters.lazy_local_admission_waves;
+  auto const parallel_waves_before = state.counters.lazy_local_parallel_waves;
   larch::score_candidates_locally_into(state, candidates, w4, w4_workspace,
                                        parallel_options, scheduler, checked);
   CHECK(barrier.release.load());
   CHECK(barrier.started.load() >= 4);
   CHECK(w1_workspace.operation_boundary_clean());
   CHECK(w4_workspace.operation_boundary_clean());
+  auto bounded_capacities = larch::chart_spr_search_detail::
+      local_score_workspace_access::task_slot_capacities(w4_workspace);
+  CHECK(bounded_capacities.first <= 4);
+  CHECK(bounded_capacities.second <= 4);
+  CHECK(state.counters.lazy_local_admission_waves - admission_waves_before ==
+        1);
+  CHECK(state.counters.lazy_local_parallel_waves - parallel_waves_before == 1);
+  CHECK(state.counters.lazy_local_admitted_concurrency_max >= 4);
+  CHECK(state.counters.lazy_local_peak_admitted_bytes > 0);
+  CHECK(state.counters.lazy_local_peak_projected_resident_bytes >
+        state.resident_pattern_cache_bytes);
   for (std::size_t index = 0; index < candidates.size(); ++index) {
     CHECK(w4[index].valid == w1[index].valid);
     CHECK(w4[index].lower_bound.value.old_score ==
@@ -2142,10 +2481,16 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
     CHECK(w4[index].lower_bound.value.delta == candidate_oracle.delta);
   }
   for (std::size_t worker = 0; worker < 4; ++worker) {
+    auto const& prepared_slot =
+        larch::chart_spr_search_detail::local_score_workspace_access::prepared(
+            w4_workspace, worker);
     auto const& worker_scratch =
         larch::chart_spr_search_detail::local_score_workspace_access::worker(
             w4_workspace, worker)
             .scratch;
+    CHECK(prepared_slot.result.invalid_reason.capacity() <
+          oversized_nested_capacity);
+    CHECK(worker_scratch.lazy_contexts.capacity() < oversized_nested_capacity);
     CHECK(worker_scratch.operation_boundary_clean());
     CHECK(worker_scratch.lazy_context_key_words.capacity() >=
           patterns.patterns.size());
@@ -2156,8 +2501,891 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
             patterns.patterns.size()));
     CHECK(worker_scratch.lazy_contexts.capacity() > 0);
   }
+
+  // Discover the allocation-free conservative preflight requirement through
+  // the fixed-size budget exception. At an exact fixed-resident boundary the
+  // task preflight (not the shared-resident guard) must be the rejection.
+  auto finite_active =
+      larch::make_active_search_patterns(patterns, chart_options);
+  auto finite_state = larch::build_chart_spr_search_state_from_active(
+      fixture.dag, fixture.grammar, std::move(finite_active), chart_options,
+      false, {}, cache_options);
+  auto finite_checked = larch::check_chart_execution_plan(
+      finite_state.grammar, finite_state.execution_plan);
+  larch::chart_spr_local_score_workspace finite_w1_workspace;
+  std::array<larch::chart_spr_local_score_result, 1> singleton_result;
+  auto discover_fixed_resident = [&](auto candidate_span, auto result_span,
+                                     auto& workspace, auto&& score) {
+    larch::local_spr_score_options options;
+    options.admission_memory_budget_bytes = 1;
+    try {
+      score(candidate_span, result_span, workspace, options);
+    } catch (
+        larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+            e) {
+      CHECK(e.available_bytes() == 1);
+      return e.required_bytes();
+    }
+    CHECK(false);
+    return std::size_t{0};
+  };
+  auto score_finite_w1 = [&](auto candidate_span, auto result_span,
+                             auto& workspace,
+                             larch::local_spr_score_options const& options) {
+    larch::score_candidates_locally_into(finite_state, candidate_span,
+                                         result_span, workspace, options, 1,
+                                         finite_checked);
+  };
+  auto first_candidate =
+      std::span<larch::grammar_spr_candidate const>{candidates}.first(1);
+  auto singleton_results =
+      std::span<larch::chart_spr_local_score_result>{singleton_result};
+  auto const w1_fixed_resident = discover_fixed_resident(
+      first_candidate, singleton_results, finite_w1_workspace, score_finite_w1);
+  CHECK(w1_fixed_resident > 1);
+
+  std::vector<std::size_t> preflight_requirements;
+  std::vector<std::size_t> steady_resident_bases;
+  preflight_requirements.reserve(candidates.size());
+  steady_resident_bases.reserve(candidates.size());
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    larch::local_spr_score_options boundary_options;
+    boundary_options.admission_memory_budget_bytes = w1_fixed_resident;
+    bool boundary_failed = false;
+    try {
+      score_finite_w1(
+          std::span<larch::grammar_spr_candidate const>{&candidates[index], 1},
+          singleton_results, finite_w1_workspace, boundary_options);
+    } catch (
+        larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+            e) {
+      boundary_failed = true;
+      CHECK(e.candidate_index() == 0);
+      CHECK(e.available_bytes() < w1_fixed_resident);
+      CHECK(e.required_bytes() > 0);
+      steady_resident_bases.push_back(w1_fixed_resident -
+                                      e.available_bytes());
+      preflight_requirements.push_back(e.required_bytes());
+    }
+    CHECK(boundary_failed);
+  }
+  CHECK(preflight_requirements.size() == candidates.size());
+  CHECK(steady_resident_bases.size() == candidates.size());
+
+  // Finite explicit W1 must use coordinator admission. Exact fit preserves
+  // semantics and the observed preparation high-water never exceeds budget;
+  // one byte less fails before a task is prepared or submitted.
+  auto const singleton_budget =
+      steady_resident_bases.front() + preflight_requirements.front();
+  larch::local_spr_score_options singleton_fit_options;
+  singleton_fit_options.admission_memory_budget_bytes = singleton_budget;
+  auto const singleton_counters_before = finite_state.counters;
+  score_finite_w1(first_candidate, singleton_results, finite_w1_workspace,
+                  singleton_fit_options);
+  CHECK(singleton_result.front().valid == w1.front().valid);
+  CHECK(singleton_result.front().lower_bound.value.new_score ==
+        w1.front().lower_bound.value.new_score);
+  CHECK(finite_state.counters.local_candidate_scores ==
+        singleton_counters_before.local_candidate_scores + 1);
+  CHECK(finite_state.counters.candidate_execution_plan_builds ==
+        singleton_counters_before.candidate_execution_plan_builds + 1);
+  CHECK(finite_state.counters.lazy_local_preparation_peak_bytes <=
+        singleton_budget);
+  CHECK(finite_w1_workspace.operation_boundary_clean());
+
+  larch::local_spr_score_options singleton_reject_options;
+  singleton_reject_options.admission_memory_budget_bytes = singleton_budget - 1;
+  auto const singleton_prepared_before =
+      finite_state.counters.lazy_local_prepared_tasks;
+  auto const singleton_failures_before =
+      finite_state.counters.lazy_local_pre_submit_budget_failures;
+  auto const singleton_scheduler_operations_before =
+      larch::chart_spr_scheduler_axis_operation_count(
+          finite_state.counters.scheduler_axes);
+  bool singleton_rejected = false;
+  try {
+    score_finite_w1(first_candidate, singleton_results, finite_w1_workspace,
+                    singleton_reject_options);
+  } catch (
+      larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+          e) {
+    singleton_rejected = true;
+    CHECK(e.required_bytes() == preflight_requirements.front());
+  }
+  CHECK(singleton_rejected);
+  CHECK(finite_state.counters.lazy_local_prepared_tasks ==
+        singleton_prepared_before);
+  CHECK(finite_state.counters.lazy_local_pre_submit_budget_failures ==
+        singleton_failures_before + 1);
+  CHECK(larch::chart_spr_scheduler_axis_operation_count(
+            finite_state.counters.scheduler_axes) ==
+        singleton_scheduler_operations_before);
+  CHECK(finite_w1_workspace.operation_boundary_clean());
+
+  // The maximum singleton preparation envelope is enough for every task when
+  // it starts a wave, but intentionally not for all four stable task slots at
+  // once. The maximal stable prefix therefore shrinks M without changing
+  // publication order or scores.
+  larch::chart_spr_local_score_workspace finite_w4_workspace;
+  std::vector<larch::chart_spr_local_score_result> limited(candidates.size());
+  auto score_finite_w4 = [&](auto candidate_span, auto result_span,
+                             auto& workspace,
+                             larch::local_spr_score_options const& options) {
+    larch::score_candidates_locally_into(finite_state, candidate_span,
+                                         result_span, workspace, options,
+                                         scheduler, finite_checked);
+  };
+  auto const w4_fixed_resident = discover_fixed_resident(
+      std::span<larch::grammar_spr_candidate const>{candidates},
+      std::span<larch::chart_spr_local_score_result>{limited},
+      finite_w4_workspace, score_finite_w4);
+  larch::local_spr_score_options w4_boundary_options;
+  w4_boundary_options.admission_memory_budget_bytes = w4_fixed_resident;
+  std::size_t w4_steady_resident = 0;
+  try {
+    score_finite_w4(
+        std::span<larch::grammar_spr_candidate const>{candidates},
+        std::span<larch::chart_spr_local_score_result>{limited},
+        finite_w4_workspace, w4_boundary_options);
+  } catch (larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error
+               const& e) {
+    CHECK(e.available_bytes() < w4_fixed_resident);
+    w4_steady_resident = w4_fixed_resident - e.available_bytes();
+  }
+  CHECK(w4_steady_resident > 0);
+  auto const maximum_preflight = *std::max_element(
+      preflight_requirements.begin(), preflight_requirements.end());
+  larch::local_spr_score_options limited_options;
+  limited_options.admission_memory_budget_bytes =
+      w4_steady_resident + maximum_preflight;
+  auto const limited_waves_before =
+      finite_state.counters.lazy_local_admission_waves;
+  auto const memory_waves_before =
+      finite_state.counters.lazy_local_memory_limited_waves;
+  score_finite_w4(std::span<larch::grammar_spr_candidate const>{candidates},
+                  std::span<larch::chart_spr_local_score_result>{limited},
+                  finite_w4_workspace, limited_options);
+  CHECK(finite_w4_workspace.operation_boundary_clean());
+  CHECK(finite_state.counters.lazy_local_admission_waves -
+            limited_waves_before >
+        1);
+  CHECK(finite_state.counters.lazy_local_memory_limited_waves -
+            memory_waves_before >=
+        1);
+  CHECK(finite_state.counters.lazy_local_preparation_peak_bytes <=
+        limited_options.admission_memory_budget_bytes);
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    CHECK(limited[index].valid == w1[index].valid);
+    CHECK(limited[index].lower_bound.value.old_score ==
+          w1[index].lower_bound.value.old_score);
+    CHECK(limited[index].lower_bound.value.new_score ==
+          w1[index].lower_bound.value.new_score);
+    CHECK(limited[index].lower_bound.value.delta ==
+          w1[index].lower_bound.value.delta);
+  }
+
+  // With ample finite headroom, a second wave reuses the first wave's
+  // descriptor/grouping capacities. The public call still releases all task
+  // payload before returning to its enumeration/promotion caller.
+  std::vector<larch::grammar_spr_candidate> repeated_candidates = candidates;
+  repeated_candidates.insert(repeated_candidates.end(), candidates.begin(),
+                             candidates.end());
+  std::vector<larch::chart_spr_local_score_result> repeated_results(
+      repeated_candidates.size());
+  larch::chart_spr_local_score_workspace reuse_workspace;
+  larch::local_spr_score_options reuse_options;
+  reuse_options.admission_memory_budget_bytes = std::size_t{1} << 30;
+  auto const reuse_waves_before =
+      finite_state.counters.lazy_local_admission_waves;
+  auto const reused_tasks_before =
+      finite_state.counters.lazy_local_reused_prepared_tasks;
+  score_finite_w4(
+      std::span<larch::grammar_spr_candidate const>{repeated_candidates},
+      std::span<larch::chart_spr_local_score_result>{repeated_results},
+      reuse_workspace, reuse_options);
+  CHECK(finite_state.counters.lazy_local_admission_waves - reuse_waves_before ==
+        2);
+  CHECK(finite_state.counters.lazy_local_reused_prepared_tasks -
+            reused_tasks_before >=
+        candidates.size());
+  CHECK(reuse_workspace.operation_boundary_clean());
+  for (std::size_t index = 0; index < repeated_results.size(); ++index) {
+    CHECK(repeated_results[index].lower_bound.value.delta ==
+          w1[index % candidates.size()].lower_bound.value.delta);
+  }
+
+  // Genuine candidate invalidity publishes only a policy-bounded diagnostic.
+  // Pin the exact finite boundary independently for checked W1 and checked W4
+  // (which may split into singleton waves); one byte less rejects before the
+  // first invalid task is prepared.
+  larch::grammar_spr_candidate invalid_candidate;
+  invalid_candidate.removed_productions.push_back(
+      larch::base_production_ref(
+          finite_state.grammar
+              .productions_by_parent[finite_state.grammar.root_clade]
+              .front()));
+  std::array<larch::grammar_spr_candidate, 4> invalid_candidates;
+  invalid_candidates.fill(invalid_candidate);
+  auto pin_invalid_boundary = [&](std::size_t workers) {
+    std::array<larch::chart_spr_local_score_result, 4> invalid_results;
+    larch::chart_spr_local_score_workspace invalid_workspace;
+    auto score = [&](larch::local_spr_score_options const& score_options) {
+      if (workers == 1) {
+        larch::score_candidates_locally_into(
+            finite_state, invalid_candidates, invalid_results,
+            invalid_workspace, score_options, 1, finite_checked);
+      } else {
+        larch::score_candidates_locally_into(
+            finite_state, invalid_candidates, invalid_results,
+            invalid_workspace, score_options, scheduler, finite_checked);
+      }
+    };
+    larch::local_spr_score_options cold;
+    cold.admission_memory_budget_bytes = 1;
+    std::size_t fixed = 0;
+    try {
+      score(cold);
+    } catch (larch::chart_spr_search_detail::
+                 chart_spr_lazy_local_budget_error const& e) {
+      fixed = e.required_bytes();
+    }
+    CHECK(fixed > 1);
+    larch::local_spr_score_options task_probe;
+    task_probe.admission_memory_budget_bytes = fixed;
+    std::size_t task = 0;
+    std::size_t steady_resident = 0;
+    try {
+      score(task_probe);
+    } catch (larch::chart_spr_search_detail::
+                 chart_spr_lazy_local_budget_error const& e) {
+      CHECK(e.available_bytes() < fixed);
+      steady_resident = fixed - e.available_bytes();
+      task = e.required_bytes();
+    }
+    CHECK(task > 0);
+    CHECK(steady_resident > 0);
+    auto const exact_budget = steady_resident + task;
+    larch::local_spr_score_options fit;
+    fit.admission_memory_budget_bytes = exact_budget;
+    score(fit);
+    CHECK(invalid_workspace.operation_boundary_clean());
+    for (auto const& result : invalid_results) {
+      CHECK(!result.valid);
+      CHECK(!result.invalid_reason.empty());
+      CHECK(result.invalid_reason.size() <=
+            larch::chart_spr_search_detail::
+                lazy_local_invalid_reason_max_size);
+    }
+
+    larch::local_spr_score_options one_under;
+    one_under.admission_memory_budget_bytes = exact_budget - 1;
+    std::array<larch::chart_spr_local_score_result, 4> reject_results;
+    larch::chart_spr_local_score_workspace reject_workspace;
+    auto const prepared_before =
+        finite_state.counters.lazy_local_prepared_tasks;
+    bool rejected = false;
+    try {
+      if (workers == 1) {
+        larch::score_candidates_locally_into(
+            finite_state, invalid_candidates, reject_results,
+            reject_workspace, one_under, 1, finite_checked);
+      } else {
+        larch::score_candidates_locally_into(
+            finite_state, invalid_candidates, reject_results,
+            reject_workspace, one_under, scheduler, finite_checked);
+      }
+    } catch (larch::chart_spr_search_detail::
+                 chart_spr_lazy_local_budget_error const&) {
+      rejected = true;
+    }
+    CHECK(rejected);
+    CHECK(finite_state.counters.lazy_local_prepared_tasks == prepared_before);
+    CHECK(reject_workspace.operation_boundary_clean());
+    return invalid_results.front().invalid_reason;
+  };
+  auto const invalid_w1_reason = pin_invalid_boundary(1);
+  auto const invalid_w4_reason = pin_invalid_boundary(4);
+  CHECK(invalid_w1_reason == invalid_w4_reason);
+
+  // The checked direct finite boundary must charge caller-owned candidate
+  // inputs independently of result growth. Inflate only nested source
+  // capacities (not logical candidate shape), prove that the cold boundary
+  // moves by exactly that visible resident delta, then pin task E/E-1. The
+  // one-under call must reject before preparation or scheduler submission.
+  std::array<larch::grammar_spr_candidate, 4> baseline_capacity_candidates;
+  baseline_capacity_candidates.fill(candidates.front());
+  auto oversized_capacity_candidates = baseline_capacity_candidates;
+  for (auto& oversized : oversized_capacity_candidates) {
+    oversized.removed_productions.reserve(4096);
+    oversized.added_clades.reserve(4096);
+    oversized.added_productions.reserve(4096);
+  }
+  auto const baseline_input_resident = larch::chart_spr_search_detail::
+      estimate_lazy_local_candidate_input_resident_bytes(
+          baseline_capacity_candidates);
+  auto const oversized_input_resident = larch::chart_spr_search_detail::
+      estimate_lazy_local_candidate_input_resident_bytes(
+          oversized_capacity_candidates);
+  CHECK(oversized_input_resident > baseline_input_resident + 4096);
+
+  auto discover_input_fixed = [&](auto const& candidate_inputs,
+                                  auto& result_outputs, auto& score_workspace) {
+    larch::local_spr_score_options cold;
+    cold.admission_memory_budget_bytes = 1;
+    try {
+      larch::score_candidates_locally_into(
+          finite_state, candidate_inputs, result_outputs, score_workspace,
+          cold, scheduler, finite_checked);
+    } catch (larch::chart_spr_search_detail::
+                 chart_spr_lazy_local_budget_error const& e) {
+      CHECK(e.available_bytes() == 1);
+      return e.required_bytes();
+    }
+    CHECK(false);
+    return std::size_t{0};
+  };
+  std::array<larch::chart_spr_local_score_result, 4>
+      baseline_capacity_results;
+  std::array<larch::chart_spr_local_score_result, 4>
+      oversized_capacity_results;
+  larch::chart_spr_local_score_workspace baseline_capacity_workspace;
+  larch::chart_spr_local_score_workspace oversized_capacity_workspace;
+  auto const baseline_capacity_fixed = discover_input_fixed(
+      baseline_capacity_candidates, baseline_capacity_results,
+      baseline_capacity_workspace);
+  auto const oversized_capacity_fixed = discover_input_fixed(
+      oversized_capacity_candidates, oversized_capacity_results,
+      oversized_capacity_workspace);
+  CHECK(oversized_capacity_fixed - baseline_capacity_fixed ==
+        oversized_input_resident - baseline_input_resident);
+
+  larch::local_spr_score_options oversized_task_probe;
+  oversized_task_probe.admission_memory_budget_bytes =
+      oversized_capacity_fixed;
+  std::size_t oversized_task_requirement = 0;
+  std::size_t oversized_steady_resident = 0;
+  try {
+    larch::score_candidates_locally_into(
+        finite_state, oversized_capacity_candidates,
+        oversized_capacity_results, oversized_capacity_workspace,
+        oversized_task_probe, scheduler, finite_checked);
+  } catch (larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error
+               const& e) {
+    CHECK(e.available_bytes() < oversized_capacity_fixed);
+    oversized_steady_resident =
+        oversized_capacity_fixed - e.available_bytes();
+    oversized_task_requirement = e.required_bytes();
+  }
+  CHECK(oversized_steady_resident > 0);
+  CHECK(oversized_task_requirement > 0);
+  auto const oversized_exact_budget =
+      oversized_steady_resident + oversized_task_requirement;
+  larch::local_spr_score_options oversized_fit;
+  oversized_fit.admission_memory_budget_bytes = oversized_exact_budget;
+  larch::score_candidates_locally_into(
+      finite_state, oversized_capacity_candidates, oversized_capacity_results,
+      oversized_capacity_workspace, oversized_fit, scheduler, finite_checked);
+  CHECK(oversized_capacity_workspace.operation_boundary_clean());
+  for (auto const& result : oversized_capacity_results) {
+    CHECK(result.valid == w1.front().valid);
+    CHECK(result.lower_bound.value.delta ==
+          w1.front().lower_bound.value.delta);
+  }
+
+  std::array<larch::chart_spr_local_score_result, 4>
+      oversized_reject_results;
+  larch::chart_spr_local_score_workspace oversized_reject_workspace;
+  larch::local_spr_score_options oversized_one_under;
+  oversized_one_under.admission_memory_budget_bytes =
+      oversized_exact_budget - 1;
+  auto const oversized_prepared_before =
+      finite_state.counters.lazy_local_prepared_tasks;
+  auto const oversized_axis_operations_before =
+      larch::chart_spr_scheduler_axis_operation_count(
+          finite_state.counters.scheduler_axes);
+  auto const oversized_scheduler_before = scheduler.metrics();
+  bool oversized_rejected = false;
+  try {
+    larch::score_candidates_locally_into(
+        finite_state, oversized_capacity_candidates, oversized_reject_results,
+        oversized_reject_workspace, oversized_one_under, scheduler,
+        finite_checked);
+  } catch (larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error
+               const& e) {
+    oversized_rejected = true;
+    CHECK(e.required_bytes() == oversized_task_requirement);
+  }
+  CHECK(oversized_rejected);
+  CHECK(finite_state.counters.lazy_local_prepared_tasks ==
+        oversized_prepared_before);
+  CHECK(larch::chart_spr_scheduler_axis_operation_count(
+            finite_state.counters.scheduler_axes) ==
+        oversized_axis_operations_before);
+  auto const oversized_scheduler_after = scheduler.metrics();
+  CHECK(oversized_scheduler_after.operations ==
+        oversized_scheduler_before.operations);
+  CHECK(oversized_scheduler_after.tasks_submitted ==
+        oversized_scheduler_before.tasks_submitted);
+  CHECK(oversized_reject_workspace.operation_boundary_clean());
+  for (auto const& result : oversized_reject_results) {
+    CHECK(result.affected_clade_count == 0);
+    CHECK(result.valid);
+    CHECK(result.invalid_reason.empty());
+  }
+
+  // Unsupported finite-budget enumeration ownership graphs fail closed before
+  // rank/batch/enumerator storage is allocated. Unlimited behavior remains on
+  // the existing source dispatch paths.
+  for (auto source : {larch::chart_spr_candidate_source::sampled_tree,
+                      larch::chart_spr_candidate_source::hybrid}) {
+    larch::chart_spr_search_options source_options;
+    source_options.acceptance_mode =
+        larch::chart_spr_acceptance_mode::lower_bound_heuristic;
+    source_options.cache.use_lazy_multisite_chart = true;
+    source_options.cache.memory_budget_bytes = 1;
+    source_options.enumeration.source = source;
+    larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+        source_workspace;
+    bool source_rejected = false;
+    try {
+      (void)larch::run_chart_spr_acceptance_iteration(
+          finite_state, source_options, 0, source_workspace, scheduler);
+    } catch (larch::chart_spr_search_detail::
+                 chart_spr_lazy_local_enumeration_budget_error const& e) {
+      source_rejected = true;
+      CHECK(e.source() == source);
+    }
+    CHECK(source_rejected);
+    CHECK(source_workspace.local_score.operation_boundary_clean());
+    CHECK(source_workspace.candidate_slots.empty());
+  }
+
+  larch::chart_spr_search_options reservoir_options;
+  reservoir_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::lower_bound_heuristic;
+  reservoir_options.cache.use_lazy_multisite_chart = true;
+  reservoir_options.cache.memory_budget_bytes = 1;
+  reservoir_options.enumeration.source =
+      larch::chart_spr_candidate_source::grammar;
+  reservoir_options.enumeration.reservoir_sample = true;
+  reservoir_options.enumeration.max_candidates = 1;
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      reservoir_workspace;
+  bool reservoir_rejected = false;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(
+        finite_state, reservoir_options, 0, reservoir_workspace, scheduler);
+  } catch (larch::chart_spr_search_detail::
+               chart_spr_lazy_local_enumeration_budget_error const& e) {
+    reservoir_rejected = true;
+    CHECK(e.source() == larch::chart_spr_candidate_source::grammar);
+  }
+  CHECK(reservoir_rejected);
+  CHECK(reservoir_workspace.candidate_slots.empty());
+
+  larch::local_spr_score_options submit_failure_options;
+  larch::local_score_worker_barrier_for_tests submit_failure_barrier;
+  submit_failure_options.force_worker_submit_failure_after_for_tests = 1;
+  submit_failure_options.worker_barrier_for_tests = &submit_failure_barrier;
+  std::array<larch::chart_spr_local_score_result, 1>
+      submit_failure_row_oracle_result;
+  larch::chart_spr_local_score_workspace submit_failure_row_oracle_workspace;
+  larch::chart_scheduler submit_failure_row_oracle_scheduler{
+      larch::chart_scheduler_options{.requested_workers = 1}};
+  auto const submit_failure_row_oracle_before =
+      state.counters.local_rows_recomputed;
+  larch::score_candidates_locally_into(
+      state,
+      std::span<larch::grammar_spr_candidate const>{candidates}.first(1),
+      submit_failure_row_oracle_result, submit_failure_row_oracle_workspace,
+      {}, submit_failure_row_oracle_scheduler, checked);
+  auto const expected_submit_failure_rows =
+      state.counters.local_rows_recomputed -
+      submit_failure_row_oracle_before;
+  CHECK(expected_submit_failure_rows > 0);
+  CHECK(submit_failure_row_oracle_workspace.operation_boundary_clean());
+  submit_failure_row_oracle_scheduler.shutdown();
+  auto const submit_failure_counters_before = state.counters;
+  auto const submit_failure_scheduler_before = scheduler.metrics();
+  bool submit_failed = false;
+  try {
+    larch::score_candidates_locally_into(state, candidates, limited,
+                                         w4_workspace, submit_failure_options,
+                                         scheduler, checked);
+  } catch (std::runtime_error const& e) {
+    submit_failed = true;
+    CHECK(std::string{e.what()}.find("forced worker submission failure") !=
+          std::string::npos);
+  }
+  CHECK(submit_failed);
+  CHECK(submit_failure_barrier.started.load() == 1);
+  CHECK(submit_failure_barrier.release.load());
+  CHECK(w4_workspace.operation_boundary_clean());
+  auto const submit_failure_scheduler_after = scheduler.metrics();
+  CHECK(submit_failure_scheduler_after.operations ==
+        submit_failure_scheduler_before.operations + 1);
+  CHECK(submit_failure_scheduler_after.tasks_submitted ==
+        submit_failure_scheduler_before.tasks_submitted + 1);
+  CHECK(submit_failure_scheduler_after.tasks_completed ==
+        submit_failure_scheduler_before.tasks_completed + 1);
+  CHECK(submit_failure_scheduler_after.tasks_joined ==
+        submit_failure_scheduler_before.tasks_joined + 1);
+  CHECK(submit_failure_scheduler_after.tasks_submitted ==
+        submit_failure_scheduler_after.tasks_completed);
+  CHECK(submit_failure_scheduler_after.tasks_submitted ==
+        submit_failure_scheduler_after.tasks_joined);
+  CHECK(submit_failure_scheduler_after.pending_tasks == 0);
+  CHECK(state.counters.candidate_batches_scored ==
+        submit_failure_counters_before.candidate_batches_scored + 1);
+  CHECK(state.counters.local_rows_recomputed ==
+        submit_failure_counters_before.local_rows_recomputed +
+            expected_submit_failure_rows);
+  for (std::size_t slot = 0; slot < 4; ++slot) {
+    auto const& folded = larch::chart_spr_search_detail::
+        local_score_workspace_access::worker(w4_workspace, slot)
+            .counters;
+    CHECK(folded.local_rows_recomputed == 0);
+    CHECK(folded.candidate_execution_plan_cache_hits == 0);
+    CHECK(larch::chart_spr_scheduler_axis_operation_count(
+              folded.scheduler_axes) == 0);
+  }
+  auto submit_failure_global_axes = state.counters.scheduler_axes;
+  larch::add_chart_spr_scheduler_axis_counters(
+      submit_failure_global_axes, finite_state.counters.scheduler_axes);
+  check_phase4_scheduler_axis_reconciliation(submit_failure_scheduler_after,
+                                             submit_failure_global_axes);
+  for (auto const& result : limited) {
+    CHECK(result.affected_clade_count == 0);
+    CHECK(result.local_score_ms == 0.0);
+    CHECK(result.valid);
+    CHECK(result.invalid_reason.empty());
+  }
+
+  auto check_no_lazy_results_published = [&] {
+    for (auto const& result : limited) {
+      CHECK(result.affected_clade_count == 0);
+      CHECK(result.local_score_ms == 0.0);
+      CHECK(result.valid);
+      CHECK(result.invalid_reason.empty());
+      CHECK(result.lower_bound.value.old_score == 0);
+      CHECK(result.lower_bound.value.new_score == 0);
+    }
+  };
+
+  // Worker invariants are fixed-size hard failures, never biological invalid
+  // candidates. All simultaneously failed workers are joined and the stable
+  // lowest slot wins; cleanup folds each worker payload once.
+  larch::local_spr_score_options invariant_failure_options;
+  invariant_failure_options.force_all_lazy_worker_invariant_failures_for_tests =
+      true;
+  auto const invariant_batches_before =
+      state.counters.candidate_batches_scored;
+  bool invariant_failed = false;
+  try {
+    larch::score_candidates_locally_into(
+        state, candidates, limited, w4_workspace, invariant_failure_options,
+        scheduler, checked);
+  } catch (larch::chart_spr_search_detail::lazy_local_worker_failure_error const&
+               e) {
+    invariant_failed = true;
+    CHECK(e.slot() == 0);
+    CHECK(e.kind() == larch::chart_spr_search_detail::
+                          lazy_local_worker_failure_kind::forced_for_tests);
+  }
+  CHECK(invariant_failed);
+  CHECK(state.counters.candidate_batches_scored ==
+        invariant_batches_before + 1);
+  CHECK(w4_workspace.operation_boundary_clean());
+  check_no_lazy_results_published();
+
+  auto run_finish_failure = [&](bool allocation) {
+    larch::local_spr_score_options failure_options;
+    if (allocation) {
+      failure_options.force_lazy_finish_allocation_for_tests = 2;
+    } else {
+      failure_options.force_lazy_finish_overflow_for_tests = 2;
+    }
+    auto const counters_before = state.counters;
+    bool failed = false;
+    try {
+      larch::score_candidates_locally_into(
+          state, candidates, limited, w4_workspace, failure_options, scheduler,
+          checked);
+    } catch (std::bad_alloc const&) {
+      CHECK(allocation);
+      failed = true;
+    } catch (std::overflow_error const& e) {
+      CHECK(!allocation);
+      CHECK(std::string{e.what()}.find("forced finish overflow") !=
+            std::string::npos);
+      failed = true;
+    }
+    CHECK(failed);
+    CHECK(state.counters.candidate_batches_scored ==
+          counters_before.candidate_batches_scored + 1);
+    CHECK(state.counters.local_rows_recomputed >
+          counters_before.local_rows_recomputed);
+    CHECK(w4_workspace.operation_boundary_clean());
+    check_no_lazy_results_published();
+    return state.counters.local_rows_recomputed -
+           counters_before.local_rows_recomputed;
+  };
+  auto const overflow_rows = run_finish_failure(false);
+  auto const allocation_rows = run_finish_failure(true);
+  CHECK(overflow_rows == allocation_rows);
+
+  // The same caller-owned workspace remains reusable after every hard-failure
+  // path and a later successful publication is complete and ordered.
+  larch::score_candidates_locally_into(state, candidates, limited, w4_workspace,
+                                       {}, scheduler, checked);
+  CHECK(w4_workspace.operation_boundary_clean());
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    CHECK(limited[index].valid == w1[index].valid);
+    CHECK(limited[index].lower_bound.value.new_score ==
+          w1[index].lower_bound.value.new_score);
+  }
+
+  // An impossible singleton is rejected before scheduler submission and the
+  // operation boundary remains reusable.
+  larch::local_spr_score_options impossible_options;
+  impossible_options.admission_memory_budget_bytes = 1;
+  auto const scheduler_operations_before =
+      larch::chart_spr_scheduler_axis_operation_count(
+          state.counters.scheduler_axes);
+  auto const failures_before =
+      state.counters.lazy_local_pre_submit_budget_failures;
+  bool budget_failed = false;
+  try {
+    larch::score_candidates_locally_into(state, candidates, limited,
+                                         w4_workspace, impossible_options,
+                                         scheduler, checked);
+  } catch (
+      larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+          e) {
+    budget_failed = true;
+    CHECK(e.candidate_index() == 0);
+  }
+  CHECK(budget_failed);
+  CHECK(w4_workspace.operation_boundary_clean());
+  CHECK(state.counters.lazy_local_pre_submit_budget_failures -
+            failures_before ==
+        1);
+  CHECK(larch::chart_spr_scheduler_axis_operation_count(
+            state.counters.scheduler_axes) == scheduler_operations_before);
   scheduler.shutdown();
 
+  std::println("  PASS");
+}
+
+static void test_lazy_local_production_multibatch_retained_budget() {
+  std::println("test_lazy_local_production_multibatch_retained_budget");
+
+  auto fixture = make_fixture();
+  CHECK(fixture.candidates.size() >= 4);
+  larch::chart_spr_search_options base_options;
+  base_options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::lower_bound_heuristic;
+  base_options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  base_options.cache.use_lazy_multisite_chart = true;
+  base_options.cache.candidate_batch_size = 1;
+  base_options.enumeration.max_candidates =
+      std::min<std::size_t>(64, fixture.candidates.size());
+  base_options.enumeration.max_candidates_is_post_dedup = true;
+  base_options.semantic_capture =
+      larch::chart_spr_semantic_capture_mode::digest;
+
+  auto make_state = [&] {
+    return larch::build_chart_spr_search_state(fixture.dag, fixture.grammar,
+                                               base_options);
+  };
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 1,
+  }};
+
+  auto discover_envelope = [&] {
+    auto state = make_state();
+    auto options = base_options;
+    options.cache.memory_budget_bytes = 1;
+    larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+        workspace;
+    try {
+      (void)larch::run_chart_spr_acceptance_iteration(state, options, 0,
+                                                      workspace, scheduler);
+    } catch (
+        larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+            e) {
+      CHECK(e.available_bytes() == 1);
+      CHECK(state.counters.lazy_local_admission_waves == 0);
+      CHECK(workspace.candidate_slots.capacity() == 0);
+      return e.required_bytes();
+    }
+    CHECK(false);
+    return std::size_t{0};
+  };
+
+  auto const envelope = discover_envelope();
+  CHECK(envelope > 1);
+
+  // The advertised global envelope includes all retained enumeration,
+  // ranked/canonical/affected growth plus the worst local task preparation.
+  // Its exact boundary therefore completes every one-candidate batch without
+  // a late local-admission rejection.
+  auto state = make_state();
+  auto fit_options = base_options;
+  fit_options.cache.memory_budget_bytes = envelope;
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      fit_workspace;
+  auto fit = larch::run_chart_spr_acceptance_iteration(
+      state, fit_options, 0, fit_workspace, scheduler);
+  CHECK(fit.candidates_generated == base_options.enumeration.max_candidates);
+  CHECK(fit.candidates_scored == base_options.enumeration.max_candidates);
+  CHECK(fit.canonical_candidates.size() == fit.candidates_scored);
+  CHECK(state.counters.lazy_local_admission_waves == fit.candidates_scored);
+  CHECK(state.counters.lazy_local_pre_submit_budget_failures == 0);
+  CHECK(state.counters.lazy_local_iteration_envelope_bytes_max == envelope);
+  CHECK(state.counters.lazy_local_iteration_task_stable_bytes_max > 0);
+  CHECK(state.counters.lazy_local_iteration_task_preparation_peak_bytes_max >
+        0);
+  CHECK(state.counters.lazy_local_peak_projected_resident_bytes <= envelope);
+  CHECK(state.counters.lazy_local_preparation_peak_bytes <= envelope);
+  CHECK(fit_workspace.local_score.operation_boundary_clean());
+  CHECK(fit_workspace.candidate_slots.capacity() == 0);
+  CHECK(fit_workspace.candidate_copy_scratch.capacity() == 0);
+  CHECK(fit_workspace.local_results.capacity() == 0);
+
+  // A canonical sample signature is not bounded by a fixed diagnostic-sized
+  // guess: sample IDs may themselves be arbitrarily long. The finite grammar
+  // envelope derives the retained record charge from their encoded lengths.
+  auto long_sample_state = make_state();
+  for (std::size_t taxon = 0;
+       taxon < long_sample_state.grammar.taxa.id_to_sample_id.size(); ++taxon) {
+    long_sample_state.grammar.taxa.id_to_sample_id[taxon] =
+        std::string(5000, static_cast<char>('a' + taxon % 26)) +
+        std::to_string(taxon);
+  }
+  auto const long_sample_envelope = larch::chart_spr_search_detail::
+      estimate_grammar_spr_finite_iteration_memory_envelope(
+          long_sample_state, base_options.enumeration.max_candidates, 1, 1,
+          true, 1);
+  auto long_sample_signature = larch::chart_spr_candidate_sample_signature(
+      long_sample_state.grammar, fixture.candidates.front());
+  CHECK(long_sample_envelope.planned_canonical_record_dynamic_bytes > 4096);
+  CHECK(long_sample_envelope.planned_canonical_record_dynamic_bytes >=
+        long_sample_signature.capacity() + 1);
+
+  auto reject_state = make_state();
+  auto reject_options = base_options;
+  reject_options.cache.memory_budget_bytes = envelope - 1;
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      reject_workspace;
+  bool rejected = false;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(
+        reject_state, reject_options, 0, reject_workspace, scheduler);
+  } catch (
+      larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+          e) {
+    rejected = true;
+    CHECK(e.required_bytes() == envelope);
+  }
+  CHECK(rejected);
+  CHECK(reject_state.counters.lazy_local_admission_waves == 0);
+  CHECK(reject_workspace.candidate_slots.capacity() == 0);
+
+  scheduler.shutdown();
+  std::println("  PASS");
+}
+
+static void test_lazy_local_named_fixture_finite_production_gates() {
+  std::println("test_lazy_local_named_fixture_finite_production_gates");
+  constexpr std::size_t budget = 12884901888ULL;
+
+  auto run_fixture = [&](std::string_view name, larch::phylo_dag dag,
+                         std::size_t expected_taxa, std::size_t expected_clades,
+                         std::size_t expected_patterns,
+                         std::size_t candidate_count,
+                         std::size_t candidate_batch_size,
+                         std::size_t worker_count) {
+    larch::recompute_compact_genomes(dag);
+    larch::set_sample_ids_from_cg(dag);
+    larch::polytomy_refinement_options refinement_options;
+    refinement_options.mode = larch::polytomy_mode::expand_soft_bounded;
+    refinement_options.max_shapes_per_polytomy = 1;
+    auto refinement = larch::build_polytomy_refined_clade_grammar(
+        dag, larch::clade_grammar_options{}, refinement_options);
+
+    larch::chart_spr_search_options options;
+    options.acceptance_mode =
+        larch::chart_spr_acceptance_mode::lower_bound_heuristic;
+    options.candidate_selection =
+        larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+    options.cache.use_lazy_multisite_chart = true;
+    options.cache.memory_budget_bytes = budget;
+    options.cache.candidate_batch_size = candidate_batch_size;
+    options.enumeration.max_candidates = candidate_count;
+    options.enumeration.max_candidates_is_post_dedup = true;
+    options.semantic_capture = larch::chart_spr_semantic_capture_mode::digest;
+    auto state = larch::build_chart_spr_search_state(
+        dag, std::move(refinement.grammar), options);
+    CHECK(state.cache_strategy ==
+          larch::chart_spr_cache_strategy::lazy_multisite_chart);
+    CHECK(state.grammar.taxa.id_to_sample_id.size() == expected_taxa);
+    CHECK(state.grammar.clades.size() == expected_clades);
+    CHECK(state.active_patterns.patterns.patterns.size() == expected_patterns);
+
+    auto const task_slots =
+        std::max<std::size_t>(1, std::min(worker_count, candidate_batch_size));
+    auto const envelope = larch::chart_spr_search_detail::
+        estimate_grammar_spr_finite_iteration_memory_envelope(
+            state, candidate_count, candidate_batch_size, 1, true, task_slots);
+    CHECK(envelope.planned_required_bytes > 0);
+    CHECK(envelope.planned_required_bytes < budget);
+    options.cache.memory_budget_bytes = envelope.planned_required_bytes;
+
+    larch::chart_scheduler scheduler{
+        larch::chart_scheduler_options{.requested_workers = worker_count}};
+    larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+        workspace;
+    auto result = larch::run_chart_spr_acceptance_iteration(
+        state, options, 0, workspace, scheduler);
+    CHECK(result.candidates_generated == candidate_count);
+    CHECK(result.candidates_scored == candidate_count);
+    CHECK(result.canonical_candidates.size() == candidate_count);
+    CHECK(state.counters.lazy_local_iteration_envelope_bytes_max ==
+          envelope.planned_required_bytes);
+    CHECK(state.counters.lazy_local_admission_waves > 0);
+    CHECK(state.counters.lazy_local_pre_submit_budget_failures == 0);
+    CHECK(state.counters.lazy_local_peak_projected_resident_bytes <=
+          envelope.planned_required_bytes);
+    CHECK(state.counters.lazy_local_preparation_peak_bytes <=
+          envelope.planned_required_bytes);
+    CHECK(workspace.local_score.operation_boundary_clean());
+    scheduler.shutdown();
+    std::println("  {} finite envelope bytes: {}", name,
+                 envelope.planned_required_bytes);
+  };
+
+  run_fixture("small", larch::load_proto_dag("data/test_5_trees/tree_0.pb.gz"),
+              70, 139, 113, 64, 32, 8);
+  run_fixture("high",
+              larch::load_proto_dag("test/wric_lazy_high_compression.pb.gz"),
+              512, 1023, 2046, 64, 32, 8);
+
+  auto reference_bytes = larch::read_file("data/seedtree/refseq.txt.gz");
+  std::string reference;
+  for (unsigned char byte : reference_bytes) {
+    if (!std::isspace(byte)) {
+      reference.push_back(static_cast<char>(std::toupper(byte)));
+    }
+  }
+  CHECK(!reference.empty());
+  run_fixture(
+      "medium",
+      larch::load_parsimony_tree("data/seedtree/seedtree.pb.gz", reference),
+      597, 1193, 1106, 4, 4, 4);
   std::println("  PASS");
 }
 
@@ -3369,6 +4597,47 @@ static void test_lazy_cache_fixed_topology_conservative_search() {
   CHECK(search.counters.selected_topology_multifurcation_rows > 0);
   CHECK(search.counters.spr_multifurcation_moves_generated > 0);
   CHECK(search.counters.multifurcation_productions_scored > 0);
+  CHECK(search.counters.lazy_local_admission_waves > 0);
+  CHECK(search.summary.lazy_local_admission_waves ==
+        search.counters.lazy_local_admission_waves);
+  CHECK(search.summary.lazy_local_parallel_waves ==
+        search.counters.lazy_local_parallel_waves);
+  CHECK(search.summary.lazy_local_memory_limited_waves ==
+        search.counters.lazy_local_memory_limited_waves);
+  CHECK(search.summary.lazy_local_admitted_concurrency_max ==
+        search.counters.lazy_local_admitted_concurrency_max);
+  CHECK(search.summary.lazy_local_prepared_tasks ==
+        search.counters.lazy_local_prepared_tasks);
+  CHECK(search.summary.lazy_local_reused_prepared_tasks ==
+        search.counters.lazy_local_reused_prepared_tasks);
+  CHECK(search.summary.lazy_local_pre_submit_budget_failures ==
+        search.counters.lazy_local_pre_submit_budget_failures);
+  CHECK(search.summary.lazy_local_peak_admitted_bytes ==
+        search.counters.lazy_local_peak_admitted_bytes);
+  CHECK(search.summary.lazy_local_peak_projected_resident_bytes ==
+        search.counters.lazy_local_peak_projected_resident_bytes);
+  CHECK(search.summary.lazy_local_preparation_peak_bytes ==
+        search.counters.lazy_local_preparation_peak_bytes);
+  CHECK(search.summary.lazy_local_result_output_resident_bytes_max ==
+        search.counters.lazy_local_result_output_resident_bytes_max);
+  CHECK(search.summary.lazy_local_retained_exact_trim_bytes_max ==
+        search.counters.lazy_local_retained_exact_trim_bytes_max);
+  CHECK(search.summary.lazy_local_canonical_exact_evidence_resident_bytes_max ==
+        search.counters
+            .lazy_local_canonical_exact_evidence_resident_bytes_max);
+  CHECK(
+      search.summary
+              .lazy_local_canonical_exact_evidence_construction_peak_bytes_max ==
+      search.counters
+          .lazy_local_canonical_exact_evidence_construction_peak_bytes_max);
+  CHECK(search.summary.lazy_local_runtime_transient_reservation_bytes_max ==
+        search.counters.lazy_local_runtime_transient_reservation_bytes_max);
+  CHECK(search.summary.lazy_local_iteration_envelope_bytes_max ==
+        search.counters.lazy_local_iteration_envelope_bytes_max);
+  CHECK(search.summary.lazy_local_iteration_task_stable_bytes_max ==
+        search.counters.lazy_local_iteration_task_stable_bytes_max);
+  CHECK(search.summary.lazy_local_iteration_task_preparation_peak_bytes_max ==
+        search.counters.lazy_local_iteration_task_preparation_peak_bytes_max);
   CHECK(search.summary.lazy_inside_rows_computed > 0);
   CHECK(search.summary.lazy_merge_ratio > 0.0);
   CHECK(search.summary.selected_topology_class_rows_computed ==
@@ -9960,8 +11229,12 @@ int main() {
   test_state_builder_from_dag_rebuilds_patterns_once();
   test_semantic_capture_reuses_primary_exact_provenance();
   test_primary_provenance_capture_failure_is_hard_error();
+  test_lazy_local_exact_semantic_evidence_envelope();
   test_pattern_batch_cache_options_match_all_cache();
+  test_lazy_local_admission_planner();
   test_lazy_local_packed_context_grouping_reuses_scratch();
+  test_lazy_local_production_multibatch_retained_budget();
+  test_lazy_local_named_fixture_finite_production_gates();
   test_local_score_into_workspace_contract();
   test_pattern_batch_into_parallel_scratch_plateau();
   test_candidate_execution_plan_lifetime_and_mismatch_guards();
