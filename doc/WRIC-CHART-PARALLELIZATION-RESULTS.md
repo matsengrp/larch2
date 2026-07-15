@@ -1424,6 +1424,58 @@ remain deferred under the authorized deadline-overlap rule. No same-revision
 diagnostic, unit fixture, or postprocessor regression is substituted for those
 performance gates.
 
+## Phase 7 packed-grouping checkpoint (unsealed; implementation in progress)
+
+The first Phase-7 product checkpoint is `c08602b` (`Use packed keys for lazy
+selected topology grouping`). The immutable measurement checkpoint remains
+`7ca527b8906d018124756182274335cbff936d72` (`Baseline measure`), and no frozen
+Phase-0 executable, workload, runner, oracle, candidate budget, or exactness
+contract changed.
+
+The checkpoint replaces every production
+`std::map<std::vector<std::size_t>, ...>` lazy grouping site with checked,
+pattern-major packed keys and deterministic grouping. This covers plan and
+grammar inside construction, grammar and plan outside contexts, lazy
+candidate-local overlay scoring, and the fixed-topology selected-tree scorer.
+The primitive preserves first-occurrence class IDs and representatives,
+input-order CSR members, and an explicit lexicographic class traversal where
+the removed ordered map made traversal observable. Checked narrowing,
+overflow, reusable-capacity accounting, empty input, collision, multifurcation,
+partial-failure, and independent ordered-map oracle cases are exercised
+directly. Test-only ordered maps remain as semantic oracles; production code
+has no remaining vector-key map grouping.
+
+The associated commits are `cb35587` (primitive), `b6193cd` (prepared
+admission/status hardening), `18d51da` (candidate-local overlay grouping),
+`533d045` (plan inside grouping), `eb1c27e` (grammar inside grouping),
+`f1ff0bb` (outside grouping), and `c08602b` (fixed-topology grouping). Commit
+`50e6e50` adds the two deterministic Phase-7 fixtures and their frozen-oracle
+regenerator. `tools/regen_wric_lazy_fixtures.py --dagutil
+build/wric-chart-parallelization/baseline-408434e/bin/dagutil --check` passed;
+the high-compression PB/ref SHA-256 values are
+`e103be6cd1df36e5a002ae9dd9ffb53110b35c840eed1d8fa867475ad3109874` and
+`86f9d532555a1cf709ea3a9a3efe7c72aa9cd6c6a01bd7aa2614636a846a9128`;
+the dense-favoring values are
+`e8dcd803ba2cd82ed594dbe66433934a62b3711ea7ddb0d349de35ef86030dd6` and
+`b16c732ac5692f8644afc19f0c454422c381e9d88eff5dacb40ac96a603f8404`.
+These hashes remain pinned by the committed regenerator and will be copied
+into the immutable supplemental manifest only during the later quiet-host
+Phase-0 seal.
+
+At `c08602b`, the GCC-trunk RelWithDebInfo command
+`ctest --test-dir build --output-on-failure -R
+'^(chart_parallel_test|chart_spr_search_test|multifurcation_chart_oracle_test|lazy_key_grouping_test)$'`
+passed 4/4 tests in 7.80 seconds. The combined suite covers the direct packed
+contracts, dense/lazy and materialized per-pattern oracles, multifurcations,
+local SPR scoring, and fixed-topology selected-row behavior. `git diff --check`
+and changed-line `git clang-format --diff` are clean.
+
+This is not a Phase-7 exit decision. Dependency-level lazy inside/outside
+wavefronts, bounded transient scratch admission, allocation-free admitted
+candidate kernels, within-clade staging where required by scaling, explicit
+`off|on|auto` policy/reporting, complete dense/lazy canonical equivalence,
+ASAN/TSAN/full-CTest, and every sealed performance/RSS gate remain pending.
+
 ## Later-phase evidence template
 
 Before the Phase-0 seal, every later-phase measurement is labelled
