@@ -168,6 +168,8 @@ if [[ $output =~ _trial([0-9]+)_ ]]; then fake_trial=${BASH_REMATCH[1]}; fi
 peak_exact=0
 (( exact == 0 )) || peak_exact=1
 reported_exact=$exact
+reported_initial=${FAKE_REPORTED_INITIAL:-7}
+reported_final=${FAKE_REPORTED_FINAL:-7}
 initial_chart_line='  initial_chart_construction_ms: 0.5'
 case ${FAKE_OBSERVABILITY_MODE:-ok} in
   ok) ;;
@@ -341,8 +343,8 @@ chart_spr_search:
   requested_max_iterations: $iterations
   iterations: 1
   accepted_moves: 0
-  initial_score: 7
-  final_score: 7
+  initial_score: $reported_initial
+  final_score: $reported_final
   candidates_generated: $candidates
   candidates_scored: $candidates
   exact_verifications: $reported_exact
@@ -424,6 +426,9 @@ $initial_chart_line
   candidate_generation:
     candidates_scored: 999
     stop_reason: candidate_cap
+  iteration_results:
+    - iteration: 0
+      state_score_after: $reported_final
 REPORT
 if [[ ${FAKE_OBSERVABILITY_MODE:-ok} == duplicate_top ]]; then
   printf '%s\n' '  materialization_ms: 0.0'
@@ -1752,6 +1757,48 @@ expect_fail "$harness" --dagutil "$tmp/dagutil" --larch2 "$tmp/larch2" \
 [[ $(awk -F '\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}$h["row_id"]=="chart-row"{print $h["candidates_scored"]}' "$tmp/success/raw_trials.tsv" | sort -u) == 2 ]]
 grep -q -- '--wric-lazy-chart on' "$tmp/success/commands.sh"
 ! grep -q -- '--chart-bnb-max-frontier 0' "$tmp/success/commands.sh"
+
+# The method objective and externally validated DAG parsimony are intentionally
+# separate score domains.  A manifest may freeze distinct values, and the
+# curve/raw row must retain both without cross-wiring either check.
+distinct_score_manifest="$tmp/distinct-score-domains.tsv"
+mutate_field "$success_manifest" "$distinct_score_manifest" chart-row \
+  expected_final_score 6
+env FAKE_REPORTED_FINAL=6 "$harness" --dagutil "$tmp/dagutil" \
+  --larch2 "$tmp/larch2" --process-metrics "$runner" \
+  --out-dir "$tmp/distinct-score-domains" \
+  --workload-manifest "$distinct_score_manifest" \
+  --run-manifest-group success-test >/dev/null
+awk -F '\t' '
+  NR==1 {for(i=1;i<=NF;i++)h[$i]=i; next}
+  $h["row_id"]=="chart-row" {
+    if ($h["initial_validated_parsimony_min"]!=7 ||
+        $h["final_validated_parsimony_min"]!=7 ||
+        $h["best_reported_objective"]!=6 ||
+        $h["best_validated_parsimony_min"]!=7) exit 1
+    found++
+  }
+  END {exit found==1 ? 0 : 1}
+' "$tmp/distinct-score-domains/raw_trials.tsv"
+awk -F '\t' '
+  NR==1 {next}
+  $1==1 && $3==6 && $4==7 {found++}
+  END {exit found==1 ? 0 : 1}
+' "$tmp/distinct-score-domains/curves/paired_chart_spr_grammar_lower_bound_heuristic_trial1_chart-row_wdefault.tsv"
+
+# Swapping either frozen endpoint into the other domain must fail.
+expect_fail env FAKE_REPORTED_FINAL=6 "$harness" --dagutil "$tmp/dagutil" \
+  --larch2 "$tmp/larch2" --process-metrics "$runner" \
+  --out-dir "$tmp/crosswired-reported-score" \
+  --workload-manifest "$success_manifest" --run-manifest-group success-test
+crosswired_validated_manifest="$tmp/crosswired-validated-score.tsv"
+mutate_field "$distinct_score_manifest" "$crosswired_validated_manifest" chart-row \
+  expected_validated_parsimony 6
+expect_fail env FAKE_REPORTED_FINAL=6 "$harness" --dagutil "$tmp/dagutil" \
+  --larch2 "$tmp/larch2" --process-metrics "$runner" \
+  --out-dir "$tmp/crosswired-validated-score" \
+  --workload-manifest "$crosswired_validated_manifest" \
+  --run-manifest-group success-test
 
 # Worker invocation policy is a sealed conditional contract.  Omitted/default
 # uses the transition sentinel, while unified/legacy explicit and auto rows

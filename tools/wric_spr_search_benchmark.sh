@@ -1669,8 +1669,17 @@ write_baseline_curve() {
 }
 write_chart_curve() {
   local report=$1 initial=$2 curve=$3 wall=$4 final=$5
+  local reported_initial=NA
+  if [[ -f "$report" && ! -L "$report" ]]; then
+    reported_initial=$(awk '
+      index($0, "  initial_score: ") == 1 {
+        count++; value=substr($0, length("  initial_score: ") + 1)
+      }
+      END { if (count == 1) print value; else print "NA" }
+    ' "$report")
+  fi
   printf 'iteration\telapsed_s\treported_objective\texternal_validated_parsimony_min\n0\t0.000000\t%s\t%s\n' \
-    "$initial" "$initial" >"$curve"
+    "$reported_initial" "$initial" >"$curve"
   awk -v wall="$wall" -v final="$final" '
     /^[[:space:]]*- iteration:/{iter=$3+1}
     /^[[:space:]]*state_score_after:/&&iter!=""{it[++n]=iter;s[n]=$2;if(iter>max)max=iter}
@@ -2505,8 +2514,10 @@ for ((raw_i=0; raw_i<${#raw_header[@]}; ++raw_i)); do raw_index[${raw_header[$ra
           expected_search=$(manifest_row_value "$row_id" oracle_search_semantic_sha256)
           expected_output=$(manifest_row_value "$row_id" oracle_output_semantic_sha256)
           expected_trial=$(manifest_row_value "$row_id" oracle_trial_semantic_sha256)
+          reported=${field[${raw_index[best_reported_objective]}]}
+          [[ "$method" != sample_explore_merge ]] || reported=$final
           [[ "$expected_initial" == - || "$initial" == "$expected_initial" ]] || final_status=workload_mismatch
-          [[ "$expected_final" == - || "$final" == "$expected_final" ]] || final_status=workload_mismatch
+          [[ "$expected_final" == - || "$reported" == "$expected_final" ]] || final_status=workload_mismatch
           [[ "$expected_validated" == - || "$final" == "$expected_validated" ]] || final_status=workload_mismatch
           [[ "$expected_search" == - || "$search_sha" == "$expected_search" ]] || final_status=workload_mismatch
           [[ "$expected_output" == - || "$output_sha" == "$expected_output" ]] || final_status=workload_mismatch
