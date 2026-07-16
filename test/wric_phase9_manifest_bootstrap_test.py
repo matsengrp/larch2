@@ -1093,6 +1093,16 @@ def main() -> None:
             == bootstrap.canonical_argv_digest(row["canonical_argv"])
             for row in produced_contract["rows"]
         )
+        assert all(
+            row["canonical_argv"][-4:]
+            == [
+                "--chart-spr-canonical-result",
+                "@search-canonical-result",
+                "-o",
+                "@output",
+            ]
+            for row in produced_contract["rows"]
+        )
 
         producer_calls = case.counter.read_bytes()
         input_calls = case.input_counter.read_bytes()
@@ -1443,6 +1453,12 @@ def main() -> None:
         assert audited.input_evidence.parsimony_min == 200
         for row in audited.supplement.rows:
             seed = int(row["seed"])
+            assert bootstrap.canonical_argv(row)[-4:] == [
+                "--chart-spr-canonical-result",
+                "@search-canonical-result",
+                "-o",
+                "@output",
+            ]
             assert row["expected_initial_score"] == "200"
             assert row["expected_final_score"] == str(70 + seed)
             assert row["expected_validated_parsimony"] == str(120 + seed)

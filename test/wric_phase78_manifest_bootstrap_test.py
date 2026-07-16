@@ -804,6 +804,16 @@ def main() -> None:
                 output, case.base_repo_root, expected_kind="supplement"
             )
             assert len(manifest.rows) == (4 if profile == "phase8" else 24)
+            assert all(
+                bootstrap.canonical_argv(row)[-4:]
+                == [
+                    "--chart-spr-canonical-result",
+                    "@search-canonical-result",
+                    "-o",
+                    "@output",
+                ]
+                for row in manifest.rows
+            )
             profile_assets = output.with_name(output.stem + ".assets")
             expected_capture_identity = {
                 "capture_contract_sha256": bootstrap.core.sha256_file(

@@ -518,13 +518,15 @@ def actual_chart_command(
     oracle: Path, fixture: Path, row: Mapping[str, str], directory: Path
 ) -> list[str]:
     argv = canonical_argv(row)
-    argv[0] = os.fspath(oracle)
-    argv[2] = os.fspath(fixture)
-    argv[-1] = os.fspath(directory / "output.pb.gz")
-    output_flag = len(argv) - 2
-    argv[output_flag:output_flag] = [
-        "--chart-spr-canonical-result",
-        os.fspath(directory / "canonical.json"),
+    replacements = {
+        "@binary:working_chart": os.fspath(oracle),
+        f"@primary:{row['primary_sha256']}": os.fspath(fixture),
+        "@search-canonical-result": os.fspath(directory / "canonical.json"),
+        "@output": os.fspath(directory / "output.pb.gz"),
+    }
+    argv = [replacements.get(token, token) for token in argv]
+    compact_index = argv.index("--chart-spr-canonical-result")
+    argv[compact_index:compact_index] = [
         "--chart-spr-canonical-sidecar",
         os.fspath(directory / "canonical.ndjson"),
     ]
@@ -1866,13 +1868,19 @@ def render_commands(
                     "manifest://fixture.pb.gz",
                 )
                 argv = canonical_argv(row)
-                argv[0] = '"$oracle"'
-                argv[2] = f'"$assets/fixtures/{fixture.key}.pb.gz"'
-                argv[-1] = f'"$out/{name}.pb.gz"'
-                output_flag = len(argv) - 2
-                argv[output_flag:output_flag] = [
-                    "--chart-spr-canonical-result",
-                    f'"$out/{name}.canonical.json"',
+                replacements = {
+                    "@binary:working_chart": '"$oracle"',
+                    f"@primary:{row['primary_sha256']}": (
+                        f'"$assets/fixtures/{fixture.key}.pb.gz"'
+                    ),
+                    "@search-canonical-result": (
+                        f'"$out/{name}.canonical.json"'
+                    ),
+                    "@output": f'"$out/{name}.pb.gz"',
+                }
+                argv = [replacements.get(token, token) for token in argv]
+                compact_index = argv.index("--chart-spr-canonical-result")
+                argv[compact_index:compact_index] = [
                     "--chart-spr-canonical-sidecar",
                     f'"$out/{name}.canonical.ndjson"',
                 ]

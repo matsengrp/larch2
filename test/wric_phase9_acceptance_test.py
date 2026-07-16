@@ -8,6 +8,7 @@ import csv
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -495,12 +496,21 @@ class Dataset:
             dag_path.parent.mkdir(parents=True, exist_ok=True)
             dag_path.write_text(json.dumps(self.output[(seed, worker, trial)]) + "\n", encoding="utf-8")
         for (seed, worker), value in self.search.items():
-            row = self.matching(seed, worker)[0]
-            report = self.root / row["report_path"]
-            compact, full, sidecar, _ = acceptance.canonical_paths(self.raw, row, report)
-            for path in (compact, full):
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+            rows = self.matching(seed, worker)
+            for row in rows:
+                report = self.root / row["report_path"]
+                compact, _, _, _ = acceptance.canonical_paths(
+                    self.raw, row, report
+                )
+                compact.parent.mkdir(parents=True, exist_ok=True)
+                compact.write_text(json.dumps(value) + "\n", encoding="utf-8")
+            first = rows[0]
+            report = self.root / first["report_path"]
+            _, full, sidecar, _ = acceptance.canonical_paths(
+                self.raw, first, report
+            )
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(json.dumps(value) + "\n", encoding="utf-8")
             sidecar.write_bytes(self.sidecars[(seed, worker)])
         for seed, (top, iterations) in self.frozen.items():
             self.write_report(self.frozen_path(seed), top, iterations)
@@ -567,6 +577,16 @@ class Phase9AcceptanceTest(unittest.TestCase):
     def assert_failure(self, expected: str) -> dict[str, object]:
         completed, result = self.run_tool()
         self.assertEqual(completed.returncode, 1, completed.stderr + completed.stdout)
+        self.assertIsInstance(result, dict)
+        self.assertIn(expected, str(result.get("failure", "")))
+        return result
+
+    def assert_written_failure(self, expected: str) -> dict[str, object]:
+        completed = subprocess.run(
+            self.command(), text=True, capture_output=True, check=False
+        )
+        self.assertEqual(completed.returncode, 1, completed.stderr + completed.stdout)
+        result = json.loads(completed.stdout)
         self.assertIsInstance(result, dict)
         self.assertIn(expected, str(result.get("failure", "")))
         return result
@@ -868,6 +888,206 @@ class Phase9AcceptanceTest(unittest.TestCase):
             row["canonical_digest"] = row["trial_semantic_sha256"]
         self.assert_failure("duplicate JSON key")
 
+    def test_each_timed_compact_result_is_present_and_untampered(self) -> None:
+        self.data.write()
+        row = self.data.matching(1, 1, 1)[0]
+        report = self.root / row["report_path"]
+        compact, _, _, _ = acceptance.canonical_paths(self.data.raw, row, report)
+        compact.unlink()
+        self.assert_written_failure("compact canonical result is missing")
+
+        self.data = Dataset(self.root)
+        self.data.write()
+        row = self.data.matching(1, 1, 1)[0]
+        report = self.root / row["report_path"]
+        compact, _, _, _ = acceptance.canonical_paths(self.data.raw, row, report)
+        value = json.loads(compact.read_text(encoding="utf-8"))
+        value["semantic_sha256"] = digest("tampered timed compact")
+        compact.write_text(json.dumps(value) + "\n", encoding="utf-8")
+        self.assert_written_failure("compact and full search-digest components differ")
+
+        self.data = Dataset(self.root)
+        self.data.write()
+        row = self.data.matching(1, 1, 1)[0]
+        report = self.root / row["report_path"]
+        compact, _, _, _ = acceptance.canonical_paths(self.data.raw, row, report)
+        value = json.loads(compact.read_text(encoding="utf-8"))
+        value["schema_version"] = 2
+        compact.write_text(json.dumps(value) + "\n", encoding="utf-8")
+        self.assert_written_failure("schema_version=2, expected 1")
+
+    def test_timed_compact_results_reject_hard_links_and_path_reuse(self) -> None:
+        self.data.write()
+        first_row = self.data.matching(1, 1, 1)[0]
+        second_row = self.data.matching(1, 1, 2)[0]
+        first_report = self.root / first_row["report_path"]
+        second_report = self.root / second_row["report_path"]
+        first, _, _, _ = acceptance.canonical_paths(
+            self.data.raw, first_row, first_report
+        )
+        second, _, _, _ = acceptance.canonical_paths(
+            self.data.raw, second_row, second_report
+        )
+        second.unlink()
+        os.link(first, second)
+        self.assert_written_failure("compact canonical result is not singly linked")
+
+        first.unlink()
+        second.unlink()
+        self.data = Dataset(self.root)
+        first_row = self.data.matching(1, 1, 1)[0]
+        self.data.matching(1, 1, 2)[0]["report_path"] = first_row["report_path"]
+        self.assert_failure("compact canonical result path is reused")
+
+    def test_phase9_command_auditor_requires_exact_timed_compact_paths(self) -> None:
+        import wric_phase9_manifest_bootstrap as bootstrap
+
+        primary = self.sandbox / "command-fixture.pb.gz"
+        primary.write_bytes(b"synthetic fixture\n")
+        dagutil_path = self.sandbox / "dagutil"
+        dagutil_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        dagutil_path.chmod(0o755)
+        dagutil = os.fspath(dagutil_path.resolve())
+        rows = tuple(
+            bootstrap.phase9_contract_row(
+                seed,
+                worker,
+                digest("command fixture"),
+                "manifest://fixture.pb.gz",
+                "0",
+            )
+            for seed in acceptance.SEEDS
+            for worker in acceptance.MEASURED_WORKERS
+        )
+        audited = argparse.Namespace(
+            supplement=argparse.Namespace(
+                path=self.sandbox / "phase9-local-commit.tsv",
+                rows=rows,
+            )
+        )
+        entries: list[tuple[str, tuple[str, ...]]] = []
+        first_timed_compact: Path | None = None
+        for row in rows:
+            worker = int(row["requested_workers"])
+            fixture = row["workload_name"]
+            row_id = row["row_id"]
+            safe = acceptance.sanitize_harness_name(fixture)
+            row_safe = acceptance.sanitize_harness_name(row_id)
+            prefix = (
+                dagutil,
+                "--dag-pb",
+                os.fspath(primary),
+                *acceptance.option_tokens(row),
+            )
+            timed_prefix = (*prefix, "--chart-spr-workers", str(worker))
+            for suffix in ("warmup1", "trial1", "trial2", "trial3"):
+                execution_suffix = f"{suffix}_{row_safe}"
+                compact = (
+                    self.root
+                    / "logs"
+                    / f"{safe}_{acceptance.METHOD}_{execution_suffix}_w{worker}.canonical.json"
+                )
+                if first_timed_compact is None:
+                    first_timed_compact = compact
+                output = (
+                    self.root
+                    / "outputs"
+                    / f"{safe}_{acceptance.METHOD}_{execution_suffix}_w{worker}.pb.gz"
+                )
+                entries.append(
+                    (
+                        f"{fixture} {acceptance.METHOD} workers={worker} {execution_suffix}",
+                        (
+                            *timed_prefix,
+                            "--chart-spr-canonical-result",
+                            os.fspath(compact),
+                            "-o",
+                            os.fspath(output),
+                        ),
+                    )
+                )
+            companion_stem = f"{safe}_{row_safe}_canonical_companion"
+            entries.append(
+                (
+                    f"{fixture} {acceptance.METHOD} deferred semantic companion workers={worker}",
+                    (
+                        *timed_prefix,
+                        "--chart-spr-canonical-result",
+                        os.fspath(self.root / "logs" / f"{companion_stem}.json"),
+                        "-o",
+                        os.fspath(self.root / "outputs" / f"{companion_stem}.pb.gz"),
+                    ),
+                )
+            )
+            full_stem = f"{safe}_{row_safe}_full_canonical"
+            entries.append(
+                (
+                    f"{fixture} {acceptance.METHOD} deferred explicit-W1 full correctness",
+                    (
+                        *prefix,
+                        "--chart-spr-workers",
+                        "1",
+                        "--chart-spr-canonical-result",
+                        os.fspath(self.root / "logs" / f"{full_stem}.json"),
+                        "--chart-spr-canonical-sidecar",
+                        os.fspath(self.root / "logs" / f"{full_stem}.ndjson"),
+                        "-o",
+                        os.fspath(self.root / "outputs" / f"{full_stem}.pb.gz"),
+                    ),
+                )
+            )
+        commands = self.sandbox / "phase9-commands.sh"
+
+        def write_commands(values: list[tuple[str, tuple[str, ...]]]) -> None:
+            lines: list[str] = []
+            for label, tokens in values:
+                lines.extend((f"# {label}", shlex.join(tokens)))
+            commands.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        write_commands(entries)
+        with (
+            mock.patch.object(
+                acceptance,
+                "production_paths",
+                return_value=(dagutil_path, dagutil_path, dagutil_path),
+            ),
+            mock.patch.object(
+                bootstrap, "resolve_manifest_uri", return_value=primary
+            ),
+        ):
+            contract_sha = acceptance.validate_phase9_commands(
+                self.root,
+                commands,
+                audited,
+                self.sandbox,
+                self.sandbox,
+            )
+            self.assertRegex(contract_sha, r"^[0-9a-f]{64}$")
+            assert first_timed_compact is not None
+            bad_entries = list(entries)
+            label, tokens = bad_entries[0]
+            bad_entries[0] = (
+                label,
+                tuple(
+                    os.fspath(self.sandbox / "wrong.json")
+                    if token == os.fspath(first_timed_compact)
+                    else token
+                    for token in tokens
+                ),
+            )
+            write_commands(bad_entries)
+            with self.assertRaisesRegex(
+                acceptance.AcceptanceError,
+                "lacks exactly one production command",
+            ):
+                acceptance.validate_phase9_commands(
+                    self.root,
+                    commands,
+                    audited,
+                    self.sandbox,
+                    self.sandbox,
+                )
+
     def test_nonfinite_json_and_ndjson_constants_are_rejected(self) -> None:
         self.data.search[(1, 1)]["record_count"] = float("nan")
         self.assert_failure("non-finite JSON constant 'NaN'")
@@ -1051,6 +1271,8 @@ class Phase9AcceptanceTest(unittest.TestCase):
             *acceptance.option_tokens(row),
             "--chart-spr-workers",
             "8",
+            "--chart-spr-canonical-result",
+            "@search-canonical-result",
             "-o",
             "@output",
         ]

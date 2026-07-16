@@ -217,15 +217,14 @@ def actual_chart_command(
     replacements = {
         "@binary:working_chart": os.fspath(binary),
         f"@primary:{row['primary_sha256']}": os.fspath(primary),
+        "@search-canonical-result": os.fspath(directory / "canonical.json"),
         "@output": os.fspath(directory / "output.pb.gz"),
     }
     if refseq is not None:
         replacements[f"@refseq:{row['refseq_sha256']}"] = os.fspath(refseq)
     argv = [replacements.get(token, token) for token in argv]
-    output_flag = argv.index("-o")
-    argv[output_flag:output_flag] = [
-        "--chart-spr-canonical-result",
-        os.fspath(directory / "canonical.json"),
+    compact_index = argv.index("--chart-spr-canonical-result")
+    argv[compact_index:compact_index] = [
         "--chart-spr-canonical-sidecar",
         os.fspath(directory / "canonical.ndjson"),
     ]
@@ -1390,16 +1389,15 @@ def render_commands(
                 else '"$assets/fixtures/tree0.pb.gz"'
             ),
             "@output": f'"$out/{row_id}.pb.gz"',
+            "@search-canonical-result": f'"$out/{row_id}.canonical.json"',
         }
         if row["input_kind"] == "tree_pb_refseq":
             replacements[f"@refseq:{row['refseq_sha256']}"] = (
                 '"$assets/fixtures/medium.refseq"'
             )
         argv = [replacements.get(token, token) for token in argv]
-        output_flag = argv.index("-o")
-        argv[output_flag:output_flag] = [
-            "--chart-spr-canonical-result",
-            f'"$out/{row_id}.canonical.json"',
+        compact_index = argv.index("--chart-spr-canonical-result")
+        argv[compact_index:compact_index] = [
             "--chart-spr-canonical-sidecar",
             f'"$out/{row_id}.canonical.ndjson"',
         ]

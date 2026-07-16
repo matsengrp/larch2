@@ -124,8 +124,8 @@ REAL20D_STDOUT_SIZE = 37
 REAL20D_STDERR_SIZE = 159
 REAL20D_REFUSAL_INTRO_REVISION = "c171278faab65839415bf4b447ab8a5684c6e36d"
 REAL20D_CANONICAL_ARGV_SHA256 = {
-    "1": "ac03537d4db4cc20a843154aae5ed578927d5d1852809c9a8d84fdc4b27dda2f",
-    "8": "27f498987087c3ef91f39db04ae56107bca4adb0abd0c32aeb5abfa3d9c3faf3",
+    "1": "518726d8e4df68ffa926b998e7f4b6853eccc0769ae0d88427137e1a535c3dc2",
+    "8": "82e697d208998f4a619e7135d004f245806f725c18644e2828fd885dd31decb6",
 }
 
 
@@ -2363,9 +2363,9 @@ def expected_native_argv_sha256(capture: CaptureSpec) -> str:
     )
 
 
-def expected_chart_argv_sha256(
+def expected_chart_argv(
     capture: CaptureSpec, key: tuple[str, str]
-) -> str:
+) -> list[str]:
     primary_sha, raw_refseq_sha = RAW_FIXTURE_HASHES[capture.fixture]
     if raw_refseq_sha == "NA":
         argv = ["@binary:working_chart", "--dag-pb", f"@primary:{primary_sha}"]
@@ -2416,10 +2416,18 @@ def expected_chart_argv_sha256(
         str(capture.memory_budget_bytes),
         "--seed",
         "1",
+        "--chart-spr-canonical-result",
+        "@search-canonical-result",
         "-o",
         "@output",
     ]
-    return canonical_argv_digest(argv)
+    return argv
+
+
+def expected_chart_argv_sha256(
+    capture: CaptureSpec, key: tuple[str, str]
+) -> str:
+    return canonical_argv_digest(expected_chart_argv(capture, key))
 
 
 def validate_raw_trial_binding(
@@ -7239,6 +7247,9 @@ def real_chart_argv(
         "@binary:working_chart": str(metadata["frozen_oracle"]),
         f"@primary:{primary_sha}": str(primary),
         f"@refseq:{refseq_sha}": str(refseq),
+        "@search-canonical-result": str(
+            capture_dir / f"worker-{spec.requested_workers}.canonical.json"
+        ),
         "@output": str(output),
     }
     actual = [replacements.get(token, token) for token in canonical]
@@ -8222,7 +8233,12 @@ def manifest_chart_argv(capture: CaptureSpec, spec: RowSpec, primary_sha: str, r
     argv += ["--seed", contract["seed"]]
     if contract["worker_option"] == "chart_spr_workers":
         argv += ["--chart-spr-workers", contract["requested_workers"]]
-    argv += ["-o", "@output"]
+    argv += [
+        "--chart-spr-canonical-result",
+        "@search-canonical-result",
+        "-o",
+        "@output",
+    ]
     return argv
 
 
@@ -9837,6 +9853,26 @@ def self_test(_: argparse.Namespace) -> None:
         "real20d": (REAL20D_PRIMARY_SHA256, REAL20D_REFSEQ_SHA256),
     }
     assert_unique_resolution(rows, by_id, fixture_hashes)
+    compact_output_suffix = [
+        "--chart-spr-canonical-result",
+        "@search-canonical-result",
+        "-o",
+        "@output",
+    ]
+    for row in rows:
+        if row.method == "sample_explore_merge":
+            continue
+        capture = by_id[row.capture_id]
+        assert expected_chart_argv(
+            capture, (row.method, row.requested_workers)
+        )[-4:] == compact_output_suffix
+        primary_sha, raw_refseq_sha = RAW_FIXTURE_HASHES[capture.fixture]
+        assert manifest_chart_argv(
+            capture,
+            row,
+            primary_sha,
+            "-" if raw_refseq_sha == "NA" else raw_refseq_sha,
+        )[-4:] == compact_output_suffix
 
     primary = by_id["medium-primary32k4-physical"]
     assert primary.iterations == 1 and primary.chart_max_candidates == 32

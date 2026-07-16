@@ -252,6 +252,7 @@ class ValidatedIterationContract:
 class Trial:
     row: dict[str, str]
     report: ParsedReport
+    compact_path: Path
     search_digest: dict[str, object]
     output_digest: dict[str, object]
     full_sidecar_sha256: str
@@ -578,7 +579,6 @@ def canonical_paths(raw_path: Path, row: dict[str, str], report_path: Path) -> t
     root = raw_path.parent
     fixture = sanitize_harness_name(row["fixture"])
     row_id = sanitize_harness_name(row["row_id"])
-    compact = root / "logs" / f"{fixture}_{row_id}_canonical_companion.json"
     full = root / "logs" / f"{fixture}_{row_id}_full_canonical.json"
     sidecar = root / "logs" / f"{fixture}_{row_id}_full_canonical.ndjson"
 
@@ -587,9 +587,15 @@ def canonical_paths(raw_path: Path, row: dict[str, str], report_path: Path) -> t
         raise AcceptanceError(
             f"{row['row_id']} trial {row['trial_index']}: cannot derive deferred output digest from report_path"
         )
+    compact = report_path.with_name(report_path.name[:-4] + ".canonical.json")
     score_name = report_path.name.replace(needle, f"{needle}score_", 1)
     score_digest = report_path.with_name(score_name[:-4] + ".canonical-dag.json")
-    return compact.resolve(), full.resolve(), sidecar.resolve(), score_digest.resolve()
+    return (
+        compact.absolute(),
+        full.absolute(),
+        sidecar.absolute(),
+        score_digest.absolute(),
+    )
 
 
 def sha256_file(path: Path, label: str) -> str:
@@ -1517,6 +1523,10 @@ def validate_trial(raw_path: Path, row: dict[str, str], seed: int, worker: int) 
     compact_path, full_path, sidecar_path, dag_path = canonical_paths(raw_path, row, report_path)
     run_root = raw_path.parent.absolute()
     compact_path = require_run_artifact(compact_path, run_root, f"{label} compact canonical result")
+    if compact_path.stat().st_nlink != 1:
+        raise AcceptanceError(
+            f"{label}: compact canonical result is not singly linked"
+        )
     full_path = require_run_artifact(full_path, run_root, f"{label} full canonical result")
     sidecar_path = require_run_artifact(sidecar_path, run_root, f"{label} full canonical sidecar")
     dag_path = require_run_artifact(dag_path, run_root, f"{label} canonical DAG result")
@@ -1529,7 +1539,7 @@ def validate_trial(raw_path: Path, row: dict[str, str], seed: int, worker: int) 
     if sidecar_sha != compact["semantic_sha256"]:
         raise AcceptanceError(f"{label}: full sidecar SHA-256 does not equal compact semantic digest")
     if compact["semantic_sha256"] != row["search_semantic_sha256"]:
-        raise AcceptanceError(f"{label}: raw/search-companion semantic digests differ")
+        raise AcceptanceError(f"{label}: raw/timed-compact semantic digests differ")
     if compact["candidate_count"] != EXPECTED_CANDIDATES or compact["exact_candidate_count"] != EXPECTED_EXACT or compact["iteration_count"] != ITERATIONS:
         raise AcceptanceError(f"{label}: canonical search record counts do not match the frozen 32/4/3 contract")
     if compact["record_count"] != canonical["record_count"]:
@@ -1562,6 +1572,7 @@ def validate_trial(raw_path: Path, row: dict[str, str], seed: int, worker: int) 
     return Trial(
         row=row,
         report=report,
+        compact_path=compact_path,
         search_digest=compact,
         output_digest=output,
         full_sidecar_sha256=sidecar_sha,
@@ -1606,6 +1617,18 @@ def select_matrix(raw_path: Path, rows: Sequence[dict[str, str]]) -> list[Trial]
     if unexpected:
         raise AcceptanceError(f"unexpected rows in sealed Phase-9 current run: {', '.join(unexpected)}")
 
+    compact_paths = [trial.compact_path for trial in trials]
+    if len(set(compact_paths)) != len(compact_paths):
+        raise AcceptanceError(
+            "a compact canonical result path is reused across Phase-9 measured trials"
+        )
+    compact_identities = {
+        (path.stat().st_dev, path.stat().st_ino) for path in compact_paths
+    }
+    if len(compact_identities) != len(compact_paths):
+        raise AcceptanceError(
+            "compact canonical results are aliased across Phase-9 measured trials"
+        )
     report_paths = [trial.report.path for trial in trials]
     if len(set(report_paths)) != len(report_paths):
         raise AcceptanceError("a report_path is reused across Phase-9 measured trials")
@@ -2285,8 +2308,20 @@ def validate_phase9_commands(
         for suffix in ("warmup1", "trial1", "trial2", "trial3"):
             execution_suffix = f"{suffix}_{row_safe}"
             output = root / "outputs" / f"{safe}_{METHOD}_{execution_suffix}_w{worker}.pb.gz"
+            compact = root / "logs" / f"{safe}_{METHOD}_{execution_suffix}_w{worker}.canonical.json"
             label = f"{fixture} {METHOD} workers={worker} {execution_suffix}"
-            take_exact(label, tuple((*timed_prefix, "-o", os.fspath(output))))
+            take_exact(
+                label,
+                tuple(
+                    (
+                        *timed_prefix,
+                        "--chart-spr-canonical-result",
+                        os.fspath(compact),
+                        "-o",
+                        os.fspath(output),
+                    )
+                ),
+            )
 
         companion_stem = f"{safe}_{row_safe}_canonical_companion"
         companion_json = root / "logs" / f"{companion_stem}.json"

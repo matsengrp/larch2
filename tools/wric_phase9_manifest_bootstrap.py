@@ -1254,7 +1254,12 @@ def canonical_argv(row: Mapping[str, str]) -> list[str]:
         argv += ["--chart-spr-workers", row["requested_workers"]]
     else:
         fail(f"Phase-9 row has unsupported worker option: {row['row_id']}")
-    argv += ["-o", "@output"]
+    argv += [
+        "--chart-spr-canonical-result",
+        "@search-canonical-result",
+        "-o",
+        "@output",
+    ]
     return argv
 
 
@@ -3041,11 +3046,13 @@ def actual_chart_command(
     values = canonical_argv(contract)
     values[0] = os.fspath(oracle)
     values[2] = os.fspath(fixture)
-    values[-1] = os.fspath(row_directory / "output.pb.gz")
-    output_index = len(values) - 2
-    values[output_index:output_index] = [
-        "--chart-spr-canonical-result",
-        os.fspath(row_directory / "canonical.json"),
+    replacements = {
+        "@search-canonical-result": os.fspath(row_directory / "canonical.json"),
+        "@output": os.fspath(row_directory / "output.pb.gz"),
+    }
+    values = [replacements.get(token, token) for token in values]
+    compact_index = values.index("--chart-spr-canonical-result")
+    values[compact_index:compact_index] = [
         "--chart-spr-canonical-sidecar",
         os.fspath(row_directory / "canonical.ndjson"),
     ]
@@ -3618,11 +3625,13 @@ def shell_command_tokens(row: Mapping[str, str]) -> list[str]:
     values = canonical_argv(row)
     values[0] = '"$oracle"'
     values[2] = '"$assets/fixture.pb.gz"'
-    values[-1] = f'"$out/{row["row_id"]}.pb.gz"'
-    insert = len(values) - 2
-    values[insert:insert] = [
-        "--chart-spr-canonical-result",
-        f'"$out/{row["row_id"]}.canonical.json"',
+    replacements = {
+        "@search-canonical-result": f'"$out/{row["row_id"]}.canonical.json"',
+        "@output": f'"$out/{row["row_id"]}.pb.gz"',
+    }
+    values = [replacements.get(token, token) for token in values]
+    compact_index = values.index("--chart-spr-canonical-result")
+    values[compact_index:compact_index] = [
         "--chart-spr-canonical-sidecar",
         f'"$out/{row["row_id"]}.canonical.ndjson"',
     ]

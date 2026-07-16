@@ -424,6 +424,16 @@ def main() -> None:
         }
         assert all(row["lazy_policy"] == "auto" for row in manifest.rows[:4])
         assert all(row["lazy_policy"] == "on" for row in manifest.rows[4:])
+        assert all(
+            bootstrap.canonical_argv(row)[-4:]
+            == [
+                "--chart-spr-canonical-result",
+                "@search-canonical-result",
+                "-o",
+                "@output",
+            ]
+            for row in manifest.rows
+        )
         assets = output.with_name("phase7-lazy-completion.assets")
         run([os.fspath(assets / "commands.sh"), "--verify-only"])
 
