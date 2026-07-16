@@ -504,8 +504,39 @@ void test_finite_admission_exact_boundary() {
               ranked_reserve_limit, false, exact_scheduler, 1,
               &envelope_options, 2, true,
               source == larch::chart_spr_candidate_source::grammar ? 0 : 1,
-              source == larch::chart_spr_candidate_source::grammar ? 0 : 1);
+              source == larch::chart_spr_candidate_source::grammar ? 0 : 1,
+              source == larch::chart_spr_candidate_source::sampled_tree ? 0
+                                                                        : 1);
       CHECK(planned.planned_required_bytes == envelope);
+      auto selected_grammar_plan = planned;
+      if (source == larch::chart_spr_candidate_source::grammar) {
+        selected_grammar_plan = larch::chart_spr_search_detail::
+            estimate_grammar_spr_finite_iteration_memory_envelope(
+                exact_state, exact_options.enumeration.max_candidates, 1,
+                ranked_reserve_limit, false, exact_scheduler, 1,
+                &envelope_options, 2, true, 0, 0, 0);
+        if (selected_grammar_plan.planned_required_bytes > envelope) {
+          std::size_t low = 1;
+          std::size_t high =
+              selected_grammar_plan.planned_grammar_candidate_wave_size;
+          selected_grammar_plan = planned;
+          while (low < high) {
+            auto const midpoint = low + (high - low + 1) / 2;
+            auto candidate = larch::chart_spr_search_detail::
+                estimate_grammar_spr_finite_iteration_memory_envelope(
+                    exact_state, exact_options.enumeration.max_candidates, 1,
+                    ranked_reserve_limit, false, exact_scheduler, 1,
+                    &envelope_options, 2, true, 0, 0, midpoint);
+            if (candidate.planned_required_bytes <= envelope) {
+              low = midpoint;
+              selected_grammar_plan = std::move(candidate);
+            } else {
+              high = midpoint - 1;
+            }
+          }
+        }
+        CHECK(selected_grammar_plan.planned_required_bytes <= envelope);
+      }
       CHECK(planned.planned_cache_strategy == exact_state.cache_strategy);
       CHECK(planned.planned_candidate_batch_size == 1);
       CHECK(planned.candidate_buffer_count == 2);
@@ -515,6 +546,12 @@ void test_finite_admission_exact_boundary() {
         CHECK(planned.planned_sampled_source_count_bound > 0);
         CHECK(planned.planned_sampled_destination_bound_per_source > 0);
         CHECK(planned.planned_sampled_source_admitted_peak_bytes > 0);
+      }
+      if (source != larch::chart_spr_candidate_source::sampled_tree) {
+        CHECK(planned.planned_grammar_candidate_wave_size == 1);
+        CHECK(planned.planned_grammar_candidate_wave_owned_bytes > 0);
+        CHECK(planned.planned_grammar_candidate_admitted_wave_bytes ==
+              planned.planned_grammar_candidate_wave_owned_bytes);
       }
       if (use_lazy) {
         CHECK(planned.planned_local_prepared_slots == 1);
@@ -534,6 +571,9 @@ void test_finite_admission_exact_boundary() {
       if (source == larch::chart_spr_candidate_source::grammar) {
         CHECK(exact.candidate_generation
                   .candidate_pipeline_serial_overlap_batches > 0);
+        CHECK(
+            exact.candidate_generation.grammar_candidate_admitted_wave_width ==
+            selected_grammar_plan.planned_grammar_candidate_wave_size);
         CHECK(exact_projection_allocations.load(std::memory_order_relaxed) ==
               0);
       } else {
@@ -627,6 +667,46 @@ void test_finite_admission_exact_boundary() {
         CHECK(seam_allocations.load(std::memory_order_relaxed) == 1);
         CHECK(seam_sources.load(std::memory_order_relaxed) == 0);
         CHECK(seam_projections.load(std::memory_order_relaxed) == 0);
+        CHECK(seam_scheduler.metrics().operations == 0);
+        seam_scheduler.shutdown();
+      }
+      if (source == larch::chart_spr_candidate_source::grammar) {
+        auto seam_input = make_fixture();
+        auto seam_options = make_options();
+        seam_options.cache.memory_budget_bytes = envelope;
+        seam_options.enumeration
+            .grammar_candidate_wave_actual_capacity_extra_bytes_for_tests =
+            selected_grammar_plan.planned_grammar_candidate_admitted_wave_bytes;
+        std::atomic<std::size_t> seam_allocations{0};
+        std::atomic<std::size_t> seam_constructions{0};
+        seam_options.enumeration
+            .before_grammar_candidate_workspace_allocation_for_tests = [&] {
+          seam_allocations.fetch_add(1, std::memory_order_relaxed);
+        };
+        seam_options.enumeration
+            .before_grammar_candidate_construction_for_tests =
+            [&](std::size_t) {
+              seam_constructions.fetch_add(1, std::memory_order_relaxed);
+            };
+        auto seam_state = make_state(seam_input, seam_options);
+        larch::chart_scheduler seam_scheduler{
+            larch::chart_scheduler_options{.requested_workers = 4}};
+        larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+            seam_workspace;
+        bool seam_rejected = false;
+        try {
+          (void)larch::run_chart_spr_acceptance_iteration(
+              seam_state, seam_options, 0, seam_workspace, seam_scheduler);
+        } catch (larch::sampled_tree_projection_budget_error const& error) {
+          seam_rejected = true;
+          CHECK(error.required_bytes() > error.budget_bytes());
+          CHECK(error.budget_bytes() ==
+                selected_grammar_plan
+                    .planned_grammar_candidate_admitted_wave_bytes);
+        }
+        CHECK(seam_rejected);
+        CHECK(seam_allocations.load(std::memory_order_relaxed) == 1);
+        CHECK(seam_constructions.load(std::memory_order_relaxed) == 0);
         CHECK(seam_scheduler.metrics().operations == 0);
         seam_scheduler.shutdown();
       }
@@ -746,20 +826,22 @@ void test_dense_partial_final_batch_uses_admitted_tile_shape() {
       estimate_grammar_spr_finite_iteration_memory_envelope(
           exact_state, exact_options.enumeration.max_candidates, 4,
           ranked_reserve_limit, true, exact_scheduler, 4, &envelope_options, 2,
-          true, 1, 1);
+          true, 1, 1, 1);
   CHECK(planned.planned_required_bytes == envelope);
   CHECK(planned.planned_local_tile_result_slots > 0);
   CHECK(planned.planned_local_weighted_candidate_order_bytes > 0);
   CHECK(planned.planned_local_untiled_concurrent_preparation_peak_bytes > 0);
   CHECK(planned.planned_local_retained_stable_capacity_bytes > 0);
-  CHECK(planned.planned_sampled_wave_with_retained_local_peak_bytes ==
-        std::max(
-            planned.planned_sampled_source_active_scratch_bytes +
-                planned.planned_sampled_source_scheduler_operation_peak_bytes,
-            planned.planned_sampled_projection_active_scratch_bytes +
-                planned
-                    .planned_sampled_projection_scheduler_operation_peak_bytes) +
-            planned.planned_local_retained_stable_capacity_bytes);
+  CHECK(
+      planned.planned_generation_wave_with_retained_local_peak_bytes ==
+      std::max(
+          {planned.planned_sampled_source_active_scratch_bytes +
+               planned.planned_sampled_source_scheduler_operation_peak_bytes,
+           planned.planned_sampled_projection_active_scratch_bytes +
+               planned
+                   .planned_sampled_projection_scheduler_operation_peak_bytes,
+           planned.planned_grammar_candidate_scheduler_operation_peak_bytes}) +
+          planned.planned_local_retained_stable_capacity_bytes);
 
   larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
       exact_workspace;

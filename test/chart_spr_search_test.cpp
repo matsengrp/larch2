@@ -2682,6 +2682,10 @@ static void test_lazy_exact_w4_combined_envelope_boundary() {
   base_options.cache.candidate_batch_size = 4;
   base_options.enumeration.max_candidates = 4;
   base_options.enumeration.max_candidates_is_post_dedup = true;
+  // Keep this boundary focused on the combined lazy-local/exact envelope.
+  // Grammar-wave admission has an independent exact-boundary matrix and would
+  // otherwise legitimately reduce its width at E-1 before rejecting.
+  base_options.enumeration.grammar_candidate_maximum_wave_size = 1;
 
   auto make_scheduler = [] {
     return std::make_unique<larch::chart_scheduler>(

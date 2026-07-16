@@ -6527,7 +6527,8 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
     std::size_t local_task_slots,
     grammar_spr_enumeration_options const* source_options,
     std::size_t candidate_buffer_count, bool include_pipeline_control,
-    std::size_t source_wave_size, std::size_t projection_wave_size) {
+    std::size_t source_wave_size, std::size_t projection_wave_size,
+    std::size_t grammar_candidate_wave_size) {
   auto add = [](std::size_t lhs, std::size_t rhs) {
     return chart_spr_checked_cache_bytes_add(
         lhs, rhs, "chart SPR finite grammar iteration envelope overflow");
@@ -6676,6 +6677,60 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   auto const grammar_enumerator =
       estimate_grammar_spr_enumeration_fixed_live_bytes(grammar,
                                                         state.execution_plan);
+  auto const has_grammar_source =
+      source != chart_spr_candidate_source::sampled_tree;
+  std::size_t grammar_wave_width = 0;
+  std::size_t grammar_wave_owned = 0;
+  std::size_t grammar_scheduler_operation = 0;
+  if (has_grammar_source &&
+      scheduler.worker_resolution().resolved_workers > 1) {
+    auto const workers = scheduler.worker_resolution().resolved_workers;
+    grammar_wave_width = workers > (std::numeric_limits<std::size_t>::max)() / 4
+                             ? (std::numeric_limits<std::size_t>::max)()
+                             : workers * 4;
+    if (source_options != nullptr &&
+        source_options->grammar_candidate_maximum_wave_size != 0) {
+      grammar_wave_width =
+          std::min(grammar_wave_width,
+                   source_options->grammar_candidate_maximum_wave_size);
+    }
+    if (grammar_candidate_wave_size != 0) {
+      grammar_wave_width =
+          std::min(grammar_wave_width, grammar_candidate_wave_size);
+    }
+    grammar_wave_width = std::max<std::size_t>(1, grammar_wave_width);
+
+    auto one_path_dynamic = doubled_vector(
+        maximum_dependency_depth, sizeof(chart_spr_detail::upward_path_step));
+    one_path_dynamic =
+        add(one_path_dynamic,
+            multiply(maximum_dependency_depth,
+                     doubled_vector(maximum_arity, sizeof(clade_id))));
+    auto const descriptor_dynamic = multiply(2, one_path_dynamic);
+    grammar_wave_owned = add(
+        sizeof(std::vector<chart_spr_detail::grammar_spr_parallel_work_item>),
+        multiply(grammar_wave_width,
+                 sizeof(chart_spr_detail::grammar_spr_parallel_work_item)));
+    grammar_wave_owned = add(grammar_wave_owned,
+                             multiply(grammar_wave_width, descriptor_dynamic));
+    grammar_wave_owned = add(
+        grammar_wave_owned,
+        sizeof(
+            std::vector<chart_spr_detail::grammar_spr_parallel_output_slot>));
+    grammar_wave_owned = add(
+        grammar_wave_owned,
+        multiply(grammar_wave_width,
+                 add(sizeof(chart_spr_detail::grammar_spr_parallel_output_slot),
+                     add(candidate_dynamic, std::size_t{512}))));
+
+    auto const grammar_plan = scheduler.plan_indexed_ranges(
+        grammar_wave_width,
+        {.minimum_grain = 1, .target_ranges_per_worker = 1});
+    if (grammar_plan.range_count > 1 && grammar_plan.worker_task_limit > 1) {
+      grammar_scheduler_operation =
+          estimate_chart_scheduler_operation_peak_bytes(grammar_plan);
+    }
+  }
   auto const one_dedup_set = multiply(candidate_limit, signature_node);
   sampled_tree_source_wave_memory_estimate sampled_wave;
   if (source != chart_spr_candidate_source::grammar) {
@@ -6760,7 +6815,8 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   std::size_t source_owned = 0;
   switch (source) {
     case chart_spr_candidate_source::grammar:
-      source_owned = add(grammar_enumerator, grammar_child_dedup);
+      source_owned =
+          add(grammar_wave_owned, add(grammar_enumerator, grammar_child_dedup));
       break;
     case chart_spr_candidate_source::sampled_tree:
       source_owned = add(sampled_waiting, sampled_child_dedup);
@@ -6773,7 +6829,8 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
       source_owned =
           add(one_dedup_set,
               std::max(add(sampled_waiting, sampled_child_dedup),
-                       add(grammar_enumerator, grammar_child_dedup)));
+                       add(grammar_wave_owned,
+                           add(grammar_enumerator, grammar_child_dedup))));
       break;
   }
   std::size_t future = source_owned;
@@ -7077,8 +7134,9 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   // capacities in the reusable local workspace.  Later source-enumeration and
   // projection stages both overlap that stable HWM. Finite lazy waves release
   // task storage and leave this component zero.
-  auto const sampled_wave_with_retained_local_peak =
-      add(std::max(source_active_peak, projection_active_peak),
+  auto const generation_wave_with_retained_local_peak =
+      add(std::max({source_active_peak, projection_active_peak,
+                    grammar_scheduler_operation}),
           local_retained_stable_capacity);
   auto const sampled_source_admitted_peak =
       source == chart_spr_candidate_source::grammar
@@ -7086,7 +7144,7 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
           : sampled_wave.required_peak_bytes -
                 sampled_wave.source_construction_scratch_bytes;
   auto const generation_transient_peak =
-      std::max(serial_overlap_peak, sampled_wave_with_retained_local_peak);
+      std::max(serial_overlap_peak, generation_wave_with_retained_local_peak);
   future = add(future, generation_transient_peak);
   auto generation_phase =
       add(estimate_chart_spr_published_state_resident_bytes(state),
@@ -7165,8 +7223,8 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
           untiled_concurrent_preparation_peak,
       .planned_local_retained_stable_capacity_bytes =
           local_retained_stable_capacity,
-      .planned_sampled_wave_with_retained_local_peak_bytes =
-          sampled_wave_with_retained_local_peak,
+      .planned_generation_wave_with_retained_local_peak_bytes =
+          generation_wave_with_retained_local_peak,
       .planned_cache_strategy = state.cache_strategy,
       .planned_candidate_batch_size = candidate_batch_size,
       .planned_local_prepared_slots = local_prepared_slots,
@@ -7192,8 +7250,12 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
       .planned_sampled_destination_bound_per_source =
           sampled_wave.destination_bound_per_source,
       .planned_sampled_source_wave_size = sampled_wave.source_wave_size,
-      .planned_sampled_projection_wave_size =
-          sampled_wave.projection_wave_size,
+      .planned_sampled_projection_wave_size = sampled_wave.projection_wave_size,
+      .planned_grammar_candidate_wave_owned_bytes = grammar_wave_owned,
+      .planned_grammar_candidate_scheduler_operation_peak_bytes =
+          grammar_scheduler_operation,
+      .planned_grammar_candidate_admitted_wave_bytes = grammar_wave_owned,
+      .planned_grammar_candidate_wave_size = grammar_wave_width,
       .candidate_buffer_count = candidate_buffer_count,
   };
 }

@@ -3941,7 +3941,7 @@ struct grammar_spr_finite_iteration_memory_envelope {
   std::size_t planned_pattern_batch_construction_scratch_bytes = 0;
   std::size_t planned_local_untiled_concurrent_preparation_peak_bytes = 0;
   std::size_t planned_local_retained_stable_capacity_bytes = 0;
-  std::size_t planned_sampled_wave_with_retained_local_peak_bytes = 0;
+  std::size_t planned_generation_wave_with_retained_local_peak_bytes = 0;
   chart_spr_cache_strategy planned_cache_strategy =
       chart_spr_cache_strategy::all_active_patterns;
   std::size_t planned_candidate_batch_size = 0;
@@ -3962,6 +3962,10 @@ struct grammar_spr_finite_iteration_memory_envelope {
   std::size_t planned_sampled_destination_bound_per_source = 0;
   std::size_t planned_sampled_source_wave_size = 0;
   std::size_t planned_sampled_projection_wave_size = 0;
+  std::size_t planned_grammar_candidate_wave_owned_bytes = 0;
+  std::size_t planned_grammar_candidate_scheduler_operation_peak_bytes = 0;
+  std::size_t planned_grammar_candidate_admitted_wave_bytes = 0;
+  std::size_t planned_grammar_candidate_wave_size = 0;
   std::size_t candidate_buffer_count = 1;
 };
 
@@ -3978,9 +3982,9 @@ estimate_grammar_spr_finite_iteration_memory_envelope(
     std::size_t local_task_slots,
     grammar_spr_enumeration_options const* source_options = nullptr,
     std::size_t candidate_buffer_count = 1,
-    bool include_pipeline_control = false,
-    std::size_t source_wave_size = 0,
-    std::size_t projection_wave_size = 0);
+    bool include_pipeline_control = false, std::size_t source_wave_size = 0,
+    std::size_t projection_wave_size = 0,
+    std::size_t grammar_candidate_wave_size = 0);
 
 // Peak coordinator scratch used while producing the per-candidate admission
 // estimates. Estimation is serial, so only the largest candidate is charged.
@@ -13028,55 +13032,97 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
 
   if (finite_iteration_admission) {
     auto estimate_envelope = [&](std::size_t source_wave_size,
-                                 std::size_t projection_wave_size) {
+                                 std::size_t projection_wave_size,
+                                 std::size_t grammar_wave_size) {
       return chart_spr_search_detail::
           estimate_grammar_spr_finite_iteration_memory_envelope(
               state, enumeration.max_candidates, candidate_batch_size,
               ranked_reserve_limit, capture_semantics, scheduler,
               local_task_slots, &enumeration, candidate_buffer_count,
-              use_pipeline, source_wave_size, projection_wave_size);
+              use_pipeline, source_wave_size, projection_wave_size,
+              grammar_wave_size);
     };
     try {
-      auto selected = estimate_envelope(0, 0);
-      if (enumeration.source != chart_spr_candidate_source::grammar &&
-          selected.planned_required_bytes > exact_memory_budget) {
-        auto const maximum_source_wave =
-            selected.planned_sampled_source_wave_size;
-        auto minimum = estimate_envelope(1, 1);
+      auto selected = estimate_envelope(0, 0, 0);
+      if (selected.planned_required_bytes > exact_memory_budget) {
+        auto const has_sampled_source =
+            enumeration.source != chart_spr_candidate_source::grammar;
+        auto const has_parallel_grammar_source =
+            enumeration.source != chart_spr_candidate_source::sampled_tree &&
+            selected.planned_grammar_candidate_wave_size != 0;
+        auto const minimum_source =
+            has_sampled_source ? std::size_t{1} : std::size_t{0};
+        auto const minimum_projection = minimum_source;
+        auto const minimum_grammar =
+            has_parallel_grammar_source ? std::size_t{1} : std::size_t{0};
+        auto minimum = estimate_envelope(minimum_source, minimum_projection,
+                                         minimum_grammar);
         selected = minimum;
         if (minimum.planned_required_bytes <= exact_memory_budget) {
-          // First admit source concurrency at the irreducible one-projection
-          // working set. Then independently spend the remaining budget on
-          // projection concurrency for that selected source width.
-          std::size_t source_low = 1;
-          std::size_t source_high = maximum_source_wave;
-          while (source_low < source_high) {
-            auto const midpoint =
-                source_low + (source_high - source_low + 1) / 2;
-            auto candidate = estimate_envelope(midpoint, 1);
-            if (candidate.planned_required_bytes <= exact_memory_budget) {
-              source_low = midpoint;
-              selected = std::move(candidate);
-            } else {
-              source_high = midpoint - 1;
+          auto selected_source = minimum_source;
+          auto selected_projection = minimum_projection;
+
+          // Admit sampled source concurrency at the irreducible one-projection
+          // and one-grammar-construction working set.
+          if (has_sampled_source) {
+            auto const maximum_source_wave =
+                estimate_envelope(0, 1, minimum_grammar)
+                    .planned_sampled_source_wave_size;
+            std::size_t low = 1;
+            std::size_t high = maximum_source_wave;
+            while (low < high) {
+              auto const midpoint = low + (high - low + 1) / 2;
+              auto candidate = estimate_envelope(midpoint, 1, minimum_grammar);
+              if (candidate.planned_required_bytes <= exact_memory_budget) {
+                low = midpoint;
+                selected = std::move(candidate);
+              } else {
+                high = midpoint - 1;
+              }
             }
+            selected_source = low;
+
+            auto const maximum_projection_wave =
+                estimate_envelope(selected_source, 0, minimum_grammar)
+                    .planned_sampled_projection_wave_size;
+            low = 1;
+            high = maximum_projection_wave;
+            selected = estimate_envelope(selected_source, 1, minimum_grammar);
+            while (low < high) {
+              auto const midpoint = low + (high - low + 1) / 2;
+              auto candidate =
+                  estimate_envelope(selected_source, midpoint, minimum_grammar);
+              if (candidate.planned_required_bytes <= exact_memory_budget) {
+                low = midpoint;
+                selected = std::move(candidate);
+              } else {
+                high = midpoint - 1;
+              }
+            }
+            selected_projection = low;
           }
 
-          auto maximum_projection = estimate_envelope(source_low, 0);
-          auto const maximum_projection_wave =
-              maximum_projection.planned_sampled_projection_wave_size;
-          std::size_t projection_low = 1;
-          std::size_t projection_high = maximum_projection_wave;
-          selected = estimate_envelope(source_low, 1);
-          while (projection_low < projection_high) {
-            auto const midpoint =
-                projection_low + (projection_high - projection_low + 1) / 2;
-            auto candidate = estimate_envelope(source_low, midpoint);
-            if (candidate.planned_required_bytes <= exact_memory_budget) {
-              projection_low = midpoint;
-              selected = std::move(candidate);
-            } else {
-              projection_high = midpoint - 1;
+          // Grammar construction is a third independent dimension and is
+          // admitted only after the sampled source/projection widths have been
+          // fixed. All three stages are scheduler-handoff alternatives.
+          if (has_parallel_grammar_source) {
+            auto const maximum_grammar_wave =
+                estimate_envelope(selected_source, selected_projection, 0)
+                    .planned_grammar_candidate_wave_size;
+            std::size_t low = 1;
+            std::size_t high = maximum_grammar_wave;
+            selected =
+                estimate_envelope(selected_source, selected_projection, 1);
+            while (low < high) {
+              auto const midpoint = low + (high - low + 1) / 2;
+              auto candidate = estimate_envelope(selected_source,
+                                                 selected_projection, midpoint);
+              if (candidate.planned_required_bytes <= exact_memory_budget) {
+                low = midpoint;
+                selected = std::move(candidate);
+              } else {
+                high = midpoint - 1;
+              }
             }
           }
         }
@@ -13128,6 +13174,13 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       enumeration.sampled_tree_source_admitted_peak_bytes =
           finite_iteration_envelope
               ->planned_sampled_source_admitted_peak_bytes;
+    }
+    if (enumeration.source != chart_spr_candidate_source::sampled_tree) {
+      enumeration.grammar_candidate_maximum_wave_size =
+          finite_iteration_envelope->planned_grammar_candidate_wave_size;
+      enumeration.grammar_candidate_admitted_wave_bytes =
+          finite_iteration_envelope
+              ->planned_grammar_candidate_admitted_wave_bytes;
     }
   }
   validate_chart_spr_pattern_batch_replay_strategy(state, options, enumeration,
@@ -13196,10 +13249,12 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   if (capture_semantics) {
     result.canonical_seed = options.seed;
   }
+  // Candidate construction and sampled-tree projection share the one
+  // search-lifetime scheduler; no source may construct a per-wave pool.  The
+  // historical option name is retained because both generation paths use the
+  // same scheduler handoff/cancellation contract.
+  enumeration.sampled_tree_projection_scheduler = &scheduler;
   if (enumeration.source != chart_spr_candidate_source::grammar) {
-    // Sampled-tree projection shares the one search-lifetime scheduler; no
-    // per-sample or per-wave scheduler/thread-pool may be constructed.
-    enumeration.sampled_tree_projection_scheduler = &scheduler;
     if (exact_memory_budget != 0) {
       if (finite_iteration_admission) {
         // The source-aware iteration envelope is the sole admission owner and
@@ -13250,9 +13305,13 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       finite_iteration_admission
           ? (enumeration.source == chart_spr_candidate_source::grammar &&
                      !use_pipeline
-                 ? chart_spr_search_detail::
-                       estimate_grammar_spr_enumeration_fixed_live_bytes(
-                           state.grammar, state.execution_plan)
+                 ? chart_spr_search_detail::local_capacity_checked_add(
+                       chart_spr_search_detail::
+                           estimate_grammar_spr_enumeration_fixed_live_bytes(
+                               state.grammar, state.execution_plan),
+                       finite_iteration_envelope
+                           ->planned_grammar_candidate_wave_owned_bytes,
+                       "chart SPR finite grammar construction wave")
                  : finite_iteration_envelope->planned_source_owned_bytes)
           : std::size_t{0};
   auto const pipeline_control_resident =
