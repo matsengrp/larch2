@@ -426,11 +426,17 @@ fi
 run_and_capture_status "$tmp/precedence.status" \
   "$runner" \
     --rss-limit-bytes 16777216 \
-    --timeout-seconds 0.02 \
+    --timeout-seconds 0.5 \
     --stdout "$tmp/precedence.out" \
     --stderr "$tmp/precedence.err" \
     -- python3 -c \
-       'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(.06); x=bytearray(64*1024*1024); time.sleep(10)' \
+       'import signal,time
+x = None
+def allocate_after_timeout(_signal, _frame):
+    global x
+    x = bytearray(64*1024*1024)
+signal.signal(signal.SIGTERM, allocate_after_timeout)
+time.sleep(10)' \
     >"$tmp/precedence.metrics"
 [[ $(<"$tmp/precedence.status") == 124 ]]
 require_metric "$tmp/precedence.metrics" outcome timeout

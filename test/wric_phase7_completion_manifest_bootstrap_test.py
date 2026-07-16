@@ -228,6 +228,20 @@ def install_source_matrix(case: phase9_test.Integration) -> None:
     case.parent_sha = phase9_test.file_digest(case.base)
 
 
+def install_base_fixture_overlay(case: phase9_test.Integration) -> None:
+    """Mirror the real Phase-0 worktree's dirty, pre-seal fixture overlay."""
+
+    relatives = (
+        bootstrap.TREE_FIXTURE.relative_path,
+        bootstrap.MEDIUM_PRIMARY_RELATIVE,
+        bootstrap.MEDIUM_REFSEQ_RELATIVE,
+    )
+    for relative in relatives:
+        destination = case.base_repo_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPO / relative, destination)
+
+
 def command(
     case: phase9_test.Integration,
     working: Path,
@@ -239,7 +253,7 @@ def command(
         os.fspath(HELPER),
         action,
         "--repo-root",
-        os.fspath(REPO),
+        os.fspath(case.base_repo_root),
         "--base-manifest",
         os.fspath(case.base),
         "--expected-parent-sha256",
@@ -328,6 +342,7 @@ def main() -> None:
     ) as temporary:
         case = phase9_test.Integration(Path(temporary))
         working = patch_oracle(case)
+        install_base_fixture_overlay(case)
         install_source_matrix(case)
         invocation_log = phase78_test.wrap_process_metrics(case)
         output = case.root / "published" / bootstrap.OUTPUT_NAME
@@ -349,10 +364,10 @@ def main() -> None:
         # The completion caller must inherit the shared deterministic-file
         # installer's refusal to resume an externally hard-linked contract.
         base_for_contract = bootstrap.core.read_manifest(
-            case.base, REPO, expected_kind="base"
+            case.base, case.base_repo_root, expected_kind="base"
         )
         source_for_contract = bootstrap.validate_source_matrix(
-            base_for_contract, REPO, case.affinity
+            base_for_contract, case.base_repo_root, case.affinity
         )
         hardlink_capture = case.root / "hardlink-capture"
         hardlink_capture.mkdir()
@@ -387,7 +402,9 @@ def main() -> None:
         existing = run(command(case, working, "build", output), success=False)
         assert "already exists" in existing.stderr
 
-        manifest = bootstrap.core.read_manifest(output, REPO, expected_kind="supplement")
+        manifest = bootstrap.core.read_manifest(
+            output, case.base_repo_root, expected_kind="supplement"
+        )
         assert len(manifest.rows) == 8
         assert [row["row_id"] for row in manifest.rows] == [
             *(bootstrap.medium_row_id(worker) for worker in bootstrap.WORKERS),
@@ -449,7 +466,7 @@ def main() -> None:
                 case.base,
                 case.parent_sha,
                 staged,
-                REPO,
+                case.base_repo_root,
                 phase9_test.file_digest(case.runner),
                 phase9_test.file_digest(working),
                 case.runner,
@@ -464,12 +481,12 @@ def main() -> None:
         assert recovery_output.with_name(recovery_output.name + ".sha256").is_file()
 
         base_manifest = bootstrap.core.read_manifest(
-            case.base, REPO, expected_kind="base"
+            case.base, case.base_repo_root, expected_kind="base"
         )
         runner_sha = phase9_test.file_digest(case.runner)
         working_sha = phase9_test.file_digest(working)
         source_matrix = bootstrap.validate_source_matrix(
-            base_manifest, REPO, case.affinity
+            base_manifest, case.base_repo_root, case.affinity
         )
         capture_identity = bootstrap.completion_capture_identity(
             base_manifest,
