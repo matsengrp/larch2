@@ -1246,6 +1246,10 @@ set_tests_properties(wric_cross_phase_acceptance_test PROPERTIES TIMEOUT 90)
 add_test(NAME wric_evidence_run_ledger_test
          COMMAND python3 test/wric_evidence_run_ledger_test.py
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME wric_benchmark_capture_test
+         COMMAND python3 test/wric_benchmark_capture_test.py
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(wric_benchmark_capture_test PROPERTIES TIMEOUT 120)
 
 # Phase 10 (cross-cutting CLI / report / identity surface) library-level tests.
 add_executable(chart_spr_phase10_test test/chart_spr_phase10_test.cpp)
