@@ -1702,6 +1702,98 @@ std::size_t chart_spr_transient_delta_payload_copy_bytes(
   return total;
 }
 
+std::size_t chart_spr_cache_commit_transaction_peak_bytes(
+    chart_spr_local_commit_substrate const& sub,
+    chart_spr_search_state const& state, spr_overlay_delta const& delta,
+    chart_scheduler const& scheduler,
+    chart_indexed_range_options range_options) {
+  if (!sub.chain || !sub.icache || !sub.ocache) {
+    throw std::logic_error(
+        "chart SPR cache-commit memory estimator: incomplete substrate");
+  }
+  using row_type = std::array<chart_cost, nuc_state_count>;
+  auto const pattern_count = sub.icache->patterns.size();
+  if (sub.ocache->patterns.size() != pattern_count ||
+      state.active_patterns.patterns.patterns.size() != pattern_count) {
+    throw std::runtime_error(
+        "chart SPR cache-commit memory estimator: pattern counts differ");
+  }
+  auto const target_temp_clades = chart_spr_checked_cache_bytes_add(
+      sub.icache->temp_clade_count, delta.temp_clades.size(),
+      "chart SPR cache-commit target temp-clade overflow");
+  auto const target_clades = chart_spr_checked_cache_bytes_add(
+      sub.base_grammar.clades.size(), target_temp_clades,
+      "chart SPR cache-commit target clade overflow");
+
+  // Both staged directions are simultaneously resident between the outside
+  // join and publication.  Charging every possible tip clade is a safe
+  // pre-append bound on the dependency-derived affected subsets.
+  auto const staged_row_count = chart_spr_checked_cache_bytes_multiply(
+      chart_spr_checked_cache_bytes_multiply(
+          pattern_count, target_clades,
+          "chart SPR cache-commit staged row-count overflow"),
+      2, "chart SPR cache-commit staged direction overflow");
+  auto total = chart_spr_checked_cache_bytes_multiply(
+      staged_row_count, sizeof(row_type),
+      "chart SPR cache-commit staged row-byte overflow");
+  total = chart_spr_checked_cache_bytes_add(
+      total,
+      chart_spr_checked_cache_bytes_multiply(
+          pattern_count, sizeof(outside_recurrence_work_stats),
+          "chart SPR cache-commit recurrence-work overflow"),
+      "chart SPR cache-commit transient overflow");
+
+  // Four ref->position tables, two affected-ref vectors, reachability/closure
+  // work bitsets, and four production-index vector surfaces.  The vector
+  // payload term below separately covers the copied merged overlay values.
+  auto const metadata_per_clade =
+      4 * sizeof(std::size_t) + 2 * sizeof(overlay_clade_ref) +
+      8 * sizeof(bool) + 4 * sizeof(std::vector<std::size_t>);
+  total = chart_spr_checked_cache_bytes_add(
+      total,
+      chart_spr_checked_cache_bytes_multiply(
+          target_clades, metadata_per_clade,
+          "chart SPR cache-commit plan metadata overflow"),
+      "chart SPR cache-commit transient overflow");
+
+  // `overlay_chain::tip()` owns a merged overlay copy.  Account every existing
+  // delta plus the proposed append with the same frozen-libstdc++ payload
+  // bound used by transient exact verification, and retain a second copy for
+  // ordered tombstone/index construction at the plan-build peak.
+  std::size_t merged_payload = 0;
+  for (std::size_t position = 0; position < sub.chain->size(); ++position) {
+    auto const& committed = sub.chain->at(position);
+    merged_payload = chart_spr_checked_cache_bytes_add(
+        merged_payload,
+        chart_spr_transient_delta_payload_copy_bytes(
+            committed.temp_clades, committed.temp_productions,
+            committed.removed_base_productions,
+            committed.commit_source.size()),
+        "chart SPR cache-commit merged payload overflow");
+  }
+  merged_payload = chart_spr_checked_cache_bytes_add(
+      merged_payload,
+      chart_spr_transient_delta_payload_copy_bytes(
+          delta.temp_clades, delta.temp_productions,
+          delta.removed_base_productions, delta.commit_source.size()),
+      "chart SPR cache-commit proposed payload overflow");
+  total = chart_spr_checked_cache_bytes_add(
+      total,
+      chart_spr_checked_cache_bytes_multiply(
+          merged_payload, 2,
+          "chart SPR cache-commit merged working-set overflow"),
+      "chart SPR cache-commit transient overflow");
+
+  // Inside and outside scheduler operations are separated by a join and use
+  // the same range plan, so one operation peak (not their sum) is resident.
+  auto const scheduler_plan =
+      scheduler.plan_indexed_ranges(pattern_count, range_options);
+  total = chart_spr_checked_cache_bytes_add(
+      total, estimate_chart_scheduler_operation_peak_bytes(scheduler_plan),
+      "chart SPR cache-commit scheduler-operation overflow");
+  return total;
+}
+
 std::size_t chart_spr_transient_verifier_extra_memory_bound(
     chart_spr_local_commit_substrate const& sub,
     grammar_spr_candidate const& candidate) {
@@ -4247,6 +4339,10 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     }
   }();
 
+  auto const cache_range_options = chart_spr_phase4_pattern_range_options(
+      sub.icache->patterns.size(),
+      scheduler.worker_resolution().resolved_workers);
+
   // Admission precedes the first shared mutation. Both persistent caches grow
   // one row per active pattern and added clade; the scoring representation's
   // corresponding worst-case growth and selected-cache admission are included
@@ -4256,6 +4352,11 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
   try {
     projected_cache_bytes = chart_spr_projected_local_commit_bytes_after_delta(
         state, *sub.icache, *sub.ocache, delta);
+    projected_cache_bytes = chart_spr_checked_cache_bytes_add(
+        projected_cache_bytes,
+        chart_spr_cache_commit_transaction_peak_bytes(
+            sub, state, delta, scheduler, cache_range_options),
+        "chart SPR local-commit transaction peak overflow");
   } catch (chart_spr_cache_budget_error const&) {
     throw;
   } catch (std::exception const& e) {
@@ -4313,9 +4414,6 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     // neither cache surface nor epoch is published until both joins succeed.
     auto cache_commit_plan = build_chart_cache_commit_plan(
         *sub.chain, outside_affected_policy::conservative_superset);
-    auto const cache_range_options = chart_spr_phase4_pattern_range_options(
-        sub.icache->patterns.size(),
-        scheduler.worker_resolution().resolved_workers);
     chart_cache_commit_run_summary cache_commit_run;
     apply_commit_to_chart_caches(
         *sub.chain, cache_commit_plan, *sub.icache, *sub.ocache, scheduler,
