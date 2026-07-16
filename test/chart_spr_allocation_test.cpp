@@ -1316,12 +1316,10 @@ static void test_warmed_direct_projection_reuses_dominant_storage(
     }
   }
   CHECK(observed_candidates == warm_candidates);
-  // The retained path intentionally leaves general-candidate validation as a
-  // later optimization.  These strict bounds reject regressions to the former
-  // 1,512 calls / 82 KiB per move while allowing allocator implementation
-  // details in that remaining validation stage.
-  CHECK(observer.statistics.calls <= jobs.size() * 220);
-  CHECK(observer.statistics.requested_bytes <= jobs.size() * 17 * 1024);
+  // One identical full pass establishes every task-local and retained-output
+  // high-water allocation.  Binary metadata resolution and the ordered-key
+  // recurrence must not allocate at all on the second pass.
+  check_statistics(observer, 0, 0, 0, 0, 0);
   std::println("  PASS ({} calls, {} requested bytes)",
                observer.statistics.calls, observer.statistics.requested_bytes);
 }

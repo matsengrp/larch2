@@ -678,7 +678,9 @@ static void test_bootstrap_projection_from_tree_validates_against_apply() {
 
 static void check_prepared_projection_fixture(std::string const& label,
                                               larch::clade_grammar const& base,
-                                              larch::phylo_dag& tree) {
+                                              larch::phylo_dag& tree,
+                                              std::size_t expected_emitted,
+                                              std::size_t expected_projected) {
   for (auto edge_variant : tree.get_all_edges()) {
     std::visit(
         [](auto edge) {
@@ -702,7 +704,7 @@ static void check_prepared_projection_fixture(std::string const& label,
   enumerator.find_all_moves(radius, [&](larch::profitable_move const& move) {
     moves.push_back(move);
   });
-  CHECK(!moves.empty());
+  CHECK(moves.size() == expected_emitted);
 
   larch::scratch_buffers reusable_enumeration_scratch;
   reusable_enumeration_scratch.resize(prepared.index().num_variable_sites());
@@ -724,6 +726,8 @@ static void check_prepared_projection_fixture(std::string const& label,
   }
 
   std::size_t projected_count = 0;
+  std::size_t direct_count = 0;
+  std::size_t fallback_count = 0;
   std::vector<std::optional<larch::grammar_spr_candidate>> sequential_results;
   sequential_results.reserve(moves.size());
   for (auto const& emitted : moves) {
@@ -735,8 +739,14 @@ static void check_prepared_projection_fixture(std::string const& label,
         project_tree_spr_move_annotated_oracle(base, oracle_tree, move);
     auto direct = larch::chart_spr_detail::project_sampled_tree_move_with_path(
         prepared, move);
-    CHECK(direct.path ==
-          larch::chart_spr_detail::sampled_tree_projection_path::direct);
+    if (direct.path ==
+        larch::chart_spr_detail::sampled_tree_projection_path::direct) {
+      ++direct_count;
+    } else if (direct.path ==
+               larch::chart_spr_detail::sampled_tree_projection_path::
+                   clone_fallback) {
+      ++fallback_count;
+    }
     auto actual = std::move(direct.candidate);
     auto profitable_actual =
         larch::project_tree_spr_move_to_candidate(prepared, emitted);
@@ -765,7 +775,9 @@ static void check_prepared_projection_fixture(std::string const& label,
     check_candidate_payload_equal(base, *actual, *profitable_actual);
     check_candidate_payload_equal(base, *actual, *legacy_actual);
   }
-  CHECK(projected_count > 0);
+  CHECK(projected_count == expected_projected);
+  CHECK(direct_count == expected_emitted);
+  CHECK(fallback_count == 0);
 
   auto project_all = [&]() {
     std::vector<std::optional<larch::grammar_spr_candidate>> result;
@@ -803,12 +815,14 @@ static void test_phase8_prepared_projection_differential_all_emitted_moves() {
   auto binary_tree =
       larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
   auto binary_grammar = larch::build_clade_grammar(binary_tree);
-  check_prepared_projection_fixture("binary", binary_grammar, binary_tree);
+  check_prepared_projection_fixture("binary", binary_grammar, binary_tree, 14,
+                                    10);
 
   auto deeper_tree =
       larch::test::make_tiny_labelled_tree("A", eight_taxon_balanced_tree());
   auto deeper_grammar = larch::build_clade_grammar(deeper_tree);
-  check_prepared_projection_fixture("eight-taxon", deeper_grammar, deeper_tree);
+  check_prepared_projection_fixture("eight-taxon", deeper_grammar, deeper_tree,
+                                    98, 88);
 
   std::vector<larch::phylo_dag> source_trees;
   source_trees.push_back(
@@ -822,7 +836,7 @@ static void test_phase8_prepared_projection_differential_all_emitted_moves() {
   auto multiparent_member_tree =
       larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree());
   check_prepared_projection_fixture("multiparent-base", multiparent_grammar,
-                                    multiparent_member_tree);
+                                    multiparent_member_tree, 14, 10);
 
   larch::grammar_spr_enumeration_options sample_options;
   sample_options.sampled_tree_source_dag = &multiparent_base;
@@ -830,8 +844,125 @@ static void test_phase8_prepared_projection_differential_all_emitted_moves() {
   auto sampled_tree = larch::chart_spr_detail::build_sampled_tree_from_grammar(
       multiparent_grammar, sample_options, 1, rng);
   check_prepared_projection_fixture("sampled-tree", multiparent_grammar,
-                                    sampled_tree);
+                                    sampled_tree, 22, 16);
 
+  std::println("  PASS");
+}
+
+static void test_phase8_binary_direct_metadata_resolver_is_fail_closed() {
+  std::println("test_phase8_binary_direct_metadata_resolver_is_fail_closed");
+  using larch::chart_spr_detail::resolve_sampled_tree_binary_move_metadata;
+  using status = larch::chart_spr_detail::sampled_tree_direct_metadata_status;
+
+  auto tree =
+      larch::test::make_tiny_labelled_tree("A", eight_taxon_balanced_tree());
+  auto grammar = larch::build_clade_grammar(tree);
+  auto prepared =
+      larch::chart_spr_detail::prepare_sampled_tree_projection(grammar, tree);
+  auto const& index = prepared.index();
+  auto const& node_to_clade = prepared.node_to_base_clade();
+  auto const& node_to_production = prepared.node_to_base_production();
+
+  larch::production_id source_production = larch::no_production;
+  larch::clade_id moved = larch::no_clade;
+  larch::clade_id old_parent = larch::no_clade;
+  larch::clade_id old_sibling = larch::no_clade;
+  larch::clade_id target = larch::no_clade;
+  larch::chart_spr_detail::sampled_tree_direct_move_metadata metadata;
+
+  auto radius = larch::compute_tree_max_depth(tree) * 2;
+  larch::move_enumerator enumerator{index, std::numeric_limits<int>::max()};
+  enumerator.find_all_moves(radius, [&](larch::profitable_move const& emitted) {
+    if (source_production != larch::no_production) return;
+    auto const parent_node = index.get_parent(emitted.src);
+    if (!index.is_valid(parent_node) ||
+        index.get_num_children(parent_node) != 2 ||
+        emitted.src >= node_to_clade.size() ||
+        emitted.dst >= node_to_clade.size() ||
+        parent_node >= node_to_clade.size() ||
+        parent_node >= node_to_production.size()) {
+      return;
+    }
+    auto const& children = index.get_children(parent_node);
+    auto found_sibling =
+        std::find_if(children.begin(), children.end(),
+                     [&](auto child) { return child != emitted.src; });
+    if (found_sibling == children.end() ||
+        *found_sibling >= node_to_clade.size()) {
+      return;
+    }
+
+    auto const candidate_source_production = node_to_production[parent_node];
+    auto const candidate_moved = node_to_clade[emitted.src];
+    auto const candidate_old_parent = node_to_clade[parent_node];
+    auto const candidate_old_sibling = node_to_clade[*found_sibling];
+    auto const candidate_target = node_to_clade[emitted.dst];
+    larch::chart_spr_detail::sampled_tree_direct_move_metadata candidate;
+    if (resolve_sampled_tree_binary_move_metadata(
+            grammar, candidate_source_production, candidate_moved,
+            candidate_old_parent, candidate_old_sibling, candidate_target,
+            candidate) != status::ready ||
+        candidate_old_parent == grammar.root_clade) {
+      return;
+    }
+    source_production = candidate_source_production;
+    moved = candidate_moved;
+    old_parent = candidate_old_parent;
+    old_sibling = candidate_old_sibling;
+    target = candidate_target;
+    metadata = candidate;
+  });
+
+  CHECK(source_production != larch::no_production);
+  CHECK(metadata.moved_clade == larch::base_clade_ref(moved));
+  CHECK(metadata.old_parent == larch::base_clade_ref(old_parent));
+  CHECK(metadata.old_sibling == larch::base_clade_ref(old_sibling));
+  CHECK(metadata.new_sibling_or_target == larch::base_clade_ref(target));
+
+  auto resolve =
+      [&](larch::clade_grammar const& selected_grammar,
+          larch::production_id selected_production,
+          larch::clade_id selected_moved, larch::clade_id selected_parent,
+          larch::clade_id selected_sibling, larch::clade_id selected_target) {
+        larch::chart_spr_detail::sampled_tree_direct_move_metadata ignored;
+        return resolve_sampled_tree_binary_move_metadata(
+            selected_grammar, selected_production, selected_moved,
+            selected_parent, selected_sibling, selected_target, ignored);
+      };
+
+  CHECK(resolve(grammar, larch::no_production, moved, old_parent, old_sibling,
+                target) == status::fallback);
+  CHECK(resolve(grammar, source_production, larch::no_clade, old_parent,
+                old_sibling, target) == status::fallback);
+  CHECK(resolve(grammar, source_production, target, old_parent, old_sibling,
+                moved) == status::fallback);
+  CHECK(resolve(grammar, source_production, moved, target, old_sibling,
+                target) == status::fallback);
+  CHECK(resolve(grammar, source_production, moved, old_parent, target,
+                target) == status::fallback);
+
+  auto nonbinary = grammar;
+  nonbinary.productions[source_production].children.push_back(target);
+  CHECK(resolve(nonbinary, source_production, moved, old_parent, old_sibling,
+                target) == status::fallback);
+  auto duplicate_moved = grammar;
+  duplicate_moved.productions[source_production].children = {moved, moved};
+  CHECK(resolve(duplicate_moved, source_production, moved, old_parent,
+                old_sibling, target) == status::fallback);
+
+  CHECK(resolve(grammar, source_production, moved, old_parent, old_sibling,
+                moved) == status::no_candidate);
+  CHECK(resolve(grammar, source_production, moved, old_parent, old_sibling,
+                old_parent) == status::no_candidate);
+  CHECK(resolve(grammar, source_production, moved, old_parent, old_sibling,
+                old_sibling) == status::no_candidate);
+  CHECK(grammar.root_clade != moved);
+  CHECK(grammar.root_clade != old_parent);
+  CHECK(grammar.root_clade != old_sibling);
+  CHECK(!larch::chart_spr_detail::disjoint_taxa(
+      grammar.clades[moved].taxa, grammar.clades[grammar.root_clade].taxa));
+  CHECK(resolve(grammar, source_production, moved, old_parent, old_sibling,
+                grammar.root_clade) == status::no_candidate);
   std::println("  PASS");
 }
 
@@ -912,6 +1043,9 @@ static void test_phase8_parallel_sampled_projection_is_deterministic() {
                      workers * 4));
       CHECK(stats.sampled_tree_projection_direct > 0);
       CHECK(stats.sampled_tree_projection_fallback == 0);
+      CHECK(stats.sampled_tree_projection_direct +
+                stats.sampled_tree_projection_fallback ==
+            stats.sampled_tree_projection_moves_preassigned);
       CHECK(stats.sampled_tree_projection_estimated_peak_bytes > 0);
       CHECK(stats.sampled_tree_source_actual_peak_bytes >=
             stats.sampled_tree_projection_estimated_peak_bytes);
@@ -1910,6 +2044,7 @@ int main() {
   test_projected_tree_spr_matches_apply_spr_move();
   test_bootstrap_projection_from_tree_validates_against_apply();
   test_phase8_prepared_projection_differential_all_emitted_moves();
+  test_phase8_binary_direct_metadata_resolver_is_fail_closed();
   test_phase8_parallel_sampled_projection_is_deterministic();
   test_phase8_grammar_and_hybrid_worker_seed_matrix();
   test_phase8_projection_budget_and_failure_atomicity();

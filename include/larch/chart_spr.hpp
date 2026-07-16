@@ -1351,6 +1351,23 @@ struct sampled_tree_direct_workspace {
   std::vector<clade_id> child_ids;
 };
 
+// Only these four non-owning references survive from the general candidate
+// builder into the exact selected-tree diff builder. Keeping the direct-path
+// metadata type free of owning containers makes the binary fast path
+// allocation-free after its workspace reaches high water.
+struct sampled_tree_direct_move_metadata {
+  overlay_clade_ref moved_clade;
+  overlay_clade_ref old_parent;
+  overlay_clade_ref old_sibling;
+  overlay_clade_ref new_sibling_or_target;
+};
+
+enum class sampled_tree_direct_metadata_status : std::uint8_t {
+  ready,
+  no_candidate,
+  fallback,
+};
+
 // A result slot is indexed by canonical ordinal rather than worker. Its
 // candidate remains live until caller-thread gather, while nested spare
 // elements preserve capacity across differently shaped payloads.
@@ -2642,7 +2659,7 @@ inline bool sampled_tree_after_keys_contains(
 
 inline bool make_candidate_from_ordered_tree_keys_prepared_into(
     sampled_tree_projection_context const& prepared, spr_move const& move,
-    grammar_spr_candidate const& metadata,
+    sampled_tree_direct_move_metadata const& metadata,
     sampled_tree_direct_workspace& workspace,
     sampled_tree_projection_output_slot& slot) {
   recycle_sampled_tree_projection_output(slot);
@@ -3064,52 +3081,6 @@ inline std::optional<grammar_spr_candidate> make_general_spr_candidate(
   return candidate;
 }
 
-// Recover the one upward path selected by the sampled tree rather than
-// enumerating every parent production in the base grammar.  The prepared
-// node-to-production map was compiled from the before-tree witnesses, so a
-// missing entry is a direct-path prerequisite failure rather than an invalid
-// SPR move.
-inline std::optional<upward_path> sampled_tree_selected_upward_path(
-    sampled_tree_projection_context const& prepared, std::size_t start_node) {
-  auto const& grammar = prepared.base();
-  auto const& index = prepared.index();
-  auto const& node_to_clade = prepared.node_to_base_clade();
-  auto const& node_to_production = prepared.node_to_base_production();
-  if (!index.is_valid(start_node) || start_node >= node_to_clade.size()) {
-    return std::nullopt;
-  }
-
-  auto node = start_node;
-  auto child = node_to_clade[node];
-  if (child == no_clade) return std::nullopt;
-  upward_path path;
-  path.reserve(index.get_dfs_info(node).level);
-  for (std::size_t steps = 0; child != grammar.root_clade; ++steps) {
-    if (steps >= index.num_nodes() || node == index.get_tree_root()) {
-      return std::nullopt;
-    }
-    auto const parent_node = index.get_parent(node);
-    if (parent_node >= node_to_clade.size() ||
-        parent_node >= node_to_production.size()) {
-      return std::nullopt;
-    }
-    auto const parent = node_to_clade[parent_node];
-    auto const production = node_to_production[parent_node];
-    if (parent == no_clade || production == no_production ||
-        production >= grammar.productions.size() ||
-        grammar.productions[production].parent != parent) {
-      return std::nullopt;
-    }
-    auto cochildren = cochildren_of(grammar, production, child);
-    if (!cochildren) return std::nullopt;
-    path.push_back(
-        upward_path_step{production, parent, child, std::move(*cochildren)});
-    node = parent_node;
-    child = parent;
-  }
-  return path;
-}
-
 inline bool production_taxa_clade_tree_order_less(
     std::vector<taxon_id> const& first, std::vector<taxon_id> const& second) {
   if (first.size() != second.size()) return first.size() < second.size();
@@ -3266,7 +3237,11 @@ inline bool sampled_tree_direct_after_keys_into(
       }
       auto const old_size = taxa.size();
       taxa.insert(taxa.end(), child_taxa->begin(), child_taxa->end());
-      std::inplace_merge(taxa.begin(), taxa.begin() + old_size, taxa.end());
+      // std::inplace_merge is permitted to acquire a temporary buffer and the
+      // required libstdc++ implementation does so even for tiny taxon rows.
+      // The row is disjoint by construction, so sorting the appended union
+      // preserves the exact canonical taxa order without any allocation.
+      if (old_size != 0) std::sort(taxa.begin(), taxa.end());
       return true;
     });
     if (!children_valid) {
@@ -3383,6 +3358,46 @@ sampled_tree_direct_after_keys(sampled_tree_projection_context const& prepared,
   return result;
 }
 
+inline sampled_tree_direct_metadata_status
+resolve_sampled_tree_binary_move_metadata(
+    clade_grammar const& grammar, production_id source_production,
+    clade_id moved, clade_id old_parent, clade_id old_sibling, clade_id target,
+    sampled_tree_direct_move_metadata& result) noexcept {
+  auto const valid_clade = [&](clade_id id) {
+    return id != no_clade && id < grammar.clades.size();
+  };
+  if (source_production == no_production ||
+      source_production >= grammar.productions.size() || !valid_clade(moved) ||
+      !valid_clade(old_parent) || !valid_clade(old_sibling) ||
+      !valid_clade(target)) {
+    return sampled_tree_direct_metadata_status::fallback;
+  }
+
+  auto const& production = grammar.productions[source_production];
+  if (production.parent != old_parent || production.children.size() != 2 ||
+      moved == old_sibling ||
+      std::count(production.children.begin(), production.children.end(),
+                 moved) != 1 ||
+      std::count(production.children.begin(), production.children.end(),
+                 old_sibling) != 1) {
+    return sampled_tree_direct_metadata_status::fallback;
+  }
+
+  // These are semantic no-ops rejected by make_general_spr_candidate on the
+  // former direct path.  They remain handled direct results rather than
+  // prerequisite failures, preserving path/counter behavior.
+  if (target == moved || target == old_parent || target == old_sibling ||
+      !disjoint_taxa(grammar.clades[moved].taxa, grammar.clades[target].taxa)) {
+    return sampled_tree_direct_metadata_status::no_candidate;
+  }
+
+  result.moved_clade = base_clade_ref(moved);
+  result.old_parent = base_clade_ref(old_parent);
+  result.old_sibling = base_clade_ref(old_sibling);
+  result.new_sibling_or_target = base_clade_ref(target);
+  return sampled_tree_direct_metadata_status::ready;
+}
+
 struct sampled_tree_direct_projection_result {
   bool prerequisites_met = false;
   std::optional<grammar_spr_candidate> candidate;
@@ -3399,26 +3414,44 @@ inline bool project_sampled_tree_move_direct_into(
   auto const& node_to_production = prepared.node_to_base_production();
   if (!index.is_valid(move.src) || !index.is_valid(move.dst)) return false;
   auto const source_parent_node = index.get_parent(move.src);
-  if (move.src >= node_to_clade.size() || move.dst >= node_to_clade.size() ||
+  if (!index.is_valid(source_parent_node) ||
+      index.get_num_children(source_parent_node) != 2 ||
+      move.src >= node_to_clade.size() || move.dst >= node_to_clade.size() ||
+      source_parent_node >= node_to_clade.size() ||
       source_parent_node >= node_to_production.size()) {
     return false;
   }
-  auto const moved = node_to_clade[move.src];
-  auto const target = node_to_clade[move.dst];
-  auto const source_production = node_to_production[source_parent_node];
-  if (moved == no_clade || target == no_clade ||
-      source_production == no_production) {
+
+  auto const& source_children = index.get_children(source_parent_node);
+  auto source_occurrences = std::size_t{0};
+  auto sibling_node = (std::numeric_limits<std::size_t>::max)();
+  for (auto child : source_children) {
+    if (child == move.src) {
+      ++source_occurrences;
+    } else if (sibling_node == (std::numeric_limits<std::size_t>::max)()) {
+      sibling_node = child;
+    } else {
+      return false;
+    }
+  }
+  if (source_occurrences != 1 || !index.is_valid(sibling_node) ||
+      sibling_node >= node_to_clade.size()) {
     return false;
   }
-  auto source_path =
-      sampled_tree_selected_upward_path(prepared, source_parent_node);
-  auto destination_path = sampled_tree_selected_upward_path(prepared, move.dst);
-  if (!source_path || !destination_path) return false;
 
-  auto metadata = make_general_spr_candidate(grammar, prepared.base_lookup(),
-                                             source_production, moved, target,
-                                             *source_path, *destination_path);
-  if (!metadata) {
+  auto const moved = node_to_clade[move.src];
+  auto const old_parent = node_to_clade[source_parent_node];
+  auto const old_sibling = node_to_clade[sibling_node];
+  auto const target = node_to_clade[move.dst];
+  auto const source_production = node_to_production[source_parent_node];
+  sampled_tree_direct_move_metadata metadata;
+  auto const metadata_status = resolve_sampled_tree_binary_move_metadata(
+      grammar, source_production, moved, old_parent, old_sibling, target,
+      metadata);
+  if (metadata_status == sampled_tree_direct_metadata_status::fallback) {
+    return false;
+  }
+  if (metadata_status == sampled_tree_direct_metadata_status::no_candidate) {
     output.engaged = false;
     return true;
   }
@@ -3426,7 +3459,7 @@ inline bool project_sampled_tree_move_direct_into(
     return false;
   }
   (void)make_candidate_from_ordered_tree_keys_prepared_into(
-      prepared, move, *metadata, workspace, output);
+      prepared, move, metadata, workspace, output);
   return true;
 }
 
