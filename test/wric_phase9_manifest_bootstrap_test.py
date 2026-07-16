@@ -848,6 +848,53 @@ def tree_bytes(root: Path) -> dict[str, bytes]:
     }
 
 
+def final_publication_bytes(output: Path) -> dict[str, bytes]:
+    assets = output.with_name(output.stem + ".assets")
+    seal_path = output.with_name(output.name + ".sha256")
+    result = {
+        output.name: output.read_bytes(),
+        seal_path.name: seal_path.read_bytes(),
+    }
+    result.update(
+        {
+            f"{assets.name}/{relative}": data
+            for relative, data in tree_bytes(assets).items()
+        }
+    )
+    return result
+
+
+def inject_publication_crash(
+    output: Path, source: Path, crash_point: str
+) -> bootstrap.PublicationPaths:
+    """Fork a hard exit after one durable publication boundary."""
+
+    output.parent.mkdir(parents=True)
+    source_assets = source.with_name(source.stem + ".assets")
+    source_seal = source.with_name(source.name + ".sha256")
+    asset_files = tree_bytes(source_assets)
+    process = os.fork()
+    if process == 0:
+        try:
+            with bootstrap.exclusive_output_lock(output) as publication:
+                bootstrap.publish_immutable_supplement(
+                    publication,
+                    asset_files,
+                    source.read_bytes(),
+                    source_seal.read_bytes(),
+                    crash_hook=lambda point: (
+                        os._exit(86) if point == crash_point else None
+                    ),
+                )
+        except BaseException:
+            os._exit(87)
+        os._exit(88)
+    _, status = os.waitpid(process, 0)
+    assert os.WIFEXITED(status), status
+    assert os.WEXITSTATUS(status) == 86, (crash_point, status)
+    return bootstrap.publication_paths(output)
+
+
 def replace_file(path: Path, data: bytes, mode: int) -> None:
     path.chmod(0o644)
     path.write_bytes(data)
@@ -953,6 +1000,51 @@ def main() -> None:
         )
         result = case.run(fake_root_command, success=False)
         assert "builder's repository root" in result.stderr
+
+        locked_output = (
+            case.root / "concurrent-publication" / "phase9-local-commit.tsv"
+        )
+        locked_output.parent.mkdir()
+        with bootstrap.exclusive_output_lock(locked_output) as locked_publication:
+            result = case.run(case.build_command(locked_output), success=False)
+            assert "owned by another builder" in result.stderr
+            assert not any(
+                os.path.lexists(path)
+                for path in (
+                    locked_publication.output,
+                    locked_publication.assets,
+                    locked_publication.seal,
+                    locked_publication.journal,
+                    locked_publication.journal_staging,
+                    locked_publication.staging,
+                    locked_publication.validation,
+                )
+            )
+
+        collision_output = (
+            case.root / "capture-publication-collision" / "phase9-local-commit.tsv"
+        )
+        collision_output.parent.mkdir()
+        collision_publication = bootstrap.publication_paths(collision_output)
+        result = case.run(
+            case.build_command(
+                collision_output, capture=collision_publication.staging
+            ),
+            success=False,
+        )
+        assert "complete supplement publication namespace" in result.stderr
+        assert not any(
+            os.path.lexists(path)
+            for path in (
+                collision_publication.output,
+                collision_publication.assets,
+                collision_publication.seal,
+                collision_publication.journal,
+                collision_publication.journal_staging,
+                collision_publication.staging,
+                collision_publication.validation,
+            )
+        )
 
         with bootstrap.exclusive_capture_lock(case.root / "capture"):
             result = case.run(
@@ -1136,6 +1228,227 @@ def main() -> None:
             os.fspath(case.runner),
         ]
         case.run(audit_command, success=True)
+
+        immutable_output = final_publication_bytes(output_a)
+        result = case.run(case.build_command(output_a), success=False)
+        assert "exclusive Phase-9 output already exists" in result.stderr
+        assert final_publication_bytes(output_a) == immutable_output
+        case.run(audit_command, success=True)
+
+        foreign_output = (
+            case.root / "foreign-target-race" / "phase9-local-commit.tsv"
+        )
+        foreign_output.parent.mkdir()
+        foreign_bytes = b"foreign immutable publication\n"
+        source_assets = output_a.with_name(output_a.stem + ".assets")
+        source_seal = output_a.with_name(output_a.name + ".sha256")
+        ownership = bootstrap.PublicationOwnership()
+        with bootstrap.exclusive_output_lock(foreign_output) as publication:
+            def insert_foreign_target(point: str) -> None:
+                if point == "staging_validated":
+                    write_bytes(publication.output, foreign_bytes, 0o444)
+
+            try:
+                bootstrap.publish_immutable_supplement(
+                    publication,
+                    tree_bytes(source_assets),
+                    output_a.read_bytes(),
+                    source_seal.read_bytes(),
+                    crash_hook=insert_foreign_target,
+                    ownership=ownership,
+                    prepublish_validator=lambda _path: None,
+                )
+            except bootstrap.BootstrapError as error:
+                assert "target already exists" in str(error)
+            else:
+                raise AssertionError("foreign publication target was replaced")
+            bootstrap.rollback_owned_publication(publication, ownership)
+        assert foreign_output.read_bytes() == foreign_bytes
+        assert tree_bytes(
+            foreign_output.with_name(foreign_output.stem + ".assets")
+        ) == tree_bytes(source_assets)
+        assert not foreign_output.with_name(foreign_output.name + ".sha256").exists()
+        result = case.run(case.build_command(foreign_output), success=False)
+        assert "duplicate staged/final components" in result.stderr
+        assert foreign_output.read_bytes() == foreign_bytes
+
+        checkpoint_output = (
+            case.root / "post-rename-checkpoint" / "phase9-local-commit.tsv"
+        )
+        checkpoint_output.parent.mkdir()
+        checkpoint_ownership = bootstrap.PublicationOwnership()
+        with bootstrap.exclusive_output_lock(checkpoint_output) as publication:
+            def interrupt_before_record(point: str) -> None:
+                if point == "assets_renamed":
+                    raise bootstrap.BootstrapError("injected post-rename interrupt")
+
+            try:
+                bootstrap.publish_immutable_supplement(
+                    publication,
+                    tree_bytes(source_assets),
+                    output_a.read_bytes(),
+                    source_seal.read_bytes(),
+                    crash_hook=interrupt_before_record,
+                    ownership=checkpoint_ownership,
+                    prepublish_validator=lambda _path: None,
+                )
+            except bootstrap.BootstrapError as error:
+                assert "injected post-rename interrupt" in str(error)
+            else:
+                raise AssertionError("post-rename interrupt was not injected")
+            assert "assets" not in checkpoint_ownership.components
+            bootstrap.rollback_owned_publication(
+                publication, checkpoint_ownership
+            )
+            assert os.path.lexists(publication.journal)
+            assert os.path.lexists(publication.staging)
+            assert os.path.lexists(publication.assets)
+        case.run(case.build_command(checkpoint_output), success=True)
+        assert final_publication_bytes(checkpoint_output) == immutable_output
+        checkpoint_publication = bootstrap.publication_paths(checkpoint_output)
+        assert not os.path.lexists(checkpoint_publication.journal)
+        assert not os.path.lexists(checkpoint_publication.staging)
+
+        journal_payload_assets = {"owned.txt": b"journal payload\n"}
+        journal_payload_manifest = b"foreign partial manifest\n"
+        journal_payload_seal = bootstrap.seal_bytes(
+            "phase9-local-commit.tsv", journal_payload_manifest
+        )
+        for journal_kind in ("symlink", "hardlink"):
+            journal_output = (
+                case.root
+                / f"{journal_kind}-publication-journal"
+                / "phase9-local-commit.tsv"
+            )
+            journal_output.parent.mkdir()
+            publication = bootstrap.publication_paths(journal_output)
+            write_bytes(journal_output, journal_payload_manifest, 0o444)
+            backing = journal_output.parent / "foreign-journal.json"
+            journal_data = bootstrap.publication_journal_bytes(
+                publication,
+                journal_payload_assets,
+                journal_payload_manifest,
+                journal_payload_seal,
+            )
+            write_bytes(backing, journal_data, 0o444)
+            if journal_kind == "symlink":
+                publication.journal.symlink_to(backing.name)
+            else:
+                os.link(backing, publication.journal)
+            try:
+                bootstrap.recover_interrupted_publication(
+                    publication, prepublish_validator=lambda _path: None
+                )
+            except bootstrap.BootstrapError as error:
+                expected = "regular file" if journal_kind == "symlink" else "hard-linked"
+                assert expected in str(error)
+            else:
+                raise AssertionError(f"{journal_kind} journal was trusted")
+            assert journal_output.read_bytes() == journal_payload_manifest
+            assert backing.read_bytes() == journal_data
+            assert os.path.lexists(publication.journal)
+
+        forged_output = (
+            case.root / "forged-publication-journal" / "phase9-local-commit.tsv"
+        )
+        forged_output.parent.mkdir()
+        forged_publication = bootstrap.publication_paths(forged_output)
+        forged_manifest = b"hash-consistent but unauditable manifest\n"
+        forged_seal = bootstrap.seal_bytes(forged_output.name, forged_manifest)
+        forged_assets = {"owned.txt": b"foreign asset\n"}
+        forged_publication.assets.mkdir()
+        write_bytes(
+            forged_publication.assets / "owned.txt", forged_assets["owned.txt"], 0o444
+        )
+        write_bytes(forged_output, forged_manifest, 0o444)
+        write_bytes(forged_publication.seal, forged_seal, 0o444)
+        forged_journal = bootstrap.publication_journal_bytes(
+            forged_publication, forged_assets, forged_manifest, forged_seal
+        )
+        write_bytes(forged_publication.journal, forged_journal, 0o444)
+        forged_before = final_publication_bytes(forged_output)
+        result = case.run(case.build_command(forged_output), success=False)
+        assert "TSV has no complete preamble/header/rows" in result.stderr
+        assert final_publication_bytes(forged_output) == forged_before
+        assert forged_publication.journal.read_bytes() == forged_journal
+
+        forged_partial_output = (
+            case.root
+            / "forged-partial-publication"
+            / "phase9-local-commit.tsv"
+        )
+        forged_partial_output.parent.mkdir()
+        forged_partial = bootstrap.publication_paths(forged_partial_output)
+        shutil.copytree(source_assets, forged_partial.assets)
+        forged_partial.staging.mkdir()
+        forged_partial_paths = bootstrap.staged_publication_paths(forged_partial)
+        forged_partial_manifest = b"invalid staged manifest\n"
+        forged_partial_seal = bootstrap.seal_bytes(
+            forged_partial_output.name, forged_partial_manifest
+        )
+        write_bytes(
+            forged_partial_paths["manifest"], forged_partial_manifest, 0o444
+        )
+        write_bytes(forged_partial_paths["seal"], forged_partial_seal, 0o444)
+        forged_partial_assets = tree_bytes(forged_partial.assets)
+        forged_partial_journal = bootstrap.publication_journal_bytes(
+            forged_partial,
+            forged_partial_assets,
+            forged_partial_manifest,
+            forged_partial_seal,
+        )
+        write_bytes(forged_partial.journal, forged_partial_journal, 0o444)
+        result = case.run(case.build_command(forged_partial_output), success=False)
+        assert "TSV has no complete preamble/header/rows" in result.stderr
+        assert not os.path.lexists(forged_partial.output)
+        assert not os.path.lexists(forged_partial.seal)
+        assert tree_bytes(forged_partial.assets) == forged_partial_assets
+        assert forged_partial_paths["manifest"].read_bytes() == forged_partial_manifest
+        assert forged_partial_paths["seal"].read_bytes() == forged_partial_seal
+        assert forged_partial.journal.read_bytes() == forged_partial_journal
+        assert not os.path.lexists(forged_partial.validation)
+
+
+        for crash_point in (
+            "journal_renamed",
+            "journal_published",
+            "staging_durable",
+            "staging_validated",
+            "assets_renamed",
+            "assets_published",
+            "manifest_published",
+            "seal_published",
+        ):
+            crash_output = (
+                case.root
+                / f"publication-crash-{crash_point}"
+                / output_a.name
+            )
+            publication = inject_publication_crash(
+                crash_output, output_a, crash_point
+            )
+            if crash_point == "seal_published":
+                before_restart = final_publication_bytes(crash_output)
+                case.run(case.build_command(crash_output), success=True)
+                assert final_publication_bytes(crash_output) == before_restart
+            else:
+                case.run(case.build_command(crash_output), success=True)
+            assert final_publication_bytes(crash_output) == immutable_output
+            assert not os.path.lexists(publication.journal)
+            assert not os.path.lexists(publication.journal_staging)
+            assert not os.path.lexists(publication.staging)
+            assert {path.name for path in crash_output.parent.iterdir()} == {
+                publication.output.name,
+                publication.assets.name,
+                publication.seal.name,
+                publication.lock.name,
+            }
+            crash_audit = list(audit_command)
+            crash_audit[crash_audit.index(os.fspath(output_a))] = os.fspath(
+                crash_output
+            )
+            case.run(crash_audit, success=True)
+
         relocated_runner = case.root / "explicit-process-metrics"
         shutil.copy2(case.runner, relocated_runner)
         relocated_audit = list(audit_command)

@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import ctypes
 import csv
 import dataclasses
+import errno
 import hashlib
 import fcntl
 import json
@@ -34,7 +36,7 @@ import shutil
 import stat
 import subprocess
 import sys
-from typing import Iterable, Iterator, Mapping, NoReturn, Sequence
+from typing import Callable, Iterable, Iterator, Mapping, NoReturn, Sequence
 
 sys.dont_write_bytecode = True
 
@@ -193,6 +195,29 @@ class AuditedFrozenCharacterization:
     input_evidence: InputEvidence
     evidence: Mapping[tuple[int, int], Evidence]
     process_metrics_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class PublicationPaths:
+    """Canonical sibling paths covered by one immutable-output transaction."""
+
+    output: Path
+    assets: Path
+    seal: Path
+    lock: Path
+    journal: Path
+    journal_staging: Path
+    staging: Path
+    validation: Path
+
+
+@dataclasses.dataclass
+class PublicationOwnership:
+    """Live-process checkpoints; disk state remains authoritative after a crash."""
+
+    journal: tuple[int, int] | None = None
+    staging: tuple[int, int] | None = None
+    components: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
 
 
 def fail(message: str) -> NoReturn:
@@ -1365,6 +1390,33 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def durable_mkdir_parents(path: Path, label: str) -> Path:
+    """Create a canonical directory chain and persist every new parent entry."""
+
+    absolute = path.absolute()
+    missing: list[Path] = []
+    current = absolute
+    while not os.path.lexists(current):
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            fail(f"{label} has no existing directory ancestor: {path}")
+        current = parent
+    require_lexical_directory(current, f"existing ancestor of {label}")
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o755)
+        except FileExistsError:
+            # A racing creator is acceptable only when it produced the exact
+            # canonical directory that this publication intended to create.
+            require_lexical_directory(directory, label)
+        else:
+            require_lexical_directory(directory, label)
+        fsync_directory(directory)
+        fsync_directory(directory.parent)
+    return require_lexical_directory(absolute, label)
+
+
 def fsync_regular_file(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
@@ -1399,6 +1451,772 @@ def ensure_exact_file(path: Path, data: bytes, label: str, mode: int = 0o444) ->
     copy_bytes(staging, data, mode)
     os.replace(staging, path)
     fsync_directory(path.parent)
+
+
+PUBLICATION_SCHEMA = "wric_phase9_supplement_publication"
+PUBLICATION_SCHEMA_VERSION = 1
+PUBLICATION_COMPONENTS = ("assets", "manifest", "seal")
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+
+
+def rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish one path and fail if the destination exists."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError:
+        fail("libc does not provide renameat2 required for immutable publication")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        AT_FDCWD,
+        os.fsencode(source),
+        AT_FDCWD,
+        os.fsencode(destination),
+        RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+        fail(f"immutable Phase-9 publication target already exists: {destination}")
+    raise OSError(
+        error_number,
+        f"renameat2(RENAME_NOREPLACE) failed: {source} -> {destination}",
+    )
+
+
+def publication_paths(output: Path) -> PublicationPaths:
+    """Derive the one canonical lock/journal namespace for an output closure."""
+
+    output = output.absolute()
+    parent = require_lexical_directory(
+        output.parent, "Phase-9 output parent directory"
+    )
+    output = parent / output.name
+    if output.suffix != ".tsv" or SAFE_ID.fullmatch(output.name) is None:
+        fail("Phase-9 supplement output must have one canonical *.tsv basename")
+    assets = output.with_name(output.stem + ".assets")
+    seal = output.with_name(output.name + ".sha256")
+    if len({output, assets, seal}) != 3:
+        fail("Phase-9 output, asset directory, and seal paths must be distinct")
+    scope = assets.name
+    result = PublicationPaths(
+        output=output,
+        assets=assets,
+        seal=seal,
+        lock=parent / f".{scope}.publication.lock",
+        journal=parent / f".{scope}.publication.json",
+        journal_staging=parent / f".{scope}.publication.json.staging",
+        staging=parent / f".{scope}.publication.staging",
+        validation=parent / f".{scope}.publication.staging" / ".validation",
+    )
+    if len(set(dataclasses.astuple(result))) != len(dataclasses.astuple(result)):
+        fail("Phase-9 publication control paths are not distinct")
+    return result
+
+
+@contextmanager
+def exclusive_output_lock(output: Path) -> Iterator[PublicationPaths]:
+    """Serialize one immutable supplement closure through audit and rollback."""
+
+    publication = publication_paths(output)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(publication.lock, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 0:
+            fail(
+                "Phase-9 output publication lock is not one empty owned regular "
+                f"file: {publication.lock}"
+            )
+        os.fsync(descriptor)
+        fsync_directory(publication.lock.parent)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fail(
+                "Phase-9 output closure is owned by another builder: "
+                f"{publication.output}"
+            )
+        yield publication
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def fsync_directory_tree(root: Path) -> None:
+    """Persist every directory entry in a prepared tree, deepest first."""
+
+    directories = [Path(directory) for directory, _, _ in os.walk(root)]
+    for directory in sorted(
+        directories, key=lambda item: len(item.relative_to(root).parts), reverse=True
+    ):
+        fsync_directory(directory)
+
+
+def publication_journal_bytes(
+    publication: PublicationPaths,
+    asset_files: Mapping[str, bytes],
+    manifest_data: bytes,
+    seal_data: bytes,
+) -> bytes:
+    value = {
+        "schema": PUBLICATION_SCHEMA,
+        "schema_version": PUBLICATION_SCHEMA_VERSION,
+        "output_name": publication.output.name,
+        "assets_name": publication.assets.name,
+        "seal_name": publication.seal.name,
+        "manifest_sha256": sha256_bytes(manifest_data),
+        "seal_sha256": sha256_bytes(seal_data),
+        "assets_sha256": {
+            relative: sha256_bytes(data)
+            for relative, data in sorted(asset_files.items())
+        },
+    }
+    return (json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+
+
+def read_publication_journal(
+    publication: PublicationPaths,
+) -> tuple[dict[str, str], str, str]:
+    require_regular(
+        publication.journal, "Phase-9 supplement publication journal"
+    )
+    if publication.journal.stat().st_nlink != 1:
+        fail(
+            "Phase-9 supplement publication journal is externally hard-linked: "
+            f"{publication.journal}"
+        )
+    value = read_json_object(
+        publication.journal, "Phase-9 supplement publication journal"
+    )
+    expected_keys = {
+        "schema",
+        "schema_version",
+        "output_name",
+        "assets_name",
+        "seal_name",
+        "manifest_sha256",
+        "seal_sha256",
+        "assets_sha256",
+    }
+    if set(value) != expected_keys:
+        fail("Phase-9 supplement publication journal schema keys changed")
+    exact: Mapping[str, object] = {
+        "schema": PUBLICATION_SCHEMA,
+        "schema_version": PUBLICATION_SCHEMA_VERSION,
+        "output_name": publication.output.name,
+        "assets_name": publication.assets.name,
+        "seal_name": publication.seal.name,
+    }
+    for key, wanted in exact.items():
+        if value[key] != wanted:
+            fail(
+                f"Phase-9 supplement publication journal {key}="
+                f"{value[key]!r}, expected {wanted!r}"
+            )
+    manifest_sha = value["manifest_sha256"]
+    seal_sha = value["seal_sha256"]
+    if not isinstance(manifest_sha, str) or not isinstance(seal_sha, str):
+        fail("Phase-9 supplement publication journal file hashes are not strings")
+    validate_hash(manifest_sha, "publication manifest hash")
+    validate_hash(seal_sha, "publication seal hash")
+    raw_assets = value["assets_sha256"]
+    if not isinstance(raw_assets, dict) or not raw_assets:
+        fail("Phase-9 supplement publication journal asset map is not an object")
+    assets: dict[str, str] = {}
+    for relative, digest in raw_assets.items():
+        if not isinstance(relative, str) or LEDGER_RELATIVE.fullmatch(relative) is None:
+            fail(f"publication journal has a non-canonical asset path: {relative!r}")
+        if not isinstance(digest, str):
+            fail(f"publication journal asset hash is not a string: {relative}")
+        validate_hash(digest, f"publication journal asset {relative}")
+        assets[relative] = digest
+    return assets, manifest_sha, seal_sha
+
+
+def expected_asset_directories(asset_paths: Iterable[str]) -> set[str]:
+    result: set[str] = set()
+    for relative in asset_paths:
+        parent = Path(relative).parent
+        while parent != Path("."):
+            result.add(parent.as_posix())
+            parent = parent.parent
+    return result
+
+
+def validate_publication_asset_tree(
+    root: Path,
+    expected: Mapping[str, str],
+    label: str,
+    *,
+    complete: bool,
+    verify_hashes: bool,
+) -> None:
+    root = require_lexical_directory(root, label)
+    observed_files: set[str] = set()
+    observed_directories: set[str] = set()
+    for directory_text, directory_names, file_names in os.walk(
+        root, followlinks=False
+    ):
+        directory = Path(directory_text)
+        for name in directory_names:
+            child = directory / name
+            info = child.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                fail(f"{label} contains a non-directory alias: {child}")
+            observed_directories.add(child.relative_to(root).as_posix())
+        for name in file_names:
+            child = directory / name
+            info = child.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+            ):
+                fail(f"{label} contains a non-owned regular file: {child}")
+            relative = child.relative_to(root).as_posix()
+            if relative not in expected:
+                fail(f"{label} contains an unexpected file: {relative}")
+            if verify_hashes and sha256_file(child) != expected[relative]:
+                fail(f"{label} file hash changed: {relative}")
+            observed_files.add(relative)
+    expected_directories = expected_asset_directories(expected)
+    if not observed_files <= set(expected) or not observed_directories <= expected_directories:
+        fail(f"{label} is outside its journal-owned asset closure")
+    if complete and (
+        observed_files != set(expected)
+        or observed_directories != expected_directories
+    ):
+        fail(f"{label} is not the complete journal-owned asset closure")
+
+
+def validate_publication_regular(
+    path: Path, digest: str, label: str, *, verify_hash: bool
+) -> None:
+    require_regular(path, label)
+    info = path.stat()
+    if info.st_nlink != 1:
+        fail(f"{label} is externally hard-linked: {path}")
+    if verify_hash and sha256_file(path) != digest:
+        fail(f"{label} hash changed: {path}")
+
+
+def publication_path_identity(path: Path) -> tuple[int, int]:
+    info = path.lstat()
+    return info.st_dev, info.st_ino
+
+
+def require_publication_identity(
+    path: Path, expected: tuple[int, int], label: str
+) -> None:
+    try:
+        observed = publication_path_identity(path)
+    except FileNotFoundError:
+        fail(f"{label} disappeared before owned cleanup: {path}")
+    if observed != expected:
+        fail(f"{label} was replaced before owned cleanup: {path}")
+
+
+def validate_publication_staging(
+    publication: PublicationPaths,
+    asset_hashes: Mapping[str, str],
+    manifest_sha: str,
+    seal_sha: str,
+    *,
+    complete: bool,
+) -> set[str]:
+    staging = require_lexical_directory(
+        publication.staging, "Phase-9 publication staging directory"
+    )
+    staged_paths = staged_publication_paths(publication)
+    names_to_components = {
+        path.name: component for component, path in staged_paths.items()
+    }
+    observed_names = {path.name for path in staging.iterdir()}
+    if not observed_names <= set(names_to_components):
+        fail(
+            "Phase-9 publication staging directory has unexpected members: "
+            f"{sorted(observed_names - set(names_to_components))}"
+        )
+    observed = {names_to_components[name] for name in observed_names}
+    if complete and observed != set(PUBLICATION_COMPONENTS):
+        fail("Phase-9 publication staging directory is incomplete")
+    if "assets" in observed:
+        validate_publication_asset_tree(
+            staged_paths["assets"],
+            asset_hashes,
+            "staged Phase-9 assets",
+            complete=complete,
+            verify_hashes=complete,
+        )
+    for name, digest in (("manifest", manifest_sha), ("seal", seal_sha)):
+        if name in observed:
+            validate_publication_regular(
+                staged_paths[name],
+                digest,
+                f"staged Phase-9 {name}",
+                verify_hash=complete,
+            )
+    return observed
+
+
+def validate_final_publication_component(
+    publication: PublicationPaths,
+    component: str,
+    asset_hashes: Mapping[str, str],
+    manifest_sha: str,
+    seal_sha: str,
+) -> None:
+    if component == "assets":
+        validate_publication_asset_tree(
+            publication.assets,
+            asset_hashes,
+            "published Phase-9 assets",
+            complete=True,
+            verify_hashes=True,
+        )
+        return
+    path, digest = (
+        (publication.output, manifest_sha)
+        if component == "manifest"
+        else (publication.seal, seal_sha)
+    )
+    validate_publication_regular(
+        path, digest, f"published Phase-9 {component}", verify_hash=True
+    )
+
+
+def validate_staged_publication_component(
+    publication: PublicationPaths,
+    component: str,
+    asset_hashes: Mapping[str, str],
+    manifest_sha: str,
+    seal_sha: str,
+) -> None:
+    path = staged_publication_paths(publication)[component]
+    if component == "assets":
+        validate_publication_asset_tree(
+            path,
+            asset_hashes,
+            "staged Phase-9 assets",
+            complete=True,
+            verify_hashes=True,
+        )
+        return
+    digest = manifest_sha if component == "manifest" else seal_sha
+    validate_publication_regular(
+        path, digest, f"staged Phase-9 {component}", verify_hash=True
+    )
+
+
+def staged_publication_paths(
+    publication: PublicationPaths,
+) -> dict[str, Path]:
+    """Use final basenames privately so the complete audit runs before publish."""
+
+    return {
+        "assets": publication.staging / publication.assets.name,
+        "manifest": publication.staging / publication.output.name,
+        "seal": publication.staging / publication.seal.name,
+    }
+
+
+def remove_interrupted_publication_validation(
+    publication: PublicationPaths,
+) -> None:
+    """Discard only the private, deterministic recovery-validation view."""
+
+    if not os.path.lexists(publication.validation):
+        return
+    require_lexical_directory(
+        publication.staging, "Phase-9 publication staging directory"
+    )
+    validation = require_lexical_directory(
+        publication.validation, "Phase-9 private recovery-validation directory"
+    )
+    identity = publication_path_identity(validation)
+    require_publication_identity(
+        validation,
+        identity,
+        "Phase-9 private recovery-validation directory",
+    )
+    shutil.rmtree(validation)
+    fsync_directory(publication.staging)
+
+
+def validate_reconstructed_publication(
+    publication: PublicationPaths,
+    published: set[str],
+    validator: Callable[[Path], None],
+) -> None:
+    """Audit a final-named private copy of a split staged/final transaction."""
+
+    if os.path.lexists(publication.validation):
+        fail("Phase-9 private recovery-validation directory already exists")
+    publication.validation.mkdir(mode=0o755)
+    validation_identity = publication_path_identity(publication.validation)
+    fsync_directory(publication.staging)
+    staged_paths = staged_publication_paths(publication)
+    final_paths = {
+        "assets": publication.assets,
+        "manifest": publication.output,
+        "seal": publication.seal,
+    }
+    private_paths = {
+        "assets": publication.validation / publication.assets.name,
+        "manifest": publication.validation / publication.output.name,
+        "seal": publication.validation / publication.seal.name,
+    }
+    try:
+        for component in PUBLICATION_COMPONENTS:
+            source = (
+                final_paths[component]
+                if component in published
+                else staged_paths[component]
+            )
+            destination = private_paths[component]
+            if component == "assets":
+                shutil.copytree(source, destination, copy_function=shutil.copy2)
+            else:
+                shutil.copy2(source, destination)
+        validator(private_paths["manifest"])
+    finally:
+        require_publication_identity(
+            publication.validation,
+            validation_identity,
+            "Phase-9 private recovery-validation directory",
+        )
+        shutil.rmtree(publication.validation)
+        fsync_directory(publication.staging)
+
+
+def rollback_owned_publication(
+    publication: PublicationPaths, ownership: PublicationOwnership
+) -> None:
+    """Clean only unpublished paths whose live-process identities still match.
+
+    Once any final component exists, the journal and staging tree are retained
+    for deterministic restart roll-forward.  In particular, rollback never
+    unlinks a final pathname that a non-cooperating writer could have replaced.
+    """
+
+    if ownership.journal is None:
+        # The journal rename may have completed immediately before an injected
+        # exception.  Retaining all paths lets restart inspect disk truth.
+        return
+    require_publication_identity(
+        publication.journal,
+        ownership.journal,
+        "owned Phase-9 publication journal",
+    )
+    journal_identity = publication_path_identity(publication.journal)
+    asset_hashes, manifest_sha, seal_sha = read_publication_journal(publication)
+    require_publication_identity(
+        publication.journal,
+        journal_identity,
+        "Phase-9 publication journal",
+    )
+    if any(
+        os.path.lexists(path)
+        for path in (publication.output, publication.assets, publication.seal)
+    ):
+        return
+    if os.path.lexists(publication.journal_staging):
+        fail("unexpected journal staging path appeared during owned rollback")
+    if os.path.lexists(publication.staging):
+        if ownership.staging is None:
+            # As with a component rename, interruption can occur between the
+            # mkdir and its in-memory ownership checkpoint.
+            return
+        require_publication_identity(
+            publication.staging,
+            ownership.staging,
+            "owned Phase-9 publication staging directory",
+        )
+        validate_publication_staging(
+            publication,
+            asset_hashes,
+            manifest_sha,
+            seal_sha,
+            complete=False,
+        )
+        shutil.rmtree(publication.staging)
+        fsync_directory(publication.staging.parent)
+    require_publication_identity(
+        publication.journal,
+        ownership.journal,
+        "owned Phase-9 publication journal",
+    )
+    publication.journal.unlink()
+    fsync_directory(publication.journal.parent)
+
+
+def recover_interrupted_publication(
+    publication: PublicationPaths,
+    *,
+    prepublish_validator: Callable[[Path], None],
+) -> bool:
+    """Roll a durable journal/staging partition forward, or discard preparation.
+
+    A complete return still retains the journal until the caller re-runs the
+    supplement audit and production-harness validation.  No self-declared
+    complete triplet is ever treated as committed merely by recovery.
+    """
+
+    if os.path.lexists(publication.journal_staging):
+        journal_staging_identity = publication_path_identity(
+            publication.journal_staging
+        )
+        validate_publication_regular(
+            publication.journal_staging,
+            "0" * 64,
+            "interrupted Phase-9 publication journal staging file",
+            verify_hash=False,
+        )
+        if os.path.lexists(publication.journal):
+            fail("journal staging path exists beside a durable Phase-9 journal")
+        if os.path.lexists(publication.staging) or any(
+            os.path.lexists(path)
+            for path in (publication.output, publication.assets, publication.seal)
+        ):
+            fail("ambiguous Phase-9 publication exists beside an incomplete journal")
+        require_publication_identity(
+            publication.journal_staging,
+            journal_staging_identity,
+            "interrupted Phase-9 publication journal staging file",
+        )
+        publication.journal_staging.unlink()
+        fsync_directory(publication.journal_staging.parent)
+    if not os.path.lexists(publication.journal):
+        if os.path.lexists(publication.staging):
+            fail("unowned Phase-9 publication staging directory exists")
+        return False
+
+    journal_identity = publication_path_identity(publication.journal)
+    asset_hashes, manifest_sha, seal_sha = read_publication_journal(publication)
+    require_publication_identity(
+        publication.journal,
+        journal_identity,
+        "Phase-9 publication journal",
+    )
+    remove_interrupted_publication_validation(publication)
+    staged: set[str] = set()
+    if os.path.lexists(publication.staging):
+        staged = validate_publication_staging(
+            publication,
+            asset_hashes,
+            manifest_sha,
+            seal_sha,
+            complete=False,
+        )
+    final_paths = {
+        "assets": publication.assets,
+        "manifest": publication.output,
+        "seal": publication.seal,
+    }
+    published = {
+        component for component, path in final_paths.items() if os.path.lexists(path)
+    }
+    overlap = staged & published
+    if overlap:
+        fail(
+            "Phase-9 publication has duplicate staged/final components: "
+            f"{sorted(overlap)}"
+        )
+    allowed_prefixes: tuple[set[str], ...] = (
+        set(),
+        {"assets"},
+        {"assets", "manifest"},
+        set(PUBLICATION_COMPONENTS),
+    )
+    if published not in allowed_prefixes:
+        fail(
+            "Phase-9 publication final components violate seal-last order: "
+            f"{sorted(published)}"
+        )
+    for component in published:
+        validate_final_publication_component(
+            publication, component, asset_hashes, manifest_sha, seal_sha
+        )
+    complete = published == set(PUBLICATION_COMPONENTS)
+    if complete:
+        if staged:
+            fail("complete Phase-9 publication retains staged components")
+        return True
+
+    # Before the first final rename, an incomplete staging tree is only a
+    # preparation crash.  It owns no immutable output and can be discarded.
+    if not published and staged != set(PUBLICATION_COMPONENTS):
+        if os.path.lexists(publication.staging):
+            shutil.rmtree(publication.staging)
+            fsync_directory(publication.staging.parent)
+        require_publication_identity(
+            publication.journal,
+            journal_identity,
+            "Phase-9 publication journal",
+        )
+        publication.journal.unlink()
+        fsync_directory(publication.journal.parent)
+        return False
+
+    if published | staged != set(PUBLICATION_COMPONENTS):
+        fail("Phase-9 publication cannot reconstruct its exact component partition")
+    for component in staged:
+        validate_staged_publication_component(
+            publication, component, asset_hashes, manifest_sha, seal_sha
+        )
+    if published:
+        validate_reconstructed_publication(
+            publication, published, prepublish_validator
+        )
+    else:
+        prepublish_validator(staged_publication_paths(publication)["manifest"])
+    # The validator consumed private copies for a split transaction.  Recheck
+    # every source immediately before the no-replace publication renames.
+    for component in published:
+        validate_final_publication_component(
+            publication, component, asset_hashes, manifest_sha, seal_sha
+        )
+    for component in staged:
+        validate_staged_publication_component(
+            publication, component, asset_hashes, manifest_sha, seal_sha
+        )
+    destinations = {
+        "assets": publication.assets,
+        "manifest": publication.output,
+        "seal": publication.seal,
+    }
+    for component in PUBLICATION_COMPONENTS:
+        if component not in staged:
+            continue
+        rename_noreplace(
+            staged_publication_paths(publication)[component],
+            destinations[component],
+        )
+        fsync_directory(publication.staging)
+        fsync_directory(destinations[component].parent)
+    return True
+
+
+def publish_immutable_supplement(
+    publication: PublicationPaths,
+    asset_files: Mapping[str, bytes],
+    manifest_data: bytes,
+    seal_data: bytes,
+    *,
+    crash_hook: Callable[[str], None] | None = None,
+    ownership: PublicationOwnership | None = None,
+    prepublish_validator: Callable[[Path], None] | None = None,
+) -> None:
+    """Durably publish assets, manifest, then completion seal without replace."""
+
+    hook = crash_hook or (lambda _point: None)
+    journal_data = publication_journal_bytes(
+        publication, asset_files, manifest_data, seal_data
+    )
+    copy_bytes(publication.journal_staging, journal_data, 0o444)
+    journal_identity = publication_path_identity(publication.journal_staging)
+    rename_noreplace(publication.journal_staging, publication.journal)
+    hook("journal_renamed")
+    if ownership is not None:
+        ownership.journal = journal_identity
+    fsync_directory(publication.journal.parent)
+    hook("journal_published")
+
+    publication.staging.mkdir(mode=0o755)
+    staging_identity = publication_path_identity(publication.staging)
+    if ownership is not None:
+        ownership.staging = staging_identity
+    fsync_directory(publication.staging.parent)
+    staged_paths = staged_publication_paths(publication)
+    staged_assets = staged_paths["assets"]
+    staged_assets.mkdir(mode=0o755)
+    for relative, data in sorted(asset_files.items()):
+        destination = staged_assets / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        copy_bytes(
+            destination, data, 0o555 if relative == "commands.sh" else 0o444
+        )
+    copy_bytes(staged_paths["manifest"], manifest_data, 0o444)
+    copy_bytes(staged_paths["seal"], seal_data, 0o444)
+    fsync_directory_tree(publication.staging)
+    asset_hashes, manifest_sha, seal_sha = read_publication_journal(publication)
+    validate_publication_staging(
+        publication,
+        asset_hashes,
+        manifest_sha,
+        seal_sha,
+        complete=True,
+    )
+    hook("staging_durable")
+    if prepublish_validator is not None:
+        prepublish_validator(staged_paths["manifest"])
+    hook("staging_validated")
+
+    for component, destination in (
+        ("assets", publication.assets),
+        ("manifest", publication.output),
+        ("seal", publication.seal),
+    ):
+        component_identity = publication_path_identity(staged_paths[component])
+        rename_noreplace(staged_paths[component], destination)
+        hook(component + "_renamed")
+        if ownership is not None:
+            ownership.components[component] = component_identity
+        fsync_directory(publication.staging)
+        fsync_directory(destination.parent)
+        hook(component + "_published")
+
+
+def finish_publication(publication: PublicationPaths) -> None:
+    """Forget the transaction only after the published closure passed audit."""
+
+    journal_identity = publication_path_identity(publication.journal)
+    asset_hashes, manifest_sha, seal_sha = read_publication_journal(publication)
+    require_publication_identity(
+        publication.journal,
+        journal_identity,
+        "audited Phase-9 publication journal",
+    )
+    if os.path.lexists(publication.staging):
+        observed = validate_publication_staging(
+            publication,
+            asset_hashes,
+            manifest_sha,
+            seal_sha,
+            complete=False,
+        )
+        if observed:
+            fail("audited Phase-9 publication retains staged components")
+        publication.staging.rmdir()
+        fsync_directory(publication.staging.parent)
+    for component in PUBLICATION_COMPONENTS:
+        validate_final_publication_component(
+            publication, component, asset_hashes, manifest_sha, seal_sha
+        )
+    require_publication_identity(
+        publication.journal,
+        journal_identity,
+        "audited Phase-9 publication journal",
+    )
+    publication.journal.unlink()
+    fsync_directory(publication.journal.parent)
 
 
 def seal_bytes(name: str, data: bytes) -> bytes:
@@ -3231,18 +4049,61 @@ def validate_with_benchmark_harness(
 
 
 def build(args: argparse.Namespace) -> None:
-    root = repo_root(args.repo_root)
+    """Build while one canonical output lock owns recovery through rollback."""
+
     output = args.output.absolute()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output_parent = require_lexical_directory(
+    output_parent = durable_mkdir_parents(
         output.parent, "Phase-9 output parent directory"
     )
     output = output_parent / output.name
-    assets = output.with_name(output.stem + ".assets")
-    seal = output.with_name(output.name + ".sha256")
-    for path in (output, assets, seal):
-        if os.path.lexists(path):
-            fail(f"exclusive Phase-9 output already exists: {path}")
+    with exclusive_output_lock(output) as publication:
+        root = repo_root(args.repo_root)
+        validate_hash(args.expected_parent_sha256, "expected parent SHA-256")
+
+        def validate_private_bundle(staged_output: Path) -> None:
+            audited = audit_supplement(
+                args.base_manifest,
+                args.expected_parent_sha256,
+                staged_output,
+                root,
+            )
+            validate_with_benchmark_harness(
+                audited, args.benchmark_harness, args.process_metrics, root
+            )
+
+        recovered_complete = recover_interrupted_publication(
+            publication, prepublish_validator=validate_private_bundle
+        )
+        if recovered_complete:
+            audited = audit_supplement(
+                args.base_manifest,
+                args.expected_parent_sha256,
+                publication.output,
+                root,
+            )
+            validate_with_benchmark_harness(
+                audited, args.benchmark_harness, args.process_metrics, root
+            )
+            finish_publication(publication)
+            return
+        existing = [
+            path
+            for path in (publication.output, publication.assets, publication.seal)
+            if os.path.lexists(path)
+        ]
+        if existing:
+            rendered = existing[0]
+            fail(f"exclusive Phase-9 output already exists: {rendered}")
+        _build_with_output_lock(args, publication)
+
+
+def _build_with_output_lock(
+    args: argparse.Namespace, publication: PublicationPaths
+) -> None:
+    root = repo_root(args.repo_root)
+    output = publication.output
+    assets = publication.assets
+    seal = publication.seal
     validate_hash(args.expected_parent_sha256, "expected parent SHA-256")
     validate_hash(args.expected_fixture_sha256, "expected fixture SHA-256")
     base = read_manifest(args.base_manifest, root, expected_kind="base")
@@ -3290,13 +4151,16 @@ def build(args: argparse.Namespace) -> None:
     require_regular(frozen_oracle, "base frozen oracle", executable=True)
 
     capture_absolute = args.capture_dir.absolute()
-    for reserved in (output, assets, seal):
+    for reserved in dataclasses.astuple(publication):
         if (
             capture_absolute == reserved
             or capture_absolute.is_relative_to(reserved)
             or reserved.is_relative_to(capture_absolute)
         ):
-            fail("--capture-dir must be disjoint from supplement output/assets/seal")
+            fail(
+                "--capture-dir must be disjoint from the complete supplement "
+                "publication namespace"
+            )
     with exclusive_capture_lock(args.capture_dir):
         input_evidence, evidence, captured_rows, capture = capture_frozen_characterization(
             args.capture_dir,
@@ -3475,37 +4339,41 @@ def build(args: argparse.Namespace) -> None:
     }
     manifest_data = tsv_bytes(preamble, rows)
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    staging = output.parent / f".{assets.name}.staging.{os.getpid()}"
-    if os.path.lexists(staging):
-        fail(f"exclusive Phase-9 staging path already exists: {staging}")
-    staging.mkdir(parents=False, mode=0o755)
-    published_assets = False
+    seal_data = seal_bytes(output.name, manifest_data)
+    ownership = PublicationOwnership()
+
+    def validate_private_bundle(staged_output: Path) -> None:
+        audited = audit_supplement(
+            args.base_manifest, args.expected_parent_sha256, staged_output, root
+        )
+        validate_with_benchmark_harness(
+            audited, args.benchmark_harness, process_metrics, root
+        )
+
     try:
-        for relative, data in sorted(asset_files.items()):
-            destination = staging / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            copy_bytes(destination, data, 0o555 if relative == "commands.sh" else 0o444)
-        os.rename(staging, assets)
-        published_assets = True
-        copy_bytes(output, manifest_data, 0o444)
-        copy_bytes(seal, detached_seal_bytes(output), 0o444)
+        publish_immutable_supplement(
+            publication,
+            asset_files,
+            manifest_data,
+            seal_data,
+            ownership=ownership,
+            prepublish_validator=validate_private_bundle,
+        )
         audited = audit_supplement(
             args.base_manifest, args.expected_parent_sha256, output, root
         )
         validate_with_benchmark_harness(
             audited, args.benchmark_harness, process_metrics, root
         )
-    except BaseException:
-        if staging.exists():
-            shutil.rmtree(staging)
-        for path in (seal, output):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-        if published_assets and assets.exists():
-            shutil.rmtree(assets)
+        finish_publication(publication)
+    except BaseException as error:
+        try:
+            rollback_owned_publication(publication, ownership)
+        except BaseException as rollback_error:
+            raise BootstrapError(
+                "Phase-9 publication rollback failed closed after "
+                f"{error}: {rollback_error}"
+            ) from error
         raise
 
 
