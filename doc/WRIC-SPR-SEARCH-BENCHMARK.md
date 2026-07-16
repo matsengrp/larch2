@@ -387,12 +387,27 @@ asks the harness to reject a nonexistent sentinel group.  Reaching that exact
 post-validation rejection proves that the harness accepted the manifest seal,
 preamble, schema, assets, hashes, and rows without starting a benchmark.
 
-Preparation is write-exclusive and launches no benchmark:
+Preparation is write-exclusive and launches no benchmark. It runs from the
+persistent Phase-0 restoration worktree: Git HEAD is the frozen research tip
+`408434e`, with the exact `7ca527b` instrumentation diff present as an
+unstaged overlay. The absolute worktree and baseline paths are part of the
+prepared trust root and must not later be moved or replaced by symlinks.
+
+After a quiet-host wrapper calibration succeeds, prepare the matrix with its
+calibration and affinity inputs explicitly bound:
 
 ```bash
+taskset -c 0-15 python3 tools/wric_wrapper_calibration.py run \
+  --output "$PWD/build/wric-wrapper-calibration/wrapper-calibration.json"
+
 python3 tools/wric_phase0_manifest_bootstrap.py prepare \
-  --expected-oracle-sha256 7ddb1fca7b15d1057912d6775b5e5fb32218390f13b3a10f6622581f21a5a38c
-python3 tools/wric_phase0_manifest_bootstrap.py matrix
+  --baseline-dir "$PWD/build/wric-chart-parallelization/baseline-408434e" \
+  --expected-oracle-sha256 7ddb1fca7b15d1057912d6775b5e5fb32218390f13b3a10f6622581f21a5a38c \
+  --wrapper-calibration \
+    "$PWD/build/wric-wrapper-calibration/wrapper-calibration.json" \
+  --physical-affinity 0,2,4,6,8,10,12,14 \
+  --smt-affinity 0-15 \
+  --unpinned-affinity 0-15
 ```
 
 The verified oracle digest is intentionally mandatory rather than defaulted,
