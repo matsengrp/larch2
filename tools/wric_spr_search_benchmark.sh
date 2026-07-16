@@ -478,9 +478,9 @@ validate_manifest_rows() {
         refusal_worker=$(h["requested_workers"])
         refusal_argv=$(h["canonical_argv_sha256"])
         expected_refusal_argv=(refusal_worker=="1" ?
-          "ac03537d4db4cc20a843154aae5ed578927d5d1852809c9a8d84fdc4b27dda2f" :
+          "518726d8e4df68ffa926b998e7f4b6853eccc0769ae0d88427137e1a535c3dc2" :
           (refusal_worker=="8" ?
-          "27f498987087c3ef91f39db04ae56107bca4adb0abd0c32aeb5abfa3d9c3faf3" : "-"))
+          "82e697d208998f4a619e7135d004f245806f725c18644e2828fd885dd31decb6" : "-"))
         if(kind!="tree_pb_refseq" ||
            $(h["primary_sha256"])!="a65f300916f158ea4c8de8bc49f5a94379905a4c3b7fba337ce6773d65ecfce4" ||
            $(h["refseq_sha256"])!="82c11885688b9a67b72ec4d2dd5913571a1723039ca501dc63bafb2cb5ea13eb" ||
@@ -836,6 +836,107 @@ extract_json_number() {
       value=substr($0,RSTART,RLENGTH); sub(/^.*:[[:space:]]*/,"",value); print value; exit
     }' "$1"
 }
+validate_chart_canonical_result() {
+  local file=$1 label=$2
+  python3 - "$file" "$label" <<'PY'
+import json
+import os
+import re
+import stat
+import sys
+
+path, label = sys.argv[1:]
+expected = {
+    "schema",
+    "schema_version",
+    "digest_algorithm",
+    "payload_encoding",
+    "semantic_sha256",
+    "contract_sha256",
+    "candidates_sha256",
+    "exact_sha256",
+    "acceptance_sha256",
+    "chain_sha256",
+    "final_topology_sha256",
+    "record_count",
+    "candidate_count",
+    "exact_candidate_count",
+    "iteration_count",
+}
+digests = {
+    "semantic_sha256",
+    "contract_sha256",
+    "candidates_sha256",
+    "exact_sha256",
+    "acceptance_sha256",
+    "chain_sha256",
+    "final_topology_sha256",
+}
+counts = {
+    "record_count",
+    "candidate_count",
+    "exact_candidate_count",
+    "iteration_count",
+}
+
+
+def reject(message: str) -> None:
+    raise ValueError(message)
+
+
+def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            reject(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+try:
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        reject("path is not a singly linked regular file")
+    with open(path, "rb") as stream:
+        payload = stream.read(65537)
+    if not payload or len(payload) > 65536:
+        reject("payload is empty or exceeds 65536 bytes")
+    document = json.loads(
+        payload.decode("utf-8"),
+        object_pairs_hook=unique_object,
+        parse_constant=lambda value: reject(f"non-finite number {value!r}"),
+    )
+    if not isinstance(document, dict):
+        reject("top level is not an object")
+    if set(document) != expected:
+        reject(
+            "key set differs: "
+            f"missing={sorted(expected - set(document))}, "
+            f"unexpected={sorted(set(document) - expected)}"
+        )
+    if (
+        document["schema"] != "larch.chart_spr.semantic_digest"
+        or document["schema_version"] != 1
+        or document["digest_algorithm"] != "sha256"
+        or document["payload_encoding"]
+        != "larch.chart_spr.semantic.ndjson.v1"
+    ):
+        reject("schema, version, algorithm, or payload encoding differs")
+    for key in digests:
+        value = document[key]
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            reject(f"{key} is not a lowercase SHA-256 digest")
+    for key in counts:
+        value = document[key]
+        if type(value) is not int or value < 0:
+            reject(f"{key} is not an unsigned integer")
+except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+    print(f"invalid chart canonical result for {label}: {path}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(document["semantic_sha256"])
+PY
+}
 metric_value() {
   awk -F= -v key="$2" '$1==key {print substr($0,length(key)+2); exit}' "$1"
 }
@@ -1118,10 +1219,11 @@ canonical_queue_order=()
 
 queue_output_validation() {
   local recorded=$1 row_id=$2 trial=$3 method=$4 pb=$5 initial=$6 report=$7 curve=$8 wall=$9
-  local score_prefix=${10} row_timeout=${11} row_rss_limit=${12}
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  local score_prefix=${10} row_timeout=${11} row_rss_limit=${12} canonical_json=${13}
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$recorded" "$row_id" "$trial" "$method" "$pb" "$initial" "$report" \
-    "$curve" "$wall" "$score_prefix" "$row_timeout" "$row_rss_limit" >>"$validation_queue"
+    "$curve" "$wall" "$score_prefix" "$row_timeout" "$row_rss_limit" \
+    "$canonical_json" >>"$validation_queue"
 }
 reset_row() {
   ROW=()
@@ -1744,7 +1846,7 @@ run_baseline() {
     queue_output_validation "$RECORD_TRIAL" "$RESOLVED_ROW_ID" "$TRIAL_INDEX" \
       sample_explore_merge "$pb" "$INITIAL_SCORE" "$err" "$curve" \
       "${ROW[wall_clock_s]}" "$out_dir/logs/${safe}_sample_explore_merge_score_${suffix}" \
-      "$timeout_seconds" "$RESOLVED_RSS_LIMIT_BYTES"
+      "$timeout_seconds" "$RESOLVED_RSS_LIMIT_BYTES" -
   fi
   if (( RECORD_TRIAL )); then emit_row
   elif [[ ${ROW[status]} != pending_validation || $validation != pending ]]; then
@@ -1789,15 +1891,15 @@ run_chart() {
   local canonical_args=()
   if "$dagutil" --help 2>&1 | awk '/chart-spr-canonical-result[[:space:]]/{found=1} END{exit !found}'; then
     canonical_args=(--chart-spr-canonical-result "$canonical_json")
-  elif [[ -n "$workload_manifest" ]]; then
-    fail "manifest mode requires working --chart-spr-canonical-result support"
+  else
+    fail "chart benchmarking requires working --chart-spr-canonical-result support"
   fi
   local lazy_args=(); (( chart_lazy_policy_explicit )) && lazy_args=(--wric-lazy-chart "$chart_lazy_policy")
   [[ -z "$run_manifest_group" ]] || lazy_args=(--wric-lazy-chart "$chart_lazy_policy")
   local chart_command=()
   if [[ -n "$run_manifest_group" ]]; then
     chart_command=("$dagutil" "${input_args[@]}" "${MANIFEST_CHART_ARGS_NO_WORKER[@]}"
-      "${MANIFEST_TIMED_WORKER_ARGS[@]}" -o "$pb")
+      "${MANIFEST_TIMED_WORKER_ARGS[@]}" "${canonical_args[@]}" -o "$pb")
   else
     chart_command=("$dagutil" "${input_args[@]}" --force-no-vcf --validate \
       --wric-polytomy-mode "$polytomy_mode" --wric-polytomy-max-shapes "$polytomy_shapes" \
@@ -1806,7 +1908,7 @@ run_chart() {
       --chart-spr-max-candidates "$max_candidates" --chart-spr-top-k-exact "$top_k_exact" \
       --chart-spr-candidate-selection lower-bound-top-k --chart-spr-candidate-source "$SOURCE" \
       --chart-spr-acceptance "$ACCEPTANCE" "${worker_args[@]}" "${memory_args[@]}" \
-      "${commit_args[@]}" --seed "$seed" -o "$pb")
+      "${commit_args[@]}" --seed "$seed" "${canonical_args[@]}" -o "$pb")
   fi
   local canonical_command=("${chart_command[@]}")
   canonical_command[0]=@binary:working_chart
@@ -2091,7 +2193,7 @@ run_chart() {
     queue_output_validation "$RECORD_TRIAL" "$RESOLVED_ROW_ID" "$TRIAL_INDEX" \
       "$METHOD" "$pb" "$INITIAL_SCORE" "$out" "$curve" "${ROW[wall_clock_s]}" \
       "$out_dir/logs/${safe}_${METHOD}_score_${suffix}_w${wsafe}" "$timeout_seconds" \
-      "$RESOLVED_RSS_LIMIT_BYTES"
+      "$RESOLVED_RSS_LIMIT_BYTES" "$canonical_json"
     local companion_key=$RESOLVED_ROW_ID
     if [[ -z ${CANONICAL_QUEUE_COMMAND[$companion_key]:-} ]]; then
       local companion_safe=${RESOLVED_ROW_ID//[^A-Za-z0-9_.-]/_}
@@ -2099,15 +2201,12 @@ run_chart() {
       local companion_json="$out_dir/logs/${safe}_${companion_safe}_canonical_companion.json"
       local companion_out="$out_dir/logs/${safe}_${companion_safe}_canonical_companion.out"
       local companion_err="$out_dir/logs/${safe}_${companion_safe}_canonical_companion.err"
-      local companion_command=() companion_arg
-      for companion_arg in "${chart_command[@]}"; do
-        if [[ "$companion_arg" == -o ]]; then
-          companion_command+=(--chart-spr-canonical-result "$companion_json" -o)
-        elif [[ "$companion_arg" == "$pb" ]]; then
-          companion_command+=("$companion_pb")
-        else
-          companion_command+=("$companion_arg")
-        fi
+      local companion_command=("${chart_command[@]}") companion_index
+      for ((companion_index=0; companion_index<${#companion_command[@]}; ++companion_index)); do
+        case "${companion_command[$companion_index]}" in
+          "$canonical_json") companion_command[$companion_index]=$companion_json ;;
+          "$pb") companion_command[$companion_index]=$companion_pb ;;
+        esac
       done
       CANONICAL_QUEUE_COMMAND[$companion_key]=$(declare -p companion_command)
       CANONICAL_QUEUE_PB[$companion_key]=$companion_pb
@@ -2382,8 +2481,8 @@ fi
 # semantic companion per exact row/worker contract, and finally bind those
 # correctness results back into the raw measured rows.
 declare -A DEFERRED_SCORE=() DEFERRED_NODES=() DEFERRED_EDGES=()
-declare -A DEFERRED_OUTPUT_SHA=() DEFERRED_VALIDATION=()
-while IFS=$'\t' read -r recorded row_id trial method pb initial report curve wall score_prefix row_timeout row_rss_limit; do
+declare -A DEFERRED_OUTPUT_SHA=() DEFERRED_SEARCH_SHA=() DEFERRED_VALIDATION=()
+while IFS=$'\t' read -r recorded row_id trial method pb initial report curve wall score_prefix row_timeout row_rss_limit canonical_json; do
   timeout_seconds=$row_timeout
   score_output "$row_id deferred output validation trial=$trial" "$pb" \
     "${score_prefix}.out" "${score_prefix}.err" "$row_rss_limit"
@@ -2401,6 +2500,13 @@ while IFS=$'\t' read -r recorded row_id trial method pb initial report curve wal
   else
     deferred_ok=0
   fi
+  timed_search=-
+  if [[ "$method" == sample_explore_merge ]]; then
+    [[ "$canonical_json" == - ]] || deferred_ok=0
+  elif ! timed_search=$(validate_chart_canonical_result \
+      "$canonical_json" "$row_id timed trial=$trial"); then
+    deferred_ok=0
+  fi
   if (( recorded )); then
     if (( deferred_ok )); then
       DEFERRED_VALIDATION[$result_key]=ok
@@ -2408,6 +2514,7 @@ while IFS=$'\t' read -r recorded row_id trial method pb initial report curve wal
       DEFERRED_NODES[$result_key]=${deferred_nodes:-NA}
       DEFERRED_EDGES[$result_key]=${deferred_edges:-NA}
       DEFERRED_OUTPUT_SHA[$result_key]=$SCORE_OUTPUT_SHA
+      DEFERRED_SEARCH_SHA[$result_key]=$timed_search
     else
       DEFERRED_VALIDATION[$result_key]=failed
     fi
@@ -2432,19 +2539,8 @@ for companion_key in "${canonical_queue_order[@]}"; do
   companion_ok=1
   (( RUN_RUNNER_STATUS == 0 )) && [[ -s "$companion_json" && -s "$companion_pb" ]] || companion_ok=0
   if (( companion_ok )); then
-    companion_search=$(extract_json_string "$companion_json" semantic_sha256)
-    [[ "$companion_search" =~ ^[0-9a-f]{64}$ &&
-       $(extract_json_number "$companion_json" schema_version) == 1 &&
-       $(extract_json_string "$companion_json" digest_algorithm) == sha256 ]] || companion_ok=0
-    for digest_key in contract_sha256 candidates_sha256 exact_sha256 \
-      acceptance_sha256 chain_sha256 final_topology_sha256; do
-      digest_value=$(extract_json_string "$companion_json" "$digest_key")
-      [[ "$digest_value" =~ ^[0-9a-f]{64}$ ]] || companion_ok=0
-    done
-    for count_key in record_count candidate_count exact_candidate_count iteration_count; do
-      count_value=$(extract_json_number "$companion_json" "$count_key")
-      [[ "$count_value" =~ ^[0-9]+$ ]] || companion_ok=0
-    done
+    companion_search=$(validate_chart_canonical_result \
+      "$companion_json" "$companion_key deferred semantic companion") || companion_ok=0
   fi
   if (( companion_ok )); then
     companion_score_prefix=${CANONICAL_QUEUE_OUT[$companion_key]%.out}.score
@@ -2467,7 +2563,9 @@ for companion_key in "${canonical_queue_order[@]}"; do
     full_err=${CANONICAL_QUEUE_FULL_JSON[$companion_key]%.json}.err
     run_capture "$companion_fixture $companion_method deferred explicit-W1 full correctness" \
       "$full_out" "$full_err" "$companion_rss_limit" "${full_command[@]}"
-    full_semantic=$(extract_json_string "${CANONICAL_QUEUE_FULL_JSON[$companion_key]}" semantic_sha256)
+    full_semantic=$(validate_chart_canonical_result \
+      "${CANONICAL_QUEUE_FULL_JSON[$companion_key]}" \
+      "$companion_key deferred explicit-W1 full correctness") || full_semantic=-
     full_sha=$(sha256sum "${CANONICAL_QUEUE_FULL_SIDECAR[$companion_key]}" 2>/dev/null | awk '{print $1}')
     if (( RUN_RUNNER_STATUS != 0 )) || [[ "$full_semantic" != "$full_sha" ||
          "$full_semantic" != "${canonical_companion_search[$companion_key]}" ]]; then
@@ -2499,11 +2597,16 @@ for ((raw_i=0; raw_i<${#raw_header[@]}; ++raw_i)); do raw_index[${raw_header[$ra
         output_sha=${DEFERRED_OUTPUT_SHA[$result_key]}
         search_sha=-
         if [[ "$method" != sample_explore_merge ]]; then
-          search_sha=${canonical_companion_search[$row_id]:--}
+          search_sha=${DEFERRED_SEARCH_SHA[$result_key]:--}
         fi
         argv_sha=${field[${raw_index[canonical_argv_sha256]}]}
         final_status=ok
         [[ "$method" == sample_explore_merge || "$search_sha" =~ ^[0-9a-f]{64}$ ]] || final_status=failed
+        if [[ "$method" != sample_explore_merge && \
+              "$search_sha" != "${canonical_companion_search[$row_id]:--}" ]]; then
+          echo "timed/companion chart semantic mismatch: $result_key" >&2
+          final_status=failed
+        fi
         [[ "$method" == sample_explore_merge || ${canonical_companion_output[$row_id]:--} == "$output_sha" ]] || final_status=failed
         trial_sha=$(trial_semantic_digest "$method" "$search_sha" "$output_sha" "$argv_sha")
         if [[ -n "$workload_manifest" ]]; then

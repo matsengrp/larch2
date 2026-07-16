@@ -135,6 +135,10 @@ if [[ ${FAKE_PHASE6_K16_TIMEOUT:-0} == 1 && $exact == 16 &&
 fi
 [[ -z "$output" ]] || cp "$input" "$output"
 semantic_payload='{"record":"contract","topology_selection":"none","refinement_exactness":"BOUNDED_REFINED_GRAMMAR","keep_mask_contract":"exact_required"}'
+if [[ ${FAKE_TIMED_TRIAL_SEMANTIC_MISMATCH:-0} == 1 &&
+      $canonical =~ _trial2_.*[.]canonical[.]json$ ]]; then
+  semantic_payload='{"record":"contract","topology_selection":"none","refinement_exactness":"BOUNDED_REFINED_GRAMMAR","keep_mask_contract":"exact_required","timed_trial_mismatch":true}'
+fi
 if [[ ${FAKE_PHASE6_W1_SEMANTIC_MISMATCH:-0} == 1 &&
       ( $exact == 4 || $exact == 16 ) &&
       $worker_requested == 1 ]]; then
@@ -146,7 +150,7 @@ fi
 semantic=$(printf '%s\n' "$semantic_payload" | sha256sum | awk '{print $1}')
 if [[ -n "$sidecar" ]]; then printf '%s\n' "$semantic_payload" >"$sidecar"; fi
 if [[ -n "$canonical" ]]; then
-  printf '{"schema":"chart_spr_canonical_result","schema_version":1,"digest_algorithm":"sha256","payload_encoding":"ndjson","semantic_sha256":"%s","contract_sha256":"%s","candidates_sha256":"%s","exact_sha256":"%s","acceptance_sha256":"%s","chain_sha256":"%s","final_topology_sha256":"%s","record_count":1,"candidate_count":%s,"exact_candidate_count":%s,"iteration_count":1}\n' \
+  printf '{"schema":"larch.chart_spr.semantic_digest","schema_version":1,"digest_algorithm":"sha256","payload_encoding":"larch.chart_spr.semantic.ndjson.v1","semantic_sha256":"%s","contract_sha256":"%s","candidates_sha256":"%s","exact_sha256":"%s","acceptance_sha256":"%s","chain_sha256":"%s","final_topology_sha256":"%s","record_count":1,"candidate_count":%s,"exact_candidate_count":%s,"iteration_count":1}\n' \
     "$semantic" "$semantic" "$semantic" "$semantic" "$semantic" "$semantic" "$semantic" "$candidates" "$exact" >"$canonical"
 fi
 cache_strategy=all_active_patterns
@@ -490,6 +494,14 @@ awk -F '\t' '
 [[ $(awk -F '\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{seen[$h["execution_order"]]=1}END{print length(seen)}' "$tmp/repeated/raw_trials.tsv") == 2 ]]
 grep -q -- '--chart-spr-local-score-workers 1' "$tmp/repeated/commands.sh"
 ! grep -q -- '--chart-spr-workers' "$tmp/repeated/commands.sh"
+mapfile -t repeated_canonical_paths < <(awk '
+  /^# .* workers=.* trial[12]$/ {
+    getline
+    for(i=1;i<NF;i++) if($i=="--chart-spr-canonical-result") print $(i+1)
+  }' "$tmp/repeated/commands.sh")
+[[ ${#repeated_canonical_paths[@]} == 2 ]]
+[[ ${repeated_canonical_paths[0]} != "${repeated_canonical_paths[1]}" ]]
+[[ -s ${repeated_canonical_paths[0]} && -s ${repeated_canonical_paths[1]} ]]
 
 # Unified matrices forward numeric worker budgets, and full provenance is a
 # separate unaggregated command rather than part of the timed command.
@@ -501,13 +513,15 @@ grep -q -- '--chart-spr-workers 2' "$tmp/matrix/commands.sh"
 [[ $(find "$tmp/full/logs" -name '*_full_canonical.ndjson' -type f | wc -l) == 1 ]]
 [[ $(grep -c -- '--chart-spr-canonical-sidecar' "$tmp/full/commands.sh") == 1 ]]
 grep -q -- '--chart-spr-workers 1' "$tmp/full/commands.sh"
-# Timed commands precede all generated-output validation and semantic work,
-# and compact capture is absent from the timed chart argv.
+# Timed commands precede all generated-output validation and semantic work.
+# Each timed chart child emits only its compact digest; the full sidecar stays
+# in the independent deferred explicit-W1 command.
 timed_chart_line=$(grep -n 'workers=default trial1' "$tmp/full/commands.sh" | cut -d: -f1)
 first_deferred_line=$(awk '/deferred output validation/{print NR;exit}' "$tmp/full/commands.sh")
 (( timed_chart_line < first_deferred_line ))
 timed_chart_command=$(sed -n "$((timed_chart_line+1))p" "$tmp/full/commands.sh")
-[[ "$timed_chart_command" != *chart-spr-canonical-result* ]]
+[[ "$timed_chart_command" == *chart-spr-canonical-result* ]]
+[[ "$timed_chart_command" != *chart-spr-canonical-sidecar* ]]
 # Every initial, timed, deferred-validation, compact-companion, and full-oracle
 # child in a non-manifest capture inherits the one frozen capture cap.
 metrics_count=0
@@ -613,7 +627,7 @@ chart_argv_sha() {
     chart_spr_local_score_workers) argv+=(--chart-spr-local-score-workers "$requested") ;;
     *) return 2 ;;
   esac
-  argv+=(-o @output)
+  argv+=(--chart-spr-canonical-result @search-canonical-result -o @output)
   canonical_argv_sha "${argv[@]}"
 }
 native_argv=$(canonical_argv_sha @binary:frozen_native --dag-pb "@primary:$input_sha" \
@@ -771,7 +785,7 @@ make_real_infeasible_manifest() {
       $x["candidate_source"]="grammar"; $x["polytomy_mode"]="expand-bounded"
       $x["polytomy_max_shapes"]="1"; $x["memory_budget_bytes"]="12884901888"
       $x["expected_initial_score"]="11155"
-      $x["canonical_argv_sha256"]="ac03537d4db4cc20a843154aae5ed578927d5d1852809c9a8d84fdc4b27dda2f"
+      $x["canonical_argv_sha256"]="518726d8e4df68ffa926b998e7f4b6853eccc0769ae0d88427137e1a535c3dc2"
       split("expected_refinement_exactness expected_cache_strategy expected_effective_pattern_batch_size expected_keep_mask_kind expected_final_compaction_exactness expected_chain_exactness expected_active_patterns expected_initial_clades expected_initial_productions expected_candidates_generated expected_candidates_scored expected_exact_verifications expected_stop_reason expected_iterations expected_accepted_moves expected_final_score expected_validated_parsimony oracle_search_semantic_sha256 oracle_output_semantic_sha256 oracle_trial_semantic_sha256 canonical_sidecar_uri canonical_sidecar_sha256 oracle_report_uri oracle_report_sha256 scale_resource scale_limit scale_largest_candidates scale_largest_top_k",dash," ")
       for(i in dash)$x[dash[i]]="-"
       print
@@ -798,6 +812,13 @@ expect_fail_reason() {
     exit 1
   }
 }
+
+# A valid but different compact digest from just one measured invocation must
+# fail against the independent row-level companion.  This proves raw trials are
+# bound to their own timed result instead of inheriting the companion digest.
+expect_fail_reason timed-trial-semantic-drift 'timed/companion chart semantic mismatch' \
+  env FAKE_TIMED_TRIAL_SEMANTIC_MISMATCH=1 "$harness" "${common[@]}" \
+  --out-dir "$tmp/timed-trial-semantic-drift" --repetitions 2
 
 # Phase-0 observability fields are accepted only from one exact two-space
 # summary key.  Missing top-level/duplicate/malformed values fail, a same-named
@@ -1075,7 +1096,7 @@ awk -F '\t' -v OFS='\t' '
   /^#/{print;next}!h{for(i=1;i<=NF;i++)x[$i]=i;h=1;print;next}
   $x["row_id"]=="chart-row" {
     $x["requested_workers"]="8"
-    $x["canonical_argv_sha256"]="27f498987087c3ef91f39db04ae56107bca4adb0abd0c32aeb5abfa3d9c3faf3"
+    $x["canonical_argv_sha256"]="82e697d208998f4a619e7135d004f245806f725c18644e2828fd885dd31decb6"
   }
   {print}' "$infeasible_manifest" >"$tmp/infeasible-w8.tsv"
 seal_manifest "$tmp/infeasible-w8.tsv"
