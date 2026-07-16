@@ -687,7 +687,8 @@ class Phase9AcceptanceTest(unittest.TestCase):
             raw_trials=None,
             defer_frozen_oracle_characterization=None,
             expected_run_ledger_sha256="0" * 64,
-            repo_root=str(REPO),
+            base_repo_root=str(REPO),
+            working_repo_root=str(REPO),
         )
         with (
             mock.patch.object(
@@ -996,9 +997,31 @@ class Phase9AcceptanceTest(unittest.TestCase):
             capture_output=True,
         ).stdout.strip()
         self.assertEqual(acceptance.validate_clean_git_checkout(checkout, head), head)
+        self.assertEqual(
+            acceptance.validate_base_repo_root(checkout, head), checkout
+        )
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "must be this acceptance checkout"
+        ):
+            acceptance.validate_working_repo_root(checkout, head)
         with self.assertRaisesRegex(acceptance.AcceptanceError, "does not equal live Git HEAD"):
             acceptance.validate_clean_git_checkout(checkout, "0" * 40)
+        checkout_alias = self.sandbox / "checkout-alias"
+        checkout_alias.symlink_to(checkout, target_is_directory=True)
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "canonical, non-symlink directory"
+        ):
+            acceptance.validate_base_repo_root(checkout_alias, head)
+        subdirectory = checkout / "subdirectory"
+        subdirectory.mkdir()
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "not exact Git toplevel"
+        ):
+            acceptance.validate_base_repo_root(subdirectory, head)
         (checkout / "untracked.txt").write_text("untracked\n")
+        self.assertEqual(
+            acceptance.validate_base_repo_root(checkout, head), checkout
+        )
         with self.assertRaisesRegex(acceptance.AcceptanceError, "not completely clean"):
             acceptance.validate_clean_git_checkout(checkout, head)
 
@@ -1035,6 +1058,31 @@ class Phase9AcceptanceTest(unittest.TestCase):
 
     def test_run_ledger_detects_mutation_extra_file_and_seal_tamper(self) -> None:
         self.data.write()
+        base_checkout = self.sandbox / "sealed-base-checkout"
+        base_checkout.mkdir()
+        subprocess.run(["git", "init", "-q", str(base_checkout)], check=True)
+        subprocess.run(
+            ["git", "-C", str(base_checkout), "config", "user.email", "phase9@example.invalid"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(base_checkout), "config", "user.name", "Phase 9 test"],
+            check=True,
+        )
+        (base_checkout / "sealed.txt").write_text("sealed base\n")
+        subprocess.run(
+            ["git", "-C", str(base_checkout), "add", "sealed.txt"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(base_checkout), "commit", "-q", "-m", "sealed base"],
+            check=True,
+        )
+        base_head = subprocess.run(
+            ["git", "-C", str(base_checkout), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
         row_ids = sorted({row["row_id"] for row in self.data.rows})
         summary = self.root / "summary.md"
         summary.write_text(
@@ -1067,6 +1115,9 @@ class Phase9AcceptanceTest(unittest.TestCase):
                 "full_canonical": True,
                 "affinity_cpus": "0",
                 "fixture_sha256": digest("input"),
+                "base_repo_root": str(base_checkout),
+                "base_revision": base_head,
+                "working_repo_root": str(REPO),
                 "working_revision": "a" * 40,
                 "repository_status": "clean",
                 "binary_provenance_limit": (
@@ -1104,6 +1155,7 @@ class Phase9AcceptanceTest(unittest.TestCase):
         audited = Stub()
         audited.base = Stub()
         audited.base.sha256 = "0" * 64
+        audited.base.preamble = {"repo_revision": base_head}
         audited.supplement = Stub()
         audited.supplement.sha256 = "0" * 64
         audited.supplement.rows = ({"primary_sha256": digest("input")},)
@@ -1117,7 +1169,9 @@ class Phase9AcceptanceTest(unittest.TestCase):
             "command_contract_sha256": metadata["command_contract_sha256"],
         }
         with self.assertRaisesRegex(acceptance.AcceptanceError, "external expected anchor"):
-            acceptance.audit_run_archive(str(self.root), audited, str(REPO), "f" * 64)
+            acceptance.audit_run_archive(
+                str(self.root), audited, str(base_checkout), str(REPO), "f" * 64
+            )
         with (
             mock.patch.object(
                 acceptance, "validate_clean_git_checkout", return_value="a" * 40
@@ -1127,18 +1181,60 @@ class Phase9AcceptanceTest(unittest.TestCase):
             ),
         ):
             acceptance.audit_run_archive(
-                str(self.root), audited, str(REPO), ledger_sha
+                str(self.root), audited, str(base_checkout), str(REPO), ledger_sha
             )
+            metadata["base_repo_root"] = str(REPO)
+            metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n")
+            ledger.write_bytes(
+                acceptance.render_run_ledger(
+                    self.root, acceptance.run_archive_members(self.root)
+                )
+            )
+            seal.write_bytes(acceptance.detached_seal_payload(ledger))
+            self_anchored_sha = acceptance.sha256_file(ledger, "ledger")
+            with self.assertRaisesRegex(
+                acceptance.AcceptanceError, "run metadata base_repo_root"
+            ):
+                acceptance.audit_run_archive(
+                    str(self.root),
+                    audited,
+                    str(base_checkout),
+                    str(REPO),
+                    self_anchored_sha,
+                )
+            metadata["base_repo_root"] = str(base_checkout)
+            metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n")
+            ledger.write_bytes(
+                acceptance.render_run_ledger(
+                    self.root, acceptance.run_archive_members(self.root)
+                )
+            )
+            seal.write_bytes(acceptance.detached_seal_payload(ledger))
+            ledger_sha = acceptance.sha256_file(ledger, "ledger")
+            with self.assertRaisesRegex(
+                acceptance.AcceptanceError, "sealed base repository root revision"
+            ):
+                acceptance.audit_run_archive(
+                    str(self.root), audited, str(REPO), str(base_checkout), ledger_sha
+                )
+            base_alias = self.sandbox / "sealed-base-alias"
+            base_alias.symlink_to(base_checkout, target_is_directory=True)
+            with self.assertRaisesRegex(
+                acceptance.AcceptanceError, "canonical, non-symlink directory"
+            ):
+                acceptance.audit_run_archive(
+                    str(self.root), audited, str(base_alias), str(REPO), ledger_sha
+                )
             (self.root / "extra.txt").write_text("extra\n")
             with self.assertRaisesRegex(acceptance.AcceptanceError, "exact archive closure"):
                 acceptance.audit_run_archive(
-                    str(self.root), audited, str(REPO), ledger_sha
+                    str(self.root), audited, str(base_checkout), str(REPO), ledger_sha
                 )
             (self.root / "extra.txt").unlink()
             seal.write_text("bad seal\n")
             with self.assertRaisesRegex(acceptance.AcceptanceError, "detached seal mismatch"):
                 acceptance.audit_run_archive(
-                    str(self.root), audited, str(REPO), ledger_sha
+                    str(self.root), audited, str(base_checkout), str(REPO), ledger_sha
                 )
 
 

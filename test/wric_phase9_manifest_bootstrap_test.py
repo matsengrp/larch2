@@ -402,6 +402,31 @@ def json_bytes(value: object) -> bytes:
 class Integration:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.base_repo_root = root
+        subprocess.run(["git", "init", "-q", root], check=True)
+        subprocess.run(
+            ["git", "-C", os.fspath(root), "config", "user.email", "phase9@example.invalid"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", os.fspath(root), "config", "user.name", "Phase 9 test"],
+            check=True,
+        )
+        marker = root / "sealed-base-revision.txt"
+        marker.write_text("synthetic sealed base revision\n")
+        subprocess.run(
+            ["git", "-C", os.fspath(root), "add", marker.name], check=True
+        )
+        subprocess.run(
+            ["git", "-C", os.fspath(root), "commit", "-q", "-m", "sealed base"],
+            check=True,
+        )
+        self.base_revision = subprocess.run(
+            ["git", "-C", os.fspath(root), "rev-parse", "--verify", "HEAD"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
         self.affinity = allowed_affinity()
         self.base_dir = root / "base"
         self.golden = root / "golden"
@@ -605,7 +630,7 @@ else:
             "kind": "base",
             "manifest_id": "synthetic-phase0",
             "parent_sha256": "-",
-            "repo_revision": "0" * 40,
+            "repo_revision": self.base_revision,
             "merge_base": "1" * 40,
             "frozen_larch2_uri": "manifest://larch2",
             "frozen_larch2_sha256": file_digest(self.larch2),
@@ -660,8 +685,8 @@ else:
             sys.executable,
             os.fspath(HELPER),
             "build",
-            "--repo-root",
-            os.fspath(REPO),
+            "--base-repo-root",
+            os.fspath(self.base_repo_root),
             "--base-manifest",
             os.fspath(self.base),
             "--expected-parent-sha256",
@@ -697,8 +722,8 @@ else:
             sys.executable,
             os.fspath(HELPER),
             "characterize",
-            "--repo-root",
-            os.fspath(REPO),
+            "--base-repo-root",
+            os.fspath(self.base_repo_root),
             "--base-manifest",
             os.fspath(self.base),
             "--expected-parent-sha256",
@@ -722,7 +747,7 @@ else:
     def write_current_run(self, run_root: Path, supplement: Path) -> None:
         acceptance = bootstrap.acceptance_module()
         audited = bootstrap.audited_frozen_characterization(
-            self.base, self.parent_sha, supplement, REPO
+            self.base, self.parent_sha, supplement, self.base_repo_root
         )
         frozen_rows = {
             (int(row["seed"]), int(row["requested_workers"])): row
@@ -1039,7 +1064,7 @@ def main() -> None:
             case.runner,
             file_digest(case.runner),
             case.affinity,
-            REPO,
+            case.base_repo_root,
         )
         assert produced_characterization.preamble["schema_version"] == "3"
         assert produced_characterization.preamble["timeout_seconds"] == str(
@@ -1138,7 +1163,7 @@ def main() -> None:
                             case.runner,
                             file_digest(case.runner),
                             case.affinity,
-                            REPO,
+                            case.base_repo_root,
                         )
                     ),
                 )
@@ -1205,7 +1230,7 @@ def main() -> None:
             case.base,
             case.parent_sha,
             independent_supplement,
-            REPO,
+            case.base_repo_root,
         )
 
         case.counter.unlink()
@@ -1291,11 +1316,10 @@ def main() -> None:
         base_hardlink.unlink()
 
         fake_root_command = case.build_command(case.root / "fake-root-rejected.tsv")
-        fake_root_command[fake_root_command.index(os.fspath(REPO))] = os.fspath(
-            case.root
-        )
+        root_flag = fake_root_command.index("--base-repo-root")
+        fake_root_command[root_flag + 1] = os.fspath(case.root / "base")
         result = case.run(fake_root_command, success=False)
-        assert "builder's repository root" in result.stderr
+        assert "repository root" in result.stderr, result.stderr
 
         locked_output = (
             case.root / "concurrent-publication" / "phase9-local-commit.tsv"
@@ -1400,7 +1424,7 @@ def main() -> None:
         )
 
         audited = bootstrap.audited_frozen_characterization(
-            case.base, case.parent_sha, output_a, REPO
+            case.base, case.parent_sha, output_a, case.base_repo_root
         )
         assert set(audited.evidence) == {
             (seed, workers)
@@ -1510,8 +1534,8 @@ def main() -> None:
             sys.executable,
             os.fspath(HELPER),
             "audit",
-            "--repo-root",
-            os.fspath(REPO),
+            "--base-repo-root",
+            os.fspath(case.base_repo_root),
             "--base-manifest",
             os.fspath(case.base),
             "--expected-parent-sha256",
@@ -1524,6 +1548,48 @@ def main() -> None:
             os.fspath(case.runner),
         ]
         case.run(audit_command, success=True)
+
+        separate_base_root = case.root / "separate-sealed-base-worktree"
+        subprocess.run(["git", "init", "-q", separate_base_root], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                os.fspath(separate_base_root),
+                "fetch",
+                "-q",
+                os.fspath(case.base_repo_root),
+                case.base_revision,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                os.fspath(separate_base_root),
+                "update-ref",
+                "HEAD",
+                "FETCH_HEAD",
+            ],
+            check=True,
+        )
+        for source in (case.larch2, case.oracle):
+            relative = source.relative_to(case.base_repo_root)
+            destination = separate_base_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+            destination.chmod(source.stat().st_mode & 0o777)
+        split_audit = list(audit_command)
+        root_flag = split_audit.index("--base-repo-root")
+        split_audit[root_flag + 1] = os.fspath(separate_base_root)
+        case.run(split_audit, success=True)
+        separate_alias = case.root / "separate-sealed-base-alias"
+        separate_alias.symlink_to(separate_base_root, target_is_directory=True)
+        alias_audit = list(split_audit)
+        alias_audit[root_flag + 1] = os.fspath(separate_alias)
+        result = case.run(alias_audit, success=False)
+        assert "must be a lexical directory" in result.stderr, result.stderr
 
         immutable_output = final_publication_bytes(output_a)
         result = case.run(case.build_command(output_a), success=False)

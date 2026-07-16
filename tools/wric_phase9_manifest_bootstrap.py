@@ -364,28 +364,76 @@ def parse_preamble_and_rows(
     return preamble, rows
 
 
-def repo_root(path: Path | None) -> Path:
-    if path is not None:
-        root = path.resolve(strict=True)
-    else:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if result.returncode != 0:
-            fail(f"cannot derive repository root: {result.stderr.strip()}")
-        root = Path(result.stdout.strip()).resolve(strict=True)
-    if not root.is_dir():
-        fail(f"repository root is not a directory: {root}")
-    if root != REPOSITORY_ROOT:
+def git_output(root: Path, arguments: Sequence[str], label: str) -> str:
+    """Run Git without inheriting mutable user configuration."""
+
+    result = subprocess.run(
+        ["/usr/bin/git", "-C", os.fspath(root), *arguments],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/nonexistent",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+        },
+    )
+    if result.returncode != 0:
         fail(
-            f"--repo-root must be the builder's repository root {REPOSITORY_ROOT}, "
-            f"not {root}"
+            f"git {label} failed for {root}: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
         )
+    return result.stdout
+
+
+def base_repo_root(path: Path | None) -> Path:
+    """Return an explicit, canonical Git toplevel for sealed ``repo://`` assets.
+
+    The Phase-0 worktree is intentionally allowed to differ from the checkout
+    containing this builder.  Its HEAD is bound separately to the sealed base
+    manifest in :func:`read_manifest`; resolving the path is never sufficient
+    evidence by itself.
+    """
+
+    candidate = path if path is not None else REPOSITORY_ROOT
+    root = require_lexical_directory(candidate.absolute(), "sealed base repository root")
+    top_text = git_output(root, ("rev-parse", "--show-toplevel"), "base repository root").strip()
+    if not top_text:
+        fail(f"git returned an empty base repository root for {root}")
+    top = require_lexical_directory(
+        Path(top_text).absolute(), "Git sealed base repository toplevel"
+    )
+    if top != root:
+        fail(f"sealed base repository root {root} is not exact Git toplevel {top}")
     return root
+
+
+def require_base_revision(root: Path, expected_revision: str) -> str:
+    """Bind an already-canonical base worktree to its sealed revision."""
+
+    if REVISION.fullmatch(expected_revision) is None:
+        fail(f"sealed base revision is not a full Git object ID: {expected_revision!r}")
+    head = git_output(
+        root, ("rev-parse", "--verify", "HEAD"), "sealed base HEAD"
+    ).strip()
+    if REVISION.fullmatch(head) is None:
+        fail(f"sealed base Git HEAD is not a full object ID: {head!r}")
+    if head != expected_revision:
+        fail(
+            "sealed base repository HEAD differs from manifest repo_revision: "
+            f"{head} != {expected_revision}"
+        )
+    return head
+
+
+def repo_root(path: Path | None) -> Path:
+    """Backward-compatible internal name for the sealed base asset root."""
+
+    return base_repo_root(path)
 
 
 def resolve_manifest_uri(manifest: Path, uri: str, root: Path) -> Path:
@@ -484,6 +532,7 @@ def validate_manifest_assets(manifest: Manifest, root: Path) -> None:
 
 
 def read_manifest(path: Path, root: Path, *, expected_kind: str) -> Manifest:
+    root = base_repo_root(root)
     path = require_canonical_regular(path, "workload manifest")
     digest = verify_detached_seal(path)
     preamble, rows = parse_preamble_and_rows(path, PREAMBLE_KEYS, MANIFEST_HEADER)
@@ -496,6 +545,8 @@ def read_manifest(path: Path, root: Path, *, expected_kind: str) -> Manifest:
     for key in ("repo_revision", "merge_base"):
         if REVISION.fullmatch(preamble[key]) is None:
             fail(f"manifest {key} is not a full revision: {path}")
+    if expected_kind == "base":
+        require_base_revision(root, preamble["repo_revision"])
     ids: set[str] = set()
     for row in rows:
         row_id = row["row_id"]
@@ -4685,7 +4736,7 @@ def validate_with_benchmark_harness(
         stderr=subprocess.PIPE,
         text=True,
         env=environment,
-        cwd=root,
+        cwd=REPOSITORY_ROOT,
         timeout=60,
     )
     if os.path.lexists(sentinel_output):
@@ -4708,7 +4759,7 @@ def build(args: argparse.Namespace) -> None:
     )
     output = output_parent / output.name
     with exclusive_output_lock(output) as publication:
-        root = repo_root(args.repo_root)
+        root = command_base_repo_root(args)
         validate_hash(args.expected_parent_sha256, "expected parent SHA-256")
 
         def validate_private_bundle(staged_output: Path) -> None:
@@ -4751,7 +4802,7 @@ def build(args: argparse.Namespace) -> None:
 def _build_with_output_lock(
     args: argparse.Namespace, publication: PublicationPaths
 ) -> None:
-    root = repo_root(args.repo_root)
+    root = command_base_repo_root(args)
     output = publication.output
     assets = publication.assets
     seal = publication.seal
@@ -5037,7 +5088,7 @@ def characterize(args: argparse.Namespace) -> None:
     )
     output = output_parent / output.name
     with exclusive_output_lock(output) as publication:
-        root = repo_root(args.repo_root)
+        root = command_base_repo_root(args)
 
         def audit_output(path: Path) -> Characterization:
             return audit_characterization_publication(
@@ -5232,7 +5283,17 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     build_parser.add_argument("--output", type=Path, required=True)
-    build_parser.add_argument("--repo-root", type=Path)
+    build_roots = build_parser.add_mutually_exclusive_group()
+    build_roots.add_argument(
+        "--base-repo-root",
+        type=Path,
+        help="canonical Git worktree containing sealed Phase-0 repo:// assets",
+    )
+    build_roots.add_argument(
+        "--repo-root",
+        type=Path,
+        help="backward-compatible same-root alias for --base-repo-root",
+    )
     build_parser.add_argument("--benchmark-harness", type=Path, required=True)
     build_parser.add_argument("--process-metrics", type=Path, required=True)
     characterize_parser = subparsers.add_parser(
@@ -5251,7 +5312,17 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="persistent restartable source-characterization capture directory",
     )
     characterize_parser.add_argument("--output", type=Path, required=True)
-    characterize_parser.add_argument("--repo-root", type=Path)
+    characterize_roots = characterize_parser.add_mutually_exclusive_group()
+    characterize_roots.add_argument(
+        "--base-repo-root",
+        type=Path,
+        help="canonical Git worktree containing sealed Phase-0 repo:// assets",
+    )
+    characterize_roots.add_argument(
+        "--repo-root",
+        type=Path,
+        help="backward-compatible same-root alias for --base-repo-root",
+    )
     characterize_parser.add_argument("--process-metrics", type=Path, required=True)
     characterize_parser.add_argument(
         "--expected-process-metrics-sha256",
@@ -5261,10 +5332,28 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     audit_parser.add_argument("--base-manifest", type=Path, required=True)
     audit_parser.add_argument("--expected-parent-sha256", required=True)
     audit_parser.add_argument("--supplement", type=Path, required=True)
-    audit_parser.add_argument("--repo-root", type=Path)
+    audit_roots = audit_parser.add_mutually_exclusive_group()
+    audit_roots.add_argument(
+        "--base-repo-root",
+        type=Path,
+        help="canonical Git worktree containing sealed Phase-0 repo:// assets",
+    )
+    audit_roots.add_argument(
+        "--repo-root",
+        type=Path,
+        help="backward-compatible same-root alias for --base-repo-root",
+    )
     audit_parser.add_argument("--benchmark-harness", type=Path, required=True)
     audit_parser.add_argument("--process-metrics", type=Path, required=True)
     return parser.parse_args(argv)
+
+
+def command_base_repo_root(args: argparse.Namespace) -> Path:
+    """Select the canonical flag or its legacy alias without self-anchoring."""
+
+    return base_repo_root(
+        getattr(args, "base_repo_root", None) or getattr(args, "repo_root", None)
+    )
 
 
 def main(argv: Sequence[str]) -> int:
@@ -5277,7 +5366,7 @@ def main(argv: Sequence[str]) -> int:
         elif args.command == "characterize":
             characterize(args)
         elif args.command == "audit":
-            root = repo_root(args.repo_root)
+            root = command_base_repo_root(args)
             audited = audit_supplement(
                 args.base_manifest,
                 args.expected_parent_sha256,

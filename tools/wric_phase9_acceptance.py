@@ -10,9 +10,10 @@ accepted sequences must all reconcile.
 
 Ad-hoc frozen reports are intentionally available only behind an explicit
 ``deferred_non_final`` result.  They can support deadline-constrained interim
-work but can never produce final ``pass`` status.  Acceptance results and
-current-run archive seals use schema version 2; the frozen canonical evidence
-retains its independently versioned historical schemas.
+work but can never produce final ``pass`` status.  Acceptance results use
+schema version 2 and split-root current-run archive seals use schema version
+3; the frozen canonical evidence retains its independently versioned
+historical schemas.
 """
 
 from __future__ import annotations
@@ -72,7 +73,7 @@ RUN_LEDGER_NAME = "phase9-run-artifacts.tsv"
 RUN_LEDGER_SEAL_NAME = RUN_LEDGER_NAME + ".sha256"
 RUN_SCHEMA = "wric_phase9_benchmark_run"
 RUN_LEDGER_SCHEMA = "wric_phase9_benchmark_artifacts"
-RUN_SCHEMA_VERSION = 2
+RUN_SCHEMA_VERSION = 3
 RUN_GROUP = "phase9-local-commit"
 RUN_METADATA_KEYS = frozenset(
     (
@@ -90,6 +91,9 @@ RUN_METADATA_KEYS = frozenset(
         "supplement_manifest_sha256",
         "characterization_sha256",
         "fixture_sha256",
+        "base_repo_root",
+        "base_revision",
+        "working_repo_root",
         "working_revision",
         "repository_status",
         "binary_provenance_limit",
@@ -1717,7 +1721,7 @@ def audit_sealed_frozen_archive(args: argparse.Namespace, trials: Sequence[Trial
             Path(args.base_manifest),
             args.expected_parent_sha256,
             Path(args.supplement),
-            Path(args.repo_root),
+            Path(args.base_repo_root),
         )
     except bootstrap.BootstrapError as error:
         raise AcceptanceError(f"sealed Phase-9 supplement audit failed: {error}") from error
@@ -2010,24 +2014,45 @@ def git_output(root: Path, arguments: Sequence[str], label: str) -> str:
     return completed.stdout
 
 
-def validate_clean_git_checkout(root: Path, expected_revision: str | None = None) -> str:
-    """Return HEAD only for a canonical checkout with no tracked or untracked dirt."""
+def validate_git_toplevel(root: Path, label: str) -> Path:
+    """Reject aliases and subdirectories; return one exact Git worktree root."""
 
-    root = require_lexical_directory(root, "repository root")
-    top = Path(git_output(root, ("rev-parse", "--show-toplevel"), "repository root").strip())
-    try:
-        top = top.resolve(strict=True)
-    except OSError as error:
-        raise AcceptanceError(f"cannot resolve Git repository root {top}: {error}") from error
+    root = require_lexical_directory(root.absolute(), label)
+    top_text = git_output(root, ("rev-parse", "--show-toplevel"), label).strip()
+    if not top_text:
+        raise AcceptanceError(f"git returned an empty toplevel for {label}: {root}")
+    top = require_lexical_directory(Path(top_text).absolute(), f"Git {label} toplevel")
     if top != root:
-        raise AcceptanceError(f"repository root {root} is not Git toplevel {top}")
+        raise AcceptanceError(f"{label} {root} is not exact Git toplevel {top}")
+    return root
+
+
+def validate_git_revision(root: Path, expected_revision: str, label: str) -> str:
+    """Bind a canonical worktree to an external full revision."""
+
+    root = validate_git_toplevel(root, label)
+    if re.fullmatch(r"[0-9a-f]{40,64}", expected_revision) is None:
+        raise AcceptanceError(f"{label} expected revision is not a canonical object ID")
     head = git_output(root, ("rev-parse", "--verify", "HEAD"), "HEAD").strip()
     if re.fullmatch(r"[0-9a-f]{40,64}", head) is None:
         raise AcceptanceError(f"Git HEAD is not a canonical object ID: {head!r}")
-    if expected_revision is not None and head != expected_revision:
+    if head != expected_revision:
         raise AcceptanceError(
-            f"working revision {expected_revision} does not equal live Git HEAD {head}"
+            f"{label} revision {expected_revision} does not equal live Git HEAD {head}"
         )
+    return head
+
+
+def validate_clean_git_checkout(root: Path, expected_revision: str | None = None) -> str:
+    """Return HEAD only for a canonical checkout with no tracked or untracked dirt."""
+
+    root = validate_git_toplevel(root, "working repository root")
+    if expected_revision is None:
+        head = git_output(root, ("rev-parse", "--verify", "HEAD"), "HEAD").strip()
+        if re.fullmatch(r"[0-9a-f]{40,64}", head) is None:
+            raise AcceptanceError(f"Git HEAD is not a canonical object ID: {head!r}")
+    else:
+        head = validate_git_revision(root, expected_revision, "working repository root")
     status = git_output(
         root,
         ("status", "--porcelain=v1", "--untracked-files=all"),
@@ -2039,6 +2064,36 @@ def validate_clean_git_checkout(root: Path, expected_revision: str | None = None
             f"repository is not completely clean (first tracked/untracked entry: {first})"
         )
     return head
+
+
+def validate_base_repo_root(root: Path, expected_revision: str) -> Path:
+    """Validate the persistent Phase-0 asset root without requiring it clean."""
+
+    root = validate_git_toplevel(root, "sealed base repository root")
+    validate_git_revision(root, expected_revision, "sealed base repository root")
+    return root
+
+
+def validate_working_repo_root(root: Path, expected_revision: str) -> Path:
+    """Validate the clean current checkout that owns this acceptance script."""
+
+    root = validate_git_toplevel(root, "working repository root")
+    if root != REPOSITORY_ROOT:
+        raise AcceptanceError(
+            f"working repository root must be this acceptance checkout {REPOSITORY_ROOT}"
+        )
+    validate_clean_git_checkout(root, expected_revision)
+    return root
+
+
+def production_paths(working_root: Path) -> tuple[Path, Path, Path]:
+    """Derive product paths only from the externally supplied working root."""
+
+    return (
+        working_root / "build" / "bin" / "larch2",
+        working_root / "build" / "bin" / "dagutil",
+        working_root / "tools" / "wric_spr_search_benchmark.sh",
+    )
 
 
 def require_exact_production_tool(argument: str, expected: Path, label: str) -> Path:
@@ -2177,7 +2232,11 @@ def command_entries(path: Path) -> list[tuple[str, tuple[str, ...]]]:
 
 
 def validate_phase9_commands(
-    root: Path, commands: Path, audited, repo_root: Path
+    root: Path,
+    commands: Path,
+    audited,
+    base_repo_root: Path,
+    working_repo_root: Path,
 ) -> str:
     try:
         import wric_phase9_manifest_bootstrap as bootstrap  # noqa: PLC0415
@@ -2188,7 +2247,8 @@ def validate_phase9_commands(
     for label, tokens in entries:
         observed.setdefault(label, []).append(tokens)
     relevant: list[tuple[str, tuple[str, ...]]] = []
-    dagutil = os.fspath(PRODUCTION_DAGUTIL.resolve(strict=True))
+    _, working_dagutil, _ = production_paths(working_repo_root)
+    dagutil = os.fspath(working_dagutil.resolve(strict=True))
     measured_rows = [
         row
         for row in audited.supplement.rows
@@ -2214,7 +2274,7 @@ def validate_phase9_commands(
         row_safe = sanitize_harness_name(row_id)
         try:
             primary = bootstrap.resolve_manifest_uri(
-                audited.supplement.path, row["primary_uri"], repo_root
+                audited.supplement.path, row["primary_uri"], base_repo_root
             )
         except bootstrap.BootstrapError as error:
             raise AcceptanceError(f"cannot resolve command input for {row_id}: {error}") from error
@@ -2284,7 +2344,11 @@ def validate_phase9_commands(
 
 
 def validate_run_configuration(
-    root: Path, row_ids: Sequence[str], audited, repo_root: Path
+    root: Path,
+    row_ids: Sequence[str],
+    audited,
+    base_repo_root: Path,
+    working_repo_root: Path,
 ) -> dict[str, str]:
     summary = require_run_artifact(root / "summary.md", root, "benchmark summary")
     commands = require_run_artifact(root / "commands.sh", root, "benchmark commands log")
@@ -2303,7 +2367,9 @@ def validate_run_configuration(
         for worker in MEASURED_WORKERS
     }:
         raise AcceptanceError("run configuration row IDs are not the exact Phase-9 matrix")
-    command_contract = validate_phase9_commands(root, commands, audited, repo_root)
+    command_contract = validate_phase9_commands(
+        root, commands, audited, base_repo_root, working_repo_root
+    )
     return {
         "summary_sha256": sha256_file(summary, "benchmark summary"),
         "commands_sha256": sha256_file(commands, "benchmark commands log"),
@@ -2326,20 +2392,24 @@ def seal_run(args: argparse.Namespace) -> dict[str, object]:
         raise AcceptanceError("current-run affinity differs from the sealed supplement affinity")
     if re.fullmatch(r"[0-9a-f]{40,64}", args.working_revision) is None:
         raise AcceptanceError("--working-revision is not a canonical Git object ID")
-    repo_root = require_lexical_directory(Path(args.repo_root), "repository root")
-    if repo_root != REPOSITORY_ROOT:
-        raise AcceptanceError(
-            f"final seal repository root must be this checkout {REPOSITORY_ROOT}"
-        )
-    head = validate_clean_git_checkout(repo_root, args.working_revision)
+    base_root = validate_base_repo_root(
+        Path(args.base_repo_root), audited.base.preamble["repo_revision"]
+    )
+    working_root = validate_working_repo_root(
+        Path(args.working_repo_root), args.working_revision
+    )
+    head = args.working_revision
+    production_larch2, production_dagutil, production_harness = production_paths(
+        working_root
+    )
     larch2 = require_exact_production_tool(
-        args.working_larch2, PRODUCTION_LARCH2, "working larch2"
+        args.working_larch2, production_larch2, "working larch2"
     )
     dagutil = require_exact_production_tool(
-        args.working_dagutil, PRODUCTION_DAGUTIL, "working dagutil"
+        args.working_dagutil, production_dagutil, "working dagutil"
     )
     harness = require_exact_production_tool(
-        args.benchmark_harness, PRODUCTION_HARNESS, "benchmark harness"
+        args.benchmark_harness, production_harness, "benchmark harness"
     )
     tool_hashes = {
         "working_larch2_sha256": sha256_file(larch2, "working larch2"),
@@ -2355,7 +2425,7 @@ def seal_run(args: argparse.Namespace) -> dict[str, object]:
             raise AcceptanceError(f"run seal destination is already occupied: {path}")
     row_ids = sorted({trial.row_id for trial in trials})
     configuration_hashes = validate_run_configuration(
-        root, row_ids, audited, repo_root
+        root, row_ids, audited, base_root, working_root
     )
     metadata: dict[str, object] = {
         "schema": RUN_SCHEMA,
@@ -2372,6 +2442,9 @@ def seal_run(args: argparse.Namespace) -> dict[str, object]:
         "supplement_manifest_sha256": audited.supplement.sha256,
         "characterization_sha256": audited.characterization.sha256,
         "fixture_sha256": audited_fixture_sha256(audited),
+        "base_repo_root": os.fspath(base_root),
+        "base_revision": audited.base.preamble["repo_revision"],
+        "working_repo_root": os.fspath(working_root),
         "working_revision": head,
         "repository_status": "clean",
         "binary_provenance_limit": (
@@ -2441,7 +2514,8 @@ def verify_expected_run_ledger_anchor(root: Path, expected_sha256: str) -> str:
 def audit_run_archive(
     root_text: str,
     audited,
-    repo_root_text: str,
+    base_repo_root_text: str,
+    working_repo_root_text: str,
     expected_ledger_sha256: str,
 ) -> tuple[dict[str, object], dict[str, object]]:
     root = require_lexical_directory(Path(root_text), "benchmark directory")
@@ -2455,6 +2529,17 @@ def audit_run_archive(
         raise AcceptanceError("run artifact ledger or detached seal is externally hard-linked")
     metadata = read_json_object(metadata_path, "run metadata")
     require_exact_json_keys(metadata, RUN_METADATA_KEYS, "run metadata")
+    base_root = validate_base_repo_root(
+        Path(base_repo_root_text), audited.base.preamble["repo_revision"]
+    )
+    working_revision = metadata.get("working_revision")
+    if not isinstance(working_revision, str) or re.fullmatch(
+        r"[0-9a-f]{40,64}", working_revision
+    ) is None:
+        raise AcceptanceError("run metadata working_revision is invalid")
+    working_root = validate_working_repo_root(
+        Path(working_repo_root_text), working_revision
+    )
     literals: Mapping[str, object] = {
         "schema": RUN_SCHEMA,
         "schema_version": RUN_SCHEMA_VERSION,
@@ -2469,6 +2554,9 @@ def audit_run_archive(
         "supplement_manifest_sha256": audited.supplement.sha256,
         "characterization_sha256": audited.characterization.sha256,
         "fixture_sha256": audited_fixture_sha256(audited),
+        "base_repo_root": os.fspath(base_root),
+        "base_revision": audited.base.preamble["repo_revision"],
+        "working_repo_root": os.fspath(working_root),
         "repository_status": "clean",
         "binary_provenance_limit": (
             "binary hashes bind the measured executables, but no reproducible-build "
@@ -2487,32 +2575,25 @@ def audit_run_archive(
             raise AcceptanceError(f"run metadata {key}={actual!r}, expected {expected!r}")
     if metadata["affinity_cpus"] != audited.characterization.preamble["affinity_cpus"]:
         raise AcceptanceError("run metadata affinity differs from sealed supplement")
-    if not isinstance(metadata["working_revision"], str) or re.fullmatch(
-        r"[0-9a-f]{40,64}", metadata["working_revision"]
-    ) is None:
-        raise AcceptanceError("run metadata working_revision is invalid")
-    repo_root = require_lexical_directory(Path(repo_root_text), "repository root")
-    if repo_root != REPOSITORY_ROOT:
-        raise AcceptanceError(
-            f"final evaluation repository root must be this checkout {REPOSITORY_ROOT}"
-        )
-    validate_clean_git_checkout(repo_root, cast(str, metadata["working_revision"]))
+    production_larch2, production_dagutil, production_harness = production_paths(
+        working_root
+    )
     live_tool_hashes = {
         "working_larch2_sha256": sha256_file(
             require_exact_production_tool(
-                os.fspath(PRODUCTION_LARCH2), PRODUCTION_LARCH2, "working larch2"
+                os.fspath(production_larch2), production_larch2, "working larch2"
             ),
             "working larch2",
         ),
         "working_dagutil_sha256": sha256_file(
             require_exact_production_tool(
-                os.fspath(PRODUCTION_DAGUTIL), PRODUCTION_DAGUTIL, "working dagutil"
+                os.fspath(production_dagutil), production_dagutil, "working dagutil"
             ),
             "working dagutil",
         ),
         "benchmark_harness_sha256": sha256_file(
             require_exact_production_tool(
-                os.fspath(PRODUCTION_HARNESS), PRODUCTION_HARNESS, "benchmark harness"
+                os.fspath(production_harness), production_harness, "benchmark harness"
             ),
             "benchmark harness",
         ),
@@ -2536,7 +2617,11 @@ def audit_run_archive(
     if sha256_file(raw_path, "raw trials") != metadata["raw_trials_sha256"]:
         raise AcceptanceError("run metadata raw-trials hash mismatch")
     configuration_hashes = validate_run_configuration(
-        root, cast(list[str], metadata["row_ids"]), audited, repo_root
+        root,
+        cast(list[str], metadata["row_ids"]),
+        audited,
+        base_root,
+        working_root,
     )
     for key, value in configuration_hashes.items():
         if metadata[key] != value:
@@ -2687,7 +2772,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
         run_metadata, run_ledger = audit_run_archive(
             os.fspath(benchmark_dir),
             audited,
-            args.repo_root,
+            args.base_repo_root,
+            args.working_repo_root,
             args.expected_run_ledger_sha256,
         )
         frozen_result = {
@@ -3081,7 +3167,18 @@ def build_parser() -> argparse.ArgumentParser:
         target.add_argument("--base-manifest", required=True)
         target.add_argument("--expected-parent-sha256", required=True)
         target.add_argument("--supplement", required=True)
-        target.add_argument("--repo-root", required=True)
+        target.add_argument(
+            "--base-repo-root",
+            help="canonical Git worktree containing sealed Phase-0 repo:// assets",
+        )
+        target.add_argument(
+            "--working-repo-root",
+            help="clean current checkout containing this tool and build/bin products",
+        )
+        target.add_argument(
+            "--repo-root",
+            help="backward-compatible alias setting both repository roots",
+        )
 
     seal = subparsers.add_parser("seal-run", help="validate and exclusively seal current run evidence")
     seal.add_argument("--benchmark-dir", required=True)
@@ -3101,7 +3198,11 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument("--base-manifest")
     evaluate_parser.add_argument("--expected-parent-sha256")
     evaluate_parser.add_argument("--supplement")
-    evaluate_parser.add_argument("--repo-root")
+    evaluate_parser.add_argument("--base-repo-root")
+    evaluate_parser.add_argument("--working-repo-root")
+    evaluate_parser.add_argument(
+        "--repo-root", help="backward-compatible alias setting both repository roots"
+    )
     evaluate_parser.add_argument(
         "--expected-run-ledger-sha256",
         help="external SHA-256 anchor printed by seal-run",
@@ -3123,16 +3224,44 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def normalize_repository_root_options(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    """Resolve explicit split roots or one legacy same-root alias."""
+
+    legacy = getattr(args, "repo_root", None)
+    base = getattr(args, "base_repo_root", None)
+    working = getattr(args, "working_repo_root", None)
+    if legacy is not None:
+        if base is not None or working is not None:
+            parser.error(
+                "--repo-root cannot be combined with --base-repo-root or "
+                "--working-repo-root"
+            )
+        args.base_repo_root = legacy
+        args.working_repo_root = legacy
+        return
+    if base is None or working is None:
+        parser.error(
+            "final provenance requires both --base-repo-root and "
+            "--working-repo-root"
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     targets: list[tuple[Path, str]] = []
+    if args.command == "seal-run":
+        normalize_repository_root_options(args, parser)
     if args.command == "evaluate":
         deferred = args.defer_frozen_oracle_characterization is not None
         provenance_values = (
             args.base_manifest,
             args.expected_parent_sha256,
             args.supplement,
+            args.base_repo_root,
+            args.working_repo_root,
             args.repo_root,
             args.expected_run_ledger_sha256,
         )
@@ -3142,11 +3271,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             if any(provenance_values):
                 parser.error("deferred/non-final evaluation must not mix in partial sealed provenance")
         else:
-            if not all(provenance_values):
+            non_root_values = (
+                args.base_manifest,
+                args.expected_parent_sha256,
+                args.supplement,
+                args.expected_run_ledger_sha256,
+            )
+            if not all(non_root_values):
                 parser.error(
                     "final evaluation requires --base-manifest, --expected-parent-sha256, "
-                    "--supplement, --repo-root, and --expected-run-ledger-sha256"
+                    "--supplement, split repository roots, and "
+                    "--expected-run-ledger-sha256"
                 )
+            normalize_repository_root_options(args, parser)
             if args.frozen_oracle_report:
                 parser.error("ad-hoc --frozen-oracle-report is permitted only in deferred/non-final mode")
         benchmark_root = (
