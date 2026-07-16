@@ -596,6 +596,25 @@ def main() -> None:
             assert "already exists" in result.stderr
             manifest = bootstrap.core.read_manifest(output, REPO, expected_kind="supplement")
             assert len(manifest.rows) == (4 if profile == "phase8" else 24)
+            profile_assets = output.with_name(output.stem + ".assets")
+            expected_capture_identity = {
+                "capture_contract_sha256": bootstrap.core.sha256_file(
+                    profile_assets / "provenance/capture-contract.json"
+                ),
+                "base_manifest_sha256": manifest.preamble["parent_sha256"],
+                "frozen_oracle_sha256": manifest.preamble[
+                    "frozen_oracle_dagutil_sha256"
+                ],
+                "process_metrics_sha256": phase9_test.file_digest(case.runner),
+            }
+            profile_statuses = sorted(
+                (profile_assets / "provenance").rglob("status.json")
+            )
+            assert profile_statuses
+            for profile_status in profile_statuses:
+                status_value = json.loads(profile_status.read_text())
+                assert status_value["schema_version"] == 2
+                assert status_value["capture_identity"] == expected_capture_identity
             if profile == "phase8":
                 assets = output.with_name("phase8-generation.assets")
                 source_row = (

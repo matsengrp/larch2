@@ -31,6 +31,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from typing import Callable, Mapping, NoReturn, Sequence
 
 sys.dont_write_bytecode = True
@@ -56,7 +57,7 @@ MEMORY_BUDGET_BYTES = core.MEMORY_BUDGET_BYTES
 CAPTURE_SCHEMA = "wric_phase7_lazy_completion_capture"
 CAPTURE_SCHEMA_VERSION = 1
 QUALIFICATION_STATUS_SCHEMA = "wric_phase7_auto_qualification_status"
-QUALIFICATION_STATUS_VERSION = 1
+QUALIFICATION_STATUS_VERSION = 2
 
 TREE_FIXTURE = phase78.FixtureSpec(
     key="tree0",
@@ -500,6 +501,24 @@ def capture_contract_bytes(
     )
 
 
+def completion_capture_identity(
+    base: core.Manifest,
+    source: Mapping[tuple[str, str, int], SourceEvidence],
+    affinity: str,
+    process_metrics_sha256: str,
+    working_chart_sha256: str,
+) -> phase78.CaptureIdentity:
+    contract = capture_contract_bytes(
+        base, source, affinity, process_metrics_sha256, working_chart_sha256
+    )
+    return phase78.CaptureIdentity(
+        capture_contract_sha256=core.sha256_bytes(contract),
+        base_manifest_sha256=base.sha256,
+        frozen_oracle_sha256=base.preamble["frozen_oracle_dagutil_sha256"],
+        process_metrics_sha256=process_metrics_sha256,
+    )
+
+
 def initialize_capture(
     capture_dir: Path,
     base: core.Manifest,
@@ -521,10 +540,10 @@ def initialize_capture(
     contract = capture_contract_bytes(
         base, source, affinity, process_metrics_sha256, working_chart_sha256
     )
-    core.ensure_exact_file(
+    phase78.ensure_exact_capture_file(
         capture / "capture-contract.json", contract, "completion capture contract"
     )
-    core.ensure_exact_file(
+    phase78.ensure_exact_capture_file(
         capture / "capture-contract.json.sha256",
         core.seal_bytes("capture-contract.json", contract),
         "completion capture contract seal",
@@ -562,6 +581,155 @@ def require_report(report, key: str, wanted: str, label: str) -> None:
         fail(f"{label}: report {key}={actual!r}, expected {wanted!r}")
 
 
+def report_unsigned(report, key: str, label: str) -> int:
+    value = report_value(report, key, label)
+    if re.fullmatch(r"0|[1-9][0-9]*", value) is None:
+        fail(f"{label}: report {key} is not a canonical unsigned integer")
+    return int(value)
+
+
+def lazy_policy_index_hash(active_patterns: int, pilot_patterns: int) -> int:
+    """Reproduce the frozen v1 midpoint-strata integer hash."""
+
+    mask = (1 << 64) - 1
+    value = 1469598103934665603
+    base, remainder = divmod(active_patterns, pilot_patterns)
+    for stratum in range(pilot_patterns):
+        begin = stratum * base + min(stratum, remainder)
+        width = base + (1 if stratum < remainder else 0)
+        index = begin + (width - 1) // 2
+        mixed = (
+            index
+            + 0x9E3779B97F4A7C15
+            + ((value << 6) & mask)
+            + (value >> 2)
+        ) & mask
+        value = (value ^ mixed) & mask
+    return value
+
+
+def validate_auto_policy_v1(
+    report,
+    workers: int,
+    source_matrix: Mapping[tuple[str, str, int], SourceEvidence],
+) -> str:
+    """Independently resolve the complete frozen v1 integer auto policy."""
+
+    label = medium_row_id(workers)
+    require_report(report, "lazy_policy_version", "1", label)
+    require_report(report, "lazy_policy_requested", "auto", label)
+    require_report(report, "lazy_policy_frozen", "true", label)
+    require_report(report, "lazy_policy_measurements_available", "true", label)
+    require_report(report, "lazy_policy_pilot_runs", "1", label)
+
+    integer_fields = (
+        "lazy_policy_active_patterns",
+        "lazy_policy_pilot_patterns",
+        "lazy_policy_pilot_pattern_index_hash",
+        "lazy_policy_pilot_inside_chart_builds",
+        "lazy_policy_pilot_outside_chart_builds",
+        "lazy_policy_pilot_exact_builds",
+        "lazy_policy_pilot_scheduler_submissions",
+        "lazy_policy_pilot_internal_structural_classes_max",
+        "lazy_policy_pilot_structural_ratio_numerator",
+        "lazy_policy_pilot_structural_ratio_denominator",
+        "lazy_policy_pilot_inside_rows",
+        "lazy_policy_pilot_dense_rows",
+        "lazy_policy_pilot_row_ratio_numerator",
+        "lazy_policy_pilot_row_ratio_denominator",
+        "lazy_policy_pilot_estimated_allocation_bytes",
+        "lazy_policy_estimated_lazy_cache_bytes",
+        "lazy_policy_estimated_dense_cache_bytes",
+        "lazy_policy_pilot_key_words",
+        "lazy_policy_pilot_dense_row_work",
+        "lazy_policy_frozen_reuses",
+    )
+    values = {key: report_unsigned(report, key, label) for key in integer_fields}
+    active = values["lazy_policy_active_patterns"]
+    expected_source = source_matrix[("medium", "off", workers)].row
+    if active != int(expected_source["expected_active_patterns"]):
+        fail(f"{label}: auto-policy active-pattern count differs from sealed source")
+    if values["lazy_policy_estimated_lazy_cache_bytes"] == 0 or values[
+        "lazy_policy_estimated_dense_cache_bytes"
+    ] == 0:
+        fail(f"{label}: auto-policy cache byte estimates must be positive")
+
+    zero_after_preflight = (
+        "lazy_policy_pilot_patterns",
+        "lazy_policy_pilot_pattern_index_hash",
+        "lazy_policy_pilot_inside_chart_builds",
+        "lazy_policy_pilot_outside_chart_builds",
+        "lazy_policy_pilot_exact_builds",
+        "lazy_policy_pilot_scheduler_submissions",
+        "lazy_policy_pilot_internal_structural_classes_max",
+        "lazy_policy_pilot_structural_ratio_numerator",
+        "lazy_policy_pilot_structural_ratio_denominator",
+        "lazy_policy_pilot_inside_rows",
+        "lazy_policy_pilot_dense_rows",
+        "lazy_policy_pilot_row_ratio_numerator",
+        "lazy_policy_pilot_row_ratio_denominator",
+        "lazy_policy_pilot_key_words",
+        "lazy_policy_pilot_dense_row_work",
+    )
+    if active == 0:
+        wanted_reason = "no_active_patterns"
+    elif values["lazy_policy_estimated_lazy_cache_bytes"] > MEMORY_BUDGET_BYTES:
+        wanted_reason = "full_lazy_budget_exceeded"
+    elif values["lazy_policy_pilot_estimated_allocation_bytes"] > MEMORY_BUDGET_BYTES:
+        wanted_reason = "pilot_budget_exceeded"
+    else:
+        pilot = values["lazy_policy_pilot_patterns"]
+        wanted_pilot = min(32, active)
+        clades = int(expected_source["expected_initial_clades"])
+        dense_rows = values["lazy_policy_pilot_dense_rows"]
+        if (
+            pilot != wanted_pilot
+            or values["lazy_policy_pilot_pattern_index_hash"]
+            != lazy_policy_index_hash(active, wanted_pilot)
+            or values["lazy_policy_pilot_inside_chart_builds"] != 1
+            or values["lazy_policy_pilot_outside_chart_builds"] != 0
+            or values["lazy_policy_pilot_exact_builds"] != 0
+            or values["lazy_policy_pilot_scheduler_submissions"] != 0
+            or dense_rows != wanted_pilot * clades
+            or values["lazy_policy_pilot_structural_ratio_numerator"]
+            != values["lazy_policy_pilot_internal_structural_classes_max"]
+            or values["lazy_policy_pilot_structural_ratio_denominator"] != pilot
+            or values["lazy_policy_pilot_row_ratio_numerator"]
+            != values["lazy_policy_pilot_inside_rows"]
+            or values["lazy_policy_pilot_row_ratio_denominator"] != dense_rows
+            or values["lazy_policy_pilot_dense_row_work"] != dense_rows
+        ):
+            fail(f"{label}: auto-policy pilot integer identities are inconsistent")
+        internal = values["lazy_policy_pilot_internal_structural_classes_max"]
+        inside_rows = values["lazy_policy_pilot_inside_rows"]
+        key_words = values["lazy_policy_pilot_key_words"]
+        if pilot == 0 or internal == 0:
+            wanted_reason = "no_internal_structural_classes"
+        elif internal > pilot // 3 and inside_rows > dense_rows // 8:
+            wanted_reason = "structural_and_strong_row_ratios_exceeded"
+        elif inside_rows > dense_rows // 2:
+            wanted_reason = "row_ratio_above_one_half"
+        elif key_words > dense_rows * 8:
+            wanted_reason = "key_work_above_eight_dense_rows"
+        else:
+            wanted_reason = "compression_thresholds_and_budget_safe"
+
+    if wanted_reason in (
+        "no_active_patterns",
+        "full_lazy_budget_exceeded",
+        "pilot_budget_exceeded",
+    ) and any(values[key] != 0 for key in zero_after_preflight):
+        fail(f"{label}: auto-policy preflight rejection retains pilot measurements")
+    resolved = (
+        "on"
+        if wanted_reason == "compression_thresholds_and_budget_safe"
+        else "off"
+    )
+    require_report(report, "lazy_policy_reason", wanted_reason, label)
+    require_report(report, "lazy_policy_resolved", resolved, label)
+    return resolved
+
+
 def qualification_status_bytes(
     directory: Path,
     workers: int,
@@ -570,6 +738,7 @@ def qualification_status_bytes(
     affinity: str,
     process_metrics_sha256: str,
     working_chart_sha256: str,
+    capture_identity: phase78.CaptureIdentity,
 ) -> bytes:
     auto_row = qualification_row(
         source,
@@ -583,6 +752,7 @@ def qualification_status_bytes(
         {
             "schema": QUALIFICATION_STATUS_SCHEMA,
             "schema_version": QUALIFICATION_STATUS_VERSION,
+            "capture_identity": dataclasses.asdict(capture_identity),
             "row_id": medium_row_id(workers),
             "workers": workers,
             "resolved_policy": source.policy,
@@ -630,6 +800,7 @@ def validate_qualification(
     affinity: str,
     process_metrics_sha256: str,
     working_chart_sha256: str,
+    capture_identity: phase78.CaptureIdentity,
     *,
     validate_status: bool = True,
 ) -> QualificationEvidence:
@@ -713,14 +884,7 @@ def validate_qualification(
     }
     for key, wanted in bindings.items():
         require_report(report, key, wanted, medium_row_id(workers))
-    require_report(report, "lazy_policy_requested", "auto", medium_row_id(workers))
-    resolved = report_value(report, "lazy_policy_resolved", medium_row_id(workers))
-    if resolved not in ("off", "on"):
-        fail(f"medium auto qualification W{workers} has invalid resolution {resolved!r}")
-    require_report(report, "lazy_policy_frozen", "true", medium_row_id(workers))
-    pilot_runs = report_value(report, "lazy_policy_pilot_runs", medium_row_id(workers))
-    if pilot_runs != "1":
-        fail(f"medium auto qualification W{workers} did not execute one bounded pilot")
+    resolved = validate_auto_policy_v1(report, workers, source_matrix)
     source = source_matrix[("medium", resolved, workers)]
     wanted_cache = "lazy_multisite_chart" if resolved == "on" else "all_active_patterns"
     require_report(report, "cache_strategy", wanted_cache, medium_row_id(workers))
@@ -775,6 +939,7 @@ def validate_qualification(
             affinity,
             process_metrics_sha256,
             working_chart_sha256,
+            capture_identity,
         )
         phase78.validate_status_file(
             directory / "status.json", wanted_status, "medium auto qualification"
@@ -795,6 +960,7 @@ def capture_qualification(
     affinity: str,
     process_metrics_sha256: str,
     working_chart_sha256: str,
+    capture_identity: phase78.CaptureIdentity,
     *,
     before_publish: Callable[[], None] | None = None,
 ) -> QualificationEvidence:
@@ -809,6 +975,7 @@ def capture_qualification(
             affinity,
             process_metrics_sha256,
             working_chart_sha256,
+            capture_identity,
         )
     phase78.remove_staging(staging)
     staging.mkdir(mode=0o755)
@@ -859,6 +1026,7 @@ def capture_qualification(
         affinity,
         process_metrics_sha256,
         working_chart_sha256,
+        capture_identity,
         validate_status=False,
     )
     status = qualification_status_bytes(
@@ -869,6 +1037,7 @@ def capture_qualification(
         affinity,
         process_metrics_sha256,
         working_chart_sha256,
+        capture_identity,
     )
     core.copy_bytes(staging / "status.json", status, 0o444)
     core.copy_bytes(
@@ -887,6 +1056,7 @@ def capture_qualification(
         affinity,
         process_metrics_sha256,
         working_chart_sha256,
+        capture_identity,
     )
 
 
@@ -931,6 +1101,13 @@ def capture_all(
         process_metrics_sha256,
         working_chart_sha256,
     )
+    identity = completion_capture_identity(
+        base,
+        source,
+        affinity,
+        process_metrics_sha256,
+        working_chart_sha256,
+    )
     tree_path = phase78.fixture_path(root, TREE_FIXTURE)
     tree_input = phase78.capture_input(
         TREE_PROFILE,
@@ -940,6 +1117,7 @@ def capture_all(
         process_metrics,
         affinity,
         capture / "inputs",
+        identity,
     )
     tree_rows: list[phase78.RowEvidence] = []
     for workers in WORKERS:
@@ -954,6 +1132,7 @@ def capture_all(
             process_metrics,
             affinity,
             capture / "rows",
+            identity,
         )
         compare_tree_evidence(evidence, source[("tree0", "off", workers)])
         tree_rows.append(evidence)
@@ -981,6 +1160,7 @@ def capture_all(
             affinity,
             process_metrics_sha256,
             working_chart_sha256,
+            identity,
         )
         for workers in WORKERS
     )
@@ -1239,26 +1419,102 @@ def read_capture_contract(
     asset_root: Path,
     base: core.Manifest,
     source: Mapping[tuple[str, str, int], SourceEvidence],
+    expected_affinity: str,
     expected_process_metrics_sha256: str,
     expected_working_chart_sha256: str,
-) -> str:
+) -> phase78.CaptureIdentity:
     path = asset_root / "provenance/capture-contract.json"
     digest = core.verify_detached_seal(path)
     value = core.read_json_object(path, "completion capture contract")
     affinity = value.get("affinity_cpus")
-    if not isinstance(affinity, str):
-        fail("completion capture contract lacks affinity")
-    core.validate_affinity(affinity, "completion capture")
+    if affinity != expected_affinity:
+        fail("completion capture affinity differs from the sealed source affinity")
     wanted = capture_contract_bytes(
         base,
         source,
-        affinity,
+        expected_affinity,
         expected_process_metrics_sha256,
         expected_working_chart_sha256,
     )
     if path.read_bytes() != wanted or digest != core.sha256_bytes(wanted):
         fail("completion capture contract differs from exact base/binary binding")
-    return affinity
+    return phase78.CaptureIdentity(
+        capture_contract_sha256=digest,
+        base_manifest_sha256=base.sha256,
+        frozen_oracle_sha256=base.preamble["frozen_oracle_dagutil_sha256"],
+        process_metrics_sha256=expected_process_metrics_sha256,
+    )
+
+
+def audit_archived_canonical_identity(
+    asset_root: Path,
+    oracle: Path,
+    process_metrics: Path,
+    affinity: str,
+) -> None:
+    """Recompute every archived protobuf identity under the approved runner."""
+
+    environment = {
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TZ": "Europe/Sofia",
+    }
+    with tempfile.TemporaryDirectory(
+        prefix="wric-phase7-completion-canonical-audit-"
+    ) as temporary:
+        replay_root = Path(temporary)
+        input_replay = replay_root / "tree0-input"
+        input_replay.mkdir(mode=0o755)
+        phase78.run_enforced_capture_command(
+            process_metrics,
+            core.actual_input_command(
+                oracle,
+                affinity,
+                asset_root / "fixtures/tree0.pb.gz",
+                input_replay,
+            ),
+            input_replay / "report.txt",
+            input_replay / "stderr.txt",
+            input_replay / "process-metrics.txt",
+            environment,
+            "completion archived tree0 input canonical audit",
+        )
+        archived_input = asset_root / "provenance/inputs/tree0/canonical.json"
+        if (input_replay / "canonical.json").read_bytes() != archived_input.read_bytes():
+            fail("archived tree0 input canonical identity differs from sealed oracle replay")
+
+        output_directories = [
+            asset_root / f"provenance/rows/{tree_row_id(workers)}"
+            for workers in WORKERS
+        ] + [
+            asset_root / f"provenance/qualifications/{medium_row_id(workers)}"
+            for workers in WORKERS
+        ]
+        for index, archived in enumerate(output_directories):
+            replay = replay_root / f"output-{index}"
+            replay.mkdir(mode=0o755)
+            phase78.run_enforced_capture_command(
+                process_metrics,
+                output_command(
+                    oracle,
+                    archived / "output.pb.gz",
+                    replay / "output-canonical.json",
+                    affinity,
+                ),
+                replay / "output-report.txt",
+                replay / "output-stderr.txt",
+                replay / "output-process-metrics.txt",
+                environment,
+                f"completion archived output canonical audit {archived.name}",
+            )
+            if (replay / "output-canonical.json").read_bytes() != (
+                archived / "output-canonical.json"
+            ).read_bytes():
+                fail(
+                    "archived output protobuf canonical identity differs from "
+                    f"sealed oracle replay: {archived.name}"
+                )
 
 
 def audit_archive(
@@ -1266,12 +1522,26 @@ def audit_archive(
     supplement: core.Manifest,
     source: Mapping[tuple[str, str, int], SourceEvidence],
     root: Path,
+    expected_affinity: str,
     expected_process_metrics_sha256: str,
     expected_working_chart_sha256: str,
-) -> tuple[str, tuple[phase78.RowEvidence, ...], tuple[QualificationEvidence, ...]]:
+    oracle: Path,
+    process_metrics: Path,
+) -> tuple[tuple[phase78.RowEvidence, ...], tuple[QualificationEvidence, ...]]:
+    expected_asset_name = supplement.path.stem + ".assets"
+    expected_commands_uri = f"manifest://{expected_asset_name}/commands.sh"
+    if supplement.preamble["commands_uri"] != expected_commands_uri:
+        fail("completion commands_uri leaves the exact supplement asset namespace")
     commands = core.resolve_manifest_uri(
         supplement.path, supplement.preamble["commands_uri"], root
     )
+    expected_commands = core.resolve_lexical_regular(
+        supplement.path.parent,
+        Path(expected_asset_name) / "commands.sh",
+        "exact completion commands asset",
+    )
+    if commands != expected_commands:
+        fail("completion commands asset is not in the exact supplement namespace")
     asset_root = core.require_lexical_directory(
         commands.parent, "completion supplement assets"
     )
@@ -1293,10 +1563,11 @@ def audit_archive(
         if member.stat().st_nlink != 1 or core.sha256_file(member) != digest:
             fail(f"completion asset changed: {relative}")
     core.audit_exact_asset_tree(asset_root, wanted_members | {"assets.sha256", "commands.sh"})
-    affinity = read_capture_contract(
+    identity = read_capture_contract(
         asset_root,
         base,
         source,
+        expected_affinity,
         expected_process_metrics_sha256,
         expected_working_chart_sha256,
     )
@@ -1317,7 +1588,7 @@ def audit_archive(
         if (prefix / "canonical.json").read_bytes() != evidence.compact.read_bytes():
             fail(f"archived source compact report changed: {evidence.row['row_id']}")
     tree_input = phase78.parse_input_evidence(
-        TREE_FIXTURE, asset_root / "provenance/inputs/tree0"
+        TREE_FIXTURE, asset_root / "provenance/inputs/tree0", identity
     )
     tree_rows: list[phase78.RowEvidence] = []
     qualifications: list[QualificationEvidence] = []
@@ -1329,7 +1600,8 @@ def audit_archive(
             workers,
             asset_root / f"provenance/rows/{tree_row_id(workers)}",
             tree_input,
-            affinity,
+            expected_affinity,
+            identity,
         )
         compare_tree_evidence(tree, source[("tree0", "off", workers)])
         tree_rows.append(tree)
@@ -1340,16 +1612,20 @@ def audit_archive(
                 workers,
                 source,
                 base.sha256,
-                affinity,
+                expected_affinity,
                 expected_process_metrics_sha256,
                 expected_working_chart_sha256,
+                identity,
             )
         )
+    audit_archived_canonical_identity(
+        asset_root, oracle, process_metrics, expected_affinity
+    )
     rows = make_manifest_rows(
         source,
         tree_rows,
         qualifications,
-        affinity,
+        expected_affinity,
         supplement.path.stem + ".assets",
     )
     wanted_commands = render_commands(
@@ -1361,7 +1637,7 @@ def audit_archive(
     )
     if commands.read_bytes() != wanted_commands or not commands.stat().st_mode & 0o111:
         fail("completion commands asset changed")
-    return affinity, tuple(tree_rows), tuple(qualifications)
+    return tuple(tree_rows), tuple(qualifications)
 
 
 def audit_supplement(
@@ -1371,6 +1647,7 @@ def audit_supplement(
     root: Path,
     expected_process_metrics_sha256: str,
     expected_working_chart_sha256: str,
+    process_metrics_path: Path,
 ) -> AuditedBundle:
     core.validate_hash(expected_parent_sha256, "expected parent SHA-256")
     core.validate_hash(expected_process_metrics_sha256, "process-metrics SHA-256")
@@ -1382,6 +1659,19 @@ def audit_supplement(
         fail(str(error))
     if base.sha256 != expected_parent_sha256 or base.preamble["parent_sha256"] != "-":
         fail("sealed base is not the exact expected Phase-0 root")
+    process_metrics, runner_sha = validate_executable(
+        process_metrics_path,
+        expected_process_metrics_sha256,
+        "process-metrics runner",
+    )
+    oracle_path = core.resolve_manifest_uri(
+        base.path, base.preamble["frozen_oracle_dagutil_uri"], root
+    )
+    oracle, oracle_sha = validate_executable(
+        oracle_path,
+        base.preamble["frozen_oracle_dagutil_sha256"],
+        "sealed frozen oracle",
+    )
     if supplement.path.name != OUTPUT_NAME:
         fail(f"completion supplement basename must be {OUTPUT_NAME}")
     if supplement.preamble["manifest_id"] != MANIFEST_ID:
@@ -1412,13 +1702,16 @@ def audit_supplement(
     affinity = source_ids[seed_id]["affinity_cpus"]
     core.validate_affinity(affinity, "completion source")
     source = validate_source_matrix(base, root, affinity)
-    affinity, tree_rows, qualifications = audit_archive(
+    tree_rows, qualifications = audit_archive(
         base,
         supplement,
         source,
         root,
+        affinity,
         expected_process_metrics_sha256,
         expected_working_chart_sha256,
+        oracle,
+        process_metrics,
     )
     expected_rows = make_manifest_rows(
         source,
@@ -1441,6 +1734,10 @@ def audit_supplement(
                 )
         fail("completion supplement rows differ from re-derived evidence")
     assert_no_resolution_collisions(base, expected_rows)
+    if core.sha256_file(process_metrics) != runner_sha or core.sha256_file(
+        oracle
+    ) != oracle_sha:
+        fail("runner/frozen oracle changed during completion canonical audit")
     return AuditedBundle(
         base,
         supplement,
@@ -1673,6 +1970,7 @@ def build_locked(
             root,
             runner_sha,
             working_sha,
+            runner,
         )
         validate_with_harness(bundle, args.benchmark_harness, runner, root)
 
@@ -1692,6 +1990,7 @@ def build_locked(
             root,
             runner_sha,
             working_sha,
+            runner,
         )
         validate_with_harness(bundle, args.benchmark_harness, runner, root)
         core.finish_publication(publication)
@@ -1721,6 +2020,7 @@ def common_audit(args: argparse.Namespace, root: Path, supplement: Path) -> Audi
         root,
         runner_sha,
         working_sha,
+        runner,
     )
     validate_with_harness(bundle, args.benchmark_harness, runner, root)
     return bundle

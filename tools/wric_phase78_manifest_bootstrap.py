@@ -58,7 +58,7 @@ HARNESS_SENTINEL_GROUP = "phase78-bootstrap-validation-sentinel"
 CAPTURE_SCHEMA = "wric_phase78_frozen_capture"
 CAPTURE_SCHEMA_VERSION = 1
 CAPTURE_STATUS_SCHEMA = "wric_phase78_capture_status"
-CAPTURE_STATUS_VERSION = 1
+CAPTURE_STATUS_VERSION = 2
 
 INPUT_FILES = (
     "report.txt",
@@ -191,6 +191,16 @@ class InputEvidence:
     semantic_sha256: str
     parsimony_min: int
     canonical_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class CaptureIdentity:
+    """Externally rooted identity inherited by every capture status record."""
+
+    capture_contract_sha256: str
+    base_manifest_sha256: str
+    frozen_oracle_sha256: str
+    process_metrics_sha256: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -676,6 +686,7 @@ def parse_row_evidence(
     directory: Path,
     input_evidence: InputEvidence,
     affinity: str,
+    capture_identity: CaptureIdentity,
     *,
     validate_status: bool = True,
 ) -> RowEvidence:
@@ -934,7 +945,7 @@ def parse_row_evidence(
         lazy_merge_ratio=lazy_merge,
     )
     if validate_status:
-        validate_row_status(profile, evidence, affinity)
+        validate_row_status(profile, evidence, affinity, capture_identity)
     return evidence
 
 
@@ -946,12 +957,14 @@ def input_status_bytes(
     fixture: FixtureSpec,
     evidence: InputEvidence,
     directory: Path,
+    capture_identity: CaptureIdentity,
 ) -> bytes:
     return json_bytes(
         {
             "schema": CAPTURE_STATUS_SCHEMA,
             "schema_version": CAPTURE_STATUS_VERSION,
             "kind": "input",
+            "capture_identity": dataclasses.asdict(capture_identity),
             "fixture_key": fixture.key,
             "fixture_sha256": fixture.sha256,
             "semantic_sha256": evidence.semantic_sha256,
@@ -962,7 +975,12 @@ def input_status_bytes(
     )
 
 
-def row_status_bytes(profile: Profile, evidence: RowEvidence, affinity: str) -> bytes:
+def row_status_bytes(
+    profile: Profile,
+    evidence: RowEvidence,
+    affinity: str,
+    capture_identity: CaptureIdentity,
+) -> bytes:
     row = contract_row(
         profile,
         evidence.fixture,
@@ -976,6 +994,7 @@ def row_status_bytes(profile: Profile, evidence: RowEvidence, affinity: str) -> 
             "schema": CAPTURE_STATUS_SCHEMA,
             "schema_version": CAPTURE_STATUS_VERSION,
             "kind": "search",
+            "capture_identity": dataclasses.asdict(capture_identity),
             "profile": profile.name,
             "row_id": capture_row_id(
                 profile, evidence.fixture, evidence.policy, evidence.workers
@@ -999,16 +1018,25 @@ def validate_status_file(path: Path, wanted: bytes, label: str) -> None:
         fail(f"{label} differs from its re-derived exact bytes: {path}")
 
 
-def validate_row_status(profile: Profile, evidence: RowEvidence, affinity: str) -> None:
+def validate_row_status(
+    profile: Profile,
+    evidence: RowEvidence,
+    affinity: str,
+    capture_identity: CaptureIdentity,
+) -> None:
     validate_status_file(
         evidence.directory / "status.json",
-        row_status_bytes(profile, evidence, affinity),
+        row_status_bytes(profile, evidence, affinity, capture_identity),
         "capture row status",
     )
 
 
 def parse_input_evidence(
-    fixture: FixtureSpec, directory: Path, *, validate_status: bool = True
+    fixture: FixtureSpec,
+    directory: Path,
+    capture_identity: CaptureIdentity,
+    *,
+    validate_status: bool = True,
 ) -> InputEvidence:
     directory = core.require_lexical_directory(directory, "frozen input capture")
     expected_names = set(INPUT_FILES)
@@ -1042,7 +1070,7 @@ def parse_input_evidence(
     if validate_status:
         validate_status_file(
             directory / "status.json",
-            input_status_bytes(fixture, evidence, directory),
+            input_status_bytes(fixture, evidence, directory, capture_identity),
             "input capture status",
         )
     return evidence
@@ -1095,6 +1123,21 @@ def capture_contract_bytes(
             "fixtures": [dataclasses.asdict(item) for item in profile.fixtures],
             "rows": rows,
         }
+    )
+
+
+def capture_identity(
+    profile: Profile,
+    base: core.Manifest,
+    process_metrics_sha256: str,
+    affinity: str,
+) -> CaptureIdentity:
+    contract = capture_contract_bytes(profile, base, process_metrics_sha256, affinity)
+    return CaptureIdentity(
+        capture_contract_sha256=core.sha256_bytes(contract),
+        base_manifest_sha256=base.sha256,
+        frozen_oracle_sha256=base.preamble["frozen_oracle_dagutil_sha256"],
+        process_metrics_sha256=process_metrics_sha256,
     )
 
 
@@ -1242,12 +1285,13 @@ def capture_input(
     process_metrics: Path,
     affinity: str,
     inputs: Path,
+    capture_identity: CaptureIdentity,
 ) -> InputEvidence:
     del profile  # the input canonical contract is profile-independent
     destination = inputs / fixture.key
     staging = inputs / f".{fixture.key}.staging"
     if os.path.lexists(destination):
-        evidence = parse_input_evidence(fixture, destination)
+        evidence = parse_input_evidence(fixture, destination, capture_identity)
         remove_staging(staging)
         return evidence
     remove_staging(staging)
@@ -1270,17 +1314,19 @@ def capture_input(
         )
         for name in INPUT_FILES:
             core.require_regular(staging / name, f"fresh input {name}")
-        evidence = parse_input_evidence(fixture, staging, validate_status=False)
-        status = input_status_bytes(fixture, evidence, staging)
+        evidence = parse_input_evidence(
+            fixture, staging, capture_identity, validate_status=False
+        )
+        status = input_status_bytes(fixture, evidence, staging, capture_identity)
         core.copy_bytes(staging / "status.json", status, 0o444)
         core.copy_bytes(
             staging / "status.json.sha256",
             core.seal_bytes("status.json", status),
             0o444,
         )
-        parse_input_evidence(fixture, staging)
+        parse_input_evidence(fixture, staging, capture_identity)
         seal_capture_directory(staging, destination)
-        return parse_input_evidence(fixture, destination)
+        return parse_input_evidence(fixture, destination, capture_identity)
     except BaseException:
         # A non-cooperating writer can create the destination after our
         # existence check.  Keep both names for fail-closed inspection; never
@@ -1302,13 +1348,21 @@ def capture_row(
     process_metrics: Path,
     affinity: str,
     rows: Path,
+    capture_identity: CaptureIdentity,
 ) -> RowEvidence:
     row_name = capture_row_id(profile, fixture, policy, workers)
     destination = rows / row_name
     staging = rows / f".{row_name}.staging"
     if os.path.lexists(destination):
         evidence = parse_row_evidence(
-            profile, fixture, policy, workers, destination, input_evidence, affinity
+            profile,
+            fixture,
+            policy,
+            workers,
+            destination,
+            input_evidence,
+            affinity,
+            capture_identity,
         )
         remove_staging(staging)
         return evidence
@@ -1357,9 +1411,10 @@ def capture_row(
             staging,
             input_evidence,
             affinity,
+            capture_identity,
             validate_status=False,
         )
-        status = row_status_bytes(profile, evidence, affinity)
+        status = row_status_bytes(profile, evidence, affinity, capture_identity)
         core.copy_bytes(staging / "status.json", status, 0o444)
         core.copy_bytes(
             staging / "status.json.sha256",
@@ -1367,11 +1422,25 @@ def capture_row(
             0o444,
         )
         parse_row_evidence(
-            profile, fixture, policy, workers, staging, input_evidence, affinity
+            profile,
+            fixture,
+            policy,
+            workers,
+            staging,
+            input_evidence,
+            affinity,
+            capture_identity,
         )
         seal_capture_directory(staging, destination)
         return parse_row_evidence(
-            profile, fixture, policy, workers, destination, input_evidence, affinity
+            profile,
+            fixture,
+            policy,
+            workers,
+            destination,
+            input_evidence,
+            affinity,
+            capture_identity,
         )
     except BaseException:
         if not os.path.lexists(destination):
@@ -1456,6 +1525,7 @@ def capture_profile(
     capture = initialize_capture(
         capture_dir, profile, base, process_metrics_sha256, affinity
     )
+    identity = capture_identity(profile, base, process_metrics_sha256, affinity)
     inputs: dict[str, InputEvidence] = {}
     evidence: list[RowEvidence] = []
     for fixture in profile.fixtures:
@@ -1468,6 +1538,7 @@ def capture_profile(
             process_metrics,
             affinity,
             capture / "inputs",
+            identity,
         )
         for policy in forced_policies(profile):
             for workers in WORKERS:
@@ -1483,6 +1554,7 @@ def capture_profile(
                         process_metrics,
                         affinity,
                         capture / "rows",
+                        identity,
                     )
                 )
     expected_input_names = {fixture.key for fixture in profile.fixtures}
@@ -1778,7 +1850,7 @@ def expected_archive_members(profile: Profile) -> set[str]:
 
 def read_capture_contract(
     profile: Profile, base: core.Manifest, asset_root: Path
-) -> tuple[str, str]:
+) -> tuple[str, str, CaptureIdentity]:
     path = asset_root / "provenance" / "capture-contract.json"
     digest = core.verify_detached_seal(path)
     try:
@@ -1796,7 +1868,16 @@ def read_capture_contract(
     )
     if path.read_bytes() != wanted or digest != core.sha256_bytes(wanted):
         fail("archived capture contract differs from the closed profile contract")
-    return process_metrics_sha256, affinity
+    return (
+        process_metrics_sha256,
+        affinity,
+        CaptureIdentity(
+            capture_contract_sha256=digest,
+            base_manifest_sha256=base.sha256,
+            frozen_oracle_sha256=base.preamble["frozen_oracle_dagutil_sha256"],
+            process_metrics_sha256=process_metrics_sha256,
+        ),
+    )
 
 
 def audit_archive(
@@ -1826,7 +1907,7 @@ def audit_archive(
         if member.stat().st_nlink != 1 or core.sha256_file(member) != digest:
             fail(f"asset ledger member changed: {relative}")
     core.audit_exact_asset_tree(asset_root, expected | {"assets.sha256", "commands.sh"})
-    process_metrics_sha256, affinity = read_capture_contract(
+    process_metrics_sha256, affinity, identity = read_capture_contract(
         profile, base, asset_root
     )
     input_evidence: dict[str, InputEvidence] = {}
@@ -1841,7 +1922,9 @@ def audit_archive(
             if core.sha256_file(reference_copy) != fixture.ref_sha256:
                 fail(f"archived fixture reference hash changed: {fixture.key}")
         input_directory = asset_root / "provenance" / "inputs" / fixture.key
-        input_evidence[fixture.key] = parse_input_evidence(fixture, input_directory)
+        input_evidence[fixture.key] = parse_input_evidence(
+            fixture, input_directory, identity
+        )
         for policy in forced_policies(profile):
             for workers in WORKERS:
                 row_name = capture_row_id(profile, fixture, policy, workers)
@@ -1854,6 +1937,7 @@ def audit_archive(
                         asset_root / "provenance" / "rows" / row_name,
                         input_evidence[fixture.key],
                         affinity,
+                        identity,
                     )
                 )
     validate_matrix(profile, evidence)
