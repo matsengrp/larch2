@@ -10739,6 +10739,88 @@ static phase4_fixture make_three_misplaced_groups_fixture() {
   return f;
 }
 
+static void test_phase9_serialized_three_accept_fixture_contract() {
+  std::println("test_phase9_serialized_three_accept_fixture_contract");
+
+  auto dag = larch::load_proto_dag("test/wric_chart_three_accepts.pb.gz");
+  auto grammar = larch::build_clade_grammar(dag);
+  CHECK(grammar.taxa.id_to_sample_id.size() == 12);
+  CHECK(grammar.clades.size() == 23);
+  CHECK(grammar.productions.size() == 11);
+  CHECK(larch::get_reference_sequence(dag).size() == 2592);
+
+  // The committed topology is exactly the three-disjoint-misplaced-quartet
+  // shape used by the in-memory multi-accept oracle.
+  for (auto const& pair : std::array<std::array<std::string_view, 2>, 6>{{
+           {{"A", "C"}},
+           {{"B", "D"}},
+           {{"E", "G"}},
+           {{"F", "H"}},
+           {{"I", "K"}},
+           {{"J", "L"}},
+       }}) {
+    (void)clade_for(grammar, {std::string{pair[0]}, std::string{pair[1]}});
+  }
+
+  auto patterns = larch::build_site_patterns(dag, grammar);
+  CHECK(patterns.total_site_count == 2592);
+  CHECK(patterns.taxon_count == 12);
+  CHECK(patterns.patterns.size() == 2592);
+  CHECK(patterns.invariant_site_count == 0);
+  CHECK(patterns.variable_site_count == 2592);
+
+  std::array<std::array<larch::taxon_id, 4>, 3> quartet_taxa{{
+      {{taxon_for(grammar, "A"), taxon_for(grammar, "B"),
+        taxon_for(grammar, "C"), taxon_for(grammar, "D")}},
+      {{taxon_for(grammar, "E"), taxon_for(grammar, "F"),
+        taxon_for(grammar, "G"), taxon_for(grammar, "H")}},
+      {{taxon_for(grammar, "I"), taxon_for(grammar, "J"),
+        taxon_for(grammar, "K"), taxon_for(grammar, "L")}},
+  }};
+  std::size_t preferred_only_patterns = 0;
+  std::size_t one_neutral_patterns = 0;
+  std::array<std::size_t, 3> neutral_patterns_by_quartet{};
+
+  for (auto const& pattern : patterns.patterns) {
+    CHECK(pattern.weight == 1);
+    CHECK(pattern.positions.size() == 1);
+    std::size_t neutral_quartets = 0;
+    for (std::size_t quartet_index = 0; quartet_index < quartet_taxa.size();
+         ++quartet_index) {
+      auto const& taxa = quartet_taxa[quartet_index];
+      auto const first = pattern.state_by_taxon[taxa[0]];
+      auto const second = pattern.state_by_taxon[taxa[1]];
+      auto const third = pattern.state_by_taxon[taxa[2]];
+      auto const fourth = pattern.state_by_taxon[taxa[3]];
+      if (first == second && second == third && third == fourth) {
+        CHECK(first == larch::nuc_base::A || first == larch::nuc_base::C);
+        ++neutral_quartets;
+        ++neutral_patterns_by_quartet[quartet_index];
+      } else {
+        CHECK(first == second);
+        CHECK(third == fourth);
+        CHECK(first != third);
+      }
+    }
+    CHECK(neutral_quartets <= 1);
+    if (neutral_quartets == 0)
+      ++preferred_only_patterns;
+    else
+      ++one_neutral_patterns;
+  }
+
+  CHECK(preferred_only_patterns == 1728);
+  CHECK(one_neutral_patterns == 864);
+  CHECK(neutral_patterns_by_quartet ==
+        (std::array<std::size_t, 3>{288, 288, 288}));
+
+  auto active = larch::make_active_search_patterns(dag, grammar);
+  CHECK(active.skipped_invariant_site_count == 0);
+  CHECK(active.active_patterns.patterns.patterns.size() == 2592);
+
+  std::println("  PASS");
+}
+
 enum class phase6_semantic_matrix_case {
   dense_cold_ua_two_pass,
   lazy_transient_exact,
@@ -12698,6 +12780,7 @@ static void test_exact_verifier_activity_is_exception_safe() {
 
 int main() {
   test_exact_verifier_activity_is_exception_safe();
+  test_phase9_serialized_three_accept_fixture_contract();
   test_lower_bound_oracle_counters_show_full_rebuild_cost();
   test_local_rejected_candidate_counter_guardrail();
   test_streaming_and_eager_candidate_apis_match();
