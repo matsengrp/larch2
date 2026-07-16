@@ -1250,6 +1250,10 @@ add_test(NAME wric_benchmark_capture_test
          COMMAND python3 test/wric_benchmark_capture_test.py
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(wric_benchmark_capture_test PROPERTIES TIMEOUT 120)
+add_test(NAME wric_historical_harness_compat_test
+         COMMAND python3 test/wric_historical_harness_compat_test.py
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(wric_historical_harness_compat_test PROPERTIES TIMEOUT 120)
 
 # Phase 10 (cross-cutting CLI / report / identity surface) library-level tests.
 add_executable(chart_spr_phase10_test test/chart_spr_phase10_test.cpp)
