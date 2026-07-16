@@ -19,10 +19,10 @@ import argparse
 import base64
 import csv
 import hashlib
-import importlib.util
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -33,7 +33,7 @@ from typing import Any, Mapping, NoReturn, Sequence
 
 
 SCHEMA = "wric.benchmark_capture"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 METADATA_NAME = "wric-benchmark-run-metadata.json"
 HARNESS_STDOUT_NAME = "wric-benchmark-harness.stdout"
 HARNESS_STDERR_NAME = "wric-benchmark-harness.stderr"
@@ -54,6 +54,7 @@ EXPECTED_TOOLCHAIN = Path("/home/ogi-agent/install/gcc-trunk")
 EXPECTED_COMPILER_LINK_COUNT = 4
 EXPECTED_BUILD_TYPE = "RelWithDebInfo"
 EXPECTED_RELWITHDEBINFO_FLAGS = "-O2 -g -DNDEBUG"
+EXPECTED_EFFECTIVE_CXX_FLAGS = "-O2 -g -DNDEBUG -std=c++26 -freflection"
 TIMED_TRIAL_DIGEST_FIX_REVISION = "3ac59125484790deed7fc21f0ef9572f0781164a"
 BINARY_PROVENANCE_LIMIT = (
     "binary hashes bind the measured executables, but no reproducible-build "
@@ -61,6 +62,12 @@ BINARY_PROVENANCE_LIMIT = (
 )
 PHYSICAL_AFFINITY = "0,2,4,6,8,10,12,14"
 SMT_AFFINITY = "0-15"
+PHASE0_CAPTURE_METADATA_NAME = "capture-metadata.txt"
+PHASE0_CALIBRATION_RELATIVE = "bootstrap-phase0/wrapper-calibration.json"
+PHASE0_CALIBRATION_SCHEMA = "wric_process_wrapper_calibration"
+PHASE0_CALIBRATION_SCHEMA_VERSION = 3
+SYS_CPU_ROOT = Path("/sys/devices/system/cpu")
+PROC_CPUINFO = Path("/proc/cpuinfo")
 
 
 def component(
@@ -192,6 +199,20 @@ RUN_COMPONENTS: Mapping[str, Sequence[Mapping[str, object]]] = {
     ),
 }
 
+HISTORICAL_RUN_REVISIONS: Mapping[str, str] = {
+    "phase1": "208ce23f0c005d3702d114f535fe21564b3b79b6",
+    "phase2": "0c4623ba1793395ae8f5c3df2a2524a27d89bc80",
+    "phase3": "7d294d68eaadc8c55b92be4f5589278c8a2f78f2",
+    "phase4": "cbf92b62284b2a93e506f59187ac94a5336b0be3",
+    "phase5": "3a10e9cc45050f7a6f846f9f1adb8d5f4157f9a5",
+    "phase6": "870c298ff1c0c21901bdf79d341bf97d121f389c",
+    "phase7-high": "38e9a281396e5263647ba68724414848841525d7",
+    "phase7-small": "38e9a281396e5263647ba68724414848841525d7",
+    "phase7-auto": "38e9a281396e5263647ba68724414848841525d7",
+    "phase8-end-to-end": "38e9a281396e5263647ba68724414848841525d7",
+    "phase8-generation": "6c8d0c7651c2aa2e5c396d0f57c2e4e18c322310",
+}
+
 SAFE_HARNESS_ENVIRONMENT = {
     "HOME": "/nonexistent",
     "LANG": "C",
@@ -245,6 +266,7 @@ RUN_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 SAFE_COMPONENT_RE = re.compile(r"[A-Za-z0-9_.-]+\Z")
 CMAKE_ENTRY_RE = re.compile(r"([A-Za-z0-9_.+-]+):([A-Za-z]+)=(.*)\Z")
 MAX_JSON_BYTES = 4 * 1024 * 1024
+MAX_ARTIFACT_LEDGER_BYTES = 64 * 1024 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024
 CHUNK_SIZE = 1024 * 1024
 
@@ -270,11 +292,13 @@ TOP_LEVEL_KEYS = frozenset(
         "compiler_version",
         "dagutil_flags",
         "environment",
+        "effective_build_commands",
         "harness_argv",
         "harness_argv_sha256",
         "harness_configuration",
         "harness_execution",
         "harness_provenance",
+        "host_contract",
         "tracked_git_blobs",
         "phase0_chain",
         "postprocessor",
@@ -297,7 +321,20 @@ TOOL_KEYS = frozenset(
         "frozen_oracle_dagutil",
         "frozen_process_metrics",
         "generic_ledger",
+        "dagutil_compile_flags",
+        "dagutil_link_command",
+        "larch_compile_flags",
+        "larch_link_command",
         "product_dagutil",
+    }
+)
+NONEXECUTABLE_TOOL_ROLES = frozenset(
+    {
+        "cmake_cache",
+        "dagutil_compile_flags",
+        "dagutil_link_command",
+        "larch_compile_flags",
+        "larch_link_command",
     }
 )
 FILE_SNAPSHOT_KEYS = frozenset(
@@ -322,6 +359,8 @@ REPOSITORY_STATE_KEYS = frozenset(
         "porcelain_v2_z_base64",
         "porcelain_v2_z_bytes",
         "porcelain_v2_z_sha256",
+        "tracked_files_v_z_bytes",
+        "tracked_files_v_z_sha256",
         "toplevel",
     }
 )
@@ -329,7 +368,15 @@ TRACKED_BLOB_KEYS = frozenset(
     {"capture_wrapper", "generic_ledger", "product_harness"}
 )
 TRACKED_BLOB_RECORD_KEYS = frozenset(
-    {"mode", "object_id", "relative", "repository"}
+    {
+        "blob_bytes",
+        "blob_sha256",
+        "mode",
+        "object_id",
+        "relative",
+        "repository",
+        "working_file",
+    }
 )
 OBSERVATION_KEYS = frozenset(
     {
@@ -349,6 +396,15 @@ class CaptureError(RuntimeError):
 
 def fail(message: str) -> NoReturn:
     raise CaptureError(message)
+
+
+def require_run_revision(run_label: str, product_revision: str) -> None:
+    historical = HISTORICAL_RUN_REVISIONS.get(run_label)
+    if historical is not None and product_revision != historical:
+        fail(
+            f"{run_label} requires exact historical product revision "
+            f"{historical}, not {product_revision}"
+        )
 
 
 def sha256_bytes(payload: bytes) -> str:
@@ -447,13 +503,15 @@ def snapshot_directory(path: Path, label: str) -> dict[str, object]:
     }
 
 
-def snapshot_file(
+def inspect_file(
     value: str | Path,
     label: str,
     *,
     executable: bool,
     expected_nlink: int = 1,
-) -> dict[str, object]:
+    collect_payload: bool,
+    maximum_bytes: int | None = None,
+) -> tuple[dict[str, object], bytes | None]:
     path = canonical_existing_path(value, label)
     descriptor: int | None = None
     try:
@@ -474,19 +532,24 @@ def snapshot_file(
             fail(f"{label} changed while opening: {path}")
         digest = hashlib.sha256()
         total = 0
+        chunks: list[bytes] | None = [] if collect_payload else None
         while True:
             block = os.read(descriptor, CHUNK_SIZE)
             if not block:
                 break
             digest.update(block)
             total += len(block)
+            if maximum_bytes is not None and total > maximum_bytes:
+                fail(f"{label} exceeds the maximum supported size")
+            if chunks is not None:
+                chunks.append(block)
         after = os.fstat(descriptor)
         if stable_signature(after) != stable_signature(before) or total != after.st_size:
             fail(f"{label} changed while hashing: {path}")
         lexical_after = path.lstat()
         if stable_signature(lexical_after) != stable_signature(after):
             fail(f"{label} path identity changed while hashing: {path}")
-        return {
+        snapshot = {
             "bytes": total,
             "ctime_ns": after.st_ctime_ns,
             "device": after.st_dev,
@@ -497,6 +560,7 @@ def snapshot_file(
             "path": os.fspath(path),
             "sha256": digest.hexdigest(),
         }
+        return snapshot, (b"".join(chunks) if chunks is not None else None)
     except CaptureError:
         raise
     except OSError as error:
@@ -504,6 +568,43 @@ def snapshot_file(
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def snapshot_file(
+    value: str | Path,
+    label: str,
+    *,
+    executable: bool,
+    expected_nlink: int = 1,
+) -> dict[str, object]:
+    snapshot, _ = inspect_file(
+        value,
+        label,
+        executable=executable,
+        expected_nlink=expected_nlink,
+        collect_payload=False,
+    )
+    return snapshot
+
+
+def read_snapshotted_file(
+    value: str | Path,
+    label: str,
+    *,
+    executable: bool = False,
+    expected_nlink: int = 1,
+    maximum_bytes: int | None = None,
+) -> tuple[dict[str, object], bytes]:
+    snapshot, payload = inspect_file(
+        value,
+        label,
+        executable=executable,
+        expected_nlink=expected_nlink,
+        collect_payload=True,
+        maximum_bytes=maximum_bytes,
+    )
+    assert payload is not None
+    return snapshot, payload
 
 
 def require_exact_keys(value: Mapping[str, object], keys: frozenset[str], label: str) -> None:
@@ -549,6 +650,7 @@ def git_run(root: Path, arguments: Sequence[str], label: str) -> bytes:
     environment = {
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_OPTIONAL_LOCKS": "0",
         "HOME": "/nonexistent",
         "LANG": "C",
@@ -557,7 +659,18 @@ def git_run(root: Path, arguments: Sequence[str], label: str) -> bytes:
     }
     try:
         completed = subprocess.run(
-            ["/usr/bin/git", "-C", os.fspath(root), *arguments],
+            [
+                "/usr/bin/git",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "core.filemode=true",
+                "-C",
+                os.fspath(root),
+                *arguments,
+            ],
             check=False,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -586,6 +699,7 @@ def git_is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
     environment = {
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_OPTIONAL_LOCKS": "0",
         "HOME": "/nonexistent",
         "LANG": "C",
@@ -595,6 +709,12 @@ def git_is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
     completed = subprocess.run(
         [
             "/usr/bin/git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.filemode=true",
             "-C",
             os.fspath(root),
             "merge-base",
@@ -636,9 +756,15 @@ def require_timed_trial_digest_fix(
             "pre-timed-trial-digest product revisions require an externally anchored "
             "materialized compatibility harness"
         )
+    _, payload = read_snapshotted_file(
+        harness,
+        "tracked product harness score-domain source",
+        executable=True,
+        maximum_bytes=MAX_JSON_BYTES,
+    )
     try:
-        text = harness.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
         fail(f"cannot inspect tracked product harness score-domain fix: {error}")
     required_fragments = (
         'reported=${field[${raw_index[best_reported_objective]}]}',
@@ -695,12 +821,28 @@ def repository_state(
     if require_clean and porcelain:
         first = porcelain.split(b"\0", 1)[0].decode("utf-8", errors="backslashreplace")
         fail(f"{label} is not completely clean (first porcelain-v2 record: {first})")
+    tracked_files = git_run(
+        root,
+        ("ls-files", "-v", "-f", "-z"),
+        f"{label} tracked-file flags",
+    )
+    for record in tracked_files.split(b"\0"):
+        if not record:
+            continue
+        if len(record) < 3 or record[1:2] != b" " or record[:1] != b"H":
+            detail = record[:256].decode("utf-8", errors="backslashreplace")
+            fail(
+                f"{label} has a forbidden tracked-file index flag "
+                f"(assume-unchanged/skip-worktree or non-stage-0 state): {detail}"
+            )
     return {
         "head": head,
         "object_format": object_format,
         "porcelain_v2_z_base64": base64.b64encode(porcelain).decode("ascii"),
         "porcelain_v2_z_bytes": len(porcelain),
         "porcelain_v2_z_sha256": sha256_bytes(porcelain),
+        "tracked_files_v_z_bytes": len(tracked_files),
+        "tracked_files_v_z_sha256": sha256_bytes(tracked_files),
         "toplevel": os.fspath(root),
     }
 
@@ -719,37 +861,104 @@ def require_tracked_file(root: Path, path: Path, label: str) -> None:
         fail(f"{label} is not one exact tracked repository path: {relative}")
 
 
-def tracked_git_blob(root: Path, path: Path, label: str) -> dict[str, str]:
+def tracked_git_blob(root: Path, path: Path, label: str) -> dict[str, object]:
     require_tracked_file(root, path, label)
     relative = path.relative_to(root).as_posix()
-    output = git_text(
+    index_output = git_text(
         root,
         ("ls-files", "--stage", "--", relative),
-        f"{label} Git blob",
+        f"{label} index blob",
     )
-    match = re.fullmatch(r"(100755) ([0-9a-f]{40,64}) 0\t([^\n]+)\n", output)
-    if match is None or match.group(3) != relative:
+    index_match = re.fullmatch(
+        r"(100755) ([0-9a-f]{40,64}) 0\t([^\n]+)\n", index_output
+    )
+    if index_match is None or index_match.group(3) != relative:
         fail(f"{label} does not have one exact stage-0 executable Git blob")
+    tree_output = git_run(
+        root,
+        ("ls-tree", "-z", "HEAD", "--", relative),
+        f"{label} HEAD blob",
+    )
+    tree_match = re.fullmatch(
+        rb"(100755) blob ([0-9a-f]{40,64})\t([^\0]+)\0", tree_output
+    )
+    if tree_match is None:
+        fail(f"{label} is not one exact executable blob at HEAD")
+    try:
+        tree_object_id = tree_match.group(2).decode("ascii")
+        tree_relative = tree_match.group(3).decode("utf-8")
+    except (UnicodeDecodeError, IndexError):
+        fail(f"{label} HEAD blob record is not canonical text")
+    if tree_relative != relative:
+        fail(f"{label} HEAD blob path differs from its lexical repository path")
+    if (
+        index_match.group(1) != "100755"
+        or index_match.group(2) != tree_object_id
+    ):
+        fail(f"{label} index blob differs from HEAD")
+    blob = git_run(root, ("cat-file", "blob", tree_object_id), f"{label} HEAD blob bytes")
+    working = snapshot_file(path, label, executable=True, expected_nlink=1)
+    if working["bytes"] != len(blob) or working["sha256"] != sha256_bytes(blob):
+        fail(f"{label} working bytes differ from the exact HEAD blob")
     return {
-        "mode": match.group(1),
-        "object_id": match.group(2),
+        "blob_bytes": len(blob),
+        "blob_sha256": sha256_bytes(blob),
+        "mode": index_match.group(1),
+        "object_id": tree_object_id,
         "relative": relative,
         "repository": os.fspath(root),
+        "working_file": working,
     }
 
 
+def validate_tracked_git_blob_record(
+    value: object, label: str
+) -> Mapping[str, object]:
+    if not isinstance(value, dict):
+        fail(f"{label} is not an object")
+    require_exact_keys(value, TRACKED_BLOB_RECORD_KEYS, label)
+    if (
+        value["mode"] != "100755"
+        or not isinstance(value["object_id"], str)
+        or REVISION_RE.fullmatch(value["object_id"]) is None
+        or not isinstance(value["relative"], str)
+        or not isinstance(value["repository"], str)
+        or isinstance(value["blob_bytes"], bool)
+        or not isinstance(value["blob_bytes"], int)
+        or value["blob_bytes"] < 0
+        or not isinstance(value["blob_sha256"], str)
+        or SHA256_RE.fullmatch(value["blob_sha256"]) is None
+    ):
+        fail(f"{label} fields are invalid")
+    working = require_snapshot_shape(value["working_file"], f"{label} working file")
+    if (
+        working["bytes"] != value["blob_bytes"]
+        or working["sha256"] != value["blob_sha256"]
+    ):
+        fail(f"{label} working snapshot differs from its HEAD blob bytes")
+    return value
+
+
 def load_python_module(path: Path, role: str) -> ModuleType:
-    snapshot_file(path, role, executable=True)
+    _, payload = read_snapshotted_file(
+        path,
+        role,
+        executable=True,
+        expected_nlink=1,
+        maximum_bytes=MAX_JSON_BYTES,
+    )
     name = f"_wric_{path.stem}_{os.getpid()}_{id(path)}"
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        fail(f"cannot construct the {role} module loader")
-    module = importlib.util.module_from_spec(spec)
+    module = ModuleType(name)
+    module.__file__ = os.fspath(path)
     sys.modules[name] = module
     previous_dont_write_bytecode = sys.dont_write_bytecode
     sys.dont_write_bytecode = True
     try:
-        spec.loader.exec_module(module)
+        source = payload.decode("utf-8")
+        code = compile(source, os.fspath(path), "exec", dont_inherit=True)
+        exec(code, module.__dict__)
+    except UnicodeDecodeError as error:
+        fail(f"cannot load {role}: source is not UTF-8: {error}")
     except Exception as error:
         fail(f"cannot load {role}: {error}")
     finally:
@@ -785,6 +994,253 @@ def require_affinity(value: str) -> str:
     if value != live:
         fail(f"requested affinity is not the exact live canonical CPU list: {value!r} != {live!r}")
     return live
+
+
+def parse_cpu_list(value: str, label: str) -> set[int]:
+    if not value or re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*", value) is None:
+        fail(f"{label} is not a canonical CPU list: {value!r}")
+    result: set[int] = set()
+    for item in value.split(","):
+        fields = item.split("-", 1)
+        start = int(fields[0])
+        end = int(fields[-1])
+        if end < start:
+            fail(f"{label} has a descending CPU range: {item!r}")
+        for cpu in range(start, end + 1):
+            if cpu in result:
+                fail(f"{label} duplicates CPU {cpu}")
+            result.add(cpu)
+    if canonical_affinity(result) != value:
+        fail(f"{label} is not the unique canonical CPU-list spelling")
+    return result
+
+
+def read_virtual_ascii(path: Path, label: str, maximum_bytes: int = 1024 * 1024) -> str:
+    descriptor: int | None = None
+    try:
+        lexical = path.lstat()
+        if stat.S_ISLNK(lexical.st_mode) or not stat.S_ISREG(lexical.st_mode):
+            fail(f"{label} is not an exact regular virtual file: {path}")
+        descriptor = os.open(path, FILE_FLAGS)
+        before = os.fstat(descriptor)
+        if (
+            before.st_dev != lexical.st_dev
+            or before.st_ino != lexical.st_ino
+            or before.st_mode != lexical.st_mode
+        ):
+            fail(f"{label} changed while opening")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            block = os.read(descriptor, 64 * 1024)
+            if not block:
+                break
+            total += len(block)
+            if total > maximum_bytes:
+                fail(f"{label} exceeds the maximum supported size")
+            chunks.append(block)
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_mode != before.st_mode
+        ):
+            fail(f"{label} changed while reading")
+        return b"".join(chunks).decode("ascii")
+    except CaptureError:
+        raise
+    except (OSError, UnicodeDecodeError) as error:
+        fail(f"cannot read {label}: {error}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def host_topology_observation() -> dict[str, object]:
+    physical = parse_cpu_list(PHYSICAL_AFFINITY, "physical affinity contract")
+    smt = parse_cpu_list(SMT_AFFINITY, "SMT affinity contract")
+    online_text = read_virtual_ascii(SYS_CPU_ROOT / "online", "online CPU list").strip()
+    online = parse_cpu_list(online_text, "online CPU list")
+    if online != smt:
+        fail(
+            "live online CPUs differ from the sealed-host SMT contract: "
+            f"{canonical_affinity(online)} != {SMT_AFFINITY}"
+        )
+    cpuinfo = read_virtual_ascii(PROC_CPUINFO, "CPU information")
+    model_names = {
+        line.split(":", 1)[1].strip()
+        for line in cpuinfo.splitlines()
+        if line.startswith("model name") and ":" in line
+    }
+    if len(model_names) != 1 or not next(iter(model_names), ""):
+        fail("live CPU information does not contain one exact nonempty model name")
+    model_name = next(iter(model_names))
+    logical: list[dict[str, int | str]] = []
+    identities: dict[tuple[int, int], set[int]] = {}
+    for cpu in sorted(smt):
+        topology = SYS_CPU_ROOT / f"cpu{cpu}" / "topology"
+        try:
+            package_id = int(
+                read_virtual_ascii(
+                    topology / "physical_package_id", f"CPU {cpu} package ID"
+                ).strip()
+            )
+            core_id = int(
+                read_virtual_ascii(topology / "core_id", f"CPU {cpu} core ID").strip()
+            )
+        except ValueError:
+            fail(f"CPU {cpu} topology contains a non-integer package/core ID")
+        siblings_text = read_virtual_ascii(
+            topology / "thread_siblings_list", f"CPU {cpu} thread siblings"
+        ).strip()
+        siblings = parse_cpu_list(siblings_text, f"CPU {cpu} thread siblings")
+        if cpu not in siblings or not siblings <= smt:
+            fail(f"CPU {cpu} has thread siblings outside the sealed-host SMT set")
+        identity = (package_id, core_id)
+        identities.setdefault(identity, set()).add(cpu)
+        logical.append(
+            {
+                "core_id": core_id,
+                "cpu": cpu,
+                "package_id": package_id,
+                "thread_siblings": canonical_affinity(siblings),
+            }
+        )
+    if len(identities) != 8 or any(len(cpus) != 2 for cpus in identities.values()):
+        fail("sealed-host topology is not exactly eight two-thread physical cores")
+    for record in logical:
+        identity = (int(record["package_id"]), int(record["core_id"]))
+        if record["thread_siblings"] != canonical_affinity(identities[identity]):
+            fail(f"CPU {record['cpu']} thread-sibling topology is inconsistent")
+    physical_identities = {
+        (int(record["package_id"]), int(record["core_id"]))
+        for record in logical
+        if int(record["cpu"]) in physical
+    }
+    if len(physical) != 8 or physical_identities != set(identities):
+        fail("physical affinity does not select one CPU from every distinct core")
+    packages = {int(record["package_id"]) for record in logical}
+    if len(packages) != 1:
+        fail("sealed-host topology is not exactly one CPU package")
+    topology_text = "1 socket; 8 cores/socket; 2 threads/core; 16 logical CPUs"
+    return {
+        "cpu_model": model_name,
+        "cpu_topology": topology_text,
+        "logical_cpus": logical,
+        "online_cpus": canonical_affinity(online),
+        "physical_affinity": PHYSICAL_AFFINITY,
+        "smt_affinity": SMT_AFFINITY,
+    }
+
+
+def parse_capture_metadata_host(path: Path) -> dict[str, str]:
+    _, payload = read_snapshotted_file(
+        path, "Phase-0 capture metadata", maximum_bytes=MAX_JSON_BYTES
+    )
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("Phase-0 capture metadata is not UTF-8")
+    wanted = {
+        "cpu_model",
+        "cpu_topology",
+        "online_cpus",
+        "physical_core_cpu_list",
+    }
+    result: dict[str, str] = {}
+    for line in text.splitlines():
+        if ": " not in line:
+            continue
+        key, value = line.split(": ", 1)
+        if key not in wanted:
+            continue
+        if key in result or not value:
+            fail(f"Phase-0 capture metadata has duplicate/empty host field {key}")
+        result[key] = value
+    if set(result) != wanted:
+        fail(
+            "Phase-0 capture metadata lacks its exact host fields: "
+            f"{sorted(wanted - set(result))}"
+        )
+    return result
+
+
+def phase0_host_contract(
+    phase0_root: Path,
+    base_path: Path,
+    artifact_entries: Mapping[str, str],
+) -> dict[str, object]:
+    capture_metadata = canonical_existing_path(
+        base_path.parent / PHASE0_CAPTURE_METADATA_NAME,
+        "Phase-0 capture metadata",
+    )
+    calibration = canonical_existing_path(
+        base_path.parent / PHASE0_CALIBRATION_RELATIVE,
+        "Phase-0 wrapper calibration",
+    )
+    for path, label in (
+        (capture_metadata, "Phase-0 capture metadata"),
+        (calibration, "Phase-0 wrapper calibration"),
+    ):
+        recorded = artifact_digest_for(artifact_entries, phase0_root, path, label)
+        observed = snapshot_file(path, label, executable=False)["sha256"]
+        if recorded != observed:
+            fail(f"{label} differs from the Phase-0 artifact ledger")
+    metadata_host = parse_capture_metadata_host(capture_metadata)
+    _, calibration_payload = read_snapshotted_file(
+        calibration, "Phase-0 wrapper calibration", maximum_bytes=MAX_JSON_BYTES
+    )
+    calibration_json = strict_json_bytes(
+        calibration_payload, "Phase-0 wrapper calibration"
+    )
+    if (
+        calibration_json.get("schema") != PHASE0_CALIBRATION_SCHEMA
+        or calibration_json.get("schema_version") != PHASE0_CALIBRATION_SCHEMA_VERSION
+        or calibration_json.get("affinity_cpus") != PHYSICAL_AFFINITY
+    ):
+        fail("Phase-0 wrapper calibration host/schema contract is invalid")
+    summary = calibration_json.get("summary")
+    if not isinstance(summary, dict) or summary.get("decision") != "PASS":
+        fail("Phase-0 wrapper calibration did not record PASS")
+    live = host_topology_observation()
+    logical_value = live["logical_cpus"]
+    if not isinstance(logical_value, list):
+        fail("live logical CPU topology is not a list")
+    physical = parse_cpu_list(PHYSICAL_AFFINITY, "physical affinity")
+    expected_cores: list[dict[str, object]] = []
+    for record_value in logical_value:
+        if not isinstance(record_value, dict):
+            fail("live logical CPU topology contains a non-object record")
+        cpu = record_value.get("cpu")
+        if not isinstance(cpu, int):
+            fail("live logical CPU topology contains an invalid CPU ID")
+        if cpu in physical:
+            expected_cores.append(
+                {
+                    "core_id": record_value.get("core_id"),
+                    "cpu": cpu,
+                    "package_id": record_value.get("package_id"),
+                }
+            )
+    if calibration_json.get("physical_cores") != expected_cores:
+        fail("Phase-0 wrapper calibration physical cores differ from live topology")
+    expected_metadata = {
+        "cpu_model": live["cpu_model"],
+        "cpu_topology": live["cpu_topology"],
+        "online_cpus": live["online_cpus"],
+        "physical_core_cpu_list": PHYSICAL_AFFINITY,
+    }
+    if metadata_host != expected_metadata:
+        fail("Phase-0 capture metadata host identity differs from live topology")
+    return {
+        "calibration_sha256": artifact_digest_for(
+            artifact_entries, phase0_root, calibration, "Phase-0 wrapper calibration"
+        ),
+        "capture_metadata_sha256": artifact_digest_for(
+            artifact_entries, phase0_root, capture_metadata, "Phase-0 capture metadata"
+        ),
+        "live": live,
+    }
 
 
 def reject_inherited_benchmark_environment(environment: Mapping[str, str]) -> None:
@@ -923,14 +1379,15 @@ def compiler_version_observation(
 
 
 def parse_cmake_cache(path: Path, product_root: Path) -> dict[str, str]:
-    snapshot = snapshot_file(path, "CMake cache", executable=False)
+    snapshot, payload = read_snapshotted_file(
+        path, "CMake cache", maximum_bytes=MAX_JSON_BYTES
+    )
     cache_bytes = snapshot["bytes"]
     if not isinstance(cache_bytes, int) or cache_bytes > MAX_JSON_BYTES:
         fail("CMake cache exceeds the maximum supported size")
     try:
-        payload = path.read_bytes()
         text = payload.decode("utf-8")
-    except (OSError, UnicodeDecodeError) as error:
+    except UnicodeDecodeError as error:
         fail(f"cannot read CMake cache as UTF-8: {error}")
     if not payload.endswith(b"\n") or b"\x00" in payload or b"\r" in payload:
         fail("CMake cache is not canonical newline-delimited text")
@@ -947,17 +1404,159 @@ def parse_cmake_cache(path: Path, product_root: Path) -> dict[str, str]:
         entries[key] = (kind, value)
     required = {
         "CMAKE_BUILD_TYPE": ("STRING", EXPECTED_BUILD_TYPE),
-        "CMAKE_CXX_COMPILER": ("FILEPATH", os.fspath(EXPECTED_COMPILER)),
+        "CMAKE_CXX_FLAGS": ("STRING", ""),
         "CMAKE_CXX_FLAGS_RELWITHDEBINFO": ("STRING", EXPECTED_RELWITHDEBINFO_FLAGS),
+        "CMAKE_EXE_LINKER_FLAGS": ("STRING", ""),
+        "CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO": ("STRING", ""),
+        "CMAKE_SHARED_LINKER_FLAGS": ("STRING", ""),
+        "CMAKE_SHARED_LINKER_FLAGS_RELWITHDEBINFO": ("STRING", ""),
+        "CMAKE_STATIC_LINKER_FLAGS": ("STRING", ""),
+        "CMAKE_STATIC_LINKER_FLAGS_RELWITHDEBINFO": ("STRING", ""),
         "CMAKE_HOME_DIRECTORY": ("INTERNAL", os.fspath(product_root)),
         "ENABLE_ASAN": ("BOOL", "OFF"),
         "ENABLE_TSAN": ("BOOL", "OFF"),
-        "GCC_TOOLCHAIN": ("PATH", os.fspath(EXPECTED_TOOLCHAIN)),
+        "ENABLE_VULKAN": ("BOOL", "OFF"),
     }
     for key, expected in required.items():
         if entries.get(key) != expected:
             fail(f"CMake cache {key} is not the exact required value: {entries.get(key)!r}")
-    return {key: value for key, (_, value) in required.items()}
+    compiler_entry = entries.get("CMAKE_CXX_COMPILER")
+    if compiler_entry not in {
+        ("FILEPATH", os.fspath(EXPECTED_COMPILER)),
+        ("STRING", os.fspath(EXPECTED_COMPILER)),
+    }:
+        fail(
+            "CMake cache CMAKE_CXX_COMPILER is not the closed exact STRING/FILEPATH "
+            f"contract: {compiler_entry!r}"
+        )
+    toolchain_entry = entries.get("GCC_TOOLCHAIN")
+    if toolchain_entry not in {
+        ("PATH", ""),
+        ("PATH", os.fspath(EXPECTED_TOOLCHAIN)),
+    }:
+        fail(
+            "CMake cache GCC_TOOLCHAIN is not the closed empty/exact-path "
+            f"contract: {toolchain_entry!r}"
+        )
+    forbidden_nonempty = (
+        "CMAKE_CXX_COMPILER_LAUNCHER",
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION",
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO",
+    )
+    for key in forbidden_nonempty:
+        entry = entries.get(key)
+        if entry is not None and entry[1] not in ("", "OFF"):
+            fail(f"CMake cache {key} enables a forbidden build override: {entry!r}")
+    assert compiler_entry is not None
+    return (
+        {key: value for key, (_, value) in required.items()}
+        | {
+            "CMAKE_CXX_COMPILER": compiler_entry[1],
+            "CMAKE_CXX_COMPILER_KIND": compiler_entry[0],
+            "GCC_TOOLCHAIN": toolchain_entry[1],
+        }
+    )
+
+
+def validate_effective_build_commands(
+    tool_paths: Mapping[str, Path], product_root: Path
+) -> dict[str, str]:
+    expected_includes = (
+        f"-I{product_root / 'include'} -I{product_root / 'build/generated'}"
+    )
+    result: dict[str, str] = {}
+    for role in ("dagutil_compile_flags", "larch_compile_flags"):
+        _, payload = read_snapshotted_file(
+            tool_paths[role], role.replace("_", " "), maximum_bytes=64 * 1024
+        )
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            fail(f"{role.replace('_', ' ')} is not UTF-8")
+        expected_text = (
+            "# CMAKE generated file: DO NOT EDIT!\n"
+            '# Generated by "Unix Makefiles" Generator, CMake Version 4.3\n'
+            "\n"
+            f"# compile CXX with {EXPECTED_COMPILER}\n"
+            "CXX_DEFINES = \n"
+            "\n"
+            f"CXX_INCLUDES = {expected_includes}\n"
+            "\n"
+            f"CXX_FLAGS = {EXPECTED_EFFECTIVE_CXX_FLAGS}\n"
+            "\n"
+        )
+        if text != expected_text:
+            fail(
+                f"{role.replace('_', ' ')} is not the exact generated "
+                "RelWithDebInfo C++26 compile contract"
+            )
+        result[role] = sha256_bytes(payload)
+    for role in ("dagutil_link_command", "larch_link_command"):
+        _, payload = read_snapshotted_file(
+            tool_paths[role], role.replace("_", " "), maximum_bytes=64 * 1024
+        )
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            fail(f"{role.replace('_', ' ')} is not UTF-8")
+        if not text.endswith("\n") or "\r" in text or "\x00" in text:
+            fail(f"{role.replace('_', ' ')} is not canonical command text")
+        if role == "dagutil_link_command":
+            lines = text.splitlines()
+            if len(lines) != 1:
+                fail("dagutil link command is not exactly one command")
+            tokens = shlex.split(lines[0], posix=True)
+            expected_tokens = [
+                os.fspath(EXPECTED_COMPILER),
+                "-O2",
+                "-g",
+                "-DNDEBUG",
+                "-static-libstdc++",
+                "-static-libgcc",
+                "-Wl,--dependency-file=CMakeFiles/dagutil.dir/link.d",
+                "CMakeFiles/dagutil.dir/tools/dagutil.cpp.o",
+                "-o",
+                "bin/dagutil",
+                "liblarch.a",
+                "/usr/lib/libz.so",
+            ]
+            if tokens != expected_tokens:
+                fail(
+                    "dagutil link command token sequence is not the exact "
+                    f"RelWithDebInfo target contract: {tokens!r}"
+                )
+        else:
+            lines = text.splitlines()
+            if len(lines) != 2:
+                fail("larch link command is not exactly two archive commands")
+            archive = shlex.split(lines[0], posix=True)
+            ranlib = shlex.split(lines[1], posix=True)
+            archive_tool = archive[0] if archive else ""
+            ranlib_tool = ranlib[0] if ranlib else ""
+            if (archive_tool, ranlib_tool) not in {
+                ("/bin/ar", "/bin/ranlib"),
+                ("/usr/bin/ar", "/usr/bin/ranlib"),
+            }:
+                fail("larch link command does not use one closed system archive pair")
+            objects = [
+                "CMakeFiles/larch.dir/src/protobuf.cpp.o",
+                "CMakeFiles/larch.dir/src/protobuf_encode.cpp.o",
+                "CMakeFiles/larch.dir/src/pickle_reader.cpp.o",
+            ]
+            if (product_root / "src/chart_scheduler.cpp").is_file():
+                objects.append("CMakeFiles/larch.dir/src/chart_scheduler.cpp.o")
+            objects.extend(
+                [
+                    "CMakeFiles/larch.dir/src/chart_spr_search.cpp.o",
+                    "CMakeFiles/larch.dir/src/chart_bnb_trim_apply.cpp.o",
+                ]
+            )
+            if archive != [archive_tool, "qc", "liblarch.a", *objects]:
+                fail("larch archive command object sequence is not exact")
+            if ranlib != [ranlib_tool, "liblarch.a"]:
+                fail("larch ranlib command token sequence is not exact")
+        result[role] = sha256_bytes(payload)
+    return result
 
 
 def required_option(arguments: Sequence[str], option: str) -> str:
@@ -994,8 +1593,9 @@ def argv_digest(argv: Sequence[str]) -> str:
 
 
 def parse_manifest_preamble(path: Path, label: str) -> tuple[dict[str, str], bytes]:
-    snapshot_file(path, label, executable=False)
-    payload = path.read_bytes()
+    _, payload = read_snapshotted_file(
+        path, label, maximum_bytes=MAX_JSON_BYTES
+    )
     if not payload.endswith(b"\n") or b"\r" in payload or b"\x00" in payload:
         fail(f"{label} is not canonical newline-delimited UTF-8")
     try:
@@ -1047,13 +1647,15 @@ def parse_manifest_preamble(path: Path, label: str) -> tuple[dict[str, str], byt
 def verify_detached_sha(path: Path, expected_sha256: str, label: str) -> dict[str, object]:
     if SHA256_RE.fullmatch(expected_sha256) is None:
         fail(f"expected {label} SHA-256 is not canonical")
-    manifest = snapshot_file(path, label, executable=False)
+    manifest, _ = read_snapshotted_file(path, label)
     if manifest["sha256"] != expected_sha256:
         fail(f"{label} differs from its external SHA-256 anchor")
     seal_path = canonical_existing_path(os.fspath(path) + ".sha256", f"{label} detached seal")
-    seal = snapshot_file(seal_path, f"{label} detached seal", executable=False)
+    seal, seal_payload = read_snapshotted_file(
+        seal_path, f"{label} detached seal", maximum_bytes=1024
+    )
     expected = f"{expected_sha256}  {path.name}\n".encode("ascii")
-    if seal_path.read_bytes() != expected:
+    if seal_payload != expected:
         fail(f"{label} detached seal is not exact GNU sha256sum format")
     return {"file": manifest, "seal": seal}
 
@@ -1077,13 +1679,19 @@ def read_artifact_ledger(
     phase0_root: Path,
     path: Path,
     expected_sha256: str,
-) -> tuple[dict[str, str], dict[str, object]]:
+) -> tuple[dict[str, str], dict[str, object], dict[str, object]]:
     files = verify_detached_sha(path, expected_sha256, "Phase-0 artifact ledger")
     try:
-        payload = path.read_bytes()
+        ledger_snapshot, payload = read_snapshotted_file(
+            path,
+            "Phase-0 artifact ledger",
+            maximum_bytes=MAX_ARTIFACT_LEDGER_BYTES,
+        )
         text = payload.decode("utf-8")
-    except (OSError, UnicodeDecodeError) as error:
+    except UnicodeDecodeError as error:
         fail(f"cannot read Phase-0 artifact ledger: {error}")
+    if ledger_snapshot != files["file"]:
+        fail("Phase-0 artifact ledger changed between verification and parsing")
     if not payload.endswith(b"\n") or b"\r" in payload or b"\x00" in payload:
         fail("Phase-0 artifact ledger is not canonical newline-delimited UTF-8")
     reader = csv.reader(text.splitlines(), dialect="excel-tab")
@@ -1092,18 +1700,42 @@ def read_artifact_ledger(
         fail("Phase-0 artifact ledger header is invalid")
     entries: dict[str, str] = {}
     order: list[str] = []
+    identities: set[tuple[int, int]] = set()
+    observations: list[dict[str, object]] = []
+    ledger_seal = path.with_name(path.name + ".sha256")
     for number, row in enumerate(rows[1:], 2):
         if len(row) != 2 or SHA256_RE.fullmatch(row[0]) is None:
             fail(f"Phase-0 artifact ledger row {number} is malformed")
         digest, uri = row
         if uri in entries:
             fail(f"Phase-0 artifact ledger duplicates URI: {uri}")
-        repo_uri_path(phase0_root, uri, f"Phase-0 artifact row {number}")
+        member = repo_uri_path(
+            phase0_root, uri, f"Phase-0 artifact row {number}"
+        )
+        if member in (path, ledger_seal):
+            fail("Phase-0 artifact ledger contains itself or its detached seal")
+        snapshot = snapshot_file(
+            member, f"Phase-0 artifact row {number}", executable=False
+        )
+        if snapshot["sha256"] != digest:
+            fail(f"Phase-0 artifact row {number} hash mismatch: {uri}")
+        device = snapshot["device"]
+        inode = snapshot["inode"]
+        assert isinstance(device, int) and isinstance(inode, int)
+        identity = (device, inode)
+        if identity in identities:
+            fail(f"Phase-0 artifact ledger aliases one inode more than once: {uri}")
+        identities.add(identity)
+        observations.append({"snapshot": snapshot, "uri": uri})
         entries[uri] = digest
         order.append(uri)
     if order != sorted(order):
         fail("Phase-0 artifact ledger URIs are not canonically sorted")
-    return entries, files
+    closure = {
+        "member_count": len(observations),
+        "observation_sha256": sha256_bytes(canonical_json_bytes(observations)),
+    }
+    return entries, files, closure
 
 
 def artifact_digest_for(
@@ -1144,11 +1776,12 @@ def manifest_chain(
     artifact_path = canonical_existing_path(
         base_path.parent / "phase0-artifacts.tsv", "Phase-0 artifact ledger"
     )
-    entries, artifact_files = read_artifact_ledger(
+    entries, artifact_files, artifact_closure = read_artifact_ledger(
         phase0_root, artifact_path, artifact_sha256
     )
     if artifact_digest_for(entries, phase0_root, base_path, "base workload manifest") != base_sha256:
         fail("Phase-0 artifact ledger base-manifest hash differs from its external anchor")
+    host_contract = phase0_host_contract(phase0_root, base_path, entries)
 
     larch2 = repo_uri_path(
         phase0_root, base["frozen_larch2_uri"], "frozen Phase-0 larch2"
@@ -1205,6 +1838,7 @@ def manifest_chain(
         )
     chain = {
         "artifact_ledger": {
+            "closure": artifact_closure,
             "expected_sha256": artifact_sha256,
             "files": artifact_files,
             "path": os.fspath(artifact_path),
@@ -1217,6 +1851,7 @@ def manifest_chain(
         },
         "phase0_root": snapshot_directory(phase0_root, "Phase-0 base root"),
         "phase0_revision": phase0_head,
+        "host_contract": host_contract,
         "supplement_manifests": supplements,
     }
     paths = {
@@ -1253,10 +1888,14 @@ def build_tool_paths(
         "capture_wrapper": capture_tool_root / "tools/wric_benchmark_capture.py",
         "cmake_cache": product_root / "build/CMakeCache.txt",
         "compiler": EXPECTED_COMPILER,
+        "dagutil_compile_flags": product_root / "build/CMakeFiles/dagutil.dir/flags.make",
+        "dagutil_link_command": product_root / "build/CMakeFiles/dagutil.dir/link.txt",
         "frozen_larch2": frozen_paths["frozen_larch2"],
         "frozen_oracle_dagutil": frozen_paths["frozen_oracle_dagutil"],
         "frozen_process_metrics": frozen_paths["frozen_process_metrics"],
         "generic_ledger": capture_tool_root / "tools/wric_evidence_run_ledger.py",
+        "larch_compile_flags": product_root / "build/CMakeFiles/larch.dir/flags.make",
+        "larch_link_command": product_root / "build/CMakeFiles/larch.dir/link.txt",
         "product_dagutil": product_root / "build/bin/dagutil",
     }
 
@@ -1282,6 +1921,8 @@ def harness_provenance(
             fail("exact tracked product harness must use metadata SHA-256 '-' ")
         require_timed_trial_digest_fix(product_root, product_revision, harness)
         blob = tracked_git_blob(product_root, harness, "product benchmark harness")
+        if blob["working_file"] != harness_snapshot:
+            fail("product benchmark harness snapshot differs from its HEAD blob check")
         return {
             "audit_result": None,
             "auditor": None,
@@ -1324,6 +1965,8 @@ def harness_provenance(
         auditor_path,
         "historical harness compatibility auditor",
     )
+    if auditor_blob["working_file"] != auditor_snapshot:
+        fail("historical harness compatibility auditor changed during its HEAD check")
     module = load_python_module(
         auditor_path, "historical harness compatibility auditor"
     )
@@ -1392,6 +2035,9 @@ def validate_harness_provenance_shape(value: object) -> Mapping[str, object]:
             or value["expected_metadata_sha256"] != "-"
         ):
             fail("exact-product harness provenance has compatibility-only fields")
+        validate_tracked_git_blob_record(
+            value["product_git_blob"], "product benchmark harness Git blob"
+        )
     elif kind == "materialized_compatibility":
         if (
             not isinstance(value["audit_result"], dict)
@@ -1405,7 +2051,14 @@ def validate_harness_provenance_shape(value: object) -> Mapping[str, object]:
         assert isinstance(auditor, dict)
         if set(auditor) != {"file", "git_blob"}:
             fail("materialized harness auditor evidence key set is invalid")
-        require_snapshot_shape(auditor["file"], "compatibility harness auditor")
+        auditor_file = require_snapshot_shape(
+            auditor["file"], "compatibility harness auditor"
+        )
+        auditor_blob = validate_tracked_git_blob_record(
+            auditor["git_blob"], "compatibility harness auditor Git blob"
+        )
+        if auditor_blob["working_file"] != auditor_file:
+            fail("compatibility harness auditor snapshot differs from its HEAD blob")
     else:
         fail("run metadata harness provenance kind is unsupported")
     expected = value["expected_harness_sha256"]
@@ -1558,6 +2211,8 @@ def phase9_seal_and_audit(
     phase9_tool_blob = tracked_git_blob(
         product_root, phase9_tool, "Phase-9 acceptance postprocessor"
     )
+    if phase9_tool_blob["working_file"] != phase9_tool_snapshot:
+        fail("Phase-9 postprocessor snapshot differs from its HEAD blob check")
     working_larch2_snapshot = snapshot_file(
         working_larch2, "Phase-9 working larch2", executable=True
     )
@@ -1575,8 +2230,18 @@ def phase9_seal_and_audit(
         tool_paths["benchmark_harness"],
         affinity,
     )
+    require_snapshot_unchanged(
+        phase9_tool_snapshot,
+        "Phase-9 acceptance postprocessor immediately before seal-run",
+        executable=True,
+    )
     status, seal_stdout, seal_stderr = run_captured_command(
         seal_argv, environment, product_root, "Phase-9 seal-run postprocessor"
+    )
+    require_snapshot_unchanged(
+        phase9_tool_snapshot,
+        "Phase-9 acceptance postprocessor immediately after seal-run",
+        executable=True,
     )
     seal_result = strict_json_bytes(seal_stdout, "Phase-9 seal-run result")
     expected_result_keys = {
@@ -1613,15 +2278,15 @@ def phase9_seal_and_audit(
     phase9_ledger = snapshot_file(
         inner / PHASE9_LEDGER_NAME, "Phase-9 run ledger", executable=False
     )
-    phase9_ledger_seal = snapshot_file(
+    phase9_ledger_seal, phase9_ledger_seal_payload = read_snapshotted_file(
         inner / PHASE9_LEDGER_SEAL_NAME,
         "Phase-9 run ledger detached seal",
-        executable=False,
+        maximum_bytes=1024,
     )
     if phase9_metadata["sha256"] != metadata_sha or phase9_ledger["sha256"] != ledger_sha:
         fail("Phase-9 seal-run result hashes differ from its published artifacts")
     expected_seal = f"{ledger_sha}  {PHASE9_LEDGER_NAME}\n".encode("ascii")
-    if (inner / PHASE9_LEDGER_SEAL_NAME).read_bytes() != expected_seal:
+    if phase9_ledger_seal_payload != expected_seal:
         fail("Phase-9 run ledger detached seal is not exact")
     audit_argv = phase9_audit_argv(
         phase9_tool,
@@ -1632,6 +2297,11 @@ def phase9_seal_and_audit(
         phase0_root,
         product_root,
         ledger_sha,
+    )
+    require_snapshot_unchanged(
+        phase9_tool_snapshot,
+        "Phase-9 acceptance postprocessor immediately before read-only audit",
+        executable=True,
     )
     audit_result, audit_stdout, audit_stderr = phase9_read_only_audit(
         audit_argv, environment, product_root
@@ -1732,7 +2402,12 @@ def audit_phase9_postprocessor(
     expected_seal = (
         f"{expected_ledger_sha256}  {PHASE9_LEDGER_NAME}\n".encode("ascii")
     )
-    if (inner / PHASE9_LEDGER_SEAL_NAME).read_bytes() != expected_seal:
+    _, live_seal_payload = read_snapshotted_file(
+        inner / PHASE9_LEDGER_SEAL_NAME,
+        "Phase-9 run ledger detached seal",
+        maximum_bytes=1024,
+    )
+    if live_seal_payload != expected_seal:
         fail("Phase-9 run ledger detached seal is not exact")
     expected_seal_argv = phase9_seal_argv(
         phase9_tool,
@@ -1795,17 +2470,38 @@ def audit_phase9_postprocessor(
         require_snapshot_unchanged(
             snapshot, f"Phase-9 postprocessor log {name}", executable=False
         )
-        payload = path.read_bytes()
+        reread_snapshot, payload = read_snapshotted_file(
+            path, f"Phase-9 postprocessor log {name}", maximum_bytes=MAX_COMMAND_OUTPUT_BYTES
+        )
+        if reread_snapshot != snapshot:
+            fail(f"Phase-9 postprocessor log changed while reading: {name}")
         if stream_observation(payload) != observations[name]:
             fail(f"Phase-9 postprocessor log observation differs: {name}")
-    seal_stdout_result = strict_json_bytes(
-        (outer / PHASE9_SEAL_STDOUT_NAME).read_bytes(),
+    _, seal_stdout_payload = read_snapshotted_file(
+        outer / PHASE9_SEAL_STDOUT_NAME,
         "recorded Phase-9 seal-run stdout",
+        maximum_bytes=MAX_COMMAND_OUTPUT_BYTES,
+    )
+    seal_stdout_result = strict_json_bytes(
+        seal_stdout_payload, "recorded Phase-9 seal-run stdout"
     )
     if seal_stdout_result != seal_result:
         fail("recorded Phase-9 seal-run stdout differs from its result")
+    phase9_tool_snapshot = require_snapshot_shape(
+        record["phase9_tool"], "Phase-9 acceptance postprocessor"
+    )
+    require_snapshot_unchanged(
+        phase9_tool_snapshot,
+        "Phase-9 acceptance postprocessor immediately before audit rerun",
+        executable=True,
+    )
     audit_result, audit_stdout, audit_stderr = phase9_read_only_audit(
         expected_audit_argv, environment, product_root
+    )
+    require_snapshot_unchanged(
+        phase9_tool_snapshot,
+        "Phase-9 acceptance postprocessor immediately after audit rerun",
+        executable=True,
     )
     if (
         audit_result != record["audit_result"]
@@ -1843,19 +2539,19 @@ def snapshot_tools(paths: Mapping[str, Path]) -> dict[str, dict[str, object]]:
         result[role] = snapshot_file(
             paths[role],
             role.replace("_", " "),
-            executable=role != "cmake_cache",
+            executable=role not in NONEXECUTABLE_TOOL_ROLES,
             expected_nlink=(EXPECTED_COMPILER_LINK_COUNT if role == "compiler" else 1),
         )
     executable_identities: set[tuple[int, int]] = set()
     for role, snapshot in result.items():
-        if role == "cmake_cache":
+        if role in NONEXECUTABLE_TOOL_ROLES:
             continue
         device = snapshot["device"]
         inode = snapshot["inode"]
         if not isinstance(device, int) or not isinstance(inode, int):
             fail(f"{role} snapshot has invalid filesystem identity")
         executable_identities.add((device, inode))
-    if len(executable_identities) != len(result) - 1:
+    if len(executable_identities) != len(result) - len(NONEXECUTABLE_TOOL_ROLES):
         fail("benchmark executable/tool roles contain a hard-linked identity alias")
     return result
 
@@ -2042,11 +2738,12 @@ def exclusive_write(path: Path, payload: bytes, label: str) -> dict[str, object]
 
 
 def strict_json_object(path: Path, label: str) -> dict[str, object]:
-    snapshot = snapshot_file(path, label, executable=False)
+    snapshot, payload = read_snapshotted_file(
+        path, label, maximum_bytes=MAX_JSON_BYTES
+    )
     json_bytes = snapshot["bytes"]
     if not isinstance(json_bytes, int) or json_bytes > MAX_JSON_BYTES:
         fail(f"{label} exceeds the maximum supported size")
-    payload = path.read_bytes()
 
     def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
@@ -2088,11 +2785,17 @@ def output_snapshot(capture: Path, name: str, label: str) -> dict[str, object]:
     return snapshot_file(capture / name, label, executable=False)
 
 
-def parse_raw_row_ids(path: Path) -> tuple[int, list[str]]:
+def parse_raw_row_ids(
+    path: Path, expected_snapshot: Mapping[str, object]
+) -> tuple[int, list[str]]:
+    snapshot, payload = read_snapshotted_file(
+        path, "raw trials TSV", maximum_bytes=MAX_JSON_BYTES
+    )
+    if snapshot != expected_snapshot:
+        fail("raw trials TSV changed between snapshot and parsing")
     try:
-        payload = path.read_bytes()
         text = payload.decode("utf-8")
-    except (OSError, UnicodeDecodeError) as error:
+    except UnicodeDecodeError as error:
         fail(f"cannot read raw trials TSV: {error}")
     if not payload.endswith(b"\n") or b"\r" in payload or b"\x00" in payload:
         fail("raw trials TSV is not canonical newline-delimited UTF-8")
@@ -2115,7 +2818,7 @@ def capture_outputs(capture: Path) -> dict[str, object]:
     raw = output_snapshot(capture, "raw_trials.tsv", "raw trials TSV")
     summary = output_snapshot(capture, "summary.md", "benchmark summary")
     commands = output_snapshot(capture, "commands.sh", "benchmark commands")
-    row_count, row_ids = parse_raw_row_ids(capture / "raw_trials.tsv")
+    row_count, row_ids = parse_raw_row_ids(capture / "raw_trials.tsv", raw)
     return {
         "commands": commands,
         "raw_trials": raw,
@@ -2179,22 +2882,50 @@ def validate_metadata_shape(metadata: Mapping[str, object]) -> None:
     for role, value in tracked.items():
         if role == "product_harness" and value is None:
             continue
-        if not isinstance(value, dict):
-            fail(f"run metadata tracked Git blob {role} is not an object")
-        require_exact_keys(
-            value, TRACKED_BLOB_RECORD_KEYS, f"run metadata tracked Git blob {role}"
+        validate_tracked_git_blob_record(
+            value, f"run metadata tracked Git blob {role}"
         )
-        if (
-            not isinstance(value["mode"], str)
-            or value["mode"] != "100755"
-            or not isinstance(value["object_id"], str)
-            or REVISION_RE.fullmatch(value["object_id"]) is None
-            or not isinstance(value["relative"], str)
-            or not isinstance(value["repository"], str)
-        ):
-            fail(f"run metadata tracked Git blob {role} fields are invalid")
+    for tracked_role, tool_role in (
+        ("capture_wrapper", "capture_wrapper"),
+        ("generic_ledger", "generic_ledger"),
+    ):
+        record = tracked[tracked_role]
+        assert isinstance(record, dict)
+        if record["working_file"] != tools[tool_role]:
+            fail(f"run metadata {tracked_role} HEAD/tool snapshots differ")
+    product_harness_blob = tracked["product_harness"]
+    if product_harness_blob is not None:
+        assert isinstance(product_harness_blob, dict)
+        if product_harness_blob["working_file"] != tools["benchmark_harness"]:
+            fail("run metadata product harness HEAD/tool snapshots differ")
     validate_harness_provenance_shape(metadata["harness_provenance"])
     validate_postprocessor_shape(metadata["postprocessor"])
+    host = metadata["host_contract"]
+    phase0_chain = metadata["phase0_chain"]
+    if (
+        not isinstance(host, dict)
+        or set(host) != {"calibration_sha256", "capture_metadata_sha256", "live"}
+        or not isinstance(phase0_chain, dict)
+        or phase0_chain.get("host_contract") != host
+    ):
+        fail("run metadata host contract is malformed or differs from Phase-0")
+    for key in ("calibration_sha256", "capture_metadata_sha256"):
+        if not isinstance(host[key], str) or SHA256_RE.fullmatch(host[key]) is None:
+            fail(f"run metadata host contract {key} is invalid")
+    if not isinstance(host["live"], dict):
+        fail("run metadata live host topology is not an object")
+    effective = metadata["effective_build_commands"]
+    expected_effective = {
+        "dagutil_compile_flags",
+        "dagutil_link_command",
+        "larch_compile_flags",
+        "larch_link_command",
+    }
+    if not isinstance(effective, dict) or set(effective) != expected_effective:
+        fail("run metadata effective build-command record is malformed")
+    for role, digest in effective.items():
+        if not isinstance(role, str) or not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+            fail("run metadata effective build-command digest is invalid")
     observation_shape(metadata["dagutil_flags"], "run metadata dagutil flags", compiler=False)
     observation_shape(metadata["compiler_version"], "run metadata compiler version", compiler=True)
 
@@ -2245,9 +2976,14 @@ def validate_postprocessor_shape(value: object) -> Mapping[str, object]:
         argv = value[name]
         if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
             fail(f"Phase-9 postprocessor {name} is invalid")
-    for name in ("seal_result", "audit_result", "phase9_tool_git_blob"):
+    for name in ("seal_result", "audit_result"):
         if not isinstance(value[name], dict):
             fail(f"Phase-9 postprocessor {name} is not an object")
+    phase9_blob = validate_tracked_git_blob_record(
+        value["phase9_tool_git_blob"], "Phase-9 postprocessor Git blob"
+    )
+    if phase9_blob["working_file"] != value["phase9_tool"]:
+        fail("Phase-9 postprocessor snapshot differs from its HEAD blob")
     for name in ("seal_stdout", "seal_stderr", "audit_stdout", "audit_stderr"):
         observation = value[name]
         if (
@@ -2345,6 +3081,7 @@ def capture_run(args: argparse.Namespace) -> dict[str, object]:
     reject_inherited_benchmark_environment(os.environ)
     if RUN_LABEL_RE.fullmatch(args.run_label) is None:
         fail("run label is not a safe canonical identifier")
+    require_run_revision(args.run_label, args.expected_product_revision)
     if bool(args.phase9_mode) != (args.run_label == "phase9"):
         fail("the phase9 run label and --phase9-mode must be selected together")
     capture, parent, parent_signature = canonical_absent_capture(args.capture_dir)
@@ -2403,10 +3140,26 @@ def capture_run(args: argparse.Namespace) -> dict[str, object]:
         require_clean=True,
     )
     tools_pre = snapshot_tools(tool_paths)
+    for tracked_role, tool_role in (
+        ("capture_wrapper", "capture_wrapper"),
+        ("generic_ledger", "generic_ledger"),
+    ):
+        record = tracked_blobs[tracked_role]
+        assert isinstance(record, dict)
+        if record["working_file"] != tools_pre[tool_role]:
+            fail(f"{tracked_role} changed between its HEAD and tool snapshots")
+    product_harness_blob = tracked_blobs["product_harness"]
+    if product_harness_blob is not None:
+        assert isinstance(product_harness_blob, dict)
+        if product_harness_blob["working_file"] != tools_pre["benchmark_harness"]:
+            fail("product benchmark harness HEAD/tool snapshots differ")
     for role, digest in expected_frozen_hashes.items():
         if tools_pre[role]["sha256"] != digest:
             fail(f"{role} bytes differ from the externally anchored Phase-0 chain")
     cmake = parse_cmake_cache(tool_paths["cmake_cache"], product_root)
+    effective_build_commands = validate_effective_build_commands(
+        tool_paths, product_root
+    )
     environment = harness_environment(phase0_root)
     affinity_pre = require_affinity(args.affinity_cpus)
     dagutil_flags_pre = command_observation(
@@ -2427,6 +3180,11 @@ def capture_run(args: argparse.Namespace) -> dict[str, object]:
     )
     harness_argv = [os.fspath(tool_paths["benchmark_harness"]), *args.harness_argv]
     require_capture_parent_unchanged(parent, parent_signature, allow_mtime_change=False)
+    require_snapshot_unchanged(
+        tools_pre["benchmark_harness"],
+        "benchmark harness immediately before execution",
+        executable=True,
+    )
 
     previous_umask = os.umask(0o022)
     try:
@@ -2451,6 +3209,11 @@ def capture_run(args: argparse.Namespace) -> dict[str, object]:
             harness_stderr = stderr_stream.read()
     finally:
         os.umask(previous_umask)
+    require_snapshot_unchanged(
+        tools_pre["benchmark_harness"],
+        "benchmark harness immediately after execution",
+        executable=True,
+    )
     if (
         len(harness_stdout) > MAX_COMMAND_OUTPUT_BYTES
         or len(harness_stderr) > MAX_COMMAND_OUTPUT_BYTES
@@ -2505,6 +3268,11 @@ def capture_run(args: argparse.Namespace) -> dict[str, object]:
         fail("a benchmark tool/build identity changed while the harness ran")
     if parse_cmake_cache(tool_paths["cmake_cache"], product_root) != cmake:
         fail("CMake build contract changed while the harness ran")
+    if (
+        validate_effective_build_commands(tool_paths, product_root)
+        != effective_build_commands
+    ):
+        fail("effective product compile/link commands changed while the harness ran")
     dagutil_flags_post = command_observation(
         (os.fspath(tool_paths["product_dagutil"]), "--help"),
         environment,
@@ -2560,11 +3328,13 @@ def capture_run(args: argparse.Namespace) -> dict[str, object]:
         "compiler_version": compiler_version_pre,
         "dagutil_flags": dagutil_flags_pre,
         "environment": environment,
+        "effective_build_commands": effective_build_commands,
         "harness_argv": harness_argv,
         "harness_argv_sha256": argv_digest(harness_argv),
         "harness_configuration": configuration,
         "harness_execution": execution,
         "harness_provenance": harness_provenance_pre,
+        "host_contract": chain["host_contract"],
         "phase0_chain": chain,
         "postprocessor": postprocessor,
         "repositories": {
@@ -2605,7 +3375,11 @@ def capture_run(args: argparse.Namespace) -> dict[str, object]:
         args.expected_capture_tool_revision,
     )
     for role, snapshot in tools_pre.items():
-        require_snapshot_unchanged(snapshot, role.replace("_", " "), executable=role != "cmake_cache")
+        require_snapshot_unchanged(
+            snapshot,
+            role.replace("_", " "),
+            executable=role not in NONEXECUTABLE_TOOL_ROLES,
+        )
     chain_before_seal, paths_before_seal, hashes_before_seal = manifest_chain(
         phase0_root,
         base_manifest,
@@ -2645,7 +3419,11 @@ def capture_run(args: argparse.Namespace) -> dict[str, object]:
         args.expected_capture_tool_revision,
     )
     for role, snapshot in tools_pre.items():
-        require_snapshot_unchanged(snapshot, role.replace("_", " "), executable=role != "cmake_cache")
+        require_snapshot_unchanged(
+            snapshot,
+            role.replace("_", " "),
+            executable=role not in NONEXECUTABLE_TOOL_ROLES,
+        )
     chain_after_seal, paths_after_seal, hashes_after_seal = manifest_chain(
         phase0_root,
         base_manifest,
@@ -2692,6 +3470,9 @@ def audit_run(args: argparse.Namespace) -> dict[str, object]:
         fail("expected ledger SHA-256 is not canonical lowercase hexadecimal")
     if RUN_LABEL_RE.fullmatch(args.expected_run_label) is None:
         fail("expected run label is not a safe canonical identifier")
+    require_run_revision(
+        args.expected_run_label, args.expected_product_revision
+    )
     if bool(args.phase9_mode) != (args.expected_run_label == "phase9"):
         fail("the phase9 expected label and --phase9-mode must be selected together")
     if args.phase9_mode:
@@ -2761,6 +3542,8 @@ def audit_run(args: argparse.Namespace) -> dict[str, object]:
     )
     if chain != live_chain:
         fail("live Phase-0/manifest provenance differs from run metadata")
+    if metadata["host_contract"] != live_chain["host_contract"]:
+        fail("live host topology differs from run metadata")
     benchmark_harness = canonical_existing_path(
         args.benchmark_harness, "benchmark harness"
     )
@@ -2797,12 +3580,21 @@ def audit_run(args: argparse.Namespace) -> dict[str, object]:
         snapshot = require_snapshot_shape(recorded_tools[role], f"run metadata tool {role}")
         if snapshot["path"] != os.fspath(tool_paths[role]):
             fail(f"run metadata {role} path differs from the derived exact role path")
-        require_snapshot_unchanged(snapshot, role.replace("_", " "), executable=role != "cmake_cache")
+        require_snapshot_unchanged(
+            snapshot,
+            role.replace("_", " "),
+            executable=role not in NONEXECUTABLE_TOOL_ROLES,
+        )
         if role in expected_frozen_hashes and snapshot["sha256"] != expected_frozen_hashes[role]:
             fail(f"run metadata {role} differs from the externally anchored Phase-0 hash")
     cmake = parse_cmake_cache(tool_paths["cmake_cache"], product_root)
     if metadata["cmake_contract"] != cmake:
         fail("live CMake build contract differs from run metadata")
+    effective_build_commands = validate_effective_build_commands(
+        tool_paths, product_root
+    )
+    if metadata["effective_build_commands"] != effective_build_commands:
+        fail("live effective product compile/link commands differ from run metadata")
     flags = command_observation(
         (os.fspath(tool_paths["product_dagutil"]), "--help"),
         expected_environment,
@@ -2884,7 +3676,11 @@ def audit_run(args: argparse.Namespace) -> dict[str, object]:
     )
     for role in sorted(TOOL_KEYS):
         snapshot = require_snapshot_shape(recorded_tools[role], f"run metadata tool {role}")
-        require_snapshot_unchanged(snapshot, role.replace("_", " "), executable=role != "cmake_cache")
+        require_snapshot_unchanged(
+            snapshot,
+            role.replace("_", " "),
+            executable=role not in NONEXECUTABLE_TOOL_ROLES,
+        )
     final_chain, final_frozen_paths, final_frozen_hashes = manifest_chain(
         phase0_root,
         base_manifest,
