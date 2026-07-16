@@ -1820,6 +1820,187 @@ Phase 9 remains open for the immutable twelve-row supplement capture/audit/seal,
 the accepted-update exemption or 1.5x speed decision, paired RSS, complete
 RelWithDebInfo CTest, complete ASAN CTest, and targeted TSan.
 
+## Phase-7/9 evidence-production tooling checkpoint
+
+Commits `0f099ca9adc7d43a601e2a9f52dd710de18e2136` (`Produce sealed
+Phase 9 characterization`),
+`3359fbf359576c48cc0de88ded0319b549f2c310` (`Complete Phase 7
+workload matrix`), and `c5156a84c67acce2e40d2a3c3115d89738f40cd4`
+(`Register Phase 7 completion bootstrap test`) are **evidence-production and
+tooling checkpoints only**. They do not contain a production Phase-0 capture,
+a production supplemental manifest, or timing/RSS acceptance evidence. Phase
+0 and every Phase-0-dependent performance gate remain open.
+
+### Phase-9 characterization producer
+
+Commit `0f099ca` adds a `characterize` command to
+`tools/wric_phase9_manifest_bootstrap.py`. It runs the sealed Phase-0 oracle
+through the explicitly hash-bound process-metrics runner for the exact
+`seed={1,7,19} x workers={1,2,4,8}` matrix. Each search and output validation
+uses the 1,800-second timeout, 16-GiB RSS limit, and 12-GiB chart-memory
+contract. The persistent capture binds the sealed base hash, fixture hash,
+oracle hash, affinity, runner hash, canonical argv and trial digests, reports,
+full canonical streams, output digests, receipts, restart status, and exact row
+closure.
+
+The producer publishes a schema-v3 characterization TSV, detached seal, and a
+hash-addressed immutable asset directory whose closure name is the SHA-256 of
+its canonical asset ledger. Publication uses the existing journaled
+assets--manifest--seal order, no-replace renames, private audit, and restart
+recovery. The later `build` command independently reruns all twelve
+frozen-oracle rows and requires them to match this source characterization
+before it can publish `phase9-local-commit.tsv`; producing the source TSV alone
+does not satisfy the Phase-9 supplement or acceptance gates.
+
+### Phase-7 completion producer
+
+Commit `3359fbf` adds
+`tools/wric_phase7_completion_manifest_bootstrap.py`. Its immutable output
+basename and manifest ID are `phase7-lazy-completion.tsv` and
+`phase7-lazy-completion`. It produces only the eight rows that are not already
+owned by the sealed Phase-0 matrix:
+
+- group `phase7-lazy-medium-auto`: seedtree `lazy=auto` at W1/2/4/8;
+- group `phase7-lazy-small-on`: exact
+  `data/test_5_trees/tree_0.pb.gz` `lazy=on` at W1/2/4/8.
+
+The medium rows are not guessed from historical wall times. At every worker
+count, the producer runs the explicitly hash-bound current working chart under
+the 600-second runner, reads the reported resolved auto policy, and requires
+its canonical search/output semantics to equal the matching sealed Phase-0
+forced branch. It re-derives the manifest semantics from the exact Phase-0
+`p0-medium-dense64-*` or `p0-medium-lazy64-*` row. The small rows are the only
+new frozen-oracle rows; each is compared with its exact sealed
+`p0-small-dense64-*` peer. The builder verifies all twelve source row IDs and
+resolution contracts, rejects resolver or row-ID collisions, binds the sealed
+base, runner, affinity, fixtures, working-chart hash, canonical argv/trial
+digests and complete assets, and uses the same crash-durable no-replace
+publication and production-harness sentinel. Commit `c5156a8` registers its
+focused integration as `wric_phase7_completion_manifest_bootstrap_test` with a
+120-second CTest timeout.
+
+### Functional tooling tests
+
+At `c5156a8`, the exact focused command was:
+
+```bash
+ctest --test-dir build --output-on-failure --no-tests=error \
+  -R '^(wric_phase9_manifest_bootstrap_test|wric_phase78_manifest_bootstrap_test|wric_phase7_completion_manifest_bootstrap_test)$'
+```
+
+All 3/3 tests passed. The individual CTest times were 79.14 seconds for the
+Phase-9 bootstrap, 12.34 seconds for the Phase-7/8 bootstrap, and 10.60 seconds
+for the Phase-7 completion bootstrap. At that checkpoint, the ephemeral
+`build/Testing/Temporary/LastTest.log` had SHA-256
+`6e5d29ad8de5862829e493e602ad552c460dc8dec3071d81f78f0bf326c85d89`;
+later CTest runs are expected to overwrite this temporary log, so it is not a
+durable acceptance artifact.
+The completion test covers the exact eight-row/group closure, seventeen
+600-second-runner receipts, wrong-binary rejection before execution, canonical
+and status tampering, resolver collision, foreign-target preservation, and
+roll-forward after an injected manifest-publication crash. These elapsed test
+times measure synthetic regression tests, not chart-SPR performance.
+
+### Future production invocations
+
+Run these only after Phase 0 has been prepared, captured, approved, finalized,
+audited, and sealed. `SEALED_REPO_ROOT` must remain the persistent absolute
+repository root recorded by Phase 0; do not move it or substitute the optimized
+worktree. Replace every angle-bracketed value with the independently recorded
+sealed value before running the hash checks.
+
+```bash
+set -euo pipefail
+
+SEALED_REPO_ROOT='<persistent absolute Phase-0 repository root>'
+BASE='<absolute path to sealed Phase-0 workloads.tsv>'
+BASE_SHA='<sealed Phase-0 workloads.tsv SHA-256>'
+RUNNER='<absolute path to the Phase-0-frozen wric-process-metrics>'
+RUNNER_SHA='<Phase-0-frozen process-metrics SHA-256>'
+AFFINITY='0,2,4,6,8,10,12,14'
+SUPPLEMENTS='<absolute persistent supplements directory>'
+HARNESS="$PWD/tools/wric_spr_search_benchmark.sh"
+WORKING_CHART="$PWD/build/bin/dagutil"
+WORKING_CHART_SHA='<qualified current working-chart SHA-256>'
+PHASE9_FIXTURE="$PWD/test/wric_chart_three_accepts.pb.gz"
+PHASE9_FIXTURE_SHA='1df318b1ab7082acc1d14c00c8e4a3b243e5fa52b2207af854fe345305f740d9'
+
+test "$(sha256sum "$BASE" | awk '{print $1}')" = "$BASE_SHA"
+test "$(sha256sum "$RUNNER" | awk '{print $1}')" = "$RUNNER_SHA"
+test "$(sha256sum "$WORKING_CHART" | awk '{print $1}')" = "$WORKING_CHART_SHA"
+test "$(sha256sum "$PHASE9_FIXTURE" | awk '{print $1}')" = "$PHASE9_FIXTURE_SHA"
+(cd "$(dirname "$BASE")" && sha256sum --check --strict "$(basename "$BASE").sha256")
+```
+
+Produce the sealed Phase-9 source characterization, then independently build
+and audit the Phase-9 supplement:
+
+```bash
+tools/wric_phase9_manifest_bootstrap.py characterize \
+  --base-manifest "$BASE" \
+  --expected-parent-sha256 "$BASE_SHA" \
+  --fixture "$PHASE9_FIXTURE" \
+  --expected-fixture-sha256 "$PHASE9_FIXTURE_SHA" \
+  --affinity-cpus "$AFFINITY" \
+  --capture-dir "$SUPPLEMENTS/phase9-characterization.capture" \
+  --output "$SUPPLEMENTS/phase9-local-commit.characterization.tsv" \
+  --repo-root "$SEALED_REPO_ROOT" \
+  --process-metrics "$RUNNER" \
+  --expected-process-metrics-sha256 "$RUNNER_SHA"
+
+tools/wric_phase9_manifest_bootstrap.py build \
+  --base-manifest "$BASE" \
+  --expected-parent-sha256 "$BASE_SHA" \
+  --characterization "$SUPPLEMENTS/phase9-local-commit.characterization.tsv" \
+  --fixture "$PHASE9_FIXTURE" \
+  --expected-fixture-sha256 "$PHASE9_FIXTURE_SHA" \
+  --capture-dir "$SUPPLEMENTS/phase9-local-commit.capture" \
+  --output "$SUPPLEMENTS/phase9-local-commit.tsv" \
+  --repo-root "$SEALED_REPO_ROOT" \
+  --benchmark-harness "$HARNESS" \
+  --process-metrics "$RUNNER"
+
+tools/wric_phase9_manifest_bootstrap.py audit \
+  --base-manifest "$BASE" \
+  --expected-parent-sha256 "$BASE_SHA" \
+  --supplement "$SUPPLEMENTS/phase9-local-commit.tsv" \
+  --repo-root "$SEALED_REPO_ROOT" \
+  --benchmark-harness "$HARNESS" \
+  --process-metrics "$RUNNER"
+```
+
+Produce and audit the separate Phase-7 completion supplement:
+
+```bash
+tools/wric_phase7_completion_manifest_bootstrap.py build \
+  --base-manifest "$BASE" \
+  --expected-parent-sha256 "$BASE_SHA" \
+  --repo-root "$SEALED_REPO_ROOT" \
+  --benchmark-harness "$HARNESS" \
+  --process-metrics "$RUNNER" \
+  --expected-process-metrics-sha256 "$RUNNER_SHA" \
+  --working-chart "$WORKING_CHART" \
+  --expected-working-chart-sha256 "$WORKING_CHART_SHA" \
+  --capture-dir "$SUPPLEMENTS/phase7-lazy-completion.capture" \
+  --output "$SUPPLEMENTS/phase7-lazy-completion.tsv" \
+  --affinity-cpus "$AFFINITY"
+
+tools/wric_phase7_completion_manifest_bootstrap.py audit \
+  --base-manifest "$BASE" \
+  --expected-parent-sha256 "$BASE_SHA" \
+  --repo-root "$SEALED_REPO_ROOT" \
+  --benchmark-harness "$HARNESS" \
+  --process-metrics "$RUNNER" \
+  --expected-process-metrics-sha256 "$RUNNER_SHA" \
+  --working-chart "$WORKING_CHART" \
+  --expected-working-chart-sha256 "$WORKING_CHART_SHA" \
+  --supplement "$SUPPLEMENTS/phase7-lazy-completion.tsv"
+```
+
+Successful completion of these commands would produce auditable input evidence
+for later benchmark runs. It would not by itself pass Phase 0, the Phase-7 or
+Phase-9 timing/RSS gates, full RelWithDebInfo CTest, ASAN, TSan, or final parity.
+
 ## Phase 10 integration checkpoint (in progress)
 
 Commit `e3ef48e` exposes the generation-phase, evidence-phase, and retained
