@@ -4328,11 +4328,15 @@ chart_spr_take_compatible_accepted_exact_trim(
           state.active_patterns.patterns.patterns.size() ||
       trim.frontier_sizes_by_clade.size() !=
           materialized.grammar.clades.size() ||
-      trim.keep_production.size() !=
-          materialized.grammar.productions.size() ||
-      trim.dominance_mode != options.exact_trim.dominance_mode ||
-      (options.exact_trim.require_exact_keep_mask &&
-       !trim.keep_production_exact)) {
+      trim.dominance_mode != options.exact_trim.dominance_mode) {
+    return reject();
+  }
+  if (trim.keep_production_exact) {
+    if (trim.keep_production.size() !=
+        materialized.grammar.productions.size()) {
+      return reject();
+    }
+  } else if (options.exact_trim.require_exact_keep_mask) {
     return reject();
   }
   auto const full_optimum = chart_spr_add_invariant_offset(
