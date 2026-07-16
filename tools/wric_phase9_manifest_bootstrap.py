@@ -130,6 +130,11 @@ CHAR_HEADER = (
     "oracle_trial_semantic_sha256",
 )
 
+CHAR_CAPTURE_SCHEMA = "wric_phase9_characterization_capture"
+CHAR_CAPTURE_SCHEMA_VERSION = 1
+CHAR_CLOSURE_PREFIX = "closure-"
+CHAR_CLOSURE_LEDGER = "assets.sha256"
+
 HEX64 = re.compile(r"[0-9a-f]{64}")
 REVISION = re.compile(r"[0-9a-f]{40,64}")
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -1449,7 +1454,7 @@ def ensure_exact_file(path: Path, data: bytes, label: str, mode: int = 0o444) ->
         return
     remove_recoverable_staging_file(staging, f"interrupted {label} staging file")
     copy_bytes(staging, data, mode)
-    os.replace(staging, path)
+    rename_noreplace(staging, path)
     fsync_directory(path.parent)
 
 
@@ -2392,8 +2397,7 @@ def exclusive_capture_lock(capture_dir: Path) -> Iterator[None]:
     """Admit one capture owner; kernel locking releases cleanly after a crash."""
 
     capture = capture_dir.absolute()
-    capture.parent.mkdir(parents=True, exist_ok=True)
-    parent = require_lexical_directory(
+    parent = durable_mkdir_parents(
         capture.parent, "Phase-9 capture parent directory"
     )
     lock_path = parent / (capture.name + ".lock")
@@ -2405,6 +2409,8 @@ def exclusive_capture_lock(capture_dir: Path) -> Iterator[None]:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 0:
             fail(f"Phase-9 capture lock is not one empty owned regular file: {lock_path}")
+        os.fsync(descriptor)
+        fsync_directory(parent)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -2511,6 +2517,172 @@ def initialize_capture_directory(
     unexpected = sorted(path.name for path in capture.iterdir() if path.name not in allowed)
     if unexpected:
         fail(f"Phase-9 capture directory has unexpected artifacts: {unexpected}")
+    return capture
+
+
+def characterization_contract(
+    base: Manifest,
+    fixture_sha256: str,
+    affinity: str,
+    capture_dir: Path,
+) -> Characterization:
+    """Return the immutable Phase-9 contract used while evidence is produced."""
+
+    placeholder = "0" * 64
+    rows: dict[tuple[int, int], Mapping[str, str]] = {}
+    for seed in SEEDS:
+        for workers in WORKERS:
+            rows[(seed, workers)] = {
+                "seed": str(seed),
+                "workers": str(workers),
+                "product_report_path": "pending/report.txt",
+                "product_report_sha256": placeholder,
+                "canonical_sidecar_path": "pending/canonical.ndjson",
+                "canonical_sidecar_sha256": placeholder,
+                "canonical_result_path": "pending/canonical.json",
+                "canonical_result_sha256": placeholder,
+                "output_canonical_path": "pending/output-canonical.json",
+                "output_canonical_sha256": placeholder,
+                "canonical_argv_sha256": placeholder,
+                "oracle_search_semantic_sha256": placeholder,
+                "oracle_output_semantic_sha256": placeholder,
+                "oracle_trial_semantic_sha256": placeholder,
+            }
+    preamble = {
+        "schema": CHAR_SCHEMA,
+        "schema_version": CHAR_SCHEMA_VERSION,
+        "parent_sha256": base.sha256,
+        "primary_sha256": fixture_sha256,
+        "input_canonical_path": "input/canonical.json",
+        "input_canonical_sha256": placeholder,
+        "frozen_oracle_sha256": base.preamble[
+            "frozen_oracle_dagutil_sha256"
+        ],
+        "affinity_cpus": affinity,
+        "timeout_seconds": str(TIMEOUT_SECONDS),
+        "rss_limit_bytes": str(RSS_LIMIT_BYTES),
+        "memory_budget_bytes": str(MEMORY_BUDGET_BYTES),
+    }
+    return Characterization(
+        capture_dir / "characterization-contract.tsv",
+        "-",
+        preamble,
+        rows,
+    )
+
+
+def characterization_capture_contract_bytes(
+    base: Manifest,
+    characterization: Characterization,
+    fixture_sha256: str,
+    process_metrics_sha256: str,
+) -> bytes:
+    rows = []
+    for seed in SEEDS:
+        for workers in WORKERS:
+            contract = phase9_contract_row(
+                seed,
+                workers,
+                fixture_sha256,
+                "manifest://fixture.pb.gz",
+                characterization.preamble["affinity_cpus"],
+            )
+            argv = canonical_argv(contract)
+            rows.append(
+                {
+                    "row_id": row_id(seed, workers),
+                    "seed": seed,
+                    "workers": workers,
+                    "canonical_argv": argv,
+                    "canonical_argv_sha256": canonical_argv_digest(argv),
+                }
+            )
+    value = {
+        "schema": CHAR_CAPTURE_SCHEMA,
+        "schema_version": CHAR_CAPTURE_SCHEMA_VERSION,
+        "parent_sha256": base.sha256,
+        "fixture_sha256": fixture_sha256,
+        "frozen_oracle_sha256": base.preamble[
+            "frozen_oracle_dagutil_sha256"
+        ],
+        "process_metrics_sha256": process_metrics_sha256,
+        "timeout_seconds": TIMEOUT_SECONDS,
+        "rss_limit_bytes": RSS_LIMIT_BYTES,
+        "memory_budget_bytes": MEMORY_BUDGET_BYTES,
+        "affinity_cpus": characterization.preamble["affinity_cpus"],
+        "rows": rows,
+    }
+    return (
+        json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def initialize_characterization_capture_directory(
+    capture_dir: Path,
+    base: Manifest,
+    characterization: Characterization,
+    fixture_sha256: str,
+    process_metrics_sha256: str,
+) -> Path:
+    """Create or resume only the exact producer-owned capture closure."""
+
+    capture = capture_dir.absolute()
+    contract = characterization_capture_contract_bytes(
+        base,
+        characterization,
+        fixture_sha256,
+        process_metrics_sha256,
+    )
+    if os.path.lexists(capture):
+        capture = require_lexical_directory(
+            capture, "Phase-9 characterization capture directory"
+        )
+    else:
+        durable_mkdir_parents(
+            capture.parent, "Phase-9 characterization capture parent"
+        )
+        capture.mkdir(mode=0o755)
+        fsync_directory(capture)
+        fsync_directory(capture.parent)
+        capture = require_lexical_directory(
+            capture, "Phase-9 characterization capture directory"
+        )
+    contract_path = capture / "capture-contract.json"
+    ensure_exact_file(
+        contract_path,
+        contract,
+        "Phase-9 characterization capture contract",
+    )
+    ensure_exact_file(
+        contract_path.with_name(contract_path.name + ".sha256"),
+        seal_bytes(contract_path.name, contract),
+        "Phase-9 characterization capture contract seal",
+    )
+    verify_detached_seal(contract_path)
+    rows = capture / "rows"
+    if os.path.lexists(rows):
+        require_lexical_directory(
+            rows, "Phase-9 characterization capture rows directory"
+        )
+    else:
+        rows.mkdir(mode=0o755)
+        fsync_directory(rows)
+        fsync_directory(capture)
+    allowed = {
+        "capture-contract.json",
+        "capture-contract.json.sha256",
+        ".input.staging",
+        "input",
+        "rows",
+    }
+    unexpected = sorted(
+        path.name for path in capture.iterdir() if path.name not in allowed
+    )
+    if unexpected:
+        fail(
+            "Phase-9 characterization capture has unexpected artifacts: "
+            f"{unexpected}"
+        )
     return capture
 
 
@@ -2626,7 +2798,7 @@ def input_capture_status_bytes(
 def validate_captured_input(
     base: Manifest,
     characterization: Characterization,
-    source_input: InputEvidence,
+    source_input: InputEvidence | None,
     fixture_sha256: str,
     process_metrics_sha256: str,
     directory: Path,
@@ -2673,9 +2845,10 @@ def validate_captured_input(
     )
     if status.read_bytes() != expected_status:
         fail("completed Phase-9 input capture status changed")
-    require_matching_input_evidence(
-        source_input, evidence, "fresh frozen-oracle input execution"
-    )
+    if source_input is not None:
+        require_matching_input_evidence(
+            source_input, evidence, "fresh frozen-oracle input execution"
+        )
     return evidence
 
 
@@ -2731,13 +2904,23 @@ def validate_captured_row(
     base: Manifest,
     characterization: Characterization,
     input_evidence: InputEvidence,
-    source_evidence: Evidence,
+    source_evidence: Evidence | None,
     fixture_sha256: str,
     process_metrics_sha256: str,
     row_directory: Path,
     *,
+    seed: int | None = None,
+    workers: int | None = None,
     require_readonly_directory: bool = True,
 ) -> tuple[Evidence, dict[str, str]]:
+    if source_evidence is not None:
+        if seed is not None and seed != source_evidence.seed:
+            fail("completed capture row seed disagrees with source evidence")
+        if workers is not None and workers != source_evidence.workers:
+            fail("completed capture row workers disagree with source evidence")
+        seed, workers = source_evidence.seed, source_evidence.workers
+    if seed not in SEEDS or workers not in WORKERS:
+        fail("completed capture row lacks one canonical Phase-9 seed/worker identity")
     row_directory = require_lexical_directory(row_directory, "completed Phase-9 capture row")
     if require_readonly_directory and row_directory.stat().st_mode & 0o222:
         fail(f"completed Phase-9 capture row directory is still writable: {row_directory}")
@@ -2764,17 +2947,17 @@ def validate_captured_row(
     verify_detached_seal(status)
     validate_process_metrics_receipt(
         row_directory / "process-metrics.txt",
-        f"completed capture {source_evidence.seed}/W{source_evidence.workers} chart metrics",
+        f"completed capture {seed}/W{workers} chart metrics",
     )
     validate_process_metrics_receipt(
         row_directory / "output-process-metrics.txt",
-        f"completed capture {source_evidence.seed}/W{source_evidence.workers} output metrics",
+        f"completed capture {seed}/W{workers} output metrics",
     )
     evidence, row = captured_evidence(
         characterization,
         input_evidence,
-        source_evidence.seed,
-        source_evidence.workers,
+        seed,
+        workers,
         row_directory,
     )
     expected_status = capture_status_bytes(
@@ -2788,12 +2971,13 @@ def validate_captured_row(
     )
     if status.read_bytes() != expected_status:
         fail(f"completed Phase-9 capture row status changed: {row_directory}")
-    require_matching_stable_evidence(
-        source_evidence,
-        evidence,
-        "fresh frozen-oracle execution "
-        + row_id(evidence.seed, evidence.workers),
-    )
+    if source_evidence is not None:
+        require_matching_stable_evidence(
+            source_evidence,
+            evidence,
+            "fresh frozen-oracle execution "
+            + row_id(evidence.seed, evidence.workers),
+        )
     return evidence, row
 
 
@@ -2915,7 +3099,7 @@ def remove_capture_staging_directory(path: Path) -> None:
 def run_frozen_capture_input(
     base: Manifest,
     characterization: Characterization,
-    source_input: InputEvidence,
+    source_input: InputEvidence | None,
     fixture: Path,
     fixture_sha256: str,
     oracle: Path,
@@ -2968,7 +3152,7 @@ def run_frozen_capture_input(
         except BootstrapError:
             remove_capture_staging_directory(staging)
         else:
-            os.rename(staging, destination)
+            rename_noreplace(staging, destination)
             fsync_directory(capture)
             return validate_captured_input(
                 base,
@@ -3003,9 +3187,10 @@ def run_frozen_capture_input(
         for filename in CAPTURE_INPUT_FILES:
             require_regular(staging / filename, f"fresh input capture {filename}")
         evidence = captured_input_evidence(staging / "canonical.json")
-        require_matching_input_evidence(
-            source_input, evidence, "fresh frozen-oracle input execution"
-        )
+        if source_input is not None:
+            require_matching_input_evidence(
+                source_input, evidence, "fresh frozen-oracle input execution"
+            )
         status_data = input_capture_status_bytes(
             base,
             characterization,
@@ -3025,7 +3210,7 @@ def run_frozen_capture_input(
             fsync_regular_file(member)
         staging.chmod(0o555)
         fsync_directory(staging)
-        os.rename(staging, destination)
+        rename_noreplace(staging, destination)
         fsync_directory(capture)
     except BaseException:
         if staging.exists():
@@ -3045,15 +3230,26 @@ def run_frozen_capture_row(
     base: Manifest,
     characterization: Characterization,
     input_evidence: InputEvidence,
-    source_evidence: Evidence,
+    source_evidence: Evidence | None,
     fixture: Path,
     fixture_sha256: str,
     oracle: Path,
     process_metrics: Path,
     process_metrics_sha256: str,
     rows_directory: Path,
+    *,
+    seed: int | None = None,
+    workers: int | None = None,
 ) -> tuple[Evidence, dict[str, str]]:
-    identity = row_id(source_evidence.seed, source_evidence.workers)
+    if source_evidence is not None:
+        if seed is not None and seed != source_evidence.seed:
+            fail("capture row seed disagrees with source evidence")
+        if workers is not None and workers != source_evidence.workers:
+            fail("capture row workers disagree with source evidence")
+        seed, workers = source_evidence.seed, source_evidence.workers
+    if seed not in SEEDS or workers not in WORKERS:
+        fail("capture row lacks one canonical Phase-9 seed/worker identity")
+    identity = row_id(seed, workers)
     destination = rows_directory / identity
     staging = rows_directory / f".{identity}.staging"
     if os.path.lexists(destination):
@@ -3071,6 +3267,8 @@ def run_frozen_capture_row(
                 fixture_sha256,
                 process_metrics_sha256,
                 destination,
+                seed=seed,
+                workers=workers,
                 require_readonly_directory=False,
             )
             for member in destination.iterdir():
@@ -3086,6 +3284,8 @@ def run_frozen_capture_row(
             fixture_sha256,
             process_metrics_sha256,
             destination,
+            seed=seed,
+            workers=workers,
         )
         if os.path.lexists(staging):
             remove_capture_staging_directory(staging)
@@ -3100,11 +3300,13 @@ def run_frozen_capture_row(
                 fixture_sha256,
                 process_metrics_sha256,
                 staging,
+                seed=seed,
+                workers=workers,
             )
         except BootstrapError:
             remove_capture_staging_directory(staging)
         else:
-            os.rename(staging, destination)
+            rename_noreplace(staging, destination)
             fsync_directory(rows_directory)
             return validate_captured_row(
                 base,
@@ -3114,11 +3316,13 @@ def run_frozen_capture_row(
                 fixture_sha256,
                 process_metrics_sha256,
                 destination,
+                seed=seed,
+                workers=workers,
             )
     staging.mkdir(mode=0o755)
     contract = phase9_contract_row(
-        source_evidence.seed,
-        source_evidence.workers,
+        seed,
+        workers,
         fixture_sha256,
         "manifest://fixture.pb.gz",
         characterization.preamble["affinity_cpus"],
@@ -3155,13 +3359,16 @@ def run_frozen_capture_row(
         evidence, row = captured_evidence(
             characterization,
             input_evidence,
-            source_evidence.seed,
-            source_evidence.workers,
+            seed,
+            workers,
             staging,
         )
-        require_matching_stable_evidence(
-            source_evidence, evidence, f"fresh frozen-oracle execution {identity}"
-        )
+        if source_evidence is not None:
+            require_matching_stable_evidence(
+                source_evidence,
+                evidence,
+                f"fresh frozen-oracle execution {identity}",
+            )
         status_data = capture_status_bytes(
             base,
             characterization,
@@ -3182,7 +3389,7 @@ def run_frozen_capture_row(
             fsync_regular_file(path)
         staging.chmod(0o555)
         fsync_directory(staging)
-        os.rename(staging, destination)
+        rename_noreplace(staging, destination)
         fsync_directory(rows_directory)
     except BaseException:
         if staging.exists():
@@ -3196,6 +3403,8 @@ def run_frozen_capture_row(
         fixture_sha256,
         process_metrics_sha256,
         destination,
+        seed=seed,
+        workers=workers,
     )
 
 
@@ -3271,6 +3480,85 @@ def capture_frozen_characterization(
         fail("Phase-9 fixture changed during frozen capture")
     if sha256_file(process_metrics) != process_metrics_sha256:
         fail("process-metrics runner changed during Phase-9 capture")
+    validate_worker_independent_evidence(evidence)
+    return input_evidence, evidence, mappings, capture
+
+
+def produce_frozen_characterization_capture(
+    capture_dir: Path,
+    base: Manifest,
+    characterization: Characterization,
+    fixture: Path,
+    fixture_sha256: str,
+    oracle: Path,
+    process_metrics: Path,
+    process_metrics_sha256: str,
+) -> tuple[InputEvidence, list[Evidence], list[dict[str, str]], Path]:
+    """Run and resume the 1/7/19 x W1/2/4/8 source characterization."""
+
+    oracle_sha256 = base.preamble["frozen_oracle_dagutil_sha256"]
+    if sha256_file(oracle) != oracle_sha256:
+        fail("frozen oracle changed before Phase-9 characterization")
+    if sha256_file(fixture) != fixture_sha256:
+        fail("Phase-9 fixture changed before characterization")
+    if sha256_file(process_metrics) != process_metrics_sha256:
+        fail("process-metrics runner changed before Phase-9 characterization")
+    capture = initialize_characterization_capture_directory(
+        capture_dir,
+        base,
+        characterization,
+        fixture_sha256,
+        process_metrics_sha256,
+    )
+    input_evidence = run_frozen_capture_input(
+        base,
+        characterization,
+        None,
+        fixture,
+        fixture_sha256,
+        oracle,
+        process_metrics,
+        process_metrics_sha256,
+        capture,
+    )
+    evidence: list[Evidence] = []
+    mappings: list[dict[str, str]] = []
+    rows_directory = capture / "rows"
+    for seed in SEEDS:
+        for workers in WORKERS:
+            item, mapping = run_frozen_capture_row(
+                base,
+                characterization,
+                input_evidence,
+                None,
+                fixture,
+                fixture_sha256,
+                oracle,
+                process_metrics,
+                process_metrics_sha256,
+                rows_directory,
+                seed=seed,
+                workers=workers,
+            )
+            evidence.append(item)
+            mappings.append(mapping)
+    wanted_rows = {row_id(seed, workers) for seed in SEEDS for workers in WORKERS}
+    unexpected = sorted(
+        path.name for path in rows_directory.iterdir() if path.name not in wanted_rows
+    )
+    if unexpected:
+        fail(
+            "Phase-9 characterization rows directory has unexpected artifacts: "
+            f"{unexpected}"
+        )
+    if os.path.lexists(capture / ".input.staging"):
+        fail("Phase-9 characterization left an interrupted input staging directory")
+    if sha256_file(oracle) != oracle_sha256:
+        fail("frozen oracle changed during Phase-9 characterization")
+    if sha256_file(fixture) != fixture_sha256:
+        fail("Phase-9 fixture changed during characterization")
+    if sha256_file(process_metrics) != process_metrics_sha256:
+        fail("process-metrics runner changed during Phase-9 characterization")
     validate_worker_independent_evidence(evidence)
     return input_evidence, evidence, mappings, capture
 
@@ -3531,6 +3819,369 @@ def audit_exact_asset_tree(root: Path, expected_files: set[str]) -> None:
             f"missing_directories={sorted(expected_directories - observed_directories)}, "
             f"extra_directories={sorted(observed_directories - expected_directories)}"
         )
+
+
+def characterization_capture_asset_members(
+    capture: Path,
+    fixture: Path,
+) -> dict[str, bytes]:
+    """Copy the exact durable capture closure into publication-owned bytes."""
+
+    members: dict[str, bytes] = {"fixture.pb.gz": fixture.read_bytes()}
+
+    def add(relative: str, source: Path) -> None:
+        if LEDGER_RELATIVE.fullmatch(relative) is None:
+            fail(f"characterization asset path is not canonical: {relative!r}")
+        if relative in members:
+            fail(f"duplicate characterization asset path: {relative}")
+        require_regular(source, f"characterization capture asset {relative}")
+        if source.stat().st_nlink != 1:
+            fail(f"characterization capture asset is externally hard-linked: {source}")
+        members[relative] = source.read_bytes()
+
+    for filename in ("capture-contract.json", "capture-contract.json.sha256"):
+        add(f"provenance/{filename}", capture / filename)
+    for filename in (*CAPTURE_INPUT_FILES, "status.json", "status.json.sha256"):
+        add(f"input/{filename}", capture / "input" / filename)
+    for seed in SEEDS:
+        for workers in WORKERS:
+            identity = row_id(seed, workers)
+            for filename in (
+                *CAPTURE_STATUS_FILES,
+                "status.json",
+                "status.json.sha256",
+            ):
+                add(
+                    f"rows/{identity}/{filename}",
+                    capture / "rows" / identity / filename,
+                )
+    return members
+
+
+def render_characterization_publication(
+    publication: PublicationPaths,
+    contract: Characterization,
+    input_evidence: InputEvidence,
+    captured_rows: Sequence[Mapping[str, str]],
+    capture: Path,
+    fixture: Path,
+) -> tuple[dict[str, bytes], bytes, bytes]:
+    """Render a schema-v3 TSV whose paths commit to the full capture ledger."""
+
+    closure_members = characterization_capture_asset_members(capture, fixture)
+    ledger = asset_ledger_bytes(closure_members)
+    ledger_sha256 = sha256_bytes(ledger)
+    closure = CHAR_CLOSURE_PREFIX + ledger_sha256
+    assets_relative = publication.assets.name
+    asset_files = {
+        f"{closure}/{relative}": data
+        for relative, data in closure_members.items()
+    }
+    asset_files[f"{closure}/{CHAR_CLOSURE_LEDGER}"] = ledger
+
+    preamble = dict(contract.preamble)
+    preamble["input_canonical_path"] = (
+        f"{assets_relative}/{closure}/input/canonical.json"
+    )
+    preamble["input_canonical_sha256"] = input_evidence.canonical_sha256
+    rows: list[dict[str, str]] = []
+    for captured in captured_rows:
+        row = dict(captured)
+        identity = row_id(int(row["seed"]), int(row["workers"]))
+        paths = {
+            "product_report": "report.txt",
+            "canonical_sidecar": "canonical.ndjson",
+            "canonical_result": "canonical.json",
+            "output_canonical": "output-canonical.json",
+        }
+        for prefix, filename in paths.items():
+            row[f"{prefix}_path"] = (
+                f"{assets_relative}/{closure}/rows/{identity}/{filename}"
+            )
+        rows.append(row)
+    manifest_data = characterization_tsv_bytes(preamble, rows)
+    return (
+        asset_files,
+        manifest_data,
+        seal_bytes(publication.output.name, manifest_data),
+    )
+
+
+def read_characterization_asset_ledger(
+    assets: Path,
+    closure: str,
+) -> tuple[Path, dict[str, str]]:
+    match = re.fullmatch(rf"{re.escape(CHAR_CLOSURE_PREFIX)}([0-9a-f]{{64}})", closure)
+    if match is None:
+        fail("Phase-9 characterization closure is not hash-addressed")
+    closure_path = require_lexical_directory(
+        assets / closure, "Phase-9 characterization closure directory"
+    )
+    ledger = resolve_lexical_regular(
+        closure_path,
+        Path(CHAR_CLOSURE_LEDGER),
+        "Phase-9 characterization asset ledger",
+    )
+    if sha256_file(ledger) != match.group(1):
+        fail("Phase-9 characterization closure name differs from its ledger hash")
+    pattern = re.compile(
+        r"([0-9a-f]{64})  ([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)"
+    )
+    try:
+        lines = ledger.read_text(encoding="ascii").splitlines()
+    except UnicodeDecodeError as error:
+        fail(f"Phase-9 characterization asset ledger is not ASCII: {error}")
+    members: dict[str, str] = {}
+    for line_number, line in enumerate(lines, 1):
+        parsed = pattern.fullmatch(line)
+        if parsed is None:
+            fail(
+                "Phase-9 characterization asset ledger line "
+                f"{line_number} is not canonical"
+            )
+        digest, relative = parsed.groups()
+        if relative in members or relative == CHAR_CLOSURE_LEDGER:
+            fail(
+                "Phase-9 characterization asset ledger has a duplicate/circular "
+                f"member: {relative}"
+            )
+        member = resolve_lexical_regular(
+            closure_path,
+            Path(relative),
+            f"Phase-9 characterization asset {relative}",
+        )
+        if sha256_file(member) != digest:
+            fail(f"Phase-9 characterization asset hash mismatch: {relative}")
+        members[relative] = digest
+    expected = b"".join(
+        f"{members[name]}  {name}\n".encode("ascii")
+        for name in sorted(members)
+    )
+    if ledger.read_bytes() != expected:
+        fail("Phase-9 characterization asset ledger is not canonical and sorted")
+    return closure_path, members
+
+
+def audit_characterization_publication(
+    base_path: Path,
+    expected_parent_sha256: str,
+    characterization_path: Path,
+    fixture_path: Path,
+    expected_fixture_sha256: str,
+    process_metrics_path: Path,
+    expected_process_metrics_sha256: str,
+    affinity: str,
+    root: Path,
+) -> Characterization:
+    """Audit every byte in a produced characterization and its provenance."""
+
+    root = repo_root(root)
+    for value, label in (
+        (expected_parent_sha256, "expected parent SHA-256"),
+        (expected_fixture_sha256, "expected fixture SHA-256"),
+        (expected_process_metrics_sha256, "expected process-metrics SHA-256"),
+    ):
+        validate_hash(value, label)
+    validate_affinity(affinity, "characterization command")
+    base = read_manifest(base_path, root, expected_kind="base")
+    if base.sha256 != expected_parent_sha256:
+        fail("sealed base hash differs from the characterization parent")
+    if base.preamble["parent_sha256"] != "-":
+        fail("base workload manifest must declare parent_sha256=-")
+    fixture = require_canonical_regular(fixture_path, "Phase-9 fixture")
+    if fixture.stat().st_nlink != 1:
+        fail("Phase-9 fixture must not be externally hard-linked")
+    if sha256_file(fixture) != expected_fixture_sha256:
+        fail("Phase-9 fixture differs from its expected characterization hash")
+    process_metrics = require_canonical_regular(
+        process_metrics_path,
+        "process-metrics runner",
+        executable=True,
+    )
+    if process_metrics.stat().st_nlink != 1:
+        fail("process-metrics runner must not be externally hard-linked")
+    if sha256_file(process_metrics) != expected_process_metrics_sha256:
+        fail("process-metrics runner differs from its expected frozen hash")
+    oracle = resolve_manifest_uri(
+        base.path, base.preamble["frozen_oracle_dagutil_uri"], root
+    )
+    require_regular(oracle, "base frozen oracle", executable=True)
+    if sha256_file(oracle) != base.preamble["frozen_oracle_dagutil_sha256"]:
+        fail("base frozen oracle changed before characterization audit")
+
+    characterization = read_characterization(characterization_path)
+    exact_preamble = {
+        "parent_sha256": base.sha256,
+        "primary_sha256": expected_fixture_sha256,
+        "frozen_oracle_sha256": base.preamble[
+            "frozen_oracle_dagutil_sha256"
+        ],
+        "affinity_cpus": affinity,
+    }
+    for key, wanted in exact_preamble.items():
+        if characterization.preamble[key] != wanted:
+            fail(f"produced characterization {key} differs from its command contract")
+
+    publication = publication_paths(characterization.path)
+    assets = require_lexical_directory(
+        publication.assets, "Phase-9 characterization assets"
+    )
+    evidence_paths = [characterization.preamble["input_canonical_path"]]
+    evidence_paths.extend(
+        row[f"{prefix}_path"]
+        for row in characterization.rows.values()
+        for prefix in (
+            "product_report",
+            "canonical_sidecar",
+            "canonical_result",
+            "output_canonical",
+        )
+    )
+    prefix_parts: set[tuple[str, str]] = set()
+    for relative_text in evidence_paths:
+        parts = Path(relative_text).parts
+        if len(parts) < 3:
+            fail("produced characterization evidence path lacks its sealed closure")
+        prefix_parts.add((parts[0], parts[1]))
+    if len(prefix_parts) != 1:
+        fail("produced characterization evidence paths span multiple closures")
+    assets_name, closure = next(iter(prefix_parts))
+    if assets_name != assets.name:
+        fail("produced characterization evidence path names a foreign asset root")
+    closure_path, ledger_members = read_characterization_asset_ledger(
+        assets, closure
+    )
+
+    expected_members = {"fixture.pb.gz", "provenance/capture-contract.json", "provenance/capture-contract.json.sha256"}
+    expected_members.update(
+        f"input/{filename}"
+        for filename in (*CAPTURE_INPUT_FILES, "status.json", "status.json.sha256")
+    )
+    for seed in SEEDS:
+        for workers in WORKERS:
+            identity = row_id(seed, workers)
+            expected_members.update(
+                f"rows/{identity}/{filename}"
+                for filename in (
+                    *CAPTURE_STATUS_FILES,
+                    "status.json",
+                    "status.json.sha256",
+                )
+            )
+    if set(ledger_members) != expected_members:
+        fail(
+            "Phase-9 characterization ledger is not the exact capture closure: "
+            f"missing={sorted(expected_members - set(ledger_members))}, "
+            f"unexpected={sorted(set(ledger_members) - expected_members)}"
+        )
+    expected_tree = {
+        f"{closure}/{relative}" for relative in expected_members
+    } | {f"{closure}/{CHAR_CLOSURE_LEDGER}"}
+    audit_exact_asset_tree(assets, expected_tree)
+    archived_fixture = closure_path / "fixture.pb.gz"
+    if (
+        sha256_file(archived_fixture) != expected_fixture_sha256
+        or archived_fixture.read_bytes() != fixture.read_bytes()
+    ):
+        fail("characterization-owned fixture differs from the requested fixture")
+
+    contract_characterization = characterization_contract(
+        base,
+        expected_fixture_sha256,
+        affinity,
+        closure_path,
+    )
+    contract_path = closure_path / "provenance/capture-contract.json"
+    verify_detached_seal(contract_path)
+    expected_contract = characterization_capture_contract_bytes(
+        base,
+        contract_characterization,
+        expected_fixture_sha256,
+        expected_process_metrics_sha256,
+    )
+    if contract_path.read_bytes() != expected_contract:
+        fail("Phase-9 characterization capture contract changed")
+
+    input_evidence = validate_captured_input(
+        base,
+        contract_characterization,
+        None,
+        expected_fixture_sha256,
+        expected_process_metrics_sha256,
+        closure_path / "input",
+        require_readonly_directory=False,
+    )
+    published_input = exact_input_evidence(characterization)
+    require_matching_input_evidence(
+        published_input,
+        input_evidence,
+        "published Phase-9 characterization input",
+    )
+    wanted_input_path = f"{assets.name}/{closure}/input/canonical.json"
+    if characterization.preamble["input_canonical_path"] != wanted_input_path:
+        fail("published Phase-9 input canonical path is not canonical")
+
+    published_evidence: list[Evidence] = []
+    for seed in SEEDS:
+        for workers in WORKERS:
+            identity = row_id(seed, workers)
+            captured, captured_row = validate_captured_row(
+                base,
+                contract_characterization,
+                input_evidence,
+                None,
+                expected_fixture_sha256,
+                expected_process_metrics_sha256,
+                closure_path / "rows" / identity,
+                seed=seed,
+                workers=workers,
+                require_readonly_directory=False,
+            )
+            published = exact_evidence(
+                characterization,
+                characterization.rows[(seed, workers)],
+                published_input,
+            )
+            require_matching_stable_evidence(
+                captured,
+                published,
+                f"published Phase-9 characterization {identity}",
+            )
+            row = characterization.rows[(seed, workers)]
+            path_names = {
+                "product_report": "report.txt",
+                "canonical_sidecar": "canonical.ndjson",
+                "canonical_result": "canonical.json",
+                "output_canonical": "output-canonical.json",
+            }
+            for prefix, filename in path_names.items():
+                expected_path = (
+                    f"{assets.name}/{closure}/rows/{identity}/{filename}"
+                )
+                if row[f"{prefix}_path"] != expected_path:
+                    fail(
+                        f"published Phase-9 characterization {identity} "
+                        f"{prefix}_path is not canonical"
+                    )
+                if row[f"{prefix}_sha256"] != captured_row[f"{prefix}_sha256"]:
+                    fail(
+                        f"published Phase-9 characterization {identity} "
+                        f"{prefix}_sha256 differs from captured evidence"
+                    )
+            for field in (
+                "canonical_argv_sha256",
+                "oracle_search_semantic_sha256",
+                "oracle_output_semantic_sha256",
+                "oracle_trial_semantic_sha256",
+            ):
+                if row[field] != captured_row[field]:
+                    fail(
+                        f"published Phase-9 characterization {identity} "
+                        f"{field} differs from captured evidence"
+                    )
+            published_evidence.append(published)
+    validate_worker_independent_evidence(published_evidence)
+    return characterization
 
 
 def audit_capture_contract(
@@ -4377,6 +5028,172 @@ def _build_with_output_lock(
         raise
 
 
+def characterize(args: argparse.Namespace) -> None:
+    """Produce or validate one immutable frozen-oracle characterization."""
+
+    output = args.output.absolute()
+    output_parent = durable_mkdir_parents(
+        output.parent, "Phase-9 characterization output parent"
+    )
+    output = output_parent / output.name
+    with exclusive_output_lock(output) as publication:
+        root = repo_root(args.repo_root)
+
+        def audit_output(path: Path) -> Characterization:
+            return audit_characterization_publication(
+                args.base_manifest,
+                args.expected_parent_sha256,
+                path,
+                args.fixture,
+                args.expected_fixture_sha256,
+                args.process_metrics,
+                args.expected_process_metrics_sha256,
+                args.affinity_cpus,
+                root,
+            )
+
+        recovered_complete = recover_interrupted_publication(
+            publication,
+            prepublish_validator=lambda path: audit_output(path),
+        )
+        if recovered_complete:
+            audit_output(publication.output)
+            finish_publication(publication)
+            return
+        existing = [
+            path
+            for path in (publication.output, publication.assets, publication.seal)
+            if os.path.lexists(path)
+        ]
+        if existing:
+            if len(existing) == len(PUBLICATION_COMPONENTS):
+                audit_output(publication.output)
+                return
+            fail(
+                "exclusive Phase-9 characterization output already exists: "
+                f"{existing[0]}"
+            )
+        _characterize_with_output_lock(args, publication, root)
+
+
+def _characterize_with_output_lock(
+    args: argparse.Namespace,
+    publication: PublicationPaths,
+    root: Path,
+) -> None:
+    for value, label in (
+        (args.expected_parent_sha256, "expected parent SHA-256"),
+        (args.expected_fixture_sha256, "expected fixture SHA-256"),
+        (
+            args.expected_process_metrics_sha256,
+            "expected process-metrics SHA-256",
+        ),
+    ):
+        validate_hash(value, label)
+    validate_affinity(args.affinity_cpus, "characterization command")
+    base = read_manifest(args.base_manifest, root, expected_kind="base")
+    if base.sha256 != args.expected_parent_sha256:
+        fail("sealed base hash differs from --expected-parent-sha256")
+    if base.preamble["parent_sha256"] != "-":
+        fail("base workload manifest must declare parent_sha256=-")
+    fixture = require_canonical_regular(args.fixture, "Phase-9 fixture")
+    if fixture.stat().st_nlink != 1:
+        fail("Phase-9 fixture must not be externally hard-linked")
+    fixture_sha256 = sha256_file(fixture)
+    if fixture_sha256 != args.expected_fixture_sha256:
+        fail("Phase-9 fixture differs from --expected-fixture-sha256")
+    process_metrics = require_canonical_regular(
+        args.process_metrics,
+        "process-metrics runner",
+        executable=True,
+    )
+    if process_metrics.stat().st_nlink != 1:
+        fail("process-metrics runner must not be externally hard-linked")
+    process_metrics_sha256 = sha256_file(process_metrics)
+    if process_metrics_sha256 != args.expected_process_metrics_sha256:
+        fail("process-metrics runner differs from --expected-process-metrics-sha256")
+    oracle = resolve_manifest_uri(
+        base.path, base.preamble["frozen_oracle_dagutil_uri"], root
+    )
+    require_regular(oracle, "base frozen oracle", executable=True)
+    if sha256_file(oracle) != base.preamble["frozen_oracle_dagutil_sha256"]:
+        fail("base frozen oracle changed before characterization")
+
+    capture_absolute = args.capture_dir.absolute()
+    for reserved in dataclasses.astuple(publication):
+        if (
+            capture_absolute == reserved
+            or capture_absolute.is_relative_to(reserved)
+            or reserved.is_relative_to(capture_absolute)
+        ):
+            fail(
+                "--capture-dir must be disjoint from the complete "
+                "characterization publication namespace"
+            )
+    contract = characterization_contract(
+        base,
+        fixture_sha256,
+        args.affinity_cpus,
+        capture_absolute,
+    )
+    with exclusive_capture_lock(args.capture_dir):
+        input_evidence, _evidence, captured_rows, capture = (
+            produce_frozen_characterization_capture(
+                args.capture_dir,
+                base,
+                contract,
+                fixture,
+                fixture_sha256,
+                oracle,
+                process_metrics,
+                process_metrics_sha256,
+            )
+        )
+    asset_files, manifest_data, seal_data = render_characterization_publication(
+        publication,
+        contract,
+        input_evidence,
+        captured_rows,
+        capture,
+        fixture,
+    )
+    ownership = PublicationOwnership()
+
+    def audit_output(path: Path) -> None:
+        audit_characterization_publication(
+            args.base_manifest,
+            args.expected_parent_sha256,
+            path,
+            fixture,
+            args.expected_fixture_sha256,
+            process_metrics,
+            args.expected_process_metrics_sha256,
+            args.affinity_cpus,
+            root,
+        )
+
+    try:
+        publish_immutable_supplement(
+            publication,
+            asset_files,
+            manifest_data,
+            seal_data,
+            ownership=ownership,
+            prepublish_validator=audit_output,
+        )
+        audit_output(publication.output)
+        finish_publication(publication)
+    except BaseException as error:
+        try:
+            rollback_owned_publication(publication, ownership)
+        except BaseException as rollback_error:
+            raise BootstrapError(
+                "Phase-9 characterization rollback failed closed after "
+                f"{error}: {rollback_error}"
+            ) from error
+        raise
+
+
 def print_characterization_template() -> None:
     print(f"# schema={CHAR_SCHEMA}")
     print(f"# schema_version={CHAR_SCHEMA_VERSION}")
@@ -4418,6 +5235,28 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     build_parser.add_argument("--repo-root", type=Path)
     build_parser.add_argument("--benchmark-harness", type=Path, required=True)
     build_parser.add_argument("--process-metrics", type=Path, required=True)
+    characterize_parser = subparsers.add_parser(
+        "characterize",
+        help="produce the sealed 12-row frozen-oracle source characterization",
+    )
+    characterize_parser.add_argument("--base-manifest", type=Path, required=True)
+    characterize_parser.add_argument("--expected-parent-sha256", required=True)
+    characterize_parser.add_argument("--fixture", type=Path, required=True)
+    characterize_parser.add_argument("--expected-fixture-sha256", required=True)
+    characterize_parser.add_argument("--affinity-cpus", required=True)
+    characterize_parser.add_argument(
+        "--capture-dir",
+        type=Path,
+        required=True,
+        help="persistent restartable source-characterization capture directory",
+    )
+    characterize_parser.add_argument("--output", type=Path, required=True)
+    characterize_parser.add_argument("--repo-root", type=Path)
+    characterize_parser.add_argument("--process-metrics", type=Path, required=True)
+    characterize_parser.add_argument(
+        "--expected-process-metrics-sha256",
+        required=True,
+    )
     audit_parser = subparsers.add_parser("audit", help="audit a sealed Phase-9 supplement")
     audit_parser.add_argument("--base-manifest", type=Path, required=True)
     audit_parser.add_argument("--expected-parent-sha256", required=True)
@@ -4435,6 +5274,8 @@ def main(argv: Sequence[str]) -> int:
             print_characterization_template()
         elif args.command == "build":
             build(args)
+        elif args.command == "characterize":
+            characterize(args)
         elif args.command == "audit":
             root = repo_root(args.repo_root)
             audited = audit_supplement(

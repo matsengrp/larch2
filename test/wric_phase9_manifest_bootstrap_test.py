@@ -411,6 +411,7 @@ class Integration:
         write_bytes(self.fixture, b"synthetic strict Phase-9 fixture\n")
         self.fixture_sha = file_digest(self.fixture)
         self.input_counter = root / "oracle-input-invocations.txt"
+        self.failure_marker = root / "oracle-fail-row.txt"
         self._write_golden()
         self.oracle = self.base_dir / "dagutil"
         self.larch2 = self.base_dir / "larch2"
@@ -462,6 +463,7 @@ if "--help" in args:
 def value(flag):
     return args[args.index(flag) + 1]
 golden = pathlib.Path({os.fspath(self.golden)!r})
+failure_marker = pathlib.Path({os.fspath(self.failure_marker)!r})
 if "--chart-spr-search" in args:
     seed = int(value("--seed"))
     workers = int(value("--chart-spr-workers"))
@@ -469,6 +471,10 @@ if "--chart-spr-search" in args:
     pathlib.Path({os.fspath(self.counter)!r}).parent.mkdir(parents=True, exist_ok=True)
     with pathlib.Path({os.fspath(self.counter)!r}).open("a") as stream:
         stream.write(f"{{seed}} {{workers}}\\n")
+    if failure_marker.exists() and failure_marker.read_text().strip() == f"{{seed}} {{workers}}":
+        failure_marker.unlink()
+        print("injected characterization row failure", file=sys.stderr)
+        raise SystemExit(42)
     shutil.copyfile(source / "canonical.json", value("--chart-spr-canonical-result"))
     shutil.copyfile(source / "canonical.ndjson", value("--chart-spr-canonical-sidecar"))
     pathlib.Path(value("-o")).write_text(f"{{seed}} {{workers}}\\n")
@@ -674,6 +680,43 @@ else:
             os.fspath(HARNESS),
             "--process-metrics",
             os.fspath(self.runner),
+        ]
+
+    def characterize_command(
+        self,
+        output: Path,
+        *,
+        capture: Path | None = None,
+        process_metrics: Path | None = None,
+        expected_process_metrics_sha256: str | None = None,
+        expected_parent: str | None = None,
+        fixture: Path | None = None,
+    ) -> list[str]:
+        runner = process_metrics or self.runner
+        return [
+            sys.executable,
+            os.fspath(HELPER),
+            "characterize",
+            "--repo-root",
+            os.fspath(REPO),
+            "--base-manifest",
+            os.fspath(self.base),
+            "--expected-parent-sha256",
+            expected_parent or self.parent_sha,
+            "--fixture",
+            os.fspath(fixture or self.fixture),
+            "--expected-fixture-sha256",
+            self.fixture_sha,
+            "--affinity-cpus",
+            self.affinity,
+            "--capture-dir",
+            os.fspath(capture or (self.root / "characterization-capture")),
+            "--output",
+            os.fspath(output),
+            "--process-metrics",
+            os.fspath(runner),
+            "--expected-process-metrics-sha256",
+            expected_process_metrics_sha256 or file_digest(self.runner),
         ]
 
     def write_current_run(self, run_root: Path, supplement: Path) -> None:
@@ -974,6 +1017,259 @@ def main() -> None:
         prefix="wric-phase9-manifest-bootstrap-", dir=REPO / "build"
     ) as temporary:
         case = Integration(Path(temporary))
+
+        produced = case.root / "produced" / "frozen-input.tsv"
+        producer_capture = case.root / "producer-capture"
+        case.run(
+            case.characterize_command(produced, capture=producer_capture),
+            success=True,
+        )
+        assert case.input_counter.read_text().splitlines() == ["input"]
+        assert case.counter.read_text().splitlines() == [
+            f"{seed} {workers}"
+            for seed in bootstrap.SEEDS
+            for workers in bootstrap.WORKERS
+        ]
+        produced_characterization = bootstrap.audit_characterization_publication(
+            case.base,
+            case.parent_sha,
+            produced,
+            case.fixture,
+            case.fixture_sha,
+            case.runner,
+            file_digest(case.runner),
+            case.affinity,
+            REPO,
+        )
+        assert produced_characterization.preamble["schema_version"] == "3"
+        assert produced_characterization.preamble["timeout_seconds"] == str(
+            bootstrap.TIMEOUT_SECONDS
+        )
+        produced_input_parts = Path(
+            produced_characterization.preamble["input_canonical_path"]
+        ).parts
+        assert produced_input_parts[0] == "frozen-input.assets"
+        assert produced_input_parts[1].startswith(bootstrap.CHAR_CLOSURE_PREFIX)
+        produced_assets = produced.with_name(produced.stem + ".assets")
+        produced_contract = bootstrap.read_json_object(
+            produced_assets
+            / produced_input_parts[1]
+            / "provenance/capture-contract.json",
+            "produced characterization contract",
+        )
+        assert produced_contract["process_metrics_sha256"] == file_digest(
+            case.runner
+        )
+        assert produced_contract["parent_sha256"] == case.parent_sha
+        assert produced_contract["fixture_sha256"] == case.fixture_sha
+        assert len(produced_contract["rows"]) == 12
+        assert all(
+            row["canonical_argv_sha256"]
+            == bootstrap.canonical_argv_digest(row["canonical_argv"])
+            for row in produced_contract["rows"]
+        )
+
+        producer_calls = case.counter.read_bytes()
+        input_calls = case.input_counter.read_bytes()
+        produced_bytes = final_publication_bytes(produced)
+        case.run(
+            case.characterize_command(produced, capture=producer_capture),
+            success=True,
+        )
+        assert case.counter.read_bytes() == producer_calls
+        assert case.input_counter.read_bytes() == input_calls
+        assert final_publication_bytes(produced) == produced_bytes
+
+        reused = case.root / "producer-reuse" / "frozen-input.tsv"
+        case.run(
+            case.characterize_command(reused, capture=producer_capture),
+            success=True,
+        )
+        assert case.counter.read_bytes() == producer_calls
+        assert case.input_counter.read_bytes() == input_calls
+        assert final_publication_bytes(reused) == produced_bytes
+
+        recovered_characterization = (
+            case.root / "producer-publication-recovery" / "frozen-input.tsv"
+        )
+        inject_publication_crash(
+            recovered_characterization,
+            produced,
+            "assets_published",
+        )
+        case.run(
+            case.characterize_command(
+                recovered_characterization,
+                capture=producer_capture,
+            ),
+            success=True,
+        )
+        assert final_publication_bytes(recovered_characterization) == produced_bytes
+        assert case.counter.read_bytes() == producer_calls
+        assert case.input_counter.read_bytes() == input_calls
+
+        no_replace_output = (
+            case.root / "producer-no-replace-race" / "frozen-input.tsv"
+        )
+        no_replace_output.parent.mkdir()
+        no_replace_publication = bootstrap.publication_paths(no_replace_output)
+        no_replace_ownership = bootstrap.PublicationOwnership()
+        no_replace_foreign = b"foreign target inserted after audit\n"
+        with bootstrap.exclusive_output_lock(no_replace_output) as publication:
+            def insert_characterization_foreign_target(point: str) -> None:
+                if point == "staging_validated":
+                    write_bytes(publication.output, no_replace_foreign, 0o444)
+
+            try:
+                bootstrap.publish_immutable_supplement(
+                    publication,
+                    tree_bytes(produced_assets),
+                    produced.read_bytes(),
+                    produced.with_name(produced.name + ".sha256").read_bytes(),
+                    crash_hook=insert_characterization_foreign_target,
+                    ownership=no_replace_ownership,
+                    prepublish_validator=lambda staged: (
+                        bootstrap.audit_characterization_publication(
+                            case.base,
+                            case.parent_sha,
+                            staged,
+                            case.fixture,
+                            case.fixture_sha,
+                            case.runner,
+                            file_digest(case.runner),
+                            case.affinity,
+                            REPO,
+                        )
+                    ),
+                )
+            except bootstrap.BootstrapError as error:
+                assert "already exists" in str(error)
+            else:
+                raise AssertionError("characterization publication replaced a race")
+            bootstrap.rollback_owned_publication(
+                publication,
+                no_replace_ownership,
+            )
+        assert no_replace_publication.output.read_bytes() == no_replace_foreign
+        assert no_replace_publication.assets.is_dir()
+        assert not no_replace_publication.seal.exists()
+
+        wrong_runner = case.root / "wrong-process-metrics"
+        write_bytes(
+            wrong_runner,
+            case.runner.read_bytes() + b"wrong frozen runner\n",
+            0o555,
+        )
+        wrong_runner_output = case.root / "wrong-runner" / "frozen-input.tsv"
+        result = case.run(
+            case.characterize_command(
+                wrong_runner_output,
+                capture=case.root / "wrong-runner-capture",
+                process_metrics=wrong_runner,
+            ),
+            success=False,
+        )
+        assert "expected-process-metrics-sha256" in result.stderr
+        assert not wrong_runner_output.exists()
+
+        foreign_characterization = (
+            case.root / "foreign-characterization" / "frozen-input.tsv"
+        )
+        foreign_characterization.parent.mkdir()
+        foreign_bytes = b"foreign characterization target\n"
+        write_bytes(foreign_characterization, foreign_bytes, 0o444)
+        result = case.run(
+            case.characterize_command(
+                foreign_characterization,
+                capture=case.root / "foreign-characterization-capture",
+            ),
+            success=False,
+        )
+        assert "characterization output already exists" in result.stderr
+        assert foreign_characterization.read_bytes() == foreign_bytes
+
+        independent_supplement = (
+            case.root / "produced-source-build" / "phase9-local-commit.tsv"
+        )
+        case.run(
+            case.build_command(
+                independent_supplement,
+                characterization=produced,
+                capture=case.root / "produced-source-build-capture",
+            ),
+            success=True,
+        )
+        assert len(case.counter.read_text().splitlines()) == 24
+        assert case.input_counter.read_text().splitlines() == ["input", "input"]
+        bootstrap.audited_frozen_characterization(
+            case.base,
+            case.parent_sha,
+            independent_supplement,
+            REPO,
+        )
+
+        case.counter.unlink()
+        case.input_counter.unlink()
+        partial_capture = case.root / "producer-partial-capture"
+        partial_output = case.root / "producer-partial" / "frozen-input.tsv"
+        write_bytes(case.failure_marker, b"1 2\n")
+        result = case.run(
+            case.characterize_command(partial_output, capture=partial_capture),
+            success=False,
+        )
+        assert "process-metrics" in result.stderr
+        assert not partial_output.exists()
+        partial_rows = partial_capture / "rows"
+        first_identity = bootstrap.row_id(1, 1)
+        failed_identity = bootstrap.row_id(1, 2)
+        assert (partial_rows / first_identity / "status.json.sha256").is_file()
+        assert not (partial_rows / f".{failed_identity}.staging").exists()
+        assert case.input_counter.read_text().splitlines() == ["input"]
+        assert case.counter.read_text().splitlines() == ["1 1", "1 2"]
+
+        foreign_row = partial_rows / failed_identity
+        foreign_row.mkdir()
+        foreign_row_bytes = b"foreign capture row\n"
+        write_bytes(foreign_row / "foreign.txt", foreign_row_bytes)
+        result = case.run(
+            case.characterize_command(partial_output, capture=partial_capture),
+            success=False,
+        )
+        assert "exact file closure" in result.stderr
+        assert (foreign_row / "foreign.txt").read_bytes() == foreign_row_bytes
+        shutil.rmtree(foreign_row)
+
+        case.run(
+            case.characterize_command(partial_output, capture=partial_capture),
+            success=True,
+        )
+        assert case.input_counter.read_text().splitlines() == ["input"]
+        assert len(case.counter.read_text().splitlines()) == 13
+        assert case.counter.read_text().splitlines().count("1 1") == 1
+        assert case.counter.read_text().splitlines().count("1 2") == 2
+
+        partial_characterization = bootstrap.read_characterization(partial_output)
+        tampered_report = bootstrap.relative_evidence_path(
+            partial_characterization.path,
+            partial_characterization.rows[(1, 1)]["product_report_path"],
+            "producer tamper report",
+        )
+        tampered_report.chmod(0o644)
+        tampered_bytes = tampered_report.read_bytes().replace(
+            b"  accepted_rebuild_ms: 120.250\n",
+            b"  accepted_rebuild_ms: 121.250\n",
+        )
+        assert tampered_bytes != tampered_report.read_bytes()
+        tampered_report.write_bytes(tampered_bytes)
+        result = case.run(
+            case.characterize_command(partial_output, capture=partial_capture),
+            success=False,
+        )
+        assert "hash mismatch" in result.stderr
+        assert tampered_report.read_bytes() == tampered_bytes
+
+        case.counter.unlink()
+        case.input_counter.unlink()
         output_a = case.root / "out-a" / "phase9-local-commit.tsv"
         output_b = case.root / "out-b" / "phase9-local-commit.tsv"
         source_hardlink = case.root / "source-characterization-hardlink.tsv"
