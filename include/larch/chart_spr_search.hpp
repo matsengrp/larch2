@@ -2186,6 +2186,9 @@ struct chart_spr_search_summary {
       lazy_local_canonical_exact_evidence_construction_peak_bytes_max = 0;
   std::size_t lazy_local_runtime_transient_reservation_bytes_max = 0;
   std::size_t lazy_local_iteration_envelope_bytes_max = 0;
+  std::size_t lazy_local_iteration_generation_phase_bytes_max = 0;
+  std::size_t lazy_local_iteration_evidence_phase_bytes_max = 0;
+  std::size_t lazy_local_ranked_candidate_exact_evidence_bytes_max = 0;
   std::size_t lazy_local_iteration_task_stable_bytes_max = 0;
   std::size_t lazy_local_iteration_task_preparation_peak_bytes_max = 0;
   std::size_t candidate_batches_scored = 0;

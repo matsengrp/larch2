@@ -153,6 +153,9 @@ chart_spr_search_counters:
   local_rows_recomputed:                                       159379494
   local_score_parallel_batches:                                0
   local_score_worker_tasks:                                    0
+  lazy_local_iteration_generation_phase_bytes_max:             0
+  lazy_local_iteration_evidence_phase_bytes_max:               0
+  lazy_local_ranked_candidate_exact_evidence_bytes_max:        0
   candidate_batches_scored:                                    88026
   pattern_batch_cache_builds:                                  0
   exact_verifications:                                         16

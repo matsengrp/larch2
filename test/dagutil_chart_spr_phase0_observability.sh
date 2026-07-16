@@ -78,6 +78,29 @@ top_value() {
   ' "$file"
 }
 
+# Read a scalar from the single four-space-indented nested counters block.
+# This deliberately rejects missing/duplicate fields and does not accept a
+# top-level summary field as a substitute for the raw counter.
+counter_value() {
+  local file=$1
+  local key=$2
+  awk -v wanted="    $key: " '
+    $0 == "  counters:" {
+      in_counters = 1
+      next
+    }
+    in_counters && /^  [^ ]/ { in_counters = 0 }
+    in_counters && index($0, wanted) == 1 {
+      count += 1
+      value = substr($0, length(wanted) + 1)
+    }
+    END {
+      if (count != 1) exit 1
+      print value
+    }
+  ' "$file"
+}
+
 require_top_value() {
   local file=$1
   local key=$2
@@ -269,6 +292,59 @@ score_ua_edge\tfalse
 validate\ttrue
 force_no_vcf\ttrue
 REPORT_CONTRACT
+
+# A real finite, forced-lazy exact search reports the temporal admission
+# envelope at both public surfaces.  Each stable name occurs exactly once in
+# the top-level summary and once in the nested raw-counter block, and both
+# surfaces carry the same nonzero value.
+finite_lazy_out=$tmp/finite_lazy.out
+run_search finite_lazy --wric-lazy-chart on \
+  --chart-spr-max-candidates 2 --chart-spr-top-k-exact 2 \
+  --chart-spr-canonical-result "$tmp/finite_lazy.json"
+temporal_keys=(
+  lazy_local_iteration_generation_phase_bytes_max
+  lazy_local_iteration_evidence_phase_bytes_max
+  lazy_local_ranked_candidate_exact_evidence_bytes_max
+)
+for key in "${temporal_keys[@]}"; do
+  summary_value=$(top_value "$finite_lazy_out" "$key") || {
+    echo "missing or duplicate top-level '$key' in $finite_lazy_out" >&2
+    exit 1
+  }
+  raw_value=$(counter_value "$finite_lazy_out" "$key") || {
+    echo "missing or duplicate nested counter '$key' in $finite_lazy_out" >&2
+    exit 1
+  }
+  if [[ ! $summary_value =~ ^[1-9][0-9]*$ ]]; then
+    echo "top-level $key is not a positive integer: '$summary_value'" >&2
+    exit 1
+  fi
+  if [[ $summary_value != "$raw_value" ]]; then
+    echo "$key differs between summary ($summary_value) and counters ($raw_value)" >&2
+    exit 1
+  fi
+done
+
+finite_envelope=$(top_value "$finite_lazy_out" \
+  lazy_local_iteration_envelope_bytes_max)
+finite_generation=$(top_value "$finite_lazy_out" \
+  lazy_local_iteration_generation_phase_bytes_max)
+finite_evidence=$(top_value "$finite_lazy_out" \
+  lazy_local_iteration_evidence_phase_bytes_max)
+finite_ranked=$(top_value "$finite_lazy_out" \
+  lazy_local_ranked_candidate_exact_evidence_bytes_max)
+finite_expected=$finite_generation
+if (( finite_evidence > finite_expected )); then
+  finite_expected=$finite_evidence
+fi
+if (( finite_envelope != finite_expected )); then
+  echo "finite lazy envelope $finite_envelope != max($finite_generation, $finite_evidence)" >&2
+  exit 1
+fi
+if (( finite_evidence < finite_ranked )); then
+  echo "finite lazy evidence phase $finite_evidence does not contain ranked evidence $finite_ranked" >&2
+  exit 1
+fi
 
 # The unified option is the authoritative forward-looking budget.
 unified_out=$tmp/unified.out

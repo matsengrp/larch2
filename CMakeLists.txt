@@ -1252,6 +1252,11 @@ add_test(NAME wric_counter_baseline_compiles
                  --target wric_counter_baseline_compile_check
                  --config $<CONFIG>
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME wric_counter_baseline_temporal_fields
+         COMMAND bash test/wric_counter_baseline_temporal_fields_test.sh
+                 doc/WRIC-CHART-SPR-SEARCH-COUNTER-BASELINE.md
+                 tools/wric_counter_baseline.cpp
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(merge_consistency_test rotaA_diagnostic_test
                      PROPERTIES SKIP_RETURN_CODE 77)
 

@@ -294,6 +294,12 @@ int main() {
                      c.lazy_local_runtime_transient_reservation_bytes_max);
   print_counter_line("lazy_local_iteration_envelope_bytes_max",
                      c.lazy_local_iteration_envelope_bytes_max);
+  print_counter_line("lazy_local_iteration_generation_phase_bytes_max",
+                     c.lazy_local_iteration_generation_phase_bytes_max);
+  print_counter_line("lazy_local_iteration_evidence_phase_bytes_max",
+                     c.lazy_local_iteration_evidence_phase_bytes_max);
+  print_counter_line("lazy_local_ranked_candidate_exact_evidence_bytes_max",
+                     c.lazy_local_ranked_candidate_exact_evidence_bytes_max);
   print_counter_line("lazy_local_iteration_task_stable_bytes_max",
                      c.lazy_local_iteration_task_stable_bytes_max);
   print_counter_line("lazy_local_iteration_task_preparation_peak_bytes_max",

@@ -2590,9 +2590,12 @@ static void test_lazy_exact_semantic_dynamic_evidence_boundary() {
           .lazy_local_iteration_generation_phase_bytes_max;
   auto const evidence_phase =
       calibration_state.counters.lazy_local_iteration_evidence_phase_bytes_max;
-  CHECK(calibration_state.counters
-            .lazy_local_ranked_candidate_exact_evidence_bytes_max > 0);
+  auto const ranked_evidence =
+      calibration_state.counters
+          .lazy_local_ranked_candidate_exact_evidence_bytes_max;
+  CHECK(ranked_evidence > 0);
   CHECK(evidence_phase > generation_phase);
+  CHECK(evidence_phase >= ranked_evidence);
   CHECK(exact_boundary == std::max(generation_phase, evidence_phase));
   CHECK(exact_boundary < larch::chart_spr_exact_candidate_checked_bytes_add(
                              generation_phase, evidence_phase,
@@ -2638,6 +2641,8 @@ static void test_lazy_exact_semantic_dynamic_evidence_boundary() {
       reject_state.counters.scheduler_axes.exact_setup_patterns;
   auto const exact_frontier_axis_before =
       reject_state.counters.scheduler_axes.exact_frontier_clades;
+  auto const exact_candidate_axis_before =
+      reject_state.counters.scheduler_axes.exact_candidates;
   bool rejected = false;
   try {
     (void)larch::run_chart_spr_acceptance_iteration(
@@ -2660,9 +2665,57 @@ static void test_lazy_exact_semantic_dynamic_evidence_boundary() {
         exact_setup_axis_before);
   CHECK(reject_state.counters.scheduler_axes.exact_frontier_clades ==
         exact_frontier_axis_before);
+  CHECK(reject_state.counters.scheduler_axes.exact_candidates ==
+        exact_candidate_axis_before);
   CHECK(reject_state.counters
             .lazy_local_canonical_exact_evidence_resident_bytes_max == 0);
   reject_scheduler->shutdown();
+
+  std::println("  PASS");
+}
+
+static void test_finite_lazy_search_summary_reports_temporal_envelope() {
+  std::println(
+      "test_finite_lazy_search_summary_reports_temporal_envelope");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 8;
+  options.max_iterations = 1;
+  options.max_candidates_per_iteration = 8;
+  options.cache.use_lazy_multisite_chart = true;
+  options.cache.candidate_batch_size = 1;
+  options.cache.memory_budget_bytes = std::size_t{1} << 40;
+  options.semantic_capture = larch::chart_spr_semantic_capture_mode::digest;
+
+  auto search =
+      larch::run_chart_spr_search(std::move(dag), grammar, options);
+  CHECK(search.iterations.size() == 1);
+  CHECK(search.iterations.front().candidates_exact_verified > 0);
+
+  auto const& counters = search.counters;
+  auto const& summary = search.summary;
+  CHECK(counters.lazy_local_iteration_generation_phase_bytes_max > 0);
+  CHECK(counters.lazy_local_iteration_evidence_phase_bytes_max > 0);
+  CHECK(counters.lazy_local_ranked_candidate_exact_evidence_bytes_max > 0);
+  CHECK(summary.lazy_local_iteration_generation_phase_bytes_max ==
+        counters.lazy_local_iteration_generation_phase_bytes_max);
+  CHECK(summary.lazy_local_iteration_evidence_phase_bytes_max ==
+        counters.lazy_local_iteration_evidence_phase_bytes_max);
+  CHECK(summary.lazy_local_ranked_candidate_exact_evidence_bytes_max ==
+        counters.lazy_local_ranked_candidate_exact_evidence_bytes_max);
+  CHECK(summary.lazy_local_iteration_envelope_bytes_max ==
+        counters.lazy_local_iteration_envelope_bytes_max);
+  CHECK(summary.lazy_local_iteration_envelope_bytes_max ==
+        std::max(summary.lazy_local_iteration_generation_phase_bytes_max,
+                 summary.lazy_local_iteration_evidence_phase_bytes_max));
+  CHECK(summary.lazy_local_iteration_evidence_phase_bytes_max >=
+        summary.lazy_local_ranked_candidate_exact_evidence_bytes_max);
 
   std::println("  PASS");
 }
@@ -12930,6 +12983,7 @@ int main() {
   test_lazy_local_exact_semantic_evidence_envelope();
   test_published_state_admission_component_identity();
   test_lazy_exact_semantic_dynamic_evidence_boundary();
+  test_finite_lazy_search_summary_reports_temporal_envelope();
   test_lazy_exact_w4_combined_envelope_boundary();
   test_scheduled_exact_state_w4_boundary();
   test_phase7_lazy_auto_policy_contract();

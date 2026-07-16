@@ -3486,6 +3486,12 @@ static void print_chart_spr_search_counter_fields(
       << counters.lazy_local_runtime_transient_reservation_bytes_max << "\n";
   out << indent << "lazy_local_iteration_envelope_bytes_max: "
       << counters.lazy_local_iteration_envelope_bytes_max << "\n";
+  out << indent << "lazy_local_iteration_generation_phase_bytes_max: "
+      << counters.lazy_local_iteration_generation_phase_bytes_max << "\n";
+  out << indent << "lazy_local_iteration_evidence_phase_bytes_max: "
+      << counters.lazy_local_iteration_evidence_phase_bytes_max << "\n";
+  out << indent << "lazy_local_ranked_candidate_exact_evidence_bytes_max: "
+      << counters.lazy_local_ranked_candidate_exact_evidence_bytes_max << "\n";
   out << indent << "lazy_local_iteration_task_stable_bytes_max: "
       << counters.lazy_local_iteration_task_stable_bytes_max << "\n";
   out << indent << "lazy_local_iteration_task_preparation_peak_bytes_max: "
@@ -4830,6 +4836,13 @@ static void run_chart_spr_search_diagnostic(
       << "\n";
   out << "  lazy_local_iteration_envelope_bytes_max: "
       << search.summary.lazy_local_iteration_envelope_bytes_max << "\n";
+  out << "  lazy_local_iteration_generation_phase_bytes_max: "
+      << search.summary.lazy_local_iteration_generation_phase_bytes_max << "\n";
+  out << "  lazy_local_iteration_evidence_phase_bytes_max: "
+      << search.summary.lazy_local_iteration_evidence_phase_bytes_max << "\n";
+  out << "  lazy_local_ranked_candidate_exact_evidence_bytes_max: "
+      << search.summary.lazy_local_ranked_candidate_exact_evidence_bytes_max
+      << "\n";
   out << "  lazy_local_iteration_task_stable_bytes_max: "
       << search.summary.lazy_local_iteration_task_stable_bytes_max << "\n";
   out << "  lazy_local_iteration_task_preparation_peak_bytes_max: "

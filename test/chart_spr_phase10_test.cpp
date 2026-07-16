@@ -774,6 +774,9 @@ static void test_phase10_counter_contract_fields_exist() {
   (void)c.selected_topology_class_rows_computed;
   (void)c.local_commit_accepted_moves;
   (void)c.local_commit_tombstone_scope_skips;
+  (void)c.lazy_local_iteration_generation_phase_bytes_max;
+  (void)c.lazy_local_iteration_evidence_phase_bytes_max;
+  (void)c.lazy_local_ranked_candidate_exact_evidence_bytes_max;
   // Summary mirrors.
   larch::chart_spr_search_summary s{};
   (void)s.sidecar_rebuilds_after_accept;
@@ -817,6 +820,9 @@ static void test_phase10_counter_contract_fields_exist() {
   (void)s.lazy_merge_ratio;
   (void)s.lazy_internal_structural_class_ratio;
   (void)s.selected_topology_class_rows_computed;
+  (void)s.lazy_local_iteration_generation_phase_bytes_max;
+  (void)s.lazy_local_iteration_evidence_phase_bytes_max;
+  (void)s.lazy_local_ranked_candidate_exact_evidence_bytes_max;
   (void)s.commit_mode;
   (void)s.verification_mode;
   (void)s.chain_per_accept_exactness_label;
