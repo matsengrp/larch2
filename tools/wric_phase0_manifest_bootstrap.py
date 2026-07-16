@@ -2682,7 +2682,7 @@ def validate_successful_raw_domains(
         fail(f"explicit chart worker observation is inconsistent: {key}")
 
     direct_report_fields = {
-        "iterations": "iterations",
+        "iterations": "requested_max_iterations",
         "seed": "seed",
         "acceptance": "acceptance",
         "objective": "objective",
@@ -2698,6 +2698,16 @@ def validate_successful_raw_domains(
                 f"successful raw/report field differs for {key}: "
                 f"{raw_field}/{report_field}"
             )
+    executed_iterations = require_unsigned_text(
+        report_value(report, "iterations"),
+        f"{key} report executed iterations",
+        positive=True,
+    )
+    if executed_iterations > capture.iterations:
+        fail(
+            "successful report executed more iterations than its requested "
+            f"maximum: {key}: {executed_iterations} > {capture.iterations}"
+        )
     report_initial_score = require_unsigned_text(
         report_value(report, "initial_score"), f"{key} report initial score"
     )
@@ -2764,13 +2774,21 @@ def validate_successful_raw_domains(
         "candidates_generated"
     ]:
         fail(f"successful row generated-candidate counters disagree: {key}")
-    iterations = int(row["iterations"])
-    if counts["candidates_generated"] > capture.chart_max_candidates * iterations:
+    if (
+        counts["candidates_generated"]
+        > capture.chart_max_candidates * executed_iterations
+    ):
         fail(f"successful row exceeds its candidate budget: {key}")
-    if counts["exact_verifications"] > capture.chart_top_k_exact * iterations:
+    if (
+        counts["exact_verifications"]
+        > capture.chart_top_k_exact * executed_iterations
+    ):
         fail(f"successful row exceeds its exact-verification budget: {key}")
-    if counts["accepted_moves"] > iterations:
-        fail(f"successful row accepts more than one move per iteration: {key}")
+    if counts["accepted_moves"] > executed_iterations:
+        fail(
+            "successful row accepts more than one move per executed iteration: "
+            f"{key}"
+        )
     if counts["candidate_accepts_attempted"] != (
         counts["accepted_moves"] + counts["post_materialization_rejections"]
     ):
@@ -10790,8 +10808,12 @@ def self_test(_: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory(prefix="wric-phase0-domain-") as temporary:
         synthetic_root = Path(temporary)
         synthetic_report = synthetic_root / "chart.report"
+        # Exercise a requested three-iteration run that stops successfully
+        # after its first non-accepting iteration.  The command budget remains
+        # three; counters are bounded by the one iteration actually executed.
+        success_capture = dataclasses.replace(primary, iterations=3)
         success_key = ("chart_spr_grammar_exact", "8")
-        success_argv = expected_chart_argv_sha256(primary, success_key)
+        success_argv = expected_chart_argv_sha256(success_capture, success_key)
         success_search = "1" * 64
         success_output = "2" * 64
         success_trial = trial_digest(
@@ -10810,7 +10832,7 @@ def self_test(_: argparse.Namespace) -> None:
             "final_validated_parsimony_min": "9",
             "best_reported_objective": "9",
             "best_validated_parsimony_min": "9",
-            "iterations": str(primary.iterations),
+            "iterations": str(success_capture.iterations),
             "seed": "1",
             "acceptance": "exact_multisite",
             "objective": "grammar_exact",
@@ -10894,7 +10916,8 @@ def self_test(_: argparse.Namespace) -> None:
             "chart_workers_resolved": "8",
             "local_score_workers": "8",
             "chart_worker_policy": "explicit",
-            "iterations": str(primary.iterations),
+            "requested_max_iterations": str(success_capture.iterations),
+            "iterations": "1",
             "seed": "1",
             "acceptance": "exact_multisite",
             "objective": "grammar_exact",
@@ -10990,10 +11013,10 @@ def self_test(_: argparse.Namespace) -> None:
             encoding="utf-8",
         )
         validate_raw_trial_binding(
-            primary, successful_chart, success_key, "ok"
+            success_capture, successful_chart, success_key, "ok"
         )
         validate_successful_raw_domains(
-            synthetic_root, primary, successful_chart, success_key
+            synthetic_root, success_capture, successful_chart, success_key
         )
         # The frozen awk path uses IEEE binary arithmetic.  At this exact
         # decimal half-way point it prints 1.985313, while direct Decimal
@@ -11026,7 +11049,7 @@ def self_test(_: argparse.Namespace) -> None:
             try:
                 validate_successful_raw_domains(
                     synthetic_root,
-                    primary,
+                    success_capture,
                     successful_chart | mutation,
                     success_key,
                 )
