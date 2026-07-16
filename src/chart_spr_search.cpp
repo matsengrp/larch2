@@ -1869,9 +1869,10 @@ void chart_spr_set_identity_tip_maps(chart_spr_local_commit_substrate& sub) {
 
 void chart_spr_set_tip_maps_from_materialization(
     chart_spr_local_commit_substrate& sub,
-    overlay_materialization_result const& materialized) {
-  sub.dense_clade_to_chain_ref = materialized.dense_clade_to_ref;
-  sub.dense_production_to_chain_ref = materialized.dense_production_to_ref;
+    overlay_materialization_result& materialized) {
+  sub.dense_clade_to_chain_ref = std::move(materialized.dense_clade_to_ref);
+  sub.dense_production_to_chain_ref =
+      std::move(materialized.dense_production_to_ref);
 }
 
 void chart_spr_publish_local_commit_tip_identity(
@@ -3833,9 +3834,10 @@ void chart_spr_recompute_lazy_outside_summary_counters(
 }
 
 lazy_multisite_chart chart_spr_project_lazy_chart_to_materialized(
-    lazy_multisite_chart const& previous,
+    lazy_multisite_chart& previous,
     overlay_materialization_result const& materialized,
-    std::vector<overlay_clade_ref> const& previous_dense_clade_to_ref) {
+    std::vector<overlay_clade_ref> const& previous_dense_clade_to_ref,
+    chart_cache_commit_plan const& cache_commit_plan) {
   if (previous_dense_clade_to_ref.size() !=
       previous.inside_rows_by_clade.size()) {
     throw std::runtime_error(
@@ -3852,7 +3854,8 @@ lazy_multisite_chart chart_spr_project_lazy_chart_to_materialized(
   next.structural_class_count_by_clade.assign(clade_count, 0);
   next.class_weight_by_clade.resize(clade_count);
   next.outside_class_weight_by_clade.resize(clade_count);
-  next.outside_global_min_by_pattern = previous.outside_global_min_by_pattern;
+  next.outside_global_min_by_pattern =
+      std::move(previous.outside_global_min_by_pattern);
   next.pattern_count = previous.pattern_count;
   next.total_pattern_weight = previous.total_pattern_weight;
   next.multifurcation_productions_scored =
@@ -3866,10 +3869,10 @@ lazy_multisite_chart chart_spr_project_lazy_chart_to_materialized(
     previous_dense_by_ref.emplace(previous_dense_clade_to_ref[dense], dense);
   }
 
-  auto copy_slot = [](auto const& from, auto& to, clade_id old_dense,
+  auto move_slot = [](auto& from, auto& to, clade_id old_dense,
                       clade_id new_dense) {
     if (old_dense < from.size() && new_dense < to.size()) {
-      to[new_dense] = from[old_dense];
+      to[new_dense] = std::move(from[old_dense]);
     }
   };
 
@@ -3878,23 +3881,31 @@ lazy_multisite_chart chart_spr_project_lazy_chart_to_materialized(
     auto it = previous_dense_by_ref.find(materialized.dense_clade_to_ref[dense]);
     if (it == previous_dense_by_ref.end()) continue;
     auto old_dense = it->second;
-    copy_slot(previous.inside_rows_by_clade, next.inside_rows_by_clade,
-              old_dense, dense);
-    copy_slot(previous.outside_rows_by_clade, next.outside_rows_by_clade,
-              old_dense, dense);
-    copy_slot(previous.class_index_by_pattern_by_clade,
-              next.class_index_by_pattern_by_clade, old_dense, dense);
-    copy_slot(previous.structural_class_index_by_pattern_by_clade,
-              next.structural_class_index_by_pattern_by_clade, old_dense,
-              dense);
-    copy_slot(previous.outside_class_index_by_pattern_by_clade,
-              next.outside_class_index_by_pattern_by_clade, old_dense, dense);
-    copy_slot(previous.structural_class_count_by_clade,
-              next.structural_class_count_by_clade, old_dense, dense);
-    copy_slot(previous.class_weight_by_clade, next.class_weight_by_clade,
-              old_dense, dense);
-    copy_slot(previous.outside_class_weight_by_clade,
-              next.outside_class_weight_by_clade, old_dense, dense);
+    auto ref = materialized.dense_clade_to_ref[dense];
+    if (cache_commit_plan.inside_position(ref) ==
+        chart_cache_commit_plan::no_position) {
+      move_slot(previous.inside_rows_by_clade, next.inside_rows_by_clade,
+                old_dense, dense);
+      move_slot(previous.class_index_by_pattern_by_clade,
+                next.class_index_by_pattern_by_clade, old_dense, dense);
+      move_slot(previous.structural_class_index_by_pattern_by_clade,
+                next.structural_class_index_by_pattern_by_clade, old_dense,
+                dense);
+      move_slot(previous.structural_class_count_by_clade,
+                next.structural_class_count_by_clade, old_dense, dense);
+      move_slot(previous.class_weight_by_clade, next.class_weight_by_clade,
+                old_dense, dense);
+    }
+    if (cache_commit_plan.outside_position(ref) ==
+        chart_cache_commit_plan::no_position) {
+      move_slot(previous.outside_rows_by_clade, next.outside_rows_by_clade,
+                old_dense, dense);
+      move_slot(previous.outside_class_index_by_pattern_by_clade,
+                next.outside_class_index_by_pattern_by_clade, old_dense,
+                dense);
+      move_slot(previous.outside_class_weight_by_clade,
+                next.outside_class_weight_by_clade, old_dense, dense);
+    }
   }
 
   return next;
@@ -3972,7 +3983,8 @@ chart_spr_lazy_commit_stats chart_spr_refresh_lazy_chart_after_local_commit(
 
   chart_spr_lazy_commit_stats stats;
   auto next = chart_spr_project_lazy_chart_to_materialized(
-      *state.lazy_chart, materialized, previous_dense_clade_to_ref);
+      *state.lazy_chart, materialized, previous_dense_clade_to_ref,
+      cache_commit_plan);
   auto const& patterns = state.active_patterns.patterns;
 
   lazy_chart_options lazy_options;
@@ -4453,7 +4465,8 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     // full_overlay_materializations.  Eliminating it entirely (direct in-place
     // splice) is Phase 6/7 scope; the persistent caches already remove the
     // expensive per-accept chart rescoring.
-    auto previous_dense_clade_to_chain_ref = sub.dense_clade_to_chain_ref;
+    auto previous_dense_clade_to_chain_ref =
+        std::move(sub.dense_clade_to_chain_ref);
     planned_overlay_materialization_result planned;
     overlay_payload_validation_stats completed_payload_validation_stats;
     try {
@@ -4486,11 +4499,11 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     if (refreshed_lazy_plan) {
       ++counters.chart_execution_plan_cache_hits;
     }
-    chart_spr_set_tip_maps_from_materialization(sub, materialized);
     ++counters.local_commit_tip_grammar_refreshes;
     chart_spr_refresh_state_tip_view_after_local_commit(
         state, materialized, std::move(next_execution_plan), *sub.icache,
         *sub.ocache, counters);
+    chart_spr_set_tip_maps_from_materialization(sub, materialized);
     sub.resident_cache_bytes = state.local_commit_persistent_cache_bytes;
     chart_spr_publish_local_commit_tip_identity(sub, state);
 
