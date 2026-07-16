@@ -31,6 +31,8 @@
 #include "test_util.hpp"
 
 #include <algorithm>
+#include <array>
+#include <optional>
 #include <print>
 #include <set>
 #include <sstream>
@@ -63,6 +65,15 @@ static larch::test::tiny_tree_node four_taxon_misplaced_tree() {
 
 static larch::phylo_dag make_four_taxon_dag() {
   return larch::test::make_tiny_labelled_tree("A", four_taxon_misplaced_tree());
+}
+
+static std::string canonical_digest_json(
+    larch::chart_spr_search_result const& search) {
+  CHECK(search.canonical_report.has_value());
+  CHECK(search.canonical_digest.has_value());
+  CHECK(!search.canonical_digest->full_sidecar.empty());
+  return larch::emit_chart_spr_semantic_digest_json(
+      *search.canonical_digest);
 }
 
 static larch::test::tiny_tree_node phase7_arity3_misplaced_tree() {
@@ -134,6 +145,96 @@ static void test_phase10_local_commit_report_counters_and_labels() {
   std::println("  PASS");
 }
 
+static larch::chart_spr_search_result run_phase10_exact_grammar_worker_case(
+    std::size_t workers) {
+  auto dag = make_four_taxon_dag();
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.max_candidates_per_iteration = 12;
+  options.top_k_exact_verify = 4;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.worker_count = workers;
+  options.local_score_worker_count = workers;
+  options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
+  return larch::run_chart_spr_search(std::move(dag), grammar, options);
+}
+
+static void check_phase10_exact_grammar_worker_case(
+    larch::chart_spr_search_result const& search,
+    std::size_t requested_workers, std::size_t resolved_workers,
+    larch::chart_worker_resolution_policy policy) {
+  CHECK(search.summary.requested_worker_count == requested_workers);
+  CHECK(search.summary.resolved_worker_count == resolved_workers);
+  CHECK(search.summary.local_score_worker_count == resolved_workers);
+  CHECK(search.summary.scheduler.requested_workers == requested_workers);
+  CHECK(search.summary.scheduler.resolved_workers == resolved_workers);
+  CHECK(search.summary.scheduler.worker_policy == policy);
+  CHECK(search.summary.initial_score == 2);
+  CHECK(search.summary.final_score == 1);
+  CHECK(search.summary.accepted_moves == 1);
+  CHECK(search.counters.accepted_moves == 1);
+  CHECK(search.counters.local_commit_accepted_moves == 1);
+  CHECK(search.counters.exact_verifications == 4);
+  CHECK(search.iterations.size() == 1);
+  auto const& iteration = search.iterations.front();
+  CHECK(iteration.candidates_generated == 12);
+  CHECK(iteration.candidates_scored == 12);
+  CHECK(iteration.candidates_exact_verified == 4);
+  CHECK(iteration.accepted.has_value());
+  CHECK(iteration.accepted_move_committed);
+  CHECK(!iteration.accepted_candidate_signature.empty());
+  CHECK(search.canonical_report.has_value());
+  CHECK(search.canonical_digest.has_value());
+  CHECK(search.canonical_report->iterations.size() == 1);
+  auto const& canonical = search.canonical_report->iterations.front();
+  CHECK(canonical.candidates.size() == 12);
+  CHECK(canonical.exact_verified_stream_indices.size() == 4);
+  CHECK(canonical.accepted_move_present);
+  CHECK(canonical.accepted_move_committed);
+  CHECK(!canonical.selected_signature.empty());
+}
+
+static void test_phase10_exact_grammar_worker_semantics() {
+  std::println("test_phase10_exact_grammar_worker_semantics");
+
+  auto automatic = run_phase10_exact_grammar_worker_case(0);
+  auto const automatic_resolved = automatic.summary.resolved_worker_count;
+  CHECK(automatic_resolved >= 1);
+  CHECK(automatic.summary.scheduler.worker_policy !=
+        larch::chart_worker_resolution_policy::explicit_count);
+  check_phase10_exact_grammar_worker_case(
+      automatic, 0, automatic_resolved,
+      automatic.summary.scheduler.worker_policy);
+
+  auto explicit_automatic =
+      run_phase10_exact_grammar_worker_case(automatic_resolved);
+  check_phase10_exact_grammar_worker_case(
+      explicit_automatic, automatic_resolved, automatic_resolved,
+      larch::chart_worker_resolution_policy::explicit_count);
+  CHECK(canonical_digest_json(automatic) ==
+        canonical_digest_json(explicit_automatic));
+  CHECK(automatic.canonical_digest->full_sidecar ==
+        explicit_automatic.canonical_digest->full_sidecar);
+
+  auto serial = run_phase10_exact_grammar_worker_case(1);
+  auto w16 = run_phase10_exact_grammar_worker_case(16);
+  check_phase10_exact_grammar_worker_case(
+      serial, 1, 1, larch::chart_worker_resolution_policy::explicit_count);
+  check_phase10_exact_grammar_worker_case(
+      w16, 16, 16, larch::chart_worker_resolution_policy::explicit_count);
+  CHECK(canonical_digest_json(serial) == canonical_digest_json(w16));
+  CHECK(serial.canonical_digest->full_sidecar ==
+        w16.canonical_digest->full_sidecar);
+  CHECK(w16.counters.local_score_parallel_batches > 0);
+
+  std::println("  PASS");
+}
+
 // =====================================================================
 // Criterion 4: conservative mode reports unchanged from the Phase 0 baseline
 // structure (per-accept materialization + sidecar rebuild; no chain report).
@@ -171,6 +272,145 @@ static void test_phase10_conservative_mode_report_unchanged() {
   // The per-accept label reports the conservative path.
   CHECK(search.summary.chain_per_accept_exactness_label ==
         "none_conservative_materialize_rebuild");
+
+  std::println("  PASS");
+}
+
+static larch::chart_spr_search_result
+run_phase10_conservative_three_accept_case(std::size_t workers) {
+  auto dag = larch::build_from_fasta_newick(
+      larch::test::source_path_string(
+          "test/wric_chart_three_accepts_tiny.fa"),
+      larch::test::source_path_string(
+          "test/wric_chart_three_accepts_tiny.nwk"),
+      larch::test::source_path_string(
+          "test/wric_chart_three_accepts_tiny.ref"));
+  larch::validate_dag(dag, "wric_chart_three_accepts_tiny fixture");
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.max_candidates_per_iteration = 256;
+  options.top_k_exact_verify = 8;
+  options.max_iterations = 4;
+  options.rebuild_after_accept = true;
+  options.worker_count = workers;
+  options.local_score_worker_count = workers;
+  options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
+  return larch::run_chart_spr_search(std::move(dag), grammar, options);
+}
+
+static void check_phase10_conservative_three_accept_case(
+    larch::chart_spr_search_result const& search, std::size_t workers) {
+  CHECK(search.summary.requested_worker_count == workers);
+  CHECK(search.summary.resolved_worker_count == workers);
+  CHECK(search.summary.local_score_worker_count == workers);
+  CHECK(search.summary.scheduler.requested_workers == workers);
+  CHECK(search.summary.scheduler.resolved_workers == workers);
+  CHECK(search.summary.scheduler.worker_policy ==
+        larch::chart_worker_resolution_policy::explicit_count);
+  CHECK(search.summary.initial_score == 6);
+  CHECK(search.summary.final_score == 3);
+  CHECK(search.summary.accepted_moves == 3);
+  CHECK(search.counters.accepted_moves == 3);
+  CHECK(search.counters.exact_verifications == 32);
+  CHECK(search.summary.exact_verifications == 32);
+  CHECK(search.counters.overlay_materializations_for_accept_materialization ==
+        3);
+  CHECK(search.summary.overlay_materializations_for_accept_materialization ==
+        3);
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 3);
+  CHECK(search.summary.sidecar_rebuilds_after_accept == 3);
+  CHECK(search.summary.initial_search_state_rebuilds == 1);
+  CHECK(search.summary.full_search_state_rebuilds == 4);
+  CHECK(search.counters.local_commit_accepted_moves == 0);
+  CHECK(search.summary.local_commit_accepted_moves == 0);
+  CHECK(search.counters.inside_rows_recomputed_on_commit == 0);
+  CHECK(search.counters.outside_rows_recomputed_on_commit == 0);
+  CHECK(search.counters.overlay_materializations_for_final_compaction == 0);
+  CHECK(search.summary.overlay_materializations_for_final_compaction == 0);
+  CHECK(search.chain_identity_report_json.empty());
+  CHECK(search.iterations.size() == 4);
+  CHECK(search.canonical_report.has_value());
+  CHECK(search.canonical_digest.has_value());
+  CHECK(search.canonical_report->contract.max_iterations == 4);
+  CHECK(search.canonical_report->contract.max_candidates == 256);
+  CHECK(search.canonical_report->contract.top_k_exact == 8);
+  CHECK(search.canonical_report->initial_score == 6);
+  CHECK(search.canonical_report->final_score == 3);
+  CHECK(search.canonical_report->accepted_moves == 3);
+  CHECK(search.canonical_report->iterations.size() == 4);
+
+  for (std::size_t index = 0; index < search.iterations.size(); ++index) {
+    auto const& iteration = search.iterations[index];
+    auto const& canonical = search.canonical_report->iterations[index];
+    CHECK(iteration.candidates_generated > 0);
+    CHECK(iteration.candidates_scored > 0);
+    CHECK(iteration.candidates_exact_verified == 8);
+    CHECK(canonical.candidates_exact_verified == 8);
+    CHECK(canonical.exact_verified_stream_indices.size() == 8);
+    CHECK(iteration.accepted_inside_rows_recomputed == 0);
+    CHECK(iteration.accepted_outside_rows_recomputed == 0);
+    if (index < 3) {
+      CHECK(iteration.accepted.has_value());
+      CHECK(iteration.accepted_move_committed);
+      CHECK(!iteration.accepted_candidate_signature.empty());
+      CHECK(canonical.accepted_move_present);
+      CHECK(canonical.accepted_move_committed);
+      CHECK(canonical.selected_stream_index.has_value());
+      CHECK(canonical.selected_signature ==
+            iteration.accepted_candidate_signature);
+    } else {
+      CHECK(!iteration.accepted.has_value());
+      CHECK(!iteration.accepted_move_committed);
+      CHECK(iteration.accepted_candidate_signature.empty());
+      CHECK(iteration.accepted_inside_rows_recomputed == 0);
+      CHECK(iteration.accepted_outside_rows_recomputed == 0);
+      CHECK(!canonical.accepted_move_present);
+      CHECK(!canonical.accepted_move_committed);
+      CHECK(!canonical.selected_stream_index.has_value());
+      CHECK(canonical.selected_signature.empty());
+      CHECK(!iteration.no_accept_reason.empty());
+      CHECK(canonical.no_accept_reason == iteration.no_accept_reason);
+    }
+  }
+
+  if (workers == 1) {
+    CHECK(search.counters.local_score_parallel_batches == 0);
+  } else {
+    CHECK(search.counters.local_score_parallel_batches > 0);
+    CHECK(search.counters.local_score_worker_tasks > 0);
+    CHECK(search.summary.scheduler_axes.local_score_candidates
+                  .parallel_operations +
+              search.summary.scheduler_axes.local_score_candidate_patterns
+                  .parallel_operations >
+          0);
+  }
+  (void)canonical_digest_json(search);
+}
+
+static void test_phase10_conservative_three_accept_worker_parity() {
+  std::println("test_phase10_conservative_three_accept_worker_parity");
+
+  constexpr std::array<std::size_t, 4> worker_counts{1, 2, 4, 8};
+  std::optional<std::string> serial_digest;
+  std::optional<std::string> serial_sidecar;
+  for (auto workers : worker_counts) {
+    auto search = run_phase10_conservative_three_accept_case(workers);
+    check_phase10_conservative_three_accept_case(search, workers);
+    auto digest = canonical_digest_json(search);
+    if (workers == 1) {
+      serial_digest = std::move(digest);
+      serial_sidecar = search.canonical_digest->full_sidecar;
+    } else {
+      CHECK(serial_digest.has_value());
+      CHECK(serial_sidecar.has_value());
+      CHECK(digest == *serial_digest);
+      CHECK(search.canonical_digest->full_sidecar == *serial_sidecar);
+    }
+  }
 
   std::println("  PASS");
 }
@@ -458,44 +698,74 @@ static void test_phase10_search_loop_chain_identity_round_trip() {
 static void test_phase7_multifurcation_chain_identity_round_trip() {
   std::println("test_phase7_multifurcation_chain_identity_round_trip");
 
-  auto dag = larch::test::make_tiny_labelled_tree(
-      "A", phase7_arity3_misplaced_tree());
-  larch::clade_grammar_options gopts;
-  gopts.allow_polytomies = true;
-  auto grammar = larch::build_clade_grammar(dag, gopts);
-  CHECK(larch::clade_grammar_max_production_arity(grammar) == 3);
+  auto run_once = [](std::size_t workers) {
+    auto dag = larch::test::make_tiny_labelled_tree(
+        "A", phase7_arity3_misplaced_tree());
+    larch::clade_grammar_options gopts;
+    gopts.allow_polytomies = true;
+    auto grammar = larch::build_clade_grammar(dag, gopts);
+    CHECK(larch::clade_grammar_max_production_arity(grammar) == 3);
 
-  larch::chart_spr_search_options options;
-  options.acceptance_mode =
-      larch::chart_spr_acceptance_mode::fixed_topology_exact;
-  options.candidate_selection =
-      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
-  options.max_iterations = 1;
-  options.rebuild_after_accept = false;
+    larch::chart_spr_search_options options;
+    options.acceptance_mode =
+        larch::chart_spr_acceptance_mode::fixed_topology_exact;
+    options.candidate_selection =
+        larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+    options.max_iterations = 1;
+    options.rebuild_after_accept = false;
+    options.worker_count = workers;
+    options.local_score_worker_count = workers;
+    options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
+    return larch::run_chart_spr_search(std::move(dag), grammar, options);
+  };
 
-  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
-  CHECK(search.counters.local_commit_accepted_moves == 1);
-  CHECK(search.counters.spr_multifurcation_moves_generated > 0);
-  CHECK(search.counters.multifurcation_productions_scored > 0);
-  CHECK(!search.chain_identity_report_json.empty());
+  auto check_result = [](larch::chart_spr_search_result& search,
+                         std::size_t workers) {
+    CHECK(search.summary.requested_worker_count == workers);
+    CHECK(search.summary.resolved_worker_count == workers);
+    CHECK(search.summary.scheduler.worker_policy ==
+          larch::chart_worker_resolution_policy::explicit_count);
+    CHECK(search.iterations.size() == 1);
+    CHECK(search.iterations.front().candidates_generated > 0);
+    CHECK(search.iterations.front().candidates_scored > 0);
+    CHECK(search.iterations.front().candidates_exact_verified > 0);
+    CHECK(search.iterations.front().accepted.has_value());
+    CHECK(search.iterations.front().accepted_move_committed);
+    CHECK(search.counters.local_commit_accepted_moves == 1);
+    CHECK(search.counters.spr_multifurcation_moves_generated > 0);
+    CHECK(search.counters.multifurcation_productions_scored > 0);
+    CHECK(!search.chain_identity_report_json.empty());
 
-  auto report = larch::parse_phase10_chain_identity_report_json(
-      search.chain_identity_report_json);
-  CHECK(report.entries.size() == 1);
-  CHECK(report.entries.front().commit_source == "spr_overlay_delta");
-  CHECK(contains_multifurcation_key(report.base_production_keys));
+    auto report = larch::parse_phase10_chain_identity_report_json(
+        search.chain_identity_report_json);
+    CHECK(report.entries.size() == 1);
+    CHECK(report.entries.front().commit_source == "spr_overlay_delta");
+    CHECK(contains_multifurcation_key(report.base_production_keys));
 
-  auto net = larch::phase10_chain_net_production_keys(report);
-  CHECK(contains_multifurcation_key(net));
+    auto net = larch::phase10_chain_net_production_keys(report);
+    CHECK(contains_multifurcation_key(net));
 
-  auto rebuilt = larch::build_clade_grammar(search.dag, gopts);
-  CHECK(larch::clade_grammar_max_production_arity(rebuilt) == 3);
-  auto rebuilt_keys = grammar_keys(rebuilt);
-  std::set<larch::rank3_production_taxa_key> rebuilt_set{
-      rebuilt_keys.begin(), rebuilt_keys.end()};
-  for (auto const& key : net) {
-    CHECK(rebuilt_set.count(key) != 0);
-  }
+    larch::clade_grammar_options gopts;
+    gopts.allow_polytomies = true;
+    auto rebuilt = larch::build_clade_grammar(search.dag, gopts);
+    CHECK(larch::clade_grammar_max_production_arity(rebuilt) == 3);
+    auto rebuilt_keys = grammar_keys(rebuilt);
+    std::set<larch::rank3_production_taxa_key> rebuilt_set{
+        rebuilt_keys.begin(), rebuilt_keys.end()};
+    for (auto const& key : net) {
+      CHECK(rebuilt_set.count(key) != 0);
+    }
+    (void)canonical_digest_json(search);
+  };
+
+  auto serial = run_once(1);
+  auto parallel = run_once(8);
+  check_result(serial, 1);
+  check_result(parallel, 8);
+  CHECK(canonical_digest_json(serial) == canonical_digest_json(parallel));
+  CHECK(serial.canonical_digest->full_sidecar ==
+        parallel.canonical_digest->full_sidecar);
+  CHECK(parallel.counters.local_score_parallel_batches > 0);
 
   std::println("  PASS");
 }
@@ -834,7 +1104,9 @@ static void test_phase10_counter_contract_fields_exist() {
 int main() {
   test_phase10_counter_contract_fields_exist();
   test_phase10_local_commit_report_counters_and_labels();
+  test_phase10_exact_grammar_worker_semantics();
   test_phase10_conservative_mode_report_unchanged();
+  test_phase10_conservative_three_accept_worker_parity();
   test_phase10_verification_mode_cold_skips_transient();
   test_phase10_commit_mode_option_c_throws();
   test_phase10_chain_identity_json_round_trip();
