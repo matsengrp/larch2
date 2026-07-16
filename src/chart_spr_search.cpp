@@ -3416,6 +3416,7 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
       counters.scheduler_axes.exact_frontier_clades,
       scheduler_runs.frontier_clades};
   std::uint64_t authoritative_new_optimum = multisite_score_inf;
+  bool transient_trim_authoritative = true;
   try {
     // Old score: the current tip's exact optimum (cached in state, lazily
     // built).  Same source the cold path reads.
@@ -3498,6 +3499,7 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
         ++counters.transient_chain_extension_oracle_mismatches;
         ++counters.transient_chain_extension_fallbacks;
         authoritative_new_optimum = oracle.cold_new_optimum;
+        transient_trim_authoritative = false;
       }
     }
 
@@ -3559,6 +3561,12 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
           std::make_shared<chart_spr_canonical_exact_evidence>(
               std::move(evidence));
     }
+  }
+  if (candidate.valid && candidate.exact && transient_trim_authoritative &&
+      state.retain_verified_exact_trim_for_local_commit) {
+    candidate.reusable_exact_trim = make_chart_spr_reusable_exact_trim(
+        ext.planned.execution_plan, state.active_patterns, state.chart_opts,
+        trim_options, state.invariant_constant_offset, std::move(new_trim));
   }
   return candidate;
 }
@@ -4167,6 +4175,61 @@ void chart_spr_assert_local_commit_two_chart_oracle(
   }
 }
 
+std::optional<multisite_trim_result>
+chart_spr_take_compatible_accepted_exact_trim(
+    chart_spr_search_state const& state,
+    overlay_materialization_result const& materialized,
+    chart_execution_plan const& next_execution_plan,
+    chart_spr_candidate_score& accepted,
+    chart_spr_search_options const& options,
+    chart_spr_search_counters& counters) {
+  if (!accepted.reusable_exact_trim) return std::nullopt;
+
+  auto reject = [&]() -> std::optional<multisite_trim_result> {
+    ++counters.accepted_exact_trim_reuse_rejections;
+    accepted.reusable_exact_trim.reset();
+    return std::nullopt;
+  };
+  if (options.acceptance_mode != chart_spr_acceptance_mode::exact_multisite ||
+      !accepted.exact) {
+    return reject();
+  }
+
+  auto& payload = *accepted.reusable_exact_trim;
+  auto const active_fingerprint =
+      inside_chart_cache_detail::fingerprint_active_pattern_set(
+          state.active_patterns);
+  auto const& trim = payload.trim;
+  if (payload.target_execution_fingerprint !=
+          next_execution_plan.fingerprint() ||
+      payload.active_pattern_fingerprint != active_fingerprint ||
+      !chart_spr_chart_options_equal(payload.chart_opts, state.chart_opts) ||
+      !chart_spr_exact_trim_options_equal(payload.trim_options,
+                                          options.exact_trim) ||
+      payload.invariant_constant_offset != state.invariant_constant_offset ||
+      trim.invariant_constant_offset != 0 ||
+      trim.active_pattern_count !=
+          state.active_patterns.patterns.patterns.size() ||
+      trim.frontier_sizes_by_clade.size() !=
+          materialized.grammar.clades.size() ||
+      trim.keep_production.size() !=
+          materialized.grammar.productions.size() ||
+      trim.dominance_mode != options.exact_trim.dominance_mode ||
+      (options.exact_trim.require_exact_keep_mask &&
+       !trim.keep_production_exact)) {
+    return reject();
+  }
+  auto const full_optimum = chart_spr_add_invariant_offset(
+      trim.optimum, state, "chart SPR accepted exact-trim reuse");
+  if (full_optimum != accepted.exact->value.new_score) return reject();
+
+  std::optional<multisite_trim_result> result;
+  result.emplace(std::move(payload.trim));
+  accepted.reusable_exact_trim.reset();
+  ++counters.accepted_exact_trims_reused;
+  return result;
+}
+
 // Refresh the derived tip view on the state (grammar + pattern_charts +
 // composite bounds + size estimates) from the chain + caches, so the next
 // iteration's candidate generation and local scoring operate on the chain tip.
@@ -4177,7 +4240,8 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
     chart_spr_search_state& state,
     overlay_materialization_result const& materialized,
     chart_execution_plan next_execution_plan, inside_chart_cache const& icache,
-    outside_chart_cache const& ocache, chart_spr_search_counters& counters) {
+    outside_chart_cache const& ocache, chart_spr_search_counters& counters,
+    std::optional<multisite_trim_result> next_exact_trim) {
   auto old_strategy = state.cache_strategy;
   auto const old_effective_pattern_batch_size =
       state.effective_pattern_batch_size;
@@ -4324,10 +4388,12 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
           composite_without_invariants, state.invariant_constant_offset,
           "chart-SPR local commit lazy lower bound invariant offset");
 
-  // Exact-trim cache: invalidated by the commit (Phase 2 hook); recomputed
-  // lazily by the next exact gate.  Leaving it absent here is the WI3
-  // lazy-invalidation rule.
-  state.exact_trim_active_only.reset();
+  // A built-in exact verifier has already paid for the accepted grammar's
+  // complete frontier.  Publish that result only after its independently
+  // materialized structural/options identity passed the compatibility gate;
+  // custom or rejected payloads retain the conservative lazy-invalidation
+  // behavior.
+  state.exact_trim_active_only = std::move(next_exact_trim);
 }
 
 // Commit an accepted candidate to the chain + caches and refresh the state's
@@ -4336,7 +4402,7 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
 // state.counters; the cumulative cache counters are mirrored onto it.
 chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     chart_spr_local_commit_substrate& sub, chart_spr_search_state& state,
-    chart_spr_candidate_score const& accepted,
+    chart_spr_candidate_score& accepted,
     chart_spr_search_options const& options,
     chart_spr_search_counters& counters, chart_scheduler& scheduler) {
   // Defensive gate check (the loop validator already rejects this combo, but a
@@ -4488,6 +4554,8 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     record_planned_overlay_materialization_stats(counters, planned);
     auto materialized = std::move(planned.materialized);
     auto next_execution_plan = std::move(planned.execution_plan);
+    auto next_exact_trim = chart_spr_take_compatible_accepted_exact_trim(
+        state, materialized, next_execution_plan, accepted, options, counters);
     // The caller's attempt counter is the authoritative snapshot and is
     // copied back onto state after commit.  Record this distinct materialized
     // grammar plan exactly once here, before any consumer reuses it.
@@ -4502,8 +4570,13 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     ++counters.local_commit_tip_grammar_refreshes;
     chart_spr_refresh_state_tip_view_after_local_commit(
         state, materialized, std::move(next_execution_plan), *sub.icache,
-        *sub.ocache, counters);
+        *sub.ocache, counters, std::move(next_exact_trim));
     chart_spr_set_tip_maps_from_materialization(sub, materialized);
+    if (state.exact_trim_active_only) {
+      require_chart_spr_retained_exact_state_memory_budget(
+          state, *state.exact_trim_active_only, scheduler,
+          options.cache.memory_budget_bytes);
+    }
     sub.resident_cache_bytes = state.local_commit_persistent_cache_bytes;
     chart_spr_publish_local_commit_tip_identity(sub, state);
 
@@ -4707,6 +4780,10 @@ void chart_spr_refresh_search_summary_from_counters(
   summary.candidate_pattern_clade_order_sorts =
       counters.candidate_pattern_clade_order_sorts;
   summary.exact_verifications = counters.exact_verifications;
+  summary.accepted_exact_trims_reused =
+      counters.accepted_exact_trims_reused;
+  summary.accepted_exact_trim_reuse_rejections =
+      counters.accepted_exact_trim_reuse_rejections;
   summary.exact_candidate_admission_batches =
       counters.exact_candidate_admission_batches;
   summary.exact_candidate_parallel_batches =
@@ -7793,6 +7870,51 @@ estimate_chart_spr_exact_candidate_memory(
                        !structural.saturated && !frontier.saturated &&
                        !setup.saturated && !serial.saturated &&
                        !inner.saturated;
+
+      if (state.retain_verified_exact_trim_for_local_commit) {
+        // Built-in grammar-exact verification transfers the finalized trim
+        // into the candidate result. Its frontier work arrays are already
+        // covered by scratch above; charge the owning result surface
+        // separately so every completed rank remains admitted until stable
+        // winner selection. A shared winner copy does not duplicate it.
+        auto retained_trim = chart_spr_saturating_size{
+            sizeof(chart_spr_reusable_exact_trim_payload) +
+                4 * sizeof(void*) + 2 * sizeof(std::size_t),
+            false};
+        retained_trim = chart_spr_saturating_add(
+            retained_trim,
+            chart_spr_saturating_multiply(
+                topology.clade_count,
+                2 * sizeof(std::size_t) +
+                    (options.exact_trim.dominance_mode ==
+                             multisite_dominance_mode::two_pass_exact_mask
+                         ? 2
+                         : 1) *
+                        sizeof(multisite_frontier_level_diagnostic)));
+        retained_trim = chart_spr_saturating_add(
+            retained_trim,
+            chart_spr_bit_capacity_bytes(topology.production_count));
+        if (options.exact_trim.capture_optimal_root_provenance) {
+          auto provenance_class = chart_spr_saturating_add(
+              {sizeof(multisite_optimal_root_provenance_class), false},
+              cost_bytes);
+          provenance_class = chart_spr_saturating_add(
+              provenance_class,
+              chart_spr_bit_capacity_bytes(topology.production_count));
+          retained_trim = chart_spr_saturating_add(
+              retained_trim,
+              chart_spr_saturating_multiply(topology.root_frontier_entries,
+                                            provenance_class.value));
+          retained_trim.saturated =
+              retained_trim.saturated || provenance_class.saturated;
+        }
+        // Builders reserve exact logical bounds, but keep a second copy-sized
+        // allowance for allocator rounding and any future geometric capacity
+        // growth without weakening finite admission.
+        retained_trim = chart_spr_saturating_multiply(retained_trim, 2);
+        estimate.retained_result_bytes = retained_trim.value;
+        safely_bounded = safely_bounded && !retained_trim.saturated;
+      }
     }
 
     if (options.semantic_capture != chart_spr_semantic_capture_mode::off) {
@@ -7838,8 +7960,11 @@ estimate_chart_spr_exact_candidate_memory(
       // Aggregation copies task evidence into the canonical candidate record
       // while the verifier result remains live in `verified`.
       retained = chart_spr_saturating_multiply(retained, 2);
-      estimate.retained_result_bytes = retained.value;
+      auto retained_with_trim = chart_spr_saturating_add(
+          {estimate.retained_result_bytes, false}, retained);
+      estimate.retained_result_bytes = retained_with_trim.value;
       safely_bounded = safely_bounded && !retained.saturated;
+      safely_bounded = safely_bounded && !retained_with_trim.saturated;
     }
     // A provider-created owning payload first lives in the stable result slot
     // and can then be copy-constructed into result.accepted while the verified
@@ -8100,6 +8225,7 @@ chart_spr_search_result run_chart_spr_search(
   if (!options.rebuild_after_accept) {
     local_commit_substrate =
         chart_spr_make_local_commit_substrate(state, options, scheduler);
+    state.retain_verified_exact_trim_for_local_commit = true;
     state.local_commit_persistent_cache_bytes =
         local_commit_substrate->resident_cache_bytes;
     state.resident_pattern_cache_bytes = chart_spr_checked_cache_bytes_add(

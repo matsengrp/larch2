@@ -417,6 +417,8 @@ struct chart_spr_search_counters {
   std::size_t outside_cache_inside_charts_reused = 0;
   std::size_t outside_cache_outside_charts_built = 0;
   std::size_t exact_verifications = 0;
+  std::size_t accepted_exact_trims_reused = 0;
+  std::size_t accepted_exact_trim_reuse_rejections = 0;
   // Phase-6 stable-rank exact-candidate admission. Candidate-parallel waves
   // disable every inner scheduler axis; singleton waves may instead use the
   // existing exact-frontier or fixed-topology-pattern axis. These counters
@@ -1675,6 +1677,8 @@ chart_spr_canonicalize_fixed_topology_evidence(
   return evidence;
 }
 
+struct chart_spr_reusable_exact_trim_payload;
+
 struct chart_spr_candidate_score {
   grammar_spr_candidate candidate;
   chart_spr_objective_score lower_bound;
@@ -1691,6 +1695,13 @@ struct chart_spr_candidate_score {
   // exact-verified subset when semantic capture is enabled.
   std::shared_ptr<chart_spr_canonical_exact_evidence>
       canonical_exact_evidence;
+  // Built-in grammar-exact verification already owns the complete exact
+  // frontier result for the candidate grammar.  Retain that result through
+  // stable winner selection so a compatible local commit can publish it as
+  // the next state's old trim without running B&B again.  The structural and
+  // option identities are checked against the independently materialized
+  // committed tip before publication; custom verifiers may leave this empty.
+  std::shared_ptr<chart_spr_reusable_exact_trim_payload> reusable_exact_trim;
   // Forces a throw at the exact materializer call boundary.  This exists only
   // to exercise exception-safe production accounting without relying on an
   // allocation failure or an impractically oversized overlay.
@@ -1698,6 +1709,29 @@ struct chart_spr_candidate_score {
   bool force_canonical_evidence_failure_for_tests = false;
   bool force_candidate_exact_bnb_overflow_for_tests = false;
 };
+
+inline bool chart_spr_exact_trim_options_equal(
+    multisite_trim_options const& lhs,
+    multisite_trim_options const& rhs) noexcept {
+  return lhs.use_bound_pruning == rhs.use_bound_pruning &&
+         lhs.dominance_mode == rhs.dominance_mode &&
+         lhs.require_exact_keep_mask == rhs.require_exact_keep_mask &&
+         lhs.upper_bound_override == rhs.upper_bound_override &&
+         lhs.known_exact_optimum == rhs.known_exact_optimum &&
+         lhs.max_frontier_entries_per_clade ==
+             rhs.max_frontier_entries_per_clade &&
+         lhs.capture_optimal_root_provenance ==
+             rhs.capture_optimal_root_provenance &&
+         lhs.force_optimal_root_provenance_capture_failure_for_tests ==
+             rhs.force_optimal_root_provenance_capture_failure_for_tests;
+}
+
+inline bool chart_spr_chart_options_equal(chart_options const& lhs,
+                                          chart_options const& rhs) noexcept {
+  return lhs.keep_trace == rhs.keep_trace &&
+         lhs.score_ua_edge == rhs.score_ua_edge &&
+         lhs.max_trace_choices == rhs.max_trace_choices;
+}
 
 inline void chart_spr_force_canonical_evidence_failure_for_tests(
     chart_spr_candidate_score const& candidate) {
@@ -2191,6 +2225,8 @@ struct chart_spr_search_summary {
   std::size_t candidate_pattern_partition_validations = 0;
   std::size_t candidate_pattern_clade_order_sorts = 0;
   std::size_t exact_verifications = 0;
+  std::size_t accepted_exact_trims_reused = 0;
+  std::size_t accepted_exact_trim_reuse_rejections = 0;
   std::size_t overlay_materializations_for_exact_verification = 0;
   std::size_t overlay_materializations_for_accept_materialization = 0;
   std::size_t overlay_materializations_for_final_compaction = 0;
@@ -2417,6 +2453,124 @@ struct active_site_pattern_set {
     }
   }
 };
+
+struct inside_chart_cache_active_pattern_fingerprint {
+  static constexpr std::uint32_t current_schema_version = 1;
+
+  std::array<std::uint64_t, 2> structure{};
+  std::uint32_t schema_version = current_schema_version;
+
+  bool operator==(inside_chart_cache_active_pattern_fingerprint const&) const =
+      default;
+};
+
+namespace inside_chart_cache_detail {
+
+// Shared identity for persistent-cache provenance and accepted exact-frontier
+// reuse. Include every semantic field so neither rows nor a trim can survive
+// an in-place mutation of the active pattern set.
+inline inside_chart_cache_active_pattern_fingerprint
+fingerprint_active_pattern_set(active_site_pattern_set const& active) {
+  inside_chart_cache_active_pattern_fingerprint result;
+  auto& first = result.structure[0];
+  auto& second = result.structure[1];
+  first = 0x6a09e667f3bcc909ULL;
+  second = 0xbb67ae8584caa73bULL;
+
+  auto mix = [&](std::uint64_t value) {
+    chart_execution_plan_detail::fingerprint_mix(first, value);
+    chart_execution_plan_detail::fingerprint_mix(second,
+                                                 value ^ 0xd6e8feb86659fd93ULL);
+  };
+  auto mix_state_map = [&](normalized_binary_state_map const& map) {
+    mix(map.exact_pattern);
+    mix(map.normalized_binary_pattern);
+    for (auto state : map.normalized_to_original) mix(state);
+    for (auto state : map.original_to_normalized) mix(state);
+  };
+  auto const& patterns = active.patterns;
+
+  mix(result.schema_version);
+  mix(patterns.taxon_count);
+  mix(patterns.patterns.size());
+  for (auto const& pattern : patterns.patterns) {
+    mix(pattern.state_by_taxon.size());
+    for (auto state : pattern.state_by_taxon) mix(state);
+    mix(pattern.positions.size());
+    for (auto position : pattern.positions) mix(position);
+    mix(pattern.weight);
+    for (auto count : pattern.reference_state_counts) mix(count);
+  }
+
+  mix(patterns.original_site_to_pattern.size());
+  for (auto pattern : patterns.original_site_to_pattern) mix(pattern);
+
+  mix(patterns.normalized_binary_patterns.size());
+  for (auto const& pattern : patterns.normalized_binary_patterns) {
+    mix(pattern.state_by_taxon.size());
+    for (auto state : pattern.state_by_taxon) mix(state);
+    mix(pattern.positions.size());
+    for (auto position : pattern.positions) mix(position);
+    mix(pattern.weight);
+    mix(pattern.exact_pattern_indices.size());
+    for (auto pattern_index : pattern.exact_pattern_indices) {
+      mix(pattern_index);
+    }
+    mix(pattern.exact_state_maps.size());
+    for (auto const& map : pattern.exact_state_maps) mix_state_map(map);
+  }
+
+  mix(patterns.exact_pattern_to_normalized_binary_pattern.size());
+  for (auto pattern : patterns.exact_pattern_to_normalized_binary_pattern) {
+    mix(pattern);
+  }
+  mix(patterns.exact_pattern_to_normalized_binary_state_map.size());
+  for (auto const& map :
+       patterns.exact_pattern_to_normalized_binary_state_map) {
+    mix_state_map(map);
+  }
+
+  mix(patterns.total_site_count);
+  mix(patterns.invariant_site_count);
+  mix(patterns.variable_site_count);
+  mix(patterns.binary_variable_site_count);
+  mix(patterns.nonbinary_variable_site_count);
+  mix(patterns.skipped_invariant_site_count);
+  mix(patterns.invariant_constant_score_excluding_ua);
+  mix(patterns.invariant_constant_score_with_reference_edge);
+  mix(patterns.skipped_invariant_constant_score_with_reference_edge);
+  return result;
+}
+
+}  // namespace inside_chart_cache_detail
+
+struct chart_spr_reusable_exact_trim_payload {
+  chart_plan_fingerprint target_execution_fingerprint;
+  inside_chart_cache_active_pattern_fingerprint active_pattern_fingerprint;
+  chart_options chart_opts;
+  multisite_trim_options trim_options;
+  std::uint64_t invariant_constant_offset = 0;
+  multisite_trim_result trim;
+};
+
+inline std::shared_ptr<chart_spr_reusable_exact_trim_payload>
+make_chart_spr_reusable_exact_trim(
+    chart_execution_plan const& target_plan,
+    active_site_pattern_set const& active_patterns,
+    chart_options const& chart_opts,
+    multisite_trim_options const& trim_options,
+    std::uint64_t invariant_constant_offset, multisite_trim_result trim) {
+  return std::make_shared<chart_spr_reusable_exact_trim_payload>(
+      chart_spr_reusable_exact_trim_payload{
+          .target_execution_fingerprint = target_plan.fingerprint(),
+          .active_pattern_fingerprint =
+              inside_chart_cache_detail::fingerprint_active_pattern_set(
+                  active_patterns),
+          .chart_opts = chart_opts,
+          .trim_options = trim_options,
+          .invariant_constant_offset = invariant_constant_offset,
+          .trim = std::move(trim)});
+}
 
 struct chart_spr_pattern_source_fingerprint {
   std::uint64_t reference_hash = 0;
@@ -3652,6 +3806,11 @@ struct chart_spr_search_state {
   // Phase-4 exact acceptance gate can lazily build and then reuse the current
   // state's old exact score even when verification APIs take a const state.
   mutable std::optional<multisite_trim_result> exact_trim_active_only;
+  // Internal local-commit orchestration enables candidate-result retention
+  // only while it owns a commit substrate capable of consuming the payload.
+  // Conservative rebuild and standalone verification must not retain one full
+  // trim per reported iteration.
+  bool retain_verified_exact_trim_for_local_commit = false;
 
   // Optional owning exact-setup source installed by local-commit
   // orchestration.  It is consulted only for pattern-batch states, whose
@@ -7302,6 +7461,9 @@ inline void add_chart_spr_search_counters(
   dst.outside_cache_outside_charts_built +=
       src.outside_cache_outside_charts_built;
   dst.exact_verifications += src.exact_verifications;
+  dst.accepted_exact_trims_reused += src.accepted_exact_trims_reused;
+  dst.accepted_exact_trim_reuse_rejections +=
+      src.accepted_exact_trim_reuse_rejections;
   dst.exact_candidate_admission_batches +=
       src.exact_candidate_admission_batches;
   dst.exact_candidate_parallel_batches += src.exact_candidate_parallel_batches;
@@ -10784,6 +10946,12 @@ inline chart_spr_candidate_score verify_candidate_exact_against_state_impl(
     if (new_trim.keep_production_exact) {
       ++counters.chart_execution_plan_cache_hits;
     }
+  }
+  if (candidate.valid && candidate.exact &&
+      state.retain_verified_exact_trim_for_local_commit) {
+    candidate.reusable_exact_trim = make_chart_spr_reusable_exact_trim(
+        planned.execution_plan, state.active_patterns, state.chart_opts,
+        trim_options, state.invariant_constant_offset, std::move(new_trim));
   }
   return candidate;
 }

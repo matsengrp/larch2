@@ -11579,13 +11579,14 @@ static void test_phase4_local_commit_counter_contract_and_oracle() {
   // The Phase 4 exit criterion: a k >= 3 local-commit run on a fixture with
   // three disjoint committable improving moves.
   CHECK(search.counters.local_commit_accepted_moves >= 3);
-  // Exactly one resident setup is built for the initial committed state and
-  // each accepted chain tip; final compaction contributes one more eagerly
-  // initialized rebuilt state.  Repeated exact gates on any one state reuse
-  // its cached setup, so no other resident-chart consumption is permitted.
+  // The initial state and final compaction each consume one resident setup.
+  // Every accepted chain tip instead adopts its already-verified exact trim,
+  // so no per-accept old-state setup is rebuilt.
   CHECK(search.counters.exact_setup_resident_inside_charts_consumed ==
-        (search.counters.local_commit_accepted_moves + 2) *
-            search.summary.active_pattern_count);
+        2 * search.summary.active_pattern_count);
+  CHECK(search.counters.accepted_exact_trims_reused ==
+        search.counters.local_commit_accepted_moves);
+  CHECK(search.counters.accepted_exact_trim_reuse_rejections == 0);
   // Final score is non-increasing (every committed move improved or held).
   CHECK(search.summary.final_score <= search.summary.initial_score);
 
@@ -11710,10 +11711,9 @@ static void test_phase4_local_commit_post_append_failure_is_hard_error() {
   std::println("  PASS");
 }
 
-// Exact-trim cache invariant (WI3 lazy invalidation): across a local-commit
-// run, after each accept the state's exact_trim_active_only is either absent
-// (invalidated on commit) or, once recomputed, equals the from-scratch exact
-// trim on the current tip grammar.  Uses the tiny three-misplaced-groups
+// Exact-trim cache invariant: across a local-commit run, every compatible
+// accepted verifier result becomes the current state's exact_trim_active_only
+// without rebuilding the old state.  Uses the tiny three-misplaced-groups
 // fixture (k >= 3 accepts under exact_multisite) so the run exercises repeated
 // lazy invalidation and recomputation.  The pandemic-scale data/test_5_trees
 // fixture is avoided here because a heavy exact-multisite search on it trips a
@@ -11737,11 +11737,13 @@ static void test_phase4_exact_trim_cache_never_stale() {
   auto search = larch::run_chart_spr_search(std::move(fixture.dag),
                                             fixture.grammar, options);
 
-  // The exact-multisite gate reads the exact trim; each accept invalidates it
-  // (Phase 2 hook) and the next gate rebuilds it lazily via
-  // ensure_chart_spr_state_exact_trim.  After the run, the rebuilt exact trim
-  // on the compacted output DAG must match the reported final score.
+  // Every committed exact accept on this built-in verifier path has a reusable
+  // trim and no compatibility rejection.  The compacted output's independent
+  // rebuild must still match the reported final score.
   CHECK(search.counters.local_commit_accepted_moves >= 1);
+  CHECK(search.counters.accepted_exact_trims_reused ==
+        search.counters.local_commit_accepted_moves);
+  CHECK(search.counters.accepted_exact_trim_reuse_rejections == 0);
   auto rebuilt = larch::build_clade_grammar(search.dag);
   auto rebuilt_state = larch::build_chart_spr_search_state(
       search.dag, rebuilt, options);
@@ -12413,6 +12415,9 @@ static void test_phase9_transient_no_full_overlay_materialization() {
   }
   // k >= 3 disjoint committable improving moves on this fixture.
   CHECK(search.counters.local_commit_accepted_moves >= 3);
+  CHECK(search.counters.accepted_exact_trims_reused ==
+        search.counters.local_commit_accepted_moves);
+  CHECK(search.counters.accepted_exact_trim_reuse_rejections == 0);
   CHECK(search.summary.final_score <= search.summary.initial_score);
 
   std::println("  PASS");
@@ -12546,6 +12551,11 @@ static void test_phase9_transient_oracle_catches_corruption() {
   CHECK(search.counters.transient_chain_extension_oracle_mismatches > 0);
   CHECK(search.counters.transient_chain_extension_fallbacks ==
         search.counters.transient_chain_extension_oracle_mismatches);
+  // A diagnostic mismatch invalidates the transient frontier even if its
+  // scalar optimum happens to equal the cold oracle.  Such a payload is never
+  // published as the next state's exact trim.
+  CHECK(search.counters.accepted_exact_trims_reused == 0);
+  CHECK(search.counters.accepted_exact_trim_reuse_rejections == 0);
   // Despite the forced corruption, the final score still matches a from-
   // scratch rebuild of the output DAG: the cold path's authoritative result
   // keeps the reported objective correct.

@@ -3537,6 +3537,10 @@ static void print_chart_spr_search_counter_fields(
       << counters.outside_cache_outside_charts_built << "\n";
   out << indent << "exact_verifications: " << counters.exact_verifications
       << "\n";
+  out << indent << "accepted_exact_trims_reused: "
+      << counters.accepted_exact_trims_reused << "\n";
+  out << indent << "accepted_exact_trim_reuse_rejections: "
+      << counters.accepted_exact_trim_reuse_rejections << "\n";
   out << indent << "accepted_moves: " << counters.accepted_moves << "\n";
   out << indent << "candidate_accepts_attempted: "
       << counters.candidate_accepts_attempted << "\n";
@@ -4625,6 +4629,10 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.candidates_locally_scored << "\n";
   out << "  exact_verifications: "
       << search.summary.exact_verifications << "\n";
+  out << "  accepted_exact_trims_reused: "
+      << search.summary.accepted_exact_trims_reused << "\n";
+  out << "  accepted_exact_trim_reuse_rejections: "
+      << search.summary.accepted_exact_trim_reuse_rejections << "\n";
   out << "  initial_search_state_rebuilds: "
       << search.summary.initial_search_state_rebuilds << "\n";
   out << "  sidecar_rebuilds_after_accept: "
