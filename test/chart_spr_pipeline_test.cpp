@@ -533,6 +533,47 @@ void test_generation_error_drains() {
   std::println("  PASS");
 }
 
+void test_finite_sampled_source_lookahead_planning() {
+  std::println("test_finite_sampled_source_lookahead_planning");
+
+  auto input = make_fixture();
+  auto state = larch::build_chart_spr_search_state(input.dag, input.grammar);
+  larch::chart_scheduler scheduler{
+      larch::chart_scheduler_options{.requested_workers = 8}};
+
+  larch::grammar_spr_enumeration_options options;
+  options.source = larch::chart_spr_candidate_source::sampled_tree;
+  options.sampled_tree_source_dag = &input.dag;
+  options.sampled_tree_count = 1;
+  options.max_candidates = 32;
+  options.max_candidates_is_post_dedup = true;
+
+  auto estimate = [&](std::size_t requested_source_wave) {
+    return larch::chart_spr_search_detail::
+        estimate_grammar_spr_finite_iteration_memory_envelope(
+            state, 32, 1, 1, false, scheduler, 1,
+            &options, 1, false, requested_source_wave, 0, 0);
+  };
+
+  auto const maximum = estimate(0);
+  CHECK(maximum.planned_sampled_source_wave_size == 2);
+  CHECK(maximum.planned_sampled_projection_wave_size >
+        maximum.planned_sampled_source_wave_size);
+  CHECK(estimate(8).planned_sampled_source_wave_size == 2);
+  CHECK(estimate(1).planned_sampled_source_wave_size == 1);
+
+  // Zero is the exhaustive/reservoir-expanded policy and remains at the
+  // resolved worker width in the same allocation-free envelope.
+  options.max_candidates = 0;
+  auto const uncapped = estimate(0);
+  CHECK(uncapped.planned_sampled_source_wave_size == 8);
+  CHECK(uncapped.planned_sampled_projection_wave_size == 32);
+
+  check_scheduler_quiescent(scheduler);
+  scheduler.shutdown();
+  std::println("  PASS");
+}
+
 void test_finite_admission_exact_boundary() {
   std::println("test_finite_admission_exact_boundary");
   for (bool use_lazy : {true, false}) {
@@ -1011,6 +1052,7 @@ int main() {
   test_stale_stamp_never_scores();
   test_error_precedence_drain_and_recovery();
   test_generation_error_drains();
+  test_finite_sampled_source_lookahead_planning();
   test_finite_admission_exact_boundary();
   test_dense_partial_final_batch_uses_admitted_tile_shape();
   std::println("chart_spr_pipeline_test PASS");

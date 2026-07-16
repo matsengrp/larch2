@@ -2080,6 +2080,20 @@ inline std::size_t bounded_sampled_tree_source_wave_size(
                       1, scheduler->worker_resolution().resolved_workers));
 }
 
+// A finite candidate stream can stop only while its canonical gather is
+// consuming a completed source wave. Keep one current source plus one source
+// of lookahead: wider source waves add only speculative enumeration at that
+// stopping boundary. Zero max_candidates includes exhaustive and
+// reservoir-expanded streams and preserves their worker-width policy.
+inline std::size_t sampled_tree_source_wave_maximum_for_candidate_cap(
+    std::size_t maximum_source_wave_size,
+    std::size_t max_candidates) noexcept {
+  if (max_candidates == 0) return maximum_source_wave_size;
+  constexpr std::size_t finite_source_lookahead = 2;
+  if (maximum_source_wave_size == 0) return finite_source_lookahead;
+  return std::min(maximum_source_wave_size, finite_source_lookahead);
+}
+
 inline sampled_tree_source_wave_memory_estimate
 estimate_sampled_tree_source_wave_memory(
     sampled_tree_projection_memory_shape const& shape,
@@ -6381,11 +6395,15 @@ project_sampled_tree_moves_in_source_waves(
         "chart SPR sampled-tree realized source shape exceeded unified "
         "admission");
   }
+  auto const maximum_source_wave_size =
+      sampled_tree_source_wave_maximum_for_candidate_cap(
+          options.sampled_tree_source_maximum_wave_size,
+          options.max_candidates);
   result.memory = admit_sampled_tree_source_wave_memory(
       prepared, scheduler, source_count,
       options.sampled_tree_projection_external_resident_bytes,
       options.sampled_tree_projection_memory_budget_bytes,
-      options.sampled_tree_source_maximum_wave_size,
+      maximum_source_wave_size,
       options.sampled_tree_projection_maximum_wave_size);
   if (options.sampled_tree_source_admitted_peak_bytes != 0 &&
       (!result.memory.safely_bounded ||
@@ -7279,6 +7297,15 @@ chart_spr_detail::for_each_hybrid_spr_candidate_stream(
     auto child = options;
     child.source = source;
     child.reservoir_sample = false;
+    if (source == chart_spr_candidate_source::sampled_tree) {
+      // A post-dedup hybrid cap is enforced by emit_unique() and therefore
+      // clears the sampled child's max_candidates below. Preserve the finite
+      // source-lookahead policy independently of that semantic cap plumbing.
+      child.sampled_tree_source_maximum_wave_size =
+          sampled_tree_source_wave_maximum_for_candidate_cap(
+              child.sampled_tree_source_maximum_wave_size,
+              options.max_candidates);
+    }
     if (options.max_candidates != 0 &&
         !options.max_candidates_is_post_dedup) {
       if (combined.candidates_constructed >= options.max_candidates) {
