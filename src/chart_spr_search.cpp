@@ -420,12 +420,34 @@ std::size_t chart_spr_projected_local_commit_bytes_after_delta(
           "chart SPR local-commit outside capacity byte overflow"),
       "chart SPR local-commit persistent capacity byte overflow");
 
-  auto current_scoring_bytes = state.resident_pattern_cache_bytes -
-                               state.local_commit_persistent_cache_bytes;
-  if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
+  auto const persistent_row_view = state.local_commit_inside_rows.valid();
+  if (persistent_row_view &&
+      state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+    throw std::runtime_error(
+        "chart SPR local-commit admission: lazy strategy published a dense "
+        "inside-row view");
+  }
+  if (persistent_row_view) {
+    state.local_commit_inside_rows.assert_compatible(state.execution_plan,
+                                                     state.active_patterns);
+    if (!state.pattern_charts.empty() ||
+        state.resident_pattern_cache_bytes !=
+            state.local_commit_persistent_cache_bytes) {
+      throw std::runtime_error(
+          "chart SPR local-commit admission: inside-row view retained a "
+          "duplicate scoring representation");
+    }
+  }
+  auto current_scoring_bytes =
+      persistent_row_view ? std::size_t{0}
+                          : state.resident_pattern_cache_bytes -
+                                state.local_commit_persistent_cache_bytes;
+  if (!persistent_row_view &&
+      state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
     current_scoring_bytes = chart_spr_all_active_cache_capacity_bytes(state);
-  } else if (state.cache_strategy ==
-             chart_spr_cache_strategy::lazy_multisite_chart) {
+  } else if (!persistent_row_view &&
+             state.cache_strategy ==
+                 chart_spr_cache_strategy::lazy_multisite_chart) {
     if (!state.lazy_chart) {
       throw std::runtime_error(
           "chart SPR local-commit admission: lazy strategy has no chart");
@@ -434,55 +456,57 @@ std::size_t chart_spr_projected_local_commit_bytes_after_delta(
         chart_spr_lazy_cache_capacity_bytes(*state.lazy_chart);
   }
   std::size_t projected_scoring_bytes = 0;
-  switch (state.cache_strategy) {
-    case chart_spr_cache_strategy::all_active_patterns: {
-      // The refreshed vector is constructed before it replaces the old one,
-      // so account both representations at the update peak.  Search charts
-      // are trace-free; their only dynamic payload is the dense inside row.
-      auto const entries = chart_spr_checked_cache_bytes_multiply(
-          active_patterns, 2,
-          "chart SPR local-commit scoring entry capacity overflow");
-      auto const entry_bytes = chart_spr_checked_cache_bytes_multiply(
-          entries, sizeof(pattern_chart_cache_entry),
-          "chart SPR local-commit scoring entry byte overflow");
-      auto const row_bytes = chart_spr_checked_cache_bytes_multiply(
-          chart_spr_checked_cache_bytes_multiply(
-              active_patterns, target_dense_clade_count,
-              "chart SPR local-commit scoring row-count overflow"),
-          sizeof(row_type), "chart SPR local-commit scoring row byte overflow");
-      projected_scoring_bytes = chart_spr_checked_cache_bytes_add(
-          current_scoring_bytes,
-          chart_spr_checked_cache_bytes_add(
-              entry_bytes, row_bytes,
-              "chart SPR local-commit scoring byte overflow"),
-          "chart SPR local-commit scoring peak byte overflow");
-      break;
+  if (!persistent_row_view) switch (state.cache_strategy) {
+      case chart_spr_cache_strategy::all_active_patterns: {
+        // The refreshed vector is constructed before it replaces the old one,
+        // so account both representations at the update peak.  Search charts
+        // are trace-free; their only dynamic payload is the dense inside row.
+        auto const entries = chart_spr_checked_cache_bytes_multiply(
+            active_patterns, 2,
+            "chart SPR local-commit scoring entry capacity overflow");
+        auto const entry_bytes = chart_spr_checked_cache_bytes_multiply(
+            entries, sizeof(pattern_chart_cache_entry),
+            "chart SPR local-commit scoring entry byte overflow");
+        auto const row_bytes = chart_spr_checked_cache_bytes_multiply(
+            chart_spr_checked_cache_bytes_multiply(
+                active_patterns, target_dense_clade_count,
+                "chart SPR local-commit scoring row-count overflow"),
+            sizeof(row_type),
+            "chart SPR local-commit scoring row byte overflow");
+        projected_scoring_bytes = chart_spr_checked_cache_bytes_add(
+            current_scoring_bytes,
+            chart_spr_checked_cache_bytes_add(
+                entry_bytes, row_bytes,
+                "chart SPR local-commit scoring byte overflow"),
+            "chart SPR local-commit scoring peak byte overflow");
+        break;
+      }
+      case chart_spr_cache_strategy::pattern_batches: {
+        auto const projected_row_bytes = chart_spr_checked_cache_bytes_multiply(
+            target_dense_clade_count, sizeof(row_type),
+            "chart SPR local-commit batch row byte overflow");
+        auto const projected_entry_bytes = chart_spr_checked_cache_bytes_add(
+            projected_row_bytes, sizeof(pattern_chart_cache_entry),
+            "chart SPR local-commit batch entry byte overflow");
+        auto const projected_batch_bytes =
+            chart_spr_checked_cache_bytes_multiply(
+                state.effective_pattern_batch_size, projected_entry_bytes,
+                "chart SPR local-commit batch byte overflow");
+        projected_scoring_bytes =
+            std::max(current_scoring_bytes, projected_batch_bytes);
+        break;
+      }
+      case chart_spr_cache_strategy::lazy_multisite_chart:
+        // Projection owns both old and new charts until publication.  The new
+        // bound includes row classes, all three per-pattern class maps, both
+        // weight vectors, structural counts, and the top-level vector objects.
+        projected_scoring_bytes = chart_spr_checked_cache_bytes_add(
+            current_scoring_bytes,
+            chart_spr_conservative_lazy_cache_bytes(target_dense_clade_count,
+                                                    active_patterns),
+            "chart SPR lazy local-commit scoring peak byte overflow");
+        break;
     }
-    case chart_spr_cache_strategy::pattern_batches: {
-      auto const projected_row_bytes = chart_spr_checked_cache_bytes_multiply(
-          target_dense_clade_count, sizeof(row_type),
-          "chart SPR local-commit batch row byte overflow");
-      auto const projected_entry_bytes = chart_spr_checked_cache_bytes_add(
-          projected_row_bytes, sizeof(pattern_chart_cache_entry),
-          "chart SPR local-commit batch entry byte overflow");
-      auto const projected_batch_bytes = chart_spr_checked_cache_bytes_multiply(
-          state.effective_pattern_batch_size, projected_entry_bytes,
-          "chart SPR local-commit batch byte overflow");
-      projected_scoring_bytes =
-          std::max(current_scoring_bytes, projected_batch_bytes);
-      break;
-    }
-    case chart_spr_cache_strategy::lazy_multisite_chart:
-      // Projection owns both old and new charts until publication.  The new
-      // bound includes row classes, all three per-pattern class maps, both
-      // weight vectors, structural counts, and the top-level vector objects.
-      projected_scoring_bytes = chart_spr_checked_cache_bytes_add(
-          current_scoring_bytes,
-          chart_spr_conservative_lazy_cache_bytes(target_dense_clade_count,
-                                                  active_patterns),
-          "chart SPR lazy local-commit scoring peak byte overflow");
-      break;
-  }
   return chart_spr_checked_cache_bytes_add(
       projected_persistent, projected_scoring_bytes,
       "chart SPR local-commit projected cache byte overflow");
@@ -1950,6 +1974,51 @@ void chart_spr_assert_local_commit_tip_identity(
     throw std::runtime_error(std::string{consumer} +
                              ": dense tip map shape mismatch");
   }
+}
+
+std::array<chart_cost, nuc_state_count> const&
+chart_spr_read_persistent_inside_dense_row(void const* context,
+                                           std::size_t pattern,
+                                           clade_id dense) {
+  auto const* sub =
+      static_cast<chart_spr_local_commit_substrate const*>(context);
+  if (sub == nullptr || !sub->icache) {
+    throw std::runtime_error(
+        "chart SPR inside-row view: missing persistent inside cache");
+  }
+  if (pattern >= sub->icache->patterns.size() || dense == no_clade ||
+      dense >= sub->dense_clade_to_chain_ref.size()) {
+    throw std::runtime_error(
+        "chart SPR inside-row view: dense row index out of range");
+  }
+  auto const ref = sub->dense_clade_to_chain_ref[dense];
+  if (ref.id == no_clade) {
+    throw std::runtime_error(
+        "chart SPR inside-row view: dense clade maps to no_clade");
+  }
+  return sub->icache->row(pattern, ref);
+}
+
+void chart_spr_publish_persistent_inside_row_view(
+    chart_spr_search_state& state,
+    chart_spr_local_commit_substrate const& sub) {
+  if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+    state.local_commit_inside_rows = {};
+    return;
+  }
+  auto checked_state =
+      check_chart_execution_plan(state.grammar, state.execution_plan);
+  chart_spr_assert_local_commit_tip_identity(
+      sub, state, checked_state, "chart SPR inside-row view publication");
+  state.local_commit_inside_rows = chart_spr_inside_row_view{
+      .context = &sub,
+      .reader = &chart_spr_read_persistent_inside_dense_row,
+      .pattern_count = state.active_patterns.patterns.patterns.size(),
+      .clade_count = state.execution_plan.clades().size(),
+      .execution_generation = state.execution_plan.grammar_generation(),
+      .execution_fingerprint = state.execution_plan.fingerprint(),
+      .active_pattern_fingerprint = sub.published_active_pattern_fingerprint,
+  };
 }
 
 overlay_clade_ref chart_spr_chain_ref_for_dense_clade(
@@ -3571,6 +3640,40 @@ chart_spr_verify_candidate_exact_multisite_from_transient_extension(
   return candidate;
 }
 
+multisite_exact_setup
+chart_spr_build_exact_setup_from_persistent_inside_cache_serial(
+    chart_spr_local_commit_substrate const& sub,
+    chart_spr_search_state const& state,
+    checked_chart_execution_plan_ref const& checked_state) {
+  chart_spr_assert_local_commit_tip_identity(
+      sub, state, checked_state, "chart SPR persistent-inside exact setup");
+  if (!sub.icache) {
+    throw std::runtime_error(
+        "chart SPR persistent-inside exact setup: missing inside cache");
+  }
+
+  single_site_chart scratch;
+  scratch.inside.resize(state.execution_plan.clades().size());
+  return build_multisite_exact_setup_from_resident_inside(
+      state.execution_plan, state.active_patterns.patterns,
+      [&](std::size_t pattern_index,
+          site_pattern const&) -> single_site_chart const& {
+        if (pattern_index >= sub.icache->patterns.size()) {
+          throw std::runtime_error(
+              "chart SPR persistent-inside exact setup: pattern index out of "
+              "range");
+        }
+        for (std::size_t dense = 0; dense < sub.dense_clade_to_chain_ref.size();
+             ++dense) {
+          scratch.inside[dense] = sub.icache->row(
+              pattern_index, sub.dense_clade_to_chain_ref[dense]);
+        }
+        scratch.multifurcation_productions_scored = 0;
+        return scratch;
+      },
+      state.chart_opts);
+}
+
 multisite_exact_setup chart_spr_build_exact_setup_from_persistent_inside_cache(
     chart_spr_local_commit_substrate const& sub,
     chart_spr_search_state const& state,
@@ -3627,9 +3730,13 @@ chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
         "rebuild_after_accept=true or score_ua_edge=false.  This is a labelled "
         "unsupported-mode throw, not a silent fallback to a cheaper mode.");
   }
+  auto const initial_scoring_resident_bytes =
+      state.pattern_batch_bootstrap_deferred
+          ? std::size_t{0}
+          : state.resident_pattern_cache_bytes;
   auto const minimum_projected_resident_bytes =
       chart_spr_checked_cache_bytes_add(
-          state.resident_pattern_cache_bytes,
+          initial_scoring_resident_bytes,
           chart_spr_minimum_local_commit_cache_bytes(state),
           "chart SPR local-commit cache admission byte overflow");
   chart_spr_require_cache_budget(minimum_projected_resident_bytes,
@@ -3656,7 +3763,15 @@ chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
   auto const cache_range_options = chart_spr_phase4_pattern_range_options(
       active_pattern_count, scheduler.worker_resolution().resolved_workers);
   auto const inside_start = std::chrono::steady_clock::now();
-  if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
+  if (state.pattern_batch_bootstrap_deferred) {
+    sub->icache = build_inside_chart_cache(
+        sub->base_grammar, *sub->checked_base_execution_plan,
+        state.active_patterns, state.chart_opts,
+        state.invariant_constant_offset, scheduler, cache_range_options,
+        &inside_run);
+    inside_was_scheduled = true;
+  } else if (state.cache_strategy ==
+             chart_spr_cache_strategy::all_active_patterns) {
     auto const pattern_count = state.active_patterns.patterns.patterns.size();
     if (state.pattern_charts.size() != pattern_count) {
       throw std::runtime_error(
@@ -3731,7 +3846,7 @@ chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
   sub->resident_cache_bytes =
       chart_spr_local_commit_cache_resident_bytes(*sub->icache, *sub->ocache);
   auto const projected_resident_bytes = chart_spr_checked_cache_bytes_add(
-      state.resident_pattern_cache_bytes, sub->resident_cache_bytes,
+      initial_scoring_resident_bytes, sub->resident_cache_bytes,
       "chart SPR local-commit cache resident byte overflow");
   chart_spr_require_cache_budget(projected_resident_bytes, options.cache,
                                  "chart SPR local commit");
@@ -3770,11 +3885,6 @@ chart_spr_make_local_commit_substrate(chart_spr_search_state const& state,
       options.verify_transient_chain_extension_oracle_for_tests;
   sub->force_transient_chain_extension_oracle_mismatch_for_tests =
       options.force_transient_chain_extension_oracle_mismatch_for_tests;
-  if (options.force_fixed_topology_cache_epoch_mismatch_for_tests) {
-    // Test-only corruption of a substrate invariant.  The verifier must throw
-    // a hard labelled error instead of returning an invalid candidate.
-    sub->icache->commit_epoch = sub->chain->size() + 1;
-  }
   return sub;
 }
 
@@ -4230,12 +4340,11 @@ chart_spr_take_compatible_accepted_exact_trim(
   return result;
 }
 
-// Refresh the derived tip view on the state (grammar + pattern_charts +
+// Refresh the derived tip view on the state (grammar + row-view identity +
 // composite bounds + size estimates) from the chain + caches, so the next
 // iteration's candidate generation and local scoring operate on the chain tip.
-// No chart recurrence runs here: pattern_charts is a flat projection of the
-// authoritative icache rows keyed by the materialization's dense_clade_to_ref
-// map, and the composite lower bound is read from the icache root rows.
+// No chart recurrence or row projection runs here; the composite lower bound
+// is read from the authoritative persistent inside-cache root rows.
 void chart_spr_refresh_state_tip_view_after_local_commit(
     chart_spr_search_state& state,
     overlay_materialization_result const& materialized,
@@ -4258,52 +4367,60 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
 
   state.estimated_full_pattern_cache_bytes =
       estimate_chart_spr_full_pattern_cache_bytes(state);
-  auto cache_selection_options = state.cache_opts;
-  // A local commit refreshes the already-published state in place. It must
-  // preserve that state's representation without repiloting or consulting an
-  // unresolved public auto request.
-  cache_selection_options.use_lazy_multisite_chart = false;
-  cache_selection_options.lazy_policy = state.lazy_policy.resolved;
-  if (state.cache_opts.memory_budget_bytes != 0) {
-    auto const mandatory_pair_bytes = chart_spr_checked_cache_bytes_multiply(
-        state.estimated_full_pattern_cache_bytes, 2,
-        "chart SPR local-commit refreshed mandatory cache byte overflow");
-    auto const scoring_pattern_bytes =
-        estimate_chart_spr_pattern_entry_cache_bytes(state.grammar);
-    auto const mandatory_with_one_pattern = chart_spr_checked_cache_bytes_add(
-        mandatory_pair_bytes, scoring_pattern_bytes,
-        "chart SPR local-commit refreshed mandatory cache byte overflow");
-    if (mandatory_with_one_pattern > state.cache_opts.memory_budget_bytes) {
-      throw chart_spr_cache_budget_error(
-          "chart SPR local-commit tip refresh: configured cache budget cannot "
-          "hold the mandatory full inside/outside caches plus one scoring "
-          "pattern");
+  auto const persistent_row_view =
+      state.local_commit_inside_rows.valid() &&
+      old_strategy != chart_spr_cache_strategy::lazy_multisite_chart;
+  if (persistent_row_view) {
+    // The mandatory persistent cache already supplies every active-pattern
+    // row. Preserve the published policy label and batch-size diagnostics, but
+    // do not reserve or repilot a second scoring representation.
+    state.cache_strategy = old_strategy;
+    state.effective_pattern_batch_size = old_effective_pattern_batch_size;
+  } else {
+    auto cache_selection_options = state.cache_opts;
+    // A local commit refreshes the already-published state in place. It must
+    // preserve that state's representation without repiloting or consulting an
+    // unresolved public auto request.
+    cache_selection_options.use_lazy_multisite_chart = false;
+    cache_selection_options.lazy_policy = state.lazy_policy.resolved;
+    if (state.cache_opts.memory_budget_bytes != 0) {
+      auto const mandatory_pair_bytes = chart_spr_checked_cache_bytes_multiply(
+          state.estimated_full_pattern_cache_bytes, 2,
+          "chart SPR local-commit refreshed mandatory cache byte overflow");
+      auto const scoring_pattern_bytes =
+          estimate_chart_spr_pattern_entry_cache_bytes(state.grammar);
+      auto const mandatory_with_one_pattern = chart_spr_checked_cache_bytes_add(
+          mandatory_pair_bytes, scoring_pattern_bytes,
+          "chart SPR local-commit refreshed mandatory cache byte overflow");
+      if (mandatory_with_one_pattern > state.cache_opts.memory_budget_bytes) {
+        throw chart_spr_cache_budget_error(
+            "chart SPR local-commit tip refresh: configured cache budget "
+            "cannot hold the mandatory full inside/outside caches plus one "
+            "scoring pattern");
+      }
+      cache_selection_options.memory_budget_bytes =
+          state.cache_opts.memory_budget_bytes - mandatory_pair_bytes;
     }
-    cache_selection_options.memory_budget_bytes =
-        state.cache_opts.memory_budget_bytes - mandatory_pair_bytes;
+    state.effective_pattern_batch_size = choose_chart_spr_pattern_batch_size(
+        state.grammar, state.active_patterns, cache_selection_options);
+    if (old_strategy == chart_spr_cache_strategy::pattern_batches) {
+      // A committed update may shrink the materialized grammar, but growing an
+      // automatic batch here would make the pre-commit admission depend on a
+      // post-commit topology size. Preserve the established upper bound; a
+      // growing grammar may still reduce it under the reserved scoring budget.
+      state.effective_pattern_batch_size = std::min(
+          old_effective_pattern_batch_size, state.effective_pattern_batch_size);
+    }
+    auto new_strategy = choose_chart_spr_cache_strategy(
+        state.grammar, state.active_patterns, cache_selection_options);
+    // Preserve a caller-requested pattern-batch mode across commits: do not
+    // silently switch an explicitly batched run into all-active just because
+    // the grammar shrank.
+    state.cache_strategy =
+        old_strategy == chart_spr_cache_strategy::pattern_batches
+            ? chart_spr_cache_strategy::pattern_batches
+            : new_strategy;
   }
-  state.effective_pattern_batch_size = choose_chart_spr_pattern_batch_size(
-      state.grammar, state.active_patterns, cache_selection_options);
-  if (old_strategy == chart_spr_cache_strategy::pattern_batches) {
-    // A committed update may shrink the materialized grammar, but growing an
-    // automatic batch here would make the pre-commit admission depend on a
-    // post-commit topology size.  Preserve the established upper bound; a
-    // growing grammar may still reduce it under the reserved scoring budget.
-    state.effective_pattern_batch_size = std::min(
-        old_effective_pattern_batch_size, state.effective_pattern_batch_size);
-  }
-  auto new_strategy = choose_chart_spr_cache_strategy(
-      state.grammar, state.active_patterns, cache_selection_options);
-  // Preserve a caller-requested pattern-batch mode across commits: do not
-  // silently switch an explicitly batched run into
-  // all-active just because the grammar shrank.  If an all-active run grows or
-  // its budget is recalculated into pattern_batches, switch to the batched view
-  // before touching resident pattern_charts so stale full rows cannot remain
-  // resident or be reported in resident-byte accounting.
-  state.cache_strategy =
-      old_strategy == chart_spr_cache_strategy::pattern_batches
-          ? chart_spr_cache_strategy::pattern_batches
-          : new_strategy;
 
   auto const& patterns = state.active_patterns.patterns.patterns;
   if (patterns.size() != icache.patterns.size()) {
@@ -4311,7 +4428,11 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
         "chart SPR local-commit tip refresh: active pattern count mismatch");
   }
 
-  if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
+  if (persistent_row_view) {
+    std::vector<pattern_chart_cache_entry>{}.swap(state.pattern_charts);
+    state.resident_pattern_cache_bytes = 0;
+  } else if (state.cache_strategy ==
+             chart_spr_cache_strategy::all_active_patterns) {
     std::vector<pattern_chart_cache_entry> refreshed;
     refreshed.reserve(patterns.size());
     for (std::size_t p = 0; p < patterns.size(); ++p) {
@@ -4345,10 +4466,8 @@ void chart_spr_refresh_state_tip_view_after_local_commit(
     state.resident_pattern_cache_bytes =
         estimate_chart_spr_pattern_cache_bytes(state);
   } else {
-    // pattern_batches strategy: there are no resident base rows to refresh; the
-    // next scoring batch rebuilds base rows once per pattern batch from the
-    // refreshed state.grammar.  Clear any all-active rows left over from the
-    // previous strategy so resident-byte reporting matches the strategy switch.
+    // Standalone pattern_batches state: there are no resident base rows to
+    // refresh. Local-commit states take the persistent-row-view branch above.
     std::vector<pattern_chart_cache_entry>{}.swap(state.pattern_charts);
     state.resident_pattern_cache_bytes =
         estimate_chart_spr_pattern_batch_cache_bytes(
@@ -4579,6 +4698,7 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     }
     sub.resident_cache_bytes = state.local_commit_persistent_cache_bytes;
     chart_spr_publish_local_commit_tip_identity(sub, state);
+    chart_spr_publish_persistent_inside_row_view(state, sub);
 
     // Mirror cumulative cache counters onto the running attempt-counters (the
     // caches persist across accepts; their counters are cumulative).
@@ -4718,6 +4838,8 @@ void chart_spr_refresh_search_summary_from_counters(
   summary.candidate_pipeline_estimated_peak_bytes =
       counters.candidate_pipeline_estimated_peak_bytes;
   summary.pattern_batch_cache_builds = counters.pattern_batch_cache_builds;
+  summary.local_commit_inside_row_view_pattern_visits =
+      counters.local_commit_inside_row_view_pattern_visits;
   summary.initial_state_inside_charts_built =
       counters.initial_state_inside_charts_built;
   summary.inside_cache_inside_charts_built =
@@ -7166,6 +7288,7 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   auto const resolved_workers = scheduler.worker_resolution().resolved_workers;
   auto const lazy_local =
       state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart;
+  auto const persistent_row_view = state.local_commit_inside_rows.valid();
   auto const local_prepared_slots =
       lazy_local ? local_task_slots
                  : std::max(candidate_batch_size, resolved_workers);
@@ -7178,7 +7301,8 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   std::size_t local_tile_result_slots = 0;
   std::size_t maximum_all_active_tile_items = 0;
   std::size_t maximum_pattern_batch_items = 0;
-  if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns &&
+  if ((state.cache_strategy == chart_spr_cache_strategy::all_active_patterns ||
+       persistent_row_view) &&
       resolved_workers > 1 && pattern_count > 1) {
     auto const target_total = multiply(resolved_workers, 4);
     auto const maximum_tiled_batch =
@@ -7196,7 +7320,8 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
           std::max(maximum_all_active_tile_items, tile_items);
     }
   } else if (state.cache_strategy ==
-             chart_spr_cache_strategy::pattern_batches) {
+                 chart_spr_cache_strategy::pattern_batches &&
+             !persistent_row_view) {
     auto const maximum_batch_patterns =
         std::min(pattern_count,
                  std::max<std::size_t>(1, state.effective_pattern_batch_size));
@@ -7214,7 +7339,8 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
     }
   }
   auto const pattern_batch_construction_scratch =
-      state.cache_strategy == chart_spr_cache_strategy::pattern_batches
+      state.cache_strategy == chart_spr_cache_strategy::pattern_batches &&
+              !persistent_row_view
           ? add(doubled_vector(maximum_pattern_batch_items,
                                sizeof(std::exception_ptr)),
                 doubled_vector(maximum_pattern_batch_items,
@@ -7315,7 +7441,8 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
         add(worker_preparation, pattern_batch_construction_scratch);
     worker_preparation = add(worker_preparation, scheduler_operation);
 
-    if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns) {
+    if (state.cache_strategy == chart_spr_cache_strategy::all_active_patterns ||
+        persistent_row_view) {
       // Untiled all-active batches prepare the descriptor and row scratch
       // inside each worker task.  Up to min(B,W) workers can therefore own
       // both old+new preparation envelopes simultaneously.  Prepared/worker
@@ -8234,6 +8361,13 @@ chart_spr_search_result run_chart_spr_search(
         "chart SPR local-commit total resident byte overflow");
     auto* substrate_ptr = local_commit_substrate.get();
     chart_spr_install_state_callback(
+        state, state.exact_setup_provider,
+        [substrate_ptr](chart_spr_search_state const& provider_state,
+                        checked_chart_execution_plan_ref const& checked_state) {
+          return chart_spr_build_exact_setup_from_persistent_inside_cache_serial(
+              *substrate_ptr, provider_state, checked_state);
+        });
+    chart_spr_install_state_callback(
         state, state.scheduled_exact_setup_provider,
         [substrate_ptr](chart_spr_search_state const& provider_state,
                         checked_chart_execution_plan_ref const& checked_state,
@@ -8253,6 +8387,27 @@ chart_spr_search_result run_chart_spr_search(
       chart_spr_search_detail::finalize_deferred_pattern_batch_bootstrap(
           state, inside_cache_composite_lower_bound_with_invariants(
                      *local_commit_substrate->icache));
+    }
+    chart_spr_publish_persistent_inside_row_view(state,
+                                                 *local_commit_substrate);
+    if (state.local_commit_inside_rows.valid()) {
+      // The persistent inside cache is now the authoritative non-lazy scoring
+      // surface. Assert/release any defensive empty projection before exact
+      // setup and candidate scoring begin.
+      std::vector<pattern_chart_cache_entry>{}.swap(state.pattern_charts);
+      state.resident_pattern_cache_bytes =
+          state.local_commit_persistent_cache_bytes;
+      chart_spr_require_cache_budget(state.resident_pattern_cache_bytes,
+                                     state.cache_opts,
+                                     "chart SPR local-commit row view");
+    }
+    if (options.force_fixed_topology_cache_epoch_mismatch_for_tests) {
+      // Corrupt only after the genuine initial tip passed row-view
+      // publication. The fixed-topology verifier must diagnose its own epoch
+      // contract; moving this hook earlier would make setup fail for the wrong
+      // reason and leave that verifier path untested.
+      local_commit_substrate->icache->commit_epoch =
+          local_commit_substrate->chain->size() + 1;
     }
     result.summary.local_inside_cache_initialization_ms =
         local_commit_substrate->inside_cache_initialization_ms;
@@ -8425,8 +8580,8 @@ chart_spr_search_result run_chart_spr_search(
 
   // Finish installing candidate verifiers on the substrate built before the
   // initial exact score. The accept path commits to it instead of
-  // dense-materializing per accept; state.grammar/pattern_charts remain a
-  // derived current-tip view.
+  // dense-materializing per accept; state.grammar and the persistent row view
+  // remain the derived current-tip scoring surface.
   if (local_commit_substrate != nullptr) {
     auto* substrate_ptr = local_commit_substrate.get();
     chart_spr_install_state_callback(

@@ -7109,7 +7109,7 @@ static void test_phase2b_deferred_pattern_batch_uses_owning_setup_provider() {
   } catch (std::runtime_error const& e) {
     deferred_rejection = e.what();
   }
-  CHECK(deferred_rejection.find("deferred pattern-batch bootstrap") !=
+  CHECK(deferred_rejection.find("deferred local-cache bootstrap") !=
         std::string::npos);
   CHECK(provider_calls == 0);
   CHECK(state.counters.exact_setup_builds == 0);
@@ -9486,6 +9486,15 @@ static void test_phase6_multifurcation_fixed_topology_local_commit() {
         search.counters.outside_cache_inside_charts_reused);
   CHECK(search.summary.outside_cache_outside_charts_built ==
         search.counters.outside_cache_outside_charts_built);
+  // Local non-lazy publication owns no preliminary dense projection: the
+  // persistent inside cache builds the sole initial recurrence surface.
+  // The cumulative initial-state counter contains only the later final-
+  // compaction rebuild; the local search tip itself was not projected first.
+  CHECK(search.counters.initial_state_inside_charts_built ==
+        search.summary.active_pattern_count);
+  CHECK(search.counters.inside_cache_inside_charts_built ==
+        search.summary.active_pattern_count);
+  CHECK(search.counters.inside_cache_resident_inside_charts_consumed == 0);
   CHECK(search.counters.spr_multifurcation_moves_generated > 0);
   CHECK(search.summary.spr_multifurcation_moves_generated ==
         search.counters.spr_multifurcation_moves_generated);
@@ -10126,7 +10135,10 @@ static void test_phase9_pattern_batch_local_update_matches_output_dag() {
   CHECK(search.summary.final_compaction_exactness_kind ==
         larch::multisite_keep_mask_kind::exact_optimal_production_union);
   CHECK(search.summary.effective_pattern_batch_size == 1);
-  CHECK(search.counters.pattern_batch_cache_builds > 0);
+  CHECK(search.counters.pattern_batch_cache_builds == 0);
+  CHECK(search.counters.local_commit_inside_row_view_pattern_visits > 0);
+  CHECK(search.summary.local_commit_inside_row_view_pattern_visits ==
+        search.counters.local_commit_inside_row_view_pattern_visits);
   CHECK(search.counters.initial_state_inside_charts_built == 0);
   CHECK(search.counters.inside_cache_inside_charts_built ==
         search.summary.active_pattern_count);
@@ -11457,6 +11469,9 @@ static void test_phase4_local_commit_counter_contract_and_oracle() {
   // Phase 3 correctness invariant: after every local commit, recompute BOTH
   // charts from scratch and assert the persistent caches agree.
   options.verify_local_commit_two_chart_oracle_for_tests = true;
+  // Exercise dense-tip -> persistent-chain row translation after multiple
+  // accepts, not only the initial identity map.
+  options.verify_local_against_full_for_tests = true;
 
   auto search = larch::run_chart_spr_search(std::move(fixture.dag),
                                             fixture.grammar, options);
@@ -11490,6 +11505,14 @@ static void test_phase4_local_commit_counter_contract_and_oracle() {
         search.counters.outside_cache_inside_charts_reused);
   CHECK(search.summary.outside_cache_outside_charts_built ==
         search.counters.outside_cache_outside_charts_built);
+
+  // The initial local tip is built directly into the persistent cache. The
+  // only dense-state build counted separately is the final compaction.
+  CHECK(search.counters.inside_cache_inside_charts_built ==
+        search.summary.active_pattern_count);
+  CHECK(search.counters.inside_cache_resident_inside_charts_consumed == 0);
+  CHECK(search.counters.initial_state_inside_charts_built ==
+        search.summary.active_pattern_count);
 
   // Exact setup work is cumulative across the resident current-state setup and
   // cold candidate/oracle setups, and every allocation-relevant field reaches
@@ -11587,6 +11610,10 @@ static void test_phase4_local_commit_counter_contract_and_oracle() {
   CHECK(search.counters.accepted_exact_trims_reused ==
         search.counters.local_commit_accepted_moves);
   CHECK(search.counters.accepted_exact_trim_reuse_rejections == 0);
+  CHECK(search.counters.local_commit_inside_row_view_pattern_visits > 0);
+  CHECK(search.summary.local_commit_inside_row_view_pattern_visits ==
+        search.counters.local_commit_inside_row_view_pattern_visits);
+  CHECK(search.counters.pattern_batch_cache_builds == 0);
   // Final score is non-increasing (every committed move improved or held).
   CHECK(search.summary.final_score <= search.summary.initial_score);
 
@@ -12184,10 +12211,9 @@ static void test_lazy_local_commit_recomputes_reactivated_clades() {
 }
 
 // pattern_batches cache strategy + local commit (Phase 4 known-issue #3).
-// chart_spr_refresh_state_tip_view_after_local_commit has a distinct branch
-// for pattern_batches mode (it leaves state.pattern_charts alone and refreshes
-// only the grammar + bounds from the icache); all other Phase 4 tests run in
-// all_active_patterns mode.  This forces cache_strategy = pattern_batches
+// Non-lazy local commit now scores through the authoritative persistent inside
+// cache even when the published policy label is pattern_batches. This forces
+// cache_strategy = pattern_batches
 // (max_cached_patterns = 1 on the three-misplaced-groups fixture, which carries
 // several active patterns) through a local-commit run so that branch is
 // exercised end-to-end and the two-chart oracle still agrees.
@@ -12228,9 +12254,8 @@ static void test_phase4_pattern_batches_local_commit() {
       search.counters.local_commit_tombstone_scope_skips,
       search.counters.pattern_batch_cache_builds);
 
-  // The local-commit run completed (no throw) with at least one commit --
-  // i.e. the pattern_batches refresh branch was taken and the next scoring
-  // batch successfully rebuilt base rows from the refreshed tip grammar.
+  // The local-commit run completed (no throw) with at least one commit and the
+  // next scoring batch read the refreshed persistent rows directly.
   CHECK(search.counters.accepted_moves ==
         search.counters.local_commit_accepted_moves);
   CHECK(search.counters.local_commit_accepted_moves >= 1);
@@ -12262,11 +12287,13 @@ static void test_phase4_pattern_batches_local_commit() {
   CHECK(search.summary.scheduler_axes.outside_cache_patterns.operations > 0);
   CHECK(search.summary.scheduler_axes.exact_setup_patterns.operations > 0);
   CHECK(search.summary.scheduler_axes.local_score_candidates.operations > 0);
-  // Pattern-batch scoring actually rebuilt base rows per batch across the run.
-  CHECK(search.counters.pattern_batch_cache_builds > 0);
+  // No cold pattern batch is rebuilt: the cache-backed view is the sole dense
+  // row source for current-tip local scoring.
+  CHECK(search.counters.pattern_batch_cache_builds == 0);
+  CHECK(search.counters.local_commit_inside_row_view_pattern_visits > 0);
+  CHECK(search.summary.local_commit_inside_row_view_pattern_visits ==
+        search.counters.local_commit_inside_row_view_pattern_visits);
   CHECK(search.summary.final_score <= search.summary.initial_score);
-  CHECK(search.summary.chart_cache_resident_bytes >
-        2 * search.summary.chart_cache_estimated_full_bytes);
 
   // Compaction produced a valid DAG whose grammar-level exact B&B optimum
   // matches the reported final score.
@@ -12279,10 +12306,9 @@ static void test_phase4_pattern_batches_local_commit() {
   CHECK(larch::chart_spr_state_exact_score_with_invariants(
             rebuilt_state, options.exact_trim) == search.summary.final_score);
 
-  // Pattern batching bounds the scoring batch, but local commit additionally
-  // requires complete persistent inside and outside caches. A budget too small
-  // for that pair is rejected explicitly instead of silently allocating it or
-  // reporting only the one-pattern scoring batch.
+  // Pattern batching no longer owns a separate scoring batch in local mode,
+  // but the complete persistent inside/outside pair remains mandatory. A
+  // budget too small for that pair is rejected explicitly.
   auto budget_fixture = make_three_misplaced_groups_fixture();
   auto budget_options = options;
   // This subcase isolates the mandatory persistent-cache admission gate; its
@@ -12294,12 +12320,8 @@ static void test_phase4_pattern_batches_local_commit() {
       larch::chart_spr_exact_candidate_checked_bytes_add(
           larch::estimate_chart_spr_state_core_resident_bytes(
               budget_calibration_state),
-          larch::chart_spr_exact_candidate_checked_bytes_add(
-              2 * larch::estimate_chart_spr_full_pattern_cache_bytes(
-                      budget_calibration_state),
-              larch::estimate_chart_spr_pattern_entry_cache_bytes(
-                  budget_calibration_state.grammar),
-              "pattern-batch local-commit mandatory cache test"),
+          2 * larch::estimate_chart_spr_full_pattern_cache_bytes(
+                  budget_calibration_state),
           "pattern-batch local-commit mandatory state test");
   CHECK(mandatory_local_commit_bytes > 1);
   budget_options.cache.memory_budget_bytes = mandatory_local_commit_bytes - 1;

@@ -3494,6 +3494,8 @@ static void print_chart_spr_search_counter_fields(
       << counters.candidate_batches_scored << "\n";
   out << indent << "pattern_batch_cache_builds: "
       << counters.pattern_batch_cache_builds << "\n";
+  out << indent << "local_commit_inside_row_view_pattern_visits: "
+      << counters.local_commit_inside_row_view_pattern_visits << "\n";
   out << indent << "initial_state_inside_charts_built: "
       << counters.initial_state_inside_charts_built << "\n";
   out << indent << "inside_cache_inside_charts_built: "
@@ -4837,6 +4839,8 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.candidate_batches_scored << "\n";
   out << "  pattern_batch_cache_builds: "
       << search.summary.pattern_batch_cache_builds << "\n";
+  out << "  local_commit_inside_row_view_pattern_visits: "
+      << search.summary.local_commit_inside_row_view_pattern_visits << "\n";
   out << "  initial_state_inside_charts_built: "
       << search.summary.initial_state_inside_charts_built << "\n";
   out << "  inside_cache_inside_charts_built: "
