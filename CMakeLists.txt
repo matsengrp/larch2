@@ -1217,6 +1217,9 @@ add_test(NAME wric_dhat_scoring_region_test
 add_test(NAME wric_phase4_acceptance_test
          COMMAND python3 test/wric_phase4_acceptance_test.py
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME wric_phase9_acceptance_test
+         COMMAND python3 test/wric_phase9_acceptance_test.py
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Phase 10 (cross-cutting CLI / report / identity surface) library-level tests.
 add_executable(chart_spr_phase10_test test/chart_spr_phase10_test.cpp)
