@@ -2,11 +2,15 @@
 """Build and audit the immutable Phase-9 local-commit workload supplement.
 
 The Phase-0 workload manifest is the root of trust.  This helper will not
-characterize a workload, bless an unsealed input, or replace an existing
-artifact.  It consumes an explicitly named and sealed base manifest plus a
-sealed index of frozen-oracle evidence, copies that evidence into a
-supplement-owned asset directory, derives the path-independent argv/trial
-digests, and writes the exact detached supplement seal.
+bless an unsealed input or replace an existing artifact.  It consumes an
+explicitly named and sealed base manifest plus a sealed index of expected
+frozen-oracle evidence, re-executes the input canonical command and all 12
+canonical search/output pairs, and accepts only exact semantic/counter
+agreement.  Completed commands are
+sealed in a restartable capture directory.  Fresh reports, canonical files,
+and per-row receipts are copied into a supplement-owned, resealed archive;
+the derived manifest and its detached seal are then checked by both this
+module and the production benchmark harness.
 
 The frozen characterization has one row for every seed/worker combination.
 Paths in it are normalized paths relative to the characterization TSV.  Its
@@ -16,9 +20,11 @@ exact schema can be printed with ``print-characterization-template``.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import csv
 import dataclasses
 import hashlib
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -28,7 +34,22 @@ import shutil
 import stat
 import subprocess
 import sys
-from typing import Iterable, Mapping, NoReturn, Sequence
+from typing import Iterable, Iterator, Mapping, NoReturn, Sequence
+
+sys.dont_write_bytecode = True
+
+TOOLS_DIRECTORY = Path(__file__).resolve().parent
+REPOSITORY_ROOT = TOOLS_DIRECTORY.parent
+if str(TOOLS_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIRECTORY))
+
+
+def acceptance_module():
+    """Import lazily so the acceptance tool can consume this module's archive API."""
+
+    import wric_phase9_acceptance  # noqa: PLC0415
+
+    return wric_phase9_acceptance
 
 
 SCHEMA = "wric_chart_parallelization_workloads"
@@ -41,7 +62,13 @@ WORKERS = (1, 2, 4, 8)
 ITERATIONS = 3
 MAX_CANDIDATES = 32
 TOP_K_EXACT = 4
-TIMEOUT_SECONDS = 600
+EXPECTED_CANDIDATES = ITERATIONS * MAX_CANDIDATES
+EXPECTED_EXACT = ITERATIONS * TOP_K_EXACT
+# Frozen-oracle characterization is an evidence-production diagnostic, not a
+# measured performance gate.  Its largest W1 run has exceeded 15 minutes
+# under load, while published workload trials retain their 600-second limit.
+WORKLOAD_TIMEOUT_SECONDS = 600
+TIMEOUT_SECONDS = 1800
 RSS_LIMIT_BYTES = 16 * 1024**3
 MEMORY_BUDGET_BYTES = 12 * 1024**3
 MIN_ACTIVE_PATTERNS = 64
@@ -70,10 +97,14 @@ PREAMBLE_KEYS = (
 MANIFEST_HEADER = """row_id\trun_group\tworkload_name\tfixture_id\tmethod\tinput_kind\tprimary_uri\tprimary_sha256\tsecondary_uri\tsecondary_sha256\trefseq_uri\trefseq_sha256\tbinary_role\tworker_option\trequested_workers\texpected_resolved_workers\texpected_worker_policy\taffinity_cpus\ttimeout_seconds\trss_limit_bytes\texpected_outcome\texpected_timeout_trials\texpected_reason_code\texpected_reason_sha256\tscale_resource\tscale_limit\tscale_largest_candidates\tscale_largest_top_k\titerations\tseed\tnative_max_moves\tchart_max_candidates\tchart_top_k_exact\tcandidate_cap_semantics\tacceptance\tobjective\tcandidate_selection\tcandidate_source\ttopology_selector\trandomize_order\treservoir_sample\tinclude_immediate_reversals\tsampled_tree_count\tsampled_tree_radius\tsampled_tree_score_threshold\tmax_upward_path_expansions\tmax_path_pairs\tmin_moved_clade_size\tmax_moved_clade_size\tmin_target_clade_size\tmax_target_clade_size\tmax_affected_clades\tpolytomy_mode\tpolytomy_max_exact_arity\tpolytomy_max_shapes\tpolytomy_max_productions\tpolytomy_max_clades\tlazy_policy\tmax_cached_patterns\tpattern_batch_size\tcandidate_batch_size\tmemory_budget_bytes\tcommit_mode\tverification_mode\tlocal_accept_updates\tdominance_mode\tbound_pruning\trequire_exact_keep_mask\tmax_frontier_entries\tscore_ua_edge\tvalidate\tforce_no_vcf\texpected_refinement_exactness\texpected_cache_strategy\texpected_effective_pattern_batch_size\texpected_keep_mask_kind\texpected_final_compaction_exactness\texpected_chain_exactness\texpected_active_patterns\texpected_initial_clades\texpected_initial_productions\texpected_candidates_generated\texpected_candidates_scored\texpected_exact_verifications\texpected_stop_reason\texpected_iterations\texpected_accepted_moves\texpected_initial_score\texpected_final_score\texpected_validated_parsimony\toracle_search_semantic_sha256\toracle_output_semantic_sha256\toracle_trial_semantic_sha256\tcanonical_sidecar_uri\tcanonical_sidecar_sha256\toracle_report_uri\toracle_report_sha256\tcanonical_argv_sha256""" .split("\t")
 
 CHAR_SCHEMA = "wric_phase9_frozen_characterization"
+CHAR_SCHEMA_VERSION = "3"
 CHAR_PREAMBLE_KEYS = (
     "schema",
     "schema_version",
+    "parent_sha256",
     "primary_sha256",
+    "input_canonical_path",
+    "input_canonical_sha256",
     "frozen_oracle_sha256",
     "affinity_cpus",
     "timeout_seconds",
@@ -91,12 +122,19 @@ CHAR_HEADER = (
     "canonical_result_sha256",
     "output_canonical_path",
     "output_canonical_sha256",
+    "canonical_argv_sha256",
+    "oracle_search_semantic_sha256",
+    "oracle_output_semantic_sha256",
+    "oracle_trial_semantic_sha256",
 )
 
 HEX64 = re.compile(r"[0-9a-f]{64}")
 REVISION = re.compile(r"[0-9a-f]{40,64}")
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 AFFINITY = re.compile(r"[0-9]+(?:[,-][0-9]+)*")
+LEDGER_RELATIVE = re.compile(
+    r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*"
+)
 
 
 class BootstrapError(RuntimeError):
@@ -120,6 +158,14 @@ class Characterization:
 
 
 @dataclasses.dataclass(frozen=True)
+class InputEvidence:
+    canonical: Path
+    canonical_sha256: str
+    semantic_sha256: str
+    parsimony_min: int
+
+
+@dataclasses.dataclass(frozen=True)
 class Evidence:
     seed: int
     workers: int
@@ -133,11 +179,30 @@ class Evidence:
     output_canonical_sha256: str
     search_semantic_sha256: str
     output_semantic_sha256: str
+    stable_report_sha256: str
     expected: Mapping[str, str]
+
+
+@dataclasses.dataclass(frozen=True)
+class AuditedFrozenCharacterization:
+    """The supplement-owned frozen evidence after the complete trust audit."""
+
+    base: Manifest
+    supplement: Manifest
+    characterization: Characterization
+    input_evidence: InputEvidence
+    evidence: Mapping[tuple[int, int], Evidence]
+    process_metrics_sha256: str
 
 
 def fail(message: str) -> NoReturn:
     raise BootstrapError(message)
+
+
+def reject_nonfinite_json_constant(value: str) -> NoReturn:
+    """Reject Python's non-standard NaN/Infinity JSON extensions."""
+
+    fail(f"JSON contains forbidden nonfinite constant {value!r}")
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -163,14 +228,67 @@ def require_regular(path: Path, label: str, *, executable: bool = False) -> None
         fail(f"{label} is not executable: {path}")
 
 
+def require_canonical_regular(
+    path: Path, label: str, *, executable: bool = False
+) -> Path:
+    """Reject a symlink in the file or any ancestor, not just after resolve()."""
+
+    absolute = path.absolute()
+    require_regular(absolute, label, executable=executable)
+    resolved = absolute.resolve(strict=True)
+    if absolute != resolved:
+        fail(f"{label} uses a symlink or noncanonical lexical path: {path}")
+    return resolved
+
+
+def resolve_lexical_regular(
+    root: Path, relative: Path, label: str, *, executable: bool = False
+) -> Path:
+    """Resolve one confined file while rejecting every lexical symlink component."""
+
+    current = root
+    for component in relative.parts:
+        current = current / component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            fail(f"{label} is missing: {current}")
+        if stat.S_ISLNK(info.st_mode):
+            fail(f"{label} uses a lexical symlink component: {current}")
+    require_regular(current, label, executable=executable)
+    resolved = current.resolve(strict=True)
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        fail(f"{label} escapes its lexical root: {current}")
+    return resolved
+
+
+def require_lexical_directory(path: Path, label: str) -> Path:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        fail(f"{label} is missing: {path}")
+    if not stat.S_ISDIR(info.st_mode) or path.is_symlink():
+        fail(f"{label} must be a lexical directory, not an alias: {path}")
+    resolved = path.resolve(strict=True)
+    if path.absolute() != resolved:
+        fail(f"{label} is not lexically canonical: {path}")
+    return resolved
+
+
 def detached_seal_bytes(path: Path) -> bytes:
     return f"{sha256_file(path)}  {path.name}\n".encode("ascii")
 
 
 def verify_detached_seal(path: Path) -> str:
     require_regular(path, "sealed file")
+    if path.stat().st_nlink != 1:
+        fail(f"sealed file must not be externally hard-linked: {path}")
     seal = path.with_name(path.name + ".sha256")
     require_regular(seal, "detached seal")
+    if seal.stat().st_nlink != 1:
+        fail(f"detached seal must not be externally hard-linked: {seal}")
     expected = detached_seal_bytes(path)
     if seal.read_bytes() != expected:
         fail(f"detached seal is not the exact SHA-256/basename bytes: {seal}")
@@ -232,6 +350,11 @@ def repo_root(path: Path | None) -> Path:
         root = Path(result.stdout.strip()).resolve(strict=True)
     if not root.is_dir():
         fail(f"repository root is not a directory: {root}")
+    if root != REPOSITORY_ROOT:
+        fail(
+            f"--repo-root must be the builder's repository root {REPOSITORY_ROOT}, "
+            f"not {root}"
+        )
     return root
 
 
@@ -252,22 +375,18 @@ def resolve_manifest_uri(manifest: Path, uri: str, root: Path) -> Path:
         or "//" in relative
     ):
         fail(f"manifest URI is not normalized and confined: {uri}")
-    try:
-        candidate = (base / rel).resolve(strict=True)
-        candidate.relative_to(base)
-    except (FileNotFoundError, ValueError):
-        fail(f"manifest URI is missing or escapes its root: {uri}")
-    require_regular(candidate, f"manifest asset {uri}")
-    return candidate
+    return resolve_lexical_regular(base, rel, f"manifest asset {uri}")
 
 
 def repo_uri(root: Path, path: Path) -> str:
+    require_regular(path, "base frozen asset")
     resolved = path.resolve(strict=True)
     try:
         relative = resolved.relative_to(root)
     except ValueError:
         fail(f"base frozen asset is outside --repo-root: {path}")
-    if path.absolute() != resolved:
+    lexical = path.absolute()
+    if lexical != resolved:
         fail(f"base frozen asset uses a symlink or noncanonical path: {path}")
     return "repo://" + relative.as_posix()
 
@@ -277,10 +396,27 @@ def validate_hash(value: str, label: str) -> None:
         fail(f"{label} is not canonical lowercase SHA-256: {value!r}")
 
 
+def validate_affinity(value: str, label: str) -> None:
+    if AFFINITY.fullmatch(value) is None:
+        fail(f"{label} affinity is not a canonical taskset CPU list: {value!r}")
+    result = subprocess.run(
+        ["taskset", "-c", value, "true"],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        fail(f"{label} affinity cannot execute on this host: {result.stderr.strip()}")
+
+
 def validate_manifest_assets(manifest: Manifest, root: Path) -> None:
     observed: dict[Path, str] = {}
 
     def require_hash(asset: Path, expected: str, label: str) -> None:
+        if asset.stat().st_nlink != 1:
+            fail(f"{label} must not be externally hard-linked: {asset}")
         actual = observed.get(asset)
         if actual is None:
             actual = sha256_file(asset)
@@ -318,6 +454,7 @@ def validate_manifest_assets(manifest: Manifest, root: Path) -> None:
 
 
 def read_manifest(path: Path, root: Path, *, expected_kind: str) -> Manifest:
+    path = require_canonical_regular(path, "workload manifest")
     digest = verify_detached_seal(path)
     preamble, rows = parse_preamble_and_rows(path, PREAMBLE_KEYS, MANIFEST_HEADER)
     if preamble["schema"] != SCHEMA or preamble["schema_version"] != SCHEMA_VERSION:
@@ -352,24 +489,26 @@ def relative_evidence_path(characterization: Path, text: str, label: str) -> Pat
     ):
         fail(f"{label} is not a normalized characterization-relative path: {text!r}")
     root = characterization.parent.resolve(strict=True)
-    try:
-        path = (root / relative).resolve(strict=True)
-        path.relative_to(root)
-    except (FileNotFoundError, ValueError):
-        fail(f"{label} is missing or escapes characterization root: {text!r}")
-    require_regular(path, label)
-    return path
+    return resolve_lexical_regular(root, relative, label)
 
 
 def read_characterization(path: Path) -> Characterization:
+    path = require_canonical_regular(path, "Phase-9 characterization")
     digest = verify_detached_seal(path)
     preamble, input_rows = parse_preamble_and_rows(path, CHAR_PREAMBLE_KEYS, CHAR_HEADER)
-    if preamble["schema"] != CHAR_SCHEMA or preamble["schema_version"] != "1":
+    if (
+        preamble["schema"] != CHAR_SCHEMA
+        or preamble["schema_version"] != CHAR_SCHEMA_VERSION
+    ):
         fail(f"unsupported Phase-9 characterization schema: {path}")
-    for key in ("primary_sha256", "frozen_oracle_sha256"):
+    for key in (
+        "parent_sha256",
+        "primary_sha256",
+        "input_canonical_sha256",
+        "frozen_oracle_sha256",
+    ):
         validate_hash(preamble[key], f"characterization {key}")
-    if AFFINITY.fullmatch(preamble["affinity_cpus"]) is None:
-        fail("characterization affinity_cpus is not canonical")
+    validate_affinity(preamble["affinity_cpus"], "characterization")
     exact_numbers = {
         "timeout_seconds": TIMEOUT_SECONDS,
         "rss_limit_bytes": RSS_LIMIT_BYTES,
@@ -381,12 +520,12 @@ def read_characterization(path: Path) -> Characterization:
     rows: dict[tuple[int, int], Mapping[str, str]] = {}
     for row in input_rows:
         try:
-            key = (int(row["seed"]), int(row["workers"]))
+            matrix_key = (int(row["seed"]), int(row["workers"]))
         except ValueError:
             fail(f"characterization has non-integer seed/workers: {row}")
-        if key in rows:
-            fail(f"duplicate characterization seed/worker row: {key}")
-        rows[key] = row
+        if matrix_key in rows:
+            fail(f"duplicate characterization seed/worker row: {matrix_key}")
+        rows[matrix_key] = row
     wanted_keys = {(seed, workers) for seed in SEEDS for workers in WORKERS}
     if set(rows) != wanted_keys:
         fail(
@@ -394,6 +533,29 @@ def read_characterization(path: Path) -> Characterization:
             f"1/2/4/8: missing={sorted(wanted_keys - set(rows))}, "
             f"unexpected={sorted(set(rows) - wanted_keys)}"
         )
+    evidence_paths = [preamble["input_canonical_path"]] + [
+        row[f"{prefix}_path"]
+        for row in rows.values()
+        for prefix in (
+            "product_report",
+            "canonical_sidecar",
+            "canonical_result",
+            "output_canonical",
+        )
+    ]
+    if len(set(evidence_paths)) != len(evidence_paths):
+        fail("characterization must own independent, non-aliased evidence paths")
+    identities: set[tuple[int, int]] = set()
+    for index, relative in enumerate(evidence_paths):
+        resolved = relative_evidence_path(
+            path, relative, f"characterization evidence path {index + 1}"
+        )
+        info = resolved.stat()
+        if info.st_nlink != 1:
+            fail(f"characterization evidence path is externally hard-linked: {resolved}")
+        identities.add((info.st_dev, info.st_ino))
+    if len(identities) != len(evidence_paths):
+        fail("characterization evidence paths must not be hard-linked aliases")
     return Characterization(path.resolve(strict=True), digest, preamble, rows)
 
 
@@ -458,8 +620,20 @@ def report_stop_reason(path: Path) -> str:
 
 
 def read_json_object(path: Path, label: str) -> dict[str, object]:
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                fail(f"{label} contains duplicate JSON key {key!r}: {path}")
+            result[key] = item
+        return result
+
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_nonfinite_json_constant,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"{label} is not one UTF-8 JSON object: {path}: {error}")
     if not isinstance(value, dict):
@@ -477,8 +651,23 @@ def sidecar_contract(path: Path) -> tuple[dict[str, object], str]:
     if not lines:
         fail(f"canonical sidecar is empty: {path}")
     for line_number, line in enumerate(lines, 1):
+        def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, item in pairs:
+                if key in result:
+                    fail(
+                        f"canonical sidecar line {line_number} contains duplicate "
+                        f"JSON key {key!r}: {path}"
+                    )
+                result[key] = item
+            return result
+
         try:
-            record = json.loads(line)
+            record = json.loads(
+                line,
+                object_pairs_hook=reject_duplicates,
+                parse_constant=reject_nonfinite_json_constant,
+            )
         except json.JSONDecodeError as error:
             fail(f"canonical sidecar line {line_number} is invalid JSON: {path}: {error}")
         if not isinstance(record, dict):
@@ -541,7 +730,37 @@ REPORT_BINDINGS = {
 }
 
 
-def exact_evidence(characterization: Characterization, row: Mapping[str, str]) -> Evidence:
+def exact_input_evidence(characterization: Characterization) -> InputEvidence:
+    """Validate the external canonical digest of the unmodified input fixture."""
+
+    expected_hash = characterization.preamble["input_canonical_sha256"]
+    validate_hash(expected_hash, "characterization input canonical hash")
+    path = relative_evidence_path(
+        characterization.path,
+        characterization.preamble["input_canonical_path"],
+        "characterization input canonical",
+    )
+    if sha256_file(path) != expected_hash:
+        fail(f"characterization input canonical hash mismatch: {path}")
+    acceptance = acceptance_module()
+    try:
+        value = acceptance.validate_dag_digest(path)
+    except acceptance.AcceptanceError as error:
+        fail(str(error))
+    return InputEvidence(
+        path,
+        expected_hash,
+        str(value["semantic_sha256"]),
+        int(value["parsimony_min"]),
+    )
+
+
+def _exact_evidence(
+    characterization: Characterization,
+    row: Mapping[str, str],
+    input_evidence: InputEvidence,
+    acceptance,
+) -> Evidence:
     seed, workers = int(row["seed"]), int(row["workers"])
     paths: dict[str, Path] = {}
     for prefix in (
@@ -550,29 +769,60 @@ def exact_evidence(characterization: Characterization, row: Mapping[str, str]) -
         "canonical_result",
         "output_canonical",
     ):
-        expected = row[f"{prefix}_sha256"]
-        validate_hash(expected, f"characterization {seed}/W{workers} {prefix} hash")
+        expected_hash = row[f"{prefix}_sha256"]
+        validate_hash(
+            expected_hash, f"characterization {seed}/W{workers} {prefix} hash"
+        )
         path = relative_evidence_path(
             characterization.path, row[f"{prefix}_path"], f"{seed}/W{workers} {prefix}"
         )
-        if sha256_file(path) != expected:
+        if sha256_file(path) != expected_hash:
             fail(f"characterization evidence hash mismatch for {seed}/W{workers}: {path}")
         paths[prefix] = path
 
     report = paths["product_report"]
+    label = f"frozen-oracle seed {seed} W{workers}"
+    try:
+        parsed_report = acceptance.parse_report(report)
+        report_summary = acceptance.validate_report_characterization(
+            parsed_report, seed, label
+        )
+        canonical_summary = acceptance.read_full_canonical_sidecar(
+            paths["canonical_sidecar"], seed, label
+        )
+        accepted_ms = acceptance.parse_decimal(
+            acceptance.require_top(parsed_report, "accepted_rebuild_ms", label),
+            f"{label} accepted_rebuild_ms",
+            positive=True,
+        )
+        total_ms = acceptance.parse_decimal(
+            acceptance.require_top(parsed_report, "total_ms", label),
+            f"{label} total_ms",
+            positive=True,
+        )
+    except acceptance.AcceptanceError as error:
+        fail(str(error))
     for key, wanted in REPORT_BINDINGS.items():
-        if report_value(report, key) != wanted:
-            fail(f"frozen report {seed}/W{workers} changed {key} from {wanted}")
-    report_exact = {
+        actual = acceptance.require_top(parsed_report, key, label)
+        if actual != wanted:
+            fail(f"{label}: {key}={actual!r}, expected {wanted!r}")
+    worker_bindings = {
         "seed": str(seed),
         "chart_workers_requested": str(workers),
         "chart_workers_resolved": str(workers),
         "chart_worker_policy": "explicit",
-        "iterations": str(ITERATIONS),
     }
-    for key, wanted in report_exact.items():
-        if report_value(report, key) != wanted:
-            fail(f"frozen report {seed}/W{workers} changed {key} from {wanted}")
+    for key, wanted in worker_bindings.items():
+        actual = acceptance.require_top(parsed_report, key, label)
+        if actual != wanted:
+            fail(f"{label}: {key}={actual!r}, expected {wanted!r}")
+    if accepted_ms > total_ms:
+        fail(f"{label}: accepted_rebuild_ms exceeds total_ms")
+    if seed == 1 and workers == 1 and accepted_ms < acceptance.MIN_FROZEN_ACCEPTED_REBUILD_MS:
+        fail(
+            "frozen seed-1 W1 accepted update is below the required 100 ms: "
+            f"{accepted_ms}"
+        )
 
     expected_fields = {
         "expected_refinement_exactness": "refinement_exactness",
@@ -588,48 +838,38 @@ def exact_evidence(characterization: Characterization, row: Mapping[str, str]) -
         "expected_exact_verifications": "exact_verifications",
         "expected_iterations": "iterations",
         "expected_accepted_moves": "accepted_moves",
-        "expected_initial_score": "initial_score",
         "expected_final_score": "final_score",
     }
-    expected = {
-        manifest_key: report_value(report, report_key)
+    expected: dict[str, str] = {
+        manifest_key: acceptance.require_top(parsed_report, report_key, label)
         for manifest_key, report_key in expected_fields.items()
     }
-    expected["expected_stop_reason"] = report_stop_reason(report)
-    unsigned_fields = tuple(expected_fields)
-    for field in unsigned_fields:
-        if field in (
-            "expected_refinement_exactness",
-            "expected_cache_strategy",
-            "expected_final_compaction_exactness",
-            "expected_chain_exactness",
-        ):
-            continue
-        if not expected[field].isdigit():
-            fail(f"frozen report {seed}/W{workers} {field} is not unsigned")
-    if int(expected["expected_active_patterns"]) < MIN_ACTIVE_PATTERNS:
-        fail(f"Phase-9 fixture has fewer than {MIN_ACTIVE_PATTERNS} active patterns")
-    accepted = int(expected["expected_accepted_moves"])
-    if accepted < MIN_ACCEPTED_MOVES:
-        fail(f"Phase-9 characterization {seed}/W{workers} accepted only {accepted} moves")
-    inside = report_value(report, "inside_rows_recomputed_on_commit")
-    outside = report_value(report, "outside_rows_recomputed_on_commit")
-    if not inside.isdigit() or not outside.isdigit():
-        fail(f"Phase-9 affected-row evidence is not unsigned: {seed}/W{workers}")
-    if int(inside) + int(outside) < accepted * MIN_AFFECTED_ROWS_PER_ACCEPT:
-        fail(f"Phase-9 characterization lacks 32 affected rows per accept: {seed}/W{workers}")
-    accepted_ms = report_value(report, "accepted_rebuild_ms")
-    try:
-        accepted_ms_value = float(accepted_ms)
-    except ValueError:
-        fail(f"Phase-9 accepted_rebuild_ms is not numeric: {seed}/W{workers}")
-    if accepted_ms_value < 0:
-        fail(f"Phase-9 accepted_rebuild_ms is negative: {seed}/W{workers}")
-    if seed == 1 and workers == 1 and accepted_ms_value < MIN_FROZEN_W1_ACCEPTED_UPDATE_MS:
+    report_initial_score = acceptance.require_top(parsed_report, "initial_score", label)
+    report_final_score = expected["expected_final_score"]
+    if not report_initial_score.isdigit() or not report_final_score.isdigit():
+        fail(f"{label}: report-domain initial/final score is not unsigned")
+    if int(report_final_score) >= int(report_initial_score):
         fail(
-            "frozen seed-1 W1 accepted update is below the required 100 ms: "
-            f"{accepted_ms_value}"
+            f"{label}: report-domain final score did not strictly improve "
+            f"{report_initial_score} -> {report_final_score}"
         )
+    expected["expected_initial_score"] = str(input_evidence.parsimony_min)
+    expected["expected_stop_reason"] = report_stop_reason(report)
+    for field in (
+        "expected_effective_pattern_batch_size",
+        "expected_active_patterns",
+        "expected_initial_clades",
+        "expected_initial_productions",
+        "expected_candidates_generated",
+        "expected_candidates_scored",
+        "expected_exact_verifications",
+        "expected_iterations",
+        "expected_accepted_moves",
+        "expected_initial_score",
+        "expected_final_score",
+    ):
+        if not expected[field].isdigit():
+            fail(f"{label}: {field} is not unsigned")
 
     contract, keep_kind = sidecar_contract(paths["canonical_sidecar"])
     contract_checks: Mapping[str, object] = {
@@ -647,35 +887,72 @@ def exact_evidence(characterization: Characterization, row: Mapping[str, str]) -
         "seed": seed,
         "polytomy_max_shapes": 1,
         "refinement_exactness": expected["expected_refinement_exactness"],
+        "score_ua_edge": False,
     }
-    for key, wanted in contract_checks.items():
-        if contract.get(key) != wanted:
+    for key, contract_wanted in contract_checks.items():
+        if contract.get(key) != contract_wanted:
             fail(
                 f"canonical sidecar contract {seed}/W{workers} {key}="
-                f"{contract.get(key)!r}, expected {wanted!r}"
+                f"{contract.get(key)!r}, expected {contract_wanted!r}"
             )
     expected["expected_keep_mask_kind"] = keep_kind
 
-    search = read_json_object(paths["canonical_result"], "canonical search result")
-    search_semantic = str(search.get("semantic_sha256", ""))
-    if (
-        search.get("schema_version") != 1
-        or search.get("digest_algorithm") != "sha256"
-        or search_semantic != row["canonical_sidecar_sha256"]
-    ):
+    try:
+        search = acceptance.validate_search_digest(paths["canonical_result"])
+        output = acceptance.validate_dag_digest(paths["output_canonical"])
+    except acceptance.AcceptanceError as error:
+        fail(str(error))
+    search_semantic = str(search["semantic_sha256"])
+    if search_semantic != row["canonical_sidecar_sha256"]:
         fail(f"compact/full canonical search mismatch: {seed}/W{workers}")
-    output = read_json_object(paths["output_canonical"], "canonical output result")
-    output_semantic = str(output.get("semantic_sha256", ""))
     if (
-        output.get("schema") != "larch.dag.semantic_digest"
-        or output.get("schema_version") != 1
-        or output.get("digest_algorithm") != "sha256"
-        or HEX64.fullmatch(output_semantic) is None
+        search["candidate_count"] != EXPECTED_CANDIDATES
+        or search["exact_candidate_count"] != EXPECTED_EXACT
+        or search["iteration_count"] != ITERATIONS
     ):
-        fail(f"canonical output has an invalid semantic contract: {seed}/W{workers}")
-    if str(output.get("parsimony_min", "")) != expected["expected_final_score"]:
-        fail(f"canonical output score differs from report: {seed}/W{workers}")
-    expected["expected_validated_parsimony"] = expected["expected_final_score"]
+        fail(f"canonical search counts violate the 32/4/3 contract: {seed}/W{workers}")
+    canonical_reconciliation = {
+        "record_count": search["record_count"],
+        "initial_score": int(report_initial_score),
+        "final_score": int(report_final_score),
+        "active_patterns": int(expected["expected_active_patterns"]),
+    }
+    if any(
+        canonical_summary[field] != wanted
+        for field, wanted in canonical_reconciliation.items()
+    ) or acceptance.report_sequence_projection(
+        canonical_summary["accepted_sequence"]
+    ) != report_summary["accepted_sequence"]:
+        fail(f"canonical sidecar/report/compact evidence differs: {seed}/W{workers}")
+    output_semantic = str(output["semantic_sha256"])
+    output_parsimony = int(output["parsimony_min"])
+    if output_parsimony >= input_evidence.parsimony_min:
+        fail(
+            f"external canonical output did not strictly improve the input: "
+            f"{seed}/W{workers}: {output_parsimony} >= "
+            f"{input_evidence.parsimony_min}"
+        )
+    expected["expected_validated_parsimony"] = str(output_parsimony)
+
+    contract_row = phase9_contract_row(
+        seed,
+        workers,
+        characterization.preamble["primary_sha256"],
+        "manifest://fixture.pb.gz",
+        characterization.preamble["affinity_cpus"],
+    )
+    argv_sha = canonical_argv_digest(canonical_argv(contract_row))
+    trial_sha = trial_digest(METHOD, search_semantic, output_semantic, argv_sha)
+    exact_digests = {
+        "canonical_argv_sha256": argv_sha,
+        "oracle_search_semantic_sha256": search_semantic,
+        "oracle_output_semantic_sha256": output_semantic,
+        "oracle_trial_semantic_sha256": trial_sha,
+    }
+    for field, wanted in exact_digests.items():
+        validate_hash(row[field], f"characterization {seed}/W{workers} {field}")
+        if row[field] != wanted:
+            fail(f"characterization {seed}/W{workers} {field} differs from derived evidence")
 
     return Evidence(
         seed,
@@ -690,11 +967,120 @@ def exact_evidence(characterization: Characterization, row: Mapping[str, str]) -
         row["output_canonical_sha256"],
         search_semantic,
         output_semantic,
+        stable_report_digest(report),
         expected,
     )
 
 
+def exact_evidence(
+    characterization: Characterization,
+    row: Mapping[str, str],
+    input_evidence: InputEvidence | None = None,
+) -> Evidence:
+    """Translate every acceptance-layer rejection into this tool's stable error API."""
+
+    acceptance = acceptance_module()
+    try:
+        return _exact_evidence(
+            characterization,
+            row,
+            input_evidence or exact_input_evidence(characterization),
+            acceptance,
+        )
+    except acceptance.AcceptanceError as error:
+        fail(str(error))
+
+
+def stable_report_digest(report: Path) -> str:
+    """Digest the complete product report after masking only volatile timings."""
+
+    try:
+        payload = report.read_bytes()
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail(f"product report is not UTF-8 for stable digest: {report}: {error}")
+    if not payload.endswith(b"\n") or b"\r" in payload:
+        fail(f"product report is not canonical newline-delimited UTF-8: {report}")
+    field = re.compile(r"^(\s*)([A-Za-z0-9_]+):[ \t]*(.*)$")
+    normalized: list[str] = []
+    for line in text.splitlines():
+        match = field.fullmatch(line)
+        if match is None:
+            normalized.append(line)
+            continue
+        indentation, key, _value = match.groups()
+        volatile = (
+            key.endswith("_ms")
+            or key.endswith("_per_second")
+            or key.endswith("_nanoseconds")
+            or key.endswith("_nanoseconds_max")
+        )
+        normalized.append(
+            f"{indentation}{key}: <volatile>" if volatile else line
+        )
+    canonical = ("\n".join(normalized) + "\n").encode("utf-8")
+    return sha256_bytes(b"wric-phase9-stable-report-v2\n" + canonical)
+
+
+def require_matching_stable_evidence(
+    source: Evidence, fresh: Evidence, label: str
+) -> None:
+    """Reconcile every stable semantic, canonical, report, and expected digest."""
+
+    fields = (
+        "canonical_sidecar_sha256",
+        "canonical_result_sha256",
+        "output_canonical_sha256",
+        "search_semantic_sha256",
+        "output_semantic_sha256",
+        "stable_report_sha256",
+    )
+    differing = [
+        field for field in fields if getattr(source, field) != getattr(fresh, field)
+    ]
+    if source.expected != fresh.expected:
+        differing.append("expected_report_projection")
+    if differing:
+        fail(
+            f"{label} differs from the sealed source characterization: "
+            f"{', '.join(differing)}"
+        )
+
+
+def require_matching_input_evidence(
+    source: InputEvidence, fresh: InputEvidence, label: str
+) -> None:
+    fields = (
+        "canonical_sha256",
+        "semantic_sha256",
+        "parsimony_min",
+    )
+    differing = [
+        field for field in fields if getattr(source, field) != getattr(fresh, field)
+    ]
+    if differing:
+        fail(
+            f"{label} differs from the sealed source input canonical evidence: "
+            f"{', '.join(differing)}"
+        )
+
+
 def validate_worker_independent_evidence(evidence: Sequence[Evidence]) -> None:
+    owned_paths = [
+        path
+        for item in evidence
+        for path in (
+            item.product_report,
+            item.canonical_sidecar,
+            item.canonical_result,
+            item.output_canonical,
+        )
+    ]
+    identities = {
+        (path.stat().st_dev, path.stat().st_ino) for path in owned_paths
+    }
+    if len(identities) != len(owned_paths):
+        fail("Phase-9 evidence rows contain hard-linked file aliases")
     for seed in SEEDS:
         rows = [item for item in evidence if item.seed == seed]
         signatures = {
@@ -821,20 +1207,19 @@ def workload_name(seed: int) -> str:
     return f"phase9-three-accepts-seed{seed}"
 
 
-def make_manifest_row(
-    evidence: Evidence,
+def phase9_contract_row(
+    seed: int,
+    workers: int,
     primary_sha256: str,
     primary_uri: str,
-    sidecar_uri: str,
-    canonical_result_uri: str,
     affinity: str,
 ) -> dict[str, str]:
     row = {field: "-" for field in MANIFEST_HEADER}
     row.update(
         {
-            "row_id": row_id(evidence.seed, evidence.workers),
+            "row_id": row_id(seed, workers),
             "run_group": RUN_GROUP,
-            "workload_name": workload_name(evidence.seed),
+            "workload_name": workload_name(seed),
             "fixture_id": "wric-chart-three-accepts",
             "method": METHOD,
             "input_kind": "dag_pb",
@@ -842,16 +1227,16 @@ def make_manifest_row(
             "primary_sha256": primary_sha256,
             "binary_role": "working_chart",
             "worker_option": "chart_spr_workers",
-            "requested_workers": str(evidence.workers),
-            "expected_resolved_workers": str(evidence.workers),
+            "requested_workers": str(workers),
+            "expected_resolved_workers": str(workers),
             "expected_worker_policy": "explicit",
             "affinity_cpus": affinity,
-            "timeout_seconds": str(TIMEOUT_SECONDS),
+            "timeout_seconds": str(WORKLOAD_TIMEOUT_SECONDS),
             "rss_limit_bytes": str(RSS_LIMIT_BYTES),
             "expected_outcome": "ok",
             "expected_timeout_trials": "0",
             "iterations": str(ITERATIONS),
-            "seed": str(evidence.seed),
+            "seed": str(seed),
             "chart_max_candidates": str(MAX_CANDIDATES),
             "chart_top_k_exact": str(TOP_K_EXACT),
             "candidate_cap_semantics": "post-dedup",
@@ -893,6 +1278,28 @@ def make_manifest_row(
             "score_ua_edge": "false",
             "validate": "true",
             "force_no_vcf": "true",
+        }
+    )
+    return row
+
+
+def make_manifest_row(
+    evidence: Evidence,
+    primary_sha256: str,
+    primary_uri: str,
+    sidecar_uri: str,
+    canonical_result_uri: str,
+    affinity: str,
+) -> dict[str, str]:
+    row = phase9_contract_row(
+        evidence.seed,
+        evidence.workers,
+        primary_sha256,
+        primary_uri,
+        affinity,
+    )
+    row.update(
+        {
             **evidence.expected,
             "oracle_search_semantic_sha256": evidence.search_semantic_sha256,
             "oracle_output_semantic_sha256": evidence.output_semantic_sha256,
@@ -921,6 +1328,16 @@ def tsv_bytes(preamble: Mapping[str, str], rows: Sequence[Mapping[str, str]]) ->
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def characterization_tsv_bytes(
+    preamble: Mapping[str, str], rows: Sequence[Mapping[str, str]]
+) -> bytes:
+    lines = [f"# {key}={preamble[key]}" for key in CHAR_PREAMBLE_KEYS]
+    lines.append("\t".join(CHAR_HEADER))
+    for row in rows:
+        lines.append("\t".join(row[field] for field in CHAR_HEADER))
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def copy_bytes(path: Path, data: bytes, mode: int) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     descriptor = os.open(path, flags, mode)
@@ -935,6 +1352,1109 @@ def copy_bytes(path: Path, data: bytes, mode: int) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def fsync_regular_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def remove_recoverable_staging_file(path: Path, label: str) -> None:
+    """Remove only an owned regular staging file left before atomic publish."""
+
+    if not os.path.lexists(path):
+        return
+    require_regular(path, label)
+    if path.stat().st_nlink != 1:
+        fail(f"{label} is externally hard-linked: {path}")
+    path.unlink()
+    fsync_directory(path.parent)
+
+
+def ensure_exact_file(path: Path, data: bytes, label: str, mode: int = 0o444) -> None:
+    """Atomically install immutable bytes and recover an interrupted staging write."""
+
+    staging = path.with_name(f".{path.name}.staging")
+    if os.path.lexists(path):
+        require_regular(path, label)
+        if path.read_bytes() != data:
+            fail(f"resumed {label} differs from the required bytes: {path}")
+        remove_recoverable_staging_file(staging, f"interrupted {label} staging file")
+        return
+    remove_recoverable_staging_file(staging, f"interrupted {label} staging file")
+    copy_bytes(staging, data, mode)
+    os.replace(staging, path)
+    fsync_directory(path.parent)
+
+
+def seal_bytes(name: str, data: bytes) -> bytes:
+    return f"{sha256_bytes(data)}  {name}\n".encode("ascii")
+
+
+CAPTURE_SCHEMA = "wric_phase9_frozen_capture"
+CAPTURE_SCHEMA_VERSION = 3
+CAPTURE_ROW_SCHEMA_VERSION = 3
+CAPTURE_INPUT_SCHEMA_VERSION = 1
+PROCESS_METRICS_KEYS = (
+    "schema_version",
+    "outcome",
+    "exit_code",
+    "term_signal",
+    "timed_out",
+    "runner_exit_code",
+    "wall_seconds",
+    "user_seconds",
+    "system_seconds",
+    "max_rss_kb",
+    "peak_sampled_rss_kb",
+    "peak_sampled_swap_kb",
+    "rss_kb_unit",
+    "proc_status_samples",
+    "proc_rss_samples",
+    "proc_swap_samples",
+    "proc_group_samples",
+    "peak_sampled_process_count",
+    "subreaper_enabled",
+    "descendants_reaped",
+    "post_leader_descendants",
+    "descendant_cleanup_kill_sent",
+    "live_descendants_at_return",
+    "process_group_alive_at_return",
+    "wait4_echild_at_return",
+    "monitor_error",
+    "monitor_error_count",
+    "wait4_collected",
+    "wait_errno",
+    "child_error_stage",
+    "child_error_errno",
+    "core_dumped",
+    "timeout_term_sent",
+    "timeout_kill_sent",
+    "rss_limit_bytes",
+    "rss_limit_enabled",
+    "rss_limit_observed",
+    "rss_limit_exceeded",
+    "rss_limit_trigger_bytes",
+    "rss_limit_term_sent",
+    "rss_limit_kill_sent",
+)
+CAPTURE_STATUS_FILES = (
+    "report.txt",
+    "stderr.txt",
+    "process-metrics.txt",
+    "canonical.ndjson",
+    "canonical.json",
+    "output.pb.gz",
+    "output-report.txt",
+    "output-stderr.txt",
+    "output-process-metrics.txt",
+    "output-canonical.json",
+)
+CAPTURE_INPUT_FILES = (
+    "report.txt",
+    "stderr.txt",
+    "process-metrics.txt",
+    "canonical.json",
+)
+
+
+def validate_process_metrics_receipt(path: Path, label: str) -> Mapping[str, str]:
+    """Validate one successful schema-v2 process-metrics enforcement receipt."""
+
+    require_regular(path, label)
+    if path.stat().st_nlink != 1:
+        fail(f"{label} is externally hard-linked: {path}")
+    try:
+        payload = path.read_bytes()
+        text = payload.decode("ascii")
+    except UnicodeDecodeError as error:
+        fail(f"{label} is not ASCII: {error}")
+    if not payload.endswith(b"\n") or b"\r" in payload:
+        fail(f"{label} is not canonical newline-delimited metrics")
+    lines = text.splitlines()
+    if len(lines) != len(PROCESS_METRICS_KEYS):
+        fail(f"{label} does not contain the exact schema-v2 key count")
+    values: dict[str, str] = {}
+    for index, (line, wanted_key) in enumerate(
+        zip(lines, PROCESS_METRICS_KEYS, strict=True), 1
+    ):
+        if "=" not in line:
+            fail(f"{label} line {index} lacks '='")
+        key, value = line.split("=", 1)
+        if key != wanted_key or not value:
+            fail(
+                f"{label} line {index} is not canonical {wanted_key}=VALUE"
+            )
+        values[key] = value
+
+    exact = {
+        "schema_version": "2",
+        "outcome": "exited",
+        "exit_code": "0",
+        "term_signal": "0",
+        "timed_out": "0",
+        "runner_exit_code": "0",
+        "peak_sampled_swap_kb": "0",
+        "rss_kb_unit": "1024_bytes",
+        "subreaper_enabled": "1",
+        "post_leader_descendants": "0",
+        "descendant_cleanup_kill_sent": "0",
+        "live_descendants_at_return": "0",
+        "process_group_alive_at_return": "0",
+        "wait4_echild_at_return": "1",
+        "monitor_error": "0",
+        "monitor_error_count": "0",
+        "wait4_collected": "1",
+        "wait_errno": "0",
+        "child_error_stage": "none",
+        "child_error_errno": "0",
+        "core_dumped": "0",
+        "timeout_term_sent": "0",
+        "timeout_kill_sent": "0",
+        "rss_limit_bytes": str(RSS_LIMIT_BYTES),
+        "rss_limit_enabled": "1",
+        "rss_limit_observed": "0",
+        "rss_limit_exceeded": "0",
+        "rss_limit_trigger_bytes": "0",
+        "rss_limit_term_sent": "0",
+        "rss_limit_kill_sent": "0",
+    }
+    for key, wanted in exact.items():
+        if values[key] != wanted:
+            fail(f"{label} {key}={values[key]!r}, expected {wanted!r}")
+    decimal = re.compile(r"(?:0|[1-9][0-9]*)[.][0-9]+")
+    for key in ("wall_seconds", "user_seconds", "system_seconds"):
+        if decimal.fullmatch(values[key]) is None:
+            fail(f"{label} {key} is not a finite canonical decimal")
+    unsigned = re.compile(r"0|[1-9][0-9]*")
+    numeric_keys = (
+        "max_rss_kb",
+        "peak_sampled_rss_kb",
+        "peak_sampled_swap_kb",
+        "proc_status_samples",
+        "proc_rss_samples",
+        "proc_swap_samples",
+        "proc_group_samples",
+        "peak_sampled_process_count",
+        "descendants_reaped",
+    )
+    for key in numeric_keys:
+        if unsigned.fullmatch(values[key]) is None:
+            fail(f"{label} {key} is not a canonical unsigned integer")
+    for key in (
+        "proc_status_samples",
+        "proc_rss_samples",
+        "proc_swap_samples",
+        "proc_group_samples",
+        "peak_sampled_process_count",
+    ):
+        if int(values[key]) == 0:
+            fail(f"{label} {key} must be positive")
+    if int(values["peak_sampled_rss_kb"]) * 1024 > RSS_LIMIT_BYTES:
+        fail(f"{label} sampled RSS exceeds the enforced Phase-9 limit")
+    return values
+
+
+@contextmanager
+def exclusive_capture_lock(capture_dir: Path) -> Iterator[None]:
+    """Admit one capture owner; kernel locking releases cleanly after a crash."""
+
+    capture = capture_dir.absolute()
+    capture.parent.mkdir(parents=True, exist_ok=True)
+    parent = require_lexical_directory(
+        capture.parent, "Phase-9 capture parent directory"
+    )
+    lock_path = parent / (capture.name + ".lock")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 0:
+            fail(f"Phase-9 capture lock is not one empty owned regular file: {lock_path}")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fail(f"Phase-9 capture directory is owned by another builder: {capture}")
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def capture_contract_bytes(
+    base: Manifest,
+    characterization: Characterization,
+    source_input: InputEvidence,
+    fixture_sha256: str,
+    process_metrics_sha256: str,
+) -> bytes:
+    rows = []
+    for seed in SEEDS:
+        for workers in WORKERS:
+            contract = phase9_contract_row(
+                seed,
+                workers,
+                fixture_sha256,
+                "manifest://fixture.pb.gz",
+                characterization.preamble["affinity_cpus"],
+            )
+            rows.append(
+                {
+                    "row_id": row_id(seed, workers),
+                    "canonical_argv_sha256": canonical_argv_digest(
+                        canonical_argv(contract)
+                    ),
+                }
+            )
+    value = {
+        "schema": CAPTURE_SCHEMA,
+        "schema_version": CAPTURE_SCHEMA_VERSION,
+        "parent_sha256": base.sha256,
+        "source_characterization_basename": characterization.path.name,
+        "source_characterization_sha256": characterization.sha256,
+        "source_characterization_seal_sha256": sha256_file(
+            characterization.path.with_name(characterization.path.name + ".sha256")
+        ),
+        "source_input_canonical_sha256": source_input.canonical_sha256,
+        "source_input_semantic_sha256": source_input.semantic_sha256,
+        "source_input_parsimony_min": source_input.parsimony_min,
+        "fixture_sha256": fixture_sha256,
+        "frozen_oracle_sha256": base.preamble["frozen_oracle_dagutil_sha256"],
+        "process_metrics_sha256": process_metrics_sha256,
+        "timeout_seconds": TIMEOUT_SECONDS,
+        "rss_limit_bytes": RSS_LIMIT_BYTES,
+        "affinity_cpus": characterization.preamble["affinity_cpus"],
+        "rows": rows,
+    }
+    return (
+        json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def initialize_capture_directory(
+    capture_dir: Path,
+    base: Manifest,
+    characterization: Characterization,
+    source_input: InputEvidence,
+    fixture_sha256: str,
+    process_metrics_sha256: str,
+) -> Path:
+    capture = capture_dir.absolute()
+    contract = capture_contract_bytes(
+        base,
+        characterization,
+        source_input,
+        fixture_sha256,
+        process_metrics_sha256,
+    )
+    if os.path.lexists(capture):
+        capture = require_lexical_directory(capture, "Phase-9 capture directory")
+    else:
+        capture.parent.mkdir(parents=True, exist_ok=True)
+        capture.mkdir(mode=0o755)
+        capture = require_lexical_directory(capture, "Phase-9 capture directory")
+    contract_path = capture / "capture-contract.json"
+    ensure_exact_file(contract_path, contract, "Phase-9 capture contract")
+    ensure_exact_file(
+        contract_path.with_name(contract_path.name + ".sha256"),
+        seal_bytes(contract_path.name, contract),
+        "Phase-9 capture contract seal",
+    )
+    rows = capture / "rows"
+    if os.path.lexists(rows):
+        require_lexical_directory(rows, "Phase-9 capture rows directory")
+    else:
+        rows.mkdir(mode=0o755)
+    allowed = {
+        "capture-contract.json",
+        "capture-contract.json.sha256",
+        ".input.staging",
+        "input",
+        "rows",
+    }
+    unexpected = sorted(path.name for path in capture.iterdir() if path.name not in allowed)
+    if unexpected:
+        fail(f"Phase-9 capture directory has unexpected artifacts: {unexpected}")
+    return capture
+
+
+def captured_row_mapping(
+    characterization: Characterization,
+    seed: int,
+    workers: int,
+    row_directory: Path,
+) -> dict[str, str]:
+    source = dict(characterization.rows[(seed, workers)])
+    capture_root = row_directory.parent.parent
+    relative_root = row_directory.relative_to(capture_root).as_posix()
+    paths = {
+        "product_report": "report.txt",
+        "canonical_sidecar": "canonical.ndjson",
+        "canonical_result": "canonical.json",
+        "output_canonical": "output-canonical.json",
+    }
+    for prefix, filename in paths.items():
+        path = row_directory / filename
+        source[f"{prefix}_path"] = f"{relative_root}/{filename}"
+        source[f"{prefix}_sha256"] = sha256_file(path)
+    acceptance = acceptance_module()
+    try:
+        search = acceptance.validate_search_digest(row_directory / "canonical.json")
+        output = acceptance.validate_dag_digest(row_directory / "output-canonical.json")
+    except acceptance.AcceptanceError as error:
+        fail(str(error))
+    contract = phase9_contract_row(
+        seed,
+        workers,
+        characterization.preamble["primary_sha256"],
+        "manifest://fixture.pb.gz",
+        characterization.preamble["affinity_cpus"],
+    )
+    argv_sha = canonical_argv_digest(canonical_argv(contract))
+    source["canonical_argv_sha256"] = argv_sha
+    source["oracle_search_semantic_sha256"] = str(search["semantic_sha256"])
+    source["oracle_output_semantic_sha256"] = str(output["semantic_sha256"])
+    source["oracle_trial_semantic_sha256"] = trial_digest(
+        METHOD,
+        source["oracle_search_semantic_sha256"],
+        source["oracle_output_semantic_sha256"],
+        argv_sha,
+    )
+    return source
+
+
+def captured_evidence(
+    characterization: Characterization,
+    input_evidence: InputEvidence,
+    seed: int,
+    workers: int,
+    row_directory: Path,
+) -> tuple[Evidence, dict[str, str]]:
+    row = captured_row_mapping(characterization, seed, workers, row_directory)
+    synthetic = Characterization(
+        row_directory.parent.parent / "capture-index.tsv",
+        "-",
+        characterization.preamble,
+        {(seed, workers): row},
+    )
+    evidence = exact_evidence(synthetic, row, input_evidence)
+    return evidence, row
+
+
+def captured_input_evidence(path: Path) -> InputEvidence:
+    require_regular(path, "captured input canonical evidence")
+    acceptance = acceptance_module()
+    try:
+        value = acceptance.validate_dag_digest(path)
+    except acceptance.AcceptanceError as error:
+        fail(str(error))
+    return InputEvidence(
+        path,
+        sha256_file(path),
+        str(value["semantic_sha256"]),
+        int(value["parsimony_min"]),
+    )
+
+
+def input_capture_status_bytes(
+    base: Manifest,
+    characterization: Characterization,
+    fixture_sha256: str,
+    process_metrics_sha256: str,
+    evidence: InputEvidence,
+    directory: Path,
+) -> bytes:
+    value = {
+        "schema": "wric_phase9_frozen_input_capture",
+        "schema_version": CAPTURE_INPUT_SCHEMA_VERSION,
+        "parent_sha256": base.sha256,
+        "fixture_sha256": fixture_sha256,
+        "frozen_oracle_sha256": base.preamble["frozen_oracle_dagutil_sha256"],
+        "process_metrics_sha256": process_metrics_sha256,
+        "timeout_seconds": TIMEOUT_SECONDS,
+        "rss_limit_bytes": RSS_LIMIT_BYTES,
+        "affinity_cpus": characterization.preamble["affinity_cpus"],
+        "canonical_sha256": evidence.canonical_sha256,
+        "semantic_sha256": evidence.semantic_sha256,
+        "parsimony_min": evidence.parsimony_min,
+        "files": {
+            filename: sha256_file(directory / filename)
+            for filename in CAPTURE_INPUT_FILES
+        },
+    }
+    return (
+        json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def validate_captured_input(
+    base: Manifest,
+    characterization: Characterization,
+    source_input: InputEvidence,
+    fixture_sha256: str,
+    process_metrics_sha256: str,
+    directory: Path,
+    *,
+    require_readonly_directory: bool = True,
+) -> InputEvidence:
+    directory = require_lexical_directory(
+        directory, "completed Phase-9 input capture"
+    )
+    if require_readonly_directory and directory.stat().st_mode & 0o222:
+        fail(f"completed Phase-9 input capture is still writable: {directory}")
+    expected_files = {
+        *CAPTURE_INPUT_FILES,
+        "status.json",
+        "status.json.sha256",
+    }
+    observed = {path.name for path in directory.iterdir()}
+    if observed != expected_files:
+        fail(
+            "completed Phase-9 input capture is not the exact file closure: "
+            f"missing={sorted(expected_files - observed)}, "
+            f"unexpected={sorted(observed - expected_files)}"
+        )
+    for filename in expected_files:
+        member = directory / filename
+        require_regular(member, f"completed input capture member {filename}")
+        if member.stat().st_nlink != 1:
+            fail(f"completed input capture member is externally hard-linked: {member}")
+        if require_readonly_directory and member.stat().st_mode & 0o222:
+            fail(f"completed input capture member is still writable: {member}")
+    validate_process_metrics_receipt(
+        directory / "process-metrics.txt", "completed input capture metrics"
+    )
+    status = directory / "status.json"
+    verify_detached_seal(status)
+    evidence = captured_input_evidence(directory / "canonical.json")
+    expected_status = input_capture_status_bytes(
+        base,
+        characterization,
+        fixture_sha256,
+        process_metrics_sha256,
+        evidence,
+        directory,
+    )
+    if status.read_bytes() != expected_status:
+        fail("completed Phase-9 input capture status changed")
+    require_matching_input_evidence(
+        source_input, evidence, "fresh frozen-oracle input execution"
+    )
+    return evidence
+
+
+def capture_status_bytes(
+    base: Manifest,
+    characterization: Characterization,
+    input_evidence: InputEvidence,
+    fixture_sha256: str,
+    process_metrics_sha256: str,
+    evidence: Evidence,
+    row_directory: Path,
+) -> bytes:
+    report = acceptance_module().parse_report(evidence.product_report)
+    files = {
+        filename: sha256_file(row_directory / filename)
+        for filename in CAPTURE_STATUS_FILES
+    }
+    contract = phase9_contract_row(
+        evidence.seed,
+        evidence.workers,
+        fixture_sha256,
+        "manifest://fixture.pb.gz",
+        characterization.preamble["affinity_cpus"],
+    )
+    value = {
+        "schema": "wric_phase9_frozen_capture_row",
+        "schema_version": CAPTURE_ROW_SCHEMA_VERSION,
+        "row_id": row_id(evidence.seed, evidence.workers),
+        "seed": evidence.seed,
+        "workers": evidence.workers,
+        "parent_sha256": base.sha256,
+        "fixture_sha256": fixture_sha256,
+        "frozen_oracle_sha256": base.preamble["frozen_oracle_dagutil_sha256"],
+        "process_metrics_sha256": process_metrics_sha256,
+        "input_canonical_sha256": input_evidence.canonical_sha256,
+        "input_semantic_sha256": input_evidence.semantic_sha256,
+        "input_parsimony_min": input_evidence.parsimony_min,
+        "timeout_seconds": TIMEOUT_SECONDS,
+        "rss_limit_bytes": RSS_LIMIT_BYTES,
+        "affinity_cpus": characterization.preamble["affinity_cpus"],
+        "canonical_argv": canonical_argv(contract),
+        "canonical_argv_sha256": canonical_argv_digest(canonical_argv(contract)),
+        "accepted_rebuild_ms": report.top["accepted_rebuild_ms"],
+        "total_ms": report.top["total_ms"],
+        "files": files,
+    }
+    return (
+        json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def validate_captured_row(
+    base: Manifest,
+    characterization: Characterization,
+    input_evidence: InputEvidence,
+    source_evidence: Evidence,
+    fixture_sha256: str,
+    process_metrics_sha256: str,
+    row_directory: Path,
+    *,
+    require_readonly_directory: bool = True,
+) -> tuple[Evidence, dict[str, str]]:
+    row_directory = require_lexical_directory(row_directory, "completed Phase-9 capture row")
+    if require_readonly_directory and row_directory.stat().st_mode & 0o222:
+        fail(f"completed Phase-9 capture row directory is still writable: {row_directory}")
+    expected_files = {
+        *CAPTURE_STATUS_FILES,
+        "status.json",
+        "status.json.sha256",
+    }
+    observed_files = {path.name for path in row_directory.iterdir()}
+    if observed_files != expected_files:
+        fail(
+            f"completed Phase-9 capture row is not the exact file closure: "
+            f"{row_directory}: missing={sorted(expected_files - observed_files)}, "
+            f"unexpected={sorted(observed_files - expected_files)}"
+        )
+    for filename in expected_files:
+        member = row_directory / filename
+        require_regular(member, f"completed capture member {filename}")
+        if member.stat().st_nlink != 1:
+            fail(f"completed capture member is externally hard-linked: {member}")
+        if require_readonly_directory and member.stat().st_mode & 0o222:
+            fail(f"completed capture member is still writable: {member}")
+    status = row_directory / "status.json"
+    verify_detached_seal(status)
+    validate_process_metrics_receipt(
+        row_directory / "process-metrics.txt",
+        f"completed capture {source_evidence.seed}/W{source_evidence.workers} chart metrics",
+    )
+    validate_process_metrics_receipt(
+        row_directory / "output-process-metrics.txt",
+        f"completed capture {source_evidence.seed}/W{source_evidence.workers} output metrics",
+    )
+    evidence, row = captured_evidence(
+        characterization,
+        input_evidence,
+        source_evidence.seed,
+        source_evidence.workers,
+        row_directory,
+    )
+    expected_status = capture_status_bytes(
+        base,
+        characterization,
+        input_evidence,
+        fixture_sha256,
+        process_metrics_sha256,
+        evidence,
+        row_directory,
+    )
+    if status.read_bytes() != expected_status:
+        fail(f"completed Phase-9 capture row status changed: {row_directory}")
+    require_matching_stable_evidence(
+        source_evidence,
+        evidence,
+        "fresh frozen-oracle execution "
+        + row_id(evidence.seed, evidence.workers),
+    )
+    return evidence, row
+
+
+def actual_chart_command(
+    oracle: Path,
+    fixture: Path,
+    contract: Mapping[str, str],
+    row_directory: Path,
+) -> list[str]:
+    values = canonical_argv(contract)
+    values[0] = os.fspath(oracle)
+    values[2] = os.fspath(fixture)
+    values[-1] = os.fspath(row_directory / "output.pb.gz")
+    output_index = len(values) - 2
+    values[output_index:output_index] = [
+        "--chart-spr-canonical-result",
+        os.fspath(row_directory / "canonical.json"),
+        "--chart-spr-canonical-sidecar",
+        os.fspath(row_directory / "canonical.ndjson"),
+    ]
+    return ["taskset", "-c", contract["affinity_cpus"], *values]
+
+
+def actual_output_command(
+    oracle: Path, affinity: str, row_directory: Path
+) -> list[str]:
+    return [
+        "taskset",
+        "-c",
+        affinity,
+        os.fspath(oracle),
+        "--dag-pb",
+        os.fspath(row_directory / "output.pb.gz"),
+        "--force-no-vcf",
+        "--validate",
+        "--dag-info",
+        "--canonical-dag-result",
+        os.fspath(row_directory / "output-canonical.json"),
+    ]
+
+
+def actual_input_command(
+    oracle: Path, affinity: str, fixture: Path, directory: Path
+) -> list[str]:
+    return [
+        "taskset",
+        "-c",
+        affinity,
+        os.fspath(oracle),
+        "--dag-pb",
+        os.fspath(fixture),
+        "--force-no-vcf",
+        "--validate",
+        "--dag-info",
+        "--canonical-dag-result",
+        os.fspath(directory / "canonical.json"),
+    ]
+
+
+def run_enforced_capture_command(
+    process_metrics: Path,
+    command: Sequence[str],
+    stdout: Path,
+    stderr: Path,
+    metrics: Path,
+    environment: Mapping[str, str],
+    label: str,
+) -> None:
+    """Run one command under the exact timeout/RSS contract and seal its receipt."""
+
+    runner = [
+        os.fspath(process_metrics),
+        "--timeout-seconds",
+        str(TIMEOUT_SECONDS),
+        "--rss-limit-bytes",
+        str(RSS_LIMIT_BYTES),
+        "--stdout",
+        os.fspath(stdout),
+        "--stderr",
+        os.fspath(stderr),
+        "--metrics",
+        os.fspath(metrics),
+        "--",
+        *command,
+    ]
+    result = subprocess.run(
+        runner,
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dict(environment),
+        timeout=TIMEOUT_SECONDS + 60,
+    )
+    if result.stdout or result.stderr:
+        fail(f"process-metrics emitted unexpected diagnostics for {label}")
+    validate_process_metrics_receipt(metrics, f"{label} process-metrics receipt")
+    if result.returncode != 0:
+        fail(f"{label} failed under process-metrics: {result.returncode}")
+
+
+def remove_capture_staging_directory(path: Path) -> None:
+    """Discard only the private incomplete row directory after making it removable."""
+
+    staging = require_lexical_directory(path, "incomplete Phase-9 capture row")
+    for directory, directory_names, _ in os.walk(
+        staging, topdown=False, followlinks=False
+    ):
+        for name in directory_names:
+            child = Path(directory) / name
+            info = child.lstat()
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                child.chmod(0o755)
+        Path(directory).chmod(0o755)
+    shutil.rmtree(staging)
+    fsync_directory(staging.parent)
+
+
+def run_frozen_capture_input(
+    base: Manifest,
+    characterization: Characterization,
+    source_input: InputEvidence,
+    fixture: Path,
+    fixture_sha256: str,
+    oracle: Path,
+    process_metrics: Path,
+    process_metrics_sha256: str,
+    capture: Path,
+) -> InputEvidence:
+    destination = capture / "input"
+    staging = capture / ".input.staging"
+    if os.path.lexists(destination):
+        destination = require_lexical_directory(
+            destination, "completed Phase-9 input capture"
+        )
+        if destination.stat().st_mode & 0o222:
+            validate_captured_input(
+                base,
+                characterization,
+                source_input,
+                fixture_sha256,
+                process_metrics_sha256,
+                destination,
+                require_readonly_directory=False,
+            )
+            for member in destination.iterdir():
+                member.chmod(0o444)
+                fsync_regular_file(member)
+            destination.chmod(0o555)
+            fsync_directory(capture)
+        result = validate_captured_input(
+            base,
+            characterization,
+            source_input,
+            fixture_sha256,
+            process_metrics_sha256,
+            destination,
+        )
+        if os.path.lexists(staging):
+            remove_capture_staging_directory(staging)
+        return result
+    if os.path.lexists(staging):
+        try:
+            validate_captured_input(
+                base,
+                characterization,
+                source_input,
+                fixture_sha256,
+                process_metrics_sha256,
+                staging,
+            )
+        except BootstrapError:
+            remove_capture_staging_directory(staging)
+        else:
+            os.rename(staging, destination)
+            fsync_directory(capture)
+            return validate_captured_input(
+                base,
+                characterization,
+                source_input,
+                fixture_sha256,
+                process_metrics_sha256,
+                destination,
+            )
+    staging.mkdir(mode=0o755)
+    environment = {
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TZ": "Europe/Sofia",
+    }
+    try:
+        run_enforced_capture_command(
+            process_metrics,
+            actual_input_command(
+                oracle,
+                characterization.preamble["affinity_cpus"],
+                fixture,
+                staging,
+            ),
+            staging / "report.txt",
+            staging / "stderr.txt",
+            staging / "process-metrics.txt",
+            environment,
+            "frozen oracle input canonical command",
+        )
+        for filename in CAPTURE_INPUT_FILES:
+            require_regular(staging / filename, f"fresh input capture {filename}")
+        evidence = captured_input_evidence(staging / "canonical.json")
+        require_matching_input_evidence(
+            source_input, evidence, "fresh frozen-oracle input execution"
+        )
+        status_data = input_capture_status_bytes(
+            base,
+            characterization,
+            fixture_sha256,
+            process_metrics_sha256,
+            evidence,
+            staging,
+        )
+        copy_bytes(staging / "status.json", status_data, 0o444)
+        copy_bytes(
+            staging / "status.json.sha256",
+            seal_bytes("status.json", status_data),
+            0o444,
+        )
+        for member in staging.iterdir():
+            member.chmod(0o444)
+            fsync_regular_file(member)
+        staging.chmod(0o555)
+        fsync_directory(staging)
+        os.rename(staging, destination)
+        fsync_directory(capture)
+    except BaseException:
+        if staging.exists():
+            remove_capture_staging_directory(staging)
+        raise
+    return validate_captured_input(
+        base,
+        characterization,
+        source_input,
+        fixture_sha256,
+        process_metrics_sha256,
+        destination,
+    )
+
+
+def run_frozen_capture_row(
+    base: Manifest,
+    characterization: Characterization,
+    input_evidence: InputEvidence,
+    source_evidence: Evidence,
+    fixture: Path,
+    fixture_sha256: str,
+    oracle: Path,
+    process_metrics: Path,
+    process_metrics_sha256: str,
+    rows_directory: Path,
+) -> tuple[Evidence, dict[str, str]]:
+    identity = row_id(source_evidence.seed, source_evidence.workers)
+    destination = rows_directory / identity
+    staging = rows_directory / f".{identity}.staging"
+    if os.path.lexists(destination):
+        destination = require_lexical_directory(
+            destination, "completed Phase-9 capture row"
+        )
+        if destination.stat().st_mode & 0o222:
+            # Recover the old rename-before-chmod crash window only after the
+            # complete row proves exact against the sealed source.
+            validate_captured_row(
+                base,
+                characterization,
+                input_evidence,
+                source_evidence,
+                fixture_sha256,
+                process_metrics_sha256,
+                destination,
+                require_readonly_directory=False,
+            )
+            for member in destination.iterdir():
+                member.chmod(0o444)
+                fsync_regular_file(member)
+            destination.chmod(0o555)
+            fsync_directory(rows_directory)
+        result = validate_captured_row(
+            base,
+            characterization,
+            input_evidence,
+            source_evidence,
+            fixture_sha256,
+            process_metrics_sha256,
+            destination,
+        )
+        if os.path.lexists(staging):
+            remove_capture_staging_directory(staging)
+        return result
+    if os.path.lexists(staging):
+        try:
+            validate_captured_row(
+                base,
+                characterization,
+                input_evidence,
+                source_evidence,
+                fixture_sha256,
+                process_metrics_sha256,
+                staging,
+            )
+        except BootstrapError:
+            remove_capture_staging_directory(staging)
+        else:
+            os.rename(staging, destination)
+            fsync_directory(rows_directory)
+            return validate_captured_row(
+                base,
+                characterization,
+                input_evidence,
+                source_evidence,
+                fixture_sha256,
+                process_metrics_sha256,
+                destination,
+            )
+    staging.mkdir(mode=0o755)
+    contract = phase9_contract_row(
+        source_evidence.seed,
+        source_evidence.workers,
+        fixture_sha256,
+        "manifest://fixture.pb.gz",
+        characterization.preamble["affinity_cpus"],
+    )
+    environment = {
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TZ": "Europe/Sofia",
+    }
+    try:
+        run_enforced_capture_command(
+            process_metrics,
+            actual_chart_command(oracle, fixture, contract, staging),
+            staging / "report.txt",
+            staging / "stderr.txt",
+            staging / "process-metrics.txt",
+            environment,
+            f"frozen oracle chart command {identity}",
+        )
+        run_enforced_capture_command(
+            process_metrics,
+            actual_output_command(
+                oracle, characterization.preamble["affinity_cpus"], staging
+            ),
+            staging / "output-report.txt",
+            staging / "output-stderr.txt",
+            staging / "output-process-metrics.txt",
+            environment,
+            f"frozen oracle output command {identity}",
+        )
+        for filename in CAPTURE_STATUS_FILES:
+            require_regular(staging / filename, f"fresh capture {identity} {filename}")
+        evidence, row = captured_evidence(
+            characterization,
+            input_evidence,
+            source_evidence.seed,
+            source_evidence.workers,
+            staging,
+        )
+        require_matching_stable_evidence(
+            source_evidence, evidence, f"fresh frozen-oracle execution {identity}"
+        )
+        status_data = capture_status_bytes(
+            base,
+            characterization,
+            input_evidence,
+            fixture_sha256,
+            process_metrics_sha256,
+            evidence,
+            staging,
+        )
+        copy_bytes(staging / "status.json", status_data, 0o444)
+        copy_bytes(
+            staging / "status.json.sha256",
+            seal_bytes("status.json", status_data),
+            0o444,
+        )
+        for path in staging.iterdir():
+            path.chmod(0o444)
+            fsync_regular_file(path)
+        staging.chmod(0o555)
+        fsync_directory(staging)
+        os.rename(staging, destination)
+        fsync_directory(rows_directory)
+    except BaseException:
+        if staging.exists():
+            remove_capture_staging_directory(staging)
+        raise
+    return validate_captured_row(
+        base,
+        characterization,
+        input_evidence,
+        source_evidence,
+        fixture_sha256,
+        process_metrics_sha256,
+        destination,
+    )
+
+
+def capture_frozen_characterization(
+    capture_dir: Path,
+    base: Manifest,
+    characterization: Characterization,
+    source_input: InputEvidence,
+    source_evidence: Sequence[Evidence],
+    fixture: Path,
+    fixture_sha256: str,
+    oracle: Path,
+    process_metrics: Path,
+    process_metrics_sha256: str,
+) -> tuple[InputEvidence, list[Evidence], list[dict[str, str]], Path]:
+    if sha256_file(oracle) != base.preamble["frozen_oracle_dagutil_sha256"]:
+        fail("frozen oracle changed before Phase-9 capture")
+    if sha256_file(fixture) != fixture_sha256:
+        fail("Phase-9 fixture changed before frozen capture")
+    if sha256_file(process_metrics) != process_metrics_sha256:
+        fail("process-metrics runner changed before Phase-9 capture")
+    capture = initialize_capture_directory(
+        capture_dir,
+        base,
+        characterization,
+        source_input,
+        fixture_sha256,
+        process_metrics_sha256,
+    )
+    input_evidence = run_frozen_capture_input(
+        base,
+        characterization,
+        source_input,
+        fixture,
+        fixture_sha256,
+        oracle,
+        process_metrics,
+        process_metrics_sha256,
+        capture,
+    )
+    rows_directory = capture / "rows"
+    source = {(item.seed, item.workers): item for item in source_evidence}
+    evidence: list[Evidence] = []
+    mappings: list[dict[str, str]] = []
+    for seed in SEEDS:
+        for workers in WORKERS:
+            item, mapping = run_frozen_capture_row(
+                base,
+                characterization,
+                input_evidence,
+                source[(seed, workers)],
+                fixture,
+                fixture_sha256,
+                oracle,
+                process_metrics,
+                process_metrics_sha256,
+                rows_directory,
+            )
+            evidence.append(item)
+            mappings.append(mapping)
+    unexpected = sorted(
+        path.name
+        for path in rows_directory.iterdir()
+        if path.name not in {row_id(seed, worker) for seed in SEEDS for worker in WORKERS}
+    )
+    if unexpected:
+        fail(f"Phase-9 capture rows directory has unexpected artifacts: {unexpected}")
+    if os.path.lexists(capture / ".input.staging"):
+        fail("Phase-9 input capture left an interrupted staging directory")
+    if sha256_file(oracle) != base.preamble["frozen_oracle_dagutil_sha256"]:
+        fail("frozen oracle changed during Phase-9 capture")
+    if sha256_file(fixture) != fixture_sha256:
+        fail("Phase-9 fixture changed during frozen capture")
+    if sha256_file(process_metrics) != process_metrics_sha256:
+        fail("process-metrics runner changed during Phase-9 capture")
+    validate_worker_independent_evidence(evidence)
+    return input_evidence, evidence, mappings, capture
 
 
 def shell_command_tokens(row: Mapping[str, str]) -> list[str]:
@@ -957,13 +2477,17 @@ def render_commands(
     oracle_sha: str,
     affinity: str,
     ledger_sha: str,
+    archived_characterization: str,
 ) -> bytes:
+    if LEDGER_RELATIVE.fullmatch(archived_characterization) is None:
+        fail("archived characterization path is not a canonical asset path")
     lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "assets=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd -P)",
         f"readonly expected_ledger_sha256={ledger_sha}",
         f"readonly expected_oracle_sha256={oracle_sha}",
+        f"readonly archived_characterization={archived_characterization}",
         '[[ $(sha256sum "$assets/assets.sha256" | awk \'{print $1}\') == "$expected_ledger_sha256" ]] || { echo "Phase-9 asset ledger hash mismatch" >&2; exit 1; }',
         '(cd "$assets" && sha256sum --check --strict assets.sha256)',
         '[[ ${1:-} != --verify-only ]] || exit 0',
@@ -1030,40 +2554,75 @@ def expected_phase9_rows(rows: Iterable[Mapping[str, str]]) -> dict[tuple[int, i
 
 def audit_phase9_rows(manifest: Manifest) -> None:
     rows = expected_phase9_rows(manifest.rows)
-    fixed = {
-        "method": METHOD,
-        "input_kind": "dag_pb",
-        "binary_role": "working_chart",
-        "worker_option": "chart_spr_workers",
-        "expected_worker_policy": "explicit",
-        "expected_outcome": "ok",
-        "expected_timeout_trials": "0",
-        "iterations": str(ITERATIONS),
-        "chart_max_candidates": str(MAX_CANDIDATES),
-        "chart_top_k_exact": str(TOP_K_EXACT),
-        "acceptance": "exact_multisite",
-        "objective": "grammar_exact",
-        "candidate_selection": "lower_bound_top_k",
-        "candidate_source": "grammar",
-        "local_accept_updates": "true",
-        "memory_budget_bytes": str(MEMORY_BUDGET_BYTES),
-    }
+    wanted_order = [
+        row_id(seed, workers) for seed in SEEDS for workers in WORKERS
+    ]
+    observed_order = [row["row_id"] for row in manifest.rows]
+    if observed_order != wanted_order:
+        fail("supplement rows are not in canonical seed/worker order")
     primary_hashes: set[str] = set()
     affinities: set[str] = set()
     for (seed, workers), row in rows.items():
-        if row["row_id"] != row_id(seed, workers):
-            fail(f"supplement row ID is not canonical: {row['row_id']}")
-        if row["workload_name"] != workload_name(seed):
-            fail(f"supplement workload name breaks seed/worker pairing: {row['row_id']}")
-        for key, wanted in fixed.items():
+        validate_affinity(row["affinity_cpus"], f"supplement row {row['row_id']}")
+        contract = phase9_contract_row(
+            seed,
+            workers,
+            row["primary_sha256"],
+            row["primary_uri"],
+            row["affinity_cpus"],
+        )
+        for key, wanted in contract.items():
+            if wanted == "-":
+                continue
             if row[key] != wanted:
                 fail(f"supplement row {row['row_id']} {key}={row[key]!r}, expected {wanted!r}")
-        if row["expected_resolved_workers"] != str(workers):
-            fail(f"supplement row worker resolution mismatch: {row['row_id']}")
+        unsigned_expected = (
+            "expected_active_patterns",
+            "expected_initial_clades",
+            "expected_initial_productions",
+            "expected_candidates_generated",
+            "expected_candidates_scored",
+            "expected_exact_verifications",
+            "expected_iterations",
+            "expected_accepted_moves",
+            "expected_initial_score",
+            "expected_final_score",
+            "expected_validated_parsimony",
+        )
+        if any(not row[field].isdigit() for field in unsigned_expected):
+            fail(f"supplement row has non-unsigned expected evidence: {row['row_id']}")
         if int(row["expected_active_patterns"]) < MIN_ACTIVE_PATTERNS:
             fail(f"supplement row lacks active-pattern evidence: {row['row_id']}")
-        if int(row["expected_accepted_moves"]) < MIN_ACCEPTED_MOVES:
-            fail(f"supplement row lacks three accepted moves: {row['row_id']}")
+        exact_counts: Mapping[str, int] = {
+            "expected_candidates_generated": EXPECTED_CANDIDATES,
+            "expected_candidates_scored": EXPECTED_CANDIDATES,
+            "expected_exact_verifications": EXPECTED_EXACT,
+            "expected_iterations": ITERATIONS,
+            "expected_accepted_moves": MIN_ACCEPTED_MOVES,
+        }
+        for field, exact_wanted in exact_counts.items():
+            if row[field] != str(exact_wanted):
+                fail(
+                    f"supplement row {row['row_id']} {field}={row[field]}, "
+                    f"expected exactly {exact_wanted}"
+                )
+        if int(row["expected_validated_parsimony"]) >= int(
+            row["expected_initial_score"]
+        ):
+            fail(
+                "supplement external canonical score did not strictly improve: "
+                f"{row['row_id']}"
+            )
+        for field in (
+            "primary_sha256",
+            "oracle_search_semantic_sha256",
+            "oracle_output_semantic_sha256",
+            "oracle_trial_semantic_sha256",
+            "canonical_sidecar_sha256",
+            "oracle_report_sha256",
+            "canonical_argv_sha256",
+        ):
+            validate_hash(row[field], f"supplement row {row['row_id']} {field}")
         argv_sha = canonical_argv_digest(canonical_argv(row))
         if row["canonical_argv_sha256"] != argv_sha:
             fail(f"supplement row canonical argv hash mismatch: {row['row_id']}")
@@ -1097,63 +2656,439 @@ def audit_phase9_rows(manifest: Manifest) -> None:
                 fail(f"supplement seed {seed} workers disagree on {field}")
 
 
-def audit_supplement_asset_ledger(manifest: Manifest, root: Path) -> None:
-    commands = resolve_manifest_uri(
-        manifest.path, manifest.preamble["commands_uri"], root
+def command_declaration(commands: Path, name: str, pattern: re.Pattern[str]) -> str:
+    prefix = f"readonly {name}="
+    try:
+        lines = commands.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        fail(f"Phase-9 commands asset is not UTF-8: {error}")
+    values = [line.removeprefix(prefix) for line in lines if line.startswith(prefix)]
+    if len(values) != 1 or pattern.fullmatch(values[0]) is None:
+        fail(f"Phase-9 commands asset lacks one canonical {name} declaration")
+    return values[0]
+
+
+def audit_exact_asset_tree(root: Path, expected_files: set[str]) -> None:
+    """Reject unledgered files/directories, aliases, and external hard links."""
+
+    root = require_lexical_directory(root, "Phase-9 supplement asset directory")
+    observed_files: set[str] = set()
+    observed_directories: set[str] = set()
+    for directory_text, directory_names, file_names in os.walk(
+        root, followlinks=False
+    ):
+        directory = Path(directory_text)
+        for name in directory_names:
+            path = directory / name
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                fail(f"Phase-9 asset tree has a non-directory alias: {path}")
+            relative = path.relative_to(root).as_posix()
+            if LEDGER_RELATIVE.fullmatch(relative) is None:
+                fail(f"Phase-9 asset directory path is not canonical: {relative}")
+            observed_directories.add(relative)
+        for name in file_names:
+            path = directory / name
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                fail(f"Phase-9 asset tree has a non-regular alias: {path}")
+            if info.st_nlink != 1:
+                fail(f"Phase-9 asset tree member is externally hard-linked: {path}")
+            relative = path.relative_to(root).as_posix()
+            if LEDGER_RELATIVE.fullmatch(relative) is None:
+                fail(f"Phase-9 asset file path is not canonical: {relative}")
+            observed_files.add(relative)
+
+    expected_directories: set[str] = set()
+    for relative in expected_files:
+        parent = Path(relative).parent
+        while parent != Path("."):
+            expected_directories.add(parent.as_posix())
+            parent = parent.parent
+    if observed_files != expected_files or observed_directories != expected_directories:
+        fail(
+            "Phase-9 asset directory is not the exact sealed closure: "
+            f"missing_files={sorted(expected_files - observed_files)}, "
+            f"extra_files={sorted(observed_files - expected_files)}, "
+            f"missing_directories={sorted(expected_directories - observed_directories)}, "
+            f"extra_directories={sorted(observed_directories - expected_directories)}"
+        )
+
+
+def audit_capture_contract(
+    contract_path: Path,
+    base: Manifest,
+    characterization: Characterization,
+    fixture_sha256: str,
+) -> tuple[Characterization, InputEvidence, str]:
+    verify_detached_seal(contract_path)
+    contract = read_json_object(contract_path, "Phase-9 capture contract")
+    expected_keys = {
+        "schema",
+        "schema_version",
+        "parent_sha256",
+        "source_characterization_basename",
+        "source_characterization_sha256",
+        "source_characterization_seal_sha256",
+        "source_input_canonical_sha256",
+        "source_input_semantic_sha256",
+        "source_input_parsimony_min",
+        "fixture_sha256",
+        "frozen_oracle_sha256",
+        "process_metrics_sha256",
+        "timeout_seconds",
+        "rss_limit_bytes",
+        "affinity_cpus",
+        "rows",
+    }
+    if set(contract) != expected_keys:
+        fail("Phase-9 capture contract schema keys changed")
+    if (
+        contract["schema"] != CAPTURE_SCHEMA
+        or contract["schema_version"] != CAPTURE_SCHEMA_VERSION
+        or contract["parent_sha256"] != base.sha256
+        or contract["source_characterization_basename"]
+        != characterization.path.name
+        or contract["fixture_sha256"] != fixture_sha256
+        or contract["frozen_oracle_sha256"]
+        != base.preamble["frozen_oracle_dagutil_sha256"]
+        or contract["timeout_seconds"] != TIMEOUT_SECONDS
+        or contract["rss_limit_bytes"] != RSS_LIMIT_BYTES
+        or contract["affinity_cpus"]
+        != characterization.preamble["affinity_cpus"]
+    ):
+        fail("Phase-9 capture contract disagrees with its audited archive")
+    for field in (
+        "source_characterization_sha256",
+        "source_characterization_seal_sha256",
+        "source_input_canonical_sha256",
+        "source_input_semantic_sha256",
+        "process_metrics_sha256",
+    ):
+        if not isinstance(contract[field], str):
+            fail(f"Phase-9 capture contract {field} is not a string")
+        validate_hash(str(contract[field]), f"Phase-9 capture contract {field}")
+    source_basename = str(contract["source_characterization_basename"])
+    source_path = resolve_lexical_regular(
+        contract_path.parent,
+        Path("source") / source_basename,
+        "archived source characterization",
     )
-    lines = commands.read_text(encoding="utf-8").splitlines()
-    prefix = "readonly expected_ledger_sha256="
-    declarations = [line.removeprefix(prefix) for line in lines if line.startswith(prefix)]
-    if len(declarations) != 1 or HEX64.fullmatch(declarations[0]) is None:
-        fail("Phase-9 commands asset lacks one canonical asset-ledger hash")
-    ledger = commands.parent / "assets.sha256"
-    require_regular(ledger, "Phase-9 asset ledger")
-    if sha256_file(ledger) != declarations[0]:
+    source_digest = verify_detached_seal(source_path)
+    source_seal = source_path.with_name(source_path.name + ".sha256")
+    if (
+        source_digest != contract["source_characterization_sha256"]
+        or sha256_file(source_seal)
+        != contract["source_characterization_seal_sha256"]
+    ):
+        fail("archived source characterization differs from the capture contract")
+    source_characterization = read_characterization(source_path)
+    source_input = exact_input_evidence(source_characterization)
+    if (
+        source_input.canonical_sha256 != contract["source_input_canonical_sha256"]
+        or source_input.semantic_sha256
+        != contract["source_input_semantic_sha256"]
+        or type(contract["source_input_parsimony_min"]) is not int
+        or source_input.parsimony_min != contract["source_input_parsimony_min"]
+    ):
+        fail("archived source input canonical differs from the capture contract")
+    source_preamble = source_characterization.preamble
+    if (
+        source_preamble["schema"] != CHAR_SCHEMA
+        or source_preamble["schema_version"] != CHAR_SCHEMA_VERSION
+        or source_preamble["parent_sha256"] != base.sha256
+        or source_preamble["primary_sha256"] != fixture_sha256
+        or source_preamble["frozen_oracle_sha256"]
+        != base.preamble["frozen_oracle_dagutil_sha256"]
+        or source_preamble["affinity_cpus"]
+        != characterization.preamble["affinity_cpus"]
+    ):
+        fail("archived source characterization contract/preamble changed")
+    expected_rows = []
+    for seed in SEEDS:
+        for workers in WORKERS:
+            row = phase9_contract_row(
+                seed,
+                workers,
+                fixture_sha256,
+                "manifest://fixture.pb.gz",
+                characterization.preamble["affinity_cpus"],
+            )
+            expected_rows.append(
+                {
+                    "row_id": row_id(seed, workers),
+                    "canonical_argv_sha256": canonical_argv_digest(canonical_argv(row)),
+                }
+            )
+    if contract["rows"] != expected_rows:
+        fail("Phase-9 capture contract row/argv matrix changed")
+    return source_characterization, source_input, str(
+        contract["process_metrics_sha256"]
+    )
+
+
+def audit_supplement_asset_ledger(
+    base: Manifest, manifest: Manifest, root: Path
+) -> tuple[Characterization, InputEvidence, dict[tuple[int, int], Evidence], str]:
+    commands = resolve_manifest_uri(manifest.path, manifest.preamble["commands_uri"], root)
+    require_regular(commands, "Phase-9 commands asset", executable=True)
+    ledger_sha = command_declaration(commands, "expected_ledger_sha256", HEX64)
+    oracle_sha = command_declaration(commands, "expected_oracle_sha256", HEX64)
+    if oracle_sha != base.preamble["frozen_oracle_dagutil_sha256"]:
+        fail("Phase-9 commands asset changes the base frozen-oracle hash")
+    archived_relative = command_declaration(
+        commands, "archived_characterization", LEDGER_RELATIVE
+    )
+    if Path(archived_relative).parent != Path("archive"):
+        fail("Phase-9 archived characterization must be archive/<original-basename>")
+    ledger = resolve_lexical_regular(
+        commands.parent, Path("assets.sha256"), "Phase-9 asset ledger"
+    )
+    if sha256_file(ledger) != ledger_sha:
         fail("Phase-9 asset ledger differs from the commands-bound hash")
-    seen: set[str] = set()
-    pattern = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)")
-    for line_number, line in enumerate(ledger.read_text(encoding="ascii").splitlines(), 1):
+
+    seen: dict[str, str] = {}
+    pattern = re.compile(
+        r"([0-9a-f]{64})  ([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)"
+    )
+    try:
+        ledger_lines = ledger.read_text(encoding="ascii").splitlines()
+    except UnicodeDecodeError as error:
+        fail(f"Phase-9 asset ledger is not ASCII: {error}")
+    for line_number, line in enumerate(ledger_lines, 1):
         match = pattern.fullmatch(line)
         if match is None:
             fail(f"Phase-9 asset ledger line {line_number} is not canonical")
         digest, relative_text = match.groups()
         if relative_text in seen or relative_text in ("assets.sha256", "commands.sh"):
             fail(f"Phase-9 asset ledger has a duplicate/circular member: {relative_text}")
-        seen.add(relative_text)
-        relative = Path(relative_text)
-        try:
-            member = (commands.parent / relative).resolve(strict=True)
-            member.relative_to(commands.parent.resolve(strict=True))
-        except (FileNotFoundError, ValueError):
-            fail(f"Phase-9 asset ledger member is missing or escapes: {relative_text}")
-        require_regular(member, f"Phase-9 asset ledger member {relative_text}")
+        member = resolve_lexical_regular(
+            commands.parent,
+            Path(relative_text),
+            f"Phase-9 asset ledger member {relative_text}",
+        )
         if sha256_file(member) != digest:
             fail(f"Phase-9 asset ledger member hash mismatch: {relative_text}")
-    required = {"fixture.pb.gz", "characterization.tsv", "characterization.tsv.sha256"}
+        seen[relative_text] = digest
+    expected_ledger = b"".join(
+        f"{seen[name]}  {name}\n".encode("ascii") for name in sorted(seen)
+    )
+    if ledger.read_bytes() != expected_ledger:
+        fail("Phase-9 asset ledger is not the canonical sorted byte stream")
+
+    characterization_path = resolve_lexical_regular(
+        commands.parent,
+        Path(archived_relative),
+        "supplement-owned archived characterization",
+    )
+    characterization = read_characterization(characterization_path)
+    if characterization.preamble["parent_sha256"] != base.sha256:
+        fail("archived characterization parent differs from the sealed base")
+    if (
+        characterization.preamble["frozen_oracle_sha256"]
+        != base.preamble["frozen_oracle_dagutil_sha256"]
+    ):
+        fail("archived characterization oracle differs from the sealed base")
+
+    fixture = resolve_lexical_regular(
+        commands.parent, Path("fixture.pb.gz"), "archived Phase-9 fixture"
+    )
+    fixture_sha256 = sha256_file(fixture)
+    if characterization.preamble["primary_sha256"] != fixture_sha256:
+        fail("archived characterization fixture hash differs from archived fixture")
+
+    input_evidence = exact_input_evidence(characterization)
+    evidence: dict[tuple[int, int], Evidence] = {}
     for seed in SEEDS:
         for workers in WORKERS:
-            stem = row_id(seed, workers)
-            required.update(
-                {
-                    f"evidence/{stem}.report.txt",
-                    f"evidence/{stem}.canonical.ndjson",
-                    f"evidence/{stem}.canonical.json",
-                    f"evidence/{stem}.output-canonical.json",
-                }
+            key = (seed, workers)
+            evidence[key] = exact_evidence(
+                characterization, characterization.rows[key], input_evidence
             )
-    if seen != required:
-        fail(
-            "Phase-9 asset ledger is not the exact evidence closure: "
-            f"missing={sorted(required - seen)}, unexpected={sorted(seen - required)}"
+    validate_worker_independent_evidence(list(evidence.values()))
+
+    archive_prefix = Path(archived_relative).parent
+    contract_path = resolve_lexical_regular(
+        commands.parent,
+        Path("provenance/capture-contract.json"),
+        "archived Phase-9 capture contract",
+    )
+    (
+        source_characterization,
+        source_input,
+        process_metrics_sha256,
+    ) = audit_capture_contract(contract_path, base, characterization, fixture_sha256)
+    require_matching_input_evidence(
+        source_input, input_evidence, "archived Phase-9 input canonical evidence"
+    )
+    source_evidence: dict[tuple[int, int], Evidence] = {}
+    for seed in SEEDS:
+        for workers in WORKERS:
+            key = (seed, workers)
+            source_evidence[key] = exact_evidence(
+                source_characterization,
+                source_characterization.rows[key],
+                source_input,
+            )
+    validate_worker_independent_evidence(list(source_evidence.values()))
+    for key, fresh in evidence.items():
+        require_matching_stable_evidence(
+            source_evidence[key], fresh, f"archived Phase-9 evidence {row_id(*key)}"
         )
 
+    required = {
+        "fixture.pb.gz",
+        archived_relative,
+        archived_relative + ".sha256",
+        "provenance/capture-contract.json",
+        "provenance/capture-contract.json.sha256",
+        f"provenance/source/{characterization.path.name}",
+        f"provenance/source/{characterization.path.name}.sha256",
+        (archive_prefix / characterization.preamble["input_canonical_path"]).as_posix(),
+        (
+            Path("provenance/source")
+            / source_characterization.preamble["input_canonical_path"]
+        ).as_posix(),
+    }
+    required.update(
+        f"provenance/input/{filename}"
+        for filename in (*CAPTURE_INPUT_FILES, "status.json", "status.json.sha256")
+    )
+    path_fields = (
+        "product_report_path",
+        "canonical_sidecar_path",
+        "canonical_result_path",
+        "output_canonical_path",
+    )
+    for key, row in characterization.rows.items():
+        for field in path_fields:
+            required.add((archive_prefix / row[field]).as_posix())
+        stem = row_id(*key)
+        required.update(
+            f"provenance/{stem}/{filename}"
+            for filename in (*CAPTURE_STATUS_FILES, "status.json", "status.json.sha256")
+        )
+    source_prefix = Path("provenance/source")
+    for row in source_characterization.rows.values():
+        for field in path_fields:
+            required.add((source_prefix / row[field]).as_posix())
+    if set(seen) != required:
+        fail(
+            "Phase-9 asset ledger is not the exact archived/provenance closure: "
+            f"missing={sorted(required - set(seen))}, "
+            f"unexpected={sorted(set(seen) - required)}"
+        )
+    audit_exact_asset_tree(
+        commands.parent, required | {"assets.sha256", "commands.sh"}
+    )
 
-def audit_supplement(
+    captured_input = validate_captured_input(
+        base,
+        characterization,
+        source_input,
+        fixture_sha256,
+        process_metrics_sha256,
+        commands.parent / "provenance/input",
+        require_readonly_directory=False,
+    )
+    capture_input_path = commands.parent / "provenance/input/canonical.json"
+    if capture_input_path.read_bytes() != input_evidence.canonical.read_bytes():
+        fail("archived input canonical is not the captured input byte stream")
+    if (capture_input_path.stat().st_dev, capture_input_path.stat().st_ino) == (
+        input_evidence.canonical.stat().st_dev,
+        input_evidence.canonical.stat().st_ino,
+    ):
+        fail("archived input canonical is hard-linked to mutable provenance")
+    require_matching_input_evidence(
+        input_evidence, captured_input, "captured Phase-9 input canonical evidence"
+    )
+
+    capture_names = {
+        "product_report": "report.txt",
+        "canonical_sidecar": "canonical.ndjson",
+        "canonical_result": "canonical.json",
+        "output_canonical": "output-canonical.json",
+    }
+    for (seed, workers), fresh in evidence.items():
+        source = source_evidence[(seed, workers)]
+        provenance = commands.parent / "provenance" / row_id(seed, workers)
+        captured, _ = validate_captured_row(
+            base,
+            characterization,
+            input_evidence,
+            source,
+            fixture_sha256,
+            process_metrics_sha256,
+            provenance,
+            require_readonly_directory=False,
+        )
+        for prefix, filename in capture_names.items():
+            archive_digest = getattr(fresh, f"{prefix}_sha256")
+            archive_path = getattr(fresh, prefix)
+            capture_path = provenance / filename
+            capture_digest = sha256_file(capture_path)
+            if capture_digest != archive_digest:
+                fail(
+                    f"archived evidence is not the captured row byte stream: "
+                    f"{row_id(seed, workers)} {prefix}"
+                )
+            archive_info = archive_path.stat()
+            capture_info = capture_path.stat()
+            if (archive_info.st_dev, archive_info.st_ino) == (
+                capture_info.st_dev,
+                capture_info.st_ino,
+            ):
+                fail(
+                    f"archived evidence is hard-linked to mutable provenance: "
+                    f"{row_id(seed, workers)} {prefix}"
+                )
+        if captured.expected != fresh.expected:
+            raise AssertionError("validate_captured_row failed to reconcile evidence")
+
+    asset_name = commands.parent.name
+    rows = expected_phase9_rows(manifest.rows)
+    ordered_rows = [rows[(seed, workers)] for seed in SEEDS for workers in WORKERS]
+    expected_commands = render_commands(
+        ordered_rows,
+        base.preamble["frozen_oracle_dagutil_sha256"],
+        characterization.preamble["affinity_cpus"],
+        ledger_sha,
+        archived_relative,
+    )
+    if commands.read_bytes() != expected_commands:
+        fail("Phase-9 commands asset differs from the exact rendered byte stream")
+    for key, item in evidence.items():
+        char_row = characterization.rows[key]
+        wanted = make_manifest_row(
+            item,
+            fixture_sha256,
+            f"manifest://{asset_name}/fixture.pb.gz",
+            "manifest://"
+            + (Path(asset_name) / archive_prefix / char_row["canonical_sidecar_path"]).as_posix(),
+            "manifest://"
+            + (Path(asset_name) / archive_prefix / char_row["canonical_result_path"]).as_posix(),
+            characterization.preamble["affinity_cpus"],
+        )
+        if dict(rows[key]) != wanted:
+            differing = sorted(
+                field for field in MANIFEST_HEADER if rows[key][field] != wanted[field]
+            )
+            fail(
+                f"supplement row is not exactly derived from archived evidence: "
+                f"{row_id(*key)} fields={differing}"
+            )
+    return characterization, input_evidence, evidence, process_metrics_sha256
+
+
+def audited_frozen_characterization(
     base_path: Path,
     expected_parent: str,
     supplement_path: Path,
     root: Path,
-) -> None:
+) -> AuditedFrozenCharacterization:
+    """Return frozen evidence only after auditing its sealed, supplement-owned chain."""
+
+    root = repo_root(root)
     validate_hash(expected_parent, "expected parent SHA-256")
     base = read_manifest(base_path, root, expected_kind="base")
     if base.sha256 != expected_parent:
@@ -1181,12 +3116,128 @@ def audit_supplement(
     if overlap:
         fail(f"Phase-9 supplement overrides base row IDs: {sorted(overlap)}")
     audit_phase9_rows(supplement)
-    audit_supplement_asset_ledger(supplement, root)
+    (
+        characterization,
+        input_evidence,
+        evidence,
+        process_metrics_sha256,
+    ) = audit_supplement_asset_ledger(base, supplement, root)
+    return AuditedFrozenCharacterization(
+        base,
+        supplement,
+        characterization,
+        input_evidence,
+        evidence,
+        process_metrics_sha256,
+    )
+
+
+def audit_supplement(
+    base_path: Path,
+    expected_parent: str,
+    supplement_path: Path,
+    root: Path,
+) -> AuditedFrozenCharacterization:
+    """Compatibility name for the public sealed-evidence audit API."""
+
+    return audited_frozen_characterization(
+        base_path, expected_parent, supplement_path, root
+    )
+
+
+HARNESS_SENTINEL_GROUP = "__phase9_sealed_supplement_validation_sentinel__"
+
+
+def validate_with_benchmark_harness(
+    audit: AuditedFrozenCharacterization,
+    harness_path: Path,
+    process_metrics_path: Path,
+    root: Path,
+) -> None:
+    """Make the production harness parse the complete base+supplement chain."""
+
+    harness = require_canonical_regular(
+        harness_path, "benchmark harness", executable=True
+    )
+    expected_harness = require_canonical_regular(
+        TOOLS_DIRECTORY / "wric_spr_search_benchmark.sh",
+        "repository benchmark harness",
+        executable=True,
+    )
+    if harness != expected_harness:
+        fail("--benchmark-harness is not the repository production harness")
+    process_metrics = require_canonical_regular(
+        process_metrics_path, "process-metrics runner", executable=True
+    )
+    if process_metrics.stat().st_nlink != 1:
+        fail("process-metrics runner must not be externally hard-linked")
+    if sha256_file(process_metrics) != audit.process_metrics_sha256:
+        fail("process-metrics runner differs from the capture-contract binary hash")
+    oracle = resolve_manifest_uri(
+        audit.base.path, audit.base.preamble["frozen_oracle_dagutil_uri"], root
+    )
+    frozen_larch2 = resolve_manifest_uri(
+        audit.base.path, audit.base.preamble["frozen_larch2_uri"], root
+    )
+    require_regular(oracle, "base frozen oracle", executable=True)
+    require_regular(frozen_larch2, "base frozen larch2", executable=True)
+    sentinel_output = audit.supplement.path.parent / (
+        "." + audit.supplement.path.name + ".harness-validation"
+    )
+    if os.path.lexists(sentinel_output):
+        fail(f"benchmark-validation sentinel output already exists: {sentinel_output}")
+    environment = {
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "TZ": "Europe/Sofia",
+        "WRIC_REPO_ROOT": os.fspath(root),
+    }
+    result = subprocess.run(
+        [
+            os.fspath(harness),
+            "--dagutil",
+            os.fspath(oracle),
+            "--larch2",
+            os.fspath(frozen_larch2),
+            "--process-metrics",
+            os.fspath(process_metrics),
+            "--out-dir",
+            os.fspath(sentinel_output),
+            "--workload-manifest",
+            os.fspath(audit.base.path),
+            "--supplemental-workload-manifest",
+            os.fspath(audit.supplement.path),
+            "--run-manifest-group",
+            HARNESS_SENTINEL_GROUP,
+        ],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+        cwd=root,
+        timeout=60,
+    )
+    if os.path.lexists(sentinel_output):
+        fail("benchmark harness created output before the validation sentinel")
+    expected = f"error: manifest group has no rows: {HARNESS_SENTINEL_GROUP}"
+    if result.returncode == 0 or expected not in result.stderr.splitlines():
+        detail = result.stderr.strip().splitlines()
+        fail(
+            "benchmark harness did not reach the post-validation sentinel: "
+            + (detail[-1] if detail else f"exit={result.returncode}")
+        )
 
 
 def build(args: argparse.Namespace) -> None:
     root = repo_root(args.repo_root)
     output = args.output.absolute()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output_parent = require_lexical_directory(
+        output.parent, "Phase-9 output parent directory"
+    )
+    output = output_parent / output.name
     assets = output.with_name(output.stem + ".assets")
     seal = output.with_name(output.name + ".sha256")
     for path in (output, assets, seal):
@@ -1200,33 +3251,173 @@ def build(args: argparse.Namespace) -> None:
     if base.preamble["parent_sha256"] != "-":
         fail("base workload manifest must declare parent_sha256=-")
     characterization = read_characterization(args.characterization)
+    if characterization.preamble["parent_sha256"] != base.sha256:
+        fail("characterization parent hash differs from the sealed base")
     if characterization.preamble["frozen_oracle_sha256"] != base.preamble["frozen_oracle_dagutil_sha256"]:
         fail("characterization frozen oracle hash differs from sealed base role")
-    fixture = args.fixture.resolve(strict=True)
-    require_regular(fixture, "Phase-9 fixture")
+    fixture = require_canonical_regular(args.fixture, "Phase-9 fixture")
+    if fixture.stat().st_nlink != 1:
+        fail("Phase-9 fixture must not be externally hard-linked")
     fixture_sha = sha256_file(fixture)
     if fixture_sha != args.expected_fixture_sha256:
         fail(f"Phase-9 fixture hash mismatch: {fixture_sha}")
     if characterization.preamble["primary_sha256"] != fixture_sha:
         fail("characterization primary hash differs from Phase-9 fixture")
-    evidence = [
-        exact_evidence(characterization, characterization.rows[(seed, workers)])
+    source_input = exact_input_evidence(characterization)
+    source_evidence = [
+        exact_evidence(
+            characterization,
+            characterization.rows[(seed, workers)],
+            source_input,
+        )
         for seed in SEEDS
         for workers in WORKERS
     ]
-    validate_worker_independent_evidence(evidence)
+    validate_worker_independent_evidence(source_evidence)
 
-    asset_files: dict[str, bytes] = {"fixture.pb.gz": fixture.read_bytes()}
-    asset_files["characterization.tsv"] = characterization.path.read_bytes()
-    asset_files["characterization.tsv.sha256"] = characterization.path.with_name(
-        characterization.path.name + ".sha256"
-    ).read_bytes()
-    for item in evidence:
-        stem = row_id(item.seed, item.workers)
-        asset_files[f"evidence/{stem}.report.txt"] = item.product_report.read_bytes()
-        asset_files[f"evidence/{stem}.canonical.ndjson"] = item.canonical_sidecar.read_bytes()
-        asset_files[f"evidence/{stem}.canonical.json"] = item.canonical_result.read_bytes()
-        asset_files[f"evidence/{stem}.output-canonical.json"] = item.output_canonical.read_bytes()
+    process_metrics = require_canonical_regular(
+        args.process_metrics, "process-metrics runner", executable=True
+    )
+    if process_metrics.stat().st_nlink != 1:
+        fail("process-metrics runner must not be externally hard-linked")
+    process_metrics_sha256 = sha256_file(process_metrics)
+
+    frozen_larch2 = resolve_manifest_uri(base.path, base.preamble["frozen_larch2_uri"], root)
+    frozen_oracle = resolve_manifest_uri(
+        base.path, base.preamble["frozen_oracle_dagutil_uri"], root
+    )
+    require_regular(frozen_larch2, "base frozen larch2", executable=True)
+    require_regular(frozen_oracle, "base frozen oracle", executable=True)
+
+    capture_absolute = args.capture_dir.absolute()
+    for reserved in (output, assets, seal):
+        if (
+            capture_absolute == reserved
+            or capture_absolute.is_relative_to(reserved)
+            or reserved.is_relative_to(capture_absolute)
+        ):
+            fail("--capture-dir must be disjoint from supplement output/assets/seal")
+    with exclusive_capture_lock(args.capture_dir):
+        input_evidence, evidence, captured_rows, capture = capture_frozen_characterization(
+            args.capture_dir,
+            base,
+            characterization,
+            source_input,
+            source_evidence,
+            fixture,
+            fixture_sha,
+            frozen_oracle,
+            process_metrics,
+            process_metrics_sha256,
+        )
+    captured_by_key = {
+        (int(row["seed"]), int(row["workers"])): row for row in captured_rows
+    }
+
+    archived_name = characterization.path.name
+    archived_relative = f"archive/{archived_name}"
+    if LEDGER_RELATIVE.fullmatch(archived_relative) is None:
+        fail("characterization basename cannot be represented in the sealed asset ledger")
+    archive_rows: list[dict[str, str]] = []
+    for seed in SEEDS:
+        for workers in WORKERS:
+            fresh = dict(captured_by_key[(seed, workers)])
+            source_row = characterization.rows[(seed, workers)]
+            for prefix in (
+                "product_report",
+                "canonical_sidecar",
+                "canonical_result",
+                "output_canonical",
+            ):
+                fresh[f"{prefix}_path"] = source_row[f"{prefix}_path"]
+            archive_rows.append(fresh)
+    archived_preamble = dict(characterization.preamble)
+    archived_preamble["input_canonical_sha256"] = input_evidence.canonical_sha256
+    archived_characterization = characterization_tsv_bytes(
+        archived_preamble, archive_rows
+    )
+
+    asset_files: dict[str, bytes] = {}
+
+    def add_asset(relative: str, data: bytes) -> None:
+        if LEDGER_RELATIVE.fullmatch(relative) is None:
+            fail(f"asset path cannot be represented canonically: {relative!r}")
+        if relative in asset_files:
+            fail(f"archive asset path collision: {relative}")
+        asset_files[relative] = data
+
+    add_asset("fixture.pb.gz", fixture.read_bytes())
+    add_asset(archived_relative, archived_characterization)
+    add_asset(
+        archived_relative + ".sha256",
+        seal_bytes(archived_name, archived_characterization),
+    )
+    add_asset(
+        f"provenance/source/{archived_name}",
+        characterization.path.read_bytes(),
+    )
+    add_asset(
+        f"provenance/source/{archived_name}.sha256",
+        characterization.path.with_name(
+            characterization.path.name + ".sha256"
+        ).read_bytes(),
+    )
+    add_asset(
+        (
+            Path("provenance/source")
+            / characterization.preamble["input_canonical_path"]
+        ).as_posix(),
+        source_input.canonical.read_bytes(),
+    )
+    for item in source_evidence:
+        source_row = characterization.rows[(item.seed, item.workers)]
+        source_members = {
+            source_row["product_report_path"]: item.product_report,
+            source_row["canonical_sidecar_path"]: item.canonical_sidecar,
+            source_row["canonical_result_path"]: item.canonical_result,
+            source_row["output_canonical_path"]: item.output_canonical,
+        }
+        for relative, source_path in source_members.items():
+            add_asset(
+                (Path("provenance/source") / relative).as_posix(),
+                source_path.read_bytes(),
+            )
+    evidence_by_key = {(item.seed, item.workers): item for item in evidence}
+    add_asset(
+        (
+            Path("archive")
+            / characterization.preamble["input_canonical_path"]
+        ).as_posix(),
+        input_evidence.canonical.read_bytes(),
+    )
+    for row in archive_rows:
+        key = (int(row["seed"]), int(row["workers"]))
+        item = evidence_by_key[key]
+        archived_sources = {
+            row["product_report_path"]: item.product_report,
+            row["canonical_sidecar_path"]: item.canonical_sidecar,
+            row["canonical_result_path"]: item.canonical_result,
+            row["output_canonical_path"]: item.output_canonical,
+        }
+        for relative, source_path in archived_sources.items():
+            add_asset((Path("archive") / relative).as_posix(), source_path.read_bytes())
+
+    for filename in ("capture-contract.json", "capture-contract.json.sha256"):
+        add_asset(f"provenance/{filename}", (capture / filename).read_bytes())
+    for filename in (*CAPTURE_INPUT_FILES, "status.json", "status.json.sha256"):
+        add_asset(
+            f"provenance/input/{filename}",
+            (capture / "input" / filename).read_bytes(),
+        )
+    for seed in SEEDS:
+        for workers in WORKERS:
+            stem = row_id(seed, workers)
+            captured = capture / "rows" / stem
+            for filename in (*CAPTURE_STATUS_FILES, "status.json", "status.json.sha256"):
+                add_asset(
+                    f"provenance/{stem}/{filename}",
+                    (captured / filename).read_bytes(),
+                )
     ledger = asset_ledger_bytes(asset_files)
     ledger_sha = sha256_bytes(ledger)
     asset_files["assets.sha256"] = ledger
@@ -1234,14 +3425,28 @@ def build(args: argparse.Namespace) -> None:
     asset_name = assets.name
     rows: list[dict[str, str]] = []
     for item in evidence:
-        stem = row_id(item.seed, item.workers)
+        archived_row = next(
+            row
+            for row in archive_rows
+            if int(row["seed"]) == item.seed and int(row["workers"]) == item.workers
+        )
         rows.append(
             make_manifest_row(
                 item,
                 fixture_sha,
                 f"manifest://{asset_name}/fixture.pb.gz",
-                f"manifest://{asset_name}/evidence/{stem}.canonical.ndjson",
-                f"manifest://{asset_name}/evidence/{stem}.canonical.json",
+                "manifest://"
+                + (
+                    Path(asset_name)
+                    / "archive"
+                    / archived_row["canonical_sidecar_path"]
+                ).as_posix(),
+                "manifest://"
+                + (
+                    Path(asset_name)
+                    / "archive"
+                    / archived_row["canonical_result_path"]
+                ).as_posix(),
                 characterization.preamble["affinity_cpus"],
             )
         )
@@ -1250,11 +3455,9 @@ def build(args: argparse.Namespace) -> None:
         base.preamble["frozen_oracle_dagutil_sha256"],
         characterization.preamble["affinity_cpus"],
         ledger_sha,
+        archived_relative,
     )
     asset_files["commands.sh"] = commands
-
-    frozen_larch2 = resolve_manifest_uri(base.path, base.preamble["frozen_larch2_uri"], root)
-    frozen_oracle = resolve_manifest_uri(base.path, base.preamble["frozen_oracle_dagutil_uri"], root)
     preamble = {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -1287,7 +3490,12 @@ def build(args: argparse.Namespace) -> None:
         published_assets = True
         copy_bytes(output, manifest_data, 0o444)
         copy_bytes(seal, detached_seal_bytes(output), 0o444)
-        audit_supplement(args.base_manifest, args.expected_parent_sha256, output, root)
+        audited = audit_supplement(
+            args.base_manifest, args.expected_parent_sha256, output, root
+        )
+        validate_with_benchmark_harness(
+            audited, args.benchmark_harness, process_metrics, root
+        )
     except BaseException:
         if staging.exists():
             shutil.rmtree(staging)
@@ -1303,8 +3511,11 @@ def build(args: argparse.Namespace) -> None:
 
 def print_characterization_template() -> None:
     print(f"# schema={CHAR_SCHEMA}")
-    print("# schema_version=1")
+    print(f"# schema_version={CHAR_SCHEMA_VERSION}")
+    print("# parent_sha256=<sealed-base-manifest-sha256>")
     print("# primary_sha256=<64-lowercase-hex>")
+    print("# input_canonical_path=<normalized-relative-canonical-dag-json>")
+    print("# input_canonical_sha256=<64-lowercase-hex>")
     print("# frozen_oracle_sha256=<64-lowercase-hex>")
     print("# affinity_cpus=0,2,4,6,8,10,12,14")
     print(f"# timeout_seconds={TIMEOUT_SECONDS}")
@@ -1326,13 +3537,26 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     build_parser.add_argument("--characterization", type=Path, required=True)
     build_parser.add_argument("--fixture", type=Path, required=True)
     build_parser.add_argument("--expected-fixture-sha256", required=True)
+    build_parser.add_argument(
+        "--capture-dir",
+        type=Path,
+        required=True,
+        help=(
+            "persistent restartable directory for the input canonical plus "
+            "12 live frozen-oracle search captures"
+        ),
+    )
     build_parser.add_argument("--output", type=Path, required=True)
     build_parser.add_argument("--repo-root", type=Path)
+    build_parser.add_argument("--benchmark-harness", type=Path, required=True)
+    build_parser.add_argument("--process-metrics", type=Path, required=True)
     audit_parser = subparsers.add_parser("audit", help="audit a sealed Phase-9 supplement")
     audit_parser.add_argument("--base-manifest", type=Path, required=True)
     audit_parser.add_argument("--expected-parent-sha256", required=True)
     audit_parser.add_argument("--supplement", type=Path, required=True)
     audit_parser.add_argument("--repo-root", type=Path)
+    audit_parser.add_argument("--benchmark-harness", type=Path, required=True)
+    audit_parser.add_argument("--process-metrics", type=Path, required=True)
     return parser.parse_args(argv)
 
 
@@ -1344,11 +3568,18 @@ def main(argv: Sequence[str]) -> int:
         elif args.command == "build":
             build(args)
         elif args.command == "audit":
-            audit_supplement(
+            root = repo_root(args.repo_root)
+            audited = audit_supplement(
                 args.base_manifest,
                 args.expected_parent_sha256,
                 args.supplement,
-                repo_root(args.repo_root),
+                root,
+            )
+            validate_with_benchmark_harness(
+                audited,
+                args.benchmark_harness,
+                args.process_metrics,
+                root,
             )
         else:
             raise AssertionError(args.command)
@@ -1359,6 +3590,7 @@ def main(argv: Sequence[str]) -> int:
         OSError,
         UnicodeError,
         ValueError,
+        subprocess.SubprocessError,
     ) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
