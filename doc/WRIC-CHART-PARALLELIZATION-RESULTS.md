@@ -33,7 +33,10 @@ committed. Phase-0 artifacts use the non-overwriting directory
 | 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | code checkpoint `cbf92b6` and evidence checkpoint `1be6ffe`; full RelWithDebInfo and targeted TSan gates pass; sealed scaling/RSS gates pending |
 | 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass post-omission semantics, full CTest, and targeted TSAN; diagnostic exact-phase scaling exceeds 2x; unified frontier/candidate admission and sealed timing/RSS remain pending |
 | 6. Parallelize exact top-K candidates | implementation complete; acceptance pending Phase 0 | code checkpoint `870c298`; in-tree Top-K/worker semantics, stable failures, deterministic scheduling, functional bounded admission, full RelWithDebInfo CTest, and targeted TSan pass; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS remain pending |
-| 7--10 | pending | may follow in plan order under the same acceptance gate |
+| 7. Make lazy charts scalable and adaptive | implementation complete; acceptance pending Phase 0 | packed deterministic grouping, dependency wavefronts, exact transient admission, and frozen `off|on|auto` policy pass through `38e9a28`; sealed timing/RSS and final sanitizer/full-suite gates remain pending |
+| 8. Parallelize and pipeline candidate generation | implementation checkpoint complete; acceptance pending Phase 0 | stable worker/seed/source semantics, finite admission, pipeline failure/drain accounting, full RelWithDebInfo, and targeted TSan pass through `6c8d0c7`; sealed speed/RSS evidence remains pending |
+| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; acceptance pending Phase 0/final gates | persistent pattern-parallel commits, exact frontier reuse, non-vacuous three-accept evidence, durable supplement publication, and abort-evidence hygiene pass through `19e26db`; capture/seal, timing/RSS, full CTest, and final sanitizer gates remain pending |
+| 10. Integrate, tune defaults, and prove parity | implementation in progress | finite temporal-memory reporting and the required hybrid, conservative/local, auto/16-worker, multiparent, and multifurcation semantics are covered through `19e26db`; cleanup, full matrices/sanitizers, sealed automatic-policy/RSS/wall gates, and the conditional default change remain pending |
 
 ## Phase 0 — immutable provenance
 
@@ -1724,6 +1727,127 @@ supplemental manifest has not been created. The quiet-host run must either pass
 the 2.0x gate or trigger another profile-supported optimization cycle; it must
 also establish Phase-7 end-to-end non-regression and paired RSS. This checkpoint
 does not reinterpret the observed miss or substitute it for sealed evidence.
+
+## Phase 9 accepted-state update checkpoint (unsealed)
+
+Phase 9 has a **functionally passing implementation checkpoint; acceptance
+pending Phase 0, supplement sealing, and the final test gates** at `19e26db`
+(`Clear aborted accept transaction evidence`). The immutable measurement
+checkpoint remains `7ca527b8906d018124756182274335cbff936d72`, whose exact
+subject is `Baseline measure`; it is an ancestor of this checkpoint and has
+not been replaced.
+
+Commits `45f2ebc`, `ef8f537`, `253c86d`, and `3eedb07` stage affected inside
+and outside rows by pattern on the one search-lifetime scheduler, admit the
+complete transaction before allocation or submission, use the exhaustively
+checked tight outside dependency set, and move unaffected lazy state instead
+of copying it. Commit publication remains single-writer and occurs only after
+both cache barriers join. Commits `ff70a71` and `e62efb6` reuse a compatible
+accepted exact frontier as the next old state and expose persistent inside-row
+views to local scoring. The report distinguishes attempted selection from a
+committed transaction; `19e26db` makes every accepted-but-uncommitted path
+publish zero recomputed rows and an empty transaction signature while retaining
+the canonical selected-candidate evidence.
+
+The committed nontrivial fixture and reference have these immutable identities:
+
+| Artifact | SHA-256 |
+|---|---|
+| `test/wric_chart_three_accepts.pb.gz` | `1df318b1ab7082acc1d14c00c8e4a3b243e5fa52b2207af854fe345305f740d9` |
+| `test/wric_chart_three_accepts.ref` | `2ecea31dd7eb5ab2a77d35c30ada571514f84e462579c239cc32e639fae0ad05` |
+
+It has 2,592 active patterns and produces three real local commits under the
+frozen seed-1 32-candidate/top-K-4 contract. The current W1 report is
+`build/wric-chart-parallelization/phase9-iteration-evidence/seed1-w1-12g.report.txt`,
+SHA-256
+`110d6e1ef1e529ed8ff3a2b7d650fba53cbbe622050fb370a284e80a6af16da5`.
+Its objective chain is `15384 -> 13608 -> 11898 -> 10314`; accepted inside /
+outside row counts are `12960 / 51840`, `12960 / 51840`, and
+`10368 / 54432`. It reports 248,832 persistent-row-view pattern visits, three
+accepted exact-trim reuses, zero reuse rejections, zero per-accept sidecar
+rebuilds, and three committed transaction signatures. The frozen-oracle and
+current output DAGs are byte-identical, SHA-256
+`4c58feef9e4c3985acb935d29dd2ea6d8167e939caf5db291b9af48debd1b4c6`.
+
+The score domains are intentionally separate. `15384 -> 10314` is the
+active-pattern chart objective without UA-edge scoring. External canonical DAG
+validation includes the UA convention and reports `11538`; the supplemental
+manifest therefore records `expected_initial_score=16648`,
+`expected_final_score=10314`, and `expected_validated_parsimony=11538` rather
+than cross-comparing unlike scores.
+
+The frozen W1 diagnostic report
+`build/wric-chart-parallelization/diagnostics/phase9-2592-frozen/s1-w1.report.txt`
+has SHA-256
+`bb11a83a067faf9cb82737422bbb48ea98e78def6127796660c296e782aadcaa`.
+It measured 179.878 ms of accepted update in 915602.498 ms total, or
+0.019646%. This one row is diagnostic only: the plan requires all twelve
+frozen seed/worker rows before the below-10% speed exemption can be decided.
+No Phase-9 speed or RSS claim is made here.
+
+Commits `2f7f8f8` through `0f7b336` add and harden the supplemental acceptance
+pipeline. It validates every captured report/output/identity hash and score
+domain, uses output-scoped locking, durable parent creation and directory
+syncs, Linux no-replace publication, inode-validated journals, private-bundle
+audit before live publication, and ownership-safe recovery at every injected
+crash boundary. Regression tests cover symlink/hardlink/forged journals,
+foreign-target races, cross-control-path collisions, partial and complete
+invalid journals, and post-rename recovery. The canonical
+`build/wric-chart-parallelization/supplements/phase9-local-commit.tsv` bundle
+has not yet been captured or sealed; tooling success is not represented as a
+sealed supplement.
+
+### Interim functional evidence
+
+At `19e26db`, a coherent RelWithDebInfo rebuild followed by
+
+```text
+ctest --test-dir build --output-on-failure --no-tests=error \
+  -R '^(chart_spr_pipeline_test|chart_spr_search_test|chart_spr_phase10_test)$'
+```
+
+passed 3/3 in 9.37 seconds (`8.69`, `0.22`, and `0.45` seconds). The search
+matrix includes the non-vacuous local tombstone abort, conservative and local
+post-materialization rejection evidence, W1/W8 multiparent transient-oracle
+parity, three committed moves, exact masks, chain identity, and canonical full
+sidecar parity. Earlier at `b648c42`, the targeted ASAN command for the
+canonical CLI/report, bootstrap/acceptance, search, and persistent cache tests
+passed 9/9 in 269.87 seconds without diagnostics. That sanitizer run predates
+the latest report/matrix changes and is interim evidence only; the complete
+ASAN suite and final targeted TSan set must be rerun at the final revision.
+
+Phase 9 remains open for the immutable twelve-row supplement capture/audit/seal,
+the accepted-update exemption or 1.5x speed decision, paired RSS, complete
+RelWithDebInfo CTest, complete ASAN CTest, and targeted TSan.
+
+## Phase 10 integration checkpoint (in progress)
+
+Commit `e3ef48e` exposes the generation-phase, evidence-phase, and retained
+ranked-candidate-exact-evidence byte maxima needed to audit the finite lazy
+iteration envelope over time. The historical frozen counter table changed by
+exactly three additive zero-valued rows and no deletion; a static regression
+test prevents recapturing or otherwise rewriting that baseline. Real finite
+lazy tests require nonzero values, summary/counter equality, the envelope as
+the maximum of mutually exclusive temporal phases, and exact `E` success /
+`E-1` pre-work rejection.
+
+Commit `37b2f18` covers exact hybrid search for seeds `1,7,19` and workers
+`1,2,4,8`, including randomized/reservoir source selection, 12 scored
+candidates, four grammar-exact evidence records, a real `2 -> 1` commit,
+scheduler reconciliation, and W1-identical canonical digest/full sidecar per
+seed. Commit `80210de` adds dynamically resolved explicit-auto equivalence,
+W16-versus-W1 semantics, the three-accept conservative W1/2/4/8 matrix, and
+fixed-topology multifurcation W1/W8 parity with an arity-three witness. Commit
+`19e26db` adds the corresponding abort-transaction hygiene and multiparent
+oracle coverage.
+
+These commits are correctness and observability checkpoints, not Phase-10
+acceptance. The complete mode/worker suite, cleanup review, final normal/ASAN/
+TSan gates, sealed Phase-0 and supplemental manifests, worker-policy selection,
+RSS bounds, primary 32/4 wall parity, W8/W1 2x speedup, unpinned explicit-auto,
+seedtree 128/16 stress, and bounded real-scale confirmations remain pending.
+The product default stays serial until explicit auto passes every prerequisite;
+no default-worker performance claim has been made.
 
 ## Later-phase evidence template
 
