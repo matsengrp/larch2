@@ -15,7 +15,6 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
-#include <future>
 #include <iterator>
 #include <limits>
 #include <map>
