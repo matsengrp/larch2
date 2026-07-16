@@ -759,6 +759,13 @@ add_test(NAME wric_phase78_manifest_bootstrap_test
                  $<TARGET_FILE:wric_process_metrics>
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(wric_phase78_manifest_bootstrap_test PROPERTIES TIMEOUT 120)
+
+add_test(NAME wric_phase7_completion_manifest_bootstrap_test
+         COMMAND bash test/wric_phase7_completion_manifest_bootstrap_test.sh
+                 $<TARGET_FILE:wric_process_metrics>
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(wric_phase7_completion_manifest_bootstrap_test
+                     PROPERTIES TIMEOUT 120)
 endif()
 
 add_test(NAME wric_bnb_trim_benchmark_smoke
