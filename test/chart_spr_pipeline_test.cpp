@@ -140,10 +140,9 @@ void check_scheduler_axis_reconciliation(
   CHECK(active == scheduler.active_worker_high_water);
 }
 
-larch::chart_spr_search_result run_semantic_case(
+larch::chart_spr_search_options semantic_case_options(
     larch::chart_spr_candidate_source source, std::uint32_t seed,
     std::size_t workers) {
-  auto input = make_fixture(true);
   auto options = pipeline_options(workers);
   options.cache.candidate_batch_size = 2;
   options.max_candidates_per_iteration = 12;
@@ -155,6 +154,27 @@ larch::chart_spr_search_result run_semantic_case(
   options.seed = seed;
   options.enumeration.seed = seed;
   options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
+  return options;
+}
+
+larch::chart_spr_search_result run_semantic_case(
+    larch::chart_spr_candidate_source source, std::uint32_t seed,
+    std::size_t workers) {
+  auto input = make_fixture(true);
+  auto options = semantic_case_options(source, seed, workers);
+  return larch::run_chart_spr_search(std::move(input.dag), input.grammar,
+                                     options);
+}
+
+larch::chart_spr_search_result run_exact_hybrid_semantic_case(
+    std::uint32_t seed, std::size_t workers) {
+  auto input = make_fixture(true);
+  auto options = semantic_case_options(
+      larch::chart_spr_candidate_source::hybrid, seed, workers);
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 4;
   return larch::run_chart_spr_search(std::move(input.dag), input.grammar,
                                      options);
 }
@@ -195,6 +215,117 @@ void test_worker_source_seed_semantics() {
         check_scheduler_axis_reconciliation(search.summary.scheduler,
                                             search.summary.scheduler_axes);
       }
+    }
+  }
+  std::println("  PASS");
+}
+
+void test_exact_hybrid_worker_seed_semantics() {
+  std::println("test_exact_hybrid_worker_seed_semantics");
+  constexpr std::array<std::uint32_t, 3> seeds{1, 7, 19};
+  constexpr std::array<std::size_t, 4> workers{1, 2, 4, 8};
+
+  for (auto seed : seeds) {
+    std::optional<std::string> w1_digest;
+    std::optional<std::string> w1_sidecar;
+    for (auto worker_count : workers) {
+      auto search = run_exact_hybrid_semantic_case(seed, worker_count);
+
+      CHECK(search.summary.requested_worker_count == worker_count);
+      CHECK(search.summary.resolved_worker_count == worker_count);
+      CHECK(search.summary.initial_score == 2);
+      CHECK(search.summary.final_score == 1);
+      CHECK(search.summary.accepted_moves == 1);
+      CHECK(search.iterations.size() == 1);
+      auto const& iteration = search.iterations.front();
+      CHECK(iteration.candidates_generated == 12);
+      CHECK(iteration.candidates_scored == 12);
+      CHECK(iteration.locally_ranked_candidates_retained == 4);
+      CHECK(iteration.candidates_exact_verified == 4);
+      CHECK(iteration.accepted.has_value());
+      CHECK(iteration.accepted_move_committed);
+      CHECK(iteration.state_score_before == 2);
+      CHECK(iteration.state_score_after == 1);
+      CHECK(iteration.accepted->exact.has_value());
+      CHECK(iteration.accepted->exact->kind ==
+            larch::chart_spr_score_kind::grammar_exact);
+
+      CHECK(search.canonical_report.has_value());
+      auto const& report = *search.canonical_report;
+      CHECK(report.contract.acceptance == "exact_multisite");
+      CHECK(report.contract.objective == "grammar_exact");
+      CHECK(report.contract.candidate_selection == "lower_bound_top_k");
+      CHECK(report.contract.candidate_source == "hybrid");
+      CHECK(report.contract.max_candidates == 12);
+      CHECK(report.contract.top_k_exact == 4);
+      CHECK(report.contract.sampled_tree_count == 2);
+      CHECK(report.contract.randomize_order);
+      CHECK(report.contract.reservoir_sample);
+      CHECK(report.contract.seed == seed);
+      CHECK(report.iterations.size() == 1);
+      auto const& canonical_iteration = report.iterations.front();
+      CHECK(canonical_iteration.candidates.size() == 12);
+      CHECK(canonical_iteration.exact_verified_stream_indices.size() == 4);
+      CHECK(canonical_iteration.accepted_move_present);
+      CHECK(canonical_iteration.accepted_move_committed);
+      CHECK(canonical_iteration.selected_stream_index.has_value());
+      CHECK(!canonical_iteration.selected_signature.empty());
+
+      std::size_t exact_evidence_records = 0;
+      for (auto stream_index :
+           canonical_iteration.exact_verified_stream_indices) {
+        CHECK(stream_index < canonical_iteration.candidates.size());
+        auto const& candidate =
+            canonical_iteration.candidates[stream_index];
+        CHECK(candidate.valid);
+        CHECK(candidate.invalid_reason.empty());
+        CHECK(candidate.exact.has_value());
+        CHECK(candidate.exact_evidence.has_value());
+        CHECK(candidate.exact->kind == "grammar_exact");
+        CHECK(candidate.exact->exact_multisite);
+        auto const& evidence = *candidate.exact_evidence;
+        CHECK(evidence.evidence_kind ==
+              "grammar_exact_frontier_provenance_companion");
+        CHECK(evidence.keep_production_exact);
+        CHECK(evidence.keep_mask_kind ==
+              "exact_optimal_production_union");
+        CHECK(!evidence.kept_production_keys.empty());
+        CHECK(!evidence.frontier_sizes.empty());
+        CHECK(!evidence.optimal_root_provenance_classes.empty());
+        ++exact_evidence_records;
+      }
+      CHECK(exact_evidence_records == 4);
+      CHECK(report.final_exact.has_value());
+      CHECK(report.final_exact->keep_production_exact);
+
+      CHECK(search.canonical_digest.has_value());
+      CHECK(search.canonical_digest->candidate_count == 12);
+      CHECK(search.canonical_digest->exact_candidate_count == 4);
+      CHECK(!search.canonical_digest->full_sidecar.empty());
+      auto digest = larch::emit_chart_spr_semantic_digest_json(
+          *search.canonical_digest);
+      if (worker_count == 1) {
+        w1_digest = digest;
+        w1_sidecar = search.canonical_digest->full_sidecar;
+        CHECK(search.summary.candidate_pipeline_batches_generated == 0);
+        CHECK(search.summary.candidate_pipeline_batches_scored == 0);
+      } else {
+        CHECK(w1_digest.has_value());
+        CHECK(w1_sidecar.has_value());
+        CHECK(digest == *w1_digest);
+        CHECK(search.canonical_digest->full_sidecar == *w1_sidecar);
+        CHECK(search.summary.candidate_pipeline_batches_generated > 0);
+        CHECK(search.summary.candidate_pipeline_batches_scored > 0);
+        CHECK(search.summary.exact_candidate_parallel_batches > 0);
+        CHECK(search.summary.scheduler_axes.exact_candidates
+                  .parallel_operations > 0);
+        CHECK(search.summary
+                  .candidate_pipeline_scheduler_projection_overlap_batches ==
+              0);
+      }
+      CHECK(search.summary.scheduler.rejected_concurrent_operations == 0);
+      check_scheduler_axis_reconciliation(search.summary.scheduler,
+                                          search.summary.scheduler_axes);
     }
   }
   std::println("  PASS");
@@ -874,6 +1005,7 @@ void test_dense_partial_final_batch_uses_admitted_tile_shape() {
 
 int main() {
   test_worker_source_seed_semantics();
+  test_exact_hybrid_worker_seed_semantics();
   test_full_slot_cancellation_drains_and_recovers();
   test_early_acceptance_discards_speculation();
   test_stale_stamp_never_scores();
