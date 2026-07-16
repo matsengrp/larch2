@@ -3956,7 +3956,8 @@ chart_spr_lazy_commit_stats chart_spr_refresh_lazy_chart_after_local_commit(
     chart_spr_search_state& state, overlay_chain const& chain,
     overlay_materialization_result const& materialized,
     chart_execution_plan const& execution_plan,
-    std::vector<overlay_clade_ref> const& previous_dense_clade_to_ref) {
+    std::vector<overlay_clade_ref> const& previous_dense_clade_to_ref,
+    chart_cache_commit_plan const& cache_commit_plan) {
   if (state.cache_strategy != chart_spr_cache_strategy::lazy_multisite_chart) {
     return {};
   }
@@ -3982,7 +3983,12 @@ chart_spr_lazy_commit_stats chart_spr_refresh_lazy_chart_after_local_commit(
 
   auto inside_multifurcation_before =
       next.multifurcation_productions_scored;
-  auto inside_affected = compute_chain_inside_affected_set(chain);
+  if (cache_commit_plan.base() != &chain.base() ||
+      cache_commit_plan.chain_size() != chain.size()) {
+    throw std::runtime_error(
+        "chart SPR lazy local commit: stale cache transaction plan");
+  }
+  auto const& inside_affected = cache_commit_plan.inside_affected();
   std::set<overlay_clade_ref> previously_reachable_refs(
       previous_dense_clade_to_ref.begin(), previous_dense_clade_to_ref.end());
   std::vector<bool> recompute_inside(materialized.grammar.clades.size(), false);
@@ -4025,7 +4031,7 @@ chart_spr_lazy_commit_stats chart_spr_refresh_lazy_chart_after_local_commit(
 
   auto outside_multifurcation_before =
       next.outside_multifurcation_productions_scored;
-  auto outside_affected = compute_chain_outside_affected_set(chain);
+  auto const& outside_affected = cache_commit_plan.outside_affected();
   for (auto ref : outside_affected) {
     recompute_outside[chart_spr_detail::dense_clade_id(materialized, ref)] =
         true;
@@ -4042,6 +4048,29 @@ chart_spr_lazy_commit_stats chart_spr_refresh_lazy_chart_after_local_commit(
     }
     stats.outside_rows_recomputed +=
         next.outside_rows_by_clade[dense].size();
+  }
+  // The tight outside dependency set correctly omits the root when its
+  // constant outside row/class map did not change.  The cached global optimum
+  // also reads inside[root], however, so refresh that scalar surface after
+  // every inside commit independently of root-outside recomputation.
+  auto const root = execution_plan.root_clade();
+  if (root == no_clade || root >= execution_plan.clades().size()) {
+    throw std::runtime_error(
+        "chart SPR lazy local commit: root clade out of range while "
+        "refreshing global minima");
+  }
+  next.outside_global_min_by_pattern.assign(next.pattern_count, chart_inf);
+  for (std::size_t pattern = 0; pattern < next.pattern_count; ++pattern) {
+    auto const& inside_root = next.inside_row(root, pattern);
+    auto const& outside_root = next.outside_row(root, pattern);
+    chart_cost best = chart_inf;
+    for (std::uint8_t state_index = 0; state_index < nuc_state_count;
+         ++state_index) {
+      best = std::min(best, parsimony_chart_detail::saturated_add(
+                                inside_root[state_index],
+                                outside_root[state_index]));
+    }
+    next.outside_global_min_by_pattern[pattern] = best;
   }
   stats.multifurcation_productions_scored +=
       next.outside_multifurcation_productions_scored -
@@ -4413,7 +4442,7 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     // cache commit as two pattern barriers.  Workers stage only affected rows;
     // neither cache surface nor epoch is published until both joins succeed.
     auto cache_commit_plan = build_chart_cache_commit_plan(
-        *sub.chain, outside_affected_policy::conservative_superset);
+        *sub.chain, outside_affected_policy::three_term_tight);
     chart_cache_commit_run_summary cache_commit_run;
     apply_commit_to_chart_caches(
         *sub.chain, cache_commit_plan, *sub.icache, *sub.ocache, scheduler,
@@ -4453,7 +4482,7 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
         state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart;
     auto lazy_stats = chart_spr_refresh_lazy_chart_after_local_commit(
         state, *sub.chain, materialized, next_execution_plan,
-        previous_dense_clade_to_chain_ref);
+        previous_dense_clade_to_chain_ref, cache_commit_plan);
     if (refreshed_lazy_plan) {
       ++counters.chart_execution_plan_cache_hits;
     }
@@ -7942,8 +7971,11 @@ void refresh_chart_spr_lazy_chart_after_local_commit_for_tests(
     overlay_materialization_result const& materialized,
     chart_execution_plan const& execution_plan,
     std::vector<overlay_clade_ref> const& previous_dense_clade_to_ref) {
+  auto cache_commit_plan = build_chart_cache_commit_plan(
+      chain, outside_affected_policy::three_term_tight);
   (void)chart_spr_refresh_lazy_chart_after_local_commit(
-      state, chain, materialized, execution_plan, previous_dense_clade_to_ref);
+      state, chain, materialized, execution_plan, previous_dense_clade_to_ref,
+      cache_commit_plan);
 }
 
 chart_spr_fixed_topology_pattern_scores

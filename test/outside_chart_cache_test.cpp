@@ -600,12 +600,72 @@ static void append_delta_and_check(active_fixture const& f,
                                               context + " committed");
 }
 
+static void assert_tight_policy_matches_all_reachable(
+    active_fixture const& f, larch::spr_overlay_delta const& delta,
+    std::string const& context) {
+  larch::overlay_chain chain(f.grammar);
+  chain.append(delta);
+  auto cold_inside = larch::build_inside_chart_cache(
+      f.grammar, f.active, f.options, f.invariant_offset);
+  auto cold_outside =
+      larch::build_outside_chart_cache(f.grammar, f.active, f.options);
+
+  auto all_inside = cold_inside;
+  auto all_outside = cold_outside;
+  larch::apply_commit_to_inside_cache(chain, all_inside);
+  larch::apply_commit_to_outside_cache(
+      chain, all_outside, all_inside,
+      larch::outside_affected_policy::conservative_superset);
+
+  auto tight_inside = cold_inside;
+  auto tight_outside = cold_outside;
+  larch::apply_commit_to_inside_cache(chain, tight_inside);
+  larch::apply_commit_to_outside_cache(
+      chain, tight_outside, tight_inside,
+      larch::outside_affected_policy::three_term_tight);
+
+  if (tight_inside.base_rows != all_inside.base_rows ||
+      tight_inside.temp_rows != all_inside.temp_rows ||
+      tight_outside.base_rows != all_outside.base_rows ||
+      tight_outside.temp_rows != all_outside.temp_rows) {
+    throw std::runtime_error(
+        "outside cache tight-policy differential mismatch: " + context);
+  }
+
+  auto tight = larch::compute_chain_outside_affected_set(
+      chain, larch::outside_affected_policy::three_term_tight);
+  std::set<larch::overlay_clade_ref> tight_set(tight.begin(), tight.end());
+  for (std::size_t pattern = 0; pattern < cold_outside.patterns.size();
+       ++pattern) {
+    for (larch::clade_id cid = 0;
+         cid < all_outside.base_rows[pattern].size(); ++cid) {
+      if (cold_outside.base_rows[pattern][cid] !=
+          all_outside.base_rows[pattern][cid]) {
+        CHECK(tight_set.count(larch::base_clade_ref(cid)) == 1);
+      }
+    }
+    for (larch::clade_id tid = 0;
+         tid < all_outside.temp_rows[pattern].size(); ++tid) {
+      auto const changed =
+          tid >= cold_outside.temp_rows[pattern].size() ||
+          cold_outside.temp_rows[pattern][tid] !=
+              all_outside.temp_rows[pattern][tid];
+      if (changed) {
+        CHECK(tight_set.count(larch::temp_clade_ref(tid)) == 1);
+      }
+    }
+  }
+  CHECK(tight_outside.outside_rows_recomputed_on_commit ==
+        tight.size() * tight_outside.patterns.size());
+}
+
 static void assert_candidate_local_and_cache_commit(
     active_fixture const& f, larch::grammar_spr_candidate const& candidate,
     std::string const& context) {
   auto delta = assert_local_overlay_delta_matches_materialized(f, candidate,
                                                               context);
   append_delta_and_check(f, delta, context);
+  assert_tight_policy_matches_all_reachable(f, delta, context);
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,6 +1604,61 @@ static void test_three_term_tight_adopted() {
       tight.size(), superset.size(), chain.size());
 }
 
+static void test_three_term_tight_exhaustive_binary_and_multiparent() {
+  std::println(
+      "test_three_term_tight_exhaustive_binary_and_multiparent");
+
+  auto grammar_has_shared_child = [](larch::clade_grammar const& grammar) {
+    std::vector<std::set<larch::clade_id>> parents_by_child(
+        grammar.clades.size());
+    for (auto const& production : grammar.productions) {
+      for (auto child : production.children) {
+        parents_by_child.at(child).insert(production.parent);
+      }
+    }
+    return std::any_of(parents_by_child.begin(), parents_by_child.end(),
+                       [](auto const& parents) { return parents.size() > 1; });
+  };
+
+  std::size_t total_appendable = 0;
+  for (auto f : {load_binary_four_fixture(), load_rich_six_taxon_fixture()}) {
+    auto const shared_child = grammar_has_shared_child(f.grammar);
+    if (f.name == "wric_binary_four") {
+      CHECK(!shared_child);
+    } else {
+      CHECK(shared_child);
+    }
+    std::size_t appendable = 0;
+    auto candidates = larch::enumerate_grammar_spr_candidates(f.grammar);
+    for (std::size_t ordinal = 0; ordinal < candidates.size(); ++ordinal) {
+      larch::spr_overlay_delta delta;
+      try {
+        delta = larch::build_spr_overlay_delta(f.grammar,
+                                               candidates[ordinal]);
+      } catch (std::runtime_error const&) {
+        continue;
+      }
+      larch::overlay_chain probe(f.grammar);
+      try {
+        probe.append(delta);
+      } catch (std::runtime_error const& error) {
+        if (!is_expected_overlay_chain_rejection(error.what())) throw;
+        continue;
+      }
+      assert_tight_policy_matches_all_reachable(
+          f, delta, f.name + " candidate " + std::to_string(ordinal));
+      ++appendable;
+    }
+    CHECK(appendable > 0);
+    total_appendable += appendable;
+    std::println("  {}: {}/{} appendable candidates checked{}", f.name,
+                 appendable, candidates.size(),
+                 shared_child ? " (shared-child/multiparent grammar)" : "");
+  }
+  CHECK(total_appendable > 0);
+  std::println("  PASS ({} appendable candidates)", total_appendable);
+}
+
 // Phase 9 paired-transaction regression.  The immutable plan must reproduce
 // the legacy serial inside-then-outside result, use real pattern parallelism,
 // and leave both cache surfaces/counters/epochs unpublished when the outside
@@ -1593,19 +1708,23 @@ static void test_paired_transaction_plan_parallel_and_failure_atomic() {
   };
 
   auto plan = larch::build_chart_cache_commit_plan(
-      chain, larch::outside_affected_policy::conservative_superset);
+      chain, larch::outside_affected_policy::three_term_tight);
   CHECK(plan.chain_size() == chain.size());
   CHECK(plan.base() == &chain.base());
   CHECK(plan.inside_affected() ==
         larch::compute_chain_inside_affected_set(chain));
   CHECK(plan.outside_affected() == larch::compute_chain_outside_affected_set(
-                                       chain));
+                                       chain,
+                                       larch::outside_affected_policy::
+                                           three_term_tight));
 
   auto [parallel_inside, parallel_outside] = make_caches();
   auto serial_inside = parallel_inside;
   auto serial_outside = parallel_outside;
   larch::apply_commit_to_inside_cache(chain, serial_inside);
-  larch::apply_commit_to_outside_cache(chain, serial_outside, serial_inside);
+  larch::apply_commit_to_outside_cache(
+      chain, serial_outside, serial_inside,
+      larch::outside_affected_policy::three_term_tight);
 
   larch::chart_scheduler scheduler{larch::chart_scheduler_options{
       .requested_workers = 4,
@@ -2036,6 +2155,7 @@ int main() {
   test_sequential_chain_on_seedtree();
   test_term1_alone_is_unsound();
   test_three_term_tight_adopted();
+  test_three_term_tight_exhaustive_binary_and_multiparent();
   test_paired_transaction_plan_parallel_and_failure_atomic();
   test_seedtree_perf_or_vacuous();
   test_score_ua_edge_root_scoring_regression();
