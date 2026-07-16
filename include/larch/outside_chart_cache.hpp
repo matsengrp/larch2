@@ -62,6 +62,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -301,6 +304,238 @@ inline std::vector<overlay_clade_ref> collect_refs_decreasing_size(
 
 }  // namespace outside_chart_cache_detail
 
+// Immutable accepted-append cache transaction plan.  One merged-tip index is
+// shared by the inside and outside dependency closures and by every pattern
+// worker.  Position tables give staged recurrence readers O(1) access to an
+// earlier affected row without copying any unaffected cache row.
+class chart_cache_commit_plan {
+ public:
+  static constexpr std::size_t no_position =
+      std::numeric_limits<std::size_t>::max();
+
+  [[nodiscard]] outside_chart_cache_detail::chain_tip_index const& tip_index()
+      const noexcept {
+    return tip_index_;
+  }
+  [[nodiscard]] std::vector<overlay_clade_ref> const& inside_affected() const
+      noexcept {
+    return inside_affected_;
+  }
+  [[nodiscard]] std::vector<overlay_clade_ref> const& outside_affected() const
+      noexcept {
+    return outside_affected_;
+  }
+  [[nodiscard]] std::size_t chain_size() const noexcept { return chain_size_; }
+  [[nodiscard]] clade_grammar const* base() const noexcept { return base_; }
+  [[nodiscard]] std::uint64_t base_execution_generation() const noexcept {
+    return base_execution_generation_;
+  }
+  [[nodiscard]] outside_affected_policy policy() const noexcept {
+    return policy_;
+  }
+  [[nodiscard]] std::size_t inside_multifurcation_per_pattern() const noexcept {
+    return inside_multifurcation_per_pattern_;
+  }
+  [[nodiscard]] std::size_t outside_multifurcation_per_pattern() const
+      noexcept {
+    return outside_multifurcation_per_pattern_;
+  }
+
+  [[nodiscard]] std::size_t inside_position(overlay_clade_ref ref) const {
+    return position(ref, inside_base_position_, inside_temp_position_,
+                    "inside");
+  }
+  [[nodiscard]] std::size_t outside_position(overlay_clade_ref ref) const {
+    return position(ref, outside_base_position_, outside_temp_position_,
+                    "outside");
+  }
+
+ private:
+  friend chart_cache_commit_plan build_chart_cache_commit_plan(
+      overlay_chain const&, outside_affected_policy);
+
+  chart_cache_commit_plan(
+      outside_chart_cache_detail::chain_tip_index tip_index,
+      std::vector<overlay_clade_ref> inside_affected,
+      std::vector<overlay_clade_ref> outside_affected,
+      std::vector<std::size_t> inside_base_position,
+      std::vector<std::size_t> inside_temp_position,
+      std::vector<std::size_t> outside_base_position,
+      std::vector<std::size_t> outside_temp_position,
+      std::size_t chain_size, clade_grammar const* base,
+      std::uint64_t base_execution_generation,
+      outside_affected_policy policy,
+      std::size_t inside_multifurcation_per_pattern,
+      std::size_t outside_multifurcation_per_pattern)
+      : tip_index_(std::move(tip_index)),
+        inside_affected_(std::move(inside_affected)),
+        outside_affected_(std::move(outside_affected)),
+        inside_base_position_(std::move(inside_base_position)),
+        inside_temp_position_(std::move(inside_temp_position)),
+        outside_base_position_(std::move(outside_base_position)),
+        outside_temp_position_(std::move(outside_temp_position)),
+        chain_size_(chain_size),
+        base_(base),
+        base_execution_generation_(base_execution_generation),
+        policy_(policy),
+        inside_multifurcation_per_pattern_(
+            inside_multifurcation_per_pattern),
+        outside_multifurcation_per_pattern_(
+            outside_multifurcation_per_pattern) {}
+
+  [[nodiscard]] static std::size_t position(
+      overlay_clade_ref ref, std::vector<std::size_t> const& base_positions,
+      std::vector<std::size_t> const& temp_positions,
+      char const* direction) {
+    auto const& positions = ref.space == overlay_id_space::base
+                                ? base_positions
+                                : temp_positions;
+    if (ref.id == no_clade || ref.id >= positions.size()) {
+      throw std::runtime_error(std::string{"cache commit plan: "} +
+                               direction + " clade ref out of range");
+    }
+    return positions[ref.id];
+  }
+
+  outside_chart_cache_detail::chain_tip_index tip_index_;
+  std::vector<overlay_clade_ref> inside_affected_;
+  std::vector<overlay_clade_ref> outside_affected_;
+  std::vector<std::size_t> inside_base_position_;
+  std::vector<std::size_t> inside_temp_position_;
+  std::vector<std::size_t> outside_base_position_;
+  std::vector<std::size_t> outside_temp_position_;
+  std::size_t chain_size_ = 0;
+  clade_grammar const* base_ = nullptr;
+  std::uint64_t base_execution_generation_ = 0;
+  outside_affected_policy policy_ =
+      outside_affected_policy::conservative_superset;
+  std::size_t inside_multifurcation_per_pattern_ = 0;
+  std::size_t outside_multifurcation_per_pattern_ = 0;
+};
+
+namespace outside_chart_cache_detail {
+
+// Defined with the affected-set algorithms below.  The immutable transaction
+// plan is declared earlier so cache-update consumers can use it alongside the
+// cache types without rebuilding the merged-tip index.
+inline descendant_closure_result reachable_superset(
+    chain_tip_index const& idx);
+inline descendant_closure_result compute_three_term_seeds_and_closure(
+    overlay_chain const& chain, chain_tip_index const& idx,
+    std::span<overlay_clade_ref const> inside_affected_vec);
+inline std::size_t count_multifurcating_outside_productions(
+    chain_tip_index const& idx, overlay_clade_ref ref);
+
+inline std::pair<std::vector<std::size_t>, std::vector<std::size_t>>
+build_affected_position_tables(chain_tip_index const& idx,
+                               std::span<overlay_clade_ref const> affected,
+                               char const* direction) {
+  auto const& base = *idx.tip_overlay.base;
+  std::vector<std::size_t> base_positions(base.clades.size(),
+                                           chart_cache_commit_plan::no_position);
+  std::vector<std::size_t> temp_positions(
+      idx.temp_clade_count, chart_cache_commit_plan::no_position);
+  for (std::size_t position = 0; position < affected.size(); ++position) {
+    auto ref = affected[position];
+    auto& positions = ref.space == overlay_id_space::base ? base_positions
+                                                          : temp_positions;
+    if (ref.id == no_clade || ref.id >= positions.size()) {
+      throw std::runtime_error(std::string{"cache commit plan: "} + direction +
+                               " affected ref out of range");
+    }
+    if (positions[ref.id] != chart_cache_commit_plan::no_position) {
+      throw std::runtime_error(std::string{"cache commit plan: duplicate "} +
+                               direction + " affected ref");
+    }
+    positions[ref.id] = position;
+  }
+  return {std::move(base_positions), std::move(temp_positions)};
+}
+
+inline std::size_t checked_pattern_row_count(std::size_t patterns,
+                                             std::size_t affected,
+                                             char const* context) {
+  if (affected != 0 &&
+      patterns > std::numeric_limits<std::size_t>::max() / affected) {
+    throw std::runtime_error(std::string{context} + ": row-count overflow");
+  }
+  return patterns * affected;
+}
+
+inline std::size_t checked_commit_counter_product(std::size_t lhs,
+                                                  std::size_t rhs,
+                                                  char const* context) {
+  if (rhs != 0 && lhs > std::numeric_limits<std::size_t>::max() / rhs) {
+    throw std::runtime_error(std::string{context} + ": counter overflow");
+  }
+  return lhs * rhs;
+}
+
+}  // namespace outside_chart_cache_detail
+
+inline chart_cache_commit_plan build_chart_cache_commit_plan(
+    overlay_chain const& chain,
+    outside_affected_policy policy =
+        outside_affected_policy::conservative_superset) {
+  if (chain.empty()) {
+    throw std::runtime_error(
+        "build_chart_cache_commit_plan: empty chain has no delta");
+  }
+  auto idx = outside_chart_cache_detail::build_chain_tip_index(chain);
+  auto inside_affected =
+      inside_chart_cache_detail::compute_inside_affected_set(chain, idx);
+
+  outside_chart_cache_detail::descendant_closure_result outside_bits;
+  switch (policy) {
+    case outside_affected_policy::conservative_superset:
+      outside_bits = outside_chart_cache_detail::reachable_superset(idx);
+      break;
+    case outside_affected_policy::three_term_tight:
+      outside_bits =
+          outside_chart_cache_detail::compute_three_term_seeds_and_closure(
+              chain, idx, inside_affected);
+      break;
+  }
+  auto outside_affected =
+      outside_chart_cache_detail::collect_refs_decreasing_size(
+          idx, outside_bits.vis_base, outside_bits.vis_temp);
+
+  auto [inside_base_position, inside_temp_position] =
+      outside_chart_cache_detail::build_affected_position_tables(
+          idx, inside_affected, "inside");
+  auto [outside_base_position, outside_temp_position] =
+      outside_chart_cache_detail::build_affected_position_tables(
+          idx, outside_affected, "outside");
+
+  std::size_t inside_multifurcation_per_pattern = 0;
+  for (auto ref : inside_affected) {
+    inside_multifurcation_per_pattern +=
+        inside_chart_cache_detail::count_multifurcating_inside_productions(
+            idx, ref);
+  }
+  std::size_t outside_multifurcation_per_pattern = 0;
+  for (auto ref : outside_affected) {
+    outside_multifurcation_per_pattern +=
+        outside_chart_cache_detail::count_multifurcating_outside_productions(
+            idx, ref);
+  }
+
+  return chart_cache_commit_plan{
+      std::move(idx),
+      std::move(inside_affected),
+      std::move(outside_affected),
+      std::move(inside_base_position),
+      std::move(inside_temp_position),
+      std::move(outside_base_position),
+      std::move(outside_temp_position),
+      chain.size(),
+      &chain.base(),
+      chain.base().execution_generation,
+      policy,
+      inside_multifurcation_per_pattern,
+      outside_multifurcation_per_pattern};
+}
+
 // Persistent outside-chart cache keyed by (active pattern, overlay-clade-ref).
 // `base_rows[p][cid]` holds the outside row for frozen-base clade `cid` under
 // active pattern `p`; `temp_rows[p][tid]` holds the row for merged-temp clade
@@ -379,10 +614,14 @@ struct outside_chart_cache {
 
 namespace outside_chart_cache_detail {
 
-inline std::array<chart_cost, nuc_state_count> recompute_tip_outside_row(
+template <class OutsideRowProvider, class InsideRowProvider>
+inline std::array<chart_cost, nuc_state_count>
+recompute_tip_outside_row_from_rows(
     outside_chart_cache const& ocache, inside_chart_cache const& icache,
     chain_tip_index const& idx, std::size_t pattern, overlay_clade_ref ref,
-    outside_recurrence_work_stats& recurrence_work) {
+    outside_recurrence_work_stats& recurrence_work,
+    OutsideRowProvider&& outside_row_provider,
+    InsideRowProvider&& inside_row_provider) {
   auto const& base = *ocache.base;
   auto root_ref = base_clade_ref(base.root_clade);
   using namespace parsimony_chart_detail;
@@ -414,9 +653,10 @@ inline std::array<chart_cost, nuc_state_count> recompute_tip_outside_row(
     struct production_view {
       std::vector<overlay_clade_ref> const& children;
     } prod{children};
-    auto const& parent_outside = ocache.row(pattern, parent_ref);
+    auto const& parent_outside =
+        std::invoke(outside_row_provider, parent_ref);
     auto row_provider = [&](overlay_clade_ref child) -> auto const& {
-      return icache.row(pattern, child);
+      return std::invoke(inside_row_provider, child);
     };
     auto consume_row =
         [&](std::size_t child_i,
@@ -433,6 +673,20 @@ inline std::array<chart_cost, nuc_state_count> recompute_tip_outside_row(
 
   for_each_tip_production_with_child(idx, ref, accumulate);
   return row;
+}
+
+inline std::array<chart_cost, nuc_state_count> recompute_tip_outside_row(
+    outside_chart_cache const& ocache, inside_chart_cache const& icache,
+    chain_tip_index const& idx, std::size_t pattern, overlay_clade_ref ref,
+    outside_recurrence_work_stats& recurrence_work) {
+  return recompute_tip_outside_row_from_rows(
+      ocache, icache, idx, pattern, ref, recurrence_work,
+      [&](overlay_clade_ref parent) -> auto const& {
+        return ocache.row(pattern, parent);
+      },
+      [&](overlay_clade_ref child) -> auto const& {
+        return icache.row(pattern, child);
+      });
 }
 
 inline std::size_t count_multifurcating_outside_productions(
@@ -882,7 +1136,8 @@ inline descendant_closure_result reachable_superset(chain_tip_index const& idx) 
 // production-touched parents union siblings of inside-affected clades union
 // descendants of those siblings).
 inline descendant_closure_result compute_three_term_seeds_and_closure(
-    overlay_chain const& chain, chain_tip_index const& idx) {
+    overlay_chain const& chain, chain_tip_index const& idx,
+    std::span<overlay_clade_ref const> inside_affected_vec) {
   auto const& base = *idx.tip_overlay.base;
   if (chain.empty()) {
     throw std::runtime_error(
@@ -890,9 +1145,9 @@ inline descendant_closure_result compute_three_term_seeds_and_closure(
   }
   auto const& last = chain.at(chain.size() - 1);
 
-  // Inside-affected set (Phase 2) drives case (a).
-  auto inside_affected_vec =
-      inside_chart_cache_detail::compute_inside_affected_set(chain, idx);
+  // Inside-affected set (Phase 2) drives case (a).  The transaction-plan
+  // builder supplies its already-computed set so the merged-tip index and
+  // ancestor closure are each built exactly once per accepted append.
   std::vector<bool> inside_aff_base(base.clades.size(), false);
   std::vector<bool> inside_aff_temp(idx.temp_clade_count, false);
   for (auto ref : inside_affected_vec) {
@@ -965,6 +1220,13 @@ inline descendant_closure_result compute_three_term_seeds_and_closure(
 
   return compute_descendant_closure(idx, std::move(seed_base),
                                     std::move(seed_temp));
+}
+
+inline descendant_closure_result compute_three_term_seeds_and_closure(
+    overlay_chain const& chain, chain_tip_index const& idx) {
+  auto inside_affected =
+      inside_chart_cache_detail::compute_inside_affected_set(chain, idx);
+  return compute_three_term_seeds_and_closure(chain, idx, inside_affected);
 }
 
 // Term-1-alone (descendants of production-touched parents ONLY).  This is the
@@ -1055,6 +1317,280 @@ compute_chain_outside_descendant_closure_only(overlay_chain const& chain) {
                                                                           idx);
   return outside_chart_cache_detail::collect_refs_decreasing_size(
       idx, bits.vis_base, bits.vis_temp);
+}
+
+struct chart_cache_commit_run_summary {
+  chart_scheduler_run_summary inside_patterns;
+  chart_scheduler_run_summary outside_patterns;
+  std::size_t inside_affected_clades = 0;
+  std::size_t outside_affected_clades = 0;
+  std::size_t patterns = 0;
+};
+
+// Transactionally apply one accepted append to both persistent cache
+// directions.  Pattern workers write only bounded staged rows.  The inside
+// join completes before the outside join begins, and neither cache surface,
+// counter, trim state, nor epoch is published until both operations succeed.
+// Unaffected rows are read in place and never copied or rebuilt.
+inline void apply_commit_to_chart_caches(
+    overlay_chain const& chain, chart_cache_commit_plan const& plan,
+    inside_chart_cache& icache, outside_chart_cache& ocache,
+    chart_scheduler& scheduler,
+    chart_indexed_range_options range_options = {},
+    chart_cache_commit_run_summary* run_summary = nullptr) {
+  if (chain.empty()) {
+    throw std::runtime_error(
+        "apply_commit_to_chart_caches: empty chain has no delta");
+  }
+  if (plan.base() != &chain.base() || plan.chain_size() != chain.size() ||
+      plan.base_execution_generation() != chain.base().execution_generation ||
+      plan.tip_index().tip_overlay.base != &chain.base()) {
+    throw std::runtime_error(
+        "apply_commit_to_chart_caches: stale or foreign transaction plan");
+  }
+  if (icache.base == nullptr || icache.base != &chain.base() ||
+      ocache.base == nullptr || ocache.base != &chain.base()) {
+    throw std::runtime_error(
+        "apply_commit_to_chart_caches: cache base does not match chain base");
+  }
+  if (icache.base_execution_generation !=
+      chain.base().execution_generation) {
+    throw std::runtime_error(
+        "apply_commit_to_chart_caches: inside cache base generation mismatch");
+  }
+  if (icache.commit_epoch + 1 != chain.size() ||
+      ocache.commit_epoch + 1 != chain.size()) {
+    throw std::runtime_error(
+        "apply_commit_to_chart_caches: cache epochs are not exactly one "
+        "behind the chain tip");
+  }
+  auto const pattern_count = icache.patterns.size();
+  if (ocache.patterns.size() != pattern_count ||
+      icache.base_rows.size() != pattern_count ||
+      icache.temp_rows.size() != pattern_count ||
+      ocache.base_rows.size() != pattern_count ||
+      ocache.temp_rows.size() != pattern_count) {
+    throw std::runtime_error(
+        "apply_commit_to_chart_caches: cache pattern surfaces do not match");
+  }
+  if (icache.temp_clade_count != ocache.temp_clade_count ||
+      plan.tip_index().temp_clade_count < icache.temp_clade_count) {
+    throw std::runtime_error(
+        "apply_commit_to_chart_caches: temp-clade surfaces do not match");
+  }
+  auto const base_clade_count = chain.base().clades.size();
+  for (std::size_t pattern = 0; pattern < pattern_count; ++pattern) {
+    if (icache.base_rows[pattern].size() != base_clade_count ||
+        ocache.base_rows[pattern].size() != base_clade_count ||
+        icache.temp_rows[pattern].size() != icache.temp_clade_count ||
+        ocache.temp_rows[pattern].size() != ocache.temp_clade_count) {
+      throw std::runtime_error(
+          "apply_commit_to_chart_caches: cache row shape mismatch");
+    }
+  }
+  if (ocache.chart_opts.score_ua_edge &&
+      ocache.reference_state_by_pattern.size() != pattern_count) {
+    throw std::runtime_error(
+        "apply_commit_to_chart_caches: outside reference-state shape "
+        "mismatch");
+  }
+
+  auto const inside_count = plan.inside_affected().size();
+  auto const outside_count = plan.outside_affected().size();
+  auto const inside_row_count =
+      outside_chart_cache_detail::checked_pattern_row_count(
+          pattern_count, inside_count,
+          "apply_commit_to_chart_caches inside stage");
+  auto const outside_row_count =
+      outside_chart_cache_detail::checked_pattern_row_count(
+          pattern_count, outside_count,
+          "apply_commit_to_chart_caches outside stage");
+  using row_type = std::array<chart_cost, nuc_state_count>;
+  std::vector<row_type> staged_inside(
+      inside_row_count, parsimony_chart_detail::make_inf_row());
+  std::vector<row_type> staged_outside(
+      outside_row_count, parsimony_chart_detail::make_inf_row());
+  std::vector<outside_recurrence_work_stats> outside_work_by_pattern(
+      pattern_count);
+
+  // Reserve every eventual temp surface before any worker is submitted.  A
+  // failed allocation can change capacity but never logical size or cache
+  // semantics; after all reserves succeed, the publication resize is
+  // allocation-free for these trivially constructible rows.
+  auto const target_temp_count = plan.tip_index().temp_clade_count;
+  for (std::size_t pattern = 0; pattern < pattern_count; ++pattern) {
+    icache.temp_rows[pattern].reserve(target_temp_count);
+    ocache.temp_rows[pattern].reserve(target_temp_count);
+  }
+
+  chart_scheduler_run_summary inside_summary;
+  if (pattern_count != 0) {
+    inside_summary = scheduler.for_each_indexed_range(
+        pattern_count, range_options,
+        [&](chart_indexed_range const& range, std::size_t,
+            chart_scheduler_cancellation_token const& cancellation) {
+          for (std::size_t pattern = range.begin; pattern < range.end;
+               ++pattern) {
+            if (cancellation.stop_requested()) return;
+            auto const pattern_offset = pattern * inside_count;
+            for (std::size_t position = 0; position < inside_count;
+                 ++position) {
+              auto const ref = plan.inside_affected()[position];
+              auto row_provider = [&](overlay_clade_ref child)
+                  -> row_type const& {
+                auto const child_position = plan.inside_position(child);
+                if (child_position != chart_cache_commit_plan::no_position) {
+                  if (child_position >= position) {
+                    throw std::runtime_error(
+                        "apply_commit_to_chart_caches: inside dependency is "
+                        "not earlier in bottom-up order");
+                  }
+                  return staged_inside[pattern_offset + child_position];
+                }
+                return icache.row(pattern, child);
+              };
+              staged_inside[pattern_offset + position] =
+                  inside_chart_cache_detail::recompute_tip_inside_row_from_rows(
+                      icache, plan.tip_index(), pattern, ref, row_provider);
+            }
+          }
+        });
+  }
+
+  chart_scheduler_run_summary outside_summary;
+  if (pattern_count != 0) {
+    outside_summary = scheduler.for_each_indexed_range(
+        pattern_count, range_options,
+        [&](chart_indexed_range const& range, std::size_t,
+            chart_scheduler_cancellation_token const& cancellation) {
+          for (std::size_t pattern = range.begin; pattern < range.end;
+               ++pattern) {
+            if (cancellation.stop_requested()) return;
+            auto const inside_offset = pattern * inside_count;
+            auto const outside_offset = pattern * outside_count;
+            for (std::size_t position = 0; position < outside_count;
+                 ++position) {
+              auto const ref = plan.outside_affected()[position];
+              auto outside_row_provider = [&](overlay_clade_ref parent)
+                  -> row_type const& {
+                auto const parent_position = plan.outside_position(parent);
+                if (parent_position != chart_cache_commit_plan::no_position) {
+                  if (parent_position >= position) {
+                    throw std::runtime_error(
+                        "apply_commit_to_chart_caches: outside dependency is "
+                        "not earlier in top-down order");
+                  }
+                  return staged_outside[outside_offset + parent_position];
+                }
+                return ocache.row(pattern, parent);
+              };
+              auto inside_row_provider = [&](overlay_clade_ref child)
+                  -> row_type const& {
+                auto const child_position = plan.inside_position(child);
+                if (child_position != chart_cache_commit_plan::no_position) {
+                  return staged_inside[inside_offset + child_position];
+                }
+                return icache.row(pattern, child);
+              };
+              staged_outside[outside_offset + position] =
+                  outside_chart_cache_detail::
+                      recompute_tip_outside_row_from_rows(
+                          ocache, icache, plan.tip_index(), pattern, ref,
+                          outside_work_by_pattern[pattern],
+                          outside_row_provider, inside_row_provider);
+            }
+          }
+        });
+  }
+
+  auto const inside_row_increment =
+      outside_chart_cache_detail::checked_commit_counter_product(
+          inside_count, pattern_count,
+          "apply_commit_to_chart_caches inside rows");
+  auto const outside_row_increment =
+      outside_chart_cache_detail::checked_commit_counter_product(
+          outside_count, pattern_count,
+          "apply_commit_to_chart_caches outside rows");
+  auto const inside_multifurcation_increment =
+      outside_chart_cache_detail::checked_commit_counter_product(
+          plan.inside_multifurcation_per_pattern(), pattern_count,
+          "apply_commit_to_chart_caches inside multifurcations");
+  auto const outside_multifurcation_increment =
+      outside_chart_cache_detail::checked_commit_counter_product(
+          plan.outside_multifurcation_per_pattern(), pattern_count,
+          "apply_commit_to_chart_caches outside multifurcations");
+  auto require_counter_room = [](std::size_t current, std::size_t increment,
+                                 char const* context) {
+    if (increment > std::numeric_limits<std::size_t>::max() - current) {
+      throw std::runtime_error(std::string{context} + ": counter overflow");
+    }
+  };
+  require_counter_room(icache.inside_rows_recomputed_on_commit,
+                       inside_row_increment,
+                       "apply_commit_to_chart_caches inside rows");
+  require_counter_room(ocache.outside_rows_recomputed_on_commit,
+                       outside_row_increment,
+                       "apply_commit_to_chart_caches outside rows");
+  require_counter_room(icache.multifurcation_productions_scored,
+                       inside_multifurcation_increment,
+                       "apply_commit_to_chart_caches inside multifurcations");
+  require_counter_room(ocache.multifurcation_productions_scored,
+                       outside_multifurcation_increment,
+                       "apply_commit_to_chart_caches outside multifurcations");
+
+  // Both joins and every throwing validation are complete.  Publish only the
+  // affected rows in deterministic pattern/ref order, then counters and the
+  // paired epoch as the single-writer transaction barrier.
+  for (std::size_t pattern = 0; pattern < pattern_count; ++pattern) {
+    icache.temp_rows[pattern].resize(
+        target_temp_count, parsimony_chart_detail::make_inf_row());
+    ocache.temp_rows[pattern].resize(
+        target_temp_count, parsimony_chart_detail::make_inf_row());
+  }
+  icache.temp_clade_count = target_temp_count;
+  ocache.temp_clade_count = target_temp_count;
+  for (std::size_t pattern = 0; pattern < pattern_count; ++pattern) {
+    auto const inside_offset = pattern * inside_count;
+    for (std::size_t position = 0; position < inside_count; ++position) {
+      auto const ref = plan.inside_affected()[position];
+      auto const& fresh = staged_inside[inside_offset + position];
+      if (ref.space == overlay_id_space::base) {
+        icache.base_rows[pattern][ref.id] = fresh;
+      } else {
+        icache.temp_rows[pattern][ref.id] = fresh;
+      }
+    }
+    auto const outside_offset = pattern * outside_count;
+    for (std::size_t position = 0; position < outside_count; ++position) {
+      auto const ref = plan.outside_affected()[position];
+      auto const& fresh = staged_outside[outside_offset + position];
+      if (ref.space == overlay_id_space::base) {
+        ocache.base_rows[pattern][ref.id] = fresh;
+      } else {
+        ocache.temp_rows[pattern][ref.id] = fresh;
+      }
+    }
+  }
+  icache.inside_rows_recomputed_on_commit += inside_row_increment;
+  ocache.outside_rows_recomputed_on_commit += outside_row_increment;
+  icache.multifurcation_productions_scored +=
+      inside_multifurcation_increment;
+  ocache.multifurcation_productions_scored +=
+      outside_multifurcation_increment;
+  for (std::size_t pattern = 0; pattern < pattern_count; ++pattern) {
+    ocache.outside_recurrence_work += outside_work_by_pattern[pattern];
+  }
+  icache.commit_epoch = chain.size();
+  ocache.commit_epoch = chain.size();
+  icache.exact_trim_active_only.reset();
+
+  if (run_summary != nullptr) {
+    run_summary->inside_patterns = inside_summary;
+    run_summary->outside_patterns = outside_summary;
+    run_summary->inside_affected_clades = inside_count;
+    run_summary->outside_affected_clades = outside_count;
+    run_summary->patterns = pattern_count;
+  }
 }
 
 // Apply the chain's last-appended delta to the persistent outside cache:

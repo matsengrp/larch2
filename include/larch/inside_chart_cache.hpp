@@ -1100,9 +1100,12 @@ namespace inside_chart_cache_detail {
 // math.  Available productions at `ref` are the frozen-base productions not
 // tombstoned by any chain delta, plus the merged temp productions with
 // `ref` as parent.
-inline std::array<chart_cost, nuc_state_count> recompute_tip_inside_row(
+template <class RowProvider>
+inline std::array<chart_cost, nuc_state_count>
+recompute_tip_inside_row_from_rows(
     inside_chart_cache const& cache, chain_tip_index const& idx,
-    std::size_t pattern, overlay_clade_ref ref) {
+    std::size_t pattern, overlay_clade_ref ref,
+    RowProvider&& row_provider) {
   auto const& base = *cache.base;
   auto const& key = chain_tip_clade_key(idx, ref);
 
@@ -1132,15 +1135,15 @@ inline std::array<chart_cost, nuc_state_count> recompute_tip_inside_row(
     } prod{children};
     for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
          ++parent_state) {
-      auto row_provider = [&](overlay_clade_ref child) -> auto const& {
+      auto checked_row_provider = [&](overlay_clade_ref child) -> auto const& {
         if (child.id == no_clade) {
           throw std::runtime_error(
               "inside cache: production child ref is no_clade");
         }
-        return cache.row(pattern, child);
+        return std::invoke(row_provider, child);
       };
       auto total = parsimony_chart_detail::combine_production_inside_row(
-          prod, parent_state, row_provider);
+          prod, parent_state, checked_row_provider);
       if (total < row[parent_state]) row[parent_state] = total;
     }
   };
@@ -1173,6 +1176,16 @@ inline std::array<chart_cost, nuc_state_count> recompute_tip_inside_row(
         "inside cache: non-singleton clade has no available productions");
   }
   return row;
+}
+
+inline std::array<chart_cost, nuc_state_count> recompute_tip_inside_row(
+    inside_chart_cache const& cache, chain_tip_index const& idx,
+    std::size_t pattern, overlay_clade_ref ref) {
+  return recompute_tip_inside_row_from_rows(
+      cache, idx, pattern, ref,
+      [&](overlay_clade_ref child) -> auto const& {
+        return cache.row(pattern, child);
+      });
 }
 
 inline std::size_t count_multifurcating_inside_productions(

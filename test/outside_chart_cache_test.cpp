@@ -52,6 +52,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <print>
@@ -1543,6 +1544,182 @@ static void test_three_term_tight_adopted() {
       tight.size(), superset.size(), chain.size());
 }
 
+// Phase 9 paired-transaction regression.  The immutable plan must reproduce
+// the legacy serial inside-then-outside result, use real pattern parallelism,
+// and leave both cache surfaces/counters/epochs unpublished when the outside
+// scheduler operation fails after the inside join has completed.
+static void test_paired_transaction_plan_parallel_and_failure_atomic() {
+  std::println("test_paired_transaction_plan_parallel_and_failure_atomic");
+
+  auto f = load_rich_six_taxon_fixture();
+  larch::overlay_chain chain(f.grammar);
+  bool appended = false;
+  for (auto const& candidate :
+       larch::enumerate_grammar_spr_candidates(f.grammar)) {
+    larch::spr_overlay_delta delta;
+    try {
+      delta = larch::build_spr_overlay_delta(f.grammar, candidate);
+    } catch (std::runtime_error const&) {
+      continue;
+    }
+    try {
+      chain.append(delta);
+      appended = true;
+      break;
+    } catch (std::runtime_error const& error) {
+      if (!is_expected_overlay_chain_rejection(error.what())) throw;
+    }
+  }
+  CHECK(appended);
+
+  auto make_caches = [&] {
+    auto inside = larch::build_inside_chart_cache(
+        f.grammar, f.active, f.options, f.invariant_offset);
+    auto outside =
+        larch::build_outside_chart_cache(f.grammar, f.active, f.options);
+    // Guarantee a genuinely parallel pattern axis without changing any row
+    // semantics: repeated identical pattern rows remain independent cache
+    // ownership units and exercise the transaction scheduler exactly as a
+    // repeated-site active set would.
+    while (inside.patterns.size() < 8) {
+      inside.patterns.push_back(inside.patterns.front());
+      inside.base_rows.push_back(inside.base_rows.front());
+      inside.temp_rows.push_back(inside.temp_rows.front());
+      outside.patterns.push_back(outside.patterns.front());
+      outside.base_rows.push_back(outside.base_rows.front());
+      outside.temp_rows.push_back(outside.temp_rows.front());
+    }
+    return std::pair{std::move(inside), std::move(outside)};
+  };
+
+  auto plan = larch::build_chart_cache_commit_plan(
+      chain, larch::outside_affected_policy::conservative_superset);
+  CHECK(plan.chain_size() == chain.size());
+  CHECK(plan.base() == &chain.base());
+  CHECK(plan.inside_affected() ==
+        larch::compute_chain_inside_affected_set(chain));
+  CHECK(plan.outside_affected() == larch::compute_chain_outside_affected_set(
+                                       chain));
+
+  auto [parallel_inside, parallel_outside] = make_caches();
+  auto serial_inside = parallel_inside;
+  auto serial_outside = parallel_outside;
+  larch::apply_commit_to_inside_cache(chain, serial_inside);
+  larch::apply_commit_to_outside_cache(chain, serial_outside, serial_inside);
+
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 1,
+  }};
+  larch::chart_indexed_range_options ranges{
+      .minimum_grain = 1,
+      .target_ranges_per_worker = 1,
+  };
+  larch::chart_cache_commit_run_summary summary;
+  larch::apply_commit_to_chart_caches(chain, plan, parallel_inside,
+                                      parallel_outside, scheduler, ranges,
+                                      &summary);
+  CHECK(summary.patterns == parallel_inside.patterns.size());
+  CHECK(summary.inside_affected_clades == plan.inside_affected().size());
+  CHECK(summary.outside_affected_clades == plan.outside_affected().size());
+  CHECK(summary.inside_patterns.used_parallel_workers());
+  CHECK(summary.outside_patterns.used_parallel_workers());
+  CHECK(parallel_inside.base_rows == serial_inside.base_rows);
+  CHECK(parallel_inside.temp_rows == serial_inside.temp_rows);
+  CHECK(parallel_outside.base_rows == serial_outside.base_rows);
+  CHECK(parallel_outside.temp_rows == serial_outside.temp_rows);
+  CHECK(parallel_inside.inside_rows_recomputed_on_commit ==
+        serial_inside.inside_rows_recomputed_on_commit);
+  CHECK(parallel_outside.outside_rows_recomputed_on_commit ==
+        serial_outside.outside_rows_recomputed_on_commit);
+  CHECK(parallel_inside.multifurcation_productions_scored ==
+        serial_inside.multifurcation_productions_scored);
+  CHECK(parallel_outside.multifurcation_productions_scored ==
+        serial_outside.multifurcation_productions_scored);
+  CHECK(parallel_outside.outside_recurrence_work ==
+        serial_outside.outside_recurrence_work);
+  assert_cache_both_charts_match_from_scratch(
+      chain, parallel_inside, parallel_outside,
+      "paired transaction parallel result");
+  scheduler.shutdown();
+
+  auto [failed_inside, failed_outside] = make_caches();
+  auto const before_inside_base = failed_inside.base_rows;
+  auto const before_inside_temp = failed_inside.temp_rows;
+  auto const before_outside_base = failed_outside.base_rows;
+  auto const before_outside_temp = failed_outside.temp_rows;
+  auto const before_inside_rows =
+      failed_inside.inside_rows_recomputed_on_commit;
+  auto const before_outside_rows =
+      failed_outside.outside_rows_recomputed_on_commit;
+  auto const before_inside_multifurcations =
+      failed_inside.multifurcation_productions_scored;
+  auto const before_outside_multifurcations =
+      failed_outside.multifurcation_productions_scored;
+  auto const before_outside_work = failed_outside.outside_recurrence_work;
+
+  larch::chart_scheduler failing_scheduler{larch::chart_scheduler_options{
+      .requested_workers = 4,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 1,
+  }};
+  auto const scheduled = failing_scheduler.plan_indexed_ranges(
+      failed_inside.patterns.size(), ranges);
+  CHECK(scheduled.worker_task_limit > 1);
+  std::atomic<std::size_t> submissions_seen{0};
+  larch::chart_scheduler_test_detail::access::set_submission_hooks(
+      failing_scheduler,
+      [&](std::size_t) {
+        auto const submission =
+            submissions_seen.fetch_add(1, std::memory_order_relaxed);
+        if (submission == scheduled.worker_task_limit) {
+          throw std::runtime_error("forced outside cache submission failure");
+        }
+      },
+      {});
+  std::string failure;
+  try {
+    larch::apply_commit_to_chart_caches(
+        chain, plan, failed_inside, failed_outside, failing_scheduler, ranges);
+  } catch (std::runtime_error const& error) {
+    failure = error.what();
+  }
+  larch::chart_scheduler_test_detail::access::clear_submission_hooks(
+      failing_scheduler);
+  CHECK(failure.find("forced outside cache submission failure") !=
+        std::string::npos);
+  CHECK(failed_inside.commit_epoch == 0);
+  CHECK(failed_outside.commit_epoch == 0);
+  CHECK(failed_inside.temp_clade_count == 0);
+  CHECK(failed_outside.temp_clade_count == 0);
+  CHECK(failed_inside.base_rows == before_inside_base);
+  CHECK(failed_inside.temp_rows == before_inside_temp);
+  CHECK(failed_outside.base_rows == before_outside_base);
+  CHECK(failed_outside.temp_rows == before_outside_temp);
+  CHECK(failed_inside.inside_rows_recomputed_on_commit == before_inside_rows);
+  CHECK(failed_outside.outside_rows_recomputed_on_commit ==
+        before_outside_rows);
+  CHECK(failed_inside.multifurcation_productions_scored ==
+        before_inside_multifurcations);
+  CHECK(failed_outside.multifurcation_productions_scored ==
+        before_outside_multifurcations);
+  CHECK(failed_outside.outside_recurrence_work == before_outside_work);
+  CHECK(failing_scheduler.metrics().pending_tasks == 0);
+
+  // The same scheduler and pristine logical cache state recover immediately.
+  larch::apply_commit_to_chart_caches(chain, plan, failed_inside,
+                                      failed_outside, failing_scheduler,
+                                      ranges);
+  CHECK(failed_inside.base_rows == serial_inside.base_rows);
+  CHECK(failed_inside.temp_rows == serial_inside.temp_rows);
+  CHECK(failed_outside.base_rows == serial_outside.base_rows);
+  CHECK(failed_outside.temp_rows == serial_outside.temp_rows);
+  failing_scheduler.shutdown();
+
+  std::println("  PASS");
+}
+
 // Performance exit criterion on the medium fixture: the three-term tight set
 // recomputes strictly fewer outside rows than the whole grammar, OR -- if no
 // move class clears the oracle on this fixture -- the superset remains and the
@@ -1859,6 +2036,7 @@ int main() {
   test_sequential_chain_on_seedtree();
   test_term1_alone_is_unsound();
   test_three_term_tight_adopted();
+  test_paired_transaction_plan_parallel_and_failure_atomic();
   test_seedtree_perf_or_vacuous();
   test_score_ua_edge_root_scoring_regression();
   test_pairing_guard();

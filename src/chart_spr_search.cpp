@@ -4205,7 +4205,7 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
     chart_spr_local_commit_substrate& sub, chart_spr_search_state& state,
     chart_spr_candidate_score const& accepted,
     chart_spr_search_options const& options,
-    chart_spr_search_counters& counters) {
+    chart_spr_search_counters& counters, chart_scheduler& scheduler) {
   // Defensive gate check (the loop validator already rejects this combo, but a
   // locally-committed chain's recorded objective must be exact -- never trust a
   // caller to re-establish the invariant).  This is a hard configuration error,
@@ -4308,11 +4308,18 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
           "forced local commit post-append failure for tests");
     }
 
-    // Paired cache commit: inside first (Phase 2), then outside (Phase 3).  Both
-    // are affected-set scoped -- no full chart rebuild per accept.  The exact-
-    // trim cache is invalidated by the inside commit (Phase 2 hook).
-    apply_commit_to_inside_cache(*sub.chain, *sub.icache);
-    apply_commit_to_outside_cache(*sub.chain, *sub.ocache, *sub.icache);
+    // Build one immutable merged-tip transaction plan, then run the paired
+    // cache commit as two pattern barriers.  Workers stage only affected rows;
+    // neither cache surface nor epoch is published until both joins succeed.
+    auto cache_commit_plan = build_chart_cache_commit_plan(
+        *sub.chain, outside_affected_policy::conservative_superset);
+    auto const cache_range_options = chart_spr_phase4_pattern_range_options(
+        sub.icache->patterns.size(),
+        scheduler.worker_resolution().resolved_workers);
+    chart_cache_commit_run_summary cache_commit_run;
+    apply_commit_to_chart_caches(
+        *sub.chain, cache_commit_plan, *sub.icache, *sub.ocache, scheduler,
+        cache_range_options, &cache_commit_run);
 
     // Refresh the derived tip view (grammar + pattern_charts + bounds).  This is
     // a grammar-only materialization (no chart rescoring); NOT counted under
@@ -4366,6 +4373,12 @@ chart_spr_local_commit_result chart_spr_commit_accepted_locally(
         sub.icache->inside_rows_recomputed_on_commit;
     counters.outside_rows_recomputed_on_commit =
         sub.ocache->outside_rows_recomputed_on_commit;
+    record_chart_spr_scheduler_axis_run(
+        counters.scheduler_axes.inside_cache_patterns,
+        cache_commit_run.inside_patterns);
+    record_chart_spr_scheduler_axis_run(
+        counters.scheduler_axes.outside_cache_patterns,
+        cache_commit_run.outside_patterns);
     counters.lazy_inside_rows_recomputed_on_commit +=
         lazy_stats.inside_rows_recomputed;
     counters.lazy_outside_rows_recomputed_on_commit +=
@@ -8421,7 +8434,7 @@ chart_spr_search_result run_chart_spr_search(
         // tombstone-scope skip leaves the chain, caches, and state pristine.
         auto commit = chart_spr_commit_accepted_locally(
             *local_commit_substrate, state, *iteration.accepted, options,
-            attempt_counters);
+            attempt_counters, scheduler);
         result.summary.accepted_rebuild_ms += chart_spr_elapsed_ms(
             materialize_start, std::chrono::steady_clock::now());
 
