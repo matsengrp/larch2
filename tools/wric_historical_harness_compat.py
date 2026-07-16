@@ -104,6 +104,17 @@ _VARIANTS: dict[str, Variant] = {
     ),
 }
 
+_APPROVED_PRODUCT_REVISIONS: dict[str, str] = {
+    "208ce23f0c005d3702d114f535fe21564b3b79b6": "phase1-5",
+    "0c4623ba1793395ae8f5c3df2a2524a27d89bc80": "phase1-5",
+    "7d294d68eaadc8c55b92be4f5589278c8a2f78f2": "phase1-5",
+    "cbf92b62284b2a93e506f59187ac94a5336b0be3": "phase1-5",
+    "3a10e9cc45050f7a6f846f9f1adb8d5f4157f9a5": "phase1-5",
+    "870c298ff1c0c21901bdf79d341bf97d121f389c": "phase6",
+    "38e9a281396e5263647ba68724414848841525d7": "phase7-8",
+    "6c8d0c7651c2aa2e5c396d0f57c2e4e18c322310": "phase7-8",
+}
+
 
 def _fail(message: str) -> NoReturn:
     raise CompatibilityError(message)
@@ -323,6 +334,9 @@ def _validate_product(
     ).decode("ascii").strip()
     if verified != expected_product_revision:
         _fail("expected product revision does not resolve to itself as a commit")
+    expected_variant = _APPROVED_PRODUCT_REVISIONS.get(expected_product_revision)
+    if expected_variant is None:
+        _fail("expected product revision is not an approved capture checkpoint")
     if _git(root, ["status", "--porcelain=v1", "--untracked-files=all"]):
         _fail("product repository must be completely clean")
 
@@ -331,6 +345,11 @@ def _validate_product(
     variant = _VARIANTS.get(digest)
     if variant is None:
         _fail(f"unknown historical base harness SHA-256: {digest}")
+    if variant.name != expected_variant:
+        _fail(
+            "approved product revision has the wrong historical harness variant: "
+            f"expected {expected_variant}, found {variant.name}"
+        )
     if blob != variant.base_blob or git_mode != "100755":
         _fail("historical harness blob or Git mode differs from its approved identity")
 
@@ -717,23 +736,26 @@ def materialize_historical_harness(
     )
     metadata_bytes = _canonical_json_bytes(document)
     harness_identity: tuple[int, int] | None = None
+    metadata_identity: tuple[int, int] | None = None
+    harness_sha256 = _sha256(result)
+    metadata_sha256 = _sha256(metadata_bytes)
     try:
         harness_identity = _publish_no_replace(output, result, _HARNESS_MODE)
-        _publish_no_replace(metadata, metadata_bytes, _METADATA_MODE)
+        metadata_identity = _publish_no_replace(metadata, metadata_bytes, _METADATA_MODE)
+        audit_materialized_harness(
+            output,
+            metadata,
+            harness_sha256,
+            metadata_sha256,
+            root,
+            expected_product_revision,
+        )
     except CompatibilityError:
+        if metadata_identity is not None:
+            _unlink_if_owned(metadata, metadata_identity)
         if harness_identity is not None:
             _unlink_if_owned(output, harness_identity)
         raise
-    harness_sha256 = _sha256(result)
-    metadata_sha256 = _sha256(metadata_bytes)
-    audit_materialized_harness(
-        output,
-        metadata,
-        harness_sha256,
-        metadata_sha256,
-        root,
-        expected_product_revision,
-    )
     return {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,

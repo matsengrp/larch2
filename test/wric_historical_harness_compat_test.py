@@ -23,11 +23,21 @@ import wric_historical_harness_compat as compat
 
 
 REVISIONS = (
-    "7ca527b8906d018124756182274335cbff936d72",
+    "208ce23f0c005d3702d114f535fe21564b3b79b6",
     "870c298ff1c0c21901bdf79d341bf97d121f389c",
     "38e9a281396e5263647ba68724414848841525d7",
 )
 EXPECTED_VARIANTS = ("phase1-5", "phase6", "phase7-8")
+APPROVED_REVISIONS = {
+    "208ce23f0c005d3702d114f535fe21564b3b79b6": "phase1-5",
+    "0c4623ba1793395ae8f5c3df2a2524a27d89bc80": "phase1-5",
+    "7d294d68eaadc8c55b92be4f5589278c8a2f78f2": "phase1-5",
+    "cbf92b62284b2a93e506f59187ac94a5336b0be3": "phase1-5",
+    "3a10e9cc45050f7a6f846f9f1adb8d5f4157f9a5": "phase1-5",
+    "870c298ff1c0c21901bdf79d341bf97d121f389c": "phase6",
+    "38e9a281396e5263647ba68724414848841525d7": "phase7-8",
+    "6c8d0c7651c2aa2e5c396d0f57c2e4e18c322310": "phase7-8",
+}
 
 
 def sha256(path: Path) -> str:
@@ -85,6 +95,7 @@ class HistoricalHarnessCompatTest(unittest.TestCase):
         return product, harness, metadata, result
 
     def test_all_three_approved_variants_are_exact_and_auditable(self) -> None:
+        self.assertEqual(compat._APPROVED_PRODUCT_REVISIONS, APPROVED_REVISIONS)
         for index, (revision, expected_variant) in enumerate(
             zip(REVISIONS, EXPECTED_VARIANTS, strict=True)
         ):
@@ -255,9 +266,35 @@ class HistoricalHarnessCompatTest(unittest.TestCase):
             cwd=unknown,
         )
         unknown_revision = run(("/usr/bin/git", "rev-parse", "HEAD"), cwd=unknown)
-        with self.assertRaisesRegex(compat.CompatibilityError, "unknown historical base"):
+        with self.assertRaisesRegex(compat.CompatibilityError, "approved capture checkpoint"):
             compat.materialize_historical_harness(
                 self.output("unknown"), unknown, unknown_revision
+            )
+
+        same_bytes = self.clone(REVISIONS[0], "product-unlisted-same-bytes")
+        original_digest = sha256(same_bytes / compat.HARNESS_RELATIVE_PATH)
+        run(
+            (
+                "/usr/bin/git",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "same harness, unlisted commit",
+            ),
+            cwd=same_bytes,
+        )
+        self.assertEqual(
+            sha256(same_bytes / compat.HARNESS_RELATIVE_PATH), original_digest
+        )
+        unlisted_revision = run(("/usr/bin/git", "rev-parse", "HEAD"), cwd=same_bytes)
+        with self.assertRaisesRegex(compat.CompatibilityError, "approved capture checkpoint"):
+            compat.materialize_historical_harness(
+                self.output("unlisted-same-bytes"), same_bytes, unlisted_revision
             )
 
     def test_wrong_context_and_already_patched_bytes_are_rejected(self) -> None:
@@ -416,6 +453,67 @@ class HistoricalHarnessCompatTest(unittest.TestCase):
         self.assertEqual(harness2.read_bytes(), original_harness)
         self.assertEqual(metadata2.read_bytes(), original_metadata)
         self.assertEqual(result2["harness_sha256"], sha256(harness2))
+
+    def test_final_self_audit_failure_rolls_back_only_owned_inodes(self) -> None:
+        revision = REVISIONS[2]
+        product = self.clone(revision, "product-self-audit-rollback")
+        harness = self.output("self-audit-rollback")
+        metadata = harness.with_name(harness.name + ".metadata.json")
+        original_unlink = compat._unlink_if_owned
+        unlink_order: list[Path] = []
+
+        def recording_unlink(path: Path, identity: tuple[int, int]) -> None:
+            unlink_order.append(path)
+            original_unlink(path, identity)
+
+        with mock.patch.object(
+            compat,
+            "audit_materialized_harness",
+            side_effect=compat.CompatibilityError("forced final self-audit failure"),
+        ), mock.patch.object(
+            compat, "_unlink_if_owned", side_effect=recording_unlink
+        ):
+            with self.assertRaisesRegex(compat.CompatibilityError, "forced final"):
+                compat.materialize_historical_harness(harness, product, revision)
+        self.assertEqual(unlink_order, [metadata, harness])
+        self.assertFalse(os.path.lexists(metadata))
+        self.assertFalse(os.path.lexists(harness))
+
+        product2 = self.clone(revision, "product-self-audit-race")
+        raced_harness = self.output("self-audit-race")
+        raced_metadata = raced_harness.with_name(
+            raced_harness.name + ".metadata.json"
+        )
+
+        def racing_audit(
+            audited_harness: Path,
+            audited_metadata: Path,
+            expected_harness_sha256: str,
+            expected_metadata_sha256: str,
+            product_repo_root: Path,
+            expected_product_revision: str,
+        ) -> Mapping[str, object]:
+            del (
+                audited_harness,
+                expected_harness_sha256,
+                expected_metadata_sha256,
+                product_repo_root,
+                expected_product_revision,
+            )
+            audited_metadata.unlink()
+            audited_metadata.write_bytes(b"racing foreign metadata\n")
+            os.chmod(audited_metadata, 0o444)
+            raise compat.CompatibilityError("forced raced final self-audit failure")
+
+        with mock.patch.object(
+            compat, "audit_materialized_harness", side_effect=racing_audit
+        ):
+            with self.assertRaisesRegex(compat.CompatibilityError, "forced raced"):
+                compat.materialize_historical_harness(
+                    raced_harness, product2, revision
+                )
+        self.assertFalse(os.path.lexists(raced_harness))
+        self.assertEqual(raced_metadata.read_bytes(), b"racing foreign metadata\n")
 
 
 if __name__ == "__main__":
