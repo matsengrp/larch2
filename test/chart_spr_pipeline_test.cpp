@@ -475,10 +475,6 @@ void test_finite_admission_exact_boundary() {
       exact_options.before_candidate_pipeline_start_for_tests = [&] {
         exact_starts.fetch_add(1, std::memory_order_relaxed);
       };
-      exact_options.before_candidate_pipeline_score_batch_for_tests =
-          [](std::size_t batch) {
-            if (batch == 0) std::this_thread::sleep_for(10ms);
-          };
       exact_options.enumeration
           .before_sampled_tree_projection_workspace_allocation_for_tests = [&] {
         exact_projection_allocations.fetch_add(1, std::memory_order_relaxed);
@@ -569,8 +565,11 @@ void test_finite_admission_exact_boundary() {
       CHECK(exact_state.counters.lazy_local_iteration_envelope_bytes_max ==
             envelope);
       if (source == larch::chart_spr_candidate_source::grammar) {
-        CHECK(exact.candidate_generation
-                  .candidate_pipeline_serial_overlap_batches > 0);
+        // A tight finite envelope may admit a single grammar construction per
+        // wave.  In that case the scheduler handoff correctly serializes the
+        // next construction behind scoring, so overlap is not an admission
+        // invariant.  test_full_slot_cancellation_drains_and_recovers proves
+        // non-vacuous producer/consumer overlap independently.
         CHECK(
             exact.candidate_generation.grammar_candidate_admitted_wave_width ==
             selected_grammar_plan.planned_grammar_candidate_wave_size);
