@@ -67,6 +67,7 @@ class SyntheticEvidence:
         expected_outcome: str = "ok",
         supplement: str | None = None,
         semantic_key: str | None = None,
+        top_k: int | None = None,
     ) -> None:
         key = fixture if semantic_key is None else semantic_key
         requested = "-" if worker == "native" else ("0" if worker == "auto" else worker)
@@ -103,7 +104,11 @@ class SyntheticEvidence:
             iterations="1",
             seed="1",
             chart_max_candidates="32" if method != cross.METHOD_LB else "64",
-            chart_top_k_exact="4" if method in (cross.METHOD_EXACT, cross.METHOD_HYBRID) else "0",
+            chart_top_k_exact=str(
+                top_k
+                if top_k is not None else
+                (4 if method in (cross.METHOD_EXACT, cross.METHOD_HYBRID) else 0)
+            ),
             acceptance="-" if worker == "native" else "synthetic",
             objective="-" if worker == "native" else "synthetic",
             candidate_source="-" if worker == "native" else "synthetic",
@@ -128,22 +133,37 @@ class SyntheticEvidence:
 
     def _make_manifest_rows(self) -> None:
         # Phase 0/1/2/3/5 named rows.
-        for template, method, fixture in (
-            (cross.SMALL_DENSE, cross.METHOD_LB, "small"),
-            (cross.SMALL_EXACT, cross.METHOD_EXACT, "small"),
-            (cross.MEDIUM_DENSE, cross.METHOD_LB, "medium"),
-            (cross.MEDIUM_CACHE, cross.METHOD_LB, "medium"),
-            (cross.MEDIUM_LAZY, cross.METHOD_LB, "medium"),
-            (cross.MEDIUM_EXACT, cross.METHOD_EXACT, "medium"),
+        for template, method, fixture, group in (
+            (cross.SMALL_DENSE, cross.METHOD_LB, "small", "p0-small-dense-physical"),
+            (cross.SMALL_EXACT, cross.METHOD_EXACT, "small", "p0-small-exact1-physical"),
+            (cross.MEDIUM_DENSE, cross.METHOD_LB, "medium", "p0-medium-dense-physical"),
+            (cross.MEDIUM_CACHE, cross.METHOD_LB, "medium", "p0-medium-cache-physical"),
+            (cross.MEDIUM_LAZY, cross.METHOD_LB, "medium", "p0-medium-lazy-physical"),
+            (cross.MEDIUM_EXACT, cross.METHOD_EXACT, "medium", "p0-medium-exact1-physical"),
         ):
-            for worker in (1, 8):
+            for worker in (1, 2, 4, 8):
                 outcome = "timeout" if template == cross.MEDIUM_LAZY and worker == 1 else "ok"
-                self.add_manifest(template.format(worker), "micro", fixture, method, str(worker), expected_outcome=outcome)
+                self.add_manifest(
+                    template.format(worker),
+                    group,
+                    fixture,
+                    method,
+                    str(worker),
+                    expected_outcome=outcome,
+                    top_k=(1 if template in (cross.SMALL_EXACT, cross.MEDIUM_EXACT) else 0),
+                )
 
         self.add_manifest("p0-native-medium-physical-i1-m50", "p0-primary-physical", "medium", cross.METHOD_NATIVE, "native")
         for method, short in METHOD_SHORT.items():
-            for worker in (1, 8):
-                self.add_manifest(f"p0-medium-primary32k4-{short}-w{worker}", "p0-primary-physical", "medium", method, str(worker))
+            for worker in (1, 2, 4, 8):
+                self.add_manifest(
+                    f"p0-medium-primary32k4-{short}-w{worker}",
+                    "p0-primary-physical",
+                    "medium",
+                    method,
+                    str(worker),
+                    top_k=4,
+                )
 
         self.add_manifest("p0-native-medium-smt-i1-m50", "p0-primary-smt", "medium", cross.METHOD_NATIVE, "native")
         for worker_token in ("1", "2", "4", "8", "16", "auto", "default"):
@@ -155,16 +175,34 @@ class SyntheticEvidence:
             self.add_manifest(f"p0-small-auto-grammar-lower-bound-heuristic-w{worker_token}", "p0-small-auto", "small", cross.METHOD_LB, worker_token)
 
         for fixture in ("small", "medium"):
-            self.add_manifest(f"p0-native-{fixture}-physical-i3-m50", "p0-stress-physical", fixture, cross.METHOD_NATIVE, "native")
+            stress_group = (
+                "p0-small-stress-physical"
+                if fixture == "small" else "p0-stress-physical"
+            )
+            self.add_manifest(
+                f"p0-native-{fixture}-physical-i3-m50",
+                stress_group,
+                fixture,
+                cross.METHOD_NATIVE,
+                "native",
+            )
             for method, short in METHOD_SHORT.items():
-                for worker in (1, 8):
-                    self.add_manifest(f"p0-{fixture}-stress128k16-{short}-w{worker}", "p0-stress-physical", fixture, method, str(worker))
+                for worker in (1, 2, 4, 8):
+                    self.add_manifest(
+                        f"p0-{fixture}-stress128k16-{short}-w{worker}",
+                        stress_group,
+                        fixture,
+                        method,
+                        str(worker),
+                        top_k=16,
+                    )
 
         for worker in (1, 8):
             self.add_manifest(
                 f"p0-real20d-preflight-grammar-exact-w{worker}",
                 "real-bounded", "real20d", cross.METHOD_EXACT, str(worker),
                 expected_outcome="expected_infeasible",
+                top_k=1,
             )
 
         for fixture in ("high-compression", "dense-favoring"):
@@ -288,6 +326,7 @@ class SyntheticEvidence:
             seed = manifest["seed"]
             input_sha = manifest["primary_sha256"]
             refseq_sha = manifest["refseq_sha256"]
+            top_k = int(manifest["chart_top_k_exact"])
             expected_outcome = (
                 manifest["expected_outcome"]
                 if label in ("phase0", "final-real") else "ok"
@@ -296,6 +335,8 @@ class SyntheticEvidence:
                 search = digest(f"search:{fixture}:{method}")
                 output = digest(f"output:{fixture}:{method}")
                 trial_hash = digest(f"trial:{row_id}")
+                policy = "explicit"
+                resolved = worker
         else:
             worker = row_id.rsplit("-w", 1)[1]
             method = cross.METHOD_SAMPLED if row_id.startswith("phase8-") else (cross.METHOD_EXACT if row_id.startswith("phase9-") else cross.METHOD_LB)
@@ -320,7 +361,25 @@ class SyntheticEvidence:
             seed = row_id.split("seed", 1)[1].split("-", 1)[0] if row_id.startswith("phase9-") else "1"
             input_sha = digest(f"input:{fixture}")
             refseq_sha = "-"
+            top_k = 4 if method in (cross.METHOD_EXACT, cross.METHOD_HYBRID) else 0
             expected_outcome = "ok"
+        exact_count = (
+            top_k * int(iterations)
+            if method != cross.METHOD_NATIVE and expected_outcome == "ok"
+            else 0
+        )
+        resolved_count = (
+            int(resolved)
+            if resolved not in ("-", "NA") else 0
+        )
+        candidate_parallel = int(exact_count > 1 and resolved_count > 1)
+        inner_parallel = int(
+            exact_count == 1 and resolved_count > 1
+        )
+        peak_exact = (
+            min(exact_count, resolved_count)
+            if candidate_parallel else int(exact_count > 0)
+        )
         report = self.root / label / "reports" / f"{row_id}.{trial}.out"
         report.parent.mkdir(parents=True, exist_ok=True)
         lazy = overrides.pop("lazy", "on" if "high-compression" in row_id or "medium-auto" in row_id else "off")
@@ -358,15 +417,32 @@ class SyntheticEvidence:
             candidate_source=(manifest["candidate_source"] if manifest else "synthetic"),
             candidates_generated="96" if iterations == "3" else "32",
             candidates_scored="96" if iterations == "3" else "32",
-            exact_verifications="12" if iterations == "3" else "4",
+            exact_verifications=str(exact_count),
             accepted_moves="3" if iterations == "3" else "0",
             initial_validated_parsimony_min="100", final_validated_parsimony_min="90",
             best_reported_objective="90", candidate_generation_ms="100",
             exact_initialization_ms="50", initial_chart_construction_ms="50",
-            local_scoring_ms="100", exact_verification_ms="50",
+            local_scoring_ms="100",
+            exact_verification_ms="50" if exact_count else "0",
             accepted_rebuild_ms="0", total_ms="200",
             chart_cache_resident_bytes="1000000",
-            exact_candidate_peak_projected_resident_bytes="2000000",
+            peak_concurrent_exact_verifiers=str(peak_exact),
+            chart_axis_exact_candidate_active_worker_high_water=str(peak_exact),
+            exact_candidate_admission_batches=str(int(exact_count > 0)),
+            exact_candidate_parallel_batches=str(candidate_parallel),
+            exact_candidate_inner_parallel_batches=str(inner_parallel),
+            exact_candidate_memory_limited_batches="0",
+            exact_candidate_peak_admitted_bytes=(
+                "1000000" if exact_count else "0"
+            ),
+            exact_candidate_peak_projected_resident_bytes=(
+                "2000000" if exact_count else "0"
+            ),
+            exact_candidate_queued_for_memory_ms="0",
+            exact_candidate_timing_count=str(exact_count),
+            exact_candidate_verification_ms_min=("10" if exact_count else "0"),
+            exact_candidate_verification_ms_mean=("10" if exact_count else "0"),
+            exact_candidate_verification_ms_max=("10" if exact_count else "0"),
             report_path=str(recorded_report),
         )
         if method == cross.METHOD_NATIVE:
@@ -493,11 +569,67 @@ class SyntheticEvidence:
         self.write_raw("phase2", {cross.MEDIUM_DENSE.format(1), cross.SMALL_EXACT.format(1)}, 5,
                        times={cross.SMALL_EXACT.format(1): "0.7"},
                        row_overrides={cross.MEDIUM_DENSE.format(1): {"local_scoring_ms": "65"}})
-        self.write_raw("phase3", {cross.SMALL_DENSE.format(1), cross.SMALL_DENSE.format(8)}, 5,
-                       times={cross.SMALL_DENSE.format(1): "1", cross.SMALL_DENSE.format(8): "1.04"})
+        phase3_ids = {
+            cross.SMALL_DENSE.format(1),
+            cross.SMALL_DENSE.format(8),
+            cross.MEDIUM_DENSE.format(1),
+        }
+        self.write_raw(
+            "phase3",
+            phase3_ids,
+            5,
+            times={
+                cross.SMALL_DENSE.format(1): "1",
+                cross.SMALL_DENSE.format(8): "1.04",
+            },
+            row_overrides={
+                cross.MEDIUM_DENSE.format(1): {"local_scoring_ms": "100"}
+            },
+        )
+        phase4_ids = {
+            template.format(worker)
+            for template in (cross.MEDIUM_DENSE, cross.MEDIUM_CACHE)
+            for worker in (1, 2, 4, 8)
+        }
+        phase4_overrides: dict[str, dict[str, str]] = {}
+        for phase4_worker in (1, 2, 4, 8):
+            phase4_overrides[cross.MEDIUM_DENSE.format(phase4_worker)] = {
+                "local_scoring_ms": "100" if phase4_worker == 1 else "40"
+            }
+            phase4_overrides[cross.MEDIUM_CACHE.format(phase4_worker)] = {
+                "initial_chart_construction_ms": "100" if phase4_worker == 1 else "40"
+            }
+        self.write_raw(
+            "phase4", phase4_ids, 5, row_overrides=phase4_overrides
+        )
         self.write_raw("phase5", {cross.MEDIUM_EXACT.format(1), cross.MEDIUM_EXACT.format(8)}, 5,
                        times={cross.MEDIUM_EXACT.format(1): "100", cross.MEDIUM_EXACT.format(8): "100"},
                        row_overrides={cross.MEDIUM_EXACT.format(1): {"exact_initialization_ms": "50", "exact_verification_ms": "50"}, cross.MEDIUM_EXACT.format(8): {"exact_initialization_ms": "20", "exact_verification_ms": "20"}})
+
+        phase6_ids = {
+            cross.MEDIUM_EXACT.format(worker) for worker in (1, 2, 4, 8)
+        } | {
+            row_id
+            for row_id, row in self.manifest_rows.items()
+            if row["run_group"] in ("p0-primary-physical", "p0-stress-physical")
+            and row["method"] != cross.METHOD_NATIVE
+        }
+        phase6_overrides: dict[str, dict[str, str]] = {}
+        for row_id in phase6_ids:
+            row = self.manifest_rows[row_id]
+            if row["run_group"] == "p0-primary-physical" and row["method"] == cross.METHOD_EXACT:
+                phase6_worker = int(cross.manifest_worker(row))
+                phase6_overrides[row_id] = {
+                    "exact_verification_ms": {
+                        1: "100",
+                        2: "80",
+                        4: "60",
+                        8: "50",
+                    }[phase6_worker]
+                }
+        self.write_raw(
+            "phase6", phase6_ids, 3, row_overrides=phase6_overrides
+        )
 
         high = {f"phase7-lazy-high-compression-{p}-w{w}" for p in ("off", "on", "auto") for w in (1, 8)}
         phase7_group_complete = {
@@ -522,17 +654,49 @@ class SyntheticEvidence:
                        row_overrides={next(rid for rid in p8 if rid.endswith("w1")): {"candidate_generation_ms": "100"}, next(rid for rid in p8 if rid.endswith("w8")): {"candidate_generation_ms": "40"}})
         self.write_raw("phase8-end-to-end", p8, 5, times={rid: "1" for rid in p8})
 
+        final_scaling = self._group(
+            "p0-primary-physical", {"1", "2", "4", "8"}
+        )
+        scaling_times: dict[str, str] = {}
+        scaling_overrides: dict[str, dict[str, str]] = {}
+        for rid in final_scaling:
+            row = self.manifest_rows[rid]
+            scaling_worker = cross.manifest_worker(row)
+            if row["method"] == cross.METHOD_NATIVE:
+                scaling_times[rid] = "1"
+            elif row["method"] == cross.METHOD_EXACT:
+                scaling_times[rid] = {
+                    "1": "0.8",
+                    "2": "0.65",
+                    "4": "0.5",
+                    "8": "0.4",
+                }[scaling_worker]
+                scaling_overrides[rid] = {
+                    "initial_chart_construction_ms": "100" if scaling_worker == "1" else "50",
+                    "local_scoring_ms": "100" if scaling_worker == "1" else "50",
+                    "exact_verification_ms": "100" if scaling_worker == "1" else "50",
+                }
+            else:
+                scaling_times[rid] = "0.9"
+        self.write_raw(
+            "final-scaling",
+            final_scaling,
+            3,
+            times=scaling_times,
+            row_overrides=scaling_overrides,
+        )
+
         primary = self._group("p0-primary-physical", {"1", "8"})
         p_times = {}
         p_overrides = {}
         for rid in primary:
             row = self.manifest_rows[rid]
-            worker = cross.manifest_worker(row)
+            primary_worker = cross.manifest_worker(row)
             if row["method"] == cross.METHOD_NATIVE:
                 p_times[rid] = "1"
             elif row["method"] == cross.METHOD_EXACT:
-                p_times[rid] = "0.8" if worker == "1" else "0.4"
-                p_overrides[rid] = {"initial_chart_construction_ms": "100" if worker == "1" else "50", "local_scoring_ms": "100" if worker == "1" else "50", "exact_verification_ms": "100" if worker == "1" else "50"}
+                p_times[rid] = "0.8" if primary_worker == "1" else "0.4"
+                p_overrides[rid] = {"initial_chart_construction_ms": "100" if primary_worker == "1" else "50", "local_scoring_ms": "100" if primary_worker == "1" else "50", "exact_verification_ms": "100" if primary_worker == "1" else "50"}
             else:
                 p_times[rid] = "0.9"
         self.write_raw("final-primary", primary, 5, times=p_times, row_overrides=p_overrides)
@@ -545,14 +709,19 @@ class SyntheticEvidence:
         unpinned = self._group("p0-primary-smt", {"auto"})
         self.write_raw("final-unpinned-auto", unpinned, 5, times={rid: ("1" if cross.manifest_worker(self.manifest_rows[rid]) == "native" else "0.9") for rid in unpinned})
         default = self._group("p0-primary-smt", {"auto", "default"})
-        self.write_raw("final-default-auto", default, 5, times={rid: ("1" if cross.manifest_worker(self.manifest_rows[rid]) == "native" else ("1.05" if cross.manifest_worker(self.manifest_rows[rid]) == "default" else "1")) for rid in default})
+        self.write_raw(
+            "final-default-auto",
+            default,
+            5,
+            times={rid: "1" for rid in default},
+        )
 
         stress = self._group("p0-stress-physical", {"1", "8"})
         stress_times, stress_overrides = {}, {}
         for rid in stress:
-            worker = cross.manifest_worker(self.manifest_rows[rid])
-            stress_times[rid] = "1" if worker in ("native", "1") else "0.9"
-            if worker not in ("native",):
+            stress_worker = cross.manifest_worker(self.manifest_rows[rid])
+            stress_times[rid] = "1" if stress_worker in ("native", "1") else "0.9"
+            if stress_worker not in ("native",):
                 stress_overrides[rid] = {"total_ms": "200"}
         self.write_raw("final-stress", stress, 3, times=stress_times, row_overrides=stress_overrides)
 
@@ -664,6 +833,29 @@ class SyntheticEvidence:
             writer = csv.DictWriter(handle, fieldnames=header, delimiter="\t", lineterminator="\n")
             writer.writeheader()
             writer.writerows(rows)
+
+    def remove_rows(
+        self,
+        label: str,
+        predicate: Callable[[Mapping[str, str]], bool],
+    ) -> None:
+        path = self.raw_paths[label]
+        with path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            assert reader.fieldnames is not None
+            header = reader.fieldnames
+            rows = list(reader)
+        retained = [row for row in rows if not predicate(row)]
+        assert len(retained) < len(rows)
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=header,
+                delimiter="\t",
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerows(retained)
 
     def remove_column(self, label: str, column: str) -> None:
         path = self.raw_paths[label]
@@ -841,11 +1033,19 @@ class SyntheticEvidence:
 
 
 class Invocation:
-    def __init__(self, returncode: int, stdout: str, stderr: str, calls: list[tuple[object, ...]]) -> None:
+    def __init__(
+        self,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        phase4_calls: list[tuple[object, ...]],
+        phase9_calls: list[tuple[object, ...]],
+    ) -> None:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
-        self.phase9_calls = calls
+        self.phase4_calls = phase4_calls
+        self.phase9_calls = phase9_calls
 
 
 class CrossPhaseAcceptanceTest(unittest.TestCase):
@@ -853,13 +1053,28 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
         self,
         data: SyntheticEvidence,
         *,
+        phase4_failure: str | None = None,
+        phase4_status: str = "pass",
         phase9_failure: str | None = None,
         **command_options: object,
     ) -> Invocation:
-        calls: list[tuple[object, ...]] = []
+        phase4_calls: list[tuple[object, ...]] = []
+        phase9_calls: list[tuple[object, ...]] = []
+
+        def phase4_validator(*args: object) -> dict[str, object]:
+            phase4_calls.append(args)
+            if phase4_failure is not None:
+                raise cross.AcceptanceError(phase4_failure)
+            return {
+                "schema_version": 1,
+                "status": phase4_status,
+                "gates": [
+                    {"name": "synthetic_deep_phase4", "status": "pass"}
+                ],
+            }
 
         def phase9_validator(*args: object) -> dict[str, object]:
-            calls.append(args)
+            phase9_calls.append(args)
             if phase9_failure is not None:
                 raise cross.AcceptanceError(phase9_failure)
             return {
@@ -873,9 +1088,16 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
         with redirect_stdout(stdout), redirect_stderr(stderr):
             returncode = cross.main(
                 data.command(**command_options),  # type: ignore[arg-type]
+                phase4_validator=phase4_validator,
                 phase9_validator=phase9_validator,
             )
-        return Invocation(returncode, stdout.getvalue(), stderr.getvalue(), calls)
+        return Invocation(
+            returncode,
+            stdout.getvalue(),
+            stderr.getvalue(),
+            phase4_calls,
+            phase9_calls,
+        )
 
     def test_complete_group_shaped_matrix_passes_without_writes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-positive-") as name:
@@ -888,8 +1110,23 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload["status"], "pass")
+            self.assertEqual(payload["schema_version"], cross.SCHEMA_VERSION)
             self.assertEqual(payload["run_labels"], list(cross.RUN_LABELS))
+            self.assertEqual(payload["phase4_acceptance"]["status"], "pass")
             self.assertEqual(payload["phase9_acceptance"]["status"], "pass")
+            self.assertEqual(len(result.phase4_calls), 1)
+            phase4_evidence = result.phase4_calls[0][0]
+            self.assertIsInstance(phase4_evidence, cross.RawEvidence)
+            assert isinstance(phase4_evidence, cross.RawEvidence)
+            self.assertEqual(phase4_evidence.label, "phase4")
+            self.assertEqual(
+                result.phase4_calls[0][1], data.raw_paths["phase3"].resolve()
+            )
+            self.assertEqual(result.phase4_calls[0][2], ROOT)
+            phase4_memory = result.phase4_calls[0][3]
+            self.assertIsInstance(phase4_memory, int)
+            assert isinstance(phase4_memory, int)
+            self.assertGreater(phase4_memory, 0)
             self.assertEqual(len(result.phase9_calls), 1)
             self.assertEqual(result.phase9_calls[0][2], data.root)
             self.assertEqual(result.phase9_calls[0][3], ROOT)
@@ -915,6 +1152,137 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             result = self.run_case(data)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("phase2_medium_local_vs_phase0", result.stderr)
+
+    def test_phase4_matrix_and_deep_acceptance_are_mandatory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p4-deep-") as name:
+            result = self.run_case(
+                SyntheticEvidence(Path(name)),
+                phase4_failure="synthetic deep Phase-4 failure",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("synthetic deep Phase-4 failure", result.stderr)
+            self.assertEqual(len(result.phase4_calls), 1)
+            self.assertFalse(result.phase9_calls)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p4-matrix-") as name:
+            data = SyntheticEvidence(Path(name))
+            missing = cross.MEDIUM_CACHE.format(2)
+            data.remove_rows("phase4", lambda row: row["row_id"] == missing)
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(missing, result.stderr)
+            self.assertFalse(result.phase4_calls)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p4-deferred-") as name:
+            result = self.run_case(
+                SyntheticEvidence(Path(name)),
+                phase4_status="deferred_baseline",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("did not return final status=pass", result.stderr)
+
+    def test_phase6_complete_matrix_speed_and_scheduler_gates(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p6-matrix-") as name:
+            data = SyntheticEvidence(Path(name))
+            missing = cross.MEDIUM_EXACT.format(2)
+            data.remove_rows("phase6", lambda row: row["row_id"] == missing)
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(missing, result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p6-speed-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase6",
+                lambda row: row["row_id"] == "p0-medium-primary32k4-grammar-exact-w8",
+                {"exact_verification_ms": "51"},
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "phase6_topk4_exact_verification_w8_over_w1",
+                result.stderr,
+            )
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p6-axis-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase6",
+                lambda row: row["row_id"] == "p0-medium-primary32k4-grammar-exact-w8",
+                {"exact_candidate_parallel_batches": "0"},
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("candidate-parallel path was not activated", result.stderr)
+
+    def test_phase6_admission_rss_and_repeat_gates_are_strict(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p6-admission-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase6",
+                lambda row: row["row_id"] == "p0-medium-stress128k16-grammar-exact-w8"
+                and row["trial_index"] == "1",
+                {
+                    "exact_candidate_peak_projected_resident_bytes": str(
+                        12 * 1024**3 + 1
+                    )
+                },
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("projected resident bytes exceed", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p6-rss-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase6",
+                lambda row: row["row_id"] == "p0-medium-stress128k16-grammar-exact-w8",
+                {"peak_sampled_rss_kb": "210001"},
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("phase6_topk16_grammar_exact_ratio", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p6-repeat-") as name:
+            data = SyntheticEvidence(Path(name))
+            changed = digest("changed repeated W8 canonical result")
+            data.mutate(
+                "phase6",
+                lambda row: row["row_id"] == "p0-medium-primary32k4-grammar-exact-w8"
+                and row["trial_index"] == "2",
+                {
+                    "trial_semantic_sha256": changed,
+                    "canonical_digest": changed,
+                },
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("trial_semantic_sha256", result.stderr)
+
+    def test_final_physical_scaling_matrix_and_speed_are_mandatory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-final-scale-matrix-") as name:
+            data = SyntheticEvidence(Path(name))
+            missing = "p0-medium-primary32k4-grammar-exact-w2"
+            data.remove_rows("final-scaling", lambda row: row["row_id"] == missing)
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(missing, result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-final-scale-speed-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "final-scaling",
+                lambda row: row["row_id"] == "p0-medium-primary32k4-grammar-exact-w8",
+                {"wall_clock_s": "0.41"},
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("final_scaling_grammar_w8_over_w1", result.stderr)
+
+    def test_default_unpinned_median_must_reach_native_parity(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-default-native-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "final-default-auto",
+                lambda row: row["requested_workers"] == "default",
+                {"wall_clock_s": "1.05"},
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("final_default_native_parity", result.stderr)
 
     def test_later_timeout_cannot_reuse_frozen_timeout(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-timeout-") as name:
@@ -1170,6 +1538,13 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             result = self.run_case(data)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(cross.ADMISSION_FIELD, result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-phase6-schema-") as name:
+            data = SyntheticEvidence(Path(name))
+            field = "exact_candidate_admission_batches"
+            data.remove_column("phase6", field)
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(field, result.stderr)
 
 
 if __name__ == "__main__":

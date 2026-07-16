@@ -26,7 +26,7 @@ from typing import Callable, Mapping, Sequence
 
 
 SCHEMA = "wric.cross_phase_acceptance"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 UINT_RE = re.compile(r"^(0|[1-9][0-9]*)$")
 
@@ -34,12 +34,15 @@ RUN_LABELS = (
     "phase1",
     "phase2",
     "phase3",
+    "phase4",
     "phase5",
+    "phase6",
     "phase7-high",
     "phase7-small",
     "phase7-auto",
     "phase8-generation",
     "phase8-end-to-end",
+    "final-scaling",
     "final-primary",
     "final-smt",
     "final-small-auto",
@@ -69,18 +72,45 @@ RAW_COLUMNS = (
     "candidate_generation_ms", "exact_initialization_ms",
     "initial_chart_construction_ms", "local_scoring_ms", "exact_verification_ms",
     "accepted_rebuild_ms", "total_ms", "chart_cache_resident_bytes",
-    "exact_candidate_peak_projected_resident_bytes", "report_path",
+    "peak_concurrent_exact_verifiers",
+    "chart_axis_exact_candidate_active_worker_high_water",
+    "exact_candidate_admission_batches", "exact_candidate_parallel_batches",
+    "exact_candidate_inner_parallel_batches",
+    "exact_candidate_memory_limited_batches",
+    "exact_candidate_peak_admitted_bytes",
+    "exact_candidate_peak_projected_resident_bytes",
+    "exact_candidate_queued_for_memory_ms", "exact_candidate_timing_count",
+    "exact_candidate_verification_ms_min",
+    "exact_candidate_verification_ms_mean",
+    "exact_candidate_verification_ms_max", "report_path",
 )
 
 HISTORICAL_PRE_ADMISSION_LABELS = frozenset(
-    ("phase0", "phase1", "phase2", "phase3", "phase5")
+    ("phase0", "phase1", "phase2", "phase3", "phase4", "phase5")
 )
 ADMISSION_FIELD = "exact_candidate_peak_projected_resident_bytes"
+ADMISSION_FIELDS = frozenset(
+    (
+        "peak_concurrent_exact_verifiers",
+        "chart_axis_exact_candidate_active_worker_high_water",
+        "exact_candidate_admission_batches",
+        "exact_candidate_parallel_batches",
+        "exact_candidate_inner_parallel_batches",
+        "exact_candidate_memory_limited_batches",
+        "exact_candidate_peak_admitted_bytes",
+        ADMISSION_FIELD,
+        "exact_candidate_queued_for_memory_ms",
+        "exact_candidate_timing_count",
+        "exact_candidate_verification_ms_min",
+        "exact_candidate_verification_ms_mean",
+        "exact_candidate_verification_ms_max",
+    )
+)
 
 
 def required_raw_columns(label: str) -> tuple[str, ...]:
     if label in HISTORICAL_PRE_ADMISSION_LABELS:
-        return tuple(field for field in RAW_COLUMNS if field != ADMISSION_FIELD)
+        return tuple(field for field in RAW_COLUMNS if field not in ADMISSION_FIELDS)
     return RAW_COLUMNS
 
 MANIFEST_COLUMNS = (
@@ -747,8 +777,13 @@ def load_raw(
         elif current_header != header:
             historical_compatible = (
                 label in HISTORICAL_PRE_ADMISSION_LABELS
-                and tuple(field for field in current_header if field != ADMISSION_FIELD)
-                == tuple(field for field in header if field != ADMISSION_FIELD)
+                and tuple(
+                    field for field in current_header
+                    if field not in ADMISSION_FIELDS
+                )
+                == tuple(
+                    field for field in header if field not in ADMISSION_FIELDS
+                )
             )
             if not historical_compatible:
                 raise AcceptanceError(f"{label}: raw TSV headers differ")
@@ -787,6 +822,134 @@ def is_hash_or_dash(value: str) -> bool:
     # The frozen harness uses NA for the absent raw DAG refseq column while
     # workload manifests use '-'.  Neither spelling is a wildcard.
     return value in ("-", "NA") or HASH_RE.fullmatch(value) is not None
+
+
+def validate_exact_candidate_admission(
+    row: Mapping[str, str], where: str, budget: int
+) -> int:
+    exact = uint(row["exact_verifications"], f"{where} exact verifications")
+    peak = uint(
+        row["peak_concurrent_exact_verifiers"],
+        f"{where} peak concurrent exact verifiers",
+    )
+    axis = uint(
+        row["chart_axis_exact_candidate_active_worker_high_water"],
+        f"{where} exact-candidate active-worker high-water",
+    )
+    batches = uint(
+        row["exact_candidate_admission_batches"],
+        f"{where} exact-candidate admission batches",
+    )
+    parallel = uint(
+        row["exact_candidate_parallel_batches"],
+        f"{where} exact-candidate parallel batches",
+    )
+    inner = uint(
+        row["exact_candidate_inner_parallel_batches"],
+        f"{where} exact-candidate inner-parallel batches",
+    )
+    limited = uint(
+        row["exact_candidate_memory_limited_batches"],
+        f"{where} exact-candidate memory-limited batches",
+    )
+    admitted = uint(
+        row["exact_candidate_peak_admitted_bytes"],
+        f"{where} exact-candidate peak admitted bytes",
+    )
+    projected = uint(
+        row[ADMISSION_FIELD], f"{where} exact-candidate projected resident bytes"
+    )
+    queued = decimal(
+        row["exact_candidate_queued_for_memory_ms"],
+        f"{where} exact-candidate memory-queue time",
+    )
+    timing_count = uint(
+        row["exact_candidate_timing_count"],
+        f"{where} exact-candidate timing count",
+    )
+    timing_min = decimal(
+        row["exact_candidate_verification_ms_min"],
+        f"{where} exact-candidate timing minimum",
+    )
+    timing_mean = decimal(
+        row["exact_candidate_verification_ms_mean"],
+        f"{where} exact-candidate timing mean",
+    )
+    timing_max = decimal(
+        row["exact_candidate_verification_ms_max"],
+        f"{where} exact-candidate timing maximum",
+    )
+    resolved = uint(row["resolved_workers"], f"{where} resolved workers", positive=True)
+
+    if (
+        parallel > batches
+        or inner > batches
+        or limited > batches
+        or parallel + inner > batches
+    ):
+        raise AcceptanceError(
+            f"{where}: exact-candidate admission batch accounting is inconsistent"
+        )
+    if admitted > projected:
+        raise AcceptanceError(
+            f"{where}: exact-candidate admitted bytes exceed projected resident bytes"
+        )
+    if projected > budget:
+        raise AcceptanceError(
+            f"{where}: exact-candidate projected resident bytes exceed the memory budget"
+        )
+    if axis > resolved:
+        raise AcceptanceError(
+            f"{where}: exact-candidate active-worker high-water exceeds resolved workers"
+        )
+    if timing_count != exact:
+        raise AcceptanceError(
+            f"{where}: exact-candidate timing count differs from exact verifications"
+        )
+    if not timing_min <= timing_mean <= timing_max:
+        raise AcceptanceError(f"{where}: exact-candidate timing order is invalid")
+
+    if exact == 0:
+        if any(
+            (
+                peak,
+                axis,
+                batches,
+                parallel,
+                inner,
+                limited,
+                admitted,
+                projected,
+                queued,
+                timing_count,
+                timing_min,
+                timing_mean,
+                timing_max,
+            )
+        ):
+            raise AcceptanceError(
+                f"{where}: zero exact verifications report nonzero admission evidence"
+            )
+    else:
+        if peak < 1 or peak > exact or peak > resolved:
+            raise AcceptanceError(
+                f"{where}: peak exact-verifier concurrency contradicts the work/worker count"
+            )
+        if batches == 0 or admitted == 0 or projected == 0:
+            raise AcceptanceError(
+                f"{where}: exact verifications lack positive admission evidence"
+            )
+    if batches == 0 and any(
+        (parallel, inner, limited, admitted, projected, queued)
+    ):
+        raise AcceptanceError(
+            f"{where}: zero admission batches report nonzero admission evidence"
+        )
+    if limited == 0 and queued != 0:
+        raise AcceptanceError(
+            f"{where}: memory-queue time is nonzero without a memory-limited batch"
+        )
+    return projected
 
 
 def validate_success(
@@ -896,13 +1059,27 @@ def validate_success(
         ):
             decimal(row[key], f"{where} {key}")
         budget = uint(row["configured_chart_memory_budget"], f"{where} memory budget", positive=True)
-        projected_text = row.get(ADMISSION_FIELD)
-        if label in HISTORICAL_PRE_ADMISSION_LABELS and projected_text in (None, "NA"):
-            projected = 0
-        elif projected_text is None:
-            raise AcceptanceError(f"{where}: missing required {ADMISSION_FIELD}")
+        available_admission = {
+            field for field in ADMISSION_FIELDS
+            if row.get(field) not in (None, "NA")
+        }
+        if label in HISTORICAL_PRE_ADMISSION_LABELS and (
+            available_admission != ADMISSION_FIELDS
+        ):
+            projected_text = row.get(ADMISSION_FIELD)
+            if projected_text is None or projected_text == "NA":
+                projected = 0
+            else:
+                projected = uint(
+                    projected_text, f"{where} projected resident bytes"
+                )
+        elif available_admission != ADMISSION_FIELDS:
+            missing = sorted(ADMISSION_FIELDS - available_admission)
+            raise AcceptanceError(
+                f"{where}: missing required exact-candidate admission fields: {missing}"
+            )
         else:
-            projected = uint(projected_text, f"{where} projected resident bytes")
+            projected = validate_exact_candidate_admission(row, where, budget)
         resident = uint(row["chart_cache_resident_bytes"], f"{where} chart resident bytes")
         if projected > budget or resident > budget:
             raise AcceptanceError(f"{where}: chart/exact resident estimate exceeds memory budget")
@@ -1099,7 +1276,18 @@ def validate_evidence(
             validated_required += 1
     for row_id in evidence.row_ids():
         selected = [row for row in evidence.rows if row["row_id"] == row_id]
-        stable = ("fixture", "method", "requested_workers", "input_sha256", "refseq_sha256", "search_semantic_sha256", "output_semantic_sha256", "canonical_argv_sha256")
+        stable = (
+            "fixture",
+            "method",
+            "requested_workers",
+            "input_sha256",
+            "refseq_sha256",
+            "search_semantic_sha256",
+            "output_semantic_sha256",
+            "trial_semantic_sha256",
+            "canonical_argv_sha256",
+            "canonical_digest",
+        )
         for key in stable:
             if len({row[key] for row in selected}) != 1:
                 raise AcceptanceError(f"{evidence.label} {row_id}: {key} changes across repetitions")
@@ -1325,6 +1513,75 @@ def canonical_directory(path: Path, label: str) -> Path:
     return resolved
 
 
+def single_row_source(
+    evidence: RawEvidence, row_id: str, repetitions: int
+) -> Path:
+    owners = {
+        regular(Path(row["__raw_path__"]), f"{evidence.label} owning raw TSV")
+        for row in evidence.selected(row_id, repetitions)
+    }
+    if len(owners) != 1:
+        raise AcceptanceError(
+            f"{evidence.label}: {row_id} repetitions span multiple raw TSV owners"
+        )
+    return next(iter(owners))
+
+
+def deep_phase4_validate(
+    raw: RawEvidence,
+    phase3_raw_path: Path,
+    working_repo_root: Path,
+    physical_memory: int,
+) -> Mapping[str, object]:
+    tool = regular(
+        Path(__file__).with_name("wric_phase4_acceptance.py"),
+        "Phase-4 deep acceptance evaluator",
+    )
+    command = [sys.executable, os.fspath(tool)]
+    for path in raw.paths:
+        command.extend(("--raw-trials", os.fspath(path)))
+    command.extend(
+        (
+            "--repetitions",
+            "5",
+            "--phase3-raw-trials",
+            os.fspath(phase3_raw_path),
+            "--physical-memory-bytes",
+            str(physical_memory),
+        )
+    )
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        command,
+        cwd=working_repo_root,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+        raise AcceptanceError(f"deep Phase-4 acceptance failed: {detail}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise AcceptanceError(
+            f"deep Phase-4 acceptance emitted invalid JSON: {error}"
+        ) from error
+    if not isinstance(payload, dict) or payload.get("status") != "pass":
+        raise AcceptanceError(
+            "deep Phase-4 acceptance did not return final status=pass"
+        )
+    return payload
+
+
+Phase4Validator = Callable[
+    [RawEvidence, Path, Path, int], Mapping[str, object]
+]
+
+
 def deep_phase9_validate(
     manifests: ManifestChain,
     raw: RawEvidence,
@@ -1385,6 +1642,32 @@ Phase9Validator = Callable[
 ]
 
 
+def exact_worker_matrix(
+    manifests: ManifestChain,
+    group: str,
+    top_k: int,
+    methods: Sequence[str],
+) -> dict[tuple[str, int], str]:
+    result: dict[tuple[str, int], str] = {}
+    for method in methods:
+        for worker in (1, 2, 4, 8):
+            matches = [
+                row_id
+                for row_id, row in manifests.base.rows.items()
+                if row["run_group"] == group
+                and row["method"] == method
+                and manifest_worker(row) == str(worker)
+                and row["chart_top_k_exact"] == str(top_k)
+            ]
+            if len(matches) != 1:
+                raise AcceptanceError(
+                    "sealed base does not define exactly one Phase-6 row for "
+                    f"{group}/{method}/TopK{top_k}/W{worker}: {sorted(matches)}"
+                )
+            result[(method, worker)] = matches[0]
+    return result
+
+
 def evaluate(
     base: ManifestChain,
     phase0: RawEvidence,
@@ -1394,6 +1677,7 @@ def evaluate(
     base_repo_root: Path,
     working_repo_root: Path,
     phase9_run_ledger_sha256: str,
+    phase4_validator: Phase4Validator = deep_phase4_validate,
     phase9_validator: Phase9Validator = deep_phase9_validate,
 ) -> dict[str, object]:
     validate_phase0(phase0, base)
@@ -1402,12 +1686,48 @@ def evaluate(
     # group-complete, so sealed extras from these groups remain admissible.
     phase1_ids = {MEDIUM_DENSE.format(1), SMALL_DENSE.format(1), SMALL_EXACT.format(1), MEDIUM_CACHE.format(1), MEDIUM_LAZY.format(1)}
     phase2_ids = {MEDIUM_DENSE.format(1), SMALL_EXACT.format(1)}
-    phase3_ids = {SMALL_DENSE.format(1), SMALL_DENSE.format(8)}
+    phase3_ids = {
+        SMALL_DENSE.format(1),
+        SMALL_DENSE.format(8),
+        MEDIUM_DENSE.format(1),
+    }
+    phase4_ids = {
+        template.format(worker)
+        for template in (MEDIUM_DENSE, MEDIUM_CACHE)
+        for worker in (1, 2, 4, 8)
+    }
     phase5_ids = {MEDIUM_EXACT.format(1), MEDIUM_EXACT.format(8)}
+    phase6_matrices = {
+        1: exact_worker_matrix(
+            base,
+            "p0-medium-exact1-physical",
+            1,
+            (METHOD_EXACT,),
+        ),
+        4: exact_worker_matrix(
+            base,
+            "p0-primary-physical",
+            4,
+            (METHOD_SAMPLED, METHOD_EXACT, METHOD_HYBRID),
+        ),
+        16: exact_worker_matrix(
+            base,
+            "p0-stress-physical",
+            16,
+            (METHOD_SAMPLED, METHOD_EXACT, METHOD_HYBRID),
+        ),
+    }
+    phase6_ids = {
+        row_id
+        for matrix in phase6_matrices.values()
+        for row_id in matrix.values()
+    }
     runs["phase1"].required_rows(phase1_ids, 5, base)
     runs["phase2"].required_rows(phase2_ids, 5, base)
     runs["phase3"].required_rows(phase3_ids, 5, base)
+    runs["phase4"].required_rows(phase4_ids, 5, base)
     runs["phase5"].required_rows(phase5_ids, 5, base)
+    runs["phase6"].required_rows(phase6_ids, 3, base)
 
     high_prefix = "phase7-lazy-high-compression"
     dense_prefix = "phase7-lazy-dense-favoring"
@@ -1422,6 +1742,8 @@ def evaluate(
     runs["phase8-generation"].required_rows(phase8_ids, 5, base)
     runs["phase8-end-to-end"].required_rows(phase8_ids, 5, base)
 
+    final_scaling = base.group("p0-primary-physical", {"1", "2", "4", "8"})
+    runs["final-scaling"].required_rows(final_scaling, 3, base)
     final_primary = base.group("p0-primary-physical", {"1", "8"})
     runs["final-primary"].required_rows(final_primary, 5, base)
     final_smt = base.group("p0-primary-smt", {"1", "2", "4", "8", "16", "auto"})
@@ -1443,12 +1765,15 @@ def evaluate(
         "phase1": phase1_ids,
         "phase2": phase2_ids,
         "phase3": phase3_ids,
+        "phase4": phase4_ids,
         "phase5": phase5_ids,
+        "phase6": phase6_ids,
         "phase7-high": high_ids,
         "phase7-small": small_ids,
         "phase7-auto": medium_ids | dense_ids,
         "phase8-generation": phase8_ids,
         "phase8-end-to-end": phase8_ids,
+        "final-scaling": final_scaling,
         "final-primary": final_primary,
         "final-smt": final_smt,
         "final-small-auto": final_small,
@@ -1466,6 +1791,18 @@ def evaluate(
             required_rows=required_by_label[label],
             required_refusal=(label == "final-real"),
         )
+    memory_bytes = physical_memory_bytes()
+    phase3_raw_path = single_row_source(
+        runs["phase3"], MEDIUM_DENSE.format(1), 5
+    )
+    phase4_result = phase4_validator(
+        runs["phase4"],
+        phase3_raw_path,
+        working_repo_root,
+        memory_bytes,
+    )
+    if not isinstance(phase4_result, Mapping) or phase4_result.get("status") != "pass":
+        raise AcceptanceError("deep Phase-4 validator did not return final status=pass")
     phase9_result = phase9_validator(
         base,
         runs["phase9"],
@@ -1476,7 +1813,6 @@ def evaluate(
     if not isinstance(phase9_result, Mapping) or phase9_result.get("status") != "pass":
         raise AcceptanceError("deep Phase-9 validator did not return final status=pass")
 
-    memory_bytes = physical_memory_bytes()
     global_rss_cap_kb = min(16 * 1024 * 1024, memory_bytes // (4 * 1024))
     gates = Gates()
 
@@ -1509,6 +1845,146 @@ def evaluate(
     gates.condition("phase5_w1_under_600s", max_decimal(runs["phase5"], p5_w1, 5, "wall_clock_s") < 600, "a W1 trial reached the frozen timeout")
     gates.condition("phase5_w8_under_180s", max_decimal(runs["phase5"], p5_w8, 5, "wall_clock_s") < 180, "a W8 trial reached 180 seconds")
     rss_pair(gates, "phase5", runs["phase5"], p5_w1, p5_w8, 5, global_rss_cap_kb)
+
+    # Phase 6 semantic matrices, concurrent-memory admission, exact speed,
+    # repeated-W8 identity, and paired RSS.
+    phase6 = runs["phase6"]
+    for top_k, matrix in phase6_matrices.items():
+        for method in sorted({key[0] for key in matrix}):
+            method_name = method.removeprefix("chart_spr_")
+            matrix_ids = tuple(matrix[(method, worker)] for worker in (1, 2, 4, 8))
+            semantic_pair(
+                phase6,
+                matrix_ids,
+                3,
+                f"phase6 TopK{top_k} {method_name} worker matrix",
+            )
+            gates.condition(
+                f"phase6_topk{top_k}_{method_name}_semantics",
+                True,
+                "worker-count semantics differ",
+            )
+            w8 = matrix[(method, 8)]
+            repeated = phase6.selected(w8, 3)
+            gates.condition(
+                f"phase6_topk{top_k}_{method_name}_w8_repeat_identity",
+                len(
+                    {
+                        (
+                            row["trial_semantic_sha256"],
+                            row["canonical_digest"],
+                        )
+                        for row in repeated
+                    }
+                )
+                == 1,
+                "repeated W8 canonical results are not byte-identical",
+            )
+            rss_pair(
+                gates,
+                f"phase6_topk{top_k}_{method_name}",
+                phase6,
+                matrix[(method, 1)],
+                w8,
+                3,
+                global_rss_cap_kb,
+            )
+            for row_id in matrix_ids:
+                for row in phase6.selected(row_id, 3):
+                    exact = uint(
+                        row["exact_verifications"],
+                        f"phase6 {row_id} exact verifications",
+                        positive=True,
+                    )
+                    if top_k == 1 and exact != 1:
+                        raise AcceptanceError(
+                            f"phase6 {row_id}: TopK1 did not perform exactly one verification"
+                        )
+
+    k4_grammar = phase6_matrices[4]
+    k4_w1 = k4_grammar[(METHOD_EXACT, 1)]
+    k4_w8 = k4_grammar[(METHOD_EXACT, 8)]
+    for worker, row_id in ((1, k4_w1), (8, k4_w8)):
+        for row in phase6.selected(row_id, 3):
+            where = f"phase6 TopK4 W{worker} trial {row['trial_index']}"
+            if uint(row["exact_verifications"], f"{where} exact verifications") != 4:
+                raise AcceptanceError(f"{where}: exact verification count is not 4")
+            exact_ms = decimal(
+                row["exact_verification_ms"],
+                f"{where} exact verification time",
+                positive=True,
+            )
+            timing_max = decimal(
+                row["exact_candidate_verification_ms_max"],
+                f"{where} exact-candidate timing maximum",
+            )
+            if timing_max > exact_ms + Decimal("0.001"):
+                raise AcceptanceError(
+                    f"{where}: candidate timing maximum exceeds aggregate exact time"
+                )
+            parallel = uint(
+                row["exact_candidate_parallel_batches"],
+                f"{where} parallel batches",
+            )
+            peak = uint(
+                row["peak_concurrent_exact_verifiers"],
+                f"{where} peak exact verifiers",
+            )
+            axis = uint(
+                row["chart_axis_exact_candidate_active_worker_high_water"],
+                f"{where} exact-candidate high-water",
+            )
+            if worker == 8 and (parallel < 1 or peak < 2 or axis < 2):
+                raise AcceptanceError(
+                    f"{where}: candidate-parallel path was not activated"
+                )
+            if worker == 1 and (parallel != 0 or peak != 1 or axis > 1):
+                raise AcceptanceError(
+                    f"{where}: one-worker candidate scheduling evidence is inconsistent"
+                )
+    gates.ratio(
+        "phase6_topk4_exact_verification_w8_over_w1",
+        med(phase6, k4_w8, 3, "exact_verification_ms"),
+        med(phase6, k4_w1, 3, "exact_verification_ms"),
+        Decimal("0.50"),
+    )
+    gates.condition(
+        "phase6_topk4_candidate_parallel_activation",
+        True,
+        "candidate-parallel scheduler evidence is incomplete",
+    )
+
+    for row_id in phase6_matrices[16].values():
+        for row in phase6.selected(row_id, 3):
+            where = f"phase6 TopK16 {row_id} trial {row['trial_index']}"
+            uint(row["exact_verifications"], f"{where} exact verifications", positive=True)
+            uint(
+                row["exact_candidate_admission_batches"],
+                f"{where} admission batches",
+                positive=True,
+            )
+            admitted = uint(
+                row["exact_candidate_peak_admitted_bytes"],
+                f"{where} admitted bytes",
+                positive=True,
+            )
+            projected = uint(
+                row[ADMISSION_FIELD], f"{where} projected resident bytes", positive=True
+            )
+            budget = uint(
+                row["configured_chart_memory_budget"],
+                f"{where} memory budget",
+                positive=True,
+            )
+            if admitted > projected or projected > budget:
+                raise AcceptanceError(
+                    f"{where}: concurrent-memory admission bound was exceeded"
+                )
+    gates.condition(
+        "phase6_topk16_concurrent_memory_admission",
+        True,
+        "TopK16 admission evidence is incomplete",
+    )
 
     # Phase 7 forced scaling, automatic policy, and both named branches.
     gates.ratio("phase7_high_forced_lazy_w8_over_w1", med(runs["phase7-high"], f"{high_prefix}-on-w8", 5, "wall_clock_s"), med(runs["phase7-high"], f"{high_prefix}-on-w1", 5, "wall_clock_s"), Decimal(2) / 3)
@@ -1571,7 +2047,63 @@ def evaluate(
         gates.ratio(f"phase8_end_to_end_w{worker}_vs_phase7", med(runs["phase8-generation"], rid, 5, "wall_clock_s"), med(runs["phase8-end-to-end"], rid, 5, "wall_clock_s"), Decimal("1.00"))
     rss_pair(gates, "phase8", runs["phase8-generation"], p8_w1, p8_w8, 5, global_rss_cap_kb)
 
-    # Final primary parity and same-revision scaling.
+    # Mandatory same-affinity physical W1/2/4/8 matrix.  This is deliberately
+    # distinct from the five-repetition paired native-parity run below.
+    scaling = runs["final-scaling"]
+    scaling_by_method: dict[str, tuple[str, ...]] = {}
+    for method in (METHOD_SAMPLED, METHOD_EXACT, METHOD_HYBRID):
+        ids = tuple(
+            unique_method_id(scaling, method, str(worker), 3)
+            for worker in (1, 2, 4, 8)
+        )
+        scaling_by_method[method] = ids
+        semantic_pair(
+            scaling,
+            ids,
+            3,
+            f"final physical scaling {method}",
+        )
+    scaling_grammar1 = scaling_by_method[METHOD_EXACT][0]
+    scaling_grammar8 = scaling_by_method[METHOD_EXACT][3]
+    gates.ratio(
+        "final_scaling_grammar_w8_over_w1",
+        med(scaling, scaling_grammar8, 3, "wall_clock_s"),
+        med(scaling, scaling_grammar1, 3, "wall_clock_s"),
+        Decimal("0.50"),
+    )
+    for field in (
+        "initial_chart_construction_ms",
+        "local_scoring_ms",
+        "exact_verification_ms",
+    ):
+        phase_one = med(scaling, scaling_grammar1, 3, field)
+        wall_ms = med(scaling, scaling_grammar1, 3, "wall_clock_s") * 1000
+        if phase_one >= wall_ms * Decimal("0.10"):
+            gates.ratio(
+                f"final_scaling_{field}_w8_over_w1",
+                med(scaling, scaling_grammar8, 3, field),
+                phase_one,
+                Decimal(2) / 3,
+            )
+        else:
+            gates.items.append(
+                {
+                    "name": f"final_scaling_{field}_w8_over_w1",
+                    "status": "pass",
+                    "comparison": "profile_exempt_below_10_percent",
+                }
+            )
+    rss_pair(
+        gates,
+        "final_scaling_grammar",
+        scaling,
+        scaling_grammar1,
+        scaling_grammar8,
+        3,
+        global_rss_cap_kb,
+    )
+
+    # Final primary parity and its existing same-revision scaling gates.
     primary = runs["final-primary"]
     native_id = unique_method_id(primary, METHOD_NATIVE, "native", 5)
     grammar1 = unique_method_id(primary, METHOD_EXACT, "1", 5)
@@ -1612,6 +2144,7 @@ def evaluate(
     unpinned_auto = unique_method_id(unpinned, METHOD_EXACT, "auto", 5)
     gates.ratio("final_unpinned_auto_native_parity", med(unpinned, unpinned_auto, 5, "wall_clock_s"), med(unpinned, unpinned_native, 5, "wall_clock_s"), Decimal("1.00"))
     default = runs["final-default-auto"]
+    default_native = unique_method_id(default, METHOD_NATIVE, "native", 5)
     default_id = unique_method_id(default, METHOD_EXACT, "default", 5)
     default_auto = unique_method_id(default, METHOD_EXACT, "auto", 5)
     d_trials = {row["trial_index"]: row for row in default.selected(default_id, 5)}
@@ -1625,6 +2158,12 @@ def evaluate(
             raise AcceptanceError("final default is more than 10% slower than auto in a paired trial")
     semantic_pair(default, (default_id, default_auto), 5, "final default/auto")
     gates.ratio("final_default_over_auto_median", med(default, default_id, 5, "wall_clock_s"), med(default, default_auto, 5, "wall_clock_s"), Decimal("1.10"))
+    gates.ratio(
+        "final_default_native_parity",
+        med(default, default_id, 5, "wall_clock_s"),
+        med(default, default_native, 5, "wall_clock_s"),
+        Decimal("1.00"),
+    )
 
     # Stress.  Phase 9 is accepted only by the delegated deep evaluator.
     stress = runs["final-stress"]
@@ -1674,6 +2213,7 @@ def evaluate(
         "run_labels": list(RUN_LABELS),
         "global_rss_cap_kb": global_rss_cap_kb,
         "gates": gates.items,
+        "phase4_acceptance": dict(phase4_result),
         "phase9_acceptance": dict(phase9_result),
     }
 
@@ -1777,6 +2317,7 @@ def parser() -> argparse.ArgumentParser:
 def main(
     argv: Sequence[str] | None = None,
     *,
+    phase4_validator: Phase4Validator = deep_phase4_validate,
     phase9_validator: Phase9Validator = deep_phase9_validate,
 ) -> int:
     args = parser().parse_args(argv)
@@ -1854,6 +2395,7 @@ def main(
             base_repo_root=base_repo_root,
             working_repo_root=working_repo_root,
             phase9_run_ledger_sha256=phase9_run_ledger_sha256,
+            phase4_validator=phase4_validator,
             phase9_validator=phase9_validator,
         )
         sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
