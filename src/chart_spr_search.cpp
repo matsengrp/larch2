@@ -4140,19 +4140,22 @@ chart_spr_lazy_commit_stats chart_spr_refresh_lazy_chart_after_local_commit(
     recompute_inside[chart_spr_detail::dense_clade_id(materialized, ref)] =
         true;
   }
-  for (auto dense : execution_plan.bottom_up_order()) {
-    if (!recompute_inside[dense]) continue;
-    chart_spr_clear_lazy_inside_clade(next, dense);
-    if (execution_plan.clade(dense).is_leaf()) {
-      lazy_chart_detail::assign_plan_leaf_classes(
-          next, execution_plan, patterns, dense, lazy_options);
-    } else {
-      auto keys = lazy_chart_detail::collect_plan_parent_keys(
-          next, execution_plan, patterns, dense);
-      lazy_chart_detail::assign_plan_internal_classes(
-          next, execution_plan, patterns, dense, keys);
+  {
+    lazy_chart_detail::plan_parent_key_workspace inside_key_workspace;
+    for (auto dense : execution_plan.bottom_up_order()) {
+      if (!recompute_inside[dense]) continue;
+      chart_spr_clear_lazy_inside_clade(next, dense);
+      if (execution_plan.clade(dense).is_leaf()) {
+        lazy_chart_detail::assign_plan_leaf_classes(
+            next, execution_plan, patterns, dense, lazy_options);
+      } else {
+        auto keys = lazy_chart_detail::collect_plan_parent_keys(
+            next, execution_plan, patterns, dense, inside_key_workspace);
+        lazy_chart_detail::assign_plan_internal_classes(
+            next, execution_plan, patterns, dense, keys);
+      }
+      stats.inside_rows_recomputed += next.inside_rows_by_clade[dense].size();
     }
-    stats.inside_rows_recomputed += next.inside_rows_by_clade[dense].size();
   }
   stats.multifurcation_productions_scored +=
       next.multifurcation_productions_scored -
@@ -4166,18 +4169,21 @@ chart_spr_lazy_commit_stats chart_spr_refresh_lazy_chart_after_local_commit(
     recompute_outside[chart_spr_detail::dense_clade_id(materialized, ref)] =
         true;
   }
-  for (auto dense : execution_plan.top_down_order()) {
-    if (!recompute_outside[dense]) continue;
-    chart_spr_clear_lazy_outside_clade(next, dense);
-    if (dense == execution_plan.root_clade()) {
-      chart_spr_initialize_lazy_root_outside(
-          next, execution_plan, patterns, state.chart_opts);
-    } else {
-      lazy_chart_detail::assign_outside_classes_for_clade(
-          next, execution_plan, patterns, dense);
+  {
+    lazy_chart_detail::outside_context_key_workspace outside_key_workspace;
+    for (auto dense : execution_plan.top_down_order()) {
+      if (!recompute_outside[dense]) continue;
+      chart_spr_clear_lazy_outside_clade(next, dense);
+      if (dense == execution_plan.root_clade()) {
+        chart_spr_initialize_lazy_root_outside(
+            next, execution_plan, patterns, state.chart_opts);
+      } else {
+        lazy_chart_detail::assign_outside_classes_for_clade(
+            next, execution_plan, patterns, dense, outside_key_workspace);
+      }
+      stats.outside_rows_recomputed +=
+          next.outside_rows_by_clade[dense].size();
     }
-    stats.outside_rows_recomputed +=
-        next.outside_rows_by_clade[dense].size();
   }
   // The tight outside dependency set correctly omits the root when its
   // constant outside row/class map did not change.  The cached global optimum
