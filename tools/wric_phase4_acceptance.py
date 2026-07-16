@@ -19,6 +19,7 @@ import csv
 import json
 import os
 import re
+import stat
 import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -124,9 +125,20 @@ class ProfilingRequired(AcceptanceError):
 
 
 @dataclass(frozen=True)
+class RawTrials:
+    """One canonical raw-trial table and the rows it owns."""
+
+    path: Path
+    header: tuple[str, ...]
+    rows: tuple[dict[str, str], ...]
+
+
+@dataclass(frozen=True)
 class Trial:
     row: dict[str, str]
     report: dict[str, str]
+    source_path: Path
+    report_path: Path
     source_line: int
 
     @property
@@ -254,11 +266,85 @@ def read_tsv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
     return header, rows
 
 
+def require_canonical_regular_file(path: Path, label: str) -> Path:
+    """Require a lexical, non-symlink regular input before opening it."""
+
+    lexical = path.absolute()
+    try:
+        info = lexical.lstat()
+        resolved = lexical.resolve(strict=True)
+    except OSError as error:
+        raise AcceptanceError(f"{label} is unavailable: {path}: {error}") from error
+    if lexical != resolved or stat.S_ISLNK(info.st_mode):
+        raise AcceptanceError(
+            f"{label} uses a symlink or noncanonical lexical path: {path}"
+        )
+    if not stat.S_ISREG(info.st_mode):
+        raise AcceptanceError(f"{label} is not a regular file: {path}")
+    return resolved
+
+
+def load_raw_trials(paths: Sequence[str | os.PathLike[str]]) -> list[RawTrials]:
+    """Load one or more tables and establish globally unique row ownership."""
+
+    if not paths:
+        raise AcceptanceError("at least one Phase-4 raw trials file is required")
+    sources: list[RawTrials] = []
+    seen_paths: set[Path] = set()
+    owners: dict[tuple[str, str], tuple[Path, int]] = {}
+    for supplied in paths:
+        path = require_canonical_regular_file(Path(supplied), "raw trials input")
+        if path in seen_paths:
+            raise AcceptanceError(f"raw trials input is repeated: {path}")
+        seen_paths.add(path)
+        header, rows = read_tsv(path)
+        missing_columns = [column for column in REQUIRED_COLUMNS if column not in header]
+        if missing_columns:
+            raise AcceptanceError(
+                f"{path}: missing required columns: {', '.join(missing_columns)}"
+            )
+        for row in rows:
+            key = (row["row_id"], row["trial_index"])
+            line = int(row["__line__"])
+            previous = owners.get(key)
+            if previous is not None and previous[0] != path:
+                previous_path, previous_line = previous
+                raise AcceptanceError(
+                    "duplicate global row key "
+                    f"({key[0]!r}, {key[1]!r}) across raw trials files: "
+                    f"{previous_path}:{previous_line} and {path}:{line}"
+                )
+            owners.setdefault(key, (path, line))
+        sources.append(RawTrials(path, tuple(header), tuple(rows)))
+    return sources
+
+
 def resolve_report_path(raw_path: Path, recorded: str) -> Path:
+    """Resolve a report only within the raw table's owning directory."""
+
+    root = raw_path.parent
     report = Path(recorded)
     if not report.is_absolute():
-        report = raw_path.parent / report
-    return report
+        report = root / report
+    lexical = report.absolute()
+    try:
+        info = lexical.lstat()
+        resolved = lexical.resolve(strict=True)
+    except OSError as error:
+        raise AcceptanceError(f"cannot read report_path {report}: {error}") from error
+    if lexical != resolved or stat.S_ISLNK(info.st_mode):
+        raise AcceptanceError(
+            f"report_path uses a symlink or noncanonical lexical path: {report}"
+        )
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise AcceptanceError(
+            f"report_path escapes owning raw trials directory: {report}"
+        ) from error
+    if not stat.S_ISREG(info.st_mode):
+        raise AcceptanceError(f"report_path is not a regular file: {report}")
+    return resolved
 
 
 def require_report_value(report: dict[str, str], key: str, label: str) -> str:
@@ -512,16 +598,20 @@ def validate_row_common(raw_path: Path, row: dict[str, str], *, scheduler: bool)
         parse_decimal(
             require_report_value(report, timing, label), f"{label} report {timing}"
         )
-    trial = Trial(row=row, report=report, source_line=line)
+    trial = Trial(
+        row=row,
+        report=report,
+        source_path=raw_path,
+        report_path=report_path,
+        source_line=line,
+    )
     if scheduler:
         validate_scheduler(trial)
     return trial
 
 
 def select_workload(
-    raw_path: Path,
-    header: Sequence[str],
-    rows: Sequence[dict[str, str]],
+    sources: Sequence[RawTrials],
     prefix: str,
     repetitions: int,
     *,
@@ -529,38 +619,50 @@ def select_workload(
     scheduler: bool = True,
     allow_other_workers: bool = False,
 ) -> list[Trial]:
-    missing_columns = [column for column in REQUIRED_COLUMNS if column not in header]
-    if missing_columns:
-        raise AcceptanceError(
-            f"{raw_path}: missing required columns: {', '.join(missing_columns)}"
-        )
-    under_prefix = [row for row in rows if row["row_id"].startswith(prefix)]
+    under_prefix = [
+        (source, row)
+        for source in sources
+        for row in source.rows
+        if row["row_id"].startswith(prefix)
+    ]
     if not under_prefix:
-        raise AcceptanceError(f"{raw_path}: no rows match prefix {prefix!r}")
+        paths = ", ".join(os.fspath(source.path) for source in sources)
+        raise AcceptanceError(
+            f"raw trials inputs ({paths}): no rows match prefix {prefix!r}"
+        )
 
     expected_ids = {f"{prefix}{worker}" for worker in workers}
-    unexpected = sorted({row["row_id"] for row in under_prefix} - expected_ids)
+    unexpected = sorted({row["row_id"] for _, row in under_prefix} - expected_ids)
     if unexpected and not allow_other_workers:
         raise AcceptanceError(
-            f"{raw_path}: unexpected rows under prefix {prefix!r}: {', '.join(unexpected)}"
+            f"unexpected rows under prefix {prefix!r}: {', '.join(unexpected)}"
         )
-    selected = [row for row in under_prefix if row["row_id"] in expected_ids]
+    selected = [
+        (source, row)
+        for source, row in under_prefix
+        if row["row_id"] in expected_ids
+    ]
 
     trials: list[Trial] = []
     for worker in workers:
         row_id = f"{prefix}{worker}"
-        matching = [row for row in selected if row["row_id"] == row_id]
+        matching = [
+            (source, row) for source, row in selected if row["row_id"] == row_id
+        ]
         if len(matching) != repetitions:
             raise AcceptanceError(
                 f"{row_id}: expected {repetitions} trials, found {len(matching)}"
             )
-        indexes = sorted(parse_uint(row["trial_index"], f"{row_id} trial_index") for row in matching)
+        indexes = sorted(
+            parse_uint(row["trial_index"], f"{row_id} trial_index")
+            for _, row in matching
+        )
         if indexes != list(range(1, repetitions + 1)):
             raise AcceptanceError(f"{row_id}: trial indexes are not exactly 1..{repetitions}")
-        for row in matching:
+        for source, row in matching:
             if row["requested_workers"] != str(worker):
                 raise AcceptanceError(f"{row_id}: requested_workers does not match row ID")
-            trials.append(validate_row_common(raw_path, row, scheduler=scheduler))
+            trials.append(validate_row_common(source.path, row, scheduler=scheduler))
 
     fixtures = {trial.row["fixture"] for trial in trials}
     methods = {trial.row["method"] for trial in trials}
@@ -575,7 +677,7 @@ def select_workload(
     }
     if len(semantic_pairs) != 1:
         raise AcceptanceError(f"{prefix}: canonical semantics differ across workers/trials")
-    report_paths = [trial.row["report_path"] for trial in trials]
+    report_paths = [trial.report_path for trial in trials]
     if len(set(report_paths)) != len(report_paths):
         raise AcceptanceError(f"{prefix}: report_path is reused across measured trials")
     for worker in workers:
@@ -657,13 +759,15 @@ def gate_ratio(
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, object]:
-    raw_path = Path(args.raw_trials).resolve()
-    header, rows = read_tsv(raw_path)
+    supplied_raw_trials = args.raw_trials
+    if isinstance(supplied_raw_trials, (str, os.PathLike)):
+        supplied_raw_trials = [supplied_raw_trials]
+    raw_sources = load_raw_trials(supplied_raw_trials)
     local = select_workload(
-        raw_path, header, rows, args.local_row_prefix, args.repetitions
+        raw_sources, args.local_row_prefix, args.repetitions
     )
     construction = select_workload(
-        raw_path, header, rows, args.construction_row_prefix, args.repetitions
+        raw_sources, args.construction_row_prefix, args.repetitions
     )
 
     # Ensure the two matrices did not accidentally select the same rows.
@@ -776,12 +880,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
 
     deferred = False
     if args.phase3_raw_trials:
-        phase3_path = Path(args.phase3_raw_trials).resolve()
-        baseline_header, baseline_rows = read_tsv(phase3_path)
+        phase3_sources = load_raw_trials([args.phase3_raw_trials])
         phase3 = select_workload(
-            phase3_path,
-            baseline_header,
-            baseline_rows,
+            phase3_sources,
             args.local_row_prefix,
             args.repetitions,
             workers=(1,),
@@ -837,18 +938,28 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
             }
         )
 
+    raw_paths = [os.fspath(source.path) for source in raw_sources]
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "deferred_baseline" if deferred else "pass",
-        "raw_trials": os.fspath(raw_path),
+        # Retain the historical scalar for one-file consumers.  The new list
+        # is authoritative and records every independently owned input.
+        "raw_trials": raw_paths[0],
+        "raw_trial_inputs": raw_paths,
         "repetitions": args.repetitions,
         "workloads": {
             "local": {
                 "row_prefix": args.local_row_prefix,
+                "source_raw_trials": sorted(
+                    {os.fspath(trial.source_path) for trial in local}
+                ),
                 "median_ms": {str(key): str(value) for key, value in local_medians.items()},
             },
             "construction": {
                 "row_prefix": args.construction_row_prefix,
+                "source_raw_trials": sorted(
+                    {os.fspath(trial.source_path) for trial in construction}
+                ),
                 "component_fields": [
                     "initial_chart_construction_ms",
                     "local_inside_cache_initialization_ms",
@@ -868,7 +979,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="strict Phase-4 WRIC chart-parallelization acceptance postprocessor"
     )
-    parser.add_argument("--raw-trials", required=True, help="Phase-4 raw_trials.tsv")
+    parser.add_argument(
+        "--raw-trials",
+        required=True,
+        action="append",
+        metavar="PATH",
+        help="Phase-4 raw_trials.tsv; repeat for independently captured matrices",
+    )
     parser.add_argument("--repetitions", required=True, type=int)
     parser.add_argument("--local-row-prefix", default=DEFAULT_LOCAL_PREFIX)
     parser.add_argument("--construction-row-prefix", default=DEFAULT_CONSTRUCTION_PREFIX)

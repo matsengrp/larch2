@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -217,6 +219,16 @@ class Dataset:
             row["process_rss_limit_bytes"] = str(max(value * 2048, 1))
             row["manifest_rss_limit_bytes"] = str(max(value * 2048, 1))
 
+    def retain_workload(self, workload: str) -> None:
+        """Keep exactly one matrix and its reports in this raw-table owner."""
+
+        kept = self.matching(workload)
+        report_paths = {row["report_path"] for row in kept}
+        self.rows = kept
+        self.reports = {
+            path: lines for path, lines in self.reports.items() if path in report_paths
+        }
+
     def write(self, *, columns: list[str] | None = None) -> None:
         for name, lines in self.reports.items():
             path = self.root / name
@@ -253,18 +265,21 @@ class Phase4AcceptanceTest(unittest.TestCase):
         defer: bool = True,
         physical_memory: int = 64 * 1024**3,
         extra: list[str] | None = None,
-    ) -> tuple[subprocess.CompletedProcess[str], dict[str, object] | None]:
-        self.data.write()
+        raw_trials: list[Path] | None = None,
+        write_data: bool = True,
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any] | None]:
+        if write_data:
+            self.data.write()
         command = [
             sys.executable,
             str(TOOL),
-            "--raw-trials",
-            str(self.data.raw),
             "--repetitions",
             str(self.data.repetitions),
             "--physical-memory-bytes",
             str(physical_memory),
         ]
+        for raw_path in raw_trials or [self.data.raw]:
+            command.extend(("--raw-trials", str(raw_path)))
         if baseline is not None:
             command.extend(("--phase3-raw-trials", str(baseline)))
         elif defer:
@@ -278,14 +293,14 @@ class Phase4AcceptanceTest(unittest.TestCase):
             parsed = None
         return completed, parsed
 
-    def assert_pass(self, **kwargs: object) -> dict[str, object]:
+    def assert_pass(self, **kwargs: Any) -> dict[str, Any]:
         completed, result = self.run_tool(**kwargs)
         self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
         self.assertIsInstance(result, dict)
         assert result is not None
         return result
 
-    def assert_failure(self, expected: str, **kwargs: object) -> dict[str, object]:
+    def assert_failure(self, expected: str, **kwargs: Any) -> dict[str, Any]:
         completed, result = self.run_tool(**kwargs)
         self.assertEqual(completed.returncode, 1, completed.stderr + completed.stdout)
         self.assertIsInstance(result, dict)
@@ -299,6 +314,119 @@ class Phase4AcceptanceTest(unittest.TestCase):
         baseline.set_timing("local", 1, "local_scoring_ms", local_ms)
         baseline.write()
         return baseline.raw
+
+    def split_workloads(self) -> tuple[Dataset, Dataset]:
+        local = Dataset(self.root / "local", repetitions=self.data.repetitions)
+        local.retain_workload("local")
+        local.write()
+        construction = Dataset(
+            self.root / "construction", repetitions=self.data.repetitions
+        )
+        construction.retain_workload("construction")
+        construction.write()
+        return local, construction
+
+    def test_one_file_interface_and_provenance_remain_compatible(self) -> None:
+        result = self.assert_pass()
+        raw = str(self.data.raw.resolve())
+        self.assertEqual(result["raw_trials"], raw)
+        self.assertEqual(result["raw_trial_inputs"], [raw])
+        self.assertEqual(result["workloads"]["local"]["source_raw_trials"], [raw])
+        self.assertEqual(
+            result["workloads"]["construction"]["source_raw_trials"], [raw]
+        )
+
+    def test_split_raw_inputs_bind_reports_to_each_owning_file(self) -> None:
+        local, construction = self.split_workloads()
+        result = self.assert_pass(raw_trials=[local.raw, construction.raw])
+        expected = [str(local.raw.resolve()), str(construction.raw.resolve())]
+        self.assertEqual(result["raw_trial_inputs"], expected)
+        self.assertEqual(
+            result["workloads"]["local"]["source_raw_trials"], [expected[0]]
+        )
+        self.assertEqual(
+            result["workloads"]["construction"]["source_raw_trials"],
+            [expected[1]],
+        )
+
+    def test_duplicate_global_row_key_across_raw_inputs_fails(self) -> None:
+        local, construction = self.split_workloads()
+        duplicate = Dataset(self.root / "duplicate", repetitions=self.data.repetitions)
+        duplicate.retain_workload("local")
+        duplicate.write()
+        self.assert_failure(
+            "duplicate global row key",
+            raw_trials=[local.raw, construction.raw, duplicate.raw],
+        )
+
+    def test_repeated_same_raw_input_fails(self) -> None:
+        self.assert_failure(
+            "raw trials input is repeated",
+            raw_trials=[self.data.raw, self.data.raw],
+        )
+
+    def test_omitted_split_input_or_required_row_fails(self) -> None:
+        local, construction = self.split_workloads()
+        self.assert_failure(
+            "no rows match prefix",
+            raw_trials=[local.raw],
+        )
+
+        construction.rows.remove(construction.matching("construction", 4)[0])
+        construction.write()
+        self.assert_failure(
+            "expected 3 trials, found 2",
+            raw_trials=[local.raw, construction.raw],
+        )
+
+    def test_raw_input_symlink_and_special_file_fail_before_reading(self) -> None:
+        self.data.write()
+        alias = self.root / "raw-alias.tsv"
+        alias.symlink_to(self.data.raw.name)
+        self.assert_failure(
+            "raw trials input uses a symlink",
+            raw_trials=[alias],
+            write_data=False,
+        )
+
+        fifo = self.root / "raw.fifo"
+        os.mkfifo(fifo)
+        self.assert_failure(
+            "raw trials input is not a regular file",
+            raw_trials=[fifo],
+            write_data=False,
+        )
+
+    def test_report_symlink_special_file_and_owner_escape_fail(self) -> None:
+        self.data.write()
+        row = self.data.matching("local", 1)[0]
+        report = self.root / row["report_path"]
+        contents = report.read_text(encoding="utf-8")
+        target = self.root / "real-report.out"
+        target.write_text(contents, encoding="utf-8")
+        report.unlink()
+        report.symlink_to(target)
+        self.assert_failure("report_path uses a symlink", write_data=False)
+
+        report.unlink()
+        os.mkfifo(report)
+        self.assert_failure("report_path is not a regular file", write_data=False)
+
+        report.unlink()
+        owned = Dataset(self.root / "owned", repetitions=self.data.repetitions)
+        owned.retain_workload("local")
+        escaped_row = owned.matching("local", 1)[0]
+        outside = self.root / "outside-report.out"
+        outside.write_text(
+            "\n".join(owned.reports[escaped_row["report_path"]]) + "\n",
+            encoding="utf-8",
+        )
+        escaped_row["report_path"] = str(outside)
+        owned.write()
+        self.assert_failure(
+            "report_path escapes owning raw trials directory",
+            raw_trials=[owned.raw],
+        )
 
     def test_all_exact_boundaries_pass_with_explicit_deferral(self) -> None:
         # Both local and construction have W8/W1 == 0.50 and W8/W4 == 1.10.
