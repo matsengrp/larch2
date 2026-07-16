@@ -1435,6 +1435,14 @@ struct sampled_tree_projection_output_slot {
   std::vector<overlay_grammar_production> spare_added_productions;
   sampled_tree_projection_path path =
       sampled_tree_projection_path::not_attempted;
+  // Projection failures are ordinal results, not scheduler-operation
+  // failures. They remain dormant until the serial canonical gather reaches
+  // this slot, so a stop at an earlier ordinal suppresses speculative work in
+  // exactly the same way as the W1 traversal.
+  std::exception_ptr failure;
+  // Distinguishes a successful empty projection from an ordinal quarantined
+  // behind an earlier failure in the same scheduler range.
+  bool completed = false;
   bool engaged = false;
 };
 
@@ -2245,6 +2253,10 @@ estimate_sampled_tree_source_wave_memory(
   // source slots may coexist until the coordinator selects the lowest source.
   result.error_and_exception_bytes =
       add(result.error_and_exception_bytes, multiply(source_wave_size, 512));
+  // Projection failures likewise survive in their ordinal output slots until
+  // canonical gather either reaches them or stops at an earlier ordinal.
+  result.error_and_exception_bytes = add(result.error_and_exception_bytes,
+                                         multiply(projection_wave_size, 512));
 
   result.required_peak_bytes = result.external_resident_bytes;
   result.required_peak_bytes =
@@ -2503,11 +2515,17 @@ estimate_sampled_tree_projection_memory(
   }
 
   // The scheduler operation estimator includes its per-range exception slots.
-  // Charge the caller-side failed summary, one retained exception/error
-  // envelope, and test-hook/function wrappers explicitly as well. No failure
-  // path may need unbudgeted slot-vector capacity.
+  // Charge the caller-side failed summary, retained per-ordinal exception
+  // envelopes, and test-hook/function wrappers explicitly as well. The
+  // exception_ptr objects themselves live in the output slots charged above.
+  // No failure path may need unbudgeted slot-vector capacity.
   result.error_and_exception_bytes =
       sizeof(chart_scheduler_run_summary) + sizeof(std::exception_ptr) + 512;
+  result.error_and_exception_bytes = sampled_tree_projection_saturating_add(
+      result.error_and_exception_bytes,
+      sampled_tree_projection_saturating_multiply(wave_size, 512,
+                                                  result.safely_bounded),
+      result.safely_bounded);
   result.error_and_exception_bytes = sampled_tree_projection_saturating_add(
       result.error_and_exception_bytes, 2 * sizeof(std::function<void()>),
       result.safely_bounded);
@@ -6139,20 +6157,42 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
 
   constexpr chart_indexed_range_options range_options{
       .minimum_grain = 1, .target_ranges_per_worker = 1};
+  auto cancellation_requested = [&]() noexcept {
+    return options.sampled_tree_projection_cancel_requested != nullptr &&
+           options.sampled_tree_projection_cancel_requested->load(
+               std::memory_order_acquire);
+  };
+  auto project_one = [&](std::size_t local, std::size_t stable_slot,
+                         sampled_tree_projection_job const& job) noexcept {
+    try {
+      if (options.before_sampled_tree_projection_for_tests) {
+        options.before_sampled_tree_projection_for_tests(job.ordinal);
+      }
+      project_sampled_tree_move_with_path_into(
+          prepared, job.move, stable_scratch[stable_slot], slots[local]);
+      slots[local].completed = true;
+      return true;
+    } catch (...) {
+      slots[local].failure = std::current_exception();
+      return false;
+    }
+  };
   for (std::size_t wave_begin = 0; wave_begin < jobs.size();) {
+    if (cancellation_requested()) {
+      result.cancelled = true;
+      return result;
+    }
     auto const count = std::min(wave_size, jobs.size() - wave_begin);
     for (std::size_t local = 0; local < count; ++local) {
       slots[local].engaged = false;
       slots[local].path = sampled_tree_projection_path::not_attempted;
+      slots[local].failure = nullptr;
+      slots[local].completed = false;
     }
 
     if (scheduler == nullptr) {
       auto const& job = jobs[wave_begin];
-      if (options.before_sampled_tree_projection_for_tests) {
-        options.before_sampled_tree_projection_for_tests(job.ordinal);
-      }
-      project_sampled_tree_move_with_path_into(prepared, job.move,
-                                               stable_scratch[0], slots[0]);
+      (void)project_one(0, 0, job);
     } else {
       chart_scheduler_run_summary failed_summary;
       std::unique_lock<std::mutex> scheduler_handoff;
@@ -6166,9 +6206,7 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
                     std::chrono::steady_clock::now() - wait_start)
                     .count());
       }
-      if (options.sampled_tree_projection_cancel_requested != nullptr &&
-          options.sampled_tree_projection_cancel_requested->load(
-              std::memory_order_acquire)) {
+      if (cancellation_requested()) {
         result.cancelled = true;
         return result;
       }
@@ -6191,12 +6229,11 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
                   break;
                 }
                 auto const& job = jobs[wave_begin + local];
-                if (options.before_sampled_tree_projection_for_tests) {
-                  options.before_sampled_tree_projection_for_tests(job.ordinal);
-                }
-                project_sampled_tree_move_with_path_into(
-                    prepared, job.move, stable_scratch[stable_slot],
-                    slots[local]);
+                // An application/projection failure belongs to this canonical
+                // ordinal. Keep the workspace quarantined for the rest of the
+                // range, but do not turn it into scheduler cancellation that
+                // could preempt an earlier canonical stop.
+                if (!project_one(local, stable_slot, job)) break;
               }
             },
             &failed_summary);
@@ -6221,6 +6258,7 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
           std::max(result.active_worker_high_water, summary.active_workers);
     }
     for (std::size_t local = 0; local < count; ++local) {
+      if (!slots[local].completed) continue;
       if (slots[local].path == sampled_tree_projection_path::direct) {
         ++result.direct_projections;
       } else if (slots[local].path ==
@@ -6230,7 +6268,26 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
     }
     ++result.waves;
 
+    // External cancellation has operation-wide precedence. It is observed
+    // only after all launched work has joined and work diagnostics have been
+    // reconciled, and suppresses captured failures and gather publication.
+    if (cancellation_requested()) {
+      result.speculative_discarded += static_cast<std::size_t>(
+          std::count_if(slots.begin(), slots.begin() + count,
+                        [](auto const& slot) { return slot.completed; }));
+      result.cancelled = true;
+      return result;
+    }
+
     for (std::size_t local = 0; local < count; ++local) {
+      if (slots[local].failure) {
+        std::rethrow_exception(slots[local].failure);
+      }
+      if (!slots[local].completed) {
+        throw std::logic_error(
+            "chart SPR sampled-tree projection wave joined without "
+            "completing an ordinal");
+      }
       static std::optional<grammar_spr_candidate> const empty;
       auto const& projected =
           slots[local].engaged ? slots[local].candidate : empty;
@@ -6249,9 +6306,11 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
       }();
       if (decision !=
           sampled_tree_projection_gather_decision::continue_projection) {
-        // These results were computed and retained but deliberately never
-        // enter legacy candidate/prune/dedup counters or callbacks.
-        result.speculative_discarded += count - local - 1;
+        // Only completed results enter the speculation counter. A quarantined
+        // tail after a captured failure was admitted but never projected.
+        result.speculative_discarded += static_cast<std::size_t>(
+            std::count_if(slots.begin() + local + 1, slots.begin() + count,
+                          [](auto const& slot) { return slot.completed; }));
         if (decision ==
             sampled_tree_projection_gather_decision::stop_before_current) {
           ++result.speculative_discarded;
@@ -6656,14 +6715,6 @@ project_sampled_tree_moves_in_source_waves(
     result.peak_source_wave_size =
         std::max(result.peak_source_wave_size, source_wave_count);
 
-    // Task exceptions are retained per stable source slot.  Scan only after
-    // every source task has joined so completion order cannot choose failure.
-    for (std::size_t local = 0; local < source_wave_count; ++local) {
-      if (source_slots[local].failure) {
-        std::rethrow_exception(source_slots[local].failure);
-      }
-    }
-
     std::size_t source_wave_move_count = 0;
     for (std::size_t local = 0; local < source_wave_count; ++local) {
       auto& slot = source_slots[local];
@@ -6702,29 +6753,42 @@ project_sampled_tree_moves_in_source_waves(
       return result;
     }
 
+    // A source-task failure is a canonical source-boundary event. Earlier
+    // sources in this joined wave must still be projected and gathered, and a
+    // stop in that prefix suppresses failures from later speculative sources.
+    // Operation-wide cancellation above instead wins before either failures
+    // or partial gather publication, matching the W1 cancellation boundary.
     std::size_t source_local = 0;
     std::size_t move_local = 0;
-    auto advance_empty_sources = [&] {
-      while (source_local < source_wave_count &&
-             move_local >= source_slots[source_local].moves.size()) {
+    auto advance_exhausted_sources = [&] {
+      while (source_local < source_wave_count) {
+        auto const& slot = source_slots[source_local];
+        if (slot.failure || move_local < slot.moves.size()) return;
         ++source_local;
         move_local = 0;
       }
     };
-    advance_empty_sources();
+    advance_exhausted_sources();
     while (source_local < source_wave_count) {
       projection_jobs.clear();
       while (projection_jobs.size() < result.memory.projection_wave_size &&
              source_local < source_wave_count) {
         auto const& source_slot = source_slots[source_local];
+        if (source_slot.failure) break;
         projection_jobs.push_back(sampled_tree_projection_job{
             source_slot.first_move_ordinal + move_local,
             source_slot.moves[move_local]});
         ++move_local;
-        advance_empty_sources();
+        advance_exhausted_sources();
       }
       auto const projection_count = projection_jobs.size();
-      if (projection_count == 0) break;
+      if (projection_count == 0) {
+        if (source_local < source_wave_count &&
+            source_slots[source_local].failure) {
+          std::rethrow_exception(source_slots[source_local].failure);
+        }
+        break;
+      }
       if (projection_count > result.memory.projection_wave_size) {
         throw std::logic_error(
             "chart SPR sampled-tree projection subwave exceeded admission");
@@ -6733,17 +6797,32 @@ project_sampled_tree_moves_in_source_waves(
         projection_slots[local].engaged = false;
         projection_slots[local].path =
             sampled_tree_projection_path::not_attempted;
+        projection_slots[local].failure = nullptr;
+        projection_slots[local].completed = false;
         projection_completed[local] = 0;
       }
 
-      if (scheduler == nullptr) {
-        auto const& job = projection_jobs[0];
-        if (options.before_sampled_tree_projection_for_tests) {
-          options.before_sampled_tree_projection_for_tests(job.ordinal);
+      auto project_one = [&](std::size_t local,
+                             std::size_t stable_slot) noexcept {
+        try {
+          auto const& job = projection_jobs[local];
+          if (options.before_sampled_tree_projection_for_tests) {
+            options.before_sampled_tree_projection_for_tests(job.ordinal);
+          }
+          project_sampled_tree_move_with_path_into(
+              prepared, job.move, projection_workspaces[stable_slot],
+              projection_slots[local]);
+          projection_slots[local].completed = true;
+          projection_completed[local] = 1;
+          return true;
+        } catch (...) {
+          projection_slots[local].failure = std::current_exception();
+          return false;
         }
-        project_sampled_tree_move_with_path_into(
-            prepared, job.move, projection_workspaces[0], projection_slots[0]);
-        projection_completed[0] = 1;
+      };
+
+      if (scheduler == nullptr) {
+        (void)project_one(0, 0);
       } else {
         auto scheduler_handoff = acquire_scheduler_handoff();
         if (cancellation_requested()) {
@@ -6772,15 +6851,10 @@ project_sampled_tree_moves_in_source_waves(
                       cancellation_requested()) {
                     break;
                   }
-                  auto const& job = projection_jobs[local];
-                  if (options.before_sampled_tree_projection_for_tests) {
-                    options.before_sampled_tree_projection_for_tests(
-                        job.ordinal);
-                  }
-                  project_sampled_tree_move_with_path_into(
-                      prepared, job.move, projection_workspaces[stable_slot],
-                      projection_slots[local]);
-                  projection_completed[local] = 1;
+                  // Keep application/projection failures attached to their
+                  // canonical ordinals. A failed workspace is not reused for
+                  // the remainder of its range, while other ranges drain.
+                  if (!project_one(local, stable_slot)) break;
                 }
               },
               &failed_summary);
@@ -6794,6 +6868,7 @@ project_sampled_tree_moves_in_source_waves(
       result.peak_projection_wave_size =
           std::max(result.peak_projection_wave_size, projection_count);
       for (std::size_t local = 0; local < projection_count; ++local) {
+        if (projection_slots[local].failure) continue;
         if (projection_completed[local] == 0) continue;
         if (projection_slots[local].path ==
             sampled_tree_projection_path::direct) {
@@ -6875,6 +6950,9 @@ project_sampled_tree_moves_in_source_waves(
       }
 
       for (std::size_t local = 0; local < projection_count; ++local) {
+        if (projection_slots[local].failure) {
+          std::rethrow_exception(projection_slots[local].failure);
+        }
         if (projection_completed[local] == 0) {
           throw std::logic_error(
               "chart SPR sampled-tree projection subwave joined without "
@@ -6903,7 +6981,13 @@ project_sampled_tree_moves_in_source_waves(
           continue;
         }
         auto boundary = projection_jobs[local].ordinal;
-        result.projection_speculative_discarded += projection_count - local - 1;
+        // A captured failure quarantines the rest of its scheduler range.
+        // Count only tail projections that actually completed before this
+        // canonical stop, not merely every preassigned ordinal in the wave.
+        result.projection_speculative_discarded += static_cast<std::size_t>(
+            std::count(projection_completed.begin() + local + 1,
+                       projection_completed.begin() + projection_count,
+                       std::uint8_t{1}));
         if (decision ==
             sampled_tree_projection_gather_decision::stop_before_current) {
           ++result.projection_speculative_discarded;
