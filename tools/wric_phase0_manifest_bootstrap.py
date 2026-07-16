@@ -2323,6 +2323,33 @@ def require_decimal_text(value: str, label: str, *, positive: bool = False) -> D
     return parsed
 
 
+def quantized_ratio_is_recomputable(
+    total: Decimal,
+    total_quantum: Decimal,
+    count: int,
+    ratio: Decimal,
+    ratio_quantum: Decimal,
+) -> bool:
+    """Return whether two independently rounded fields can share one value.
+
+    The frozen shell harness parses the three-decimal report timer as an IEEE
+    binary value before printing the six-decimal per-candidate ratio.  Decimal
+    half-even division is therefore not an exact model at a decimal half-way
+    point.  Prove the stronger representation-independent property instead:
+    the closed pre-rounding intervals represented by both fields overlap.
+    """
+
+    if count <= 0 or total_quantum <= 0 or ratio_quantum <= 0:
+        return False
+    total_half = total_quantum / Decimal(2)
+    ratio_half = ratio_quantum / Decimal(2)
+    total_lower = max(Decimal(0), total - total_half)
+    total_upper = total + total_half
+    ratio_total_lower = max(Decimal(0), ratio - ratio_half) * Decimal(count)
+    ratio_total_upper = (ratio + ratio_half) * Decimal(count)
+    return total_lower <= ratio_total_upper and ratio_total_lower <= total_upper
+
+
 def capture_row_spec(capture: CaptureSpec, key: tuple[str, str]) -> RowSpec:
     method, worker = key
     return RowSpec(
@@ -2927,12 +2954,23 @@ def validate_successful_raw_domains(
     if row.get("committed_attempt_ratio") != expected_commit_ratio:
         fail(f"successful row committed-attempt ratio is not recomputable: {key}")
     scored = counts["candidates_scored"]
-    expected_local_ratio = (
-        "NA"
-        if scored == 0
-        else f"{timers['local_scoring_ms'] / Decimal(scored):.6f}"
-    )
-    if row.get("local_ms_per_candidate") != expected_local_ratio:
+    local_ratio_text = row.get("local_ms_per_candidate", "")
+    if scored == 0:
+        local_ratio_recomputable = local_ratio_text == "NA"
+    else:
+        local_ratio_recomputable = (
+            re.fullmatch(r"[0-9]+\.[0-9]{6}", local_ratio_text) is not None
+            and re.fullmatch(r"[0-9]+\.[0-9]{3}", row.get("local_scoring_ms", ""))
+            is not None
+            and quantized_ratio_is_recomputable(
+                timers["local_scoring_ms"],
+                Decimal("0.001"),
+                scored,
+                Decimal(local_ratio_text),
+                Decimal("0.000001"),
+            )
+        )
+    if not local_ratio_recomputable:
         fail(f"successful row local per-candidate timing is not recomputable: {key}")
     if report_value(report, "chain_per_accept_exactness_label") != (
         "none_conservative_materialize_rebuild"
@@ -10957,6 +10995,24 @@ def self_test(_: argparse.Namespace) -> None:
         validate_successful_raw_domains(
             synthetic_root, primary, successful_chart, success_key
         )
+        # The frozen awk path uses IEEE binary arithmetic.  At this exact
+        # decimal half-way point it prints 1.985313, while direct Decimal
+        # half-even division prints 1.985312.  Both rounded fields still bind
+        # one narrow, overlapping pre-rounding interval.
+        assert quantized_ratio_is_recomputable(
+            Decimal("127.060"),
+            Decimal("0.001"),
+            64,
+            Decimal("1.985313"),
+            Decimal("0.000001"),
+        )
+        assert not quantized_ratio_is_recomputable(
+            Decimal("127.060"),
+            Decimal("0.001"),
+            64,
+            Decimal("1.985323"),
+            Decimal("0.000001"),
+        )
         for mutation in (
             {"worker_policy": "automatic"},
             {"candidates_generated": "1"},
@@ -10965,6 +11021,7 @@ def self_test(_: argparse.Namespace) -> None:
             {"exact_candidate_queued_for_memory_ms": ""},
             {"final_compaction_exactness_kind": "unknown"},
             {"active_patterns": "3"},
+            {"local_ms_per_candidate": "1.010000"},
         ):
             try:
                 validate_successful_raw_domains(
