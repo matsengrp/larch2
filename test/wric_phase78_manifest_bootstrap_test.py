@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
 import hashlib
 import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import stat
 import subprocess
 import sys
@@ -369,6 +372,50 @@ os.execv({os.fspath(real_runner)!r}, [{os.fspath(real_runner)!r}, *sys.argv[1:]]
     return invocation_log
 
 
+def create_fixture_source(root: Path) -> tuple[Path, str]:
+    """Create a stable tracked source worktree independent of the sealed base."""
+
+    source = root / "tracked-fixture-source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", source], check=True)
+    subprocess.run(
+        ["git", "-C", os.fspath(source), "config", "user.email", "phase78@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", os.fspath(source), "config", "user.name", "Phase 78 test"],
+        check=True,
+    )
+    relative_paths = sorted(
+        {
+            relative
+            for profile in bootstrap.PROFILES.values()
+            for fixture in profile.fixtures
+            for relative in (fixture.relative_path, fixture.ref_relative_path)
+            if relative is not None
+        }
+    )
+    for relative in relative_paths:
+        destination = source / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPO / relative, destination)
+        destination.chmod(0o644)
+    subprocess.run(
+        ["git", "-C", os.fspath(source), "add", "--", *relative_paths], check=True
+    )
+    subprocess.run(
+        ["git", "-C", os.fspath(source), "commit", "-q", "-m", "tracked fixtures"],
+        check=True,
+    )
+    revision = subprocess.run(
+        ["git", "-C", os.fspath(source), "rev-parse", "--verify", "HEAD"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    return source, revision
+
+
 def command(
     case: phase9_test.Integration,
     profile: str,
@@ -382,7 +429,7 @@ def command(
         "--profile",
         profile,
         "--repo-root",
-        os.fspath(REPO),
+        os.fspath(case.base_repo_root),
         "--base-manifest",
         os.fspath(case.base),
         "--expected-parent-sha256",
@@ -397,6 +444,10 @@ def command(
     if action == "build":
         common.extend(
             [
+                "--fixture-source-root",
+                os.fspath(case.fixture_source_root),
+                "--expected-fixture-source-revision",
+                case.fixture_source_revision,
                 "--capture-dir",
                 os.fspath(case.root / f"capture-{profile}"),
                 "--output",
@@ -562,6 +613,161 @@ def main() -> None:
         case = phase9_test.Integration(Path(temporary))
         replace_oracle(case)
         runner_log = wrap_process_metrics(case)
+        fixture_source, fixture_revision = create_fixture_source(case.root)
+        case.fixture_source_root = fixture_source
+        case.fixture_source_revision = fixture_revision
+
+        phase8_profile = bootstrap.PROFILES["phase8"]
+        same_root = bootstrap.fixture_source_for_build(
+            argparse.Namespace(
+                fixture_source_root=None,
+                expected_fixture_source_revision=None,
+            ),
+            phase8_profile,
+            fixture_source,
+            argparse.Namespace(
+                preamble={"repo_revision": fixture_revision}
+            ),
+        )
+        assert same_root.root == fixture_source
+        unrelated = fixture_source / "unrelated-untracked.txt"
+        unrelated.write_text("irrelevant dirt is outside the trusted path set\n")
+        bootstrap.validate_fixture_source_tree(
+            phase8_profile, fixture_source, fixture_revision
+        )
+
+        def source_rejection(
+            label: str,
+            mutate,  # type: ignore[no-untyped-def]
+            expected: str,
+        ) -> None:
+            candidate = command(
+                case,
+                "phase8",
+                "build",
+                case.root / f"source-negative-{label}/phase8-generation.tsv",
+            )
+            capture_index = candidate.index("--capture-dir") + 1
+            candidate[capture_index] = os.fspath(
+                case.root / f"source-negative-{label}.capture"
+            )
+            mutate(candidate)
+            rejected = run(candidate, success=False)
+            assert expected in rejected.stderr, rejected.stderr
+
+        source_rejection(
+            "wrong-revision",
+            lambda argv: argv.__setitem__(
+                argv.index("--expected-fixture-source-revision") + 1,
+                "0" * 40,
+            ),
+            "fixture source provenance is invalid",
+        )
+
+        def remove_expected_revision(argv: list[str]) -> None:
+            index = argv.index("--expected-fixture-source-revision")
+            del argv[index : index + 2]
+
+        source_rejection(
+            "partial-provenance",
+            remove_expected_revision,
+            "must be supplied together",
+        )
+        source_alias = case.root / "tracked-fixture-source-alias"
+        source_alias.symlink_to(fixture_source, target_is_directory=True)
+        source_rejection(
+            "symlink-root",
+            lambda argv: argv.__setitem__(
+                argv.index("--fixture-source-root") + 1,
+                os.fspath(source_alias),
+            ),
+            "fixture source provenance is invalid",
+        )
+        source_rejection(
+            "subdirectory-root",
+            lambda argv: argv.__setitem__(
+                argv.index("--fixture-source-root") + 1,
+                os.fspath(fixture_source / "test"),
+            ),
+            "fixture source provenance is invalid",
+        )
+        source_rejection(
+            "swapped-base-root",
+            lambda argv: argv.__setitem__(
+                argv.index("--fixture-source-root") + 1,
+                os.fspath(case.base_repo_root),
+            ),
+            "fixture source provenance is invalid",
+        )
+        phase8_fixture = phase8_profile.fixtures[0]
+        tracked_fixture = fixture_source / phase8_fixture.relative_path
+        tracked_fixture.chmod(0o755)
+        source_rejection(
+            "dirty-relevant",
+            lambda argv: None,
+            "dirty relevant files",
+        )
+        tracked_fixture.chmod(0o644)
+        assert subprocess.run(
+            [
+                "git",
+                "-C",
+                os.fspath(fixture_source),
+                "status",
+                "--porcelain=v1",
+                "--",
+                phase8_fixture.relative_path,
+            ],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout == ""
+        external_hardlink = case.root / "external-fixture-hardlink.pb.gz"
+        shutil.copyfile(tracked_fixture, external_hardlink)
+        tracked_fixture.unlink()
+        os.link(external_hardlink, tracked_fixture)
+        try:
+            bootstrap.fixture_path(fixture_source, phase8_fixture)
+        except bootstrap.Phase78Error as error:
+            assert "externally hard-linked" in str(error)
+        else:
+            raise AssertionError("hard-linked fixture source was accepted")
+        tracked_fixture.unlink()
+        shutil.copyfile(REPO / phase8_fixture.relative_path, tracked_fixture)
+        tracked_fixture.chmod(0o644)
+        external_hardlink.unlink()
+        tracked_fixture.unlink()
+        tracked_fixture.symlink_to(REPO / phase8_fixture.relative_path)
+        try:
+            bootstrap.fixture_path(fixture_source, phase8_fixture)
+        except bootstrap.core.BootstrapError as error:
+            assert "symlink" in str(error)
+        else:
+            raise AssertionError("symlinked fixture source was accepted")
+        tracked_fixture.unlink()
+        os.mkfifo(tracked_fixture)
+        try:
+            bootstrap.fixture_path(fixture_source, phase8_fixture)
+        except bootstrap.core.BootstrapError as error:
+            assert "regular file" in str(error)
+        else:
+            raise AssertionError("special fixture source was accepted")
+        tracked_fixture.unlink()
+        shutil.copyfile(REPO / phase8_fixture.relative_path, tracked_fixture)
+        tracked_fixture.chmod(0o644)
+        escaped_fixture = dataclasses.replace(
+            phase8_fixture, relative_path="../escaped.pb.gz"
+        )
+        escaped_profile = dataclasses.replace(
+            phase8_profile, fixtures=(escaped_fixture,)
+        )
+        try:
+            bootstrap.fixture_relative_paths(escaped_profile)
+        except bootstrap.Phase78Error as error:
+            assert "not normalized and confined" in str(error)
+        else:
+            raise AssertionError("escaping fixture source path was accepted")
+
         noninvoking_marker = case.root / "noninvoking-runner-was-called"
         noninvoking_runner = case.root / "wrong-process-metrics"
         phase9_test.write_bytes(
@@ -594,7 +800,9 @@ def main() -> None:
             run(command(case, profile, "audit", output))
             result = run(command(case, profile, "build", output), success=False)
             assert "already exists" in result.stderr
-            manifest = bootstrap.core.read_manifest(output, REPO, expected_kind="supplement")
+            manifest = bootstrap.core.read_manifest(
+                output, case.base_repo_root, expected_kind="supplement"
+            )
             assert len(manifest.rows) == (4 if profile == "phase8" else 24)
             profile_assets = output.with_name(output.stem + ".assets")
             expected_capture_identity = {
@@ -810,6 +1018,8 @@ def main() -> None:
             assert invocation[timeout_index + 1] == "600"
 
         phase8_output = case.root / "out-phase8" / "phase8-generation.tsv"
+        shutil.rmtree(fixture_source)
+        run(command(case, "phase8", "audit", phase8_output))
         extra = phase8_output.with_name("phase8-generation.assets") / "unledgered.txt"
         extra.write_text("not sealed\n")
         result = run(command(case, "phase8", "audit", phase8_output), success=False)

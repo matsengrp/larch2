@@ -230,6 +230,14 @@ class AuditedBundle:
     profile: Profile
 
 
+@dataclasses.dataclass(frozen=True)
+class FixtureSource:
+    """Externally revision-bound source for build-only fixture ingestion."""
+
+    root: Path
+    revision: str
+
+
 def profile_named(name: str) -> Profile:
     try:
         return PROFILES[name]
@@ -290,6 +298,126 @@ def fixture_ref_path(root: Path, fixture: FixtureSpec) -> Path | None:
     if core.sha256_file(path) != fixture.ref_sha256:
         fail(f"tracked fixture reference hash changed: {fixture.ref_relative_path}")
     return path
+
+
+def fixture_relative_paths(profile: Profile) -> tuple[str, ...]:
+    """Return the closed, hard-coded source path set for one profile."""
+
+    paths = [fixture.relative_path for fixture in profile.fixtures]
+    paths.extend(
+        fixture.ref_relative_path
+        for fixture in profile.fixtures
+        if fixture.ref_relative_path is not None
+    )
+    if len(paths) != len(set(paths)):
+        fail(f"{profile.name} fixture source paths are not unique")
+    for text in paths:
+        relative = Path(text)
+        if (
+            not text
+            or relative.is_absolute()
+            or "." in relative.parts
+            or ".." in relative.parts
+            or "\\" in text
+            or "//" in text
+        ):
+            fail(f"fixture source path is not normalized and confined: {text!r}")
+    return tuple(paths)
+
+
+def validate_fixture_source_tree(
+    profile: Profile, root: Path, expected_revision: str
+) -> FixtureSource:
+    """Validate exact Git provenance and every relevant tracked fixture byte."""
+
+    if core.REVISION.fullmatch(expected_revision) is None:
+        fail("expected fixture-source revision is not a full Git object ID")
+    try:
+        source_root = core.base_repo_root(root)
+        core.require_base_revision(source_root, expected_revision)
+    except core.BootstrapError as error:
+        fail(f"fixture source provenance is invalid: {error}")
+    relatives = fixture_relative_paths(profile)
+    try:
+        tracked = core.git_output(
+            source_root,
+            ("--literal-pathspecs", "ls-files", "--stage", "--", *relatives),
+            "fixture source tracked-file audit",
+        )
+        dirty = core.git_output(
+            source_root,
+            (
+                "--literal-pathspecs",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                *relatives,
+            ),
+            "fixture source relevant-status audit",
+        )
+    except core.BootstrapError as error:
+        fail(str(error))
+    observed: list[str] = []
+    for line in tracked.splitlines():
+        if "\t" not in line:
+            fail("fixture source tracked-file record is malformed")
+        metadata, relative = line.split("\t", 1)
+        fields = metadata.split()
+        if len(fields) != 3 or fields[0] != "100644" or fields[2] != "0":
+            fail(f"fixture source tracked-file mode/stage is invalid: {relative}")
+        observed.append(relative)
+    if sorted(observed) != sorted(relatives):
+        fail(
+            "fixture source does not track the exact required path set: "
+            f"observed={sorted(observed)}, expected={sorted(relatives)}"
+        )
+    if dirty:
+        fail(
+            "fixture source has dirty relevant files: "
+            + dirty.splitlines()[0]
+        )
+    for fixture in profile.fixtures:
+        fixture_path(source_root, fixture)
+        fixture_ref_path(source_root, fixture)
+    return FixtureSource(source_root, expected_revision)
+
+
+def fixture_source_for_build(
+    args: argparse.Namespace,
+    profile: Profile,
+    base_root: Path,
+    base: core.Manifest,
+) -> FixtureSource:
+    """Select explicit split-root provenance or safe sealed same-root defaults."""
+
+    source_argument, revision_argument = fixture_source_options(args)
+    if source_argument is None:
+        return validate_fixture_source_tree(
+            profile, base_root, base.preamble["repo_revision"]
+        )
+    return validate_fixture_source_tree(
+        profile, Path(source_argument), str(revision_argument)
+    )
+
+
+def fixture_source_options(
+    args: argparse.Namespace,
+) -> tuple[Path | None, str | None]:
+    """Reject partial or self-derived explicit fixture provenance."""
+
+    source_argument = getattr(args, "fixture_source_root", None)
+    revision_argument = getattr(args, "expected_fixture_source_revision", None)
+    if (source_argument is None) != (revision_argument is None):
+        fail(
+            "--fixture-source-root and --expected-fixture-source-revision "
+            "must be supplied together"
+        )
+    if revision_argument is not None and core.REVISION.fullmatch(
+        str(revision_argument)
+    ) is None:
+        fail("--expected-fixture-source-revision is not a full Git object ID")
+    return source_argument, revision_argument
 
 
 def contract_row(
@@ -1515,7 +1643,7 @@ def validate_matrix(profile: Profile, evidence: Sequence[RowEvidence]) -> None:
 def capture_profile(
     profile: Profile,
     base: core.Manifest,
-    root: Path,
+    fixture_root: Path,
     capture_dir: Path,
     oracle: Path,
     process_metrics: Path,
@@ -1529,7 +1657,7 @@ def capture_profile(
     inputs: dict[str, InputEvidence] = {}
     evidence: list[RowEvidence] = []
     for fixture in profile.fixtures:
-        path = fixture_path(root, fixture)
+        path = fixture_path(fixture_root, fixture)
         inputs[fixture.key] = capture_input(
             profile,
             fixture,
@@ -2133,7 +2261,7 @@ def validate_with_harness(
 
 def validate_build_inputs(
     args: argparse.Namespace, profile: Profile, root: Path
-) -> tuple[core.Manifest, Path, Path, Path, str]:
+) -> tuple[core.Manifest, Path, Path, Path, str, FixtureSource]:
     try:
         base = core.read_manifest(args.base_manifest, root, expected_kind="base")
     except core.BootstrapError as error:
@@ -2147,9 +2275,7 @@ def validate_build_inputs(
     if base.preamble["parent_sha256"] != "-":
         fail("base workload manifest must declare parent_sha256=-")
     core.validate_affinity(args.affinity_cpus, "Phase-7/8 capture")
-    for fixture in profile.fixtures:
-        fixture_path(root, fixture)
-        fixture_ref_path(root, fixture)
+    fixture_source = fixture_source_for_build(args, profile, root, base)
     oracle = core.resolve_manifest_uri(
         base.path, base.preamble["frozen_oracle_dagutil_uri"], root
     )
@@ -2169,7 +2295,14 @@ def validate_build_inputs(
             "process-metrics runner differs from "
             "--expected-process-metrics-sha256"
         )
-    return base, oracle, larch2, process_metrics, process_metrics_sha256
+    return (
+        base,
+        oracle,
+        larch2,
+        process_metrics,
+        process_metrics_sha256,
+        fixture_source,
+    )
 
 
 def build_locked(
@@ -2178,9 +2311,14 @@ def build_locked(
     publication: core.PublicationPaths,
     root: Path,
 ) -> None:
-    base, oracle, larch2, process_metrics, process_metrics_sha256 = validate_build_inputs(
-        args, profile, root
-    )
+    (
+        base,
+        oracle,
+        larch2,
+        process_metrics,
+        process_metrics_sha256,
+        fixture_source,
+    ) = validate_build_inputs(args, profile, root)
     capture_absolute = args.capture_dir.absolute()
     for reserved in dataclasses.astuple(publication):
         if (
@@ -2193,7 +2331,7 @@ def build_locked(
         capture, _inputs, evidence = capture_profile(
             profile,
             base,
-            root,
+            fixture_source.root,
             args.capture_dir,
             oracle,
             process_metrics,
@@ -2207,7 +2345,13 @@ def build_locked(
     if core.sha256_file(process_metrics) != process_metrics_sha256:
         fail("process-metrics runner changed during capture")
 
-    asset_files = capture_asset_files(profile, root, capture)
+    # Revalidate both revision and relevant-file cleanliness after the long
+    # capture, before any source byte enters the immutable archive.
+    fixture_source = validate_fixture_source_tree(
+        profile, fixture_source.root, fixture_source.revision
+    )
+
+    asset_files = capture_asset_files(profile, fixture_source.root, capture)
     ledger = asset_ledger_bytes(asset_files)
     ledger_sha = core.sha256_bytes(ledger)
     asset_files["assets.sha256"] = ledger
@@ -2289,6 +2433,7 @@ def build_locked(
 
 def build(args: argparse.Namespace) -> None:
     profile = profile_named(args.profile)
+    fixture_source_options(args)
     root = core.repo_root(args.repo_root)
     output = args.output.absolute()
     if output.name != profile.output_name:
@@ -2431,6 +2576,21 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             "--expected-process-metrics-sha256", required=True
         )
         if name == "build":
+            command.add_argument(
+                "--fixture-source-root",
+                type=Path,
+                help=(
+                    "canonical Git worktree containing the profile's hard-coded "
+                    "tracked fixture paths"
+                ),
+            )
+            command.add_argument(
+                "--expected-fixture-source-revision",
+                help=(
+                    "externally recorded full Git revision for "
+                    "--fixture-source-root"
+                ),
+            )
             command.add_argument("--capture-dir", type=Path, required=True)
             command.add_argument("--output", type=Path, required=True)
             command.add_argument("--affinity-cpus", required=True)
