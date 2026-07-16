@@ -1449,14 +1449,23 @@ static void test_prepared_lazy_local_core_is_allocation_free() {
   check_statistics(signature_observer, 0, 0, 0, 0, 0);
   auto const signature_node_bytes =
       sizeof(std::set<std::string>::value_type) + 4 * sizeof(void*);
+  auto expected_signature_capacity = [](std::size_t encoded_size) {
+    auto const sso_capacity = std::string{}.capacity();
+    if (encoded_size <= sso_capacity) return sso_capacity;
+    constexpr std::size_t allocation_quantum = 16;
+    return ((encoded_size + 1 + allocation_quantum - 1) / allocation_quantum) *
+               allocation_quantum -
+           1;
+  };
   for (std::size_t index = 0; index < signature_candidates.size(); ++index) {
     auto actual = larch::chart_spr_candidate_taxon_signature(
         state.grammar, signature_candidates[index]);
+    auto const expected_capacity = expected_signature_capacity(actual.size());
+    CHECK(actual.capacity() == expected_capacity);
     CHECK(signature_resident[index] >=
           signature_node_bytes + actual.capacity() + 1);
     CHECK(signature_resident[index] ==
-          signature_node_bytes +
-              std::max(actual.size(), std::string{}.capacity()) + 1);
+          signature_node_bytes + expected_capacity + 1);
   }
 
   auto checked =

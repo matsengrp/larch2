@@ -6485,11 +6485,21 @@ chart_spr_search_detail::estimate_grammar_spr_enumeration_signature_live_bytes(
     encoded_length = add(encoded_length, add(length, 1));  // ';'
   }
 
-  // On the frozen libstdc++ toolchain a copied/moved signature owns either
-  // the SSO buffer or an allocation with capacity equal to its encoded size.
-  // Querying the empty-string SSO capacity is allocation-free.
-  auto const string_capacity =
-      std::max(encoded_length, std::string{}.capacity());
+  // The required GCC-trunk/libstdc++ allocator uses allocate_at_least for
+  // non-SSO strings and exposes the 16-byte allocation quantum through
+  // basic_string::capacity().  Charge that retained slack exactly: N encoded
+  // bytes require round_up(N + 1, 16) allocation bytes and therefore retain a
+  // capacity one byte smaller.  Querying the SSO capacity remains
+  // allocation-free.
+  auto string_capacity = std::string{}.capacity();
+  if (encoded_length > string_capacity) {
+    constexpr std::size_t allocation_quantum = 16;
+    auto allocation_bytes = add(encoded_length, 1);
+    allocation_bytes = add(allocation_bytes, allocation_quantum - 1);
+    allocation_bytes =
+        (allocation_bytes / allocation_quantum) * allocation_quantum;
+    string_capacity = allocation_bytes - 1;
+  }
   return chart_spr_checked_cache_bytes_add(
       sizeof(std::set<std::string>::value_type) + 4 * sizeof(void*),
       chart_spr_checked_cache_bytes_add(
