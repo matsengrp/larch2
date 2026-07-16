@@ -1833,6 +1833,16 @@ struct chart_spr_iteration_result {
   std::vector<std::size_t> affected_clade_counts;
   std::optional<chart_spr_candidate_score> accepted;
   bool accepted_move_committed = false;
+  // Product-level evidence for the single-writer accepted-state transaction.
+  // These are deltas of the persistent dense (pattern, clade) cache counters
+  // across this iteration's successful local commit.  They remain zero for
+  // no-accept/rejected iterations and for conservative materialize-rebuild
+  // mode, whose rebuild accounting has a separate counter contract.
+  std::size_t accepted_inside_rows_recomputed = 0;
+  std::size_t accepted_outside_rows_recomputed = 0;
+  // Captured against the pre-commit grammar so every committed iteration can
+  // report the accepted candidate after the mutable tip advances.
+  std::string accepted_candidate_signature;
   bool post_materialization_rejected = false;
   std::string post_materialization_rejection_reason;
   bool reused_patterns_after_accept = false;
@@ -4141,6 +4151,7 @@ struct grammar_spr_finite_iteration_memory_envelope {
   std::size_t planned_post_release_result_bytes = 0;
   std::size_t planned_ranked_candidate_exact_evidence_bytes = 0;
   std::size_t planned_accepted_candidate_dynamic_bytes = 0;
+  std::size_t planned_accepted_candidate_signature_bytes = 0;
   std::size_t planned_local_workspace_resident_bytes = 0;
   std::size_t planned_signature_node_bytes = 0;
   std::size_t planned_candidate_live_bytes = 0;
@@ -15125,6 +15136,29 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
             std::chrono::steady_clock::now() - exact_stage_start)
             .count();
     std::vector<chart_spr_candidate_score>{}.swap(ranked);
+  }
+
+  if (result.accepted) {
+    // The accepted candidate's dense IDs are meaningful only against this
+    // pre-commit grammar.  Retain its stable sample signature before the
+    // caller advances the tip, with the allocation charged to the finite
+    // iteration result envelope below.
+    result.accepted_candidate_signature = chart_spr_candidate_sample_signature(
+        state.grammar, result.accepted->candidate);
+    if (finite_iteration_admission) {
+      auto const signature_bytes =
+          chart_spr_search_detail::local_owned_dynamic_capacity_bytes(
+              result.accepted_candidate_signature);
+      if (signature_bytes > finite_iteration_envelope
+                                ->planned_accepted_candidate_signature_bytes) {
+        fail_finite_iteration_budget(
+            0, signature_bytes,
+            finite_iteration_envelope
+                ->planned_accepted_candidate_signature_bytes);
+      }
+      check_finite_actual_live(
+          enumeration_seen_count == 0 ? 0 : enumeration_seen_count - 1);
+    }
   }
 
   if (capture_semantics &&

@@ -6644,6 +6644,8 @@ std::size_t chart_spr_search_detail::estimate_exact_loop_resident_input_bytes(
   chart_spr_exact_resident_add(total, accepted_copy_dynamic_peak);
 
   chart_spr_exact_resident_add_string(total, iteration.no_accept_reason);
+  chart_spr_exact_resident_add_string(total,
+                                      iteration.accepted_candidate_signature);
   chart_spr_exact_resident_add_vector(total,
                                       iteration.affected_clade_counts);
   chart_spr_exact_resident_add_string(
@@ -7225,6 +7227,7 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   future = add(future, multiply(ranked_limit, candidate_record_dynamic));
   future = add(future, candidate_record_dynamic);
   future = add(future, no_accept_reason_capacity);
+  future = add(future, sample_signature_capacity);
   chart_spr_canonical_exact_evidence_memory_estimate
       canonical_state_exact_evidence;
   std::size_t ranked_candidate_exact_evidence_bytes = 0;
@@ -7527,6 +7530,7 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
       add(post_release_result, doubled_vector(ranked_limit, sizeof(double)));
   post_release_result = add(post_release_result, candidate_record_dynamic);
   post_release_result = add(post_release_result, no_accept_reason_capacity);
+  post_release_result = add(post_release_result, sample_signature_capacity);
   if (capture_semantics) {
     post_release_result =
         add(post_release_result,
@@ -7558,6 +7562,7 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
       .planned_post_release_result_bytes = post_release_result,
       .planned_ranked_candidate_exact_evidence_bytes =
           ranked_candidate_exact_evidence_bytes,
+      .planned_accepted_candidate_signature_bytes = sample_signature_capacity,
       .planned_local_workspace_resident_bytes = local_workspace,
       .planned_signature_node_bytes = signature_node,
       .planned_candidate_live_bytes = candidate_live,
@@ -8856,6 +8861,10 @@ chart_spr_search_result run_chart_spr_search(
         // Commit to the chain + caches.  Refreshes state.grammar /
         // state.pattern_charts in place (the derived tip view).  A
         // tombstone-scope skip leaves the chain, caches, and state pristine.
+        auto const inside_rows_before_commit =
+            attempt_counters.inside_rows_recomputed_on_commit;
+        auto const outside_rows_before_commit =
+            attempt_counters.outside_rows_recomputed_on_commit;
         auto commit = chart_spr_commit_accepted_locally(
             *local_commit_substrate, state, *iteration.accepted, options,
             attempt_counters, scheduler);
@@ -8888,6 +8897,21 @@ chart_spr_search_result run_chart_spr_search(
           result.iterations.push_back(std::move(iteration));
           break;
         }
+
+        if (attempt_counters.inside_rows_recomputed_on_commit <
+                inside_rows_before_commit ||
+            attempt_counters.outside_rows_recomputed_on_commit <
+                outside_rows_before_commit) {
+          throw chart_spr_local_commit_hard_error(
+              "chart SPR local commit: persistent affected-row counter moved "
+              "backwards");
+        }
+        iteration.accepted_inside_rows_recomputed =
+            attempt_counters.inside_rows_recomputed_on_commit -
+            inside_rows_before_commit;
+        iteration.accepted_outside_rows_recomputed =
+            attempt_counters.outside_rows_recomputed_on_commit -
+            outside_rows_before_commit;
 
         local_commit_mutated_shared_state = true;
         immediate_reversal_key_to_skip = accepted_immediate_reversal_key;

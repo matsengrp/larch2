@@ -5018,6 +5018,10 @@ static void run_chart_spr_search_diagnostic(
       out << "      accepted_move_committed: "
           << (iteration.accepted_move_committed ? "true" : "false")
           << "\n";
+      out << "      accepted_inside_rows_recomputed: "
+          << iteration.accepted_inside_rows_recomputed << "\n";
+      out << "      accepted_outside_rows_recomputed: "
+          << iteration.accepted_outside_rows_recomputed << "\n";
       out << "      post_materialization_rejected: "
           << (iteration.post_materialization_rejected ? "true" : "false")
           << "\n";
@@ -5054,11 +5058,9 @@ static void run_chart_spr_search_diagnostic(
             << "\n";
         out << "      post_materialization_rebuilt_score: "
             << iteration.post_materialization_rebuilt_score << "\n";
-        if (iteration.iteration == 0) {
+        if (iteration.accepted_move_committed) {
           out << "      accepted_candidate_signature: "
-              << chart_spr_candidate_sample_signature(
-                     refinement.grammar, accepted.candidate)
-              << "\n";
+              << iteration.accepted_candidate_signature << "\n";
         }
       }
       out << "      affected_clade_count_distribution:\n";

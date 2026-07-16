@@ -65,6 +65,78 @@ expected=$(sed -n \
 actual=$(sha256sum "$tmp/search-1.ndjson" | awk '{print $1}')
 [[ $expected == "$actual" ]]
 
+# A three-commit CLI run makes the per-iteration accepted-update evidence and
+# pre-commit candidate-signature lifetime non-vacuous.  The tiny three-pattern
+# source mirrors the committed Phase-9 performance fixture's topology while
+# keeping this semantic/report contract test fast.
+three_common=(
+  --fasta test/wric_chart_three_accepts_tiny.fa
+  --newick test/wric_chart_three_accepts_tiny.nwk
+  --refseq test/wric_chart_three_accepts_tiny.ref
+  --force-no-vcf
+  --validate
+  --wric-polytomy-mode reject
+  --chart-spr-search
+  --chart-spr-local-accept-updates
+  --chart-spr-acceptance exact-multisite
+  --chart-spr-candidate-selection lower-bound-top-k
+  --chart-spr-max-candidates 32
+  --chart-spr-top-k-exact 4
+  --chart-spr-max-iterations 3
+)
+
+run_three() {
+  local seed=$1
+  local workers=$2
+  "$dagutil" "${three_common[@]}" \
+    --seed "$seed" \
+    --chart-spr-workers "$workers" \
+    --chart-spr-canonical-result "$tmp/three-$seed-$workers.json" \
+    --chart-spr-canonical-sidecar "$tmp/three-$seed-$workers.ndjson" \
+    >"$tmp/three-$seed-$workers.out" \
+    2>"$tmp/three-$seed-$workers.err"
+}
+
+for seed in 1 7 19; do
+  for worker_count in 1 2 4 8; do
+    run_three "$seed" "$worker_count"
+    [[ $(grep -Ec '^      accepted_candidate_signature: .+' \
+          "$tmp/three-$seed-$worker_count.out") == 3 ]]
+    [[ $(grep -Ec '^      accepted_inside_rows_recomputed: [1-9][0-9]*$' \
+          "$tmp/three-$seed-$worker_count.out") == 3 ]]
+    [[ $(grep -Ec '^      accepted_outside_rows_recomputed: [1-9][0-9]*$' \
+          "$tmp/three-$seed-$worker_count.out") == 3 ]]
+    [[ $(grep -c '"record":"iteration_outcome".*"accepted_move_committed":true.*"selected_signature":".' \
+          "$tmp/three-$seed-$worker_count.ndjson") == 3 ]]
+
+    iteration_inside=$(awk '/^      accepted_inside_rows_recomputed: / {sum += $2} END {print sum + 0}' \
+      "$tmp/three-$seed-$worker_count.out")
+    total_inside=$(awk '/^  inside_rows_recomputed_on_commit: / {print $2}' \
+      "$tmp/three-$seed-$worker_count.out")
+    [[ $iteration_inside == "$total_inside" ]]
+    iteration_outside=$(awk '/^      accepted_outside_rows_recomputed: / {sum += $2} END {print sum + 0}' \
+      "$tmp/three-$seed-$worker_count.out")
+    total_outside=$(awk '/^  outside_rows_recomputed_on_commit: / {print $2}' \
+      "$tmp/three-$seed-$worker_count.out")
+    [[ $iteration_outside == "$total_outside" ]]
+
+    grep '^      accepted_candidate_signature: ' \
+      "$tmp/three-$seed-$worker_count.out" \
+      >"$tmp/three-$seed-$worker_count.signatures"
+    grep -E '^      accepted_(inside|outside)_rows_recomputed: ' \
+      "$tmp/three-$seed-$worker_count.out" \
+      >"$tmp/three-$seed-$worker_count.rows"
+  done
+
+  for worker_count in 2 4 8; do
+    cmp "$tmp/three-$seed-1.json" "$tmp/three-$seed-$worker_count.json"
+    cmp "$tmp/three-$seed-1.ndjson" "$tmp/three-$seed-$worker_count.ndjson"
+    cmp "$tmp/three-$seed-1.signatures" \
+      "$tmp/three-$seed-$worker_count.signatures"
+    cmp "$tmp/three-$seed-1.rows" "$tmp/three-$seed-$worker_count.rows"
+  done
+done
+
 # `--chart-bnb-score-only` still computes an exact scalar optimum, but
 # intentionally has no exact keep mask or tied-production provenance.  Search
 # capture must neither force that unavailable evidence nor change the search

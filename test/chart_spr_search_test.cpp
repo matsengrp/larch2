@@ -4508,6 +4508,9 @@ static void test_lazy_local_production_multibatch_retained_budget() {
   CHECK(fit.candidates_generated == base_options.enumeration.max_candidates);
   CHECK(fit.candidates_scored == base_options.enumeration.max_candidates);
   CHECK(fit.canonical_candidates.size() == fit.candidates_scored);
+  if (fit.accepted) {
+    CHECK(!fit.accepted_candidate_signature.empty());
+  }
   CHECK(state.counters.lazy_local_admission_waves == fit.candidates_scored);
   CHECK(state.counters.lazy_local_pre_submit_budget_failures == 0);
   CHECK(state.counters.lazy_local_iteration_envelope_bytes_max == envelope);
@@ -4540,6 +4543,8 @@ static void test_lazy_local_production_multibatch_retained_budget() {
   CHECK(long_sample_envelope.planned_canonical_record_dynamic_bytes > 4096);
   CHECK(long_sample_envelope.planned_canonical_record_dynamic_bytes >=
         long_sample_signature.capacity() + 1);
+  CHECK(long_sample_envelope.planned_accepted_candidate_signature_bytes >=
+        long_sample_signature.capacity() + 1);
 
   auto reject_state = make_state();
   auto reject_options = base_options;
@@ -4559,6 +4564,77 @@ static void test_lazy_local_production_multibatch_retained_budget() {
   CHECK(rejected);
   CHECK(reject_state.counters.lazy_local_admission_waves == 0);
   CHECK(reject_workspace.candidate_slots.capacity() == 0);
+
+  // The accepted-signature allocation itself is covered at the strict finite
+  // boundary.  A one-candidate improving fixture prevents E-1 from shrinking
+  // any source/batch wave, so the rejection proves the new result ownership
+  // was included before candidate generation.
+  auto improving_dag =
+      larch::test::make_tiny_labelled_tree("A", four_taxon_misplaced_tree());
+  auto improving_grammar = larch::build_clade_grammar(improving_dag);
+  auto signature_options = base_options;
+  signature_options.semantic_capture =
+      larch::chart_spr_semantic_capture_mode::digest;
+  signature_options.enumeration.max_candidates = 1;
+  signature_options.cache.candidate_batch_size = 1;
+  signature_options.enable_candidate_generation_pipeline = false;
+  auto const signature_state_options = signature_options;
+  auto make_signature_state = [&] {
+    return larch::build_chart_spr_search_state(improving_dag, improving_grammar,
+                                               signature_state_options);
+  };
+  auto signature_state = make_signature_state();
+  auto const signature_envelope = larch::chart_spr_search_detail::
+      estimate_grammar_spr_finite_iteration_memory_envelope(
+          signature_state, 1, 1, 1, true, scheduler, 1);
+  CHECK(signature_envelope.planned_accepted_candidate_signature_bytes > 0);
+
+  auto signature_discovery_state = make_signature_state();
+  auto signature_discovery_options = signature_options;
+  signature_discovery_options.cache.memory_budget_bytes = 1;
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      signature_discovery_workspace;
+  std::size_t signature_budget = 0;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(
+        signature_discovery_state, signature_discovery_options, 0,
+        signature_discovery_workspace, scheduler);
+    CHECK(false);
+  } catch (
+      larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+          e) {
+    signature_budget = e.required_bytes();
+  }
+  CHECK(signature_budget > 1);
+  signature_options.cache.memory_budget_bytes =
+      signature_budget;
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      signature_workspace;
+  auto signature_fit = larch::run_chart_spr_acceptance_iteration(
+      signature_state, signature_options, 0, signature_workspace, scheduler);
+  CHECK(signature_fit.accepted.has_value());
+  CHECK(!signature_fit.accepted_candidate_signature.empty());
+  CHECK(signature_fit.accepted_candidate_signature.capacity() + 1 <=
+        signature_envelope.planned_accepted_candidate_signature_bytes);
+
+  auto signature_reject_state = make_signature_state();
+  signature_options.cache.memory_budget_bytes =
+      signature_budget - 1;
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      signature_reject_workspace;
+  bool signature_rejected = false;
+  try {
+    (void)larch::run_chart_spr_acceptance_iteration(
+        signature_reject_state, signature_options, 0,
+        signature_reject_workspace, scheduler);
+  } catch (
+      larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+          e) {
+    signature_rejected = true;
+    CHECK(e.required_bytes() == signature_budget);
+  }
+  CHECK(signature_rejected);
+  CHECK(signature_reject_state.counters.lazy_local_admission_waves == 0);
 
   scheduler.shutdown();
   std::println("  PASS");
@@ -9910,6 +9986,9 @@ static void test_phase5_no_improvement_search_stops_without_commit() {
 
   CHECK(search.iterations.size() == 1);
   CHECK(!search.iterations.front().accepted_move_committed);
+  CHECK(search.iterations.front().accepted_inside_rows_recomputed == 0);
+  CHECK(search.iterations.front().accepted_outside_rows_recomputed == 0);
+  CHECK(search.iterations.front().accepted_candidate_signature.empty());
   CHECK(search.counters.accepted_moves == 0);
   CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
   CHECK(search.summary.initial_search_state_rebuilds == 1);
@@ -11750,6 +11829,11 @@ static void test_phase4_conservative_mode_counters_unchanged() {
   CHECK(search.counters.local_commit_accepted_moves == 0);
   CHECK(search.counters.inside_rows_recomputed_on_commit == 0);
   CHECK(search.counters.outside_rows_recomputed_on_commit == 0);
+  CHECK(search.iterations.size() == 1);
+  CHECK(search.iterations.front().accepted_move_committed);
+  CHECK(search.iterations.front().accepted_inside_rows_recomputed == 0);
+  CHECK(search.iterations.front().accepted_outside_rows_recomputed == 0);
+  CHECK(!search.iterations.front().accepted_candidate_signature.empty());
 
   std::println("  PASS");
 }
@@ -12730,8 +12814,10 @@ static void test_phase9_transient_multi_worker_matches_serial() {
         larch::chart_spr_candidate_selection_mode::exhaustive_exact;
     options.max_iterations = 12;
     options.rebuild_after_accept = false;
+    options.worker_count = workers;
     options.local_score_worker_count = workers;
     options.cache.candidate_batch_size = 128;
+    options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
     options.verify_local_commit_two_chart_oracle_for_tests = true;
     options.verify_transient_chain_extension_oracle_for_tests = oracle;
     return larch::run_chart_spr_search(std::move(fixture.dag),
@@ -12742,8 +12828,49 @@ static void test_phase9_transient_multi_worker_matches_serial() {
   auto parallel = run_once(4, true);
 
   CHECK(serial.counters.accepted_moves == parallel.counters.accepted_moves);
+  CHECK(serial.counters.accepted_moves >= 3);
   CHECK(serial.summary.final_score == parallel.summary.final_score);
   CHECK(serial.summary.initial_score == parallel.summary.initial_score);
+  CHECK(serial.iterations.size() == parallel.iterations.size());
+  CHECK(serial.canonical_report.has_value());
+  CHECK(parallel.canonical_report.has_value());
+  CHECK(serial.canonical_digest.has_value());
+  CHECK(parallel.canonical_digest.has_value());
+  CHECK(serial.canonical_digest->full_sidecar ==
+        parallel.canonical_digest->full_sidecar);
+
+  std::size_t committed = 0;
+  std::size_t serial_inside_rows = 0;
+  std::size_t serial_outside_rows = 0;
+  for (std::size_t index = 0; index < serial.iterations.size(); ++index) {
+    auto const& serial_iteration = serial.iterations[index];
+    auto const& parallel_iteration = parallel.iterations[index];
+    CHECK(serial_iteration.accepted_move_committed ==
+          parallel_iteration.accepted_move_committed);
+    CHECK(serial_iteration.accepted_inside_rows_recomputed ==
+          parallel_iteration.accepted_inside_rows_recomputed);
+    CHECK(serial_iteration.accepted_outside_rows_recomputed ==
+          parallel_iteration.accepted_outside_rows_recomputed);
+    CHECK(serial_iteration.accepted_candidate_signature ==
+          parallel_iteration.accepted_candidate_signature);
+    if (serial_iteration.accepted_move_committed) {
+      ++committed;
+      CHECK(serial_iteration.accepted_inside_rows_recomputed > 0);
+      CHECK(serial_iteration.accepted_outside_rows_recomputed > 0);
+      CHECK(!serial_iteration.accepted_candidate_signature.empty());
+      CHECK(serial.canonical_report->iterations[index].selected_signature ==
+            serial_iteration.accepted_candidate_signature);
+      serial_inside_rows += serial_iteration.accepted_inside_rows_recomputed;
+      serial_outside_rows += serial_iteration.accepted_outside_rows_recomputed;
+    } else {
+      CHECK(serial_iteration.accepted_inside_rows_recomputed == 0);
+      CHECK(serial_iteration.accepted_outside_rows_recomputed == 0);
+    }
+  }
+  CHECK(committed == serial.counters.local_commit_accepted_moves);
+  CHECK(serial_inside_rows == serial.counters.inside_rows_recomputed_on_commit);
+  CHECK(serial_outside_rows ==
+        serial.counters.outside_rows_recomputed_on_commit);
   CHECK(parallel.counters.transient_chain_extensions_for_verification > 0);
   CHECK(parallel.counters.transient_chain_diagnostic_cache_extensions ==
         parallel.counters.transient_chain_extensions_for_verification);
