@@ -533,8 +533,8 @@ void test_generation_error_drains() {
   std::println("  PASS");
 }
 
-void test_finite_sampled_source_lookahead_planning() {
-  std::println("test_finite_sampled_source_lookahead_planning");
+void test_finite_sampled_source_adaptive_planning() {
+  std::println("test_finite_sampled_source_adaptive_planning");
 
   auto input = make_fixture();
   auto state = larch::build_chart_spr_search_state(input.dag, input.grammar);
@@ -556,11 +556,23 @@ void test_finite_sampled_source_lookahead_planning() {
   };
 
   auto const maximum = estimate(0);
-  CHECK(maximum.planned_sampled_source_wave_size == 2);
+  // Finite admission remains conservative at the complete worker width. The
+  // runtime policy narrows only its first active source wave, so the retained
+  // slots and memory envelope still bound a later full-width wave.
+  CHECK(maximum.planned_sampled_source_wave_size == 8);
   CHECK(maximum.planned_sampled_projection_wave_size >
         maximum.planned_sampled_source_wave_size);
-  CHECK(estimate(8).planned_sampled_source_wave_size == 2);
+  CHECK(estimate(8).planned_sampled_source_wave_size == 8);
+  CHECK(estimate(4).planned_sampled_source_wave_size == 4);
   CHECK(estimate(1).planned_sampled_source_wave_size == 1);
+  CHECK(larch::chart_spr_detail::sampled_tree_source_initial_runtime_wave_size(
+            8, true, true, 0) == 4);
+  CHECK(larch::chart_spr_detail::sampled_tree_source_initial_runtime_wave_size(
+            8, true, false, 0) == 8);
+  CHECK(larch::chart_spr_detail::sampled_tree_source_initial_runtime_wave_size(
+            8, true, true, 2) == 2);
+  CHECK(larch::chart_spr_detail::sampled_tree_source_initial_runtime_wave_size(
+            4, true, true, 8) == 4);
 
   // Zero is the exhaustive/reservoir-expanded policy and remains at the
   // resolved worker width in the same allocation-free envelope.
@@ -1052,7 +1064,7 @@ int main() {
   test_stale_stamp_never_scores();
   test_error_precedence_drain_and_recovery();
   test_generation_error_drains();
-  test_finite_sampled_source_lookahead_planning();
+  test_finite_sampled_source_adaptive_planning();
   test_finite_admission_exact_boundary();
   test_dense_partial_final_batch_uses_admitted_tile_shape();
   std::println("chart_spr_pipeline_test PASS");

@@ -7110,13 +7110,10 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
           "chart SPR finite iteration envelope: sampled/hybrid source "
           "requires a source DAG");
     }
-    auto const maximum_source_wave_size =
-        chart_spr_detail::sampled_tree_source_wave_maximum_for_candidate_cap(
-            source_wave_size, source_options->max_candidates);
     sampled_wave =
         chart_spr_detail::estimate_sampled_tree_source_memory_bound(
             grammar, *source_options->sampled_tree_source_dag, &scheduler,
-            maximum_source_wave_size, projection_wave_size);
+            source_wave_size, projection_wave_size);
     if (!sampled_wave.safely_bounded) {
       throw std::overflow_error(
           "chart SPR finite sampled source-wave shape overflow");

@@ -323,6 +323,13 @@ struct grammar_spr_enumeration_options {
   std::size_t sampled_tree_source_admitted_source_count_bound = 0;
   std::size_t sampled_tree_source_admitted_destination_bound = 0;
   std::size_t sampled_tree_source_admitted_peak_bytes = 0;
+  // A finite stream normally starts with four sources, then uses the complete
+  // admitted source width after that first wave is consumed without stopping.
+  // A nonzero value fixes every finite-stream source wave to this width (still
+  // clamped by admission) so deterministic profiles can compare speculation
+  // and useful source parallelism at widths such as 2, 4, and worker-count.
+  // It does not reduce the admitted allocation or its reported memory bound.
+  std::size_t sampled_tree_source_finite_wave_size_for_diagnostics = 0;
   // Grammar-native construction uses the same persistent scheduler and
   // top-level handoff. Zero selects the bounded product maximum; finite search
   // admission may reduce the wave and publish a strict realized-capacity
@@ -427,6 +434,15 @@ struct chart_spr_candidate_generation_stats {
   // be classified from move ordinals without inventing a false boundary.
   std::size_t sampled_tree_source_speculative_sources_discarded = 0;
   std::size_t sampled_tree_source_admitted_wave_width = 0;
+  // The default finite-stream policy reports its one narrowed initial wave and
+  // whether it subsequently activated the complete admitted source width.
+  // The first two remain zero for exhaustive/reservoir streams and for a
+  // diagnostic fixed-width override. A widening records the policy transition
+  // even when the final tail has fewer sources; peak/full-width counters expose
+  // realized work for every policy.
+  std::size_t sampled_tree_source_adaptive_initial_wave_width = 0;
+  std::size_t sampled_tree_source_adaptive_widenings = 0;
+  std::size_t sampled_tree_source_full_width_waves = 0;
   std::size_t sampled_tree_projection_admitted_subwave_width = 0;
   std::size_t sampled_tree_source_actual_peak_bytes = 0;
 
@@ -1480,6 +1496,9 @@ struct sampled_tree_source_wave_execution_stats {
   std::size_t fallback_projections = 0;
   std::size_t source_speculative_moves_discarded = 0;
   std::size_t source_speculative_sources_discarded = 0;
+  std::size_t adaptive_initial_source_wave_width = 0;
+  std::size_t adaptive_source_wave_widenings = 0;
+  std::size_t full_width_source_waves = 0;
   std::uint64_t scheduler_handoff_stall_nanoseconds = 0;
   bool cancelled = false;
   sampled_tree_source_wave_memory_estimate memory;
@@ -2088,18 +2107,24 @@ inline std::size_t bounded_sampled_tree_source_wave_size(
                       1, scheduler->worker_resolution().resolved_workers));
 }
 
-// A finite candidate stream can stop only while its canonical gather is
-// consuming a completed source wave. Keep one current source plus one source
-// of lookahead: wider source waves add only speculative enumeration at that
-// stopping boundary. Zero max_candidates includes exhaustive and
-// reservoir-expanded streams and preserves their worker-width policy.
-inline std::size_t sampled_tree_source_wave_maximum_for_candidate_cap(
-    std::size_t maximum_source_wave_size,
-    std::size_t max_candidates) noexcept {
-  if (max_candidates == 0) return maximum_source_wave_size;
-  constexpr std::size_t finite_source_lookahead = 2;
-  if (maximum_source_wave_size == 0) return finite_source_lookahead;
-  return std::min(maximum_source_wave_size, finite_source_lookahead);
+// A finite candidate cap commonly lands in the first few canonical sources.
+// Four sources retain useful parallel enumeration on the named W8 fixture
+// without launching the original eight-source speculative tail. If that wave
+// exhausts, later work uses the complete admitted width so long or low-yield
+// traversals do not remain permanently half occupied.
+inline std::size_t sampled_tree_source_initial_runtime_wave_size(
+    std::size_t admitted_wave_size, bool finite_candidate_stream,
+    bool adaptive_initial_wave_pending,
+    std::size_t fixed_finite_wave_size_for_diagnostics) noexcept {
+  if (admitted_wave_size == 0) return 0;
+  if (!finite_candidate_stream) return admitted_wave_size;
+  if (fixed_finite_wave_size_for_diagnostics != 0) {
+    return std::min(admitted_wave_size,
+                    fixed_finite_wave_size_for_diagnostics);
+  }
+  if (!adaptive_initial_wave_pending) return admitted_wave_size;
+  constexpr std::size_t finite_initial_source_wave_size = 4;
+  return std::min(admitted_wave_size, finite_initial_source_wave_size);
 }
 
 inline sampled_tree_source_wave_memory_estimate
@@ -4607,7 +4632,8 @@ template <typename F>
 chart_spr_candidate_generation_stats
 for_each_sampled_tree_spr_candidate_stream(
     clade_grammar const& grammar,
-    grammar_spr_enumeration_options const& options, F&& callback);
+    grammar_spr_enumeration_options const& options, F&& callback,
+    bool finite_candidate_stream_from_parent = false);
 
 template <typename F>
 chart_spr_candidate_generation_stats for_each_hybrid_spr_candidate_stream(
@@ -6427,9 +6453,13 @@ sampled_tree_source_wave_execution_stats
 project_sampled_tree_moves_in_source_waves(
     sampled_tree_projection_context const& prepared,
     grammar_spr_enumeration_options const& options, std::size_t radius,
-    std::mt19937& rng, Gather&& gather) {
+    std::mt19937& rng, Gather&& gather,
+    bool finite_candidate_stream_override = false,
+    bool adaptive_initial_wave_pending = true) {
   sampled_tree_source_wave_execution_stats result;
   auto* scheduler = options.sampled_tree_projection_scheduler;
+  auto const finite_candidate_stream =
+      options.max_candidates != 0 || finite_candidate_stream_override;
   auto cancellation_requested = [&]() noexcept {
     return options.sampled_tree_projection_cancel_requested != nullptr &&
            options.sampled_tree_projection_cancel_requested->load(
@@ -6454,15 +6484,11 @@ project_sampled_tree_moves_in_source_waves(
         "chart SPR sampled-tree realized source shape exceeded unified "
         "admission");
   }
-  auto const maximum_source_wave_size =
-      sampled_tree_source_wave_maximum_for_candidate_cap(
-          options.sampled_tree_source_maximum_wave_size,
-          options.max_candidates);
   result.memory = admit_sampled_tree_source_wave_memory(
       prepared, scheduler, source_count,
       options.sampled_tree_projection_external_resident_bytes,
       options.sampled_tree_projection_memory_budget_bytes,
-      maximum_source_wave_size,
+      options.sampled_tree_source_maximum_wave_size,
       options.sampled_tree_projection_maximum_wave_size);
   if (options.sampled_tree_source_admitted_peak_bytes != 0 &&
       (!result.memory.safely_bounded ||
@@ -6663,9 +6689,22 @@ project_sampled_tree_moves_in_source_waves(
     }
   };
 
+  auto runtime_source_wave_size = sampled_tree_source_initial_runtime_wave_size(
+      result.memory.source_wave_size, finite_candidate_stream,
+      adaptive_initial_wave_pending,
+      options.sampled_tree_source_finite_wave_size_for_diagnostics);
+  auto adaptive_width_pending =
+      finite_candidate_stream &&
+      options.sampled_tree_source_finite_wave_size_for_diagnostics == 0 &&
+      adaptive_initial_wave_pending &&
+      runtime_source_wave_size < result.memory.source_wave_size;
+  if (adaptive_width_pending) {
+    result.adaptive_initial_source_wave_width = runtime_source_wave_size;
+  }
+
   std::size_t next_move_ordinal = 0;
   for (std::size_t source_begin = 0; source_begin < source_order.size();) {
-    auto const source_wave_count = std::min(result.memory.source_wave_size,
+    auto const source_wave_count = std::min(runtime_source_wave_size,
                                             source_order.size() - source_begin);
     if (source_wave_count > result.memory.source_wave_size) {
       throw std::logic_error(
@@ -6711,6 +6750,9 @@ project_sampled_tree_moves_in_source_waves(
       record_source_summary(summary);
     }
     ++result.source_waves;
+    if (source_wave_count == result.memory.source_wave_size) {
+      ++result.full_width_source_waves;
+    }
     result.sources_enumerated += source_wave_count;
     result.peak_source_wave_size =
         std::max(result.peak_source_wave_size, source_wave_count);
@@ -7002,6 +7044,11 @@ project_sampled_tree_moves_in_source_waves(
       }
     }
     source_begin += source_wave_count;
+    if (source_begin < source_order.size() && adaptive_width_pending) {
+      runtime_source_wave_size = result.memory.source_wave_size;
+      adaptive_width_pending = false;
+      ++result.adaptive_source_wave_widenings;
+    }
   }
   return result;
 }
@@ -7143,6 +7190,13 @@ inline void add_generation_count_stats(
   dst.sampled_tree_source_admitted_wave_width =
       std::max(dst.sampled_tree_source_admitted_wave_width,
                src.sampled_tree_source_admitted_wave_width);
+  dst.sampled_tree_source_adaptive_initial_wave_width = std::max(
+      dst.sampled_tree_source_adaptive_initial_wave_width,
+      src.sampled_tree_source_adaptive_initial_wave_width);
+  dst.sampled_tree_source_adaptive_widenings +=
+      src.sampled_tree_source_adaptive_widenings;
+  dst.sampled_tree_source_full_width_waves +=
+      src.sampled_tree_source_full_width_waves;
   dst.sampled_tree_projection_admitted_subwave_width =
       std::max(dst.sampled_tree_projection_admitted_subwave_width,
                src.sampled_tree_projection_admitted_subwave_width);
@@ -7183,7 +7237,8 @@ template <typename F>
 chart_spr_candidate_generation_stats
 chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
     clade_grammar const& grammar,
-    grammar_spr_enumeration_options const& options, F&& callback) {
+    grammar_spr_enumeration_options const& options, F&& callback,
+    bool finite_candidate_stream_from_parent) {
   using namespace chart_spr_detail;
 
   chart_spr_candidate_generation_stats stats;
@@ -7207,6 +7262,9 @@ chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
            options.max_candidates_is_post_dedup &&
            stats.candidates_generated_after_dedup >= options.max_candidates;
   };
+  auto const finite_candidate_stream =
+      options.max_candidates != 0 || finite_candidate_stream_from_parent;
+  bool adaptive_initial_wave_pending = finite_candidate_stream;
 
   std::mt19937 rng(options.seed);
   for (std::size_t sample_i = 0;
@@ -7267,7 +7325,11 @@ chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
             return decision::stop_after_current;
           }
           return decision::continue_projection;
-        });
+        },
+        finite_candidate_stream, adaptive_initial_wave_pending);
+    if (execution.source_waves != 0) {
+      adaptive_initial_wave_pending = false;
+    }
     stats.sampled_tree_projection_moves_preassigned +=
         execution.moves_enumerated;
     stats.sampled_tree_projection_move_enumeration_visits +=
@@ -7318,6 +7380,13 @@ chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
     stats.sampled_tree_source_admitted_wave_width =
         std::max(stats.sampled_tree_source_admitted_wave_width,
                  execution.memory.source_wave_size);
+    stats.sampled_tree_source_adaptive_initial_wave_width = std::max(
+        stats.sampled_tree_source_adaptive_initial_wave_width,
+        execution.adaptive_initial_source_wave_width);
+    stats.sampled_tree_source_adaptive_widenings +=
+        execution.adaptive_source_wave_widenings;
+    stats.sampled_tree_source_full_width_waves +=
+        execution.full_width_source_waves;
     stats.sampled_tree_projection_admitted_subwave_width =
         std::max(stats.sampled_tree_projection_admitted_subwave_width,
                  execution.memory.projection_wave_size);
@@ -7381,15 +7450,6 @@ chart_spr_detail::for_each_hybrid_spr_candidate_stream(
     auto child = options;
     child.source = source;
     child.reservoir_sample = false;
-    if (source == chart_spr_candidate_source::sampled_tree) {
-      // A post-dedup hybrid cap is enforced by emit_unique() and therefore
-      // clears the sampled child's max_candidates below. Preserve the finite
-      // source-lookahead policy independently of that semantic cap plumbing.
-      child.sampled_tree_source_maximum_wave_size =
-          sampled_tree_source_wave_maximum_for_candidate_cap(
-              child.sampled_tree_source_maximum_wave_size,
-              options.max_candidates);
-    }
     if (options.max_candidates != 0 &&
         !options.max_candidates_is_post_dedup) {
       if (combined.candidates_constructed >= options.max_candidates) {
@@ -7427,7 +7487,8 @@ chart_spr_detail::for_each_hybrid_spr_candidate_stream(
         grammar, sampled_options,
         [&](grammar_spr_candidate const& candidate) {
           return emit_unique(candidate) && !stopped();
-        });
+        },
+        options.max_candidates != 0);
     add_generation_count_stats(combined, sampled_stats);
     propagate_child_stop(sampled_stats);
   }

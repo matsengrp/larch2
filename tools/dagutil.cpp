@@ -3888,6 +3888,12 @@ static void print_chart_spr_generation_stats(
       << stats.sampled_tree_source_speculative_sources_discarded << "\n";
   out << indent << "sampled_tree_source_admitted_wave_width: "
       << stats.sampled_tree_source_admitted_wave_width << "\n";
+  out << indent << "sampled_tree_source_adaptive_initial_wave_width: "
+      << stats.sampled_tree_source_adaptive_initial_wave_width << "\n";
+  out << indent << "sampled_tree_source_adaptive_widenings: "
+      << stats.sampled_tree_source_adaptive_widenings << "\n";
+  out << indent << "sampled_tree_source_full_width_waves: "
+      << stats.sampled_tree_source_full_width_waves << "\n";
   out << indent << "sampled_tree_projection_admitted_subwave_width: "
       << stats.sampled_tree_projection_admitted_subwave_width << "\n";
   out << indent << "sampled_tree_source_actual_peak_bytes: "

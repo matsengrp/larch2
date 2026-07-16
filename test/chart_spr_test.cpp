@@ -104,6 +104,25 @@ static larch::test::tiny_tree_node eight_taxon_balanced_tree() {
                        {tiny_leaf("G", "C"), tiny_leaf("H", "C")})})});
 }
 
+static larch::test::tiny_tree_node eight_taxon_distinct_balanced_tree() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return tiny_inner(
+      "root", "AA",
+      {tiny_inner(
+           "ABCD", "AA",
+           {tiny_inner("AB", "AA",
+                       {tiny_leaf("A", "AA"), tiny_leaf("B", "AC")}),
+            tiny_inner("CD", "AG",
+                       {tiny_leaf("C", "AG"), tiny_leaf("D", "AT")})}),
+       tiny_inner(
+           "EFGH", "CA",
+           {tiny_inner("EF", "CA",
+                       {tiny_leaf("E", "CA"), tiny_leaf("F", "CC")}),
+            tiny_inner("GH", "CG",
+                       {tiny_leaf("G", "CG"), tiny_leaf("H", "CT")})})});
+}
+
 static larch::taxon_id taxon_for(larch::clade_grammar const& grammar,
                                  std::string const& sample_id) {
   auto it = grammar.taxa.sample_id_to_id.find(sample_id);
@@ -1040,16 +1059,27 @@ static void test_phase8_parallel_sampled_projection_is_deterministic() {
         CHECK(stats.sampled_tree_projection_enumeration_passes == 1);
         CHECK(stats.sampled_tree_source_waves > 0);
         CHECK(stats.sampled_tree_sources_enumerated > 0);
-        auto expected_source_width =
-            std::min(workers, stats.sampled_tree_sources_enumerated);
-        if (max_candidates != 0) {
-          expected_source_width =
-              std::min(expected_source_width, std::size_t{2});
+        CHECK(stats.sampled_tree_source_admitted_wave_width <= workers);
+        CHECK(stats.sampled_tree_source_admitted_wave_width >=
+              stats.sampled_tree_source_peak_wave_size);
+        CHECK(stats.sampled_tree_source_peak_wave_size >=
+              std::min(workers, std::size_t{2}));
+        if (max_candidates == 0) {
+          CHECK(stats.sampled_tree_source_peak_wave_size ==
+                stats.sampled_tree_source_admitted_wave_width);
+          CHECK(stats.sampled_tree_source_adaptive_initial_wave_width == 0);
+          CHECK(stats.sampled_tree_source_adaptive_widenings == 0);
+        } else if (stats.sampled_tree_source_admitted_wave_width > 4) {
+          CHECK(stats.sampled_tree_source_adaptive_initial_wave_width == 4);
+          CHECK(stats.sampled_tree_source_peak_wave_size >= 4);
+          if (stats.sampled_tree_source_adaptive_widenings == 0) {
+            CHECK(stats.sampled_tree_source_peak_wave_size == 4);
+          }
+          if (stats.sampled_tree_source_full_width_waves != 0) {
+            CHECK(stats.sampled_tree_source_peak_wave_size ==
+                  stats.sampled_tree_source_admitted_wave_width);
+          }
         }
-        CHECK(stats.sampled_tree_source_admitted_wave_width ==
-              expected_source_width);
-        CHECK(stats.sampled_tree_source_peak_wave_size ==
-              expected_source_width);
         CHECK(stats.sampled_tree_projection_admitted_subwave_width <=
               workers * 4);
         CHECK(stats.sampled_tree_projection_admitted_subwave_width >=
@@ -1164,13 +1194,20 @@ static void test_phase8_grammar_and_hybrid_worker_seed_matrix() {
           CHECK(stats.sampled_tree_source_one_pass_move_visits ==
                 stats.sampled_tree_projection_moves_preassigned);
           CHECK(stats.sampled_tree_source_waves > 0);
-          auto const expected_source_width =
-              std::min({workers, std::size_t{2},
-                        stats.sampled_tree_sources_enumerated});
-          CHECK(stats.sampled_tree_source_admitted_wave_width ==
-                expected_source_width);
-          CHECK(stats.sampled_tree_source_peak_wave_size ==
-                expected_source_width);
+          CHECK(stats.sampled_tree_source_admitted_wave_width <= workers);
+          CHECK(stats.sampled_tree_source_admitted_wave_width >=
+                stats.sampled_tree_source_peak_wave_size);
+          if (stats.sampled_tree_source_admitted_wave_width > 4) {
+            CHECK(stats.sampled_tree_source_adaptive_initial_wave_width == 4);
+            CHECK(stats.sampled_tree_source_peak_wave_size >= 4);
+            if (stats.sampled_tree_source_adaptive_widenings == 0) {
+              CHECK(stats.sampled_tree_source_peak_wave_size == 4);
+            }
+            if (stats.sampled_tree_source_full_width_waves != 0) {
+              CHECK(stats.sampled_tree_source_peak_wave_size ==
+                    stats.sampled_tree_source_admitted_wave_width);
+            }
+          }
         }
 
         if (workers == 1) {
@@ -2324,6 +2361,159 @@ static void test_phase8_speculative_failures_follow_canonical_order() {
     CHECK(recovery_gather_calls > 0);
     check_scheduler_quiescent(scheduler);
   }
+  std::println("  PASS");
+}
+
+static void test_phase8_adaptive_finite_source_wave_policy() {
+  std::println("test_phase8_adaptive_finite_source_wave_policy");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AA", eight_taxon_distinct_balanced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  struct run_result {
+    std::vector<larch::grammar_spr_candidate> candidates;
+    larch::chart_spr_candidate_generation_stats stats;
+  };
+  auto run = [&](std::size_t workers,
+                 larch::grammar_spr_enumeration_options options) {
+    auto scheduler = make_projection_scheduler(workers);
+    options.sampled_tree_projection_scheduler = &scheduler;
+    run_result result;
+    result.candidates = collect_candidates(grammar, options, &result.stats);
+    auto const metrics = scheduler.metrics();
+    CHECK(metrics.pending_tasks == 0);
+    CHECK(metrics.tasks_submitted == metrics.tasks_completed);
+    CHECK(metrics.tasks_submitted == metrics.tasks_joined);
+    return result;
+  };
+  auto check_same_candidates = [&](run_result const& expected,
+                                   run_result const& actual) {
+    CHECK(actual.candidates.size() == expected.candidates.size());
+    check_legacy_generation_stats_equal(actual.stats, expected.stats);
+    for (std::size_t i = 0; i < actual.candidates.size(); ++i) {
+      check_candidate_payload_equal(grammar, expected.candidates[i],
+                                    actual.candidates[i]);
+    }
+  };
+
+  larch::grammar_spr_enumeration_options low_yield;
+  low_yield.source = larch::chart_spr_candidate_source::sampled_tree;
+  low_yield.sampled_tree_source_dag = &dag;
+  low_yield.sampled_tree_count = 1;
+  low_yield.sampled_tree_spr_radius = 16;
+  low_yield.sampled_tree_score_threshold = std::numeric_limits<int>::max();
+  low_yield.min_moved_clade_size = 2;
+  low_yield.min_target_clade_size = 2;
+  low_yield.seed = 1;
+
+  auto const exhaustive = run(1, low_yield);
+  CHECK(exhaustive.stats.stop_reason ==
+        larch::chart_spr_candidate_stop_reason::exhausted);
+  CHECK(exhaustive.candidates.size() >= 4);
+  CHECK(exhaustive.stats.sampled_tree_projection_moves_preassigned >
+        exhaustive.candidates.size());
+
+  // Put the finite boundary one unique candidate before exhaustion. The
+  // filtered stream must consume its four-source probe and activate all eight
+  // admitted source slots; W1 and W8 still publish the identical prefix.
+  auto late_cap_options = low_yield;
+  late_cap_options.max_candidates = exhaustive.candidates.size() - 1;
+  late_cap_options.max_candidates_is_post_dedup = true;
+  auto const late_w1 = run(1, late_cap_options);
+  auto const late_w8 = run(8, late_cap_options);
+  CHECK(late_w8.stats.stop_reason ==
+        larch::chart_spr_candidate_stop_reason::candidate_cap);
+  check_same_candidates(late_w1, late_w8);
+  CHECK(late_w8.stats.sampled_tree_source_admitted_wave_width == 8);
+  CHECK(late_w8.stats.sampled_tree_source_adaptive_initial_wave_width == 4);
+  CHECK(late_w8.stats.sampled_tree_source_adaptive_widenings == 1);
+  CHECK(late_w8.stats.sampled_tree_source_peak_wave_size == 8);
+  CHECK(late_w8.stats.sampled_tree_source_full_width_waves > 0);
+
+  // Explicit maximum widths remain hard admission/runtime limits. They expose
+  // the deterministic operation-count cost of keeping a late finite stream at
+  // two or four sources, while preserving the same canonical result.
+  auto source_two_options = late_cap_options;
+  source_two_options.sampled_tree_source_maximum_wave_size = 2;
+  auto source_four_options = late_cap_options;
+  source_four_options.sampled_tree_source_maximum_wave_size = 4;
+  auto const source_two = run(8, source_two_options);
+  auto const source_four = run(8, source_four_options);
+  check_same_candidates(late_w1, source_two);
+  check_same_candidates(late_w1, source_four);
+  CHECK(source_two.stats.sampled_tree_source_admitted_wave_width == 2);
+  CHECK(source_two.stats.sampled_tree_source_peak_wave_size == 2);
+  CHECK(source_two.stats.sampled_tree_source_adaptive_initial_wave_width == 0);
+  CHECK(source_two.stats.sampled_tree_source_adaptive_widenings == 0);
+  CHECK(source_four.stats.sampled_tree_source_admitted_wave_width == 4);
+  CHECK(source_four.stats.sampled_tree_source_peak_wave_size == 4);
+  CHECK(source_four.stats.sampled_tree_source_adaptive_initial_wave_width == 0);
+  CHECK(source_four.stats.sampled_tree_source_adaptive_widenings == 0);
+  CHECK(source_two.stats.sampled_tree_source_waves >
+        source_four.stats.sampled_tree_source_waves);
+  CHECK(source_four.stats.sampled_tree_source_waves >
+        late_w8.stats.sampled_tree_source_waves);
+
+  // Both post-dedup and pre-dedup cap-one streams retain only the four-source
+  // initial wave and never activate the admitted speculative tail.
+  auto cap_one_post_options = low_yield;
+  cap_one_post_options.min_moved_clade_size = 1;
+  cap_one_post_options.min_target_clade_size = 1;
+  cap_one_post_options.max_candidates = 1;
+  cap_one_post_options.max_candidates_is_post_dedup = true;
+  auto const cap_one_post_w1 = run(1, cap_one_post_options);
+  auto const cap_one_post_w8 = run(8, cap_one_post_options);
+  check_same_candidates(cap_one_post_w1, cap_one_post_w8);
+  CHECK(cap_one_post_w8.candidates.size() == 1);
+  CHECK(cap_one_post_w8.stats.sampled_tree_source_peak_wave_size == 4);
+  CHECK(cap_one_post_w8.stats.sampled_tree_source_adaptive_widenings == 0);
+
+  auto cap_one_pre_options = low_yield;
+  cap_one_pre_options.min_moved_clade_size = 1;
+  cap_one_pre_options.min_target_clade_size = 1;
+  cap_one_pre_options.max_candidates = 1;
+  cap_one_pre_options.max_candidates_is_post_dedup = false;
+  auto const cap_one_pre_w1 = run(1, cap_one_pre_options);
+  auto const cap_one_pre_w8 = run(8, cap_one_pre_options);
+  check_same_candidates(cap_one_pre_w1, cap_one_pre_w8);
+  CHECK(cap_one_pre_w8.stats.candidates_constructed == 1);
+  CHECK(cap_one_pre_w8.stats.sampled_tree_source_peak_wave_size == 4);
+  CHECK(cap_one_pre_w8.stats.sampled_tree_source_adaptive_widenings == 0);
+
+  // A finite cap above the entire two-sample stream remains "exhausted". The
+  // first sampled tree performs the sole adaptive transition; the second tree
+  // starts at full width instead of paying another narrowed first wave.
+  auto multiple_options = low_yield;
+  multiple_options.sampled_tree_count = 2;
+  multiple_options.max_candidates = (std::numeric_limits<std::size_t>::max)();
+  multiple_options.max_candidates_is_post_dedup = true;
+  auto const multiple = run(8, multiple_options);
+  CHECK(multiple.stats.stop_reason ==
+        larch::chart_spr_candidate_stop_reason::exhausted);
+  CHECK(multiple.stats.sampled_tree_projection_enumeration_passes == 2);
+  CHECK(multiple.stats.sampled_tree_source_adaptive_initial_wave_width == 4);
+  CHECK(multiple.stats.sampled_tree_source_adaptive_widenings == 1);
+  CHECK(multiple.stats.sampled_tree_source_peak_wave_size == 8);
+  CHECK(multiple.stats.sampled_tree_source_full_width_waves >= 2);
+  CHECK(multiple.candidates.size() < multiple_options.max_candidates);
+
+  // Hybrid clears the sampled child's semantic post-dedup cap because the cap
+  // is global. It must nevertheless retain finite adaptive scheduling, exhaust
+  // sampled work, then run the grammar remainder before the unreachable cap.
+  auto hybrid_options = multiple_options;
+  hybrid_options.source = larch::chart_spr_candidate_source::hybrid;
+  hybrid_options.sampled_tree_count = 1;
+  auto const hybrid = run(8, hybrid_options);
+  CHECK(hybrid.stats.stop_reason ==
+        larch::chart_spr_candidate_stop_reason::exhausted);
+  CHECK(hybrid.stats.sampled_tree_source_adaptive_initial_wave_width == 4);
+  CHECK(hybrid.stats.sampled_tree_source_adaptive_widenings == 1);
+  CHECK(hybrid.stats.sampled_tree_source_peak_wave_size == 8);
+  CHECK(hybrid.stats.sampled_tree_source_speculative_moves_discarded == 0);
+  CHECK(hybrid.stats.grammar_candidate_construction_waves > 0);
+  CHECK(hybrid.stats.grammar_candidate_scheduler_operations > 0);
+  CHECK(hybrid.stats.grammar_candidate_parallel_operations > 0);
 
   std::println("  PASS");
 }
@@ -2340,11 +2530,14 @@ static void test_phase8_named_source_wave_stops_near_candidate_cap() {
   larch::require_polytomy_refinement_binary_charting(
       refinement.audit, "phase8 named sampled-generation-high fixture");
   auto grammar = std::move(refinement.grammar);
-  std::vector<larch::grammar_spr_candidate> baseline;
-  larch::chart_spr_candidate_generation_stats w1_stats;
-  larch::chart_spr_candidate_generation_stats w8_stats;
-  for (auto workers : {std::size_t{1}, std::size_t{8}}) {
+
+  struct run_result {
+    std::vector<larch::grammar_spr_candidate> candidates;
+    larch::chart_spr_candidate_generation_stats stats;
+  };
+  auto run = [&](std::size_t workers, std::size_t diagnostic_wave_size = 0) {
     auto scheduler = make_projection_scheduler(workers);
+    std::latch adaptive_first_wave_started{4};
     larch::grammar_spr_enumeration_options options;
     options.source = larch::chart_spr_candidate_source::sampled_tree;
     options.sampled_tree_source_dag = &dag;
@@ -2355,60 +2548,108 @@ static void test_phase8_named_source_wave_stops_near_candidate_cap() {
     options.max_candidates_is_post_dedup = true;
     options.seed = 1;
     options.sampled_tree_projection_scheduler = &scheduler;
-
-    larch::chart_spr_candidate_generation_stats stats;
-    auto candidates = collect_candidates(grammar, options, &stats);
-    CHECK(candidates.size() == 256);
-    CHECK(stats.stop_reason ==
-          larch::chart_spr_candidate_stop_reason::candidate_cap);
-    CHECK(stats.sampled_tree_projection_enumeration_passes == 1);
-    CHECK(stats.sampled_tree_projection_move_enumeration_visits ==
-          stats.sampled_tree_projection_moves_preassigned);
-    CHECK(stats.sampled_tree_source_one_pass_move_visits ==
-          stats.sampled_tree_projection_moves_preassigned);
-    CHECK(stats.sampled_tree_sources_enumerated < dag.node_high_mark());
-    CHECK(stats.sampled_tree_source_admitted_wave_width ==
-          (workers == 1 ? 1 : 2));
-    CHECK(stats.sampled_tree_source_peak_wave_size ==
-          stats.sampled_tree_source_admitted_wave_width);
-    CHECK(stats.sampled_tree_source_waves ==
-          (stats.sampled_tree_sources_enumerated +
-           stats.sampled_tree_source_peak_wave_size - 1) /
-              stats.sampled_tree_source_peak_wave_size);
-    CHECK(stats.sampled_tree_projection_admitted_subwave_width == workers * 4);
-    CHECK(stats.sampled_tree_projection_peak_wave_size == workers * 4);
-    CHECK(stats.sampled_tree_source_speculative_moves_discarded > 0);
-
-    if (workers == 1) {
-      baseline = candidates;
-      w1_stats = stats;
-    } else {
-      w8_stats = stats;
-      CHECK(candidates.size() == baseline.size());
-      check_legacy_generation_stats_equal(stats, w1_stats);
-      for (std::size_t i = 0; i < candidates.size(); ++i) {
-        check_candidate_payload_equal(grammar, baseline[i], candidates[i]);
-      }
-      CHECK(stats.sampled_tree_projection_parallel_operations > 0);
-      CHECK(stats.sampled_tree_source_enumeration_parallel_operations > 0);
+    options.sampled_tree_source_finite_wave_size_for_diagnostics =
+        diagnostic_wave_size;
+    if (workers == 8 && diagnostic_wave_size == 0) {
+      options.before_sampled_tree_source_enumeration_for_tests =
+          [&](std::size_t source_ordinal, std::size_t) {
+            if (source_ordinal >= 4) return;
+            adaptive_first_wave_started.count_down();
+            adaptive_first_wave_started.wait();
+          };
     }
+
+    run_result result;
+    result.candidates = collect_candidates(grammar, options, &result.stats);
+    CHECK(result.candidates.size() == 256);
+    CHECK(result.stats.stop_reason ==
+          larch::chart_spr_candidate_stop_reason::candidate_cap);
+    CHECK(result.stats.sampled_tree_projection_enumeration_passes == 1);
+    CHECK(result.stats.sampled_tree_projection_move_enumeration_visits ==
+          result.stats.sampled_tree_projection_moves_preassigned);
+    CHECK(result.stats.sampled_tree_source_one_pass_move_visits ==
+          result.stats.sampled_tree_projection_moves_preassigned);
+    CHECK(result.stats.sampled_tree_sources_enumerated < dag.node_high_mark());
+    CHECK(result.stats.sampled_tree_projection_admitted_subwave_width ==
+          workers * 4);
+    CHECK(result.stats.sampled_tree_projection_peak_wave_size == workers * 4);
+    CHECK(result.stats.sampled_tree_source_speculative_moves_discarded > 0);
     auto const metrics = scheduler.metrics();
     CHECK(metrics.pending_tasks == 0);
     CHECK(metrics.tasks_submitted == metrics.tasks_completed);
     CHECK(metrics.tasks_submitted == metrics.tasks_joined);
+    return result;
+  };
+
+  auto const w1 = run(1);
+  auto const adaptive_w8 = run(8);
+  auto const fixed_w2 = run(8, 2);
+  auto const fixed_w4 = run(8, 4);
+  auto const fixed_w8 = run(8, 8);
+  auto check_same_canonical_result = [&](run_result const& actual) {
+    CHECK(actual.candidates.size() == w1.candidates.size());
+    check_legacy_generation_stats_equal(actual.stats, w1.stats);
+    for (std::size_t i = 0; i < actual.candidates.size(); ++i) {
+      check_candidate_payload_equal(grammar, w1.candidates[i],
+                                    actual.candidates[i]);
+    }
+  };
+  check_same_canonical_result(adaptive_w8);
+  check_same_canonical_result(fixed_w2);
+  check_same_canonical_result(fixed_w4);
+  check_same_canonical_result(fixed_w8);
+
+  CHECK(w1.stats.sampled_tree_source_admitted_wave_width == 1);
+  CHECK(w1.stats.sampled_tree_source_peak_wave_size == 1);
+  for (auto const* result :
+       {&adaptive_w8, &fixed_w2, &fixed_w4, &fixed_w8}) {
+    CHECK(result->stats.sampled_tree_source_admitted_wave_width == 8);
+    CHECK(result->stats.sampled_tree_projection_parallel_operations > 0);
+    CHECK(result->stats.sampled_tree_source_enumeration_parallel_operations >
+          0);
   }
+
+  // Default W8 uses four sources immediately. It therefore has useful source
+  // parallelism on this four-source stopping prefix without admitting only
+  // half the worker width or launching the old eight-source speculative tail.
+  CHECK(adaptive_w8.stats.sampled_tree_source_peak_wave_size == 4);
+  CHECK(adaptive_w8.stats.sampled_tree_source_adaptive_initial_wave_width == 4);
+  CHECK(adaptive_w8.stats.sampled_tree_source_adaptive_widenings == 0);
+  CHECK(adaptive_w8.stats.sampled_tree_source_full_width_waves == 0);
+  CHECK(adaptive_w8.stats.sampled_tree_source_enumeration_ranges >= 4);
+  CHECK(adaptive_w8.stats
+            .sampled_tree_source_enumeration_active_worker_high_water >= 4);
+
+  CHECK(fixed_w2.stats.sampled_tree_source_peak_wave_size == 2);
+  CHECK(fixed_w4.stats.sampled_tree_source_peak_wave_size == 4);
+  CHECK(fixed_w8.stats.sampled_tree_source_peak_wave_size == 8);
+  CHECK(fixed_w2.stats.sampled_tree_source_adaptive_initial_wave_width == 0);
+  CHECK(fixed_w4.stats.sampled_tree_source_adaptive_initial_wave_width == 0);
+  CHECK(fixed_w8.stats.sampled_tree_source_adaptive_initial_wave_width == 0);
+  CHECK(fixed_w2.stats.sampled_tree_source_adaptive_widenings == 0);
+  CHECK(fixed_w4.stats.sampled_tree_source_adaptive_widenings == 0);
+  CHECK(fixed_w8.stats.sampled_tree_source_adaptive_widenings == 0);
 
   // The pre-source-wave implementation at 51702c7 globally preassigned
   // 16,454 moves and visited them twice. The original W8 source wave then
   // admitted eight sources, visiting 812 moves and discarding 416 source
-  // moves (four complete sources). Two-source lookahead retains the W1
-  // stopping boundary while leaving the W8 projection subwave at 32.
-  CHECK(w1_stats.sampled_tree_sources_enumerated == 4);
-  CHECK(w8_stats.sampled_tree_sources_enumerated == 4);
-  CHECK(w1_stats.sampled_tree_projection_moves_preassigned == 405);
-  CHECK(w8_stats.sampled_tree_projection_moves_preassigned == 405);
-  CHECK(w8_stats.sampled_tree_source_speculative_moves_discarded == 9);
-  CHECK(w8_stats.sampled_tree_source_speculative_sources_discarded == 0);
+  // moves (four complete sources). The deterministic width comparison proves
+  // that default adaptive work equals width 4 (and width 2), while restoring a
+  // four-source active W8 wave; fixed width 8 reproduces the excessive tail.
+  CHECK(w1.stats.sampled_tree_sources_enumerated == 4);
+  CHECK(adaptive_w8.stats.sampled_tree_sources_enumerated == 4);
+  CHECK(fixed_w2.stats.sampled_tree_sources_enumerated == 4);
+  CHECK(fixed_w4.stats.sampled_tree_sources_enumerated == 4);
+  CHECK(fixed_w8.stats.sampled_tree_sources_enumerated == 8);
+  CHECK(w1.stats.sampled_tree_projection_moves_preassigned == 405);
+  CHECK(adaptive_w8.stats.sampled_tree_projection_moves_preassigned == 405);
+  CHECK(fixed_w2.stats.sampled_tree_projection_moves_preassigned == 405);
+  CHECK(fixed_w4.stats.sampled_tree_projection_moves_preassigned == 405);
+  CHECK(fixed_w8.stats.sampled_tree_projection_moves_preassigned == 812);
+  CHECK(adaptive_w8.stats.sampled_tree_source_speculative_moves_discarded == 9);
+  CHECK(adaptive_w8.stats.sampled_tree_source_speculative_sources_discarded ==
+        0);
+  CHECK(fixed_w8.stats.sampled_tree_source_speculative_sources_discarded == 4);
 
   std::println("  PASS");
 }
@@ -2615,6 +2856,7 @@ int main() {
   test_phase8_midwave_stop_preserves_legacy_counters();
   test_phase8_source_wave_admission_failure_and_cancellation();
   test_phase8_speculative_failures_follow_canonical_order();
+  test_phase8_adaptive_finite_source_wave_policy();
   test_phase8_named_source_wave_stops_near_candidate_cap();
   test_phase6_randomized_and_reservoir_enumeration();
   test_phase6_stable_taxon_dedup_across_equivalent_builds();
