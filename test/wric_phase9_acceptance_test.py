@@ -730,7 +730,15 @@ class Phase9AcceptanceTest(unittest.TestCase):
                 acceptance,
                 "frozen_oracle_search_digests",
                 return_value={
-                    key: dict(value) for key, value in self.data.search.items()
+                    key: acceptance.SearchDigestSnapshot(
+                        path=self.root / "frozen" / f"{key[0]}-{key[1]}.json",
+                        mapping=dict(value),
+                        data=(json.dumps(value) + "\n").encode("utf-8"),
+                        identity=(0, index),
+                    )
+                    for index, (key, value) in enumerate(
+                        self.data.search.items(), start=1
+                    )
                 },
             ),
             mock.patch.object(
@@ -916,7 +924,7 @@ class Phase9AcceptanceTest(unittest.TestCase):
         value = json.loads(compact.read_text(encoding="utf-8"))
         value["semantic_sha256"] = digest("tampered timed compact")
         compact.write_text(json.dumps(value) + "\n", encoding="utf-8")
-        self.assert_written_failure("compact and full search-digest components differ")
+        self.assert_written_failure("compact and full search-digest bytes differ")
 
         self.data = Dataset(self.root)
         self.data.write()
@@ -927,6 +935,18 @@ class Phase9AcceptanceTest(unittest.TestCase):
         value["schema_version"] = 2
         compact.write_text(json.dumps(value) + "\n", encoding="utf-8")
         self.assert_written_failure("schema_version=2, expected 1")
+
+        self.data = Dataset(self.root)
+        self.data.write()
+        row = self.data.matching(1, 1, 1)[0]
+        report = self.root / row["report_path"]
+        compact, _, _, _ = acceptance.canonical_paths(self.data.raw, row, report)
+        value = json.loads(compact.read_text(encoding="utf-8"))
+        compact.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.assert_written_failure("compact and full search-digest bytes differ")
 
     def test_raw_report_path_is_bound_to_the_exact_timed_command_name(self) -> None:
         for row in self.data.rows:
@@ -957,7 +977,7 @@ class Phase9AcceptanceTest(unittest.TestCase):
         value["semantic_sha256"] = digest("tampered warmup")
         warmup.write_text(json.dumps(value) + "\n", encoding="utf-8")
         self.assert_written_failure(
-            "differs from the measured row/full canonical search digest"
+            "differs from the measured row/full canonical search-digest bytes"
         )
 
         self.data = Dataset(self.root)
@@ -970,6 +990,21 @@ class Phase9AcceptanceTest(unittest.TestCase):
         value["schema_version"] = 2
         warmup.write_text(json.dumps(value) + "\n", encoding="utf-8")
         self.assert_written_failure("schema_version=2, expected 1")
+
+        self.data = Dataset(self.root)
+        self.data.write()
+        row = self.data.matching(1, 1)[0]
+        warmup = acceptance.expected_phase9_warmup_compact_path(
+            self.root, row, 1
+        )
+        value = json.loads(warmup.read_text(encoding="utf-8"))
+        warmup.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.assert_written_failure(
+            "differs from the measured row/full canonical search-digest bytes"
+        )
 
     def test_warmup_compacts_reject_aliasing_and_oracle_drift(self) -> None:
         self.data.write()
@@ -991,18 +1026,103 @@ class Phase9AcceptanceTest(unittest.TestCase):
         _, rows = acceptance.read_tsv(self.data.raw)
         trials = acceptance.select_matrix(self.data.raw, rows)
         oracle = {
-            (seed, worker): dict(
-                acceptance.trials_for(trials, seed, worker)[0].search_digest
+            (seed, worker): acceptance.SearchDigestSnapshot(
+                path=acceptance.trials_for(trials, seed, worker)[0].compact_path,
+                mapping=dict(
+                    acceptance.trials_for(trials, seed, worker)[0].search_digest
+                ),
+                data=acceptance.trials_for(trials, seed, worker)[
+                    0
+                ].search_digest_bytes,
+                identity=acceptance.trials_for(trials, seed, worker)[
+                    0
+                ].compact_identity,
             )
             for seed in acceptance.SEEDS
             for worker in acceptance.MEASURED_WORKERS
         }
-        oracle[(1, 1)]["chain_sha256"] = digest("oracle drift")
+        oracle[(1, 1)].mapping["chain_sha256"] = digest("oracle drift")
         with self.assertRaisesRegex(
             acceptance.AcceptanceError, "sealed frozen oracle"
         ):
             acceptance.validate_phase9_warmup_compacts(
                 self.root, trials, oracle
+            )
+
+        oracle[(1, 1)].mapping["chain_sha256"] = trials[0].search_digest[
+            "chain_sha256"
+        ]
+        oracle[(1, 1)] = acceptance.SearchDigestSnapshot(
+            path=oracle[(1, 1)].path,
+            mapping=oracle[(1, 1)].mapping,
+            data=(
+                json.dumps(oracle[(1, 1)].mapping, indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8"),
+            identity=oracle[(1, 1)].identity,
+        )
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "sealed frozen oracle bytes"
+        ):
+            acceptance.validate_phase9_warmup_compacts(
+                self.root, trials, oracle
+            )
+
+    def test_digest_reader_rejects_path_replacement_during_read(self) -> None:
+        self.data.write()
+        row = self.data.matching(1, 1, 1)[0]
+        report = self.root / row["report_path"]
+        compact, _, _, _ = acceptance.canonical_paths(
+            self.data.raw, row, report
+        )
+        replacement = compact.with_name("replacement.canonical.json")
+        replacement.write_bytes(compact.read_bytes())
+        real_read = os.read
+        replaced = False
+
+        def replacing_read(descriptor: int, count: int) -> bytes:
+            nonlocal replaced
+            data = real_read(descriptor, count)
+            if data and not replaced:
+                os.replace(replacement, compact)
+                replaced = True
+            return data
+
+        with (
+            mock.patch.object(os, "read", side_effect=replacing_read),
+            self.assertRaisesRegex(
+                acceptance.AcceptanceError, "changed while it was read"
+            ),
+        ):
+            acceptance.read_stable_search_digest(
+                compact,
+                compact.parent,
+                "replacement-raced digest",
+                require_single_link=True,
+            )
+
+        oversized = compact.with_name("oversized.canonical.json")
+        oversized.write_bytes(b" " * (acceptance.MAX_SEARCH_DIGEST_BYTES + 1))
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "exceeds 65536 bytes"
+        ):
+            acceptance.read_stable_search_digest(
+                oversized,
+                oversized.parent,
+                "oversized digest",
+                require_single_link=True,
+            )
+
+        alias = compact.with_name("alias.canonical.json")
+        alias.symlink_to(compact.name)
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "lexical regular file, not an alias"
+        ):
+            acceptance.read_stable_search_digest(
+                alias,
+                alias.parent,
+                "symlinked digest",
+                require_single_link=True,
             )
 
     def test_timed_compact_results_reject_hard_links_and_path_reuse(self) -> None:

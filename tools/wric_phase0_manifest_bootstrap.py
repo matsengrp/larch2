@@ -3755,6 +3755,18 @@ def validate_chart_semantic_artifacts(
         f"compact semantic companion for {key}",
     )
     sidecar, full_report = exact_canonical_asset_pair(capture_root, capture, key)
+    compact_mapping, compact_data, _ = read_timed_chart_compact(
+        compact,
+        stage_dir,
+        f"compact semantic report for {key}",
+    )
+    full_mapping, full_data, _ = read_timed_chart_compact(
+        full_report,
+        capture_root / "characterization",
+        f"full canonical report for {key}",
+    )
+    if compact_mapping != full_mapping or compact_data != full_data:
+        fail(f"compact/full canonical digest bytes differ for {key}")
     validate_canonical_sidecar_source(
         capture_root,
         (
@@ -3762,13 +3774,7 @@ def validate_chart_semantic_artifacts(
             full_report.relative_to(capture_root).as_posix(),
         ),
         f"{key[0]}@{key[1]}",
-    )
-    compact_data = compact.read_bytes()
-    full_data = full_report.read_bytes()
-    if compact_data != full_data:
-        fail(f"compact/full canonical digest maps differ for {key}")
-    compact_mapping = parse_chart_search_digest_bytes(
-        compact_data, compact, f"compact semantic report for {key}"
+        stable_digest_mapping=full_mapping,
     )
     require_chart_compact_match(
         timed_mapping,
@@ -5566,6 +5572,8 @@ def validate_canonical_sidecar_source(
     capture_root: Path,
     artifact_paths: Sequence[str],
     row_id: str,
+    *,
+    stable_digest_mapping: Mapping[str, object] | None = None,
 ) -> None:
     if len(artifact_paths) != 2:
         fail(f"canonical companion does not name sidecar plus digest: {row_id}")
@@ -5583,7 +5591,11 @@ def validate_canonical_sidecar_source(
         ):
             fail(f"canonical companion is not canonical newline-delimited JSON: {row_id}")
         records = [json.loads(line.decode("utf-8")) for line in raw_lines]
-        digest = json.loads(report_path.read_text(encoding="utf-8"))
+        digest = (
+            json.loads(report_path.read_text(encoding="utf-8"))
+            if stable_digest_mapping is None
+            else dict(stable_digest_mapping)
+        )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"canonical companion is not parseable for {row_id}: {error}")
     if not records or any(not isinstance(record, dict) for record in records):

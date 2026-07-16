@@ -223,6 +223,7 @@ SEARCH_JSON_KEYS = frozenset(
         *SEARCH_COUNT_KEYS,
     )
 )
+MAX_SEARCH_DIGEST_BYTES = 64 * 1024
 DAG_DIGEST_KEYS = ("semantic_sha256", "clades_sha256", "productions_sha256")
 DAG_COUNT_KEYS = ("clade_count", "production_count", "parsimony_min")
 DAG_JSON_KEYS = frozenset(
@@ -249,11 +250,21 @@ class ValidatedIterationContract:
 
 
 @dataclass(frozen=True)
+class SearchDigestSnapshot:
+    path: Path
+    mapping: dict[str, object]
+    data: bytes
+    identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
 class Trial:
     row: dict[str, str]
     report: ParsedReport
     compact_path: Path
     search_digest: dict[str, object]
+    search_digest_bytes: bytes
+    compact_identity: tuple[int, int]
     output_digest: dict[str, object]
     full_sidecar_sha256: str
     accepted_sequence: tuple[dict[str, object], ...]
@@ -515,9 +526,21 @@ def require_exact_json_keys(value: dict[str, object], expected: frozenset[str], 
         raise AcceptanceError(f"{label}: JSON schema mismatch ({'; '.join(details)})")
 
 
-def validate_search_digest(path: Path) -> dict[str, object]:
-    label = f"search digest {path}"
-    value = read_json_object(path, "search digest")
+def parse_search_digest_bytes(
+    data: bytes, path: Path, label: str
+) -> dict[str, object]:
+    try:
+        value = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_nonfinite_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, AcceptanceError) as error:
+        raise AcceptanceError(
+            f"search digest {path}: malformed JSON: {error}"
+        ) from error
+    if not isinstance(value, dict):
+        raise AcceptanceError(f"search digest {path}: expected a JSON object")
     require_exact_json_keys(value, SEARCH_JSON_KEYS, label)
     literals = {
         "schema": "larch.chart_spr.semantic_digest",
@@ -541,6 +564,172 @@ def validate_search_digest(path: Path) -> dict[str, object]:
     if record_count <= 0:
         raise AcceptanceError(f"{label}: record_count must be positive")
     return value
+
+
+def search_digest_file_signature(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def search_digest_directory_identity(info: os.stat_result) -> tuple[int, int, int]:
+    return info.st_dev, info.st_ino, info.st_mode
+
+
+def read_stable_search_digest(
+    path: Path,
+    expected_parent: Path,
+    label: str,
+    *,
+    require_single_link: bool,
+) -> SearchDigestSnapshot:
+    """Read one bounded digest through a no-follow parent/file descriptor pair."""
+
+    lexical = path.absolute()
+    parent = expected_parent.absolute()
+    if lexical.parent != parent:
+        raise AcceptanceError(
+            f"{label} is not its exact lexical parent-local file: {path}"
+        )
+    try:
+        parent_info = parent.lstat()
+        parent_resolved = parent.resolve(strict=True)
+    except OSError as error:
+        raise AcceptanceError(
+            f"{label} parent directory is unavailable: {parent}: {error}"
+        ) from error
+    if not stat.S_ISDIR(parent_info.st_mode) or parent_resolved != parent:
+        raise AcceptanceError(
+            f"{label} parent is not a canonical directory: {parent}"
+        )
+
+    directory_descriptor = -1
+    descriptor = -1
+    try:
+        directory_descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened_parent = os.fstat(directory_descriptor)
+        if search_digest_directory_identity(
+            opened_parent
+        ) != search_digest_directory_identity(parent_info):
+            raise AcceptanceError(
+                f"{label} parent changed while it was opened: {parent}"
+            )
+        try:
+            before = os.stat(
+                lexical.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise AcceptanceError(f"{label} is missing: {lexical}") from error
+        if not stat.S_ISREG(before.st_mode):
+            raise AcceptanceError(
+                f"{label} must be a lexical regular file, not an alias: {lexical}"
+            )
+        if require_single_link and before.st_nlink != 1:
+            raise AcceptanceError(f"{label} is not singly linked")
+        if before.st_size > MAX_SEARCH_DIGEST_BYTES:
+            raise AcceptanceError(
+                f"{label} exceeds {MAX_SEARCH_DIGEST_BYTES} bytes: {lexical}"
+            )
+
+        descriptor = os.open(
+            lexical.name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        if search_digest_file_signature(opened) != search_digest_file_signature(
+            before
+        ):
+            raise AcceptanceError(
+                f"{label} changed while its descriptor was opened: {lexical}"
+            )
+        chunks: list[bytes] = []
+        byte_count = 0
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            byte_count += len(chunk)
+            if byte_count > MAX_SEARCH_DIGEST_BYTES:
+                raise AcceptanceError(
+                    f"{label} exceeds {MAX_SEARCH_DIGEST_BYTES} bytes: {lexical}"
+                )
+            chunks.append(chunk)
+
+        opened_after = os.fstat(descriptor)
+        after = os.stat(
+            lexical.name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        opened_parent_after = os.fstat(directory_descriptor)
+        lexical_parent_after = parent.lstat()
+        lexical_parent_resolved_after = parent.resolve(strict=True)
+        if (
+            search_digest_directory_identity(opened_parent_after)
+            != search_digest_directory_identity(opened_parent)
+            or search_digest_directory_identity(lexical_parent_after)
+            != search_digest_directory_identity(opened_parent)
+            or lexical_parent_resolved_after != parent
+        ):
+            raise AcceptanceError(
+                f"{label} parent changed while it was read: {parent}"
+            )
+        if (
+            search_digest_file_signature(opened_after)
+            != search_digest_file_signature(opened)
+            or search_digest_file_signature(after)
+            != search_digest_file_signature(opened)
+        ):
+            raise AcceptanceError(f"{label} changed while it was read: {lexical}")
+        data = b"".join(chunks)
+        if len(data) != opened.st_size:
+            raise AcceptanceError(
+                f"{label} byte count changed while it was read: {lexical}"
+            )
+    except AcceptanceError:
+        raise
+    except OSError as error:
+        raise AcceptanceError(
+            f"cannot descriptor-read {label}: {lexical}: {error}"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
+
+    mapping = parse_search_digest_bytes(data, lexical, f"search digest {lexical}")
+    return SearchDigestSnapshot(
+        path=lexical,
+        mapping=mapping,
+        data=data,
+        identity=(opened.st_dev, opened.st_ino),
+    )
+
+
+def validate_search_digest(path: Path) -> dict[str, object]:
+    lexical = path.absolute()
+    return read_stable_search_digest(
+        lexical,
+        lexical.parent,
+        f"search digest {lexical}",
+        require_single_link=False,
+    ).mapping
 
 
 def validate_dag_digest(path: Path) -> dict[str, object]:
@@ -1568,18 +1757,29 @@ def validate_trial(raw_path: Path, row: dict[str, str], seed: int, worker: int) 
             f"{label}: canonical DAG result is not the exact deterministic Phase-9 score path"
         )
     run_root = raw_path.parent.absolute()
-    compact_path = require_run_artifact(compact_path, run_root, f"{label} compact canonical result")
-    if compact_path.stat().st_nlink != 1:
-        raise AcceptanceError(
-            f"{label}: compact canonical result is not singly linked"
-        )
-    full_path = require_run_artifact(full_path, run_root, f"{label} full canonical result")
+    run_logs = run_root / "logs"
+    compact_snapshot = read_stable_search_digest(
+        compact_path,
+        run_logs,
+        f"{label}: compact canonical result",
+        require_single_link=True,
+    )
+    compact_path = compact_snapshot.path
+    full_snapshot = read_stable_search_digest(
+        full_path,
+        run_logs,
+        f"{label}: full canonical result",
+        require_single_link=True,
+    )
+    full_path = full_snapshot.path
     sidecar_path = require_run_artifact(sidecar_path, run_root, f"{label} full canonical sidecar")
     dag_path = require_run_artifact(dag_path, run_root, f"{label} canonical DAG result")
-    compact = validate_search_digest(compact_path)
-    full = validate_search_digest(full_path)
-    if compact != full:
-        raise AcceptanceError(f"{label}: compact and full search-digest components differ")
+    compact = compact_snapshot.mapping
+    full = full_snapshot.mapping
+    if compact != full or compact_snapshot.data != full_snapshot.data:
+        raise AcceptanceError(
+            f"{label}: compact and full search-digest bytes differ"
+        )
     canonical = read_full_canonical_sidecar(sidecar_path, seed, label)
     sidecar_sha = sha256_file(sidecar_path, "full canonical sidecar")
     if sidecar_sha != compact["semantic_sha256"]:
@@ -1620,6 +1820,8 @@ def validate_trial(raw_path: Path, row: dict[str, str], seed: int, worker: int) 
         report=report,
         compact_path=compact_path,
         search_digest=compact,
+        search_digest_bytes=compact_snapshot.data,
+        compact_identity=compact_snapshot.identity,
         output_digest=output,
         full_sidecar_sha256=sidecar_sha,
         accepted_sequence=canonical_sequence,
@@ -1638,7 +1840,7 @@ def trials_for(trials: Iterable[Trial], seed: int, worker: int) -> list[Trial]:
 def validate_phase9_warmup_compacts(
     root: Path,
     trials: Sequence[Trial],
-    oracle_digests: Mapping[tuple[int, int], Mapping[str, object]] | None = None,
+    oracle_digests: Mapping[tuple[int, int], SearchDigestSnapshot] | None = None,
 ) -> tuple[Path, ...]:
     """Bind all six commanded warmups to their row, full stream, and oracle."""
 
@@ -1650,7 +1852,7 @@ def validate_phase9_warmup_compacts(
             "sealed frozen oracle does not provide the exact Phase-9 warmup matrix"
         )
 
-    warmup_paths: list[Path] = []
+    warmup_snapshots: list[SearchDigestSnapshot] = []
     measured_paths = [trial.compact_path for trial in trials]
     for seed, worker in sorted(expected_keys):
         row_trials = trials_for(trials, seed, worker)
@@ -1663,13 +1865,19 @@ def validate_phase9_warmup_compacts(
         path = expected_phase9_warmup_compact_path(
             root, representative.row, worker
         )
-        path = require_run_artifact(path, root.absolute(), label)
-        if path.stat().st_nlink != 1:
-            raise AcceptanceError(f"{label} is not singly linked")
-        digest = validate_search_digest(path)
-        if digest != representative.search_digest:
+        snapshot = read_stable_search_digest(
+            path,
+            root.absolute() / "logs",
+            label,
+            require_single_link=True,
+        )
+        digest = snapshot.mapping
+        if (
+            digest != representative.search_digest
+            or snapshot.data != representative.search_digest_bytes
+        ):
             raise AcceptanceError(
-                f"{label} differs from the measured row/full canonical search digest"
+                f"{label} differs from the measured row/full canonical search-digest bytes"
             )
         if (
             digest["semantic_sha256"]
@@ -1678,17 +1886,23 @@ def validate_phase9_warmup_compacts(
             raise AcceptanceError(f"{label} differs from the raw-row semantic digest")
         if digest["semantic_sha256"] != representative.full_sidecar_sha256:
             raise AcceptanceError(f"{label} differs from the full canonical sidecar")
-        if oracle_digests is not None and digest != oracle_digests[(seed, worker)]:
-            raise AcceptanceError(f"{label} differs from the sealed frozen oracle")
-        warmup_paths.append(path)
+        if oracle_digests is not None:
+            oracle = oracle_digests[(seed, worker)]
+            if digest != oracle.mapping or snapshot.data != oracle.data:
+                raise AcceptanceError(
+                    f"{label} differs from the sealed frozen oracle bytes"
+                )
+        warmup_snapshots.append(snapshot)
 
+    warmup_paths = [snapshot.path for snapshot in warmup_snapshots]
     combined_paths = [*measured_paths, *warmup_paths]
     if len(set(combined_paths)) != len(combined_paths):
         raise AcceptanceError(
             "a compact canonical result path is reused across Phase-9 warmups/measured trials"
         )
     identities = {
-        (path.stat().st_dev, path.stat().st_ino) for path in combined_paths
+        *(trial.compact_identity for trial in trials),
+        *(snapshot.identity for snapshot in warmup_snapshots),
     }
     if len(identities) != len(combined_paths):
         raise AcceptanceError(
@@ -1699,11 +1913,14 @@ def validate_phase9_warmup_compacts(
 
 def frozen_oracle_search_digests(
     audited: object,
-) -> dict[tuple[int, int], dict[str, object]]:
+) -> dict[tuple[int, int], SearchDigestSnapshot]:
     evidence = getattr(audited, "evidence")
     return {
-        (seed, worker): validate_search_digest(
-            evidence[(seed, worker)].canonical_result
+        (seed, worker): read_stable_search_digest(
+            evidence[(seed, worker)].canonical_result,
+            evidence[(seed, worker)].canonical_result.parent,
+            f"sealed frozen seed {seed} W{worker} compact canonical result",
+            require_single_link=True,
         )
         for seed in SEEDS
         for worker in MEASURED_WORKERS
@@ -1743,9 +1960,7 @@ def select_matrix(raw_path: Path, rows: Sequence[dict[str, str]]) -> list[Trial]
         raise AcceptanceError(
             "a compact canonical result path is reused across Phase-9 measured trials"
         )
-    compact_identities = {
-        (path.stat().st_dev, path.stat().st_ino) for path in compact_paths
-    }
+    compact_identities = {trial.compact_identity for trial in trials}
     if len(compact_identities) != len(compact_paths):
         raise AcceptanceError(
             "compact canonical results are aliased across Phase-9 measured trials"
