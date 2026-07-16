@@ -210,7 +210,7 @@ HISTORICAL_RUN_REVISIONS: Mapping[str, str] = {
     "phase7-small": "38e9a281396e5263647ba68724414848841525d7",
     "phase7-auto": "38e9a281396e5263647ba68724414848841525d7",
     "phase8-end-to-end": "38e9a281396e5263647ba68724414848841525d7",
-    "phase8-generation": "6c8d0c7651c2aa2e5c396d0f57c2e4e18c322310",
+    "phase8-generation": "a21ab7aef81d3309c8f6c07cb7d5b3ddf4d19638",
 }
 
 SAFE_HARNESS_ENVIRONMENT = {
@@ -282,6 +282,15 @@ DIRECTORY_FLAGS = (
     | getattr(os, "O_CLOEXEC", 0)
 )
 
+GIT_CONFIG_OVERRIDES = (
+    "core.fsmonitor=false",
+    "core.untrackedCache=false",
+    "core.filemode=true",
+    "core.trustctime=true",
+    "core.checkStat=default",
+    "core.ignoreStat=false",
+)
+
 TOP_LEVEL_KEYS = frozenset(
     {
         "affinity",
@@ -317,12 +326,14 @@ TOOL_KEYS = frozenset(
         "capture_wrapper",
         "cmake_cache",
         "compiler",
+        "dagutil_compile_recipes",
+        "dagutil_compile_flags",
+        "dagutil_link_command",
         "frozen_larch2",
         "frozen_oracle_dagutil",
         "frozen_process_metrics",
         "generic_ledger",
-        "dagutil_compile_flags",
-        "dagutil_link_command",
+        "larch_compile_recipes",
         "larch_compile_flags",
         "larch_link_command",
         "product_dagutil",
@@ -331,8 +342,10 @@ TOOL_KEYS = frozenset(
 NONEXECUTABLE_TOOL_ROLES = frozenset(
     {
         "cmake_cache",
+        "dagutil_compile_recipes",
         "dagutil_compile_flags",
         "dagutil_link_command",
+        "larch_compile_recipes",
         "larch_compile_flags",
         "larch_link_command",
     }
@@ -361,6 +374,9 @@ REPOSITORY_STATE_KEYS = frozenset(
         "porcelain_v2_z_sha256",
         "tracked_files_v_z_bytes",
         "tracked_files_v_z_sha256",
+        "tracked_worktree_bytes",
+        "tracked_worktree_files",
+        "tracked_worktree_observation_sha256",
         "toplevel",
     }
 )
@@ -661,12 +677,11 @@ def git_run(root: Path, arguments: Sequence[str], label: str) -> bytes:
         completed = subprocess.run(
             [
                 "/usr/bin/git",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.untrackedCache=false",
-                "-c",
-                "core.filemode=true",
+                *(
+                    token
+                    for setting in GIT_CONFIG_OVERRIDES
+                    for token in ("-c", setting)
+                ),
                 "-C",
                 os.fspath(root),
                 *arguments,
@@ -709,12 +724,11 @@ def git_is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
     completed = subprocess.run(
         [
             "/usr/bin/git",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.untrackedCache=false",
-            "-c",
-            "core.filemode=true",
+            *(
+                token
+                for setting in GIT_CONFIG_OVERRIDES
+                for token in ("-c", setting)
+            ),
             "-C",
             os.fspath(root),
             "merge-base",
@@ -795,6 +809,164 @@ def validate_git_toplevel(value: str | Path, label: str) -> Path:
     return root
 
 
+def parse_head_tree_records(
+    payload: bytes, object_format: str, label: str
+) -> list[tuple[bytes, str, str]]:
+    object_id_bytes = 40 if object_format == "sha1" else 64
+    result: list[tuple[bytes, str, str]] = []
+    paths: set[bytes] = set()
+    for raw_record in payload.split(b"\0"):
+        if not raw_record:
+            continue
+        try:
+            prefix, relative = raw_record.split(b"\t", 1)
+            mode_bytes, kind, object_id = prefix.split(b" ")
+            mode = mode_bytes.decode("ascii")
+            object_id_text = object_id.decode("ascii")
+        except (UnicodeDecodeError, ValueError):
+            fail(f"{label} HEAD tree contains a malformed record")
+        if (
+            mode not in ("100644", "100755")
+            or kind != b"blob"
+            or len(object_id_text) != object_id_bytes
+            or re.fullmatch(r"[0-9a-f]+", object_id_text) is None
+            or not relative
+            or relative in paths
+        ):
+            fail(f"{label} HEAD tree contains an unsupported or duplicate entry")
+        paths.add(relative)
+        result.append((relative, mode, object_id_text))
+    return result
+
+
+def parse_index_stage_records(
+    payload: bytes, object_format: str, label: str
+) -> list[tuple[bytes, str, str]]:
+    object_id_bytes = 40 if object_format == "sha1" else 64
+    result: list[tuple[bytes, str, str]] = []
+    paths: set[bytes] = set()
+    for raw_record in payload.split(b"\0"):
+        if not raw_record:
+            continue
+        try:
+            prefix, relative = raw_record.split(b"\t", 1)
+            mode_bytes, object_id, stage = prefix.split(b" ")
+            mode = mode_bytes.decode("ascii")
+            object_id_text = object_id.decode("ascii")
+        except (UnicodeDecodeError, ValueError):
+            fail(f"{label} index contains a malformed stage record")
+        if (
+            mode not in ("100644", "100755")
+            or stage != b"0"
+            or len(object_id_text) != object_id_bytes
+            or re.fullmatch(r"[0-9a-f]+", object_id_text) is None
+            or not relative
+            or relative in paths
+        ):
+            fail(f"{label} index contains an unsupported or duplicate stage entry")
+        paths.add(relative)
+        result.append((relative, mode, object_id_text))
+    return result
+
+
+def canonical_tracked_path(root: Path, relative_bytes: bytes, label: str) -> Path:
+    relative = os.fsdecode(relative_bytes)
+    pure = PurePosixPath(relative)
+    if (
+        not relative
+        or pure.is_absolute()
+        or pure.as_posix() != relative
+        or any(component in ("", ".", "..") for component in pure.parts)
+    ):
+        fail(f"{label} contains an unsafe tracked path")
+    path = canonical_existing_path(
+        root / Path(*pure.parts), f"{label} tracked file {relative!r}"
+    )
+    try:
+        path.relative_to(root)
+    except ValueError:
+        fail(f"{label} tracked file escapes its repository: {relative!r}")
+    return path
+
+
+def raw_tracked_worktree_observation(
+    root: Path, object_format: str, label: str
+) -> dict[str, object]:
+    if object_format not in ("sha1", "sha256"):
+        fail(f"{label} uses an unsupported Git object format: {object_format!r}")
+    tree_payload = git_run(
+        root,
+        ("ls-tree", "-r", "-z", "--full-tree", "HEAD"),
+        f"{label} recursive HEAD tree",
+    )
+    index_payload = git_run(
+        root,
+        ("ls-files", "--stage", "-z"),
+        f"{label} stage-0 index",
+    )
+    tree = parse_head_tree_records(tree_payload, object_format, label)
+    index = parse_index_stage_records(index_payload, object_format, label)
+    if tree != index:
+        fail(f"{label} index paths, modes, or object IDs differ from HEAD")
+
+    observations: list[dict[str, object]] = []
+    total_bytes = 0
+    for relative_bytes, git_mode, expected_object_id in tree:
+        path = canonical_tracked_path(root, relative_bytes, label)
+        snapshot, payload = read_snapshotted_file(
+            path,
+            f"{label} tracked file {os.fsdecode(relative_bytes)!r}",
+            executable=git_mode == "100755",
+        )
+        expected_mode = 0o755 if git_mode == "100755" else 0o644
+        if snapshot["mode"] != expected_mode:
+            fail(
+                f"{label} tracked file mode differs from the exact HEAD checkout "
+                f"contract: {os.fsdecode(relative_bytes)!r}"
+            )
+        constructor = hashlib.new(object_format)
+        constructor.update(f"blob {len(payload)}\0".encode("ascii"))
+        constructor.update(payload)
+        observed_object_id = constructor.hexdigest()
+        if observed_object_id != expected_object_id:
+            fail(
+                f"{label} tracked file raw working bytes differ from HEAD: "
+                f"{os.fsdecode(relative_bytes)!r}"
+            )
+        observations.append(
+            {
+                "git_mode": git_mode,
+                "object_id": expected_object_id,
+                "path_base64": base64.b64encode(relative_bytes).decode("ascii"),
+                "snapshot": snapshot,
+            }
+        )
+        total_bytes += len(payload)
+
+    if (
+        git_run(
+            root,
+            ("ls-tree", "-r", "-z", "--full-tree", "HEAD"),
+            f"{label} final recursive HEAD tree",
+        )
+        != tree_payload
+        or git_run(
+            root,
+            ("ls-files", "--stage", "-z"),
+            f"{label} final stage-0 index",
+        )
+        != index_payload
+    ):
+        fail(f"{label} HEAD tree or index changed during raw verification")
+    return {
+        "tracked_worktree_bytes": total_bytes,
+        "tracked_worktree_files": len(observations),
+        "tracked_worktree_observation_sha256": sha256_bytes(
+            canonical_json_bytes(observations)
+        ),
+    }
+
+
 def repository_state(
     root: Path,
     expected_revision: str,
@@ -835,6 +1007,19 @@ def repository_state(
                 f"{label} has a forbidden tracked-file index flag "
                 f"(assume-unchanged/skip-worktree or non-stage-0 state): {detail}"
             )
+    tracked_worktree = raw_tracked_worktree_observation(
+        root, object_format, label
+    )
+    final_head = git_text(
+        root, ("rev-parse", "--verify", "HEAD^{commit}"), f"final {label} HEAD"
+    ).strip()
+    final_porcelain = git_run(
+        root,
+        ("status", "--porcelain=v2", "-z", "--untracked-files=all"),
+        f"final {label} porcelain-v2 clean-status",
+    )
+    if final_head != head or final_porcelain != porcelain:
+        fail(f"{label} HEAD or clean status changed during raw verification")
     return {
         "head": head,
         "object_format": object_format,
@@ -844,7 +1029,7 @@ def repository_state(
         "tracked_files_v_z_bytes": len(tracked_files),
         "tracked_files_v_z_sha256": sha256_bytes(tracked_files),
         "toplevel": os.fspath(root),
-    }
+    } | tracked_worktree
 
 
 def require_tracked_file(root: Path, path: Path, label: str) -> None:
@@ -939,14 +1124,19 @@ def validate_tracked_git_blob_record(
     return value
 
 
-def load_python_module(path: Path, role: str) -> ModuleType:
-    _, payload = read_snapshotted_file(
+def load_python_module(
+    path: Path, role: str, expected_snapshot: Mapping[str, object]
+) -> ModuleType:
+    expected = require_snapshot_shape(expected_snapshot, role)
+    observed, payload = read_snapshotted_file(
         path,
         role,
         executable=True,
         expected_nlink=1,
         maximum_bytes=MAX_JSON_BYTES,
     )
+    if observed != dict(expected):
+        fail(f"{role} differs from its already-proved HEAD snapshot before execution")
     name = f"_wric_{path.stem}_{os.getpid()}_{id(path)}"
     module = ModuleType(name)
     module.__file__ = os.fspath(path)
@@ -1458,6 +1648,147 @@ def parse_cmake_cache(path: Path, product_root: Path) -> dict[str, str]:
     )
 
 
+def target_compile_sources(
+    product_root: Path, target: str
+) -> list[tuple[str, Path]]:
+    if target == "dagutil":
+        return [
+            (
+                "CMakeFiles/dagutil.dir/tools/dagutil.cpp.o",
+                product_root / "tools/dagutil.cpp",
+            )
+        ]
+    if target != "larch":
+        fail(f"unsupported effective compile-recipe target: {target}")
+    relatives = [
+        "src/protobuf.cpp",
+        "src/protobuf_encode.cpp",
+        "src/pickle_reader.cpp",
+    ]
+    if (product_root / "src/chart_scheduler.cpp").is_file():
+        relatives.append("src/chart_scheduler.cpp")
+    relatives.extend(
+        ["src/chart_spr_search.cpp", "src/chart_bnb_trim_apply.cpp"]
+    )
+    return [
+        (f"CMakeFiles/larch.dir/{relative}.o", product_root / relative)
+        for relative in relatives
+    ]
+
+
+def validate_target_compile_recipes(
+    path: Path, product_root: Path, target: str
+) -> str:
+    role = f"{target} compile recipes"
+    _, payload = read_snapshotted_file(
+        path, role, maximum_bytes=1024 * 1024
+    )
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        fail(f"{role} are not UTF-8")
+    if not payload.endswith(b"\n") or b"\r" in payload or b"\x00" in payload:
+        fail(f"{role} are not canonical generated Make text")
+    sources = target_compile_sources(product_root, target)
+    target_prefix = re.escape(f"CMakeFiles/{target}.dir/")
+    declared_objects = re.findall(
+        rf"^({target_prefix}[^\n:]+\.cpp\.o): "
+        rf"CMakeFiles/{re.escape(target)}\.dir/flags\.make$",
+        text,
+        flags=re.MULTILINE,
+    )
+    expected_objects = [object_path for object_path, _ in sources]
+    if declared_objects != expected_objects:
+        fail(
+            f"{role} declare a non-exact source/object sequence: "
+            f"{declared_objects!r}"
+        )
+    expected_recipe_lines: list[str] = []
+    for progress, (object_path, source_path) in enumerate(sources, 1):
+        dependency = (
+            f"{object_path}: CMakeFiles/{target}.dir/flags.make\n"
+            f"{object_path}: {source_path}\n"
+            f"{object_path}: CMakeFiles/{target}.dir/compiler_depend.ts\n"
+        )
+        echo = (
+            "\t@$(CMAKE_COMMAND) -E cmake_echo_color \"--switch=$(COLOR)\" "
+            f"--green --progress-dir={product_root}/build/CMakeFiles "
+            f"--progress-num=$(CMAKE_PROGRESS_{progress}) "
+            f'"Building CXX object {object_path}"\n'
+        )
+        compile_command = (
+            f"\t{EXPECTED_COMPILER} $(CXX_DEFINES) $(CXX_INCLUDES) "
+            f"$(CXX_FLAGS) -MD -MT {object_path} -MF {object_path}.d "
+            f"-o {object_path} -c {source_path}\n\n"
+        )
+        fragment = dependency + echo + compile_command
+        if text.count(fragment) != 1:
+            fail(
+                f"{role} do not contain one exact launcher-free recipe for "
+                f"{object_path}"
+            )
+        intermediate = object_path.removesuffix(".o")
+        expected_recipe_lines.extend(
+            [
+                echo.rstrip("\n"),
+                compile_command.splitlines()[0],
+                (
+                    "\t@$(CMAKE_COMMAND) -E cmake_echo_color "
+                    '"--switch=$(COLOR)" --green '
+                    f'"Preprocessing CXX source to {intermediate}.i"'
+                ),
+                (
+                    f"\t{EXPECTED_COMPILER} $(CXX_DEFINES) $(CXX_INCLUDES) "
+                    f"$(CXX_FLAGS) -E {source_path} > {intermediate}.i"
+                ),
+                (
+                    "\t@$(CMAKE_COMMAND) -E cmake_echo_color "
+                    '"--switch=$(COLOR)" --green '
+                    f'"Compiling CXX source to assembly {intermediate}.s"'
+                ),
+                (
+                    f"\t{EXPECTED_COMPILER} $(CXX_DEFINES) $(CXX_INCLUDES) "
+                    f"$(CXX_FLAGS) -S {source_path} -o {intermediate}.s"
+                ),
+            ]
+        )
+    link_progress = len(sources) + 1
+    link_description = (
+        "Linking CXX executable bin/dagutil"
+        if target == "dagutil"
+        else "Linking CXX static library liblarch.a"
+    )
+    expected_recipe_lines.append(
+        "\t@$(CMAKE_COMMAND) -E cmake_echo_color \"--switch=$(COLOR)\" "
+        f"--green --bold --progress-dir={product_root}/build/CMakeFiles "
+        f"--progress-num=$(CMAKE_PROGRESS_{link_progress}) "
+        f'"{link_description}"'
+    )
+    if target == "larch":
+        expected_recipe_lines.append(
+            "\t$(CMAKE_COMMAND) -P CMakeFiles/larch.dir/cmake_clean_target.cmake"
+        )
+    expected_recipe_lines.extend(
+        [
+            f"\t$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/{target}.dir/link.txt --verbose=$(VERBOSE)",
+            f"\t$(CMAKE_COMMAND) -P CMakeFiles/{target}.dir/cmake_clean.cmake",
+            (
+                f"\tcd {product_root}/build && $(CMAKE_COMMAND) -E cmake_depends "
+                f'"Unix Makefiles" {product_root} {product_root} '
+                f"{product_root}/build {product_root}/build "
+                f"{product_root}/build/CMakeFiles/{target}.dir/DependInfo.cmake "
+                f'"--color=$(COLOR)" {target}'
+            ),
+        ]
+    )
+    actual_recipe_lines = [line for line in text.splitlines() if line.startswith("\t")]
+    if actual_recipe_lines != expected_recipe_lines:
+        fail(
+            f"{role} contain an extra, missing, reordered, or modified target recipe"
+        )
+    return sha256_bytes(payload)
+
+
 def validate_effective_build_commands(
     tool_paths: Mapping[str, Path], product_root: Path
 ) -> dict[str, str]:
@@ -1465,6 +1796,11 @@ def validate_effective_build_commands(
         f"-I{product_root / 'include'} -I{product_root / 'build/generated'}"
     )
     result: dict[str, str] = {}
+    for target in ("dagutil", "larch"):
+        role = f"{target}_compile_recipes"
+        result[role] = validate_target_compile_recipes(
+            tool_paths[role], product_root, target
+        )
     for role in ("dagutil_compile_flags", "larch_compile_flags"):
         _, payload = read_snapshotted_file(
             tool_paths[role], role.replace("_", " "), maximum_bytes=64 * 1024
@@ -1539,18 +1875,9 @@ def validate_effective_build_commands(
             }:
                 fail("larch link command does not use one closed system archive pair")
             objects = [
-                "CMakeFiles/larch.dir/src/protobuf.cpp.o",
-                "CMakeFiles/larch.dir/src/protobuf_encode.cpp.o",
-                "CMakeFiles/larch.dir/src/pickle_reader.cpp.o",
+                object_path
+                for object_path, _ in target_compile_sources(product_root, "larch")
             ]
-            if (product_root / "src/chart_scheduler.cpp").is_file():
-                objects.append("CMakeFiles/larch.dir/src/chart_scheduler.cpp.o")
-            objects.extend(
-                [
-                    "CMakeFiles/larch.dir/src/chart_spr_search.cpp.o",
-                    "CMakeFiles/larch.dir/src/chart_bnb_trim_apply.cpp.o",
-                ]
-            )
             if archive != [archive_tool, "qc", "liblarch.a", *objects]:
                 fail("larch archive command object sequence is not exact")
             if ranlib != [ranlib_tool, "liblarch.a"]:
@@ -1644,16 +1971,31 @@ def parse_manifest_preamble(path: Path, label: str) -> tuple[dict[str, str], byt
     return preamble, payload
 
 
+def require_sealed_file_mode(
+    snapshot: Mapping[str, object], label: str
+) -> None:
+    # Legacy Phase-0 evidence was finalized in owner-writable worktrees.  Its
+    # exact mode is still bound into each repeated snapshot, while write access
+    # by group/other (and therefore a wider mutation surface) is forbidden.
+    mode = snapshot.get("mode")
+    if not isinstance(mode, int) or isinstance(mode, bool):
+        fail(f"{label} snapshot lacks a valid permission mode")
+    if mode & 0o022:
+        fail(f"{label} is group/other-writable: mode {mode:04o}")
+
+
 def verify_detached_sha(path: Path, expected_sha256: str, label: str) -> dict[str, object]:
     if SHA256_RE.fullmatch(expected_sha256) is None:
         fail(f"expected {label} SHA-256 is not canonical")
     manifest, _ = read_snapshotted_file(path, label)
+    require_sealed_file_mode(manifest, label)
     if manifest["sha256"] != expected_sha256:
         fail(f"{label} differs from its external SHA-256 anchor")
     seal_path = canonical_existing_path(os.fspath(path) + ".sha256", f"{label} detached seal")
     seal, seal_payload = read_snapshotted_file(
         seal_path, f"{label} detached seal", maximum_bytes=1024
     )
+    require_sealed_file_mode(seal, f"{label} detached seal")
     expected = f"{expected_sha256}  {path.name}\n".encode("ascii")
     if seal_payload != expected:
         fail(f"{label} detached seal is not exact GNU sha256sum format")
@@ -1717,6 +2059,7 @@ def read_artifact_ledger(
         snapshot = snapshot_file(
             member, f"Phase-0 artifact row {number}", executable=False
         )
+        require_sealed_file_mode(snapshot, f"Phase-0 artifact row {number}")
         if snapshot["sha256"] != digest:
             fail(f"Phase-0 artifact row {number} hash mismatch: {uri}")
         device = snapshot["device"]
@@ -1888,12 +2231,16 @@ def build_tool_paths(
         "capture_wrapper": capture_tool_root / "tools/wric_benchmark_capture.py",
         "cmake_cache": product_root / "build/CMakeCache.txt",
         "compiler": EXPECTED_COMPILER,
+        "dagutil_compile_recipes": product_root
+        / "build/CMakeFiles/dagutil.dir/build.make",
         "dagutil_compile_flags": product_root / "build/CMakeFiles/dagutil.dir/flags.make",
         "dagutil_link_command": product_root / "build/CMakeFiles/dagutil.dir/link.txt",
         "frozen_larch2": frozen_paths["frozen_larch2"],
         "frozen_oracle_dagutil": frozen_paths["frozen_oracle_dagutil"],
         "frozen_process_metrics": frozen_paths["frozen_process_metrics"],
         "generic_ledger": capture_tool_root / "tools/wric_evidence_run_ledger.py",
+        "larch_compile_recipes": product_root
+        / "build/CMakeFiles/larch.dir/build.make",
         "larch_compile_flags": product_root / "build/CMakeFiles/larch.dir/flags.make",
         "larch_link_command": product_root / "build/CMakeFiles/larch.dir/link.txt",
         "product_dagutil": product_root / "build/bin/dagutil",
@@ -1968,7 +2315,9 @@ def harness_provenance(
     if auditor_blob["working_file"] != auditor_snapshot:
         fail("historical harness compatibility auditor changed during its HEAD check")
     module = load_python_module(
-        auditor_path, "historical harness compatibility auditor"
+        auditor_path,
+        "historical harness compatibility auditor",
+        auditor_snapshot,
     )
     if (
         getattr(module, "SCHEMA", None) != "wric.historical_harness_compat"
@@ -2767,8 +3116,10 @@ def strict_json_object(path: Path, label: str) -> dict[str, object]:
     return value
 
 
-def load_ledger_module(path: Path) -> ModuleType:
-    module = load_python_module(path, "generic ledger")
+def load_ledger_module(
+    path: Path, expected_snapshot: Mapping[str, object]
+) -> ModuleType:
+    module = load_python_module(path, "generic ledger", expected_snapshot)
     if (
         getattr(module, "SCHEMA", None) != "wric.evidence_run_ledger"
         or getattr(module, "SCHEMA_VERSION", None) != 2
@@ -2916,8 +3267,10 @@ def validate_metadata_shape(metadata: Mapping[str, object]) -> None:
         fail("run metadata live host topology is not an object")
     effective = metadata["effective_build_commands"]
     expected_effective = {
+        "dagutil_compile_recipes",
         "dagutil_compile_flags",
         "dagutil_link_command",
+        "larch_compile_recipes",
         "larch_compile_flags",
         "larch_link_command",
     }
@@ -3046,8 +3399,12 @@ def require_live_repositories(
     return result
 
 
-def seal_with_generic_ledger(capture: Path, ledger_path: Path) -> tuple[str, int]:
-    module = load_ledger_module(ledger_path)
+def seal_with_generic_ledger(
+    capture: Path,
+    ledger_path: Path,
+    expected_snapshot: Mapping[str, object],
+) -> tuple[str, int]:
+    module = load_ledger_module(ledger_path, expected_snapshot)
     try:
         result = module.seal_capture(capture)
     except Exception as error:
@@ -3062,8 +3419,13 @@ def seal_with_generic_ledger(capture: Path, ledger_path: Path) -> tuple[str, int
     return digest, count
 
 
-def audit_with_generic_ledger(capture: Path, ledger_path: Path, expected_sha256: str) -> int:
-    module = load_ledger_module(ledger_path)
+def audit_with_generic_ledger(
+    capture: Path,
+    ledger_path: Path,
+    expected_sha256: str,
+    expected_snapshot: Mapping[str, object],
+) -> int:
+    module = load_ledger_module(ledger_path, expected_snapshot)
     try:
         result = module.audit_capture(capture, expected_sha256)
     except Exception as error:
@@ -3407,7 +3769,9 @@ def capture_run(args: argparse.Namespace) -> dict[str, object]:
         fail("process affinity changed before ledger sealing")
     if args.phase9_mode:
         require_phase9_record_unchanged(postprocessor)
-    digest, member_count = seal_with_generic_ledger(capture, tool_paths["generic_ledger"])
+    digest, member_count = seal_with_generic_ledger(
+        capture, tool_paths["generic_ledger"], tools_pre["generic_ledger"]
+    )
 
     # The ledger invocation is executable code too.  Emit its external anchor
     # only after one final live-provenance and ledger audit succeeds.
@@ -3451,7 +3815,12 @@ def capture_run(args: argparse.Namespace) -> dict[str, object]:
         fail("process affinity changed during ledger sealing")
     if args.phase9_mode:
         require_phase9_record_unchanged(postprocessor)
-    audit_with_generic_ledger(capture, tool_paths["generic_ledger"], digest)
+    audit_with_generic_ledger(
+        capture,
+        tool_paths["generic_ledger"],
+        digest,
+        tools_pre["generic_ledger"],
+    )
     result_payload: dict[str, object] = {
         "capture_dir": os.fspath(capture),
         "ledger_sha256": digest,
@@ -3489,10 +3858,33 @@ def audit_run(args: argparse.Namespace) -> dict[str, object]:
         args.capture_tool_repo_root, "capture-tool repository"
     )
     phase0_root = validate_git_toplevel(args.phase0_base_root, "Phase-0 base root")
+    capture_wrapper_path = canonical_existing_path(
+        capture_tool_root / "tools/wric_benchmark_capture.py", "capture wrapper"
+    )
     ledger_path = canonical_existing_path(
         capture_tool_root / "tools/wric_evidence_run_ledger.py", "generic ledger"
     )
-    first_count = audit_with_generic_ledger(capture, ledger_path, args.expected_ledger_sha256)
+    ensure_running_wrapper(capture_wrapper_path)
+    repository_state(
+        capture_tool_root,
+        args.expected_capture_tool_revision,
+        "capture-tool repository bootstrap",
+        require_clean=True,
+    )
+    tracked_git_blob(
+        capture_tool_root, capture_wrapper_path, "capture wrapper bootstrap"
+    )
+    bootstrap_ledger_blob = tracked_git_blob(
+        capture_tool_root, ledger_path, "generic ledger bootstrap"
+    )
+    bootstrap_ledger_snapshot = bootstrap_ledger_blob["working_file"]
+    assert isinstance(bootstrap_ledger_snapshot, dict)
+    first_count = audit_with_generic_ledger(
+        capture,
+        ledger_path,
+        args.expected_ledger_sha256,
+        bootstrap_ledger_snapshot,
+    )
     metadata_path = capture / METADATA_NAME
     metadata_snapshot = snapshot_file(metadata_path, "run metadata", executable=False)
     if metadata_snapshot["mode"] != 0o444:
@@ -3708,7 +4100,15 @@ def audit_run(args: argparse.Namespace) -> dict[str, object]:
         fail("process affinity changed during audit")
     if snapshot_file(metadata_path, "run metadata", executable=False) != metadata_snapshot:
         fail("run metadata changed during audit")
-    second_count = audit_with_generic_ledger(capture, ledger_path, args.expected_ledger_sha256)
+    generic_ledger_snapshot = require_snapshot_shape(
+        recorded_tools["generic_ledger"], "run metadata tool generic_ledger"
+    )
+    second_count = audit_with_generic_ledger(
+        capture,
+        ledger_path,
+        args.expected_ledger_sha256,
+        generic_ledger_snapshot,
+    )
     if second_count != first_count:
         fail("generic ledger member count changed during audit")
     result_payload: dict[str, object] = {

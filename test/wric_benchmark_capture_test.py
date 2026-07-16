@@ -87,11 +87,98 @@ def commit_all(root: Path, message: str) -> str:
 def effective_build_paths(root: Path) -> dict[str, Path]:
     build = root / "build"
     return {
+        "dagutil_compile_recipes": build / "CMakeFiles/dagutil.dir/build.make",
         "dagutil_compile_flags": build / "CMakeFiles/dagutil.dir/flags.make",
         "dagutil_link_command": build / "CMakeFiles/dagutil.dir/link.txt",
+        "larch_compile_recipes": build / "CMakeFiles/larch.dir/build.make",
         "larch_compile_flags": build / "CMakeFiles/larch.dir/flags.make",
         "larch_link_command": build / "CMakeFiles/larch.dir/link.txt",
     }
+
+
+def generated_build_make(root: Path, target: str) -> str:
+    sources = capture_tool.target_compile_sources(root, target)
+    lines = ["# exact synthetic CMake target recipes", ""]
+    for progress, (object_path, source_path) in enumerate(sources, 1):
+        intermediate = object_path.removesuffix(".o")
+        lines.extend(
+            [
+                f"{object_path}: CMakeFiles/{target}.dir/flags.make",
+                f"{object_path}: {source_path}",
+                f"{object_path}: CMakeFiles/{target}.dir/compiler_depend.ts",
+                (
+                    '\t@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" '
+                    f"--green --progress-dir={root}/build/CMakeFiles "
+                    f"--progress-num=$(CMAKE_PROGRESS_{progress}) "
+                    f'"Building CXX object {object_path}"'
+                ),
+                (
+                    f"\t{capture_tool.EXPECTED_COMPILER} $(CXX_DEFINES) "
+                    f"$(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT {object_path} "
+                    f"-MF {object_path}.d -o {object_path} -c {source_path}"
+                ),
+                "",
+                f"{intermediate}.i: cmake_force",
+                (
+                    '\t@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" '
+                    f'--green "Preprocessing CXX source to {intermediate}.i"'
+                ),
+                (
+                    f"\t{capture_tool.EXPECTED_COMPILER} $(CXX_DEFINES) "
+                    f"$(CXX_INCLUDES) $(CXX_FLAGS) -E {source_path} > {intermediate}.i"
+                ),
+                "",
+                f"{intermediate}.s: cmake_force",
+                (
+                    '\t@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" '
+                    f'--green "Compiling CXX source to assembly {intermediate}.s"'
+                ),
+                (
+                    f"\t{capture_tool.EXPECTED_COMPILER} $(CXX_DEFINES) "
+                    f"$(CXX_INCLUDES) $(CXX_FLAGS) -S {source_path} -o {intermediate}.s"
+                ),
+                "",
+            ]
+        )
+    link_progress = len(sources) + 1
+    description = (
+        "Linking CXX executable bin/dagutil"
+        if target == "dagutil"
+        else "Linking CXX static library liblarch.a"
+    )
+    lines.extend(
+        [
+            f"{target}: {' '.join(object_path for object_path, _ in sources)}",
+            (
+                '\t@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" '
+                f"--green --bold --progress-dir={root}/build/CMakeFiles "
+                f"--progress-num=$(CMAKE_PROGRESS_{link_progress}) "
+                f'"{description}"'
+            ),
+        ]
+    )
+    if target == "larch":
+        lines.append(
+            "\t$(CMAKE_COMMAND) -P CMakeFiles/larch.dir/cmake_clean_target.cmake"
+        )
+    lines.extend(
+        [
+            f"\t$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/{target}.dir/link.txt --verbose=$(VERBOSE)",
+            "",
+            f"CMakeFiles/{target}.dir/clean:",
+            f"\t$(CMAKE_COMMAND) -P CMakeFiles/{target}.dir/cmake_clean.cmake",
+            "",
+            f"CMakeFiles/{target}.dir/depend:",
+            (
+                f"\tcd {root}/build && $(CMAKE_COMMAND) -E cmake_depends "
+                f'"Unix Makefiles" {root} {root} {root}/build {root}/build '
+                f"{root}/build/CMakeFiles/{target}.dir/DependInfo.cmake "
+                f'"--color=$(COLOR)" {target}'
+            ),
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 class Fixture:
@@ -153,6 +240,10 @@ class Fixture:
         )
         for target in ("dagutil", "larch"):
             write(self.product / f"build/CMakeFiles/{target}.dir/flags.make", flags)
+            write(
+                self.product / f"build/CMakeFiles/{target}.dir/build.make",
+                generated_build_make(self.product, target),
+            )
         write(
             self.product / "build/CMakeFiles/dagutil.dir/link.txt",
             "/home/ogi-agent/install/gcc-trunk/bin/g++-trunk -O2 -g -DNDEBUG "
@@ -739,6 +830,10 @@ class Phase9Fixture(Fixture):
         )
         for target in ("dagutil", "larch"):
             write(self.product / f"build/CMakeFiles/{target}.dir/flags.make", flags)
+            write(
+                self.product / f"build/CMakeFiles/{target}.dir/build.make",
+                generated_build_make(self.product, target),
+            )
         write(
             self.product / "build/CMakeFiles/dagutil.dir/link.txt",
             "/home/ogi-agent/install/gcc-trunk/bin/g++-trunk -O2 -g -DNDEBUG "
@@ -1201,6 +1296,46 @@ class BenchmarkCaptureTest(unittest.TestCase):
                 self.fixture.phase0, ledger, digest
             )
 
+    def test_phase0_sealed_modes_reject_group_other_write_but_allow_owner_write(self) -> None:
+        member = self.fixture.extra_phase0_artifact
+        member.chmod(0o666)
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError, "artifact row .* group/other-writable"
+        ):
+            capture_tool.read_artifact_ledger(
+                self.fixture.phase0,
+                self.fixture.artifact_ledger,
+                self.fixture.artifact_sha256,
+            )
+        member.chmod(0o644)
+        capture_tool.read_artifact_ledger(
+            self.fixture.phase0,
+            self.fixture.artifact_ledger,
+            self.fixture.artifact_sha256,
+        )
+
+        self.fixture.artifact_ledger.chmod(0o666)
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError, "artifact ledger is group/other-writable"
+        ):
+            capture_tool.read_artifact_ledger(
+                self.fixture.phase0,
+                self.fixture.artifact_ledger,
+                self.fixture.artifact_sha256,
+            )
+        self.fixture.artifact_ledger.chmod(0o444)
+        seal = Path(os.fspath(self.fixture.artifact_ledger) + ".sha256")
+        seal.chmod(0o666)
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError,
+            "artifact ledger detached seal is group/other-writable",
+        ):
+            capture_tool.read_artifact_ledger(
+                self.fixture.phase0,
+                self.fixture.artifact_ledger,
+                self.fixture.artifact_sha256,
+            )
+
     def test_index_flags_head_blob_bytes_and_git_runtime_overrides_fail_closed(self) -> None:
         assume_top = self.top / "assume-unchanged"
         assume_top.mkdir()
@@ -1252,6 +1387,9 @@ class BenchmarkCaptureTest(unittest.TestCase):
             "core.fsmonitor=false",
             "core.untrackedCache=false",
             "core.filemode=true",
+            "core.trustctime=true",
+            "core.checkStat=default",
+            "core.ignoreStat=false",
         ):
             self.assertIn(setting, argv)
         self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
@@ -1271,6 +1409,9 @@ class BenchmarkCaptureTest(unittest.TestCase):
             "core.fsmonitor=false",
             "core.untrackedCache=false",
             "core.filemode=true",
+            "core.trustctime=true",
+            "core.checkStat=default",
+            "core.ignoreStat=false",
         ):
             self.assertIn(setting, argv)
         self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
@@ -1307,6 +1448,90 @@ class BenchmarkCaptureTest(unittest.TestCase):
         )
         self.assertEqual(state["head"], anchored)
 
+    def test_unproved_python_module_bytes_never_execute(self) -> None:
+        module = self.fixture.ledger
+        expected = capture_tool.snapshot_file(
+            module, "expected generic ledger", executable=True
+        )
+        marker = self.top / "unexpected-module-execution"
+        with module.open("a", encoding="utf-8") as stream:
+            stream.write(
+                f"\nPath({os.fspath(marker)!r}).write_text('executed', encoding='utf-8')\n"
+            )
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError, "already-proved HEAD snapshot before execution"
+        ):
+            capture_tool.load_python_module(
+                module, "adversarial generic ledger", expected
+            )
+        self.assertFalse(marker.exists())
+
+    def test_audit_bootstrap_rejects_restoring_ledger_before_it_executes(self) -> None:
+        root, result = self.successful_capture("ledger-bootstrap")
+        marker = self.top / "unexpected-bootstrap-execution"
+        tools = self.fixture.controller / "tools"
+        original = self.fixture.controller / "tools.original"
+        tools.rename(original)
+        shutil.copytree(original, tools, copy_function=shutil.copy2)
+        malicious_ledger = tools / LEDGER.name
+        with malicious_ledger.open("a", encoding="utf-8") as stream:
+            stream.write(
+                f"\nPath({os.fspath(marker)!r}).write_text('executed', encoding='utf-8')\n"
+                f"_stash=Path({os.fspath(self.fixture.controller / '__pycache__')!r})\n"
+                "_stash.mkdir(exist_ok=True)\n"
+                f"os.rename({os.fspath(tools)!r}, "
+                f"{os.fspath(self.fixture.controller / '__pycache__/evil-tools')!r})\n"
+                f"os.rename({os.fspath(original)!r}, {os.fspath(tools)!r})\n"
+            )
+        audited = self.fixture.run(
+            self.fixture.audit_command(root, str(result["ledger_sha256"]))
+        )
+        self.assertEqual(audited.returncode, 2)
+        self.assertIn("capture-tool repository bootstrap", audited.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_raw_tracked_verification_defeats_git_stat_cache_bypass(self) -> None:
+        root = self.top / "stat-cache-repository"
+        initialize_git(root)
+        tracked = root / "tracked"
+        write(tracked, "AAAA\n")
+        fixed_time = 1_577_829_600_123_456_789
+        os.utime(tracked, ns=(fixed_time, fixed_time))
+        revision = commit_all(root, "anchored raw bytes")
+        git(root, "config", "core.trustctime", "false")
+        git(root, "config", "core.checkStat", "minimal")
+        write(tracked, "BBBB\n")
+        os.utime(tracked, ns=(fixed_time, fixed_time))
+        uncontrolled = subprocess.run(
+            [
+                "/usr/bin/git",
+                "-C",
+                os.fspath(root),
+                "status",
+                "--porcelain=v2",
+                "--untracked-files=all",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        )
+        self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
+        self.assertEqual(uncontrolled.stdout, b"")
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError, "raw working bytes differ from HEAD"
+        ):
+            capture_tool.raw_tracked_worktree_observation(
+                root,
+                git(root, "rev-parse", "--show-object-format"),
+                "stat-cache repository",
+            )
+        with self.assertRaises(capture_tool.CaptureError):
+            capture_tool.repository_state(
+                root, revision, "stat-cache repository", require_clean=True
+            )
+
     def test_real_current_and_historical_build_contracts_are_accepted(self) -> None:
         historical = REPO.parent / "larch2-wric-evidence" / "phase1"
         self.assertTrue(
@@ -1331,8 +1556,10 @@ class BenchmarkCaptureTest(unittest.TestCase):
                 self.assertEqual(
                     set(commands),
                     {
+                        "dagutil_compile_recipes",
                         "dagutil_compile_flags",
                         "dagutil_link_command",
+                        "larch_compile_recipes",
                         "larch_compile_flags",
                         "larch_link_command",
                     },
@@ -1385,6 +1612,22 @@ class BenchmarkCaptureTest(unittest.TestCase):
 
         paths = effective_build_paths(self.fixture.product)
         mutations: tuple[tuple[Path, Callable[[str], str], str], ...] = (
+            (
+                paths["dagutil_compile_recipes"],
+                lambda text: text.replace(
+                    "$(CXX_FLAGS) -MD -MT", "$(CXX_FLAGS) -O0 -MD -MT", 1
+                ),
+                "launcher-free recipe",
+            ),
+            (
+                paths["larch_compile_recipes"],
+                lambda text: text.replace(
+                    "\t$(CMAKE_COMMAND) -P CMakeFiles/larch.dir/cmake_clean_target.cmake\n",
+                    "\t/bin/true\n"
+                    "\t$(CMAKE_COMMAND) -P CMakeFiles/larch.dir/cmake_clean_target.cmake\n",
+                ),
+                "extra, missing, reordered, or modified target recipe",
+            ),
             (
                 paths["dagutil_compile_flags"],
                 lambda text: text + "EXTRA_FLAGS = -O0\n",
@@ -1440,14 +1683,16 @@ class BenchmarkCaptureTest(unittest.TestCase):
         captured = audit_fixture.run(audit_fixture.capture_command(audit_root))
         self.assertEqual(captured.returncode, 0, captured.stderr)
         anchor = str(json.loads(captured.stdout)["ledger_sha256"])
-        flags = audit_fixture.product / "build/CMakeFiles/larch.dir/flags.make"
-        with flags.open("a", encoding="utf-8") as stream:
+        recipes = audit_fixture.product / "build/CMakeFiles/larch.dir/build.make"
+        with recipes.open("a", encoding="utf-8") as stream:
             stream.write("# audit drift\n")
         completed = audit_fixture.run(
             audit_fixture.audit_command(audit_root, anchor)
         )
         self.assertEqual(completed.returncode, 2)
-        self.assertIn("larch compile flags identity or bytes changed", completed.stderr)
+        self.assertIn(
+            "larch compile recipes identity or bytes changed", completed.stderr
+        )
 
     def test_host_model_calibration_and_sysfs_topology_are_bound(self) -> None:
         live_model = str(capture_tool.host_topology_observation()["cpu_model"])
@@ -1509,6 +1754,10 @@ class BenchmarkCaptureTest(unittest.TestCase):
                 capture_tool.host_topology_observation()
 
     def test_historical_run_labels_require_their_exact_product_revision(self) -> None:
+        self.assertEqual(
+            capture_tool.HISTORICAL_RUN_REVISIONS["phase8-generation"],
+            "a21ab7aef81d3309c8f6c07cb7d5b3ddf4d19638",
+        )
         for label, revision in capture_tool.HISTORICAL_RUN_REVISIONS.items():
             with self.subTest(label=label):
                 capture_tool.require_run_revision(label, revision)
