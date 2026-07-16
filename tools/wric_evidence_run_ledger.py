@@ -3,10 +3,12 @@
 
 This is deliberately a small generic primitive.  It does not know about any
 WRIC phase, manifest, row schema, repository, or executable.  ``seal`` binds
-every regular file below one completed capture directory and publishes a
-ledger plus detached seal without replacing an existing directory entry.
+every regular file and descendant directory below one completed capture
+directory and publishes a ledger plus detached seal without replacing an
+existing directory entry.  Directory records make intentional empty output
+namespaces part of the closure instead of treating them as mutable omissions.
 ``audit`` requires an external ledger SHA-256 anchor and verifies the exact
-current directory closure.
+current typed path closure.
 
 The publication protocol is fail-closed.  Staging files are fsynced and then
 hard-linked to their final names (POSIX no-replace publication), the directory
@@ -31,11 +33,11 @@ from typing import Mapping, NoReturn, Sequence
 
 
 SCHEMA = "wric.evidence_run_ledger"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 LEDGER_NAME = "wric-evidence-run-ledger.tsv"
 SEAL_NAME = LEDGER_NAME + ".sha256"
 STAGING_PREFIX = ".wric-evidence-run-ledger.stage-"
-HEADER = ("sha256", "bytes", "mode", "path")
+HEADER = ("kind", "sha256", "bytes", "mode", "path")
 PREAMBLE = (
     f"# schema={SCHEMA}",
     f"# schema_version={SCHEMA_VERSION}",
@@ -78,9 +80,18 @@ class FileRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectoryRecord:
+    relative: str
+    mode: int
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True, slots=True)
 class LedgerEntry:
-    sha256: str
-    size: int
+    kind: str
+    sha256: str | None
+    size: int | None
     mode: int
     relative: str
 
@@ -88,7 +99,7 @@ class LedgerEntry:
 @dataclass(frozen=True, slots=True)
 class ScanResult:
     files: Mapping[str, FileRecord]
-    directories: frozenset[str]
+    directories: Mapping[str, DirectoryRecord]
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,15 +298,6 @@ def hash_open_regular(
             os.close(descriptor)
 
 
-def required_directories(paths: Sequence[str]) -> frozenset[str]:
-    result: set[str] = set()
-    for relative in paths:
-        parts = PurePosixPath(relative).parts
-        for length in range(1, len(parts)):
-            result.add("/".join(parts[:length]))
-    return frozenset(result)
-
-
 def scan_capture_descriptor(
     root_descriptor: int,
     exclusions: Mapping[str, tuple[int, int]],
@@ -303,7 +305,7 @@ def scan_capture_descriptor(
     durable: bool,
 ) -> ScanResult:
     files: dict[str, FileRecord] = {}
-    directories: set[str] = set()
+    directories: dict[str, DirectoryRecord] = {}
     inodes: set[tuple[int, int]] = set()
 
     def visit(directory_descriptor: int, prefix: str) -> None:
@@ -348,13 +350,18 @@ def scan_capture_descriptor(
                         or identity(child_info) != identity(lexical_info)
                     ):
                         fail(f"capture directory changed while opening: {relative}")
-                    directories.add(relative)
                     visit(child_descriptor, relative)
                     child_after = os.fstat(child_descriptor)
                     if stable_directory_signature(child_after) != stable_directory_signature(
                         child_info
                     ):
                         fail(f"capture directory changed while scanning: {relative}")
+                    directories[relative] = DirectoryRecord(
+                        relative=relative,
+                        mode=permission_mode(child_after),
+                        device=child_after.st_dev,
+                        inode=child_after.st_ino,
+                    )
                 except LedgerError:
                     raise
                 except OSError as error:
@@ -397,31 +404,32 @@ def scan_capture_descriptor(
     visit(root_descriptor, "")
     if not files:
         fail("capture directory contains no evidence files")
-    expected_directories = required_directories(tuple(files))
-    if frozenset(directories) != expected_directories:
-        extras = sorted(directories - set(expected_directories))
-        missing = sorted(set(expected_directories) - directories)
-        fail(
-            "capture directory contains an unbound directory closure: "
-            f"missing={missing}, extra={extras}"
-        )
-    return ScanResult(files=files, directories=frozenset(directories))
+    return ScanResult(files=files, directories=directories)
 
 
 def render_ledger(scan: ScanResult) -> bytes:
     lines = list(PREAMBLE)
-    for relative in sorted(scan.files):
-        record = scan.files[relative]
-        lines.append(
-            "\t".join(
-                (
-                    record.sha256,
-                    str(record.size),
-                    f"{record.mode:04o}",
-                    relative,
-                )
+    paths = sorted((*scan.files, *scan.directories))
+    for relative in paths:
+        if relative in scan.files:
+            record = scan.files[relative]
+            fields = (
+                "file",
+                record.sha256,
+                str(record.size),
+                f"{record.mode:04o}",
+                relative,
             )
-        )
+        else:
+            directory = scan.directories[relative]
+            fields = (
+                "directory",
+                "-",
+                "-",
+                f"{directory.mode:04o}",
+                relative,
+            )
+        lines.append("\t".join(fields))
     return ("\n".join(lines) + "\n").encode("ascii")
 
 
@@ -441,26 +449,39 @@ def parse_ledger(payload: bytes) -> Mapping[str, LedgerEntry]:
         fail("ledger is not ASCII")
     lines = text[:-1].split("\n")
     if tuple(lines[: len(PREAMBLE)]) != PREAMBLE:
-        fail("ledger preamble or header is not the exact v1 schema")
+        fail("ledger preamble or header is not the exact v2 schema")
     entries: dict[str, LedgerEntry] = {}
     paths: list[str] = []
     for line_number, line in enumerate(lines[len(PREAMBLE) :], len(PREAMBLE) + 1):
         fields = line.split("\t")
-        if len(fields) != 4:
+        if len(fields) != 5:
             fail(f"ledger line {line_number} is malformed")
-        digest, size_text, mode_text, relative = fields
-        if SHA256_RE.fullmatch(digest) is None:
-            fail(f"ledger line {line_number} has a noncanonical SHA-256")
-        if UINT_RE.fullmatch(size_text) is None:
-            fail(f"ledger line {line_number} has a noncanonical byte count")
+        kind, digest, size_text, mode_text, relative = fields
+        if kind == "file":
+            if SHA256_RE.fullmatch(digest) is None:
+                fail(f"ledger line {line_number} has a noncanonical SHA-256")
+            if UINT_RE.fullmatch(size_text) is None:
+                fail(f"ledger line {line_number} has a noncanonical byte count")
+            parsed_digest: str | None = digest
+            parsed_size: int | None = int(size_text)
+        elif kind == "directory":
+            if digest != "-" or size_text != "-":
+                fail(
+                    f"ledger line {line_number} has noncanonical directory fields"
+                )
+            parsed_digest = None
+            parsed_size = None
+        else:
+            fail(f"ledger line {line_number} has an unknown entry kind")
         if MODE_RE.fullmatch(mode_text) is None:
-            fail(f"ledger line {line_number} has a noncanonical file mode")
+            fail(f"ledger line {line_number} has a noncanonical entry mode")
         validate_ledger_relative(relative)
         if relative in entries:
             fail(f"ledger duplicates path: {relative}")
         entry = LedgerEntry(
-            sha256=digest,
-            size=int(size_text),
+            kind=kind,
+            sha256=parsed_digest,
+            size=parsed_size,
             mode=int(mode_text, 8),
             relative=relative,
         )
@@ -470,6 +491,18 @@ def parse_ledger(payload: bytes) -> Mapping[str, LedgerEntry]:
         fail("ledger contains no evidence members")
     if paths != sorted(paths):
         fail("ledger member paths are not in canonical ASCII order")
+    if not any(entry.kind == "file" for entry in entries.values()):
+        fail("ledger contains no evidence files")
+    for relative in paths:
+        parts = PurePosixPath(relative).parts
+        for length in range(1, len(parts)):
+            parent = "/".join(parts[:length])
+            parent_entry = entries.get(parent)
+            if parent_entry is None or parent_entry.kind != "directory":
+                fail(
+                    "ledger directory closure omits typed parent: "
+                    f"{parent} for {relative}"
+                )
     return entries
 
 
@@ -674,24 +707,32 @@ def unlink_owned(
 
 
 def scans_equal(left: ScanResult, right: ScanResult) -> bool:
-    return left.directories == right.directories and dict(left.files) == dict(right.files)
+    return (
+        dict(left.directories) == dict(right.directories)
+        and dict(left.files) == dict(right.files)
+    )
 
 
 def audit_entries(entries: Mapping[str, LedgerEntry], scan: ScanResult) -> None:
     listed = set(entries)
-    actual = set(scan.files)
+    actual = set(scan.files) | set(scan.directories)
     if listed != actual:
         missing = sorted(listed - actual)
         extra = sorted(actual - listed)
         fail(f"ledger is not the exact capture closure: missing={missing}, extra={extra}")
     for relative in sorted(entries):
         entry = entries[relative]
-        record = scan.files[relative]
-        if (
-            entry.sha256 != record.sha256
-            or entry.size != record.size
-            or entry.mode != record.mode
-        ):
+        if entry.kind == "file":
+            record = scan.files.get(relative)
+            changed = record is None or (
+                entry.sha256 != record.sha256
+                or entry.size != record.size
+                or entry.mode != record.mode
+            )
+        else:
+            directory = scan.directories.get(relative)
+            changed = directory is None or entry.mode != directory.mode
+        if changed:
             fail(f"sealed capture member changed: {relative}")
 
 
@@ -869,7 +910,7 @@ def audit_capture(capture_directory: Path, expected_ledger_sha256: str) -> Resul
         return Result(
             status="audited",
             ledger_sha256=observed_sha256,
-            member_count=len(entries),
+            member_count=len(scan.files),
         )
     finally:
         os.close(root_descriptor)

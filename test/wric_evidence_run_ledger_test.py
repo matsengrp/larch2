@@ -78,7 +78,7 @@ class EvidenceRunLedgerTest(unittest.TestCase):
             },
         )
 
-    def test_exact_v1_format_detached_seal_and_cli_output(self) -> None:
+    def test_exact_v2_format_detached_seal_and_cli_output(self) -> None:
         root = self.capture(two_files=True)
         completed = self.cli("seal", "--capture-dir", os.fspath(root))
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -89,9 +89,10 @@ class EvidenceRunLedgerTest(unittest.TestCase):
         expected_ledger = (
             f"# schema={ledger.SCHEMA}\n"
             f"# schema_version={ledger.SCHEMA_VERSION}\n"
-            "sha256\tbytes\tmode\tpath\n"
-            f"{sha256(alpha)}\t{len(alpha)}\t0640\talpha.txt\n"
-            f"{sha256(nested)}\t{len(nested)}\t0755\tnested/z.bin\n"
+            "kind\tsha256\tbytes\tmode\tpath\n"
+            f"file\t{sha256(alpha)}\t{len(alpha)}\t0640\talpha.txt\n"
+            "directory\t-\t-\t0755\tnested\n"
+            f"file\t{sha256(nested)}\t{len(nested)}\t0755\tnested/z.bin\n"
         ).encode("ascii")
         observed = (root / ledger.LEDGER_NAME).read_bytes()
         self.assertEqual(observed, expected_ledger)
@@ -347,12 +348,16 @@ class EvidenceRunLedgerTest(unittest.TestCase):
     def test_malformed_ledgers_are_rejected_even_with_matching_new_anchor(self) -> None:
         variants = (
             "preamble",
+            "v1",
             "crlf",
             "non-ascii",
             "no-final-newline",
+            "kind",
             "digest",
             "size",
             "mode",
+            "directory-fields",
+            "missing-parent",
             "escape",
             "self",
             "duplicate",
@@ -369,6 +374,9 @@ class EvidenceRunLedgerTest(unittest.TestCase):
                 rows = lines[3:]
                 if variant == "preamble":
                     lines[0] = "# schema=wrong"
+                elif variant == "v1":
+                    lines[1] = "# schema_version=1"
+                    lines[2] = "sha256\tbytes\tmode\tpath"
                 elif variant == "crlf":
                     payload = valid.replace(b"\n", b"\r\n")
                     anchor = self.rewrite_ledger(root, payload)
@@ -387,25 +395,35 @@ class EvidenceRunLedgerTest(unittest.TestCase):
                     with self.assertRaisesRegex(ledger.LedgerError, "canonical newline"):
                         ledger.audit_capture(root, anchor)
                     continue
+                elif variant == "kind":
+                    fields = rows[0].split("\t")
+                    fields[0] = "socket"
+                    lines[3] = "\t".join(fields)
                 elif variant == "digest":
                     fields = rows[0].split("\t")
-                    fields[0] = "g" * 64
+                    fields[1] = "g" * 64
                     lines[3] = "\t".join(fields)
                 elif variant == "size":
                     fields = rows[0].split("\t")
-                    fields[1] = "06"
+                    fields[2] = "06"
                     lines[3] = "\t".join(fields)
                 elif variant == "mode":
                     fields = rows[0].split("\t")
-                    fields[2] = "8888"
+                    fields[3] = "8888"
                     lines[3] = "\t".join(fields)
+                elif variant == "directory-fields":
+                    fields = rows[1].split("\t")
+                    fields[1] = "0" * 64
+                    lines[4] = "\t".join(fields)
+                elif variant == "missing-parent":
+                    del lines[4]
                 elif variant == "escape":
                     fields = rows[0].split("\t")
-                    fields[3] = "../escape"
+                    fields[4] = "../escape"
                     lines[3] = "\t".join(fields)
                 elif variant == "self":
                     fields = rows[0].split("\t")
-                    fields[3] = ledger.LEDGER_NAME
+                    fields[4] = ledger.LEDGER_NAME
                     lines[3] = "\t".join(fields)
                 elif variant == "duplicate":
                     lines.append(rows[0])
@@ -427,7 +445,7 @@ class EvidenceRunLedgerTest(unittest.TestCase):
         with self.assertRaisesRegex(ledger.LedgerError, "detached seal is not exact"):
             ledger.audit_capture(root, result.ledger_sha256)
 
-    def test_unsafe_names_empty_captures_and_empty_directories_fail_closed(self) -> None:
+    def test_unsafe_names_and_empty_captures_fail_closed(self) -> None:
         empty = self.top / "empty"
         empty.mkdir()
         with self.assertRaisesRegex(ledger.LedgerError, "no evidence files"):
@@ -438,10 +456,48 @@ class EvidenceRunLedgerTest(unittest.TestCase):
         with self.assertRaisesRegex(ledger.LedgerError, "unsafe or reserved path"):
             self.seal(unsafe)
 
-        empty_directory = self.capture()
-        (empty_directory / "empty").mkdir()
-        with self.assertRaisesRegex(ledger.LedgerError, "unbound directory closure"):
-            self.seal(empty_directory)
+    def test_empty_directories_are_bound_and_audited(self) -> None:
+        root = self.capture()
+        outputs = root / "outputs"
+        outputs.mkdir(mode=0o750)
+        nested = root / "logs" / "empty"
+        nested.mkdir(parents=True)
+        result = self.seal(root)
+        observed = (root / ledger.LEDGER_NAME).read_text(encoding="ascii")
+        self.assertIn("directory\t-\t-\t0755\tlogs\n", observed)
+        self.assertIn("directory\t-\t-\t0755\tlogs/empty\n", observed)
+        self.assertIn("directory\t-\t-\t0750\toutputs\n", observed)
+        ledger.audit_capture(root, result.ledger_sha256)
+
+    def test_empty_directory_add_remove_rename_mode_and_retype_fail(self) -> None:
+        variants = ("add", "remove", "rename", "mode", "file", "symlink", "fifo")
+        for variant in variants:
+            with self.subTest(variant=variant):
+                root = self.capture()
+                outputs = root / "outputs"
+                outputs.mkdir(mode=0o750)
+                result = self.seal(root)
+                if variant == "add":
+                    (root / "extra-empty").mkdir()
+                elif variant == "remove":
+                    outputs.rmdir()
+                elif variant == "rename":
+                    outputs.rename(root / "renamed-outputs")
+                elif variant == "mode":
+                    outputs.chmod(0o700)
+                elif variant == "file":
+                    outputs.rmdir()
+                    outputs.write_bytes(b"not a directory")
+                elif variant == "symlink":
+                    outputs.rmdir()
+                    replacement = self.top / f"replacement-{self.counter}"
+                    replacement.mkdir()
+                    outputs.symlink_to(replacement, target_is_directory=True)
+                else:
+                    outputs.rmdir()
+                    os.mkfifo(outputs)
+                with self.assertRaises(ledger.LedgerError):
+                    ledger.audit_capture(root, result.ledger_sha256)
 
     def test_capture_root_symlink_is_rejected(self) -> None:
         root = self.capture()
