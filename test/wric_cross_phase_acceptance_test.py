@@ -68,6 +68,8 @@ class SyntheticEvidence:
         supplement: str | None = None,
         semantic_key: str | None = None,
         top_k: int | None = None,
+        max_candidates: int | None = None,
+        iterations: int = 1,
     ) -> None:
         key = fixture if semantic_key is None else semantic_key
         requested = "-" if worker == "native" else ("0" if worker == "auto" else worker)
@@ -101,9 +103,13 @@ class SyntheticEvidence:
                 self.refusal_stderr_sha
                 if expected_outcome == "expected_infeasible" else "-"
             ),
-            iterations="1",
+            iterations=str(iterations),
             seed="1",
-            chart_max_candidates="32" if method != cross.METHOD_LB else "64",
+            chart_max_candidates=str(
+                max_candidates
+                if max_candidates is not None else
+                (64 if method == cross.METHOD_LB else 32)
+            ),
             chart_top_k_exact=str(
                 top_k
                 if top_k is not None else
@@ -151,6 +157,11 @@ class SyntheticEvidence:
                     str(worker),
                     expected_outcome=outcome,
                     top_k=(1 if template in (cross.SMALL_EXACT, cross.MEDIUM_EXACT) else 0),
+                    max_candidates=(
+                        1
+                        if template in (cross.SMALL_EXACT, cross.MEDIUM_EXACT)
+                        else None
+                    ),
                 )
 
         self.add_manifest("p0-native-medium-physical-i1-m50", "p0-primary-physical", "medium", cross.METHOD_NATIVE, "native")
@@ -185,6 +196,7 @@ class SyntheticEvidence:
                 fixture,
                 cross.METHOD_NATIVE,
                 "native",
+                iterations=3,
             )
             for method, short in METHOD_SHORT.items():
                 for worker in (1, 2, 4, 8):
@@ -195,6 +207,8 @@ class SyntheticEvidence:
                         method,
                         str(worker),
                         top_k=16,
+                        max_candidates=128,
+                        iterations=3,
                     )
 
         for worker in (1, 8):
@@ -256,8 +270,8 @@ class SyntheticEvidence:
                     str(worker),
                     supplement="phase9",
                     semantic_key=f"phase9-seed{seed}",
+                    iterations=3,
                 )
-                self.manifest_rows[row_id]["iterations"] = "3"
                 self.manifest_rows[row_id]["seed"] = str(seed)
 
     @staticmethod
@@ -327,6 +341,7 @@ class SyntheticEvidence:
             input_sha = manifest["primary_sha256"]
             refseq_sha = manifest["refseq_sha256"]
             top_k = int(manifest["chart_top_k_exact"])
+            max_candidates = int(manifest["chart_max_candidates"])
             expected_outcome = (
                 manifest["expected_outcome"]
                 if label in ("phase0", "final-real") else "ok"
@@ -362,11 +377,17 @@ class SyntheticEvidence:
             input_sha = digest(f"input:{fixture}")
             refseq_sha = "-"
             top_k = 4 if method in (cross.METHOD_EXACT, cross.METHOD_HYBRID) else 0
+            max_candidates = 32
             expected_outcome = "ok"
         exact_count = (
             top_k * int(iterations)
             if method != cross.METHOD_NATIVE and expected_outcome == "ok"
             else 0
+        )
+        candidate_count = (
+            max_candidates * int(iterations)
+            if method != cross.METHOD_NATIVE and expected_outcome == "ok"
+            else (96 if iterations == "3" else 32)
         )
         resolved_count = (
             int(resolved)
@@ -415,8 +436,8 @@ class SyntheticEvidence:
             acceptance=(manifest["acceptance"] if manifest else "synthetic"),
             objective=(manifest["objective"] if manifest else "synthetic"),
             candidate_source=(manifest["candidate_source"] if manifest else "synthetic"),
-            candidates_generated="96" if iterations == "3" else "32",
-            candidates_scored="96" if iterations == "3" else "32",
+            candidates_generated=str(candidate_count),
+            candidates_scored=str(candidate_count),
             exact_verifications=str(exact_count),
             accepted_moves="3" if iterations == "3" else "0",
             initial_validated_parsimony_min="100", final_validated_parsimony_min="90",
@@ -857,12 +878,12 @@ class SyntheticEvidence:
             writer.writeheader()
             writer.writerows(retained)
 
-    def remove_column(self, label: str, column: str) -> None:
+    def remove_columns(self, label: str, columns: set[str]) -> None:
         path = self.raw_paths[label]
         with path.open(encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle, delimiter="\t")
-            assert reader.fieldnames is not None and column in reader.fieldnames
-            header = [field for field in reader.fieldnames if field != column]
+            assert reader.fieldnames is not None and columns <= set(reader.fieldnames)
+            header = [field for field in reader.fieldnames if field not in columns]
             rows = list(reader)
         with path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
@@ -871,6 +892,9 @@ class SyntheticEvidence:
             )
             writer.writeheader()
             writer.writerows(rows)
+
+    def remove_column(self, label: str, column: str) -> None:
+        self.remove_columns(label, {column})
 
     def split_raw(self, label: str) -> None:
         source = self.raw_paths[label]
@@ -1253,6 +1277,132 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("trial_semantic_sha256", result.stderr)
 
+    def test_selected_chart_work_must_match_sealed_literal_contracts(self) -> None:
+        cases = (
+            (
+                "phase6-topk1-candidates",
+                "phase6",
+                cross.MEDIUM_EXACT.format(1),
+                {"candidates_scored": "0"},
+                "iterations*chart_max_candidates=1",
+            ),
+            (
+                "phase6-topk4-exact",
+                "phase6",
+                "p0-medium-primary32k4-grammar-exact-w1",
+                {
+                    "exact_verifications": "3",
+                    "exact_candidate_timing_count": "3",
+                },
+                "iterations*chart_top_k_exact=4",
+            ),
+            (
+                "phase6-topk16-exact",
+                "phase6",
+                "p0-medium-stress128k16-grammar-exact-w1",
+                {
+                    "exact_verifications": "47",
+                    "exact_candidate_timing_count": "47",
+                },
+                "iterations*chart_top_k_exact=48",
+            ),
+            (
+                "final-scaling",
+                "final-scaling",
+                "p0-medium-primary32k4-sampled-tree-fixed-topology-w1",
+                {"candidates_scored": "31"},
+                "iterations*chart_max_candidates=32",
+            ),
+            (
+                "final-primary",
+                "final-primary",
+                "p0-medium-primary32k4-hybrid-exact-w1",
+                {"candidates_scored": "31"},
+                "iterations*chart_max_candidates=32",
+            ),
+            (
+                "final-default",
+                "final-default-auto",
+                "p0-medium-primary32k4-smt-grammar-exact-wdefault",
+                {"candidates_scored": "31"},
+                "iterations*chart_max_candidates=32",
+            ),
+            (
+                "final-stress",
+                "final-stress",
+                "p0-medium-stress128k16-sampled-tree-fixed-topology-w1",
+                {"candidates_scored": "383"},
+                "iterations*chart_max_candidates=384",
+            ),
+        )
+        for case, label, row_id, changes, message in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(
+                prefix=f"wric-cross-work-{case}-"
+            ) as name:
+                data = SyntheticEvidence(Path(name))
+
+                def selected_trial(row: Mapping[str, str]) -> bool:
+                    return (
+                        row["row_id"] == row_id
+                        and row["trial_index"] == "1"
+                    )
+
+                data.mutate(
+                    label,
+                    selected_trial,
+                    changes,
+                )
+                result = self.run_case(data)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+    def test_projected_resident_covers_chart_and_admitted_bytes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-projection-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase6",
+                lambda row: (
+                    row["row_id"]
+                    == "p0-medium-stress128k16-grammar-exact-w8"
+                    and row["trial_index"] == "1"
+                ),
+                {cross.ADMISSION_FIELD: "1999999"},
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "do not cover chart resident plus admitted bytes",
+                result.stderr,
+            )
+
+    def test_work_arithmetic_is_uint64_bounded_and_overflow_safe(self) -> None:
+        with self.assertRaisesRegex(cross.AcceptanceError, "nonnegative integer"):
+            cross.checked_uint64("-1", "synthetic selected work")
+        with self.assertRaisesRegex(cross.AcceptanceError, "addition overflows"):
+            cross.checked_uint64_sum(
+                cross.UINT64_MAX, 1, "synthetic projected bytes"
+            )
+        with self.assertRaisesRegex(
+            cross.AcceptanceError, "multiplication overflows"
+        ):
+            cross.checked_uint64_product(
+                cross.UINT64_MAX, 2, "synthetic selected work"
+            )
+        with tempfile.TemporaryDirectory(prefix="wric-cross-uint64-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "final-primary",
+                lambda row: (
+                    row["row_id"]
+                    == "p0-medium-primary32k4-grammar-exact-w1"
+                    and row["trial_index"] == "1"
+                ),
+                {"candidates_scored": str(cross.UINT64_MAX + 1)},
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("exceeds uint64", result.stderr)
+
     def test_final_physical_scaling_matrix_and_speed_are_mandatory(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-final-scale-matrix-") as name:
             data = SyntheticEvidence(Path(name))
@@ -1526,12 +1676,59 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("duplicate row/trial", result.stderr)
 
-    def test_historical_admission_field_can_be_absent_but_final_field_is_required(self) -> None:
+    def test_historical_admission_schema_is_all_absent_or_complete(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-historical-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.remove_columns("phase1", set(cross.ADMISSION_FIELDS))
+            result = self.run_case(data)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-historical-na-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase1",
+                lambda row: True,
+                {field: "NA" for field in cross.ADMISSION_FIELDS},
+            )
+            result = self.run_case(data)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-historical-partial-header-"
+        ) as name:
             data = SyntheticEvidence(Path(name))
             data.remove_column("phase1", cross.ADMISSION_FIELD)
             result = self.run_case(data)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("partial exact-candidate admission schema", result.stderr)
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-historical-mixed-na-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase1",
+                lambda row: (
+                    row["row_id"] == cross.SMALL_EXACT.format(1)
+                    and row["trial_index"] == "1"
+                ),
+                {cross.ADMISSION_FIELD: "NA"},
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("mixes NA and recorded values", result.stderr)
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-historical-malformed-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase1",
+                lambda row: (
+                    row["row_id"] == cross.SMALL_EXACT.format(1)
+                    and row["trial_index"] == "1"
+                ),
+                {"exact_candidate_admission_batches": "malformed"},
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("admission batches is not a nonnegative integer", result.stderr)
         with tempfile.TemporaryDirectory(prefix="wric-cross-final-schema-") as name:
             data = SyntheticEvidence(Path(name))
             data.remove_column("final-primary", cross.ADMISSION_FIELD)

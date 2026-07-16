@@ -29,6 +29,7 @@ SCHEMA = "wric.cross_phase_acceptance"
 SCHEMA_VERSION = 2
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 UINT_RE = re.compile(r"^(0|[1-9][0-9]*)$")
+UINT64_MAX = (1 << 64) - 1
 
 RUN_LABELS = (
     "phase1",
@@ -112,6 +113,7 @@ def required_raw_columns(label: str) -> tuple[str, ...]:
     if label in HISTORICAL_PRE_ADMISSION_LABELS:
         return tuple(field for field in RAW_COLUMNS if field not in ADMISSION_FIELDS)
     return RAW_COLUMNS
+
 
 MANIFEST_COLUMNS = (
     "row_id", "run_group", "workload_name", "fixture_id", "method",
@@ -242,6 +244,29 @@ def uint(value: str, label: str, *, positive: bool = False) -> int:
     if UINT_RE.fullmatch(value) is None or (positive and value == "0"):
         raise AcceptanceError(f"{label} is not a {'positive' if positive else 'nonnegative'} integer: {value!r}")
     return int(value)
+
+
+def checked_uint64(value: str, label: str, *, positive: bool = False) -> int:
+    result = uint(value, label, positive=positive)
+    if result > UINT64_MAX:
+        raise AcceptanceError(f"{label}: unsigned value exceeds uint64")
+    return result
+
+
+def checked_uint64_sum(left: int, right: int, label: str) -> int:
+    if left < 0 or right < 0 or left > UINT64_MAX or right > UINT64_MAX:
+        raise AcceptanceError(f"{label}: operands are outside uint64")
+    if left > UINT64_MAX - right:
+        raise AcceptanceError(f"{label}: uint64 addition overflows")
+    return left + right
+
+
+def checked_uint64_product(left: int, right: int, label: str) -> int:
+    if left < 0 or right < 0 or left > UINT64_MAX or right > UINT64_MAX:
+        raise AcceptanceError(f"{label}: operands are outside uint64")
+    if left != 0 and right > UINT64_MAX // left:
+        raise AcceptanceError(f"{label}: uint64 multiplication overflows")
+    return left * right
 
 
 def median(values: Sequence[Decimal], label: str) -> Decimal:
@@ -772,6 +797,14 @@ def load_raw(
         current_header, current_rows = read_tsv(
             canonical, required_raw_columns(label), f"{label} raw TSV"
         )
+        if label in HISTORICAL_PRE_ADMISSION_LABELS:
+            present_admission = ADMISSION_FIELDS.intersection(current_header)
+            if present_admission and present_admission != ADMISSION_FIELDS:
+                missing = sorted(ADMISSION_FIELDS - present_admission)
+                raise AcceptanceError(
+                    f"{label}: raw TSV has a partial exact-candidate admission "
+                    f"schema; missing={missing}"
+                )
         if header is None:
             header = current_header
         elif current_header != header:
@@ -824,8 +857,43 @@ def is_hash_or_dash(value: str) -> bool:
     return value in ("-", "NA") or HASH_RE.fullmatch(value) is not None
 
 
+def admission_block_available(
+    row: Mapping[str, str], label: str, where: str
+) -> bool:
+    present = {field for field in ADMISSION_FIELDS if field in row}
+    if label in HISTORICAL_PRE_ADMISSION_LABELS:
+        if not present:
+            return False
+        if present != ADMISSION_FIELDS:
+            missing = sorted(ADMISSION_FIELDS - present)
+            raise AcceptanceError(
+                f"{where}: partial exact-candidate admission block; missing={missing}"
+            )
+        unavailable = {field for field in ADMISSION_FIELDS if row[field] == "NA"}
+        if unavailable == ADMISSION_FIELDS:
+            return False
+        if unavailable:
+            raise AcceptanceError(
+                f"{where}: exact-candidate admission block mixes NA and recorded "
+                f"values; unavailable={sorted(unavailable)}"
+            )
+        return True
+
+    unavailable = {
+        field
+        for field in ADMISSION_FIELDS
+        if row.get(field) in (None, "NA")
+    }
+    if unavailable:
+        raise AcceptanceError(
+            f"{where}: missing required exact-candidate admission fields: "
+            f"{sorted(unavailable)}"
+        )
+    return True
+
+
 def validate_exact_candidate_admission(
-    row: Mapping[str, str], where: str, budget: int
+    row: Mapping[str, str], where: str, budget: int, resident: int
 ) -> int:
     exact = uint(row["exact_verifications"], f"{where} exact verifications")
     peak = uint(
@@ -852,11 +920,11 @@ def validate_exact_candidate_admission(
         row["exact_candidate_memory_limited_batches"],
         f"{where} exact-candidate memory-limited batches",
     )
-    admitted = uint(
+    admitted = checked_uint64(
         row["exact_candidate_peak_admitted_bytes"],
         f"{where} exact-candidate peak admitted bytes",
     )
-    projected = uint(
+    projected = checked_uint64(
         row[ADMISSION_FIELD], f"{where} exact-candidate projected resident bytes"
     )
     queued = decimal(
@@ -898,6 +966,17 @@ def validate_exact_candidate_admission(
         raise AcceptanceError(
             f"{where}: exact-candidate projected resident bytes exceed the memory budget"
         )
+    if exact > 0:
+        required_projection = checked_uint64_sum(
+            resident,
+            admitted,
+            f"{where} chart resident plus exact-candidate admitted bytes",
+        )
+        if projected < required_projection:
+            raise AcceptanceError(
+                f"{where}: exact-candidate projected resident bytes do not cover "
+                "chart resident plus admitted bytes"
+            )
     if axis > resolved:
         raise AcceptanceError(
             f"{where}: exact-candidate active-worker high-water exceeds resolved workers"
@@ -1058,29 +1137,19 @@ def validate_success(
             "exact_verification_ms", "accepted_rebuild_ms", "total_ms",
         ):
             decimal(row[key], f"{where} {key}")
-        budget = uint(row["configured_chart_memory_budget"], f"{where} memory budget", positive=True)
-        available_admission = {
-            field for field in ADMISSION_FIELDS
-            if row.get(field) not in (None, "NA")
-        }
-        if label in HISTORICAL_PRE_ADMISSION_LABELS and (
-            available_admission != ADMISSION_FIELDS
-        ):
-            projected_text = row.get(ADMISSION_FIELD)
-            if projected_text is None or projected_text == "NA":
-                projected = 0
-            else:
-                projected = uint(
-                    projected_text, f"{where} projected resident bytes"
-                )
-        elif available_admission != ADMISSION_FIELDS:
-            missing = sorted(ADMISSION_FIELDS - available_admission)
-            raise AcceptanceError(
-                f"{where}: missing required exact-candidate admission fields: {missing}"
+        budget = checked_uint64(
+            row["configured_chart_memory_budget"],
+            f"{where} memory budget",
+            positive=True,
+        )
+        resident = checked_uint64(
+            row["chart_cache_resident_bytes"], f"{where} chart resident bytes"
+        )
+        projected = 0
+        if admission_block_available(row, label, where):
+            projected = validate_exact_candidate_admission(
+                row, where, budget, resident
             )
-        else:
-            projected = validate_exact_candidate_admission(row, where, budget)
-        resident = uint(row["chart_cache_resident_bytes"], f"{where} chart resident bytes")
         if projected > budget or resident > budget:
             raise AcceptanceError(f"{where}: chart/exact resident estimate exceeds memory budget")
     regular(Path(row["report_path"]), f"{where} recorded report")
@@ -1645,6 +1714,7 @@ Phase9Validator = Callable[
 def exact_worker_matrix(
     manifests: ManifestChain,
     group: str,
+    max_candidates: int,
     top_k: int,
     methods: Sequence[str],
 ) -> dict[tuple[str, int], str]:
@@ -1657,15 +1727,99 @@ def exact_worker_matrix(
                 if row["run_group"] == group
                 and row["method"] == method
                 and manifest_worker(row) == str(worker)
+                and row["chart_max_candidates"] == str(max_candidates)
                 and row["chart_top_k_exact"] == str(top_k)
             ]
             if len(matches) != 1:
                 raise AcceptanceError(
                     "sealed base does not define exactly one Phase-6 row for "
-                    f"{group}/{method}/TopK{top_k}/W{worker}: {sorted(matches)}"
+                    f"{group}/{method}/{max_candidates}c/TopK{top_k}/W{worker}: "
+                    f"{sorted(matches)}"
                 )
             result[(method, worker)] = matches[0]
     return result
+
+
+def require_manifest_work_contract(
+    manifests: ManifestChain,
+    row_ids: set[str],
+    max_candidates: int,
+    top_k: int,
+    label: str,
+) -> None:
+    chart_rows = 0
+    for row_id in sorted(row_ids):
+        row = manifests.rows[row_id]
+        if row["method"] == METHOD_NATIVE:
+            continue
+        chart_rows += 1
+        if (
+            row["chart_max_candidates"] != str(max_candidates)
+            or row["chart_top_k_exact"] != str(top_k)
+        ):
+            raise AcceptanceError(
+                f"{label}: sealed row {row_id} work contract is "
+                f"{row['chart_max_candidates']}/{row['chart_top_k_exact']}, "
+                f"expected {max_candidates}/{top_k}"
+            )
+    if chart_rows == 0:
+        raise AcceptanceError(f"{label}: sealed selection contains no chart rows")
+
+
+def validate_selected_work(
+    evidence: RawEvidence,
+    row_ids: set[str],
+    manifests: ManifestChain,
+) -> None:
+    for row in evidence.rows:
+        row_id = row["row_id"]
+        if row_id not in row_ids or row["method"] == METHOD_NATIVE:
+            continue
+        manifest = manifests.rows[row_id]
+        where = f"{evidence.label} {row_id} trial {row['trial_index']}"
+        iterations = checked_uint64(
+            manifest["iterations"], f"{where} sealed iterations", positive=True
+        )
+        max_candidates = checked_uint64(
+            manifest["chart_max_candidates"],
+            f"{where} sealed chart_max_candidates",
+            positive=True,
+        )
+        top_k = checked_uint64(
+            manifest["chart_top_k_exact"],
+            f"{where} sealed chart_top_k_exact",
+            positive=True,
+        )
+        if top_k > max_candidates:
+            raise AcceptanceError(
+                f"{where}: sealed exact Top-K exceeds the candidate budget"
+            )
+        expected_candidates = checked_uint64_product(
+            iterations,
+            max_candidates,
+            f"{where} expected candidate-score work",
+        )
+        expected_exact = checked_uint64_product(
+            iterations,
+            top_k,
+            f"{where} expected exact-verification work",
+        )
+        actual_candidates = checked_uint64(
+            row["candidates_scored"], f"{where} candidates_scored"
+        )
+        actual_exact = checked_uint64(
+            row["exact_verifications"], f"{where} exact_verifications"
+        )
+        if actual_candidates != expected_candidates:
+            raise AcceptanceError(
+                f"{where}: candidates_scored={actual_candidates}, expected "
+                f"iterations*chart_max_candidates={expected_candidates}"
+            )
+        if actual_exact != expected_exact:
+            raise AcceptanceError(
+                f"{where}: exact_verifications={actual_exact}, expected "
+                f"iterations*chart_top_k_exact={expected_exact}"
+            )
 
 
 def evaluate(
@@ -1702,17 +1856,20 @@ def evaluate(
             base,
             "p0-medium-exact1-physical",
             1,
+            1,
             (METHOD_EXACT,),
         ),
         4: exact_worker_matrix(
             base,
             "p0-primary-physical",
+            32,
             4,
             (METHOD_SAMPLED, METHOD_EXACT, METHOD_HYBRID),
         ),
         16: exact_worker_matrix(
             base,
             "p0-stress-physical",
+            128,
             16,
             (METHOD_SAMPLED, METHOD_EXACT, METHOD_HYBRID),
         ),
@@ -1761,6 +1918,36 @@ def evaluate(
     runs["final-real"].required_rows(final_real, 3, base)
     phase9_ids = {f"phase9-local-commit-seed{seed}-w{worker}" for seed in (1, 7, 19) for worker in (1, 8)}
     runs["phase9"].required_rows(phase9_ids, 3, base)
+    for top_k, max_candidates in ((1, 1), (4, 32), (16, 128)):
+        require_manifest_work_contract(
+            base,
+            set(phase6_matrices[top_k].values()),
+            max_candidates,
+            top_k,
+            f"phase6 TopK{top_k}",
+        )
+    strict_work_by_label = {
+        "phase6": phase6_ids,
+        "final-scaling": final_scaling,
+        "final-primary": final_primary,
+        "final-smt": final_smt,
+        "final-unpinned-auto": final_unpinned,
+        "final-default-auto": final_default,
+        "final-stress": final_stress,
+    }
+    for label in (
+        "final-scaling",
+        "final-primary",
+        "final-smt",
+        "final-unpinned-auto",
+        "final-default-auto",
+    ):
+        require_manifest_work_contract(
+            base, strict_work_by_label[label], 32, 4, label
+        )
+    require_manifest_work_contract(
+        base, final_stress, 128, 16, "final-stress"
+    )
     required_by_label = {
         "phase1": phase1_ids,
         "phase2": phase2_ids,
@@ -1791,6 +1978,10 @@ def evaluate(
             required_rows=required_by_label[label],
             required_refusal=(label == "final-real"),
         )
+        if label in strict_work_by_label:
+            validate_selected_work(
+                runs[label], strict_work_by_label[label], base
+            )
     memory_bytes = physical_memory_bytes()
     phase3_raw_path = single_row_source(
         runs["phase3"], MEDIUM_DENSE.format(1), 5
