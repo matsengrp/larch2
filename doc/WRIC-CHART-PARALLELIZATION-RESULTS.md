@@ -1580,6 +1580,151 @@ sanitizer gates remain pending. Under the authorized deadline-overlap rule,
 implementation proceeds to Phase 8 without substituting the diagnostics above
 for those gates.
 
+## Phase 8 implementation checkpoint (unsealed)
+
+Phase 8 has a **functionally passing implementation checkpoint; acceptance
+pending Phase 0 and the remaining performance gates** at
+`6c8d0c7651c2aa2e5c396d0f57c2e4e18c322310` (`Make finite pipeline
+admission test scheduler-invariant`, tree
+`8773b0a742f0a7ddca7909f8a9bf616dcbb1a9e7`). The immutable measurement
+checkpoint remains `7ca527b8906d018124756182274335cbff936d72`
+(`Baseline measure`). The historical counter-baseline document remains
+byte-identical, SHA-256
+`cdb3fd9f936cb335f8f93eafd5abbc4d31822bfe657f4f3fd343c85c1203a82e`.
+No frozen executable, oracle, runner, workload, candidate/exact budget,
+validation, or exactness contract was replaced.
+
+Commits `6671235`, `ea8d492`, and `e48cadd` prepare sampled trees once,
+partition projection into stable indexed slots on the one search-lifetime
+scheduler, and add a bounded two-buffer producer/consumer pipeline. The
+pipeline snapshots the grammar, execution plan, cache, and pattern epochs;
+generation and scoring share an explicit scheduler-handoff barrier; every
+early accept, stale snapshot, failure, and cancellation drains the producer
+and invalidates unscored buffers before commit.
+
+Commits `648f74f`, `5c5b849`, `3d00358`, `60e04c7`, and `913f1cf` replace the
+global all-move sampled preassignment with bounded stable-source waves, direct
+tree-delta projection, reusable per-slot dominant storage, capacity-rounded
+signature accounting, and allocation-free prepared metadata. The coordinator
+alone advances the legacy RNG stream and performs canonical filter, signature,
+deduplication, cap/reservoir, callback, counter, and final-order decisions.
+Workers may construct speculative results, but completion order is never
+semantic; a stop restores the exact canonical RNG/counter boundary and discards
+the tail after joining it. Warmed direct projection of all 416 named-fixture
+moves now reports zero allocation calls and zero requested bytes.
+
+Commits `15459e3`, `3110d1e`, and `45573cb` close the finite-memory and grammar
+halves. The unified finite iteration envelope independently admits sampled
+source, sampled projection, and grammar-construction widths, charges retained
+source/dedup/output ownership once, treats mutually exclusive scheduler
+operations as temporal alternatives, and retains actual-capacity backstops.
+Grammar enumeration remains the exact canonical event/RNG stream; bounded work
+descriptors own source/destination paths and the post-event RNG/counter
+snapshot, candidate construction runs in parallel, and serial gather restores
+the last committed boundary on stop or failure. Exact E succeeds, E-1 rejects
+before buffer reserve/submission, and deliberately underestimated realized
+source/projection/grammar capacities fail before semantic work or scheduler
+handoff.
+
+Commit `6c8d0c7` separates two independent contracts found during the TSan
+gate. A tight finite envelope may admit one grammar construction per wave; the
+scheduler handoff must then serialize the next construction behind scoring,
+so overlap is not an admission invariant. The finite-boundary test no longer
+uses a timing sleep or demands overlap in that case. The dedicated full-slot
+cancellation test still requires and observes non-vacuous producer/consumer
+overlap, drain, stale-work discard, and scheduler recovery.
+
+### Functional evidence
+
+The current main worktree rebuilt `larch`, `chart_spr_test`,
+`chart_spr_pipeline_test`, `chart_spr_search_test`, and
+`chart_spr_allocation_test` with the required GCC-trunk C++26 RelWithDebInfo
+toolchain. The registered focused command
+
+```text
+ctest --test-dir build --output-on-failure --parallel 4 -R '^(chart_spr_test|chart_spr_pipeline_test|chart_spr_search_test|chart_spr_allocation_test)$'
+```
+
+passed 4/4 in 8.32 seconds. Its raw log is
+`build/wric-chart-parallelization/phase8-45573cb-main/focused.ctest.log`,
+SHA-256
+`1239b09fbb91325c6608b66f3a7a891248e5e2a468a0c5822a41a27b29a86d71`.
+The matrix compares workers `1,2,4,8` and seeds `1,7,19` for grammar,
+sampled-tree, and hybrid sources; checks candidate identity/order/source,
+random traversal and reservoir selection, exact counters, callbacks, and
+repeated W8 output; exercises binary, multifurcating, multiparent, and sampled
+projection differentials; and requires real parallel operations/high-water.
+Dedicated pipeline tests cover overlap, stale state, early acceptance,
+cancellation, scoring/generation error precedence, quiescent recovery, and the
+three-dimensional finite boundary.
+
+At `6c8d0c7`, the complete RelWithDebInfo command
+
+```text
+ctest --test-dir build --output-on-failure --parallel 8
+```
+
+passed 167/167 in 185.54 seconds. `merge_consistency_test` and
+`rotaA_diagnostic_test` retained their pre-existing documented skips. The raw
+successful log is
+`build/wric-chart-parallelization/phase8-6c8d0c7/full-rerun.ctest.log`,
+SHA-256
+`12b1d0acbb74e1ec30386b771ef8660a6480e87e9e84c50a94e0e7fa2aa3c6e8`.
+The immediately preceding full attempt passed every chart test but observed a
+loaded-host timeout-startup race in `wric_process_metrics_test`
+(`timeout_kill_sent=0` rather than `1`); that test then passed alone in 4.33
+seconds and in the complete successful rerun. The failed-attempt log is
+retained, SHA-256
+`996ccc5923baf87c3da4f16ce69d3037db1a0bc750f69b09adacfb759d80d5d8`,
+and is not counted as gate evidence.
+
+The targeted GCC-trunk TSan command used serial CTest execution for
+`chart_parallel_test`, `chart_scheduler_test`, `chart_spr_test`,
+`chart_spr_search_test`, and `chart_spr_pipeline_test`. All 5/5 passed in 43.13
+seconds with `TSAN_OPTIONS=halt_on_error=1` and no race report. The raw log is
+`build/wric-chart-parallelization/phase8-45573cb-main/tsan.ctest.log`,
+SHA-256
+`730dcbee30b2543bec51de054b52f0192dc2f758423870ba53e8f8a116fcfd14`.
+The required patched runtime is
+`build/wric-chart-parallelization/phase3-7d294d6/patched-tsan-runtime/libtsan.so.2.0.0`,
+SHA-256
+`58725dae226e91ea96bebbdf54f84820638404a691528570ec1dab595ed08842`.
+
+### Collected generation diagnostics
+
+`data/test_5_trees/tree_0.pb.gz` qualifies for the named
+`sampled-generation-high` row: the frozen command emits exactly 256 post-dedup
+candidates and the pre-source-wave W1 product timer at `51702c7` measured
+702.396 ms, above the plan's 100 ms minimum. The fixture SHA-256 is
+`e8dcd803ba2cd82ed594dbe66433934a62b3711ea7ddb0d349de35ef86030dd6`.
+The pre-optimization profile, exact command, executable hashes, split counters,
+and recommendation are preserved under
+`build/wric-chart-parallelization/phase8-generation-profile/`.
+
+After bounded source waves and reusable direct projection, three unsealed
+trials produced the following diagnostic medians:
+
+| Metric | W1 | W8 | Comparison |
+|---|---:|---:|---:|
+| candidate generation | 344.876 ms | 646.266 ms | 0.534x W8 speedup |
+| whole-process wall | 0.464027 s | 0.775479 s | 0.598x W8 speedup |
+| maximum sampled RSS | 17,316 KiB | 17,516 KiB | 1.012x W8/W1 |
+
+W1 generation is 2.04x faster than the earlier 702.396 ms product result, but
+the noisy-host W8 result misses the required same-revision 2.0x gate. All six
+runs have byte-identical canonical-file SHA-256
+`7bd15c26b2b529fcdb9f8095b24f6b7437c0beeaba6dc8a64ac5abf5b3c2d594`.
+The copied raw outputs are under
+`build/wric-chart-parallelization/phase8-45573cb-main/source-waves-unsealed/`
+and `direct-projection-unsealed/`.
+
+These measurements are deliberately not an exit decision: unrelated host
+compilation was active, Phase 0 is not calibrated/sealed, and the Phase-8
+supplemental manifest has not been created. The quiet-host run must either pass
+the 2.0x gate or trigger another profile-supported optimization cycle; it must
+also establish Phase-7 end-to-end non-regression and paired RSS. This checkpoint
+does not reinterpret the observed miss or substitute it for sealed evidence.
+
 ## Later-phase evidence template
 
 Before the Phase-0 seal, every later-phase measurement is labelled
