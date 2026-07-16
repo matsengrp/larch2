@@ -1120,6 +1120,20 @@ static void test_phase8_grammar_and_hybrid_worker_seed_matrix() {
         if (source == larch::chart_spr_candidate_source::grammar) {
           CHECK(stats.sampled_tree_projection_moves_preassigned == 0);
           CHECK(stats.sampled_tree_projection_scheduler_operations == 0);
+          if (workers == 1) {
+            CHECK(stats.grammar_candidate_scheduler_operations == 0);
+            CHECK(stats.grammar_candidate_admitted_wave_width == 0);
+          } else {
+            CHECK(stats.grammar_candidate_construction_waves > 0);
+            CHECK(stats.grammar_candidate_scheduler_operations > 0);
+            CHECK(stats.grammar_candidate_parallel_operations > 0);
+            CHECK(stats.grammar_candidate_ranges >= 2);
+            CHECK(stats.grammar_candidate_worker_tasks >= 2);
+            CHECK(stats.grammar_candidate_active_worker_high_water >= 2);
+            CHECK(stats.grammar_candidate_peak_wave_size > 1);
+            CHECK(stats.grammar_candidate_admitted_wave_width == workers * 4);
+            CHECK(stats.grammar_candidate_actual_peak_bytes > 0);
+          }
         } else {
           CHECK(stats.sampled_tree_projection_moves_preassigned > 0);
           CHECK(stats.sampled_tree_projection_scheduler_operations > 0);
@@ -1146,6 +1160,143 @@ static void test_phase8_grammar_and_hybrid_worker_seed_matrix() {
       }
     }
   }
+
+  std::println("  PASS");
+}
+
+static void test_phase8_parallel_grammar_stop_reservoir_and_failure() {
+  std::println("test_phase8_parallel_grammar_stop_reservoir_and_failure");
+
+  std::vector<larch::phylo_dag> source_trees;
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree()));
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_cross_tree()));
+  auto dag = larch::test::merge_tiny_trees(std::move(source_trees));
+  auto grammar = larch::build_clade_grammar(dag);
+
+  auto base_options = larch::grammar_spr_enumeration_options{};
+  base_options.source = larch::chart_spr_candidate_source::grammar;
+  base_options.randomize_order = true;
+  base_options.seed = 19;
+
+  // A callback stop inside a full construction wave commits exactly the same
+  // semantic prefix/counters and RNG boundary as the serial oracle; only the
+  // dedicated speculative counter observes the drained tail.
+  auto serial_options = base_options;
+  auto serial_scheduler = make_projection_scheduler(1);
+  serial_options.sampled_tree_projection_scheduler = &serial_scheduler;
+  std::vector<larch::grammar_spr_candidate> serial_prefix;
+  auto serial_stats = larch::for_each_grammar_spr_candidate(
+      grammar, serial_options,
+      [&](larch::grammar_spr_candidate const& candidate) {
+        serial_prefix.push_back(candidate);
+        return false;
+      });
+  CHECK(serial_prefix.size() == 1);
+
+  auto parallel_options = base_options;
+  auto parallel_scheduler = make_projection_scheduler(4);
+  parallel_options.sampled_tree_projection_scheduler = &parallel_scheduler;
+  std::vector<larch::grammar_spr_candidate> parallel_prefix;
+  auto parallel_stats = larch::for_each_grammar_spr_candidate(
+      grammar, parallel_options,
+      [&](larch::grammar_spr_candidate const& candidate) {
+        parallel_prefix.push_back(candidate);
+        return false;
+      });
+  CHECK(parallel_prefix.size() == 1);
+  check_candidate_payload_equal(grammar, serial_prefix.front(),
+                                parallel_prefix.front());
+  check_legacy_generation_stats_equal(serial_stats, parallel_stats);
+  CHECK(parallel_stats.grammar_candidate_parallel_operations > 0);
+  CHECK(parallel_stats.grammar_candidate_speculative_discarded > 0);
+  CHECK(parallel_scheduler.metrics().pending_tasks == 0);
+
+  // Path-pair stopping drains the already-enumerated canonical prefix before
+  // publishing the path-budget reason and rolls back no-longer-reachable work.
+  auto serial_path_options = base_options;
+  serial_path_options.max_path_pairs_considered = 5;
+  auto serial_path_scheduler = make_projection_scheduler(1);
+  serial_path_options.sampled_tree_projection_scheduler =
+      &serial_path_scheduler;
+  larch::chart_spr_candidate_generation_stats serial_path_stats;
+  auto serial_path = collect_candidates(grammar, serial_path_options,
+                                        &serial_path_stats);
+  auto parallel_path_options = serial_path_options;
+  auto parallel_path_scheduler = make_projection_scheduler(4);
+  parallel_path_options.sampled_tree_projection_scheduler =
+      &parallel_path_scheduler;
+  larch::chart_spr_candidate_generation_stats parallel_path_stats;
+  auto parallel_path = collect_candidates(grammar, parallel_path_options,
+                                          &parallel_path_stats);
+  CHECK(parallel_path.size() == serial_path.size());
+  check_legacy_generation_stats_equal(serial_path_stats, parallel_path_stats);
+  for (std::size_t i = 0; i < serial_path.size(); ++i) {
+    check_candidate_payload_equal(grammar, serial_path[i], parallel_path[i]);
+  }
+  CHECK(parallel_path_stats.stop_reason ==
+        larch::chart_spr_candidate_stop_reason::path_budget);
+
+  // Reservoir draws occur only during canonical gather. Exhaustive child
+  // enumeration may be parallel, but every seed/worker count must select the
+  // identical ordered subset and retain identical legacy counters.
+  for (auto seed : {std::uint32_t{1}, std::uint32_t{7}, std::uint32_t{19}}) {
+    std::vector<std::string> baseline;
+    larch::chart_spr_candidate_generation_stats baseline_stats;
+    for (auto workers :
+         {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+      auto scheduler = make_projection_scheduler(workers);
+      auto options = base_options;
+      options.seed = seed;
+      options.reservoir_sample = true;
+      options.max_candidates = 4;
+      options.sampled_tree_projection_scheduler = &scheduler;
+      larch::chart_spr_candidate_generation_stats stats;
+      auto selected = collect_candidate_signature_vector(grammar, options,
+                                                         &stats);
+      if (workers == 1) {
+        baseline = selected;
+        baseline_stats = stats;
+      } else {
+        CHECK(selected == baseline);
+        check_legacy_generation_stats_equal(stats, baseline_stats);
+        CHECK(stats.grammar_candidate_parallel_operations > 0);
+      }
+      CHECK(scheduler.metrics().pending_tasks == 0);
+    }
+  }
+
+  // Multiple workers fail in one wave. Even when a later ordinal completes
+  // first, gather rethrows the lowest canonical failing ordinal and leaves the
+  // persistent scheduler reusable.
+  auto failure_scheduler = make_projection_scheduler(4);
+  auto failure_options = base_options;
+  failure_options.sampled_tree_projection_scheduler = &failure_scheduler;
+  std::latch later_failure_started{1};
+  failure_options.before_grammar_candidate_construction_for_tests =
+      [&](std::size_t ordinal) {
+        if (ordinal == 0) {
+          later_failure_started.wait();
+          throw std::runtime_error("forced grammar failure 0");
+        }
+        if (ordinal == 4) {
+          later_failure_started.count_down();
+          throw std::runtime_error("forced grammar failure 4");
+        }
+      };
+  std::string failure;
+  try {
+    (void)collect_candidates(grammar, failure_options);
+  } catch (std::runtime_error const& error) {
+    failure = error.what();
+  }
+  CHECK(failure == "forced grammar failure 0");
+  CHECK(failure_scheduler.metrics().pending_tasks == 0);
+  failure_options.before_grammar_candidate_construction_for_tests = {};
+  auto recovered = collect_candidates(grammar, failure_options);
+  CHECK(!recovered.empty());
+  CHECK(failure_scheduler.metrics().pending_tasks == 0);
 
   std::println("  PASS");
 }
@@ -2077,6 +2228,7 @@ int main() {
   test_phase8_binary_direct_metadata_resolver_is_fail_closed();
   test_phase8_parallel_sampled_projection_is_deterministic();
   test_phase8_grammar_and_hybrid_worker_seed_matrix();
+  test_phase8_parallel_grammar_stop_reservoir_and_failure();
   test_phase8_projection_budget_and_failure_atomicity();
   test_phase8_midwave_stop_preserves_legacy_counters();
   test_phase8_source_wave_admission_failure_and_cancellation();

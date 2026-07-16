@@ -311,9 +311,9 @@ struct grammar_spr_enumeration_options {
   // active projection scratch, and scheduler ownership/operation envelope.
   std::size_t sampled_tree_projection_memory_budget_bytes = 0;
   std::size_t sampled_tree_projection_external_resident_bytes = 0;
-  // Search-level unified admission may cap the projection wave before the
-  // representative tree/job count exists. Zero preserves the direct-library
-  // maximum; a finite value is an already-admitted upper bound.
+  // Search-level unified admission may cap the bounded sampled-tree source and
+  // projection waves before the representative tree exists. Zero preserves
+  // the direct-library maximum; a finite value is an admitted upper bound.
   std::size_t sampled_tree_source_maximum_wave_size = 0;
   std::size_t sampled_tree_projection_maximum_wave_size = 0;
   // A finite search-level admission records the allocation-free shape that
@@ -323,6 +323,12 @@ struct grammar_spr_enumeration_options {
   std::size_t sampled_tree_source_admitted_source_count_bound = 0;
   std::size_t sampled_tree_source_admitted_destination_bound = 0;
   std::size_t sampled_tree_source_admitted_peak_bytes = 0;
+  // Grammar-native construction uses the same persistent scheduler and
+  // top-level handoff. Zero selects the bounded product maximum; finite search
+  // admission may reduce the wave and publish a strict realized-capacity
+  // backstop before the grammar stream allocates or submits work.
+  std::size_t grammar_candidate_maximum_wave_size = 0;
+  std::size_t grammar_candidate_admitted_wave_bytes = 0;
 
   // A pipelined caller may perform serial enumeration/gather on a coordinator
   // while the persistent scheduler scores the preceding buffer.  The one
@@ -346,6 +352,13 @@ struct grammar_spr_enumeration_options {
       before_sampled_tree_projection_workspace_allocation_for_tests = {};
   std::optional<std::size_t>
       force_sampled_tree_projection_submit_failure_after_for_tests;
+  std::function<void()> before_grammar_candidate_workspace_allocation_for_tests =
+      {};
+  std::function<void(std::size_t)>
+      before_grammar_candidate_construction_for_tests = {};
+  std::optional<std::size_t>
+      force_grammar_candidate_submit_failure_after_for_tests;
+  std::size_t grammar_candidate_wave_actual_capacity_extra_bytes_for_tests = 0;
   // Added to measured source-wave container capacity after allocation.  This
   // lets the exact-budget test exercise the runtime underestimation backstop
   // without relying on an implementation-specific vector growth policy.
@@ -416,6 +429,23 @@ struct chart_spr_candidate_generation_stats {
   std::size_t sampled_tree_source_admitted_wave_width = 0;
   std::size_t sampled_tree_projection_admitted_subwave_width = 0;
   std::size_t sampled_tree_source_actual_peak_bytes = 0;
+
+  // Grammar path events are preassigned in exact serial/RNG order, constructed
+  // in bounded scheduler waves, and gathered canonically. Semantic counters
+  // exclude the drained tail after a cap/callback stop; these diagnostics make
+  // that speculation and the actual scheduler work explicit.
+  std::size_t grammar_candidate_construction_waves = 0;
+  std::size_t grammar_candidate_scheduler_operations = 0;
+  std::size_t grammar_candidate_parallel_operations = 0;
+  std::size_t grammar_candidate_ranges = 0;
+  std::size_t grammar_candidate_worker_tasks = 0;
+  std::size_t grammar_candidate_active_worker_high_water = 0;
+  std::size_t grammar_candidate_peak_wave_size = 0;
+  std::size_t grammar_candidate_speculative_discarded = 0;
+  std::size_t grammar_candidate_admitted_wave_width = 0;
+  std::size_t grammar_candidate_actual_peak_bytes = 0;
+  std::uint64_t grammar_candidate_scheduler_handoff_stall_nanoseconds = 0;
+  std::size_t grammar_candidate_cancellations = 0;
 
   // Phase-8 bounded producer/consumer diagnostics.  "Serial overlap" means
   // source enumeration, canonical gather, or candidate copying progressed on
@@ -3176,6 +3206,112 @@ struct upward_path_step {
 
 using upward_path = std::vector<upward_path_step>;
 
+struct grammar_spr_enumeration_counter_snapshot {
+  std::size_t upward_path_iterator_steps = 0;
+  std::size_t upward_paths_completed = 0;
+  std::size_t path_pairs_considered = 0;
+  std::size_t candidates_pruned_before_construction = 0;
+  std::size_t candidates_pruned_root_or_trivial = 0;
+  std::size_t candidates_pruned_moved_size = 0;
+  std::size_t candidates_pruned_target_size = 0;
+  std::size_t candidates_pruned_overlap = 0;
+  std::size_t candidates_pruned_affected_estimate_before = 0;
+  // Restoring this state after a speculative tail makes the local RNG stream
+  // byte-for-byte identical to the serial boundary, including randomized path
+  // traversal. mt19937 is deliberately stored by value in the bounded wave.
+  std::mt19937 rng;
+};
+
+struct grammar_spr_parallel_work_item {
+  std::size_t ordinal = 0;
+  production_id source_pid = no_production;
+  clade_id moved = no_clade;
+  clade_id target = no_clade;
+  upward_path source_path;
+  upward_path dest_path;
+  grammar_spr_enumeration_counter_snapshot enumeration_after;
+};
+
+struct grammar_spr_parallel_output_slot {
+  std::optional<grammar_spr_candidate> candidate;
+  std::exception_ptr failure;
+  bool completed = false;
+};
+
+inline std::size_t bounded_grammar_spr_candidate_wave_size(
+    grammar_spr_enumeration_options const& options) noexcept {
+  auto const* scheduler = options.sampled_tree_projection_scheduler;
+  if (scheduler == nullptr ||
+      scheduler->worker_resolution().resolved_workers <= 1) {
+    return 0;
+  }
+  auto const workers = scheduler->worker_resolution().resolved_workers;
+  auto maximum = workers > (std::numeric_limits<std::size_t>::max)() / 4
+                     ? (std::numeric_limits<std::size_t>::max)()
+                     : workers * 4;
+  if (options.grammar_candidate_maximum_wave_size != 0) {
+    maximum =
+        std::min(maximum, options.grammar_candidate_maximum_wave_size);
+  }
+  return std::max<std::size_t>(1, maximum);
+}
+
+inline std::size_t grammar_spr_parallel_path_capacity_bytes(
+    upward_path const& path, bool& safely_bounded) noexcept {
+  auto total = sampled_tree_projection_vector_capacity_bytes(path,
+                                                             safely_bounded);
+  for (auto const& step : path) {
+    total = sampled_tree_projection_saturating_add(
+        total,
+        sampled_tree_projection_vector_capacity_bytes(step.cochildren,
+                                                      safely_bounded),
+        safely_bounded);
+  }
+  return total;
+}
+
+inline std::size_t grammar_spr_parallel_wave_actual_bytes(
+    std::vector<grammar_spr_parallel_work_item> const& work,
+    std::vector<grammar_spr_parallel_output_slot> const& output,
+    std::size_t extra_bytes, bool& safely_bounded) noexcept {
+  auto total = sampled_tree_projection_saturating_add(
+      sizeof(work), sizeof(output), safely_bounded);
+  total = sampled_tree_projection_saturating_add(
+      total,
+      sampled_tree_projection_saturating_multiply(
+          work.capacity(), sizeof(grammar_spr_parallel_work_item),
+          safely_bounded),
+      safely_bounded);
+  total = sampled_tree_projection_saturating_add(
+      total,
+      sampled_tree_projection_saturating_multiply(
+          output.capacity(), sizeof(grammar_spr_parallel_output_slot),
+          safely_bounded),
+      safely_bounded);
+  for (auto const& item : work) {
+    total = sampled_tree_projection_saturating_add(
+        total,
+        grammar_spr_parallel_path_capacity_bytes(item.source_path,
+                                                 safely_bounded),
+        safely_bounded);
+    total = sampled_tree_projection_saturating_add(
+        total,
+        grammar_spr_parallel_path_capacity_bytes(item.dest_path,
+                                                 safely_bounded),
+        safely_bounded);
+  }
+  for (auto const& slot : output) {
+    if (!slot.candidate) continue;
+    total = sampled_tree_projection_saturating_add(
+        total,
+        sampled_tree_projection_candidate_capacity_bytes(*slot.candidate,
+                                                         safely_bounded),
+        safely_bounded);
+  }
+  return sampled_tree_projection_saturating_add(total, extra_bytes,
+                                                safely_bounded);
+}
+
 inline std::optional<std::vector<clade_id>> cochildren_of(
     clade_grammar const& grammar, production_id pid, clade_id child) {
   if (pid == no_production || pid >= grammar.productions.size())
@@ -4489,6 +4625,350 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
   }
   shuffle_if_requested(target_order, options, &rng);
 
+  std::size_t gathered_affected_prunes = 0;
+  auto capture_enumeration = [&] {
+    return grammar_spr_enumeration_counter_snapshot{
+        .upward_path_iterator_steps = stats.upward_path_iterator_steps,
+        .upward_paths_completed = stats.upward_paths_completed,
+        .path_pairs_considered = stats.path_pairs_considered,
+        .candidates_pruned_before_construction =
+            stats.candidates_pruned_before_construction,
+        .candidates_pruned_root_or_trivial =
+            stats.candidates_pruned_root_or_trivial,
+        .candidates_pruned_moved_size = stats.candidates_pruned_moved_size,
+        .candidates_pruned_target_size = stats.candidates_pruned_target_size,
+        .candidates_pruned_overlap = stats.candidates_pruned_overlap,
+        .candidates_pruned_affected_estimate_before =
+            stats.candidates_pruned_affected_estimate -
+            gathered_affected_prunes,
+        .rng = rng,
+    };
+  };
+  auto restore_enumeration =
+      [&](grammar_spr_enumeration_counter_snapshot const& snapshot) {
+        stats.upward_path_iterator_steps =
+            snapshot.upward_path_iterator_steps;
+        stats.upward_paths_completed = snapshot.upward_paths_completed;
+        stats.path_pairs_considered = snapshot.path_pairs_considered;
+        stats.candidates_pruned_before_construction =
+            snapshot.candidates_pruned_before_construction;
+        stats.candidates_pruned_root_or_trivial =
+            snapshot.candidates_pruned_root_or_trivial;
+        stats.candidates_pruned_moved_size =
+            snapshot.candidates_pruned_moved_size;
+        stats.candidates_pruned_target_size =
+            snapshot.candidates_pruned_target_size;
+        stats.candidates_pruned_overlap = snapshot.candidates_pruned_overlap;
+        stats.candidates_pruned_affected_estimate =
+            snapshot.candidates_pruned_affected_estimate_before +
+            gathered_affected_prunes;
+        rng = snapshot.rng;
+      };
+
+  auto gather_candidate =
+      [&](std::optional<grammar_spr_candidate>& candidate) -> bool {
+    if (!candidate) {
+      note_pruned_after(
+          stats,
+          &chart_spr_candidate_generation_stats::candidates_pruned_invalid);
+      return true;
+    }
+    ++stats.candidates_constructed;
+
+    if (options.max_estimated_affected_clades != 0 &&
+        estimate_candidate_affected_clades(*candidate) >
+            options.max_estimated_affected_clades) {
+      note_pruned_after(
+          stats,
+          &chart_spr_candidate_generation_stats::
+              candidates_pruned_affected_estimate);
+      ++gathered_affected_prunes;
+      if (pre_dedup_cap_reached()) {
+        return request_stop(chart_spr_candidate_stop_reason::candidate_cap);
+      }
+      return true;
+    }
+
+    if (!options.include_immediate_reversal_candidates &&
+        !options.immediate_reversal_candidate_key_to_skip.empty() &&
+        chart_spr_candidate_reversal_key(grammar, *candidate) ==
+            options.immediate_reversal_candidate_key_to_skip) {
+      note_pruned_after(
+          stats,
+          &chart_spr_candidate_generation_stats::
+              candidates_pruned_immediate_reversal);
+      if (pre_dedup_cap_reached()) {
+        return request_stop(chart_spr_candidate_stop_reason::candidate_cap);
+      }
+      return true;
+    }
+
+    auto signature =
+        chart_spr_candidate_taxon_signature(grammar, *candidate);
+    if (!seen.insert(std::move(signature)).second) {
+      note_pruned_after(
+          stats,
+          &chart_spr_candidate_generation_stats::candidates_pruned_duplicate);
+      if (pre_dedup_cap_reached()) {
+        return request_stop(chart_spr_candidate_stop_reason::candidate_cap);
+      }
+      return true;
+    }
+
+    ++stats.candidates_generated_after_dedup;
+    if (grammar_spr_candidate_involves_multifurcation(grammar, *candidate)) {
+      ++stats.spr_multifurcation_moves_generated;
+    }
+    if (!invoke_candidate_callback(callback, *candidate)) {
+      return request_stop(chart_spr_candidate_stop_reason::callback_stop);
+    }
+    if (pre_dedup_cap_reached() || post_dedup_cap_reached()) {
+      return request_stop(chart_spr_candidate_stop_reason::candidate_cap);
+    }
+    return true;
+  };
+
+  auto const grammar_wave_size =
+      bounded_grammar_spr_candidate_wave_size(options);
+  std::vector<grammar_spr_parallel_work_item> grammar_work;
+  std::vector<grammar_spr_parallel_output_slot> grammar_output;
+  grammar_spr_enumeration_counter_snapshot grammar_wave_start;
+  auto grammar_committed_enumeration = capture_enumeration();
+  std::size_t next_grammar_ordinal = 0;
+  if (grammar_wave_size != 0) {
+    if (options.before_grammar_candidate_workspace_allocation_for_tests) {
+      options.before_grammar_candidate_workspace_allocation_for_tests();
+    }
+    grammar_work.reserve(grammar_wave_size);
+    grammar_output.resize(grammar_wave_size);
+    stats.grammar_candidate_admitted_wave_width = grammar_wave_size;
+    bool safely_bounded = true;
+    auto const actual = grammar_spr_parallel_wave_actual_bytes(
+        grammar_work, grammar_output,
+        options.grammar_candidate_wave_actual_capacity_extra_bytes_for_tests,
+        safely_bounded);
+    stats.grammar_candidate_actual_peak_bytes = actual;
+    if (options.grammar_candidate_admitted_wave_bytes != 0 &&
+        (!safely_bounded ||
+         actual > options.grammar_candidate_admitted_wave_bytes)) {
+      throw sampled_tree_projection_budget_error{
+          actual, options.grammar_candidate_admitted_wave_bytes};
+    }
+    if (options.force_grammar_candidate_submit_failure_after_for_tests) {
+      chart_scheduler_test_detail::access::fail_submission_after(
+          *options.sampled_tree_projection_scheduler,
+          *options.force_grammar_candidate_submit_failure_after_for_tests);
+    }
+  }
+
+  auto clear_grammar_wave = [&] {
+    for (auto& slot : grammar_output) {
+      slot.candidate.reset();
+      slot.failure = nullptr;
+      slot.completed = false;
+    }
+    grammar_work.clear();
+  };
+  auto cancel_requested = [&] {
+    return options.sampled_tree_projection_cancel_requested != nullptr &&
+           options.sampled_tree_projection_cancel_requested->load(
+               std::memory_order_acquire);
+  };
+  auto drain_grammar_wave = [&]() -> bool {
+    if (grammar_work.empty()) return !stopped();
+    auto const count = grammar_work.size();
+    auto discard_complete_wave =
+        [&](grammar_spr_enumeration_counter_snapshot const& boundary) {
+      restore_enumeration(boundary);
+      stats.grammar_candidate_speculative_discarded += count;
+      clear_grammar_wave();
+    };
+    if (cancel_requested()) {
+      discard_complete_wave(grammar_committed_enumeration);
+      ++stats.grammar_candidate_cancellations;
+      return request_stop(chart_spr_candidate_stop_reason::callback_stop);
+    }
+
+    bool pre_submit_safely_bounded = true;
+    auto const pre_submit_actual = grammar_spr_parallel_wave_actual_bytes(
+        grammar_work, grammar_output,
+        options.grammar_candidate_wave_actual_capacity_extra_bytes_for_tests,
+        pre_submit_safely_bounded);
+    stats.grammar_candidate_actual_peak_bytes =
+        std::max(stats.grammar_candidate_actual_peak_bytes, pre_submit_actual);
+    if (options.grammar_candidate_admitted_wave_bytes != 0 &&
+        (!pre_submit_safely_bounded ||
+         pre_submit_actual > options.grammar_candidate_admitted_wave_bytes)) {
+      restore_enumeration(grammar_wave_start);
+      clear_grammar_wave();
+      throw sampled_tree_projection_budget_error{
+          pre_submit_actual, options.grammar_candidate_admitted_wave_bytes};
+    }
+
+    for (std::size_t local = 0; local < count; ++local) {
+      grammar_output[local].candidate.reset();
+      grammar_output[local].failure = nullptr;
+      grammar_output[local].completed = false;
+    }
+    std::unique_lock<std::mutex> scheduler_handoff;
+    if (options.sampled_tree_projection_scheduler_handoff_mutex != nullptr) {
+      auto const wait_start = std::chrono::steady_clock::now();
+      scheduler_handoff = std::unique_lock<std::mutex>{
+          *options.sampled_tree_projection_scheduler_handoff_mutex};
+      stats.grammar_candidate_scheduler_handoff_stall_nanoseconds +=
+          static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - wait_start)
+                  .count());
+    }
+    if (cancel_requested()) {
+      if (scheduler_handoff.owns_lock()) scheduler_handoff.unlock();
+      discard_complete_wave(grammar_committed_enumeration);
+      ++stats.grammar_candidate_cancellations;
+      return request_stop(chart_spr_candidate_stop_reason::callback_stop);
+    }
+
+    chart_scheduler_run_summary failed_summary;
+    chart_scheduler_run_summary summary;
+    try {
+      summary =
+          options.sampled_tree_projection_scheduler->for_each_indexed_range(
+              count,
+              {.minimum_grain = 1, .target_ranges_per_worker = 1},
+              [&](chart_indexed_range const& range, std::size_t,
+                  chart_scheduler_cancellation_token const& cancellation) {
+                for (auto local = range.begin; local < range.end; ++local) {
+                  if ((local != range.begin && cancellation.stop_requested()) ||
+                      cancel_requested()) {
+                    break;
+                  }
+                  auto& output = grammar_output[local];
+                  try {
+                    if (options
+                            .before_grammar_candidate_construction_for_tests) {
+                      options.before_grammar_candidate_construction_for_tests(
+                          grammar_work[local].ordinal);
+                    }
+                    auto const& item = grammar_work[local];
+                    output.candidate = make_general_spr_candidate(
+                        grammar, base_lookup, item.source_pid, item.moved,
+                        item.target, item.source_path, item.dest_path);
+                  } catch (...) {
+                    output.failure = std::current_exception();
+                  }
+                  output.completed = true;
+                }
+              },
+              &failed_summary);
+    } catch (...) {
+      if (options.sampled_tree_projection_scheduler_diagnostics_sink !=
+          nullptr) {
+        options.sampled_tree_projection_scheduler_diagnostics_sink->record(
+            failed_summary);
+      }
+      restore_enumeration(grammar_wave_start);
+      clear_grammar_wave();
+      throw;
+    }
+    if (scheduler_handoff.owns_lock()) scheduler_handoff.unlock();
+    if (options.sampled_tree_projection_scheduler_diagnostics_sink != nullptr) {
+      options.sampled_tree_projection_scheduler_diagnostics_sink->record(
+          summary);
+    }
+    ++stats.grammar_candidate_construction_waves;
+    ++stats.grammar_candidate_scheduler_operations;
+    stats.grammar_candidate_parallel_operations +=
+        summary.parallel_branch_entered ? 1 : 0;
+    stats.grammar_candidate_ranges += summary.range_count;
+    stats.grammar_candidate_worker_tasks += summary.worker_tasks_submitted;
+    stats.grammar_candidate_active_worker_high_water =
+        std::max(stats.grammar_candidate_active_worker_high_water,
+                 summary.active_workers);
+    stats.grammar_candidate_peak_wave_size =
+        std::max(stats.grammar_candidate_peak_wave_size, count);
+
+    bool post_submit_safely_bounded = true;
+    auto const post_submit_actual = grammar_spr_parallel_wave_actual_bytes(
+        grammar_work, grammar_output,
+        options.grammar_candidate_wave_actual_capacity_extra_bytes_for_tests,
+        post_submit_safely_bounded);
+    stats.grammar_candidate_actual_peak_bytes =
+        std::max(stats.grammar_candidate_actual_peak_bytes, post_submit_actual);
+    if (options.grammar_candidate_admitted_wave_bytes != 0 &&
+        (!post_submit_safely_bounded ||
+         post_submit_actual > options.grammar_candidate_admitted_wave_bytes)) {
+      restore_enumeration(grammar_wave_start);
+      clear_grammar_wave();
+      throw sampled_tree_projection_budget_error{
+          post_submit_actual, options.grammar_candidate_admitted_wave_bytes};
+    }
+    if (cancel_requested()) {
+      discard_complete_wave(grammar_committed_enumeration);
+      ++stats.grammar_candidate_cancellations;
+      return request_stop(chart_spr_candidate_stop_reason::callback_stop);
+    }
+
+    for (std::size_t local = 0; local < count; ++local) {
+      auto& output = grammar_output[local];
+      auto const& item = grammar_work[local];
+      if (!output.completed) {
+        restore_enumeration(item.enumeration_after);
+        stats.grammar_candidate_speculative_discarded += count - local;
+        clear_grammar_wave();
+        throw std::runtime_error(
+            "chart SPR grammar candidate wave did not complete canonical "
+            "ordinal");
+      }
+      if (output.failure) {
+        auto failure = output.failure;
+        restore_enumeration(item.enumeration_after);
+        stats.grammar_candidate_speculative_discarded += count - local - 1;
+        clear_grammar_wave();
+        std::rethrow_exception(failure);
+      }
+      bool keep_going = false;
+      try {
+        keep_going = gather_candidate(output.candidate);
+      } catch (...) {
+        restore_enumeration(item.enumeration_after);
+        stats.grammar_candidate_speculative_discarded += count - local - 1;
+        clear_grammar_wave();
+        throw;
+      }
+      if (!keep_going) {
+        restore_enumeration(item.enumeration_after);
+        stats.grammar_candidate_speculative_discarded += count - local - 1;
+        clear_grammar_wave();
+        return false;
+      }
+      output.candidate.reset();
+    }
+    grammar_committed_enumeration = capture_enumeration();
+    clear_grammar_wave();
+    return true;
+  };
+
+  auto submit_candidate =
+      [&](production_id source_pid, clade_id moved, clade_id target,
+          upward_path const& source_path, upward_path const& dest_path,
+          grammar_spr_enumeration_counter_snapshot const& enumeration_before,
+          grammar_spr_enumeration_counter_snapshot enumeration_after) -> bool {
+    if (grammar_work.empty()) grammar_wave_start = enumeration_before;
+    grammar_work.push_back(grammar_spr_parallel_work_item{
+        .ordinal = next_grammar_ordinal++,
+        .source_pid = source_pid,
+        .moved = moved,
+        .target = target,
+        .source_path = source_path,
+        .dest_path = dest_path,
+        .enumeration_after = std::move(enumeration_after),
+    });
+    if (grammar_work.size() == grammar_wave_size) {
+      return drain_grammar_wave();
+    }
+    return true;
+  };
+
   for (auto source_pid : source_order) {
     if (stopped()) break;
     if (pre_dedup_cap_reached()) {
@@ -4579,8 +5059,14 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
                     if (options.max_path_pairs_considered != 0 &&
                         stats.path_pairs_considered >=
                             options.max_path_pairs_considered) {
+                      if (!drain_grammar_wave()) return false;
                       return request_stop(
                           chart_spr_candidate_stop_reason::path_budget);
+                    }
+                    std::optional<grammar_spr_enumeration_counter_snapshot>
+                        enumeration_before;
+                    if (grammar_wave_size != 0) {
+                      enumeration_before.emplace(capture_enumeration());
                     }
                     ++stats.path_pairs_considered;
                     auto affected_estimate =
@@ -4595,81 +5081,20 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
                               candidates_pruned_affected_estimate);
                       return true;
                     }
-
-                    auto candidate = make_general_spr_candidate(
-                        grammar, base_lookup, source_pid, moved, target,
-                        source_path, dest_path);
-                    if (!candidate) {
-                      note_pruned_after(
-                          stats,
-                          &chart_spr_candidate_generation_stats::
-                              candidates_pruned_invalid);
-                      return true;
+                    if (grammar_wave_size == 0) {
+                      auto candidate = make_general_spr_candidate(
+                          grammar, base_lookup, source_pid, moved, target,
+                          source_path, dest_path);
+                      return gather_candidate(candidate);
                     }
-                    ++stats.candidates_constructed;
-
-                    if (options.max_estimated_affected_clades != 0 &&
-                        estimate_candidate_affected_clades(*candidate) >
-                            options.max_estimated_affected_clades) {
-                      note_pruned_after(
-                          stats,
-                          &chart_spr_candidate_generation_stats::
-                              candidates_pruned_affected_estimate);
-                      if (pre_dedup_cap_reached()) {
-                        return request_stop(
-                            chart_spr_candidate_stop_reason::candidate_cap);
-                      }
-                      return true;
-                    }
-
-                    if (!options.include_immediate_reversal_candidates &&
-                        !options.immediate_reversal_candidate_key_to_skip
-                             .empty() &&
-                        chart_spr_candidate_reversal_key(grammar, *candidate) ==
-                            options.immediate_reversal_candidate_key_to_skip) {
-                      note_pruned_after(
-                          stats,
-                          &chart_spr_candidate_generation_stats::
-                              candidates_pruned_immediate_reversal);
-                      if (pre_dedup_cap_reached()) {
-                        return request_stop(
-                            chart_spr_candidate_stop_reason::candidate_cap);
-                      }
-                      return true;
-                    }
-
-                    auto signature = chart_spr_candidate_taxon_signature(
-                        grammar, *candidate);
-                    if (!seen.insert(std::move(signature)).second) {
-                      note_pruned_after(
-                          stats,
-                          &chart_spr_candidate_generation_stats::
-                              candidates_pruned_duplicate);
-                      if (pre_dedup_cap_reached()) {
-                        return request_stop(
-                            chart_spr_candidate_stop_reason::candidate_cap);
-                      }
-                      return true;
-                    }
-
-                    ++stats.candidates_generated_after_dedup;
-                    if (grammar_spr_candidate_involves_multifurcation(
-                            grammar, *candidate)) {
-                      ++stats.spr_multifurcation_moves_generated;
-                    }
-                    if (!invoke_candidate_callback(callback, *candidate)) {
-                      return request_stop(
-                          chart_spr_candidate_stop_reason::callback_stop);
-                    }
-                    if (pre_dedup_cap_reached() || post_dedup_cap_reached()) {
-                      return request_stop(
-                          chart_spr_candidate_stop_reason::candidate_cap);
-                    }
-                    return true;
+                    return submit_candidate(
+                        source_pid, moved, target, source_path, dest_path,
+                        *enumeration_before, capture_enumeration());
                   },
                   dest_control, &rng);
 
               if (dest_control.budget_exhausted) {
+                if (!drain_grammar_wave()) return false;
                 return request_stop(
                     chart_spr_candidate_stop_reason::path_budget);
               }
@@ -4678,11 +5103,14 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
             source_control, &rng);
 
         if (source_control.budget_exhausted) {
+          if (!drain_grammar_wave()) break;
           request_stop(chart_spr_candidate_stop_reason::path_budget);
         }
       }
     }
   }
+
+  if (!stopped()) (void)drain_grammar_wave();
 
   return stats;
 }
@@ -6619,6 +7047,32 @@ inline void add_generation_count_stats(
   dst.sampled_tree_source_actual_peak_bytes =
       std::max(dst.sampled_tree_source_actual_peak_bytes,
                src.sampled_tree_source_actual_peak_bytes);
+  dst.grammar_candidate_construction_waves +=
+      src.grammar_candidate_construction_waves;
+  dst.grammar_candidate_scheduler_operations +=
+      src.grammar_candidate_scheduler_operations;
+  dst.grammar_candidate_parallel_operations +=
+      src.grammar_candidate_parallel_operations;
+  dst.grammar_candidate_ranges += src.grammar_candidate_ranges;
+  dst.grammar_candidate_worker_tasks += src.grammar_candidate_worker_tasks;
+  dst.grammar_candidate_active_worker_high_water = std::max(
+      dst.grammar_candidate_active_worker_high_water,
+      src.grammar_candidate_active_worker_high_water);
+  dst.grammar_candidate_peak_wave_size =
+      std::max(dst.grammar_candidate_peak_wave_size,
+               src.grammar_candidate_peak_wave_size);
+  dst.grammar_candidate_speculative_discarded +=
+      src.grammar_candidate_speculative_discarded;
+  dst.grammar_candidate_admitted_wave_width =
+      std::max(dst.grammar_candidate_admitted_wave_width,
+               src.grammar_candidate_admitted_wave_width);
+  dst.grammar_candidate_actual_peak_bytes =
+      std::max(dst.grammar_candidate_actual_peak_bytes,
+               src.grammar_candidate_actual_peak_bytes);
+  dst.grammar_candidate_scheduler_handoff_stall_nanoseconds +=
+      src.grammar_candidate_scheduler_handoff_stall_nanoseconds;
+  dst.grammar_candidate_cancellations +=
+      src.grammar_candidate_cancellations;
 }
 
 }  // namespace chart_spr_detail

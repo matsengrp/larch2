@@ -3880,6 +3880,31 @@ static void print_chart_spr_generation_stats(
       << stats.sampled_tree_projection_admitted_subwave_width << "\n";
   out << indent << "sampled_tree_source_actual_peak_bytes: "
       << stats.sampled_tree_source_actual_peak_bytes << "\n";
+  out << indent << "grammar_candidate_construction_waves: "
+      << stats.grammar_candidate_construction_waves << "\n";
+  out << indent << "grammar_candidate_scheduler_operations: "
+      << stats.grammar_candidate_scheduler_operations << "\n";
+  out << indent << "grammar_candidate_parallel_operations: "
+      << stats.grammar_candidate_parallel_operations << "\n";
+  out << indent << "grammar_candidate_ranges: "
+      << stats.grammar_candidate_ranges << "\n";
+  out << indent << "grammar_candidate_worker_tasks: "
+      << stats.grammar_candidate_worker_tasks << "\n";
+  out << indent << "grammar_candidate_active_worker_high_water: "
+      << stats.grammar_candidate_active_worker_high_water << "\n";
+  out << indent << "grammar_candidate_peak_wave_size: "
+      << stats.grammar_candidate_peak_wave_size << "\n";
+  out << indent << "grammar_candidate_speculative_discarded: "
+      << stats.grammar_candidate_speculative_discarded << "\n";
+  out << indent << "grammar_candidate_admitted_wave_width: "
+      << stats.grammar_candidate_admitted_wave_width << "\n";
+  out << indent << "grammar_candidate_actual_peak_bytes: "
+      << stats.grammar_candidate_actual_peak_bytes << "\n";
+  out << indent
+      << "grammar_candidate_scheduler_handoff_stall_nanoseconds: "
+      << stats.grammar_candidate_scheduler_handoff_stall_nanoseconds << "\n";
+  out << indent << "grammar_candidate_cancellations: "
+      << stats.grammar_candidate_cancellations << "\n";
   out << indent << "candidate_pipeline_batches_generated: "
       << stats.candidate_pipeline_batches_generated << "\n";
   out << indent << "candidate_pipeline_batches_scored: "
