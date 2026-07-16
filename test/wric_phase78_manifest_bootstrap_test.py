@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
 import sys
@@ -447,6 +448,36 @@ def main() -> None:
         assert stat.S_IMODE(external.stat().st_mode) == 0o400
         external.chmod(0o600)
 
+        hardlink_root = Path(temporary) / "capture-cleanup-hardlink"
+        hardlink_root.mkdir()
+        hardlink_target = Path(temporary) / "external-hardlink.txt"
+        hardlink_target.write_text("must remain multiply linked\n")
+        os.link(hardlink_target, hardlink_root / "foreign-hardlink")
+        try:
+            bootstrap.remove_staging(hardlink_root)
+        except bootstrap.Phase78Error as error:
+            assert "externally hard-linked" in str(error)
+        else:
+            raise AssertionError("capture cleanup removed a hard-linked staging file")
+        assert hardlink_root.is_dir()
+        assert hardlink_target.stat().st_nlink == 2
+        (hardlink_root / "foreign-hardlink").unlink()
+        bootstrap.remove_staging(hardlink_root)
+
+        special_root = Path(temporary) / "capture-cleanup-special"
+        special_root.mkdir()
+        fifo = special_root / "foreign-fifo"
+        os.mkfifo(fifo)
+        try:
+            bootstrap.remove_staging(special_root)
+        except bootstrap.Phase78Error as error:
+            assert "special file" in str(error)
+        else:
+            raise AssertionError("capture cleanup removed a special staging node")
+        assert stat.S_ISFIFO(fifo.lstat().st_mode)
+        fifo.unlink()
+        bootstrap.remove_staging(special_root)
+
         race_root = Path(temporary) / "capture-publish-race"
         staging = race_root / ".row.staging"
         destination = race_root / "row"
@@ -471,6 +502,62 @@ def main() -> None:
         assert staging.is_dir() and marker.read_text() == "owned staged evidence\n"
         staging.chmod(0o755)
         marker.chmod(0o644)
+
+        contract_root = Path(temporary) / "capture-contract-race"
+        contract_root.mkdir()
+        contract = contract_root / "capture-contract.json"
+        required_contract = b"owned deterministic contract\n"
+        foreign_contract = b"foreign contract must survive\n"
+
+        def inject_foreign_contract() -> None:
+            bootstrap.core.copy_bytes(contract, foreign_contract, 0o444)
+
+        try:
+            bootstrap.ensure_exact_capture_file(
+                contract,
+                required_contract,
+                "focused capture contract",
+                before_publish=inject_foreign_contract,
+            )
+        except bootstrap.core.BootstrapError as error:
+            assert "already exists" in str(error)
+        else:
+            raise AssertionError("capture contract publication replaced a foreign file")
+        assert contract.read_bytes() == foreign_contract
+        contract_staging = contract_root / ".capture-contract.json.staging"
+        assert contract_staging.read_bytes() == required_contract
+        contract.unlink()
+        bootstrap.ensure_exact_capture_file(
+            contract, required_contract, "focused capture contract"
+        )
+        assert contract.read_bytes() == required_contract
+        assert not os.path.lexists(contract_staging)
+
+        sentinel_error = (
+            "error: manifest group has no rows: "
+            + bootstrap.HARNESS_SENTINEL_GROUP
+            + "\n"
+        )
+        for result in (
+            subprocess.CompletedProcess(
+                args=["synthetic-harness"],
+                returncode=-signal.SIGSEGV,
+                stdout="",
+                stderr=sentinel_error,
+            ),
+            subprocess.CompletedProcess(
+                args=["synthetic-harness"],
+                returncode=1,
+                stdout="",
+                stderr=sentinel_error + "unexpected later failure\n",
+            ),
+        ):
+            try:
+                bootstrap.validate_harness_sentinel_result(result)
+            except bootstrap.Phase78Error as error:
+                assert "exact post-validation" in str(error)
+            else:
+                raise AssertionError("non-exact harness sentinel result was accepted")
 
         case = phase9_test.Integration(Path(temporary))
         replace_oracle(case)
@@ -576,6 +663,45 @@ def main() -> None:
                     bootstrap.json_bytes(unknown_compact)
                 )
                 reject_canonical_mutation("unknown kind")
+
+                ordered_records = bootstrap.sidecar_records(
+                    source_row / "canonical.ndjson"
+                )
+                candidate_positions = [
+                    index
+                    for index, record in enumerate(ordered_records)
+                    if record.get("record") == "candidate"
+                ]
+                assert len(candidate_positions) >= 2
+                first, second = candidate_positions[:2]
+                ordered_records[first], ordered_records[second] = (
+                    ordered_records[second],
+                    ordered_records[first],
+                )
+                final_state = next(
+                    record
+                    for record in ordered_records
+                    if record.get("record") == "final_state"
+                )
+                stream_expected = {
+                    "expected_candidates_generated": "256",
+                    "expected_candidates_scored": "256",
+                    "expected_exact_verifications": "1",
+                    "expected_stop_reason": "candidate_cap",
+                    "expected_final_score": str(final_state["final_score"]),
+                    "expected_accepted_moves": "0",
+                }
+                try:
+                    bootstrap.validate_profile_canonical_stream(
+                        bootstrap.PROFILES["phase8"],
+                        ordered_records,
+                        stream_expected,
+                        "focused canonical ordering mutation",
+                    )
+                except bootstrap.Phase78Error as error:
+                    assert "candidate stream indexes" in str(error)
+                else:
+                    raise AssertionError("canonical candidate reordering was accepted")
 
                 commands = assets / "commands.sh"
                 assert "\n+  " not in commands.read_text()

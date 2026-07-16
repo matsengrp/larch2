@@ -1116,10 +1116,10 @@ def initialize_capture(
     contract = capture_contract_bytes(
         profile, base, process_metrics_sha256, affinity
     )
-    core.ensure_exact_file(
+    ensure_exact_capture_file(
         capture / "capture-contract.json", contract, "Phase-7/8 capture contract"
     )
-    core.ensure_exact_file(
+    ensure_exact_capture_file(
         capture / "capture-contract.json.sha256",
         core.seal_bytes("capture-contract.json", contract),
         "Phase-7/8 capture contract seal",
@@ -1143,10 +1143,65 @@ def initialize_capture(
     return capture
 
 
+def ensure_exact_capture_file(
+    path: Path,
+    data: bytes,
+    label: str,
+    *,
+    before_publish: Callable[[], None] | None = None,
+) -> None:
+    """Install or resume one deterministic capture file without replacement."""
+
+    staging = path.with_name(f".{path.name}.staging")
+    if os.path.lexists(path):
+        core.require_regular(path, label)
+        if path.stat().st_nlink != 1:
+            fail(f"{label} is externally hard-linked: {path}")
+        if path.read_bytes() != data:
+            fail(f"resumed {label} differs from the required bytes: {path}")
+        if os.path.lexists(staging):
+            fail(f"completed {label} has an ambiguous staging peer: {staging}")
+        return
+
+    if os.path.lexists(staging):
+        core.require_regular(staging, f"interrupted {label} staging file")
+        if staging.stat().st_nlink != 1:
+            fail(f"interrupted {label} staging file is externally hard-linked: {staging}")
+        if staging.read_bytes() != data:
+            fail(f"interrupted {label} staging file differs from required bytes: {staging}")
+        core.fsync_regular_file(staging)
+    else:
+        core.copy_bytes(staging, data, 0o444)
+    core.fsync_directory(path.parent)
+    if before_publish is not None:
+        before_publish()
+    core.rename_noreplace(staging, path)
+    core.fsync_directory(path.parent)
+
+
 def remove_staging(path: Path) -> None:
     if not os.path.lexists(path):
         return
     root = core.require_lexical_directory(path, "incomplete Phase-7/8 capture staging")
+    # Preflight the complete closure before changing modes or unlinking anything.
+    # Symlinks are safe to unlink as aliases, but hard-linked regular files and
+    # special nodes make ownership ambiguous and must remain untouched.
+    for directory_text, directories, files in os.walk(root, followlinks=False):
+        directory = Path(directory_text)
+        for name in directories:
+            child = directory / name
+            info = child.lstat()
+            if not stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                fail(f"capture staging contains a non-directory alias: {child}")
+        for name in files:
+            child = directory / name
+            info = child.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                fail(f"capture staging contains a special file: {child}")
+            if info.st_nlink != 1:
+                fail(f"capture staging contains an externally hard-linked file: {child}")
     for directory_text, directories, _files in os.walk(
         root, topdown=False, followlinks=False
     ):
@@ -1900,6 +1955,25 @@ def audit_supplement(
     )
 
 
+def validate_harness_sentinel_result(
+    result: subprocess.CompletedProcess[str],
+) -> None:
+    """Require the one ordinary failure that proves full manifest validation."""
+
+    expected = f"error: manifest group has no rows: {HARNESS_SENTINEL_GROUP}"
+    if (
+        result.returncode != 1
+        or result.stdout != ""
+        or result.stderr != expected + "\n"
+    ):
+        detail = (result.stdout + result.stderr).strip().splitlines()
+        fail(
+            "benchmark harness did not produce the exact post-validation "
+            "exit-1/empty-stdout/lone-stderr sentinel: "
+            + (detail[-1] if detail else f"exit={result.returncode}")
+        )
+
+
 def validate_with_harness(
     audit: AuditedBundle,
     harness_path: Path,
@@ -1970,18 +2044,7 @@ def validate_with_harness(
     )
     if os.path.lexists(sentinel):
         fail("benchmark harness created output before reaching the sentinel")
-    expected = f"error: manifest group has no rows: {HARNESS_SENTINEL_GROUP}"
-    if (
-        result.returncode != 1
-        or result.stdout != ""
-        or result.stderr != expected + "\n"
-    ):
-        detail = (result.stdout + result.stderr).strip().splitlines()
-        fail(
-            "benchmark harness did not produce the exact post-validation "
-            "exit-1/empty-stdout/lone-stderr sentinel: "
-            + (detail[-1] if detail else f"exit={result.returncode}")
-        )
+    validate_harness_sentinel_result(result)
 
 
 def validate_build_inputs(
