@@ -10388,20 +10388,24 @@ static void test_phase9_multi_iteration_local_updates_match_output_dag() {
   // the first improving move and then stops at a tombstone-scope skip; the
   // multi-accept path itself is exercised on the larger data/test_5_trees
   // fixture in the Phase 4 tests below.
-  CHECK(search.counters.accepted_moves >= 1);
+  CHECK(search.counters.accepted_moves == 1);
   CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
   CHECK(search.summary.final_compaction_rebuilds == 1);
   CHECK(search.summary.final_compaction_exactness_kind ==
         larch::multisite_keep_mask_kind::exact_optimal_production_union);
-  // The skip (if the search stopped before max_iterations) must be labelled
-  // and counted, never silent.
-  if (search.counters.accepted_moves < options.max_iterations) {
-    CHECK(search.counters.local_commit_tombstone_scope_skips >= 1);
-    CHECK(!search.iterations.back().no_accept_reason.empty());
-    CHECK(search.iterations.back()
-              .no_accept_reason.find("tombstone-scope") !=
-          std::string::npos);
-  }
+  // This fixture deterministically reaches the skip after its first commit;
+  // keep the regression non-vacuous and require the aborted transaction to
+  // publish no per-accept commit evidence.
+  CHECK(search.counters.local_commit_tombstone_scope_skips == 1);
+  CHECK(search.iterations.size() == 2);
+  auto const& skipped = search.iterations.back();
+  CHECK(skipped.accepted.has_value());
+  CHECK(!skipped.accepted_move_committed);
+  CHECK(skipped.post_materialization_rejected);
+  CHECK(skipped.no_accept_reason.find("tombstone-scope") != std::string::npos);
+  CHECK(skipped.accepted_inside_rows_recomputed == 0);
+  CHECK(skipped.accepted_outside_rows_recomputed == 0);
+  CHECK(skipped.accepted_candidate_signature.empty());
   auto rebuilt = larch::build_clade_grammar(search.dag);
   auto rebuilt_state = larch::build_chart_spr_search_state(
       search.dag, rebuilt, options);
@@ -10514,6 +10518,7 @@ static void test_phase5_post_materialization_worsening_rejects_commit() {
       larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
   options.top_k_exact_verify = 8;
   options.max_iterations = 1;
+  options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
   options.override_post_materialization_rebuilt_score_for_tests =
       std::numeric_limits<std::uint64_t>::max();
 
@@ -10527,6 +10532,9 @@ static void test_phase5_post_materialization_worsening_rejects_commit() {
   CHECK(iteration.post_materialization_rejected);
   CHECK(iteration.post_materialization_rebuilt_score ==
         std::numeric_limits<std::uint64_t>::max());
+  CHECK(iteration.accepted_inside_rows_recomputed == 0);
+  CHECK(iteration.accepted_outside_rows_recomputed == 0);
+  CHECK(iteration.accepted_candidate_signature.empty());
   CHECK(search.counters.candidate_accepts_attempted == 1);
   CHECK(search.counters.accepted_moves == 0);
   CHECK(search.counters.post_materialization_rejections == 1);
@@ -10540,6 +10548,69 @@ static void test_phase5_post_materialization_worsening_rejects_commit() {
   CHECK(search.summary.final_score == search.summary.initial_score);
   CHECK(larch::node_count(search.dag) == initial_nodes);
   CHECK(larch::edge_count(search.dag) == initial_edges);
+  CHECK(search.canonical_report.has_value());
+  CHECK(search.canonical_report->iterations.size() == 1);
+  auto const& canonical_iteration = search.canonical_report->iterations.front();
+  CHECK(canonical_iteration.accepted_move_present);
+  CHECK(!canonical_iteration.accepted_move_committed);
+  CHECK(canonical_iteration.selected_stream_index.has_value());
+  CHECK(!canonical_iteration.selected_signature.empty());
+
+  std::println("  PASS");
+}
+
+static void test_phase9_local_objective_worsening_rejects_commit_evidence() {
+  std::println(
+      "test_phase9_local_objective_worsening_rejects_commit_evidence");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "A", four_taxon_misplaced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto initial_nodes = larch::node_count(dag);
+  auto initial_edges = larch::edge_count(dag);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 8;
+  options.max_iterations = 1;
+  options.rebuild_after_accept = false;
+  options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
+  options.override_post_materialization_rebuilt_score_for_tests =
+      std::numeric_limits<std::uint64_t>::max();
+
+  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+
+  CHECK(search.iterations.size() == 1);
+  auto const& iteration = search.iterations.front();
+  CHECK(iteration.accepted.has_value());
+  CHECK(!iteration.accepted_move_committed);
+  CHECK(iteration.post_materialization_rejected);
+  CHECK(iteration.no_accept_reason.find("local commit objective worsened") !=
+        std::string::npos);
+  CHECK(iteration.accepted_inside_rows_recomputed == 0);
+  CHECK(iteration.accepted_outside_rows_recomputed == 0);
+  CHECK(iteration.accepted_candidate_signature.empty());
+  CHECK(search.counters.candidate_accepts_attempted == 1);
+  CHECK(search.counters.accepted_moves == 0);
+  CHECK(search.counters.local_commit_accepted_moves == 0);
+  CHECK(search.counters.post_materialization_rejections == 1);
+  CHECK(search.counters.inside_rows_recomputed_on_commit == 0);
+  CHECK(search.counters.outside_rows_recomputed_on_commit == 0);
+  CHECK(search.counters.sidecar_rebuilds_after_accept == 0);
+  CHECK(search.counters.overlay_materializations_for_accept_materialization ==
+        0);
+  CHECK(search.summary.final_score == search.summary.initial_score);
+  CHECK(larch::node_count(search.dag) == initial_nodes);
+  CHECK(larch::edge_count(search.dag) == initial_edges);
+  CHECK(search.canonical_report.has_value());
+  CHECK(search.canonical_report->iterations.size() == 1);
+  auto const& canonical_iteration = search.canonical_report->iterations.front();
+  CHECK(canonical_iteration.accepted_move_present);
+  CHECK(!canonical_iteration.accepted_move_committed);
+  CHECK(canonical_iteration.selected_stream_index.has_value());
+  CHECK(!canonical_iteration.selected_signature.empty());
 
   std::println("  PASS");
 }
@@ -12728,29 +12799,70 @@ static void test_phase9_transient_oracle_both_charts_green() {
 static void test_phase9_transient_oracle_green_on_multiparent_dag() {
   std::println("test_phase9_transient_oracle_green_on_multiparent_dag");
 
-  std::vector<larch::phylo_dag> trees;
-  trees.push_back(larch::test::make_tiny_labelled_tree(
-      "A", five_taxon_multiparent_tree_one()));
-  trees.push_back(larch::test::make_tiny_labelled_tree(
-      "A", five_taxon_multiparent_tree_two()));
-  auto dag = larch::test::merge_tiny_trees(std::move(trees));
-  auto grammar = larch::build_clade_grammar(dag);
+  auto run_once = [](std::size_t workers) {
+    std::vector<larch::phylo_dag> trees;
+    trees.push_back(larch::test::make_tiny_labelled_tree(
+        "A", five_taxon_multiparent_tree_one()));
+    trees.push_back(larch::test::make_tiny_labelled_tree(
+        "A", five_taxon_multiparent_tree_two()));
+    auto dag = larch::test::merge_tiny_trees(std::move(trees));
+    auto grammar = larch::build_clade_grammar(dag);
 
-  larch::chart_spr_search_options options;
-  options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
-  options.candidate_selection =
-      larch::chart_spr_candidate_selection_mode::exhaustive_exact;
-  options.max_iterations = 1;
-  options.rebuild_after_accept = false;
-  options.verify_transient_chain_extension_oracle_for_tests = true;
+    // Non-vacuous structural witness: the shared AB clade occurs below at
+    // least two distinct parents in the merged DAG.
+    auto ab = clade_for(grammar, {"A", "B"});
+    CHECK(grammar.productions_by_child[ab].size() >= 2);
 
-  auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
+    larch::chart_spr_search_options options;
+    options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
+    options.candidate_selection =
+        larch::chart_spr_candidate_selection_mode::exhaustive_exact;
+    options.max_iterations = 1;
+    options.rebuild_after_accept = false;
+    options.worker_count = workers;
+    options.local_score_worker_count = workers;
+    options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
+    options.verify_transient_chain_extension_oracle_for_tests = true;
 
-  CHECK(search.counters.transient_chain_extensions_for_verification > 0);
-  CHECK(search.counters.transient_chain_diagnostic_cache_extensions ==
-        search.counters.transient_chain_extensions_for_verification);
-  CHECK(search.counters.transient_chain_extension_oracle_mismatches == 0);
-  CHECK(search.counters.transient_chain_extension_fallbacks == 0);
+    return larch::run_chart_spr_search(std::move(dag), grammar, options);
+  };
+
+  auto check_run = [](larch::chart_spr_search_result const& search,
+                      std::size_t workers) {
+    CHECK(search.summary.requested_worker_count == workers);
+    CHECK(search.summary.resolved_worker_count == workers);
+    CHECK(search.summary.local_score_worker_count == workers);
+    CHECK(search.counters.exact_verifications > 0);
+    CHECK(!search.iterations.empty());
+    CHECK(search.iterations.front().candidates_exact_verified > 0);
+    CHECK(search.counters.transient_chain_extensions_for_verification > 0);
+    CHECK(search.counters.transient_chain_diagnostic_cache_extensions ==
+          search.counters.transient_chain_extensions_for_verification);
+    CHECK(search.counters.transient_chain_extension_oracle_rows_checked_for_tests >
+          0);
+    CHECK(search.counters.transient_chain_extension_oracle_mismatches == 0);
+    CHECK(search.counters.transient_chain_extension_fallbacks == 0);
+    CHECK(search.counters.overlay_materializations_for_oracle >=
+          search.counters.transient_chain_extensions_for_verification);
+    CHECK(search.canonical_report.has_value());
+    CHECK(search.canonical_digest.has_value());
+    CHECK(!search.canonical_digest->full_sidecar.empty());
+  };
+
+  auto serial = run_once(1);
+  auto parallel = run_once(8);
+  check_run(serial, 1);
+  check_run(parallel, 8);
+
+  CHECK(serial.summary.initial_score == parallel.summary.initial_score);
+  CHECK(serial.summary.final_score == parallel.summary.final_score);
+  CHECK(serial.counters.accepted_moves == parallel.counters.accepted_moves);
+  CHECK(serial.iterations.size() == parallel.iterations.size());
+  CHECK(larch::emit_chart_spr_semantic_digest_json(*serial.canonical_digest) ==
+        larch::emit_chart_spr_semantic_digest_json(
+            *parallel.canonical_digest));
+  CHECK(serial.canonical_digest->full_sidecar ==
+        parallel.canonical_digest->full_sidecar);
 
   std::println("  PASS");
 }
@@ -12829,23 +12941,35 @@ static void test_phase9_transient_tombstone_scope_falls_back_to_cold() {
   options.top_k_exact_verify = 32;
   options.max_iterations = 3;
   options.rebuild_after_accept = false;
+  options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
 
   auto search = larch::run_chart_spr_search(std::move(dag), grammar, options);
 
-  // At least one improving move is committed (the transient path serves
-  // committable candidates).
-  CHECK(search.counters.accepted_moves >= 1);
+  // Exactly one improving move is committed before the deterministic
+  // tombstone-scope abort.
+  CHECK(search.counters.accepted_moves == 1);
   // After the first accept, a sequential SPR whose tombstones do not resolve
   // to frozen-base productions falls back to the cold path for verification
   // and then reaches the commit-time tombstone-scope skip.  On this small
   // single-topology fixture the search commits one move and stops at the
   // labelled skip.
-  if (search.counters.accepted_moves < options.max_iterations) {
-    CHECK(search.counters.local_commit_tombstone_scope_skips >= 1);
-    CHECK(!search.iterations.back().no_accept_reason.empty());
-    CHECK(search.iterations.back().no_accept_reason.find("tombstone-scope") !=
-          std::string::npos);
-  }
+  CHECK(search.counters.local_commit_tombstone_scope_skips == 1);
+  CHECK(search.iterations.size() == 2);
+  auto const& skipped = search.iterations.back();
+  CHECK(skipped.accepted.has_value());
+  CHECK(!skipped.accepted_move_committed);
+  CHECK(skipped.post_materialization_rejected);
+  CHECK(skipped.no_accept_reason.find("tombstone-scope") != std::string::npos);
+  CHECK(skipped.accepted_inside_rows_recomputed == 0);
+  CHECK(skipped.accepted_outside_rows_recomputed == 0);
+  CHECK(skipped.accepted_candidate_signature.empty());
+  CHECK(search.canonical_report.has_value());
+  CHECK(search.canonical_report->iterations.size() == search.iterations.size());
+  auto const& canonical_skipped = search.canonical_report->iterations.back();
+  CHECK(canonical_skipped.accepted_move_present);
+  CHECK(!canonical_skipped.accepted_move_committed);
+  CHECK(canonical_skipped.selected_stream_index.has_value());
+  CHECK(!canonical_skipped.selected_signature.empty());
 
   std::println("  PASS");
 }
@@ -12918,6 +13042,7 @@ static void test_phase9_transient_multi_worker_matches_serial() {
     } else {
       CHECK(serial_iteration.accepted_inside_rows_recomputed == 0);
       CHECK(serial_iteration.accepted_outside_rows_recomputed == 0);
+      CHECK(serial_iteration.accepted_candidate_signature.empty());
     }
   }
   CHECK(committed == serial.counters.local_commit_accepted_moves);
@@ -13071,6 +13196,7 @@ int main() {
   test_phase9_multi_iteration_local_updates_match_output_dag();
   test_phase5_rejected_candidates_do_not_rebuild_sidecar();
   test_phase5_post_materialization_worsening_rejects_commit();
+  test_phase9_local_objective_worsening_rejects_commit_evidence();
   test_phase5_fixed_topology_mode_commits_with_rebuilt_certificate_gate();
   test_phase5_pattern_fingerprint_mismatch_rebuilds_patterns();
   test_phase5_seeded_multi_iteration_is_deterministic();

@@ -8299,6 +8299,21 @@ fixed_topology_selected_cache_pattern_scores_for_tests(
   return scores;
 }
 
+namespace {
+
+// These fields describe work performed by a committed accept transaction, not
+// merely the candidate selected by the acceptance gate.  Keep the selected
+// candidate (`accepted` and canonical candidate records) intact for semantic
+// reporting, while making an aborted transaction release all commit evidence.
+void chart_spr_discard_uncommitted_accept_transaction_evidence(
+    chart_spr_iteration_result& iteration) noexcept {
+  iteration.accepted_inside_rows_recomputed = 0;
+  iteration.accepted_outside_rows_recomputed = 0;
+  std::string{}.swap(iteration.accepted_candidate_signature);
+}
+
+}  // namespace
+
 chart_spr_search_result run_chart_spr_search(
     phylo_dag initial_dag, clade_grammar initial_grammar,
     chart_spr_search_options options) {
@@ -8767,6 +8782,7 @@ chart_spr_search_result run_chart_spr_search(
               "rebuilt objective " + std::to_string(rebuilt_score) +
               " exceeds pre-accept objective " +
               std::to_string(iteration.state_score_before);
+          chart_spr_discard_uncommitted_accept_transaction_evidence(iteration);
           result.summary.final_score = iteration.state_score_after;
           result.iterations.push_back(std::move(iteration));
           break;
@@ -8841,6 +8857,7 @@ chart_spr_search_result run_chart_spr_search(
               "locally committed objective " + std::to_string(rebuilt_score) +
               " exceeds chain objective " +
               std::to_string(local_commit_gate_baseline);
+          chart_spr_discard_uncommitted_accept_transaction_evidence(iteration);
           result.summary.final_score = iteration.state_score_after;
           result.iterations.push_back(std::move(iteration));
           break;
@@ -8899,6 +8916,7 @@ chart_spr_search_result run_chart_spr_search(
               "candidate fallback / admitting removed temp productions, is "
               "deferred; direct temp-production removal is Phase 6/7 scope)";
           iteration.post_materialization_rejection_reason = commit.skip_reason;
+          chart_spr_discard_uncommitted_accept_transaction_evidence(iteration);
           result.summary.final_score = iteration.state_score_after;
           result.iterations.push_back(std::move(iteration));
           break;
@@ -9003,6 +9021,7 @@ chart_spr_search_result run_chart_spr_search(
       iteration.no_accept_reason =
           "accepted candidate failed materialization/rebuild";
       iteration.post_materialization_rejection_reason = e.what();
+      chart_spr_discard_uncommitted_accept_transaction_evidence(iteration);
       result.summary.final_score = iteration.state_score_after;
       result.iterations.push_back(std::move(iteration));
       break;
