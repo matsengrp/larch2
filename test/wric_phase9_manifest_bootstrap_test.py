@@ -759,6 +759,16 @@ else:
             for workers in acceptance.MEASURED_WORKERS:
                 frozen = frozen_rows[(seed, workers)]
                 accepted_ms = "180.000" if workers == 1 else "100.000"
+                golden = self.evidence_directory(seed, workers)
+                warmup = acceptance.expected_phase9_warmup_compact_path(
+                    run_root,
+                    {
+                        "fixture": bootstrap.workload_name(seed),
+                        "row_id": bootstrap.row_id(seed, workers),
+                    },
+                    workers,
+                )
+                write_bytes(warmup, (golden / "canonical.json").read_bytes())
                 for trial in range(1, 4):
                     report_relative = (
                         f"logs/{bootstrap.workload_name(seed)}_{bootstrap.METHOD}_"
@@ -848,7 +858,6 @@ else:
                     compact, full, sidecar, dag = acceptance.canonical_paths(
                         raw_path, row, report_path
                     )
-                    golden = self.evidence_directory(seed, workers)
                     write_bytes(compact, (golden / "canonical.json").read_bytes())
                     write_bytes(full, (golden / "canonical.json").read_bytes())
                     write_bytes(sidecar, (golden / "canonical.ndjson").read_bytes())

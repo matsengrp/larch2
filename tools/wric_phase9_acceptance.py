@@ -575,6 +575,37 @@ def sanitize_harness_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", value)
 
 
+def expected_phase9_trial_paths(
+    raw_path: Path, row: Mapping[str, str], trial_index: int, worker: int
+) -> tuple[Path, Path, Path]:
+    """Derive the only report/search/output-digest names admitted for a timed row."""
+
+    root = raw_path.parent.absolute()
+    fixture = sanitize_harness_name(row["fixture"])
+    row_id = sanitize_harness_name(row["row_id"])
+    stem = f"{fixture}_{METHOD}_trial{trial_index}_{row_id}_w{worker}"
+    report = root / "logs" / f"{stem}.out"
+    compact = root / "logs" / f"{stem}.canonical.json"
+    score = (
+        root
+        / "logs"
+        / f"{fixture}_{METHOD}_score_trial{trial_index}_{row_id}_w{worker}.canonical-dag.json"
+    )
+    return report, compact, score
+
+
+def expected_phase9_warmup_compact_path(
+    root: Path, row: Mapping[str, str], worker: int
+) -> Path:
+    fixture = sanitize_harness_name(row["fixture"])
+    row_id = sanitize_harness_name(row["row_id"])
+    return (
+        root.absolute()
+        / "logs"
+        / f"{fixture}_{METHOD}_warmup1_{row_id}_w{worker}.canonical.json"
+    )
+
+
 def canonical_paths(raw_path: Path, row: dict[str, str], report_path: Path) -> tuple[Path, Path, Path, Path]:
     root = raw_path.parent
     fixture = sanitize_harness_name(row["fixture"])
@@ -1494,6 +1525,13 @@ def validate_trial(raw_path: Path, row: dict[str, str], seed: int, worker: int) 
         raise AcceptanceError(f"{label}: trial semantic digest does not bind method/search/output/argv")
 
     report_path = resolve_recorded_path(raw_path, row["report_path"])
+    expected_report_path, expected_compact_path, expected_dag_path = (
+        expected_phase9_trial_paths(raw_path, row, trial_index, worker)
+    )
+    if report_path != expected_report_path:
+        raise AcceptanceError(
+            f"{label}: report_path is not the exact deterministic Phase-9 timed report path"
+        )
     report = parse_report(report_path)
     report_summary = validate_current_counters(report, seed, worker, label)
     if int(report.top["seed"]) != seed:
@@ -1521,6 +1559,14 @@ def validate_trial(raw_path: Path, row: dict[str, str], seed: int, worker: int) 
         )
 
     compact_path, full_path, sidecar_path, dag_path = canonical_paths(raw_path, row, report_path)
+    if compact_path != expected_compact_path:
+        raise AcceptanceError(
+            f"{label}: compact canonical result is not the exact deterministic Phase-9 timed path"
+        )
+    if dag_path != expected_dag_path:
+        raise AcceptanceError(
+            f"{label}: canonical DAG result is not the exact deterministic Phase-9 score path"
+        )
     run_root = raw_path.parent.absolute()
     compact_path = require_run_artifact(compact_path, run_root, f"{label} compact canonical result")
     if compact_path.stat().st_nlink != 1:
@@ -1587,6 +1633,81 @@ def validate_trial(raw_path: Path, row: dict[str, str], seed: int, worker: int) 
 
 def trials_for(trials: Iterable[Trial], seed: int, worker: int) -> list[Trial]:
     return [trial for trial in trials if trial.seed == seed and trial.worker == worker]
+
+
+def validate_phase9_warmup_compacts(
+    root: Path,
+    trials: Sequence[Trial],
+    oracle_digests: Mapping[tuple[int, int], Mapping[str, object]] | None = None,
+) -> tuple[Path, ...]:
+    """Bind all six commanded warmups to their row, full stream, and oracle."""
+
+    expected_keys = {
+        (seed, worker) for seed in SEEDS for worker in MEASURED_WORKERS
+    }
+    if oracle_digests is not None and set(oracle_digests) != expected_keys:
+        raise AcceptanceError(
+            "sealed frozen oracle does not provide the exact Phase-9 warmup matrix"
+        )
+
+    warmup_paths: list[Path] = []
+    measured_paths = [trial.compact_path for trial in trials]
+    for seed, worker in sorted(expected_keys):
+        row_trials = trials_for(trials, seed, worker)
+        if len(row_trials) != 3:
+            raise AcceptanceError(
+                f"seed {seed} W{worker}: cannot bind warmup without exactly three measured trials"
+            )
+        representative = min(row_trials, key=lambda trial: trial.trial_index)
+        label = f"seed {seed} W{worker} warmup1 compact canonical result"
+        path = expected_phase9_warmup_compact_path(
+            root, representative.row, worker
+        )
+        path = require_run_artifact(path, root.absolute(), label)
+        if path.stat().st_nlink != 1:
+            raise AcceptanceError(f"{label} is not singly linked")
+        digest = validate_search_digest(path)
+        if digest != representative.search_digest:
+            raise AcceptanceError(
+                f"{label} differs from the measured row/full canonical search digest"
+            )
+        if (
+            digest["semantic_sha256"]
+            != representative.row["search_semantic_sha256"]
+        ):
+            raise AcceptanceError(f"{label} differs from the raw-row semantic digest")
+        if digest["semantic_sha256"] != representative.full_sidecar_sha256:
+            raise AcceptanceError(f"{label} differs from the full canonical sidecar")
+        if oracle_digests is not None and digest != oracle_digests[(seed, worker)]:
+            raise AcceptanceError(f"{label} differs from the sealed frozen oracle")
+        warmup_paths.append(path)
+
+    combined_paths = [*measured_paths, *warmup_paths]
+    if len(set(combined_paths)) != len(combined_paths):
+        raise AcceptanceError(
+            "a compact canonical result path is reused across Phase-9 warmups/measured trials"
+        )
+    identities = {
+        (path.stat().st_dev, path.stat().st_ino) for path in combined_paths
+    }
+    if len(identities) != len(combined_paths):
+        raise AcceptanceError(
+            "compact canonical results are aliased across Phase-9 warmups/measured trials"
+        )
+    return tuple(warmup_paths)
+
+
+def frozen_oracle_search_digests(
+    audited: object,
+) -> dict[tuple[int, int], dict[str, object]]:
+    evidence = getattr(audited, "evidence")
+    return {
+        (seed, worker): validate_search_digest(
+            evidence[(seed, worker)].canonical_result
+        )
+        for seed in SEEDS
+        for worker in MEASURED_WORKERS
+    }
 
 
 def select_matrix(raw_path: Path, rows: Sequence[dict[str, str]]) -> list[Trial]:
@@ -2418,6 +2539,9 @@ def seal_run(args: argparse.Namespace) -> dict[str, object]:
     _, rows = read_tsv(raw_path)
     trials = select_matrix(raw_path, rows)
     audited, _, _ = audit_sealed_frozen_archive(args, trials)
+    validate_phase9_warmup_compacts(
+        root, trials, frozen_oracle_search_digests(audited)
+    )
     if args.warmups != 1:
         raise AcceptanceError("final Phase-9 run metadata requires exactly one warmup per row")
     if not args.full_canonical:
@@ -2778,6 +2902,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
     run_ledger: dict[str, object] | None = None
     frozen_speed_gate_required = False
     if deferred:
+        validate_phase9_warmup_compacts(benchmark_dir, trials)
         frozen_result: dict[str, object] = {
             "status": "deferred_non_final",
             "reason": args.defer_frozen_oracle_characterization,
@@ -2803,6 +2928,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
     else:
         audited, frozen_rows, frozen_speed_gate_required = (
             audit_sealed_frozen_archive(args, trials)
+        )
+        validate_phase9_warmup_compacts(
+            benchmark_dir, trials, frozen_oracle_search_digests(audited)
         )
         run_metadata, run_ledger = audit_run_archive(
             os.fspath(benchmark_dir),

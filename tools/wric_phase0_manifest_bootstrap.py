@@ -3462,13 +3462,271 @@ def exact_canonical_asset_pair(
     return sidecar, report
 
 
+CHART_SEARCH_DIGEST_FIELDS = frozenset(
+    {
+        "schema",
+        "schema_version",
+        "digest_algorithm",
+        "payload_encoding",
+        "semantic_sha256",
+        "contract_sha256",
+        "candidates_sha256",
+        "exact_sha256",
+        "acceptance_sha256",
+        "chain_sha256",
+        "final_topology_sha256",
+        "record_count",
+        "candidate_count",
+        "exact_candidate_count",
+        "iteration_count",
+    }
+)
+CHART_SEARCH_DIGEST_SHA_FIELDS = (
+    "semantic_sha256",
+    "contract_sha256",
+    "candidates_sha256",
+    "exact_sha256",
+    "acceptance_sha256",
+    "chain_sha256",
+    "final_topology_sha256",
+)
+CHART_SEARCH_DIGEST_COUNT_FIELDS = (
+    "record_count",
+    "candidate_count",
+    "exact_candidate_count",
+    "iteration_count",
+)
+MAX_CHART_SEARCH_DIGEST_BYTES = 64 * 1024
+
+
+def parse_chart_search_digest_bytes(
+    data: bytes, path: Path, label: str
+) -> dict[str, object]:
+    def closed_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                fail(f"{label} has duplicate JSON key {key!r}: {path}")
+            result[key] = value
+        return result
+
+    def reject_nonfinite(value: str) -> object:
+        raise BootstrapError(
+            f"{label} has non-finite JSON constant {value!r}: {path}"
+        )
+
+    try:
+        value = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=closed_object,
+            parse_constant=reject_nonfinite,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"{label} is not strict UTF-8 JSON: {path}: {error}")
+    if not isinstance(value, dict) or set(value) != CHART_SEARCH_DIGEST_FIELDS:
+        fail(f"{label} has an open or incomplete key set: {path}")
+    literals = {
+        "schema": "larch.chart_spr.semantic_digest",
+        "schema_version": 1,
+        "digest_algorithm": "sha256",
+        "payload_encoding": "larch.chart_spr.semantic.ndjson.v1",
+    }
+    for field, expected in literals.items():
+        if value[field] != expected or type(value[field]) is not type(expected):
+            fail(f"{label} schema changed at {field}: {path}")
+    for field in CHART_SEARCH_DIGEST_SHA_FIELDS:
+        digest = value[field]
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            fail(f"{label} has an invalid {field}: {path}")
+    for field in CHART_SEARCH_DIGEST_COUNT_FIELDS:
+        count = value[field]
+        if type(count) is not int or count < 0:
+            fail(f"{label} has an invalid {field}: {path}")
+    if value["record_count"] == 0:
+        fail(f"{label} has an empty canonical record stream: {path}")
+    return {str(field): item for field, item in value.items()}
+
+
+def compact_file_signature(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def compact_directory_identity(info: os.stat_result) -> tuple[int, int, int]:
+    return info.st_dev, info.st_ino, info.st_mode
+
+
+def read_timed_chart_compact(
+    path: Path, stage_dir: Path, label: str
+) -> tuple[dict[str, object], bytes, tuple[int, int]]:
+    """Read an exact stage-local compact through a stable no-follow descriptor."""
+
+    stage = stage_dir.resolve(strict=True)
+    logs = stage / "logs"
+    try:
+        logs_info = logs.lstat()
+        logs_resolved = logs.resolve(strict=True)
+    except OSError as error:
+        fail(f"{label} logs directory is unavailable: {logs}: {error}")
+    if not stat.S_ISDIR(logs_info.st_mode) or logs_resolved != logs:
+        fail(f"{label} logs directory is not a canonical directory: {logs}")
+    if not path.is_absolute() or path.absolute() != path or path.parent != logs:
+        fail(f"{label} is not its exact lexical stage-local file: {path}")
+
+    directory_descriptor = -1
+    descriptor = -1
+    try:
+        directory_descriptor = os.open(
+            logs,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened_logs = os.fstat(directory_descriptor)
+        if compact_directory_identity(opened_logs) != compact_directory_identity(
+            logs_info
+        ):
+            fail(f"{label} logs directory changed while it was opened: {logs}")
+        try:
+            before = os.stat(
+                path.name, dir_fd=directory_descriptor, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            fail(f"{label} is missing: {path}")
+        if not stat.S_ISREG(before.st_mode):
+            fail(f"{label} must be a lexical regular file, not an alias: {path}")
+        if before.st_nlink != 1:
+            fail(f"{label} is not singly linked: {path}")
+        if before.st_size > MAX_CHART_SEARCH_DIGEST_BYTES:
+            fail(
+                f"{label} exceeds {MAX_CHART_SEARCH_DIGEST_BYTES} bytes: {path}"
+            )
+
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        if compact_file_signature(opened) != compact_file_signature(before):
+            fail(f"{label} changed while its descriptor was opened: {path}")
+        chunks: list[bytes] = []
+        byte_count = 0
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            byte_count += len(chunk)
+            if byte_count > MAX_CHART_SEARCH_DIGEST_BYTES:
+                fail(
+                    f"{label} exceeds {MAX_CHART_SEARCH_DIGEST_BYTES} bytes: {path}"
+                )
+            chunks.append(chunk)
+
+        opened_after = os.fstat(descriptor)
+        after = os.stat(
+            path.name, dir_fd=directory_descriptor, follow_symlinks=False
+        )
+        lexical_logs_after = logs.lstat()
+        lexical_logs_resolved = logs.resolve(strict=True)
+        if (
+            compact_directory_identity(opened_logs)
+            != compact_directory_identity(lexical_logs_after)
+            or lexical_logs_resolved != logs
+        ):
+            fail(f"{label} logs directory changed while it was read: {logs}")
+        if (
+            compact_file_signature(opened_after)
+            != compact_file_signature(opened)
+            or compact_file_signature(after) != compact_file_signature(opened)
+        ):
+            fail(f"{label} changed while it was read: {path}")
+        data = b"".join(chunks)
+        if len(data) != opened.st_size:
+            fail(f"{label} byte count changed while it was read: {path}")
+    except OSError as error:
+        fail(f"cannot descriptor-read {label}: {path}: {error}")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
+    mapping = parse_chart_search_digest_bytes(data, path, label)
+    return mapping, data, (opened.st_dev, opened.st_ino)
+
+
+def register_unique_chart_compact(
+    path: Path,
+    identity: tuple[int, int],
+    paths: set[Path],
+    identities: dict[tuple[int, int], Path],
+    label: str,
+) -> None:
+    if path in paths:
+        fail(f"capture stage reuses a chart compact path for {label}: {path}")
+    if identity in identities:
+        fail(
+            f"capture stage aliases chart compacts for {label}: "
+            f"{path} and {identities[identity]}"
+        )
+    paths.add(path)
+    identities[identity] = path
+
+
+def measured_chart_compact_path(row: Mapping[str, str]) -> Path:
+    return Path(row.get("report_path", "")).with_suffix(".canonical.json")
+
+
+def warmup_chart_compact_path(
+    stage_dir: Path,
+    capture: CaptureSpec,
+    key: tuple[str, str],
+    warmup_index: int,
+) -> Path:
+    if warmup_index <= 0:
+        fail("chart compact warmup index must be positive")
+    fixture = re.sub(
+        r"[^A-Za-z0-9_.-]", "_", RAW_FIXTURE_LABELS[capture.fixture]
+    )
+    worker = re.sub(r"[^A-Za-z0-9_.-]", "_", key[1])
+    return (
+        stage_dir.resolve(strict=True)
+        / "logs"
+        / f"{fixture}_{key[0]}_warmup{warmup_index}_w{worker}.canonical.json"
+    )
+
+
+def require_chart_compact_match(
+    mapping: Mapping[str, object],
+    data: bytes,
+    expected_mapping: Mapping[str, object],
+    expected_data: bytes,
+    label: str,
+) -> None:
+    if mapping != expected_mapping or data != expected_data:
+        fail(f"{label} differs from its row/full-sidecar canonical oracle")
+
+
 def validate_chart_semantic_artifacts(
     capture_root: Path,
     stage_dir: Path,
     capture: CaptureSpec,
     row: Mapping[str, str],
     key: tuple[str, str],
-) -> None:
+    timed_mapping: Mapping[str, object],
+    timed_data: bytes,
+) -> tuple[dict[str, object], bytes]:
     stem = companion_stem(capture, key)
     compact_prefix = stage_dir.resolve(strict=True) / "logs" / f"{stem}_canonical_companion"
     compact = require_stage_log_file(
@@ -3505,9 +3763,20 @@ def validate_chart_semantic_artifacts(
         ),
         f"{key[0]}@{key[1]}",
     )
-    if compact.read_bytes() != full_report.read_bytes():
+    compact_data = compact.read_bytes()
+    full_data = full_report.read_bytes()
+    if compact_data != full_data:
         fail(f"compact/full canonical digest maps differ for {key}")
-    compact_mapping = json.loads(compact.read_text(encoding="utf-8"))
+    compact_mapping = parse_chart_search_digest_bytes(
+        compact_data, compact, f"compact semantic report for {key}"
+    )
+    require_chart_compact_match(
+        timed_mapping,
+        timed_data,
+        compact_mapping,
+        compact_data,
+        f"timed compact semantic report for {key}",
+    )
     if compact_mapping.get("semantic_sha256") != row.get(
         "search_semantic_sha256"
     ):
@@ -3543,6 +3812,7 @@ def validate_chart_semantic_artifacts(
         prefix=companion_score_prefix,
         bind_shape=False,
     )
+    return compact_mapping, compact_data
 
 
 def validate_stage_artifact_bindings(
@@ -3550,6 +3820,8 @@ def validate_stage_artifact_bindings(
     stage_dir: Path,
     capture: CaptureSpec,
     rows: Sequence[Mapping[str, str]],
+    *,
+    warmups: int,
 ) -> None:
     safe_fixture = re.sub(
         r"[^A-Za-z0-9_.-]", "_", RAW_FIXTURE_LABELS[capture.fixture]
@@ -3581,6 +3853,11 @@ def validate_stage_artifact_bindings(
         fail(f"stage initial-score stdout disagrees with raw rows: {stage_dir}")
 
     seen_metrics: set[Path] = set()
+    seen_compact_paths: set[Path] = set()
+    seen_compact_identities: dict[tuple[int, int], Path] = {}
+    chart_oracles: dict[
+        tuple[str, str], tuple[dict[str, object], bytes, Mapping[str, str]]
+    ] = {}
     for row in rows:
         key = raw_key(row)
         metrics_path = timed_process_metrics_path(stage_dir, row, key)
@@ -3598,9 +3875,69 @@ def validate_stage_artifact_bindings(
             continue
         validate_score_artifacts(stage_dir, capture, row, key)
         if key[0] != "sample_explore_merge":
-            validate_chart_semantic_artifacts(
-                capture_root, stage_dir, capture, row, key
+            timed_path = measured_chart_compact_path(row)
+            timed_mapping, timed_data, timed_identity = read_timed_chart_compact(
+                timed_path,
+                stage_dir,
+                f"timed chart compact for {key} trial {row.get('trial_index', '')}",
             )
+            register_unique_chart_compact(
+                timed_path,
+                timed_identity,
+                seen_compact_paths,
+                seen_compact_identities,
+                f"{key} trial {row.get('trial_index', '')}",
+            )
+            oracle_mapping, oracle_data = validate_chart_semantic_artifacts(
+                capture_root,
+                stage_dir,
+                capture,
+                row,
+                key,
+                timed_mapping,
+                timed_data,
+            )
+            prior = chart_oracles.get(key)
+            if prior is not None:
+                require_chart_compact_match(
+                    oracle_mapping,
+                    oracle_data,
+                    prior[0],
+                    prior[1],
+                    f"repeated chart compact oracle for {key}",
+                )
+            else:
+                chart_oracles[key] = (oracle_mapping, oracle_data, row)
+
+    for key, (oracle_mapping, oracle_data, row) in chart_oracles.items():
+        for warmup_index in range(1, warmups + 1):
+            warmup_path = warmup_chart_compact_path(
+                stage_dir, capture, key, warmup_index
+            )
+            mapping, data, identity = read_timed_chart_compact(
+                warmup_path,
+                stage_dir,
+                f"chart warmup compact for {key} warmup {warmup_index}",
+            )
+            register_unique_chart_compact(
+                warmup_path,
+                identity,
+                seen_compact_paths,
+                seen_compact_identities,
+                f"{key} warmup {warmup_index}",
+            )
+            require_chart_compact_match(
+                mapping,
+                data,
+                oracle_mapping,
+                oracle_data,
+                f"chart warmup compact for {key} warmup {warmup_index}",
+            )
+            if mapping["semantic_sha256"] != row.get("search_semantic_sha256"):
+                fail(
+                    "chart warmup compact semantic digest differs from raw row "
+                    f"{key}"
+                )
 
 
 def validate_stage(
@@ -3692,7 +4029,7 @@ def validate_stage(
                 capture_root, key, successes, stage_dir=stage_dir
             )
     validate_stage_artifact_bindings(
-        capture_root, stage_dir, capture, rows
+        capture_root, stage_dir, capture, rows, warmups=warmups
     )
     return rows, any_timeout
 
@@ -10851,6 +11188,151 @@ def self_test(_: argparse.Namespace) -> None:
                 "fixture",
             ),
             "aliased report path",
+        )
+
+    # Every successful chart child must leave a distinct, single-link,
+    # schema-v1 compact at the exact report-adjacent path.  Exercise the
+    # descriptor reader independently so deletion, tamper, alias, and reuse
+    # cannot be masked by the later artifact-ledger walk.
+    with tempfile.TemporaryDirectory(
+        prefix="wric-phase0-timed-compact-"
+    ) as temporary:
+        compact_root = Path(temporary).resolve()
+        compact_stage = compact_root / "repeat"
+        compact_logs = compact_stage / "logs"
+        compact_logs.mkdir(parents=True)
+        method = "chart_spr_grammar_exact"
+        key = (method, "8")
+        safe_fixture = re.sub(
+            r"[^A-Za-z0-9_.-]", "_", RAW_FIXTURE_LABELS[primary.fixture]
+        )
+        report_path = compact_logs / f"{safe_fixture}_{method}_trial1_w8.out"
+        report_path.write_text("report\n", encoding="utf-8")
+        compact_path = report_path.with_suffix(".canonical.json")
+        compact_mapping: dict[str, object] = {
+            "schema": "larch.chart_spr.semantic_digest",
+            "schema_version": 1,
+            "digest_algorithm": "sha256",
+            "payload_encoding": "larch.chart_spr.semantic.ndjson.v1",
+            "semantic_sha256": "0" * 64,
+            "contract_sha256": "1" * 64,
+            "candidates_sha256": "2" * 64,
+            "exact_sha256": "3" * 64,
+            "acceptance_sha256": "4" * 64,
+            "chain_sha256": "5" * 64,
+            "final_topology_sha256": "6" * 64,
+            "record_count": 1,
+            "candidate_count": 0,
+            "exact_candidate_count": 0,
+            "iteration_count": 0,
+        }
+        compact_data = (
+            json.dumps(compact_mapping, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        compact_path.write_bytes(compact_data)
+        observed_mapping, observed_data, identity = read_timed_chart_compact(
+            compact_path, compact_stage, "synthetic timed chart compact"
+        )
+        assert observed_mapping == compact_mapping
+        assert observed_data == compact_data
+        assert measured_chart_compact_path(
+            {"report_path": str(report_path)}
+        ) == compact_path
+        assert warmup_chart_compact_path(
+            compact_stage, primary, key, 1
+        ) == compact_logs / f"{safe_fixture}_{method}_warmup1_w8.canonical.json"
+
+        missing = compact_logs / "missing.canonical.json"
+        assert_rejected(
+            lambda: read_timed_chart_compact(
+                missing, compact_stage, "missing timed chart compact"
+            ),
+            "missing timed compact",
+        )
+        schema_tamper = compact_logs / "schema-tamper.canonical.json"
+        schema_tamper.write_text(
+            json.dumps(compact_mapping | {"schema_version": 2}) + "\n",
+            encoding="utf-8",
+        )
+        assert_rejected(
+            lambda: read_timed_chart_compact(
+                schema_tamper, compact_stage, "schema-tampered chart compact"
+            ),
+            "timed compact schema tamper",
+        )
+        duplicate = compact_logs / "duplicate.canonical.json"
+        duplicate.write_bytes(
+            compact_data[:-2]
+            + b',"schema":"larch.chart_spr.semantic_digest"}\n'
+        )
+        assert_rejected(
+            lambda: read_timed_chart_compact(
+                duplicate, compact_stage, "duplicate-key chart compact"
+            ),
+            "timed compact duplicate key",
+        )
+        oversized = compact_logs / "oversized.canonical.json"
+        oversized.write_bytes(b" " * (MAX_CHART_SEARCH_DIGEST_BYTES + 1))
+        assert_rejected(
+            lambda: read_timed_chart_compact(
+                oversized, compact_stage, "oversized chart compact"
+            ),
+            "oversized timed compact",
+        )
+        hardlink = compact_logs / "hardlink.canonical.json"
+        os.link(compact_path, hardlink)
+        assert_rejected(
+            lambda: read_timed_chart_compact(
+                compact_path, compact_stage, "hard-linked timed chart compact"
+            ),
+            "timed compact hard link",
+        )
+        hardlink.unlink()
+
+        tampered_mapping = compact_mapping | {"semantic_sha256": "f" * 64}
+        tampered_data = (
+            json.dumps(tampered_mapping, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        assert_rejected(
+            lambda: require_chart_compact_match(
+                tampered_mapping,
+                tampered_data,
+                compact_mapping,
+                compact_data,
+                "tampered warmup compact",
+            ),
+            "timed compact semantic tamper",
+        )
+        seen_paths: set[Path] = set()
+        seen_identities: dict[tuple[int, int], Path] = {}
+        register_unique_chart_compact(
+            compact_path,
+            identity,
+            seen_paths,
+            seen_identities,
+            "synthetic measured compact",
+        )
+        assert_rejected(
+            lambda: register_unique_chart_compact(
+                compact_path,
+                identity,
+                seen_paths,
+                seen_identities,
+                "reused measured compact",
+            ),
+            "timed compact path reuse",
+        )
+        assert_rejected(
+            lambda: register_unique_chart_compact(
+                compact_logs / "other.canonical.json",
+                identity,
+                seen_paths,
+                seen_identities,
+                "aliased warmup compact",
+            ),
+            "timed compact inode reuse",
         )
 
     with tempfile.TemporaryDirectory(prefix="wric-phase0-sidecar-") as temporary:

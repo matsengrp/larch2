@@ -497,6 +497,11 @@ class Dataset:
             dag_path.write_text(json.dumps(self.output[(seed, worker, trial)]) + "\n", encoding="utf-8")
         for (seed, worker), value in self.search.items():
             rows = self.matching(seed, worker)
+            warmup = acceptance.expected_phase9_warmup_compact_path(
+                self.root, rows[0], worker
+            )
+            warmup.parent.mkdir(parents=True, exist_ok=True)
+            warmup.write_text(json.dumps(value) + "\n", encoding="utf-8")
             for row in rows:
                 report = self.root / row["report_path"]
                 compact, _, _, _ = acceptance.canonical_paths(
@@ -723,6 +728,13 @@ class Phase9AcceptanceTest(unittest.TestCase):
             ),
             mock.patch.object(
                 acceptance,
+                "frozen_oracle_search_digests",
+                return_value={
+                    key: dict(value) for key, value in self.data.search.items()
+                },
+            ),
+            mock.patch.object(
+                acceptance,
                 "audit_run_archive",
                 return_value=({}, {}),
             ),
@@ -916,6 +928,83 @@ class Phase9AcceptanceTest(unittest.TestCase):
         compact.write_text(json.dumps(value) + "\n", encoding="utf-8")
         self.assert_written_failure("schema_version=2, expected 1")
 
+    def test_raw_report_path_is_bound_to_the_exact_timed_command_name(self) -> None:
+        for row in self.data.rows:
+            original = Path(row["report_path"])
+            row["report_path"] = os.fspath(
+                original.with_name(f"alternate_{original.name}")
+            )
+        self.assert_failure(
+            "report_path is not the exact deterministic Phase-9 timed report path"
+        )
+
+    def test_all_commanded_warmup_compacts_are_present_and_semantic(self) -> None:
+        self.data.write()
+        row = self.data.matching(1, 1)[0]
+        warmup = acceptance.expected_phase9_warmup_compact_path(
+            self.root, row, 1
+        )
+        warmup.unlink()
+        self.assert_written_failure("warmup1 compact canonical result is missing")
+
+        self.data = Dataset(self.root)
+        self.data.write()
+        row = self.data.matching(1, 1)[0]
+        warmup = acceptance.expected_phase9_warmup_compact_path(
+            self.root, row, 1
+        )
+        value = json.loads(warmup.read_text(encoding="utf-8"))
+        value["semantic_sha256"] = digest("tampered warmup")
+        warmup.write_text(json.dumps(value) + "\n", encoding="utf-8")
+        self.assert_written_failure(
+            "differs from the measured row/full canonical search digest"
+        )
+
+        self.data = Dataset(self.root)
+        self.data.write()
+        row = self.data.matching(1, 1)[0]
+        warmup = acceptance.expected_phase9_warmup_compact_path(
+            self.root, row, 1
+        )
+        value = json.loads(warmup.read_text(encoding="utf-8"))
+        value["schema_version"] = 2
+        warmup.write_text(json.dumps(value) + "\n", encoding="utf-8")
+        self.assert_written_failure("schema_version=2, expected 1")
+
+    def test_warmup_compacts_reject_aliasing_and_oracle_drift(self) -> None:
+        self.data.write()
+        row = self.data.matching(1, 1, 1)[0]
+        report = self.root / row["report_path"]
+        measured, _, _, _ = acceptance.canonical_paths(
+            self.data.raw, row, report
+        )
+        warmup = acceptance.expected_phase9_warmup_compact_path(
+            self.root, row, 1
+        )
+        warmup.unlink()
+        os.link(measured, warmup)
+        self.assert_written_failure("compact canonical result is not singly linked")
+        warmup.unlink()
+
+        self.data = Dataset(self.root)
+        self.data.write()
+        _, rows = acceptance.read_tsv(self.data.raw)
+        trials = acceptance.select_matrix(self.data.raw, rows)
+        oracle = {
+            (seed, worker): dict(
+                acceptance.trials_for(trials, seed, worker)[0].search_digest
+            )
+            for seed in acceptance.SEEDS
+            for worker in acceptance.MEASURED_WORKERS
+        }
+        oracle[(1, 1)]["chain_sha256"] = digest("oracle drift")
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "sealed frozen oracle"
+        ):
+            acceptance.validate_phase9_warmup_compacts(
+                self.root, trials, oracle
+            )
+
     def test_timed_compact_results_reject_hard_links_and_path_reuse(self) -> None:
         self.data.write()
         first_row = self.data.matching(1, 1, 1)[0]
@@ -937,7 +1026,9 @@ class Phase9AcceptanceTest(unittest.TestCase):
         self.data = Dataset(self.root)
         first_row = self.data.matching(1, 1, 1)[0]
         self.data.matching(1, 1, 2)[0]["report_path"] = first_row["report_path"]
-        self.assert_failure("compact canonical result path is reused")
+        self.assert_failure(
+            "report_path is not the exact deterministic Phase-9 timed report path"
+        )
 
     def test_phase9_command_auditor_requires_exact_timed_compact_paths(self) -> None:
         import wric_phase9_manifest_bootstrap as bootstrap
