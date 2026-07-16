@@ -1,0 +1,1867 @@
+#!/usr/bin/env python3
+"""Read-only consolidated WRIC chart-parallelization acceptance evaluator.
+
+The benchmark harness remains the owner of measurements and semantic
+validation.  This program joins those immutable workload identities across
+revisions and applies the timing/RSS gates which cannot be evaluated inside a
+single harness invocation.  It writes nothing: the only successful result is
+one JSON document on stdout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Callable, Mapping, Sequence
+
+
+SCHEMA = "wric.cross_phase_acceptance"
+SCHEMA_VERSION = 1
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+UINT_RE = re.compile(r"^(0|[1-9][0-9]*)$")
+
+RUN_LABELS = (
+    "phase1",
+    "phase2",
+    "phase3",
+    "phase5",
+    "phase7-high",
+    "phase7-small",
+    "phase7-auto",
+    "phase8-generation",
+    "phase8-end-to-end",
+    "final-primary",
+    "final-smt",
+    "final-small-auto",
+    "final-unpinned-auto",
+    "final-default-auto",
+    "final-stress",
+    "final-real",
+    "phase9",
+)
+
+RAW_COLUMNS = (
+    "row_id", "fixture", "method", "status", "validation_status",
+    "requested_workers", "resolved_workers", "worker_policy", "trial_index",
+    "runner_outcome", "runner_exit_code", "exit_code", "term_signal",
+    "core_dumped", "timed_out", "monitor_error", "rss_limit_enabled",
+    "rss_limit_observed", "rss_limit_exceeded", "rss_limit_trigger_bytes",
+    "rss_limit_term_sent", "rss_limit_kill_sent", "wall_clock_s", "user_cpu_s",
+    "system_cpu_s", "max_rss_kb", "peak_sampled_rss_kb", "peak_sampled_swap_kb",
+    "process_rss_limit_bytes", "manifest_rss_limit_bytes",
+    "configured_chart_memory_budget", "input_sha256", "refseq_sha256",
+    "search_semantic_sha256", "output_semantic_sha256",
+    "trial_semantic_sha256", "canonical_argv_sha256", "canonical_digest",
+    "iterations", "seed", "acceptance", "objective", "candidate_source",
+    "candidates_generated", "candidates_scored",
+    "exact_verifications", "accepted_moves", "initial_validated_parsimony_min",
+    "final_validated_parsimony_min", "best_reported_objective",
+    "candidate_generation_ms", "exact_initialization_ms",
+    "initial_chart_construction_ms", "local_scoring_ms", "exact_verification_ms",
+    "accepted_rebuild_ms", "total_ms", "chart_cache_resident_bytes",
+    "exact_candidate_peak_projected_resident_bytes", "report_path",
+)
+
+HISTORICAL_PRE_ADMISSION_LABELS = frozenset(
+    ("phase0", "phase1", "phase2", "phase3", "phase5")
+)
+ADMISSION_FIELD = "exact_candidate_peak_projected_resident_bytes"
+
+
+def required_raw_columns(label: str) -> tuple[str, ...]:
+    if label in HISTORICAL_PRE_ADMISSION_LABELS:
+        return tuple(field for field in RAW_COLUMNS if field != ADMISSION_FIELD)
+    return RAW_COLUMNS
+
+MANIFEST_COLUMNS = (
+    "row_id", "run_group", "workload_name", "fixture_id", "method",
+    "primary_sha256", "refseq_sha256", "requested_workers",
+    "expected_resolved_workers", "expected_worker_policy", "rss_limit_bytes",
+    "expected_outcome", "expected_timeout_trials", "expected_reason_code",
+    "expected_reason_sha256",
+    "iterations", "seed", "chart_max_candidates", "chart_top_k_exact",
+    "acceptance", "objective", "candidate_source", "memory_budget_bytes",
+    "expected_candidates_generated", "expected_candidates_scored",
+    "expected_exact_verifications", "expected_accepted_moves",
+    "expected_initial_score", "expected_final_score",
+    "expected_validated_parsimony",
+    "oracle_search_semantic_sha256", "oracle_output_semantic_sha256",
+    "oracle_trial_semantic_sha256", "canonical_argv_sha256",
+)
+
+METHOD_NATIVE = "sample_explore_merge"
+METHOD_LB = "chart_spr_grammar_lower_bound_heuristic"
+METHOD_EXACT = "chart_spr_grammar_exact"
+METHOD_SAMPLED = "chart_spr_sampled_tree_fixed_topology"
+METHOD_HYBRID = "chart_spr_hybrid_exact"
+
+SMALL_DENSE = "p0-small-dense64-grammar-lower-bound-heuristic-w{}"
+SMALL_EXACT = "p0-small-exact1-grammar-exact-w{}"
+MEDIUM_DENSE = "p0-medium-dense64-grammar-lower-bound-heuristic-w{}"
+MEDIUM_CACHE = "p0-medium-cache1-grammar-lower-bound-heuristic-w{}"
+MEDIUM_LAZY = "p0-medium-lazy64-grammar-lower-bound-heuristic-w{}"
+MEDIUM_EXACT = "p0-medium-exact1-grammar-exact-w{}"
+
+REAL_REFUSAL_REASON_CODE = "high_arity_refinement_refusal"
+REAL_REFUSAL_SUFFIX = (
+    "error: polytomy refinement: bounded expansion requires arity <= 63\n"
+)
+REAL_REFUSAL_STDOUT = "leaves: 3832\nnodes: 5436\nedges: 5435\n"
+REAL_REFUSAL_STDOUT_SHA256 = (
+    "b0174b43d6ddf95ec64e301a7820b4fb19c74c38d9da0873a76787715cfeab36"
+)
+
+
+@dataclass(frozen=True)
+class SupplementSpec:
+    label: str
+    manifest_id: str
+    basename: str
+    row_ids: frozenset[str]
+
+
+SUPPLEMENT_SPECS: Mapping[str, SupplementSpec] = {
+    "phase7": SupplementSpec(
+        "phase7",
+        "phase7-lazy",
+        "phase7-lazy.tsv",
+        frozenset(
+            f"phase7-lazy-{fixture}-{policy}-w{worker}"
+            for fixture in ("high-compression", "dense-favoring")
+            for policy in ("off", "on", "auto")
+            for worker in (1, 2, 4, 8)
+        ),
+    ),
+    "phase7-completion": SupplementSpec(
+        "phase7-completion",
+        "phase7-lazy-completion",
+        "phase7-lazy-completion.tsv",
+        frozenset(
+            (
+                *(f"phase7-lazy-completion-tree0-on-w{worker}" for worker in (1, 2, 4, 8)),
+                *(f"phase7-lazy-completion-medium-auto-w{worker}" for worker in (1, 2, 4, 8)),
+            )
+        ),
+    ),
+    "phase8": SupplementSpec(
+        "phase8",
+        "phase8-generation",
+        "phase8-generation.tsv",
+        frozenset(
+            f"phase8-generation-tree0-off-w{worker}" for worker in (1, 2, 4, 8)
+        ),
+    ),
+    "phase9": SupplementSpec(
+        "phase9",
+        "phase9-local-commit",
+        "phase9-local-commit.tsv",
+        frozenset(
+            f"phase9-local-commit-seed{seed}-w{worker}"
+            for seed in (1, 7, 19)
+            for worker in (1, 2, 4, 8)
+        ),
+    ),
+}
+
+
+class AcceptanceError(RuntimeError):
+    """Malformed evidence or a failed mandatory gate."""
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def regular(path: Path, label: str) -> Path:
+    absolute = path.absolute()
+    try:
+        info = absolute.lstat()
+        resolved = absolute.resolve(strict=True)
+    except OSError as error:
+        raise AcceptanceError(f"{label} is unavailable: {path}: {error}") from error
+    if absolute != resolved or not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise AcceptanceError(f"{label} is not a canonical lexical regular file: {path}")
+    return resolved
+
+
+def decimal(value: str, label: str, *, positive: bool = False) -> Decimal:
+    try:
+        result = Decimal(value)
+    except (InvalidOperation, ValueError) as error:
+        raise AcceptanceError(f"{label} is not a finite decimal: {value!r}") from error
+    if not result.is_finite() or result < 0 or (positive and result <= 0):
+        raise AcceptanceError(f"{label} is not a {'positive' if positive else 'nonnegative'} finite decimal")
+    return result
+
+
+def uint(value: str, label: str, *, positive: bool = False) -> int:
+    if UINT_RE.fullmatch(value) is None or (positive and value == "0"):
+        raise AcceptanceError(f"{label} is not a {'positive' if positive else 'nonnegative'} integer: {value!r}")
+    return int(value)
+
+
+def median(values: Sequence[Decimal], label: str) -> Decimal:
+    if not values:
+        raise AcceptanceError(f"{label} has no finite samples")
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def read_tsv(path: Path, required: Sequence[str], label: str) -> tuple[tuple[str, ...], list[dict[str, str]]]:
+    path = regular(path, label)
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle, delimiter="\t", strict=True)
+            header = tuple(next(reader))
+            if not header or any(not name for name in header):
+                raise AcceptanceError(f"{label} has an empty header field")
+            duplicates = sorted({name for name in header if header.count(name) > 1})
+            if duplicates:
+                raise AcceptanceError(f"{label} has duplicate header fields: {', '.join(duplicates)}")
+            missing = [name for name in required if name not in header]
+            if missing:
+                raise AcceptanceError(f"{label} lacks required fields: {', '.join(missing)}")
+            rows: list[dict[str, str]] = []
+            for number, fields in enumerate(reader, 2):
+                if len(fields) != len(header) or any(field == "" for field in fields):
+                    raise AcceptanceError(f"{label}:{number} has extra, missing, or empty cells")
+                row = dict(zip(header, fields, strict=True))
+                row["__line__"] = str(number)
+                rows.append(row)
+    except StopIteration as error:
+        raise AcceptanceError(f"{label} is empty") from error
+    except (OSError, UnicodeError, csv.Error) as error:
+        raise AcceptanceError(f"cannot parse {label}: {error}") from error
+    if not rows:
+        raise AcceptanceError(f"{label} contains no rows")
+    return header, rows
+
+
+@dataclass(frozen=True)
+class SealedManifest:
+    path: Path
+    sha256: str
+    preamble: Mapping[str, str]
+    rows: Mapping[str, Mapping[str, str]]
+
+    def unchanged(self) -> None:
+        if sha256_file(self.path) != self.sha256:
+            raise AcceptanceError(f"sealed manifest changed during evaluation: {self.path}")
+        seal = self.path.with_name(self.path.name + ".sha256")
+        if seal.read_bytes() != f"{self.sha256}  {self.path.name}\n".encode("ascii"):
+            raise AcceptanceError(f"manifest seal changed during evaluation: {seal}")
+
+
+@dataclass(frozen=True)
+class ManifestChain:
+    base: SealedManifest
+    supplements: Mapping[str, SealedManifest]
+    rows: Mapping[str, Mapping[str, str]]
+
+    @property
+    def path(self) -> Path:
+        return self.base.path
+
+    @property
+    def sha256(self) -> str:
+        return self.base.sha256
+
+    def group(self, name: str, workers: set[str]) -> set[str]:
+        selected: set[str] = set()
+        # Final Phase-0 groups must be selected from the base itself.  A
+        # supplement is not permitted to create a similarly named base row.
+        for row_id, row in self.base.rows.items():
+            if row["run_group"] != name:
+                continue
+            token = manifest_worker(row)
+            if token == "native" or token in workers:
+                selected.add(row_id)
+        if not selected:
+            raise AcceptanceError(f"sealed base contains no selected rows for group {name!r}")
+        return selected
+
+
+def load_manifest(
+    path: Path,
+    expected_sha: str,
+    *,
+    label: str,
+    kind: str,
+    parent_sha256: str,
+    manifest_id: str | None = None,
+    basename: str | None = None,
+    expected_rows: frozenset[str] | None = None,
+) -> SealedManifest:
+    path = regular(path, label)
+    if HASH_RE.fullmatch(expected_sha) is None:
+        raise AcceptanceError(f"{label} expected SHA-256 is not canonical lowercase SHA-256")
+    actual = sha256_file(path)
+    if actual != expected_sha:
+        raise AcceptanceError(f"{label} SHA-256 differs: {actual} != {expected_sha}")
+    seal = regular(path.with_name(path.name + ".sha256"), f"{label} detached seal")
+    wanted_seal = f"{actual}  {path.name}\n".encode("ascii")
+    if seal.read_bytes() != wanted_seal:
+        raise AcceptanceError(f"{label} detached seal is not exact GNU sha256sum bytes")
+    if basename is not None and path.name != basename:
+        raise AcceptanceError(f"{label} basename is {path.name!r}, expected {basename!r}")
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    preamble: dict[str, str] = {}
+    data_start = 0
+    while data_start < len(lines) and lines[data_start].startswith("# "):
+        line = lines[data_start]
+        if "=" not in line[2:]:
+            raise AcceptanceError(f"invalid {label} preamble line {data_start + 1}")
+        key, value = line[2:].split("=", 1)
+        if not key or not value or key in preamble:
+            raise AcceptanceError(f"invalid/duplicate {label} preamble key {key!r}")
+        preamble[key] = value
+        data_start += 1
+    if preamble.get("schema") != "wric_chart_parallelization_workloads" or preamble.get("schema_version") != "1":
+        raise AcceptanceError(f"unsupported {label} workload schema")
+    if preamble.get("kind") != kind or preamble.get("parent_sha256") != parent_sha256:
+        raise AcceptanceError(f"{label} kind/parent binding is not exact")
+    if manifest_id is not None and preamble.get("manifest_id") != manifest_id:
+        raise AcceptanceError(f"{label} manifest_id is not {manifest_id!r}")
+    if data_start >= len(lines):
+        raise AcceptanceError(f"{label} lacks a TSV header")
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        for _ in range(data_start):
+            next(handle)
+        reader = csv.reader(handle, delimiter="\t", strict=True)
+        header = tuple(next(reader))
+        if not header or any(not field for field in header):
+            raise AcceptanceError(f"{label} has an empty header field")
+        if len(set(header)) != len(header):
+            raise AcceptanceError(f"{label} has duplicate header fields")
+        missing = [name for name in MANIFEST_COLUMNS if name not in header]
+        if missing:
+            raise AcceptanceError(f"{label} lacks required fields: {', '.join(missing)}")
+        rows: dict[str, Mapping[str, str]] = {}
+        for number, fields in enumerate(reader, data_start + 2):
+            if len(fields) != len(header) or any(field == "" for field in fields):
+                raise AcceptanceError(f"{label} line {number} has malformed cells")
+            row = dict(zip(header, fields, strict=True))
+            row_id = row["row_id"]
+            if not row_id or row_id in rows:
+                raise AcceptanceError(f"{label} has empty/duplicate row ID {row_id!r}")
+            outcome = row["expected_outcome"]
+            if outcome not in ("ok", "timeout", "expected_infeasible", "scale_limit"):
+                raise AcceptanceError(f"{label} {row_id}: unsupported expected outcome {outcome!r}")
+            timeout_trials = uint(
+                row["expected_timeout_trials"],
+                f"{label} {row_id} expected_timeout_trials",
+            )
+            if outcome == "timeout":
+                if timeout_trials == 0:
+                    raise AcceptanceError(f"{label} {row_id}: timeout has no characterized trials")
+            elif timeout_trials != 0:
+                raise AcceptanceError(f"{label} {row_id}: non-timeout row claims timeout trials")
+            if outcome == "expected_infeasible":
+                if row["expected_reason_code"] != REAL_REFUSAL_REASON_CODE:
+                    raise AcceptanceError(f"{label} {row_id}: refusal reason code is not exact")
+                if HASH_RE.fullmatch(row["expected_reason_sha256"]) is None:
+                    raise AcceptanceError(f"{label} {row_id}: refusal reason hash is invalid")
+            elif row["expected_reason_code"] != "-" or row["expected_reason_sha256"] != "-":
+                raise AcceptanceError(f"{label} {row_id}: non-refusal row claims refusal evidence")
+            rows[row_id] = row
+    if not rows:
+        raise AcceptanceError(f"{label} contains no rows")
+    if expected_rows is not None and set(rows) != set(expected_rows):
+        raise AcceptanceError(
+            f"{label} row set mismatch; missing={sorted(expected_rows - set(rows))}, "
+            f"unexpected={sorted(set(rows) - expected_rows)}"
+        )
+    return SealedManifest(path, actual, preamble, rows)
+
+
+def load_manifest_chain(
+    base_path: Path,
+    expected_base_sha: str,
+    supplement_paths: Mapping[str, Path],
+    supplement_hashes: Mapping[str, str],
+) -> ManifestChain:
+    base = load_manifest(
+        base_path,
+        expected_base_sha,
+        label="sealed base manifest",
+        kind="base",
+        parent_sha256="-",
+    )
+    expected_labels = set(SUPPLEMENT_SPECS)
+    if set(supplement_paths) != expected_labels or set(supplement_hashes) != expected_labels:
+        raise AcceptanceError(
+            "supplement-label set mismatch; "
+            f"paths_missing={sorted(expected_labels - set(supplement_paths))}, "
+            f"paths_unexpected={sorted(set(supplement_paths) - expected_labels)}, "
+            f"anchors_missing={sorted(expected_labels - set(supplement_hashes))}, "
+            f"anchors_unexpected={sorted(set(supplement_hashes) - expected_labels)}"
+        )
+    supplements: dict[str, SealedManifest] = {}
+    authoritative: dict[str, Mapping[str, str]] = dict(base.rows)
+    for label in SUPPLEMENT_SPECS:
+        spec = SUPPLEMENT_SPECS[label]
+        supplement = load_manifest(
+            supplement_paths[label],
+            supplement_hashes[label],
+            label=f"sealed {label} supplement",
+            kind="supplement",
+            parent_sha256=base.sha256,
+            manifest_id=spec.manifest_id,
+            basename=spec.basename,
+            expected_rows=spec.row_ids,
+        )
+        for inherited in (
+            "repo_revision",
+            "merge_base",
+            "frozen_larch2_sha256",
+            "frozen_oracle_dagutil_sha256",
+        ):
+            if inherited in base.preamble and supplement.preamble.get(inherited) != base.preamble[inherited]:
+                raise AcceptanceError(f"sealed {label} supplement changes inherited role {inherited}")
+        collisions = set(authoritative) & set(supplement.rows)
+        if collisions:
+            raise AcceptanceError(
+                f"sealed {label} supplement duplicates/overrides row IDs: {sorted(collisions)}"
+            )
+        authoritative.update(supplement.rows)
+        supplements[label] = supplement
+    return ManifestChain(base, supplements, authoritative)
+
+
+def manifest_worker(row: Mapping[str, str]) -> str:
+    if row["method"] == METHOD_NATIVE:
+        return "native"
+    requested = row["requested_workers"]
+    return "auto" if requested == "0" else requested
+
+
+@dataclass(frozen=True)
+class RawEvidence:
+    label: str
+    paths: tuple[Path, ...]
+    digests: tuple[str, ...]
+    rows: tuple[Mapping[str, str], ...]
+
+    def row_ids(self) -> set[str]:
+        return {row["row_id"] for row in self.rows}
+
+    def selected(self, row_id: str, repetitions: int) -> list[Mapping[str, str]]:
+        result = [row for row in self.rows if row["row_id"] == row_id]
+        if len(result) != repetitions:
+            raise AcceptanceError(f"{self.label}: {row_id} has {len(result)}/{repetitions} trials")
+        indexes = sorted(uint(row["trial_index"], f"{self.label} {row_id} trial_index", positive=True) for row in result)
+        if indexes != list(range(1, repetitions + 1)):
+            raise AcceptanceError(f"{self.label}: {row_id} trial indexes are not exactly 1..{repetitions}")
+        return result
+
+    def required_rows(
+        self,
+        expected: set[str],
+        repetitions: int,
+        manifests: ManifestChain,
+    ) -> None:
+        actual = self.row_ids()
+        missing = expected - actual
+        if missing:
+            raise AcceptanceError(
+                f"{self.label}: required row set is incomplete; missing={sorted(missing)}"
+            )
+        unknown_required = expected - set(manifests.rows)
+        if unknown_required:
+            raise AcceptanceError(
+                f"{self.label}: required rows are absent from sealed manifests: {sorted(unknown_required)}"
+            )
+        allowed_groups = {manifests.rows[row_id]["run_group"] for row_id in expected}
+        disallowed: list[str] = []
+        for row_id in sorted(actual - expected):
+            manifest = manifests.rows.get(row_id)
+            if manifest is None or manifest["run_group"] not in allowed_groups:
+                disallowed.append(row_id)
+        if disallowed:
+            raise AcceptanceError(
+                f"{self.label}: rows are outside the explicitly expected sealed run groups "
+                f"{sorted(allowed_groups)}: {disallowed}"
+            )
+        for row_id in sorted(expected):
+            self.selected(row_id, repetitions)
+        for row_id in sorted(actual - expected):
+            extras = [row for row in self.rows if row["row_id"] == row_id]
+            indexes = sorted(
+                uint(
+                    row["trial_index"],
+                    f"{self.label} allowed extra {row_id} trial_index",
+                    positive=True,
+                )
+                for row in extras
+            )
+            if indexes != list(range(1, len(extras) + 1)):
+                raise AcceptanceError(
+                    f"{self.label}: allowed extra {row_id} trial indexes are not contiguous"
+                )
+
+    def unchanged(self) -> None:
+        for path, before in zip(self.paths, self.digests, strict=True):
+            if sha256_file(path) != before:
+                raise AcceptanceError(f"read-only input changed during evaluation: {path}")
+
+
+@dataclass(frozen=True)
+class Phase0ArtifactLedger:
+    path: Path
+    sha256: str
+    seal_path: Path
+    members: tuple[tuple[str, Path, str], ...]
+    capture_raws: tuple[tuple[Path, str], ...]
+
+    def unchanged(self) -> None:
+        if sha256_file(self.path) != self.sha256:
+            raise AcceptanceError(
+                f"Phase-0 artifact ledger changed during evaluation: {self.path}"
+            )
+        wanted = f"{self.sha256}  {self.path.name}\n".encode("ascii")
+        if self.seal_path.read_bytes() != wanted:
+            raise AcceptanceError(
+                "Phase-0 artifact-ledger seal changed during evaluation: "
+                f"{self.seal_path}"
+            )
+
+
+def load_phase0_artifact_ledger(
+    path: Path,
+    expected_sha256: str,
+    base_repo_root: Path,
+) -> Phase0ArtifactLedger:
+    if HASH_RE.fullmatch(expected_sha256) is None:
+        raise AcceptanceError(
+            "--expected-phase0-artifact-ledger-sha256 is not canonical "
+            "lowercase SHA-256"
+        )
+    ledger = regular(path, "Phase-0 artifact ledger")
+    if ledger.name != "phase0-artifacts.tsv":
+        raise AcceptanceError(
+            "Phase-0 artifact ledger basename is not 'phase0-artifacts.tsv'"
+        )
+    try:
+        ledger.relative_to(base_repo_root)
+    except ValueError as error:
+        raise AcceptanceError(
+            "Phase-0 artifact ledger is outside --base-repo-root"
+        ) from error
+    actual_sha256 = sha256_file(ledger)
+    if actual_sha256 != expected_sha256:
+        raise AcceptanceError(
+            "Phase-0 artifact ledger differs from external anchor: "
+            f"{actual_sha256} != {expected_sha256}"
+        )
+    seal = regular(
+        ledger.with_name(ledger.name + ".sha256"),
+        "Phase-0 artifact-ledger detached seal",
+    )
+    wanted_seal = f"{actual_sha256}  {ledger.name}\n".encode("ascii")
+    if seal.read_bytes() != wanted_seal:
+        raise AcceptanceError(
+            "Phase-0 artifact-ledger detached seal is not exact GNU sha256sum bytes"
+        )
+    if not ledger.read_bytes().startswith(b"sha256\turi\n"):
+        raise AcceptanceError(
+            "Phase-0 artifact ledger header bytes are not exactly 'sha256\\turi\\n'"
+        )
+
+    header, rows = read_tsv(
+        ledger,
+        ("sha256", "uri"),
+        "Phase-0 artifact ledger",
+    )
+    if header != ("sha256", "uri"):
+        raise AcceptanceError(
+            "Phase-0 artifact ledger header is not exactly 'sha256\\turi'"
+        )
+    seen_uris: set[str] = set()
+    seen_paths: set[Path] = set()
+    members: list[tuple[str, Path, str]] = []
+    capture_raws: list[tuple[Path, str]] = []
+    forbidden = {ledger, seal}
+    for row in rows:
+        digest = row["sha256"]
+        uri = row["uri"]
+        if HASH_RE.fullmatch(digest) is None:
+            raise AcceptanceError(
+                f"Phase-0 artifact ledger has a noncanonical member hash: {digest!r}"
+            )
+        if uri in seen_uris:
+            raise AcceptanceError(
+                f"Phase-0 artifact ledger has a duplicate URI: {uri}"
+            )
+        seen_uris.add(uri)
+        if not uri.startswith("repo://"):
+            raise AcceptanceError(
+                f"Phase-0 artifact URI is not repository-confined: {uri}"
+            )
+        relative_text = uri.removeprefix("repo://")
+        relative = Path(relative_text)
+        if (
+            not relative_text
+            or "\\" in relative_text
+            or relative.is_absolute()
+            or relative.as_posix() != relative_text
+            or any(part in (".", "..") for part in relative.parts)
+        ):
+            raise AcceptanceError(f"Phase-0 artifact URI is not normalized: {uri}")
+        lexical_target = base_repo_root / relative
+        try:
+            target = regular(lexical_target, f"Phase-0 artifact-ledger member {uri}")
+            target.relative_to(base_repo_root)
+        except ValueError as error:
+            raise AcceptanceError(
+                f"Phase-0 artifact URI escapes --base-repo-root: {uri}"
+            ) from error
+        if target.relative_to(base_repo_root).as_posix() != relative_text:
+            raise AcceptanceError(
+                f"Phase-0 artifact URI uses an alias instead of lexical bytes: {uri}"
+            )
+        if target in seen_paths:
+            raise AcceptanceError(
+                f"Phase-0 artifact ledger aliases one member more than once: {uri}"
+            )
+        seen_paths.add(target)
+        if target in forbidden:
+            raise AcceptanceError(
+                "Phase-0 artifact ledger violates its non-circular contract by "
+                f"listing {uri}"
+            )
+        member_sha256 = sha256_file(target)
+        if member_sha256 != digest:
+            raise AcceptanceError(
+                f"Phase-0 artifact-ledger member hash mismatch: {uri}: "
+                f"{member_sha256} != {digest}"
+            )
+        members.append((uri, target, digest))
+
+        try:
+            capture_relative = target.relative_to(ledger.parent)
+        except ValueError:
+            continue
+        parts = capture_relative.parts
+        if (
+            len(parts) == 4
+            and parts[0] == "bootstrap-phase0"
+            and parts[1] == "captures"
+            and re.fullmatch(r"[a-z0-9][a-z0-9-]*", parts[2]) is not None
+            and parts[3] == "raw_trials.tsv"
+        ):
+            capture_raws.append((target, digest))
+
+    uris = [uri for uri, _, _ in members]
+    if uris != sorted(uris):
+        raise AcceptanceError(
+            "Phase-0 artifact ledger members are not in canonical URI order"
+        )
+    if not capture_raws:
+        raise AcceptanceError(
+            "Phase-0 artifact ledger contains no canonical capture raw TSVs"
+        )
+    return Phase0ArtifactLedger(
+        ledger,
+        actual_sha256,
+        seal,
+        tuple(members),
+        tuple(capture_raws),
+    )
+
+
+def verify_phase0_raw_arguments(
+    paths: Sequence[Path],
+    expected_sha256: Sequence[str],
+    ledger: Phase0ArtifactLedger,
+) -> None:
+    supplied_paths = tuple(
+        regular(path, f"Phase-0 raw TSV argument {index}")
+        for index, path in enumerate(paths, 1)
+    )
+    for index, digest in enumerate(expected_sha256, 1):
+        if HASH_RE.fullmatch(digest) is None:
+            raise AcceptanceError(
+                f"Phase-0 raw SHA-256 anchor {index} is not canonical lowercase SHA-256"
+            )
+    supplied = tuple(zip(supplied_paths, expected_sha256, strict=False))
+    if supplied != ledger.capture_raws:
+        raise AcceptanceError(
+            "Phase-0 raw arguments/anchors are not the exact ordered complete "
+            "capture set derived from the artifact ledger; "
+            f"ledger={[(os.fspath(path), digest) for path, digest in ledger.capture_raws]!r}, "
+            f"supplied={[(os.fspath(path), digest) for path, digest in supplied]!r}"
+        )
+
+
+def load_raw(
+    label: str,
+    paths: Sequence[Path],
+    expected_sha256: Sequence[str],
+) -> RawEvidence:
+    if not paths:
+        raise AcceptanceError(f"no raw TSV supplied for {label}")
+    if len(expected_sha256) != len(paths):
+        raise AcceptanceError(
+            f"{label}: raw SHA-256 anchor/file multiplicity differs: "
+            f"{len(expected_sha256)}/{len(paths)}"
+        )
+    rows: list[Mapping[str, str]] = []
+    resolved: list[Path] = []
+    digests: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    header: tuple[str, ...] | None = None
+    for index, (path, expected) in enumerate(
+        zip(paths, expected_sha256, strict=True), 1
+    ):
+        if HASH_RE.fullmatch(expected) is None:
+            raise AcceptanceError(
+                f"{label}: raw SHA-256 anchor {index} is not canonical lowercase SHA-256"
+            )
+        canonical = regular(path, f"{label} raw TSV")
+        actual = sha256_file(canonical)
+        if actual != expected:
+            raise AcceptanceError(
+                f"{label}: raw SHA-256 anchor {index} differs: {actual} != {expected}"
+            )
+        current_header, current_rows = read_tsv(
+            canonical, required_raw_columns(label), f"{label} raw TSV"
+        )
+        if header is None:
+            header = current_header
+        elif current_header != header:
+            historical_compatible = (
+                label in HISTORICAL_PRE_ADMISSION_LABELS
+                and tuple(field for field in current_header if field != ADMISSION_FIELD)
+                == tuple(field for field in header if field != ADMISSION_FIELD)
+            )
+            if not historical_compatible:
+                raise AcceptanceError(f"{label}: raw TSV headers differ")
+        if canonical in resolved:
+            raise AcceptanceError(f"{label}: duplicate raw TSV path {canonical}")
+        resolved.append(canonical)
+        digests.append(actual)
+        for row in current_rows:
+            key = (row["row_id"], row["trial_index"])
+            if key in seen:
+                raise AcceptanceError(f"{label}: duplicate row/trial {key[0]}#{key[1]}")
+            seen.add(key)
+            owned = dict(row)
+            owned["__raw_path__"] = os.fspath(canonical)
+            recorded_report = Path(row["report_path"])
+            if recorded_report.is_absolute():
+                normalized_report = recorded_report
+            else:
+                if recorded_report in (Path("."), Path("")) or any(
+                    part in (".", "..") for part in recorded_report.parts
+                ):
+                    raise AcceptanceError(
+                        f"{label}: {key[0]}#{key[1]} has a noncanonical relative report path"
+                    )
+                normalized_report = canonical.parent / recorded_report
+            owned["report_path"] = os.fspath(normalized_report)
+            rows.append(owned)
+    return RawEvidence(label, tuple(resolved), tuple(digests), tuple(rows))
+
+
+def expected_raw_worker(manifest: Mapping[str, str]) -> str:
+    return manifest_worker(manifest)
+
+
+def is_hash_or_dash(value: str) -> bool:
+    # The frozen harness uses NA for the absent raw DAG refseq column while
+    # workload manifests use '-'.  Neither spelling is a wildcard.
+    return value in ("-", "NA") or HASH_RE.fullmatch(value) is not None
+
+
+def validate_success(
+    row: Mapping[str, str],
+    label: str,
+    base: ManifestChain,
+    *,
+    expected_status: str = "ok",
+) -> None:
+    rid = row["row_id"]
+    trial = row["trial_index"]
+    where = f"{label} {rid} trial {trial}"
+    literals = {
+        "status": expected_status, "validation_status": "ok", "runner_outcome": "exited",
+        "runner_exit_code": "0", "exit_code": "0", "term_signal": "0",
+        "core_dumped": "0", "timed_out": "0", "monitor_error": "0",
+        "rss_limit_enabled": "1", "rss_limit_observed": "0",
+        "rss_limit_exceeded": "0", "rss_limit_trigger_bytes": "0",
+        "rss_limit_term_sent": "0", "rss_limit_kill_sent": "0",
+    }
+    for key, wanted in literals.items():
+        if row[key] != wanted:
+            raise AcceptanceError(f"{where}: {key}={row[key]!r}, expected {wanted!r}")
+    wall = decimal(row["wall_clock_s"], f"{where} wall_clock_s", positive=True)
+    decimal(row["user_cpu_s"], f"{where} user_cpu_s")
+    decimal(row["system_cpu_s"], f"{where} system_cpu_s")
+    del wall
+    peak = uint(row["peak_sampled_rss_kb"], f"{where} peak RSS", positive=True)
+    uint(row["max_rss_kb"], f"{where} wait4 peak RSS", positive=True)
+    if uint(row["peak_sampled_swap_kb"], f"{where} peak swap") != 0:
+        raise AcceptanceError(f"{where}: peak sampled swap is nonzero")
+    for key in ("process_rss_limit_bytes", "manifest_rss_limit_bytes"):
+        limit = uint(row[key], f"{where} {key}", positive=True)
+        if peak * 1024 > limit:
+            raise AcceptanceError(f"{where}: sampled RSS exceeds {key}")
+    if row["canonical_digest"] != row["trial_semantic_sha256"]:
+        raise AcceptanceError(f"{where}: canonical/trial digest mismatch")
+    for key in ("input_sha256", "output_semantic_sha256", "trial_semantic_sha256", "canonical_argv_sha256", "canonical_digest"):
+        if HASH_RE.fullmatch(row[key]) is None:
+            raise AcceptanceError(f"{where}: {key} is not a lowercase SHA-256")
+    if not is_hash_or_dash(row["refseq_sha256"]):
+        raise AcceptanceError(f"{where}: refseq_sha256 is invalid")
+    if row["method"] != METHOD_NATIVE and HASH_RE.fullmatch(row["search_semantic_sha256"]) is None:
+        raise AcceptanceError(f"{where}: chart search semantic digest is invalid")
+    if row["method"] == METHOD_NATIVE and row["search_semantic_sha256"] != "-":
+        raise AcceptanceError(f"{where}: native row claims a chart search digest")
+
+    manifest = base.rows.get(rid)
+    if manifest is None:
+        raise AcceptanceError(f"{where}: row is absent from the sealed manifest chain")
+    if manifest["expected_outcome"] == "expected_infeasible":
+        raise AcceptanceError(
+            f"{where}: successful raw row contradicts sealed outcome {manifest['expected_outcome']!r}"
+        )
+    pairs = (("fixture", "workload_name"), ("method", "method"), ("iterations", "iterations"), ("seed", "seed"))
+    for raw_key, manifest_key in pairs:
+        if row[raw_key] != manifest[manifest_key]:
+            raise AcceptanceError(f"{where}: {raw_key} differs from sealed manifest row")
+    if row["requested_workers"] != expected_raw_worker(manifest):
+        raise AcceptanceError(f"{where}: requested worker differs from sealed manifest row")
+    if row["input_sha256"] != manifest["primary_sha256"]:
+        raise AcceptanceError(f"{where}: input SHA-256 differs from sealed manifest row")
+    frozen_refseq = manifest["refseq_sha256"]
+    raw_refseq = "-" if row["refseq_sha256"] == "NA" else row["refseq_sha256"]
+    if raw_refseq != frozen_refseq:
+        raise AcceptanceError(f"{where}: refseq SHA-256 differs from sealed manifest row")
+    for key in ("acceptance", "objective", "candidate_source"):
+        if manifest[key] != "-" and row[key] != manifest[key]:
+            raise AcceptanceError(f"{where}: {key} differs from sealed manifest row")
+    for raw_key, manifest_key in (
+        ("search_semantic_sha256", "oracle_search_semantic_sha256"),
+        ("output_semantic_sha256", "oracle_output_semantic_sha256"),
+        ("trial_semantic_sha256", "oracle_trial_semantic_sha256"),
+        ("canonical_argv_sha256", "canonical_argv_sha256"),
+    ):
+        frozen = manifest[manifest_key]
+        if frozen != "-" and row[raw_key] != frozen:
+            raise AcceptanceError(f"{where}: {raw_key} differs from sealed manifest row")
+    if manifest["expected_resolved_workers"] not in ("-", "policy") and row["resolved_workers"] != manifest["expected_resolved_workers"]:
+        raise AcceptanceError(f"{where}: resolved workers differ from sealed manifest row")
+    if manifest["expected_worker_policy"] not in ("-", "policy") and row["worker_policy"] != manifest["expected_worker_policy"]:
+        raise AcceptanceError(f"{where}: worker policy differs from sealed manifest row")
+    if manifest["rss_limit_bytes"] != "-" and row["manifest_rss_limit_bytes"] != manifest["rss_limit_bytes"]:
+        raise AcceptanceError(f"{where}: RSS limit differs from sealed manifest row")
+    if row["method"] != METHOD_NATIVE and manifest["memory_budget_bytes"] != "-" and row["configured_chart_memory_budget"] != manifest["memory_budget_bytes"]:
+        raise AcceptanceError(f"{where}: memory budget differs from sealed manifest row")
+    for raw_key, manifest_key in (
+        ("candidates_generated", "expected_candidates_generated"),
+        ("candidates_scored", "expected_candidates_scored"),
+        ("exact_verifications", "expected_exact_verifications"),
+        ("accepted_moves", "expected_accepted_moves"),
+    ):
+        frozen = manifest[manifest_key]
+        if frozen != "-" and row[raw_key] != frozen:
+            raise AcceptanceError(f"{where}: {raw_key} differs from sealed manifest row")
+
+    if row["method"] != METHOD_NATIVE:
+        initial = uint(row["initial_validated_parsimony_min"], f"{where} initial score")
+        final = uint(row["final_validated_parsimony_min"], f"{where} final score")
+        best = uint(row["best_reported_objective"], f"{where} reported objective")
+        if final > initial or best > initial:
+            raise AcceptanceError(f"{where}: chart search worsened its initial objective")
+        for key in (
+            "candidate_generation_ms", "exact_initialization_ms",
+            "initial_chart_construction_ms", "local_scoring_ms",
+            "exact_verification_ms", "accepted_rebuild_ms", "total_ms",
+        ):
+            decimal(row[key], f"{where} {key}")
+        budget = uint(row["configured_chart_memory_budget"], f"{where} memory budget", positive=True)
+        projected_text = row.get(ADMISSION_FIELD)
+        if label in HISTORICAL_PRE_ADMISSION_LABELS and projected_text in (None, "NA"):
+            projected = 0
+        elif projected_text is None:
+            raise AcceptanceError(f"{where}: missing required {ADMISSION_FIELD}")
+        else:
+            projected = uint(projected_text, f"{where} projected resident bytes")
+        resident = uint(row["chart_cache_resident_bytes"], f"{where} chart resident bytes")
+        if projected > budget or resident > budget:
+            raise AcceptanceError(f"{where}: chart/exact resident estimate exceeds memory budget")
+    regular(Path(row["report_path"]), f"{where} recorded report")
+
+
+def path_absent(path: Path, label: str) -> None:
+    if os.path.lexists(path):
+        raise AcceptanceError(f"{label} unexpectedly exists: {path}")
+
+
+def validate_refusal(
+    row: Mapping[str, str],
+    label: str,
+    base: ManifestChain,
+    *,
+    exact_artifacts: bool,
+) -> None:
+    where = f"{label} {row['row_id']} trial {row['trial_index']}"
+    wanted = {
+        "status": "expected_infeasible", "validation_status": "not_applicable",
+        "runner_outcome": "exited", "runner_exit_code": "1", "exit_code": "1",
+        "term_signal": "0", "core_dumped": "0", "timed_out": "0",
+        "monitor_error": "0", "rss_limit_enabled": "1",
+        "rss_limit_observed": "0", "rss_limit_exceeded": "0",
+        "rss_limit_trigger_bytes": "0", "rss_limit_term_sent": "0",
+        "rss_limit_kill_sent": "0",
+    }
+    for key, value in wanted.items():
+        if row[key] != value:
+            raise AcceptanceError(f"{where}: refusal {key}={row[key]!r}, expected {value!r}")
+    manifest = base.rows.get(row["row_id"])
+    if manifest is None or manifest["expected_outcome"] != "expected_infeasible":
+        raise AcceptanceError(f"{where}: refusal is not sealed as expected_infeasible")
+    if (
+        manifest["expected_timeout_trials"] != "0"
+        or manifest["expected_reason_code"] != REAL_REFUSAL_REASON_CODE
+        or HASH_RE.fullmatch(manifest["expected_reason_sha256"]) is None
+    ):
+        raise AcceptanceError(f"{where}: sealed refusal reason contract is invalid")
+    for raw_key, manifest_key in (
+        ("fixture", "workload_name"),
+        ("method", "method"),
+        ("iterations", "iterations"),
+        ("seed", "seed"),
+        ("input_sha256", "primary_sha256"),
+        ("canonical_argv_sha256", "canonical_argv_sha256"),
+        ("manifest_rss_limit_bytes", "rss_limit_bytes"),
+    ):
+        if row[raw_key] != manifest[manifest_key]:
+            raise AcceptanceError(f"{where}: refusal {raw_key} differs from sealed manifest row")
+    raw_refseq = "-" if row["refseq_sha256"] == "NA" else row["refseq_sha256"]
+    if raw_refseq != manifest["refseq_sha256"]:
+        raise AcceptanceError(f"{where}: refusal refseq SHA-256 differs from sealed manifest row")
+    if row["requested_workers"] != expected_raw_worker(manifest):
+        raise AcceptanceError(f"{where}: refusal worker differs from sealed manifest row")
+    if row["resolved_workers"] != "NA" or row["worker_policy"] != "unobserved":
+        raise AcceptanceError(f"{where}: refusal claims scheduler observations")
+    if row["process_rss_limit_bytes"] != manifest["rss_limit_bytes"]:
+        raise AcceptanceError(f"{where}: refusal process RSS cap differs from sealed manifest row")
+    if manifest["memory_budget_bytes"] != "-" and row["configured_chart_memory_budget"] != manifest["memory_budget_bytes"]:
+        raise AcceptanceError(f"{where}: refusal memory budget differs from sealed manifest row")
+    if manifest["expected_initial_score"] != "-" and row["initial_validated_parsimony_min"] != manifest["expected_initial_score"]:
+        raise AcceptanceError(f"{where}: refusal initial score differs from sealed manifest row")
+    for field in (
+        "search_semantic_sha256",
+        "output_semantic_sha256",
+        "trial_semantic_sha256",
+        "canonical_digest",
+    ):
+        if row[field] != "-":
+            raise AcceptanceError(f"{where}: refusal claims unavailable semantic field {field}")
+    peak = uint(row["peak_sampled_rss_kb"], f"{where} peak RSS", positive=True)
+    if peak * 1024 > uint(manifest["rss_limit_bytes"], f"{where} sealed RSS cap", positive=True):
+        raise AcceptanceError(f"{where}: refusal sampled RSS exceeds its sealed cap")
+
+    report = regular(Path(row["report_path"]), f"{where} refusal stdout")
+    if not exact_artifacts:
+        return
+    raw_root = regular(Path(row["__raw_path__"]), f"{where} owning raw TSV").parent
+    try:
+        report.relative_to(raw_root)
+    except ValueError as error:
+        raise AcceptanceError(f"{where}: refusal stdout escapes its evidence directory") from error
+    stdout_bytes = report.read_bytes()
+    if (
+        stdout_bytes != REAL_REFUSAL_STDOUT.encode("utf-8")
+        or hashlib.sha256(stdout_bytes).hexdigest() != REAL_REFUSAL_STDOUT_SHA256
+    ):
+        raise AcceptanceError(f"{where}: frozen refusal stdout changed")
+    stderr = regular(report.with_suffix(".err"), f"{where} refusal stderr")
+    stderr_bytes = stderr.read_bytes()
+    if hashlib.sha256(stderr_bytes).hexdigest() != manifest["expected_reason_sha256"]:
+        raise AcceptanceError(f"{where}: refusal stderr hash differs from sealed evidence")
+    try:
+        stderr_text = stderr_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise AcceptanceError(f"{where}: refusal stderr is not UTF-8") from error
+    if not stderr_text.endswith(REAL_REFUSAL_SUFFIX):
+        raise AcceptanceError(f"{where}: refusal stderr does not contain the sealed reason")
+    expected_output = raw_root / "outputs" / f"{report.stem}.pb.gz"
+    path_absent(expected_output, f"{where} derived output")
+
+
+def validate_timeout(
+    row: Mapping[str, str], label: str, base: ManifestChain
+) -> None:
+    where = f"{label} {row['row_id']} trial {row['trial_index']}"
+    manifest = base.rows.get(row["row_id"])
+    if manifest is None or manifest["expected_outcome"] != "timeout":
+        raise AcceptanceError(f"{where}: timeout is not declared by a sealed manifest row")
+    wanted = {
+        "status": "timeout",
+        "validation_status": "not_run",
+        "runner_outcome": "timed_out",
+        "timed_out": "1",
+        "monitor_error": "0",
+        "rss_limit_enabled": "1",
+        "rss_limit_observed": "0",
+        "rss_limit_exceeded": "0",
+        "rss_limit_trigger_bytes": "0",
+        "rss_limit_term_sent": "0",
+        "rss_limit_kill_sent": "0",
+    }
+    for field, value in wanted.items():
+        if row[field] != value:
+            raise AcceptanceError(f"{where}: timeout {field}={row[field]!r}, expected {value!r}")
+    for raw_key, manifest_key in (
+        ("fixture", "workload_name"),
+        ("method", "method"),
+        ("iterations", "iterations"),
+        ("seed", "seed"),
+        ("input_sha256", "primary_sha256"),
+        ("canonical_argv_sha256", "canonical_argv_sha256"),
+        ("manifest_rss_limit_bytes", "rss_limit_bytes"),
+        ("process_rss_limit_bytes", "rss_limit_bytes"),
+    ):
+        if row[raw_key] != manifest[manifest_key]:
+            raise AcceptanceError(f"{where}: timeout {raw_key} differs from sealed manifest row")
+    if row["requested_workers"] != expected_raw_worker(manifest):
+        raise AcceptanceError(f"{where}: timeout worker differs from sealed manifest row")
+    raw_refseq = "-" if row["refseq_sha256"] == "NA" else row["refseq_sha256"]
+    if raw_refseq != manifest["refseq_sha256"]:
+        raise AcceptanceError(f"{where}: timeout refseq SHA-256 differs from sealed manifest row")
+    if row["resolved_workers"] != "NA" or row["worker_policy"] != "timeout_unobserved":
+        raise AcceptanceError(f"{where}: timeout claims scheduler observations")
+    if manifest["memory_budget_bytes"] != "-" and row["configured_chart_memory_budget"] != manifest["memory_budget_bytes"]:
+        raise AcceptanceError(f"{where}: timeout memory budget differs from sealed manifest row")
+    for field in (
+        "search_semantic_sha256",
+        "output_semantic_sha256",
+        "trial_semantic_sha256",
+        "canonical_digest",
+    ):
+        if row[field] != "-":
+            raise AcceptanceError(f"{where}: timeout claims unavailable semantic field {field}")
+    decimal(row["wall_clock_s"], f"{where} wall_clock_s", positive=True)
+    decimal(row["user_cpu_s"], f"{where} user_cpu_s")
+    decimal(row["system_cpu_s"], f"{where} system_cpu_s")
+    peak = uint(row["peak_sampled_rss_kb"], f"{where} peak RSS", positive=True)
+    if peak * 1024 > uint(manifest["rss_limit_bytes"], f"{where} RSS cap", positive=True):
+        raise AcceptanceError(f"{where}: timeout sampled RSS exceeds sealed cap")
+
+
+def validate_evidence(
+    evidence: RawEvidence,
+    base: ManifestChain,
+    *,
+    required_rows: set[str],
+    required_refusal: bool = False,
+) -> int:
+    validated_required = 0
+    for row in evidence.rows:
+        required = row["row_id"] in required_rows
+        if required_refusal and required:
+            validate_refusal(row, evidence.label, base, exact_artifacts=True)
+        elif required:
+            validate_success(row, evidence.label, base)
+        elif row["status"] == "ok":
+            validate_success(row, evidence.label, base)
+        elif row["status"] == "timeout":
+            validate_timeout(row, evidence.label, base)
+        elif row["status"] == "scale_limit":
+            validate_success(
+                row, evidence.label, base, expected_status="scale_limit"
+            )
+        elif row["status"] == "expected_infeasible":
+            validate_refusal(row, evidence.label, base, exact_artifacts=False)
+        else:
+            raise AcceptanceError(
+                f"{evidence.label} {row['row_id']}: unsupported allowed-extra status {row['status']!r}"
+            )
+        if required:
+            validated_required += 1
+    for row_id in evidence.row_ids():
+        selected = [row for row in evidence.rows if row["row_id"] == row_id]
+        stable = ("fixture", "method", "requested_workers", "input_sha256", "refseq_sha256", "search_semantic_sha256", "output_semantic_sha256", "canonical_argv_sha256")
+        for key in stable:
+            if len({row[key] for row in selected}) != 1:
+                raise AcceptanceError(f"{evidence.label} {row_id}: {key} changes across repetitions")
+    if required_refusal:
+        output_roots = {
+            Path(row["__raw_path__"]).parent / "outputs"
+            for row in evidence.rows
+            if row["row_id"] in required_rows
+        }
+        for output_root in sorted(output_roots):
+            try:
+                info = output_root.lstat()
+            except OSError as error:
+                raise AcceptanceError(f"{evidence.label}: refusal output namespace is unavailable: {error}") from error
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise AcceptanceError(f"{evidence.label}: refusal output namespace is not a real directory")
+            with os.scandir(output_root) as entries:
+                unexpected = sorted(entry.name for entry in entries)
+            if unexpected:
+                raise AcceptanceError(
+                    f"{evidence.label}: refusal output namespace is not empty: {unexpected}"
+                )
+    return validated_required
+
+
+def validate_phase0(evidence: RawEvidence, base: ManifestChain) -> None:
+    actual_rows = evidence.row_ids()
+    sealed_rows = set(base.base.rows)
+    if actual_rows != sealed_rows:
+        raise AcceptanceError(
+            "Phase-0 capture row set is not the entire sealed base row set; "
+            f"missing={sorted(sealed_rows - actual_rows)}, "
+            f"unexpected={sorted(actual_rows - sealed_rows)}"
+        )
+    for row_id in sorted(evidence.row_ids()):
+        rows = [row for row in evidence.rows if row["row_id"] == row_id]
+        manifest = base.base.rows.get(row_id)
+        if manifest is None:
+            raise AcceptanceError(f"phase0 {row_id}: row is absent from the sealed base manifest")
+        statuses = {row["status"] for row in rows}
+        expected = manifest["expected_outcome"]
+        if statuses != {expected}:
+            raise AcceptanceError(
+                f"phase0 {row_id}: raw outcome {sorted(statuses)} differs from sealed {expected!r}"
+            )
+        indexes = sorted(
+            uint(row["trial_index"], f"phase0 {row_id} trial_index", positive=True)
+            for row in rows
+        )
+        if indexes != list(range(1, len(rows) + 1)):
+            raise AcceptanceError(f"phase0 {row_id}: trial indexes are not exactly 1..{len(rows)}")
+        expected_timeouts = uint(
+            manifest["expected_timeout_trials"],
+            f"phase0 {row_id} expected_timeout_trials",
+        )
+        if expected == "timeout" and len(rows) != expected_timeouts:
+            raise AcceptanceError(
+                f"phase0 {row_id}: timeout trial count {len(rows)} differs from sealed {expected_timeouts}"
+            )
+        for row in rows:
+            if expected == "timeout":
+                validate_timeout(row, "phase0", base)
+            elif expected in ("ok", "scale_limit"):
+                validate_success(row, "phase0", base, expected_status=expected)
+            elif expected == "expected_infeasible":
+                validate_refusal(row, "phase0", base, exact_artifacts=False)
+            else:
+                raise AcceptanceError(f"phase0 {row_id}: unsupported sealed outcome {expected!r}")
+
+
+def values(rows: Sequence[Mapping[str, str]], field: str, label: str) -> list[Decimal]:
+    return [decimal(row[field], f"{label} {field}") for row in rows]
+
+
+def med(evidence: RawEvidence, row_id: str, reps: int, field: str) -> Decimal:
+    return median(values(evidence.selected(row_id, reps), field, f"{evidence.label} {row_id}"), f"{evidence.label} {row_id} median {field}")
+
+
+def max_decimal(evidence: RawEvidence, row_id: str, reps: int, field: str) -> Decimal:
+    return max(values(evidence.selected(row_id, reps), field, f"{evidence.label} {row_id}"))
+
+
+def phase_sum(evidence: RawEvidence, row_id: str, reps: int, fields: Sequence[str]) -> Decimal:
+    samples = [sum((decimal(row[field], f"{row_id} {field}") for field in fields), Decimal(0)) for row in evidence.selected(row_id, reps)]
+    return median(samples, f"{evidence.label} {row_id} phase median")
+
+
+class Gates:
+    def __init__(self) -> None:
+        self.items: list[dict[str, object]] = []
+
+    def ratio(self, name: str, numerator: Decimal, denominator: Decimal, limit: Decimal) -> None:
+        if denominator <= 0:
+            raise AcceptanceError(f"{name}: denominator is not positive")
+        ratio = numerator / denominator
+        if ratio > limit:
+            raise AcceptanceError(f"{name}: ratio {ratio} exceeds {limit}")
+        self.items.append({"name": name, "status": "pass", "ratio": str(ratio), "limit": str(limit)})
+
+    def condition(self, name: str, condition: bool, detail: str) -> None:
+        if not condition:
+            raise AcceptanceError(f"{name}: {detail}")
+        self.items.append({"name": name, "status": "pass"})
+
+
+def baseline_compare(gates: Gates, name: str, phase0: RawEvidence, current: RawEvidence,
+                     base: ManifestChain, row_id: str, current_reps: int,
+                     field: str, limit: Decimal) -> None:
+    frozen = [row for row in phase0.rows if row["row_id"] == row_id]
+    if not frozen:
+        raise AcceptanceError(f"{name}: frozen Phase-0 row is missing: {row_id}")
+    finite = [row for row in frozen if row["status"] == "ok"]
+    timed = [row for row in frozen if row["status"] == "timeout"]
+    if finite and timed:
+        raise AcceptanceError(f"{name}: Phase-0 row mixes finite and timeout outcomes")
+    current_value = med(current, row_id, current_reps, field)
+    if timed:
+        manifest = base.base.rows.get(row_id)
+        if manifest is None:
+            raise AcceptanceError(f"{name}: timeout comparator is absent from sealed base")
+        expected_count = uint(
+            manifest["expected_timeout_trials"],
+            f"{name} expected timeout trials",
+            positive=True,
+        )
+        if len(timed) != expected_count:
+            raise AcceptanceError(
+                f"{name}: frozen timeout row has {len(timed)}/{expected_count} characterized trials"
+            )
+        gates.items.append({"name": name, "status": "pass", "comparison": "finite_completion_after_all_timeout"})
+        return
+    if not finite:
+        raise AcceptanceError(f"{name}: finite Phase-0 row has no captured trials")
+    base_value = median(values(finite, field, f"phase0 {row_id}"), f"phase0 {row_id} median")
+    gates.ratio(name, current_value, base_value, limit)
+
+
+def rss_max(evidence: RawEvidence, row_id: str, reps: int) -> int:
+    return max(uint(row["peak_sampled_rss_kb"], f"{row_id} RSS", positive=True) for row in evidence.selected(row_id, reps))
+
+
+def rss_pair(gates: Gates, name: str, evidence: RawEvidence, w1: str, w8: str, reps: int, global_cap: int) -> None:
+    one, eight = rss_max(evidence, w1, reps), rss_max(evidence, w8, reps)
+    gates.condition(name + "_ratio", eight <= 2 * one, f"W8 RSS {eight} KiB exceeds 2x W1 {one} KiB")
+    gates.condition(name + "_global", eight <= global_cap, f"W8 RSS {eight} KiB exceeds global cap {global_cap} KiB")
+
+
+def semantic_pair(evidence: RawEvidence, row_ids: Sequence[str], reps: int, label: str) -> None:
+    pairs = set()
+    for row_id in row_ids:
+        for row in evidence.selected(row_id, reps):
+            pairs.add((row["search_semantic_sha256"], row["output_semantic_sha256"]))
+    if len(pairs) != 1:
+        raise AcceptanceError(f"{label}: canonical search/output semantics differ")
+
+
+def top_report_value(path: Path, key: str) -> str:
+    path = regular(path, "recorded product report")
+    values: list[str] = []
+    in_search = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line == "chart_spr_search:":
+            if in_search:
+                raise AcceptanceError(f"{path}: duplicate chart_spr_search section")
+            in_search = True
+            continue
+        if in_search and line and not line.startswith(" "):
+            break
+        if in_search:
+            match = re.fullmatch(rf"  {re.escape(key)}:[ \t]*(\S+)[ \t]*", line)
+            if match:
+                values.append(match.group(1))
+    if len(values) != 1:
+        raise AcceptanceError(f"{path}: expected one top-level {key}, found {len(values)}")
+    return values[0]
+
+
+def lazy_auto_gate(gates: Gates, evidence: RawEvidence, prefix: str, reps: int, name: str, worker: int = 1) -> str:
+    off, on, auto = (f"{prefix}-{policy}-w{worker}" for policy in ("off", "on", "auto"))
+    off_m, on_m, auto_m = (med(evidence, rid, reps, "wall_clock_s") for rid in (off, on, auto))
+    faster = "off" if off_m <= on_m else "on"
+    fastest = min(off_m, on_m)
+    gates.ratio(name + "_wall", auto_m, fastest, Decimal("1.10"))
+    if max(off_m, on_m) / fastest > Decimal("1.10"):
+        for row in evidence.selected(auto, reps):
+            resolved = top_report_value(Path(row["report_path"]), "lazy_policy_resolved")
+            if resolved != faster:
+                raise AcceptanceError(f"{name}: auto resolved {resolved!r}, faster forced policy is {faster!r}")
+    return faster
+
+
+def verify_phase9_run_ledger_anchor(
+    raw_paths: Sequence[Path], expected_sha256: str
+) -> str:
+    if len(raw_paths) != 1:
+        raise AcceptanceError("phase9 requires exactly one sealed benchmark raw TSV")
+    if HASH_RE.fullmatch(expected_sha256) is None:
+        raise AcceptanceError(
+            "--expected-phase9-run-ledger-sha256 is not canonical lowercase SHA-256"
+        )
+    raw = regular(raw_paths[0], "phase9 raw TSV")
+    ledger = regular(raw.parent / "phase9-run-artifacts.tsv", "Phase-9 run artifact ledger")
+    seal = regular(raw.parent / "phase9-run-artifacts.tsv.sha256", "Phase-9 run artifact ledger seal")
+    ledger_sha = sha256_file(ledger)
+    if ledger_sha != expected_sha256:
+        raise AcceptanceError(
+            f"Phase-9 run ledger differs from external anchor: {ledger_sha} != {expected_sha256}"
+        )
+    if seal.read_bytes() != f"{ledger_sha}  {ledger.name}\n".encode("ascii"):
+        raise AcceptanceError("Phase-9 run ledger detached seal is invalid")
+    return ledger_sha
+
+
+def canonical_directory(path: Path, label: str) -> Path:
+    absolute = path.absolute()
+    try:
+        info = absolute.lstat()
+        resolved = absolute.resolve(strict=True)
+    except OSError as error:
+        raise AcceptanceError(f"{label} is unavailable: {path}: {error}") from error
+    if absolute != resolved or not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise AcceptanceError(f"{label} is not a canonical lexical directory: {path}")
+    return resolved
+
+
+def deep_phase9_validate(
+    manifests: ManifestChain,
+    raw: RawEvidence,
+    base_repo_root: Path,
+    working_repo_root: Path,
+    expected_run_ledger_sha256: str,
+) -> Mapping[str, object]:
+    if len(raw.paths) != 1:
+        raise AcceptanceError("phase9 requires exactly one sealed benchmark raw TSV")
+    tool = regular(
+        Path(__file__).with_name("wric_phase9_acceptance.py"),
+        "Phase-9 deep acceptance evaluator",
+    )
+    command = [
+        sys.executable,
+        os.fspath(tool),
+        "evaluate",
+        "--raw-trials",
+        os.fspath(raw.paths[0]),
+        "--base-manifest",
+        os.fspath(manifests.base.path),
+        "--expected-parent-sha256",
+        manifests.base.sha256,
+        "--supplement",
+        os.fspath(manifests.supplements["phase9"].path),
+        "--base-repo-root",
+        os.fspath(base_repo_root),
+        "--working-repo-root",
+        os.fspath(working_repo_root),
+        "--expected-run-ledger-sha256",
+        expected_run_ledger_sha256,
+    ]
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        command,
+        cwd=working_repo_root,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+        raise AcceptanceError(f"deep Phase-9 acceptance failed: {detail}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise AcceptanceError(f"deep Phase-9 acceptance emitted invalid JSON: {error}") from error
+    if not isinstance(payload, dict) or payload.get("status") != "pass":
+        raise AcceptanceError("deep Phase-9 acceptance did not return final status=pass")
+    return payload
+
+
+Phase9Validator = Callable[
+    [ManifestChain, RawEvidence, Path, Path, str], Mapping[str, object]
+]
+
+
+def evaluate(
+    base: ManifestChain,
+    phase0: RawEvidence,
+    phase0_artifact_ledger: Phase0ArtifactLedger,
+    runs: Mapping[str, RawEvidence],
+    *,
+    base_repo_root: Path,
+    working_repo_root: Path,
+    phase9_run_ledger_sha256: str,
+    phase9_validator: Phase9Validator = deep_phase9_validate,
+) -> dict[str, object]:
+    validate_phase0(phase0, base)
+
+    # Required row/cardinality contracts.  A direct harness output is
+    # group-complete, so sealed extras from these groups remain admissible.
+    phase1_ids = {MEDIUM_DENSE.format(1), SMALL_DENSE.format(1), SMALL_EXACT.format(1), MEDIUM_CACHE.format(1), MEDIUM_LAZY.format(1)}
+    phase2_ids = {MEDIUM_DENSE.format(1), SMALL_EXACT.format(1)}
+    phase3_ids = {SMALL_DENSE.format(1), SMALL_DENSE.format(8)}
+    phase5_ids = {MEDIUM_EXACT.format(1), MEDIUM_EXACT.format(8)}
+    runs["phase1"].required_rows(phase1_ids, 5, base)
+    runs["phase2"].required_rows(phase2_ids, 5, base)
+    runs["phase3"].required_rows(phase3_ids, 5, base)
+    runs["phase5"].required_rows(phase5_ids, 5, base)
+
+    high_prefix = "phase7-lazy-high-compression"
+    dense_prefix = "phase7-lazy-dense-favoring"
+    high_ids = {f"{high_prefix}-{policy}-w{worker}" for policy in ("off", "on", "auto") for worker in (1, 8)}
+    runs["phase7-high"].required_rows(high_ids, 5, base)
+    small_ids = {SMALL_DENSE.format(worker) for worker in (1, 8)} | {f"phase7-lazy-completion-tree0-on-w{worker}" for worker in (1, 8)}
+    runs["phase7-small"].required_rows(small_ids, 5, base)
+    medium_ids = {MEDIUM_DENSE.format(worker) for worker in (1, 8)} | {MEDIUM_LAZY.format(worker) for worker in (1, 8)} | {f"phase7-lazy-completion-medium-auto-w{worker}" for worker in (1, 8)}
+    dense_ids = {f"{dense_prefix}-{policy}-w{worker}" for policy in ("off", "on", "auto") for worker in (1, 8)}
+    runs["phase7-auto"].required_rows(medium_ids | dense_ids, 5, base)
+    phase8_ids = {f"phase8-generation-tree0-off-w{worker}" for worker in (1, 8)}
+    runs["phase8-generation"].required_rows(phase8_ids, 5, base)
+    runs["phase8-end-to-end"].required_rows(phase8_ids, 5, base)
+
+    final_primary = base.group("p0-primary-physical", {"1", "8"})
+    runs["final-primary"].required_rows(final_primary, 5, base)
+    final_smt = base.group("p0-primary-smt", {"1", "2", "4", "8", "16", "auto"})
+    runs["final-smt"].required_rows(final_smt, 3, base)
+    final_small = base.group("p0-small-auto", {"1", "auto"})
+    runs["final-small-auto"].required_rows(final_small, 5, base)
+    unpinned_group = "p0-primary-unpinned" if any(row["run_group"] == "p0-primary-unpinned" for row in base.base.rows.values()) else "p0-primary-smt"
+    final_unpinned = base.group(unpinned_group, {"auto"})
+    runs["final-unpinned-auto"].required_rows(final_unpinned, 5, base)
+    final_default = base.group(unpinned_group, {"auto", "default"})
+    runs["final-default-auto"].required_rows(final_default, 5, base)
+    final_stress = base.group("p0-stress-physical", {"1", "8"})
+    runs["final-stress"].required_rows(final_stress, 3, base)
+    final_real = base.group("real-bounded", {"1", "8"})
+    runs["final-real"].required_rows(final_real, 3, base)
+    phase9_ids = {f"phase9-local-commit-seed{seed}-w{worker}" for seed in (1, 7, 19) for worker in (1, 8)}
+    runs["phase9"].required_rows(phase9_ids, 3, base)
+    required_by_label = {
+        "phase1": phase1_ids,
+        "phase2": phase2_ids,
+        "phase3": phase3_ids,
+        "phase5": phase5_ids,
+        "phase7-high": high_ids,
+        "phase7-small": small_ids,
+        "phase7-auto": medium_ids | dense_ids,
+        "phase8-generation": phase8_ids,
+        "phase8-end-to-end": phase8_ids,
+        "final-primary": final_primary,
+        "final-smt": final_smt,
+        "final-small-auto": final_small,
+        "final-unpinned-auto": final_unpinned,
+        "final-default-auto": final_default,
+        "final-stress": final_stress,
+        "final-real": final_real,
+        "phase9": phase9_ids,
+    }
+    validated_required: dict[str, int] = {}
+    for label in RUN_LABELS:
+        validated_required[label] = validate_evidence(
+            runs[label],
+            base,
+            required_rows=required_by_label[label],
+            required_refusal=(label == "final-real"),
+        )
+    phase9_result = phase9_validator(
+        base,
+        runs["phase9"],
+        base_repo_root,
+        working_repo_root,
+        phase9_run_ledger_sha256,
+    )
+    if not isinstance(phase9_result, Mapping) or phase9_result.get("status") != "pass":
+        raise AcceptanceError("deep Phase-9 validator did not return final status=pass")
+
+    memory_bytes = physical_memory_bytes()
+    global_rss_cap_kb = min(16 * 1024 * 1024, memory_bytes // (4 * 1024))
+    gates = Gates()
+
+    # Phases 1-3.
+    for row_id, field in (
+        (MEDIUM_DENSE.format(1), "local_scoring_ms"),
+        (SMALL_DENSE.format(1), "wall_clock_s"),
+        (SMALL_EXACT.format(1), "wall_clock_s"),
+        (MEDIUM_CACHE.format(1), "wall_clock_s"),
+        (MEDIUM_LAZY.format(1), "wall_clock_s"),
+    ):
+        baseline_compare(gates, f"phase1_{row_id}", phase0, runs["phase1"], base, row_id, 5, field, Decimal("1.05"))
+    baseline_compare(gates, "phase2_medium_local_vs_phase0", phase0, runs["phase2"], base, MEDIUM_DENSE.format(1), 5, "local_scoring_ms", Decimal("0.70"))
+    gates.ratio("phase2_medium_local_vs_phase1", med(runs["phase2"], MEDIUM_DENSE.format(1), 5, "local_scoring_ms"), med(runs["phase1"], MEDIUM_DENSE.format(1), 5, "local_scoring_ms"), Decimal("1.05"))
+    gates.ratio("phase2_small_exact_vs_phase1", med(runs["phase2"], SMALL_EXACT.format(1), 5, "wall_clock_s"), med(runs["phase1"], SMALL_EXACT.format(1), 5, "wall_clock_s"), Decimal("0.75"))
+    for row_id in (MEDIUM_DENSE.format(1), SMALL_EXACT.format(1)):
+        frozen = [row for row in phase0.rows if row["row_id"] == row_id and row["status"] == "ok"]
+        if not frozen:
+            raise AcceptanceError(
+                f"phase2 RSS comparator {row_id} lacks finite Phase-0 trials"
+            )
+        current_rss = rss_max(runs["phase2"], row_id, 5)
+        frozen_rss = max(uint(row["peak_sampled_rss_kb"], f"phase0 {row_id} RSS") for row in frozen)
+        gates.condition(f"phase2_{row_id}_rss", Decimal(current_rss) <= Decimal("1.25") * frozen_rss, "RSS exceeds 1.25x Phase 0")
+    gates.ratio("phase3_small_w8_over_w1", med(runs["phase3"], SMALL_DENSE.format(8), 5, "wall_clock_s"), med(runs["phase3"], SMALL_DENSE.format(1), 5, "wall_clock_s"), Decimal("1.05"))
+
+    # Phase 5 exact span and timeout bounds.
+    p5_w1, p5_w8 = MEDIUM_EXACT.format(1), MEDIUM_EXACT.format(8)
+    gates.ratio("phase5_exact_span_w8_over_w1", phase_sum(runs["phase5"], p5_w8, 5, ("exact_initialization_ms", "exact_verification_ms")), phase_sum(runs["phase5"], p5_w1, 5, ("exact_initialization_ms", "exact_verification_ms")), Decimal("0.50"))
+    gates.condition("phase5_w1_under_600s", max_decimal(runs["phase5"], p5_w1, 5, "wall_clock_s") < 600, "a W1 trial reached the frozen timeout")
+    gates.condition("phase5_w8_under_180s", max_decimal(runs["phase5"], p5_w8, 5, "wall_clock_s") < 180, "a W8 trial reached 180 seconds")
+    rss_pair(gates, "phase5", runs["phase5"], p5_w1, p5_w8, 5, global_rss_cap_kb)
+
+    # Phase 7 forced scaling, automatic policy, and both named branches.
+    gates.ratio("phase7_high_forced_lazy_w8_over_w1", med(runs["phase7-high"], f"{high_prefix}-on-w8", 5, "wall_clock_s"), med(runs["phase7-high"], f"{high_prefix}-on-w1", 5, "wall_clock_s"), Decimal(2) / 3)
+    small_on1, small_on8 = "phase7-lazy-completion-tree0-on-w1", "phase7-lazy-completion-tree0-on-w8"
+    gates.ratio("phase7_small_forced_lazy_w8_over_w1", med(runs["phase7-small"], small_on8, 5, "wall_clock_s"), med(runs["phase7-small"], small_on1, 5, "wall_clock_s"), Decimal("1.10"))
+    semantic_pair(runs["phase7-high"], tuple(sorted(high_ids)), 5, "phase7 high-compression forced/auto")
+    semantic_pair(runs["phase7-small"], tuple(sorted(small_ids)), 5, "phase7 named small dense/lazy")
+    semantic_pair(runs["phase7-auto"], tuple(sorted(dense_ids)), 5, "phase7 dense-favoring forced/auto")
+    high_branch = lazy_auto_gate(gates, runs["phase7-high"], high_prefix, 5, "phase7_high_auto_w1", 1)
+    lazy_auto_gate(gates, runs["phase7-high"], high_prefix, 5, "phase7_high_auto_w8", 8)
+    dense_branch = lazy_auto_gate(gates, runs["phase7-auto"], dense_prefix, 5, "phase7_dense_auto_w1", 1)
+    lazy_auto_gate(gates, runs["phase7-auto"], dense_prefix, 5, "phase7_dense_auto_w8", 8)
+    medium_off, medium_on, medium_auto = MEDIUM_DENSE.format(1), MEDIUM_LAZY.format(1), "phase7-lazy-completion-medium-auto-w1"
+    medium_medians = {"off": med(runs["phase7-auto"], medium_off, 5, "wall_clock_s"), "on": med(runs["phase7-auto"], medium_on, 5, "wall_clock_s")}
+    faster_medium = min(medium_medians, key=medium_medians.get)  # type: ignore[arg-type]
+    gates.ratio("phase7_medium_auto_wall", med(runs["phase7-auto"], medium_auto, 5, "wall_clock_s"), min(medium_medians.values()), Decimal("1.10"))
+    if max(medium_medians.values()) / min(medium_medians.values()) > Decimal("1.10"):
+        for row in runs["phase7-auto"].selected(medium_auto, 5):
+            if top_report_value(Path(row["report_path"]), "lazy_policy_resolved") != faster_medium:
+                raise AcceptanceError("phase7 medium auto did not select the faster forced representation")
+    medium_off8, medium_on8, medium_auto8 = MEDIUM_DENSE.format(8), MEDIUM_LAZY.format(8), "phase7-lazy-completion-medium-auto-w8"
+    medium8 = {
+        "off": med(runs["phase7-auto"], medium_off8, 5, "wall_clock_s"),
+        "on": med(runs["phase7-auto"], medium_on8, 5, "wall_clock_s"),
+    }
+    gates.ratio("phase7_medium_auto_wall_w8", med(runs["phase7-auto"], medium_auto8, 5, "wall_clock_s"), min(medium8.values()), Decimal("1.10"))
+    if max(medium8.values()) / min(medium8.values()) > Decimal("1.10"):
+        faster8 = min(medium8, key=medium8.get)  # type: ignore[arg-type]
+        for row in runs["phase7-auto"].selected(medium_auto8, 5):
+            if top_report_value(Path(row["report_path"]), "lazy_policy_resolved") != faster8:
+                raise AcceptanceError("phase7 medium W8 auto did not select the faster forced representation")
+    semantic_pair(
+        runs["phase7-auto"],
+        (medium_off, medium_on, medium_auto, medium_off8, medium_on8, medium_auto8),
+        5,
+        "phase7 medium forced/auto",
+    )
+    gates.condition("phase7_named_auto_branches", {high_branch, dense_branch} == {"on", "off"}, "named fixtures did not exercise both lazy and dense automatic branches")
+    for evidence, one, eight, name in (
+        (runs["phase7-high"], f"{high_prefix}-on-w1", f"{high_prefix}-on-w8", "phase7_high"),
+        (runs["phase7-small"], small_on1, small_on8, "phase7_small"),
+    ):
+        rss_pair(gates, name, evidence, one, eight, 5, global_rss_cap_kb)
+
+    # Phase 8 generation and end-to-end non-regression from Phase 7.
+    p8_w1, p8_w8 = "phase8-generation-tree0-off-w1", "phase8-generation-tree0-off-w8"
+    semantic_pair(runs["phase8-generation"], (p8_w1, p8_w8), 5, "phase8")
+    current_semantics = {
+        (row["search_semantic_sha256"], row["output_semantic_sha256"])
+        for row in runs["phase8-generation"].rows
+    }
+    prior_semantics = {
+        (row["search_semantic_sha256"], row["output_semantic_sha256"])
+        for row in runs["phase8-end-to-end"].rows
+    }
+    gates.condition("phase8_phase7_semantics", current_semantics == prior_semantics, "Phase-8 and same-workload Phase-7 semantics differ")
+    gates.ratio("phase8_generation_w8_over_w1", med(runs["phase8-generation"], p8_w8, 5, "candidate_generation_ms"), med(runs["phase8-generation"], p8_w1, 5, "candidate_generation_ms"), Decimal("0.50"))
+    for worker in (1, 8):
+        rid = f"phase8-generation-tree0-off-w{worker}"
+        gates.ratio(f"phase8_end_to_end_w{worker}_vs_phase7", med(runs["phase8-generation"], rid, 5, "wall_clock_s"), med(runs["phase8-end-to-end"], rid, 5, "wall_clock_s"), Decimal("1.00"))
+    rss_pair(gates, "phase8", runs["phase8-generation"], p8_w1, p8_w8, 5, global_rss_cap_kb)
+
+    # Final primary parity and same-revision scaling.
+    primary = runs["final-primary"]
+    native_id = unique_method_id(primary, METHOD_NATIVE, "native", 5)
+    grammar1 = unique_method_id(primary, METHOD_EXACT, "1", 5)
+    grammar8 = unique_method_id(primary, METHOD_EXACT, "8", 5)
+    native_trials = {row["trial_index"]: row for row in primary.selected(native_id, 5)}
+    grammar_trials = {row["trial_index"]: row for row in primary.selected(grammar8, 5)}
+    pair_ratios = [decimal(grammar_trials[index]["wall_clock_s"], "chart wall") / decimal(native_trials[index]["wall_clock_s"], "native wall", positive=True) for index in sorted(native_trials)]
+    gates.ratio("final_primary_grammar_native_median", med(primary, grammar8, 5, "wall_clock_s"), med(primary, native_id, 5, "wall_clock_s"), Decimal("1.00"))
+    gates.condition("final_primary_paired_majority", sum(ratio <= 1 for ratio in pair_ratios) >= 3, "fewer than 3/5 chart trials beat their native peer")
+    gates.condition("final_primary_paired_outlier", max(pair_ratios) <= Decimal("1.15"), "a paired chart/native ratio exceeds 1.15")
+    gates.ratio("final_primary_w8_over_w1", med(primary, grammar8, 5, "wall_clock_s"), med(primary, grammar1, 5, "wall_clock_s"), Decimal("0.50"))
+    semantic_pair(primary, (grammar1, grammar8), 5, "final primary grammar")
+    for field in ("initial_chart_construction_ms", "local_scoring_ms", "exact_verification_ms"):
+        phase_one = med(primary, grammar1, 5, field)
+        wall_ms = med(primary, grammar1, 5, "wall_clock_s") * 1000
+        if phase_one >= wall_ms * Decimal("0.10"):
+            gates.ratio(f"final_primary_{field}_w8_over_w1", med(primary, grammar8, 5, field), phase_one, Decimal(2) / 3)
+        else:
+            gates.items.append({"name": f"final_primary_{field}_w8_over_w1", "status": "pass", "comparison": "profile_exempt_below_10_percent"})
+    rss_pair(gates, "final_primary", primary, grammar1, grammar8, 5, global_rss_cap_kb)
+    for method in (METHOD_SAMPLED, METHOD_HYBRID):
+        current = unique_method_id(primary, method, "8", 5)
+        baseline_compare(gates, f"final_{method}_phase0_nonregression", phase0, primary, base, current, 5, "wall_clock_s", Decimal("1.00"))
+
+    # Same-affinity automatic policy, small guard, unpinned parity, and default.
+    smt = runs["final-smt"]
+    smt_auto = unique_method_id(smt, METHOD_EXACT, "auto", 3)
+    explicit = [unique_method_id(smt, METHOD_EXACT, str(worker), 3) for worker in (1, 2, 4, 8, 16)]
+    best = min(med(smt, rid, 3, "wall_clock_s") for rid in explicit)
+    gates.ratio("final_smt_auto_vs_best_explicit", med(smt, smt_auto, 3, "wall_clock_s"), best, Decimal("1.10"))
+    semantic_pair(smt, (*explicit, smt_auto), 3, "final SMT automatic policy")
+    small = runs["final-small-auto"]
+    small1 = unique_method_id(small, METHOD_LB, "1", 5)
+    small_auto = unique_method_id(small, METHOD_LB, "auto", 5)
+    gates.ratio("final_small_auto_over_w1", med(small, small_auto, 5, "wall_clock_s"), med(small, small1, 5, "wall_clock_s"), Decimal("1.10"))
+    unpinned = runs["final-unpinned-auto"]
+    unpinned_native = unique_method_id(unpinned, METHOD_NATIVE, "native", 5)
+    unpinned_auto = unique_method_id(unpinned, METHOD_EXACT, "auto", 5)
+    gates.ratio("final_unpinned_auto_native_parity", med(unpinned, unpinned_auto, 5, "wall_clock_s"), med(unpinned, unpinned_native, 5, "wall_clock_s"), Decimal("1.00"))
+    default = runs["final-default-auto"]
+    default_id = unique_method_id(default, METHOD_EXACT, "default", 5)
+    default_auto = unique_method_id(default, METHOD_EXACT, "auto", 5)
+    d_trials = {row["trial_index"]: row for row in default.selected(default_id, 5)}
+    a_trials = {row["trial_index"]: row for row in default.selected(default_auto, 5)}
+    for index in sorted(d_trials):
+        if d_trials[index]["worker_policy"] != "automatic_default" or a_trials[index]["worker_policy"] != "automatic":
+            raise AcceptanceError("final default/auto worker-policy labels are not exact")
+        if d_trials[index]["resolved_workers"] != a_trials[index]["resolved_workers"]:
+            raise AcceptanceError("final default/auto resolved worker counts differ")
+        if decimal(d_trials[index]["wall_clock_s"], "default wall") > Decimal("1.10") * decimal(a_trials[index]["wall_clock_s"], "auto wall"):
+            raise AcceptanceError("final default is more than 10% slower than auto in a paired trial")
+    semantic_pair(default, (default_id, default_auto), 5, "final default/auto")
+    gates.ratio("final_default_over_auto_median", med(default, default_id, 5, "wall_clock_s"), med(default, default_auto, 5, "wall_clock_s"), Decimal("1.10"))
+
+    # Stress.  Phase 9 is accepted only by the delegated deep evaluator.
+    stress = runs["final-stress"]
+    for row_id in sorted(stress.row_ids()):
+        row = stress.selected(row_id, 3)[0]
+        if row["method"] == METHOD_NATIVE or row["requested_workers"] != "1":
+            continue
+        peer = next((rid for rid in stress.row_ids() if stress.selected(rid, 3)[0]["method"] == row["method"] and stress.selected(rid, 3)[0]["fixture"] == row["fixture"] and stress.selected(rid, 3)[0]["requested_workers"] == "8"), None)
+        if peer is None:
+            raise AcceptanceError(f"stress row {row_id} lacks its W8 peer")
+        threshold = Decimal("1.00") if med(stress, row_id, 3, "total_ms") >= 100 else Decimal("1.10")
+        gates.ratio(f"final_stress_{row_id}_w8_over_w1", med(stress, peer, 3, "wall_clock_s"), med(stress, row_id, 3, "wall_clock_s"), threshold)
+        rss_pair(gates, f"final_stress_{row_id}", stress, row_id, peer, 3, global_rss_cap_kb)
+
+    expected_refusal_trials = len(final_real) * 3
+    gates.condition(
+        "final_real_bounded_contract",
+        validated_required["final-real"] == expected_refusal_trials,
+        "validated refusal trial count differs from exact required matrix: "
+        f"{validated_required['final-real']}/{expected_refusal_trials}",
+    )
+
+    phase0.unchanged()
+    phase0_artifact_ledger.unchanged()
+    for evidence in runs.values():
+        evidence.unchanged()
+    base.base.unchanged()
+    for supplement in base.supplements.values():
+        supplement.unchanged()
+    return {
+        "schema": SCHEMA,
+        "schema_version": SCHEMA_VERSION,
+        "status": "pass",
+        "base_manifest": os.fspath(base.path),
+        "base_manifest_sha256": base.sha256,
+        "phase0_artifact_ledger": os.fspath(phase0_artifact_ledger.path),
+        "phase0_artifact_ledger_sha256": phase0_artifact_ledger.sha256,
+        "base_repo_root": os.fspath(base_repo_root),
+        "working_repo_root": os.fspath(working_repo_root),
+        "supplement_manifests": {
+            label: {
+                "path": os.fspath(base.supplements[label].path),
+                "sha256": base.supplements[label].sha256,
+            }
+            for label in SUPPLEMENT_SPECS
+        },
+        "run_labels": list(RUN_LABELS),
+        "global_rss_cap_kb": global_rss_cap_kb,
+        "gates": gates.items,
+        "phase9_acceptance": dict(phase9_result),
+    }
+
+
+def unique_method_id(evidence: RawEvidence, method: str, worker: str, reps: int) -> str:
+    ids = {row["row_id"] for row in evidence.rows if row["method"] == method and row["requested_workers"] == worker}
+    if len(ids) != 1:
+        raise AcceptanceError(f"{evidence.label}: expected one {method}@{worker} row, found {sorted(ids)}")
+    row_id = next(iter(ids))
+    evidence.selected(row_id, reps)
+    return row_id
+
+
+def physical_memory_bytes() -> int:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            match = re.fullmatch(r"MemTotal:\s+([1-9][0-9]*) kB", line)
+            if match:
+                return int(match.group(1)) * 1024
+    except OSError as error:
+        raise AcceptanceError(f"cannot read physical memory: {error}") from error
+    raise AcceptanceError("cannot determine physical memory")
+
+
+def run_assignment(value: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("--run must be LABEL=raw.tsv")
+    label, path = value.split("=", 1)
+    if label not in RUN_LABELS or not path:
+        raise argparse.ArgumentTypeError(f"unknown/empty --run assignment {value!r}")
+    return label, Path(path)
+
+
+def supplement_assignment(value: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("--supplement must be LABEL=manifest.tsv")
+    label, path = value.split("=", 1)
+    if label not in SUPPLEMENT_SPECS or not path:
+        raise argparse.ArgumentTypeError(f"unknown/empty --supplement assignment {value!r}")
+    return label, Path(path)
+
+
+def supplement_hash_assignment(value: str) -> tuple[str, str]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError(
+            "--expected-supplement-sha256 must be LABEL=HASH"
+        )
+    label, digest = value.split("=", 1)
+    if label not in SUPPLEMENT_SPECS or not digest:
+        raise argparse.ArgumentTypeError(
+            f"unknown/empty --expected-supplement-sha256 assignment {value!r}"
+        )
+    return label, digest
+
+
+def raw_hash_assignment(value: str) -> tuple[str, str]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("--expected-raw-sha256 must be LABEL=HASH")
+    label, digest = value.split("=", 1)
+    if label not in ("phase0", *RUN_LABELS) or not digest:
+        raise argparse.ArgumentTypeError(
+            f"unknown/empty --expected-raw-sha256 assignment {value!r}"
+        )
+    return label, digest
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    commands = result.add_subparsers(dest="command", required=True)
+    evaluate_parser = commands.add_parser("evaluate", help="perform every cross-phase gate read-only")
+    evaluate_parser.add_argument("--base-manifest", type=Path, required=True)
+    evaluate_parser.add_argument("--expected-base-sha256", required=True)
+    evaluate_parser.add_argument("--base-repo-root", type=Path, required=True)
+    evaluate_parser.add_argument("--working-repo-root", type=Path, required=True)
+    evaluate_parser.add_argument(
+        "--phase0-artifact-ledger", type=Path, required=True
+    )
+    evaluate_parser.add_argument(
+        "--expected-phase0-artifact-ledger-sha256", required=True
+    )
+    evaluate_parser.add_argument(
+        "--supplement", type=supplement_assignment, action="append",
+        required=True, metavar="LABEL=manifest.tsv",
+    )
+    evaluate_parser.add_argument(
+        "--expected-supplement-sha256", type=supplement_hash_assignment,
+        action="append", required=True, metavar="LABEL=HASH",
+    )
+    evaluate_parser.add_argument("--phase0-raw", type=Path, action="append", required=True)
+    evaluate_parser.add_argument("--run", type=run_assignment, action="append", required=True, metavar="LABEL=raw.tsv")
+    evaluate_parser.add_argument(
+        "--expected-raw-sha256", type=raw_hash_assignment, action="append",
+        required=True, metavar="LABEL=HASH",
+    )
+    evaluate_parser.add_argument(
+        "--expected-phase9-run-ledger-sha256", required=True
+    )
+    return result
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    phase9_validator: Phase9Validator = deep_phase9_validate,
+) -> int:
+    args = parser().parse_args(argv)
+    try:
+        assignments: dict[str, list[Path]] = {}
+        raw_hashes: dict[str, list[str]] = {}
+        supplement_paths: dict[str, Path] = {}
+        supplement_hashes: dict[str, str] = {}
+        all_paths: set[Path] = set()
+        for label, path in args.run:
+            assignments.setdefault(label, []).append(path)
+        for label, digest in args.expected_raw_sha256:
+            raw_hashes.setdefault(label, []).append(digest)
+        for label, path in args.supplement:
+            if label in supplement_paths:
+                raise AcceptanceError(f"duplicate supplement assignment for {label}")
+            supplement_paths[label] = path
+        for label, digest in args.expected_supplement_sha256:
+            if label in supplement_hashes:
+                raise AcceptanceError(f"duplicate supplement SHA-256 anchor for {label}")
+            supplement_hashes[label] = digest
+        labels = set(assignments)
+        expected = set(RUN_LABELS)
+        if labels != expected:
+            raise AcceptanceError(f"run-label set mismatch; missing={sorted(expected-labels)}, unexpected={sorted(labels-expected)}")
+        expected_raw_labels = {"phase0", *RUN_LABELS}
+        if set(raw_hashes) != expected_raw_labels:
+            raise AcceptanceError(
+                f"raw-anchor label set mismatch; missing={sorted(expected_raw_labels-set(raw_hashes))}, "
+                f"unexpected={sorted(set(raw_hashes)-expected_raw_labels)}"
+            )
+        for label, paths in assignments.items():
+            for path in paths:
+                canonical = regular(path, f"{label} raw TSV")
+                if canonical in all_paths:
+                    raise AcceptanceError(f"raw TSV reused across run labels: {canonical}")
+                all_paths.add(canonical)
+        phase9_run_ledger_sha256 = verify_phase9_run_ledger_anchor(
+            assignments["phase9"], args.expected_phase9_run_ledger_sha256
+        )
+        base_repo_root = canonical_directory(
+            args.base_repo_root, "sealed base repository root"
+        )
+        working_repo_root = canonical_directory(
+            args.working_repo_root, "working product repository root"
+        )
+        phase0_artifact_ledger = load_phase0_artifact_ledger(
+            args.phase0_artifact_ledger,
+            args.expected_phase0_artifact_ledger_sha256,
+            base_repo_root,
+        )
+        verify_phase0_raw_arguments(
+            args.phase0_raw,
+            raw_hashes["phase0"],
+            phase0_artifact_ledger,
+        )
+        base = load_manifest_chain(
+            args.base_manifest,
+            args.expected_base_sha256,
+            supplement_paths,
+            supplement_hashes,
+        )
+        phase0 = load_raw("phase0", args.phase0_raw, raw_hashes["phase0"])
+        if any(path in all_paths for path in phase0.paths):
+            raise AcceptanceError("Phase-0 raw TSV is reused as a later run")
+        runs = {
+            label: load_raw(label, paths, raw_hashes[label])
+            for label, paths in assignments.items()
+        }
+        result = evaluate(
+            base,
+            phase0,
+            phase0_artifact_ledger,
+            runs,
+            base_repo_root=base_repo_root,
+            working_repo_root=working_repo_root,
+            phase9_run_ledger_sha256=phase9_run_ledger_sha256,
+            phase9_validator=phase9_validator,
+        )
+        sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        return 0
+    except (AcceptanceError, OSError, UnicodeError, ValueError, csv.Error) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

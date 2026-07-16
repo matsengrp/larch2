@@ -1239,6 +1239,10 @@ add_test(NAME wric_phase4_acceptance_test
 add_test(NAME wric_phase9_acceptance_test
          COMMAND python3 test/wric_phase9_acceptance_test.py
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME wric_cross_phase_acceptance_test
+         COMMAND python3 test/wric_cross_phase_acceptance_test.py
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(wric_cross_phase_acceptance_test PROPERTIES TIMEOUT 90)
 
 # Phase 10 (cross-cutting CLI / report / identity surface) library-level tests.
 add_executable(chart_spr_phase10_test test/chart_spr_phase10_test.cpp)
