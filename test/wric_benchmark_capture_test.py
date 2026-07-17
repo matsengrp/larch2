@@ -1756,7 +1756,7 @@ class BenchmarkCaptureTest(unittest.TestCase):
     def test_historical_run_labels_require_their_exact_product_revision(self) -> None:
         self.assertEqual(
             capture_tool.HISTORICAL_RUN_REVISIONS["phase8-generation"],
-            "a21ab7aef81d3309c8f6c07cb7d5b3ddf4d19638",
+            "94a63238d25a8e3262428419d53f8f0986e8879b",
         )
         for label, revision in capture_tool.HISTORICAL_RUN_REVISIONS.items():
             with self.subTest(label=label):

@@ -210,7 +210,7 @@ HISTORICAL_RUN_REVISIONS: Mapping[str, str] = {
     "phase7-small": "38e9a281396e5263647ba68724414848841525d7",
     "phase7-auto": "38e9a281396e5263647ba68724414848841525d7",
     "phase8-end-to-end": "38e9a281396e5263647ba68724414848841525d7",
-    "phase8-generation": "a21ab7aef81d3309c8f6c07cb7d5b3ddf4d19638",
+    "phase8-generation": "94a63238d25a8e3262428419d53f8f0986e8879b",
 }
 
 SAFE_HARNESS_ENVIRONMENT = {
