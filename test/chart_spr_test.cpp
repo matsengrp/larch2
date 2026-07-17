@@ -1597,6 +1597,18 @@ static void test_phase8_projection_budget_and_failure_atomicity() {
       prepared, submit_options, radius, submit_rng);
   submit_options.force_sampled_tree_projection_submit_failure_after_for_tests =
       1;
+  larch::sampled_tree_projection_scheduler_diagnostics submit_diagnostics;
+  submit_options.sampled_tree_projection_scheduler_diagnostics_sink =
+      &submit_diagnostics;
+  std::atomic<std::size_t> submit_application_failures{0};
+  submit_options.before_sampled_tree_projection_for_tests =
+      [&](std::size_t ordinal) {
+        if (ordinal == 0) {
+          submit_application_failures.fetch_add(1, std::memory_order_relaxed);
+          throw std::runtime_error(
+              "application failure behind scheduler submission failure");
+        }
+      };
   auto submit_before = submit_scheduler.metrics();
   std::size_t submit_gather_calls = 0;
   bool submit_failed = false;
@@ -1612,6 +1624,9 @@ static void test_phase8_projection_budget_and_failure_atomicity() {
   }
   CHECK(submit_failed);
   CHECK(submit_gather_calls == 0);
+  CHECK(submit_application_failures.load(std::memory_order_relaxed) == 1);
+  CHECK(submit_diagnostics.operations == 1);
+  CHECK(submit_diagnostics.worker_tasks == 1);
   auto submit_after = submit_scheduler.metrics();
   CHECK(submit_after.tasks_submitted - submit_before.tasks_submitted == 1);
   CHECK(submit_after.tasks_completed - submit_before.tasks_completed == 1);
@@ -1619,9 +1634,123 @@ static void test_phase8_projection_budget_and_failure_atomicity() {
   CHECK(submit_after.pending_tasks == 0);
   submit_options.force_sampled_tree_projection_submit_failure_after_for_tests
       .reset();
+  submit_options.before_sampled_tree_projection_for_tests = {};
+  submit_options.sampled_tree_projection_scheduler_diagnostics_sink = nullptr;
   auto submit_recovered =
       collect_projection(submit_preassignment, submit_options);
   check_projection_vectors(baseline, submit_recovered);
+
+  // Nested same-scheduler fallback inherits the outer stable slot even when
+  // the inner projection plan has fewer worker tasks.  The admitted workspace
+  // object domain must therefore cover all resolved slots, while only the
+  // inner active count owns populated dynamic capacity. A failure quarantines
+  // that inherited slot across every later nested range and a fresh invocation
+  // can reuse it normally.
+  auto nested_scheduler = make_projection_scheduler(8);
+  auto nested_options = sample_options;
+  nested_options.sampled_tree_projection_scheduler = &nested_scheduler;
+  nested_options.sampled_tree_projection_maximum_wave_size = 2;
+  auto nested_rng = projection_rng_state;
+  auto nested_preassignment = preassign_sampled_tree_projection_jobs(
+      prepared, nested_options, radius, nested_rng);
+  CHECK(nested_preassignment.jobs.size() >= 2);
+  CHECK(nested_preassignment.memory.wave_size == 2);
+  CHECK(nested_preassignment.memory.stable_slot_count == 8);
+  CHECK(nested_preassignment.memory.active_projection_count == 2);
+  CHECK(
+      nested_preassignment.memory.stable_slot_scratch_bytes >=
+      sizeof(
+          std::vector<larch::chart_spr_detail::sampled_tree_direct_workspace>) +
+          8 * sizeof(larch::chart_spr_detail::sampled_tree_direct_workspace));
+  std::atomic<std::size_t> nested_failure_hooks{0};
+  nested_options.before_sampled_tree_projection_for_tests =
+      [&](std::size_t ordinal) {
+        nested_failure_hooks.fetch_add(1, std::memory_order_relaxed);
+        if (ordinal == 0) {
+          throw std::runtime_error("nested inherited-slot projection failure");
+        }
+      };
+  std::string nested_failure;
+  std::size_t nested_failed_gather_calls = 0;
+  (void)nested_scheduler.for_each_indexed_range(
+      8, {.minimum_grain = 1, .target_ranges_per_worker = 1},
+      [&](larch::chart_indexed_range const&, std::size_t stable_slot,
+          larch::chart_scheduler_cancellation_token const&) {
+        if (stable_slot != 7) return;
+        try {
+          (void)project_preassigned_sampled_tree_moves(
+              prepared, nested_preassignment, nested_options,
+              [&](std::size_t,
+                  std::optional<larch::grammar_spr_candidate> const&) {
+                ++nested_failed_gather_calls;
+                return true;
+              });
+        } catch (std::runtime_error const& error) {
+          nested_failure = error.what();
+        }
+      });
+  CHECK(nested_failure == "nested inherited-slot projection failure");
+  CHECK(nested_failure_hooks.load(std::memory_order_relaxed) == 1);
+  CHECK(nested_failed_gather_calls == 0);
+  CHECK(nested_scheduler.metrics().nested_serial_fallbacks > 0);
+
+  // A later captured failure is not itself a completed speculative result. An
+  // earlier canonical stop suppresses it and reports an exact zero discard
+  // count; the quarantined slot does not attempt work beyond ordinal one.
+  nested_failure_hooks.store(0, std::memory_order_relaxed);
+  nested_options.before_sampled_tree_projection_for_tests =
+      [&](std::size_t ordinal) {
+        nested_failure_hooks.fetch_add(1, std::memory_order_relaxed);
+        if (ordinal == 1) {
+          throw std::runtime_error(
+              "nested failure behind canonical projection stop");
+        }
+      };
+  std::optional<
+      larch::chart_spr_detail::sampled_tree_projection_execution_stats>
+      nested_stopped;
+  std::size_t nested_stopped_gather_calls = 0;
+  (void)nested_scheduler.for_each_indexed_range(
+      8, {.minimum_grain = 1, .target_ranges_per_worker = 1},
+      [&](larch::chart_indexed_range const&, std::size_t stable_slot,
+          larch::chart_scheduler_cancellation_token const&) {
+        if (stable_slot != 7) return;
+        nested_stopped = project_preassigned_sampled_tree_moves(
+            prepared, nested_preassignment, nested_options,
+            [&](std::size_t,
+                std::optional<larch::grammar_spr_candidate> const&) {
+              ++nested_stopped_gather_calls;
+              return false;
+            });
+      });
+  CHECK(nested_stopped.has_value());
+  CHECK(!nested_stopped->cancelled);
+  CHECK(nested_stopped->waves == 1);
+  CHECK(nested_stopped->speculative_discarded == 0);
+  CHECK(nested_failure_hooks.load(std::memory_order_relaxed) == 2);
+  CHECK(nested_stopped_gather_calls == 1);
+
+  nested_options.before_sampled_tree_projection_for_tests = {};
+  std::size_t nested_recovery_gather_calls = 0;
+  (void)nested_scheduler.for_each_indexed_range(
+      8, {.minimum_grain = 1, .target_ranges_per_worker = 1},
+      [&](larch::chart_indexed_range const&, std::size_t stable_slot,
+          larch::chart_scheduler_cancellation_token const&) {
+        if (stable_slot != 7) return;
+        auto nested_recovered = project_preassigned_sampled_tree_moves(
+            prepared, nested_preassignment, nested_options,
+            [&](std::size_t,
+                std::optional<larch::grammar_spr_candidate> const&) {
+              ++nested_recovery_gather_calls;
+              return true;
+            });
+        CHECK(!nested_recovered.cancelled);
+      });
+  CHECK(nested_recovery_gather_calls == nested_preassignment.jobs.size());
+  auto const nested_metrics = nested_scheduler.metrics();
+  CHECK(nested_metrics.pending_tasks == 0);
+  CHECK(nested_metrics.tasks_submitted == nested_metrics.tasks_completed);
+  CHECK(nested_metrics.tasks_submitted == nested_metrics.tasks_joined);
 
   CHECK(snapshot_projection_source(tree) == source_before);
   std::println("  PASS");
@@ -1981,6 +2110,130 @@ static void test_phase8_source_wave_admission_failure_and_cancellation() {
   CHECK(projection_recovery_metrics.tasks_submitted ==
         projection_recovery_metrics.tasks_joined);
 
+  // The bounded source-wave runner has the same inherited-slot contract as
+  // direct preassignment. First prove that this deterministic exhaustive run
+  // launches a two-range first projection subwave, then enter it from outer
+  // stable slot seven. Ordinal-zero failure must quarantine that slot before
+  // the already-admitted ordinal-one range can touch the workspace.
+  CHECK(source_count <= 8);
+  auto nested_source_probe_scheduler = make_projection_scheduler(8);
+  auto nested_source_options = sample_options;
+  nested_source_options.max_candidates = 0;
+  nested_source_options.sampled_tree_projection_scheduler =
+      &nested_source_probe_scheduler;
+  nested_source_options.sampled_tree_source_maximum_wave_size = source_count;
+  nested_source_options.sampled_tree_projection_maximum_wave_size = 2;
+  auto nested_source_probe_rng = projection_rng_state;
+  std::size_t nested_source_probe_gather_calls = 0;
+  auto nested_source_probe = project_sampled_tree_moves_in_source_waves(
+      prepared, nested_source_options, sample_options.sampled_tree_spr_radius,
+      nested_source_probe_rng,
+      [&](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+        ++nested_source_probe_gather_calls;
+        return false;
+      });
+  CHECK(!nested_source_probe.cancelled);
+  CHECK(nested_source_probe_gather_calls == 1);
+  CHECK(nested_source_probe.moves_enumerated >= 2);
+  CHECK(nested_source_probe.memory.source_wave_size == source_count);
+  CHECK(nested_source_probe.memory.projection_wave_size == 2);
+  CHECK(nested_source_probe.memory.stable_slot_count == 8);
+  CHECK(nested_source_probe.memory.active_projection_count == 2);
+  CHECK(nested_source_probe.peak_projection_wave_size == 2);
+  CHECK(nested_source_probe.projection_speculative_discarded == 1);
+  CHECK(nested_source_probe.source_speculative_moves_discarded ==
+        nested_source_probe.moves_enumerated - 1);
+  auto const nested_source_probe_metrics =
+      nested_source_probe_scheduler.metrics();
+  CHECK(nested_source_probe_metrics.pending_tasks == 0);
+  CHECK(nested_source_probe_metrics.tasks_submitted ==
+        nested_source_probe_metrics.tasks_completed);
+  CHECK(nested_source_probe_metrics.tasks_submitted ==
+        nested_source_probe_metrics.tasks_joined);
+
+  auto nested_source_scheduler = make_projection_scheduler(8);
+  nested_source_options.sampled_tree_projection_scheduler =
+      &nested_source_scheduler;
+  std::atomic<std::size_t> nested_source_failure_hooks{0};
+  nested_source_options.before_sampled_tree_projection_for_tests =
+      [&](std::size_t ordinal) {
+        nested_source_failure_hooks.fetch_add(1, std::memory_order_relaxed);
+        if (ordinal == 0) {
+          throw std::runtime_error(
+              "nested source inherited-slot projection failure");
+        }
+      };
+  auto const nested_source_before = nested_source_scheduler.metrics();
+  std::string nested_source_failure;
+  std::size_t nested_source_failed_gather_calls = 0;
+  (void)nested_source_scheduler.for_each_indexed_range(
+      8, {.minimum_grain = 1, .target_ranges_per_worker = 1},
+      [&](larch::chart_indexed_range const&, std::size_t stable_slot,
+          larch::chart_scheduler_cancellation_token const&) {
+        if (stable_slot != 7) return;
+        auto nested_source_rng = projection_rng_state;
+        try {
+          (void)project_sampled_tree_moves_in_source_waves(
+              prepared, nested_source_options,
+              sample_options.sampled_tree_spr_radius, nested_source_rng,
+              [&](std::size_t,
+                  std::optional<larch::grammar_spr_candidate> const&) {
+                ++nested_source_failed_gather_calls;
+                return true;
+              });
+        } catch (std::runtime_error const& error) {
+          nested_source_failure = error.what();
+        }
+      });
+  CHECK(nested_source_failure ==
+        "nested source inherited-slot projection failure");
+  CHECK(nested_source_failure_hooks.load(std::memory_order_relaxed) == 1);
+  CHECK(nested_source_failed_gather_calls == 0);
+  auto const nested_source_after = nested_source_scheduler.metrics();
+  CHECK(nested_source_after.nested_serial_fallbacks -
+            nested_source_before.nested_serial_fallbacks ==
+        2);
+  CHECK(nested_source_after.pending_tasks == 0);
+  CHECK(nested_source_after.tasks_submitted ==
+        nested_source_after.tasks_completed);
+  CHECK(nested_source_after.tasks_submitted ==
+        nested_source_after.tasks_joined);
+
+  nested_source_options.before_sampled_tree_projection_for_tests = {};
+  std::optional<
+      larch::chart_spr_detail::sampled_tree_source_wave_execution_stats>
+      nested_source_recovered;
+  std::size_t nested_source_recovery_gather_calls = 0;
+  (void)nested_source_scheduler.for_each_indexed_range(
+      8, {.minimum_grain = 1, .target_ranges_per_worker = 1},
+      [&](larch::chart_indexed_range const&, std::size_t stable_slot,
+          larch::chart_scheduler_cancellation_token const&) {
+        if (stable_slot != 7) return;
+        auto nested_source_rng = projection_rng_state;
+        nested_source_recovered = project_sampled_tree_moves_in_source_waves(
+            prepared, nested_source_options,
+            sample_options.sampled_tree_spr_radius, nested_source_rng,
+            [&](std::size_t,
+                std::optional<larch::grammar_spr_candidate> const&) {
+              ++nested_source_recovery_gather_calls;
+              return true;
+            });
+      });
+  CHECK(nested_source_recovered.has_value());
+  CHECK(!nested_source_recovered->cancelled);
+  CHECK(nested_source_recovered->peak_projection_wave_size == 2);
+  CHECK(nested_source_recovered->memory.stable_slot_count == 8);
+  CHECK(nested_source_recovered->memory.active_projection_count == 2);
+  CHECK(nested_source_recovery_gather_calls ==
+        nested_source_recovered->moves_enumerated);
+  CHECK(nested_source_recovery_gather_calls >= 2);
+  auto const nested_source_recovery_metrics = nested_source_scheduler.metrics();
+  CHECK(nested_source_recovery_metrics.pending_tasks == 0);
+  CHECK(nested_source_recovery_metrics.tasks_submitted ==
+        nested_source_recovery_metrics.tasks_completed);
+  CHECK(nested_source_recovery_metrics.tasks_submitted ==
+        nested_source_recovery_metrics.tasks_joined);
+
   // External cancellation drains the launched source wave and publishes no
   // partially projected ordinal.
   auto cancel_scheduler = make_projection_scheduler(4);
@@ -2153,6 +2406,7 @@ static void test_phase8_speculative_failures_follow_canonical_order() {
             return false;
           });
       CHECK(stopped.waves == 1);
+      CHECK(!stopped.cancelled);
     } catch (...) {
       unexpected_failure = true;
     }
@@ -2184,8 +2438,9 @@ static void test_phase8_speculative_failures_follow_canonical_order() {
     CHECK(later_failure_calls.load(std::memory_order_relaxed) == 1);
     check_scheduler_quiescent(scheduler);
 
-    // Cancellation is operation-wide and therefore precedes a captured later
-    // projection failure. The joined scheduler remains reusable afterwards.
+    // Cancellation visible at the post-join/pre-gather boundary precedes a
+    // captured later projection failure. The joined scheduler remains reusable
+    // afterwards.
     std::atomic<bool> cancel_requested{false};
     options.sampled_tree_projection_cancel_requested = &cancel_requested;
     options.before_sampled_tree_projection_for_tests =
@@ -2224,6 +2479,81 @@ static void test_phase8_speculative_failures_follow_canonical_order() {
         });
     CHECK(!recovered.cancelled);
     CHECK(recovery_gather_calls == projection_job_count);
+    check_scheduler_quiescent(scheduler);
+  }
+
+  // That cancellation boundary is a linearization point, not a retroactive
+  // flag poll between canonical ordinals.  Once gather has started, publishing
+  // a prefix and then returning "cancelled" would violate wave atomicity.  A
+  // request raised after ordinal zero enters gather is therefore deferred; the
+  // already-captured canonical failure at ordinal one wins.  The next call,
+  // with cancellation visible before gather, publishes nothing.
+  {
+    auto scheduler = make_projection_scheduler(4);
+    auto options = base_options;
+    options.sampled_tree_projection_scheduler = &scheduler;
+    std::mt19937 rng(*projection_order_seed);
+    auto preassignment = preassign_sampled_tree_projection_jobs(
+        prepared, options, base_options.sampled_tree_spr_radius, rng);
+    CHECK(preassignment.memory.wave_size > 1);
+    CHECK(preassignment.jobs.size() > 1);
+    std::atomic<bool> cancel_requested{false};
+    std::atomic<std::size_t> failure_calls{0};
+    options.sampled_tree_projection_cancel_requested = &cancel_requested;
+    options.before_sampled_tree_projection_for_tests =
+        [&](std::size_t ordinal) {
+          if (ordinal == 1) {
+            failure_calls.fetch_add(1, std::memory_order_relaxed);
+            throw std::runtime_error(
+                "failure after gather cancellation boundary");
+          }
+        };
+    std::latch gather_entered{1};
+    std::latch cancellation_written{1};
+    auto cancellation_setter = std::async(std::launch::async, [&] {
+      gather_entered.wait();
+      cancel_requested.store(true, std::memory_order_release);
+      cancellation_written.count_down();
+    });
+    std::size_t gather_calls = 0;
+    std::string failure;
+    try {
+      (void)project_preassigned_sampled_tree_moves(
+          prepared, preassignment, options,
+          [&](std::size_t ordinal,
+              std::optional<larch::grammar_spr_candidate> const&) {
+            CHECK(ordinal == 0);
+            gather_entered.count_down();
+            cancellation_written.wait();
+            ++gather_calls;
+            return true;
+          });
+    } catch (std::runtime_error const& error) {
+      failure = error.what();
+    }
+    cancellation_setter.get();
+    CHECK(failure == "failure after gather cancellation boundary");
+    CHECK(gather_calls == 1);
+    CHECK(failure_calls.load(std::memory_order_relaxed) == 1);
+    check_scheduler_quiescent(scheduler);
+
+    std::size_t cancelled_gather_calls = 0;
+    bool cancellation_threw = false;
+    larch::chart_spr_detail::sampled_tree_projection_execution_stats cancelled;
+    try {
+      cancelled = project_preassigned_sampled_tree_moves(
+          prepared, preassignment, options,
+          [&](std::size_t, std::optional<larch::grammar_spr_candidate> const&) {
+            ++cancelled_gather_calls;
+            return true;
+          });
+    } catch (...) {
+      cancellation_threw = true;
+    }
+    CHECK(!cancellation_threw);
+    CHECK(cancelled.cancelled);
+    CHECK(cancelled_gather_calls == 0);
+    CHECK(failure_calls.load(std::memory_order_relaxed) == 1);
     check_scheduler_quiescent(scheduler);
   }
 

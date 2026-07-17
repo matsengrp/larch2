@@ -13832,7 +13832,13 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   bool enumeration_active = true;
 
   auto finite_workspace_resident = [&](bool include_local_results = true) {
-    if (!use_pipeline) {
+    if (!use_pipeline || !enumeration_active) {
+      // While the producer is live, its two buffers cannot be inspected
+      // concurrently and are charged at their admitted capacities below. Once
+      // it has joined, release_retained_storage_before_exact() makes the
+      // ordinary capacity walker authoritative; carrying the admitted buffers
+      // into the evidence phase would double-count storage that no longer
+      // exists and spuriously reject exact E.
       return workspace.local_admission_additional_resident_bytes(
           include_local_results);
     }

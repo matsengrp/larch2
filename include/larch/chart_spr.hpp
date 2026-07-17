@@ -531,6 +531,13 @@ struct sampled_tree_projection_memory_estimate {
   std::size_t required_peak_bytes = 0;
   std::size_t job_count = 0;
   std::size_t wave_size = 0;
+  // Stable-slot identity spans the scheduler's complete worker domain because
+  // nested same-scheduler fallback inherits an outer slot. A top-level
+  // operation uses only [0, worker_task_limit), while an entire nested
+  // operation is serial and populates one inherited slot. Dynamic capacity is
+  // therefore required for at most active_projection_count slots even though
+  // the indexable object domain covers every resolved worker.
+  std::size_t stable_slot_count = 0;
   std::size_t active_projection_count = 0;
   bool safely_bounded = true;
 };
@@ -573,6 +580,9 @@ struct sampled_tree_source_wave_memory_estimate {
   std::size_t source_wave_size = 0;
   std::size_t projection_wave_size = 0;
   std::size_t active_enumeration_count = 0;
+  // See sampled_tree_projection_memory_estimate::stable_slot_count. Source
+  // waves obey the same top-level prefix/nested-single-slot scheduler contract.
+  std::size_t stable_slot_count = 0;
   std::size_t active_projection_count = 0;
   bool safely_bounded = true;
 };
@@ -1420,6 +1430,11 @@ struct sampled_tree_direct_workspace {
   std::vector<std::size_t> tree_order;
   std::vector<std::size_t> lexicographic_order;
   std::vector<clade_id> child_ids;
+  // A caught projection failure can leave nested capacity semantically
+  // unusable.  Keep that scheduler slot quarantined until the caller starts a
+  // new joined wave; nested same-scheduler fallback may otherwise present the
+  // same inherited slot for several serial ranges.
+  bool quarantined = false;
 };
 
 // Only these four non-owning references survive from the general candidate
@@ -2218,18 +2233,26 @@ estimate_sampled_tree_source_wave_memory(
     projection_plan = scheduler->plan_indexed_ranges(
         projection_wave_size,
         {.minimum_grain = 1, .target_ranges_per_worker = 1});
+    result.stable_slot_count = scheduler->worker_resolution().resolved_workers;
     result.active_projection_count = projection_plan.range_count <= 1
                                          ? std::size_t{1}
                                          : projection_plan.worker_task_limit;
   } else if (projection_wave_size != 0) {
+    result.stable_slot_count = 1;
     result.active_projection_count = 1;
   }
   auto const direct_workspace =
       estimate_sampled_tree_projection_direct_workspace_bytes(
           shape, result.safely_bounded);
-  result.projection_stable_slot_workspace_bytes = add(
-      sizeof(std::vector<sampled_tree_direct_workspace>),
-      multiply(result.active_projection_count, direct_workspace));
+  auto const direct_workspace_dynamic =
+      direct_workspace - sizeof(sampled_tree_direct_workspace);
+  result.projection_stable_slot_workspace_bytes =
+      add(sizeof(std::vector<sampled_tree_direct_workspace>),
+          multiply(result.stable_slot_count,
+                   sizeof(sampled_tree_direct_workspace)));
+  result.projection_stable_slot_workspace_bytes =
+      add(result.projection_stable_slot_workspace_bytes,
+          multiply(result.active_projection_count, direct_workspace_dynamic));
   result.planned_stable_slot_workspace_bytes =
       result.projection_stable_slot_workspace_bytes;
   auto const projection_fallback_scratch =
@@ -2268,6 +2291,10 @@ estimate_sampled_tree_source_wave_memory(
       add(result.active_projection_scratch_bytes,
           result.projection_scheduler_operation_bytes);
   result.temporal_stage_peak_bytes = std::max(source_stage, projection_stage);
+  // The 512-byte allowances are the frozen in-process bookkeeping envelope
+  // for each retained failure. Arbitrarily large dynamically allocated
+  // payloads supplied by external/test hooks are outside the
+  // library-controlled admission contract.
   result.error_and_exception_bytes = sizeof(chart_scheduler_run_summary) + 512;
   result.error_and_exception_bytes =
       add(result.error_and_exception_bytes,
@@ -2487,9 +2514,11 @@ estimate_sampled_tree_projection_memory(
   if (scheduler != nullptr && wave_size != 0) {
     plan = scheduler->plan_indexed_ranges(
         wave_size, {.minimum_grain = 1, .target_ranges_per_worker = 1});
+    result.stable_slot_count = scheduler->worker_resolution().resolved_workers;
     result.active_projection_count =
         plan.range_count <= 1 ? std::size_t{1} : plan.worker_task_limit;
   } else if (wave_size != 0) {
+    result.stable_slot_count = 1;
     result.active_projection_count = 1;
   }
 
@@ -2506,12 +2535,22 @@ estimate_sampled_tree_projection_memory(
                                                   result.safely_bounded),
       result.safely_bounded);
   result.wave_slot_and_payload_bytes = result.retained_output_bytes;
-  auto const per_stable_slot = sampled_tree_projection_saturating_add(
-      task_scratch, direct_workspace, result.safely_bounded);
-  result.stable_slot_scratch_bytes =
+  auto const direct_workspace_dynamic =
+      direct_workspace - sizeof(sampled_tree_direct_workspace);
+  result.stable_slot_scratch_bytes = sampled_tree_projection_saturating_add(
+      sizeof(std::vector<sampled_tree_direct_workspace>),
       sampled_tree_projection_saturating_multiply(
-          result.active_projection_count, per_stable_slot,
-          result.safely_bounded);
+          result.stable_slot_count, sizeof(sampled_tree_direct_workspace),
+          result.safely_bounded),
+      result.safely_bounded);
+  auto const per_active_slot = sampled_tree_projection_saturating_add(
+      task_scratch, direct_workspace_dynamic, result.safely_bounded);
+  result.stable_slot_scratch_bytes = sampled_tree_projection_saturating_add(
+      result.stable_slot_scratch_bytes,
+      sampled_tree_projection_saturating_multiply(
+          result.active_projection_count, per_active_slot,
+          result.safely_bounded),
+      result.safely_bounded);
   result.active_projection_scratch_bytes = result.stable_slot_scratch_bytes;
 
   if (scheduler != nullptr) {
@@ -2543,7 +2582,10 @@ estimate_sampled_tree_projection_memory(
   // Charge the caller-side failed summary, retained per-ordinal exception
   // envelopes, and test-hook/function wrappers explicitly as well. The
   // exception_ptr objects themselves live in the output slots charged above.
-  // No failure path may need unbudgeted slot-vector capacity.
+  // No failure path may need unbudgeted slot-vector capacity. The 512-byte
+  // per-failure allowance is the frozen library bookkeeping envelope;
+  // arbitrarily large dynamically allocated exception payloads created by
+  // external/test hooks are outside the library-controlled admission contract.
   result.error_and_exception_bytes =
       sizeof(chart_scheduler_run_summary) + sizeof(std::exception_ptr) + 512;
   result.error_and_exception_bytes = sampled_tree_projection_saturating_add(
@@ -6172,7 +6214,7 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
   // precedes this owning result wave and scheduler operation storage.
   std::vector<sampled_tree_projection_output_slot> slots(wave_size);
   std::vector<sampled_tree_direct_workspace> stable_scratch(
-      std::max<std::size_t>(1, preassignment.memory.active_projection_count));
+      std::max<std::size_t>(1, preassignment.memory.stable_slot_count));
 
   if (scheduler != nullptr &&
       options.force_sampled_tree_projection_submit_failure_after_for_tests) {
@@ -6215,6 +6257,7 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
       slots[local].failure = nullptr;
       slots[local].completed = false;
     }
+    for (auto& scratch : stable_scratch) scratch.quarantined = false;
 
     if (scheduler == nullptr) {
       auto const& job = jobs[wave_begin];
@@ -6247,6 +6290,7 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
                     "chart SPR sampled-tree projection stable slot exceeded "
                     "admitted scratch");
               }
+              if (stable_scratch[stable_slot].quarantined) return;
               for (auto local = range.begin; local < range.end; ++local) {
                 // A submitted runner owns its first ordinal even when a later
                 // submit fails. Subsequent ordinals cooperate with
@@ -6256,10 +6300,14 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
                 }
                 auto const& job = jobs[wave_begin + local];
                 // An application/projection failure belongs to this canonical
-                // ordinal. Keep the workspace quarantined for the rest of the
-                // range, but do not turn it into scheduler cancellation that
-                // could preempt an earlier canonical stop.
-                if (!project_one(local, stable_slot, job)) break;
+                // ordinal. Keep the workspace quarantined for every later
+                // range inherited by this stable slot, but do not turn it into
+                // scheduler cancellation that could preempt an earlier
+                // canonical stop.
+                if (!project_one(local, stable_slot, job)) {
+                  stable_scratch[stable_slot].quarantined = true;
+                  break;
+                }
               }
             },
             &failed_summary);
@@ -6294,9 +6342,11 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
     }
     ++result.waves;
 
-    // External cancellation has operation-wide precedence. It is observed
-    // only after all launched work has joined and work diagnostics have been
-    // reconciled, and suppresses captured failures and gather publication.
+    // This acquire-load is the cancellation linearization point for the joined
+    // wave. Cancellation already visible here suppresses captured failures and
+    // all publication from this wave. Once canonical gather starts, a later
+    // asynchronous request is deliberately deferred to the next wave boundary
+    // so the current wave is never only partially gathered due to cancellation.
     if (cancellation_requested()) {
       result.speculative_discarded += static_cast<std::size_t>(
           std::count_if(slots.begin(), slots.begin() + count,
@@ -6382,8 +6432,7 @@ inline std::size_t sampled_tree_source_wave_planned_container_bytes(
               sizeof(std::uint8_t));
   add_product(memory.projection_wave_size,
               sizeof(sampled_tree_projection_output_slot));
-  add_product(memory.active_projection_count,
-              sizeof(sampled_tree_direct_workspace));
+  add_product(memory.stable_slot_count, sizeof(sampled_tree_direct_workspace));
   return total;
 }
 
@@ -6540,7 +6589,7 @@ project_sampled_tree_moves_in_source_waves(
   std::vector<sampled_tree_projection_output_slot> projection_slots(
       result.memory.projection_wave_size);
   std::vector<sampled_tree_direct_workspace> projection_workspaces(
-      result.memory.active_projection_count);
+      result.memory.stable_slot_count);
 
   bool actual_safely_bounded = true;
   auto planned_container_bytes =
@@ -6843,6 +6892,9 @@ project_sampled_tree_moves_in_source_waves(
         projection_slots[local].completed = false;
         projection_completed[local] = 0;
       }
+      for (auto& workspace : projection_workspaces) {
+        workspace.quarantined = false;
+      }
 
       auto project_one = [&](std::size_t local,
                              std::size_t stable_slot) noexcept {
@@ -6888,15 +6940,20 @@ project_sampled_tree_moves_in_source_waves(
                       "chart SPR sampled-tree projection stable slot exceeded "
                       "admitted scratch");
                 }
+                if (projection_workspaces[stable_slot].quarantined) return;
                 for (auto local = range.begin; local < range.end; ++local) {
                   if ((local != range.begin && cancellation.stop_requested()) ||
                       cancellation_requested()) {
                     break;
                   }
                   // Keep application/projection failures attached to their
-                  // canonical ordinals. A failed workspace is not reused for
-                  // the remainder of its range, while other ranges drain.
-                  if (!project_one(local, stable_slot)) break;
+                  // canonical ordinals. A failed workspace is not reused by
+                  // any later range inherited by this stable slot, while all
+                  // other slots drain independently.
+                  if (!project_one(local, stable_slot)) {
+                    projection_workspaces[stable_slot].quarantined = true;
+                    break;
+                  }
                 }
               },
               &failed_summary);
@@ -6977,6 +7034,10 @@ project_sampled_tree_moves_in_source_waves(
             result.memory.actual_peak_bytes, budget};
       }
 
+      // Linearize cancellation after this projection subwave has joined and
+      // before any of its canonical results are gathered. A request raised
+      // after gather begins is deferred to the next subwave/wave boundary so
+      // cancellation never partially gathers the current subwave.
       if (cancellation_requested()) {
         auto const boundary = projection_jobs.front().ordinal;
         result.projection_speculative_discarded += static_cast<std::size_t>(
