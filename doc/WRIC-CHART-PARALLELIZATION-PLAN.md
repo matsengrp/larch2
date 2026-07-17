@@ -28,7 +28,7 @@ in this document.
 
 | Phase | Status | Required evidence |
 |---|---|---|
-| 0. Repair and freeze measurement | in progress (calibration passed; partial capture) | Native/oracle/runner frozen and functional gates audited; the frozen wrapper calibration passes and four small physical-core captures are complete with no timeouts. Medium and unpinned capture, finalization, audits, and seal remain pending |
+| 0. Repair and freeze measurement | in progress (calibration passed; partial capture) | Native/oracle/runner frozen and functional gates audited; seven completed capture status records contain 175 canonical rows across 45 repeat stages with zero timeouts, including every small capture and the dense/cache physical-core medium captures. Remaining medium/real-preflight capture, finalization, audits, and seal remain pending |
 | 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | Functional/counter gates pass at `208ce23`; canonical Phase-0 comparison and serial speed/no-regression gates await the sealed baseline |
 | 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | `0c4623b` passes the allocation/build/canonical/full-CTest/targeted-ASAN gates; serial timing and RSS comparisons await the sealed baseline |
 | 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | Safe one-pool orchestration, full CTest, and targeted TSAN pass at `7d294d6`; small-case timing awaits the sealed baseline |
@@ -315,16 +315,27 @@ The median paired wrapper/direct ratio is `1.015775988195` and the ratio of
 medians is `1.008541338978`, both below the frozen `1.02` limit; the live guard
 recorded zero forbidden-process matches.
 
-Four physical-core small captures are also complete:
+Seven captures are now complete. The five small captures
 `small-dense64-physical`, `small-exact1-physical`,
-`small-primary32k4-physical`, and `small-stress128k16-physical`. Together their
-status records contain 120 canonical rows across 34 repeat stages and zero
-timeouts. These artifacts are partial capture evidence, not Phase-0
-acceptance. Every medium capture, the small automatic/unpinned capture,
-approvals, finalization, pending audit, seal, and final audit remain mandatory.
-Interrupted medium attempts are archived separately as external-interference
-evidence and do not count as baseline captures. No performance gate below may
-be accepted from the calibration or the four small captures alone.
+`small-primary32k4-physical`, `small-stress128k16-physical`, and
+`small-auto-unpinned` contain 135 canonical rows across 37 repeat stages. The
+physical-core medium captures `medium-dense64-physical` and
+`medium-cache1-physical` add 40 canonical rows across eight repeat stages.
+All seven closed with zero timeouts, for a partial total of 175 canonical rows
+and 45 repeat stages. The two new medium status records and every nested hash
+they reference were revalidated after capture; their live snapshots also bind
+the same frozen revision, binaries, calibration, affinity, and unchanged dirty
+worktree bytes before and after each run.
+
+These artifacts are partial capture evidence, not Phase-0 acceptance. The
+remaining exact-one, primary 32/4, stress 128/16, lazy, SMT, and real-preflight
+captures, approvals, finalization, pending audit, seal, and final audit remain
+mandatory. Four earlier dense-medium attempts are archived separately as
+external-interference evidence and do not count as baseline captures. A later
+`medium-exact1-physical` launch was rejected immediately when its guard found
+a restarted external proof-assist build; the helper created no capture
+artifact. No performance gate below may be accepted from the calibration or
+these seven partial captures alone.
 
 ### Actions
 
@@ -767,11 +778,12 @@ results ledger.
 
 The immutable measurement checkpoint remains
 `7ca527b8906d018124756182274335cbff936d72` (`Baseline measure`). Its frozen
-runner, oracle, workloads, and binaries are unchanged. The wrapper calibration
-and four small physical-core captures have since completed, but every medium
-capture, the small automatic/unpinned capture, finalization, audits, and seal
-remain deferred under the authorized deadline-overlap rule; therefore all
-Phase-6 performance acceptance remains pending. In particular, the frozen
+runner, oracle, workloads, and binaries are unchanged. The wrapper calibration,
+all five small captures, and the dense/cache physical-core medium captures
+have since completed, but the remaining medium/real-preflight capture,
+finalization, audits, and seal remain deferred under the authorized
+deadline-overlap rule; therefore all Phase-6 performance acceptance remains
+pending. In particular, the frozen
 medium Top-K-4 scaling gate, real Top-K-16 admission gate, paired W1/W8 RSS
 gate, and frozen-workload repeated-output capture cannot be inferred from the
 passing in-tree functional contracts, benchmark-postprocessor regressions, or

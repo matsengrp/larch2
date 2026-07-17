@@ -6,10 +6,11 @@ This ledger records evidence for
 `doc/WRIC-CHART-PARALLELIZATION-PLAN.md`. It is intentionally incomplete:
 the final Phase-0 semantic oracle and capture contract are frozen and the
 strict workload-manifest harness repair has passed focused and complete
-functional verification. The frozen wrapper calibration now passes and four
-small physical-core captures are complete, while every medium capture, the
-small automatic/unpinned capture, finalization, audits, and the detached seal
-remain outstanding. The plan's deadline-overlap rule authorizes Phase-1+
+functional verification. The frozen wrapper calibration now passes, all five
+small captures and the first two physical-core medium captures are complete,
+while the remaining medium/real-preflight captures, finalization, audits, and
+the detached seal remain outstanding. The plan's deadline-overlap rule
+authorizes Phase-1+
 implementation and functional evidence now, but Phase 0 remains open. No
 Phase-1+ timing, scaling, memory, or parity result is acceptance evidence until
 Phase 0 is completely captured, finalized, audited, and sealed.
@@ -32,7 +33,7 @@ committed. Phase-0 artifacts use the non-overwriting directory
 
 | Phase | Evidence status | Result |
 |---|---|---|
-| 0. Repair and freeze measurement | in progress (calibration passed; partial capture) | native/oracle/runner bytes frozen and functional gates independently audited; calibration passes and four small physical-core captures contain 120 canonical rows across 34 repeat stages with zero timeouts; every medium and unpinned capture, finalization, audits, and seal remain pending |
+| 0. Repair and freeze measurement | in progress (calibration passed; partial capture) | native/oracle/runner bytes frozen and functional gates independently audited; seven completed capture status records contain 175 canonical rows across 45 repeat stages with zero timeouts, including all five small captures and the dense/cache physical-core medium captures; remaining medium/real-preflight captures, finalization, audits, and seal remain pending |
 | 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | code checkpoint `208ce23`; focused and full RelWithDebInfo correctness/counter gates pass; canonical baseline and timing gates remain pending |
 | 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | code checkpoint `0c4623b`; same-profiler allocation reduction, warmed-zero allocation, frozen semantic/counter, focused/full RelWithDebInfo, and targeted ASAN gates pass; serial timing, exact-small timing, RSS, and sealed canonical comparison remain pending |
 | 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | code checkpoint `7d294d6`; scheduler contract, canonical worker matrix, full RelWithDebInfo, and targeted TSan gates pass; small-case timing remains pending |
@@ -380,16 +381,33 @@ unchanged `1.020000000000` limit. The live guard recorded zero forbidden
 process matches; its maximum unselected-SMT activity was 65,518 ppm against
 the frozen 200,000-ppm threshold.
 
-Four physical-core small captures have completed under
+Seven captures have completed under
 `baseline-408434e/bootstrap-phase0/captures/`:
 
-| Capture ID | Canonical rows | Repeat stages | Timeouts |
-|---|---:|---:|---:|
-| `small-dense64-physical` | 25 | 5 | 0 |
-| `small-exact1-physical` | 20 | 4 | 0 |
-| `small-primary32k4-physical` | 36 | 12 | 0 |
-| `small-stress128k16-physical` | 39 | 13 | 0 |
-| **Total** | **120** | **34** | **0** |
+| Capture ID | Canonical rows | Repeat stages | Timeouts | Status SHA-256 |
+|---|---:|---:|---:|---|
+| `small-dense64-physical` | 25 | 5 | 0 | `841ec89429720bef9b5ef7d3f6f4a20e77393d1870a6b62e1a34e2c865ede4f8` |
+| `small-exact1-physical` | 20 | 4 | 0 | `94132bd12bfb736f1d4248ab3fc9c199c49db217ae046e3418b492126aa74b38` |
+| `small-primary32k4-physical` | 36 | 12 | 0 | `d1edbe2b79abbd64213f16ab30d41f0906f1f31db268a3da8d096453a8bc7ae6` |
+| `small-stress128k16-physical` | 39 | 13 | 0 | `ae4e51995372a1228ca3d2c7f5f004babc91a47cf2824868d59b263361f263ff` |
+| `small-auto-unpinned` | 15 | 3 | 0 | `5f7c6a2cd34f2ae658cbbb15ce14074e4b66a906000eb1170eb88f2e451632d4` |
+| `medium-dense64-physical` | 20 | 4 | 0 | `433e236692c884cf278c67c83f51aec22e4157cd80ae54c40a0bd52333907af3` |
+| `medium-cache1-physical` | 20 | 4 | 0 | `da5f4c77f516657160ad684eec3238ba4f63531a740da8fcea75345e5e9d6dcd` |
+| **Total** | **175** | **45** | **0** | — |
+
+`medium-dense64-physical` bound W1/2/4/8 to four canonical paired rows
+each and covered 2451.982 seconds between its live pre/post snapshots. Its
+preflight quiet-monitor SHA-256 is
+`b334e99c5619261026d799bc7546bc6d3aa54172526f4a6867027499104d5e0b`;
+no capture-run guard transcript was persisted, so only the preflight monitor
+survives and no claim here depends on an absent transcript. The corresponding
+`medium-cache1-physical` interval was 2324.777 seconds, with the same four
+W1/2/4/8 repeat stages. Its preflight quiet-monitor SHA-256 is
+`960c6144fa0de3b554178975b61c590210d0361ece48c49a1b9873ad4f8d90a3`
+and its persisted no-interference guard log SHA-256 is
+`da758986264aa05e7d57b1171b3d474daafe6ab99aeade673306953fae6c0925`.
+These durations describe capture intervals, not accepted wall-performance
+results.
 
 These rows are valid partial-capture evidence, not an accepted or sealed
 baseline. Four starts of `medium-dense64-physical` were interrupted by
@@ -401,9 +419,14 @@ unrelated external builds and were moved out of the baseline to
 passed its five-second guard at 102,766 ppm and then ran cleanly for more than
 14 minutes before the recurring proof-assist build restarted during its second
 repeat block. All four are contaminated partial attempts and count as neither
-captures nor timing evidence. Every medium capture, the small
-automatic/unpinned capture, post-capture approvals, finalization, pending
-audits, detached seal, and final audit remain mandatory.
+captures nor timing evidence. A subsequent `medium-exact1-physical` launch at
+`2026-07-17T10:18:59+03:00` was stopped immediately by its persisted guard
+when the same external build restarted in the launch race. The helper created
+no capture artifact, so the exact-one destination remains fresh. The rejected
+guard log has SHA-256
+`07b7b9ff848c40ed575a3f490581c14ccb7eb4f6d617b4ad5ba2f7560fab79e5`.
+The remaining medium and real-preflight captures, post-capture approvals,
+finalization, pending audits, detached seal, and final audit remain mandatory.
 
 ### Strict bootstrap and source-binding audit
 
@@ -592,10 +615,13 @@ worker-scaling ratio. Medians alone cannot hide a paired-ratio failure.
 - [x] The frozen process-wrapper calibration passes both 2% overhead gates and
   its canonical JSON is bound by SHA-256.
 - [x] The four required small physical-core captures contain 120 canonical rows
-  across 34 repeat stages with zero timeouts.
+  across 34 repeat stages with zero timeouts, and the separate automatic/
+  unpinned small capture adds 15 rows across three stages with zero timeouts.
+- [x] The dense64 and cache1 physical-core medium captures contain 40 canonical
+  rows across eight W1/2/4/8 repeat stages with zero timeouts.
 - [ ] Native and exact-chart medium 32/4 and 128/16 rows are captured.
-- [ ] Every other medium row and the small automatic/unpinned row are captured
-  without external interference.
+- [ ] Every remaining medium and real-preflight row is captured without
+  external interference.
 - [x] Instrumented `dagutil` is frozen; exact native/oracle mismatch rejection
   is covered by the harness regression and runner mismatch rejection by the
   bootstrap regression.
