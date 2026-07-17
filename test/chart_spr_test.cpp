@@ -407,6 +407,87 @@ static void check_legacy_generation_stats_equal(
   CHECK(lhs.stop_reason == rhs.stop_reason);
 }
 
+// Reservoir publication happens only after an exhaustive child stream has
+// completed. These counters distinguish that contract from a finite-cap child
+// which happened to select the same final candidates. Scheduler stall
+// durations are deliberately excluded because they are wall-clock values.
+static void check_exhaustive_generation_work_equal(
+    larch::chart_spr_candidate_generation_stats const& lhs,
+    larch::chart_spr_candidate_generation_stats const& rhs) {
+  check_legacy_generation_stats_equal(lhs, rhs);
+  CHECK(lhs.sampled_tree_projection_moves_preassigned ==
+        rhs.sampled_tree_projection_moves_preassigned);
+  CHECK(lhs.sampled_tree_projection_move_enumeration_visits ==
+        rhs.sampled_tree_projection_move_enumeration_visits);
+  CHECK(lhs.sampled_tree_projection_enumeration_passes ==
+        rhs.sampled_tree_projection_enumeration_passes);
+  CHECK(lhs.sampled_tree_projection_waves == rhs.sampled_tree_projection_waves);
+  CHECK(lhs.sampled_tree_projection_scheduler_operations ==
+        rhs.sampled_tree_projection_scheduler_operations);
+  CHECK(lhs.sampled_tree_projection_parallel_operations ==
+        rhs.sampled_tree_projection_parallel_operations);
+  CHECK(lhs.sampled_tree_projection_ranges ==
+        rhs.sampled_tree_projection_ranges);
+  CHECK(lhs.sampled_tree_projection_worker_tasks ==
+        rhs.sampled_tree_projection_worker_tasks);
+  CHECK(lhs.sampled_tree_projection_peak_wave_size ==
+        rhs.sampled_tree_projection_peak_wave_size);
+  CHECK(lhs.sampled_tree_projection_speculative_discarded ==
+        rhs.sampled_tree_projection_speculative_discarded);
+  CHECK(lhs.sampled_tree_projection_direct ==
+        rhs.sampled_tree_projection_direct);
+  CHECK(lhs.sampled_tree_projection_fallback ==
+        rhs.sampled_tree_projection_fallback);
+  CHECK(lhs.sampled_tree_projection_estimated_peak_bytes ==
+        rhs.sampled_tree_projection_estimated_peak_bytes);
+  CHECK(lhs.sampled_tree_projection_cancellations ==
+        rhs.sampled_tree_projection_cancellations);
+  CHECK(lhs.sampled_tree_source_waves == rhs.sampled_tree_source_waves);
+  CHECK(lhs.sampled_tree_sources_enumerated ==
+        rhs.sampled_tree_sources_enumerated);
+  CHECK(lhs.sampled_tree_source_enumeration_operations ==
+        rhs.sampled_tree_source_enumeration_operations);
+  CHECK(lhs.sampled_tree_source_enumeration_parallel_operations ==
+        rhs.sampled_tree_source_enumeration_parallel_operations);
+  CHECK(lhs.sampled_tree_source_enumeration_ranges ==
+        rhs.sampled_tree_source_enumeration_ranges);
+  CHECK(lhs.sampled_tree_source_enumeration_worker_tasks ==
+        rhs.sampled_tree_source_enumeration_worker_tasks);
+  CHECK(lhs.sampled_tree_source_peak_wave_size ==
+        rhs.sampled_tree_source_peak_wave_size);
+  CHECK(lhs.sampled_tree_source_one_pass_move_visits ==
+        rhs.sampled_tree_source_one_pass_move_visits);
+  CHECK(lhs.sampled_tree_source_speculative_moves_discarded ==
+        rhs.sampled_tree_source_speculative_moves_discarded);
+  CHECK(lhs.sampled_tree_source_speculative_sources_discarded ==
+        rhs.sampled_tree_source_speculative_sources_discarded);
+  CHECK(lhs.sampled_tree_source_admitted_wave_width ==
+        rhs.sampled_tree_source_admitted_wave_width);
+  CHECK(lhs.sampled_tree_projection_admitted_subwave_width ==
+        rhs.sampled_tree_projection_admitted_subwave_width);
+  CHECK(lhs.sampled_tree_source_actual_peak_bytes ==
+        rhs.sampled_tree_source_actual_peak_bytes);
+  CHECK(lhs.grammar_candidate_construction_waves ==
+        rhs.grammar_candidate_construction_waves);
+  CHECK(lhs.grammar_candidate_scheduler_operations ==
+        rhs.grammar_candidate_scheduler_operations);
+  CHECK(lhs.grammar_candidate_parallel_operations ==
+        rhs.grammar_candidate_parallel_operations);
+  CHECK(lhs.grammar_candidate_ranges == rhs.grammar_candidate_ranges);
+  CHECK(lhs.grammar_candidate_worker_tasks ==
+        rhs.grammar_candidate_worker_tasks);
+  CHECK(lhs.grammar_candidate_peak_wave_size ==
+        rhs.grammar_candidate_peak_wave_size);
+  CHECK(lhs.grammar_candidate_speculative_discarded ==
+        rhs.grammar_candidate_speculative_discarded);
+  CHECK(lhs.grammar_candidate_admitted_wave_width ==
+        rhs.grammar_candidate_admitted_wave_width);
+  CHECK(lhs.grammar_candidate_actual_peak_bytes ==
+        rhs.grammar_candidate_actual_peak_bytes);
+  CHECK(lhs.grammar_candidate_cancellations ==
+        rhs.grammar_candidate_cancellations);
+}
+
 // Independent oracle for the pre-preparation projection algorithm.  It
 // intentionally performs the annotated legacy SPR edit and recomputes every
 // before-side lookup so differential tests can detect a bad prepared cache or
@@ -1362,6 +1443,123 @@ static void test_phase8_parallel_grammar_stop_reservoir_and_failure() {
   auto recovered = collect_candidates(grammar, failure_options);
   CHECK(!recovered.empty());
   CHECK(failure_scheduler.metrics().pending_tasks == 0);
+
+  std::println("  PASS");
+}
+
+static void test_phase8_sampled_hybrid_reservoir_worker_seed_matrix() {
+  std::println("test_phase8_sampled_hybrid_reservoir_worker_seed_matrix");
+
+  auto dag =
+      larch::test::make_tiny_labelled_tree("A", eight_taxon_balanced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+  auto const source_before = snapshot_projection_source(dag);
+  constexpr std::size_t reservoir_size = 4;
+
+  for (auto source : {larch::chart_spr_candidate_source::sampled_tree,
+                      larch::chart_spr_candidate_source::hybrid}) {
+    for (auto seed : {std::uint32_t{1}, std::uint32_t{7}, std::uint32_t{19}}) {
+      std::vector<larch::grammar_spr_candidate> w1_selected;
+      larch::chart_spr_candidate_generation_stats w1_stats;
+      for (auto workers :
+           {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+        auto make_options = [&](larch::chart_scheduler& scheduler) {
+          larch::grammar_spr_enumeration_options options;
+          options.source = source;
+          options.sampled_tree_source_dag = &dag;
+          options.sampled_tree_count = 1;
+          options.sampled_tree_spr_radius = 32;
+          options.sampled_tree_score_threshold =
+              std::numeric_limits<int>::max();
+          options.randomize_order = true;
+          options.seed = seed;
+          options.max_candidates_is_post_dedup = true;
+          options.sampled_tree_projection_scheduler = &scheduler;
+          return options;
+        };
+
+        // This is the exact child stream the reservoir wrapper must execute:
+        // no finite cap and therefore no two-source lookahead restriction.
+        auto scheduler = make_projection_scheduler(workers);
+        auto exhaustive_options = make_options(scheduler);
+        exhaustive_options.max_candidates = 0;
+        larch::chart_spr_candidate_generation_stats exhaustive_stats;
+        auto exhaustive =
+            collect_candidates(grammar, exhaustive_options, &exhaustive_stats);
+        CHECK(exhaustive.size() > reservoir_size);
+        CHECK(exhaustive_stats.candidates_generated_after_dedup ==
+              exhaustive.size());
+        CHECK(exhaustive_stats.stop_reason ==
+              larch::chart_spr_candidate_stop_reason::exhausted);
+        CHECK(exhaustive_stats.sampled_tree_sources_enumerated >= workers);
+        CHECK(exhaustive_stats.sampled_tree_source_admitted_wave_width ==
+              workers);
+        CHECK(exhaustive_stats.sampled_tree_source_peak_wave_size == workers);
+        CHECK(exhaustive_stats.sampled_tree_projection_admitted_subwave_width ==
+              workers * 4);
+        auto const exhaustive_metrics = scheduler.metrics();
+        CHECK(exhaustive_metrics.pending_tasks == 0);
+        CHECK(exhaustive_metrics.tasks_submitted ==
+              exhaustive_metrics.tasks_completed);
+        CHECK(exhaustive_metrics.tasks_submitted ==
+              exhaustive_metrics.tasks_joined);
+
+        auto reservoir_options = make_options(scheduler);
+        reservoir_options.reservoir_sample = true;
+        reservoir_options.max_candidates = reservoir_size;
+        larch::chart_spr_candidate_generation_stats reservoir_stats;
+        auto selected =
+            collect_candidates(grammar, reservoir_options, &reservoir_stats);
+        CHECK(selected.size() == reservoir_size);
+        CHECK(reservoir_stats.candidates_generated_after_dedup ==
+              exhaustive.size());
+        CHECK(reservoir_stats.stop_reason ==
+              larch::chart_spr_candidate_stop_reason::exhausted);
+        check_exhaustive_generation_work_equal(reservoir_stats,
+                                               exhaustive_stats);
+        CHECK(reservoir_stats.sampled_tree_source_admitted_wave_width ==
+              workers);
+        CHECK(reservoir_stats.sampled_tree_source_peak_wave_size == workers);
+        CHECK(reservoir_stats.sampled_tree_projection_admitted_subwave_width ==
+              workers * 4);
+
+        for (auto const& candidate : selected) {
+          auto const signature =
+              larch::chart_spr_candidate_taxon_signature(grammar, candidate);
+          CHECK(std::ranges::any_of(
+              exhaustive, [&](larch::grammar_spr_candidate const& underlying) {
+                return larch::chart_spr_candidate_taxon_signature(
+                           grammar, underlying) == signature;
+              }));
+        }
+        if (workers == 1) {
+          w1_selected = selected;
+          w1_stats = reservoir_stats;
+        } else {
+          CHECK(selected.size() == w1_selected.size());
+          check_legacy_generation_stats_equal(reservoir_stats, w1_stats);
+          for (std::size_t i = 0; i < selected.size(); ++i) {
+            check_candidate_payload_equal(grammar, selected[i], w1_selected[i]);
+          }
+          CHECK(reservoir_stats
+                    .sampled_tree_source_enumeration_parallel_operations > 0);
+          CHECK(reservoir_stats.sampled_tree_projection_parallel_operations >
+                0);
+          if (source == larch::chart_spr_candidate_source::hybrid) {
+            CHECK(reservoir_stats.grammar_candidate_parallel_operations > 0);
+          }
+        }
+        auto const reservoir_metrics = scheduler.metrics();
+        CHECK(reservoir_metrics.pending_tasks == 0);
+        CHECK(reservoir_metrics.tasks_submitted ==
+              reservoir_metrics.tasks_completed);
+        CHECK(reservoir_metrics.tasks_submitted ==
+              reservoir_metrics.tasks_joined);
+        scheduler.shutdown();
+        CHECK(snapshot_projection_source(dag) == source_before);
+      }
+    }
+  }
 
   std::println("  PASS");
 }
@@ -3182,6 +3380,7 @@ int main() {
   test_phase8_parallel_sampled_projection_is_deterministic();
   test_phase8_grammar_and_hybrid_worker_seed_matrix();
   test_phase8_parallel_grammar_stop_reservoir_and_failure();
+  test_phase8_sampled_hybrid_reservoir_worker_seed_matrix();
   test_phase8_projection_budget_and_failure_atomicity();
   test_phase8_midwave_stop_preserves_legacy_counters();
   test_phase8_source_wave_admission_failure_and_cancellation();
