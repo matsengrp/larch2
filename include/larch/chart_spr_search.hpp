@@ -3847,10 +3847,6 @@ struct chart_spr_search_state {
   // Keep their contribution separate while substrate construction is in
   // flight so admission never under-reports the two full cache surfaces.
   std::size_t local_commit_persistent_cache_bytes = 0;
-  // Source-compatible diagnostic retained from the pre-Phase-6 shared
-  // selected-cache implementation. Selected caches are task-local now, so no
-  // bytes remain admitted after an operation and this value stays zero.
-  mutable std::size_t selected_topology_cache_admitted_bytes = 0;
   std::size_t effective_pattern_batch_size = 0;
   mutable std::size_t effective_candidate_batch_size = 0;
   std::vector<pattern_chart_cache_entry> pattern_charts;

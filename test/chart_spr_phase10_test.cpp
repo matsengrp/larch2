@@ -723,6 +723,7 @@ static void test_phase7_multifurcation_chain_identity_round_trip() {
                          std::size_t workers) {
     CHECK(search.summary.requested_worker_count == workers);
     CHECK(search.summary.resolved_worker_count == workers);
+    CHECK(search.summary.local_score_worker_count == workers);
     CHECK(search.summary.scheduler.worker_policy ==
           larch::chart_worker_resolution_policy::explicit_count);
     CHECK(search.iterations.size() == 1);
@@ -758,14 +759,35 @@ static void test_phase7_multifurcation_chain_identity_round_trip() {
     (void)canonical_digest_json(search);
   };
 
-  auto serial = run_once(1);
-  auto parallel = run_once(8);
-  check_result(serial, 1);
-  check_result(parallel, 8);
-  CHECK(canonical_digest_json(serial) == canonical_digest_json(parallel));
-  CHECK(serial.canonical_digest->full_sidecar ==
-        parallel.canonical_digest->full_sidecar);
-  CHECK(parallel.counters.local_score_parallel_batches > 0);
+  constexpr std::array<std::size_t, 4> worker_counts{1, 2, 4, 8};
+  std::optional<std::string> serial_digest;
+  std::optional<std::string> serial_sidecar;
+  for (auto workers : worker_counts) {
+    auto search = run_once(workers);
+    check_result(search, workers);
+    auto digest = canonical_digest_json(search);
+    if (workers == 1) {
+      serial_digest = std::move(digest);
+      serial_sidecar = search.canonical_digest->full_sidecar;
+      CHECK(search.counters.local_score_parallel_batches == 0);
+      CHECK(search.summary.scheduler.parallel_operations == 0);
+      CHECK(search.summary.scheduler.pool_lifetimes == 0);
+    } else {
+      CHECK(serial_digest.has_value());
+      CHECK(serial_sidecar.has_value());
+      CHECK(digest == *serial_digest);
+      CHECK(search.canonical_digest->full_sidecar == *serial_sidecar);
+      CHECK(search.counters.local_score_parallel_batches > 0);
+      CHECK(search.counters.local_score_worker_tasks > 1);
+      CHECK(search.summary.scheduler.parallel_operations > 0);
+      CHECK(search.summary.scheduler.tasks_submitted > 1);
+      CHECK(search.summary.scheduler.pool_lifetimes == 1);
+      CHECK(search.summary.scheduler.pool_lifetimes_stopped == 1);
+    }
+    CHECK(search.summary.scheduler.pending_tasks == 0);
+    CHECK(search.summary.scheduler.live_pool_threads == 0);
+    CHECK(search.summary.scheduler.shutdown);
+  }
 
   std::println("  PASS");
 }

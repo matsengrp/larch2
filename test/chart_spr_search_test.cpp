@@ -497,6 +497,53 @@ static void test_phase7_lazy_auto_policy_contract() {
   CHECK(dense.reason == larch::chart_spr_lazy_policy_reason::
                             structural_and_strong_row_ratios_exceeded);
 
+  // Exercise the automatic dense decision through production state
+  // construction at every required worker count.  Resolver-only coverage is
+  // insufficient here: the selected dense builder must preserve the same
+  // objective while actually entering its parallel pattern axis.
+  auto published_dense = dense;
+  published_dense.frozen = true;
+  std::optional<std::uint64_t> dense_score_without_invariants;
+  std::optional<std::uint64_t> dense_score_with_invariants;
+  for (auto workers :
+       {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+    auto active = larch::make_active_search_patterns(dense_patterns);
+    larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+        .requested_workers = workers,
+        .default_minimum_grain = 1,
+        .default_target_ranges_per_worker = 4,
+    }};
+    auto state = larch::build_chart_spr_search_state_from_active(
+        fixture.dag, fixture.grammar, std::move(active), {}, false, {},
+        automatic, {}, &scheduler);
+    CHECK(state.lazy_policy == published_dense);
+    CHECK(state.cache_strategy ==
+          larch::chart_spr_cache_strategy::all_active_patterns);
+    CHECK(state.counters.lazy_policy_pilot_runs == 1);
+    CHECK(state.counters.lazy_policy_frozen_reuses == 0);
+    CHECK(state.counters.scheduler_axes.initial_chart_patterns.operations > 0);
+    check_phase4_scheduler_axis_reconciliation(scheduler.metrics(),
+                                               state.counters.scheduler_axes);
+    CHECK(scheduler.worker_resolution().resolved_workers == workers);
+    if (workers == 1) {
+      dense_score_without_invariants =
+          state.composite_lower_bound_without_invariants;
+      dense_score_with_invariants = state.composite_lower_bound_with_invariants;
+    } else {
+      CHECK(dense_score_without_invariants.has_value());
+      CHECK(dense_score_with_invariants.has_value());
+      CHECK(state.composite_lower_bound_without_invariants ==
+            *dense_score_without_invariants);
+      CHECK(state.composite_lower_bound_with_invariants ==
+            *dense_score_with_invariants);
+      CHECK(state.counters.scheduler_axes.initial_chart_patterns
+                .parallel_operations > 0);
+      CHECK(state.counters.scheduler_axes.initial_chart_patterns.worker_tasks >
+            1);
+    }
+    scheduler.shutdown();
+  }
+
   // Default off and both explicit-on spellings never allocate or execute a
   // pilot.  The compatibility rule is unambiguous: legacy true wins over the
   // enum, including an enum value of auto.
@@ -12847,22 +12894,36 @@ static void test_phase9_transient_oracle_green_on_multiparent_dag() {
     CHECK(search.canonical_report.has_value());
     CHECK(search.canonical_digest.has_value());
     CHECK(!search.canonical_digest->full_sidecar.empty());
+    if (workers == 1) {
+      CHECK(search.summary.scheduler.parallel_operations == 0);
+      CHECK(search.summary.scheduler.tasks_submitted == 0);
+    } else {
+      CHECK(search.counters.local_score_parallel_batches > 0);
+      CHECK(search.summary.scheduler.parallel_operations > 0);
+      CHECK(search.summary.scheduler.tasks_submitted > 1);
+      CHECK(search.summary.scheduler_axes.local_score_candidates.worker_tasks +
+                search.summary.scheduler_axes.local_score_candidate_patterns
+                    .worker_tasks >
+            1);
+    }
   };
 
   auto serial = run_once(1);
-  auto parallel = run_once(8);
   check_run(serial, 1);
-  check_run(parallel, 8);
-
-  CHECK(serial.summary.initial_score == parallel.summary.initial_score);
-  CHECK(serial.summary.final_score == parallel.summary.final_score);
-  CHECK(serial.counters.accepted_moves == parallel.counters.accepted_moves);
-  CHECK(serial.iterations.size() == parallel.iterations.size());
-  CHECK(larch::emit_chart_spr_semantic_digest_json(*serial.canonical_digest) ==
-        larch::emit_chart_spr_semantic_digest_json(
-            *parallel.canonical_digest));
-  CHECK(serial.canonical_digest->full_sidecar ==
-        parallel.canonical_digest->full_sidecar);
+  auto const serial_digest =
+      larch::emit_chart_spr_semantic_digest_json(*serial.canonical_digest);
+  for (auto workers : {std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+    auto parallel = run_once(workers);
+    check_run(parallel, workers);
+    CHECK(serial.summary.initial_score == parallel.summary.initial_score);
+    CHECK(serial.summary.final_score == parallel.summary.final_score);
+    CHECK(serial.counters.accepted_moves == parallel.counters.accepted_moves);
+    CHECK(serial.iterations.size() == parallel.iterations.size());
+    CHECK(serial_digest == larch::emit_chart_spr_semantic_digest_json(
+                               *parallel.canonical_digest));
+    CHECK(serial.canonical_digest->full_sidecar ==
+          parallel.canonical_digest->full_sidecar);
+  }
 
   std::println("  PASS");
 }
@@ -13002,34 +13063,25 @@ static void test_phase9_transient_multi_worker_matches_serial() {
   };
 
   auto serial = run_once(1, true);
-  auto parallel = run_once(4, true);
-
-  CHECK(serial.counters.accepted_moves == parallel.counters.accepted_moves);
   CHECK(serial.counters.accepted_moves >= 3);
-  CHECK(serial.summary.final_score == parallel.summary.final_score);
-  CHECK(serial.summary.initial_score == parallel.summary.initial_score);
-  CHECK(serial.iterations.size() == parallel.iterations.size());
   CHECK(serial.canonical_report.has_value());
-  CHECK(parallel.canonical_report.has_value());
   CHECK(serial.canonical_digest.has_value());
-  CHECK(parallel.canonical_digest.has_value());
-  CHECK(serial.canonical_digest->full_sidecar ==
-        parallel.canonical_digest->full_sidecar);
+  CHECK(!serial.canonical_digest->full_sidecar.empty());
+  CHECK(serial.summary.requested_worker_count == 1);
+  CHECK(serial.summary.resolved_worker_count == 1);
+  CHECK(serial.summary.local_score_worker_count == 1);
+  CHECK(serial.summary.scheduler.requested_workers == 1);
+  CHECK(serial.summary.scheduler.resolved_workers == 1);
+  CHECK(serial.summary.scheduler.worker_policy ==
+        larch::chart_worker_resolution_policy::explicit_count);
+  CHECK(serial.summary.scheduler.parallel_operations == 0);
+  CHECK(serial.summary.scheduler.tasks_submitted == 0);
 
   std::size_t committed = 0;
   std::size_t serial_inside_rows = 0;
   std::size_t serial_outside_rows = 0;
   for (std::size_t index = 0; index < serial.iterations.size(); ++index) {
     auto const& serial_iteration = serial.iterations[index];
-    auto const& parallel_iteration = parallel.iterations[index];
-    CHECK(serial_iteration.accepted_move_committed ==
-          parallel_iteration.accepted_move_committed);
-    CHECK(serial_iteration.accepted_inside_rows_recomputed ==
-          parallel_iteration.accepted_inside_rows_recomputed);
-    CHECK(serial_iteration.accepted_outside_rows_recomputed ==
-          parallel_iteration.accepted_outside_rows_recomputed);
-    CHECK(serial_iteration.accepted_candidate_signature ==
-          parallel_iteration.accepted_candidate_signature);
     if (serial_iteration.accepted_move_committed) {
       ++committed;
       CHECK(serial_iteration.accepted_inside_rows_recomputed > 0);
@@ -13049,16 +13101,60 @@ static void test_phase9_transient_multi_worker_matches_serial() {
   CHECK(serial_inside_rows == serial.counters.inside_rows_recomputed_on_commit);
   CHECK(serial_outside_rows ==
         serial.counters.outside_rows_recomputed_on_commit);
-  CHECK(parallel.counters.transient_chain_extensions_for_verification > 0);
-  CHECK(parallel.counters.transient_chain_diagnostic_cache_extensions ==
-        parallel.counters.transient_chain_extensions_for_verification);
-  // Parallel scoring actually used the workers.
-  CHECK(parallel.counters.local_score_parallel_batches > 0);
-  // The transient oracle stays green under parallel local scoring (the
-  // transient extensions are reader-local and do not race the scoring
-  // workers).
-  CHECK(parallel.counters.transient_chain_extension_oracle_mismatches == 0);
-  CHECK(parallel.counters.transient_chain_extension_fallbacks == 0);
+
+  auto const serial_digest =
+      larch::emit_chart_spr_semantic_digest_json(*serial.canonical_digest);
+  for (auto workers : {std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+    auto parallel = run_once(workers, true);
+    CHECK(serial.counters.accepted_moves == parallel.counters.accepted_moves);
+    CHECK(serial.summary.final_score == parallel.summary.final_score);
+    CHECK(serial.summary.initial_score == parallel.summary.initial_score);
+    CHECK(serial.iterations.size() == parallel.iterations.size());
+    CHECK(parallel.canonical_report.has_value());
+    CHECK(parallel.canonical_digest.has_value());
+    CHECK(parallel.summary.requested_worker_count == workers);
+    CHECK(parallel.summary.resolved_worker_count == workers);
+    CHECK(parallel.summary.local_score_worker_count == workers);
+    CHECK(parallel.summary.scheduler.requested_workers == workers);
+    CHECK(parallel.summary.scheduler.resolved_workers == workers);
+    CHECK(parallel.summary.scheduler.worker_policy ==
+          larch::chart_worker_resolution_policy::explicit_count);
+    CHECK(serial_digest == larch::emit_chart_spr_semantic_digest_json(
+                               *parallel.canonical_digest));
+    CHECK(serial.canonical_digest->full_sidecar ==
+          parallel.canonical_digest->full_sidecar);
+
+    for (std::size_t index = 0; index < serial.iterations.size(); ++index) {
+      auto const& serial_iteration = serial.iterations[index];
+      auto const& parallel_iteration = parallel.iterations[index];
+      CHECK(serial_iteration.accepted_move_committed ==
+            parallel_iteration.accepted_move_committed);
+      CHECK(serial_iteration.accepted_inside_rows_recomputed ==
+            parallel_iteration.accepted_inside_rows_recomputed);
+      CHECK(serial_iteration.accepted_outside_rows_recomputed ==
+            parallel_iteration.accepted_outside_rows_recomputed);
+      CHECK(serial_iteration.accepted_candidate_signature ==
+            parallel_iteration.accepted_candidate_signature);
+    }
+
+    CHECK(parallel.counters.transient_chain_extensions_for_verification > 0);
+    CHECK(parallel.counters.transient_chain_diagnostic_cache_extensions ==
+          parallel.counters.transient_chain_extensions_for_verification);
+    // Every required parallel count must actually enter the shared scheduler;
+    // semantic parity alone cannot let a silently serial path pass.
+    CHECK(parallel.counters.local_score_parallel_batches > 0);
+    CHECK(parallel.summary.scheduler.parallel_operations > 0);
+    CHECK(parallel.summary.scheduler.tasks_submitted > 1);
+    CHECK(parallel.summary.scheduler_axes.local_score_candidates.worker_tasks +
+              parallel.summary.scheduler_axes.local_score_candidate_patterns
+                  .worker_tasks >
+          1);
+    // The transient oracle stays green under parallel local scoring (the
+    // transient extensions are reader-local and do not race the scoring
+    // workers).
+    CHECK(parallel.counters.transient_chain_extension_oracle_mismatches == 0);
+    CHECK(parallel.counters.transient_chain_extension_fallbacks == 0);
+  }
 
   std::println("  PASS");
 }

@@ -2779,44 +2779,50 @@ static void test_scheduled_multisite_frontier_wavefronts() {
         auto oracle = larch::build_multisite_trim(grammar, patterns,
                                                   chart_options, trim_options);
 
-        larch::chart_scheduler one_worker{larch::chart_scheduler_options{
-            .requested_workers = 1,
-            .default_minimum_grain = 1,
-            .default_target_ranges_per_worker = 4,
-        }};
-        larch::multisite_trim_scheduler_run_summaries one_runs;
-        auto scheduled_one = larch::build_multisite_trim(
-            plan, patterns, one_worker, chart_options, trim_options, &one_runs);
-        check_multisite_trim_results_equal(oracle, scheduled_one);
-        CHECK(one_runs.frontier_clades.size() == frontier_passes * level_count);
-        CHECK(std::all_of(one_runs.frontier_clades.begin(),
-                          one_runs.frontier_clades.end(), [](auto const& run) {
-                            return !run.used_parallel_workers() &&
-                                   run.ranges_completed == run.range_count;
-                          }));
-        CHECK(one_worker.metrics().pending_tasks == 0);
-        one_worker.shutdown();
+        constexpr std::array<std::size_t, 4> worker_counts{1, 2, 4, 8};
+        std::optional<larch::multisite_trim_result> scheduled_one;
+        for (auto workers : worker_counts) {
+          larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+              .requested_workers = workers,
+              .default_minimum_grain = 1,
+              .default_target_ranges_per_worker = 4,
+          }};
+          larch::multisite_trim_scheduler_run_summaries runs;
+          auto scheduled = larch::build_multisite_trim(
+              plan, patterns, scheduler, chart_options, trim_options, &runs);
+          check_multisite_trim_results_equal(oracle, scheduled);
+          if (workers == 1) {
+            scheduled_one = scheduled;
+          } else {
+            CHECK(scheduled_one.has_value());
+            check_multisite_trim_results_equal(*scheduled_one, scheduled);
+          }
 
-        larch::chart_scheduler eight_workers{larch::chart_scheduler_options{
-            .requested_workers = 8,
-            .default_minimum_grain = 1,
-            .default_target_ranges_per_worker = 4,
-        }};
-        larch::multisite_trim_scheduler_run_summaries eight_runs;
-        auto scheduled_eight = larch::build_multisite_trim(
-            plan, patterns, eight_workers, chart_options, trim_options,
-            &eight_runs);
-        check_multisite_trim_results_equal(oracle, scheduled_eight);
-        check_multisite_trim_results_equal(scheduled_one, scheduled_eight);
-        CHECK(eight_runs.frontier_clades.size() ==
-              frontier_passes * level_count);
-        CHECK(std::all_of(eight_runs.frontier_clades.begin(),
-                          eight_runs.frontier_clades.end(),
-                          [](auto const& run) {
-                            return run.ranges_completed == run.range_count;
-                          }));
-        CHECK(eight_workers.metrics().pending_tasks == 0);
-        eight_workers.shutdown();
+          CHECK(scheduler.worker_resolution().resolved_workers == workers);
+          CHECK(runs.frontier_clades.size() == frontier_passes * level_count);
+          CHECK(std::all_of(runs.frontier_clades.begin(),
+                            runs.frontier_clades.end(), [](auto const& run) {
+                              return run.ranges_completed == run.range_count;
+                            }));
+          auto const metrics = scheduler.metrics();
+          CHECK(metrics.pending_tasks == 0);
+          if (workers == 1) {
+            CHECK(std::ranges::none_of(
+                runs.frontier_clades,
+                [](auto const& run) { return run.used_parallel_workers(); }));
+            CHECK(metrics.parallel_operations == 0);
+            CHECK(metrics.pool_lifetimes == 0);
+          } else {
+            CHECK(std::ranges::any_of(
+                runs.frontier_clades,
+                [](auto const& run) { return run.used_parallel_workers(); }));
+            CHECK(metrics.parallel_operations > 0);
+            CHECK(metrics.tasks_submitted > 1);
+            CHECK(metrics.pool_lifetimes == 1);
+          }
+          scheduler.shutdown();
+          CHECK(scheduler.metrics().live_pool_threads == 0);
+        }
       }
     }
   }
