@@ -104,6 +104,32 @@ void check_scheduler_quiescent(larch::chart_scheduler const& scheduler) {
   CHECK(metrics.pending_tasks == 0);
 }
 
+void check_canonical_exact_evidence_equal(
+    larch::chart_spr_canonical_exact_evidence const& lhs,
+    larch::chart_spr_canonical_exact_evidence const& rhs) {
+  CHECK(lhs.evidence_kind == rhs.evidence_kind);
+  CHECK(lhs.keep_mask_kind == rhs.keep_mask_kind);
+  CHECK(lhs.keep_production_exact == rhs.keep_production_exact);
+  CHECK(lhs.optimum_active == rhs.optimum_active);
+  CHECK(lhs.invariant_offset == rhs.invariant_offset);
+  CHECK(lhs.kept_production_keys == rhs.kept_production_keys);
+  CHECK(lhs.frontier_sizes == rhs.frontier_sizes);
+  CHECK(lhs.optimal_root_provenance_classes.size() ==
+        rhs.optimal_root_provenance_classes.size());
+  for (std::size_t i = 0; i < lhs.optimal_root_provenance_classes.size(); ++i) {
+    CHECK(lhs.optimal_root_provenance_classes[i].cost ==
+          rhs.optimal_root_provenance_classes[i].cost);
+    CHECK(lhs.optimal_root_provenance_classes[i].production_keys ==
+          rhs.optimal_root_provenance_classes[i].production_keys);
+  }
+  CHECK(lhs.topology_selection_kind == rhs.topology_selection_kind);
+  CHECK(lhs.topology_selector == rhs.topology_selector);
+  CHECK(lhs.before_topology_production_keys ==
+        rhs.before_topology_production_keys);
+  CHECK(lhs.after_topology_production_keys ==
+        rhs.after_topology_production_keys);
+}
+
 std::array<larch::chart_spr_scheduler_axis_metrics const*, 13> axes(
     larch::chart_spr_scheduler_axis_counters const& counters) {
   return {
@@ -621,10 +647,8 @@ void test_hybrid_width_two_exact_admission_boundary() {
     auto outer_state = larch::build_chart_spr_search_state(
         outer_input.dag, outer_input.grammar, outer_options);
     CHECK(outer_state.exact_trim_active_only.has_value());
-    auto& provenance =
-        outer_state.exact_trim_active_only->optimal_root_provenance_classes;
-    CHECK(!provenance.empty());
-    auto const provenance_exemplar = provenance.front();
+    CHECK(!outer_state.exact_trim_active_only->optimal_root_provenance_classes
+               .empty());
     larch::chart_scheduler outer_scheduler{
         larch::chart_scheduler_options{.requested_workers = 2}};
     auto outer_enumeration = outer_options.enumeration;
@@ -639,93 +663,127 @@ void test_hybrid_width_two_exact_admission_boundary() {
               grammar_width);
     };
 
-    // Model a valid high-provenance exact state by retaining repeated tied
-    // root classes. Doubling avoids a fixture-specific byte constant: stop at
-    // the first shape where deferred canonical evidence is the temporal
-    // high-water for both the irreducible and full width-two plans.
+    // Pin a realizable one-byte planner boundary on the unmodified production
+    // state. Source width is admitted first against the irreducible
+    // projection/grammar widths, so E selects two sources while E-1 must
+    // retain a single source. Later grammar widening is allowed only when it
+    // fits the already-selected temporal envelope.
     auto outer_minimum = estimate_outer(1, 1, 1);
+    auto outer_source_two = estimate_outer(2, 1, 1);
+    auto outer_source_one_projection_two = estimate_outer(1, 2, 1);
+    auto outer_source_two_projection_two = estimate_outer(2, 2, 1);
     auto outer_full = estimate_outer(0, 0, 0);
-    while (outer_full.planned_required_bytes !=
-               outer_minimum.planned_required_bytes ||
-           outer_full.planned_required_bytes !=
-               outer_full.planned_evidence_phase_required_bytes) {
-      CHECK(provenance.size() < 131072);
-      auto const old_size = provenance.size();
-      provenance.insert(provenance.end(), old_size, provenance_exemplar);
-      outer_minimum = estimate_outer(1, 1, 1);
-      outer_full = estimate_outer(0, 0, 0);
-    }
-    CHECK(outer_full.planned_required_bytes ==
-          outer_minimum.planned_required_bytes);
-    CHECK(outer_full.planned_required_bytes ==
-          outer_full.planned_evidence_phase_required_bytes);
-    CHECK(outer_full.planned_generation_phase_required_bytes <
-          outer_full.planned_required_bytes);
     CHECK(outer_minimum.planned_sampled_source_wave_size == 1);
+    CHECK(outer_minimum.planned_sampled_projection_wave_size == 1);
+    CHECK(outer_minimum.planned_grammar_candidate_wave_size == 1);
+    CHECK(outer_source_two.planned_sampled_source_wave_size == 2);
+    CHECK(outer_source_two.planned_sampled_projection_wave_size == 1);
+    CHECK(outer_source_two.planned_grammar_candidate_wave_size == 1);
+    CHECK(outer_source_two.planned_required_bytes >
+          outer_minimum.planned_required_bytes);
+    CHECK(outer_source_two.planned_required_bytes ==
+          outer_source_two.planned_generation_phase_required_bytes);
+    CHECK(outer_source_two.planned_evidence_phase_required_bytes ==
+          outer_minimum.planned_evidence_phase_required_bytes);
+    CHECK(outer_source_one_projection_two.planned_required_bytes >=
+          outer_source_two.planned_required_bytes);
+    CHECK(outer_source_two_projection_two.planned_required_bytes >
+          outer_source_two.planned_required_bytes);
     CHECK(outer_full.planned_sampled_source_wave_size == 2);
     CHECK(outer_full.planned_sampled_projection_wave_size > 1);
-    CHECK(outer_full.planned_sampled_source_admitted_peak_bytes > 0);
-    auto const outer_budget = outer_full.planned_required_bytes;
+    CHECK(outer_full.planned_grammar_candidate_wave_size > 1);
+    CHECK(outer_full.planned_required_bytes >
+          outer_source_two.planned_required_bytes);
+    CHECK(outer_source_two.planned_sampled_source_admitted_peak_bytes > 0);
+    auto const outer_budget = outer_source_two.planned_required_bytes;
     CHECK(outer_budget > 1);
 
-    // E-1 is below the irreducible outer envelope as well as the selected
-    // width-two envelope, so the unified preflight must reject before any
-    // producer, source RNG, workspace allocation, or scheduler operation.
-    auto outer_rejected_options = outer_options;
-    outer_rejected_options.cache.memory_budget_bytes = outer_budget - 1;
-    std::atomic<std::size_t> outer_rejected_pipeline_starts{0};
-    std::atomic<std::size_t> outer_rejected_workspace_allocations{0};
-    std::atomic<std::size_t> outer_rejected_sources{0};
-    std::atomic<std::size_t> outer_rejected_projections{0};
-    outer_rejected_options.before_candidate_pipeline_start_for_tests = [&] {
-      outer_rejected_pipeline_starts.fetch_add(1, std::memory_order_relaxed);
+    // E-1 remains above the irreducible envelope. It must execute normally,
+    // but the unified planner cannot admit the second sampled source.
+    auto outer_narrow_options = outer_options;
+    outer_narrow_options.cache.memory_budget_bytes = outer_budget - 1;
+    std::atomic<std::size_t> outer_narrow_pipeline_starts{0};
+    std::atomic<std::size_t> outer_narrow_workspace_allocations{0};
+    std::atomic<std::size_t> outer_narrow_grammar_workspace_allocations{0};
+    std::atomic<std::size_t> outer_narrow_sources{0};
+    std::atomic<std::size_t> outer_narrow_projections{0};
+    outer_narrow_options.before_candidate_pipeline_start_for_tests = [&] {
+      outer_narrow_pipeline_starts.fetch_add(1, std::memory_order_relaxed);
     };
-    outer_rejected_options.enumeration
+    outer_narrow_options.enumeration
         .before_sampled_tree_projection_workspace_allocation_for_tests = [&] {
-      outer_rejected_workspace_allocations.fetch_add(1,
-                                                     std::memory_order_relaxed);
+      outer_narrow_workspace_allocations.fetch_add(1,
+                                                   std::memory_order_relaxed);
     };
-    outer_rejected_options.enumeration
+    outer_narrow_options.enumeration
+        .before_grammar_candidate_workspace_allocation_for_tests = [&] {
+      outer_narrow_grammar_workspace_allocations.fetch_add(
+          1, std::memory_order_relaxed);
+    };
+    outer_narrow_options.enumeration
         .before_sampled_tree_source_enumeration_for_tests = [&](std::size_t,
                                                                 std::size_t) {
-      outer_rejected_sources.fetch_add(1, std::memory_order_relaxed);
+      outer_narrow_sources.fetch_add(1, std::memory_order_relaxed);
     };
-    outer_rejected_options.enumeration
-        .before_sampled_tree_projection_for_tests = [&](std::size_t) {
-      outer_rejected_projections.fetch_add(1, std::memory_order_relaxed);
-    };
+    outer_narrow_options.enumeration.before_sampled_tree_projection_for_tests =
+        [&](std::size_t) {
+          outer_narrow_projections.fetch_add(1, std::memory_order_relaxed);
+        };
     larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
-        outer_rejected_workspace;
-    bool outer_rejected = false;
-    try {
-      (void)larch::run_chart_spr_acceptance_iteration(
-          outer_state, outer_rejected_options, 0, outer_rejected_workspace,
-          outer_scheduler);
-    } catch (
-        larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
-            error) {
-      outer_rejected = true;
-      CHECK(error.required_bytes() == outer_budget);
-      CHECK(error.available_bytes() == outer_budget - 1);
-    }
-    CHECK(outer_rejected);
-    CHECK(outer_rejected_pipeline_starts.load(std::memory_order_relaxed) == 0);
-    CHECK(outer_rejected_workspace_allocations.load(
-              std::memory_order_relaxed) == 0);
-    CHECK(outer_rejected_sources.load(std::memory_order_relaxed) == 0);
-    CHECK(outer_rejected_projections.load(std::memory_order_relaxed) == 0);
-    CHECK(outer_rejected_workspace.candidate_slots.capacity() == 0);
-    CHECK(outer_rejected_workspace.pipeline_candidate_slots.capacity() == 0);
-    CHECK(outer_scheduler.metrics().operations == 0);
+        outer_narrow_workspace;
+    auto outer_narrow = larch::run_chart_spr_acceptance_iteration(
+        outer_state, outer_narrow_options, 0, outer_narrow_workspace,
+        outer_scheduler);
+    CHECK(outer_narrow_pipeline_starts.load(std::memory_order_relaxed) == 1);
+    CHECK(outer_narrow_workspace_allocations.load(std::memory_order_relaxed) >
+          0);
+    CHECK(outer_narrow_grammar_workspace_allocations.load(
+              std::memory_order_relaxed) > 0);
+    CHECK(outer_narrow_sources.load(std::memory_order_relaxed) > 0);
+    CHECK(outer_narrow_projections.load(std::memory_order_relaxed) > 0);
+    CHECK(outer_narrow.candidate_generation
+              .sampled_tree_source_admitted_wave_width == 1);
+    CHECK(
+        outer_narrow.candidate_generation.sampled_tree_source_peak_wave_size ==
+        1);
+    CHECK(outer_narrow.candidate_generation
+              .sampled_tree_projection_admitted_subwave_width == 1);
+    CHECK(outer_narrow.candidate_generation
+              .grammar_candidate_admitted_wave_width ==
+          outer_full.planned_grammar_candidate_wave_size);
+    auto const outer_narrow_plan =
+        estimate_outer(outer_narrow.candidate_generation
+                           .sampled_tree_source_admitted_wave_width,
+                       outer_narrow.candidate_generation
+                           .sampled_tree_projection_admitted_subwave_width,
+                       outer_narrow.candidate_generation
+                           .grammar_candidate_admitted_wave_width);
+    CHECK(outer_narrow_plan.planned_required_bytes <= outer_budget - 1);
+    CHECK(outer_narrow.candidate_generation
+              .sampled_tree_source_actual_peak_bytes <=
+          outer_narrow_plan.planned_sampled_source_admitted_peak_bytes);
+    CHECK(
+        outer_narrow.candidate_generation.grammar_candidate_actual_peak_bytes <=
+        outer_narrow_plan.planned_grammar_candidate_admitted_wave_bytes);
+    CHECK(outer_narrow.candidates_generated == 0);
+    CHECK(outer_narrow.candidates_scored == 0);
+    CHECK(outer_narrow.canonical_state_exact_before.has_value());
+    CHECK(outer_narrow_workspace.candidate_slots.capacity() == 0);
+    CHECK(outer_narrow_workspace.pipeline_candidate_slots.capacity() == 0);
+    CHECK(outer_state.counters.lazy_local_iteration_envelope_bytes_max ==
+          outer_minimum.planned_required_bytes);
+    check_scheduler_quiescent(outer_scheduler);
 
     // Exact E preserves the planner's width-two contract through the hybrid
-    // child's post-dedup cap clearing and completes canonical evidence
-    // publication within the same temporal envelope.
+    // child's post-dedup cap clearing. It must publish the same empty semantic
+    // result and canonical old-state evidence as the narrowed execution.
     auto outer_exact_options = outer_options;
     outer_exact_options.cache.memory_budget_bytes = outer_budget;
     std::atomic<std::size_t> outer_exact_pipeline_starts{0};
     std::atomic<std::size_t> outer_exact_workspace_allocations{0};
+    std::atomic<std::size_t> outer_exact_grammar_workspace_allocations{0};
     std::atomic<std::size_t> outer_exact_sources{0};
+    std::atomic<std::size_t> outer_exact_projections{0};
     outer_exact_options.before_candidate_pipeline_start_for_tests = [&] {
       outer_exact_pipeline_starts.fetch_add(1, std::memory_order_relaxed);
     };
@@ -734,33 +792,73 @@ void test_hybrid_width_two_exact_admission_boundary() {
       outer_exact_workspace_allocations.fetch_add(1, std::memory_order_relaxed);
     };
     outer_exact_options.enumeration
+        .before_grammar_candidate_workspace_allocation_for_tests = [&] {
+      outer_exact_grammar_workspace_allocations.fetch_add(
+          1, std::memory_order_relaxed);
+    };
+    outer_exact_options.enumeration
         .before_sampled_tree_source_enumeration_for_tests = [&](std::size_t,
                                                                 std::size_t) {
       outer_exact_sources.fetch_add(1, std::memory_order_relaxed);
     };
+    outer_exact_options.enumeration.before_sampled_tree_projection_for_tests =
+        [&](std::size_t) {
+          outer_exact_projections.fetch_add(1, std::memory_order_relaxed);
+        };
     larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
         outer_exact_workspace;
     auto outer_exact = larch::run_chart_spr_acceptance_iteration(
-        outer_state, outer_exact_options, 0, outer_exact_workspace,
+        outer_state, outer_exact_options, 1, outer_exact_workspace,
         outer_scheduler);
     CHECK(outer_exact_pipeline_starts.load(std::memory_order_relaxed) == 1);
     CHECK(outer_exact_workspace_allocations.load(std::memory_order_relaxed) >
           0);
+    CHECK(outer_exact_grammar_workspace_allocations.load(
+              std::memory_order_relaxed) > 0);
     CHECK(outer_exact_sources.load(std::memory_order_relaxed) > 0);
+    CHECK(outer_exact_projections.load(std::memory_order_relaxed) > 0);
     CHECK(outer_exact.candidate_generation
               .sampled_tree_source_admitted_wave_width ==
-          outer_full.planned_sampled_source_wave_size);
+          outer_source_two.planned_sampled_source_wave_size);
     CHECK(outer_exact.candidate_generation
               .sampled_tree_source_admitted_wave_width == 2);
+    CHECK(outer_exact.candidate_generation.sampled_tree_source_peak_wave_size ==
+          2);
     CHECK(outer_exact.candidate_generation
               .sampled_tree_projection_admitted_subwave_width ==
-          outer_full.planned_sampled_projection_wave_size);
+          outer_source_two.planned_sampled_projection_wave_size);
+    CHECK(outer_exact.candidate_generation
+              .grammar_candidate_admitted_wave_width ==
+          outer_full.planned_grammar_candidate_wave_size);
+    auto const outer_exact_plan = estimate_outer(
+        outer_exact.candidate_generation
+            .sampled_tree_source_admitted_wave_width,
+        outer_exact.candidate_generation
+            .sampled_tree_projection_admitted_subwave_width,
+        outer_exact.candidate_generation.grammar_candidate_admitted_wave_width);
+    CHECK(outer_exact_plan.planned_required_bytes == outer_budget);
     CHECK(outer_exact.candidate_generation
               .sampled_tree_source_actual_peak_bytes <=
-          outer_full.planned_sampled_source_admitted_peak_bytes);
+          outer_exact_plan.planned_sampled_source_admitted_peak_bytes);
+    CHECK(
+        outer_exact.candidate_generation.grammar_candidate_actual_peak_bytes <=
+        outer_exact_plan.planned_grammar_candidate_admitted_wave_bytes);
     CHECK(outer_exact.candidates_generated == 0);
     CHECK(outer_exact.candidates_scored == 0);
     CHECK(outer_exact.canonical_state_exact_before.has_value());
+    CHECK(outer_exact.state_score_before == outer_narrow.state_score_before);
+    CHECK(outer_exact.state_score_after == outer_narrow.state_score_after);
+    CHECK(outer_exact.no_accept_reason == outer_narrow.no_accept_reason);
+    CHECK(outer_exact.canonical_seed == outer_narrow.canonical_seed);
+    CHECK(outer_exact.canonical_candidates.empty());
+    CHECK(outer_narrow.canonical_candidates.empty());
+    CHECK(outer_exact.canonical_ranked_stream_indices ==
+          outer_narrow.canonical_ranked_stream_indices);
+    CHECK(outer_exact.canonical_exact_verified_stream_indices ==
+          outer_narrow.canonical_exact_verified_stream_indices);
+    check_canonical_exact_evidence_equal(
+        *outer_exact.canonical_state_exact_before,
+        *outer_narrow.canonical_state_exact_before);
     CHECK(outer_exact_workspace.candidate_slots.capacity() == 0);
     CHECK(outer_exact_workspace.pipeline_candidate_slots.capacity() == 0);
     CHECK(outer_state.counters.lazy_local_iteration_envelope_bytes_max ==
@@ -786,12 +884,12 @@ void test_hybrid_width_two_exact_admission_boundary() {
   larch::chart_scheduler scheduler{
       larch::chart_scheduler_options{.requested_workers = 4}};
 
-  // The allocation-free unified planner selects the finite two-source
-  // lookahead and a bounded projection subwave. Its conservative shape must
+  // Pin the allocation-free parent contract to a two-source lookahead and let
+  // it select the bounded projection subwave. Its conservative shape must
   // cover the concrete sampled tree used by the child stream.
   auto const parent = larch::chart_spr_search_detail::
       estimate_grammar_spr_finite_iteration_memory_envelope(
-          state, 1, 1, 1, false, scheduler, 1, &options.enumeration, 2, true, 0,
+          state, 1, 1, 1, false, scheduler, 1, &options.enumeration, 2, true, 2,
           0, 1);
   CHECK(parent.planned_sampled_source_wave_size == 2);
   CHECK(parent.planned_sampled_projection_wave_size > 1);

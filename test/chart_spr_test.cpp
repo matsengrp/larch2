@@ -1504,6 +1504,28 @@ static void test_phase8_sampled_hybrid_reservoir_worker_seed_matrix() {
         CHECK(exhaustive_metrics.tasks_submitted ==
               exhaustive_metrics.tasks_joined);
 
+        // Replay Algorithm R independently over the exact child stream. This
+        // freezes both replacement draws and the wrapper's final shuffle; a
+        // seed-ignoring or first-K implementation cannot pass by returning an
+        // arbitrary exhaustive subset.
+        std::vector<larch::grammar_spr_candidate> expected_reservoir;
+        expected_reservoir.reserve(reservoir_size);
+        std::mt19937 reservoir_oracle_rng(seed ^ 0x9e3779b9U);
+        std::size_t reservoir_oracle_seen = 0;
+        for (auto const& candidate : exhaustive) {
+          ++reservoir_oracle_seen;
+          if (expected_reservoir.size() < reservoir_size) {
+            expected_reservoir.push_back(candidate);
+            continue;
+          }
+          std::uniform_int_distribution<std::size_t> distribution(
+              0, reservoir_oracle_seen - 1);
+          auto const slot = distribution(reservoir_oracle_rng);
+          if (slot < reservoir_size) expected_reservoir[slot] = candidate;
+        }
+        std::shuffle(expected_reservoir.begin(), expected_reservoir.end(),
+                     reservoir_oracle_rng);
+
         auto reservoir_options = make_options(scheduler);
         reservoir_options.reservoir_sample = true;
         reservoir_options.max_candidates = reservoir_size;
@@ -1522,6 +1544,11 @@ static void test_phase8_sampled_hybrid_reservoir_worker_seed_matrix() {
         CHECK(reservoir_stats.sampled_tree_source_peak_wave_size == workers);
         CHECK(reservoir_stats.sampled_tree_projection_admitted_subwave_width ==
               workers * 4);
+        CHECK(selected.size() == expected_reservoir.size());
+        for (std::size_t i = 0; i < selected.size(); ++i) {
+          check_candidate_payload_equal(grammar, expected_reservoir[i],
+                                        selected[i]);
+        }
 
         for (auto const& candidate : selected) {
           auto const signature =
