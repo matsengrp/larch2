@@ -28,7 +28,7 @@ in this document.
 
 | Phase | Status | Required evidence |
 |---|---|---|
-| 0. Repair and freeze measurement | in progress (timing deferred) | Native/oracle/runner frozen and functional gates audited; quiet-host calibration, capture, finalization, and seal pending |
+| 0. Repair and freeze measurement | in progress (calibration passed; partial capture) | Native/oracle/runner frozen and functional gates audited; the frozen wrapper calibration passes and four small physical-core captures are complete with no timeouts. Medium and unpinned capture, finalization, audits, and seal remain pending |
 | 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | Functional/counter gates pass at `208ce23`; canonical Phase-0 comparison and serial speed/no-regression gates await the sealed baseline |
 | 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | `0c4623b` passes the allocation/build/canonical/full-CTest/targeted-ASAN gates; serial timing and RSS comparisons await the sealed baseline |
 | 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | Safe one-pool orchestration, full CTest, and targeted TSAN pass at `7d294d6`; small-case timing awaits the sealed baseline |
@@ -36,7 +36,7 @@ in this document.
 | 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass W1/W8 exact semantics, full CTest, and targeted TSAN; same-revision diagnostics exceed the 2x exact-phase target; measured-0% heavy splitting is omitted; unified frontier/candidate admission and sealed timing/RSS remain pending |
 | 6. Parallelize exact top-K candidates | implementation complete; acceptance pending Phase 0 | `870c298` passes the in-tree Top-K/worker semantic and stable-failure matrix, deterministic scheduling, functional bounded-admission tests, full RelWithDebInfo CTest, and targeted TSan; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS gates await Phase 0 |
 | 7. Make lazy charts scalable and adaptive | implementation complete; acceptance pending Phase 0 | Packed deterministic grouping, dependency wavefronts, exact transient admission, the profile-supported within-clade omission, and frozen `off|on|auto` policy are implemented through `38e9a28`; `3359fbf` adds the exact eight-row medium-auto/small-on completion producer and `c5156a8` registers its passing synthetic CTest. These are tooling checkpoints only: the Phase-7 supplements, named-fixture medians/scaling, sparse-reclamation TSan, full CTest, RSS, and sealed performance gates remain pending |
-| 8. Parallelize and pipeline candidate generation | implementation checkpoint complete; acceptance pending Phase 0 | `6c8d0c7` passes the stable worker/seed/source matrix, exact finite admission, pipeline drain/stale/cancellation semantics, full RelWithDebInfo CTest, and targeted TSan; unsealed W8 sampled-generation diagnostics miss 2x, so the supplemental seal, quiet-host speed cycle, Phase-7 end-to-end comparison, and paired RSS gate remain pending |
+| 8. Parallelize and pipeline candidate generation | implementation hardening complete; acceptance pending Phase 0/final gates | Source waves, stable direct-projection workspaces, nested-workspace quarantine, seeded reservoir ordering, and realizable outer/direct width-two boundaries are committed through `94a6323`; the focused RelWithDebInfo chart and pipeline binaries pass. Current-revision full CTest, ASAN/TSan, supplemental seal, quiet-host speed cycle, Phase-7 comparison, and paired RSS remain pending |
 | 9. Parallelize accepted-state cache updates | implementation checkpoint complete; acceptance pending Phase 0/final gates | Persistent pattern-parallel cache transactions, exact-state reuse, non-vacuous three-accept W1/2/4/8 semantics, crash-durable supplemental tooling, and counter/report contracts pass through `19e26db`; `0f099ca` adds the passing schema-v3 frozen-oracle characterization producer. This is an evidence-production checkpoint only: the production characterization and immutable supplement capture/seal, accepted-update timing/RSS decision, ASAN/TSAN, and full CTest remain pending |
 | 10. Integrate, tune defaults, and prove parity | implementation in progress | Temporal finite-memory reporting and the exact hybrid, conservative/local, auto/16-worker, multiparent, and multifurcation matrices pass through `19e26db`; cleanup, complete correctness/sanitizer gates, sealed worker-policy/RSS/wall evidence, and the conditional default change remain pending |
 
@@ -297,6 +297,34 @@ parallel execution, so a silently serial implementation cannot pass.
 Create and freeze a trustworthy benchmark contract and correctness oracle
 before changing product performance code; complete its quiet-host measurement
 and seal before accepting any performance result.
+
+### Current evidence (2026-07-17)
+
+The immutable measurement checkpoint remains
+`7ca527b8906d018124756182274335cbff936d72`, with exact subject
+`Baseline measure` and sole parent
+`408434ecfd096af484ecbbd3deeb67511151cd76`. It remains an ancestor of the
+implementation tip; its detached runner, oracle, workload definitions, and
+binaries are the only admissible Phase-0 inputs.
+
+The frozen wrapper calibration now passes. Its canonical JSON is
+`build/wric-chart-parallelization/phase0-calibration-408434e/wrapper-calibration.json`
+in the detached Phase-0 worktree and has SHA-256
+`b254001b2327e0b2e8ef2c1d6c32e5b0f5e315bdeeadffa9249a8765228f39d0`.
+The median paired wrapper/direct ratio is `1.015775988195` and the ratio of
+medians is `1.008541338978`, both below the frozen `1.02` limit; the live guard
+recorded zero forbidden-process matches.
+
+Four physical-core small captures are also complete:
+`small-dense64-physical`, `small-exact1-physical`,
+`small-primary32k4-physical`, and `small-stress128k16-physical`. Together their
+status records contain 120 canonical rows across 34 repeat stages and zero
+timeouts. These artifacts are partial capture evidence, not Phase-0
+acceptance. Every medium capture, the small automatic/unpinned capture,
+approvals, finalization, pending audit, seal, and final audit remain mandatory.
+The interrupted medium attempt is archived separately as external-interference
+evidence and does not count as a baseline capture. No performance gate below
+may be accepted from the calibration or the four small captures alone.
 
 ### Actions
 
@@ -739,13 +767,15 @@ results ledger.
 
 The immutable measurement checkpoint remains
 `7ca527b8906d018124756182274335cbff936d72` (`Baseline measure`). Its frozen
-runner, oracle, workloads, and binaries are unchanged. Quiet-host Phase-0
-calibration, baseline capture, finalization, audit, and seal are deliberately
-deferred under the authorized deadline-overlap rule; therefore all Phase-6
-performance acceptance remains pending. In particular, the frozen medium
-Top-K-4 scaling gate, real Top-K-16 admission gate, paired W1/W8 RSS gate, and
-frozen-workload repeated-output capture cannot be inferred from the passing
-in-tree functional contracts or benchmark-postprocessor regressions.
+runner, oracle, workloads, and binaries are unchanged. The wrapper calibration
+and four small physical-core captures have since completed, but every medium
+capture, the small automatic/unpinned capture, finalization, audits, and seal
+remain deferred under the authorized deadline-overlap rule; therefore all
+Phase-6 performance acceptance remains pending. In particular, the frozen
+medium Top-K-4 scaling gate, real Top-K-16 admission gate, paired W1/W8 RSS
+gate, and frozen-workload repeated-output capture cannot be inferred from the
+passing in-tree functional contracts, benchmark-postprocessor regressions, or
+partial Phase-0 capture.
 
 ### Goal
 
@@ -843,6 +873,37 @@ medium fixture's nearly unique context-key failure mode.
 Do not make `auto` the default until all these gates pass.
 
 ## Phase 8 — Parallelize and pipeline candidate generation
+
+### Implementation status (2026-07-17)
+
+The committed hardening chain through `e3eec44` extends the earlier `6c8d0c7`
+checkpoint without changing the canonical source/RNG contract. `0c0fbb9`
+preserves ordinal failure selection after speculative work joins; `b66e115`
+adds finite and adaptive sampled-source waves under the unified temporal
+memory envelope; and `6e8167d` sizes direct-projection workspace vectors by
+stable scheduler slots while charging dynamic storage only for the active
+wave. The same checkpoint quarantines a failed direct workspace for the rest
+of its joined wave/subwave, including nested same-scheduler serial fallback,
+and removes the stale retained-candidate charge from the post-generation
+evidence phase. `e3eec44` adds sampled/hybrid reservoir matrices and the first
+direct/outer width-two admission tests. `94a6323` hardens those tests: the
+reservoir matrix now replays Algorithm R and its final shuffle independently
+over the exhaustive canonical child stream for every required seed; the outer
+unified-memory test uses the unmodified production state to prove a realizable
+adaptive boundary where exact budget `E` admits source width two while `E-1`
+executes at source width one; and the direct child test explicitly pins width
+two and rejects `E-1` before source/workspace/scheduler side effects. The outer
+test compares every canonical old-state evidence field across both widths and
+does not synthesize duplicate provenance or claim presemantic rejection at an
+unreachable state. The focused RelWithDebInfo `chart_spr_test` and
+`chart_spr_pipeline_test` binaries both pass at this checkpoint.
+
+The targeted TSan result at `6c8d0c7` is historical evidence only. Because the
+subsequent production concurrency and workspace lifetime code changed, the
+current revision still requires focused and full RelWithDebInfo validation,
+the complete ASAN gate, and the targeted TSan gate. The supplemental fixture
+seal and all quiet-host generation, end-to-end, and RSS gates also remain
+pending Phase 0.
 
 ### Goal
 
