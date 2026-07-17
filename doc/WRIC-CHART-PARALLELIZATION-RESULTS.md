@@ -39,10 +39,10 @@ committed. Phase-0 artifacts use the non-overwriting directory
 | 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | code checkpoint `cbf92b6` and evidence checkpoint `1be6ffe`; full RelWithDebInfo and targeted TSan gates pass; sealed scaling/RSS gates pending |
 | 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass post-omission semantics, full CTest, and targeted TSAN; diagnostic exact-phase scaling exceeds 2x; unified frontier/candidate admission and sealed timing/RSS remain pending |
 | 6. Parallelize exact top-K candidates | implementation complete; acceptance pending Phase 0 | code checkpoint `870c298`; in-tree Top-K/worker semantics, stable failures, deterministic scheduling, functional bounded admission, full RelWithDebInfo CTest, and targeted TSan pass; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS remain pending |
-| 7. Make lazy charts scalable and adaptive | implementation complete; acceptance pending Phase 0 | packed deterministic grouping, dependency wavefronts, exact transient admission, and frozen `off|on|auto` policy pass through `38e9a28`; current pre-default complete ASAN and targeted TSan gates pass through `51d2a3c`, while production supplements and sealed timing/RSS remain pending |
-| 8. Parallelize and pipeline candidate generation | implementation hardening complete; acceptance pending Phase 0/final gates | source waves, stable direct-projection workspaces, nested-workspace quarantine, seeded reservoir ordering, and realizable outer/direct width-two boundaries are committed through `94a6323`; `51d2a3c` pins production generation evidence to that checkpoint. The current production-code full RelWithDebInfo suite, complete ASAN suite, focused anchor test, and exact 55-test TSan matrix pass; supplemental sealing, quiet-host speed, Phase-7 comparison, and paired RSS remain pending |
-| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; acceptance pending Phase 0/final gates | persistent pattern-parallel commits, exact frontier reuse, non-vacuous three-accept evidence, durable supplement publication, and abort-evidence hygiene pass through `19e26db`; current pre-default full RelWithDebInfo, complete ASAN, and targeted TSan gates pass through `51d2a3c`, while capture/seal and timing/RSS remain pending |
-| 10. Integrate, tune defaults, and prove parity | implementation in progress | finite temporal-memory reporting and the required hybrid, conservative/local, auto/16-worker, multiparent, and multifurcation semantics are covered through `19e26db`; current pre-default full normal, complete ASAN, and targeted TSan gates pass through `51d2a3c`. Cleanup review, the complete mode/worker matrix, sealed automatic-policy/RSS/wall gates, and the conditional default decision remain pending; a default change requires the final gates to be rerun |
+| 7. Make lazy charts scalable and adaptive | implementation complete; acceptance pending Phase 0 | packed deterministic grouping, dependency wavefronts, exact transient admission, and frozen `off|on|auto` policy pass through `38e9a28`; current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`, while production supplements and sealed timing/RSS remain pending |
+| 8. Parallelize and pipeline candidate generation | implementation hardening complete; acceptance pending Phase 0/final gates | source waves, stable direct-projection workspaces, nested-workspace quarantine, seeded reservoir ordering, and realizable outer/direct width-two boundaries are committed through `94a6323`; `51d2a3c` pins production generation evidence to that checkpoint. Current post-cleanup full RelWithDebInfo, complete ASAN, focused matrix, and exact 55-test TSan gates pass at `4ef6126`; supplemental sealing, quiet-host speed, Phase-7 comparison, and paired RSS remain pending |
+| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; acceptance pending Phase 0/final gates | persistent pattern-parallel commits, exact frontier reuse, non-vacuous three-accept W1/2/4/8 evidence, durable supplement publication, and abort-evidence hygiene pass through `4ef6126`; current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`, while capture/seal and timing/RSS remain pending |
+| 10. Integrate, tune defaults, and prove parity | implementation in progress | cleanup review and the complete in-tree required mode/worker matrix pass at `4ef6126`, as do the current post-cleanup full RelWithDebInfo, complete ASAN, and exact 55-test TSan gates. Sealed automatic-policy/RSS/wall gates, Phase-0 and supplemental sealing, and the conditional default decision remain pending; any later production/default change reopens affected final gates |
 
 ## Phase 0 — immutable provenance
 
@@ -1830,7 +1830,7 @@ This focused evidence is not a Phase-8 exit decision. The Phase-8 supplemental
 capture/seal, quiet-host 2x generation cycle, Phase-7 end-to-end comparison,
 paired RSS gate, and every still-open Phase-0 gate remain pending.
 
-### Current pre-default correctness and sanitizer closure (`51d2a3c`)
+### Latest complete pre-cleanup correctness and sanitizer closure (`51d2a3c`)
 
 Commit `51d2a3c2c19c0e71c94ff23013a1a58cadf3b9ed` corrects the
 capture contract by pinning historical run label `phase8-generation` to full
@@ -1907,11 +1907,120 @@ and
 `61e9e99b7b820b727814c2e4c91004a45d9c17a68385077a020c96733d68155f`;
 the files are under `build/wric-chart-parallelization/tsan-51d2a3c/`.
 
-These results close the current pre-default normal and sanitizer gates for the
-Phase-7--10 production implementation. They close no Phase-0, supplement,
-performance, RSS, automatic-policy, or default-change gate. If the conditional
-product-default change is later made, the complete normal, ASAN, and TSan
-sequence must be rerun at that descendant.
+These results close only the latest complete pre-cleanup normal and sanitizer
+checkpoint. They close no Phase-0, supplement, performance, RSS,
+automatic-policy, or default-change gate. The production-state cleanup at
+`4ef6126` invalidated this evidence and the complete post-cleanup sequence was
+rerun as recorded next.
+
+### Post-cleanup correctness and sanitizer closure (`4ef6126`)
+
+Commit `4ef6126607c8da5f25d54928ea2fd6d152b89e29`, tree
+`833842e7b8416ff8a22b5ee471609e31e3b2f252`, was clean before and after
+every accepted gate. The immutable `Baseline measure` commit remains its
+ancestor with exact sole parent `408434e`. All builds use the required
+GCC-trunk C++26 compiler; the compiler SHA-256 is
+`776a974a2559ed75f973d8f9ec4de789763c897a34950b4651875c9c0d57a404`.
+
+The focused cleanup/matrix gate used:
+
+```bash
+cmake --build build --parallel 8 --target \
+  chart_parallel_test chart_scheduler_test chart_trim_test \
+  chart_spr_search_test chart_spr_pipeline_test chart_spr_phase10_test
+
+ctest --test-dir build --output-on-failure --no-tests=error \
+  -R '^(chart_parallel_test|chart_scheduler_test|chart_trim_test|chart_spr_search_test|chart_spr_pipeline_test|chart_spr_phase10_test|no_direct_chart_spr_multisite_helpers|no_direct_chart_spr_root_score_detail|no_chart_bnb_superset_topology_exact|no_overlay_chain_compaction_prefix_materialize|no_keep_production_without_exact_check)$'
+```
+
+It passes 11/11 in 12.24 seconds. The build, CTest, and preserved LastTest
+SHA-256 values are
+`c8f24d78135dbfff221f2a650e7b461e1487892ec02f9792c67267141a42c0e5`,
+`b250e6d184bbb41f792c7c9138da1bb894f6b23481b204a3a4475f95dbcd45ad`,
+and
+`5b906f0c9196370a8afa9b855b980893dbdfae1413778c0363bf2c34d933b7b6`.
+The evidence is under
+`build/wric-chart-parallelization/phase10-matrix-4ef6126/`; its artifact
+manifest SHA-256 is
+`451bb931332232256e41f8fed4aeb314fc13b945a2e2c249618dacb5a37d529a`.
+
+The complete normal gate used:
+
+```bash
+cmake --build build --parallel 8
+ctest --test-dir build --output-on-failure --parallel 8 --no-tests=error
+```
+
+All 176 registered tests complete with zero failures in 213.57 seconds: 174
+pass, while the established code-77 `merge_consistency_test` and
+`rotaA_diagnostic_test` skip for their unchanged reasons. The command,
+build, inventory, CTest, and preserved LastTest SHA-256 values are
+`9f8f57ee05f07396046e8089a86ede2434e879d6bd43018d010b47e3a63e02d2`,
+`3265ecd47afd5c4c526c9569308c6b5f5c9841a2ed7395557908be6d3a1776f8`,
+`f214ccee352c3689affdc794e2591ca40a9a86e913158eaec6c1e4e8b8550e76`,
+`b5341dd922a557b86948af1358a76b7a83e317961d040c406643fc03a115d758`,
+and
+`8b9a4b3005e12a37729a9ee972a55a1ea8b4413ada3c9ac98496d7c61c7942bb`.
+The evidence is under
+`build/wric-chart-parallelization/post-phase10-4ef6126/`; its artifact
+manifest SHA-256 is
+`0ad04ec468d1aa8d5e317e7240a4adeb5701ce8552bc7a16b7a908b0acd42bea`.
+
+The complete ASAN gate used the plan's RelWithDebInfo configuration and:
+
+```bash
+cmake --build build-asan --parallel 8
+LD_LIBRARY_PATH=/home/ogi-agent/install/gcc-trunk/lib64 \
+ASAN_OPTIONS=halt_on_error=1:detect_leaks=1 \
+  ctest --test-dir build-asan --output-on-failure --parallel 1 \
+    --no-tests=error
+```
+
+All 176 registered tests again complete with zero failures in 873.06 seconds:
+174 pass and the same two established code-77 tests skip. The diagnostic scan
+finds no AddressSanitizer or LeakSanitizer report. Every representative binary
+resolves GCC-trunk `libasan`, `libstdc++`, and `libgcc_s`; exact
+`libasan.so.8.0.0` SHA-256 remains
+`182be2e1985a5c9a3a3c6a52f56f92af375f34a69e950d50b940b5baff395575`.
+The command, build, inventory, runtime, CTest, and preserved LastTest SHA-256
+values are
+`7705a40146f0585c17c029c0f7207cea2bf96b16f8371dbea35aad01fa64cce1`,
+`3ba59f17196c5a2cde1b8b9b88ee4a94596a7e1b2d54f60ef9e847a4be100ac7`,
+`071877401ab17e7b1ca44e8357618bee22185e83cc79db0c638baa90c1f4aec4`,
+`8fbb0bdf75ebc966bf8bc0b61faf82bdbd8692f8c701e290ac1c298de81405a6`,
+`819d8a5d6df2073f085ed9b8744aadad29287baa14b456030e0b69ce73102882`,
+and
+`7a9228239cf8ad6c05c5a689e026ae201b84115de7121e5e26de44e90d339415`.
+The evidence is under `build/wric-chart-parallelization/asan-4ef6126/`; its
+artifact manifest SHA-256 is
+`cea275ecb93bd2f20073795adec2659a1e93fa9bc3f7585f7d1c4787af28b2a3`.
+
+The exact TSan regex in the plan and command transcript selects 55 of 176
+registered tests. With
+`LD_LIBRARY_PATH` preferring the validated patched runtime and
+`TSAN_OPTIONS=halt_on_error=1`, the serial targeted matrix passes 55/55 in
+582.49 seconds with no TSan, race, lock-order, publication, or thread-leak
+diagnostic. Patched `libtsan.so.2.0.0` SHA-256 remains
+`58725dae226e91ea96bebbdf54f84820638404a691528570ec1dab595ed08842`.
+The command, build, selected inventory, runtime, CTest, and preserved LastTest
+SHA-256 values are
+`8dd99420d1375afbb152f7638ad055873a516828ec068946788d81869536c7a7`,
+`9d7b68049312ccfa6a15d37d675f1b7b916891a2ab4318d7dde2e8f00f3f8c52`,
+`b49508c42ca10a2bc94ed54bf826edb57abc0540867fda3676c31ae8db72da86`,
+`80783b00e5ff6e32e93950cc2ce889b4b176b4ce0ad6ab6ef6cd478e3820aabb`,
+`51a29a1c46a0e928998f0dccb2d2b12ef15e5ed30a7d67e4b9d95d5f3f520b24`,
+and
+`8c56f23c7163fc51441fe6cef20fa7a303d7700c81e9e043d08690833ec7054e`.
+The evidence is under `build/wric-chart-parallelization/tsan-4ef6126/`; its
+`SHA256SUMS` digest is
+`de70d1d6cf21ac25a0bbf8ee84c7f7a4a7e843967bb0d19cf4454bcc70ead612`.
+
+The sanitizer rebuilds overlapped each other and the unrelated proof-assist
+campaign; the normal and sanitizer tests also ran while unrelated host work
+was present. Their elapsed times are operational diagnostics only. These
+results close the current post-cleanup functional and sanitizer gates, but no
+Phase-0, supplement, performance, scaling, RSS, automatic-policy, or default
+gate. Any later production/default change reopens every affected test gate.
 
 ## Phase 9 accepted-state update checkpoint (unsealed)
 
@@ -2000,9 +2109,11 @@ sidecar parity. Earlier at `b648c42`, the targeted ASAN command for the
 canonical CLI/report, bootstrap/acceptance, search, and persistent cache tests
 passed 9/9 in 269.87 seconds without diagnostics. That sanitizer run predates
 the latest report/matrix changes and is interim evidence only. The current
-pre-default complete ASAN and exact final targeted TSan gates are now recorded
-under the Phase-8 closure section above at `51d2a3c`; they include both
-persistent cache tests and pass without diagnostics.
+post-cleanup complete normal/ASAN and exact targeted TSan gates are recorded
+under the `4ef6126` closure section above; they include both persistent cache
+tests and pass without diagnostics. The expanded Phase-9 production matrix at
+that checkpoint covers multiparent and non-vacuous local multi-accept paths at
+W1/2/4/8 with exact canonical parity and non-vacuous scheduler evidence.
 
 Phase 9 remains open for the immutable twelve-row supplement capture/audit/seal,
 the accepted-update exemption or 1.5x speed decision, and paired RSS. A later
@@ -2190,6 +2301,56 @@ Successful completion of these commands would produce auditable input evidence
 for later benchmark runs. It would not by itself pass Phase 0, the Phase-7 or
 Phase-9 timing/RSS gates, full RelWithDebInfo CTest, ASAN, TSan, or final parity.
 
+## Historical benchmark-capture preparation (setup only)
+
+To shorten the post-Phase-0 critical path without creating premature timing
+evidence, clean detached historical product roots and capture-compatible
+RelWithDebInfo builds were prepared under
+`/home/ogi-agent/matsen/larch2-wric-evidence` (abbreviated `$E` below). No
+benchmark capture, supplement, timing run, or Phase-0 operation was performed.
+
+The clean detached capture-tool root is `$E/capture-tool-b6ae1a9` at revision
+`b6ae1a968c0a2374d8180e5682ae53775377c31e`, tree
+`6feae616b0eb8e6c6c0ac0887cdc3ff341e550f3`. Its raw tracked-root audit
+observed 1,081 files and 107,252,099 bytes with digest
+`ca13ad1d8b80a7e9601879d23fe4e26e8531f50eb38c1f926066f52984869c8e`.
+The capture wrapper, compatibility auditor, and evidence ledger SHA-256 values
+are, respectively,
+`e374ed726e026ab973ffa9ff385b13cd8c0eea8041d32b861df61fb4fa6c652e`,
+`22f526a08bc20825ed66ca679a3d4121e5f0c5d83f181f6d27fe42397c3e3075`,
+and
+`def3ce4b6868b16c050599b918240ba600e204dcf884caea36bffe52769cd29f`.
+
+| Run label(s) / root | Product revision | `dagutil` SHA-256 | Harness SHA-256 | Metadata SHA-256 |
+|---|---|---|---|---|
+| `phase1` / `$E/phase1` | `208ce23f0c005d3702d114f535fe21564b3b79b6` | `4f39d997ecc48c2896778e0d31e88cfa6744c1eaa48914e76e8e4f4cbd2b056b` | `2fa15aeb1c34de8b018b3ba079ca4fb2a117baf53bc59feb2dabd67d0161d795` | `737812a139fd47e237f1b0673ef7996b344f84ec880a53eb4bc9aee8b7ddffc0` |
+| `phase2` / `$E/phase2` | `0c4623ba1793395ae8f5c3df2a2524a27d89bc80` | `6827c53e3838715a308d1cc039986033651489aece73de864bbbe410856c02e4` | `2fa15aeb1c34de8b018b3ba079ca4fb2a117baf53bc59feb2dabd67d0161d795` | `a0b65b91d0182eea8b91929f2542b26761857a8232320e4d82c220a94e3ef686` |
+| `phase3` / `$E/phase3` | `7d294d68eaadc8c55b92be4f5589278c8a2f78f2` | `73042280f79250c12fde8f408eacfa9229a9a82037d29197b62bb1d97cb8461c` | `2fa15aeb1c34de8b018b3ba079ca4fb2a117baf53bc59feb2dabd67d0161d795` | `c0fbad76a0c44b317f0a9a5218ed89ea9352c0dc65385a4f64597c0347dbc50f` |
+| `phase4` / `$E/phase4` | `cbf92b62284b2a93e506f59187ac94a5336b0be3` | `1c5995c1b367264ec0d099d2590924da83dc9ba460a55951e4f96d31d2415b07` | `2fa15aeb1c34de8b018b3ba079ca4fb2a117baf53bc59feb2dabd67d0161d795` | `c4bf4f13fc7952c0eaddaaa087b5652c19f53de12ef976848f812fdb43fc6de2` |
+| `phase5` / `$E/phase5` | `3a10e9cc45050f7a6f846f9f1adb8d5f4157f9a5` | `e6d2c83abb97c119a7799706cdc9dc1a50c9910eacedc8d0226da1b318147dc3` | `2fa15aeb1c34de8b018b3ba079ca4fb2a117baf53bc59feb2dabd67d0161d795` | `73d8dea53f65a6ba9d675f08909e78aedb29c485fab92a55dad642ee2bb0a64a` |
+| `phase6` / `$E/phase6` | `870c298ff1c0c21901bdf79d341bf97d121f389c` | `ee69fde20f1daba3c23928bb62e3d2249d511c80d07d05cf97d21605185d0da2` | `17d178cb27e3f500fdbe5b95ada89282ce537630907b4796a7f6e00945165068` | `af5d27f2c472ae14eabb6369436789b737586fb31640bd22dd84d686451a484d` |
+| `phase7-high`, `phase7-small`, `phase7-auto`, `phase8-end-to-end` / `$E/phase7` | `38e9a281396e5263647ba68724414848841525d7` | `447c24d9f18291fdcc07d8d209d11ff6a44b0f905dd20bd035370cc04d672901` | `ed089af213f7f6773a252908dc3111a4d86bf01c85f12ad9d3a846ec92b3770f` | `6163b746551a058dd6cd8faf8f0ca2cfd35c3b6710e75635a51885b1610b07a1` |
+| `phase8-generation` / `$E/phase8-generation` | `94a63238d25a8e3262428419d53f8f0986e8879b` | `55065540af091ee28e555601101505fabf36d6b901c40171b2fbc53cc85c7933` | tracked `ed089af213f7f6773a252908dc3111a4d86bf01c85f12ad9d3a846ec92b3770f` | none (`-`) |
+
+Every listed product root was clean and detached at inventory time and its
+capture-compatible build passed cache/recipe/flag/link validation. Each
+generated Phase-1--7 compatibility pair re-audited with status `ok` against
+the capture-tool root; `phase8-generation` uses the tracked harness byte
+directly and therefore has no generated compatibility metadata. The common
+compatibility transformation-spec SHA-256 is
+`c53e4f57b685dfba70b0cc781cda00e9ff4ca5b3c41329cde752931fe84fe697`.
+The compatibility harnesses are singly linked mode `0555` and their metadata
+mode `0444`, but the roots and builds remain owner-writable preparation state,
+not sealed evidence. The capture wrapper must revalidate and bind all live
+provenance at capture time; any mutation requires a fresh inventory.
+
+The Phase-7 completion supplement must use exact `$E/phase7` as its fixture
+source at revision `38e9a28`, because its lazy fixtures are absent from the
+frozen Phase-0 root. The old diagnostic Phase-8 roots at `6c8d0c7` and
+`a21ab7a` must not be used for `phase8-generation`; the selected product is the
+`94a6323` root above. Phase 0, supplements, timing, RSS, scaling, parity, and
+all acceptance decisions are unchanged and remain open.
+
 ## Phase 10 integration checkpoint (in progress)
 
 Commit `e3ef48e` exposes the generation-phase, evidence-phase, and retained
@@ -2211,15 +2372,41 @@ fixed-topology multifurcation W1/W8 parity with an arity-three witness. Commit
 `19e26db` adds the corresponding abort-transaction hygiene and multiparent
 oracle coverage.
 
+Commit `4ef6126607c8da5f25d54928ea2fd6d152b89e29` completes the
+cleanup review and required in-tree semantic matrix. The review removed the
+obsolete, zero-only
+`chart_spr_search_state::selected_topology_cache_admitted_bytes` diagnostic;
+selected caches are task-local and no behavior or admission decision depended
+on it. This public state-surface removal is not claimed to preserve source or
+ABI compatibility. No superseded per-batch pool, duplicate production chart
+builder, unused scratch copy, or temporary compatibility execution path
+remained. The persistent search-lifetime scheduler, bounded source-wave
+producer, supported public source-compatibility wrappers, and cold/oracle
+fallbacks remain active intentional contracts.
+
+The completed in-tree matrix adds W1/2/4/8 production-path coverage for
+automatic dense construction, multiparent transient verification,
+non-vacuous three-accept local commits, and fixed-topology multifurcation. The
+scheduled multisite frontier covers `score_ua_edge={false,true}` by all four
+dominance modes by bound pruning `{false,true}` by W1/2/4/8. Every parallel
+count matches W1, including canonical digest/full sidecar where applicable,
+and proves exact worker binding, scheduler dispatch/tasks, pool lifetime, and
+shutdown. Existing deterministic overlap cases in `chart_trim_test`,
+`chart_spr_search_test`, and `chart_scheduler_test` supply the required active
+worker high-water witnesses without flaky timing assertions. The exact
+focused 11/11 gate and current full normal/ASAN/TSan evidence are recorded in
+the post-cleanup closure section above.
+
 These commits are correctness and observability checkpoints, not Phase-10
-acceptance. The current pre-default normal/ASAN/TSan gates are recorded above;
-the complete mode/worker suite, cleanup review, sealed Phase-0 and supplemental
-manifests, worker-policy selection, RSS bounds, primary 32/4 wall parity,
-W8/W1 2x speedup, unpinned explicit-auto, seedtree 128/16 stress, and bounded
-real-scale confirmations remain pending. The product default stays serial
-until explicit auto passes every prerequisite; no default-worker performance
-claim has been made. If the conditional default change occurs, the complete
-normal and sanitizer sequence must pass again at that descendant.
+acceptance. This closes only the cleanup review, in-tree functional
+mode/worker matrix, and current post-cleanup normal/sanitizer gates. Sealed
+Phase-0 and supplemental manifests, worker-policy selection, RSS bounds,
+primary 32/4 wall parity, W8/W1 2x speedup, unpinned explicit-auto, seedtree
+128/16 stress, and bounded real-scale confirmations remain pending. The
+product default stays serial until explicit auto passes every prerequisite;
+no default-worker performance claim has been made. Any later production or
+conditional default change requires every affected normal and sanitizer gate
+to pass again at that descendant.
 
 ## Later-phase evidence template
 
