@@ -322,9 +322,9 @@ status records contain 120 canonical rows across 34 repeat stages and zero
 timeouts. These artifacts are partial capture evidence, not Phase-0
 acceptance. Every medium capture, the small automatic/unpinned capture,
 approvals, finalization, pending audit, seal, and final audit remain mandatory.
-The interrupted medium attempt is archived separately as external-interference
-evidence and does not count as a baseline capture. No performance gate below
-may be accepted from the calibration or the four small captures alone.
+Interrupted medium attempts are archived separately as external-interference
+evidence and do not count as baseline captures. No performance gate below may
+be accepted from the calibration or the four small captures alone.
 
 ### Actions
 

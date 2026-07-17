@@ -392,10 +392,11 @@ Four physical-core small captures have completed under
 | **Total** | **120** | **34** | **0** |
 
 These rows are valid partial-capture evidence, not an accepted or sealed
-baseline. Two starts of `medium-dense64-physical` were interrupted by unrelated
-external builds and were moved out of the baseline to
-`phase0-failed-external-interference-20260716T233345Z/` and
-`phase0-failed-external-interference-20260717T010228Z/`. Both are contaminated
+baseline. Three starts of `medium-dense64-physical` were interrupted by
+unrelated external builds and were moved out of the baseline to
+`phase0-failed-external-interference-20260716T233345Z/`,
+`phase0-failed-external-interference-20260717T010228Z/`, and
+`phase0-failed-external-interference-20260717T011149Z/`. All are contaminated
 partial attempts and count as neither captures nor timing evidence. Every
 medium capture, the small automatic/unpinned capture, post-capture approvals,
 finalization, pending audits, detached seal, and final audit remain mandatory.
