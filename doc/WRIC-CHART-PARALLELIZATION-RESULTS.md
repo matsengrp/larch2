@@ -6,19 +6,25 @@ This ledger records evidence for
 `doc/WRIC-CHART-PARALLELIZATION-PLAN.md`. It is intentionally incomplete:
 the final Phase-0 semantic oracle and capture contract are frozen and the
 strict workload-manifest harness repair has passed focused and complete
-functional verification, while a passing wrapper calibration and the baseline
-trials remain outstanding. The plan's deadline-overlap rule authorizes
-Phase-1+ implementation and functional evidence now, but Phase 0 remains open.
-No Phase-1+ timing, scaling, memory, or parity result is acceptance evidence
-until Phase 0 is calibrated, captured, finalized, audited, and sealed.
+functional verification. The frozen wrapper calibration now passes and four
+small physical-core captures are complete, while every medium capture, the
+small automatic/unpinned capture, finalization, audits, and the detached seal
+remain outstanding. The plan's deadline-overlap rule authorizes Phase-1+
+implementation and functional evidence now, but Phase 0 remains open. No
+Phase-1+ timing, scaling, memory, or parity result is acceptance evidence until
+Phase 0 is completely captured, finalized, audited, and sealed.
 
 On 2026-07-14 the user authorized a deadline-driven scheduling exception: this
 state may be committed as the Phase-0 measurement checkpoint and later-phase
 implementation may begin before the quiet-host timing campaign. The
-checkpoint is measurement infrastructure, not an accepted timing baseline.
-Phase 0 stays open, the frozen executable/workload identities remain binding,
-and calibration, capture, finalization, detached sealing, and final audit are
-still mandatory before any timing-dependent phase exit or Phase-10 acceptance.
+checkpoint is `7ca527b8906d018124756182274335cbff936d72`, with exact subject
+`Baseline measure` and sole parent
+`408434ecfd096af484ecbbd3deeb67511151cd76`; it remains an ancestor of the
+current implementation and documentation checkpoints. It is measurement
+infrastructure, not an accepted timing baseline. Phase 0 stays open, the frozen
+executable/workload identities remain binding, and completion of capture,
+finalization, detached sealing, and final audit is still mandatory before any
+timing-dependent phase exit or Phase-10 acceptance.
 
 Raw artifacts belong under `build/wric-chart-parallelization/` and are not
 committed. Phase-0 artifacts use the non-overwriting directory
@@ -26,7 +32,7 @@ committed. Phase-0 artifacts use the non-overwriting directory
 
 | Phase | Evidence status | Result |
 |---|---|---|
-| 0. Repair and freeze measurement | in progress (timing deferred) | native/oracle/runner bytes frozen and functional gates independently audited; passing calibration, capture, finalization, and seal pending |
+| 0. Repair and freeze measurement | in progress (calibration passed; partial capture) | native/oracle/runner bytes frozen and functional gates independently audited; calibration passes and four small physical-core captures contain 120 canonical rows across 34 repeat stages with zero timeouts; every medium and unpinned capture, finalization, audits, and seal remain pending |
 | 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | code checkpoint `208ce23`; focused and full RelWithDebInfo correctness/counter gates pass; canonical baseline and timing gates remain pending |
 | 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | code checkpoint `0c4623b`; same-profiler allocation reduction, warmed-zero allocation, frozen semantic/counter, focused/full RelWithDebInfo, and targeted ASAN gates pass; serial timing, exact-small timing, RSS, and sealed canonical comparison remain pending |
 | 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | code checkpoint `7d294d6`; scheduler contract, canonical worker matrix, full RelWithDebInfo, and targeted TSan gates pass; small-case timing remains pending |
@@ -34,7 +40,7 @@ committed. Phase-0 artifacts use the non-overwriting directory
 | 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass post-omission semantics, full CTest, and targeted TSAN; diagnostic exact-phase scaling exceeds 2x; unified frontier/candidate admission and sealed timing/RSS remain pending |
 | 6. Parallelize exact top-K candidates | implementation complete; acceptance pending Phase 0 | code checkpoint `870c298`; in-tree Top-K/worker semantics, stable failures, deterministic scheduling, functional bounded admission, full RelWithDebInfo CTest, and targeted TSan pass; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS remain pending |
 | 7. Make lazy charts scalable and adaptive | implementation complete; acceptance pending Phase 0 | packed deterministic grouping, dependency wavefronts, exact transient admission, and frozen `off|on|auto` policy pass through `38e9a28`; sealed timing/RSS and final sanitizer/full-suite gates remain pending |
-| 8. Parallelize and pipeline candidate generation | implementation checkpoint complete; acceptance pending Phase 0 | stable worker/seed/source semantics, finite admission, pipeline failure/drain accounting, full RelWithDebInfo, and targeted TSan pass through `6c8d0c7`; sealed speed/RSS evidence remains pending |
+| 8. Parallelize and pipeline candidate generation | implementation hardening complete; acceptance pending Phase 0/final gates | source waves, stable direct-projection workspaces, nested-workspace quarantine, seeded reservoir ordering, and realizable outer/direct width-two boundaries are committed through `94a6323`; the focused RelWithDebInfo chart and pipeline binaries pass, while current-revision full CTest, ASAN/TSan, supplemental seal, quiet-host speed, Phase-7 comparison, and paired RSS remain pending |
 | 9. Parallelize accepted-state cache updates | implementation checkpoint complete; acceptance pending Phase 0/final gates | persistent pattern-parallel commits, exact frontier reuse, non-vacuous three-accept evidence, durable supplement publication, and abort-evidence hygiene pass through `19e26db`; capture/seal, timing/RSS, full CTest, and final sanitizer gates remain pending |
 | 10. Integrate, tune defaults, and prove parity | implementation in progress | finite temporal-memory reporting and the required hybrid, conservative/local, auto/16-worker, multiparent, and multifurcation semantics are covered through `19e26db`; cleanup, full matrices/sanitizers, sealed automatic-policy/RSS/wall gates, and the conditional default change remain pending |
 
@@ -359,6 +365,41 @@ reached `7.859542808287`, a fully paused retry rejected a later direct arm at
 floor, indicating intermittent host competition. Neither attempt is an
 overhead result and the gate has not been relaxed.
 
+#### Passing calibration and partial capture update (2026-07-17)
+
+The failed diagnostics above remain part of the append-only record, but their
+then-current statement that no passing calibration existed is now superseded.
+The canonical calibration JSON in the detached Phase-0 worktree is
+`build/wric-chart-parallelization/phase0-calibration-408434e/wrapper-calibration.json`;
+the bootstrap consumed a byte-identical copy at
+`baseline-408434e/bootstrap-phase0/wrapper-calibration.json`. Its SHA-256 is
+`b254001b2327e0b2e8ef2c1d6c32e5b0f5e315bdeeadffa9249a8765228f39d0`
+and its decision is `PASS`. The median paired wrapped/direct ratio is
+`1.015775988195` and the ratio of medians is `1.008541338978`, both below the
+unchanged `1.020000000000` limit. The live guard recorded zero forbidden
+process matches; its maximum unselected-SMT activity was 65,518 ppm against
+the frozen 200,000-ppm threshold.
+
+Four physical-core small captures have completed under
+`baseline-408434e/bootstrap-phase0/captures/`:
+
+| Capture ID | Canonical rows | Repeat stages | Timeouts |
+|---|---:|---:|---:|
+| `small-dense64-physical` | 25 | 5 | 0 |
+| `small-exact1-physical` | 20 | 4 | 0 |
+| `small-primary32k4-physical` | 36 | 12 | 0 |
+| `small-stress128k16-physical` | 39 | 13 | 0 |
+| **Total** | **120** | **34** | **0** |
+
+These rows are valid partial-capture evidence, not an accepted or sealed
+baseline. Two starts of `medium-dense64-physical` were interrupted by unrelated
+external builds and were moved out of the baseline to
+`phase0-failed-external-interference-20260716T233345Z/` and
+`phase0-failed-external-interference-20260717T010228Z/`. Both are contaminated
+partial attempts and count as neither captures nor timing evidence. Every
+medium capture, the small automatic/unpinned capture, post-capture approvals,
+finalization, pending audits, detached seal, and final audit remain mandatory.
+
 ### Strict bootstrap and source-binding audit
 
 The final pre-capture bootstrap/harness state passed an independent audit on
@@ -543,7 +584,13 @@ worker-scaling ratio. Medians alone cannot hide a paired-ratio failure.
 - [x] Canonical semantic output is deterministic and the corrected oracle's
   observational-safety/exception audit passes.
 - [x] Workload and supplemental manifest validation tests pass.
+- [x] The frozen process-wrapper calibration passes both 2% overhead gates and
+  its canonical JSON is bound by SHA-256.
+- [x] The four required small physical-core captures contain 120 canonical rows
+  across 34 repeat stages with zero timeouts.
 - [ ] Native and exact-chart medium 32/4 and 128/16 rows are captured.
+- [ ] Every other medium row and the small automatic/unpinned row are captured
+  without external interference.
 - [x] Instrumented `dagutil` is frozen; exact native/oracle mismatch rejection
   is covered by the harness regression and runner mismatch rejection by the
   bootstrap regression.
@@ -1727,6 +1774,60 @@ supplemental manifest has not been created. The quiet-host run must either pass
 the 2.0x gate or trigger another profile-supported optimization cycle; it must
 also establish Phase-7 end-to-end non-regression and paired RSS. This checkpoint
 does not reinterpret the observed miss or substitute it for sealed evidence.
+
+### Stable-slot, reservoir, and finite-envelope hardening (current through `94a6323`)
+
+The later committed hardening chain extends the historical `6c8d0c7`
+checkpoint without changing its canonical source/RNG contract:
+
+- `0c0fbb9` (`Preserve canonical speculative failure ordering`) retains the
+  earliest canonical accepted failure after every speculative task has joined.
+- `b66e115` (`Adapt finite sampled source waves`) adds bounded, adaptive
+  sampled-source waves under the unified temporal-memory envelope.
+- `6e8167d` (`Harden nested sampled projection waves`) sizes direct-projection
+  workspace vectors by stable scheduler slots while charging dynamic storage
+  only for the active wave, quarantines a failed workspace for the rest of its
+  joined wave/subwave (including nested same-scheduler fallback), and removes
+  a stale retained-candidate charge from the post-generation evidence phase.
+- `e3eec44` (`Cover reservoir and width-two admission contracts`) adds the
+  sampled/hybrid reservoir matrix and direct/outer width-two admission
+  coverage.
+- `94a6323` (`Strengthen reservoir and admission oracles`) independently
+  replays Algorithm R and the final shuffle over the exhaustive canonical child
+  stream for workers `1,2,4,8` and seeds `1,7,19`. It also replaces an
+  unreachable duplicated-provenance outer fixture with an unmodified
+  production state: exact budget `E` admits source width two, `E-1` executes at
+  source width one with identical canonical old-state evidence, and the direct
+  child boundary still rejects its own `E-1` before source, projection,
+  workspace, or scheduler side effects.
+
+The implementation-plan evidence status was synchronized at `d8adbb5`
+(`Record Phase 8 hardening evidence`); that commit changes documentation only.
+The immutable measurement checkpoint remains
+`7ca527b8906d018124756182274335cbff936d72`, with exact subject
+`Baseline measure` and sole parent
+`408434ecfd096af484ecbbd3deeb67511151cd76`. Git ancestry verification confirms
+that it is an ancestor of both `94a6323` and `d8adbb5`; no baseline checkpoint
+or frozen executable role was replaced.
+
+On the required GCC-trunk C++26 RelWithDebInfo build, the focused binaries
+`build/chart_spr_test` and `build/chart_spr_pipeline_test` both report
+`PASS` at this source checkpoint. Their raw logs are respectively
+`build/wric-chart-parallelization/phase8-hardening-current/chart_spr_test.log`
+(SHA-256
+`06cdf0627834ea91e59b77541b26bcda26430f0e45db4f23496455f146e57776`)
+and
+`build/wric-chart-parallelization/phase8-hardening-current/chart_spr_pipeline_test.log`
+(SHA-256
+`676d55384d07c861e4d8a89ecb5e847863c249c5490770601e3e284102d06009`).
+
+This is focused functional evidence, not a Phase-8 exit decision. The complete
+RelWithDebInfo and targeted TSan results recorded above at `6c8d0c7` remain
+valid historical evidence for that revision only; subsequent production
+concurrency and workspace-lifetime code changed. Current-revision full CTest,
+ASAN, and targeted TSan therefore remain pending, as do the Phase-8
+supplemental capture/seal, quiet-host 2x generation cycle, Phase-7 end-to-end
+comparison, paired RSS gate, and every still-open Phase-0 gate.
 
 ## Phase 9 accepted-state update checkpoint (unsealed)
 
