@@ -35,10 +35,10 @@ in this document.
 | 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | `cbf92b6` passes deterministic pattern/cache/local/fixed-topology scheduling, bounded-memory admission, caught-failure accounting, full CTest, and targeted TSAN; scaling, Phase-3 serial comparison, and RSS gates await the sealed baseline |
 | 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass W1/W8 exact semantics, full CTest, and targeted TSAN; same-revision diagnostics exceed the 2x exact-phase target; measured-0% heavy splitting is omitted; unified frontier/candidate admission and sealed timing/RSS remain pending |
 | 6. Parallelize exact top-K candidates | implementation complete; acceptance pending Phase 0 | `870c298` passes the in-tree Top-K/worker semantic and stable-failure matrix, deterministic scheduling, functional bounded-admission tests, full RelWithDebInfo CTest, and targeted TSan; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS gates await Phase 0 |
-| 7. Make lazy charts scalable and adaptive | implementation complete; acceptance pending Phase 0 | Packed deterministic grouping, dependency wavefronts, exact transient admission, the profile-supported within-clade omission, and frozen `off|on|auto` policy are implemented through `38e9a28`; `3359fbf` adds the exact eight-row medium-auto/small-on completion producer and `c5156a8` registers its passing synthetic CTest. These are tooling checkpoints only: the Phase-7 supplements, named-fixture medians/scaling, sparse-reclamation TSan, full CTest, RSS, and sealed performance gates remain pending |
-| 8. Parallelize and pipeline candidate generation | implementation hardening complete; acceptance pending Phase 0/final gates | Source waves, stable direct-projection workspaces, nested-workspace quarantine, seeded reservoir ordering, and realizable outer/direct width-two boundaries are committed through `94a6323`; the focused RelWithDebInfo chart and pipeline binaries pass. Current-revision full CTest, ASAN/TSan, supplemental seal, quiet-host speed cycle, Phase-7 comparison, and paired RSS remain pending |
-| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; acceptance pending Phase 0/final gates | Persistent pattern-parallel cache transactions, exact-state reuse, non-vacuous three-accept W1/2/4/8 semantics, crash-durable supplemental tooling, and counter/report contracts pass through `19e26db`; `0f099ca` adds the passing schema-v3 frozen-oracle characterization producer. This is an evidence-production checkpoint only: the production characterization and immutable supplement capture/seal, accepted-update timing/RSS decision, ASAN/TSAN, and full CTest remain pending |
-| 10. Integrate, tune defaults, and prove parity | implementation in progress | Temporal finite-memory reporting and the exact hybrid, conservative/local, auto/16-worker, multiparent, and multifurcation matrices pass through `19e26db`; cleanup, complete correctness/sanitizer gates, sealed worker-policy/RSS/wall evidence, and the conditional default change remain pending |
+| 7. Make lazy charts scalable and adaptive | implementation complete; acceptance pending Phase 0 | Packed deterministic grouping, dependency wavefronts, exact transient admission, the profile-supported within-clade omission, and frozen `off|on|auto` policy are implemented through `38e9a28`; `3359fbf` adds the exact eight-row medium-auto/small-on completion producer and `c5156a8` registers its passing synthetic CTest. The current pre-default complete ASAN and targeted TSan gates pass through `51d2a3c`; the production Phase-7 supplements, named-fixture medians/scaling, RSS, and sealed performance gates remain pending |
+| 8. Parallelize and pipeline candidate generation | implementation hardening complete; acceptance pending Phase 0/final gates | Source waves, stable direct-projection workspaces, nested-workspace quarantine, seeded reservoir ordering, and realizable outer/direct width-two boundaries are committed through `94a6323`; `51d2a3c` pins the Phase-8 generation evidence label to that immutable checkpoint. The current production-code full RelWithDebInfo suite, complete ASAN suite, focused anchor test, and exact 55-test TSan matrix pass; supplemental sealing, the quiet-host speed cycle, Phase-7 comparison, and paired RSS remain pending |
+| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; acceptance pending Phase 0/final gates | Persistent pattern-parallel cache transactions, exact-state reuse, non-vacuous three-accept W1/2/4/8 semantics, crash-durable supplemental tooling, and counter/report contracts pass through `19e26db`; `0f099ca` adds the passing schema-v3 frozen-oracle characterization producer. Current pre-default full RelWithDebInfo, complete ASAN, and targeted TSan gates pass through `51d2a3c`; the production characterization, immutable supplement capture/seal, and accepted-update timing/RSS decision remain pending |
+| 10. Integrate, tune defaults, and prove parity | implementation in progress | Temporal finite-memory reporting and the exact hybrid, conservative/local, auto/16-worker, multiparent, and multifurcation matrices pass through `19e26db`; current pre-default full RelWithDebInfo, complete ASAN, and targeted TSan gates pass through `51d2a3c`. Cleanup review, the complete mode/worker matrix, sealed worker-policy/RSS/wall evidence, and the conditional default decision remain pending, and any default change requires all three test gates to be rerun |
 
 ### Deadline-overlap scheduling exception
 
@@ -898,12 +898,21 @@ does not synthesize duplicate provenance or claim presemantic rejection at an
 unreachable state. The focused RelWithDebInfo `chart_spr_test` and
 `chart_spr_pipeline_test` binaries both pass at this checkpoint.
 
-The targeted TSan result at `6c8d0c7` is historical evidence only. Because the
-subsequent production concurrency and workspace lifetime code changed, the
-current revision still requires focused and full RelWithDebInfo validation,
-the complete ASAN gate, and the targeted TSan gate. The supplemental fixture
-seal and all quiet-host generation, end-to-end, and RSS gates also remain
-pending Phase 0.
+The targeted TSan result at `6c8d0c7` is historical evidence only. The current
+production-code full RelWithDebInfo suite has zero failures across 176
+registered tests at `1923bbc` (174 pass and the two established tests skip);
+the only
+later code/test change, `51d2a3c`, pins `phase8-generation` to immutable
+checkpoint `94a6323`, and its focused 26-case capture-contract test passes.
+At `51d2a3c`, the complete serial ASAN suite has zero failures across 176
+registered tests (174 pass and the same two established code-77 tests skip),
+and the exact final TSan regex passes 55/55 with the pinned patched runtime and
+no diagnostic. The post-anchor full normal suite also has zero failures across
+176 registered tests at `51d2a3c` (174 pass and the same two tests skip).
+These close the current pre-default correctness and sanitizer gates. The
+supplemental fixture seal and all quiet-host generation, end-to-end, and RSS
+gates remain pending Phase 0; a later conditional default change must rerun
+the complete final test sequence.
 
 ### Goal
 
