@@ -140,6 +140,9 @@ RUN_COMPONENTS: Mapping[str, Sequence[Mapping[str, object]]] = {
     "phase8-generation": (
         component("phase8-generation", "1,8", "5", ("phase8-generation",)),
     ),
+    "phase8-generation-retry1": (
+        component("phase8-generation", "1,8", "5", ("phase8-generation",)),
+    ),
     "phase8-end-to-end": (
         component("phase8-generation", "1,8", "5", ("phase8-generation",)),
     ),
@@ -211,6 +214,7 @@ HISTORICAL_RUN_REVISIONS: Mapping[str, str] = {
     "phase7-auto": "38e9a281396e5263647ba68724414848841525d7",
     "phase8-end-to-end": "38e9a281396e5263647ba68724414848841525d7",
     "phase8-generation": "94a63238d25a8e3262428419d53f8f0986e8879b",
+    "phase8-generation-retry1": "07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c",
 }
 
 SAFE_HARNESS_ENVIRONMENT = {

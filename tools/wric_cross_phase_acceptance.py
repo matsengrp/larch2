@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -21,15 +22,51 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping, Sequence
+
+import wric_benchmark_capture as capture_contract
 
 
 SCHEMA = "wric.cross_phase_acceptance"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 UINT_RE = re.compile(r"^(0|[1-9][0-9]*)$")
 UINT64_MAX = (1 << 64) - 1
+
+EVALUATION_MODES = ("pre-default", "final")
+PHASE8_CAPTURE_LABELS = (
+    "phase8-generation",
+    "phase8-generation-retry1",
+)
+PHASE8_ATTEMPT0_PRODUCT_REVISION = (
+    "94a63238d25a8e3262428419d53f8f0986e8879b"
+)
+PHASE8_ATTEMPT0_CAPTURE_TOOL_REVISION = (
+    "b6ae1a968c0a2374d8180e5682ae53775377c31e"
+)
+PHASE8_ATTEMPT0_RAW_SHA256 = (
+    "e3eb3b3d9e77fc4006aa2c701102f39f84244971fae4f794bf66e5ca72cf4a56"
+)
+PHASE8_ATTEMPT0_LEDGER_SHA256 = (
+    "d22f42f31cf4e37bc92abc53e70f938d163f5fc422af68677c0f7dd7244841e1"
+)
+PHASE8_ATTEMPT0_CAPTURE_WRAPPER_SHA256 = (
+    "e374ed726e026ab973ffa9ff385b13cd8c0eea8041d32b861df61fb4fa6c652e"
+)
+PHASE8_RETRY1_PRODUCT_REVISION = (
+    "07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c"
+)
+PHASE8_AFFINITY = "0,2,4,6,8,10,12,14"
+PHASE8_METADATA_NAME = "wric-benchmark-run-metadata.json"
+GENERIC_LEDGER_NAME = "wric-evidence-run-ledger.tsv"
+GENERIC_LEDGER_SEAL_NAME = GENERIC_LEDGER_NAME + ".sha256"
+GENERIC_LEDGER_PREAMBLE = (
+    "# schema=wric.evidence_run_ledger",
+    "# schema_version=2",
+    "kind\tsha256\tbytes\tmode\tpath",
+)
+SAFE_CAPTURE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 RUN_LABELS = (
     "phase1",
@@ -42,6 +79,7 @@ RUN_LABELS = (
     "phase7-small",
     "phase7-auto",
     "phase8-generation",
+    "phase8-generation-retry1",
     "phase8-end-to-end",
     "final-scaling",
     "final-primary",
@@ -301,10 +339,12 @@ def median(values: Sequence[Decimal], label: str) -> Decimal:
     return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
 
 
-def read_tsv(path: Path, required: Sequence[str], label: str) -> tuple[tuple[str, ...], list[dict[str, str]]]:
-    path = regular(path, label)
+def read_tsv_payload(
+    payload: bytes, required: Sequence[str], label: str
+) -> tuple[tuple[str, ...], list[dict[str, str]]]:
     try:
-        with path.open("r", encoding="utf-8", newline="") as handle:
+        text_payload = payload.decode("utf-8")
+        with io.StringIO(text_payload, newline="") as handle:
             reader = csv.reader(handle, delimiter="\t", strict=True)
             header = tuple(next(reader))
             if not header or any(not name for name in header):
@@ -324,11 +364,20 @@ def read_tsv(path: Path, required: Sequence[str], label: str) -> tuple[tuple[str
                 rows.append(row)
     except StopIteration as error:
         raise AcceptanceError(f"{label} is empty") from error
-    except (OSError, UnicodeError, csv.Error) as error:
+    except (UnicodeError, csv.Error) as error:
         raise AcceptanceError(f"cannot parse {label}: {error}") from error
     if not rows:
         raise AcceptanceError(f"{label} contains no rows")
     return header, rows
+
+
+def read_tsv(path: Path, required: Sequence[str], label: str) -> tuple[tuple[str, ...], list[dict[str, str]]]:
+    path = regular(path, label)
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise AcceptanceError(f"cannot read {label}: {error}") from error
+    return read_tsv_payload(payload, required, label)
 
 
 @dataclass(frozen=True)
@@ -952,6 +1001,8 @@ def load_raw(
     expected_sha256: Sequence[str],
     *,
     phase0_inputs: Sequence[Phase0RawInput] | None = None,
+    anchored_payloads: Sequence[bytes] | None = None,
+    anchored_signatures: Sequence[tuple[int, ...]] | None = None,
 ) -> RawEvidence:
     if not paths:
         raise AcceptanceError(f"no raw TSV supplied for {label}")
@@ -960,6 +1011,13 @@ def load_raw(
             f"{label}: raw SHA-256 anchor/file multiplicity differs: "
             f"{len(expected_sha256)}/{len(paths)}"
         )
+    if (anchored_payloads is None) != (anchored_signatures is None):
+        raise AssertionError("anchored raw payload/signature arguments differ")
+    if anchored_payloads is not None and (
+        len(anchored_payloads) != len(paths)
+        or len(anchored_signatures or ()) != len(paths)
+    ):
+        raise AssertionError("anchored raw payloads do not match raw paths")
     rows: list[Mapping[str, str]] = []
     resolved: list[Path] = []
     digests: list[str] = []
@@ -1003,13 +1061,39 @@ def load_raw(
                 f"{label}: raw SHA-256 anchor {index} is not canonical lowercase SHA-256"
             )
         canonical = regular(path, f"{label} raw TSV")
-        actual = sha256_file(canonical)
+        anchored_payload = (
+            None if anchored_payloads is None else anchored_payloads[index - 1]
+        )
+        if anchored_payload is None:
+            actual = sha256_file(canonical)
+        else:
+            current_payload, actual, _, current_signature = _stable_read_bytes(
+                canonical,
+                f"{label} anchored raw TSV {index}",
+                maximum_bytes=128 * 1024 * 1024,
+            )
+            assert anchored_signatures is not None
+            if (
+                current_payload != anchored_payload
+                or current_signature != anchored_signatures[index - 1]
+            ):
+                raise AcceptanceError(
+                    f"{label}: anchored raw TSV changed before exact-byte parsing"
+                )
         if actual != expected:
             raise AcceptanceError(
                 f"{label}: raw SHA-256 anchor {index} differs: {actual} != {expected}"
             )
-        current_header, current_rows = read_tsv(
-            canonical, required_raw_columns(label), f"{label} raw TSV"
+        current_header, current_rows = (
+            read_tsv(
+                canonical, required_raw_columns(label), f"{label} raw TSV"
+            )
+            if anchored_payload is None
+            else read_tsv_payload(
+                anchored_payload,
+                required_raw_columns(label),
+                f"{label} anchored raw TSV",
+            )
         )
         if label in HISTORICAL_PRE_ADMISSION_LABELS:
             present_admission = ADMISSION_FIELDS.intersection(current_header)
@@ -1984,6 +2068,1037 @@ def canonical_directory(path: Path, label: str) -> Path:
     return resolved
 
 
+@dataclass(frozen=True)
+class CaptureMember:
+    relative: str
+    kind: str
+    sha256: str | None
+    size: int | None
+    mode: int
+    signature: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class Phase8CaptureProvenance:
+    label: str
+    capture_directory: Path
+    capture_signature: tuple[int, ...]
+    raw_path: Path
+    raw_sha256: str
+    raw_payload: bytes
+    raw_signature: tuple[int, ...]
+    metadata_path: Path
+    metadata_sha256: str
+    metadata: Mapping[str, object]
+    ledger_path: Path
+    ledger_sha256: str
+    ledger_signature: tuple[int, ...]
+    seal_path: Path
+    seal_sha256: str
+    seal_signature: tuple[int, ...]
+    product_revision: str
+    capture_tool_revision: str
+    capture_wrapper_sha256: str
+    product_repo_root: Path
+    capture_tool_repo_root: Path
+    members: tuple[CaptureMember, ...]
+
+    def unchanged(self) -> None:
+        label = f"{self.label} capture provenance final check"
+        root = canonical_directory(self.capture_directory, label)
+        if _stable_directory_signature(root.lstat()) != self.capture_signature:
+            raise AcceptanceError(
+                f"{self.label}: capture directory changed during evaluation"
+            )
+        ledger_payload, ledger_signature = _read_capture_control(
+            self.ledger_path,
+            f"{self.label} generic-v2 ledger final check",
+            maximum_bytes=64 * 1024 * 1024,
+        )
+        seal_payload, seal_signature = _read_capture_control(
+            self.seal_path,
+            f"{self.label} generic-v2 ledger seal final check",
+            maximum_bytes=256,
+        )
+        if (
+            sha256_bytes(ledger_payload) != self.ledger_sha256
+            or ledger_signature != self.ledger_signature
+            or sha256_bytes(seal_payload) != self.seal_sha256
+            or seal_signature != self.seal_signature
+        ):
+            raise AcceptanceError(
+                f"{self.label}: capture ledger or seal changed during evaluation"
+            )
+        current = _scan_capture_members(root)
+        if current != self.members:
+            raise AcceptanceError(
+                f"{self.label}: generic-v2 capture closure changed during evaluation"
+            )
+
+    def output(self) -> dict[str, str]:
+        return {
+            "capture_directory": os.fspath(self.capture_directory),
+            "raw_path": os.fspath(self.raw_path),
+            "raw_sha256": self.raw_sha256,
+            "metadata_path": os.fspath(self.metadata_path),
+            "metadata_sha256": self.metadata_sha256,
+            "ledger_path": os.fspath(self.ledger_path),
+            "ledger_sha256": self.ledger_sha256,
+            "seal_path": os.fspath(self.seal_path),
+            "seal_sha256": self.seal_sha256,
+            "product_revision": self.product_revision,
+            "capture_tool_revision": self.capture_tool_revision,
+            "capture_wrapper_sha256": self.capture_wrapper_sha256,
+        }
+
+
+def sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _stable_file_signature(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _stable_directory_signature(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _stable_hash(path: Path, label: str) -> tuple[str, int, int, tuple[int, ...]]:
+    descriptor: int | None = None
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise AcceptanceError(f"{label} is unavailable: {error}") from error
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+    ):
+        raise AcceptanceError(
+            f"{label} is not a single-link, non-symlink regular file"
+        )
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        signature = _stable_file_signature(before)
+        if _stable_file_signature(opened) != signature:
+            raise AcceptanceError(f"{label} changed while opening")
+        digest = hashlib.sha256()
+        byte_count = 0
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+            byte_count += len(block)
+        after_open = os.fstat(descriptor)
+        after = path.lstat()
+    except OSError as error:
+        raise AcceptanceError(f"{label} changed while hashing: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        _stable_file_signature(after_open) != signature
+        or _stable_file_signature(after) != signature
+        or byte_count != after_open.st_size
+    ):
+        raise AcceptanceError(f"{label} changed while hashing")
+    return digest.hexdigest(), byte_count, stat.S_IMODE(after.st_mode), signature
+
+
+def _stable_read_bytes(
+    path: Path, label: str, *, maximum_bytes: int
+) -> tuple[bytes, str, int, tuple[int, ...]]:
+    descriptor: int | None = None
+    try:
+        lexical = path.lstat()
+        if (
+            stat.S_ISLNK(lexical.st_mode)
+            or not stat.S_ISREG(lexical.st_mode)
+            or lexical.st_nlink != 1
+        ):
+            raise AcceptanceError(
+                f"{label} is not a single-link, non-symlink regular file"
+            )
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        signature = _stable_file_signature(lexical)
+        if _stable_file_signature(opened) != signature:
+            raise AcceptanceError(f"{label} changed while opening")
+        if opened.st_size > maximum_bytes:
+            raise AcceptanceError(f"{label} exceeds the maximum supported size")
+        chunks: list[bytes] = []
+        byte_count = 0
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            byte_count += len(block)
+            if byte_count > maximum_bytes:
+                raise AcceptanceError(
+                    f"{label} exceeds the maximum supported size"
+                )
+            chunks.append(block)
+        after_open = os.fstat(descriptor)
+        after_lexical = path.lstat()
+    except AcceptanceError:
+        raise
+    except OSError as error:
+        raise AcceptanceError(f"cannot read {label}: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        _stable_file_signature(after_open) != signature
+        or _stable_file_signature(after_lexical) != signature
+        or byte_count != after_open.st_size
+    ):
+        raise AcceptanceError(f"{label} changed while reading")
+    payload = b"".join(chunks)
+    return payload, sha256_bytes(payload), stat.S_IMODE(after_open.st_mode), signature
+
+
+def _read_capture_control(
+    path: Path,
+    label: str,
+    *,
+    maximum_bytes: int,
+) -> tuple[bytes, tuple[int, ...]]:
+    payload, _, mode, signature = _stable_read_bytes(
+        path, label, maximum_bytes=maximum_bytes
+    )
+    if mode != 0o444:
+        raise AcceptanceError(f"{label} is not exact mode 0444")
+    return payload, signature
+
+
+def _validate_capture_relative(relative: str, label: str) -> None:
+    pure = PurePosixPath(relative)
+    if (
+        not relative
+        or pure.is_absolute()
+        or pure.as_posix() != relative
+        or not pure.parts
+    ):
+        raise AcceptanceError(f"{label} has an unsafe path: {relative!r}")
+    for component in pure.parts:
+        if (
+            SAFE_CAPTURE_COMPONENT_RE.fullmatch(component) is None
+            or component in (".", "..", GENERIC_LEDGER_NAME,
+                             GENERIC_LEDGER_SEAL_NAME)
+            or component.startswith(".wric-evidence-run-ledger.stage-")
+        ):
+            raise AcceptanceError(f"{label} has an unsafe path: {relative!r}")
+
+
+def _scan_capture_members(root: Path) -> tuple[CaptureMember, ...]:
+    members: dict[str, CaptureMember] = {}
+    seen_inodes: set[tuple[int, int]] = set()
+
+    def visit(directory: Path, prefix: str) -> None:
+        try:
+            before = directory.lstat()
+            children = sorted(directory.iterdir(), key=lambda path: path.name)
+        except OSError as error:
+            raise AcceptanceError(
+                f"cannot scan Phase-8 capture {prefix or '.'}: {error}"
+            ) from error
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+            raise AcceptanceError(
+                f"Phase-8 capture member is not a directory: {prefix or '.'}"
+            )
+        for child in children:
+            relative = child.name if not prefix else f"{prefix}/{child.name}"
+            if not prefix and child.name in (
+                GENERIC_LEDGER_NAME,
+                GENERIC_LEDGER_SEAL_NAME,
+            ):
+                continue
+            _validate_capture_relative(relative, "generic-v2 capture closure")
+            try:
+                info = child.lstat()
+            except OSError as error:
+                raise AcceptanceError(
+                    f"cannot inspect Phase-8 capture member {relative}: {error}"
+                ) from error
+            if stat.S_ISLNK(info.st_mode):
+                raise AcceptanceError(
+                    f"Phase-8 capture contains a symlink: {relative}"
+                )
+            if stat.S_ISDIR(info.st_mode):
+                visit(child, relative)
+                try:
+                    after = child.lstat()
+                except OSError as error:
+                    raise AcceptanceError(
+                        f"Phase-8 capture directory changed: {relative}: {error}"
+                    ) from error
+                signature = _stable_directory_signature(after)
+                if signature != _stable_directory_signature(info):
+                    raise AcceptanceError(
+                        f"Phase-8 capture directory changed while scanning: {relative}"
+                    )
+                members[relative] = CaptureMember(
+                    relative,
+                    "directory",
+                    None,
+                    None,
+                    stat.S_IMODE(after.st_mode),
+                    signature,
+                )
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise AcceptanceError(
+                    f"Phase-8 capture contains a special file: {relative}"
+                )
+            identity = (info.st_dev, info.st_ino)
+            if info.st_nlink != 1 or identity in seen_inodes:
+                raise AcceptanceError(
+                    f"Phase-8 capture contains a hard-linked/aliased file: {relative}"
+                )
+            seen_inodes.add(identity)
+            digest, size, mode, signature = _stable_hash(
+                child, f"Phase-8 capture member {relative}"
+            )
+            members[relative] = CaptureMember(
+                relative, "file", digest, size, mode, signature
+            )
+        try:
+            after = directory.lstat()
+        except OSError as error:
+            raise AcceptanceError(
+                f"Phase-8 capture directory changed: {prefix or '.'}: {error}"
+            ) from error
+        if _stable_directory_signature(after) != _stable_directory_signature(before):
+            raise AcceptanceError(
+                f"Phase-8 capture directory changed while scanning: {prefix or '.'}"
+            )
+
+    visit(root, "")
+    if not any(member.kind == "file" for member in members.values()):
+        raise AcceptanceError("Phase-8 capture contains no evidence files")
+    return tuple(members[path] for path in sorted(members))
+
+
+def _parse_generic_v2_ledger(
+    payload: bytes, label: str
+) -> tuple[tuple[str, str, str, str, str], ...]:
+    if not payload.endswith(b"\n") or b"\r" in payload or b"\x00" in payload:
+        raise AcceptanceError(f"{label} is not canonical newline-delimited ASCII")
+    try:
+        lines = payload[:-1].decode("ascii").split("\n")
+    except UnicodeDecodeError as error:
+        raise AcceptanceError(f"{label} is not ASCII") from error
+    if tuple(lines[: len(GENERIC_LEDGER_PREAMBLE)]) != GENERIC_LEDGER_PREAMBLE:
+        raise AcceptanceError(f"{label} is not the exact generic-v2 schema")
+    result: list[tuple[str, str, str, str, str]] = []
+    seen: set[str] = set()
+    for number, line in enumerate(
+        lines[len(GENERIC_LEDGER_PREAMBLE):],
+        len(GENERIC_LEDGER_PREAMBLE) + 1,
+    ):
+        fields = line.split("\t")
+        if len(fields) != 5:
+            raise AcceptanceError(f"{label} line {number} is malformed")
+        kind, digest, size, mode, relative = fields
+        if kind == "file":
+            if HASH_RE.fullmatch(digest) is None or UINT_RE.fullmatch(size) is None:
+                raise AcceptanceError(
+                    f"{label} line {number} has invalid file fields"
+                )
+        elif kind == "directory":
+            if digest != "-" or size != "-":
+                raise AcceptanceError(
+                    f"{label} line {number} has invalid directory fields"
+                )
+        else:
+            raise AcceptanceError(f"{label} line {number} has unknown kind")
+        if re.fullmatch(r"[0-7]{4}", mode) is None:
+            raise AcceptanceError(f"{label} line {number} has invalid mode")
+        _validate_capture_relative(relative, label)
+        if relative in seen:
+            raise AcceptanceError(f"{label} duplicates path {relative}")
+        seen.add(relative)
+        result.append((kind, digest, size, mode, relative))
+    if not result or [record[4] for record in result] != sorted(seen):
+        raise AcceptanceError(f"{label} member order/closure is not canonical")
+    for _, _, _, _, relative in result:
+        parts = PurePosixPath(relative).parts
+        for length in range(1, len(parts)):
+            parent = "/".join(parts[:length])
+            parent_record = next(
+                (record for record in result if record[4] == parent), None
+            )
+            if parent_record is None or parent_record[0] != "directory":
+                raise AcceptanceError(
+                    f"{label} omits typed parent {parent} for {relative}"
+                )
+    return tuple(result)
+
+
+def _strict_canonical_json(path: Path, label: str) -> tuple[dict[str, object], str]:
+    payload, digest, mode, signature = _stable_read_bytes(
+        path, label, maximum_bytes=64 * 1024 * 1024
+    )
+    if mode != 0o444:
+        raise AcceptanceError(f"{label} is not exact mode 0444")
+
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in items:
+            if key in result:
+                raise AcceptanceError(f"{label} duplicates JSON key {key!r}")
+            result[key] = value
+        return result
+
+    def constant(value: str) -> None:
+        raise AcceptanceError(f"{label} contains non-finite number {value}")
+
+    try:
+        value = json.loads(
+            payload, object_pairs_hook=pairs, parse_constant=constant
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise AcceptanceError(f"{label} is invalid JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise AcceptanceError(f"{label} root is not an object")
+    canonical = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+    if canonical != payload:
+        raise AcceptanceError(f"{label} is not exact canonical JSON")
+    if _stable_file_signature(path.lstat()) != signature:
+        raise AcceptanceError(f"{label} changed while parsing")
+    return value, digest
+
+
+def _metadata_mapping(
+    value: object, label: str
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise AcceptanceError(f"{label} is not an object")
+    return value
+
+
+def _metadata_revision(
+    metadata: Mapping[str, object],
+    role: str,
+    expected: str,
+    expected_root: Path,
+    label: str,
+) -> None:
+    repositories = _metadata_mapping(metadata.get("repositories"), f"{label} repositories")
+    record = _metadata_mapping(repositories.get(role), f"{label} repository {role}")
+    if (
+        record.get("expected_revision") != expected
+        or record.get("path") != os.fspath(expected_root)
+    ):
+        raise AcceptanceError(
+            f"{label} {role} root/revision differs from its external anchors"
+        )
+    before = record.get("pre")
+    after = record.get("post")
+    if before != after:
+        raise AcceptanceError(f"{label} repository {role} changed during capture")
+    for position in ("pre", "post"):
+        state = _metadata_mapping(
+            record.get(position), f"{label} repository {role} {position}"
+        )
+        if (
+            state.get("head") != expected
+            or state.get("toplevel") != os.fspath(expected_root)
+            or state.get("porcelain_v2_z_base64") != ""
+            or state.get("porcelain_v2_z_bytes") != 0
+            or state.get("porcelain_v2_z_sha256")
+            != hashlib.sha256(b"").hexdigest()
+        ):
+            raise AcceptanceError(
+                f"{label} repository {role} {position} is not the exact clean anchored state"
+            )
+
+
+def _require_metadata_snapshot_member(
+    snapshot_value: object,
+    path: Path,
+    member: CaptureMember,
+    label: str,
+) -> None:
+    try:
+        snapshot = capture_contract.require_snapshot_shape(snapshot_value, label)
+    except capture_contract.CaptureError as error:
+        raise AcceptanceError(f"{label}: {error}") from error
+    signature = member.signature
+    expected = {
+        "bytes": member.size,
+        "ctime_ns": signature[6],
+        "device": signature[0],
+        "inode": signature[1],
+        "mode": member.mode,
+        "mtime_ns": signature[5],
+        "nlink": signature[3],
+        "path": os.fspath(path),
+        "sha256": member.sha256,
+    }
+    if dict(snapshot) != expected:
+        raise AcceptanceError(
+            f"{label}: metadata snapshot differs from the exact ledger member"
+        )
+
+
+def _require_live_metadata_snapshot(
+    snapshot_value: object,
+    path: Path,
+    label: str,
+    *,
+    executable: bool,
+) -> None:
+    try:
+        snapshot = capture_contract.require_snapshot_shape(snapshot_value, label)
+    except capture_contract.CaptureError as error:
+        raise AcceptanceError(f"{label}: {error}") from error
+    digest, size, mode, signature = _stable_hash(path, label)
+    expected = {
+        "bytes": size,
+        "ctime_ns": signature[6],
+        "device": signature[0],
+        "inode": signature[1],
+        "mode": mode,
+        "mtime_ns": signature[5],
+        "nlink": signature[3],
+        "path": os.fspath(path),
+        "sha256": digest,
+    }
+    if dict(snapshot) != expected or (executable and mode & 0o111 == 0):
+        raise AcceptanceError(
+            f"{label}: metadata snapshot differs from the live exact file"
+        )
+
+
+def load_phase8_capture_provenance(
+    label: str,
+    capture_directory: Path,
+    raw_path_argument: Path,
+    expected_raw_sha256: str,
+    expected_ledger_sha256: str,
+    expected_product_revision: str,
+    expected_capture_tool_revision: str,
+    expected_capture_wrapper_sha256: str,
+    product_repo_root_argument: Path,
+    capture_tool_repo_root_argument: Path,
+    base: ManifestChain,
+    phase0_artifact_ledger: Phase0ArtifactLedger,
+    base_repo_root: Path,
+) -> Phase8CaptureProvenance:
+    if label not in PHASE8_CAPTURE_LABELS:
+        raise AssertionError(f"unsupported Phase-8 capture label {label}")
+    for value, description, pattern in (
+        (expected_raw_sha256, "raw SHA-256", HASH_RE),
+        (expected_ledger_sha256, "ledger SHA-256", HASH_RE),
+        (expected_capture_wrapper_sha256, "capture-wrapper SHA-256", HASH_RE),
+        (expected_product_revision, "product revision", re.compile(r"^[0-9a-f]{40}$")),
+        (expected_capture_tool_revision, "capture-tool revision", re.compile(r"^[0-9a-f]{40}$")),
+    ):
+        if pattern.fullmatch(value) is None:
+            raise AcceptanceError(
+                f"{label}: external {description} is not canonical"
+            )
+    required_product = (
+        PHASE8_ATTEMPT0_PRODUCT_REVISION
+        if label == "phase8-generation"
+        else PHASE8_RETRY1_PRODUCT_REVISION
+    )
+    if expected_product_revision != required_product:
+        raise AcceptanceError(
+            f"{label}: product revision must be exact immutable revision "
+            f"{required_product}, not {expected_product_revision}"
+        )
+    if label == "phase8-generation":
+        for actual, required, description in (
+            (
+                expected_raw_sha256,
+                PHASE8_ATTEMPT0_RAW_SHA256,
+                "raw SHA-256",
+            ),
+            (
+                expected_ledger_sha256,
+                PHASE8_ATTEMPT0_LEDGER_SHA256,
+                "generic-v2 ledger SHA-256",
+            ),
+            (
+                expected_capture_wrapper_sha256,
+                PHASE8_ATTEMPT0_CAPTURE_WRAPPER_SHA256,
+                "capture-wrapper SHA-256",
+            ),
+        ):
+            if actual != required:
+                raise AcceptanceError(
+                    f"{label}: immutable attempt0 {description} must be "
+                    f"{required}, not {actual}"
+                )
+        if expected_capture_tool_revision != PHASE8_ATTEMPT0_CAPTURE_TOOL_REVISION:
+            raise AcceptanceError(
+                f"{label}: capture-tool revision must be exact immutable revision "
+                f"{PHASE8_ATTEMPT0_CAPTURE_TOOL_REVISION}"
+            )
+    elif expected_capture_tool_revision == PHASE8_ATTEMPT0_CAPTURE_TOOL_REVISION:
+        raise AcceptanceError(
+            f"{label}: retry capture-tool revision C must be distinct from attempt 0"
+        )
+    root = canonical_directory(
+        capture_directory, f"{label} capture directory"
+    )
+    product_repo_root = canonical_directory(
+        product_repo_root_argument, f"{label} product repository root"
+    )
+    capture_tool_repo_root = canonical_directory(
+        capture_tool_repo_root_argument,
+        f"{label} capture-tool repository root",
+    )
+    root_signature = _stable_directory_signature(root.lstat())
+    raw_path = regular(raw_path_argument, f"{label} raw TSV")
+    if raw_path != root / "raw_trials.tsv":
+        raise AcceptanceError(
+            f"{label}: raw TSV is not the canonical capture raw_trials.tsv"
+        )
+    ledger_path = root / GENERIC_LEDGER_NAME
+    seal_path = root / GENERIC_LEDGER_SEAL_NAME
+    ledger_payload, ledger_signature = _read_capture_control(
+        ledger_path,
+        f"{label} generic-v2 ledger",
+        maximum_bytes=64 * 1024 * 1024,
+    )
+    actual_ledger_sha256 = sha256_bytes(ledger_payload)
+    if actual_ledger_sha256 != expected_ledger_sha256:
+        raise AcceptanceError(
+            f"{label}: generic-v2 ledger differs from external anchor: "
+            f"{actual_ledger_sha256} != {expected_ledger_sha256}"
+        )
+    seal_payload, seal_signature = _read_capture_control(
+        seal_path,
+        f"{label} generic-v2 ledger seal",
+        maximum_bytes=256,
+    )
+    if seal_payload != (
+        f"{actual_ledger_sha256}  {GENERIC_LEDGER_NAME}\n".encode("ascii")
+    ):
+        raise AcceptanceError(
+            f"{label}: generic-v2 ledger detached seal is not exact"
+        )
+    ledger_records = _parse_generic_v2_ledger(
+        ledger_payload, f"{label} generic-v2 ledger"
+    )
+    members = _scan_capture_members(root)
+    actual_records = tuple(
+        (
+            member.kind,
+            member.sha256 if member.sha256 is not None else "-",
+            str(member.size) if member.size is not None else "-",
+            f"{member.mode:04o}",
+            member.relative,
+        )
+        for member in members
+    )
+    if ledger_records != actual_records:
+        raise AcceptanceError(
+            f"{label}: generic-v2 ledger does not match the capture closure"
+        )
+    by_relative = {member.relative: member for member in members}
+    metadata_member = by_relative.get(PHASE8_METADATA_NAME)
+    raw_member = by_relative.get("raw_trials.tsv")
+    if (
+        metadata_member is None
+        or metadata_member.kind != "file"
+        or raw_member is None
+        or raw_member.kind != "file"
+    ):
+        raise AcceptanceError(
+            f"{label}: generic-v2 ledger omits metadata or raw_trials.tsv"
+        )
+    raw_payload, raw_sha256, _, raw_signature = _stable_read_bytes(
+        raw_path,
+        f"{label} exact anchored raw TSV",
+        maximum_bytes=128 * 1024 * 1024,
+    )
+    if (
+        raw_sha256 != expected_raw_sha256
+        or raw_member.sha256 != expected_raw_sha256
+        or raw_member.signature != raw_signature
+    ):
+        raise AcceptanceError(
+            f"{label}: raw TSV hash differs between external anchor, ledger, and evidence"
+        )
+    metadata_path = root / PHASE8_METADATA_NAME
+    metadata, metadata_sha256 = _strict_canonical_json(
+        metadata_path, f"{label} canonical v2 capture metadata"
+    )
+    if metadata_sha256 != metadata_member.sha256:
+        raise AcceptanceError(f"{label}: metadata differs from generic-v2 ledger")
+    try:
+        capture_contract.validate_metadata_shape(metadata)
+    except capture_contract.CaptureError as error:
+        raise AcceptanceError(
+            f"{label}: invalid full schema-v2 capture metadata: {error}"
+        ) from error
+    if (
+        metadata.get("schema") != "wric.benchmark_capture"
+        or metadata.get("schema_version") != 2
+        or metadata.get("run_label") != label
+        or metadata.get("capture_dir") != os.fspath(root)
+    ):
+        raise AcceptanceError(
+            f"{label}: capture metadata schema/label/directory binding is not exact"
+        )
+    outputs = _metadata_mapping(
+        metadata.get("capture_outputs"), f"{label} capture outputs"
+    )
+    if set(outputs) != {
+        "commands", "raw_trial_rows", "raw_trials", "row_ids", "summary"
+    }:
+        raise AcceptanceError(f"{label}: capture-output key set is not exact")
+    raw_snapshot = _metadata_mapping(
+        outputs.get("raw_trials"), f"{label} raw snapshot"
+    )
+    if (
+        raw_snapshot.get("path") != os.fspath(raw_path)
+        or raw_snapshot.get("sha256") != expected_raw_sha256
+        or raw_snapshot.get("bytes") != raw_member.size
+        or raw_snapshot.get("mode") != raw_member.mode
+        or raw_snapshot.get("nlink") != 1
+    ):
+        raise AcceptanceError(
+            f"{label}: metadata does not bind the exact raw path/hash/snapshot"
+        )
+    _require_metadata_snapshot_member(
+        raw_snapshot,
+        raw_path,
+        raw_member,
+        f"{label} raw snapshot",
+    )
+    expected_ids = sorted(
+        f"phase8-generation-tree0-off-w{worker}" for worker in (1, 8)
+    )
+    if (
+        outputs.get("raw_trial_rows") != 10
+        or outputs.get("row_ids") != expected_ids
+    ):
+        raise AcceptanceError(
+            f"{label}: metadata raw row/cardinality identity is not exact"
+        )
+    configuration = _metadata_mapping(
+        metadata.get("harness_configuration"),
+        f"{label} harness configuration",
+    )
+    if set(configuration) != {
+        "affinity_class",
+        "base_manifest",
+        "frozen_larch2",
+        "frozen_process_metrics",
+        "full_canonical_correctness",
+        "out_dir",
+        "product_dagutil",
+        "repetitions",
+        "run_label",
+        "run_manifest_group",
+        "supplement_manifest_ids",
+        "supplement_manifests",
+        "warmups",
+        "workers_list",
+    }:
+        raise AcceptanceError(f"{label}: harness-configuration key set is not exact")
+    if (
+        configuration.get("run_label") != label
+        or configuration.get("run_manifest_group") != "phase8-generation"
+        or configuration.get("out_dir") != os.fspath(root)
+        or configuration.get("workers_list") != "1,8"
+        or configuration.get("repetitions") != "5"
+        or configuration.get("warmups") != "1"
+        or configuration.get("full_canonical_correctness") is not True
+        or configuration.get("affinity_class") != "P"
+        or configuration.get("base_manifest") != os.fspath(base.path)
+        or configuration.get("supplement_manifest_ids")
+        != ["phase8-generation"]
+        or configuration.get("supplement_manifests")
+        != [os.fspath(base.supplements["phase8"].path)]
+    ):
+        raise AcceptanceError(
+            f"{label}: metadata harness route is not the exact Phase-8 capture"
+        )
+    if (
+        metadata.get("working_directory") != os.fspath(base_repo_root)
+        or metadata.get("environment")
+        != capture_contract.harness_environment(base_repo_root)
+        or metadata.get("umask") != "0022"
+        or metadata.get("affinity")
+        != {
+            "pre": PHASE8_AFFINITY,
+            "post": PHASE8_AFFINITY,
+            "requested": PHASE8_AFFINITY,
+        }
+    ):
+        raise AcceptanceError(
+            f"{label}: environment/affinity/working-directory contract is not exact"
+        )
+    _metadata_revision(
+        metadata,
+        "product",
+        expected_product_revision,
+        product_repo_root,
+        label,
+    )
+    _metadata_revision(
+        metadata,
+        "capture_tool",
+        expected_capture_tool_revision,
+        capture_tool_repo_root,
+        label,
+    )
+    tools = _metadata_mapping(metadata.get("tools"), f"{label} tools")
+    wrapper = _metadata_mapping(
+        tools.get("capture_wrapper"), f"{label} capture-wrapper tool"
+    )
+    tracked = _metadata_mapping(
+        metadata.get("tracked_git_blobs"), f"{label} tracked Git blobs"
+    )
+    tracked_wrapper = _metadata_mapping(
+        tracked.get("capture_wrapper"), f"{label} tracked capture wrapper"
+    )
+    tracked_working = _metadata_mapping(
+        tracked_wrapper.get("working_file"),
+        f"{label} tracked capture-wrapper working file",
+    )
+    if (
+        wrapper.get("sha256") != expected_capture_wrapper_sha256
+        or tracked_wrapper.get("blob_sha256") != expected_capture_wrapper_sha256
+        or tracked_working.get("sha256") != expected_capture_wrapper_sha256
+        or tracked_wrapper.get("working_file") != wrapper
+        or tracked_wrapper.get("repository")
+        != os.fspath(capture_tool_repo_root)
+        or tracked_wrapper.get("relative")
+        != "tools/wric_benchmark_capture.py"
+    ):
+        raise AcceptanceError(
+            f"{label}: capture-wrapper hash/provenance differs from its external anchor"
+        )
+    wrapper_path = regular(
+        capture_tool_repo_root / "tools/wric_benchmark_capture.py",
+        f"{label} externally routed capture wrapper",
+    )
+    wrapper_digest, _, wrapper_mode, _ = _stable_hash(
+        wrapper_path, f"{label} externally routed capture wrapper"
+    )
+    if (
+        wrapper_digest != expected_capture_wrapper_sha256
+        or wrapper_mode & 0o111 == 0
+        or wrapper.get("path") != os.fspath(wrapper_path)
+    ):
+        raise AcceptanceError(
+            f"{label}: externally routed capture-wrapper root/path/hash is not exact"
+        )
+    _require_live_metadata_snapshot(
+        wrapper,
+        wrapper_path,
+        f"{label} externally routed capture wrapper",
+        executable=True,
+    )
+    generic_ledger = _metadata_mapping(
+        tools.get("generic_ledger"), f"{label} generic-ledger tool"
+    )
+    generic_ledger_path = regular(
+        capture_tool_repo_root / "tools/wric_evidence_run_ledger.py",
+        f"{label} externally routed generic ledger",
+    )
+    if generic_ledger.get("path") != os.fspath(generic_ledger_path):
+        raise AcceptanceError(
+            f"{label}: generic-ledger tool is not routed through its capture-tool root"
+        )
+    _require_live_metadata_snapshot(
+        generic_ledger,
+        generic_ledger_path,
+        f"{label} externally routed generic ledger",
+        executable=True,
+    )
+    tracked_ledger = _metadata_mapping(
+        tracked.get("generic_ledger"), f"{label} tracked generic ledger"
+    )
+    if (
+        tracked_ledger.get("working_file") != generic_ledger
+        or tracked_ledger.get("repository")
+        != os.fspath(capture_tool_repo_root)
+        or tracked_ledger.get("relative")
+        != "tools/wric_evidence_run_ledger.py"
+    ):
+        raise AcceptanceError(
+            f"{label}: generic-ledger HEAD/tool provenance is not exact"
+        )
+    harness_provenance = _metadata_mapping(
+        metadata.get("harness_provenance"), f"{label} harness provenance"
+    )
+    benchmark_harness = _metadata_mapping(
+        tools.get("benchmark_harness"), f"{label} benchmark harness"
+    )
+    product_harness = _metadata_mapping(
+        _metadata_mapping(
+            metadata.get("tracked_git_blobs"), f"{label} tracked Git blobs"
+        ).get("product_harness"),
+        f"{label} product harness Git blob",
+    )
+    if (
+        harness_provenance.get("kind") != "exact_product_tracked"
+        or harness_provenance.get("expected_metadata_sha256") != "-"
+        or harness_provenance.get("expected_harness_sha256")
+        != benchmark_harness.get("sha256")
+        or harness_provenance.get("product_git_blob") != product_harness
+        or product_harness.get("working_file") != benchmark_harness
+        or product_harness.get("repository") != os.fspath(product_repo_root)
+        or product_harness.get("relative")
+        != "tools/wric_spr_search_benchmark.sh"
+        or benchmark_harness.get("path")
+        != os.fspath(product_repo_root / "tools/wric_spr_search_benchmark.sh")
+    ):
+        raise AcceptanceError(
+            f"{label}: exact product-harness provenance is not fully bound"
+        )
+    harness_path = regular(
+        product_repo_root / "tools/wric_spr_search_benchmark.sh",
+        f"{label} exact product benchmark harness",
+    )
+    _require_live_metadata_snapshot(
+        benchmark_harness,
+        harness_path,
+        f"{label} exact product benchmark harness",
+        executable=True,
+    )
+    harness_argv = metadata.get("harness_argv")
+    if (
+        not isinstance(harness_argv, list)
+        or not harness_argv
+        or not all(isinstance(token, str) for token in harness_argv)
+        or harness_argv[0] != benchmark_harness.get("path")
+        or metadata.get("harness_argv_sha256")
+        != capture_contract.argv_digest(harness_argv)
+    ):
+        raise AcceptanceError(f"{label}: harness argv/digest binding is invalid")
+    chain = _metadata_mapping(
+        metadata.get("phase0_chain"), f"{label} Phase-0 chain"
+    )
+    chain_base = _metadata_mapping(
+        chain.get("base_manifest"), f"{label} Phase-0 base manifest"
+    )
+    chain_artifacts = _metadata_mapping(
+        chain.get("artifact_ledger"), f"{label} Phase-0 artifact ledger"
+    )
+    chain_root = _metadata_mapping(
+        chain.get("phase0_root"), f"{label} Phase-0 root"
+    )
+    chain_supplements = chain.get("supplement_manifests")
+    if chain_root.get("path") != os.fspath(base_repo_root):
+        raise AcceptanceError(f"{label}: Phase-0 root binding is invalid")
+    if (
+        chain_base.get("path") != os.fspath(base.path)
+        or chain_base.get("expected_sha256") != base.sha256
+        or chain_artifacts.get("path")
+        != os.fspath(phase0_artifact_ledger.path)
+        or chain_artifacts.get("expected_sha256")
+        != phase0_artifact_ledger.sha256
+        or not isinstance(chain_supplements, list)
+        or len(chain_supplements) != 1
+        or not isinstance(chain_supplements[0], Mapping)
+        or chain_supplements[0].get("path")
+        != os.fspath(base.supplements["phase8"].path)
+        or chain_supplements[0].get("expected_sha256")
+        != base.supplements["phase8"].sha256
+    ):
+        raise AcceptanceError(
+            f"{label}: Phase-0 manifest/supplement/artifact chain is not exact"
+        )
+    execution = _metadata_mapping(
+        metadata.get("harness_execution"), f"{label} harness execution"
+    )
+    if set(execution) != {
+        "returncode", "stderr", "stderr_name", "stdout", "stdout_name"
+    } or (
+        execution.get("returncode") != 0
+        or execution.get("stdout_name") != "wric-benchmark-harness.stdout"
+        or execution.get("stderr_name") != "wric-benchmark-harness.stderr"
+    ):
+        raise AcceptanceError(
+            f"{label}: harness execution is not one exact successful run"
+        )
+    for stream, basename in (
+        ("stdout", "wric-benchmark-harness.stdout"),
+        ("stderr", "wric-benchmark-harness.stderr"),
+    ):
+        member = by_relative.get(basename)
+        if member is None or member.kind != "file":
+            raise AcceptanceError(
+                f"{label}: harness {stream} is absent from the ledger closure"
+            )
+        _require_metadata_snapshot_member(
+            execution.get(stream), root / basename, member,
+            f"{label} harness {stream}",
+        )
+    for role, basename in (("commands", "commands.sh"), ("summary", "summary.md")):
+        member = by_relative.get(basename)
+        if member is None or member.kind != "file":
+            raise AcceptanceError(
+                f"{label}: capture output {role} is absent from the ledger closure"
+            )
+        _require_metadata_snapshot_member(
+            outputs.get(role), root / basename, member,
+            f"{label} capture output {role}",
+        )
+    if _stable_directory_signature(root.lstat()) != root_signature:
+        raise AcceptanceError(f"{label}: capture changed during provenance loading")
+    return Phase8CaptureProvenance(
+        label=label,
+        capture_directory=root,
+        capture_signature=root_signature,
+        raw_path=raw_path,
+        raw_sha256=expected_raw_sha256,
+        raw_payload=raw_payload,
+        raw_signature=raw_signature,
+        metadata_path=metadata_path,
+        metadata_sha256=metadata_sha256,
+        metadata=metadata,
+        ledger_path=ledger_path,
+        ledger_sha256=actual_ledger_sha256,
+        ledger_signature=ledger_signature,
+        seal_path=seal_path,
+        seal_sha256=sha256_bytes(seal_payload),
+        seal_signature=seal_signature,
+        product_revision=expected_product_revision,
+        capture_tool_revision=expected_capture_tool_revision,
+        capture_wrapper_sha256=expected_capture_wrapper_sha256,
+        product_repo_root=product_repo_root,
+        capture_tool_repo_root=capture_tool_repo_root,
+        members=members,
+    )
+
+
 def single_row_source(
     evidence: RawEvidence, row_id: str, repetitions: int
 ) -> Path:
@@ -2050,6 +3165,158 @@ def deep_phase4_validate(
 
 Phase4Validator = Callable[
     [RawEvidence, Path, Path, int], Mapping[str, object]
+]
+
+
+def deep_phase8_capture_audit(
+    provenance: Phase8CaptureProvenance,
+    manifests: ManifestChain,
+    phase0_artifact_ledger: Phase0ArtifactLedger,
+    base_repo_root: Path,
+) -> Mapping[str, object]:
+    """Audit one capture with the exact externally anchored capture wrapper."""
+    wrapper = regular(
+        provenance.capture_tool_repo_root
+        / "tools/wric_benchmark_capture.py",
+        f"{provenance.label} exact capture-wrapper audit route",
+    )
+    wrapper_digest, _, wrapper_mode, _ = _stable_hash(
+        wrapper, f"{provenance.label} exact capture-wrapper audit route"
+    )
+    if (
+        wrapper_digest != provenance.capture_wrapper_sha256
+        or wrapper_mode & 0o111 == 0
+    ):
+        raise AcceptanceError(
+            f"{provenance.label}: exact capture-wrapper audit route changed"
+        )
+    tools = _metadata_mapping(
+        provenance.metadata.get("tools"), f"{provenance.label} tools"
+    )
+    harness = _metadata_mapping(
+        tools.get("benchmark_harness"),
+        f"{provenance.label} benchmark harness",
+    )
+    harness_provenance = _metadata_mapping(
+        provenance.metadata.get("harness_provenance"),
+        f"{provenance.label} harness provenance",
+    )
+    harness_path = harness.get("path")
+    harness_sha256 = harness_provenance.get("expected_harness_sha256")
+    harness_metadata_sha256 = harness_provenance.get(
+        "expected_metadata_sha256"
+    )
+    if not all(
+        isinstance(value, str)
+        for value in (
+            harness_path,
+            harness_sha256,
+            harness_metadata_sha256,
+        )
+    ):
+        raise AcceptanceError(
+            f"{provenance.label}: harness audit anchors are not strings"
+        )
+    taskset = regular(Path("/usr/bin/taskset"), "taskset audit launcher")
+    supplement = manifests.supplements["phase8"]
+    command = [
+        os.fspath(taskset),
+        "-c",
+        PHASE8_AFFINITY,
+        os.fspath(wrapper),
+        "audit",
+        "--capture-dir",
+        os.fspath(provenance.capture_directory),
+        "--expected-ledger-sha256",
+        provenance.ledger_sha256,
+        "--expected-run-label",
+        provenance.label,
+        "--expected-affinity-cpus",
+        PHASE8_AFFINITY,
+        "--product-repo-root",
+        os.fspath(provenance.product_repo_root),
+        "--expected-product-revision",
+        provenance.product_revision,
+        "--capture-tool-repo-root",
+        os.fspath(provenance.capture_tool_repo_root),
+        "--expected-capture-tool-revision",
+        provenance.capture_tool_revision,
+        "--benchmark-harness",
+        harness_path,
+        "--expected-harness-sha256",
+        harness_sha256,
+        "--expected-harness-metadata-sha256",
+        harness_metadata_sha256,
+        "--phase0-base-root",
+        os.fspath(base_repo_root),
+        "--base-manifest",
+        os.fspath(manifests.base.path),
+        "--expected-base-manifest-sha256",
+        manifests.base.sha256,
+        "--supplement-manifest",
+        os.fspath(supplement.path),
+        "--expected-supplement-manifest-sha256",
+        supplement.sha256,
+        "--expected-phase0-artifact-ledger-sha256",
+        phase0_artifact_ledger.sha256,
+    ]
+    environment = {
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TMPDIR": "/tmp",
+        "TZ": "Europe/Sofia",
+    }
+    result = subprocess.run(
+        command,
+        cwd=base_repo_root,
+        env=environment,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+        raise AcceptanceError(
+            f"{provenance.label}: exact capture-wrapper audit failed: {detail}"
+        )
+    if result.stderr:
+        raise AcceptanceError(
+            f"{provenance.label}: exact capture-wrapper audit emitted stderr"
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise AcceptanceError(
+            f"{provenance.label}: exact capture-wrapper audit emitted invalid JSON: "
+            f"{error}"
+        ) from error
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {"capture_dir", "ledger_sha256", "member_count", "run_label", "status"}
+        or payload.get("capture_dir")
+        != os.fspath(provenance.capture_directory)
+        or payload.get("ledger_sha256") != provenance.ledger_sha256
+        or payload.get("run_label") != provenance.label
+        or payload.get("status") != "audited"
+        or isinstance(payload.get("member_count"), bool)
+        or not isinstance(payload.get("member_count"), int)
+        or payload["member_count"] <= 0
+    ):
+        raise AcceptanceError(
+            f"{provenance.label}: exact capture-wrapper audit result is not exact"
+        )
+    return payload
+
+
+Phase8CaptureAuditor = Callable[
+    [Phase8CaptureProvenance, ManifestChain, Phase0ArtifactLedger, Path],
+    Mapping[str, object],
 ]
 
 
@@ -2229,13 +3496,27 @@ def evaluate(
     phase0: RawEvidence,
     phase0_artifact_ledger: Phase0ArtifactLedger,
     runs: Mapping[str, RawEvidence],
+    phase8_provenance: Mapping[str, Phase8CaptureProvenance],
     *,
+    evaluation_mode: str,
     base_repo_root: Path,
     working_repo_root: Path,
     phase9_run_ledger_sha256: str,
+    phase8_capture_auditor: Phase8CaptureAuditor = deep_phase8_capture_audit,
     phase4_validator: Phase4Validator = deep_phase4_validate,
     phase9_validator: Phase9Validator = deep_phase9_validate,
 ) -> dict[str, object]:
+    if evaluation_mode not in EVALUATION_MODES:
+        raise AcceptanceError(f"unsupported evaluation mode {evaluation_mode!r}")
+    scoped_run_labels = tuple(
+        label
+        for label in RUN_LABELS
+        if evaluation_mode == "final" or label != "final-default-auto"
+    )
+    if set(runs) != set(scoped_run_labels):
+        raise AcceptanceError("internal run scope differs from evaluation mode")
+    if set(phase8_provenance) != set(PHASE8_CAPTURE_LABELS):
+        raise AcceptanceError("Phase-8 capture provenance label set is not exact")
     validate_phase0(phase0, base)
 
     # Required row/cardinality contracts.  A direct harness output is
@@ -2299,6 +3580,7 @@ def evaluate(
     runs["phase7-auto"].required_rows(medium_ids | dense_ids, 5, base)
     phase8_ids = {f"phase8-generation-tree0-off-w{worker}" for worker in (1, 8)}
     runs["phase8-generation"].required_rows(phase8_ids, 5, base)
+    runs["phase8-generation-retry1"].required_rows(phase8_ids, 5, base)
     runs["phase8-end-to-end"].required_rows(phase8_ids, 5, base)
 
     final_scaling = base.group("p0-primary-physical", {"1", "2", "4", "8"})
@@ -2313,7 +3595,8 @@ def evaluate(
     final_unpinned = base.group(unpinned_group, {"auto"})
     runs["final-unpinned-auto"].required_rows(final_unpinned, 5, base)
     final_default = base.group(unpinned_group, {"auto", "default"})
-    runs["final-default-auto"].required_rows(final_default, 5, base)
+    if evaluation_mode == "final":
+        runs["final-default-auto"].required_rows(final_default, 5, base)
     final_stress = base.group("p0-stress-physical", {"1", "8"})
     runs["final-stress"].required_rows(final_stress, 3, base)
     final_real = base.group("real-bounded", {"1", "8"})
@@ -2361,6 +3644,7 @@ def evaluate(
         "phase7-small": small_ids,
         "phase7-auto": medium_ids | dense_ids,
         "phase8-generation": phase8_ids,
+        "phase8-generation-retry1": phase8_ids,
         "phase8-end-to-end": phase8_ids,
         "final-scaling": final_scaling,
         "final-primary": final_primary,
@@ -2372,8 +3656,11 @@ def evaluate(
         "final-real": final_real,
         "phase9": phase9_ids,
     }
+    if evaluation_mode == "pre-default":
+        del strict_work_by_label["final-default-auto"]
+        del required_by_label["final-default-auto"]
     validated_required: dict[str, int] = {}
-    for label in RUN_LABELS:
+    for label in scoped_run_labels:
         validated_required[label] = validate_evidence(
             runs[label],
             base,
@@ -2384,6 +3671,28 @@ def evaluate(
             validate_selected_work(
                 runs[label], strict_work_by_label[label], base
             )
+    phase8_audit_results: dict[str, Mapping[str, object]] = {}
+    for label in PHASE8_CAPTURE_LABELS:
+        provenance = phase8_provenance[label]
+        audit_result = phase8_capture_auditor(
+            provenance,
+            base,
+            phase0_artifact_ledger,
+            base_repo_root,
+        )
+        if (
+            not isinstance(audit_result, Mapping)
+            or audit_result.get("status") != "audited"
+            or audit_result.get("run_label") != label
+            or audit_result.get("capture_dir")
+            != os.fspath(provenance.capture_directory)
+            or audit_result.get("ledger_sha256") != provenance.ledger_sha256
+        ):
+            raise AcceptanceError(
+                f"{label}: exact capture-wrapper auditor did not return the "
+                "anchored audited capture"
+            )
+        phase8_audit_results[label] = audit_result
     memory_bytes = physical_memory_bytes()
     phase3_raw_path = single_row_source(
         runs["phase3"], MEDIUM_DENSE.format(1), 5
@@ -2622,23 +3931,148 @@ def evaluate(
     ):
         rss_pair(gates, name, evidence, one, eight, 5, global_rss_cap_kb)
 
-    # Phase 8 generation and end-to-end non-regression from Phase 7.
+    # Phase 8 attempt 0 is immutable required failure evidence.  Retry 1 is
+    # the only observation allowed to discharge the speed/non-regression/RSS
+    # decision; preserving attempt 0 must never turn it into a passing run.
     p8_w1, p8_w8 = "phase8-generation-tree0-off-w1", "phase8-generation-tree0-off-w8"
     semantic_pair(runs["phase8-generation"], (p8_w1, p8_w8), 5, "phase8")
-    current_semantics = {
+    semantic_pair(
+        runs["phase8-generation-retry1"],
+        (p8_w1, p8_w8),
+        5,
+        "phase8 retry1",
+    )
+    attempt0_semantics = {
         (row["search_semantic_sha256"], row["output_semantic_sha256"])
         for row in runs["phase8-generation"].rows
+    }
+    retry1_semantics = {
+        (row["search_semantic_sha256"], row["output_semantic_sha256"])
+        for row in runs["phase8-generation-retry1"].rows
     }
     prior_semantics = {
         (row["search_semantic_sha256"], row["output_semantic_sha256"])
         for row in runs["phase8-end-to-end"].rows
     }
-    gates.condition("phase8_phase7_semantics", current_semantics == prior_semantics, "Phase-8 and same-workload Phase-7 semantics differ")
-    gates.ratio("phase8_generation_w8_over_w1", med(runs["phase8-generation"], p8_w8, 5, "candidate_generation_ms"), med(runs["phase8-generation"], p8_w1, 5, "candidate_generation_ms"), Decimal("0.50"))
+    if attempt0_semantics != retry1_semantics or retry1_semantics != prior_semantics:
+        raise AcceptanceError(
+            "Phase-8 attempt0/retry1 and same-workload Phase-7 semantics differ"
+        )
+    attempt0_w1_generation = med(
+        runs["phase8-generation"], p8_w1, 5, "candidate_generation_ms"
+    )
+    attempt0_w8_generation = med(
+        runs["phase8-generation"], p8_w8, 5, "candidate_generation_ms"
+    )
+    if attempt0_w1_generation <= 0:
+        raise AcceptanceError(
+            "phase8 attempt0 generation-speed denominator is not positive"
+        )
+    attempt0_ratio = attempt0_w8_generation / attempt0_w1_generation
+    if attempt0_ratio <= Decimal("0.50"):
+        raise AcceptanceError(
+            "immutable Phase-8 attempt 0 is not the retained failed observation: "
+            f"generation ratio {attempt0_ratio} is at or below 0.50"
+        )
+    retry1_w1_generation = med(
+        runs["phase8-generation-retry1"],
+        p8_w1,
+        5,
+        "candidate_generation_ms",
+    )
+    retry1_w8_generation = med(
+        runs["phase8-generation-retry1"],
+        p8_w8,
+        5,
+        "candidate_generation_ms",
+    )
+    if retry1_w1_generation <= 0:
+        raise AcceptanceError(
+            "phase8 retry1 generation-speed denominator is not positive"
+        )
+    retry1_ratio = retry1_w8_generation / retry1_w1_generation
+    gates.ratio(
+        "phase8_generation_retry1_w8_over_w1",
+        retry1_w8_generation,
+        retry1_w1_generation,
+        Decimal("0.50"),
+    )
     for worker in (1, 8):
         rid = f"phase8-generation-tree0-off-w{worker}"
-        gates.ratio(f"phase8_end_to_end_w{worker}_vs_phase7", med(runs["phase8-generation"], rid, 5, "wall_clock_s"), med(runs["phase8-end-to-end"], rid, 5, "wall_clock_s"), Decimal("1.00"))
-    rss_pair(gates, "phase8", runs["phase8-generation"], p8_w1, p8_w8, 5, global_rss_cap_kb)
+        gates.ratio(
+            f"phase8_retry1_end_to_end_w{worker}_vs_phase7",
+            med(
+                runs["phase8-generation-retry1"], rid, 5, "wall_clock_s"
+            ),
+            med(runs["phase8-end-to-end"], rid, 5, "wall_clock_s"),
+            Decimal("1.00"),
+        )
+    attempt0_w1_rss = rss_max(
+        runs["phase8-generation"], p8_w1, 5
+    )
+    attempt0_w8_rss = rss_max(
+        runs["phase8-generation"], p8_w8, 5
+    )
+    rss_pair(
+        gates,
+        "phase8_retry1",
+        runs["phase8-generation-retry1"],
+        p8_w1,
+        p8_w8,
+        5,
+        global_rss_cap_kb,
+    )
+    phase8_generation_attempts: dict[str, dict[str, object]] = {}
+    for (
+        label,
+        disposition,
+        w1_generation,
+        w8_generation,
+        ratio,
+        status,
+    ) in (
+        (
+            "phase8-generation",
+            "retained_failed_observation",
+            attempt0_w1_generation,
+            attempt0_w8_generation,
+            attempt0_ratio,
+            "fail",
+        ),
+        (
+            "phase8-generation-retry1",
+            "accepted_retry",
+            retry1_w1_generation,
+            retry1_w8_generation,
+            retry1_ratio,
+            "pass",
+        ),
+    ):
+        provenance = phase8_provenance[label]
+        phase8_generation_attempts[label] = {
+            "disposition": disposition,
+            "candidate_generation_w1_median_ms": str(w1_generation),
+            "candidate_generation_w8_median_ms": str(w8_generation),
+            "measured_ratio": str(ratio),
+            "limit": "0.50",
+            "status": status,
+            **provenance.output(),
+            "product_repo_root": os.fspath(provenance.product_repo_root),
+            "capture_tool_repo_root": os.fspath(
+                provenance.capture_tool_repo_root
+            ),
+            "capture_audit_status": phase8_audit_results[label]["status"],
+            "historical_health_status": (
+                "observed" if label == "phase8-generation" else "not_applicable"
+            ),
+        }
+    phase8_generation_attempts["phase8-generation"].update(
+        {
+            "historical_w1_peak_rss_kb": attempt0_w1_rss,
+            "historical_w8_peak_rss_kb": attempt0_w8_rss,
+            "historical_rss_status": "observed_not_gated",
+        }
+    )
 
     # Mandatory same-affinity physical W1/2/4/8 matrix.  This is deliberately
     # distinct from the five-repetition paired native-parity run below.
@@ -2736,27 +4170,50 @@ def evaluate(
     unpinned_native = unique_method_id(unpinned, METHOD_NATIVE, "native", 5)
     unpinned_auto = unique_method_id(unpinned, METHOD_EXACT, "auto", 5)
     gates.ratio("final_unpinned_auto_native_parity", med(unpinned, unpinned_auto, 5, "wall_clock_s"), med(unpinned, unpinned_native, 5, "wall_clock_s"), Decimal("1.00"))
-    default = runs["final-default-auto"]
-    default_native = unique_method_id(default, METHOD_NATIVE, "native", 5)
-    default_id = unique_method_id(default, METHOD_EXACT, "default", 5)
-    default_auto = unique_method_id(default, METHOD_EXACT, "auto", 5)
-    d_trials = {row["trial_index"]: row for row in default.selected(default_id, 5)}
-    a_trials = {row["trial_index"]: row for row in default.selected(default_auto, 5)}
-    for index in sorted(d_trials):
-        if d_trials[index]["worker_policy"] != "automatic_default" or a_trials[index]["worker_policy"] != "automatic":
-            raise AcceptanceError("final default/auto worker-policy labels are not exact")
-        if d_trials[index]["resolved_workers"] != a_trials[index]["resolved_workers"]:
-            raise AcceptanceError("final default/auto resolved worker counts differ")
-        if decimal(d_trials[index]["wall_clock_s"], "default wall") > Decimal("1.10") * decimal(a_trials[index]["wall_clock_s"], "auto wall"):
-            raise AcceptanceError("final default is more than 10% slower than auto in a paired trial")
-    semantic_pair(default, (default_id, default_auto), 5, "final default/auto")
-    gates.ratio("final_default_over_auto_median", med(default, default_id, 5, "wall_clock_s"), med(default, default_auto, 5, "wall_clock_s"), Decimal("1.10"))
-    gates.ratio(
-        "final_default_native_parity",
-        med(default, default_id, 5, "wall_clock_s"),
-        med(default, default_native, 5, "wall_clock_s"),
-        Decimal("1.00"),
-    )
+    if evaluation_mode == "final":
+        default = runs["final-default-auto"]
+        default_native = unique_method_id(default, METHOD_NATIVE, "native", 5)
+        default_id = unique_method_id(default, METHOD_EXACT, "default", 5)
+        default_auto = unique_method_id(default, METHOD_EXACT, "auto", 5)
+        d_trials = {
+            row["trial_index"]: row for row in default.selected(default_id, 5)
+        }
+        a_trials = {
+            row["trial_index"]: row for row in default.selected(default_auto, 5)
+        }
+        for index in sorted(d_trials):
+            if (
+                d_trials[index]["worker_policy"] != "automatic_default"
+                or a_trials[index]["worker_policy"] != "automatic"
+            ):
+                raise AcceptanceError(
+                    "final default/auto worker-policy labels are not exact"
+                )
+            if d_trials[index]["resolved_workers"] != a_trials[index]["resolved_workers"]:
+                raise AcceptanceError(
+                    "final default/auto resolved worker counts differ"
+                )
+            if decimal(
+                d_trials[index]["wall_clock_s"], "default wall"
+            ) > Decimal("1.10") * decimal(
+                a_trials[index]["wall_clock_s"], "auto wall"
+            ):
+                raise AcceptanceError(
+                    "final default is more than 10% slower than auto in a paired trial"
+                )
+        semantic_pair(default, (default_id, default_auto), 5, "final default/auto")
+        gates.ratio(
+            "final_default_over_auto_median",
+            med(default, default_id, 5, "wall_clock_s"),
+            med(default, default_auto, 5, "wall_clock_s"),
+            Decimal("1.10"),
+        )
+        gates.ratio(
+            "final_default_native_parity",
+            med(default, default_id, 5, "wall_clock_s"),
+            med(default, default_native, 5, "wall_clock_s"),
+            Decimal("1.00"),
+        )
 
     # Stress.  Phase 9 is accepted only by the delegated deep evaluator.
     stress = runs["final-stress"]
@@ -2783,6 +4240,8 @@ def evaluate(
     phase0_artifact_ledger.unchanged()
     for evidence in runs.values():
         evidence.unchanged()
+    for provenance in phase8_provenance.values():
+        provenance.unchanged()
     base.base.unchanged()
     for supplement in base.supplements.values():
         supplement.unchanged()
@@ -2790,6 +4249,11 @@ def evaluate(
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
         "status": "pass",
+        "evaluation_mode": evaluation_mode,
+        "completion_eligible": evaluation_mode == "final",
+        "deferred_run_labels": (
+            [] if evaluation_mode == "final" else ["final-default-auto"]
+        ),
         "base_manifest": os.fspath(base.path),
         "base_manifest_sha256": base.sha256,
         "phase0_artifact_ledger": os.fspath(phase0_artifact_ledger.path),
@@ -2803,9 +4267,15 @@ def evaluate(
             }
             for label in SUPPLEMENT_SPECS
         },
-        "run_labels": list(RUN_LABELS),
+        "run_labels": list(scoped_run_labels),
+        "all_run_labels": list(RUN_LABELS),
         "global_rss_cap_kb": global_rss_cap_kb,
         "gates": gates.items,
+        "phase8_generation_attempts": phase8_generation_attempts,
+        "phase8_capture_audits": {
+            label: dict(phase8_audit_results[label])
+            for label in PHASE8_CAPTURE_LABELS
+        },
         "phase4_acceptance": dict(phase4_result),
         "phase9_acceptance": dict(phase9_result),
     }
@@ -2829,6 +4299,16 @@ def physical_memory_bytes() -> int:
     except OSError as error:
         raise AcceptanceError(f"cannot read physical memory: {error}") from error
     raise AcceptanceError("cannot determine physical memory")
+
+
+def run_labels_for_mode(evaluation_mode: str) -> tuple[str, ...]:
+    if evaluation_mode not in EVALUATION_MODES:
+        raise AcceptanceError(f"unsupported evaluation mode {evaluation_mode!r}")
+    return tuple(
+        label
+        for label in RUN_LABELS
+        if evaluation_mode == "final" or label != "final-default-auto"
+    )
 
 
 def run_assignment(value: str) -> tuple[str, Path]:
@@ -2873,10 +4353,39 @@ def raw_hash_assignment(value: str) -> tuple[str, str]:
     return label, digest
 
 
+def phase8_path_assignment(value: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError(
+            "Phase-8 capture assignment must be LABEL=PATH"
+        )
+    label, path = value.split("=", 1)
+    if label not in PHASE8_CAPTURE_LABELS or not path:
+        raise argparse.ArgumentTypeError(
+            f"unknown/empty Phase-8 capture assignment {value!r}"
+        )
+    return label, Path(path)
+
+
+def phase8_value_assignment(value: str) -> tuple[str, str]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError(
+            "Phase-8 provenance assignment must be LABEL=VALUE"
+        )
+    label, assigned = value.split("=", 1)
+    if label not in PHASE8_CAPTURE_LABELS or not assigned:
+        raise argparse.ArgumentTypeError(
+            f"unknown/empty Phase-8 provenance assignment {value!r}"
+        )
+    return label, assigned
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
     evaluate_parser = commands.add_parser("evaluate", help="perform every cross-phase gate read-only")
+    evaluate_parser.add_argument(
+        "--evaluation-mode", choices=EVALUATION_MODES, required=True
+    )
     evaluate_parser.add_argument("--base-manifest", type=Path, required=True)
     evaluate_parser.add_argument("--expected-base-sha256", required=True)
     evaluate_parser.add_argument("--base-repo-root", type=Path, required=True)
@@ -2904,12 +4413,43 @@ def parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument(
         "--expected-phase9-run-ledger-sha256", required=True
     )
+    evaluate_parser.add_argument(
+        "--phase8-capture-dir", type=phase8_path_assignment,
+        action="append", required=True, metavar="LABEL=DIR",
+    )
+    evaluate_parser.add_argument(
+        "--phase8-product-repo-root", type=phase8_path_assignment,
+        action="append", required=True, metavar="LABEL=ROOT",
+    )
+    evaluate_parser.add_argument(
+        "--phase8-capture-tool-repo-root", type=phase8_path_assignment,
+        action="append", required=True, metavar="LABEL=ROOT",
+    )
+    evaluate_parser.add_argument(
+        "--expected-phase8-run-ledger-sha256", type=phase8_value_assignment,
+        action="append", required=True, metavar="LABEL=HASH",
+    )
+    evaluate_parser.add_argument(
+        "--expected-phase8-product-revision", type=phase8_value_assignment,
+        action="append", required=True, metavar="LABEL=REVISION",
+    )
+    evaluate_parser.add_argument(
+        "--expected-phase8-capture-tool-revision",
+        type=phase8_value_assignment, action="append", required=True,
+        metavar="LABEL=REVISION",
+    )
+    evaluate_parser.add_argument(
+        "--expected-phase8-capture-wrapper-sha256",
+        type=phase8_value_assignment, action="append", required=True,
+        metavar="LABEL=HASH",
+    )
     return result
 
 
 def main(
     argv: Sequence[str] | None = None,
     *,
+    phase8_capture_auditor: Phase8CaptureAuditor = deep_phase8_capture_audit,
     phase4_validator: Phase4Validator = deep_phase4_validate,
     phase9_validator: Phase9Validator = deep_phase9_validate,
 ) -> int:
@@ -2920,6 +4460,52 @@ def main(
         supplement_paths: dict[str, Path] = {}
         supplement_hashes: dict[str, str] = {}
         all_paths: set[Path] = set()
+
+        def exact_phase8_assignments(
+            values: Sequence[tuple[str, object]], description: str
+        ) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for label, value in values:
+                if label in result:
+                    raise AcceptanceError(
+                        f"duplicate {description} assignment for {label}"
+                    )
+                result[label] = value
+            expected_labels = set(PHASE8_CAPTURE_LABELS)
+            if set(result) != expected_labels:
+                raise AcceptanceError(
+                    f"{description} label set mismatch; "
+                    f"missing={sorted(expected_labels - set(result))}, "
+                    f"unexpected={sorted(set(result) - expected_labels)}"
+                )
+            return result
+
+        phase8_capture_dirs = exact_phase8_assignments(
+            args.phase8_capture_dir, "Phase-8 capture directory"
+        )
+        phase8_product_repo_roots = exact_phase8_assignments(
+            args.phase8_product_repo_root, "Phase-8 product repository root"
+        )
+        phase8_capture_tool_repo_roots = exact_phase8_assignments(
+            args.phase8_capture_tool_repo_root,
+            "Phase-8 capture-tool repository root",
+        )
+        phase8_ledger_hashes = exact_phase8_assignments(
+            args.expected_phase8_run_ledger_sha256,
+            "Phase-8 run-ledger anchor",
+        )
+        phase8_product_revisions = exact_phase8_assignments(
+            args.expected_phase8_product_revision,
+            "Phase-8 product revision",
+        )
+        phase8_capture_tool_revisions = exact_phase8_assignments(
+            args.expected_phase8_capture_tool_revision,
+            "Phase-8 capture-tool revision",
+        )
+        phase8_wrapper_hashes = exact_phase8_assignments(
+            args.expected_phase8_capture_wrapper_sha256,
+            "Phase-8 capture-wrapper anchor",
+        )
         for label, path in args.run:
             assignments.setdefault(label, []).append(path)
         for label, digest in args.expected_raw_sha256:
@@ -2933,10 +4519,11 @@ def main(
                 raise AcceptanceError(f"duplicate supplement SHA-256 anchor for {label}")
             supplement_hashes[label] = digest
         labels = set(assignments)
-        expected = set(RUN_LABELS)
+        scoped_run_labels = run_labels_for_mode(args.evaluation_mode)
+        expected = set(scoped_run_labels)
         if labels != expected:
             raise AcceptanceError(f"run-label set mismatch; missing={sorted(expected-labels)}, unexpected={sorted(labels-expected)}")
-        expected_raw_labels = {"phase0", *RUN_LABELS}
+        expected_raw_labels = {"phase0", *scoped_run_labels}
         if set(raw_hashes) != expected_raw_labels:
             raise AcceptanceError(
                 f"raw-anchor label set mismatch; missing={sorted(expected_raw_labels-set(raw_hashes))}, "
@@ -2981,18 +4568,90 @@ def main(
         )
         if any(path in all_paths for path in phase0.paths):
             raise AcceptanceError("Phase-0 raw TSV is reused as a later run")
-        runs = {
-            label: load_raw(label, paths, raw_hashes[label])
-            for label, paths in assignments.items()
+        for label in PHASE8_CAPTURE_LABELS:
+            if len(assignments[label]) != 1 or len(raw_hashes[label]) != 1:
+                raise AcceptanceError(
+                    f"{label}: Phase-8 capture requires exactly one raw TSV "
+                    "and one external raw anchor"
+                )
+        phase8_provenance = {
+            label: load_phase8_capture_provenance(
+                label,
+                phase8_capture_dirs[label],  # type: ignore[arg-type]
+                assignments[label][0],
+                raw_hashes[label][0],
+                phase8_ledger_hashes[label],  # type: ignore[arg-type]
+                phase8_product_revisions[label],  # type: ignore[arg-type]
+                phase8_capture_tool_revisions[label],  # type: ignore[arg-type]
+                phase8_wrapper_hashes[label],  # type: ignore[arg-type]
+                phase8_product_repo_roots[label],  # type: ignore[arg-type]
+                phase8_capture_tool_repo_roots[label],  # type: ignore[arg-type]
+                base,
+                phase0_artifact_ledger,
+                base_repo_root,
+            )
+            for label in PHASE8_CAPTURE_LABELS
         }
+        runs: dict[str, RawEvidence] = {}
+        for label, paths in assignments.items():
+            provenance = phase8_provenance.get(label)
+            runs[label] = load_raw(
+                label,
+                paths,
+                raw_hashes[label],
+                anchored_payloads=(
+                    None if provenance is None else [provenance.raw_payload]
+                ),
+                anchored_signatures=(
+                    None if provenance is None else [provenance.raw_signature]
+                ),
+            )
+        attempt0 = phase8_provenance["phase8-generation"]
+        retry1 = phase8_provenance["phase8-generation-retry1"]
+        if os.path.samefile(
+            attempt0.capture_directory, retry1.capture_directory
+        ):
+            raise AcceptanceError(
+                "Phase-8 attempt 0 and retry1 reuse the same capture directory"
+            )
+        if os.path.samefile(attempt0.raw_path, retry1.raw_path):
+            raise AcceptanceError(
+                "Phase-8 attempt 0 and retry1 reuse the same raw TSV path"
+            )
+        if attempt0.raw_sha256 == retry1.raw_sha256:
+            raise AcceptanceError(
+                "Phase-8 attempt 0 and retry1 reuse the same raw TSV bytes"
+            )
+        if (
+            attempt0.capture_tool_revision
+            == retry1.capture_tool_revision
+        ):
+            raise AcceptanceError(
+                "Phase-8 retry1 capture-tool revision C is not distinct"
+            )
+        if os.path.samefile(
+            attempt0.product_repo_root, retry1.product_repo_root
+        ):
+            raise AcceptanceError(
+                "Phase-8 attempt 0 and retry1 reuse the same product repository root"
+            )
+        if os.path.samefile(
+            attempt0.capture_tool_repo_root, retry1.capture_tool_repo_root
+        ):
+            raise AcceptanceError(
+                "Phase-8 attempt 0 and retry1 reuse the same capture-tool repository root"
+            )
         result = evaluate(
             base,
             phase0,
             phase0_artifact_ledger,
             runs,
+            phase8_provenance,
+            evaluation_mode=args.evaluation_mode,
             base_repo_root=base_repo_root,
             working_repo_root=working_repo_root,
             phase9_run_ledger_sha256=phase9_run_ledger_sha256,
+            phase8_capture_auditor=phase8_capture_auditor,
             phase4_validator=phase4_validator,
             phase9_validator=phase9_validator,
         )

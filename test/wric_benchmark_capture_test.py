@@ -1758,6 +1758,36 @@ class BenchmarkCaptureTest(unittest.TestCase):
             capture_tool.HISTORICAL_RUN_REVISIONS["phase8-generation"],
             "94a63238d25a8e3262428419d53f8f0986e8879b",
         )
+        self.assertEqual(
+            capture_tool.HISTORICAL_RUN_REVISIONS[
+                "phase8-generation-retry1"
+            ],
+            "07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c",
+        )
+        self.assertNotEqual(
+            capture_tool.HISTORICAL_RUN_REVISIONS["phase8-generation"],
+            capture_tool.HISTORICAL_RUN_REVISIONS[
+                "phase8-generation-retry1"
+            ],
+        )
+        for label, other_revision in (
+            (
+                "phase8-generation",
+                capture_tool.HISTORICAL_RUN_REVISIONS[
+                    "phase8-generation-retry1"
+                ],
+            ),
+            (
+                "phase8-generation-retry1",
+                capture_tool.HISTORICAL_RUN_REVISIONS["phase8-generation"],
+            ),
+        ):
+            with self.subTest(cross_label=label):
+                with self.assertRaisesRegex(
+                    capture_tool.CaptureError,
+                    "requires exact historical product revision",
+                ):
+                    capture_tool.require_run_revision(label, other_revision)
         for label, revision in capture_tool.HISTORICAL_RUN_REVISIONS.items():
             with self.subTest(label=label):
                 capture_tool.require_run_revision(label, revision)
@@ -1767,6 +1797,329 @@ class BenchmarkCaptureTest(unittest.TestCase):
                 ):
                     capture_tool.require_run_revision(label, "0" * 40)
         capture_tool.require_run_revision("final-small-auto", "0" * 40)
+
+    def test_phase8_generation_retry1_component_is_exact_and_fail_closed(self) -> None:
+        attempt_label = "phase8-generation"
+        retry_label = "phase8-generation-retry1"
+        self.assertEqual(
+            capture_tool.RUN_COMPONENTS[retry_label],
+            capture_tool.RUN_COMPONENTS[attempt_label],
+        )
+        self.assertNotIn("phase8-generation-retry2", capture_tool.RUN_COMPONENTS)
+        self.assertNotIn(
+            "phase8-generation-retry2",
+            capture_tool.HISTORICAL_RUN_REVISIONS,
+        )
+
+        supplement, _ = self.fixture.add_supplement("phase8-generation")
+        out = self.fixture.captures / "phase8-generation-retry1-contract"
+        tool_paths = capture_tool.build_tool_paths(
+            self.fixture.product,
+            self.fixture.controller,
+            {
+                "frozen_larch2": self.fixture.larch2,
+                "frozen_oracle_dagutil": self.fixture.oracle,
+                "frozen_process_metrics": self.fixture.process_metrics,
+            },
+            self.fixture.harness,
+        )
+        canonical = [
+            "--dagutil",
+            os.fspath(tool_paths["product_dagutil"]),
+            "--larch2",
+            os.fspath(tool_paths["frozen_larch2"]),
+            "--process-metrics",
+            os.fspath(tool_paths["frozen_process_metrics"]),
+            "--workload-manifest",
+            os.fspath(self.fixture.base_manifest),
+            "--supplemental-workload-manifest",
+            os.fspath(supplement),
+            "--out-dir",
+            os.fspath(out),
+            "--run-manifest-group",
+            "phase8-generation",
+            "--workers-list",
+            "1,8",
+            "--warmups",
+            "1",
+            "--repetitions",
+            "5",
+            "--full-canonical-correctness",
+        ]
+
+        def validate(
+            arguments: Sequence[str],
+            *,
+            label: str = retry_label,
+            supplement_ids: Sequence[str] = ("phase8-generation",),
+            affinity: str = capture_tool.PHYSICAL_AFFINITY,
+        ) -> dict[str, object]:
+            return capture_tool.validate_harness_arguments(
+                arguments,
+                out,
+                tool_paths,
+                self.fixture.base_manifest,
+                [supplement],
+                supplement_ids,
+                label,
+                affinity,
+            )
+
+        for label in (attempt_label, retry_label):
+            with self.subTest(accepted_label=label):
+                self.assertEqual(validate(canonical, label=label)["run_label"], label)
+
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError,
+            "run label has no approved benchmark component matrix",
+        ):
+            validate(canonical, label="phase8-generation-retry2")
+
+        for option, altered in (
+            ("--run-manifest-group", "phase8-generation-retry1"),
+            ("--workers-list", "1,4"),
+            ("--repetitions", "3"),
+        ):
+            arguments = canonical.copy()
+            arguments[arguments.index(option) + 1] = altered
+            with self.subTest(altered_option=option):
+                with self.assertRaisesRegex(
+                    capture_tool.CaptureError,
+                    "not an exact approved component",
+                ):
+                    validate(arguments)
+
+        wrong_supplement = canonical.copy()
+        supplement_index = (
+            wrong_supplement.index("--supplemental-workload-manifest") + 1
+        )
+        wrong_supplement[supplement_index] = os.fspath(self.fixture.base_manifest)
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError,
+            "supplemental manifest paths/order differ from external anchors",
+        ):
+            validate(wrong_supplement)
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError,
+            "not an exact approved component",
+        ):
+            validate(canonical, supplement_ids=("phase8-generation-retry1",))
+
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError,
+            "requires exact physical-core affinity",
+        ):
+            validate(canonical, affinity=capture_tool.SMT_AFFINITY)
+
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError,
+            "exact canonical approved component argv",
+        ):
+            validate(canonical + ["--require-wall-ratio", "unexpected=1.0"])
+
+    def test_phase8_generation_retry1_capture_and_read_only_audit(self) -> None:
+        retry_label = "phase8-generation-retry1"
+        product_revision = "07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c"
+
+        # Keep the fixture's synthetic, ignored build tree while moving its
+        # product repository onto the exact immutable product commit required
+        # by the retry label.  The controller remains a separately committed
+        # repository containing the wrapper that is actually executed.
+        git(
+            self.fixture.product,
+            "fetch",
+            "-q",
+            os.fspath(REPO),
+            product_revision,
+        )
+        git(
+            self.fixture.product,
+            "checkout",
+            "-q",
+            "--detach",
+            product_revision,
+        )
+        self.fixture.product_revision = product_revision
+        self.assertEqual(
+            git(self.fixture.product, "rev-parse", "HEAD"), product_revision
+        )
+        self.assertEqual(git(self.fixture.product, "status", "--porcelain=v1"), "")
+        self.assertNotEqual(self.fixture.controller_revision, product_revision)
+
+        # The real R tree contains chart_scheduler.cpp, unlike the fixture's
+        # original one-file product repository.  Regenerate the synthetic
+        # CMake evidence so it describes R's exact target source sequence.
+        for target in ("dagutil", "larch"):
+            write(
+                self.fixture.product / f"build/CMakeFiles/{target}.dir/build.make",
+                generated_build_make(self.fixture.product, target),
+            )
+        larch_objects = " ".join(
+            object_path
+            for object_path, _ in capture_tool.target_compile_sources(
+                self.fixture.product, "larch"
+            )
+        )
+        write(
+            self.fixture.product / "build/CMakeFiles/larch.dir/link.txt",
+            f"/bin/ar qc liblarch.a {larch_objects}\n/bin/ranlib liblarch.a\n",
+        )
+
+        compatibility_metadata = {
+            "product_revision": product_revision,
+            "schema": capture_tool.SCHEMA.replace(
+                "benchmark_capture", "historical_harness_compat"
+            ),
+            "schema_version": 1,
+        }
+        self.fixture.harness_metadata.chmod(0o644)
+        write(
+            self.fixture.harness_metadata,
+            json.dumps(
+                compatibility_metadata, sort_keys=True, separators=(",", ":")
+            )
+            + "\n",
+            0o444,
+        )
+        self.fixture.harness_metadata_sha256 = sha256_file(
+            self.fixture.harness_metadata
+        )
+        supplement, _ = self.fixture.add_supplement("phase8-generation")
+
+        root = self.fixture.captures / "phase8-generation-retry1"
+        harness_arguments = [
+            "--dagutil",
+            os.fspath(self.fixture.product / "build/bin/dagutil"),
+            "--larch2",
+            os.fspath(self.fixture.larch2),
+            "--process-metrics",
+            os.fspath(self.fixture.process_metrics),
+            "--workload-manifest",
+            os.fspath(self.fixture.base_manifest),
+            "--supplemental-workload-manifest",
+            os.fspath(supplement),
+            "--out-dir",
+            os.fspath(root),
+            "--run-manifest-group",
+            "phase8-generation",
+            "--workers-list",
+            "1,8",
+            "--warmups",
+            "1",
+            "--repetitions",
+            "5",
+            "--full-canonical-correctness",
+        ]
+        capture_command = [
+            sys.executable,
+            os.fspath(self.fixture.wrapper),
+            "capture",
+            "--run-label",
+            retry_label,
+            "--affinity-cpus",
+            capture_tool.PHYSICAL_AFFINITY,
+            *self.fixture.common(root),
+            "--",
+            *harness_arguments,
+        ]
+        captured = self.fixture.run(
+            [
+                "/usr/bin/taskset",
+                "-c",
+                capture_tool.PHYSICAL_AFFINITY,
+                *capture_command,
+            ]
+        )
+        self.assertEqual(captured.returncode, 0, captured.stderr)
+        capture_result = json.loads(captured.stdout)
+        self.assertEqual(capture_result["status"], "sealed")
+
+        metadata = json.loads(
+            (root / capture_tool.METADATA_NAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(metadata["run_label"], retry_label)
+        self.assertEqual(
+            metadata["repositories"]["product"]["expected_revision"],
+            product_revision,
+        )
+        self.assertEqual(
+            metadata["repositories"]["capture_tool"]["expected_revision"],
+            self.fixture.controller_revision,
+        )
+        self.assertNotEqual(
+            metadata["repositories"]["capture_tool"]["expected_revision"],
+            metadata["repositories"]["product"]["expected_revision"],
+        )
+        self.assertEqual(
+            metadata["harness_configuration"],
+            {
+                "affinity_class": "P",
+                "base_manifest": os.fspath(self.fixture.base_manifest),
+                "frozen_larch2": os.fspath(self.fixture.larch2),
+                "frozen_process_metrics": os.fspath(self.fixture.process_metrics),
+                "full_canonical_correctness": True,
+                "out_dir": os.fspath(root),
+                "product_dagutil": os.fspath(
+                    self.fixture.product / "build/bin/dagutil"
+                ),
+                "repetitions": "5",
+                "run_label": retry_label,
+                "run_manifest_group": "phase8-generation",
+                "supplement_manifest_ids": ["phase8-generation"],
+                "supplement_manifests": [os.fspath(supplement)],
+                "warmups": "1",
+                "workers_list": "1,8",
+            },
+        )
+        self.assertEqual(
+            metadata["harness_argv"],
+            [os.fspath(self.fixture.harness), *harness_arguments],
+        )
+
+        def sealed_tree() -> list[tuple[str, int, int, int, str | None]]:
+            observation: list[tuple[str, int, int, int, str | None]] = []
+            for path in [root, *sorted(root.rglob("*"))]:
+                info = path.stat()
+                observation.append(
+                    (
+                        "." if path == root else path.relative_to(root).as_posix(),
+                        stat.S_IMODE(info.st_mode),
+                        info.st_size,
+                        info.st_mtime_ns,
+                        sha256_file(path) if path.is_file() else None,
+                    )
+                )
+            return observation
+
+        before_audit = sealed_tree()
+        audit_command = [
+            sys.executable,
+            os.fspath(self.fixture.wrapper),
+            "audit",
+            "--expected-ledger-sha256",
+            str(capture_result["ledger_sha256"]),
+            "--expected-run-label",
+            retry_label,
+            "--expected-affinity-cpus",
+            capture_tool.PHYSICAL_AFFINITY,
+            *self.fixture.common(root),
+        ]
+        audited = self.fixture.run(
+            [
+                "/usr/bin/taskset",
+                "-c",
+                capture_tool.PHYSICAL_AFFINITY,
+                *audit_command,
+            ]
+        )
+        self.assertEqual(audited.returncode, 0, audited.stderr)
+        audit_result = json.loads(audited.stdout)
+        self.assertEqual(audit_result["status"], "audited")
+        self.assertEqual(audit_result["run_label"], retry_label)
+        self.assertEqual(
+            audit_result["ledger_sha256"], capture_result["ledger_sha256"]
+        )
+        self.assertEqual(sealed_tree(), before_audit)
 
     def test_affinity_canonicalization_and_start_end_mock_drift(self) -> None:
         self.assertEqual(capture_tool.canonical_affinity({0, 1, 2, 4, 6, 7}), "0-2,4,6-7")

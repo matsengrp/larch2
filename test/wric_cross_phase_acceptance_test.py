@@ -8,9 +8,11 @@ from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -44,6 +46,25 @@ class SyntheticEvidence:
         self.manifest_rows: dict[str, dict[str, str]] = {}
         self.raw_paths: dict[str, Path] = {}
         self.raw_inputs: dict[str, list[Path]] = {}
+        self.phase8_capture_dirs: dict[str, Path] = {}
+        self.phase8_ledger_shas: dict[str, str] = {}
+        self.phase8_product_revisions = {
+            "phase8-generation": cross.PHASE8_ATTEMPT0_PRODUCT_REVISION,
+            "phase8-generation-retry1": cross.PHASE8_RETRY1_PRODUCT_REVISION,
+        }
+        self.phase8_capture_tool_revisions = {
+            "phase8-generation": cross.PHASE8_ATTEMPT0_CAPTURE_TOOL_REVISION,
+            "phase8-generation-retry1": "c" * 40,
+        }
+        self.phase8_product_repo_roots = {
+            label: root / f"{label}-product"
+            for label in cross.PHASE8_CAPTURE_LABELS
+        }
+        self.phase8_capture_tool_repo_roots = {
+            label: root / f"{label}-capture-tool"
+            for label in cross.PHASE8_CAPTURE_LABELS
+        }
+        self.phase8_wrapper_hashes: dict[str, str] = {}
         self.phase0_capture_paths: list[Path] = []
         self.phase0_classification_paths: list[Path] = []
         self.phase0_inputs: list[Path] = []
@@ -57,7 +78,14 @@ class SyntheticEvidence:
         self._make_manifest_rows()
         self._write_manifests()
         self._write_phase0()
+        self._make_phase8_repositories()
         self._write_runs()
+        self.phase8_immutable_attempt0_raw_sha = hashlib.sha256(
+            self.raw_paths["phase8-generation"].read_bytes()
+        ).hexdigest()
+        self.phase8_immutable_attempt0_ledger_sha = self.phase8_ledger_shas[
+            "phase8-generation"
+        ]
 
     def add_manifest(
         self,
@@ -727,9 +755,403 @@ class SyntheticEvidence:
         self.phase0_artifact_ledger_sha = self._seal(
             self.phase0_artifact_ledger
         )
+        if all(label in self.raw_paths for label in cross.PHASE8_CAPTURE_LABELS):
+            for label in cross.PHASE8_CAPTURE_LABELS:
+                self.refresh_phase8_capture(label)
+            self.phase8_immutable_attempt0_raw_sha = hashlib.sha256(
+                self.raw_paths["phase8-generation"].read_bytes()
+            ).hexdigest()
+            self.phase8_immutable_attempt0_ledger_sha = self.phase8_ledger_shas[
+                "phase8-generation"
+            ]
 
     def _group(self, name: str, workers: set[str]) -> set[str]:
         return {rid for rid, row in self.manifest_rows.items() if row["run_group"] == name and (cross.manifest_worker(row) == "native" or cross.manifest_worker(row) in workers)}
+
+    @staticmethod
+    def _metadata_snapshot(path: Path) -> dict[str, object]:
+        info = path.lstat()
+        return {
+            "bytes": info.st_size,
+            "ctime_ns": info.st_ctime_ns,
+            "device": info.st_dev,
+            "inode": info.st_ino,
+            "mode": info.st_mode & 0o7777,
+            "mtime_ns": info.st_mtime_ns,
+            "nlink": info.st_nlink,
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    def _make_phase8_repositories(self) -> None:
+        for label in cross.PHASE8_CAPTURE_LABELS:
+            product = self.phase8_product_repo_roots[label]
+            capture_tool = self.phase8_capture_tool_repo_roots[label]
+            (product / "tools").mkdir(parents=True)
+            (product / "build/bin").mkdir(parents=True)
+            (product / "synthetic-tools").mkdir(parents=True)
+            (capture_tool / "tools").mkdir(parents=True)
+            wrapper = capture_tool / "tools/wric_benchmark_capture.py"
+            wrapper.write_text(
+                "#!/usr/bin/python3\n"
+                f"# synthetic exact capture wrapper for {label}\n",
+                encoding="utf-8",
+            )
+            generic_ledger = capture_tool / "tools/wric_evidence_run_ledger.py"
+            generic_ledger.write_text(
+                "#!/usr/bin/python3\n# synthetic generic-v2 ledger\n",
+                encoding="utf-8",
+            )
+            harness = product / "tools/wric_spr_search_benchmark.sh"
+            harness.write_text(
+                "#!/bin/sh\n# synthetic product benchmark harness\n",
+                encoding="utf-8",
+            )
+            dagutil = product / "build/bin/dagutil"
+            dagutil.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            for path in (wrapper, generic_ledger, harness, dagutil):
+                path.chmod(0o755)
+            for role in cross.capture_contract.TOOL_KEYS - {
+                "benchmark_harness",
+                "capture_wrapper",
+                "generic_ledger",
+                "product_dagutil",
+            }:
+                path = product / "synthetic-tools" / role
+                path.write_text(f"synthetic {role}\n", encoding="utf-8")
+                path.chmod(
+                    0o644
+                    if role in cross.capture_contract.NONEXECUTABLE_TOOL_ROLES
+                    else 0o755
+                )
+            self.phase8_wrapper_hashes[label] = hashlib.sha256(
+                wrapper.read_bytes()
+            ).hexdigest()
+
+    def _phase8_tool_paths(self, label: str) -> dict[str, Path]:
+        product = self.phase8_product_repo_roots[label]
+        capture_tool = self.phase8_capture_tool_repo_roots[label]
+        result = {
+            role: product / "synthetic-tools" / role
+            for role in cross.capture_contract.TOOL_KEYS
+        }
+        result.update(
+            benchmark_harness=product / "tools/wric_spr_search_benchmark.sh",
+            capture_wrapper=capture_tool / "tools/wric_benchmark_capture.py",
+            generic_ledger=capture_tool / "tools/wric_evidence_run_ledger.py",
+            product_dagutil=product / "build/bin/dagutil",
+        )
+        return result
+
+    @staticmethod
+    def _phase8_repository_state(
+        root: Path, revision: str
+    ) -> dict[str, object]:
+        empty_sha = hashlib.sha256(b"").hexdigest()
+        return {
+            "head": revision,
+            "object_format": "sha1",
+            "porcelain_v2_z_base64": "",
+            "porcelain_v2_z_bytes": 0,
+            "porcelain_v2_z_sha256": empty_sha,
+            "tracked_files_v_z_bytes": 1,
+            "tracked_files_v_z_sha256": digest(f"tracked:{root}"),
+            "tracked_worktree_bytes": 1,
+            "tracked_worktree_files": 1,
+            "tracked_worktree_observation_sha256": digest(
+                f"worktree:{root}"
+            ),
+            "toplevel": str(root),
+        }
+
+    def _phase8_tracked_blob(
+        self, path: Path, repository: Path, relative: str
+    ) -> dict[str, object]:
+        snapshot = self._metadata_snapshot(path)
+        return {
+            "blob_bytes": snapshot["bytes"],
+            "blob_sha256": snapshot["sha256"],
+            "mode": "100755",
+            "object_id": digest(f"blob:{repository}:{relative}")[:40],
+            "relative": relative,
+            "repository": str(repository),
+            "working_file": snapshot,
+        }
+
+    @staticmethod
+    def _phase8_observation(*, compiler: bool = False) -> dict[str, object]:
+        empty_sha = hashlib.sha256(b"").hexdigest()
+        result: dict[str, object] = {
+            "argv": ["synthetic"],
+            "returncode": 0,
+            "stderr_bytes": 0,
+            "stderr_sha256": empty_sha,
+            "stdout_bytes": 0,
+            "stdout_sha256": empty_sha,
+        }
+        if compiler:
+            result.update(stdout_text="", stderr_text="")
+        return result
+
+    def refresh_phase8_capture(self, label: str) -> None:
+        capture = self.raw_paths[label].parent
+        raw = self.raw_paths[label]
+        metadata_path = capture / cross.PHASE8_METADATA_NAME
+        if metadata_path.exists():
+            metadata_path.chmod(0o644)
+            metadata_path.unlink()
+        commands = capture / "commands.sh"
+        summary = capture / "summary.md"
+        stdout = capture / cross.capture_contract.HARNESS_STDOUT_NAME
+        stderr = capture / cross.capture_contract.HARNESS_STDERR_NAME
+        for path in (commands, summary, stdout, stderr):
+            if path.exists():
+                path.chmod(0o644)
+        commands.write_text("#!/bin/sh\n# synthetic capture command\n", encoding="utf-8")
+        summary.write_text("# Synthetic capture summary\n", encoding="utf-8")
+        stdout.write_text("synthetic harness output\n", encoding="utf-8")
+        stderr.write_bytes(b"")
+        commands.chmod(0o755)
+        for path in (summary, stdout, stderr):
+            path.chmod(0o444)
+        product = self.phase8_product_repo_roots[label]
+        capture_tool = self.phase8_capture_tool_repo_roots[label]
+        tool_paths = self._phase8_tool_paths(label)
+        tools = {
+            role: self._metadata_snapshot(tool_paths[role])
+            for role in cross.capture_contract.TOOL_KEYS
+        }
+        wrapper = tools["capture_wrapper"]
+        generic_ledger = tools["generic_ledger"]
+        benchmark_harness = tools["benchmark_harness"]
+        revision = self.phase8_product_revisions[label]
+        capture_revision = self.phase8_capture_tool_revisions[label]
+        product_state = self._phase8_repository_state(product, revision)
+        capture_state = self._phase8_repository_state(
+            capture_tool, capture_revision
+        )
+        wrapper_blob = self._phase8_tracked_blob(
+            tool_paths["capture_wrapper"],
+            capture_tool,
+            "tools/wric_benchmark_capture.py",
+        )
+        ledger_blob = self._phase8_tracked_blob(
+            tool_paths["generic_ledger"],
+            capture_tool,
+            "tools/wric_evidence_run_ledger.py",
+        )
+        harness_blob = self._phase8_tracked_blob(
+            tool_paths["benchmark_harness"],
+            product,
+            "tools/wric_spr_search_benchmark.sh",
+        )
+        harness_argv = [
+            str(tool_paths["benchmark_harness"]),
+            "--out-dir",
+            str(capture),
+            "--run-label",
+            label,
+            "--run-manifest-group",
+            "phase8-generation",
+            "--workers-list",
+            "1,8",
+            "--repetitions",
+            "5",
+            "--warmups",
+            "1",
+            "--full-canonical-correctness",
+        ]
+        host = {
+            "calibration_sha256": digest("synthetic calibration"),
+            "capture_metadata_sha256": digest("synthetic phase0 metadata"),
+            "live": {},
+        }
+        metadata = {
+            "affinity": {
+                "pre": cross.PHASE8_AFFINITY,
+                "post": cross.PHASE8_AFFINITY,
+                "requested": cross.PHASE8_AFFINITY,
+            },
+            "binary_provenance_limit":
+                cross.capture_contract.BINARY_PROVENANCE_LIMIT,
+            "capture_dir": str(capture),
+            "capture_outputs": {
+                "commands": self._metadata_snapshot(commands),
+                "raw_trial_rows": 10,
+                "raw_trials": self._metadata_snapshot(raw),
+                "row_ids": sorted(
+                    f"phase8-generation-tree0-off-w{worker}"
+                    for worker in (1, 8)
+                ),
+                "summary": self._metadata_snapshot(summary),
+            },
+            "cmake_contract": {},
+            "compiler_version": self._phase8_observation(compiler=True),
+            "dagutil_flags": self._phase8_observation(),
+            "effective_build_commands": {
+                role: tools[role]["sha256"]
+                for role in (
+                    "dagutil_compile_recipes",
+                    "dagutil_compile_flags",
+                    "dagutil_link_command",
+                    "larch_compile_recipes",
+                    "larch_compile_flags",
+                    "larch_link_command",
+                )
+            },
+            "environment": cross.capture_contract.harness_environment(
+                self.root
+            ),
+            "harness_argv": harness_argv,
+            "harness_argv_sha256": cross.capture_contract.argv_digest(
+                harness_argv
+            ),
+            "harness_configuration": {
+                "affinity_class": "P",
+                "base_manifest": str(self.base),
+                "frozen_larch2": str(tool_paths["frozen_larch2"]),
+                "frozen_process_metrics": str(
+                    tool_paths["frozen_process_metrics"]
+                ),
+                "full_canonical_correctness": True,
+                "out_dir": str(capture),
+                "product_dagutil": str(tool_paths["product_dagutil"]),
+                "repetitions": "5",
+                "run_label": label,
+                "run_manifest_group": "phase8-generation",
+                "supplement_manifest_ids": ["phase8-generation"],
+                "supplement_manifests": [str(self.supplements["phase8"])],
+                "warmups": "1",
+                "workers_list": "1,8",
+            },
+            "harness_execution": {
+                "returncode": 0,
+                "stderr": self._metadata_snapshot(stderr),
+                "stderr_name": stderr.name,
+                "stdout": self._metadata_snapshot(stdout),
+                "stdout_name": stdout.name,
+            },
+            "harness_provenance": {
+                "audit_result": None,
+                "auditor": None,
+                "expected_harness_sha256": benchmark_harness["sha256"],
+                "expected_metadata_sha256": "-",
+                "kind": "exact_product_tracked",
+                "metadata": None,
+                "product_git_blob": harness_blob,
+            },
+            "host_contract": host,
+            "phase0_chain": {
+                "artifact_ledger": {
+                    "expected_sha256": self.phase0_artifact_ledger_sha,
+                    "path": str(self.phase0_artifact_ledger),
+                },
+                "base_manifest": {
+                    "expected_sha256": self.base_sha,
+                    "path": str(self.base),
+                },
+                "host_contract": host,
+                "phase0_root": {"path": str(self.root)},
+                "supplement_manifests": [{
+                    "expected_sha256": self.supplement_shas["phase8"],
+                    "path": str(self.supplements["phase8"]),
+                }],
+            },
+            "postprocessor": {"kind": "none"},
+            "repositories": {
+                "capture_tool": {
+                    "expected_revision": capture_revision,
+                    "path": str(capture_tool),
+                    "post": capture_state,
+                    "pre": capture_state,
+                },
+                "product": {
+                    "expected_revision": revision,
+                    "path": str(product),
+                    "post": product_state,
+                    "pre": product_state,
+                },
+            },
+            "run_label": label,
+            "schema": "wric.benchmark_capture",
+            "schema_version": 2,
+            "tools": tools,
+            "tracked_git_blobs": {
+                "capture_wrapper": wrapper_blob,
+                "generic_ledger": ledger_blob,
+                "product_harness": harness_blob,
+            },
+            "umask": "0022",
+            "working_directory": str(self.root),
+        }
+        metadata_path.write_text(
+            json.dumps(metadata, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        metadata_path.chmod(0o444)
+        self.reseal_phase8_capture(label)
+
+    def reseal_phase8_capture(self, label: str) -> None:
+        capture = self.raw_paths[label].parent
+        ledger = capture / cross.GENERIC_LEDGER_NAME
+        seal = capture / cross.GENERIC_LEDGER_SEAL_NAME
+        for control in (ledger, seal):
+            if control.exists():
+                control.unlink()
+        records: list[tuple[str, str, str, str, str]] = []
+        for path in sorted(capture.rglob("*")):
+            if path in (ledger, seal):
+                continue
+            relative = path.relative_to(capture).as_posix()
+            info = path.lstat()
+            mode = f"{info.st_mode & 0o7777:04o}"
+            if path.is_dir():
+                records.append(("directory", "-", "-", mode, relative))
+            else:
+                payload = path.read_bytes()
+                records.append((
+                    "file",
+                    hashlib.sha256(payload).hexdigest(),
+                    str(len(payload)),
+                    mode,
+                    relative,
+                ))
+        records.sort(key=lambda record: record[4])
+        ledger_payload = (
+            "\n".join((*cross.GENERIC_LEDGER_PREAMBLE,
+                         *("\t".join(record) for record in records)))
+            + "\n"
+        ).encode("ascii")
+        ledger.write_bytes(ledger_payload)
+        ledger.chmod(0o444)
+        ledger_sha = hashlib.sha256(ledger_payload).hexdigest()
+        seal.write_text(
+            f"{ledger_sha}  {cross.GENERIC_LEDGER_NAME}\n", encoding="ascii"
+        )
+        seal.chmod(0o444)
+        self.phase8_capture_dirs[label] = capture
+        self.phase8_ledger_shas[label] = ledger_sha
+
+    def rewrite_phase8_metadata(
+        self,
+        label: str,
+        mutate: Callable[[dict[str, object]], None],
+        *,
+        canonical: bool = True,
+    ) -> None:
+        path = self.phase8_capture_dirs[label] / cross.PHASE8_METADATA_NAME
+        value = json.loads(path.read_text(encoding="utf-8"))
+        assert isinstance(value, dict)
+        mutate(value)
+        path.chmod(0o644)
+        payload = (
+            json.dumps(value, sort_keys=True, indent=2) + "\n"
+            if canonical
+            else json.dumps(value, sort_keys=False) + "\n"
+        )
+        path.write_text(payload, encoding="utf-8")
+        path.chmod(0o444)
+        self.reseal_phase8_capture(label)
 
     def _write_runs(self) -> None:
         p1 = {cross.MEDIUM_DENSE.format(1), cross.SMALL_DENSE.format(1), cross.SMALL_EXACT.format(1), cross.MEDIUM_CACHE.format(1), cross.MEDIUM_LAZY.format(1)}
@@ -819,8 +1241,12 @@ class SyntheticEvidence:
 
         p8 = {f"phase8-generation-tree0-off-w{w}" for w in (1, 8)}
         self.write_raw("phase8-generation", p8, 5, times={rid: "0.9" for rid in p8},
+                       row_overrides={next(rid for rid in p8 if rid.endswith("w1")): {"candidate_generation_ms": "100"}, next(rid for rid in p8 if rid.endswith("w8")): {"candidate_generation_ms": "125"}})
+        self.write_raw("phase8-generation-retry1", p8, 5, times={rid: "0.9" for rid in p8},
                        row_overrides={next(rid for rid in p8 if rid.endswith("w1")): {"candidate_generation_ms": "100"}, next(rid for rid in p8 if rid.endswith("w8")): {"candidate_generation_ms": "40"}})
         self.write_raw("phase8-end-to-end", p8, 5, times={rid: "1" for rid in p8})
+        for label in cross.PHASE8_CAPTURE_LABELS:
+            self.refresh_phase8_capture(label)
 
         final_scaling = self._group(
             "p0-primary-physical", {"1", "2", "4", "8"}
@@ -928,6 +1354,7 @@ class SyntheticEvidence:
     def command(
         self,
         *,
+        evaluation_mode: str = "final",
         omit: str | None = None,
         omit_raw_anchor: str | None = None,
         raw_anchor_override: dict[str, str] | None = None,
@@ -936,9 +1363,19 @@ class SyntheticEvidence:
         supplement_anchor_override: dict[str, str] | None = None,
         ledger_anchor: str | None = None,
         phase0_ledger_anchor: str | None = None,
+        phase8_capture_override: dict[str, Path] | None = None,
+        phase8_ledger_anchor_override: dict[str, str] | None = None,
+        phase8_product_revision_override: dict[str, str] | None = None,
+        phase8_capture_tool_revision_override: dict[str, str] | None = None,
+        phase8_wrapper_anchor_override: dict[str, str] | None = None,
+        phase8_product_root_override: dict[str, Path] | None = None,
+        phase8_capture_tool_root_override: dict[str, Path] | None = None,
+        omit_phase8_assignment: tuple[str, str] | None = None,
+        duplicate_phase8_assignment: tuple[str, str] | None = None,
     ) -> list[str]:
         command = [
             "evaluate",
+            "--evaluation-mode", evaluation_mode,
             "--base-manifest", str(self.base),
             "--expected-base-sha256", self.base_sha,
             "--base-repo-root", str(self.root),
@@ -963,7 +1400,7 @@ class SyntheticEvidence:
                     "phase0", hashlib.sha256(path.read_bytes()).hexdigest()
                 )
                 command.extend(("--expected-raw-sha256", f"phase0={value}"))
-        for label in cross.RUN_LABELS:
+        for label in cross.run_labels_for_mode(evaluation_mode):
             if label == omit:
                 continue
             for path in self.raw_inputs[label]:
@@ -977,6 +1414,57 @@ class SyntheticEvidence:
             "--expected-phase9-run-ledger-sha256",
             self.phase9_ledger_sha if ledger_anchor is None else ledger_anchor,
         ))
+        for label in cross.PHASE8_CAPTURE_LABELS:
+            phase8_values = (
+                (
+                    "--phase8-capture-dir",
+                    (phase8_capture_override or {}).get(
+                        label, self.phase8_capture_dirs[label]
+                    ),
+                ),
+                (
+                    "--phase8-product-repo-root",
+                    (phase8_product_root_override or {}).get(
+                        label, self.phase8_product_repo_roots[label]
+                    ),
+                ),
+                (
+                    "--phase8-capture-tool-repo-root",
+                    (phase8_capture_tool_root_override or {}).get(
+                        label, self.phase8_capture_tool_repo_roots[label]
+                    ),
+                ),
+                (
+                    "--expected-phase8-run-ledger-sha256",
+                    (phase8_ledger_anchor_override or {}).get(
+                        label, self.phase8_ledger_shas[label]
+                    ),
+                ),
+                (
+                    "--expected-phase8-product-revision",
+                    (phase8_product_revision_override or {}).get(
+                        label, self.phase8_product_revisions[label]
+                    ),
+                ),
+                (
+                    "--expected-phase8-capture-tool-revision",
+                    (phase8_capture_tool_revision_override or {}).get(
+                        label, self.phase8_capture_tool_revisions[label]
+                    ),
+                ),
+                (
+                    "--expected-phase8-capture-wrapper-sha256",
+                    (phase8_wrapper_anchor_override or {}).get(
+                        label, self.phase8_wrapper_hashes[label]
+                    ),
+                ),
+            )
+            for option, value in phase8_values:
+                if omit_phase8_assignment == (option, label):
+                    continue
+                command.extend((option, f"{label}={value}"))
+                if duplicate_phase8_assignment == (option, label):
+                    command.extend((option, f"{label}={value}"))
         return command
 
     def mutate(
@@ -1327,12 +1815,14 @@ class Invocation:
         returncode: int,
         stdout: str,
         stderr: str,
+        phase8_calls: list[tuple[object, ...]],
         phase4_calls: list[tuple[object, ...]],
         phase9_calls: list[tuple[object, ...]],
     ) -> None:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+        self.phase8_calls = phase8_calls
         self.phase4_calls = phase4_calls
         self.phase9_calls = phase9_calls
 
@@ -1344,14 +1834,33 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
         *,
         phase4_failure: str | None = None,
         phase4_status: str = "pass",
+        phase4_action: Callable[[], None] | None = None,
+        phase8_failure: str | None = None,
         phase9_failure: str | None = None,
         **command_options: object,
     ) -> Invocation:
+        phase8_calls: list[tuple[object, ...]] = []
         phase4_calls: list[tuple[object, ...]] = []
         phase9_calls: list[tuple[object, ...]] = []
 
+        def phase8_capture_auditor(*args: object) -> dict[str, object]:
+            phase8_calls.append(args)
+            if phase8_failure is not None:
+                raise cross.AcceptanceError(phase8_failure)
+            provenance = args[0]
+            assert isinstance(provenance, cross.Phase8CaptureProvenance)
+            return {
+                "capture_dir": str(provenance.capture_directory),
+                "ledger_sha256": provenance.ledger_sha256,
+                "member_count": len(provenance.members),
+                "run_label": provenance.label,
+                "status": "audited",
+            }
+
         def phase4_validator(*args: object) -> dict[str, object]:
             phase4_calls.append(args)
+            if phase4_action is not None:
+                phase4_action()
             if phase4_failure is not None:
                 raise cross.AcceptanceError(phase4_failure)
             return {
@@ -1374,9 +1883,18 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             }
 
         stdout, stderr = io.StringIO(), io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
+        with mock.patch.multiple(
+            cross,
+            PHASE8_ATTEMPT0_RAW_SHA256=
+                data.phase8_immutable_attempt0_raw_sha,
+            PHASE8_ATTEMPT0_LEDGER_SHA256=
+                data.phase8_immutable_attempt0_ledger_sha,
+            PHASE8_ATTEMPT0_CAPTURE_WRAPPER_SHA256=
+                data.phase8_wrapper_hashes["phase8-generation"],
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
             returncode = cross.main(
                 data.command(**command_options),  # type: ignore[arg-type]
+                phase8_capture_auditor=phase8_capture_auditor,
                 phase4_validator=phase4_validator,
                 phase9_validator=phase9_validator,
             )
@@ -1384,6 +1902,7 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             returncode,
             stdout.getvalue(),
             stderr.getvalue(),
+            phase8_calls,
             phase4_calls,
             phase9_calls,
         )
@@ -1435,7 +1954,86 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["status"], "pass")
             self.assertEqual(payload["schema_version"], cross.SCHEMA_VERSION)
+            self.assertEqual(payload["evaluation_mode"], "final")
+            self.assertTrue(payload["completion_eligible"])
+            self.assertEqual(payload["deferred_run_labels"], [])
             self.assertEqual(payload["run_labels"], list(cross.RUN_LABELS))
+            self.assertEqual(payload["all_run_labels"], list(cross.RUN_LABELS))
+            attempts = payload["phase8_generation_attempts"]
+            self.assertEqual(list(attempts), list(cross.PHASE8_CAPTURE_LABELS))
+            self.assertEqual(
+                [attempts[label]["disposition"] for label in attempts],
+                ["retained_failed_observation", "accepted_retry"],
+            )
+            self.assertEqual(attempts["phase8-generation"]["status"], "fail")
+            self.assertEqual(
+                attempts["phase8-generation-retry1"]["status"], "pass"
+            )
+            self.assertEqual(
+                attempts["phase8-generation"]["product_revision"],
+                cross.PHASE8_ATTEMPT0_PRODUCT_REVISION,
+            )
+            self.assertEqual(
+                attempts["phase8-generation-retry1"]["product_revision"],
+                cross.PHASE8_RETRY1_PRODUCT_REVISION,
+            )
+            for label in cross.PHASE8_CAPTURE_LABELS:
+                self.assertEqual(attempts[label]["limit"], "0.50")
+                for key in (
+                    "candidate_generation_w1_median_ms",
+                    "candidate_generation_w8_median_ms",
+                    "measured_ratio",
+                    "capture_directory",
+                    "raw_path",
+                    "raw_sha256",
+                    "product_repo_root",
+                    "capture_tool_revision",
+                    "capture_tool_repo_root",
+                    "capture_wrapper_sha256",
+                    "metadata_path",
+                    "metadata_sha256",
+                    "ledger_path",
+                    "ledger_sha256",
+                    "seal_path",
+                    "seal_sha256",
+                ):
+                    self.assertIn(key, attempts[label])
+            self.assertEqual(
+                {
+                    label: (
+                        attempts[label]["candidate_generation_w1_median_ms"],
+                        attempts[label]["candidate_generation_w8_median_ms"],
+                        attempts[label]["measured_ratio"],
+                    )
+                    for label in cross.PHASE8_CAPTURE_LABELS
+                },
+                {
+                    "phase8-generation": ("100", "125", "1.25"),
+                    "phase8-generation-retry1": ("100", "40", "0.4"),
+                },
+            )
+            gate_names = {gate["name"] for gate in payload["gates"]}
+            self.assertFalse(
+                any(name.startswith("phase8_attempt0") for name in gate_names)
+            )
+            self.assertEqual(len(result.phase8_calls), 2)
+            for label, call in zip(
+                cross.PHASE8_CAPTURE_LABELS, result.phase8_calls, strict=True
+            ):
+                provenance = call[0]
+                self.assertIsInstance(
+                    provenance, cross.Phase8CaptureProvenance
+                )
+                assert isinstance(provenance, cross.Phase8CaptureProvenance)
+                self.assertEqual(provenance.label, label)
+                self.assertEqual(
+                    provenance.product_repo_root,
+                    data.phase8_product_repo_roots[label],
+                )
+                self.assertEqual(
+                    provenance.capture_tool_repo_root,
+                    data.phase8_capture_tool_repo_roots[label],
+                )
             self.assertEqual(payload["phase4_acceptance"]["status"], "pass")
             self.assertEqual(payload["phase9_acceptance"]["status"], "pass")
             self.assertEqual(len(result.phase4_calls), 1)
@@ -1752,6 +2350,458 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("run-label set mismatch", result.stderr)
 
+    def test_evaluation_mode_has_exact_pre_default_and_final_scopes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-pre-default-") as name:
+            data = SyntheticEvidence(Path(name))
+            result = self.run_case(data, evaluation_mode="pre-default")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["evaluation_mode"], "pre-default")
+            self.assertFalse(payload["completion_eligible"])
+            self.assertEqual(
+                payload["deferred_run_labels"], ["final-default-auto"]
+            )
+            self.assertEqual(
+                payload["run_labels"],
+                [
+                    label for label in cross.RUN_LABELS
+                    if label != "final-default-auto"
+                ],
+            )
+            self.assertNotIn("final-default-auto", payload["run_labels"])
+        with tempfile.TemporaryDirectory(prefix="wric-cross-pre-missing-") as name:
+            result = self.run_case(
+                SyntheticEvidence(Path(name)),
+                evaluation_mode="pre-default",
+                omit="phase9",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("run-label set mismatch", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-final-missing-") as name:
+            result = self.run_case(
+                SyntheticEvidence(Path(name)), omit="final-default-auto"
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("run-label set mismatch", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-mode-required-") as name:
+            command = SyntheticEvidence(Path(name)).command()
+            index = command.index("--evaluation-mode")
+            del command[index:index + 2]
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                cross.main(command)
+
+    def test_phase8_capture_provenance_anchors_and_routes_are_strict(self) -> None:
+        cases = (
+            (
+                "ledger-anchor",
+                {"phase8_ledger_anchor_override": {
+                    "phase8-generation-retry1": "0" * 64
+                }},
+                "external anchor",
+            ),
+            (
+                "attempt0-product",
+                {"phase8_product_revision_override": {
+                    "phase8-generation": "0" * 40
+                }},
+                "exact immutable revision",
+            ),
+            (
+                "retry-product",
+                {"phase8_product_revision_override": {
+                    "phase8-generation-retry1": "0" * 40
+                }},
+                "exact immutable revision",
+            ),
+            (
+                "attempt0-tool",
+                {"phase8_capture_tool_revision_override": {
+                    "phase8-generation": "d" * 40
+                }},
+                "exact immutable revision",
+            ),
+            (
+                "retry-tool-not-distinct",
+                {"phase8_capture_tool_revision_override": {
+                    "phase8-generation-retry1":
+                        cross.PHASE8_ATTEMPT0_CAPTURE_TOOL_REVISION
+                }},
+                "must be distinct",
+            ),
+            (
+                "wrapper-anchor",
+                {"phase8_wrapper_anchor_override": {
+                    "phase8-generation-retry1": "0" * 64
+                }},
+                "capture-wrapper hash/provenance",
+            ),
+        )
+        for case, options, message in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(
+                prefix=f"wric-cross-p8-provenance-{case}-"
+            ) as name:
+                result = self.run_case(
+                    SyntheticEvidence(Path(name)), **options
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-route-") as name:
+            data = SyntheticEvidence(Path(name))
+            result = self.run_case(
+                data,
+                phase8_capture_override={
+                    "phase8-generation-retry1":
+                        data.phase8_capture_dirs["phase8-generation"]
+                },
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(
+                "canonical capture raw_trials.tsv" in result.stderr
+                or "schema/label/directory" in result.stderr,
+                result.stderr,
+            )
+
+    def test_phase8_immutable_attempt0_constants_are_exact(self) -> None:
+        self.assertEqual(
+            cross.PHASE8_ATTEMPT0_RAW_SHA256,
+            "e3eb3b3d9e77fc4006aa2c701102f39f84244971fae4f794bf66e5ca72cf4a56",
+        )
+        self.assertEqual(
+            cross.PHASE8_ATTEMPT0_LEDGER_SHA256,
+            "d22f42f31cf4e37bc92abc53e70f938d163f5fc422af68677c0f7dd7244841e1",
+        )
+        self.assertEqual(
+            cross.PHASE8_ATTEMPT0_CAPTURE_WRAPPER_SHA256,
+            "e374ed726e026ab973ffa9ff385b13cd8c0eea8041d32b861df61fb4fa6c652e",
+        )
+        self.assertEqual(
+            cross.PHASE8_ATTEMPT0_PRODUCT_REVISION,
+            "94a63238d25a8e3262428419d53f8f0986e8879b",
+        )
+        self.assertEqual(
+            cross.PHASE8_ATTEMPT0_CAPTURE_TOOL_REVISION,
+            "b6ae1a968c0a2374d8180e5682ae53775377c31e",
+        )
+        self.assertEqual(
+            cross.PHASE8_RETRY1_PRODUCT_REVISION,
+            "07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c",
+        )
+
+    def test_phase8_cli_assignments_are_complete_and_unique(self) -> None:
+        options = (
+            "--phase8-capture-dir",
+            "--phase8-product-repo-root",
+            "--phase8-capture-tool-repo-root",
+            "--expected-phase8-run-ledger-sha256",
+            "--expected-phase8-product-revision",
+            "--expected-phase8-capture-tool-revision",
+            "--expected-phase8-capture-wrapper-sha256",
+        )
+        label = "phase8-generation-retry1"
+        for option in options:
+            for disposition in ("missing", "duplicate"):
+                with self.subTest(
+                    option=option, disposition=disposition
+                ), tempfile.TemporaryDirectory(
+                    prefix="wric-cross-p8-cli-"
+                ) as name:
+                    argument = (option, label)
+                    result = self.run_case(
+                        SyntheticEvidence(Path(name)),
+                        **{
+                            (
+                                "omit_phase8_assignment"
+                                if disposition == "missing"
+                                else "duplicate_phase8_assignment"
+                            ): argument
+                        },
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        "label set mismatch"
+                        if disposition == "missing"
+                        else "duplicate",
+                        result.stderr,
+                    )
+
+    def test_phase8_capture_filesystem_closure_is_strict(self) -> None:
+        label = "phase8-generation-retry1"
+
+        def metadata_mode(data: SyntheticEvidence) -> None:
+            metadata = data.phase8_capture_dirs[label] / cross.PHASE8_METADATA_NAME
+            metadata.chmod(0o644)
+            data.reseal_phase8_capture(label)
+
+        def ledger_mode(data: SyntheticEvidence) -> None:
+            (data.phase8_capture_dirs[label] / cross.GENERIC_LEDGER_NAME).chmod(
+                0o644
+            )
+
+        def seal_mode(data: SyntheticEvidence) -> None:
+            (
+                data.phase8_capture_dirs[label]
+                / cross.GENERIC_LEDGER_SEAL_NAME
+            ).chmod(0o644)
+
+        def member_symlink(data: SyntheticEvidence) -> None:
+            capture = data.phase8_capture_dirs[label]
+            os.symlink("commands.sh", capture / "alias-symlink")
+
+        def member_hardlink(data: SyntheticEvidence) -> None:
+            capture = data.phase8_capture_dirs[label]
+            os.link(capture / "commands.sh", capture / "alias-hardlink")
+
+        def member_special(data: SyntheticEvidence) -> None:
+            os.mkfifo(data.phase8_capture_dirs[label] / "special-fifo")
+
+        def control_seal(data: SyntheticEvidence) -> None:
+            seal = (
+                data.phase8_capture_dirs[label]
+                / cross.GENERIC_LEDGER_SEAL_NAME
+            )
+            seal.chmod(0o644)
+            seal.write_text("0" * 64 + "  wrong-ledger\n", encoding="ascii")
+            seal.chmod(0o444)
+
+        cases = (
+            ("metadata-mode", metadata_mode, "mode 0444"),
+            ("ledger-mode", ledger_mode, "mode 0444"),
+            ("seal-mode", seal_mode, "mode 0444"),
+            ("symlink", member_symlink, "symlink"),
+            ("hardlink", member_hardlink, "hard-linked"),
+            ("special", member_special, "special file"),
+            ("control-seal", control_seal, "detached seal"),
+        )
+        for case, mutate, message in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(
+                prefix=f"wric-cross-p8-fs-{case}-"
+            ) as name:
+                data = SyntheticEvidence(Path(name))
+                mutate(data)
+                result = self.run_case(data)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+    def test_phase8_metadata_ledger_and_raw_tampering_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-metadata-") as name:
+            data = SyntheticEvidence(Path(name))
+            metadata = (
+                data.phase8_capture_dirs["phase8-generation-retry1"]
+                / cross.PHASE8_METADATA_NAME
+            )
+            metadata.chmod(0o644)
+            metadata.write_bytes(metadata.read_bytes() + b" ")
+            metadata.chmod(0o444)
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("capture closure", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-schema-") as name:
+            data = SyntheticEvidence(Path(name))
+
+            def wrong_schema(value: dict[str, object]) -> None:
+                value["schema_version"] = 1
+
+            data.rewrite_phase8_metadata(
+                "phase8-generation-retry1", wrong_schema
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("schema-v2 capture metadata", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-canonical-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.rewrite_phase8_metadata(
+                "phase8-generation-retry1", lambda value: None,
+                canonical=False,
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not exact canonical JSON", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-ledger-") as name:
+            data = SyntheticEvidence(Path(name))
+            label = "phase8-generation-retry1"
+            ledger = data.phase8_capture_dirs[label] / cross.GENERIC_LEDGER_NAME
+            ledger.chmod(0o644)
+            payload = ledger.read_bytes().replace(
+                b"# schema_version=2", b"# schema_version=1", 1
+            )
+            ledger.write_bytes(payload)
+            ledger.chmod(0o444)
+            ledger_sha = hashlib.sha256(payload).hexdigest()
+            seal = data.phase8_capture_dirs[label] / cross.GENERIC_LEDGER_SEAL_NAME
+            seal.chmod(0o644)
+            seal.write_text(
+                f"{ledger_sha}  {cross.GENERIC_LEDGER_NAME}\n",
+                encoding="ascii",
+            )
+            seal.chmod(0o444)
+            result = self.run_case(
+                data,
+                phase8_ledger_anchor_override={label: ledger_sha},
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("exact generic-v2 schema", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-raw-anchor-") as name:
+            result = self.run_case(
+                SyntheticEvidence(Path(name)),
+                raw_anchor_override={"phase8-generation-retry1": "0" * 64},
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("raw TSV hash differs", result.stderr)
+
+    def test_phase8_attempts_cannot_be_rewritten_or_reused(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-rewrite-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase8-generation",
+                lambda row: row["row_id"].endswith("w8"),
+                {"candidate_generation_ms": "45"},
+            )
+            data.refresh_phase8_capture("phase8-generation")
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("immutable attempt0 raw SHA-256", result.stderr)
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-p8-resealed-failed-ratio-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase8-generation",
+                lambda row: (
+                    row["row_id"].endswith("w8")
+                    and row["trial_index"] == "1"
+                ),
+                {"wall_clock_s": "0.91"},
+            )
+            data.refresh_phase8_capture("phase8-generation")
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(
+                "immutable attempt0 raw SHA-256" in result.stderr
+                or "immutable attempt0 generic-v2 ledger SHA-256"
+                in result.stderr,
+                result.stderr,
+            )
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-speed-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase8-generation-retry1",
+                lambda row: row["row_id"].endswith("w8"),
+                {"candidate_generation_ms": "60"},
+            )
+            data.refresh_phase8_capture("phase8-generation-retry1")
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("phase8_generation_retry1_w8_over_w1", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-same-path-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.raw_inputs["phase8-generation-retry1"] = [
+                data.raw_paths["phase8-generation"]
+            ]
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("reused across run labels", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-same-raw-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.raw_paths["phase8-generation-retry1"].write_bytes(
+                data.raw_paths["phase8-generation"].read_bytes()
+            )
+            data.refresh_phase8_capture("phase8-generation-retry1")
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("reuse the same raw TSV bytes", result.stderr)
+        for role in ("product", "capture-tool"):
+            with self.subTest(reused_root=role), tempfile.TemporaryDirectory(
+                prefix=f"wric-cross-p8-same-{role}-root-"
+            ) as name:
+                data = SyntheticEvidence(Path(name))
+                attempt_label = "phase8-generation"
+                retry_label = "phase8-generation-retry1"
+                if role == "product":
+                    data.phase8_product_repo_roots[retry_label] = (
+                        data.phase8_product_repo_roots[attempt_label]
+                    )
+                else:
+                    data.phase8_capture_tool_repo_roots[retry_label] = (
+                        data.phase8_capture_tool_repo_roots[attempt_label]
+                    )
+                    data.phase8_wrapper_hashes[retry_label] = (
+                        data.phase8_wrapper_hashes[attempt_label]
+                    )
+                data.refresh_phase8_capture(retry_label)
+                result = self.run_case(data)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    f"reuse the same {role} repository root", result.stderr
+                )
+
+    def test_phase8_semantics_routes_and_toctou_are_strict(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-semantic-") as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase8-generation-retry1",
+                lambda row: (
+                    row["row_id"].endswith("w8")
+                    and row["trial_index"] == "1"
+                ),
+                {"output_semantic_sha256": "f" * 64},
+            )
+            data.refresh_phase8_capture("phase8-generation-retry1")
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("sealed manifest row", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-label-swap-") as name:
+            data = SyntheticEvidence(Path(name))
+
+            def retry_label(value: dict[str, object]) -> None:
+                value["run_label"] = "phase8-generation-retry1"
+                configuration = value["harness_configuration"]
+                assert isinstance(configuration, dict)
+                configuration["run_label"] = "phase8-generation-retry1"
+
+            def attempt0_label(value: dict[str, object]) -> None:
+                value["run_label"] = "phase8-generation"
+                configuration = value["harness_configuration"]
+                assert isinstance(configuration, dict)
+                configuration["run_label"] = "phase8-generation"
+
+            data.rewrite_phase8_metadata("phase8-generation", retry_label)
+            data.rewrite_phase8_metadata(
+                "phase8-generation-retry1", attempt0_label
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("immutable attempt0", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-harness-route-") as name:
+            data = SyntheticEvidence(Path(name))
+
+            def wrong_route(value: dict[str, object]) -> None:
+                configuration = value["harness_configuration"]
+                assert isinstance(configuration, dict)
+                configuration["run_manifest_group"] = "phase7-lazy"
+
+            data.rewrite_phase8_metadata(
+                "phase8-generation-retry1", wrong_route
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("harness route", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p8-toctou-") as name:
+            data = SyntheticEvidence(Path(name))
+            metadata = (
+                data.phase8_capture_dirs["phase8-generation-retry1"]
+                / cross.PHASE8_METADATA_NAME
+            )
+
+            def mutate_after_load() -> None:
+                metadata.chmod(0o644)
+                metadata.write_bytes(metadata.read_bytes() + b" ")
+                metadata.chmod(0o444)
+
+            result = self.run_case(data, phase4_action=mutate_after_load)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("changed during evaluation", result.stderr)
+
     def test_duplicate_raw_header_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-header-") as name:
             data = SyntheticEvidence(Path(name))
@@ -2056,9 +3106,10 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
                 lambda row: row["row_id"].endswith("w1") and row["trial_index"] == "1",
                 {"input_sha256": "f" * 64},
             )
+            data.refresh_phase8_capture("phase8-generation")
             result = self.run_case(data)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("sealed manifest row", result.stderr)
+            self.assertIn("immutable attempt0 raw SHA-256", result.stderr)
 
     def test_phase0_timeout_count_comes_from_sealed_manifest(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-timeout-count-") as name:
