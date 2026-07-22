@@ -1083,6 +1083,15 @@ def stable_report_digest(report: Path) -> str:
     if not payload.endswith(b"\n") or b"\r" in payload:
         fail(f"product report is not canonical newline-delimited UTF-8: {report}")
     field = re.compile(r"^(\s*)([A-Za-z0-9_]+):[ \t]*(.*)$")
+    volatile_suffixes = (
+        "_ms",
+        "_ms_min",
+        "_ms_mean",
+        "_ms_max",
+        "_per_second",
+        "_nanoseconds",
+        "_nanoseconds_max",
+    )
     normalized: list[str] = []
     for line in text.splitlines():
         match = field.fullmatch(line)
@@ -1090,17 +1099,12 @@ def stable_report_digest(report: Path) -> str:
             normalized.append(line)
             continue
         indentation, key, _value = match.groups()
-        volatile = (
-            key.endswith("_ms")
-            or key.endswith("_per_second")
-            or key.endswith("_nanoseconds")
-            or key.endswith("_nanoseconds_max")
-        )
+        volatile = key.endswith(volatile_suffixes)
         normalized.append(
             f"{indentation}{key}: <volatile>" if volatile else line
         )
     canonical = ("\n".join(normalized) + "\n").encode("utf-8")
-    return sha256_bytes(b"wric-phase9-stable-report-v2\n" + canonical)
+    return sha256_bytes(b"wric-phase9-stable-report-v3\n" + canonical)
 
 
 def require_matching_stable_evidence(

@@ -1046,11 +1046,78 @@ def expect_bootstrap_error(action, fragment: str) -> None:  # type: ignore[no-un
         raise AssertionError(f"expected BootstrapError containing {fragment!r}")
 
 
+def test_stable_report_digest(root: Path) -> None:
+    source = root / "stable-report-source.txt"
+    timing_variant = root / "stable-report-timing-variant.txt"
+    semantic_variant = root / "stable-report-semantic-variant.txt"
+    scheduler_variant = root / "stable-report-scheduler-variant.txt"
+    unit_token_variant = root / "stable-report-unit-token-variant.txt"
+    source_lines = (
+        "chart_spr_search:",
+        "  accepted_moves: 3",
+        "  exact_candidate_verification_ms: 100.000",
+        "  exact_candidate_verification_ms_min: 10.000",
+        "  exact_candidate_verification_ms_mean: 20.000",
+        "  exact_candidate_verification_ms_max: 30.000",
+        "  local_rows_recomputed_per_second: 40.000",
+        "  chart_scheduler_queue_wait_nanoseconds: 50",
+        "  chart_scheduler_queue_wait_nanoseconds_max: 60",
+        "  chart_scheduler_queue_wait_samples: 12",
+        "  semantic_ms_contract: exact",
+    )
+    write_bytes(source, ("\n".join(source_lines) + "\n").encode())
+    write_bytes(
+        timing_variant,
+        (
+            "\n".join(
+                (
+                    source_lines[0],
+                    source_lines[1],
+                    "  exact_candidate_verification_ms: 101.000",
+                    "  exact_candidate_verification_ms_min: 11.000",
+                    "  exact_candidate_verification_ms_mean: 21.000",
+                    "  exact_candidate_verification_ms_max: 31.000",
+                    "  local_rows_recomputed_per_second: 41.000",
+                    "  chart_scheduler_queue_wait_nanoseconds: 51",
+                    "  chart_scheduler_queue_wait_nanoseconds_max: 61",
+                    source_lines[9],
+                    source_lines[10],
+                )
+            )
+            + "\n"
+        ).encode(),
+    )
+    write_bytes(
+        semantic_variant,
+        source.read_bytes().replace(b"  accepted_moves: 3\n", b"  accepted_moves: 2\n"),
+    )
+    write_bytes(
+        scheduler_variant,
+        source.read_bytes().replace(
+            b"  chart_scheduler_queue_wait_samples: 12\n",
+            b"  chart_scheduler_queue_wait_samples: 11\n",
+        ),
+    )
+    write_bytes(
+        unit_token_variant,
+        source.read_bytes().replace(
+            b"  semantic_ms_contract: exact\n",
+            b"  semantic_ms_contract: approximate\n",
+        ),
+    )
+    source_digest = bootstrap.stable_report_digest(source)
+    assert bootstrap.stable_report_digest(timing_variant) == source_digest
+    assert bootstrap.stable_report_digest(semantic_variant) != source_digest
+    assert bootstrap.stable_report_digest(scheduler_variant) != source_digest
+    assert bootstrap.stable_report_digest(unit_token_variant) != source_digest
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(
         prefix="wric-phase9-manifest-bootstrap-", dir=REPO / "build"
     ) as temporary:
         case = Integration(Path(temporary))
+        test_stable_report_digest(case.root)
 
         produced = case.root / "produced" / "frozen-input.tsv"
         producer_capture = case.root / "producer-capture"
