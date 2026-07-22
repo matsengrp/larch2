@@ -28,17 +28,17 @@ in this document.
 
 | Phase | Status | Required evidence |
 |---|---|---|
-| 0. Repair and freeze measurement | in progress (calibration passed; partial capture) | Native/oracle/runner frozen and functional gates audited; seven completed capture status records contain 175 canonical rows across 45 repeat stages with zero timeouts, including every small capture and the dense/cache physical-core medium captures. Remaining medium/real-preflight capture, finalization, audits, and seal remain pending |
-| 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | Functional/counter gates pass at `208ce23`; canonical Phase-0 comparison and serial speed/no-regression gates await the sealed baseline |
-| 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | `0c4623b` passes the allocation/build/canonical/full-CTest/targeted-ASAN gates; serial timing and RSS comparisons await the sealed baseline |
-| 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | Safe one-pool orchestration, full CTest, and targeted TSAN pass at `7d294d6`; small-case timing awaits the sealed baseline |
-| 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | `cbf92b6` passes deterministic pattern/cache/local/fixed-topology scheduling, bounded-memory admission, caught-failure accounting, full CTest, and targeted TSAN; scaling, Phase-3 serial comparison, and RSS gates await the sealed baseline |
-| 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass W1/W8 exact semantics, full CTest, and targeted TSAN; same-revision diagnostics exceed the 2x exact-phase target; measured-0% heavy splitting is omitted; unified frontier/candidate admission and sealed timing/RSS remain pending |
-| 6. Parallelize exact top-K candidates | implementation complete; acceptance pending Phase 0 | `870c298` passes the in-tree Top-K/worker semantic and stable-failure matrix, deterministic scheduling, functional bounded-admission tests, full RelWithDebInfo CTest, and targeted TSan; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS gates await Phase 0 |
-| 7. Make lazy charts scalable and adaptive | implementation complete; acceptance pending Phase 0 | Packed deterministic grouping, dependency wavefronts, exact transient admission, the profile-supported within-clade omission, and frozen `off|on|auto` policy are implemented through `38e9a28`; `3359fbf` adds the exact eight-row medium-auto/small-on completion producer and `c5156a8` registers its passing synthetic CTest. The current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`; the production Phase-7 supplements, named-fixture medians/scaling, RSS, and sealed performance gates remain pending |
-| 8. Parallelize and pipeline candidate generation | implementation hardening complete; acceptance pending Phase 0/final gates | Source waves, stable direct-projection workspaces, nested-workspace quarantine, seeded reservoir ordering, and realizable outer/direct width-two boundaries are committed through `94a6323`; `51d2a3c` pins the Phase-8 generation evidence label to that immutable checkpoint. The current post-cleanup full RelWithDebInfo, complete ASAN, focused matrix, and exact 55-test TSan gates pass at `4ef6126`; supplemental sealing, the quiet-host speed cycle, Phase-7 comparison, and paired RSS remain pending |
-| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; acceptance pending Phase 0/final gates | Persistent pattern-parallel cache transactions, exact-state reuse, non-vacuous three-accept W1/2/4/8 semantics, crash-durable supplemental tooling, and counter/report contracts pass through `4ef6126`; `0f099ca` adds the passing schema-v3 frozen-oracle characterization producer. The current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`; the production characterization, immutable supplement capture/seal, and accepted-update timing/RSS decision remain pending |
-| 10. Integrate, tune defaults, and prove parity | implementation in progress | Cleanup review and the required in-tree semantic mode/worker matrix pass at `4ef6126`, as do the current post-cleanup full RelWithDebInfo, complete ASAN, and exact 55-test TSan gates. Sealed worker-policy/RSS/wall evidence, Phase-0 and supplemental sealing, and the conditional default decision remain pending; any later production or default change reopens all affected test gates |
+| 0. Repair and freeze measurement | complete (audited and sealed) | Thirteen captures are closed: 267 ordinary canonical rows across 60 repeat stages, 27 manifest-approved timeouts, and two real-fixture W1/W8 `high_arity_refinement_refusal` observations. Pending/final audits and strict smokes passed, and the final workload and artifact-ledger SHA-256 values are `32ae82a93cb72a28afaa510391eac83f80f13638d46e1513881d2b484c9dc3ae` and `a33436d78ec6c840427b343615c6b9a7b555a87f989000865873e9c5adeb06bb` |
+| 1. Compile an immutable chart plan | implementation complete; performance acceptance pending | Functional/counter gates pass at `208ce23`; the sealed Phase-0 base is available, but canonical comparison and serial speed/no-regression gates have not yet been run |
+| 2. Remove allocations and duplicate work | implementation complete; performance acceptance pending | `0c4623b` passes the allocation/build/canonical/full-CTest/targeted-ASAN gates; serial timing and RSS comparisons against the sealed base remain pending |
+| 3. Add one persistent adaptive scheduler | implementation complete; performance acceptance pending | Safe one-pool orchestration, full CTest, and targeted TSAN pass at `7d294d6`; the small-case timing gate remains pending |
+| 4. Parallelize patterns and local scoring | implementation complete; performance acceptance pending | `cbf92b6` passes deterministic pattern/cache/local/fixed-topology scheduling, bounded-memory admission, caught-failure accounting, full CTest, and targeted TSAN; scaling, Phase-3 serial comparison, and RSS gates remain pending |
+| 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 6/final gates | `bb29300` plus harness fix `3a10e9c` pass W1/W8 exact semantics, full CTest, and targeted TSAN; same-revision diagnostics exceed the 2x exact-phase target; measured-0% heavy splitting is omitted; unified frontier/candidate admission and final timing/RSS remain pending |
+| 6. Parallelize exact top-K candidates | implementation complete; performance acceptance pending | `870c298` passes the in-tree Top-K/worker semantic and stable-failure matrix, deterministic scheduling, functional bounded-admission tests, full RelWithDebInfo CTest, and targeted TSan; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS gates remain pending |
+| 7. Make lazy charts scalable and adaptive | implementation complete; performance acceptance pending | Packed deterministic grouping, dependency wavefronts, exact transient admission, the profile-supported within-clade omission, and frozen `off|on|auto` policy are implemented through `38e9a28`; `3359fbf` adds the exact eight-row medium-auto/small-on completion producer and `c5156a8` registers its passing synthetic CTest. The current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`; the production Phase-7 supplements, named-fixture medians/scaling, RSS, and sealed performance gates remain pending |
+| 8. Parallelize and pipeline candidate generation | implementation hardening complete; final gates pending | Source waves, stable direct-projection workspaces, nested-workspace quarantine, seeded reservoir ordering, and realizable outer/direct width-two boundaries are committed through `94a6323`; `51d2a3c` pins the Phase-8 generation evidence label to that immutable checkpoint. The current post-cleanup full RelWithDebInfo, complete ASAN, focused matrix, and exact 55-test TSan gates pass at `4ef6126`; supplemental sealing, the quiet-host speed cycle, Phase-7 comparison, and paired RSS remain pending |
+| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; final gates pending | Persistent pattern-parallel cache transactions, exact-state reuse, non-vacuous three-accept W1/2/4/8 semantics, crash-durable supplemental tooling, and counter/report contracts pass through `4ef6126`; `0f099ca` adds the passing schema-v3 frozen-oracle characterization producer. The current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`; the production characterization, immutable supplement capture/seal, and accepted-update timing/RSS decision remain pending |
+| 10. Integrate, tune defaults, and prove parity | implementation in progress | Cleanup review and the required in-tree semantic mode/worker matrix pass at `4ef6126`, as do the current post-cleanup full RelWithDebInfo, complete ASAN, and exact 55-test TSan gates. Sealed worker-policy/RSS/wall evidence, supplemental sealing, and the conditional default decision remain pending; any later production or default change reopens all affected test gates |
 
 ### Deadline-overlap scheduling exception
 
@@ -51,16 +51,14 @@ non-performance correctness/counter gates pass, the executor may continue to
 the next phase in plan order even while Phase-0-dependent performance gates
 remain pending.
 
-This overlap, authorized on 2026-07-14, is not phase completion and waives
-nothing: Phase 0 remains `in progress`; a later phase may be marked only
-`implementation in progress` or `implementation complete; acceptance pending
-Phase 0`; frozen Phase-0 inputs and artifacts must not change or be replaced by
-optimized working-tree binaries; all implementation, build, test, and other
-host work stops during calibration and capture; and no phase or final
-performance claim may be accepted until a passing calibration is frozen and
-Phase 0 is prepared, captured, approved, finalized, audited, and sealed. The
-deferred capture uses the already-frozen Phase-0 executables, so later work
-cannot manufacture its own baseline.
+This overlap, authorized on 2026-07-14, did not waive any gate. While capture
+was outstanding, later phases could be marked only as implementation
+checkpoints and frozen Phase-0 inputs could not be replaced by optimized
+working-tree binaries. That deferred work is now complete: Phase 0 was
+prepared, captured, approved, finalized, audited, and sealed from the frozen
+executables. Later phases still require their own canonical, timing, scaling,
+RSS, supplemental-manifest, and final acceptance gates; completion of Phase 0
+does not make any of those gates pass.
 
 ## Objective
 
@@ -298,7 +296,7 @@ Create and freeze a trustworthy benchmark contract and correctness oracle
 before changing product performance code; complete its quiet-host measurement
 and seal before accepting any performance result.
 
-### Current evidence (2026-07-17)
+### Current evidence (sealed 2026-07-22)
 
 The immutable measurement checkpoint remains
 `7ca527b8906d018124756182274335cbff936d72`, with exact subject
@@ -315,27 +313,24 @@ The median paired wrapper/direct ratio is `1.015775988195` and the ratio of
 medians is `1.008541338978`, both below the frozen `1.02` limit; the live guard
 recorded zero forbidden-process matches.
 
-Seven captures are now complete. The five small captures
-`small-dense64-physical`, `small-exact1-physical`,
-`small-primary32k4-physical`, `small-stress128k16-physical`, and
-`small-auto-unpinned` contain 135 canonical rows across 37 repeat stages. The
-physical-core medium captures `medium-dense64-physical` and
-`medium-cache1-physical` add 40 canonical rows across eight repeat stages.
-All seven closed with zero timeouts, for a partial total of 175 canonical rows
-and 45 repeat stages. The two new medium status records and every nested hash
-they reference were revalidated after capture; their live snapshots also bind
-the same frozen revision, binaries, calibration, affinity, and unchanged dirty
-worktree bytes before and after each run.
+All 13 planned captures are complete. The 12 ordinary capture records contain
+267 canonical rows across 60 repeat stages and classify 27 timeouts approved
+by the immutable manifest. The real 20D preflight separately records exact W1
+and W8 ordinary-exit-status-1 refusals with reason
+`high_arity_refinement_refusal`; both have zero signal/core/timeout/RSS-limit
+flags, produce no output artifact, and match approved stderr SHA-256
+`84d2f5dec0140f55f8bd3fcde7d89b2cbf95e7c4ae6437daccbfe4b9fde15e35`.
+These are two expected-infeasible observations, not successful timing rows.
 
-These artifacts are partial capture evidence, not Phase-0 acceptance. The
-remaining exact-one, primary 32/4, stress 128/16, lazy, SMT, and real-preflight
-captures, approvals, finalization, pending audit, seal, and final audit remain
-mandatory. Four earlier dense-medium attempts are archived separately as
-external-interference evidence and do not count as baseline captures. A later
-`medium-exact1-physical` launch was rejected immediately when its guard found
-a restarted external proof-assist build; the helper created no capture
-artifact. No performance gate below may be accepted from the calibration or
-these seven partial captures alone.
+Pending and final audits, both ordinary and real strict smoke runs, and the
+seal completed successfully. The pending and final workload manifests are
+byte-identical. The sealed `workloads.tsv` SHA-256 is
+`32ae82a93cb72a28afaa510391eac83f80f13638d46e1513881d2b484c9dc3ae`;
+the final `phase0-artifacts.tsv` ledger SHA-256 is
+`a33436d78ec6c840427b343615c6b9a7b555a87f989000865873e9c5adeb06bb`.
+Phase 0 is therefore complete as the immutable measurement base. This closes
+no later-phase timing, scaling, RSS, parity, supplemental-manifest, automatic
+policy, or default-selection gate.
 
 ### Actions
 
@@ -449,8 +444,8 @@ these seven partial captures alone.
 Unless a row says otherwise, use one iteration, seed 1, validation on,
 `expand-bounded`, one refinement shape, dense/lazy-off, transient verification,
 conservative commit, the current exact dominance mode, and 12 GiB unified
-memory budget. The generated Phase-0 `commands.sh` is the final authority and
-is SHA-256-manifested.
+memory budget. The generated Phase-0 `commands.phase0.sh` is the final
+authority and is SHA-256-manifested.
 
 | Name | Fixture | Mode | Candidate/exact budget | Purpose |
 |---|---|---|---:|---|
@@ -778,16 +773,14 @@ results ledger.
 
 The immutable measurement checkpoint remains
 `7ca527b8906d018124756182274335cbff936d72` (`Baseline measure`). Its frozen
-runner, oracle, workloads, and binaries are unchanged. The wrapper calibration,
-all five small captures, and the dense/cache physical-core medium captures
-have since completed, but the remaining medium/real-preflight capture,
-finalization, audits, and seal remain deferred under the authorized
-deadline-overlap rule; therefore all Phase-6 performance acceptance remains
-pending. In particular, the frozen
+runner, oracle, workloads, and binaries are unchanged. Its wrapper calibration,
+all 13 captures, approvals, finalization, pending/final audits, and seal have
+now completed, so the sealed base is available. Phase-6 performance acceptance
+nevertheless remains pending. In particular, the later-phase
 medium Top-K-4 scaling gate, real Top-K-16 admission gate, paired W1/W8 RSS
 gate, and frozen-workload repeated-output capture cannot be inferred from the
-passing in-tree functional contracts, benchmark-postprocessor regressions, or
-partial Phase-0 capture.
+passing in-tree functional contracts or benchmark-postprocessor regressions;
+they must be run against the sealed base.
 
 ### Goal
 
@@ -1149,11 +1142,13 @@ not waive the gate: record a minimal diagnostic and report the goal blocked.
 
 ## Strict final performance acceptance
 
-No result in this section is final acceptance evidence until a passing wrapper
-calibration has been frozen by `prepare`, every required Phase-0 capture and
-approval has completed, and `finalize`, pending `audit`, `seal`, and final
-`audit` have all succeeded. Any earlier development run is diagnostic only and
-cannot satisfy a phase exit criterion.
+The Phase-0 prerequisite for this section is satisfied: a passing wrapper
+calibration was frozen by `prepare`, every required capture and approval
+completed, and `finalize`, pending `audit`, `seal`, and final `audit` all
+succeeded. Earlier development runs remain diagnostic only. Each result below
+still has to be produced with the sealed base and pass its own canonical,
+timing, scaling, RSS, supplemental-manifest, and policy criteria before it can
+satisfy a phase exit criterion.
 
 The Phase-0 harness extensions make the following commands executable. They
 must not be replaced with informal `time` invocations.

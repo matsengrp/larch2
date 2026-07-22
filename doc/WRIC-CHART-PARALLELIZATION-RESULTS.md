@@ -4,16 +4,17 @@
 
 This ledger records evidence for
 `doc/WRIC-CHART-PARALLELIZATION-PLAN.md`. It is intentionally incomplete:
-the final Phase-0 semantic oracle and capture contract are frozen and the
-strict workload-manifest harness repair has passed focused and complete
-functional verification. The frozen wrapper calibration now passes, all five
-small captures and the first two physical-core medium captures are complete,
-while the remaining medium/real-preflight captures, finalization, audits, and
-the detached seal remain outstanding. The plan's deadline-overlap rule
-authorizes Phase-1+
-implementation and functional evidence now, but Phase 0 remains open. No
-Phase-1+ timing, scaling, memory, or parity result is acceptance evidence until
-Phase 0 is completely captured, finalized, audited, and sealed.
+Phase 0 is now completely captured, audited, and sealed, while later-phase
+performance and supplemental-manifest gates remain open. The sealed base has
+13 captures: 267 ordinary canonical rows across 60 repeat stages, 27 approved
+timeouts, and two real-fixture W1/W8 expected-infeasible refusal observations.
+The pending and final audits and strict smokes passed. The workload-manifest
+SHA-256 is
+`32ae82a93cb72a28afaa510391eac83f80f13638d46e1513881d2b484c9dc3ae`,
+and the final artifact-ledger SHA-256 is
+`a33436d78ec6c840427b343615c6b9a7b555a87f989000865873e9c5adeb06bb`.
+No Phase-1+ timing, scaling, memory, parity, policy, or default result is
+accepted merely because this prerequisite is complete.
 
 On 2026-07-14 the user authorized a deadline-driven scheduling exception: this
 state may be committed as the Phase-0 measurement checkpoint and later-phase
@@ -21,11 +22,11 @@ implementation may begin before the quiet-host timing campaign. The
 checkpoint is `7ca527b8906d018124756182274335cbff936d72`, with exact subject
 `Baseline measure` and sole parent
 `408434ecfd096af484ecbbd3deeb67511151cd76`; it remains an ancestor of the
-current implementation and documentation checkpoints. It is measurement
-infrastructure, not an accepted timing baseline. Phase 0 stays open, the frozen
-executable/workload identities remain binding, and completion of capture,
-finalization, detached sealing, and final audit is still mandatory before any
-timing-dependent phase exit or Phase-10 acceptance.
+current implementation and documentation checkpoints. The authorization did
+not itself accept a timing baseline; the subsequently completed capture,
+finalization, audit, and seal do. The frozen executable/workload identities
+remain binding, and every timing-dependent later-phase or Phase-10 gate must
+still be run and decided independently against that sealed base.
 
 Raw artifacts belong under `build/wric-chart-parallelization/` and are not
 committed. Phase-0 artifacts use the non-overwriting directory
@@ -33,17 +34,17 @@ committed. Phase-0 artifacts use the non-overwriting directory
 
 | Phase | Evidence status | Result |
 |---|---|---|
-| 0. Repair and freeze measurement | in progress (calibration passed; partial capture) | native/oracle/runner bytes frozen and functional gates independently audited; seven completed capture status records contain 175 canonical rows across 45 repeat stages with zero timeouts, including all five small captures and the dense/cache physical-core medium captures; remaining medium/real-preflight captures, finalization, audits, and seal remain pending |
-| 1. Compile an immutable chart plan | implementation complete; acceptance pending Phase 0 | code checkpoint `208ce23`; focused and full RelWithDebInfo correctness/counter gates pass; canonical baseline and timing gates remain pending |
-| 2. Remove allocations and duplicate work | implementation complete; acceptance pending Phase 0 | code checkpoint `0c4623b`; same-profiler allocation reduction, warmed-zero allocation, frozen semantic/counter, focused/full RelWithDebInfo, and targeted ASAN gates pass; serial timing, exact-small timing, RSS, and sealed canonical comparison remain pending |
-| 3. Add one persistent adaptive scheduler | implementation complete; acceptance pending Phase 0 | code checkpoint `7d294d6`; scheduler contract, canonical worker matrix, full RelWithDebInfo, and targeted TSan gates pass; small-case timing remains pending |
-| 4. Parallelize patterns and local scoring | implementation complete; acceptance pending Phase 0 | code checkpoint `cbf92b6` and evidence checkpoint `1be6ffe`; full RelWithDebInfo and targeted TSan gates pass; sealed scaling/RSS gates pending |
-| 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 0/6 | `bb29300` plus harness fix `3a10e9c` pass post-omission semantics, full CTest, and targeted TSAN; diagnostic exact-phase scaling exceeds 2x; unified frontier/candidate admission and sealed timing/RSS remain pending |
-| 6. Parallelize exact top-K candidates | implementation complete; acceptance pending Phase 0 | code checkpoint `870c298`; in-tree Top-K/worker semantics, stable failures, deterministic scheduling, functional bounded admission, full RelWithDebInfo CTest, and targeted TSan pass; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS remain pending |
-| 7. Make lazy charts scalable and adaptive | implementation complete; acceptance pending Phase 0 | packed deterministic grouping, dependency wavefronts, exact transient admission, and frozen `off|on|auto` policy pass through `38e9a28`; current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`, while production supplements and sealed timing/RSS remain pending |
-| 8. Parallelize and pipeline candidate generation | implementation hardening complete; acceptance pending Phase 0/final gates | source waves, stable direct-projection workspaces, nested-workspace quarantine, seeded reservoir ordering, and realizable outer/direct width-two boundaries are committed through `94a6323`; `51d2a3c` pins production generation evidence to that checkpoint. Current post-cleanup full RelWithDebInfo, complete ASAN, focused matrix, and exact 55-test TSan gates pass at `4ef6126`; supplemental sealing, quiet-host speed, Phase-7 comparison, and paired RSS remain pending |
-| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; acceptance pending Phase 0/final gates | persistent pattern-parallel commits, exact frontier reuse, non-vacuous three-accept W1/2/4/8 evidence, durable supplement publication, and abort-evidence hygiene pass through `4ef6126`; current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`, while capture/seal and timing/RSS remain pending |
-| 10. Integrate, tune defaults, and prove parity | implementation in progress | cleanup review and the complete in-tree required mode/worker matrix pass at `4ef6126`, as do the current post-cleanup full RelWithDebInfo, complete ASAN, and exact 55-test TSan gates. Sealed automatic-policy/RSS/wall gates, Phase-0 and supplemental sealing, and the conditional default decision remain pending; any later production/default change reopens affected final gates |
+| 0. Repair and freeze measurement | complete (audited and sealed) | 13 capture statuses close 267 ordinary canonical rows across 60 repeat stages, 27 approved timeouts, and two real-fixture exact-refusal observations; pending/final audits and strict smokes pass; workload and final-ledger SHA-256 values are `32ae82a93cb72a28afaa510391eac83f80f13638d46e1513881d2b484c9dc3ae` and `a33436d78ec6c840427b343615c6b9a7b555a87f989000865873e9c5adeb06bb` |
+| 1. Compile an immutable chart plan | implementation complete; performance acceptance pending | code checkpoint `208ce23`; focused and full RelWithDebInfo correctness/counter gates pass; the sealed base is available, but canonical comparison and timing gates remain pending |
+| 2. Remove allocations and duplicate work | implementation complete; performance acceptance pending | code checkpoint `0c4623b`; same-profiler allocation reduction, warmed-zero allocation, frozen semantic/counter, focused/full RelWithDebInfo, and targeted ASAN gates pass; serial timing, exact-small timing, RSS, and sealed canonical comparison remain pending |
+| 3. Add one persistent adaptive scheduler | implementation complete; performance acceptance pending | code checkpoint `7d294d6`; scheduler contract, canonical worker matrix, full RelWithDebInfo, and targeted TSan gates pass; small-case timing remains pending |
+| 4. Parallelize patterns and local scoring | implementation complete; performance acceptance pending | code checkpoint `cbf92b6` and evidence checkpoint `1be6ffe`; full RelWithDebInfo and targeted TSan gates pass; sealed scaling/RSS gates pending |
+| 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 6/final gates | `bb29300` plus harness fix `3a10e9c` pass post-omission semantics, full CTest, and targeted TSAN; diagnostic exact-phase scaling exceeds 2x; unified frontier/candidate admission and final timing/RSS remain pending |
+| 6. Parallelize exact top-K candidates | implementation complete; performance acceptance pending | code checkpoint `870c298`; in-tree Top-K/worker semantics, stable failures, deterministic scheduling, functional bounded admission, full RelWithDebInfo CTest, and targeted TSan pass; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS remain pending |
+| 7. Make lazy charts scalable and adaptive | implementation complete; performance acceptance pending | packed deterministic grouping, dependency wavefronts, exact transient admission, and frozen `off|on|auto` policy pass through `38e9a28`; current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`, while production supplements and sealed timing/RSS remain pending |
+| 8. Parallelize and pipeline candidate generation | implementation hardening complete; final gates pending | source waves, stable direct-projection workspaces, nested-workspace quarantine, seeded reservoir ordering, and realizable outer/direct width-two boundaries are committed through `94a6323`; `51d2a3c` pins production generation evidence to that checkpoint. Current post-cleanup full RelWithDebInfo, complete ASAN, focused matrix, and exact 55-test TSan gates pass at `4ef6126`; supplemental sealing, quiet-host speed, Phase-7 comparison, and paired RSS remain pending |
+| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; final gates pending | persistent pattern-parallel commits, exact frontier reuse, non-vacuous three-accept W1/2/4/8 evidence, durable supplement publication, and abort-evidence hygiene pass through `4ef6126`; current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`, while supplemental capture/seal and timing/RSS remain pending |
+| 10. Integrate, tune defaults, and prove parity | implementation in progress | cleanup review and the complete in-tree required mode/worker matrix pass at `4ef6126`, as do the current post-cleanup full RelWithDebInfo, complete ASAN, and exact 55-test TSan gates. Sealed automatic-policy/RSS/wall gates, supplemental sealing, and the conditional default decision remain pending; any later production/default change reopens affected final gates |
 
 ## Phase 0 — immutable provenance
 
@@ -260,9 +261,10 @@ substitute for per-run capture.
 
 ## Phase 0 — fixture checksum inputs
 
-Checksums for all currently available planned fixtures were captured in
-`baseline-408434e/unsealed-sha256-inputs.txt`. That file is an input to the
-future workload manifest; it is not itself the sealed workload manifest.
+Checksums for all planned base fixtures were initially captured in
+`baseline-408434e/unsealed-sha256-inputs.txt`. That historical input list is
+now covered by the sealed workload and artifact manifests; it is not itself
+the authoritative manifest.
 
 | Fixture | SHA-256 |
 |---|---|
@@ -312,12 +314,16 @@ for W1 and
 `27f498987087c3ef91f39db04ae56107bca4adb0abd0c32aeb5abfa3d9c3faf3`
 for W8.
 
-This diagnostic selects the plan's exact `expected_infeasible` branch; it is
-not itself the sealed manifest evidence. The final Phase-0 bootstrap must
-repeat W1 and W8 through the frozen timeout/RSS wrapper, require explicit
-post-capture approval of the exact reason tuple, and include all command,
-process, stderr, no-output, fixture, binary, and approval evidence in the
-detached artifact ledger.
+This diagnostic selected the plan's exact `expected_infeasible` branch. The
+final Phase-0 bootstrap subsequently repeated W1 and W8 through the frozen
+timeout/RSS wrapper and approved both as
+`high_arity_refinement_refusal`. Each sealed observation has ordinary exit
+status 1; zero signal, core, timeout, and RSS-limit flags; no output artifact;
+and the approved stderr SHA-256
+`84d2f5dec0140f55f8bd3fcde7d89b2cbf95e7c4ae6437daccbfe4b9fde15e35`.
+Their capture-status SHA-256 is
+`470a630c48f7d05493f8fc3a21ddb2345bc83958e53554f5f8e713765ccd7f70`.
+They are sealed refusal observations, not successful wall-time measurements.
 
 ## Phase 0 — measurement ledger
 
@@ -351,9 +357,9 @@ instead of two traversals and about eight reads.  The resulting runner binary
 SHA-256 is
 `3dbf846e6aa05b007160d9b8d149a82f8e26c4e8099a4e4fc39fdbc63ab02104`.
 The adversarial 10-repetition lifecycle result above is against these exact
-bytes.  A passing calibration has not yet been recorded; Phase 0 remains open
-until a canonical calibration JSON tied to this runner passes both 2% gates
-and is included in the prepared and final detached artifact closures.
+bytes. At that historical checkpoint no passing calibration had yet been
+recorded; the sealed completion update below supersedes that then-current
+status without altering the diagnostic record.
 
 Two canonical-v3 attempts against these exact bytes were rejected without
 creating a JSON artifact. The directories
@@ -366,7 +372,7 @@ reached `7.859542808287`, a fully paused retry rejected a later direct arm at
 floor, indicating intermittent host competition. Neither attempt is an
 overhead result and the gate has not been relaxed.
 
-#### Passing calibration and partial capture update (2026-07-17)
+#### Passing calibration and sealed capture update (completed 2026-07-22)
 
 The failed diagnostics above remain part of the append-only record, but their
 then-current statement that no passing calibration existed is now superseded.
@@ -381,8 +387,9 @@ unchanged `1.020000000000` limit. The live guard recorded zero forbidden
 process matches; its maximum unselected-SMT activity was 65,518 ppm against
 the frozen 200,000-ppm threshold.
 
-Seven captures have completed under
-`baseline-408434e/bootstrap-phase0/captures/`:
+All 12 ordinary captures have completed under
+`baseline-408434e/bootstrap-phase0/captures/`; their status records are stored
+at `baseline-408434e/bootstrap-phase0/capture-*.status.json`:
 
 | Capture ID | Canonical rows | Repeat stages | Timeouts | Status SHA-256 |
 |---|---:|---:|---:|---|
@@ -393,7 +400,12 @@ Seven captures have completed under
 | `small-auto-unpinned` | 15 | 3 | 0 | `5f7c6a2cd34f2ae658cbbb15ce14074e4b66a906000eb1170eb88f2e451632d4` |
 | `medium-dense64-physical` | 20 | 4 | 0 | `433e236692c884cf278c67c83f51aec22e4157cd80ae54c40a0bd52333907af3` |
 | `medium-cache1-physical` | 20 | 4 | 0 | `da5f4c77f516657160ad684eec3238ba4f63531a740da8fcea75345e5e9d6dcd` |
-| **Total** | **175** | **45** | **0** | — |
+| `medium-exact1-physical` | 4 | 0 | 4 | `9bc0b7fc4385c94a867b19323e905fb0159eb83b7b28e38b2c59593e11385243` |
+| `medium-primary32k4-physical` | 33 | 5 | 8 | `99f82d4dc4db02ede225bc2381c7366659cf0152ff76afeeb358a756f7525fcf` |
+| `medium-stress128k16-physical` | 23 | 5 | 8 | `e2956ed5fa183d1f734be6c75bcd73205b62ce55e5296fc11b9d55727e3d8c2b` |
+| `medium-lazy64-physical` | 20 | 4 | 0 | `56d80b07d6204889b2eb81f1154415cc6cdfa4552b7117503211a20a3a074061` |
+| `medium-primary32k4-smt` | 12 | 1 | 7 | `c2db6d0f982ce80e32e290ac5c66c1740ef7e18fc0f5ad1960b92159f8701e5b` |
+| **Ordinary total** | **267** | **60** | **27** | — |
 
 `medium-dense64-physical` bound W1/2/4/8 to four canonical paired rows
 each and covered 2451.982 seconds between its live pre/post snapshots. Its
@@ -409,8 +421,10 @@ and its persisted no-interference guard log SHA-256 is
 These durations describe capture intervals, not accepted wall-performance
 results.
 
-These rows are valid partial-capture evidence, not an accepted or sealed
-baseline. Four starts of `medium-dense64-physical` were interrupted by
+The 27 timeouts are explicit record-only characterization observations
+authorized by four immutable timeout-approval records. They do not make a
+strict later-phase acceptance run timeout-tolerant. Four earlier starts of
+`medium-dense64-physical` were interrupted by
 unrelated external builds and were moved out of the baseline to
 `phase0-failed-external-interference-20260716T233345Z/`,
 `phase0-failed-external-interference-20260717T010228Z/`, and
@@ -422,11 +436,47 @@ repeat block. All four are contaminated partial attempts and count as neither
 captures nor timing evidence. A subsequent `medium-exact1-physical` launch at
 `2026-07-17T10:18:59+03:00` was stopped immediately by its persisted guard
 when the same external build restarted in the launch race. The helper created
-no capture artifact, so the exact-one destination remains fresh. The rejected
-guard log has SHA-256
+no artifact for that rejected attempt; the later accepted exact-one capture is
+the status row in the table above. The rejected guard log has SHA-256
 `07b7b9ff848c40ed575a3f490581c14ccb7eb4f6d617b4ad5ba2f7560fab79e5`.
-The remaining medium and real-preflight captures, post-capture approvals,
-finalization, pending audits, detached seal, and final audit remain mandatory.
+
+The thirteenth capture is the real 20D exact-one preflight. It records two
+non-timing observations, W1 and W8, both approved as
+`high_arity_refinement_refusal` with the exact exit/no-output contract and
+stderr hash documented above. Thus the complete Phase-0 capture consists of
+267 ordinary canonical rows plus two real-refusal observations, across 13
+capture statuses and 60 repeat stages.
+
+The pending and final ordinary strict smokes and the pending and final real
+strict smokes all exited zero and bind manifest SHA-256
+`32ae82a93cb72a28afaa510391eac83f80f13638d46e1513881d2b484c9dc3ae`.
+Pending audit, seal promotion, and final audit passed. The pending and final
+workload manifests are byte-identical at that hash; the seal transaction names
+`workloads.tsv` and `phase0-artifacts.tsv` as the final manifests. The final
+artifact ledger has SHA-256
+`a33436d78ec6c840427b343615c6b9a7b555a87f989000865873e9c5adeb06bb`.
+Phase 0 is complete as a sealed measurement base. No later-phase performance,
+RSS, scaling, parity, supplemental-manifest, policy, or default gate is closed
+by that fact alone.
+
+### Final sealed-base independent audit
+
+An independent read-only audit reran the frozen helper's final audit and
+returned `strict final-manifest/artifact audit passed`. A complete before/after
+snapshot of path, type, mode, size, nanosecond mtime, and content SHA-256 was
+byte-identical at
+`c97844e8efe65735b320051634e7a3cd41b62b23e636a70810229f6c2dad3432`,
+covering 7,448 files and 332 directories; the audit modified nothing.
+
+The independent closure check verified 89 unique ordered workload rows, all
+13 planned capture statuses, the 267 ordinary rows and two real refusal
+observations, all 60 repeat stages, and exact coverage of the 27 approved
+timeouts by four approval records. It also verified every entry in the
+7,451-row final artifact ledger. The pending-to-final ledger delta is exactly
+67 expected additions, with no removed URI and no changed common hash. The
+final manifest and ledger hashes match the sealed values above, and the
+required manifests, detached seals, transaction, command contract, helper,
+and executable roles have their exact read-only/executable modes.
 
 ### Strict bootstrap and source-binding audit
 
@@ -514,37 +564,35 @@ The frozen native, oracle, and runner hashes and modes remained unchanged.
 
 ### Raw artifact contract
 
-The following final artifact names are reserved but not yet sealed:
+The final Phase-0 artifact set is sealed:
 
 | Artifact | Current state |
 |---|---|
-| `bin/larch2` | frozen and hashed |
-| `bin/dagutil` | corrected semantic oracle frozen and hashed |
-| `workloads.tsv` | schema/reconstruction verified; pending capture completion and seal |
-| `commands.sh` | generator verified; pending one-time prepared bootstrap artifact |
-| raw per-trial TSV | pending |
-| aggregate TSV/report | pending |
-| full canonical sidecars | pending |
-| compact timed semantic digests | pending |
-| final SHA-256 manifest | pending; seal only after all preceding artifacts exist |
+| `bin/larch2` | frozen at SHA-256 `ee160aa4fdecce5660f1bf0737289fc32fd33b1965e660f0ec92072805a4de9b`; ledger-covered |
+| `bin/dagutil` | final oracle frozen at SHA-256 `7ddb1fca7b15d1057912d6775b5e5fb32218390f13b3a10f6622581f21a5a38c`; ledger-covered |
+| `workloads.tsv` | sealed at SHA-256 `32ae82a93cb72a28afaa510391eac83f80f13638d46e1513881d2b484c9dc3ae` |
+| `commands.phase0.sh` | prepared command contract; ledger-covered |
+| raw/aggregate TSVs, reports, and canonical sidecars | captured beneath the 12 ordinary capture directories; ledger-covered |
+| real preflight evidence and approval | W1/W8 exact refusal statuses and approval; ledger-covered |
+| `phase0-artifacts.tsv` | final ledger sealed at SHA-256 `a33436d78ec6c840427b343615c6b9a7b555a87f989000865873e9c5adeb06bb` |
 
 No existing artifact in this directory may be overwritten once the final
 Phase-0 SHA-256 manifest is sealed.
 
 ### Named microbenchmarks
 
-`pending` means no run has been claimed. A timeout will be recorded only as an
-explicit manifest-declared result row, never as a blank cell.
+An ordinary timeout below is an explicit manifest-approved characterization
+row, never a blank or imputed result. Later supplements remain separate.
 
 | Benchmark | Frozen mode/budget from plan | Workers required | Phase-0 result |
 |---|---|---|---|
-| `dense-local-small-64` | `grammar_lower_bound`, 64/0 | matrix | pending |
-| `dense-local-medium-64` | `grammar_lower_bound`, 64/0 | matrix | pending |
-| `cache-medium` | `grammar_lower_bound`, 1/0 | matrix | pending |
-| `exact-small-one` | `grammar_exact`, 1/1 | matrix | pending |
-| `exact-medium-one` | `grammar_exact`, 1/1, 600 s | 1 and 8 required | pending |
-| `exact-medium-topk4` | `grammar_exact`, 32/4 | matrix | pending |
-| `lazy-compression-medium` | `grammar_lower_bound`, 64/0, forced lazy | matrix | pending |
+| `dense-local-small-64` | `grammar_lower_bound`, 64/0 | matrix | captured in `small-dense64-physical` |
+| `dense-local-medium-64` | `grammar_lower_bound`, 64/0 | matrix | captured in `medium-dense64-physical` |
+| `cache-medium` | `grammar_lower_bound`, 1/0 | matrix | captured in `medium-cache1-physical` |
+| `exact-small-one` | `grammar_exact`, 1/1 | matrix | captured in `small-exact1-physical` |
+| `exact-medium-one` | `grammar_exact`, 1/1, 600 s | 1 and 8 required | four approved timeout rows captured in `medium-exact1-physical` |
+| `exact-medium-topk4` | `grammar_exact`, 32/4 | matrix | captured in physical-core and SMT primary captures, with approved timeout rows |
+| `lazy-compression-medium` | `grammar_lower_bound`, 64/0, forced lazy | matrix | captured in `medium-lazy64-physical` |
 | `sampled-generation-high` | `sampled_tree_fixed`, at least 256/1 | later supplement | fixture pending |
 | `local-commit-three` | `grammar_exact`, 32/4, 3 iterations, local commit | later supplement | fixture pending |
 
@@ -574,13 +622,13 @@ imputed row. Its in-process canonical capture is known to add reporting
 overhead, so the final corrected capture uses a capture-off timed process and
 a separate correctness companion.
 
-### Primary and stress comparisons
+### Primary and stress baseline availability
 
 | Contract | Native rows | Chart rows | Canonical parity | Wall result | RSS result |
 |---|---|---|---|---|---|
-| medium primary, native 50 vs chart 32/4 | pending | pending | pending | pending | pending |
-| medium stress, native 50 vs chart 128/16 | pending | pending | pending | pending | pending |
-| bounded real-scale confirmation | pending preflight | pending preflight | pending | pending | pending |
+| medium primary, native 50 vs chart 32/4 | captured | captured, including approved timeout observations | sealed for completed ordinary trials | optimized comparison pending | optimized comparison pending |
+| medium stress, native 50 vs chart 128/16 | captured | captured, including approved timeout observations | sealed for completed ordinary trials | optimized comparison pending | optimized comparison pending |
+| bounded real-scale confirmation | not applicable to refusal branch | W1/W8 `expected_infeasible` refusal observations sealed | exact refusal identity sealed | no successful timing row | no successful timing row |
 
 The primary acceptance summary will report all five paired trials, alternating
 execution order, each paired chart/native ratio, both medians, and the
@@ -619,20 +667,28 @@ worker-scaling ratio. Medians alone cannot hide a paired-ratio failure.
   unpinned small capture adds 15 rows across three stages with zero timeouts.
 - [x] The dense64 and cache1 physical-core medium captures contain 40 canonical
   rows across eight W1/2/4/8 repeat stages with zero timeouts.
-- [ ] Native and exact-chart medium 32/4 and 128/16 rows are captured.
-- [ ] Every remaining medium and real-preflight row is captured without
+- [x] Native and exact-chart medium 32/4 and 128/16 rows are captured, with
+  every manifest-approved timeout recorded explicitly.
+- [x] Every remaining medium and real-preflight row is captured without
   external interference.
 - [x] Instrumented `dagutil` is frozen; exact native/oracle mismatch rejection
   is covered by the harness regression and runner mismatch rejection by the
   bootstrap regression.
-- [ ] The final sealed manifest/harness audit re-verifies both executable hashes.
-- [ ] `commands.sh`, reports, TSVs, sidecars, fixtures, and executables are
-  covered by the final SHA-256 manifest.
+- [x] The pending/final manifest and harness audits re-verify the frozen
+  executable hashes, and all four strict ordinary/real smokes exit zero.
+- [x] `commands.phase0.sh`, reports, TSVs, sidecars, fixtures, and executables
+  are covered by final artifact ledger SHA-256
+  `a33436d78ec6c840427b343615c6b9a7b555a87f989000865873e9c5adeb06bb`.
 - [x] All pre-existing and new Phase-0 tests pass (155/155, with two expected
   diagnostic skips and zero failures).
 - [x] Frozen Phase-0 capture inputs and artifacts contain no product
   performance optimization; deadline-overlap Phase-1+ working-tree changes are
   segregated and excluded from every Phase-0 executable role.
+
+**Phase-0 decision:** pass. The base workload manifest is sealed at SHA-256
+`32ae82a93cb72a28afaa510391eac83f80f13638d46e1513881d2b484c9dc3ae`.
+This decision establishes the immutable comparison base only; it is not a
+decision on any later-phase performance gate.
 
 ## Phase 1 — immutable chart execution plan
 
@@ -726,12 +782,13 @@ their established skip status. The copied full `LastTest.log` SHA-256 is
 |---|---|
 | Zero candidate-by-pattern full validation and clade sorting | pass, mechanically asserted |
 | Targeted and full RelWithDebInfo CTest | pass |
-| Canonical semantic equality to sealed Phase 0 | pending Phase-0 capture/seal; in-tree independent semantic oracles pass |
-| Medium one-worker local-score target and <=5% chart-phase regressions | pending Phase-0 capture/seal |
+| Canonical semantic equality to sealed Phase 0 | sealed base available; comparison run pending; in-tree independent semantic oracles pass |
+| Medium one-worker local-score target and <=5% chart-phase regressions | sealed base available; timing run pending |
 
-Phase 1 is therefore **implementation complete; acceptance pending Phase 0**.
-No timing, scaling, RSS, or final parity claim is made from the deadline-overlap
-worktree.
+Phase 1 is therefore **implementation complete; performance acceptance
+pending**. No timing, scaling, RSS, or final parity claim is made from the
+deadline-overlap worktree; the sealed comparison base is now available for
+the outstanding runs.
 
 ## Phase 2 — first allocation/reuse checkpoint
 
@@ -1065,15 +1122,16 @@ There were no address or leak diagnostics.
 |---|---|
 | At least 80% fewer scoped allocations per 1,000 candidates | pass: 99.941257540% same-profiler reduction; warmed result is zero |
 | One unchanged active-pattern inside build per committed state | pass: disjoint build/reuse counters and one-owner assertions cover all-active, lazy, and pattern-batch modes |
-| Medium one-worker local scoring at least 30% faster than Phase 0 and no more than 5% slower than Phase 1 | pending sealed Phase-0 capture |
-| Small one-candidate exact at least 25% faster than Phase 1 | pending sealed Phase-0 capture |
-| Peak RSS no more than 25% above every reference | pending sealed Phase-0 capture; per-worker resident descriptor ownership is mechanically bounded |
-| Canonical output | in-tree frozen tuple/digest and byte-identical profiled output pass; final sealed Phase-0 comparison pending |
+| Medium one-worker local scoring at least 30% faster than Phase 0 and no more than 5% slower than Phase 1 | sealed base available; timing run pending |
+| Small one-candidate exact at least 25% faster than Phase 1 | sealed base available; timing run pending |
+| Peak RSS no more than 25% above every reference | sealed base available; paired RSS run pending; per-worker resident descriptor ownership is mechanically bounded |
+| Canonical output | in-tree frozen tuple/digest and byte-identical profiled output pass; sealed-base comparison run pending |
 | Full CTest and targeted ASAN | pass |
 
-Phase 2 is therefore **implementation complete; acceptance pending Phase 0**
-under the deadline-overlap rule. No busy-host wall time or RSS observation in
-this section is acceptance evidence.
+Phase 2 is therefore **implementation complete; performance acceptance
+pending**. No busy-host wall time or RSS observation in this section is
+acceptance evidence; the sealed comparison base is now available for the
+outstanding runs.
 
 ## Phase 3 — persistent adaptive chart scheduler
 
@@ -1150,13 +1208,14 @@ There were no TSan race reports.
 | Explicit W1 matches the Phase-2 canonical oracle | pass; direct and CLI worker matrices are byte-identical |
 | Empty/small/repeated/exception/cancellation coverage | pass |
 | All submitted work joined; zero pending/live work at shutdown | pass |
-| Small 64-candidate W8 no more than 5% slower than W1 | pending sealed Phase-0 capture |
+| Small 64-candidate W8 no more than 5% slower than W1 | sealed base available; timing run pending |
 | Non-vacuous parallel execution above threshold | pass |
 | Targeted TSan and full CTest | pass: 52/52 and 159/159 |
 
-Phase 3 is therefore **implementation complete; acceptance pending Phase 0**
-under the deadline-overlap rule. No busy-host timing observation is accepted
-as evidence for the outstanding small-case wall-time gate.
+Phase 3 is therefore **implementation complete; performance acceptance
+pending**. No busy-host timing observation is accepted as evidence for the
+outstanding small-case wall-time gate; the sealed comparison base is now
+available for that run.
 
 ## Phase 4 — pattern construction and local scoring
 
@@ -1253,16 +1312,16 @@ acceptance evidence.
 
 | Phase-4 exit criterion | Decision |
 |---|---|
-| W1/W2/W4/W8 canonical matrix for seeds 1, 7, and 19 across dense, fixed-topology, and grammar-exact modes | pending sealed Phase-0 capture; in-tree serial/parallel oracle, W1/W4 pattern-axis, W1/W8 multi-accept, and CLI identity tests pass |
-| Medium 64-candidate local W8/W1 at most 0.50 and Phase-4 W1/Phase-3 W1 at most 1.05 | pending sealed Phase-0 capture |
-| Medium construction W8/W1 at most 0.50 | pending sealed Phase-0 capture |
-| Local and construction W8/W4 at most 1.10; CPU contention investigated above 0.25 | pending sealed Phase-0 capture; strict postprocessor and boundary tests pass |
-| W8 peak RSS within the global final bound | pending sealed Phase-0 capture; fail-closed admission and postprocessor gates pass |
+| W1/W2/W4/W8 canonical matrix for seeds 1, 7, and 19 across dense, fixed-topology, and grammar-exact modes | sealed base available; capture run pending; in-tree serial/parallel oracle, W1/W4 pattern-axis, W1/W8 multi-accept, and CLI identity tests pass |
+| Medium 64-candidate local W8/W1 at most 0.50 and Phase-4 W1/Phase-3 W1 at most 1.05 | sealed base available; timing run pending |
+| Medium construction W8/W1 at most 0.50 | sealed base available; timing run pending |
+| Local and construction W8/W4 at most 1.10; CPU contention investigated above 0.25 | sealed base available; timing run pending; strict postprocessor and boundary tests pass |
+| W8 peak RSS within the global final bound | sealed base available; paired RSS run pending; fail-closed admission and postprocessor gates pass |
 | Full CTest and targeted TSan | pass |
 
-Phase 4 is therefore **implementation complete; acceptance pending Phase 0**.
-No timing or RSS value in this section satisfies an outstanding performance
-gate.
+Phase 4 is therefore **implementation complete; performance acceptance
+pending**. No timing or RSS value in this section satisfies an outstanding
+performance gate; the sealed comparison base is now available for those runs.
 
 ## Phase 5 profile-guided checkpoint (diagnostic, acceptance pending Phase 0)
 
@@ -1415,15 +1474,15 @@ These timing/RSS observations are diagnostic only until Phase 0 is calibrated,
 captured, finalized, audited, and sealed.
 
 Phase 5 therefore has a **functionally passing implementation checkpoint**,
-but is not accepted. Phase 6 must first close the global bounded-memory
-invariant by releasing score-pass frontiers before exact-mask recovery and by
-admitting candidate/frontier scratch under the unified budget. Phase 0 must
-then supply sealed timeout, scaling, and RSS evidence. Under the authorized
-deadline-overlap rule, implementation proceeds to Phase 6 now.
+but is not accepted. At this checkpoint Phase 6 still had to close the global
+bounded-memory invariant, and Phase 0 still had to supply sealed timeout,
+scaling, and RSS evidence. Phase 6 has since implemented that invariant and
+the Phase-0 base is now sealed; the final timing and RSS decisions remain
+pending.
 
 ## Phase 6 implementation checkpoint (unsealed)
 
-Phase 6 is **implementation complete; acceptance pending Phase 0** at
+Phase 6 is **implementation complete; performance acceptance pending** at
 `870c298ff1c0c21901bdf79d341bf97d121f389c` (tree
 `e98984f4f587546e5ef19ba08e2f1b1a4e8ce6b1`). The immutable measurement
 checkpoint remains `7ca527b8906d018124756182274335cbff936d72`
@@ -1493,16 +1552,16 @@ and reference sequence
 
 | Phase-6 exit criterion | Decision |
 |---|---|
-| Top-K `1,4,16` exact semantics and stable exceptions at W1/W2/W4/W8 | pass in the independent in-tree matrix; final frozen-workload capture remains a Phase-0-dependent final gate |
-| Medium Top-K-4 W8 `exact_verification_ms` at least 2.0x faster than same-revision W1 | pending sealed Phase-0 workload capture |
-| Real Top-K-16 stays within configured concurrent-memory admission bound | pending sealed real-workload run; synthetic/fixture admission, splitting, rejection, and estimator-backstop contracts pass |
-| W8 peak RSS no more than 2.0x W1 | pending paired sealed Phase-0 run |
+| Top-K `1,4,16` exact semantics and stable exceptions at W1/W2/W4/W8 | pass in the independent in-tree matrix; sealed frozen-workload capture run remains pending |
+| Medium Top-K-4 W8 `exact_verification_ms` at least 2.0x faster than same-revision W1 | sealed base available; timing run pending |
+| Real Top-K-16 stays within configured concurrent-memory admission bound | sealed real-workload contract available; bounded confirmation pending; synthetic/fixture admission, splitting, rejection, and estimator-backstop contracts pass |
+| W8 peak RSS no more than 2.0x W1 | sealed base available; paired RSS run pending |
 | Repeated W8 results byte-identical | pass in-tree for digest and full canonical sidecar; frozen-workload repetition remains pending |
 | Exact-search TSan and full CTest | pass at the code checkpoint; exact hashes are retained in the artifact manifest |
 
 Quiet-host Phase-0 calibration, capture, finalization, audit, and detached seal
-remain deferred under the authorized deadline-overlap rule. No same-revision
-diagnostic, unit fixture, or postprocessor regression is substituted for those
+have since completed. No same-revision diagnostic, unit fixture, or
+postprocessor regression is substituted for the still-pending Phase-6
 performance gates.
 
 ## Phase 7 packed-grouping checkpoint (unsealed; implementation in progress)
@@ -1592,7 +1651,7 @@ and all deferred Phase-0-dependent measurements remain pending.
 
 ### Phase-7 implementation checkpoint
 
-Phase 7 is **implementation complete; acceptance pending Phase 0** at
+Phase 7 is **implementation complete; performance acceptance pending** at
 `38e9a281396e5263647ba68724414848841525d7` (`Select lazy chart policy
 automatically`). The immutable measurement checkpoint remains
 `7ca527b8906d018124756182274335cbff936d72` (`Baseline measure`) and is an
@@ -1663,8 +1722,8 @@ for those gates.
 
 ## Phase 8 implementation checkpoint (unsealed)
 
-Phase 8 has a **functionally passing implementation checkpoint; acceptance
-pending Phase 0 and the remaining performance gates** at
+Phase 8 has a **functionally passing implementation checkpoint; final
+performance acceptance pending** at
 `6c8d0c7651c2aa2e5c396d0f57c2e4e18c322310` (`Make finite pipeline
 admission test scheduler-invariant`, tree
 `8773b0a742f0a7ddca7909f8a9bf616dcbb1a9e7`). The immutable measurement
@@ -1854,7 +1913,7 @@ and
 
 This focused evidence is not a Phase-8 exit decision. The Phase-8 supplemental
 capture/seal, quiet-host 2x generation cycle, Phase-7 end-to-end comparison,
-paired RSS gate, and every still-open Phase-0 gate remain pending.
+and paired RSS gate remain pending; the Phase-0 prerequisite is now sealed.
 
 ### Latest complete pre-cleanup correctness and sanitizer closure (`51d2a3c`)
 
@@ -2051,8 +2110,8 @@ gate. Any later production/default change reopens every affected test gate.
 ## Phase 9 accepted-state update checkpoint (unsealed)
 
 Phase 9 has a **functionally passing implementation checkpoint; acceptance
-pending Phase 0, supplement sealing, the accepted-update timing decision,
-and the RSS gates** at `19e26db`
+pending supplement sealing, the accepted-update timing decision, and the RSS
+gates** at `19e26db`
 (`Clear aborted accept transaction evidence`). The immutable measurement
 checkpoint remains `7ca527b8906d018124756182274335cbff936d72`, whose exact
 subject is `Baseline measure`; it is an ancestor of this checkpoint and has
@@ -2153,9 +2212,9 @@ Phase 9 characterization`),
 `3359fbf359576c48cc0de88ded0319b549f2c310` (`Complete Phase 7
 workload matrix`), and `c5156a84c67acce2e40d2a3c3115d89738f40cd4`
 (`Register Phase 7 completion bootstrap test`) are **evidence-production and
-tooling checkpoints only**. They do not contain a production Phase-0 capture,
-a production supplemental manifest, or timing/RSS acceptance evidence. Phase
-0 and every Phase-0-dependent performance gate remain open.
+tooling checkpoints only**. They do not contain a production supplemental
+manifest or timing/RSS acceptance evidence. The production Phase-0 base was
+subsequently sealed; every later-phase performance gate remains open.
 
 ### Phase-9 characterization producer
 
@@ -2374,8 +2433,8 @@ The Phase-7 completion supplement must use exact `$E/phase7` as its fixture
 source at revision `38e9a28`, because its lazy fixtures are absent from the
 frozen Phase-0 root. The old diagnostic Phase-8 roots at `6c8d0c7` and
 `a21ab7a` must not be used for `phase8-generation`; the selected product is the
-`94a6323` root above. Phase 0, supplements, timing, RSS, scaling, parity, and
-all acceptance decisions are unchanged and remain open.
+`94a6323` root above. Phase 0 has since been sealed; supplements, timing, RSS,
+scaling, parity, and all later-phase acceptance decisions remain open.
 
 ## Phase 10 integration checkpoint (in progress)
 
@@ -2425,10 +2484,10 @@ the post-cleanup closure section above.
 
 These commits are correctness and observability checkpoints, not Phase-10
 acceptance. This closes only the cleanup review, in-tree functional
-mode/worker matrix, and current post-cleanup normal/sanitizer gates. Sealed
-Phase-0 and supplemental manifests, worker-policy selection, RSS bounds,
-primary 32/4 wall parity, W8/W1 2x speedup, unpinned explicit-auto, seedtree
-128/16 stress, and bounded real-scale confirmations remain pending. The
+mode/worker matrix, and current post-cleanup normal/sanitizer gates. The
+Phase-0 manifest is sealed; supplemental manifests, worker-policy selection,
+RSS bounds, primary 32/4 wall parity, W8/W1 2x speedup, unpinned explicit-auto,
+seedtree 128/16 stress, and bounded real-scale confirmations remain pending. The
 product default stays serial until explicit auto passes every prerequisite;
 no default-worker performance claim has been made. Any later production or
 conditional default change requires every affected normal and sanitizer gate
