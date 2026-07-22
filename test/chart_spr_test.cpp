@@ -9,6 +9,7 @@
 #include <future>
 #include <latch>
 #include <limits>
+#include <locale>
 #include <mutex>
 #include <optional>
 #include <print>
@@ -344,8 +345,8 @@ static void check_optional_source_move_equal(
   CHECK(lhs->score_change == rhs->score_change);
 }
 
-static void check_candidate_payload_equal(
-    larch::clade_grammar const& base, larch::grammar_spr_candidate const& lhs,
+static void check_candidate_projection_fields_equal(
+    larch::grammar_spr_candidate const& lhs,
     larch::grammar_spr_candidate const& rhs) {
   CHECK(lhs.moved_clade == rhs.moved_clade);
   CHECK(lhs.old_parent == rhs.old_parent);
@@ -363,6 +364,12 @@ static void check_candidate_payload_equal(
         rhs.source_before_topology_productions);
   CHECK(lhs.source_after_topology_productions ==
         rhs.source_after_topology_productions);
+}
+
+static void check_candidate_payload_equal(
+    larch::clade_grammar const& base, larch::grammar_spr_candidate const& lhs,
+    larch::grammar_spr_candidate const& rhs) {
+  check_candidate_projection_fields_equal(lhs, rhs);
   CHECK(larch::chart_spr_candidate_taxon_signature(base, lhs) ==
         larch::chart_spr_candidate_taxon_signature(base, rhs));
   CHECK(larch::chart_spr_candidate_sample_signature(base, lhs) ==
@@ -615,6 +622,276 @@ static larch::grammar_spr_candidate cross_candidate(
   return candidate;
 }
 
+static void test_phase8_binary_taxon_dedup_key_matches_legacy() {
+  std::println("test_phase8_binary_taxon_dedup_key_matches_legacy");
+
+  std::vector<larch::phylo_dag> source_trees;
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree()));
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_cross_tree()));
+  auto dag = larch::test::merge_tiny_trees(std::move(source_trees));
+  auto grammar = larch::build_clade_grammar(dag);
+
+  std::size_t generated_checked = 0;
+  std::vector<std::pair<std::string, std::string>> generated_keys;
+  CHECK(std::locale{} == std::locale::classic());
+  for (auto source : {larch::chart_spr_candidate_source::grammar,
+                      larch::chart_spr_candidate_source::sampled_tree,
+                      larch::chart_spr_candidate_source::hybrid}) {
+    for (auto seed : {std::uint32_t{1}, std::uint32_t{7},
+                      std::uint32_t{19}}) {
+      larch::grammar_spr_enumeration_options options;
+      options.source = source;
+      options.sampled_tree_source_dag = &dag;
+      options.sampled_tree_count = 1;
+      options.sampled_tree_spr_radius = 8;
+      options.sampled_tree_score_threshold =
+          std::numeric_limits<int>::max();
+      options.randomize_order = true;
+      options.seed = seed;
+      options.max_candidates = 12;
+      options.max_candidates_is_post_dedup = true;
+
+      auto candidates = collect_candidates(grammar, options);
+      CHECK(!candidates.empty());
+      for (auto const& candidate : candidates) {
+        auto const legacy =
+            larch::chart_spr_candidate_taxon_signature(grammar, candidate);
+        auto const binary = larch::chart_spr_detail::
+            chart_spr_candidate_taxon_dedup_key(grammar, candidate);
+        CHECK(!binary.empty());
+        CHECK(binary.front() == '\0');
+        generated_keys.emplace_back(legacy, binary);
+        ++generated_checked;
+      }
+    }
+  }
+  CHECK(generated_checked > 0);
+  for (auto const& lhs : generated_keys) {
+    for (auto const& rhs : generated_keys) {
+      CHECK((lhs.first == rhs.first) == (lhs.second == rhs.second));
+    }
+  }
+
+  auto check_binary_equality_equivalence =
+      [&](auto const& lhs, auto const& rhs) {
+        auto const legacy_equal =
+            larch::chart_spr_candidate_taxon_signature(grammar, lhs) ==
+            larch::chart_spr_candidate_taxon_signature(grammar, rhs);
+        auto const binary_equal =
+            larch::chart_spr_detail::chart_spr_candidate_taxon_dedup_key(
+                grammar, lhs) ==
+            larch::chart_spr_detail::chart_spr_candidate_taxon_dedup_key(
+                grammar, rhs);
+        CHECK(binary_equal == legacy_equal);
+        return legacy_equal;
+      };
+
+  // Exercise decimal-width boundaries and ordering domains explicitly.  The
+  // temp-ref order differs from numeric child-taxa order, and bytewise whole-
+  // production ordering puts the signature beginning with "{10," before the
+  // one beginning with "{9,".
+  auto const max_taxon = std::numeric_limits<larch::taxon_id>::max();
+  larch::grammar_spr_candidate edge_ids;
+  edge_ids.added_clades = {
+      larch::clade_key{{10}},
+      larch::clade_key{{9}},
+      larch::clade_key{{max_taxon}},
+      larch::clade_key{{0, 9, 10, max_taxon}},
+  };
+  edge_ids.moved_clade = larch::temp_clade_ref(2);
+  edge_ids.old_parent = larch::temp_clade_ref(0);
+  edge_ids.old_sibling = larch::temp_clade_ref(1);
+  edge_ids.new_sibling_or_target = larch::temp_clade_ref(3);
+  edge_ids.added_productions.push_back(temp_prod(
+      larch::temp_clade_ref(1),
+      {larch::temp_clade_ref(0), larch::temp_clade_ref(2)}));
+  edge_ids.added_productions.push_back(temp_prod(
+      larch::temp_clade_ref(0),
+      {larch::temp_clade_ref(2), larch::temp_clade_ref(1)}));
+
+  auto const expected_edge_signature =
+      std::string{"m={4294967295,};op={10,};os={9,};"
+                  "nt={0,9,10,4294967295,};"
+                  "clades={0,9,10,4294967295,}{9,}{10,}{4294967295,};"
+                  "rm=;add={10,}->{9,}{4294967295,};"
+                  "{9,}->{10,}{4294967295,};"};
+  CHECK(larch::chart_spr_candidate_taxon_signature(grammar, edge_ids) ==
+        expected_edge_signature);
+  CHECK(check_binary_equality_equivalence(edge_ids, edge_ids));
+
+  auto unnormalized = edge_ids;
+  unnormalized.added_clades[3].taxa = {max_taxon, 10, 9, 10, 0};
+  CHECK(larch::chart_spr_candidate_taxon_signature(grammar, unnormalized) ==
+        expected_edge_signature);
+  CHECK(check_binary_equality_equivalence(edge_ids, unnormalized));
+
+  // Normalization applies inside optional refs and production parent/child
+  // keys as well as the standalone added-clade multiset.
+  auto malformed_production_taxa = edge_ids;
+  malformed_production_taxa.added_clades[0].taxa = {10, 10};
+  malformed_production_taxa.added_clades[1].taxa = {9, 9};
+  malformed_production_taxa.added_clades[2].taxa = {max_taxon, max_taxon};
+  CHECK(larch::chart_spr_candidate_taxon_signature(
+            grammar, malformed_production_taxa) == expected_edge_signature);
+  CHECK(check_binary_equality_equivalence(edge_ids,
+                                          malformed_production_taxa));
+
+  // Added clades, child refs, and productions are multisets in the legacy
+  // identity. Their stored order is irrelevant, but duplicate elements remain
+  // significant. Keep the decimal 9/10 edge in this permutation matrix so a
+  // binary implementation cannot accidentally substitute string ordering for
+  // numeric child-taxa ordering.
+  auto permuted = edge_ids;
+  std::reverse(permuted.added_productions.begin(),
+               permuted.added_productions.end());
+  for (auto& production : permuted.added_productions) {
+    std::reverse(production.children.begin(), production.children.end());
+  }
+  CHECK(check_binary_equality_equivalence(edge_ids, permuted));
+
+  larch::grammar_spr_candidate clade_multiset;
+  clade_multiset.added_clades = {
+      larch::clade_key{{10}}, larch::clade_key{{9}},
+      larch::clade_key{{max_taxon}}};
+  auto clade_multiset_permuted = clade_multiset;
+  std::reverse(clade_multiset_permuted.added_clades.begin(),
+               clade_multiset_permuted.added_clades.end());
+  CHECK(check_binary_equality_equivalence(clade_multiset,
+                                          clade_multiset_permuted));
+  auto duplicate_clade = clade_multiset;
+  duplicate_clade.added_clades.push_back(duplicate_clade.added_clades.front());
+  CHECK(!check_binary_equality_equivalence(clade_multiset, duplicate_clade));
+
+  auto duplicate_production = edge_ids;
+  duplicate_production.added_productions.push_back(
+      duplicate_production.added_productions.front());
+  CHECK(!check_binary_equality_equivalence(edge_ids, duplicate_production));
+  auto duplicate_child = edge_ids;
+  duplicate_child.added_productions.front().children.push_back(
+      duplicate_child.added_productions.front().children.front());
+  CHECK(!check_binary_equality_equivalence(edge_ids, duplicate_child));
+
+  auto swapped_optional_fields = edge_ids;
+  std::swap(swapped_optional_fields.moved_clade,
+            swapped_optional_fields.old_parent);
+  CHECK(!check_binary_equality_equivalence(edge_ids,
+                                           swapped_optional_fields));
+
+  // The text key intentionally makes a missing optional ref equivalent to a
+  // valid ref whose normalized taxa are empty. Preserve even this unusual
+  // malformed-candidate equivalence.
+  larch::grammar_spr_candidate empty_optional;
+  empty_optional.added_clades.push_back(larch::clade_key{{}});
+  auto explicit_empty_optional = empty_optional;
+  explicit_empty_optional.moved_clade = larch::temp_clade_ref(0);
+  CHECK(check_binary_equality_equivalence(empty_optional,
+                                          explicit_empty_optional));
+
+  CHECK(grammar.productions.size() >= 2);
+  auto removed_forward = edge_ids;
+  removed_forward.removed_productions = {
+      larch::base_production_ref(0), larch::base_production_ref(1)};
+  auto removed_reverse = removed_forward;
+  std::reverse(removed_reverse.removed_productions.begin(),
+               removed_reverse.removed_productions.end());
+  auto const sorted_removed_signature =
+      larch::chart_spr_candidate_taxon_signature(grammar, removed_forward);
+  CHECK(larch::chart_spr_candidate_taxon_signature(grammar, removed_reverse) ==
+        sorted_removed_signature);
+  CHECK(check_binary_equality_equivalence(removed_forward, removed_reverse));
+  auto duplicate_removed = removed_forward;
+  duplicate_removed.removed_productions.push_back(
+      duplicate_removed.removed_productions.front());
+  CHECK(!check_binary_equality_equivalence(removed_forward,
+                                           duplicate_removed));
+
+  // The legacy ostream formatter inherits the process-global locale. Binary
+  // dedup serialization must therefore fall back when a custom numeric facet
+  // makes that locale observable, rather than changing W>1 dedup identities.
+  struct grouped_taxon_ids : std::numpunct<char> {
+   protected:
+    char do_thousands_sep() const override { return '_'; }
+    std::string do_grouping() const override { return "\3"; }
+  };
+  struct restore_global_locale {
+    std::locale previous;
+    ~restore_global_locale() { std::locale::global(previous); }
+  };
+  {
+    restore_global_locale restore{std::locale{}};
+    std::locale::global(
+        std::locale{std::locale::classic(), new grouped_taxon_ids});
+    auto const localized_legacy =
+        larch::chart_spr_candidate_taxon_signature(grammar, edge_ids);
+    CHECK(localized_legacy.find('_') != std::string::npos);
+    CHECK(larch::chart_spr_detail::chart_spr_candidate_taxon_dedup_key(
+              grammar, edge_ids) == localized_legacy);
+  }
+
+  auto exception_message = [](auto&& serialize) -> std::string {
+    try {
+      (void)serialize();
+    } catch (std::runtime_error const& error) {
+      return error.what();
+    }
+    CHECK(false && "signature serializer did not reject invalid candidate");
+    return {};
+  };
+  auto check_matching_exception = [&](auto const& invalid) {
+    auto const binary_message = exception_message([&] {
+      return larch::chart_spr_detail::chart_spr_candidate_taxon_dedup_key(
+          grammar, invalid);
+    });
+    auto const legacy_message = exception_message([&] {
+      return larch::chart_spr_candidate_taxon_signature(grammar, invalid);
+    });
+    CHECK(!legacy_message.empty());
+    CHECK(binary_message == legacy_message);
+  };
+
+  auto invalid_ref = edge_ids;
+  invalid_ref.moved_clade = larch::temp_clade_ref(
+      static_cast<larch::clade_id>(invalid_ref.added_clades.size()));
+  check_matching_exception(invalid_ref);
+
+  invalid_ref = edge_ids;
+  invalid_ref.moved_clade = larch::base_clade_ref(
+      static_cast<larch::clade_id>(grammar.clades.size()));
+  check_matching_exception(invalid_ref);
+
+  auto invalid_removed = edge_ids;
+  invalid_removed.removed_productions.push_back(
+      larch::temp_production_ref(0));
+  check_matching_exception(invalid_removed);
+
+  invalid_removed = edge_ids;
+  invalid_removed.removed_productions.push_back(
+      larch::base_production_ref(
+          static_cast<larch::production_id>(grammar.productions.size())));
+  check_matching_exception(invalid_removed);
+
+  auto invalid_added = edge_ids;
+  invalid_added.added_productions.front().children = {
+      larch::temp_clade_ref(
+          static_cast<larch::clade_id>(invalid_added.added_clades.size())),
+      larch::base_clade_ref(
+          static_cast<larch::clade_id>(grammar.clades.size()))};
+  invalid_added.added_productions.front().parent = larch::base_clade_ref(
+      static_cast<larch::clade_id>(grammar.clades.size()));
+  // With multiple invalid refs the first child must still win, before either
+  // a later child or the parent is inspected.
+  check_matching_exception(invalid_added);
+
+  invalid_added = edge_ids;
+  invalid_added.added_productions.front().parent = larch::temp_clade_ref(
+      static_cast<larch::clade_id>(invalid_added.added_clades.size()));
+  check_matching_exception(invalid_added);
+
+  std::println("  PASS");
+}
+
 static void test_overlay_temp_clades_and_single_site_score() {
   std::println("test_overlay_temp_clades_and_single_site_score");
 
@@ -828,6 +1105,8 @@ static void check_prepared_projection_fixture(std::string const& label,
   std::size_t projected_count = 0;
   std::size_t direct_count = 0;
   std::size_t fallback_count = 0;
+  larch::chart_spr_detail::sampled_tree_direct_workspace cached_workspace;
+  larch::chart_spr_detail::sampled_tree_projection_output_slot cached_output;
   std::vector<std::optional<larch::grammar_spr_candidate>> sequential_results;
   sequential_results.reserve(moves.size());
   for (auto const& emitted : moves) {
@@ -839,6 +1118,15 @@ static void check_prepared_projection_fixture(std::string const& label,
         project_tree_spr_move_annotated_oracle(base, oracle_tree, move);
     auto direct = larch::chart_spr_detail::project_sampled_tree_move_with_path(
         prepared, move);
+    larch::chart_spr_detail::
+        project_sampled_tree_move_with_path_into_with_cached_after_refs(
+            prepared, move, cached_workspace, cached_output);
+    CHECK(cached_output.path == direct.path);
+    CHECK(cached_output.engaged == direct.candidate.has_value());
+    if (cached_output.engaged) {
+      check_candidate_payload_equal(base, *direct.candidate,
+                                    *cached_output.candidate);
+    }
     if (direct.path ==
         larch::chart_spr_detail::sampled_tree_projection_path::direct) {
       ++direct_count;
@@ -1126,6 +1414,13 @@ static void test_phase8_parallel_sampled_projection_is_deterministic() {
         larch::chart_spr_candidate_generation_stats stats;
         auto candidates = collect_candidates(grammar, options, &stats);
         CHECK(!candidates.empty());
+        for (auto const& candidate : candidates) {
+          CHECK(candidate.source_before_topology_productions.has_value());
+          CHECK(candidate.source_after_topology_productions.has_value());
+          CHECK(!candidate.source_before_topology_productions->empty());
+          CHECK(candidate.source_after_topology_productions->size() ==
+                candidate.source_before_topology_productions->size());
+        }
         if (max_candidates != 0) {
           CHECK(candidates.size() == max_candidates);
           CHECK(stats.stop_reason ==
@@ -1161,14 +1456,17 @@ static void test_phase8_parallel_sampled_projection_is_deterministic() {
                   stats.sampled_tree_source_admitted_wave_width);
           }
         }
+        auto const projection_jobs_per_worker =
+            workers == 1 ? std::size_t{4} : std::size_t{64};
+        auto const maximum_projection_wave =
+            workers * projection_jobs_per_worker;
         CHECK(stats.sampled_tree_projection_admitted_subwave_width <=
-              workers * 4);
+              maximum_projection_wave);
         CHECK(stats.sampled_tree_projection_admitted_subwave_width >=
               stats.sampled_tree_projection_peak_wave_size);
         CHECK(stats.sampled_tree_projection_scheduler_operations > 0);
-        CHECK(stats.sampled_tree_projection_peak_wave_size ==
-              std::min(stats.sampled_tree_projection_moves_preassigned,
-                       workers * 4));
+        CHECK(stats.sampled_tree_projection_peak_wave_size <=
+              stats.sampled_tree_projection_moves_preassigned);
         CHECK(stats.sampled_tree_projection_direct > 0);
         CHECK(stats.sampled_tree_projection_fallback == 0);
         CHECK(stats.sampled_tree_projection_direct +
@@ -1208,6 +1506,308 @@ static void test_phase8_parallel_sampled_projection_is_deterministic() {
         CHECK(metrics.tasks_submitted == metrics.tasks_joined);
         CHECK(snapshot_projection_source(dag) == source_before);
       }
+    }
+  }
+
+  std::println("  PASS");
+}
+
+static void
+test_phase8_parallel_projection_cached_after_refs_preserves_fallback() {
+  std::println(
+      "test_phase8_parallel_projection_cached_after_refs_preserves_fallback");
+  using larch::chart_spr_detail::preassign_sampled_tree_projection_jobs;
+  using larch::chart_spr_detail::project_preassigned_sampled_tree_moves;
+
+  // First select a real direct move and a production that the move leaves
+  // untouched.  Making only that unrelated base production unfindable below
+  // disables the direct prerequisite and complete topology certificate while
+  // leaving the clone-diff candidate itself well defined.
+  auto probe_tree =
+      larch::test::make_tiny_labelled_tree("A", eight_taxon_balanced_tree());
+  auto probe_grammar = larch::build_clade_grammar(probe_tree);
+  auto probe_prepared =
+      larch::chart_spr_detail::prepare_sampled_tree_projection(probe_grammar,
+                                                               probe_tree);
+  auto const radius = larch::compute_tree_max_depth(probe_tree) * 2;
+  larch::move_enumerator enumerator{probe_prepared.index(),
+                                    std::numeric_limits<int>::max()};
+  std::optional<larch::profitable_move> selected_move;
+  std::optional<larch::grammar_spr_candidate> expected_fallback_payload;
+  larch::production_id unrelated_pid = larch::no_production;
+  enumerator.find_all_moves(radius, [&](larch::profitable_move const& move) {
+    if (selected_move) return;
+    auto projected =
+        larch::project_tree_spr_move_to_candidate(probe_prepared, move);
+    if (!projected) return;
+    for (std::size_t pid = 0; pid < probe_grammar.productions.size(); ++pid) {
+      auto const typed_pid = static_cast<larch::production_id>(pid);
+      if (probe_grammar.productions[pid].children.size() < 2 ||
+          std::find(projected->removed_productions.begin(),
+                    projected->removed_productions.end(),
+                    larch::base_production_ref(typed_pid)) !=
+              projected->removed_productions.end()) {
+        continue;
+      }
+      selected_move = move;
+      unrelated_pid = typed_pid;
+      expected_fallback_payload = std::move(*projected);
+      expected_fallback_payload->source_before_topology_productions.reset();
+      expected_fallback_payload->source_after_topology_productions.reset();
+      return;
+    }
+  });
+  CHECK(selected_move.has_value());
+  CHECK(expected_fallback_payload.has_value());
+  CHECK(unrelated_pid != larch::no_production);
+
+  auto fallback_tree =
+      larch::test::make_tiny_labelled_tree("A", eight_taxon_balanced_tree());
+  auto fallback_grammar = larch::build_clade_grammar(fallback_tree);
+  CHECK(unrelated_pid < fallback_grammar.productions.size());
+  auto& malformed_unrelated = fallback_grammar.productions[unrelated_pid];
+  CHECK(malformed_unrelated.children.size() >= 2);
+  malformed_unrelated.children[1] = malformed_unrelated.children[0];
+
+  auto prepared = larch::chart_spr_detail::prepare_sampled_tree_projection(
+      fallback_grammar, fallback_tree);
+  CHECK(!prepared.direct_projection_ready());
+  CHECK(!prepared.source_before_topology_refs().has_value());
+
+  std::optional<larch::grammar_spr_candidate> w1_candidate;
+  for (auto workers :
+       {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
+    auto scheduler = make_projection_scheduler(workers);
+    larch::grammar_spr_enumeration_options options;
+    options.sampled_tree_spr_radius = radius;
+    options.sampled_tree_score_threshold = std::numeric_limits<int>::max();
+    options.sampled_tree_projection_scheduler = &scheduler;
+    std::mt19937 rng(19);
+    auto preassignment = preassign_sampled_tree_projection_jobs(
+        prepared, options, radius, rng);
+    auto selected = std::find_if(
+        preassignment.jobs.begin(), preassignment.jobs.end(),
+        [&](auto const& job) {
+          return job.move.src == selected_move->src &&
+                 job.move.dst == selected_move->dst &&
+                 job.move.lca == selected_move->lca &&
+                 job.move.score_change == selected_move->score_change;
+        });
+    CHECK(selected != preassignment.jobs.end());
+    auto selected_job = *selected;
+    selected_job.ordinal = 0;
+    preassignment.jobs.assign(1, selected_job);
+
+    std::optional<larch::grammar_spr_candidate> actual;
+    auto execution = project_preassigned_sampled_tree_moves(
+        prepared, preassignment, options,
+        [&](std::size_t ordinal,
+            std::optional<larch::grammar_spr_candidate> const& candidate) {
+          CHECK(ordinal == 0);
+          CHECK(!actual.has_value());
+          actual = candidate;
+          return true;
+        });
+    CHECK(execution.moves_preassigned == 1);
+    CHECK(execution.direct_projections == 0);
+    CHECK(execution.fallback_projections == 1);
+    CHECK(actual.has_value());
+    CHECK(!actual->source_before_topology_productions.has_value());
+    CHECK(!actual->source_after_topology_productions.has_value());
+    check_candidate_projection_fields_equal(*expected_fallback_payload,
+                                            *actual);
+    if (workers == 1) {
+      w1_candidate = actual;
+    } else {
+      CHECK(w1_candidate.has_value());
+      check_candidate_projection_fields_equal(*w1_candidate, *actual);
+    }
+
+    auto const metrics = scheduler.metrics();
+    CHECK(metrics.pending_tasks == 0);
+    CHECK(metrics.tasks_submitted == metrics.tasks_completed);
+    CHECK(metrics.tasks_submitted == metrics.tasks_joined);
+  }
+
+  std::println("  PASS");
+}
+
+static void test_phase8_parallel_postprocessing_gather_matches_w1() {
+  std::println("test_phase8_parallel_postprocessing_gather_matches_w1");
+  using larch::chart_spr_detail::project_sampled_tree_moves_in_source_waves;
+  using larch::chart_spr_detail::sampled_tree_projection_postprocessing;
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AA", eight_taxon_distinct_balanced_tree());
+  auto grammar = larch::build_clade_grammar(dag);
+
+  larch::grammar_spr_enumeration_options base_options;
+  base_options.source = larch::chart_spr_candidate_source::sampled_tree;
+  base_options.sampled_tree_source_dag = &dag;
+  base_options.sampled_tree_count = 1;
+  base_options.sampled_tree_spr_radius = 16;
+  base_options.sampled_tree_score_threshold =
+      std::numeric_limits<int>::max();
+  // This fixture has both leaf-source rejections and accepted internal-clade
+  // moves, so the test observes both postprocessing outcomes rather than only
+  // checking pointer plumbing.
+  base_options.min_moved_clade_size = 2;
+  base_options.min_target_clade_size = 2;
+  base_options.randomize_order = true;
+  base_options.seed = 19;
+
+  std::mt19937 tree_rng(base_options.seed);
+  auto tree = larch::chart_spr_detail::build_sampled_tree_from_grammar(
+      grammar, base_options, 0, tree_rng);
+  auto const projection_rng_state = tree_rng;
+  auto prepared =
+      larch::chart_spr_detail::prepare_sampled_tree_projection(grammar, tree);
+
+  struct run_result {
+    std::vector<larch::grammar_spr_candidate> candidates;
+    larch::chart_spr_candidate_generation_stats stats;
+    std::size_t gather_calls = 0;
+    std::size_t engaged_calls = 0;
+    std::size_t null_postprocessing_calls = 0;
+    std::size_t nonnull_postprocessing_calls = 0;
+    std::size_t attempted_postprocessing_calls = 0;
+    std::size_t filter_rejections = 0;
+    std::size_t passing_signatures = 0;
+    larch::chart_spr_detail::sampled_tree_source_wave_execution_stats
+        execution;
+  };
+
+  auto run = [&](std::size_t workers) {
+    auto scheduler = make_projection_scheduler(workers);
+    auto options = base_options;
+    options.sampled_tree_projection_scheduler = &scheduler;
+    auto rng = projection_rng_state;
+    run_result result;
+    std::set<std::string> seen;
+    result.execution = project_sampled_tree_moves_in_source_waves(
+        prepared, options, base_options.sampled_tree_spr_radius, rng,
+        [&](std::size_t,
+            std::optional<larch::grammar_spr_candidate> const& projected,
+            sampled_tree_projection_postprocessing* postprocessing) {
+          ++result.gather_calls;
+          if (postprocessing == nullptr) {
+            ++result.null_postprocessing_calls;
+          } else {
+            ++result.nonnull_postprocessing_calls;
+          }
+          if (!projected) {
+            if (postprocessing != nullptr) {
+              CHECK(!postprocessing->attempted);
+            }
+            larch::chart_spr_detail::note_pruned_after(
+                result.stats,
+                &larch::chart_spr_candidate_generation_stats::
+                    candidates_pruned_invalid);
+            return true;
+          }
+
+          ++result.engaged_calls;
+          ++result.stats.candidates_constructed;
+          bool filters_passed = false;
+          std::string signature;
+          if (postprocessing == nullptr) {
+            CHECK(workers == 1);
+            filters_passed =
+                larch::chart_spr_detail::candidate_passes_postconstruction_filters(
+                    grammar, *projected, options, result.stats);
+            if (filters_passed) {
+              signature =
+                  larch::chart_spr_candidate_taxon_signature(grammar,
+                                                              *projected);
+            }
+          } else {
+            CHECK(workers > 1);
+            CHECK(postprocessing->attempted);
+            CHECK(!postprocessing->failure);
+            ++result.attempted_postprocessing_calls;
+            larch::chart_spr_detail::add_generation_count_stats(
+                result.stats, postprocessing->filter_stats);
+            filters_passed = postprocessing->filter_passed;
+            if (filters_passed) {
+              auto const expected_signature = larch::chart_spr_detail::
+                  chart_spr_candidate_taxon_dedup_key(grammar, *projected);
+              CHECK(!postprocessing->taxon_signature.empty());
+              CHECK(postprocessing->taxon_signature == expected_signature);
+              signature = postprocessing->taxon_signature;
+            } else {
+              CHECK(postprocessing->taxon_signature.empty());
+            }
+          }
+
+          if (!filters_passed) {
+            ++result.filter_rejections;
+            return true;
+          }
+          ++result.passing_signatures;
+          if (!seen.insert(std::move(signature)).second) {
+            larch::chart_spr_detail::note_pruned_after(
+                result.stats,
+                &larch::chart_spr_candidate_generation_stats::
+                    candidates_pruned_duplicate);
+            return true;
+          }
+          ++result.stats.candidates_generated_after_dedup;
+          if (larch::chart_spr_detail::
+                  grammar_spr_candidate_involves_multifurcation(
+                      grammar, *projected)) {
+            ++result.stats.spr_multifurcation_moves_generated;
+          }
+          result.candidates.push_back(*projected);
+          return true;
+        });
+
+    CHECK(!result.execution.cancelled);
+    CHECK(result.execution.projection_speculative_discarded == 0);
+    CHECK(result.gather_calls == result.execution.moves_enumerated);
+    CHECK(result.engaged_calls == result.stats.candidates_constructed);
+    CHECK(result.filter_rejections > 0);
+    CHECK(result.passing_signatures > 0);
+    if (workers == 1) {
+      CHECK(result.null_postprocessing_calls == result.gather_calls);
+      CHECK(result.nonnull_postprocessing_calls == 0);
+      CHECK(result.attempted_postprocessing_calls == 0);
+      CHECK(result.execution.projection_scheduler_operations ==
+            result.execution.projection_waves);
+    } else {
+      CHECK(result.null_postprocessing_calls == 0);
+      CHECK(result.nonnull_postprocessing_calls == result.gather_calls);
+      CHECK(result.attempted_postprocessing_calls == result.engaged_calls);
+      CHECK(result.execution.projection_scheduler_operations ==
+            2 * result.execution.projection_waves);
+    }
+
+    // Compare the low-level three-argument gather with the product collector,
+    // including every legacy semantic counter that the serial gather owns.
+    larch::chart_spr_candidate_generation_stats product_stats;
+    auto product_candidates = collect_candidates(grammar, options,
+                                                 &product_stats);
+    check_legacy_generation_stats_equal(result.stats, product_stats);
+    CHECK(result.candidates.size() == product_candidates.size());
+    for (std::size_t i = 0; i < result.candidates.size(); ++i) {
+      check_candidate_payload_equal(grammar, result.candidates[i],
+                                    product_candidates[i]);
+    }
+
+    auto const metrics = scheduler.metrics();
+    CHECK(metrics.pending_tasks == 0);
+    CHECK(metrics.tasks_submitted == metrics.tasks_completed);
+    CHECK(metrics.tasks_submitted == metrics.tasks_joined);
+    return result;
+  };
+
+  auto const w1 = run(1);
+  for (auto workers : {std::size_t{4}, std::size_t{8}}) {
+    auto const parallel = run(workers);
+    CHECK(parallel.candidates.size() == w1.candidates.size());
+    check_legacy_generation_stats_equal(parallel.stats, w1.stats);
+    for (std::size_t i = 0; i < parallel.candidates.size(); ++i) {
+      check_candidate_payload_equal(grammar, w1.candidates[i],
+                                    parallel.candidates[i]);
     }
   }
 
@@ -1495,8 +2095,12 @@ static void test_phase8_sampled_hybrid_reservoir_worker_seed_matrix() {
         CHECK(exhaustive_stats.sampled_tree_source_admitted_wave_width ==
               workers);
         CHECK(exhaustive_stats.sampled_tree_source_peak_wave_size == workers);
-        CHECK(exhaustive_stats.sampled_tree_projection_admitted_subwave_width ==
-              workers * 4);
+        auto const projection_jobs_per_worker =
+            workers == 1 ? std::size_t{4} : std::size_t{64};
+        CHECK(exhaustive_stats.sampled_tree_projection_admitted_subwave_width <=
+              workers * projection_jobs_per_worker);
+        CHECK(exhaustive_stats.sampled_tree_projection_admitted_subwave_width >=
+              exhaustive_stats.sampled_tree_projection_peak_wave_size);
         auto const exhaustive_metrics = scheduler.metrics();
         CHECK(exhaustive_metrics.pending_tasks == 0);
         CHECK(exhaustive_metrics.tasks_submitted ==
@@ -1543,7 +2147,7 @@ static void test_phase8_sampled_hybrid_reservoir_worker_seed_matrix() {
               workers);
         CHECK(reservoir_stats.sampled_tree_source_peak_wave_size == workers);
         CHECK(reservoir_stats.sampled_tree_projection_admitted_subwave_width ==
-              workers * 4);
+              exhaustive_stats.sampled_tree_projection_admitted_subwave_width);
         CHECK(selected.size() == expected_reservoir.size());
         for (std::size_t i = 0; i < selected.size(); ++i) {
           check_candidate_payload_equal(grammar, expected_reservoir[i],
@@ -2277,7 +2881,7 @@ static void test_phase8_source_wave_admission_failure_and_cancellation() {
           prepared, &projection_failure_scheduler, source_count, 0, 0);
   auto const projection_plan = projection_failure_scheduler.plan_indexed_ranges(
       projection_memory.projection_wave_size,
-      {.minimum_grain = 1, .target_ranges_per_worker = 1});
+      {.minimum_grain = 1, .target_ranges_per_worker = 64});
   CHECK(projection_plan.range_count >= 2);
   auto const later_projection_ordinal = projection_plan.effective_grain;
   std::latch later_projection_started{1};
@@ -3125,9 +3729,16 @@ static void test_phase8_named_source_wave_stops_near_candidate_cap() {
     CHECK(result.stats.sampled_tree_source_one_pass_move_visits ==
           result.stats.sampled_tree_projection_moves_preassigned);
     CHECK(result.stats.sampled_tree_sources_enumerated < dag.node_high_mark());
-    CHECK(result.stats.sampled_tree_projection_admitted_subwave_width ==
-          workers * 4);
-    CHECK(result.stats.sampled_tree_projection_peak_wave_size == workers * 4);
+    auto const projection_jobs_per_worker =
+        workers == 1 ? std::size_t{4} : std::size_t{64};
+    auto const maximum_projection_wave =
+        workers * projection_jobs_per_worker;
+    CHECK(result.stats.sampled_tree_projection_admitted_subwave_width <=
+          maximum_projection_wave);
+    CHECK(result.stats.sampled_tree_projection_admitted_subwave_width >=
+          result.stats.sampled_tree_projection_peak_wave_size);
+    CHECK(result.stats.sampled_tree_projection_peak_wave_size <=
+          result.stats.sampled_tree_projection_moves_preassigned);
     CHECK(result.stats.sampled_tree_source_speculative_moves_discarded > 0);
     auto const metrics = scheduler.metrics();
     CHECK(metrics.pending_tasks == 0);
@@ -3156,9 +3767,13 @@ static void test_phase8_named_source_wave_stops_near_candidate_cap() {
 
   CHECK(w1.stats.sampled_tree_source_admitted_wave_width == 1);
   CHECK(w1.stats.sampled_tree_source_peak_wave_size == 1);
+  CHECK(w1.stats.sampled_tree_projection_admitted_subwave_width == 4);
+  CHECK(w1.stats.sampled_tree_projection_peak_wave_size == 4);
   for (auto const* result :
        {&adaptive_w8, &fixed_w2, &fixed_w4, &fixed_w8}) {
     CHECK(result->stats.sampled_tree_source_admitted_wave_width == 8);
+    CHECK(result->stats.sampled_tree_projection_admitted_subwave_width ==
+          8 * 64);
     CHECK(result->stats.sampled_tree_projection_parallel_operations > 0);
     CHECK(result->stats.sampled_tree_source_enumeration_parallel_operations >
           0);
@@ -3201,6 +3816,18 @@ static void test_phase8_named_source_wave_stops_near_candidate_cap() {
   CHECK(fixed_w2.stats.sampled_tree_projection_moves_preassigned == 405);
   CHECK(fixed_w4.stats.sampled_tree_projection_moves_preassigned == 405);
   CHECK(fixed_w8.stats.sampled_tree_projection_moves_preassigned == 812);
+  CHECK(adaptive_w8.stats.sampled_tree_projection_peak_wave_size == 405);
+  // The one 405-job adaptive subwave has two joined scheduler operations. The
+  // relatively uniform projection work uses four ranges per worker (32
+  // ranges); signature/filter postprocessing retains unit-grain dynamic
+  // claiming because its candidate costs vary materially (405 ranges).
+  CHECK(adaptive_w8.stats.sampled_tree_projection_waves == 1);
+  CHECK(adaptive_w8.stats.sampled_tree_projection_scheduler_operations == 2);
+  CHECK(adaptive_w8.stats.sampled_tree_projection_parallel_operations == 2);
+  CHECK(adaptive_w8.stats.sampled_tree_projection_ranges == 32 + 405);
+  CHECK(adaptive_w8.stats.sampled_tree_projection_worker_tasks == 8 + 8);
+  CHECK(fixed_w4.stats.sampled_tree_projection_peak_wave_size == 405);
+  CHECK(fixed_w8.stats.sampled_tree_projection_peak_wave_size == 512);
   CHECK(adaptive_w8.stats.sampled_tree_source_speculative_moves_discarded == 9);
   CHECK(adaptive_w8.stats.sampled_tree_source_speculative_sources_discarded ==
         0);
@@ -3398,6 +4025,7 @@ static void test_multisite_exact_vs_lower_bound_labels() {
 
 int main() {
   test_overlay_temp_clades_and_single_site_score();
+  test_phase8_binary_taxon_dedup_key_matches_legacy();
   test_local_recompute_matches_full_rebuild();
   test_grammar_native_candidate_enumeration();
   test_projected_tree_spr_matches_apply_spr_move();
@@ -3405,6 +4033,8 @@ int main() {
   test_phase8_prepared_projection_differential_all_emitted_moves();
   test_phase8_binary_direct_metadata_resolver_is_fail_closed();
   test_phase8_parallel_sampled_projection_is_deterministic();
+  test_phase8_parallel_projection_cached_after_refs_preserves_fallback();
+  test_phase8_parallel_postprocessing_gather_matches_w1();
   test_phase8_grammar_and_hybrid_worker_seed_matrix();
   test_phase8_parallel_grammar_stop_reservoir_and_failure();
   test_phase8_sampled_hybrid_reservoir_worker_seed_matrix();

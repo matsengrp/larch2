@@ -8,9 +8,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <locale>
 #include <optional>
 #include <print>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -102,6 +104,83 @@ void check_scheduler_quiescent(larch::chart_scheduler const& scheduler) {
   CHECK(metrics.tasks_submitted == metrics.tasks_completed);
   CHECK(metrics.tasks_submitted == metrics.tasks_joined);
   CHECK(metrics.pending_tasks == 0);
+}
+
+void check_candidate_payload_equal(
+    larch::grammar_spr_candidate const& lhs,
+    larch::grammar_spr_candidate const& rhs) {
+  CHECK(lhs.moved_clade == rhs.moved_clade);
+  CHECK(lhs.old_parent == rhs.old_parent);
+  CHECK(lhs.old_sibling == rhs.old_sibling);
+  CHECK(lhs.new_sibling_or_target == rhs.new_sibling_or_target);
+  CHECK(lhs.removed_productions == rhs.removed_productions);
+  CHECK(lhs.added_clades == rhs.added_clades);
+  CHECK(lhs.added_productions.size() == rhs.added_productions.size());
+  for (std::size_t production_i = 0;
+       production_i < lhs.added_productions.size(); ++production_i) {
+    auto const& lhs_production = lhs.added_productions[production_i];
+    auto const& rhs_production = rhs.added_productions[production_i];
+    CHECK(lhs_production.parent == rhs_production.parent);
+    CHECK(lhs_production.children == rhs_production.children);
+    CHECK(lhs_production.multiplicity == rhs_production.multiplicity);
+    CHECK(lhs_production.witnesses.size() ==
+          rhs_production.witnesses.size());
+    for (std::size_t witness_i = 0;
+         witness_i < lhs_production.witnesses.size(); ++witness_i) {
+      auto const& lhs_witness = lhs_production.witnesses[witness_i];
+      auto const& rhs_witness = rhs_production.witnesses[witness_i];
+      CHECK(lhs_witness.parent_node == rhs_witness.parent_node);
+      CHECK(lhs_witness.children.size() == rhs_witness.children.size());
+      for (std::size_t child_i = 0;
+           child_i < lhs_witness.children.size(); ++child_i) {
+        CHECK(lhs_witness.children[child_i].child ==
+              rhs_witness.children[child_i].child);
+        CHECK(lhs_witness.children[child_i].edge_alternatives ==
+              rhs_witness.children[child_i].edge_alternatives);
+      }
+    }
+  }
+  CHECK(lhs.source_tree_move.has_value() == rhs.source_tree_move.has_value());
+  if (lhs.source_tree_move) {
+    CHECK(lhs.source_tree_move->src == rhs.source_tree_move->src);
+    CHECK(lhs.source_tree_move->dst == rhs.source_tree_move->dst);
+    CHECK(lhs.source_tree_move->lca == rhs.source_tree_move->lca);
+    CHECK(lhs.source_tree_move->score_change ==
+          rhs.source_tree_move->score_change);
+  }
+  CHECK(lhs.source_before_topology_productions ==
+        rhs.source_before_topology_productions);
+  CHECK(lhs.source_after_topology_productions ==
+        rhs.source_after_topology_productions);
+}
+
+void check_generation_semantics_equal(
+    larch::chart_spr_candidate_generation_stats const& lhs,
+    larch::chart_spr_candidate_generation_stats const& rhs) {
+  CHECK(lhs.upward_path_iterator_steps == rhs.upward_path_iterator_steps);
+  CHECK(lhs.upward_paths_completed == rhs.upward_paths_completed);
+  CHECK(lhs.path_pairs_considered == rhs.path_pairs_considered);
+  CHECK(lhs.candidates_constructed == rhs.candidates_constructed);
+  CHECK(lhs.candidates_pruned_before_construction ==
+        rhs.candidates_pruned_before_construction);
+  CHECK(lhs.candidates_pruned_after_construction ==
+        rhs.candidates_pruned_after_construction);
+  CHECK(lhs.candidates_generated_after_dedup ==
+        rhs.candidates_generated_after_dedup);
+  CHECK(lhs.candidates_pruned_root_or_trivial ==
+        rhs.candidates_pruned_root_or_trivial);
+  CHECK(lhs.candidates_pruned_moved_size == rhs.candidates_pruned_moved_size);
+  CHECK(lhs.candidates_pruned_target_size == rhs.candidates_pruned_target_size);
+  CHECK(lhs.candidates_pruned_overlap == rhs.candidates_pruned_overlap);
+  CHECK(lhs.candidates_pruned_affected_estimate ==
+        rhs.candidates_pruned_affected_estimate);
+  CHECK(lhs.candidates_pruned_immediate_reversal ==
+        rhs.candidates_pruned_immediate_reversal);
+  CHECK(lhs.candidates_pruned_duplicate == rhs.candidates_pruned_duplicate);
+  CHECK(lhs.candidates_pruned_invalid == rhs.candidates_pruned_invalid);
+  CHECK(lhs.spr_multifurcation_moves_generated ==
+        rhs.spr_multifurcation_moves_generated);
+  CHECK(lhs.stop_reason == rhs.stop_reason);
 }
 
 void check_canonical_exact_evidence_equal(
@@ -607,10 +686,282 @@ void test_finite_sampled_source_adaptive_planning() {
   options.max_candidates = 0;
   auto const uncapped = estimate(0);
   CHECK(uncapped.planned_sampled_source_wave_size == 8);
-  CHECK(uncapped.planned_sampled_projection_wave_size == 32);
+  CHECK(uncapped.planned_sampled_projection_wave_size ==
+        std::min(std::size_t{8} *
+                     uncapped.planned_sampled_destination_bound_per_source,
+                 std::size_t{8} * 64));
 
   check_scheduler_quiescent(scheduler);
   scheduler.shutdown();
+  std::println("  PASS");
+}
+
+void test_phase8_postprocessing_memory_contract() {
+  std::println("test_phase8_postprocessing_memory_contract");
+
+  auto input = make_fixture();
+  larch::grammar_spr_enumeration_options options;
+  options.source = larch::chart_spr_candidate_source::sampled_tree;
+  options.sampled_tree_source_dag = &input.dag;
+  options.sampled_tree_count = 1;
+  options.sampled_tree_spr_radius = 8;
+  options.sampled_tree_score_threshold = std::numeric_limits<int>::max();
+  options.max_candidates = 32;
+  options.max_candidates_is_post_dedup = true;
+  options.seed = 19;
+
+  larch::chart_scheduler w1_scheduler{
+      larch::chart_scheduler_options{.requested_workers = 1}};
+  larch::chart_scheduler w4_scheduler{
+      larch::chart_scheduler_options{.requested_workers = 4}};
+  auto const maximum_jobs = (std::numeric_limits<std::size_t>::max)();
+  CHECK(larch::chart_spr_detail::
+            bounded_sampled_tree_source_projection_wave_size(&w1_scheduler,
+                                                             maximum_jobs) ==
+        4);
+  CHECK(larch::chart_spr_detail::
+            bounded_sampled_tree_source_projection_wave_size(&w4_scheduler,
+                                                             maximum_jobs) ==
+        4 * 64);
+
+  auto const w1_bound =
+      larch::chart_spr_detail::estimate_sampled_tree_source_memory_bound(
+          input.grammar, input.dag, &w1_scheduler);
+  CHECK(w1_bound.safely_bounded);
+  CHECK(w1_bound.active_postprocessing_count == 0);
+  CHECK(w1_bound.active_postprocessing_scratch_bytes == 0);
+  CHECK(w1_bound.postprocessing_scheduler_operation_bytes == 0);
+  CHECK(w1_bound.planned_retained_taxon_signature_bytes_per_slot == 0);
+  CHECK(w1_bound.projection_wave_size <= 4);
+  CHECK(w1_bound.temporal_stage_peak_bytes ==
+        std::max(w1_bound.active_enumeration_scratch_bytes +
+                     w1_bound.source_scheduler_operation_bytes,
+                 w1_bound.active_projection_scratch_bytes +
+                     w1_bound.projection_scheduler_operation_bytes));
+
+  auto const w4_bound =
+      larch::chart_spr_detail::estimate_sampled_tree_source_memory_bound(
+          input.grammar, input.dag, &w4_scheduler);
+  CHECK(w4_bound.safely_bounded);
+  CHECK(w4_bound.projection_wave_size <= 4 * 64);
+  CHECK(w4_bound.active_postprocessing_count > 1);
+  CHECK(w4_bound.active_postprocessing_scratch_bytes > 0);
+  CHECK(w4_bound.postprocessing_scheduler_operation_bytes > 0);
+  CHECK(w4_bound.planned_retained_taxon_signature_bytes_per_slot > 256);
+  CHECK(w4_bound.temporal_stage_peak_bytes ==
+        std::max({w4_bound.active_enumeration_scratch_bytes +
+                      w4_bound.source_scheduler_operation_bytes,
+                  w4_bound.active_projection_scratch_bytes +
+                      w4_bound.projection_scheduler_operation_bytes,
+                  w4_bound.active_postprocessing_scratch_bytes +
+                      w4_bound.postprocessing_scheduler_operation_bytes}));
+
+  std::mt19937 tree_rng(options.seed);
+  auto tree = larch::chart_spr_detail::build_sampled_tree_from_grammar(
+      input.grammar, options, 0, tree_rng);
+  auto const projection_rng_state = tree_rng;
+  auto prepared = larch::chart_spr_detail::prepare_sampled_tree_projection(
+      input.grammar, tree);
+  auto const source_count = prepared.index().get_searchable_nodes().size();
+  constexpr std::size_t source_width = 1;
+  constexpr std::size_t projection_width = 4;
+  auto const exact_memory =
+      larch::chart_spr_detail::estimate_sampled_tree_source_wave_memory(
+          prepared, &w4_scheduler, source_count, source_width,
+          projection_width, 0);
+  CHECK(exact_memory.safely_bounded);
+  CHECK(exact_memory.active_postprocessing_count > 1);
+
+  auto runtime_options = options;
+  runtime_options.sampled_tree_projection_scheduler = &w4_scheduler;
+  runtime_options.sampled_tree_source_maximum_wave_size = source_width;
+  runtime_options.sampled_tree_projection_maximum_wave_size = projection_width;
+  runtime_options.sampled_tree_source_admitted_peak_bytes =
+      exact_memory.required_peak_bytes;
+  runtime_options.sampled_tree_projection_memory_budget_bytes = 0;
+  std::size_t workspace_allocations = 0;
+  runtime_options.before_sampled_tree_projection_workspace_allocation_for_tests =
+      [&] { ++workspace_allocations; };
+  auto exact_rng = projection_rng_state;
+  std::size_t retained_signatures = 0;
+  auto exact = larch::chart_spr_detail::project_sampled_tree_moves_in_source_waves(
+      prepared, runtime_options, options.sampled_tree_spr_radius, exact_rng,
+      [&](std::size_t,
+          std::optional<larch::grammar_spr_candidate> const& candidate,
+          larch::chart_spr_detail::sampled_tree_projection_postprocessing*
+              postprocessing) {
+        if (candidate && postprocessing && postprocessing->filter_passed) {
+          CHECK(postprocessing->attempted);
+          CHECK(postprocessing->taxon_signature_storage_activated);
+          CHECK(postprocessing->taxon_signature.capacity() + 1 <=
+                exact_memory
+                    .planned_retained_taxon_signature_bytes_per_slot);
+          ++retained_signatures;
+        }
+        return true;
+      });
+  CHECK(workspace_allocations == 1);
+  CHECK(retained_signatures > 0);
+  CHECK(exact.memory.required_peak_bytes == exact_memory.required_peak_bytes);
+  CHECK(exact.memory.actual_retained_payload_bytes <=
+        exact.memory.planned_retained_payload_bytes);
+  CHECK(exact.memory.actual_peak_bytes <= exact_memory.required_peak_bytes);
+  check_scheduler_quiescent(w4_scheduler);
+
+  auto rejected_options = runtime_options;
+  rejected_options.sampled_tree_source_admitted_peak_bytes =
+      exact_memory.required_peak_bytes - 1;
+  std::size_t rejected_allocations = 0;
+  std::size_t rejected_projections = 0;
+  rejected_options.before_sampled_tree_projection_workspace_allocation_for_tests =
+      [&] { ++rejected_allocations; };
+  rejected_options.before_sampled_tree_projection_for_tests =
+      [&](std::size_t) { ++rejected_projections; };
+  auto const metrics_before_rejection = w4_scheduler.metrics();
+  auto rejected_rng = projection_rng_state;
+  bool rejected = false;
+  try {
+    (void)larch::chart_spr_detail::project_sampled_tree_moves_in_source_waves(
+        prepared, rejected_options, options.sampled_tree_spr_radius,
+        rejected_rng,
+        [](std::size_t,
+           std::optional<larch::grammar_spr_candidate> const&,
+           larch::chart_spr_detail::sampled_tree_projection_postprocessing*) {
+          return true;
+        });
+  } catch (larch::sampled_tree_projection_budget_error const& error) {
+    rejected = true;
+    CHECK(error.required_bytes() == exact_memory.required_peak_bytes);
+    CHECK(error.budget_bytes() == exact_memory.required_peak_bytes - 1);
+  }
+  CHECK(rejected);
+  CHECK(rejected_allocations == 0);
+  CHECK(rejected_projections == 0);
+  CHECK(w4_scheduler.metrics().operations ==
+        metrics_before_rejection.operations);
+
+  auto state = larch::build_chart_spr_search_state(input.dag, input.grammar);
+  auto envelope_options = options;
+  auto const outer = larch::chart_spr_search_detail::
+      estimate_grammar_spr_finite_iteration_memory_envelope(
+          state, 32, 1, 1, false, w4_scheduler, 1, &envelope_options, 1,
+          false, source_width, projection_width, 0);
+  auto const set_node_overhead =
+      sizeof(std::set<std::string>::value_type) + 4 * sizeof(void*);
+  CHECK(outer.planned_sampled_dedup_signature_node_bytes >=
+        set_node_overhead +
+            exact_memory.planned_retained_taxon_signature_bytes_per_slot);
+  CHECK(outer.planned_sampled_postprocessing_active_scratch_bytes > 0);
+  CHECK(
+      outer.planned_sampled_postprocessing_scheduler_operation_peak_bytes > 0);
+
+  struct grouped_taxon_ids : std::numpunct<char> {
+   protected:
+    char do_thousands_sep() const override { return '_'; }
+    std::string do_grouping() const override { return "\3"; }
+  };
+  struct restore_global_locale {
+    std::locale previous;
+    ~restore_global_locale() { std::locale::global(previous); }
+  };
+  {
+    restore_global_locale restore{std::locale{}};
+    std::locale::global(
+        std::locale{std::locale::classic(), new grouped_taxon_ids});
+
+    // The finite outer search envelope remains fail-closed because its
+    // retained-set bound is the classic-locale binary-key bound. This check is
+    // allocation-free and precedes every search/scheduler side effect.
+    bool finite_outer_rejected = false;
+    try {
+      (void)larch::chart_spr_search_detail::
+          estimate_grammar_spr_finite_iteration_memory_envelope(
+              state, 32, 1, 1, false, w4_scheduler, 1, &envelope_options, 1,
+              false, source_width, projection_width, 0);
+    } catch (std::invalid_argument const& error) {
+      finite_outer_rejected =
+          std::string{error.what()}.find("classic global locale") !=
+          std::string::npos;
+    }
+    CHECK(finite_outer_rejected);
+
+    // Direct/unbudgeted library generation still has to preserve its W1
+    // oracle. With a custom locale, W>1 keeps projection parallel but routes
+    // filtering and the historical localized text key through serial gather.
+    struct generation_run {
+      std::vector<larch::grammar_spr_candidate> candidates;
+      larch::chart_spr_candidate_generation_stats stats;
+    };
+    auto run_generation = [&](larch::chart_scheduler& scheduler) {
+      auto locale_options = options;
+      locale_options.randomize_order = true;
+      locale_options.reservoir_sample = true;
+      locale_options.max_candidates = 2;
+      locale_options.seed = 19;
+      locale_options.sampled_tree_projection_scheduler = &scheduler;
+      generation_run run;
+      run.stats = larch::for_each_grammar_spr_candidate(
+          input.grammar, locale_options,
+          [&](larch::grammar_spr_candidate const& candidate) {
+            run.candidates.push_back(candidate);
+            return true;
+          });
+      return run;
+    };
+
+    auto const w1_locale = run_generation(w1_scheduler);
+    auto const w4_locale = run_generation(w4_scheduler);
+    CHECK(!w1_locale.candidates.empty());
+    CHECK(w4_locale.candidates.size() == w1_locale.candidates.size());
+    for (std::size_t i = 0; i < w1_locale.candidates.size(); ++i) {
+      check_candidate_payload_equal(w1_locale.candidates[i],
+                                    w4_locale.candidates[i]);
+      CHECK(larch::chart_spr_candidate_taxon_signature(
+                input.grammar, w1_locale.candidates[i]) ==
+            larch::chart_spr_candidate_taxon_signature(
+                input.grammar, w4_locale.candidates[i]));
+    }
+    check_generation_semantics_equal(w1_locale.stats, w4_locale.stats);
+    CHECK(w4_locale.stats.sampled_tree_projection_scheduler_operations ==
+          w4_locale.stats.sampled_tree_projection_waves);
+
+    // Exercise the three-argument source-wave boundary directly: nullptr on
+    // every gathered ordinal proves no worker-created postprocessing payload
+    // or second postprocessing scheduler operation escaped the locale switch.
+    auto locale_options = runtime_options;
+    locale_options.sampled_tree_source_admitted_peak_bytes = 0;
+    std::size_t locale_allocations = 0;
+    locale_options
+        .before_sampled_tree_projection_workspace_allocation_for_tests =
+        [&] { ++locale_allocations; };
+    auto locale_rng = projection_rng_state;
+    std::size_t locale_gather_calls = 0;
+    std::size_t locale_postprocessing_calls = 0;
+    auto const locale_execution =
+        larch::chart_spr_detail::project_sampled_tree_moves_in_source_waves(
+            prepared, locale_options, options.sampled_tree_spr_radius,
+            locale_rng,
+            [&](std::size_t,
+                std::optional<larch::grammar_spr_candidate> const&,
+                larch::chart_spr_detail::
+                    sampled_tree_projection_postprocessing* postprocessing) {
+              ++locale_gather_calls;
+              if (postprocessing != nullptr) {
+                ++locale_postprocessing_calls;
+              }
+              return true;
+            });
+    CHECK(locale_allocations == 1);
+    CHECK(locale_gather_calls > 0);
+    CHECK(locale_postprocessing_calls == 0);
+    CHECK(locale_execution.projection_scheduler_operations ==
+          locale_execution.projection_waves);
+  }
+
+  check_scheduler_quiescent(w1_scheduler);
+  check_scheduler_quiescent(w4_scheduler);
+  w1_scheduler.shutdown();
+  w4_scheduler.shutdown();
   std::println("  PASS");
 }
 
@@ -907,10 +1258,10 @@ void test_hybrid_width_two_exact_admission_boundary() {
       input.grammar, tree);
   auto const source_count = prepared.index().get_searchable_nodes().size();
   auto const exact_memory =
-      larch::chart_spr_detail::estimate_sampled_tree_source_wave_memory(
-          prepared, &scheduler, source_count,
+      larch::chart_spr_detail::admit_sampled_tree_source_wave_memory(
+          prepared, &scheduler, source_count, 0, 0,
           parent.planned_sampled_source_wave_size,
-          parent.planned_sampled_projection_wave_size, 0);
+          parent.planned_sampled_projection_wave_size);
   CHECK(exact_memory.safely_bounded);
   CHECK(exact_memory.source_wave_size == 2);
   CHECK(exact_memory.required_peak_bytes > 1);
@@ -951,6 +1302,8 @@ void test_hybrid_width_two_exact_admission_boundary() {
         parent.planned_sampled_source_wave_size);
   CHECK(exact_stats.sampled_tree_source_admitted_wave_width == 2);
   CHECK(exact_stats.sampled_tree_projection_admitted_subwave_width ==
+        exact_memory.projection_wave_size);
+  CHECK(exact_stats.sampled_tree_projection_admitted_subwave_width <=
         parent.planned_sampled_projection_wave_size);
   CHECK(exact_stats.sampled_tree_source_actual_peak_bytes <= exact_budget);
   CHECK(exact_stats.sampled_tree_source_actual_peak_bytes <=
@@ -1433,8 +1786,18 @@ void test_dense_partial_final_batch_uses_admitted_tile_shape() {
            planned.planned_sampled_projection_active_scratch_bytes +
                planned
                    .planned_sampled_projection_scheduler_operation_peak_bytes,
+           planned.planned_sampled_postprocessing_active_scratch_bytes +
+               planned
+                   .planned_sampled_postprocessing_scheduler_operation_peak_bytes,
            planned.planned_grammar_candidate_scheduler_operation_peak_bytes}) +
           planned.planned_local_retained_stable_capacity_bytes);
+  CHECK(planned.planned_sampled_postprocessing_active_scratch_bytes > 0);
+  // This fixture deliberately admits one projection/postprocessing ordinal
+  // at a time. Its task-local scratch is live, but a width-one range takes
+  // the scheduler's inline path and therefore owns no scheduler operation.
+  CHECK(
+      planned.planned_sampled_postprocessing_scheduler_operation_peak_bytes ==
+      0);
 
   larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
       exact_workspace;
@@ -1475,6 +1838,7 @@ int main() {
   test_error_precedence_drain_and_recovery();
   test_generation_error_drains();
   test_finite_sampled_source_adaptive_planning();
+  test_phase8_postprocessing_memory_contract();
   test_hybrid_width_two_exact_admission_boundary();
   test_finite_admission_exact_boundary();
   test_dense_partial_final_batch_uses_admitted_tile_shape();

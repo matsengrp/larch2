@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <locale>
 #include <map>
 #include <memory>
 #include <optional>
@@ -6918,6 +6919,14 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   auto const source = source_options == nullptr
                           ? chart_spr_candidate_source::grammar
                           : source_options->source;
+  auto const resolved_workers =
+      scheduler.worker_resolution().resolved_workers;
+  if (source != chart_spr_candidate_source::grammar && resolved_workers > 1 &&
+      std::locale{} != std::locale::classic()) {
+    throw std::invalid_argument(
+        "chart SPR finite parallel sampled-tree admission requires the "
+        "classic global locale");
+  }
   auto decimal_digits = [](std::size_t value) noexcept {
     std::size_t digits = 1;
     while (value >= 10) {
@@ -7014,6 +7023,19 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
       string_capacity_bound(numeric_signature);
   auto const sample_signature_capacity =
       string_capacity_bound(sample_signature);
+  std::size_t binary_signature_capacity = 0;
+  if (source != chart_spr_candidate_source::grammar && resolved_workers > 1) {
+    bool binary_signature_safely_bounded = true;
+    binary_signature_capacity = chart_spr_detail::
+        estimate_chart_spr_binary_taxon_dedup_key_capacity_bytes(
+            taxa, candidate_clades, removed_productions, maximum_arity,
+            candidate_productions, candidate_maximum_arity,
+            binary_signature_safely_bounded);
+    if (!binary_signature_safely_bounded) {
+      throw std::overflow_error(
+          "chart SPR finite sampled dedup signature envelope overflow");
+    }
+  }
   auto const invalid_reason_capacity =
       lazy_local_invalid_reason_owned_capacity_bound();
   // Before exact verification, a ranked score owns the grammar candidate,
@@ -7041,6 +7063,10 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   auto const signature_node =
       add(sizeof(std::set<std::string>::value_type) + 4 * sizeof(void*),
           numeric_signature_capacity);
+  auto sampled_dedup_signature_capacity =
+      resolved_workers > 1
+          ? std::max(numeric_signature_capacity, binary_signature_capacity)
+          : numeric_signature_capacity;
   auto const candidate_live =
       add(sizeof(grammar_spr_candidate), candidate_dynamic);
 
@@ -7118,7 +7144,16 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
       throw std::overflow_error(
           "chart SPR finite sampled source-wave shape overflow");
     }
+    if (resolved_workers > 1) {
+      sampled_dedup_signature_capacity = std::max(
+          sampled_dedup_signature_capacity,
+          sampled_wave
+              .planned_retained_taxon_signature_bytes_per_slot);
+    }
   }
+  auto const sampled_dedup_signature_node =
+      add(sizeof(std::set<std::string>::value_type) + 4 * sizeof(void*),
+          sampled_dedup_signature_capacity);
   std::size_t sampled_waiting = 0;
   if (source != chart_spr_candidate_source::grammar) {
     sampled_waiting = add(sampled_waiting,
@@ -7179,7 +7214,8 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
     }
   }
   auto const sampled_child_dedup =
-      multiply(sampled_child_signature_count, signature_node);
+      multiply(sampled_child_signature_count,
+               sampled_dedup_signature_node);
   auto const grammar_child_dedup =
       multiply(grammar_child_signature_count, signature_node);
   std::size_t source_owned = 0;
@@ -7304,7 +7340,6 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
                             doubled_vector(ranked_limit, sizeof(std::size_t)));
   }
 
-  auto const resolved_workers = scheduler.worker_resolution().resolved_workers;
   auto const lazy_local =
       state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart;
   auto const persistent_row_view = state.local_commit_inside_rows.valid();
@@ -7494,10 +7529,10 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
                   untiled_concurrent_preparation_peak});
   }
   // Tree construction and canonical gather are serial producer work and can
-  // overlap scoring. Source enumeration and projection both use the one
-  // scheduler handoff, so their operations are temporal alternatives to each
-  // other and to score operations.  The persistent scheduler core is charged
-  // exactly once by generation_phase below.
+  // overlap scoring. Source enumeration, projection, and joined parallel
+  // postprocessing all use the one scheduler handoff, so their operations are
+  // temporal alternatives to each other and to score operations. The
+  // persistent scheduler core is charged exactly once by generation_phase.
   auto const serial_overlap_peak =
       add(enumeration_callback_concurrent, local_task_peak);
   auto const source_active_peak =
@@ -7506,12 +7541,16 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   auto const projection_active_peak =
       add(sampled_wave.active_projection_scratch_bytes,
           sampled_wave.projection_scheduler_operation_bytes);
+  auto const postprocessing_active_peak =
+      add(sampled_wave.active_postprocessing_scratch_bytes,
+          sampled_wave.postprocessing_scheduler_operation_bytes);
   // A completed dense score retains descriptor, worker, and tile nested
   // capacities in the reusable local workspace.  Later source-enumeration and
   // projection stages both overlap that stable HWM. Finite lazy waves release
   // task storage and leave this component zero.
   auto const generation_wave_with_retained_local_peak =
       add(std::max({source_active_peak, projection_active_peak,
+                    postprocessing_active_peak,
                     grammar_scheduler_operation}),
           local_retained_stable_capacity);
   auto const sampled_source_admitted_peak =
@@ -7614,6 +7653,10 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
       .planned_candidate_buffer_owned_bytes = candidate_buffer_owned,
       .planned_pipeline_control_bytes = pipeline_control,
       .planned_sampled_source_waiting_bytes = sampled_waiting,
+      .planned_sampled_dedup_signature_node_bytes =
+          source == chart_spr_candidate_source::grammar
+              ? std::size_t{0}
+              : sampled_dedup_signature_node,
       .planned_sampled_source_active_scratch_bytes =
           sampled_wave.active_enumeration_scratch_bytes,
       .planned_sampled_source_scheduler_operation_peak_bytes =
@@ -7622,6 +7665,10 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
           sampled_wave.active_projection_scratch_bytes,
       .planned_sampled_projection_scheduler_operation_peak_bytes =
           sampled_wave.projection_scheduler_operation_bytes,
+      .planned_sampled_postprocessing_active_scratch_bytes =
+          sampled_wave.active_postprocessing_scratch_bytes,
+      .planned_sampled_postprocessing_scheduler_operation_peak_bytes =
+          sampled_wave.postprocessing_scheduler_operation_bytes,
       .planned_sampled_source_admitted_peak_bytes =
           sampled_source_admitted_peak,
       .planned_sampled_source_count_bound = sampled_wave.source_count,

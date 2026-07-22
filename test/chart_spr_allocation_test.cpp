@@ -1232,10 +1232,84 @@ test_sampled_tree_projection_nested_witness_capacity_walkers() {
       output.spare_added_productions.capacity() *
           sizeof(larch::overlay_grammar_production) +
       production_capacity;
+  auto const default_signature_capacity =
+      output.postprocessing.taxon_signature.capacity();
+  CHECK(!output.postprocessing.taxon_signature_storage_activated);
+  // A never-activated string may report an implementation-owned SSO capacity,
+  // but no allocation belongs to the output slot until product postprocessing
+  // has actually retained a signature.
+  CHECK(default_signature_capacity > 0);
   bool output_safely_bounded = true;
   CHECK(larch::chart_spr_detail::sampled_tree_projection_output_capacity_bytes(
             output, output_safely_bounded) == expected_output_capacity);
   CHECK(output_safely_bounded);
+
+  output.postprocessing.taxon_signature.assign(
+      default_signature_capacity + 256, 's');
+  output.postprocessing.taxon_signature_storage_activated = true;
+  auto const activated_signature_capacity =
+      output.postprocessing.taxon_signature.capacity();
+  CHECK(activated_signature_capacity > default_signature_capacity);
+  auto const expected_activated_output_capacity =
+      expected_output_capacity + activated_signature_capacity + 1;
+  output_safely_bounded = true;
+  CHECK(larch::chart_spr_detail::sampled_tree_projection_output_capacity_bytes(
+            output, output_safely_bounded) ==
+        expected_activated_output_capacity);
+  CHECK(output_safely_bounded);
+
+  output.postprocessing.taxon_signature.clear();
+  CHECK(output.postprocessing.taxon_signature.empty());
+  CHECK(output.postprocessing.taxon_signature.capacity() ==
+        activated_signature_capacity);
+  output_safely_bounded = true;
+  CHECK(larch::chart_spr_detail::sampled_tree_projection_output_capacity_bytes(
+            output, output_safely_bounded) ==
+        expected_activated_output_capacity);
+  CHECK(output_safely_bounded);
+
+  // Canonical gather moves the key into its dedup set. The standard only
+  // promises a valid moved-from string, so account its live capacity rather
+  // than assuming that the heap buffer was transferred or retained. The
+  // persistent activation bit must keep this slot auditable either way.
+  output.postprocessing.taxon_signature.assign(
+      default_signature_capacity + 256, 'm');
+  auto gathered_signature =
+      std::move(output.postprocessing.taxon_signature);
+  CHECK(!gathered_signature.empty());
+  CHECK(output.postprocessing.taxon_signature_storage_activated);
+  auto const moved_from_signature_capacity =
+      output.postprocessing.taxon_signature.capacity();
+  output_safely_bounded = true;
+  CHECK(larch::chart_spr_detail::sampled_tree_projection_output_capacity_bytes(
+            output, output_safely_bounded) ==
+        expected_output_capacity + moved_from_signature_capacity + 1);
+  CHECK(output_safely_bounded);
+
+  // The next rejected/invalid ordinal clears no activation history. This is
+  // the state walked after a later wave even if no replacement key is built.
+  output.postprocessing.taxon_signature.clear();
+  CHECK(output.postprocessing.taxon_signature_storage_activated);
+  output_safely_bounded = true;
+  CHECK(larch::chart_spr_detail::sampled_tree_projection_output_capacity_bytes(
+            output, output_safely_bounded) ==
+        expected_output_capacity + moved_from_signature_capacity + 1);
+  CHECK(output_safely_bounded);
+
+  bool saturation_safely_bounded = true;
+  CHECK(larch::chart_spr_detail::sampled_tree_projection_saturating_add(
+            (std::numeric_limits<std::size_t>::max)() - 3, 4,
+            saturation_safely_bounded) ==
+        (std::numeric_limits<std::size_t>::max)());
+  CHECK(!saturation_safely_bounded);
+
+  bool signature_safely_bounded = true;
+  CHECK(larch::chart_spr_detail::
+            estimate_chart_spr_binary_taxon_dedup_key_capacity_bytes(
+                (std::numeric_limits<std::size_t>::max)(), 1, 1, 2, 1, 2,
+                signature_safely_bounded) ==
+        (std::numeric_limits<std::size_t>::max)());
+  CHECK(!signature_safely_bounded);
   std::println("  PASS ({} nested retained bytes)", production_capacity);
   return expected_output_capacity;
 }
@@ -1459,7 +1533,11 @@ static void test_prepared_lazy_local_core_is_allocation_free() {
     auto actual = larch::chart_spr_candidate_taxon_signature(
         state.grammar, signature_candidates[index]);
     auto const expected_capacity = expected_signature_capacity(actual.size());
-    CHECK(actual.capacity() == expected_capacity);
+    // C++26 basic_ostringstream::str() may transfer an exactly-sized string
+    // even though the frozen conservative envelope still rounds a direct
+    // allocation to the allocator quantum.  The proof requires the live
+    // capacity not to exceed that envelope; equality is not required.
+    CHECK(actual.capacity() <= expected_capacity);
     CHECK(signature_resident[index] >=
           signature_node_bytes + actual.capacity() + 1);
     CHECK(signature_resident[index] ==

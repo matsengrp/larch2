@@ -35,10 +35,10 @@ in this document.
 | 4. Parallelize patterns and local scoring | implementation complete; performance acceptance pending | `cbf92b6` passes deterministic pattern/cache/local/fixed-topology scheduling, bounded-memory admission, caught-failure accounting, full CTest, and targeted TSAN; scaling, Phase-3 serial comparison, and RSS gates remain pending |
 | 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 6/final gates | `bb29300` plus harness fix `3a10e9c` pass W1/W8 exact semantics, full CTest, and targeted TSAN; same-revision diagnostics exceed the 2x exact-phase target; measured-0% heavy splitting is omitted; unified frontier/candidate admission and final timing/RSS remain pending |
 | 6. Parallelize exact top-K candidates | implementation complete; performance acceptance pending | `870c298` passes the in-tree Top-K/worker semantic and stable-failure matrix, deterministic scheduling, functional bounded-admission tests, full RelWithDebInfo CTest, and targeted TSan; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS gates remain pending |
-| 7. Make lazy charts scalable and adaptive | implementation complete; performance acceptance pending | Packed deterministic grouping, dependency wavefronts, exact transient admission, the profile-supported within-clade omission, and frozen `off|on|auto` policy are implemented through `38e9a28`; `3359fbf` adds the exact eight-row medium-auto/small-on completion producer and `c5156a8` registers its passing synthetic CTest. The current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`; the production Phase-7 supplements, named-fixture medians/scaling, RSS, and sealed performance gates remain pending |
-| 8. Parallelize and pipeline candidate generation | implementation hardening complete; final gates pending | Source waves, stable direct-projection workspaces, nested-workspace quarantine, seeded reservoir ordering, and realizable outer/direct width-two boundaries are committed through `94a6323`; `51d2a3c` pins the Phase-8 generation evidence label to that immutable checkpoint. The current post-cleanup full RelWithDebInfo, complete ASAN, focused matrix, and exact 55-test TSan gates pass at `4ef6126`; supplemental sealing, the quiet-host speed cycle, Phase-7 comparison, and paired RSS remain pending |
-| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; final gates pending | Persistent pattern-parallel cache transactions, exact-state reuse, non-vacuous three-accept W1/2/4/8 semantics, crash-durable supplemental tooling, and counter/report contracts pass through `4ef6126`; `0f099ca` adds the passing schema-v3 frozen-oracle characterization producer. The current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`; the production characterization, immutable supplement capture/seal, and accepted-update timing/RSS decision remain pending |
-| 10. Integrate, tune defaults, and prove parity | implementation in progress | Cleanup review and the required in-tree semantic mode/worker matrix pass at `4ef6126`, as do the current post-cleanup full RelWithDebInfo, complete ASAN, and exact 55-test TSan gates. Sealed worker-policy/RSS/wall evidence, supplemental sealing, and the conditional default decision remain pending; any later production or default change reopens all affected test gates |
+| 7. Make lazy charts scalable and adaptive | implementation complete; performance acceptance pending | Packed deterministic grouping, dependency wavefronts, exact transient admission, the profile-supported within-clade omission, and frozen `off\|on\|auto` policy are implemented through `38e9a28`. The production manifests `phase7-lazy.tsv` and `phase7-lazy-completion.tsv` are sealed at SHA-256 `82250bb26d5394d3c2c616e4ccbf606e80eca074e560fd8e3361274655e56718` and `7b934fa0ad8279893d03321724935dccf8df99fa840899652dccdc63c8c37bff`; named-fixture medians/scaling, RSS, and sealed performance decisions remain pending. The current pre-R full RelWithDebInfo, serial ASAN, and exact 55-test TSan gates pass |
+| 8. Parallelize and pipeline candidate generation | sealed attempt 0 failed; optimized pre-R diagnostic passes; immutable retry pending | Attempt 0 at immutable product revision `94a63238d25a8e3262428419d53f8f0986e8879b` remains a sealed failure at W8/W1 `1.287784679`. The accounting-complete cleaned pre-R implementation has a non-accepting same-workload diagnostic ratio of `0.400917506349`, but it has no immutable product revision, retry capture, capture-tool identity, ledger, seal, or acceptance-evaluator decision. Preserve attempt 0; commit and test the product as revision R, then capture exact additive label `phase8-generation-retry1`. The current pre-R full RelWithDebInfo, serial ASAN, and exact 55-test TSan gates pass; Phase-7 comparison, immutable sealed retry, and all remaining final gates stay open |
+| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; final gates pending | Persistent pattern-parallel cache transactions, exact-state reuse, non-vacuous three-accept W1/2/4/8 semantics, crash-durable supplemental tooling, and counter/report contracts pass through `4ef6126`. The characterization and production manifests are sealed at SHA-256 `8dc08f393bccb4c8a609501f90cb3c949f1b44600ef967fa8038edc7fd399ed1` and `2f332c5d459b8f47901df015427cba3d4ead7daedac56e1fd9873882b5b65b39`; the accepted-update timing/RSS decision remains pending. The current pre-R full RelWithDebInfo, serial ASAN, and exact 55-test TSan gates pass |
+| 10. Integrate, tune defaults, and prove parity | implementation in progress | Cleanup review and the required in-tree semantic mode/worker matrix passed at `4ef6126`, as did its historical full RelWithDebInfo, ASAN, and exact 55-test TSan closure. The current pre-R full RelWithDebInfo, serial ASAN, and exact 55-test TSan gates have since passed. Sealed worker-policy/RSS/wall evidence and the conditional default decision remain pending |
 
 ### Deadline-overlap scheduling exception
 
@@ -438,6 +438,11 @@ policy, or default-selection gate.
     running them through frozen Phase-0 `dagutil`. Record the parent base hash,
     fixture hashes, canonical output, options, and counters. Never edit
     `baseline-408434e/workloads.tsv` to add them.
+
+This supplemental-manifest action is complete: the two Phase-7 manifests, the
+Phase-8 generation manifest, and the Phase-9 characterization and production
+manifests are sealed at the hashes in the status table. Their performance and
+cross-phase acceptance gates remain separate and open.
 
 ### Named Phase-0 workload contract
 
@@ -915,11 +920,159 @@ and the exact final TSan regex passes 55/55 with the pinned patched runtime and
 no diagnostic. The post-anchor full normal suite also has zero failures across
 176 registered tests at `51d2a3c` (174 pass and the same two tests skip).
 Those results close only the pre-cleanup correctness and sanitizer checkpoint.
-The current post-cleanup full RelWithDebInfo, ASAN, and targeted TSan gates pass
-at `4ef6126` as recorded under Phase 10 below. The supplemental fixture seal
-and all quiet-host generation, end-to-end, and RSS gates remain pending Phase
-0; a later production or conditional default change must rerun every affected
-final test gate.
+The last committed post-cleanup full RelWithDebInfo, ASAN, and targeted TSan
+gates passed at `4ef6126` as recorded under Phase 10 below. The current pre-R
+Phase-8 production changes reopened all three gates; the current full
+RelWithDebInfo and serial ASAN gates have since rerun and passed, while
+the exact targeted TSan gate has now also rerun and passed. The supplemental
+fixture seal and first quiet-host generation attempt have since been completed
+as recorded below. That attempt failed the generation-speed gate; end-to-end
+comparison, a sealed optimized retry, and all remaining final gates stay open.
+
+### Sealed generation attempt 0 (failed 2026-07-22)
+
+The original historical run label `phase8-generation` remains bound to full
+product revision `94a63238d25a8e3262428419d53f8f0986e8879b`. Its immutable
+capture-tool revision is
+`b6ae1a968c0a2374d8180e5682ae53775377c31e`. Its frozen supplement is
+sealed at SHA-256
+`773545d093904c20eaa80343615fa77089989735e61d34947530b07ef008cf17`.
+The frozen-oracle W1 characterization reports `1044.731 ms` of candidate
+generation and 256 post-dedup candidates, so the named fixture satisfies the
+required at-least-100-ms and at-least-256-candidate qualification.
+
+The quiet-host five-repetition capture is preserved at
+`/home/ogi-agent/matsen/larch2-wric-evidence/captures/phase8-generation/phase8-generation__workers-1-8__reps-5`.
+Its `raw_trials.tsv` SHA-256 is
+`e3eb3b3d9e77fc4006aa2c701102f39f84244971fae4f794bf66e5ca72cf4a56`,
+and its independently audited `wric-evidence-run-ledger.tsv` SHA-256 is
+`d22f42f31cf4e37bc92abc53e70f938d163f5fc422af68677c0f7dd7244841e1`.
+The W1 and W8 candidate-generation medians are respectively `48.783 ms` and
+`62.822 ms`: W8/W1 is `1.287784679`, which decisively fails the required
+`<= 0.50` gate.
+
+The failure is not semantic or a workload/RSS escape. All measured W1/W8 rows
+completed with successful validation and matching search/output semantics;
+each generated and scored 256 candidates and performed one exact
+verification, while both enumerated four sources and 405 moves with the same
+nine discarded source-speculative moves. Their maximum sampled RSS values are
+18,296 KiB and 18,516 KiB (`1.012` W8/W1), with no RSS-limit or swap event.
+Those supported gates pass, but they cannot compensate for the failed speed
+gate or close the still-uncaptured Phase-7 end-to-end comparison.
+
+Attempt 0 is immutable failure evidence. It must not be deleted, overwritten,
+relabelled, resealed around a different executable, or silently reused for a
+later product revision. The next optimized capture must use a new monotonically
+named run/capture label (starting with `phase8-generation-retry1`), a newly
+pinned immutable product revision and capture-tool identity, a distinct
+capture directory and ledger, and new external hash anchors. Later retries
+increment the suffix and remain additive. A retry may satisfy the Phase-8
+speed gate only on its own complete, independently auditable evidence; it does
+not replace this failed observation.
+
+### Accounting-complete cleaned pre-R diagnostic (non-accepting 2026-07-22)
+
+The post-attempt-0 optimization keeps the W1 projection path unchanged while
+allowing the bounded W>1 product path to retain up to 64 projection ordinals
+per worker. Projection uses four target ranges per worker; after it joins, a
+second unit-grain scheduler operation performs postconstruction filtering and
+canonical dedup-key construction before the serial gather publishes counters,
+errors, RNG/cap decisions, callbacks, and final order. The W>1 classic-locale
+dedup key is a count-delimited binary encoding with the same equality relation
+as the historical textual key. W1 and public/report signatures retain the
+historical representation; standalone custom-locale generation falls back to
+that representation, while finite W>1 sampled admission rejects a custom
+global locale before work rather than mixing an unaccounted encoding.
+Candidate-owned after-certificate references avoid a second direct-projection
+lookup pass.
+
+The finite-memory envelope now charges each retained signature, active-worker
+postprocessing scratch, its scheduler operation, and the binary dedup-set
+node. Runtime actual-capacity backstops and exact-budget rejection remain
+authoritative. The unit-grain projection experiment was reverted, and the
+superseded fast textual serializer and unused prepared-destination API were
+removed rather than retained as dormant alternatives.
+
+On the sealed Phase-8 fixture, one warmup plus five W1/W8 measured pairs in
+`build/wric-chart-parallelization/phase8-accounting-complete-clean-diagnostic/`
+produced:
+
+| Cleaned pre-R candidate-generation metric | W1 | W8 | Diagnostic result |
+|---|---:|---:|---|
+| five-trial values (ms) | 48.927, 48.828, 48.617, 48.498, 50.252 | 19.292, 18.819, 19.997, 19.576, 19.707 | complete |
+| median (ms) | 48.828 | 19.576 | W8/W1 = `0.400917506349` |
+| implied speedup | - | - | `2.494278709x` |
+
+All ten measured rows have successful execution and validation, identical
+search/output semantics, 256 generated and 256 scored candidates, and one
+exact verification. Maximum process RSS is 17,564 KiB at W1 and 17,628 KiB at
+W8; every row reports zero sampled swap. The exact diagnostic executable and
+`raw_trials.tsv` SHA-256 values are respectively
+`dd64567e43404c7bd86b80d2bd9319bb50d13b46974a40cf748274dd33d6fa5f`
+and
+`4bfd1339ae5021a82c473dd247687cbaf4b12b2b534e8dcffc3c604ed12985cc`.
+
+This is deliberately not attempt 1 and does not change the sealed attempt-0
+failure. It is a build-local pre-R diagnostic without an immutable product
+revision, the exact outer label `phase8-generation-retry1`, a newly pinned
+capture-tool revision, capture metadata, an independently audited ledger and
+seal, external hash anchors, or an acceptance-evaluator decision. It also
+does not close the Phase-7 end-to-end comparison. On the same current pre-R
+production tree, the exact commands
+
+```sh
+cmake --build build --parallel 8
+ctest --test-dir build --output-on-failure --parallel 8
+```
+
+completed the full RelWithDebInfo gate: 176 tests were registered, 174 passed,
+zero failed, and exactly `123 - merge_consistency_test` and
+`130 - rotaA_diagnostic_test` skipped for their unchanged reasons. CTest took
+197.38 seconds. This closes the current pre-R full normal gate only; revision
+R is still unknown, and any further product change reopens it. The current
+serial ASAN gate then used the plan's exact commands:
+
+```sh
+cmake -S . -B build-asan \
+  -DGCC_TOOLCHAIN=/home/ogi-agent/install/gcc-trunk \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DENABLE_ASAN=ON \
+  -DENABLE_TSAN=OFF
+cmake --build build-asan --parallel 8
+ASAN_OPTIONS=halt_on_error=1:detect_leaks=1 \
+  ctest --test-dir build-asan --output-on-failure --parallel 1
+```
+
+The serial ASAN CTest registered 176 tests: 174 passed, zero failed, and
+exactly `123 - merge_consistency_test` and `130 - rotaA_diagnostic_test`
+skipped for their unchanged reasons. It took 842.54 seconds. A grep of
+`build-asan/Testing/Temporary/LastTest.log` found no `AddressSanitizer`,
+`LeakSanitizer`, or detected-leak diagnostic. This closes the current pre-R
+ASAN gate only; revision R is still unknown, and any further product change
+reopens both current gates.
+
+The current targeted TSan gate used the exact 55-test regex in the `### TSAN`
+section below. Its selected inventory is preserved at
+`build/wric-chart-parallelization/phase8-tsan-pre-r/inventory.log`, SHA-256
+`b49508c42ca10a2bc94ed54bf826edb57abc0540867fda3676c31ae8db72da86`.
+`LD_LIBRARY_PATH` selected the validated patched runtime first and GCC-trunk
+`lib64` second, without `LD_PRELOAD`; representative `ldd` output confirms
+that selection. Patched `libtsan.so.2.0.0` has SHA-256
+`58725dae226e91ea96bebbdf54f84820638404a691528570ec1dab595ed08842`.
+With serial CTest and `TSAN_OPTIONS=halt_on_error=1`, all 55 selected tests
+passed with zero failures in 288.11 seconds. The CTest output contains exactly
+55 `Passed` records, the preserved LastTest log contains exactly 55
+`<end of output>` records, and the diagnostic scan has no match. The CTest and
+LastTest log SHA-256 values are
+`09fc0239311c114810fbd7f6623452d6df3de90b9ecbd94cfbdde03860b7a25f`
+and
+`18d2bc1c7552db146d4ed98d039cb4135f41204fa4fab8df3b04601de1ae5628`.
+
+This closes the current pre-R TSan gate only. Revision R, additive retry
+tooling revision C, and sealed retry1 remain unknown or pending, and any
+further product change reopens all three current test/sanitizer gates. Commit
+product revision R, implement and test additive retry tooling, and
+capture/seal/audit retry1 before changing Phase-8 status.
 
 ### Goal
 
@@ -1050,6 +1203,10 @@ has the same result with no diagnostic, and the exact targeted TSan matrix
 passes 55/55 with no diagnostic. These are correctness and sanitizer results,
 not Phase-0, timing, scaling, RSS, supplement, automatic-policy, or default
 evidence. Their exact commands and hashes are recorded in the results ledger.
+The current pre-R Phase-8 production changes postdate and reopen the complete
+normal, ASAN, and targeted TSan gates. The full normal and serial ASAN gates
+have since rerun and passed on the current pre-R tree; the exact 55-test TSan
+gate has now also rerun and passed.
 
 ### Actions
 
@@ -1450,12 +1607,22 @@ The `/goal` is complete only when all boxes can truthfully be checked:
       such an action never waives the phase's exit criteria.
 - [x] Canonical semantics match at every worker count assigned to each case by
       the required matrix; scheduler cases additionally cover `0/auto` and 16.
-- [x] Full RelWithDebInfo CTest passes at `4ef6126`; rerun after any later
-      production/default change.
-- [x] Full ASAN CTest passes without diagnostics at `4ef6126`; rerun after any
-      later production/default change.
-- [x] Targeted TSAN CTest passes without diagnostics at `4ef6126`; rerun after
-      any later production/default change.
+- [x] Current pre-R full RelWithDebInfo build and CTest pass: 176 tests were
+      registered, 174 passed, zero failed, and exactly
+      `123 - merge_consistency_test` and `130 - rotaA_diagnostic_test` skipped
+      for their unchanged reasons in 197.38 seconds. Revision R remains to be
+      assigned; any further product change reopens this gate.
+- [x] Current pre-R full serial ASAN CTest passes with leak detection: 176
+      tests were registered, 174 passed, zero failed, and exactly
+      `123 - merge_consistency_test` and `130 - rotaA_diagnostic_test` skipped
+      for their unchanged reasons in 842.54 seconds. `LastTest.log` has no
+      AddressSanitizer, LeakSanitizer, or detected-leak diagnostic. Revision R
+      remains to be assigned; any further product change reopens this gate.
+- [x] Current pre-R targeted TSAN CTest selects the exact 55-test inventory and
+      passes 55/55 serially with zero failures in 288.11 seconds under the
+      pinned patched runtime and `TSAN_OPTIONS=halt_on_error=1`; output-record
+      counts are complete and the diagnostic scan has no match. Revision R
+      remains to be assigned; any further product change reopens this gate.
 - [ ] Primary medium grammar-exact wall parity passes exactly as specified.
 - [ ] Eight-worker grammar exact is at least 2.0x faster than one worker.
 - [ ] RSS, chart-memory, and concurrent-verifier bounds pass.

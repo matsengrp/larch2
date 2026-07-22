@@ -4,10 +4,12 @@
 
 This ledger records evidence for
 `doc/WRIC-CHART-PARALLELIZATION-PLAN.md`. It is intentionally incomplete:
-Phase 0 is now completely captured, audited, and sealed, while later-phase
-performance and supplemental-manifest gates remain open. The sealed base has
-13 captures: 267 ordinary canonical rows across 60 repeat stages, 27 approved
-timeouts, and two real-fixture W1/W8 expected-infeasible refusal observations.
+Phase 0 is now completely captured, audited, and sealed. The Phase-7/8/9
+supplemental manifests have also been captured, audited, and sealed, while
+their performance, RSS, cross-phase, and final acceptance decisions remain
+open. The sealed base has 13 captures: 267 ordinary canonical rows across 60
+repeat stages, 27 approved timeouts, and two real-fixture W1/W8
+expected-infeasible refusal observations.
 The pending and final audits and strict smokes passed. The workload-manifest
 SHA-256 is
 `32ae82a93cb72a28afaa510391eac83f80f13638d46e1513881d2b484c9dc3ae`,
@@ -41,10 +43,10 @@ committed. Phase-0 artifacts use the non-overwriting directory
 | 4. Parallelize patterns and local scoring | implementation complete; performance acceptance pending | code checkpoint `cbf92b6` and evidence checkpoint `1be6ffe`; full RelWithDebInfo and targeted TSan gates pass; sealed scaling/RSS gates pending |
 | 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 6/final gates | `bb29300` plus harness fix `3a10e9c` pass post-omission semantics, full CTest, and targeted TSAN; diagnostic exact-phase scaling exceeds 2x; unified frontier/candidate admission and final timing/RSS remain pending |
 | 6. Parallelize exact top-K candidates | implementation complete; performance acceptance pending | code checkpoint `870c298`; in-tree Top-K/worker semantics, stable failures, deterministic scheduling, functional bounded admission, full RelWithDebInfo CTest, and targeted TSan pass; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS remain pending |
-| 7. Make lazy charts scalable and adaptive | implementation complete; performance acceptance pending | packed deterministic grouping, dependency wavefronts, exact transient admission, and frozen `off|on|auto` policy pass through `38e9a28`; current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`, while production supplements and sealed timing/RSS remain pending |
-| 8. Parallelize and pipeline candidate generation | implementation hardening complete; final gates pending | source waves, stable direct-projection workspaces, nested-workspace quarantine, seeded reservoir ordering, and realizable outer/direct width-two boundaries are committed through `94a6323`; `51d2a3c` pins production generation evidence to that checkpoint. Current post-cleanup full RelWithDebInfo, complete ASAN, focused matrix, and exact 55-test TSan gates pass at `4ef6126`; supplemental sealing, quiet-host speed, Phase-7 comparison, and paired RSS remain pending |
-| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; final gates pending | persistent pattern-parallel commits, exact frontier reuse, non-vacuous three-accept W1/2/4/8 evidence, durable supplement publication, and abort-evidence hygiene pass through `4ef6126`; current post-cleanup full RelWithDebInfo, complete ASAN, and targeted TSan gates pass at `4ef6126`, while supplemental capture/seal and timing/RSS remain pending |
-| 10. Integrate, tune defaults, and prove parity | implementation in progress | cleanup review and the complete in-tree required mode/worker matrix pass at `4ef6126`, as do the current post-cleanup full RelWithDebInfo, complete ASAN, and exact 55-test TSan gates. Sealed automatic-policy/RSS/wall gates, supplemental sealing, and the conditional default decision remain pending; any later production/default change reopens affected final gates |
+| 7. Make lazy charts scalable and adaptive | implementation complete; performance acceptance pending | packed deterministic grouping, dependency wavefronts, exact transient admission, and frozen `off\|on\|auto` policy pass through `38e9a28`; `phase7-lazy.tsv` and `phase7-lazy-completion.tsv` are sealed at SHA-256 `82250bb26d5394d3c2c616e4ccbf606e80eca074e560fd8e3361274655e56718` and `7b934fa0ad8279893d03321724935dccf8df99fa840899652dccdc63c8c37bff`, while timing/scaling/RSS decisions remain pending; the current pre-R full RelWithDebInfo, serial ASAN, and exact 55-test TSan gates pass |
+| 8. Parallelize and pipeline candidate generation | sealed attempt 0 failed; optimized pre-R diagnostic passes; immutable retry pending | attempt 0 at product `94a63238d25a8e3262428419d53f8f0986e8879b` remains a sealed failure at W8/W1 `1.287784679`; the accounting-complete cleaned pre-R implementation has a non-accepting diagnostic ratio of `0.400917506349`, and the current pre-R full RelWithDebInfo, serial ASAN, and exact 55-test TSan gates pass, but product revision R, additive capture tooling revision C, sealed `phase8-generation-retry1`, Phase-7 comparison, and evaluator acceptance all remain pending |
+| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; final gates pending | persistent pattern-parallel commits, exact frontier reuse, non-vacuous three-accept W1/2/4/8 evidence, durable supplement publication, and abort-evidence hygiene pass through `4ef6126`; characterization and production manifests are sealed at SHA-256 `8dc08f393bccb4c8a609501f90cb3c949f1b44600ef967fa8038edc7fd399ed1` and `2f332c5d459b8f47901df015427cba3d4ead7daedac56e1fd9873882b5b65b39`, while accepted-update timing/RSS remain pending; the current pre-R full RelWithDebInfo, serial ASAN, and exact 55-test TSan gates pass |
+| 10. Integrate, tune defaults, and prove parity | implementation in progress | cleanup review and the complete in-tree required mode/worker matrix passed at `4ef6126`, as did its historical full RelWithDebInfo, ASAN, and exact 55-test TSan closure; the current pre-R full RelWithDebInfo, serial ASAN, and exact 55-test TSan gates have since passed; sealed automatic-policy/RSS/wall evidence plus the conditional default decision remain pending |
 
 ## Phase 0 — immutable provenance
 
@@ -281,9 +283,11 @@ the authoritative manifest.
 | `test/wric_two_polytomy.nwk` | `e41d284185c20c48166894306f63553b588976c4c6aa49509b7a5a1d00da1ceb` |
 | `test/wric_two_polytomy.ref` | `06f961b802bc46ee168555f066d28f4f0e9afdf3f88174c1ee6f9de004fc30a0` |
 
-Phase-7/8/9 fixtures do not yet exist and therefore have no checksum or
-historical performance result. They must be added through append-only
-supplemental manifests after frozen-oracle characterization.
+At the Phase-0 seal, Phase-7/8/9 fixtures did not yet exist in the base
+manifest and therefore had no Phase-0 performance result. They were
+subsequently added through append-only frozen-oracle characterization and the
+five sealed supplemental manifests whose hashes are recorded in the current
+status table; no base row was replaced.
 
 ### 20D bounded-real preflight classification
 
@@ -593,8 +597,8 @@ row, never a blank or imputed result. Later supplements remain separate.
 | `exact-medium-one` | `grammar_exact`, 1/1, 600 s | 1 and 8 required | four approved timeout rows captured in `medium-exact1-physical` |
 | `exact-medium-topk4` | `grammar_exact`, 32/4 | matrix | captured in physical-core and SMT primary captures, with approved timeout rows |
 | `lazy-compression-medium` | `grammar_lower_bound`, 64/0, forced lazy | matrix | captured in `medium-lazy64-physical` |
-| `sampled-generation-high` | `sampled_tree_fixed`, at least 256/1 | later supplement | fixture pending |
-| `local-commit-three` | `grammar_exact`, 32/4, 3 iterations, local commit | later supplement | fixture pending |
+| `sampled-generation-high` | `sampled_tree_fixed`, at least 256/1 | later supplement | sealed in `phase8-generation.tsv` at SHA-256 `773545d093904c20eaa80343615fa77089989735e61d34947530b07ef008cf17` |
+| `local-commit-three` | `grammar_exact`, 32/4, 3 iterations, local commit | later supplement | characterization and production manifests sealed at SHA-256 `8dc08f393bccb4c8a609501f90cb3c949f1b44600ef967fa8038edc7fd399ed1` and `2f332c5d459b8f47901df015427cba3d4ead7daedac56e1fd9873882b5b65b39` |
 
 ### Unsealed diagnostic characterization
 
@@ -1598,9 +1602,9 @@ the high-compression PB/ref SHA-256 values are
 the dense-favoring values are
 `e8dcd803ba2cd82ed594dbe66433934a62b3711ea7ddb0d349de35ef86030dd6` and
 `b16c732ac5692f8644afc19f0c454422c381e9d88eff5dacb40ac96a603f8404`.
-These hashes remain pinned by the committed regenerator and will be copied
-into the immutable supplemental manifest only during the later quiet-host
-Phase-0 seal.
+These hashes remain pinned by the committed regenerator and were subsequently
+bound into the sealed `phase7-lazy.tsv` and `phase7-lazy-completion.tsv`
+manifests recorded in the current status table.
 
 At `c08602b`, the GCC-trunk RelWithDebInfo command
 `ctest --test-dir build --output-on-failure -R
@@ -1639,7 +1643,8 @@ internal child whose sparse maps remain readable through both same-level
 parents and are reclaimed only at the level barrier. Lazy inside/outside clade
 axes are included in scheduler reconciliation and the dagutil report.
 
-On the clean current main worktree, the GCC-trunk RelWithDebInfo command
+On the clean worktree at that historical checkpoint, the GCC-trunk
+RelWithDebInfo command
 `ctest --test-dir build --output-on-failure -R
 '^(chart_parallel_test|chart_spr_search_test|multifurcation_chart_oracle_test|lazy_key_grouping_test)$'`
 passed 4/4 tests in 7.71 seconds; `dagutil` compiled, `git diff --check` was
@@ -1698,7 +1703,7 @@ overhead in its inside half. A second nested pattern/representative staging
 axis is therefore not justified. These measurements support only that
 conditional omission and are not sealed Phase-7 performance acceptance.
 
-The current main worktree rebuilt `chart_spr_search_test`,
+The worktree at the `38e9a28` checkpoint rebuilt `chart_spr_search_test`,
 `chart_spr_allocation_test`, `chart_spr_phase10_test`, `chart_parallel_test`,
 `dagutil`, `larch2`, and the counter compile check. The build log SHA-256 is
 `7521135fbfa6a5467afa63de43419baccdfd64c6ec509d5751f4c54323a8a4b5`.
@@ -1712,15 +1717,19 @@ A separate clean-tip review also passed the benchmark-harness regression and
 found no branch-specific accounting, scheduler-axis, formatting, or CLI
 blocker. Changed-line clang-format and `git diff --check` are clean.
 
-This is not the Phase-7 exit decision. Quiet-host forced-off/forced-on/auto
-medians on both named fixtures, the `phase7-lazy.tsv` supplemental manifest,
-the required high-fixture and small-fixture scaling/overhead comparisons,
-paired RSS, sparse-reclamation TSan, full RelWithDebInfo CTest, and final
-sanitizer gates remain pending. Under the authorized deadline-overlap rule,
-implementation proceeds to Phase 8 without substituting the diagnostics above
-for those gates.
+This was not the Phase-7 exit decision. The later production manifests are now
+sealed: `phase7-lazy.tsv` has SHA-256
+`82250bb26d5394d3c2c616e4ccbf606e80eca074e560fd8e3361274655e56718`,
+and `phase7-lazy-completion.tsv` has SHA-256
+`7b934fa0ad8279893d03321724935dccf8df99fa840899652dccdc63c8c37bff`.
+Quiet-host forced-off/forced-on/auto medians, the required high-fixture and
+small-fixture scaling/overhead comparisons, paired RSS, sparse-reclamation
+TSan remain pending. The current full normal, serial ASAN, and exact 55-test
+TSan gates have since passed as recorded under Phase 8. Under the authorized
+deadline-overlap rule, implementation proceeded to Phase 8 without
+substituting the earlier diagnostics for the remaining gates.
 
-## Phase 8 implementation checkpoint (unsealed)
+## Historical Phase 8 implementation checkpoint (unsealed)
 
 Phase 8 has a **functionally passing implementation checkpoint; final
 performance acceptance pending** at
@@ -1776,7 +1785,8 @@ overlap, drain, stale-work discard, and scheduler recovery.
 
 ### Functional evidence
 
-The current main worktree rebuilt `larch`, `chart_spr_test`,
+The worktree at that implementation checkpoint rebuilt `larch`,
+`chart_spr_test`,
 `chart_spr_pipeline_test`, `chart_spr_search_test`, and
 `chart_spr_allocation_test` with the required GCC-trunk C++26 RelWithDebInfo
 toolchain. The registered focused command
@@ -1858,12 +1868,12 @@ The copied raw outputs are under
 `build/wric-chart-parallelization/phase8-45573cb-main/source-waves-unsealed/`
 and `direct-projection-unsealed/`.
 
-These measurements are deliberately not an exit decision: unrelated host
-compilation was active, Phase 0 is not calibrated/sealed, and the Phase-8
-supplemental manifest has not been created. The quiet-host run must either pass
-the 2.0x gate or trigger another profile-supported optimization cycle; it must
-also establish Phase-7 end-to-end non-regression and paired RSS. This checkpoint
-does not reinterpret the observed miss or substitute it for sealed evidence.
+These measurements were deliberately not an exit decision: unrelated host
+compilation was active, Phase 0 was not yet calibrated/sealed, and the Phase-8
+supplemental manifest had not yet been created. Phase 0 and the supplement were
+subsequently sealed, and sealed generation attempt 0 failed as recorded below.
+This historical checkpoint does not reinterpret that miss or substitute for
+the later sealed evidence.
 
 ### Stable-slot, reservoir, and finite-envelope hardening (current through `94a6323`)
 
@@ -1911,9 +1921,12 @@ and
 (SHA-256
 `676d55384d07c861e4d8a89ecb5e847863c249c5490770601e3e284102d06009`).
 
-This focused evidence is not a Phase-8 exit decision. The Phase-8 supplemental
-capture/seal, quiet-host 2x generation cycle, Phase-7 end-to-end comparison,
-and paired RSS gate remain pending; the Phase-0 prerequisite is now sealed.
+This focused evidence was not a Phase-8 exit decision. The Phase-8 supplement
+was subsequently sealed at SHA-256
+`773545d093904c20eaa80343615fa77089989735e61d34947530b07ef008cf17`,
+and sealed attempt 0 subsequently failed the 2x generation gate. The additive
+optimized retry, Phase-7 end-to-end comparison, and remaining RSS decision
+remain pending.
 
 ### Latest complete pre-cleanup correctness and sanitizer closure (`51d2a3c`)
 
@@ -2103,15 +2116,236 @@ The evidence is under `build/wric-chart-parallelization/tsan-4ef6126/`; its
 The sanitizer rebuilds overlapped each other and the unrelated proof-assist
 campaign; the normal and sanitizer tests also ran while unrelated host work
 was present. Their elapsed times are operational diagnostics only. These
-results close the current post-cleanup functional and sanitizer gates, but no
-Phase-0, supplement, performance, scaling, RSS, automatic-policy, or default
-gate. Any later production/default change reopens every affected test gate.
+results closed the post-cleanup functional and sanitizer gates at `4ef6126`,
+but no Phase-0, supplement, performance, scaling, RSS, automatic-policy, or
+default gate. The current pre-R Phase-8 production changes postdate and reopen
+the complete normal, ASAN, and targeted TSan gates. The current full normal
+and serial ASAN suites have since rerun and passed as recorded below; the
+targeted TSan suite has now also rerun and passed.
 
-## Phase 9 accepted-state update checkpoint (unsealed)
+### Sealed Phase-8 generation attempt 0 (failed 2026-07-22)
+
+The first production capture is a valid sealed failed attempt, not a pending
+or discardable diagnostic. Historical run label `phase8-generation` is bound
+to full product revision
+`94a63238d25a8e3262428419d53f8f0986e8879b`; its immutable capture-tool
+revision is `b6ae1a968c0a2374d8180e5682ae53775377c31e`. The independently
+audited Phase-8 supplemental manifest is sealed at SHA-256
+`773545d093904c20eaa80343615fa77089989735e61d34947530b07ef008cf17`.
+Its frozen-oracle W1 characterization records `1044.731 ms` of candidate
+generation and 256 post-dedup candidates, qualifying the named fixture against
+the plan's minimum 100 ms and 256 candidates.
+
+The five-repetition W1/W8 capture is preserved at
+`/home/ogi-agent/matsen/larch2-wric-evidence/captures/phase8-generation/phase8-generation__workers-1-8__reps-5`.
+Its `raw_trials.tsv` SHA-256 is
+`e3eb3b3d9e77fc4006aa2c701102f39f84244971fae4f794bf66e5ca72cf4a56`.
+Its independently audited `wric-evidence-run-ledger.tsv` SHA-256, also
+recorded by its detached seal, is
+`d22f42f31cf4e37bc92abc53e70f938d163f5fc422af68677c0f7dd7244841e1`.
+
+| Attempt-0 candidate-generation metric | W1 | W8 | Decision |
+|---|---:|---:|---|
+| five-trial values (ms) | 49.089, 48.520, 48.628, 48.783, 49.819 | 61.907, 65.186, 61.478, 62.822, 64.901 | complete |
+| median (ms) | 48.783 | 62.822 | W8/W1 = `1.287784679` |
+| required W8/W1 | - | - | `<= 0.50`: **fail** |
+
+All ten measured rows exited normally with `status=ok` and
+`validation_status=ok`. W1 and W8 have identical search-semantic and
+output-semantic SHA-256 values, validated objective 174, 256 generated and 256
+scored candidates, and one exact verification. Both enumerate four sampled
+sources and preassign/visit 405 moves, with the same nine discarded
+source-speculative moves; the differing direct-projection counts are permitted
+joined speculative tails rather than different canonical work. Thus the
+supported semantic and canonical-work gates pass.
+
+The maximum sampled RSS is 18,296 KiB at W1 and 18,516 KiB at W8, a W8/W1
+ratio of approximately `1.012`; every measured row reports zero sampled swap,
+no RSS-limit trigger, and no timeout. The supported paired-ratio and configured
+RSS-limit checks therefore pass. The capture does not contain the separate
+Phase-7 end-to-end comparison and makes no claim to close it. Whole-process W8
+wall time being slightly lower than W1 also cannot substitute for the explicit
+candidate-generation metric required by the exit criterion.
+
+**Attempt-0 decision:** fail Phase 8. The `1.287784679` generation ratio is
+above `0.50`, so capture execution stopped before the remaining campaign
+components. This capture, its supplement, ledger, hashes, label, and product
+revision remain permanent evidence and must not be removed, overwritten,
+relabelled, or resealed to describe another executable.
+
+Optimization evidence proceeds monotonically. The next full attempt must use
+a fresh label beginning with `phase8-generation-retry1`, pin a new immutable
+product revision and capture-tool identity, write a distinct capture directory
+and ledger, and publish new external hash anchors; further attempts increment
+the suffix. The acceptance evaluator may consume a successful retry only as
+an additive successor while continuing to retain and audit attempt 0. A retry
+cannot alter this result or inherit its speed decision.
+
+### Accounting-complete cleaned pre-R diagnostic (non-accepting 2026-07-22)
+
+The cleaned post-attempt-0 product retains the bounded source-wave and stable
+ordinal contracts while deepening only the W>1 product projection wave to at
+most 64 ordinals per worker; W1 retains its historical width four. Projection
+uses four target ranges per worker. Once projection joins, a second unit-grain
+scheduler operation performs postconstruction filters and constructs each
+canonical dedup key before the serial gather alone publishes filter counters,
+chooses the first observable failure, advances RNG/caps, invokes callbacks,
+and fixes final candidate order.
+
+The W>1 classic-locale path uses a fixed-width, count-delimited binary taxon
+key with the exact equality relation of the historical textual key. Public and
+cross-run signatures and W1 behavior retain the historical representation.
+Standalone custom-locale generation falls back to that representation; finite
+W>1 sampled admission rejects a custom global locale before work rather than
+mixing an encoding outside its bound. The W>1 direct builder also records
+after-certificate production references in candidate-owned storage during its
+first lookup pass rather than repeating those lookups. The unified finite-
+memory envelope charges retained per-slot key capacity, active-worker
+postprocessing scratch, the postprocessing scheduler operation, and the binary
+dedup-set node; runtime capacity backstops and exact pre-work budget rejection
+remain in force.
+
+No abandoned alternative is carried into the prospective product revision.
+The slower unit-grain projection-range experiment was reverted, the
+superseded fast textual signature family was removed after the binary key
+replaced its only product use, and the unintegrated prepared-destination API
+and tests were removed.
+
+The quiet-host development command used one warmup and five measured W1/W8
+pairs with full canonical correctness. Its build-local output is
+`build/wric-chart-parallelization/phase8-accounting-complete-clean-diagnostic/`.
+
+| Cleaned pre-R candidate-generation metric | W1 | W8 | Diagnostic result |
+|---|---:|---:|---|
+| five-trial values (ms) | 48.927, 48.828, 48.617, 48.498, 50.252 | 19.292, 18.819, 19.997, 19.576, 19.707 | complete |
+| median (ms) | 48.828 | 19.576 | W8/W1 = `0.400917506349` |
+| implied speedup | - | - | `2.494278709x` |
+| maximum process RSS (KiB) | 17,564 | 17,628 | W8/W1 = `1.003644` |
+
+All ten measured rows exited normally with `status=ok` and
+`validation_status=ok`, generated and scored 256 candidates, performed one
+exact verification, and reported zero sampled swap. Every row has search-
+semantic SHA-256
+`be6e4a8819b89a419840395ba30bb63e323ecb36c6a57aba96555037bd0dcbf8`
+and output-semantic SHA-256
+`281ca02744aca9054a9ca328804a7ec4caca1402a82f237cf747d78a08caedb6`.
+The measured executable SHA-256 is
+`dd64567e43404c7bd86b80d2bd9319bb50d13b46974a40cf748274dd33d6fa5f`;
+the `raw_trials.tsv` SHA-256 is
+`4bfd1339ae5021a82c473dd247687cbaf4b12b2b534e8dcffc3c604ed12985cc`.
+
+**Diagnostic decision:** this establishes performance headroom for committing
+the optimized implementation, but it is not Phase-8 acceptance and is not
+attempt 1. The run predates immutable product revision R and has no exact
+outer `phase8-generation-retry1` label, newly pinned capture-tool revision C,
+capture metadata, independent artifact ledger/seal, external immutable hash
+anchor, heterogeneous-tool audit, or acceptance-evaluator decision. It also
+does not include the separate Phase-7 end-to-end comparison. Full
+RelWithDebInfo CTest has since passed on the current pre-R tree as recorded
+below. Serial ASAN with leak detection and the exact serial patched-runtime
+TSan matrix have also passed as recorded below. A later additive retry1
+captured from clean immutable R by committed tooling C can supersede attempt 0
+for the current speed decision; it may not remove or rewrite the failed
+historical evidence.
+
+### Current pre-R full RelWithDebInfo closure (2026-07-22)
+
+The current production tree built and passed the complete normal suite with
+the exact commands
+
+```sh
+cmake --build build --parallel 8
+ctest --test-dir build --output-on-failure --parallel 8
+```
+
+CTest registered 176 tests: 174 passed, zero failed, and exactly
+`123 - merge_consistency_test` and `130 - rotaA_diagnostic_test` skipped for
+their unchanged reasons. Total CTest time was 197.38 seconds.
+
+This closes the full RelWithDebInfo gate only for the current pre-R production
+bytes. Immutable product revision R has not yet been assigned, so this result
+does not close TSan, Phase-8 performance/retry acceptance, or any sealed
+R-specific gate. Any further product change reopens the normal gate.
+
+### Current pre-R serial ASAN closure (2026-07-22)
+
+The current production tree used the plan's exact ASAN configure, build, and
+serial test commands:
+
+```sh
+cmake -S . -B build-asan \
+  -DGCC_TOOLCHAIN=/home/ogi-agent/install/gcc-trunk \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DENABLE_ASAN=ON \
+  -DENABLE_TSAN=OFF
+cmake --build build-asan --parallel 8
+ASAN_OPTIONS=halt_on_error=1:detect_leaks=1 \
+  ctest --test-dir build-asan --output-on-failure --parallel 1
+```
+
+CTest registered 176 tests: 174 passed, zero failed, and exactly
+`123 - merge_consistency_test` and `130 - rotaA_diagnostic_test` skipped for
+their unchanged reasons. Total CTest time was 842.54 seconds. A grep of
+`build-asan/Testing/Temporary/LastTest.log` found no `AddressSanitizer`,
+`LeakSanitizer`, or detected-leak diagnostic.
+
+This closes the full serial ASAN gate only for the current pre-R production
+bytes. Immutable product revision R has not yet been assigned, and Phase-8
+retry acceptance remains pending. Any further product change reopens both the
+normal and ASAN gates.
+
+### Current pre-R targeted TSan closure (2026-07-22)
+
+The exact final regex selected the following 55-test inventory:
+
+```sh
+TSAN_REGEX='^(thread_pool_test|chart_parallel_test|chart_scheduler_test|parsimony_chart_test|chart_trim_test|chart_bnb_trim_apply_test|chart_spr_test|chart_spr_search_test|chart_spr_pipeline_test|chart_two_chart_oracle_test|multifurcation_chart_oracle_test|overlay_chain_test|inside_chart_cache_test|outside_chart_cache_test|chart_spr_phase10_test|dagutil_chart_spr_.*|dagutil_wric_phase9_chart_bnb_.*|dagutil_wric_lazy_chart_.*|dagutil_wric_lazy_polytomy_fixed_topology_search|larch2_chart_bnb_.*|wric_bnb_trim_benchmark_smoke)$'
+ctest --test-dir build-tsan -N -R "$TSAN_REGEX"
+```
+
+The full numbered selection is preserved at
+`build/wric-chart-parallelization/phase8-tsan-pre-r/inventory.log`, SHA-256
+`b49508c42ca10a2bc94ed54bf826edb57abc0540867fda3676c31ae8db72da86`.
+It contains exactly `Total Tests: 55`.
+
+The serial run used the validated patched runtime through search-path
+selection, not preloading:
+
+```sh
+LD_LIBRARY_PATH="$PWD/build/wric-chart-parallelization/phase3-7d294d6/patched-tsan-runtime:/home/ogi-agent/install/gcc-trunk/lib64" \
+TSAN_OPTIONS=halt_on_error=1 \
+  ctest --test-dir build-tsan --output-on-failure --parallel 1 \
+    -R "$TSAN_REGEX"
+```
+
+`LD_PRELOAD` was not used. Representative `ldd` output preserved as
+`build/wric-chart-parallelization/phase8-tsan-pre-r/ldd.log` resolves
+`libtsan.so.2` to the Phase-3 patched runtime, then `libstdc++.so.6` and
+`libgcc_s.so.1` to GCC-trunk `lib64`. Its SHA-256 is
+`92616f6be163505716926f945ea73b5b3c3ec6b14d2a454c01f3b62fd41a4ba6`.
+The resolved `libtsan.so.2.0.0` SHA-256 is
+`58725dae226e91ea96bebbdf54f84820638404a691528570ec1dab595ed08842`.
+
+All 55 selected tests passed serially with zero failures in 288.11 seconds.
+The CTest output contains exactly 55 `Passed` records, and the preserved
+LastTest log contains exactly 55 `<end of output>` records. Scanning both logs
+finds no TSan warning, fatal, summary, race, lock-order, publication, or
+thread-leak diagnostic. The artifacts and SHA-256 values are:
+
+| Current pre-R TSan artifact | SHA-256 |
+|---|---|
+| `build/wric-chart-parallelization/phase8-tsan-pre-r/targeted.ctest.log` | `09fc0239311c114810fbd7f6623452d6df3de90b9ecbd94cfbdde03860b7a25f` |
+| `build/wric-chart-parallelization/phase8-tsan-pre-r/targeted.LastTest.log` | `18d2bc1c7552db146d4ed98d039cb4135f41204fa4fab8df3b04601de1ae5628` |
+
+This closes the exact targeted TSan gate only for the current pre-R production
+bytes. Immutable product revision R, additive retry tooling revision C, and
+sealed Phase-8 retry1 remain pending. Any further product change reopens the
+normal, ASAN, and TSan gates.
+
+## Phase 9 accepted-state update checkpoint (supplements sealed; performance pending)
 
 Phase 9 has a **functionally passing implementation checkpoint; acceptance
-pending supplement sealing, the accepted-update timing decision, and the RSS
-gates** at `19e26db`
+pending the accepted-update timing decision and paired RSS** at `19e26db`
 (`Clear aborted accept transaction evidence`). The immutable measurement
 checkpoint remains `7ca527b8906d018124756182274335cbff936d72`, whose exact
 subject is `Baseline measure`; it is an ancestor of this checkpoint and has
@@ -2161,9 +2395,9 @@ The frozen W1 diagnostic report
 has SHA-256
 `bb11a83a067faf9cb82737422bbb48ea98e78def6127796660c296e782aadcaa`.
 It measured 179.878 ms of accepted update in 915602.498 ms total, or
-0.019646%. This one row is diagnostic only: the plan requires all twelve
-frozen seed/worker rows before the below-10% speed exemption can be decided.
-No Phase-9 speed or RSS claim is made here.
+0.019646%. This one row is diagnostic only. The required twelve-row
+characterization and production manifests have since been sealed, but no
+accepted-update speed exemption/decision or RSS claim is made here.
 
 Commits `2f7f8f8` through `0f7b336` add and harden the supplemental acceptance
 pipeline. It validates every captured report/output/identity hash and score
@@ -2173,9 +2407,13 @@ audit before live publication, and ownership-safe recovery at every injected
 crash boundary. Regression tests cover symlink/hardlink/forged journals,
 foreign-target races, cross-control-path collisions, partial and complete
 invalid journals, and post-rename recovery. The canonical
-`build/wric-chart-parallelization/supplements/phase9-local-commit.tsv` bundle
-has not yet been captured or sealed; tooling success is not represented as a
-sealed supplement.
+`build/wric-chart-parallelization/supplements/phase9-local-commit.characterization.tsv`
+and `phase9-local-commit.tsv` bundles are now sealed at SHA-256
+`8dc08f393bccb4c8a609501f90cb3c949f1b44600ef967fa8038edc7fd399ed1`
+and
+`2f332c5d459b8f47901df015427cba3d4ead7daedac56e1fd9873882b5b65b39`,
+respectively. Their sealing does not itself decide the speed exemption or RSS
+gate.
 
 ### Interim functional evidence
 
@@ -2193,17 +2431,19 @@ parity, three committed moves, exact masks, chain identity, and canonical full
 sidecar parity. Earlier at `b648c42`, the targeted ASAN command for the
 canonical CLI/report, bootstrap/acceptance, search, and persistent cache tests
 passed 9/9 in 269.87 seconds without diagnostics. That sanitizer run predates
-the latest report/matrix changes and is interim evidence only. The current
+the latest report/matrix changes and is interim evidence only. The historical
 post-cleanup complete normal/ASAN and exact targeted TSan gates are recorded
 under the `4ef6126` closure section above; they include both persistent cache
-tests and pass without diagnostics. The expanded Phase-9 production matrix at
-that checkpoint covers multiparent and non-vacuous local multi-accept paths at
-W1/2/4/8 with exact canonical parity and non-vacuous scheduler evidence.
+tests and passed without diagnostics. The expanded Phase-9 production matrix
+at that checkpoint covers multiparent and non-vacuous local multi-accept paths
+at W1/2/4/8 with exact canonical parity and non-vacuous scheduler evidence.
+Current pre-R Phase-8 production changes reopened all three global gates. The
+current full normal, serial ASAN, and exact targeted TSan gates have since
+rerun and passed.
 
-Phase 9 remains open for the immutable twelve-row supplement capture/audit/seal,
-the accepted-update exemption or 1.5x speed decision, and paired RSS. A later
-conditional default change would require the complete normal and sanitizer
-gates to be rerun at the default-change descendant.
+Phase 9 remains open for the accepted-update exemption or 1.5x speed decision,
+and paired RSS. A later conditional default change would require the affected
+test and sanitizer gates to be rerun at the default-change descendant.
 
 ## Phase-7/9 evidence-production tooling checkpoint
 
@@ -2212,8 +2452,9 @@ Phase 9 characterization`),
 `3359fbf359576c48cc0de88ded0319b549f2c310` (`Complete Phase 7
 workload matrix`), and `c5156a84c67acce2e40d2a3c3115d89738f40cd4`
 (`Register Phase 7 completion bootstrap test`) are **evidence-production and
-tooling checkpoints only**. They do not contain a production supplemental
-manifest or timing/RSS acceptance evidence. The production Phase-0 base was
+tooling checkpoints only**. Those commits did not themselves contain a
+production supplemental manifest or timing/RSS acceptance evidence. The
+production Phase-0 base and all five Phase-7/8/9 supplement manifests were
 subsequently sealed; every later-phase performance gate remains open.
 
 ### Phase-9 characterization producer
@@ -2433,7 +2674,8 @@ The Phase-7 completion supplement must use exact `$E/phase7` as its fixture
 source at revision `38e9a28`, because its lazy fixtures are absent from the
 frozen Phase-0 root. The old diagnostic Phase-8 roots at `6c8d0c7` and
 `a21ab7a` must not be used for `phase8-generation`; the selected product is the
-`94a6323` root above. Phase 0 has since been sealed; supplements, timing, RSS,
+`94a6323` root above. Phase 0 and the five later-phase manifests have since
+been sealed with the hashes recorded in the status table. Timing, RSS,
 scaling, parity, and all later-phase acceptance decisions remain open.
 
 ## Phase 10 integration checkpoint (in progress)
@@ -2479,19 +2721,22 @@ and proves exact worker binding, scheduler dispatch/tasks, pool lifetime, and
 shutdown. Existing deterministic overlap cases in `chart_trim_test`,
 `chart_spr_search_test`, and `chart_scheduler_test` supply the required active
 worker high-water witnesses without flaky timing assertions. The exact
-focused 11/11 gate and current full normal/ASAN/TSan evidence are recorded in
-the post-cleanup closure section above.
+focused 11/11 gate and historical full normal/ASAN/TSan evidence are recorded
+in the `4ef6126` post-cleanup closure section above.
 
 These commits are correctness and observability checkpoints, not Phase-10
-acceptance. This closes only the cleanup review, in-tree functional
-mode/worker matrix, and current post-cleanup normal/sanitizer gates. The
-Phase-0 manifest is sealed; supplemental manifests, worker-policy selection,
-RSS bounds, primary 32/4 wall parity, W8/W1 2x speedup, unpinned explicit-auto,
-seedtree 128/16 stress, and bounded real-scale confirmations remain pending. The
-product default stays serial until explicit auto passes every prerequisite;
-no default-worker performance claim has been made. Any later production or
-conditional default change requires every affected normal and sanitizer gate
-to pass again at that descendant.
+acceptance. This closes only the cleanup review and the in-tree functional
+mode/worker matrix at that checkpoint. Phase 0 and the later-phase supplement
+manifests are sealed; worker-policy selection, RSS bounds, primary 32/4 wall
+parity, W8/W1 2x speedup, unpinned explicit-auto, seedtree 128/16 stress, and
+bounded real-scale confirmations remain pending. Current pre-R Phase-8
+production changes reopened the complete normal, ASAN, and targeted TSan
+gates. The current full normal, serial ASAN, and exact targeted TSan gates have
+since rerun and passed.
+The product default stays serial until explicit auto passes every prerequisite;
+no default-worker performance claim has been made. A later conditional default
+change requires every affected normal and sanitizer gate to pass again at that
+descendant.
 
 ## Later-phase evidence template
 

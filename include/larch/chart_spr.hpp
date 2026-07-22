@@ -15,6 +15,7 @@
 #include <exception>
 #include <functional>
 #include <limits>
+#include <locale>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -562,9 +563,14 @@ struct sampled_tree_source_wave_memory_estimate {
   // temporal stage instead.
   std::size_t projection_stable_slot_workspace_bytes = 0;
   std::size_t active_projection_scratch_bytes = 0;
+  // Worker-local allocations that exist only while filters and canonical
+  // taxon signatures are constructed after the projection operation joins.
+  // The retained signature itself is charged in the ordinal-owned payload.
+  std::size_t active_postprocessing_scratch_bytes = 0;
   std::size_t scheduler_resident_bytes = 0;
   std::size_t source_scheduler_operation_bytes = 0;
   std::size_t projection_scheduler_operation_bytes = 0;
+  std::size_t postprocessing_scheduler_operation_bytes = 0;
   std::size_t temporal_stage_peak_bytes = 0;
   std::size_t error_and_exception_bytes = 0;
   std::size_t required_peak_bytes = 0;
@@ -572,6 +578,7 @@ struct sampled_tree_source_wave_memory_estimate {
   std::size_t planned_container_capacity_bytes = 0;
   std::size_t actual_container_capacity_bytes = 0;
   std::size_t planned_retained_payload_bytes = 0;
+  std::size_t planned_retained_taxon_signature_bytes_per_slot = 0;
   std::size_t actual_retained_payload_bytes = 0;
   std::size_t planned_stable_slot_workspace_bytes = 0;
   std::size_t actual_stable_slot_workspace_bytes = 0;
@@ -580,6 +587,7 @@ struct sampled_tree_source_wave_memory_estimate {
   std::size_t source_wave_size = 0;
   std::size_t projection_wave_size = 0;
   std::size_t active_enumeration_count = 0;
+  std::size_t active_postprocessing_count = 0;
   // See sampled_tree_projection_memory_estimate::stable_slot_count. Source
   // waves obey the same top-level prefix/nested-single-slot scheduler contract.
   std::size_t stable_slot_count = 0;
@@ -1448,6 +1456,31 @@ struct sampled_tree_direct_move_metadata {
   overlay_clade_ref new_sibling_or_target;
 };
 
+inline bool candidate_passes_postconstruction_filters(
+    clade_grammar const& grammar, grammar_spr_candidate const& candidate,
+    grammar_spr_enumeration_options const& options,
+    chart_spr_candidate_generation_stats& stats);
+
+// Optional product-path work completed by the ordinal's projection runner.
+// Filter counters are not published here: canonical gather applies them only
+// if it reaches this ordinal. The signature remains ordinal-owned until that
+// gather, so its complete retained capacity can be audited before publication.
+struct sampled_tree_projection_postprocessing {
+  chart_spr_candidate_generation_stats filter_stats;
+  // W>1 stores an internal canonical binary dedup key here. The standalone
+  // helper retains a textual fallback for compatibility, but the bounded
+  // product path admits parallel postprocessing only under the classic
+  // global locale.
+  std::string taxon_signature;
+  std::exception_ptr failure;
+  bool filter_passed = false;
+  bool attempted = false;
+  // Unlike attempted, this is persistent across slot reuse. It distinguishes
+  // a never-used W1/invalid-result SSO object from a moved-from string that may
+  // still retain implementation-defined heap capacity.
+  bool taxon_signature_storage_activated = false;
+};
+
 enum class sampled_tree_direct_metadata_status : std::uint8_t {
   ready,
   no_candidate,
@@ -1464,6 +1497,7 @@ struct sampled_tree_projection_output_slot {
   std::optional<grammar_spr_candidate> candidate;
   std::vector<clade_key> spare_added_clades;
   std::vector<overlay_grammar_production> spare_added_productions;
+  sampled_tree_projection_postprocessing postprocessing;
   sampled_tree_projection_path path =
       sampled_tree_projection_path::not_attempted;
   // Projection failures are ordinal results, not scheduler-operation
@@ -1698,6 +1732,12 @@ inline std::size_t sampled_tree_projection_output_capacity_bytes(
                                                           safely_bounded),
         safely_bounded);
   }
+  if (slot.postprocessing.taxon_signature_storage_activated) {
+    auto const signature_bytes = sampled_tree_projection_saturating_add(
+        slot.postprocessing.taxon_signature.capacity(), 1, safely_bounded);
+    total = sampled_tree_projection_saturating_add(
+        total, signature_bytes, safely_bounded);
+  }
   return total;
 }
 
@@ -1706,6 +1746,7 @@ struct sampled_tree_projection_memory_shape {
   std::size_t edge_count = 0;
   std::size_t taxon_count = 0;
   std::size_t production_count = 0;
+  std::size_t maximum_production_arity = 0;
   std::size_t variable_site_count = 0;
   std::size_t reference_and_sample_id_bytes = 0;
   std::size_t job_count = 0;
@@ -1720,6 +1761,15 @@ sampled_tree_projection_shape_from_prepared(
   shape.edge_count = prepared.source_tree().edge_high_mark();
   shape.taxon_count = prepared.base().taxa.id_to_sample_id.size();
   shape.production_count = prepared.base().productions.size();
+  // A sampled SPR preserves the selected tree's maximum arity. The direct
+  // projection keys are the exact before-tree productions, so they provide a
+  // tighter and independently checkable bound than the complete base grammar.
+  for (auto const& key : prepared.ordered_before_keys()) {
+    shape.maximum_production_arity =
+        std::max(shape.maximum_production_arity, key.children.size());
+  }
+  shape.maximum_production_arity =
+      std::max<std::size_t>(2, shape.maximum_production_arity);
   shape.variable_site_count = prepared.index().num_variable_sites();
   auto const& reference =
       prepared.source_tree().get_root_as<node_kind::ua>().reference_sequence();
@@ -2098,6 +2148,110 @@ inline std::size_t estimate_sampled_tree_projection_retained_candidate_bytes(
   return total;
 }
 
+inline constexpr char chart_spr_binary_taxon_dedup_key_prefix[] =
+    "\0chart-spr-binary-v1";
+
+// Capacity, including the terminating byte, for the internal fixed-width
+// binary key. Every variable component is count-delimited: four optional
+// clades, the added-clade multiset, and the removed/added production multisets.
+// A production owns one parent key, one child count, and at most the supplied
+// number of child keys. The frozen libstdc++ string starts at reserve(256),
+// grows geometrically, and uses a 16-byte allocation quantum. Rounding the
+// maximum of the reserve floor and twice the encoded size therefore bounds
+// its retained allocation without relying on the candidate-payload size.
+inline std::size_t estimate_chart_spr_binary_taxon_dedup_key_capacity_bytes(
+    std::size_t taxon_count, std::size_t added_clade_count,
+    std::size_t removed_production_count,
+    std::size_t removed_maximum_arity,
+    std::size_t added_production_count,
+    std::size_t added_maximum_arity,
+    bool& safely_bounded) noexcept {
+  auto add = [&](std::size_t lhs, std::size_t rhs) {
+    return sampled_tree_projection_saturating_add(lhs, rhs, safely_bounded);
+  };
+  auto multiply = [&](std::size_t lhs, std::size_t rhs) {
+    return sampled_tree_projection_saturating_multiply(lhs, rhs,
+                                                       safely_bounded);
+  };
+  auto const taxa_key = add(
+      sizeof(std::size_t), multiply(taxon_count, sizeof(taxon_id)));
+  auto production_multiset = [&](std::size_t production_count,
+                                 std::size_t maximum_arity) {
+    auto const production_key = add(
+        add(taxa_key, sizeof(std::size_t)),
+        multiply(maximum_arity, taxa_key));
+    // The multiset count and one encoded-length prefix per production are
+    // distinct from the child count inside each production key.
+    return add(sizeof(std::size_t),
+               multiply(production_count,
+                        add(sizeof(std::size_t), production_key)));
+  };
+
+  std::size_t encoded_size =
+      sizeof(chart_spr_binary_taxon_dedup_key_prefix) - 1;
+  encoded_size = add(encoded_size, multiply(4, taxa_key));
+  encoded_size = add(encoded_size, sizeof(std::size_t));
+  encoded_size = add(encoded_size,
+                     multiply(added_clade_count, taxa_key));
+  encoded_size = add(
+      encoded_size,
+      production_multiset(removed_production_count,
+                          removed_maximum_arity));
+  encoded_size = add(
+      encoded_size,
+      production_multiset(added_production_count, added_maximum_arity));
+  constexpr std::size_t allocation_quantum = 16;
+  auto const geometric_capacity = multiply(encoded_size, 2);
+  auto allocation_bytes =
+      add(std::max<std::size_t>(256, geometric_capacity), 1);
+  allocation_bytes = add(allocation_bytes, allocation_quantum - 1);
+  allocation_bytes = multiply(allocation_bytes / allocation_quantum,
+                              allocation_quantum);
+  return safely_bounded ? allocation_bytes
+                        : (std::numeric_limits<std::size_t>::max)();
+}
+
+inline std::size_t
+estimate_sampled_tree_projection_retained_taxon_signature_bytes(
+    sampled_tree_projection_memory_shape const& shape,
+    bool& safely_bounded) noexcept {
+  auto const production_count =
+      std::max(shape.node_count, shape.production_count);
+  return estimate_chart_spr_binary_taxon_dedup_key_capacity_bytes(
+      shape.taxon_count, shape.node_count, production_count,
+      shape.maximum_production_arity, production_count,
+      shape.maximum_production_arity, safely_bounded);
+}
+
+inline std::size_t
+estimate_sampled_tree_projection_postprocessing_transient_bytes(
+    sampled_tree_projection_memory_shape const& shape,
+    bool& safely_bounded) noexcept {
+  auto const candidate_bytes =
+      estimate_sampled_tree_projection_retained_candidate_bytes(
+          shape, safely_bounded);
+  auto const signature_bytes =
+      estimate_sampled_tree_projection_retained_taxon_signature_bytes(
+          shape, safely_bounded);
+  // The frozen implementation can simultaneously own the output key, returned
+  // string, one sorted vector of per-production strings, and the current
+  // component key. Four complete signature envelopes cover those string
+  // allocations. Two candidate envelopes cover copied/sorted clade and child-
+  // taxon vectors; 4 KiB covers stream/locale and fixed allocator state.
+  // This is charged per active runner, while each retained result string is
+  // charged separately in its ordinal-owned output slot.
+  auto total = sampled_tree_projection_saturating_add(
+      4096,
+      sampled_tree_projection_saturating_multiply(
+          signature_bytes, 4, safely_bounded),
+      safely_bounded);
+  return sampled_tree_projection_saturating_add(
+      total,
+      sampled_tree_projection_saturating_multiply(candidate_bytes, 2,
+                                                  safely_bounded),
+      safely_bounded);
+}
+
 inline std::size_t bounded_sampled_tree_projection_wave_size(
     chart_scheduler const* scheduler, std::size_t job_count) noexcept {
   if (job_count == 0) return 0;
@@ -2106,11 +2260,53 @@ inline std::size_t bounded_sampled_tree_projection_wave_size(
   if (scheduler == nullptr) return 1;
   auto const workers = scheduler->worker_resolution().resolved_workers;
   auto const bounded_workers = std::max<std::size_t>(1, workers);
+  constexpr std::size_t jobs_per_worker = 4;
   auto const maximum =
-      bounded_workers > (std::numeric_limits<std::size_t>::max)() / 4
+      bounded_workers >
+              (std::numeric_limits<std::size_t>::max)() / jobs_per_worker
           ? (std::numeric_limits<std::size_t>::max)()
-          : bounded_workers * 4;
+          : bounded_workers * jobs_per_worker;
   return std::min(job_count, maximum);
+}
+
+// The bounded product source-wave path owns its projection result slots under
+// the unified finite-memory admission.  It can therefore retain a deeper
+// subwave than the legacy preassigned API without changing that API's
+// speculation, failure, or RSS contract.  W1 stays at its historical width;
+// W>1 amortizes scheduler/handoff boundaries across at most 64 jobs per
+// worker, with the admission search remaining authoritative.
+inline std::size_t bounded_sampled_tree_source_projection_wave_size(
+    chart_scheduler const* scheduler, std::size_t job_count) noexcept {
+  if (job_count == 0) return 0;
+  if (scheduler == nullptr) return 1;
+  auto const workers = std::max<std::size_t>(
+      1, scheduler->worker_resolution().resolved_workers);
+  auto const jobs_per_worker =
+      workers == 1 ? std::size_t{4} : std::size_t{64};
+  auto const maximum =
+      workers > (std::numeric_limits<std::size_t>::max)() / jobs_per_worker
+          ? (std::numeric_limits<std::size_t>::max)()
+          : workers * jobs_per_worker;
+  return std::min(job_count, maximum);
+}
+
+inline chart_indexed_range_options sampled_tree_source_projection_range_options(
+    chart_scheduler const* scheduler) noexcept {
+  auto const workers = scheduler == nullptr
+                           ? std::size_t{1}
+                           : scheduler->worker_resolution().resolved_workers;
+  return chart_indexed_range_options{
+      .minimum_grain = 1,
+      .target_ranges_per_worker = workers > 1 ? std::size_t{4}
+                                              : std::size_t{1}};
+}
+
+inline chart_indexed_range_options
+sampled_tree_source_postprocessing_range_options() noexcept {
+  // Unit ranges through the admitted 512-job W8 maximum keep dynamic claiming
+  // responsive when valid candidates are clustered late in canonical order.
+  return chart_indexed_range_options{
+      .minimum_grain = 1, .target_ranges_per_worker = 64};
 }
 
 inline std::size_t bounded_sampled_tree_source_wave_size(
@@ -2217,26 +2413,48 @@ estimate_sampled_tree_source_wave_memory(
   auto const retained =
       estimate_sampled_tree_projection_retained_candidate_bytes(
           shape, result.safely_bounded);
+  auto const retains_parallel_signature =
+      scheduler != nullptr &&
+      scheduler->worker_resolution().resolved_workers > 1;
+  auto const retained_signature =
+      retains_parallel_signature
+          ? estimate_sampled_tree_projection_retained_taxon_signature_bytes(
+                shape, result.safely_bounded)
+          : std::size_t{0};
+  result.planned_retained_taxon_signature_bytes_per_slot =
+      retained_signature;
   result.projection_slot_and_payload_bytes =
       sizeof(std::vector<sampled_tree_projection_output_slot>);
   auto const retained_active_and_spare = multiply(retained, 2);
+  auto const retained_payload =
+      add(retained_active_and_spare, retained_signature);
   result.projection_slot_and_payload_bytes = add(
       result.projection_slot_and_payload_bytes,
       multiply(projection_wave_size,
                add(sizeof(sampled_tree_projection_output_slot),
-                   retained_active_and_spare)));
+                   retained_payload)));
   result.planned_retained_payload_bytes =
-      multiply(projection_wave_size, retained_active_and_spare);
+      multiply(projection_wave_size, retained_payload);
 
   chart_indexed_range_plan projection_plan;
+  chart_indexed_range_plan postprocessing_plan;
   if (scheduler != nullptr && projection_wave_size != 0) {
     projection_plan = scheduler->plan_indexed_ranges(
         projection_wave_size,
-        {.minimum_grain = 1, .target_ranges_per_worker = 1});
+        sampled_tree_source_projection_range_options(scheduler));
     result.stable_slot_count = scheduler->worker_resolution().resolved_workers;
     result.active_projection_count = projection_plan.range_count <= 1
                                          ? std::size_t{1}
                                          : projection_plan.worker_task_limit;
+    if (retains_parallel_signature) {
+      postprocessing_plan = scheduler->plan_indexed_ranges(
+          projection_wave_size,
+          sampled_tree_source_postprocessing_range_options());
+      result.active_postprocessing_count =
+          postprocessing_plan.range_count <= 1
+              ? std::size_t{1}
+              : postprocessing_plan.worker_task_limit;
+    }
   } else if (projection_wave_size != 0) {
     result.stable_slot_count = 1;
     result.active_projection_count = 1;
@@ -2260,6 +2478,11 @@ estimate_sampled_tree_source_wave_memory(
           shape, result.safely_bounded);
   result.active_projection_scratch_bytes =
       multiply(result.active_projection_count, projection_fallback_scratch);
+  auto const postprocessing_transient =
+      estimate_sampled_tree_projection_postprocessing_transient_bytes(
+          shape, result.safely_bounded);
+  result.active_postprocessing_scratch_bytes = multiply(
+      result.active_postprocessing_count, postprocessing_transient);
 
   if (scheduler != nullptr) {
     result.scheduler_resident_bytes =
@@ -2278,6 +2501,12 @@ estimate_sampled_tree_source_wave_memory(
         result.projection_scheduler_operation_bytes =
             estimate_chart_scheduler_operation_peak_bytes(projection_plan);
       }
+      if (postprocessing_plan.range_count > 1 &&
+          postprocessing_plan.worker_task_limit > 1) {
+        result.postprocessing_scheduler_operation_bytes =
+            estimate_chart_scheduler_operation_peak_bytes(
+                postprocessing_plan);
+      }
     } catch (std::overflow_error const&) {
       result.scheduler_resident_bytes =
           (std::numeric_limits<std::size_t>::max)();
@@ -2290,7 +2519,11 @@ estimate_sampled_tree_source_wave_memory(
   auto const projection_stage =
       add(result.active_projection_scratch_bytes,
           result.projection_scheduler_operation_bytes);
-  result.temporal_stage_peak_bytes = std::max(source_stage, projection_stage);
+  auto const postprocessing_stage =
+      add(result.active_postprocessing_scratch_bytes,
+          result.postprocessing_scheduler_operation_bytes);
+  result.temporal_stage_peak_bytes =
+      std::max({source_stage, projection_stage, postprocessing_stage});
   // The 512-byte allowances are the frozen in-process bookkeeping envelope
   // for each retained failure. Arbitrarily large dynamically allocated
   // payloads supplied by external/test hooks are outside the
@@ -2340,6 +2573,56 @@ estimate_sampled_tree_source_wave_memory(
   return result;
 }
 
+inline void sampled_tree_source_wave_raise_retained_candidate_bound(
+    sampled_tree_source_wave_memory_estimate& result,
+    std::size_t candidate_byte_delta, std::size_t projection_wave_size,
+    bool& safely_bounded) noexcept {
+  if (candidate_byte_delta == 0) return;
+  auto const parallel_postprocessing =
+      result.active_postprocessing_count != 0;
+  // The concrete delta is retained witness capacity. Taxon serialization does
+  // not inspect witnesses, so it changes the active/spare candidate payloads
+  // but not the independently derived binary-key bound.
+  constexpr std::size_t per_slot_multiplier = 2;
+  auto const retained_delta = sampled_tree_projection_saturating_scale(
+      candidate_byte_delta, projection_wave_size, per_slot_multiplier,
+      safely_bounded);
+  result.projection_slot_and_payload_bytes =
+      sampled_tree_projection_saturating_add(
+          result.projection_slot_and_payload_bytes, retained_delta,
+          safely_bounded);
+  result.planned_retained_payload_bytes =
+      sampled_tree_projection_saturating_add(
+          result.planned_retained_payload_bytes, retained_delta,
+          safely_bounded);
+
+  auto const previous_temporal_peak = result.temporal_stage_peak_bytes;
+  if (parallel_postprocessing) {
+    // Per active worker the transient bound owns two candidate copies. The four
+    // signature envelopes are derived from topology/taxon shape and therefore
+    // do not grow with witness capacity.
+    auto const transient_delta = sampled_tree_projection_saturating_scale(
+        candidate_byte_delta, result.active_postprocessing_count, 2,
+        safely_bounded);
+    result.active_postprocessing_scratch_bytes =
+        sampled_tree_projection_saturating_add(
+            result.active_postprocessing_scratch_bytes, transient_delta,
+            safely_bounded);
+    auto const postprocessing_stage = sampled_tree_projection_saturating_add(
+        result.active_postprocessing_scratch_bytes,
+        result.postprocessing_scheduler_operation_bytes, safely_bounded);
+    result.temporal_stage_peak_bytes =
+        std::max(result.temporal_stage_peak_bytes, postprocessing_stage);
+  }
+  auto const temporal_delta = result.temporal_stage_peak_bytes -
+                              previous_temporal_peak;
+  auto required_delta = sampled_tree_projection_saturating_add(
+      retained_delta, temporal_delta, safely_bounded);
+  result.required_peak_bytes = sampled_tree_projection_saturating_add(
+      result.required_peak_bytes, required_delta, safely_bounded);
+  result.actual_peak_bytes = result.required_peak_bytes;
+}
+
 inline sampled_tree_source_wave_memory_estimate
 estimate_sampled_tree_source_wave_memory(
     sampled_tree_projection_context const& prepared,
@@ -2364,20 +2647,9 @@ estimate_sampled_tree_source_wave_memory(
       estimate_sampled_tree_projection_retained_candidate_bytes(
           prepared, safely_bounded);
   if (prepared_retained > shape_retained) {
-    auto const retained_delta = sampled_tree_projection_saturating_scale(
-        prepared_retained - shape_retained, projection_wave_size, 2,
+    sampled_tree_source_wave_raise_retained_candidate_bound(
+        result, prepared_retained - shape_retained, projection_wave_size,
         safely_bounded);
-    result.projection_slot_and_payload_bytes =
-        sampled_tree_projection_saturating_add(
-            result.projection_slot_and_payload_bytes, retained_delta,
-            safely_bounded);
-    result.planned_retained_payload_bytes =
-        sampled_tree_projection_saturating_add(
-            result.planned_retained_payload_bytes, retained_delta,
-            safely_bounded);
-    result.required_peak_bytes = sampled_tree_projection_saturating_add(
-        result.required_peak_bytes, retained_delta, safely_bounded);
-    result.actual_peak_bytes = result.required_peak_bytes;
   }
   result.safely_bounded = safely_bounded;
   if (!result.safely_bounded) {
@@ -2415,8 +2687,8 @@ admit_sampled_tree_source_wave_memory(
     if (!safely_bounded) {
       return (std::numeric_limits<std::size_t>::max)();
     }
-    auto maximum =
-        bounded_sampled_tree_projection_wave_size(scheduler, move_bound);
+    auto maximum = bounded_sampled_tree_source_projection_wave_size(
+        scheduler, move_bound);
     if (maximum_projection_wave_size != 0) {
       maximum = std::min(maximum, maximum_projection_wave_size);
     }
@@ -2654,6 +2926,12 @@ estimate_sampled_tree_projection_source_memory_bound(
   shape.edge_count = sampled_tree_projection_saturating_multiply(
       shape.node_count, 2, safely_bounded);
   shape.production_count = std::max(shape.node_count, base.productions.size());
+  for (auto const& production : base.productions) {
+    shape.maximum_production_arity = std::max(
+        shape.maximum_production_arity, production.children.size());
+  }
+  shape.maximum_production_arity =
+      std::max<std::size_t>(2, shape.maximum_production_arity);
   auto const& reference =
       source_dag.get_root_as<node_kind::ua>().reference_sequence();
   shape.variable_site_count = reference.size();
@@ -2733,6 +3011,12 @@ estimate_sampled_tree_source_memory_bound(
   shape.edge_count = sampled_tree_projection_saturating_multiply(
       shape.node_count, 2, safely_bounded);
   shape.production_count = std::max(shape.node_count, base.productions.size());
+  for (auto const& production : base.productions) {
+    shape.maximum_production_arity = std::max(
+        shape.maximum_production_arity, production.children.size());
+  }
+  shape.maximum_production_arity =
+      std::max<std::size_t>(2, shape.maximum_production_arity);
   auto const& reference =
       source_dag.get_root_as<node_kind::ua>().reference_sequence();
   shape.variable_site_count = reference.size();
@@ -2780,8 +3064,8 @@ estimate_sampled_tree_source_memory_bound(
   }
   auto const move_bound = sampled_tree_projection_saturating_multiply(
       source_wave, shape.node_count, safely_bounded);
-  auto projection_wave =
-      bounded_sampled_tree_projection_wave_size(scheduler, move_bound);
+  auto projection_wave = bounded_sampled_tree_source_projection_wave_size(
+      scheduler, move_bound);
   if (maximum_projection_wave_size != 0) {
     projection_wave =
         std::min(projection_wave, maximum_projection_wave_size);
@@ -2797,19 +3081,9 @@ estimate_sampled_tree_source_memory_bound(
       estimate_sampled_tree_projection_retained_witness_bytes(
           base, safely_bounded);
   if (base_witness > shape_witness) {
-    auto const retained_delta = sampled_tree_projection_saturating_scale(
-        base_witness - shape_witness, projection_wave, 2, safely_bounded);
-    result.projection_slot_and_payload_bytes =
-        sampled_tree_projection_saturating_add(
-            result.projection_slot_and_payload_bytes, retained_delta,
-            safely_bounded);
-    result.planned_retained_payload_bytes =
-        sampled_tree_projection_saturating_add(
-            result.planned_retained_payload_bytes, retained_delta,
-            safely_bounded);
-    result.required_peak_bytes = sampled_tree_projection_saturating_add(
-        result.required_peak_bytes, retained_delta, safely_bounded);
-    result.actual_peak_bytes = result.required_peak_bytes;
+    sampled_tree_source_wave_raise_retained_candidate_bound(
+        result, base_witness - shape_witness, projection_wave,
+        safely_bounded);
   }
   result.safely_bounded = result.safely_bounded && safely_bounded;
   if (!result.safely_bounded) {
@@ -3272,6 +3546,112 @@ inline bool make_candidate_from_ordered_tree_keys_prepared_into(
     }
   }
   if (!certificate_available) {
+    candidate.source_before_topology_productions.reset();
+    candidate.source_after_topology_productions.reset();
+  }
+  slot.engaged = true;
+  return true;
+}
+
+// W>1 direct-projection variant.  The legacy builder above deliberately keeps
+// its two-pass certificate lookup for null/resolved-one schedulers.  Parallel
+// projection already owns one candidate per canonical ordinal, so use that
+// candidate's retained after-certificate vector to remember the production
+// ref at the same tree-order point where the production is classified or
+// added.  This removes the second key lookup and temp-production scan without
+// adding another persistent per-worker/per-ordinal container.
+inline bool
+make_candidate_from_ordered_tree_keys_prepared_into_with_cached_after_refs(
+    sampled_tree_projection_context const& prepared, spr_move const& move,
+    sampled_tree_direct_move_metadata const& metadata,
+    sampled_tree_direct_workspace& workspace,
+    sampled_tree_projection_output_slot& slot) {
+  recycle_sampled_tree_projection_output(slot);
+  auto& candidate = *slot.candidate;
+  candidate.moved_clade = metadata.moved_clade;
+  candidate.old_parent = metadata.old_parent;
+  candidate.old_sibling = metadata.old_sibling;
+  candidate.new_sibling_or_target = metadata.new_sibling_or_target;
+  candidate.source_tree_move = move;
+
+  for (auto const& key : prepared.ordered_before_keys()) {
+    if (sampled_tree_after_keys_contains(workspace, key)) continue;
+    auto base_pid = find_base_production_by_key_reusing(
+        prepared.base(), prepared.base_lookup(), key, workspace);
+    if (!base_pid) return false;
+    candidate.removed_productions.push_back(base_production_ref(*base_pid));
+  }
+  std::sort(candidate.removed_productions.begin(),
+            candidate.removed_productions.end());
+  candidate.removed_productions.erase(
+      std::unique(candidate.removed_productions.begin(),
+                  candidate.removed_productions.end()),
+      candidate.removed_productions.end());
+
+  bool certificate_available =
+      prepared.source_before_topology_refs().has_value();
+  auto const source_after_was_present =
+      candidate.source_after_topology_productions.has_value();
+  if (certificate_available) {
+    if (!candidate.source_after_topology_productions) {
+      candidate.source_after_topology_productions.emplace();
+    }
+    candidate.source_after_topology_productions->clear();
+    candidate.source_after_topology_productions->reserve(
+        workspace.tree_order.size());
+  }
+
+  for (auto index : workspace.tree_order) {
+    auto const& key = workspace.after_keys[index];
+    auto base_pid = find_base_production_by_key_reusing(
+        prepared.base(), prepared.base_lookup(), key, workspace);
+    auto const base_available =
+        base_pid && !candidate_removes_base_production(candidate, *base_pid);
+    if (prepared.before_keys().contains(key) || base_available) {
+      if (certificate_available) {
+        // A before key is necessarily retained rather than removed because it
+        // is also in the after-key set.  Fail closed if malformed prepared
+        // state violates that invariant, matching the old second-pass lookup.
+        if (!base_available) {
+          certificate_available = false;
+        } else {
+          candidate.source_after_topology_productions->push_back(
+              base_production_ref(*base_pid));
+        }
+      }
+      continue;
+    }
+
+    auto const temp_id =
+        static_cast<production_id>(candidate.added_productions.size());
+    add_sampled_tree_projection_production(prepared, slot, key);
+    if (certificate_available) {
+      candidate.source_after_topology_productions->push_back(
+          temp_production_ref(temp_id));
+    }
+  }
+
+  if (candidate.removed_productions.empty() &&
+      candidate.added_productions.empty()) {
+    // Preserve the legacy never-activated retained state for an empty result.
+    // A recycled, previously activated vector remains owned by the slot just
+    // as it did before this attempt.
+    if (!source_after_was_present) {
+      candidate.source_after_topology_productions.reset();
+    } else {
+      candidate.source_after_topology_productions->clear();
+    }
+    return false;
+  }
+
+  if (certificate_available) {
+    if (!candidate.source_before_topology_productions) {
+      candidate.source_before_topology_productions.emplace();
+    }
+    candidate.source_before_topology_productions->assign(
+        prepared.source_before_topology_refs()->begin(),
+        prepared.source_before_topology_refs()->end());
+  } else {
     candidate.source_before_topology_productions.reset();
     candidate.source_after_topology_productions.reset();
   }
@@ -4113,6 +4493,70 @@ inline bool project_sampled_tree_move_direct_into(
   return true;
 }
 
+// Parallel-only counterpart of project_sampled_tree_move_direct_into().  Keep
+// the complete prerequisite sequence byte-for-byte aligned with the legacy
+// path; only the final candidate/certificate builder differs.
+inline bool project_sampled_tree_move_direct_into_with_cached_after_refs(
+    sampled_tree_projection_context const& prepared, spr_move const& move,
+    sampled_tree_direct_workspace& workspace,
+    sampled_tree_projection_output_slot& output) {
+  if (!prepared.direct_projection_ready()) return false;
+  auto const& grammar = prepared.base();
+  auto const& index = prepared.index();
+  auto const& node_to_clade = prepared.node_to_base_clade();
+  auto const& node_to_production = prepared.node_to_base_production();
+  if (!index.is_valid(move.src) || !index.is_valid(move.dst)) return false;
+  auto const source_parent_node = index.get_parent(move.src);
+  if (!index.is_valid(source_parent_node) ||
+      index.get_num_children(source_parent_node) != 2 ||
+      move.src >= node_to_clade.size() || move.dst >= node_to_clade.size() ||
+      source_parent_node >= node_to_clade.size() ||
+      source_parent_node >= node_to_production.size()) {
+    return false;
+  }
+
+  auto const& source_children = index.get_children(source_parent_node);
+  auto source_occurrences = std::size_t{0};
+  auto sibling_node = (std::numeric_limits<std::size_t>::max)();
+  for (auto child : source_children) {
+    if (child == move.src) {
+      ++source_occurrences;
+    } else if (sibling_node == (std::numeric_limits<std::size_t>::max)()) {
+      sibling_node = child;
+    } else {
+      return false;
+    }
+  }
+  if (source_occurrences != 1 || !index.is_valid(sibling_node) ||
+      sibling_node >= node_to_clade.size()) {
+    return false;
+  }
+
+  auto const moved = node_to_clade[move.src];
+  auto const old_parent = node_to_clade[source_parent_node];
+  auto const old_sibling = node_to_clade[sibling_node];
+  auto const target = node_to_clade[move.dst];
+  auto const source_production = node_to_production[source_parent_node];
+  sampled_tree_direct_move_metadata metadata;
+  auto const metadata_status = resolve_sampled_tree_binary_move_metadata(
+      grammar, source_production, moved, old_parent, old_sibling, target,
+      metadata);
+  if (metadata_status == sampled_tree_direct_metadata_status::fallback) {
+    return false;
+  }
+  if (metadata_status == sampled_tree_direct_metadata_status::no_candidate) {
+    output.engaged = false;
+    return true;
+  }
+  if (!sampled_tree_direct_after_keys_into(prepared, move, workspace)) {
+    return false;
+  }
+  (void)
+      make_candidate_from_ordered_tree_keys_prepared_into_with_cached_after_refs(
+          prepared, move, metadata, workspace, output);
+  return true;
+}
+
 inline sampled_tree_direct_projection_result project_sampled_tree_move_direct(
     sampled_tree_projection_context const& prepared, spr_move const& move) {
   sampled_tree_direct_workspace workspace;
@@ -4192,6 +4636,71 @@ inline void project_sampled_tree_move_with_path_into(
   output.path = sampled_tree_projection_path::clone_fallback;
 }
 
+// This entry point is selected only by an admitted scheduler with more than
+// one resolved worker.  Its fallback half is intentionally identical to the
+// legacy entry point above; the cached certificate builder is confined to a
+// successful direct projection.
+inline void
+project_sampled_tree_move_with_path_into_with_cached_after_refs(
+    sampled_tree_projection_context const& prepared, spr_move const& move,
+    sampled_tree_direct_workspace& workspace,
+    sampled_tree_projection_output_slot& output) {
+  output.engaged = false;
+  output.path = sampled_tree_projection_path::not_attempted;
+  auto const& tree = prepared.source_tree();
+  auto const& index = prepared.index();
+  if (!index.is_valid(move.src) || !index.is_valid(move.dst) ||
+      move.src == move.dst || move.src == index.get_tree_root() ||
+      index.is_ancestor(move.src, move.dst)) {
+    return;
+  }
+
+  auto const source_parent_node = index.get_parent(move.src);
+  if (index.get_num_children(source_parent_node) != 2) return;
+  if (project_sampled_tree_move_direct_into_with_cached_after_refs(
+          prepared, move, workspace, output)) {
+    output.path = sampled_tree_projection_path::direct;
+    return;
+  }
+
+  auto mapped_clade = [&](std::size_t node) -> std::optional<clade_id> {
+    if (node >= prepared.node_to_base_clade().size()) return std::nullopt;
+    auto const clade = prepared.node_to_base_clade()[node];
+    if (clade == no_clade) return std::nullopt;
+    return clade;
+  };
+  auto moved = mapped_clade(move.src);
+  auto old_parent = mapped_clade(source_parent_node);
+  auto target = mapped_clade(move.dst);
+  if (!moved || !old_parent || !target) return;
+
+  std::optional<clade_id> old_sibling;
+  for (auto child : index.get_children(source_parent_node)) {
+    if (child == move.src) continue;
+    old_sibling = mapped_clade(child);
+  }
+  if (!old_sibling) return;
+
+  grammar_spr_candidate candidate;
+  candidate.moved_clade = base_clade_ref(*moved);
+  candidate.old_parent = base_clade_ref(*old_parent);
+  candidate.old_sibling = base_clade_ref(*old_sibling);
+  candidate.new_sibling_or_target = base_clade_ref(*target);
+  candidate.source_tree_move = move;
+
+  auto after_tree = apply_spr_move_topology_only(tree, move.src, move.dst);
+  build_clade_offsets(after_tree);
+  auto after_tree_grammar = build_clade_grammar(after_tree);
+  auto projected = make_candidate_from_tree_diff_prepared(
+      prepared, after_tree_grammar, std::move(candidate));
+  recycle_sampled_tree_projection_output(output);
+  if (projected) {
+    *output.candidate = std::move(*projected);
+    output.engaged = true;
+  }
+  output.path = sampled_tree_projection_path::clone_fallback;
+}
+
 inline sampled_tree_projected_candidate project_sampled_tree_move_with_path(
     sampled_tree_projection_context const& prepared, spr_move const& move) {
   sampled_tree_direct_workspace workspace;
@@ -4220,6 +4729,19 @@ inline void project_sampled_tree_move_with_path_into(
                   .lca = move.lca,
                   .score_change = move.score_change};
   project_sampled_tree_move_with_path_into(prepared, source, workspace, output);
+}
+
+inline void
+project_sampled_tree_move_with_path_into_with_cached_after_refs(
+    sampled_tree_projection_context const& prepared,
+    profitable_move const& move, sampled_tree_direct_workspace& workspace,
+    sampled_tree_projection_output_slot& output) {
+  spr_move source{.src = move.src,
+                  .dst = move.dst,
+                  .lca = move.lca,
+                  .score_change = move.score_change};
+  project_sampled_tree_move_with_path_into_with_cached_after_refs(
+      prepared, source, workspace, output);
 }
 
 inline void append_deduplicated_candidate(
@@ -4595,6 +5117,241 @@ inline std::string chart_spr_candidate_sample_signature(
   return chart_spr_candidate_signature_impl(base, candidate,
                                             true /* use_sample_ids */);
 }
+
+namespace chart_spr_detail {
+
+inline bool chart_spr_taxa_are_sorted_unique(
+    std::vector<taxon_id> const& taxa) noexcept {
+  return std::adjacent_find(
+             taxa.begin(), taxa.end(),
+             [](taxon_id lhs, taxon_id rhs) { return lhs >= rhs; }) ==
+         taxa.end();
+}
+
+template <std::unsigned_integral UInt>
+inline void chart_spr_binary_store_unsigned(char* destination, UInt value) {
+  for (auto byte = sizeof(UInt); byte != 0; --byte) {
+    auto const shift = (byte - 1) * 8;
+    *destination++ = static_cast<char>((value >> shift) & UInt{0xff});
+  }
+}
+
+template <std::unsigned_integral UInt>
+inline void chart_spr_binary_append_unsigned(std::string& out, UInt value) {
+  // One growth check per fixed-width value; the byte stores themselves do not
+  // repeatedly re-enter basic_string::push_back.
+  auto const offset = out.size();
+  out.append(sizeof(UInt), '\0');
+  chart_spr_binary_store_unsigned(out.data() + offset, value);
+}
+
+inline void chart_spr_binary_append_sorted_unique_taxa(
+    std::string& out, std::vector<taxon_id> const& taxa) {
+  chart_spr_binary_append_unsigned(out, taxa.size());
+  if (taxa.size() > (out.max_size() - out.size()) / sizeof(taxon_id)) {
+    throw std::length_error(
+        "chart SPR candidate binary signature exceeds string maximum size");
+  }
+  auto const offset = out.size();
+  out.append(taxa.size() * sizeof(taxon_id), '\0');
+  auto* destination = out.data() + offset;
+  for (auto taxon : taxa) {
+    chart_spr_binary_store_unsigned(destination, taxon);
+    destination += sizeof(taxon_id);
+  }
+}
+
+inline void chart_spr_binary_append_taxa(
+    std::string& out, std::vector<taxon_id> const& taxa) {
+  if (chart_spr_taxa_are_sorted_unique(taxa)) {
+    chart_spr_binary_append_sorted_unique_taxa(out, taxa);
+    return;
+  }
+  auto normalized = chart_spr_normalize_taxa(taxa);
+  chart_spr_binary_append_sorted_unique_taxa(out, normalized);
+}
+
+template <typename ChildTaxaAt>
+inline std::string chart_spr_binary_production_taxon_key(
+    std::vector<taxon_id> const& parent_taxa, std::size_t child_count,
+    ChildTaxaAt&& child_taxa_at, bool all_taxa_are_sorted_unique) {
+  std::string out;
+  out.reserve(64);
+  if (all_taxa_are_sorted_unique) {
+    std::vector<std::vector<taxon_id> const*> sorted_children;
+    sorted_children.reserve(child_count);
+    for (std::size_t index = 0; index < child_count; ++index) {
+      sorted_children.push_back(&child_taxa_at(index));
+    }
+    std::sort(sorted_children.begin(), sorted_children.end(),
+              [](auto const* lhs, auto const* rhs) { return *lhs < *rhs; });
+    chart_spr_binary_append_sorted_unique_taxa(out, parent_taxa);
+    chart_spr_binary_append_unsigned(out, child_count);
+    for (auto const* child : sorted_children) {
+      chart_spr_binary_append_sorted_unique_taxa(out, *child);
+    }
+    return out;
+  }
+
+  auto normalized_parent = chart_spr_normalize_taxa(parent_taxa);
+  std::vector<std::vector<taxon_id>> normalized_children;
+  normalized_children.reserve(child_count);
+  for (std::size_t index = 0; index < child_count; ++index) {
+    normalized_children.push_back(
+        chart_spr_normalize_taxa(child_taxa_at(index)));
+  }
+  std::sort(normalized_children.begin(), normalized_children.end());
+  chart_spr_binary_append_sorted_unique_taxa(out, normalized_parent);
+  chart_spr_binary_append_unsigned(out, child_count);
+  for (auto const& child : normalized_children) {
+    chart_spr_binary_append_sorted_unique_taxa(out, child);
+  }
+  return out;
+}
+
+inline void chart_spr_binary_append_production_multiset(
+    std::string& out, std::vector<std::string>& productions) {
+  // The legacy key sorts complete production strings bytewise. Any stable
+  // ordering of an injective canonical production encoding represents the
+  // same multiset equality relation; binary byte order is cheaper and remains
+  // deterministic. Lengths make the concatenation independently decodable.
+  std::sort(productions.begin(), productions.end());
+  chart_spr_binary_append_unsigned(out, productions.size());
+  for (auto const& production : productions) {
+    chart_spr_binary_append_unsigned(out, production.size());
+    out.append(production);
+  }
+}
+
+// Internal W>1 dedup identity. Under the classic locale this fixed-width,
+// count-delimited binary encoding has exactly the equality relation of the
+// historical textual taxon signature while avoiding decimal conversion. It
+// intentionally remains private to sampled-tree parallel postprocessing: W1,
+// public diagnostics, and cross-run reports keep their historical bytes.
+inline std::string chart_spr_candidate_taxon_dedup_key(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    bool use_binary_encoding) {
+  // A custom global numeric locale changes the historical textual identity.
+  // The caller snapshots this choice before worker launch so one wave cannot
+  // mix encodings if another thread changes the global locale concurrently.
+  if (!use_binary_encoding) {
+    return chart_spr_candidate_taxon_signature(base, candidate);
+  }
+
+  std::string out;
+  out.reserve(256);
+  out.append(chart_spr_binary_taxon_dedup_key_prefix,
+             sizeof(chart_spr_binary_taxon_dedup_key_prefix) - 1);
+
+  auto append_optional_ref = [&](overlay_clade_ref ref) {
+    if (ref.id == no_clade) {
+      chart_spr_binary_append_unsigned(out, std::size_t{0});
+      return;
+    }
+    chart_spr_binary_append_taxa(
+        out, chart_spr_clade_taxa_for_ref(base, candidate, ref));
+  };
+  append_optional_ref(candidate.moved_clade);
+  append_optional_ref(candidate.old_parent);
+  append_optional_ref(candidate.old_sibling);
+  append_optional_ref(candidate.new_sibling_or_target);
+
+  auto all_clades_are_sorted_unique = true;
+  for (auto const& key : candidate.added_clades) {
+      if (!chart_spr_taxa_are_sorted_unique(key.taxa)) {
+      all_clades_are_sorted_unique = false;
+    }
+  }
+  chart_spr_binary_append_unsigned(out, candidate.added_clades.size());
+  if (all_clades_are_sorted_unique) {
+    std::vector<std::vector<taxon_id> const*> added_clades;
+    added_clades.reserve(candidate.added_clades.size());
+    for (auto const& key : candidate.added_clades) {
+      added_clades.push_back(&key.taxa);
+    }
+    std::sort(added_clades.begin(), added_clades.end(),
+              [](auto const* lhs, auto const* rhs) { return *lhs < *rhs; });
+    for (auto const* taxa : added_clades) {
+      chart_spr_binary_append_sorted_unique_taxa(out, *taxa);
+    }
+  } else {
+    std::vector<std::vector<taxon_id>> added_clades;
+    added_clades.reserve(candidate.added_clades.size());
+    for (auto const& key : candidate.added_clades) {
+      added_clades.push_back(chart_spr_normalize_taxa(key.taxa));
+    }
+    std::sort(added_clades.begin(), added_clades.end());
+    for (auto const& taxa : added_clades) {
+      chart_spr_binary_append_sorted_unique_taxa(out, taxa);
+    }
+  }
+
+  std::vector<std::string> removed;
+  removed.reserve(candidate.removed_productions.size());
+  for (auto ref : candidate.removed_productions) {
+    if (ref.space != overlay_id_space::base) {
+      throw std::runtime_error(
+          "chart SPR candidate signature: removed production is not base");
+    }
+    if (ref.id == no_production || ref.id >= base.productions.size()) {
+      throw std::runtime_error(
+          "chart SPR candidate signature: removed production out of range");
+    }
+    auto const& production = base.productions[ref.id];
+    auto all_taxa_are_sorted_unique =
+        chart_spr_taxa_are_sorted_unique(
+            base.clades[production.parent].taxa);
+    for (auto child : production.children) {
+      if (!chart_spr_taxa_are_sorted_unique(base.clades[child].taxa)) {
+        all_taxa_are_sorted_unique = false;
+      }
+    }
+    removed.push_back(chart_spr_binary_production_taxon_key(
+        base.clades[production.parent].taxa, production.children.size(),
+        [&](std::size_t index) -> std::vector<taxon_id> const& {
+          return base.clades[production.children[index]].taxa;
+        },
+        all_taxa_are_sorted_unique));
+  }
+  chart_spr_binary_append_production_multiset(out, removed);
+
+  std::vector<std::string> added;
+  added.reserve(candidate.added_productions.size());
+  for (auto const& production : candidate.added_productions) {
+    // Match the legacy resolver's observable validation order: all children
+    // in stored order, then the parent, before canonical sorting.
+    auto all_taxa_are_sorted_unique = true;
+    for (auto child : production.children) {
+      auto const& taxa =
+          chart_spr_clade_taxa_for_ref(base, candidate, child);
+      if (!chart_spr_taxa_are_sorted_unique(taxa)) {
+        all_taxa_are_sorted_unique = false;
+      }
+    }
+    auto const& parent_taxa =
+        chart_spr_clade_taxa_for_ref(base, candidate, production.parent);
+    if (!chart_spr_taxa_are_sorted_unique(parent_taxa)) {
+      all_taxa_are_sorted_unique = false;
+    }
+    added.push_back(chart_spr_binary_production_taxon_key(
+        parent_taxa, production.children.size(),
+        [&](std::size_t index) -> std::vector<taxon_id> const& {
+          return chart_spr_clade_taxa_for_ref(
+              base, candidate, production.children[index]);
+        },
+        all_taxa_are_sorted_unique));
+  }
+  chart_spr_binary_append_production_multiset(out, added);
+  return out;
+}
+
+inline std::string chart_spr_candidate_taxon_dedup_key(
+    clade_grammar const& base, grammar_spr_candidate const& candidate) {
+  return chart_spr_candidate_taxon_dedup_key(
+      base, candidate, std::locale{} == std::locale::classic());
+}
+
+}  // namespace chart_spr_detail
 
 inline void chart_spr_append_reversal_key_piece(
     std::ostringstream& out, char const* label,
@@ -6205,6 +6962,9 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
     throw std::logic_error(
         "chart SPR sampled-tree projection scheduler changed after admission");
   }
+  auto const cache_direct_after_refs =
+      scheduler != nullptr &&
+      scheduler->worker_resolution().resolved_workers > 1;
   auto const wave_size = preassignment.memory.wave_size;
   result.peak_wave_size = wave_size;
   result.memory = preassignment.memory;
@@ -6236,8 +6996,13 @@ sampled_tree_projection_execution_stats project_preassigned_sampled_tree_moves(
       if (options.before_sampled_tree_projection_for_tests) {
         options.before_sampled_tree_projection_for_tests(job.ordinal);
       }
-      project_sampled_tree_move_with_path_into(
-          prepared, job.move, stable_scratch[stable_slot], slots[local]);
+      if (cache_direct_after_refs) {
+        project_sampled_tree_move_with_path_into_with_cached_after_refs(
+            prepared, job.move, stable_scratch[stable_slot], slots[local]);
+      } else {
+        project_sampled_tree_move_with_path_into(
+            prepared, job.move, stable_scratch[stable_slot], slots[local]);
+      }
       slots[local].completed = true;
       return true;
     } catch (...) {
@@ -6507,6 +7272,22 @@ project_sampled_tree_moves_in_source_waves(
     bool adaptive_initial_wave_pending = true) {
   sampled_tree_source_wave_execution_stats result;
   auto* scheduler = options.sampled_tree_projection_scheduler;
+  constexpr bool gather_accepts_parallel_postprocessing =
+      std::is_invocable_v<
+          Gather&, std::size_t,
+          std::optional<grammar_spr_candidate> const&,
+          sampled_tree_projection_postprocessing*>;
+  auto const parallel_postprocessing_requested =
+      gather_accepts_parallel_postprocessing && scheduler != nullptr &&
+      scheduler->worker_resolution().resolved_workers > 1;
+  auto const parallel_taxon_key_locale_is_classic =
+      std::locale{} == std::locale::classic();
+  auto const parallel_postprocessing_enabled =
+      parallel_postprocessing_requested &&
+      parallel_taxon_key_locale_is_classic;
+  auto const cache_direct_after_refs =
+      scheduler != nullptr &&
+      scheduler->worker_resolution().resolved_workers > 1;
   auto const finite_candidate_stream =
       options.max_candidates != 0 || finite_candidate_stream_override;
   auto cancellation_requested = [&]() noexcept {
@@ -6658,8 +7439,12 @@ project_sampled_tree_moves_in_source_waves(
         *options.force_sampled_tree_projection_submit_failure_after_for_tests);
   }
 
-  constexpr chart_indexed_range_options range_options{
+  constexpr chart_indexed_range_options source_range_options{
       .minimum_grain = 1, .target_ranges_per_worker = 1};
+  auto const projection_range_options =
+      sampled_tree_source_projection_range_options(scheduler);
+  auto const postprocessing_range_options =
+      sampled_tree_source_postprocessing_range_options();
   struct source_enumeration_cancelled {};
   auto enumerate_source = [&](sampled_tree_source_wave_slot& slot) noexcept {
     try {
@@ -6781,7 +7566,7 @@ project_sampled_tree_moves_in_source_waves(
       chart_scheduler_run_summary summary;
       try {
         summary = scheduler->for_each_indexed_range(
-            source_wave_count, range_options,
+            source_wave_count, source_range_options,
             [&](chart_indexed_range const& range, std::size_t,
                 chart_scheduler_cancellation_token const& cancellation) {
               for (auto local = range.begin; local < range.end; ++local) {
@@ -6890,6 +7675,13 @@ project_sampled_tree_moves_in_source_waves(
             sampled_tree_projection_path::not_attempted;
         projection_slots[local].failure = nullptr;
         projection_slots[local].completed = false;
+        if (parallel_postprocessing_enabled) {
+          projection_slots[local].postprocessing.filter_stats = {};
+          projection_slots[local].postprocessing.taxon_signature.clear();
+          projection_slots[local].postprocessing.failure = nullptr;
+          projection_slots[local].postprocessing.filter_passed = false;
+          projection_slots[local].postprocessing.attempted = false;
+        }
         projection_completed[local] = 0;
       }
       for (auto& workspace : projection_workspaces) {
@@ -6903,9 +7695,15 @@ project_sampled_tree_moves_in_source_waves(
           if (options.before_sampled_tree_projection_for_tests) {
             options.before_sampled_tree_projection_for_tests(job.ordinal);
           }
-          project_sampled_tree_move_with_path_into(
-              prepared, job.move, projection_workspaces[stable_slot],
-              projection_slots[local]);
+          if (cache_direct_after_refs) {
+            project_sampled_tree_move_with_path_into_with_cached_after_refs(
+                prepared, job.move, projection_workspaces[stable_slot],
+                projection_slots[local]);
+          } else {
+            project_sampled_tree_move_with_path_into(
+                prepared, job.move, projection_workspaces[stable_slot],
+                projection_slots[local]);
+          }
           projection_slots[local].completed = true;
           projection_completed[local] = 1;
           return true;
@@ -6932,7 +7730,7 @@ project_sampled_tree_moves_in_source_waves(
         chart_scheduler_run_summary summary;
         try {
           summary = scheduler->for_each_indexed_range(
-              projection_count, range_options,
+              projection_count, projection_range_options,
               [&](chart_indexed_range const& range, std::size_t stable_slot,
                   chart_scheduler_cancellation_token const& cancellation) {
                 if (stable_slot >= projection_workspaces.size()) {
@@ -6954,6 +7752,68 @@ project_sampled_tree_moves_in_source_waves(
                     projection_workspaces[stable_slot].quarantined = true;
                     break;
                   }
+                }
+              },
+              &failed_summary);
+        } catch (...) {
+          record_failed_summary(failed_summary);
+          throw;
+        }
+        record_projection_summary(summary);
+      }
+
+      if (parallel_postprocessing_enabled) {
+        auto postprocess_one = [&](std::size_t local) noexcept {
+          auto& slot = projection_slots[local];
+          if (slot.failure || !slot.completed || !slot.engaged) return;
+          slot.postprocessing.attempted = true;
+          try {
+            slot.postprocessing.filter_passed =
+                candidate_passes_postconstruction_filters(
+                    prepared.base(), *slot.candidate, options,
+                    slot.postprocessing.filter_stats);
+            if (slot.postprocessing.filter_passed) {
+              slot.postprocessing.taxon_signature =
+                  chart_spr_candidate_taxon_dedup_key(prepared.base(),
+                                                       *slot.candidate, true);
+              slot.postprocessing.taxon_signature_storage_activated = true;
+            }
+          } catch (...) {
+            // Postprocessing failures are ordinal results.  Keep processing
+            // later speculative ordinals so the serial gather alone chooses
+            // the first observable failure after all work joins.
+            slot.postprocessing.failure = std::current_exception();
+          }
+        };
+
+        auto scheduler_handoff = acquire_scheduler_handoff();
+        if (cancellation_requested()) {
+          auto const boundary = projection_jobs.front().ordinal;
+          result.projection_speculative_discarded +=
+              static_cast<std::size_t>(std::count(
+                  projection_completed.begin(),
+                  projection_completed.begin() + projection_count,
+                  std::uint8_t{1}));
+          result.source_speculative_moves_discarded +=
+              source_wave_end_ordinal - boundary;
+          result.source_speculative_sources_discarded +=
+              count_fully_speculative_sources(boundary);
+          result.cancelled = true;
+          return result;
+        }
+        chart_scheduler_run_summary failed_summary;
+        chart_scheduler_run_summary summary;
+        try {
+          summary = scheduler->for_each_indexed_range(
+              projection_count, postprocessing_range_options,
+              [&](chart_indexed_range const& range, std::size_t,
+                  chart_scheduler_cancellation_token const& cancellation) {
+                for (auto local = range.begin; local < range.end; ++local) {
+                  if ((local != range.begin && cancellation.stop_requested()) ||
+                      cancellation_requested()) {
+                    break;
+                  }
+                  postprocess_one(local);
                 }
               },
               &failed_summary);
@@ -7065,8 +7925,19 @@ project_sampled_tree_moves_in_source_waves(
         auto const& projected = projection_slots[local].engaged
                                     ? projection_slots[local].candidate
                                     : empty;
-        auto gather_result = std::invoke(
-            gather, projection_jobs[local].ordinal, std::as_const(projected));
+        auto gather_result = [&] {
+          if constexpr (gather_accepts_parallel_postprocessing) {
+            auto* postprocessing =
+                parallel_postprocessing_enabled
+                    ? &projection_slots[local].postprocessing
+                    : nullptr;
+            return std::invoke(gather, projection_jobs[local].ordinal,
+                               std::as_const(projected), postprocessing);
+          } else {
+            return std::invoke(gather, projection_jobs[local].ordinal,
+                               std::as_const(projected));
+          }
+        }();
         auto decision = [&] {
           if constexpr (std::is_same_v<
                             std::remove_cvref_t<decltype(gather_result)>,
@@ -7339,7 +8210,8 @@ chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
     auto projection = prepare_sampled_tree_projection(grammar, tree);
     auto execution = project_sampled_tree_moves_in_source_waves(
         projection, options, radius, rng,
-        [&](std::size_t, std::optional<grammar_spr_candidate> const& projected)
+        [&](std::size_t, std::optional<grammar_spr_candidate> const& projected,
+            sampled_tree_projection_postprocessing* postprocessing)
             -> sampled_tree_projection_gather_decision {
           using decision = sampled_tree_projection_gather_decision;
           if (stopped()) return decision::stop_before_current;
@@ -7353,16 +8225,34 @@ chart_spr_detail::for_each_sampled_tree_spr_candidate_stream(
             return decision::continue_projection;
           }
           ++stats.candidates_constructed;
-          if (!candidate_passes_postconstruction_filters(grammar, *projected,
-                                                         options, stats)) {
+          bool filters_passed = false;
+          if (postprocessing == nullptr) {
+            filters_passed = candidate_passes_postconstruction_filters(
+                grammar, *projected, options, stats);
+          } else {
+            if (!postprocessing->attempted) {
+              throw std::logic_error(
+                  "chart SPR sampled-tree parallel postprocessing missing for "
+                  "an engaged projection");
+            }
+            add_generation_count_stats(stats,
+                                       postprocessing->filter_stats);
+            if (postprocessing->failure) {
+              std::rethrow_exception(postprocessing->failure);
+            }
+            filters_passed = postprocessing->filter_passed;
+          }
+          if (!filters_passed) {
             if (pre_dedup_cap_reached()) {
               request_stop(chart_spr_candidate_stop_reason::candidate_cap);
               return decision::stop_after_current;
             }
             return decision::continue_projection;
           }
-          auto signature =
-              chart_spr_candidate_taxon_signature(grammar, *projected);
+          auto signature = postprocessing == nullptr
+                               ? chart_spr_candidate_taxon_signature(
+                                     grammar, *projected)
+                               : std::move(postprocessing->taxon_signature);
           if (!seen.insert(std::move(signature)).second) {
             note_pruned_after(stats, &chart_spr_candidate_generation_stats::
                                          candidates_pruned_duplicate);

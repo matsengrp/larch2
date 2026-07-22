@@ -4177,10 +4177,14 @@ struct grammar_spr_finite_iteration_memory_envelope {
   std::size_t planned_candidate_buffer_owned_bytes = 0;
   std::size_t planned_pipeline_control_bytes = 0;
   std::size_t planned_sampled_source_waiting_bytes = 0;
+  std::size_t planned_sampled_dedup_signature_node_bytes = 0;
   std::size_t planned_sampled_source_active_scratch_bytes = 0;
   std::size_t planned_sampled_source_scheduler_operation_peak_bytes = 0;
   std::size_t planned_sampled_projection_active_scratch_bytes = 0;
   std::size_t planned_sampled_projection_scheduler_operation_peak_bytes = 0;
+  std::size_t planned_sampled_postprocessing_active_scratch_bytes = 0;
+  std::size_t
+      planned_sampled_postprocessing_scheduler_operation_peak_bytes = 0;
   std::size_t planned_sampled_source_admitted_peak_bytes = 0;
   std::size_t planned_sampled_source_count_bound = 0;
   std::size_t planned_sampled_destination_bound_per_source = 0;
