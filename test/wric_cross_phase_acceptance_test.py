@@ -45,8 +45,11 @@ class SyntheticEvidence:
         self.raw_paths: dict[str, Path] = {}
         self.raw_inputs: dict[str, list[Path]] = {}
         self.phase0_capture_paths: list[Path] = []
+        self.phase0_classification_paths: list[Path] = []
         self.phase0_inputs: list[Path] = []
         self.phase0_capture_by_name: dict[str, Path] = {}
+        self.phase0_classification_by_name: dict[str, Path] = {}
+        self.phase0_strict_real: Path | None = None
         self.phase0_artifact_ledger = root / "phase0-artifacts.tsv"
         self.phase0_ledger_member = root / "phase0-ledger-member.txt"
         self.refusal_stderr = "synthetic frozen larch2 diagnostic\n" + cross.REAL_REFUSAL_SUFFIX
@@ -507,6 +510,12 @@ class SyntheticEvidence:
         return path
 
     def _write_phase0(self) -> None:
+        phase0_raw_columns = tuple(
+            field
+            for field in cross.RAW_COLUMNS
+            if field in cross.PHASE0_LEGACY_EXACT_TIMING_FIELDS
+            or field not in cross.ADMISSION_FIELDS
+        )
         gate_ids = {
             cross.MEDIUM_DENSE.format(1), cross.SMALL_DENSE.format(1),
             cross.SMALL_EXACT.format(1), cross.MEDIUM_CACHE.format(1),
@@ -514,10 +523,16 @@ class SyntheticEvidence:
             "p0-medium-primary32k4-sampled-tree-fixed-topology-w8",
             "p0-medium-primary32k4-hybrid-exact-w8",
         }
-        captures = {
-            "acceptance-core": gate_ids,
-            "remaining-base": set(self.base_rows) - gate_ids,
+        real_ids = {
+            row_id
+            for row_id, row in self.base_rows.items()
+            if row["expected_outcome"] == "expected_infeasible"
         }
+        captures: dict[str, set[str]] = {}
+        for row_id, manifest in self.base_rows.items():
+            if row_id in real_ids:
+                continue
+            captures.setdefault(manifest["run_group"], set()).add(row_id)
         for capture_id, ids in captures.items():
             path = (
                 self.root / "bootstrap-phase0" / "captures" / capture_id
@@ -525,42 +540,174 @@ class SyntheticEvidence:
             )
             path.parent.mkdir(parents=True, exist_ok=True)
             rows: list[dict[str, str]] = []
+            classifications: list[dict[str, str]] = []
             for row_id in sorted(ids):
-                outcome = self.base_rows[row_id]["expected_outcome"]
+                manifest = self.base_rows[row_id]
+                outcome = manifest["expected_outcome"]
                 repetitions = (
                     1 if outcome in ("timeout", "expected_infeasible")
                     else 5 if row_id in gate_ids
                     else 3
                 )
+                worker = cross.manifest_worker(manifest)
+                method = manifest["method"]
+                semantic_fixture = next(
+                    fixture
+                    for fixture in ("small", "medium")
+                    if manifest["primary_sha256"] == digest(f"input:{fixture}")
+                )
+                source_fixture = f"{semantic_fixture}.pb.gz"
+                source_row_id = f"{source_fixture}/{method}@{worker}"
+                source_argv = digest(
+                    f"pre-manifest-argv:{capture_id}:{method}:{worker}"
+                )
+                source_trial = digest(
+                    f"pre-manifest-trial:{capture_id}:{method}:{worker}"
+                )
                 for trial in range(1, repetitions + 1):
                     wall = "600" if outcome == "timeout" else "1"
                     row = self.raw_row(row_id, trial, label="phase0", wall=wall)
+                    row["fixture"] = source_fixture
+                    row["row_id"] = source_row_id
+                    if method != cross.METHOD_NATIVE:
+                        row["canonical_argv_sha256"] = source_argv
+                        if outcome == "ok":
+                            row["trial_semantic_sha256"] = source_trial
+                            row["canonical_digest"] = source_trial
+                    if outcome == "timeout":
+                        row.update(
+                            runner_outcome="timeout",
+                            runner_exit_code="124",
+                            exit_code="-1",
+                            term_signal="15",
+                        )
                     if row_id == cross.MEDIUM_DENSE.format(1):
                         row["local_scoring_ms"] = "100"
                     rows.append(row)
+                classifications.append(
+                    {
+                        "method": method,
+                        "requested_workers": worker,
+                        "row_id": row_id,
+                        "measured_trial_target": str(
+                            5 if outcome == "timeout" else repetitions
+                        ),
+                        "observed_trial_count": str(repetitions),
+                        "outcome": outcome,
+                        "evidence_kind": (
+                            "timeout_characterization_non_performance"
+                            if outcome == "timeout"
+                            else "finite_performance"
+                        ),
+                        "characterization_stage": "characterization",
+                        "repeat_stage": (
+                            "-"
+                            if outcome == "timeout"
+                            else f"repeats/{method}--{worker}"
+                        ),
+                        "trial1_native_peer": (
+                            "self"
+                            if method == cross.METHOD_NATIVE
+                            else "characterization:sample_explore_merge@native"
+                        ),
+                    }
+                )
             with path.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.DictWriter(
                     handle,
-                    fieldnames=cross.RAW_COLUMNS,
+                    fieldnames=phase0_raw_columns,
+                    delimiter="\t",
+                    lineterminator="\n",
+                    extrasaction="ignore",
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            classification_path = path.with_name("trial_classification.tsv")
+            with classification_path.open(
+                "w", encoding="utf-8", newline=""
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=cross.PHASE0_CLASSIFICATION_COLUMNS,
                     delimiter="\t",
                     lineterminator="\n",
                 )
                 writer.writeheader()
-                writer.writerows(rows)
+                writer.writerows(
+                    sorted(
+                        classifications,
+                        key=lambda row: (
+                            row["method"], row["requested_workers"]
+                        ),
+                    )
+                )
             self.phase0_capture_by_name[capture_id] = path
+            self.phase0_classification_by_name[capture_id] = classification_path
         self.phase0_capture_paths = [
             self.phase0_capture_by_name[name]
             for name in sorted(self.phase0_capture_by_name)
         ]
-        self.phase0_inputs = list(self.phase0_capture_paths)
-        self.phase0 = self.phase0_capture_by_name["acceptance-core"]
+        self.phase0_classification_paths = [
+            self.phase0_classification_by_name[name]
+            for name in sorted(self.phase0_classification_by_name)
+        ]
+        strict_real = (
+            self.root / "bootstrap-phase0" / "strict-real-smoke-final"
+            / "raw_trials.tsv"
+        )
+        strict_real.parent.mkdir(parents=True, exist_ok=True)
+        (strict_real.parent / "outputs").mkdir()
+        real_rows: list[dict[str, str]] = []
+        for row_id in sorted(real_ids):
+            row = self.raw_row(row_id, 1, label="phase0")
+            source_report = Path(row["report_path"])
+            report = strict_real.parent / "logs" / source_report.name
+            report.parent.mkdir(exist_ok=True)
+            report.write_bytes(source_report.read_bytes())
+            report.with_suffix(".err").write_bytes(
+                source_report.with_suffix(".err").read_bytes()
+            )
+            row["report_path"] = str(report.relative_to(strict_real.parent))
+            real_rows.append(row)
+        with strict_real.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=phase0_raw_columns,
+                delimiter="\t",
+                lineterminator="\n",
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            writer.writerows(real_rows)
+        self.phase0_strict_real = strict_real
+        self.phase0_inputs = [*self.phase0_capture_paths, strict_real]
+        lazy_row_id = cross.MEDIUM_LAZY.format(1)
+        for path in self.phase0_capture_paths:
+            with path.with_name("trial_classification.tsv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                classified_ids = {
+                    row["row_id"]
+                    for row in csv.DictReader(handle, delimiter="\t")
+                }
+            if lazy_row_id in classified_ids:
+                self.phase0 = path
+                break
+        else:
+            raise AssertionError("synthetic Phase-0 lazy capture is absent")
         self.phase0_ledger_member.write_text(
             "synthetic immutable Phase-0 closure member\n", encoding="utf-8"
         )
         self.refresh_phase0_ledger()
 
     def refresh_phase0_ledger(self) -> None:
-        members = [*self.phase0_capture_paths, self.phase0_ledger_member]
+        assert self.phase0_strict_real is not None
+        members = [
+            *self.phase0_capture_paths,
+            *self.phase0_classification_paths,
+            self.phase0_strict_real,
+            self.phase0_ledger_member,
+        ]
         records = sorted(
             [
                 (
@@ -935,20 +1082,33 @@ class SyntheticEvidence:
             writer.writerows(rows)
 
     def append_timeout_trial(self) -> None:
-        with self.phase0.open(encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle, delimiter="\t")
-            assert reader.fieldnames is not None
-            header = reader.fieldnames
-            rows = list(reader)
-        source = next(row for row in rows if row["status"] == "timeout")
-        extra = dict(source)
-        extra["trial_index"] = "2"
-        rows.append(extra)
-        with self.phase0.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=header, delimiter="\t", lineterminator="\n")
-            writer.writeheader()
-            writer.writerows(rows)
-        self.refresh_phase0_ledger()
+        for path in self.phase0_capture_paths:
+            with path.open(encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle, delimiter="\t")
+                assert reader.fieldnames is not None
+                header = reader.fieldnames
+                rows = list(reader)
+            source = next(
+                (row for row in rows if row["status"] == "timeout"),
+                None,
+            )
+            if source is None:
+                continue
+            extra = dict(source)
+            extra["trial_index"] = "2"
+            rows.append(extra)
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=header,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            self.refresh_phase0_ledger()
+            return
+        raise AssertionError("synthetic Phase-0 closure contains no timeout row")
 
     def remove_phase0_rows(
         self,
@@ -956,12 +1116,31 @@ class SyntheticEvidence:
     ) -> None:
         removed = 0
         for path in self.phase0_capture_paths:
+            classification_path = path.with_name("trial_classification.tsv")
+            with classification_path.open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                classification_reader = csv.DictReader(handle, delimiter="\t")
+                assert classification_reader.fieldnames is not None
+                classification_header = classification_reader.fieldnames
+                classifications = list(classification_reader)
+            projected_ids = {
+                (row["method"], row["requested_workers"]): row["row_id"]
+                for row in classifications
+            }
             with path.open(encoding="utf-8", newline="") as handle:
                 reader = csv.DictReader(handle, delimiter="\t")
                 assert reader.fieldnames is not None
                 header = reader.fieldnames
                 rows = list(reader)
-            retained = [row for row in rows if not predicate(row)]
+            retained = []
+            for row in rows:
+                projected = dict(row)
+                projected["row_id"] = projected_ids[
+                    (row["method"], row["requested_workers"])
+                ]
+                if not predicate(projected):
+                    retained.append(row)
             removed += len(rows) - len(retained)
             if len(retained) == len(rows):
                 continue
@@ -974,15 +1153,67 @@ class SyntheticEvidence:
                 )
                 writer.writeheader()
                 writer.writerows(retained)
+            observed = {
+                (row["method"], row["requested_workers"]): 0
+                for row in retained
+            }
+            for row in retained:
+                observed[(row["method"], row["requested_workers"])] += 1
+            classifications = [
+                row
+                for row in classifications
+                if (row["method"], row["requested_workers"]) in observed
+            ]
+            for row in classifications:
+                count = observed[(row["method"], row["requested_workers"])]
+                row["observed_trial_count"] = str(count)
+                if row["outcome"] == "ok":
+                    row["measured_trial_target"] = str(count)
+            with classification_path.open(
+                "w", encoding="utf-8", newline=""
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=classification_header,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerows(classifications)
         assert removed
         self.refresh_phase0_ledger()
 
     def duplicate_phase0_row_trial_across_captures(self) -> None:
-        source = self.phase0_capture_by_name["acceptance-core"]
-        target = self.phase0_capture_by_name["remaining-base"]
-        with source.open(encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle, delimiter="\t")
-            duplicate = next(iter(reader))
+        selected: tuple[Path, Path, dict[str, str]] | None = None
+        for source in self.phase0_capture_paths:
+            with source.open(encoding="utf-8", newline="") as handle:
+                source_rows = list(csv.DictReader(handle, delimiter="\t"))
+            for target in self.phase0_capture_paths:
+                if target == source:
+                    continue
+                with target.with_name("trial_classification.tsv").open(
+                    encoding="utf-8", newline=""
+                ) as handle:
+                    target_keys = {
+                        (row["method"], row["requested_workers"])
+                        for row in csv.DictReader(handle, delimiter="\t")
+                    }
+                duplicate = next(
+                    (
+                        row
+                        for row in source_rows
+                        if (row["method"], row["requested_workers"])
+                        not in target_keys
+                    ),
+                    None,
+                )
+                if duplicate is not None:
+                    selected = (source, target, duplicate)
+                    break
+            if selected is not None:
+                break
+        assert selected is not None
+        source, target, duplicate = selected
         with target.open(encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle, delimiter="\t")
             assert reader.fieldnames is not None
@@ -998,6 +1229,40 @@ class SyntheticEvidence:
             )
             writer.writeheader()
             writer.writerows(rows)
+        source_classification = source.with_name("trial_classification.tsv")
+        with source_classification.open(
+            encoding="utf-8", newline=""
+        ) as handle:
+            source_reader = csv.DictReader(handle, delimiter="\t")
+            copied_classification = next(
+                row
+                for row in source_reader
+                if (
+                    row["method"], row["requested_workers"]
+                ) == (duplicate["method"], duplicate["requested_workers"])
+            )
+        target_classification = target.with_name("trial_classification.tsv")
+        with target_classification.open(
+            encoding="utf-8", newline=""
+        ) as handle:
+            target_reader = csv.DictReader(handle, delimiter="\t")
+            assert target_reader.fieldnames is not None
+            classification_header = target_reader.fieldnames
+            classification_rows = list(target_reader)
+        copied_classification["observed_trial_count"] = "1"
+        copied_classification["measured_trial_target"] = "1"
+        classification_rows.append(copied_classification)
+        with target_classification.open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=classification_header,
+                delimiter="\t",
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerows(classification_rows)
         self.refresh_phase0_ledger()
 
     def rewrite_phase0_ledger(
@@ -1126,6 +1391,41 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
     def test_complete_group_shaped_matrix_passes_without_writes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-positive-") as name:
             data = SyntheticEvidence(Path(name))
+            source_ids: list[str] = []
+            for raw_path, classification_path in zip(
+                data.phase0_capture_paths,
+                data.phase0_classification_paths,
+                strict=True,
+            ):
+                with raw_path.open(encoding="utf-8", newline="") as handle:
+                    raw_rows = list(csv.DictReader(handle, delimiter="\t"))
+                source_ids.extend(row["row_id"] for row in raw_rows)
+                self.assertTrue(
+                    all(not row["row_id"].startswith("p0-") for row in raw_rows)
+                )
+                with classification_path.open(
+                    encoding="utf-8", newline=""
+                ) as handle:
+                    reader = csv.DictReader(handle, delimiter="\t")
+                    self.assertEqual(
+                        tuple(reader.fieldnames or ()),
+                        cross.PHASE0_CLASSIFICATION_COLUMNS,
+                    )
+            self.assertLess(len(set(source_ids)), len(source_ids))
+            assert data.phase0_strict_real is not None
+            with data.phase0_strict_real.open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                self.assertEqual(
+                    {
+                        row["row_id"]
+                        for row in csv.DictReader(handle, delimiter="\t")
+                    },
+                    {
+                        "p0-real20d-preflight-grammar-exact-w1",
+                        "p0-real20d-preflight-grammar-exact-w8",
+                    },
+                )
             before = {
                 path: hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in data.root.rglob("*") if path.is_file()
@@ -1480,7 +1780,7 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="wric-cross-p0-omit-capture-") as name:
             data = SyntheticEvidence(Path(name))
             data.phase0_inputs.remove(
-                data.phase0_capture_by_name["remaining-base"]
+                data.phase0_capture_paths[-1]
             )
             result = self.run_case(data)
             self.assertNotEqual(result.returncode, 0)
@@ -1493,6 +1793,137 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             result = self.run_case(data)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("exact ordered complete capture set", result.stderr)
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p0-omit-real-") as name:
+            data = SyntheticEvidence(Path(name))
+            assert data.phase0_strict_real is not None
+            data.phase0_inputs.remove(data.phase0_strict_real)
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("exact ordered complete capture set", result.stderr)
+
+    def test_phase0_rejects_normalized_row_ids_in_aggregate_capture(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p0-source-id-") as name:
+            data = SyntheticEvidence(Path(name))
+            raw_path = data.phase0_capture_paths[0]
+            classification_path = raw_path.with_name("trial_classification.tsv")
+            with classification_path.open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                classification = next(csv.DictReader(handle, delimiter="\t"))
+            with raw_path.open(encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle, delimiter="\t")
+                assert reader.fieldnames is not None
+                header = reader.fieldnames
+                rows = list(reader)
+            target = next(
+                row
+                for row in rows
+                if (
+                    row["method"], row["requested_workers"]
+                ) == (
+                    classification["method"],
+                    classification["requested_workers"],
+                )
+            )
+            target["row_id"] = classification["row_id"]
+            with raw_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=header,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            data.refresh_phase0_ledger()
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("pre-manifest harness identity", result.stderr)
+
+    def test_phase0_native_capture_binds_normalized_semantic_identity(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p0-native-id-") as name:
+            data = SyntheticEvidence(Path(name))
+            selected: tuple[Path, list[str], list[dict[str, str]]] | None = None
+            for raw_path in data.phase0_capture_paths:
+                with raw_path.open(encoding="utf-8", newline="") as handle:
+                    reader = csv.DictReader(handle, delimiter="\t")
+                    assert reader.fieldnames is not None
+                    header = reader.fieldnames
+                    rows = list(reader)
+                if any(row["method"] == cross.METHOD_NATIVE for row in rows):
+                    selected = (raw_path, header, rows)
+                    break
+            assert selected is not None
+            raw_path, header, rows = selected
+            native = next(
+                row
+                for row in rows
+                if row["method"] == cross.METHOD_NATIVE
+            )
+            native_key = (native["method"], native["requested_workers"])
+            forged_argv = digest(
+                "forged sealed Phase-0 native argv identity"
+            )
+            for row in rows:
+                if (row["method"], row["requested_workers"]) == native_key:
+                    row["canonical_argv_sha256"] = forged_argv
+            with raw_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=header,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            data.refresh_phase0_ledger()
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "canonical_argv_sha256 differs from sealed manifest row",
+                result.stderr,
+            )
+
+    def test_phase0_strict_real_is_one_trial_and_outputless(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p0-real-count-") as name:
+            data = SyntheticEvidence(Path(name))
+            assert data.phase0_strict_real is not None
+            with data.phase0_strict_real.open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                reader = csv.DictReader(handle, delimiter="\t")
+                assert reader.fieldnames is not None
+                header = reader.fieldnames
+                rows = list(reader)
+            extra = dict(rows[0])
+            extra["trial_index"] = "2"
+            rows.append(extra)
+            with data.phase0_strict_real.open(
+                "w", encoding="utf-8", newline=""
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=header,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            data.refresh_phase0_ledger()
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "must have exactly one trial_index=1 observation",
+                result.stderr,
+            )
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p0-real-output-") as name:
+            data = SyntheticEvidence(Path(name))
+            assert data.phase0_strict_real is not None
+            unexpected = data.phase0_strict_real.parent / "outputs" / "forged.pb.gz"
+            unexpected.write_bytes(b"forged Phase-0 refusal output\n")
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("refusal output namespace is not empty", result.stderr)
 
     def test_phase0_requires_every_sealed_base_row_and_unique_trials(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-p0-missing-row-") as name:
@@ -1508,7 +1939,7 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             data.duplicate_phase0_row_trial_across_captures()
             result = self.run_case(data)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("duplicate row/trial", result.stderr)
+            self.assertIn("more than one capture", result.stderr)
 
     def test_phase0_finite_trial_count_comes_only_from_sealed_capture(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-p0-finite-count-") as name:
@@ -1555,6 +1986,24 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             result = self.run_case(data)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("member hash mismatch", result.stderr)
+
+    def test_phase0_final_unchanged_check_rehashes_every_member(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wric-cross-p0-toctou-") as name:
+            data = SyntheticEvidence(Path(name))
+            ledger = cross.load_phase0_artifact_ledger(
+                data.phase0_artifact_ledger,
+                data.phase0_artifact_ledger_sha,
+                data.root,
+            )
+            data.phase0_ledger_member.write_text(
+                "mutated after the sealed closure was loaded\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                cross.AcceptanceError,
+                "artifact-ledger member changed during evaluation",
+            ):
+                ledger.unchanged()
 
     def test_phase0_ledger_uri_escape_and_raw_hash_divergence_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-p0-uri-") as name:
@@ -1617,7 +2066,7 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             data.append_timeout_trial()
             result = self.run_case(data)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("timeout trial count 2 differs from sealed 1", result.stderr)
+            self.assertIn("records 1 observations", result.stderr)
 
     def test_phase9_ledger_anchor_and_deep_failure_propagate(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-ledger-") as name:
