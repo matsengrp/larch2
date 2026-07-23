@@ -1032,6 +1032,109 @@ class BenchmarkCaptureTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def q_summary_compat_provenance(self) -> dict[str, object]:
+        provenance = capture_tool.harness_provenance(
+            self.fixture.harness,
+            self.fixture.harness_sha256,
+            self.fixture.harness_metadata_sha256,
+            self.fixture.product,
+            self.fixture.product_revision,
+            self.fixture.controller,
+        )
+        result = {
+            "harness": os.fspath(self.fixture.harness),
+            "harness_sha256": capture_tool.SUMMARY_COMPAT_HARNESS_SHA256,
+            "kind": "audit",
+            "metadata": os.fspath(self.fixture.harness_metadata),
+            "metadata_sha256": self.fixture.harness_metadata_sha256,
+            "product_repo_root": os.fspath(self.fixture.product),
+            "product_revision": capture_tool.SUMMARY_COMPAT_PRODUCT_REVISION,
+            "schema": "wric.historical_harness_compat",
+            "schema_version": 1,
+            "status": "ok",
+            "transformation_spec_sha256": "a" * 64,
+            "variant": capture_tool.SUMMARY_COMPAT_VARIANT,
+        }
+        provenance["audit_result"] = result
+        provenance["expected_harness_sha256"] = (
+            capture_tool.SUMMARY_COMPAT_HARNESS_SHA256
+        )
+        return provenance
+
+    def test_product_q_harness_policy_is_exact_and_phase9_separated(self) -> None:
+        compatibility = self.q_summary_compat_provenance()
+        capture_tool.require_run_harness_policy(
+            "phase3",
+            capture_tool.SUMMARY_COMPAT_PRODUCT_REVISION,
+            self.fixture.product,
+            self.fixture.harness,
+            compatibility,
+        )
+
+        exact = {
+            "expected_harness_sha256": (
+                capture_tool.SUMMARY_COMPAT_TRACKED_HARNESS_SHA256
+            ),
+            "expected_metadata_sha256": "-",
+            "kind": "exact_product_tracked",
+        }
+        tracked = self.fixture.product / "tools/wric_spr_search_benchmark.sh"
+        capture_tool.require_run_harness_policy(
+            "phase9",
+            capture_tool.SUMMARY_COMPAT_PRODUCT_REVISION,
+            self.fixture.product,
+            tracked,
+            exact,
+        )
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError, "non-Phase9 capture requires"
+        ):
+            capture_tool.require_run_harness_policy(
+                "phase3",
+                capture_tool.SUMMARY_COMPAT_PRODUCT_REVISION,
+                self.fixture.product,
+                tracked,
+                exact,
+            )
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError, "Phase-9 capture requires"
+        ):
+            capture_tool.require_run_harness_policy(
+                "phase9",
+                capture_tool.SUMMARY_COMPAT_PRODUCT_REVISION,
+                self.fixture.product,
+                self.fixture.harness,
+                compatibility,
+            )
+
+        wrong_variant = dict(compatibility)
+        wrong_result = dict(compatibility["audit_result"])
+        wrong_result["variant"] = "phase7-8"
+        wrong_variant["audit_result"] = wrong_result
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError, "not the exact approved route"
+        ):
+            capture_tool.require_run_harness_policy(
+                "phase3",
+                capture_tool.SUMMARY_COMPAT_PRODUCT_REVISION,
+                self.fixture.product,
+                self.fixture.harness,
+                wrong_variant,
+            )
+
+        wrong_metadata = dict(compatibility)
+        wrong_metadata["expected_metadata_sha256"] = "b" * 64
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError, "metadata is not fully externally bound"
+        ):
+            capture_tool.require_run_harness_policy(
+                "phase3",
+                capture_tool.SUMMARY_COMPAT_PRODUCT_REVISION,
+                self.fixture.product,
+                self.fixture.harness,
+                wrong_metadata,
+            )
+
     def successful_capture(self, name: str = "capture") -> tuple[Path, dict[str, object]]:
         capture = self.fixture.captures / name
         completed = self.fixture.run(self.fixture.capture_command(capture))

@@ -26,8 +26,14 @@ REVISIONS = (
     "208ce23f0c005d3702d114f535fe21564b3b79b6",
     "870c298ff1c0c21901bdf79d341bf97d121f389c",
     "38e9a281396e5263647ba68724414848841525d7",
+    "a9db72e60f153a95362db544107373817a58a258",
 )
-EXPECTED_VARIANTS = ("phase1-5", "phase6", "phase7-8")
+EXPECTED_VARIANTS = (
+    "phase1-5",
+    "phase6",
+    "phase7-8",
+    "timed-trial-current",
+)
 APPROVED_REVISIONS = {
     "208ce23f0c005d3702d114f535fe21564b3b79b6": "phase1-5",
     "0c4623ba1793395ae8f5c3df2a2524a27d89bc80": "phase1-5",
@@ -37,6 +43,7 @@ APPROVED_REVISIONS = {
     "870c298ff1c0c21901bdf79d341bf97d121f389c": "phase6",
     "38e9a281396e5263647ba68724414848841525d7": "phase7-8",
     "6c8d0c7651c2aa2e5c396d0f57c2e4e18c322310": "phase7-8",
+    "a9db72e60f153a95362db544107373817a58a258": "timed-trial-current",
 }
 
 
@@ -94,7 +101,7 @@ class HistoricalHarnessCompatTest(unittest.TestCase):
         metadata = harness.with_name(harness.name + ".metadata.json")
         return product, harness, metadata, result
 
-    def test_all_three_approved_variants_are_exact_and_auditable(self) -> None:
+    def test_all_approved_variants_are_exact_and_auditable(self) -> None:
         self.assertEqual(compat._APPROVED_PRODUCT_REVISIONS, APPROVED_REVISIONS)
         for index, (revision, expected_variant) in enumerate(
             zip(REVISIONS, EXPECTED_VARIANTS, strict=True)
@@ -129,11 +136,20 @@ class HistoricalHarnessCompatTest(unittest.TestCase):
                 proof = cast(list[dict[str, object]], transformation["proof"])
                 self.assertEqual(spec["score_domain_source_revision"], compat.SCORE_DOMAIN_SOURCE_REVISION)
                 self.assertEqual(spec["timed_trial_source_revision"], compat.TIMED_TRIAL_SOURCE_REVISION)
-                self.assertEqual(len(proof), 17)
-                self.assertEqual(
-                    [item["name"] for item in proof[:2]],
-                    ["score-domain-01", "score-domain-02"],
+                expected_proof_length = (
+                    1 if expected_variant == "timed-trial-current" else 17
                 )
+                self.assertEqual(len(proof), expected_proof_length)
+                if expected_variant == "timed-trial-current":
+                    self.assertEqual(
+                        [item["name"] for item in proof],
+                        ["summary-row-id-01"],
+                    )
+                else:
+                    self.assertEqual(
+                        [item["name"] for item in proof[:2]],
+                        ["score-domain-01", "score-domain-02"],
+                    )
                 self.assertEqual(proof[-1]["name"], "summary-row-id-01")
                 correction = cast(
                     dict[str, object], spec["summary_aggregation_correction"]
@@ -193,6 +209,36 @@ class HistoricalHarnessCompatTest(unittest.TestCase):
             'g=$h["fixture"] SUBSEP $h["method"] SUBSEP $h["requested_workers"]',
             text,
         )
+
+    def test_current_timed_trial_product_applies_only_summary_correction(
+        self,
+    ) -> None:
+        product, harness, metadata, result = self.create(
+            REVISIONS[3], "current-summary-only"
+        )
+        source, blob, mode = compat._git_harness(product, REVISIONS[3])
+        self.assertEqual(
+            hashlib.sha256(source).hexdigest(),
+            compat.TIMED_TRIAL_SOURCE_SHA256,
+        )
+        self.assertEqual(blob, "fa04eeb645b47b7db21fa313bf278110bfebeeb6")
+        self.assertEqual(mode, "100755")
+        self.assertEqual(source.count(compat._SUMMARY_ROW_ID_OLD), 1)
+        expected = source.replace(
+            compat._SUMMARY_ROW_ID_OLD, compat._SUMMARY_ROW_ID_NEW, 1
+        )
+        self.assertEqual(harness.read_bytes(), expected)
+        self.assertEqual(
+            result["harness_sha256"],
+            compat.PHASE78_SUMMARY_ROW_ID_RESULT_SHA256,
+        )
+        document = cast(dict[str, object], json.loads(metadata.read_text()))
+        transformation = cast(dict[str, object], document["transformation"])
+        proof = cast(list[dict[str, object]], transformation["proof"])
+        spec = cast(dict[str, object], transformation["spec"])
+        hunks = cast(list[dict[str, object]], spec["hunks"])
+        self.assertEqual([item["name"] for item in proof], ["summary-row-id-01"])
+        self.assertEqual([item["name"] for item in hunks], ["summary-row-id-01"])
 
     def test_summary_aggregation_keeps_multi_policy_row_digests_separate(
         self,

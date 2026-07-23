@@ -56,6 +56,14 @@ EXPECTED_BUILD_TYPE = "RelWithDebInfo"
 EXPECTED_RELWITHDEBINFO_FLAGS = "-O2 -g -DNDEBUG"
 EXPECTED_EFFECTIVE_CXX_FLAGS = "-O2 -g -DNDEBUG -std=c++26 -freflection"
 TIMED_TRIAL_DIGEST_FIX_REVISION = "3ac59125484790deed7fc21f0ef9572f0781164a"
+SUMMARY_COMPAT_PRODUCT_REVISION = "a9db72e60f153a95362db544107373817a58a258"
+SUMMARY_COMPAT_VARIANT = "timed-trial-current"
+SUMMARY_COMPAT_HARNESS_SHA256 = (
+    "ff7f7d2904752c7198f05e13d1eafffaa087ccba9ef70221c5084a91325ef821"
+)
+SUMMARY_COMPAT_TRACKED_HARNESS_SHA256 = (
+    "ed089af213f7f6773a252908dc3111a4d86bf01c85f12ad9d3a846ec92b3770f"
+)
 BINARY_PROVENANCE_LIMIT = (
     "binary hashes bind the measured executables, but no reproducible-build "
     "attestation proves derivation from HEAD"
@@ -2475,6 +2483,92 @@ def validate_harness_provenance_shape(value: object) -> Mapping[str, object]:
     return value
 
 
+def require_run_harness_policy(
+    run_label: str,
+    product_revision: str,
+    product_root: Path,
+    harness: Path,
+    provenance: Mapping[str, object],
+) -> None:
+    """Require Q captures to use the one approved summary-key route."""
+
+    if product_revision != SUMMARY_COMPAT_PRODUCT_REVISION:
+        return
+    if run_label not in CURRENT_PRODUCT_RUN_REVISIONS:
+        fail("summary-compat product revision has an unapproved run label")
+    kind = provenance.get("kind")
+    expected_harness = product_root / "tools/wric_spr_search_benchmark.sh"
+    if run_label == "phase9":
+        if (
+            kind != "exact_product_tracked"
+            or harness != expected_harness
+            or provenance.get("expected_harness_sha256")
+            != SUMMARY_COMPAT_TRACKED_HARNESS_SHA256
+            or provenance.get("expected_metadata_sha256") != "-"
+        ):
+            fail("Product-Q Phase-9 capture requires its exact tracked harness")
+        return
+
+    if (
+        kind != "materialized_compatibility"
+        or provenance.get("expected_harness_sha256")
+        != SUMMARY_COMPAT_HARNESS_SHA256
+    ):
+        fail(
+            "Product-Q non-Phase9 capture requires the approved summary-row-ID "
+            "compatibility harness"
+        )
+    metadata = require_snapshot_shape(
+        provenance.get("metadata"), "Product-Q compatibility harness metadata"
+    )
+    expected_metadata_sha256 = provenance.get("expected_metadata_sha256")
+    metadata_path = Path(os.fspath(harness) + ".metadata.json")
+    if (
+        not isinstance(expected_metadata_sha256, str)
+        or SHA256_RE.fullmatch(expected_metadata_sha256) is None
+        or metadata.get("sha256") != expected_metadata_sha256
+        or metadata.get("path") != os.fspath(metadata_path)
+        or metadata.get("mode") != 0o444
+    ):
+        fail("Product-Q compatibility metadata is not fully externally bound")
+    audit_result = provenance.get("audit_result")
+    expected_audit_keys = {
+        "harness",
+        "harness_sha256",
+        "kind",
+        "metadata",
+        "metadata_sha256",
+        "product_repo_root",
+        "product_revision",
+        "schema",
+        "schema_version",
+        "status",
+        "transformation_spec_sha256",
+        "variant",
+    }
+    if not isinstance(audit_result, dict) or set(audit_result) != expected_audit_keys:
+        fail("Product-Q compatibility audit result has an invalid key set")
+    if (
+        audit_result.get("schema") != "wric.historical_harness_compat"
+        or audit_result.get("schema_version") != 1
+        or audit_result.get("status") != "ok"
+        or audit_result.get("kind") != "audit"
+        or audit_result.get("variant") != SUMMARY_COMPAT_VARIANT
+        or audit_result.get("product_repo_root") != os.fspath(product_root)
+        or audit_result.get("product_revision") != product_revision
+        or audit_result.get("harness") != os.fspath(harness)
+        or audit_result.get("metadata") != os.fspath(metadata_path)
+        or audit_result.get("harness_sha256") != SUMMARY_COMPAT_HARNESS_SHA256
+        or audit_result.get("metadata_sha256") != expected_metadata_sha256
+        or not isinstance(audit_result.get("transformation_spec_sha256"), str)
+        or SHA256_RE.fullmatch(
+            str(audit_result.get("transformation_spec_sha256"))
+        )
+        is None
+    ):
+        fail("Product-Q compatibility audit result is not the exact approved route")
+
+
 def require_outer_phase9_layout(outer: Path) -> Path:
     try:
         names = sorted(os.listdir(outer))
@@ -3543,6 +3637,13 @@ def capture_run(args: argparse.Namespace) -> dict[str, object]:
         args.expected_product_revision,
         capture_tool_root,
     )
+    require_run_harness_policy(
+        args.run_label,
+        args.expected_product_revision,
+        product_root,
+        benchmark_harness,
+        harness_provenance_pre,
+    )
     tracked_blobs: dict[str, object] = {
         "capture_wrapper": tracked_git_blob(
             capture_tool_root, tool_paths["capture_wrapper"], "capture wrapper"
@@ -4013,6 +4114,13 @@ def audit_run(args: argparse.Namespace) -> dict[str, object]:
         product_root,
         args.expected_product_revision,
         capture_tool_root,
+    )
+    require_run_harness_policy(
+        args.expected_run_label,
+        args.expected_product_revision,
+        product_root,
+        benchmark_harness,
+        live_harness_provenance,
     )
     if metadata["harness_provenance"] != live_harness_provenance:
         fail("live benchmark harness provenance differs from run metadata")

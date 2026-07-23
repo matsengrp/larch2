@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Materialize and audit the narrowly approved historical WRIC harness fix.
+"""Materialize and audit narrowly approved WRIC capture-harness fixes.
 
-The historical product checkout remains pristine.  This tool reads its exact
-tracked benchmark harness, applies a Git-derived allowlist of score-domain and
-per-trial canonical-digest hunks plus one fixed, hash-allowlisted summary-key
-correction, and publishes a separate immutable harness and canonical metadata
-record without replacing any existing path.
+The product checkout remains pristine.  This tool reads its exact tracked
+benchmark harness, applies (or proves already present) a Git-derived allowlist
+of score-domain and per-trial canonical-digest hunks plus one fixed,
+hash-allowlisted summary-key correction, and publishes a separate immutable
+harness and canonical metadata record without replacing any existing path.
 """
 
 from __future__ import annotations
@@ -97,6 +97,7 @@ class Variant:
     base_sha256: str
     base_blob: str
     result_sha256: str
+    summary_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,13 @@ _VARIANTS: dict[str, Variant] = {
         base_blob="c791f4fbd7f807e8d15cb7474062b8ee319dc323",
         result_sha256=PHASE78_SUMMARY_ROW_ID_RESULT_SHA256,
     ),
+    TIMED_TRIAL_SOURCE_SHA256: Variant(
+        name="timed-trial-current",
+        base_sha256=TIMED_TRIAL_SOURCE_SHA256,
+        base_blob="fa04eeb645b47b7db21fa313bf278110bfebeeb6",
+        result_sha256=PHASE78_SUMMARY_ROW_ID_RESULT_SHA256,
+        summary_only=True,
+    ),
 }
 
 _APPROVED_PRODUCT_REVISIONS: dict[str, str] = {
@@ -145,6 +153,7 @@ _APPROVED_PRODUCT_REVISIONS: dict[str, str] = {
     "870c298ff1c0c21901bdf79d341bf97d121f389c": "phase6",
     "38e9a281396e5263647ba68724414848841525d7": "phase7-8",
     "6c8d0c7651c2aa2e5c396d0f57c2e4e18c322310": "phase7-8",
+    "a9db72e60f153a95362db544107373817a58a258": "timed-trial-current",
 }
 
 
@@ -552,6 +561,19 @@ def _apply_transformations(
     return result, proof
 
 
+def _variant_hunks(
+    hunks: Sequence[Hunk], variant: Variant
+) -> tuple[Hunk, ...]:
+    """Select the exact allowlisted transformation profile for one base."""
+
+    if not variant.summary_only:
+        return tuple(hunks)
+    selected = tuple(hunk for hunk in hunks if hunk.category == "summary-row-id")
+    if len(selected) != 1 or selected[0].name != "summary-row-id-01":
+        _fail("summary-only transformation profile is not exactly one known hunk")
+    return selected
+
+
 def _tool_provenance() -> Mapping[str, object]:
     tool = Path(__file__).resolve(strict=True)
     if tool != Path(__file__).absolute():
@@ -777,7 +799,7 @@ def materialize_historical_harness(
     _require_ignored_destination(root, metadata)
     if output == root / HARNESS_RELATIVE_PATH:
         _fail("materialized harness must not alias the tracked product harness")
-    hunks = _derive_hunks(root)
+    hunks = _variant_hunks(_derive_hunks(root), variant)
     result, proof = _apply_transformations(base, hunks, variant)
     document = _metadata_document(
         root=root,
@@ -860,7 +882,7 @@ def audit_materialized_harness(
     if actual_metadata_sha256 != expected_metadata_sha256:
         _fail("materialized metadata differs from its external SHA-256 anchor")
 
-    hunks = _derive_hunks(root)
+    hunks = _variant_hunks(_derive_hunks(root), variant)
     expected_harness, proof = _apply_transformations(base, hunks, variant)
     if harness_bytes != expected_harness:
         _fail("materialized harness differs from its exact Git-derived bytes")
