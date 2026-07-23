@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1427,6 +1428,10 @@ class SyntheticEvidence:
         command.extend((
             "--expected-phase9-run-ledger-sha256",
             self.phase9_ledger_sha if ledger_anchor is None else ledger_anchor,
+            "--phase9-acceptance-tool",
+            str(ROOT / "tools/wric_phase9_acceptance.py"),
+            "--expected-phase9-acceptance-tool-sha256",
+            cross.PHASE9_ACCEPTANCE_TOOL_SHA256,
         ))
         for label in cross.PHASE8_CAPTURE_LABELS:
             phase8_values = (
@@ -1842,6 +1847,316 @@ class Invocation:
 
 
 class CrossPhaseAcceptanceTest(unittest.TestCase):
+    def test_phase9_deep_validator_uses_the_product_local_evaluator(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-phase9-product-route-"
+        ) as name:
+            root = Path(name)
+            product_root = root / "immutable-product"
+            product_tool = (
+                product_root / "tools/wric_phase9_acceptance.py"
+            )
+            raw = mock.Mock(paths=(root / "phase9-raw.tsv",))
+            manifests = mock.Mock()
+            manifests.base.path = root / "workloads.tsv"
+            manifests.base.sha256 = "a" * 64
+            manifests.supplements = {
+                "phase9": mock.Mock(path=root / "phase9.tsv")
+            }
+            delegated_payload = {
+                "schema": "wric.phase9.acceptance",
+                "schema_version": 2,
+                "status": "pass",
+                "benchmark_dir": str(raw.paths[0].parent),
+                "raw_trials": str(raw.paths[0]),
+                "matrix": {
+                    "seeds": [1, 7, 19],
+                    "workers": [1, 8],
+                    "repetitions": 3,
+                    "row_id_template":
+                        "phase9-local-commit-seed{seed}-w{worker}",
+                    "fixture_by_seed": {
+                        str(seed): f"fixture-{seed}"
+                        for seed in (1, 7, 19)
+                    },
+                },
+                "same_revision": {
+                    "role": "only_source_for_w1_w8_timing_comparison",
+                    **{
+                        field: {str(seed): {} for seed in (1, 7, 19)}
+                        for field in (
+                            "timings", "rss", "process_metrics", "semantics"
+                        )
+                    },
+                },
+                "frozen_oracle_characterization": {"status": "pass"},
+                "provenance": {"status": "pass"},
+                "verified_evidence": ["synthetic evidence"],
+                "gates": [{"name": "synthetic", "status": "pass"}],
+            }
+            completed = mock.Mock(
+                returncode=0,
+                stdout=json.dumps(delegated_payload),
+                stderr="",
+            )
+            repository_state = {
+                "head": cross.capture_contract.CURRENT_PRODUCT_REVISION,
+                "toplevel": str(product_root),
+            }
+            tracked_blob = {
+                "blob_sha256": cross.PHASE9_ACCEPTANCE_TOOL_SHA256,
+                "object_id": "c" * 40,
+                "working_file": {
+                    "sha256": cross.PHASE9_ACCEPTANCE_TOOL_SHA256,
+                },
+            }
+
+            with mock.patch.object(
+                cross, "regular", return_value=product_tool
+            ) as regular_mock, mock.patch.object(
+                cross.subprocess, "run", return_value=completed
+            ) as run_mock, mock.patch.object(
+                cross.capture_contract,
+                "repository_state",
+                return_value=repository_state,
+            ) as repository_mock, mock.patch.object(
+                cross.capture_contract,
+                "tracked_git_blob",
+                return_value=tracked_blob,
+            ) as blob_mock:
+                result = cross.deep_phase9_validate(
+                    manifests,
+                    raw,
+                    root / "phase0",
+                    product_root,
+                    "b" * 64,
+                    product_tool,
+                    cross.PHASE9_ACCEPTANCE_TOOL_SHA256,
+                )
+
+            self.assertEqual(
+                result,
+                {
+                    "schema": "wric.cross_phase_phase9_delegation",
+                    "schema_version": 1,
+                    "status": "pass",
+                    "delegated_result": delegated_payload,
+                    "product_tool": {
+                        "path": str(product_tool),
+                        "sha256": cross.PHASE9_ACCEPTANCE_TOOL_SHA256,
+                        "product_revision":
+                            cross.capture_contract.CURRENT_PRODUCT_REVISION,
+                        "repository_state": repository_state,
+                        "tracked_git_blob": tracked_blob,
+                    },
+                },
+            )
+            self.assertEqual(
+                result["delegated_result"],
+                delegated_payload,
+            )
+            self.assertEqual(
+                result["product_tool"],
+                {
+                    "path": str(product_tool),
+                    "sha256": cross.PHASE9_ACCEPTANCE_TOOL_SHA256,
+                    "product_revision":
+                        cross.capture_contract.CURRENT_PRODUCT_REVISION,
+                    "repository_state": repository_state,
+                    "tracked_git_blob": tracked_blob,
+                },
+            )
+            self.assertEqual(regular_mock.call_count, 2)
+            regular_mock.assert_has_calls(
+                2
+                * [
+                    mock.call(
+                        product_tool,
+                        "immutable current-product Phase-9 acceptance evaluator",
+                    )
+                ]
+            )
+            command = run_mock.call_args.args[0]
+            self.assertEqual(
+                command[:9],
+                [
+                    sys.executable,
+                    "-E",
+                    "-s",
+                    "-S",
+                    "-B",
+                    "-X",
+                    "pycache_prefix=/dev/null",
+                    str(product_tool),
+                    "evaluate",
+                ],
+            )
+            self.assertEqual(
+                run_mock.call_args.kwargs["cwd"], product_root
+            )
+            self.assertIs(
+                run_mock.call_args.kwargs["stdin"],
+                subprocess.DEVNULL,
+            )
+            self.assertEqual(
+                run_mock.call_args.kwargs["env"],
+                {
+                    "GIT_CONFIG_GLOBAL": "/dev/null",
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_NO_REPLACE_OBJECTS": "1",
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "HOME": "/nonexistent",
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "PATH": "/usr/bin:/bin",
+                    "TMPDIR": "/tmp",
+                    "TZ": "Europe/Sofia",
+                },
+            )
+            self.assertEqual(repository_mock.call_count, 2)
+            self.assertEqual(blob_mock.call_count, 2)
+            repository_mock.assert_has_calls(
+                2
+                * [
+                    mock.call(
+                        product_root,
+                        cross.capture_contract.CURRENT_PRODUCT_REVISION,
+                        "Phase-9 product repository",
+                        require_clean=True,
+                    )
+                ]
+            )
+            blob_mock.assert_has_calls(
+                2
+                * [
+                    mock.call(
+                        product_root,
+                        product_tool,
+                        "Phase-9 product acceptance tool",
+                    )
+                ]
+            )
+
+            with self.assertRaisesRegex(
+                cross.AcceptanceError, "exact product-local path"
+            ):
+                cross.deep_phase9_validate(
+                    manifests,
+                    raw,
+                    root / "phase0",
+                    product_root,
+                    "b" * 64,
+                    Path(cross.__file__).with_name(
+                        "wric_phase9_acceptance.py"
+                    ),
+                    cross.PHASE9_ACCEPTANCE_TOOL_SHA256,
+                )
+
+            with mock.patch.object(
+                cross, "regular", return_value=product_tool
+            ), self.assertRaisesRegex(
+                cross.AcceptanceError, "external SHA-256 anchor"
+            ):
+                cross.deep_phase9_validate(
+                    manifests,
+                    raw,
+                    root / "phase0",
+                    product_root,
+                    "b" * 64,
+                    product_tool,
+                    "0" * 64,
+                )
+
+            wrong_blob = dict(tracked_blob, blob_sha256="0" * 64)
+            with mock.patch.object(
+                cross, "regular", return_value=product_tool
+            ), mock.patch.object(
+                cross.capture_contract,
+                "repository_state",
+                return_value=repository_state,
+            ), mock.patch.object(
+                cross.capture_contract,
+                "tracked_git_blob",
+                return_value=wrong_blob,
+            ), self.assertRaisesRegex(
+                cross.AcceptanceError, "exact HEAD blob"
+            ):
+                cross.deep_phase9_validate(
+                    manifests,
+                    raw,
+                    root / "phase0",
+                    product_root,
+                    "b" * 64,
+                    product_tool,
+                    cross.PHASE9_ACCEPTANCE_TOOL_SHA256,
+                )
+
+            for malformed in (
+                mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"status": "pass"}),
+                    stderr="",
+                ),
+                mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(delegated_payload),
+                    stderr="unexpected diagnostic",
+                ),
+            ):
+                with self.subTest(
+                    delegated_stdout=malformed.stdout,
+                    delegated_stderr=malformed.stderr,
+                ), mock.patch.object(
+                    cross, "regular", return_value=product_tool
+                ), mock.patch.object(
+                    cross.subprocess, "run", return_value=malformed
+                ), mock.patch.object(
+                    cross.capture_contract,
+                    "repository_state",
+                    return_value=repository_state,
+                ), mock.patch.object(
+                    cross.capture_contract,
+                    "tracked_git_blob",
+                    return_value=tracked_blob,
+                ), self.assertRaises(cross.AcceptanceError):
+                    cross.deep_phase9_validate(
+                        manifests,
+                        raw,
+                        root / "phase0",
+                        product_root,
+                        "b" * 64,
+                        product_tool,
+                        cross.PHASE9_ACCEPTANCE_TOOL_SHA256,
+                    )
+
+            changed_state = dict(repository_state, changed=True)
+            with mock.patch.object(
+                cross, "regular", return_value=product_tool
+            ), mock.patch.object(
+                cross.subprocess, "run", return_value=completed
+            ), mock.patch.object(
+                cross.capture_contract,
+                "repository_state",
+                side_effect=(repository_state, changed_state),
+            ), mock.patch.object(
+                cross.capture_contract,
+                "tracked_git_blob",
+                return_value=tracked_blob,
+            ), self.assertRaisesRegex(
+                cross.AcceptanceError, "changed during delegated validation"
+            ):
+                cross.deep_phase9_validate(
+                    manifests,
+                    raw,
+                    root / "phase0",
+                    product_root,
+                    "b" * 64,
+                    product_tool,
+                    cross.PHASE9_ACCEPTANCE_TOOL_SHA256,
+                )
+
     def run_case(
         self,
         data: SyntheticEvidence,
@@ -2093,6 +2408,14 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             self.assertEqual(result.phase9_calls[0][2], data.root)
             self.assertEqual(result.phase9_calls[0][3], ROOT)
             self.assertEqual(result.phase9_calls[0][4], data.phase9_ledger_sha)
+            self.assertEqual(
+                result.phase9_calls[0][5],
+                ROOT / "tools/wric_phase9_acceptance.py",
+            )
+            self.assertEqual(
+                result.phase9_calls[0][6],
+                cross.PHASE9_ACCEPTANCE_TOOL_SHA256,
+            )
             observed_phase7 = {
                 row.split("\t", 1)[0]
                 for row in data.raw_paths["phase7-high"].read_text().splitlines()[1:]

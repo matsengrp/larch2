@@ -29,7 +29,7 @@ import wric_benchmark_capture as capture_contract
 
 
 SCHEMA = "wric.cross_phase_acceptance"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 UINT_RE = re.compile(r"^(0|[1-9][0-9]*)$")
 UINT64_MAX = (1 << 64) - 1
@@ -65,6 +65,24 @@ PHASE6_ACCEPTANCE_SOURCES: Mapping[int, str] = {
     4: "final-scaling",
     16: "final-stress",
 }
+PHASE9_ACCEPTANCE_TOOL_SHA256 = (
+    "12eef19f3cad3dcd26363d6dfc951642cdd3b0647ddda98b6f6affb185314568"
+)
+PHASE9_DELEGATED_RESULT_KEYS = frozenset(
+    (
+        "schema",
+        "schema_version",
+        "status",
+        "benchmark_dir",
+        "raw_trials",
+        "matrix",
+        "same_revision",
+        "frozen_oracle_characterization",
+        "provenance",
+        "verified_evidence",
+        "gates",
+    )
+)
 CURRENT_PRODUCT_RETRY_LABELS = (
     "phase3",
     "phase4",
@@ -3342,15 +3360,78 @@ def deep_phase9_validate(
     base_repo_root: Path,
     working_repo_root: Path,
     expected_run_ledger_sha256: str,
+    phase9_acceptance_tool: Path,
+    expected_phase9_acceptance_tool_sha256: str,
 ) -> Mapping[str, object]:
     if len(raw.paths) != 1:
         raise AcceptanceError("phase9 requires exactly one sealed benchmark raw TSV")
-    tool = regular(
-        Path(__file__).with_name("wric_phase9_acceptance.py"),
-        "Phase-9 deep acceptance evaluator",
-    )
+
+    def product_tool_provenance() -> dict[str, object]:
+        expected_tool = working_repo_root / "tools/wric_phase9_acceptance.py"
+        if (
+            not phase9_acceptance_tool.is_absolute()
+            or phase9_acceptance_tool != expected_tool
+        ):
+            raise AcceptanceError(
+                "Phase-9 acceptance tool is not the exact product-local path: "
+                f"{phase9_acceptance_tool} != {expected_tool}"
+            )
+        tool = regular(
+            phase9_acceptance_tool,
+            "immutable current-product Phase-9 acceptance evaluator",
+        )
+        if (
+            expected_phase9_acceptance_tool_sha256
+            != PHASE9_ACCEPTANCE_TOOL_SHA256
+        ):
+            raise AcceptanceError(
+                "Phase-9 acceptance-tool external SHA-256 anchor differs "
+                "from the immutable current-product tool"
+            )
+        try:
+            repository_state = capture_contract.repository_state(
+                working_repo_root,
+                capture_contract.CURRENT_PRODUCT_REVISION,
+                "Phase-9 product repository",
+                require_clean=True,
+            )
+            tracked_blob = capture_contract.tracked_git_blob(
+                working_repo_root,
+                tool,
+                "Phase-9 product acceptance tool",
+            )
+        except capture_contract.CaptureError as error:
+            raise AcceptanceError(str(error)) from error
+        working_file = tracked_blob.get("working_file")
+        if (
+            not isinstance(working_file, Mapping)
+            or working_file.get("sha256")
+            != expected_phase9_acceptance_tool_sha256
+            or tracked_blob.get("blob_sha256")
+            != expected_phase9_acceptance_tool_sha256
+        ):
+            raise AcceptanceError(
+                "Phase-9 product acceptance tool bytes do not match its "
+                "external SHA-256 anchor and exact HEAD blob"
+            )
+        return {
+            "path": os.fspath(tool),
+            "sha256": expected_phase9_acceptance_tool_sha256,
+            "product_revision": capture_contract.CURRENT_PRODUCT_REVISION,
+            "repository_state": repository_state,
+            "tracked_git_blob": tracked_blob,
+        }
+
+    tool_provenance = product_tool_provenance()
+    tool = Path(str(tool_provenance["path"]))
     command = [
         sys.executable,
+        "-E",
+        "-s",
+        "-S",
+        "-B",
+        "-X",
+        "pycache_prefix=/dev/null",
         os.fspath(tool),
         "evaluate",
         "--raw-trials",
@@ -3368,31 +3449,113 @@ def deep_phase9_validate(
         "--expected-run-ledger-sha256",
         expected_run_ledger_sha256,
     ]
-    environment = os.environ.copy()
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment = {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": "/tmp",
+        "TZ": "Europe/Sofia",
+    }
     result = subprocess.run(
         command,
         cwd=working_repo_root,
         env=environment,
         text=True,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
     )
-    if result.returncode != 0:
+    if product_tool_provenance() != tool_provenance:
+        raise AcceptanceError(
+            "Phase-9 product repository or acceptance tool changed during "
+            "delegated validation"
+        )
+    if result.returncode != 0 or result.stderr:
         detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
-        raise AcceptanceError(f"deep Phase-9 acceptance failed: {detail}")
+        raise AcceptanceError(
+            "deep Phase-9 acceptance failed or emitted stderr: " + detail
+        )
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise AcceptanceError(f"deep Phase-9 acceptance emitted invalid JSON: {error}") from error
-    if not isinstance(payload, dict) or payload.get("status") != "pass":
-        raise AcceptanceError("deep Phase-9 acceptance did not return final status=pass")
-    return payload
+    expected_seed_keys = {"1", "7", "19"}
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != PHASE9_DELEGATED_RESULT_KEYS
+        or payload.get("schema") != "wric.phase9.acceptance"
+        or payload.get("schema_version") != 2
+        or payload.get("status") != "pass"
+        or payload.get("benchmark_dir") != os.fspath(raw.paths[0].parent)
+        or payload.get("raw_trials") != os.fspath(raw.paths[0])
+    ):
+        raise AcceptanceError(
+            "deep Phase-9 acceptance did not return the exact passing "
+            "schema-v2 result envelope"
+        )
+    matrix = payload["matrix"]
+    same_revision = payload["same_revision"]
+    frozen = payload["frozen_oracle_characterization"]
+    provenance = payload["provenance"]
+    verified = payload["verified_evidence"]
+    gates = payload["gates"]
+    if (
+        not isinstance(matrix, Mapping)
+        or set(matrix)
+        != {"seeds", "workers", "repetitions", "row_id_template", "fixture_by_seed"}
+        or matrix.get("seeds") != [1, 7, 19]
+        or matrix.get("workers") != [1, 8]
+        or matrix.get("repetitions") != 3
+        or matrix.get("row_id_template")
+        != "phase9-local-commit-seed{seed}-w{worker}"
+        or not isinstance(matrix.get("fixture_by_seed"), Mapping)
+        or set(matrix["fixture_by_seed"]) != expected_seed_keys
+        or not isinstance(same_revision, Mapping)
+        or set(same_revision)
+        != {"role", "timings", "rss", "process_metrics", "semantics"}
+        or same_revision.get("role")
+        != "only_source_for_w1_w8_timing_comparison"
+        or any(
+            not isinstance(same_revision.get(field), Mapping)
+            or set(same_revision[field]) != expected_seed_keys
+            for field in ("timings", "rss", "process_metrics", "semantics")
+        )
+        or not isinstance(frozen, Mapping)
+        or frozen.get("status") != "pass"
+        or not isinstance(provenance, Mapping)
+        or provenance.get("status") != "pass"
+        or not isinstance(verified, list)
+        or not verified
+        or any(not isinstance(item, str) or not item for item in verified)
+        or not isinstance(gates, list)
+        or not gates
+        or any(
+            not isinstance(gate, Mapping) or gate.get("status") != "pass"
+            for gate in gates
+        )
+    ):
+        raise AcceptanceError(
+            "deep Phase-9 acceptance returned a malformed passing "
+            "schema-v2 result"
+        )
+    return {
+        "schema": "wric.cross_phase_phase9_delegation",
+        "schema_version": 1,
+        "status": "pass",
+        "delegated_result": payload,
+        "product_tool": tool_provenance,
+    }
 
 
 Phase9Validator = Callable[
-    [ManifestChain, RawEvidence, Path, Path, str], Mapping[str, object]
+    [ManifestChain, RawEvidence, Path, Path, str, Path, str],
+    Mapping[str, object],
 ]
 
 
@@ -3518,6 +3681,8 @@ def evaluate(
     base_repo_root: Path,
     working_repo_root: Path,
     phase9_run_ledger_sha256: str,
+    phase9_acceptance_tool: Path,
+    expected_phase9_acceptance_tool_sha256: str,
     phase8_capture_auditor: Phase8CaptureAuditor = deep_phase8_capture_audit,
     phase4_validator: Phase4Validator = deep_phase4_validate,
     phase9_validator: Phase9Validator = deep_phase9_validate,
@@ -3766,6 +3931,8 @@ def evaluate(
         base_repo_root,
         working_repo_root,
         phase9_run_ledger_sha256,
+        phase9_acceptance_tool,
+        expected_phase9_acceptance_tool_sha256,
     )
     if not isinstance(phase9_result, Mapping) or phase9_result.get("status") != "pass":
         raise AcceptanceError("deep Phase-9 validator did not return final status=pass")
@@ -4489,6 +4656,12 @@ def parser() -> argparse.ArgumentParser:
         "--expected-phase9-run-ledger-sha256", required=True
     )
     evaluate_parser.add_argument(
+        "--phase9-acceptance-tool", type=Path, required=True
+    )
+    evaluate_parser.add_argument(
+        "--expected-phase9-acceptance-tool-sha256", required=True
+    )
+    evaluate_parser.add_argument(
         "--phase8-capture-dir", type=phase8_path_assignment,
         action="append", required=True, metavar="LABEL=DIR",
     )
@@ -4726,6 +4899,10 @@ def main(
             base_repo_root=base_repo_root,
             working_repo_root=working_repo_root,
             phase9_run_ledger_sha256=phase9_run_ledger_sha256,
+            phase9_acceptance_tool=args.phase9_acceptance_tool,
+            expected_phase9_acceptance_tool_sha256=(
+                args.expected_phase9_acceptance_tool_sha256
+            ),
             phase8_capture_auditor=phase8_capture_auditor,
             phase4_validator=phase4_validator,
             phase9_validator=phase9_validator,
