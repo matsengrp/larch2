@@ -1304,6 +1304,7 @@ def validate_exact_candidate_admission(
     row: Mapping[str, str], where: str, budget: int, resident: int
 ) -> int:
     exact = uint(row["exact_verifications"], f"{where} exact verifications")
+    accepted = checked_uint64(row["accepted_moves"], f"{where} accepted moves")
     peak = uint(
         row["peak_concurrent_exact_verifiers"],
         f"{where} peak concurrent exact verifiers",
@@ -1374,7 +1375,15 @@ def validate_exact_candidate_admission(
         raise AcceptanceError(
             f"{where}: exact-candidate projected resident bytes exceed the memory budget"
         )
-    if exact > 0:
+    # The admission projection is a high-water mark of contemporaneous
+    # (published state + coordinator storage + retained prior-wave results +
+    # this wave's admitted bytes).  chart_cache_resident_bytes, however, is
+    # reported from the final state after all accepted updates and final
+    # compaction.  It is therefore a component of the projected state only
+    # when the successful run committed no update.  For a run with one or more
+    # committed accepts, adding that final-state value to an independently
+    # maximized admitted value combines storage from different points in time.
+    if exact > 0 and accepted == 0:
         required_projection = checked_uint64_sum(
             resident,
             admitted,

@@ -2870,24 +2870,61 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
                             mock.Mock(rows={row_id: changed}),
                         )
 
-    def test_projected_resident_covers_chart_and_admitted_bytes(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="wric-cross-projection-") as name:
+    def test_projection_does_not_mix_final_multi_accept_state_with_peak_wave(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-projection-multi-accept-"
+        ) as name:
             data = SyntheticEvidence(Path(name))
-            data.mutate(
-                "final-stress",
-                lambda row: (
-                    row["row_id"]
-                    == "p0-medium-stress128k16-grammar-exact-w8"
-                    and row["trial_index"] == "1"
-                ),
-                {cross.ADMISSION_FIELD: "1999999"},
+            row = data.raw_row(
+                "phase9-local-commit-seed1-w8", 1, label="phase9"
             )
-            result = self.run_case(data)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(
+            row.update(
+                accepted_moves="3",
+                peak_concurrent_exact_verifiers="4",
+                chart_axis_exact_candidate_active_worker_high_water="4",
+                exact_candidate_admission_batches="3",
+                exact_candidate_parallel_batches="3",
+                exact_candidate_inner_parallel_batches="0",
+                exact_candidate_peak_admitted_bytes="36057496",
+                exact_candidate_peak_projected_resident_bytes="39575800",
+            )
+            projected = cross.validate_exact_candidate_admission(
+                row,
+                "synthetic Phase9 multi-accept",
+                12 * 1024**3,
+                4687184,
+            )
+            self.assertEqual(projected, 39575800)
+            self.assertGreater(4687184 + 36057496, projected)
+
+    def test_unchanged_state_projection_covers_chart_and_admitted_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-projection-unchanged-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            row = data.raw_row(
+                "p0-medium-stress128k16-grammar-exact-w8",
+                1,
+                label="final-stress",
+            )
+            row.update(
+                accepted_moves="0",
+                exact_candidate_peak_projected_resident_bytes="1999999",
+            )
+            with self.assertRaisesRegex(
+                cross.AcceptanceError,
                 "do not cover chart resident plus admitted bytes",
-                result.stderr,
-            )
+            ):
+                cross.validate_exact_candidate_admission(
+                    row,
+                    "synthetic unchanged state",
+                    12 * 1024**3,
+                    1000000,
+                )
 
     def test_work_arithmetic_is_uint64_bounded_and_overflow_safe(self) -> None:
         with self.assertRaisesRegex(cross.AcceptanceError, "nonnegative integer"):
