@@ -1786,6 +1786,10 @@ class BenchmarkCaptureTest(unittest.TestCase):
 
     def test_pinned_run_labels_require_their_exact_product_revision(self) -> None:
         self.assertEqual(
+            capture_tool.CURRENT_PRODUCT_REVISION,
+            "a9db72e60f153a95362db544107373817a58a258",
+        )
+        self.assertEqual(
             capture_tool.HISTORICAL_RUN_REVISIONS["phase6"],
             "870c298ff1c0c21901bdf79d341bf97d121f389c",
         )
@@ -1832,6 +1836,11 @@ class BenchmarkCaptureTest(unittest.TestCase):
                 ):
                     capture_tool.require_run_revision(label, "0" * 40)
         expected_current = {
+            "phase3",
+            "phase4",
+            "phase7-high",
+            "phase7-small",
+            "phase7-auto",
             "final-phase6-exact1",
             "final-scaling",
             "final-primary",
@@ -1846,6 +1855,28 @@ class BenchmarkCaptureTest(unittest.TestCase):
             set(capture_tool.CURRENT_PRODUCT_RUN_REVISIONS),
             expected_current,
         )
+        self.assertTrue(
+            {
+                "phase3",
+                "phase4",
+                "phase7-high",
+                "phase7-small",
+                "phase7-auto",
+            }.isdisjoint(capture_tool.HISTORICAL_RUN_REVISIONS)
+        )
+        former_retry_revisions = {
+            "phase3": "7d294d68eaadc8c55b92be4f5589278c8a2f78f2",
+            "phase4": "cbf92b62284b2a93e506f59187ac94a5336b0be3",
+            "phase7-high": "38e9a281396e5263647ba68724414848841525d7",
+            "phase7-small": "38e9a281396e5263647ba68724414848841525d7",
+            "phase7-auto": "38e9a281396e5263647ba68724414848841525d7",
+        }
+        for label, former_revision in former_retry_revisions.items():
+            with self.subTest(former_retry_revision=label), self.assertRaisesRegex(
+                capture_tool.CaptureError,
+                "requires exact current-product revision",
+            ):
+                capture_tool.require_run_revision(label, former_revision)
         for label in sorted(expected_current):
             with self.subTest(current_product_label=label):
                 self.assertEqual(
@@ -1865,11 +1896,102 @@ class BenchmarkCaptureTest(unittest.TestCase):
             "final-default-auto",
             capture_tool.CURRENT_PRODUCT_RUN_REVISIONS,
         )
+        historical_labels = set(capture_tool.HISTORICAL_RUN_REVISIONS)
+        current_labels = set(capture_tool.CURRENT_PRODUCT_RUN_REVISIONS)
+        self.assertTrue(historical_labels.isdisjoint(current_labels))
+        self.assertEqual(
+            set(capture_tool.RUN_COMPONENTS),
+            historical_labels
+            | current_labels
+            | {capture_tool.DEFERRED_DEFAULT_RUN_LABEL},
+        )
+        current_without_phase3 = {
+            label: revision
+            for label, revision in
+            capture_tool.CURRENT_PRODUCT_RUN_REVISIONS.items()
+            if label != "phase3"
+        }
+        with mock.patch.dict(
+            capture_tool.CURRENT_PRODUCT_RUN_REVISIONS,
+            current_without_phase3,
+            clear=True,
+        ), self.assertRaisesRegex(
+            capture_tool.CaptureError, "has no pinned product revision"
+        ):
+            capture_tool.require_run_revision(
+                "phase3", capture_tool.CURRENT_PRODUCT_REVISION
+            )
         with self.assertRaisesRegex(
             capture_tool.CaptureError,
             "disabled until the default-promotion product revision",
         ):
             capture_tool.require_run_revision("final-default-auto", "0" * 40)
+
+    def test_current_retry_capture_components_are_exact(self) -> None:
+        self.assertEqual(
+            capture_tool.RUN_COMPONENTS["phase3"],
+            (
+                capture_tool.component(
+                    "p0-small-dense-physical", "1,8", "5"
+                ),
+                capture_tool.component(
+                    "p0-medium-dense-physical", "1", "5"
+                ),
+            ),
+        )
+        self.assertEqual(
+            capture_tool.RUN_COMPONENTS["phase4"],
+            (
+                capture_tool.component(
+                    "p0-medium-dense-physical", "1,2,4,8", "5"
+                ),
+                capture_tool.component(
+                    "p0-medium-cache-physical", "1,2,4,8", "5"
+                ),
+            ),
+        )
+        self.assertEqual(
+            capture_tool.RUN_COMPONENTS["phase7-high"],
+            (
+                capture_tool.component(
+                    "phase7-lazy", "1,8", "5", ("phase7-lazy",)
+                ),
+            ),
+        )
+        self.assertEqual(
+            capture_tool.RUN_COMPONENTS["phase7-small"],
+            (
+                capture_tool.component(
+                    "p0-small-dense-physical", "1,8", "5"
+                ),
+                capture_tool.component(
+                    "phase7-lazy-small-on",
+                    "1,8",
+                    "5",
+                    ("phase7-lazy-completion",),
+                ),
+            ),
+        )
+        self.assertEqual(
+            capture_tool.RUN_COMPONENTS["phase7-auto"],
+            (
+                capture_tool.component(
+                    "p0-medium-dense-physical", "1,8", "5"
+                ),
+                capture_tool.component(
+                    "p0-medium-lazy-physical", "1,8", "5"
+                ),
+                capture_tool.component(
+                    "phase7-lazy-medium-auto",
+                    "1,8",
+                    "5",
+                    ("phase7-lazy-completion",),
+                ),
+                capture_tool.component(
+                    "phase7-lazy", "1,8", "5", ("phase7-lazy",)
+                ),
+            ),
+        )
 
     def test_current_phase6_capture_components_are_exact(self) -> None:
         self.assertEqual(

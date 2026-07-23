@@ -210,20 +210,25 @@ RUN_COMPONENTS: Mapping[str, Sequence[Mapping[str, object]]] = {
 HISTORICAL_RUN_REVISIONS: Mapping[str, str] = {
     "phase1": "208ce23f0c005d3702d114f535fe21564b3b79b6",
     "phase2": "0c4623ba1793395ae8f5c3df2a2524a27d89bc80",
-    "phase3": "7d294d68eaadc8c55b92be4f5589278c8a2f78f2",
-    "phase4": "cbf92b62284b2a93e506f59187ac94a5336b0be3",
     "phase5": "3a10e9cc45050f7a6f846f9f1adb8d5f4157f9a5",
     "phase6": "870c298ff1c0c21901bdf79d341bf97d121f389c",
-    "phase7-high": "38e9a281396e5263647ba68724414848841525d7",
-    "phase7-small": "38e9a281396e5263647ba68724414848841525d7",
-    "phase7-auto": "38e9a281396e5263647ba68724414848841525d7",
     "phase8-end-to-end": "38e9a281396e5263647ba68724414848841525d7",
     "phase8-generation": "94a63238d25a8e3262428419d53f8f0986e8879b",
     "phase8-generation-retry1": "07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c",
 }
 
-CURRENT_PRODUCT_REVISION = "30805e6ff33df9a7ace4ced8c74d2dc740347c22"
+# Later optimizations are allowed to discharge still-open earlier-phase
+# performance gates, but every such retry must measure the same immutable
+# current product as final acceptance.  The original Phase-3/4/7 captures stay
+# preserved under their earlier capture-tool revisions; this revision admits
+# only the additive Q retries below.
+CURRENT_PRODUCT_REVISION = "a9db72e60f153a95362db544107373817a58a258"
 CURRENT_PRODUCT_RUN_REVISIONS: Mapping[str, str] = {
+    "phase3": CURRENT_PRODUCT_REVISION,
+    "phase4": CURRENT_PRODUCT_REVISION,
+    "phase7-high": CURRENT_PRODUCT_REVISION,
+    "phase7-small": CURRENT_PRODUCT_REVISION,
+    "phase7-auto": CURRENT_PRODUCT_REVISION,
     "final-phase6-exact1": CURRENT_PRODUCT_REVISION,
     "final-scaling": CURRENT_PRODUCT_REVISION,
     "final-primary": CURRENT_PRODUCT_REVISION,
@@ -441,6 +446,11 @@ def fail(message: str) -> NoReturn:
 
 
 def require_run_revision(run_label: str, product_revision: str) -> None:
+    if run_label == DEFERRED_DEFAULT_RUN_LABEL:
+        fail(
+            f"{run_label} is disabled until the default-promotion product "
+            "revision is committed and pinned"
+        )
     historical = HISTORICAL_RUN_REVISIONS.get(run_label)
     if historical is not None and product_revision != historical:
         fail(
@@ -453,10 +463,13 @@ def require_run_revision(run_label: str, product_revision: str) -> None:
             f"{run_label} requires exact current-product revision "
             f"{current}, not {product_revision}"
         )
-    if run_label == DEFERRED_DEFAULT_RUN_LABEL:
+    if (
+        historical is None
+        and current is None
+        and run_label in RUN_COMPONENTS
+    ):
         fail(
-            f"{run_label} is disabled until the default-promotion product "
-            "revision is committed and pinned"
+            f"{run_label} has no pinned product revision"
         )
 
 

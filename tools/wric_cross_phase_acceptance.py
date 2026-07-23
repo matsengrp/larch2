@@ -29,7 +29,7 @@ import wric_benchmark_capture as capture_contract
 
 
 SCHEMA = "wric.cross_phase_acceptance"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 UINT_RE = re.compile(r"^(0|[1-9][0-9]*)$")
 UINT64_MAX = (1 << 64) - 1
@@ -65,6 +65,13 @@ PHASE6_ACCEPTANCE_SOURCES: Mapping[int, str] = {
     4: "final-scaling",
     16: "final-stress",
 }
+CURRENT_PRODUCT_RETRY_LABELS = (
+    "phase3",
+    "phase4",
+    "phase7-high",
+    "phase7-small",
+    "phase7-auto",
+)
 PHASE8_METADATA_NAME = "wric-benchmark-run-metadata.json"
 GENERIC_LEDGER_NAME = "wric-evidence-run-ledger.tsv"
 GENERIC_LEDGER_SEAL_NAME = GENERIC_LEDGER_NAME + ".sha256"
@@ -147,7 +154,7 @@ PHASE0_CAPTURE_SOURCE = "pre_manifest_capture"
 PHASE0_REAL_SOURCE = "manifest_strict_real_smoke"
 
 HISTORICAL_PRE_ADMISSION_LABELS = frozenset(
-    ("phase0", "phase1", "phase2", "phase3", "phase4", "phase5")
+    ("phase0", "phase1", "phase2", "phase5")
 )
 ADMISSION_FIELD = "exact_candidate_peak_projected_resident_bytes"
 ADMISSION_FIELDS = frozenset(
@@ -167,7 +174,7 @@ ADMISSION_FIELDS = frozenset(
         "exact_candidate_verification_ms_max",
     )
 )
-PHASE0_LEGACY_EXACT_TIMING_FIELDS = frozenset(
+HISTORICAL_LEGACY_EXACT_TIMING_FIELDS = frozenset(
     (
         "peak_concurrent_exact_verifiers",
         "exact_candidate_timing_count",
@@ -176,6 +183,8 @@ PHASE0_LEGACY_EXACT_TIMING_FIELDS = frozenset(
         "exact_candidate_verification_ms_max",
     )
 )
+# Retain the former tooling name for consumers of this import-only module.
+PHASE0_LEGACY_EXACT_TIMING_FIELDS = HISTORICAL_LEGACY_EXACT_TIMING_FIELDS
 
 
 def required_raw_columns(label: str) -> tuple[str, ...]:
@@ -1103,16 +1112,16 @@ def load_raw(
             )
         )
         if label in HISTORICAL_PRE_ADMISSION_LABELS:
+            # Every historical raw payload reaches schema inspection only
+            # after its exact bytes match the external SHA-256 anchor above.
             present_admission = ADMISSION_FIELDS.intersection(current_header)
-            phase0_legacy = (
-                phase0_inputs is not None
-                and label == "phase0"
-                and present_admission == PHASE0_LEGACY_EXACT_TIMING_FIELDS
+            historical_legacy_timing = (
+                present_admission == HISTORICAL_LEGACY_EXACT_TIMING_FIELDS
             )
             if (
                 present_admission
                 and present_admission != ADMISSION_FIELDS
-                and not phase0_legacy
+                and not historical_legacy_timing
             ):
                 missing = sorted(ADMISSION_FIELDS - present_admission)
                 raise AcceptanceError(
@@ -1236,8 +1245,8 @@ def admission_block_available(
 ) -> bool:
     present = {field for field in ADMISSION_FIELDS if field in row}
     if (
-        row.get("__phase0_source_kind__") == PHASE0_CAPTURE_SOURCE
-        and present == PHASE0_LEGACY_EXACT_TIMING_FIELDS
+        label in HISTORICAL_PRE_ADMISSION_LABELS
+        and present == HISTORICAL_LEGACY_EXACT_TIMING_FIELDS
     ):
         return False
     if label in HISTORICAL_PRE_ADMISSION_LABELS:
@@ -3515,6 +3524,18 @@ def evaluate(
 ) -> dict[str, object]:
     if evaluation_mode not in EVALUATION_MODES:
         raise AcceptanceError(f"unsupported evaluation mode {evaluation_mode!r}")
+    current_retry_bindings = {
+        label: capture_contract.CURRENT_PRODUCT_RUN_REVISIONS.get(label)
+        for label in CURRENT_PRODUCT_RETRY_LABELS
+    }
+    if current_retry_bindings != {
+        label: PHASE6_ACCEPTANCE_PRODUCT_REVISION
+        for label in CURRENT_PRODUCT_RETRY_LABELS
+    }:
+        raise AcceptanceError(
+            "internal Phase-3/4/7 retries are not bound to the immutable "
+            "current product"
+        )
     phase6_source_labels = set(PHASE6_ACCEPTANCE_SOURCES.values())
     if (
         set(PHASE6_ACCEPTANCE_SOURCES) != {1, 4, 16}
@@ -4311,6 +4332,10 @@ def evaluate(
         "run_labels": list(scoped_run_labels),
         "all_run_labels": list(RUN_LABELS),
         "global_rss_cap_kb": global_rss_cap_kb,
+        "current_product_retries": {
+            "required_product_revision": PHASE6_ACCEPTANCE_PRODUCT_REVISION,
+            "run_labels": list(CURRENT_PRODUCT_RETRY_LABELS),
+        },
         "phase6_acceptance_sources": {
             "historical_run_label": PHASE6_HISTORICAL_RUN_LABEL,
             "historical_disposition": "diagnostic_not_an_acceptance_input",

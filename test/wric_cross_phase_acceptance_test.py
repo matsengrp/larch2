@@ -541,7 +541,7 @@ class SyntheticEvidence:
         phase0_raw_columns = tuple(
             field
             for field in cross.RAW_COLUMNS
-            if field in cross.PHASE0_LEGACY_EXACT_TIMING_FIELDS
+            if field in cross.HISTORICAL_LEGACY_EXACT_TIMING_FIELDS
             or field not in cross.ADMISSION_FIELDS
         )
         gate_ids = {
@@ -1977,6 +1977,14 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
                 cross.PHASE6_HISTORICAL_RUN_LABEL, payload["run_labels"]
             )
             self.assertEqual(
+                payload["current_product_retries"],
+                {
+                    "required_product_revision":
+                        cross.PHASE6_ACCEPTANCE_PRODUCT_REVISION,
+                    "run_labels": list(cross.CURRENT_PRODUCT_RETRY_LABELS),
+                },
+            )
+            self.assertEqual(
                 payload["phase6_acceptance_sources"],
                 {
                     "historical_run_label": "phase6",
@@ -2216,6 +2224,21 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(
                 "Phase-6 acceptance sources are not uniquely bound",
+                result.stderr,
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-current-retry-pin-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            with mock.patch.dict(
+                cross.capture_contract.CURRENT_PRODUCT_RUN_REVISIONS,
+                {"phase3": "0" * 40},
+            ):
+                result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "Phase-3/4/7 retries are not bound",
                 result.stderr,
             )
 
@@ -3262,10 +3285,31 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("duplicate row/trial", result.stderr)
 
-    def test_historical_admission_schema_is_all_absent_or_complete(self) -> None:
+    def test_historical_admission_schema_allows_only_absent_legacy_or_complete(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-historical-") as name:
             data = SyntheticEvidence(Path(name))
             data.remove_columns("phase1", set(cross.ADMISSION_FIELDS))
+            result = self.run_case(data)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-historical-legacy-timing-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            later_historical_labels = (
+                cross.HISTORICAL_PRE_ADMISSION_LABELS - {"phase0"}
+            )
+            self.assertEqual(
+                later_historical_labels,
+                {"phase1", "phase2", "phase5"},
+            )
+            for label in sorted(later_historical_labels):
+                data.remove_columns(
+                    label,
+                    cross.ADMISSION_FIELDS
+                    - cross.HISTORICAL_LEGACY_EXACT_TIMING_FIELDS,
+                )
             result = self.run_case(data)
             self.assertEqual(result.returncode, 0, result.stderr)
         with tempfile.TemporaryDirectory(prefix="wric-cross-historical-na-") as name:
@@ -3321,6 +3365,37 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             result = self.run_case(data)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(cross.ADMISSION_FIELD, result.stderr)
+        for label in ("phase3", "phase4"):
+            with self.subTest(
+                label=label, schema="absent"
+            ), tempfile.TemporaryDirectory(
+                prefix=f"wric-cross-current-absent-admission-{label}-"
+            ) as name:
+                data = SyntheticEvidence(Path(name))
+                data.remove_columns(label, set(cross.ADMISSION_FIELDS))
+                result = self.run_case(data)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(cross.ADMISSION_FIELD, result.stderr)
+        for label in (
+            "phase3",
+            "phase4",
+            "phase8-generation-retry1",
+            "final-primary",
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory(
+                prefix=f"wric-cross-current-legacy-timing-{label}-"
+            ) as name:
+                data = SyntheticEvidence(Path(name))
+                data.remove_columns(
+                    label,
+                    cross.ADMISSION_FIELDS
+                    - cross.HISTORICAL_LEGACY_EXACT_TIMING_FIELDS,
+                )
+                if label == "phase8-generation-retry1":
+                    data.refresh_phase8_capture(label)
+                result = self.run_case(data)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(cross.ADMISSION_FIELD, result.stderr)
         with tempfile.TemporaryDirectory(prefix="wric-cross-phase6-schema-") as name:
             data = SyntheticEvidence(Path(name))
             field = "exact_candidate_admission_batches"
