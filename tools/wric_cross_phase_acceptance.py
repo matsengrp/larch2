@@ -219,8 +219,10 @@ MANIFEST_COLUMNS = (
     "expected_reason_sha256",
     "iterations", "seed", "chart_max_candidates", "chart_top_k_exact",
     "acceptance", "objective", "candidate_source", "memory_budget_bytes",
+    "local_accept_updates",
     "expected_candidates_generated", "expected_candidates_scored",
-    "expected_exact_verifications", "expected_accepted_moves",
+    "expected_exact_verifications", "expected_iterations",
+    "expected_accepted_moves",
     "expected_initial_score", "expected_final_score",
     "expected_validated_parsimony",
     "oracle_search_semantic_sha256", "oracle_output_semantic_sha256",
@@ -3625,9 +3627,82 @@ def validate_selected_work(
             continue
         manifest = manifests.rows[row_id]
         where = f"{evidence.label} {row_id} trial {row['trial_index']}"
-        iterations = checked_uint64(
+        max_iterations = checked_uint64(
             manifest["iterations"], f"{where} sealed iterations", positive=True
         )
+        report_path = Path(row["report_path"])
+        reported_max_iterations = checked_uint64(
+            top_report_value(report_path, "requested_max_iterations"),
+            f"{where} reported requested_max_iterations",
+            positive=True,
+        )
+        if reported_max_iterations != max_iterations:
+            raise AcceptanceError(
+                f"{where}: reported requested_max_iterations="
+                f"{reported_max_iterations}, sealed maximum={max_iterations}"
+            )
+        executed_iterations = checked_uint64(
+            top_report_value(report_path, "iterations"),
+            f"{where} reported iterations",
+            positive=True,
+        )
+        if executed_iterations > max_iterations:
+            raise AcceptanceError(
+                f"{where}: reported iterations={executed_iterations} exceeds "
+                f"sealed maximum={max_iterations}"
+            )
+        accepted_moves = checked_uint64(
+            row["accepted_moves"], f"{where} accepted_moves"
+        )
+        if accepted_moves > max_iterations:
+            raise AcceptanceError(
+                f"{where}: accepted_moves={accepted_moves} exceeds sealed "
+                f"maximum={max_iterations}"
+            )
+        if manifest["local_accept_updates"] != "false":
+            raise AcceptanceError(
+                f"{where}: strict work accounting requires non-local commit "
+                "semantics"
+            )
+        accepted_plus_terminal = checked_uint64_sum(
+            accepted_moves, 1, f"{where} accepted moves plus terminal iteration"
+        )
+        expected_executed_iterations = min(
+            max_iterations, accepted_plus_terminal
+        )
+        if executed_iterations != expected_executed_iterations:
+            raise AcceptanceError(
+                f"{where}: reported iterations={executed_iterations}, expected "
+                f"min(max_iterations, accepted_moves + 1)="
+                f"{expected_executed_iterations}"
+            )
+        frozen_iterations = manifest["expected_iterations"]
+        if (
+            frozen_iterations != "-"
+            and executed_iterations
+            != checked_uint64(
+                frozen_iterations,
+                f"{where} sealed expected_iterations",
+                positive=True,
+            )
+        ):
+            raise AcceptanceError(
+                f"{where}: reported iterations={executed_iterations} differs "
+                f"from sealed expected_iterations={frozen_iterations}"
+            )
+        frozen_accepted_moves = manifest["expected_accepted_moves"]
+        if (
+            frozen_accepted_moves != "-"
+            and accepted_moves
+            != checked_uint64(
+                frozen_accepted_moves,
+                f"{where} sealed expected_accepted_moves",
+            )
+        ):
+            raise AcceptanceError(
+                f"{where}: accepted_moves={accepted_moves} differs from sealed "
+                f"expected_accepted_moves={frozen_accepted_moves}"
+            )
         max_candidates = checked_uint64(
             manifest["chart_max_candidates"],
             f"{where} sealed chart_max_candidates",
@@ -3643,14 +3718,17 @@ def validate_selected_work(
                 f"{where}: sealed exact Top-K exceeds the candidate budget"
             )
         expected_candidates = checked_uint64_product(
-            iterations,
+            executed_iterations,
             max_candidates,
             f"{where} expected candidate-score work",
         )
         expected_exact = checked_uint64_product(
-            iterations,
+            executed_iterations,
             top_k,
             f"{where} expected exact-verification work",
+        )
+        actual_generated = checked_uint64(
+            row["candidates_generated"], f"{where} candidates_generated"
         )
         actual_candidates = checked_uint64(
             row["candidates_scored"], f"{where} candidates_scored"
@@ -3658,15 +3736,22 @@ def validate_selected_work(
         actual_exact = checked_uint64(
             row["exact_verifications"], f"{where} exact_verifications"
         )
+        if actual_generated != expected_candidates:
+            raise AcceptanceError(
+                f"{where}: candidates_generated={actual_generated}, expected "
+                f"reported_iterations*chart_max_candidates="
+                f"{expected_candidates}"
+            )
         if actual_candidates != expected_candidates:
             raise AcceptanceError(
                 f"{where}: candidates_scored={actual_candidates}, expected "
-                f"iterations*chart_max_candidates={expected_candidates}"
+                f"reported_iterations*chart_max_candidates="
+                f"{expected_candidates}"
             )
         if actual_exact != expected_exact:
             raise AcceptanceError(
                 f"{where}: exact_verifications={actual_exact}, expected "
-                f"iterations*chart_top_k_exact={expected_exact}"
+                f"reported_iterations*chart_top_k_exact={expected_exact}"
             )
 
 

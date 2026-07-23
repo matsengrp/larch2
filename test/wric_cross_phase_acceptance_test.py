@@ -151,6 +151,10 @@ class SyntheticEvidence:
             objective="-" if worker == "native" else "synthetic",
             candidate_source="-" if worker == "native" else "synthetic",
             memory_budget_bytes=str(12 * 1024**3) if worker != "native" else "-",
+            local_accept_updates=(
+                "-" if worker == "native" else
+                "true" if group == "phase9-local-commit" else "false"
+            ),
             expected_initial_score="100",
             expected_final_score="90" if expected_outcome == "ok" else "-",
             expected_validated_parsimony="90" if expected_outcome == "ok" else "-",
@@ -441,7 +445,13 @@ class SyntheticEvidence:
             report.with_suffix(".err").write_text(self.refusal_stderr, encoding="utf-8")
             (self.root / label / "outputs").mkdir(parents=True, exist_ok=True)
         else:
-            report.write_text(f"chart_spr_search:\n  lazy_policy_resolved: {lazy}\n", encoding="utf-8")
+            report.write_text(
+                "chart_spr_search:\n"
+                f"  requested_max_iterations: {iterations}\n"
+                f"  iterations: {iterations}\n"
+                f"  lazy_policy_resolved: {lazy}\n",
+                encoding="utf-8",
+            )
         recorded_report = (
             report.relative_to(self.root / label)
             if label != "phase0" else report
@@ -2614,7 +2624,7 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
                 "final-phase6-exact1",
                 cross.MEDIUM_EXACT.format(1),
                 {"candidates_scored": "0"},
-                "iterations*chart_max_candidates=1",
+                "reported_iterations*chart_max_candidates=1",
             ),
             (
                 "phase6-topk4-exact",
@@ -2624,7 +2634,7 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
                     "exact_verifications": "3",
                     "exact_candidate_timing_count": "3",
                 },
-                "iterations*chart_top_k_exact=4",
+                "reported_iterations*chart_top_k_exact=4",
             ),
             (
                 "phase6-topk16-exact",
@@ -2634,35 +2644,35 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
                     "exact_verifications": "47",
                     "exact_candidate_timing_count": "47",
                 },
-                "iterations*chart_top_k_exact=48",
+                "reported_iterations*chart_top_k_exact=48",
             ),
             (
                 "final-scaling",
                 "final-scaling",
                 "p0-medium-primary32k4-sampled-tree-fixed-topology-w1",
                 {"candidates_scored": "31"},
-                "iterations*chart_max_candidates=32",
+                "reported_iterations*chart_max_candidates=32",
             ),
             (
                 "final-primary",
                 "final-primary",
                 "p0-medium-primary32k4-hybrid-exact-w1",
                 {"candidates_scored": "31"},
-                "iterations*chart_max_candidates=32",
+                "reported_iterations*chart_max_candidates=32",
             ),
             (
                 "final-default",
                 "final-default-auto",
                 "p0-medium-primary32k4-smt-grammar-exact-wdefault",
                 {"candidates_scored": "31"},
-                "iterations*chart_max_candidates=32",
+                "reported_iterations*chart_max_candidates=32",
             ),
             (
                 "final-stress",
                 "final-stress",
                 "p0-medium-stress128k16-sampled-tree-fixed-topology-w1",
                 {"candidates_scored": "383"},
-                "iterations*chart_max_candidates=384",
+                "reported_iterations*chart_max_candidates=384",
             ),
         )
         for case, label, row_id, changes, message in cases:
@@ -2685,6 +2695,180 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
                 result = self.run_case(data)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
+
+    def test_selected_chart_work_uses_executed_not_max_iterations(self) -> None:
+        row_id = "p0-medium-stress128k16-sampled-tree-fixed-topology-w1"
+
+        def selected_trial(row: Mapping[str, str]) -> bool:
+            return row["row_id"] == row_id and row["trial_index"] == "1"
+
+        def write_report(
+            data: SyntheticEvidence,
+            iterations: int,
+            requested_max_iterations: int = 3,
+        ) -> None:
+            report = data.root / "final-stress" / "reports" / f"{row_id}.1.out"
+            report.write_text(
+                "chart_spr_search:\n"
+                f"  requested_max_iterations: {requested_max_iterations}\n"
+                f"  iterations: {iterations}\n"
+                "  lazy_policy_resolved: off\n",
+                encoding="utf-8",
+            )
+
+        early_stop = {
+            "candidates_generated": "128",
+            "candidates_scored": "128",
+            "exact_verifications": "16",
+            "accepted_moves": "0",
+            "exact_candidate_timing_count": "16",
+        }
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-work-executed-iterations-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate("final-stress", selected_trial, early_stop)
+            write_report(data, 1)
+            result = self.run_case(data)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-work-early-stop-underwork-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "final-stress",
+                selected_trial,
+                {**early_stop, "candidates_scored": "127"},
+            )
+            write_report(data, 1)
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "reported_iterations*chart_max_candidates=128",
+                result.stderr,
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-work-early-stop-generation-underwork-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "final-stress",
+                selected_trial,
+                {**early_stop, "candidates_generated": "127"},
+            )
+            write_report(data, 1)
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "candidates_generated=127, expected "
+                "reported_iterations*chart_max_candidates=128",
+                result.stderr,
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-work-requested-maximum-mismatch-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            write_report(data, 3, requested_max_iterations=2)
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "reported requested_max_iterations=2, sealed maximum=3",
+                result.stderr,
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-work-accepted-iteration-mismatch-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate("final-stress", selected_trial, early_stop)
+            write_report(data, 2)
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "reported iterations=2, expected "
+                "min(max_iterations, accepted_moves + 1)=1",
+                result.stderr,
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-work-executed-over-maximum-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            write_report(data, 4)
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "reported iterations=4 exceeds sealed maximum=3",
+                result.stderr,
+            )
+
+    def test_selected_chart_work_binds_manifest_execution_contract(self) -> None:
+        row_id = "strict-work-w1"
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-work-manifest-execution-"
+        ) as name:
+            report = Path(name) / "report.out"
+            report.write_text(
+                "chart_spr_search:\n"
+                "  requested_max_iterations: 3\n"
+                "  iterations: 1\n",
+                encoding="utf-8",
+            )
+            row = {
+                "row_id": row_id,
+                "method": cross.METHOD_EXACT,
+                "trial_index": "1",
+                "report_path": str(report),
+                "accepted_moves": "0",
+                "candidates_generated": "128",
+                "candidates_scored": "128",
+                "exact_verifications": "16",
+            }
+            manifest = {
+                "iterations": "3",
+                "chart_max_candidates": "128",
+                "chart_top_k_exact": "16",
+                "local_accept_updates": "false",
+                "expected_iterations": "1",
+                "expected_accepted_moves": "0",
+            }
+            evidence = mock.Mock(label="strict-work", rows=[row])
+            manifests = mock.Mock(rows={row_id: manifest})
+            cross.validate_selected_work(
+                evidence, {row_id}, manifests
+            )
+
+            for field, value, message in (
+                (
+                    "local_accept_updates",
+                    "true",
+                    "strict work accounting requires non-local commit semantics",
+                ),
+                (
+                    "expected_iterations",
+                    "2",
+                    "differs from sealed expected_iterations=2",
+                ),
+                (
+                    "expected_accepted_moves",
+                    "1",
+                    "differs from sealed expected_accepted_moves=1",
+                ),
+            ):
+                with self.subTest(field=field):
+                    changed = dict(manifest)
+                    changed[field] = value
+                    with self.assertRaisesRegex(
+                        cross.AcceptanceError, message
+                    ):
+                        cross.validate_selected_work(
+                            evidence,
+                            {row_id},
+                            mock.Mock(rows={row_id: changed}),
+                        )
 
     def test_projected_resident_covers_chart_and_admitted_bytes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-projection-") as name:
