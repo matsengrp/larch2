@@ -68,6 +68,15 @@ PHASE0_CALIBRATION_SCHEMA = "wric_process_wrapper_calibration"
 PHASE0_CALIBRATION_SCHEMA_VERSION = 3
 SYS_CPU_ROOT = Path("/sys/devices/system/cpu")
 PROC_CPUINFO = Path("/proc/cpuinfo")
+PHASE9_PYTHON_PREFIX = (
+    sys.executable,
+    "-E",
+    "-s",
+    "-S",
+    "-B",
+    "-X",
+    "pycache_prefix=/dev/null",
+)
 
 
 def component(
@@ -2506,6 +2515,7 @@ def phase9_seal_argv(
     affinity: str,
 ) -> list[str]:
     return [
+        *PHASE9_PYTHON_PREFIX,
         os.fspath(phase9_tool),
         "seal-run",
         "--benchmark-dir",
@@ -2547,6 +2557,7 @@ def phase9_audit_argv(
     ledger_sha256: str,
 ) -> list[str]:
     return [
+        *PHASE9_PYTHON_PREFIX,
         os.fspath(phase9_tool),
         "evaluate",
         "--benchmark-dir",

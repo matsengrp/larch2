@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
+import py_compile
 import shutil
 import stat
 import subprocess
@@ -747,15 +749,20 @@ class Phase9Fixture(Fixture):
         git(self.product, "config", "user.email", "wric-test@example.invalid")
         write(self.product / "tracked-sentinel", "phase9-product-clean\n")
         self._write_phase9_harness(extra_inner=False)
+        bootstrap = self.product / "tools/wric_phase9_manifest_bootstrap.py"
+        write(bootstrap, "TOKEN = 'tracked-source'\n")
         write(
             self.product / "tools/wric_phase9_acceptance.py",
             "#!/usr/bin/env python3\n"
             "from __future__ import annotations\n"
             "import argparse, hashlib, json, os\n"
+            "import wric_phase9_manifest_bootstrap as bootstrap\n"
             "from pathlib import Path\n"
             "META='phase9-run-metadata.json'\n"
             "LEDGER='phase9-run-artifacts.tsv'\n"
             "SEAL=LEDGER+'.sha256'\n"
+            "def require_source():\n"
+            "    if bootstrap.TOKEN != 'tracked-source': raise RuntimeError('ignored Phase9 bootstrap bytecode was loaded')\n"
             "def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()\n"
             "def publish(path, payload):\n"
             "    fd=os.open(path, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)\n"
@@ -763,6 +770,7 @@ class Phase9Fixture(Fixture):
             "        os.write(fd, payload); os.fchmod(fd, 0o444); os.fsync(fd)\n"
             "    finally: os.close(fd)\n"
             "def seal(args):\n"
+            "    require_source()\n"
             "    root=Path(args.benchmark_dir)\n"
             "    outer=root.parent\n"
             "    if sorted(p.name for p in outer.iterdir()) != ['benchmark']: raise RuntimeError('controller reordered Phase9 sealing')\n"
@@ -778,6 +786,7 @@ class Phase9Fixture(Fixture):
             "    publish(root/SEAL, f'{ledger_sha}  {LEDGER}\\n'.encode())\n"
             "    return {'artifact_count':len(members),'benchmark_dir':str(root),'ledger_sha256':ledger_sha,'metadata_sha256':hashlib.sha256(metadata).hexdigest(),'schema':'fake.phase9','schema_version':1,'status':'sealed'}\n"
             "def evaluate(args):\n"
+            "    require_source()\n"
             "    root=Path(args.benchmark_dir)\n"
             "    actual=digest(root/LEDGER)\n"
             "    if actual != args.expected_run_ledger_sha256: raise RuntimeError('ledger anchor')\n"
@@ -800,6 +809,20 @@ class Phase9Fixture(Fixture):
             0o755,
         )
         self.product_revision = commit_all(self.product, "fake Phase9 product")
+        poison = self.top / "phase9-bootstrap-poison.py"
+        write(poison, "TOKEN = 'poisoned-cache'\n")
+        poison_cache = Path(importlib.util.cache_from_source(os.fspath(bootstrap)))
+        poison_cache.parent.mkdir(parents=True, exist_ok=True)
+        py_compile.compile(
+            os.fspath(poison),
+            cfile=os.fspath(poison_cache),
+            dfile=os.fspath(bootstrap),
+            doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        )
+        poison.unlink()
+        self.phase9_poison_cache = poison_cache
+        self.phase9_poison_sha256 = sha256_file(poison_cache)
         write(
             self.product / "build/bin/dagutil",
             "#!/bin/sh\n"
@@ -2406,6 +2429,31 @@ class Phase9BenchmarkCaptureTest(unittest.TestCase):
         return result
 
     def test_gap_free_phase9_seal_then_outer_seal_and_repeatable_audit(self) -> None:
+        control = subprocess.run(
+            [
+                sys.executable,
+                "-E",
+                "-s",
+                "-S",
+                "-B",
+                "-c",
+                (
+                    "import sys; sys.path.insert(0, sys.argv[1]); "
+                    "import wric_phase9_manifest_bootstrap as bootstrap; "
+                    "print(bootstrap.TOKEN)"
+                ),
+                os.fspath(self.fixture.product / "tools"),
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        )
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(control.stdout, "poisoned-cache\n")
+
         product_harness = self.fixture.product / "tools/wric_spr_search_benchmark.sh"
         capture_tool.require_timed_trial_digest_fix(
             self.fixture.product,
@@ -2445,7 +2493,25 @@ class Phase9BenchmarkCaptureTest(unittest.TestCase):
             post["ledger_sha256"], result["phase9_ledger_sha256"]
         )
         self.assertEqual(
-            post["seal_argv"][2:4], ["--benchmark-dir", os.fspath(inner)]
+            post["seal_argv"][:8],
+            [
+                *capture_tool.PHASE9_PYTHON_PREFIX,
+                os.fspath(self.fixture.product / "tools/wric_phase9_acceptance.py"),
+            ],
+        )
+        self.assertEqual(post["seal_argv"][8:11], ["seal-run", "--benchmark-dir", os.fspath(inner)])
+        self.assertEqual(post["audit_argv"][:8], post["seal_argv"][:8])
+        self.assertEqual(post["audit_argv"][8:11], ["evaluate", "--benchmark-dir", os.fspath(inner)])
+        self.assertTrue(self.fixture.phase9_poison_cache.is_file())
+        self.assertEqual(
+            sha256_file(self.fixture.phase9_poison_cache),
+            self.fixture.phase9_poison_sha256,
+        )
+        self.assertEqual(
+            post["seal_argv_sha256"], capture_tool.argv_digest(post["seal_argv"])
+        )
+        self.assertEqual(
+            post["audit_argv_sha256"], capture_tool.argv_digest(post["audit_argv"])
         )
         before = self.closure(root)
         command = self.fixture.audit_command(
@@ -2458,6 +2524,10 @@ class Phase9BenchmarkCaptureTest(unittest.TestCase):
             self.assertEqual(audited.returncode, 0, audited.stderr)
             self.assertEqual(json.loads(audited.stdout)["status"], "audited")
         self.assertEqual(self.closure(root), before)
+        self.assertEqual(
+            sha256_file(self.fixture.phase9_poison_cache),
+            self.fixture.phase9_poison_sha256,
+        )
 
     def test_phase9_mode_omission_wrong_inner_and_extra_inner_fail_closed(self) -> None:
         omitted_root = self.fixture.captures / "omitted"
@@ -2507,7 +2577,11 @@ class Phase9BenchmarkCaptureTest(unittest.TestCase):
         metadata_path.chmod(0o644)
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         argv = metadata["postprocessor"]["seal_argv"]
-        argv[2], argv[4] = argv[4], argv[2]
+        cache_index = argv.index("pycache_prefix=/dev/null")
+        argv[cache_index] = "pycache_prefix=/tmp/untrusted-phase9-cache"
+        metadata["postprocessor"]["seal_argv_sha256"] = (
+            capture_tool.argv_digest(argv)
+        )
         metadata_path.write_text(
             json.dumps(metadata, sort_keys=True, indent=2) + "\n", encoding="utf-8"
         )
