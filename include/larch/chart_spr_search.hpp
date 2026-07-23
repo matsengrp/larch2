@@ -14668,6 +14668,23 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
            !state.exact_multisite_verifier_parallel_safe)))) {
       exact_candidate_worker_limit = 1;
     }
+    // The built-in cold multi-site verifier owns a complete outside-boundary
+    // chart and B&B frontier for every concurrently verified candidate.  Four
+    // such candidates exceed the contracted W8/W1 RSS ratio on the frozen
+    // medium workload.  Preserve useful outer parallelism with one stable
+    // two-candidate prefix, then give each remaining singleton the whole
+    // scheduler through the existing inner-parallel path.  Contextual
+    // transient verifiers and fixed-topology verification have different
+    // storage surfaces and retain their ordinary worker limit.
+    auto const transient_multisite_callback_active =
+        options.verification_mode ==
+            chart_spr_verification_mode::transient &&
+        (state.exact_multisite_verifier ||
+         state.contextual_exact_multisite_verifier);
+    auto const bounded_cold_multisite_outer_burst =
+        options.acceptance_mode ==
+            chart_spr_acceptance_mode::exact_multisite &&
+        !transient_multisite_callback_active;
     auto const scheduler_resident =
         chart_spr_search_detail::estimate_chart_spr_scheduler_resident_bytes(
             scheduler);
@@ -14928,6 +14945,9 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
 
     std::size_t wave_begin = 0;
     std::size_t carried_retained_bytes = 0;
+    bool cold_multisite_outer_burst_available =
+        bounded_cold_multisite_outer_burst &&
+        exact_candidate_worker_limit >= 2;
     while (wave_begin < ranked.size()) {
       auto const already_resident_overflow =
           resident_exact_base >
@@ -14944,8 +14964,15 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         }
         available_bytes = exact_memory_budget - already_resident;
       }
+      auto wave_worker_limit = exact_candidate_worker_limit;
+      if (bounded_cold_multisite_outer_burst) {
+        wave_worker_limit =
+            cold_multisite_outer_burst_available
+                ? std::min<std::size_t>(exact_candidate_worker_limit, 2)
+                : std::size_t{1};
+      }
       auto wave = plan_chart_spr_exact_candidate_admission_wave(
-          memory_estimates, wave_begin, exact_candidate_worker_limit,
+          memory_estimates, wave_begin, wave_worker_limit,
           available_bytes, finite_budget, &scheduler, exact_range_options);
       // The historical transient callback receives a scheduler reference and
       // may use it. It therefore cannot take the serial-scratch fallback that
@@ -14989,8 +15016,8 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       if (wave.memory_limited) {
         ++state.counters.exact_candidate_memory_limited_batches;
       }
-      auto const candidate_limit = std::min(
-          exact_candidate_worker_limit, ranked.size() - wave_begin);
+      auto const candidate_limit =
+          std::min(wave_worker_limit, ranked.size() - wave_begin);
       auto const candidates_deferred_for_memory =
           finite_budget && wave_count < candidate_limit;
       auto const wave_start = std::chrono::steady_clock::now();
@@ -15043,6 +15070,14 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         run_candidate(wave_begin, &scheduler);
       } else {
         run_candidate(wave_begin, nullptr);
+      }
+
+      // Consume the one outer burst only after a complete pair returned.
+      // When a finite byte budget admits just one candidate, keeping the
+      // burst available permits the next stable prefix to use it if the
+      // retained-result envelope still has room.
+      if (bounded_cold_multisite_outer_burst && wave_count >= 2) {
+        cold_multisite_outer_burst_available = false;
       }
 
       // Join is complete here. Merge task-local diagnostics and select hard

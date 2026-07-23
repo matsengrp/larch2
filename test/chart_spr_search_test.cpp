@@ -65,9 +65,10 @@ class phase6_exact_candidate_pair_rendezvous {
 };
 
 // The exact-candidate runner catches task failures into stable rank-indexed
-// slots. Hold every other rank in the hook while rank 1 fails, then keep rank
-// 0 parked until the scheduler confirms that rank 1's worker task completed.
-// This makes reverse completion order deterministic rather than timing-based.
+// slots. In the bounded cold-verifier pair, let rank 1 fail first, then keep
+// rank 0 parked until the scheduler confirms that rank 1's worker task
+// completed. This makes reverse completion order deterministic rather than
+// timing-based.
 class phase6_reverse_rank_failure_rendezvous {
  public:
   explicit phase6_reverse_rank_failure_rendezvous(
@@ -141,9 +142,9 @@ class phase6_reverse_rank_failure_rendezvous {
     return invocations_;
   }
 
-  [[nodiscard]] bool saw_ranks_zero_through_three() const {
+  [[nodiscard]] bool saw_only_ranks_zero_and_one() const {
     std::lock_guard lock{mutex_};
-    return std::ranges::all_of(seen_rank_, [](bool seen) { return seen; });
+    return seen_rank_[0] && seen_rank_[1] && !seen_rank_[2] && !seen_rank_[3];
   }
 
   [[nodiscard]] bool rank_one_completed_before_rank_zero_failure() const {
@@ -7514,8 +7515,8 @@ static void test_top_k_exact_verification_count_is_bounded() {
   std::println("  PASS");
 }
 
-static void test_phase6_top_k_four_uses_exact_candidate_axis_only() {
-  std::println("test_phase6_top_k_four_uses_exact_candidate_axis_only");
+static void test_phase6_top_k_four_uses_bounded_cold_exact_waves() {
+  std::println("test_phase6_top_k_four_uses_bounded_cold_exact_waves");
 
   auto fixture = make_fixture();
   larch::chart_spr_search_options options;
@@ -7562,25 +7563,28 @@ static void test_phase6_top_k_four_uses_exact_candidate_axis_only() {
   CHECK(candidate_after.operations == candidate_before.operations + 1);
   CHECK(candidate_after.parallel_operations ==
         candidate_before.parallel_operations + 1);
-  CHECK(candidate_after.items == candidate_before.items + 4);
-  CHECK(candidate_after.worker_tasks == candidate_before.worker_tasks + 4);
+  CHECK(candidate_after.items == candidate_before.items + 2);
+  CHECK(candidate_after.worker_tasks == candidate_before.worker_tasks + 2);
   CHECK(candidate_after.active_worker_high_water >= 2);
   CHECK(state.exact_verifier_concurrency->peak() >= 2);
-  CHECK(state.counters.exact_candidate_admission_batches == 1);
+  CHECK(state.counters.exact_candidate_admission_batches == 3);
   CHECK(state.counters.exact_candidate_parallel_batches == 1);
-  CHECK(state.counters.exact_candidate_inner_parallel_batches == 0);
+  CHECK(state.counters.exact_candidate_inner_parallel_batches == 2);
   CHECK(state.counters.exact_candidate_memory_limited_batches == 0);
   CHECK(state.counters.exact_candidate_peak_admitted_bytes > 0);
   CHECK(state.counters.exact_candidate_peak_projected_resident_bytes >=
         state.counters.exact_candidate_peak_admitted_bytes);
   CHECK(state.counters.exact_candidate_queued_for_memory_ms == 0.0);
 
-  // The outer candidate wave owns the scheduler. Candidate-local exact work
-  // must therefore stay serial and publish no nested inner-axis operation.
-  CHECK(state.counters.scheduler_axes.exact_setup_patterns ==
-        exact_setup_before);
-  CHECK(state.counters.scheduler_axes.exact_frontier_clades ==
-        exact_frontier_before);
+  // Only the stable rank-0/rank-1 prefix runs on the outer candidate axis.
+  // The remaining two singletons get the scheduler in stable-rank order and
+  // must publish candidate-local exact work on at least one inner axis.
+  auto const inner_exact_operation_delta =
+      state.counters.scheduler_axes.exact_setup_patterns.operations -
+          exact_setup_before.operations +
+      state.counters.scheduler_axes.exact_frontier_clades.operations -
+          exact_frontier_before.operations;
+  CHECK(inner_exact_operation_delta > 0);
   CHECK(state.counters.scheduler_axes.fixed_topology_patterns == fixed_before);
 
   scheduler.shutdown();
@@ -7694,14 +7698,14 @@ static void test_phase6_exact_candidate_failures_choose_stable_rank_and_join() {
         std::string{error.what()} == "phase-6 exact candidate rank 0 failure";
   }
   CHECK(lower_rank_failure_selected);
-  CHECK(rendezvous->invocations() == 4);
-  CHECK(rendezvous->saw_ranks_zero_through_three());
+  CHECK(rendezvous->invocations() == 2);
+  CHECK(rendezvous->saw_only_ranks_zero_and_one());
   CHECK(rendezvous->rank_one_completed_before_rank_zero_failure());
   CHECK((rendezvous->failure_order() == std::vector<std::size_t>{1, 0}));
   CHECK(state.counters.scheduler_axes.exact_candidates.operations == 1);
   CHECK(state.counters.scheduler_axes.exact_candidates.parallel_operations ==
         1);
-  CHECK(state.counters.scheduler_axes.exact_candidates.worker_tasks == 4);
+  CHECK(state.counters.scheduler_axes.exact_candidates.worker_tasks == 2);
   CHECK(
       state.counters.scheduler_axes.exact_candidates.active_worker_high_water >=
       2);
@@ -7796,8 +7800,8 @@ static void test_phase6_exact_candidate_partial_submit_joins_and_reconciles() {
   CHECK(state.counters.scheduler_axes.exact_candidates.operations == 1);
   CHECK(state.counters.scheduler_axes.exact_candidates.parallel_operations ==
         1);
-  CHECK(state.counters.scheduler_axes.exact_candidates.items == 4);
-  CHECK(state.counters.scheduler_axes.exact_candidates.ranges == 4);
+  CHECK(state.counters.scheduler_axes.exact_candidates.items == 2);
+  CHECK(state.counters.scheduler_axes.exact_candidates.ranges == 2);
   CHECK(state.counters.scheduler_axes.exact_candidates.worker_tasks == 1);
   CHECK(state.counters.exact_candidate_admission_batches == 1);
   CHECK(state.counters.exact_candidate_parallel_batches == 1);
@@ -7811,7 +7815,9 @@ static void test_phase6_exact_candidate_partial_submit_joins_and_reconciles() {
   CHECK(recovered.locally_ranked_candidates_retained == 4);
   CHECK(recovered.candidates_exact_verified == 4);
   CHECK(state.counters.scheduler_axes.exact_candidates.operations == 2);
-  CHECK(state.counters.exact_candidate_admission_batches == 2);
+  CHECK(state.counters.exact_candidate_admission_batches == 4);
+  CHECK(state.counters.exact_candidate_parallel_batches == 2);
+  CHECK(state.counters.exact_candidate_inner_parallel_batches == 2);
   CHECK(scheduler.metrics().rejected_concurrent_operations == 0);
 
   scheduler.shutdown();
@@ -8129,8 +8135,9 @@ static void test_phase6_exact_state_fails_before_unified_budget_overrun() {
   std::println("  PASS");
 }
 
-static void test_phase6_finite_budget_splits_exact_candidate_wave() {
-  std::println("test_phase6_finite_budget_splits_exact_candidate_wave");
+static void test_phase6_finite_budget_falls_back_within_bounded_waves() {
+  std::println(
+      "test_phase6_finite_budget_falls_back_within_bounded_waves");
 
   larch::chart_spr_search_options options;
   options.acceptance_mode = larch::chart_spr_acceptance_mode::exact_multisite;
@@ -8150,7 +8157,9 @@ static void test_phase6_finite_budget_splits_exact_candidate_wave() {
   CHECK(unlimited.iterations.size() == 1);
   CHECK(unlimited.iterations.front().locally_ranked_candidates_retained == 16);
   CHECK(unlimited.iterations.front().candidates_exact_verified == 16);
-  CHECK(unlimited.summary.exact_candidate_admission_batches == 1);
+  CHECK(unlimited.summary.exact_candidate_admission_batches == 15);
+  CHECK(unlimited.summary.exact_candidate_parallel_batches == 1);
+  CHECK(unlimited.summary.exact_candidate_inner_parallel_batches == 14);
   CHECK(unlimited.summary.exact_candidate_memory_limited_batches == 0);
   CHECK(unlimited.summary.exact_candidate_peak_admitted_bytes > 0);
   CHECK(unlimited.summary.exact_candidate_peak_projected_resident_bytes >
@@ -8178,15 +8187,24 @@ static void test_phase6_finite_budget_splits_exact_candidate_wave() {
   CHECK(finite.iterations.front().exact_candidate_verification_ms.size() == 16);
   CHECK(hook_count->load(std::memory_order_relaxed) == 16);
 
-  CHECK(finite.summary.exact_candidate_admission_batches > 1);
-  CHECK(finite.summary.exact_candidate_admission_batches >
+  // The pair-first policy already fixes the stable outer-wave shape.  This
+  // one-byte-short budget therefore preserves the pair and batch count, then
+  // forces at least one singleton from inner-parallel to serial scratch.  No
+  // candidate is deferred, so policy serialization must not be reported as
+  // memory queueing.
+  CHECK(finite.summary.exact_candidate_admission_batches ==
         unlimited.summary.exact_candidate_admission_batches);
-  CHECK(finite.summary.exact_candidate_parallel_batches >= 1);
+  CHECK(finite.summary.exact_candidate_parallel_batches ==
+        unlimited.summary.exact_candidate_parallel_batches);
+  CHECK(finite.summary.exact_candidate_inner_parallel_batches <
+        unlimited.summary.exact_candidate_inner_parallel_batches);
   CHECK(finite.summary.exact_candidate_memory_limited_batches >= 1);
-  CHECK(finite.summary.exact_candidate_queued_for_memory_ms > 0.0);
+  CHECK(finite.summary.exact_candidate_queued_for_memory_ms == 0.0);
   CHECK(finite.summary.exact_candidate_peak_admitted_bytes > 0);
-  CHECK(finite.summary.exact_candidate_peak_admitted_bytes <
+  CHECK(finite.summary.exact_candidate_peak_admitted_bytes ==
         unlimited.summary.exact_candidate_peak_admitted_bytes);
+  CHECK(finite.summary.exact_candidate_peak_projected_resident_bytes <
+        unlimited.summary.exact_candidate_peak_projected_resident_bytes);
   CHECK(finite.summary.exact_candidate_peak_projected_resident_bytes <=
         finite_budget);
   CHECK(finite.summary.exact_candidate_timing_count == 16);
@@ -11240,12 +11258,21 @@ static larch::chart_spr_search_result run_phase6_semantic_matrix_case(
     }
   }
 
-  auto const expected_batches = (top_k + workers - 1) / workers;
   auto const candidate_parallel = top_k > 1 && workers > 1;
+  auto const bounded_cold_exact =
+      matrix_case == phase6_semantic_matrix_case::dense_cold_ua_two_pass;
+  auto const expected_batches =
+      bounded_cold_exact && candidate_parallel
+          ? top_k - 1
+          : (top_k + workers - 1) / workers;
   auto const expected_parallel_batches =
-      candidate_parallel ? expected_batches : std::size_t{0};
+      candidate_parallel
+          ? bounded_cold_exact ? std::size_t{1} : expected_batches
+          : std::size_t{0};
   auto const expected_inner_batches =
-      candidate_parallel ? std::size_t{0} : expected_batches;
+      bounded_cold_exact && candidate_parallel
+          ? top_k - 2
+          : candidate_parallel ? std::size_t{0} : expected_batches;
   CHECK(search.summary.exact_candidate_admission_batches == expected_batches);
   CHECK(search.summary.exact_candidate_parallel_batches ==
         expected_parallel_batches);
@@ -11278,9 +11305,11 @@ static larch::chart_spr_search_result run_phase6_semantic_matrix_case(
   if (candidate_parallel) {
     CHECK(rendezvous != nullptr);
     CHECK(rendezvous->arrivals() == 2);
-    CHECK(exact_axis.items == top_k);
-    CHECK(exact_axis.ranges == top_k);
-    CHECK(exact_axis.worker_tasks == top_k);
+    auto const expected_outer_items =
+        bounded_cold_exact ? std::size_t{2} : top_k;
+    CHECK(exact_axis.items == expected_outer_items);
+    CHECK(exact_axis.ranges == expected_outer_items);
+    CHECK(exact_axis.worker_tasks == expected_outer_items);
     CHECK(exact_axis.active_worker_high_water >= 2);
     CHECK(search.summary.peak_concurrent_exact_verifiers >= 2);
   } else {
@@ -11424,7 +11453,7 @@ static void test_phase6_forced_exception_top_k_worker_parity_and_quiescence() {
       }
       CHECK(observed_failure == forced_failure);
       CHECK(hook_calls->load(std::memory_order_relaxed) ==
-            std::min(top_k, workers));
+            std::min(top_k, std::min(workers, std::size_t{2})));
       CHECK(state.counters.candidate_accepts_attempted == 0);
       CHECK(state.counters.exact_candidate_admission_batches == 1);
       CHECK(state.exact_verifier_concurrency->peak() >= 1);
@@ -13240,7 +13269,7 @@ int main() {
   test_exact_verification_reuses_state_old_score();
   test_failed_exact_materialization_is_timed();
   test_top_k_exact_verification_count_is_bounded();
-  test_phase6_top_k_four_uses_exact_candidate_axis_only();
+  test_phase6_top_k_four_uses_bounded_cold_exact_waves();
   test_phase6_top_k_one_preserves_inner_exact_parallelism();
   test_phase6_exact_candidate_failures_choose_stable_rank_and_join();
   test_phase6_exact_candidate_partial_submit_joins_and_reconciles();
@@ -13250,7 +13279,7 @@ int main() {
   test_phase6_exact_candidate_admission_retained_carryover();
   test_phase6_exact_candidate_admission_arithmetic_guards();
   test_phase6_exact_state_fails_before_unified_budget_overrun();
-  test_phase6_finite_budget_splits_exact_candidate_wave();
+  test_phase6_finite_budget_falls_back_within_bounded_waves();
   test_phase6_finite_budget_rejects_before_verifier_hook();
   test_phase6_fixed_tightened_budget_rejects_before_generation();
   test_phase6_custom_exact_contracts_fail_closed_and_serialize();
