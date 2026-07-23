@@ -17,6 +17,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <locale>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -358,6 +359,12 @@ struct chart_spr_search_counters {
   std::size_t lazy_local_admission_waves = 0;
   std::size_t lazy_local_parallel_waves = 0;
   std::size_t lazy_local_memory_limited_waves = 0;
+  // Candidate concurrency before/after the profile-supported bandwidth cap.
+  // The admitted maximum below can be smaller still under a finite memory
+  // budget.
+  std::size_t lazy_local_requested_concurrency_max = 0;
+  std::size_t lazy_local_effective_concurrency_max = 0;
+  std::size_t lazy_local_bandwidth_capped_batches = 0;
   std::size_t lazy_local_admitted_concurrency_max = 0;
   std::size_t lazy_local_prepared_tasks = 0;
   std::size_t lazy_local_reused_prepared_tasks = 0;
@@ -530,6 +537,21 @@ struct chart_spr_search_counters {
   std::size_t lazy_chart_outside_reused_slot_waves = 0;
   std::size_t lazy_chart_inside_workspace_evictions = 0;
   std::size_t lazy_chart_outside_workspace_evictions = 0;
+  // Finite strict-binary state builds can replace per-level wavefront
+  // submissions with one dependency-ready scheduler operation. Executions,
+  // logical jobs, and scheduler operations accumulate across successful
+  // state builds; resident bytes are the maximum dependency-ready
+  // queue/countdown capacity observed in any one build.
+  std::size_t lazy_chart_inside_dependency_ready_executions = 0;
+  std::size_t lazy_chart_outside_dependency_ready_executions = 0;
+  std::size_t lazy_chart_inside_dependency_ready_jobs = 0;
+  std::size_t lazy_chart_outside_dependency_ready_jobs = 0;
+  std::size_t lazy_chart_inside_dependency_ready_scheduler_operations = 0;
+  std::size_t lazy_chart_outside_dependency_ready_scheduler_operations = 0;
+  std::size_t
+      lazy_chart_inside_dependency_ready_capacity_resident_bytes_max = 0;
+  std::size_t
+      lazy_chart_outside_dependency_ready_capacity_resident_bytes_max = 0;
   std::size_t lazy_chart_preflight_peak_bytes = 0;
   std::size_t lazy_chart_actual_peak_bytes = 0;
   std::size_t lazy_chart_pre_submit_rejections = 0;
@@ -1067,6 +1089,7 @@ chart_spr_lazy_policy_from_rebuild_token(
 }  // namespace chart_spr_search_detail
 
 struct chart_spr_search_state;
+struct lazy_local_admission_test_observer;
 
 using chart_spr_topology_selection_provider = std::function<
     std::optional<chart_spr_topology_selection>(
@@ -1272,12 +1295,23 @@ struct chart_spr_search_options {
       force_candidate_pipeline_stale_buffer_after_batches_for_tests;
   std::function<void()> before_candidate_pipeline_start_for_tests = {};
   std::function<void(std::size_t)>
+      after_candidate_pipeline_publish_batch_for_tests = {};
+  std::function<void(std::size_t)>
       before_candidate_pipeline_score_batch_for_tests = {};
   std::function<void(std::size_t)>
       after_candidate_pipeline_score_batch_for_tests = {};
   // Non-owning oversized-diagnostic seam for finite dense-score admission
   // tests. The view must outlive the synchronous acceptance iteration.
   std::string_view force_dense_invalid_reason_for_tests = {};
+  // Finite-admission cache regression seams. The fill counter is touched only
+  // by the coordinator that freezes published-state residence after exact
+  // setup. The optional oracle re-walks that graph once at return and proves
+  // the retained byte value stayed exact across every candidate batch.
+  std::size_t* finite_published_state_resident_cache_fills_for_tests = nullptr;
+  bool verify_finite_published_state_resident_cache_for_tests = false;
+  lazy_local_admission_test_observer*
+      lazy_local_admission_observer_for_tests = nullptr;
+  bool verify_lazy_local_task_capacity_ledger_for_tests = false;
 };
 
 struct chart_spr_exact_candidate_memory_estimate {
@@ -2171,6 +2205,9 @@ struct chart_spr_search_summary {
   std::size_t lazy_local_admission_waves = 0;
   std::size_t lazy_local_parallel_waves = 0;
   std::size_t lazy_local_memory_limited_waves = 0;
+  std::size_t lazy_local_requested_concurrency_max = 0;
+  std::size_t lazy_local_effective_concurrency_max = 0;
+  std::size_t lazy_local_bandwidth_capped_batches = 0;
   std::size_t lazy_local_admitted_concurrency_max = 0;
   std::size_t lazy_local_prepared_tasks = 0;
   std::size_t lazy_local_reused_prepared_tasks = 0;
@@ -2284,6 +2321,16 @@ struct chart_spr_search_summary {
   std::size_t lazy_chart_outside_reused_slot_waves = 0;
   std::size_t lazy_chart_inside_workspace_evictions = 0;
   std::size_t lazy_chart_outside_workspace_evictions = 0;
+  std::size_t lazy_chart_inside_dependency_ready_executions = 0;
+  std::size_t lazy_chart_outside_dependency_ready_executions = 0;
+  std::size_t lazy_chart_inside_dependency_ready_jobs = 0;
+  std::size_t lazy_chart_outside_dependency_ready_jobs = 0;
+  std::size_t lazy_chart_inside_dependency_ready_scheduler_operations = 0;
+  std::size_t lazy_chart_outside_dependency_ready_scheduler_operations = 0;
+  std::size_t
+      lazy_chart_inside_dependency_ready_capacity_resident_bytes_max = 0;
+  std::size_t
+      lazy_chart_outside_dependency_ready_capacity_resident_bytes_max = 0;
   std::size_t lazy_chart_preflight_peak_bytes = 0;
   std::size_t lazy_chart_actual_peak_bytes = 0;
   std::size_t lazy_chart_pre_submit_rejections = 0;
@@ -4139,13 +4186,24 @@ std::size_t estimate_exact_loop_accepted_candidate_dynamic_bytes(
 std::size_t estimate_grammar_spr_enumeration_fixed_live_bytes(
     clade_grammar const& grammar, chart_execution_plan const& plan);
 std::size_t estimate_grammar_spr_enumeration_signature_live_bytes(
-    clade_grammar const& grammar, grammar_spr_candidate const& candidate);
+    clade_grammar const& grammar, grammar_spr_candidate const& candidate,
+    std::size_t encoded_length_prefix_for_tests = 0,
+    bool use_binary_encoding = false);
 
 struct grammar_spr_finite_iteration_memory_envelope {
   std::size_t planned_required_bytes = 0;
   std::size_t planned_generation_phase_required_bytes = 0;
   std::size_t planned_evidence_phase_required_bytes = 0;
   std::size_t future_dynamic_bytes = 0;
+  // Optional finite-lazy fast path. These four fields add the conservative
+  // stable task-slot HWM to every later source/projection wave. The iteration
+  // owner selects them only when the resulting full envelope fits; otherwise
+  // planned_* and future_dynamic_bytes retain the cold-release contract.
+  std::size_t planned_lazy_local_reusable_required_bytes = 0;
+  std::size_t
+      planned_lazy_local_reusable_generation_phase_required_bytes = 0;
+  std::size_t planned_lazy_local_reusable_future_dynamic_bytes = 0;
+  std::size_t planned_lazy_local_reusable_stable_capacity_bytes = 0;
   std::size_t planned_post_release_result_bytes = 0;
   std::size_t planned_ranked_candidate_exact_evidence_bytes = 0;
   std::size_t planned_accepted_candidate_dynamic_bytes = 0;
@@ -4212,7 +4270,8 @@ estimate_grammar_spr_finite_iteration_memory_envelope(
     std::size_t candidate_buffer_count = 1,
     bool include_pipeline_control = false, std::size_t source_wave_size = 0,
     std::size_t projection_wave_size = 0,
-    std::size_t grammar_candidate_wave_size = 0);
+    std::size_t grammar_candidate_wave_size = 0,
+    std::optional<std::size_t> published_state_resident_bytes = std::nullopt);
 
 // Peak coordinator scratch used while producing the per-candidate admission
 // estimates. Estimation is serial, so only the largest candidate is charged.
@@ -4980,6 +5039,28 @@ inline void add_lazy_chart_memory_report(
       report.inside_workspace_evictions;
   counters.lazy_chart_outside_workspace_evictions =
       report.outside_workspace_evictions;
+  counters.lazy_chart_inside_dependency_ready_executions +=
+      report.inside_dependency_ready_execution ? 1 : 0;
+  counters.lazy_chart_outside_dependency_ready_executions +=
+      report.outside_dependency_ready_execution ? 1 : 0;
+  counters.lazy_chart_inside_dependency_ready_jobs +=
+      report.inside_dependency_ready_jobs;
+  counters.lazy_chart_outside_dependency_ready_jobs +=
+      report.outside_dependency_ready_jobs;
+  counters.lazy_chart_inside_dependency_ready_scheduler_operations +=
+      report.inside_dependency_ready_scheduler_operations;
+  counters.lazy_chart_outside_dependency_ready_scheduler_operations +=
+      report.outside_dependency_ready_scheduler_operations;
+  counters.lazy_chart_inside_dependency_ready_capacity_resident_bytes_max =
+      std::max(
+          counters
+              .lazy_chart_inside_dependency_ready_capacity_resident_bytes_max,
+          report.inside_dependency_ready_capacity_resident_bytes);
+  counters.lazy_chart_outside_dependency_ready_capacity_resident_bytes_max =
+      std::max(
+          counters
+              .lazy_chart_outside_dependency_ready_capacity_resident_bytes_max,
+          report.outside_dependency_ready_capacity_resident_bytes);
   counters.lazy_chart_preflight_peak_bytes =
       report.preflight_peak_capacity_resident_bytes;
   counters.lazy_chart_actual_peak_bytes =
@@ -5526,6 +5607,9 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
     lazy_chart_options lazy_options;
     lazy_options.chart = chart_build_options;
     lazy_options.retain_all_inside_class_maps = true;
+    auto const validated_lazy_patterns =
+        lazy_chart_detail::validate_plan_patterns_once(
+            state.execution_plan, state.active_patterns.patterns);
     std::vector<chart_scheduler_run_summary> lazy_inside_runs;
     std::vector<chart_scheduler_run_summary> lazy_outside_runs;
     lazy_chart_detail::plan_lazy_chart_scheduler_workspace
@@ -5555,7 +5639,8 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
       state.lazy_chart = build_lazy_inside_chart_scheduled(
           state.execution_plan, state.active_patterns.patterns, lazy_options,
           *lazy_scheduler, &lazy_inside_runs, nullptr,
-          &lazy_scheduler_workspace, lazy_memory_options, &lazy_memory_report);
+          &lazy_scheduler_workspace, lazy_memory_options, &lazy_memory_report,
+          &validated_lazy_patterns);
       lazy_scheduler_workspace.release_inside();
     }
     ++state.counters.chart_execution_plan_cache_hits;
@@ -5580,7 +5665,7 @@ inline chart_spr_search_state build_chart_spr_search_state_from_active(
             state.execution_plan, state.active_patterns.patterns,
             *state.lazy_chart, options, *lazy_scheduler, &lazy_outside_runs,
             nullptr, &lazy_scheduler_workspace, outside_memory_options,
-            &lazy_memory_report);
+            &lazy_memory_report, &validated_lazy_patterns);
         lazy_scheduler_workspace.release_outside();
       }
       ++state.counters.chart_execution_plan_cache_hits;
@@ -5999,6 +6084,16 @@ struct local_score_worker_barrier_for_tests {
   std::atomic<bool> release = false;
 };
 
+// Read-only diagnostics for the finite lazy-local admission hot path. Tests
+// may also request the allocation-free full capacity walk after each ledger
+// update; production callers leave both seams disabled.
+struct lazy_local_admission_test_observer {
+  std::size_t task_capacity_ledger_initializations = 0;
+  std::size_t task_capacity_ledger_slot_refreshes = 0;
+  std::size_t task_capacity_ledger_full_walk_verifications = 0;
+  std::size_t task_capacity_ledger_mismatches = 0;
+};
+
 struct local_spr_score_options {
   bool verify_against_full_overlay = false;  // tests/debug only
   bool exact_multisite = false;              // false = composite/lower bound
@@ -6025,6 +6120,9 @@ struct local_spr_score_options {
   // every admitted slot has completed throw-capable score finalization.
   std::optional<std::size_t> force_lazy_finish_overflow_for_tests;
   std::optional<std::size_t> force_lazy_finish_allocation_for_tests;
+  lazy_local_admission_test_observer*
+      lazy_local_admission_observer_for_tests = nullptr;
+  bool verify_lazy_local_task_capacity_ledger_for_tests = false;
 
   // Optional tighter unified budget for local-task admission. Zero inherits
   // the search state's cache budget (and is unlimited when that is also zero).
@@ -6035,6 +6133,12 @@ struct local_spr_score_options {
   // internally; callers must not include either in this external value.
   std::size_t admission_memory_budget_bytes = 0;
   std::size_t admission_additional_resident_bytes = 0;
+  // The finite iteration owns an immutable published search-state graph after
+  // exact-trim setup. It supplies that graph's once-walked capacity here so
+  // per-batch local admission does not repeat the full ownership traversal.
+  // Direct callers leave this disengaged and the scorer walks the state once
+  // for its operation.
+  std::optional<std::size_t> admission_published_state_resident_bytes;
   // Production acceptance already charges the owning result-vector outer
   // capacity. The checked direct `_into` boundary otherwise charges the
   // caller span's logical object storage itself. Both paths always charge and
@@ -6056,6 +6160,13 @@ struct local_spr_score_options {
   // supplies both applicable bounds.
   std::size_t admission_weighted_candidate_order_capacity_bytes = 0;
   std::size_t admission_pattern_batch_construction_scratch_bytes = 0;
+  // The finite acceptance-iteration owner may keep lazy descriptor/grouping
+  // high-water storage between candidate batches only after its unified
+  // generation envelope has charged that stable capacity concurrently with
+  // every source/projection stage. Direct finite callers leave this false.
+  // The lazy scorer still measures every retained slot against the operation
+  // budget, and exceptional exits always discard the retained payload.
+  bool admission_retain_lazy_local_task_storage = false;
 
   // Non-owning test seam for exercising diagnostics produced after dense
   // preparation.  Production callers leave it empty.  The view must outlive
@@ -7599,6 +7710,14 @@ inline void add_chart_spr_search_counters(
   dst.lazy_local_admission_waves += src.lazy_local_admission_waves;
   dst.lazy_local_parallel_waves += src.lazy_local_parallel_waves;
   dst.lazy_local_memory_limited_waves += src.lazy_local_memory_limited_waves;
+  dst.lazy_local_requested_concurrency_max =
+      std::max(dst.lazy_local_requested_concurrency_max,
+               src.lazy_local_requested_concurrency_max);
+  dst.lazy_local_effective_concurrency_max =
+      std::max(dst.lazy_local_effective_concurrency_max,
+               src.lazy_local_effective_concurrency_max);
+  dst.lazy_local_bandwidth_capped_batches +=
+      src.lazy_local_bandwidth_capped_batches;
   dst.lazy_local_admitted_concurrency_max =
       std::max(dst.lazy_local_admitted_concurrency_max,
                src.lazy_local_admitted_concurrency_max);
@@ -7820,6 +7939,26 @@ inline void add_chart_spr_search_counters(
       src.lazy_chart_inside_workspace_evictions;
   dst.lazy_chart_outside_workspace_evictions +=
       src.lazy_chart_outside_workspace_evictions;
+  dst.lazy_chart_inside_dependency_ready_executions +=
+      src.lazy_chart_inside_dependency_ready_executions;
+  dst.lazy_chart_outside_dependency_ready_executions +=
+      src.lazy_chart_outside_dependency_ready_executions;
+  dst.lazy_chart_inside_dependency_ready_jobs +=
+      src.lazy_chart_inside_dependency_ready_jobs;
+  dst.lazy_chart_outside_dependency_ready_jobs +=
+      src.lazy_chart_outside_dependency_ready_jobs;
+  dst.lazy_chart_inside_dependency_ready_scheduler_operations +=
+      src.lazy_chart_inside_dependency_ready_scheduler_operations;
+  dst.lazy_chart_outside_dependency_ready_scheduler_operations +=
+      src.lazy_chart_outside_dependency_ready_scheduler_operations;
+  dst.lazy_chart_inside_dependency_ready_capacity_resident_bytes_max =
+      std::max(
+          dst.lazy_chart_inside_dependency_ready_capacity_resident_bytes_max,
+          src.lazy_chart_inside_dependency_ready_capacity_resident_bytes_max);
+  dst.lazy_chart_outside_dependency_ready_capacity_resident_bytes_max =
+      std::max(
+          dst.lazy_chart_outside_dependency_ready_capacity_resident_bytes_max,
+          src.lazy_chart_outside_dependency_ready_capacity_resident_bytes_max);
   dst.lazy_chart_preflight_peak_bytes = std::max(
       dst.lazy_chart_preflight_peak_bytes, src.lazy_chart_preflight_peak_bytes);
   dst.lazy_chart_actual_peak_bytes = std::max(dst.lazy_chart_actual_peak_bytes,
@@ -8142,6 +8281,15 @@ class prepared_local_candidate_score {
 struct local_score_worker_workspace {
   chart_spr_local_score_scratch scratch;
   chart_spr_search_counters counters;
+  // Coordinator-owned cache used only while a finite lazy-local operation is
+  // active. It is deliberately outside dynamic_capacity_bytes(): the worker
+  // object itself is already charged through its vector capacity.
+  std::size_t lazy_local_task_dynamic_capacity_ledger_bytes = 0;
+  // Coordinator-only provenance for the reuse diagnostic. Dynamic capacity
+  // is nonzero even for a cold slot because std::string reports its inline
+  // buffer, so capacity alone cannot distinguish first use from retained
+  // lazy-local payload.
+  bool lazy_local_task_retained_payload = false;
 
   void reset_for_operation() noexcept {
     scratch.clear_borrows();
@@ -8151,6 +8299,7 @@ struct local_score_worker_workspace {
   void release_retained_storage() noexcept {
     scratch.release_retained_storage();
     counters = {};
+    lazy_local_task_retained_payload = false;
   }
 
   [[nodiscard]] bool operation_boundary_clean() const noexcept {
@@ -8221,6 +8370,8 @@ class chart_spr_local_score_workspace {
     std::vector<chart_spr_search_detail::local_score_tile_result>{}.swap(
         tile_results_);
     serial_scratch_ = {};
+    lazy_task_dynamic_capacity_total_ = 0;
+    lazy_task_capacity_ledger_valid_ = false;
   }
 
  private:
@@ -8231,6 +8382,8 @@ class chart_spr_local_score_workspace {
   std::vector<chart_spr_search_detail::local_score_worker_workspace> workers_;
   std::vector<chart_spr_search_detail::local_score_tile_result> tile_results_;
   chart_spr_local_score_scratch serial_scratch_;
+  std::size_t lazy_task_dynamic_capacity_total_ = 0;
+  bool lazy_task_capacity_ledger_valid_ = false;
   std::size_t prepared_active_ = 0;
   std::size_t worker_active_ = 0;
   std::size_t tile_active_ = 0;
@@ -8339,6 +8492,49 @@ struct lazy_local_admission_wave {
   bool memory_limited = false;
 };
 
+inline constexpr std::size_t
+    lazy_local_bandwidth_saturation_min_active_patterns = 1024;
+inline constexpr std::size_t
+    lazy_local_bandwidth_saturation_min_resolved_workers = 8;
+
+struct lazy_local_candidate_concurrency_plan {
+  std::size_t requested_tasks = 0;
+  std::size_t effective_tasks = 0;
+  bool bandwidth_capped = false;
+};
+
+// The lazy-local kernel prepares, per candidate, at least two size_t grouping
+// work arrays, five size_t result arrays, and one 32-bit packed-key word per
+// active pattern. At 1,024 patterns that mandatory footprint reaches 60 KiB,
+// before context accumulators and chart rows. The pinned 8-core
+// high-compression sweep (2,046 active patterns) peaked at W6 and regressed at
+// W7/W8, while the cache phase remained flat. Keep the search scheduler at its
+// resolved width, but admit floor(3W/4) simultaneous lazy-local candidates for
+// this demonstrably streaming shape. W1, W2--W7, smaller pattern streams, and
+// batches already narrower than the cap retain their requested concurrency.
+inline lazy_local_candidate_concurrency_plan
+plan_lazy_local_candidate_concurrency(std::size_t resolved_workers,
+                                      std::size_t candidate_count,
+                                      std::size_t active_pattern_count) noexcept {
+  lazy_local_candidate_concurrency_plan plan;
+  plan.requested_tasks = std::min(resolved_workers, candidate_count);
+  plan.effective_tasks = plan.requested_tasks;
+  if (resolved_workers <
+          lazy_local_bandwidth_saturation_min_resolved_workers ||
+      active_pattern_count <
+          lazy_local_bandwidth_saturation_min_active_patterns) {
+    return plan;
+  }
+
+  // floor(3W/4), written without a potentially overflowing multiplication.
+  auto const quarters = resolved_workers / 4;
+  auto const remainder = resolved_workers % 4;
+  auto const bandwidth_limit = quarters * 3 + (remainder * 3) / 4;
+  plan.effective_tasks = std::min(plan.effective_tasks, bandwidth_limit);
+  plan.bandwidth_capped = plan.effective_tasks < plan.requested_tasks;
+  return plan;
+}
+
 // Pure maximal stable-prefix planner. The runtime can feed measured deep
 // capacities one at a time without allocating another estimates buffer; tests
 // exercise the same function with a complete wave to pin prefix and failure
@@ -8400,6 +8596,8 @@ struct local_score_workspace_access {
       }
       workspace.serial_scratch_.release_retained_storage();
     }
+    workspace.lazy_task_dynamic_capacity_total_ = 0;
+    workspace.lazy_task_capacity_ledger_valid_ = false;
   }
 
   static void begin(chart_spr_local_score_workspace& workspace,
@@ -8411,6 +8609,8 @@ struct local_score_workspace_access {
           "chart SPR local score workspace: overlapping operation or stale "
           "borrow");
     }
+    workspace.lazy_task_dynamic_capacity_total_ = 0;
+    workspace.lazy_task_capacity_ledger_valid_ = false;
     // Grow before publishing an active operation so allocation failure leaves
     // the caller-visible boundary clean.
     if (workspace.prepared_.size() < prepared_count) {
@@ -8497,6 +8697,98 @@ struct local_score_workspace_access {
         workspace.prepared_[index].dynamic_capacity_bytes(),
         workspace.workers_[index].dynamic_capacity_bytes(),
         "chart SPR lazy-local task capacity");
+  }
+
+  static void initialize_task_capacity_ledger(
+      chart_spr_local_score_workspace& workspace, std::size_t task_count) {
+    if (task_count > workspace.prepared_.size() ||
+        task_count > workspace.workers_.size()) {
+      throw std::logic_error(
+          "chart SPR lazy-local capacity ledger: task count out of range");
+    }
+    workspace.lazy_task_dynamic_capacity_total_ = 0;
+    workspace.lazy_task_capacity_ledger_valid_ = false;
+    std::size_t total = 0;
+    for (std::size_t slot = 0; slot < task_count; ++slot) {
+      auto const capacity = task_dynamic_capacity_bytes(workspace, slot);
+      workspace.workers_[slot]
+          .lazy_local_task_dynamic_capacity_ledger_bytes = capacity;
+      total = local_capacity_checked_add(
+          total, capacity,
+          "chart SPR lazy-local capacity ledger initialization");
+    }
+    workspace.lazy_task_dynamic_capacity_total_ = total;
+    workspace.lazy_task_capacity_ledger_valid_ = true;
+  }
+
+  static std::size_t task_capacity_ledger_total(
+      chart_spr_local_score_workspace const& workspace) {
+    if (!workspace.lazy_task_capacity_ledger_valid_) {
+      throw std::logic_error(
+          "chart SPR lazy-local capacity ledger: total is not initialized");
+    }
+    return workspace.lazy_task_dynamic_capacity_total_;
+  }
+
+  static std::size_t task_capacity_ledger_slot(
+      chart_spr_local_score_workspace const& workspace, std::size_t index) {
+    if (!workspace.lazy_task_capacity_ledger_valid_ ||
+        index >= workspace.prepared_.size() ||
+        index >= workspace.workers_.size()) {
+      throw std::logic_error(
+          "chart SPR lazy-local capacity ledger: slot is not initialized");
+    }
+    return workspace.workers_[index]
+        .lazy_local_task_dynamic_capacity_ledger_bytes;
+  }
+
+  static std::size_t refresh_task_capacity_ledger_slot(
+      chart_spr_local_score_workspace& workspace, std::size_t index,
+      std::size_t* worker_capacity_bytes = nullptr) {
+    auto const old_capacity = task_capacity_ledger_slot(workspace, index);
+    if (old_capacity > workspace.lazy_task_dynamic_capacity_total_) {
+      throw std::logic_error(
+          "chart SPR lazy-local capacity ledger: slot exceeds total");
+    }
+    auto const prepared_capacity =
+        workspace.prepared_[index].dynamic_capacity_bytes();
+    auto const worker_capacity =
+        workspace.workers_[index].dynamic_capacity_bytes();
+    auto const new_capacity = local_capacity_checked_add(
+        prepared_capacity, worker_capacity,
+        "chart SPR lazy-local capacity ledger task refresh");
+    workspace.lazy_task_dynamic_capacity_total_ = local_capacity_checked_add(
+        workspace.lazy_task_dynamic_capacity_total_ - old_capacity,
+        new_capacity, "chart SPR lazy-local capacity ledger refresh");
+    workspace.workers_[index]
+        .lazy_local_task_dynamic_capacity_ledger_bytes = new_capacity;
+    if (worker_capacity_bytes != nullptr) {
+      *worker_capacity_bytes = worker_capacity;
+    }
+    return new_capacity;
+  }
+
+  static bool verify_task_capacity_ledger(
+      chart_spr_local_score_workspace const& workspace,
+      std::size_t task_count) {
+    if (!workspace.lazy_task_capacity_ledger_valid_ ||
+        task_count > workspace.prepared_.size() ||
+        task_count > workspace.workers_.size()) {
+      return false;
+    }
+    std::size_t total = 0;
+    for (std::size_t slot = 0; slot < task_count; ++slot) {
+      auto const capacity = task_dynamic_capacity_bytes(workspace, slot);
+      if (capacity !=
+          workspace.workers_[slot]
+              .lazy_local_task_dynamic_capacity_ledger_bytes) {
+        return false;
+      }
+      total = local_capacity_checked_add(
+          total, capacity,
+          "chart SPR lazy-local capacity ledger verification");
+    }
+    return total == workspace.lazy_task_dynamic_capacity_total_;
   }
 
   static std::size_t fixed_resident_capacity_bytes(
@@ -9255,29 +9547,28 @@ inline std::size_t lazy_overlay_inside_class_index(
   return class_index;
 }
 
-inline void append_lazy_overlay_leaf_state(
-    std::vector<site_pattern> const& patterns, taxon_id taxon,
-    std::size_t pattern,
-    std::vector<lazy_key_grouping_detail::packed_key_word>& key) {
-  if (taxon == chart_plan_no_taxon) return;
-  if (pattern >= patterns.size() ||
-      taxon >= patterns[pattern].state_by_taxon.size()) {
+inline std::size_t lazy_overlay_inside_class_index_after_shape_validation(
+    lazy_multisite_chart const& lazy, clade_id clade, std::size_t pattern) {
+  // Pattern zero has already proved the candidate-fixed clade bounds, map
+  // engagement, and row-vector bounds in the same component order. Retain all
+  // pattern-dependent checks for later pattern-major keys.
+  if (pattern >= lazy.pattern_count) {
     throw std::runtime_error(
-        "chart SPR lazy local score: leaf state key out of range");
+        "chart SPR lazy local score: pattern index out of range");
   }
-  key.push_back(lazy_key_grouping_detail::checked_packed_key_word(
-      patterns[pattern].state_by_taxon[taxon],
-      "chart SPR lazy local leaf-state key"));
+  auto const class_index =
+      (*lazy.class_index_by_pattern_by_clade[clade])[pattern];
+  if (class_index >= lazy.inside_rows_by_clade[clade].size()) {
+    throw std::runtime_error(
+        "chart SPR lazy local score: inside class index out of range");
+  }
+  return class_index;
 }
 
-inline void append_lazy_overlay_base_class(
-    lazy_multisite_chart const& lazy, overlay_clade_ref ref,
-    std::size_t pattern,
-    std::vector<lazy_key_grouping_detail::packed_key_word>& key) {
-  if (ref.space != overlay_id_space::base) return;
-  key.push_back(lazy_key_grouping_detail::checked_packed_key_word(
-      lazy_overlay_inside_class_index(lazy, ref.id, pattern),
-      "chart SPR lazy local inside-class key"));
+inline std::size_t lazy_overlay_inside_class_index_after_key_validation(
+    lazy_multisite_chart const& lazy, clade_id clade,
+    std::size_t pattern) noexcept {
+  return (*lazy.class_index_by_pattern_by_clade[clade])[pattern];
 }
 
 inline std::size_t lazy_overlay_context_key_width(
@@ -9363,37 +9654,70 @@ prepare_lazy_local_score_scratch_for_candidate(
   };
 }
 
-inline void append_lazy_overlay_context_key(
+inline void fill_lazy_overlay_context_key(
     chart_spr_search_state const& state, spr_overlay_delta const& delta,
     std::size_t pattern,
-    std::vector<lazy_key_grouping_detail::packed_key_word>& key_words) {
+    std::span<lazy_key_grouping_detail::packed_key_word> key_words,
+    bool fixed_shape_validated) {
   if (!state.lazy_chart) {
     throw std::runtime_error("chart SPR lazy local score: missing lazy chart");
   }
   auto const& lazy = *state.lazy_chart;
   auto const& patterns = state.active_patterns.patterns.patterns;
-  key_words.push_back(lazy_key_grouping_detail::checked_packed_key_word(
-      lazy_overlay_inside_class_index(lazy, state.grammar.root_clade, pattern),
-      "chart SPR lazy local root-class key"));
+  std::size_t output = 0;
+  auto store = [&](std::size_t value, std::string_view context) {
+    auto const packed =
+        lazy_key_grouping_detail::checked_packed_key_word(value, context);
+    if (output >= key_words.size()) {
+      throw std::logic_error(
+          "chart SPR lazy local score: inconsistent context-key width");
+    }
+    key_words[output++] = packed;
+  };
+  auto inside_class = [&](clade_id clade) {
+    return fixed_shape_validated
+               ? lazy_overlay_inside_class_index_after_shape_validation(
+                     lazy, clade, pattern)
+               : lazy_overlay_inside_class_index(lazy, clade, pattern);
+  };
+  auto append_base_class = [&](overlay_clade_ref ref) {
+    if (ref.space != overlay_id_space::base) return;
+    store(inside_class(ref.id), "chart SPR lazy local inside-class key");
+  };
+  auto append_leaf_state = [&](taxon_id taxon) {
+    if (taxon == chart_plan_no_taxon) return;
+    if (pattern >= patterns.size() ||
+        taxon >= patterns[pattern].state_by_taxon.size()) {
+      throw std::runtime_error(
+          "chart SPR lazy local score: leaf state key out of range");
+    }
+    store(patterns[pattern].state_by_taxon[taxon],
+          "chart SPR lazy local leaf-state key");
+  };
+
+  store(inside_class(state.grammar.root_clade),
+        "chart SPR lazy local root-class key");
 
   auto append_children =
       [&](std::span<candidate_chart_child_descriptor const> children) {
         for (auto const& child : children) {
-          append_lazy_overlay_base_class(lazy, child.clade, pattern, key_words);
-          append_lazy_overlay_leaf_state(patterns, child.leaf_taxon, pattern,
-                                         key_words);
+          append_base_class(child.clade);
+          append_leaf_state(child.leaf_taxon);
         }
       };
 
   for (auto const& row : delta.compiled_rows) {
     auto ref = row.clade;
-    append_lazy_overlay_base_class(lazy, ref, pattern, key_words);
-    append_lazy_overlay_leaf_state(patterns, row.leaf_taxon, pattern,
-                                   key_words);
+    append_base_class(ref);
+    append_leaf_state(row.leaf_taxon);
     for (auto const& production :
          candidate_chart_productions_for_row(delta, row)) {
       append_children(candidate_chart_children(delta, production));
     }
+  }
+  if (output != key_words.size()) {
+    throw std::logic_error(
+        "chart SPR lazy local score: inconsistent context-key width");
   }
 }
 
@@ -9417,7 +9741,8 @@ struct lazy_overlay_row_provider {
       throw std::runtime_error(
           "chart SPR lazy local score: reachable temp clade has no local row");
     }
-    auto class_index = lazy_overlay_inside_class_index(lazy, ref.id, pattern);
+    auto class_index = lazy_overlay_inside_class_index_after_key_validation(
+        lazy, ref.id, pattern);
     return lazy.inside_rows_by_clade[ref.id][class_index];
   }
 
@@ -9435,8 +9760,8 @@ struct lazy_overlay_row_provider {
       throw std::runtime_error(
           "chart SPR lazy local score: compiled child has no base row");
     }
-    auto class_index =
-        lazy_overlay_inside_class_index(lazy, child.base_clade, pattern);
+    auto class_index = lazy_overlay_inside_class_index_after_key_validation(
+        lazy, child.base_clade, pattern);
     return lazy.inside_rows_by_clade[child.base_clade][class_index];
   }
 };
@@ -9544,19 +9869,19 @@ inline void accumulate_prepared_local_candidate_lazy_prepared(
       throw std::logic_error(
           "chart SPR lazy local score: prepared scratch capacity is too small");
     }
-    scratch.lazy_context_key_words.clear();
+    scratch.lazy_context_key_words.resize(word_count);
+    auto key_matrix =
+        std::span<lazy_key_grouping_detail::packed_key_word>{
+            scratch.lazy_context_key_words};
     for (std::size_t pattern_index = 0; pattern_index < patterns.size();
          ++pattern_index) {
       if (counters != nullptr) {
         ++counters->candidate_execution_plan_cache_hits;
       }
-      append_lazy_overlay_context_key(state, delta, pattern_index,
-                                      scratch.lazy_context_key_words);
-      auto const expected_words = (pattern_index + 1) * key_width;
-      if (scratch.lazy_context_key_words.size() != expected_words) {
-        throw std::logic_error(
-            "chart SPR lazy local score: inconsistent context-key width");
-      }
+      fill_lazy_overlay_context_key(
+          state, delta, pattern_index,
+          key_matrix.subspan(pattern_index * key_width, key_width),
+          pattern_index != 0);
     }
 
     auto const grouping_status =
@@ -9568,7 +9893,9 @@ inline void accumulate_prepared_local_candidate_lazy_prepared(
             },
             scratch.lazy_context_grouping_workspace,
             scratch.lazy_context_grouping_result,
-            scratch.lazy_prepared_grouping_resident_bytes);
+            scratch.lazy_prepared_grouping_resident_bytes,
+            lazy_key_grouping_detail::packed_key_grouping_result_mode::
+                ordered_classes);
     scratch.lazy_grouping_status = grouping_status;
     if (!grouping_status.succeeded()) {
       return;
@@ -10583,9 +10910,21 @@ inline void score_candidates_locally_into_impl(
       candidates.empty() ? 0 : resolved_workers;
   auto const lazy_resident_cache =
       state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart;
-  auto const lazy_task_count =
-      candidates.empty() ? 0
-                         : std::min(effective_worker_count, candidates.size());
+  auto const lazy_concurrency = plan_lazy_local_candidate_concurrency(
+      effective_worker_count, candidates.size(),
+      state.active_patterns.patterns.patterns.size());
+  auto const lazy_task_count = lazy_concurrency.effective_tasks;
+  if (lazy_resident_cache && !candidates.empty()) {
+    state.counters.lazy_local_requested_concurrency_max =
+        std::max(state.counters.lazy_local_requested_concurrency_max,
+                 lazy_concurrency.requested_tasks);
+    state.counters.lazy_local_effective_concurrency_max =
+        std::max(state.counters.lazy_local_effective_concurrency_max,
+                 lazy_concurrency.effective_tasks);
+    if (lazy_concurrency.bandwidth_capped) {
+      ++state.counters.lazy_local_bandwidth_capped_batches;
+    }
+  }
   auto const resident_cache =
       state.cache_strategy == chart_spr_cache_strategy::all_active_patterns ||
       lazy_resident_cache || state.local_commit_inside_rows.valid();
@@ -10604,6 +10943,12 @@ inline void score_candidates_locally_into_impl(
   if (lazy_resident_cache) {
     auto const admission_budget =
         effective_lazy_local_admission_budget_bytes(state, options);
+    auto const published_state_resident =
+        admission_budget == 0
+            ? std::size_t{0}
+            : operation_options.admission_published_state_resident_bytes
+                  ? *operation_options.admission_published_state_resident_bytes
+                  : estimate_chart_spr_published_state_resident_bytes(state);
     if (admission_budget != 0) {
       if (scheduler != nullptr) {
         operation_options.admission_additional_resident_bytes =
@@ -10642,23 +10987,41 @@ inline void score_candidates_locally_into_impl(
         }
       }
       auto resident_before_begin = local_capacity_checked_add(
-          estimate_chart_spr_published_state_resident_bytes(state),
+          published_state_resident,
           operation_options.admission_additional_resident_bytes,
           "chart SPR lazy-local outer shared resident capacity");
-      resident_before_begin = local_capacity_checked_add(
-          resident_before_begin,
-          local_score_workspace_access::finite_outer_bound_peak_capacity_bytes(
-              workspace, lazy_task_count),
-          "chart SPR lazy-local outer replacement peak");
-      resident_before_begin = local_capacity_checked_add(
-          resident_before_begin, candidate_input_resident,
-          "chart SPR lazy-local candidate input resident peak");
-      resident_before_begin = local_capacity_checked_add(
-          resident_before_begin, output_current,
-          "chart SPR lazy-local output resident peak");
-      resident_before_begin = local_capacity_checked_add(
-          resident_before_begin, output_replacement,
-          "chart SPR lazy-local output replacement peak");
+      auto add_outer_operation_peak = [&](std::size_t base) {
+        base = local_capacity_checked_add(
+            base,
+            local_score_workspace_access::
+                finite_outer_bound_peak_capacity_bytes(workspace,
+                                                       lazy_task_count),
+            "chart SPR lazy-local outer replacement peak");
+        base = local_capacity_checked_add(
+            base, candidate_input_resident,
+            "chart SPR lazy-local candidate input resident peak");
+        base = local_capacity_checked_add(
+            base, output_current,
+            "chart SPR lazy-local output resident peak");
+        return local_capacity_checked_add(
+            base, output_replacement,
+            "chart SPR lazy-local output replacement peak");
+      };
+      resident_before_begin =
+          add_outer_operation_peak(resident_before_begin);
+      if (resident_before_begin > admission_budget &&
+          operation_options.admission_retain_lazy_local_task_storage) {
+        // A later short/tight batch is allowed to fall back to the historical
+        // cold envelope. Shed the previously admitted HWM without allocating,
+        // then re-evaluate the complete old+replacement peak before touching
+        // output storage or beginning the operation.
+        workspace.release_retained_storage();
+        resident_before_begin = add_outer_operation_peak(
+            local_capacity_checked_add(
+                published_state_resident,
+                operation_options.admission_additional_resident_bytes,
+                "chart SPR lazy-local cold outer shared resident capacity"));
+      }
       if (resident_before_begin > admission_budget) {
         ++state.counters.lazy_local_pre_submit_budget_failures;
         throw chart_spr_lazy_local_budget_error(0, resident_before_begin,
@@ -10695,10 +11058,12 @@ inline void score_candidates_locally_into_impl(
               output_resident, "chart SPR lazy-local output resident capacity");
     }
     local_score_workspace_access::bound_lazy_task_slots(
-        workspace, lazy_task_count, admission_budget != 0);
+        workspace, lazy_task_count,
+        admission_budget != 0 &&
+            !operation_options.admission_retain_lazy_local_task_storage);
     if (admission_budget != 0) {
       auto resident_after_bound = local_capacity_checked_add(
-          estimate_chart_spr_published_state_resident_bytes(state),
+          published_state_resident,
           operation_options.admission_additional_resident_bytes,
           "chart SPR lazy-local bounded shared resident capacity");
       resident_after_bound = local_capacity_checked_add(
@@ -13419,6 +13784,13 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart &&
       exact_memory_budget != 0;
   auto const worker_count = scheduler.worker_resolution().resolved_workers;
+  // Freeze the locale-sensitive representation before a producer is launched.
+  // W1 retains the historical textual identity; W>1 may use the equivalent
+  // fixed-width key only under the classic locale.
+  auto const grammar_candidate_uses_binary_taxon_dedup_key =
+      worker_count > 1 && std::locale{} == std::locale::classic();
+  enumeration.grammar_candidate_use_binary_taxon_dedup_key =
+      grammar_candidate_uses_binary_taxon_dedup_key;
   auto const pipeline_requested =
       options.enable_candidate_generation_pipeline && worker_count > 1;
   auto const finite_pipeline_admission =
@@ -13453,11 +13825,19 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
           : (rank_limit != chart_spr_rank_unlimited ? rank_limit : 0);
   bool const capture_semantics =
       options.semantic_capture != chart_spr_semantic_capture_mode::off;
-  auto const local_task_slots =
-      std::max<std::size_t>(1, std::min(worker_count, candidate_batch_size));
+  auto const lazy_local_concurrency =
+      chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+          worker_count, candidate_batch_size,
+          state.active_patterns.patterns.patterns.size());
+  auto const local_task_slots = std::max<std::size_t>(
+      1, state.cache_strategy ==
+                 chart_spr_cache_strategy::lazy_multisite_chart
+             ? lazy_local_concurrency.effective_tasks
+             : std::min(worker_count, candidate_batch_size));
   std::optional<
       chart_spr_search_detail::grammar_spr_finite_iteration_memory_envelope>
       finite_iteration_envelope;
+  bool retain_finite_lazy_local_task_storage = false;
   auto const finite_scheduler_resident =
       finite_iteration_admission
           ? chart_spr_search_detail::
@@ -13470,6 +13850,26 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     throw chart_spr_search_detail::chart_spr_lazy_local_budget_error(
         candidate_index, required_bytes, available_bytes);
   };
+  struct finite_local_score_failure_cleanup {
+    chart_spr_search_detail::chart_spr_acceptance_iteration_workspace&
+        workspace;
+    bool enabled = false;
+    bool completed = false;
+
+    ~finite_local_score_failure_cleanup() noexcept {
+      if (!enabled || completed ||
+          !workspace.local_score.operation_boundary_clean()) {
+        return;
+      }
+      // A retained lazy HWM is admitted only for this iteration's generation
+      // phase. Never let it escape an exceptional iteration boundary.
+      try {
+        workspace.local_score.release_retained_storage();
+      } catch (...) {
+        std::terminate();
+      }
+    }
+  } finite_local_cleanup{workspace, finite_iteration_admission};
   if (finite_iteration_admission) {
     // Establish an empty acceptance ownership graph before either a cold exact
     // trim or the iteration reserves are allowed to allocate.
@@ -13521,18 +13921,36 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       throw chart_spr_search_detail::
           chart_spr_canonical_exact_evidence_budget_error{};
     }
-  } else if (options.acceptance_mode ==
-                 chart_spr_acceptance_mode::fixed_topology_exact &&
-             exact_memory_budget != 0 &&
-             estimate_chart_spr_published_state_resident_bytes(state) >
-                 exact_memory_budget) {
+  }
+  // Exact-trim setup above is the last mutation of the published search-state
+  // ownership graph in this iteration. Capacity admission reads that immutable
+  // graph hundreds of times on a long finite candidate stream, so retain its
+  // exact frozen-toolchain walk once and reuse the byte value at every later
+  // boundary. The cache is lazy to avoid adding work to paths that never need
+  // a resident-state estimate.
+  std::optional<std::size_t> published_state_resident_bytes;
+  auto published_state_resident = [&]() -> std::size_t {
+    if (!published_state_resident_bytes) {
+      published_state_resident_bytes =
+          estimate_chart_spr_published_state_resident_bytes(state);
+      if (options
+              .finite_published_state_resident_cache_fills_for_tests !=
+          nullptr) {
+        ++*options.finite_published_state_resident_cache_fills_for_tests;
+      }
+    }
+    return *published_state_resident_bytes;
+  };
+  if (options.acceptance_mode ==
+          chart_spr_acceptance_mode::fixed_topology_exact &&
+      exact_memory_budget != 0 &&
+      published_state_resident() > exact_memory_budget) {
     // Fixed-topology verification needs no published exact trim, but a caller
     // may tighten the iteration budget below the already-resident chart/cache
     // generation. Reject that state before candidate generation allocates its
     // batch/rank workspace.
-    throw chart_spr_exact_state_budget_error(
-        estimate_chart_spr_published_state_resident_bytes(state),
-        exact_memory_budget);
+    throw chart_spr_exact_state_budget_error(published_state_resident(),
+                                             exact_memory_budget);
   }
   state.counters.lazy_local_retained_exact_trim_bytes_max = std::max(
       state.counters.lazy_local_retained_exact_trim_bytes_max,
@@ -13548,7 +13966,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
               ranked_reserve_limit, capture_semantics, scheduler,
               local_task_slots, &enumeration, candidate_buffer_count,
               use_pipeline, source_wave_size, projection_wave_size,
-              grammar_wave_size);
+              grammar_wave_size, published_state_resident());
     };
     try {
       auto selected = estimate_envelope(0, 0, 0);
@@ -13635,6 +14053,21 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
           }
         }
       }
+      if (finite_lazy_local_admission &&
+          selected.planned_lazy_local_reusable_required_bytes <=
+              exact_memory_budget) {
+        // Select the additive overlap envelope only when it independently
+        // fits. Tight budgets retain the historical cold-release path and its
+        // smaller pre-enumeration requirement.
+        retain_finite_lazy_local_task_storage = true;
+        selected.planned_required_bytes =
+            selected.planned_lazy_local_reusable_required_bytes;
+        selected.planned_generation_phase_required_bytes =
+            selected
+                .planned_lazy_local_reusable_generation_phase_required_bytes;
+        selected.future_dynamic_bytes =
+            selected.planned_lazy_local_reusable_future_dynamic_bytes;
+      }
       finite_iteration_envelope = std::move(selected);
     } catch (std::overflow_error const&) {
       fail_finite_iteration_budget(0, (std::numeric_limits<std::size_t>::max)(),
@@ -13714,8 +14147,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   workspace.reserve_batch(candidate_batch_size, use_pipeline);
 
   if (finite_iteration_admission) {
-    auto actual_with_future =
-        estimate_chart_spr_published_state_resident_bytes(state);
+    auto actual_with_future = published_state_resident();
     actual_with_future = chart_spr_search_detail::local_capacity_checked_add(
         actual_with_future, finite_scheduler_resident,
         "chart SPR finite grammar scheduler ownership");
@@ -13778,8 +14210,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
                 : std::min(
                       exact_memory_budget,
                       enumeration.sampled_tree_projection_memory_budget_bytes);
-        auto projection_external_resident =
-            estimate_chart_spr_published_state_resident_bytes(state);
+        auto projection_external_resident = published_state_resident();
         projection_external_resident =
             chart_spr_search_detail::local_capacity_checked_add(
                 projection_external_resident,
@@ -13809,6 +14240,16 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       options.verify_local_against_full_for_tests;
   local_options.force_dense_invalid_reason_for_tests =
       options.force_dense_invalid_reason_for_tests;
+  local_options.lazy_local_admission_observer_for_tests =
+      options.lazy_local_admission_observer_for_tests;
+  local_options.verify_lazy_local_task_capacity_ledger_for_tests =
+      options.verify_lazy_local_task_capacity_ledger_for_tests;
+  local_options.admission_retain_lazy_local_task_storage =
+      retain_finite_lazy_local_task_storage;
+  if (finite_iteration_admission) {
+    local_options.admission_published_state_resident_bytes =
+        published_state_resident();
+  }
   auto const enumeration_fixed_resident =
       finite_iteration_admission
           ? (enumeration.source == chart_spr_candidate_source::grammar &&
@@ -13855,7 +14296,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
   };
 
   auto finite_actual_live_bytes = [&]() {
-    auto total = estimate_chart_spr_published_state_resident_bytes(state);
+    auto total = published_state_resident();
     total = chart_spr_search_detail::local_capacity_checked_add(
         total, finite_scheduler_resident,
         "chart SPR finite grammar live scheduler ownership");
@@ -13925,13 +14366,17 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
           state.cache_strategy ==
               chart_spr_cache_strategy::all_active_patterns ||
           lazy_local || state.local_commit_inside_rows.valid();
+      auto const runtime_lazy_concurrency =
+          chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+              worker_count, candidate_batch.size(),
+              state.active_patterns.patterns.patterns.size());
       auto const runtime_prepared_slots =
-          lazy_local ? std::min(worker_count, candidate_batch.size())
+          lazy_local ? runtime_lazy_concurrency.effective_tasks
           : resident_local
               ? (tile_plan.enabled() ? candidate_batch.size() : worker_count)
               : candidate_batch.size();
       auto const runtime_worker_slots =
-          lazy_local ? std::min(worker_count, candidate_batch.size())
+          lazy_local ? runtime_lazy_concurrency.effective_tasks
                      : worker_count;
       auto const runtime_tile_result_slots =
           std::max(tile_plan.total_tiles, fusion_plan.total_tiles);
@@ -14092,7 +14537,8 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
               }
               auto const signature_live = chart_spr_search_detail::
                   estimate_grammar_spr_enumeration_signature_live_bytes(
-                      state.grammar, candidate);
+                      state.grammar, candidate, 0,
+                      grammar_candidate_uses_binary_taxon_dedup_key);
               if (signature_live >
                   finite_iteration_envelope->planned_signature_node_bytes) {
                 fail_finite_iteration_budget(
@@ -14211,9 +14657,14 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
                   .candidate_pipeline_serial_overlap_batches;
           }
         }
+        auto const published_sequence = next_sequence;
         ++next_sequence;
         filling_buffer.reset();
         pipeline.state_changed.notify_all();
+        if (options.after_candidate_pipeline_publish_batch_for_tests) {
+          options.after_candidate_pipeline_publish_batch_for_tests(
+              published_sequence);
+        }
       };
       auto acquire_filling_buffer = [&]() -> bool {
         if (filling_buffer) return true;
@@ -14697,8 +15148,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     if (finite_budget && options.acceptance_mode ==
                              chart_spr_acceptance_mode::fixed_topology_exact &&
         !ranked.empty()) {
-      auto selector_resident =
-          estimate_chart_spr_published_state_resident_bytes(state);
+      auto selector_resident = published_state_resident();
       selector_resident = chart_spr_exact_candidate_checked_bytes_add(
           selector_resident, scheduler_resident,
           "chart SPR topology-selector scheduler ownership");
@@ -14755,8 +15205,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       attach_fixed_topology_selection_for_acceptance(state, candidate, options);
     }
 
-    auto resident_exact_base =
-        estimate_chart_spr_published_state_resident_bytes(state);
+    auto resident_exact_base = published_state_resident();
     resident_exact_base = chart_spr_exact_candidate_checked_bytes_add(
         resident_exact_base, scheduler_resident,
         "chart SPR exact-candidate scheduler ownership");
@@ -14872,8 +15321,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       auto evidence_phase = post_release_result;
       if (evidence_phase != (std::numeric_limits<std::size_t>::max)()) {
         evidence_phase = chart_spr_exact_candidate_checked_bytes_add(
-            estimate_chart_spr_published_state_resident_bytes(state),
-            finite_scheduler_resident,
+            published_state_resident(), finite_scheduler_resident,
             "chart SPR finite evidence scheduler ownership");
         evidence_phase = chart_spr_exact_candidate_checked_bytes_add(
             evidence_phase, post_release_result,
@@ -15291,6 +15739,17 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
     state.counters.rejected_moves +=
         result.candidates_scored - (result.accepted ? 1U : 0U);
   }
+  if (options.verify_finite_published_state_resident_cache_for_tests) {
+    auto const cached = published_state_resident();
+    auto const observed =
+        estimate_chart_spr_published_state_resident_bytes(state);
+    if (cached != observed) {
+      throw std::logic_error(
+          "chart SPR finite published-state resident cache changed during "
+          "acceptance iteration");
+    }
+  }
+  finite_local_cleanup.completed = true;
   return result;
 }
 

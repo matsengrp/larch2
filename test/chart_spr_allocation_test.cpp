@@ -1507,6 +1507,8 @@ static void test_prepared_lazy_local_core_is_allocation_free() {
 
   allocation_test::allocation_observer signature_observer;
   std::vector<std::size_t> signature_resident(signature_candidates.size());
+  std::vector<std::size_t> binary_signature_resident(
+      signature_candidates.size());
   {
     allocation_test::scoped_allocation_observation observation{
         signature_observer};
@@ -1514,6 +1516,9 @@ static void test_prepared_lazy_local_core_is_allocation_free() {
       signature_resident[index] = larch::chart_spr_search_detail::
           estimate_grammar_spr_enumeration_signature_live_bytes(
               state.grammar, signature_candidates[index]);
+      binary_signature_resident[index] = larch::chart_spr_search_detail::
+          estimate_grammar_spr_enumeration_signature_live_bytes(
+              state.grammar, signature_candidates[index], 0, true);
     }
   }
   CHECK(signature_observer.statistics ==
@@ -1542,7 +1547,84 @@ static void test_prepared_lazy_local_core_is_allocation_free() {
           signature_node_bytes + actual.capacity() + 1);
     CHECK(signature_resident[index] ==
           signature_node_bytes + expected_capacity + 1);
+
+    auto binary = larch::chart_spr_detail::
+        chart_spr_candidate_taxon_dedup_key(
+            state.grammar, signature_candidates[index], true);
+    constexpr std::size_t binary_reserve_floor = 256;
+    constexpr std::size_t allocation_quantum = 16;
+    auto const binary_requested_capacity =
+        std::max(binary_reserve_floor, 2 * binary.size());
+    auto const expected_binary_allocation =
+        ((binary_requested_capacity + 1 + allocation_quantum - 1) /
+         allocation_quantum) *
+        allocation_quantum;
+    CHECK(binary_signature_resident[index] >=
+          signature_node_bytes + binary.capacity() + 1);
+    CHECK(binary_signature_resident[index] ==
+          signature_node_bytes + expected_binary_allocation);
   }
+  larch::chart_scheduler binary_signature_scheduler{
+      larch::chart_scheduler_options{.requested_workers = 8}};
+  auto const binary_signature_envelope = larch::chart_spr_search_detail::
+      estimate_grammar_spr_finite_iteration_memory_envelope(
+          state, signature_candidates.size(), signature_candidates.size(),
+          /*ranked_limit=*/1, /*capture_semantics=*/false,
+          binary_signature_scheduler,
+          /*local_task_slots=*/8, &enumeration,
+          /*candidate_buffer_count=*/2,
+          /*include_pipeline_control=*/true);
+  for (auto resident : binary_signature_resident) {
+    CHECK(binary_signature_envelope.planned_signature_node_bytes >= resident);
+  }
+  binary_signature_scheduler.shutdown();
+
+  // Canonical clade keys take the linear estimator path. Direct-library
+  // callers may still supply unsorted or duplicate taxa, so those inputs must
+  // retain the exact normalization-equivalent fallback and capacity bound.
+  larch::clade_grammar signature_grammar;
+  signature_grammar.clades.push_back(
+      larch::clade_key{.taxa = {1, 2, 10, 100, 1000}});
+  larch::grammar_spr_candidate signature_candidate{
+      .moved_clade = larch::base_clade_ref(0),
+      .old_parent = larch::base_clade_ref(larch::no_clade),
+      .old_sibling = larch::base_clade_ref(larch::no_clade),
+      .new_sibling_or_target = larch::base_clade_ref(larch::no_clade),
+  };
+  auto estimate_test_signature = [&] {
+    return larch::chart_spr_search_detail::
+        estimate_grammar_spr_enumeration_signature_live_bytes(
+            signature_grammar, signature_candidate);
+  };
+  auto expected_test_signature_resident = [&] {
+    auto actual = larch::chart_spr_candidate_taxon_signature(
+        signature_grammar, signature_candidate);
+    return signature_node_bytes +
+           expected_signature_capacity(actual.size()) + 1;
+  };
+  auto const sorted_signature_resident = estimate_test_signature();
+  CHECK(sorted_signature_resident == expected_test_signature_resident());
+
+  signature_grammar.clades[0].taxa = {100, 1, 1000, 10, 2};
+  auto const unsorted_signature_resident = estimate_test_signature();
+  CHECK(unsorted_signature_resident == expected_test_signature_resident());
+  CHECK(unsorted_signature_resident == sorted_signature_resident);
+
+  signature_grammar.clades[0].taxa = {1, 2, 2, 10, 100, 1000, 1000};
+  auto const duplicate_signature_resident = estimate_test_signature();
+  CHECK(duplicate_signature_resident == expected_test_signature_resident());
+  CHECK(duplicate_signature_resident == sorted_signature_resident);
+
+  bool signature_length_overflowed = false;
+  try {
+    (void)larch::chart_spr_search_detail::
+        estimate_grammar_spr_enumeration_signature_live_bytes(
+            signature_grammar, signature_candidate,
+            (std::numeric_limits<std::size_t>::max)());
+  } catch (std::overflow_error const&) {
+    signature_length_overflowed = true;
+  }
+  CHECK(signature_length_overflowed);
 
   auto checked =
       larch::check_chart_execution_plan(state.grammar, state.execution_plan);
@@ -1733,6 +1815,55 @@ static void test_prepared_lazy_local_core_is_allocation_free() {
                           lazy_local_invalid_reason_owned_capacity_bound());
   CHECK(state.counters.lazy_local_reused_prepared_tasks - reused_before == 7);
   CHECK(multiwave_finite_workspace.operation_boundary_clean());
+
+  // A unified iteration with enough headroom may retain the finite lazy task
+  // HWM between public candidate batches. The second identical batch reuses
+  // that storage; tightening the next operation below even published-state
+  // residence first sheds the retained HWM, then rejects from the ordinary
+  // cold envelope without preparing a task.
+  larch::chart_spr_local_score_workspace retained_finite_workspace;
+  std::array<larch::chart_spr_local_score_result, 1> retained_finite_result;
+  larch::local_spr_score_options retained_finite_options;
+  retained_finite_options.admission_memory_budget_bytes =
+      k_chart_memory_budget_bytes;
+  retained_finite_options.admission_retain_lazy_local_task_storage = true;
+  larch::score_candidates_locally_into(
+      state, candidates, retained_finite_result, retained_finite_workspace,
+      retained_finite_options, 1, checked);
+  auto const retained_capacity = larch::chart_spr_search_detail::
+      local_score_workspace_access::retained_task_dynamic_capacity_bytes(
+          retained_finite_workspace);
+  CHECK(retained_capacity > 0);
+  auto const cross_batch_reuse_before =
+      state.counters.lazy_local_reused_prepared_tasks;
+  larch::score_candidates_locally_into(
+      state, candidates, retained_finite_result, retained_finite_workspace,
+      retained_finite_options, 1, checked);
+  CHECK(state.counters.lazy_local_reused_prepared_tasks ==
+        cross_batch_reuse_before + 1);
+  CHECK(larch::chart_spr_search_detail::local_score_workspace_access::
+            retained_task_dynamic_capacity_bytes(retained_finite_workspace) >
+        0);
+
+  auto tightened_options = retained_finite_options;
+  tightened_options.admission_memory_budget_bytes = 1;
+  auto const tightened_prepared_before =
+      state.counters.lazy_local_prepared_tasks;
+  bool tightened_failed = false;
+  try {
+    larch::score_candidates_locally_into(
+        state, candidates, retained_finite_result, retained_finite_workspace,
+        tightened_options, 1, checked);
+  } catch (larch::chart_spr_search_detail::
+               chart_spr_lazy_local_budget_error const&) {
+    tightened_failed = true;
+  }
+  CHECK(tightened_failed);
+  CHECK(state.counters.lazy_local_prepared_tasks == tightened_prepared_before);
+  CHECK(retained_finite_workspace.operation_boundary_clean());
+  CHECK(larch::chart_spr_search_detail::local_score_workspace_access::
+            retained_task_dynamic_capacity_bytes(retained_finite_workspace) ==
+        0);
 
   // The production finite-grammar boundary must reject an impossible global
   // envelope before rank/batch/enumerator or cold local-slot allocation.

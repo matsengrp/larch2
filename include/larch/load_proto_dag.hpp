@@ -71,7 +71,9 @@ inline constexpr auto field_numbers<larch::dag_data_meta> =
 
 namespace larch {
 
-inline phylo_dag load_proto_dag(std::string_view path) {
+inline phylo_dag load_proto_dag(
+    std::string_view path,
+    std::size_t compact_genome_workers) {
   // Get raw data via mmap (plain .pb) or read_file (.pb.gz)
   std::optional<mmap_file> mf;
   std::vector<char> file_bytes;
@@ -210,7 +212,12 @@ inline phylo_dag load_proto_dag(std::string_view path) {
         ev);
   }
 
-  recompute_compact_genomes(d);
+  if (compact_genome_workers > 1) {
+    (void)recompute_compact_genomes_parallel_tree(
+        d, compact_genome_workers, thread_pool::get_default());
+  } else {
+    recompute_compact_genomes(d);
+  }
 
   // Set sample IDs for leaves without one.
   // Use CG string as base, but disambiguate duplicates so that
@@ -242,6 +249,12 @@ inline phylo_dag load_proto_dag(std::string_view path) {
 
   build_clade_offsets(d);
   return d;
+}
+
+// Preserve the original one-argument API (including exact function-pointer
+// uses); only chart-SPR's explicitly worker-aware loader calls the overload.
+inline phylo_dag load_proto_dag(std::string_view path) {
+  return load_proto_dag(path, 1);
 }
 
 }  // namespace larch

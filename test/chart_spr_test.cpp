@@ -18,6 +18,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -888,6 +889,76 @@ static void test_phase8_binary_taxon_dedup_key_matches_legacy() {
   invalid_added.added_productions.front().parent = larch::temp_clade_ref(
       static_cast<larch::clade_id>(invalid_added.added_clades.size()));
   check_matching_exception(invalid_added);
+
+  std::println("  PASS");
+}
+
+static void test_phase8_grammar_binary_dedup_mode_selection() {
+  std::println("test_phase8_grammar_binary_dedup_mode_selection");
+
+  std::vector<larch::phylo_dag> source_trees;
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree()));
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_cross_tree()));
+  auto dag = larch::test::merge_tiny_trees(std::move(source_trees));
+  auto grammar = larch::build_clade_grammar(dag);
+
+  auto run = [&](std::size_t workers) {
+    auto scheduler = make_projection_scheduler(workers);
+    larch::grammar_spr_enumeration_options options;
+    options.source = larch::chart_spr_candidate_source::grammar;
+    options.max_candidates = 12;
+    options.max_candidates_is_post_dedup = true;
+    options.sampled_tree_projection_scheduler = &scheduler;
+    larch::chart_spr_candidate_generation_stats stats;
+    auto candidates = collect_candidates(grammar, options, &stats);
+    CHECK(scheduler.metrics().pending_tasks == 0);
+    scheduler.shutdown();
+    return std::pair{std::move(candidates), stats};
+  };
+
+  CHECK(std::locale{} == std::locale::classic());
+  auto [w1_candidates, w1_stats] = run(1);
+  auto [w8_candidates, w8_stats] = run(8);
+  CHECK(!w1_candidates.empty());
+  CHECK(w8_candidates.size() == w1_candidates.size());
+  check_legacy_generation_stats_equal(w8_stats, w1_stats);
+  for (std::size_t index = 0; index < w1_candidates.size(); ++index) {
+    check_candidate_payload_equal(grammar, w8_candidates[index],
+                                  w1_candidates[index]);
+  }
+  CHECK(w1_stats.grammar_candidate_binary_taxon_dedup_keys == 0);
+  CHECK(w1_stats.grammar_candidate_text_taxon_dedup_keys > 0);
+  CHECK(w8_stats.grammar_candidate_binary_taxon_dedup_keys ==
+        w1_stats.grammar_candidate_text_taxon_dedup_keys);
+  CHECK(w8_stats.grammar_candidate_text_taxon_dedup_keys == 0);
+
+  struct grouped_taxon_ids : std::numpunct<char> {
+   protected:
+    char do_thousands_sep() const override { return '_'; }
+    std::string do_grouping() const override { return "\3"; }
+  };
+  struct restore_global_locale {
+    std::locale previous;
+    ~restore_global_locale() { std::locale::global(previous); }
+  };
+  auto localized = [&] {
+    restore_global_locale restore{std::locale{}};
+    std::locale::global(
+        std::locale{std::locale::classic(), new grouped_taxon_ids});
+    return run(8);
+  }();
+  auto& [localized_candidates, localized_stats] = localized;
+  CHECK(localized_candidates.size() == w1_candidates.size());
+  check_legacy_generation_stats_equal(localized_stats, w1_stats);
+  for (std::size_t index = 0; index < w1_candidates.size(); ++index) {
+    check_candidate_payload_equal(grammar, localized_candidates[index],
+                                  w1_candidates[index]);
+  }
+  CHECK(localized_stats.grammar_candidate_binary_taxon_dedup_keys == 0);
+  CHECK(localized_stats.grammar_candidate_text_taxon_dedup_keys ==
+        w1_stats.grammar_candidate_text_taxon_dedup_keys);
 
   std::println("  PASS");
 }
@@ -2043,6 +2114,96 @@ static void test_phase8_parallel_grammar_stop_reservoir_and_failure() {
   auto recovered = collect_candidates(grammar, failure_options);
   CHECK(!recovered.empty());
   CHECK(failure_scheduler.metrics().pending_tasks == 0);
+
+  std::println("  PASS");
+}
+
+static void test_phase8_production_small_grammar_waves_run_inline() {
+  std::println("test_phase8_production_small_grammar_waves_run_inline");
+
+  std::vector<larch::phylo_dag> source_trees;
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_base_tree()));
+  source_trees.push_back(
+      larch::test::make_tiny_labelled_tree("A", four_taxon_cross_tree()));
+  auto dag = larch::test::merge_tiny_trees(std::move(source_trees));
+  auto grammar = larch::build_clade_grammar(dag);
+
+  auto run = [&](std::size_t minimum_grain, std::mutex& handoff) {
+    larch::chart_scheduler scheduler{
+        larch::chart_scheduler_options{
+            .requested_workers = 8,
+            .default_minimum_grain = minimum_grain,
+            .default_target_ranges_per_worker = 4},
+        larch::chart_worker_topology_snapshot{
+            .affinity_logical_cpu_count = 8,
+            .affinity_physical_core_count = 8,
+            .hardware_thread_count = 8}};
+    larch::grammar_spr_enumeration_options options;
+    options.source = larch::chart_spr_candidate_source::grammar;
+    options.max_candidates = 64;
+    options.max_candidates_is_post_dedup = true;
+    options.grammar_candidate_maximum_wave_size = 32;
+    options.sampled_tree_projection_scheduler = &scheduler;
+    options.sampled_tree_projection_scheduler_handoff_mutex = &handoff;
+    larch::chart_spr_candidate_generation_stats stats;
+    auto candidates = collect_candidates(grammar, options, &stats);
+    auto const metrics = scheduler.metrics();
+    CHECK(metrics.pending_tasks == 0);
+    scheduler.shutdown();
+    return std::tuple{std::move(candidates), stats, metrics};
+  };
+
+  std::mutex scheduled_handoff;
+  auto [scheduled_candidates, scheduled_stats, scheduled_metrics] =
+      run(1, scheduled_handoff);
+  CHECK(!scheduled_candidates.empty());
+  CHECK(scheduled_stats.grammar_candidate_construction_waves > 0);
+  CHECK(scheduled_stats.grammar_candidate_scheduler_operations ==
+        scheduled_stats.grammar_candidate_construction_waves);
+  CHECK(scheduled_stats.grammar_candidate_parallel_operations > 0);
+  CHECK(scheduled_metrics.operations ==
+        scheduled_stats.grammar_candidate_scheduler_operations);
+
+  std::mutex inline_handoff;
+  auto [inline_candidates, inline_stats, inline_metrics] =
+      run(64, inline_handoff);
+  CHECK(inline_candidates.size() == scheduled_candidates.size());
+  check_legacy_generation_stats_equal(inline_stats, scheduled_stats);
+  for (std::size_t index = 0; index < inline_candidates.size(); ++index) {
+    check_candidate_payload_equal(grammar, inline_candidates[index],
+                                  scheduled_candidates[index]);
+  }
+  CHECK(inline_stats.grammar_candidate_construction_waves ==
+        scheduled_stats.grammar_candidate_construction_waves);
+  CHECK(inline_stats.grammar_candidate_scheduler_operations == 0);
+  CHECK(inline_stats.grammar_candidate_parallel_operations == 0);
+  CHECK(inline_stats.grammar_candidate_ranges == 0);
+  CHECK(inline_stats.grammar_candidate_worker_tasks == 0);
+  CHECK(inline_stats.grammar_candidate_active_worker_high_water == 0);
+  CHECK(inline_stats.grammar_candidate_scheduler_handoff_stall_nanoseconds ==
+        0);
+  CHECK(inline_stats.grammar_candidate_peak_wave_size <= 32);
+  CHECK(inline_stats.grammar_candidate_admitted_wave_width == 32);
+  CHECK(inline_stats.grammar_candidate_speculative_discarded ==
+        scheduled_stats.grammar_candidate_speculative_discarded);
+  CHECK(inline_stats.grammar_candidate_actual_peak_bytes ==
+        scheduled_stats.grammar_candidate_actual_peak_bytes);
+  CHECK(inline_stats.grammar_candidate_cancellations ==
+        scheduled_stats.grammar_candidate_cancellations);
+  CHECK(inline_metrics.operations == 0);
+  CHECK(inline_metrics.tasks_submitted == 0);
+
+  std::mutex repeated_handoff;
+  auto [repeated_candidates, repeated_stats, repeated_metrics] =
+      run(64, repeated_handoff);
+  CHECK(repeated_candidates.size() == inline_candidates.size());
+  check_exhaustive_generation_work_equal(repeated_stats, inline_stats);
+  for (std::size_t index = 0; index < inline_candidates.size(); ++index) {
+    check_candidate_payload_equal(grammar, repeated_candidates[index],
+                                  inline_candidates[index]);
+  }
+  CHECK(repeated_metrics.operations == 0);
 
   std::println("  PASS");
 }
@@ -4026,6 +4187,7 @@ static void test_multisite_exact_vs_lower_bound_labels() {
 int main() {
   test_overlay_temp_clades_and_single_site_score();
   test_phase8_binary_taxon_dedup_key_matches_legacy();
+  test_phase8_grammar_binary_dedup_mode_selection();
   test_local_recompute_matches_full_rebuild();
   test_grammar_native_candidate_enumeration();
   test_projected_tree_spr_matches_apply_spr_move();
@@ -4037,6 +4199,7 @@ int main() {
   test_phase8_parallel_postprocessing_gather_matches_w1();
   test_phase8_grammar_and_hybrid_worker_seed_matrix();
   test_phase8_parallel_grammar_stop_reservoir_and_failure();
+  test_phase8_production_small_grammar_waves_run_inline();
   test_phase8_sampled_hybrid_reservoir_worker_seed_matrix();
   test_phase8_projection_budget_and_failure_atomicity();
   test_phase8_midwave_stop_preserves_legacy_counters();

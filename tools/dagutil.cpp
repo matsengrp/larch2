@@ -44,6 +44,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace larch;
@@ -3365,6 +3366,32 @@ static void print_chart_spr_search_counter_fields(
         << counters.lazy_chart_inside_workspace_evictions << "\n";
     out << indent << "lazy_chart_outside_workspace_evictions: "
         << counters.lazy_chart_outside_workspace_evictions << "\n";
+    out << indent << "lazy_chart_inside_dependency_ready_executions: "
+        << counters.lazy_chart_inside_dependency_ready_executions << "\n";
+    out << indent << "lazy_chart_outside_dependency_ready_executions: "
+        << counters.lazy_chart_outside_dependency_ready_executions << "\n";
+    out << indent << "lazy_chart_inside_dependency_ready_jobs: "
+        << counters.lazy_chart_inside_dependency_ready_jobs << "\n";
+    out << indent << "lazy_chart_outside_dependency_ready_jobs: "
+        << counters.lazy_chart_outside_dependency_ready_jobs << "\n";
+    out << indent
+        << "lazy_chart_inside_dependency_ready_scheduler_operations: "
+        << counters.lazy_chart_inside_dependency_ready_scheduler_operations
+        << "\n";
+    out << indent
+        << "lazy_chart_outside_dependency_ready_scheduler_operations: "
+        << counters.lazy_chart_outside_dependency_ready_scheduler_operations
+        << "\n";
+    out << indent
+        << "lazy_chart_inside_dependency_ready_capacity_resident_bytes_max: "
+        << counters
+               .lazy_chart_inside_dependency_ready_capacity_resident_bytes_max
+        << "\n";
+    out << indent
+        << "lazy_chart_outside_dependency_ready_capacity_resident_bytes_max: "
+        << counters
+               .lazy_chart_outside_dependency_ready_capacity_resident_bytes_max
+        << "\n";
     out << indent << "lazy_chart_preflight_peak_bytes: "
         << counters.lazy_chart_preflight_peak_bytes << "\n";
     out << indent << "lazy_chart_actual_peak_bytes: "
@@ -3455,6 +3482,12 @@ static void print_chart_spr_search_counter_fields(
       << "\n";
   out << indent << "lazy_local_memory_limited_waves: "
       << counters.lazy_local_memory_limited_waves << "\n";
+  out << indent << "lazy_local_requested_concurrency_max: "
+      << counters.lazy_local_requested_concurrency_max << "\n";
+  out << indent << "lazy_local_effective_concurrency_max: "
+      << counters.lazy_local_effective_concurrency_max << "\n";
+  out << indent << "lazy_local_bandwidth_capped_batches: "
+      << counters.lazy_local_bandwidth_capped_batches << "\n";
   out << indent << "lazy_local_admitted_concurrency_max: "
       << counters.lazy_local_admitted_concurrency_max << "\n";
   out << indent
@@ -3923,6 +3956,10 @@ static void print_chart_spr_generation_stats(
       << stats.grammar_candidate_scheduler_handoff_stall_nanoseconds << "\n";
   out << indent << "grammar_candidate_cancellations: "
       << stats.grammar_candidate_cancellations << "\n";
+  out << indent << "grammar_candidate_binary_taxon_dedup_keys: "
+      << stats.grammar_candidate_binary_taxon_dedup_keys << "\n";
+  out << indent << "grammar_candidate_text_taxon_dedup_keys: "
+      << stats.grammar_candidate_text_taxon_dedup_keys << "\n";
   out << indent << "candidate_pipeline_batches_generated: "
       << stats.candidate_pipeline_batches_generated << "\n";
   out << indent << "candidate_pipeline_batches_scored: "
@@ -4745,6 +4782,34 @@ static void run_chart_spr_search_diagnostic(
         << search.summary.lazy_chart_inside_workspace_evictions << "\n";
     out << "  lazy_chart_outside_workspace_evictions: "
         << search.summary.lazy_chart_outside_workspace_evictions << "\n";
+    out << "  lazy_chart_inside_dependency_ready_executions: "
+        << search.summary.lazy_chart_inside_dependency_ready_executions
+        << "\n";
+    out << "  lazy_chart_outside_dependency_ready_executions: "
+        << search.summary.lazy_chart_outside_dependency_ready_executions
+        << "\n";
+    out << "  lazy_chart_inside_dependency_ready_jobs: "
+        << search.summary.lazy_chart_inside_dependency_ready_jobs << "\n";
+    out << "  lazy_chart_outside_dependency_ready_jobs: "
+        << search.summary.lazy_chart_outside_dependency_ready_jobs << "\n";
+    out << "  lazy_chart_inside_dependency_ready_scheduler_operations: "
+        << search.summary
+               .lazy_chart_inside_dependency_ready_scheduler_operations
+        << "\n";
+    out << "  lazy_chart_outside_dependency_ready_scheduler_operations: "
+        << search.summary
+               .lazy_chart_outside_dependency_ready_scheduler_operations
+        << "\n";
+    out
+        << "  lazy_chart_inside_dependency_ready_capacity_resident_bytes_max: "
+        << search.summary
+               .lazy_chart_inside_dependency_ready_capacity_resident_bytes_max
+        << "\n";
+    out
+        << "  lazy_chart_outside_dependency_ready_capacity_resident_bytes_max: "
+        << search.summary
+               .lazy_chart_outside_dependency_ready_capacity_resident_bytes_max
+        << "\n";
     out << "  lazy_chart_preflight_peak_bytes: "
         << search.summary.lazy_chart_preflight_peak_bytes << "\n";
     out << "  lazy_chart_actual_peak_bytes: "
@@ -4812,6 +4877,12 @@ static void run_chart_spr_search_diagnostic(
       << search.summary.lazy_local_parallel_waves << "\n";
   out << "  lazy_local_memory_limited_waves: "
       << search.summary.lazy_local_memory_limited_waves << "\n";
+  out << "  lazy_local_requested_concurrency_max: "
+      << search.summary.lazy_local_requested_concurrency_max << "\n";
+  out << "  lazy_local_effective_concurrency_max: "
+      << search.summary.lazy_local_effective_concurrency_max << "\n";
+  out << "  lazy_local_bandwidth_capped_batches: "
+      << search.summary.lazy_local_bandwidth_capped_batches << "\n";
   out << "  lazy_local_admitted_concurrency_max: "
       << search.summary.lazy_local_admitted_concurrency_max << "\n";
   out << "  lazy_local_prepared_tasks: "
@@ -5282,6 +5353,315 @@ static void print_arity_gate_throw_counters(std::ostream& out) {
   }
 }
 
+// A proper rooted tree with unique leaf identities needs none of merge's
+// label deduplication, fragment reconnection, or alternative trimming.  Prove
+// that narrow case, then rebuild only its physical node/edge order exactly as
+// merge::build_result would.  The lightweight normalization is important:
+// protobuf loading does not preserve merge-assigned IDs, while grammar witness
+// diagnostics and admission arrays intentionally expose those IDs.
+enum class chart_spr_single_input_normalization {
+  not_identity,
+  normalized_needs_edge_recompute,
+  normalized_canonical_edges,
+};
+
+enum class chart_spr_edge_map_provenance {
+  unknown,
+  compact_genomes_derived_from_edge_maps,
+  edge_maps_derived_from_compact_genomes,
+};
+
+static chart_spr_single_input_normalization
+chart_spr_normalize_single_input_merge_identity(args const& a,
+                                                phylo_dag& dag,
+                                                chart_spr_edge_map_provenance
+                                                    edge_map_provenance) {
+  using result = chart_spr_single_input_normalization;
+  if (!a.chart_spr_search || a.print_rf_distance || !a.rf.empty() ||
+      !is_tree(dag)) {
+    return result::not_identity;
+  }
+
+  auto const root_idx = get_root_idx(dag);
+  struct input_child_edge {
+    std::size_t child;
+    std::size_t clade;
+  };
+  std::unordered_set<std::string> leaf_ids;
+  std::unordered_set<std::size_t> reachable;
+  std::unordered_map<std::size_t, std::vector<input_child_edge>>
+      children_by_node;
+  std::vector<std::size_t> preorder;
+  std::vector<std::size_t> pending{root_idx};
+
+  while (!pending.empty()) {
+    auto const node_idx = pending.back();
+    pending.pop_back();
+    if (!reachable.insert(node_idx).second) return result::not_identity;
+    preorder.push_back(node_idx);
+
+    auto const root = node_idx == root_idx;
+    bool ua_kind = false;
+    bool leaf_kind = false;
+    bool inner_kind = false;
+    std::size_t parent_count = 0;
+    std::size_t child_count = 0;
+    std::string_view sample_id;
+    auto& children = children_by_node[node_idx];
+
+    std::visit(
+        [&](auto node) {
+          using node_view_type = std::remove_cvref_t<decltype(node)>;
+          ua_kind = std::is_same_v<node_view_type,
+                                   node_view<phylo_dag, node_kind::ua>>;
+          leaf_kind = std::is_same_v<node_view_type,
+                                     node_view<phylo_dag, node_kind::leaf>>;
+          inner_kind = std::is_same_v<node_view_type,
+                                      node_view<phylo_dag, node_kind::inner>>;
+          for (auto unused : node.get_parents()) {
+            (void)unused;
+            ++parent_count;
+          }
+          for (auto edge_variant : node.get_children()) {
+            std::visit(
+                [&](auto edge) {
+                  ++child_count;
+                  std::visit([&](auto child) {
+                    children.push_back(
+                        {child.index(), edge.clade_index()});
+                    pending.push_back(child.index());
+                  }, edge.get_child());
+                },
+                edge_variant);
+          }
+          if constexpr (requires { node.sample_id(); }) {
+            sample_id = node.sample_id();
+          }
+        },
+        dag.get_node(node_idx));
+
+    if (root) {
+      if (!ua_kind || parent_count != 0 || child_count != 1)
+        return result::not_identity;
+    } else if (parent_count != 1) {
+      return result::not_identity;
+    }
+
+    auto const structurally_leaf = child_count == 0;
+    if (structurally_leaf) {
+      if (!leaf_kind || sample_id.empty() ||
+          !leaf_ids.emplace(sample_id).second) {
+        return result::not_identity;
+      }
+    } else if (!root && (!inner_kind || child_count < 2)) {
+      return result::not_identity;
+    }
+  }
+
+  if (reachable.size() != node_count(dag) || leaf_ids.empty()) {
+    return result::not_identity;
+  }
+
+  // For one proper tree, the local merge inserts every non-UA node in this
+  // exact DFS postorder and build_result assigns their new indices 1..N-1
+  // after the newly appended UA at index zero. Retain the order for the
+  // allocation-light physical normalization below.
+  std::vector<std::size_t> merge_postorder;
+  merge_postorder.reserve(preorder.size());
+  std::vector<std::pair<std::size_t, bool>> merge_stack{{root_idx, false}};
+  while (!merge_stack.empty()) {
+    auto const [node_idx, expanded] = merge_stack.back();
+    if (expanded) {
+      merge_stack.pop_back();
+      merge_postorder.push_back(node_idx);
+      continue;
+    }
+    merge_stack.back().second = true;
+    auto const& children = children_by_node.at(node_idx);
+    for (auto child = children.rbegin(); child != children.rend(); ++child) {
+      merge_stack.emplace_back(child->child, false);
+    }
+  }
+  if (merge_postorder.size() != reachable.size() ||
+      merge_postorder.back() != root_idx) {
+    return result::not_identity;
+  }
+
+  // For a single input, merge's global leaf ordinals are assigned while its
+  // locally deduplicated nodes are iterated in stable DFS postorder.
+  // Child subtrees have disjoint, nonempty ordinal sets, so their
+  // lexicographic order is determined by their distinct minimum ordinals.
+  // This validates merge's rebuilt clade order without retaining every
+  // subtree leaf set.
+  std::unordered_map<std::size_t, std::size_t> minimum_leaf_ordinal;
+  std::size_t next_leaf_ordinal = 0;
+  for (auto const node_idx : merge_postorder) {
+    auto const& children = children_by_node.at(node_idx);
+    if (children.empty()) {
+      minimum_leaf_ordinal.emplace(node_idx, next_leaf_ordinal++);
+      continue;
+    }
+
+    std::vector<std::pair<std::size_t, std::size_t>> ordered_clades;
+    ordered_clades.reserve(children.size());
+    for (auto const& edge : children) {
+      auto const child_minimum = minimum_leaf_ordinal.find(edge.child);
+      if (child_minimum == minimum_leaf_ordinal.end()) {
+        return result::not_identity;
+      }
+      ordered_clades.emplace_back(child_minimum->second, edge.clade);
+    }
+    std::ranges::sort(ordered_clades);
+    for (std::size_t expected = 0; expected < ordered_clades.size();
+         ++expected) {
+      if (ordered_clades[expected].second != expected) {
+        return result::not_identity;
+      }
+      if (expected != 0 &&
+          ordered_clades[expected - 1].first ==
+              ordered_clades[expected].first) {
+        return result::not_identity;
+      }
+    }
+    minimum_leaf_ordinal.emplace(node_idx, ordered_clades.front().first);
+  }
+
+  if (!minimum_leaf_ordinal.contains(root_idx)) return result::not_identity;
+
+  std::vector<std::size_t> source_edge_order;
+  source_edge_order.reserve(edge_count(dag));
+  std::optional<std::size_t> source_root_edge;
+  for (auto edge_variant : dag.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          source_edge_order.push_back(edge.index());
+          auto const parent_idx = std::visit(
+              [](auto parent) { return parent.index(); }, edge.get_parent());
+          if (parent_idx == root_idx) source_root_edge = edge.index();
+        },
+        edge_variant);
+  }
+  if (!source_root_edge || source_edge_order.size() != edge_count(dag)) {
+    return result::not_identity;
+  }
+
+  // All supported single-input loaders either derive each unique-parent
+  // child's compact genome by applying this edge map, or derive the edge map
+  // from the endpoint genomes. Under that lifecycle, absent positions inherit
+  // the parent and cannot hide a transition. Certify only the stored records;
+  // malformed parent bases and no-op records retain the exact full fallback.
+  bool source_edges_are_canonical =
+      edge_map_provenance ==
+      chart_spr_edge_map_provenance::edge_maps_derived_from_compact_genomes;
+  compact_genome const reference_cg;
+  auto const& reference = get_reference_sequence(dag);
+  for (auto source_edge_idx : source_edge_order) {
+    if (edge_map_provenance != chart_spr_edge_map_provenance::
+                                   compact_genomes_derived_from_edge_maps) {
+      break;
+    }
+    source_edges_are_canonical = true;
+    std::visit(
+        [&](auto edge) {
+          auto const* parent_cg = &reference_cg;
+          std::visit(
+              [&](auto parent) {
+                if constexpr (requires { parent.cg(); }) {
+                  parent_cg = &parent.cg();
+                }
+              },
+              edge.get_parent());
+          auto const* child_cg = &reference_cg;
+          std::visit(
+              [&](auto child) {
+                if constexpr (requires { child.cg(); }) {
+                  child_cg = &child.cg();
+                }
+              },
+              edge.get_child());
+          for (auto const& [position, bases] : edge.mutations()) {
+            auto const parent_base = parent_cg->get_base(position, reference);
+            auto const child_base = child_cg->get_base(position, reference);
+            if (!(bases.first == parent_base) ||
+                !(bases.second == child_base) ||
+                bases.first == bases.second) {
+              source_edges_are_canonical = false;
+              return;
+            }
+          }
+        },
+        dag.get_edge(source_edge_idx));
+    if (!source_edges_are_canonical) break;
+  }
+
+  phylo_dag normalized;
+  std::vector<std::size_t> old_to_new(dag.node_high_mark(), no_idx);
+  auto normalized_ua = normalized.append_node<node_kind::ua>();
+  normalized_ua.reference_sequence() =
+      std::move(dag.get_root_as<node_kind::ua>().reference_sequence());
+  normalized.set_root(normalized_ua);
+  old_to_new[root_idx] = normalized_ua.index();
+
+  // process_dag_locally inserts non-UA node labels in merge_postorder;
+  // build_result then appends them after UA in that same insertion order.
+  for (auto source_idx : merge_postorder) {
+    if (source_idx == root_idx) continue;
+    std::visit(
+        [&](auto source) {
+          using source_type = std::remove_cvref_t<decltype(source)>;
+          if constexpr (std::is_same_v<
+                            source_type,
+                            node_view<phylo_dag, node_kind::leaf>>) {
+            auto destination = normalized.append_node<node_kind::leaf>();
+            destination.cg() = std::move(source.cg());
+            destination.sample_id() = std::move(source.sample_id());
+            old_to_new[source_idx] = destination.index();
+          } else if constexpr (std::is_same_v<
+                                   source_type,
+                                   node_view<phylo_dag, node_kind::inner>>) {
+            auto destination = normalized.append_node<node_kind::inner>();
+            destination.cg() = std::move(source.cg());
+            old_to_new[source_idx] = destination.index();
+          }
+        },
+        dag.get_node(source_idx));
+    if (old_to_new[source_idx] == no_idx) return result::not_identity;
+  }
+
+  auto append_normalized_edge = [&](std::size_t source_edge_idx) {
+    std::visit(
+        [&](auto source) {
+          auto destination = normalized.append_edge<edge_kind::clade>();
+          destination.mutations() = std::move(source.mutations());
+          destination.clade_index() = source.clade_index();
+          destination.edge_weight() = source.edge_weight();
+          auto const source_parent = std::visit(
+              [](auto parent) { return parent.index(); }, source.get_parent());
+          auto const source_child = std::visit(
+              [](auto child) { return child.index(); }, source.get_child());
+          auto parent = normalized.get_node(old_to_new[source_parent]);
+          auto child = normalized.get_node(old_to_new[source_child]);
+          std::visit([&](auto node) { destination.set_parent(node); }, parent);
+          std::visit([&](auto node) { destination.set_child(node); }, child);
+        },
+        dag.get_edge(source_edge_idx));
+  };
+
+  // build_result appends the unique UA edge first, then the ordinary edges in
+  // their stable source insertion order.
+  append_normalized_edge(*source_root_edge);
+  for (auto source_edge_idx : source_edge_order) {
+    if (source_edge_idx != *source_root_edge) {
+      append_normalized_edge(source_edge_idx);
+    }
+  }
+
+  dag = std::move(normalized);
+  return source_edges_are_canonical
+             ? result::normalized_canonical_edges
+             : result::normalized_needs_edge_recompute;
+}
+
 int main(int argc, char** argv) try {
   auto a = parse_args(argc, argv);
 
@@ -5327,11 +5707,49 @@ int main(int argc, char** argv) try {
   }
 
   // ---- Merge ----
-  auto const& ref = get_reference_sequence(dags.front());
-  merge m{ref};
-  for (auto& dag : dags) m.add_dag(dag);
+  std::unique_ptr<merge> merger;
+  phylo_dag* result_ptr = nullptr;
+  bool single_input_merge_fast_path = false;
+  auto single_input_normalization =
+      chart_spr_single_input_normalization::not_identity;
+  if (dags.size() == 1) {
+    auto edge_map_provenance = chart_spr_edge_map_provenance::unknown;
+    if (!a.vcf.empty() || a.fastas.size() == 1) {
+      // VCF application and FASTA/Newick loading both finish by deriving the
+      // complete edge maps from endpoint compact genomes.
+      edge_map_provenance =
+          chart_spr_edge_map_provenance::edge_maps_derived_from_compact_genomes;
+    } else if (a.dag_pbs.size() == 1 || a.tree_pbs.size() == 1) {
+      // Both protobuf loaders derive every compact genome from its unique
+      // parent edge. In that lifecycle, a stored-record certificate is enough
+      // to prove that no transition can be absent from the edge map.
+      edge_map_provenance =
+          chart_spr_edge_map_provenance::compact_genomes_derived_from_edge_maps;
+    }
+    single_input_normalization = chart_spr_normalize_single_input_merge_identity(
+        a, dags.front(), edge_map_provenance);
+  }
+  if (single_input_normalization !=
+      chart_spr_single_input_normalization::not_identity) {
+    // merge::build_result canonicalizes edge mutations from compact genomes.
+    // A certified loader map already has those exact bytes; malformed/no-op
+    // annotations retain the historical full union-map recomputation.
+    if (single_input_normalization ==
+        chart_spr_single_input_normalization::
+            normalized_needs_edge_recompute) {
+      recompute_edge_mutations(dags.front());
+    }
+    build_clade_offsets(dags.front());
+    result_ptr = &dags.front();
+    single_input_merge_fast_path = true;
+  } else {
+    auto const& ref = get_reference_sequence(dags.front());
+    merger = std::make_unique<merge>(ref);
+    for (auto& dag : dags) merger->add_dag(dag);
+    result_ptr = &merger->get_result();
+  }
 
-  auto& result = m.get_result();
+  auto& result = *result_ptr;
   auto root_idx = get_root_idx(result);
 
   std::cout << "leaves: " << leaf_count(result) << "\n";
@@ -5425,6 +5843,10 @@ int main(int argc, char** argv) try {
     auto& refinement = get_chart_refinement();
     run_chart_spr_search_diagnostic(
         std::cout, result, refinement, a);
+    // Emit this only after a successful chart search. In particular, the
+    // frozen pre-report high-arity refusal keeps its exact three-line stdout.
+    std::cout << "single_input_merge_fast_path: "
+              << (single_input_merge_fast_path ? "true" : "false") << "\n";
     root_idx = get_root_idx(result);
     chart_refinement_cache.reset();
     exact_patterns_cache.reset();
@@ -6037,7 +6459,8 @@ int main(int argc, char** argv) try {
     }
 
     if (a.print_rf_distance) {
-      sum_rf_distance_ops rf_ops{m, m};
+      assert(merger != nullptr);
+      sum_rf_distance_ops rf_ops{*merger, *merger};
       sum_rf_distance srf(rf_ops);
       weight_accumulator<sum_rf_distance> wa_rf(srf);
       subtree_weight<weight_accumulator<sum_rf_distance>> rf_sw(result, a.seed);
@@ -6227,7 +6650,8 @@ int main(int argc, char** argv) try {
         merge rf_m{get_reference_sequence(rf_dag)};
         rf_m.add_dag(rf_dag);
 
-        sum_rf_distance_ops rf_ops{rf_m, m};
+        assert(merger != nullptr);
+        sum_rf_distance_ops rf_ops{rf_m, *merger};
         sum_rf_distance srf(rf_ops);
         subtree_weight<sum_rf_distance> sw(result, a.seed, mr);
         sw.compute_weight_below(root_idx, srf);

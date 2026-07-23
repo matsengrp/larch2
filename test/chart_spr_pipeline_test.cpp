@@ -443,9 +443,25 @@ void test_full_slot_cancellation_drains_and_recovers() {
   auto input = make_fixture();
   auto options = pipeline_options();
   options.force_candidate_pipeline_cancel_after_scored_batches_for_tests = 1;
+  std::atomic<bool> first_batch_scoring = false;
+  std::atomic<bool> second_batch_published = false;
+  options.after_candidate_pipeline_publish_batch_for_tests =
+      [&](std::size_t sequence) {
+        if (sequence == 0) {
+          while (!first_batch_scoring.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+          }
+        } else if (sequence == 1) {
+          second_batch_published.store(true, std::memory_order_release);
+        }
+      };
   options.before_candidate_pipeline_score_batch_for_tests =
-      [](std::size_t batch) {
-        if (batch == 0) std::this_thread::sleep_for(30ms);
+      [&](std::size_t batch) {
+        if (batch != 0) return;
+        first_batch_scoring.store(true, std::memory_order_release);
+        while (!second_batch_published.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
       };
   auto state = larch::build_chart_spr_search_state(input.dag, input.grammar);
   larch::chart_scheduler scheduler{larch::chart_scheduler_options{
@@ -1002,6 +1018,13 @@ void test_hybrid_width_two_exact_admission_boundary() {
                .empty());
     larch::chart_scheduler outer_scheduler{
         larch::chart_scheduler_options{.requested_workers = 2}};
+    auto const outer_local_concurrency =
+        larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+            outer_scheduler.worker_resolution().resolved_workers,
+            /*candidate_count=*/1,
+            outer_state.active_patterns.patterns.patterns.size());
+    auto const outer_local_task_slots =
+        std::max<std::size_t>(1, outer_local_concurrency.effective_tasks);
     auto outer_enumeration = outer_options.enumeration;
     outer_enumeration.sampled_tree_source_dag = outer_state.dag;
     auto estimate_outer = [&](std::size_t source_width,
@@ -1009,7 +1032,8 @@ void test_hybrid_width_two_exact_admission_boundary() {
                               std::size_t grammar_width) {
       return larch::chart_spr_search_detail::
           estimate_grammar_spr_finite_iteration_memory_envelope(
-              outer_state, 1, 1, 1, true, outer_scheduler, 1,
+              outer_state, 1, 1, 1, true, outer_scheduler,
+              outer_local_task_slots,
               &outer_enumeration, 2, true, source_width, projection_width,
               grammar_width);
     };
@@ -1048,9 +1072,40 @@ void test_hybrid_width_two_exact_admission_boundary() {
     CHECK(outer_source_two.planned_sampled_source_admitted_peak_bytes > 0);
     auto const outer_budget = outer_source_two.planned_required_bytes;
     CHECK(outer_budget > 1);
+    auto const maximal_admitted_grammar_width =
+        [&](std::size_t source_width, std::size_t projection_width,
+            std::size_t budget) {
+          auto const intrinsic_width =
+              estimate_outer(source_width, projection_width, 0)
+                  .planned_grammar_candidate_wave_size;
+          CHECK(intrinsic_width > 0);
+          CHECK(estimate_outer(source_width, projection_width, 1)
+                    .planned_required_bytes <= budget);
+
+          std::size_t low = 1;
+          std::size_t high = intrinsic_width;
+          while (low < high) {
+            auto const midpoint = low + (high - low + 1) / 2;
+            if (estimate_outer(source_width, projection_width, midpoint)
+                    .planned_required_bytes <= budget) {
+              low = midpoint;
+            } else {
+              high = midpoint - 1;
+            }
+          }
+          CHECK(estimate_outer(source_width, projection_width, low)
+                    .planned_required_bytes <= budget);
+          if (low < intrinsic_width) {
+            CHECK(estimate_outer(source_width, projection_width, low + 1)
+                      .planned_required_bytes > budget);
+          }
+          return low;
+        };
 
     // E-1 remains above the irreducible envelope. It must execute normally,
-    // but the unified planner cannot admit the second sampled source.
+    // but the unified planner cannot admit the second sampled source. Grammar
+    // concurrency is then widened independently to the maximum that fits the
+    // selected source/projection widths and E-1.
     auto outer_narrow_options = outer_options;
     outer_narrow_options.cache.memory_budget_bytes = outer_budget - 1;
     std::atomic<std::size_t> outer_narrow_pipeline_starts{0};
@@ -1099,9 +1154,16 @@ void test_hybrid_width_two_exact_admission_boundary() {
         1);
     CHECK(outer_narrow.candidate_generation
               .sampled_tree_projection_admitted_subwave_width == 1);
+    auto const outer_narrow_maximal_grammar_width =
+        maximal_admitted_grammar_width(
+            outer_narrow.candidate_generation
+                .sampled_tree_source_admitted_wave_width,
+            outer_narrow.candidate_generation
+                .sampled_tree_projection_admitted_subwave_width,
+            outer_budget - 1);
     CHECK(outer_narrow.candidate_generation
               .grammar_candidate_admitted_wave_width ==
-          outer_full.planned_grammar_candidate_wave_size);
+          outer_narrow_maximal_grammar_width);
     auto const outer_narrow_plan =
         estimate_outer(outer_narrow.candidate_generation
                            .sampled_tree_source_admitted_wave_width,
@@ -1125,9 +1187,11 @@ void test_hybrid_width_two_exact_admission_boundary() {
           outer_minimum.planned_required_bytes);
     check_scheduler_quiescent(outer_scheduler);
 
-    // Exact E preserves the planner's width-two contract through the hybrid
-    // child's post-dedup cap clearing. It must publish the same empty semantic
-    // result and canonical old-state evidence as the narrowed execution.
+    // Exact E preserves the planner's source-width-two contract through the
+    // hybrid child's post-dedup cap clearing. Grammar concurrency is again the
+    // maximum independently admitted after fixing source/projection widths.
+    // It must publish the same empty semantic result and canonical old-state
+    // evidence as the narrowed execution.
     auto outer_exact_options = outer_options;
     outer_exact_options.cache.memory_budget_bytes = outer_budget;
     std::atomic<std::size_t> outer_exact_pipeline_starts{0};
@@ -1178,9 +1242,16 @@ void test_hybrid_width_two_exact_admission_boundary() {
     CHECK(outer_exact.candidate_generation
               .sampled_tree_projection_admitted_subwave_width ==
           outer_source_two.planned_sampled_projection_wave_size);
+    auto const outer_exact_maximal_grammar_width =
+        maximal_admitted_grammar_width(
+            outer_exact.candidate_generation
+                .sampled_tree_source_admitted_wave_width,
+            outer_exact.candidate_generation
+                .sampled_tree_projection_admitted_subwave_width,
+            outer_budget);
     CHECK(outer_exact.candidate_generation
               .grammar_candidate_admitted_wave_width ==
-          outer_full.planned_grammar_candidate_wave_size);
+          outer_exact_maximal_grammar_width);
     auto const outer_exact_plan = estimate_outer(
         outer_exact.candidate_generation
             .sampled_tree_source_admitted_wave_width,
@@ -1430,6 +1501,13 @@ void test_finite_admission_exact_boundary() {
       auto exact_state = make_state(exact_input, exact_options);
       larch::chart_scheduler exact_scheduler{
           larch::chart_scheduler_options{.requested_workers = 4}};
+      auto const exact_local_concurrency =
+          larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+              exact_scheduler.worker_resolution().resolved_workers,
+              /*candidate_count=*/1,
+              exact_state.active_patterns.patterns.patterns.size());
+      auto const exact_local_task_slots =
+          std::max<std::size_t>(1, exact_local_concurrency.effective_tasks);
       larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
           exact_workspace;
       auto envelope_options = exact_options.enumeration;
@@ -1444,7 +1522,8 @@ void test_finite_admission_exact_boundary() {
       auto const planned = larch::chart_spr_search_detail::
           estimate_grammar_spr_finite_iteration_memory_envelope(
               exact_state, exact_options.enumeration.max_candidates, 1,
-              ranked_reserve_limit, false, exact_scheduler, 1,
+              ranked_reserve_limit, false, exact_scheduler,
+              exact_local_task_slots,
               &envelope_options, 2, true,
               source == larch::chart_spr_candidate_source::grammar ? 0 : 1,
               source == larch::chart_spr_candidate_source::grammar ? 0 : 1,
@@ -1456,7 +1535,8 @@ void test_finite_admission_exact_boundary() {
         selected_grammar_plan = larch::chart_spr_search_detail::
             estimate_grammar_spr_finite_iteration_memory_envelope(
                 exact_state, exact_options.enumeration.max_candidates, 1,
-                ranked_reserve_limit, false, exact_scheduler, 1,
+                ranked_reserve_limit, false, exact_scheduler,
+                exact_local_task_slots,
                 &envelope_options, 2, true, 0, 0, 0);
         if (selected_grammar_plan.planned_required_bytes > envelope) {
           std::size_t low = 1;
@@ -1468,7 +1548,8 @@ void test_finite_admission_exact_boundary() {
             auto candidate = larch::chart_spr_search_detail::
                 estimate_grammar_spr_finite_iteration_memory_envelope(
                     exact_state, exact_options.enumeration.max_candidates, 1,
-                    ranked_reserve_limit, false, exact_scheduler, 1,
+                    ranked_reserve_limit, false, exact_scheduler,
+                    exact_local_task_slots,
                     &envelope_options, 2, true, 0, 0, midpoint);
             if (candidate.planned_required_bytes <= envelope) {
               low = midpoint;

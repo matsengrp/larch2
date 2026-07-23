@@ -709,6 +709,32 @@ void chart_spr_add_search_state_rebuild_counters(
       rebuild_counters.lazy_chart_inside_workspace_evictions;
   accumulated.lazy_chart_outside_workspace_evictions +=
       rebuild_counters.lazy_chart_outside_workspace_evictions;
+  accumulated.lazy_chart_inside_dependency_ready_executions +=
+      rebuild_counters.lazy_chart_inside_dependency_ready_executions;
+  accumulated.lazy_chart_outside_dependency_ready_executions +=
+      rebuild_counters.lazy_chart_outside_dependency_ready_executions;
+  accumulated.lazy_chart_inside_dependency_ready_jobs +=
+      rebuild_counters.lazy_chart_inside_dependency_ready_jobs;
+  accumulated.lazy_chart_outside_dependency_ready_jobs +=
+      rebuild_counters.lazy_chart_outside_dependency_ready_jobs;
+  accumulated.lazy_chart_inside_dependency_ready_scheduler_operations +=
+      rebuild_counters
+          .lazy_chart_inside_dependency_ready_scheduler_operations;
+  accumulated.lazy_chart_outside_dependency_ready_scheduler_operations +=
+      rebuild_counters
+          .lazy_chart_outside_dependency_ready_scheduler_operations;
+  accumulated.lazy_chart_inside_dependency_ready_capacity_resident_bytes_max =
+      std::max(
+          accumulated
+              .lazy_chart_inside_dependency_ready_capacity_resident_bytes_max,
+          rebuild_counters
+              .lazy_chart_inside_dependency_ready_capacity_resident_bytes_max);
+  accumulated.lazy_chart_outside_dependency_ready_capacity_resident_bytes_max =
+      std::max(
+          accumulated
+              .lazy_chart_outside_dependency_ready_capacity_resident_bytes_max,
+          rebuild_counters
+              .lazy_chart_outside_dependency_ready_capacity_resident_bytes_max);
   accumulated.lazy_chart_preflight_peak_bytes =
       std::max(accumulated.lazy_chart_preflight_peak_bytes,
                rebuild_counters.lazy_chart_preflight_peak_bytes);
@@ -4785,6 +4811,12 @@ void chart_spr_refresh_search_summary_from_counters(
   summary.lazy_local_parallel_waves = counters.lazy_local_parallel_waves;
   summary.lazy_local_memory_limited_waves =
       counters.lazy_local_memory_limited_waves;
+  summary.lazy_local_requested_concurrency_max =
+      counters.lazy_local_requested_concurrency_max;
+  summary.lazy_local_effective_concurrency_max =
+      counters.lazy_local_effective_concurrency_max;
+  summary.lazy_local_bandwidth_capped_batches =
+      counters.lazy_local_bandwidth_capped_batches;
   summary.lazy_local_admitted_concurrency_max =
       counters.lazy_local_admitted_concurrency_max;
   summary.lazy_local_prepared_tasks = counters.lazy_local_prepared_tasks;
@@ -4999,6 +5031,24 @@ void chart_spr_refresh_search_summary_from_counters(
       counters.lazy_chart_inside_workspace_evictions;
   summary.lazy_chart_outside_workspace_evictions =
       counters.lazy_chart_outside_workspace_evictions;
+  summary.lazy_chart_inside_dependency_ready_executions =
+      counters.lazy_chart_inside_dependency_ready_executions;
+  summary.lazy_chart_outside_dependency_ready_executions =
+      counters.lazy_chart_outside_dependency_ready_executions;
+  summary.lazy_chart_inside_dependency_ready_jobs =
+      counters.lazy_chart_inside_dependency_ready_jobs;
+  summary.lazy_chart_outside_dependency_ready_jobs =
+      counters.lazy_chart_outside_dependency_ready_jobs;
+  summary.lazy_chart_inside_dependency_ready_scheduler_operations =
+      counters.lazy_chart_inside_dependency_ready_scheduler_operations;
+  summary.lazy_chart_outside_dependency_ready_scheduler_operations =
+      counters.lazy_chart_outside_dependency_ready_scheduler_operations;
+  summary.lazy_chart_inside_dependency_ready_capacity_resident_bytes_max =
+      counters
+          .lazy_chart_inside_dependency_ready_capacity_resident_bytes_max;
+  summary.lazy_chart_outside_dependency_ready_capacity_resident_bytes_max =
+      counters
+          .lazy_chart_outside_dependency_ready_capacity_resident_bytes_max;
   summary.lazy_chart_preflight_peak_bytes =
       counters.lazy_chart_preflight_peak_bytes;
   summary.lazy_chart_actual_peak_bytes = counters.lazy_chart_actual_peak_bytes;
@@ -5329,12 +5379,16 @@ class lazy_local_wave_operation_guard {
       chart_spr_search_state const& state,
       chart_spr_local_score_workspace& workspace, std::size_t task_count,
       bool release_retained_storage,
-      chart_spr_search_counters& aggregate) noexcept
+      chart_spr_search_counters& aggregate,
+      lazy_local_admission_test_observer* observer,
+      bool verify_capacity_ledger) noexcept
       : state_(state),
         workspace_(workspace),
         task_count_(task_count),
         release_retained_storage_(release_retained_storage),
-        aggregate_(aggregate) {}
+        aggregate_(aggregate),
+        observer_(observer),
+        verify_capacity_ledger_(verify_capacity_ledger) {}
 
   lazy_local_wave_operation_guard(lazy_local_wave_operation_guard const&) =
       delete;
@@ -5347,8 +5401,18 @@ class lazy_local_wave_operation_guard {
       if (release_retained_storage_) {
         local_score_workspace_access::release_task_retained_storage(workspace_,
                                                                     slot);
+        try {
+          (void)local_score_workspace_access::
+              refresh_task_capacity_ledger_slot(workspace_, slot);
+          if (observer_ != nullptr) {
+            ++observer_->task_capacity_ledger_slot_refreshes;
+          }
+        } catch (...) {
+          std::terminate();
+        }
       }
     }
+    verify_ledger_noexcept();
     add_chart_spr_search_counters(state_.counters, aggregate_);
   }
 
@@ -5359,22 +5423,77 @@ class lazy_local_wave_operation_guard {
     counters = {};
   }
 
-  void release_slot(std::size_t slot) noexcept {
+  void release_slot(std::size_t slot) {
     fold_worker(slot);
     local_score_workspace_access::release_task_retained_storage(workspace_,
                                                                 slot);
+    (void)local_score_workspace_access::refresh_task_capacity_ledger_slot(
+        workspace_, slot);
+    if (observer_ != nullptr) {
+      ++observer_->task_capacity_ledger_slot_refreshes;
+    }
+    verify_ledger();
   }
 
-  void release_slots(std::size_t count) noexcept {
+  void release_slots(std::size_t count) {
     for (std::size_t slot = 0; slot < count; ++slot) release_slot(slot);
   }
 
+  void keep_retained_storage_on_success() noexcept {
+    release_retained_storage_ = false;
+  }
+
+  std::size_t refresh_slot(std::size_t slot,
+                           std::size_t* worker_capacity_bytes = nullptr) {
+    auto const capacity =
+        local_score_workspace_access::refresh_task_capacity_ledger_slot(
+            workspace_, slot, worker_capacity_bytes);
+    if (observer_ != nullptr) {
+      ++observer_->task_capacity_ledger_slot_refreshes;
+    }
+    return capacity;
+  }
+
+  void verify_ledger() {
+    if (!verify_capacity_ledger_) return;
+    if (observer_ != nullptr) {
+      ++observer_->task_capacity_ledger_full_walk_verifications;
+    }
+    if (!local_score_workspace_access::verify_task_capacity_ledger(
+            workspace_, task_count_)) {
+      if (observer_ != nullptr) {
+        ++observer_->task_capacity_ledger_mismatches;
+      }
+      throw std::logic_error(
+          "chart SPR lazy-local capacity ledger mismatch");
+    }
+  }
+
  private:
+  void verify_ledger_noexcept() noexcept {
+    if (!verify_capacity_ledger_) return;
+    if (observer_ != nullptr) {
+      ++observer_->task_capacity_ledger_full_walk_verifications;
+    }
+    try {
+      if (local_score_workspace_access::verify_task_capacity_ledger(
+              workspace_, task_count_)) {
+        return;
+      }
+    } catch (...) {
+    }
+    if (observer_ != nullptr) {
+      ++observer_->task_capacity_ledger_mismatches;
+    }
+  }
+
   chart_spr_search_state const& state_;
   chart_spr_local_score_workspace& workspace_;
   std::size_t task_count_;
   bool release_retained_storage_;
   chart_spr_search_counters& aggregate_;
+  lazy_local_admission_test_observer* observer_;
+  bool verify_capacity_ledger_;
 };
 
 }  // namespace
@@ -5390,16 +5509,47 @@ void score_candidates_locally_lazy_waves_into(
   chart_spr_search_counters aggregate;
   if (candidates.empty()) return;
   ++aggregate.candidate_batches_scored;
+  auto const resolved_workers =
+      scheduler == nullptr
+          ? std::size_t{1}
+          : scheduler->worker_resolution().resolved_workers;
+  auto const concurrency = plan_lazy_local_candidate_concurrency(
+      resolved_workers, candidates.size(),
+      state.active_patterns.patterns.patterns.size());
+  if (task_limit != concurrency.effective_tasks) {
+    throw std::logic_error(
+        "chart SPR lazy-local runtime concurrency diverged from admission "
+        "plan");
+  }
   task_limit =
       std::max<std::size_t>(1, std::min(task_limit, candidates.size()));
 
   auto const budget =
       effective_lazy_local_admission_budget_bytes(state, options);
   auto const enforce_budget = budget != 0;
+  auto const retain_finite_task_storage =
+      enforce_budget && options.admission_retain_lazy_local_task_storage;
+  local_score_workspace_access::initialize_task_capacity_ledger(workspace,
+                                                                task_limit);
+  if (options.lazy_local_admission_observer_for_tests != nullptr) {
+    ++options.lazy_local_admission_observer_for_tests
+          ->task_capacity_ledger_initializations;
+  }
   lazy_local_wave_operation_guard operation_guard{
-      state, workspace, task_limit, enforce_budget, aggregate};
+      state,
+      workspace,
+      task_limit,
+      enforce_budget,
+      aggregate,
+      options.lazy_local_admission_observer_for_tests,
+      options.verify_lazy_local_task_capacity_ledger_for_tests};
+  operation_guard.verify_ledger();
+  auto const published_state_resident =
+      options.admission_published_state_resident_bytes
+          ? *options.admission_published_state_resident_bytes
+          : estimate_chart_spr_published_state_resident_bytes(state);
   auto resident_base = local_capacity_checked_add(
-      estimate_chart_spr_published_state_resident_bytes(state),
+      published_state_resident,
       options.admission_additional_resident_bytes,
       "chart SPR lazy-local shared resident capacity");
   resident_base = local_capacity_checked_add(
@@ -5423,16 +5573,8 @@ void score_candidates_locally_lazy_waves_into(
     fail_budget(0, resident_base, budget);
   }
 
-  auto slots_dynamic_capacity = [&](std::size_t count) {
-    std::size_t total = 0;
-    for (std::size_t slot = 0; slot < count; ++slot) {
-      total = local_capacity_checked_add(
-          total,
-          local_score_workspace_access::task_dynamic_capacity_bytes(workspace,
-                                                                    slot),
-          "chart SPR lazy-local retained task slots");
-    }
-    return total;
+  auto slots_dynamic_capacity = [&]() {
+    return local_score_workspace_access::task_capacity_ledger_total(workspace);
   };
   auto runtime_transient_reservation = [](std::size_t count) {
     return local_capacity_checked_multiply(
@@ -5471,10 +5613,10 @@ void score_candidates_locally_lazy_waves_into(
       auto check_preflight = [&]() {
         candidate_preflight_fit fit;
         if (!enforce_budget) return fit;
-        auto const slots_dynamic = slots_dynamic_capacity(task_limit);
+        auto const slots_dynamic = slots_dynamic_capacity();
         auto const old_slot =
-            local_score_workspace_access::task_dynamic_capacity_bytes(workspace,
-                                                                      admitted);
+            local_score_workspace_access::task_capacity_ledger_slot(workspace,
+                                                                    admitted);
         auto const other_slots = slots_dynamic - old_slot;
         auto const preparation_base = local_capacity_checked_add(
             resident_base, slots_dynamic,
@@ -5540,10 +5682,12 @@ void score_candidates_locally_lazy_waves_into(
       worker.reset_for_operation();
       auto const prepare_start = std::chrono::steady_clock::now();
       auto const before_dynamic =
-          local_score_workspace_access::task_dynamic_capacity_bytes(workspace,
-                                                                    admitted);
-      auto const before_slots_dynamic = slots_dynamic_capacity(task_limit);
-      auto const reused_prepared_storage = begin != 0 && before_dynamic != 0;
+          local_score_workspace_access::task_capacity_ledger_slot(workspace,
+                                                                  admitted);
+      auto const before_slots_dynamic = slots_dynamic_capacity();
+      auto const reused_prepared_storage =
+          worker.lazy_local_task_retained_payload &&
+          (begin != 0 || retain_finite_task_storage);
       lazy_local_scratch_preparation_report scratch_report;
       try {
         if (enforce_budget) prepared.reserve_finite_invalid_reason();
@@ -5575,9 +5719,10 @@ void score_candidates_locally_lazy_waves_into(
       }
       prepared.result.local_score_ms =
           chart_spr_elapsed_ms(prepare_start, std::chrono::steady_clock::now());
+      std::size_t worker_dynamic = 0;
       auto const task_dynamic =
-          local_score_workspace_access::task_dynamic_capacity_bytes(workspace,
-                                                                    admitted);
+          operation_guard.refresh_slot(admitted, &worker_dynamic);
+      operation_guard.verify_ledger();
       auto prep_peak = local_capacity_checked_add(
           before_dynamic, task_dynamic,
           "chart SPR lazy-local descriptor preparation peak");
@@ -5586,7 +5731,7 @@ void score_candidates_locally_lazy_waves_into(
         prep_peak = std::max(
             prep_peak,
             local_capacity_checked_add(
-                task_dynamic - worker.dynamic_capacity_bytes(),
+                task_dynamic - worker_dynamic,
                 scratch_report
                     .observed_prepublication_peak_dynamic_capacity_bytes,
                 "chart SPR lazy-local scratch preparation peak"));
@@ -5608,7 +5753,7 @@ void score_candidates_locally_lazy_waves_into(
         // observed old+new preparation high-water before publishing the task.
         // Also fail closed if a frozen-toolchain assumption in the preflight
         // ever underestimates an observed capacity despite a looser budget.
-        auto const after_slots_dynamic = slots_dynamic_capacity(task_limit);
+        auto const after_slots_dynamic = slots_dynamic_capacity();
         projected_stable = local_capacity_checked_add(
             local_capacity_checked_add(
                 resident_base,
@@ -5642,6 +5787,7 @@ void score_candidates_locally_lazy_waves_into(
         fail_budget(candidate_index,
                     std::max(projected_prep_peak, projected_stable), budget);
       }
+      worker.lazy_local_task_retained_payload = true;
       admitted_dynamic = local_capacity_checked_add(
           admitted_dynamic,
           local_capacity_checked_add(
@@ -5672,7 +5818,7 @@ void score_candidates_locally_lazy_waves_into(
     auto const scheduler_operation_peak =
         planned_scheduler_operation_peak(admitted);
     auto const retained_wave_dynamic = local_capacity_checked_add(
-        slots_dynamic_capacity(task_limit), wave_runtime_transient_reservation,
+        slots_dynamic_capacity(), wave_runtime_transient_reservation,
         "chart SPR lazy-local retained wave and worker transients");
     aggregate.lazy_local_peak_projected_resident_bytes =
         std::max(aggregate.lazy_local_peak_projected_resident_bytes,
@@ -5751,12 +5897,16 @@ void score_candidates_locally_lazy_waves_into(
       throw;
     }
 
+    for (std::size_t slot = 0; slot < admitted; ++slot) {
+      operation_guard.refresh_slot(slot);
+    }
+    operation_guard.verify_ledger();
     std::size_t observed_admitted_dynamic = 0;
     for (std::size_t slot = 0; slot < admitted; ++slot) {
       observed_admitted_dynamic = local_capacity_checked_add(
           observed_admitted_dynamic,
           local_capacity_checked_add(
-              local_score_workspace_access::task_dynamic_capacity_bytes(
+              local_score_workspace_access::task_capacity_ledger_slot(
                   workspace, slot),
               runtime_transient_reservation(1),
               "chart SPR lazy-local observed task and worker transient"),
@@ -5765,7 +5915,7 @@ void score_candidates_locally_lazy_waves_into(
     aggregate.lazy_local_peak_admitted_bytes = std::max(
         aggregate.lazy_local_peak_admitted_bytes, observed_admitted_dynamic);
     auto const observed_retained_dynamic = local_capacity_checked_add(
-        slots_dynamic_capacity(task_limit), wave_runtime_transient_reservation,
+        slots_dynamic_capacity(), wave_runtime_transient_reservation,
         "chart SPR lazy-local observed retained worker transients");
     auto const observed_projected = local_capacity_checked_add(
         local_capacity_checked_add(resident_base, observed_retained_dynamic,
@@ -5811,6 +5961,13 @@ void score_candidates_locally_lazy_waves_into(
       prepared.release_operation_borrows();
     }
     begin += admitted;
+  }
+  if (retain_finite_task_storage) {
+    // Reaching this point proves that every published result and every
+    // throw-capable finalization completed. The operation-level measured
+    // capacity checks above bound the retained HWM; the finite iteration
+    // owner separately admits its overlap with later generation stages.
+    operation_guard.keep_retained_storage_on_success();
   }
 }
 
@@ -6763,11 +6920,128 @@ chart_spr_search_detail::estimate_grammar_spr_enumeration_fixed_live_bytes(
 
 std::size_t
 chart_spr_search_detail::estimate_grammar_spr_enumeration_signature_live_bytes(
-    clade_grammar const& grammar, grammar_spr_candidate const& candidate) {
+    clade_grammar const& grammar, grammar_spr_candidate const& candidate,
+    std::size_t encoded_length_prefix_for_tests, bool use_binary_encoding) {
   auto add = [](std::size_t lhs, std::size_t rhs) {
     return chart_spr_checked_cache_bytes_add(
         lhs, rhs, "chart SPR enumeration signature length overflow");
   };
+  auto multiply = [](std::size_t lhs, std::size_t rhs) {
+    return chart_spr_checked_cache_bytes_multiply(
+        lhs, rhs, "chart SPR enumeration signature length overflow");
+  };
+  if (use_binary_encoding) {
+    auto normalized_taxa_count =
+        [](std::vector<taxon_id> const& taxa) noexcept {
+          if (chart_spr_detail::chart_spr_taxa_are_sorted_unique(taxa)) {
+            return taxa.size();
+          }
+          std::size_t count = 0;
+          for (std::size_t index = 0; index < taxa.size(); ++index) {
+            bool appeared_before = false;
+            for (std::size_t previous = 0; previous < index; ++previous) {
+              if (taxa[previous] == taxa[index]) {
+                appeared_before = true;
+                break;
+              }
+            }
+            if (!appeared_before) ++count;
+          }
+          return count;
+        };
+    auto taxa_key_length = [&](std::vector<taxon_id> const& taxa) {
+      return add(sizeof(std::size_t),
+                 multiply(normalized_taxa_count(taxa), sizeof(taxon_id)));
+    };
+    auto required_ref_taxa =
+        [&](overlay_clade_ref ref) -> std::vector<taxon_id> const& {
+      return chart_spr_clade_taxa_for_ref(grammar, candidate, ref);
+    };
+    auto optional_ref_length = [&](overlay_clade_ref ref) {
+      return ref.id == no_clade ? sizeof(std::size_t)
+                                : taxa_key_length(required_ref_taxa(ref));
+    };
+    auto production_length = [&](std::vector<taxon_id> const& parent,
+                                 auto const& children,
+                                 auto&& resolve_child) {
+      auto length = add(taxa_key_length(parent), sizeof(std::size_t));
+      for (auto const& child : children) {
+        length = add(length, taxa_key_length(resolve_child(child)));
+      }
+      return length;
+    };
+
+    auto encoded_length = add(
+        encoded_length_prefix_for_tests,
+        sizeof(chart_spr_detail::chart_spr_binary_taxon_dedup_key_prefix) - 1);
+    encoded_length =
+        add(encoded_length, optional_ref_length(candidate.moved_clade));
+    encoded_length =
+        add(encoded_length, optional_ref_length(candidate.old_parent));
+    encoded_length =
+        add(encoded_length, optional_ref_length(candidate.old_sibling));
+    encoded_length = add(
+        encoded_length,
+        optional_ref_length(candidate.new_sibling_or_target));
+    encoded_length = add(encoded_length, sizeof(std::size_t));
+    for (auto const& clade : candidate.added_clades) {
+      encoded_length = add(encoded_length, taxa_key_length(clade.taxa));
+    }
+
+    encoded_length = add(encoded_length, sizeof(std::size_t));
+    for (auto ref : candidate.removed_productions) {
+      if (ref.space != overlay_id_space::base || ref.id == no_production ||
+          ref.id >= grammar.productions.size()) {
+        throw std::runtime_error(
+            "chart SPR enumeration signature: removed production out of "
+            "range");
+      }
+      auto const& production = grammar.productions[ref.id];
+      if (production.parent == no_clade ||
+          production.parent >= grammar.clades.size()) {
+        throw std::runtime_error(
+            "chart SPR enumeration signature: production parent out of range");
+      }
+      auto const length = production_length(
+          grammar.clades[production.parent].taxa, production.children,
+          [&](clade_id child) -> std::vector<taxon_id> const& {
+            if (child == no_clade || child >= grammar.clades.size()) {
+              throw std::runtime_error(
+                  "chart SPR enumeration signature: production child out of "
+                  "range");
+            }
+            return grammar.clades[child].taxa;
+          });
+      encoded_length =
+          add(encoded_length, add(sizeof(std::size_t), length));
+    }
+
+    encoded_length = add(encoded_length, sizeof(std::size_t));
+    for (auto const& production : candidate.added_productions) {
+      auto const length = production_length(
+          required_ref_taxa(production.parent), production.children,
+          [&](overlay_clade_ref child) -> std::vector<taxon_id> const& {
+            return required_ref_taxa(child);
+          });
+      encoded_length =
+          add(encoded_length, add(sizeof(std::size_t), length));
+    }
+
+    // The binary serializer reserves 256 bytes and may geometrically grow once
+    // more while appending. This is the same frozen-libstdc++ retained-capacity
+    // bound used by sampled-tree admission, specialized to the realized
+    // candidate without allocating a second key in the admission callback.
+    constexpr std::size_t reserve_floor = 256;
+    constexpr std::size_t allocation_quantum = 16;
+    auto allocation_bytes =
+        add(std::max(reserve_floor, multiply(encoded_length, 2)),
+            std::size_t{1});
+    allocation_bytes = add(allocation_bytes, allocation_quantum - 1);
+    allocation_bytes =
+        multiply(allocation_bytes / allocation_quantum, allocation_quantum);
+    return add(sizeof(std::set<std::string>::value_type) + 4 * sizeof(void*),
+               allocation_bytes);
+  }
   auto decimal_digits = [](taxon_id value) noexcept {
     std::size_t digits = 1;
     while (value >= 10) {
@@ -6778,6 +7052,13 @@ chart_spr_search_detail::estimate_grammar_spr_enumeration_signature_live_bytes(
   };
   auto taxa_key_length = [&](std::vector<taxon_id> const& taxa) {
     std::size_t length = 2;  // '{' and '}'
+    if (chart_spr_detail::chart_spr_taxa_are_sorted_unique(taxa)) {
+      for (auto taxon : taxa) {
+        length = add(length, decimal_digits(taxon));
+        length = add(length, 1);  // trailing comma
+      }
+      return length;
+    }
     // Normalization changes ordering and removes duplicates, neither of which
     // requires constructing the normalized vector to calculate encoded size.
     for (std::size_t index = 0; index < taxa.size(); ++index) {
@@ -6811,7 +7092,7 @@ chart_spr_search_detail::estimate_grammar_spr_enumeration_signature_live_bytes(
     return length;
   };
 
-  std::size_t encoded_length = 0;
+  std::size_t encoded_length = encoded_length_prefix_for_tests;
   auto add_literal = [&](std::string_view literal) {
     encoded_length = add(encoded_length, literal.size());
   };
@@ -6899,7 +7180,8 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
     grammar_spr_enumeration_options const* source_options,
     std::size_t candidate_buffer_count, bool include_pipeline_control,
     std::size_t source_wave_size, std::size_t projection_wave_size,
-    std::size_t grammar_candidate_wave_size) {
+    std::size_t grammar_candidate_wave_size,
+    std::optional<std::size_t> published_state_resident_bytes) {
   auto add = [](std::size_t lhs, std::size_t rhs) {
     return chart_spr_checked_cache_bytes_add(
         lhs, rhs, "chart SPR finite grammar iteration envelope overflow");
@@ -6921,6 +7203,14 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
                           : source_options->source;
   auto const resolved_workers =
       scheduler.worker_resolution().resolved_workers;
+  auto published_state_resident_cache = published_state_resident_bytes;
+  auto published_state_resident = [&]() {
+    if (!published_state_resident_cache) {
+      published_state_resident_cache =
+          estimate_chart_spr_published_state_resident_bytes(state);
+    }
+    return *published_state_resident_cache;
+  };
   if (source != chart_spr_candidate_source::grammar && resolved_workers > 1 &&
       std::locale{} != std::locale::classic()) {
     throw std::invalid_argument(
@@ -7024,7 +7314,7 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   auto const sample_signature_capacity =
       string_capacity_bound(sample_signature);
   std::size_t binary_signature_capacity = 0;
-  if (source != chart_spr_candidate_source::grammar && resolved_workers > 1) {
+  if (resolved_workers > 1) {
     bool binary_signature_safely_bounded = true;
     binary_signature_capacity = chart_spr_detail::
         estimate_chart_spr_binary_taxon_dedup_key_capacity_bytes(
@@ -7033,7 +7323,7 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
             binary_signature_safely_bounded);
     if (!binary_signature_safely_bounded) {
       throw std::overflow_error(
-          "chart SPR finite sampled dedup signature envelope overflow");
+          "chart SPR finite binary dedup signature envelope overflow");
     }
   }
   auto const invalid_reason_capacity =
@@ -7060,9 +7350,13 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
        std::string_view{"no lower-bound-improving candidate"}.size(),
        std::string_view{"no valid locally scored candidates retained"}.size(),
        std::string_view{"no exact-improving verified candidate"}.size()}));
+  auto const grammar_dedup_signature_capacity =
+      resolved_workers > 1
+          ? std::max(numeric_signature_capacity, binary_signature_capacity)
+          : numeric_signature_capacity;
   auto const signature_node =
       add(sizeof(std::set<std::string>::value_type) + 4 * sizeof(void*),
-          numeric_signature_capacity);
+          grammar_dedup_signature_capacity);
   auto sampled_dedup_signature_capacity =
       resolved_workers > 1
           ? std::max(numeric_signature_capacity, binary_signature_capacity)
@@ -7174,45 +7468,17 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
     sampled_waiting = add(sampled_waiting,
                           sampled_wave.error_and_exception_bytes);
   }
-  auto sampled_child_signature_count = candidate_limit;
-  auto grammar_child_signature_count = candidate_limit;
-  if (source == chart_spr_candidate_source::hybrid) {
-    sampled_child_signature_count = multiply(
-        source_options->sampled_tree_count,
-        multiply(sampled_wave.source_count,
-                 sampled_wave.destination_bound_per_source));
-
-    // Each moved child of a source production pairs every upward path from
-    // that production's parent with every upward path from the target. The
-    // immutable plan compiles those production-distinct path counts in one
-    // top-down pass, avoiding an exponential structural surrogate here.
-    auto const path_pair_limit = source_options->max_path_pairs_considered;
-    auto multiply_capped = [&](std::size_t lhs, std::size_t rhs) {
-      if (path_pair_limit == 0) return multiply(lhs, rhs);
-      if (lhs == 0 || rhs == 0) return std::size_t{0};
-      if (lhs > path_pair_limit / rhs) return path_pair_limit;
-      return std::min(path_pair_limit, lhs * rhs);
-    };
-    auto add_capped = [&](std::size_t lhs, std::size_t rhs) {
-      if (path_pair_limit == 0) return add(lhs, rhs);
-      if (lhs >= path_pair_limit || rhs >= path_pair_limit - lhs) {
-        return path_pair_limit;
-      }
-      return lhs + rhs;
-    };
-    grammar_child_signature_count = 0;
-    for (auto const& production : state.execution_plan.productions()) {
-      if (production.child_count < 2) continue;
-      auto const source_paths =
-          state.execution_plan.clade(production.parent).upward_path_count;
-      for (auto const& target : state.execution_plan.clades()) {
-        auto pairs = multiply_capped(source_paths, target.upward_path_count);
-        pairs = multiply_capped(production.child_count, pairs);
-        grammar_child_signature_count =
-            add_capped(grammar_child_signature_count, pairs);
-      }
-    }
-  }
+  // A hybrid child clears its own post-dedup cap so duplicates of candidates
+  // emitted by the earlier child do not stop the combined stream too soon.
+  // Its `seen` identity nevertheless has exactly the same equality relation
+  // as the outer hybrid taxon signature, and the outer callback stops the
+  // child synchronously at the global cap. Every child-unique equality class
+  // therefore either belongs to the outer set at child entry or grows that
+  // set; the two disjoint groups contain at most `candidate_limit` classes in
+  // total. Structural source and path-pair visit bounds count
+  // filtered/duplicate visits and are not a retained child-dedup bound.
+  auto const sampled_child_signature_count = candidate_limit;
+  auto const grammar_child_signature_count = candidate_limit;
   auto const sampled_child_dedup =
       multiply(sampled_child_signature_count,
                sampled_dedup_signature_node);
@@ -7229,8 +7495,6 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
       break;
     case chart_spr_candidate_source::hybrid:
       // The outer emitted set persists across both sequential child streams.
-      // Full child visit bounds are required because child-unique signatures
-      // can duplicate the outer set without advancing the global output cap.
       // Sampled and grammar child ownership are temporal alternatives.
       source_owned =
           add(one_dedup_set,
@@ -7253,8 +7517,10 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
           multiply(candidate_clades,
                    sizeof(std::pair<std::vector<taxon_id> const, clade_id>) +
                        4 * sizeof(void*)));
-  auto signature_construction_peak = multiply(
-      8, std::max(numeric_signature_capacity, sample_signature_capacity));
+  auto signature_construction_peak =
+      multiply(8, std::max({numeric_signature_capacity,
+                            sample_signature_capacity,
+                            binary_signature_capacity}));
   signature_construction_peak =
       add(signature_construction_peak,
           doubled_vector(add(removed_productions, candidate_productions),
@@ -7446,7 +7712,10 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
   std::size_t local_task_peak = 0;
   std::size_t untiled_concurrent_preparation_peak = 0;
   std::size_t local_retained_stable_capacity = 0;
+  std::size_t lazy_local_reusable_stable_capacity = 0;
   if (lazy_local) {
+    lazy_local_reusable_stable_capacity =
+        multiply(local_task_slots, local_task.stable_dynamic_capacity_bytes);
     auto const stable_wave = add(
         multiply(local_task_slots, local_task.stable_dynamic_capacity_bytes),
         scheduler_operation);
@@ -7545,14 +7814,24 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
       add(sampled_wave.active_postprocessing_scratch_bytes,
           sampled_wave.postprocessing_scheduler_operation_bytes);
   // A completed dense score retains descriptor, worker, and tile nested
-  // capacities in the reusable local workspace.  Later source-enumeration and
-  // projection stages both overlap that stable HWM. Finite lazy waves release
-  // task storage and leave this component zero.
+  // capacities in the reusable local workspace. Later source-enumeration and
+  // projection stages both overlap that stable HWM. Finite lazy waves use the
+  // cold-release envelope by default; the additive reusable envelope below
+  // admits the same overlap only when the full iteration has enough headroom.
+  auto const generation_stage_peak =
+      std::max({source_active_peak, projection_active_peak,
+                postprocessing_active_peak, grammar_scheduler_operation});
   auto const generation_wave_with_retained_local_peak =
-      add(std::max({source_active_peak, projection_active_peak,
-                    postprocessing_active_peak,
-                    grammar_scheduler_operation}),
-          local_retained_stable_capacity);
+      add(generation_stage_peak, local_retained_stable_capacity);
+  auto saturating_add = [](std::size_t lhs, std::size_t rhs) noexcept {
+    return rhs > (std::numeric_limits<std::size_t>::max)() - lhs
+               ? (std::numeric_limits<std::size_t>::max)()
+               : lhs + rhs;
+  };
+  auto const generation_wave_with_reusable_lazy_local_peak = saturating_add(
+      generation_stage_peak,
+      saturating_add(local_retained_stable_capacity,
+                     lazy_local_reusable_stable_capacity));
   auto const sampled_source_admitted_peak =
       source == chart_spr_candidate_source::grammar
           ? std::size_t{0}
@@ -7560,15 +7839,20 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
                 sampled_wave.source_construction_scratch_bytes;
   auto const generation_transient_peak =
       std::max(serial_overlap_peak, generation_wave_with_retained_local_peak);
+  auto const reusable_generation_transient_peak = std::max(
+      serial_overlap_peak, generation_wave_with_reusable_lazy_local_peak);
+  auto const reusable_future =
+      saturating_add(future, reusable_generation_transient_peak);
   future = add(future, generation_transient_peak);
-  auto generation_phase =
-      add(estimate_chart_spr_published_state_resident_bytes(state),
-          acceptance_outer);
-  generation_phase = add(generation_phase, scheduler_resident);
-  generation_phase = add(generation_phase, pipeline_control);
-  generation_phase = add(generation_phase, exact_input_outer);
-  generation_phase = add(generation_phase, local_workspace);
-  generation_phase = add(generation_phase, future);
+  auto generation_fixed =
+      add(published_state_resident(), acceptance_outer);
+  generation_fixed = add(generation_fixed, scheduler_resident);
+  generation_fixed = add(generation_fixed, pipeline_control);
+  generation_fixed = add(generation_fixed, exact_input_outer);
+  generation_fixed = add(generation_fixed, local_workspace);
+  auto const generation_phase = add(generation_fixed, future);
+  auto const reusable_generation_phase =
+      saturating_add(generation_fixed, reusable_future);
 
   // After enumeration and exact aggregation, ranked/task/workspace storage is
   // explicitly released. Keep only the result capacities that survive into
@@ -7603,17 +7887,24 @@ chart_spr_search_detail::estimate_grammar_spr_finite_iteration_memory_envelope(
         add(post_release_result, ranked_candidate_exact_evidence_bytes);
   }
   auto evidence_phase =
-      add(estimate_chart_spr_published_state_resident_bytes(state),
-          scheduler_resident);
+      add(published_state_resident(), scheduler_resident);
   evidence_phase = add(evidence_phase, post_release_result);
   evidence_phase = add(evidence_phase,
                        canonical_state_exact_evidence.construction_peak_bytes);
   auto const planned = std::max(generation_phase, evidence_phase);
+  auto const reusable_planned =
+      std::max(reusable_generation_phase, evidence_phase);
   return grammar_spr_finite_iteration_memory_envelope{
       .planned_required_bytes = planned,
       .planned_generation_phase_required_bytes = generation_phase,
       .planned_evidence_phase_required_bytes = evidence_phase,
       .future_dynamic_bytes = future,
+      .planned_lazy_local_reusable_required_bytes = reusable_planned,
+      .planned_lazy_local_reusable_generation_phase_required_bytes =
+          reusable_generation_phase,
+      .planned_lazy_local_reusable_future_dynamic_bytes = reusable_future,
+      .planned_lazy_local_reusable_stable_capacity_bytes =
+          lazy_local_reusable_stable_capacity,
       .planned_post_release_result_bytes = post_release_result,
       .planned_ranked_candidate_exact_evidence_bytes =
           ranked_candidate_exact_evidence_bytes,

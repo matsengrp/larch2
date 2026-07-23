@@ -7,6 +7,7 @@
 #include <fstream>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace pb {
@@ -20,6 +21,7 @@ class writer {
   void write_tag(uint32_t field_number, wire_type wt);
   void write_length_prefixed(std::span<const uint8_t> data);
   std::vector<uint8_t> const& data() const;
+  std::vector<uint8_t> take_data() && noexcept;
 };
 
 // Forward declaration
@@ -111,7 +113,7 @@ std::vector<uint8_t> encode(T const& msg) {
   [&]<std::size_t... Is>(std::index_sequence<Is...>) {
     (encode_field(msg.[:get_member<T, Is>():], field_numbers<T>[Is], w), ...);
   }(std::make_index_sequence<member_count<T>()>{});
-  return w.data();
+  return std::move(w).take_data();
 }
 
 // Convenience: encode to file

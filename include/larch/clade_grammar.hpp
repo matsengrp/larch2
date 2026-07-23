@@ -309,8 +309,8 @@ inline reachable_dag_info collect_reachable(phylo_dag& dag) {
 }
 
 struct leaf_observation {
-  std::string sample_id;
-  compact_genome cg;
+  std::string const* sample_id = nullptr;
+  compact_genome const* cg = nullptr;
 };
 
 inline leaf_observation get_leaf_observation(phylo_dag& dag,
@@ -322,7 +322,7 @@ inline leaf_observation get_leaf_observation(phylo_dag& dag,
                         node.sample_id();
                         node.cg();
                       }) {
-          return leaf_observation{std::string{node.sample_id()}, node.cg()};
+          return leaf_observation{&node.sample_id(), &node.cg()};
         } else {
           throw std::runtime_error(
               "clade grammar: expected leaf node with sample_id at node " +
@@ -337,13 +337,17 @@ inline void update_strict_nucleotide_counts(phylo_dag& dag,
                                             clade_grammar_audit& audit) {
   auto const& reference = get_reference_sequence(dag);
   std::vector<bool> reference_is_acgt(reference.size(), false);
+  std::size_t reference_acgt_pass = 0;
+  std::size_t reference_acgt_fail = 0;
   for (std::size_t i = 0; i < reference.size(); ++i) {
     reference_is_acgt[i] = is_acgt_char(reference[i]);
     if (reference_is_acgt[i])
-      ++audit.strict_reference_acgt_pass;
+      ++reference_acgt_pass;
     else
-      ++audit.strict_reference_acgt_fail;
+      ++reference_acgt_fail;
   }
+  audit.strict_reference_acgt_pass += reference_acgt_pass;
+  audit.strict_reference_acgt_fail += reference_acgt_fail;
 
   for (auto node_idx : reachable.nodes) {
     auto nv = dag.get_node(node_idx);
@@ -355,29 +359,31 @@ inline void update_strict_nucleotide_counts(phylo_dag& dag,
                           node.sample_id();
                           node.cg();
                         }) {
-            auto it = node.cg().begin();
-            auto end = node.cg().end();
-            for (mutation_position pos = 1; pos <= reference.size(); ++pos) {
-              while (it != end && it->first < pos) {
-                ++audit.strict_leaf_compact_genome_acgt_fail;
-                ++it;
+            // Begin with the reference classification for every site, then
+            // replace the classification at each in-range compact-genome
+            // mutation. Entries outside the 1-based reference interval remain
+            // one failure each, matching the former position-by-position scan.
+            std::size_t leaf_acgt_pass = reference_acgt_pass;
+            std::size_t leaf_acgt_fail = reference_acgt_fail;
+            for (auto const& [pos, base] : node.cg()) {
+              if (pos == 0 || pos > reference.size()) {
+                ++leaf_acgt_fail;
+                continue;
               }
-              if (it != end && it->first == pos) {
-                if (is_valid_nuc_base(it->second))
-                  ++audit.strict_leaf_compact_genome_acgt_pass;
-                else
-                  ++audit.strict_leaf_compact_genome_acgt_fail;
-                ++it;
-              } else if (reference_is_acgt[pos - 1]) {
-                ++audit.strict_leaf_compact_genome_acgt_pass;
+
+              if (reference_is_acgt[pos - 1]) {
+                --leaf_acgt_pass;
               } else {
-                ++audit.strict_leaf_compact_genome_acgt_fail;
+                --leaf_acgt_fail;
               }
+
+              if (is_valid_nuc_base(base))
+                ++leaf_acgt_pass;
+              else
+                ++leaf_acgt_fail;
             }
-            while (it != end) {
-              ++audit.strict_leaf_compact_genome_acgt_fail;
-              ++it;
-            }
+            audit.strict_leaf_compact_genome_acgt_pass += leaf_acgt_pass;
+            audit.strict_leaf_compact_genome_acgt_fail += leaf_acgt_fail;
           }
         },
         nv);
@@ -387,7 +393,10 @@ inline void update_strict_nucleotide_counts(phylo_dag& dag,
 inline taxon_registry build_taxon_registry(
     phylo_dag& dag, reachable_dag_info const& reachable,
     clade_grammar_options const& options, clade_grammar_audit& audit) {
-  std::map<std::string, compact_genome> sample_to_cg;
+  // The DAG owns leaf annotations for this entire build. Borrow compact
+  // genomes while checking duplicate sample IDs instead of copying each
+  // std::map-backed genome into this temporary registry.
+  std::map<std::string, compact_genome const*> sample_to_cg;
 
   for (auto node_idx : reachable.nodes) {
     auto nv = dag.get_node(node_idx);
@@ -397,21 +406,21 @@ inline taxon_registry build_taxon_registry(
                                std::to_string(node_idx) + " has children");
 
     auto obs = get_leaf_observation(dag, node_idx);
-    if (obs.sample_id.empty())
+    if (obs.sample_id->empty())
       throw std::runtime_error("clade grammar: empty sample_id at leaf node " +
                                std::to_string(node_idx));
 
-    auto [it, inserted] = sample_to_cg.emplace(obs.sample_id, obs.cg);
+    auto [it, inserted] = sample_to_cg.emplace(*obs.sample_id, obs.cg);
     if (!inserted) {
       ++audit.duplicate_sample_id_occurrences;
-      if (!(it->second == obs.cg)) {
+      if (!(*it->second == *obs.cg)) {
         throw std::runtime_error(
-            "clade grammar: duplicate sample_id '" + obs.sample_id +
+            "clade grammar: duplicate sample_id '" + *obs.sample_id +
             "' has conflicting compact genomes");
       }
       if (!options.coalesce_duplicate_sample_ids_with_identical_cg) {
         throw std::runtime_error(
-            "clade grammar: duplicate sample_id '" + obs.sample_id +
+            "clade grammar: duplicate sample_id '" + *obs.sample_id +
             "' encountered and duplicate coalescing is disabled");
       }
     }
@@ -471,10 +480,10 @@ struct node_taxa_computer {
     auto nv = dag.get_node(node_idx);
     if (is_leaf_node(nv)) {
       auto obs = get_leaf_observation(dag, node_idx);
-      auto it = taxa.sample_id_to_id.find(obs.sample_id);
+      auto it = taxa.sample_id_to_id.find(*obs.sample_id);
       if (it == taxa.sample_id_to_id.end())
         throw std::runtime_error("clade grammar: unknown sample_id '" +
-                                 obs.sample_id + "' at leaf node " +
+                                 *obs.sample_id + "' at leaf node " +
                                  std::to_string(node_idx));
       node_taxa[node_idx] = {it->second};
     } else {

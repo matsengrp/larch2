@@ -46,6 +46,14 @@ The run is deterministic: serial local scoring (`local_score_worker_count = 1`,
 the option default) and a fixed `seed = 1`, so two runs on the same commit
 produce byte-identical counters and the splice is idempotent.
 
+The regeneration command is valid only at the frozen Phase-0 product
+revision.  Do not replace this baseline with output from a later optimized
+binary.  When a later phase extends the counter schema, append the new field
+with the value attributable to the frozen Phase-0 behavior (zero for work that
+did not exist there), while keeping every previously frozen value unchanged.
+The compile-only generator test then guards the current field names without
+silently rebasing this historical snapshot.
+
 ## Configuration
 
 - **Fixture:** `data/test_5_trees/tree_0.pb.gz .. tree_4.pb.gz`, merged.
@@ -153,6 +161,17 @@ chart_spr_search_counters:
   local_rows_recomputed:                                       159379494
   local_score_parallel_batches:                                0
   local_score_worker_tasks:                                    0
+  lazy_local_requested_concurrency_max:                        0
+  lazy_local_effective_concurrency_max:                        0
+  lazy_local_bandwidth_capped_batches:                         0
+  lazy_chart_inside_dependency_ready_executions:               0
+  lazy_chart_outside_dependency_ready_executions:              0
+  lazy_chart_inside_dependency_ready_jobs:                     0
+  lazy_chart_outside_dependency_ready_jobs:                    0
+  lazy_chart_inside_dependency_ready_scheduler_operations:     0
+  lazy_chart_outside_dependency_ready_scheduler_operations:    0
+  lazy_chart_inside_dependency_ready_capacity_resident_bytes_max: 0
+  lazy_chart_outside_dependency_ready_capacity_resident_bytes_max: 0
   lazy_local_iteration_generation_phase_bytes_max:             0
   lazy_local_iteration_evidence_phase_bytes_max:               0
   lazy_local_ranked_candidate_exact_evidence_bytes_max:        0

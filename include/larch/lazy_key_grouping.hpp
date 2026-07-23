@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -131,6 +132,7 @@ enum class packed_key_grouping_shape_error_kind : std::uint8_t {
   word_count_mismatch,
   offset_count_overflow,
   resident_capacity_overflow,
+  partition_class_out_of_range,
 };
 
 enum class packed_key_grouping_prepared_status_code : std::uint8_t {
@@ -141,6 +143,7 @@ enum class packed_key_grouping_prepared_status_code : std::uint8_t {
   storage_not_prepared,
   resident_capacity_overflow,
   budget_exceeded,
+  partition_class_out_of_range,
 };
 
 // Fixed-size value result for the scheduled grouping seam. `required` and
@@ -148,9 +151,11 @@ enum class packed_key_grouping_prepared_status_code : std::uint8_t {
 // describe counts for shape/storage failures and bytes for resident/budget
 // failures. `secondary_available` is the result-storage capacity when
 // storage_not_prepared is reported, and the key count for word-count overflow.
-// For resident-capacity overflow, `required == size_t::max()` is a sentinel:
-// the true byte requirement is not representable. Returning this status never
-// allocates exception storage.
+// A published-partition range failure reports the exclusive class cardinality
+// in `required`, the invalid class ID in `available`, and its input index in
+// `secondary_available`. For resident-capacity overflow,
+// `required == size_t::max()` is a sentinel: the true byte requirement is not
+// representable. Returning this status never allocates exception storage.
 struct packed_key_grouping_prepared_status {
   packed_key_grouping_prepared_status_code code =
       packed_key_grouping_prepared_status_code::success;
@@ -267,6 +272,15 @@ inline std::size_t packed_key_word_buffer_resident_bytes(
       "packed lazy-key word-buffer resident");
 }
 
+enum class packed_key_grouping_result_mode : std::uint8_t {
+  // Stable first-occurrence class map and representative only.
+  classes,
+  // `classes` plus deterministic lexicographic class traversal.
+  ordered_classes,
+  // `ordered_classes` plus input-order CSR membership.
+  full,
+};
+
 struct packed_key_grouping_result {
   // Class IDs are assigned by the first input key in each equivalence class.
   std::vector<std::size_t> class_by_input;
@@ -289,6 +303,11 @@ struct packed_key_grouping_result {
       std::size_t class_id) const {
     if (class_id >= class_count()) {
       throw std::out_of_range("packed lazy-key grouping: class out of range");
+    }
+    if (member_offsets_by_class.size() != class_count() + 1 ||
+        members_by_class.size() != class_by_input.size()) {
+      throw std::logic_error(
+          "packed lazy-key grouping: class membership was not materialized");
     }
     auto const begin = member_offsets_by_class[class_id];
     auto const end = member_offsets_by_class[class_id + 1];
@@ -366,6 +385,47 @@ struct packed_key_grouping_result {
   bool operator==(packed_key_grouping_result const&) const = default;
 };
 
+// A small exact fast path can group tuples of already-published partition
+// class maps without first narrowing and materializing a packed-key matrix.
+// Components are ordered most-significant first, so the mixed-radix token has
+// the same order as lexicographic tuple comparison. The optimization is
+// deliberately bounded to at most three components and a token domain no
+// larger than key_count; callers fall back to packed grouping otherwise.
+struct bounded_partition_tuple_view {
+  std::size_t key_count = 0;
+  std::size_t tuple_width = 0;
+  std::array<std::span<std::size_t const>, 3> class_by_input;
+  std::array<std::size_t, 3> class_count;
+};
+
+struct bounded_partition_tuple_grouping_attempt {
+  bool applicable = false;
+  packed_key_grouping_prepared_status status;
+};
+
+// Arbitrary callers retain the transactional optimization-miss contract: every
+// source map is checked before workspace/result mutation. Lazy-chart callers
+// may identify maps that were just published by an exact grouping operation.
+// That stronger contract lets grouping validate each component while building
+// its injective mixed-radix token, avoiding a separate full-map pass.
+enum class bounded_partition_tuple_input_contract : std::uint8_t {
+  arbitrary,
+  published_partitions,
+};
+
+class packed_key_grouping_workspace;
+
+inline bounded_partition_tuple_grouping_attempt
+try_group_bounded_partition_tuple_prepared(
+    bounded_partition_tuple_view tuple,
+    packed_key_grouping_workspace& workspace,
+    packed_key_grouping_result& result,
+    std::size_t admitted_owned_capacity_bytes,
+    packed_key_grouping_result_mode result_mode =
+        packed_key_grouping_result_mode::full,
+    bounded_partition_tuple_input_contract input_contract =
+        bounded_partition_tuple_input_contract::arbitrary) noexcept;
+
 class packed_key_grouping_workspace {
  public:
   [[nodiscard]] std::size_t dynamic_capacity_bytes() const {
@@ -416,6 +476,7 @@ class packed_key_grouping_workspace {
   void swap(packed_key_grouping_workspace& other) noexcept {
     sort_order_.swap(other.sort_order_);
     merge_buffer_.swap(other.merge_buffer_);
+    radix_buckets_.swap(other.radix_buckets_);
   }
 
   bool operator==(packed_key_grouping_workspace const&) const = default;
@@ -423,10 +484,21 @@ class packed_key_grouping_workspace {
  private:
   std::vector<std::size_t> sort_order_;
   std::vector<std::size_t> merge_buffer_;
+  // Keep radix scratch in the owned workspace so its fixed resident bytes are
+  // included in every existing sizeof(workspace)-based estimate and admission
+  // check. The two dynamic index buffers remain the only per-key scratch.
+  std::array<std::size_t, 256> radix_buckets_{};
 
   friend packed_key_grouping_prepared_status try_group_packed_keys_prepared(
       packed_key_matrix_view, packed_key_grouping_workspace&,
-      packed_key_grouping_result&, std::size_t) noexcept;
+      packed_key_grouping_result&, std::size_t,
+      packed_key_grouping_result_mode) noexcept;
+  friend bounded_partition_tuple_grouping_attempt
+  try_group_bounded_partition_tuple_prepared(
+      bounded_partition_tuple_view, packed_key_grouping_workspace&,
+      packed_key_grouping_result&, std::size_t,
+      packed_key_grouping_result_mode,
+      bounded_partition_tuple_input_contract) noexcept;
   friend packed_key_grouping_result group_packed_keys(
       packed_key_matrix_view, packed_key_grouping_workspace&);
 };
@@ -849,7 +921,426 @@ inline void stable_merge_sort_key_indices(
   }
 }
 
+inline bool should_use_stable_lsd_radix_sort(std::size_t key_count,
+                                             std::size_t key_width) noexcept {
+  // The observed hot lazy-chart shapes have 2046 keys and widths 2--4. Retain
+  // merge sort for small inputs, zero-width keys, and wide tuples where four
+  // counting passes per word would not repay their fixed setup cost.
+  return key_count >= 128 && key_width >= 1 && key_width <= 4;
+}
+
+inline bool should_try_first_occurrence_hash_grouping(
+    std::size_t key_count, std::size_t key_width) noexcept {
+  // Hash interning pays when a large matrix collapses to relatively few
+  // classes, which is precisely the lazy-chart compression case.  The same
+  // bounded-width gate retains merge sort for small/wide compatibility inputs;
+  // a deterministic radix fallback below handles weakly compressed matrices.
+  return key_count >= 128 && key_width >= 1 && key_width <= 4;
+}
+
+inline std::uint64_t packed_key_hash(packed_key_matrix_view keys,
+                                     std::size_t input) noexcept {
+  auto const offset = input * keys.key_width;
+  auto pack_pair = [&](std::size_t first) noexcept {
+    return (static_cast<std::uint64_t>(keys.words[offset + first]) << 32) |
+           static_cast<std::uint64_t>(keys.words[offset + first + 1]);
+  };
+
+  // These are the only widths admitted to the hash route. Pack widths one
+  // and two injectively and combine the second pair for widths three/four.
+  // One final multiply per complete tuple is materially cheaper than the old
+  // two-multiply SplitMix round per word. Hash equality is only a filter:
+  // packed_key_equal() below remains the exact collision oracle.
+  std::uint64_t value = 0;
+  switch (keys.key_width) {
+    case 1:
+      value = keys.words[offset];
+      break;
+    case 2:
+      value = pack_pair(0);
+      break;
+    case 3:
+      value = pack_pair(0) ^
+              std::rotl(static_cast<std::uint64_t>(keys.words[offset + 2]),
+                        29);
+      break;
+    case 4:
+      value = pack_pair(0) ^ std::rotl(pack_pair(2), 29);
+      break;
+    default:
+      // Kept total for defensive direct callers; the adaptive gate rejects
+      // this case before reaching the hash route.
+      return 0;
+  }
+
+  value ^= std::uint64_t{0x9e3779b97f4a7c15ULL} * keys.key_width;
+  value ^= value >> 30;
+  value *= std::uint64_t{0xbf58476d1ce4e5b9ULL};
+  value ^= value >> 27;
+  return value;
+}
+
+inline void stable_merge_sort_class_ids_by_representative(
+    packed_key_matrix_view keys,
+    std::vector<std::size_t> const& representative_by_class,
+    std::vector<std::size_t>& order,
+    std::vector<std::size_t>& merge_buffer) noexcept {
+  auto const count = representative_by_class.size();
+  order.resize(count);
+  merge_buffer.resize(count);
+  for (std::size_t class_id = 0; class_id < count; ++class_id) {
+    order[class_id] = class_id;
+  }
+  if (count < 2) return;
+
+  // Sort only the distinct representatives. This is the exact lexicographic
+  // class order produced by sorting all inputs, while retaining the prepared,
+  // allocation-free storage contract.
+  for (std::size_t run_width = 1;;) {
+    for (std::size_t begin = 0; begin < count;) {
+      auto const middle = begin + std::min(run_width, count - begin);
+      auto const end = middle + std::min(run_width, count - middle);
+      auto left = begin;
+      auto right = middle;
+      auto output = begin;
+      while (left < middle && right < end) {
+        auto const left_input = representative_by_class[order[left]];
+        auto const right_input = representative_by_class[order[right]];
+        if (packed_key_less(keys, right_input, left_input)) {
+          merge_buffer[output++] = order[right++];
+        } else {
+          merge_buffer[output++] = order[left++];
+        }
+      }
+      while (left < middle) merge_buffer[output++] = order[left++];
+      while (right < end) merge_buffer[output++] = order[right++];
+      begin = end;
+    }
+    order.swap(merge_buffer);
+    if (run_width >= count - run_width) break;
+    run_width *= 2;
+  }
+}
+
+inline bool try_first_occurrence_hash_grouping(
+    packed_key_matrix_view keys, std::vector<std::size_t>& buckets,
+    std::vector<std::size_t>& bucket_hashes_and_sort_scratch,
+    packed_key_grouping_result& result,
+    bool build_lexicographic_order = true) noexcept {
+  if (!should_try_first_occurrence_hash_grouping(keys.key_count,
+                                                  keys.key_width)) {
+    return false;
+  }
+
+  // Reuse the already admitted sort-order array as an open-address table. A
+  // power-of-two prefix avoids division, and abandoning the attempt before a
+  // 50% load factor gives bounded expected probes on compressed inputs. Any
+  // adversarial collision chain or weakly compressed input falls back to the
+  // exact stable radix implementation using that same admitted storage.
+  auto const bucket_count = std::bit_floor(keys.key_count);
+  auto const bucket_mask = bucket_count - 1;
+  auto const maximum_classes = bucket_count / 2;
+  auto const no_class = (std::numeric_limits<std::size_t>::max)();
+  buckets.resize(keys.key_count);
+  bucket_hashes_and_sort_scratch.resize(keys.key_count);
+  std::fill_n(buckets.begin(), bucket_count, no_class);
+  result.representative_by_class.clear();
+
+  constexpr std::size_t maximum_probe_count = 32;
+  for (std::size_t input = 0; input < keys.key_count; ++input) {
+    // Lazy-chart keys are emitted in pattern order and commonly form long
+    // runs.  The preceding input already has its canonical first-occurrence
+    // class, so an exact adjacent equality can reuse it without hashing or
+    // probing.  This does not alter table occupancy, representative order, or
+    // the deterministic radix fallback when compression is weak.
+    if (input != 0 && packed_key_equal(keys, input - 1, input)) {
+      result.class_by_input[input] = result.class_by_input[input - 1];
+      continue;
+    }
+    auto const hash = static_cast<std::size_t>(packed_key_hash(keys, input));
+    auto bucket = hash & bucket_mask;
+    bool assigned = false;
+    for (std::size_t probe = 0; probe < maximum_probe_count; ++probe) {
+      auto& class_id = buckets[bucket];
+      if (class_id == no_class) {
+        if (result.representative_by_class.size() >= maximum_classes) {
+          return false;
+        }
+        class_id = result.representative_by_class.size();
+        bucket_hashes_and_sort_scratch[bucket] = hash;
+        result.representative_by_class.push_back(input);
+        result.class_by_input[input] = class_id;
+        assigned = true;
+        break;
+      }
+      if (bucket_hashes_and_sort_scratch[bucket] == hash &&
+          packed_key_equal(keys, result.representative_by_class[class_id],
+                           input)) {
+        result.class_by_input[input] = class_id;
+        assigned = true;
+        break;
+      }
+      bucket = (bucket + 1) & bucket_mask;
+    }
+    if (!assigned) return false;
+  }
+
+  if (build_lexicographic_order) {
+    stable_merge_sort_class_ids_by_representative(
+        keys, result.representative_by_class,
+        result.lexicographic_class_order, bucket_hashes_and_sort_scratch);
+  }
+  return true;
+}
+
+inline void stable_lsd_radix_sort_key_indices(
+    packed_key_matrix_view keys, std::vector<std::size_t>& order,
+    std::vector<std::size_t>& merge_buffer,
+    std::array<std::size_t, 256>& buckets) noexcept {
+  for (std::size_t index = 0; index < keys.key_count; ++index) {
+    order[index] = index;
+  }
+
+  auto* source = &order;
+  auto* destination = &merge_buffer;
+  constexpr unsigned bits_per_byte = 8;
+  constexpr packed_key_word byte_mask = 0xff;
+
+  // A packed key is a lexicographic tuple of uint32_t words. Stable LSD passes
+  // therefore visit tuple words last-to-first and each numeric word's bytes
+  // low-to-high. Shift/mask extraction makes this independent of host byte
+  // order. Scattering source indices left-to-right preserves input order for
+  // equal complete keys.
+  for (auto word = keys.key_width; word-- != 0;) {
+    for (unsigned shift = 0; shift < sizeof(packed_key_word) * 8;
+         shift += bits_per_byte) {
+      buckets.fill(0);
+      for (auto index : *source) {
+        auto const value = keys.words[index * keys.key_width + word];
+        auto const digit =
+            static_cast<std::size_t>((value >> shift) & byte_mask);
+        ++buckets[digit];
+      }
+
+      std::size_t occupied_buckets = 0;
+      for (auto count : buckets) occupied_buckets += count != 0;
+      if (occupied_buckets < 2) continue;
+
+      std::size_t next_offset = 0;
+      for (auto& bucket : buckets) {
+        auto const count = bucket;
+        bucket = next_offset;
+        next_offset += count;
+      }
+      for (auto index : *source) {
+        auto const value = keys.words[index * keys.key_width + word];
+        auto const digit =
+            static_cast<std::size_t>((value >> shift) & byte_mask);
+        (*destination)[buckets[digit]++] = index;
+      }
+      std::swap(source, destination);
+    }
+  }
+
+  // An odd number of nonconstant byte passes leaves the sorted indices in the
+  // secondary vector. Preserve the established postcondition that `order`
+  // owns them without copying or allocating.
+  if (source != &order) order.swap(merge_buffer);
+}
+
 }  // namespace implementation
+
+// Allocation-free grouping over a bounded Cartesian product of already
+// published partition maps. `applicable == false` is an optimization miss and
+// leaves workspace/result untouched, so the caller can run the ordinary
+// packed-key path. An applicable attempt has the same preparation/admission
+// contract and result semantics as try_group_packed_keys_prepared().
+inline bounded_partition_tuple_grouping_attempt
+try_group_bounded_partition_tuple_prepared(
+    bounded_partition_tuple_view tuple,
+    packed_key_grouping_workspace& workspace,
+    packed_key_grouping_result& result,
+    std::size_t admitted_owned_capacity_bytes,
+    packed_key_grouping_result_mode result_mode,
+    bounded_partition_tuple_input_contract input_contract) noexcept {
+  if (tuple.tuple_width < 2 || tuple.tuple_width > tuple.class_by_input.size()) {
+    return {};
+  }
+  if (tuple.key_count == (std::numeric_limits<std::size_t>::max)()) {
+    return bounded_partition_tuple_grouping_attempt{
+        .applicable = true,
+        .status = packed_key_grouping_prepared_status{
+            .code = packed_key_grouping_prepared_status_code::
+                offset_count_overflow,
+            .required = tuple.key_count,
+            .available = tuple.key_count - 1,
+        },
+    };
+  }
+
+  std::size_t token_count = 1;
+  for (std::size_t component = 0; component < tuple.tuple_width;
+       ++component) {
+    if (tuple.class_by_input[component].size() != tuple.key_count ||
+        tuple.class_count[component] == 0) {
+      return {};
+    }
+    if (token_count > tuple.key_count / tuple.class_count[component]) {
+      return {};
+    }
+    token_count *= tuple.class_count[component];
+  }
+  if (token_count > tuple.key_count) return {};
+
+  if (input_contract == bounded_partition_tuple_input_contract::arbitrary) {
+    // An optimization miss must leave both caller-owned objects untouched.
+    // Check arbitrary maps before admission or mutation so the packed-key
+    // fallback sees exactly the state supplied by its caller.
+    for (std::size_t component = 0; component < tuple.tuple_width;
+         ++component) {
+      auto const cardinality = tuple.class_count[component];
+      for (auto const class_id : tuple.class_by_input[component]) {
+        if (class_id >= cardinality ||
+            class_id > (std::numeric_limits<packed_key_word>::max)()) {
+          return {};
+        }
+      }
+    }
+  }
+
+  auto const workspace_capacity = std::min(workspace.sort_order_.capacity(),
+                                           workspace.merge_buffer_.capacity());
+  auto const result_capacity =
+      std::min({result.class_by_input.capacity(),
+                result.representative_by_class.capacity(),
+                result.members_by_class.capacity(),
+                result.lexicographic_class_order.capacity(),
+                result.member_offsets_by_class.capacity() == 0
+                    ? std::size_t{0}
+                    : result.member_offsets_by_class.capacity() - 1});
+  if (!workspace.has_capacity_for(tuple.key_count) ||
+      !result.has_worst_case_capacity_for(tuple.key_count)) {
+    return bounded_partition_tuple_grouping_attempt{
+        .applicable = true,
+        .status = packed_key_grouping_prepared_status{
+            .code = packed_key_grouping_prepared_status_code::
+                storage_not_prepared,
+            .required = tuple.key_count,
+            .available = workspace_capacity,
+            .secondary_available = result_capacity,
+        },
+    };
+  }
+  std::size_t actual_owned_capacity_bytes = 0;
+  if (!try_packed_key_grouping_owned_resident_bytes(
+          workspace, result, actual_owned_capacity_bytes)) {
+    return bounded_partition_tuple_grouping_attempt{
+        .applicable = true,
+        .status = packed_key_grouping_prepared_status{
+            .code = packed_key_grouping_prepared_status_code::
+                resident_capacity_overflow,
+            .required = (std::numeric_limits<std::size_t>::max)(),
+            .available = admitted_owned_capacity_bytes,
+        },
+    };
+  }
+  if (actual_owned_capacity_bytes > admitted_owned_capacity_bytes) {
+    return bounded_partition_tuple_grouping_attempt{
+        .applicable = true,
+        .status = packed_key_grouping_prepared_status{
+            .code = packed_key_grouping_prepared_status_code::budget_exceeded,
+            .required = actual_owned_capacity_bytes,
+            .available = admitted_owned_capacity_bytes,
+        },
+    };
+  }
+
+  auto const no_class = (std::numeric_limits<std::size_t>::max)();
+  // Materialize one injective mixed-radix token per input into already-admitted
+  // scratch. The previous implementation compared adjacent tuples by rereading
+  // two complete source tuples and then reread a non-adjacent tuple to compute
+  // its token. Published chart partitions are valid by construction, but retain
+  // a fused release-mode bounds check before using a component as a radix
+  // digit. An invalid published map is an invariant failure, not an
+  // optimization miss; result remains unpublished and the caller propagates
+  // the returned status.
+  workspace.merge_buffer_.resize(tuple.key_count);
+  for (std::size_t input = 0; input < tuple.key_count; ++input) {
+    std::size_t token = 0;
+    for (std::size_t component = 0; component < tuple.tuple_width;
+         ++component) {
+      auto const class_id = tuple.class_by_input[component][input];
+      auto const cardinality = tuple.class_count[component];
+      if (input_contract ==
+              bounded_partition_tuple_input_contract::published_partitions &&
+          (class_id >= cardinality ||
+           class_id > (std::numeric_limits<packed_key_word>::max)())) {
+        return bounded_partition_tuple_grouping_attempt{
+            .applicable = true,
+            .status = packed_key_grouping_prepared_status{
+                .code = packed_key_grouping_prepared_status_code::
+                    partition_class_out_of_range,
+                .required = cardinality,
+                .available = class_id,
+                .secondary_available = input,
+            },
+        };
+      }
+      token = token * cardinality + class_id;
+    }
+    workspace.merge_buffer_[input] = token;
+  }
+
+  workspace.sort_order_.resize(token_count);
+  std::fill(workspace.sort_order_.begin(), workspace.sort_order_.end(),
+            no_class);
+  result.clear_sizes();
+  result.class_by_input.resize(tuple.key_count);
+
+  for (std::size_t input = 0; input < tuple.key_count; ++input) {
+    auto const token = workspace.merge_buffer_[input];
+    if (input != 0 && workspace.merge_buffer_[input - 1] == token) {
+      result.class_by_input[input] = result.class_by_input[input - 1];
+      continue;
+    }
+    auto& class_id = workspace.sort_order_[token];
+    if (class_id == no_class) {
+      class_id = result.representative_by_class.size();
+      result.representative_by_class.push_back(input);
+    }
+    result.class_by_input[input] = class_id;
+  }
+
+  if (result_mode != packed_key_grouping_result_mode::classes) {
+    for (auto const class_id : workspace.sort_order_) {
+      if (class_id != no_class) {
+        result.lexicographic_class_order.push_back(class_id);
+      }
+    }
+  }
+  if (result_mode == packed_key_grouping_result_mode::full) {
+    auto const class_count = result.representative_by_class.size();
+    result.member_offsets_by_class.resize(class_count + 1);
+    std::fill(result.member_offsets_by_class.begin(),
+              result.member_offsets_by_class.end(), std::size_t{0});
+    result.members_by_class.resize(tuple.key_count);
+    for (auto const class_id : result.class_by_input) {
+      ++result.member_offsets_by_class[class_id + 1];
+    }
+    for (std::size_t class_id = 0; class_id < class_count; ++class_id) {
+      result.member_offsets_by_class[class_id + 1] +=
+          result.member_offsets_by_class[class_id];
+      workspace.merge_buffer_[class_id] =
+          result.member_offsets_by_class[class_id];
+    }
+    for (std::size_t input = 0; input < tuple.key_count; ++input) {
+      auto const class_id = result.class_by_input[input];
+      result.members_by_class[workspace.merge_buffer_[class_id]++] = input;
+    }
+  }
+
+  return bounded_partition_tuple_grouping_attempt{.applicable = true};
+}
 
 // Allocation-free grouping over pre-admitted storage. The budget covers the
 // measured stable capacities of workspace and result. Caller-owned packed
@@ -860,7 +1351,9 @@ inline void stable_merge_sort_key_indices(
 inline packed_key_grouping_prepared_status try_group_packed_keys_prepared(
     packed_key_matrix_view keys, packed_key_grouping_workspace& workspace,
     packed_key_grouping_result& result,
-    std::size_t admitted_owned_capacity_bytes) noexcept {
+    std::size_t admitted_owned_capacity_bytes,
+    packed_key_grouping_result_mode result_mode =
+        packed_key_grouping_result_mode::full) noexcept {
   auto const shape_status =
       try_validate_packed_key_matrix_for_prepared_grouping(keys);
   if (!shape_status.succeeded()) return shape_status;
@@ -907,54 +1400,86 @@ inline packed_key_grouping_prepared_status try_group_packed_keys_prepared(
   result.clear_sizes();
   result.class_by_input.resize(keys.key_count);
 
-  implementation::stable_merge_sort_key_indices(keys, workspace.sort_order_,
-                                                workspace.merge_buffer_);
+  auto const hash_grouped =
+      implementation::try_first_occurrence_hash_grouping(
+          keys, workspace.sort_order_, workspace.merge_buffer_, result,
+          result_mode != packed_key_grouping_result_mode::classes);
+  if (!hash_grouped) {
+    // A failed hash attempt has modified only prepared result values/sizes;
+    // clear them before the deterministic sort fallback. Capacities and the
+    // already completed admission decision remain unchanged.
+    result.clear_sizes();
+    result.class_by_input.resize(keys.key_count);
+    workspace.sort_order_.resize(keys.key_count);
+    workspace.merge_buffer_.resize(keys.key_count);
 
-  std::size_t class_count = 0;
-  for (std::size_t begin = 0; begin < keys.key_count;) {
-    auto end = begin + 1;
-    while (end < keys.key_count &&
-           implementation::packed_key_equal(keys, workspace.sort_order_[begin],
-                                            workspace.sort_order_[end])) {
-      ++end;
+    if (implementation::should_use_stable_lsd_radix_sort(keys.key_count,
+                                                          keys.key_width)) {
+      implementation::stable_lsd_radix_sort_key_indices(
+          keys, workspace.sort_order_, workspace.merge_buffer_,
+          workspace.radix_buckets_);
+    } else {
+      implementation::stable_merge_sort_key_indices(
+          keys, workspace.sort_order_, workspace.merge_buffer_);
     }
-    for (auto position = begin; position < end; ++position) {
-      result.class_by_input[workspace.sort_order_[position]] = class_count;
+
+    std::size_t lexicographic_class_count = 0;
+    for (std::size_t begin = 0; begin < keys.key_count;) {
+      auto end = begin + 1;
+      while (end < keys.key_count &&
+             implementation::packed_key_equal(
+                 keys, workspace.sort_order_[begin],
+                 workspace.sort_order_[end])) {
+        ++end;
+      }
+      for (auto position = begin; position < end; ++position) {
+        result.class_by_input[workspace.sort_order_[position]] =
+            lexicographic_class_count;
+      }
+      ++lexicographic_class_count;
+      begin = end;
     }
-    ++class_count;
-    begin = end;
+
+    result.representative_by_class.resize(lexicographic_class_count);
+    if (result_mode != packed_key_grouping_result_mode::classes) {
+      result.lexicographic_class_order.resize(lexicographic_class_count);
+    }
+
+    // The sort pass assigned temporary lexicographic class IDs. Convert them
+    // to stable first-occurrence IDs with one input-order scan. merge_buffer is
+    // no longer needed by the sort and becomes the lexicographic-to-stable map.
+    auto const no_class = (std::numeric_limits<std::size_t>::max)();
+    workspace.merge_buffer_.resize(lexicographic_class_count);
+    std::fill(workspace.merge_buffer_.begin(), workspace.merge_buffer_.end(),
+              no_class);
+    std::size_t next_class = 0;
+    for (std::size_t input = 0; input < keys.key_count; ++input) {
+      auto const lexicographic_class = result.class_by_input[input];
+      auto& stable_class = workspace.merge_buffer_[lexicographic_class];
+      if (stable_class == no_class) {
+        stable_class = next_class++;
+        result.representative_by_class[stable_class] = input;
+      }
+      result.class_by_input[input] = stable_class;
+    }
+    if (result_mode != packed_key_grouping_result_mode::classes) {
+      for (std::size_t lexicographic_class = 0;
+           lexicographic_class < lexicographic_class_count;
+           ++lexicographic_class) {
+        result.lexicographic_class_order[lexicographic_class] =
+            workspace.merge_buffer_[lexicographic_class];
+      }
+    }
   }
 
-  result.representative_by_class.resize(class_count);
+  if (result_mode != packed_key_grouping_result_mode::full) return {};
+
+  auto const class_count = result.representative_by_class.size();
   // Validation proved key_count < size_t::max(), and class_count <= key_count.
   result.member_offsets_by_class.resize(class_count + 1);
   std::fill(result.member_offsets_by_class.begin(),
             result.member_offsets_by_class.end(), std::size_t{0});
   result.members_by_class.resize(keys.key_count);
-  result.lexicographic_class_order.resize(class_count);
-
-  // The sort pass assigned temporary lexicographic class IDs. Convert them to
-  // stable first-occurrence IDs with one input-order scan. merge_buffer is no
-  // longer needed by the sort and becomes the lexicographic-to-stable map.
-  auto const no_class = (std::numeric_limits<std::size_t>::max)();
-  workspace.merge_buffer_.resize(class_count);
-  std::fill(workspace.merge_buffer_.begin(), workspace.merge_buffer_.end(),
-            no_class);
-  std::size_t next_class = 0;
-  for (std::size_t input = 0; input < keys.key_count; ++input) {
-    auto const lexicographic_class = result.class_by_input[input];
-    auto& stable_class = workspace.merge_buffer_[lexicographic_class];
-    if (stable_class == no_class) {
-      stable_class = next_class++;
-      result.representative_by_class[stable_class] = input;
-    }
-    result.class_by_input[input] = stable_class;
-  }
-  for (std::size_t lexicographic_class = 0; lexicographic_class < class_count;
-       ++lexicographic_class) {
-    result.lexicographic_class_order[lexicographic_class] =
-        workspace.merge_buffer_[lexicographic_class];
-  }
 
   for (auto class_id : result.class_by_input) {
     ++result.member_offsets_by_class[class_id + 1];
@@ -1001,6 +1526,11 @@ inline packed_key_grouping_prepared_status try_group_packed_keys_prepared(
           status.required, status.available);
     case packed_key_grouping_prepared_status_code::budget_exceeded:
       throw packed_key_grouping_budget_error(status.required, status.available);
+    case packed_key_grouping_prepared_status_code::
+        partition_class_out_of_range:
+      throw packed_key_grouping_shape_error(
+          packed_key_grouping_shape_error_kind::partition_class_out_of_range,
+          status.required, status.available);
     case packed_key_grouping_prepared_status_code::success:
       throw std::logic_error(
           "cannot throw a successful packed lazy-key grouping status");
@@ -1014,9 +1544,11 @@ inline packed_key_grouping_prepared_status try_group_packed_keys_prepared(
 inline packed_key_grouping_result const& group_packed_keys_prepared(
     packed_key_matrix_view keys, packed_key_grouping_workspace& workspace,
     packed_key_grouping_result& result,
-    std::size_t admitted_owned_capacity_bytes) {
+    std::size_t admitted_owned_capacity_bytes,
+    packed_key_grouping_result_mode result_mode =
+        packed_key_grouping_result_mode::full) {
   auto const status = try_group_packed_keys_prepared(
-      keys, workspace, result, admitted_owned_capacity_bytes);
+      keys, workspace, result, admitted_owned_capacity_bytes, result_mode);
   if (!status.succeeded()) {
     throw_packed_key_grouping_prepared_failure(status);
   }

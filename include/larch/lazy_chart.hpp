@@ -9,12 +9,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -215,6 +218,36 @@ inline void validate_patterns(chart_execution_plan const& plan,
                        " taxon " + std::to_string(tid));
       }
     }
+  }
+}
+
+struct validated_plan_patterns_ref {
+  chart_execution_plan const* plan = nullptr;
+  site_pattern_set const* patterns = nullptr;
+
+  void assert_same(chart_execution_plan const& expected_plan,
+                   site_pattern_set const& expected_patterns) const {
+    if (plan != std::addressof(expected_plan) ||
+        patterns != std::addressof(expected_patterns)) {
+      throw std::logic_error(
+          "lazy chart: validated plan/pattern reference mismatch");
+    }
+  }
+};
+
+inline validated_plan_patterns_ref validate_plan_patterns_once(
+    chart_execution_plan const& plan, site_pattern_set const& patterns) {
+  validate_patterns(plan, patterns);
+  return {.plan = std::addressof(plan), .patterns = std::addressof(patterns)};
+}
+
+inline void validate_patterns_or_assert(
+    chart_execution_plan const& plan, site_pattern_set const& patterns,
+    validated_plan_patterns_ref const* validated) {
+  if (validated == nullptr) {
+    validate_patterns(plan, patterns);
+  } else {
+    validated->assert_same(plan, patterns);
   }
 }
 
@@ -494,7 +527,7 @@ inline map_dependency_counts count_map_dependencies(
   return counts;
 }
 
-inline void consume_plan_inside_child_map(
+inline std::size_t consume_plan_inside_child_map(
     lazy_multisite_chart& chart, chart_execution_plan const& plan,
     clade_id child, map_dependency_counts& remaining) {
   if (remaining.inside[child] == 0) {
@@ -503,11 +536,20 @@ inline void consume_plan_inside_child_map(
   }
   --remaining.inside[child];
   if (remaining.inside[child] == 0 && child != plan.root_clade()) {
+    auto const released =
+        chart.class_index_by_pattern_by_clade[child]
+            ? lazy_key_grouping_detail::checked_packed_key_bytes_multiply(
+                  chart.class_index_by_pattern_by_clade[child]->capacity(),
+                  sizeof(std::size_t),
+                  "lazy chart released inside-map capacity")
+            : 0;
     chart.class_index_by_pattern_by_clade[child] = std::nullopt;
+    return released;
   }
+  return 0;
 }
 
-inline void consume_plan_structural_child_map(
+inline std::size_t consume_plan_structural_child_map(
     lazy_multisite_chart& chart, chart_execution_plan const& plan,
     clade_id child, map_dependency_counts& remaining) {
   if (remaining.structural[child] == 0) {
@@ -516,22 +558,40 @@ inline void consume_plan_structural_child_map(
   }
   --remaining.structural[child];
   if (remaining.structural[child] == 0 && child != plan.root_clade()) {
+    auto const released =
+        chart.structural_class_index_by_pattern_by_clade[child]
+            ? lazy_key_grouping_detail::checked_packed_key_bytes_multiply(
+                  chart.structural_class_index_by_pattern_by_clade[child]
+                      ->capacity(),
+                  sizeof(std::size_t),
+                  "lazy chart released structural-map capacity")
+            : 0;
     chart.structural_class_index_by_pattern_by_clade[child] = std::nullopt;
+    return released;
   }
+  return 0;
 }
 
-inline void consume_plan_parent_map_dependencies(
+inline std::size_t consume_plan_parent_map_dependencies(
     lazy_multisite_chart& chart, chart_execution_plan const& plan,
     clade_id parent, map_dependency_counts& remaining) {
+  std::size_t released = 0;
   auto const production_ids = plan.productions_for_parent(parent);
   for (std::size_t prod_i = 0; prod_i < production_ids.size(); ++prod_i) {
     for (auto child : plan.children(production_ids[prod_i])) {
-      consume_plan_inside_child_map(chart, plan, child, remaining);
+      released = lazy_key_grouping_detail::checked_packed_key_bytes_add(
+          released,
+          consume_plan_inside_child_map(chart, plan, child, remaining),
+          "lazy chart released parent-map capacity");
       if (prod_i == 0) {
-        consume_plan_structural_child_map(chart, plan, child, remaining);
+        released = lazy_key_grouping_detail::checked_packed_key_bytes_add(
+            released,
+            consume_plan_structural_child_map(chart, plan, child, remaining),
+            "lazy chart released parent-map capacity");
       }
     }
   }
+  return released;
 }
 
 struct plan_parent_key_grouping_memory_accounting {
@@ -765,16 +825,6 @@ inline packed_plan_parent_keys collect_plan_parent_keys(
       keys.memory.structural_word_preparation.previous_capacity_resident_bytes,
       keys.memory.structural_word_preparation
           .observed_prepublication_peak_capacity_resident_bytes);
-  workspace.packed_words.resize(structural_estimate.packed_word_count);
-  for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
-    auto output = pattern * structural_width;
-    for (auto child : structural_children) {
-      workspace.packed_words[output++] =
-          checked_packed_key_word(plan_structural_class_index_for_pattern(
-                                      chart, plan, patterns, child, pattern),
-                                  "lazy plan structural class index");
-    }
-  }
 
   workspace_before = workspace.resident_bytes();
   keys.memory.structural_grouping_preparation =
@@ -787,16 +837,60 @@ inline packed_plan_parent_keys collect_plan_parent_keys(
           .previous_owned_capacity_resident_bytes,
       keys.memory.structural_grouping_preparation
           .observed_prepublication_peak_owned_capacity_resident_bytes);
-  auto structural_view = packed_key_matrix_view{
-      .key_count = chart.pattern_count,
-      .key_width = structural_width,
-      .words = workspace.packed_words,
-  };
-  require_plan_parent_key_grouping_success(try_group_packed_keys_prepared(
-      structural_view, workspace.grouping_workspace,
-      workspace.structural_grouping,
-      keys.memory.structural_grouping_preparation
-          .prepared_owned_capacity_resident_bytes));
+  bool grouped_structural_maps_directly = false;
+  if (structural_width == 2) {
+    auto const left = structural_children[0];
+    auto const right = structural_children[1];
+    auto const& left_map =
+        chart.structural_class_index_by_pattern_by_clade[left];
+    auto const& right_map =
+        chart.structural_class_index_by_pattern_by_clade[right];
+    if (left_map && right_map) {
+      auto const attempt = try_group_bounded_partition_tuple_prepared(
+          bounded_partition_tuple_view{
+              .key_count = chart.pattern_count,
+              .tuple_width = 2,
+              .class_by_input =
+                  {std::span<std::size_t const>{*left_map},
+                   std::span<std::size_t const>{*right_map}, {}},
+              .class_count =
+                  {chart.structural_class_count_by_clade[left],
+                   chart.structural_class_count_by_clade[right], 0},
+          },
+          workspace.grouping_workspace, workspace.structural_grouping,
+          keys.memory.structural_grouping_preparation
+              .prepared_owned_capacity_resident_bytes,
+          packed_key_grouping_result_mode::classes,
+          bounded_partition_tuple_input_contract::published_partitions);
+      if (attempt.applicable) {
+        require_plan_parent_key_grouping_success(attempt.status);
+        grouped_structural_maps_directly = true;
+      }
+    }
+  }
+  if (!grouped_structural_maps_directly) {
+    workspace.packed_words.resize(structural_estimate.packed_word_count);
+    for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
+      auto output = pattern * structural_width;
+      for (auto child : structural_children) {
+        workspace.packed_words[output++] =
+            checked_packed_key_word(plan_structural_class_index_for_pattern(
+                                        chart, plan, patterns, child, pattern),
+                                    "lazy plan structural class index");
+      }
+    }
+    auto const structural_view = packed_key_matrix_view{
+        .key_count = chart.pattern_count,
+        .key_width = structural_width,
+        .words = workspace.packed_words,
+    };
+    require_plan_parent_key_grouping_success(try_group_packed_keys_prepared(
+        structural_view, workspace.grouping_workspace,
+        workspace.structural_grouping,
+        keys.memory.structural_grouping_preparation
+            .prepared_owned_capacity_resident_bytes,
+        packed_key_grouping_result_mode::classes));
+  }
 
   auto const structural_class_count =
       workspace.structural_grouping.class_count();
@@ -846,7 +940,8 @@ inline packed_plan_parent_keys collect_plan_parent_keys(
   require_plan_parent_key_grouping_success(try_group_packed_keys_prepared(
       row_view, workspace.grouping_workspace, workspace.row_grouping,
       keys.memory.row_grouping_preparation
-          .prepared_owned_capacity_resident_bytes));
+          .prepared_owned_capacity_resident_bytes,
+      packed_key_grouping_result_mode::classes));
   keys.memory.row_key_class_count = workspace.row_grouping.class_count();
 
   keys.memory.logical_resident_bytes =
@@ -965,7 +1060,8 @@ inline packed_grammar_parent_keys collect_ready_grammar_parent_keys(
       structural_view, workspace.grouping_workspace,
       workspace.structural_grouping,
       keys.memory.structural_grouping_preparation
-          .prepared_owned_capacity_resident_bytes));
+          .prepared_owned_capacity_resident_bytes,
+      packed_key_grouping_result_mode::ordered_classes));
 
   auto const structural_class_count =
       workspace.structural_grouping.class_count();
@@ -1015,7 +1111,8 @@ inline packed_grammar_parent_keys collect_ready_grammar_parent_keys(
   require_plan_parent_key_grouping_success(try_group_packed_keys_prepared(
       row_view, workspace.grouping_workspace, workspace.row_grouping,
       keys.memory.row_grouping_preparation
-          .prepared_owned_capacity_resident_bytes));
+          .prepared_owned_capacity_resident_bytes,
+      packed_key_grouping_result_mode::classes));
   keys.memory.row_key_class_count = workspace.row_grouping.class_count();
 
   // Sparse child maps stay live until both packed stages have published their
@@ -1505,7 +1602,8 @@ inline void assign_plan_internal_classes_task_local(
   require_plan_parent_key_grouping_success(try_group_packed_keys_prepared(
       row_value_view, workspace.grouping_workspace,
       workspace.row_value_grouping,
-      row_value_preparation.prepared_owned_capacity_resident_bytes));
+      row_value_preparation.prepared_owned_capacity_resident_bytes,
+      packed_key_grouping_result_mode::classes));
   auto const& row_value_classes = workspace.row_value_grouping;
   rows.resize(row_value_classes.class_count());
   for (std::size_t row_class = 0; row_class < rows.size(); ++row_class) {
@@ -1588,9 +1686,9 @@ inline void maybe_discard_nonroot_maps(lazy_multisite_chart& chart,
 
 inline void materialize_inside_class_maps(
     lazy_multisite_chart& chart, chart_execution_plan const& plan,
-    site_pattern_set const& patterns) {
-  plan.assert_valid();
-  validate_patterns(plan, patterns);
+    site_pattern_set const& patterns,
+    validated_plan_patterns_ref const* validated = nullptr) {
+  validate_patterns_or_assert(plan, patterns, validated);
   auto const clade_count = plan.clades().size();
   if (chart.pattern_count != patterns.patterns.size()) {
     throw std::runtime_error(
@@ -1889,7 +1987,8 @@ inline packed_outside_context_keys collect_packed_outside_context_keys(
   require_outside_context_key_grouping_success(try_group_packed_keys_prepared(
       view, workspace.grouping_workspace, workspace.grouping,
       keys.memory.grouping_preparation
-          .prepared_owned_capacity_resident_bytes));
+          .prepared_owned_capacity_resident_bytes,
+      packed_key_grouping_result_mode::full));
   keys.memory.class_count = workspace.grouping.class_count();
 
   keys.memory.logical_resident_bytes =
@@ -2137,10 +2236,195 @@ inline packed_outside_context_keys collect_outside_context_keys(
       });
 }
 
+// The fused strict-binary outside recurrence consumes only the grouped class
+// map, representatives, and lexicographic traversal. When all three source
+// partitions are retained and their Cartesian domain fits the already
+// admitted per-pattern scratch, group those spans directly. The generic
+// collector remains the compatibility fallback because it also publishes CSR
+// membership and the packed key words used by other callers.
+inline bool try_collect_plan_strict_binary_outside_context_classes_direct(
+    lazy_multisite_chart const& chart, chart_execution_plan const& plan,
+    production_id pid, outside_context_key_workspace& workspace) {
+  using namespace lazy_key_grouping_detail;
+  auto const& production = plan.production(pid);
+  auto const children = plan.children(pid);
+  if (!production.is_binary() || children.size() != 2) return false;
+
+  auto const& parent_map =
+      chart.outside_class_index_by_pattern_by_clade[production.parent];
+  auto const& left_map = chart.class_index_by_pattern_by_clade[children[0]];
+  auto const& right_map = chart.class_index_by_pattern_by_clade[children[1]];
+  if (!parent_map || !left_map || !right_map) return false;
+
+  auto const preparation = prepare_packed_key_grouping_storage(
+      chart.pattern_count, workspace.grouping_workspace, workspace.grouping);
+  auto const attempt = try_group_bounded_partition_tuple_prepared(
+      bounded_partition_tuple_view{
+          .key_count = chart.pattern_count,
+          .tuple_width = 3,
+          .class_by_input =
+              {std::span<std::size_t const>{*parent_map},
+               std::span<std::size_t const>{*left_map},
+               std::span<std::size_t const>{*right_map}},
+          .class_count =
+              {chart.outside_rows_by_clade[production.parent].size(),
+               chart.inside_rows_by_clade[children[0]].size(),
+               chart.inside_rows_by_clade[children[1]].size()},
+      },
+      workspace.grouping_workspace, workspace.grouping,
+      preparation.prepared_owned_capacity_resident_bytes,
+      packed_key_grouping_result_mode::ordered_classes,
+      bounded_partition_tuple_input_contract::published_partitions);
+  if (!attempt.applicable) return false;
+  require_outside_context_key_grouping_success(attempt.status);
+  return true;
+}
+
 struct plan_outside_clade_work_stats {
   std::size_t multifurcation_productions_scored = 0;
   outside_recurrence_work_stats recurrence_work;
 };
+
+inline void publish_plan_outside_classes_for_clade(
+    lazy_multisite_chart& chart, site_pattern_set const& patterns,
+    clade_id clade, std::vector<row_type>& outside_by_pattern,
+    outside_context_key_workspace& key_workspace) {
+  using namespace lazy_key_grouping_detail;
+  auto const row_word_count = checked_packed_key_count_multiply(
+      chart.pattern_count, nuc_state_count, "lazy plan outside row-value keys");
+  prepare_packed_key_word_buffer(row_word_count, key_workspace.packed_words);
+  key_workspace.packed_words.resize(row_word_count);
+  auto word = key_workspace.packed_words.begin();
+  for (auto const& row : outside_by_pattern) {
+    for (auto cost : row) *word++ = cost;
+  }
+  auto const row_grouping_preparation = prepare_packed_key_grouping_storage(
+      chart.pattern_count, key_workspace.grouping_workspace,
+      key_workspace.grouping);
+  auto const row_view = packed_key_matrix_view{
+      .key_count = chart.pattern_count,
+      .key_width = nuc_state_count,
+      .words = key_workspace.packed_words,
+  };
+  require_outside_context_key_grouping_success(try_group_packed_keys_prepared(
+      row_view, key_workspace.grouping_workspace, key_workspace.grouping,
+      row_grouping_preparation.prepared_owned_capacity_resident_bytes,
+      packed_key_grouping_result_mode::classes));
+
+  auto& class_map = chart.outside_class_index_by_pattern_by_clade[clade];
+  if (!class_map) class_map.emplace();
+  class_map->assign(key_workspace.grouping.class_by_input.begin(),
+                    key_workspace.grouping.class_by_input.end());
+  auto& rows = chart.outside_rows_by_clade[clade];
+  auto const class_count = key_workspace.grouping.class_count();
+  if (std::addressof(rows) == std::addressof(outside_by_pattern)) {
+    // The finite strict-tree sibling route uses this already-prepared chart
+    // vector as its second pattern-row buffer. First-occurrence class IDs make
+    // representative indices strictly increasing and never smaller than
+    // their class IDs, so left-to-right in-place compaction cannot overwrite a
+    // later representative.
+    for (std::size_t row_class = 0; row_class < class_count; ++row_class) {
+      auto const representative =
+          key_workspace.grouping.representative_by_class[row_class];
+      if (representative < row_class) {
+        throw std::logic_error(
+            "lazy chart: outside row representative precedes its class");
+      }
+      rows[row_class] = rows[representative];
+    }
+    rows.resize(class_count);
+  } else {
+    rows.resize(class_count);
+    for (std::size_t row_class = 0; row_class < rows.size(); ++row_class) {
+      rows[row_class] =
+          outside_by_pattern[key_workspace.grouping
+                                 .representative_by_class[row_class]];
+    }
+  }
+  auto& weights = chart.outside_class_weight_by_clade[clade];
+  weights.assign(rows.size(), 0);
+  for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
+    auto const class_index = (*class_map)[pattern];
+    checked_add_weight(weights[class_index], patterns.patterns[pattern].weight,
+                       "outside class");
+  }
+}
+
+// In a strict tree each child has exactly one outside contribution. The
+// context grouping has therefore already proved that every pattern in one
+// context class produces the same row. Group only those representative rows,
+// then expand the final row class through the copied context map. Context IDs
+// are first-occurrence IDs, so grouping them in numeric order preserves the
+// historical first-pattern class numbering exactly.
+inline void publish_plan_outside_classes_from_context_classes(
+    lazy_multisite_chart& chart, site_pattern_set const& patterns,
+    clade_id clade, std::vector<row_type>& outside_by_context,
+    outside_context_key_workspace& key_workspace) {
+  using namespace lazy_key_grouping_detail;
+  auto const context_count = outside_by_context.size();
+  auto& class_map = chart.outside_class_index_by_pattern_by_clade[clade];
+  if (!class_map || class_map->size() != chart.pattern_count) {
+    throw std::logic_error(
+        "lazy chart: strict-tree outside context map was not retained");
+  }
+
+  auto const row_word_count = checked_packed_key_count_multiply(
+      context_count, nuc_state_count,
+      "lazy plan outside context-class row-value keys");
+  prepare_packed_key_word_buffer(row_word_count, key_workspace.packed_words);
+  key_workspace.packed_words.resize(row_word_count);
+  auto word = key_workspace.packed_words.begin();
+  for (auto const& row : outside_by_context) {
+    for (auto cost : row) *word++ = cost;
+  }
+  auto const row_grouping_preparation = prepare_packed_key_grouping_storage(
+      context_count, key_workspace.grouping_workspace,
+      key_workspace.grouping);
+  auto const row_view = packed_key_matrix_view{
+      .key_count = context_count,
+      .key_width = nuc_state_count,
+      .words = key_workspace.packed_words,
+  };
+  require_outside_context_key_grouping_success(try_group_packed_keys_prepared(
+      row_view, key_workspace.grouping_workspace, key_workspace.grouping,
+      row_grouping_preparation.prepared_owned_capacity_resident_bytes,
+      packed_key_grouping_result_mode::classes));
+
+  auto& rows = chart.outside_rows_by_clade[clade];
+  auto const class_count = key_workspace.grouping.class_count();
+  if (std::addressof(rows) == std::addressof(outside_by_context)) {
+    for (std::size_t row_class = 0; row_class < class_count; ++row_class) {
+      auto const representative =
+          key_workspace.grouping.representative_by_class[row_class];
+      if (representative < row_class) {
+        throw std::logic_error(
+            "lazy chart: outside context representative precedes its class");
+      }
+      rows[row_class] = rows[representative];
+    }
+    rows.resize(class_count);
+  } else {
+    rows.resize(class_count);
+    for (std::size_t row_class = 0; row_class < class_count; ++row_class) {
+      rows[row_class] = outside_by_context[
+          key_workspace.grouping.representative_by_class[row_class]];
+    }
+  }
+
+  for (auto& context_class : *class_map) {
+    if (context_class >= context_count) {
+      throw std::logic_error(
+          "lazy chart: strict-tree outside context class out of range");
+    }
+    context_class = key_workspace.grouping.class_by_input[context_class];
+  }
+  auto& weights = chart.outside_class_weight_by_clade[clade];
+  weights.assign(rows.size(), 0);
+  for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
+    checked_add_weight(weights[(*class_map)[pattern]],
+                       patterns.patterns[pattern].weight, "outside class");
+  }
+}
 
 inline void assign_plan_outside_classes_for_clade_task_local(
     lazy_multisite_chart& chart, chart_execution_plan const& plan,
@@ -2185,44 +2469,225 @@ inline void assign_plan_outside_classes_for_clade_task_local(
     }
   }
 
-  using namespace lazy_key_grouping_detail;
-  auto const row_word_count = checked_packed_key_count_multiply(
-      chart.pattern_count, nuc_state_count, "lazy plan outside row-value keys");
-  prepare_packed_key_word_buffer(row_word_count, key_workspace.packed_words);
-  key_workspace.packed_words.resize(row_word_count);
-  auto word = key_workspace.packed_words.begin();
-  for (auto const& row : outside_by_pattern) {
-    for (auto cost : row) *word++ = cost;
-  }
-  auto const row_grouping_preparation = prepare_packed_key_grouping_storage(
-      chart.pattern_count, key_workspace.grouping_workspace,
-      key_workspace.grouping);
-  auto const row_view = packed_key_matrix_view{
-      .key_count = chart.pattern_count,
-      .key_width = nuc_state_count,
-      .words = key_workspace.packed_words,
-  };
-  require_outside_context_key_grouping_success(try_group_packed_keys_prepared(
-      row_view, key_workspace.grouping_workspace, key_workspace.grouping,
-      row_grouping_preparation.prepared_owned_capacity_resident_bytes));
+  publish_plan_outside_classes_for_clade(
+      chart, patterns, clade, outside_by_pattern, key_workspace);
+}
 
-  auto& class_map = chart.outside_class_index_by_pattern_by_clade[clade];
-  if (!class_map) class_map.emplace();
-  class_map->assign(key_workspace.grouping.class_by_input.begin(),
-                    key_workspace.grouping.class_by_input.end());
-  auto& rows = chart.outside_rows_by_clade[clade];
-  auto& weights = chart.outside_class_weight_by_clade[clade];
-  rows.resize(key_workspace.grouping.class_count());
-  for (std::size_t row_class = 0; row_class < rows.size(); ++row_class) {
-    rows[row_class] =
-        outside_by_pattern[key_workspace.grouping
-                               .representative_by_class[row_class]];
+inline bool plan_has_strict_binary_tree_outside_structure(
+    chart_execution_plan const& plan) {
+  plan.assert_valid();
+  auto const root = plan.root_clade();
+  for (auto const& clade : plan.clades()) {
+    auto const cid = clade.source_id;
+    auto const parent_productions = plan.productions_for_parent(cid);
+    auto const child_occurrences = plan.child_occurrences_for_clade(cid);
+    if (cid == root) {
+      if (!child_occurrences.empty()) return false;
+    } else if (child_occurrences.size() != 1) {
+      return false;
+    }
+    if (clade.is_leaf()) {
+      if (!parent_productions.empty()) return false;
+    } else {
+      if (parent_productions.size() != 1 ||
+          !plan.production(parent_productions.front()).is_binary()) {
+        return false;
+      }
+    }
   }
-  weights.assign(rows.size(), 0);
-  for (std::size_t pattern = 0; pattern < chart.pattern_count; ++pattern) {
-    auto const class_index = (*class_map)[pattern];
-    checked_add_weight(weights[class_index], patterns.patterns[pattern].weight,
-                       "outside class");
+  return true;
+}
+
+enum class plan_outside_sibling_work_kind : std::uint8_t {
+  singleton,
+  fused_leader,
+  fused_follower,
+};
+
+struct plan_outside_sibling_work {
+  plan_outside_sibling_work_kind kind =
+      plan_outside_sibling_work_kind::singleton;
+  clade_id sibling = no_clade;
+};
+
+inline plan_outside_sibling_work classify_plan_outside_sibling_work(
+    chart_execution_plan const& plan,
+    std::span<clade_id const> admitted_wave, std::size_t item) {
+  if (item >= admitted_wave.size()) {
+    throw std::logic_error(
+        "lazy outside chart: admitted sibling item out of range");
+  }
+  auto const clade = admitted_wave[item];
+  auto const occurrences = plan.child_occurrences_for_clade(clade);
+  if (occurrences.size() != 1) return {};
+  auto const occurrence = occurrences.front();
+  auto const children = plan.children(occurrence.production);
+  if (children.size() != 2 || occurrence.child_slot >= children.size()) {
+    return {};
+  }
+  auto const sibling = children[std::size_t{1} - occurrence.child_slot];
+  auto const found = std::find(admitted_wave.begin(), admitted_wave.end(),
+                               sibling);
+  if (found == admitted_wave.end()) return {};
+  auto const sibling_item =
+      static_cast<std::size_t>(found - admitted_wave.begin());
+  if (sibling_item == item) {
+    throw std::logic_error(
+        "lazy outside chart: strict-tree child is its own sibling");
+  }
+  return {
+      .kind = item < sibling_item
+                  ? plan_outside_sibling_work_kind::fused_leader
+                  : plan_outside_sibling_work_kind::fused_follower,
+      .sibling = sibling,
+  };
+}
+
+inline void assign_plan_outside_classes_for_strict_tree_sibling_pair_task_local(
+    lazy_multisite_chart& chart, chart_execution_plan const& plan,
+    site_pattern_set const& patterns, clade_id first, clade_id second,
+    outside_context_key_workspace& key_workspace,
+    plan_outside_clade_work_stats& stats) {
+  auto const occurrences = plan.child_occurrences_for_clade(first);
+  if (occurrences.size() != 1) {
+    throw std::logic_error(
+        "lazy outside chart: fused child lacks one strict-tree occurrence");
+  }
+  auto const occurrence = occurrences.front();
+  auto const pid = occurrence.production;
+  auto const& production = plan.production(pid);
+  auto const children = plan.children(pid);
+  if (!production.is_binary() || occurrence.child_slot >= children.size() ||
+      children[std::size_t{1} - occurrence.child_slot] != second) {
+    throw std::logic_error(
+        "lazy outside chart: fused clades are not binary siblings");
+  }
+
+  auto& first_by_pattern = key_workspace.outside_by_pattern;
+  if (!try_collect_plan_strict_binary_outside_context_classes_direct(
+          chart, plan, pid, key_workspace)) {
+    (void)collect_outside_context_keys(chart, plan, patterns, pid,
+                                       key_workspace);
+  }
+  auto const& context_classes = key_workspace.grouping;
+  auto const context_count = context_classes.class_count();
+
+  auto& first_class_map =
+      chart.outside_class_index_by_pattern_by_clade[first];
+  auto& second_class_map =
+      chart.outside_class_index_by_pattern_by_clade[second];
+  if (!first_class_map) first_class_map.emplace();
+  if (!second_class_map) second_class_map.emplace();
+  first_class_map->assign(context_classes.class_by_input.begin(),
+                          context_classes.class_by_input.end());
+  second_class_map->assign(context_classes.class_by_input.begin(),
+                           context_classes.class_by_input.end());
+
+  if (first_by_pattern.capacity() < chart.pattern_count) {
+    first_by_pattern.reserve(chart.pattern_count);
+    ++key_workspace.outside_pattern_capacity_growths;
+  }
+  first_by_pattern.assign(context_count,
+                          parsimony_chart_detail::make_inf_row());
+  auto& second_by_pattern = chart.outside_rows_by_clade[second];
+  second_by_pattern.assign(context_count,
+                           parsimony_chart_detail::make_inf_row());
+
+  for (auto context_class : context_classes.lexicographic_class_order) {
+    auto const representative =
+        context_classes.representative_by_class[context_class];
+    auto const parent_outside_class = outside_class_index_for_pattern(
+        chart, production.parent, representative);
+    auto const& parent_outside_rows =
+        chart.outside_rows_by_clade[production.parent];
+    if (parent_outside_class >= parent_outside_rows.size()) {
+      throw std::runtime_error(
+          "lazy chart: parent outside class out of range");
+    }
+    auto const& parent_outside = parent_outside_rows[parent_outside_class];
+    std::array<row_type, 2> contributions{
+        parsimony_chart_detail::make_inf_row(),
+        parsimony_chart_detail::make_inf_row()};
+    auto inside_row = [&](clade_id child) -> row_type const& {
+      auto const class_index = plan_inside_class_index_for_pattern(
+          chart, plan, patterns, child, representative);
+      auto const& child_rows = chart.inside_rows_by_clade[child];
+      if (class_index >= child_rows.size()) {
+        throw std::runtime_error(
+            "lazy chart: child inside class index out of range");
+      }
+      return child_rows[class_index];
+    };
+    auto const& left_inside = inside_row(children[0]);
+    auto const& right_inside = inside_row(children[1]);
+
+    // This certified strict-binary path consumes both sibling rows together.
+    // Fetch each immutable inside row once per context rather than once for
+    // every parent state through the generic provider/consumer boundary.
+    for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+         ++parent_state) {
+      auto const base = parent_outside[parent_state];
+      if (base >= chart_inf) continue;
+      std::array<chart_cost, 2> child_best{chart_inf, chart_inf};
+      for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+           ++child_state) {
+        auto const transition =
+            static_cast<chart_cost>(
+                plan.transition_cost(parent_state, child_state));
+        child_best[0] = std::min(
+            child_best[0], parsimony_chart_detail::saturated_add(
+                               left_inside[child_state], transition));
+        child_best[1] = std::min(
+            child_best[1], parsimony_chart_detail::saturated_add(
+                               right_inside[child_state], transition));
+      }
+      for (std::size_t child_slot = 0; child_slot < 2; ++child_slot) {
+        auto const sibling_slot = std::size_t{1} - child_slot;
+        auto const sibling_context =
+            parsimony_chart_detail::saturated_add(base,
+                                                  child_best[sibling_slot]);
+        if (sibling_context >= chart_inf) continue;
+        for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+             ++child_state) {
+          auto const transition = static_cast<chart_cost>(
+              plan.transition_cost(parent_state, child_state));
+          contributions[child_slot][child_state] = std::min(
+              contributions[child_slot][child_state],
+              parsimony_chart_detail::saturated_add(sibling_context,
+                                                    transition));
+        }
+      }
+    }
+    // The public work counter historically recorded one binary dispatch for
+    // each child assignment. The fused direct kernel retains that observable
+    // aggregate even though it computes both children together.
+    stats.recurrence_work.binary_stack_productions_scored += 2;
+    first_by_pattern[context_class] = contributions[occurrence.child_slot];
+    second_by_pattern[context_class] =
+        contributions[std::size_t{1} - occurrence.child_slot];
+  }
+
+  // Publishing overwrites the reusable grouping result. Both pattern maps
+  // were copied above while the context grouping was still live.
+  auto const siblings_have_identical_context_rows =
+      first_by_pattern == second_by_pattern;
+  publish_plan_outside_classes_from_context_classes(
+      chart, patterns, first, first_by_pattern, key_workspace);
+  if (siblings_have_identical_context_rows) {
+    // Equal context rows and the shared context-to-pattern map imply the same
+    // first-occurrence row partition, transformed pattern map, weights, and
+    // row payload. The first publication has already proved all checked
+    // weight additions. Reuse it through the coordinator-prepared sibling
+    // buffers instead of packing/grouping/scattering the same values twice.
+    auto const& first_rows = chart.outside_rows_by_clade[first];
+    second_by_pattern.assign(first_rows.begin(), first_rows.end());
+    second_class_map->assign(first_class_map->begin(), first_class_map->end());
+    auto& second_weights = chart.outside_class_weight_by_clade[second];
+    auto const& first_weights = chart.outside_class_weight_by_clade[first];
+    second_weights.assign(first_weights.begin(), first_weights.end());
+  } else {
+    publish_plan_outside_classes_from_context_classes(
+        chart, patterns, second, second_by_pattern, key_workspace);
   }
 }
 
@@ -2417,7 +2882,23 @@ struct plan_lazy_chart_scheduler_test_hooks {
   std::function<void(clade_id, std::size_t, std::size_t)> after_outside_clade;
   std::function<void(lazy_multisite_chart const&, std::size_t)>
       observe_outside_level_failure_cleanup;
+  std::function<void(lazy_multisite_chart const&, std::size_t,
+                     std::string_view)>
+      observe_capacity_ledger_barrier;
 };
+
+inline bool plan_lazy_chart_test_hooks_observe_execution(
+    plan_lazy_chart_scheduler_test_hooks const* hooks) noexcept {
+  return hooks != nullptr &&
+         (hooks->before_inside_clade || hooks->after_inside_clade ||
+          hooks->observe_completed_inside_clade ||
+          hooks->observe_inside_level_join ||
+          hooks->observe_inside_level_reclamation ||
+          hooks->observe_inside_level_failure_cleanup ||
+          hooks->before_outside_clade || hooks->after_outside_clade ||
+          hooks->observe_outside_level_failure_cleanup ||
+          hooks->observe_capacity_ledger_barrier);
+}
 
 // A finite lazy-chart build treats the configured byte limit as one live-set
 // envelope.  retained_resident_bytes is storage owned by the caller/state that
@@ -2440,8 +2921,27 @@ struct plan_lazy_chart_memory_report {
   std::size_t outside_reused_slot_waves = 0;
   std::size_t inside_workspace_evictions = 0;
   std::size_t outside_workspace_evictions = 0;
+  bool inside_retained_completed_output_capacity = false;
+  bool outside_retained_completed_output_capacity = false;
+  std::size_t inside_completed_output_compaction_attempts = 0;
+  std::size_t outside_completed_output_compaction_attempts = 0;
+  bool inside_certified_worker_output_allocation = false;
+  bool outside_certified_worker_output_allocation = false;
+  std::size_t inside_certified_worker_output_waves = 0;
+  std::size_t outside_certified_worker_output_waves = 0;
+  std::size_t inside_certified_worker_output_capacity_resident_bytes = 0;
+  std::size_t outside_certified_worker_output_capacity_resident_bytes = 0;
+  std::size_t certified_worker_output_bound_failures = 0;
   std::size_t inside_coordinator_capacity_resident_bytes = 0;
   std::size_t outside_coordinator_capacity_resident_bytes = 0;
+  bool inside_dependency_ready_execution = false;
+  bool outside_dependency_ready_execution = false;
+  std::size_t inside_dependency_ready_jobs = 0;
+  std::size_t outside_dependency_ready_jobs = 0;
+  std::size_t inside_dependency_ready_scheduler_operations = 0;
+  std::size_t outside_dependency_ready_scheduler_operations = 0;
+  std::size_t inside_dependency_ready_capacity_resident_bytes = 0;
+  std::size_t outside_dependency_ready_capacity_resident_bytes = 0;
   std::size_t preflight_peak_capacity_resident_bytes = 0;
   std::size_t actual_peak_capacity_resident_bytes = 0;
   std::size_t pre_submit_rejections = 0;
@@ -2497,6 +2997,30 @@ inline std::size_t plan_lazy_chart_capacity_multiply(std::size_t lhs,
                                                                      context);
 }
 
+// Optional fast-path projections must not turn an otherwise admissible build
+// into an overflow or budget rejection. Accumulate only while the complete
+// projection remains representable inside the already validated finite
+// envelope; a miss simply leaves the historical compact-after-join path in
+// force.
+inline bool try_add_plan_lazy_chart_retention_component(
+    std::size_t& projection, std::size_t component,
+    std::size_t memory_budget_bytes) noexcept {
+  if (projection > memory_budget_bytes ||
+      component > memory_budget_bytes - projection) {
+    return false;
+  }
+  projection += component;
+  return true;
+}
+
+inline bool try_multiply_plan_lazy_chart_retention_component(
+    std::size_t lhs, std::size_t rhs, std::size_t memory_budget_bytes,
+    std::size_t& product) noexcept {
+  if (lhs != 0 && rhs > memory_budget_bytes / lhs) return false;
+  product = lhs * rhs;
+  return product <= memory_budget_bytes;
+}
+
 template <class Vector>
 inline std::size_t plan_lazy_chart_vector_capacity_bytes(
     Vector const& values, std::string_view context) {
@@ -2536,6 +3060,238 @@ inline std::size_t lazy_multisite_chart_capacity_resident_bytes(
   add_nested(chart.outside_class_weight_by_clade, "lazy outside class weights");
   add_vector(chart.outside_global_min_by_pattern, "lazy outside global minima");
   return total;
+}
+
+// The finite scheduler is the sole owner of chart-capacity mutations while it
+// prepares output vectors and reclaims dependency maps.  Seed this ledger once
+// from the deliberately slow full-scan oracle above, then publish a delta only
+// after the corresponding staged vector operation succeeds.  Worker tasks only
+// change vector sizes within coordinator-prepared capacities.
+class lazy_multisite_chart_capacity_ledger {
+ public:
+  explicit lazy_multisite_chart_capacity_ledger(
+      lazy_multisite_chart const& chart)
+      : resident_bytes_(lazy_multisite_chart_capacity_resident_bytes(chart)) {}
+
+  [[nodiscard]] std::size_t resident_bytes() const noexcept {
+    return resident_bytes_;
+  }
+
+  void replace_component_resident_bytes(std::size_t previous,
+                                        std::size_t replacement,
+                                        std::string_view context) {
+    if (previous > resident_bytes_) {
+      throw std::logic_error(
+          "lazy chart capacity ledger component exceeds chart resident");
+    }
+    resident_bytes_ = plan_lazy_chart_capacity_add(
+        resident_bytes_ - previous, replacement, context);
+  }
+
+  void release_dynamic_capacity_bytes(std::size_t released) {
+    if (released > resident_bytes_) {
+      throw std::logic_error(
+          "lazy chart capacity ledger release exceeds chart resident");
+    }
+    resident_bytes_ -= released;
+  }
+
+  void add_dynamic_capacity_bytes(std::size_t added,
+                                  std::string_view context) {
+    resident_bytes_ =
+        plan_lazy_chart_capacity_add(resident_bytes_, added, context);
+  }
+
+  [[nodiscard]] bool matches_oracle(
+      lazy_multisite_chart const& chart) const {
+    return resident_bytes_ ==
+           lazy_multisite_chart_capacity_resident_bytes(chart);
+  }
+
+  void require_matches_oracle(lazy_multisite_chart const& chart) const {
+    if (!matches_oracle(chart)) {
+      throw std::logic_error(
+          "lazy chart incremental capacity ledger disagrees with oracle");
+    }
+  }
+
+ private:
+  std::size_t resident_bytes_;
+};
+
+inline void observe_plan_lazy_chart_capacity_ledger_barrier(
+    plan_lazy_chart_scheduler_test_hooks const* test_hooks,
+    lazy_multisite_chart const& chart,
+    lazy_multisite_chart_capacity_ledger const& capacity_ledger,
+    std::string_view barrier) {
+  if (test_hooks != nullptr &&
+      test_hooks->observe_capacity_ledger_barrier) {
+    test_hooks->observe_capacity_ledger_barrier(
+        chart, capacity_ledger.resident_bytes(), barrier);
+  }
+}
+
+// The certified strict-tree route keeps one scheduler operation alive while
+// worker callbacks claim newly dependency-ready jobs. The ring is allocated
+// to the exact number of phase jobs before scheduler entry and never grows in
+// a worker. Each job is enqueued exactly once, so removing a queued job always
+// creates enough room for any successors that its completion can publish.
+template <class Job>
+struct plan_lazy_chart_dependency_ready_queue {
+  explicit plan_lazy_chart_dependency_ready_queue(std::size_t total)
+      : ring(total), total_jobs(total) {}
+
+  void seed(Job job) {
+    std::lock_guard lock{mutex};
+    if (completed != 0 || stopped) {
+      throw std::logic_error(
+          "lazy chart dependency-ready queue seeded after execution");
+    }
+    enqueue_unlocked(job);
+  }
+
+  [[nodiscard]] bool pop(Job& job) {
+    std::unique_lock lock{mutex};
+    ready.wait(lock, [&] {
+      return stopped || queued != 0 || completed == total_jobs;
+    });
+    if (stopped || queued == 0) return false;
+    job = ring[head];
+    head = (head + 1) % ring.size();
+    --queued;
+    ++active;
+    return true;
+  }
+
+  void complete_and_push(std::span<Job const> successors) {
+    bool wake_all = false;
+    {
+      std::lock_guard lock{mutex};
+      if (active == 0 || completed >= total_jobs) {
+        throw std::logic_error(
+            "lazy chart dependency-ready completion overflow");
+      }
+      if (!stopped) {
+        for (auto successor : successors) enqueue_unlocked(successor);
+      }
+      --active;
+      ++completed;
+      if (!stopped && queued == 0 && active == 0 &&
+          completed != total_jobs) {
+        // A failed job deliberately publishes no successor. Drain every
+        // independent reachable branch first, then wake all waiters once only
+        // failed-dependent jobs remain unreachable.
+        stopped = true;
+      }
+      wake_all = stopped || completed == total_jobs ||
+                 successors.size() > std::size_t{1};
+    }
+    if (wake_all) {
+      ready.notify_all();
+    } else if (!successors.empty()) {
+      ready.notify_one();
+    }
+  }
+
+  void complete_failed() {
+    complete_and_push(std::span<Job const>{});
+  }
+
+  void cancel(std::exception_ptr failure = {}) {
+    {
+      std::lock_guard lock{mutex};
+      if (failure && !infrastructure_failure) {
+        infrastructure_failure = std::move(failure);
+      }
+      stopped = true;
+    }
+    ready.notify_all();
+  }
+
+  [[nodiscard]] std::exception_ptr captured_infrastructure_failure() {
+    std::lock_guard lock{mutex};
+    return infrastructure_failure;
+  }
+
+  [[nodiscard]] bool finished_successfully() {
+    std::lock_guard lock{mutex};
+    return !stopped && completed == total_jobs && enqueued == total_jobs &&
+           queued == 0;
+  }
+
+  [[nodiscard]] std::size_t capacity_resident_bytes() const {
+    return plan_lazy_chart_capacity_add(
+        sizeof(*this),
+        plan_lazy_chart_vector_capacity_bytes(
+            ring, "lazy chart dependency-ready ring"),
+        "lazy chart dependency-ready queue");
+  }
+
+ private:
+  void enqueue_unlocked(Job job) {
+    if (ring.empty() || enqueued >= total_jobs || queued >= ring.size()) {
+      throw std::logic_error(
+          "lazy chart dependency-ready enqueue exceeded its fixed ring");
+    }
+    ring[tail] = job;
+    tail = (tail + 1) % ring.size();
+    ++queued;
+    ++enqueued;
+  }
+
+  std::vector<Job> ring;
+  mutable std::mutex mutex;
+  std::condition_variable ready;
+  std::size_t head = 0;
+  std::size_t tail = 0;
+  std::size_t queued = 0;
+  std::size_t enqueued = 0;
+  std::size_t active = 0;
+  std::size_t completed = 0;
+  std::size_t total_jobs = 0;
+  bool stopped = false;
+  std::exception_ptr infrastructure_failure;
+};
+
+struct plan_lazy_inside_dependency_ready_state {
+  explicit plan_lazy_inside_dependency_ready_state(std::size_t clade_count)
+      : ready(clade_count), remaining_children(clade_count) {}
+
+  [[nodiscard]] std::size_t capacity_resident_bytes() const {
+    return plan_lazy_chart_capacity_add(
+        sizeof(*this) - sizeof(ready),
+        plan_lazy_chart_capacity_add(
+            ready.capacity_resident_bytes(),
+            plan_lazy_chart_vector_capacity_bytes(
+                remaining_children,
+                "lazy inside dependency-ready child counts"),
+            "lazy inside dependency-ready state"),
+        "lazy inside dependency-ready state");
+  }
+
+  plan_lazy_chart_dependency_ready_queue<clade_id> ready;
+  std::vector<std::atomic<std::uint32_t>> remaining_children;
+};
+
+inline std::size_t logical_plan_lazy_inside_dependency_ready_bytes(
+    std::size_t clade_count) {
+  auto const dynamic = plan_lazy_chart_capacity_multiply(
+      clade_count,
+      sizeof(clade_id) + sizeof(std::atomic<std::uint32_t>),
+      "lazy inside dependency-ready arrays");
+  return plan_lazy_chart_capacity_add(
+      sizeof(plan_lazy_inside_dependency_ready_state), dynamic,
+      "lazy inside dependency-ready state");
+}
+
+inline std::size_t logical_plan_lazy_outside_dependency_ready_bytes(
+    std::size_t production_count) {
+  return plan_lazy_chart_capacity_add(
+      sizeof(plan_lazy_chart_dependency_ready_queue<production_id>),
+      plan_lazy_chart_capacity_multiply(
+          production_count, sizeof(production_id),
+          "lazy outside dependency-ready ring"),
+      "lazy outside dependency-ready state");
 }
 
 struct plan_lazy_chart_scheduler_workspace {
@@ -3072,6 +3828,7 @@ inline std::pair<std::size_t, std::size_t> plan_outside_clade_shape(
 inline plan_lazy_slot_preparation_report prepare_plan_inside_clade_output(
     lazy_multisite_chart& chart, chart_execution_plan const& plan,
     clade_id clade, lazy_chart_options const& options,
+    lazy_multisite_chart_capacity_ledger& capacity_ledger,
     std::size_t chart_peak_acceptance_limit_bytes =
         (std::numeric_limits<std::size_t>::max)()) {
   auto const pattern_count = chart.pattern_count;
@@ -3086,8 +3843,7 @@ inline plan_lazy_slot_preparation_report prepare_plan_inside_clade_output(
                                      plan_lazy_chart_vector_capacity_bytes(
                                          values, "lazy inside output vector"),
                                      "lazy inside output vector");
-    auto const chart_before =
-        lazy_multisite_chart_capacity_resident_bytes(chart);
+    auto const chart_before = capacity_ledger.resident_bytes();
     auto const other = chart_before - component_before;
     if (other > chart_peak_acceptance_limit_bytes) {
       throw lazy_key_grouping_detail::packed_key_grouping_budget_error(
@@ -3111,6 +3867,10 @@ inline plan_lazy_slot_preparation_report prepare_plan_inside_clade_output(
             vector_report.observed_prepublication_peak_capacity_resident_bytes -
                 vector_report.previous_capacity_resident_bytes,
             "lazy inside output preparation peak"));
+    capacity_ledger.replace_component_resident_bytes(
+        vector_report.previous_capacity_resident_bytes,
+        vector_report.prepared_capacity_resident_bytes,
+        "lazy inside output capacity publication");
   };
   prepare_vector(chart.inside_rows_by_clade[clade], row_count);
   prepare_vector(chart.class_weight_by_clade[clade], row_count);
@@ -3125,15 +3885,18 @@ inline plan_lazy_slot_preparation_report prepare_plan_inside_clade_output(
     prepare_vector(*class_map, pattern_count);
     prepare_vector(*structural_map, pattern_count);
   }
-  report.stable_resident_bytes =
-      lazy_multisite_chart_capacity_resident_bytes(chart);
+  report.stable_resident_bytes = capacity_ledger.resident_bytes();
   report.peak_resident_bytes =
       std::max(report.peak_resident_bytes, report.stable_resident_bytes);
+#ifndef NDEBUG
+  capacity_ledger.require_matches_oracle(chart);
+#endif
   return report;
 }
 
 inline plan_lazy_slot_preparation_report prepare_plan_outside_clade_output(
     lazy_multisite_chart& chart, clade_id clade,
+    lazy_multisite_chart_capacity_ledger& capacity_ledger,
     std::size_t chart_peak_acceptance_limit_bytes =
         (std::numeric_limits<std::size_t>::max)()) {
   auto const pattern_count = chart.pattern_count;
@@ -3144,8 +3907,7 @@ inline plan_lazy_slot_preparation_report prepare_plan_outside_clade_output(
                                      plan_lazy_chart_vector_capacity_bytes(
                                          values, "lazy outside output vector"),
                                      "lazy outside output vector");
-    auto const chart_before =
-        lazy_multisite_chart_capacity_resident_bytes(chart);
+    auto const chart_before = capacity_ledger.resident_bytes();
     auto const other = chart_before - component_before;
     if (other > chart_peak_acceptance_limit_bytes) {
       throw lazy_key_grouping_detail::packed_key_grouping_budget_error(
@@ -3169,16 +3931,97 @@ inline plan_lazy_slot_preparation_report prepare_plan_outside_clade_output(
             vector_report.observed_prepublication_peak_capacity_resident_bytes -
                 vector_report.previous_capacity_resident_bytes,
             "lazy outside output preparation peak"));
+    capacity_ledger.replace_component_resident_bytes(
+        vector_report.previous_capacity_resident_bytes,
+        vector_report.prepared_capacity_resident_bytes,
+        "lazy outside output capacity publication");
   };
   prepare_vector(chart.outside_rows_by_clade[clade]);
   prepare_vector(chart.outside_class_weight_by_clade[clade]);
   auto& class_map = chart.outside_class_index_by_pattern_by_clade[clade];
   if (!class_map) class_map.emplace();
   prepare_vector(*class_map);
-  report.stable_resident_bytes =
-      lazy_multisite_chart_capacity_resident_bytes(chart);
+  report.stable_resident_bytes = capacity_ledger.resident_bytes();
   report.peak_resident_bytes =
       std::max(report.peak_resident_bytes, report.stable_resident_bytes);
+#ifndef NDEBUG
+  capacity_ledger.require_matches_oracle(chart);
+#endif
+  return report;
+}
+
+struct plan_lazy_chart_compaction_report {
+  bool compacted = false;
+  std::size_t stable_resident_bytes = 0;
+  std::size_t observed_peak_resident_bytes = 0;
+};
+
+// Completed row and weight vectors were prepared for the pattern-count worst
+// case, but their immutable class-count payload is commonly much smaller.
+// Compact one vector at a time through unpublished storage.  The old and new
+// allocations are both admitted before reserve, and publication is a noexcept
+// swap, so allocation failure leaves the completed output untouched.
+template <class Vector>
+inline plan_lazy_chart_compaction_report
+compact_completed_plan_lazy_chart_vector(
+    Vector& values, lazy_multisite_chart_capacity_ledger& capacity_ledger,
+    std::size_t chart_peak_acceptance_limit_bytes =
+        (std::numeric_limits<std::size_t>::max)()) {
+  plan_lazy_chart_compaction_report report{
+      .stable_resident_bytes = capacity_ledger.resident_bytes(),
+      .observed_peak_resident_bytes = capacity_ledger.resident_bytes(),
+  };
+  auto const previous_dynamic = plan_lazy_chart_vector_capacity_bytes(
+      values, "lazy completed output old capacity");
+  auto const replacement_dynamic = lazy_key_grouping_detail::
+      frozen_libstdcxx_allocate_at_least_capacity_bytes<
+          typename Vector::value_type>(
+          values.size(), "lazy completed output compact capacity");
+  if (replacement_dynamic >= previous_dynamic) return report;
+
+  auto const projected_peak = plan_lazy_chart_capacity_add(
+      capacity_ledger.resident_bytes(),
+      plan_lazy_chart_capacity_add(sizeof(Vector), replacement_dynamic,
+                                   "lazy completed output compact staging"),
+      "lazy completed output compact peak");
+  if (projected_peak > chart_peak_acceptance_limit_bytes) return report;
+
+  Vector staged;
+  try {
+    staged.reserve(values.size());
+  } catch (std::bad_alloc const&) {
+    return report;
+  }
+  auto const measured_dynamic = plan_lazy_chart_vector_capacity_bytes(
+      staged, "lazy completed output measured compact capacity");
+  auto const measured_peak = plan_lazy_chart_capacity_add(
+      capacity_ledger.resident_bytes(),
+      plan_lazy_chart_capacity_add(sizeof(Vector), measured_dynamic,
+                                   "lazy completed output compact staging"),
+      "lazy completed output compact peak");
+  if (measured_peak > chart_peak_acceptance_limit_bytes) {
+    throw lazy_key_grouping_detail::packed_key_grouping_budget_error(
+        measured_peak, chart_peak_acceptance_limit_bytes, measured_peak);
+  }
+  if (measured_dynamic >= previous_dynamic) {
+    report.observed_peak_resident_bytes = measured_peak;
+    return report;
+  }
+
+  staged.assign(values.begin(), values.end());
+  auto const previous_resident = plan_lazy_chart_capacity_add(
+      sizeof(values), previous_dynamic,
+      "lazy completed output old resident capacity");
+  auto const replacement_resident = plan_lazy_chart_capacity_add(
+      sizeof(values), measured_dynamic,
+      "lazy completed output compact resident capacity");
+  values.swap(staged);
+  capacity_ledger.replace_component_resident_bytes(
+      previous_resident, replacement_resident,
+      "lazy completed output compact publication");
+  report.compacted = true;
+  report.stable_resident_bytes = capacity_ledger.resident_bytes();
+  report.observed_peak_resident_bytes = measured_peak;
   return report;
 }
 
@@ -3260,10 +4103,14 @@ inline chart_indexed_range_options plan_lazy_chart_clade_range_options();
 inline void reserve_plan_lazy_chart_run_summaries(
     std::vector<chart_scheduler_run_summary>* runs, std::size_t count,
     std::string_view context);
-inline void clear_plan_inside_clade_output(lazy_multisite_chart& chart,
-                                           clade_id clade) noexcept;
-inline void clear_plan_outside_clade_output(lazy_multisite_chart& chart,
-                                            clade_id clade) noexcept;
+inline std::size_t clear_plan_inside_clade_output(
+    lazy_multisite_chart& chart, clade_id clade);
+inline std::size_t clear_plan_outside_clade_output(
+    lazy_multisite_chart& chart, clade_id clade);
+inline std::size_t release_plan_inside_clade_output(
+    lazy_multisite_chart& chart, clade_id clade);
+inline std::size_t release_plan_outside_clade_output(
+    lazy_multisite_chart& chart, clade_id clade);
 
 inline std::size_t logical_plan_outside_clade_output_bytes(
     std::size_t pattern_count) {
@@ -3271,6 +4118,48 @@ inline std::size_t logical_plan_outside_clade_output_bytes(
       pattern_count,
       sizeof(row_type) + sizeof(std::uint32_t) + sizeof(std::size_t),
       "lazy outside admitted output");
+}
+
+// A certified worker-output wave starts with empty per-clade output vectors.
+// The worker kernels grow each disjoint vector monotonically and never shrink
+// its capacity, so the capacities visible at the joined barrier are both the
+// published resident delta and the allocation high-water for that output.
+inline std::size_t plan_inside_clade_output_dynamic_capacity_bytes(
+    lazy_multisite_chart const& chart, clade_id clade) {
+  std::size_t total = 0;
+  auto add = [&](auto const& values, std::string_view context) {
+    total = plan_lazy_chart_capacity_add(
+        total, plan_lazy_chart_vector_capacity_bytes(values, context),
+        "lazy inside completed worker output");
+  };
+  add(chart.inside_rows_by_clade[clade], "lazy inside worker rows");
+  add(chart.class_weight_by_clade[clade], "lazy inside worker weights");
+  if (auto const& map = chart.class_index_by_pattern_by_clade[clade]) {
+    add(*map, "lazy inside worker class map");
+  }
+  if (auto const& map =
+          chart.structural_class_index_by_pattern_by_clade[clade]) {
+    add(*map, "lazy inside worker structural map");
+  }
+  return total;
+}
+
+inline std::size_t plan_outside_clade_output_dynamic_capacity_bytes(
+    lazy_multisite_chart const& chart, clade_id clade) {
+  std::size_t total = 0;
+  auto add = [&](auto const& values, std::string_view context) {
+    total = plan_lazy_chart_capacity_add(
+        total, plan_lazy_chart_vector_capacity_bytes(values, context),
+        "lazy outside completed worker output");
+  };
+  add(chart.outside_rows_by_clade[clade], "lazy outside worker rows");
+  add(chart.outside_class_weight_by_clade[clade],
+      "lazy outside worker weights");
+  if (auto const& map =
+          chart.outside_class_index_by_pattern_by_clade[clade]) {
+    add(*map, "lazy outside worker class map");
+  }
+  return total;
 }
 
 inline std::size_t plan_lazy_chart_scheduler_resident_bytes(
@@ -3351,6 +4240,341 @@ inline std::size_t logical_plan_inside_coordinator_bytes(
   return total;
 }
 
+inline chart_indexed_range_options
+plan_lazy_chart_dependency_ready_range_options() {
+  return chart_indexed_range_options{
+      .minimum_grain = 1,
+      .target_ranges_per_worker = 1,
+  };
+}
+
+inline bool try_build_plan_lazy_inside_chart_dependency_ready(
+    lazy_multisite_chart& chart, chart_execution_plan const& plan,
+    site_pattern_set const& patterns, lazy_chart_options const& options,
+    chart_scheduler& scheduler, std::span<clade_id const> level_order,
+    std::vector<chart_scheduler_run_summary>* level_runs,
+    plan_lazy_chart_scheduler_workspace& scheduler_workspace,
+    plan_lazy_chart_memory_options const& memory_options,
+    plan_lazy_chart_memory_report* memory_report,
+    lazy_multisite_chart_capacity_ledger& chart_capacity,
+    std::vector<plan_inside_clade_work_stats>& stats_by_clade,
+    std::vector<std::exception_ptr>& errors_by_clade,
+    std::size_t retained_resident_bytes, std::size_t coordinator_bytes,
+    std::size_t retained_maximum_slot_count,
+    std::size_t certified_worker_output_capacity_limit) {
+  auto const clade_count = plan.clades().size();
+  auto const loop_count =
+      std::min(clade_count, retained_maximum_slot_count);
+  if (clade_count == 0 || loop_count == 0 ||
+      scheduler_workspace.inside_by_slot.size() < loop_count) {
+    return false;
+  }
+  for (auto clade : level_order) {
+    if (plan_inside_clade_output_dynamic_capacity_bytes(chart, clade) != 0) {
+      if (memory_report != nullptr) {
+        ++memory_report->certified_worker_output_bound_failures;
+      }
+      return false;
+    }
+  }
+
+  auto const range_options =
+      plan_lazy_chart_dependency_ready_range_options();
+  auto const range_plan =
+      scheduler.plan_indexed_ranges(loop_count, range_options);
+  auto const scheduler_operation_bytes =
+      estimate_chart_scheduler_operation_peak_bytes(range_plan);
+  auto const logical_ready_bytes =
+      logical_plan_lazy_inside_dependency_ready_bytes(clade_count);
+  auto const budget = memory_options.memory_budget_bytes;
+  std::size_t logical_projection = 0;
+  auto const logical_fits =
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection, retained_resident_bytes, budget) &&
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection, chart_capacity.resident_bytes(), budget) &&
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection, coordinator_bytes, budget) &&
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection,
+          scheduler_workspace.inside_capacity_resident_bytes(), budget) &&
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection, logical_ready_bytes, budget) &&
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection, scheduler_operation_bytes, budget) &&
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection, certified_worker_output_capacity_limit, budget);
+  if (!logical_fits) return false;
+  record_plan_lazy_chart_preflight(memory_report, logical_projection);
+
+  plan_lazy_inside_dependency_ready_state ready_state{clade_count};
+  for (clade_id clade = 0; clade < clade_count; ++clade) {
+    ready_state.remaining_children[clade].store(
+        plan.clade(clade).is_leaf() ? 0u : 2u,
+        std::memory_order_relaxed);
+  }
+  std::size_t seed_count = 0;
+  for (auto clade : level_order) {
+    if (!plan.clade(clade).is_leaf()) continue;
+    ready_state.ready.seed(clade);
+    ++seed_count;
+  }
+  if (seed_count == 0) {
+    throw std::logic_error(
+        "lazy inside dependency-ready tree has no leaf seed");
+  }
+
+  auto const ready_bytes = ready_state.capacity_resident_bytes();
+  auto const route_coordinator_bytes = plan_lazy_chart_capacity_add(
+      coordinator_bytes, ready_bytes,
+      "lazy inside dependency-ready coordinator");
+  auto actual_base = plan_lazy_chart_capacity_add(
+      retained_resident_bytes, chart_capacity.resident_bytes(),
+      "lazy inside dependency-ready live capacity");
+  actual_base = plan_lazy_chart_capacity_add(
+      actual_base, route_coordinator_bytes,
+      "lazy inside dependency-ready live capacity");
+  actual_base = plan_lazy_chart_capacity_add(
+      actual_base, scheduler_workspace.inside_capacity_resident_bytes(),
+      "lazy inside dependency-ready live capacity");
+  record_plan_lazy_chart_actual_peak(memory_report, actual_base);
+  if (actual_base > budget) {
+    reject_plan_lazy_chart_already_observed(
+        memory_options, memory_report, plan_lazy_chart_memory_phase::inside,
+        actual_base);
+  }
+  auto scheduler_projection = plan_lazy_chart_capacity_add(
+      actual_base, scheduler_operation_bytes,
+      "lazy inside dependency-ready scheduler operation");
+  scheduler_projection = plan_lazy_chart_capacity_add(
+      scheduler_projection, certified_worker_output_capacity_limit,
+      "lazy inside dependency-ready certified outputs");
+  if (scheduler_projection > budget) return false;
+  record_plan_lazy_chart_preflight(memory_report, scheduler_projection);
+
+  if (memory_report != nullptr) {
+    memory_report->inside_dependency_ready_execution = true;
+    memory_report->inside_dependency_ready_jobs = clade_count;
+    memory_report->inside_dependency_ready_capacity_resident_bytes =
+        ready_bytes;
+    memory_report->inside_coordinator_capacity_resident_bytes =
+        route_coordinator_bytes;
+    ++memory_report->inside_dependency_ready_scheduler_operations;
+    ++memory_report->inside_admission_waves;
+    ++memory_report->inside_reused_slot_waves;
+    memory_report->inside_max_admitted_slots =
+        std::max(memory_report->inside_max_admitted_slots, loop_count);
+    ++memory_report->scheduler_submissions;
+  }
+  record_plan_lazy_chart_actual_peak(
+      memory_report,
+      plan_lazy_chart_capacity_add(
+          actual_base, scheduler_operation_bytes,
+          "lazy inside dependency-ready entered scheduler"));
+
+  auto release_all_outputs = [&] {
+    std::size_t released = 0;
+    for (auto clade : level_order) {
+      released = plan_lazy_chart_capacity_add(
+          released, release_plan_inside_clade_output(chart, clade),
+          "lazy inside dependency-ready cleanup");
+    }
+    return released;
+  };
+  auto record_unpublished_output_peak = [&] {
+    auto observed = plan_lazy_chart_capacity_add(
+        retained_resident_bytes,
+        lazy_multisite_chart_capacity_resident_bytes(chart),
+        "lazy inside dependency-ready unpublished output");
+    observed = plan_lazy_chart_capacity_add(
+        observed, route_coordinator_bytes,
+        "lazy inside dependency-ready unpublished output");
+    observed = plan_lazy_chart_capacity_add(
+        observed, scheduler_workspace.inside_capacity_resident_bytes(),
+        "lazy inside dependency-ready unpublished output");
+    observed = plan_lazy_chart_capacity_add(
+        observed, scheduler_operation_bytes,
+        "lazy inside dependency-ready unpublished output");
+    record_plan_lazy_chart_actual_peak(memory_report, observed);
+  };
+
+  chart_scheduler_run_summary failed_run;
+  chart_scheduler_run_summary run;
+  try {
+    run = scheduler.for_each_indexed_range(
+        loop_count, range_options,
+        [&](chart_indexed_range const&, std::size_t stable_slot,
+            chart_scheduler_cancellation_token const&) {
+          if (stable_slot >= scheduler_workspace.inside_by_slot.size()) {
+            ready_state.ready.cancel(std::make_exception_ptr(
+                std::logic_error(
+                    "lazy inside dependency-ready scheduler slot out of "
+                    "range")));
+            return;
+          }
+          auto& workspace =
+              scheduler_workspace.inside_by_slot[stable_slot];
+          for (;;) {
+            clade_id clade = no_clade;
+            try {
+              if (!ready_state.ready.pop(clade)) return;
+            } catch (...) {
+              ready_state.ready.cancel(std::current_exception());
+              return;
+            }
+            try {
+              if (plan.clade(clade).is_leaf()) {
+                assign_plan_leaf_classes(chart, plan, patterns, clade,
+                                         options);
+              } else {
+                auto keys = collect_plan_parent_keys(
+                    chart, plan, patterns, clade, workspace);
+                assign_plan_internal_classes_task_local(
+                    chart, plan, patterns, clade, keys,
+                    stats_by_clade[clade]);
+              }
+            } catch (...) {
+              errors_by_clade[clade] = std::current_exception();
+              try {
+                ready_state.ready.complete_failed();
+              } catch (...) {
+                ready_state.ready.cancel(std::current_exception());
+                return;
+              }
+              continue;
+            }
+            try {
+              std::array<clade_id, 1> successors{};
+              std::size_t successor_count = 0;
+              if (clade != plan.root_clade()) {
+                auto const occurrences =
+                    plan.child_occurrences_for_clade(clade);
+                if (occurrences.size() != 1) {
+                  throw std::logic_error(
+                      "lazy inside dependency-ready child occurrence is not "
+                      "unique");
+                }
+                auto const parent =
+                    plan.production(occurrences.front().production).parent;
+                auto const previous =
+                    ready_state.remaining_children[parent].fetch_sub(
+                        1, std::memory_order_acq_rel);
+                if (previous == 0 || previous > 2) {
+                  throw std::logic_error(
+                      "lazy inside dependency-ready child count underflow");
+                }
+                if (previous == 1) {
+                  successors[successor_count++] = parent;
+                }
+              }
+              ready_state.ready.complete_and_push(
+                  std::span<clade_id const>{successors.data(),
+                                            successor_count});
+            } catch (...) {
+              ready_state.ready.cancel(std::current_exception());
+              return;
+            }
+          }
+        },
+        &failed_run);
+    if (level_runs != nullptr) level_runs->push_back(run);
+  } catch (...) {
+    ready_state.ready.cancel();
+    record_unpublished_output_peak();
+    (void)release_all_outputs();
+#ifndef NDEBUG
+    chart_capacity.require_matches_oracle(chart);
+#endif
+    if (level_runs != nullptr && failed_run.failed) {
+      level_runs->push_back(failed_run);
+    }
+    throw;
+  }
+
+  std::exception_ptr selected_error;
+  for (auto clade : level_order) {
+    if (errors_by_clade[clade]) {
+      selected_error = errors_by_clade[clade];
+      break;
+    }
+  }
+  if (!selected_error) {
+    selected_error =
+        ready_state.ready.captured_infrastructure_failure();
+  }
+  if (!selected_error && !ready_state.ready.finished_successfully()) {
+    selected_error = std::make_exception_ptr(std::logic_error(
+        "lazy inside dependency-ready queue ended incompletely"));
+  }
+  if (selected_error) {
+    record_unpublished_output_peak();
+    (void)release_all_outputs();
+#ifndef NDEBUG
+    chart_capacity.require_matches_oracle(chart);
+#endif
+    std::rethrow_exception(selected_error);
+  }
+
+  std::size_t output_capacity = 0;
+  for (auto clade : level_order) {
+    output_capacity = plan_lazy_chart_capacity_add(
+        output_capacity,
+        plan_inside_clade_output_dynamic_capacity_bytes(chart, clade),
+        "lazy inside dependency-ready completed output");
+  }
+  if (output_capacity > certified_worker_output_capacity_limit) {
+    if (memory_report != nullptr) {
+      ++memory_report->certified_worker_output_bound_failures;
+    }
+    record_unpublished_output_peak();
+    (void)release_all_outputs();
+#ifndef NDEBUG
+    chart_capacity.require_matches_oracle(chart);
+#endif
+    throw std::logic_error(
+        "lazy inside dependency-ready output exceeded its certified "
+        "capacity surface");
+  }
+  chart_capacity.add_dynamic_capacity_bytes(
+      output_capacity, "lazy inside dependency-ready output publication");
+  auto observed = plan_lazy_chart_capacity_add(
+      retained_resident_bytes, chart_capacity.resident_bytes(),
+      "lazy inside dependency-ready output join");
+  observed = plan_lazy_chart_capacity_add(
+      observed, route_coordinator_bytes,
+      "lazy inside dependency-ready output join");
+  observed = plan_lazy_chart_capacity_add(
+      observed, scheduler_workspace.inside_capacity_resident_bytes(),
+      "lazy inside dependency-ready output join");
+  observed = plan_lazy_chart_capacity_add(
+      observed, scheduler_operation_bytes,
+      "lazy inside dependency-ready output join");
+  record_plan_lazy_chart_actual_peak(memory_report, observed);
+  if (observed > budget) {
+    if (memory_report != nullptr) {
+      ++memory_report->certified_worker_output_bound_failures;
+    }
+    auto const released = release_all_outputs();
+    chart_capacity.release_dynamic_capacity_bytes(released);
+#ifndef NDEBUG
+    chart_capacity.require_matches_oracle(chart);
+#endif
+    throw plan_lazy_chart_memory_budget_error(
+        plan_lazy_chart_memory_phase::inside, observed, budget);
+  }
+  if (memory_report != nullptr) {
+    memory_report->inside_certified_worker_output_allocation = true;
+    ++memory_report->inside_certified_worker_output_waves;
+    memory_report
+        ->inside_certified_worker_output_capacity_resident_bytes =
+        output_capacity;
+  }
+#ifndef NDEBUG
+  chart_capacity.require_matches_oracle(chart);
+#endif
+  return true;
+}
+
 inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
     lazy_multisite_chart chart, chart_execution_plan const& plan,
     site_pattern_set const& patterns, lazy_chart_options const& options,
@@ -3374,6 +4598,9 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
       memory_options.retained_resident_bytes,
       plan_lazy_chart_scheduler_resident_bytes(scheduler),
       "lazy inside retained scheduler capacity");
+  lazy_multisite_chart_capacity_ledger chart_capacity{chart};
+  observe_plan_lazy_chart_capacity_ledger_barrier(
+      test_hooks, chart, chart_capacity, "inside-initial");
 
   // Reuse prepared finite scratch when it can participate in this scheduler.
   // An oversized slot array cannot be used by the resolved worker topology and
@@ -3387,8 +4614,7 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
       logical_plan_inside_coordinator_bytes(clade_count, sparse, level_runs);
   auto project_coordinator = [&] {
     auto projection = plan_lazy_chart_capacity_add(
-        retained_resident_bytes,
-        lazy_multisite_chart_capacity_resident_bytes(chart),
+        retained_resident_bytes, chart_capacity.resident_bytes(),
         "lazy inside coordinator preflight");
     projection =
         plan_lazy_chart_capacity_add(projection, coordinator_projection,
@@ -3430,8 +4656,7 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
         coordinator_bytes;
   }
   auto actual = plan_lazy_chart_capacity_add(
-      retained_resident_bytes,
-      lazy_multisite_chart_capacity_resident_bytes(chart),
+      retained_resident_bytes, chart_capacity.resident_bytes(),
       "lazy inside coordinator capacity");
   actual = plan_lazy_chart_capacity_add(actual, coordinator_bytes,
                                         "lazy inside coordinator capacity");
@@ -3447,6 +4672,214 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
   require_plan_lazy_chart_memory_budget(memory_options, memory_report,
                                         plan_lazy_chart_memory_phase::inside,
                                         actual);
+
+  auto prepare_inside_slots = [&](std::size_t slot_count,
+                                  std::size_t maximum_row_width) {
+    for (std::size_t slot = 0; slot < slot_count; ++slot) {
+      auto& workspace = scheduler_workspace.inside_by_slot[slot];
+      auto workspace_live = plan_lazy_chart_capacity_add(
+          retained_resident_bytes, chart_capacity.resident_bytes(),
+          "lazy inside slot preparation");
+      workspace_live = plan_lazy_chart_capacity_add(
+          workspace_live, coordinator_bytes, "lazy inside slot preparation");
+      workspace_live = plan_lazy_chart_capacity_add(
+          workspace_live,
+          scheduler_workspace.inside_capacity_resident_bytes(),
+          "lazy inside slot preparation");
+      auto const workspace_resident = workspace.resident_bytes();
+      if (workspace_live < workspace_resident) {
+        throw std::logic_error(
+            "lazy inside slot is absent from scheduler live capacity");
+      }
+      auto const outside_workspace = workspace_live - workspace_resident;
+      if (outside_workspace > memory_options.memory_budget_bytes) {
+        reject_plan_lazy_chart_already_observed(
+            memory_options, memory_report,
+            plan_lazy_chart_memory_phase::inside, workspace_live);
+      }
+      plan_lazy_slot_preparation_report preparation;
+      try {
+        preparation = prepare_plan_inside_slot(
+            workspace, chart.pattern_count, maximum_row_width,
+            memory_options.memory_budget_bytes - outside_workspace);
+      } catch (
+          lazy_key_grouping_detail::packed_key_grouping_budget_error const&
+              error) {
+        auto const required = plan_lazy_chart_capacity_add(
+            outside_workspace, error.required_bytes(),
+            "lazy inside rejected slot preparation");
+        record_plan_lazy_chart_preflight(memory_report, required);
+        record_plan_lazy_chart_actual_peak(
+            memory_report,
+            plan_lazy_rejected_preparation_actual_peak(
+                error, outside_workspace,
+                plan_lazy_chart_capacity_add(
+                    outside_workspace, workspace.resident_bytes(),
+                    "lazy inside rejected slot capacity"),
+                "lazy inside rejected slot actual peak"));
+        if (memory_report != nullptr) ++memory_report->pre_submit_rejections;
+        throw plan_lazy_chart_memory_budget_error(
+            plan_lazy_chart_memory_phase::inside, required,
+            memory_options.memory_budget_bytes);
+      }
+      auto preparation_live = plan_lazy_chart_capacity_add(
+          outside_workspace, preparation.peak_resident_bytes,
+          "lazy inside slot preparation");
+      record_plan_lazy_chart_actual_peak(memory_report, preparation_live);
+      if (preparation_live > memory_options.memory_budget_bytes) {
+        reject_plan_lazy_chart_already_observed(
+            memory_options, memory_report,
+            plan_lazy_chart_memory_phase::inside, preparation_live);
+      }
+    }
+  };
+
+  // Compaction is useful close to the finite boundary, but serially copying
+  // every completed row and weight vector is pure overhead when the caller has
+  // supplied a much larger envelope. Prove a stronger-than-required bound
+  // before retaining those prepared capacities: the initial chart plus every
+  // worst-case output, all maximum-shape worker slots, both preparation
+  // overlaps, and the largest scheduler operation must fit together. Charge a
+  // second complete output surface as eligibility headroom. This keeps exact
+  // and near-boundary budgets on the historical compaction route and absorbs
+  // any conservative allocator-capacity discrepancy; the normal measured
+  // per-wave guards remain authoritative in either mode.
+  bool retain_completed_output_capacity = false;
+  std::size_t retained_maximum_slot_count = 0;
+  std::size_t retained_maximum_row_width = 0;
+  std::size_t certified_worker_output_capacity_limit = 0;
+  if (!plan_lazy_chart_test_hooks_observe_execution(test_hooks)) {
+    auto const budget = memory_options.memory_budget_bytes;
+    std::size_t complete_output_bytes = 0;
+    std::size_t maximum_level_item_count = 0;
+    std::size_t maximum_scheduler_operation_bytes = 0;
+    bool projection_fits = true;
+    for (std::size_t level = 0; level < level_count; ++level) {
+      auto const level_begin = level_offsets[level];
+      auto const level_end = level_offsets[level + 1];
+      auto const level_item_count = level_end - level_begin;
+      maximum_level_item_count =
+          std::max(maximum_level_item_count, level_item_count);
+      if (level_item_count != 0) {
+        maximum_scheduler_operation_bytes =
+            std::max(maximum_scheduler_operation_bytes,
+                     estimate_chart_scheduler_operation_peak_bytes(
+                         scheduler.plan_indexed_ranges(
+                             level_item_count,
+                             plan_lazy_chart_clade_range_options())));
+      }
+      for (std::size_t item = level_begin; item < level_end; ++item) {
+        auto const clade = level_order[item];
+        auto const output_bytes = logical_plan_inside_clade_output_bytes(
+            plan, clade, chart.pattern_count, options);
+        if (projection_fits) {
+          projection_fits = try_add_plan_lazy_chart_retention_component(
+              complete_output_bytes, output_bytes, budget);
+        }
+        if (!plan.clade(clade).is_leaf()) {
+          retained_maximum_row_width =
+              std::max(retained_maximum_row_width,
+                       plan_inside_clade_row_key_width(plan, clade));
+        }
+      }
+    }
+    retained_maximum_slot_count =
+        std::min(worker_count, maximum_level_item_count);
+    auto const slot_bytes = logical_plan_inside_slot_resident_bytes(
+        chart.pattern_count, retained_maximum_row_width);
+    std::size_t full_slot_bytes = 0;
+    projection_fits =
+        projection_fits &&
+        try_multiply_plan_lazy_chart_retention_component(
+            retained_maximum_slot_count, slot_bytes, budget, full_slot_bytes);
+    std::size_t cold_scratch_bytes = sizeof(scheduler_workspace);
+    projection_fits =
+        projection_fits &&
+        try_add_plan_lazy_chart_retention_component(
+            cold_scratch_bytes, full_slot_bytes, budget);
+    auto const scratch_bytes =
+        std::max(cold_scratch_bytes,
+                 scheduler_workspace.inside_capacity_resident_bytes());
+    std::size_t projection = 0;
+    projection_fits =
+        projection_fits &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, retained_resident_bytes, budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, chart_capacity.resident_bytes(), budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, complete_output_bytes, budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, coordinator_bytes, budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, scratch_bytes, budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection,
+            logical_plan_inside_slot_preparation_extra_bytes(
+                chart.pattern_count),
+            budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, logical_plan_output_preparation_extra_bytes(), budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, maximum_scheduler_operation_bytes, budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, complete_output_bytes, budget);
+    retain_completed_output_capacity = projection_fits;
+    if (projection_fits) {
+      certified_worker_output_capacity_limit =
+          plan_lazy_chart_capacity_add(
+              complete_output_bytes, complete_output_bytes,
+              "lazy inside certified worker output capacity");
+    }
+  }
+  if (memory_report != nullptr) {
+    memory_report->inside_retained_completed_output_capacity =
+        retain_completed_output_capacity;
+  }
+  bool full_phase_inside_slots_prepared = false;
+  if (retain_completed_output_capacity &&
+      retained_maximum_slot_count != 0) {
+    // The retention certificate covers the larger of the measured warm pool
+    // and an exact cold maximum-shape pool, not their allocation overlap.
+    // Preserve a fully reusable pool; otherwise destroy it before constructing
+    // and preparing the certified cold replacement.
+    auto const reusable = scheduler_workspace.can_reuse_inside_slots(
+        retained_maximum_slot_count, chart.pattern_count,
+        retained_maximum_row_width);
+    if (!reusable) {
+      if (scheduler_workspace.inside_by_slot.capacity() != 0) {
+        scheduler_workspace.release_inside();
+        if (memory_report != nullptr) {
+          ++memory_report->inside_workspace_evictions;
+        }
+      }
+      scheduler_workspace.hard_bound_inside_slots(
+          retained_maximum_slot_count);
+      prepare_inside_slots(retained_maximum_slot_count,
+                           retained_maximum_row_width);
+    }
+    full_phase_inside_slots_prepared = true;
+  }
+  bool certified_worker_output_allocation =
+      retain_completed_output_capacity && full_phase_inside_slots_prepared;
+  if (worker_count > 1 && certified_worker_output_allocation &&
+      options.retain_all_inside_class_maps &&
+      !plan_lazy_chart_test_hooks_observe_execution(test_hooks) &&
+      plan_has_strict_binary_tree_outside_structure(plan) &&
+      try_build_plan_lazy_inside_chart_dependency_ready(
+          chart, plan, patterns, options, scheduler, level_order, level_runs,
+          scheduler_workspace, memory_options, memory_report, chart_capacity,
+          stats_by_clade, errors_by_clade, retained_resident_bytes,
+          coordinator_bytes, retained_maximum_slot_count,
+          certified_worker_output_capacity_limit)) {
+    for (auto clade : level_order) {
+      add_plan_inside_clade_work_stats(chart, stats_by_clade[clade]);
+    }
+    finalize_inside_counters(chart);
+    maybe_discard_nonroot_maps(chart, plan, options);
+    return chart;
+  }
+  std::size_t certified_worker_output_capacity_published = 0;
 
   for (std::size_t level = 0; level < level_count; ++level) {
     auto const level_begin = level_offsets[level];
@@ -3467,8 +4900,7 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
                                    std::size_t output_bytes) {
         auto const slot_count = std::min(worker_count, candidate);
         auto projection = plan_lazy_chart_capacity_add(
-            retained_resident_bytes,
-            lazy_multisite_chart_capacity_resident_bytes(chart),
+            retained_resident_bytes, chart_capacity.resident_bytes(),
             "lazy inside wave preflight");
         projection = plan_lazy_chart_capacity_add(projection, coordinator_bytes,
                                                   "lazy inside wave preflight");
@@ -3503,8 +4935,7 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
       auto project_reused_wave = [&](std::size_t candidate,
                                      std::size_t output_bytes) {
         auto projection = plan_lazy_chart_capacity_add(
-            retained_resident_bytes,
-            lazy_multisite_chart_capacity_resident_bytes(chart),
+            retained_resident_bytes, chart_capacity.resident_bytes(),
             "lazy inside reused wave preflight");
         projection = plan_lazy_chart_capacity_add(
             projection, coordinator_bytes, "lazy inside reused wave preflight");
@@ -3523,7 +4954,45 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
                     candidate, plan_lazy_chart_clade_range_options())),
             "lazy inside scheduler operation");
       };
-      for (std::size_t candidate = remaining; candidate != 0; --candidate) {
+      bool certified_worker_output_wave = false;
+      if (certified_worker_output_allocation && wave_begin == 0) {
+        std::size_t output_bytes = 0;
+        for (std::size_t local = 0; local < remaining; ++local) {
+          auto const clade = level_order[level_begin + local];
+          output_bytes = plan_lazy_chart_capacity_add(
+              output_bytes,
+              logical_plan_inside_clade_output_bytes(
+                  plan, clade, chart.pattern_count, options),
+              "lazy inside certified full-level output");
+          if (plan_inside_clade_output_dynamic_capacity_bytes(chart, clade) !=
+              0) {
+            if (memory_report != nullptr) {
+              ++memory_report->certified_worker_output_bound_failures;
+            }
+            certified_worker_output_allocation = false;
+            break;
+          }
+        }
+        if (certified_worker_output_allocation) {
+          auto const projection =
+              project_reused_wave(remaining, output_bytes);
+          if (projection <= memory_options.memory_budget_bytes) {
+            admitted_items = remaining;
+            admitted_slots = std::min(worker_count, remaining);
+            admitted_row_width = retained_maximum_row_width;
+            admitted_projection = projection;
+            admitted_reuses_slots = true;
+            certified_worker_output_wave = true;
+          } else {
+            if (memory_report != nullptr) {
+              ++memory_report->certified_worker_output_bound_failures;
+            }
+            certified_worker_output_allocation = false;
+          }
+        }
+      }
+      for (std::size_t candidate = admitted_items == 0 ? remaining : 0;
+           candidate != 0; --candidate) {
         std::size_t output_bytes = 0;
         std::size_t maximum_row_width = 0;
         for (std::size_t local = 0; local < candidate; ++local) {
@@ -3578,6 +5047,10 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
         throw std::logic_error("lazy inside chart: unreachable admission");
       }
       if (admitted_items < remaining) level_memory_limited = true;
+      if (full_phase_inside_slots_prepared && !admitted_reuses_slots) {
+        throw std::logic_error(
+            "lazy inside full-envelope scratch was not reusable");
+      }
 
       // Prepare output and every worker-owned vector before scheduler entry.
       if (!admitted_reuses_slots &&
@@ -3595,63 +5068,8 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
       if (!admitted_reuses_slots) {
         scheduler_workspace.hard_bound_inside_slots(admitted_slots);
       }
-      for (std::size_t slot = 0; slot < admitted_slots; ++slot) {
-        auto& workspace = scheduler_workspace.inside_by_slot[slot];
-        auto workspace_live = plan_lazy_chart_capacity_add(
-            retained_resident_bytes,
-            lazy_multisite_chart_capacity_resident_bytes(chart),
-            "lazy inside slot preparation");
-        workspace_live = plan_lazy_chart_capacity_add(
-            workspace_live, coordinator_bytes, "lazy inside slot preparation");
-        workspace_live = plan_lazy_chart_capacity_add(
-            workspace_live,
-            scheduler_workspace.inside_capacity_resident_bytes(),
-            "lazy inside slot preparation");
-        auto const workspace_resident = workspace.resident_bytes();
-        if (workspace_live < workspace_resident) {
-          throw std::logic_error(
-              "lazy inside slot is absent from scheduler live capacity");
-        }
-        auto const outside_workspace = workspace_live - workspace_resident;
-        if (outside_workspace > memory_options.memory_budget_bytes) {
-          reject_plan_lazy_chart_already_observed(
-              memory_options, memory_report,
-              plan_lazy_chart_memory_phase::inside, workspace_live);
-        }
-        plan_lazy_slot_preparation_report preparation;
-        try {
-          preparation = prepare_plan_inside_slot(
-              workspace, chart.pattern_count, admitted_row_width,
-              memory_options.memory_budget_bytes - outside_workspace);
-        } catch (
-            lazy_key_grouping_detail::packed_key_grouping_budget_error const&
-                error) {
-          auto const required = plan_lazy_chart_capacity_add(
-              outside_workspace, error.required_bytes(),
-              "lazy inside rejected slot preparation");
-          record_plan_lazy_chart_preflight(memory_report, required);
-          record_plan_lazy_chart_actual_peak(
-              memory_report,
-              plan_lazy_rejected_preparation_actual_peak(
-                  error, outside_workspace,
-                  plan_lazy_chart_capacity_add(
-                      outside_workspace, workspace.resident_bytes(),
-                      "lazy inside rejected slot capacity"),
-                  "lazy inside rejected slot actual peak"));
-          if (memory_report != nullptr) ++memory_report->pre_submit_rejections;
-          throw plan_lazy_chart_memory_budget_error(
-              plan_lazy_chart_memory_phase::inside, required,
-              memory_options.memory_budget_bytes);
-        }
-        auto preparation_live = plan_lazy_chart_capacity_add(
-            outside_workspace, preparation.peak_resident_bytes,
-            "lazy inside slot preparation");
-        record_plan_lazy_chart_actual_peak(memory_report, preparation_live);
-        if (preparation_live > memory_options.memory_budget_bytes) {
-          reject_plan_lazy_chart_already_observed(
-              memory_options, memory_report,
-              plan_lazy_chart_memory_phase::inside, preparation_live);
-        }
+      if (!full_phase_inside_slots_prepared) {
+        prepare_inside_slots(admitted_slots, admitted_row_width);
       }
       auto const output_outside_chart = plan_lazy_chart_capacity_add(
           plan_lazy_chart_capacity_add(retained_resident_bytes,
@@ -3660,51 +5078,53 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
           scheduler_workspace.inside_capacity_resident_bytes(),
           "lazy inside output preparation");
       auto const output_live = plan_lazy_chart_capacity_add(
-          output_outside_chart,
-          lazy_multisite_chart_capacity_resident_bytes(chart),
+          output_outside_chart, chart_capacity.resident_bytes(),
           "lazy inside output live capacity");
-      if (output_live > memory_options.memory_budget_bytes) {
+      if (!certified_worker_output_wave &&
+          output_live > memory_options.memory_budget_bytes) {
         reject_plan_lazy_chart_already_observed(
             memory_options, memory_report, plan_lazy_chart_memory_phase::inside,
             output_live);
       }
       auto const chart_peak_limit =
           memory_options.memory_budget_bytes - output_outside_chart;
-      for (std::size_t local = 0; local < admitted_items; ++local) {
-        try {
-          auto const preparation = prepare_plan_inside_clade_output(
-              chart, plan, level_order[level_begin + wave_begin + local],
-              options, chart_peak_limit);
-          record_plan_lazy_chart_actual_peak(
-              memory_report,
-              plan_lazy_chart_capacity_add(output_outside_chart,
-                                           preparation.peak_resident_bytes,
-                                           "lazy inside output preparation"));
-        } catch (
-            lazy_key_grouping_detail::packed_key_grouping_budget_error const&
-                error) {
-          auto const required = plan_lazy_chart_capacity_add(
-              output_outside_chart, error.required_bytes(),
-              "lazy inside rejected output preparation");
-          record_plan_lazy_chart_preflight(memory_report, required);
-          record_plan_lazy_chart_actual_peak(
-              memory_report,
-              plan_lazy_rejected_preparation_actual_peak(
-                  error, output_outside_chart,
-                  plan_lazy_chart_capacity_add(
-                      output_outside_chart,
-                      lazy_multisite_chart_capacity_resident_bytes(chart),
-                      "lazy inside rejected output capacity"),
-                  "lazy inside rejected output actual peak"));
-          if (memory_report != nullptr) ++memory_report->pre_submit_rejections;
-          throw plan_lazy_chart_memory_budget_error(
-              plan_lazy_chart_memory_phase::inside, required,
-              memory_options.memory_budget_bytes);
+      if (!certified_worker_output_wave) {
+        for (std::size_t local = 0; local < admitted_items; ++local) {
+          try {
+            auto const preparation = prepare_plan_inside_clade_output(
+                chart, plan, level_order[level_begin + wave_begin + local],
+                options, chart_capacity, chart_peak_limit);
+            record_plan_lazy_chart_actual_peak(
+                memory_report,
+                plan_lazy_chart_capacity_add(
+                    output_outside_chart, preparation.peak_resident_bytes,
+                    "lazy inside output preparation"));
+          } catch (
+              lazy_key_grouping_detail::packed_key_grouping_budget_error const&
+                  error) {
+            auto const required = plan_lazy_chart_capacity_add(
+                output_outside_chart, error.required_bytes(),
+                "lazy inside rejected output preparation");
+            record_plan_lazy_chart_preflight(memory_report, required);
+            record_plan_lazy_chart_actual_peak(
+                memory_report,
+                plan_lazy_rejected_preparation_actual_peak(
+                    error, output_outside_chart,
+                    plan_lazy_chart_capacity_add(
+                        output_outside_chart, chart_capacity.resident_bytes(),
+                        "lazy inside rejected output capacity"),
+                    "lazy inside rejected output actual peak"));
+            if (memory_report != nullptr) ++memory_report->pre_submit_rejections;
+            throw plan_lazy_chart_memory_budget_error(
+                plan_lazy_chart_memory_phase::inside, required,
+                memory_options.memory_budget_bytes);
+          }
         }
       }
+      observe_plan_lazy_chart_capacity_ledger_barrier(
+          test_hooks, chart, chart_capacity, "inside-output-publication");
       actual = plan_lazy_chart_capacity_add(
-          retained_resident_bytes,
-          lazy_multisite_chart_capacity_resident_bytes(chart),
+          retained_resident_bytes, chart_capacity.resident_bytes(),
           "lazy inside prepared wave");
       actual = plan_lazy_chart_capacity_add(actual, coordinator_bytes,
                                             "lazy inside prepared wave");
@@ -3712,12 +5132,16 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
           actual, scheduler_workspace.inside_capacity_resident_bytes(),
           "lazy inside prepared wave");
       record_plan_lazy_chart_actual_peak(memory_report, actual);
-      auto const scheduler_projection = plan_lazy_chart_capacity_add(
-          actual,
+      auto const scheduler_operation_bytes =
           estimate_chart_scheduler_operation_peak_bytes(
               scheduler.plan_indexed_ranges(
-                  admitted_items, plan_lazy_chart_clade_range_options())),
-          "lazy inside scheduler operation");
+                  admitted_items, plan_lazy_chart_clade_range_options()));
+      auto const scheduler_projection =
+          certified_worker_output_wave
+              ? admitted_projection
+              : plan_lazy_chart_capacity_add(
+                    actual, scheduler_operation_bytes,
+                    "lazy inside scheduler operation");
       record_plan_lazy_chart_preflight(memory_report, scheduler_projection);
       if (scheduler_projection > memory_options.memory_budget_bytes) {
         reject_plan_lazy_chart_projected(memory_options, memory_report,
@@ -3780,10 +5204,38 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
             &failed_run);
         if (level_runs != nullptr) level_runs->push_back(run);
       } catch (...) {
-        for (std::size_t item = 0; item < level_item_count; ++item) {
-          clear_plan_inside_clade_output(chart,
-                                         level_order[level_begin + item]);
+        if (certified_worker_output_wave) {
+          auto observed = plan_lazy_chart_capacity_add(
+              retained_resident_bytes,
+              lazy_multisite_chart_capacity_resident_bytes(chart),
+              "lazy inside failed certified worker output");
+          observed = plan_lazy_chart_capacity_add(
+              observed, coordinator_bytes,
+              "lazy inside failed certified worker output");
+          observed = plan_lazy_chart_capacity_add(
+              observed,
+              scheduler_workspace.inside_capacity_resident_bytes(),
+              "lazy inside failed certified worker output");
+          observed = plan_lazy_chart_capacity_add(
+              observed, scheduler_operation_bytes,
+              "lazy inside failed certified worker output");
+          record_plan_lazy_chart_actual_peak(memory_report, observed);
         }
+        std::size_t released = 0;
+        for (std::size_t item = 0; item < level_item_count; ++item) {
+          auto const clade = level_order[level_begin + item];
+          released = plan_lazy_chart_capacity_add(
+              released,
+              certified_worker_output_wave
+                  ? release_plan_inside_clade_output(chart, clade)
+                  : clear_plan_inside_clade_output(chart, clade),
+              "lazy inside failure cleanup released capacity");
+        }
+        if (!certified_worker_output_wave) {
+          chart_capacity.release_dynamic_capacity_bytes(released);
+        }
+        observe_plan_lazy_chart_capacity_ledger_barrier(
+            test_hooks, chart, chart_capacity, "inside-failure-cleanup");
         if (test_hooks != nullptr &&
             test_hooks->observe_inside_level_failure_cleanup) {
           test_hooks->observe_inside_level_failure_cleanup(chart, level);
@@ -3803,16 +5255,152 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
         }
       }
       if (selected_error) {
-        for (std::size_t item = 0; item < level_item_count; ++item) {
-          clear_plan_inside_clade_output(chart,
-                                         level_order[level_begin + item]);
+        if (certified_worker_output_wave) {
+          auto observed = plan_lazy_chart_capacity_add(
+              retained_resident_bytes,
+              lazy_multisite_chart_capacity_resident_bytes(chart),
+              "lazy inside exceptional certified worker output");
+          observed = plan_lazy_chart_capacity_add(
+              observed, coordinator_bytes,
+              "lazy inside exceptional certified worker output");
+          observed = plan_lazy_chart_capacity_add(
+              observed,
+              scheduler_workspace.inside_capacity_resident_bytes(),
+              "lazy inside exceptional certified worker output");
+          observed = plan_lazy_chart_capacity_add(
+              observed, scheduler_operation_bytes,
+              "lazy inside exceptional certified worker output");
+          record_plan_lazy_chart_actual_peak(memory_report, observed);
         }
+        std::size_t released = 0;
+        for (std::size_t item = 0; item < level_item_count; ++item) {
+          auto const clade = level_order[level_begin + item];
+          released = plan_lazy_chart_capacity_add(
+              released,
+              certified_worker_output_wave
+                  ? release_plan_inside_clade_output(chart, clade)
+                  : clear_plan_inside_clade_output(chart, clade),
+              "lazy inside failure cleanup released capacity");
+        }
+        if (!certified_worker_output_wave) {
+          chart_capacity.release_dynamic_capacity_bytes(released);
+        }
+        observe_plan_lazy_chart_capacity_ledger_barrier(
+            test_hooks, chart, chart_capacity, "inside-failure-cleanup");
         if (test_hooks != nullptr &&
             test_hooks->observe_inside_level_failure_cleanup) {
           test_hooks->observe_inside_level_failure_cleanup(chart, level);
         }
         std::rethrow_exception(selected_error);
       }
+      if (certified_worker_output_wave) {
+        std::size_t wave_capacity = 0;
+        for (std::size_t local = 0; local < admitted_items; ++local) {
+          wave_capacity = plan_lazy_chart_capacity_add(
+              wave_capacity,
+              plan_inside_clade_output_dynamic_capacity_bytes(
+                  chart, level_order[level_begin + wave_begin + local]),
+              "lazy inside certified worker output wave");
+        }
+        auto const phase_capacity = plan_lazy_chart_capacity_add(
+            certified_worker_output_capacity_published, wave_capacity,
+            "lazy inside certified worker output phase");
+        if (phase_capacity > certified_worker_output_capacity_limit) {
+          if (memory_report != nullptr) {
+            ++memory_report->certified_worker_output_bound_failures;
+          }
+          for (std::size_t item = 0; item < level_item_count; ++item) {
+            release_plan_inside_clade_output(
+                chart, level_order[level_begin + item]);
+          }
+          throw std::logic_error(
+              "lazy inside certified worker output exceeded its capacity "
+              "surface");
+        }
+        chart_capacity.add_dynamic_capacity_bytes(
+            wave_capacity, "lazy inside certified worker output publication");
+        certified_worker_output_capacity_published = phase_capacity;
+        auto observed = plan_lazy_chart_capacity_add(
+            retained_resident_bytes, chart_capacity.resident_bytes(),
+            "lazy inside certified worker output join");
+        observed = plan_lazy_chart_capacity_add(
+            observed, coordinator_bytes,
+            "lazy inside certified worker output join");
+        observed = plan_lazy_chart_capacity_add(
+            observed, scheduler_workspace.inside_capacity_resident_bytes(),
+            "lazy inside certified worker output join");
+        observed = plan_lazy_chart_capacity_add(
+            observed, scheduler_operation_bytes,
+            "lazy inside certified worker output join");
+        record_plan_lazy_chart_actual_peak(memory_report, observed);
+        if (observed > memory_options.memory_budget_bytes) {
+          if (memory_report != nullptr) {
+            ++memory_report->certified_worker_output_bound_failures;
+          }
+          std::size_t released = 0;
+          for (std::size_t item = 0; item < level_item_count; ++item) {
+            released = plan_lazy_chart_capacity_add(
+                released,
+                release_plan_inside_clade_output(
+                    chart, level_order[level_begin + item]),
+                "lazy inside rejected certified output release");
+          }
+          chart_capacity.release_dynamic_capacity_bytes(released);
+          certified_worker_output_capacity_published -= released;
+#ifndef NDEBUG
+          chart_capacity.require_matches_oracle(chart);
+#endif
+          throw plan_lazy_chart_memory_budget_error(
+              plan_lazy_chart_memory_phase::inside, observed,
+              memory_options.memory_budget_bytes);
+        }
+        if (memory_report != nullptr) {
+          memory_report->inside_certified_worker_output_allocation = true;
+          ++memory_report->inside_certified_worker_output_waves;
+          memory_report
+              ->inside_certified_worker_output_capacity_resident_bytes =
+              phase_capacity;
+        }
+        observe_plan_lazy_chart_capacity_ledger_barrier(
+            test_hooks, chart, chart_capacity,
+            "inside-certified-worker-output-publication");
+      }
+      if (!retain_completed_output_capacity) {
+        auto compaction_chart_peak_limit = chart_peak_limit;
+        if (memory_report != nullptr) {
+          compaction_chart_peak_limit =
+              memory_report->actual_peak_capacity_resident_bytes <
+                      output_outside_chart
+                  ? 0
+                  : std::min(
+                        compaction_chart_peak_limit,
+                        memory_report->actual_peak_capacity_resident_bytes -
+                            output_outside_chart);
+        }
+        for (std::size_t local = 0; local < admitted_items; ++local) {
+          auto const clade = level_order[level_begin + wave_begin + local];
+          auto compact = [&](auto& values) {
+            if (memory_report != nullptr) {
+              ++memory_report->inside_completed_output_compaction_attempts;
+            }
+            auto const compaction = compact_completed_plan_lazy_chart_vector(
+                values, chart_capacity, compaction_chart_peak_limit);
+            record_plan_lazy_chart_actual_peak(
+                memory_report,
+                plan_lazy_chart_capacity_add(
+                    output_outside_chart,
+                    compaction.observed_peak_resident_bytes,
+                    "lazy inside completed-output compaction"));
+          };
+          compact(chart.inside_rows_by_clade[clade]);
+          compact(chart.class_weight_by_clade[clade]);
+        }
+      }
+#ifndef NDEBUG
+      chart_capacity.require_matches_oracle(chart);
+#endif
+      observe_plan_lazy_chart_capacity_ledger_barrier(
+          test_hooks, chart, chart_capacity, "inside-wave-join");
       wave_begin += admitted_items;
     }
 
@@ -3825,11 +5413,17 @@ inline lazy_multisite_chart build_plan_lazy_inside_chart_scheduled_finite(
     for (std::size_t item = 0; item < level_item_count; ++item) {
       auto const clade = level_order[level_begin + item];
       if (remaining_dependencies && !plan.clade(clade).is_leaf()) {
-        consume_plan_parent_map_dependencies(chart, plan, clade,
-                                             *remaining_dependencies);
+        chart_capacity.release_dynamic_capacity_bytes(
+            consume_plan_parent_map_dependencies(
+                chart, plan, clade, *remaining_dependencies));
       }
       add_plan_inside_clade_work_stats(chart, stats_by_clade[clade]);
     }
+#ifndef NDEBUG
+    chart_capacity.require_matches_oracle(chart);
+#endif
+    observe_plan_lazy_chart_capacity_ledger_barrier(
+        test_hooks, chart, chart_capacity, "inside-level-reclamation");
     if (test_hooks != nullptr && test_hooks->observe_inside_level_reclamation) {
       test_hooks->observe_inside_level_reclamation(chart, level);
     }
@@ -3892,6 +5486,327 @@ inline std::size_t plan_lazy_outside_coordinator_capacity_bytes(
   return total;
 }
 
+inline bool try_build_plan_lazy_outside_chart_dependency_ready(
+    lazy_multisite_chart& chart, chart_execution_plan const& plan,
+    site_pattern_set const& patterns, chart_scheduler& scheduler,
+    std::span<clade_id const> nonroot_level_order,
+    std::vector<chart_scheduler_run_summary>* level_runs,
+    plan_lazy_chart_scheduler_workspace& scheduler_workspace,
+    plan_lazy_chart_memory_options const& memory_options,
+    plan_lazy_chart_memory_report* memory_report,
+    lazy_multisite_chart_capacity_ledger& chart_capacity,
+    std::vector<plan_outside_clade_work_stats>& stats_by_clade,
+    std::vector<std::exception_ptr>& errors_by_clade,
+    std::size_t retained_resident_bytes, std::size_t coordinator_bytes,
+    std::size_t retained_maximum_slot_count,
+    std::size_t certified_worker_output_capacity_limit) {
+  auto const production_count = plan.productions().size();
+  auto const loop_count =
+      std::min(production_count, retained_maximum_slot_count);
+  if (production_count == 0 || loop_count == 0 ||
+      scheduler_workspace.outside_by_slot.size() < loop_count) {
+    return false;
+  }
+  for (auto clade : nonroot_level_order) {
+    if (plan_outside_clade_output_dynamic_capacity_bytes(chart, clade) != 0) {
+      if (memory_report != nullptr) {
+        ++memory_report->certified_worker_output_bound_failures;
+      }
+      return false;
+    }
+  }
+
+  auto const range_options =
+      plan_lazy_chart_dependency_ready_range_options();
+  auto const range_plan =
+      scheduler.plan_indexed_ranges(loop_count, range_options);
+  auto const scheduler_operation_bytes =
+      estimate_chart_scheduler_operation_peak_bytes(range_plan);
+  auto const logical_ready_bytes =
+      logical_plan_lazy_outside_dependency_ready_bytes(production_count);
+  auto const budget = memory_options.memory_budget_bytes;
+  std::size_t logical_projection = 0;
+  auto const logical_fits =
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection, retained_resident_bytes, budget) &&
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection, chart_capacity.resident_bytes(), budget) &&
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection, coordinator_bytes, budget) &&
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection,
+          scheduler_workspace.outside_capacity_resident_bytes(), budget) &&
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection, logical_ready_bytes, budget) &&
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection, scheduler_operation_bytes, budget) &&
+      try_add_plan_lazy_chart_retention_component(
+          logical_projection, certified_worker_output_capacity_limit, budget);
+  if (!logical_fits) return false;
+  record_plan_lazy_chart_preflight(memory_report, logical_projection);
+
+  plan_lazy_chart_dependency_ready_queue<production_id> ready{
+      production_count};
+  auto const root_productions =
+      plan.productions_for_parent(plan.root_clade());
+  if (root_productions.size() != 1) {
+    throw std::logic_error(
+        "lazy outside dependency-ready root production is not unique");
+  }
+  ready.seed(root_productions.front());
+
+  auto const ready_bytes = ready.capacity_resident_bytes();
+  auto const route_coordinator_bytes = plan_lazy_chart_capacity_add(
+      coordinator_bytes, ready_bytes,
+      "lazy outside dependency-ready coordinator");
+  auto actual_base = plan_lazy_chart_capacity_add(
+      retained_resident_bytes, chart_capacity.resident_bytes(),
+      "lazy outside dependency-ready live capacity");
+  actual_base = plan_lazy_chart_capacity_add(
+      actual_base, route_coordinator_bytes,
+      "lazy outside dependency-ready live capacity");
+  actual_base = plan_lazy_chart_capacity_add(
+      actual_base, scheduler_workspace.outside_capacity_resident_bytes(),
+      "lazy outside dependency-ready live capacity");
+  record_plan_lazy_chart_actual_peak(memory_report, actual_base);
+  if (actual_base > budget) {
+    reject_plan_lazy_chart_already_observed(
+        memory_options, memory_report, plan_lazy_chart_memory_phase::outside,
+        actual_base);
+  }
+  auto scheduler_projection = plan_lazy_chart_capacity_add(
+      actual_base, scheduler_operation_bytes,
+      "lazy outside dependency-ready scheduler operation");
+  scheduler_projection = plan_lazy_chart_capacity_add(
+      scheduler_projection, certified_worker_output_capacity_limit,
+      "lazy outside dependency-ready certified outputs");
+  if (scheduler_projection > budget) return false;
+  record_plan_lazy_chart_preflight(memory_report, scheduler_projection);
+
+  if (memory_report != nullptr) {
+    memory_report->outside_dependency_ready_execution = true;
+    memory_report->outside_dependency_ready_jobs = production_count;
+    memory_report->outside_dependency_ready_capacity_resident_bytes =
+        ready_bytes;
+    memory_report->outside_coordinator_capacity_resident_bytes =
+        route_coordinator_bytes;
+    ++memory_report->outside_dependency_ready_scheduler_operations;
+    ++memory_report->outside_admission_waves;
+    ++memory_report->outside_reused_slot_waves;
+    memory_report->outside_max_admitted_slots =
+        std::max(memory_report->outside_max_admitted_slots, loop_count);
+    ++memory_report->scheduler_submissions;
+  }
+  record_plan_lazy_chart_actual_peak(
+      memory_report,
+      plan_lazy_chart_capacity_add(
+          actual_base, scheduler_operation_bytes,
+          "lazy outside dependency-ready entered scheduler"));
+
+  auto release_all_outputs = [&] {
+    std::size_t released = 0;
+    for (auto clade : nonroot_level_order) {
+      released = plan_lazy_chart_capacity_add(
+          released, release_plan_outside_clade_output(chart, clade),
+          "lazy outside dependency-ready cleanup");
+    }
+    return released;
+  };
+  auto record_unpublished_output_peak = [&] {
+    auto observed = plan_lazy_chart_capacity_add(
+        retained_resident_bytes,
+        lazy_multisite_chart_capacity_resident_bytes(chart),
+        "lazy outside dependency-ready unpublished output");
+    observed = plan_lazy_chart_capacity_add(
+        observed, route_coordinator_bytes,
+        "lazy outside dependency-ready unpublished output");
+    observed = plan_lazy_chart_capacity_add(
+        observed, scheduler_workspace.outside_capacity_resident_bytes(),
+        "lazy outside dependency-ready unpublished output");
+    observed = plan_lazy_chart_capacity_add(
+        observed, scheduler_operation_bytes,
+        "lazy outside dependency-ready unpublished output");
+    record_plan_lazy_chart_actual_peak(memory_report, observed);
+  };
+
+  chart_scheduler_run_summary failed_run;
+  chart_scheduler_run_summary run;
+  try {
+    run = scheduler.for_each_indexed_range(
+        loop_count, range_options,
+        [&](chart_indexed_range const&, std::size_t stable_slot,
+            chart_scheduler_cancellation_token const&) {
+          if (stable_slot >= scheduler_workspace.outside_by_slot.size()) {
+            ready.cancel(std::make_exception_ptr(std::logic_error(
+                "lazy outside dependency-ready scheduler slot out of "
+                "range")));
+            return;
+          }
+          auto& workspace =
+              scheduler_workspace.outside_by_slot[stable_slot];
+          for (;;) {
+            production_id production = no_production;
+            try {
+              if (!ready.pop(production)) return;
+            } catch (...) {
+              ready.cancel(std::current_exception());
+              return;
+            }
+            clade_id first = no_clade;
+            clade_id second = no_clade;
+            try {
+              auto const children = plan.children(production);
+              if (children.size() != 2) {
+                throw std::logic_error(
+                    "lazy outside dependency-ready production is not "
+                    "binary");
+              }
+              first = children[0];
+              second = children[1];
+              auto const first_level = plan.clade(first).dependency_level;
+              auto const second_level = plan.clade(second).dependency_level;
+              if (second_level > first_level ||
+                  (second_level == first_level && second < first)) {
+                std::swap(first, second);
+              }
+            } catch (...) {
+              ready.cancel(std::current_exception());
+              return;
+            }
+            try {
+              assign_plan_outside_classes_for_strict_tree_sibling_pair_task_local(
+                  chart, plan, patterns, first, second, workspace,
+                  stats_by_clade[first]);
+            } catch (...) {
+              errors_by_clade[first] = std::current_exception();
+              try {
+                ready.complete_failed();
+              } catch (...) {
+                ready.cancel(std::current_exception());
+                return;
+              }
+              continue;
+            }
+            try {
+              std::array<production_id, 2> successors{};
+              std::size_t successor_count = 0;
+              for (auto child : std::array{first, second}) {
+                if (plan.clade(child).is_leaf()) continue;
+                auto const child_productions =
+                    plan.productions_for_parent(child);
+                if (child_productions.size() != 1) {
+                  throw std::logic_error(
+                      "lazy outside dependency-ready child production is not "
+                      "unique");
+                }
+                successors[successor_count++] =
+                    child_productions.front();
+              }
+              ready.complete_and_push(
+                  std::span<production_id const>{successors.data(),
+                                                 successor_count});
+            } catch (...) {
+              ready.cancel(std::current_exception());
+              return;
+            }
+          }
+        },
+        &failed_run);
+    if (level_runs != nullptr) level_runs->push_back(run);
+  } catch (...) {
+    ready.cancel();
+    record_unpublished_output_peak();
+    (void)release_all_outputs();
+#ifndef NDEBUG
+    chart_capacity.require_matches_oracle(chart);
+#endif
+    if (level_runs != nullptr && failed_run.failed) {
+      level_runs->push_back(failed_run);
+    }
+    throw;
+  }
+
+  std::exception_ptr selected_error;
+  for (auto clade : nonroot_level_order) {
+    if (errors_by_clade[clade]) {
+      selected_error = errors_by_clade[clade];
+      break;
+    }
+  }
+  if (!selected_error) selected_error = ready.captured_infrastructure_failure();
+  if (!selected_error && !ready.finished_successfully()) {
+    selected_error = std::make_exception_ptr(std::logic_error(
+        "lazy outside dependency-ready queue ended incompletely"));
+  }
+  if (selected_error) {
+    record_unpublished_output_peak();
+    (void)release_all_outputs();
+#ifndef NDEBUG
+    chart_capacity.require_matches_oracle(chart);
+#endif
+    std::rethrow_exception(selected_error);
+  }
+
+  std::size_t output_capacity = 0;
+  for (auto clade : nonroot_level_order) {
+    output_capacity = plan_lazy_chart_capacity_add(
+        output_capacity,
+        plan_outside_clade_output_dynamic_capacity_bytes(chart, clade),
+        "lazy outside dependency-ready completed output");
+  }
+  if (output_capacity > certified_worker_output_capacity_limit) {
+    if (memory_report != nullptr) {
+      ++memory_report->certified_worker_output_bound_failures;
+    }
+    record_unpublished_output_peak();
+    (void)release_all_outputs();
+#ifndef NDEBUG
+    chart_capacity.require_matches_oracle(chart);
+#endif
+    throw std::logic_error(
+        "lazy outside dependency-ready output exceeded its certified "
+        "capacity surface");
+  }
+  chart_capacity.add_dynamic_capacity_bytes(
+      output_capacity, "lazy outside dependency-ready output publication");
+  auto observed = plan_lazy_chart_capacity_add(
+      retained_resident_bytes, chart_capacity.resident_bytes(),
+      "lazy outside dependency-ready output join");
+  observed = plan_lazy_chart_capacity_add(
+      observed, route_coordinator_bytes,
+      "lazy outside dependency-ready output join");
+  observed = plan_lazy_chart_capacity_add(
+      observed, scheduler_workspace.outside_capacity_resident_bytes(),
+      "lazy outside dependency-ready output join");
+  observed = plan_lazy_chart_capacity_add(
+      observed, scheduler_operation_bytes,
+      "lazy outside dependency-ready output join");
+  record_plan_lazy_chart_actual_peak(memory_report, observed);
+  if (observed > budget) {
+    if (memory_report != nullptr) {
+      ++memory_report->certified_worker_output_bound_failures;
+    }
+    auto const released = release_all_outputs();
+    chart_capacity.release_dynamic_capacity_bytes(released);
+#ifndef NDEBUG
+    chart_capacity.require_matches_oracle(chart);
+#endif
+    throw plan_lazy_chart_memory_budget_error(
+        plan_lazy_chart_memory_phase::outside, observed, budget);
+  }
+  if (memory_report != nullptr) {
+    memory_report->outside_certified_worker_output_allocation = true;
+    ++memory_report->outside_certified_worker_output_waves;
+    memory_report
+        ->outside_certified_worker_output_capacity_resident_bytes =
+        output_capacity;
+  }
+#ifndef NDEBUG
+  chart_capacity.require_matches_oracle(chart);
+#endif
+  return true;
+}
+
 inline void build_plan_lazy_outside_chart_scheduled_finite(
     lazy_multisite_chart& chart, chart_execution_plan const& plan,
     site_pattern_set const& patterns, chart_scheduler& scheduler,
@@ -3908,6 +5823,14 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
   if (worker_count == 0) {
     throw std::logic_error("lazy outside chart: scheduler has no worker slots");
   }
+  // Keep every hook-observable execution on the historical per-clade route.
+  // The finite, unhooked strict-tree route may fuse two siblings only when
+  // both have already been admitted to the same wave.
+  auto const strict_tree_structure =
+      !plan_lazy_chart_test_hooks_observe_execution(test_hooks) &&
+      plan_has_strict_binary_tree_outside_structure(plan);
+  auto const enable_strict_tree_sibling_fusion =
+      test_hooks == nullptr && strict_tree_structure;
   if (memory_report != nullptr) {
     memory_report->memory_budget_bytes = memory_options.memory_budget_bytes;
   }
@@ -3915,6 +5838,9 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
       memory_options.retained_resident_bytes,
       plan_lazy_chart_scheduler_resident_bytes(scheduler),
       "lazy outside retained scheduler capacity");
+  lazy_multisite_chart_capacity_ledger chart_capacity{chart};
+  observe_plan_lazy_chart_capacity_ledger_barrier(
+      test_hooks, chart, chart_capacity, "outside-initial");
 
   if (scheduler_workspace.outside_by_slot.size() > worker_count) {
     scheduler_workspace.release_outside();
@@ -3924,8 +5850,7 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
       clade_count, level_count, level_runs);
   auto project_coordinator = [&] {
     auto projection = plan_lazy_chart_capacity_add(
-        retained_resident_bytes,
-        lazy_multisite_chart_capacity_resident_bytes(chart),
+        retained_resident_bytes, chart_capacity.resident_bytes(),
         "lazy outside coordinator preflight");
     projection =
         plan_lazy_chart_capacity_add(projection, coordinator_projection,
@@ -3981,8 +5906,7 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
         coordinator_bytes;
   }
   auto actual = plan_lazy_chart_capacity_add(
-      retained_resident_bytes,
-      lazy_multisite_chart_capacity_resident_bytes(chart),
+      retained_resident_bytes, chart_capacity.resident_bytes(),
       "lazy outside coordinator capacity");
   actual = plan_lazy_chart_capacity_add(actual, coordinator_bytes,
                                         "lazy outside coordinator capacity");
@@ -3998,6 +5922,202 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
   require_plan_lazy_chart_memory_budget(memory_options, memory_report,
                                         plan_lazy_chart_memory_phase::outside,
                                         actual);
+
+  auto prepare_outside_slots = [&](std::size_t slot_count,
+                                   std::size_t maximum_context_width,
+                                   std::size_t maximum_arity) {
+    for (std::size_t slot = 0; slot < slot_count; ++slot) {
+      auto& workspace = scheduler_workspace.outside_by_slot[slot];
+      auto workspace_live = plan_lazy_chart_capacity_add(
+          retained_resident_bytes, chart_capacity.resident_bytes(),
+          "lazy outside slot preparation");
+      workspace_live = plan_lazy_chart_capacity_add(
+          workspace_live, coordinator_bytes, "lazy outside slot preparation");
+      workspace_live = plan_lazy_chart_capacity_add(
+          workspace_live,
+          scheduler_workspace.outside_capacity_resident_bytes(),
+          "lazy outside slot preparation");
+      auto const workspace_resident = workspace.resident_bytes();
+      if (workspace_live < workspace_resident) {
+        throw std::logic_error(
+            "lazy outside slot is absent from scheduler live capacity");
+      }
+      auto const outside_workspace = workspace_live - workspace_resident;
+      if (outside_workspace > memory_options.memory_budget_bytes) {
+        reject_plan_lazy_chart_already_observed(
+            memory_options, memory_report,
+            plan_lazy_chart_memory_phase::outside, workspace_live);
+      }
+      plan_lazy_slot_preparation_report preparation;
+      try {
+        preparation = prepare_plan_outside_slot(
+            workspace, chart.pattern_count, maximum_context_width,
+            maximum_arity,
+            memory_options.memory_budget_bytes - outside_workspace);
+      } catch (
+          lazy_key_grouping_detail::packed_key_grouping_budget_error const&
+              error) {
+        auto const required = plan_lazy_chart_capacity_add(
+            outside_workspace, error.required_bytes(),
+            "lazy outside rejected slot preparation");
+        record_plan_lazy_chart_preflight(memory_report, required);
+        record_plan_lazy_chart_actual_peak(
+            memory_report,
+            plan_lazy_rejected_preparation_actual_peak(
+                error, outside_workspace,
+                plan_lazy_chart_capacity_add(
+                    outside_workspace, workspace.resident_bytes(),
+                    "lazy outside rejected slot capacity"),
+                "lazy outside rejected slot actual peak"));
+        if (memory_report != nullptr) ++memory_report->pre_submit_rejections;
+        throw plan_lazy_chart_memory_budget_error(
+            plan_lazy_chart_memory_phase::outside, required,
+            memory_options.memory_budget_bytes);
+      }
+      auto preparation_live = plan_lazy_chart_capacity_add(
+          outside_workspace, preparation.peak_resident_bytes,
+          "lazy outside slot preparation");
+      record_plan_lazy_chart_actual_peak(memory_report, preparation_live);
+      if (preparation_live > memory_options.memory_budget_bytes) {
+        reject_plan_lazy_chart_already_observed(
+            memory_options, memory_report,
+            plan_lazy_chart_memory_phase::outside, preparation_live);
+      }
+    }
+  };
+
+  bool retain_completed_output_capacity = false;
+  std::size_t retained_maximum_slot_count = 0;
+  std::size_t retained_maximum_context_width = nuc_state_count;
+  std::size_t retained_maximum_arity = 0;
+  std::size_t certified_worker_output_capacity_limit = 0;
+  if (!plan_lazy_chart_test_hooks_observe_execution(test_hooks)) {
+    auto const budget = memory_options.memory_budget_bytes;
+    std::size_t complete_output_bytes = 0;
+    std::size_t maximum_level_item_count = 0;
+    std::size_t maximum_scheduler_operation_bytes = 0;
+    bool projection_fits = true;
+    for (std::size_t level = 0; level < level_count; ++level) {
+      auto const level_begin = nonroot_level_offsets[level];
+      auto const level_end = nonroot_level_offsets[level + 1];
+      auto const level_item_count = level_end - level_begin;
+      maximum_level_item_count =
+          std::max(maximum_level_item_count, level_item_count);
+      if (level_item_count != 0) {
+        maximum_scheduler_operation_bytes =
+            std::max(maximum_scheduler_operation_bytes,
+                     estimate_chart_scheduler_operation_peak_bytes(
+                         scheduler.plan_indexed_ranges(
+                             level_item_count,
+                             plan_lazy_chart_clade_range_options())));
+      }
+      for (std::size_t item = level_begin; item < level_end; ++item) {
+        auto const clade = nonroot_level_order[item];
+        if (projection_fits) {
+          projection_fits = try_add_plan_lazy_chart_retention_component(
+              complete_output_bytes,
+              logical_plan_outside_clade_output_bytes(chart.pattern_count),
+              budget);
+        }
+        auto const [context_width, arity] =
+            plan_outside_clade_shape(plan, clade);
+        retained_maximum_context_width =
+            std::max(retained_maximum_context_width, context_width);
+        retained_maximum_arity = std::max(retained_maximum_arity, arity);
+      }
+    }
+    retained_maximum_slot_count =
+        std::min(worker_count, maximum_level_item_count);
+    auto const slot_bytes = logical_plan_outside_slot_resident_bytes(
+        chart.pattern_count, retained_maximum_context_width,
+        retained_maximum_arity);
+    std::size_t full_slot_bytes = 0;
+    projection_fits =
+        projection_fits &&
+        try_multiply_plan_lazy_chart_retention_component(
+            retained_maximum_slot_count, slot_bytes, budget, full_slot_bytes);
+    std::size_t cold_scratch_bytes = sizeof(scheduler_workspace);
+    projection_fits =
+        projection_fits &&
+        try_add_plan_lazy_chart_retention_component(
+            cold_scratch_bytes, full_slot_bytes, budget);
+    auto const scratch_bytes =
+        std::max(cold_scratch_bytes,
+                 scheduler_workspace.outside_capacity_resident_bytes());
+    std::size_t projection = 0;
+    projection_fits =
+        projection_fits &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, retained_resident_bytes, budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, chart_capacity.resident_bytes(), budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, complete_output_bytes, budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, coordinator_bytes, budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, scratch_bytes, budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, logical_plan_outside_slot_preparation_extra_bytes(),
+            budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, logical_plan_output_preparation_extra_bytes(), budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, maximum_scheduler_operation_bytes, budget) &&
+        try_add_plan_lazy_chart_retention_component(
+            projection, complete_output_bytes, budget);
+    retain_completed_output_capacity = projection_fits;
+    if (projection_fits) {
+      certified_worker_output_capacity_limit =
+          plan_lazy_chart_capacity_add(
+              complete_output_bytes, complete_output_bytes,
+              "lazy outside certified worker output capacity");
+    }
+  }
+  if (memory_report != nullptr) {
+    memory_report->outside_retained_completed_output_capacity =
+        retain_completed_output_capacity;
+  }
+  bool full_phase_outside_slots_prepared = false;
+  if (retain_completed_output_capacity &&
+      retained_maximum_slot_count != 0) {
+    // Do not grow a partial warm pool in place: the certificate admits the
+    // larger of warm and cold scratch, not an old-plus-new vector overlap.
+    auto const reusable = scheduler_workspace.can_reuse_outside_slots(
+        retained_maximum_slot_count, chart.pattern_count,
+        retained_maximum_context_width, retained_maximum_arity);
+    if (!reusable) {
+      if (scheduler_workspace.outside_by_slot.capacity() != 0) {
+        scheduler_workspace.release_outside();
+        if (memory_report != nullptr) {
+          ++memory_report->outside_workspace_evictions;
+        }
+      }
+      scheduler_workspace.hard_bound_outside_slots(
+          retained_maximum_slot_count);
+      prepare_outside_slots(retained_maximum_slot_count,
+                            retained_maximum_context_width,
+                            retained_maximum_arity);
+    }
+    full_phase_outside_slots_prepared = true;
+  }
+  bool certified_worker_output_allocation =
+      retain_completed_output_capacity && full_phase_outside_slots_prepared;
+  if (worker_count > 1 && certified_worker_output_allocation &&
+      strict_tree_structure &&
+      try_build_plan_lazy_outside_chart_dependency_ready(
+          chart, plan, patterns, scheduler, nonroot_level_order, level_runs,
+          scheduler_workspace, memory_options, memory_report, chart_capacity,
+          stats_by_clade, errors_by_clade, retained_resident_bytes,
+          coordinator_bytes, retained_maximum_slot_count,
+          certified_worker_output_capacity_limit)) {
+    for (auto clade : nonroot_level_order) {
+      add_plan_outside_clade_work_stats(chart, stats_by_clade[clade]);
+    }
+    finalize_outside_counters(chart);
+    return;
+  }
+  std::size_t certified_worker_output_capacity_published = 0;
 
   for (std::size_t level = 0; level < level_count; ++level) {
     auto const level_begin = nonroot_level_offsets[level];
@@ -4019,8 +6139,7 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
                                    std::size_t maximum_arity) {
         auto const slot_count = std::min(worker_count, candidate);
         auto projection = plan_lazy_chart_capacity_add(
-            retained_resident_bytes,
-            lazy_multisite_chart_capacity_resident_bytes(chart),
+            retained_resident_bytes, chart_capacity.resident_bytes(),
             "lazy outside wave preflight");
         projection = plan_lazy_chart_capacity_add(
             projection, coordinator_bytes, "lazy outside wave preflight");
@@ -4057,8 +6176,7 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
       };
       auto project_reused_wave = [&](std::size_t candidate) {
         auto projection = plan_lazy_chart_capacity_add(
-            retained_resident_bytes,
-            lazy_multisite_chart_capacity_resident_bytes(chart),
+            retained_resident_bytes, chart_capacity.resident_bytes(),
             "lazy outside reused wave preflight");
         projection =
             plan_lazy_chart_capacity_add(projection, coordinator_bytes,
@@ -4083,7 +6201,41 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
                     candidate, plan_lazy_chart_clade_range_options())),
             "lazy outside scheduler operation");
       };
-      for (std::size_t candidate = remaining; candidate != 0; --candidate) {
+      bool certified_worker_output_wave = false;
+      if (certified_worker_output_allocation && wave_begin == 0) {
+        bool outputs_empty = true;
+        for (std::size_t local = 0; local < remaining; ++local) {
+          auto const clade =
+              nonroot_level_order[level_begin + local];
+          if (plan_outside_clade_output_dynamic_capacity_bytes(chart, clade) !=
+              0) {
+            outputs_empty = false;
+            break;
+          }
+        }
+        if (outputs_empty) {
+          auto const projection = project_reused_wave(remaining);
+          if (projection <= memory_options.memory_budget_bytes) {
+            admitted_items = remaining;
+            admitted_slots = std::min(worker_count, remaining);
+            admitted_context_width = retained_maximum_context_width;
+            admitted_arity = retained_maximum_arity;
+            admitted_projection = projection;
+            admitted_reuses_slots = true;
+            certified_worker_output_wave = true;
+          } else {
+            certified_worker_output_allocation = false;
+          }
+        } else {
+          certified_worker_output_allocation = false;
+        }
+        if (!certified_worker_output_allocation &&
+            memory_report != nullptr) {
+          ++memory_report->certified_worker_output_bound_failures;
+        }
+      }
+      for (std::size_t candidate = admitted_items == 0 ? remaining : 0;
+           candidate != 0; --candidate) {
         std::size_t maximum_context_width = nuc_state_count;
         std::size_t maximum_arity = 0;
         for (std::size_t local = 0; local < candidate; ++local) {
@@ -4131,6 +6283,10 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
         throw std::logic_error("lazy outside chart: unreachable admission");
       }
       if (admitted_items < remaining) level_memory_limited = true;
+      if (full_phase_outside_slots_prepared && !admitted_reuses_slots) {
+        throw std::logic_error(
+            "lazy outside full-envelope scratch was not reusable");
+      }
 
       if (!admitted_reuses_slots &&
           scheduler_workspace.outside_by_slot.capacity() != 0) {
@@ -4147,64 +6303,9 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
       if (!admitted_reuses_slots) {
         scheduler_workspace.hard_bound_outside_slots(admitted_slots);
       }
-      for (std::size_t slot = 0; slot < admitted_slots; ++slot) {
-        auto& workspace = scheduler_workspace.outside_by_slot[slot];
-        auto workspace_live = plan_lazy_chart_capacity_add(
-            retained_resident_bytes,
-            lazy_multisite_chart_capacity_resident_bytes(chart),
-            "lazy outside slot preparation");
-        workspace_live = plan_lazy_chart_capacity_add(
-            workspace_live, coordinator_bytes, "lazy outside slot preparation");
-        workspace_live = plan_lazy_chart_capacity_add(
-            workspace_live,
-            scheduler_workspace.outside_capacity_resident_bytes(),
-            "lazy outside slot preparation");
-        auto const workspace_resident = workspace.resident_bytes();
-        if (workspace_live < workspace_resident) {
-          throw std::logic_error(
-              "lazy outside slot is absent from scheduler live capacity");
-        }
-        auto const outside_workspace = workspace_live - workspace_resident;
-        if (outside_workspace > memory_options.memory_budget_bytes) {
-          reject_plan_lazy_chart_already_observed(
-              memory_options, memory_report,
-              plan_lazy_chart_memory_phase::outside, workspace_live);
-        }
-        plan_lazy_slot_preparation_report preparation;
-        try {
-          preparation = prepare_plan_outside_slot(
-              workspace, chart.pattern_count, admitted_context_width,
-              admitted_arity,
-              memory_options.memory_budget_bytes - outside_workspace);
-        } catch (
-            lazy_key_grouping_detail::packed_key_grouping_budget_error const&
-                error) {
-          auto const required = plan_lazy_chart_capacity_add(
-              outside_workspace, error.required_bytes(),
-              "lazy outside rejected slot preparation");
-          record_plan_lazy_chart_preflight(memory_report, required);
-          record_plan_lazy_chart_actual_peak(
-              memory_report,
-              plan_lazy_rejected_preparation_actual_peak(
-                  error, outside_workspace,
-                  plan_lazy_chart_capacity_add(
-                      outside_workspace, workspace.resident_bytes(),
-                      "lazy outside rejected slot capacity"),
-                  "lazy outside rejected slot actual peak"));
-          if (memory_report != nullptr) ++memory_report->pre_submit_rejections;
-          throw plan_lazy_chart_memory_budget_error(
-              plan_lazy_chart_memory_phase::outside, required,
-              memory_options.memory_budget_bytes);
-        }
-        auto preparation_live = plan_lazy_chart_capacity_add(
-            outside_workspace, preparation.peak_resident_bytes,
-            "lazy outside slot preparation");
-        record_plan_lazy_chart_actual_peak(memory_report, preparation_live);
-        if (preparation_live > memory_options.memory_budget_bytes) {
-          reject_plan_lazy_chart_already_observed(
-              memory_options, memory_report,
-              plan_lazy_chart_memory_phase::outside, preparation_live);
-        }
+      if (!full_phase_outside_slots_prepared) {
+        prepare_outside_slots(admitted_slots, admitted_context_width,
+                              admitted_arity);
       }
       auto const output_outside_chart = plan_lazy_chart_capacity_add(
           plan_lazy_chart_capacity_add(retained_resident_bytes,
@@ -4213,51 +6314,53 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
           scheduler_workspace.outside_capacity_resident_bytes(),
           "lazy outside output preparation");
       auto const output_live = plan_lazy_chart_capacity_add(
-          output_outside_chart,
-          lazy_multisite_chart_capacity_resident_bytes(chart),
+          output_outside_chart, chart_capacity.resident_bytes(),
           "lazy outside output live capacity");
-      if (output_live > memory_options.memory_budget_bytes) {
+      if (!certified_worker_output_wave &&
+          output_live > memory_options.memory_budget_bytes) {
         reject_plan_lazy_chart_already_observed(
             memory_options, memory_report,
             plan_lazy_chart_memory_phase::outside, output_live);
       }
       auto const chart_peak_limit =
           memory_options.memory_budget_bytes - output_outside_chart;
-      for (std::size_t local = 0; local < admitted_items; ++local) {
-        try {
-          auto const preparation = prepare_plan_outside_clade_output(
-              chart, nonroot_level_order[level_begin + wave_begin + local],
-              chart_peak_limit);
-          record_plan_lazy_chart_actual_peak(
-              memory_report,
-              plan_lazy_chart_capacity_add(output_outside_chart,
-                                           preparation.peak_resident_bytes,
-                                           "lazy outside output preparation"));
-        } catch (
-            lazy_key_grouping_detail::packed_key_grouping_budget_error const&
-                error) {
-          auto const required = plan_lazy_chart_capacity_add(
-              output_outside_chart, error.required_bytes(),
-              "lazy outside rejected output preparation");
-          record_plan_lazy_chart_preflight(memory_report, required);
-          record_plan_lazy_chart_actual_peak(
-              memory_report,
-              plan_lazy_rejected_preparation_actual_peak(
-                  error, output_outside_chart,
-                  plan_lazy_chart_capacity_add(
-                      output_outside_chart,
-                      lazy_multisite_chart_capacity_resident_bytes(chart),
-                      "lazy outside rejected output capacity"),
-                  "lazy outside rejected output actual peak"));
-          if (memory_report != nullptr) ++memory_report->pre_submit_rejections;
-          throw plan_lazy_chart_memory_budget_error(
-              plan_lazy_chart_memory_phase::outside, required,
-              memory_options.memory_budget_bytes);
+      if (!certified_worker_output_wave) {
+        for (std::size_t local = 0; local < admitted_items; ++local) {
+          try {
+            auto const preparation = prepare_plan_outside_clade_output(
+                chart, nonroot_level_order[level_begin + wave_begin + local],
+                chart_capacity, chart_peak_limit);
+            record_plan_lazy_chart_actual_peak(
+                memory_report,
+                plan_lazy_chart_capacity_add(
+                    output_outside_chart, preparation.peak_resident_bytes,
+                    "lazy outside output preparation"));
+          } catch (
+              lazy_key_grouping_detail::packed_key_grouping_budget_error const&
+                  error) {
+            auto const required = plan_lazy_chart_capacity_add(
+                output_outside_chart, error.required_bytes(),
+                "lazy outside rejected output preparation");
+            record_plan_lazy_chart_preflight(memory_report, required);
+            record_plan_lazy_chart_actual_peak(
+                memory_report,
+                plan_lazy_rejected_preparation_actual_peak(
+                    error, output_outside_chart,
+                    plan_lazy_chart_capacity_add(
+                        output_outside_chart, chart_capacity.resident_bytes(),
+                        "lazy outside rejected output capacity"),
+                    "lazy outside rejected output actual peak"));
+            if (memory_report != nullptr) ++memory_report->pre_submit_rejections;
+            throw plan_lazy_chart_memory_budget_error(
+                plan_lazy_chart_memory_phase::outside, required,
+                memory_options.memory_budget_bytes);
+          }
         }
       }
+      observe_plan_lazy_chart_capacity_ledger_barrier(
+          test_hooks, chart, chart_capacity, "outside-output-publication");
       actual = plan_lazy_chart_capacity_add(
-          retained_resident_bytes,
-          lazy_multisite_chart_capacity_resident_bytes(chart),
+          retained_resident_bytes, chart_capacity.resident_bytes(),
           "lazy outside prepared wave");
       actual = plan_lazy_chart_capacity_add(actual, coordinator_bytes,
                                             "lazy outside prepared wave");
@@ -4265,12 +6368,16 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
           actual, scheduler_workspace.outside_capacity_resident_bytes(),
           "lazy outside prepared wave");
       record_plan_lazy_chart_actual_peak(memory_report, actual);
-      auto const scheduler_projection = plan_lazy_chart_capacity_add(
-          actual,
+      auto const scheduler_operation_bytes =
           estimate_chart_scheduler_operation_peak_bytes(
               scheduler.plan_indexed_ranges(
-                  admitted_items, plan_lazy_chart_clade_range_options())),
-          "lazy outside scheduler operation");
+                  admitted_items, plan_lazy_chart_clade_range_options()));
+      auto const scheduler_projection =
+          certified_worker_output_wave
+              ? admitted_projection
+              : plan_lazy_chart_capacity_add(
+                    actual, scheduler_operation_bytes,
+                    "lazy outside scheduler operation");
       record_plan_lazy_chart_preflight(memory_report, scheduler_projection);
       if (scheduler_projection > memory_options.memory_budget_bytes) {
         reject_plan_lazy_chart_projected(memory_options, memory_report,
@@ -4281,6 +6388,9 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
 
       chart_scheduler_run_summary failed_run;
       chart_scheduler_run_summary run;
+      auto const admitted_wave = std::span<clade_id const>{
+          nonroot_level_order.data() + level_begin + wave_begin,
+          admitted_items};
       if (memory_report != nullptr) {
         ++memory_report->outside_admission_waves;
         memory_report->outside_max_admitted_slots =
@@ -4299,22 +6409,38 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
               auto& workspace =
                   scheduler_workspace.outside_by_slot[stable_slot];
               for (std::size_t item = range.begin; item < range.end; ++item) {
-                auto const clade =
-                    nonroot_level_order[level_begin + wave_begin + item];
+                auto const clade = admitted_wave[item];
+                auto sibling_work = plan_outside_sibling_work{};
+                if (enable_strict_tree_sibling_fusion) {
+                  sibling_work = classify_plan_outside_sibling_work(
+                      plan, admitted_wave, item);
+                  if (sibling_work.kind ==
+                      plan_outside_sibling_work_kind::fused_follower) {
+                    continue;
+                  }
+                }
+                auto failed_clade = clade;
                 try {
                   if (test_hooks != nullptr &&
                       test_hooks->before_outside_clade) {
                     test_hooks->before_outside_clade(clade, level, stable_slot);
                   }
-                  assign_plan_outside_classes_for_clade_task_local(
-                      chart, plan, patterns, clade, workspace,
-                      stats_by_clade[clade]);
+                  if (sibling_work.kind ==
+                      plan_outside_sibling_work_kind::fused_leader) {
+                    assign_plan_outside_classes_for_strict_tree_sibling_pair_task_local(
+                        chart, plan, patterns, clade, sibling_work.sibling,
+                        workspace, stats_by_clade[clade]);
+                  } else {
+                    assign_plan_outside_classes_for_clade_task_local(
+                        chart, plan, patterns, clade, workspace,
+                        stats_by_clade[clade]);
+                  }
                   if (test_hooks != nullptr &&
                       test_hooks->after_outside_clade) {
                     test_hooks->after_outside_clade(clade, level, stable_slot);
                   }
                 } catch (...) {
-                  errors_by_clade[clade] = std::current_exception();
+                  errors_by_clade[failed_clade] = std::current_exception();
                   break;
                 }
               }
@@ -4322,10 +6448,38 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
             &failed_run);
         if (level_runs != nullptr) level_runs->push_back(run);
       } catch (...) {
-        for (std::size_t item = 0; item < level_item_count; ++item) {
-          clear_plan_outside_clade_output(
-              chart, nonroot_level_order[level_begin + item]);
+        if (certified_worker_output_wave) {
+          auto observed = plan_lazy_chart_capacity_add(
+              retained_resident_bytes,
+              lazy_multisite_chart_capacity_resident_bytes(chart),
+              "lazy outside failed certified worker output");
+          observed = plan_lazy_chart_capacity_add(
+              observed, coordinator_bytes,
+              "lazy outside failed certified worker output");
+          observed = plan_lazy_chart_capacity_add(
+              observed,
+              scheduler_workspace.outside_capacity_resident_bytes(),
+              "lazy outside failed certified worker output");
+          observed = plan_lazy_chart_capacity_add(
+              observed, scheduler_operation_bytes,
+              "lazy outside failed certified worker output");
+          record_plan_lazy_chart_actual_peak(memory_report, observed);
         }
+        std::size_t released = 0;
+        for (std::size_t item = 0; item < level_item_count; ++item) {
+          auto const clade = nonroot_level_order[level_begin + item];
+          released = plan_lazy_chart_capacity_add(
+              released,
+              certified_worker_output_wave
+                  ? release_plan_outside_clade_output(chart, clade)
+                  : clear_plan_outside_clade_output(chart, clade),
+              "lazy outside failure cleanup released capacity");
+        }
+        if (!certified_worker_output_wave) {
+          chart_capacity.release_dynamic_capacity_bytes(released);
+        }
+        observe_plan_lazy_chart_capacity_ledger_barrier(
+            test_hooks, chart, chart_capacity, "outside-failure-cleanup");
         if (test_hooks != nullptr &&
             test_hooks->observe_outside_level_failure_cleanup) {
           test_hooks->observe_outside_level_failure_cleanup(chart, level);
@@ -4345,16 +6499,154 @@ inline void build_plan_lazy_outside_chart_scheduled_finite(
         }
       }
       if (selected_error) {
-        for (std::size_t item = 0; item < level_item_count; ++item) {
-          clear_plan_outside_clade_output(
-              chart, nonroot_level_order[level_begin + item]);
+        if (certified_worker_output_wave) {
+          auto observed = plan_lazy_chart_capacity_add(
+              retained_resident_bytes,
+              lazy_multisite_chart_capacity_resident_bytes(chart),
+              "lazy outside exceptional certified worker output");
+          observed = plan_lazy_chart_capacity_add(
+              observed, coordinator_bytes,
+              "lazy outside exceptional certified worker output");
+          observed = plan_lazy_chart_capacity_add(
+              observed,
+              scheduler_workspace.outside_capacity_resident_bytes(),
+              "lazy outside exceptional certified worker output");
+          observed = plan_lazy_chart_capacity_add(
+              observed, scheduler_operation_bytes,
+              "lazy outside exceptional certified worker output");
+          record_plan_lazy_chart_actual_peak(memory_report, observed);
         }
+        std::size_t released = 0;
+        for (std::size_t item = 0; item < level_item_count; ++item) {
+          auto const clade = nonroot_level_order[level_begin + item];
+          released = plan_lazy_chart_capacity_add(
+              released,
+              certified_worker_output_wave
+                  ? release_plan_outside_clade_output(chart, clade)
+                  : clear_plan_outside_clade_output(chart, clade),
+              "lazy outside failure cleanup released capacity");
+        }
+        if (!certified_worker_output_wave) {
+          chart_capacity.release_dynamic_capacity_bytes(released);
+        }
+        observe_plan_lazy_chart_capacity_ledger_barrier(
+            test_hooks, chart, chart_capacity, "outside-failure-cleanup");
         if (test_hooks != nullptr &&
             test_hooks->observe_outside_level_failure_cleanup) {
           test_hooks->observe_outside_level_failure_cleanup(chart, level);
         }
         std::rethrow_exception(selected_error);
       }
+      if (certified_worker_output_wave) {
+        std::size_t wave_capacity = 0;
+        for (std::size_t local = 0; local < admitted_items; ++local) {
+          wave_capacity = plan_lazy_chart_capacity_add(
+              wave_capacity,
+              plan_outside_clade_output_dynamic_capacity_bytes(
+                  chart,
+                  nonroot_level_order[level_begin + wave_begin + local]),
+              "lazy outside certified worker output wave");
+        }
+        auto const phase_capacity = plan_lazy_chart_capacity_add(
+            certified_worker_output_capacity_published, wave_capacity,
+            "lazy outside certified worker output phase");
+        if (phase_capacity > certified_worker_output_capacity_limit) {
+          if (memory_report != nullptr) {
+            ++memory_report->certified_worker_output_bound_failures;
+          }
+          for (std::size_t item = 0; item < level_item_count; ++item) {
+            release_plan_outside_clade_output(
+                chart, nonroot_level_order[level_begin + item]);
+          }
+          throw std::logic_error(
+              "lazy outside certified worker output exceeded its capacity "
+              "surface");
+        }
+        chart_capacity.add_dynamic_capacity_bytes(
+            wave_capacity, "lazy outside certified worker output publication");
+        certified_worker_output_capacity_published = phase_capacity;
+        auto observed = plan_lazy_chart_capacity_add(
+            retained_resident_bytes, chart_capacity.resident_bytes(),
+            "lazy outside certified worker output join");
+        observed = plan_lazy_chart_capacity_add(
+            observed, coordinator_bytes,
+            "lazy outside certified worker output join");
+        observed = plan_lazy_chart_capacity_add(
+            observed, scheduler_workspace.outside_capacity_resident_bytes(),
+            "lazy outside certified worker output join");
+        observed = plan_lazy_chart_capacity_add(
+            observed, scheduler_operation_bytes,
+            "lazy outside certified worker output join");
+        record_plan_lazy_chart_actual_peak(memory_report, observed);
+        if (observed > memory_options.memory_budget_bytes) {
+          if (memory_report != nullptr) {
+            ++memory_report->certified_worker_output_bound_failures;
+          }
+          std::size_t released = 0;
+          for (std::size_t item = 0; item < level_item_count; ++item) {
+            released = plan_lazy_chart_capacity_add(
+                released,
+                release_plan_outside_clade_output(
+                    chart, nonroot_level_order[level_begin + item]),
+                "lazy outside rejected certified output release");
+          }
+          chart_capacity.release_dynamic_capacity_bytes(released);
+          certified_worker_output_capacity_published -= released;
+#ifndef NDEBUG
+          chart_capacity.require_matches_oracle(chart);
+#endif
+          throw plan_lazy_chart_memory_budget_error(
+              plan_lazy_chart_memory_phase::outside, observed,
+              memory_options.memory_budget_bytes);
+        }
+        if (memory_report != nullptr) {
+          memory_report->outside_certified_worker_output_allocation = true;
+          ++memory_report->outside_certified_worker_output_waves;
+          memory_report
+              ->outside_certified_worker_output_capacity_resident_bytes =
+              phase_capacity;
+        }
+        observe_plan_lazy_chart_capacity_ledger_barrier(
+            test_hooks, chart, chart_capacity,
+            "outside-certified-worker-output-publication");
+      }
+      if (!retain_completed_output_capacity) {
+        auto compaction_chart_peak_limit = chart_peak_limit;
+        if (memory_report != nullptr) {
+          compaction_chart_peak_limit =
+              memory_report->actual_peak_capacity_resident_bytes <
+                      output_outside_chart
+                  ? 0
+                  : std::min(
+                        compaction_chart_peak_limit,
+                        memory_report->actual_peak_capacity_resident_bytes -
+                            output_outside_chart);
+        }
+        for (std::size_t local = 0; local < admitted_items; ++local) {
+          auto const clade =
+              nonroot_level_order[level_begin + wave_begin + local];
+          auto compact = [&](auto& values) {
+            if (memory_report != nullptr) {
+              ++memory_report->outside_completed_output_compaction_attempts;
+            }
+            auto const compaction = compact_completed_plan_lazy_chart_vector(
+                values, chart_capacity, compaction_chart_peak_limit);
+            record_plan_lazy_chart_actual_peak(
+                memory_report,
+                plan_lazy_chart_capacity_add(
+                    output_outside_chart,
+                    compaction.observed_peak_resident_bytes,
+                    "lazy outside completed-output compaction"));
+          };
+          compact(chart.outside_rows_by_clade[clade]);
+          compact(chart.outside_class_weight_by_clade[clade]);
+        }
+      }
+#ifndef NDEBUG
+      chart_capacity.require_matches_oracle(chart);
+#endif
+      observe_plan_lazy_chart_capacity_ledger_barrier(
+          test_hooks, chart, chart_capacity, "outside-wave-join");
       wave_begin += admitted_items;
     }
 
@@ -4403,20 +6695,76 @@ inline void reserve_plan_lazy_chart_run_summaries(
   runs->reserve(runs->size() + count);
 }
 
-inline void clear_plan_inside_clade_output(lazy_multisite_chart& chart,
-                                           clade_id clade) noexcept {
+inline std::size_t clear_plan_inside_clade_output(
+    lazy_multisite_chart& chart, clade_id clade) {
+  std::size_t released = 0;
+  auto add_map_capacity = [&](auto const& map, std::string_view context) {
+    if (!map) return;
+    released = plan_lazy_chart_capacity_add(
+        released,
+        plan_lazy_chart_capacity_multiply(map->capacity(), sizeof(std::size_t),
+                                          context),
+        "lazy inside failure cleanup released capacity");
+  };
+  add_map_capacity(chart.class_index_by_pattern_by_clade[clade],
+                   "lazy inside failure cleanup class map");
+  add_map_capacity(chart.structural_class_index_by_pattern_by_clade[clade],
+                   "lazy inside failure cleanup structural map");
   chart.inside_rows_by_clade[clade].clear();
   chart.class_index_by_pattern_by_clade[clade] = std::nullopt;
   chart.structural_class_index_by_pattern_by_clade[clade] = std::nullopt;
   chart.structural_class_count_by_clade[clade] = 0;
   chart.class_weight_by_clade[clade].clear();
+  return released;
 }
 
-inline void clear_plan_outside_clade_output(lazy_multisite_chart& chart,
-                                            clade_id clade) noexcept {
+inline std::size_t clear_plan_outside_clade_output(
+    lazy_multisite_chart& chart, clade_id clade) {
+  auto const released =
+      chart.outside_class_index_by_pattern_by_clade[clade]
+          ? plan_lazy_chart_capacity_multiply(
+                chart.outside_class_index_by_pattern_by_clade[clade]
+                    ->capacity(),
+                sizeof(std::size_t),
+                "lazy outside failure cleanup class map")
+          : 0;
   chart.outside_rows_by_clade[clade].clear();
   chart.outside_class_index_by_pattern_by_clade[clade] = std::nullopt;
   chart.outside_class_weight_by_clade[clade].clear();
+  return released;
+}
+
+// Certified worker-output waves allocate rows and weights inside disjoint
+// worker tasks. Before their capacities are published to the chart ledger, a
+// failed wave must destroy every such allocation rather than merely clear the
+// vector sizes. The ordinary prepared-output failure path intentionally keeps
+// its coordinator-published row/weight capacity and therefore continues to
+// use clear_plan_*_clade_output above.
+inline std::size_t release_plan_inside_clade_output(
+    lazy_multisite_chart& chart, clade_id clade) {
+  auto const released =
+      plan_inside_clade_output_dynamic_capacity_bytes(chart, clade);
+  std::remove_cvref_t<decltype(chart.inside_rows_by_clade[clade])>{}.swap(
+      chart.inside_rows_by_clade[clade]);
+  std::remove_cvref_t<decltype(chart.class_weight_by_clade[clade])>{}.swap(
+      chart.class_weight_by_clade[clade]);
+  chart.class_index_by_pattern_by_clade[clade] = std::nullopt;
+  chart.structural_class_index_by_pattern_by_clade[clade] = std::nullopt;
+  chart.structural_class_count_by_clade[clade] = 0;
+  return released;
+}
+
+inline std::size_t release_plan_outside_clade_output(
+    lazy_multisite_chart& chart, clade_id clade) {
+  auto const released =
+      plan_outside_clade_output_dynamic_capacity_bytes(chart, clade);
+  std::remove_cvref_t<decltype(chart.outside_rows_by_clade[clade])>{}.swap(
+      chart.outside_rows_by_clade[clade]);
+  std::remove_cvref_t<
+      decltype(chart.outside_class_weight_by_clade[clade])>{}.swap(
+      chart.outside_class_weight_by_clade[clade]);
+  chart.outside_class_index_by_pattern_by_clade[clade] = std::nullopt;
+  return released;
 }
 
 inline std::size_t logical_plan_lazy_inside_initial_chart_bytes(
@@ -4444,18 +6792,18 @@ inline void preflight_plan_lazy_inside_direct_finite(
     std::vector<chart_scheduler_run_summary> const* level_runs,
     plan_lazy_chart_scheduler_workspace* scheduler_workspace,
     plan_lazy_chart_memory_options const& memory_options,
-    plan_lazy_chart_memory_report* memory_report) {
+    plan_lazy_chart_memory_report* memory_report,
+    validated_plan_patterns_ref const* validated = nullptr) {
   if (memory_options.memory_budget_bytes == 0) return;
   if (memory_report != nullptr) {
     memory_report->memory_budget_bytes = memory_options.memory_budget_bytes;
   }
-  plan.assert_valid();
   if (options.chart.keep_trace) {
     throw std::runtime_error(
         "lazy inside chart: keep_trace uses the binary choice layer; lazy "
         "inside rows are row-only");
   }
-  validate_patterns(plan, patterns);
+  validate_patterns_or_assert(plan, patterns, validated);
 
   auto const clade_count = plan.clades().size();
   auto const worker_count = scheduler.worker_resolution().resolved_workers;
@@ -4542,14 +6890,14 @@ inline void preflight_plan_lazy_inside_direct_finite(
 
 inline lazy_multisite_chart initialize_plan_lazy_inside_chart(
     chart_execution_plan const& plan, site_pattern_set const& patterns,
-    lazy_chart_options const& options) {
-  plan.assert_valid();
+    lazy_chart_options const& options,
+    validated_plan_patterns_ref const* validated = nullptr) {
   if (options.chart.keep_trace) {
     throw std::runtime_error(
         "lazy inside chart: keep_trace uses the binary choice layer; lazy "
         "inside rows are row-only");
   }
-  validate_patterns(plan, patterns);
+  validate_patterns_or_assert(plan, patterns, validated);
 
   lazy_multisite_chart chart;
   chart.pattern_count = patterns.patterns.size();
@@ -4695,13 +7043,17 @@ inline lazy_multisite_chart build_lazy_inside_chart_scheduled(
         scheduler_workspace = nullptr,
     lazy_chart_detail::plan_lazy_chart_memory_options const& memory_options =
         {},
-    lazy_chart_detail::plan_lazy_chart_memory_report* memory_report = nullptr) {
+    lazy_chart_detail::plan_lazy_chart_memory_report* memory_report = nullptr,
+    lazy_chart_detail::validated_plan_patterns_ref const* validated =
+        nullptr) {
   using namespace lazy_chart_detail;
 
   preflight_plan_lazy_inside_direct_finite(plan, patterns, options, scheduler,
                                            level_runs, scheduler_workspace,
-                                           memory_options, memory_report);
-  auto chart = initialize_plan_lazy_inside_chart(plan, patterns, options);
+                                           memory_options, memory_report,
+                                           validated);
+  auto chart =
+      initialize_plan_lazy_inside_chart(plan, patterns, options, validated);
   auto const level_order = plan.bottom_up_level_order();
   auto const level_offsets = plan.bottom_up_level_offsets();
   auto const clade_count = plan.clades().size();
@@ -5272,13 +7624,13 @@ inline void preflight_plan_lazy_outside_direct_finite(
     std::vector<chart_scheduler_run_summary> const* level_runs,
     plan_lazy_chart_scheduler_workspace* scheduler_workspace,
     plan_lazy_chart_memory_options const& memory_options,
-    plan_lazy_chart_memory_report* memory_report) {
+    plan_lazy_chart_memory_report* memory_report,
+    validated_plan_patterns_ref const* validated = nullptr) {
   if (memory_options.memory_budget_bytes == 0) return;
   if (memory_report != nullptr) {
     memory_report->memory_budget_bytes = memory_options.memory_budget_bytes;
   }
-  plan.assert_valid();
-  validate_patterns(plan, patterns);
+  validate_patterns_or_assert(plan, patterns, validated);
   if (options.score_ua_edge) {
     parsimony_chart_detail::validate_state(reference_state, "reference");
   }
@@ -5388,9 +7740,10 @@ inline void initialize_plan_lazy_outside_chart(chart_execution_plan const& plan,
                                                site_pattern_set const& patterns,
                                                lazy_multisite_chart& chart,
                                                chart_options const& options,
-                                               std::uint8_t reference_state) {
-  plan.assert_valid();
-  validate_patterns(plan, patterns);
+                                               std::uint8_t reference_state,
+                                               validated_plan_patterns_ref const*
+                                                   validated = nullptr) {
+  validate_patterns_or_assert(plan, patterns, validated);
   if (options.score_ua_edge) {
     parsimony_chart_detail::validate_state(reference_state, "reference");
   }
@@ -5403,7 +7756,7 @@ inline void initialize_plan_lazy_outside_chart(chart_execution_plan const& plan,
     throw std::runtime_error(
         "lazy outside chart: inside row clade count mismatch");
   }
-  materialize_inside_class_maps(chart, plan, patterns);
+  materialize_inside_class_maps(chart, plan, patterns, validated);
 
   chart.outside_rows_by_clade.assign(clade_count, {});
   chart.outside_class_index_by_pattern_by_clade.assign(clade_count,
@@ -5477,14 +7830,16 @@ inline void build_lazy_outside_chart_in_place_scheduled(
         scheduler_workspace = nullptr,
     lazy_chart_detail::plan_lazy_chart_memory_options const& memory_options =
         {},
-    lazy_chart_detail::plan_lazy_chart_memory_report* memory_report = nullptr) {
+    lazy_chart_detail::plan_lazy_chart_memory_report* memory_report = nullptr,
+    lazy_chart_detail::validated_plan_patterns_ref const* validated =
+        nullptr) {
   using namespace lazy_chart_detail;
 
   preflight_plan_lazy_outside_direct_finite(
       plan, patterns, chart, options, reference_state, scheduler, level_runs,
-      scheduler_workspace, memory_options, memory_report);
+      scheduler_workspace, memory_options, memory_report, validated);
   initialize_plan_lazy_outside_chart(plan, patterns, chart, options,
-                                     reference_state);
+                                     reference_state, validated);
   auto const level_order = plan.top_down_level_order();
   auto const level_offsets = plan.top_down_level_offsets();
   auto const clade_count = plan.clades().size();
@@ -5532,12 +7887,19 @@ inline void build_lazy_outside_chart_in_place_scheduled(
   auto& workspaces = shared_scheduler_workspace.outside_by_slot;
   std::vector<plan_outside_clade_work_stats> stats_by_clade(clade_count);
   std::vector<std::exception_ptr> errors_by_clade(clade_count);
+  // Match the finite scheduler's certified strict-tree route. Hook-observable
+  // runs retain one callback and one task-local assignment per clade.
+  auto const enable_strict_tree_sibling_fusion =
+      test_hooks == nullptr &&
+      plan_has_strict_binary_tree_outside_structure(plan);
 
   for (std::size_t level = 0; level < level_count; ++level) {
     auto const begin = nonroot_level_offsets[level];
     auto const end = nonroot_level_offsets[level + 1];
     auto const item_count = end - begin;
     if (item_count == 0) continue;
+    auto const admitted_wave = std::span<clade_id const>{
+        nonroot_level_order.data() + begin, item_count};
 
     chart_scheduler_run_summary failed_run;
     chart_scheduler_run_summary run;
@@ -5552,14 +7914,30 @@ inline void build_lazy_outside_chart_in_place_scheduled(
             }
             auto& workspace = workspaces[stable_slot];
             for (std::size_t item = range.begin; item < range.end; ++item) {
-              auto const clade = nonroot_level_order[begin + item];
+              auto const clade = admitted_wave[item];
+              auto sibling_work = plan_outside_sibling_work{};
+              if (enable_strict_tree_sibling_fusion) {
+                sibling_work = classify_plan_outside_sibling_work(
+                    plan, admitted_wave, item);
+                if (sibling_work.kind ==
+                    plan_outside_sibling_work_kind::fused_follower) {
+                  continue;
+                }
+              }
               try {
                 if (test_hooks != nullptr && test_hooks->before_outside_clade) {
                   test_hooks->before_outside_clade(clade, level, stable_slot);
                 }
-                assign_plan_outside_classes_for_clade_task_local(
-                    chart, plan, patterns, clade, workspace,
-                    stats_by_clade[clade]);
+                if (sibling_work.kind ==
+                    plan_outside_sibling_work_kind::fused_leader) {
+                  assign_plan_outside_classes_for_strict_tree_sibling_pair_task_local(
+                      chart, plan, patterns, clade, sibling_work.sibling,
+                      workspace, stats_by_clade[clade]);
+                } else {
+                  assign_plan_outside_classes_for_clade_task_local(
+                      chart, plan, patterns, clade, workspace,
+                      stats_by_clade[clade]);
+                }
                 if (test_hooks != nullptr && test_hooks->after_outside_clade) {
                   test_hooks->after_outside_clade(clade, level, stable_slot);
                 }
@@ -5618,7 +7996,9 @@ inline void build_lazy_outside_chart_in_place_scheduled(
         scheduler_workspace = nullptr,
     lazy_chart_detail::plan_lazy_chart_memory_options const& memory_options =
         {},
-    lazy_chart_detail::plan_lazy_chart_memory_report* memory_report = nullptr) {
+    lazy_chart_detail::plan_lazy_chart_memory_report* memory_report = nullptr,
+    lazy_chart_detail::validated_plan_patterns_ref const* validated =
+        nullptr) {
   if (options.score_ua_edge) {
     throw std::runtime_error(
         "lazy outside chart: reference state is required when "
@@ -5626,7 +8006,8 @@ inline void build_lazy_outside_chart_in_place_scheduled(
   }
   build_lazy_outside_chart_in_place_scheduled(
       plan, patterns, chart, options, std::uint8_t{0}, scheduler, level_runs,
-      test_hooks, scheduler_workspace, memory_options, memory_report);
+      test_hooks, scheduler_workspace, memory_options, memory_report,
+      validated);
 }
 
 inline void build_lazy_outside_chart_in_place(

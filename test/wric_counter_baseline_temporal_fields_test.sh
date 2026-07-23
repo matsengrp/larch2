@@ -33,6 +33,17 @@ awk -v begin="$begin" -v end="$end" '
 }
 
 keys=(
+  lazy_chart_inside_dependency_ready_executions
+  lazy_chart_outside_dependency_ready_executions
+  lazy_chart_inside_dependency_ready_jobs
+  lazy_chart_outside_dependency_ready_jobs
+  lazy_chart_inside_dependency_ready_scheduler_operations
+  lazy_chart_outside_dependency_ready_scheduler_operations
+  lazy_chart_inside_dependency_ready_capacity_resident_bytes_max
+  lazy_chart_outside_dependency_ready_capacity_resident_bytes_max
+  lazy_local_requested_concurrency_max
+  lazy_local_effective_concurrency_max
+  lazy_local_bandwidth_capped_batches
   lazy_local_iteration_generation_phase_bytes_max
   lazy_local_iteration_evidence_phase_bytes_max
   lazy_local_ranked_candidate_exact_evidence_bytes_max

@@ -3,20 +3,25 @@
 #include <larch/pmr_arena.hpp>
 #include <larch/phylo_dag.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <memory_resource>
+#include <numeric>
+#include <optional>
 #include <queue>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <variant>
+#include <vector>
 
 namespace larch {
 
@@ -31,6 +36,7 @@ inline std::size_t edge_count(phylo_dag& d) { return d.edge_count(); }
 inline void recompute_compact_genomes(phylo_dag& d) {
   auto const& ref = get_reference_sequence(d);
   auto ua = d.get_root_as<node_kind::ua>();
+  compact_genome const reference_cg;
 
   // BFS from UA's children.
   // For DAGs, a node may have parents at different BFS depths.  We must
@@ -79,18 +85,31 @@ inline void recompute_compact_genomes(phylo_dag& d) {
                   if (!processed.contains(parent_idx)) return;
 
                   auto& edge_muts = pe.mutations();
-                  compact_genome parent_cg;
+                  // Parent annotations live in stable DAG node storage for
+                  // the duration of this traversal. Borrow the already
+                  // finalized genome instead of copying its mutation map for
+                  // every edge; UA intentionally borrows the empty reference
+                  // genome value.
+                  compact_genome const* parent_cg = &reference_cg;
                   std::visit(
                       [&](auto parent) {
                         if constexpr (requires { parent.cg(); }) {
-                          parent_cg = parent.cg();
+                          parent_cg = &parent.cg();
                         }
                       },
                       pe.get_parent());
 
                   if constexpr (requires { node.cg(); }) {
-                    node.cg() = compact_genome{};
-                    node.cg().add_parent_edge(edge_muts, parent_cg, ref);
+                    if (edge_muts.empty()) {
+                      // An empty edge inherits the complete parent genome.
+                      // Copying the value also copies its cached hash and
+                      // avoids cloning then rescanning a potentially large
+                      // mutation map through add_parent_edge().
+                      node.cg() = *parent_cg;
+                    } else {
+                      node.cg() = compact_genome{};
+                      node.cg().add_parent_edge(edge_muts, *parent_cg, ref);
+                    }
                   }
                   cg_set = true;
                 },
@@ -121,30 +140,35 @@ inline void recompute_compact_genomes(phylo_dag& d) {
 
 inline void recompute_edge_mutations(phylo_dag& d) {
   auto const& ref = get_reference_sequence(d);
+  compact_genome const reference_cg;
 
   for (auto edge_var : d.get_all_edges()) {
     std::visit(
         [&](auto edge) {
-          compact_genome parent_cg;
+          // Node compact genomes are immutable during this pass.  Refer to
+          // them directly: copying either std::map-backed genome once per
+          // incident edge made the single-tree normalization path quadratic
+          // in retained mutation payload and dominated chart-SPR wall time.
+          auto const* parent_cg = &reference_cg;
           std::visit(
               [&](auto parent) {
                 if constexpr (requires { parent.cg(); }) {
-                  parent_cg = parent.cg();
+                  parent_cg = &parent.cg();
                 }
               },
               edge.get_parent());
 
-          compact_genome child_cg;
+          auto const* child_cg = &reference_cg;
           std::visit(
               [&](auto child) {
                 if constexpr (requires { child.cg(); }) {
-                  child_cg = child.cg();
+                  child_cg = &child.cg();
                 }
               },
               edge.get_child());
 
-          edge.mutations() =
-              compact_genome::to_edge_mutations(ref, parent_cg, child_cg);
+          edge.mutations() = compact_genome::to_edge_mutations(
+              ref, *parent_cg, *child_cg);
         },
         edge_var);
   }
@@ -968,6 +992,258 @@ inline void fitch_assign_compact_genomes(
 #include <larch/thread_pool.hpp>
 
 namespace larch {
+
+namespace compute_detail {
+
+struct compact_genome_tree_plan {
+  std::vector<std::vector<std::size_t>> levels;
+  std::vector<std::size_t> incoming_edge_by_node;
+};
+
+inline std::optional<compact_genome_tree_plan>
+build_compact_genome_tree_levels(phylo_dag& d) {
+  auto const nodes = node_count(d);
+  if (nodes == 0 || edge_count(d) != nodes - 1) return std::nullopt;
+
+  auto const root = get_root_idx(d);
+  auto const high_mark = d.node_high_mark();
+  if (root >= high_mark) return std::nullopt;
+
+  compact_genome_tree_plan result;
+  result.incoming_edge_by_node.assign(high_mark, no_idx);
+  std::vector<bool> present(high_mark, false);
+  for (auto node_variant : d.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if (node.index() < high_mark) present[node.index()] = true;
+        },
+        node_variant);
+  }
+  if (!present[root] || std::ranges::count(present, true) != nodes) {
+    return std::nullopt;
+  }
+
+  // Build the dependency graph from the authoritative edge objects, then
+  // prove that both endpoint adjacency lists name each edge exactly once.
+  // This keeps a malformed DAG on the historical serial path rather than
+  // allowing a worker to read a same-level compact genome.
+  auto const edge_high_mark = d.edge_high_mark();
+  std::vector<bool> edge_present(edge_high_mark, false);
+  std::vector<bool> parent_listed(edge_high_mark, false);
+  std::vector<bool> child_listed(edge_high_mark, false);
+  std::vector<std::vector<std::size_t>> children_by_parent(high_mark);
+  std::size_t observed_edges = 0;
+  bool valid_edges = true;
+  for (auto edge_variant : d.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          auto const edge_index = edge.index();
+          auto const parent_index = std::visit(
+              [](auto parent) { return parent.index(); }, edge.get_parent());
+          auto const child_index = std::visit(
+              [](auto child) { return child.index(); }, edge.get_child());
+          if (edge_index >= edge_high_mark || edge_present[edge_index] ||
+              parent_index >= high_mark || child_index >= high_mark ||
+              !present[parent_index] || !present[child_index] ||
+              child_index == root ||
+              result.incoming_edge_by_node[child_index] != no_idx) {
+            valid_edges = false;
+            return;
+          }
+          edge_present[edge_index] = true;
+          result.incoming_edge_by_node[child_index] = edge_index;
+          children_by_parent[parent_index].push_back(child_index);
+          ++observed_edges;
+        },
+        edge_variant);
+  }
+  if (!valid_edges || observed_edges != edge_count(d) ||
+      result.incoming_edge_by_node[root] != no_idx) {
+    return std::nullopt;
+  }
+  for (std::size_t node_index = 0; node_index < high_mark; ++node_index) {
+    if (present[node_index] && node_index != root &&
+        result.incoming_edge_by_node[node_index] == no_idx) {
+      return std::nullopt;
+    }
+  }
+
+  for (auto node_variant : d.get_all_nodes()) {
+    bool adjacency_valid = true;
+    std::visit(
+        [&](auto node) {
+          auto const node_index = node.index();
+          std::size_t parent_count = 0;
+          for (auto edge_variant : node.get_parents()) {
+            std::visit(
+                [&](auto edge) {
+                  ++parent_count;
+                  auto const edge_index = edge.index();
+                  auto const child_index = std::visit(
+                      [](auto child) { return child.index(); },
+                      edge.get_child());
+                  if (edge_index >= edge_high_mark ||
+                      !edge_present[edge_index] || parent_listed[edge_index] ||
+                      child_index != node_index ||
+                      result.incoming_edge_by_node[node_index] != edge_index) {
+                    adjacency_valid = false;
+                    return;
+                  }
+                  parent_listed[edge_index] = true;
+                },
+                edge_variant);
+          }
+          if (node_index == root ? parent_count != 0 : parent_count != 1) {
+            adjacency_valid = false;
+          }
+          for (auto edge_variant : node.get_children()) {
+            std::visit(
+                [&](auto edge) {
+                  auto const edge_index = edge.index();
+                  auto const parent_index = std::visit(
+                      [](auto parent) { return parent.index(); },
+                      edge.get_parent());
+                  if (edge_index >= edge_high_mark ||
+                      !edge_present[edge_index] || child_listed[edge_index] ||
+                      parent_index != node_index) {
+                    adjacency_valid = false;
+                    return;
+                  }
+                  child_listed[edge_index] = true;
+                },
+                edge_variant);
+          }
+        },
+        node_variant);
+    if (!adjacency_valid) return std::nullopt;
+  }
+  for (std::size_t edge_index = 0; edge_index < edge_high_mark; ++edge_index) {
+    if (edge_present[edge_index] &&
+        (!parent_listed[edge_index] || !child_listed[edge_index])) {
+      return std::nullopt;
+    }
+  }
+
+  std::vector<bool> visited(high_mark, false);
+  visited[root] = true;
+  std::size_t visited_count = 1;
+  std::vector<std::size_t> frontier{root};
+  while (!frontier.empty()) {
+    std::vector<std::size_t> next;
+    for (auto node_index : frontier) {
+      for (auto child_index : children_by_parent[node_index]) {
+        if (visited[child_index]) return std::nullopt;
+        visited[child_index] = true;
+        ++visited_count;
+        next.push_back(child_index);
+      }
+    }
+    if (!next.empty()) result.levels.push_back(next);
+    frontier = std::move(next);
+  }
+  if (visited_count != nodes) return std::nullopt;
+  return result;
+}
+
+}  // namespace compute_detail
+
+// Parallelize only a proved unique-parent tree. Generic DAGs retain the exact
+// historical processed-parent BFS. The return value reports whether the
+// parallel tree specialization was used; either path fully recomputes CGs.
+inline bool recompute_compact_genomes_parallel_tree(
+    phylo_dag& d, std::size_t workers, thread_pool& pool) {
+  if (workers <= 1) {
+    recompute_compact_genomes(d);
+    return false;
+  }
+  auto levels = compute_detail::build_compact_genome_tree_levels(d);
+  if (!levels) {
+    recompute_compact_genomes(d);
+    return false;
+  }
+
+  auto const& reference = get_reference_sequence(d);
+  // Keep malformed-position exception type, message, order, and partial-state
+  // behavior on the serial implementation. Valid product inputs take the
+  // allocation-light level-parallel path below.
+  for (auto const& level : levels->levels) {
+    for (auto node_index : level) {
+      bool positions_valid = true;
+      std::visit(
+          [&](auto edge) {
+            for (auto const& [position, unused] : edge.mutations()) {
+              (void)unused;
+              if (position == 0 || position > reference.size()) {
+                positions_valid = false;
+                return;
+              }
+            }
+          },
+          d.get_edge(levels->incoming_edge_by_node[node_index]));
+      if (!positions_valid) {
+        recompute_compact_genomes(d);
+        return false;
+      }
+    }
+  }
+
+  compact_genome const reference_cg;
+  auto compute_node = [&](std::size_t node_index) {
+    auto const incoming_edge = levels->incoming_edge_by_node[node_index];
+    std::visit(
+        [&](auto node) {
+          std::visit(
+              [&](auto edge) {
+                auto const* parent_cg = &reference_cg;
+                std::visit(
+                    [&](auto parent) {
+                      if constexpr (requires { parent.cg(); }) {
+                        parent_cg = &parent.cg();
+                      }
+                    },
+                    edge.get_parent());
+                if constexpr (requires { node.cg(); }) {
+                  if (edge.mutations().empty()) {
+                    node.cg() = *parent_cg;
+                  } else {
+                    node.cg() = compact_genome{};
+                    node.cg().add_parent_edge(edge.mutations(), *parent_cg,
+                                              reference);
+                  }
+                }
+              },
+              d.get_edge(incoming_edge));
+        },
+        d.get_node(node_index));
+  };
+
+  for (auto const& level : levels->levels) {
+    auto const task_count = std::min(workers, level.size());
+    if (task_count == 1) {
+      compute_node(level.front());
+      continue;
+    }
+    std::vector<std::size_t> tasks(task_count);
+    std::iota(tasks.begin(), tasks.end(), std::size_t{0});
+    std::vector<std::exception_ptr> errors(level.size());
+    parallel_for_each(pool, tasks, [&](std::size_t task) {
+      auto const begin = level.size() * task / task_count;
+      auto const end = level.size() * (task + 1) / task_count;
+      for (auto index = begin; index < end; ++index) {
+        try {
+          compute_node(level[index]);
+        } catch (...) {
+          errors[index] = std::current_exception();
+          break;
+        }
+      }
+    });
+    for (auto const& error : errors) {
+      if (error) std::rethrow_exception(error);
+    }
+  }
+  return true;
+}
 
 inline void validate_dag(phylo_dag& d, std::string_view label,
                          thread_pool& pool) {

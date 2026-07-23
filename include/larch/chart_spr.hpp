@@ -332,11 +332,18 @@ struct grammar_spr_enumeration_options {
   // It does not reduce the admitted allocation or its reported memory bound.
   std::size_t sampled_tree_source_finite_wave_size_for_diagnostics = 0;
   // Grammar-native construction uses the same persistent scheduler and
-  // top-level handoff. Zero selects the bounded product maximum; finite search
-  // admission may reduce the wave and publish a strict realized-capacity
-  // backstop before the grammar stream allocates or submits work.
+  // top-level handoff for multi-range waves. A production one-range wave may
+  // execute on its producer while retaining the identical admitted storage,
+  // gather, cancellation, and rollback contract. Zero selects the bounded
+  // product maximum; finite search admission may reduce the wave and publish a
+  // strict realized-capacity backstop before construction begins.
   std::size_t grammar_candidate_maximum_wave_size = 0;
   std::size_t grammar_candidate_admitted_wave_bytes = 0;
+  // Search-level callers freeze this representation choice before launching a
+  // producer so one stream cannot mix locale-sensitive text and the equivalent
+  // fixed-width binary identity. Direct-library callers leave it disengaged and
+  // select binary only for W>1 under the classic locale.
+  std::optional<bool> grammar_candidate_use_binary_taxon_dedup_key;
 
   // A pipelined caller may perform serial enumeration/gather on a coordinator
   // while the persistent scheduler scores the preceding buffer.  The one
@@ -448,9 +455,11 @@ struct chart_spr_candidate_generation_stats {
   std::size_t sampled_tree_source_actual_peak_bytes = 0;
 
   // Grammar path events are preassigned in exact serial/RNG order, constructed
-  // in bounded scheduler waves, and gathered canonically. Semantic counters
-  // exclude the drained tail after a cap/callback stop; these diagnostics make
-  // that speculation and the actual scheduler work explicit.
+  // in bounded waves, and gathered canonically. Production one-range waves
+  // may run on the producer; scheduler_operations counts only waves actually
+  // submitted to the persistent scheduler. Semantic counters exclude the
+  // drained tail after a cap/callback stop; these diagnostics expose that
+  // speculation and the realized construction work.
   std::size_t grammar_candidate_construction_waves = 0;
   std::size_t grammar_candidate_scheduler_operations = 0;
   std::size_t grammar_candidate_parallel_operations = 0;
@@ -463,6 +472,10 @@ struct chart_spr_candidate_generation_stats {
   std::size_t grammar_candidate_actual_peak_bytes = 0;
   std::uint64_t grammar_candidate_scheduler_handoff_stall_nanoseconds = 0;
   std::size_t grammar_candidate_cancellations = 0;
+  // Representation-only diagnostics. Their sum is the number of grammar
+  // candidates that reached equality deduplication, including duplicates.
+  std::size_t grammar_candidate_binary_taxon_dedup_keys = 0;
+  std::size_t grammar_candidate_text_taxon_dedup_keys = 0;
 
   // Phase-8 bounded producer/consumer diagnostics.  "Serial overlap" means
   // source enumeration, canonical gather, or candidate copying progressed on
@@ -5226,8 +5239,8 @@ inline void chart_spr_binary_append_production_multiset(
 // Internal W>1 dedup identity. Under the classic locale this fixed-width,
 // count-delimited binary encoding has exactly the equality relation of the
 // historical textual taxon signature while avoiding decimal conversion. It
-// intentionally remains private to sampled-tree parallel postprocessing: W1,
-// public diagnostics, and cross-run reports keep their historical bytes.
+// remains private to candidate-generation deduplication: W1, public
+// diagnostics, and cross-run reports keep their historical bytes.
 inline std::string chart_spr_candidate_taxon_dedup_key(
     clade_grammar const& base, grammar_spr_candidate const& candidate,
     bool use_binary_encoding) {
@@ -5446,6 +5459,13 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
   chart_spr_candidate_generation_stats stats;
   auto base_lookup = build_clade_lookup(grammar);
   std::set<std::string> seen;
+  auto const use_binary_taxon_dedup_key =
+      options.grammar_candidate_use_binary_taxon_dedup_key.value_or(
+          options.sampled_tree_projection_scheduler != nullptr &&
+          options.sampled_tree_projection_scheduler->worker_resolution()
+                  .resolved_workers >
+              1 &&
+          std::locale{} == std::locale::classic());
 
   auto request_stop = [&](chart_spr_candidate_stop_reason reason) -> bool {
     if (stats.stop_reason == chart_spr_candidate_stop_reason::exhausted) {
@@ -5560,8 +5580,13 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
       return true;
     }
 
-    auto signature =
-        chart_spr_candidate_taxon_signature(grammar, *candidate);
+    auto signature = chart_spr_candidate_taxon_dedup_key(
+        grammar, *candidate, use_binary_taxon_dedup_key);
+    if (use_binary_taxon_dedup_key) {
+      ++stats.grammar_candidate_binary_taxon_dedup_keys;
+    } else {
+      ++stats.grammar_candidate_text_taxon_dedup_keys;
+    }
     if (!seen.insert(std::move(signature)).second) {
       note_pruned_after(
           stats,
@@ -5667,80 +5692,113 @@ chart_spr_candidate_generation_stats for_each_grammar_spr_candidate_stream(
       grammar_output[local].failure = nullptr;
       grammar_output[local].completed = false;
     }
-    std::unique_lock<std::mutex> scheduler_handoff;
-    if (options.sampled_tree_projection_scheduler_handoff_mutex != nullptr) {
-      auto const wait_start = std::chrono::steady_clock::now();
-      scheduler_handoff = std::unique_lock<std::mutex>{
-          *options.sampled_tree_projection_scheduler_handoff_mutex};
-      stats.grammar_candidate_scheduler_handoff_stall_nanoseconds +=
-          static_cast<std::uint64_t>(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  std::chrono::steady_clock::now() - wait_start)
-                  .count());
-    }
-    if (cancel_requested()) {
-      if (scheduler_handoff.owns_lock()) scheduler_handoff.unlock();
-      discard_complete_wave(grammar_committed_enumeration);
-      ++stats.grammar_candidate_cancellations;
-      return request_stop(chart_spr_candidate_stop_reason::callback_stop);
-    }
+    auto construct_one = [&](std::size_t local) noexcept {
+      auto& output = grammar_output[local];
+      try {
+        if (options.before_grammar_candidate_construction_for_tests) {
+          options.before_grammar_candidate_construction_for_tests(
+              grammar_work[local].ordinal);
+        }
+        auto const& item = grammar_work[local];
+        output.candidate = make_general_spr_candidate(
+            grammar, base_lookup, item.source_pid, item.moved, item.target,
+            item.source_path, item.dest_path);
+      } catch (...) {
+        output.failure = std::current_exception();
+      }
+      output.completed = true;
+    };
 
-    chart_scheduler_run_summary failed_summary;
-    chart_scheduler_run_summary summary;
-    try {
-      summary =
-          options.sampled_tree_projection_scheduler->for_each_indexed_range(
-              count,
-              {.minimum_grain = 1, .target_ranges_per_worker = 1},
-              [&](chart_indexed_range const& range, std::size_t,
-                  chart_scheduler_cancellation_token const& cancellation) {
-                for (auto local = range.begin; local < range.end; ++local) {
-                  if ((local != range.begin && cancellation.stop_requested()) ||
-                      cancel_requested()) {
-                    break;
-                  }
-                  auto& output = grammar_output[local];
-                  try {
-                    if (options
-                            .before_grammar_candidate_construction_for_tests) {
-                      options.before_grammar_candidate_construction_for_tests(
-                          grammar_work[local].ordinal);
+    // Production's bounded grammar waves are commonly smaller than the
+    // scheduler's inherited minimum grain.  Keep their admitted workspace and
+    // canonical gather/rollback contract, but avoid waiting for the scoring
+    // pipeline handoff merely to execute a one-range operation.  Compatibility
+    // schedulers inherit grain one; hooks and forced-submit seams retain the
+    // scheduled path so their concurrency and failure contracts are stable.
+    auto const inherited_plan =
+        options.sampled_tree_projection_scheduler->plan_indexed_ranges(
+            count, {.target_ranges_per_worker = 1});
+    auto const construct_inline =
+        options.sampled_tree_projection_scheduler_handoff_mutex != nullptr &&
+        inherited_plan.range_count == 1 &&
+        !options.before_grammar_candidate_construction_for_tests &&
+        !options.force_grammar_candidate_submit_failure_after_for_tests;
+
+    if (construct_inline) {
+      if (cancel_requested()) {
+        discard_complete_wave(grammar_committed_enumeration);
+        ++stats.grammar_candidate_cancellations;
+        return request_stop(chart_spr_candidate_stop_reason::callback_stop);
+      }
+      for (std::size_t local = 0; local < count; ++local) {
+        if (cancel_requested()) break;
+        construct_one(local);
+      }
+    } else {
+      std::unique_lock<std::mutex> scheduler_handoff;
+      if (options.sampled_tree_projection_scheduler_handoff_mutex != nullptr) {
+        auto const wait_start = std::chrono::steady_clock::now();
+        scheduler_handoff = std::unique_lock<std::mutex>{
+            *options.sampled_tree_projection_scheduler_handoff_mutex};
+        stats.grammar_candidate_scheduler_handoff_stall_nanoseconds +=
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start)
+                    .count());
+      }
+      if (cancel_requested()) {
+        if (scheduler_handoff.owns_lock()) scheduler_handoff.unlock();
+        discard_complete_wave(grammar_committed_enumeration);
+        ++stats.grammar_candidate_cancellations;
+        return request_stop(chart_spr_candidate_stop_reason::callback_stop);
+      }
+
+      chart_scheduler_run_summary failed_summary;
+      chart_scheduler_run_summary summary;
+      try {
+        summary =
+            options.sampled_tree_projection_scheduler->for_each_indexed_range(
+                count,
+                {.minimum_grain = 1, .target_ranges_per_worker = 1},
+                [&](chart_indexed_range const& range, std::size_t,
+                    chart_scheduler_cancellation_token const& cancellation) {
+                  for (auto local = range.begin; local < range.end; ++local) {
+                    if ((local != range.begin &&
+                         cancellation.stop_requested()) ||
+                        cancel_requested()) {
+                      break;
                     }
-                    auto const& item = grammar_work[local];
-                    output.candidate = make_general_spr_candidate(
-                        grammar, base_lookup, item.source_pid, item.moved,
-                        item.target, item.source_path, item.dest_path);
-                  } catch (...) {
-                    output.failure = std::current_exception();
+                    construct_one(local);
                   }
-                  output.completed = true;
-                }
-              },
-              &failed_summary);
-    } catch (...) {
+                },
+                &failed_summary);
+      } catch (...) {
+        if (options.sampled_tree_projection_scheduler_diagnostics_sink !=
+            nullptr) {
+          options.sampled_tree_projection_scheduler_diagnostics_sink->record(
+              failed_summary);
+        }
+        restore_enumeration(grammar_wave_start);
+        clear_grammar_wave();
+        throw;
+      }
+      if (scheduler_handoff.owns_lock()) scheduler_handoff.unlock();
       if (options.sampled_tree_projection_scheduler_diagnostics_sink !=
           nullptr) {
         options.sampled_tree_projection_scheduler_diagnostics_sink->record(
-            failed_summary);
+            summary);
       }
-      restore_enumeration(grammar_wave_start);
-      clear_grammar_wave();
-      throw;
+      ++stats.grammar_candidate_scheduler_operations;
+      stats.grammar_candidate_parallel_operations +=
+          summary.parallel_branch_entered ? 1 : 0;
+      stats.grammar_candidate_ranges += summary.range_count;
+      stats.grammar_candidate_worker_tasks += summary.worker_tasks_submitted;
+      stats.grammar_candidate_active_worker_high_water =
+          std::max(stats.grammar_candidate_active_worker_high_water,
+                   summary.active_workers);
     }
-    if (scheduler_handoff.owns_lock()) scheduler_handoff.unlock();
-    if (options.sampled_tree_projection_scheduler_diagnostics_sink != nullptr) {
-      options.sampled_tree_projection_scheduler_diagnostics_sink->record(
-          summary);
-    }
+
     ++stats.grammar_candidate_construction_waves;
-    ++stats.grammar_candidate_scheduler_operations;
-    stats.grammar_candidate_parallel_operations +=
-        summary.parallel_branch_entered ? 1 : 0;
-    stats.grammar_candidate_ranges += summary.range_count;
-    stats.grammar_candidate_worker_tasks += summary.worker_tasks_submitted;
-    stats.grammar_candidate_active_worker_high_water =
-        std::max(stats.grammar_candidate_active_worker_high_water,
-                 summary.active_workers);
     stats.grammar_candidate_peak_wave_size =
         std::max(stats.grammar_candidate_peak_wave_size, count);
 
@@ -8161,6 +8219,10 @@ inline void add_generation_count_stats(
       src.grammar_candidate_scheduler_handoff_stall_nanoseconds;
   dst.grammar_candidate_cancellations +=
       src.grammar_candidate_cancellations;
+  dst.grammar_candidate_binary_taxon_dedup_keys +=
+      src.grammar_candidate_binary_taxon_dedup_keys;
+  dst.grammar_candidate_text_taxon_dedup_keys +=
+      src.grammar_candidate_text_taxon_dedup_keys;
 }
 
 }  // namespace chart_spr_detail

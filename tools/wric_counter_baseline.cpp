@@ -191,6 +191,26 @@ int main() {
                      c.lazy_chart_inside_workspace_evictions);
   print_counter_line("lazy_chart_outside_workspace_evictions",
                      c.lazy_chart_outside_workspace_evictions);
+  print_counter_line("lazy_chart_inside_dependency_ready_executions",
+                     c.lazy_chart_inside_dependency_ready_executions);
+  print_counter_line("lazy_chart_outside_dependency_ready_executions",
+                     c.lazy_chart_outside_dependency_ready_executions);
+  print_counter_line("lazy_chart_inside_dependency_ready_jobs",
+                     c.lazy_chart_inside_dependency_ready_jobs);
+  print_counter_line("lazy_chart_outside_dependency_ready_jobs",
+                     c.lazy_chart_outside_dependency_ready_jobs);
+  print_counter_line(
+      "lazy_chart_inside_dependency_ready_scheduler_operations",
+      c.lazy_chart_inside_dependency_ready_scheduler_operations);
+  print_counter_line(
+      "lazy_chart_outside_dependency_ready_scheduler_operations",
+      c.lazy_chart_outside_dependency_ready_scheduler_operations);
+  print_counter_line(
+      "lazy_chart_inside_dependency_ready_capacity_resident_bytes_max",
+      c.lazy_chart_inside_dependency_ready_capacity_resident_bytes_max);
+  print_counter_line(
+      "lazy_chart_outside_dependency_ready_capacity_resident_bytes_max",
+      c.lazy_chart_outside_dependency_ready_capacity_resident_bytes_max);
   print_counter_line("lazy_chart_preflight_peak_bytes",
                      c.lazy_chart_preflight_peak_bytes);
   print_counter_line("lazy_chart_actual_peak_bytes",
@@ -268,6 +288,12 @@ int main() {
   print_counter_line("lazy_local_parallel_waves", c.lazy_local_parallel_waves);
   print_counter_line("lazy_local_memory_limited_waves",
                      c.lazy_local_memory_limited_waves);
+  print_counter_line("lazy_local_requested_concurrency_max",
+                     c.lazy_local_requested_concurrency_max);
+  print_counter_line("lazy_local_effective_concurrency_max",
+                     c.lazy_local_effective_concurrency_max);
+  print_counter_line("lazy_local_bandwidth_capped_batches",
+                     c.lazy_local_bandwidth_capped_batches);
   print_counter_line("lazy_local_admitted_concurrency_max",
                      c.lazy_local_admitted_concurrency_max);
   print_counter_line("lazy_local_prepared_tasks", c.lazy_local_prepared_tasks);

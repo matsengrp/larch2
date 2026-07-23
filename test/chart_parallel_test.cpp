@@ -1643,6 +1643,481 @@ static void test_scheduled_plan_lazy_dependency_wavefronts() {
   CHECK(root_outside_runs.empty());
 }
 
+static void test_finite_strict_tree_outside_sibling_fusion() {
+  std::println("test_finite_strict_tree_outside_sibling_fusion");
+  using larch::lazy_chart_detail::classify_plan_outside_sibling_work;
+  using larch::lazy_chart_detail::plan_has_strict_binary_tree_outside_structure;
+  using larch::lazy_chart_detail::plan_lazy_chart_memory_options;
+  using larch::lazy_chart_detail::plan_lazy_chart_memory_report;
+  using larch::lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks;
+  using larch::lazy_chart_detail::plan_lazy_chart_scheduler_workspace;
+  using larch::lazy_chart_detail::plan_outside_sibling_work_kind;
+  using larch::test::chart_spr_allocation::allocation_observer;
+  using larch::test::chart_spr_allocation::scoped_allocation_observation;
+
+  auto const grammar = make_binary_grammar();
+  auto const plan = larch::build_chart_execution_plan(grammar);
+  CHECK(plan_has_strict_binary_tree_outside_structure(plan));
+  CHECK(!plan_has_strict_binary_tree_outside_structure(
+      larch::build_chart_execution_plan(make_trinary_grammar())));
+  CHECK(!plan_has_strict_binary_tree_outside_structure(
+      larch::build_chart_execution_plan(make_nonlex_binary_dag_grammar())));
+  CHECK(!plan_has_strict_binary_tree_outside_structure(
+      larch::build_chart_execution_plan(make_shared_internal_child_grammar())));
+
+  auto const top_down = plan.top_down_level_order();
+  auto const offsets = plan.top_down_level_offsets();
+  CHECK(offsets.size() >= 3);
+  auto const sibling_wave =
+      top_down.subspan(offsets[1], offsets[2] - offsets[1]);
+  CHECK(sibling_wave.size() == 2);
+  auto const leader =
+      classify_plan_outside_sibling_work(plan, sibling_wave, 0);
+  auto const follower =
+      classify_plan_outside_sibling_work(plan, sibling_wave, 1);
+  CHECK(leader.kind == plan_outside_sibling_work_kind::fused_leader);
+  CHECK(follower.kind == plan_outside_sibling_work_kind::fused_follower);
+  CHECK(leader.sibling == sibling_wave[1]);
+  CHECK(follower.sibling == sibling_wave[0]);
+  auto const singleton =
+      classify_plan_outside_sibling_work(plan, sibling_wave.first(1), 0);
+  CHECK(singleton.kind == plan_outside_sibling_work_kind::singleton);
+  CHECK(singleton.sibling == larch::no_clade);
+
+  auto const patterns = make_weighted_patterns(plan.taxon_count());
+  larch::lazy_chart_options inside_options;
+  inside_options.retain_all_inside_class_maps = true;
+  auto oracle =
+      larch::build_lazy_inside_chart(plan, patterns, inside_options);
+  larch::build_lazy_outside_chart_in_place(
+      plan, patterns, oracle, larch::chart_options{});
+
+  // Exercise the fused worker boundary directly after serial capacity
+  // preparation. Both the reusable row buffer and the sibling's chart output
+  // are already admitted, so the operation itself must not allocate.
+  auto prepared =
+      larch::build_lazy_inside_chart(plan, patterns, inside_options);
+  larch::lazy_chart_detail::initialize_plan_lazy_outside_chart(
+      plan, patterns, prepared, larch::chart_options{}, std::uint8_t{0});
+  larch::lazy_chart_detail::outside_context_key_workspace pair_workspace;
+  auto const pair_shape =
+      larch::lazy_chart_detail::plan_outside_clade_shape(plan,
+                                                        sibling_wave.front());
+  (void)larch::lazy_chart_detail::prepare_plan_outside_slot(
+      pair_workspace, patterns.patterns.size(), pair_shape.first,
+      pair_shape.second);
+  larch::lazy_chart_detail::lazy_multisite_chart_capacity_ledger pair_ledger{
+      prepared};
+  for (auto clade : sibling_wave) {
+    (void)larch::lazy_chart_detail::prepare_plan_outside_clade_output(
+        prepared, clade, pair_ledger);
+  }
+  larch::lazy_chart_detail::plan_outside_clade_work_stats pair_stats;
+  allocation_observer pair_observer;
+  {
+    scoped_allocation_observation observe{pair_observer};
+    larch::lazy_chart_detail::
+        assign_plan_outside_classes_for_strict_tree_sibling_pair_task_local(
+            prepared, plan, patterns, sibling_wave[0], sibling_wave[1],
+            pair_workspace, pair_stats);
+  }
+  CHECK(pair_observer.statistics.calls == 0);
+  CHECK(pair_ledger.matches_oracle(prepared));
+  for (auto clade : sibling_wave) {
+    CHECK(prepared.outside_rows_by_clade[clade] ==
+          oracle.outside_rows_by_clade[clade]);
+    CHECK(prepared.outside_class_index_by_pattern_by_clade[clade] ==
+          oracle.outside_class_index_by_pattern_by_clade[clade]);
+    CHECK(prepared.outside_class_weight_by_clade[clade] ==
+          oracle.outside_class_weight_by_clade[clade]);
+  }
+
+  constexpr auto huge_budget = std::size_t{1} << 40;
+  auto run_finite = [&](std::size_t workers, bool install_empty_hooks,
+                        plan_lazy_chart_memory_report& report,
+                        plan_lazy_chart_scheduler_workspace& workspace,
+                        std::vector<larch::chart_scheduler_run_summary>& runs) {
+    larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+        .requested_workers = workers,
+        .default_minimum_grain = 1,
+        .default_target_ranges_per_worker = 4,
+    }};
+    auto chart =
+        larch::build_lazy_inside_chart(plan, patterns, inside_options);
+    plan_lazy_chart_scheduler_test_hooks legacy_hooks;
+    legacy_hooks.before_outside_clade =
+        [](larch::clade_id, std::size_t, std::size_t) {};
+    larch::build_lazy_outside_chart_in_place_scheduled(
+        plan, patterns, chart, larch::chart_options{}, scheduler, &runs,
+        install_empty_hooks ? &legacy_hooks : nullptr, &workspace,
+        plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+        &report);
+    return chart;
+  };
+  auto check_run_shapes = [](auto const& fused, auto const& legacy) {
+    CHECK(fused.size() == legacy.size());
+    for (std::size_t index = 0; index < fused.size(); ++index) {
+      CHECK(fused[index].item_count == legacy[index].item_count);
+      CHECK(fused[index].range_count == legacy[index].range_count);
+      CHECK(fused[index].effective_grain == legacy[index].effective_grain);
+      CHECK(fused[index].worker_tasks_submitted ==
+            legacy[index].worker_tasks_submitted);
+      CHECK(fused[index].serial_reason == legacy[index].serial_reason);
+      CHECK(fused[index].cancelled == legacy[index].cancelled);
+      CHECK(fused[index].failed == legacy[index].failed);
+    }
+  };
+  auto run_unbounded =
+      [&](std::size_t workers, bool install_empty_hooks,
+          std::vector<larch::chart_scheduler_run_summary>& runs) {
+        larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+            .requested_workers = workers,
+            .default_minimum_grain = 1,
+            .default_target_ranges_per_worker = 4,
+        }};
+        auto chart =
+            larch::build_lazy_inside_chart(plan, patterns, inside_options);
+        plan_lazy_chart_scheduler_test_hooks empty_hooks;
+        larch::build_lazy_outside_chart_in_place_scheduled(
+            plan, patterns, chart, larch::chart_options{}, scheduler, &runs,
+            install_empty_hooks ? &empty_hooks : nullptr);
+        return chart;
+      };
+  for (auto workers : {std::size_t{1}, std::size_t{4}}) {
+    plan_lazy_chart_memory_report fused_report;
+    plan_lazy_chart_memory_report legacy_report;
+    plan_lazy_chart_scheduler_workspace fused_workspace;
+    plan_lazy_chart_scheduler_workspace legacy_workspace;
+    std::vector<larch::chart_scheduler_run_summary> fused_runs;
+    std::vector<larch::chart_scheduler_run_summary> legacy_runs;
+    auto fused = run_finite(workers, false, fused_report, fused_workspace,
+                            fused_runs);
+    auto legacy = run_finite(workers, true, legacy_report, legacy_workspace,
+                             legacy_runs);
+    check_lazy_charts_equal(oracle, fused);
+    check_lazy_charts_equal(oracle, legacy);
+    if (workers == 1) {
+      check_run_shapes(fused_runs, legacy_runs);
+      CHECK(fused_report.outside_admission_waves ==
+            legacy_report.outside_admission_waves);
+      CHECK(fused_report.outside_max_admitted_slots ==
+            legacy_report.outside_max_admitted_slots);
+      CHECK(fused_report.outside_memory_limited_levels ==
+            legacy_report.outside_memory_limited_levels);
+      // The observing legacy control deliberately disables the full-output
+      // retention certificate. Its first level prepares the cold W1 slot and
+      // only its second level reuses it; the unobserved certified run reuses
+      // the phase-wide prepared slot in both levels.
+      CHECK(fused_report.outside_reused_slot_waves == 2);
+      CHECK(legacy_report.outside_reused_slot_waves == 1);
+      CHECK(fused_report.scheduler_submissions ==
+            legacy_report.scheduler_submissions);
+    } else {
+      CHECK(fused_report.outside_dependency_ready_execution);
+      CHECK(!legacy_report.outside_dependency_ready_execution);
+      CHECK(fused_runs.size() == 1);
+      CHECK(legacy_runs.size() > fused_runs.size());
+    }
+    CHECK(larch::lazy_chart_detail::lazy_multisite_chart_capacity_resident_bytes(
+              fused) ==
+          larch::lazy_chart_detail::lazy_multisite_chart_capacity_resident_bytes(
+              legacy));
+    if (workers == 1) {
+      CHECK(fused_workspace.outside_capacity_resident_bytes() ==
+            legacy_workspace.outside_capacity_resident_bytes());
+    }
+
+    std::vector<larch::chart_scheduler_run_summary> unbounded_fused_runs;
+    std::vector<larch::chart_scheduler_run_summary> unbounded_legacy_runs;
+    auto unbounded_fused =
+        run_unbounded(workers, false, unbounded_fused_runs);
+    auto unbounded_legacy =
+        run_unbounded(workers, true, unbounded_legacy_runs);
+    check_lazy_charts_equal(oracle, unbounded_fused);
+    check_lazy_charts_equal(oracle, unbounded_legacy);
+    check_run_shapes(unbounded_fused_runs, unbounded_legacy_runs);
+    CHECK(larch::lazy_chart_detail::lazy_multisite_chart_capacity_resident_bytes(
+              unbounded_fused) ==
+          larch::lazy_chart_detail::lazy_multisite_chart_capacity_resident_bytes(
+              unbounded_legacy));
+  }
+}
+
+static void test_finite_strict_binary_dependency_ready_execution() {
+  std::println("test_finite_strict_binary_dependency_ready_execution");
+  using larch::lazy_chart_detail::plan_lazy_chart_memory_options;
+  using larch::lazy_chart_detail::plan_lazy_chart_memory_report;
+  using larch::lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks;
+  using larch::lazy_chart_detail::plan_lazy_chart_scheduler_workspace;
+
+  constexpr auto huge_budget = std::size_t{1} << 40;
+  auto const grammar = make_wide_balanced_binary_grammar(8);
+  auto const plan = larch::build_chart_execution_plan(grammar);
+  auto const patterns = make_wide_star_patterns(8, 4);
+  larch::lazy_chart_options options;
+  options.retain_all_inside_class_maps = true;
+
+  auto const oracle_inside =
+      larch::build_lazy_inside_chart(plan, patterns, options);
+  auto oracle = oracle_inside;
+  larch::build_lazy_outside_chart_in_place(
+      plan, patterns, oracle, larch::chart_options{});
+
+  auto make_scheduler = [] {
+    return std::make_unique<larch::chart_scheduler>(
+        larch::chart_scheduler_options{
+            .requested_workers = 4,
+            .default_minimum_grain = 1,
+            .default_target_ranges_per_worker = 4,
+        });
+  };
+
+  auto scheduler = make_scheduler();
+  plan_lazy_chart_scheduler_workspace workspace;
+  plan_lazy_chart_memory_report report;
+  std::vector<larch::chart_scheduler_run_summary> inside_runs;
+  auto chart = larch::build_lazy_inside_chart_scheduled(
+      plan, patterns, options, *scheduler, &inside_runs, nullptr, &workspace,
+      plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+      &report);
+  check_lazy_charts_equal(oracle_inside, chart);
+  CHECK(report.inside_dependency_ready_execution);
+  CHECK(report.inside_dependency_ready_jobs == plan.clades().size());
+  CHECK(report.inside_dependency_ready_scheduler_operations == 1);
+  CHECK(report.inside_dependency_ready_capacity_resident_bytes != 0);
+  CHECK(report.inside_admission_waves == 1);
+  CHECK(report.inside_reused_slot_waves == 1);
+  CHECK(report.inside_certified_worker_output_allocation);
+  CHECK(report.inside_certified_worker_output_waves == 1);
+  CHECK(inside_runs.size() == 1);
+  CHECK(inside_runs.front().item_count == 4);
+  CHECK(inside_runs.front().range_count == 4);
+  CHECK(inside_runs.front().worker_tasks_submitted == 4);
+
+  std::vector<larch::chart_scheduler_run_summary> outside_runs;
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, chart, larch::chart_options{}, *scheduler,
+      &outside_runs, nullptr, &workspace,
+      plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+      &report);
+  check_lazy_charts_equal(oracle, chart);
+  CHECK(report.outside_dependency_ready_execution);
+  CHECK(report.outside_dependency_ready_jobs == plan.productions().size());
+  CHECK(report.outside_dependency_ready_scheduler_operations == 1);
+  CHECK(report.outside_dependency_ready_capacity_resident_bytes != 0);
+  CHECK(report.outside_admission_waves == 1);
+  CHECK(report.outside_reused_slot_waves == 1);
+  CHECK(report.outside_certified_worker_output_allocation);
+  CHECK(report.outside_certified_worker_output_waves == 1);
+  CHECK(report.certified_worker_output_bound_failures == 0);
+  CHECK(report.scheduler_submissions == 2);
+  CHECK(report.actual_peak_capacity_resident_bytes <= huge_budget);
+  CHECK(report.preflight_peak_capacity_resident_bytes <= huge_budget);
+  CHECK(outside_runs.size() == 1);
+  CHECK(outside_runs.front().item_count == 4);
+  CHECK(outside_runs.front().range_count == 4);
+  CHECK(outside_runs.front().worker_tasks_submitted == 4);
+  CHECK(scheduler->metrics().pending_tasks == 0);
+
+  // Every execution-observing hook remains on the historical joined-level
+  // route, preserving callback and reclamation order.
+  auto hook_scheduler = make_scheduler();
+  plan_lazy_chart_scheduler_workspace hook_workspace;
+  plan_lazy_chart_memory_report hook_report;
+  std::atomic<std::size_t> inside_hook_calls = 0;
+  std::atomic<std::size_t> outside_hook_calls = 0;
+  plan_lazy_chart_scheduler_test_hooks hooks;
+  hooks.before_inside_clade =
+      [&](larch::clade_id, std::size_t, std::size_t) {
+        ++inside_hook_calls;
+      };
+  hooks.before_outside_clade =
+      [&](larch::clade_id, std::size_t, std::size_t) {
+        ++outside_hook_calls;
+      };
+  std::vector<larch::chart_scheduler_run_summary> hook_inside_runs;
+  auto hooked = larch::build_lazy_inside_chart_scheduled(
+      plan, patterns, options, *hook_scheduler, &hook_inside_runs, &hooks,
+      &hook_workspace,
+      plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+      &hook_report);
+  CHECK(!hook_report.inside_dependency_ready_execution);
+  CHECK(inside_hook_calls.load(std::memory_order_relaxed) ==
+        plan.clades().size());
+  CHECK(hook_inside_runs.size() ==
+        plan.bottom_up_level_offsets().size() - 1);
+  std::vector<larch::chart_scheduler_run_summary> hook_outside_runs;
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, hooked, larch::chart_options{}, *hook_scheduler,
+      &hook_outside_runs, &hooks, &hook_workspace,
+      plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+      &hook_report);
+  CHECK(!hook_report.outside_dependency_ready_execution);
+  CHECK(outside_hook_calls.load(std::memory_order_relaxed) ==
+        plan.clades().size() - 1);
+  std::size_t expected_outside_level_runs = 0;
+  auto const top_down_order = plan.top_down_level_order();
+  auto const top_down_offsets = plan.top_down_level_offsets();
+  for (std::size_t level = 0; level + 1 < top_down_offsets.size(); ++level) {
+    bool has_nonroot = false;
+    for (std::size_t item = top_down_offsets[level];
+         item < top_down_offsets[level + 1]; ++item) {
+      has_nonroot = has_nonroot ||
+                    top_down_order[item] != plan.root_clade();
+    }
+    if (has_nonroot) ++expected_outside_level_runs;
+  }
+  CHECK(hook_outside_runs.size() == expected_outside_level_runs);
+  check_lazy_charts_equal(oracle, hooked);
+
+  // An all-binary DAG with shared occurrences and multiple root productions
+  // must retain the generic dependency-level implementation.
+  auto const generic_plan =
+      larch::build_chart_execution_plan(make_nonlex_binary_dag_grammar());
+  auto const generic_patterns = make_nonlex_four_taxon_patterns();
+  auto const generic_oracle_inside =
+      larch::build_lazy_inside_chart(generic_plan, generic_patterns, options);
+  auto generic_oracle = generic_oracle_inside;
+  larch::build_lazy_outside_chart_in_place(
+      generic_plan, generic_patterns, generic_oracle,
+      larch::chart_options{});
+  auto generic_scheduler = make_scheduler();
+  plan_lazy_chart_scheduler_workspace generic_workspace;
+  plan_lazy_chart_memory_report generic_report;
+  auto generic = larch::build_lazy_inside_chart_scheduled(
+      generic_plan, generic_patterns, options, *generic_scheduler, nullptr,
+      nullptr, &generic_workspace,
+      plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+      &generic_report);
+  CHECK(!generic_report.inside_dependency_ready_execution);
+  check_lazy_charts_equal(generic_oracle_inside, generic);
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      generic_plan, generic_patterns, generic, larch::chart_options{},
+      *generic_scheduler, nullptr, nullptr, &generic_workspace,
+      plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+      &generic_report);
+  CHECK(!generic_report.outside_dependency_ready_execution);
+  check_lazy_charts_equal(generic_oracle, generic);
+
+  // Sparse inside-map reclamation remains coordinator-owned and therefore
+  // cannot use the dependency-ready worker route.
+  larch::lazy_chart_options sparse_options;
+  auto const sparse_oracle =
+      larch::build_lazy_inside_chart(plan, patterns, sparse_options);
+  auto sparse_scheduler = make_scheduler();
+  plan_lazy_chart_scheduler_workspace sparse_workspace;
+  plan_lazy_chart_memory_report sparse_report;
+  auto sparse = larch::build_lazy_inside_chart_scheduled(
+      plan, patterns, sparse_options, *sparse_scheduler, nullptr, nullptr,
+      &sparse_workspace,
+      plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+      &sparse_report);
+  CHECK(!sparse_report.inside_dependency_ready_execution);
+  check_lazy_charts_equal(sparse_oracle, sparse);
+
+  // A submission failure after one accepted callback cannot strand queue
+  // waiters: that callback drains the complete DAG, the scheduler joins it,
+  // cleanup destroys every unpublished output, and the same objects retry.
+  auto retry_scheduler = make_scheduler();
+  plan_lazy_chart_scheduler_workspace retry_workspace;
+  plan_lazy_chart_memory_report failed_inside_report;
+  std::vector<larch::chart_scheduler_run_summary> failed_inside_runs;
+  larch::chart_scheduler_test_detail::access::fail_submission_after(
+      *retry_scheduler, 1);
+  bool inside_submit_failed = false;
+  try {
+    (void)larch::build_lazy_inside_chart_scheduled(
+        plan, patterns, options, *retry_scheduler, &failed_inside_runs,
+        nullptr, &retry_workspace,
+        plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+        &failed_inside_report);
+  } catch (larch::chart_scheduler_submit_error const&) {
+    inside_submit_failed = true;
+  }
+  CHECK(inside_submit_failed);
+  CHECK(failed_inside_report.inside_dependency_ready_execution);
+  CHECK(failed_inside_runs.size() == 1);
+  CHECK(failed_inside_runs.front().failed);
+  CHECK(failed_inside_runs.front().item_count == 4);
+  CHECK(failed_inside_runs.front().worker_tasks_submitted == 1);
+  CHECK(retry_scheduler->metrics().pending_tasks == 0);
+  plan_lazy_chart_memory_report retry_inside_report;
+  auto retry_inside = larch::build_lazy_inside_chart_scheduled(
+      plan, patterns, options, *retry_scheduler, nullptr, nullptr,
+      &retry_workspace,
+      plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+      &retry_inside_report);
+  CHECK(retry_inside_report.inside_dependency_ready_execution);
+  check_lazy_charts_equal(oracle_inside, retry_inside);
+
+  auto outside_retry_scheduler = make_scheduler();
+  plan_lazy_chart_scheduler_workspace outside_retry_workspace;
+  auto outside_failed_chart = oracle_inside;
+  auto expected_root_only = oracle_inside;
+  larch::lazy_chart_detail::initialize_plan_lazy_outside_chart(
+      plan, patterns, expected_root_only, larch::chart_options{},
+      std::uint8_t{0});
+  plan_lazy_chart_memory_report failed_outside_report;
+  std::vector<larch::chart_scheduler_run_summary> failed_outside_runs;
+  larch::chart_scheduler_test_detail::access::fail_submission_after(
+      *outside_retry_scheduler, 1);
+  bool outside_submit_failed = false;
+  try {
+    larch::build_lazy_outside_chart_in_place_scheduled(
+        plan, patterns, outside_failed_chart, larch::chart_options{},
+        *outside_retry_scheduler, &failed_outside_runs, nullptr,
+        &outside_retry_workspace,
+        plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+        &failed_outside_report);
+  } catch (larch::chart_scheduler_submit_error const&) {
+    outside_submit_failed = true;
+  }
+  CHECK(outside_submit_failed);
+  CHECK(failed_outside_report.outside_dependency_ready_execution);
+  CHECK(failed_outside_runs.size() == 1);
+  CHECK(failed_outside_runs.front().failed);
+  CHECK(failed_outside_runs.front().item_count == 4);
+  CHECK(failed_outside_runs.front().worker_tasks_submitted == 1);
+  CHECK(outside_retry_scheduler->metrics().pending_tasks == 0);
+  check_lazy_charts_equal(expected_root_only, outside_failed_chart);
+  plan_lazy_chart_memory_report retry_outside_report;
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, outside_failed_chart, larch::chart_options{},
+      *outside_retry_scheduler, nullptr, nullptr, &outside_retry_workspace,
+      plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+      &retry_outside_report);
+  CHECK(retry_outside_report.outside_dependency_ready_execution);
+  check_lazy_charts_equal(oracle, outside_failed_chart);
+
+  // A worker-kernel exception is selected after the one operation joins and
+  // releases every nonroot output without publishing it to the finite ledger.
+  auto exceptional_scheduler = make_scheduler();
+  plan_lazy_chart_scheduler_workspace exceptional_workspace;
+  auto exceptional = oracle_inside;
+  auto const root_production =
+      plan.productions_for_parent(plan.root_clade()).front();
+  auto const corrupted_child = plan.children(root_production).front();
+  exceptional.inside_rows_by_clade[corrupted_child].clear();
+  plan_lazy_chart_memory_report exceptional_report;
+  auto const exceptional_message = runtime_error_message([&] {
+    larch::build_lazy_outside_chart_in_place_scheduled(
+        plan, patterns, exceptional, larch::chart_options{},
+        *exceptional_scheduler, nullptr, nullptr, &exceptional_workspace,
+        plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+        &exceptional_report);
+  });
+  CHECK(exceptional_message.find("child inside class index out of range") !=
+        std::string::npos);
+  CHECK(exceptional_report.outside_dependency_ready_execution);
+  CHECK(exceptional_scheduler->metrics().pending_tasks == 0);
+  for (auto clade : plan.top_down_level_order()) {
+    if (clade == plan.root_clade()) continue;
+    CHECK(exceptional.outside_rows_by_clade[clade].empty());
+    CHECK(!exceptional.outside_class_index_by_pattern_by_clade[clade]);
+    CHECK(exceptional.outside_class_weight_by_clade[clade].empty());
+  }
+}
+
 static void test_finite_scheduled_lazy_state_admission() {
   std::println("test_finite_scheduled_lazy_state_admission");
   using larch::lazy_chart_detail::plan_lazy_chart_memory_budget_error;
@@ -1651,7 +2126,96 @@ static void test_finite_scheduled_lazy_state_admission() {
   using larch::lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks;
   using larch::lazy_chart_detail::plan_lazy_chart_scheduler_workspace;
   using larch::test::chart_spr_allocation::allocation_observer;
+  using larch::test::chart_spr_allocation::scoped_backend_failures;
   namespace allocation_detail = larch::test::chart_spr_allocation::detail;
+
+  // The incremental chart-capacity ledger has the full nested scan as its
+  // oracle. Optional engagement contributes no extra vector object (that
+  // object is already within the optional array), so reclamation subtracts
+  // exactly the dynamic payload.
+  {
+    larch::lazy_multisite_chart chart;
+    chart.class_index_by_pattern_by_clade.resize(1);
+    chart.class_index_by_pattern_by_clade.front().emplace();
+    chart.class_index_by_pattern_by_clade.front()->reserve(17);
+    larch::lazy_chart_detail::lazy_multisite_chart_capacity_ledger ledger{
+        chart};
+    auto const before = ledger.resident_bytes();
+    auto const released =
+        chart.class_index_by_pattern_by_clade.front()->capacity() *
+        sizeof(std::size_t);
+    chart.class_index_by_pattern_by_clade.front() = std::nullopt;
+    ledger.release_dynamic_capacity_bytes(released);
+    CHECK(before - ledger.resident_bytes() == released);
+    CHECK(ledger.matches_oracle(chart));
+  }
+
+  // Completed output compaction admits the exact old+new transient, reports
+  // that peak, and then publishes the smaller frozen-toolchain capacity.
+  {
+    larch::lazy_multisite_chart chart;
+    chart.inside_rows_by_clade.resize(1);
+    auto& rows = chart.inside_rows_by_clade.front();
+    rows.reserve(64);
+    rows.resize(2);
+    rows[0][0] = 7;
+    rows[1][0] = 11;
+    auto const original = rows;
+    auto const original_capacity = rows.capacity();
+    larch::lazy_chart_detail::lazy_multisite_chart_capacity_ledger ledger{
+        chart};
+    auto const before = ledger.resident_bytes();
+    auto const compact_dynamic = larch::lazy_key_grouping_detail::
+        frozen_libstdcxx_allocate_at_least_capacity_bytes<
+            larch::lazy_multisite_chart::row_type>(
+            rows.size(), "test lazy output compact capacity");
+    auto const exact_peak =
+        before + sizeof(rows) + compact_dynamic;
+
+    auto skipped = larch::lazy_chart_detail::
+        compact_completed_plan_lazy_chart_vector(rows, ledger, exact_peak - 1);
+    CHECK(!skipped.compacted);
+    CHECK(rows.capacity() == original_capacity);
+    CHECK(rows == original);
+    CHECK(ledger.matches_oracle(chart));
+
+    auto compacted = larch::lazy_chart_detail::
+        compact_completed_plan_lazy_chart_vector(rows, ledger, exact_peak);
+    CHECK(compacted.compacted);
+    CHECK(compacted.observed_peak_resident_bytes == exact_peak);
+    CHECK(compacted.stable_resident_bytes == ledger.resident_bytes());
+    CHECK(rows.capacity() * sizeof(rows.front()) == compact_dynamic);
+    CHECK(rows == original);
+    CHECK(ledger.matches_oracle(chart));
+  }
+
+  // A failed staging allocation is swallowed by this opportunistic
+  // optimization; the original vector and ledger remain byte-for-byte stable.
+  {
+    larch::lazy_multisite_chart chart;
+    chart.class_weight_by_clade.resize(1);
+    auto& weights = chart.class_weight_by_clade.front();
+    weights.reserve(64);
+    weights.assign({3, 5});
+    auto const original = weights;
+    auto const original_capacity = weights.capacity();
+    larch::lazy_chart_detail::lazy_multisite_chart_capacity_ledger ledger{
+        chart};
+    auto const before = ledger.resident_bytes();
+    larch::lazy_chart_detail::plan_lazy_chart_compaction_report failed;
+    {
+      scoped_backend_failures failures{1};
+      failed = larch::lazy_chart_detail::
+          compact_completed_plan_lazy_chart_vector(weights, ledger);
+      CHECK(failures.remaining() == 0);
+    }
+    CHECK(!failed.compacted);
+    CHECK(failed.stable_resident_bytes == before);
+    CHECK(failed.observed_peak_resident_bytes == before);
+    CHECK(weights.capacity() == original_capacity);
+    CHECK(weights == original);
+    CHECK(ledger.matches_oracle(chart));
+  }
 
   auto const grammar = make_shared_internal_child_grammar();
   auto const plan = larch::build_chart_execution_plan(grammar);
@@ -1744,8 +2308,27 @@ static void test_finite_scheduled_lazy_state_admission() {
   auto calibration_scheduler = make_scheduler(1);
   plan_lazy_chart_memory_report calibration_report;
   plan_lazy_chart_scheduler_workspace calibration_workspace;
+  bool inside_ledger_initial = false;
+  bool inside_ledger_publication = false;
+  bool inside_ledger_join = false;
+  bool inside_ledger_reclamation = false;
+  plan_lazy_chart_scheduler_test_hooks inside_ledger_hooks;
+  inside_ledger_hooks.observe_capacity_ledger_barrier =
+      [&](larch::lazy_multisite_chart const& chart, std::size_t ledger_bytes,
+          std::string_view barrier) {
+        CHECK(ledger_bytes == larch::lazy_chart_detail::
+                                  lazy_multisite_chart_capacity_resident_bytes(
+                                      chart));
+        inside_ledger_initial |= barrier == "inside-initial";
+        inside_ledger_publication |=
+            barrier == "inside-output-publication";
+        inside_ledger_join |= barrier == "inside-wave-join";
+        inside_ledger_reclamation |=
+            barrier == "inside-level-reclamation";
+      };
   auto calibration = larch::build_lazy_inside_chart_scheduled(
-      plan, patterns, options, *calibration_scheduler, nullptr, nullptr,
+      plan, patterns, options, *calibration_scheduler, nullptr,
+      &inside_ledger_hooks,
       &calibration_workspace,
       plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
       &calibration_report);
@@ -1754,9 +2337,16 @@ static void test_finite_scheduled_lazy_state_admission() {
   CHECK(calibration_report.inside_admission_waves > 0);
   CHECK(calibration_report.inside_reused_slot_waves > 0);
   CHECK(calibration_report.inside_coordinator_capacity_resident_bytes > 0);
+  CHECK(!calibration_report.inside_retained_completed_output_capacity);
+  CHECK(!calibration_report.inside_certified_worker_output_allocation);
+  CHECK(calibration_report.inside_completed_output_compaction_attempts > 0);
   CHECK(calibration_report.actual_peak_capacity_resident_bytes <= huge_budget);
   CHECK(calibration_report.preflight_peak_capacity_resident_bytes <=
         huge_budget);
+  CHECK(inside_ledger_initial);
+  CHECK(inside_ledger_publication);
+  CHECK(inside_ledger_join);
+  CHECK(inside_ledger_reclamation);
   auto const exact_w1_budget =
       std::max(calibration_report.actual_peak_capacity_resident_bytes,
                calibration_report.preflight_peak_capacity_resident_bytes);
@@ -1958,7 +2548,7 @@ static void test_finite_scheduled_lazy_state_admission() {
   auto const later_level_two_clade =
       plan.bottom_up_level_order()[level_two_begin + 1];
   auto run_split_error = [&](std::size_t workers, bool& later_started,
-                             bool& cleanup_seen,
+                             bool& cleanup_seen, bool& ledger_cleanup_seen,
                              plan_lazy_chart_memory_report& report) {
     auto scheduler = make_scheduler(workers);
     plan_lazy_chart_scheduler_test_hooks hooks;
@@ -1980,6 +2570,16 @@ static void test_finite_scheduled_lazy_state_admission() {
             CHECK(!chart.structural_class_index_by_pattern_by_clade[clade]);
           }
         };
+    hooks.observe_capacity_ledger_barrier =
+        [&](larch::lazy_multisite_chart const& chart,
+            std::size_t ledger_bytes, std::string_view barrier) {
+          CHECK(ledger_bytes ==
+                larch::lazy_chart_detail::
+                    lazy_multisite_chart_capacity_resident_bytes(chart));
+          if (barrier == "inside-failure-cleanup") {
+            ledger_cleanup_seen = true;
+          }
+        };
     return runtime_error_message([&] {
       (void)larch::build_lazy_inside_chart_scheduled(
           plan, patterns, options, *scheduler, nullptr, &hooks, nullptr,
@@ -1990,19 +2590,25 @@ static void test_finite_scheduled_lazy_state_admission() {
   };
   bool w1_later_started = false;
   bool w1_cleanup_seen = false;
+  bool w1_ledger_cleanup_seen = false;
   plan_lazy_chart_memory_report w1_error_report;
-  auto const w1_error =
-      run_split_error(1, w1_later_started, w1_cleanup_seen, w1_error_report);
+  auto const w1_error = run_split_error(
+      1, w1_later_started, w1_cleanup_seen, w1_ledger_cleanup_seen,
+      w1_error_report);
   bool w4_later_started = false;
   bool w4_cleanup_seen = false;
+  bool w4_ledger_cleanup_seen = false;
   plan_lazy_chart_memory_report w4_error_report;
-  auto const w4_error =
-      run_split_error(4, w4_later_started, w4_cleanup_seen, w4_error_report);
+  auto const w4_error = run_split_error(
+      4, w4_later_started, w4_cleanup_seen, w4_ledger_cleanup_seen,
+      w4_error_report);
   CHECK(w4_error == w1_error);
   CHECK(w1_later_started);
   CHECK(!w4_later_started);
   CHECK(w1_cleanup_seen);
   CHECK(w4_cleanup_seen);
+  CHECK(w1_ledger_cleanup_seen);
+  CHECK(w4_ledger_cleanup_seen);
   CHECK(w1_error_report.inside_admission_waves > 0);
   CHECK(w4_error_report.inside_admission_waves > 0);
   CHECK(w1_error_report.scheduler_submissions ==
@@ -2123,9 +2729,24 @@ static void test_finite_scheduled_lazy_state_admission() {
   auto outside_calibration = make_outside_input();
   plan_lazy_chart_memory_report outside_calibration_report;
   plan_lazy_chart_scheduler_workspace outside_calibration_workspace;
+  bool outside_ledger_initial = false;
+  bool outside_ledger_publication = false;
+  bool outside_ledger_join = false;
+  plan_lazy_chart_scheduler_test_hooks outside_ledger_hooks;
+  outside_ledger_hooks.observe_capacity_ledger_barrier =
+      [&](larch::lazy_multisite_chart const& chart, std::size_t ledger_bytes,
+          std::string_view barrier) {
+        CHECK(ledger_bytes == larch::lazy_chart_detail::
+                                  lazy_multisite_chart_capacity_resident_bytes(
+                                      chart));
+        outside_ledger_initial |= barrier == "outside-initial";
+        outside_ledger_publication |=
+            barrier == "outside-output-publication";
+        outside_ledger_join |= barrier == "outside-wave-join";
+      };
   larch::build_lazy_outside_chart_in_place_scheduled(
       plan, patterns, outside_calibration, larch::chart_options{},
-      *outside_calibration_scheduler, nullptr, nullptr,
+      *outside_calibration_scheduler, nullptr, &outside_ledger_hooks,
       &outside_calibration_workspace,
       plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
       &outside_calibration_report);
@@ -2133,8 +2754,17 @@ static void test_finite_scheduled_lazy_state_admission() {
   CHECK(outside_calibration_report.outside_max_admitted_slots == 1);
   CHECK(outside_calibration_report.outside_admission_waves > 0);
   CHECK(outside_calibration_report.outside_reused_slot_waves > 0);
+  CHECK(!outside_calibration_report
+             .outside_retained_completed_output_capacity);
+  CHECK(!outside_calibration_report
+             .outside_certified_worker_output_allocation);
+  CHECK(outside_calibration_report
+            .outside_completed_output_compaction_attempts > 0);
   CHECK(outside_calibration_report.actual_peak_capacity_resident_bytes <=
         huge_budget);
+  CHECK(outside_ledger_initial);
+  CHECK(outside_ledger_publication);
+  CHECK(outside_ledger_join);
   auto const exact_outside_w1_budget = std::max(
       outside_calibration_report.actual_peak_capacity_resident_bytes,
       outside_calibration_report.preflight_peak_capacity_resident_bytes);
@@ -2429,6 +3059,7 @@ static void test_finite_scheduled_lazy_state_admission() {
       plan.top_down_level_order()[outside_level_one_begin + 1];
   auto run_outside_split_error = [&](std::size_t workers, std::size_t budget,
                                      bool& later_started, bool& cleanup_seen,
+                                     bool& ledger_cleanup_seen,
                                      plan_lazy_chart_memory_report& report) {
     auto scheduler = make_scheduler(workers);
     auto chart = make_outside_input();
@@ -2452,6 +3083,16 @@ static void test_finite_scheduled_lazy_state_admission() {
             CHECK(!failed.outside_class_index_by_pattern_by_clade[clade]);
           }
         };
+    hooks.observe_capacity_ledger_barrier =
+        [&](larch::lazy_multisite_chart const& failed,
+            std::size_t ledger_bytes, std::string_view barrier) {
+          CHECK(ledger_bytes ==
+                larch::lazy_chart_detail::
+                    lazy_multisite_chart_capacity_resident_bytes(failed));
+          if (barrier == "outside-failure-cleanup") {
+            ledger_cleanup_seen = true;
+          }
+        };
     return runtime_error_message([&] {
       larch::build_lazy_outside_chart_in_place_scheduled(
           plan, patterns, chart, larch::chart_options{}, *scheduler, nullptr,
@@ -2462,21 +3103,25 @@ static void test_finite_scheduled_lazy_state_admission() {
   };
   bool outside_w1_later = false;
   bool outside_w1_cleanup = false;
+  bool outside_w1_ledger_cleanup = false;
   plan_lazy_chart_memory_report outside_w1_error_report;
-  auto const outside_w1_error =
-      run_outside_split_error(1, exact_outside_w1_budget, outside_w1_later,
-                              outside_w1_cleanup, outside_w1_error_report);
+  auto const outside_w1_error = run_outside_split_error(
+      1, exact_outside_w1_budget, outside_w1_later, outside_w1_cleanup,
+      outside_w1_ledger_cleanup, outside_w1_error_report);
   bool outside_w4_later = false;
   bool outside_w4_cleanup = false;
+  bool outside_w4_ledger_cleanup = false;
   plan_lazy_chart_memory_report outside_w4_error_report;
-  auto const outside_w4_error =
-      run_outside_split_error(4, outside_w4_singleton_budget, outside_w4_later,
-                              outside_w4_cleanup, outside_w4_error_report);
+  auto const outside_w4_error = run_outside_split_error(
+      4, outside_w4_singleton_budget, outside_w4_later, outside_w4_cleanup,
+      outside_w4_ledger_cleanup, outside_w4_error_report);
   CHECK(outside_w4_error == outside_w1_error);
   CHECK(outside_w1_later);
   CHECK(!outside_w4_later);
   CHECK(outside_w1_cleanup);
   CHECK(outside_w4_cleanup);
+  CHECK(outside_w1_ledger_cleanup);
+  CHECK(outside_w4_ledger_cleanup);
   CHECK(outside_w1_error_report.outside_admission_waves > 0);
   CHECK(outside_w4_error_report.outside_admission_waves > 0);
   CHECK(outside_w1_error_report.scheduler_submissions ==
@@ -2633,6 +3278,7 @@ static void test_finite_wide_lazy_prefix_admission() {
   using larch::lazy_chart_detail::plan_lazy_chart_memory_budget_error;
   using larch::lazy_chart_detail::plan_lazy_chart_memory_options;
   using larch::lazy_chart_detail::plan_lazy_chart_memory_report;
+  using larch::lazy_chart_detail::plan_lazy_chart_scheduler_test_hooks;
   using larch::lazy_chart_detail::plan_lazy_chart_scheduler_workspace;
 
   constexpr auto workers = std::size_t{8};
@@ -2692,6 +3338,24 @@ static void test_finite_wide_lazy_prefix_admission() {
   CHECK(inside_report.inside_memory_limited_levels == 0);
   CHECK(inside_report.inside_reused_slot_waves == 2);
   CHECK(inside_report.inside_workspace_evictions == 0);
+  CHECK(inside_report.inside_retained_completed_output_capacity);
+  CHECK(inside_report.inside_completed_output_compaction_attempts == 0);
+  CHECK(inside_report.inside_certified_worker_output_allocation);
+  CHECK(inside_report.inside_certified_worker_output_waves ==
+        inside_report.inside_admission_waves);
+  CHECK(inside_report.certified_worker_output_bound_failures == 0);
+  std::size_t inside_worst_case_output_capacity = 0;
+  for (auto clade : plan.bottom_up_level_order()) {
+    inside_worst_case_output_capacity =
+        larch::lazy_chart_detail::plan_lazy_chart_capacity_add(
+            inside_worst_case_output_capacity,
+            larch::lazy_chart_detail::logical_plan_inside_clade_output_bytes(
+                plan, clade, patterns.patterns.size(), inside_options),
+            "test certified inside worst-case output");
+  }
+  CHECK(inside_report
+            .inside_certified_worker_output_capacity_resident_bytes <
+        inside_worst_case_output_capacity);
   CHECK(inside_workspace.inside_by_slot.size() == workers);
   CHECK(inside_workspace.inside_by_slot.capacity() == workers);
 
@@ -2716,17 +3380,74 @@ static void test_finite_wide_lazy_prefix_admission() {
   CHECK(outside_report.outside_memory_limited_levels == 0);
   CHECK(outside_report.outside_reused_slot_waves == 1);
   CHECK(outside_report.outside_workspace_evictions == 0);
+  CHECK(outside_report.outside_retained_completed_output_capacity);
+  CHECK(outside_report.outside_completed_output_compaction_attempts == 0);
+  CHECK(outside_report.outside_certified_worker_output_allocation);
+  CHECK(outside_report.outside_certified_worker_output_waves ==
+        outside_report.outside_admission_waves);
+  CHECK(outside_report.certified_worker_output_bound_failures == 0);
+  auto const outside_worst_case_output_capacity =
+      (plan.clades().size() - 1) *
+      larch::lazy_chart_detail::logical_plan_outside_clade_output_bytes(
+          patterns.patterns.size());
+  CHECK(outside_report
+            .outside_certified_worker_output_capacity_resident_bytes <
+        outside_worst_case_output_capacity);
   CHECK(outside_workspace.outside_by_slot.size() == workers);
   CHECK(outside_workspace.outside_by_slot.capacity() == workers);
+
+  // A certified wave publishes worker-grown output capacity only after a
+  // successful join. A partial scheduler submission must therefore destroy
+  // every uncommitted row/weight allocation and leave the escaped in-place
+  // chart at exactly the serially initialized root surface.
+  auto failed_outside = inside_oracle;
+  auto failed_outside_initialized = inside_oracle;
+  larch::lazy_chart_detail::initialize_plan_lazy_outside_chart(
+      plan, patterns, failed_outside_initialized, larch::chart_options{},
+      std::uint8_t{0});
+  auto const failed_outside_initialized_capacity =
+      larch::lazy_chart_detail::lazy_multisite_chart_capacity_resident_bytes(
+          failed_outside_initialized);
+  auto failed_outside_scheduler = make_scheduler();
+  auto failed_outside_workspace = prepare_outside_workspace();
+  larch::chart_scheduler_test_detail::access::fail_submission_after(
+      *failed_outside_scheduler, 1);
+  std::vector<larch::chart_scheduler_run_summary> failed_outside_runs;
+  plan_lazy_chart_memory_report failed_outside_report;
+  bool certified_submit_error_escaped = false;
+  try {
+    larch::build_lazy_outside_chart_in_place_scheduled(
+        plan, patterns, failed_outside, larch::chart_options{},
+        *failed_outside_scheduler, &failed_outside_runs, nullptr,
+        &failed_outside_workspace,
+        plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+        &failed_outside_report);
+  } catch (larch::chart_scheduler_submit_error const&) {
+    certified_submit_error_escaped = true;
+  }
+  CHECK(certified_submit_error_escaped);
+  CHECK(failed_outside_report.outside_retained_completed_output_capacity);
+  CHECK(!failed_outside_report.outside_certified_worker_output_allocation);
+  CHECK(failed_outside_runs.size() == 1);
+  CHECK(failed_outside_runs.front().failed);
+  CHECK(failed_outside_runs.front().worker_tasks_submitted == 1);
+  CHECK(failed_outside_scheduler->metrics().pending_tasks == 0);
+  CHECK(larch::lazy_chart_detail::lazy_multisite_chart_capacity_resident_bytes(
+            failed_outside) == failed_outside_initialized_capacity);
+  larch::build_lazy_outside_chart_in_place_scheduled(
+      plan, patterns, failed_outside, larch::chart_options{},
+      *failed_outside_scheduler, nullptr, nullptr, &failed_outside_workspace,
+      plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget});
+  check_lazy_charts_equal(outside_oracle, failed_outside);
 
   auto make_tight_workspace = [] {
     plan_lazy_chart_scheduler_workspace workspace;
     return workspace;
   };
 
-  // Freeze a full first outside wave, then reject only its scheduler-operation
-  // envelope. The prepared chart/workspaces are live and within budget; the
-  // operation estimate belongs to preflight until scheduler entry.
+  // Calibrate complete first inside/outside waves. The boundary checks below
+  // retain report-driven compaction and account for adaptive stable-prefix
+  // splitting before proving that a rejected wave never enters the scheduler.
   auto const projection_patterns = make_wide_star_patterns(64, 1);
   larch::lazy_chart_options projection_inside_options;
   projection_inside_options.retain_all_inside_class_maps = true;
@@ -2857,7 +3578,8 @@ static void test_finite_wide_lazy_prefix_admission() {
       [&](larch::chart_scheduler& scheduler,
           plan_lazy_chart_scheduler_workspace& workspace,
           std::vector<larch::chart_scheduler_run_summary>* runs,
-          std::size_t budget, plan_lazy_chart_memory_report* report) {
+          std::size_t budget, plan_lazy_chart_memory_report* report,
+          plan_lazy_chart_scheduler_test_hooks const* hooks = nullptr) {
         auto chart = projection_inside;
         larch::lazy_chart_detail::initialize_plan_lazy_outside_chart(
             plan, projection_patterns, chart, larch::chart_options{}, 0);
@@ -2865,7 +3587,7 @@ static void test_finite_wide_lazy_prefix_admission() {
             build_plan_lazy_outside_chart_scheduled_finite(
                 chart, plan, projection_patterns, scheduler,
                 plan.top_down_level_order(), plan.top_down_level_offsets(),
-                runs, nullptr, workspace,
+                runs, hooks, workspace,
                 plan_lazy_chart_memory_options{.memory_budget_bytes = budget},
                 report);
         return chart;
@@ -2911,36 +3633,136 @@ static void test_finite_wide_lazy_prefix_admission() {
           "test outside scheduler projection");
   CHECK(outside_scheduler_projection > 1);
 
+  // A one-byte reduction from the complete 64-item wave may still admit a
+  // smaller stable prefix. Find the exact cold-state boundary, then prove that
+  // its one-under run rejects before entering the scheduler for that wave.
+  auto minimum_successful_outside_budget =
+      std::max(projection_calibration_report
+                   .preflight_peak_capacity_resident_bytes,
+               projection_calibration_report
+                   .actual_peak_capacity_resident_bytes);
+  CHECK(projection_calibration_report.actual_peak_capacity_resident_bytes ==
+        outside_scheduler_projection);
+  CHECK(minimum_successful_outside_budget >= outside_scheduler_projection);
+  auto can_build_projection_outside_at = [&](std::size_t budget) {
+    auto scheduler = make_scheduler();
+    auto workspace = make_tight_workspace();
+    std::vector<larch::chart_scheduler_run_summary> runs;
+    plan_lazy_chart_memory_report probe_report;
+    try {
+      auto built = build_projection_outside(*scheduler, workspace, &runs,
+                                            budget, &probe_report);
+      check_lazy_charts_equal(projection_oracle, built);
+      CHECK(probe_report.preflight_peak_capacity_resident_bytes <= budget);
+      CHECK(probe_report.actual_peak_capacity_resident_bytes <= budget);
+      CHECK(probe_report.pre_submit_rejections == 0);
+      return true;
+    } catch (plan_lazy_chart_memory_budget_error const&) {
+      return false;
+    }
+  };
+  CHECK(!can_build_projection_outside_at(1));
+  CHECK(can_build_projection_outside_at(minimum_successful_outside_budget));
+  auto outside_rejected_budget = std::size_t{1};
+  while (outside_rejected_budget + 1 < minimum_successful_outside_budget) {
+    auto const midpoint =
+        outside_rejected_budget +
+        (minimum_successful_outside_budget - outside_rejected_budget) / 2;
+    if (can_build_projection_outside_at(midpoint)) {
+      minimum_successful_outside_budget = midpoint;
+    } else {
+      outside_rejected_budget = midpoint;
+    }
+  }
+  CHECK(minimum_successful_outside_budget == outside_rejected_budget + 1);
+
   auto projection_rejected_scheduler = make_scheduler();
   auto const projection_rejected_operations =
       projection_rejected_scheduler->metrics().operations;
   auto projection_rejected_workspace = make_tight_workspace();
   std::vector<larch::chart_scheduler_run_summary> projection_rejected_runs;
   plan_lazy_chart_memory_report projection_rejected_report;
+  std::atomic<std::size_t> rejected_items_started = 0;
+  std::atomic<std::size_t> rejected_items_completed = 0;
+  plan_lazy_chart_scheduler_test_hooks projection_rejected_hooks;
+  projection_rejected_hooks.before_outside_clade =
+      [&](larch::clade_id, std::size_t, std::size_t) {
+        rejected_items_started.fetch_add(1, std::memory_order_relaxed);
+      };
+  projection_rejected_hooks.after_outside_clade =
+      [&](larch::clade_id, std::size_t, std::size_t) {
+        rejected_items_completed.fetch_add(1, std::memory_order_relaxed);
+      };
   bool outside_projection_rejected = false;
   try {
     (void)build_projection_outside(
         *projection_rejected_scheduler, projection_rejected_workspace,
-        &projection_rejected_runs, outside_scheduler_projection - 1,
-        &projection_rejected_report);
+        &projection_rejected_runs, outside_rejected_budget,
+        &projection_rejected_report, &projection_rejected_hooks);
   } catch (plan_lazy_chart_memory_budget_error const& error) {
     outside_projection_rejected = true;
     CHECK(error.phase() ==
           larch::lazy_chart_detail::plan_lazy_chart_memory_phase::outside);
-    CHECK(error.required_bytes() == outside_scheduler_projection);
-    CHECK(error.budget_bytes() == outside_scheduler_projection - 1);
+    CHECK(error.required_bytes() == minimum_successful_outside_budget);
+    CHECK(error.budget_bytes() == outside_rejected_budget);
   }
   CHECK(outside_projection_rejected);
   CHECK(projection_rejected_report.preflight_peak_capacity_resident_bytes >=
-        outside_scheduler_projection);
-  CHECK(projection_rejected_report.actual_peak_capacity_resident_bytes <=
-        outside_scheduler_projection - 1);
+        minimum_successful_outside_budget);
+  // The measured peak is unpublished preparation for the rejected final
+  // prefix. The finite limit governs admission/publication and the report must
+  // expose, not hide, that one-byte allocator-rounded overlap.
+  CHECK(projection_rejected_report.actual_peak_capacity_resident_bytes ==
+        minimum_successful_outside_budget);
   CHECK(projection_rejected_report.pre_submit_rejections == 1);
-  CHECK(projection_rejected_report.outside_admission_waves == 0);
-  CHECK(projection_rejected_report.scheduler_submissions == 0);
-  CHECK(projection_rejected_runs.empty());
-  CHECK(projection_rejected_scheduler->metrics().operations ==
-        projection_rejected_operations);
+  CHECK(projection_rejected_report.outside_admission_waves ==
+        projection_rejected_report.scheduler_submissions);
+  CHECK(projection_rejected_runs.size() ==
+        projection_rejected_report.scheduler_submissions);
+  CHECK(projection_rejected_scheduler->metrics().operations -
+            projection_rejected_operations ==
+        projection_rejected_report.scheduler_submissions);
+  auto const rejected_completed_items = std::accumulate(
+      projection_rejected_runs.begin(), projection_rejected_runs.end(),
+      std::size_t{0}, [](std::size_t total, auto const& run) {
+        return total + run.item_count;
+      });
+  CHECK(rejected_items_started.load(std::memory_order_relaxed) ==
+        rejected_completed_items);
+  CHECK(rejected_items_completed.load(std::memory_order_relaxed) ==
+        rejected_completed_items);
+  CHECK(rejected_completed_items > 0);
+  CHECK(rejected_completed_items + 1 == plan.clades().size() - 1);
+
+  auto projection_exact_scheduler = make_scheduler();
+  auto const projection_exact_operations =
+      projection_exact_scheduler->metrics().operations;
+  auto projection_exact_workspace = make_tight_workspace();
+  std::vector<larch::chart_scheduler_run_summary> projection_exact_runs;
+  plan_lazy_chart_memory_report projection_exact_report;
+  auto projection_exact = build_projection_outside(
+      *projection_exact_scheduler, projection_exact_workspace,
+      &projection_exact_runs, minimum_successful_outside_budget,
+      &projection_exact_report);
+  check_lazy_charts_equal(projection_oracle, projection_exact);
+  CHECK(projection_exact_report.preflight_peak_capacity_resident_bytes <=
+        minimum_successful_outside_budget);
+  CHECK(projection_exact_report.actual_peak_capacity_resident_bytes <=
+        minimum_successful_outside_budget);
+  CHECK(projection_exact_report.pre_submit_rejections == 0);
+  CHECK(projection_exact_report.outside_admission_waves ==
+        projection_exact_report.scheduler_submissions);
+  CHECK(projection_exact_runs.size() ==
+        projection_exact_report.scheduler_submissions);
+  CHECK(std::accumulate(
+            projection_exact_runs.begin(), projection_exact_runs.end(),
+            std::size_t{0}, [](std::size_t total, auto const& run) {
+              return total + run.item_count;
+            }) ==
+        plan.clades().size() - 1);
+  CHECK(projection_exact_scheduler->metrics().operations -
+            projection_exact_operations ==
+        projection_exact_report.scheduler_submissions);
 
   // With one pattern and binary row shapes, an W8 scheduler can fit the final
   // singleton at a budget that cannot admit S=8 scratch for every preceding
@@ -2978,6 +3800,92 @@ static void test_finite_wide_lazy_prefix_admission() {
       *calibration_scheduler, calibration_workspace, &tight_calibration_runs,
       huge_budget, &tight_calibration_report);
   check_lazy_charts_equal(tight_oracle, tight_calibration);
+  CHECK(tight_calibration_report.inside_retained_completed_output_capacity);
+  CHECK(tight_calibration_report.inside_admission_waves ==
+        tight_calibration_runs.size());
+  CHECK(tight_calibration_report.inside_reused_slot_waves ==
+        tight_calibration_report.inside_admission_waves);
+  CHECK(tight_calibration_report.inside_workspace_evictions == 0);
+  CHECK(tight_calibration_report.inside_max_admitted_slots == workers);
+  CHECK(tight_calibration_report.inside_memory_limited_levels == 0);
+  CHECK(calibration_workspace.inside_by_slot.size() == workers);
+  CHECK(calibration_workspace.inside_by_slot.capacity() == workers);
+  std::size_t tight_maximum_row_width = 0;
+  for (auto clade : tight_plan.bottom_up_level_order()) {
+    if (!tight_plan.clade(clade).is_leaf()) {
+      tight_maximum_row_width = std::max(
+          tight_maximum_row_width,
+          larch::lazy_chart_detail::plan_inside_clade_row_key_width(
+              tight_plan, clade));
+    }
+  }
+  for (auto const& slot : calibration_workspace.inside_by_slot) {
+    CHECK(slot.has_capacity_for(tight_patterns.patterns.size(),
+                                tight_maximum_row_width));
+  }
+
+  // A fresh top-down binary-tree run encounters slot prefixes 2, 4, and 8.
+  // The admitted full-output envelope prepares the final maximum-shape pool
+  // once, so every wave reuses scratch instead of evicting the two smaller
+  // prefixes. An existing two-slot prefix is discarded exactly once before
+  // the same cold full-pool preparation.
+  auto tight_outside_oracle = tight_oracle;
+  larch::build_lazy_outside_chart_in_place(
+      tight_plan, tight_patterns, tight_outside_oracle,
+      larch::chart_options{});
+  auto run_tight_outside =
+      [&](plan_lazy_chart_scheduler_workspace& workspace,
+          plan_lazy_chart_memory_report& report) {
+        auto scheduler = make_scheduler();
+        auto chart = tight_oracle;
+        std::vector<larch::chart_scheduler_run_summary> runs;
+        larch::build_lazy_outside_chart_in_place_scheduled(
+            tight_plan, tight_patterns, chart, larch::chart_options{},
+            *scheduler, &runs, nullptr, &workspace,
+            plan_lazy_chart_memory_options{.memory_budget_bytes = huge_budget},
+            &report);
+        check_lazy_charts_equal(tight_outside_oracle, chart);
+        CHECK(report.outside_retained_completed_output_capacity);
+        CHECK(report.outside_admission_waves == runs.size());
+        CHECK(report.outside_reused_slot_waves ==
+              report.outside_admission_waves);
+        CHECK(report.outside_max_admitted_slots == workers);
+        CHECK(report.outside_memory_limited_levels == 0);
+        CHECK(workspace.outside_by_slot.size() == workers);
+        CHECK(workspace.outside_by_slot.capacity() == workers);
+      };
+  std::size_t tight_maximum_context_width = larch::nuc_state_count;
+  std::size_t tight_maximum_arity = 0;
+  for (auto clade : tight_plan.top_down_level_order()) {
+    if (clade == tight_plan.root_clade()) continue;
+    auto const [context_width, arity] =
+        larch::lazy_chart_detail::plan_outside_clade_shape(tight_plan, clade);
+    tight_maximum_context_width =
+        std::max(tight_maximum_context_width, context_width);
+    tight_maximum_arity = std::max(tight_maximum_arity, arity);
+  }
+
+  plan_lazy_chart_scheduler_workspace fresh_outside_workspace;
+  plan_lazy_chart_memory_report fresh_outside_report;
+  run_tight_outside(fresh_outside_workspace, fresh_outside_report);
+  CHECK(fresh_outside_report.outside_workspace_evictions == 0);
+  for (auto const& slot : fresh_outside_workspace.outside_by_slot) {
+    CHECK(slot.has_capacity_for(tight_patterns.patterns.size(),
+                                tight_maximum_context_width,
+                                tight_maximum_arity));
+  }
+
+  plan_lazy_chart_scheduler_workspace partial_outside_workspace;
+  partial_outside_workspace.hard_bound_outside_slots(2);
+  for (auto& slot : partial_outside_workspace.outside_by_slot) {
+    (void)larch::lazy_chart_detail::prepare_plan_outside_slot(
+        slot, tight_patterns.patterns.size(), tight_maximum_context_width,
+        tight_maximum_arity);
+  }
+  plan_lazy_chart_memory_report partial_outside_report;
+  run_tight_outside(partial_outside_workspace, partial_outside_report);
+  CHECK(partial_outside_report.outside_workspace_evictions == 1);
+
   auto minimum_successful_budget =
       std::max(tight_calibration_report.preflight_peak_capacity_resident_bytes,
                tight_calibration_report.actual_peak_capacity_resident_bytes);
@@ -3007,11 +3915,9 @@ static void test_finite_wide_lazy_prefix_admission() {
   }
   CHECK(minimum_successful_budget == rejected_budget + 1);
 
-  // The final one-under rejection is the post-preparation scheduler-operation
-  // projection. It remains preflight-only until scheduler entry, while the
-  // stable prepared live set remains within budget. The rejected final wave is
-  // not published, and every earlier successful wave reconciles with one
-  // scheduler submission and operation.
+  // The final one-under rejection may be the measured, unpublished preparation
+  // boundary. The rejected final wave never enters the scheduler, and every
+  // earlier successful wave reconciles with one submission and operation.
   auto rejected_scheduler = make_scheduler();
   auto const rejected_operations = rejected_scheduler->metrics().operations;
   auto rejected_workspace = make_tight_workspace();
@@ -3031,7 +3937,8 @@ static void test_finite_wide_lazy_prefix_admission() {
   CHECK(projection_rejected);
   CHECK(rejected_report.preflight_peak_capacity_resident_bytes >=
         rejected_required);
-  CHECK(rejected_report.actual_peak_capacity_resident_bytes <= rejected_budget);
+  CHECK(rejected_report.actual_peak_capacity_resident_bytes ==
+        minimum_successful_budget);
   CHECK(rejected_report.pre_submit_rejections == 1);
   CHECK(rejected_report.inside_admission_waves ==
         rejected_report.scheduler_submissions);
@@ -3708,6 +4615,8 @@ int main() {
   test_checked_and_plan_lazy_multifurcation_equivalence();
   test_nonlex_packed_plan_lazy_grouping_equivalence();
   test_scheduled_plan_lazy_dependency_wavefronts();
+  test_finite_strict_tree_outside_sibling_fusion();
+  test_finite_strict_binary_dependency_ready_execution();
   test_scheduler_memory_estimate_allocation_bounds();
   test_finite_scheduled_lazy_state_admission();
   test_finite_wide_lazy_prefix_admission();

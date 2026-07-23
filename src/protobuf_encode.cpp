@@ -29,4 +29,8 @@ void writer::write_length_prefixed(std::span<const uint8_t> data) {
 
 std::vector<uint8_t> const& writer::data() const { return buf_; }
 
+std::vector<uint8_t> writer::take_data() && noexcept {
+  return std::move(buf_);
+}
+
 }  // namespace pb

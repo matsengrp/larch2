@@ -14,16 +14,19 @@ grep -q -- '--chart-spr-canonical-result <PATH>' <<<"$help"
 grep -q -- '--chart-spr-canonical-sidecar <PATH>' <<<"$help"
 grep -q -- '--canonical-dag-result <PATH>' <<<"$help"
 
-common=(
-  --fasta test/wric_binary_four.fa
-  --newick test/wric_binary_four.nwk
-  --refseq test/wric_binary_four.ref
+search_controls=(
   --force-no-vcf
   --wric-polytomy-mode reject
   --chart-spr-search
   --chart-spr-max-candidates 2
   --chart-spr-top-k-exact 2
   --chart-spr-max-iterations 1
+)
+common=(
+  --fasta test/wric_binary_four.fa
+  --newick test/wric_binary_four.nwk
+  --refseq test/wric_binary_four.ref
+  "${search_controls[@]}"
 )
 
 run() {
@@ -33,6 +36,7 @@ run() {
     --chart-spr-canonical-result "$tmp/search-$workers.json" \
     --chart-spr-canonical-sidecar "$tmp/search-$workers.ndjson" \
     --canonical-dag-result "$tmp/dag-$workers.json" \
+    -o "$tmp/output-$workers.pb.gz" \
     >"$tmp/run-$workers.out" 2>"$tmp/run-$workers.err"
 }
 
@@ -40,6 +44,47 @@ workers=(1 2 4 8 16 0)
 for worker_count in "${workers[@]}"; do
   run "$worker_count"
 done
+
+# A proper single tree can use the lightweight physical normalization without
+# changing any output bytes. Repeating the same input forces the general merge
+# path and supplies the complete parity oracle.
+grep -q '^single_input_merge_fast_path: true$' "$tmp/run-1.out"
+"$dagutil" "${common[@]}" \
+  --fasta test/wric_binary_four.fa \
+  --newick test/wric_binary_four.nwk \
+  --chart-spr-workers 1 \
+  --chart-spr-canonical-result "$tmp/search-general.json" \
+  --chart-spr-canonical-sidecar "$tmp/search-general.ndjson" \
+  --canonical-dag-result "$tmp/dag-general.json" \
+  -o "$tmp/output-general.pb.gz" \
+  >"$tmp/run-general.out" 2>"$tmp/run-general.err"
+grep -q '^single_input_merge_fast_path: false$' "$tmp/run-general.out"
+cmp "$tmp/search-1.json" "$tmp/search-general.json"
+cmp "$tmp/search-1.ndjson" "$tmp/search-general.ndjson"
+cmp "$tmp/dag-1.json" "$tmp/dag-general.json"
+cmp <(gzip -dc "$tmp/output-1.pb.gz") \
+    <(gzip -dc "$tmp/output-general.pb.gz")
+
+# Re-load a real DAG protobuf through the worker-aware compact-genome path.
+# Its W1 and W4 searches must preserve the same full semantics and serialized
+# output, and both must remain eligible for the one-input normalization.
+for worker_count in 1 4; do
+  "$dagutil" --dag-pb "$tmp/output-1.pb.gz" "${search_controls[@]}" \
+    --chart-spr-workers "$worker_count" \
+    --chart-spr-canonical-result "$tmp/pb-search-$worker_count.json" \
+    --chart-spr-canonical-sidecar "$tmp/pb-search-$worker_count.ndjson" \
+    --canonical-dag-result "$tmp/pb-dag-$worker_count.json" \
+    -o "$tmp/pb-output-$worker_count.pb.gz" \
+    >"$tmp/pb-run-$worker_count.out" \
+    2>"$tmp/pb-run-$worker_count.err"
+  grep -q '^single_input_merge_fast_path: true$' \
+    "$tmp/pb-run-$worker_count.out"
+done
+cmp "$tmp/pb-search-1.json" "$tmp/pb-search-4.json"
+cmp "$tmp/pb-search-1.ndjson" "$tmp/pb-search-4.ndjson"
+cmp "$tmp/pb-dag-1.json" "$tmp/pb-dag-4.json"
+cmp <(gzip -dc "$tmp/pb-output-1.pb.gz") \
+    <(gzip -dc "$tmp/pb-output-4.pb.gz")
 
 # Worker count, batching, timings, and memory/counter diagnostics are excluded
 # from the semantic bytes.  The search and external-output oracles must match

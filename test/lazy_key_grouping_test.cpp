@@ -147,6 +147,29 @@ static packed_key_grouping_result quadratic_grouping_oracle(
   return result;
 }
 
+static std::vector<packed_key_word> make_adversarial_packed_words(
+    std::size_t key_count, std::size_t key_width) {
+  constexpr std::array<packed_key_word, 12> byte_boundary_values{
+      0u,         1u,          0x7fu,       0xffu,
+      0x100u,     0xffffu,     0x10000u,    0xffffffu,
+      0x1000000u, 0x7fffffffu, 0x80000000u, 0xffffffffu,
+  };
+  std::vector<packed_key_word> words(key_count * key_width);
+  for (std::size_t input = 0; input < key_count; ++input) {
+    // This deliberately nonmonotonic, repeating seed produces interleaved
+    // duplicate keys as well as differences in both early and late words.
+    auto const class_seed = (input * 37 + input / 7 + key_count) % 73;
+    for (std::size_t word = 0; word < key_width; ++word) {
+      auto const value_index =
+          (class_seed * 11 + word * 17 + class_seed * word * 3) %
+          byte_boundary_values.size();
+      words[input * key_width + word] =
+          byte_boundary_values[value_index];
+    }
+  }
+  return words;
+}
+
 static void test_explicit_width_one_contract() {
   std::println("test_explicit_width_one_contract");
 
@@ -322,6 +345,170 @@ static void test_merge_boundaries_against_quadratic_oracle() {
             quadratic_grouping_oracle(keys));
     }
   }
+
+  std::println("  PASS");
+}
+
+static void test_adaptive_gate_and_byte_boundaries_against_quadratic_oracle() {
+  std::println(
+      "test_adaptive_gate_and_byte_boundaries_against_quadratic_oracle");
+
+  using larch::lazy_key_grouping_detail::implementation::
+      should_use_stable_lsd_radix_sort;
+  using larch::lazy_key_grouping_detail::implementation::
+      should_try_first_occurrence_hash_grouping;
+  CHECK(!should_use_stable_lsd_radix_sort(127, 1));
+  CHECK(should_use_stable_lsd_radix_sort(128, 1));
+  CHECK(!should_use_stable_lsd_radix_sort(128, 0));
+  CHECK(should_use_stable_lsd_radix_sort(128, 4));
+  CHECK(!should_use_stable_lsd_radix_sort(128, 5));
+  CHECK(!should_try_first_occurrence_hash_grouping(127, 1));
+  CHECK(should_try_first_occurrence_hash_grouping(128, 1));
+  CHECK(!should_try_first_occurrence_hash_grouping(128, 0));
+  CHECK(should_try_first_occurrence_hash_grouping(128, 4));
+  CHECK(!should_try_first_occurrence_hash_grouping(128, 5));
+
+  packed_key_grouping_workspace workspace;
+  for (auto width : {std::size_t{1}, std::size_t{2}, std::size_t{3},
+                     std::size_t{4}, std::size_t{5}}) {
+    for (auto count : {std::size_t{127}, std::size_t{128},
+                       std::size_t{129}, std::size_t{257}}) {
+      auto const words = make_adversarial_packed_words(count, width);
+      auto const keys = matrix_view(count, width, words);
+      CHECK(group_packed_keys(keys, workspace) ==
+            quadratic_grouping_oracle(keys));
+    }
+  }
+
+  // Every key is equal, but its tuple contains different byte-boundary values.
+  // This exercises the compressed hash route's exact tuple equality.
+  constexpr std::size_t identical_count = 257;
+  constexpr std::array<packed_key_word, 4> identical_key{
+      0xffffffffu, 0x100u, 0xffu, 0x1000000u};
+  std::vector<packed_key_word> identical_words(identical_count *
+                                                identical_key.size());
+  for (std::size_t input = 0; input < identical_count; ++input) {
+    std::copy(identical_key.begin(), identical_key.end(),
+              identical_words.begin() + input * identical_key.size());
+  }
+  auto const identical_keys =
+      matrix_view(identical_count, identical_key.size(), identical_words);
+  CHECK(group_packed_keys(identical_keys, workspace) ==
+        quadratic_grouping_oracle(identical_keys));
+
+  // The cheap width-four combiner deliberately permits hash collisions. Make
+  // two distinct tuples with the same combined value and verify that cached
+  // bucket fingerprints remain only a filter for exact tuple equality.
+  constexpr std::size_t collision_count = 128;
+  constexpr std::size_t collision_width = 4;
+  std::vector<packed_key_word> collision_words(collision_count *
+                                                collision_width);
+  for (std::size_t input = 0; input < collision_count; ++input) {
+    if ((input & 1) != 0) {
+      collision_words[input * collision_width + 1] = 1u << 29;
+      collision_words[input * collision_width + 3] = 1u;
+    }
+  }
+  auto const collision_keys =
+      matrix_view(collision_count, collision_width, collision_words);
+  CHECK(larch::lazy_key_grouping_detail::implementation::packed_key_hash(
+            collision_keys, 0) ==
+        larch::lazy_key_grouping_detail::implementation::packed_key_hash(
+            collision_keys, 1));
+  CHECK(group_packed_keys(collision_keys, workspace) ==
+        quadratic_grouping_oracle(collision_keys));
+
+  // Match the profiled high-compression shape. First-occurrence class IDs are
+  // deliberately unrelated to lexicographic order, and all five output fields
+  // must still match the independent oracle exactly.
+  constexpr std::size_t hot_key_count = 2046;
+  constexpr std::size_t hot_class_count = 256;
+  constexpr std::size_t hot_key_width = 4;
+  std::vector<packed_key_word> hot_words(hot_key_count * hot_key_width);
+  for (std::size_t input = 0; input < hot_key_count; ++input) {
+    auto const discovery_class = input % hot_class_count;
+    auto const value = hot_class_count - 1 - discovery_class;
+    hot_words[input * hot_key_width] =
+        static_cast<packed_key_word>(value);
+    hot_words[input * hot_key_width + 1] =
+        static_cast<packed_key_word>(value * 257);
+    hot_words[input * hot_key_width + 2] =
+        static_cast<packed_key_word>(0x10000u + value);
+    hot_words[input * hot_key_width + 3] =
+        static_cast<packed_key_word>(value ^ 0xa5u);
+  }
+  auto const hot_keys =
+      matrix_view(hot_key_count, hot_key_width, hot_words);
+  CHECK(group_packed_keys(hot_keys, workspace) ==
+        quadratic_grouping_oracle(hot_keys));
+
+  // Profile-shaped runs exercise the adjacent exact-key shortcut for every
+  // admitted hash width.  Discovery order is the reverse of lexicographic
+  // order, and the last word distinguishes classes that share prefixes.
+  constexpr std::size_t run_key_count = 2046;
+  constexpr std::size_t run_class_count = 31;
+  for (auto width : {std::size_t{1}, std::size_t{2}, std::size_t{3},
+                     std::size_t{4}}) {
+    std::vector<packed_key_word> run_words(run_key_count * width);
+    for (std::size_t input = 0; input < run_key_count; ++input) {
+      auto const discovered = (input / 8) % run_class_count;
+      auto const value = run_class_count - 1 - discovered;
+      for (std::size_t word = 0; word < width; ++word) {
+        run_words[input * width + word] = static_cast<packed_key_word>(
+            word + 1 == width ? 0x10000u + value
+                              : word * 17u + value % 3u);
+      }
+    }
+    auto const run_keys = matrix_view(run_key_count, width, run_words);
+    auto const expected = quadratic_grouping_oracle(run_keys);
+    CHECK(group_packed_keys(run_keys, workspace) == expected);
+
+    packed_key_grouping_workspace prepared_workspace;
+    packed_key_grouping_result prepared_result;
+    auto const preparation = prepare_packed_key_grouping_storage(
+        run_key_count, prepared_workspace, prepared_result);
+    auto const status = invoke_without_allocations([&] {
+      return try_group_packed_keys_prepared(
+          run_keys, prepared_workspace, prepared_result,
+          preparation.prepared_owned_capacity_resident_bytes);
+    });
+    CHECK(status.succeeded());
+    CHECK(prepared_result == expected);
+  }
+
+  // More than half the inputs below are distinct, so hash admission must
+  // abandon after some adjacent pairs have taken the shortcut.  The stable
+  // radix fallback must replace all partial state with the exact oracle
+  // result, including membership CSR and lexicographic class order.
+  constexpr std::size_t weak_key_count = 2046;
+  constexpr std::size_t weak_key_width = 4;
+  std::vector<packed_key_word> weak_words(weak_key_count * weak_key_width);
+  for (std::size_t input = 0; input < weak_key_count; ++input) {
+    auto const value = input < 800 ? input / 2 : input - 400;
+    weak_words[input * weak_key_width] =
+        static_cast<packed_key_word>(value >> 16);
+    weak_words[input * weak_key_width + 1] =
+        static_cast<packed_key_word>(value & 0xffffu);
+    weak_words[input * weak_key_width + 2] =
+        static_cast<packed_key_word>((value * 257u) ^ 0xa5a5u);
+    weak_words[input * weak_key_width + 3] =
+        static_cast<packed_key_word>(value * 65537u);
+  }
+  auto const weak_keys =
+      matrix_view(weak_key_count, weak_key_width, weak_words);
+  auto const weak_expected = quadratic_grouping_oracle(weak_keys);
+  CHECK(group_packed_keys(weak_keys, workspace) == weak_expected);
+  packed_key_grouping_workspace weak_workspace;
+  packed_key_grouping_result weak_result;
+  auto const weak_preparation = prepare_packed_key_grouping_storage(
+      weak_key_count, weak_workspace, weak_result);
+  auto const weak_status = invoke_without_allocations([&] {
+    return try_group_packed_keys_prepared(
+        weak_keys, weak_workspace, weak_result,
+        weak_preparation.prepared_owned_capacity_resident_bytes);
+  });
+  CHECK(weak_status.succeeded());
+  CHECK(weak_result == weak_expected);
 
   std::println("  PASS");
 }
@@ -591,6 +778,103 @@ static void test_prepared_grouping_is_allocation_free() {
   std::println("  PASS");
 }
 
+static void test_prepared_radix_grouping_is_allocation_free_and_atomic() {
+  std::println(
+      "test_prepared_radix_grouping_is_allocation_free_and_atomic");
+
+  using namespace larch::lazy_key_grouping_detail;
+  constexpr std::size_t key_count = 257;
+  constexpr std::size_t key_width = 4;
+  // Every tuple is unique, so the bounded-load compressed hash attempt must
+  // abandon at its class limit and reuse the same prepared arrays for radix.
+  std::vector<packed_key_word> words(key_count * key_width);
+  for (std::size_t input = 0; input < key_count; ++input) {
+    words[input * key_width] = static_cast<packed_key_word>(input);
+    words[input * key_width + 1] =
+        static_cast<packed_key_word>(input * 257u + 0xffu);
+    words[input * key_width + 2] =
+        static_cast<packed_key_word>(input ^ 0x10000u);
+    words[input * key_width + 3] =
+        static_cast<packed_key_word>(0xffffffffu - input);
+  }
+  auto const keys = matrix_view(key_count, key_width, words);
+  auto const expected = quadratic_grouping_oracle(keys);
+  packed_key_grouping_workspace workspace;
+  packed_key_grouping_result result;
+  auto const preparation =
+      prepare_packed_key_grouping_storage(key_count, workspace, result);
+  auto const admitted = preparation.prepared_owned_capacity_resident_bytes;
+
+  auto status = invoke_without_allocations([&] {
+    return try_group_packed_keys_prepared(keys, workspace, result, admitted);
+  });
+  CHECK(status.succeeded());
+  CHECK(result == expected);
+
+  auto const workspace_before_rejection = workspace;
+  auto const result_before_rejection = result;
+  status = invoke_without_allocations([&] {
+    return try_group_packed_keys_prepared(keys, workspace, result,
+                                          admitted - 1);
+  });
+  CHECK(status.code ==
+        packed_key_grouping_prepared_status_code::budget_exceeded);
+  CHECK(status.required == admitted);
+  CHECK(status.available == admitted - 1);
+  CHECK(workspace == workspace_before_rejection);
+  CHECK(result == result_before_rejection);
+
+  std::println("  PASS");
+}
+
+static void test_prepared_compressed_hash_grouping_is_allocation_free() {
+  std::println(
+      "test_prepared_compressed_hash_grouping_is_allocation_free");
+
+  using namespace larch::lazy_key_grouping_detail;
+  constexpr std::size_t key_count = 2046;
+  constexpr std::size_t class_count = 256;
+  constexpr std::size_t key_width = 2;
+  std::vector<packed_key_word> words(key_count * key_width);
+  for (std::size_t input = 0; input < key_count; ++input) {
+    auto const value = class_count - 1 - input % class_count;
+    words[input * key_width] = static_cast<packed_key_word>(value);
+    words[input * key_width + 1] =
+        static_cast<packed_key_word>(value * 65537u);
+  }
+  auto const keys = matrix_view(key_count, key_width, words);
+  auto const expected = quadratic_grouping_oracle(keys);
+  std::vector<std::size_t> hash_buckets;
+  std::vector<std::size_t> lexicographic_scratch;
+  hash_buckets.reserve(key_count);
+  lexicographic_scratch.reserve(key_count);
+  packed_key_grouping_result interned;
+  interned.reserve_worst_case(key_count);
+  interned.class_by_input.resize(key_count);
+  CHECK(implementation::try_first_occurrence_hash_grouping(
+      keys, hash_buckets, lexicographic_scratch, interned));
+  CHECK(interned.class_by_input == expected.class_by_input);
+  CHECK(interned.representative_by_class ==
+        expected.representative_by_class);
+  CHECK(interned.lexicographic_class_order ==
+        expected.lexicographic_class_order);
+
+  packed_key_grouping_workspace workspace;
+  packed_key_grouping_result result;
+  auto const preparation =
+      prepare_packed_key_grouping_storage(key_count, workspace, result);
+
+  auto const status = invoke_without_allocations([&] {
+    return try_group_packed_keys_prepared(
+        keys, workspace, result,
+        preparation.prepared_owned_capacity_resident_bytes);
+  });
+  CHECK(status.succeeded());
+  CHECK(result == expected);
+
+  std::println("  PASS");
+}
+
 static void test_prepared_grouping_rejections_are_allocation_free_and_atomic() {
   std::println(
       "test_prepared_grouping_rejections_are_allocation_free_and_atomic");
@@ -710,6 +994,254 @@ static void test_prepared_grouping_rejections_are_allocation_free_and_atomic() {
   std::println("  PASS");
 }
 
+static void test_prepared_result_modes_preserve_exact_classes() {
+  std::println("test_prepared_result_modes_preserve_exact_classes");
+
+  using namespace larch::lazy_key_grouping_detail;
+  std::vector<std::pair<std::size_t, std::vector<packed_key_word>>> fixtures;
+
+  // Compressed hash route, with differences in the final tuple word.
+  std::vector<packed_key_word> compressed(2046 * 4);
+  for (std::size_t input = 0; input < 2046; ++input) {
+    auto const value = (input / 7) % 31;
+    compressed[input * 4] = static_cast<packed_key_word>(value % 3);
+    compressed[input * 4 + 1] = static_cast<packed_key_word>(value * 17);
+    compressed[input * 4 + 2] = static_cast<packed_key_word>(value ^ 0xa5u);
+    compressed[input * 4 + 3] = static_cast<packed_key_word>(31 - value);
+  }
+  fixtures.emplace_back(4, std::move(compressed));
+
+  // More than 50% distinct keys force the deterministic radix fallback.
+  std::vector<packed_key_word> weak(257 * 2);
+  for (std::size_t input = 0; input < 257; ++input) {
+    weak[input * 2] = static_cast<packed_key_word>(input >> 4);
+    weak[input * 2 + 1] = static_cast<packed_key_word>(input);
+  }
+  fixtures.emplace_back(2, std::move(weak));
+
+  for (auto const& [width, words] : fixtures) {
+    auto const count = words.size() / width;
+    auto const keys = matrix_view(count, width, words);
+    auto const expected = quadratic_grouping_oracle(keys);
+    packed_key_grouping_workspace workspace;
+    packed_key_grouping_result result;
+    auto const preparation =
+        prepare_packed_key_grouping_storage(count, workspace, result);
+    auto const admitted =
+        preparation.prepared_owned_capacity_resident_bytes;
+
+    for (auto mode : {packed_key_grouping_result_mode::classes,
+                      packed_key_grouping_result_mode::ordered_classes,
+                      packed_key_grouping_result_mode::full}) {
+      auto const status = invoke_without_allocations([&] {
+        return try_group_packed_keys_prepared(keys, workspace, result,
+                                              admitted, mode);
+      });
+      CHECK(status.succeeded());
+      CHECK(result.class_by_input == expected.class_by_input);
+      CHECK(result.representative_by_class ==
+            expected.representative_by_class);
+      if (mode == packed_key_grouping_result_mode::classes) {
+        CHECK(result.lexicographic_class_order.empty());
+      } else {
+        CHECK(result.lexicographic_class_order ==
+              expected.lexicographic_class_order);
+      }
+      if (mode == packed_key_grouping_result_mode::full) {
+        CHECK(result.member_offsets_by_class ==
+              expected.member_offsets_by_class);
+        CHECK(result.members_by_class == expected.members_by_class);
+      } else {
+        CHECK(result.member_offsets_by_class.empty());
+        CHECK(result.members_by_class.empty());
+        (void)expect_throw<std::logic_error>(
+            [&] { (void)result.members_for_class(0); });
+      }
+    }
+  }
+
+  std::println("  PASS");
+}
+
+static void test_bounded_partition_tuple_grouping() {
+  std::println("test_bounded_partition_tuple_grouping");
+  using namespace larch::lazy_key_grouping_detail;
+
+  auto check_fixture = [&](std::span<std::size_t const> first,
+                           std::span<std::size_t const> second,
+                           std::span<std::size_t const> third,
+                           std::array<std::size_t, 3> cardinalities,
+                           std::size_t width) {
+    CHECK(first.size() == second.size());
+    CHECK(width == 2 || first.size() == third.size());
+    std::vector<packed_key_word> words;
+    words.reserve(first.size() * width);
+    for (std::size_t input = 0; input < first.size(); ++input) {
+      words.push_back(static_cast<packed_key_word>(first[input]));
+      words.push_back(static_cast<packed_key_word>(second[input]));
+      if (width == 3) {
+        words.push_back(static_cast<packed_key_word>(third[input]));
+      }
+    }
+    auto const expected =
+        quadratic_grouping_oracle(matrix_view(first.size(), width, words));
+
+    packed_key_grouping_workspace workspace;
+    packed_key_grouping_result result;
+    auto const preparation =
+        prepare_packed_key_grouping_storage(first.size(), workspace, result);
+    auto const admitted = preparation.prepared_owned_capacity_resident_bytes;
+    auto const tuple = bounded_partition_tuple_view{
+        .key_count = first.size(),
+        .tuple_width = width,
+        .class_by_input = {first, second, third},
+        .class_count = cardinalities,
+    };
+    for (auto const contract :
+         {bounded_partition_tuple_input_contract::arbitrary,
+          bounded_partition_tuple_input_contract::published_partitions}) {
+      for (auto const mode : {packed_key_grouping_result_mode::classes,
+                              packed_key_grouping_result_mode::ordered_classes,
+                              packed_key_grouping_result_mode::full}) {
+        auto const attempt = invoke_without_allocations([&] {
+          return try_group_bounded_partition_tuple_prepared(
+              tuple, workspace, result, admitted, mode, contract);
+        });
+        CHECK(attempt.applicable);
+        CHECK(attempt.status.succeeded());
+        CHECK(result.class_by_input == expected.class_by_input);
+        CHECK(result.representative_by_class ==
+              expected.representative_by_class);
+        if (mode == packed_key_grouping_result_mode::classes) {
+          CHECK(result.lexicographic_class_order.empty());
+        } else {
+          CHECK(result.lexicographic_class_order ==
+                expected.lexicographic_class_order);
+        }
+        if (mode == packed_key_grouping_result_mode::full) {
+          CHECK(result.member_offsets_by_class ==
+                expected.member_offsets_by_class);
+          CHECK(result.members_by_class == expected.members_by_class);
+        } else {
+          CHECK(result.member_offsets_by_class.empty());
+          CHECK(result.members_by_class.empty());
+        }
+      }
+    }
+
+    auto const result_before_rejection = result;
+    auto const workspace_before_rejection = workspace;
+    for (auto const contract :
+         {bounded_partition_tuple_input_contract::arbitrary,
+          bounded_partition_tuple_input_contract::published_partitions}) {
+      auto const budget_attempt = invoke_without_allocations([&] {
+        return try_group_bounded_partition_tuple_prepared(
+            tuple, workspace, result, admitted - 1,
+            packed_key_grouping_result_mode::full, contract);
+      });
+      CHECK(budget_attempt.applicable);
+      CHECK(budget_attempt.status.code ==
+            packed_key_grouping_prepared_status_code::budget_exceeded);
+      CHECK(result == result_before_rejection);
+      CHECK(workspace == workspace_before_rejection);
+    }
+
+    auto too_wide = tuple;
+    too_wide.class_count[0] = first.size();
+    too_wide.class_count[1] = first.size();
+    auto miss = invoke_without_allocations([&] {
+      return try_group_bounded_partition_tuple_prepared(
+          too_wide, workspace, result, admitted,
+          packed_key_grouping_result_mode::full);
+    });
+    CHECK(!miss.applicable);
+    CHECK(result == result_before_rejection);
+    CHECK(workspace == workspace_before_rejection);
+
+    auto invalid = tuple;
+    invalid.class_count[0] = 1;
+    miss = invoke_without_allocations([&] {
+      return try_group_bounded_partition_tuple_prepared(
+          invalid, workspace, result, admitted,
+          packed_key_grouping_result_mode::full);
+    });
+    CHECK(!miss.applicable);
+    CHECK(result == result_before_rejection);
+    CHECK(workspace == workspace_before_rejection);
+
+    auto const published_invalid = invoke_without_allocations([&] {
+      return try_group_bounded_partition_tuple_prepared(
+          invalid, workspace, result, admitted,
+          packed_key_grouping_result_mode::full,
+          bounded_partition_tuple_input_contract::published_partitions);
+    });
+    CHECK(published_invalid.applicable);
+    CHECK(published_invalid.status.code ==
+          packed_key_grouping_prepared_status_code::
+              partition_class_out_of_range);
+    CHECK(published_invalid.status.required == 1);
+    CHECK(published_invalid.status.secondary_available == 0);
+    CHECK(result == result_before_rejection);
+    auto const invalid_error =
+        expect_throw<packed_key_grouping_shape_error>([&] {
+          throw_packed_key_grouping_prepared_failure(
+              published_invalid.status);
+        });
+    CHECK(invalid_error.kind() ==
+          packed_key_grouping_shape_error_kind::partition_class_out_of_range);
+
+    // The fused invalid-map check may overwrite admitted scratch, but never
+    // publishes a partial result. A subsequent valid chart partition must
+    // reuse that storage without allocating and recover the exact answer.
+    auto const recovered = invoke_without_allocations([&] {
+      return try_group_bounded_partition_tuple_prepared(
+          tuple, workspace, result, admitted,
+          packed_key_grouping_result_mode::full,
+          bounded_partition_tuple_input_contract::published_partitions);
+    });
+    CHECK(recovered.applicable);
+    CHECK(recovered.status.succeeded());
+    CHECK(result == expected);
+  };
+
+  // Products exactly equal key_count, with adjacent runs, nonlexicographic
+  // first occurrences, and interleaved repeats.
+  std::array<std::size_t, 12> first2{2, 2, 0, 0, 1, 1,
+                                     2, 0, 1, 2, 0, 1};
+  std::array<std::size_t, 12> second2{3, 3, 2, 2, 1, 1,
+                                      0, 1, 0, 2, 0, 3};
+  check_fixture(first2, second2, {}, {3, 4, 0}, 2);
+
+  std::array<std::size_t, 12> first3{1, 1, 0, 0, 1, 1,
+                                     0, 0, 1, 0, 1, 0};
+  std::array<std::size_t, 12> second3{1, 1, 0, 0, 0, 0,
+                                      1, 1, 1, 0, 0, 1};
+  std::array<std::size_t, 12> third3{2, 2, 1, 1, 0, 0,
+                                     2, 0, 1, 2, 1, 1};
+  check_fixture(first3, second3, third3, {2, 2, 3}, 3);
+
+  packed_key_grouping_workspace cold_workspace;
+  packed_key_grouping_result cold_result;
+  auto const cold_tuple = bounded_partition_tuple_view{
+      .key_count = first2.size(),
+      .tuple_width = 2,
+      .class_by_input = {first2, second2, {}},
+      .class_count = {3, 4, 0},
+  };
+  auto const cold_attempt = invoke_without_allocations([&] {
+    return try_group_bounded_partition_tuple_prepared(
+        cold_tuple, cold_workspace, cold_result,
+        (std::numeric_limits<std::size_t>::max)());
+  });
+  CHECK(cold_attempt.applicable);
+  CHECK(cold_attempt.status.code ==
+        packed_key_grouping_prepared_status_code::storage_not_prepared);
+  CHECK(cold_workspace == packed_key_grouping_workspace{});
+  CHECK(cold_result == packed_key_grouping_result{});
+
+  std::println("  PASS");
+}
+
 static void test_validation_and_overflow_boundaries() {
   std::println("test_validation_and_overflow_boundaries");
 
@@ -793,11 +1325,16 @@ int main() {
   test_width_seven_non_power_of_two();
   test_repeated_determinism_and_workspace_reuse();
   test_merge_boundaries_against_quadratic_oracle();
+  test_adaptive_gate_and_byte_boundaries_against_quadratic_oracle();
   test_checked_memory_estimates_and_budget_backstop();
   test_prepared_storage_warm_growth_is_transactional();
   test_packed_word_buffer_preparation_is_transactional();
   test_prepared_grouping_is_allocation_free();
+  test_prepared_radix_grouping_is_allocation_free_and_atomic();
+  test_prepared_compressed_hash_grouping_is_allocation_free();
   test_prepared_grouping_rejections_are_allocation_free_and_atomic();
+  test_prepared_result_modes_preserve_exact_classes();
+  test_bounded_partition_tuple_grouping();
   test_validation_and_overflow_boundaries();
   std::println("lazy_key_grouping_test: PASS");
 }

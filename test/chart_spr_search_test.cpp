@@ -2233,9 +2233,16 @@ static void test_lazy_local_exact_semantic_evidence_envelope() {
             state.grammar, *state.exact_trim_active_only);
     larch::chart_scheduler scheduler{
         larch::chart_scheduler_options{.requested_workers = 1}};
+    auto const local_concurrency =
+        larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+            scheduler.worker_resolution().resolved_workers,
+            /*candidate_count=*/1,
+            state.active_patterns.patterns.patterns.size());
+    auto const local_task_slots =
+        std::max<std::size_t>(1, local_concurrency.effective_tasks);
     auto const envelope = larch::chart_spr_search_detail::
         estimate_grammar_spr_finite_iteration_memory_envelope(
-            state, 1, 1, 1, true, scheduler, 1);
+            state, 1, 1, 1, true, scheduler, local_task_slots);
     CHECK(envelope.planned_required_bytes >
           larch::estimate_chart_spr_published_state_resident_bytes(state));
     CHECK(envelope.planned_required_bytes ==
@@ -2740,11 +2747,17 @@ static void test_finite_lazy_search_summary_reports_temporal_envelope() {
   options.cache.candidate_batch_size = 1;
   options.cache.memory_budget_bytes = std::size_t{1} << 40;
   options.semantic_capture = larch::chart_spr_semantic_capture_mode::digest;
+  std::size_t published_state_cache_fills = 0;
+  options.finite_published_state_resident_cache_fills_for_tests =
+      &published_state_cache_fills;
+  options.verify_finite_published_state_resident_cache_for_tests = true;
 
   auto search =
       larch::run_chart_spr_search(std::move(dag), grammar, options);
   CHECK(search.iterations.size() == 1);
   CHECK(search.iterations.front().candidates_exact_verified > 0);
+  CHECK(search.iterations.front().candidates_scored > 1);
+  CHECK(published_state_cache_fills == 1);
 
   auto const& counters = search.counters;
   auto const& summary = search.summary;
@@ -2764,6 +2777,7 @@ static void test_finite_lazy_search_summary_reports_temporal_envelope() {
                  summary.lazy_local_iteration_evidence_phase_bytes_max));
   CHECK(summary.lazy_local_iteration_evidence_phase_bytes_max >=
         summary.lazy_local_ranked_candidate_exact_evidence_bytes_max);
+  CHECK(counters.lazy_local_reused_prepared_tasks > 0);
 
   std::println("  PASS");
 }
@@ -2816,11 +2830,19 @@ static void test_lazy_exact_w4_combined_envelope_boundary() {
   };
   auto envelope_for = [&](larch::chart_spr_search_state const& state,
                           larch::chart_scheduler const& scheduler) {
+    auto const local_concurrency =
+        larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+            scheduler.worker_resolution().resolved_workers,
+            base_options.cache.candidate_batch_size,
+            state.active_patterns.patterns.patterns.size());
+    auto const local_task_slots =
+        std::max<std::size_t>(1, local_concurrency.effective_tasks);
     return larch::chart_spr_search_detail::
         estimate_grammar_spr_finite_iteration_memory_envelope(
             state, base_options.enumeration.max_candidates,
             base_options.cache.candidate_batch_size,
-            base_options.top_k_exact_verify, false, scheduler, 4,
+            base_options.top_k_exact_verify, false, scheduler,
+            local_task_slots,
             &base_options.enumeration,
             /*candidate_buffer_count=*/2,
             /*include_pipeline_control=*/true);
@@ -3447,6 +3469,44 @@ static void test_pattern_batch_cache_options_match_all_cache() {
 
 static void test_lazy_local_admission_planner() {
   std::println("test_lazy_local_admission_planner");
+  using larch::chart_spr_search_detail::
+      lazy_local_bandwidth_saturation_min_active_patterns;
+
+  auto w1_large =
+      larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+          1, 8, lazy_local_bandwidth_saturation_min_active_patterns);
+  CHECK(w1_large.requested_tasks == 1);
+  CHECK(w1_large.effective_tasks == 1);
+  CHECK(!w1_large.bandwidth_capped);
+
+  auto w7_large =
+      larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+          7, 8, lazy_local_bandwidth_saturation_min_active_patterns);
+  CHECK(w7_large.requested_tasks == 7);
+  CHECK(w7_large.effective_tasks == 7);
+  CHECK(!w7_large.bandwidth_capped);
+
+  auto w8_small =
+      larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+          8, 8, lazy_local_bandwidth_saturation_min_active_patterns - 1);
+  CHECK(w8_small.requested_tasks == 8);
+  CHECK(w8_small.effective_tasks == 8);
+  CHECK(!w8_small.bandwidth_capped);
+
+  auto w8_large =
+      larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+          8, 8, lazy_local_bandwidth_saturation_min_active_patterns);
+  CHECK(w8_large.requested_tasks == 8);
+  CHECK(w8_large.effective_tasks == 6);
+  CHECK(w8_large.bandwidth_capped);
+
+  auto narrow_large =
+      larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+          8, 5, lazy_local_bandwidth_saturation_min_active_patterns);
+  CHECK(narrow_large.requested_tasks == 5);
+  CHECK(narrow_large.effective_tasks == 5);
+  CHECK(!narrow_large.bandwidth_capped);
+
   constexpr std::array<std::size_t, 4> task_bytes{8, 5, 7, 3};
 
   auto unlimited =
@@ -3483,6 +3543,101 @@ static void test_lazy_local_admission_planner() {
     CHECK(e.available_bytes() == 7);
   }
   CHECK(failed);
+  std::println("  PASS");
+}
+
+static void test_lazy_local_bandwidth_cap_semantics() {
+  std::println("test_lazy_local_bandwidth_cap_semantics");
+
+  auto fixture = make_fixture();
+  constexpr std::size_t candidate_count = 8;
+  std::vector<larch::grammar_spr_candidate> candidates;
+  candidates.reserve(candidate_count);
+  for (std::size_t index = 0; index < candidate_count; ++index) {
+    candidates.push_back(fixture.candidates[index % fixture.candidates.size()]);
+  }
+
+  auto run_shape = [&](std::size_t pattern_count,
+                       std::size_t expected_effective_concurrency,
+                       std::size_t expected_waves,
+                       std::size_t expected_capped_batches) {
+    auto patterns = make_phase4_wide_patterns(pattern_count);
+    auto active = larch::make_active_search_patterns(patterns);
+    larch::chart_cache_options cache_options;
+    cache_options.use_lazy_multisite_chart = true;
+    auto state = larch::build_chart_spr_search_state_from_active(
+        fixture.dag, fixture.grammar, std::move(active), {}, false, {},
+        cache_options);
+    CHECK(state.cache_strategy ==
+          larch::chart_spr_cache_strategy::lazy_multisite_chart);
+
+    std::vector<larch::chart_spr_local_score_result> w1(candidate_count);
+    std::vector<larch::chart_spr_local_score_result> w8(candidate_count);
+    larch::chart_spr_local_score_workspace w1_workspace;
+    larch::chart_spr_local_score_workspace w8_workspace;
+    larch::score_candidates_locally_into(state, candidates, w1, w1_workspace,
+                                         {}, 1);
+    CHECK(state.counters.lazy_local_requested_concurrency_max == 1);
+    CHECK(state.counters.lazy_local_effective_concurrency_max == 1);
+    CHECK(state.counters.lazy_local_bandwidth_capped_batches == 0);
+
+    larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+        .requested_workers = 8,
+        .default_minimum_grain = 1,
+        .default_target_ranges_per_worker = 1,
+    }};
+    CHECK(scheduler.worker_resolution().resolved_workers == 8);
+    larch::local_score_worker_barrier_for_tests barrier;
+    larch::local_spr_score_options parallel_options;
+    parallel_options.worker_barrier_for_tests = &barrier;
+    auto checked =
+        larch::check_chart_execution_plan(state.grammar, state.execution_plan);
+    larch::score_candidates_locally_into(state, candidates, w8, w8_workspace,
+                                         parallel_options, scheduler, checked);
+
+    CHECK(barrier.release.load());
+    CHECK(barrier.started.load() >= candidate_count);
+    CHECK(state.counters.lazy_local_requested_concurrency_max == 8);
+    CHECK(state.counters.lazy_local_effective_concurrency_max ==
+          expected_effective_concurrency);
+    CHECK(state.counters.lazy_local_bandwidth_capped_batches ==
+          expected_capped_batches);
+    CHECK(state.counters.lazy_local_admitted_concurrency_max ==
+          expected_effective_concurrency);
+    CHECK(state.counters.lazy_local_admission_waves == expected_waves);
+    CHECK(state.counters.lazy_local_parallel_waves == expected_waves);
+    CHECK(state.counters.scheduler_axes.local_score_candidates.items ==
+          candidate_count);
+    CHECK(state.counters.scheduler_axes.local_score_candidates.worker_tasks ==
+          candidate_count);
+    CHECK(state.counters.scheduler_axes.local_score_candidates
+              .active_worker_high_water == expected_effective_concurrency);
+    CHECK(w1_workspace.operation_boundary_clean());
+    CHECK(w8_workspace.operation_boundary_clean());
+    auto const task_slot_capacities =
+        larch::chart_spr_search_detail::local_score_workspace_access::
+            task_slot_capacities(w8_workspace);
+    CHECK(task_slot_capacities.first <= expected_effective_concurrency);
+    CHECK(task_slot_capacities.second <= expected_effective_concurrency);
+
+    for (std::size_t index = 0; index < candidate_count; ++index) {
+      CHECK(w8[index].valid == w1[index].valid);
+      CHECK(w8[index].affected_clade_count == w1[index].affected_clade_count);
+      CHECK(w8[index].invalid_reason == w1[index].invalid_reason);
+      CHECK(w8[index].lower_bound.value.old_score ==
+            w1[index].lower_bound.value.old_score);
+      CHECK(w8[index].lower_bound.value.new_score ==
+            w1[index].lower_bound.value.new_score);
+      CHECK(w8[index].lower_bound.value.delta ==
+            w1[index].lower_bound.value.delta);
+    }
+  };
+
+  using larch::chart_spr_search_detail::
+      lazy_local_bandwidth_saturation_min_active_patterns;
+  run_shape(64, 8, 1, 0);
+  run_shape(lazy_local_bandwidth_saturation_min_active_patterns, 6, 2, 1);
+
   std::println("  PASS");
 }
 
@@ -3594,6 +3749,10 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
   auto const& delta = oracle_prepared.delta();
   auto const& lazy = *state.lazy_chart;
   auto const& active_patterns = state.active_patterns.patterns.patterns;
+  auto const packed_key_width =
+      larch::chart_spr_search_detail::lazy_overlay_context_key_width(delta);
+  CHECK(scratch.lazy_context_key_words.size() ==
+        active_patterns.size() * packed_key_width);
   std::map<std::vector<std::size_t>, std::vector<std::size_t>> old_groups;
   for (std::size_t pattern_index = 0; pattern_index < active_patterns.size();
        ++pattern_index) {
@@ -3625,9 +3784,15 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
         }
       }
     }
-    CHECK(
-        key.size() ==
-        larch::chart_spr_search_detail::lazy_overlay_context_key_width(delta));
+    CHECK(key.size() == packed_key_width);
+    auto const packed_row = std::span{
+        scratch.lazy_context_key_words.data() + pattern_index * packed_key_width,
+        packed_key_width};
+    for (std::size_t word = 0; word < packed_key_width; ++word) {
+      CHECK(packed_row[word] ==
+            larch::lazy_key_grouping_detail::checked_packed_key_word(
+                key[word], "test lazy-local packed context key"));
+    }
     old_groups[std::move(key)].push_back(pattern_index);
   }
 
@@ -3642,7 +3807,19 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
     CHECK(class_id < grouping.class_count());
     expected_lexicographic_class_order.push_back(class_id);
     CHECK(grouping.representative_by_class[class_id] == members.front());
-    CHECK(std::ranges::equal(grouping.members_for_class(class_id), members));
+    // Local scoring consumes the class map directly and deliberately omits
+    // the unused CSR membership buffers. Reconstruct membership from that map
+    // while preserving the former input-order oracle.
+    std::vector<std::size_t> grouped_members;
+    for (std::size_t input = 0; input < grouping.class_by_input.size();
+         ++input) {
+      if (grouping.class_by_input[input] == class_id) {
+        grouped_members.push_back(input);
+      }
+    }
+    CHECK(grouped_members == members);
+    CHECK(grouping.member_offsets_by_class.empty());
+    CHECK(grouping.members_by_class.empty());
     saw_merged_context = saw_merged_context || members.size() > 1;
 
     larch::lazy_overlay_context_accumulator expected;
@@ -4061,6 +4238,10 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
   larch::chart_spr_local_score_workspace reuse_workspace;
   larch::local_spr_score_options reuse_options;
   reuse_options.admission_memory_budget_bytes = std::size_t{1} << 30;
+  larch::lazy_local_admission_test_observer reuse_ledger_observer;
+  reuse_options.lazy_local_admission_observer_for_tests =
+      &reuse_ledger_observer;
+  reuse_options.verify_lazy_local_task_capacity_ledger_for_tests = true;
   auto const reuse_waves_before =
       finite_state.counters.lazy_local_admission_waves;
   auto const reused_tasks_before =
@@ -4072,9 +4253,15 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
   CHECK(finite_state.counters.lazy_local_admission_waves - reuse_waves_before ==
         2);
   CHECK(finite_state.counters.lazy_local_reused_prepared_tasks -
-            reused_tasks_before >=
+            reused_tasks_before ==
         candidates.size());
   CHECK(reuse_workspace.operation_boundary_clean());
+  CHECK(reuse_ledger_observer.task_capacity_ledger_initializations == 1);
+  CHECK(reuse_ledger_observer.task_capacity_ledger_slot_refreshes >
+        repeated_candidates.size());
+  CHECK(
+      reuse_ledger_observer.task_capacity_ledger_full_walk_verifications > 0);
+  CHECK(reuse_ledger_observer.task_capacity_ledger_mismatches == 0);
   for (std::size_t index = 0; index < repeated_results.size(); ++index) {
     CHECK(repeated_results[index].lower_bound.value.delta ==
           w1[index % candidates.size()].lower_bound.value.delta);
@@ -4464,8 +4651,27 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
   CHECK(w4_workspace.operation_boundary_clean());
   check_no_lazy_results_published();
 
+  // The conservative capacity oracle counts each prepared result's inline
+  // string buffer even after every heap-backed payload has been discarded.
+  // Establish that empty-slot floor explicitly so the exceptional-retention
+  // check distinguishes released storage from the admitted high-water mark.
+  larch::chart_spr_local_score_workspace released_task_floor_workspace;
+  larch::chart_spr_search_detail::local_score_workspace_access::
+      bound_lazy_task_slots(released_task_floor_workspace, candidates.size(),
+                            true);
+  auto const released_task_capacity_floor =
+      larch::chart_spr_search_detail::local_score_workspace_access::
+          retained_task_dynamic_capacity_bytes(
+              released_task_floor_workspace);
+
   auto run_finish_failure = [&](bool allocation) {
     larch::local_spr_score_options failure_options;
+    failure_options.admission_memory_budget_bytes = std::size_t{1} << 40;
+    failure_options.admission_retain_lazy_local_task_storage = true;
+    larch::lazy_local_admission_test_observer ledger_observer;
+    failure_options.lazy_local_admission_observer_for_tests =
+        &ledger_observer;
+    failure_options.verify_lazy_local_task_capacity_ledger_for_tests = true;
     if (allocation) {
       failure_options.force_lazy_finish_allocation_for_tests = 2;
     } else {
@@ -4492,6 +4698,15 @@ static void test_lazy_local_packed_context_grouping_reuses_scratch() {
     CHECK(state.counters.local_rows_recomputed >
           counters_before.local_rows_recomputed);
     CHECK(w4_workspace.operation_boundary_clean());
+    CHECK(larch::chart_spr_search_detail::local_score_workspace_access::
+              retained_task_dynamic_capacity_bytes(w4_workspace) ==
+          released_task_capacity_floor);
+    CHECK(ledger_observer.task_capacity_ledger_initializations == 1);
+    CHECK(ledger_observer.task_capacity_ledger_slot_refreshes >=
+          candidates.size());
+    CHECK(
+        ledger_observer.task_capacity_ledger_full_walk_verifications > 0);
+    CHECK(ledger_observer.task_capacity_ledger_mismatches == 0);
     check_no_lazy_results_published();
     return state.counters.local_rows_recomputed -
            counters_before.local_rows_recomputed;
@@ -4602,6 +4817,9 @@ static void test_lazy_local_production_multibatch_retained_budget() {
   auto state = make_state();
   auto fit_options = base_options;
   fit_options.cache.memory_budget_bytes = envelope;
+  larch::lazy_local_admission_test_observer fit_ledger_observer;
+  fit_options.lazy_local_admission_observer_for_tests = &fit_ledger_observer;
+  fit_options.verify_lazy_local_task_capacity_ledger_for_tests = true;
   larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
       fit_workspace;
   auto fit = larch::run_chart_spr_acceptance_iteration(
@@ -4620,6 +4838,13 @@ static void test_lazy_local_production_multibatch_retained_budget() {
         0);
   CHECK(state.counters.lazy_local_peak_projected_resident_bytes <= envelope);
   CHECK(state.counters.lazy_local_preparation_peak_bytes <= envelope);
+  CHECK(fit_ledger_observer.task_capacity_ledger_initializations ==
+        fit.candidates_scored);
+  CHECK(fit_ledger_observer.task_capacity_ledger_slot_refreshes >=
+        fit.candidates_scored);
+  CHECK(
+      fit_ledger_observer.task_capacity_ledger_full_walk_verifications > 0);
+  CHECK(fit_ledger_observer.task_capacity_ledger_mismatches == 0);
   CHECK(fit_workspace.local_score.operation_boundary_clean());
   CHECK(fit_workspace.candidate_slots.capacity() == 0);
   CHECK(fit_workspace.candidate_copy_scratch.capacity() == 0);
@@ -4778,10 +5003,15 @@ static void test_lazy_local_named_fixture_finite_production_gates() {
     CHECK(state.grammar.clades.size() == expected_clades);
     CHECK(state.active_patterns.patterns.patterns.size() == expected_patterns);
 
-    auto const task_slots =
-        std::max<std::size_t>(1, std::min(worker_count, candidate_batch_size));
     larch::chart_scheduler scheduler{
         larch::chart_scheduler_options{.requested_workers = worker_count}};
+    auto const concurrency =
+        larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+            scheduler.worker_resolution().resolved_workers,
+            candidate_batch_size,
+            state.active_patterns.patterns.patterns.size());
+    auto const task_slots =
+        std::max<std::size_t>(1, concurrency.effective_tasks);
     auto const use_pipeline =
         options.enable_candidate_generation_pipeline && worker_count > 1;
     auto const envelope = larch::chart_spr_search_detail::
@@ -4832,6 +5062,69 @@ static void test_lazy_local_named_fixture_finite_production_gates() {
       "medium",
       larch::load_parsimony_tree("data/seedtree/seedtree.pb.gz", reference),
       597, 1193, 1106, 4, 4, 4);
+  std::println("  PASS");
+}
+
+static void test_hybrid_finite_child_dedup_uses_global_cap() {
+  std::println("test_hybrid_finite_child_dedup_uses_global_cap");
+
+  auto fixture = make_fixture();
+  constexpr std::size_t candidate_limit = 4;
+  constexpr std::size_t candidate_batch_size = 4;
+  larch::chart_spr_search_options options;
+  options.max_candidates_per_iteration = candidate_limit;
+  options.cache.candidate_batch_size = candidate_batch_size;
+  options.enumeration.max_candidates = candidate_limit;
+  options.enumeration.max_candidates_is_post_dedup = true;
+  options.enumeration.source = larch::chart_spr_candidate_source::hybrid;
+  options.enumeration.sampled_tree_count = 1;
+  options.enumeration.sampled_tree_spr_radius = 8;
+  options.enumeration.sampled_tree_score_threshold =
+      std::numeric_limits<int>::max();
+  options.enumeration.max_path_pairs_considered = 0;
+
+  auto state = larch::build_chart_spr_search_state(
+      fixture.dag, fixture.grammar, options);
+  larch::chart_scheduler scheduler{
+      larch::chart_scheduler_options{.requested_workers = 2}};
+  auto estimate_source = [&](larch::chart_spr_candidate_source source) {
+    auto enumeration = options.enumeration;
+    enumeration.source = source;
+    enumeration.sampled_tree_source_dag = state.dag;
+    return larch::chart_spr_search_detail::
+        estimate_grammar_spr_finite_iteration_memory_envelope(
+            state, candidate_limit, candidate_batch_size,
+            /*ranked_limit=*/1, /*capture_semantics=*/false, scheduler,
+            /*local_task_slots=*/2, &enumeration,
+            /*candidate_buffer_count=*/2,
+            /*include_pipeline_control=*/true);
+  };
+
+  auto const hybrid =
+      estimate_source(larch::chart_spr_candidate_source::hybrid);
+  auto const sampled =
+      estimate_source(larch::chart_spr_candidate_source::sampled_tree);
+  auto const grammar =
+      estimate_source(larch::chart_spr_candidate_source::grammar);
+  auto const outer_dedup =
+      larch::chart_spr_exact_candidate_checked_bytes_multiply(
+          candidate_limit, hybrid.planned_signature_node_bytes,
+          "test hybrid outer dedup bytes");
+  auto const expected_source =
+      larch::chart_spr_exact_candidate_checked_bytes_add(
+          outer_dedup,
+          std::max(sampled.planned_source_owned_bytes,
+                   grammar.planned_source_owned_bytes),
+          "test hybrid child source bytes");
+
+  CHECK(hybrid.planned_sampled_source_count_bound > candidate_limit);
+  CHECK(hybrid.planned_sampled_destination_bound_per_source > candidate_limit);
+  CHECK(hybrid.planned_source_owned_bytes == expected_source);
+  CHECK(hybrid.planned_source_owned_bytes >
+        std::max(sampled.planned_source_owned_bytes,
+                 grammar.planned_source_owned_bytes));
+  scheduler.shutdown();
+
   std::println("  PASS");
 }
 
@@ -6050,6 +6343,12 @@ static void test_lazy_cache_fixed_topology_conservative_search() {
         search.counters.lazy_local_parallel_waves);
   CHECK(search.summary.lazy_local_memory_limited_waves ==
         search.counters.lazy_local_memory_limited_waves);
+  CHECK(search.summary.lazy_local_requested_concurrency_max ==
+        search.counters.lazy_local_requested_concurrency_max);
+  CHECK(search.summary.lazy_local_effective_concurrency_max ==
+        search.counters.lazy_local_effective_concurrency_max);
+  CHECK(search.summary.lazy_local_bandwidth_capped_batches ==
+        search.counters.lazy_local_bandwidth_capped_batches);
   CHECK(search.summary.lazy_local_admitted_concurrency_max ==
         search.counters.lazy_local_admitted_concurrency_max);
   CHECK(search.summary.lazy_local_prepared_tasks ==
@@ -6913,6 +7212,110 @@ static void test_phase7_scheduled_lazy_chart_axes_match_w1() {
         finite.counters.lazy_chart_inside_admission_waves);
   CHECK(finite.counters.scheduler_axes.lazy_outside_clades.operations ==
         finite.counters.lazy_chart_outside_admission_waves);
+  CHECK(finite.lazy_chart.has_value());
+  CHECK(finite.counters.lazy_chart_inside_dependency_ready_executions == 0);
+  CHECK(finite.counters.lazy_chart_outside_dependency_ready_executions == 0);
+  CHECK(finite.counters.lazy_chart_inside_dependency_ready_jobs == 0);
+  CHECK(finite.counters.lazy_chart_outside_dependency_ready_jobs == 0);
+  CHECK(
+      finite.counters.lazy_chart_inside_dependency_ready_scheduler_operations ==
+      0);
+  CHECK(finite.counters
+            .lazy_chart_outside_dependency_ready_scheduler_operations == 0);
+
+  // Under the same finite certificate, W4 takes the strict-binary
+  // dependency-ready route. Its scheduler axes expose one runner operation;
+  // the route counters separately expose every logical clade/production job
+  // drained by those runners.
+  auto finite_w4_scheduler = make_scheduler(4);
+  auto finite_w4_active = larch::make_active_search_patterns(patterns);
+  auto finite_w4 = larch::build_chart_spr_search_state_from_active(
+      fixture.dag, fixture.grammar, std::move(finite_w4_active), {}, false, {},
+      finite_cache, {}, finite_w4_scheduler.get());
+  CHECK(finite_w4.lazy_chart.has_value());
+  CHECK(finite_w4.lazy_chart->inside_rows_by_clade ==
+        finite.lazy_chart->inside_rows_by_clade);
+  CHECK(finite_w4.lazy_chart->outside_rows_by_clade ==
+        finite.lazy_chart->outside_rows_by_clade);
+  CHECK(finite_w4.counters.lazy_chart_inside_dependency_ready_executions == 1);
+  CHECK(finite_w4.counters.lazy_chart_outside_dependency_ready_executions ==
+        1);
+  CHECK(finite_w4.counters.lazy_chart_inside_dependency_ready_jobs ==
+        finite_w4.execution_plan.clades().size());
+  CHECK(finite_w4.counters.lazy_chart_outside_dependency_ready_jobs ==
+        finite_w4.execution_plan.productions().size());
+  CHECK(finite_w4.counters
+            .lazy_chart_inside_dependency_ready_scheduler_operations == 1);
+  CHECK(finite_w4.counters
+            .lazy_chart_outside_dependency_ready_scheduler_operations == 1);
+  CHECK(
+      finite_w4.counters
+          .lazy_chart_inside_dependency_ready_capacity_resident_bytes_max > 0);
+  CHECK(
+      finite_w4.counters
+          .lazy_chart_outside_dependency_ready_capacity_resident_bytes_max >
+      0);
+  CHECK(finite_w4.counters.scheduler_axes.lazy_inside_clades.operations ==
+        finite_w4.counters
+            .lazy_chart_inside_dependency_ready_scheduler_operations);
+  CHECK(finite_w4.counters.scheduler_axes.lazy_outside_clades.operations ==
+        finite_w4.counters
+            .lazy_chart_outside_dependency_ready_scheduler_operations);
+  CHECK(
+      finite_w4.counters.scheduler_axes.lazy_inside_clades.parallel_operations ==
+      1);
+  CHECK(finite_w4.counters.scheduler_axes.lazy_outside_clades
+            .parallel_operations == 1);
+
+  // A returned search summary mirrors the non-vacuous route counters used by
+  // dagutil and sealed benchmark evidence.
+  auto summary_fixture = make_fixture();
+  larch::chart_spr_search_options summary_options;
+  summary_options.max_iterations = 0;
+  summary_options.worker_count = 4;
+  summary_options.local_score_worker_count = 4;
+  summary_options.cache = finite_cache;
+  auto summary_search = larch::run_chart_spr_search(
+      std::move(summary_fixture.dag), std::move(summary_fixture.grammar),
+      summary_options);
+  CHECK(
+      summary_search.counters.lazy_chart_inside_dependency_ready_executions ==
+      1);
+  CHECK(
+      summary_search.counters.lazy_chart_outside_dependency_ready_executions ==
+      1);
+  CHECK(summary_search.summary.lazy_chart_inside_dependency_ready_executions ==
+        summary_search.counters
+            .lazy_chart_inside_dependency_ready_executions);
+  CHECK(summary_search.summary.lazy_chart_outside_dependency_ready_executions ==
+        summary_search.counters
+            .lazy_chart_outside_dependency_ready_executions);
+  CHECK(summary_search.summary.lazy_chart_inside_dependency_ready_jobs ==
+        summary_search.counters.lazy_chart_inside_dependency_ready_jobs);
+  CHECK(summary_search.summary.lazy_chart_outside_dependency_ready_jobs ==
+        summary_search.counters.lazy_chart_outside_dependency_ready_jobs);
+  CHECK(
+      summary_search.summary
+          .lazy_chart_inside_dependency_ready_scheduler_operations ==
+      summary_search.counters
+          .lazy_chart_inside_dependency_ready_scheduler_operations);
+  CHECK(
+      summary_search.summary
+          .lazy_chart_outside_dependency_ready_scheduler_operations ==
+      summary_search.counters
+          .lazy_chart_outside_dependency_ready_scheduler_operations);
+  CHECK(
+      summary_search.summary
+          .lazy_chart_inside_dependency_ready_capacity_resident_bytes_max ==
+      summary_search.counters
+          .lazy_chart_inside_dependency_ready_capacity_resident_bytes_max);
+  CHECK(
+      summary_search.summary
+          .lazy_chart_outside_dependency_ready_capacity_resident_bytes_max ==
+      summary_search.counters
+          .lazy_chart_outside_dependency_ready_capacity_resident_bytes_max);
+
+  finite_w4_scheduler->shutdown();
   finite_scheduler->shutdown();
   check_phase4_scheduler_axis_reconciliation(w1_scheduler->metrics(),
                                              w1.counters.scheduler_axes);
@@ -13240,9 +13643,11 @@ int main() {
   test_phase7_lazy_auto_budget_and_freeze_contract();
   test_pattern_batch_cache_options_match_all_cache();
   test_lazy_local_admission_planner();
+  test_lazy_local_bandwidth_cap_semantics();
   test_lazy_local_packed_context_grouping_reuses_scratch();
   test_lazy_local_production_multibatch_retained_budget();
   test_lazy_local_named_fixture_finite_production_gates();
+  test_hybrid_finite_child_dedup_uses_global_cap();
   test_local_score_into_workspace_contract();
   test_pattern_batch_into_parallel_scratch_plateau();
   test_candidate_execution_plan_lifetime_and_mismatch_guards();

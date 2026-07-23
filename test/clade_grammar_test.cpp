@@ -5,8 +5,12 @@
 
 #include <print>
 #include <cstdlib>
+#include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <variant>
 #include <vector>
 
 [[noreturn]] static void test_fail(char const* expr, char const* file, int line) {
@@ -90,6 +94,104 @@ static bool throws_grammar_error(auto&& f) {
     return true;
   }
   return false;
+}
+
+static std::string grammar_error_message(auto&& f) {
+  try {
+    f();
+  } catch (std::runtime_error const& error) {
+    return error.what();
+  }
+  return {};
+}
+
+static void set_leaf_compact_genome(
+    larch::phylo_dag& dag, std::string const& sample_id,
+    std::map<larch::mutation_position, larch::nuc_base> mutations) {
+  bool found = false;
+  for (auto nv : dag.get_all_nodes()) {
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires {
+                          node.sample_id();
+                          node.cg();
+                        }) {
+            if (node.sample_id() != sample_id) return;
+            CHECK(!found);
+            node.cg() = larch::compact_genome{std::move(mutations)};
+            found = true;
+          }
+        },
+        nv);
+  }
+  CHECK(found);
+}
+
+static void update_strict_nucleotide_counts_oracle(
+    larch::phylo_dag& dag,
+    larch::detail::reachable_dag_info const& reachable,
+    larch::clade_grammar_audit& audit) {
+  auto const& reference = larch::get_reference_sequence(dag);
+  std::vector<bool> reference_is_acgt(reference.size(), false);
+  for (std::size_t i = 0; i < reference.size(); ++i) {
+    reference_is_acgt[i] = larch::detail::is_acgt_char(reference[i]);
+    if (reference_is_acgt[i])
+      ++audit.strict_reference_acgt_pass;
+    else
+      ++audit.strict_reference_acgt_fail;
+  }
+
+  for (auto node_idx : reachable.nodes) {
+    auto nv = dag.get_node(node_idx);
+    if (!larch::detail::is_leaf_node(nv)) continue;
+
+    std::visit(
+        [&](auto node) {
+          if constexpr (requires {
+                          node.sample_id();
+                          node.cg();
+                        }) {
+            auto it = node.cg().begin();
+            auto end = node.cg().end();
+            for (larch::mutation_position pos = 1; pos <= reference.size();
+                 ++pos) {
+              while (it != end && it->first < pos) {
+                ++audit.strict_leaf_compact_genome_acgt_fail;
+                ++it;
+              }
+              if (it != end && it->first == pos) {
+                if (larch::detail::is_valid_nuc_base(it->second))
+                  ++audit.strict_leaf_compact_genome_acgt_pass;
+                else
+                  ++audit.strict_leaf_compact_genome_acgt_fail;
+                ++it;
+              } else if (reference_is_acgt[pos - 1]) {
+                ++audit.strict_leaf_compact_genome_acgt_pass;
+              } else {
+                ++audit.strict_leaf_compact_genome_acgt_fail;
+              }
+            }
+            while (it != end) {
+              ++audit.strict_leaf_compact_genome_acgt_fail;
+              ++it;
+            }
+          }
+        },
+        nv);
+  }
+}
+
+static void check_strict_nucleotide_counts_equal(
+    larch::clade_grammar_audit const& actual,
+    larch::clade_grammar_audit const& expected) {
+  CHECK(actual.strict_reference_acgt_pass ==
+        expected.strict_reference_acgt_pass);
+  CHECK(actual.strict_reference_acgt_fail ==
+        expected.strict_reference_acgt_fail);
+  CHECK(actual.strict_leaf_compact_genome_acgt_pass ==
+        expected.strict_leaf_compact_genome_acgt_pass);
+  CHECK(actual.strict_leaf_compact_genome_acgt_fail ==
+        expected.strict_leaf_compact_genome_acgt_fail);
 }
 
 static void test_single_tree_clades_and_productions() {
@@ -190,11 +292,11 @@ static void test_compact_genome_redundancy_collapses_by_leaf_set() {
 static void test_taxon_identity_policy() {
   std::println("test_taxon_identity_policy");
 
-  CHECK(throws_grammar_error([] {
+  CHECK(grammar_error_message([] {
     auto dag = larch::test::make_tiny_labelled_tree(
         "AAAA", larch::test::tiny_leaf("", "AAAA"));
     (void)larch::build_clade_grammar(dag);
-  }));
+  }) == "clade grammar: empty sample_id at leaf node 1");
 
   auto duplicate_ok = larch::test::make_tiny_labelled_dag(
       "AAAA", "root",
@@ -205,13 +307,89 @@ static void test_taxon_identity_policy() {
   CHECK(built.audit.duplicate_sample_id_occurrences == 1);
   CHECK(built.grammar.productions.empty());
 
-  CHECK(throws_grammar_error([] {
+  CHECK(grammar_error_message([] {
     auto duplicate_bad = larch::test::make_tiny_labelled_dag(
         "AAAA", "root",
         {{"root", "AAAA", ""}, {"a1", "AAAA", "A"}, {"a2", "CAAA", "A"}},
         {{"root", "a1", 0}, {"root", "a2", 0}});
     (void)larch::build_clade_grammar(duplicate_bad);
-  }));
+  }) ==
+        "clade grammar: duplicate sample_id 'A' has conflicting compact "
+        "genomes");
+
+  CHECK(grammar_error_message([] {
+    auto duplicate_ok_disabled = larch::test::make_tiny_labelled_dag(
+        "AAAA", "root",
+        {{"root", "AAAA", ""}, {"a1", "AAAA", "A"}, {"a2", "AAAA", "A"}},
+        {{"root", "a1", 0}, {"root", "a2", 0}});
+    larch::clade_grammar_options opts;
+    opts.coalesce_duplicate_sample_ids_with_identical_cg = false;
+    (void)larch::build_clade_grammar(duplicate_ok_disabled, opts);
+  }) ==
+        "clade grammar: duplicate sample_id 'A' encountered and duplicate "
+        "coalescing is disabled");
+
+  // A compact-genome conflict is diagnosed before the duplicate-coalescing
+  // policy, preserving the established exception ordering and wording.
+  CHECK(grammar_error_message([] {
+    auto duplicate_bad_disabled = larch::test::make_tiny_labelled_dag(
+        "AAAA", "root",
+        {{"root", "AAAA", ""}, {"a1", "AAAA", "A"}, {"a2", "CAAA", "A"}},
+        {{"root", "a1", 0}, {"root", "a2", 0}});
+    larch::clade_grammar_options opts;
+    opts.coalesce_duplicate_sample_ids_with_identical_cg = false;
+    (void)larch::build_clade_grammar(duplicate_bad_disabled, opts);
+  }) ==
+        "clade grammar: duplicate sample_id 'A' has conflicting compact "
+        "genomes");
+
+  std::println("  PASS");
+}
+
+static void test_strict_nucleotide_audit_sparse_equivalence() {
+  std::println("test_strict_nucleotide_audit_sparse_equivalence");
+
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "ANt?", larch::test::tiny_inner(
+                   "root", "ANt?",
+                   {larch::test::tiny_leaf("A", "ANt?"),
+                    larch::test::tiny_leaf("B", "ANt?")}));
+  set_leaf_compact_genome(
+      dag, "A",
+      {{0, larch::nuc_base{larch::nuc_base::A}},
+       {2, larch::nuc_base{larch::nuc_base::C}},
+       {4, larch::nuc_base{7}},
+       {5, larch::nuc_base{larch::nuc_base::G}}});
+  set_leaf_compact_genome(
+      dag, "B",
+      {{1, larch::nuc_base{larch::nuc_base::T}},
+       {3, larch::nuc_base{7}}});
+
+  auto reachable = larch::detail::collect_reachable(dag);
+  larch::clade_grammar_audit expected;
+  larch::clade_grammar_audit actual;
+  update_strict_nucleotide_counts_oracle(dag, reachable, expected);
+  larch::detail::update_strict_nucleotide_counts(dag, reachable, actual);
+  check_strict_nucleotide_counts_equal(actual, expected);
+  CHECK(actual.strict_reference_acgt_pass == 2);
+  CHECK(actual.strict_reference_acgt_fail == 2);
+  CHECK(actual.strict_leaf_compact_genome_acgt_pass == 4);
+  CHECK(actual.strict_leaf_compact_genome_acgt_fail == 6);
+
+  // The public audit counters are size_t and historically wrap on overflow.
+  // Pre-seeding the old oracle and optimized implementation at max locks that
+  // behavior without requiring an infeasibly large reference or leaf set.
+  auto const max = std::numeric_limits<std::size_t>::max();
+  expected = {};
+  actual = {};
+  expected.strict_reference_acgt_pass = max;
+  expected.strict_reference_acgt_fail = max;
+  expected.strict_leaf_compact_genome_acgt_pass = max;
+  expected.strict_leaf_compact_genome_acgt_fail = max;
+  actual = expected;
+  update_strict_nucleotide_counts_oracle(dag, reachable, expected);
+  larch::detail::update_strict_nucleotide_counts(dag, reachable, actual);
+  check_strict_nucleotide_counts_equal(actual, expected);
 
   std::println("  PASS");
 }
@@ -319,6 +497,7 @@ int main() {
   test_two_trees_deduplicate_shared_clades();
   test_compact_genome_redundancy_collapses_by_leaf_set();
   test_taxon_identity_policy();
+  test_strict_nucleotide_audit_sparse_equivalence();
   test_invalid_clade_group_alternatives_fail();
   test_invalid_child_partition_fails();
   test_polytomy_policy();
