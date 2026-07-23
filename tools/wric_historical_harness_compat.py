@@ -3,8 +3,9 @@
 
 The historical product checkout remains pristine.  This tool reads its exact
 tracked benchmark harness, applies a Git-derived allowlist of score-domain and
-per-trial canonical-digest hunks, and publishes a separate immutable harness
-and canonical metadata record without replacing any existing path.
+per-trial canonical-digest hunks plus one fixed, hash-allowlisted summary-key
+correction, and publishes a separate immutable harness and canonical metadata
+record without replacing any existing path.
 """
 
 from __future__ import annotations
@@ -40,6 +41,41 @@ SCORE_DOMAIN_SOURCE_SHA256 = (
 )
 TIMED_TRIAL_SOURCE_SHA256 = (
     "ed089af213f7f6773a252908dc3111a4d86bf01c85f12ad9d3a846ec92b3770f"
+)
+PHASE15_SUMMARY_ROW_ID_RESULT_SHA256 = (
+    "17e11516a0b3056a445595607a939648f5290c8aaefd43f4bd2b71fbda4c347b"
+)
+PHASE6_SUMMARY_ROW_ID_RESULT_SHA256 = (
+    "f7d3ff47140d94d3924b2fb78744d399eacaf0956d478e9f04664cd3f9c1c7f3"
+)
+PHASE78_SUMMARY_ROW_ID_RESULT_SHA256 = (
+    "ff7f7d2904752c7198f05e13d1eafffaa087ccba9ef70221c5084a91325ef821"
+)
+
+_SUMMARY_ROW_ID_OLD = (
+    b"# Aggregate measured rows by fixture/method/requested worker. wall_clock_s is\n"
+    b"# the median; explicit aggregate columns retain the maximums and trial count.\n"
+    b"awk -F '\\t' -v OFS='\\t' '\n"
+    b"  NR==1 {for(i=1;i<=NF;i++){h[$i]=i; name[i]=$i} nfields=NF;\n"
+    b'    print $0,"trial_count","wall_clock_max_s","user_cpu_median_s","system_cpu_median_s","max_rss_max_kb","peak_sampled_rss_max_kb"; next}\n'
+    b"  {\n"
+    b'    g=$h["fixture"] SUBSEP $h["method"] SUBSEP $h["requested_workers"]\n'
+)
+_SUMMARY_ROW_ID_NEW = (
+    b"# Aggregate measured trials by manifest row ID. A row ID is the sealed workload\n"
+    b"# and policy identity; wall_clock_s is the median, while explicit aggregate\n"
+    b"# columns retain the maximums and trial count.\n"
+    b"awk -F '\\t' -v OFS='\\t' '\n"
+    b"  NR==1 {for(i=1;i<=NF;i++){h[$i]=i; name[i]=$i} nfields=NF;\n"
+    b'    print $0,"trial_count","wall_clock_max_s","user_cpu_median_s","system_cpu_median_s","max_rss_max_kb","peak_sampled_rss_max_kb"; next}\n'
+    b"  {\n"
+    b'    g=$h["row_id"]\n'
+)
+SUMMARY_ROW_ID_OLD_SHA256 = (
+    "3bdb20c44e249748e439a19057a419a159a1e052360c18fb9c8ec328c13cb2a2"
+)
+SUMMARY_ROW_ID_NEW_SHA256 = (
+    "16ad3c0eb900b052420b475fff07f51e8ce0fcebc124311812028d8d22e42f4d"
 )
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -82,9 +118,7 @@ _VARIANTS: dict[str, Variant] = {
             "9cdcd0c0eaa9cfed37ceed3a34c8cc557637988bc0834a17465a752d8560ba32"
         ),
         base_blob="9678ff856c745852882ea6cb5e38d85c47d50693",
-        result_sha256=(
-            "2fa15aeb1c34de8b018b3ba079ca4fb2a117baf53bc59feb2dabd67d0161d795"
-        ),
+        result_sha256=PHASE15_SUMMARY_ROW_ID_RESULT_SHA256,
     ),
     "e9460139457ac406522a81f6206182c30a3c4d38d9f2877f2785c02ec1648f14": Variant(
         name="phase6",
@@ -92,15 +126,13 @@ _VARIANTS: dict[str, Variant] = {
             "e9460139457ac406522a81f6206182c30a3c4d38d9f2877f2785c02ec1648f14"
         ),
         base_blob="623181bc826d33ddb7bd748dc2aa5ba2ff0a632d",
-        result_sha256=(
-            "17d178cb27e3f500fdbe5b95ada89282ce537630907b4796a7f6e00945165068"
-        ),
+        result_sha256=PHASE6_SUMMARY_ROW_ID_RESULT_SHA256,
     ),
     PHASE78_REFERENCE_SHA256: Variant(
         name="phase7-8",
         base_sha256=PHASE78_REFERENCE_SHA256,
         base_blob="c791f4fbd7f807e8d15cb7474062b8ee319dc323",
-        result_sha256=TIMED_TRIAL_SOURCE_SHA256,
+        result_sha256=PHASE78_SUMMARY_ROW_ID_RESULT_SHA256,
     ),
 }
 
@@ -439,18 +471,40 @@ def _derive_hunks(root: Path) -> tuple[Hunk, ...]:
     timed_hunks = _unified_hunks(score, timed, "timed-trial-canonical")
     if len(score_hunks) != 2 or len(timed_hunks) != 14:
         _fail("approved transformation hunk cardinality changed")
-    return (*score_hunks, *timed_hunks)
+    if (
+        _sha256(_SUMMARY_ROW_ID_OLD) != SUMMARY_ROW_ID_OLD_SHA256
+        or _sha256(_SUMMARY_ROW_ID_NEW) != SUMMARY_ROW_ID_NEW_SHA256
+    ):
+        _fail("fixed summary row-ID correction changed")
+    summary_hunk = Hunk(
+        category="summary-row-id",
+        index=1,
+        old=_SUMMARY_ROW_ID_OLD,
+        new=_SUMMARY_ROW_ID_NEW,
+    )
+    return (*score_hunks, *timed_hunks, summary_hunk)
 
 
 def _spec_document(hunks: Sequence[Hunk]) -> Mapping[str, object]:
     return {
-        "algorithm": "python-difflib-unified-diff-context3-exact-once-v1",
+        "algorithm": (
+            "python-difflib-unified-diff-context3-plus-fixed-summary-row-id-"
+            "exact-once-v2"
+        ),
         "phase78_reference_revision": PHASE78_REFERENCE_REVISION,
         "phase78_reference_sha256": PHASE78_REFERENCE_SHA256,
         "score_domain_source_revision": SCORE_DOMAIN_SOURCE_REVISION,
         "score_domain_source_sha256": SCORE_DOMAIN_SOURCE_SHA256,
         "timed_trial_source_revision": TIMED_TRIAL_SOURCE_REVISION,
         "timed_trial_source_sha256": TIMED_TRIAL_SOURCE_SHA256,
+        "summary_aggregation_correction": {
+            "kind": "fixed_allowlisted_exact_once",
+            "scope": "post_trial_summary_grouping",
+            "old_key": ["fixture", "method", "requested_workers"],
+            "new_key": ["row_id"],
+            "old_sha256": SUMMARY_ROW_ID_OLD_SHA256,
+            "new_sha256": SUMMARY_ROW_ID_NEW_SHA256,
+        },
         "hunks": [
             {
                 "name": hunk.name,
@@ -566,6 +620,7 @@ def _metadata_document(
             "child_runner_logic_unchanged": True,
             "timing_boundary_unchanged": True,
             "deferred_validation_only": True,
+            "summary_aggregation_logic_unchanged_except_group_key": True,
         },
         "result_harness": {
             "path": os.fspath(harness),

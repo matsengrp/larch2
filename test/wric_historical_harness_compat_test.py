@@ -129,17 +129,39 @@ class HistoricalHarnessCompatTest(unittest.TestCase):
                 proof = cast(list[dict[str, object]], transformation["proof"])
                 self.assertEqual(spec["score_domain_source_revision"], compat.SCORE_DOMAIN_SOURCE_REVISION)
                 self.assertEqual(spec["timed_trial_source_revision"], compat.TIMED_TRIAL_SOURCE_REVISION)
-                self.assertEqual(len(proof), 16)
+                self.assertEqual(len(proof), 17)
                 self.assertEqual(
                     [item["name"] for item in proof[:2]],
                     ["score-domain-01", "score-domain-02"],
                 )
+                self.assertEqual(proof[-1]["name"], "summary-row-id-01")
+                correction = cast(
+                    dict[str, object], spec["summary_aggregation_correction"]
+                )
+                self.assertEqual(
+                    correction["old_key"],
+                    ["fixture", "method", "requested_workers"],
+                )
+                self.assertEqual(correction["new_key"], ["row_id"])
+                self.assertEqual(
+                    correction["old_sha256"], compat.SUMMARY_ROW_ID_OLD_SHA256
+                )
+                self.assertEqual(
+                    correction["new_sha256"], compat.SUMMARY_ROW_ID_NEW_SHA256
+                )
                 self.assertTrue(transformation["child_runner_logic_unchanged"])
                 self.assertTrue(transformation["timing_boundary_unchanged"])
+                self.assertTrue(
+                    transformation[
+                        "summary_aggregation_logic_unchanged_except_group_key"
+                    ]
+                )
 
-    def test_score_domains_and_per_trial_digest_flow_match_frozen_template(self) -> None:
+    def test_score_domains_digest_flow_and_summary_correction_match_allowlist(
+        self,
+    ) -> None:
         product, harness, _, _ = self.create(name="semantics")
-        expected = subprocess.check_output(
+        frozen = subprocess.check_output(
             (
                 "/usr/bin/git",
                 "-C",
@@ -147,6 +169,11 @@ class HistoricalHarnessCompatTest(unittest.TestCase):
                 "show",
                 f"{compat.TIMED_TRIAL_SOURCE_REVISION}:{compat.HARNESS_RELATIVE_PATH}",
             )
+        )
+        self.assertEqual(frozen.count(compat._SUMMARY_ROW_ID_OLD), 1)
+        self.assertEqual(frozen.count(compat._SUMMARY_ROW_ID_NEW), 0)
+        expected = frozen.replace(
+            compat._SUMMARY_ROW_ID_OLD, compat._SUMMARY_ROW_ID_NEW, 1
         )
         self.assertEqual(harness.read_bytes(), expected)
         text = expected.decode()
@@ -161,6 +188,85 @@ class HistoricalHarnessCompatTest(unittest.TestCase):
         deferred = text.index("# No validation or semantic-capture process is allowed")
         timed_validation = text.index("elif ! timed_search=$(validate_chart_canonical_result")
         self.assertGreater(timed_validation, deferred)
+        self.assertIn("g=$h[\"row_id\"]", text)
+        self.assertNotIn(
+            'g=$h["fixture"] SUBSEP $h["method"] SUBSEP $h["requested_workers"]',
+            text,
+        )
+
+    def test_summary_aggregation_keeps_multi_policy_row_digests_separate(
+        self,
+    ) -> None:
+        _, harness, _, _ = self.create(name="summary-behavior")
+        text = harness.read_text(encoding="utf-8")
+        marker = "# Aggregate measured trials by manifest row ID."
+        start = text.index("awk -F '\\t' -v OFS='\\t' '\n", text.index(marker))
+        program_start = start + len("awk -F '\\t' -v OFS='\\t' '\n")
+        program_end = text.index(
+            "\n' \"$raw_trials_tsv\" >\"$summary_tsv\"", program_start
+        )
+        program = text[program_start:program_end]
+
+        columns = (
+            "row_id",
+            "fixture",
+            "method",
+            "requested_workers",
+            "wall_clock_s",
+            "user_cpu_s",
+            "system_cpu_s",
+            "max_rss_kb",
+            "peak_sampled_rss_kb",
+            "status",
+            "validation_status",
+            "canonical_digest",
+        )
+        lines = ["\t".join(columns)]
+        policies = (
+            ("phase7-lazy-off", "a" * 64),
+            ("phase7-lazy-on", "b" * 64),
+            ("phase7-lazy-auto", "c" * 64),
+        )
+        for row_id, digest in policies:
+            for trial, wall in enumerate((1.0, 3.0), start=1):
+                lines.append(
+                    "\t".join(
+                        (
+                            row_id,
+                            "same-fixture",
+                            "chart_spr_grammar_lower_bound_heuristic",
+                            "default",
+                            str(wall),
+                            str(float(trial)),
+                            "0.1",
+                            str(100 + trial),
+                            str(200 + trial),
+                            "ok",
+                            "ok",
+                            digest,
+                        )
+                    )
+                )
+        aggregated = subprocess.run(
+            ("/usr/bin/awk", "-F", "\t", "-v", "OFS=\t", program),
+            input="\n".join(lines) + "\n",
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.splitlines()
+        self.assertEqual(len(aggregated), 4)
+        header = aggregated[0].split("\t")
+        index = {name: position for position, name in enumerate(header)}
+        rows = {
+            fields[index["row_id"]]: fields
+            for fields in (line.split("\t") for line in aggregated[1:])
+        }
+        self.assertEqual(set(rows), {row_id for row_id, _ in policies})
+        for row_id, digest in policies:
+            self.assertEqual(rows[row_id][index["canonical_digest"]], digest)
+            self.assertEqual(rows[row_id][index["trial_count"]], "2")
+            self.assertEqual(rows[row_id][index["wall_clock_s"]], "2.000000")
 
     def test_cli_create_and_audit_emit_canonical_external_anchors(self) -> None:
         revision = REVISIONS[1]
@@ -311,6 +417,48 @@ class HistoricalHarnessCompatTest(unittest.TestCase):
         damaged = base.replace(b"write_chart_curve()", b"write_chart_curve_broken()", 1)
         with self.assertRaisesRegex(compat.CompatibilityError, "wrong context"):
             compat._apply_transformations(damaged, hunks, variant)
+
+        summary_hunk = hunks[-1]
+        self.assertEqual(summary_hunk.name, "summary-row-id-01")
+        corrected, proof = compat._apply_transformations(
+            template, (summary_hunk,), variant
+        )
+        self.assertEqual(
+            hashlib.sha256(corrected).hexdigest(),
+            compat.PHASE78_SUMMARY_ROW_ID_RESULT_SHA256,
+        )
+        self.assertEqual(proof[0]["old_occurrences_before"], 1)
+        self.assertEqual(proof[0]["new_occurrences_after"], 1)
+        with self.assertRaisesRegex(compat.CompatibilityError, "already patched"):
+            compat._apply_transformations(corrected, (summary_hunk,), variant)
+
+        wrong_summary_context = template.replace(
+            b'g=$h["fixture"] SUBSEP $h["method"] SUBSEP $h["requested_workers"]',
+            b'g=$h["fixture"] SUBSEP $h["method"]',
+            1,
+        )
+        with self.assertRaisesRegex(compat.CompatibilityError, "wrong context"):
+            compat._apply_transformations(
+                wrong_summary_context, (summary_hunk,), variant
+            )
+
+        duplicated_summary_context = template + summary_hunk.old
+        with self.assertRaisesRegex(
+            compat.CompatibilityError, "old=2, new=0"
+        ):
+            compat._apply_transformations(
+                duplicated_summary_context, (summary_hunk,), variant
+            )
+
+        with mock.patch.object(
+            compat,
+            "_SUMMARY_ROW_ID_NEW",
+            compat._SUMMARY_ROW_ID_NEW + b"# unapproved\n",
+        ):
+            with self.assertRaisesRegex(
+                compat.CompatibilityError, "fixed summary row-ID correction changed"
+            ):
+                compat._derive_hunks(product)
 
     def test_output_metadata_and_external_anchor_tampering_fail_closed(self) -> None:
         product, harness, metadata, result = self.create(name="tamper-harness")
