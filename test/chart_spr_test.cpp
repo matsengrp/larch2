@@ -1905,6 +1905,8 @@ static void test_phase8_grammar_and_hybrid_worker_seed_matrix() {
       for (auto workers :
            {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
         auto scheduler = make_projection_scheduler(workers);
+        std::atomic<std::size_t> grammar_barrier_arrivals = 0;
+        std::latch two_grammar_workers_started{2};
         larch::grammar_spr_enumeration_options options;
         options.source = source;
         options.sampled_tree_source_dag = &dag;
@@ -1916,6 +1918,22 @@ static void test_phase8_grammar_and_hybrid_worker_seed_matrix() {
         options.max_candidates = 8;
         options.max_candidates_is_post_dedup = true;
         options.sampled_tree_projection_scheduler = &scheduler;
+        if (source == larch::chart_spr_candidate_source::grammar &&
+            workers > 1) {
+          // The grammar work in this tiny fixture is short enough that one
+          // worker can otherwise drain both ranges before a peer is scheduled,
+          // especially when CTest itself runs in parallel. Hold the first two
+          // construction callbacks at a test-only barrier so the active-worker
+          // assertion below measures scheduler concurrency deterministically.
+          options.before_grammar_candidate_construction_for_tests =
+              [&](std::size_t) {
+                auto const arrival = grammar_barrier_arrivals.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (arrival >= 2) return;
+                two_grammar_workers_started.count_down();
+                two_grammar_workers_started.wait();
+              };
+        }
 
         larch::chart_spr_candidate_generation_stats stats;
         auto candidates = collect_candidates(grammar, options, &stats);
