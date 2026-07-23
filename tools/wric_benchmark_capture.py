@@ -146,6 +146,9 @@ RUN_COMPONENTS: Mapping[str, Sequence[Mapping[str, object]]] = {
     "phase8-end-to-end": (
         component("phase8-generation", "1,8", "5", ("phase8-generation",)),
     ),
+    "final-phase6-exact1": (
+        component("p0-medium-exact1-physical", "1,2,4,8", "3"),
+    ),
     "final-scaling": (component("p0-primary-physical", "1,2,4,8", "3"),),
     "final-primary": (
         component(
@@ -190,7 +193,9 @@ RUN_COMPONENTS: Mapping[str, Sequence[Mapping[str, object]]] = {
             ),
         ),
     ),
-    "final-stress": (component("p0-stress-physical", "1,8", "3"),),
+    "final-stress": (
+        component("p0-stress-physical", "1,2,4,8", "3"),
+    ),
     "final-real": (component("real-bounded", "1,8", "3"),),
     "phase9": (
         component(
@@ -216,6 +221,23 @@ HISTORICAL_RUN_REVISIONS: Mapping[str, str] = {
     "phase8-generation": "94a63238d25a8e3262428419d53f8f0986e8879b",
     "phase8-generation-retry1": "07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c",
 }
+
+CURRENT_PRODUCT_REVISION = "30805e6ff33df9a7ace4ced8c74d2dc740347c22"
+CURRENT_PRODUCT_RUN_REVISIONS: Mapping[str, str] = {
+    "final-phase6-exact1": CURRENT_PRODUCT_REVISION,
+    "final-scaling": CURRENT_PRODUCT_REVISION,
+    "final-primary": CURRENT_PRODUCT_REVISION,
+    "final-smt": CURRENT_PRODUCT_REVISION,
+    "final-small-auto": CURRENT_PRODUCT_REVISION,
+    "final-unpinned-auto": CURRENT_PRODUCT_REVISION,
+    "final-stress": CURRENT_PRODUCT_REVISION,
+    "final-real": CURRENT_PRODUCT_REVISION,
+    "phase9": CURRENT_PRODUCT_REVISION,
+}
+DEFERRED_DEFAULT_RUN_LABEL = "final-default-auto"
+# The paired default/explicit-auto evidence must come from the later, separately
+# pinned default-promotion product.  Until that immutable revision exists, fail
+# closed instead of treating the absent mapping as permission to use any HEAD.
 
 SAFE_HARNESS_ENVIRONMENT = {
     "HOME": "/nonexistent",
@@ -424,6 +446,17 @@ def require_run_revision(run_label: str, product_revision: str) -> None:
         fail(
             f"{run_label} requires exact historical product revision "
             f"{historical}, not {product_revision}"
+        )
+    current = CURRENT_PRODUCT_RUN_REVISIONS.get(run_label)
+    if current is not None and product_revision != current:
+        fail(
+            f"{run_label} requires exact current-product revision "
+            f"{current}, not {product_revision}"
+        )
+    if run_label == DEFERRED_DEFAULT_RUN_LABEL:
+        fail(
+            f"{run_label} is disabled until the default-promotion product "
+            "revision is committed and pinned"
         )
 
 

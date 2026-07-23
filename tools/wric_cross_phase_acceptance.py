@@ -29,7 +29,7 @@ import wric_benchmark_capture as capture_contract
 
 
 SCHEMA = "wric.cross_phase_acceptance"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 UINT_RE = re.compile(r"^(0|[1-9][0-9]*)$")
 UINT64_MAX = (1 << 64) - 1
@@ -58,6 +58,13 @@ PHASE8_RETRY1_PRODUCT_REVISION = (
     "07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c"
 )
 PHASE8_AFFINITY = "0,2,4,6,8,10,12,14"
+PHASE6_HISTORICAL_RUN_LABEL = "phase6"
+PHASE6_ACCEPTANCE_PRODUCT_REVISION = capture_contract.CURRENT_PRODUCT_REVISION
+PHASE6_ACCEPTANCE_SOURCES: Mapping[int, str] = {
+    1: "final-phase6-exact1",
+    4: "final-scaling",
+    16: "final-stress",
+}
 PHASE8_METADATA_NAME = "wric-benchmark-run-metadata.json"
 GENERIC_LEDGER_NAME = "wric-evidence-run-ledger.tsv"
 GENERIC_LEDGER_SEAL_NAME = GENERIC_LEDGER_NAME + ".sha256"
@@ -74,13 +81,13 @@ RUN_LABELS = (
     "phase3",
     "phase4",
     "phase5",
-    "phase6",
     "phase7-high",
     "phase7-small",
     "phase7-auto",
     "phase8-generation",
     "phase8-generation-retry1",
     "phase8-end-to-end",
+    "final-phase6-exact1",
     "final-scaling",
     "final-primary",
     "final-smt",
@@ -3508,6 +3515,23 @@ def evaluate(
 ) -> dict[str, object]:
     if evaluation_mode not in EVALUATION_MODES:
         raise AcceptanceError(f"unsupported evaluation mode {evaluation_mode!r}")
+    phase6_source_labels = set(PHASE6_ACCEPTANCE_SOURCES.values())
+    if (
+        set(PHASE6_ACCEPTANCE_SOURCES) != {1, 4, 16}
+        or len(phase6_source_labels) != len(PHASE6_ACCEPTANCE_SOURCES)
+        or {
+            label: capture_contract.CURRENT_PRODUCT_RUN_REVISIONS.get(label)
+            for label in phase6_source_labels
+        }
+        != {
+            label: PHASE6_ACCEPTANCE_PRODUCT_REVISION
+            for label in phase6_source_labels
+        }
+    ):
+        raise AcceptanceError(
+            "internal Phase-6 acceptance sources are not uniquely bound to "
+            "the immutable current product"
+        )
     scoped_run_labels = tuple(
         label
         for label in RUN_LABELS
@@ -3557,17 +3581,14 @@ def evaluate(
             (METHOD_SAMPLED, METHOD_EXACT, METHOD_HYBRID),
         ),
     }
-    phase6_ids = {
-        row_id
-        for matrix in phase6_matrices.values()
-        for row_id in matrix.values()
+    phase6_ids_by_top_k = {
+        top_k: set(matrix.values()) for top_k, matrix in phase6_matrices.items()
     }
     runs["phase1"].required_rows(phase1_ids, 5, base)
     runs["phase2"].required_rows(phase2_ids, 5, base)
     runs["phase3"].required_rows(phase3_ids, 5, base)
     runs["phase4"].required_rows(phase4_ids, 5, base)
     runs["phase5"].required_rows(phase5_ids, 5, base)
-    runs["phase6"].required_rows(phase6_ids, 3, base)
 
     high_prefix = "phase7-lazy-high-compression"
     dense_prefix = "phase7-lazy-dense-favoring"
@@ -3583,6 +3604,10 @@ def evaluate(
     runs["phase8-generation-retry1"].required_rows(phase8_ids, 5, base)
     runs["phase8-end-to-end"].required_rows(phase8_ids, 5, base)
 
+    final_phase6_exact1 = phase6_ids_by_top_k[1]
+    runs["final-phase6-exact1"].required_rows(
+        final_phase6_exact1, 3, base
+    )
     final_scaling = base.group("p0-primary-physical", {"1", "2", "4", "8"})
     runs["final-scaling"].required_rows(final_scaling, 3, base)
     final_primary = base.group("p0-primary-physical", {"1", "8"})
@@ -3597,7 +3622,9 @@ def evaluate(
     final_default = base.group(unpinned_group, {"auto", "default"})
     if evaluation_mode == "final":
         runs["final-default-auto"].required_rows(final_default, 5, base)
-    final_stress = base.group("p0-stress-physical", {"1", "8"})
+    final_stress = base.group(
+        "p0-stress-physical", {"1", "2", "4", "8"}
+    )
     runs["final-stress"].required_rows(final_stress, 3, base)
     final_real = base.group("real-bounded", {"1", "8"})
     runs["final-real"].required_rows(final_real, 3, base)
@@ -3612,7 +3639,7 @@ def evaluate(
             f"phase6 TopK{top_k}",
         )
     strict_work_by_label = {
-        "phase6": phase6_ids,
+        "final-phase6-exact1": final_phase6_exact1,
         "final-scaling": final_scaling,
         "final-primary": final_primary,
         "final-smt": final_smt,
@@ -3620,6 +3647,13 @@ def evaluate(
         "final-default-auto": final_default,
         "final-stress": final_stress,
     }
+    require_manifest_work_contract(
+        base,
+        final_phase6_exact1,
+        1,
+        1,
+        "final-phase6-exact1",
+    )
     for label in (
         "final-scaling",
         "final-primary",
@@ -3639,13 +3673,13 @@ def evaluate(
         "phase3": phase3_ids,
         "phase4": phase4_ids,
         "phase5": phase5_ids,
-        "phase6": phase6_ids,
         "phase7-high": high_ids,
         "phase7-small": small_ids,
         "phase7-auto": medium_ids | dense_ids,
         "phase8-generation": phase8_ids,
         "phase8-generation-retry1": phase8_ids,
         "phase8-end-to-end": phase8_ids,
+        "final-phase6-exact1": final_phase6_exact1,
         "final-scaling": final_scaling,
         "final-primary": final_primary,
         "final-smt": final_smt,
@@ -3748,10 +3782,15 @@ def evaluate(
     gates.condition("phase5_w8_under_180s", max_decimal(runs["phase5"], p5_w8, 5, "wall_clock_s") < 180, "a W8 trial reached 180 seconds")
     rss_pair(gates, "phase5", runs["phase5"], p5_w1, p5_w8, 5, global_rss_cap_kb)
 
-    # Phase 6 semantic matrices, concurrent-memory admission, exact speed,
-    # repeated-W8 identity, and paired RSS.
-    phase6 = runs["phase6"]
+    # Phase 6 is accepted only from the immutable current product.  The 870c
+    # historical label is a retained diagnostic and is intentionally absent
+    # from accepting evaluator inputs.
+    phase6_sources = {
+        top_k: runs[label]
+        for top_k, label in PHASE6_ACCEPTANCE_SOURCES.items()
+    }
     for top_k, matrix in phase6_matrices.items():
+        phase6 = phase6_sources[top_k]
         for method in sorted({key[0] for key in matrix}):
             method_name = method.removeprefix("chart_spr_")
             matrix_ids = tuple(matrix[(method, worker)] for worker in (1, 2, 4, 8))
@@ -3804,10 +3843,11 @@ def evaluate(
                         )
 
     k4_grammar = phase6_matrices[4]
+    phase6_topk4 = phase6_sources[4]
     k4_w1 = k4_grammar[(METHOD_EXACT, 1)]
     k4_w8 = k4_grammar[(METHOD_EXACT, 8)]
     for worker, row_id in ((1, k4_w1), (8, k4_w8)):
-        for row in phase6.selected(row_id, 3):
+        for row in phase6_topk4.selected(row_id, 3):
             where = f"phase6 TopK4 W{worker} trial {row['trial_index']}"
             if uint(row["exact_verifications"], f"{where} exact verifications") != 4:
                 raise AcceptanceError(f"{where}: exact verification count is not 4")
@@ -3846,8 +3886,8 @@ def evaluate(
                 )
     gates.ratio(
         "phase6_topk4_exact_verification_w8_over_w1",
-        med(phase6, k4_w8, 3, "exact_verification_ms"),
-        med(phase6, k4_w1, 3, "exact_verification_ms"),
+        med(phase6_topk4, k4_w8, 3, "exact_verification_ms"),
+        med(phase6_topk4, k4_w1, 3, "exact_verification_ms"),
         Decimal("0.50"),
     )
     gates.condition(
@@ -3856,8 +3896,9 @@ def evaluate(
         "candidate-parallel scheduler evidence is incomplete",
     )
 
+    phase6_topk16 = phase6_sources[16]
     for row_id in phase6_matrices[16].values():
-        for row in phase6.selected(row_id, 3):
+        for row in phase6_topk16.selected(row_id, 3):
             where = f"phase6 TopK16 {row_id} trial {row['trial_index']}"
             uint(row["exact_verifications"], f"{where} exact verifications", positive=True)
             uint(
@@ -4270,6 +4311,15 @@ def evaluate(
         "run_labels": list(scoped_run_labels),
         "all_run_labels": list(RUN_LABELS),
         "global_rss_cap_kb": global_rss_cap_kb,
+        "phase6_acceptance_sources": {
+            "historical_run_label": PHASE6_HISTORICAL_RUN_LABEL,
+            "historical_disposition": "diagnostic_not_an_acceptance_input",
+            "required_product_revision": PHASE6_ACCEPTANCE_PRODUCT_REVISION,
+            "top_k": {
+                str(top_k): PHASE6_ACCEPTANCE_SOURCES[top_k]
+                for top_k in sorted(PHASE6_ACCEPTANCE_SOURCES)
+            },
+        },
         "gates": gates.items,
         "phase8_generation_attempts": phase8_generation_attempts,
         "phase8_capture_audits": {

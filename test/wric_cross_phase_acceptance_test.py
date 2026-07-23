@@ -1196,7 +1196,7 @@ class SyntheticEvidence:
                        times={cross.MEDIUM_EXACT.format(1): "100", cross.MEDIUM_EXACT.format(8): "100"},
                        row_overrides={cross.MEDIUM_EXACT.format(1): {"exact_initialization_ms": "50", "exact_verification_ms": "50"}, cross.MEDIUM_EXACT.format(8): {"exact_initialization_ms": "20", "exact_verification_ms": "20"}})
 
-        phase6_ids = {
+        historical_phase6_ids = {
             cross.MEDIUM_EXACT.format(worker) for worker in (1, 2, 4, 8)
         } | {
             row_id
@@ -1204,12 +1204,12 @@ class SyntheticEvidence:
             if row["run_group"] in ("p0-primary-physical", "p0-stress-physical")
             and row["method"] != cross.METHOD_NATIVE
         }
-        phase6_overrides: dict[str, dict[str, str]] = {}
-        for row_id in phase6_ids:
+        historical_phase6_overrides: dict[str, dict[str, str]] = {}
+        for row_id in historical_phase6_ids:
             row = self.manifest_rows[row_id]
             if row["run_group"] == "p0-primary-physical" and row["method"] == cross.METHOD_EXACT:
                 phase6_worker = int(cross.manifest_worker(row))
-                phase6_overrides[row_id] = {
+                historical_phase6_overrides[row_id] = {
                     "exact_verification_ms": {
                         1: "100",
                         2: "80",
@@ -1218,7 +1218,10 @@ class SyntheticEvidence:
                     }[phase6_worker]
                 }
         self.write_raw(
-            "phase6", phase6_ids, 3, row_overrides=phase6_overrides
+            "phase6",
+            historical_phase6_ids,
+            3,
+            row_overrides=historical_phase6_overrides,
         )
 
         high = {f"phase7-lazy-high-compression-{p}-w{w}" for p in ("off", "on", "auto") for w in (1, 8)}
@@ -1247,6 +1250,15 @@ class SyntheticEvidence:
         self.write_raw("phase8-end-to-end", p8, 5, times={rid: "1" for rid in p8})
         for label in cross.PHASE8_CAPTURE_LABELS:
             self.refresh_phase8_capture(label)
+
+        final_phase6_exact1 = {
+            cross.MEDIUM_EXACT.format(worker) for worker in (1, 2, 4, 8)
+        }
+        self.write_raw(
+            "final-phase6-exact1",
+            final_phase6_exact1,
+            3,
+        )
 
         final_scaling = self._group(
             "p0-primary-physical", {"1", "2", "4", "8"}
@@ -1310,7 +1322,9 @@ class SyntheticEvidence:
             times={rid: "1" for rid in default},
         )
 
-        stress = self._group("p0-stress-physical", {"1", "8"})
+        stress = self._group(
+            "p0-stress-physical", {"1", "2", "4", "8"}
+        )
         stress_times, stress_overrides = {}, {}
         for rid in stress:
             stress_worker = cross.manifest_worker(self.manifest_rows[rid])
@@ -1959,6 +1973,24 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             self.assertEqual(payload["deferred_run_labels"], [])
             self.assertEqual(payload["run_labels"], list(cross.RUN_LABELS))
             self.assertEqual(payload["all_run_labels"], list(cross.RUN_LABELS))
+            self.assertNotIn(
+                cross.PHASE6_HISTORICAL_RUN_LABEL, payload["run_labels"]
+            )
+            self.assertEqual(
+                payload["phase6_acceptance_sources"],
+                {
+                    "historical_run_label": "phase6",
+                    "historical_disposition":
+                        "diagnostic_not_an_acceptance_input",
+                    "required_product_revision":
+                        cross.PHASE6_ACCEPTANCE_PRODUCT_REVISION,
+                    "top_k": {
+                        "1": "final-phase6-exact1",
+                        "4": "final-scaling",
+                        "16": "final-stress",
+                    },
+                },
+            )
             attempts = payload["phase8_generation_attempts"]
             self.assertEqual(list(attempts), list(cross.PHASE8_CAPTURE_LABELS))
             self.assertEqual(
@@ -2105,14 +2137,28 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="wric-cross-p6-matrix-") as name:
             data = SyntheticEvidence(Path(name))
             missing = cross.MEDIUM_EXACT.format(2)
-            data.remove_rows("phase6", lambda row: row["row_id"] == missing)
+            data.remove_rows(
+                "final-phase6-exact1",
+                lambda row: row["row_id"] == missing,
+            )
+            result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(missing, result.stderr)
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-p6-stress-matrix-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            missing = "p0-medium-stress128k16-grammar-exact-w2"
+            data.remove_rows(
+                "final-stress", lambda row: row["row_id"] == missing
+            )
             result = self.run_case(data)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(missing, result.stderr)
         with tempfile.TemporaryDirectory(prefix="wric-cross-p6-speed-") as name:
             data = SyntheticEvidence(Path(name))
             data.mutate(
-                "phase6",
+                "final-scaling",
                 lambda row: row["row_id"] == "p0-medium-primary32k4-grammar-exact-w8",
                 {"exact_verification_ms": "51"},
             )
@@ -2125,7 +2171,7 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="wric-cross-p6-axis-") as name:
             data = SyntheticEvidence(Path(name))
             data.mutate(
-                "phase6",
+                "final-scaling",
                 lambda row: row["row_id"] == "p0-medium-primary32k4-grammar-exact-w8",
                 {"exact_candidate_parallel_batches": "0"},
             )
@@ -2133,11 +2179,51 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("candidate-parallel path was not activated", result.stderr)
 
+    def test_historical_phase6_is_diagnostic_and_current_sources_are_pinned(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-p6-historical-diagnostic-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            data.mutate(
+                "phase6",
+                lambda row: True,
+                {
+                    "status": "failed_historical_diagnostic",
+                    "peak_sampled_rss_kb": "999999999",
+                },
+            )
+            command = data.command()
+            self.assertFalse(
+                any(
+                    argument.startswith("phase6=")
+                    for argument in command
+                )
+            )
+            result = self.run_case(data)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-p6-source-pin-"
+        ) as name:
+            data = SyntheticEvidence(Path(name))
+            with mock.patch.dict(
+                cross.capture_contract.CURRENT_PRODUCT_RUN_REVISIONS,
+                {"final-scaling": "0" * 40},
+            ):
+                result = self.run_case(data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "Phase-6 acceptance sources are not uniquely bound",
+                result.stderr,
+            )
+
     def test_phase6_admission_rss_and_repeat_gates_are_strict(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wric-cross-p6-admission-") as name:
             data = SyntheticEvidence(Path(name))
             data.mutate(
-                "phase6",
+                "final-stress",
                 lambda row: row["row_id"] == "p0-medium-stress128k16-grammar-exact-w8"
                 and row["trial_index"] == "1",
                 {
@@ -2152,7 +2238,7 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="wric-cross-p6-rss-") as name:
             data = SyntheticEvidence(Path(name))
             data.mutate(
-                "phase6",
+                "final-stress",
                 lambda row: row["row_id"] == "p0-medium-stress128k16-grammar-exact-w8",
                 {"peak_sampled_rss_kb": "210001"},
             )
@@ -2163,7 +2249,7 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             data = SyntheticEvidence(Path(name))
             changed = digest("changed repeated W8 canonical result")
             data.mutate(
-                "phase6",
+                "final-scaling",
                 lambda row: row["row_id"] == "p0-medium-primary32k4-grammar-exact-w8"
                 and row["trial_index"] == "2",
                 {
@@ -2179,14 +2265,14 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
         cases = (
             (
                 "phase6-topk1-candidates",
-                "phase6",
+                "final-phase6-exact1",
                 cross.MEDIUM_EXACT.format(1),
                 {"candidates_scored": "0"},
                 "iterations*chart_max_candidates=1",
             ),
             (
                 "phase6-topk4-exact",
-                "phase6",
+                "final-scaling",
                 "p0-medium-primary32k4-grammar-exact-w1",
                 {
                     "exact_verifications": "3",
@@ -2196,7 +2282,7 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             ),
             (
                 "phase6-topk16-exact",
-                "phase6",
+                "final-stress",
                 "p0-medium-stress128k16-grammar-exact-w1",
                 {
                     "exact_verifications": "47",
@@ -2258,7 +2344,7 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="wric-cross-projection-") as name:
             data = SyntheticEvidence(Path(name))
             data.mutate(
-                "phase6",
+                "final-stress",
                 lambda row: (
                     row["row_id"]
                     == "p0-medium-stress128k16-grammar-exact-w8"
@@ -3238,7 +3324,7 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="wric-cross-phase6-schema-") as name:
             data = SyntheticEvidence(Path(name))
             field = "exact_candidate_admission_batches"
-            data.remove_column("phase6", field)
+            data.remove_column("final-stress", field)
             result = self.run_case(data)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(field, result.stderr)

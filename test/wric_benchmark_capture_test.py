@@ -276,9 +276,19 @@ class Fixture:
         copied_controller = tools / TOOL.name
         controller_text = copied_controller.read_text(encoding="utf-8")
         live_affinity = capture_tool.canonical_affinity(set(os.sched_getaffinity(0)))
+        current_revision_line = (
+            f'CURRENT_PRODUCT_REVISION = "{capture_tool.CURRENT_PRODUCT_REVISION}"'
+        )
+        if controller_text.count(current_revision_line) != 1:
+            raise AssertionError(
+                "copied controller current-product pin is not unique"
+            )
         copied_controller.write_text(
             controller_text.replace(
                 'SMT_AFFINITY = "0-15"', f'SMT_AFFINITY = "{live_affinity}"'
+            ).replace(
+                current_revision_line,
+                f'CURRENT_PRODUCT_REVISION = "{self.product_revision}"',
             ),
             encoding="utf-8",
         )
@@ -897,8 +907,26 @@ class Phase9Fixture(Fixture):
 
     def set_extra_inner(self) -> None:
         self._write_phase9_harness(extra_inner=True)
+        previous_revision = self.product_revision
         self.product_revision = commit_all(self.product, "fake extra inner output")
         self.harness_sha256 = sha256_file(self.harness)
+        wrapper = self.controller / "tools" / TOOL.name
+        text = wrapper.read_text(encoding="utf-8")
+        old_pin = f'CURRENT_PRODUCT_REVISION = "{previous_revision}"'
+        if text.count(old_pin) != 1:
+            raise AssertionError(
+                "Phase9 fixture current-product pin is not unique"
+            )
+        wrapper.write_text(
+            text.replace(
+                old_pin,
+                f'CURRENT_PRODUCT_REVISION = "{self.product_revision}"',
+            ),
+            encoding="utf-8",
+        )
+        self.controller_revision = commit_all(
+            self.controller, "retarget fake current product"
+        )
 
     def harness_arguments(self, capture: Path, extra: Sequence[str] = ()) -> list[str]:
         if extra:
@@ -1204,7 +1232,10 @@ class BenchmarkCaptureTest(unittest.TestCase):
         command[revision_index] = "0" * 40
         wrong_revision = self.fixture.run(command)
         self.assertEqual(wrong_revision.returncode, 2)
-        self.assertIn("path/revision differs from external expectation", wrong_revision.stderr)
+        self.assertIn(
+            "requires exact current-product revision",
+            wrong_revision.stderr,
+        )
 
         with (self.fixture.product / "build/bin/dagutil").open("a", encoding="utf-8") as stream:
             stream.write("# drift\n")
@@ -1753,7 +1784,11 @@ class BenchmarkCaptureTest(unittest.TestCase):
             ):
                 capture_tool.host_topology_observation()
 
-    def test_historical_run_labels_require_their_exact_product_revision(self) -> None:
+    def test_pinned_run_labels_require_their_exact_product_revision(self) -> None:
+        self.assertEqual(
+            capture_tool.HISTORICAL_RUN_REVISIONS["phase6"],
+            "870c298ff1c0c21901bdf79d341bf97d121f389c",
+        )
         self.assertEqual(
             capture_tool.HISTORICAL_RUN_REVISIONS["phase8-generation"],
             "94a63238d25a8e3262428419d53f8f0986e8879b",
@@ -1796,7 +1831,71 @@ class BenchmarkCaptureTest(unittest.TestCase):
                     "requires exact historical product revision",
                 ):
                     capture_tool.require_run_revision(label, "0" * 40)
-        capture_tool.require_run_revision("final-small-auto", "0" * 40)
+        expected_current = {
+            "final-phase6-exact1",
+            "final-scaling",
+            "final-primary",
+            "final-smt",
+            "final-small-auto",
+            "final-unpinned-auto",
+            "final-stress",
+            "final-real",
+            "phase9",
+        }
+        self.assertEqual(
+            set(capture_tool.CURRENT_PRODUCT_RUN_REVISIONS),
+            expected_current,
+        )
+        for label in sorted(expected_current):
+            with self.subTest(current_product_label=label):
+                self.assertEqual(
+                    capture_tool.CURRENT_PRODUCT_RUN_REVISIONS[label],
+                    capture_tool.CURRENT_PRODUCT_REVISION,
+                )
+                capture_tool.require_run_revision(
+                    label, capture_tool.CURRENT_PRODUCT_REVISION
+                )
+                with self.assertRaisesRegex(
+                    capture_tool.CaptureError,
+                    "requires exact current-product revision",
+                ):
+                    capture_tool.require_run_revision(label, "0" * 40)
+
+        self.assertNotIn(
+            "final-default-auto",
+            capture_tool.CURRENT_PRODUCT_RUN_REVISIONS,
+        )
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError,
+            "disabled until the default-promotion product revision",
+        ):
+            capture_tool.require_run_revision("final-default-auto", "0" * 40)
+
+    def test_current_phase6_capture_components_are_exact(self) -> None:
+        self.assertEqual(
+            capture_tool.RUN_COMPONENTS["final-phase6-exact1"],
+            (
+                capture_tool.component(
+                    "p0-medium-exact1-physical", "1,2,4,8", "3"
+                ),
+            ),
+        )
+        self.assertEqual(
+            capture_tool.RUN_COMPONENTS["final-scaling"],
+            (
+                capture_tool.component(
+                    "p0-primary-physical", "1,2,4,8", "3"
+                ),
+            ),
+        )
+        self.assertEqual(
+            capture_tool.RUN_COMPONENTS["final-stress"],
+            (
+                capture_tool.component(
+                    "p0-stress-physical", "1,2,4,8", "3"
+                ),
+            ),
+        )
 
     def test_phase8_generation_retry1_component_is_exact_and_fail_closed(self) -> None:
         attempt_label = "phase8-generation"
