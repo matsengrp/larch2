@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import subprocess
@@ -311,9 +312,604 @@ class Phase4AcceptanceTest(unittest.TestCase):
     def make_phase3(self, local_ms: str = "100") -> Path:
         baseline_root = self.root / "phase3"
         baseline = Dataset(baseline_root, repetitions=self.data.repetitions)
+        current = self.data.matching("local", 1)[0]
+        for row in baseline.rows:
+            for field in (
+                "input_sha256",
+                "refseq_sha256",
+                "search_semantic_sha256",
+                "output_semantic_sha256",
+            ):
+                row[field] = current[field]
         baseline.set_timing("local", 1, "local_scoring_ms", local_ms)
         baseline.write()
         return baseline.raw
+
+    @staticmethod
+    def file_hash(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    @staticmethod
+    def write_tsv(
+        path: Path, fields: tuple[str, ...], rows: list[dict[str, object]]
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=fields, delimiter="\t", lineterminator="\n"
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def rewrite_receipt(self, path: Path, receipt: dict[str, Any]) -> str:
+        path.write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return self.file_hash(path)
+
+    def receipt_arguments(
+        self, receipt: Path, receipt_hash: str, revision: str, dagutil_hash: str
+    ) -> list[str]:
+        return [
+            "--contention-investigation-receipt",
+            str(receipt),
+            "--expected-contention-investigation-receipt-sha256",
+            receipt_hash,
+            "--expected-contention-product-revision",
+            revision,
+            "--expected-contention-dagutil-sha256",
+            dagutil_hash,
+        ]
+
+    def make_contention_receipt(
+        self,
+        baseline: Path,
+        *,
+        completion_marker_bytes: bytes = b"complete\n",
+        fixed_control_violations: int = 8,
+        metrics_mismatch: bool = False,
+        preflight_mode: str = "valid",
+        provenance_mismatch: bool = False,
+    ) -> tuple[Path, dict[str, Any], str, str, str]:
+        profile_root = self.root / "contention-profile"
+        profile_root.mkdir(exist_ok=True)
+
+        def artifact(relative: str, contents: bytes) -> dict[str, str]:
+            path = profile_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
+            return {"path": relative, "sha256": self.file_hash(path)}
+
+        product_root = self.root / "product"
+        product_root.mkdir(exist_ok=True)
+        dagutil = product_root / "dagutil"
+        dagutil.write_bytes(b"synthetic dagutil\n")
+        input_path = product_root / "input.pb.gz"
+        input_path.write_bytes(b"synthetic input\n")
+        refseq_path = product_root / "refseq.txt.gz"
+        refseq_path.write_bytes(b"synthetic refseq\n")
+        metrics_path = product_root / "wric-process-metrics"
+        metrics_path.write_bytes(b"synthetic process metrics\n")
+        input_hash = self.file_hash(input_path)
+        refseq_hash = self.file_hash(refseq_path)
+        dagutil_hash = self.file_hash(dagutil)
+        metrics_hash = self.file_hash(metrics_path)
+        revision = "a" * 40
+
+        for row in self.data.rows:
+            row["input_sha256"] = input_hash
+            row["refseq_sha256"] = refseq_hash
+        self.data.write()
+
+        with baseline.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            baseline_fields = list(reader.fieldnames or [])
+            baseline_rows = list(reader)
+        for row in baseline_rows:
+            row["input_sha256"] = input_hash
+            row["refseq_sha256"] = refseq_hash
+        with baseline.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=baseline_fields,
+                delimiter="\t",
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerows(baseline_rows)
+
+        raw_metadata = self.root / "wric-benchmark-run-metadata.json"
+        raw_metadata.write_text("{}\n", encoding="utf-8")
+        raw_ledger = self.root / "wric-evidence-run-ledger.tsv"
+        raw_ledger.write_text("path\tsha256\n", encoding="utf-8")
+        baseline_metadata = baseline.parent / "wric-benchmark-run-metadata.json"
+        baseline_metadata.write_text("{}\n", encoding="utf-8")
+        baseline_ledger = baseline.parent / "wric-evidence-run-ledger.tsv"
+        baseline_ledger.write_text("path\tsha256\n", encoding="utf-8")
+
+        timing_fields = (
+            "role",
+            "worker",
+            "repetition",
+            "user_s",
+            "system_s",
+            "wall_s",
+            "peak_sampled_rss_kb",
+            "semantic_sha256",
+            "canonical_sha256",
+            "metrics_sha256",
+            "stdout_sha256",
+            "stderr_sha256",
+            "output_mode",
+            "output_sha256",
+        )
+
+        native_groups = (
+            ("cache", 1),
+            ("cache", 2),
+            ("cache", 4),
+            ("cache", 8),
+            ("dense", 1),
+            ("dense", 2),
+            ("dense", 4),
+            ("dense", 8),
+        )
+        devnull_groups = (
+            ("cache", 1),
+            ("cache", 8),
+            ("dense", 1),
+            ("dense", 8),
+            ("fixed", 1),
+        )
+        native_path = profile_root / "native/times.tsv"
+        devnull_path = profile_root / "devnull/times.tsv"
+        profile_semantics = {
+            "cache": self.data.matching("construction")[0][
+                "search_semantic_sha256"
+            ],
+            "dense": self.data.matching("local")[0]["search_semantic_sha256"],
+            "fixed": self.data.matching("local")[0]["output_semantic_sha256"],
+        }
+        canonical_contents = {
+            role: (json.dumps({"role": role}, sort_keys=True) + "\n").encode()
+            for role in ("cache", "dense", "fixed")
+        }
+        profile_canonicals = {
+            role: hashlib.sha256(contents).hexdigest()
+            for role, contents in canonical_contents.items()
+        }
+        violation_counts = {
+            "native": {
+                ("cache", 1): 7,
+                ("cache", 2): 3,
+                ("cache", 4): 5,
+                ("cache", 8): 7,
+                ("dense", 1): 2,
+                ("dense", 2): 4,
+                ("dense", 4): 4,
+                ("dense", 8): 6,
+            },
+            "devnull": {
+                ("cache", 1): 4,
+                ("cache", 8): 4,
+                ("dense", 1): 5,
+                ("dense", 8): 4,
+                ("fixed", 1): fixed_control_violations,
+            },
+        }
+
+        def timing_rows(
+            directory: str, groups: tuple[tuple[str, int], ...]
+        ) -> list[dict[str, object]]:
+            rows = []
+            for role, worker in groups:
+                for repetition in range(1, 11):
+                    stem = f"{role}-w{worker}-r{repetition}"
+                    root = profile_root / directory
+                    root.mkdir(parents=True, exist_ok=True)
+                    user_s = "4"
+                    system_s = (
+                        "2"
+                        if repetition <= violation_counts[directory][(role, worker)]
+                        else "1"
+                    )
+                    metrics_values = [
+                        ("schema_version", "2"),
+                        ("outcome", "exited"),
+                        ("exit_code", "0"),
+                        ("term_signal", "0"),
+                        ("timed_out", "0"),
+                        ("runner_exit_code", "0"),
+                        ("wall_seconds", "5"),
+                        (
+                            "user_seconds",
+                            (
+                                "9"
+                                if metrics_mismatch
+                                and directory == "native"
+                                and role == "cache"
+                                and worker == 1
+                                and repetition == 1
+                                else user_s
+                            ),
+                        ),
+                        ("system_seconds", system_s),
+                        ("max_rss_kb", "900"),
+                        ("peak_sampled_rss_kb", "1000"),
+                        ("peak_sampled_swap_kb", "0"),
+                        ("rss_kb_unit", "1024_bytes"),
+                        ("proc_status_samples", "2"),
+                        ("proc_rss_samples", "2"),
+                        ("proc_swap_samples", "2"),
+                        ("proc_group_samples", "3"),
+                        ("peak_sampled_process_count", "1"),
+                        ("subreaper_enabled", "1"),
+                        ("descendants_reaped", "0"),
+                        ("post_leader_descendants", "0"),
+                        ("descendant_cleanup_kill_sent", "0"),
+                        ("live_descendants_at_return", "0"),
+                        ("process_group_alive_at_return", "0"),
+                        ("wait4_echild_at_return", "1"),
+                        ("monitor_error", "0"),
+                        ("monitor_error_count", "0"),
+                        ("wait4_collected", "1"),
+                        ("wait_errno", "0"),
+                        ("child_error_stage", "none"),
+                        ("child_error_errno", "0"),
+                        ("core_dumped", "0"),
+                        ("timeout_term_sent", "0"),
+                        ("timeout_kill_sent", "0"),
+                        ("rss_limit_bytes", "17179869184"),
+                        ("rss_limit_enabled", "1"),
+                        ("rss_limit_observed", "0"),
+                        ("rss_limit_exceeded", "0"),
+                        ("rss_limit_trigger_bytes", "0"),
+                        ("rss_limit_term_sent", "0"),
+                        ("rss_limit_kill_sent", "0"),
+                    ]
+                    per_run = {
+                        "canonical.json": canonical_contents[role],
+                        "metrics": (
+                            "".join(
+                                f"{key}={value}\n" for key, value in metrics_values
+                            )
+                        ).encode(),
+                        "stdout": f"{stem} stdout\n".encode(),
+                        "stderr": b"",
+                    }
+                    hashes = {}
+                    for suffix, contents in per_run.items():
+                        path = root / f"{stem}.{suffix}"
+                        path.write_bytes(contents)
+                        hashes[suffix] = self.file_hash(path)
+                    output_hash = "-"
+                    output_mode = "no_output" if role == "fixed" else "devnull"
+                    if directory == "native":
+                        output = root / f"{stem}.pb.gz"
+                        output.write_bytes(f"{stem} output\n".encode())
+                        output_hash = self.file_hash(output)
+                        output_mode = "file"
+                    rows.append(
+                        {
+                            "role": role,
+                            "worker": worker,
+                            "repetition": repetition,
+                            "user_s": user_s,
+                            "system_s": system_s,
+                            "wall_s": "5",
+                            "peak_sampled_rss_kb": "1000",
+                            "semantic_sha256": profile_semantics[role],
+                            "canonical_sha256": hashes["canonical.json"],
+                            "metrics_sha256": hashes["metrics"],
+                            "stdout_sha256": hashes["stdout"],
+                            "stderr_sha256": hashes["stderr"],
+                            "output_mode": output_mode,
+                            "output_sha256": output_hash,
+                        }
+                    )
+            return rows
+
+        self.write_tsv(
+            native_path, timing_fields, timing_rows("native", native_groups)
+        )
+        self.write_tsv(
+            devnull_path, timing_fields, timing_rows("devnull", devnull_groups)
+        )
+
+        summary_fields = (
+            "role",
+            "worker",
+            "semantic_sha256",
+            "canonical_sha256",
+            "output_sha256",
+            "stdout_sha256",
+            "stderr_sha256",
+            "profile_sha256",
+            "log_sha256",
+            "annotation_sha256",
+            "instructions",
+            "syscall_count",
+            "system_time_ns",
+            "system_cpu_time_ns",
+        )
+        callgrind_runs: list[dict[str, object]] = []
+        summary_rows: list[dict[str, object]] = []
+        for role, worker in (("dense", 8), ("cache", 8), ("fixed", 1)):
+            profile_path = profile_root / "callgrind" / f"{role}-w{worker}.callgrind"
+            profile_path.parent.mkdir(parents=True, exist_ok=True)
+            profile_path.write_text(f"{role} {worker}\n", encoding="utf-8")
+            profile_hash = self.file_hash(profile_path)
+            row = {
+                "role": role,
+                "worker": worker,
+                "semantic_sha256": profile_semantics[role],
+                "canonical_sha256": profile_canonicals[role],
+                "output_sha256": "9" * 64,
+                "stdout_sha256": "a" * 64,
+                "stderr_sha256": "b" * 64,
+                "profile_sha256": profile_hash,
+                "log_sha256": "c" * 64,
+                "annotation_sha256": "d" * 64,
+                "instructions": "1",
+                "syscall_count": "2",
+                "system_time_ns": "3",
+                "system_cpu_time_ns": "4",
+            }
+            summary_rows.append(row)
+            callgrind_runs.append(
+                {
+                    "canonical_sha256": row["canonical_sha256"],
+                    "profile_sha256": profile_hash,
+                    "role": role,
+                    "semantic_sha256": row["semantic_sha256"],
+                    "syscall_count": 2,
+                    "system_cpu_time_ns": 4,
+                    "system_time_ns": 3,
+                    "worker": worker,
+                }
+            )
+        summary_path = profile_root / "callgrind/summary.tsv"
+        self.write_tsv(summary_path, summary_fields, summary_rows)
+
+        def group_summaries(
+            directory: str, groups: tuple[tuple[str, int], ...]
+        ) -> list[dict[str, object]]:
+            return [
+                {
+                    "role": role,
+                    "rows": 10,
+                    "violations": violation_counts[directory][(role, worker)],
+                    "worker": worker,
+                }
+                for role, worker in groups
+            ]
+
+        runner = artifact("profile-controller.sh", b"#!/bin/sh\nexit 0\n")
+        provenance_values = [
+            ("schema", "wric.phase4.contention_profile_provenance"),
+            ("schema_version", "1"),
+            ("controller_sha256", runner["sha256"]),
+            (
+                "product_revision",
+                "c" * 40 if provenance_mismatch else revision,
+            ),
+            ("product_tree", "b" * 40),
+            ("dagutil_sha256", dagutil_hash),
+            ("input_sha256", input_hash),
+            ("refseq_sha256", refseq_hash),
+            ("process_metrics_sha256", metrics_hash),
+            (
+                "valgrind_sha256",
+                "9e8422466bd87902983118bb7bc51e67679b0bbaa09788f7d6b2aa0af40406b3",
+            ),
+            (
+                "callgrind_annotate_sha256",
+                "8716f89225e5c49615788f9d04779a92fb20928626ba13cf25045697d40e5e4d",
+            ),
+            ("valgrind_version", "valgrind-3.27.1"),
+            ("kernel", "synthetic-kernel"),
+            ("affinity", "0,2,4,6,8,10,12,14"),
+            (
+                "environment",
+                "HOME=/nonexistent LANG=C LC_ALL=C PATH=/usr/bin:/bin "
+                "TMPDIR=/tmp TZ=Europe/Sofia",
+            ),
+            ("native_repetitions", "10"),
+            ("native_warmups_per_cell", "1"),
+            ("callgrind_interpretation", "qualitative_only"),
+        ]
+        provenance = artifact(
+            "provenance.txt",
+            "".join(f"{key}={value}\n" for key, value in provenance_values).encode(),
+        )
+        completion = artifact("profile-complete", completion_marker_bytes)
+        preflight_rows = 14 if preflight_mode == "short" else 15
+        preflight_text = (
+            "sample\tepoch\tload1\trunnable_processes\ttotal_processes\n"
+            + "".join(
+                f"{sample}\t{1000 + sample}.0\t"
+                f"{'2.0' if preflight_mode == 'busy' and sample == 1 else '0.5'}"
+                "\t1\t100\n"
+                for sample in range(1, preflight_rows + 1)
+            )
+        )
+        preflight = artifact("host-preflight.tsv", preflight_text.encode())
+        before = artifact("host-processes-before.txt", b"before\n")
+        after = artifact("host-processes-after.txt", b"after\n")
+        rationale = artifact("investigation.md", b"synthetic rationale\n")
+        builder = artifact("build-investigation-receipt.py", b"# synthetic\n")
+
+        raw_hash = self.file_hash(self.data.raw)
+        violations = []
+        for role, rows in (
+            ("construction", self.data.matching("construction")),
+            ("local", self.data.matching("local")),
+        ):
+            for row in rows:
+                if (
+                    acceptance.Decimal(row["system_cpu_s"])
+                    > acceptance.Decimal(row["user_cpu_s"])
+                    * acceptance.CONTENTION_LIMIT
+                ):
+                    violations.append(
+                        {
+                            "raw_trials_sha256": raw_hash,
+                            "role": role,
+                            "row_id": row["row_id"],
+                            "system_cpu_s": row["system_cpu_s"],
+                            "trial_index": int(row["trial_index"]),
+                            "user_cpu_s": row["user_cpu_s"],
+                            "worker": int(row["requested_workers"]),
+                        }
+                    )
+
+        def bound_file(path: Path) -> dict[str, str]:
+            return {"path": str(path.resolve()), "sha256": self.file_hash(path)}
+
+        workloads = []
+        for role, rows, prefix in (
+            (
+                "construction",
+                self.data.matching("construction"),
+                acceptance.DEFAULT_CONSTRUCTION_PREFIX,
+            ),
+            ("local", self.data.matching("local"), acceptance.DEFAULT_LOCAL_PREFIX),
+        ):
+            first = rows[0]
+            workloads.append(
+                {
+                    "fixture": first["fixture"],
+                    "input_sha256": first["input_sha256"],
+                    "method": first["method"],
+                    "output_semantic_sha256": first["output_semantic_sha256"],
+                    "refseq_sha256": first["refseq_sha256"],
+                    "role": role,
+                    "search_semantic_sha256": first["search_semantic_sha256"],
+                    "workers": [
+                        {
+                            "canonical_argv_sha256": self.data.matching(role, worker)[
+                                0
+                            ]["canonical_argv_sha256"],
+                            "row_id": f"{prefix}{worker}",
+                            "worker": worker,
+                        }
+                        for worker in acceptance.WORKERS
+                    ],
+                }
+            )
+
+        receipt: dict[str, Any] = {
+            "capture": {
+                "phase3_baseline": {
+                    **bound_file(baseline),
+                    "metadata": bound_file(baseline_metadata),
+                    "run_ledger": bound_file(baseline_ledger),
+                },
+                "raw_trials": [
+                    {
+                        **bound_file(self.data.raw),
+                        "metadata": bound_file(raw_metadata),
+                        "role": role,
+                        "run_ledger": bound_file(raw_ledger),
+                    }
+                    for role in ("construction", "local")
+                ],
+                "repetitions": self.data.repetitions,
+                "row_prefixes": {
+                    "construction": acceptance.DEFAULT_CONSTRUCTION_PREFIX,
+                    "local": acceptance.DEFAULT_LOCAL_PREFIX,
+                },
+            },
+            "disposition": "no_rollback_required_for_bound_capture",
+            "finding": {
+                "acceptance_timing_source": "bound_raw_trials_only",
+                "alternate_timing_waiver": False,
+                "classification": "short_run_fixed_overhead_and_parallel_contention_not_scaling_blocker",
+                "diagnostic_timings_used_for_acceptance": False,
+                "rationale": rationale,
+                "rollback_review": "completed",
+            },
+            "product": {
+                "dagutil": bound_file(dagutil),
+                "input": bound_file(input_path),
+                "process_metrics": bound_file(metrics_path),
+                "refseq": bound_file(refseq_path),
+                "revision": revision,
+                "tree": "b" * 40,
+            },
+            "profile": {
+                "affinity": "0,2,4,6,8,10,12,14",
+                "callgrind": {
+                    "artifact": {
+                        "path": "callgrind/summary.tsv",
+                        "sha256": self.file_hash(summary_path),
+                    },
+                    "interpretation": "qualitative_only",
+                    "profiler": {
+                        "binary_sha256": "9e8422466bd87902983118bb7bc51e67679b0bbaa09788f7d6b2aa0af40406b3",
+                        "kind": "callgrind_collect_systime_nsec",
+                        "version": "valgrind-3.27.1",
+                    },
+                    "runs": callgrind_runs,
+                },
+                "completion_marker": completion,
+                "devnull_and_fixed_controls": {
+                    "artifact": {
+                        "path": "devnull/times.tsv",
+                        "sha256": self.file_hash(devnull_path),
+                    },
+                    "group_violations": group_summaries(
+                        "devnull", devnull_groups
+                    ),
+                    "measured_repetitions_per_cell": 10,
+                    "rows": 50,
+                    "violations": sum(violation_counts["devnull"].values()),
+                    "warmups_per_cell": 1,
+                },
+                "environment": [
+                    "HOME=/nonexistent",
+                    "LANG=C",
+                    "LC_ALL=C",
+                    "PATH=/usr/bin:/bin",
+                    "TMPDIR=/tmp",
+                    "TZ=Europe/Sofia",
+                ],
+                "host_preflight": {
+                    "processes_after": after,
+                    "processes_before": before,
+                    "samples": 15,
+                    "times": preflight,
+                },
+                "native_rusage": {
+                    "artifact": {
+                        "path": "native/times.tsv",
+                        "sha256": self.file_hash(native_path),
+                    },
+                    "group_violations": group_summaries("native", native_groups),
+                    "measured_repetitions_per_cell": 10,
+                    "rows": 80,
+                    "violations": sum(violation_counts["native"].values()),
+                    "warmups_per_cell": 1,
+                },
+                "process_metrics_sha256": metrics_hash,
+                "provenance": provenance,
+                "runner": {"kind": "preserved_script", **runner},
+            },
+            "receipt_builder": builder,
+            "schema": "wric.phase4.contention_investigation",
+            "schema_version": 1,
+            "status": "complete",
+            "threshold": {
+                "comparison": "greater_than",
+                "limit": "0.25",
+                "metric": "system_cpu_s_over_user_cpu_s",
+            },
+            "violations": violations,
+            "workloads": workloads,
+        }
+        receipt_path = profile_root / "phase4-contention-investigation.json"
+        receipt_hash = self.rewrite_receipt(receipt_path, receipt)
+        return receipt_path, receipt, receipt_hash, revision, dagutil_hash
 
     def split_workloads(self) -> tuple[Dataset, Dataset]:
         local = Dataset(self.root / "local", repetitions=self.data.repetitions)
@@ -338,6 +934,9 @@ class Phase4AcceptanceTest(unittest.TestCase):
 
     def test_split_raw_inputs_bind_reports_to_each_owning_file(self) -> None:
         local, construction = self.split_workloads()
+        for row in construction.rows:
+            row["fixture"] = "cache-medium"
+        construction.write()
         result = self.assert_pass(raw_trials=[local.raw, construction.raw])
         expected = [str(local.raw.resolve()), str(construction.raw.resolve())]
         self.assertEqual(result["raw_trial_inputs"], expected)
@@ -347,6 +946,17 @@ class Phase4AcceptanceTest(unittest.TestCase):
         self.assertEqual(
             result["workloads"]["construction"]["source_raw_trials"],
             [expected[1]],
+        )
+
+    def test_split_matrices_still_require_the_same_input_identity(self) -> None:
+        local, construction = self.split_workloads()
+        for row in construction.rows:
+            row["fixture"] = "cache-medium"
+            row["input_sha256"] = "a" * 64
+        construction.write()
+        self.assert_failure(
+            "local/construction matrices differ in input_sha256",
+            raw_trials=[local.raw, construction.raw],
         )
 
     def test_duplicate_global_row_key_across_raw_inputs_fails(self) -> None:
@@ -517,6 +1127,314 @@ class Phase4AcceptanceTest(unittest.TestCase):
         row["system_cpu_s"] = "1.0001"
         result = self.assert_failure("system/user CPU ratio")
         self.assertEqual(result["status"], "profiling_required")
+
+    def test_exact_contention_receipt_continues_with_investigated_gate(self) -> None:
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        baseline = self.make_phase3()
+        receipt, _, receipt_hash, revision, dagutil_hash = (
+            self.make_contention_receipt(baseline)
+        )
+        result = self.assert_pass(
+            baseline=baseline,
+            defer=False,
+            extra=self.receipt_arguments(
+                receipt, receipt_hash, revision, dagutil_hash
+            ),
+        )
+        cpu_gate = next(
+            gate for gate in result["gates"] if gate["name"] == "system_over_user_cpu"
+        )
+        self.assertEqual(cpu_gate["status"], "investigated")
+        self.assertEqual(cpu_gate["violations"], 1)
+        self.assertEqual(
+            cpu_gate["disposition"], "no_rollback_required_for_bound_capture"
+        )
+
+    def test_contention_receipt_is_forbidden_without_violations(self) -> None:
+        baseline = self.make_phase3()
+        receipt, _, receipt_hash, revision, dagutil_hash = (
+            self.make_contention_receipt(baseline)
+        )
+        self.assert_failure(
+            "receipt is forbidden",
+            baseline=baseline,
+            defer=False,
+            extra=self.receipt_arguments(
+                receipt, receipt_hash, revision, dagutil_hash
+            ),
+        )
+
+    def test_contention_receipt_requires_exact_violation_set(self) -> None:
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        baseline = self.make_phase3()
+        receipt_path, receipt, _, revision, dagutil_hash = (
+            self.make_contention_receipt(baseline)
+        )
+        original = list(receipt["violations"])
+        for changed, label in (
+            ([], "missing"),
+            ([*original, dict(original[0])], "extra"),
+        ):
+            with self.subTest(label=label):
+                receipt["violations"] = changed
+                receipt_hash = self.rewrite_receipt(receipt_path, receipt)
+                self.assert_failure(
+                    "violation set does not exactly match",
+                    baseline=baseline,
+                    defer=False,
+                    extra=self.receipt_arguments(
+                        receipt_path, receipt_hash, revision, dagutil_hash
+                    ),
+                )
+        receipt["violations"] = original
+
+    def test_contention_receipt_detects_raw_product_and_profile_tamper(self) -> None:
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        baseline = self.make_phase3()
+        receipt_path, receipt, receipt_hash, revision, dagutil_hash = (
+            self.make_contention_receipt(baseline)
+        )
+        arguments = self.receipt_arguments(
+            receipt_path, receipt_hash, revision, dagutil_hash
+        )
+
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0002"
+        self.data.write()
+        self.assert_failure(
+            "violation set does not exactly match",
+            baseline=baseline,
+            defer=False,
+            extra=arguments,
+            write_data=False,
+        )
+
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        self.data.write()
+        dagutil = Path(receipt["product"]["dagutil"]["path"])
+        dagutil.write_bytes(b"tampered dagutil\n")
+        self.assert_failure(
+            "product.dagutil SHA-256",
+            baseline=baseline,
+            defer=False,
+            extra=arguments,
+            write_data=False,
+        )
+        dagutil.write_bytes(b"synthetic dagutil\n")
+
+        native = receipt_path.parent / receipt["profile"]["native_rusage"]["artifact"][
+            "path"
+        ]
+        native.write_text(
+            native.read_text(encoding="utf-8") + "tamper\n", encoding="utf-8"
+        )
+        self.assert_failure(
+            "profile.native_rusage.artifact SHA-256",
+            baseline=baseline,
+            defer=False,
+            extra=arguments,
+            write_data=False,
+        )
+
+    def test_contention_receipt_hash_and_canonical_json_are_enforced(self) -> None:
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        baseline = self.make_phase3()
+        receipt_path, receipt, receipt_hash, revision, dagutil_hash = (
+            self.make_contention_receipt(baseline)
+        )
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        self.assert_failure(
+            "receipt SHA-256",
+            baseline=baseline,
+            defer=False,
+            extra=self.receipt_arguments(
+                receipt_path, receipt_hash, revision, dagutil_hash
+            ),
+        )
+        noncanonical_hash = self.file_hash(receipt_path)
+        self.assert_failure(
+            "JSON is not in canonical sorted form",
+            baseline=baseline,
+            defer=False,
+            extra=self.receipt_arguments(
+                receipt_path, noncanonical_hash, revision, dagutil_hash
+            ),
+        )
+
+    def test_contention_receipt_product_and_argv_identity_are_stale_closed(self) -> None:
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        baseline = self.make_phase3()
+        receipt_path, receipt, receipt_hash, revision, dagutil_hash = (
+            self.make_contention_receipt(baseline)
+        )
+        self.assert_failure(
+            "product revision does not match expected",
+            baseline=baseline,
+            defer=False,
+            extra=self.receipt_arguments(
+                receipt_path, receipt_hash, "c" * 40, dagutil_hash
+            ),
+        )
+
+        receipt["workloads"][1]["workers"][3]["canonical_argv_sha256"] = "f" * 64
+        receipt_hash = self.rewrite_receipt(receipt_path, receipt)
+        self.assert_failure(
+            "workload/argv identity does not match",
+            baseline=baseline,
+            defer=False,
+            extra=self.receipt_arguments(
+                receipt_path, receipt_hash, revision, dagutil_hash
+            ),
+        )
+
+    def test_contention_profile_metrics_must_match_timing_rows(self) -> None:
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        baseline = self.make_phase3()
+        receipt, _, receipt_hash, revision, dagutil_hash = (
+            self.make_contention_receipt(baseline, metrics_mismatch=True)
+        )
+        self.assert_failure(
+            "user_seconds does not exactly match the timing TSV",
+            baseline=baseline,
+            defer=False,
+            extra=self.receipt_arguments(
+                receipt, receipt_hash, revision, dagutil_hash
+            ),
+        )
+
+    def test_contention_profile_provenance_must_match_receipt(self) -> None:
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        baseline = self.make_phase3()
+        receipt, _, receipt_hash, revision, dagutil_hash = (
+            self.make_contention_receipt(
+                baseline, provenance_mismatch=True
+            )
+        )
+        self.assert_failure(
+            "provenance product_revision does not match receipt",
+            baseline=baseline,
+            defer=False,
+            extra=self.receipt_arguments(
+                receipt, receipt_hash, revision, dagutil_hash
+            ),
+        )
+
+    def test_contention_profile_completion_marker_is_semantic(self) -> None:
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        baseline = self.make_phase3()
+        receipt, _, receipt_hash, revision, dagutil_hash = (
+            self.make_contention_receipt(
+                baseline, completion_marker_bytes=b"not complete\n"
+            )
+        )
+        self.assert_failure(
+            "completion_marker is not exactly",
+            baseline=baseline,
+            defer=False,
+            extra=self.receipt_arguments(
+                receipt, receipt_hash, revision, dagutil_hash
+            ),
+        )
+
+    def test_contention_profile_preflight_cardinality_and_quiescence(self) -> None:
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        baseline = self.make_phase3()
+        for mode, expected in (
+            ("short", "must contain 15 rows"),
+            ("busy", "host preflight is not quiescent"),
+        ):
+            with self.subTest(mode=mode):
+                receipt, _, receipt_hash, revision, dagutil_hash = (
+                    self.make_contention_receipt(
+                        baseline, preflight_mode=mode
+                    )
+                )
+                self.assert_failure(
+                    expected,
+                    baseline=baseline,
+                    defer=False,
+                    extra=self.receipt_arguments(
+                        receipt, receipt_hash, revision, dagutil_hash
+                    ),
+                )
+
+    def test_contention_profile_requires_fixed_control_breaches(self) -> None:
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        baseline = self.make_phase3()
+        receipt, _, receipt_hash, revision, dagutil_hash = (
+            self.make_contention_receipt(
+                baseline, fixed_control_violations=0
+            )
+        )
+        self.assert_failure(
+            "fixed W1 control must breach in exactly 8/10 trials",
+            baseline=baseline,
+            defer=False,
+            extra=self.receipt_arguments(
+                receipt, receipt_hash, revision, dagutil_hash
+            ),
+        )
+
+    def test_contention_receipt_cli_arguments_are_atomic(self) -> None:
+        completed, _ = self.run_tool(
+            extra=["--contention-investigation-receipt", str(self.root / "x.json")]
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(
+            "all four contention-investigation receipt/product arguments",
+            completed.stderr,
+        )
+
+    def test_inconclusive_or_rollback_contention_disposition_still_blocks(self) -> None:
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        baseline = self.make_phase3()
+        receipt_path, receipt, _, revision, dagutil_hash = (
+            self.make_contention_receipt(baseline)
+        )
+        for disposition in ("inconclusive", "rollback_required"):
+            with self.subTest(disposition=disposition):
+                receipt["disposition"] = disposition
+                receipt_hash = self.rewrite_receipt(receipt_path, receipt)
+                result = self.assert_failure(
+                    f"disposition is {disposition}",
+                    baseline=baseline,
+                    defer=False,
+                    extra=self.receipt_arguments(
+                        receipt_path, receipt_hash, revision, dagutil_hash
+                    ),
+                )
+                self.assertEqual(result["status"], "profiling_required")
+
+    def test_contention_receipt_does_not_waive_timing_or_rss_gates(self) -> None:
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        self.data.set_timing("local", 8, "local_scoring_ms", "50.001")
+        baseline = self.make_phase3()
+        receipt, _, receipt_hash, revision, dagutil_hash = (
+            self.make_contention_receipt(baseline)
+        )
+        self.assert_failure(
+            "local_w8_over_w1",
+            baseline=baseline,
+            defer=False,
+            extra=self.receipt_arguments(
+                receipt, receipt_hash, revision, dagutil_hash
+            ),
+        )
+
+        self.data = Dataset(self.root)
+        self.data.matching("local", 8)[0]["system_cpu_s"] = "1.0001"
+        self.data.set_rss("local", 8, 2001)
+        baseline = self.make_phase3()
+        receipt, _, receipt_hash, revision, dagutil_hash = (
+            self.make_contention_receipt(baseline)
+        )
+        self.assert_failure(
+            "exceeds 2x W1",
+            baseline=baseline,
+            defer=False,
+            extra=self.receipt_arguments(
+                receipt, receipt_hash, revision, dagutil_hash
+            ),
+        )
 
     def test_rss_exact_two_x_boundary_passes_and_just_over_fails(self) -> None:
         self.assert_pass()

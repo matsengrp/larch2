@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 from contextlib import redirect_stderr, redirect_stdout
+from decimal import Decimal
 import hashlib
 import io
 import json
@@ -1411,6 +1412,8 @@ class SyntheticEvidence:
                 self.phase0_artifact_ledger_sha
                 if phase0_ledger_anchor is None else phase0_ledger_anchor
             ),
+            "--phase4-contention-profile-dir", str(self.root),
+            "--expected-phase4-contention-profile-ledger-sha256", "e" * 64,
         ]
         for label in cross.SUPPLEMENT_SPECS:
             if label != omit_supplement:
@@ -1857,6 +1860,428 @@ class Invocation:
 
 
 class CrossPhaseAcceptanceTest(unittest.TestCase):
+    def phase4_delegation_fixture(
+        self, root: Path
+    ) -> tuple[
+        cross.Phase4ContentionProfile,
+        cross.RawEvidence,
+        Path,
+        int,
+        dict[str, object],
+    ]:
+        local_raw = root / "phase4-dense.tsv"
+        construction_raw = root / "phase4-cache.tsv"
+        phase3_raw = root / "phase3-dense.tsv"
+        for path in (local_raw, construction_raw, phase3_raw):
+            path.write_text("synthetic sealed input\n", encoding="utf-8")
+
+        rows: list[dict[str, str]] = []
+        for template, path in (
+            (cross.MEDIUM_DENSE, local_raw),
+            (cross.MEDIUM_CACHE, construction_raw),
+        ):
+            for worker in (1, 2, 4, 8):
+                for trial in range(1, 6):
+                    rows.append(
+                        {
+                            "row_id": template.format(worker),
+                            "trial_index": str(trial),
+                            "__raw_path__": os.fspath(path),
+                        }
+                    )
+        raw = cross.RawEvidence(
+            label="phase4",
+            paths=(local_raw, construction_raw),
+            digests=("c" * 64, "d" * 64),
+            rows=tuple(rows),
+        )
+
+        receipt = root / "synthetic-receipt.json"
+        receipt.write_text('{"synthetic":"receipt"}\n', encoding="utf-8")
+        profile = cross.Phase4ContentionProfile(
+            capture_directory=root,
+            capture_signature=(1,),
+            ledger_sha256="a" * 64,
+            member_count=692,
+            receipt_path=receipt,
+            receipt_sha256="b" * 64,
+            receipt_signature=(2,),
+        )
+        physical_memory = 64 * 1024 * 1024 * 1024
+
+        def ratio_gate(
+            name: str, numerator: str, denominator: str, limit: str
+        ) -> dict[str, object]:
+            return {
+                "name": name,
+                "status": "pass",
+                "ratio": str(Decimal(numerator) / Decimal(denominator)),
+                "limit": limit,
+                "numerator": numerator,
+                "denominator": denominator,
+            }
+
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "status": "pass",
+            "raw_trials": os.fspath(local_raw),
+            "raw_trial_inputs": [
+                os.fspath(local_raw),
+                os.fspath(construction_raw),
+            ],
+            "repetitions": 5,
+            "workloads": {
+                "local": {
+                    "row_prefix": cross.MEDIUM_DENSE.format(""),
+                    "source_raw_trials": [os.fspath(local_raw)],
+                    "median_ms": {
+                        "1": "10",
+                        "2": "8",
+                        "4": "6",
+                        "8": "4",
+                    },
+                },
+                "construction": {
+                    "row_prefix": cross.MEDIUM_CACHE.format(""),
+                    "source_raw_trials": [os.fspath(construction_raw)],
+                    "component_fields": [
+                        "initial_chart_construction_ms",
+                        "local_inside_cache_initialization_ms",
+                        "local_outside_cache_initialization_ms",
+                    ],
+                    "median_ms": {
+                        "1": "20",
+                        "2": "12",
+                        "4": "8",
+                        "8": "6",
+                    },
+                },
+            },
+            "phase3_baseline": {
+                "status": "pass",
+                "phase3_median_ms": "11",
+            },
+            "gates": [
+                {
+                    "name": "system_over_user_cpu",
+                    "status": "investigated",
+                    "limit": "0.25",
+                    "violations": cross.PHASE4_CONTENTION_VIOLATIONS,
+                    "disposition":
+                        "no_rollback_required_for_bound_capture",
+                    "receipt": os.fspath(receipt),
+                    "receipt_sha256": profile.receipt_sha256,
+                },
+                ratio_gate("local_w8_over_w1", "4", "10", "0.50"),
+                ratio_gate("local_w8_over_w4", "4", "6", "1.10"),
+                ratio_gate(
+                    "construction_w8_over_w1", "6", "20", "0.50"
+                ),
+                ratio_gate(
+                    "construction_w8_over_w4", "6", "8", "1.10"
+                ),
+                {"name": "parallel_high_water", "status": "pass"},
+                {
+                    "name": "rss",
+                    "status": "pass",
+                    "global_cap_kb": 16 * 1024 * 1024,
+                    "local": {
+                        "w1_max_kb": 44144,
+                        "w8_max_kb": 43896,
+                    },
+                    "construction": {
+                        "w1_max_kb": 36324,
+                        "w8_max_kb": 35836,
+                    },
+                },
+                {"name": "swap_zero", "status": "pass"},
+                ratio_gate(
+                    "local_w1_over_phase3_w1", "10", "11", "1.05"
+                ),
+            ],
+        }
+        return profile, raw, phase3_raw, physical_memory, payload
+
+    @staticmethod
+    def canonical_json(payload: object) -> str:
+        return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+    def test_phase4_contention_profile_generic_audit_binds_receipt(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-phase4-profile-"
+        ) as name:
+            capture = Path(name) / "capture"
+            capture.mkdir()
+            receipt = capture / cross.PHASE4_CONTENTION_RECEIPT_NAME
+            receipt.write_text('{"status":"synthetic"}\n', encoding="utf-8")
+            receipt.chmod(0o444)
+            seal = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools/wric_evidence_run_ledger.py"),
+                    "seal",
+                    "--capture-dir",
+                    str(capture),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(seal.returncode, 0, seal.stderr + seal.stdout)
+            ledger_sha = json.loads(seal.stdout)["ledger_sha256"]
+            profile = cross.audit_phase4_contention_profile(
+                capture, ledger_sha, ROOT
+            )
+            self.assertEqual(profile.capture_directory, capture.resolve())
+            self.assertEqual(profile.ledger_sha256, ledger_sha)
+            self.assertEqual(profile.member_count, 1)
+            self.assertEqual(
+                profile.receipt_sha256,
+                hashlib.sha256(receipt.read_bytes()).hexdigest(),
+            )
+
+            receipt.chmod(0o644)
+            receipt.write_text('{"status":"tampered"}\n', encoding="utf-8")
+            with self.assertRaisesRegex(
+                cross.AcceptanceError, "generic-v2 audit failed"
+            ):
+                cross.audit_phase4_contention_profile(capture, ledger_sha, ROOT)
+
+    def test_phase4_deep_validator_routes_receipt_and_rescans(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-phase4-delegated-"
+        ) as name:
+            root = Path(name)
+            profile, raw, phase3_raw, physical_memory, payload = (
+                self.phase4_delegation_fixture(root)
+            )
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=self.canonical_json(payload),
+                stderr="",
+            )
+            with mock.patch.object(
+                cross,
+                "audit_phase4_contention_profile",
+                side_effect=(profile, profile),
+            ) as auditor, mock.patch.object(
+                cross.subprocess, "run", return_value=completed
+            ) as delegated:
+                result = cross.deep_phase4_validate(
+                    raw,
+                    phase3_raw,
+                    ROOT,
+                    physical_memory,
+                    root,
+                    "a" * 64,
+                )
+            self.assertEqual(result, payload)
+            self.assertEqual(auditor.call_count, 2)
+            command = delegated.call_args.args[0]
+            self.assertEqual(
+                [
+                    command[index + 1]
+                    for index, token in enumerate(command)
+                    if token == "--raw-trials"
+                ],
+                [os.fspath(path) for path in raw.paths],
+            )
+            self.assertEqual(
+                command[
+                    command.index("--contention-investigation-receipt") + 1
+                ],
+                os.fspath(profile.receipt_path),
+            )
+            self.assertEqual(
+                command[
+                    command.index(
+                        "--expected-contention-investigation-receipt-sha256"
+                    )
+                    + 1
+                ],
+                profile.receipt_sha256,
+            )
+            self.assertEqual(
+                command[
+                    command.index("--expected-contention-product-revision")
+                    + 1
+                ],
+                cross.PHASE6_ACCEPTANCE_PRODUCT_REVISION,
+            )
+            self.assertEqual(
+                command[
+                    command.index("--expected-contention-dagutil-sha256")
+                    + 1
+                ],
+                cross.PHASE4_ACCEPTANCE_DAGUTIL_SHA256,
+            )
+
+            changed = cross.Phase4ContentionProfile(
+                **{**profile.__dict__, "member_count": 693}
+            )
+            with mock.patch.object(
+                cross,
+                "audit_phase4_contention_profile",
+                side_effect=(profile, changed),
+            ), mock.patch.object(
+                cross.subprocess, "run", return_value=completed
+            ), self.assertRaisesRegex(
+                cross.AcceptanceError, "closure changed"
+            ):
+                cross.deep_phase4_validate(
+                    raw,
+                    phase3_raw,
+                    ROOT,
+                    physical_memory,
+                    root,
+                    "a" * 64,
+                )
+
+    def test_phase4_deep_validator_rejects_spoofed_results(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="wric-cross-phase4-spoofed-"
+        ) as name:
+            root = Path(name)
+            profile, raw, phase3_raw, physical_memory, payload = (
+                self.phase4_delegation_fixture(root)
+            )
+
+            def clone() -> dict[str, object]:
+                result = json.loads(json.dumps(payload))
+                assert isinstance(result, dict)
+                return result
+
+            wrong_receipt = clone()
+            wrong_receipt["gates"][0]["receipt"] = "/forged/receipt.json"  # type: ignore[index]
+            wrong_hash = clone()
+            wrong_hash["gates"][0]["receipt_sha256"] = "0" * 64  # type: ignore[index]
+            wrong_gate = clone()
+            wrong_gate["gates"][0]["violations"] = 21  # type: ignore[index]
+            wrong_order = clone()
+            wrong_order["gates"][1], wrong_order["gates"][2] = (  # type: ignore[index]
+                wrong_order["gates"][2],  # type: ignore[index]
+                wrong_order["gates"][1],  # type: ignore[index]
+            )
+            wrong_raw_order = clone()
+            wrong_raw_order["raw_trial_inputs"].reverse()  # type: ignore[union-attr]
+            deferred_baseline = clone()
+            deferred_baseline["phase3_baseline"] = {
+                "status": "deferred",
+                "reason": "spoofed",
+            }
+            downstream_nonpass = clone()
+            downstream_nonpass["gates"][1]["status"] = "fail"  # type: ignore[index]
+            false_passing_ratio = clone()
+            false_passing_ratio["gates"][1].update(  # type: ignore[index]
+                {"numerator": "100", "denominator": "1", "ratio": "100"}
+            )
+
+            cases = (
+                (
+                    "stderr",
+                    self.canonical_json(payload),
+                    "unexpected diagnostic",
+                    "unexpected stderr",
+                ),
+                (
+                    "underspecified",
+                    self.canonical_json({"status": "pass"}),
+                    "",
+                    "top-level key set",
+                ),
+                (
+                    "wrong-receipt",
+                    self.canonical_json(wrong_receipt),
+                    "",
+                    "contention gate/provenance",
+                ),
+                (
+                    "wrong-hash",
+                    self.canonical_json(wrong_hash),
+                    "",
+                    "contention gate/provenance",
+                ),
+                (
+                    "wrong-gate",
+                    self.canonical_json(wrong_gate),
+                    "",
+                    "contention gate/provenance",
+                ),
+                (
+                    "wrong-order",
+                    self.canonical_json(wrong_order),
+                    "",
+                    "gate list/order",
+                ),
+                (
+                    "wrong-raw-order",
+                    self.canonical_json(wrong_raw_order),
+                    "",
+                    "raw input list/order",
+                ),
+                (
+                    "deferred-baseline",
+                    self.canonical_json(deferred_baseline),
+                    "",
+                    "Phase-3 baseline",
+                ),
+                ("malformed", "{", "", "invalid JSON"),
+                (
+                    "noncanonical",
+                    json.dumps(payload) + "\n",
+                    "",
+                    "canonical JSON",
+                ),
+                (
+                    "duplicate",
+                    '{"status":"pass","status":"pass"}\n',
+                    "",
+                    "duplicates JSON key",
+                ),
+                (
+                    "nonfinite",
+                    '{"value":NaN}\n',
+                    "",
+                    "non-finite",
+                ),
+                (
+                    "downstream-nonpass",
+                    self.canonical_json(downstream_nonpass),
+                    "",
+                    "ratio gate",
+                ),
+                (
+                    "false-passing-ratio",
+                    self.canonical_json(false_passing_ratio),
+                    "",
+                    "operands/limit",
+                ),
+            )
+            for label, stdout, stderr, message in cases:
+                completed = subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+                with self.subTest(label=label), mock.patch.object(
+                    cross,
+                    "audit_phase4_contention_profile",
+                    side_effect=(profile, profile),
+                ) as auditor, mock.patch.object(
+                    cross.subprocess, "run", return_value=completed
+                ), self.assertRaisesRegex(cross.AcceptanceError, message):
+                    cross.deep_phase4_validate(
+                        raw,
+                        phase3_raw,
+                        ROOT,
+                        physical_memory,
+                        root,
+                        "a" * 64,
+                    )
+                self.assertEqual(auditor.call_count, 2)
+
     def test_phase9_deep_validator_uses_the_product_local_evaluator(
         self,
     ) -> None:
@@ -2414,6 +2839,8 @@ class CrossPhaseAcceptanceTest(unittest.TestCase):
             self.assertIsInstance(phase4_memory, int)
             assert isinstance(phase4_memory, int)
             self.assertGreater(phase4_memory, 0)
+            self.assertEqual(result.phase4_calls[0][4], data.root)
+            self.assertEqual(result.phase4_calls[0][5], "e" * 64)
             self.assertEqual(len(result.phase9_calls), 1)
             self.assertEqual(result.phase9_calls[0][2], data.root)
             self.assertEqual(result.phase9_calls[0][3], ROOT)

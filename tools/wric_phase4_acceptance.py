@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,8 @@ SCHEMA_VERSION = 1
 WORKERS = (1, 2, 4, 8)
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 UINT_RE = re.compile(r"^(0|[1-9][0-9]*)$")
+REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+CONTENTION_LIMIT = Decimal("0.25")
 
 DEFAULT_LOCAL_PREFIX = "p0-medium-dense64-grammar-lower-bound-heuristic-w"
 DEFAULT_CONSTRUCTION_PREFIX = (
@@ -282,6 +285,111 @@ def require_canonical_regular_file(path: Path, label: str) -> Path:
     if not stat.S_ISREG(info.st_mode):
         raise AcceptanceError(f"{label} is not a regular file: {path}")
     return resolved
+
+
+def sha256_file(path: Path, label: str) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as error:
+        raise AcceptanceError(f"cannot hash {label} {path}: {error}") from error
+    return digest.hexdigest()
+
+
+def require_object(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise AcceptanceError(f"{label}: expected a JSON object")
+    return value
+
+
+def require_list(value: object, label: str) -> list[object]:
+    if not isinstance(value, list):
+        raise AcceptanceError(f"{label}: expected a JSON array")
+    return value
+
+
+def require_string(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise AcceptanceError(f"{label}: expected a nonempty JSON string")
+    return value
+
+
+def require_exact_keys(
+    value: dict[str, object], expected: set[str], label: str
+) -> None:
+    missing = sorted(expected - value.keys())
+    extra = sorted(value.keys() - expected)
+    if missing or extra:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if extra:
+            details.append(f"unexpected {', '.join(extra)}")
+        raise AcceptanceError(f"{label}: {'; '.join(details)}")
+
+
+def load_canonical_json(path: Path, label: str) -> dict[str, object]:
+    try:
+        encoded = path.read_bytes()
+        text = encoded.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise AcceptanceError(f"cannot read {label} {path}: {error}") from error
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise AcceptanceError(f"{label}: duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        parsed = json.loads(text, object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, AcceptanceError) as error:
+        if isinstance(error, AcceptanceError):
+            raise
+        raise AcceptanceError(f"{label}: malformed JSON: {error}") from error
+    result = require_object(parsed, label)
+    canonical = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    if canonical.encode("utf-8") != encoded:
+        raise AcceptanceError(f"{label}: JSON is not in canonical sorted form")
+    return result
+
+
+def receipt_artifact(
+    receipt_path: Path,
+    reference: object,
+    label: str,
+    *,
+    expected_path: Path | None = None,
+) -> Path:
+    item = require_object(reference, label)
+    require_exact_keys(item, {"path", "sha256"}, label)
+    recorded = require_string(item["path"], f"{label}.path")
+    expected_hash = require_string(item["sha256"], f"{label}.sha256")
+    if not SHA256_RE.fullmatch(expected_hash):
+        raise AcceptanceError(f"{label}.sha256 is not a lowercase SHA-256")
+    supplied = Path(recorded)
+    if not supplied.is_absolute():
+        supplied = receipt_path.parent / supplied
+    path = require_canonical_regular_file(supplied, label)
+    if not Path(recorded).is_absolute():
+        try:
+            path.relative_to(receipt_path.parent)
+        except ValueError as error:
+            raise AcceptanceError(f"{label}.path escapes the receipt directory") from error
+    if expected_path is not None and path != expected_path:
+        raise AcceptanceError(
+            f"{label}.path {path} does not match bound input {expected_path}"
+        )
+    actual_hash = sha256_file(path, label)
+    if actual_hash != expected_hash:
+        raise AcceptanceError(
+            f"{label} SHA-256 {actual_hash} does not match receipt {expected_hash}"
+        )
+    return path
 
 
 def load_raw_trials(paths: Sequence[str | os.PathLike[str]]) -> list[RawTrials]:
@@ -758,6 +866,1113 @@ def gate_ratio(
         raise AcceptanceError(f"{name}: ratio {ratio} exceeds {limit}")
 
 
+def contention_violations(
+    local: Sequence[Trial], construction: Sequence[Trial]
+) -> list[dict[str, object]]:
+    raw_hashes = {
+        trial.source_path: sha256_file(trial.source_path, "Phase-4 raw trials")
+        for trial in (*local, *construction)
+    }
+    violations: list[dict[str, object]] = []
+    for role, trials in (("construction", construction), ("local", local)):
+        for trial in trials:
+            user = parse_decimal(
+                trial.row["user_cpu_s"], f"{trial.row_id} user CPU", positive=True
+            )
+            system = parse_decimal(
+                trial.row["system_cpu_s"], f"{trial.row_id} system CPU"
+            )
+            if system > user * CONTENTION_LIMIT:
+                violations.append(
+                    {
+                        "raw_trials_sha256": raw_hashes[trial.source_path],
+                        "role": role,
+                        "row_id": trial.row_id,
+                        "system_cpu_s": trial.row["system_cpu_s"],
+                        "trial_index": trial.trial_index,
+                        "user_cpu_s": trial.row["user_cpu_s"],
+                        "worker": trial.worker,
+                    }
+                )
+    return violations
+
+
+def profile_tsv_rows(
+    path: Path, expected_fields: tuple[str, ...], label: str
+) -> list[dict[str, str]]:
+    header, rows = read_tsv(path)
+    if tuple(header) != expected_fields:
+        raise AcceptanceError(
+            f"{label}: header does not match the contention-profile schema"
+        )
+    return rows
+
+
+PROCESS_METRICS_FIELDS = {
+    "schema_version",
+    "outcome",
+    "exit_code",
+    "term_signal",
+    "timed_out",
+    "runner_exit_code",
+    "wall_seconds",
+    "user_seconds",
+    "system_seconds",
+    "max_rss_kb",
+    "peak_sampled_rss_kb",
+    "peak_sampled_swap_kb",
+    "rss_kb_unit",
+    "proc_status_samples",
+    "proc_rss_samples",
+    "proc_swap_samples",
+    "proc_group_samples",
+    "peak_sampled_process_count",
+    "subreaper_enabled",
+    "descendants_reaped",
+    "post_leader_descendants",
+    "descendant_cleanup_kill_sent",
+    "live_descendants_at_return",
+    "process_group_alive_at_return",
+    "wait4_echild_at_return",
+    "monitor_error",
+    "monitor_error_count",
+    "wait4_collected",
+    "wait_errno",
+    "child_error_stage",
+    "child_error_errno",
+    "core_dumped",
+    "timeout_term_sent",
+    "timeout_kill_sent",
+    "rss_limit_bytes",
+    "rss_limit_enabled",
+    "rss_limit_observed",
+    "rss_limit_exceeded",
+    "rss_limit_trigger_bytes",
+    "rss_limit_term_sent",
+    "rss_limit_kill_sent",
+}
+PROFILE_PROVENANCE_FIELDS = {
+    "schema",
+    "schema_version",
+    "controller_sha256",
+    "product_revision",
+    "product_tree",
+    "dagutil_sha256",
+    "input_sha256",
+    "refseq_sha256",
+    "process_metrics_sha256",
+    "valgrind_sha256",
+    "callgrind_annotate_sha256",
+    "valgrind_version",
+    "kernel",
+    "affinity",
+    "environment",
+    "native_repetitions",
+    "native_warmups_per_cell",
+    "callgrind_interpretation",
+}
+
+
+def read_key_value_file(
+    path: Path, label: str, expected_fields: set[str]
+) -> dict[str, str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise AcceptanceError(f"cannot read {label} {path}: {error}") from error
+    values: dict[str, str] = {}
+    for line_number, line in enumerate(lines, start=1):
+        if "=" not in line:
+            raise AcceptanceError(f"{label}:{line_number}: malformed metric")
+        key, value = line.split("=", 1)
+        if not key or not value:
+            raise AcceptanceError(f"{label}:{line_number}: empty metric key/value")
+        if key in values:
+            raise AcceptanceError(f"{label}:{line_number}: duplicate metric {key}")
+        values[key] = value
+    require_exact_keys(values, expected_fields, label)
+    return values
+
+
+def read_process_metrics(path: Path, label: str) -> dict[str, str]:
+    return read_key_value_file(path, label, PROCESS_METRICS_FIELDS)
+
+
+def validate_profile_process_metrics(
+    metrics: dict[str, str], row: dict[str, str], label: str
+) -> None:
+    for metric, row_field in (
+        ("user_seconds", "user_s"),
+        ("system_seconds", "system_s"),
+        ("wall_seconds", "wall_s"),
+        ("peak_sampled_rss_kb", "peak_sampled_rss_kb"),
+    ):
+        if metrics[metric] != row[row_field]:
+            raise AcceptanceError(
+                f"{label}: {metric} does not exactly match the timing TSV"
+            )
+    expected = {
+        "schema_version": "2",
+        "outcome": "exited",
+        "exit_code": "0",
+        "term_signal": "0",
+        "timed_out": "0",
+        "runner_exit_code": "0",
+        "peak_sampled_swap_kb": "0",
+        "rss_kb_unit": "1024_bytes",
+        "peak_sampled_process_count": "1",
+        "subreaper_enabled": "1",
+        "descendants_reaped": "0",
+        "post_leader_descendants": "0",
+        "descendant_cleanup_kill_sent": "0",
+        "live_descendants_at_return": "0",
+        "process_group_alive_at_return": "0",
+        "wait4_echild_at_return": "1",
+        "monitor_error": "0",
+        "monitor_error_count": "0",
+        "wait4_collected": "1",
+        "wait_errno": "0",
+        "child_error_stage": "none",
+        "child_error_errno": "0",
+        "core_dumped": "0",
+        "timeout_term_sent": "0",
+        "timeout_kill_sent": "0",
+        "rss_limit_bytes": "17179869184",
+        "rss_limit_enabled": "1",
+        "rss_limit_observed": "0",
+        "rss_limit_exceeded": "0",
+        "rss_limit_trigger_bytes": "0",
+        "rss_limit_term_sent": "0",
+        "rss_limit_kill_sent": "0",
+    }
+    for metric, expected_value in expected.items():
+        if metrics[metric] != expected_value:
+            raise AcceptanceError(
+                f"{label}: {metric}={metrics[metric]!r}, expected {expected_value!r}"
+            )
+    parse_uint(metrics["max_rss_kb"], f"{label} max_rss_kb", positive=True)
+    parse_uint(
+        metrics["peak_sampled_rss_kb"],
+        f"{label} peak_sampled_rss_kb",
+        positive=True,
+    )
+    status_samples = parse_uint(
+        metrics["proc_status_samples"], f"{label} proc_status_samples", positive=True
+    )
+    rss_samples = parse_uint(
+        metrics["proc_rss_samples"], f"{label} proc_rss_samples", positive=True
+    )
+    swap_samples = parse_uint(
+        metrics["proc_swap_samples"], f"{label} proc_swap_samples", positive=True
+    )
+    group_samples = parse_uint(
+        metrics["proc_group_samples"], f"{label} proc_group_samples", positive=True
+    )
+    if not (
+        rss_samples == swap_samples
+        and status_samples - rss_samples in (0, 1)
+        and group_samples - status_samples in (0, 1)
+    ):
+        raise AcceptanceError(f"{label}: process-monitor sample counts do not reconcile")
+
+
+def profile_group_summary(
+    rows: Sequence[dict[str, str]], groups: Sequence[tuple[str, int]], label: str
+) -> tuple[list[dict[str, object]], int]:
+    expected = set(groups)
+    actual: dict[tuple[str, int], list[dict[str, str]]] = {}
+    violations = 0
+    for row in rows:
+        role = row["role"]
+        worker = parse_uint(row["worker"], f"{label} worker", positive=True)
+        group = (role, worker)
+        if group not in expected:
+            raise AcceptanceError(f"{label}: unexpected group {role}/W{worker}")
+        actual.setdefault(group, []).append(row)
+        user = parse_decimal(row["user_s"], f"{label} user_s", positive=True)
+        system = parse_decimal(row["system_s"], f"{label} system_s")
+        if system > user * CONTENTION_LIMIT:
+            violations += 1
+    if set(actual) != expected:
+        raise AcceptanceError(f"{label}: incomplete workload/worker group matrix")
+
+    summaries: list[dict[str, object]] = []
+    for role, worker in groups:
+        group_rows = actual[(role, worker)]
+        repetitions = sorted(
+            parse_uint(row["repetition"], f"{label} repetition", positive=True)
+            for row in group_rows
+        )
+        if repetitions != list(range(1, 11)):
+            raise AcceptanceError(
+                f"{label}: {role}/W{worker} repetitions are not exactly 1..10"
+            )
+        group_violations = sum(
+            parse_decimal(row["system_s"], f"{label} system_s")
+            > parse_decimal(row["user_s"], f"{label} user_s", positive=True)
+            * CONTENTION_LIMIT
+            for row in group_rows
+        )
+        summaries.append(
+            {
+                "role": role,
+                "rows": 10,
+                "violations": group_violations,
+                "worker": worker,
+            }
+        )
+    return summaries, violations
+
+
+def validate_contention_profile(
+    receipt_path: Path, receipt: dict[str, object]
+) -> None:
+    profile = require_object(receipt["profile"], "contention receipt profile")
+    require_exact_keys(
+        profile,
+        {
+            "affinity",
+            "callgrind",
+            "completion_marker",
+            "devnull_and_fixed_controls",
+            "environment",
+            "host_preflight",
+            "native_rusage",
+            "process_metrics_sha256",
+            "provenance",
+            "runner",
+        },
+        "contention receipt profile",
+    )
+    if profile["affinity"] != "0,2,4,6,8,10,12,14":
+        raise AcceptanceError(
+            "contention receipt profile.affinity does not match the frozen CPU set"
+        )
+    environment = require_list(
+        profile["environment"], "contention receipt profile.environment"
+    )
+    if environment != [
+        "HOME=/nonexistent",
+        "LANG=C",
+        "LC_ALL=C",
+        "PATH=/usr/bin:/bin",
+        "TMPDIR=/tmp",
+        "TZ=Europe/Sofia",
+    ]:
+        raise AcceptanceError(
+            "contention receipt profile.environment does not match the frozen environment"
+        )
+    process_metrics_hash = require_string(
+        profile["process_metrics_sha256"],
+        "contention receipt profile.process_metrics_sha256",
+    )
+    if not SHA256_RE.fullmatch(process_metrics_hash):
+        raise AcceptanceError(
+            "contention receipt profile.process_metrics_sha256 is not a lowercase SHA-256"
+        )
+
+    completion_marker = receipt_artifact(
+        receipt_path,
+        profile["completion_marker"],
+        "contention receipt profile.completion_marker",
+    )
+    try:
+        marker_bytes = completion_marker.read_bytes()
+    except OSError as error:
+        raise AcceptanceError(
+            f"cannot read contention profile completion marker: {error}"
+        ) from error
+    if marker_bytes != b"complete\n":
+        raise AcceptanceError(
+            "contention receipt profile.completion_marker is not exactly 'complete\\n'"
+        )
+    provenance_path = receipt_artifact(
+        receipt_path,
+        profile["provenance"],
+        "contention receipt profile.provenance",
+    )
+    runner = require_object(profile["runner"], "contention receipt profile.runner")
+    require_exact_keys(
+        runner, {"kind", "path", "sha256"}, "contention receipt profile.runner"
+    )
+    if runner["kind"] != "preserved_script":
+        raise AcceptanceError(
+            "contention receipt profile.runner.kind must be 'preserved_script'"
+        )
+    receipt_artifact(
+        receipt_path,
+        {"path": runner["path"], "sha256": runner["sha256"]},
+        "contention receipt profile.runner",
+    )
+    provenance = read_key_value_file(
+        provenance_path,
+        "contention receipt profile.provenance",
+        PROFILE_PROVENANCE_FIELDS,
+    )
+    product = require_object(receipt["product"], "contention receipt product")
+    callgrind = require_object(
+        profile["callgrind"], "contention receipt profile.callgrind"
+    )
+    profiler = require_object(
+        callgrind.get("profiler"), "contention receipt profile.callgrind.profiler"
+    )
+    expected_provenance = {
+        "schema": "wric.phase4.contention_profile_provenance",
+        "schema_version": "1",
+        "controller_sha256": require_string(
+            runner.get("sha256"), "contention receipt profile.runner.sha256"
+        ),
+        "product_revision": require_string(
+            product.get("revision"), "contention receipt product.revision"
+        ),
+        "product_tree": require_string(
+            product.get("tree"), "contention receipt product.tree"
+        ),
+        "dagutil_sha256": require_string(
+            require_object(
+                product.get("dagutil"), "contention receipt product.dagutil"
+            ).get("sha256"),
+            "contention receipt product.dagutil.sha256",
+        ),
+        "input_sha256": require_string(
+            require_object(
+                product.get("input"), "contention receipt product.input"
+            ).get("sha256"),
+            "contention receipt product.input.sha256",
+        ),
+        "refseq_sha256": require_string(
+            require_object(
+                product.get("refseq"), "contention receipt product.refseq"
+            ).get("sha256"),
+            "contention receipt product.refseq.sha256",
+        ),
+        "process_metrics_sha256": process_metrics_hash,
+        "valgrind_sha256": require_string(
+            profiler.get("binary_sha256"),
+            "contention receipt profile.callgrind.profiler.binary_sha256",
+        ),
+        "callgrind_annotate_sha256": "8716f89225e5c49615788f9d04779a92fb20928626ba13cf25045697d40e5e4d",
+        "valgrind_version": require_string(
+            profiler.get("version"),
+            "contention receipt profile.callgrind.profiler.version",
+        ),
+        "affinity": require_string(
+            profile.get("affinity"), "contention receipt profile.affinity"
+        ),
+        "environment": " ".join(
+            require_string(value, "contention receipt profile.environment value")
+            for value in environment
+        ),
+        "native_repetitions": "10",
+        "native_warmups_per_cell": "1",
+        "callgrind_interpretation": require_string(
+            callgrind.get("interpretation"),
+            "contention receipt profile.callgrind.interpretation",
+        ),
+    }
+    for key, expected_value in expected_provenance.items():
+        if provenance[key] != expected_value:
+            raise AcceptanceError(
+                f"contention receipt profile.provenance {key} does not match receipt"
+            )
+    require_string(
+        provenance["kernel"], "contention receipt profile.provenance kernel"
+    )
+
+    host = require_object(
+        profile["host_preflight"], "contention receipt profile.host_preflight"
+    )
+    require_exact_keys(
+        host,
+        {"processes_after", "processes_before", "samples", "times"},
+        "contention receipt profile.host_preflight",
+    )
+    if host["samples"] != 15:
+        raise AcceptanceError(
+            "contention receipt profile.host_preflight.samples must equal 15"
+        )
+    for field in ("processes_after", "processes_before"):
+        receipt_artifact(
+            receipt_path,
+            host[field],
+            f"contention receipt profile.host_preflight.{field}",
+        )
+    preflight_path = receipt_artifact(
+        receipt_path,
+        host["times"],
+        "contention receipt profile.host_preflight.times",
+    )
+    preflight_rows = profile_tsv_rows(
+        preflight_path,
+        (
+            "sample",
+            "epoch",
+            "load1",
+            "runnable_processes",
+            "total_processes",
+        ),
+        "contention receipt profile.host_preflight.times",
+    )
+    if len(preflight_rows) != 15:
+        raise AcceptanceError(
+            "contention receipt profile.host_preflight.times must contain 15 rows"
+        )
+    samples = [
+        parse_uint(
+            row["sample"], "contention receipt host preflight sample", positive=True
+        )
+        for row in preflight_rows
+    ]
+    if samples != list(range(1, 16)):
+        raise AcceptanceError(
+            "contention receipt host preflight samples are not exactly 1..15"
+        )
+    epochs = [
+        parse_decimal(
+            row["epoch"], "contention receipt host preflight epoch", positive=True
+        )
+        for row in preflight_rows
+    ]
+    for previous, current in zip(epochs, epochs[1:]):
+        interval = current - previous
+        if interval < Decimal("0.9") or interval > Decimal("1.1"):
+            raise AcceptanceError(
+                "contention receipt host preflight intervals are not one-second samples"
+            )
+    for row in preflight_rows:
+        load = parse_decimal(
+            row["load1"], "contention receipt host preflight load1"
+        )
+        runnable = parse_uint(
+            row["runnable_processes"],
+            "contention receipt host preflight runnable_processes",
+            positive=True,
+        )
+        total = parse_uint(
+            row["total_processes"],
+            "contention receipt host preflight total_processes",
+            positive=True,
+        )
+        if load > Decimal("1.0") or runnable > 2 or total < runnable:
+            raise AcceptanceError(
+                "contention receipt host preflight is not quiescent"
+            )
+
+    timing_fields = (
+        "role",
+        "worker",
+        "repetition",
+        "user_s",
+        "system_s",
+        "wall_s",
+        "peak_sampled_rss_kb",
+        "semantic_sha256",
+        "canonical_sha256",
+        "metrics_sha256",
+        "stdout_sha256",
+        "stderr_sha256",
+        "output_mode",
+        "output_sha256",
+    )
+    timing_specs = (
+        (
+            "native_rusage",
+            80,
+            (
+                ("cache", 1),
+                ("cache", 2),
+                ("cache", 4),
+                ("cache", 8),
+                ("dense", 1),
+                ("dense", 2),
+                ("dense", 4),
+                ("dense", 8),
+            ),
+        ),
+        (
+            "devnull_and_fixed_controls",
+            50,
+            (
+                ("cache", 1),
+                ("cache", 8),
+                ("dense", 1),
+                ("dense", 8),
+                ("fixed", 1),
+            ),
+        ),
+    )
+    workloads = {
+        require_string(
+            require_object(item, "contention receipt workload").get("role"),
+            "contention receipt workload.role",
+        ): require_object(item, "contention receipt workload")
+        for item in require_list(receipt["workloads"], "contention receipt workloads")
+    }
+    if set(workloads) != {"construction", "local"}:
+        raise AcceptanceError("contention receipt workload roles are invalid")
+    output_semantics = {
+        require_string(
+            workload.get("output_semantic_sha256"),
+            "contention receipt workload.output_semantic_sha256",
+        )
+        for workload in workloads.values()
+    }
+    if len(output_semantics) != 1:
+        raise AcceptanceError(
+            "contention receipt workload output semantics disagree"
+        )
+    profile_semantics = {
+        "cache": require_string(
+            workloads["construction"].get("search_semantic_sha256"),
+            "construction search semantic",
+        ),
+        "dense": require_string(
+            workloads["local"].get("search_semantic_sha256"),
+            "local search semantic",
+        ),
+        "fixed": next(iter(output_semantics)),
+    }
+    callgrind = require_object(
+        profile["callgrind"], "contention receipt profile.callgrind"
+    )
+    receipt_runs = require_list(
+        callgrind.get("runs"), "contention receipt profile.callgrind.runs"
+    )
+    profile_canonicals: dict[str, str] = {}
+    for index, value in enumerate(receipt_runs):
+        run = require_object(
+            value, f"contention receipt profile.callgrind.runs[{index}]"
+        )
+        role = require_string(
+            run.get("role"), f"contention receipt profile.callgrind.runs[{index}].role"
+        )
+        canonical = require_string(
+            run.get("canonical_sha256"),
+            f"contention receipt profile.callgrind.runs[{index}].canonical_sha256",
+        )
+        if (
+            role not in profile_semantics
+            or role in profile_canonicals
+            or not SHA256_RE.fullmatch(canonical)
+            or run.get("semantic_sha256") != profile_semantics[role]
+        ):
+            raise AcceptanceError(
+                "contention receipt callgrind run identities do not match workloads"
+            )
+        profile_canonicals[role] = canonical
+    if set(profile_canonicals) != {"cache", "dense", "fixed"}:
+        raise AcceptanceError(
+            "contention receipt callgrind run identities are incomplete"
+        )
+
+    for field, expected_rows, groups in timing_specs:
+        section_label = f"contention receipt profile.{field}"
+        section = require_object(profile[field], section_label)
+        require_exact_keys(
+            section,
+            {
+                "artifact",
+                "group_violations",
+                "measured_repetitions_per_cell",
+                "rows",
+                "violations",
+                "warmups_per_cell",
+            },
+            section_label,
+        )
+        if (
+            section["rows"] != expected_rows
+            or section["measured_repetitions_per_cell"] != 10
+            or section["warmups_per_cell"] != 1
+        ):
+            raise AcceptanceError(
+                f"{section_label}: expected {expected_rows} rows, 10 measured repetitions, and 1 warmup"
+            )
+        artifact_path = receipt_artifact(
+            receipt_path, section["artifact"], f"{section_label}.artifact"
+        )
+        rows = profile_tsv_rows(artifact_path, timing_fields, f"{section_label}.artifact")
+        if len(rows) != expected_rows:
+            raise AcceptanceError(
+                f"{section_label}.artifact: expected {expected_rows} rows, found {len(rows)}"
+            )
+        artifact_root = artifact_path.parent
+        for row in rows:
+            role = row["role"]
+            if role not in profile_semantics:
+                raise AcceptanceError(
+                    f"{section_label}.artifact: unexpected role {role!r}"
+                )
+            worker = parse_uint(
+                row["worker"], f"{section_label}.artifact worker", positive=True
+            )
+            repetition = parse_uint(
+                row["repetition"],
+                f"{section_label}.artifact repetition",
+                positive=True,
+            )
+            parse_decimal(
+                row["wall_s"], f"{section_label}.artifact wall_s", positive=True
+            )
+            parse_uint(
+                row["peak_sampled_rss_kb"],
+                f"{section_label}.artifact peak_sampled_rss_kb",
+                positive=True,
+            )
+            for hash_field in (
+                "semantic_sha256",
+                "canonical_sha256",
+                "metrics_sha256",
+                "stdout_sha256",
+                "stderr_sha256",
+            ):
+                if not SHA256_RE.fullmatch(row[hash_field]):
+                    raise AcceptanceError(
+                        f"{section_label}.artifact: {hash_field} is not a lowercase SHA-256"
+                    )
+            if (
+                row["semantic_sha256"] != profile_semantics[role]
+                or row["canonical_sha256"] != profile_canonicals[role]
+            ):
+                raise AcceptanceError(
+                    f"{section_label}.artifact: {role}/W{worker} semantic or canonical identity is stale"
+                )
+            stem = f"{role}-w{worker}-r{repetition}"
+            per_run_paths: dict[str, Path] = {}
+            for suffix, hash_field_name in (
+                ("canonical.json", "canonical_sha256"),
+                ("metrics", "metrics_sha256"),
+                ("stdout", "stdout_sha256"),
+                ("stderr", "stderr_sha256"),
+            ):
+                per_run_path = require_canonical_regular_file(
+                    artifact_root / f"{stem}.{suffix}",
+                    f"{section_label}.artifact {stem}.{suffix}",
+                )
+                if sha256_file(per_run_path, f"{section_label} per-run artifact") != row[
+                    hash_field_name
+                ]:
+                    raise AcceptanceError(
+                        f"{section_label}.artifact: {stem}.{suffix} SHA-256 mismatch"
+                    )
+                per_run_paths[suffix] = per_run_path
+            metrics = read_process_metrics(
+                per_run_paths["metrics"],
+                f"{section_label}.artifact {stem}.metrics",
+            )
+            validate_profile_process_metrics(
+                metrics,
+                row,
+                f"{section_label}.artifact {stem}.metrics",
+            )
+            if field == "native_rusage":
+                if (
+                    row["output_mode"] != "file"
+                    or not SHA256_RE.fullmatch(row["output_sha256"])
+                ):
+                    raise AcceptanceError(
+                        f"{section_label}.artifact: {stem} output identity is invalid"
+                    )
+                output_path = require_canonical_regular_file(
+                    artifact_root / f"{stem}.pb.gz",
+                    f"{section_label}.artifact {stem}.pb.gz",
+                )
+                if sha256_file(output_path, f"{section_label} output") != row[
+                    "output_sha256"
+                ]:
+                    raise AcceptanceError(
+                        f"{section_label}.artifact: {stem}.pb.gz SHA-256 mismatch"
+                    )
+            elif (
+                row["output_mode"]
+                != ("no_output" if role == "fixed" else "devnull")
+                or row["output_sha256"] != "-"
+            ):
+                raise AcceptanceError(
+                    f"{section_label}.artifact: {stem} output mode is invalid"
+                )
+        summaries, violations = profile_group_summary(rows, groups, section_label)
+        if section["group_violations"] != summaries:
+            raise AcceptanceError(
+                f"{section_label}.group_violations does not match the bound artifact"
+            )
+        if section["violations"] != violations:
+            raise AcceptanceError(
+                f"{section_label}.violations does not match the bound artifact"
+            )
+        if field == "devnull_and_fixed_controls":
+            fixed = next(
+                summary
+                for summary in summaries
+                if summary["role"] == "fixed" and summary["worker"] == 1
+            )
+            if fixed["violations"] != 8:
+                raise AcceptanceError(
+                    f"{section_label}: fixed W1 control must breach in exactly 8/10 trials"
+                )
+        exact_violations = 38 if field == "native_rusage" else 25
+        if violations != exact_violations:
+            raise AcceptanceError(
+                f"{section_label}: expected exactly {exact_violations} threshold violations"
+            )
+
+    callgrind_label = "contention receipt profile.callgrind"
+    require_exact_keys(
+        callgrind,
+        {"artifact", "interpretation", "profiler", "runs"},
+        callgrind_label,
+    )
+    if callgrind["interpretation"] != "qualitative_only":
+        raise AcceptanceError(
+            f"{callgrind_label}.interpretation must be 'qualitative_only'"
+        )
+    profiler = require_object(callgrind["profiler"], f"{callgrind_label}.profiler")
+    require_exact_keys(
+        profiler,
+        {"binary_sha256", "kind", "version"},
+        f"{callgrind_label}.profiler",
+    )
+    if profiler != {
+        "binary_sha256": "9e8422466bd87902983118bb7bc51e67679b0bbaa09788f7d6b2aa0af40406b3",
+        "kind": "callgrind_collect_systime_nsec",
+        "version": "valgrind-3.27.1",
+    }:
+        raise AcceptanceError(f"{callgrind_label}.profiler identity is invalid")
+    summary_path = receipt_artifact(
+        receipt_path, callgrind["artifact"], f"{callgrind_label}.artifact"
+    )
+    summary_fields = (
+        "role",
+        "worker",
+        "semantic_sha256",
+        "canonical_sha256",
+        "output_sha256",
+        "stdout_sha256",
+        "stderr_sha256",
+        "profile_sha256",
+        "log_sha256",
+        "annotation_sha256",
+        "instructions",
+        "syscall_count",
+        "system_time_ns",
+        "system_cpu_time_ns",
+    )
+    summary = profile_tsv_rows(summary_path, summary_fields, f"{callgrind_label}.artifact")
+    if len(summary) != 3:
+        raise AcceptanceError(f"{callgrind_label}.artifact: expected 3 rows")
+    expected_groups = {("dense", 8), ("cache", 8), ("fixed", 1)}
+    if {
+        (row["role"], parse_uint(row["worker"], f"{callgrind_label} worker", positive=True))
+        for row in summary
+    } != expected_groups:
+        raise AcceptanceError(f"{callgrind_label}.artifact: invalid run matrix")
+    expected_runs = []
+    for row in summary:
+        role = row["role"]
+        worker = parse_uint(row["worker"], f"{callgrind_label} worker", positive=True)
+        for hash_field in ("semantic_sha256", "canonical_sha256", "profile_sha256"):
+            if not SHA256_RE.fullmatch(row[hash_field]):
+                raise AcceptanceError(
+                    f"{callgrind_label}.artifact: {hash_field} is not a lowercase SHA-256"
+                )
+        profile_path = require_canonical_regular_file(
+            receipt_path.parent / "callgrind" / f"{role}-w{worker}.callgrind",
+            f"{callgrind_label} {role}/W{worker} profile",
+        )
+        if sha256_file(profile_path, f"{callgrind_label} profile") != row[
+            "profile_sha256"
+        ]:
+            raise AcceptanceError(
+                f"{callgrind_label}: {role}/W{worker} profile SHA-256 mismatch"
+            )
+        expected_runs.append(
+            {
+                "canonical_sha256": row["canonical_sha256"],
+                "profile_sha256": row["profile_sha256"],
+                "role": role,
+                "semantic_sha256": row["semantic_sha256"],
+                "syscall_count": parse_uint(
+                    row["syscall_count"], f"{callgrind_label} syscall_count"
+                ),
+                "system_cpu_time_ns": parse_uint(
+                    row["system_cpu_time_ns"], f"{callgrind_label} system_cpu_time_ns"
+                ),
+                "system_time_ns": parse_uint(
+                    row["system_time_ns"], f"{callgrind_label} system_time_ns"
+                ),
+                "worker": worker,
+            }
+        )
+    if callgrind["runs"] != expected_runs:
+        raise AcceptanceError(f"{callgrind_label}.runs does not match the bound artifact")
+
+
+def validate_contention_receipt(
+    args: argparse.Namespace,
+    local: Sequence[Trial],
+    construction: Sequence[Trial],
+    violations: list[dict[str, object]],
+) -> tuple[Path, str]:
+    receipt_path = require_canonical_regular_file(
+        Path(args.contention_investigation_receipt),
+        "contention investigation receipt",
+    )
+    expected_receipt_hash = args.expected_contention_investigation_receipt_sha256
+    if not SHA256_RE.fullmatch(expected_receipt_hash):
+        raise AcceptanceError(
+            "expected contention investigation receipt SHA-256 is invalid"
+        )
+    actual_receipt_hash = sha256_file(
+        receipt_path, "contention investigation receipt"
+    )
+    if actual_receipt_hash != expected_receipt_hash:
+        raise AcceptanceError(
+            "contention investigation receipt SHA-256 "
+            f"{actual_receipt_hash} does not match expected {expected_receipt_hash}"
+        )
+    receipt = load_canonical_json(receipt_path, "contention investigation receipt")
+    require_exact_keys(
+        receipt,
+        {
+            "capture",
+            "disposition",
+            "finding",
+            "product",
+            "profile",
+            "receipt_builder",
+            "schema",
+            "schema_version",
+            "status",
+            "threshold",
+            "violations",
+            "workloads",
+        },
+        "contention investigation receipt",
+    )
+    if (
+        receipt["schema"] != "wric.phase4.contention_investigation"
+        or receipt["schema_version"] != 1
+        or receipt["status"] != "complete"
+    ):
+        raise AcceptanceError("contention investigation receipt schema/status is invalid")
+    threshold = require_object(receipt["threshold"], "contention receipt threshold")
+    require_exact_keys(
+        threshold, {"comparison", "limit", "metric"}, "contention receipt threshold"
+    )
+    if threshold != {
+        "comparison": "greater_than",
+        "limit": "0.25",
+        "metric": "system_cpu_s_over_user_cpu_s",
+    }:
+        raise AcceptanceError("contention investigation receipt threshold is invalid")
+    if receipt["violations"] != violations:
+        raise AcceptanceError(
+            "contention investigation receipt violation set does not exactly match raw trials"
+        )
+
+    capture = require_object(receipt["capture"], "contention receipt capture")
+    require_exact_keys(
+        capture,
+        {"phase3_baseline", "raw_trials", "repetitions", "row_prefixes"},
+        "contention receipt capture",
+    )
+    if capture["repetitions"] != args.repetitions or capture["row_prefixes"] != {
+        "construction": args.construction_row_prefix,
+        "local": args.local_row_prefix,
+    }:
+        raise AcceptanceError(
+            "contention investigation receipt capture matrix does not match invocation"
+        )
+    raw_bindings = require_list(
+        capture["raw_trials"], "contention receipt capture.raw_trials"
+    )
+    if len(raw_bindings) != 2:
+        raise AcceptanceError(
+            "contention receipt capture.raw_trials must bind local and construction"
+        )
+    expected_sources = {
+        "local": {trial.source_path for trial in local},
+        "construction": {trial.source_path for trial in construction},
+    }
+    if any(len(paths) != 1 for paths in expected_sources.values()):
+        raise AcceptanceError(
+            "contention receipt requires one raw-trials owner per workload matrix"
+        )
+    seen_roles: set[str] = set()
+    for index, value in enumerate(raw_bindings):
+        label = f"contention receipt capture.raw_trials[{index}]"
+        binding = require_object(value, label)
+        require_exact_keys(
+            binding,
+            {"metadata", "path", "role", "run_ledger", "sha256"},
+            label,
+        )
+        role = require_string(binding["role"], f"{label}.role")
+        if role not in expected_sources or role in seen_roles:
+            raise AcceptanceError(f"{label}.role is invalid or repeated")
+        seen_roles.add(role)
+        expected_path = next(iter(expected_sources[role]))
+        receipt_artifact(
+            receipt_path,
+            {"path": binding["path"], "sha256": binding["sha256"]},
+            label,
+            expected_path=expected_path,
+        )
+        receipt_artifact(receipt_path, binding["metadata"], f"{label}.metadata")
+        receipt_artifact(receipt_path, binding["run_ledger"], f"{label}.run_ledger")
+    if seen_roles != {"local", "construction"}:
+        raise AcceptanceError("contention receipt raw-trials roles are incomplete")
+
+    if not args.phase3_raw_trials:
+        raise AcceptanceError(
+            "contention investigation receipt requires a bound Phase-3 baseline"
+        )
+    phase3_path = require_canonical_regular_file(
+        Path(args.phase3_raw_trials), "Phase-3 raw trials input"
+    )
+    phase3 = require_object(
+        capture["phase3_baseline"], "contention receipt capture.phase3_baseline"
+    )
+    require_exact_keys(
+        phase3,
+        {"metadata", "path", "run_ledger", "sha256"},
+        "contention receipt capture.phase3_baseline",
+    )
+    receipt_artifact(
+        receipt_path,
+        {"path": phase3["path"], "sha256": phase3["sha256"]},
+        "contention receipt capture.phase3_baseline",
+        expected_path=phase3_path,
+    )
+    receipt_artifact(
+        receipt_path,
+        phase3["metadata"],
+        "contention receipt capture.phase3_baseline.metadata",
+    )
+    receipt_artifact(
+        receipt_path,
+        phase3["run_ledger"],
+        "contention receipt capture.phase3_baseline.run_ledger",
+    )
+
+    expected_workloads: list[dict[str, object]] = []
+    for role, matrix in (("construction", construction), ("local", local)):
+        expected_workloads.append(
+            {
+                "fixture": matrix[0].row["fixture"],
+                "input_sha256": matrix[0].row["input_sha256"],
+                "method": matrix[0].row["method"],
+                "output_semantic_sha256": matrix[0].row["output_semantic_sha256"],
+                "refseq_sha256": matrix[0].row["refseq_sha256"],
+                "role": role,
+                "search_semantic_sha256": matrix[0].row["search_semantic_sha256"],
+                "workers": [
+                    {
+                        "canonical_argv_sha256": by_worker(matrix, worker)[0].row[
+                            "canonical_argv_sha256"
+                        ],
+                        "row_id": f"{args.construction_row_prefix if role == 'construction' else args.local_row_prefix}{worker}",
+                        "worker": worker,
+                    }
+                    for worker in WORKERS
+                ],
+            }
+        )
+    if receipt["workloads"] != expected_workloads:
+        raise AcceptanceError(
+            "contention investigation receipt workload/argv identity does not match raw trials"
+        )
+
+    product = require_object(receipt["product"], "contention receipt product")
+    require_exact_keys(
+        product,
+        {"dagutil", "input", "process_metrics", "refseq", "revision", "tree"},
+        "contention receipt product",
+    )
+    if product["revision"] != args.expected_contention_product_revision:
+        raise AcceptanceError(
+            "contention investigation receipt product revision does not match expected"
+        )
+    if not REVISION_RE.fullmatch(require_string(product["tree"], "product.tree")):
+        raise AcceptanceError("contention investigation receipt product tree is invalid")
+    dagutil = require_object(product["dagutil"], "contention receipt product.dagutil")
+    if dagutil.get("sha256") != args.expected_contention_dagutil_sha256:
+        raise AcceptanceError(
+            "contention investigation receipt dagutil SHA-256 does not match expected"
+        )
+    receipt_artifact(
+        receipt_path, dagutil, "contention receipt product.dagutil"
+    )
+    receipt_artifact(receipt_path, product["input"], "contention receipt product.input")
+    receipt_artifact(receipt_path, product["refseq"], "contention receipt product.refseq")
+    receipt_artifact(
+        receipt_path,
+        product["process_metrics"],
+        "contention receipt product.process_metrics",
+    )
+    input_hash = local[0].row["input_sha256"]
+    refseq_hash = local[0].row["refseq_sha256"]
+    if (
+        require_object(product["input"], "product.input").get("sha256") != input_hash
+        or require_object(product["refseq"], "product.refseq").get("sha256")
+        != refseq_hash
+    ):
+        raise AcceptanceError(
+            "contention investigation receipt product input/refseq identity is stale"
+        )
+    process_metrics = require_object(
+        product["process_metrics"], "contention receipt product.process_metrics"
+    )
+    profile = require_object(receipt["profile"], "contention receipt profile")
+    if profile.get("process_metrics_sha256") != process_metrics.get("sha256"):
+        raise AcceptanceError(
+            "contention investigation receipt process-metrics identities disagree"
+        )
+
+    finding = require_object(receipt["finding"], "contention receipt finding")
+    require_exact_keys(
+        finding,
+        {
+            "acceptance_timing_source",
+            "alternate_timing_waiver",
+            "classification",
+            "diagnostic_timings_used_for_acceptance",
+            "rationale",
+            "rollback_review",
+        },
+        "contention receipt finding",
+    )
+    if (
+        finding["acceptance_timing_source"] != "bound_raw_trials_only"
+        or finding["alternate_timing_waiver"] is not False
+        or finding["diagnostic_timings_used_for_acceptance"] is not False
+        or finding["rollback_review"] != "completed"
+        or finding["classification"]
+        != "short_run_fixed_overhead_and_parallel_contention_not_scaling_blocker"
+    ):
+        raise AcceptanceError("contention investigation receipt finding is invalid")
+    receipt_artifact(
+        receipt_path, finding["rationale"], "contention receipt finding.rationale"
+    )
+    receipt_artifact(
+        receipt_path, receipt["receipt_builder"], "contention receipt receipt_builder"
+    )
+    validate_contention_profile(receipt_path, receipt)
+
+    disposition = require_string(
+        receipt["disposition"], "contention receipt disposition"
+    )
+    if disposition in ("inconclusive", "rollback_required"):
+        raise ProfilingRequired(
+            f"contention investigation disposition is {disposition}"
+        )
+    if disposition != "no_rollback_required_for_bound_capture":
+        raise AcceptanceError(
+            f"contention investigation receipt disposition {disposition!r} is invalid"
+        )
+    return receipt_path, actual_receipt_hash
+
+
 def evaluate(args: argparse.Namespace) -> dict[str, object]:
     supplied_raw_trials = args.raw_trials
     if isinstance(supplied_raw_trials, (str, os.PathLike)):
@@ -775,7 +1990,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
     construction_keys = {(trial.row_id, trial.trial_index) for trial in construction}
     if local_keys & construction_keys:
         raise AcceptanceError("local and construction workload selectors overlap")
-    for identity_field in ("fixture", "method", "input_sha256", "refseq_sha256"):
+    # `fixture` is the frozen workload label, so the local-scoring and
+    # construction variants intentionally use different values even though
+    # they consume the same underlying fixture.  Bind that shared identity by
+    # method and immutable input/refseq hashes; select_workload has already
+    # required one internally consistent fixture label within each matrix.
+    for identity_field in ("method", "input_sha256", "refseq_sha256"):
         local_identity = {trial.row[identity_field] for trial in local}
         construction_identity = {trial.row[identity_field] for trial in construction}
         if local_identity != construction_identity:
@@ -783,20 +2003,44 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
                 f"local/construction matrices differ in {identity_field}"
             )
 
-    # Contention above this boundary mandates profiling before any timing
-    # result may be interpreted, so it deliberately takes precedence over the
-    # downstream speed ratios.
-    for trial in (*local, *construction):
-        user = parse_decimal(trial.row["user_cpu_s"], f"{trial.row_id} user CPU", positive=True)
-        system = parse_decimal(trial.row["system_cpu_s"], f"{trial.row_id} system CPU")
-        ratio = system / user
-        if ratio > Decimal("0.25"):
-            raise ProfilingRequired(
-                f"{trial.row_id} trial {trial.trial_index}: system/user CPU ratio {ratio} exceeds 0.25"
-            )
+    violations = contention_violations(local, construction)
+    receipt_supplied = args.contention_investigation_receipt is not None
+    if not violations and receipt_supplied:
+        raise AcceptanceError(
+            "contention investigation receipt is forbidden when no system/user CPU violations exist"
+        )
+    if violations and not receipt_supplied:
+        first = violations[0]
+        user = parse_decimal(str(first["user_cpu_s"]), "violating user CPU", positive=True)
+        system = parse_decimal(str(first["system_cpu_s"]), "violating system CPU")
+        raise ProfilingRequired(
+            f"{first['row_id']} trial {first['trial_index']}: system/user CPU ratio "
+            f"{system / user} exceeds 0.25"
+        )
 
+    contention_gate: dict[str, object]
+    if violations:
+        receipt_path, receipt_hash = validate_contention_receipt(
+            args, local, construction, violations
+        )
+        contention_gate = {
+            "name": "system_over_user_cpu",
+            "status": "investigated",
+            "limit": "0.25",
+            "violations": len(violations),
+            "disposition": "no_rollback_required_for_bound_capture",
+            "receipt": os.fspath(receipt_path),
+            "receipt_sha256": receipt_hash,
+        }
+    else:
+        contention_gate = {
+            "name": "system_over_user_cpu",
+            "status": "pass",
+            "limit": "0.25",
+            "violations": 0,
+        }
     gates: list[dict[str, object]] = []
-    gates.append({"name": "system_over_user_cpu", "status": "pass", "limit": "0.25"})
+    gates.append(contention_gate)
     local_medians = {
         worker: timing_median(
             by_worker(local, worker), "local_scoring_ms", f"local W{worker} median"
@@ -1001,6 +2245,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="override /proc/meminfo for reproducible/off-host validation",
     )
+    parser.add_argument(
+        "--contention-investigation-receipt",
+        metavar="PATH",
+        help="canonical Phase-4 contention-investigation JSON receipt",
+    )
+    parser.add_argument(
+        "--expected-contention-investigation-receipt-sha256",
+        metavar="HEX",
+        help="expected SHA-256 of the contention-investigation receipt",
+    )
+    parser.add_argument(
+        "--expected-contention-product-revision",
+        metavar="HEX",
+        help="expected product revision bound by the contention receipt",
+    )
+    parser.add_argument(
+        "--expected-contention-dagutil-sha256",
+        metavar="HEX",
+        help="expected dagutil SHA-256 bound by the contention receipt",
+    )
     parser.add_argument("--json-output", help="also atomically write the JSON result")
     return parser
 
@@ -1031,6 +2295,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--physical-memory-bytes must be positive")
     if args.defer_phase3_baseline is not None and not args.defer_phase3_baseline.strip():
         parser.error("--defer-phase3-baseline requires a nonempty reason")
+    contention_arguments = (
+        args.contention_investigation_receipt,
+        args.expected_contention_investigation_receipt_sha256,
+        args.expected_contention_product_revision,
+        args.expected_contention_dagutil_sha256,
+    )
+    if any(value is not None for value in contention_arguments) and not all(
+        value is not None for value in contention_arguments
+    ):
+        parser.error(
+            "all four contention-investigation receipt/product arguments are required together"
+        )
+    if (
+        args.expected_contention_investigation_receipt_sha256 is not None
+        and not SHA256_RE.fullmatch(
+            args.expected_contention_investigation_receipt_sha256
+        )
+    ):
+        parser.error(
+            "--expected-contention-investigation-receipt-sha256 must be a lowercase SHA-256"
+        )
+    if (
+        args.expected_contention_product_revision is not None
+        and not REVISION_RE.fullmatch(args.expected_contention_product_revision)
+    ):
+        parser.error("--expected-contention-product-revision must be a lowercase revision")
+    if (
+        args.expected_contention_dagutil_sha256 is not None
+        and not SHA256_RE.fullmatch(args.expected_contention_dagutil_sha256)
+    ):
+        parser.error(
+            "--expected-contention-dagutil-sha256 must be a lowercase SHA-256"
+        )
     try:
         result = evaluate(args)
         emit_result(result, args.json_output)

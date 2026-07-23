@@ -68,6 +68,41 @@ PHASE6_ACCEPTANCE_SOURCES: Mapping[int, str] = {
 PHASE9_ACCEPTANCE_TOOL_SHA256 = (
     "12eef19f3cad3dcd26363d6dfc951642cdd3b0647ddda98b6f6affb185314568"
 )
+PHASE4_CONTENTION_RECEIPT_NAME = "phase4-contention-investigation.json"
+PHASE4_ACCEPTANCE_DAGUTIL_SHA256 = (
+    "8d135043b6b9fe19d5f971a590d9f52278befa87fd9c6b861c284d69bd4fff54"
+)
+PHASE4_DELEGATED_RESULT_KEYS = frozenset(
+    (
+        "schema_version",
+        "status",
+        "raw_trials",
+        "raw_trial_inputs",
+        "repetitions",
+        "workloads",
+        "phase3_baseline",
+        "gates",
+    )
+)
+PHASE4_DELEGATED_GATE_NAMES = (
+    "system_over_user_cpu",
+    "local_w8_over_w1",
+    "local_w8_over_w4",
+    "construction_w8_over_w1",
+    "construction_w8_over_w4",
+    "parallel_high_water",
+    "rss",
+    "swap_zero",
+    "local_w1_over_phase3_w1",
+)
+PHASE4_DELEGATED_RATIO_LIMITS = {
+    "local_w8_over_w1": "0.50",
+    "local_w8_over_w4": "1.10",
+    "construction_w8_over_w1": "0.50",
+    "construction_w8_over_w4": "1.10",
+    "local_w1_over_phase3_w1": "1.05",
+}
+PHASE4_CONTENTION_VIOLATIONS = 22
 PHASE9_DELEGATED_RESULT_KEYS = frozenset(
     (
         "schema",
@@ -3158,12 +3193,466 @@ def single_row_source(
     return next(iter(owners))
 
 
+@dataclass(frozen=True)
+class Phase4ContentionProfile:
+    """One externally anchored generic-v2 investigation closure."""
+
+    capture_directory: Path
+    capture_signature: tuple[int, ...]
+    ledger_sha256: str
+    member_count: int
+    receipt_path: Path
+    receipt_sha256: str
+    receipt_signature: tuple[int, ...]
+
+
+def audit_phase4_contention_profile(
+    capture_directory: Path,
+    expected_ledger_sha256: str,
+    working_repo_root: Path,
+) -> Phase4ContentionProfile:
+    """Run the immutable generic auditor and bind the exact receipt payload."""
+
+    if HASH_RE.fullmatch(expected_ledger_sha256) is None:
+        raise AcceptanceError(
+            "Phase-4 contention-profile ledger anchor is not canonical "
+            "lowercase SHA-256"
+        )
+    root = canonical_directory(
+        capture_directory, "Phase-4 contention-profile capture directory"
+    )
+    before_signature = _stable_directory_signature(root.lstat())
+    ledger_tool = regular(
+        Path(__file__).with_name("wric_evidence_run_ledger.py"),
+        "Phase-4 contention-profile generic-v2 auditor",
+    )
+    command = [
+        sys.executable,
+        os.fspath(ledger_tool),
+        "audit",
+        "--capture-dir",
+        os.fspath(root),
+        "--expected-ledger-sha256",
+        expected_ledger_sha256,
+    ]
+    environment = {
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TMPDIR": "/tmp",
+        "TZ": "Europe/Sofia",
+    }
+    result = subprocess.run(
+        command,
+        cwd=working_repo_root,
+        env=environment,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+        raise AcceptanceError(
+            f"Phase-4 contention-profile generic-v2 audit failed: {detail}"
+        )
+    if result.stderr:
+        raise AcceptanceError(
+            "Phase-4 contention-profile generic-v2 audit emitted stderr"
+        )
+    try:
+        audit_result = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise AcceptanceError(
+            "Phase-4 contention-profile generic-v2 audit emitted invalid JSON"
+        ) from error
+    if (
+        not isinstance(audit_result, dict)
+        or set(audit_result)
+        != {"ledger", "ledger_sha256", "member_count", "status"}
+        or audit_result.get("ledger") != "wric-evidence-run-ledger.tsv"
+        or audit_result.get("ledger_sha256") != expected_ledger_sha256
+        or audit_result.get("status") != "audited"
+        or isinstance(audit_result.get("member_count"), bool)
+        or not isinstance(audit_result.get("member_count"), int)
+        or audit_result["member_count"] <= 0
+    ):
+        raise AcceptanceError(
+            "Phase-4 contention-profile generic-v2 audit result is not exact"
+        )
+    root_after = canonical_directory(
+        root, "Phase-4 contention-profile capture directory after audit"
+    )
+    after_signature = _stable_directory_signature(root_after.lstat())
+    if root_after != root or after_signature != before_signature:
+        raise AcceptanceError(
+            "Phase-4 contention-profile directory changed during generic-v2 audit"
+        )
+    receipt = regular(
+        root / PHASE4_CONTENTION_RECEIPT_NAME,
+        "Phase-4 contention investigation receipt",
+    )
+    receipt_payload, receipt_signature = _read_capture_control(
+        receipt,
+        "Phase-4 contention investigation receipt",
+        maximum_bytes=4 * 1024 * 1024,
+    )
+    return Phase4ContentionProfile(
+        capture_directory=root,
+        capture_signature=after_signature,
+        ledger_sha256=expected_ledger_sha256,
+        member_count=audit_result["member_count"],
+        receipt_path=receipt,
+        receipt_sha256=sha256_bytes(receipt_payload),
+        receipt_signature=receipt_signature,
+    )
+
+
+def _parse_delegated_phase4_json(stdout: str) -> dict[str, object]:
+    """Parse the direct Phase-4 result without accepting JSON ambiguities."""
+
+    label = "deep Phase-4 acceptance result"
+
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in items:
+            if key in result:
+                raise AcceptanceError(f"{label} duplicates JSON key {key!r}")
+            result[key] = value
+        return result
+
+    def constant(value: str) -> None:
+        raise AcceptanceError(f"{label} contains non-finite number {value}")
+
+    try:
+        payload = json.loads(
+            stdout,
+            object_pairs_hook=pairs,
+            parse_constant=constant,
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise AcceptanceError(f"{label} is invalid JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise AcceptanceError(f"{label} root is not an object")
+    canonical = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    if stdout != canonical:
+        raise AcceptanceError(f"{label} is not exact canonical JSON")
+    return payload
+
+
+def _phase4_result_object(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise AcceptanceError(f"deep Phase-4 acceptance {label} is not an object")
+    return value
+
+
+def _phase4_result_decimal(
+    value: object,
+    label: str,
+    *,
+    positive: bool = False,
+) -> Decimal:
+    if not isinstance(value, str):
+        raise AcceptanceError(
+            f"deep Phase-4 acceptance {label} is not a decimal string"
+        )
+    return decimal(
+        value,
+        f"deep Phase-4 acceptance {label}",
+        positive=positive,
+    )
+
+
+def _validate_delegated_phase4_payload(
+    payload: dict[str, object],
+    raw: RawEvidence,
+    physical_memory: int,
+    profile: Phase4ContentionProfile,
+) -> None:
+    """Bind a direct Phase-4 result to the routed evidence and receipt."""
+
+    if set(payload) != PHASE4_DELEGATED_RESULT_KEYS:
+        raise AcceptanceError(
+            "deep Phase-4 acceptance top-level key set is not exact"
+        )
+    if (
+        payload["schema_version"] != 1
+        or payload["status"] != "pass"
+        or payload["repetitions"] != 5
+    ):
+        raise AcceptanceError(
+            "deep Phase-4 acceptance schema/repetitions/status envelope is not exact"
+        )
+
+    raw_paths = [os.fspath(path) for path in raw.paths]
+    if (
+        len(raw_paths) != 2
+        or len(set(raw_paths)) != 2
+        or payload["raw_trials"] != raw_paths[0]
+        or payload["raw_trial_inputs"] != raw_paths
+    ):
+        raise AcceptanceError(
+            "deep Phase-4 acceptance raw input list/order is not exact"
+        )
+
+    source_paths: dict[str, str] = {}
+    for role, template in (
+        ("local", MEDIUM_DENSE),
+        ("construction", MEDIUM_CACHE),
+    ):
+        owners = {
+            single_row_source(raw, template.format(worker), 5)
+            for worker in (1, 2, 4, 8)
+        }
+        if len(owners) != 1:
+            raise AcceptanceError(
+                f"deep Phase-4 acceptance {role} matrix has multiple raw owners"
+            )
+        source_paths[role] = os.fspath(next(iter(owners)))
+    if (
+        source_paths["local"] == source_paths["construction"]
+        or set(source_paths.values()) != set(raw_paths)
+    ):
+        raise AcceptanceError(
+            "deep Phase-4 acceptance workload/raw ownership is not exact"
+        )
+
+    workloads = _phase4_result_object(payload["workloads"], "workloads")
+    if set(workloads) != {"local", "construction"}:
+        raise AcceptanceError(
+            "deep Phase-4 acceptance workload key set is not exact"
+        )
+    expected_workloads: dict[str, tuple[set[str], str, list[str] | None]] = {
+        "local": (
+            {"row_prefix", "source_raw_trials", "median_ms"},
+            MEDIUM_DENSE.format(""),
+            None,
+        ),
+        "construction": (
+            {
+                "row_prefix",
+                "source_raw_trials",
+                "component_fields",
+                "median_ms",
+            },
+            MEDIUM_CACHE.format(""),
+            [
+                "initial_chart_construction_ms",
+                "local_inside_cache_initialization_ms",
+                "local_outside_cache_initialization_ms",
+            ],
+        ),
+    }
+    workload_medians: dict[str, dict[str, Decimal]] = {}
+    for role, (expected_keys, row_prefix, component_fields) in (
+        expected_workloads.items()
+    ):
+        workload = _phase4_result_object(
+            workloads[role], f"workloads.{role}"
+        )
+        if (
+            set(workload) != expected_keys
+            or workload["row_prefix"] != row_prefix
+            or workload["source_raw_trials"] != [source_paths[role]]
+        ):
+            raise AcceptanceError(
+                f"deep Phase-4 acceptance {role} workload provenance is not exact"
+            )
+        if (
+            component_fields is not None
+            and workload["component_fields"] != component_fields
+        ):
+            raise AcceptanceError(
+                "deep Phase-4 acceptance construction components are not exact"
+            )
+        medians = _phase4_result_object(
+            workload["median_ms"], f"workloads.{role}.median_ms"
+        )
+        if set(medians) != {"1", "2", "4", "8"}:
+            raise AcceptanceError(
+                f"deep Phase-4 acceptance {role} median worker set is not exact"
+            )
+        workload_medians[role] = {}
+        for worker, value in medians.items():
+            workload_medians[role][worker] = _phase4_result_decimal(
+                value,
+                f"workloads.{role}.median_ms[{worker}]",
+                positive=True,
+            )
+
+    baseline = _phase4_result_object(
+        payload["phase3_baseline"], "phase3_baseline"
+    )
+    if set(baseline) != {"status", "phase3_median_ms"} or baseline["status"] != "pass":
+        raise AcceptanceError(
+            "deep Phase-4 acceptance Phase-3 baseline envelope is not exact/pass"
+        )
+    phase3_median = _phase4_result_decimal(
+        baseline["phase3_median_ms"],
+        "phase3_baseline.phase3_median_ms",
+        positive=True,
+    )
+
+    gates = payload["gates"]
+    if (
+        not isinstance(gates, list)
+        or len(gates) != len(PHASE4_DELEGATED_GATE_NAMES)
+        or any(not isinstance(gate, dict) for gate in gates)
+        or [gate["name"] if "name" in gate else None for gate in gates]
+        != list(PHASE4_DELEGATED_GATE_NAMES)
+    ):
+        raise AcceptanceError(
+            "deep Phase-4 acceptance gate list/order is not exact"
+        )
+
+    expected_contention_gate = {
+        "name": "system_over_user_cpu",
+        "status": "investigated",
+        "limit": "0.25",
+        "violations": PHASE4_CONTENTION_VIOLATIONS,
+        "disposition": "no_rollback_required_for_bound_capture",
+        "receipt": os.fspath(profile.receipt_path),
+        "receipt_sha256": profile.receipt_sha256,
+    }
+    if gates[0] != expected_contention_gate:
+        raise AcceptanceError(
+            "deep Phase-4 acceptance investigated contention gate/provenance is not exact"
+        )
+
+    expected_ratio_operands = {
+        "local_w8_over_w1": (
+            workload_medians["local"]["8"],
+            workload_medians["local"]["1"],
+        ),
+        "local_w8_over_w4": (
+            workload_medians["local"]["8"],
+            workload_medians["local"]["4"],
+        ),
+        "construction_w8_over_w1": (
+            workload_medians["construction"]["8"],
+            workload_medians["construction"]["1"],
+        ),
+        "construction_w8_over_w4": (
+            workload_medians["construction"]["8"],
+            workload_medians["construction"]["4"],
+        ),
+        "local_w1_over_phase3_w1": (
+            workload_medians["local"]["1"],
+            phase3_median,
+        ),
+    }
+    for candidate in (gates[1], gates[2], gates[3], gates[4], gates[8]):
+        gate = _phase4_result_object(candidate, "ratio gate")
+        name = gate.get("name")
+        if not isinstance(name, str):
+            raise AcceptanceError(
+                "deep Phase-4 acceptance ratio gate name is not a string"
+            )
+        if (
+            set(gate)
+            != {
+                "name",
+                "status",
+                "ratio",
+                "limit",
+                "numerator",
+                "denominator",
+            }
+            or gate["status"] != "pass"
+            or gate["limit"] != PHASE4_DELEGATED_RATIO_LIMITS[name]
+        ):
+            raise AcceptanceError(
+                f"deep Phase-4 acceptance ratio gate {name} is not exact/pass"
+            )
+        numerator = _phase4_result_decimal(
+            gate["numerator"], f"gate {name} numerator", positive=True
+        )
+        denominator = _phase4_result_decimal(
+            gate["denominator"], f"gate {name} denominator", positive=True
+        )
+        ratio = _phase4_result_decimal(
+            gate["ratio"], f"gate {name} ratio"
+        )
+        expected_numerator, expected_denominator = expected_ratio_operands[name]
+        limit = Decimal(PHASE4_DELEGATED_RATIO_LIMITS[name])
+        if (
+            numerator != expected_numerator
+            or denominator != expected_denominator
+            or ratio != numerator / denominator
+            or ratio > limit
+        ):
+            raise AcceptanceError(
+                f"deep Phase-4 acceptance ratio gate {name} operands/limit are inconsistent"
+            )
+
+    if gates[5] != {"name": "parallel_high_water", "status": "pass"}:
+        raise AcceptanceError(
+            "deep Phase-4 acceptance parallel high-water gate is not exact/pass"
+        )
+
+    rss = _phase4_result_object(gates[6], "RSS gate")
+    expected_rss_cap = min(16 * 1024 * 1024, physical_memory // (4 * 1024))
+    if (
+        set(rss)
+        != {
+            "name",
+            "status",
+            "global_cap_kb",
+            "local",
+            "construction",
+        }
+        or rss["name"] != "rss"
+        or rss["status"] != "pass"
+        or isinstance(rss["global_cap_kb"], bool)
+        or rss["global_cap_kb"] != expected_rss_cap
+    ):
+        raise AcceptanceError(
+            "deep Phase-4 acceptance RSS gate envelope is not exact/pass"
+        )
+    for role in ("local", "construction"):
+        values = _phase4_result_object(rss[role], f"RSS gate {role}")
+        if set(values) != {"w1_max_kb", "w8_max_kb"}:
+            raise AcceptanceError(
+                f"deep Phase-4 acceptance RSS gate {role} keys are not exact"
+            )
+        w1 = values["w1_max_kb"]
+        w8 = values["w8_max_kb"]
+        if (
+            isinstance(w1, bool)
+            or not isinstance(w1, int)
+            or w1 <= 0
+            or isinstance(w8, bool)
+            or not isinstance(w8, int)
+            or w8 <= 0
+            or w8 > 2 * w1
+            or w8 > expected_rss_cap
+        ):
+            raise AcceptanceError(
+                f"deep Phase-4 acceptance RSS gate {role} values are invalid"
+            )
+
+    if gates[7] != {"name": "swap_zero", "status": "pass"}:
+        raise AcceptanceError(
+            "deep Phase-4 acceptance swap gate is not exact/pass"
+        )
+
+
 def deep_phase4_validate(
     raw: RawEvidence,
     phase3_raw_path: Path,
     working_repo_root: Path,
     physical_memory: int,
+    contention_profile_directory: Path,
+    contention_profile_ledger_sha256: str,
 ) -> Mapping[str, object]:
+    profile_before = audit_phase4_contention_profile(
+        contention_profile_directory,
+        contention_profile_ledger_sha256,
+        working_repo_root,
+    )
     tool = regular(
         Path(__file__).with_name("wric_phase4_acceptance.py"),
         "Phase-4 deep acceptance evaluator",
@@ -3179,6 +3668,14 @@ def deep_phase4_validate(
             os.fspath(phase3_raw_path),
             "--physical-memory-bytes",
             str(physical_memory),
+            "--contention-investigation-receipt",
+            os.fspath(profile_before.receipt_path),
+            "--expected-contention-investigation-receipt-sha256",
+            profile_before.receipt_sha256,
+            "--expected-contention-product-revision",
+            PHASE6_ACCEPTANCE_PRODUCT_REVISION,
+            "--expected-contention-dagutil-sha256",
+            PHASE4_ACCEPTANCE_DAGUTIL_SHA256,
         )
     )
     environment = os.environ.copy()
@@ -3192,24 +3689,34 @@ def deep_phase4_validate(
         stderr=subprocess.PIPE,
         check=False,
     )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
-        raise AcceptanceError(f"deep Phase-4 acceptance failed: {detail}")
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
+    profile_after = audit_phase4_contention_profile(
+        contention_profile_directory,
+        contention_profile_ledger_sha256,
+        working_repo_root,
+    )
+    if profile_after != profile_before:
         raise AcceptanceError(
-            f"deep Phase-4 acceptance emitted invalid JSON: {error}"
-        ) from error
-    if not isinstance(payload, dict) or payload.get("status") != "pass":
-        raise AcceptanceError(
-            "deep Phase-4 acceptance did not return final status=pass"
+            "Phase-4 contention-profile closure changed during delegated validation"
         )
+    if result.stderr:
+        raise AcceptanceError(
+            "deep Phase-4 acceptance emitted unexpected stderr"
+        )
+    if result.returncode != 0:
+        detail = result.stdout.strip() or "no diagnostic"
+        raise AcceptanceError(f"deep Phase-4 acceptance failed: {detail}")
+    payload = _parse_delegated_phase4_json(result.stdout)
+    _validate_delegated_phase4_payload(
+        payload,
+        raw,
+        physical_memory,
+        profile_before,
+    )
     return payload
 
 
 Phase4Validator = Callable[
-    [RawEvidence, Path, Path, int], Mapping[str, object]
+    [RawEvidence, Path, Path, int, Path, str], Mapping[str, object]
 ]
 
 
@@ -3774,6 +4281,8 @@ def evaluate(
     evaluation_mode: str,
     base_repo_root: Path,
     working_repo_root: Path,
+    phase4_contention_profile_directory: Path,
+    phase4_contention_profile_ledger_sha256: str,
     phase9_run_ledger_sha256: str,
     phase9_acceptance_tool: Path,
     expected_phase9_acceptance_tool_sha256: str,
@@ -4016,6 +4525,8 @@ def evaluate(
         phase3_raw_path,
         working_repo_root,
         memory_bytes,
+        phase4_contention_profile_directory,
+        phase4_contention_profile_ledger_sha256,
     )
     if not isinstance(phase4_result, Mapping) or phase4_result.get("status") != "pass":
         raise AcceptanceError("deep Phase-4 validator did not return final status=pass")
@@ -4747,6 +5258,12 @@ def parser() -> argparse.ArgumentParser:
         required=True, metavar="LABEL=HASH",
     )
     evaluate_parser.add_argument(
+        "--phase4-contention-profile-dir", type=Path, required=True
+    )
+    evaluate_parser.add_argument(
+        "--expected-phase4-contention-profile-ledger-sha256", required=True
+    )
+    evaluate_parser.add_argument(
         "--expected-phase9-run-ledger-sha256", required=True
     )
     evaluate_parser.add_argument(
@@ -4992,6 +5509,12 @@ def main(
             evaluation_mode=args.evaluation_mode,
             base_repo_root=base_repo_root,
             working_repo_root=working_repo_root,
+            phase4_contention_profile_directory=(
+                args.phase4_contention_profile_dir
+            ),
+            phase4_contention_profile_ledger_sha256=(
+                args.expected_phase4_contention_profile_ledger_sha256
+            ),
             phase9_run_ledger_sha256=phase9_run_ledger_sha256,
             phase9_acceptance_tool=args.phase9_acceptance_tool,
             expected_phase9_acceptance_tool_sha256=(
