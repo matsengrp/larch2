@@ -29,16 +29,20 @@ in this document.
 | Phase | Status | Required evidence |
 |---|---|---|
 | 0. Repair and freeze measurement | complete (audited and sealed) | Thirteen captures are closed: 267 ordinary canonical rows across 60 repeat stages, 27 manifest-approved timeouts, and two real-fixture W1/W8 `high_arity_refinement_refusal` observations. Pending/final audits and strict smokes passed, and the final workload and artifact-ledger SHA-256 values are `32ae82a93cb72a28afaa510391eac83f80f13638d46e1513881d2b484c9dc3ae` and `a33436d78ec6c840427b343615c6b9a7b555a87f989000865873e9c5adeb06bb` |
-| 1. Compile an immutable chart plan | implementation complete; optimized-candidate acceptance pending | Functional/counter gates pass at `208ce23`. The complete Q/C4 evidence and subsequent gate-by-gate diagnosis found the Phase-1 canonical and serial no-regression gates passing, but the current optimized candidate must be frozen and recaptured before this phase can close on the final product |
-| 2. Remove allocations and duplicate work | implementation complete; optimized-candidate acceptance pending | `0c4623b` passes the allocation/build/canonical/full-CTest/targeted-ASAN gates. Q/C4 passed the Phase-2 serial timing and RSS diagnosis; the changed candidate reopens the candidate-bound correctness, timing, RSS, and sanitizer gates |
-| 3. Add one persistent adaptive scheduler | implementation complete; optimized-candidate acceptance pending | Safe one-pool orchestration, full CTest, and targeted TSan pass at `7d294d6`, and the Q/C4 small-case timing diagnosis passed. The final immutable candidate still requires its clean suite, sanitizer, and timing evidence |
-| 4. Parallelize patterns and local scoring | implementation complete; optimized-candidate acceptance pending | `cbf92b6` passes the functional gates. The sealed Q/C4 deep Phase-4 validator and contention investigation passed scaling, Phase-3 serial comparison, RSS, swap, and parallel-high-water gates; candidate-bound recapture and validation remain required |
-| 5. Parallelize a single exact B&B | implementation checkpoint complete; optimized-candidate acceptance pending | `bb29300` plus harness fix `3a10e9c` pass semantics and sanitizer checkpoints, and Q/C4 passed the exact-span, timeout, and RSS diagnosis. The final candidate's fresh full evidence remains pending |
-| 6. Parallelize exact top-K candidates | implementation complete; optimized-candidate acceptance pending | `870c298` passes the in-tree functional matrix. Q/C4 covered the current-product Top-K 1/4/16 worker semantics, repeatability, scaling, admission, and RSS diagnosis; the changed candidate must repeat the authoritative campaign and evaluator |
-| 7. Make lazy charts scalable and adaptive | optimized candidate implemented; authoritative acceptance pending | Immutable Q `a9db72e60f153a95362db544107373817a58a258` has sealed normal/ASAN/TSan closure and a complete C4 campaign, but C7 found forced high-compression lazy W8/W1 `0.682706744372248`, above `2/3`. The retained fingerprint-fusion candidate diagnostic is `0.630021916938`, but it cannot close the gate before an immutable candidate, full tests/sanitizers, a fresh campaign, and a passing evaluator. The production manifest hashes remain `82250bb26d5394d3c2c616e4ccbf606e80eca074e560fd8e3361274655e56718` and `7b934fa0ad8279893d03321724935dccf8df99fa840899652dccdc63c8c37bff` |
-| 8. Parallelize and pipeline candidate generation | sealed retry1 generation gate passes; candidate end-to-end acceptance pending | Attempt 0 remains a sealed failure at W8/W1 `1.287784679`; additive retry1 on R `07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c` passes at `0.403067171046`. Q-aware tool C4 `be5e4a025c357d22fb1a6b41f544e35f2d8a5891` completed and audited the 20-component/430-row Q campaign, and the diagnosis found no Phase-8 failure. The changed candidate still requires its same-workload recapture and strict evaluator decision |
-| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; optimized-candidate acceptance pending | Persistent cache transactions, exact-state reuse, the three-accept worker matrix, durable manifests, and counter contracts pass through `4ef6126`. Q/C4 deep Phase-9 validation and its timing/RSS diagnosis passed before C7 failed later gates; candidate-bound validation, sanitizers, timing, and RSS remain pending |
-| 10. Integrate, tune defaults, and prove parity | implementation in progress; authoritative candidate closure pending | Q has sealed normal/ASAN/TSan closure, and C4 completed and audited all 20 components/430 rows. C7's single pre-default invocation failed closed; diagnosis identified exactly four gaps: forced lazy, physical grammar scaling, primary grammar scaling, and sampled-tree fixed-topology stress. Dirty candidate diagnostics now pass all four limits, but the immutable candidate, full tests/sanitizers, fresh campaign, passing pre-default evaluator, conditional default promotion, and post-default closure all remain pending |
+| 1. Compile an immutable chart plan | complete | Immutable product P `4b5f0efb4b8355916375f4639fff0e0a3abdc03c` passes canonical/counter gates and all five serial no-regression ratios (`0.040746`--`0.563431`, limit `1.05`) in the strict evaluator |
+| 2. Remove allocations and duplicate work | complete | Candidate-bound medium local scoring is `0.014882` of Phase 0 and `0.365246` of Phase 1; small exact is `0.094208` of Phase 1, with both RSS gates passing |
+| 3. Add one persistent adaptive scheduler | complete | Safe one-pool semantics, shutdown/counter contracts, clean sanitizer closure, and the small-case W8/W1 ratio `0.799327` (limit `1.05`) pass |
+| 4. Parallelize patterns and local scoring | complete | Local scoring W8/W1 is `0.262055`, construction W8/W1 is `0.165803`, and local W1/Phase-3 W1 is `0.838877`; RSS, swap, and high-water gates pass. The CPU-contention observation is `investigated` with disposition `no_rollback_required_for_bound_capture`, not a pass gate |
+| 5. Parallelize a single exact B&B | complete | Exact-span W8/W1 is `0.270110` (limit `0.50`); W1 and W8 timeout, global-memory, semantic, and sanitizer gates pass |
+| 6. Parallelize exact top-K candidates | complete | Top-K 1/4/16 semantics and repeat identity pass across required methods; Top-K 4 exact verification W8/W1 is `0.390049`, with parallel activation, admission, RSS, and global bounds passing |
+| 7. Make lazy charts scalable and adaptive | complete | High-compression forced-lazy W8/W1 is `0.631174` (limit `2/3`), small forced-lazy is `0.790565`, and all auto-policy wall ratios pass (`1.089814` maximum) |
+| 8. Parallelize and pipeline candidate generation | complete | The sealed attempt-0 failure `1.287784679` is retained; predeclared retry1 passes at W8/W1 `0.403067171`, with end-to-end W1/W8 versus Phase 7 at `0.143239`/`0.122875` |
+| 9. Parallelize accepted-state cache updates | complete | The `three_real_local_commits` gate passes for seeds 1/7/19 across W1/W2/W4/W8 with exact accepted-sequence and cache-counter parity. Accepted-update W1 profile shares are `0.000665`--`0.000673`, so the speed target is correctly `exempt_below_10_percent` |
+| 10. Integrate, tune defaults, and prove parity | complete | P passes the pre-default evaluator 95/95; its accepted predeclared C2 primary retry is W8/W1 `0.489953` after immutable C1 failed at `0.506532`. Descendant D `2f5d7dc0f2df38b68960dc55f0eaef04a256ba68` passes normal 174/two-skip, ASAN/LSan 174/two-skip, TSan 55/55, default capture, post-capture normal 174/two-skip, and final evaluation 97/97; default/auto is `0.971877` and default/native is `0.006219` |
+
+Checkpoint-time `pending` statements retained inside the phase bodies are
+historical chronology. They do not override this status table, the strict
+final acceptance record, or the completed checklist at the end of this file.
 
 ### Deadline-overlap scheduling exception
 
@@ -1566,13 +1570,24 @@ not waive the gate: record a minimal diagnostic and report the goal blocked.
 
 ## Strict final performance acceptance
 
-The Phase-0 prerequisite for this section is satisfied: a passing wrapper
-calibration was frozen by `prepare`, every required capture and approval
-completed, and `finalize`, pending `audit`, `seal`, and final `audit` all
-succeeded. Earlier development runs remain diagnostic only. Each result below
-still has to be produced with the sealed base and pass its own canonical,
-timing, scaling, RSS, supplemental-manifest, and policy criteria before it can
-satisfy a phase exit criterion.
+The Phase-0 prerequisite and strict performance campaign are complete.
+Immutable product P `4b5f0efb4b8355916375f4639fff0e0a3abdc03c`
+passed all 95 pre-default gates. Its accepted primary result is the
+predeclared P/C2 retry at W8/W1 `0.4899534621334762`; immutable P/C1 remains
+sealed as the failed `0.506532` observation. The Phase-4 contention signal is
+recorded as `investigated` with disposition
+`no_rollback_required_for_bound_capture`, not as a pass gate. Phase 9 proves
+three real local commits and correctly applies its below-10-percent profile
+exemption.
+
+After that pre-default pass, descendant D
+`2f5d7dc0f2df38b68960dc55f0eaef04a256ba68` promoted omitted workers to
+automatic and passed the full normal, ASAN/LSan, targeted TSan, default
+capture, and post-capture normal closures. Its completion-eligible final
+evaluation passes 97/97 gates with no deferred labels; omitted/default
+automatic is `0.9718770014776646` of explicit auto and `0.006219268786980212`
+of native. The commands below remain the reproducible acceptance contract for
+these sealed results.
 
 The Phase-0 harness extensions make the following commands executable. They
 must not be replaced with informal `time` invocations.
@@ -1867,48 +1882,47 @@ remaining in-scope profile-supported work can make meaningful progress.
 
 ## Completion checklist
 
-The `/goal` is complete only when all boxes can truthfully be checked:
+All completion evidence is closed for immutable optimized product P and its
+default-promotion descendant D. P's strict pre-default evaluator passes 95/95
+gates, and D's completion-eligible final evaluator passes 97/97 after its
+normal, ASAN/LSan, TSan, default-capture, and post-capture normal closures.
 
-Immutable product Q's sealed 174-pass/two-skip normal and ASAN inventories and
-55/55 targeted TSan result remain valid historical evidence. They do not
-satisfy the completion gates below after the optimized product changes.
-
-- [ ] Every Phase 0--10 exit criterion passes. Only actions explicitly labelled
+- [x] Every Phase 0--10 exit criterion passes. Only actions explicitly labelled
       conditional may be omitted under their stated profile threshold; omitting
       such an action never waives the phase's exit criteria.
-- [ ] The immutable optimized candidate is committed, clean, locked, and
+- [x] The immutable optimized candidate is committed, clean, locked, and
       recorded with its revision, tree, executable hashes, and exact
       implementation/test scope.
-- [ ] The immutable optimized candidate's canonical semantics match at every
+- [x] The immutable optimized candidate's canonical semantics match at every
       worker count assigned to each case by the required matrix; scheduler
       cases additionally cover `0/auto` and 16.
-- [ ] The immutable optimized candidate's full RelWithDebInfo build and
+- [x] The immutable optimized candidate's full RelWithDebInfo build and
       176-test CTest inventory pass with exactly the two established skips.
-- [ ] The immutable optimized candidate's full serial ASAN/LSan suite passes
+- [x] The immutable optimized candidate's full serial ASAN/LSan suite passes
       with the exact inventory and a clean diagnostic scan.
-- [ ] The immutable optimized candidate's exact 55-test targeted TSan suite
+- [x] The immutable optimized candidate's exact 55-test targeted TSan suite
       passes under the pinned patched runtime with a clean strict scan.
-- [ ] A fresh candidate-bound 20-component campaign completes all expected
+- [x] A fresh candidate-bound 20-component campaign completes all expected
       rows, audits, ledgers, and hashes without reusing Q/C4 result slots.
-- [ ] A new no-clobber strict pre-default evaluator result proves every
+- [x] A new no-clobber strict pre-default evaluator result proves every
       explicit-auto correctness, timing, RSS, policy, stress, and real-scale
       gate passes.
-- [ ] Primary medium grammar-exact wall parity passes exactly as specified.
-- [ ] Eight-worker grammar exact is at least 2.0x faster than one worker.
-- [ ] RSS, chart-memory, and concurrent-verifier bounds pass.
-- [ ] Unpinned explicit-auto mode reaches native parity before any default
+- [x] Primary medium grammar-exact wall parity passes exactly as specified.
+- [x] Eight-worker grammar exact is at least 2.0x faster than one worker.
+- [x] RSS, chart-memory, and concurrent-verifier bounds pass.
+- [x] Unpinned explicit-auto mode reaches native parity before any default
       change.
-- [ ] Only after the strict pre-default pass, a descendant commit promotes
+- [x] Only after the strict pre-default pass, a descendant commit promotes
       omitted workers to automatic while retaining explicit one-worker
       compatibility.
-- [ ] Omitted/default automatic mode matches explicit auto and reaches native
+- [x] Omitted/default automatic mode matches explicit auto and reaches native
       parity in a fresh post-promotion capture and final evaluator result.
-- [ ] The post-default descendant repeats and passes the required full normal,
+- [x] The post-default descendant repeats and passes the required full normal,
       ASAN/LSan, and targeted TSan closures.
-- [ ] Small workloads do not suffer material parallel overhead.
-- [ ] Seedtree 128/16 stress completes; bounded real-scale confirmation either
+- [x] Small workloads do not suffer material parallel overhead.
+- [x] Seedtree 128/16 stress completes; bounded real-scale confirmation either
       completes or records only the exact allowed `expected_infeasible` or
       resource-preflight `scale_limit` contract above.
-- [ ] Documentation and final raw-artifact paths reproduce every claim.
-- [ ] No native baseline algorithm, search budget, validation, or exactness was
+- [x] Documentation and final raw-artifact paths reproduce every claim.
+- [x] No native baseline algorithm, search budget, validation, or exactness was
       weakened.
