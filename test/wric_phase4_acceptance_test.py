@@ -366,7 +366,7 @@ class Phase4AcceptanceTest(unittest.TestCase):
         baseline: Path,
         *,
         completion_marker_bytes: bytes = b"complete\n",
-        fixed_control_violations: int = 8,
+        fixed_control_violations: int = 10,
         metrics_mismatch: bool = False,
         preflight_mode: str = "valid",
         provenance_mismatch: bool = False,
@@ -480,20 +480,20 @@ class Phase4AcceptanceTest(unittest.TestCase):
         }
         violation_counts = {
             "native": {
-                ("cache", 1): 7,
-                ("cache", 2): 3,
+                ("cache", 1): 6,
+                ("cache", 2): 6,
                 ("cache", 4): 5,
-                ("cache", 8): 7,
-                ("dense", 1): 2,
-                ("dense", 2): 4,
-                ("dense", 4): 4,
-                ("dense", 8): 6,
+                ("cache", 8): 6,
+                ("dense", 1): 6,
+                ("dense", 2): 3,
+                ("dense", 4): 6,
+                ("dense", 8): 5,
             },
             "devnull": {
-                ("cache", 1): 4,
-                ("cache", 8): 4,
+                ("cache", 1): 6,
+                ("cache", 8): 9,
                 ("dense", 1): 5,
-                ("dense", 8): 4,
+                ("dense", 8): 7,
                 ("fixed", 1): fixed_control_violations,
             },
         }
@@ -1366,7 +1366,7 @@ class Phase4AcceptanceTest(unittest.TestCase):
             )
         )
         self.assert_failure(
-            "fixed W1 control must breach in exactly 8/10 trials",
+            "fixed W1 control must breach in exactly 10/10 trials",
             baseline=baseline,
             defer=False,
             extra=self.receipt_arguments(

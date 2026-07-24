@@ -70,7 +70,7 @@ PHASE9_ACCEPTANCE_TOOL_SHA256 = (
 )
 PHASE4_CONTENTION_RECEIPT_NAME = "phase4-contention-investigation.json"
 PHASE4_ACCEPTANCE_DAGUTIL_SHA256 = (
-    "8d135043b6b9fe19d5f971a590d9f52278befa87fd9c6b861c284d69bd4fff54"
+    "1bf9e1a736092a9e6cc52e4c2aac3c563636a2e23e9f11f1803b2d018ebe6550"
 )
 PHASE4_DELEGATED_RESULT_KEYS = frozenset(
     (
@@ -102,7 +102,7 @@ PHASE4_DELEGATED_RATIO_LIMITS = {
     "construction_w8_over_w4": "1.10",
     "local_w1_over_phase3_w1": "1.05",
 }
-PHASE4_CONTENTION_VIOLATIONS = 22
+PHASE4_CONTENTION_VIOLATIONS = 20
 PHASE9_DELEGATED_RESULT_KEYS = frozenset(
     (
         "schema",

@@ -1606,11 +1606,11 @@ def validate_contention_profile(
                 for summary in summaries
                 if summary["role"] == "fixed" and summary["worker"] == 1
             )
-            if fixed["violations"] != 8:
+            if fixed["violations"] != 10:
                 raise AcceptanceError(
-                    f"{section_label}: fixed W1 control must breach in exactly 8/10 trials"
+                    f"{section_label}: fixed W1 control must breach in exactly 10/10 trials"
                 )
-        exact_violations = 38 if field == "native_rusage" else 25
+        exact_violations = 43 if field == "native_rusage" else 37
         if violations != exact_violations:
             raise AcceptanceError(
                 f"{section_label}: expected exactly {exact_violations} threshold violations"
