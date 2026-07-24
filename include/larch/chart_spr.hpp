@@ -1393,7 +1393,8 @@ class sampled_tree_projection_context {
 inline sampled_tree_projection_context prepare_sampled_tree_projection(
     clade_grammar const& base, phylo_dag& tree) {
   build_clade_offsets(tree);
-  auto before_tree_grammar = build_clade_grammar(tree);
+  auto before_tree_grammar = build_clade_grammar(
+      tree, clade_grammar_options{.allow_polytomies = true});
   return sampled_tree_projection_context{
       sampled_tree_projection_context::prepared_tag{}, base, tree,
       std::move(before_tree_grammar)};
@@ -4586,6 +4587,37 @@ struct sampled_tree_projected_candidate {
       sampled_tree_projection_path::not_attempted;
 };
 
+// Removing one child from a multifurcating source parent can leave a gap in
+// that tree node's clade-index groups.  The topology is valid, but the grammar
+// builder correctly rejects sparse group indices.  Preserve alternative-edge
+// grouping while compacting every node to a dense [0, k) index range before
+// constructing the clone/diff fallback grammar.
+inline void compact_sampled_tree_projection_clade_indices(phylo_dag& tree) {
+  for (auto node_variant : tree.get_all_nodes()) {
+    std::map<std::size_t, std::vector<std::size_t>> groups;
+    std::visit(
+        [&](auto node) {
+          for (auto edge_variant : node.get_children()) {
+            std::visit(
+                [&](auto edge) {
+                  groups[edge.clade_index()].push_back(edge.index());
+                },
+                edge_variant);
+          }
+        },
+        node_variant);
+    std::size_t compact_index = 0;
+    for (auto const& [unused_old_index, edges] : groups) {
+      (void)unused_old_index;
+      for (auto edge_index : edges) {
+        tree.get_edge_as<edge_kind::clade>(edge_index).clade_index() =
+            compact_index;
+      }
+      ++compact_index;
+    }
+  }
+}
+
 // The path tag is deliberately returned with the task-local result.  Parallel
 // callers reduce it only after their worker operation has joined, avoiding a
 // shared diagnostic counter in the projection hot path.
@@ -4604,7 +4636,11 @@ inline void project_sampled_tree_move_with_path_into(
   }
 
   auto const source_parent_node = index.get_parent(move.src);
-  if (index.get_num_children(source_parent_node) != 2) return;
+  // The allocation-light direct projector is intentionally binary-only, but
+  // the clone/diff projector below is arity agnostic.  Do not reject a move
+  // merely because its source parent is multifurcating: let the direct path
+  // decline it and preserve the complete before/after topology certificate via
+  // the fallback.
   if (project_sampled_tree_move_direct_into(prepared, move, workspace,
                                             output)) {
     output.path = sampled_tree_projection_path::direct;
@@ -4625,7 +4661,7 @@ inline void project_sampled_tree_move_with_path_into(
   std::optional<clade_id> old_sibling;
   for (auto child : index.get_children(source_parent_node)) {
     if (child == move.src) continue;
-    old_sibling = mapped_clade(child);
+    if (!old_sibling) old_sibling = mapped_clade(child);
   }
   if (!old_sibling) return;
 
@@ -4637,8 +4673,10 @@ inline void project_sampled_tree_move_with_path_into(
   candidate.source_tree_move = move;
 
   auto after_tree = apply_spr_move_topology_only(tree, move.src, move.dst);
+  compact_sampled_tree_projection_clade_indices(after_tree);
   build_clade_offsets(after_tree);
-  auto after_tree_grammar = build_clade_grammar(after_tree);
+  auto after_tree_grammar = build_clade_grammar(
+      after_tree, clade_grammar_options{.allow_polytomies = true});
   auto projected = make_candidate_from_tree_diff_prepared(
       prepared, after_tree_grammar, std::move(candidate));
   recycle_sampled_tree_projection_output(output);
@@ -4653,8 +4691,7 @@ inline void project_sampled_tree_move_with_path_into(
 // one resolved worker.  Its fallback half is intentionally identical to the
 // legacy entry point above; the cached certificate builder is confined to a
 // successful direct projection.
-inline void
-project_sampled_tree_move_with_path_into_with_cached_after_refs(
+inline void project_sampled_tree_move_with_path_into_with_cached_after_refs(
     sampled_tree_projection_context const& prepared, spr_move const& move,
     sampled_tree_direct_workspace& workspace,
     sampled_tree_projection_output_slot& output) {
@@ -4669,7 +4706,8 @@ project_sampled_tree_move_with_path_into_with_cached_after_refs(
   }
 
   auto const source_parent_node = index.get_parent(move.src);
-  if (index.get_num_children(source_parent_node) != 2) return;
+  // Keep the same k-ary fallback contract as the serial entry point.  The
+  // cached direct builder remains binary-only and simply returns false here.
   if (project_sampled_tree_move_direct_into_with_cached_after_refs(
           prepared, move, workspace, output)) {
     output.path = sampled_tree_projection_path::direct;
@@ -4690,7 +4728,7 @@ project_sampled_tree_move_with_path_into_with_cached_after_refs(
   std::optional<clade_id> old_sibling;
   for (auto child : index.get_children(source_parent_node)) {
     if (child == move.src) continue;
-    old_sibling = mapped_clade(child);
+    if (!old_sibling) old_sibling = mapped_clade(child);
   }
   if (!old_sibling) return;
 
@@ -4702,8 +4740,10 @@ project_sampled_tree_move_with_path_into_with_cached_after_refs(
   candidate.source_tree_move = move;
 
   auto after_tree = apply_spr_move_topology_only(tree, move.src, move.dst);
+  compact_sampled_tree_projection_clade_indices(after_tree);
   build_clade_offsets(after_tree);
-  auto after_tree_grammar = build_clade_grammar(after_tree);
+  auto after_tree_grammar = build_clade_grammar(
+      after_tree, clade_grammar_options{.allow_polytomies = true});
   auto projected = make_candidate_from_tree_diff_prepared(
       prepared, after_tree_grammar, std::move(candidate));
   recycle_sampled_tree_projection_output(output);
@@ -6883,11 +6923,6 @@ inline phylo_dag build_sampled_tree_from_grammar(
         chosen = productions[(sample_index + clade) % productions.size()];
       }
       auto const& prod = grammar.productions[chosen];
-      if (prod.children.size() != 2) {
-        throw std::runtime_error(
-            "chart SPR sampled-tree source: representative tree requires "
-            "binary productions");
-      }
       for (std::size_t child_i = 0; child_i < prod.children.size(); ++child_i) {
         auto child_idx = self(self, prod.children[child_i]);
         append_synthetic_tree_edge(tree, node_idx, child_idx, child_i);

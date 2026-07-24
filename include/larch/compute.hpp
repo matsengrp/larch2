@@ -806,16 +806,23 @@ inline uint8_t base_to_one_hot(nuc_base b) {
 inline uint8_t fitch_set_from_counts(std::array<uint32_t, 4> const& counts,
                                      uint32_t num_children) {
   if (num_children == 0) return 0;
-  uint8_t intersection = 0;
+
+  // For unordered unit-cost parsimony, assigning state i at this node adds
+  // one change for every child whose optimal state set does not contain i.
+  // Therefore the optimal parent states are exactly those contained in the
+  // largest number of child sets.  This reduces to intersection-if-present,
+  // otherwise-union for binary nodes, while also handling multifurcations.
+  uint32_t max_count = 0;
+  for (auto count : counts) max_count = std::max(max_count, count);
+
+  // Preserve the empty-set sentinel used by topology-update bookkeeping.
+  if (max_count == 0) return 0;
+
+  uint8_t optimal_states = 0;
   for (int i = 0; i < 4; i++) {
-    if (counts[i] == num_children) intersection |= static_cast<uint8_t>(1 << i);
+    if (counts[i] == max_count) optimal_states |= static_cast<uint8_t>(1 << i);
   }
-  if (intersection) return intersection;
-  uint8_t union_set = 0;
-  for (int i = 0; i < 4; i++) {
-    if (counts[i] > 0) union_set |= static_cast<uint8_t>(1 << i);
-  }
-  return union_set;
+  return optimal_states;
 }
 
 // Bottom-up + top-down Fitch pass to assign optimal inner node CGs.

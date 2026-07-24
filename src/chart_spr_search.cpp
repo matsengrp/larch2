@@ -1,11 +1,16 @@
 #include <larch/chart_spr_search.hpp>
 #include <larch/chart_two_chart_oracle.hpp>
 #include <larch/inside_chart_cache.hpp>
+#include <larch/merge.hpp>
+#include <larch/native_optimize.hpp>
 #include <larch/outside_chart_cache.hpp>
 #include <larch/overlay_chain.hpp>
 #include <larch/overlay_chain_compaction.hpp>
+#include <larch/overlay_spr.hpp>
 #include <larch/phase10_report.hpp>
 #include <larch/rank3_rewrite.hpp>
+#include <larch/subtree_weight.hpp>
+#include <larch/weight_ops.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -13,11 +18,14 @@
 #include <locale>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
+#include <random>
 #include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -8666,6 +8674,385 @@ fixed_topology_selected_cache_pattern_scores_for_tests(
 
 namespace {
 
+struct chart_spr_additive_tree_score_evidence {
+  std::uint64_t score = 0;
+  std::size_t grammar_max_arity = 0;
+  std::size_t selected_multifurcation_productions = 0;
+  std::size_t active_pattern_count = 0;
+};
+
+std::uint64_t chart_spr_external_dag_parsimony(phylo_dag& dag) {
+  parsimony_score_ops ops;
+  subtree_weight<parsimony_score_ops> scorer{dag, std::uint32_t{1}};
+  return scorer.compute_weight_below(get_root_idx(dag), ops);
+}
+
+chart_spr_additive_tree_score_evidence chart_spr_exact_selected_tree_parsimony(
+    phylo_dag& tree, chart_options const& options) {
+  build_clade_offsets(tree);
+  auto grammar = build_clade_grammar(
+      tree, clade_grammar_options{.allow_polytomies = true});
+  auto patterns = build_site_patterns(tree, grammar);
+  auto topology = first_rank3_topology(grammar);
+
+  chart_spr_additive_tree_score_evidence evidence;
+  evidence.score =
+      score_selected_topology(grammar, patterns, topology, options);
+  evidence.grammar_max_arity = clade_grammar_max_production_arity(grammar);
+  evidence.active_pattern_count = patterns.patterns.size();
+  for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
+    if (topology.used_production[pid] &&
+        grammar.productions[pid].children.size() > 2) {
+      ++evidence.selected_multifurcation_productions;
+    }
+  }
+  return evidence;
+}
+
+std::size_t chart_spr_additive_worker_count(
+    chart_spr_search_options const& options) {
+  if (options.worker_count != 0) {
+    return std::max<std::size_t>(1, options.worker_count);
+  }
+  return std::max<std::size_t>(1, std::thread::hardware_concurrency());
+}
+
+chart_spr_search_result run_chart_spr_additive_batch_union_search(
+    phylo_dag initial_dag, clade_grammar initial_grammar,
+    chart_spr_search_options const& options) {
+  if (!options.rebuild_after_accept) {
+    throw std::invalid_argument(
+        "chart SPR additive batch union requires rebuild_after_accept");
+  }
+  if (!options.materialize_accepted_moves) {
+    throw std::invalid_argument(
+        "chart SPR additive batch union requires materialized accepted moves");
+  }
+  if (options.semantic_capture != chart_spr_semantic_capture_mode::off) {
+    throw std::invalid_argument(
+        "chart SPR additive batch union does not support canonical semantic "
+        "capture");
+  }
+  if (!options.chart.score_ua_edge) {
+    throw std::invalid_argument(
+        "chart SPR additive batch union requires score_ua_edge=true so exact "
+        "chart and independent external parsimony use the same convention");
+  }
+
+  auto const total_start = std::chrono::steady_clock::now();
+  auto const workers = chart_spr_additive_worker_count(options);
+  thread_pool pool{workers};
+
+  chart_spr_search_result result;
+  result.dag = std::move(initial_dag);
+  result.summary.acceptance_mode =
+      chart_spr_acceptance_mode::fixed_topology_exact;
+  result.summary.candidate_selection = options.candidate_selection;
+  result.summary.commit_mode = options.commit_mode;
+  result.summary.verification_mode = options.verification_mode;
+  result.summary.chain_per_accept_exactness_label =
+      "none_conservative_materialize_rebuild";
+  result.summary.initial_search_state_rebuilds = 1;
+  result.summary.initial_grammar_clade_count = initial_grammar.clades.size();
+  result.summary.initial_grammar_production_count =
+      initial_grammar.productions.size();
+  result.summary.final_grammar_clade_count =
+      result.summary.initial_grammar_clade_count;
+  result.summary.final_grammar_production_count =
+      result.summary.initial_grammar_production_count;
+  result.summary.requested_worker_count = options.worker_count;
+  result.summary.resolved_worker_count = workers;
+  result.summary.local_score_worker_count = workers;
+
+  auto current_grammar = std::move(initial_grammar);
+  auto current_score = chart_spr_external_dag_parsimony(result.dag);
+  result.summary.initial_score = current_score;
+  result.summary.final_score = current_score;
+  {
+    auto initial_patterns = build_site_patterns(result.dag, current_grammar);
+    result.summary.active_pattern_count = initial_patterns.patterns.size();
+  }
+
+  // Match the native optimizer's public seed convention: --seed initializes a
+  // stream and each optimization iteration receives the next 32-bit draw.
+  std::mt19937 seed_stream{options.seed};
+
+  for (std::size_t iteration_index = 0;
+       iteration_index < options.max_iterations; ++iteration_index) {
+    chart_spr_iteration_result iteration;
+    iteration.iteration = iteration_index;
+    iteration.acceptance_mode = chart_spr_acceptance_mode::fixed_topology_exact;
+    iteration.candidate_selection = options.candidate_selection;
+    iteration.additive_batch_union = true;
+    iteration.state_score_before = current_score;
+    iteration.state_score_after = current_score;
+
+    auto generation_start = std::chrono::steady_clock::now();
+    parsimony_score_ops parsimony_ops;
+    auto const sample_seed = seed_stream();
+    subtree_weight<parsimony_score_ops> sampler{result.dag, sample_seed};
+    auto const sampled_stored_score =
+        sampler.compute_weight_below(get_root_idx(result.dag), parsimony_ops);
+    if (sampled_stored_score != current_score) {
+      throw std::logic_error(
+          "chart SPR additive batch union: sampled stored objective disagrees "
+          "with current external score");
+    }
+    auto sampled = sampler.min_weight_sample_tree(parsimony_ops);
+    fitch_assign_compact_genomes(sampled);
+    recompute_edge_mutations(sampled);
+    set_sample_ids_from_cg(sampled);
+    build_clade_offsets(sampled);
+
+    auto const sampled_exact =
+        chart_spr_exact_selected_tree_parsimony(sampled, options.chart);
+    iteration.batch_sampled_tree_exact_chart_score = sampled_exact.score;
+    iteration.batch_sampled_tree_external_score =
+        chart_spr_external_dag_parsimony(sampled);
+    if (iteration.batch_sampled_tree_exact_chart_score !=
+        iteration.batch_sampled_tree_external_score) {
+      throw std::runtime_error(
+          "chart SPR additive batch union: sampled k-ary tree exact chart "
+          "score disagrees with independently rescored tree");
+    }
+
+    tree_index index{sampled, pool};
+    move_enumerator enumerator{index, options.additive_batch_score_threshold};
+    auto max_radius = options.enumeration.sampled_tree_spr_radius != 0
+                          ? options.enumeration.sampled_tree_spr_radius
+                          : compute_tree_max_depth(sampled) * 2;
+    if (max_radius == 0) max_radius = 1;
+
+    std::vector<profitable_move> retained_moves;
+    for (std::size_t radius = 2; radius <= max_radius;) {
+      std::vector<profitable_move> radius_moves;
+      enumerator.find_all_moves_parallel(
+          radius,
+          [&](profitable_move const& move) { radius_moves.push_back(move); },
+          pool);
+      iteration.batch_moves_enumerated += radius_moves.size();
+
+      // Deliberately match the native loop's ordering and cap semantics. The
+      // source enumeration is deterministic, and frozen-toolchain std::sort
+      // supplies the same tie behavior used by larch2's pre-WRIC loop.
+      std::sort(radius_moves.begin(), radius_moves.end(),
+                [](profitable_move const& lhs, profitable_move const& rhs) {
+                  return lhs.score_change < rhs.score_change;
+                });
+      if (options.additive_batch_max_moves_per_radius != 0 &&
+          radius_moves.size() > options.additive_batch_max_moves_per_radius) {
+        radius_moves.resize(options.additive_batch_max_moves_per_radius);
+      }
+      iteration.batch_moves_retained += radius_moves.size();
+      retained_moves.insert(retained_moves.end(), radius_moves.begin(),
+                            radius_moves.end());
+
+      if (radius > max_radius / 2) break;
+      radius *= 2;
+    }
+
+    auto projection = chart_spr_detail::prepare_sampled_tree_projection(
+        current_grammar, sampled);
+    std::vector<grammar_spr_candidate> projected_candidates;
+    projected_candidates.reserve(retained_moves.size());
+    for (auto const& move : retained_moves) {
+      auto candidate = project_tree_spr_move_to_candidate(projection, move);
+      if (!candidate) {
+        ++iteration.candidate_generation.candidates_pruned_after_construction;
+        ++iteration.candidate_generation.candidates_pruned_invalid;
+        continue;
+      }
+      if (!candidate->source_after_topology_productions.has_value() ||
+          candidate->source_after_topology_productions->empty()) {
+        throw std::runtime_error(
+            "chart SPR additive batch union: projected sampled-tree candidate "
+            "has no complete after-topology certificate");
+      }
+
+      ++iteration.batch_moves_projected;
+      ++iteration.candidate_generation.candidates_constructed;
+      ++iteration.candidate_generation.candidates_generated_after_dedup;
+      auto const source_parent = index.get_parent(move.src);
+      auto const source_parent_arity =
+          static_cast<std::size_t>(index.get_num_children(source_parent));
+      iteration.batch_max_source_parent_arity = std::max(
+          iteration.batch_max_source_parent_arity, source_parent_arity);
+      if (source_parent_arity > 2) {
+        ++iteration.batch_multifurcating_moves_projected;
+        ++iteration.candidate_generation.spr_multifurcation_moves_generated;
+      }
+      projected_candidates.push_back(std::move(*candidate));
+    }
+    iteration.candidates_generated = iteration.batch_moves_projected;
+    iteration.candidates_scored = iteration.batch_moves_projected;
+    iteration.candidate_generation_ms = chart_spr_elapsed_ms(
+        generation_start, std::chrono::steady_clock::now());
+
+    result.counters.candidates_constructed +=
+        iteration.candidate_generation.candidates_constructed;
+    result.counters.candidates_pruned_after_construction +=
+        iteration.candidate_generation.candidates_pruned_after_construction;
+    result.counters.candidates_pruned_invalid +=
+        iteration.candidate_generation.candidates_pruned_invalid;
+    result.counters.candidates_generated_after_dedup +=
+        iteration.candidate_generation.candidates_generated_after_dedup;
+    result.counters.spr_multifurcation_moves_generated +=
+        iteration.candidate_generation.spr_multifurcation_moves_generated;
+
+    if (projected_candidates.empty()) {
+      iteration.no_accept_reason =
+          retained_moves.empty()
+              ? "native-ranked sampled-tree enumeration produced no moves"
+              : "no retained sampled-tree move projected to a chart candidate";
+      result.iterations.push_back(std::move(iteration));
+      break;
+    }
+
+    std::vector<phylo_dag> fragments(projected_candidates.size());
+    std::vector<std::size_t> fragment_indices(projected_candidates.size());
+    std::iota(fragment_indices.begin(), fragment_indices.end(), std::size_t{0});
+    parallel_for_each(pool, fragment_indices, [&](std::size_t index_value) {
+      auto const& candidate = projected_candidates[index_value];
+      auto materialized =
+          validate_and_dense_materialize_candidate(current_grammar, candidate);
+
+      std::vector<production_id> after_productions;
+      after_productions.reserve(
+          candidate.source_after_topology_productions->size());
+      for (auto ref : *candidate.source_after_topology_productions) {
+        after_productions.push_back(
+            chart_spr_dense_production_id_for_ref(materialized, ref));
+      }
+      auto after_topology = grammar_topology_from_productions(
+          materialized.grammar, after_productions);
+      (void)validate_grammar_topology(materialized.grammar, after_topology);
+
+      // The complete fragment is built from the projected candidate's exact
+      // after-topology certificate, rather than independently replaying its
+      // raw source move. Materialization only reads `sampled`, and every
+      // worker owns a distinct output slot.
+      fragments[index_value] = materialize_rank3_tree_from_topology(
+          sampled, materialized.grammar, after_topology, true, 0.0F);
+    });
+    iteration.batch_fragments_materialized = fragments.size();
+    iteration.batch_candidate_certificates_materialized = fragments.size();
+
+    auto const reference = get_reference_sequence(result.dag);
+    merge tentative_merger{reference, pool};
+    tentative_merger.add_dag(result.dag);
+    for (auto& fragment : fragments) {
+      tentative_merger.add_dag(std::move(fragment));
+    }
+    tentative_merger.add_dag(sampled);
+    auto tentative_dag = std::move(tentative_merger.get_result());
+    validate_dag(tentative_dag,
+                 "chart SPR additive batch tentative fragment union", pool);
+    iteration.batch_tentative_union_external_score =
+        chart_spr_external_dag_parsimony(tentative_dag);
+
+    auto exact_start = std::chrono::steady_clock::now();
+    subtree_weight<parsimony_score_ops> witness_sampler{
+        tentative_dag, static_cast<std::uint32_t>(sample_seed ^ 0x9e3779b9U)};
+    (void)witness_sampler.compute_weight_below(get_root_idx(tentative_dag),
+                                               parsimony_ops);
+    auto witness = witness_sampler.min_weight_sample_tree(parsimony_ops);
+    fitch_assign_compact_genomes(witness);
+    recompute_edge_mutations(witness);
+    set_sample_ids_from_cg(witness);
+    build_clade_offsets(witness);
+
+    auto const witness_exact =
+        chart_spr_exact_selected_tree_parsimony(witness, options.chart);
+    iteration.batch_exact_witness_chart_score = witness_exact.score;
+    iteration.batch_exact_witness_external_score =
+        chart_spr_external_dag_parsimony(witness);
+    iteration.batch_exact_witness_multifurcation_productions =
+        witness_exact.selected_multifurcation_productions;
+    iteration.batch_exact_witness_score_parity =
+        iteration.batch_exact_witness_chart_score ==
+        iteration.batch_exact_witness_external_score;
+    iteration.candidates_exact_verified = 1;
+    iteration.exact_verification_ms =
+        chart_spr_elapsed_ms(exact_start, std::chrono::steady_clock::now());
+    ++result.counters.exact_verifications;
+
+    if (!iteration.batch_exact_witness_score_parity) {
+      throw std::runtime_error(
+          "chart SPR additive batch union: exact k-ary witness chart score "
+          "disagrees with independently rescored witness");
+    }
+
+    // Retain the complete additive union, and also materialize the
+    // independently verified exact witness with its globally optimal k-ary
+    // Fitch assignment. The latter guarantees that the accepted output contains
+    // the topology whose chart/external parity was checked, even when shared
+    // input compact genomes were suboptimal for that topology.
+    merge output_merger{reference, pool};
+    output_merger.add_dag(tentative_dag);
+    output_merger.add_dag(witness);
+    auto output_dag = std::move(output_merger.get_result());
+    validate_dag(output_dag, "chart SPR additive batch accepted output", pool);
+    iteration.batch_output_external_score =
+        chart_spr_external_dag_parsimony(output_dag);
+    if (iteration.batch_output_external_score >
+        iteration.batch_exact_witness_external_score) {
+      throw std::logic_error(
+          "chart SPR additive batch union: output lost its exact witness");
+    }
+
+    auto output_grammar = build_clade_grammar(
+        output_dag, clade_grammar_options{.allow_polytomies = true});
+    iteration.batch_output_grammar_max_arity =
+        clade_grammar_max_production_arity(output_grammar);
+    ++result.counters.candidate_accepts_attempted;
+
+    if (iteration.batch_exact_witness_external_score <
+            iteration.batch_sampled_tree_external_score &&
+        iteration.batch_exact_witness_external_score < current_score &&
+        iteration.batch_output_external_score < current_score) {
+      result.dag = std::move(output_dag);
+      current_grammar = std::move(output_grammar);
+      current_score = iteration.batch_output_external_score;
+      iteration.state_score_after = current_score;
+      iteration.accepted_move_committed = true;
+      ++result.counters.accepted_moves;
+      ++result.counters.sidecar_rebuilds_after_accept;
+      ++result.counters.grammar_rebuilds;
+      ++result.counters.pattern_rebuilds;
+      result.summary.final_score = current_score;
+      result.summary.final_grammar_clade_count = current_grammar.clades.size();
+      result.summary.final_grammar_production_count =
+          current_grammar.productions.size();
+      result.summary.active_pattern_count = witness_exact.active_pattern_count;
+      result.iterations.push_back(std::move(iteration));
+      continue;
+    }
+
+    ++result.counters.rejected_moves;
+    iteration.no_accept_reason =
+        "additive fragment union did not produce an exact chart-verified "
+        "witness below the refitted sampled baseline and an output that lowers "
+        "independent DAG parsimony";
+    result.iterations.push_back(std::move(iteration));
+    break;
+  }
+
+  result.summary.iterations = result.iterations.size();
+  chart_spr_refresh_search_summary_from_counters(result.summary,
+                                                 result.counters);
+  result.summary.initial_search_state_rebuilds = 1;
+  result.summary.full_search_state_rebuilds =
+      result.counters.sidecar_rebuilds_after_accept;
+  result.summary.final_score = current_score;
+  result.summary.total_ms =
+      chart_spr_elapsed_ms(total_start, std::chrono::steady_clock::now());
+  for (auto const& iteration : result.iterations) {
+    result.summary.candidate_generation_ms += iteration.candidate_generation_ms;
+    result.summary.exact_verification_ms += iteration.exact_verification_ms;
+  }
+  return result;
+}
+
 // These fields describe work performed by a committed accept transaction, not
 // merely the candidate selected by the acceptance gate.  Keep the selected
 // candidate (`accepted` and canonical candidate records) intact for semantic
@@ -8679,9 +9066,13 @@ void chart_spr_discard_uncommitted_accept_transaction_evidence(
 
 }  // namespace
 
-chart_spr_search_result run_chart_spr_search(
-    phylo_dag initial_dag, clade_grammar initial_grammar,
-    chart_spr_search_options options) {
+chart_spr_search_result run_chart_spr_search(phylo_dag initial_dag,
+                                             clade_grammar initial_grammar,
+                                             chart_spr_search_options options) {
+  if (options.additive_batch_union) {
+    return run_chart_spr_additive_batch_union_search(
+        std::move(initial_dag), std::move(initial_grammar), options);
+  }
   configure_chart_spr_primary_exact_provenance(options);
   validate_chart_spr_search_loop_options(options);
 

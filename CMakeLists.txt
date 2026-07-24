@@ -793,6 +793,20 @@ set_tests_properties(dagutil_chart_spr_helper_benchmark_seedtree_larger_fixture
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "full_composite_rebuilds: 2")
 
+# Correctness/usability gate for the direct arbitrary-arity additive chart-SPR
+# path. This deliberately asserts an independently rescored 1642 -> <=1627
+# improvement and contains no timing comparison. The timeout is only a
+# deadlock/runaway guard for a medium integration fixture.
+add_test(NAME dagutil_chart_spr_additive_medium
+         COMMAND bash test/dagutil_chart_spr_additive_medium_test.sh
+                 $<TARGET_FILE:dagutil>
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(dagutil_chart_spr_additive_medium
+                     PROPERTIES
+                     LABELS "integration;medium;wric"
+                     RUN_SERIAL TRUE
+                     TIMEOUT 900)
+
 add_test(NAME dagutil_wric_phase9_chart_fluidity_site
          COMMAND dagutil
                  --dag-pb data/test_5_trees/tree_0.pb.gz
@@ -1202,6 +1216,7 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   chart_scheduler_test
                   site_patterns_test chart_trim_test chart_bnb_trim_apply_test
                   chart_spr_test chart_spr_search_test
+                  chart_spr_additive_batch_test
                   chart_spr_pipeline_test plateau_test
                   rank3_rewrite_test chart_two_chart_oracle_test
                   multifurcation_chart_oracle_test

@@ -1312,6 +1312,21 @@ struct chart_spr_search_options {
   lazy_local_admission_test_observer*
       lazy_local_admission_observer_for_tests = nullptr;
   bool verify_lazy_local_task_capacity_ledger_for_tests = false;
+
+  // Usability mode matching the history-DAG optimizer's sample/SPR/merge
+  // semantics.  The ordinary loop treats every overlay as a replacement and
+  // accepts at most one independently improving candidate.  In this mode the
+  // projected SPR candidates from one sampled topology form one additive batch:
+  // their complete fragments are unioned with the current DAG, one concrete
+  // minimum topology is rescored by the k-ary chart, and the whole batch is
+  // committed only when the independently computed DAG parsimony decreases.
+  //
+  // This is deliberately a conservative materialize/rebuild path.  It does not
+  // use the composite lower bound and it is incompatible with local overlay
+  // commits and canonical semantic capture.
+  bool additive_batch_union = false;
+  std::size_t additive_batch_max_moves_per_radius = 50;
+  int additive_batch_score_threshold = -1;
 };
 
 struct chart_spr_exact_candidate_memory_estimate {
@@ -1921,6 +1936,26 @@ struct chart_spr_iteration_result {
   std::vector<std::size_t> canonical_exact_verified_stream_indices;
   std::optional<chart_spr_canonical_exact_evidence>
       canonical_state_exact_before;
+
+  // Populated by additive_batch_union.  A batch is a single accept transaction
+  // containing zero or more independently projected rank-3 SPR moves.
+  bool additive_batch_union = false;
+  std::size_t batch_moves_enumerated = 0;
+  std::size_t batch_moves_retained = 0;
+  std::size_t batch_moves_projected = 0;
+  std::size_t batch_multifurcating_moves_projected = 0;
+  std::size_t batch_max_source_parent_arity = 0;
+  std::size_t batch_fragments_materialized = 0;
+  std::size_t batch_candidate_certificates_materialized = 0;
+  std::size_t batch_output_grammar_max_arity = 0;
+  std::size_t batch_exact_witness_multifurcation_productions = 0;
+  std::uint64_t batch_sampled_tree_exact_chart_score = 0;
+  std::uint64_t batch_sampled_tree_external_score = 0;
+  std::uint64_t batch_tentative_union_external_score = 0;
+  std::uint64_t batch_exact_witness_chart_score = 0;
+  std::uint64_t batch_exact_witness_external_score = 0;
+  std::uint64_t batch_output_external_score = 0;
+  bool batch_exact_witness_score_parity = false;
 };
 
 enum class chart_spr_cache_strategy {

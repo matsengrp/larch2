@@ -4370,16 +4370,15 @@ static void test_single_node_fitch_new_child() {
   // Now I has 3 children: {A, B, C}.
   assert(idx.get_num_children(I) == 3);
 
-  // fitch_set_from_counts uses intersection/union:
-  //   - intersection = bases present in ALL children
-  //   - if intersection non-empty → return intersection, else return union
+  // fitch_set_from_counts selects the bases present in the largest number of
+  // child optimal-state sets.
   //
   // With 3 children {A, B, C}:
-  // Site 0 (pos 1): A=T, B=A, C=A → counts: A=2,T=1 → no base in all 3 → union={A,T}
-  // Site 1 (pos 2): A=A, B=T, C=A → counts: A=2,T=1 → no base in all 3 → union={A,T}
-  // Site 2 (pos 3): A=A, B=A, C=T → counts: A=2,T=1 → no base in all 3 → union={A,T}
+  // Site 0 (pos 1): A=T, B=A, C=A → counts: A=2,T=1 → {A}
+  // Site 1 (pos 2): A=A, B=T, C=A → counts: A=2,T=1 → {A}
+  // Site 2 (pos 3): A=A, B=A, C=T → counts: A=2,T=1 → {A}
   for (std::size_t i = 0; i < nsites; i++) {
-    assert(idx.get_fitch_set(I, i) == (0b0001 | 0b1000));  // {A, T}
+    assert(idx.get_fitch_set(I, i) == 0b0001);  // {A}
   }
 
   // allele_union should be union of all children's alleles: {A, T} for all sites.
@@ -4387,10 +4386,11 @@ static void test_single_node_fitch_new_child() {
     assert(idx.get_allele_union(I, i) == (0b0001 | 0b1000));  // {A, T}
   }
 
-  // Site 2 should have changed: was {A} (intersection of A,A with 2 children),
-  // now {A,T} (union, since no base in all 3 children).
-  // Sites 0,1 were already {A,T} with 2 children (no intersection → union).
-  assert(idx.get_fitch_set(I, 2) != fitch_before[2]);
+  // Sites 0 and 1 changed from the binary disjoint union {A,T} to {A};
+  // site 2 was already {A}.
+  assert(idx.get_fitch_set(I, 0) != fitch_before[0]);
+  assert(idx.get_fitch_set(I, 1) != fitch_before[1]);
+  assert(idx.get_fitch_set(I, 2) == fitch_before[2]);
 
   std::println("  PASS");
 }

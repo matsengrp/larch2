@@ -4,6 +4,7 @@
 #include "test_util.hpp"
 
 #include <cassert>
+#include <cstdlib>
 #include <print>
 #include <random>
 #include <set>
@@ -14,6 +15,74 @@
 
 using namespace larch;
 using larch::test::cg_from_sequence;
+
+// ---------------------------------------------------------------------------
+// Generalized Fitch/Sankoff count helpers
+// ---------------------------------------------------------------------------
+
+static void test_kary_fitch_count_helpers() {
+  std::println("test_kary_fitch_count_helpers");
+
+  auto require = [](bool condition, std::string_view message) {
+    if (!condition) {
+      std::println(stderr, "  FAIL: {}", message);
+      std::abort();
+    }
+  };
+
+  // Three singleton children A, A, C: A is the unique optimal parent state,
+  // with one changing child edge.
+  std::array<uint32_t, 4> repeated_state = {2, 1, 0, 0};
+  require(fitch_set_from_counts(repeated_state, 3) == 0b0001,
+          "A,A,C must select only A");
+  require(fitch_cost_from_counts(repeated_state, 3) == 1,
+          "A,A,C must cost one change");
+
+  // Three mutually disjoint singleton children require two changes.
+  std::array<uint32_t, 4> disjoint_states = {1, 1, 1, 0};
+  require(fitch_set_from_counts(disjoint_states, 3) == 0b0111,
+          "A,C,G must retain all tied optimal states");
+  require(fitch_cost_from_counts(disjoint_states, 3) == 2,
+          "A,C,G must cost two changes");
+
+  // Ambiguous child sets {A,C}, {A,G}, {C,G} tie all three bases for the
+  // maximum membership count and require one change.
+  std::array<uint32_t, 4> ambiguous_states = {2, 2, 2, 0};
+  require(fitch_set_from_counts(ambiguous_states, 3) == 0b0111,
+          "tied ambiguous child sets must retain every maximum");
+  require(fitch_cost_from_counts(ambiguous_states, 3) == 1,
+          "tied ambiguous child sets must cost one change");
+
+  // Binary intersection/union behavior remains unchanged.
+  std::array<uint32_t, 4> binary_disjoint = {1, 1, 0, 0};
+  require(fitch_set_from_counts(binary_disjoint, 2) == 0b0011,
+          "binary disjoint sets must still form their union");
+  require(fitch_cost_from_counts(binary_disjoint, 2) == 1,
+          "binary disjoint sets must still cost one change");
+  std::array<uint32_t, 4> binary_overlap = {2, 1, 0, 0};
+  require(fitch_set_from_counts(binary_overlap, 2) == 0b0001,
+          "binary overlapping sets must still form their intersection");
+  require(fitch_cost_from_counts(binary_overlap, 2) == 0,
+          "binary overlapping sets must still cost no change");
+
+  // A unary ambiguous child retains its full set without adding cost, and an
+  // empty bookkeeping node retains the empty-set sentinel.
+  require(fitch_set_from_counts(binary_disjoint, 1) == 0b0011,
+          "a unary node must retain its child's ambiguity");
+  require(fitch_cost_from_counts(binary_disjoint, 1) == 0,
+          "a unary node must cost no change");
+  std::array<uint32_t, 4> empty = {0, 0, 0, 0};
+  require(fitch_set_from_counts(empty, 0) == 0,
+          "an empty node must retain the empty-set sentinel");
+  require(fitch_cost_from_counts(empty, 0) == 0,
+          "an empty node must cost no change");
+  require(fitch_set_from_counts(empty, 1) == 0,
+          "an empty unary bookkeeping set must remain empty");
+  require(fitch_cost_from_counts(empty, 1) == 0,
+          "an empty unary bookkeeping set must preserve its zero cost");
+
+  std::println("  PASS");
+}
 
 // ---------------------------------------------------------------------------
 // helpers (same patterns as optimize_test.cpp)
@@ -182,6 +251,71 @@ static phylo_dag make_sample_dag() {
 
   recompute_edge_mutations(d);
   return d;
+}
+
+struct kary_move_delta_fixture {
+  phylo_dag tree;
+  std::size_t src;
+  std::size_t dst;
+  std::size_t source_parent;
+  std::size_t lca;
+};
+
+// One-site tree whose selected SPR removes G from the three-way (A,C,G)
+// source parent and inserts it beside T:
+//
+//          root                       root
+//         /    \                     /    \
+//      source    T       ->       source   new
+//      / | \                       / \     / \
+//     A  C  G                     A   C   G   T
+//
+// Both trees have parsimony three.  The source-parent contribution changes
+// from two to one while the new binary node contributes one.  Treating a
+// disjoint k-ary node as binary incorrectly predicts a delta of +1.
+static kary_move_delta_fixture make_kary_move_delta_fixture() {
+  constexpr std::string_view ref = "A";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto leaf_a = d.append_node<node_kind::leaf>();
+  leaf_a.cg() = cg_from_sequence("A", ref);
+  leaf_a.sample_id() = "leaf-A";
+  auto leaf_c = d.append_node<node_kind::leaf>();
+  leaf_c.cg() = cg_from_sequence("C", ref);
+  leaf_c.sample_id() = "leaf-C";
+  auto leaf_g = d.append_node<node_kind::leaf>();
+  leaf_g.cg() = cg_from_sequence("G", ref);
+  leaf_g.sample_id() = "leaf-G";
+  auto leaf_t = d.append_node<node_kind::leaf>();
+  leaf_t.cg() = cg_from_sequence("T", ref);
+  leaf_t.sample_id() = "leaf-T";
+
+  auto root = d.append_node<node_kind::inner>();
+  auto source_parent = d.append_node<node_kind::inner>();
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), source_parent.index(), 0);
+  add_edge(d, root.index(), leaf_t.index(), 1);
+  add_edge(d, source_parent.index(), leaf_a.index(), 0);
+  add_edge(d, source_parent.index(), leaf_c.index(), 1);
+  add_edge(d, source_parent.index(), leaf_g.index(), 2);
+
+  fitch_assign_compact_genomes(d);
+  recompute_edge_mutations(d);
+
+  auto const src_index = leaf_g.index();
+  auto const dst_index = leaf_t.index();
+  auto const source_parent_index = source_parent.index();
+  auto const lca_index = root.index();
+  return {.tree = std::move(d),
+          .src = src_index,
+          .dst = dst_index,
+          .source_parent = source_parent_index,
+          .lca = lca_index};
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +559,80 @@ static std::size_t count_tree_mutations(phylo_dag& tree) {
   return total;
 }
 
+static std::size_t independently_score_tree_parsimony(phylo_dag& tree) {
+  parsimony_score_ops ops;
+  subtree_weight<parsimony_score_ops> scorer{tree, std::uint32_t{1}};
+  return scorer.compute_weight_below(get_root_idx(tree), ops);
+}
+
+static void test_kary_move_delta_matches_refitted_tree() {
+  std::println("test_kary_move_delta_matches_refitted_tree");
+
+  auto require = [](bool condition, std::string_view message) {
+    if (!condition) {
+      std::println(stderr, "  FAIL: {}", message);
+      std::abort();
+    }
+  };
+
+  auto fixture = make_kary_move_delta_fixture();
+  auto& tree = fixture.tree;
+  tree_index index{tree};
+  move_enumerator enumerator{index};
+
+  std::size_t kary_source_moves_checked = 0;
+  require(index.get_parent(fixture.src) == fixture.source_parent,
+          "fixture source parent mismatch");
+  require(index.get_num_children(fixture.source_parent) > 2,
+          "SPR source parent must be multifurcating");
+  ++kary_source_moves_checked;
+  require(index.is_ancestor(fixture.lca, fixture.src) &&
+              index.is_ancestor(fixture.lca, fixture.dst),
+          "fixture LCA must contain both SPR endpoints");
+  require(!index.is_ancestor(fixture.src, fixture.dst) &&
+              !index.is_ancestor(fixture.dst, fixture.src),
+          "fixture SPR endpoints must be on separate branches");
+
+  auto const before_mutations = count_tree_mutations(tree);
+  auto const before_external = independently_score_tree_parsimony(tree);
+  require(before_mutations == before_external,
+          "initial mutation count and external parsimony disagree");
+  require(before_external == 3,
+          "fixture must start at its known parsimony score");
+
+  auto const predicted_delta =
+      enumerator.compute_move_score(fixture.src, fixture.dst, fixture.lca);
+
+  auto moved = apply_spr_move_topology_only(tree, fixture.src, fixture.dst);
+  fitch_assign_compact_genomes(moved);
+  recompute_edge_mutations(moved);
+
+  auto const after_mutations = count_tree_mutations(moved);
+  auto const after_external = independently_score_tree_parsimony(moved);
+  require(after_mutations == after_external,
+          "moved mutation count and external parsimony disagree");
+
+  auto const mutation_delta =
+      static_cast<int>(after_mutations) - static_cast<int>(before_mutations);
+  auto const external_delta =
+      static_cast<int>(after_external) - static_cast<int>(before_external);
+  std::println(
+      "  source arity={} predicted={} mutation_delta={} external_delta={}",
+      index.get_num_children(fixture.source_parent), predicted_delta,
+      mutation_delta, external_delta);
+
+  require(kary_source_moves_checked > 0,
+          "no move with a multifurcating source parent was checked");
+  require(after_external == 3,
+          "known moved topology must retain parsimony three");
+  require(mutation_delta == external_delta,
+          "independent actual score deltas disagree");
+  require(predicted_delta == mutation_delta,
+          "k-ary move prediction disagrees with the refitted moved tree");
+
+  std::println("  PASS");
+}
+
 static void test_score_vs_ground_truth() {
   std::println("test_score_vs_ground_truth");
 
@@ -644,10 +852,12 @@ int main() {
   // Disable stdout buffering to prevent hangs with std::println
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 
+  test_kary_fitch_count_helpers();
   test_tree_index_construction();
   test_enumerator_finds_moves();
   test_cached_vs_independent();
   test_pruned_vs_exhaustive();
+  test_kary_move_delta_matches_refitted_tree();
   test_score_vs_ground_truth();
   test_dag_grows();
   test_valid_dag();

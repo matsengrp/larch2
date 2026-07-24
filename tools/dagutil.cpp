@@ -1261,6 +1261,14 @@ Analysis:
                           by default). Acceptance objective and candidate-
                           selection exact-verification policy are separate and
                           reported separately.
+  --chart-spr-additive-batch-union
+                          Run the sampled-tree SPR/fragment-union usability
+                          mode. Retained moves are committed as one additive
+                          batch only when independently scored DAG parsimony
+                          decreases; uses conservative materialize/rebuild
+  --chart-spr-additive-batch-max-moves <N>
+                          Maximum retained moves per sampled-tree SPR radius
+                          in additive-batch mode (default 50; positive integer)
   --chart-spr-local-accept-updates
                           Use DAG-native local accepted-state updates: append
                           accepted overlays to a base-plus-overlay chain and
@@ -1362,6 +1370,10 @@ Analysis:
   --chart-spr-sampled-tree-radius <N>
                           Tree-SPR radius for sampled-tree projected moves
                           (default 0 => tree depth * 2)
+  --chart-spr-sampled-tree-score-threshold <INT>
+                          Signed native move-score threshold for sampled-tree
+                          enumeration. Additive-batch mode defaults to -1 and
+                          uses this value for its retained-move threshold
   --chart-spr-topology-selector <M>
                           Deterministic selector used by fixed-topology mode
                           when no explicit certificate provider is wired
@@ -1462,6 +1474,9 @@ struct args {
   bool chart_spr_candidates = false;
   bool chart_spr_score_local = false;
   bool chart_spr_search = false;
+  bool chart_spr_additive_batch_union = false;
+  std::size_t chart_spr_additive_batch_max_moves = 50;
+  std::optional<int> chart_spr_sampled_tree_score_threshold;
   std::size_t chart_spr_max_iterations = 1;
   std::size_t chart_spr_top_k_exact = 16;
   chart_spr_acceptance_mode chart_spr_acceptance =
@@ -1674,6 +1689,51 @@ static std::size_t parse_positive_size_token_strict(
                              " value must be positive");
   }
   return value;
+}
+
+static int parse_int_token_strict(std::string_view token,
+                                  std::string_view arg_name) {
+  if (token.empty()) {
+    throw std::runtime_error(std::string{arg_name} +
+                             " contains an empty value");
+  }
+  auto digit_begin = std::size_t{0};
+  if (token.front() == '-' || token.front() == '+') {
+    digit_begin = 1;
+  }
+  if (digit_begin == token.size()) {
+    throw std::runtime_error(std::string{arg_name} + " value '" +
+                             std::string{token} +
+                             "' must be a signed decimal integer");
+  }
+  for (auto i = digit_begin; i < token.size(); ++i) {
+    auto const c = token[i];
+    if (c < '0' || c > '9') {
+      throw std::runtime_error(std::string{arg_name} + " value '" +
+                               std::string{token} +
+                               "' must be a signed decimal integer");
+    }
+  }
+
+  std::string owned{token};
+  std::size_t pos = 0;
+  long long parsed = 0;
+  try {
+    parsed = std::stoll(owned, &pos, 10);
+  } catch (std::exception const&) {
+    throw std::runtime_error(std::string{arg_name} + " value '" + owned +
+                             "' is out of range");
+  }
+  if (pos != owned.size()) {
+    throw std::runtime_error(std::string{arg_name} + " value '" + owned +
+                             "' has trailing characters");
+  }
+  if (parsed < static_cast<long long>((std::numeric_limits<int>::min)()) ||
+      parsed > static_cast<long long>((std::numeric_limits<int>::max)())) {
+    throw std::runtime_error(std::string{arg_name} + " value '" + owned +
+                             "' exceeds int range");
+  }
+  return static_cast<int>(parsed);
 }
 
 static std::vector<std::size_t> parse_size_csv(std::string_view text,
@@ -1910,6 +1970,11 @@ static args parse_args(int argc, char** argv) {
       a.chart_spr_score_local = true;
     } else if (arg == "--chart-spr-search") {
       a.chart_spr_search = true;
+    } else if (arg == "--chart-spr-additive-batch-union") {
+      a.chart_spr_additive_batch_union = true;
+    } else if (arg == "--chart-spr-additive-batch-max-moves") {
+      a.chart_spr_additive_batch_max_moves = parse_positive_size_token_strict(
+          next(), "--chart-spr-additive-batch-max-moves");
     } else if (arg == "--chart-spr-local-accept-updates" ||
                arg == "--chart-spr-no-rebuild-after-accept") {
       a.chart_spr_local_accept_updates = true;
@@ -2015,6 +2080,11 @@ static args parse_args(int argc, char** argv) {
     } else if (arg == "--chart-spr-sampled-tree-radius") {
       a.chart_spr_enumeration.sampled_tree_spr_radius =
           parse_size_token_strict(next(), "--chart-spr-sampled-tree-radius");
+    } else if (arg == "--chart-spr-sampled-tree-score-threshold") {
+      auto const threshold = parse_int_token_strict(
+          next(), "--chart-spr-sampled-tree-score-threshold");
+      a.chart_spr_sampled_tree_score_threshold = threshold;
+      a.chart_spr_enumeration.sampled_tree_score_threshold = threshold;
     } else if (arg == "--chart-spr-topology-selector") {
       a.chart_spr_topology_selector = std::string{next()};
       if (!chart_spr_builtin_fixed_topology_selector_name(
@@ -2202,6 +2272,30 @@ static args parse_args(int argc, char** argv) {
     std::cerr << "error: --chart-spr-canonical-sidecar requires "
                  "--chart-spr-canonical-result\n";
     std::exit(1);
+  }
+  if (a.chart_spr_additive_batch_union) {
+    if (!a.chart_spr_search) {
+      std::cerr << "error: --chart-spr-additive-batch-union requires "
+                   "--chart-spr-search\n";
+      std::exit(1);
+    }
+    if (a.chart_spr_local_accept_updates) {
+      std::cerr << "error: --chart-spr-additive-batch-union is incompatible "
+                   "with --chart-spr-local-accept-updates\n";
+      std::exit(1);
+    }
+    if (!a.chart_spr_canonical_result.empty() ||
+        !a.chart_spr_canonical_sidecar.empty()) {
+      std::cerr << "error: --chart-spr-additive-batch-union is incompatible "
+                   "with chart-SPR canonical semantic capture\n";
+      std::exit(1);
+    }
+    if (!a.chart_spr_sampled_tree_score_threshold) {
+      // Match the native sample/SPR/merge loop: retain only moves whose
+      // predicted score change is at most -1 unless the caller explicitly
+      // selects another signed threshold.
+      a.chart_spr_enumeration.sampled_tree_score_threshold = -1;
+    }
   }
   if (a.wric_lazy_chart_policy == chart_spr_lazy_policy::automatic) {
     auto const supported_state_mode =
@@ -4215,6 +4309,13 @@ static chart_spr_search_options make_chart_spr_search_options(
   options.worker_count = requested_workers;
   options.local_score_worker_count = requested_workers;
   options.rebuild_after_accept = !a.chart_spr_local_accept_updates;
+  options.additive_batch_union = a.chart_spr_additive_batch_union;
+  options.additive_batch_max_moves_per_radius =
+      a.chart_spr_additive_batch_max_moves;
+  if (options.additive_batch_union) {
+    options.additive_batch_score_threshold =
+        options.enumeration.sampled_tree_score_threshold;
+  }
   // Phase 10 cross-cutting surface: mirror the selected commit / verification
   // modes into the search options.  Defaults unchanged.
   options.commit_mode = a.chart_spr_commit;
@@ -4369,37 +4470,88 @@ static void run_chart_spr_search_diagnostic(
   out << "  grammar_max_arity: "
       << clade_grammar_max_production_arity(refinement.grammar) << "\n";
   out << "  arity_support: arity_agnostic_chart_spr\n";
-  out << "  search_mode: "
-      << (options.rebuild_after_accept
-              ? "phase5_accept_reject_materialize_rebuild"
-              : "phase5_accept_reject_overlay_chain_local_commit")
-      << "\n";
-  out << "  accepted_state_update_mode: "
-      << (options.rebuild_after_accept ? "materialize_rebuild"
-                                       : "overlay_chain_local_cache_commit")
-      << "\n";
-  out << "  accepted_state_materialization: "
-      << (options.rebuild_after_accept
-              ? "materialize_dag_and_rebuild"
-              : "none_per_accept_overlay_chain_local_cache_update")
-      << "\n";
-  out << "  final_compaction_mode: "
-      << (options.rebuild_after_accept
-              ? "per_accept_materialized_dag"
-              : "grammar_level_exact_multi_tree_compaction")
-      << "\n";
+  out << "  search_mode: ";
+  if (options.additive_batch_union) {
+    out << "sampled_tree_spr_additive_fragment_union\n";
+  } else {
+    out << (options.rebuild_after_accept
+                ? "phase5_accept_reject_materialize_rebuild"
+                : "phase5_accept_reject_overlay_chain_local_commit")
+        << "\n";
+  }
+  out << "  accepted_state_update_mode: ";
+  if (options.additive_batch_union) {
+    out << "single_transaction_additive_union_materialize_rebuild\n";
+  } else {
+    out << (options.rebuild_after_accept ? "materialize_rebuild"
+                                         : "overlay_chain_local_cache_commit")
+        << "\n";
+  }
+  out << "  accepted_state_materialization: ";
+  if (options.additive_batch_union) {
+    out << "materialize_fragment_union_dag_and_rebuild\n";
+  } else {
+    out << (options.rebuild_after_accept
+                ? "materialize_dag_and_rebuild"
+                : "none_per_accept_overlay_chain_local_cache_update")
+        << "\n";
+  }
+  out << "  final_compaction_mode: ";
+  if (options.additive_batch_union) {
+    out << "accepted_additive_union_dag_no_trim_requirement\n";
+  } else {
+    out << (options.rebuild_after_accept
+                ? "per_accept_materialized_dag"
+                : "grammar_level_exact_multi_tree_compaction")
+        << "\n";
+  }
   out << "  preserves_full_accepted_overlay_dag: "
       << (options.rebuild_after_accept ? "not_applicable" : "true")
       << "\n";
   out << "  actual_dag_mutation: "
       << (search.summary.accepted_moves > 0 ? "true" : "false") << "\n";
-  out << "  acceptance: "
-      << chart_spr_acceptance_mode_name(options.acceptance_mode) << "\n";
-  out << "  candidate_selection: "
-      << chart_spr_candidate_selection_mode_name(options.candidate_selection)
-      << "\n";
-  out << "  candidate_source: "
-      << chart_spr_candidate_source_name(options.enumeration.source) << "\n";
+  out << "  acceptance: ";
+  if (options.additive_batch_union) {
+    out << "exact_witness_and_final_output_external_parsimony_decrease\n";
+  } else {
+    out << chart_spr_acceptance_mode_name(options.acceptance_mode) << "\n";
+  }
+  out << "  candidate_selection: ";
+  if (options.additive_batch_union) {
+    out << "native_predicted_delta_per_radius\n";
+  } else {
+    out << chart_spr_candidate_selection_mode_name(options.candidate_selection)
+        << "\n";
+  }
+  out << "  candidate_source: ";
+  if (options.additive_batch_union) {
+    out << "sampled_tree_native_ranked\n";
+  } else {
+    out << chart_spr_candidate_source_name(options.enumeration.source) << "\n";
+  }
+  if (options.additive_batch_union) {
+    out << "  additive_batch_union: true\n";
+    out << "  additive_batch_max_moves_per_radius: "
+        << options.additive_batch_max_moves_per_radius << "\n";
+    out << "  additive_batch_score_threshold: "
+        << options.additive_batch_score_threshold << "\n";
+    out << "  additive_batch_move_semantics: "
+           "native_compatible_ranked_moves_per_radius\n";
+    out << "  additive_batch_sampled_topology: "
+           "stored_parsimony_minimum_tree\n";
+    out << "  additive_batch_union_semantics: "
+           "current_dag_plus_complete_spr_fragments_plus_sampled_tree_plus_"
+           "exact_witness\n";
+    out << "  additive_batch_fragment_materialization: "
+           "projected_chart_candidate_exact_after_topology_certificate\n";
+    out << "  additive_batch_acceptance_objective: "
+           "exact_witness_and_final_output_external_dag_minimum_parsimony_"
+           "decrease\n";
+    out << "  additive_batch_exact_witness_objective: "
+           "kary_fixed_topology_exact_chart\n";
+    out << "  additive_batch_update_semantics: "
+           "all_retained_fragments_one_conservative_transaction\n";
+  }
   out << "  candidate_cap_semantics: "
       << (options.enumeration.max_candidates_is_post_dedup ? "post-dedup"
                                                            : "pre-dedup")
@@ -4468,8 +4620,11 @@ static void run_chart_spr_search_diagnostic(
     out << "none\n";
   }
   out << "  objective: ";
-  if (options.acceptance_mode ==
-      chart_spr_acceptance_mode::lower_bound_heuristic) {
+  if (options.additive_batch_union) {
+    out << "external_dag_minimum_parsimony_with_exact_kary_witness_and_"
+           "output_improvement\n";
+  } else if (options.acceptance_mode ==
+             chart_spr_acceptance_mode::lower_bound_heuristic) {
     out << "composite_lower_bound_heuristic\n";
   } else if (options.acceptance_mode ==
              chart_spr_acceptance_mode::fixed_topology_exact) {
@@ -4481,15 +4636,29 @@ static void run_chart_spr_search_diagnostic(
   // the chain's per-accept exactness label (Work item 1 exactness contract).
   // Defaults are overlay_delta / transient; the labels are reported so a run
   // cannot silently fall back to a cheaper mode.
-  out << "  commit_mode: "
-      << chart_spr_commit_mode_name(options.commit_mode) << "\n";
-  out << "  verification_mode: "
-      << chart_spr_verification_mode_name(options.verification_mode) << "\n";
+  out << "  commit_mode: ";
+  if (options.additive_batch_union) {
+    out << "additive_fragment_union\n";
+  } else {
+    out << chart_spr_commit_mode_name(options.commit_mode) << "\n";
+  }
+  out << "  verification_mode: ";
+  if (options.additive_batch_union) {
+    out << "exact_kary_topology_plus_external_parity\n";
+  } else {
+    out << chart_spr_verification_mode_name(options.verification_mode) << "\n";
+  }
   out << "  local_accept_updates: "
       << (options.rebuild_after_accept ? "false" : "true") << "\n";
   out << "  chain_per_accept_exactness_label: "
       << search.summary.chain_per_accept_exactness_label << "\n";
-  out << "  score_convention: active_cache_plus_single_invariant_offset\n";
+  out << "  score_convention: ";
+  if (options.additive_batch_union) {
+    out << "external_dag_minimum_stored_parsimony_plus_refitched_exact_kary_"
+           "witness_parity\n";
+  } else {
+    out << "active_cache_plus_single_invariant_offset\n";
+  }
   out << "  score_ua_edge: "
       << (a.chart_score_ua_edge ? "true" : "false") << "\n";
   out << "  dominance_mode: "
@@ -5066,6 +5235,43 @@ static void run_chart_spr_search_diagnostic(
   } else {
     for (auto const& iteration : search.iterations) {
       out << "    - iteration: " << iteration.iteration << "\n";
+      if (options.additive_batch_union) {
+        out << "      additive_batch_union: "
+            << (iteration.additive_batch_union ? "true" : "false") << "\n";
+        out << "      batch_moves_enumerated: "
+            << iteration.batch_moves_enumerated << "\n";
+        out << "      batch_moves_retained: " << iteration.batch_moves_retained
+            << "\n";
+        out << "      batch_moves_projected: "
+            << iteration.batch_moves_projected << "\n";
+        out << "      batch_multifurcating_moves_projected: "
+            << iteration.batch_multifurcating_moves_projected << "\n";
+        out << "      batch_max_source_parent_arity: "
+            << iteration.batch_max_source_parent_arity << "\n";
+        out << "      batch_fragments_materialized: "
+            << iteration.batch_fragments_materialized << "\n";
+        out << "      batch_candidate_certificates_materialized: "
+            << iteration.batch_candidate_certificates_materialized << "\n";
+        out << "      batch_output_grammar_max_arity: "
+            << iteration.batch_output_grammar_max_arity << "\n";
+        out << "      batch_exact_witness_multifurcation_productions: "
+            << iteration.batch_exact_witness_multifurcation_productions << "\n";
+        out << "      batch_sampled_tree_exact_chart_score: "
+            << iteration.batch_sampled_tree_exact_chart_score << "\n";
+        out << "      batch_sampled_tree_external_score: "
+            << iteration.batch_sampled_tree_external_score << "\n";
+        out << "      batch_tentative_union_external_score: "
+            << iteration.batch_tentative_union_external_score << "\n";
+        out << "      batch_exact_witness_chart_score: "
+            << iteration.batch_exact_witness_chart_score << "\n";
+        out << "      batch_exact_witness_external_score: "
+            << iteration.batch_exact_witness_external_score << "\n";
+        out << "      batch_output_external_score: "
+            << iteration.batch_output_external_score << "\n";
+        out << "      batch_exact_witness_score_parity: "
+            << (iteration.batch_exact_witness_score_parity ? "true" : "false")
+            << "\n";
+      }
       out << "      candidates_generated: "
           << iteration.candidates_generated << "\n";
       out << "      candidates_scored: " << iteration.candidates_scored
