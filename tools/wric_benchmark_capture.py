@@ -56,7 +56,7 @@ EXPECTED_BUILD_TYPE = "RelWithDebInfo"
 EXPECTED_RELWITHDEBINFO_FLAGS = "-O2 -g -DNDEBUG"
 EXPECTED_EFFECTIVE_CXX_FLAGS = "-O2 -g -DNDEBUG -std=c++26 -freflection"
 TIMED_TRIAL_DIGEST_FIX_REVISION = "3ac59125484790deed7fc21f0ef9572f0781164a"
-SUMMARY_COMPAT_PRODUCT_REVISION = "a9db72e60f153a95362db544107373817a58a258"
+SUMMARY_COMPAT_PRODUCT_REVISION = "4b5f0efb4b8355916375f4639fff0e0a3abdc03c"
 SUMMARY_COMPAT_VARIANT = "timed-trial-current"
 SUMMARY_COMPAT_HARNESS_SHA256 = (
     "ff7f7d2904752c7198f05e13d1eafffaa087ccba9ef70221c5084a91325ef821"
@@ -238,8 +238,8 @@ HISTORICAL_RUN_REVISIONS: Mapping[str, str] = {
 # performance gates, but every such retry must measure the same immutable
 # current product as final acceptance.  The original Phase-3/4/7 captures stay
 # preserved under their earlier capture-tool revisions; this revision admits
-# only the additive Q retries below.
-CURRENT_PRODUCT_REVISION = "a9db72e60f153a95362db544107373817a58a258"
+# only the additive retries for the immutable current product below.
+CURRENT_PRODUCT_REVISION = "4b5f0efb4b8355916375f4639fff0e0a3abdc03c"
 CURRENT_PRODUCT_RUN_REVISIONS: Mapping[str, str] = {
     "phase3": CURRENT_PRODUCT_REVISION,
     "phase4": CURRENT_PRODUCT_REVISION,
@@ -2490,7 +2490,7 @@ def require_run_harness_policy(
     harness: Path,
     provenance: Mapping[str, object],
 ) -> None:
-    """Require Q captures to use the one approved summary-key route."""
+    """Require current-product captures to use the approved summary-key route."""
 
     if product_revision != SUMMARY_COMPAT_PRODUCT_REVISION:
         return
@@ -2506,7 +2506,9 @@ def require_run_harness_policy(
             != SUMMARY_COMPAT_TRACKED_HARNESS_SHA256
             or provenance.get("expected_metadata_sha256") != "-"
         ):
-            fail("Product-Q Phase-9 capture requires its exact tracked harness")
+            fail(
+                "Current-product Phase-9 capture requires its exact tracked harness"
+            )
         return
 
     if (
@@ -2515,11 +2517,11 @@ def require_run_harness_policy(
         != SUMMARY_COMPAT_HARNESS_SHA256
     ):
         fail(
-            "Product-Q non-Phase9 capture requires the approved summary-row-ID "
-            "compatibility harness"
+            "Current-product non-Phase9 capture requires the approved "
+            "summary-row-ID compatibility harness"
         )
     metadata = require_snapshot_shape(
-        provenance.get("metadata"), "Product-Q compatibility harness metadata"
+        provenance.get("metadata"), "current-product compatibility harness metadata"
     )
     expected_metadata_sha256 = provenance.get("expected_metadata_sha256")
     metadata_path = Path(os.fspath(harness) + ".metadata.json")
@@ -2530,7 +2532,7 @@ def require_run_harness_policy(
         or metadata.get("path") != os.fspath(metadata_path)
         or metadata.get("mode") != 0o444
     ):
-        fail("Product-Q compatibility metadata is not fully externally bound")
+        fail("Current-product compatibility metadata is not fully externally bound")
     audit_result = provenance.get("audit_result")
     expected_audit_keys = {
         "harness",
@@ -2547,7 +2549,7 @@ def require_run_harness_policy(
         "variant",
     }
     if not isinstance(audit_result, dict) or set(audit_result) != expected_audit_keys:
-        fail("Product-Q compatibility audit result has an invalid key set")
+        fail("Current-product compatibility audit result has an invalid key set")
     if (
         audit_result.get("schema") != "wric.historical_harness_compat"
         or audit_result.get("schema_version") != 1
@@ -2566,7 +2568,9 @@ def require_run_harness_policy(
         )
         is None
     ):
-        fail("Product-Q compatibility audit result is not the exact approved route")
+        fail(
+            "Current-product compatibility audit result is not the exact approved route"
+        )
 
 
 def require_outer_phase9_layout(outer: Path) -> Path:

@@ -22,16 +22,20 @@ sys.path.insert(0, os.fspath(TOOL.parent))
 import wric_historical_harness_compat as compat
 
 
+Q_PRODUCT_REVISION = "a9db72e60f153a95362db544107373817a58a258"
+P_PRODUCT_REVISION = "4b5f0efb4b8355916375f4639fff0e0a3abdc03c"
 REVISIONS = (
     "208ce23f0c005d3702d114f535fe21564b3b79b6",
     "870c298ff1c0c21901bdf79d341bf97d121f389c",
     "38e9a281396e5263647ba68724414848841525d7",
-    "a9db72e60f153a95362db544107373817a58a258",
+    Q_PRODUCT_REVISION,
+    P_PRODUCT_REVISION,
 )
 EXPECTED_VARIANTS = (
     "phase1-5",
     "phase6",
     "phase7-8",
+    "timed-trial-current",
     "timed-trial-current",
 )
 APPROVED_REVISIONS = {
@@ -43,7 +47,8 @@ APPROVED_REVISIONS = {
     "870c298ff1c0c21901bdf79d341bf97d121f389c": "phase6",
     "38e9a281396e5263647ba68724414848841525d7": "phase7-8",
     "6c8d0c7651c2aa2e5c396d0f57c2e4e18c322310": "phase7-8",
-    "a9db72e60f153a95362db544107373817a58a258": "timed-trial-current",
+    Q_PRODUCT_REVISION: "timed-trial-current",
+    P_PRODUCT_REVISION: "timed-trial-current",
 }
 
 
@@ -214,9 +219,9 @@ class HistoricalHarnessCompatTest(unittest.TestCase):
         self,
     ) -> None:
         product, harness, metadata, result = self.create(
-            REVISIONS[3], "current-summary-only"
+            P_PRODUCT_REVISION, "current-summary-only"
         )
-        source, blob, mode = compat._git_harness(product, REVISIONS[3])
+        source, blob, mode = compat._git_harness(product, P_PRODUCT_REVISION)
         self.assertEqual(
             hashlib.sha256(source).hexdigest(),
             compat.TIMED_TRIAL_SOURCE_SHA256,

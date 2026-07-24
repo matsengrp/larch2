@@ -1032,7 +1032,7 @@ class BenchmarkCaptureTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def q_summary_compat_provenance(self) -> dict[str, object]:
+    def current_summary_compat_provenance(self) -> dict[str, object]:
         provenance = capture_tool.harness_provenance(
             self.fixture.harness,
             self.fixture.harness_sha256,
@@ -1061,8 +1061,10 @@ class BenchmarkCaptureTest(unittest.TestCase):
         )
         return provenance
 
-    def test_product_q_harness_policy_is_exact_and_phase9_separated(self) -> None:
-        compatibility = self.q_summary_compat_provenance()
+    def test_current_product_harness_policy_is_exact_and_phase9_separated(
+        self,
+    ) -> None:
+        compatibility = self.current_summary_compat_provenance()
         capture_tool.require_run_harness_policy(
             "phase3",
             capture_tool.SUMMARY_COMPAT_PRODUCT_REVISION,
@@ -1913,7 +1915,11 @@ class BenchmarkCaptureTest(unittest.TestCase):
     def test_pinned_run_labels_require_their_exact_product_revision(self) -> None:
         self.assertEqual(
             capture_tool.CURRENT_PRODUCT_REVISION,
-            "a9db72e60f153a95362db544107373817a58a258",
+            "4b5f0efb4b8355916375f4639fff0e0a3abdc03c",
+        )
+        self.assertEqual(
+            capture_tool.SUMMARY_COMPAT_PRODUCT_REVISION,
+            capture_tool.CURRENT_PRODUCT_REVISION,
         )
         self.assertEqual(
             capture_tool.HISTORICAL_RUN_REVISIONS["phase6"],
@@ -2017,6 +2023,14 @@ class BenchmarkCaptureTest(unittest.TestCase):
                     "requires exact current-product revision",
                 ):
                     capture_tool.require_run_revision(label, "0" * 40)
+                with self.assertRaisesRegex(
+                    capture_tool.CaptureError,
+                    "requires exact current-product revision",
+                ):
+                    capture_tool.require_run_revision(
+                        label,
+                        "a9db72e60f153a95362db544107373817a58a258",
+                    )
 
         self.assertNotIn(
             "final-default-auto",
