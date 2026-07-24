@@ -1032,7 +1032,10 @@ class BenchmarkCaptureTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def current_summary_compat_provenance(self) -> dict[str, object]:
+    def current_summary_compat_provenance(
+        self,
+        product_revision: str = capture_tool.SUMMARY_COMPAT_PRODUCT_REVISION,
+    ) -> dict[str, object]:
         provenance = capture_tool.harness_provenance(
             self.fixture.harness,
             self.fixture.harness_sha256,
@@ -1048,7 +1051,7 @@ class BenchmarkCaptureTest(unittest.TestCase):
             "metadata": os.fspath(self.fixture.harness_metadata),
             "metadata_sha256": self.fixture.harness_metadata_sha256,
             "product_repo_root": os.fspath(self.fixture.product),
-            "product_revision": capture_tool.SUMMARY_COMPAT_PRODUCT_REVISION,
+            "product_revision": product_revision,
             "schema": "wric.historical_harness_compat",
             "schema_version": 1,
             "status": "ok",
@@ -1107,6 +1110,47 @@ class BenchmarkCaptureTest(unittest.TestCase):
                 self.fixture.product,
                 self.fixture.harness,
                 compatibility,
+            )
+
+        default_compatibility = self.current_summary_compat_provenance(
+            capture_tool.DEFAULT_PROMOTION_PRODUCT_REVISION
+        )
+        capture_tool.require_run_harness_policy(
+            "final-default-auto",
+            capture_tool.DEFAULT_PROMOTION_PRODUCT_REVISION,
+            self.fixture.product,
+            self.fixture.harness,
+            default_compatibility,
+        )
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError, "unapproved run-label/revision pairing"
+        ):
+            capture_tool.require_run_harness_policy(
+                "phase3",
+                capture_tool.DEFAULT_PROMOTION_PRODUCT_REVISION,
+                self.fixture.product,
+                self.fixture.harness,
+                default_compatibility,
+            )
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError, "unapproved run-label/revision pairing"
+        ):
+            capture_tool.require_run_harness_policy(
+                "final-default-auto",
+                capture_tool.CURRENT_PRODUCT_REVISION,
+                self.fixture.product,
+                self.fixture.harness,
+                compatibility,
+            )
+        with self.assertRaisesRegex(
+            capture_tool.CaptureError, "non-Phase9 capture requires"
+        ):
+            capture_tool.require_run_harness_policy(
+                "final-default-auto",
+                capture_tool.DEFAULT_PROMOTION_PRODUCT_REVISION,
+                self.fixture.product,
+                tracked,
+                exact,
             )
 
         wrong_variant = dict(compatibility)
@@ -1987,6 +2031,14 @@ class BenchmarkCaptureTest(unittest.TestCase):
             set(capture_tool.CURRENT_PRODUCT_RUN_REVISIONS),
             expected_current,
         )
+        self.assertEqual(len(expected_current), 14)
+        self.assertEqual(
+            sum(
+                len(capture_tool.RUN_COMPONENTS[label])
+                for label in expected_current
+            ),
+            20,
+        )
         self.assertTrue(
             {
                 "phase3",
@@ -2032,18 +2084,30 @@ class BenchmarkCaptureTest(unittest.TestCase):
                         "a9db72e60f153a95362db544107373817a58a258",
                     )
 
-        self.assertNotIn(
-            "final-default-auto",
-            capture_tool.CURRENT_PRODUCT_RUN_REVISIONS,
+        self.assertEqual(
+            capture_tool.DEFAULT_PROMOTION_PRODUCT_REVISION,
+            "2f5d7dc0f2df38b68960dc55f0eaef04a256ba68",
+        )
+        expected_default_promotion = {
+            "final-default-auto": capture_tool.DEFAULT_PROMOTION_PRODUCT_REVISION,
+        }
+        self.assertEqual(
+            capture_tool.DEFAULT_PROMOTION_RUN_REVISIONS,
+            expected_default_promotion,
         )
         historical_labels = set(capture_tool.HISTORICAL_RUN_REVISIONS)
         current_labels = set(capture_tool.CURRENT_PRODUCT_RUN_REVISIONS)
+        default_promotion_labels = set(
+            capture_tool.DEFAULT_PROMOTION_RUN_REVISIONS
+        )
         self.assertTrue(historical_labels.isdisjoint(current_labels))
+        self.assertTrue(historical_labels.isdisjoint(default_promotion_labels))
+        self.assertTrue(current_labels.isdisjoint(default_promotion_labels))
         self.assertEqual(
             set(capture_tool.RUN_COMPONENTS),
             historical_labels
             | current_labels
-            | {capture_tool.DEFERRED_DEFAULT_RUN_LABEL},
+            | default_promotion_labels,
         )
         current_without_phase3 = {
             label: revision
@@ -2061,11 +2125,62 @@ class BenchmarkCaptureTest(unittest.TestCase):
             capture_tool.require_run_revision(
                 "phase3", capture_tool.CURRENT_PRODUCT_REVISION
             )
-        with self.assertRaisesRegex(
-            capture_tool.CaptureError,
-            "disabled until the default-promotion product revision",
+        capture_tool.require_run_revision(
+            "final-default-auto",
+            capture_tool.DEFAULT_PROMOTION_PRODUCT_REVISION,
+        )
+        for wrong_revision in (
+            capture_tool.CURRENT_PRODUCT_REVISION,
+            "0" * 40,
+        ):
+            with (
+                self.subTest(default_wrong_revision=wrong_revision),
+                self.assertRaisesRegex(
+                    capture_tool.CaptureError,
+                    "requires exact default-promotion product revision",
+                ),
+            ):
+                capture_tool.require_run_revision(
+                    "final-default-auto", wrong_revision
+                )
+        for label in sorted(expected_current):
+            with (
+                self.subTest(current_label_on_default_product=label),
+                self.assertRaisesRegex(
+                    capture_tool.CaptureError,
+                    "requires exact current-product revision",
+                ),
+            ):
+                capture_tool.require_run_revision(
+                    label, capture_tool.DEFAULT_PROMOTION_PRODUCT_REVISION
+                )
+        with mock.patch.dict(
+            capture_tool.DEFAULT_PROMOTION_RUN_REVISIONS,
+            {},
+            clear=True,
+        ), self.assertRaisesRegex(
+            capture_tool.CaptureError, "has no pinned product revision"
         ):
             capture_tool.require_run_revision("final-default-auto", "0" * 40)
+
+    def test_default_promotion_capture_component_is_exact(self) -> None:
+        self.assertEqual(
+            capture_tool.RUN_COMPONENTS["final-default-auto"],
+            (
+                capture_tool.component(
+                    "p0-primary-smt",
+                    "default,auto",
+                    "5",
+                    affinity="U",
+                    extras=(
+                        "--require-wall-ratio",
+                        "chart_spr_grammar_exact@default=1.0",
+                        "--require-worker-policy",
+                        "default=automatic_default",
+                    ),
+                ),
+            ),
+        )
 
     def test_current_retry_capture_components_are_exact(self) -> None:
         self.assertEqual(

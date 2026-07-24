@@ -256,10 +256,12 @@ CURRENT_PRODUCT_RUN_REVISIONS: Mapping[str, str] = {
     "final-real": CURRENT_PRODUCT_REVISION,
     "phase9": CURRENT_PRODUCT_REVISION,
 }
-DEFERRED_DEFAULT_RUN_LABEL = "final-default-auto"
-# The paired default/explicit-auto evidence must come from the later, separately
-# pinned default-promotion product.  Until that immutable revision exists, fail
-# closed instead of treating the absent mapping as permission to use any HEAD.
+DEFAULT_PROMOTION_PRODUCT_REVISION = (
+    "2f5d7dc0f2df38b68960dc55f0eaef04a256ba68"
+)
+DEFAULT_PROMOTION_RUN_REVISIONS: Mapping[str, str] = {
+    "final-default-auto": DEFAULT_PROMOTION_PRODUCT_REVISION,
+}
 
 SAFE_HARNESS_ENVIRONMENT = {
     "HOME": "/nonexistent",
@@ -463,11 +465,6 @@ def fail(message: str) -> NoReturn:
 
 
 def require_run_revision(run_label: str, product_revision: str) -> None:
-    if run_label == DEFERRED_DEFAULT_RUN_LABEL:
-        fail(
-            f"{run_label} is disabled until the default-promotion product "
-            "revision is committed and pinned"
-        )
     historical = HISTORICAL_RUN_REVISIONS.get(run_label)
     if historical is not None and product_revision != historical:
         fail(
@@ -480,9 +477,16 @@ def require_run_revision(run_label: str, product_revision: str) -> None:
             f"{run_label} requires exact current-product revision "
             f"{current}, not {product_revision}"
         )
+    default_promotion = DEFAULT_PROMOTION_RUN_REVISIONS.get(run_label)
+    if default_promotion is not None and product_revision != default_promotion:
+        fail(
+            f"{run_label} requires exact default-promotion product revision "
+            f"{default_promotion}, not {product_revision}"
+        )
     if (
         historical is None
         and current is None
+        and default_promotion is None
         and run_label in RUN_COMPONENTS
     ):
         fail(
@@ -2490,12 +2494,21 @@ def require_run_harness_policy(
     harness: Path,
     provenance: Mapping[str, object],
 ) -> None:
-    """Require current-product captures to use the approved summary-key route."""
+    """Require P/D captures to use their exact approved summary-key route."""
 
-    if product_revision != SUMMARY_COMPAT_PRODUCT_REVISION:
+    if product_revision not in {
+        SUMMARY_COMPAT_PRODUCT_REVISION,
+        DEFAULT_PROMOTION_PRODUCT_REVISION,
+    }:
         return
-    if run_label not in CURRENT_PRODUCT_RUN_REVISIONS:
-        fail("summary-compat product revision has an unapproved run label")
+    approved_revision = CURRENT_PRODUCT_RUN_REVISIONS.get(run_label)
+    if approved_revision is None:
+        approved_revision = DEFAULT_PROMOTION_RUN_REVISIONS.get(run_label)
+    if approved_revision != product_revision:
+        fail(
+            "summary-compat product revision has an unapproved "
+            "run-label/revision pairing"
+        )
     kind = provenance.get("kind")
     expected_harness = product_root / "tools/wric_spr_search_benchmark.sh"
     if run_label == "phase9":

@@ -24,17 +24,20 @@ import wric_historical_harness_compat as compat
 
 Q_PRODUCT_REVISION = "a9db72e60f153a95362db544107373817a58a258"
 P_PRODUCT_REVISION = "4b5f0efb4b8355916375f4639fff0e0a3abdc03c"
+D_PRODUCT_REVISION = "2f5d7dc0f2df38b68960dc55f0eaef04a256ba68"
 REVISIONS = (
     "208ce23f0c005d3702d114f535fe21564b3b79b6",
     "870c298ff1c0c21901bdf79d341bf97d121f389c",
     "38e9a281396e5263647ba68724414848841525d7",
     Q_PRODUCT_REVISION,
     P_PRODUCT_REVISION,
+    D_PRODUCT_REVISION,
 )
 EXPECTED_VARIANTS = (
     "phase1-5",
     "phase6",
     "phase7-8",
+    "timed-trial-current",
     "timed-trial-current",
     "timed-trial-current",
 )
@@ -49,6 +52,7 @@ APPROVED_REVISIONS = {
     "6c8d0c7651c2aa2e5c396d0f57c2e4e18c322310": "phase7-8",
     Q_PRODUCT_REVISION: "timed-trial-current",
     P_PRODUCT_REVISION: "timed-trial-current",
+    D_PRODUCT_REVISION: "timed-trial-current",
 }
 
 
@@ -215,35 +219,50 @@ class HistoricalHarnessCompatTest(unittest.TestCase):
             text,
         )
 
-    def test_current_timed_trial_product_applies_only_summary_correction(
+    def test_current_timed_trial_products_apply_only_summary_correction(
         self,
     ) -> None:
-        product, harness, metadata, result = self.create(
-            P_PRODUCT_REVISION, "current-summary-only"
-        )
-        source, blob, mode = compat._git_harness(product, P_PRODUCT_REVISION)
-        self.assertEqual(
-            hashlib.sha256(source).hexdigest(),
-            compat.TIMED_TRIAL_SOURCE_SHA256,
-        )
-        self.assertEqual(blob, "fa04eeb645b47b7db21fa313bf278110bfebeeb6")
-        self.assertEqual(mode, "100755")
-        self.assertEqual(source.count(compat._SUMMARY_ROW_ID_OLD), 1)
-        expected = source.replace(
-            compat._SUMMARY_ROW_ID_OLD, compat._SUMMARY_ROW_ID_NEW, 1
-        )
-        self.assertEqual(harness.read_bytes(), expected)
-        self.assertEqual(
-            result["harness_sha256"],
-            compat.PHASE78_SUMMARY_ROW_ID_RESULT_SHA256,
-        )
-        document = cast(dict[str, object], json.loads(metadata.read_text()))
-        transformation = cast(dict[str, object], document["transformation"])
-        proof = cast(list[dict[str, object]], transformation["proof"])
-        spec = cast(dict[str, object], transformation["spec"])
-        hunks = cast(list[dict[str, object]], spec["hunks"])
-        self.assertEqual([item["name"] for item in proof], ["summary-row-id-01"])
-        self.assertEqual([item["name"] for item in hunks], ["summary-row-id-01"])
+        for revision, name in (
+            (P_PRODUCT_REVISION, "pre-default-summary-only"),
+            (D_PRODUCT_REVISION, "post-default-summary-only"),
+        ):
+            with self.subTest(revision=revision):
+                product, harness, metadata, result = self.create(revision, name)
+                source, blob, mode = compat._git_harness(product, revision)
+                self.assertEqual(
+                    hashlib.sha256(source).hexdigest(),
+                    compat.TIMED_TRIAL_SOURCE_SHA256,
+                )
+                self.assertEqual(
+                    blob, "fa04eeb645b47b7db21fa313bf278110bfebeeb6"
+                )
+                self.assertEqual(mode, "100755")
+                self.assertEqual(source.count(compat._SUMMARY_ROW_ID_OLD), 1)
+                expected = source.replace(
+                    compat._SUMMARY_ROW_ID_OLD, compat._SUMMARY_ROW_ID_NEW, 1
+                )
+                self.assertEqual(harness.read_bytes(), expected)
+                self.assertEqual(
+                    result["harness_sha256"],
+                    compat.PHASE78_SUMMARY_ROW_ID_RESULT_SHA256,
+                )
+                document = cast(
+                    dict[str, object], json.loads(metadata.read_text())
+                )
+                transformation = cast(
+                    dict[str, object], document["transformation"]
+                )
+                proof = cast(
+                    list[dict[str, object]], transformation["proof"]
+                )
+                spec = cast(dict[str, object], transformation["spec"])
+                hunks = cast(list[dict[str, object]], spec["hunks"])
+                self.assertEqual(
+                    [item["name"] for item in proof], ["summary-row-id-01"]
+                )
+                self.assertEqual(
+                    [item["name"] for item in hunks], ["summary-row-id-01"]
+                )
 
     def test_summary_aggregation_keeps_multi_policy_row_digests_separate(
         self,

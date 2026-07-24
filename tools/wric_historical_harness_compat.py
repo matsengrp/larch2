@@ -155,6 +155,7 @@ _APPROVED_PRODUCT_REVISIONS: dict[str, str] = {
     "6c8d0c7651c2aa2e5c396d0f57c2e4e18c322310": "phase7-8",
     "a9db72e60f153a95362db544107373817a58a258": "timed-trial-current",
     "4b5f0efb4b8355916375f4639fff0e0a3abdc03c": "timed-trial-current",
+    "2f5d7dc0f2df38b68960dc55f0eaef04a256ba68": "timed-trial-current",
 }
 
 
