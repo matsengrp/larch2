@@ -97,7 +97,29 @@ struct site_pattern_options {
   bool build_normalized_binary_patterns = false;
 };
 
+// Optional source observations produced while site-pattern construction is
+// already visiting every reachable compact genome. Duplicate leaf nodes are
+// retained in reachable order because the chart-SPR source fingerprint hashes
+// the complete reachable leaf multiset, not merely the taxon-indexed maps.
+struct site_pattern_source_metadata {
+  std::vector<std::pair<taxon_id, std::uint64_t>>
+      compact_genome_leaf_hashes_by_taxon;
+};
+
 namespace site_patterns_detail {
+
+inline std::uint64_t mix_source_fingerprint_u64(std::uint64_t seed,
+                                                std::uint64_t value) {
+  seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+  return seed;
+}
+
+inline std::uint64_t append_compact_genome_mutation_to_source_fingerprint(
+    std::uint64_t seed, mutation_position pos, nuc_base base) {
+  seed = mix_source_fingerprint_u64(seed, static_cast<std::uint64_t>(pos));
+  return mix_source_fingerprint_u64(seed,
+                                    static_cast<std::uint64_t>(base.raw()));
+}
 
 struct vector_uint8_hash {
   std::size_t operator()(std::vector<std::uint8_t> const& values) const noexcept {
@@ -205,11 +227,17 @@ struct taxon_mutations {
 
 inline std::vector<taxon_mutations> collect_taxon_mutations(
     phylo_dag& dag, clade_grammar const& grammar,
-    std::size_t reference_length) {
+    std::size_t reference_length,
+    std::vector<std::pair<taxon_id, std::uint64_t>>*
+        compact_genome_leaf_hashes_by_taxon = nullptr) {
   validate_taxon_registry(grammar.taxa);
 
   std::vector<taxon_mutations> result(grammar.taxa.id_to_sample_id.size());
   auto reachable = detail::collect_reachable(dag);
+  if (compact_genome_leaf_hashes_by_taxon != nullptr) {
+    compact_genome_leaf_hashes_by_taxon->reserve(
+        grammar.taxa.id_to_sample_id.size());
+  }
 
   for (auto node_idx : reachable.nodes) {
     auto nv = dag.get_node(node_idx);
@@ -236,6 +264,7 @@ inline std::vector<taxon_mutations> collect_taxon_mutations(
             }
 
             std::vector<std::pair<mutation_position, std::uint8_t>> observed;
+            std::uint64_t compact_genome_hash = 1469598103934665603ULL;
             for (auto const& [pos, base] : node.cg()) {
               if (pos == 0 || pos > reference_length) {
                 throw std::runtime_error(
@@ -246,6 +275,11 @@ inline std::vector<taxon_mutations> collect_taxon_mutations(
               }
               observed.emplace_back(
                   pos, strict_decode_mutation_state(base, sample_id, pos));
+              if (compact_genome_leaf_hashes_by_taxon != nullptr) {
+                compact_genome_hash =
+                    append_compact_genome_mutation_to_source_fingerprint(
+                        compact_genome_hash, pos, base);
+              }
             }
 
             if (result[tid].seen && result[tid].mutations != observed) {
@@ -256,6 +290,10 @@ inline std::vector<taxon_mutations> collect_taxon_mutations(
             if (!result[tid].seen) {
               result[tid].mutations = std::move(observed);
               result[tid].seen = true;
+            }
+            if (compact_genome_leaf_hashes_by_taxon != nullptr) {
+              compact_genome_leaf_hashes_by_taxon->emplace_back(
+                  tid, compact_genome_hash);
             }
           } else {
             throw std::runtime_error(
@@ -467,15 +505,20 @@ inline bool is_binary_variable_site_pattern(site_pattern const& pattern) {
   return site_patterns_detail::distinct_state_count(pattern.state_by_taxon) == 2;
 }
 
-inline site_pattern_set build_site_patterns(
-    phylo_dag& dag, clade_grammar const& grammar,
-    site_pattern_options options = {}) {
-  using namespace site_patterns_detail;
+namespace site_patterns_detail {
 
+inline site_pattern_set build_site_patterns_with_optional_source_metadata(
+    phylo_dag& dag, clade_grammar const& grammar,
+    site_pattern_options options,
+    site_pattern_source_metadata* source_metadata) {
   auto const& reference = get_reference_sequence(dag);
   auto reference_states = strict_reference_states(reference);
-  auto taxon_mutations =
-      collect_taxon_mutations(dag, grammar, reference_states.size());
+  std::vector<std::pair<taxon_id, std::uint64_t>>
+      compact_genome_leaf_hashes_by_taxon;
+  auto taxon_mutations = collect_taxon_mutations(
+      dag, grammar, reference_states.size(),
+      source_metadata == nullptr ? nullptr
+                                 : &compact_genome_leaf_hashes_by_taxon);
 
   site_pattern_set result;
   result.taxon_count = grammar.taxa.id_to_sample_id.size();
@@ -559,7 +602,25 @@ inline site_pattern_set build_site_patterns(
         result.patterns.size(), normalized_binary_state_map{});
   }
 
+  if (source_metadata != nullptr) {
+    site_pattern_source_metadata published_metadata;
+    published_metadata.compact_genome_leaf_hashes_by_taxon =
+        std::move(compact_genome_leaf_hashes_by_taxon);
+    *source_metadata = std::move(published_metadata);
+  }
+
   return result;
+}
+
+}  // namespace site_patterns_detail
+
+// Preserve the original three-argument API and function type. Metadata is an
+// opt-in internal extension used by multi-worker chart-SPR state creation.
+inline site_pattern_set build_site_patterns(
+    phylo_dag& dag, clade_grammar const& grammar,
+    site_pattern_options options = {}) {
+  return site_patterns_detail::build_site_patterns_with_optional_source_metadata(
+      dag, grammar, options, nullptr);
 }
 
 inline std::vector<single_site_chart> build_pattern_charts(

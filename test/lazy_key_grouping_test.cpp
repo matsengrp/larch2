@@ -52,6 +52,7 @@ static auto invoke_without_allocations(Function&& function) {
 
 using larch::lazy_key_grouping_detail::group_packed_keys;
 using larch::lazy_key_grouping_detail::packed_key_grouping_result;
+using larch::lazy_key_grouping_detail::packed_key_grouping_sort_policy;
 using larch::lazy_key_grouping_detail::packed_key_grouping_workspace;
 using larch::lazy_key_grouping_detail::packed_key_matrix_view;
 using larch::lazy_key_grouping_detail::packed_key_word;
@@ -362,6 +363,12 @@ static void test_adaptive_gate_and_byte_boundaries_against_quadratic_oracle() {
   CHECK(!should_use_stable_lsd_radix_sort(128, 0));
   CHECK(should_use_stable_lsd_radix_sort(128, 4));
   CHECK(!should_use_stable_lsd_radix_sort(128, 5));
+  CHECK(should_use_stable_lsd_radix_sort(
+      128, 5, packed_key_grouping_sort_policy::parallel_wide_radix));
+  CHECK(should_use_stable_lsd_radix_sort(
+      128, 8, packed_key_grouping_sort_policy::parallel_wide_radix));
+  CHECK(!should_use_stable_lsd_radix_sort(
+      128, 9, packed_key_grouping_sort_policy::parallel_wide_radix));
   CHECK(!should_try_first_occurrence_hash_grouping(127, 1));
   CHECK(should_try_first_occurrence_hash_grouping(128, 1));
   CHECK(!should_try_first_occurrence_hash_grouping(128, 0));
@@ -1019,6 +1026,25 @@ static void test_prepared_result_modes_preserve_exact_classes() {
   }
   fixtures.emplace_back(2, std::move(weak));
 
+  // Profile-shaped wide context keys take the explicit parallel radix route.
+  // Cover every uint32 byte boundary while keeping discovery order unrelated
+  // to lexicographic order.
+  std::vector<packed_key_word> wide(257 * 8);
+  constexpr std::array<packed_key_word, 8> byte_boundaries{
+      0xffu,      0x100u,     0xffffu,     0x10000u,
+      0xffffffu, 0x1000000u, 0xffffffffu, 0u};
+  for (std::size_t input = 0; input < 257; ++input) {
+    auto const value = 256 - input;
+    for (std::size_t word = 0; word < byte_boundaries.size(); ++word) {
+      wide[input * byte_boundaries.size() + word] =
+          byte_boundaries[word] == 0
+              ? 0
+              : byte_boundaries[word] ^
+                    static_cast<packed_key_word>(value * (word * 2 + 1));
+    }
+  }
+  fixtures.emplace_back(byte_boundaries.size(), std::move(wide));
+
   for (auto const& [width, words] : fixtures) {
     auto const count = words.size() / width;
     auto const keys = matrix_view(count, width, words);
@@ -1034,8 +1060,11 @@ static void test_prepared_result_modes_preserve_exact_classes() {
                       packed_key_grouping_result_mode::ordered_classes,
                       packed_key_grouping_result_mode::full}) {
       auto const status = invoke_without_allocations([&] {
+        auto const policy =
+            width > 4 ? packed_key_grouping_sort_policy::parallel_wide_radix
+                      : packed_key_grouping_sort_policy::adaptive;
         return try_group_packed_keys_prepared(keys, workspace, result,
-                                              admitted, mode);
+                                              admitted, mode, policy);
       });
       CHECK(status.succeeded());
       CHECK(result.class_by_input == expected.class_by_input);

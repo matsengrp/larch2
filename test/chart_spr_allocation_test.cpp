@@ -1637,6 +1637,9 @@ static void test_prepared_lazy_local_core_is_allocation_free() {
   (void)larch::chart_spr_search_detail::
       prepare_lazy_local_score_scratch_for_candidate(state, prepared.delta(),
                                                      scratch, nullptr);
+  auto const expected_lazy_context_key_component_count =
+      scratch.lazy_context_key_components.size();
+  CHECK(expected_lazy_context_key_component_count > 0);
 
   allocation_test::allocation_observer observer;
   {
@@ -1712,6 +1715,122 @@ static void test_prepared_lazy_local_core_is_allocation_free() {
         allocation_test::allocation_statistics{});
   check_statistics(preflight_observer, 0, 0, 0, 0, 0);
   CHECK(workspace.operation_boundary_clean());
+
+  // Pin the finite candidate preflight boundary itself. The exact budget must
+  // admit preparation, while E-1 fails before incrementing the prepared-task
+  // counter. Retain the accepted task high-water so the new flattened
+  // context-key component buffer can be inspected after the public boundary.
+  larch::chart_spr_local_score_workspace component_workspace;
+  std::array<larch::chart_spr_local_score_result, 1> component_result;
+  auto score_component_boundary =
+      [&](larch::local_spr_score_options const& score_options) {
+        larch::score_candidates_locally_into(
+            state, candidates, component_result, component_workspace,
+            score_options, 1, checked);
+      };
+
+  larch::local_spr_score_options component_cold_probe;
+  component_cold_probe.admission_memory_budget_bytes = 1;
+  std::size_t component_fixed_resident = 0;
+  try {
+    score_component_boundary(component_cold_probe);
+  } catch (
+      larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+          e) {
+    CHECK(e.candidate_index() == 0);
+    CHECK(e.available_bytes() == 1);
+    component_fixed_resident = e.required_bytes();
+  }
+  CHECK(component_fixed_resident > 1);
+
+  larch::local_spr_score_options component_task_probe;
+  component_task_probe.admission_memory_budget_bytes = component_fixed_resident;
+  std::size_t component_steady_resident = 0;
+  std::size_t component_task_requirement = 0;
+  try {
+    score_component_boundary(component_task_probe);
+  } catch (
+      larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+          e) {
+    CHECK(e.candidate_index() == 0);
+    CHECK(e.available_bytes() < component_fixed_resident);
+    component_steady_resident = component_fixed_resident - e.available_bytes();
+    component_task_requirement = e.required_bytes();
+  }
+  CHECK(component_steady_resident > 0);
+  CHECK(component_task_requirement > 0);
+  auto const component_exact_budget =
+      component_steady_resident + component_task_requirement;
+  CHECK(component_exact_budget > component_steady_resident);
+
+  larch::local_spr_score_options component_one_under;
+  component_one_under.admission_memory_budget_bytes =
+      component_exact_budget - 1;
+  component_one_under.admission_retain_lazy_local_task_storage = true;
+  auto const component_prepared_before =
+      state.counters.lazy_local_prepared_tasks;
+  bool component_one_under_rejected = false;
+  try {
+    score_component_boundary(component_one_under);
+  } catch (
+      larch::chart_spr_search_detail::chart_spr_lazy_local_budget_error const&
+          e) {
+    component_one_under_rejected = true;
+    CHECK(e.candidate_index() == 0);
+    CHECK(e.required_bytes() == component_task_requirement);
+    CHECK(e.available_bytes() + 1 == component_task_requirement);
+  }
+  CHECK(component_one_under_rejected);
+  CHECK(state.counters.lazy_local_prepared_tasks == component_prepared_before);
+  CHECK(component_workspace.operation_boundary_clean());
+
+  larch::local_spr_score_options component_exact_fit;
+  component_exact_fit.admission_memory_budget_bytes = component_exact_budget;
+  component_exact_fit.admission_retain_lazy_local_task_storage = true;
+  score_component_boundary(component_exact_fit);
+  CHECK(component_result.front().valid == results.front().valid);
+  CHECK(component_result.front().lower_bound.value.new_score ==
+        results.front().lower_bound.value.new_score);
+  CHECK(state.counters.lazy_local_prepared_tasks ==
+        component_prepared_before + 1);
+  CHECK(state.counters.lazy_local_preparation_peak_bytes <=
+        component_exact_budget);
+  CHECK(component_workspace.operation_boundary_clean());
+
+  auto& component_scratch =
+      larch::chart_spr_search_detail::local_score_workspace_access::worker(
+          component_workspace, 0)
+          .scratch;
+  CHECK(component_scratch.lazy_context_key_components.empty());
+  CHECK(component_scratch.lazy_context_key_components.capacity() >=
+        expected_lazy_context_key_component_count);
+  auto const component_capacity_bytes =
+      larch::chart_spr_search_detail::local_vector_dynamic_capacity_bytes(
+          component_scratch.lazy_context_key_components);
+  CHECK(component_capacity_bytes > 0);
+  auto const accounted_scratch_bytes = larch::chart_spr_search_detail::
+      local_score_scratch_dynamic_capacity_bytes(component_scratch);
+  auto const accounted_task_bytes =
+      larch::chart_spr_search_detail::local_score_workspace_access::
+          task_dynamic_capacity_bytes(component_workspace, 0);
+  CHECK(component_task_requirement >= accounted_task_bytes);
+  CHECK(component_task_requirement >= component_capacity_bytes);
+
+  std::vector<larch::lazy_overlay_context_key_component> held_components;
+  held_components.swap(component_scratch.lazy_context_key_components);
+  CHECK(accounted_scratch_bytes ==
+        larch::chart_spr_search_detail::
+                local_score_scratch_dynamic_capacity_bytes(component_scratch) +
+            component_capacity_bytes);
+  CHECK(accounted_task_bytes ==
+        larch::chart_spr_search_detail::local_score_workspace_access::
+                task_dynamic_capacity_bytes(component_workspace, 0) +
+            component_capacity_bytes);
+  component_scratch.lazy_context_key_components.swap(held_components);
+  CHECK(larch::chart_spr_search_detail::local_score_workspace_access::
+            task_dynamic_capacity_bytes(component_workspace, 0) ==
+        accounted_task_bytes);
+  CHECK(component_workspace.operation_boundary_clean());
 
   // Every compatibility wrapper whose outer scheduler/result/promotion or
   // fingerprint ownership is not part of the finite envelope fails before

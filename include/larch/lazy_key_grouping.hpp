@@ -281,6 +281,16 @@ enum class packed_key_grouping_result_mode : std::uint8_t {
   full,
 };
 
+// The ordinary adaptive route is tuned for general serial callers. Search
+// waves that are already executing several independent candidates may opt in
+// to the wider radix route: it uses the same admitted storage and publishes
+// exactly the same stable classes, while avoiding comparison-heavy wide-key
+// merge sorts in the bandwidth-saturated lazy-local kernel.
+enum class packed_key_grouping_sort_policy : std::uint8_t {
+  adaptive,
+  parallel_wide_radix,
+};
+
 struct packed_key_grouping_result {
   // Class IDs are assigned by the first input key in each equivalence class.
   std::vector<std::size_t> class_by_input;
@@ -492,7 +502,8 @@ class packed_key_grouping_workspace {
   friend packed_key_grouping_prepared_status try_group_packed_keys_prepared(
       packed_key_matrix_view, packed_key_grouping_workspace&,
       packed_key_grouping_result&, std::size_t,
-      packed_key_grouping_result_mode) noexcept;
+      packed_key_grouping_result_mode,
+      packed_key_grouping_sort_policy) noexcept;
   friend bounded_partition_tuple_grouping_attempt
   try_group_bounded_partition_tuple_prepared(
       bounded_partition_tuple_view, packed_key_grouping_workspace&,
@@ -921,12 +932,18 @@ inline void stable_merge_sort_key_indices(
   }
 }
 
-inline bool should_use_stable_lsd_radix_sort(std::size_t key_count,
-                                             std::size_t key_width) noexcept {
-  // The observed hot lazy-chart shapes have 2046 keys and widths 2--4. Retain
-  // merge sort for small inputs, zero-width keys, and wide tuples where four
-  // counting passes per word would not repay their fixed setup cost.
-  return key_count >= 128 && key_width >= 1 && key_width <= 4;
+inline bool should_use_stable_lsd_radix_sort(
+    std::size_t key_count, std::size_t key_width,
+    packed_key_grouping_sort_policy policy =
+        packed_key_grouping_sort_policy::adaptive) noexcept {
+  // Retain merge sort for small inputs and zero-width keys. Ordinary callers
+  // use radix through width four; an explicitly parallel lazy-local wave may
+  // extend that allocation-free route through the profiled width-eight range.
+  auto const maximum_width =
+      policy == packed_key_grouping_sort_policy::parallel_wide_radix
+          ? std::size_t{8}
+          : std::size_t{4};
+  return key_count >= 128 && key_width >= 1 && key_width <= maximum_width;
 }
 
 inline bool should_try_first_occurrence_hash_grouping(
@@ -1112,7 +1129,15 @@ inline void stable_lsd_radix_sort_key_indices(
   // order. Scattering source indices left-to-right preserves input order for
   // equal complete keys.
   for (auto word = keys.key_width; word-- != 0;) {
-    for (unsigned shift = 0; shift < sizeof(packed_key_word) * 8;
+    packed_key_word maximum_value = 0;
+    for (auto index : *source) {
+      maximum_value =
+          std::max(maximum_value, keys.words[index * keys.key_width + word]);
+    }
+    auto const significant_bits = std::bit_width(maximum_value);
+    auto const significant_bytes =
+        (significant_bits + bits_per_byte - 1) / bits_per_byte;
+    for (unsigned shift = 0; shift < significant_bytes * bits_per_byte;
          shift += bits_per_byte) {
       buckets.fill(0);
       for (auto index : *source) {
@@ -1353,7 +1378,9 @@ inline packed_key_grouping_prepared_status try_group_packed_keys_prepared(
     packed_key_grouping_result& result,
     std::size_t admitted_owned_capacity_bytes,
     packed_key_grouping_result_mode result_mode =
-        packed_key_grouping_result_mode::full) noexcept {
+        packed_key_grouping_result_mode::full,
+    packed_key_grouping_sort_policy sort_policy =
+        packed_key_grouping_sort_policy::adaptive) noexcept {
   auto const shape_status =
       try_validate_packed_key_matrix_for_prepared_grouping(keys);
   if (!shape_status.succeeded()) return shape_status;
@@ -1413,8 +1440,8 @@ inline packed_key_grouping_prepared_status try_group_packed_keys_prepared(
     workspace.sort_order_.resize(keys.key_count);
     workspace.merge_buffer_.resize(keys.key_count);
 
-    if (implementation::should_use_stable_lsd_radix_sort(keys.key_count,
-                                                          keys.key_width)) {
+    if (implementation::should_use_stable_lsd_radix_sort(
+            keys.key_count, keys.key_width, sort_policy)) {
       implementation::stable_lsd_radix_sort_key_indices(
           keys, workspace.sort_order_, workspace.merge_buffer_,
           workspace.radix_buckets_);

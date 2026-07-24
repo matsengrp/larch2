@@ -799,7 +799,7 @@ chart_spr_search_state rebuild_chart_spr_search_state_after_accept(
   }
 
   auto active_build = make_active_search_patterns(
-      rebuilt_dag, rebuilt_grammar, options.chart);
+      rebuilt_dag, rebuilt_grammar, scheduler, options.chart);
   auto state = build_chart_spr_search_state_from_active(
       rebuilt_dag, std::move(rebuilt_grammar), std::move(active_build),
       options.chart, build_exact, options.exact_trim, options.cache, {},
@@ -5306,6 +5306,12 @@ lazy_local_candidate_preflight estimate_lazy_local_candidate_shape_preflight(
                           "chart SPR lazy-local preflight grouping capacity");
   scratch = add(
       scratch,
+      vector_growth_bytes(
+          key_width, sizeof(lazy_overlay_context_key_component),
+          "chart SPR lazy-local preflight context-key components"),
+      "chart SPR lazy-local preflight context-key components");
+  scratch = add(
+      scratch,
       vector_growth_bytes(patterns, sizeof(lazy_overlay_context_accumulator),
                           "chart SPR lazy-local preflight contexts"),
       "chart SPR lazy-local preflight contexts");
@@ -5844,7 +5850,12 @@ void score_candidates_locally_lazy_waves_into(
       auto const start = std::chrono::steady_clock::now();
       accumulate_prepared_local_candidate_lazy_prepared(
           state, prepared, options, &worker.counters, worker.scratch,
-          checked_state);
+          checked_state,
+          admitted > 1
+              ? lazy_key_grouping_detail::packed_key_grouping_sort_policy::
+                    parallel_wide_radix
+              : lazy_key_grouping_detail::packed_key_grouping_sort_policy::
+                    adaptive);
       prepared.result.local_score_ms +=
           chart_spr_elapsed_ms(start, std::chrono::steady_clock::now());
     };
@@ -8154,14 +8165,20 @@ estimate_chart_spr_exact_candidate_memory(
       auto per_worker_direct = chart_spr_saturating_multiply(
           topology.clade_count,
           2 * row_bytes + 4 * sizeof(std::size_t) + 8 * sizeof(void*));
-      auto direct_serial = per_worker_direct;
+      auto const direct_scratch_object_bytes =
+          sizeof(
+              std::vector<std::optional<chart_multisite_detail::chart_row>>) +
+          sizeof(chart_spr_restricted_overlay_topology_row_scratch);
+      auto direct_serial = chart_spr_saturating_add(
+          per_worker_direct, direct_scratch_object_bytes);
       auto direct_inner = chart_spr_saturating_multiply(
           per_worker_direct,
           std::min(resolved_workers, std::max<std::size_t>(1, pattern_count)));
       direct_inner = chart_spr_saturating_add(
           direct_inner,
-          chart_spr_saturating_multiply(resolved_workers,
-                                        sizeof(chart_spr_search_counters)));
+          chart_spr_saturating_multiply(
+              resolved_workers,
+              sizeof(chart_spr_search_counters) + direct_scratch_object_bytes));
 
       // Cache, cache-copy, direct-oracle and optional materialized-oracle
       // results can retain eight old/new per-pattern score arrays at once.
@@ -8700,8 +8717,8 @@ chart_spr_search_result run_chart_spr_search(
   result.summary.initial_search_state_rebuilds = 1;
 
   auto cache_start = std::chrono::steady_clock::now();
-  auto active_build =
-      make_active_search_patterns(result.dag, initial_grammar, options.chart);
+  auto active_build = make_active_search_patterns(
+      result.dag, initial_grammar, scheduler, options.chart);
   chart_spr_search_detail::chart_spr_state_build_policy state_build_policy;
   state_build_policy.defer_pattern_batch_bootstrap_to_local_cache =
       !options.rebuild_after_accept;

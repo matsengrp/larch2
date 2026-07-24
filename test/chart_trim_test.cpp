@@ -414,6 +414,47 @@ static void check_multisite_trim_results_equal(
   }
 }
 
+static void check_frontier_entries_equal(
+    larch::frontier_entry const& lhs, larch::frontier_entry const& rhs) {
+  CHECK(rhs.f.cost == lhs.f.cost);
+  CHECK(rhs.f.topology_hash == lhs.f.topology_hash);
+  CHECK(rhs.used_production == lhs.used_production);
+  CHECK(rhs.provenance.size() == lhs.provenance.size());
+  for (std::size_t index = 0; index < lhs.provenance.size(); ++index) {
+    CHECK(rhs.provenance[index].production ==
+          lhs.provenance[index].production);
+    CHECK(rhs.provenance[index].left_entry ==
+          lhs.provenance[index].left_entry);
+    CHECK(rhs.provenance[index].right_entry ==
+          lhs.provenance[index].right_entry);
+  }
+}
+
+static void check_frontier_build_results_equal(
+    larch::chart_multisite_detail::multisite_frontier_build_result const& lhs,
+    larch::chart_multisite_detail::multisite_frontier_build_result const& rhs,
+    larch::clade_id root, bool compare_all_frontiers) {
+  CHECK(rhs.composite_lower_bound == lhs.composite_lower_bound);
+  CHECK(rhs.initial_upper_bound == lhs.initial_upper_bound);
+  CHECK(rhs.invariant_constant_offset == lhs.invariant_constant_offset);
+  CHECK(rhs.frontier_sizes_by_clade == lhs.frontier_sizes_by_clade);
+  CHECK(rhs.equality_deduplicated == lhs.equality_deduplicated);
+  CHECK(rhs.bound_pruned == lhs.bound_pruned);
+  CHECK(rhs.dominance_candidates_considered ==
+        lhs.dominance_candidates_considered);
+  CHECK(rhs.dominance_pruned == lhs.dominance_pruned);
+  CHECK(rhs.active_pattern_count == lhs.active_pattern_count);
+  CHECK(rhs.level_diagnostics.size() == lhs.level_diagnostics.size());
+  for (std::size_t cid = 0; cid < lhs.frontiers.size(); ++cid) {
+    if (!compare_all_frontiers && cid != root) continue;
+    CHECK(rhs.frontiers[cid].size() == lhs.frontiers[cid].size());
+    for (std::size_t entry = 0; entry < lhs.frontiers[cid].size(); ++entry) {
+      check_frontier_entries_equal(lhs.frontiers[cid][entry],
+                                   rhs.frontiers[cid][entry]);
+    }
+  }
+}
+
 static larch::multisite_trim_result build_plan_trim_without_structural_work(
     larch::chart_execution_plan const& plan,
     larch::site_pattern_set const& patterns,
@@ -1152,6 +1193,56 @@ static void test_multisite_composite_counterexample() {
   for (auto const& topology : traced.topologies) {
     CHECK(larch::score_selected_topology(grammar, patterns, topology) == 3);
   }
+
+  std::println("  PASS");
+}
+
+static void test_restricted_topology_row_reuses_scratch_after_failure() {
+  std::println("test_restricted_topology_row_reuses_scratch_after_failure");
+
+  auto tree =
+      larch::test::make_tiny_labelled_tree("AA", paper_tree1_spec());
+  auto grammar = larch::build_clade_grammar(tree);
+  auto plan = larch::build_chart_execution_plan(grammar);
+  auto patterns = larch::build_site_patterns(tree, grammar);
+  auto topology = larch::chart_multisite_detail::first_topology(grammar);
+  std::vector<std::optional<larch::chart_multisite_detail::chart_row>>
+      grammar_scratch;
+  std::vector<std::optional<larch::chart_multisite_detail::chart_row>>
+      plan_scratch;
+
+  for (auto const& pattern : patterns.patterns) {
+    auto const fresh = larch::chart_multisite_detail::restricted_topology_row(
+        grammar, pattern, topology);
+    auto const reused = larch::chart_multisite_detail::restricted_topology_row(
+        grammar, pattern, topology, grammar_scratch);
+    auto const planned =
+        larch::chart_multisite_detail::restricted_topology_row(
+            plan, pattern, topology, plan_scratch);
+    CHECK(reused == fresh);
+    CHECK(planned == fresh);
+  }
+
+  auto malformed = patterns.patterns.front();
+  malformed.state_by_taxon.clear();
+  CHECK(throws_runtime_error([&] {
+    (void)larch::chart_multisite_detail::restricted_topology_row(
+        grammar, malformed, topology, grammar_scratch);
+  }));
+  auto const grammar_recovered =
+      larch::chart_multisite_detail::restricted_topology_row(
+          grammar, patterns.patterns.front(), topology, grammar_scratch);
+  CHECK(throws_runtime_error([&] {
+    (void)larch::chart_multisite_detail::restricted_topology_row(
+        plan, malformed, topology, plan_scratch);
+  }));
+  auto const recovered =
+      larch::chart_multisite_detail::restricted_topology_row(
+          plan, patterns.patterns.front(), topology, plan_scratch);
+  auto const oracle = larch::chart_multisite_detail::restricted_topology_row(
+      grammar, patterns.patterns.front(), topology);
+  CHECK(grammar_recovered == oracle);
+  CHECK(recovered == oracle);
 
   std::println("  PASS");
 }
@@ -2732,6 +2823,182 @@ static void test_scheduled_multisite_exact_setup_and_topology_scoring() {
   std::println("  PASS");
 }
 
+static void test_plan_multisite_frontier_consumer_reclamation() {
+  std::println("test_plan_multisite_frontier_consumer_reclamation");
+
+  std::vector<larch::phylo_dag> trees;
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree1_with_invariant_spec()));
+  trees.push_back(larch::test::make_tiny_labelled_tree(
+      "AAA", paper_tree2_with_invariant_spec()));
+  auto merged = larch::test::merge_tiny_trees(std::move(trees));
+  auto grammar = larch::build_clade_grammar(merged);
+  auto plan = larch::build_chart_execution_plan(grammar);
+  larch::site_pattern_options pattern_options;
+  pattern_options.skip_invariant_sites = true;
+  auto patterns = larch::build_site_patterns(merged, grammar, pattern_options);
+  larch::chart_options chart_options;
+  auto setup =
+      larch::build_multisite_exact_setup(plan, patterns, chart_options);
+
+  larch::chart_multisite_detail::multisite_frontier_build_options
+      retained_options;
+  retained_options.use_bound_pruning = false;
+  auto retained =
+      larch::chart_multisite_detail::build_multisite_frontiers_from_setup(
+          plan, setup, chart_options, retained_options,
+          "frontier reclamation retained oracle");
+
+  auto reclaimed_options = retained_options;
+  reclaimed_options.release_consumed_frontiers = true;
+  auto reclaimed =
+      larch::chart_multisite_detail::build_multisite_frontiers_from_setup(
+          plan, setup, chart_options, reclaimed_options,
+          "frontier reclamation serial");
+  check_frontier_build_results_equal(retained, reclaimed, plan.root_clade(),
+                                     false);
+
+  std::optional<larch::clade_id> shared_child;
+  for (std::size_t cid = 0; cid < plan.clades().size(); ++cid) {
+    auto const clade = static_cast<larch::clade_id>(cid);
+    if (plan.child_occurrences_for_clade(clade).size() > 1) {
+      shared_child = clade;
+      break;
+    }
+  }
+  CHECK(shared_child.has_value());
+  CHECK(!retained.frontiers[*shared_child].empty());
+  CHECK(reclaimed.frontier_sizes_by_clade[*shared_child] ==
+        retained.frontiers[*shared_child].size());
+  for (std::size_t cid = 0; cid < plan.clades().size(); ++cid) {
+    if (cid == plan.root_clade()) continue;
+    CHECK(reclaimed.frontiers[cid].empty());
+    CHECK(reclaimed.frontiers[cid].capacity() == 0);
+  }
+
+  // Public exact trimming opts into reclamation, but every scalar, exact keep
+  // mask, diagnostic, and captured canonical root-provenance class remains
+  // byte-for-byte equivalent to the grammar-backed oracle.
+  larch::multisite_trim_options trim_options;
+  trim_options.use_bound_pruning = false;
+  trim_options.capture_optimal_root_provenance = true;
+  auto grammar_trim =
+      larch::build_multisite_trim(grammar, patterns, chart_options,
+                                  trim_options);
+  auto plan_trim =
+      larch::build_multisite_trim(plan, patterns, chart_options, trim_options);
+  check_multisite_trim_results_equal(grammar_trim, plan_trim);
+
+  // A caller that needs child-entry indices must retain every frontier even if
+  // reclamation was requested accidentally.
+  auto provenance_options = retained_options;
+  provenance_options.keep_provenance = true;
+  auto retained_provenance =
+      larch::chart_multisite_detail::build_multisite_frontiers_from_setup(
+          plan, setup, chart_options, provenance_options,
+          "frontier provenance retained oracle");
+  provenance_options.release_consumed_frontiers = true;
+  auto protected_provenance =
+      larch::chart_multisite_detail::build_multisite_frontiers_from_setup(
+          plan, setup, chart_options, provenance_options,
+          "frontier provenance reclamation guard");
+  check_frontier_build_results_equal(retained_provenance,
+                                     protected_provenance, plan.root_clade(),
+                                     true);
+  CHECK(!protected_provenance.frontiers[*shared_child].empty());
+
+  // A leaf consumed by two distinct parents in the same dependency level is
+  // the scheduled lifetime hazard: neither worker may retire it while the
+  // other still reads. Force those two consumers to overlap and verify that
+  // coordinator-only post-join reclamation preserves the serial root result.
+  auto shared_tree1 = larch::test::tiny_inner(
+      "root", "AA",
+      {larch::test::tiny_inner(
+           "AB", "AA",
+           {larch::test::tiny_leaf("A", "AA"),
+            larch::test::tiny_leaf("B", "AC")}),
+       larch::test::tiny_leaf("C", "CA")});
+  auto shared_tree2 = larch::test::tiny_inner(
+      "root", "AA",
+      {larch::test::tiny_inner(
+           "AC", "AA",
+           {larch::test::tiny_leaf("A", "AA"),
+            larch::test::tiny_leaf("C", "CA")}),
+       larch::test::tiny_leaf("B", "AC")});
+  std::vector<larch::phylo_dag> shared_trees;
+  shared_trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", shared_tree1));
+  shared_trees.push_back(
+      larch::test::make_tiny_labelled_tree("AA", shared_tree2));
+  auto shared_merged =
+      larch::test::merge_tiny_trees(std::move(shared_trees));
+  auto shared_grammar = larch::build_clade_grammar(shared_merged);
+  auto shared_plan = larch::build_chart_execution_plan(shared_grammar);
+  auto shared_patterns =
+      larch::build_site_patterns(shared_merged, shared_grammar);
+  auto shared_setup = larch::build_multisite_exact_setup(
+      shared_plan, shared_patterns, chart_options);
+  auto a = clade_for(shared_grammar, {"A"});
+  auto ab = clade_for(shared_grammar, {"A", "B"});
+  auto ac = clade_for(shared_grammar, {"A", "C"});
+  CHECK(shared_plan.clade(ab).dependency_level ==
+        shared_plan.clade(ac).dependency_level);
+  CHECK(shared_plan.child_occurrences_for_clade(a).size() == 2);
+
+  auto shared_retained =
+      larch::chart_multisite_detail::build_multisite_frontiers_from_setup(
+          shared_plan, shared_setup, chart_options, retained_options,
+          "same-level shared-child serial oracle");
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = 2,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  timed_test_rendezvous shared_consumer_overlap{2};
+  std::atomic<std::size_t> ab_visits = 0;
+  std::atomic<std::size_t> ac_visits = 0;
+  std::mutex shared_thread_mutex;
+  std::set<std::thread::id> shared_threads;
+  larch::chart_multisite_detail::multisite_frontier_scheduler_test_hooks hooks;
+  hooks.before_clade = [&](larch::clade_id clade, std::size_t,
+                           std::size_t) {
+    if (clade != ab && clade != ac) return;
+    if (clade == ab) {
+      ab_visits.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      ac_visits.fetch_add(1, std::memory_order_relaxed);
+    }
+    {
+      std::lock_guard lock{shared_thread_mutex};
+      shared_threads.insert(std::this_thread::get_id());
+    }
+    shared_consumer_overlap.arrive_and_wait();
+  };
+  std::vector<larch::chart_scheduler_run_summary> runs;
+  auto shared_reclaimed =
+      larch::chart_multisite_detail::build_multisite_frontiers_from_setup(
+          shared_plan, shared_setup, chart_options, reclaimed_options,
+          "same-level shared-child scheduled reclamation", scheduler, &runs,
+          &hooks);
+  check_frontier_build_results_equal(shared_retained, shared_reclaimed,
+                                     shared_plan.root_clade(), false);
+  CHECK(ab_visits.load(std::memory_order_relaxed) == 1);
+  CHECK(ac_visits.load(std::memory_order_relaxed) == 1);
+  CHECK(shared_threads.size() == 2);
+  CHECK(shared_reclaimed.frontier_sizes_by_clade[a] ==
+        shared_retained.frontiers[a].size());
+  for (std::size_t cid = 0; cid < shared_plan.clades().size(); ++cid) {
+    if (cid == shared_plan.root_clade()) continue;
+    CHECK(shared_reclaimed.frontiers[cid].empty());
+    CHECK(shared_reclaimed.frontiers[cid].capacity() == 0);
+  }
+  CHECK(scheduler.metrics().pending_tasks == 0);
+  scheduler.shutdown();
+  CHECK(scheduler.metrics().live_pool_threads == 0);
+
+  std::println("  PASS");
+}
+
 static void test_scheduled_multisite_frontier_wavefronts() {
   std::println("test_scheduled_multisite_frontier_wavefronts");
 
@@ -3453,6 +3720,7 @@ int main() {
   test_checked_multisite_arithmetic_boundaries();
   test_binary_outside_stack_recurrence_matches_generic();
   test_multisite_composite_counterexample();
+  test_restricted_topology_row_reuses_scratch_after_failure();
   test_lazy_multisite_bnb_feeding_matches_dense();
   test_lazy_structural_pandemic_ratio_on_binary_tree();
   test_multisite_phase0_diagnostics_and_exactness_labels();
@@ -3469,6 +3737,7 @@ int main() {
   test_multisite_exact_setup_cold_resident_and_lifetime();
   test_unique_topology_exact_setup_fast_path();
   test_scheduled_multisite_exact_setup_and_topology_scoring();
+  test_plan_multisite_frontier_consumer_reclamation();
   test_scheduled_multisite_frontier_wavefronts();
   test_composite_reference_state_diagnostics();
   test_multisite_rejects_pattern_taxon_count_mismatch();

@@ -65,7 +65,7 @@ class phase6_exact_candidate_pair_rendezvous {
 };
 
 // The exact-candidate runner catches task failures into stable rank-indexed
-// slots. In the bounded cold-verifier pair, let rank 1 fail first, then keep
+// slots. In a bounded cold-verifier wave, let rank 1 fail first, then keep
 // rank 0 parked until the scheduler confirms that rank 1's worker task
 // completed. This makes reverse completion order deterministic rather than
 // timing-based.
@@ -142,9 +142,9 @@ class phase6_reverse_rank_failure_rendezvous {
     return invocations_;
   }
 
-  [[nodiscard]] bool saw_only_ranks_zero_and_one() const {
+  [[nodiscard]] bool saw_only_ranks_zero_one_and_two() const {
     std::lock_guard lock{mutex_};
-    return seen_rank_[0] && seen_rank_[1] && !seen_rank_[2] && !seen_rank_[3];
+    return seen_rank_[0] && seen_rank_[1] && seen_rank_[2] && !seen_rank_[3];
   }
 
   [[nodiscard]] bool rank_one_completed_before_rank_zero_failure() const {
@@ -306,6 +306,24 @@ struct phase4_fixture {
   larch::phylo_dag dag;
   larch::clade_grammar grammar;
 };
+
+static larch::phylo_dag make_fingerprint_fusion_duplicate_leaf_dag() {
+  using larch::test::tiny_dag_edge;
+  using larch::test::tiny_dag_node;
+  return larch::test::make_tiny_labelled_dag(
+      "AAA", "root",
+      std::vector<tiny_dag_node>{
+          {"root", "AAA", ""},
+          {"a1", "CAC", "A"},
+          {"a2", "CAC", "A"},
+          {"b", "ACC", "B"},
+      },
+      std::vector<tiny_dag_edge>{
+          {"root", "a1", 0},
+          {"root", "a2", 0},
+          {"root", "b", 1},
+      });
+}
 
 static phase4_fixture make_three_misplaced_groups_fixture();
 
@@ -1291,6 +1309,7 @@ static larch::chart_spr_search_state make_phase5_direct_state(
   larch::chart_spr_search_state state;
   state.dag = &dag;
   state.grammar = std::move(grammar);
+  state.execution_plan = larch::build_chart_execution_plan(state.grammar);
   state.active_patterns = std::move(active_build.active_patterns);
   state.pattern_source_fingerprint =
       std::move(active_build.pattern_source_fingerprint);
@@ -1996,6 +2015,171 @@ static void test_state_builder_from_dag_rebuilds_patterns_once() {
   CHECK(larch::chart_spr_pattern_source_fingerprint_matches(
       dag, grammar, state.pattern_source_fingerprint));
   state.active_patterns.assert_no_skipped_invariant_metadata();
+
+  std::println("  PASS");
+}
+
+static void check_active_pattern_build_results_equal(
+    larch::chart_spr_active_pattern_build_result const& lhs,
+    larch::chart_spr_active_pattern_build_result const& rhs) {
+  CHECK(lhs.pattern_source_fingerprint == rhs.pattern_source_fingerprint);
+  CHECK(lhs.invariant_constant_offset == rhs.invariant_constant_offset);
+  CHECK(lhs.skipped_invariant_site_count ==
+        rhs.skipped_invariant_site_count);
+
+  auto const& left = lhs.active_patterns.patterns;
+  auto const& right = rhs.active_patterns.patterns;
+  CHECK(left.patterns.size() == right.patterns.size());
+  for (std::size_t index = 0; index < left.patterns.size(); ++index) {
+    CHECK(left.patterns[index].state_by_taxon ==
+          right.patterns[index].state_by_taxon);
+    CHECK(left.patterns[index].positions == right.patterns[index].positions);
+    CHECK(left.patterns[index].weight == right.patterns[index].weight);
+    CHECK(left.patterns[index].reference_state_counts ==
+          right.patterns[index].reference_state_counts);
+  }
+  CHECK(left.original_site_to_pattern == right.original_site_to_pattern);
+  CHECK(left.normalized_binary_patterns.empty());
+  CHECK(right.normalized_binary_patterns.empty());
+  CHECK(left.exact_pattern_to_normalized_binary_pattern ==
+        right.exact_pattern_to_normalized_binary_pattern);
+  CHECK(left.exact_pattern_to_normalized_binary_state_map.size() ==
+        right.exact_pattern_to_normalized_binary_state_map.size());
+  for (std::size_t index = 0;
+       index < left.exact_pattern_to_normalized_binary_state_map.size();
+       ++index) {
+    auto const& left_map =
+        left.exact_pattern_to_normalized_binary_state_map[index];
+    auto const& right_map =
+        right.exact_pattern_to_normalized_binary_state_map[index];
+    CHECK(left_map.exact_pattern == right_map.exact_pattern);
+    CHECK(left_map.normalized_binary_pattern ==
+          right_map.normalized_binary_pattern);
+    CHECK(left_map.normalized_to_original ==
+          right_map.normalized_to_original);
+    CHECK(left_map.original_to_normalized ==
+          right_map.original_to_normalized);
+  }
+  CHECK(left.taxon_count == right.taxon_count);
+  CHECK(left.total_site_count == right.total_site_count);
+  CHECK(left.invariant_site_count == right.invariant_site_count);
+  CHECK(left.variable_site_count == right.variable_site_count);
+  CHECK(left.binary_variable_site_count ==
+        right.binary_variable_site_count);
+  CHECK(left.nonbinary_variable_site_count ==
+        right.nonbinary_variable_site_count);
+  CHECK(left.skipped_invariant_site_count ==
+        right.skipped_invariant_site_count);
+  CHECK(left.invariant_constant_score_excluding_ua ==
+        right.invariant_constant_score_excluding_ua);
+  CHECK(left.invariant_constant_score_with_reference_edge ==
+        right.invariant_constant_score_with_reference_edge);
+  CHECK(left.skipped_invariant_constant_score_with_reference_edge ==
+        right.skipped_invariant_constant_score_with_reference_edge);
+
+  CHECK(larch::inside_chart_cache_detail::fingerprint_active_pattern_set(
+            lhs.active_patterns) ==
+        larch::inside_chart_cache_detail::fingerprint_active_pattern_set(
+            rhs.active_patterns));
+}
+
+static void test_pattern_fingerprint_fusion_w1_w8_parity() {
+  std::println("test_pattern_fingerprint_fusion_w1_w8_parity");
+
+  auto dag = make_fingerprint_fusion_duplicate_leaf_dag();
+  auto built = larch::build_clade_grammar_with_audit(dag);
+  CHECK(built.audit.duplicate_sample_id_occurrences == 1);
+  auto const& grammar = built.grammar;
+
+  larch::site_pattern_options pattern_options;
+  pattern_options.build_normalized_binary_patterns = true;
+  auto source_options = pattern_options;
+  source_options.skip_invariant_sites = true;
+  larch::site_pattern_source_metadata source_metadata;
+  (void)larch::site_patterns_detail::
+      build_site_patterns_with_optional_source_metadata(
+          dag, grammar, source_options, &source_metadata);
+  CHECK(source_metadata.compact_genome_leaf_hashes_by_taxon.size() == 3);
+
+  auto const direct_fingerprint =
+      larch::build_chart_spr_pattern_source_fingerprint(dag, grammar);
+  auto const collected_fingerprint =
+      larch::chart_spr_search_detail::
+          build_chart_spr_pattern_source_fingerprint_from_site_pattern_metadata(
+              dag, grammar, source_metadata);
+  CHECK(collected_fingerprint == direct_fingerprint);
+
+  // Metadata carries compact taxon IDs, but the historical fingerprint orders
+  // its compact-genome multiset by sample ID. Reverse this valid registry so
+  // numeric ID order is B,A and catch any accidental sort by the compact IDs.
+  auto nonlexicographic_registry_grammar = grammar;
+  std::swap(nonlexicographic_registry_grammar.taxa.id_to_sample_id[0],
+            nonlexicographic_registry_grammar.taxa.id_to_sample_id[1]);
+  nonlexicographic_registry_grammar.taxa.sample_id_to_id.clear();
+  for (std::size_t id = 0;
+       id < nonlexicographic_registry_grammar.taxa.id_to_sample_id.size();
+       ++id) {
+    nonlexicographic_registry_grammar.taxa.sample_id_to_id.emplace(
+        nonlexicographic_registry_grammar.taxa.id_to_sample_id[id],
+        static_cast<larch::taxon_id>(id));
+  }
+  auto const reordered_a =
+      nonlexicographic_registry_grammar.taxa.sample_id_to_id.at("A");
+  auto const reordered_b =
+      nonlexicographic_registry_grammar.taxa.sample_id_to_id.at("B");
+  CHECK(reordered_b < reordered_a);
+
+  larch::site_pattern_source_metadata reordered_metadata;
+  (void)larch::site_patterns_detail::
+      build_site_patterns_with_optional_source_metadata(
+          dag, nonlexicographic_registry_grammar, source_options,
+          &reordered_metadata);
+  auto numeric_hash_order =
+      reordered_metadata.compact_genome_leaf_hashes_by_taxon;
+  std::sort(numeric_hash_order.begin(), numeric_hash_order.end());
+  CHECK(numeric_hash_order.size() == 3);
+  CHECK(numeric_hash_order[0].first == reordered_b);
+  CHECK(numeric_hash_order[1].first == reordered_a);
+  CHECK(numeric_hash_order[2].first == reordered_a);
+  CHECK(numeric_hash_order[1].second == numeric_hash_order[2].second);
+
+  auto const reordered_direct_fingerprint =
+      larch::build_chart_spr_pattern_source_fingerprint(
+          dag, nonlexicographic_registry_grammar);
+  auto const reordered_collected_fingerprint =
+      larch::chart_spr_search_detail::
+          build_chart_spr_pattern_source_fingerprint_from_site_pattern_metadata(
+              dag, nonlexicographic_registry_grammar,
+              std::move(reordered_metadata));
+  CHECK(reordered_collected_fingerprint == reordered_direct_fingerprint);
+
+  larch::chart_options chart_options;
+  chart_options.score_ua_edge = true;
+  auto expected = larch::make_active_search_patterns(
+      dag, grammar, chart_options, pattern_options);
+
+  larch::chart_scheduler w1{larch::chart_scheduler_options{
+      .requested_workers = 1,
+  }};
+  larch::chart_scheduler w8{larch::chart_scheduler_options{
+      .requested_workers = 8,
+  }};
+  CHECK(w1.worker_resolution().resolved_workers == 1);
+  CHECK(w8.worker_resolution().resolved_workers == 8);
+
+  auto serial = larch::make_active_search_patterns(
+      dag, grammar, w1, chart_options, pattern_options);
+  auto parallel = larch::make_active_search_patterns(
+      dag, grammar, w8, chart_options, pattern_options);
+  check_active_pattern_build_results_equal(serial, expected);
+  check_active_pattern_build_results_equal(parallel, expected);
+  check_active_pattern_build_results_equal(parallel, serial);
+
+  CHECK(serial.pattern_source_fingerprint == direct_fingerprint);
+  CHECK(parallel.pattern_source_fingerprint == collected_fingerprint);
+  CHECK(parallel.active_patterns.patterns.patterns.size() == 2);
+  CHECK(parallel.skipped_invariant_site_count == 1);
+  CHECK(parallel.invariant_constant_offset == 1);
 
   std::println("  PASS");
 }
@@ -3471,6 +3655,21 @@ static void test_lazy_local_admission_planner() {
   std::println("test_lazy_local_admission_planner");
   using larch::chart_spr_search_detail::
       lazy_local_bandwidth_saturation_min_active_patterns;
+  using larch::fixed_topology_candidate_bandwidth_min_active_patterns;
+
+  CHECK(larch::plan_builtin_dense_fixed_topology_candidate_workers(
+                8, fixed_topology_candidate_bandwidth_min_active_patterns,
+                true) == 2);
+  CHECK(larch::plan_builtin_dense_fixed_topology_candidate_workers(
+                1, fixed_topology_candidate_bandwidth_min_active_patterns,
+                true) == 1);
+  CHECK(larch::plan_builtin_dense_fixed_topology_candidate_workers(
+                8,
+                fixed_topology_candidate_bandwidth_min_active_patterns - 1,
+                true) == 8);
+  CHECK(larch::plan_builtin_dense_fixed_topology_candidate_workers(
+                8, fixed_topology_candidate_bandwidth_min_active_patterns,
+                false) == 8);
 
   auto w1_large =
       larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
@@ -3499,6 +3698,36 @@ static void test_lazy_local_admission_planner() {
   CHECK(w8_large.requested_tasks == 8);
   CHECK(w8_large.effective_tasks == 6);
   CHECK(w8_large.bandwidth_capped);
+  CHECK(larch::chart_spr_search_detail::
+            plan_lazy_local_automatic_candidate_batch_size(
+                8, lazy_local_bandwidth_saturation_min_active_patterns) ==
+        30);
+  CHECK(larch::chart_spr_search_detail::
+            plan_lazy_local_automatic_candidate_batch_size(
+                8,
+                lazy_local_bandwidth_saturation_min_active_patterns - 1) ==
+        32);
+  CHECK(larch::chart_spr_search_detail::
+            plan_lazy_local_automatic_candidate_batch_size(
+                7, lazy_local_bandwidth_saturation_min_active_patterns) ==
+        28);
+  CHECK(larch::chart_spr_search_detail::
+            plan_lazy_local_automatic_candidate_batch_size(
+                1, lazy_local_bandwidth_saturation_min_active_patterns) ==
+        1);
+  auto const maximum_workers = (std::numeric_limits<std::size_t>::max)();
+  auto const maximum_concurrency =
+      larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
+          maximum_workers, maximum_workers,
+          lazy_local_bandwidth_saturation_min_active_patterns);
+  auto const maximum_batch = larch::chart_spr_search_detail::
+      plan_lazy_local_automatic_candidate_batch_size(
+          maximum_workers,
+          lazy_local_bandwidth_saturation_min_active_patterns);
+  CHECK(maximum_concurrency.effective_tasks != 0);
+  CHECK(maximum_batch ==
+        maximum_workers -
+            maximum_workers % maximum_concurrency.effective_tasks);
 
   auto narrow_large =
       larch::chart_spr_search_detail::plan_lazy_local_candidate_concurrency(
@@ -7966,21 +8195,21 @@ static void test_phase6_top_k_four_uses_bounded_cold_exact_waves() {
   CHECK(candidate_after.operations == candidate_before.operations + 1);
   CHECK(candidate_after.parallel_operations ==
         candidate_before.parallel_operations + 1);
-  CHECK(candidate_after.items == candidate_before.items + 2);
-  CHECK(candidate_after.worker_tasks == candidate_before.worker_tasks + 2);
+  CHECK(candidate_after.items == candidate_before.items + 3);
+  CHECK(candidate_after.worker_tasks == candidate_before.worker_tasks + 3);
   CHECK(candidate_after.active_worker_high_water >= 2);
   CHECK(state.exact_verifier_concurrency->peak() >= 2);
-  CHECK(state.counters.exact_candidate_admission_batches == 3);
+  CHECK(state.counters.exact_candidate_admission_batches == 2);
   CHECK(state.counters.exact_candidate_parallel_batches == 1);
-  CHECK(state.counters.exact_candidate_inner_parallel_batches == 2);
+  CHECK(state.counters.exact_candidate_inner_parallel_batches == 1);
   CHECK(state.counters.exact_candidate_memory_limited_batches == 0);
   CHECK(state.counters.exact_candidate_peak_admitted_bytes > 0);
   CHECK(state.counters.exact_candidate_peak_projected_resident_bytes >=
         state.counters.exact_candidate_peak_admitted_bytes);
   CHECK(state.counters.exact_candidate_queued_for_memory_ms == 0.0);
 
-  // Only the stable rank-0/rank-1 prefix runs on the outer candidate axis.
-  // The remaining two singletons get the scheduler in stable-rank order and
+  // Only the stable rank-0/rank-1/rank-2 prefix runs on the outer candidate
+  // axis. The remaining singleton gets the scheduler in stable-rank order and
   // must publish candidate-local exact work on at least one inner axis.
   auto const inner_exact_operation_delta =
       state.counters.scheduler_axes.exact_setup_patterns.operations -
@@ -7993,6 +8222,247 @@ static void test_phase6_top_k_four_uses_bounded_cold_exact_waves() {
   scheduler.shutdown();
   check_phase4_scheduler_axis_reconciliation(scheduler.metrics(),
                                              state.counters.scheduler_axes);
+  std::println("  PASS");
+}
+
+static std::string phase6_fixed_dense_iteration_semantic_sidecar(
+    larch::chart_spr_search_state const& state,
+    larch::chart_spr_iteration_result const& source) {
+  larch::chart_spr_canonical_report report;
+  report.capture_mode = larch::chart_spr_semantic_capture_mode::full;
+  report.contract.acceptance = "fixed_topology_exact";
+  report.contract.objective = "fixed_topology_exact";
+  report.contract.candidate_selection = "lower_bound_top_k";
+  report.contract.top_k_exact = 4;
+  report.active_pattern_count =
+      state.active_patterns.patterns.patterns.size();
+  report.skipped_invariant_site_count = state.skipped_invariant_site_count;
+  report.invariant_constant_offset = state.invariant_constant_offset;
+  report.initial_score = state.composite_lower_bound_with_invariants;
+  report.chain_base_production_keys =
+      larch::chart_spr_canonical_grammar_production_keys(state.grammar);
+
+  larch::chart_spr_canonical_iteration_record iteration;
+  iteration.iteration = source.iteration;
+  iteration.seed = source.canonical_seed;
+  iteration.state_score_before = source.state_score_before;
+  iteration.state_score_after = source.state_score_after;
+  iteration.generation_stop_reason =
+      larch::chart_spr_candidate_stop_reason_name(
+          source.candidate_generation.stop_reason);
+  iteration.candidates_generated = source.candidates_generated;
+  iteration.candidates_scored = source.candidates_scored;
+  iteration.candidates_exact_verified = source.candidates_exact_verified;
+  iteration.unverified_candidates_may_contain_improvements =
+      source.unverified_candidates_may_contain_improvements;
+  iteration.candidates = source.canonical_candidates;
+  iteration.ranked_stream_indices =
+      source.canonical_ranked_stream_indices;
+  iteration.exact_verified_stream_indices =
+      source.canonical_exact_verified_stream_indices;
+  iteration.accepted_move_present = source.accepted.has_value();
+  iteration.accepted_move_committed = source.accepted_move_committed;
+  iteration.post_materialization_rejected =
+      source.post_materialization_rejected;
+  iteration.no_accept_reason = source.no_accept_reason;
+  iteration.post_materialization_rejection_reason =
+      source.post_materialization_rejection_reason;
+  iteration.state_exact_before = source.canonical_state_exact_before;
+  if (source.accepted) {
+    auto const stream_index = source.accepted->canonical_stream_index;
+    CHECK(stream_index != (std::numeric_limits<std::size_t>::max)());
+    CHECK(stream_index < iteration.candidates.size());
+    iteration.selected_stream_index = stream_index;
+    iteration.selected_signature =
+        iteration.candidates[stream_index].signature;
+    CHECK(iteration.selected_signature ==
+          source.accepted_candidate_signature);
+  }
+  report.iterations.push_back(std::move(iteration));
+
+  // A bare acceptance iteration has no commit substrate. Its semantic final
+  // state is therefore the same published grammar/cache state it started from,
+  // even when it identifies an accepting candidate.
+  report.final_score = report.initial_score;
+  report.final_clade_keys =
+      larch::chart_spr_canonical_grammar_clade_keys(state.grammar);
+  report.final_production_keys =
+      larch::chart_spr_canonical_grammar_production_keys(state.grammar);
+  return larch::build_chart_spr_semantic_digest_report(std::move(report))
+      .full_sidecar;
+}
+
+struct phase6_fixed_dense_cap_observation {
+  std::string semantic_sidecar;
+  larch::chart_spr_scheduler_axis_metrics exact_candidate_axis;
+  std::size_t exact_candidate_admission_batches = 0;
+  std::size_t exact_candidate_parallel_batches = 0;
+  std::size_t exact_candidate_inner_parallel_batches = 0;
+  std::size_t peak_exact_verifier_concurrency = 0;
+};
+
+static phase6_fixed_dense_cap_observation
+run_phase6_fixed_dense_cap_case(std::size_t active_pattern_count,
+                                std::size_t workers,
+                                bool install_parallel_safe_custom_verifier,
+                                bool force_pair_overlap) {
+  auto fixture = make_fixture();
+  auto patterns = make_phase4_wide_patterns(active_pattern_count);
+
+  larch::chart_spr_search_options options;
+  options.acceptance_mode =
+      larch::chart_spr_acceptance_mode::fixed_topology_exact;
+  options.candidate_selection =
+      larch::chart_spr_candidate_selection_mode::lower_bound_top_k;
+  options.top_k_exact_verify = 4;
+  options.worker_count = workers;
+  options.semantic_capture = larch::chart_spr_semantic_capture_mode::full;
+  // Keep candidate generation deterministic and isolate the exact-candidate
+  // bandwidth policy from the independent producer/scorer pipeline.
+  options.enable_candidate_generation_pipeline = false;
+
+  auto active =
+      larch::make_active_search_patterns(patterns, options.chart);
+  CHECK(active.active_patterns.patterns.patterns.size() ==
+        active_pattern_count);
+  auto state = larch::build_chart_spr_search_state_from_active(
+      fixture.dag, fixture.grammar, std::move(active), options.chart,
+      /*build_exact_trim=*/false, options.exact_trim, options.cache);
+  CHECK(state.cache_strategy ==
+        larch::chart_spr_cache_strategy::all_active_patterns);
+
+  if (install_parallel_safe_custom_verifier) {
+    state.contextual_fixed_topology_exact_verifier =
+        [](larch::chart_spr_search_state const& verifier_state,
+           larch::chart_spr_candidate_score candidate,
+           larch::chart_spr_exact_verification_context& context) {
+          return larch::verify_candidate_fixed_topology_exact_impl(
+              verifier_state, std::move(candidate), context);
+        };
+    larch::declare_chart_spr_state_callback_target_resident_bytes(state, 0);
+    state.fixed_topology_exact_verifier_parallel_safe = true;
+  }
+
+  std::shared_ptr<phase6_exact_candidate_pair_rendezvous> rendezvous;
+  if (force_pair_overlap) {
+    rendezvous = std::make_shared<phase6_exact_candidate_pair_rendezvous>();
+    options.before_exact_candidate_verification_for_tests =
+        [rendezvous](std::size_t rank) {
+          rendezvous->arrive_and_wait(rank);
+        };
+  }
+
+  larch::chart_scheduler scheduler{larch::chart_scheduler_options{
+      .requested_workers = workers,
+      .default_minimum_grain = 1,
+      .default_target_ranges_per_worker = 4,
+  }};
+  CHECK(scheduler.worker_resolution().resolved_workers == workers);
+  CHECK(state.counters.scheduler_axes.exact_candidates.operations == 0);
+  larch::chart_spr_search_detail::chart_spr_acceptance_iteration_workspace
+      workspace;
+  auto iteration = larch::run_chart_spr_acceptance_iteration(
+      state, options, 0, workspace, scheduler);
+
+  CHECK(iteration.candidates_scored >= 4);
+  CHECK(iteration.locally_ranked_candidates_retained == 4);
+  CHECK(iteration.candidates_exact_verified == 4);
+  CHECK(iteration.canonical_ranked_stream_indices.size() == 4);
+  CHECK(iteration.canonical_exact_verified_stream_indices ==
+        iteration.canonical_ranked_stream_indices);
+  CHECK(state.counters.exact_verifications == 4);
+  CHECK(state.counters.overlay_materializations_for_exact_verification == 0);
+  CHECK(state.counters.full_overlay_materializations == 0);
+  if (rendezvous) CHECK(rendezvous->arrivals() == 2);
+
+  phase6_fixed_dense_cap_observation observation{
+      .semantic_sidecar =
+          phase6_fixed_dense_iteration_semantic_sidecar(state, iteration),
+      .exact_candidate_axis =
+          state.counters.scheduler_axes.exact_candidates,
+      .exact_candidate_admission_batches =
+          state.counters.exact_candidate_admission_batches,
+      .exact_candidate_parallel_batches =
+          state.counters.exact_candidate_parallel_batches,
+      .exact_candidate_inner_parallel_batches =
+          state.counters.exact_candidate_inner_parallel_batches,
+      .peak_exact_verifier_concurrency =
+          state.exact_verifier_concurrency->peak(),
+  };
+
+  scheduler.shutdown();
+  check_phase4_scheduler_axis_reconciliation(
+      scheduler.metrics(), state.counters.scheduler_axes);
+  return observation;
+}
+
+static void
+test_phase6_builtin_dense_fixed_topology_runtime_width_cap_and_bypass() {
+  std::println(
+      "test_phase6_builtin_dense_fixed_topology_runtime_width_cap_and_bypass");
+  using larch::fixed_topology_candidate_bandwidth_min_active_patterns;
+  constexpr std::size_t top_k = 4;
+
+  auto serial = run_phase6_fixed_dense_cap_case(
+      fixed_topology_candidate_bandwidth_min_active_patterns,
+      /*workers=*/1, /*install_parallel_safe_custom_verifier=*/false,
+      /*force_pair_overlap=*/false);
+  auto capped = run_phase6_fixed_dense_cap_case(
+      fixed_topology_candidate_bandwidth_min_active_patterns,
+      /*workers=*/8, /*install_parallel_safe_custom_verifier=*/false,
+      /*force_pair_overlap=*/true);
+
+  // At the built-in dense threshold, Top-K=4/W8 must execute as exactly two
+  // two-candidate outer waves. No singleton is allowed to turn into an inner
+  // pattern-parallel batch, and the forced rendezvous makes peak concurrency
+  // two a deterministic runtime observation.
+  CHECK(capped.exact_candidate_admission_batches == 2);
+  CHECK(capped.exact_candidate_parallel_batches == 2);
+  CHECK(capped.exact_candidate_inner_parallel_batches == 0);
+  CHECK(capped.exact_candidate_axis.operations == 2);
+  CHECK(capped.exact_candidate_axis.parallel_operations == 2);
+  CHECK(capped.exact_candidate_axis.items == top_k);
+  CHECK(capped.exact_candidate_axis.ranges == top_k);
+  CHECK(capped.exact_candidate_axis.worker_tasks == top_k);
+  CHECK(capped.exact_candidate_axis.active_worker_high_water == 2);
+  CHECK(capped.peak_exact_verifier_concurrency == 2);
+  CHECK(capped.semantic_sidecar == serial.semantic_sidecar);
+
+  auto below_threshold = run_phase6_fixed_dense_cap_case(
+      fixed_topology_candidate_bandwidth_min_active_patterns - 1,
+      /*workers=*/8, /*install_parallel_safe_custom_verifier=*/false,
+      /*force_pair_overlap=*/false);
+  auto below_threshold_serial = run_phase6_fixed_dense_cap_case(
+      fixed_topology_candidate_bandwidth_min_active_patterns - 1,
+      /*workers=*/1, /*install_parallel_safe_custom_verifier=*/false,
+      /*force_pair_overlap=*/false);
+  CHECK(below_threshold.exact_candidate_admission_batches == 1);
+  CHECK(below_threshold.exact_candidate_parallel_batches == 1);
+  CHECK(below_threshold.exact_candidate_inner_parallel_batches == 0);
+  CHECK(below_threshold.exact_candidate_axis.operations == 1);
+  CHECK(below_threshold.exact_candidate_axis.parallel_operations == 1);
+  CHECK(below_threshold.exact_candidate_axis.items == top_k);
+  CHECK(below_threshold.exact_candidate_axis.ranges == top_k);
+  CHECK(below_threshold.exact_candidate_axis.worker_tasks == top_k);
+  CHECK(below_threshold.semantic_sidecar ==
+        below_threshold_serial.semantic_sidecar);
+
+  auto custom_bypass = run_phase6_fixed_dense_cap_case(
+      fixed_topology_candidate_bandwidth_min_active_patterns,
+      /*workers=*/8, /*install_parallel_safe_custom_verifier=*/true,
+      /*force_pair_overlap=*/false);
+  CHECK(custom_bypass.exact_candidate_admission_batches == 1);
+  CHECK(custom_bypass.exact_candidate_parallel_batches == 1);
+  CHECK(custom_bypass.exact_candidate_inner_parallel_batches == 0);
+  CHECK(custom_bypass.exact_candidate_axis.operations == 1);
+  CHECK(custom_bypass.exact_candidate_axis.parallel_operations == 1);
+  CHECK(custom_bypass.exact_candidate_axis.items == top_k);
+  CHECK(custom_bypass.exact_candidate_axis.ranges == top_k);
+  CHECK(custom_bypass.exact_candidate_axis.worker_tasks == top_k);
+  // The callback delegates to the built-in implementation, so bypassing only
+  // the built-in policy classification must not change the exact semantics.
+  CHECK(custom_bypass.semantic_sidecar == capped.semantic_sidecar);
+
   std::println("  PASS");
 }
 
@@ -8101,14 +8571,14 @@ static void test_phase6_exact_candidate_failures_choose_stable_rank_and_join() {
         std::string{error.what()} == "phase-6 exact candidate rank 0 failure";
   }
   CHECK(lower_rank_failure_selected);
-  CHECK(rendezvous->invocations() == 2);
-  CHECK(rendezvous->saw_only_ranks_zero_and_one());
+  CHECK(rendezvous->invocations() == 3);
+  CHECK(rendezvous->saw_only_ranks_zero_one_and_two());
   CHECK(rendezvous->rank_one_completed_before_rank_zero_failure());
   CHECK((rendezvous->failure_order() == std::vector<std::size_t>{1, 0}));
   CHECK(state.counters.scheduler_axes.exact_candidates.operations == 1);
   CHECK(state.counters.scheduler_axes.exact_candidates.parallel_operations ==
         1);
-  CHECK(state.counters.scheduler_axes.exact_candidates.worker_tasks == 2);
+  CHECK(state.counters.scheduler_axes.exact_candidates.worker_tasks == 3);
   CHECK(
       state.counters.scheduler_axes.exact_candidates.active_worker_high_water >=
       2);
@@ -8203,8 +8673,8 @@ static void test_phase6_exact_candidate_partial_submit_joins_and_reconciles() {
   CHECK(state.counters.scheduler_axes.exact_candidates.operations == 1);
   CHECK(state.counters.scheduler_axes.exact_candidates.parallel_operations ==
         1);
-  CHECK(state.counters.scheduler_axes.exact_candidates.items == 2);
-  CHECK(state.counters.scheduler_axes.exact_candidates.ranges == 2);
+  CHECK(state.counters.scheduler_axes.exact_candidates.items == 3);
+  CHECK(state.counters.scheduler_axes.exact_candidates.ranges == 3);
   CHECK(state.counters.scheduler_axes.exact_candidates.worker_tasks == 1);
   CHECK(state.counters.exact_candidate_admission_batches == 1);
   CHECK(state.counters.exact_candidate_parallel_batches == 1);
@@ -8218,9 +8688,9 @@ static void test_phase6_exact_candidate_partial_submit_joins_and_reconciles() {
   CHECK(recovered.locally_ranked_candidates_retained == 4);
   CHECK(recovered.candidates_exact_verified == 4);
   CHECK(state.counters.scheduler_axes.exact_candidates.operations == 2);
-  CHECK(state.counters.exact_candidate_admission_batches == 4);
+  CHECK(state.counters.exact_candidate_admission_batches == 3);
   CHECK(state.counters.exact_candidate_parallel_batches == 2);
-  CHECK(state.counters.exact_candidate_inner_parallel_batches == 2);
+  CHECK(state.counters.exact_candidate_inner_parallel_batches == 1);
   CHECK(scheduler.metrics().rejected_concurrent_operations == 0);
 
   scheduler.shutdown();
@@ -8560,9 +9030,9 @@ static void test_phase6_finite_budget_falls_back_within_bounded_waves() {
   CHECK(unlimited.iterations.size() == 1);
   CHECK(unlimited.iterations.front().locally_ranked_candidates_retained == 16);
   CHECK(unlimited.iterations.front().candidates_exact_verified == 16);
-  CHECK(unlimited.summary.exact_candidate_admission_batches == 15);
+  CHECK(unlimited.summary.exact_candidate_admission_batches == 14);
   CHECK(unlimited.summary.exact_candidate_parallel_batches == 1);
-  CHECK(unlimited.summary.exact_candidate_inner_parallel_batches == 14);
+  CHECK(unlimited.summary.exact_candidate_inner_parallel_batches == 13);
   CHECK(unlimited.summary.exact_candidate_memory_limited_batches == 0);
   CHECK(unlimited.summary.exact_candidate_peak_admitted_bytes > 0);
   CHECK(unlimited.summary.exact_candidate_peak_projected_resident_bytes >
@@ -8590,11 +9060,9 @@ static void test_phase6_finite_budget_falls_back_within_bounded_waves() {
   CHECK(finite.iterations.front().exact_candidate_verification_ms.size() == 16);
   CHECK(hook_count->load(std::memory_order_relaxed) == 16);
 
-  // The pair-first policy already fixes the stable outer-wave shape.  This
-  // one-byte-short budget therefore preserves the pair and batch count, then
-  // forces at least one singleton from inner-parallel to serial scratch.  No
-  // candidate is deferred, so policy serialization must not be reported as
-  // memory queueing.
+  // The one-byte-short budget cannot admit the peak singleton inner-parallel
+  // scratch. It preserves the stable admission-wave partition, records the
+  // memory-limited fallback, and verifies one singleton serially.
   CHECK(finite.summary.exact_candidate_admission_batches ==
         unlimited.summary.exact_candidate_admission_batches);
   CHECK(finite.summary.exact_candidate_parallel_batches ==
@@ -9296,6 +9764,64 @@ static void test_fixed_topology_exact_certificate_scores_selected_topology() {
   CHECK(fixed.exact->value.old_score == old_score);
   CHECK(fixed.exact->value.new_score == new_score);
 
+  // The direct public scorers consume the cached execution plan for the
+  // before topology. A same-generation grammar mutation must therefore be
+  // rejected before either serial or scheduled pattern scoring begins.
+  {
+    auto stale =
+        larch::build_chart_spr_search_state(dag, grammar, patterns);
+    auto const generation = stale.grammar.execution_generation;
+    std::swap(stale.grammar.productions.front().children[0],
+              stale.grammar.productions.front().children[1]);
+    CHECK(stale.grammar.execution_generation == generation);
+    auto const mismatch_before = stale.counters.plan_mismatch_rejections;
+    bool mismatch_threw = false;
+    try {
+      (void)larch::fixed_topology_direct_selected_pattern_scores(stale,
+                                                                 *chosen);
+    } catch (larch::chart_execution_plan_mismatch const&) {
+      mismatch_threw = true;
+    }
+    CHECK(mismatch_threw);
+    CHECK(stale.counters.plan_mismatch_rejections == mismatch_before + 1);
+  }
+  {
+    auto stale =
+        larch::build_chart_spr_search_state(dag, grammar, patterns);
+    std::swap(stale.grammar.productions.front().children[0],
+              stale.grammar.productions.front().children[1]);
+    auto const mismatch_before = stale.counters.plan_mismatch_rejections;
+    larch::chart_scheduler scheduler{
+        larch::chart_scheduler_options{.requested_workers = 2}};
+    auto const scheduler_before = scheduler.metrics();
+    bool mismatch_threw = false;
+    try {
+      (void)larch::fixed_topology_direct_selected_pattern_scores(
+          stale, *chosen, scheduler);
+    } catch (larch::chart_execution_plan_mismatch const&) {
+      mismatch_threw = true;
+    }
+    CHECK(mismatch_threw);
+    CHECK(stale.counters.plan_mismatch_rejections == mismatch_before + 1);
+    CHECK(scheduler.metrics().tasks_submitted ==
+          scheduler_before.tasks_submitted);
+  }
+  {
+    auto stale =
+        larch::build_chart_spr_search_state(dag, grammar, patterns);
+    std::swap(stale.grammar.productions.front().children[0],
+              stale.grammar.productions.front().children[1]);
+    auto const exact_before = stale.counters.exact_verifications;
+    auto const mismatch_before = stale.counters.plan_mismatch_rejections;
+    auto rejected =
+        larch::verify_candidate_fixed_topology_exact(stale, *chosen);
+    CHECK(!rejected.valid);
+    CHECK(!rejected.exact.has_value());
+    CHECK(rejected.invalid_reason.find("fingerprint") != std::string::npos);
+    CHECK(stale.counters.exact_verifications == exact_before + 1);
+    CHECK(stale.counters.plan_mismatch_rejections == mismatch_before + 1);
+  }
+
   std::println("  PASS");
 }
 
@@ -9443,6 +9969,32 @@ static void phase8_assert_fixed_candidate_matches_materialized_per_pattern(
   CHECK(!active.empty());
   CHECK(direct_scores.old_pattern_scores.size() == active.size());
   CHECK(direct_scores.new_pattern_scores.size() == active.size());
+
+  // Reused scratch must be reset at entry even when the preceding call
+  // unwound after partially marking its traversal state. Exercise the exact
+  // good -> failure -> good sequence on the production overload.
+  larch::chart_spr_restricted_overlay_topology_row_scratch row_scratch;
+  auto const first_row = larch::chart_spr_restricted_overlay_topology_row(
+      fixture.grammar, chosen.candidate, active.front(), selected,
+      row_scratch);
+  auto malformed_pattern = active.front();
+  malformed_pattern.state_by_taxon.clear();
+  bool malformed_rejected = false;
+  try {
+    (void)larch::chart_spr_restricted_overlay_topology_row(
+        fixture.grammar, chosen.candidate, malformed_pattern, selected,
+        row_scratch);
+  } catch (std::runtime_error const& error) {
+    malformed_rejected = true;
+    CHECK(std::string_view{error.what()}.find("leaf taxon out of pattern") !=
+          std::string_view::npos);
+  }
+  CHECK(malformed_rejected);
+  auto const recovered_row =
+      larch::chart_spr_restricted_overlay_topology_row(
+          fixture.grammar, chosen.candidate, active.front(), selected,
+          row_scratch);
+  CHECK(recovered_row == first_row);
 
   std::uint64_t materialized_new_active = 0;
   for (std::size_t p = 0; p < active.size(); ++p) {
@@ -11664,9 +12216,13 @@ static larch::chart_spr_search_result run_phase6_semantic_matrix_case(
   auto const candidate_parallel = top_k > 1 && workers > 1;
   auto const bounded_cold_exact =
       matrix_case == phase6_semantic_matrix_case::dense_cold_ua_two_pass;
+  auto const bounded_outer_width =
+      bounded_cold_exact && candidate_parallel
+          ? std::min({top_k, workers, std::size_t{3}})
+          : std::size_t{0};
   auto const expected_batches =
       bounded_cold_exact && candidate_parallel
-          ? top_k - 1
+          ? 1 + top_k - bounded_outer_width
           : (top_k + workers - 1) / workers;
   auto const expected_parallel_batches =
       candidate_parallel
@@ -11674,7 +12230,7 @@ static larch::chart_spr_search_result run_phase6_semantic_matrix_case(
           : std::size_t{0};
   auto const expected_inner_batches =
       bounded_cold_exact && candidate_parallel
-          ? top_k - 2
+          ? top_k - bounded_outer_width
           : candidate_parallel ? std::size_t{0} : expected_batches;
   CHECK(search.summary.exact_candidate_admission_batches == expected_batches);
   CHECK(search.summary.exact_candidate_parallel_batches ==
@@ -11709,7 +12265,7 @@ static larch::chart_spr_search_result run_phase6_semantic_matrix_case(
     CHECK(rendezvous != nullptr);
     CHECK(rendezvous->arrivals() == 2);
     auto const expected_outer_items =
-        bounded_cold_exact ? std::size_t{2} : top_k;
+        bounded_cold_exact ? bounded_outer_width : top_k;
     CHECK(exact_axis.items == expected_outer_items);
     CHECK(exact_axis.ranges == expected_outer_items);
     CHECK(exact_axis.worker_tasks == expected_outer_items);
@@ -11856,7 +12412,7 @@ static void test_phase6_forced_exception_top_k_worker_parity_and_quiescence() {
       }
       CHECK(observed_failure == forced_failure);
       CHECK(hook_calls->load(std::memory_order_relaxed) ==
-            std::min(top_k, std::min(workers, std::size_t{2})));
+            std::min(top_k, std::min(workers, std::size_t{3})));
       CHECK(state.counters.candidate_accepts_attempted == 0);
       CHECK(state.counters.exact_candidate_admission_batches == 1);
       CHECK(state.exact_verifier_concurrency->peak() >= 1);
@@ -13631,6 +14187,7 @@ int main() {
   test_root_reference_counts_preserved_in_cache();
   test_active_pattern_assertions_reject_skipped_metadata();
   test_state_builder_from_dag_rebuilds_patterns_once();
+  test_pattern_fingerprint_fusion_w1_w8_parity();
   test_semantic_capture_reuses_primary_exact_provenance();
   test_primary_provenance_capture_failure_is_hard_error();
   test_lazy_local_exact_semantic_evidence_envelope();
@@ -13675,6 +14232,7 @@ int main() {
   test_failed_exact_materialization_is_timed();
   test_top_k_exact_verification_count_is_bounded();
   test_phase6_top_k_four_uses_bounded_cold_exact_waves();
+  test_phase6_builtin_dense_fixed_topology_runtime_width_cap_and_bypass();
   test_phase6_top_k_one_preserves_inner_exact_parallelism();
   test_phase6_exact_candidate_failures_choose_stable_rank_and_join();
   test_phase6_exact_candidate_partial_submit_joins_and_reconciles();

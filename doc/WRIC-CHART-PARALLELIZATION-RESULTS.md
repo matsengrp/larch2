@@ -18,6 +18,19 @@ and the final artifact-ledger SHA-256 is
 No Phase-1+ timing, scaling, memory, parity, policy, or default result is
 accepted merely because this prerequisite is complete.
 
+The current immutable evidence product is Q,
+`a9db72e60f153a95362db544107373817a58a258` (`Stabilize grammar worker
+overlap test`). Historical product P
+`3b0e442e213a7913c6e007c76715d7d856bce0bd` remains the source of the retained
+six-repetition diagnostics, but a clean full-suite run exposed its
+timing-sensitive `chart_spr_test` high-water assertion. Q replaces that test
+timing dependency with a deterministic latch and has the sealed clean normal
+result: 176 unique tests, 174 pass, zero fail, and exactly the two established
+skips. Q's full serial ASAN suite also passes with the same inventory and a
+clean ASAN/LSan scan. Q's exact targeted TSan matrix also passes 55/55 with a
+clean race/lifetime/thread scan. Timed recaptures and final acceptance remain
+open.
+
 On 2026-07-14 the user authorized a deadline-driven scheduling exception: this
 state may be committed as the Phase-0 measurement checkpoint and later-phase
 implementation may begin before the quiet-host timing campaign. The
@@ -37,16 +50,16 @@ committed. Phase-0 artifacts use the non-overwriting directory
 | Phase | Evidence status | Result |
 |---|---|---|
 | 0. Repair and freeze measurement | complete (audited and sealed) | 13 capture statuses close 267 ordinary canonical rows across 60 repeat stages, 27 approved timeouts, and two real-fixture exact-refusal observations; pending/final audits and strict smokes pass; workload and final-ledger SHA-256 values are `32ae82a93cb72a28afaa510391eac83f80f13638d46e1513881d2b484c9dc3ae` and `a33436d78ec6c840427b343615c6b9a7b555a87f989000865873e9c5adeb06bb` |
-| 1. Compile an immutable chart plan | implementation complete; performance acceptance pending | code checkpoint `208ce23`; focused and full RelWithDebInfo correctness/counter gates pass; the sealed base is available, but canonical comparison and timing gates remain pending |
-| 2. Remove allocations and duplicate work | implementation complete; performance acceptance pending | code checkpoint `0c4623b`; same-profiler allocation reduction, warmed-zero allocation, frozen semantic/counter, focused/full RelWithDebInfo, and targeted ASAN gates pass; serial timing, exact-small timing, RSS, and sealed canonical comparison remain pending |
-| 3. Add one persistent adaptive scheduler | implementation complete; performance acceptance pending | code checkpoint `7d294d6`; scheduler contract, canonical worker matrix, full RelWithDebInfo, and targeted TSan gates pass; small-case timing remains pending |
-| 4. Parallelize patterns and local scoring | implementation complete; performance acceptance pending | code checkpoint `cbf92b6` and evidence checkpoint `1be6ffe`; full RelWithDebInfo and targeted TSan gates pass; sealed scaling/RSS gates pending |
-| 5. Parallelize a single exact B&B | implementation checkpoint complete; acceptance pending Phase 6/final gates | `bb29300` plus harness fix `3a10e9c` pass post-omission semantics, full CTest, and targeted TSAN; diagnostic exact-phase scaling exceeds 2x; unified frontier/candidate admission and final timing/RSS remain pending |
-| 6. Parallelize exact top-K candidates | implementation complete; performance acceptance pending | code checkpoint `870c298`; in-tree Top-K/worker semantics, stable failures, deterministic scheduling, functional bounded admission, full RelWithDebInfo CTest, and targeted TSan pass; sealed medium scaling, real Top-K-16 admission, frozen-workload repeatability, and RSS remain pending |
-| 7. Make lazy charts scalable and adaptive | implementation complete; performance acceptance pending | packed deterministic grouping, dependency wavefronts, exact transient admission, and frozen `off\|on\|auto` policy pass through `38e9a28`; `phase7-lazy.tsv` and `phase7-lazy-completion.tsv` are sealed at SHA-256 `82250bb26d5394d3c2c616e4ccbf606e80eca074e560fd8e3361274655e56718` and `7b934fa0ad8279893d03321724935dccf8df99fa840899652dccdc63c8c37bff`, while timing/scaling/RSS decisions remain pending; immutable product R passes the full RelWithDebInfo, serial ASAN, and exact 55-test TSan gates |
-| 8. Parallelize and pipeline candidate generation | sealed attempt 0 failed; immutable R diagnostic passes; sealed retry pending | attempt 0 at product `94a63238d25a8e3262428419d53f8f0986e8879b` remains a sealed failure at W8/W1 `1.287784679`; optimized product R is pinned at `07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c`, has a non-accepting diagnostic ratio of `0.400917506349`, and passes the full RelWithDebInfo, serial ASAN, and exact 55-test TSan gates; expanded retry/evaluator suites pass 28/28 and 39/39 and independent tooling audit approves the bytes, while tooling commit/root C, sealed `phase8-generation-retry1`, Phase-7 comparison, and evaluator acceptance remain pending |
-| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; final gates pending | persistent pattern-parallel commits, exact frontier reuse, non-vacuous three-accept W1/2/4/8 evidence, durable supplement publication, and abort-evidence hygiene pass through `4ef6126`; characterization and production manifests are sealed at SHA-256 `8dc08f393bccb4c8a609501f90cb3c949f1b44600ef967fa8038edc7fd399ed1` and `2f332c5d459b8f47901df015427cba3d4ead7daedac56e1fd9873882b5b65b39`, while accepted-update timing/RSS remain pending; immutable product R passes the full RelWithDebInfo, serial ASAN, and exact 55-test TSan gates |
-| 10. Integrate, tune defaults, and prove parity | implementation in progress | cleanup review and the complete in-tree required mode/worker matrix passed at `4ef6126`, as did its historical full RelWithDebInfo, ASAN, and exact 55-test TSan closure; immutable product R passes the current full RelWithDebInfo, serial ASAN, and exact 55-test TSan gates; sealed automatic-policy/RSS/wall evidence plus the conditional default decision remain pending |
+| 1. Compile an immutable chart plan | implementation complete; optimized-candidate acceptance pending | checkpoint `208ce23` passes its functional gates. Q/C4's complete evidence and gate-by-gate diagnosis passed Phase-1 canonical and serial no-regression comparisons; the changed candidate must be frozen and recaptured |
+| 2. Remove allocations and duplicate work | implementation complete; optimized-candidate acceptance pending | checkpoint `0c4623b` passes its allocation/correctness gates, and Q/C4 passed the Phase-2 timing/RSS diagnosis. Candidate-bound correctness, timing, RSS, and sanitizer closure remain pending |
+| 3. Add one persistent adaptive scheduler | implementation complete; optimized-candidate acceptance pending | checkpoint `7d294d6` passes the scheduler gates, and Q/C4 passed the small-case diagnosis. The immutable candidate's clean suite, sanitizers, and recapture remain pending |
+| 4. Parallelize patterns and local scoring | implementation complete; optimized-candidate acceptance pending | checkpoint `cbf92b6` passes the functional gates; Q/C4's deep Phase-4 validator and contention investigation passed scaling, Phase-3 comparison, RSS, swap, and high-water gates. Candidate-bound recapture remains pending |
+| 5. Parallelize a single exact B&B | implementation checkpoint complete; optimized-candidate acceptance pending | `bb29300` plus `3a10e9c` pass historical functional gates, and Q/C4 passed the exact-span, timeout, and RSS diagnosis. Fresh final-product evidence remains pending |
+| 6. Parallelize exact top-K candidates | implementation complete; optimized-candidate acceptance pending | checkpoint `870c298` passes its in-tree matrix; Q/C4 covered current-product Top-K 1/4/16 semantics, repeatability, scaling, admission, and RSS without a diagnosed failure. The changed candidate must repeat the authoritative campaign and evaluator |
+| 7. Make lazy charts scalable and adaptive | optimized candidate implemented; authoritative acceptance pending | Q `a9db72e60f153a95362db544107373817a58a258` has sealed normal/ASAN/TSan closure and a complete C4 campaign, but C7 measured forced-lazy W8/W1 `0.682706744372248`, above `2/3`. The retained fingerprint-fusion diagnostic is `0.630021916938`; immutable-candidate tests, sanitizers, recapture, and evaluator remain pending. Manifest hashes remain `82250bb26d5394d3c2c616e4ccbf606e80eca074e560fd8e3361274655e56718` and `7b934fa0ad8279893d03321724935dccf8df99fa840899652dccdc63c8c37bff` |
+| 8. Parallelize and pipeline candidate generation | sealed retry1 generation gate passes; candidate end-to-end acceptance pending | attempt 0 remains a sealed failure at `1.287784679`; retry1 on R `07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c` passes at `0.403067171046`. C4 `be5e4a025c357d22fb1a6b41f544e35f2d8a5891` completed and audited all 20 Q components/430 rows, and the diagnosis found no Phase-8 failure. Candidate same-workload recapture and strict evaluation remain pending |
+| 9. Parallelize accepted-state cache updates | implementation checkpoint complete; optimized-candidate acceptance pending | functional, manifest, and counter gates pass through `4ef6126`; Q/C4's deep Phase-9 validation and timing/RSS diagnosis passed before C7 failed later performance gates. Candidate-bound validation, sanitizers, timing, and RSS remain pending |
+| 10. Integrate, tune defaults, and prove parity | implementation in progress; authoritative candidate closure pending | Q has sealed normal/ASAN/TSan closure, and C4 completed/audited 20 components and 430 rows. C7's sole pre-default invocation failed closed on four diagnosed gaps: forced lazy, physical grammar scaling, primary grammar scaling, and sampled-tree fixed-topology stress. Dirty candidate diagnostics pass all four limits; immutable-candidate closure, a fresh campaign/evaluator, conditional default promotion, and post-default closure remain pending |
 
 ## Phase 0 — immutable provenance
 
@@ -1724,10 +1737,256 @@ and `phase7-lazy-completion.tsv` has SHA-256
 `7b934fa0ad8279893d03321724935dccf8df99fa840899652dccdc63c8c37bff`.
 Quiet-host forced-off/forced-on/auto medians, the required high-fixture and
 small-fixture scaling/overhead comparisons, paired RSS, sparse-reclamation
-TSan remain pending. The current full normal, serial ASAN, and exact 55-test
-TSan gates have since passed as recorded under Phase 8. Under the authorized
-deadline-overlap rule, implementation proceeded to Phase 8 without
-substituting the earlier diagnostics for the remaining gates.
+TSan remain pending. The full normal, serial ASAN, and exact 55-test TSan
+gates later passed on immutable product R as recorded under Phase 8. Product P
+was a later implementation change, but its clean full-suite attempt exposed a
+timing-sensitive high-water assertion. Product Q fixes that test
+deterministically and has the sealed clean normal closure recorded below; Q
+full serial ASAN and exact targeted TSan have also passed. Under the authorized deadline-overlap rule,
+implementation proceeded to Phase 8 without substituting diagnostics for the
+remaining gates.
+
+### Historical immutable product P dependency-ready checkpoint (diagnostic only)
+
+The historical implementation checkpoint is immutable commit
+`3b0e442e213a7913c6e007c76715d7d856bce0bd` (`Parallelize WRIC chart search
+pipeline`), called product P below. Its diagnostic `dagutil` and
+`wric-process-metrics` SHA-256 values are respectively
+`c13704f26a811efdfbf5c65b4a609c07a658d4d7db6ba99f5fb20af084717f79`
+and
+`3dbf846e6aa05b007160d9b8d149a82f8e26c4e8099a4e4fc39fdbc63ab02104`.
+The retained artifacts are:
+
+- `build/wric-chart-parallelization/diag-dependency-ready-r6/`; and
+- `build/wric-chart-parallelization/diag-auto-policy-r6/`.
+
+Product P adds a finite dependency-ready route for full-retention lazy charts
+over strict binary trees at W2 or greater when no observing hook is installed.
+The inside phase uses atomic remaining-child counts and the outside phase uses
+the unique strict-tree production dependency; each has a fixed-capacity ready
+queue and occupies one scheduler operation for the complete phase. Outputs
+and statistics have stable disjoint owners, worker-output capacity is
+certified and charged, and a joined deterministic fold chooses the earliest
+canonical worker failure. Generic DAGs, sparse mode, W1, observer-enabled
+execution, and certificate or finite-budget misses retain the earlier
+wavefront/serial fallback. Submission failure, worker failure, cleanup, and
+same-scheduler retry are covered directly.
+
+The same checkpoint caps candidate-local lazy work at three quarters of the
+resolved workers once there are at least 1,024 active patterns. At W8 that is
+six concurrent tasks; W1, W2--W7, smaller streams, and already-small batches
+are unchanged. The shared planner drives both runtime waves and the finite
+iteration envelope. The route and cap are exposed by these additive report
+counters:
+
+- `lazy_chart_{inside,outside}_dependency_ready_executions`;
+- `lazy_chart_{inside,outside}_dependency_ready_jobs`;
+- `lazy_chart_{inside,outside}_dependency_ready_scheduler_operations`;
+- `lazy_chart_{inside,outside}_dependency_ready_capacity_resident_bytes_max`;
+- `lazy_local_requested_concurrency_max`;
+- `lazy_local_effective_concurrency_max`; and
+- `lazy_local_bandwidth_capped_batches`.
+
+The focused RelWithDebInfo command covered
+`chart_parallel_test`, `chart_spr_search_test`,
+`chart_spr_pipeline_test`, `chart_spr_allocation_test`,
+`lazy_key_grouping_test`, `chart_spr_test`, `merge_test`,
+`dagutil_chart_spr_canonical`, and
+`wric_counter_baseline_temporal_fields`; all 9/9 passed. A prior in-tree
+full-suite run appeared to account for all 176 tests, but the clean detached P
+run failed `chart_spr_test` because
+`grammar_candidate_active_worker_high_water >= 2` depended on incidental
+scheduler overlap. The isolated test could pass, which confirms the assertion
+was timing-sensitive rather than establishing a clean normal closure. P is
+therefore superseded as the evidence product by Q below.
+
+#### Dependency-ready six-repetition matrix
+
+All rows used the high-compression fixture at physical-core affinity
+`0,2,4,6,8,10,12,14`, 64 scored candidates, no exact verification, and the
+same bounded one-iteration workload. Medians are the mean of the middle two
+of six repetitions.
+
+| Forced policy/workers | Wall median (s) | Report total (ms) | Cache build (ms) | Initial chart (ms) | Generation (ms) | Local score (ms) |
+|---|---:|---:|---:|---:|---:|---:|
+| off / W1 | 0.233316443500 | 186.518500 | 127.218500 | 90.628000 | 4.991500 | 39.336000 |
+| off / W8 | 0.122693050000 | 82.311000 | 54.034500 | 17.209500 | 8.698500 | 10.493500 |
+| on / W1 | 0.202869868500 | 157.075500 | 85.873000 | 48.766000 | 4.876500 | 50.492000 |
+| on / W8 | 0.131911820500 | 87.868500 | 55.538000 | 18.794000 | 4.239500 | 14.570500 |
+
+The exact diagnostic arithmetic is:
+
+- forced lazy W8/W1 =
+  `0.131911820500 / 0.202869868500 = 0.650228747499`, which is below
+  `2/3`;
+- forced dense W8/W1 =
+  `0.122693050000 / 0.233316443500 = 0.525865421911`; and
+- forced lazy/dense at W8 =
+  `0.131911820500 / 0.122693050000 = 1.075136859830`, which is below
+  `1.10`.
+
+Every forced-lazy W8 repetition reports exactly one inside and one outside
+dependency-ready execution, 1,023 inside jobs and 511 outside jobs, one
+scheduler operation for each phase, and capacity maxima of 8,400 and 2,232
+bytes respectively. Each also reports requested/effective lazy-local
+concurrency `8/6` and two bandwidth-capped batches. All 24 compact canonical
+sidecars are byte-identical with SHA-256
+`ae62f9153f5a0f8af0646db23e08088790c727f4a7990cbe1a6a5e71d97b84c6`;
+all reports embed canonical semantic SHA-256
+`0f50e129d006c960de0f1825072f062ac04350d78ba77af62fbcab772ec2edef`.
+
+#### Automatic-policy six-repetition matrix
+
+The second rotated matrix used W8 and the same candidate/search controls. The
+forced high-compression medians come from the immediately preceding
+same-product matrix.
+
+| Fixture/policy | Resolved policy | Wall median (s) |
+|---|---|---:|
+| dense-favoring / off | off | 0.040738142500 |
+| dense-favoring / on | on | 0.040660933500 |
+| dense-favoring / auto | off | 0.040736641000 |
+| high-compression / off | off | 0.122693050000 |
+| high-compression / on | on | 0.131911820500 |
+| high-compression / auto | on | 0.131609652500 |
+
+Dense auto is `1.001861922329` times its fastest forced representation and
+the two dense forced medians differ by only `1.001898849666`, so choosing
+`off` is permitted by the within-10% rule. High auto is `1.072674063445`
+times its fastest forced representation and the high forced medians differ by
+only `1.075136859830`, so choosing `on` is likewise permitted. High auto is
+`0.997709318249` times the forced-on median. Thus both auto overhead
+diagnostics are below `1.10`, and the two named fixtures exercise both
+resolved branches.
+
+All 18 dense compact sidecars have SHA-256
+`24cc66ce9fa739d4066d75651d38eb4e5fdec4b12c02c48263802b22f3f904c9`
+and embedded semantic SHA-256
+`b8d55c73220a7025b8d977ac4bb083f1e4e76dee5bf007e8754b1f79d42b8442`.
+All six high-auto sidecars have SHA-256
+`ae62f9153f5a0f8af0646db23e08088790c727f4a7990cbe1a6a5e71d97b84c6`
+and embedded semantic SHA-256
+`0f50e129d006c960de0f1825072f062ac04350d78ba77af62fbcab772ec2edef`.
+The before/after input hashes match: the high-compression and dense-favoring
+fixture SHA-256 values remain
+`e103be6cd1df36e5a002ae9dd9ffb53110b35c840eed1d8fa867475ad3109874`
+and
+`e8dcd803ba2cd82ed594dbe66433934a62b3711ea7ddb0d349de35ef86030dd6`.
+
+Both matrices are explicitly **non-accepting diagnostics**. They are not
+published through the sealed harness/evaluator, do not decide the
+small-fixture overhead or RSS gates, and cannot close Phase 7 or Phase 10.
+The required sealed Q Phase-7 recaptures, their cross-phase decision, Q sanitizer
+reruns, and all remaining final acceptance gates are pending.
+
+### Immutable product Q sealed clean normal closure (2026-07-23)
+
+Current evidence product Q is
+`a9db72e60f153a95362db544107373817a58a258` (`Stabilize grammar worker
+overlap test`), tree
+`904f35c58daa1c331f2c43f3aba373f8c8858d4e`, with P as its sole parent.
+Q uses a deterministic latch to hold grammar candidates until multiple
+workers are active before releasing them, removing the suite-load dependency
+from the overlap assertion without changing the P chart implementation or its
+historical diagnostics.
+
+The clean detached locked worktree is
+`/home/ogi-agent/matsen/larch2-wric-product-a9db72e`; its evidence root is
+`/home/ogi-agent/matsen/larch2-wric-evidence/product-a9db72e-normal-full`.
+The literal command
+
+```sh
+ctest --test-dir build --output-on-failure --parallel 8
+```
+
+registered 176 unique tests and completed with exit 0: 174 passed, zero
+failed, and exactly `123 - merge_consistency_test` and
+`130 - rotaA_diagnostic_test` skipped. `chart_spr_test` passed in 3.11
+seconds; total suite wall time was 192.64 seconds. The worktree was clean
+before and after the run.
+
+| Q normal evidence artifact | SHA-256 |
+|---|---|
+| `full.ctest.log` | `15fb82e99b72ecadeb0b2bc28df28d01e4c36fea46cefcd6688b9067be34d76c` |
+| `full.LastTest.log` | `ace8762f67f1d407ccc461203e2ac75e086dd53db5c51487a02da5852c5fb0c8` |
+| `posttest-provenance.txt` | `80d80c2f1405cb1474cfc95e21365fb18182bc35c9b9ac29b3dc5173b8c3fc52` |
+| `artifacts.sha256` | `d6b36894d951aa89e3ba983b271b2129c1c83f09817184dc67d7761f8b1cf04c` |
+| `build/CMakeCache.txt` | `a494d9671f8ee27077b0ca401b560fbbc8959e3bcfea30ccc5188602ab3e7b67` |
+| `build/bin/dagutil` | `8d135043b6b9fe19d5f971a590d9f52278befa87fd9c6b861c284d69bd4fff54` |
+| `build/bin/larch2` | `6399773f3ef043f500b0950e6cb976eaa373f71494d43dcf8047f611ffba3da4` |
+| `build/bin/wric-process-metrics` | `637a3974a0b7879dc60f2eebef672923cac4c0ffdabb177466ac41ae9b7275f3` |
+| `build/chart_spr_test` | `5ea28533cc598fdc7e6c68355c96e8ef209c96a3e1204907610715e9441fa87a` |
+| `build/wric_counter_baseline_compile_check` | `0f2f66b64eb810ee2ce189354ff4e7a06840c5d50901a33e8aec55ede640e01b` |
+
+This seals Q's normal result only.
+
+### Immutable product Q sealed full-ASAN closure
+
+The same clean detached Q root was configured and built with the pinned
+GCC-trunk toolchain, `ENABLE_ASAN=ON`, `ENABLE_TSAN=OFF`, and
+`RelWithDebInfo`. The excluded counter-baseline target was built explicitly,
+then the exact 176-test inventory ran serially with
+`ASAN_OPTIONS=halt_on_error=1:detect_leaks=1` and the pinned GCC-trunk runtime
+library path. It completed in 728.20 seconds: 174 passed, zero failed, and
+exactly `123 - merge_consistency_test` and `130 - rotaA_diagnostic_test`
+skipped. `LastTest.log` contains all 176 records. The explicit scan found zero
+AddressSanitizer, LeakSanitizer, or detected-leak signatures, and Q remained
+clean and exact throughout.
+
+The sealed evidence root is
+`/home/ogi-agent/matsen/larch2-wric-evidence/product-a9db72e-asan-full`.
+
+| Q ASAN evidence artifact | SHA-256 |
+|---|---|
+| `build.log` | `c010dafcd0b14850cc0ab70d69240e106a4469bf7333b734d3e5bb1fcb8d63c1` |
+| `configure.log` | `a9a3f1899ae385548ee3c0f98b68935af3c4674cb71964949c54039c2aa29b68` |
+| `excluded-target-build.log` | `98daf11118f8128e53ee5063f6a949bd0ad5b774026e2ce043b9cce3c49e8079` |
+| `full-inventory.log` | `11a5692e1080b2ad7e1f4bbb59a05a3a2f83cb4e609e5fff30ca19c1bf89a15f` |
+| `full.ctest.log` | `5abb6db6ea594359cd10eb66f6bdab1949684009e27093e83addaaa468981d1f` |
+| `full.LastTest.log` | `8cbc3f3d364d5c2d1d72d9dcca9f8aaeaad0937f36fcc7ab1cdd2ef2addc4fa7` |
+| `diagnostic-scan.log` | `00adc251e5163809e3fef0b04edb2b6d71c8637fe69999ebefcb74aa3b958c1a` |
+| `postflight.log` | `b5cf0ac93a3f3316775a9698f757de560f159fe1b98e9bc0704390fc9bc2875b` |
+| `SHA256SUMS` | `ac339eee73459489962f844f437b0e7e11c78051c972d1d3d153e93a913683fd` |
+
+This closes Q's ASAN gate. The targeted TSan closure is recorded immediately
+below. At this checkpoint every timed Q recapture was pending; C4 later
+completed and audited all 20 components. This sanitizer result alone was not
+Phase-7, Phase-10, default, or final acceptance.
+
+### Immutable product Q sealed targeted-TSan closure
+
+The same clean Q root was configured and built with `ENABLE_ASAN=OFF`,
+`ENABLE_TSAN=ON`, and the pinned GCC-trunk toolchain. The full inventory is
+176 and the exact required regex selects 55 tests. Those 55 ran serially with
+`TSAN_OPTIONS=halt_on_error=1`, `LD_PRELOAD` unset, and the pinned patched
+runtime first in `LD_LIBRARY_PATH`; all 55 passed, with zero skips or failures,
+in 281.86 seconds. Eleven representative binaries all resolve `libtsan.so.2`
+to patched bytes with SHA-256
+`58725dae226e91ea96bebbdf54f84820638404a691528570ec1dab595ed08842`.
+The strict scan found zero ThreadSanitizer, data-race, lock-order,
+use-after-publication, thread-leak, summary, warning, or fatal signatures. Q
+remained detached, clean, and exact throughout.
+
+The sealed evidence root is
+`/home/ogi-agent/matsen/larch2-wric-evidence/product-a9db72e-tsan-focused`.
+
+| Q TSan evidence artifact | SHA-256 |
+|---|---|
+| `build.log` | `63f2cd6c3ac4e7d1016380dac684d733a7c50975ce7e4858bbdd31dd6e8fdf1c` |
+| `configure.log` | `e772eff4a532cf1b4525da5ca51e595cf2dfe823c83537ef18ecc66ac79dfd47` |
+| `full-inventory.log` | `6848e57f60b888da9e00275b35ab9a6e16d6ab6ec2d926ee6d616ce375104726` |
+| `targeted-inventory.log` | `a31ed742b506e2c39393bc835fad8e2e3115bd99e629acb92e9395f9218987b7` |
+| `focused.ctest.log` | `a3cbef485a81da355096734757c0607d0102f65bcafd9ed25cb31ee9b95811a2` |
+| `focused.LastTest.log` | `67a1e94c0344eb1a5e427d6c1f7bb9b9f8a528d7e68cccf1b03e9f0fdc46fb91` |
+| `runtime-provenance.log` | `9a79f46db76cd3322f26bb9d414841e3a3eed2b6a2aa1c1ec471e50544228ff3` |
+| `diagnostic-scan.log` | `6615793e3480df9ae24df6ec7813afd53ce5b44f0586513ceacdae761dc0db29` |
+| `postflight.log` | `33592677448e7d786f79eab502254a29cab4fba8c85658ece3e53bacb2d96741` |
+| `SHA256SUMS` | `5b90a3f931853a03aec20bdaf2b44ff71c7f2d1afddc54c42a51a3f7c7f4eef1` |
+
+This closes Q's normal, ASAN, and targeted TSan gates. C4 later completed all
+timed Q recaptures, and C7 failed the pre-default decision on the four gaps
+recorded below. Any later product revision reopens the affected
+product-bound gates.
 
 ## Historical Phase 8 implementation checkpoint (unsealed)
 
@@ -2121,7 +2380,8 @@ but no Phase-0, supplement, performance, scaling, RSS, automatic-policy, or
 default gate. The later Phase-8 production changes postdate and reopened the
 complete normal, ASAN, and targeted TSan gates. All three have since rerun and
 passed on the exact bytes now committed as immutable product revision R, as
-recorded below.
+recorded below. P and then Q postdate R; Q has sealed clean normal, full serial
+ASAN, and exact targeted TSan closure.
 
 ### Sealed Phase-8 generation attempt 0 (failed 2026-07-22)
 
@@ -2183,13 +2443,13 @@ components. This capture, its supplement, ledger, hashes, label, and product
 revision remain permanent evidence and must not be removed, overwritten,
 relabelled, or resealed to describe another executable.
 
-Optimization evidence proceeds monotonically. The next full attempt must use
-a fresh label beginning with `phase8-generation-retry1`, pin a new immutable
-product revision and capture-tool identity, write a distinct capture directory
-and ledger, and publish new external hash anchors; further attempts increment
-the suffix. The acceptance evaluator may consume a successful retry only as
-an additive successor while continuing to retain and audit attempt 0. A retry
-cannot alter this result or inherit its speed decision.
+Optimization evidence proceeds monotonically. The successor was required to
+use the fresh `phase8-generation-retry1` label, pin new immutable product and
+capture-tool identities, write a distinct capture directory and ledger, and
+publish new external hash anchors. The sealed retry1 recorded below satisfies
+those requirements as an additive successor while retaining attempt 0; it
+does not alter this failed result or inherit its speed decision. Any further
+attempt must increment the suffix and remain additive.
 
 ### Immutable optimized product revision R (locked 2026-07-23)
 
@@ -2203,7 +2463,7 @@ That root is detached at exact R with no worktree changes. Its product-local
 
 Revision R contains the optimized chart-SPR product and its tests and
 documentation, but deliberately contains no additive retry capture or
-schema-v3 evaluator tooling. Those tooling changes are descendant work and
+later evaluator tooling. Those tooling changes are descendant work and
 therefore cannot change the identity of the executable under measurement.
 
 ### Accounting-complete immutable-R diagnostic (non-accepting 2026-07-22)
@@ -2260,21 +2520,19 @@ the `raw_trials.tsv` SHA-256 is
 `4bfd1339ae5021a82c473dd247687cbaf4b12b2b534e8dcffc3c604ed12985cc`.
 
 **Diagnostic decision:** this establishes performance headroom for immutable
-product R, but it is not Phase-8 acceptance and is not attempt 1. Its product
-source bytes are now pinned by R, yet the run was not captured from the locked
-R root under the exact outer `phase8-generation-retry1` label and has no newly
-pinned capture-tool revision C, capture metadata, independent artifact
-ledger/seal, external immutable hash anchor, heterogeneous-tool audit, or
-acceptance-evaluator decision. It also does not include the separate Phase-7
-end-to-end comparison. Full RelWithDebInfo CTest, serial ASAN with leak
-detection, and the exact serial patched-runtime TSan matrix have passed on
-exact R as recorded below. A later additive retry1 captured from clean
-immutable R by committed tooling C can supersede attempt 0 for the current
-speed decision; it may not remove or rewrite the failed historical evidence.
+product R, but it is not Phase-8 acceptance and is not attempt 1. At the time,
+the run lacked the exact outer retry label, independent capture-tool identity,
+metadata, audited ledger and seal, and external immutable hash anchors. The
+later sealed retry1 below supplies those artifacts and supersedes attempt 0
+for the current generation-speed decision without removing or rewriting the
+failed historical evidence. Neither the diagnostic nor retry1 supplies the
+separate Phase-7 end-to-end comparison. Full RelWithDebInfo CTest, serial ASAN
+with leak detection, and the exact serial patched-runtime TSan matrix passed
+on exact R as recorded below.
 
 ### Immutable-R full RelWithDebInfo closure (2026-07-22)
 
-The current production tree built and passed the complete normal suite with
+The immutable R tree built and passed the complete normal suite with
 the exact commands
 
 ```sh
@@ -2292,7 +2550,7 @@ Any later product change reopens the normal gate.
 
 ### Immutable-R serial ASAN closure (2026-07-22)
 
-The current production tree used the plan's exact ASAN configure, build, and
+The immutable R tree used the plan's exact ASAN configure, build, and
 serial test commands:
 
 ```sh
@@ -2312,9 +2570,9 @@ their unchanged reasons. Total CTest time was 842.54 seconds. A grep of
 `build-asan/Testing/Temporary/LastTest.log` found no `AddressSanitizer`,
 `LeakSanitizer`, or detected-leak diagnostic.
 
-This closes the full serial ASAN gate for exact immutable product R. Phase-8
-retry acceptance remains pending. Any later product change reopens both the
-normal and ASAN gates.
+This closes the full serial ASAN gate for exact immutable product R. The
+generation retry is sealed below; any later product change, including Q,
+reopens current-product normal and ASAN gates.
 
 ### Immutable-R targeted TSan closure (2026-07-22)
 
@@ -2359,88 +2617,147 @@ thread-leak diagnostic. The artifacts and SHA-256 values are:
 | `build/wric-chart-parallelization/phase8-tsan-pre-r/targeted.ctest.log` | `09fc0239311c114810fbd7f6623452d6df3de90b9ecbd94cfbdde03860b7a25f` |
 | `build/wric-chart-parallelization/phase8-tsan-pre-r/targeted.LastTest.log` | `18d2bc1c7552db146d4ed98d039cb4135f41204fa4fab8df3b04601de1ae5628` |
 
-This closes the exact targeted TSan gate for immutable product R. Additive
-retry tooling revision/root C and sealed Phase-8 retry1 remain pending. Any
-later product change reopens the normal, ASAN, and TSan gates.
+This closes the exact targeted TSan gate for immutable product R. The additive
+retry1 is sealed below and passes its generation-speed gate. Q is a later
+product and therefore requires fresh current-product normal, ASAN, and TSan
+closure.
 
-### Descendant retry tooling checkpoint
+### Sealed optimized generation retry1 (passing 2026-07-23)
 
-Status: post-audit rerun passed; C pending as of 2026-07-23.
-
-The current post-R working tree implements the additive retry path while
-keeping the measured product frozen. The capture controller adds exactly one
-new outer label, `phase8-generation-retry1`, bound to product revision
-`07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c`. It routes that label to the
-existing `phase8-generation` supplement group and exact W1/W8, one-warmup,
-five-repetition, full-canonical-correctness component. Capture-tool revision C
-must be a newly committed descendant distinct from attempt 0's
-`b6ae1a968c0a2374d8180e5682ae53775377c31e`. Neither C nor its clean detached
-tooling root has been assigned yet.
-
-The cross-phase evaluator advances to schema version 3 and makes its scope
-explicit. `--evaluation-mode pre-default` requires and evaluates every run
-except `final-default-auto`, reports that exact deferred label, and emits
-`completion_eligible=false`. `--evaluation-mode final` additionally requires
-and evaluates `final-default-auto` and is the only completion-eligible result.
-This prevents a passing pre-default audit from being mistaken for final
-acceptance.
-
-Both modes retain both Phase-8 observations. The output identifies
-`phase8-generation` as `retained_failed_observation`, but treats it only as
-authenticated historical observation: it is not fed through generic evidence
-gates and has no current RSS acceptance role. Only
-`phase8-generation-retry1` owns the current generation ratio `<= 0.50`, W1/W8
-end-to-end non-regression against the same-workload Phase-7 capture, semantic
-comparison, and Phase-8 RSS decisions. Each output observation records its W1
-and W8 medians, ratio, `0.50` limit, disposition, and full provenance.
-
-The evaluator accepts heterogeneous capture-tool provenance deliberately: the
-historical attempt is pinned to its original tool revision and detached b6
-root, while retry1 must be pinned to future revision/root C. For each label,
-the CLI requires independently routed external product and capture-tool roots
-plus inputs for its capture directory, raw TSV SHA-256, generic-v2 ledger
-SHA-256, product revision, capture-tool revision, and capture-wrapper SHA-256.
-Attempt 0's raw, ledger, and wrapper anchors are additionally hard-pinned to
-`e3eb3b3d9e77fc4006aa2c701102f39f84244971fae4f794bf66e5ca72cf4a56`,
-`d22f42f31cf4e37bc92abc53e70f938d163f5fc422af68677c0f7dd7244841e1`,
+The additive `phase8-generation-retry1` observation is sealed on immutable
+product R `07309523cf3a3aaa9e5095f4d4b1d0f98ac4557c` and immutable capture tool
+`0013fcc7231c32bce0fb5ccb11eaae62dacea4c5`. Their locked detached roots are
+`/home/ogi-agent/matsen/larch2-wric-evidence/phase8-generation-retry1-product`
 and
-`e374ed726e026ab973ffa9ff385b13cd8c0eea8041d32b861df61fb4fa6c652e`.
-The loader verifies canonical schema-v2 capture metadata, pre/post repository
-revisions against the routed roots, exact harness route, raw snapshot, tracked
-wrapper blob, complete generic-v2 ledger membership/modes/hashes, and the
-detached ledger seal. It audits attempt 0's exact wrapper from the b6 root and
-retry1's exact wrapper from C's future root. It rejects symlinks, hard-link
-aliases, unsafe paths, and any reused attempt/retry directory, raw path, raw
-bytes, product root, capture-tool root, or capture-tool revision. A final
-unchanged pass rescans the capture closure and rechecks directory, ledger,
-seal, and member signatures to make the evaluation fail closed against TOCTOU
-changes. Each schema-v3 attempt record includes the capture, raw, metadata,
-ledger, and seal paths and hashes, both routed repository roots, and the exact
-product/capture-tool/wrapper identities in addition to its timing decision.
+`/home/ogi-agent/matsen/larch2-wric-evidence/capture-tool-0013fcc`.
+The distinct capture is
+`/home/ogi-agent/matsen/larch2-wric-evidence/captures/phase8-generation-retry1/phase8-generation-retry1__workers-1-8__reps-5`.
 
-Before the final audit-driven root-routing extensions, standalone direct
-reruns of the two affected suites produced:
+| Retry1 metric | W1 | W8 | Decision |
+|---|---:|---:|---|
+| five candidate-generation values (ms) | 48.815, 49.128, 48.608, 48.905, 49.428 | 19.506, 20.004, 19.712, 20.723, 18.938 | complete |
+| candidate-generation median (ms) | 48.905 | 19.712 | W8/W1 = `0.403067171046` |
+| median wall time (s) | 0.151872 | 0.131355 | W8/W1 is approximately `0.865` |
+| required generation ratio | - | - | `<= 0.50`: **pass** |
 
-| Descendant tooling test | Result | Elapsed |
-|---|---:|---:|
-| `python3 test/wric_benchmark_capture_test.py` | 27/27 pass | 27.182 s |
-| `python3 test/wric_cross_phase_acceptance_test.py` | 36/36 pass | 17.542 s |
+All measured rows completed with successful validation and the same
+search/output semantic SHA-256 values as the R diagnostic. The immutable raw
+TSV SHA-256 is
+`0e5eff54263cb1d1c3da15ac8d21ec9d456993992b4a60189ae2105f1238e36a`;
+the independently audited ledger and detached seal bind SHA-256
+`5a307b51f1ba662b1484e1919f03a8b18f17af934522953e06c039ef90501fdd`.
 
-On the final post-audit bytes, the expanded independent reruns are:
+**Retry1 decision:** pass the Phase-8 candidate-generation speed gate. Attempt
+0 remains immutable failed evidence; retry1 is its additive current
+generation observation. This does not by itself close the separate Phase-7
+same-workload non-regression, all Q recaptures, pre-default/final evaluation,
+default promotion, or final acceptance.
 
-| Final descendant tooling test | Result | Elapsed |
-|---|---:|---:|
-| `python3 test/wric_benchmark_capture_test.py` | 28/28 pass | 28.418 s |
-| `python3 test/wric_cross_phase_acceptance_test.py` | 39/39 pass | 19.392 s |
-| registered CTest entries together | 2/2 pass | 55.65 s |
+### Immutable Q-aware capture-tool C checkpoint (superseded before capture)
 
-`py_compile` and `git diff --check` pass. An independent final audit also
-reloaded the real immutable attempt-0 closure, reran its exact historical b6
-wrapper audit (`status=audited`, 166 files), and approved the current tooling
-bytes with no remaining blocker. These results still do not assign immutable
-tooling commit/root C, do not constitute a live
-`phase8-generation-retry1` capture or seal, and do not establish either
-pre-default or final evaluator acceptance.
+The historical capture/evaluation tool is immutable C,
+`03ff9f12d0b479321ea1c887a3112fed1d34ef71` (`Pin Q acceptance capture
+retries`), tree
+`05d70b80cd05fd33d2fad4a42586c29066039191`, in locked detached root
+`/home/ogi-agent/matsen/larch2-wric-evidence/capture-tool-03ff9f1`.
+
+| Tool C artifact | SHA-256 |
+|---|---|
+| `tools/wric_benchmark_capture.py` | `786b8a17874c00f89693b6d8d399c447d6e5a79a144ab9a304be33dcb4133ce1` |
+| `tools/wric_evidence_run_ledger.py` | `def3ce4b6868b16c050599b918240ba600e204dcf884caea36bffe52769cd29f` |
+| `tools/wric_cross_phase_acceptance.py` | `4503d67e3804b83aab04da5b8787b4eb846819ec89745a1e5aecc4fbb43b72c1` |
+
+The evaluator output is schema v5. It retains attempt 0 and retry1 with their
+own historical product/tool roots and hard-pinned anchors, while all current
+recapture labels are pinned to Q. Its explicit `pre-default` mode reports
+`completion_eligible=false` and defers exactly `final-default-auto`; only
+`final` requires that capture and can be completion-eligible. The loader
+verifies canonical metadata, routed pre/post repository state, tracked wrapper
+and ledger bytes, complete ledger closure and detached seals. It rejects
+symlink/hard-link aliases, unsafe paths, and reused capture identities, then
+rescans the closure to fail closed against TOCTOU changes.
+
+The two focused registered capture/evaluator tests pass 2/2 on exact C. No Q
+timed capture used C. A subsequent final dry-run audit found that C selected
+its own sibling Phase-9 acceptance evaluator while passing Q as the product
+root; the product evaluator correctly rejected that mixed route. C therefore
+remains immutable failed tooling evidence and is superseded only by C2.
+
+### Immutable Q-aware capture-tool C2 checkpoint (superseded before capture)
+
+Historical capture/evaluation tool C2 is immutable commit
+`af4f2011d8d462cceaab7efe1d443eaa4c207fc8` (`Bind Phase 9 acceptance to
+product root`), tree
+`3233c90da3d3f408e5bde32db57fa926b83dd9bd`, with C as its sole parent. Its
+clean locked detached root is
+`/home/ogi-agent/matsen/larch2-wric-evidence/capture-tool-af4f201`.
+
+| Tool C2 artifact | SHA-256 |
+|---|---|
+| `tools/wric_benchmark_capture.py` | `786b8a17874c00f89693b6d8d399c447d6e5a79a144ab9a304be33dcb4133ce1` |
+| `tools/wric_evidence_run_ledger.py` | `def3ce4b6868b16c050599b918240ba600e204dcf884caea36bffe52769cd29f` |
+| `tools/wric_cross_phase_acceptance.py` | `84d1fdfec0dcec611c1128d2d7348a8c179d543ac3483e2985264683eaa861d0` |
+
+Schema v6 requires the exact Q-local Phase-9 evaluator and binds its working
+bytes and tracked HEAD blob to external SHA-256
+`12eef19f3cad3dcd26363d6dfc951642cdd3b0647ddda98b6f6affb185314568`.
+It checks clean Q repository and tool provenance before and after delegated
+evaluation, uses a fixed interpreter environment that still permits the
+authenticated sibling manifest helper but excludes ambient configuration and
+ignored bytecode, rejects any stderr, validates the exact schema-v2 Phase-9
+payload, and records it separately from product-tool provenance.
+
+The direct product-root/isolation regression passes. Under the unchanged CTest
+timeouts, `wric_cross_phase_acceptance_test` passed in 29.37 seconds and
+`wric_benchmark_capture_test` passed in 38.86 seconds; both completed 2/2 in
+38.87 seconds. This closes the current tooling checkpoint, not any performance
+result. No timed Q capture used C2. A final capture-path audit found that C2's
+Phase-9 seal/audit subprocesses could load a valid ignored sibling bootstrap
+`.pyc` through the product tool's shebang. Because Git-clean and tracked-blob
+checks do not authenticate ignored bytecode, C2 is superseded before capture.
+
+### Historical immutable Q-aware capture-tool C3 checkpoint
+
+Historical capture/evaluation tool C3 is immutable commit
+`82aaec5813121230b82f45050b01e4bbd27a4b24` (`Isolate Phase 9 capture
+postprocessor`), tree
+`e0e25e1e58e2c5d7dc08fa04de079aa49c3dffda`, with C2 as its sole parent. Its
+clean locked detached root is
+`/home/ogi-agent/matsen/larch2-wric-evidence/capture-tool-82aaec5`.
+
+| Tool C3 artifact | SHA-256 |
+|---|---|
+| `tools/wric_benchmark_capture.py` | `6ddfa017d03a035718a7a046c68bae76cfbe5ffb2b2578048165b76cb41730ec` |
+| `tools/wric_evidence_run_ledger.py` | `def3ce4b6868b16c050599b918240ba600e204dcf884caea36bffe52769cd29f` |
+| `tools/wric_cross_phase_acceptance.py` | `84d1fdfec0dcec611c1128d2d7348a8c179d543ac3483e2985264683eaa861d0` |
+
+C3 runs both Phase-9 postprocessor commands under fixed
+`-E -s -S -B -X pycache_prefix=/dev/null` interpreter isolation, retaining
+the authenticated script directory for the tracked sibling source while
+excluding ambient configuration, site hooks, and ignored cache reads/writes.
+The regression installs an unchecked-hash poisoned sibling `.pyc`, proves an
+unisolated interpreter reads it, and then proves capture plus two repeat audits
+use tracked source without deleting or rewriting the poison. The Phase-9 class
+passes 3/3; the full registered capture-controller entry passes in 42.99
+seconds. C2's registered cross-phase test had already passed with the same
+evaluator bytes. C3 was the sole permitted tool at this checkpoint; it was
+superseded before measurement by C4.
+
+The campaign driver is
+`/home/ogi-agent/matsen/larch2-wric-evidence/run-q-c3-capture-campaign.sh`,
+mode `0755`, nlink one, and SHA-256
+`71e94f3103249be23a358c258053ca5531af955556032c912ebc5f7aee7c6557`.
+`bash -n` and an independent read-only contract audit pass. The audit confirms
+all 20 tuples exactly match C3, their expected row counts sum to 430, P/S/U
+affinity semantics are correct, Phase-9 outer/inner ledgers remain distinct,
+all destinations are new, and default-auto is intentionally absent. This C3
+driver was not executed; C4's successor driver later completed and audited
+the 20-component/430-row Q campaign.
+
+This closed the historical C3 tooling checkpoint, not any performance result.
+Q's targeted TSan and timed C4 campaign subsequently completed. C7's
+pre-default invocation failed the four gaps recorded below; candidate-bound
+pre-default/final evaluation and final acceptance remain pending.
 
 ## Phase 9 accepted-state update checkpoint (supplements sealed; performance pending)
 
@@ -2539,7 +2856,8 @@ at that checkpoint covers multiparent and non-vacuous local multi-accept paths
 at W1/2/4/8 with exact canonical parity and non-vacuous scheduler evidence.
 The Phase-8 production changes now pinned as immutable R reopened all three
 global gates. The full normal, serial ASAN, and exact targeted TSan gates have
-since rerun and passed on exact R.
+since rerun and passed on exact R. P and then Q postdate R; Q has sealed clean
+normal, full serial ASAN, and exact targeted TSan closure.
 
 Phase 9 remains open for the accepted-update exemption or 1.5x speed decision,
 and paired RSS. A later conditional default change would require the affected
@@ -2825,17 +3143,234 @@ focused 11/11 gate and historical full normal/ASAN/TSan evidence are recorded
 in the `4ef6126` post-cleanup closure section above.
 
 These commits are correctness and observability checkpoints, not Phase-10
-acceptance. This closes only the cleanup review and the in-tree functional
+acceptance. They close only the cleanup review and in-tree functional
 mode/worker matrix at that checkpoint. Phase 0 and the later-phase supplement
-manifests are sealed; worker-policy selection, RSS bounds, primary 32/4 wall
-parity, W8/W1 2x speedup, unpinned explicit-auto, seedtree 128/16 stress, and
-bounded real-scale confirmations remain pending. The Phase-8 production
-changes now pinned as immutable R reopened the complete normal, ASAN, and
-targeted TSan gates. All three have since rerun and passed on exact R.
+manifests are sealed. Q later obtained clean normal, full serial ASAN, and
+exact targeted TSan closure, and C4 captured and audited the worker-policy,
+RSS, primary, scaling, unpinned-auto, stress, and bounded-real matrices. C7's
+sole pre-default invocation nevertheless failed closed; the diagnosis below
+identified exactly four performance gaps. The dirty optimized candidate
+diagnostics pass those four limits, but no candidate-bound acceptance result
+exists yet.
+
 The product default stays serial until explicit auto passes every prerequisite;
 no default-worker performance claim has been made. A later conditional default
 change requires every affected normal and sanitizer gate to pass again at that
 descendant.
+
+## Post-Q pre-default gap closure (diagnostic; authoritative recapture pending)
+
+Let `$E` denote
+`/home/ogi-agent/matsen/larch2-wric-evidence` and `$D` denote
+`$E/diagnostics`.
+
+### Product-Q/C4 capture and C7 decision
+
+Product Q remains
+`a9db72e60f153a95362db544107373817a58a258`. Capture tool C4 is
+`be5e4a025c357d22fb1a6b41f544e35f2d8a5891`, tree
+`222a373a3e8c12ff7c72107645fc7eed0c70b6bb`. Its retry-2 campaign completed
+and individually audited all 20 required components, totaling 430 measured
+rows. The component paths, row counts, and outer ledger SHA-256 values are
+recorded in `$E/q-c4-retry2-full-campaign.log`; the captures and their audit
+receipts are under `$E/captures/`.
+
+The separately sealed Phase-4 contention investigation is under
+`$E/phase4-contention-profile-a9db72e/`. It classified the system/user CPU
+trigger as short-run fixed overhead plus parallel contention, not a scaling
+blocker, and concluded
+`no_rollback_required_for_bound_capture`. The sealed acceptance timings remain
+authoritative: dense local scoring fell from `29.445 ms` at W1 to `8.031 ms`
+at W8 (3.67x), construction fell from `58.846 ms` to `10.071 ms` (5.84x),
+and Phase-4 W1 was `0.9642` of Phase-3 W1. W8 RSS was below W1 in both
+matrices. The diagnostic/profile timings were not substituted into
+acceptance.
+
+Analysis tool C7 is
+`6e5fccfd8553b641f18c668025a806b2dc30826b`, tree
+`6512c8123202fbac64f05dcff4a48e72b25ff2de`. Its schema-v6 cross-phase
+evaluator SHA-256 is
+`638fc37d789babd701ef3f86e2bb0e9052a4f5b24ce23097dace749d6351848a`.
+The C7 pre-default controller was invoked exactly once against the complete
+Q/C4 campaign. It failed closed on the first failing gate and preserved its
+no-clobber staging files:
+
+- result partial:
+  `$E/captures/q-c4-c7-pre-default-evaluation.result.json.partial`, zero
+  bytes, SHA-256
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
+- stderr partial:
+  `$E/captures/q-c4-c7-pre-default-evaluation.stderr.partial`, SHA-256
+  `0d01536b496685a4d9c8855c07eb820f1473b69b338450aedf79ecde79491057`.
+
+The preserved stderr reports only the first failure because the evaluator is
+fail-fast. A gate-by-gate diagnosis of the same sealed rows found exactly four
+performance gaps:
+
+| Gate | Q W1 median (s) | Q W8 median (s) | W8/W1 | Limit | Result |
+|---|---:|---:|---:|---:|---|
+| Phase-7 high-compression forced lazy | 0.192696926 | 0.131555491 | `0.682706744372248` | `2/3` | fail |
+| Final physical scaling, grammar exact | 1.321053506 | 0.680584192 | `0.515182911902434` | `0.50` | fail |
+| Final primary, grammar exact | 1.321595265 | 0.684191774 | `0.517701441673976` | `0.50` | fail |
+| Final stress, sampled-tree fixed topology | 23.718979292 | 42.840240608 | `1.806158691763320` | `1.00` | fail |
+
+All other pre-default gates passed that diagnosis. The partials must remain
+untouched; they are not a reusable evaluator slot.
+
+### Optimization iterations after the C7 diagnosis
+
+The following measurements are exploratory diagnostics from a dirty working
+tree based on C7. They preserve executable and canonical hashes but are not
+substitutes for an immutable candidate capture, full tests, sanitizers, or the
+strict evaluator.
+
+The retained implementation combines:
+
+- binary two-child recurrence fast paths, while preserving the generic checked
+  multifurcation path;
+- caller-owned reusable restricted-topology memo and overlay scratch;
+- exact-frontier liveness accounting using immutable-plan child occurrences,
+  with nonroot frontiers released only after their final consumer and only
+  after a scheduled dependency level joins;
+- a three-candidate cold exact outer burst;
+- a two-candidate bandwidth cap for the built-in dense fixed-topology verifier
+  at at least 1,024 active patterns, with smaller workloads and callback
+  verifiers bypassing the cap;
+- one-time candidate lazy-context flattening, stable wide-key LSD radix
+  grouping, zero-byte pass elision, and an automatic W8 batch of 30;
+- finite-memory accounting for reusable fixed-topology scratch and lazy-context
+  vector capacity;
+- checked grammar/execution-plan identity before dense, lazy, or fixed-topology
+  dispatch;
+- W>1 fusion of compact-genome source-fingerprint collection into site-pattern
+  construction, while retaining the historical W1 path and the public
+  three-argument `build_site_patterns` API.
+
+#### Primary grammar exact
+
+A three-candidate cold burst first brought the primary grammar ratio to the
+threshold but left insufficient margin and exceeded the RSS ratio:
+
+| Diagnostic | W1 median wall (s) | W8 median wall (s) | W8/W1 | Median `max_rss_kb` W1/W8 | RSS ratio |
+|---|---:|---:|---:|---:|---:|
+| `primary-grammar-burst3-draft{1,2,3}-w{1,8}` | 1.170888945 | 0.585510088 | `0.500056039046` | 85,292 / 176,176 | `2.065563007082` |
+| `primary-grammar-reclaim3-r{1,2,3}-w{1,8}` | 1.140849370 | 0.564544153 | `0.494845479031` | 77,252 / 144,492 | `1.870398177393` |
+
+The second row includes consumed-frontier reclamation and passes both the
+`<= 0.50` wall ratio and `<= 2.0` RSS ratio diagnostically. Its executable
+SHA-256 is
+`658567411a0f889d38069a26d1e47c61abbd0dc3f7e9128ce23bbdba53c6d076`.
+All six W1/W8 canonical files have SHA-256
+`9de2fa7254d688e8fb55e4b94650352e70f4521e8e77e00e182f390aba7f79d8`.
+
+#### Sampled-tree fixed-topology stress
+
+Scratch reuse alone exposed memory-bandwidth saturation: the single W1 and W8
+diagnostics were `15.157949032 s` and `22.384412405 s`, respectively. A
+two-candidate verifier cap reduced the W8 observation to `15.136242571 s`.
+The cap was retained, but the accompanying experimental latch/rendezvous was
+removed: review found an unsafe stack-lifetime race, and the latch itself
+provided no performance benefit.
+
+The subsequent three-pair campaign is under
+`$D/stress-fixed-reclaim-futures-r{1,2,3}-w{1,8}`:
+
+| Metric | W1 median | W8 median | W8/W1 |
+|---|---:|---:|---:|
+| wall (s) | 15.479752045 | 14.937815446 | `0.964990615003` |
+
+This diagnostically passes the workload’s `<= 1.00` non-regression gate. The
+executable SHA-256 is
+`658567411a0f889d38069a26d1e47c61abbd0dc3f7e9128ce23bbdba53c6d076`,
+and every canonical file has SHA-256
+`e8959afb7acf5d67e92ed60efd60577e5d5bcd53c6496a464c561344a909269c`.
+
+#### Phase-7 high-compression lazy width
+
+All complete campaigns use the same high-compression fixture SHA-256
+`e103be6cd1df36e5a002ae9dd9ffb53110b35c840eed1d8fa867475ad3109874`
+and produced the same canonical SHA-256
+`ae62f9153f5a0f8af0646db23e08088790c727f4a7990cbe1a6a5e71d97b84c6`.
+
+| Iteration and artifact directory | Paired repetitions | W1 median (s) | W8 median (s) | W8/W1 | Disposition |
+|---|---:|---:|---:|---:|---|
+| `phase7-width-cap6-q-c7-r2` | 9 | 0.192382710 | 0.131268303 | `0.682329004514` | cap tuning rejected |
+| `phase7-width-cap8-q-c7` | 9 | 0.192283396 | 0.131416506 | `0.683452179095` | cap tuning rejected |
+| `phase7-width-flattened-q-c7-draft1` | 9 | 0.192424824 | 0.131503249 | `0.683400645854` | flattening retained for structural reuse; insufficient alone |
+| `phase7-width-latch-flat-cap2-draft2` | 9 | 0.192106768 | 0.131569737 | `0.684878197524` | latch rejected and reverted |
+| `phase7-width-radix-batch30-futures-draft3` | 10 | 0.192461142 | 0.131503947 | `0.683275312790` | radix/batching retained; still fails `2/3` |
+| `phase7-width-tuple-fixed-broad-draft1` | 5 | 0.192282628 | 0.131456665 | `0.683663762906` | fixed-width tuple specialization rejected and fully reverted |
+| `phase7-width-fingerprint-fusion-draft1` | 7 | 0.192369022 | 0.121196700 | `0.630021916938` | retained; diagnostic pass |
+
+The retained fingerprint-fusion campaign uses executable SHA-256
+`650e2709e98756d44049468b5de2c8fd5c1a45df9abaeeb710c058525aeca268`.
+Its recorded median `max_rss_kb` values are 70,488 at W1 and 73,112 at W8,
+ratio `1.037226194530`. Recorded component medians are:
+
+| Width | `total_ms` | `cache_build_ms` | `initial_chart_construction_ms` | `local_scoring_ms` |
+|---|---:|---:|---:|---:|
+| W1 | 148.755 | 84.240 | 47.660 | 44.891 |
+| W8 | 80.922 | 50.803 | 18.267 | 13.396 |
+
+Relative to the preceding radix/batch campaign, fusion leaves W1 essentially
+unchanged (`0.999521357927` ratio) and reduces W8 wall to
+`0.921620246121` of its prior median. It avoids a second reachable-DAG and
+compact-genome walk by collecting exact per-taxon compact-genome hashes during
+the existing parallel site-pattern traversal and performing only canonical
+fingerprint finalization afterward.
+
+Tests added with this candidate cover reusable-scratch recovery after failure,
+frontier reclamation with shared children and scheduled levels, provenance
+retention, fixed-topology cap and bypass behavior, the three-candidate cold
+burst, stale-plan rejection, finite `E`/`E-1` allocation accounting,
+wide-radix semantic/allocation oracles, duplicate-leaf fingerprint parity, and
+transactional optional metadata publication.
+
+#### Normalized pre-commit confirmation
+
+After removing formatter-only churn, repository-style `clang-format`
+normalization was byte-identical before and after for every cleaned source
+file.  The normalized working binary has SHA-256
+`4aba2df83629419ea11227742f34b13befc61fb7bf004610a57d7c2341ed21bd`.
+The focused five-test set (`site_patterns_test`, `lazy_key_grouping_test`,
+`chart_trim_test`, `chart_spr_search_test`, and
+`chart_spr_allocation_test`) passed 5/5; its log is
+`$E/candidate-focused/ctest-final.log`.
+
+Fresh normalized diagnostics retained margin on all four previously failing
+gates:
+
+| Diagnostic | W1 median (s) | W8 median (s) | W8/W1 | Result |
+|---|---:|---:|---:|---|
+| Phase-7 high forced lazy, 7 pairs | 0.192034901 | 0.121367114 | `0.632005501958` | pass (`<= 2/3`) |
+| Primary grammar exact, 3 pairs | 1.170644780 | 0.575482835 | `0.491594756011` | pass (`<= 0.50`) |
+| Stress sampled-tree fixed, 3 pairs | 15.717782112 | 15.418867137 | `0.980982369340` | pass (`<= 1.00`) |
+
+The primary grammar median RSS values were 77,444 KiB at W1 and 144,484 KiB
+at W8, ratio `1.865657765611`, below the `2.0` limit.  Raw diagnostic roots are
+`$D/phase7-width-phase7-width-normalized-final`,
+`$D/primary-grammar-normalized-final-r{1,2,3}-w{1,8}`, and
+`$D/stress-fixed-normalized-final-r{1,2,3}-w{1,8}`.  These remain diagnostic
+until the revision is committed and the strict candidate-bound campaign is
+captured and evaluated.
+
+### Remaining authoritative gates
+
+None of the diagnostics above changes a phase status by itself. The following
+records remain to be appended after they actually complete:
+
+| Gate | Pending authoritative record |
+|---|---|
+| Immutable optimized candidate | revision, tree, clean root, executable hashes, and committed implementation/test scope |
+| Correctness | focused tests and full 176-test RelWithDebInfo result |
+| Sanitizers | full serial ASAN/LSan result and exact 55-test targeted TSan result, with clean scans |
+| Candidate timing campaign | fresh candidate-bound 20-component capture, row count, audit receipts, ledgers, and hashes |
+| Pre-default decision | a new no-clobber strict evaluator result proving every gate passes |
+| Conditional default promotion | descendant commit changing omitted workers only after the pre-default pass |
+| Post-default closure | default/explicit-auto capture, final evaluator, repeated normal/ASAN/TSan gates, and final artifact identities |
+
+The serial default remains unchanged until the immutable candidate passes the
+strict pre-default evaluator.
 
 ## Later-phase evidence template
 

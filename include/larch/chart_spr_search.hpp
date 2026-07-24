@@ -1340,6 +1340,28 @@ struct chart_spr_exact_candidate_admission_wave {
   bool use_inner_parallelism = false;
 };
 
+inline constexpr std::size_t
+    fixed_topology_candidate_bandwidth_min_active_patterns = 1024;
+inline constexpr std::size_t fixed_topology_candidate_bandwidth_max_workers = 2;
+
+// The built-in dense fixed-topology verifier streams complete topology-sized
+// memo/state domains for every active pattern. On the frozen 1,106-pattern
+// stress shape, scratch reuse removes allocator churn but useful throughput
+// saturates at two concurrent candidates; wider waves increase memory-system
+// contention. Custom/contextual and compressed verifiers retain their own
+// declared concurrency contracts.
+inline std::size_t plan_builtin_dense_fixed_topology_candidate_workers(
+    std::size_t resolved_workers, std::size_t active_pattern_count,
+    bool builtin_dense_verifier) noexcept {
+  if (!builtin_dense_verifier ||
+      active_pattern_count <
+          fixed_topology_candidate_bandwidth_min_active_patterns) {
+    return resolved_workers;
+  }
+  return std::min(resolved_workers,
+                  fixed_topology_candidate_bandwidth_max_workers);
+}
+
 class chart_spr_exact_candidate_budget_error : public std::runtime_error {
  public:
   chart_spr_exact_candidate_budget_error(std::size_t stable_rank,
@@ -2720,8 +2742,7 @@ struct chart_spr_active_pattern_build_result {
 namespace chart_spr_search_detail {
 
 inline std::uint64_t mix_u64(std::uint64_t seed, std::uint64_t value) {
-  seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-  return seed;
+  return site_patterns_detail::mix_source_fingerprint_u64(seed, value);
 }
 
 inline std::uint64_t fnv1a_append_byte(std::uint64_t seed,
@@ -2919,6 +2940,83 @@ inline std::size_t multifurcation_productions_scored_for_entries(
   return total;
 }
 
+inline chart_spr_pattern_source_fingerprint
+initialize_chart_spr_pattern_source_fingerprint(phylo_dag& dag,
+                                                clade_grammar const& grammar) {
+  chart_spr_pattern_source_fingerprint fp;
+  fp.reference_hash = hash_string_u64(get_reference_sequence(dag));
+
+  std::uint64_t sample_seed = grammar.taxa.id_to_sample_id.size();
+  for (auto const& sample_id : grammar.taxa.id_to_sample_id) {
+    sample_seed = mix_u64(sample_seed, hash_string_u64(sample_id));
+  }
+  fp.sample_id_hash = sample_seed;
+  return fp;
+}
+
+template <class Identifier, class SampleIdFor>
+inline chart_spr_pattern_source_fingerprint
+finish_chart_spr_pattern_source_fingerprint(
+    chart_spr_pattern_source_fingerprint fp, clade_grammar const& grammar,
+    std::vector<std::pair<Identifier, std::uint64_t>> leaf_hashes,
+    SampleIdFor const& sample_id_for) {
+  std::sort(leaf_hashes.begin(), leaf_hashes.end(),
+            [&](auto const& lhs, auto const& rhs) {
+              auto const& lhs_sample = sample_id_for(lhs.first);
+              auto const& rhs_sample = sample_id_for(rhs.first);
+              auto const sample_order = lhs_sample.compare(rhs_sample);
+              if (sample_order != 0) return sample_order < 0;
+              return lhs.second < rhs.second;
+            });
+  std::uint64_t cg_seed = leaf_hashes.size();
+  for (auto const& [identifier, hash] : leaf_hashes) {
+    cg_seed = mix_u64(cg_seed, hash_string_u64(sample_id_for(identifier)));
+    cg_seed = mix_u64(cg_seed, hash);
+  }
+  fp.compact_genome_hash = cg_seed;
+
+  std::uint64_t registry_seed = grammar.taxa.id_to_sample_id.size();
+  for (std::size_t id = 0; id < grammar.taxa.id_to_sample_id.size(); ++id) {
+    registry_seed = mix_u64(registry_seed, static_cast<std::uint64_t>(id));
+    registry_seed = mix_u64(registry_seed,
+                            hash_string_u64(grammar.taxa.id_to_sample_id[id]));
+  }
+  std::vector<std::pair<std::string, taxon_id>> taxon_map_entries;
+  taxon_map_entries.reserve(grammar.taxa.sample_id_to_id.size());
+  for (auto const& [sample_id, id] : grammar.taxa.sample_id_to_id) {
+    taxon_map_entries.emplace_back(sample_id, id);
+  }
+  std::sort(taxon_map_entries.begin(), taxon_map_entries.end());
+  for (auto const& [sample_id, id] : taxon_map_entries) {
+    registry_seed = mix_u64(registry_seed, hash_string_u64(sample_id));
+    registry_seed = mix_u64(registry_seed, static_cast<std::uint64_t>(id));
+  }
+  fp.taxon_registry_hash = registry_seed;
+  return fp;
+}
+
+inline chart_spr_pattern_source_fingerprint
+build_chart_spr_pattern_source_fingerprint_from_site_pattern_metadata(
+    phylo_dag& dag, clade_grammar const& grammar,
+    site_pattern_source_metadata source_metadata) {
+  for (auto const& [taxon, hash] :
+       source_metadata.compact_genome_leaf_hashes_by_taxon) {
+    (void)hash;
+    if (taxon >= grammar.taxa.id_to_sample_id.size()) {
+      throw std::logic_error(
+          "chart SPR pattern metadata: taxon id out of range");
+    }
+  }
+  auto fp = initialize_chart_spr_pattern_source_fingerprint(dag, grammar);
+  auto const sample_id_for = [&](taxon_id taxon) -> std::string const& {
+    return grammar.taxa.id_to_sample_id[taxon];
+  };
+  return finish_chart_spr_pattern_source_fingerprint(
+      fp, grammar,
+      std::move(source_metadata.compact_genome_leaf_hashes_by_taxon),
+      sample_id_for);
+}
+
 }  // namespace chart_spr_search_detail
 
 inline void validate_supported_chart_cache_options(
@@ -2944,17 +3042,9 @@ inline void validate_supported_chart_cache_options(
 inline chart_spr_pattern_source_fingerprint
 build_chart_spr_pattern_source_fingerprint(phylo_dag& dag,
                                            clade_grammar const& grammar) {
-  using chart_spr_search_detail::hash_string_u64;
-  using chart_spr_search_detail::mix_u64;
-
-  chart_spr_pattern_source_fingerprint fp;
-  fp.reference_hash = hash_string_u64(get_reference_sequence(dag));
-
-  std::uint64_t sample_seed = grammar.taxa.id_to_sample_id.size();
-  for (auto const& sample_id : grammar.taxa.id_to_sample_id) {
-    sample_seed = mix_u64(sample_seed, hash_string_u64(sample_id));
-  }
-  fp.sample_id_hash = sample_seed;
+  auto fp =
+      chart_spr_search_detail::initialize_chart_spr_pattern_source_fingerprint(
+          dag, grammar);
 
   std::vector<std::pair<std::string, std::uint64_t>> leaf_hashes;
   auto reachable = detail::collect_reachable(dag);
@@ -2969,9 +3059,9 @@ build_chart_spr_pattern_source_fingerprint(phylo_dag& dag,
                         }) {
             std::uint64_t cg_seed = 1469598103934665603ULL;
             for (auto const& [pos, base] : node.cg()) {
-              cg_seed = mix_u64(cg_seed, static_cast<std::uint64_t>(pos));
-              cg_seed = mix_u64(cg_seed,
-                                static_cast<std::uint64_t>(base.raw()));
+              cg_seed = site_patterns_detail::
+                  append_compact_genome_mutation_to_source_fingerprint(
+                      cg_seed, pos, base);
             }
             leaf_hashes.emplace_back(std::string{node.sample_id()}, cg_seed);
           } else {
@@ -2982,32 +3072,12 @@ build_chart_spr_pattern_source_fingerprint(phylo_dag& dag,
         },
         nv);
   }
-  std::sort(leaf_hashes.begin(), leaf_hashes.end());
-  std::uint64_t cg_seed = leaf_hashes.size();
-  for (auto const& [sample_id, hash] : leaf_hashes) {
-    cg_seed = mix_u64(cg_seed, hash_string_u64(sample_id));
-    cg_seed = mix_u64(cg_seed, hash);
-  }
-  fp.compact_genome_hash = cg_seed;
-
-  std::uint64_t registry_seed = grammar.taxa.id_to_sample_id.size();
-  for (std::size_t id = 0; id < grammar.taxa.id_to_sample_id.size(); ++id) {
-    registry_seed = mix_u64(registry_seed, static_cast<std::uint64_t>(id));
-    registry_seed = mix_u64(registry_seed,
-                            hash_string_u64(grammar.taxa.id_to_sample_id[id]));
-  }
-  std::vector<std::pair<std::string, taxon_id>> taxon_map_entries;
-  taxon_map_entries.reserve(grammar.taxa.sample_id_to_id.size());
-  for (auto const& [sample_id, id] : grammar.taxa.sample_id_to_id) {
-    taxon_map_entries.emplace_back(sample_id, id);
-  }
-  std::sort(taxon_map_entries.begin(), taxon_map_entries.end());
-  for (auto const& [sample_id, id] : taxon_map_entries) {
-    registry_seed = mix_u64(registry_seed, hash_string_u64(sample_id));
-    registry_seed = mix_u64(registry_seed, static_cast<std::uint64_t>(id));
-  }
-  fp.taxon_registry_hash = registry_seed;
-  return fp;
+  auto const sample_id_for =
+      [](std::string const& sample_id) -> std::string const& {
+    return sample_id;
+  };
+  return chart_spr_search_detail::finish_chart_spr_pattern_source_fingerprint(
+      fp, grammar, std::move(leaf_hashes), sample_id_for);
 }
 
 inline bool chart_spr_pattern_source_fingerprint_matches(
@@ -3075,6 +3145,33 @@ inline chart_spr_active_pattern_build_result make_active_search_patterns(
   auto result = make_active_search_patterns(raw_patterns, chart_opts);
   result.pattern_source_fingerprint =
       build_chart_spr_pattern_source_fingerprint(dag, grammar);
+  return result;
+}
+
+// A multi-worker search will immediately use the same scheduler for chart
+// construction.  While its source patterns are being decoded, retain the
+// exact per-leaf compact-genome hashes needed by the source fingerprint and
+// avoid a second reachable-DAG/compact-genome walk.  Explicit W1 keeps the
+// established path as its serial-regression oracle.
+inline chart_spr_active_pattern_build_result make_active_search_patterns(
+    phylo_dag& dag, clade_grammar const& grammar, chart_scheduler& scheduler,
+    chart_options const& chart_opts = {},
+    site_pattern_options pattern_opts = {}) {
+  if (scheduler.worker_resolution().resolved_workers <= 1) {
+    return make_active_search_patterns(dag, grammar, chart_opts, pattern_opts);
+  }
+
+  pattern_opts.skip_invariant_sites = true;
+  site_pattern_source_metadata source_metadata;
+  auto result = [&] {
+    auto raw_patterns =
+        site_patterns_detail::build_site_patterns_with_optional_source_metadata(
+            dag, grammar, pattern_opts, &source_metadata);
+    return make_active_search_patterns(raw_patterns, chart_opts);
+  }();
+  result.pattern_source_fingerprint = chart_spr_search_detail::
+      build_chart_spr_pattern_source_fingerprint_from_site_pattern_metadata(
+          dag, grammar, std::move(source_metadata));
   return result;
 }
 
@@ -8027,8 +8124,25 @@ struct lazy_overlay_context_accumulator {
   std::array<std::uint64_t, nuc_state_count> reference_state_counts{};
 };
 
+enum class lazy_overlay_context_key_component_kind : std::uint8_t {
+  inside_class,
+  leaf_state,
+};
+
+// Candidate-fixed flattened context-key traversal. The component value is a
+// base clade ID for inside_class and a taxon ID for leaf_state. Keeping the
+// ordered descriptor in worker scratch removes a repeated overlay-plan walk
+// from every candidate-pattern key while retaining pattern-dependent bounds
+// and packed-word validation in the worker.
+struct lazy_overlay_context_key_component {
+  lazy_overlay_context_key_component_kind kind =
+      lazy_overlay_context_key_component_kind::inside_class;
+  std::size_t value = 0;
+};
+
 struct chart_spr_local_score_scratch {
   local_overlay_chart_rows rows;
+  std::vector<lazy_overlay_context_key_component> lazy_context_key_components;
   std::vector<lazy_key_grouping_detail::packed_key_word> lazy_context_key_words;
   lazy_key_grouping_detail::packed_key_grouping_workspace
       lazy_context_grouping_workspace;
@@ -8058,6 +8172,7 @@ struct chart_spr_local_score_scratch {
   void clear_borrows() noexcept {
     rows.base_row_slot = {};
     rows.temp_row_slot = {};
+    lazy_context_key_components.clear();
     lazy_context_key_words.clear();
     lazy_context_grouping_workspace.clear_sizes();
     lazy_context_grouping_result.clear_sizes();
@@ -8072,6 +8187,8 @@ struct chart_spr_local_score_scratch {
   void release_retained_storage() noexcept {
     clear_borrows();
     std::vector<std::array<chart_cost, nuc_state_count>>{}.swap(rows.rows);
+    std::vector<lazy_overlay_context_key_component>{}.swap(
+        lazy_context_key_components);
     std::vector<lazy_key_grouping_detail::packed_key_word>{}.swap(
         lazy_context_key_words);
     lazy_context_grouping_workspace.release();
@@ -8081,6 +8198,7 @@ struct chart_spr_local_score_scratch {
 
   [[nodiscard]] bool operation_boundary_clean() const noexcept {
     return rows.base_row_slot.empty() && rows.temp_row_slot.empty() &&
+           lazy_context_key_components.empty() &&
            lazy_context_key_words.empty() && lazy_contexts.empty() &&
            lazy_prepared_key_width == 0 &&
            lazy_prepared_grouping_resident_bytes == 0 &&
@@ -8101,6 +8219,10 @@ namespace chart_spr_search_detail {
 inline std::size_t local_score_scratch_dynamic_capacity_bytes(
     chart_spr_local_score_scratch const& scratch) {
   std::size_t total = local_vector_dynamic_capacity_bytes(scratch.rows.rows);
+  total = local_capacity_checked_add(
+      total,
+      local_vector_dynamic_capacity_bytes(scratch.lazy_context_key_components),
+      "chart SPR lazy-local scratch key-component capacity");
   total = local_capacity_checked_add(
       total,
       lazy_key_grouping_detail::packed_key_word_buffer_dynamic_capacity_bytes(
@@ -8533,6 +8655,26 @@ plan_lazy_local_candidate_concurrency(std::size_t resolved_workers,
   plan.effective_tasks = std::min(plan.effective_tasks, bandwidth_limit);
   plan.bandwidth_capped = plan.effective_tasks < plan.requested_tasks;
   return plan;
+}
+
+// Keep an automatic lazy candidate batch on whole effective-concurrency
+// waves. This avoids a short tail inside every default batch when the W8
+// bandwidth policy admits six candidates at a time (32 would otherwise split
+// as 6+6+6+6+6+2). Explicit user batch sizes remain exact.
+inline std::size_t plan_lazy_local_automatic_candidate_batch_size(
+    std::size_t resolved_workers, std::size_t active_pattern_count) noexcept {
+  auto const maximum = (std::numeric_limits<std::size_t>::max)();
+  auto ordinary = std::size_t{1};
+  if (resolved_workers > 1) {
+    ordinary = resolved_workers > maximum / 4 ? maximum : resolved_workers * 4;
+  }
+  auto const concurrency = plan_lazy_local_candidate_concurrency(
+      resolved_workers, ordinary, active_pattern_count);
+  if (!concurrency.bandwidth_capped || concurrency.effective_tasks == 0) {
+    return ordinary;
+  }
+  auto const aligned = ordinary - ordinary % concurrency.effective_tasks;
+  return std::max<std::size_t>(1, aligned);
 }
 
 // Pure maximal stable-prefix planner. The runtime can feed measured deep
@@ -9598,6 +9740,44 @@ inline std::size_t lazy_overlay_context_key_width(
   return width;
 }
 
+inline void prepare_lazy_overlay_context_key_components(
+    spr_overlay_delta const& delta, clade_id root_clade,
+    std::vector<lazy_overlay_context_key_component>& components) {
+  auto const key_width = lazy_overlay_context_key_width(delta);
+  components.clear();
+  components.reserve(key_width);
+  auto append_optional_components = [&](overlay_clade_ref clade,
+                                        taxon_id leaf_taxon) {
+    if (clade.space == overlay_id_space::base) {
+      components.push_back(lazy_overlay_context_key_component{
+          .kind = lazy_overlay_context_key_component_kind::inside_class,
+          .value = clade.id});
+    }
+    if (leaf_taxon != chart_plan_no_taxon) {
+      components.push_back(lazy_overlay_context_key_component{
+          .kind = lazy_overlay_context_key_component_kind::leaf_state,
+          .value = leaf_taxon});
+    }
+  };
+
+  components.push_back(lazy_overlay_context_key_component{
+      .kind = lazy_overlay_context_key_component_kind::inside_class,
+      .value = root_clade});
+  for (auto const& row : delta.compiled_rows) {
+    append_optional_components(row.clade, row.leaf_taxon);
+    for (auto const& production :
+         candidate_chart_productions_for_row(delta, row)) {
+      for (auto const& child : candidate_chart_children(delta, production)) {
+        append_optional_components(child.clade, child.leaf_taxon);
+      }
+    }
+  }
+  if (components.size() != key_width) {
+    throw std::logic_error(
+        "chart SPR lazy local score: inconsistent prepared context-key width");
+  }
+}
+
 struct lazy_local_scratch_preparation_report {
   std::size_t observed_prepublication_peak_dynamic_capacity_bytes = 0;
 };
@@ -9613,7 +9793,9 @@ prepare_lazy_local_score_scratch_for_candidate(
     chart_spr_search_counters* counters) {
   scratch.clear_borrows();
   auto const patterns = state.active_patterns.patterns.patterns.size();
-  auto const key_width = lazy_overlay_context_key_width(delta);
+  prepare_lazy_overlay_context_key_components(
+      delta, state.grammar.root_clade, scratch.lazy_context_key_components);
+  auto const key_width = scratch.lazy_context_key_components.size();
   auto const word_count =
       lazy_key_grouping_detail::checked_packed_key_count_multiply(
           patterns, key_width, "chart SPR lazy local packed context keys");
@@ -9655,7 +9837,8 @@ prepare_lazy_local_score_scratch_for_candidate(
 }
 
 inline void fill_lazy_overlay_context_key(
-    chart_spr_search_state const& state, spr_overlay_delta const& delta,
+    chart_spr_search_state const& state,
+    std::span<lazy_overlay_context_key_component const> components,
     std::size_t pattern,
     std::span<lazy_key_grouping_detail::packed_key_word> key_words,
     bool fixed_shape_validated) {
@@ -9680,12 +9863,7 @@ inline void fill_lazy_overlay_context_key(
                      lazy, clade, pattern)
                : lazy_overlay_inside_class_index(lazy, clade, pattern);
   };
-  auto append_base_class = [&](overlay_clade_ref ref) {
-    if (ref.space != overlay_id_space::base) return;
-    store(inside_class(ref.id), "chart SPR lazy local inside-class key");
-  };
-  auto append_leaf_state = [&](taxon_id taxon) {
-    if (taxon == chart_plan_no_taxon) return;
+  auto append_leaf_state = [&](std::size_t taxon) {
     if (pattern >= patterns.size() ||
         taxon >= patterns[pattern].state_by_taxon.size()) {
       throw std::runtime_error(
@@ -9695,24 +9873,15 @@ inline void fill_lazy_overlay_context_key(
           "chart SPR lazy local leaf-state key");
   };
 
-  store(inside_class(state.grammar.root_clade),
-        "chart SPR lazy local root-class key");
-
-  auto append_children =
-      [&](std::span<candidate_chart_child_descriptor const> children) {
-        for (auto const& child : children) {
-          append_base_class(child.clade);
-          append_leaf_state(child.leaf_taxon);
-        }
-      };
-
-  for (auto const& row : delta.compiled_rows) {
-    auto ref = row.clade;
-    append_base_class(ref);
-    append_leaf_state(row.leaf_taxon);
-    for (auto const& production :
-         candidate_chart_productions_for_row(delta, row)) {
-      append_children(candidate_chart_children(delta, production));
+  for (auto const& component : components) {
+    switch (component.kind) {
+      case lazy_overlay_context_key_component_kind::inside_class:
+        store(inside_class(component.value),
+              "chart SPR lazy local inside-class key");
+        break;
+      case lazy_overlay_context_key_component_kind::leaf_state:
+        append_leaf_state(component.value);
+        break;
     }
   }
   if (output != key_words.size()) {
@@ -9802,7 +9971,9 @@ inline void accumulate_prepared_local_candidate_lazy_prepared(
     prepared_local_candidate_score& prepared,
     local_spr_score_options const& options, chart_spr_search_counters* counters,
     chart_spr_local_score_scratch& scratch,
-    checked_chart_execution_plan_ref const& checked_state) {
+    checked_chart_execution_plan_ref const& checked_state,
+    lazy_key_grouping_detail::packed_key_grouping_sort_policy sort_policy =
+        lazy_key_grouping_detail::packed_key_grouping_sort_policy::adaptive) {
   if (!prepared.valid_for_accumulation) return;
   try {
     checked_state.assert_same(state.grammar, state.execution_plan);
@@ -9854,7 +10025,7 @@ inline void accumulate_prepared_local_candidate_lazy_prepared(
 
   auto const& patterns = state.active_patterns.patterns.patterns;
   try {
-    auto const key_width = lazy_overlay_context_key_width(delta);
+    auto const key_width = scratch.lazy_context_key_components.size();
     if (scratch.lazy_prepared_key_width != key_width) {
       throw std::logic_error(
           "chart SPR lazy local score: scratch was not prepared for candidate");
@@ -9879,7 +10050,7 @@ inline void accumulate_prepared_local_candidate_lazy_prepared(
         ++counters->candidate_execution_plan_cache_hits;
       }
       fill_lazy_overlay_context_key(
-          state, delta, pattern_index,
+          state, scratch.lazy_context_key_components, pattern_index,
           key_matrix.subspan(pattern_index * key_width, key_width),
           pattern_index != 0);
     }
@@ -9895,7 +10066,8 @@ inline void accumulate_prepared_local_candidate_lazy_prepared(
             scratch.lazy_context_grouping_result,
             scratch.lazy_prepared_grouping_resident_bytes,
             lazy_key_grouping_detail::packed_key_grouping_result_mode::
-                ordered_classes);
+                ordered_classes,
+            sort_policy);
     scratch.lazy_grouping_status = grouping_status;
     if (!grouping_status.succeeded()) {
       return;
@@ -12358,21 +12530,65 @@ chart_spr_restricted_overlay_topology_row_impl(
     if (children.size() != 2 && counters != nullptr) {
       ++counters->selected_topology_multifurcation_rows;
     }
-    std::vector<chart_multisite_detail::chart_row> child_rows;
-    child_rows.reserve(children.size());
-    for (auto child : children) {
-      child_rows.push_back(chart_spr_restricted_overlay_topology_row_impl(
-          base, candidate, pattern, selected, child, base_memo, temp_memo,
-          base_state, temp_state, counters));
+    if (children.size() == 2) {
+      auto const left = chart_spr_restricted_overlay_topology_row_impl(
+          base, candidate, pattern, selected, children[0], base_memo, temp_memo,
+          base_state, temp_state, counters);
+      auto const right = chart_spr_restricted_overlay_topology_row_impl(
+          base, candidate, pattern, selected, children[1], base_memo, temp_memo,
+          base_state, temp_state, counters);
+      std::array<chart_multisite_detail::chart_row, 2> child_rows{left, right};
+      row = chart_multisite_detail::combine_rows(
+          std::span<chart_multisite_detail::chart_row const>{child_rows});
+    } else {
+      std::vector<chart_multisite_detail::chart_row> child_rows;
+      child_rows.reserve(children.size());
+      for (auto child : children) {
+        child_rows.push_back(chart_spr_restricted_overlay_topology_row_impl(
+            base, candidate, pattern, selected, child, base_memo, temp_memo,
+            base_state, temp_state, counters));
+      }
+      row = chart_multisite_detail::combine_rows(
+          std::span<chart_multisite_detail::chart_row const>{
+              child_rows.data(), child_rows.size()});
     }
-    row = chart_multisite_detail::combine_rows(
-        std::span<chart_multisite_detail::chart_row const>{
-            child_rows.data(), child_rows.size()});
   }
 
   memo_slot = row;
   state_slot = 2;
   return row;
+}
+
+struct chart_spr_restricted_overlay_topology_row_scratch {
+  std::vector<std::optional<chart_multisite_detail::chart_row>> base_memo;
+  std::vector<std::optional<chart_multisite_detail::chart_row>> temp_memo;
+  std::vector<std::uint8_t> base_state;
+  std::vector<std::uint8_t> temp_state;
+
+  void reset(std::size_t base_count, std::size_t temp_count) {
+    base_memo.resize(base_count);
+    temp_memo.resize(temp_count);
+    base_state.resize(base_count);
+    temp_state.resize(temp_count);
+    std::fill(base_memo.begin(), base_memo.end(), std::nullopt);
+    std::fill(temp_memo.begin(), temp_memo.end(), std::nullopt);
+    std::fill(base_state.begin(), base_state.end(), std::uint8_t{0});
+    std::fill(temp_state.begin(), temp_state.end(), std::uint8_t{0});
+  }
+};
+
+inline std::array<chart_cost, nuc_state_count>
+chart_spr_restricted_overlay_topology_row(
+    clade_grammar const& base, grammar_spr_candidate const& candidate,
+    site_pattern const& pattern,
+    std::map<overlay_clade_ref, overlay_production_ref> const& selected,
+    chart_spr_restricted_overlay_topology_row_scratch& scratch,
+    chart_spr_search_counters* counters = nullptr) {
+  scratch.reset(base.clades.size(), candidate.added_clades.size());
+  return chart_spr_restricted_overlay_topology_row_impl(
+      base, candidate, pattern, selected, base_clade_ref(base.root_clade),
+      scratch.base_memo, scratch.temp_memo, scratch.base_state,
+      scratch.temp_state, counters);
 }
 
 inline std::array<chart_cost, nuc_state_count>
@@ -12381,15 +12597,9 @@ chart_spr_restricted_overlay_topology_row(
     site_pattern const& pattern,
     std::map<overlay_clade_ref, overlay_production_ref> const& selected,
     chart_spr_search_counters* counters = nullptr) {
-  std::vector<std::optional<std::array<chart_cost, nuc_state_count>>> base_memo(
-      base.clades.size());
-  std::vector<std::optional<std::array<chart_cost, nuc_state_count>>> temp_memo(
-      candidate.added_clades.size());
-  std::vector<std::uint8_t> base_state(base.clades.size(), 0);
-  std::vector<std::uint8_t> temp_state(candidate.added_clades.size(), 0);
-  return chart_spr_restricted_overlay_topology_row_impl(
-      base, candidate, pattern, selected, base_clade_ref(base.root_clade),
-      base_memo, temp_memo, base_state, temp_state, counters);
+  chart_spr_restricted_overlay_topology_row_scratch scratch;
+  return chart_spr_restricted_overlay_topology_row(base, candidate, pattern,
+                                                   selected, scratch, counters);
 }
 
 struct chart_spr_lazy_selected_topology_entry {
@@ -12682,11 +12892,24 @@ fixed_topology_lazy_selected_pattern_scores(
   return scores;
 }
 
+inline checked_chart_execution_plan_ref
+check_fixed_topology_direct_execution_plan(
+    chart_spr_search_state const& state, chart_spr_search_counters& counters) {
+  try {
+    return check_chart_execution_plan(state.grammar, state.execution_plan);
+  } catch (chart_execution_plan_mismatch const&) {
+    ++counters.plan_mismatch_rejections;
+    throw;
+  }
+}
+
 inline chart_spr_fixed_topology_pattern_scores
 fixed_topology_direct_selected_pattern_scores(
     chart_spr_search_state const& state,
     chart_spr_candidate_score const& candidate,
     chart_spr_search_counters& counters) {
+  auto checked_state =
+      check_fixed_topology_direct_execution_plan(state, counters);
   if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
     return fixed_topology_lazy_selected_pattern_scores(state, candidate,
                                                        counters);
@@ -12714,6 +12937,8 @@ fixed_topology_direct_selected_pattern_scores(
   auto const& active = state.active_patterns.patterns.patterns;
   scores.old_pattern_scores.reserve(active.size());
   scores.new_pattern_scores.reserve(active.size());
+  std::vector<std::optional<chart_multisite_detail::chart_row>> before_row_memo;
+  chart_spr_restricted_overlay_topology_row_scratch after_row_scratch;
   for (std::size_t pattern_index = 0; pattern_index < active.size();
        ++pattern_index) {
     auto const& pattern = active[pattern_index];
@@ -12722,9 +12947,10 @@ fixed_topology_direct_selected_pattern_scores(
           pattern, pattern_index);
     }
     auto old_row = chart_multisite_detail::restricted_topology_row(
-        state.grammar, pattern, before_topology);
+        checked_state.plan(), pattern, before_topology, before_row_memo);
     auto new_row = chart_spr_restricted_overlay_topology_row(
-        state.grammar, candidate.candidate, pattern, selected_after, &counters);
+        state.grammar, candidate.candidate, pattern, selected_after,
+        after_row_scratch, &counters);
     auto old_score = chart_spr_weighted_root_score_from_row(old_row, pattern,
                                                             state.chart_opts);
     auto new_score = chart_spr_weighted_root_score_from_row(new_row, pattern,
@@ -12746,6 +12972,8 @@ fixed_topology_direct_selected_pattern_scores(
     chart_spr_search_state const& state,
     chart_spr_candidate_score const& candidate,
     chart_spr_search_counters& counters, chart_scheduler& scheduler) {
+  auto checked_state =
+      check_fixed_topology_direct_execution_plan(state, counters);
   if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
     return fixed_topology_lazy_selected_pattern_scores(state, candidate,
                                                        counters);
@@ -12781,6 +13009,10 @@ fixed_topology_direct_selected_pattern_scores(
   scores.new_pattern_scores.resize(active.size());
   auto const resolved_workers = scheduler.worker_resolution().resolved_workers;
   std::vector<chart_spr_search_counters> counters_by_slot(resolved_workers);
+  std::vector<std::vector<std::optional<chart_multisite_detail::chart_row>>>
+      before_row_memo_by_slot(resolved_workers);
+  std::vector<chart_spr_restricted_overlay_topology_row_scratch>
+      after_row_scratch_by_slot(resolved_workers);
   std::vector<std::exception_ptr> errors(active.size());
   auto range_options =
       chart_spr_phase4_pattern_range_options(active.size(), resolved_workers);
@@ -12795,9 +13027,11 @@ fixed_topology_direct_selected_pattern_scores(
             try {
               auto const& pattern = active[pattern_index];
               auto old_row = chart_multisite_detail::restricted_topology_row(
-                  state.grammar, pattern, before_topology);
+                  checked_state.plan(), pattern, before_topology,
+                  before_row_memo_by_slot[stable_slot]);
               auto new_row = chart_spr_restricted_overlay_topology_row(
                   state.grammar, candidate.candidate, pattern, selected_after,
+                  after_row_scratch_by_slot[stable_slot],
                   &counters_by_slot[stable_slot]);
               scores.old_pattern_scores[pattern_index] =
                   chart_spr_weighted_root_score_from_row(old_row, pattern,
@@ -13303,6 +13537,11 @@ inline std::size_t chart_spr_effective_candidate_batch_size(
   }
   if (state.cache_strategy == chart_spr_cache_strategy::pattern_batches) {
     return std::max<std::size_t>(1, workers * 4);
+  }
+  if (state.cache_strategy == chart_spr_cache_strategy::lazy_multisite_chart) {
+    return chart_spr_search_detail::
+        plan_lazy_local_automatic_candidate_batch_size(
+            workers, state.active_patterns.patterns.patterns.size());
   }
   return workers > 1 ? std::max<std::size_t>(1, workers * 4) : 1;
 }
@@ -15119,12 +15358,25 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
            !state.exact_multisite_verifier_parallel_safe)))) {
       exact_candidate_worker_limit = 1;
     }
+    auto const builtin_dense_fixed_topology_verifier =
+        options.acceptance_mode ==
+            chart_spr_acceptance_mode::fixed_topology_exact &&
+        state.cache_strategy == chart_spr_cache_strategy::all_active_patterns &&
+        !state.fixed_topology_exact_verifier &&
+        !state.contextual_fixed_topology_exact_verifier;
+    exact_candidate_worker_limit =
+        plan_builtin_dense_fixed_topology_candidate_workers(
+            exact_candidate_worker_limit,
+            state.active_patterns.patterns.patterns.size(),
+            builtin_dense_fixed_topology_verifier);
     // The built-in cold multi-site verifier owns a complete outside-boundary
     // chart and B&B frontier for every concurrently verified candidate.  Four
     // such candidates exceed the contracted W8/W1 RSS ratio on the frozen
-    // medium workload.  Preserve useful outer parallelism with one stable
-    // two-candidate prefix, then give each remaining singleton the whole
-    // scheduler through the existing inner-parallel path.  Contextual
+    // medium workload. A four-candidate burst exceeded the bound, while a
+    // three-candidate prefix retains the measured wall-speed margin without
+    // carrying a fourth complete verifier scratch domain. Preserve that one
+    // stable prefix, then give each remaining singleton the whole scheduler
+    // through the existing inner-parallel path. Contextual
     // transient verifiers and fixed-topology verification have different
     // storage surfaces and retain their ordinary worker limit.
     auto const transient_multisite_callback_active =
@@ -15416,7 +15668,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
       if (bounded_cold_multisite_outer_burst) {
         wave_worker_limit =
             cold_multisite_outer_burst_available
-                ? std::min<std::size_t>(exact_candidate_worker_limit, 2)
+                ? std::min<std::size_t>(exact_candidate_worker_limit, 3)
                 : std::size_t{1};
       }
       auto wave = plan_chart_spr_exact_candidate_admission_wave(
@@ -15520,7 +15772,7 @@ inline chart_spr_iteration_result run_chart_spr_acceptance_iteration(
         run_candidate(wave_begin, nullptr);
       }
 
-      // Consume the one outer burst only after a complete pair returned.
+      // Consume the one outer burst only after a multi-candidate wave returned.
       // When a finite byte budget admits just one candidate, keeping the
       // burst available permits the next stable prefix to use it if the
       // retained-result envelope still has room.

@@ -11,6 +11,7 @@
 #include <print>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -50,6 +51,150 @@ static std::uint64_t explicit_uncompressed_total(
     }
   }
   return total;
+}
+
+static void check_normalized_binary_state_map_equal(
+    larch::normalized_binary_state_map const& lhs,
+    larch::normalized_binary_state_map const& rhs) {
+  CHECK(lhs.exact_pattern == rhs.exact_pattern);
+  CHECK(lhs.normalized_binary_pattern == rhs.normalized_binary_pattern);
+  CHECK(lhs.normalized_to_original == rhs.normalized_to_original);
+  CHECK(lhs.original_to_normalized == rhs.original_to_normalized);
+}
+
+static void check_site_pattern_sets_equal(larch::site_pattern_set const& lhs,
+                                          larch::site_pattern_set const& rhs) {
+  CHECK(lhs.patterns.size() == rhs.patterns.size());
+  for (std::size_t index = 0; index < lhs.patterns.size(); ++index) {
+    auto const& left = lhs.patterns[index];
+    auto const& right = rhs.patterns[index];
+    CHECK(left.state_by_taxon == right.state_by_taxon);
+    CHECK(left.positions == right.positions);
+    CHECK(left.weight == right.weight);
+    CHECK(left.reference_state_counts == right.reference_state_counts);
+  }
+
+  CHECK(lhs.original_site_to_pattern == rhs.original_site_to_pattern);
+  CHECK(lhs.normalized_binary_patterns.size() ==
+        rhs.normalized_binary_patterns.size());
+  for (std::size_t index = 0; index < lhs.normalized_binary_patterns.size();
+       ++index) {
+    auto const& left = lhs.normalized_binary_patterns[index];
+    auto const& right = rhs.normalized_binary_patterns[index];
+    CHECK(left.state_by_taxon == right.state_by_taxon);
+    CHECK(left.positions == right.positions);
+    CHECK(left.weight == right.weight);
+    CHECK(left.exact_pattern_indices == right.exact_pattern_indices);
+    CHECK(left.exact_state_maps.size() == right.exact_state_maps.size());
+    for (std::size_t map_index = 0;
+         map_index < left.exact_state_maps.size(); ++map_index) {
+      check_normalized_binary_state_map_equal(left.exact_state_maps[map_index],
+                                               right.exact_state_maps[map_index]);
+    }
+  }
+
+  CHECK(lhs.exact_pattern_to_normalized_binary_pattern ==
+        rhs.exact_pattern_to_normalized_binary_pattern);
+  CHECK(lhs.exact_pattern_to_normalized_binary_state_map.size() ==
+        rhs.exact_pattern_to_normalized_binary_state_map.size());
+  for (std::size_t index = 0;
+       index < lhs.exact_pattern_to_normalized_binary_state_map.size();
+       ++index) {
+    check_normalized_binary_state_map_equal(
+        lhs.exact_pattern_to_normalized_binary_state_map[index],
+        rhs.exact_pattern_to_normalized_binary_state_map[index]);
+  }
+
+  CHECK(lhs.taxon_count == rhs.taxon_count);
+  CHECK(lhs.total_site_count == rhs.total_site_count);
+  CHECK(lhs.invariant_site_count == rhs.invariant_site_count);
+  CHECK(lhs.variable_site_count == rhs.variable_site_count);
+  CHECK(lhs.binary_variable_site_count == rhs.binary_variable_site_count);
+  CHECK(lhs.nonbinary_variable_site_count ==
+        rhs.nonbinary_variable_site_count);
+  CHECK(lhs.skipped_invariant_site_count ==
+        rhs.skipped_invariant_site_count);
+  CHECK(lhs.invariant_constant_score_excluding_ua ==
+        rhs.invariant_constant_score_excluding_ua);
+  CHECK(lhs.invariant_constant_score_with_reference_edge ==
+        rhs.invariant_constant_score_with_reference_edge);
+  CHECK(lhs.skipped_invariant_constant_score_with_reference_edge ==
+        rhs.skipped_invariant_constant_score_with_reference_edge);
+}
+
+static larch::phylo_dag make_duplicate_identical_leaf_pattern_dag() {
+  using larch::test::tiny_dag_edge;
+  using larch::test::tiny_dag_node;
+  return larch::test::make_tiny_labelled_dag(
+      "AAA", "root",
+      std::vector<tiny_dag_node>{
+          {"root", "AAA", ""},
+          {"a1", "CAC", "A"},
+          {"a2", "CAC", "A"},
+          {"b", "ACC", "B"},
+      },
+      std::vector<tiny_dag_edge>{
+          {"root", "a1", 0},
+          {"root", "a2", 0},
+          {"root", "b", 1},
+      });
+}
+
+static void test_optional_source_metadata_is_exact_and_transactional() {
+  std::println("test_optional_source_metadata_is_exact_and_transactional");
+
+  auto dag = make_duplicate_identical_leaf_pattern_dag();
+  auto built = larch::build_clade_grammar_with_audit(dag);
+  CHECK(built.audit.duplicate_sample_id_occurrences == 1);
+  auto const& grammar = built.grammar;
+
+  larch::site_pattern_options options;
+  options.build_normalized_binary_patterns = true;
+  auto expected = larch::build_site_patterns(dag, grammar, options);
+  auto const a_taxon = grammar.taxa.sample_id_to_id.at("A");
+  auto const b_taxon = grammar.taxa.sample_id_to_id.at("B");
+
+  larch::site_pattern_source_metadata metadata;
+  metadata.compact_genome_leaf_hashes_by_taxon = {{b_taxon, 7}};
+  auto actual =
+      larch::site_patterns_detail::
+          build_site_patterns_with_optional_source_metadata(
+              dag, grammar, options, &metadata);
+  check_site_pattern_sets_equal(actual, expected);
+
+  auto hashes = metadata.compact_genome_leaf_hashes_by_taxon;
+  std::sort(hashes.begin(), hashes.end());
+  CHECK(hashes.size() == 3);
+  CHECK(hashes[0].first == a_taxon);
+  CHECK(hashes[1].first == a_taxon);
+  CHECK(hashes[2].first == b_taxon);
+  CHECK(hashes[0].second == hashes[1].second);
+
+  // Fail after the complete reachable-leaf scan. Keeping both registry maps
+  // internally consistent avoids an earlier validation error and proves that
+  // the caller-owned metadata is published only after the whole build commits.
+  auto missing_taxon_grammar = grammar;
+  auto const missing_id = static_cast<larch::taxon_id>(
+      missing_taxon_grammar.taxa.id_to_sample_id.size());
+  missing_taxon_grammar.taxa.id_to_sample_id.push_back("missing");
+  missing_taxon_grammar.taxa.sample_id_to_id.emplace("missing", missing_id);
+
+  larch::site_pattern_source_metadata unchanged;
+  unchanged.compact_genome_leaf_hashes_by_taxon = {{a_taxon, 19}};
+  auto const sentinel = unchanged.compact_genome_leaf_hashes_by_taxon;
+  std::string failure;
+  try {
+    (void)larch::site_patterns_detail::
+        build_site_patterns_with_optional_source_metadata(
+            dag, missing_taxon_grammar, options, &unchanged);
+  } catch (std::runtime_error const& error) {
+    failure = error.what();
+  }
+  CHECK(failure.find("missing reachable leaf for taxon 'missing'") !=
+        std::string::npos);
+  CHECK(unchanged.compact_genome_leaf_hashes_by_taxon == sentinel);
+
+  std::println("  PASS");
 }
 
 static void test_identical_sites_collapse_and_weight() {
@@ -288,6 +433,7 @@ static void test_strict_validation_errors() {
 }
 
 int main() {
+  test_optional_source_metadata_is_exact_and_transactional();
   test_identical_sites_collapse_and_weight();
   test_invariant_sites_can_be_skipped_with_constants();
   test_binary_normalization_groups_complements();

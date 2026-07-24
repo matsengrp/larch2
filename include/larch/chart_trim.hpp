@@ -2812,26 +2812,48 @@ inline chart_row restricted_topology_row_impl(
     }
     parsimony_chart_detail::validate_production_inside_row_inputs(
         grammar, prod, pid, "multi-site trim selected topology");
-    std::vector<chart_row> child_rows;
-    child_rows.reserve(prod.children.size());
-    for (auto child : prod.children) {
-      child_rows.push_back(
-          restricted_topology_row_impl(grammar, pattern, topo, child, memo));
+    if (prod.children.size() == 2) {
+      // Frozen production inputs are overwhelmingly strict binary. Avoid one
+      // heap allocation at every internal clade while preserving the same
+      // left-to-right recursion and combine order. Higher-rank productions
+      // retain the general ordered-vector path below.
+      auto const left = restricted_topology_row_impl(grammar, pattern, topo,
+                                                     prod.children[0], memo);
+      auto const right = restricted_topology_row_impl(grammar, pattern, topo,
+                                                      prod.children[1], memo);
+      std::array<chart_row, 2> child_rows{left, right};
+      row = combine_rows(std::span<chart_row const>{child_rows});
+    } else {
+      std::vector<chart_row> child_rows;
+      child_rows.reserve(prod.children.size());
+      for (auto child : prod.children) {
+        child_rows.push_back(
+            restricted_topology_row_impl(grammar, pattern, topo, child, memo));
+      }
+      row = combine_rows(
+          std::span<chart_row const>{child_rows.data(), child_rows.size()});
     }
-    row = combine_rows(
-        std::span<chart_row const>{child_rows.data(), child_rows.size()});
   }
 
   memo[clade] = row;
   return row;
 }
 
+inline chart_row restricted_topology_row(
+    clade_grammar const& grammar, site_pattern const& pattern,
+    selected_topology const& topo,
+    std::vector<std::optional<chart_row>>& memo) {
+  memo.resize(grammar.clades.size());
+  std::fill(memo.begin(), memo.end(), std::nullopt);
+  return restricted_topology_row_impl(grammar, pattern, topo,
+                                      grammar.root_clade, memo);
+}
+
 inline chart_row restricted_topology_row(clade_grammar const& grammar,
                                          site_pattern const& pattern,
                                          selected_topology const& topo) {
-  std::vector<std::optional<chart_row>> memo(grammar.clades.size());
-  return restricted_topology_row_impl(grammar, pattern, topo,
-                                      grammar.root_clade, memo);
+  std::vector<std::optional<chart_row>> memo;
+  return restricted_topology_row(grammar, pattern, topo, memo);
 }
 
 inline std::uint64_t score_selected_topology(clade_grammar const& grammar,
@@ -2964,25 +2986,35 @@ inline chart_row restricted_topology_row_impl(
       throw std::runtime_error(
           "multi-site trim: selected production parent mismatch");
     }
-    std::vector<chart_row> child_rows;
     auto children = plan.children(pid);
-    child_rows.reserve(children.size());
-    for (auto child : children) {
-      child_rows.push_back(
-          restricted_topology_row_impl(plan, pattern, topo, child, memo));
+    if (children.size() == 2) {
+      auto const left =
+          restricted_topology_row_impl(plan, pattern, topo, children[0], memo);
+      auto const right =
+          restricted_topology_row_impl(plan, pattern, topo, children[1], memo);
+      std::array<chart_row, 2> child_rows{left, right};
+      row = combine_rows(plan, std::span<chart_row const>{child_rows});
+    } else {
+      std::vector<chart_row> child_rows;
+      child_rows.reserve(children.size());
+      for (auto child : children) {
+        child_rows.push_back(
+            restricted_topology_row_impl(plan, pattern, topo, child, memo));
+      }
+      row = combine_rows(
+          plan,
+          std::span<chart_row const>{child_rows.data(), child_rows.size()});
     }
-    row = combine_rows(
-        plan,
-        std::span<chart_row const>{child_rows.data(), child_rows.size()});
   }
 
   memo[clade] = row;
   return row;
 }
 
-inline chart_row restricted_topology_row(chart_execution_plan const& plan,
-                                         site_pattern const& pattern,
-                                         selected_topology const& topo) {
+inline chart_row restricted_topology_row(
+    chart_execution_plan const& plan, site_pattern const& pattern,
+    selected_topology const& topo,
+    std::vector<std::optional<chart_row>>& memo) {
   if (topo.selected_production_by_clade.size() != plan.clades().size()) {
     throw std::runtime_error(
         "multi-site trim: selected topology clade vector has wrong size");
@@ -2991,9 +3023,17 @@ inline chart_row restricted_topology_row(chart_execution_plan const& plan,
     throw std::runtime_error(
         "multi-site trim: selected topology production vector has wrong size");
   }
-  std::vector<std::optional<chart_row>> memo(plan.clades().size());
+  memo.resize(plan.clades().size());
+  std::fill(memo.begin(), memo.end(), std::nullopt);
   return restricted_topology_row_impl(plan, pattern, topo, plan.root_clade(),
                                       memo);
+}
+
+inline chart_row restricted_topology_row(chart_execution_plan const& plan,
+                                         site_pattern const& pattern,
+                                         selected_topology const& topo) {
+  std::vector<std::optional<chart_row>> memo;
+  return restricted_topology_row(plan, pattern, topo, memo);
 }
 
 inline std::uint64_t score_selected_topology(
@@ -4478,6 +4518,13 @@ struct multisite_frontier_build_options {
   std::optional<std::uint64_t> upper_bound_override;
   std::size_t max_frontier_entries_per_clade = 0;
   std::size_t max_provenance_choices_per_entry = 0;
+
+  // Exact trimming needs only the root frontier after a pass: every surviving
+  // entry owns its complete production-union mask. Plan-backed builders may
+  // therefore release a child frontier after its final consumer production has
+  // completed. Topology-trace builders leave this false because their
+  // provenance choices retain child-entry indices.
+  bool release_consumed_frontiers = false;
 };
 
 struct multisite_frontier_build_result {
@@ -4867,6 +4914,77 @@ inline void add_multisite_frontier_clade_work(
   result.dominance_pruned += work.dominance_pruned;
 }
 
+inline std::vector<std::size_t>
+initialize_multisite_frontier_remaining_consumer_counts(
+    chart_execution_plan const& plan,
+    multisite_frontier_build_options const& build_options) {
+  if (!build_options.release_consumed_frontiers ||
+      build_options.keep_provenance) {
+    return {};
+  }
+
+  std::vector<std::size_t> remaining(plan.clades().size(), 0);
+  for (std::size_t cid = 0; cid < plan.clades().size(); ++cid) {
+    remaining[cid] =
+        plan.child_occurrences_for_clade(static_cast<clade_id>(cid)).size();
+  }
+  return remaining;
+}
+
+inline void release_multisite_frontiers_consumed_by_clade(
+    chart_execution_plan const& plan, clade_id parent,
+    std::vector<std::size_t>& remaining_consumers,
+    std::vector<std::vector<frontier_entry>>& frontiers) {
+  if (remaining_consumers.empty()) return;
+  if (remaining_consumers.size() != plan.clades().size() ||
+      frontiers.size() != plan.clades().size()) {
+    throw std::logic_error(
+        "multi-site frontier reclamation: consumer-count shape mismatch");
+  }
+
+  auto release_if_dead = [&](clade_id clade) {
+    if (clade != plan.root_clade() && remaining_consumers[clade] == 0) {
+      std::vector<frontier_entry>{}.swap(frontiers[clade]);
+    }
+  };
+
+  // child_occurrences_for_clade counts one occurrence per production, even if
+  // a malformed production repeats a child. Count each distinct child once to
+  // keep this lifetime ledger aligned with the validated plan index.
+  for (auto pid : plan.productions_for_parent(parent)) {
+    auto const children = plan.children(pid);
+    for (std::size_t child_index = 0; child_index < children.size();
+         ++child_index) {
+      auto const child = children[child_index];
+      if (std::find(children.begin(), children.begin() + child_index, child) !=
+          children.begin() + child_index) {
+        continue;
+      }
+      if (child >= remaining_consumers.size() ||
+          remaining_consumers[child] == 0) {
+        throw std::logic_error(
+            "multi-site frontier reclamation: consumer-count underflow");
+      }
+      --remaining_consumers[child];
+      release_if_dead(child);
+    }
+  }
+
+  // A disconnected non-root clade has no consumer at all. Its diagnostic size
+  // has already been published by the caller, so its frontier is dead as soon
+  // as its own construction completes.
+  release_if_dead(parent);
+}
+
+inline void validate_multisite_frontier_consumers_exhausted(
+    std::vector<std::size_t> const& remaining_consumers) {
+  if (std::any_of(remaining_consumers.begin(), remaining_consumers.end(),
+                  [](std::size_t count) { return count != 0; })) {
+    throw std::logic_error(
+        "multi-site frontier reclamation: unconsumed plan occurrence");
+  }
+}
+
 inline multisite_frontier_build_result
 build_multisite_frontiers_from_prepared_active(
     chart_execution_plan const& plan, chart_options const& options,
@@ -4885,6 +5003,9 @@ build_multisite_frontiers_from_prepared_active(
   auto const pruning_upper_bound = build_options.upper_bound_override
                                        ? *build_options.upper_bound_override
                                        : result.initial_upper_bound;
+  auto remaining_consumers =
+      initialize_multisite_frontier_remaining_consumer_counts(plan,
+                                                              build_options);
   auto const level_order = plan.bottom_up_level_order();
   auto const level_offsets = plan.bottom_up_level_offsets();
   for (std::size_t level = 0; level + 1 < level_offsets.size(); ++level) {
@@ -4914,12 +5035,15 @@ build_multisite_frontiers_from_prepared_active(
       diagnostic.dominance_candidates_considered +=
           work.dominance_candidates_considered;
       diagnostic.dominance_pruned += work.dominance_pruned;
+      release_multisite_frontiers_consumed_by_clade(
+          plan, clade, remaining_consumers, result.frontiers);
     }
     diagnostic.wave_ms = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - started)
                              .count();
     result.level_diagnostics.push_back(std::move(diagnostic));
   }
+  validate_multisite_frontier_consumers_exhausted(remaining_consumers);
   return result;
 }
 
@@ -4950,6 +5074,9 @@ build_multisite_frontiers_from_prepared_active_scheduled(
   auto const pruning_upper_bound = build_options.upper_bound_override
                                        ? *build_options.upper_bound_override
                                        : result.initial_upper_bound;
+  auto remaining_consumers =
+      initialize_multisite_frontier_remaining_consumer_counts(plan,
+                                                              build_options);
   auto const level_order = plan.bottom_up_level_order();
   auto const level_offsets = plan.bottom_up_level_offsets();
   if (level_offsets.empty() || level_offsets.front() != 0 ||
@@ -5048,11 +5175,20 @@ build_multisite_frontiers_from_prepared_active_scheduled(
           work.dominance_candidates_considered;
       diagnostic.dominance_pruned += work.dominance_pruned;
     }
+    // Workers in one dependency level can share a child frontier. Reclamation
+    // is coordinator-only and begins after the complete level has joined, so a
+    // final consumer can never invalidate a concurrent reader.
+    for (std::size_t item = 0; item < item_count; ++item) {
+      auto const clade = level_order[begin + item];
+      release_multisite_frontiers_consumed_by_clade(
+          plan, clade, remaining_consumers, result.frontiers);
+    }
     diagnostic.wave_ms = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - wave_started)
                              .count();
     result.level_diagnostics.push_back(std::move(diagnostic));
   }
+  validate_multisite_frontier_consumers_exhausted(remaining_consumers);
   return result;
 }
 
@@ -5579,6 +5715,7 @@ inline multisite_trim_result build_multisite_trim_impl(
         trim_options.upper_bound_override;
     score_build_options.max_frontier_entries_per_clade =
         trim_options.max_frontier_entries_per_clade;
+    score_build_options.release_consumed_frontiers = true;
     {
       auto score_build =
           build_frontiers(score_build_options, "multi-site trim score pass");
@@ -5613,6 +5750,7 @@ inline multisite_trim_result build_multisite_trim_impl(
     mask_build_options.upper_bound_override = result.optimum;
     mask_build_options.max_frontier_entries_per_clade =
         trim_options.max_frontier_entries_per_clade;
+    mask_build_options.release_consumed_frontiers = true;
     auto mask_build = build_frontiers(
         mask_build_options, "multi-site trim exact mask recovery pass");
     append_multisite_frontier_diagnostics(
@@ -5654,6 +5792,7 @@ inline multisite_trim_result build_multisite_trim_impl(
   build_options.upper_bound_override = trim_options.upper_bound_override;
   build_options.max_frontier_entries_per_clade =
       trim_options.max_frontier_entries_per_clade;
+  build_options.release_consumed_frontiers = true;
   auto build = build_frontiers(build_options, "multi-site trim");
   append_multisite_frontier_diagnostics(result, build,
                                         multisite_frontier_pass_kind::exact, 0);
