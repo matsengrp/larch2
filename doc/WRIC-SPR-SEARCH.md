@@ -103,6 +103,12 @@ must explicitly opt into parallel safety. Fixed-topology selector callbacks
 run serially before the verifier wave because they likewise have no implicit
 thread-safety contract.
 
+For `dagutil`, omitting both worker options now requests automatic worker
+resolution, the same numeric request as explicit `--chart-spr-workers 0`, and
+is reported as `automatic_default`. Explicit `--chart-spr-workers 1` remains
+the serial semantic oracle. The legacy local-score option remains an explicit
+compatibility alias and is never silently combined with the unified option.
+
 After the wave joins, the coordinator merges task-local counters, chooses a
 hard failure, copies canonical evidence, and selects the winning candidate in
 stable-rank order. Completion order is never observable. An exact-wave

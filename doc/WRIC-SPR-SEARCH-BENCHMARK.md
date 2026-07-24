@@ -224,9 +224,9 @@ a wildcard. Booleans are lowercase `true` or `false`. Closed values include:
 - `expected_worker_policy` is `-` for native, `explicit` or `automatic` for
   the unified option, and `legacy_explicit` or `legacy_automatic` for its
   compatibility alias. Only an omitted/default row uses `policy`: its runtime
-  report must be one of the closed transition labels `default_serial` or
-  `automatic_default`. Manifest numeric zero is reported in raw/summary output
-  as the stable user-facing worker label `auto`.
+  report must be one of the closed transition labels historical
+  `default_serial` or promoted `automatic_default`. Manifest numeric zero is
+  reported in raw/summary output as the stable user-facing worker label `auto`.
 
 The Phase-10 transition is a separate strict gate:
 

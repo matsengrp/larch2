@@ -20,7 +20,13 @@ is `doc/WRIC-CHART-SPR-SEARCH-COUNTER-BASELINE.md` (Phase 0).
 
 Two new enums (`include/larch/chart_spr_search.hpp`) name the accepted-state
 commit path and the exact-verification path a run selects, surfaced as labelled
-report fields and CLI flags.  Defaults are unchanged.
+report fields and CLI flags. Their enum defaults are unchanged.
+
+The later Phase-10 worker-policy promotion is deliberately limited to the
+`dagutil` CLI: omitting both worker options requests automatic affinity-based
+resolution and reports `automatic_default`. Explicit
+`--chart-spr-workers 1` continues to select the serial oracle, and direct
+library defaults remain unchanged.
 
 - `chart_spr_commit_mode`: `overlay_delta` (default, the Phase-4 local-commit
   SPR path / Option A/B materialize-and-merge) or `option_c` (rank-3 Option-C

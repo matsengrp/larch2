@@ -43,8 +43,10 @@ g++-trunk -std=c++26 -freflection -I include -I build/generated \
 ```
 
 The run is deterministic: serial local scoring (`local_score_worker_count = 1`,
-the option default) and a fixed `seed = 1`, so two runs on the same commit
-produce byte-identical counters and the splice is idempotent.
+the frozen Phase-0 `chart_spr_search_options` library default) and a fixed
+`seed = 1`, so two runs on the same commit produce byte-identical counters and
+the splice is idempotent. This historical library default is distinct from the
+later promoted `dagutil` omitted-worker policy.
 
 The regeneration command is valid only at the frozen Phase-0 product
 revision.  Do not replace this baseline with output from a later optimized

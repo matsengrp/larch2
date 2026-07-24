@@ -233,12 +233,35 @@ require_scheduler_contract() {
 
 default_out=$tmp/default.out
 run_search default
-require_top_value "$default_out" chart_workers_requested 1
-require_top_value "$default_out" chart_workers_resolved 1
-require_top_value "$default_out" chart_worker_policy default_serial
-require_top_value "$default_out" local_score_workers 1
-require_top_value "$default_out" chart_worker_resolution_policy explicit
+require_top_value "$default_out" chart_workers_requested 0
+require_top_value "$default_out" chart_worker_policy automatic_default
+default_resolved=$(top_value "$default_out" chart_workers_resolved)
+if [[ ! $default_resolved =~ ^[1-9][0-9]*$ ]]; then
+  echo "default chart worker count did not resolve positively: '$default_resolved'" >&2
+  exit 1
+fi
+require_top_value "$default_out" local_score_workers "$default_resolved"
+default_resolution_policy=$(top_value "$default_out" chart_worker_resolution_policy)
+case "$default_resolution_policy" in
+  affinity_physical_cores|affinity_logical_cpus|hardware_concurrency|serial_fallback)
+    ;;
+  *)
+    echo "unexpected default chart worker resolution policy: '$default_resolution_policy'" >&2
+    exit 1
+    ;;
+esac
 require_scheduler_contract "$default_out"
+
+# Explicit one-worker execution remains the serial semantic oracle and
+# compatibility path after omitted workers become automatic.
+serial_out=$tmp/serial.out
+run_search serial --chart-spr-workers 1
+require_top_value "$serial_out" chart_workers_requested 1
+require_top_value "$serial_out" chart_workers_resolved 1
+require_top_value "$serial_out" chart_worker_policy explicit
+require_top_value "$serial_out" local_score_workers 1
+require_top_value "$serial_out" chart_worker_resolution_policy explicit
+require_scheduler_contract "$serial_out"
 
 # Every workload-defining manifest field is repeated by the real product
 # report.  These checks complement the synthetic manifest test: a fake CLI

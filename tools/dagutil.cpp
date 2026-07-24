@@ -1327,7 +1327,7 @@ Analysis:
                           grammar (default), sampled-tree, or hybrid
   --chart-spr-workers <N>
                           Unified dense-chart/B&B and chart-search worker
-                          budget (default 1; 0
+                          budget (default 0, automatic; 0
                           chooses affinity-restricted physical cores when
                           available, then affinity logical CPUs, hardware
                           concurrency, or the serial portable fallback)
@@ -4033,7 +4033,7 @@ static void run_chart_spr_local_scoring_diagnostic(
   auto scored_candidates = score_candidates_locally(
       state, candidates, {},
       a.chart_spr_workers.value_or(
-          a.chart_spr_local_score_workers.value_or(1)));
+          a.chart_spr_local_score_workers.value_or(0)));
   auto local_scoring_wall_ms = elapsed_ms(scoring_start,
                                           std::chrono::steady_clock::now());
   for (auto& scored : scored_candidates) {
@@ -4102,7 +4102,7 @@ static void run_chart_spr_local_scoring_diagnostic(
   out << "  local_score_workers: "
       << chart_spr_search_detail::normalize_chart_spr_worker_count(
              a.chart_spr_workers.value_or(
-                 a.chart_spr_local_score_workers.value_or(1)))
+                 a.chart_spr_local_score_workers.value_or(0)))
       << "\n";
   out << "  cache_build_ms: " << std::fixed << std::setprecision(3)
       << cache_ms << "\n";
@@ -4211,7 +4211,7 @@ static chart_spr_search_options make_chart_spr_search_options(
   options.cache.lazy_policy = a.wric_lazy_chart_policy;
   auto const requested_workers =
       a.chart_spr_workers.value_or(
-          a.chart_spr_local_score_workers.value_or(1));
+          a.chart_spr_local_score_workers.value_or(0));
   options.worker_count = requested_workers;
   options.local_score_worker_count = requested_workers;
   options.rebuild_after_accept = !a.chart_spr_local_accept_updates;
@@ -4546,7 +4546,7 @@ static void run_chart_spr_search_diagnostic(
     out << (*a.chart_spr_local_score_workers == 0 ? "legacy_automatic"
                                                   : "legacy_explicit");
   } else {
-    out << "default_serial";
+    out << "automatic_default";
   }
   out << "\n";
   out << "  local_score_workers: "
@@ -6070,7 +6070,7 @@ int main(int argc, char** argv) try {
     chart_spr_scheduler_axis_metrics exact_setup_axis;
     chart_spr_scheduler_axis_metrics exact_frontier_clade_axis;
     auto const requested_workers = a.chart_spr_workers.value_or(
-        a.chart_spr_local_score_workers.value_or(1));
+        a.chart_spr_local_score_workers.value_or(0));
     auto bnb_start = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point bnb_end;
     if (lazy_chart) {

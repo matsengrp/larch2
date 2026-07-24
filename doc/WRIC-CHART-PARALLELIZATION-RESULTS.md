@@ -3153,10 +3153,10 @@ identified exactly four performance gaps. The dirty optimized candidate
 diagnostics pass those four limits, but no candidate-bound acceptance result
 exists yet.
 
-The product default stays serial until explicit auto passes every prerequisite;
-no default-worker performance claim has been made. A later conditional default
-change requires every affected normal and sanitizer gate to pass again at that
-descendant.
+At this checkpoint the product default stayed serial because explicit auto had
+not yet passed every prerequisite; no default-worker performance claim had
+been made. The later conditional promotion still requires every affected
+normal and sanitizer gate to pass again at its descendant.
 
 ## Post-Q pre-default gap closure (diagnostic; authoritative recapture pending)
 
@@ -3369,8 +3369,10 @@ records remain to be appended after they actually complete:
 | Conditional default promotion | descendant commit changing omitted workers only after the pre-default pass |
 | Post-default closure | default/explicit-auto capture, final evaluator, repeated normal/ASAN/TSan gates, and final artifact identities |
 
-The serial default remains unchanged until the immutable candidate passes the
-strict pre-default evaluator.
+This diagnostic section records the pre-promotion state: its serial-default
+statement applies only until an immutable candidate passes the strict
+pre-default evaluator. The authoritative promotion and post-default closure
+are recorded separately below rather than rewriting this history.
 
 ## Later-phase evidence template
 
