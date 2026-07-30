@@ -92,6 +92,19 @@ static larch::test::tiny_tree_node three_taxon_star_spec() {
                      tiny_leaf("C", "AAGA")});
 }
 
+static larch::test::tiny_tree_node kary_ua_edge_star_spec(
+    std::size_t arity) {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  std::vector<larch::test::tiny_tree_node> leaves;
+  leaves.reserve(arity);
+  for (std::size_t i = 0; i < arity; ++i) {
+    leaves.push_back(
+        tiny_leaf("taxon-" + std::to_string(i), i == 0 ? "CC" : "CA"));
+  }
+  return tiny_inner("root", "CA", std::move(leaves));
+}
+
 static larch::polytomy_refinement_result binary_refinement(larch::phylo_dag& dag) {
   larch::clade_grammar_options grammar_opts;
   larch::polytomy_refinement_options refinement_opts;
@@ -266,6 +279,81 @@ static void test_score_ua_edge_single_taxon_validation() {
   CHECK(applied.validation_succeeded);
 }
 
+static void test_kary_topology_materialize_roundtrip_fitch_ua_parity() {
+  std::println("test_kary_topology_materialize_roundtrip_fitch_ua_parity");
+  for (std::size_t arity :
+       {std::size_t{3}, std::size_t{4}, std::size_t{5}, std::size_t{10}}) {
+    auto source = larch::test::make_tiny_labelled_tree(
+        "AA", kary_ua_edge_star_spec(arity));
+    larch::polytomy_refinement_options refinement_opts;
+    refinement_opts.mode = larch::polytomy_mode::allow;
+    auto refinement = larch::build_polytomy_refined_clade_grammar(
+        source, larch::clade_grammar_options{}, refinement_opts);
+    CHECK(refinement.audit.contains_kary_productions);
+    CHECK(larch::clade_grammar_max_production_arity(refinement.grammar) ==
+          arity);
+
+    std::vector<larch::production_id> production_ids;
+    production_ids.reserve(refinement.grammar.productions.size());
+    for (std::size_t pid = 0; pid < refinement.grammar.productions.size();
+         ++pid) {
+      production_ids.push_back(static_cast<larch::production_id>(pid));
+    }
+    auto topology = larch::grammar_topology_from_productions(
+        refinement.grammar, production_ids);
+    (void)larch::validate_grammar_topology(refinement.grammar, topology);
+
+    auto patterns =
+        larch::build_site_patterns(source, refinement.grammar);
+    larch::chart_options ua_free_opts;
+    larch::chart_options with_ua_opts;
+    with_ua_opts.score_ua_edge = true;
+    CHECK(larch::score_selected_topology(refinement.grammar, patterns, topology,
+                                         ua_free_opts) == 1);
+    CHECK(larch::score_selected_topology(refinement.grammar, patterns, topology,
+                                         with_ua_opts) == 2);
+
+    auto materialized = larch::materialize_grammar_topology_tree(
+        source, refinement.grammar, topology);
+    CHECK(larch::is_tree(materialized));
+    CHECK(larch::test::score_tree_fitch_parsimony(materialized, false) == 1);
+    CHECK(larch::test::score_tree_fitch_parsimony(materialized, true) == 2);
+
+    auto path = larch::test::unique_temp_path(
+        "chart_bnb_kary_topology_roundtrip", ".pb.gz");
+    larch::save_proto_dag(materialized, path.string());
+    auto loaded = larch::load_proto_dag(path.string());
+    std::filesystem::remove(path);
+    larch::validate_dag(loaded, "chart B&B kary topology roundtrip",
+                        larch::thread_pool::get_default());
+    CHECK(larch::is_tree(loaded));
+    CHECK(larch::test::score_tree_fitch_parsimony(loaded, false) == 1);
+    CHECK(larch::test::score_tree_fitch_parsimony(loaded, true) == 2);
+
+    auto loaded_refinement = larch::build_polytomy_refined_clade_grammar(
+        loaded, larch::clade_grammar_options{}, refinement_opts);
+    CHECK(larch::clade_grammar_max_production_arity(
+              loaded_refinement.grammar) == arity);
+    std::vector<larch::production_id> loaded_production_ids;
+    loaded_production_ids.reserve(loaded_refinement.grammar.productions.size());
+    for (std::size_t pid = 0;
+         pid < loaded_refinement.grammar.productions.size(); ++pid) {
+      loaded_production_ids.push_back(
+          static_cast<larch::production_id>(pid));
+    }
+    auto loaded_topology = larch::grammar_topology_from_productions(
+        loaded_refinement.grammar, loaded_production_ids);
+    auto loaded_patterns =
+        larch::build_site_patterns(loaded, loaded_refinement.grammar);
+    CHECK(larch::score_selected_topology(loaded_refinement.grammar,
+                                         loaded_patterns, loaded_topology,
+                                         ua_free_opts) == 1);
+    CHECK(larch::score_selected_topology(loaded_refinement.grammar,
+                                         loaded_patterns, loaded_topology,
+                                         with_ua_opts) == 2);
+  }
+}
+
 static void test_production_mask_round_trips_through_protobuf() {
   std::println("test_production_mask_round_trips_through_protobuf");
   std::vector<larch::phylo_dag> trees;
@@ -437,6 +525,7 @@ int main() {
   test_optimal_topology_materialize_cap_truncation_fails();
   test_production_mask_rejects_synthetic_polytomy_provenance();
   test_score_ua_edge_single_taxon_validation();
+  test_kary_topology_materialize_roundtrip_fitch_ua_parity();
   test_production_mask_round_trips_through_protobuf();
   test_production_mask_reports_recombination_superset();
   test_annotated_validation_cap_truncation_reported();

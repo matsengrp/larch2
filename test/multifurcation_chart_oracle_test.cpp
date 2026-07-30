@@ -1,6 +1,8 @@
 #include <larch/chart_spr.hpp>
 #include <larch/chart_trim.hpp>
 #include <larch/clade_grammar.hpp>
+#include <larch/grammar_topology_census.hpp>
+#include <larch/grammar_topology_enumerator.hpp>
 #include <larch/lazy_chart.hpp>
 #include <larch/parsimony_chart.hpp>
 #include <larch/plateau.hpp>
@@ -10,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <print>
@@ -18,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -946,6 +950,222 @@ static void test_mixed_arity_fixture() {
   std::println("  PASS");
 }
 
+static larch::clade_grammar direct_mixed_enumeration_grammar() {
+  larch::clade_grammar grammar;
+  grammar.taxa.id_to_sample_id = {"A", "B", "C", "D", "E", "F"};
+  for (std::size_t i = 0; i < grammar.taxa.id_to_sample_id.size(); ++i) {
+    grammar.taxa.sample_id_to_id.emplace(grammar.taxa.id_to_sample_id[i],
+                                         static_cast<larch::taxon_id>(i));
+  }
+  grammar.clades = {
+      {{0}},                 // A
+      {{1}},                 // B
+      {{2}},                 // C
+      {{3}},                 // D
+      {{4}},                 // E
+      {{5}},                 // F
+      {{1, 2}},              // BC
+      {{0, 1, 2}},           // ABC
+      {{3, 4}},              // DE
+      {{3, 4, 5}},           // DEF
+      {{0, 1, 2, 3, 4, 5}},  // root
+  };
+  grammar.root_clade = 10;
+  grammar.productions_by_parent.resize(grammar.clades.size());
+  grammar.productions_by_child.resize(grammar.clades.size());
+
+  auto add_production = [&](larch::clade_id parent,
+                            std::vector<larch::clade_id> children) {
+    auto pid = static_cast<larch::production_id>(grammar.productions.size());
+    grammar.productions.push_back(
+        {.parent = parent, .children = std::move(children)});
+    grammar.productions_by_parent[parent].push_back(pid);
+    for (auto child : grammar.productions.back().children) {
+      grammar.productions_by_child[child].push_back(pid);
+    }
+    return pid;
+  };
+
+  CHECK(add_production(6, {1, 2}) == 0);     // BC
+  CHECK(add_production(7, {0, 1, 2}) == 1);  // direct ternary ABC
+  CHECK(add_production(7, {0, 6}) == 2);     // A + BC
+  CHECK(add_production(8, {3, 4}) == 3);     // DE
+  CHECK(add_production(9, {3, 4, 5}) == 4);  // direct ternary DEF
+  CHECK(add_production(9, {8, 5}) == 5);     // DE + F
+  CHECK(add_production(10, {7, 9}) == 6);    // ABC + DEF
+  return grammar;
+}
+
+static std::vector<larch::production_id> selected_productions(
+    larch::grammar_topology const& topology) {
+  std::vector<larch::production_id> selected;
+  for (std::size_t pid = 0; pid < topology.used_production.size(); ++pid) {
+    if (topology.used_production[pid])
+      selected.push_back(static_cast<larch::production_id>(pid));
+  }
+  return selected;
+}
+
+static void test_direct_kary_streaming_topology_enumerator() {
+  std::println("test_direct_kary_streaming_topology_enumerator");
+
+  auto grammar = direct_mixed_enumeration_grammar();
+  larch::grammar_topology_enumerator enumerator(grammar);
+  CHECK(enumerator.topology_count() == 4);
+  CHECK(enumerator.topology_count(7) == 2);
+  CHECK(enumerator.topology_count(9) == 2);
+  CHECK(enumerator.topology_count(grammar.root_clade) == 4);
+  CHECK(enumerator.topology_count_for_production(1) == 1);
+  CHECK(enumerator.topology_count_for_production(2) == 1);
+  CHECK(enumerator.topology_count_for_production(6) == 4);
+
+  auto patterns = make_pattern_set_from_strings({"ACCAAA", "AAACCA"});
+  std::vector<std::vector<larch::production_id>> expected_productions{
+      {1, 4, 6}, {1, 3, 5, 6}, {0, 2, 4, 6}, {0, 2, 3, 5, 6}};
+  std::vector<std::uint64_t> expected_scores{6, 4, 5, 3};
+  std::map<std::uint64_t, std::size_t> expected_histogram{
+      {3, 1}, {4, 1}, {5, 1}, {6, 1}};
+
+  std::vector<std::vector<larch::production_id>> serial_productions;
+  std::vector<std::uint64_t> serial_scores;
+  std::map<std::uint64_t, std::size_t> serial_histogram;
+  auto emitted = enumerator.stream(
+      [&](std::uint64_t ordinal, larch::grammar_topology const& topology) {
+        CHECK(ordinal == serial_scores.size());
+        (void)larch::validate_grammar_topology(grammar, topology);
+        serial_productions.push_back(selected_productions(topology));
+        auto score =
+            larch::score_selected_topology(grammar, patterns, topology);
+        serial_scores.push_back(score);
+        ++serial_histogram[score];
+      });
+  CHECK(emitted == 4);
+  CHECK(serial_productions == expected_productions);
+  CHECK(serial_scores == expected_scores);
+  CHECK(serial_histogram == expected_histogram);
+
+  for (bool score_ua_edge : {false, true}) {
+    larch::chart_options chart_options;
+    chart_options.score_ua_edge = score_ua_edge;
+    larch::grammar_topology_fitch_scorer incremental_scorer(
+        grammar, patterns, chart_options);
+    std::map<std::uint64_t, std::uint64_t> parity_histogram;
+    enumerator.stream(
+        [&](std::uint64_t, larch::grammar_topology const& topology) {
+          auto const fitch =
+              incremental_scorer.score_enumerator_topology(topology);
+          auto const sankoff = larch::score_selected_topology(
+              grammar, patterns, topology, chart_options);
+          CHECK(fitch == sankoff);
+          ++parity_histogram[fitch];
+        });
+
+    larch::grammar_topology_census_options serial_options;
+    serial_options.worker_count = 1;
+    serial_options.sankoff_verification_stride = 1;
+    auto serial_census = larch::census_grammar_topologies(
+        grammar, patterns, chart_options, serial_options);
+    CHECK(serial_census.expected_topology_count == 4);
+    CHECK(serial_census.scored_topology_count == 4);
+    CHECK(serial_census.sankoff_verified_topology_count == 4);
+    CHECK(serial_census.score_histogram == parity_histogram);
+    CHECK(serial_census.recomputed_internal_clade_visits > 0);
+    CHECK(serial_census.selected_score_histogram_by_production.size() ==
+          grammar.productions.size());
+    CHECK(serial_census.selected_score_histogram_by_production[6] ==
+          parity_histogram);
+    std::uint64_t abc_direct_count = 0;
+    for (auto const& [score, count] :
+         serial_census.selected_score_histogram_by_production[1]) {
+      (void)score;
+      abc_direct_count += count;
+    }
+    CHECK(abc_direct_count == 2);
+
+    auto parallel_options = serial_options;
+    parallel_options.worker_count = 3;
+    auto parallel_census = larch::census_grammar_topologies(
+        grammar, patterns, chart_options, parallel_options);
+    CHECK(parallel_census.expected_topology_count ==
+          serial_census.expected_topology_count);
+    CHECK(parallel_census.scored_topology_count ==
+          serial_census.scored_topology_count);
+    CHECK(parallel_census.score_histogram ==
+          serial_census.score_histogram);
+    CHECK(parallel_census.optimum == serial_census.optimum);
+    CHECK(parallel_census.optimal_ordinals ==
+          serial_census.optimal_ordinals);
+    CHECK(parallel_census.selected_score_histogram_by_production ==
+          serial_census.selected_score_histogram_by_production);
+  }
+
+  for (std::uint64_t ordinal = 0; ordinal < enumerator.topology_count();
+       ++ordinal) {
+    auto topology = enumerator.topology_at(ordinal);
+    CHECK(selected_productions(topology) == expected_productions[ordinal]);
+    CHECK(larch::score_selected_topology(grammar, patterns, topology) ==
+          expected_scores[ordinal]);
+  }
+
+  struct worker_row {
+    std::uint64_t ordinal = 0;
+    std::vector<larch::production_id> productions;
+    std::uint64_t score = 0;
+  };
+  for (std::size_t worker_count :
+       {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{7}}) {
+    std::vector<std::vector<worker_row>> rows(worker_count);
+    std::vector<std::thread> workers;
+    for (std::size_t worker = 0; worker < worker_count; ++worker) {
+      workers.emplace_back([&, worker] {
+        auto range = enumerator.worker_partition(worker, worker_count);
+        auto worker_emitted = enumerator.stream(
+            range, [&](std::uint64_t ordinal,
+                       larch::grammar_topology const& topology) {
+              rows[worker].push_back(
+                  {.ordinal = ordinal,
+                   .productions = selected_productions(topology),
+                   .score = larch::score_selected_topology(grammar, patterns,
+                                                           topology)});
+            });
+        CHECK(worker_emitted == range.size());
+      });
+    }
+    for (auto& worker : workers) worker.join();
+
+    std::vector<worker_row> combined;
+    for (auto& worker_rows : rows) {
+      combined.insert(combined.end(),
+                      std::make_move_iterator(worker_rows.begin()),
+                      std::make_move_iterator(worker_rows.end()));
+    }
+    CHECK(combined.size() == enumerator.topology_count());
+    for (std::size_t ordinal = 0; ordinal < combined.size(); ++ordinal) {
+      CHECK(combined[ordinal].ordinal == ordinal);
+      CHECK(combined[ordinal].productions == expected_productions[ordinal]);
+      CHECK(combined[ordinal].score == expected_scores[ordinal]);
+    }
+  }
+
+  std::vector<std::uint64_t> stopped_ordinals;
+  CHECK(enumerator.stream(
+            [&](std::uint64_t ordinal, larch::grammar_topology const&) -> bool {
+              stopped_ordinals.push_back(ordinal);
+              return stopped_ordinals.size() < 2;
+            }) == 2);
+  CHECK(stopped_ordinals == std::vector<std::uint64_t>({0, 1}));
+  CHECK(enumerator.stream(
+            {2, 2}, [](std::uint64_t, larch::grammar_topology const&) {}) == 0);
+  CHECK(runtime_error_message([&] {
+          (void)enumerator.worker_partition(0, 0);
+        }).find("worker count must be positive") != std::string::npos);
+  CHECK(runtime_error_message([&] {
+          (void)enumerator.topology_at(4);
+        }).find("topology ordinal out of range") != std::string::npos);
+
+  std::println("  PASS");
+}
+
 static void test_lazy_inside_binary_fixture() {
   std::println("test_lazy_inside_binary_fixture");
 
@@ -1134,6 +1354,7 @@ int main() {
   test_four_ary_fixture();
   test_five_ary_fixture();
   test_mixed_arity_fixture();
+  test_direct_kary_streaming_topology_enumerator();
   test_lazy_inside_binary_fixture();
   test_lazy_inside_multifurcation_fixtures();
   test_lazy_inside_pandemic_shape_counter();

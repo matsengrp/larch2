@@ -23,7 +23,10 @@
 #include <larch/chart_trim.hpp>
 #include <larch/chart_bnb_trim_apply.hpp>
 #include <larch/chart_spr_search.hpp>
+#include <larch/chart_spr_semantic_report.hpp>
+#include <larch/grammar_topology_census.hpp>
 #include <larch/plateau.hpp>
+#include <larch/sha256.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1204,6 +1207,16 @@ Analysis:
                           counts (POS is 1-based)
   --chart-composite-score Print summed per-pattern chart score labelled as a
                           LOWER_BOUND diagnostic
+  --chart-kary-census     Exhaustively score every direct grammar parse without
+                          refining multifurcations
+  --chart-kary-census-workers <N>
+                          Contiguous exact-census worker count (default 1)
+  --chart-kary-census-sankoff-stride <N>
+                          Verify every Nth ordinal with stateless Sankoff
+                          scoring (default 0/off)
+  --chart-kary-census-output-prefix <path>
+                          Materialize, Fitch-rescore, reload, and validate one
+                          DAG per distinct minimum topology class
   --chart-bnb-trim        Run exact multi-site B&B trimming and print frontier
                           statistics (intended for small/medium DAGs)
   --chart-fluidity-site <POS>
@@ -1453,6 +1466,10 @@ struct args {
   bool chart_pattern_info = false;
   std::optional<mutation_position> chart_trim_site;
   bool chart_composite_score = false;
+  bool chart_kary_census = false;
+  std::size_t chart_kary_census_workers = 1;
+  std::uint64_t chart_kary_census_sankoff_stride = 0;
+  std::string chart_kary_census_output_prefix;
   bool chart_bnb_trim = false;
   std::optional<mutation_position> chart_fluidity_site;
   bool chart_score_ua_edge = false;
@@ -1910,6 +1927,16 @@ static args parse_args(int argc, char** argv) {
       a.chart_trim_site = pos;
     } else if (arg == "--chart-composite-score") {
       a.chart_composite_score = true;
+    } else if (arg == "--chart-kary-census") {
+      a.chart_kary_census = true;
+    } else if (arg == "--chart-kary-census-workers") {
+      a.chart_kary_census_workers = parse_positive_size_token_strict(
+          next(), "--chart-kary-census-workers");
+    } else if (arg == "--chart-kary-census-sankoff-stride") {
+      a.chart_kary_census_sankoff_stride = parse_size_token_strict(
+          next(), "--chart-kary-census-sankoff-stride");
+    } else if (arg == "--chart-kary-census-output-prefix") {
+      a.chart_kary_census_output_prefix = next();
     } else if (arg == "--chart-bnb-trim") {
       a.chart_bnb_trim = true;
     } else if (arg == "--chart-fluidity-site" || arg == "--plateau-site") {
@@ -2312,6 +2339,12 @@ static args parse_args(int argc, char** argv) {
       std::exit(1);
     }
   }
+  if (!a.chart_kary_census_output_prefix.empty() &&
+      !a.chart_kary_census) {
+    std::cerr << "error: --chart-kary-census-output-prefix requires "
+                 "--chart-kary-census\n";
+    std::exit(1);
+  }
   if (a.seed) a.chart_spr_enumeration.seed = *a.seed;
 
   return a;
@@ -2333,6 +2366,137 @@ static chart_bnb_trim_apply_options make_chart_bnb_trim_apply_options(
   opts.max_exact_topologies_to_materialize =
       a.chart_bnb_max_exact_topologies;
   return opts;
+}
+
+static std::string canonical_grammar_topology_sha256(
+    clade_grammar const& grammar, grammar_topology const& topology) {
+  (void)validate_grammar_topology(grammar, topology);
+  std::vector<std::string> production_keys;
+  for (std::size_t pid = 0; pid < topology.used_production.size(); ++pid) {
+    if (!topology.used_production[pid]) continue;
+    production_keys.push_back(chart_spr_canonical_production_sample_key(
+        grammar, static_cast<production_id>(pid)));
+  }
+  std::sort(production_keys.begin(), production_keys.end());
+
+  sha256 digest;
+  digest.update("larch.direct-kary-topology.v1\n");
+  for (auto const& key : production_keys) {
+    digest.update(std::to_string(key.size()));
+    digest.update(":");
+    digest.update(key);
+    digest.update("\n");
+  }
+  return digest.hex_digest();
+}
+
+static std::uint64_t independently_fitch_score_tree(
+    phylo_dag& tree, bool score_ua_edge, std::string_view context) {
+  if (!is_tree(tree)) {
+    throw std::runtime_error(std::string{context} +
+                             ": materialized witness is not a tree");
+  }
+  build_clade_offsets(tree);
+  fitch_assign_compact_genomes(tree);
+  recompute_edge_mutations(tree);
+  build_clade_offsets(tree);
+  if (score_ua_edge) {
+    parsimony_score_ops ops;
+    subtree_weight<parsimony_score_ops> scorer(tree);
+    return scorer.compute_weight_below(get_root_idx(tree), ops);
+  }
+  ua_free_parsimony_score_ops ops;
+  subtree_weight<ua_free_parsimony_score_ops> scorer(tree);
+  return scorer.compute_weight_below(get_root_idx(tree), ops);
+}
+
+struct chart_kary_census_minimum_class {
+  std::string topology_sha256;
+  std::vector<std::uint64_t> ordinals;
+  std::uint64_t sankoff_score = multisite_score_inf;
+  std::uint64_t materialized_fitch_score = multisite_score_inf;
+  std::uint64_t reloaded_fitch_score = multisite_score_inf;
+  std::string output_path;
+  canonical_dag_digest_report canonical_dag_digest;
+  bool reloaded_and_validated = false;
+};
+
+static std::vector<chart_kary_census_minimum_class>
+validate_chart_kary_census_minima(
+    phylo_dag& source_dag, clade_grammar const& grammar,
+    site_pattern_set const& patterns, chart_options const& chart_options,
+    grammar_topology_census_result const& census,
+    std::string const& output_prefix) {
+  grammar_topology_enumerator enumerator(grammar);
+  std::map<std::string, std::vector<std::uint64_t>> ordinals_by_digest;
+  for (auto ordinal : census.optimal_ordinals) {
+    auto topology = enumerator.topology_at(ordinal);
+    ordinals_by_digest[canonical_grammar_topology_sha256(grammar, topology)]
+        .push_back(ordinal);
+  }
+
+  std::vector<chart_kary_census_minimum_class> classes;
+  classes.reserve(ordinals_by_digest.size());
+  for (auto const& [digest, ordinals] : ordinals_by_digest) {
+    chart_kary_census_minimum_class minimum;
+    minimum.topology_sha256 = digest;
+    minimum.ordinals = ordinals;
+    auto topology = enumerator.topology_at(ordinals.front());
+    minimum.sankoff_score =
+        score_selected_topology(grammar, patterns, topology, chart_options);
+    if (minimum.sankoff_score != census.optimum) {
+      throw std::runtime_error(
+          "chart kary census: minimum witness failed Sankoff parity");
+    }
+
+    auto materialized =
+        materialize_grammar_topology_tree(source_dag, grammar, topology);
+    validate_dag(materialized, "chart kary census materialized minimum",
+                 thread_pool::get_default());
+    minimum.materialized_fitch_score = independently_fitch_score_tree(
+        materialized, chart_options.score_ua_edge,
+        "chart kary census materialized minimum");
+    if (minimum.materialized_fitch_score != census.optimum) {
+      throw std::runtime_error(
+          "chart kary census: materialized minimum failed generalized-Fitch "
+          "parity");
+    }
+
+    if (!output_prefix.empty()) {
+      auto const class_index = classes.size();
+      minimum.output_path =
+          output_prefix + ".class-" + std::to_string(class_index) +
+          ".ordinal-" + std::to_string(ordinals.front()) + ".pb.gz";
+      save_proto_dag(materialized, minimum.output_path);
+      auto reloaded = load_proto_dag(minimum.output_path);
+      validate_dag(reloaded, "chart kary census reloaded minimum",
+                   thread_pool::get_default());
+      minimum.reloaded_fitch_score = independently_fitch_score_tree(
+          reloaded, chart_options.score_ua_edge,
+          "chart kary census reloaded minimum");
+      if (minimum.reloaded_fitch_score != census.optimum) {
+        throw std::runtime_error(
+            "chart kary census: reloaded minimum failed generalized-Fitch "
+            "parity");
+      }
+      clade_grammar_options grammar_options;
+      grammar_options.allow_polytomies = true;
+      auto rebuilt =
+          build_clade_grammar_with_audit(reloaded, grammar_options);
+      minimum.canonical_dag_digest = build_canonical_dag_digest_report(
+          rebuilt.grammar, minimum.reloaded_fitch_score);
+      minimum.reloaded_and_validated = true;
+    } else {
+      clade_grammar_options grammar_options;
+      grammar_options.allow_polytomies = true;
+      auto rebuilt =
+          build_clade_grammar_with_audit(materialized, grammar_options);
+      minimum.canonical_dag_digest = build_canonical_dag_digest_report(
+          rebuilt.grammar, minimum.materialized_fitch_score);
+    }
+    classes.push_back(std::move(minimum));
+  }
+  return classes;
 }
 
 static void print_chart_bnb_apply_result(
@@ -6255,6 +6419,193 @@ int main(int argc, char** argv) try {
     }
     print_limited_per_pattern_roots(std::cout, patterns, composite,
                                     a.chart_entry_limit);
+  }
+
+  if (a.chart_kary_census) {
+    auto& refinement = get_chart_refinement();
+    auto& grammar = refinement.grammar;
+    auto& patterns = get_exact_patterns();
+    chart_options chart_opts;
+    chart_opts.score_ua_edge = a.chart_score_ua_edge;
+    grammar_topology_census_options census_opts;
+    census_opts.worker_count = a.chart_kary_census_workers;
+    census_opts.sankoff_verification_stride =
+        a.chart_kary_census_sankoff_stride;
+
+    auto census_start = std::chrono::steady_clock::now();
+    auto census = census_grammar_topologies(grammar, patterns, chart_opts,
+                                            census_opts);
+    auto census_ms = elapsed_ms(census_start,
+                                std::chrono::steady_clock::now());
+    auto minimum_classes = validate_chart_kary_census_minima(
+        result, grammar, patterns, chart_opts, census,
+        a.chart_kary_census_output_prefix);
+
+    auto const audit_count =
+        refinement.source_grammar_audit.grammar_tree_count_estimate;
+    auto const audit_count_exact =
+        !refinement.source_grammar_audit
+             .grammar_tree_count_estimate_saturated;
+    auto const counts_reconcile =
+        audit_count_exact &&
+        audit_count == census.expected_topology_count &&
+        census.expected_topology_count == census.scored_topology_count;
+
+    std::cout << "chart_kary_census:\n";
+    std::cout << "  score_kind: EXACT_DIRECT_KARY_CENSUS\n";
+    print_wric_polytomy_score_fields(std::cout, refinement,
+                                      a.wric_polytomy_opts.mode, false);
+    std::cout << "  direct_grammar_only: true\n";
+    std::cout << "  binary_refinement_used: false\n";
+    std::cout << "  score_ua_edge: "
+              << (a.chart_score_ua_edge ? "true" : "false") << "\n";
+    std::cout << "  workers: " << a.chart_kary_census_workers << "\n";
+    std::cout << "  grammar_audit_topology_count: " << audit_count << "\n";
+    std::cout << "  grammar_audit_topology_count_exact: "
+              << (audit_count_exact ? "true" : "false") << "\n";
+    std::cout << "  enumerator_topology_count: "
+              << census.expected_topology_count << "\n";
+    std::cout << "  scored_topology_count: "
+              << census.scored_topology_count << "\n";
+    std::cout << "  counts_reconcile: "
+              << (counts_reconcile ? "true" : "false") << "\n";
+    if (!counts_reconcile) {
+      throw std::runtime_error(
+          "chart kary census: independent parse counts do not reconcile");
+    }
+    std::cout << "  sankoff_verification_stride: "
+              << a.chart_kary_census_sankoff_stride << "\n";
+    std::cout << "  sankoff_verified_topology_count: "
+              << census.sankoff_verified_topology_count << "\n";
+    std::cout << "  reachable_internal_clade_visits: "
+              << census.reachable_internal_clade_visits << "\n";
+    std::cout << "  recomputed_internal_clade_visits: "
+              << census.recomputed_internal_clade_visits << "\n";
+    std::cout << "  optimum: " << census.optimum << "\n";
+    std::cout << "  optimal_topology_count: "
+              << census.optimal_ordinals.size() << "\n";
+    std::cout << "  distinct_minimum_class_count: "
+              << minimum_classes.size() << "\n";
+    std::cout << "  score_histogram:\n";
+    for (auto const& [score, count] : census.score_histogram) {
+      std::cout << "    " << score << ": " << count << "\n";
+    }
+    std::cout << "  production_ablation:\n";
+    for (clade_id clade = 0; clade < grammar.clades.size(); ++clade) {
+      auto const& alternatives = grammar.productions_by_parent[clade];
+      if (alternatives.size() <= 1) continue;
+      std::uint64_t reachable_count = 0;
+      for (auto pid : alternatives) {
+        for (auto const& [score, count] :
+             census.selected_score_histogram_by_production[pid]) {
+          (void)score;
+          grammar_topology_census_detail::checked_accumulate(
+              reachable_count, count,
+              "multi-production clade reachable count");
+        }
+      }
+      if (reachable_count > census.scored_topology_count) {
+        throw std::logic_error(
+            "chart kary census: production selections exceed topology count");
+      }
+      std::cout << "    - clade: " << clade << "\n";
+      std::cout << "      parent_taxa: "
+                << grammar.clades[clade].taxa.size() << "\n";
+      std::cout << "      unreachable_topology_count: "
+                << census.scored_topology_count - reachable_count << "\n";
+      std::cout << "      alternatives:\n";
+      for (auto pid : alternatives) {
+        auto const& selected =
+            census.selected_score_histogram_by_production[pid];
+        if (selected.empty()) {
+          throw std::logic_error(
+              "chart kary census: reachable production was never selected");
+        }
+        std::uint64_t selected_count = 0;
+        for (auto const& [score, count] : selected) {
+          (void)score;
+          grammar_topology_census_detail::checked_accumulate(
+              selected_count, count, "selected topology count");
+        }
+        auto const forced_optimum = selected.begin()->first;
+        auto const forced_optimum_count = selected.begin()->second;
+        auto global_selected = selected.find(census.optimum);
+        auto const global_optimum_selected_count =
+            global_selected == selected.end() ? 0 : global_selected->second;
+
+        std::uint64_t removed_optimum = multisite_score_inf;
+        std::uint64_t removed_optimum_count = 0;
+        for (auto const& [score, all_count] : census.score_histogram) {
+          auto selected_it = selected.find(score);
+          auto const selected_at_score =
+              selected_it == selected.end() ? 0 : selected_it->second;
+          if (selected_at_score > all_count) {
+            throw std::logic_error(
+                "chart kary census: selected histogram exceeds total");
+          }
+          auto const remaining = all_count - selected_at_score;
+          if (remaining != 0) {
+            removed_optimum = score;
+            removed_optimum_count = remaining;
+            break;
+          }
+        }
+        std::cout << "        - production: " << pid << "\n";
+        std::cout << "          arity: "
+                  << grammar.productions[pid].children.size() << "\n";
+        std::cout << "          selected_topology_count: "
+                  << selected_count << "\n";
+        std::cout << "          forced_optimum: " << forced_optimum
+                  << "\n";
+        std::cout << "          forced_optimum_count: "
+                  << forced_optimum_count << "\n";
+        std::cout << "          removed_optimum: " << removed_optimum
+                  << "\n";
+        std::cout << "          removed_optimum_count: "
+                  << removed_optimum_count << "\n";
+        std::cout << "          global_optimum_selected_count: "
+                  << global_optimum_selected_count << "\n";
+      }
+    }
+    std::cout << "  minimum_classes:\n";
+    for (std::size_t class_index = 0;
+         class_index < minimum_classes.size(); ++class_index) {
+      auto const& minimum = minimum_classes[class_index];
+      std::cout << "    - class: " << class_index << "\n";
+      std::cout << "      topology_sha256: " << minimum.topology_sha256
+                << "\n";
+      std::cout << "      occurrence_count: " << minimum.ordinals.size()
+                << "\n";
+      std::cout << "      ordinals: [";
+      for (std::size_t i = 0; i < minimum.ordinals.size(); ++i) {
+        if (i != 0) std::cout << ", ";
+        std::cout << minimum.ordinals[i];
+      }
+      std::cout << "]\n";
+      std::cout << "      sankoff_score: " << minimum.sankoff_score << "\n";
+      std::cout << "      materialized_fitch_score: "
+                << minimum.materialized_fitch_score << "\n";
+      std::cout << "      reloaded_and_validated: "
+                << (minimum.reloaded_and_validated ? "true" : "false")
+                << "\n";
+      if (minimum.reloaded_and_validated) {
+        std::cout << "      reloaded_fitch_score: "
+                  << minimum.reloaded_fitch_score << "\n";
+        std::cout << "      output_path: " << minimum.output_path << "\n";
+      }
+      std::cout << "      canonical_dag_semantic_sha256: "
+                << minimum.canonical_dag_digest.semantic_sha256 << "\n";
+      std::cout << "      canonical_dag_clades_sha256: "
+                << minimum.canonical_dag_digest.clades_sha256 << "\n";
+      std::cout << "      canonical_dag_productions_sha256: "
+                << minimum.canonical_dag_digest.productions_sha256 << "\n";
+    }
+    std::cout << "  grammar_build_ms: " << std::fixed
+              << std::setprecision(3) << chart_grammar_build_ms << "\n";
+    std::cout << "  pattern_build_ms: " << std::fixed
+              << std::setprecision(3) << exact_pattern_build_ms << "\n";
+    std::cout << "  census_ms: " << std::fixed << std::setprecision(3)
+              << census_ms << "\n";
   }
 
   if (a.chart_bnb_trim) {

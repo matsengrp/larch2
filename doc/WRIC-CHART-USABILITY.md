@@ -43,32 +43,44 @@ the historical control.
 
 Two correctness/semantics issues explain the unusable result.
 
-### A native improvement is an additive union, not one replacement
+### The best native result requires an additive union, not one replacement
 
 The ordinary chart loop scores one candidate overlay as a replacement and
 accepts at most one independently improving candidate. The native
 sample--SPR--merge loop instead retains many ranked moves at each radius,
 materializes every complete SPR fragment, and merges all fragments into the
-current DAG. Recombination among the fragments can contain a better topology
-even when no fragment is better by itself.
+current DAG. Recombination among the fragments can contain a topology better
+than every input fragment and, in principle, can do so even when no fragment
+is better than the source by itself.
 
-The frozen seed-1 native crosswalk made this distinction concrete:
+The frozen seed-1 native crosswalk originally made this distinction concrete
+using the compact-genome assignments stored by the pre-fix executable:
 
 | Evidence | Result |
 |---|---:|
 | Distinct retained native moves | 53 |
-| Individually materialized fragment scores | 1643--1658 |
+| Historically stored fragment scores | 1643--1658 |
 | Input score | 1642 |
-| Full fragment-union score | 1627 |
+| Historically stored full-union score | 1627 |
 | Optimal trees in the full union | 28 |
 | Moves whose source parent was multifurcating | 8 |
 | Those source-parent arities | four arity-3, four arity-6 |
 | Full union size | 1164 nodes, 1430 edges |
 | Full union tree count | 38,080 |
 
-No individual fragment can pass a strict `candidate < 1642` gate. The 1627
-topology exists only in the additive union, so changing the ordinary
-single-candidate acceptance mode cannot recover it.
+Those individual scores are not valid topology-level evidence that no
+improving fragment existed: they used the incorrect binary shortcut for k-ary
+Fitch assignment described below. Re-Fitching the 53 distinct historical
+fragment topologies with the corrected recurrence gives scores 1632--1646,
+and merging those corrected historical topologies gives minimum 1626.
+
+The corrected current capture gives the clean additive result: its best
+complete one-SPR fragment scores 1632, while a cardinality-minimum combination
+of five compatible fragment outcomes scores 1620. A single-candidate
+transaction can commit at most one of those outcomes; it cannot recover the
+five-block topology in the same transaction. The exhaustive attribution,
+including all 32 subsets and the corrected-native confounder, is recorded in
+`doc/WRIC-CHART-RECOMBINATION-CASE-STUDY.md`.
 
 ### The generalized Fitch recurrence was wrong for `k > 2`
 

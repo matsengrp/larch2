@@ -1,0 +1,16 @@
+site	captured_occurrences_included	byte_distinct_class_representatives	best_site_score	required_productions	provider_note
+7716	source	source	24		source alone
+7716	31	31	23	449	one byte-distinct alternative provider
+7716	82	30	23	449	occurrence 82 aliases representative 30
+7899	source	source	4		source alone
+7899	264	114	3	352,460	occurrence 264 aliases representative 114
+26799	source	source	5		source alone
+26799	36	35	4	465	occurrence 36 aliases representative 35
+26799	84	28	4	132	occurrence 84 aliases representative 28
+26799	36,84	35,28	3	132,465	joint minimum
+27563	source	source	22		source alone
+27563	33	33	21	463	one byte-distinct alternative provider
+27563	34	32	21	463	occurrence 34 aliases representative 32
+27563	86	39	21	470	occurrence 86 aliases representative 39
+27563	33,86	33,39	20	463,470	joint minimum
+27563	34,86	32,39	20	463,470	joint minimum through alternative provider

@@ -704,7 +704,8 @@ static std::size_t build_materialized_tree_subtree(
       throw std::runtime_error(
           "chart B&B trim apply: selected production parent mismatch");
     }
-    chart_trim_detail::validate_binary_production_for_trim(grammar, prod, pid);
+    parsimony_chart_detail::validate_production_inside_row_inputs(
+        grammar, prod, pid, "chart B&B trim apply: materialized topology");
     auto inner = tree.append_node<node_kind::inner>();
     node_idx = inner.index();
     for (std::size_t child_i = 0; child_i < prod.children.size(); ++child_i) {
