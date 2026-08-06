@@ -316,15 +316,6 @@ inline refined_production_origin merge_production_origin(
   return added;
 }
 
-inline bool clade_id_key_less(clade_grammar const& grammar, clade_id lhs,
-                              clade_id rhs) {
-  auto const& lkey = grammar.clades[lhs];
-  auto const& rkey = grammar.clades[rhs];
-  if (detail::clade_key_less(lkey, rkey)) return true;
-  if (detail::clade_key_less(rkey, lkey)) return false;
-  return lhs < rhs;
-}
-
 inline void canonicalize_production_children_by_clade_key(
     clade_grammar const& draft, grammar_production& prod) {
   if (prod.children.size() <= 1) return;
@@ -333,8 +324,8 @@ inline void canonicalize_production_children_by_clade_key(
   std::iota(permutation.begin(), permutation.end(), std::size_t{0});
   std::stable_sort(permutation.begin(), permutation.end(),
                    [&](std::size_t lhs, std::size_t rhs) {
-                     return clade_id_key_less(draft, prod.children[lhs],
-                                              prod.children[rhs]);
+                     return detail::clade_id_key_less(
+                         draft, prod.children[lhs], prod.children[rhs]);
                    });
 
   auto old_children = prod.children;
@@ -1807,7 +1798,7 @@ inline polytomy_refinement_result finalize_exact_expansion(
   for (std::size_t cid = 0; cid < ctx.draft.clades.size(); ++cid)
     order.push_back(static_cast<clade_id>(cid));
   std::stable_sort(order.begin(), order.end(), [&](clade_id lhs, clade_id rhs) {
-    return clade_id_key_less(ctx.draft, lhs, rhs);
+    return detail::clade_id_key_less(ctx.draft, lhs, rhs);
   });
 
   result.grammar.taxa = ctx.draft.taxa;

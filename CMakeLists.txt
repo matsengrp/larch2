@@ -1264,6 +1264,10 @@ add_test(NAME wric_evidence_run_ledger_test
 add_test(NAME wric_benchmark_capture_test
          COMMAND python3 test/wric_benchmark_capture_test.py
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME wric_chart_empirical_evidence_test
+         COMMAND python3 tools/verify_wric_chart_empirical_evidence.py
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(wric_benchmark_capture_test PROPERTIES TIMEOUT 120)
 add_test(NAME wric_historical_harness_compat_test
          COMMAND python3 test/wric_historical_harness_compat_test.py
@@ -1321,6 +1325,10 @@ add_test(NAME no_overlay_chain_compaction_prefix_materialize
 
 add_test(NAME no_keep_production_without_exact_check
          COMMAND bash test/no_keep_production_without_exact_check.sh
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME no_legacy_dominance_provenance_merge
+         COMMAND bash test/no_legacy_dominance_provenance_merge.sh
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Vulkan compute tests

@@ -1,4 +1,4 @@
-site	captured_occurrences_included	byte_distinct_class_representatives	best_site_score	required_productions	provider_note
+site	captured_occurrences_included	byte_distinct_class_representatives	best_site_score	captured_provider_productions	provider_note
 7716	source	source	24		source alone
 7716	31	31	23	449	one byte-distinct alternative provider
 7716	82	30	23	449	occurrence 82 aliases representative 30

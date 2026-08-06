@@ -2448,38 +2448,6 @@ inline bool dominates(multisite_cost_function const& lhs,
   return true;
 }
 
-// Legacy provenance-merging dominance helper.  Merging a dominated entry's
-// used_production/provenance into the dominator is not a valid exact-mask
-// recovery strategy: it can over-keep productions that are never globally
-// optimal, while simply discarding the dominated entry can under-keep tied
-// outside-context optima.  Public B&B trim modes use the score-only,
-// strict-mask-safe, or two-pass helpers below instead.
-inline void apply_dominance_pruning(std::vector<frontier_entry>& entries,
-                                    std::size_t& dominance_pruned) {
-  std::vector<bool> remove(entries.size(), false);
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    if (remove[i]) continue;
-    for (std::size_t j = 0; j < entries.size(); ++j) {
-      if (i == j || remove[j]) continue;
-      if (entries[i].f.cost == entries[j].f.cost) continue;
-      if (dominates(entries[i].f, entries[j].f)) {
-        merge_used_productions(entries[i].used_production,
-                               entries[j].used_production);
-        merge_provenance_choices(entries[i].provenance, entries[j].provenance);
-        remove[j] = true;
-        ++dominance_pruned;
-      }
-    }
-  }
-
-  std::vector<frontier_entry> kept;
-  kept.reserve(entries.size());
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    if (!remove[i]) kept.push_back(std::move(entries[i]));
-  }
-  entries = std::move(kept);
-}
-
 inline void apply_score_only_dominance_pruning(
     std::vector<frontier_entry>& entries,
     std::size_t& dominance_candidates_considered,

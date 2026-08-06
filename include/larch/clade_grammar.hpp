@@ -515,6 +515,20 @@ inline bool clade_key_less(clade_key const& a, clade_key const& b) {
   return a.taxa < b.taxa;
 }
 
+// Canonical production-child order is the same clade-key order used to assign
+// clade IDs.  Keep this as the single comparator for both direct grammar
+// construction and later grammar refinements: refinement drafts may append
+// synthetic clades before their final IDs are reassigned, so comparing raw IDs
+// there would not be equivalent.
+inline bool clade_id_key_less(clade_grammar const& grammar, clade_id lhs,
+                              clade_id rhs) {
+  auto const& lkey = grammar.clades[lhs];
+  auto const& rkey = grammar.clades[rhs];
+  if (clade_key_less(lkey, rkey)) return true;
+  if (clade_key_less(rkey, lkey)) return false;
+  return lhs < rhs;
+}
+
 struct production_map_key {
   clade_id parent = no_clade;
   std::vector<clade_id> children;
@@ -872,7 +886,8 @@ inline clade_grammar_build_result build_clade_grammar_with_audit(
       std::iota(permutation.begin(), permutation.end(), std::size_t{0});
       std::stable_sort(permutation.begin(), permutation.end(),
                        [&](std::size_t lhs, std::size_t rhs) {
-                         return children[lhs] < children[rhs];
+                         return detail::clade_id_key_less(
+                             grammar, children[lhs], children[rhs]);
                        });
       std::vector<clade_id> sorted_children;
       std::vector<production_child_witness> sorted_witness_children;

@@ -51,6 +51,11 @@ collapsed-grammar representations:
 | Maximum score and count | 1642, count 2 | 1642, count 2 |
 | Collapsed semantic SHA-256 | `b39fbf5d36614de8bc0a931cd21144f7c6c78208e9207d2487da0ee1020a72cd` | same |
 
+The complete 23-bin score distributions are also identical. They are retained
+in
+[`WRIC-CHART-RECOMBINATION-SCORE-HISTOGRAM.tsv`](WRIC-CHART-RECOMBINATION-SCORE-HISTOGRAM.tsv),
+where each column sums to all 45,084 labelled histories.
+
 The two protobuf byte hashes differ, but the canonical JSON representations
 are byte-identical: their canonical clades, productions, score, and semantic
 digest are the same. The protobuf difference is therefore non-semantic under

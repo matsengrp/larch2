@@ -142,7 +142,11 @@ pattern minima, but it must pay one step at each of patterns 304 and 1023.
 
 The four-site provider experiment explains the first structural obstruction
 at a smaller scale. It studies patterns 304, 312, 1002, and 1023, whose
-individual minima sum to 49. Their direct-grammar Pareto frontier consists of:
+individual minima sum to 49. All four patterns have multiplicity one, as
+recorded with their representative sites, reference states, regrets, and
+provider provenance in
+[`WRIC-CHART-1614-PATTERN-PROVENANCE.tsv`](WRIC-CHART-1614-PATTERN-PROVENANCE.tsv).
+Their direct-grammar Pareto frontier consists of:
 
 | Scores `(304,312,1002,1023)` | Parses | Label-compatible parses | Four-site sum |
 |---|---:|---:|---:|
@@ -172,10 +176,12 @@ Pair and triple intersections are retained in
 The raw trace has SHA-256
 `0074b0c9d231c8da91e42f42b293f0729918f3844dd56e81dad1280086b52c14`.
 
-The minimum opportunities have the following outcome and production
-providers:
+The minimum opportunities have the following captured outcome providers and
+one sufficient production package for each route.  The package is not a claim
+that every minimizing direct parse must use exactly those productions (for
+example, pattern 312 can use production 460 or 462 at the conflicting clade):
 
-| Site | Captured provider occurrences | Byte-distinct class representatives | Required productions |
+| Site | Captured provider occurrences | Byte-distinct class representatives | Captured production package |
 |---:|---|---|---|
 | 7716 | 31 or 82 | 31 or 30 | 449 |
 | 7899 | 264 | 114 | 352 and 460 |

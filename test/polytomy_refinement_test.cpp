@@ -15,6 +15,7 @@
 #include <print>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -66,6 +67,31 @@ static larch::phylo_dag make_four_taxon_star() {
       "AAAA", tiny_inner("root", "AAAA",
                          {tiny_leaf("A", "AAAA"), tiny_leaf("B", "CAAA"),
                           tiny_leaf("C", "AAGA"), tiny_leaf("D", "AAAT")}));
+}
+
+static larch::phylo_dag make_unequal_child_polytomy() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return larch::test::make_tiny_labelled_tree(
+      "AAAA",
+      tiny_inner("root", "AAAA",
+                 {tiny_inner("AB", "AAAA",
+                             {tiny_leaf("A", "AAAA"),
+                              tiny_leaf("B", "CAAA")}),
+                  tiny_leaf("C", "AAGA"), tiny_leaf("D", "AAAT")}));
+}
+
+static larch::phylo_dag make_permuted_unequal_child_polytomy() {
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  return larch::test::make_tiny_labelled_tree(
+      "AAAA",
+      tiny_inner("root", "AAAA",
+                 {tiny_leaf("D", "AAAT"),
+                  tiny_inner("AB", "AAAA",
+                             {tiny_leaf("B", "CAAA"),
+                              tiny_leaf("A", "AAAA")}),
+                  tiny_leaf("C", "AAGA")}));
 }
 
 static larch::phylo_dag make_four_taxon_star_with_observed_bcd_alternatives() {
@@ -411,6 +437,94 @@ static std::uint64_t count_derivations(larch::clade_grammar const& grammar) {
     }
   }
   return counts[grammar.root_clade];
+}
+
+static std::vector<std::string> normalized_clade(
+    larch::clade_grammar const& grammar, larch::clade_id clade) {
+  CHECK(clade < grammar.clades.size());
+  std::vector<std::string> result;
+  result.reserve(grammar.clades[clade].taxa.size());
+  for (auto taxon : grammar.clades[clade].taxa) {
+    CHECK(taxon < grammar.taxa.id_to_sample_id.size());
+    result.push_back(grammar.taxa.id_to_sample_id[taxon]);
+  }
+  std::sort(result.begin(), result.end());
+  return result;
+}
+
+static std::vector<std::vector<std::string>> normalized_children(
+    larch::clade_grammar const& grammar,
+    larch::grammar_production const& production) {
+  std::vector<std::vector<std::string>> result;
+  result.reserve(production.children.size());
+  for (auto child : production.children)
+    result.push_back(normalized_clade(grammar, child));
+  return result;
+}
+
+static void check_observed_witness_edge_alignment(
+    larch::phylo_dag& dag, larch::clade_grammar const& grammar) {
+  for (auto const& prod : grammar.productions) {
+    for (auto const& witness : prod.witnesses) {
+      CHECK(witness.parent_node < grammar.node_to_clade.size());
+      CHECK(grammar.node_to_clade[witness.parent_node] == prod.parent);
+      CHECK(witness.children.size() == prod.children.size());
+      for (std::size_t i = 0; i < witness.children.size(); ++i) {
+        auto const& child_witness = witness.children[i];
+        CHECK(child_witness.child == prod.children[i]);
+        CHECK(!child_witness.edge_alternatives.empty());
+        for (auto edge : child_witness.edge_alternatives) {
+          CHECK(larch::get_parent_idx(dag, edge) == witness.parent_node);
+          auto child_node = larch::get_child_idx(dag, edge);
+          CHECK(child_node < grammar.node_to_clade.size());
+          CHECK(grammar.node_to_clade[child_node] == prod.children[i]);
+        }
+      }
+    }
+  }
+}
+
+using normalized_production = std::tuple<
+    std::vector<std::string>, std::vector<std::vector<std::string>>,
+    std::uint64_t, std::vector<std::vector<std::vector<std::string>>>>;
+
+static std::vector<normalized_production> normalized_productions(
+    larch::clade_grammar const& grammar) {
+  std::vector<normalized_production> result;
+  result.reserve(grammar.productions.size());
+  for (auto const& prod : grammar.productions) {
+    std::vector<std::vector<std::string>> children;
+    children.reserve(prod.children.size());
+    for (auto child : prod.children)
+      children.push_back(normalized_clade(grammar, child));
+
+    std::vector<std::vector<std::vector<std::string>>> witness_children;
+    witness_children.reserve(prod.witnesses.size());
+    for (auto const& witness : prod.witnesses) {
+      CHECK(witness.children.size() == prod.children.size());
+      auto& normalized_witness = witness_children.emplace_back();
+      normalized_witness.reserve(witness.children.size());
+      for (std::size_t i = 0; i < witness.children.size(); ++i) {
+        CHECK(witness.children[i].child == prod.children[i]);
+        normalized_witness.push_back(
+            normalized_clade(grammar, witness.children[i].child));
+      }
+    }
+    std::sort(witness_children.begin(), witness_children.end());
+    result.emplace_back(normalized_clade(grammar, prod.parent),
+                        std::move(children), prod.multiplicity,
+                        std::move(witness_children));
+  }
+  std::sort(result.begin(), result.end());
+  return result;
+}
+
+static std::uint64_t grammar_chart_score(larch::phylo_dag& dag,
+                                         larch::clade_grammar const& grammar) {
+  auto patterns = larch::build_site_patterns(dag, grammar);
+  auto charts = larch::build_pattern_charts(grammar, patterns);
+  return larch::weighted_pattern_chart_total(charts, patterns,
+                                             grammar.root_clade);
 }
 
 static larch::chart_cost brute_force_star_score(
@@ -964,6 +1078,143 @@ static void test_exact_expansion_merges_reversed_observed_witnesses() {
   CHECK(result.production_info[ab_prod].origin ==
         larch::refined_production_origin::observed_and_synthetic);
   CHECK(result.production_info[ab_prod].source_productions.size() == 3);
+
+  std::println("  PASS");
+}
+
+static void test_refined_children_use_direct_grammar_canonical_order() {
+  std::println("test_refined_children_use_direct_grammar_canonical_order");
+
+  auto dag = make_unequal_child_polytomy();
+  auto permuted_dag = make_permuted_unequal_child_polytomy();
+  larch::clade_grammar_options grammar_opts;
+  grammar_opts.allow_polytomies = true;
+  auto direct = larch::build_clade_grammar(dag, grammar_opts);
+  auto permuted_direct = larch::build_clade_grammar(permuted_dag, grammar_opts);
+  CHECK(normalized_productions(direct) ==
+        normalized_productions(permuted_direct));
+  CHECK(count_derivations(direct) == 1);
+  CHECK(count_derivations(permuted_direct) == 1);
+  CHECK(grammar_chart_score(dag, direct) ==
+        grammar_chart_score(permuted_dag, permuted_direct));
+  check_observed_witness_edge_alignment(dag, direct);
+  check_observed_witness_edge_alignment(permuted_dag, permuted_direct);
+  for (auto const& prod : direct.productions) {
+    CHECK(std::is_sorted(
+        prod.children.begin(), prod.children.end(),
+        [&](larch::clade_id lhs, larch::clade_id rhs) {
+          return larch::detail::clade_id_key_less(direct, lhs, rhs);
+        }));
+  }
+
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_exact_or_fail;
+  auto refined = larch::build_polytomy_refined_clade_grammar(
+      dag, larch::clade_grammar_options{}, opts);
+  auto permuted_refined = larch::build_polytomy_refined_clade_grammar(
+      permuted_dag, larch::clade_grammar_options{}, opts);
+  CHECK(refined.audit.source_kary_production_count == 1);
+  CHECK(permuted_refined.audit.source_kary_production_count == 1);
+  CHECK(normalized_productions(refined.grammar) ==
+        normalized_productions(permuted_refined.grammar));
+  CHECK(count_derivations(refined.grammar) == 3);
+  CHECK(count_derivations(permuted_refined.grammar) == 3);
+  CHECK(grammar_chart_score(dag, refined.grammar) ==
+        grammar_chart_score(permuted_dag, permuted_refined.grammar));
+  check_observed_witness_edge_alignment(dag, refined.grammar);
+  check_observed_witness_edge_alignment(permuted_dag,
+                                        permuted_refined.grammar);
+  CHECK(!refined.grammar.productions.empty());
+  for (auto const& prod : refined.grammar.productions) {
+    CHECK(prod.children.size() == 2);
+    CHECK(std::is_sorted(
+        prod.children.begin(), prod.children.end(),
+        [&](larch::clade_id lhs, larch::clade_id rhs) {
+          return larch::detail::clade_id_key_less(refined.grammar, lhs, rhs);
+        }));
+    for (auto const& witness : prod.witnesses) {
+      CHECK(witness.children.size() == prod.children.size());
+      for (std::size_t i = 0; i < prod.children.size(); ++i)
+        CHECK(witness.children[i].child == prod.children[i]);
+    }
+  }
+
+  std::println("  PASS");
+}
+
+static void test_disabled_canonicalization_preserves_observed_order() {
+  std::println("test_disabled_canonicalization_preserves_observed_order");
+
+  auto dag = make_permuted_unequal_child_polytomy();
+  larch::clade_grammar_options grammar_opts;
+  grammar_opts.allow_polytomies = true;
+  grammar_opts.canonicalize_binary_children = false;
+  auto direct = larch::build_clade_grammar(dag, grammar_opts);
+  CHECK(count_derivations(direct) == 1);
+
+  CHECK(direct.productions_by_parent[direct.root_clade].size() == 1);
+  auto const& direct_root = direct.productions[
+      direct.productions_by_parent[direct.root_clade].front()];
+  CHECK(normalized_children(direct, direct_root) ==
+        std::vector<std::vector<std::string>>(
+            {{"D"}, {"A", "B"}, {"C"}}));
+  auto direct_ab = clade_for(direct, {"A", "B"});
+  auto direct_ab_pid = production_for(
+      direct, direct_ab,
+      {clade_for(direct, {"A"}), clade_for(direct, {"B"})});
+  CHECK(normalized_children(direct, direct.productions[direct_ab_pid]) ==
+        std::vector<std::vector<std::string>>({{"B"}, {"A"}}));
+  check_observed_witness_edge_alignment(dag, direct);
+
+  bool direct_has_noncanonical_order = false;
+  for (auto const& prod : direct.productions) {
+    if (!std::is_sorted(
+            prod.children.begin(), prod.children.end(),
+            [&](larch::clade_id lhs, larch::clade_id rhs) {
+              return larch::detail::clade_id_key_less(direct, lhs, rhs);
+            })) {
+      direct_has_noncanonical_order = true;
+    }
+    for (auto const& witness : prod.witnesses) {
+      CHECK(witness.children.size() == prod.children.size());
+      for (std::size_t i = 0; i < prod.children.size(); ++i)
+        CHECK(witness.children[i].child == prod.children[i]);
+    }
+  }
+  CHECK(direct_has_noncanonical_order);
+
+  larch::polytomy_refinement_options opts;
+  opts.mode = larch::polytomy_mode::expand_soft_exact_or_fail;
+  opts.canonicalize_binary_children = false;
+  auto refined = larch::build_polytomy_refined_clade_grammar(
+      dag, grammar_opts, opts);
+  CHECK(count_derivations(refined.grammar) == 3);
+  auto refined_ab = clade_for(refined.grammar, {"A", "B"});
+  auto refined_ab_pid = production_for(
+      refined.grammar, refined_ab,
+      {clade_for(refined.grammar, {"A"}),
+       clade_for(refined.grammar, {"B"})});
+  CHECK(normalized_children(refined.grammar,
+                            refined.grammar.productions[refined_ab_pid]) ==
+        std::vector<std::vector<std::string>>({{"B"}, {"A"}}));
+  check_observed_witness_edge_alignment(dag, refined.grammar);
+  bool refined_has_noncanonical_order = false;
+  for (auto const& prod : refined.grammar.productions) {
+    if (!std::is_sorted(
+            prod.children.begin(), prod.children.end(),
+            [&](larch::clade_id lhs, larch::clade_id rhs) {
+              return larch::detail::clade_id_key_less(refined.grammar, lhs,
+                                                      rhs);
+            })) {
+      refined_has_noncanonical_order = true;
+    }
+    for (auto const& witness : prod.witnesses) {
+      CHECK(witness.children.size() == prod.children.size());
+      for (std::size_t i = 0; i < prod.children.size(); ++i)
+        CHECK(witness.children[i].child == prod.children[i]);
+    }
+  }
+  CHECK(refined_has_noncanonical_order);
 
   std::println("  PASS");
 }
@@ -1762,6 +2013,8 @@ int main() {
   test_exact_expansion_four_taxon_star_matches_bruteforce();
   test_exact_expansion_reuses_existing_observed_clade();
   test_exact_expansion_merges_reversed_observed_witnesses();
+  test_refined_children_use_direct_grammar_canonical_order();
+  test_disabled_canonicalization_preserves_observed_order();
   test_exact_expansion_merges_synthetic_provenance();
   test_exact_expansion_caps_throw();
   test_binary_compatibility_rejects_out_of_range_taxa();

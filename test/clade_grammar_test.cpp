@@ -3,10 +3,11 @@
 
 #include "test_util.hpp"
 
-#include <print>
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <print>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -461,6 +462,44 @@ static void test_polytomy_policy() {
   std::println("  PASS");
 }
 
+static void test_kary_children_use_canonical_clade_order() {
+  std::println("test_kary_children_use_canonical_clade_order");
+
+  using larch::test::tiny_inner;
+  using larch::test::tiny_leaf;
+  auto dag = larch::test::make_tiny_labelled_tree(
+      "AAAA", tiny_inner("root", "AAAA",
+                          {tiny_leaf("C", "AAGA"),
+                           tiny_leaf("A", "AAAA"),
+                           tiny_leaf("D", "AAAT"),
+                           tiny_leaf("B", "CAAA")}));
+  larch::clade_grammar_options opts;
+  opts.allow_polytomies = true;
+  auto built = larch::build_clade_grammar_with_audit(dag, opts);
+  auto const& grammar = built.grammar;
+
+  CHECK(grammar.productions.size() == 1);
+  auto const& prod = grammar.productions.front();
+  CHECK(prod.children.size() == 4);
+  CHECK(std::is_sorted(
+      prod.children.begin(), prod.children.end(),
+      [&](larch::clade_id lhs, larch::clade_id rhs) {
+        return larch::detail::clade_id_key_less(grammar, lhs, rhs);
+      }));
+  CHECK(prod.children ==
+        std::vector<larch::clade_id>({clade_for(grammar, {"A"}),
+                                     clade_for(grammar, {"B"}),
+                                     clade_for(grammar, {"C"}),
+                                     clade_for(grammar, {"D"})}));
+  CHECK(prod.witnesses.size() == 1);
+  CHECK(prod.witnesses.front().children.size() == prod.children.size());
+  for (std::size_t i = 0; i < prod.children.size(); ++i) {
+    CHECK(prod.witnesses.front().children[i].child == prod.children[i]);
+  }
+
+  std::println("  PASS");
+}
+
 static void test_existing_fixture_builds() {
   std::println("test_existing_fixture_builds");
 
@@ -501,6 +540,7 @@ int main() {
   test_invalid_clade_group_alternatives_fail();
   test_invalid_child_partition_fails();
   test_polytomy_policy();
+  test_kary_children_use_canonical_clade_order();
   test_existing_fixture_builds();
 
   std::println("All clade grammar tests passed!");
