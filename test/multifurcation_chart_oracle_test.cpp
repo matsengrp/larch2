@@ -1063,12 +1063,14 @@ static void test_direct_kary_streaming_topology_enumerator() {
     larch::grammar_topology_census_options serial_options;
     serial_options.worker_count = 1;
     serial_options.sankoff_verification_stride = 1;
+    serial_options.retain_ordinal_score_ledger = true;
     auto serial_census = larch::census_grammar_topologies(
         grammar, patterns, chart_options, serial_options);
     CHECK(serial_census.expected_topology_count == 4);
     CHECK(serial_census.scored_topology_count == 4);
     CHECK(serial_census.sankoff_verified_topology_count == 4);
     CHECK(serial_census.score_histogram == parity_histogram);
+    CHECK(serial_census.ordinal_scores == expected_scores);
     CHECK(serial_census.recomputed_internal_clade_visits > 0);
     CHECK(serial_census.selected_score_histogram_by_production.size() ==
           grammar.productions.size());
@@ -1095,6 +1097,7 @@ static void test_direct_kary_streaming_topology_enumerator() {
     CHECK(parallel_census.optimum == serial_census.optimum);
     CHECK(parallel_census.optimal_ordinals ==
           serial_census.optimal_ordinals);
+    CHECK(parallel_census.ordinal_scores == serial_census.ordinal_scores);
     CHECK(parallel_census.selected_score_histogram_by_production ==
           serial_census.selected_score_histogram_by_production);
   }

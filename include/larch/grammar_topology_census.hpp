@@ -25,6 +25,12 @@ struct grammar_topology_census_options {
   // disables periodic checks.  Final minimum witnesses should additionally be
   // checked by the caller after the census.
   std::uint64_t sankoff_verification_stride = 0;
+
+  // Retain one compact score per global grammar ordinal while performing the
+  // existing exact pass.  This is opt-in so historical census callers keep
+  // their prior memory envelope; score-band export enables it to avoid a
+  // second full enumeration.
+  bool retain_ordinal_score_ledger = false;
 };
 
 struct grammar_topology_census_result {
@@ -42,6 +48,10 @@ struct grammar_topology_census_result {
   std::uint64_t sankoff_verified_topology_count = 0;
   std::uint64_t reachable_internal_clade_visits = 0;
   std::uint64_t recomputed_internal_clade_visits = 0;
+  // Present exactly when retain_ordinal_score_ledger was requested.  Index is
+  // the global grammar ordinal; worker-local contiguous ranges are joined in
+  // canonical ordinal order and checked against the score histogram.
+  std::vector<std::uint64_t> ordinal_scores;
 };
 
 namespace grammar_topology_census_detail {
@@ -56,6 +66,7 @@ inline void checked_accumulate(std::uint64_t& target, std::uint64_t value,
 }
 
 struct worker_result {
+  std::uint64_t ordinal_begin = 0;
   std::uint64_t scored_topology_count = 0;
   std::map<std::uint64_t, std::uint64_t> score_histogram;
   std::vector<std::map<std::uint64_t, std::uint64_t>>
@@ -65,21 +76,38 @@ struct worker_result {
   std::uint64_t sankoff_verified_topology_count = 0;
   std::uint64_t reachable_internal_clade_visits = 0;
   std::uint64_t recomputed_internal_clade_visits = 0;
+  std::vector<std::uint64_t> ordinal_scores;
 };
 
 inline worker_result census_worker(
     clade_grammar const& grammar, site_pattern_set const& patterns,
     chart_options const& chart_options,
     grammar_topology_enumerator const& enumerator, grammar_topology_range range,
-    std::uint64_t sankoff_verification_stride) {
+    std::uint64_t sankoff_verification_stride,
+    bool retain_ordinal_score_ledger) {
   worker_result result;
+  result.ordinal_begin = range.begin;
   result.selected_score_histogram_by_production.resize(
       grammar.productions.size());
+  if (retain_ordinal_score_ledger) {
+    if (range.size() > std::numeric_limits<std::size_t>::max()) {
+      throw std::length_error(
+          "grammar topology census: ordinal-score ledger exceeds size_t");
+    }
+    result.ordinal_scores.reserve(static_cast<std::size_t>(range.size()));
+  }
   grammar_topology_fitch_scorer scorer(grammar, patterns, chart_options);
   auto emitted = enumerator.stream(
       range, [&](std::uint64_t ordinal, grammar_topology const& topology) {
         grammar_topology_fitch_score_stats stats;
         auto const score = scorer.score_enumerator_topology(topology, &stats);
+        if (score >= multisite_score_inf) {
+          throw std::runtime_error(
+              "grammar topology census: non-finite or saturated score at "
+              "ordinal " +
+              std::to_string(ordinal));
+        }
+        if (retain_ordinal_score_ledger) result.ordinal_scores.push_back(score);
         checked_accumulate(result.reachable_internal_clade_visits,
                            stats.reachable_internal_clades,
                            "reachable-clade counter");
@@ -151,6 +179,16 @@ inline grammar_topology_census_result census_grammar_topologies(
     throw std::runtime_error(
         "grammar topology census: grammar has no concrete topologies");
   }
+  if (census_options.retain_ordinal_score_ledger &&
+      result.expected_topology_count >
+          std::numeric_limits<std::size_t>::max()) {
+    throw std::length_error(
+        "grammar topology census: ordinal-score ledger exceeds size_t");
+  }
+  if (census_options.retain_ordinal_score_ledger) {
+    result.ordinal_scores.reserve(
+        static_cast<std::size_t>(result.expected_topology_count));
+  }
 
   thread_pool pool(census_options.worker_count);
   std::vector<std::future<grammar_topology_census_detail::worker_result>>
@@ -162,12 +200,27 @@ inline grammar_topology_census_result census_grammar_topologies(
     futures.push_back(pool.submit([&, range] {
       return grammar_topology_census_detail::census_worker(
           grammar, patterns, chart_options, enumerator, range,
-          census_options.sankoff_verification_stride);
+          census_options.sankoff_verification_stride,
+          census_options.retain_ordinal_score_ledger);
     }));
   }
 
   for (auto& future : futures) {
     auto worker = future.get();
+    if (census_options.retain_ordinal_score_ledger) {
+      if (worker.ordinal_begin != result.ordinal_scores.size() ||
+          worker.ordinal_scores.size() != worker.scored_topology_count) {
+        throw std::runtime_error(
+            "grammar topology census: worker ordinal-score ledger is not "
+            "gap-free");
+      }
+      result.ordinal_scores.insert(result.ordinal_scores.end(),
+                                   worker.ordinal_scores.begin(),
+                                   worker.ordinal_scores.end());
+    } else if (!worker.ordinal_scores.empty()) {
+      throw std::logic_error(
+          "grammar topology census: unrequested ordinal-score ledger retained");
+    }
     grammar_topology_census_detail::checked_accumulate(
         result.scored_topology_count, worker.scored_topology_count,
         "scored-topology count");
@@ -223,6 +276,24 @@ inline grammar_topology_census_result census_grammar_topologies(
   if (histogram_total != result.expected_topology_count) {
     throw std::runtime_error(
         "grammar topology census: histogram does not reconcile");
+  }
+  if (census_options.retain_ordinal_score_ledger) {
+    if (result.ordinal_scores.size() != result.expected_topology_count) {
+      throw std::runtime_error(
+          "grammar topology census: ordinal-score ledger does not reconcile");
+    }
+    std::map<std::uint64_t, std::uint64_t> ledger_histogram;
+    for (auto score : result.ordinal_scores) {
+      grammar_topology_census_detail::checked_accumulate(
+          ledger_histogram[score], 1, "ordinal-score ledger histogram");
+    }
+    if (ledger_histogram != result.score_histogram) {
+      throw std::runtime_error(
+          "grammar topology census: ordinal-score ledger histogram mismatch");
+    }
+  } else if (!result.ordinal_scores.empty()) {
+    throw std::logic_error(
+        "grammar topology census: unrequested ordinal-score ledger published");
   }
   if (result.optimum >= multisite_score_inf ||
       result.optimal_ordinals.empty()) {

@@ -1,0 +1,8 @@
+key	value
+edge_weight	unit
+face_policy	certified_commuting_rspr_square_deferred_v1
+hodge_metric	not_applicable
+landscape_semantics_hash	134dbd85d9680f0184b9b3ce8721530c3c7fdf89649e277ab500ffda2b7f44cb
+null_family	not_applicable
+numeric_policy	exact_integer
+score_view	absolute_score_interval_inclusive_v1:10:11

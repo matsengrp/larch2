@@ -1,0 +1,10 @@
+key	value
+command	python3.14%20phylo/tools/generate_topology_landscape_v1_fixture.py
+derivation_ref	TI-0%20synthetic%20contract%20fixture
+input_artifact_sha256	fa99c476d9b53f3728ce9b2afcdf537c9560e730301df9d2feed814c8b68eb53
+output_data_sha256	c7f61a27f3010bec083d4eea3240aa8fa3b46aac0944035830a3be069fba448b
+producer_commit	synthetic_fixture_no_commit_claim
+producer_dirty	not_applicable
+producer_repository	tric-explore%20fixture%20authority
+toolchain	python3.14%20hashlib
+worker_count	1

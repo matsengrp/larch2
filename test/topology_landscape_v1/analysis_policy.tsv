@@ -1,0 +1,8 @@
+key	value
+edge_weight	unit
+face_policy	not_applicable
+hodge_metric	not_applicable
+landscape_semantics_hash	8e6c3dfc4e654cda90afed6b1710acff0ad9cd7ffdae4edc08e51121aadb5cdb
+null_family	not_applicable
+numeric_policy	exact_integer
+score_view	absolute_and_delta

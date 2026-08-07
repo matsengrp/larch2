@@ -110,6 +110,60 @@ add_library(larch src/protobuf.cpp src/protobuf_encode.cpp src/pickle_reader.cpp
 target_include_directories(larch PUBLIC include ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(larch PUBLIC ZLIB::ZLIB Threads::Threads)
 
+# TI-0 neutral topology-landscape exchange.  This remains independent of the
+# protobuf/DAG/search library so contract validation has no scientific side
+# effects or search-oriented adjacency dependencies.
+add_library(topology_landscape_bundle src/topology_landscape_bundle.cpp)
+add_library(larch::topology_landscape_bundle ALIAS topology_landscape_bundle)
+target_include_directories(topology_landscape_bundle PUBLIC include)
+
+# TI-1 exact topology/taxon kernel. This intentionally has no dependency on
+# DAG search, compact genomes, score filters, or chart-SPR candidate streams.
+add_library(exhaustive_rooted_rspr
+            src/rooted_topology.cpp
+            src/exhaustive_rooted_rspr.cpp
+            src/rooted_rspr_pair_index.cpp)
+add_library(larch::exhaustive_rooted_rspr ALIAS exhaustive_rooted_rspr)
+target_include_directories(exhaustive_rooted_rspr PUBLIC include)
+target_link_libraries(topology_landscape_bundle
+                      PUBLIC larch::exhaustive_rooted_rspr)
+
+add_library(phylo_topology_adapter src/phylo_topology_adapter.cpp)
+add_library(larch::phylo_topology_adapter ALIAS phylo_topology_adapter)
+target_include_directories(phylo_topology_adapter PUBLIC include)
+target_link_libraries(phylo_topology_adapter
+                      PUBLIC larch larch::exhaustive_rooted_rspr)
+
+# TI-2 exact ordinal-score ledger and deterministic score-band selection.
+add_library(grammar_topology_band src/grammar_topology_band.cpp)
+add_library(larch::grammar_topology_band ALIAS grammar_topology_band)
+target_include_directories(grammar_topology_band PUBLIC include)
+target_link_libraries(grammar_topology_band PUBLIC larch)
+
+add_library(tree_pattern_sankoff src/tree_pattern_sankoff.cpp)
+add_library(larch::tree_pattern_sankoff ALIAS tree_pattern_sankoff)
+target_include_directories(tree_pattern_sankoff PUBLIC include)
+target_link_libraries(tree_pattern_sankoff
+                      PUBLIC larch larch::exhaustive_rooted_rspr)
+
+add_library(grammar_topology_band_export
+            src/grammar_topology_band_export.cpp)
+add_library(larch::grammar_topology_band_export ALIAS
+            grammar_topology_band_export)
+target_include_directories(grammar_topology_band_export PUBLIC include)
+target_link_libraries(grammar_topology_band_export
+                      PUBLIC larch
+                             larch::grammar_topology_band
+                             larch::phylo_topology_adapter
+                             larch::topology_landscape_bundle
+                             larch::tree_pattern_sankoff)
+
+add_library(grammar_topology_replay src/grammar_topology_replay.cpp)
+add_library(larch::grammar_topology_replay ALIAS grammar_topology_replay)
+target_include_directories(grammar_topology_replay PUBLIC include)
+target_link_libraries(grammar_topology_replay
+                      PUBLIC larch::grammar_topology_band_export)
+
 # --- Optional Vulkan compute --------------------------------------------------
 
 option(ENABLE_VULKAN "Enable Vulkan compute for neural network inference" OFF)
@@ -138,7 +192,26 @@ add_executable(larch2 tools/larch2.cpp)
 target_link_libraries(larch2 PRIVATE larch)
 
 add_executable(dagutil tools/dagutil.cpp)
-target_link_libraries(dagutil PRIVATE larch)
+target_link_libraries(dagutil PRIVATE larch larch::grammar_topology_replay)
+
+add_executable(topology_landscape_bundle_cli
+               tools/topology_landscape_bundle.cpp)
+target_link_libraries(topology_landscape_bundle_cli
+                      PRIVATE larch::topology_landscape_bundle)
+set_target_properties(topology_landscape_bundle_cli PROPERTIES
+                      OUTPUT_NAME "topology-landscape-bundle")
+
+add_executable(topology_kernel_cli tools/topology_kernel.cpp)
+target_link_libraries(topology_kernel_cli PRIVATE larch::exhaustive_rooted_rspr)
+set_target_properties(topology_kernel_cli PROPERTIES OUTPUT_NAME "topology-kernel")
+
+add_executable(topology_rspr_pair_index_cli
+               tools/topology_rspr_pair_index.cpp)
+target_link_libraries(topology_rspr_pair_index_cli
+                      PRIVATE larch::topology_landscape_bundle
+                              larch::exhaustive_rooted_rspr)
+set_target_properties(topology_rspr_pair_index_cli PROPERTIES
+                      OUTPUT_NAME "topology-rspr-pair-index")
 
 add_executable(larch2-bcr tools/larch2-bcr.cpp)
 target_link_libraries(larch2-bcr PRIVATE larch)
@@ -209,6 +282,171 @@ add_executable(chart_spr_semantic_report_test
 target_include_directories(chart_spr_semantic_report_test PRIVATE include)
 add_test(NAME chart_spr_semantic_report_test
          COMMAND chart_spr_semantic_report_test)
+
+add_executable(topology_landscape_bundle_test
+               test/topology_landscape_bundle_test.cpp)
+target_link_libraries(topology_landscape_bundle_test
+                      PRIVATE larch::topology_landscape_bundle)
+target_compile_definitions(topology_landscape_bundle_test PRIVATE
+  "LARCH_TOPOLOGY_LANDSCAPE_FIXTURE=\"${CMAKE_SOURCE_DIR}/test/topology_landscape_v1\"")
+foreach(_mode valid rewrite checksum_reject canonical_reject
+              identity_link_reject false_completeness_reject schema_reject
+              duplicate_topology_reject missing_endpoint_reject literal_hyphen
+              empty_cell_reject fixed_role_reject tree_status_reject
+              witness_status_reject completeness_scope_reject
+              unsafe_symlink_reject nullable_ordinal
+              grammar_ordinal_conflict_reject score_delta_reject
+              edge_self_loop_reject edge_reversed_reject edge_duplicate_reject
+              edge_bad_id_reject witness_bad_id_reject witness_projection_reject
+              crlf_reject row_order_reject topology_digest_reject
+              utf8_label_reject)
+  add_test(NAME topology_landscape_bundle_${_mode}
+           COMMAND topology_landscape_bundle_test ${_mode})
+  set_tests_properties(topology_landscape_bundle_${_mode} PROPERTIES
+                       LABELS "topology_landscape;fast")
+endforeach()
+
+foreach(_mode valid ordinal census_score selected_score interval coverage
+              oracle_name oracle_equal both_na_valid audit_digest wrong_domain
+              range empty_view view_scope completeness digest_namespace cross_link)
+  add_test(NAME topology_landscape_v2_${_mode}
+    COMMAND python3.14
+            ${CMAKE_SOURCE_DIR}/test/topology_landscape_v2_contract_test.py
+            $<TARGET_FILE:topology_landscape_bundle_cli>
+            ${CMAKE_SOURCE_DIR}/test/topology_landscape_v2
+            larch ${_mode})
+  set_tests_properties(topology_landscape_v2_${_mode} PROPERTIES
+                       LABELS "topology_islands_ti2;fast" TIMEOUT 30)
+endforeach()
+
+foreach(_mode rewrite rewrite_no_replace)
+  add_test(NAME topology_landscape_v2_${_mode}
+    COMMAND python3.14
+            ${CMAKE_SOURCE_DIR}/test/topology_landscape_v2_contract_test.py
+            $<TARGET_FILE:topology_landscape_bundle_cli>
+            ${CMAKE_SOURCE_DIR}/test/topology_landscape_v2
+            larch ${_mode})
+  set_tests_properties(topology_landscape_v2_${_mode} PROPERTIES
+                       LABELS "topology_islands_ti2;fast" TIMEOUT 30)
+endforeach()
+
+foreach(_mode valid outer_hash table_hash schema fixed_token ordinal census_score
+              interval coverage false_oracle oracle_name validation audit bad_hash
+              wrong_domain taxon range empty_view duplicate numeric_order)
+  add_test(NAME topology_score_band_raw_v1_${_mode}
+    COMMAND python3.14
+            ${CMAKE_SOURCE_DIR}/test/topology_score_band_raw_v1_test.py
+            $<TARGET_FILE:topology_landscape_bundle_cli>
+            ${CMAKE_SOURCE_DIR}/test/topology_score_band_raw_v1
+            ${_mode})
+  set_tests_properties(topology_score_band_raw_v1_${_mode} PROPERTIES
+                       LABELS "topology_islands_ti2;fast" TIMEOUT 30)
+endforeach()
+
+add_test(NAME topology_landscape_export_v2_valid
+  COMMAND python3.14
+          ${CMAKE_SOURCE_DIR}/test/topology_landscape_v2_contract_test.py
+          $<TARGET_FILE:topology_landscape_bundle_cli>
+          ${CMAKE_SOURCE_DIR}/test/topology_landscape_export_v2
+          larch valid)
+set_tests_properties(topology_landscape_export_v2_valid PROPERTIES
+                     LABELS "topology_islands_ti2;fast" TIMEOUT 30)
+
+add_test(NAME topology_islands_atomic_directory_no_replace
+         COMMAND bash test/publish_directory_no_replace_test.sh
+                      ${CMAKE_SOURCE_DIR}/test/publish_directory_no_replace.py)
+set_tests_properties(topology_islands_atomic_directory_no_replace PROPERTIES
+                     LABELS "topology_islands_ti2;fast" TIMEOUT 30
+                     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(grammar_topology_band_test test/grammar_topology_band_test.cpp)
+target_link_libraries(grammar_topology_band_test
+                      PRIVATE larch::grammar_topology_band)
+foreach(_mode selection worker_parity rejection saturation)
+  add_test(NAME grammar_topology_band_${_mode}
+           COMMAND grammar_topology_band_test ${_mode})
+  set_tests_properties(grammar_topology_band_${_mode} PROPERTIES
+                       LABELS "topology_islands_ti2;fast" TIMEOUT 30)
+endforeach()
+
+add_executable(tree_pattern_sankoff_test test/tree_pattern_sankoff_test.cpp)
+target_link_libraries(tree_pattern_sankoff_test
+                      PRIVATE larch::tree_pattern_sankoff)
+foreach(_mode masks_weights reference_offset arbitrary_arity
+              site_pattern_adapter rejection)
+  add_test(NAME tree_pattern_sankoff_${_mode}
+           COMMAND tree_pattern_sankoff_test ${_mode})
+  set_tests_properties(tree_pattern_sankoff_${_mode} PROPERTIES
+                       LABELS "topology_islands_ti2;fast" TIMEOUT 30)
+endforeach()
+
+add_executable(grammar_topology_band_export_test
+               test/grammar_topology_band_export_test.cpp)
+target_include_directories(grammar_topology_band_export_test PRIVATE test)
+target_link_libraries(grammar_topology_band_export_test
+                      PRIVATE larch::grammar_topology_replay)
+target_compile_definitions(grammar_topology_band_export_test PRIVATE
+  "LARCH_TOPOLOGY_BAND_EXPORT_FIXTURE=\"${CMAKE_SOURCE_DIR}/test/topology_score_band_export_v1\"")
+foreach(_mode synthetic_export worker_parity no_replace mismatch collision
+              rejection_matrix arity_roundtrip replay_contract golden)
+  add_test(NAME grammar_topology_band_export_${_mode}
+           COMMAND grammar_topology_band_export_test ${_mode})
+  set_tests_properties(grammar_topology_band_export_${_mode} PROPERTIES
+                       LABELS "topology_islands_ti2;fast" TIMEOUT 30)
+endforeach()
+
+add_executable(rooted_topology_kernel_test
+               test/rooted_topology_kernel_test.cpp)
+target_link_libraries(rooted_topology_kernel_test
+                      PRIVATE larch::exhaustive_rooted_rspr)
+target_compile_definitions(rooted_topology_kernel_test PRIVATE
+  "LARCH_TOPOLOGY_KERNEL_CERTIFICATE=\"${CMAKE_SOURCE_DIR}/test/TOPOLOGY-KERNEL-V1-CERTIFICATE.tsv\"")
+foreach(_mode canonical binary_enumeration hard_enumeration binary_rspr hard_rspr
+              digest scoring metamorphic binary_restriction certificate)
+  add_test(NAME rooted_topology_${_mode}
+           COMMAND rooted_topology_kernel_test ${_mode})
+  set_tests_properties(rooted_topology_${_mode} PROPERTIES
+                       LABELS "topology_islands_ti1;fast" TIMEOUT 60)
+endforeach()
+add_test(NAME rooted_topology_artifact_cli
+         COMMAND bash test/topology_kernel_cli_test.sh
+                      $<TARGET_FILE:topology_kernel_cli>)
+set_tests_properties(rooted_topology_artifact_cli PROPERTIES
+                     LABELS "topology_islands_ti1;fast" TIMEOUT 60
+                     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(phylo_topology_adapter_test
+               test/phylo_topology_adapter_test.cpp)
+target_link_libraries(phylo_topology_adapter_test
+                      PRIVATE larch::phylo_topology_adapter)
+add_test(NAME rooted_topology_phylo_adapter
+         COMMAND phylo_topology_adapter_test)
+set_tests_properties(rooted_topology_phylo_adapter PROPERTIES
+                     LABELS "topology_islands_ti1;fast" TIMEOUT 30)
+
+add_executable(rooted_rspr_pair_index_test
+               test/rooted_rspr_pair_index_test.cpp)
+target_link_libraries(rooted_rspr_pair_index_test
+                      PRIVATE larch::exhaustive_rooted_rspr)
+foreach(_mode parity collision determinism parent_fates)
+  add_test(NAME rooted_rspr_pair_index_${_mode}
+           COMMAND rooted_rspr_pair_index_test ${_mode})
+  set_tests_properties(rooted_rspr_pair_index_${_mode} PROPERTIES
+                       LABELS "topology_islands_ti3;fast" TIMEOUT 60)
+endforeach()
+
+foreach(_mode valid identity_reject selection_reject no_replace publication
+              v1_reject)
+  add_test(NAME topology_rspr_pair_index_cli_${_mode}
+    COMMAND python3.14
+            ${CMAKE_SOURCE_DIR}/test/topology_rspr_pair_index_cli_test.py
+            $<TARGET_FILE:topology_rspr_pair_index_cli>
+            ${CMAKE_SOURCE_DIR}/test/topology_landscape_v2
+            ${CMAKE_SOURCE_DIR}/test/topology_landscape_v1
+            ${_mode})
+  set_tests_properties(topology_rspr_pair_index_cli_${_mode} PROPERTIES
+                       LABELS "topology_islands_ti3;fast" TIMEOUT 30)
+endforeach()
 
 # Header-only tests (no library link needed beyond include path)
 foreach(test_name chain_test dag_test hash_chain_test extend_dag_test
@@ -806,6 +1044,130 @@ set_tests_properties(dagutil_chart_spr_additive_medium
                      LABELS "integration;medium;wric"
                      RUN_SERIAL TRUE
                      TIMEOUT 900)
+
+add_test(NAME topology_islands_ti2_provider_replay
+         COMMAND bash test/topology_islands_ti2_provider_replay.sh
+                 $<TARGET_FILE:dagutil>
+                 ${CMAKE_BINARY_DIR}/topology-islands-ti2/provider
+                 ${CMAKE_SOURCE_DIR}/doc/WRIC-TOPOLOGY-SCORE-BAND-REPLAY-V1.tsv
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(topology_islands_ti2_provider_replay
+                     PROPERTIES
+                     LABELS "topology_islands_ti2;slow;integration"
+                     FIXTURES_SETUP topology_islands_ti2_provider
+                     RESOURCE_LOCK topology_islands_ti2_provider
+                     RUN_SERIAL TRUE
+                     TIMEOUT 1200)
+
+foreach(_workers 1 8)
+  add_test(NAME topology_islands_ti2_wric_census_w${_workers}
+           COMMAND bash test/topology_islands_ti2_census_replay.sh
+                   $<TARGET_FILE:dagutil>
+                   ${CMAKE_BINARY_DIR}/topology-islands-ti2/provider/provider.pb.gz
+                   ${CMAKE_SOURCE_DIR}/doc/WRIC-TOPOLOGY-SCORE-BAND-REPLAY-V1.tsv
+                   ${CMAKE_BINARY_DIR}/topology-islands-ti2/census-w${_workers}
+                   ${_workers}
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(topology_islands_ti2_wric_census_w${_workers}
+                       PROPERTIES
+                       LABELS "topology_islands_ti2;slow;integration"
+                       FIXTURES_REQUIRED topology_islands_ti2_provider
+                       FIXTURES_SETUP topology_islands_ti2_census_w${_workers}
+                       RESOURCE_LOCK topology_islands_ti2_census
+                       RUN_SERIAL TRUE
+                       TIMEOUT 3600)
+endforeach()
+
+add_test(NAME topology_islands_ti2_wric_census_parity
+         COMMAND bash test/topology_islands_ti2_census_parity.sh
+                 ${CMAKE_BINARY_DIR}/topology-islands-ti2/census-w1
+                 ${CMAKE_BINARY_DIR}/topology-islands-ti2/census-w8
+                 ${CMAKE_BINARY_DIR}/topology-islands-ti2/CENSUS-PARITY.tsv
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(topology_islands_ti2_wric_census_parity
+                     PROPERTIES
+                     LABELS "topology_islands_ti2;slow;integration"
+                     FIXTURES_REQUIRED
+                       "topology_islands_ti2_census_w1;topology_islands_ti2_census_w8"
+                     RESOURCE_LOCK topology_islands_ti2_census
+                     RUN_SERIAL TRUE
+                     TIMEOUT 60)
+
+foreach(_workers 1 8)
+  add_test(NAME topology_islands_ti2_wric_delta01_raw_w${_workers}
+           COMMAND bash test/topology_islands_ti2_band_export.sh
+                   $<TARGET_FILE:dagutil>
+                   $<TARGET_FILE:topology_landscape_bundle_cli>
+                   ${CMAKE_BINARY_DIR}/topology-islands-ti2/provider/provider.pb.gz
+                   ${CMAKE_SOURCE_DIR}/doc/WRIC-TOPOLOGY-SCORE-BAND-REPLAY-V1.tsv
+                   ${CMAKE_BINARY_DIR}/topology-islands-ti2/delta01-w${_workers}
+                   ${_workers}
+                   1
+                   ${CMAKE_CXX_COMPILER}
+                   ${CMAKE_SOURCE_DIR}/test/publish_directory_no_replace.py
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(topology_islands_ti2_wric_delta01_raw_w${_workers}
+                       PROPERTIES
+                       LABELS "topology_islands_ti2;slow;integration"
+                       FIXTURES_REQUIRED topology_islands_ti2_provider
+                       FIXTURES_SETUP topology_islands_ti2_delta01_raw_w${_workers}
+                       RESOURCE_LOCK topology_islands_ti2_census
+                       RUN_SERIAL TRUE
+                       TIMEOUT 5400)
+endforeach()
+
+add_test(NAME topology_islands_ti2_wric_delta01_raw_parity
+         COMMAND bash test/topology_islands_ti2_raw_parity.sh
+                 ${CMAKE_BINARY_DIR}/topology-islands-ti2/delta01-w1
+                 ${CMAKE_BINARY_DIR}/topology-islands-ti2/delta01-w8
+                 ${CMAKE_BINARY_DIR}/topology-islands-ti2/DELTA01-RAW-PARITY.tsv
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(topology_islands_ti2_wric_delta01_raw_parity
+                     PROPERTIES
+                     LABELS "topology_islands_ti2;slow;integration"
+                     FIXTURES_REQUIRED
+                       "topology_islands_ti2_delta01_raw_w1;topology_islands_ti2_delta01_raw_w8"
+                     RESOURCE_LOCK topology_islands_ti2_census
+                     RUN_SERIAL TRUE
+                     TIMEOUT 60)
+
+foreach(_workers 1 8)
+  add_test(NAME topology_islands_ti2_wric_delta02_raw_w${_workers}
+           COMMAND bash test/topology_islands_ti2_band_export.sh
+                   $<TARGET_FILE:dagutil>
+                   $<TARGET_FILE:topology_landscape_bundle_cli>
+                   ${CMAKE_BINARY_DIR}/topology-islands-ti2/provider/provider.pb.gz
+                   ${CMAKE_SOURCE_DIR}/doc/WRIC-TOPOLOGY-SCORE-BAND-REPLAY-V1.tsv
+                   ${CMAKE_BINARY_DIR}/topology-islands-ti2/delta02-w${_workers}
+                   ${_workers}
+                   2
+                   ${CMAKE_CXX_COMPILER}
+                   ${CMAKE_SOURCE_DIR}/test/publish_directory_no_replace.py
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(topology_islands_ti2_wric_delta02_raw_w${_workers}
+                       PROPERTIES
+                       LABELS "topology_islands_ti2;slow;integration;extended"
+                       FIXTURES_REQUIRED topology_islands_ti2_provider
+                       FIXTURES_SETUP topology_islands_ti2_delta02_raw_w${_workers}
+                       RESOURCE_LOCK topology_islands_ti2_census
+                       RUN_SERIAL TRUE
+                       TIMEOUT 18000)
+endforeach()
+
+add_test(NAME topology_islands_ti2_wric_delta02_raw_parity
+         COMMAND bash test/topology_islands_ti2_raw_parity.sh
+                 ${CMAKE_BINARY_DIR}/topology-islands-ti2/delta02-w1
+                 ${CMAKE_BINARY_DIR}/topology-islands-ti2/delta02-w8
+                 ${CMAKE_BINARY_DIR}/topology-islands-ti2/DELTA02-RAW-PARITY.tsv
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(topology_islands_ti2_wric_delta02_raw_parity
+                     PROPERTIES
+                     LABELS "topology_islands_ti2;slow;integration;extended"
+                     FIXTURES_REQUIRED
+                       "topology_islands_ti2_delta02_raw_w1;topology_islands_ti2_delta02_raw_w8"
+                     RESOURCE_LOCK topology_islands_ti2_census
+                     RUN_SERIAL TRUE
+                     TIMEOUT 120)
 
 add_test(NAME dagutil_wric_phase9_chart_fluidity_site
          COMMAND dagutil

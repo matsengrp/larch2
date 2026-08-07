@@ -25,6 +25,7 @@
 #include <larch/chart_spr_search.hpp>
 #include <larch/chart_spr_semantic_report.hpp>
 #include <larch/grammar_topology_census.hpp>
+#include <larch/grammar_topology_replay.hpp>
 #include <larch/plateau.hpp>
 #include <larch/sha256.hpp>
 
@@ -36,6 +37,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -1217,6 +1219,30 @@ Analysis:
   --chart-kary-census-output-prefix <path>
                           Materialize, Fitch-rescore, reload, and validate one
                           DAG per distinct minimum topology class
+  --chart-kary-census-replay-manifest <path>
+                          Require the exact TI-2 provider/input/grammar/prior-
+                          census identities before accepting the census
+  --chart-kary-census-seed-input <path>
+                          Seed-tree artifact bound by replay/export provenance
+  --chart-kary-census-export-max-delta <N>
+                          Export the inclusive optimum-through-optimum+N band
+                          from the same retained census pass
+  --chart-kary-census-export-directory <path>
+                          Publish one validated raw-v1 score-band directory
+  --chart-kary-census-identity-report <path>
+                          Write a no-replace pre-census identity report
+  --chart-kary-census-ledger-output <path>
+                          Write the complete canonical ordinal/score TSV after
+                          replay validation, without replacing an existing file
+  --chart-kary-census-grammar-construction <token>
+                          Construction-policy token for an identity report
+  --chart-kary-census-universe <token>
+                          Grammar-universe token for an identity report
+  --chart-kary-census-producer-dirty-attestation <true|false>
+                          Wrapper-derived worktree-state attestation required
+                          for raw export
+  --chart-kary-census-producer-source-state <path>
+                          Source-state certificate hashed into raw provenance
   --chart-bnb-trim        Run exact multi-site B&B trimming and print frontier
                           statistics (intended for small/medium DAGs)
   --chart-fluidity-site <POS>
@@ -1470,6 +1496,16 @@ struct args {
   std::size_t chart_kary_census_workers = 1;
   std::uint64_t chart_kary_census_sankoff_stride = 0;
   std::string chart_kary_census_output_prefix;
+  std::string chart_kary_census_replay_manifest;
+  std::string chart_kary_census_seed_input;
+  std::optional<std::uint64_t> chart_kary_census_export_max_delta;
+  std::string chart_kary_census_export_directory;
+  std::string chart_kary_census_identity_report;
+  std::string chart_kary_census_ledger_output;
+  std::string chart_kary_census_grammar_construction;
+  std::string chart_kary_census_universe;
+  std::string chart_kary_census_producer_dirty;
+  std::string chart_kary_census_producer_source_state;
   bool chart_bnb_trim = false;
   std::optional<mutation_position> chart_fluidity_site;
   bool chart_score_ua_edge = false;
@@ -1937,6 +1973,28 @@ static args parse_args(int argc, char** argv) {
           next(), "--chart-kary-census-sankoff-stride");
     } else if (arg == "--chart-kary-census-output-prefix") {
       a.chart_kary_census_output_prefix = next();
+    } else if (arg == "--chart-kary-census-replay-manifest") {
+      a.chart_kary_census_replay_manifest = next();
+    } else if (arg == "--chart-kary-census-seed-input") {
+      a.chart_kary_census_seed_input = next();
+    } else if (arg == "--chart-kary-census-export-max-delta") {
+      a.chart_kary_census_export_max_delta = parse_size_token_strict(
+          next(), "--chart-kary-census-export-max-delta");
+    } else if (arg == "--chart-kary-census-export-directory") {
+      a.chart_kary_census_export_directory = next();
+    } else if (arg == "--chart-kary-census-identity-report") {
+      a.chart_kary_census_identity_report = next();
+    } else if (arg == "--chart-kary-census-ledger-output") {
+      a.chart_kary_census_ledger_output = next();
+    } else if (arg == "--chart-kary-census-grammar-construction") {
+      a.chart_kary_census_grammar_construction = next();
+    } else if (arg == "--chart-kary-census-universe") {
+      a.chart_kary_census_universe = next();
+    } else if (arg ==
+               "--chart-kary-census-producer-dirty-attestation") {
+      a.chart_kary_census_producer_dirty = next();
+    } else if (arg == "--chart-kary-census-producer-source-state") {
+      a.chart_kary_census_producer_source_state = next();
     } else if (arg == "--chart-bnb-trim") {
       a.chart_bnb_trim = true;
     } else if (arg == "--chart-fluidity-site" || arg == "--plateau-site") {
@@ -2343,6 +2401,62 @@ static args parse_args(int argc, char** argv) {
       !a.chart_kary_census) {
     std::cerr << "error: --chart-kary-census-output-prefix requires "
                  "--chart-kary-census\n";
+    std::exit(1);
+  }
+  auto const export_requested =
+      a.chart_kary_census_export_max_delta.has_value() ||
+      !a.chart_kary_census_export_directory.empty();
+  if (export_requested &&
+      (!a.chart_kary_census_export_max_delta ||
+       a.chart_kary_census_export_directory.empty())) {
+    std::cerr << "error: score-band export requires both max-delta and "
+                 "directory\n";
+    std::exit(1);
+  }
+  if ((!a.chart_kary_census_replay_manifest.empty() || export_requested) &&
+      (!a.chart_kary_census || a.chart_kary_census_seed_input.empty() ||
+       a.chart_kary_census_output_prefix.empty() ||
+       a.dag_pbs.size() != 1 || a.refseq.empty())) {
+    std::cerr << "error: TI-2 replay/export requires --chart-kary-census, one "
+                 "--dag-pb provider, --refseq, --chart-kary-census-seed-"
+                 "input, and a minimum-witness output prefix\n";
+    std::exit(1);
+  }
+  if (export_requested && a.chart_kary_census_replay_manifest.empty()) {
+    std::cerr << "error: score-band export requires a replay manifest\n";
+    std::exit(1);
+  }
+  if (export_requested &&
+      a.chart_kary_census_producer_dirty != "true" &&
+      a.chart_kary_census_producer_dirty != "false") {
+    std::cerr << "error: score-band export requires an explicit true/false "
+                 "producer-dirty attestation\n";
+    std::exit(1);
+  }
+  if (export_requested &&
+      (a.chart_kary_census_producer_source_state.empty() ||
+       !std::filesystem::is_regular_file(
+           a.chart_kary_census_producer_source_state))) {
+    std::cerr << "error: score-band export requires a regular producer "
+                 "source-state certificate\n";
+    std::exit(1);
+  }
+  auto const identity_report_requested =
+      !a.chart_kary_census_identity_report.empty();
+  if (identity_report_requested &&
+      (a.chart_kary_census_grammar_construction.empty() ||
+       a.chart_kary_census_universe.empty() ||
+       a.chart_kary_census_seed_input.empty() || a.dag_pbs.size() != 1 ||
+       a.refseq.empty())) {
+    std::cerr << "error: identity report requires one --dag-pb provider, "
+                 "--refseq, seed input, grammar construction, and universe\n";
+    std::exit(1);
+  }
+  if (!a.chart_kary_census_ledger_output.empty() &&
+      (!a.chart_kary_census ||
+       a.chart_kary_census_replay_manifest.empty())) {
+    std::cerr << "error: census ledger output requires a manifest-bound "
+                 "--chart-kary-census replay\n";
     std::exit(1);
   }
   if (a.seed) a.chart_spr_enumeration.seed = *a.seed;
@@ -6032,7 +6146,127 @@ chart_spr_normalize_single_input_merge_identity(args const& a,
              : result::normalized_needs_edge_recompute;
 }
 
+static void write_no_replace_file(std::filesystem::path const& destination,
+                                  std::string_view bytes) {
+  if (destination.filename().empty()) {
+    throw std::runtime_error("identity report path has no filename");
+  }
+  auto parent = destination.parent_path();
+  if (parent.empty()) parent = ".";
+  std::filesystem::create_directories(parent);
+  auto staging = parent /
+                 ("." + destination.filename().native() + ".staging");
+  if (std::filesystem::exists(destination) ||
+      std::filesystem::exists(staging)) {
+    throw std::runtime_error(
+        "identity report destination or staging file already exists");
+  }
+  try {
+    std::ofstream output(staging, std::ios::binary | std::ios::trunc);
+    if (!output ||
+        !output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()))) {
+      throw std::runtime_error("cannot write identity report staging file");
+    }
+    output.close();
+    if (!output) {
+      throw std::runtime_error("cannot close identity report staging file");
+    }
+    std::error_code error;
+    std::filesystem::create_hard_link(staging, destination, error);
+    if (error) {
+      throw std::runtime_error(
+          "cannot publish identity report without replacement: " +
+          error.message());
+    }
+    std::filesystem::remove(staging);
+  } catch (...) {
+    std::error_code ignored;
+    std::filesystem::remove(staging, ignored);
+    throw;
+  }
+}
+
+static std::string normalized_invocation(int argc, char** argv) {
+  std::string result = "A" + std::to_string(argc) + "[";
+  for (int index = 0; index < argc; ++index) {
+    std::string_view argument{argv[index]};
+    result += std::to_string(argument.size()) + ":";
+    result.append(argument);
+  }
+  result += "]";
+  return result;
+}
+
+static void write_chart_kary_identity_report(
+    args const& a, phylo_dag& provider, clade_grammar const& grammar,
+    site_pattern_set const& patterns, chart_options const& chart_options) {
+  auto rebuilt_patterns = build_site_patterns(provider, grammar);
+  auto derived = derive_topology_score_band_semantics(
+      provider, grammar, patterns, chart_options,
+      a.chart_kary_census_grammar_construction);
+  auto rebuilt = derive_topology_score_band_semantics(
+      provider, grammar, rebuilt_patterns, chart_options,
+      a.chart_kary_census_grammar_construction);
+  if (derived.alignment_sha256 != rebuilt.alignment_sha256 ||
+      derived.site_pattern_digest != rebuilt.site_pattern_digest ||
+      derived.input_content_sha256 != rebuilt.input_content_sha256) {
+    throw std::runtime_error(
+        "chart kary identity report: scorer patterns differ from provider");
+  }
+  if (read_refseq(a.refseq) != get_reference_sequence(provider)) {
+    throw std::runtime_error(
+        "chart kary identity report: reference artifact differs from provider");
+  }
+  grammar_topology_enumerator enumerator(grammar);
+  std::map<std::string, std::string> fields{
+      {"alignment_sha256", derived.alignment_sha256},
+      {"ambiguity_policy", derived.ambiguity_policy},
+      {"grammar_construction", a.chart_kary_census_grammar_construction},
+      {"grammar_digest", derived.grammar_digest},
+      {"grammar_semantic_digest", derived.grammar_semantic_digest},
+      {"grammar_topology_count", std::to_string(enumerator.topology_count())},
+      {"input_content_sha256", derived.input_content_sha256},
+      {"parsimony_model", derived.parsimony_model},
+      {"provider_input_sha256",
+       topology_score_band_artifact_sha256(a.dag_pbs.front())},
+      {"provider_legacy_dag_semantic_sha256",
+       topology_score_band_provider_legacy_dag_semantic_sha256(
+           provider, chart_options.score_ua_edge)},
+      {"provider_stored_history_parsimony_min",
+       std::to_string(
+           topology_score_band_provider_stored_history_parsimony_min(
+               provider, chart_options.score_ua_edge))},
+      {"reference_input_sha256",
+       topology_score_band_artifact_sha256(a.refseq)},
+      {"reference_sha256", derived.reference_sha256},
+      {"seed_tree_input_sha256",
+       topology_score_band_artifact_sha256(
+           a.chart_kary_census_seed_input)},
+      {"site_pattern_digest", derived.site_pattern_digest},
+      {"taxon_labels_sha256", derived.taxon_labels_sha256},
+      {"ua_scoring", derived.ua_scoring},
+      {"universe", a.chart_kary_census_universe},
+  };
+  std::string report = "key\tvalue\n";
+  for (auto const& [key, value] : fields) {
+    if (key.contains('\t') || key.contains('\n') || value.contains('\t') ||
+        value.contains('\n')) {
+      throw std::runtime_error(
+          "chart kary identity report: non-TSV-safe field");
+    }
+    report += key + "\t" + value + "\n";
+  }
+  write_no_replace_file(a.chart_kary_census_identity_report, report);
+  std::cout << "chart_kary_census_identity_report:\n";
+  std::cout << "  path: " << a.chart_kary_census_identity_report << "\n";
+  std::cout << "  sha256: "
+            << topology_score_band_artifact_sha256(
+                   a.chart_kary_census_identity_report)
+            << "\n";
+}
+
 int main(int argc, char** argv) try {
+  auto invocation = normalized_invocation(argc, argv);
   auto a = parse_args(argc, argv);
 
   // ---- Load all inputs (in parallel) ----
@@ -6169,6 +6403,15 @@ int main(int argc, char** argv) try {
     }
     return *exact_patterns_cache;
   };
+
+  if (!a.chart_kary_census_identity_report.empty()) {
+    auto& grammar = get_chart_grammar();
+    auto& patterns = get_exact_patterns();
+    chart_options chart_opts;
+    chart_opts.score_ua_edge = a.chart_score_ua_edge;
+    write_chart_kary_identity_report(a, result, grammar, patterns,
+                                     chart_opts);
+  }
 
   if (a.wric_audit || a.wric_polytomy_report) {
     clade_grammar_options grammar_opts;
@@ -6427,19 +6670,110 @@ int main(int argc, char** argv) try {
     auto& patterns = get_exact_patterns();
     chart_options chart_opts;
     chart_opts.score_ua_edge = a.chart_score_ua_edge;
+    std::optional<topology_score_band_replay_manifest> replay_manifest;
+    std::optional<topology_score_band_replay_preflight> replay_preflight;
+    if (!a.chart_kary_census_replay_manifest.empty()) {
+      replay_manifest = read_topology_score_band_replay_manifest(
+          a.chart_kary_census_replay_manifest);
+      if (a.chart_kary_census_sankoff_stride !=
+          replay_manifest->sankoff_verification_stride) {
+        throw std::runtime_error(
+            "chart kary census: Sankoff audit stride differs from replay "
+            "manifest");
+      }
+      replay_preflight = validate_topology_score_band_replay_preflight(
+          *replay_manifest, result, grammar, patterns, chart_opts,
+          a.dag_pbs.front(), a.refseq, a.chart_kary_census_seed_input);
+    }
     grammar_topology_census_options census_opts;
     census_opts.worker_count = a.chart_kary_census_workers;
     census_opts.sankoff_verification_stride =
         a.chart_kary_census_sankoff_stride;
+    census_opts.retain_ordinal_score_ledger = replay_manifest.has_value();
 
     auto census_start = std::chrono::steady_clock::now();
     auto census = census_grammar_topologies(grammar, patterns, chart_opts,
                                             census_opts);
     auto census_ms = elapsed_ms(census_start,
                                 std::chrono::steady_clock::now());
+    if (replay_manifest) {
+      validate_topology_score_band_replay_census(*replay_manifest, census);
+    }
+    if (!a.chart_kary_census_ledger_output.empty()) {
+      std::string ledger = "ordinal\texact_score\n";
+      ledger.reserve(census.ordinal_scores.size() * 12);
+      for (std::size_t ordinal = 0;
+           ordinal < census.ordinal_scores.size(); ++ordinal) {
+        ledger += std::to_string(ordinal) + "\t" +
+                  std::to_string(census.ordinal_scores[ordinal]) + "\n";
+      }
+      write_no_replace_file(a.chart_kary_census_ledger_output, ledger);
+      std::cout << "chart_kary_census_ledger:\n";
+      std::cout << "  path: " << a.chart_kary_census_ledger_output << "\n";
+      std::cout << "  sha256: "
+                << topology_score_band_artifact_sha256(
+                       a.chart_kary_census_ledger_output)
+                << "\n";
+    }
     auto minimum_classes = validate_chart_kary_census_minima(
         result, grammar, patterns, chart_opts, census,
         a.chart_kary_census_output_prefix);
+    if (replay_manifest) {
+      std::vector<topology_score_band_replay_minimum> replay_minima;
+      replay_minima.reserve(minimum_classes.size());
+      std::string minimum_ledger =
+          "class\tordinal\texact_score\ttopology_sha256\tcanonical_dag_"
+          "semantic_sha256\tcanonical_dag_clades_sha256\tcanonical_dag_"
+          "productions_sha256\tartifact\tartifact_sha256\n";
+      for (std::size_t class_index = 0;
+           class_index < minimum_classes.size(); ++class_index) {
+        auto const& minimum = minimum_classes[class_index];
+        if (minimum.ordinals.size() != 1 ||
+            !minimum.reloaded_and_validated || minimum.output_path.empty()) {
+          throw std::runtime_error(
+              "chart kary census: replay minimum is not one fully reloaded "
+              "historical witness");
+        }
+        auto const artifact_sha256 =
+            topology_score_band_artifact_sha256(minimum.output_path);
+        replay_minima.push_back({
+            .class_index = class_index,
+            .ordinal = minimum.ordinals.front(),
+            .exact_score = census.optimum,
+            .topology_sha256 = minimum.topology_sha256,
+            .canonical_dag_semantic_sha256 =
+                minimum.canonical_dag_digest.semantic_sha256,
+            .canonical_dag_clades_sha256 =
+                minimum.canonical_dag_digest.clades_sha256,
+            .canonical_dag_productions_sha256 =
+                minimum.canonical_dag_digest.productions_sha256,
+            .artifact_sha256 = artifact_sha256,
+        });
+        minimum_ledger += std::to_string(class_index) + "\t" +
+                          std::to_string(minimum.ordinals.front()) + "\t" +
+                          std::to_string(census.optimum) + "\t" +
+                          minimum.topology_sha256 + "\t" +
+                          minimum.canonical_dag_digest.semantic_sha256 +
+                          "\t" + minimum.canonical_dag_digest.clades_sha256 +
+                          "\t" +
+                          minimum.canonical_dag_digest.productions_sha256 +
+                          "\t" +
+                          std::filesystem::path(minimum.output_path)
+                              .filename()
+                              .native() +
+                          "\t" + artifact_sha256 + "\n";
+      }
+      validate_topology_score_band_replay_minima(*replay_manifest,
+                                                 replay_minima);
+      auto minimum_ledger_path =
+          a.chart_kary_census_output_prefix + ".minimum-witnesses.tsv";
+      write_no_replace_file(minimum_ledger_path, minimum_ledger);
+      std::cout << "chart_kary_census_minimum_ledger:\n";
+      std::cout << "  path: " << minimum_ledger_path << "\n";
+      std::cout << "  sha256: "
+                << topology_score_band_artifact_sha256(minimum_ledger_path)
+                << "\n";
+    }
 
     auto const audit_count =
         refinement.source_grammar_audit.grammar_tree_count_estimate;
@@ -6606,6 +6940,81 @@ int main(int argc, char** argv) try {
               << std::setprecision(3) << exact_pattern_build_ms << "\n";
     std::cout << "  census_ms: " << std::fixed << std::setprecision(3)
               << census_ms << "\n";
+    if (a.chart_kary_census_export_max_delta) {
+      if (!replay_manifest || !replay_preflight) {
+        throw std::logic_error(
+            "chart kary census: export lost replay preflight");
+      }
+      auto const delta = *a.chart_kary_census_export_max_delta;
+      if (delta > std::numeric_limits<std::uint64_t>::max() - census.optimum) {
+        throw std::runtime_error(
+            "chart kary census: optimum plus export delta overflows");
+      }
+      auto const maximum_score = census.optimum + delta;
+      auto band = project_grammar_topology_band(
+          grammar, patterns, chart_opts, std::move(census),
+          replay_manifest->score_baseline, maximum_score,
+          a.chart_kary_census_workers);
+      grammar_topology_band_export_options export_options;
+      export_options.output_directory =
+          a.chart_kary_census_export_directory;
+      export_options.semantics = {
+          .alignment_sha256 =
+              replay_manifest->semantics.alignment_sha256,
+          .ambiguity_policy = replay_manifest->semantics.ambiguity_policy,
+          .grammar_construction = replay_manifest->grammar_construction,
+          .grammar_digest = replay_manifest->semantics.grammar_digest,
+          .grammar_semantic_digest =
+              replay_manifest->semantics.grammar_semantic_digest,
+          .input_content_sha256 =
+              replay_manifest->semantics.input_content_sha256,
+          .parsimony_model = replay_manifest->semantics.parsimony_model,
+          .reference_sha256 = replay_manifest->semantics.reference_sha256,
+          .score_baseline = replay_manifest->score_baseline,
+          .site_pattern_digest =
+              replay_manifest->semantics.site_pattern_digest,
+          .taxon_labels_sha256 =
+              replay_manifest->semantics.taxon_labels_sha256,
+          .ua_scoring = replay_manifest->semantics.ua_scoring,
+          .universe = replay_manifest->universe,
+      };
+      export_options.provenance = {
+          .command = invocation,
+          .derivation_ref =
+              "replay-manifest-sha256:" +
+              replay_preflight->manifest_sha256 +
+              ";producer-source-state-sha256:" +
+              topology_score_band_artifact_sha256(
+                  a.chart_kary_census_producer_source_state),
+          .producer_commit = git_commit,
+          .producer_dirty = a.chart_kary_census_producer_dirty,
+          .producer_repository = "larch2-spectral",
+          .provider_input_sha256 =
+              replay_manifest->provider_input_sha256,
+          .provider_legacy_dag_semantic_sha256 =
+              replay_manifest->provider_legacy_dag_semantic_sha256,
+          .reference_input_sha256 =
+              replay_manifest->reference_input_sha256,
+          .seed_tree_input_sha256 =
+              replay_manifest->seed_tree_input_sha256,
+          .toolchain = __VERSION__,
+          .provider_input_path = a.dag_pbs.front(),
+          .reference_input_path = a.refseq,
+          .seed_tree_input_path = a.chart_kary_census_seed_input,
+      };
+      export_options.production_origin = "unknown";
+      auto exported = export_grammar_topology_band_raw(
+          result, grammar, patterns, chart_opts, band, export_options);
+      std::cout << "chart_kary_census_export:\n";
+      std::cout << "  output_directory: "
+                << exported.output_directory.native() << "\n";
+      std::cout << "  selected_topology_count: "
+                << exported.selected.size() << "\n";
+      std::cout << "  semantic_data_sha256: "
+                << exported.semantic_data_sha256 << "\n";
+      std::cout << "  semantics_hash: " << exported.semantics_hash << "\n";
+      std::cout << "  provenance_id: " << exported.provenance_id << "\n";
+    }
   }
 
   if (a.chart_bnb_trim) {
