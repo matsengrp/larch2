@@ -803,7 +803,8 @@ inline uint8_t base_to_one_hot(nuc_base b) {
   return static_cast<uint8_t>(1 << b.raw());
 }
 
-inline uint8_t fitch_set_from_counts(std::array<uint32_t, 4> const& counts,
+template <typename Count>
+inline uint8_t fitch_set_from_counts(std::array<Count, 4> const& counts,
                                      uint32_t num_children) {
   if (num_children == 0) return 0;
 
@@ -812,7 +813,7 @@ inline uint8_t fitch_set_from_counts(std::array<uint32_t, 4> const& counts,
   // Therefore the optimal parent states are exactly those contained in the
   // largest number of child sets.  This reduces to intersection-if-present,
   // otherwise-union for binary nodes, while also handling multifurcations.
-  uint32_t max_count = 0;
+  Count max_count = 0;
   for (auto count : counts) max_count = std::max(max_count, count);
 
   // Preserve the empty-set sentinel used by topology-update bookkeeping.

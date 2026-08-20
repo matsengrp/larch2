@@ -3882,6 +3882,10 @@ static void test_phase8_named_source_wave_stops_near_candidate_cap() {
     options.sampled_tree_count = 1;
     options.sampled_tree_spr_radius = 0;
     options.sampled_tree_score_threshold = std::numeric_limits<int>::max();
+    // The wave-stopping constants below were calibrated with root-clade
+    // moves excluded from the sampled-tree projection post-filters; keep
+    // that posture here so the historical move counts stay comparable.
+    options.include_root_moves = false;
     options.max_candidates = 256;
     options.max_candidates_is_post_dedup = true;
     options.seed = 1;
@@ -4073,6 +4077,10 @@ static void test_phase6_sampled_tree_and_hybrid_sources() {
   sampled_opts.sampled_tree_source_dag = &dag;
   sampled_opts.sampled_tree_count = 2;
   sampled_opts.max_candidates = 16;
+  // The native-move score check below validates the tree-SPR scorer on a
+  // fixed first candidate; keep the historical root-clade exclusion so the
+  // first projected candidate is an ordinary in-tree move.
+  sampled_opts.include_root_moves = false;
   auto sampled = collect_candidates(grammar, sampled_opts);
   CHECK(!sampled.empty());
   for (auto const& candidate : sampled) {

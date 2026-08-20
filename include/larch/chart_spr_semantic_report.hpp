@@ -127,7 +127,7 @@ struct chart_spr_canonical_contract {
   bool randomize_order = false;
   bool reservoir_sample = false;
   bool include_immediate_reversals = false;
-  bool include_root_moves = false;
+  bool include_root_moves = true;
   bool include_neutral_or_reversal_candidates = false;
   std::size_t sampled_tree_count = 0;
   std::size_t sampled_tree_radius = 0;

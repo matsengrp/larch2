@@ -2,6 +2,7 @@
 
 #include <larch/task.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <coroutine>
@@ -21,6 +22,34 @@
 
 namespace larch {
 
+namespace detail {
+
+// Slot of the pool-worker thread running the current task.  Pool workers
+// store their creation index here once per thread; threads that are not a
+// worker of the pool whose task they run (e.g. a caller helping out via
+// thread_pool::try_run_one) temporarily install workers_.size().  The
+// sentinel means "no pool context yet".
+constexpr std::size_t no_pool_thread_slot =
+    static_cast<std::size_t>(-1);
+
+inline std::size_t& pool_thread_slot() {
+  thread_local std::size_t slot = no_pool_thread_slot;
+  return slot;
+}
+
+// RAII guard installing a pool thread slot for the duration of a task run
+// on a thread that is not one of the pool's own workers.
+struct scoped_pool_thread_slot {
+  std::size_t saved;
+  scoped_pool_thread_slot(std::size_t slot) {
+    saved = pool_thread_slot();
+    pool_thread_slot() = slot;
+  }
+  ~scoped_pool_thread_slot() { pool_thread_slot() = saved; }
+};
+
+}  // namespace detail
+
 class thread_pool {
   std::queue<std::move_only_function<void()>> tasks_;
   std::mutex mutex_;
@@ -37,7 +66,8 @@ class thread_pool {
     n = std::max(std::size_t{1}, n);
     workers_.reserve(n);
     for (std::size_t i{0}; i < n; ++i) {
-      workers_.emplace_back([this](std::stop_token st) {
+      workers_.emplace_back([this, i](std::stop_token st) {
+        detail::pool_thread_slot() = i;
         for (;;) {
           std::move_only_function<void()> task;
           {
@@ -53,6 +83,21 @@ class thread_pool {
   }
 
   ~thread_pool() = default;
+
+  // Number of worker threads in the pool.
+  std::size_t size() const { return workers_.size(); }
+
+  // Stable slot index of the thread executing the current pool task.
+  // A pool worker reports its creation index in [0, size()); a task that
+  // runs on a non-worker thread (a caller helping via try_run_one) reports
+  // size().  The value is constant for the duration of a task, and two
+  // concurrently running tasks never share a slot, so per-slot scratch
+  // state keyed by this index is race-free.  Only meaningful while
+  // executing a task of this pool.
+  std::size_t worker_slot() const {
+    auto const slot = detail::pool_thread_slot();
+    return slot == detail::no_pool_thread_slot ? workers_.size() : slot;
+  }
 
   // Enqueue a callable, return a future for its result.
   template <typename Callable>
@@ -91,6 +136,7 @@ class thread_pool {
       task = std::move(tasks_.front());
       tasks_.pop();
     }
+    detail::scoped_pool_thread_slot slot{workers_.size()};
     task();
     return true;
   }
@@ -308,6 +354,30 @@ template <std::ranges::forward_range Range, typename Callable>
 void parallel_for_each(Range&& range, Callable&& f) {
   parallel_for_each(thread_pool::get_default(), std::forward<Range>(range),
                     std::forward<Callable>(f));
+}
+
+// --- parallel_for_each_block (chunked, worker-slot aware) ---
+
+// Partitions [0, count) into contiguous blocks of at most block_size
+// indices and runs one pool task per block, invoking f(begin, end).
+// Compared to parallel_for_each this amortizes per-task scheduling
+// overhead over many elements and lets callers keep pool-affine scratch
+// alive for a whole block (key it by pool.worker_slot()).
+template <typename Callable>
+void parallel_for_each_block(thread_pool& pool, std::size_t count,
+                             std::size_t block_size, Callable&& f) {
+  if (count == 0) return;
+  if (block_size == 0) block_size = 1;
+  std::vector<std::pair<std::size_t, std::size_t>> blocks;
+  blocks.reserve((count + block_size - 1) / block_size);
+  for (std::size_t begin = 0; begin < count; begin += block_size) {
+    blocks.emplace_back(begin, std::min(begin + block_size, count));
+  }
+  parallel_for_each(
+      pool, blocks,
+      [&f](std::pair<std::size_t, std::size_t> const& block) {
+        f(block.first, block.second);
+      });
 }
 
 }  // namespace larch

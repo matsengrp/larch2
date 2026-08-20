@@ -827,8 +827,8 @@ static void test_parallel_tree_index() {
              par_idx.get_allele_union(nid, i));
       if (seq_idx.has_child_counts(nid)) {
         assert(par_idx.has_child_counts(nid));
-        auto& sc = seq_idx.get_child_counts(nid, i);
-        auto& pc = par_idx.get_child_counts(nid, i);
+        auto sc = seq_idx.get_child_counts(nid, i);
+        auto pc = par_idx.get_child_counts(nid, i);
         assert(sc == pc);
       }
     }

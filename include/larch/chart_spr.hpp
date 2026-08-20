@@ -277,7 +277,12 @@ struct grammar_spr_enumeration_options {
   std::size_t max_target_clade_size = 0;
   std::size_t max_estimated_affected_clades = 0;
 
-  bool include_root_moves = false;
+  // Root-clade SPR moves (moving the root clade, or re-attaching a moved
+  // clade as the root's sibling) are enabled by default: measured viral-dag
+  // campaigns show real score gains from root-neighborhood moves.  Callers
+  // can disable them via the enumeration options (dagutil exposes
+  // --chart-spr-include-root-moves <0|1>).
+  bool include_root_moves = true;
   bool include_neutral_or_reversal_candidates = false;
   bool include_immediate_reversal_candidates = false;
   chart_spr_candidate_source source = chart_spr_candidate_source::grammar;

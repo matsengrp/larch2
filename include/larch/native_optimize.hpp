@@ -10,10 +10,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <numeric>
 #include <queue>
 #include <random>
 #include <set>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -82,6 +85,16 @@ struct scratch_buffers {
   std::vector<uint8_t> prev_new_fitch;
   src_removal_result removal;
 
+  // Dirty-site work lists for compute_move_score_cached's upward walk.  A
+  // site whose carried old/new child sets are equal is a provable no-op at
+  // that level and at every level above it, so the walk only visits the
+  // (typically small) set of sites that can still change anything.  All
+  // lists hold ascending site indices.
+  std::vector<uint32_t> dirty;         // sites that may still differ
+  std::vector<uint32_t> next_dirty;    // scratch for the next level
+  std::vector<uint32_t> node_dirty;    // merged per-node work list
+  std::vector<uint32_t> removal_dirty;  // sites where removal old/new differ
+
   void resize(std::size_t n_sites) {
     new_node_fitch.resize(n_sites);
     prev_old_fitch.resize(n_sites);
@@ -95,16 +108,32 @@ struct scratch_buffers {
 // ============================================================================
 // base_to_one_hot and fitch_set_from_counts are defined in compute.hpp
 
-inline int fitch_cost_from_counts(std::array<uint32_t, 4> const& counts,
+template <typename Count>
+inline int fitch_cost_from_counts(std::array<Count, 4> const& counts,
                                   uint32_t num_children) {
   if (num_children <= 1) return 0;
 
-  uint32_t max_count = 0;
+  Count max_count = 0;
   for (auto count : counts) max_count = std::max(max_count, count);
 
   // Choosing a state present in max_count child optimal-state sets changes
   // the edge to each of the remaining children.
   return static_cast<int>(num_children) - static_cast<int>(max_count);
+}
+
+// Narrow child-count storage guard: counts are bounded by node arity, and
+// any topology whose arity exceeds this bound is rejected at build time
+// instead of being silently truncated.
+inline constexpr uint32_t k_max_counted_children =
+    std::numeric_limits<uint16_t>::max();
+
+inline void assert_child_count_representable(uint32_t num_children) {
+  if (num_children > k_max_counted_children) {
+    throw std::length_error(
+        "tree_index: node arity " + std::to_string(num_children) +
+        " exceeds the packed child-count representation limit " +
+        std::to_string(k_max_counted_children));
+  }
 }
 
 inline std::size_t compute_tree_max_depth(phylo_dag& d) {
@@ -187,9 +216,13 @@ class tree_index {
     return &fitch_sets_[node * num_variable_sites_];
   }
 
-  std::array<uint32_t, 4> const& get_child_counts(std::size_t node,
-                                                  std::size_t site_idx) const {
-    return child_counts_[node * num_variable_sites_ + site_idx];
+  // Child-count rows are stored packed (4 x uint16 per site) to halve the
+  // memory traffic of the move-enumeration hot loops; values are bounded by
+  // node arity and guarded by assert_child_count_representable().
+  std::array<uint32_t, 4> get_child_counts(std::size_t node,
+                                            std::size_t site_idx) const {
+    auto const& counts = child_counts_[node * num_variable_sites_ + site_idx];
+    return {counts[0], counts[1], counts[2], counts[3]};
   }
 
   bool has_child_counts(std::size_t node) const {
@@ -441,6 +474,7 @@ class tree_index {
            "recompute_node_fitch must not be called on a leaf node");
     auto& children = children_[node_id];
     uint32_t nc = static_cast<uint32_t>(children.size());
+    assert_child_count_representable(nc);
     num_children_[node_id] = nc;
     has_child_counts_[node_id] = true;
     std::size_t base = node_id * num_variable_sites_;
@@ -454,7 +488,10 @@ class tree_index {
           if (cf & (1 << j)) counts[j]++;
         au |= allele_union_[child * num_variable_sites_ + i];
       }
-      child_counts_[base + i] = counts;
+      child_counts_[base + i] = {static_cast<uint16_t>(counts[0]),
+                                 static_cast<uint16_t>(counts[1]),
+                                 static_cast<uint16_t>(counts[2]),
+                                 static_cast<uint16_t>(counts[3])};
       fitch_sets_[base + i] = fitch_set_from_counts(counts, nc);
       allele_union_[base + i] = au;
     }
@@ -473,6 +510,7 @@ class tree_index {
            "recompute_node_fitch_tracked must not be called on a leaf node");
     auto& children = children_[node_id];
     uint32_t nc = static_cast<uint32_t>(children.size());
+    assert_child_count_representable(nc);
     uint32_t old_nc = num_children_[node_id];
     num_children_[node_id] = nc;
     has_child_counts_[node_id] = true;
@@ -498,7 +536,10 @@ class tree_index {
       uint8_t new_fitch = fitch_set_from_counts(counts, nc);
       int new_cost = fitch_cost_from_counts(counts, nc);
 
-      child_counts_[base + i] = counts;
+      child_counts_[base + i] = {static_cast<uint16_t>(counts[0]),
+                                 static_cast<uint16_t>(counts[1]),
+                                 static_cast<uint16_t>(counts[2]),
+                                 static_cast<uint16_t>(counts[3])};
       fitch_sets_[base + i] = new_fitch;
       allele_union_[base + i] = au;
 
@@ -1018,6 +1059,7 @@ class tree_index {
 
       has_child_counts_[node_id] = true;
       uint32_t nc = static_cast<uint32_t>(children.size());
+      assert_child_count_representable(nc);
       num_children_[node_id] = nc;
 
       for (std::size_t i = 0; i < num_variable_sites_; i++) {
@@ -1085,6 +1127,7 @@ class tree_index {
     // Compute this node's Fitch data from children
     has_child_counts_[node_id] = true;
     uint32_t nc = static_cast<uint32_t>(children.size());
+    assert_child_count_representable(nc);
     num_children_[node_id] = nc;
 
     for (std::size_t i = 0; i < num_variable_sites_; i++) {
@@ -1133,7 +1176,7 @@ class tree_index {
   std::vector<uint8_t> has_dfs_info_;
   std::vector<uint8_t> is_valid_;
   std::vector<uint8_t> fitch_sets_;
-  std::vector<std::array<uint32_t, 4>> child_counts_;
+  std::vector<std::array<uint16_t, 4>> child_counts_;
   std::vector<uint8_t> has_child_counts_;
   std::vector<uint32_t> num_children_;
   std::vector<uint8_t> allele_union_;
@@ -1148,6 +1191,9 @@ class tree_index {
 // ============================================================================
 // move_enumerator: Bounded search for profitable SPR moves
 // ============================================================================
+
+
+
 
 class move_enumerator {
  public:
@@ -1402,7 +1448,7 @@ class move_enumerator {
 
       auto const* sibling_fitch = index_.get_fitch_set_ptr(sibling);
       for (std::size_t si = 0; si < n_sites; si++) {
-        auto& counts = index_.get_child_counts(src_parent, si);
+        auto counts = index_.get_child_counts(src_parent, si);
         uint32_t nc = index_.get_num_children(src_parent);
         result.score_change -= fitch_cost_from_counts(counts, nc);
         result.old_fitch[si] = src_parent_fitch[si];
@@ -1446,11 +1492,21 @@ class move_enumerator {
     uint32_t nc = index_.get_num_children(current_lca);
 
     for (std::size_t si = 0; si < n_sites; si++) {
-      auto counts = index_.get_child_counts(current_lca, si);
-      int old_cost = fitch_cost_from_counts(counts, nc);
-
       uint8_t old_child_f = removal.old_fitch[si];
       uint8_t new_child_f = removal.new_fitch[si];
+
+      // No-op fast path: an unchanged src-side set leaves the counts row,
+      // the node cost and the node's Fitch set exactly as they are, so the
+      // propagated pair is simply the node's current set.  Exact, not
+      // approximate.
+      if (old_child_f == new_child_f) {
+        removal.old_fitch[si] = lca_fitch[si];
+        removal.new_fitch[si] = lca_fitch[si];
+        continue;
+      }
+
+      auto counts = index_.get_child_counts(current_lca, si);
+      int old_cost = fitch_cost_from_counts(counts, nc);
 
       for (int j = 0; j < 4; j++) {
         if (old_child_f & (1 << j)) {
@@ -1510,12 +1566,20 @@ class move_enumerator {
     int total = removal.score_change;
 
     auto& new_node_fitch = scratch.new_node_fitch;
+    auto& dirty = scratch.dirty;
+    auto& next_dirty = scratch.next_dirty;
+    auto& node_dirty = scratch.node_dirty;
+    dirty.clear();
     for (std::size_t si = 0; si < n_sites; si++) {
       uint8_t sf = src_fitch_ptr[si];
       uint8_t df = dst_fitch_ptr[si];
       uint8_t inter = sf & df;
-      new_node_fitch[si] = inter ? inter : (sf | df);
+      uint8_t nn = inter ? inter : (sf | df);
+      new_node_fitch[si] = nn;
       total += inter ? 0 : 1;
+      // The first path node swaps dst's set for the moved node's set; only
+      // sites where those differ can ever change anything on the walk.
+      if (nn != df) dirty.push_back(static_cast<uint32_t>(si));
     }
 
     auto& prev_old_fitch = scratch.prev_old_fitch;
@@ -1532,20 +1596,84 @@ class move_enumerator {
             is_lca ? static_cast<uint32_t>(static_cast<int>(nc) +
                                            removal.lca_nc_adjustment)
                    : nc;
+        bool arity_adjusted = is_lca && effective_nc != nc;
 
-        for (std::size_t si = 0; si < n_sites; si++) {
-          auto counts = index_.get_child_counts(node, si);
-          int old_cost = fitch_cost_from_counts(counts, nc);
+        // Visit only the sites that can change something at this node.
+        // Away from the LCA the carried dirty list is complete.  At the LCA
+        // the src-side removal can additionally wake clean sites, so visit
+        // the union; a nonzero arity adjustment shifts the node cost at
+        // every site, so the whole row must be visited.  A site that is
+        // visited but was never carried has equal old/new child sets by
+        // construction (its carried pair was last written equal), so its
+        // child-swap contributes exactly nothing.
+        next_dirty.clear();
+        std::size_t di = 0;
+        auto const& rd = scratch.removal_dirty;
+        std::size_t ri = 0;
+        auto for_each_work_site = [&](auto&& visit) {
+          if (arity_adjusted) {
+            // Full row: walk the dirty cursor alongside the site index so
+            // carried sites are recognized.
+            for (std::size_t si = 0; si < n_sites; si++) {
+              while (di < dirty.size() && dirty[di] < si) ++di;
+              bool carried = di < dirty.size() && dirty[di] == si;
+              visit(static_cast<uint32_t>(si), carried);
+            }
+          } else if (is_lca) {
+            while (di < dirty.size() || ri < rd.size()) {
+              uint32_t si;
+              bool carried;
+              if (di < dirty.size() &&
+                  (ri >= rd.size() || dirty[di] <= rd[ri])) {
+                si = dirty[di];
+                carried = true;
+                if (ri < rd.size() && rd[ri] == si) ++ri;
+                ++di;
+              } else {
+                si = rd[ri];
+                carried = false;
+                ++ri;
+              }
+              visit(si, carried);
+            }
+          } else {
+            for (uint32_t si : dirty) visit(si, true);
+          }
+        };
 
+        for_each_work_site([&](uint32_t si, bool carried) {
           uint8_t old_child_f;
           uint8_t new_child_f;
           if (is_first) {
             old_child_f = dst_fitch_ptr[si];
             new_child_f = new_node_fitch[si];
-          } else {
+          } else if (carried) {
             old_child_f = prev_old_fitch[si];
             new_child_f = prev_new_fitch[si];
+          } else {
+            // Never carried this call: its old/new child sets were last
+            // written equal, so the child swap is exactly a no-op.  Any
+            // equal pair reproduces that; only the removal adjustment (or
+            // arity shift) can change anything at this site.
+            old_child_f = 0;
+            new_child_f = 0;
           }
+
+          // No-op fast path: when the swapped child keeps an identical
+          // optimal-state set (and, at the LCA, the src-side removal is
+          // unchanged and the arity adjustment is zero), the counts row,
+          // this node's Fitch cost and its Fitch set are all exactly what
+          // they were before the move.  Only the carried child sets for
+          // the next level need updating.  This is exact, not approximate.
+          if (old_child_f == new_child_f && !arity_adjusted &&
+              (!is_lca || removal_old[si] == removal_new[si])) {
+            prev_old_fitch[si] = node_fitch_ptr[si];
+            prev_new_fitch[si] = node_fitch_ptr[si];
+            return;
+          }
+
+          auto counts = index_.get_child_counts(node, si);
+          int old_cost = fitch_cost_from_counts(counts, nc);
 
           for (int j = 0; j < 4; j++) {
             if (old_child_f & (1 << j)) {
@@ -1570,7 +1698,11 @@ class move_enumerator {
 
           prev_old_fitch[si] = node_fitch_ptr[si];
           prev_new_fitch[si] = fitch_set_from_counts(counts, effective_nc);
-        }
+          if (prev_new_fitch[si] != prev_old_fitch[si]) {
+            next_dirty.push_back(si);
+          }
+        });
+        dirty.swap(next_dirty);
       }
 
       nodes_remaining--;
@@ -1580,13 +1712,9 @@ class move_enumerator {
         return total;
       }
 
-      bool fitch_changed = false;
-      for (std::size_t si = 0; si < n_sites; si++) {
-        if (prev_old_fitch[si] != prev_new_fitch[si]) {
-          fitch_changed = true;
-          break;
-        }
-      }
+      // Equivalent to scanning prev_old_fitch vs prev_new_fitch: a site
+      // enters the carried list exactly when those differ.
+      bool fitch_changed = !dirty.empty();
 
       bool is_current_lca = (node == lca);
 
@@ -1595,7 +1723,7 @@ class move_enumerator {
 
       if (node == index_.get_tree_root()) {
         auto const* ref_alleles = index_.get_ref_alleles_ptr();
-        for (std::size_t si = 0; si < n_sites; si++) {
+        for (uint32_t si : dirty) {
           uint8_t old_f = prev_old_fitch[si];
           uint8_t new_f = prev_new_fitch[si];
           if (old_f != new_f) {
@@ -1618,6 +1746,14 @@ class move_enumerator {
                                 src_removal_result const& removal) const {
     scratch_buffers scratch;
     scratch.resize(index_.num_variable_sites());
+    // Rebuild the removal-dirty site list for callers that did not go
+    // through find_moves_for_source's maintained scratch.
+    scratch.removal_dirty.clear();
+    for (std::size_t si = 0; si < index_.num_variable_sites(); si++) {
+      if (removal.old_fitch[si] != removal.new_fitch[si]) {
+        scratch.removal_dirty.push_back(static_cast<uint32_t>(si));
+      }
+    }
     return compute_move_score_cached(src, dst, lca, removal, scratch);
   }
 
@@ -1650,14 +1786,34 @@ class move_enumerator {
     auto& searchable = index_.get_searchable_nodes();
     std::vector<std::vector<profitable_move>> per_source(searchable.size());
 
-    std::vector<std::size_t> indices(searchable.size());
-    std::iota(indices.begin(), indices.end(), std::size_t{0});
+    auto const count = searchable.size();
+    if (count == 0) return;
 
-    parallel_for_each(pool, indices, [&](std::size_t i) {
-      find_moves_for_source(
-          searchable[i], radius,
-          [&](profitable_move const& m) { per_source[i].push_back(m); });
-    });
+    // One pool-affine scratch_buffers per worker slot (workers plus the
+    // helping-caller slot), reused across every source node that slot
+    // visits instead of being rebuilt per source node.  Each pool task
+    // covers a contiguous block of source nodes, amortizing scheduling
+    // overhead; results land in per-source vectors that are drained in
+    // searchable order below, so the emitted move sequence is identical
+    // to the one-task-per-source version regardless of scheduling.
+    auto const slots = pool.size() + 1;
+    std::vector<scratch_buffers> scratch(slots);
+    // Aim for a handful of blocks per worker so stragglers (small subtrees
+    // finish fast) still balance across the pool.
+    constexpr std::size_t blocks_per_slot = 8;
+    auto const block_size = std::max<std::size_t>(
+        1, (count + slots * blocks_per_slot - 1) / (slots * blocks_per_slot));
+
+    parallel_for_each_block(
+        pool, count, block_size, [&](std::size_t begin, std::size_t end) {
+          auto& slot_scratch = scratch[pool.worker_slot()];
+          for (std::size_t i = begin; i < end; ++i) {
+            find_moves_for_source(
+                searchable[i], radius,
+                [&](profitable_move const& m) { per_source[i].push_back(m); },
+                slot_scratch);
+          }
+        });
 
     for (auto& v : per_source)
       for (auto& m : v) callback(m);
@@ -1697,11 +1853,24 @@ class move_enumerator {
     src_removal_result& removal = scratch.removal;
     removal.score_change = 0;
     removal.lca_nc_adjustment = -1;
+    auto& removal_dirty = scratch.removal_dirty;
+    removal_dirty.clear();
     auto const* src_fitch = index_.get_fitch_set_ptr(src);
     for (std::size_t si = 0; si < n_sites; si++) {
       removal.old_fitch[si] = src_fitch[si];
       removal.new_fitch[si] = 0;
+      if (src_fitch[si] != 0) {
+        removal_dirty.push_back(static_cast<uint32_t>(si));
+      }
     }
+    auto refresh_removal_dirty = [&]() {
+      removal_dirty.clear();
+      for (std::size_t si = 0; si < n_sites; si++) {
+        if (removal.old_fitch[si] != removal.new_fitch[si]) {
+          removal_dirty.push_back(static_cast<uint32_t>(si));
+        }
+      }
+    };
 
     auto current = index_.get_parent(src);
     auto prev = src;
@@ -1727,6 +1896,7 @@ class move_enumerator {
         compute_initial_removal(src, removal);
       else
         propagate_removal_upward(current, removal);
+      refresh_removal_dirty();
 
       prev = current;
       current = index_.get_parent(current);
@@ -1739,6 +1909,7 @@ class move_enumerator {
 };
 
 // ============================================================================
+
 // Tree cloning and SPR move application
 // ============================================================================
 

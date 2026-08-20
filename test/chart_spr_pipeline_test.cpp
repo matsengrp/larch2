@@ -254,6 +254,9 @@ larch::chart_spr_search_options semantic_case_options(
   options.cache.candidate_batch_size = 2;
   options.max_candidates_per_iteration = 12;
   options.enumeration.max_candidates = 12;
+  // The calibrated per-iteration candidate counts below assume root-clade
+  // moves stay excluded from the grammar-source post-filters.
+  options.enumeration.include_root_moves = false;
   options.enumeration.source = source;
   options.enumeration.sampled_tree_count = 2;
   options.enumeration.randomize_order = true;

@@ -1377,6 +1377,10 @@ Analysis:
   --chart-spr-include-immediate-reversals
                           Do not suppress the taxon-key reverse of the
                           immediately previous accepted chart-SPR move
+  --chart-spr-include-root-moves <0|1>
+                          Include root-clade SPR moves (moving the root
+                          clade or reattaching under the root) in grammar-
+                          native candidate enumeration (default 1)
   --chart-spr-sampled-tree-count <N>
                           Number of representative grammar trees to project in
                           sampled-tree/hybrid source modes (default 1)
@@ -1706,6 +1710,16 @@ static std::size_t parse_positive_size_token_strict(
                              " value must be positive");
   }
   return value;
+}
+
+static bool parse_bool_0_1_token_strict(std::string_view token,
+                                        std::string_view arg_name) {
+  auto const value = parse_size_token_strict(token, arg_name);
+  if (value > 1) {
+    throw std::runtime_error(std::string{arg_name} + " value '" +
+                             std::string{token} + "' must be 0 or 1");
+  }
+  return value == 1;
 }
 
 static int parse_int_token_strict(std::string_view token,
@@ -2101,6 +2115,9 @@ static args parse_args(int argc, char** argv) {
       a.chart_spr_enumeration.reservoir_sample = true;
     } else if (arg == "--chart-spr-include-immediate-reversals") {
       a.chart_spr_enumeration.include_immediate_reversal_candidates = true;
+    } else if (arg == "--chart-spr-include-root-moves") {
+      a.chart_spr_enumeration.include_root_moves =
+          parse_bool_0_1_token_strict(next(), "--chart-spr-include-root-moves");
     } else if (arg == "--chart-spr-sampled-tree-count") {
       a.chart_spr_enumeration.sampled_tree_count =
           parse_size_token_strict(next(), "--chart-spr-sampled-tree-count");
@@ -4739,6 +4756,9 @@ static void run_chart_spr_search_diagnostic(
   out << "  include_immediate_reversals: "
       << (options.enumeration.include_immediate_reversal_candidates ? "true"
                                                                     : "false")
+      << "\n";
+  out << "  include_root_moves: "
+      << (options.enumeration.include_root_moves ? "true" : "false")
       << "\n";
   out << "  max_upward_path_expansions: "
       << options.enumeration.max_upward_path_expansions << "\n";
