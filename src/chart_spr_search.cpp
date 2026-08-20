@@ -8687,8 +8687,48 @@ std::uint64_t chart_spr_external_dag_parsimony(phylo_dag& dag) {
   return scorer.compute_weight_below(get_root_idx(dag), ops);
 }
 
+// Pool-parallel equivalent of score_selected_topology for the additive
+// path.  The per-pattern restricted rows are independent pure computations,
+// and the ordered serial accumulation below reproduces the reference
+// implementation's checked addition sequence exactly, so the returned score
+// is bit-identical to the serial scorer's.
+std::uint64_t chart_spr_additive_score_selected_topology_parallel(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    rank3_topology const& topology, chart_options const& options,
+    thread_pool& pool) {
+  std::uint64_t total =
+      chart_multisite_detail::invariant_constant_offset(patterns, options);
+  std::vector<std::size_t> active_indices;
+  active_indices.reserve(patterns.patterns.size());
+  for (std::size_t pattern_index = 0;
+       pattern_index < patterns.patterns.size(); ++pattern_index) {
+    auto const& pattern = patterns.patterns[pattern_index];
+    if (options.score_ua_edge) {
+      chart_multisite_detail::validate_pattern_reference_counts(pattern,
+                                                               pattern_index);
+    }
+    if (chart_multisite_detail::is_active_pattern(pattern)) {
+      active_indices.push_back(pattern_index);
+    }
+  }
+  std::vector<std::uint64_t> pattern_scores(patterns.patterns.size(), 0);
+  parallel_for_each(pool, active_indices, [&](std::size_t pattern_index) {
+    auto const& pattern = patterns.patterns[pattern_index];
+    auto row = chart_multisite_detail::restricted_topology_row(grammar,
+                                                               pattern,
+                                                               topology);
+    pattern_scores[pattern_index] = chart_spr_weighted_root_score_from_row(
+        row, pattern, options);
+  });
+  for (auto pattern_index : active_indices) {
+    total = chart_multisite_detail::checked_add_u64(
+        total, pattern_scores[pattern_index], "selected topology score");
+  }
+  return total;
+}
+
 chart_spr_additive_tree_score_evidence chart_spr_exact_selected_tree_parsimony(
-    phylo_dag& tree, chart_options const& options) {
+    phylo_dag& tree, chart_options const& options, thread_pool& pool) {
   build_clade_offsets(tree);
   auto grammar = build_clade_grammar(
       tree, clade_grammar_options{.allow_polytomies = true});
@@ -8696,8 +8736,8 @@ chart_spr_additive_tree_score_evidence chart_spr_exact_selected_tree_parsimony(
   auto topology = first_rank3_topology(grammar);
 
   chart_spr_additive_tree_score_evidence evidence;
-  evidence.score =
-      score_selected_topology(grammar, patterns, topology, options);
+  evidence.score = chart_spr_additive_score_selected_topology_parallel(
+      grammar, patterns, topology, options, pool);
   evidence.grammar_max_arity = clade_grammar_max_production_arity(grammar);
   evidence.active_pattern_count = patterns.patterns.size();
   for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
@@ -8805,7 +8845,7 @@ chart_spr_search_result run_chart_spr_additive_batch_union_search(
     build_clade_offsets(sampled);
 
     auto const sampled_exact =
-        chart_spr_exact_selected_tree_parsimony(sampled, options.chart);
+        chart_spr_exact_selected_tree_parsimony(sampled, options.chart, pool);
     iteration.batch_sampled_tree_exact_chart_score = sampled_exact.score;
     iteration.batch_sampled_tree_external_score =
         chart_spr_external_dag_parsimony(sampled);
@@ -8853,10 +8893,34 @@ chart_spr_search_result run_chart_spr_additive_batch_union_search(
 
     auto projection = chart_spr_detail::prepare_sampled_tree_projection(
         current_grammar, sampled);
+    // The per-move projection calls are independent (the prepared context is
+    // immutable before-side state and every call owns its workspace), so the
+    // dominant per-move projection work runs on the pool while the counters
+    // and candidate order are folded below in the historical deterministic
+    // visit order.
+    struct projected_move_slot {
+      std::optional<grammar_spr_candidate> candidate;
+      std::size_t source_parent_arity = 0;
+    };
+    std::vector<projected_move_slot> projected_slots(retained_moves.size());
+    std::vector<std::size_t> projection_indices(retained_moves.size());
+    std::iota(projection_indices.begin(), projection_indices.end(),
+              std::size_t{0});
+    parallel_for_each(pool, projection_indices, [&](std::size_t move_index) {
+      auto const& move = retained_moves[move_index];
+      projected_move_slot slot;
+      slot.candidate = project_tree_spr_move_to_candidate(projection, move);
+      if (slot.candidate) {
+        auto const source_parent = index.get_parent(move.src);
+        slot.source_parent_arity =
+            static_cast<std::size_t>(index.get_num_children(source_parent));
+      }
+      projected_slots[move_index] = std::move(slot);
+    });
     std::vector<grammar_spr_candidate> projected_candidates;
     projected_candidates.reserve(retained_moves.size());
-    for (auto const& move : retained_moves) {
-      auto candidate = project_tree_spr_move_to_candidate(projection, move);
+    for (auto& slot : projected_slots) {
+      auto candidate = std::move(slot.candidate);
       if (!candidate) {
         ++iteration.candidate_generation.candidates_pruned_after_construction;
         ++iteration.candidate_generation.candidates_pruned_invalid;
@@ -8872,12 +8936,9 @@ chart_spr_search_result run_chart_spr_additive_batch_union_search(
       ++iteration.batch_moves_projected;
       ++iteration.candidate_generation.candidates_constructed;
       ++iteration.candidate_generation.candidates_generated_after_dedup;
-      auto const source_parent = index.get_parent(move.src);
-      auto const source_parent_arity =
-          static_cast<std::size_t>(index.get_num_children(source_parent));
       iteration.batch_max_source_parent_arity = std::max(
-          iteration.batch_max_source_parent_arity, source_parent_arity);
-      if (source_parent_arity > 2) {
+          iteration.batch_max_source_parent_arity, slot.source_parent_arity);
+      if (slot.source_parent_arity > 2) {
         ++iteration.batch_multifurcating_moves_projected;
         ++iteration.candidate_generation.spr_multifurcation_moves_generated;
       }
@@ -8930,9 +8991,14 @@ chart_spr_search_result run_chart_spr_additive_batch_union_search(
       // The complete fragment is built from the projected candidate's exact
       // after-topology certificate, rather than independently replaying its
       // raw source move. Materialization only reads `sampled`, and every
-      // worker owns a distinct output slot.
+      // worker owns a distinct output slot.  The fragment tree itself skips
+      // its standalone structural validation pass: the after-topology was
+      // validated above, and the tentative-union plus accepted-output DAG
+      // validations below are the structural certificate for every node and
+      // edge that reaches the accepted state, so a per-fragment validate_dag
+      // would re-check shapes the union pass checks again.
       fragments[index_value] = materialize_rank3_tree_from_topology(
-          sampled, materialized.grammar, after_topology, true, 0.0F);
+          sampled, materialized.grammar, after_topology, false, 0.0F);
     });
     iteration.batch_fragments_materialized = fragments.size();
     iteration.batch_candidate_certificates_materialized = fragments.size();
@@ -8962,7 +9028,7 @@ chart_spr_search_result run_chart_spr_additive_batch_union_search(
     build_clade_offsets(witness);
 
     auto const witness_exact =
-        chart_spr_exact_selected_tree_parsimony(witness, options.chart);
+        chart_spr_exact_selected_tree_parsimony(witness, options.chart, pool);
     iteration.batch_exact_witness_chart_score = witness_exact.score;
     iteration.batch_exact_witness_external_score =
         chart_spr_external_dag_parsimony(witness);

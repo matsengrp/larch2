@@ -3873,7 +3873,8 @@ static void test_phase8_named_source_wave_stops_near_candidate_cap() {
     std::vector<larch::grammar_spr_candidate> candidates;
     larch::chart_spr_candidate_generation_stats stats;
   };
-  auto run = [&](std::size_t workers, std::size_t diagnostic_wave_size = 0) {
+  auto run = [&](std::size_t workers, std::size_t diagnostic_wave_size = 0,
+                 bool include_root_moves = false) {
     auto scheduler = make_projection_scheduler(workers);
     std::latch adaptive_first_wave_started{4};
     larch::grammar_spr_enumeration_options options;
@@ -3884,15 +3885,17 @@ static void test_phase8_named_source_wave_stops_near_candidate_cap() {
     options.sampled_tree_score_threshold = std::numeric_limits<int>::max();
     // The wave-stopping constants below were calibrated with root-clade
     // moves excluded from the sampled-tree projection post-filters; keep
-    // that posture here so the historical move counts stay comparable.
-    options.include_root_moves = false;
+    // that posture (the default argument) so the historical move counts
+    // stay comparable.  The root-move-included constants are pinned
+    // separately after the historical block below.
+    options.include_root_moves = include_root_moves;
     options.max_candidates = 256;
     options.max_candidates_is_post_dedup = true;
     options.seed = 1;
     options.sampled_tree_projection_scheduler = &scheduler;
     options.sampled_tree_source_finite_wave_size_for_diagnostics =
         diagnostic_wave_size;
-    if (workers == 8 && diagnostic_wave_size == 0) {
+    if (workers == 8 && diagnostic_wave_size == 0 && !include_root_moves) {
       options.before_sampled_tree_source_enumeration_for_tests =
           [&](std::size_t source_ordinal, std::size_t) {
             if (source_ordinal >= 4) return;
@@ -3935,6 +3938,68 @@ static void test_phase8_named_source_wave_stops_near_candidate_cap() {
   auto const fixed_w2 = run(8, 2);
   auto const fixed_w4 = run(8, 4);
   auto const fixed_w8 = run(8, 8);
+
+  // Root-move-included posture (the production default since root-clade
+  // moves were enabled).  Numbers measured on ae551d1 by running this
+  // binary with a temporary dump of the same stats fields (observed:
+  // W1 sources=3 preassigned=270 subwave=4 peak=4 admitted=1 peak_src=1
+  // full_waves=3 speculative_discarded=11; adaptive W8 sources=4
+  // preassigned=405 subwave=512 peak=405 admitted=8 peak_src=4
+  // adaptive_initial=4 widenings=0 full_waves=0 ranges=4 hwm=4
+  // speculative_discarded=146 speculative_sources_discarded=1
+  // projection waves=1 scheduler_ops=2 parallel_ops=2 ranges=32+405
+  // worker_tasks=8+8).  Unlike the root-move-excluded posture, the serial
+  // and 8-worker source waves stop after different source prefixes (root
+  // moves add candidates per source), so the legacy stats-equality oracle
+  // does not apply; the candidate payloads themselves remain identical.
+  {
+    auto const w1_root = run(1, 0, true);
+    auto const adaptive_w8_root = run(8, 0, true);
+    CHECK(w1_root.stats.sampled_tree_sources_enumerated == 3);
+    CHECK(w1_root.stats.sampled_tree_projection_moves_preassigned == 270);
+    CHECK(w1_root.stats.sampled_tree_projection_admitted_subwave_width == 4);
+    CHECK(w1_root.stats.sampled_tree_projection_peak_wave_size == 4);
+    CHECK(w1_root.stats.sampled_tree_source_admitted_wave_width == 1);
+    CHECK(w1_root.stats.sampled_tree_source_peak_wave_size == 1);
+    CHECK(w1_root.stats.sampled_tree_source_full_width_waves == 3);
+    CHECK(w1_root.stats.sampled_tree_source_speculative_moves_discarded ==
+          11);
+    CHECK(adaptive_w8_root.stats.sampled_tree_sources_enumerated == 4);
+    CHECK(adaptive_w8_root.stats.sampled_tree_projection_moves_preassigned ==
+          405);
+    CHECK(adaptive_w8_root.stats.sampled_tree_projection_admitted_subwave_width ==
+          8 * 64);
+    CHECK(adaptive_w8_root.stats.sampled_tree_projection_peak_wave_size ==
+          405);
+    CHECK(adaptive_w8_root.stats.sampled_tree_source_admitted_wave_width ==
+          8);
+    CHECK(adaptive_w8_root.stats.sampled_tree_source_peak_wave_size == 4);
+    CHECK(adaptive_w8_root.stats.sampled_tree_source_adaptive_initial_wave_width ==
+          4);
+    CHECK(adaptive_w8_root.stats.sampled_tree_source_adaptive_widenings == 0);
+    CHECK(adaptive_w8_root.stats.sampled_tree_source_full_width_waves == 0);
+    CHECK(adaptive_w8_root.stats.sampled_tree_source_enumeration_ranges >= 4);
+    CHECK(adaptive_w8_root.stats
+              .sampled_tree_source_enumeration_active_worker_high_water >= 4);
+    CHECK(adaptive_w8_root.stats
+              .sampled_tree_source_speculative_moves_discarded == 146);
+    CHECK(adaptive_w8_root.stats
+              .sampled_tree_source_speculative_sources_discarded == 1);
+    CHECK(adaptive_w8_root.stats.sampled_tree_projection_waves == 1);
+    CHECK(adaptive_w8_root.stats.sampled_tree_projection_scheduler_operations ==
+          2);
+    CHECK(adaptive_w8_root.stats.sampled_tree_projection_parallel_operations ==
+          2);
+    CHECK(adaptive_w8_root.stats.sampled_tree_projection_ranges ==
+          32 + 405);
+    CHECK(adaptive_w8_root.stats.sampled_tree_projection_worker_tasks ==
+          8 + 8);
+    CHECK(adaptive_w8_root.candidates.size() == w1_root.candidates.size());
+    for (std::size_t i = 0; i < w1_root.candidates.size(); ++i) {
+      check_candidate_payload_equal(grammar, w1_root.candidates[i],
+                                    adaptive_w8_root.candidates[i]);
+    }
+  }
   auto check_same_canonical_result = [&](run_result const& actual) {
     CHECK(actual.candidates.size() == w1.candidates.size());
     check_legacy_generation_stats_equal(actual.stats, w1.stats);
@@ -4157,6 +4222,49 @@ static void test_phase6_sampled_tree_and_hybrid_sources() {
   CHECK(pre_cap_stats.stop_reason ==
         larch::chart_spr_candidate_stop_reason::candidate_cap);
   CHECK(pre_cap_stats.candidates_constructed <= 1);
+
+  // Root-move-included posture (the production default).  Numbers measured
+  // on ae551d1 by running this binary with a temporary print of the same
+  // fields (observed: size=16; first projected move src=2 dst=6 with
+  // score_change=1 while apply+rescore gives 1->1, i.e. delta 0).  The
+  // divergence is expected: the native sampled-tree estimate treats the
+  // root-sibling attachment edge as a real reattachment, whereas applying
+  // that move to the representative tree is score-neutral here; estimates
+  // never gate acceptance (exact verification does), which is why the
+  // parity identity above is asserted only for the root-move-excluded
+  // first candidate.
+  {
+    auto root_opts = sampled_opts;
+    root_opts.include_root_moves = true;
+    auto sampled_root = collect_candidates(grammar, root_opts);
+    CHECK(sampled_root.size() == 16);
+    CHECK(!sampled_root.empty());
+    for (auto const& candidate : sampled_root) {
+      CHECK(candidate.source_tree_move.has_value());
+      CHECK(candidate.source_tree_move->score_change.has_value());
+    }
+
+    auto single_root_opts = root_opts;
+    single_root_opts.sampled_tree_count = 1;
+    single_root_opts.max_candidates = 1;
+    auto single_root = collect_candidates(grammar, single_root_opts);
+    CHECK(single_root.size() == 1);
+    auto const& root_move = *single_root.front().source_tree_move;
+    CHECK(root_move.src == 2);
+    CHECK(root_move.dst == 6);
+    CHECK(*root_move.score_change == 1);
+    std::mt19937 root_tree_rng(single_root_opts.seed);
+    auto root_representative_tree =
+        larch::chart_spr_detail::build_sampled_tree_from_grammar(
+            grammar, single_root_opts, 0, root_tree_rng);
+    larch::tree_index root_before_index{root_representative_tree};
+    auto root_after_tree = larch::apply_spr_move(root_representative_tree,
+                                                 root_move.src,
+                                                 root_move.dst);
+    larch::tree_index root_after_index{root_after_tree};
+    CHECK(root_before_index.compute_parsimony_score() == 1);
+    CHECK(root_after_index.compute_parsimony_score() == 1);
+  }
 
   std::println("  PASS");
 }

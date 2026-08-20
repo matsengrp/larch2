@@ -1348,10 +1348,14 @@ Analysis:
                           grammar (default), sampled-tree, or hybrid
   --chart-spr-workers <N>
                           Unified dense-chart/B&B and chart-search worker
-                          budget (default 0, automatic; 0
-                          chooses affinity-restricted physical cores when
-                          available, then affinity logical CPUs, hardware
-                          concurrency, or the serial portable fallback)
+                          budget (default 0, automatic; 0 prefers
+                          affinity-restricted physical cores only when the
+                          OS exposes per-CPU topology, then falls back to
+                          the affinity-restricted logical CPU count,
+                          hardware concurrency, or the serial portable
+                          fallback; the fallbacks count SMT siblings, so
+                          without OS topology info the default is all
+                          logical CPUs)
   --chart-spr-local-score-workers <N>
                           Compatibility alias for --chart-spr-workers; the two
                           options may not be supplied together
