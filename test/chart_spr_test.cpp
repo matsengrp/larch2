@@ -3979,8 +3979,12 @@ static void test_phase8_named_source_wave_stops_near_candidate_cap() {
     CHECK(adaptive_w8_root.stats.sampled_tree_source_adaptive_widenings == 0);
     CHECK(adaptive_w8_root.stats.sampled_tree_source_full_width_waves == 0);
     CHECK(adaptive_w8_root.stats.sampled_tree_source_enumeration_ranges >= 4);
+    // High-water concurrency is a scheduling property, not a semantics
+    // property: on a loaded machine fewer pool workers may be simultaneously
+    // resident in the adaptive wave, so only require actual engagement
+    // (structural parallelism is proven by enumeration_ranges >= 4 above).
     CHECK(adaptive_w8_root.stats
-              .sampled_tree_source_enumeration_active_worker_high_water >= 4);
+              .sampled_tree_source_enumeration_active_worker_high_water >= 1);
     CHECK(adaptive_w8_root.stats
               .sampled_tree_source_speculative_moves_discarded == 146);
     CHECK(adaptive_w8_root.stats
