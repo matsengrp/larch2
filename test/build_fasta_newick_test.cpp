@@ -114,8 +114,7 @@ TTAA
         [&](auto node) {
           if constexpr (requires { node.sample_id(); }) {
             leaf_sequences.emplace(node.sample_id(),
-                                   node_sequence(dag,
-                                                              node.index()));
+                                   node_sequence(dag, node.index()));
           }
         },
         nv);

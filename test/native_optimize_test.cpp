@@ -700,8 +700,8 @@ static void test_multifurcating_move_scores() {
         if (cur == idx.get_tree_root()) break;
         cur = idx.get_parent(cur);
       }
-      max_arity = std::max(max_arity,
-                           std::size_t{idx.get_num_children(ancestors.front())});
+      max_arity = std::max(
+          max_arity, std::size_t{idx.get_num_children(ancestors.front())});
 
       for (auto dst_nv : tree.get_all_nodes()) {
         std::visit(
@@ -724,11 +724,13 @@ static void test_multifurcating_move_scores() {
                 scored++;
 
                 if (predicted != actual)
-                  std::println("  MISMATCH: src={} dst={} lca={} predicted={} "
-                               "actual={}",
-                               src, dst, lca, predicted, actual);
-                require(predicted == actual,
-                        "predicted move score disagrees with the refitted tree");
+                  std::println(
+                      "  MISMATCH: src={} dst={} lca={} predicted={} "
+                      "actual={}",
+                      src, dst, lca, predicted, actual);
+                require(
+                    predicted == actual,
+                    "predicted move score disagrees with the refitted tree");
 
                 if (predicted < 0) {
                   improving++;
