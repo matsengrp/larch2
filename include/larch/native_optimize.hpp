@@ -98,10 +98,13 @@ struct scratch_buffers {
 inline int fitch_cost_from_counts(std::array<uint32_t, 4> const& counts,
                                   uint32_t num_children) {
   if (num_children <= 1) return 0;
-  for (int i = 0; i < 4; i++) {
-    if (counts[i] == num_children) return 0;
-  }
-  return 1;
+
+  uint32_t max_count = 0;
+  for (auto count : counts) max_count = std::max(max_count, count);
+
+  // Choosing a state present in max_count child optimal-state sets changes
+  // the edge to each of the remaining children.
+  return static_cast<int>(num_children) - static_cast<int>(max_count);
 }
 
 inline std::size_t compute_tree_max_depth(phylo_dag& d) {

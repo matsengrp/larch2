@@ -3,7 +3,9 @@
 
 #include "test_util.hpp"
 
+#include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <print>
 #include <random>
 #include <set>
@@ -14,6 +16,38 @@
 
 using namespace larch;
 using larch::test::cg_from_sequence;
+using larch::test::require;
+
+// ---------------------------------------------------------------------------
+// Generalized Fitch count helpers
+// ---------------------------------------------------------------------------
+
+static void test_kary_fitch_count_helpers() {
+  std::println("test_kary_fitch_count_helpers");
+
+  // A,A,A,T has a unique optimal parent state A and costs one change.
+  std::array<uint32_t, 4> majority = {3, 0, 0, 1};
+  require(fitch_set_from_counts(majority, 4) == 0b0001,
+          "A,A,A,T must select only A");
+  require(fitch_cost_from_counts(majority, 4) == 1,
+          "A,A,A,T must cost one change");
+
+  // A,A,T,T retains both tied states but costs two changes.
+  std::array<uint32_t, 4> tie = {2, 0, 0, 2};
+  require(fitch_set_from_counts(tie, 4) == 0b1001,
+          "A,A,T,T must retain both tied states");
+  require(fitch_cost_from_counts(tie, 4) == 2,
+          "A,A,T,T must cost two changes");
+
+  // Binary behavior remains intersection-if-present, otherwise union.
+  std::array<uint32_t, 4> binary = {1, 1, 0, 0};
+  require(fitch_set_from_counts(binary, 2) == 0b0011,
+          "binary disjoint states must form their union");
+  require(fitch_cost_from_counts(binary, 2) == 1,
+          "binary disjoint states must cost one change");
+
+  std::println("  PASS");
+}
 
 // ---------------------------------------------------------------------------
 // helpers (same patterns as optimize_test.cpp)
@@ -500,6 +534,228 @@ static void test_score_vs_ground_truth() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 5b: move scoring at multifurcating nodes (issue #43)
+// ---------------------------------------------------------------------------
+
+struct kary_move_delta_fixture {
+  phylo_dag tree;
+  std::size_t src;
+  std::size_t dst;
+  std::size_t source_parent;
+  std::size_t lca;
+};
+
+// One-site tree whose SPR removes G from the three-way (A,C,G) source parent
+// and inserts it beside T:
+//
+//          root                       root
+//         /    \                     /    \
+//      source    T       ->       source   new
+//      / | \                       / \     / \
+//     A  C  G                     A   C   G   T
+//
+// Both trees have parsimony three: the source parent's contribution drops
+// from two to one while the new binary node contributes one.  Scoring the
+// three-way node as if it were binary predicts a delta of +1 instead of 0.
+static kary_move_delta_fixture make_kary_move_delta_fixture() {
+  constexpr std::string_view ref = "A";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  auto leaf_a = d.append_node<node_kind::leaf>();
+  leaf_a.cg() = cg_from_sequence("A", ref);
+  leaf_a.sample_id() = "leaf-A";
+  auto leaf_c = d.append_node<node_kind::leaf>();
+  leaf_c.cg() = cg_from_sequence("C", ref);
+  leaf_c.sample_id() = "leaf-C";
+  auto leaf_g = d.append_node<node_kind::leaf>();
+  leaf_g.cg() = cg_from_sequence("G", ref);
+  leaf_g.sample_id() = "leaf-G";
+  auto leaf_t = d.append_node<node_kind::leaf>();
+  leaf_t.cg() = cg_from_sequence("T", ref);
+  leaf_t.sample_id() = "leaf-T";
+
+  auto root = d.append_node<node_kind::inner>();
+  auto source_parent = d.append_node<node_kind::inner>();
+
+  add_edge(d, ua.index(), root.index(), 0);
+  add_edge(d, root.index(), source_parent.index(), 0);
+  add_edge(d, root.index(), leaf_t.index(), 1);
+  add_edge(d, source_parent.index(), leaf_a.index(), 0);
+  add_edge(d, source_parent.index(), leaf_c.index(), 1);
+  add_edge(d, source_parent.index(), leaf_g.index(), 2);
+
+  fitch_assign_compact_genomes(d);
+  recompute_edge_mutations(d);
+
+  return {.tree = std::move(d),
+          .src = leaf_g.index(),
+          .dst = leaf_t.index(),
+          .source_parent = source_parent.index(),
+          .lca = root.index()};
+}
+
+static void test_kary_move_delta_matches_refitted_tree() {
+  std::println("test_kary_move_delta_matches_refitted_tree");
+
+  auto fixture = make_kary_move_delta_fixture();
+  tree_index idx{fixture.tree};
+  move_enumerator enumerator{idx};
+
+  require(idx.get_num_children(fixture.source_parent) == 3,
+          "fixture source parent must be multifurcating");
+  auto const before = count_tree_mutations(fixture.tree);
+  require(before == 3, "fixture must start at its known parsimony score");
+
+  int predicted =
+      enumerator.compute_move_score(fixture.src, fixture.dst, fixture.lca);
+  auto moved = apply_spr_move(fixture.tree, fixture.src, fixture.dst);
+  int actual =
+      static_cast<int>(count_tree_mutations(moved)) - static_cast<int>(before);
+
+  require(actual == 0, "moved topology must retain parsimony three");
+  require(predicted == actual,
+          "k-ary move prediction disagrees with the refitted tree");
+
+  std::println("  PASS");
+}
+
+// Random tree whose inner nodes have between two and five children.
+static phylo_dag make_random_multifurcating_tree(std::mt19937& rng,
+                                                 std::size_t num_leaves,
+                                                 std::string_view ref) {
+  constexpr std::string_view bases = "ACGT";
+  phylo_dag d;
+
+  auto ua = d.append_node<node_kind::ua>();
+  ua.reference_sequence() = std::string{ref};
+  d.set_root(ua);
+
+  std::vector<std::size_t> pending;
+  for (std::size_t i = 0; i < num_leaves; i++) {
+    std::string seq{ref};
+    for (auto& base : seq)
+      if (rng() % 10 < 4) base = bases[rng() % 4];
+    auto leaf = d.append_node<node_kind::leaf>();
+    leaf.cg() = cg_from_sequence(seq, ref);
+    leaf.sample_id() = "L" + std::to_string(i);
+    pending.push_back(leaf.index());
+  }
+
+  while (pending.size() > 1) {
+    std::shuffle(pending.begin(), pending.end(), rng);
+    auto arity = std::min<std::size_t>(pending.size(), 2 + rng() % 4);
+    auto inner = d.append_node<node_kind::inner>();
+    for (std::size_t clade = 0; clade < arity; clade++)
+      add_edge(d, inner.index(), pending[clade], clade);
+    pending.erase(pending.begin(),
+                  pending.begin() + static_cast<std::ptrdiff_t>(arity));
+    pending.push_back(inner.index());
+  }
+
+  add_edge(d, ua.index(), pending.front(), 0);
+  fitch_assign_compact_genomes(d);
+  recompute_edge_mutations(d);
+  return d;
+}
+
+// The fixtures above are binary except for one hand-built three-way node, so
+// they exercise few of the incremental scoring paths.  Sweep random
+// multifurcating trees instead: every move's predicted score change must
+// match a full refit of the moved tree, and the pruned search must report
+// every improving move that brute force finds.
+static void test_multifurcating_move_scores() {
+  std::println("test_multifurcating_move_scores");
+
+  constexpr std::size_t num_trees = 40;
+  constexpr std::string_view ref = "ACGT";
+  std::mt19937 rng{20260917u};
+
+  std::size_t scored = 0;
+  std::size_t improving = 0;
+  std::size_t max_arity = 0;
+
+  for (std::size_t trial = 0; trial < num_trees; trial++) {
+    auto tree = make_random_multifurcating_tree(rng, 4 + rng() % 6, ref);
+    tree_index idx{tree};
+    move_enumerator enumerator{idx};
+
+    auto radius = compute_tree_max_depth(tree) * 2;
+    if (radius == 0) radius = 1;
+
+    std::set<std::pair<std::size_t, std::size_t>> found;
+    enumerator.find_all_moves(radius,
+                              [&](auto& m) { found.insert({m.src, m.dst}); });
+
+    auto const original = static_cast<int>(count_tree_mutations(tree));
+
+    for (auto src : idx.get_searchable_nodes()) {
+      std::vector<std::size_t> ancestors;
+      auto cur = idx.get_parent(src);
+      while (idx.has_dfs_info(cur)) {
+        ancestors.push_back(cur);
+        if (cur == idx.get_tree_root()) break;
+        cur = idx.get_parent(cur);
+      }
+      max_arity = std::max(
+          max_arity, std::size_t{idx.get_num_children(ancestors.front())});
+
+      for (auto dst_nv : tree.get_all_nodes()) {
+        std::visit(
+            [&](auto dst_node) {
+              auto dst = dst_node.index();
+              if (is_ua(tree, dst)) return;
+              if (dst == idx.get_tree_root()) return;
+              if (dst == src) return;
+              if (idx.is_ancestor(src, dst)) return;
+              if (idx.is_ancestor(dst, src)) return;
+              if (!idx.has_dfs_info(dst)) return;
+
+              for (auto lca : ancestors) {
+                if (!idx.is_ancestor(lca, dst)) continue;
+
+                int predicted = enumerator.compute_move_score(src, dst, lca);
+                auto moved = apply_spr_move(tree, src, dst);
+                int actual =
+                    static_cast<int>(count_tree_mutations(moved)) - original;
+                scored++;
+
+                if (predicted != actual)
+                  std::println(
+                      "  MISMATCH: src={} dst={} lca={} predicted={} "
+                      "actual={}",
+                      src, dst, lca, predicted, actual);
+                require(
+                    predicted == actual,
+                    "predicted move score disagrees with the refitted tree");
+
+                if (predicted < 0) {
+                  improving++;
+                  if (found.count({src, dst}) == 0)
+                    std::println("  MISSED: src={} dst={} lca={} score={}", src,
+                                 dst, lca, predicted);
+                  require(found.count({src, dst}) > 0,
+                          "pruned search dropped an improving move");
+                }
+                break;
+              }
+            },
+            dst_nv);
+      }
+    }
+  }
+
+  std::println("  {} trees, max arity {}, {} moves scored, {} improving",
+               num_trees, max_arity, scored, improving);
+  require(max_arity > 2, "sweep must contain multifurcating nodes");
+  require(improving > 0, "sweep must contain improving moves");
+  std::println("  PASS");
+}
+
+// ---------------------------------------------------------------------------
 // Test 6: sampled trees are valid after optimization
 // ---------------------------------------------------------------------------
 
@@ -644,6 +900,9 @@ int main() {
   // Disable stdout buffering to prevent hangs with std::println
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 
+  test_kary_fitch_count_helpers();
+  test_kary_move_delta_matches_refitted_tree();
+  test_multifurcating_move_scores();
   test_tree_index_construction();
   test_enumerator_finds_moves();
   test_cached_vs_independent();

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <map>
+#include <print>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -17,6 +18,21 @@
 #include <unistd.h>
 
 namespace larch::test {
+
+// Checks that survive NDEBUG, unlike assert: tests are built in Release in CI.
+inline void require(bool condition, std::string_view message) {
+  if (!condition) {
+    std::println(stderr, "  FAIL: {}", message);
+    std::abort();
+  }
+}
+
+inline std::size_t count_mutations(phylo_dag& dag) {
+  std::size_t total = 0;
+  for (auto ev : dag.get_all_edges())
+    std::visit([&](auto edge) { total += edge.mutations().size(); }, ev);
+  return total;
+}
 
 inline std::filesystem::path source_path(std::string_view relative) {
   std::filesystem::path rel{std::string{relative}};

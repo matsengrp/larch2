@@ -13,6 +13,9 @@
 #include <variant>
 
 using namespace larch;
+using larch::test::count_mutations;
+using larch::test::node_sequence;
+using larch::test::require;
 
 namespace {
 
@@ -36,6 +39,45 @@ void write_text(std::filesystem::path const& path, std::string_view contents) {
   std::ofstream out{path};
   out << contents;
   assert(out.good());
+}
+
+void test_multifurcating_fitch_reconstruction(
+    std::filesystem::path const& directory) {
+  auto const fasta_path = directory / "polytomy.fa";
+  auto const newick_path = directory / "polytomy.nwk";
+  auto const reference_path = directory / "polytomy-reference.txt";
+
+  write_text(fasta_path, R"(>reference_sequence
+GGTTGG
+>s1
+GGTAGG
+>s2
+GGTAGG
+>s3
+GGTAGG
+>s4
+GGTTGG
+)");
+  write_text(reference_path, "GGTTGG\n");
+
+  write_text(newick_path, "(s1,s2,s3,s4);\n");
+  auto star = build_from_fasta_newick(fasta_path.string(),
+                                      newick_path.string(),
+                                      reference_path.string());
+  auto const star_root = get_non_ua_root_idx(star);
+  require(get_child_indices(star, star_root).size() == 4,
+          "Fitch regression fixture must contain a four-way node");
+  require(node_sequence(star, star_root) == "GGTAGG",
+          "four-way node must be assigned its majority state");
+  require(count_mutations(star) == 2,
+          "four-way topology must have parsimony score two");
+
+  write_text(newick_path, "((s1,s2),(s3,s4));\n");
+  auto binary = build_from_fasta_newick(fasta_path.string(),
+                                        newick_path.string(),
+                                        reference_path.string());
+  require(count_mutations(binary) == 2,
+          "binary control topology must have parsimony score two");
 }
 
 }  // namespace
@@ -72,8 +114,7 @@ TTAA
         [&](auto node) {
           if constexpr (requires { node.sample_id(); }) {
             leaf_sequences.emplace(node.sample_id(),
-                                   larch::test::node_sequence(dag,
-                                                              node.index()));
+                                   node_sequence(dag, node.index()));
           }
         },
         nv);
@@ -85,6 +126,8 @@ TTAA
 
   auto const real_root_idx = get_non_ua_root_idx(dag);
   assert(get_child_indices(dag, real_root_idx).size() == 2);
+
+  test_multifurcating_fitch_reconstruction(tmp.path());
 
   std::println("build_fasta_newick test passed");
 }

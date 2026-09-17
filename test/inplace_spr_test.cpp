@@ -4,6 +4,10 @@
 #include <larch/subtree_weight.hpp>
 #include <larch/simple_weight_ops.hpp>
 
+#include "test_util.hpp"
+
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <map>
 #include <print>
@@ -15,6 +19,7 @@
 #include <vector>
 
 using namespace larch;
+using larch::test::require;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -4370,27 +4375,29 @@ static void test_single_node_fitch_new_child() {
   // Now I has 3 children: {A, B, C}.
   assert(idx.get_num_children(I) == 3);
 
-  // fitch_set_from_counts uses intersection/union:
-  //   - intersection = bases present in ALL children
-  //   - if intersection non-empty → return intersection, else return union
+  // fitch_set_from_counts keeps the states held by the largest number of
+  // children, which at two children is the old intersection-if-present,
+  // otherwise-union rule.
   //
   // With 3 children {A, B, C}:
-  // Site 0 (pos 1): A=T, B=A, C=A → counts: A=2,T=1 → no base in all 3 → union={A,T}
-  // Site 1 (pos 2): A=A, B=T, C=A → counts: A=2,T=1 → no base in all 3 → union={A,T}
-  // Site 2 (pos 3): A=A, B=A, C=T → counts: A=2,T=1 → no base in all 3 → union={A,T}
+  // Site 0 (pos 1): A=T, B=A, C=A → counts: A=2,T=1 → majority {A}
+  // Site 1 (pos 2): A=A, B=T, C=A → counts: A=2,T=1 → majority {A}
+  // Site 2 (pos 3): A=A, B=A, C=T → counts: A=2,T=1 → majority {A}
   for (std::size_t i = 0; i < nsites; i++) {
-    assert(idx.get_fitch_set(I, i) == (0b0001 | 0b1000));  // {A, T}
+    require(idx.get_fitch_set(I, i) == 0b0001, "majority state is {A}");
   }
 
-  // allele_union should be union of all children's alleles: {A, T} for all sites.
+  // allele_union is still the union of all children's alleles: {A, T}.
   for (std::size_t i = 0; i < nsites; i++) {
-    assert(idx.get_allele_union(I, i) == (0b0001 | 0b1000));  // {A, T}
+    require(idx.get_allele_union(I, i) == (0b0001 | 0b1000), "union is {A, T}");
   }
 
-  // Site 2 should have changed: was {A} (intersection of A,A with 2 children),
-  // now {A,T} (union, since no base in all 3 children).
-  // Sites 0,1 were already {A,T} with 2 children (no intersection → union).
-  assert(idx.get_fitch_set(I, 2) != fitch_before[2]);
+  // Sites 0 and 1 changed: each was {A,T} from two children that disagreed,
+  // and the third child breaks the tie in favour of {A}.  Site 2 was already
+  // {A} (both children agreed) and stays {A}.
+  require(idx.get_fitch_set(I, 0) != fitch_before[0], "site 0 narrowed to {A}");
+  require(idx.get_fitch_set(I, 1) != fitch_before[1], "site 1 narrowed to {A}");
+  require(idx.get_fitch_set(I, 2) == fitch_before[2], "site 2 stays {A}");
 
   std::println("  PASS");
 }
@@ -5051,7 +5058,9 @@ static void test_update_fitch_insertion_early_termination() {
 // ---------------------------------------------------------------------------
 
 // Helper: verify Fitch self-consistency — every valid inner node's Fitch set
-// must match the standard Fitch rule applied to its children's Fitch sets.
+// must match the majority rule applied to its children's Fitch sets: the
+// states held by the largest number of children.  At two children that is the
+// familiar intersection-if-present, otherwise-union rule.
 static void verify_fitch_self_consistent(tree_index& idx) {
   auto nsites = idx.num_variable_sites();
   auto nnodes = idx.num_nodes();
@@ -5061,14 +5070,19 @@ static void verify_fitch_self_consistent(tree_index& idx) {
     if (children.empty()) continue;  // leaf
 
     for (std::size_t s = 0; s < nsites; s++) {
-      uint8_t intersection = 0xFF;
-      uint8_t union_bits = 0;
+      std::array<uint32_t, 4> counts{};
       for (auto child : children) {
         uint8_t cf = idx.get_fitch_set(child, s);
-        intersection &= cf;
-        union_bits |= cf;
+        for (std::size_t j = 0; j < 4; j++)
+          if (cf & (1 << j)) counts[j]++;
       }
-      uint8_t expected = (intersection != 0) ? intersection : union_bits;
+      uint32_t max_count = 0;
+      for (auto count : counts) max_count = std::max(max_count, count);
+
+      uint8_t expected = 0;
+      for (std::size_t j = 0; j < 4; j++)
+        if (max_count > 0 && counts[j] == max_count)
+          expected |= static_cast<uint8_t>(1 << j);
       uint8_t actual = idx.get_fitch_set(nid, s);
       if (actual != expected) {
         std::println("  FAIL: fitch mismatch at node {} site {}: "
