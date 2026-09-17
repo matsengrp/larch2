@@ -4,6 +4,7 @@
 #include "test_util.hpp"
 
 #include <cassert>
+#include <cstdlib>
 #include <print>
 #include <random>
 #include <set>
@@ -14,6 +15,44 @@
 
 using namespace larch;
 using larch::test::cg_from_sequence;
+
+// ---------------------------------------------------------------------------
+// Generalized Fitch count helpers
+// ---------------------------------------------------------------------------
+
+static void test_kary_fitch_count_helpers() {
+  std::println("test_kary_fitch_count_helpers");
+
+  auto require = [](bool condition, std::string_view message) {
+    if (!condition) {
+      std::println(stderr, "  FAIL: {}", message);
+      std::abort();
+    }
+  };
+
+  // A,A,A,T has a unique optimal parent state A and costs one change.
+  std::array<uint32_t, 4> majority = {3, 0, 0, 1};
+  require(fitch_set_from_counts(majority, 4) == 0b0001,
+          "A,A,A,T must select only A");
+  require(fitch_cost_from_counts(majority, 4) == 1,
+          "A,A,A,T must cost one change");
+
+  // A,A,T,T retains both tied states but costs two changes.
+  std::array<uint32_t, 4> tie = {2, 0, 0, 2};
+  require(fitch_set_from_counts(tie, 4) == 0b1001,
+          "A,A,T,T must retain both tied states");
+  require(fitch_cost_from_counts(tie, 4) == 2,
+          "A,A,T,T must cost two changes");
+
+  // Binary behavior remains intersection-if-present, otherwise union.
+  std::array<uint32_t, 4> binary = {1, 1, 0, 0};
+  require(fitch_set_from_counts(binary, 2) == 0b0011,
+          "binary disjoint states must form their union");
+  require(fitch_cost_from_counts(binary, 2) == 1,
+          "binary disjoint states must cost one change");
+
+  std::println("  PASS");
+}
 
 // ---------------------------------------------------------------------------
 // helpers (same patterns as optimize_test.cpp)
@@ -644,6 +683,7 @@ int main() {
   // Disable stdout buffering to prevent hangs with std::println
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 
+  test_kary_fitch_count_helpers();
   test_tree_index_construction();
   test_enumerator_finds_moves();
   test_cached_vs_independent();
