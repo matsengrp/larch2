@@ -287,6 +287,26 @@ Post-processing:
                           Fail if any B&B clade frontier exceeds N entries
   --chart-bnb-max-exact-topologies <N>
                           Cap optimal topology materialization; 0 = unlimited
+  --chart-bnb-dominance <M>
+                          B&B frontier strategy for chart-bnb trim: off
+                          (default; single pass, retains unpruned frontier
+                          entries), two-pass-exact-mask (cheap score pass,
+                          then exact mask recovered under the validated
+                          optimum), strict-mask-safe, or provenance-preserving.
+                          two-pass trades a second traversal for much smaller
+                          peak frontier memory on large grammars
+  --chart-bnb-upper-bound <N>
+                          Pruning upper bound for the chart-B&B trim passes
+                          (e.g. a known or externally validated optimum);
+                          tighter bounds prune frontier entries earlier. The
+                          final optimum is still computed and validated
+                          independently, so an overly tight bound fails rather
+                          than silently trimming wrong
+  --chart-bnb-score-only
+                          Run the primary chart-B&B pass with score-only
+                          dominance and no exact keep mask (cheap; pairs
+                          with --chart-bnb-apply optimal-topology-materialize
+                          and --chart-bnb-max-exact-topologies)
   --wric-polytomy-mode <M>
                           reject, audit-kary, allow, expand-exact, or
                           expand-bounded
@@ -339,6 +359,10 @@ struct args {
       chart_bnb_trim_application_mode::production_mask_superset;
   std::size_t chart_bnb_max_frontier = 0;
   std::optional<std::size_t> chart_bnb_max_exact_topologies;
+  multisite_dominance_mode chart_bnb_dominance =
+      multisite_dominance_mode::off;
+  std::optional<std::uint64_t> chart_bnb_upper_bound;
+  bool chart_bnb_score_only = false;
   bool wric_lazy_chart = false;
   chart_spr_lazy_policy wric_lazy_chart_policy = chart_spr_lazy_policy::off;
   polytomy_refinement_options chart_bnb_polytomy_opts = [] {
@@ -452,6 +476,24 @@ static std::optional<polytomy_mode> parse_larch2_polytomy_mode(
   if (text == "expand-bounded" || text == "expand_bounded" ||
       text == "expand_soft_bounded") {
     return polytomy_mode::expand_soft_bounded;
+  }
+  return std::nullopt;
+}
+
+static std::optional<multisite_dominance_mode>
+parse_larch2_multisite_dominance_mode(std::string_view text) {
+  if (text == "off") return multisite_dominance_mode::off;
+  if (text == "score-only" || text == "score_only") {
+    return multisite_dominance_mode::score_only;
+  }
+  if (text == "strict-mask-safe" || text == "strict_mask_safe") {
+    return multisite_dominance_mode::strict_mask_safe;
+  }
+  if (text == "two-pass-exact-mask" || text == "two_pass_exact_mask") {
+    return multisite_dominance_mode::two_pass_exact_mask;
+  }
+  if (text == "provenance-preserving" || text == "provenance_preserving") {
+    return multisite_dominance_mode::provenance_preserving;
   }
   return std::nullopt;
 }
@@ -680,6 +722,27 @@ static args parse_args(int argc, char** argv) {
       }
     } else if (arg == "--chart-bnb-max-exact-topologies") {
       a.chart_bnb_max_exact_topologies = parse_size_arg(next(), arg);
+    } else if (arg == "--chart-bnb-dominance") {
+      auto value = next();
+      auto mode = parse_larch2_multisite_dominance_mode(value);
+      if (!mode) {
+        std::cerr << "error: --chart-bnb-dominance must be "
+                     "off|score-only|strict-mask-safe|two-pass-exact-mask|"
+                     "provenance-preserving\n";
+        std::exit(1);
+      }
+      a.chart_bnb_dominance = *mode;
+    } else if (arg == "--chart-bnb-upper-bound") {
+      auto value = next();
+      std::uint64_t bound = 0;
+      auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), bound);
+      if (ec != std::errc{} || ptr != value.data() + value.size()) {
+        std::cerr << "error: --chart-bnb-upper-bound must be a nonnegative integer\n";
+        std::exit(1);
+      }
+      a.chart_bnb_upper_bound = bound;
+    } else if (arg == "--chart-bnb-score-only") {
+      a.chart_bnb_score_only = true;
     } else if (arg == "--wric-polytomy-mode") {
       auto value = next();
       auto mode = parse_larch2_polytomy_mode(value);
@@ -2628,13 +2691,17 @@ static void print_chart_bnb_trim_report(
     chart_options const& chart_opts, bool wric_lazy_chart,
     chart_spr_lazy_policy_diagnostics const& lazy_policy,
     chart_bnb_trim_application_mode requested_mode, bool auto_fallback) {
-  if (!trim.keep_production_exact) {
+  if (!trim.keep_production_exact &&
+      apply.mode != chart_bnb_trim_application_mode::optimal_topology_materialize) {
     throw std::runtime_error(
-        "larch2 chart-B&B trim report requires an exact keep-production mask");
+        "larch2 chart-B&B trim report requires an exact keep-production mask "
+        "unless topologies are materialized");
   }
   auto kept = static_cast<std::size_t>(
-      std::count(trim.keep_production.begin(), trim.keep_production.end(),
-                 true));
+      trim.keep_production_exact
+          ? std::count(trim.keep_production.begin(), trim.keep_production.end(),
+                       true)
+          : apply.kept_productions_requested);
 
   std::cerr << "chart_bnb_trim:\n";
   std::cerr << "  trim_mode: chart-bnb\n";
@@ -2751,6 +2818,9 @@ static void print_chart_bnb_trim_report(
   std::cerr << "  validation_status: " << apply.validation_status << "\n";
   std::cerr << "  materialized_topologies: " << apply.materialized_topologies
             << "\n";
+  if (apply.witness_only_materialization) {
+    std::cerr << "  witness_only_materialization: true\n";
+  }
   std::cerr << "  topology_cap_truncated: "
             << (apply.topology_cap_truncated ? "true" : "false") << "\n";
   std::cerr << "  source_edges_removed: " << apply.source_edges_removed
@@ -2787,8 +2857,29 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
   chart_opts.score_ua_edge = true;
 
   multisite_trim_options trim_opts;
-  trim_opts.dominance_mode = multisite_dominance_mode::off;
+  trim_opts.dominance_mode = a.chart_bnb_dominance;
+  if (a.chart_bnb_upper_bound) {
+    trim_opts.upper_bound_override = *a.chart_bnb_upper_bound;
+  }
   trim_opts.require_exact_keep_mask = true;
+  if (a.chart_bnb_score_only) {
+    if (trim_opts.dominance_mode != multisite_dominance_mode::off &&
+        trim_opts.dominance_mode != multisite_dominance_mode::score_only) {
+      std::cerr << "  note: --chart-bnb-score-only overrides "
+                << "--chart-bnb-dominance "
+                << multisite_dominance_mode_name(trim_opts.dominance_mode)
+                << "\n";
+    }
+    trim_opts.dominance_mode = multisite_dominance_mode::score_only;
+    trim_opts.require_exact_keep_mask = false;
+  } else if (trim_opts.dominance_mode ==
+             multisite_dominance_mode::score_only) {
+    // Score-only dominance cannot return an exact keep mask; couple the two
+    // the same way dagutil's --chart-bnb-score-only does.
+    trim_opts.require_exact_keep_mask = false;
+    std::cerr << "  note: --chart-bnb-dominance score-only clears the exact "
+                 "keep-mask requirement\n";
+  }
   trim_opts.max_frontier_entries_per_clade = a.chart_bnb_max_frontier;
 
   chart_spr_lazy_policy_diagnostics lazy_policy;

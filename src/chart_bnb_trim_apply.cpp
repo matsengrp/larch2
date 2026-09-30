@@ -1261,20 +1261,50 @@ static chart_bnb_trim_apply_result apply_optimal_topology_materialize(
   result.output_contains_only_optimal_topologies = "true";
 
   constexpr std::size_t default_topology_cap = 1000;
-  auto topology_cap = options.max_exact_topologies_to_materialize.value_or(
-      default_topology_cap);
 
-  multisite_topology_trace_options trace_opts;
-  trace_opts.keep_provenance = true;
-  trace_opts.max_optimal_topologies = topology_cap;
-  trace_opts.trim_options.dominance_mode = multisite_dominance_mode::off;
-  trace_opts.trim_options.require_exact_keep_mask = true;
-  trace_opts.trim_options.known_exact_optimum = trim.optimum;
+  // An explicit finite cap selects the witness-only materialization path:
+  // score-dominance frontier build with construction provenance, no exact
+  // keep-mask retention, and a soft cap (more optimal topologies may exist;
+  // topology_cap_truncated reports it) instead of the legacy fail-on-
+  // truncation enumeration.  Explicit 0 (unlimited) and the unset default
+  // keep the legacy exact-mask path.
+  bool const witness_only =
+      options.max_exact_topologies_to_materialize.has_value() &&
+      *options.max_exact_topologies_to_materialize != 0;
+  auto topology_cap = witness_only
+                          ? *options.max_exact_topologies_to_materialize
+                          : options.max_exact_topologies_to_materialize
+                                .value_or(default_topology_cap);
 
-  auto trace = build_multisite_optimal_topologies(grammar, patterns, chart_opts,
-                                                  trace_opts);
+  multisite_topology_trace_result trace;
+  if (witness_only) {
+    multisite_topology_trace_options trace_opts;
+    trace_opts.keep_provenance = true;
+    trace_opts.max_optimal_topologies = topology_cap;
+    trace_opts.trim_options.dominance_mode =
+        multisite_dominance_mode::score_only;
+    trace_opts.trim_options.require_exact_keep_mask = false;
+    trace_opts.trim_options.use_bound_pruning = true;
+    // The primary trim already certified this optimum; use it both as the
+    // pruning bound (tightest possible) and as a cross-validation check.
+    trace_opts.trim_options.upper_bound_override = trim.optimum;
+    trace_opts.trim_options.known_exact_optimum = trim.optimum;
+    trace = build_multisite_optimal_topology_witnesses(
+        grammar, patterns, chart_opts, trace_opts);
+  } else {
+    multisite_topology_trace_options trace_opts;
+    trace_opts.keep_provenance = true;
+    trace_opts.max_optimal_topologies = topology_cap;
+    trace_opts.trim_options.dominance_mode = multisite_dominance_mode::off;
+    trace_opts.trim_options.require_exact_keep_mask = true;
+    trace_opts.trim_options.known_exact_optimum = trim.optimum;
+
+    trace = build_multisite_optimal_topologies(grammar, patterns, chart_opts,
+                                                trace_opts);
+  }
+  result.witness_only_materialization = witness_only;
   result.topology_cap_truncated = trace.topology_cap_truncated;
-  if (trace.topology_cap_truncated) {
+  if (trace.topology_cap_truncated && !witness_only) {
     throw std::runtime_error(
         "chart B&B trim apply: optimal topology materialization cap was "
         "truncated; rerun with a larger --chart-bnb-max-exact-topologies "

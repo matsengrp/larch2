@@ -1899,7 +1899,7 @@ inline bool same_provenance_choice(frontier_provenance_choice const& lhs,
 inline void merge_provenance_choices(
     std::vector<frontier_provenance_choice>& dst,
     std::vector<frontier_provenance_choice> const& src,
-    std::size_t max_choices_per_entry = 0) {
+    std::size_t max_choices_per_entry = 0, bool drop_on_cap = false) {
   for (auto choice : src) {
     auto found =
         std::find_if(dst.begin(), dst.end(), [&](auto const& existing) {
@@ -1907,8 +1907,14 @@ inline void merge_provenance_choices(
         });
     if (found != dst.end()) continue;
     if (max_choices_per_entry != 0 && dst.size() >= max_choices_per_entry) {
-      throw std::runtime_error(
-          "multi-site topology trace: provenance-choice cap exceeded");
+      if (!drop_on_cap) {
+        throw std::runtime_error(
+            "multi-site topology trace: provenance-choice cap exceeded");
+      }
+      // Witness-only mode: the provenance union need not be complete, so
+      // extra construction choices are simply dropped.  Every retained
+      // choice remains a real construction referencing surviving entries.
+      continue;
     }
     dst.push_back(choice);
   }
@@ -2578,7 +2584,8 @@ inline void insert_or_merge_frontier_entry(
     std::unordered_map<std::vector<chart_cost>, std::size_t,
                        chart_cost_vector_hash>& index_by_cost,
     frontier_entry candidate, std::size_t& equality_deduplicated,
-    std::size_t max_provenance_choices_per_entry = 0) {
+    std::size_t max_provenance_choices_per_entry = 0,
+    bool drop_provenance_on_cap = false) {
   auto found = index_by_cost.find(candidate.f.cost);
   if (found != index_by_cost.end()) {
     if (!entries[found->second].used_production.empty() ||
@@ -2588,7 +2595,8 @@ inline void insert_or_merge_frontier_entry(
     }
     merge_provenance_choices(entries[found->second].provenance,
                              candidate.provenance,
-                             max_provenance_choices_per_entry);
+                             max_provenance_choices_per_entry,
+                             drop_provenance_on_cap);
     // Diagnostic-only, but use an associative representative so equality-class
     // identity does not depend on merge grouping.
     entries[found->second].f.topology_hash = std::min(
@@ -4493,6 +4501,12 @@ struct multisite_frontier_build_options {
   // completed. Topology-trace builders leave this false because their
   // provenance choices retain child-entry indices.
   bool release_consumed_frontiers = false;
+
+  // See frontier_entry::provenance_for_witness_only above.  When true,
+  // score-only dominance with keep_provenance is accepted; the caller
+  // thereby disclaims exact production-union mask semantics and must
+  // re-score every emitted topology.
+  bool provenance_for_witness_only = false;
 };
 
 struct multisite_frontier_build_result {
@@ -4552,7 +4566,8 @@ inline void validate_multisite_frontier_build_options(
     multisite_frontier_build_options const& build_options,
     std::string const& context) {
   if (build_options.keep_provenance &&
-      build_options.dominance_mode == multisite_dominance_mode::score_only) {
+      build_options.dominance_mode == multisite_dominance_mode::score_only &&
+      !build_options.provenance_for_witness_only) {
     throw std::runtime_error(
         context +
         ": score-only dominance cannot build exact topology provenance");
@@ -4660,7 +4675,8 @@ build_multisite_frontiers_from_prepared_active(
           insert_or_merge_frontier_entry(
               entries, index_by_cost, std::move(candidate),
               result.equality_deduplicated,
-              build_options.max_provenance_choices_per_entry);
+              build_options.max_provenance_choices_per_entry,
+              build_options.provenance_for_witness_only);
         }
       }
     }
@@ -5821,7 +5837,7 @@ inline multisite_trim_result build_multisite_trim_from_exact_setup(
               build_options,
           std::string const& context) {
         ++frontier_passes;
-        return chart_multisite_detail::build_multisite_frontiers_from_setup(
+        return build_multisite_frontiers_from_setup(
             grammar, setup, options, build_options, context);
       });
   result.exact_setup_work = setup.work;
@@ -5868,7 +5884,7 @@ inline multisite_trim_result build_multisite_trim_from_exact_setup(
               build_options,
           std::string const& context) {
         ++frontier_passes;
-        return chart_multisite_detail::build_multisite_frontiers_from_setup(
+        return build_multisite_frontiers_from_setup(
             plan, setup, options, build_options, context, scheduler,
             run_summaries == nullptr ? nullptr
                                      : &run_summaries->frontier_clades);
@@ -5893,7 +5909,7 @@ inline multisite_trim_result build_multisite_trim_from_exact_setup(
               build_options,
           std::string const& context) {
         ++frontier_passes;
-        return chart_multisite_detail::build_multisite_frontiers_from_setup(
+        return build_multisite_frontiers_from_setup(
             plan, setup, options, build_options, context);
       });
   result.exact_setup_work = setup.work;
@@ -5960,6 +5976,13 @@ inline std::uint64_t score_selected_topology(
       grammar, patterns, topology, options, scheduler, run_summary);
 }
 
+inline multisite_topology_trace_result finish_multisite_topology_trace(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options,
+    multisite_topology_trace_options const& trace_opts,
+    chart_multisite_detail::multisite_frontier_build_result const& build,
+    std::string const& context);
+
 inline multisite_topology_trace_result build_multisite_optimal_topologies(
     clade_grammar const& grammar, site_pattern_set const& patterns,
     chart_options const& options = {},
@@ -5988,7 +6011,104 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
       trace_opts.max_provenance_choices_per_entry;
   auto build = build_multisite_frontiers(
       grammar, patterns, options, build_options, "multi-site topology trace");
+  return finish_multisite_topology_trace(grammar, patterns, options,
+                                         trace_opts, build,
+                                         "multi-site topology trace");
+}
 
+// Witness-only topology trace.  Recovers up to
+// trace_opts.max_optimal_topologies optimal topologies without retaining the
+// exact keep-mask frontier: the frontier build runs under score-only (or
+// strict-mask-safe) dominance with construction provenance retained via
+// multisite_frontier_build_options::provenance_for_witness_only.  Because
+// parents are combined only after each child clade's frontier has been
+// pruned, surviving entries' provenance chains reference surviving entries,
+// so chains from surviving optimal root entries reach leaves.  Score-only
+// dominance preserves the scalar optimum by the swap-in argument, and every
+// emitted topology is re-scored exactly inside
+// finish_multisite_topology_trace, so the witness claim never relies on the
+// relaxed dominance.  The result's keep_production is the union of
+// productions used by the emitted topologies only, NOT an exact
+// optimal-production mask; topologies may be a strict subset of all optimal
+// topologies when the cap truncates enumeration.
+inline multisite_topology_trace_result build_multisite_optimal_topology_witnesses(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options = {},
+    multisite_topology_trace_options const& trace_opts = {}) {
+  using namespace chart_multisite_detail;
+  validate_multisite_inputs(grammar, patterns, options);
+  validate_required_productions(grammar, trace_opts.required_productions);
+  if (!trace_opts.keep_provenance) {
+    throw std::runtime_error(
+        "multi-site topology witness: keep_provenance=false cannot emit "
+        "concrete topologies");
+  }
+  auto dominance = trace_opts.trim_options.dominance_mode;
+  if (dominance != multisite_dominance_mode::off &&
+      dominance != multisite_dominance_mode::score_only &&
+      dominance != multisite_dominance_mode::strict_mask_safe) {
+    throw std::runtime_error(
+        "multi-site topology witness: dominance mode '" +
+        std::string(multisite_dominance_mode_name(dominance)) +
+        "' is not usable for witness recovery; use off, score-only, or "
+        "strict-mask-safe");
+  }
+  if (trace_opts.trim_options.require_exact_keep_mask) {
+    throw std::runtime_error(
+        "multi-site topology witness: witness recovery cannot return an "
+        "exact keep-production mask; set require_exact_keep_mask=false");
+  }
+
+  multisite_frontier_build_options build_options;
+  build_options.keep_provenance = true;
+  build_options.keep_used_production = false;
+  build_options.use_bound_pruning = trace_opts.trim_options.use_bound_pruning;
+  build_options.dominance_mode = dominance;
+  build_options.provenance_for_witness_only =
+      dominance == multisite_dominance_mode::score_only;
+  // Prune with the tightest validated bound available: an explicit override,
+  // else the certified optimum (every optimal-parse entry has composite
+  // lower bound at most the optimum, so nothing optimal-extensible is lost).
+  if (trace_opts.trim_options.upper_bound_override) {
+    build_options.upper_bound_override =
+        trace_opts.trim_options.upper_bound_override;
+  } else if (trace_opts.trim_options.known_exact_optimum) {
+    build_options.upper_bound_override =
+        trace_opts.trim_options.known_exact_optimum;
+  }
+  build_options.max_frontier_entries_per_clade =
+      trace_opts.trim_options.max_frontier_entries_per_clade;
+  // Bound construction-provenance choices per entry so the witness build
+  // stays cheap: any retained choice is a real construction, so a handful
+  // per entry is enough to emit up to the requested number of distinct
+  // witnesses (plus one to detect cap truncation).
+  build_options.max_provenance_choices_per_entry =
+      trace_opts.max_provenance_choices_per_entry != 0
+          ? trace_opts.max_provenance_choices_per_entry
+          : std::max<std::size_t>(
+                2, trace_opts.max_optimal_topologies + 1);
+  // Build through the shared exact setup like the primary trim does.  The
+  // plain grammar entry point (build_multisite_frontiers) computes its
+  // initial upper bound by exactly re-scoring one traceback topology per
+  // active pattern, which the bound override below discards anyway; the
+  // setup path derives the bound from deduplicated topologies instead.
+  // The setup must outlive the returned build: borrowed active patterns
+  // are referenced until finish_multisite_topology_trace returns.
+  auto setup = build_multisite_exact_setup(grammar, patterns, options);
+  auto build = build_multisite_frontiers_from_setup(
+      grammar, setup, options, build_options, "multi-site topology witness");
+  return finish_multisite_topology_trace(grammar, patterns, options,
+                                         trace_opts, build,
+                                         "multi-site topology witness");
+}
+
+inline multisite_topology_trace_result finish_multisite_topology_trace(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    chart_options const& options,
+    multisite_topology_trace_options const& trace_opts,
+    chart_multisite_detail::multisite_frontier_build_result const& build,
+    std::string const& context) {
+  using namespace chart_multisite_detail;
   multisite_topology_trace_result result;
   result.composite_lower_bound = build.composite_lower_bound;
   result.initial_upper_bound = build.initial_upper_bound;
@@ -6003,7 +6123,7 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
   auto const& frontiers = build.frontiers;
   auto const& root_frontier = frontiers[grammar.root_clade];
   if (root_frontier.empty()) {
-    throw std::runtime_error("multi-site topology trace: empty root frontier");
+    throw std::runtime_error(context + ": empty root frontier");
   }
 
   std::vector<std::size_t> optimal_root_entries;
@@ -6020,11 +6140,10 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
   }
   result.optimal_frontier_entry_count = optimal_root_entries.size();
   if (result.optimum >= multisite_score_inf || optimal_root_entries.empty()) {
-    throw std::runtime_error(
-        "multi-site topology trace: no finite optimal topology");
+    throw std::runtime_error(context + ": no finite optimal topology");
   }
   validate_known_exact_optimum(result.optimum, trace_opts.trim_options,
-                               "multi-site topology trace");
+                               context);
 
   std::sort(optimal_root_entries.begin(), optimal_root_entries.end(),
             [&](std::size_t lhs, std::size_t rhs) {
@@ -6072,7 +6191,7 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
 
   if (result.topologies.empty()) {
     throw std::runtime_error(
-        "multi-site topology trace: no optimal topologies were emitted");
+        context + ": no optimal topologies were emitted");
   }
 
   for (auto const& topology : result.topologies) {
@@ -6081,7 +6200,7 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
         grammar, patterns, topology, options);
     if (score != result.optimum) {
       throw std::runtime_error(
-          "multi-site topology trace: emitted topology failed exact re-score");
+          context + ": emitted topology failed exact re-score");
     }
     merge_used_productions(result.keep_production, reachable);
   }
@@ -6089,7 +6208,8 @@ inline multisite_topology_trace_result build_multisite_optimal_topologies(
   if (!result.uncovered_required_productions.empty() &&
       trace_opts.require_required_production_coverage) {
     std::string message =
-        "multi-site topology trace: required productions are not covered by "
+        context +
+        ": required productions are not covered by "
         "emitted optimal topologies (optimum=" +
         std::to_string(result.optimum) +
         ", emitted=" + std::to_string(result.topologies.size()) +

@@ -221,8 +221,8 @@ static void test_sparse_source_indices_apply_in_source_witness_space() {
                       larch::thread_pool::get_default());
 }
 
-static void test_optimal_topology_materialize_cap_truncation_fails() {
-  std::println("test_optimal_topology_materialize_cap_truncation_fails");
+static void test_optimal_topology_materialize_cap_truncation_reports() {
+  std::println("test_optimal_topology_materialize_cap_truncation_reports");
   std::vector<larch::phylo_dag> trees;
   trees.push_back(larch::test::make_tiny_labelled_tree("AA", paper_tree1_spec()));
   trees.push_back(larch::test::make_tiny_labelled_tree("AA", paper_tree2_spec()));
@@ -235,10 +235,19 @@ static void test_optimal_topology_materialize_cap_truncation_fails() {
   options.mode =
       larch::chart_bnb_trim_application_mode::optimal_topology_materialize;
   options.max_exact_topologies_to_materialize = 1;
-  CHECK(throws_runtime_error_containing(
-      [&] { (void)larch::apply_chart_bnb_trim(dag, refinement, patterns, {}, trim,
-                                               options); },
-      "cap was truncated"));
+  auto applied = larch::apply_chart_bnb_trim(dag, refinement, patterns, {},
+                                             trim, options);
+  // An explicit finite cap takes the witness-only path: a strict subset of
+  // the optimal topologies is materialized, the truncation is reported
+  // instead of throwing, and every emitted topology is still exactly
+  // re-scored against the certified optimum.
+  CHECK(applied.witness_only_materialization);
+  CHECK(applied.topology_cap_truncated);
+  CHECK(applied.materialized_topologies == 1);
+  CHECK(applied.identity_preserving_tree_set);
+  CHECK(applied.validation_succeeded);
+  CHECK(applied.validated_output_parsimony_min == trim.optimum);
+  CHECK(applied.validated_output_parsimony_min_exact);
 }
 
 static void test_production_mask_rejects_synthetic_polytomy_provenance() {
@@ -522,7 +531,7 @@ int main() {
   test_production_mask_apply_writes_valid_superset();
   test_optimal_topology_materialize_identity_tree_set();
   test_sparse_source_indices_apply_in_source_witness_space();
-  test_optimal_topology_materialize_cap_truncation_fails();
+  test_optimal_topology_materialize_cap_truncation_reports();
   test_production_mask_rejects_synthetic_polytomy_provenance();
   test_score_ua_edge_single_taxon_validation();
   test_kary_topology_materialize_roundtrip_fitch_ua_parity();

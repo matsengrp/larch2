@@ -48,6 +48,12 @@ struct chart_bnb_trim_apply_result {
   bool coupled_frontier_exact = false;
   bool annotated_optimal_trim = false;
   bool identity_preserving_tree_set = false;
+  // True when topologies were recovered by the score-dominance witness path
+  // (build_multisite_optimal_topology_witnesses) instead of the full exact
+  // keep-mask provenance enumeration.  Emitted topologies are still exactly
+  // re-scored, but the set may be a strict subset of all optimal topologies
+  // when a finite cap truncates enumeration.
+  bool witness_only_materialization = false;
   std::string refinement_exactness = "EXACT";
   std::size_t source_edges_removed = 0;
   std::size_t source_nodes_removed = 0;
