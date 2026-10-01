@@ -4,6 +4,9 @@
 #include <larch/grammar_topology.hpp>
 #include <larch/parsimony_chart.hpp>
 #include <larch/site_patterns.hpp>
+#include <larch/thread_pool.hpp>
+
+#include <cstring>
 
 #include <algorithm>
 #include <array>
@@ -1533,6 +1536,26 @@ struct multisite_trim_options {
   // 0 means unlimited.
   std::size_t max_frontier_entries_per_clade = 0;
 
+  // Score passes may store frontier entries class-compressed (one row per
+  // clade restriction class instead of one row per active pattern).  This is
+  // a pure representation change: every derived scalar of a score pass is
+  // identical to the per-pattern builder.  Ignored by passes that need
+  // production bitsets; the class-compressed witness builder additionally
+  // supports topology provenance.
+  bool class_compressed_score_pass = false;
+
+  // Witness-beam bounds for the class-compressed score pass: clades wider
+  // than beam_after_taxa keep at most beam_width entries with the smallest
+  // per-entry lower bounds (truncation happens during insertion, so peak
+  // memory stays bounded by a small multiple of beam_width).  Zero
+  // beam_after_taxa disables beaming.  Beaming trades completeness for
+  // tractability: the pass may drop every optimal-completable entry, in
+  // which case the computed optimum exceeds the true optimum and validation
+  // against a known exact optimum fails loudly.  Every emitted topology is
+  // still exactly re-scored, so beaming can never produce a wrong tree.
+  std::size_t beam_after_taxa = 0;
+  std::size_t beam_width = 0;
+
   // Opt-in semantic-oracle evidence.  When enabled, retain the equality-
   // deduplicated optimal root cost vectors together with the union of
   // production provenance represented by each vector.  This is deliberately
@@ -1648,6 +1671,22 @@ struct multisite_trim_result {
   std::vector<std::size_t> lazy_structural_class_count_by_clade;
   std::vector<multisite_optimal_root_provenance_class>
       optimal_root_provenance_classes;
+  // Set when a score pass stored frontier entries class-compressed (one row
+  // per clade restriction class instead of one row per active pattern).
+  bool class_compressed_score_pass = false;
+  std::size_t restriction_class_total = 0;
+  std::size_t restriction_class_max = 0;
+  // Constant-class factorization diagnostics for the class-compressed score
+  // pass: classes whose 4-state row is identical across every surviving
+  // entry of a clade are factored out of entry storage and lower bounds.
+  std::size_t factored_class_total = 0;
+  std::size_t factored_predictive_total = 0;
+  std::size_t factored_empirical_total = 0;
+  std::size_t varying_class_max = 0;
+  // Witness-beam diagnostics: set when any clade wider than beam_after_taxa
+  // had its frontier truncated to beam_width best-by-lower-bound entries.
+  bool beam_truncated = false;
+  std::size_t beam_truncated_entries = 0;
   multisite_exact_setup_work_stats exact_setup_work;
   std::vector<multisite_frontier_level_diagnostic> frontier_level_diagnostics;
   std::size_t exact_bnb_levels = 0;
@@ -1672,6 +1711,12 @@ struct multisite_topology_trace_result {
   std::uint64_t optimum = multisite_score_inf;
   std::uint64_t composite_lower_bound = multisite_score_inf;
   std::uint64_t initial_upper_bound = multisite_score_inf;
+  // Witness-beam diagnostics (see multisite_trim_options::beam_after_taxa):
+  // set when any clade's frontier was truncated to the beam width.  The
+  // emitted topology set may then be incomplete; every emitted topology is
+  // still exactly re-scored against the reported optimum.
+  bool beam_truncated = false;
+  std::size_t beam_truncated_entries = 0;
   std::vector<grammar_topology> topologies;
   std::vector<bool> keep_production;
   std::vector<std::size_t> frontier_sizes_by_clade;
@@ -2463,18 +2508,133 @@ inline void apply_score_only_dominance_pruning(
   // dominator in an optimal outside context, so merging would over-keep and
   // discarding would under-keep for exact optimal-production masks.  Public
   // callers using this helper must label keep_production as non-exact.
-  std::vector<bool> remove(entries.size(), false);
+  //
+  // Componentwise dominance implies a cascade of cheap necessary
+  // conditions: the dominating vector's component SUM, its component MINIMUM,
+  // and its whole PER-PATTERN MINIMA VECTOR must all be at most the dominated
+  // one's.  Sorting by (sum, min, index) plus the uint8 per-pattern minima
+  // vector (saturating costs above 255, which preserves the <= implication)
+  // rejects most incomparable pairs within a few patterns instead of a full
+  // cost-vector scan, which matters on large near-tied frontier clades where
+  // sums cluster inside the bound band.
+  struct dom_key {
+    std::uint64_t sum;
+    chart_cost min_component;
+    std::size_t index;
+  };
+  std::vector<dom_key> keys;
+  keys.reserve(entries.size());
+  std::vector<std::uint8_t> minima_storage;
+  minima_storage.reserve(entries.size() *
+                         (entries.empty() ? std::size_t{0}
+                                          : entries.front().f.cost.size() /
+                                                nuc_state_count));
   for (std::size_t i = 0; i < entries.size(); ++i) {
-    if (remove[i]) continue;
-    for (std::size_t j = 0; j < entries.size(); ++j) {
-      if (i == j || remove[j]) continue;
-      if (entries[i].f.cost == entries[j].f.cost) continue;
-      ++dominance_candidates_considered;
-      if (dominates(entries[i].f, entries[j].f)) {
-        remove[j] = true;
-        ++dominance_pruned;
+    auto const& cost = entries[i].f.cost;
+    std::uint64_t sum = 0;
+    chart_cost min_component = 0;
+    bool first = true;
+    auto base = minima_storage.size();
+    minima_storage.resize(base + cost.size() / nuc_state_count);
+    for (std::size_t k = 0; k < cost.size() / nuc_state_count; ++k) {
+      chart_cost pattern_min = cost[k * nuc_state_count];
+      for (std::uint8_t s = 1; s < nuc_state_count; ++s) {
+        auto v = cost[k * nuc_state_count + s];
+        if (v < pattern_min) pattern_min = v;
+      }
+      minima_storage[base + k] = pattern_min > 255
+                                     ? std::uint8_t{255}
+                                     : static_cast<std::uint8_t>(pattern_min);
+    }
+    for (auto v : cost) {
+      if (sum > (std::numeric_limits<std::uint64_t>::max)() - v) {
+        sum = (std::numeric_limits<std::uint64_t>::max)();
+      } else {
+        sum += v;
+      }
+      if (first || v < min_component) {
+        min_component = v;
+        first = false;
       }
     }
+    keys.push_back(dom_key{sum, min_component, i});
+  }
+  std::sort(keys.begin(), keys.end(), [](dom_key const& a, dom_key const& b) {
+    if (a.sum != b.sum) return a.sum < b.sum;
+    if (a.min_component != b.min_component)
+      return a.min_component < b.min_component;
+    return a.index < b.index;
+  });
+
+  std::vector<bool> remove(entries.size(), false);
+  auto const patterns_per_entry =
+      entries.empty() ? std::size_t{0}
+                      : entries.front().f.cost.size() / nuc_state_count;
+
+  // Per-target dominance checks are independent: by transitivity, "dominated
+  // by some other entry" equals "dominated by some surviving entry", so no
+  // sequencing between targets is required.  Large clades therefore check
+  // targets in parallel on the default pool with strided chunk assignment
+  // (high-sum targets scan longer prefixes, so striding balances chunks).
+  struct dom_chunk_counts {
+    std::size_t considered = 0;
+    std::size_t pruned = 0;
+  };
+  auto process_target = [&](std::size_t jj, dom_chunk_counts& counts) {
+    auto const& kj = keys[jj];
+    if (remove[kj.index]) return;
+    auto const* minima_j =
+        minima_storage.data() + kj.index * patterns_per_entry;
+    // Sorted order gives sum_i <= sum_j for every scanned ii; the scan stops
+    // after the equal-sum block.  Equal vectors never remove each other,
+    // matching the original pairwise loop's equality guard.
+    for (std::size_t ii = 0; ii < keys.size() && keys[ii].sum <= kj.sum;
+         ++ii) {
+      if (ii == jj) continue;
+      auto ki = keys[ii];
+      if (ki.min_component > kj.min_component) continue;
+      auto const* minima_i =
+          minima_storage.data() + ki.index * patterns_per_entry;
+      bool minima_ok = true;
+      for (std::size_t k = 0; k < patterns_per_entry; ++k) {
+        if (minima_i[k] > minima_j[k]) {
+          minima_ok = false;
+          break;
+        }
+      }
+      if (!minima_ok) continue;
+      ++counts.considered;
+      if (!dominates(entries[ki.index].f, entries[kj.index].f)) continue;
+      if (entries[ki.index].f.cost == entries[kj.index].f.cost) continue;
+      remove[kj.index] = true;
+      ++counts.pruned;
+      return;
+    }
+  };
+
+  auto const key_count = keys.size();
+  if (key_count >= 512) {
+    auto chunk_count = std::min<std::size_t>(
+        key_count, thread_pool::get_default().size() * 4);
+    std::vector<dom_chunk_counts> chunk_counts(chunk_count);
+    std::vector<std::size_t> chunk_ids(chunk_count);
+    std::iota(chunk_ids.begin(), chunk_ids.end(), std::size_t{0});
+    parallel_for_each(chunk_ids, [&](std::size_t chunk) {
+      for (std::size_t jj = chunk; jj < key_count; jj += chunk_count) {
+        process_target(jj, chunk_counts[chunk]);
+      }
+    });
+    for (auto const& cc : chunk_counts) {
+      dominance_candidates_considered += cc.considered;
+      dominance_pruned += cc.pruned;
+    }
+  } else {
+    dom_chunk_counts serial_counts;
+    for (std::size_t jj = 0; jj < key_count; ++jj) {
+      process_target(jj, serial_counts);
+    }
+    dominance_candidates_considered += serial_counts.considered;
+    dominance_pruned += serial_counts.pruned;
   }
 
   std::vector<frontier_entry> kept;
@@ -4507,6 +4667,20 @@ struct multisite_frontier_build_options {
   // thereby disclaims exact production-union mask semantics and must
   // re-score every emitted topology.
   bool provenance_for_witness_only = false;
+
+  // Store score-pass frontier entries as one row per restriction class of
+  // the clade instead of one row per active pattern (see the class-compressed
+  // builder below).  Requires a score-only build without production
+  // bitsets; the class-compressed builder additionally supports topology
+  // provenance for witness materialization.
+  bool class_compressed_entries = false;
+
+  // Witness-beam bounds (see multisite_trim_options::beam_after_taxa):
+  // clades wider than beam_after_taxa keep at most beam_width entries with
+  // the smallest lower bounds; truncation also runs during insertion once
+  // entries exceed four times beam_width.  Requires class_compressed_entries.
+  std::size_t beam_after_taxa = 0;
+  std::size_t beam_width = 0;
 };
 
 struct multisite_frontier_build_result {
@@ -4527,6 +4701,20 @@ struct multisite_frontier_build_result {
   std::size_t dominance_pruned = 0;
   std::size_t active_pattern_count = 0;
   std::vector<multisite_frontier_level_diagnostic> level_diagnostics;
+
+  // Set when frontier entries were stored class-compressed.  The class
+  // totals describe the compression actually used by the pass.
+  bool class_compressed = false;
+  std::size_t restriction_class_total = 0;
+  std::size_t restriction_class_max = 0;
+  // Constant-class factorization diagnostics (see multisite_trim_result).
+  std::size_t factored_class_total = 0;
+  std::size_t factored_predictive_total = 0;
+  std::size_t factored_empirical_total = 0;
+  std::size_t varying_class_max = 0;
+  // Witness-beam diagnostics (see multisite_trim_options::beam_after_taxa).
+  bool beam_truncated = false;
+  std::size_t beam_truncated_entries = 0;
 
   [[nodiscard]] std::vector<active_pattern_info> const&
   active_pattern_view() const noexcept {
@@ -4583,6 +4771,1279 @@ inline void validate_multisite_frontier_build_options(
   }
 }
 
+// --- Class-compressed score-pass frontiers ---------------------------------
+//
+// The multisite combine operator is pattern independent: a binary production
+// applies the same min-plus state operator to every active pattern's column,
+// and patterns enter the dynamic program only through their leaf rows.  Two
+// active patterns with identical restrictions to a clade's taxa therefore
+// carry identical columns in every frontier entry at that clade, so a
+// frontier entry can store one row per restriction class instead of one row
+// per pattern.  On grammars whose whole-column pattern compression is poor
+// this shrinks entry storage, dedup keys, and dominance scans by the class
+// redundancy while every derived scalar (lower bounds, pruned counts,
+// equality deduplication, and the certified optimum) stays identical to the
+// per-pattern builder.  The root clade's restriction classes are the distinct
+// whole-column patterns, so exporting the root frontier back to full
+// per-pattern cost vectors loses nothing.
+
+struct multisite_restriction_classes {
+  std::size_t class_count = 0;
+  // One entry per active pattern.
+  std::vector<std::uint32_t> class_of_pattern;
+  std::vector<std::uint64_t> weight_by_class;
+  // Only populated for leaf clades: the observed state of each class.
+  std::vector<std::uint8_t> leaf_state_by_class;
+};
+
+inline multisite_restriction_classes build_restriction_classes(
+    clade_grammar const& grammar, clade_id clade,
+    std::vector<active_pattern_info> const& active,
+    std::vector<multisite_restriction_classes> const& classes_so_far) {
+  // Bottom-up row-key classes.  Two active patterns with identical
+  // restriction to a clade's taxa have identical columns in every frontier
+  // entry at that clade, because the multisite combine operator is pattern
+  // independent and patterns enter the DP only through leaf rows.  The
+  // converse fails, so restriction classes are refined into row-key classes:
+  // a pattern's key at an interior clade is the tuple of its child classes
+  // over every production of that clade.  By induction over the bottom-up
+  // build, equal keys again imply identical columns in every entry at the
+  // clade, and this grouping is coarser than plain restriction classes
+  // wherever the grammar cannot distinguish two restrictions.
+  auto const pattern_count = active.size();
+  multisite_restriction_classes classes;
+  classes.class_of_pattern.assign(pattern_count, 0);
+
+  auto const& key = grammar.clades[clade];
+  if (key.taxa.size() == 1) {
+    // Leaf classes are the distinct observed states.
+    auto taxon = key.taxa.front();
+    std::vector<std::uint8_t> class_state;
+    std::unordered_map<std::uint8_t, std::uint32_t> class_by_state;
+    for (std::size_t index = 0; index < pattern_count; ++index) {
+      auto const& states = active[index].state_by_taxon;
+      if (taxon >= states.size()) {
+        throw std::runtime_error(
+            "multi-site trim: taxon out of active pattern range");
+      }
+      auto observed = states[taxon];
+      auto [found, inserted] =
+          class_by_state.emplace(observed, classes.class_count);
+      if (inserted) {
+        ++classes.class_count;
+        class_state.push_back(observed);
+      }
+      classes.class_of_pattern[index] = found->second;
+    }
+    classes.leaf_state_by_class = std::move(class_state);
+  } else {
+    struct class_key_hash {
+      std::size_t operator()(
+          std::vector<std::uint32_t> const& key) const noexcept {
+        std::size_t h = key.size();
+        for (auto value : key) {
+          h ^= std::hash<std::uint32_t>{}(value) + 0x9e3779b97f4a7c15ULL +
+               (h << 6) + (h >> 2);
+        }
+        return h;
+      }
+    };
+    std::vector<std::uint32_t> class_key;
+    std::unordered_map<std::vector<std::uint32_t>, std::uint32_t,
+                       class_key_hash>
+        class_by_key;
+    class_by_key.reserve(pattern_count * 2);
+    auto const& productions = grammar.productions_by_parent[clade];
+    for (std::size_t index = 0; index < pattern_count; ++index) {
+      class_key.clear();
+      class_key.reserve(productions.size() * 2);
+      for (auto pid : productions) {
+        for (auto child : grammar.productions[pid].children) {
+          class_key.push_back(
+              classes_so_far[child].class_of_pattern[index]);
+        }
+      }
+      auto found = class_by_key.find(class_key);
+      if (found != class_by_key.end()) {
+        classes.class_of_pattern[index] = found->second;
+        continue;
+      }
+      class_by_key.emplace(class_key, classes.class_count);
+      classes.class_of_pattern[index] = classes.class_count;
+      ++classes.class_count;
+    }
+  }
+
+  classes.weight_by_class.assign(classes.class_count, 0);
+  for (std::size_t index = 0; index < pattern_count; ++index) {
+    classes.weight_by_class[classes.class_of_pattern[index]] +=
+        active[index].weight;
+  }
+  return classes;
+}
+
+struct multisite_production_class_map {
+  // Parent class -> (left child class, right child class).  A parent class is
+  // a restriction to the parent's taxa, which determines the restrictions to
+  // each child's taxa, so this map is a well-defined function.
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> children_by_class;
+};
+
+inline multisite_production_class_map build_production_class_map(
+    clade_grammar const& grammar, grammar_production const& prod,
+    std::vector<multisite_restriction_classes> const& classes) {
+  multisite_production_class_map map;
+  map.children_by_class.assign(classes[prod.parent].class_count, {0, 0});
+  std::vector<bool> seen(classes[prod.parent].class_count, false);
+  for (std::size_t index = 0; index < classes[prod.parent].class_of_pattern.size();
+       ++index) {
+    auto parent_class = classes[prod.parent].class_of_pattern[index];
+    auto left_class = classes[prod.children[0]].class_of_pattern[index];
+    auto right_class = classes[prod.children[1]].class_of_pattern[index];
+    if (!seen[parent_class]) {
+      map.children_by_class[parent_class] = {left_class, right_class};
+      seen[parent_class] = true;
+    } else if (map.children_by_class[parent_class] !=
+               std::make_pair(left_class, right_class)) {
+      throw std::runtime_error(
+          "multi-site trim: class-compressed combine map is inconsistent");
+    }
+  }
+  return map;
+}
+
+struct compressed_frontier_entry {
+  // Class-major rows over the clade's varying classes: varying_count *
+  // nuc_state_count components.
+  std::vector<chart_cost> rows;
+  std::uint64_t topology_hash = 0;
+  // Construction provenance (keep_provenance builds only): each choice fixes
+  // one production and the child frontier entries combined here.  Equal rows
+  // merge provenance under max_provenance_choices_per_entry.
+  std::vector<frontier_provenance_choice> provenance;
+  // Cached per-entry lower bound (lb_offset + varying part), used by
+  // witness-beam truncation.  Meaningful only when computed during insertion.
+  std::uint64_t lb = 0;
+};
+
+inline void combine_compressed_rows(
+    std::span<chart_cost const> left, std::span<chart_cost const> right,
+    multisite_production_class_map const& map, production_id pid,
+    std::uint64_t left_hash, std::uint64_t right_hash, std::size_t class_count,
+    compressed_frontier_entry& out) {
+  out.rows.assign(class_count * nuc_state_count, chart_inf);
+  out.topology_hash =
+      mix_hash(mix_hash(mix_hash(0x70726f64ULL, pid), left_hash), right_hash);
+  for (std::size_t parent_class = 0; parent_class < class_count;
+       ++parent_class) {
+    auto [left_class, right_class] =
+        map.children_by_class[parent_class];
+    for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+         ++parent_state) {
+      chart_cost best_left = chart_inf;
+      chart_cost best_right = chart_inf;
+      for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+           ++child_state) {
+        best_left = std::min(
+            best_left, parsimony_chart_detail::saturated_add(
+                           left[left_class * nuc_state_count + child_state],
+                           parsimony_chart_detail::transition_cost(
+                               parent_state, child_state)));
+        best_right = std::min(
+            best_right, parsimony_chart_detail::saturated_add(
+                            right[right_class * nuc_state_count + child_state],
+                            parsimony_chart_detail::transition_cost(
+                                parent_state, child_state)));
+      }
+      out.rows[parent_class * nuc_state_count + parent_state] =
+          parsimony_chart_detail::saturated_add(best_left, best_right);
+    }
+  }
+}
+
+inline std::uint64_t lower_bound_for_compressed_rows(
+    std::span<chart_cost const> rows,
+    multisite_restriction_classes const& classes, clade_id clade,
+    std::vector<active_pattern_info> const& active,
+    std::uint64_t invariant_offset, chart_options const& options) {
+  std::uint64_t total = invariant_offset;
+  if (rows.size() != classes.class_count * nuc_state_count) {
+    throw std::runtime_error(
+        "multi-site trim: class-compressed cost vector has wrong size");
+  }
+  for (std::size_t active_index = 0; active_index < active.size();
+       ++active_index) {
+    auto const& info = active[active_index];
+    auto const* row =
+        rows.data() + classes.class_of_pattern[active_index] * nuc_state_count;
+    if (!options.score_ua_edge) {
+      if (clade >= info.outside_ua_free.outside.size()) {
+        throw std::runtime_error("multi-site trim: clade out of outside range");
+      }
+      chart_cost best = chart_inf;
+      for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+        best = std::min(
+            best, parsimony_chart_detail::saturated_add(
+                      row[state], info.outside_ua_free.outside[clade][state]));
+      }
+      total = checked_add_u64(
+          total,
+          checked_mul_cost(info.weight, best,
+                           "weighted active-pattern lower bound"),
+          "active-pattern lower-bound total");
+    } else {
+      for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+           ++reference_state) {
+        auto count = info.reference_state_counts[reference_state];
+        if (count == 0) continue;
+        auto const& outside = info.outside_by_reference[reference_state];
+        if (clade >= outside.outside.size()) {
+          throw std::runtime_error(
+              "multi-site trim: clade out of reference outside range");
+        }
+        chart_cost best = chart_inf;
+        for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+          best = std::min(
+              best,
+              parsimony_chart_detail::saturated_add(
+                  row[state], outside.outside[clade][state]));
+        }
+        total = checked_add_u64(
+            total,
+            checked_mul_cost(count, best,
+                             "weighted active-pattern root-edge lower "
+                             "bound"),
+            "active-pattern root-edge lower-bound total");
+      }
+    }
+  }
+  return total;
+}
+
+inline void apply_score_only_dominance_pruning_compressed(
+    std::vector<compressed_frontier_entry>& entries,
+    std::size_t& dominance_candidates_considered,
+    std::size_t& dominance_pruned,
+    std::uint64_t factored_sum_offset = 0,
+    chart_cost factored_min_component = chart_inf) {
+  // Identical cascade to apply_score_only_dominance_pruning, with the
+  // minima-vector test operating per class instead of per pattern: classes
+  // partition the patterns, so class-row dominance is exactly pattern-column
+  // dominance and the removal set is unchanged.
+  //
+  // When constant classes have been factored out of the stored rows, the
+  // factored components are identical in every entry.  Adding their common
+  // sum to every key and flooring every key's minimum component with their
+  // common minimum reproduces the full-row keys exactly, so the sort order,
+  // the candidate count, and the removal set are bit-identical to the
+  // unfactored scan.  The per-class minima filter may drop factored classes
+  // from its width; a factored class never fails the filter because both
+  // sides share the same minima there.
+  struct dom_key {
+    std::uint64_t sum;
+    chart_cost min_component;
+    std::size_t index;
+  };
+  std::vector<dom_key> keys;
+  keys.reserve(entries.size());
+  std::vector<std::uint8_t> minima_storage;
+  std::size_t class_count = 0;
+  if (!entries.empty()) {
+    class_count = entries.front().rows.size() / nuc_state_count;
+    minima_storage.reserve(entries.size() * class_count);
+  }
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    auto const& rows = entries[i].rows;
+    std::uint64_t sum = factored_sum_offset;
+    chart_cost min_component = factored_min_component;
+    bool first = false;
+    auto base = minima_storage.size();
+    minima_storage.resize(base + class_count);
+    for (std::size_t c = 0; c < class_count; ++c) {
+      chart_cost class_min = rows[c * nuc_state_count];
+      for (std::uint8_t s = 1; s < nuc_state_count; ++s) {
+        auto v = rows[c * nuc_state_count + s];
+        if (v < class_min) class_min = v;
+      }
+      minima_storage[base + c] =
+          class_min > 255 ? std::uint8_t{255}
+                          : static_cast<std::uint8_t>(class_min);
+    }
+    for (auto v : rows) {
+      if (sum > (std::numeric_limits<std::uint64_t>::max)() - v) {
+        sum = (std::numeric_limits<std::uint64_t>::max)();
+      } else {
+        sum += v;
+      }
+      if (first || v < min_component) {
+        min_component = v;
+        first = false;
+      }
+    }
+    keys.push_back(dom_key{sum, min_component, i});
+  }
+  std::sort(keys.begin(), keys.end(), [](dom_key const& a, dom_key const& b) {
+    if (a.sum != b.sum) return a.sum < b.sum;
+    if (a.min_component != b.min_component)
+      return a.min_component < b.min_component;
+    return a.index < b.index;
+  });
+
+  std::vector<bool> remove(entries.size(), false);
+  auto rows_dominates = [](std::span<chart_cost const> lhs,
+                           std::span<chart_cost const> rhs) {
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+      if (lhs[i] > rhs[i]) return false;
+    }
+    return true;
+  };
+
+  struct dom_chunk_counts {
+    std::size_t considered = 0;
+    std::size_t pruned = 0;
+  };
+  auto process_target = [&](std::size_t jj, dom_chunk_counts& counts) {
+    auto const& kj = keys[jj];
+    if (remove[kj.index]) return;
+    auto const* minima_j = minima_storage.data() + kj.index * class_count;
+    for (std::size_t ii = 0; ii < keys.size() && keys[ii].sum <= kj.sum;
+         ++ii) {
+      if (ii == jj) continue;
+      auto ki = keys[ii];
+      if (ki.min_component > kj.min_component) continue;
+      auto const* minima_i = minima_storage.data() + ki.index * class_count;
+      bool minima_ok = true;
+      for (std::size_t c = 0; c < class_count; ++c) {
+        if (minima_i[c] > minima_j[c]) {
+          minima_ok = false;
+          break;
+        }
+      }
+      if (!minima_ok) continue;
+      ++counts.considered;
+      if (!rows_dominates(entries[ki.index].rows, entries[kj.index].rows)) {
+        continue;
+      }
+      if (entries[ki.index].rows == entries[kj.index].rows) continue;
+      remove[kj.index] = true;
+      ++counts.pruned;
+      return;
+    }
+  };
+
+  auto const key_count = keys.size();
+  if (key_count >= 512) {
+    auto chunk_count = std::min<std::size_t>(
+        key_count, thread_pool::get_default().size() * 4);
+    std::vector<dom_chunk_counts> chunk_counts(chunk_count);
+    std::vector<std::size_t> chunk_ids(chunk_count);
+    std::iota(chunk_ids.begin(), chunk_ids.end(), std::size_t{0});
+    parallel_for_each(chunk_ids, [&](std::size_t chunk) {
+      for (std::size_t jj = chunk; jj < key_count; jj += chunk_count) {
+        process_target(jj, chunk_counts[chunk]);
+      }
+    });
+    for (auto const& cc : chunk_counts) {
+      dominance_candidates_considered += cc.considered;
+      dominance_pruned += cc.pruned;
+    }
+  } else {
+    dom_chunk_counts serial_counts;
+    for (std::size_t jj = 0; jj < key_count; ++jj) {
+      process_target(jj, serial_counts);
+    }
+    dominance_candidates_considered += serial_counts.considered;
+    dominance_pruned += serial_counts.pruned;
+  }
+
+  std::vector<compressed_frontier_entry> kept;
+  kept.reserve(entries.size());
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (!remove[i]) kept.push_back(std::move(entries[i]));
+  }
+  entries = std::move(kept);
+}
+
+inline std::size_t compressed_row_hash(std::span<chart_cost const> rows) {
+  std::size_t h = rows.size();
+  for (auto value : rows) {
+    h ^= std::hash<chart_cost>{}(value) + 0x9e3779b97f4a7c15ULL + (h << 6) +
+         (h >> 2);
+  }
+  return h;
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic constant-class factorization.
+//
+// A class whose 4-state cost row is identical across every surviving entry
+// of a clade's frontier is dead for every decision above that clade: the row
+// is entry independent, so neither the choice among the clade's entries nor
+// any completion above it can change that class's contribution to an
+// ancestor score.  Factored classes therefore need no per-entry row storage,
+// contribute a per-clade constant to every lower bound, and can be dropped
+// from dominance scans exactly, because equality and dominance of full cost
+// vectors are determined by the varying projection alone.  Constancy is
+// detected two ways, both exact:
+//
+//   * predictively, bottom-up: a class is factored when every production of
+//     the clade maps it to child classes that are factored at the (fully
+//     processed) children and the combined values agree across productions;
+//     such a class is constant across all candidates, hence across all
+//     survivors;
+//   * empirically, after dominance: any remaining class whose row is
+//     identical across all survivors is factored regardless of how the
+//     constancy arose (bound pruning and dominance can make whole classes
+//     entry independent).
+//
+// Leaves have a single entry, so all their classes are factored, and once a
+// class is factored at a clade its constancy propagates upward through the
+// predictive rule.
+struct multisite_clade_factorization {
+  static constexpr std::uint32_t no_slot =
+      (std::numeric_limits<std::uint32_t>::max)();
+
+  // class_count * nuc_state_count; meaningful only for factored classes.
+  std::vector<chart_cost> factored_value;
+  // class_count -> slot index for varying classes, no_slot for factored.
+  std::vector<std::uint32_t> slot_of_class;
+  // slot -> class id, varying classes only.
+  std::vector<std::uint32_t> varying_classes;
+  // (active pattern index, slot) for every pattern in a varying class.
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> varying_pattern_refs;
+  // invariant offset + lower-bound contribution of every factored class at
+  // this clade; the per-candidate bound is this plus the varying part.
+  std::uint64_t lb_offset = 0;
+  // Sum of all factored components and their minimum, so dominance over the
+  // varying projection reproduces the full-row keys exactly.
+  std::uint64_t factored_component_sum = 0;
+  chart_cost factored_component_min = chart_inf;
+};
+
+// Min-plus combine of one class row, matching combine_compressed_rows'
+// arithmetic for a single parent class.
+inline void combine_class_row(chart_cost const* left, chart_cost const* right,
+                              chart_cost* out) {
+  for (std::uint8_t parent_state = 0; parent_state < nuc_state_count;
+       ++parent_state) {
+    chart_cost best_left = chart_inf;
+    chart_cost best_right = chart_inf;
+    for (std::uint8_t child_state = 0; child_state < nuc_state_count;
+         ++child_state) {
+      best_left = std::min(
+          best_left,
+          parsimony_chart_detail::saturated_add(
+              left[child_state], parsimony_chart_detail::transition_cost(
+                                     parent_state, child_state)));
+      best_right = std::min(
+          best_right,
+          parsimony_chart_detail::saturated_add(
+              right[child_state], parsimony_chart_detail::transition_cost(
+                                      parent_state, child_state)));
+    }
+    out[parent_state] =
+        parsimony_chart_detail::saturated_add(best_left, best_right);
+  }
+}
+
+inline multisite_clade_factorization compute_leaf_factorization(
+    multisite_restriction_classes const& classes) {
+  multisite_clade_factorization fact;
+  fact.factored_value.assign(classes.class_count * nuc_state_count,
+                             chart_inf);
+  for (std::size_t c = 0; c < classes.class_count; ++c) {
+    fact.factored_value[c * nuc_state_count +
+                        classes.leaf_state_by_class[c]] = chart_cost{0};
+  }
+  fact.slot_of_class.assign(classes.class_count,
+                            multisite_clade_factorization::no_slot);
+  return fact;
+}
+
+inline multisite_clade_factorization compute_interior_factorization(
+    clade_grammar const& grammar, clade_id clade,
+    std::vector<multisite_restriction_classes> const& classes,
+    std::vector<multisite_production_class_map> const& production_maps,
+    std::vector<multisite_clade_factorization> const& factorization) {
+  auto const class_count = classes[clade].class_count;
+  multisite_clade_factorization fact;
+  fact.factored_value.assign(class_count * nuc_state_count, chart_inf);
+  fact.slot_of_class.assign(class_count,
+                            multisite_clade_factorization::no_slot);
+  std::vector<chart_cost> combined(nuc_state_count);
+  std::vector<chart_cost> first(nuc_state_count);
+  for (std::size_t c = 0; c < class_count; ++c) {
+    bool factored = true;
+    bool have_first = false;
+    for (auto pid : grammar.productions_by_parent[clade]) {
+      auto const& prod = grammar.productions[pid];
+      auto const& map = production_maps[pid];
+      auto [left_class, right_class] = map.children_by_class[c];
+      auto const& left_fact = factorization[prod.children[0]];
+      auto const& right_fact = factorization[prod.children[1]];
+      if (left_fact.slot_of_class[left_class] !=
+              multisite_clade_factorization::no_slot ||
+          right_fact.slot_of_class[right_class] !=
+              multisite_clade_factorization::no_slot) {
+        factored = false;
+        break;
+      }
+      combine_class_row(
+          left_fact.factored_value.data() + left_class * nuc_state_count,
+          right_fact.factored_value.data() + right_class * nuc_state_count,
+          combined.data());
+      if (!have_first) {
+        first = combined;
+        have_first = true;
+      } else if (first != combined) {
+        factored = false;
+        break;
+      }
+    }
+    if (factored) {
+      std::copy(first.begin(), first.end(),
+                fact.factored_value.begin() +
+                    static_cast<std::ptrdiff_t>(c) * nuc_state_count);
+    } else {
+      fact.slot_of_class[c] =
+          static_cast<std::uint32_t>(fact.varying_classes.size());
+      fact.varying_classes.push_back(static_cast<std::uint32_t>(c));
+    }
+  }
+  return fact;
+}
+
+// Accumulates the factored-class lower-bound offset and the dominance key
+// offsets from the current predictive factoring, and records the varying
+// pattern list.
+inline void finalize_factorization_bounds(
+    multisite_clade_factorization& fact,
+    multisite_restriction_classes const& classes, clade_id clade,
+    std::vector<active_pattern_info> const& active,
+    std::uint64_t invariant_offset, chart_options const& options) {
+  fact.lb_offset = invariant_offset;
+  fact.factored_component_sum = 0;
+  fact.factored_component_min = chart_inf;
+  fact.varying_pattern_refs.clear();
+  for (std::size_t active_index = 0; active_index < active.size();
+       ++active_index) {
+    auto parent_class = classes.class_of_pattern[active_index];
+    if (fact.slot_of_class[parent_class] !=
+        multisite_clade_factorization::no_slot) {
+      fact.varying_pattern_refs.emplace_back(
+          static_cast<std::uint32_t>(active_index),
+          fact.slot_of_class[parent_class]);
+      continue;
+    }
+    auto const* row =
+        fact.factored_value.data() + parent_class * nuc_state_count;
+    auto const& info = active[active_index];
+    if (!options.score_ua_edge) {
+      chart_cost best = chart_inf;
+      for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+        best = std::min(
+            best, parsimony_chart_detail::saturated_add(
+                      row[state], info.outside_ua_free.outside[clade][state]));
+      }
+      fact.lb_offset = checked_add_u64(
+          fact.lb_offset,
+          checked_mul_cost(info.weight, best,
+                           "weighted active-pattern lower bound"),
+          "active-pattern lower-bound total");
+    } else {
+      for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+           ++reference_state) {
+        auto count = info.reference_state_counts[reference_state];
+        if (count == 0) continue;
+        auto const& outside = info.outside_by_reference[reference_state];
+        chart_cost best = chart_inf;
+        for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+          best = std::min(
+              best,
+              parsimony_chart_detail::saturated_add(
+                  row[state], outside.outside[clade][state]));
+        }
+        fact.lb_offset = checked_add_u64(
+            fact.lb_offset,
+            checked_mul_cost(count, best,
+                             "weighted active-pattern root-edge lower bound"),
+            "active-pattern lower-bound total");
+      }
+    }
+  }
+  for (std::size_t c = 0; c < classes.class_count; ++c) {
+    if (fact.slot_of_class[c] != multisite_clade_factorization::no_slot) {
+      continue;
+    }
+    for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+      auto value = fact.factored_value[c * nuc_state_count + state];
+      fact.factored_component_sum += value;
+      if (value < fact.factored_component_min) {
+        fact.factored_component_min = value;
+      }
+    }
+  }
+}
+
+inline std::uint64_t lower_bound_for_compressed_rows_factored(
+    std::span<chart_cost const> rows,
+    multisite_clade_factorization const& fact,
+    std::vector<active_pattern_info> const& active, clade_id clade,
+    chart_options const& options) {
+  // Varying-class part of lower_bound_for_compressed_rows; same arithmetic,
+  // restricted to patterns whose class still varies at this clade.
+  std::uint64_t total = 0;
+  for (auto const& [active_index, slot] : fact.varying_pattern_refs) {
+    auto const& info = active[active_index];
+    auto const* row = rows.data() + slot * nuc_state_count;
+    if (!options.score_ua_edge) {
+      chart_cost best = chart_inf;
+      for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+        best = std::min(
+            best, parsimony_chart_detail::saturated_add(
+                      row[state], info.outside_ua_free.outside[clade][state]));
+      }
+      total = checked_add_u64(
+          total,
+          checked_mul_cost(info.weight, best,
+                           "weighted active-pattern lower bound"),
+          "active-pattern lower-bound total");
+    } else {
+      for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+           ++reference_state) {
+        auto count = info.reference_state_counts[reference_state];
+        if (count == 0) continue;
+        auto const& outside = info.outside_by_reference[reference_state];
+        chart_cost best = chart_inf;
+        for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+          best = std::min(
+              best,
+              parsimony_chart_detail::saturated_add(
+                  row[state], outside.outside[clade][state]));
+        }
+        total = checked_add_u64(
+            total,
+            checked_mul_cost(count, best,
+                             "weighted active-pattern root-edge lower "
+                             "bound"),
+            "active-pattern lower-bound total");
+      }
+    }
+  }
+  return total;
+}
+
+// Per-production instruction list for building a candidate's varying rows.
+struct compressed_combine_plan {
+  struct instr {
+    std::uint32_t parent_slot;
+    std::uint32_t left_class;
+    std::uint32_t left_slot;  // no_slot => read the child's factored table
+    std::uint32_t right_class;
+    std::uint32_t right_slot;
+  };
+  std::vector<instr> instrs;
+};
+
+inline compressed_combine_plan build_combine_plan(
+    multisite_clade_factorization const& parent_fact,
+    multisite_production_class_map const& map,
+    multisite_clade_factorization const& left_fact,
+    multisite_clade_factorization const& right_fact) {
+  compressed_combine_plan plan;
+  plan.instrs.reserve(parent_fact.varying_classes.size());
+  for (auto parent_class : parent_fact.varying_classes) {
+    auto [left_class, right_class] = map.children_by_class[parent_class];
+    plan.instrs.push_back(compressed_combine_plan::instr{
+        parent_fact.slot_of_class[parent_class], left_class,
+        left_fact.slot_of_class[left_class], right_class,
+        right_fact.slot_of_class[right_class]});
+  }
+  return plan;
+}
+
+inline void combine_compressed_rows_factored(
+    std::span<chart_cost const> left, std::span<chart_cost const> right,
+    compressed_combine_plan const& plan,
+    multisite_clade_factorization const& left_fact,
+    multisite_clade_factorization const& right_fact, production_id pid,
+    std::uint64_t left_hash, std::uint64_t right_hash,
+    std::size_t varying_count, compressed_frontier_entry& out) {
+  out.rows.assign(varying_count * nuc_state_count, chart_inf);
+  out.topology_hash =
+      mix_hash(mix_hash(mix_hash(0x70726f64ULL, pid), left_hash), right_hash);
+  for (auto const& ins : plan.instrs) {
+    chart_cost const* left_row =
+        ins.left_slot == multisite_clade_factorization::no_slot
+            ? left_fact.factored_value.data() +
+                  ins.left_class * nuc_state_count
+            : left.data() + ins.left_slot * nuc_state_count;
+    chart_cost const* right_row =
+        ins.right_slot == multisite_clade_factorization::no_slot
+            ? right_fact.factored_value.data() +
+                  ins.right_class * nuc_state_count
+            : right.data() + ins.right_slot * nuc_state_count;
+    combine_class_row(
+        left_row, right_row,
+        out.rows.data() + ins.parent_slot * nuc_state_count);
+  }
+}
+
+// Factors every remaining class whose row is identical across all
+// survivors, compacts the stored rows, and returns the number of classes
+// newly factored.  Called after dominance, before any parent consumes the
+// frontier.
+inline std::size_t compact_constant_classes(
+    std::vector<compressed_frontier_entry>& entries,
+    multisite_clade_factorization& fact,
+    multisite_restriction_classes const& classes) {
+  auto const slot_count = fact.varying_classes.size();
+  if (entries.size() <= 1 || slot_count == 0) {
+    if (entries.size() == 1 && slot_count != 0) {
+      // A single survivor makes every remaining class constant.
+      auto const& reference = entries.front().rows;
+      for (std::size_t j = 0; j < slot_count; ++j) {
+        auto parent_class = fact.varying_classes[j];
+        std::copy(reference.begin() +
+                      static_cast<std::ptrdiff_t>(j) * nuc_state_count,
+                  reference.begin() +
+                      static_cast<std::ptrdiff_t>(j + 1) * nuc_state_count,
+                  fact.factored_value.begin() +
+                      static_cast<std::ptrdiff_t>(parent_class) *
+                          nuc_state_count);
+        fact.slot_of_class[parent_class] =
+            multisite_clade_factorization::no_slot;
+      }
+      fact.varying_classes.clear();
+      for (auto& entry : entries) {
+        std::vector<chart_cost>().swap(entry.rows);
+      }
+      return slot_count;
+    }
+    return 0;
+  }
+  std::vector<char> alive(slot_count, 1);
+  auto const& reference = entries.front().rows;
+  for (std::size_t e = 1; e < entries.size(); ++e) {
+    auto const& rows = entries[e].rows;
+    char any_alive = 0;
+    for (std::size_t j = 0; j < slot_count; ++j) {
+      if (!alive[j]) continue;
+      auto const* a =
+          reference.data() + static_cast<std::ptrdiff_t>(j) * nuc_state_count;
+      auto const* b =
+          rows.data() + static_cast<std::ptrdiff_t>(j) * nuc_state_count;
+      bool equal = true;
+      for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+        if (a[state] != b[state]) {
+          equal = false;
+          break;
+        }
+      }
+      if (!equal) alive[j] = 0;
+      any_alive |= alive[j];
+    }
+    if (!any_alive) break;
+  }
+  std::size_t newly_factored = 0;
+  for (std::size_t j = 0; j < slot_count; ++j) {
+    if (alive[j]) {
+      ++newly_factored;
+      auto parent_class = fact.varying_classes[j];
+      std::copy(reference.begin() +
+                    static_cast<std::ptrdiff_t>(j) * nuc_state_count,
+                reference.begin() +
+                    static_cast<std::ptrdiff_t>(j + 1) * nuc_state_count,
+                fact.factored_value.begin() +
+                    static_cast<std::ptrdiff_t>(parent_class) *
+                        nuc_state_count);
+      fact.slot_of_class[parent_class] =
+          multisite_clade_factorization::no_slot;
+    }
+  }
+  if (newly_factored == 0) return 0;
+  std::vector<std::uint32_t> remap(slot_count,
+                                   multisite_clade_factorization::no_slot);
+  std::vector<std::uint32_t> kept_slots;
+  kept_slots.reserve(slot_count - newly_factored);
+  for (std::size_t j = 0; j < slot_count; ++j) {
+    if (!alive[j]) {
+      remap[j] = static_cast<std::uint32_t>(kept_slots.size());
+      kept_slots.push_back(static_cast<std::uint32_t>(j));
+    }
+  }
+  std::vector<std::uint32_t> new_varying_classes;
+  new_varying_classes.reserve(kept_slots.size());
+  for (auto j : kept_slots) {
+    new_varying_classes.push_back(fact.varying_classes[j]);
+  }
+  fact.varying_classes = std::move(new_varying_classes);
+  for (std::size_t c = 0; c < classes.class_count; ++c) {
+    auto& slot = fact.slot_of_class[c];
+    if (slot != multisite_clade_factorization::no_slot) {
+      slot = remap[slot];
+    }
+  }
+  auto kept_width = kept_slots.size() * nuc_state_count;
+  for (auto& entry : entries) {
+    std::vector<chart_cost> compact(kept_width, chart_inf);
+    for (std::size_t k = 0; k < kept_slots.size(); ++k) {
+      auto src = static_cast<std::ptrdiff_t>(kept_slots[k]) * nuc_state_count;
+      std::copy_n(entry.rows.begin() + src, nuc_state_count,
+                  compact.begin() +
+                      static_cast<std::ptrdiff_t>(k) * nuc_state_count);
+    }
+    entry.rows = std::move(compact);
+  }
+  return newly_factored;
+}
+
+inline multisite_frontier_build_result build_multisite_frontiers_class_compressed(
+    clade_grammar const& grammar, chart_options const& options,
+    multisite_frontier_build_options const& build_options,
+    std::string const& context,
+    std::vector<active_pattern_info> const* setup_active_patterns,
+    std::vector<active_pattern_info> owned_active_patterns,
+    std::uint64_t composite_lower_bound,
+    std::uint64_t invariant_constant_offset_value,
+    std::uint64_t initial_upper_bound_value) {
+  if (build_options.keep_used_production) {
+    throw std::runtime_error(
+        context +
+        ": class-compressed frontiers do not carry production bitsets");
+  }
+  if (build_options.dominance_mode != multisite_dominance_mode::off &&
+      build_options.dominance_mode != multisite_dominance_mode::score_only) {
+    throw std::runtime_error(
+        context +
+        ": class-compressed frontiers support off or score-only dominance");
+  }
+  if ((build_options.beam_after_taxa != 0 || build_options.beam_width != 0) &&
+      !(build_options.beam_after_taxa != 0 && build_options.beam_width != 0)) {
+    throw std::runtime_error(
+        context +
+        ": witness beaming requires both beam_after_taxa and beam_width");
+  }
+
+  multisite_frontier_build_result result;
+  result.class_compressed = true;
+  result.composite_lower_bound = composite_lower_bound;
+  result.frontier_sizes_by_clade.assign(grammar.clades.size(), 0);
+  result.invariant_constant_offset = invariant_constant_offset_value;
+
+  result.active_patterns = std::move(owned_active_patterns);
+  result.setup_active_patterns = setup_active_patterns;
+  auto const& active_patterns = result.active_pattern_view();
+  result.active_pattern_count = active_patterns.size();
+  result.initial_upper_bound = initial_upper_bound_value;
+  auto pruning_upper_bound = build_options.upper_bound_override
+                                 ? *build_options.upper_bound_override
+                                 : result.initial_upper_bound;
+
+  bool const prof_active = std::getenv("WRIC_PROFILE_FRONTIER") != nullptr;
+  auto const prof_unused = std::chrono::steady_clock::time_point{};
+  auto prof_ms_since = [](std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0)
+        .count();
+  };
+
+  std::vector<multisite_restriction_classes> classes(grammar.clades.size());
+  {
+    auto tables_t0 = prof_active ? std::chrono::steady_clock::now()
+                                 : prof_unused;
+    // Row-key classes are built bottom-up: a clade's key references its
+    // children's classes, and children always have strictly fewer taxa than
+    // their parents, so ascending taxa order visits every child first.
+    std::vector<clade_id> table_order(grammar.clades.size());
+    std::iota(table_order.begin(), table_order.end(), clade_id{0});
+    std::stable_sort(table_order.begin(), table_order.end(),
+                     [&](clade_id lhs, clade_id rhs) {
+                       auto lsize = grammar.clades[lhs].taxa.size();
+                       auto rsize = grammar.clades[rhs].taxa.size();
+                       if (lsize != rsize) return lsize < rsize;
+                       return lhs < rhs;
+                     });
+    for (auto clade : table_order) {
+      classes[clade] = build_restriction_classes(
+          grammar, clade, active_patterns, classes);
+      result.restriction_class_total += classes[clade].class_count;
+      result.restriction_class_max =
+          std::max(result.restriction_class_max, classes[clade].class_count);
+    }
+    if (prof_active) {
+      std::fprintf(stderr, "  prof_class_tables_ms=%.0f class_total=%zu\n",
+                   prof_ms_since(tables_t0), result.restriction_class_total);
+      std::fflush(stderr);
+    }
+  }
+  auto maps_t0 = prof_active ? std::chrono::steady_clock::now()
+                              : prof_unused;
+  std::vector<multisite_production_class_map> production_maps(
+      grammar.productions.size());
+  for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
+    auto const& prod = grammar.productions[pid];
+    if (prod.children.size() != 2) {
+      throw std::runtime_error(
+          context +
+          ": class-compressed frontiers support binary productions only");
+    }
+    production_maps[pid] =
+        build_production_class_map(grammar, prod, classes);
+  }
+  if (prof_active) {
+    std::fprintf(stderr, "  prof_production_maps_ms=%.0f\n",
+                 prof_ms_since(maps_t0));
+    std::fflush(stderr);
+  }
+
+  // Score passes read each frontier only from the productions of its parents,
+  // so a child frontier is released after its final consumer production has
+  // completed.  The root frontier is exported below.
+  std::vector<std::size_t> remaining_consumers(grammar.clades.size(), 0);
+  for (auto const& prod : grammar.productions) {
+    for (auto child : prod.children) {
+      ++remaining_consumers[child];
+    }
+  }
+
+  std::vector<clade_id> order(grammar.clades.size());
+  std::iota(order.begin(), order.end(), clade_id{0});
+  std::stable_sort(order.begin(), order.end(), [&](clade_id lhs, clade_id rhs) {
+    auto lsize = grammar.clades[lhs].taxa.size();
+    auto rsize = grammar.clades[rhs].taxa.size();
+    if (lsize != rsize) return lsize < rsize;
+    return lhs < rhs;
+  });
+
+  std::vector<std::vector<compressed_frontier_entry>> frontiers(
+      grammar.clades.size());
+  // Per-clade constant-class factorization state.  Computed lazily at each
+  // clade's traversal turn: the traversal is bottom-up, so both children's
+  // states (predictive plus empirical) are final by then.  States are small
+  // (class tables plus factored values) and stay alive for the whole pass
+  // because parent combine plans read them.
+  std::vector<multisite_clade_factorization> factorization(
+      grammar.clades.size());
+
+  std::size_t prof_clade_ordinal = 0;
+  for (auto clade : order) {
+    ++prof_clade_ordinal;
+    auto whole_t0 = prof_active ? std::chrono::steady_clock::now()
+                                : prof_unused;
+    auto const& key = grammar.clades[clade];
+    double prof_combine_ms = 0, prof_lb_ms = 0, prof_insert_ms = 0;
+    double prof_dom_ms = 0;
+    std::size_t prof_candidates = 0;
+    if (prof_active) {
+      std::fprintf(stderr, "  prof_clade_begin=%u taxa=%zu classes=%zu\n",
+                   static_cast<unsigned>(clade), key.taxa.size(),
+                   classes[clade].class_count);
+      std::fflush(stderr);
+    }
+    if (key.taxa.size() == 1) {
+      factorization[clade] = compute_leaf_factorization(classes[clade]);
+      finalize_factorization_bounds(factorization[clade], classes[clade],
+                                    clade, active_patterns,
+                                    result.invariant_constant_offset, options);
+      result.factored_predictive_total += classes[clade].class_count;
+      result.factored_class_total += classes[clade].class_count;
+      result.varying_class_max =
+          std::max(result.varying_class_max,
+                   factorization[clade].varying_classes.size());
+      compressed_frontier_entry leaf;
+      leaf.topology_hash = mix_hash(0x6c656166ULL, key.taxa.front());
+      frontiers[clade].push_back(std::move(leaf));
+      result.frontier_sizes_by_clade[clade] = frontiers[clade].size();
+      continue;
+    }
+
+    // Constant-class factorization for this clade, then the per-production
+    // combine plans over its varying classes.
+    auto& fact = factorization[clade];
+    if (grammar.productions_by_parent[clade].empty()) {
+      fact = multisite_clade_factorization{};
+      fact.slot_of_class.assign(
+          classes[clade].class_count,
+          multisite_clade_factorization::no_slot);
+      for (std::uint32_t c = 0;
+           c < classes[clade].class_count; ++c) {
+        fact.slot_of_class[c] = c;
+        fact.varying_classes.push_back(c);
+      }
+      finalize_factorization_bounds(fact, classes[clade], clade,
+                                    active_patterns,
+                                    result.invariant_constant_offset, options);
+    } else {
+      fact = compute_interior_factorization(grammar, clade, classes,
+                                            production_maps, factorization);
+      finalize_factorization_bounds(fact, classes[clade], clade,
+                                    active_patterns,
+                                    result.invariant_constant_offset, options);
+      auto predictive =
+          classes[clade].class_count - fact.varying_classes.size();
+      result.factored_predictive_total += predictive;
+      result.factored_class_total += predictive;
+    }
+    auto const& parent_productions = grammar.productions_by_parent[clade];
+    std::vector<compressed_combine_plan> plans(parent_productions.size());
+    for (std::size_t pi = 0; pi < parent_productions.size(); ++pi) {
+      auto const& prod = grammar.productions[parent_productions[pi]];
+      plans[pi] = build_combine_plan(
+          fact, production_maps[parent_productions[pi]],
+          factorization[prod.children[0]], factorization[prod.children[1]]);
+    }
+
+    std::unordered_map<std::size_t, std::vector<std::size_t>> entry_index;
+    auto& entries = frontiers[clade];
+    bool const beam_active =
+        build_options.beam_after_taxa != 0 &&
+        key.taxa.size() > build_options.beam_after_taxa;
+    // Keep the best beam_width entries by (lower bound, insertion order).
+    // Stable selection: ties keep earlier-inserted entries, so truncation is
+    // deterministic.  Rebuild the dedup index afterwards because entry
+    // indices move.  Nothing references this clade's entry indices yet (its
+    // parents build later), so moving entries mid-insertion is safe.
+    auto beam_truncate = [&] {
+      if (!beam_active || entries.size() <= build_options.beam_width) return;
+      std::vector<std::uint32_t> order(entries.size());
+      std::iota(order.begin(), order.end(), 0U);
+      auto keep_count = build_options.beam_width;
+      std::partial_sort(order.begin(), order.begin() + keep_count,
+                        order.end(), [&](std::uint32_t lhs, std::uint32_t rhs) {
+                          if (entries[lhs].lb != entries[rhs].lb)
+                            return entries[lhs].lb < entries[rhs].lb;
+                          return lhs < rhs;
+                        });
+      std::vector<char> keep(entries.size(), 0);
+      for (std::size_t i = 0; i < keep_count; ++i) keep[order[i]] = 1;
+      std::vector<compressed_frontier_entry> kept;
+      kept.reserve(keep_count);
+      for (std::size_t i = 0; i < entries.size(); ++i) {
+        if (keep[i]) kept.push_back(std::move(entries[i]));
+      }
+      result.beam_truncated_entries += entries.size() - keep_count;
+      result.beam_truncated = true;
+      entries = std::move(kept);
+      entry_index.clear();
+      for (std::size_t i = 0; i < entries.size(); ++i) {
+        entry_index[compressed_row_hash(entries[i].rows)].push_back(i);
+      }
+    };
+    compressed_frontier_entry candidate;
+    for (std::size_t pi = 0; pi < parent_productions.size(); ++pi) {
+      auto pid = parent_productions[pi];
+      auto const& prod = grammar.productions[pid];
+      if (prod.parent != clade) {
+        throw std::runtime_error(
+            context +
+            ": production parent mismatch during frontier construction");
+      }
+      chart_trim_detail::validate_binary_production_for_trim(grammar, prod,
+                                                             pid);
+      auto left_child = prod.children[0];
+      auto right_child = prod.children[1];
+      if (left_child >= frontiers.size() || right_child >= frontiers.size()) {
+        throw std::runtime_error(
+            context + ": production child out of frontier range");
+      }
+      for (std::size_t left_index = 0; left_index < frontiers[left_child].size();
+           ++left_index) {
+        auto const& left = frontiers[left_child][left_index];
+        for (std::size_t right_index = 0;
+             right_index < frontiers[right_child].size(); ++right_index) {
+          auto const& right = frontiers[right_child][right_index];
+          auto cand_t0 = prof_active ? std::chrono::steady_clock::now()
+                                     : prof_unused;
+          combine_compressed_rows_factored(
+              left.rows, right.rows, plans[pi], factorization[left_child],
+              factorization[right_child], pid, left.topology_hash,
+              right.topology_hash, fact.varying_classes.size(), candidate);
+          if (prof_active) prof_combine_ms += prof_ms_since(cand_t0);
+          if (build_options.keep_provenance) {
+            candidate.provenance.assign(
+                1, frontier_provenance_choice{
+                       pid, left_index, right_index});
+          }
+          bool const bound_prune_active =
+              build_options.use_bound_pruning &&
+              pruning_upper_bound < multisite_score_inf;
+          if (bound_prune_active || beam_active) {
+            auto lb_t0 = prof_active ? std::chrono::steady_clock::now()
+                                     : prof_unused;
+            auto lb = checked_add_u64(
+                fact.lb_offset,
+                lower_bound_for_compressed_rows_factored(
+                    candidate.rows, fact, active_patterns, clade, options),
+                "active-pattern lower-bound total");
+            if (prof_active) prof_lb_ms += prof_ms_since(lb_t0);
+            candidate.lb = lb;
+            if (bound_prune_active && lb > pruning_upper_bound) {
+              ++result.bound_pruned;
+              continue;
+            }
+          }
+          auto ins_t0 =
+              prof_active ? std::chrono::steady_clock::now() : prof_unused;
+          auto hash = compressed_row_hash(candidate.rows);
+          std::size_t found = std::numeric_limits<std::size_t>::max();
+          auto bucket = entry_index.find(hash);
+          if (bucket != entry_index.end()) {
+            for (auto entry : bucket->second) {
+              if (entries[entry].rows == candidate.rows) {
+                found = entry;
+                break;
+              }
+            }
+          }
+          if (found != std::numeric_limits<std::size_t>::max()) {
+            entries[found].topology_hash = std::min(
+                entries[found].topology_hash, candidate.topology_hash);
+            if (build_options.keep_provenance) {
+              merge_provenance_choices(
+                  entries[found].provenance, candidate.provenance,
+                  build_options.max_provenance_choices_per_entry,
+                  build_options.provenance_for_witness_only);
+            }
+            ++result.equality_deduplicated;
+          } else {
+            entry_index[hash].push_back(entries.size());
+            entries.push_back(compressed_frontier_entry{
+                candidate.rows, candidate.topology_hash,
+                std::move(candidate.provenance), candidate.lb});
+          }
+          if (prof_active) prof_insert_ms += prof_ms_since(ins_t0);
+          ++prof_candidates;
+          // Bound insertion memory at beamed clades: truncate well before the
+          // full candidate product can accumulate.
+          if (beam_active &&
+              entries.size() >= 4 * build_options.beam_width) {
+            beam_truncate();
+          }
+        }
+      }
+    }
+
+    // Final beam truncation before dominance: at beamed clades only the
+    // beam_width best-by-lower-bound entries continue, so dominance and
+    // compaction see a bounded set.
+    beam_truncate();
+
+    if (build_options.dominance_mode == multisite_dominance_mode::score_only) {
+      auto dom_t0 = prof_active ? std::chrono::steady_clock::now()
+                               : prof_unused;
+      apply_score_only_dominance_pruning_compressed(
+          entries, result.dominance_candidates_considered,
+          result.dominance_pruned, fact.factored_component_sum,
+          fact.factored_component_min);
+      if (prof_active) prof_dom_ms = prof_ms_since(dom_t0);
+    }
+    // Factor classes whose row became constant across the survivors (bound
+    // pruning and dominance can make classes entry independent that the
+    // predictive rule could not), and compact the stored rows before any
+    // parent consumes this frontier.
+    auto newly_factored =
+        compact_constant_classes(entries, fact, classes[clade]);
+    result.factored_empirical_total += newly_factored;
+    result.factored_class_total += newly_factored;
+    result.varying_class_max =
+        std::max(result.varying_class_max, fact.varying_classes.size());
+    if (prof_active) {
+      auto total_clade_ms =
+          prof_combine_ms + prof_lb_ms + prof_insert_ms + prof_dom_ms;
+      if (total_clade_ms > 500.0 || prof_clade_ordinal % 256 == 0) {
+        std::fprintf(stderr,
+                     "  prof_clade=%u taxa=%zu cand=%llu "
+                     "combine_ms=%.0f lb_ms=%.0f insert_ms=%.0f "
+                     "dom_ms=%.0f entries=%zu whole_ms=%.1f classes=%zu "
+                     "varying=%zu factored=%zu\n",
+                     static_cast<unsigned>(clade), key.taxa.size(),
+                     static_cast<unsigned long long>(prof_candidates),
+                     prof_combine_ms, prof_lb_ms, prof_insert_ms,
+                     prof_dom_ms, entries.size(),
+                     prof_ms_since(whole_t0), classes[clade].class_count,
+                     fact.varying_classes.size(),
+                     classes[clade].class_count - fact.varying_classes.size());
+        std::fflush(stderr);
+      }
+    }
+
+    if (build_options.max_frontier_entries_per_clade != 0 &&
+        entries.size() > build_options.max_frontier_entries_per_clade) {
+      std::string message = context +
+                            ": frontier entry cap exceeded for clade " +
+                            std::to_string(clade);
+      if (context.find("exact mask recovery pass") != std::string::npos) {
+        message +=
+            "; exact mask recovery pass exceeded the frontier cap; rerun "
+            "with a larger cap or use score-only mode if an exact mask is "
+            "not required";
+      }
+      throw std::runtime_error(message);
+    }
+    result.frontier_sizes_by_clade[clade] = entries.size();
+
+    for (auto pid : grammar.productions_by_parent[clade]) {
+      for (auto child : grammar.productions[pid].children) {
+        if (--remaining_consumers[child] == 0 &&
+            !build_options.keep_provenance) {
+          std::vector<compressed_frontier_entry>().swap(frontiers[child]);
+        }
+      }
+    }
+  }
+
+  // Export frontier entries for downstream consumers.  Score passes need
+  // only the root frontier, exported as full per-pattern entries (the root's
+  // restriction classes are the distinct whole-column patterns, so this is
+  // an expansion, not a recomputation).  Witness builds keep provenance, so
+  // every clade is exported: construction provenance chains reference child
+  // clades' entry indices, and the topology enumerator reads provenance
+  // only (plus root cost vectors for the optimum scan), so non-root entries
+  // are exported without expanding their rows.
+  auto root = grammar.root_clade;
+  result.frontiers.assign(grammar.clades.size(), {});
+  auto const& root_classes = classes[root];
+  auto const& root_fact = factorization[root];
+  auto export_entry = [&](clade_id clade,
+                          compressed_frontier_entry const& entry) {
+    frontier_entry out;
+    if (clade == root) {
+      out.f.cost.assign(active_patterns.size() * nuc_state_count, chart_inf);
+      for (std::size_t active_index = 0; active_index < active_patterns.size();
+           ++active_index) {
+        auto parent_class = root_classes.class_of_pattern[active_index];
+        auto const* row =
+            root_fact.slot_of_class[parent_class] ==
+                    multisite_clade_factorization::no_slot
+                ? root_fact.factored_value.data() +
+                      parent_class * nuc_state_count
+                : entry.rows.data() +
+                      root_fact.slot_of_class[parent_class] * nuc_state_count;
+        for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+          out.f.cost[active_index * nuc_state_count + state] = row[state];
+        }
+      }
+      out.f.topology_hash = entry.topology_hash;
+    }
+    out.provenance = entry.provenance;
+    return out;
+  };
+  if (build_options.keep_provenance) {
+    for (clade_id clade{0}; clade < frontiers.size(); ++clade) {
+      for (auto const& entry : frontiers[clade]) {
+        result.frontiers[clade].push_back(export_entry(clade, entry));
+      }
+    }
+  } else {
+    for (auto const& entry : frontiers[root]) {
+      result.frontiers[root].push_back(export_entry(root, entry));
+    }
+  }
+
+  return result;
+}
+
 inline multisite_frontier_build_result
 build_multisite_frontiers_from_prepared_active(
     clade_grammar const& grammar, chart_options const& options,
@@ -4594,6 +6055,12 @@ build_multisite_frontiers_from_prepared_active(
     std::uint64_t invariant_constant_offset_value,
     std::uint64_t initial_upper_bound_value) {
   validate_multisite_frontier_build_options(build_options, context);
+  if (build_options.class_compressed_entries) {
+    return build_multisite_frontiers_class_compressed(
+        grammar, options, build_options, context, setup_active_patterns,
+        std::move(owned_active_patterns), composite_lower_bound,
+        invariant_constant_offset_value, initial_upper_bound_value);
+  }
   multisite_frontier_build_result result;
   result.composite_lower_bound = composite_lower_bound;
   result.frontier_sizes_by_clade.assign(grammar.clades.size(), 0);
@@ -4618,7 +6085,21 @@ build_multisite_frontiers_from_prepared_active(
   });
 
   result.frontiers.assign(grammar.clades.size(), {});
+  // TEMP-PROF: per-stage timing for frontier construction (env-gated).
+  bool const prof_active = std::getenv("WRIC_PROFILE_FRONTIER") != nullptr;
+  auto const prof_unused = std::chrono::steady_clock::time_point{};
+  auto prof_ms_since = [](std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0)
+        .count();
+  };
+  double prof_combine_ms = 0, prof_lb_ms = 0, prof_insert_ms = 0;
+  double prof_dom_ms = 0;
+  std::size_t prof_candidates = 0;
   for (auto clade : order) {
+    prof_combine_ms = prof_lb_ms = prof_insert_ms = 0;
+    prof_dom_ms = 0;
+    prof_candidates = 0;
     auto const& key = grammar.clades[clade];
     if (key.taxa.size() == 1) {
       result.frontiers[clade].push_back(
@@ -4655,42 +6136,71 @@ build_multisite_frontiers_from_prepared_active(
              right_index < result.frontiers[right_child].size();
              ++right_index) {
           auto const& right = result.frontiers[right_child][right_index];
+          auto cand_t0 = prof_active ? std::chrono::steady_clock::now()
+                                     : prof_unused;
           auto candidate = combine_frontier_entries(
               grammar, prod, pid, left, right, active_patterns.size(),
               build_options.keep_used_production);
+          if (prof_active) prof_combine_ms += prof_ms_since(cand_t0);
           if (build_options.keep_provenance) {
             candidate.provenance.push_back(
                 frontier_provenance_choice{pid, left_index, right_index});
           }
           if (build_options.use_bound_pruning &&
               pruning_upper_bound < multisite_score_inf) {
+            auto lb_t0 = prof_active ? std::chrono::steady_clock::now()
+                                     : prof_unused;
             auto lb = lower_bound_for_entry(
                 candidate, clade, active_patterns,
                 result.invariant_constant_offset, options);
+            if (prof_active) prof_lb_ms += prof_ms_since(lb_t0);
             if (lb > pruning_upper_bound) {
               ++result.bound_pruned;
               continue;
             }
           }
+          auto ins_t0 =
+              prof_active ? std::chrono::steady_clock::now() : prof_unused;
           insert_or_merge_frontier_entry(
               entries, index_by_cost, std::move(candidate),
               result.equality_deduplicated,
               build_options.max_provenance_choices_per_entry,
               build_options.provenance_for_witness_only);
+          if (prof_active) prof_insert_ms += prof_ms_since(ins_t0);
+          ++prof_candidates;
         }
       }
     }
 
     if (build_options.dominance_mode == multisite_dominance_mode::score_only) {
+      auto dom_t0 = prof_active ? std::chrono::steady_clock::now()
+                               : prof_unused;
       apply_score_only_dominance_pruning(entries,
                                          result.dominance_candidates_considered,
                                          result.dominance_pruned);
+      if (prof_active) prof_dom_ms = prof_ms_since(dom_t0);
     } else if (build_options.dominance_mode ==
                multisite_dominance_mode::strict_mask_safe) {
       apply_strict_mask_safe_dominance_pruning(
           entries, clade, active_patterns, options,
           result.dominance_candidates_considered, result.dominance_pruned);
     }
+    if (prof_active) {
+      auto total_clade_ms =
+          prof_combine_ms + prof_lb_ms + prof_insert_ms + prof_dom_ms;
+      if (total_clade_ms > 500.0) {
+        std::fprintf(stderr,
+                     "  prof_clade=%u taxa=%zu cand=%llu "
+                     "combine_ms=%.0f lb_ms=%.0f insert_ms=%.0f "
+                     "dom_ms=%.0f entries=%zu\n",
+                     static_cast<unsigned>(clade), key.taxa.size(),
+                     static_cast<unsigned long long>(prof_candidates),
+                     prof_combine_ms, prof_lb_ms, prof_insert_ms,
+                     prof_dom_ms, entries.size());
+        std::fflush(stderr);
+      }
+    }
+
 
     if (build_options.max_frontier_entries_per_clade != 0 &&
         entries.size() > build_options.max_frontier_entries_per_clade) {
@@ -4756,8 +6266,14 @@ inline multisite_frontier_build_result build_multisite_frontiers_from_active(
     std::uint64_t composite_lower_bound) {
   validate_multisite_inputs(grammar, patterns, options);
   auto const invariant_offset = invariant_constant_offset(patterns, options);
-  auto const upper_bound =
-      initial_upper_bound(grammar, patterns, active_patterns, options);
+  // The default initial upper bound is derived by exactly re-scoring one
+  // traceback topology per active pattern, which is quadratic in the
+  // pattern count.  Skip it entirely when an explicit override already
+  // supplies the pruning bound (the override fully replaces it).
+  auto const upper_bound = build_options.upper_bound_override
+                               ? multisite_score_inf
+                               : initial_upper_bound(grammar, patterns,
+                                                      active_patterns, options);
   return build_multisite_frontiers_from_prepared_active(
       grammar, options, build_options, context, nullptr,
       std::move(active_patterns), composite_lower_bound, invariant_offset,
@@ -5218,8 +6734,12 @@ inline multisite_frontier_build_result build_multisite_frontiers_from_active(
   validate_multisite_inputs(plan, patterns, options);
   auto const invariant_offset =
       invariant_constant_offset(plan, patterns, options);
-  auto const upper_bound =
-      initial_upper_bound(plan, patterns, active_patterns, options);
+  // See the grammar overload: skip the per-pattern-rescore initial bound
+  // when an explicit override supplies the pruning bound.
+  auto const upper_bound = build_options.upper_bound_override
+                               ? multisite_score_inf
+                               : initial_upper_bound(plan, patterns,
+                                                     active_patterns, options);
   return build_multisite_frontiers_from_prepared_active(
       plan, options, build_options, context, nullptr,
       std::move(active_patterns), composite_lower_bound, invariant_offset,
@@ -5487,6 +7007,13 @@ inline multisite_trim_result build_multisite_trim_impl(
       "use --wric-polytomy-mode expand-exact or expand-bounded before B&B "
       "trim, or use an arity-agnostic SPR/fixed-topology path");
 
+  if ((trim_options.beam_after_taxa != 0 || trim_options.beam_width != 0) &&
+      !trim_options.class_compressed_score_pass) {
+    throw std::runtime_error(
+        "multi-site trim: witness beaming requires the class-compressed "
+        "score pass");
+  }
+
   auto keep_mask_kind = keep_mask_kind_for_options(trim_options);
   auto keep_production_exact =
       keep_mask_kind ==
@@ -5518,6 +7045,10 @@ inline multisite_trim_result build_multisite_trim_impl(
         trim_options.upper_bound_override;
     score_build_options.max_frontier_entries_per_clade =
         trim_options.max_frontier_entries_per_clade;
+    score_build_options.class_compressed_entries =
+        trim_options.class_compressed_score_pass;
+    score_build_options.beam_after_taxa = trim_options.beam_after_taxa;
+    score_build_options.beam_width = trim_options.beam_width;
     {
       auto score_build =
           build_frontiers(score_build_options, "multi-site trim score pass");
@@ -5540,6 +7071,17 @@ inline multisite_trim_result build_multisite_trim_impl(
       result.dominance_pruned_score_pass = score_build.dominance_pruned;
       result.bound_pruned = score_build.bound_pruned;
       result.equality_deduplicated = score_build.equality_deduplicated;
+      result.class_compressed_score_pass = score_build.class_compressed;
+      result.restriction_class_total = score_build.restriction_class_total;
+      result.restriction_class_max = score_build.restriction_class_max;
+      result.factored_class_total = score_build.factored_class_total;
+      result.factored_predictive_total =
+          score_build.factored_predictive_total;
+      result.factored_empirical_total =
+          score_build.factored_empirical_total;
+      result.varying_class_max = score_build.varying_class_max;
+      result.beam_truncated = score_build.beam_truncated;
+      result.beam_truncated_entries = score_build.beam_truncated_entries;
       result.active_pattern_count = score_build.active_pattern_count;
       result.invariant_constant_offset = score_build.invariant_constant_offset;
     }
@@ -5595,6 +7137,10 @@ inline multisite_trim_result build_multisite_trim_impl(
   build_options.upper_bound_override = trim_options.upper_bound_override;
   build_options.max_frontier_entries_per_clade =
       trim_options.max_frontier_entries_per_clade;
+  build_options.class_compressed_entries =
+      trim_options.class_compressed_score_pass;
+  build_options.beam_after_taxa = trim_options.beam_after_taxa;
+  build_options.beam_width = trim_options.beam_width;
   auto build = build_frontiers(build_options, "multi-site trim");
   append_multisite_frontier_diagnostics(result, build,
                                         multisite_frontier_pass_kind::exact, 0);
@@ -5615,6 +7161,15 @@ inline multisite_trim_result build_multisite_trim_impl(
   }
   result.bound_pruned = build.bound_pruned;
   result.equality_deduplicated = build.equality_deduplicated;
+  result.class_compressed_score_pass = build.class_compressed;
+  result.restriction_class_total = build.restriction_class_total;
+  result.restriction_class_max = build.restriction_class_max;
+  result.factored_class_total = build.factored_class_total;
+  result.factored_predictive_total = build.factored_predictive_total;
+  result.factored_empirical_total = build.factored_empirical_total;
+  result.varying_class_max = build.varying_class_max;
+  result.beam_truncated = build.beam_truncated;
+  result.beam_truncated_entries = build.beam_truncated_entries;
   result.active_pattern_count = build.active_pattern_count;
   result.invariant_constant_offset = build.invariant_constant_offset;
 
@@ -5649,6 +7204,13 @@ inline multisite_trim_result build_multisite_trim_impl(
       "B&B frontier",
       "use --wric-polytomy-mode expand-exact or expand-bounded before B&B "
       "trim, or use an arity-agnostic SPR/fixed-topology path");
+
+  if ((trim_options.beam_after_taxa != 0 || trim_options.beam_width != 0) &&
+      !trim_options.class_compressed_score_pass) {
+    throw std::runtime_error(
+        "multi-site trim: witness beaming requires the class-compressed "
+        "score pass");
+  }
 
   auto keep_mask_kind = keep_mask_kind_for_options(trim_options);
   auto keep_production_exact =
@@ -6066,6 +7628,14 @@ inline multisite_topology_trace_result build_multisite_optimal_topology_witnesse
   build_options.dominance_mode = dominance;
   build_options.provenance_for_witness_only =
       dominance == multisite_dominance_mode::score_only;
+  // Route through the class-compressed builder (constant-class
+  // factorization plus optional witness beam) when requested.  Provenance
+  // chains survive row compression untouched: choices reference child entry
+  // indices, which row storage never changes.
+  build_options.class_compressed_entries =
+      trace_opts.trim_options.class_compressed_score_pass;
+  build_options.beam_after_taxa = trace_opts.trim_options.beam_after_taxa;
+  build_options.beam_width = trace_opts.trim_options.beam_width;
   // Prune with the tightest validated bound available: an explicit override,
   // else the certified optimum (every optimal-parse entry has composite
   // lower bound at most the optimum, so nothing optimal-extensible is lost).
@@ -6112,6 +7682,8 @@ inline multisite_topology_trace_result finish_multisite_topology_trace(
   multisite_topology_trace_result result;
   result.composite_lower_bound = build.composite_lower_bound;
   result.initial_upper_bound = build.initial_upper_bound;
+  result.beam_truncated = build.beam_truncated;
+  result.beam_truncated_entries = build.beam_truncated_entries;
   result.keep_production.assign(grammar.productions.size(), false);
   result.frontier_sizes_by_clade = build.frontier_sizes_by_clade;
   result.equality_deduplicated = build.equality_deduplicated;

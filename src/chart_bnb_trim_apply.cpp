@@ -1289,6 +1289,10 @@ static chart_bnb_trim_apply_result apply_optimal_topology_materialize(
     // pruning bound (tightest possible) and as a cross-validation check.
     trace_opts.trim_options.upper_bound_override = trim.optimum;
     trace_opts.trim_options.known_exact_optimum = trim.optimum;
+    trace_opts.trim_options.class_compressed_score_pass =
+        options.class_compressed_score_pass;
+    trace_opts.trim_options.beam_after_taxa = options.beam_after_taxa;
+    trace_opts.trim_options.beam_width = options.beam_width;
     trace = build_multisite_optimal_topology_witnesses(
         grammar, patterns, chart_opts, trace_opts);
   } else {

@@ -307,6 +307,23 @@ Post-processing:
                           dominance and no exact keep mask (cheap; pairs
                           with --chart-bnb-apply optimal-topology-materialize
                           and --chart-bnb-max-exact-topologies)
+  --chart-bnb-beam-after-taxa <N>
+                          Beam B&B frontiers wider than N taxa (requires
+                          --chart-bnb-class-compress on); see
+                          --chart-bnb-beam-width
+  --chart-bnb-beam-width <K>
+                          Keep at most K best-by-lower-bound entries per
+                          beamed frontier (witness materialization keeps
+                          exact per-tree re-scoring; a beam that drops every
+                          optimal-completable entry fails loudly at optimum
+                          validation instead of emitting wrong trees)
+  --chart-bnb-class-compress on|off
+                          Store score-pass frontier entries as one row per
+                          clade restriction class instead of one row per
+                          site pattern (default off; strongly recommended
+                          when whole-column pattern compression is poor).
+                          Score passes only; every derived scalar is
+                          identical to the uncompressed builder
   --wric-polytomy-mode <M>
                           reject, audit-kary, allow, expand-exact, or
                           expand-bounded
@@ -363,6 +380,9 @@ struct args {
       multisite_dominance_mode::off;
   std::optional<std::uint64_t> chart_bnb_upper_bound;
   bool chart_bnb_score_only = false;
+  bool chart_bnb_class_compress = false;
+  std::size_t chart_bnb_beam_after_taxa = 0;
+  std::size_t chart_bnb_beam_width = 0;
   bool wric_lazy_chart = false;
   chart_spr_lazy_policy wric_lazy_chart_policy = chart_spr_lazy_policy::off;
   polytomy_refinement_options chart_bnb_polytomy_opts = [] {
@@ -743,6 +763,20 @@ static args parse_args(int argc, char** argv) {
       a.chart_bnb_upper_bound = bound;
     } else if (arg == "--chart-bnb-score-only") {
       a.chart_bnb_score_only = true;
+    } else if (arg == "--chart-bnb-class-compress") {
+      auto value = next();
+      if (value == "on") {
+        a.chart_bnb_class_compress = true;
+      } else if (value == "off") {
+        a.chart_bnb_class_compress = false;
+      } else {
+        std::cerr << "error: --chart-bnb-class-compress expects on or off\n";
+        std::exit(1);
+      }
+    } else if (arg == "--chart-bnb-beam-after-taxa") {
+      a.chart_bnb_beam_after_taxa = parse_size_arg(next(), arg);
+    } else if (arg == "--chart-bnb-beam-width") {
+      a.chart_bnb_beam_width = parse_size_arg(next(), arg);
     } else if (arg == "--wric-polytomy-mode") {
       auto value = next();
       auto mode = parse_larch2_polytomy_mode(value);
@@ -2714,6 +2748,27 @@ static void print_chart_bnb_trim_report(
   std::cerr << "  refinement_exactness: " << apply.refinement_exactness
             << "\n";
   std::cerr << "  exact_bnb_objective: " << trim.optimum << "\n";
+  std::cerr << "  class_compressed_score_pass: "
+            << (trim.class_compressed_score_pass ? "true" : "false")
+            << "\n";
+  if (trim.class_compressed_score_pass) {
+    std::cerr << "  restriction_class_total: " << trim.restriction_class_total
+              << "\n";
+    std::cerr << "  restriction_class_max: " << trim.restriction_class_max
+              << "\n";
+    std::cerr << "  factored_class_total: " << trim.factored_class_total
+              << "\n";
+    std::cerr << "  factored_predictive_total: "
+              << trim.factored_predictive_total << "\n";
+    std::cerr << "  factored_empirical_total: "
+              << trim.factored_empirical_total << "\n";
+    std::cerr << "  varying_class_max: " << trim.varying_class_max << "\n";
+    if (trim.beam_truncated) {
+      std::cerr << "  beam_truncated: true\n";
+      std::cerr << "  beam_truncated_entries: "
+                << trim.beam_truncated_entries << "\n";
+    }
+  }
   std::cerr << "  composite_lower_bound_kind: LOWER_BOUND\n";
   std::cerr << "  composite_lower_bound: " << trim.composite_lower_bound
             << "\n";
@@ -2858,6 +2913,9 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
 
   multisite_trim_options trim_opts;
   trim_opts.dominance_mode = a.chart_bnb_dominance;
+  trim_opts.class_compressed_score_pass = a.chart_bnb_class_compress;
+  trim_opts.beam_after_taxa = a.chart_bnb_beam_after_taxa;
+  trim_opts.beam_width = a.chart_bnb_beam_width;
   if (a.chart_bnb_upper_bound) {
     trim_opts.upper_bound_override = *a.chart_bnb_upper_bound;
   }
@@ -2926,6 +2984,9 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
   apply_opts.mode = a.chart_bnb_application_mode;
   apply_opts.max_exact_topologies_to_materialize =
       a.chart_bnb_max_exact_topologies;
+  apply_opts.beam_after_taxa = a.chart_bnb_beam_after_taxa;
+  apply_opts.beam_width = a.chart_bnb_beam_width;
+  apply_opts.class_compressed_score_pass = a.chart_bnb_class_compress;
 
   bool auto_fallback = false;
   if (!a.chart_bnb_trim_application_explicit &&

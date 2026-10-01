@@ -31,6 +31,19 @@ struct chart_bnb_trim_apply_options {
   // annotated_optimal_trim mode this bounds optional small-fixture validation
   // enumeration only; the packed annotation itself is not topology-capped.
   std::optional<std::size_t> max_exact_topologies_to_materialize;
+
+  // Witness-beam bounds forwarded to the witness topology build (see
+  // multisite_trim_options::beam_after_taxa).  Requires the class-compressed
+  // witness builder; trades enumeration completeness for tractability on
+  // grammars whose root-region frontiers are intrinsically huge.  Every
+  // emitted topology is still exactly re-scored.
+  std::size_t beam_after_taxa = 0;
+  std::size_t beam_width = 0;
+
+  // Route the witness build through the class-compressed builder
+  // (constant-class factorization; required for the beam above).  larch2
+  // mirrors the primary pass's --chart-bnb-class-compress flag here.
+  bool class_compressed_score_pass = false;
 };
 
 struct chart_bnb_trim_apply_result {
