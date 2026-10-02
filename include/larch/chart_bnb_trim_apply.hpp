@@ -40,6 +40,12 @@ struct chart_bnb_trim_apply_options {
   std::size_t beam_after_taxa = 0;
   std::size_t beam_width = 0;
 
+  // Mask-profile dedup forwarded to the witness topology build (see
+  // multisite_trim_options::profile_dedup).  Keeps, per distinct argmin-mask
+  // profile, the smallest-B entry, so the witness enumeration runs over
+  // collapsed frontiers; one optimal witness per profile survives.
+  bool profile_dedup = false;
+
   // Route the witness build through the class-compressed builder
   // (constant-class factorization; required for the beam above).  larch2
   // mirrors the primary pass's --chart-bnb-class-compress flag here.

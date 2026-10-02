@@ -1556,6 +1556,17 @@ struct multisite_trim_options {
   std::size_t beam_after_taxa = 0;
   std::size_t beam_width = 0;
 
+  // Mask-profile dedup for the class-compressed score pass: among entries
+  // with identical per-class argmin-state masks over the clade's varying
+  // classes, keep only the entry with the smallest weighted per-class
+  // minimum sum B = sum_c w_c m_c (first-inserted on ties).  Parents consume
+  // child rows only through unit-edge responses m_c + [t not in S_c], so
+  // same-profile entries differ in every future score by exactly their B
+  // gap; this preserves the optimum value and one optimal witness per
+  // profile while possibly dropping other optimal topologies (equal-B
+  // ties).  Requires class_compressed_score_pass.
+  bool profile_dedup = false;
+
   // Opt-in semantic-oracle evidence.  When enabled, retain the equality-
   // deduplicated optimal root cost vectors together with the union of
   // production provenance represented by each vector.  This is deliberately
@@ -1687,6 +1698,12 @@ struct multisite_trim_result {
   // had its frontier truncated to beam_width best-by-lower-bound entries.
   bool beam_truncated = false;
   std::size_t beam_truncated_entries = 0;
+  // Mask-profile dedup diagnostics (see
+  // multisite_trim_options::profile_dedup): candidates dropped as strictly
+  // worse-B same-profile, and entries replaced in place by better-B
+  // same-profile candidates.
+  std::size_t profile_dedup_pruned = 0;
+  std::size_t profile_dedup_replaced = 0;
   multisite_exact_setup_work_stats exact_setup_work;
   std::vector<multisite_frontier_level_diagnostic> frontier_level_diagnostics;
   std::size_t exact_bnb_levels = 0;
@@ -1717,6 +1734,12 @@ struct multisite_topology_trace_result {
   // still exactly re-scored against the reported optimum.
   bool beam_truncated = false;
   std::size_t beam_truncated_entries = 0;
+  // Mask-profile dedup diagnostics (see
+  // multisite_trim_options::profile_dedup): entries dropped as strictly
+  // worse-B same-profile candidates, and entries replaced in place by a
+  // better-B candidate of the same profile.
+  std::size_t profile_dedup_pruned = 0;
+  std::size_t profile_dedup_replaced = 0;
   std::vector<grammar_topology> topologies;
   std::vector<bool> keep_production;
   std::vector<std::size_t> frontier_sizes_by_clade;
@@ -4681,6 +4704,12 @@ struct multisite_frontier_build_options {
   // entries exceed four times beam_width.  Requires class_compressed_entries.
   std::size_t beam_after_taxa = 0;
   std::size_t beam_width = 0;
+
+  // Mask-profile dedup (see multisite_trim_options::profile_dedup):
+  // keep, per distinct per-class argmin-mask profile over the clade's
+  // varying classes, only the smallest-B entry.  Requires
+  // class_compressed_entries.
+  bool profile_dedup = false;
 };
 
 struct multisite_frontier_build_result {
@@ -4715,6 +4744,9 @@ struct multisite_frontier_build_result {
   // Witness-beam diagnostics (see multisite_trim_options::beam_after_taxa).
   bool beam_truncated = false;
   std::size_t beam_truncated_entries = 0;
+  // Mask-profile dedup diagnostics (see build option profile_dedup).
+  std::size_t profile_dedup_pruned = 0;
+  std::size_t profile_dedup_replaced = 0;
 
   [[nodiscard]] std::vector<active_pattern_info> const&
   active_pattern_view() const noexcept {
@@ -4768,6 +4800,10 @@ inline void validate_multisite_frontier_build_options(
         context + ": dominance mode '" +
         multisite_dominance_mode_name(build_options.dominance_mode) +
         "' is not implemented in frontier construction");
+  }
+  if (build_options.profile_dedup && !build_options.class_compressed_entries) {
+    throw std::runtime_error(
+        context + ": mask-profile dedup requires class_compressed_entries");
   }
 }
 
@@ -5641,6 +5677,13 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
                                  : result.initial_upper_bound;
 
   bool const prof_active = std::getenv("WRIC_PROFILE_FRONTIER") != nullptr;
+  // WRIC_PROFILE_MASKS=1: mask-profile collapse measurement (block after
+  // compact_constant_classes below): entries vs distinct external mask
+  // profiles vs min-B-per-profile representatives.
+  bool const masks_active = std::getenv("WRIC_PROFILE_MASKS") != nullptr;
+  std::size_t masks_clades_measured = 0;
+  std::size_t masks_entries_total = 0;
+  std::size_t masks_profiles_total = 0;
   auto const prof_unused = std::chrono::steady_clock::time_point{};
   auto prof_ms_since = [](std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(
@@ -5948,6 +5991,152 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
     result.factored_class_total += newly_factored;
     result.varying_class_max =
         std::max(result.varying_class_max, fact.varying_classes.size());
+    if (build_options.profile_dedup && !fact.varying_classes.empty() &&
+        entries.size() > 1) {
+      // Mask-profile dedup, POST-dominance and over the compacted
+      // varying set.  Pre-dominance pools carry masses of distinct
+      // profiles that dominance removes anyway; the survivors are what
+      // concentrate (measured: 263,680 survivors -> 61 profiles at the
+      // widest HBV clade).  Keep, per distinct per-class argmin-mask
+      // profile, only the entry with the smallest weighted minimum sum
+      // B = sum_c w_c m_c (first-inserted on ties).  Parents consume
+      // child rows only through unit-edge responses
+      // m_c + [t notin S_c], so same-profile entries differ in every
+      // future score by exactly their B gap: the optimum value and one
+      // optimal witness per profile survive, alternative equal-B
+      // topologies may not.  Parents then consume the collapsed
+      // frontier, which is where the candidate-product savings come
+      // from.
+      auto const slot_count = fact.varying_classes.size();
+      auto weighted_min_sum = [&](compressed_frontier_entry const& entry) {
+        std::uint64_t total = 0;
+        for (std::size_t j = 0; j < slot_count; ++j) {
+          auto const* row = entry.rows.data() + j * nuc_state_count;
+          chart_cost m = row[0];
+          for (std::uint8_t s = 1; s < nuc_state_count; ++s)
+            m = std::min(m, row[s]);
+          total = checked_add_u64(
+              total,
+              checked_mul_cost(
+                  classes[clade].weight_by_class[fact.varying_classes[j]],
+                  m, "profile-dedup weighted minimum sum"),
+              "profile-dedup weighted minimum sum");
+        }
+        return total;
+      };
+      std::unordered_map<
+          std::uint64_t,
+          std::vector<std::pair<std::vector<std::uint8_t>, std::size_t>>>
+          profile_keepers;
+      std::vector<std::uint64_t> entry_b(entries.size());
+      for (std::size_t i = 0; i < entries.size(); ++i) {
+        std::vector<std::uint8_t> profile(slot_count);
+        for (std::size_t j = 0; j < slot_count; ++j) {
+          auto const* row =
+              entries[i].rows.data() + j * nuc_state_count;
+          chart_cost m = row[0];
+          for (std::uint8_t s = 1; s < nuc_state_count; ++s)
+            m = std::min(m, row[s]);
+          std::uint8_t mask = 0;
+          for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+            if (row[s] == m)
+              mask |= static_cast<std::uint8_t>(1u << s);
+          profile[j] = mask;
+        }
+        entry_b[i] = weighted_min_sum(entries[i]);
+        std::uint64_t profile_hash = 1469598103934665603ULL;
+        for (auto b : profile) {
+          profile_hash ^= b;
+          profile_hash *= 1099511628211ULL;
+        }
+        auto& bucket = profile_keepers[profile_hash];
+        bool matched = false;
+        for (auto& [key, keeper] : bucket) {
+          if (key != profile) continue;
+          if (entry_b[i] < entry_b[keeper]) keeper = i;
+          matched = true;
+          break;
+        }
+        if (!matched) {
+          bucket.emplace_back(std::move(profile), i);
+        }
+      }
+      std::vector<char> keep(entries.size(), 0);
+      for (auto const& [hash_value, bucket] : profile_keepers) {
+        for (auto const& [key, keeper] : bucket) keep[keeper] = 1;
+      }
+      std::vector<compressed_frontier_entry> deduped;
+      deduped.reserve(entries.size());
+      for (std::size_t i = 0; i < entries.size(); ++i) {
+        if (keep[i]) deduped.push_back(std::move(entries[i]));
+      }
+      result.profile_dedup_pruned += entries.size() - deduped.size();
+      entries = std::move(deduped);
+    }
+
+    // Mask-profile collapse measurement.  The external interface of an
+    // entry through any unit-cost edge is (min, argmin-set) per class
+    // (M_p(t) = m_p + [t notin S_p]), so entries with identical per-class
+    // argmin masks combine identically in every future context; a min-B
+    // representative per profile suffices for single-optimum work.
+    // "profiles" is the frontier size that representation would keep,
+    // "drop" the entries profile dedup removes on top of row-equality
+    // dedup and dominance, "maxprof" the largest profile's multiplicity.
+    if (masks_active && entries.size() >= 64 &&
+        !fact.varying_classes.empty()) {
+      auto const slot_count = fact.varying_classes.size();
+      std::unordered_map<
+          std::uint64_t,
+          std::vector<std::pair<std::vector<std::uint8_t>, std::size_t>>>
+          profile_buckets;
+      std::size_t profile_count = 0;
+      std::size_t max_profile_count = 1;
+      for (auto const& entry : entries) {
+        std::vector<std::uint8_t> profile(slot_count);
+        for (std::size_t j = 0; j < slot_count; ++j) {
+          chart_cost m = entry.rows[j * nuc_state_count];
+          for (std::uint8_t s = 1; s < nuc_state_count; ++s) {
+            m = std::min(m, entry.rows[j * nuc_state_count + s]);
+          }
+          std::uint8_t mask = 0;
+          for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
+            if (entry.rows[j * nuc_state_count + s] == m) {
+              mask |= static_cast<std::uint8_t>(1u << s);
+            }
+          }
+          profile[j] = mask;
+        }
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (auto b : profile) {
+          hash ^= b;
+          hash *= 1099511628211ULL;
+        }
+        auto& bucket = profile_buckets[hash];
+        bool matched = false;
+        for (auto& [key, count] : bucket) {
+          if (key == profile) {
+            ++count;
+            max_profile_count = std::max(max_profile_count, count);
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) {
+          bucket.emplace_back(std::move(profile), 1);
+          ++profile_count;
+        }
+      }
+      ++masks_clades_measured;
+      masks_entries_total += entries.size();
+      masks_profiles_total += profile_count;
+      std::fprintf(
+          stderr,
+          "  prof_masks clade=%u entries=%zu profiles=%zu drop=%zu "
+          "maxprof=%zu varying=%zu\n",
+          static_cast<unsigned>(clade), entries.size(), profile_count,
+          entries.size() - profile_count, max_profile_count, slot_count);
+      std::fflush(stderr);
+    }
     if (prof_active) {
       auto total_clade_ms =
           prof_combine_ms + prof_lb_ms + prof_insert_ms + prof_dom_ms;
@@ -6039,6 +6228,16 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
     for (auto const& entry : frontiers[root]) {
       result.frontiers[root].push_back(export_entry(root, entry));
     }
+  }
+
+  if (masks_active && masks_clades_measured != 0) {
+    std::fprintf(
+        stderr,
+        "  prof_masks_total clades=%zu entries=%zu profiles=%zu "
+        "drop=%zu\n",
+        masks_clades_measured, masks_entries_total, masks_profiles_total,
+        masks_entries_total - masks_profiles_total);
+    std::fflush(stderr);
   }
 
   return result;
@@ -6802,7 +7001,13 @@ inline std::uint64_t compute_root_frontier_optimum_and_update_mask(
     std::vector<bool>& keep_production, std::string const& context) {
   auto const& root_frontier = build.frontiers[grammar.root_clade];
   if (root_frontier.empty()) {
-    throw std::runtime_error(context + ": empty root frontier");
+    // Refutation runs reach this point on purpose; the tally decides whether
+    // the emptiness is a valid infeasibility proof (zero beam truncations).
+    throw std::runtime_error(
+        context + ": empty root frontier (beam_truncated=" +
+        std::string(build.beam_truncated ? "true" : "false") +
+        ", beam_truncated_entries=" +
+        std::to_string(build.beam_truncated_entries) + ")");
   }
   if (merge_exact_keep_mask &&
       keep_production.size() != grammar.productions.size()) {
@@ -6834,7 +7039,11 @@ inline std::uint64_t compute_root_frontier_optimum_and_update_mask(
     std::vector<bool>& keep_production, std::string const& context) {
   auto const& root_frontier = build.frontiers[plan.root_clade()];
   if (root_frontier.empty()) {
-    throw std::runtime_error(context + ": empty root frontier");
+    throw std::runtime_error(
+        context + ": empty root frontier (beam_truncated=" +
+        std::string(build.beam_truncated ? "true" : "false") +
+        ", beam_truncated_entries=" +
+        std::to_string(build.beam_truncated_entries) + ")");
   }
   if (merge_exact_keep_mask &&
       keep_production.size() != plan.productions().size()) {
@@ -7007,6 +7216,13 @@ inline multisite_trim_result build_multisite_trim_impl(
       "use --wric-polytomy-mode expand-exact or expand-bounded before B&B "
       "trim, or use an arity-agnostic SPR/fixed-topology path");
 
+  if (trim_options.profile_dedup &&
+      !trim_options.class_compressed_score_pass) {
+    throw std::runtime_error(
+        "multi-site trim: mask-profile dedup requires the class-compressed "
+        "score pass");
+  }
+
   if ((trim_options.beam_after_taxa != 0 || trim_options.beam_width != 0) &&
       !trim_options.class_compressed_score_pass) {
     throw std::runtime_error(
@@ -7049,6 +7265,7 @@ inline multisite_trim_result build_multisite_trim_impl(
         trim_options.class_compressed_score_pass;
     score_build_options.beam_after_taxa = trim_options.beam_after_taxa;
     score_build_options.beam_width = trim_options.beam_width;
+    score_build_options.profile_dedup = trim_options.profile_dedup;
     {
       auto score_build =
           build_frontiers(score_build_options, "multi-site trim score pass");
@@ -7082,6 +7299,8 @@ inline multisite_trim_result build_multisite_trim_impl(
       result.varying_class_max = score_build.varying_class_max;
       result.beam_truncated = score_build.beam_truncated;
       result.beam_truncated_entries = score_build.beam_truncated_entries;
+      result.profile_dedup_pruned = score_build.profile_dedup_pruned;
+      result.profile_dedup_replaced = score_build.profile_dedup_replaced;
       result.active_pattern_count = score_build.active_pattern_count;
       result.invariant_constant_offset = score_build.invariant_constant_offset;
     }
@@ -7141,6 +7360,7 @@ inline multisite_trim_result build_multisite_trim_impl(
       trim_options.class_compressed_score_pass;
   build_options.beam_after_taxa = trim_options.beam_after_taxa;
   build_options.beam_width = trim_options.beam_width;
+  build_options.profile_dedup = trim_options.profile_dedup;
   auto build = build_frontiers(build_options, "multi-site trim");
   append_multisite_frontier_diagnostics(result, build,
                                         multisite_frontier_pass_kind::exact, 0);
@@ -7170,6 +7390,8 @@ inline multisite_trim_result build_multisite_trim_impl(
   result.varying_class_max = build.varying_class_max;
   result.beam_truncated = build.beam_truncated;
   result.beam_truncated_entries = build.beam_truncated_entries;
+  result.profile_dedup_pruned = build.profile_dedup_pruned;
+  result.profile_dedup_replaced = build.profile_dedup_replaced;
   result.active_pattern_count = build.active_pattern_count;
   result.invariant_constant_offset = build.invariant_constant_offset;
 
@@ -7204,6 +7426,13 @@ inline multisite_trim_result build_multisite_trim_impl(
       "B&B frontier",
       "use --wric-polytomy-mode expand-exact or expand-bounded before B&B "
       "trim, or use an arity-agnostic SPR/fixed-topology path");
+
+  if (trim_options.profile_dedup &&
+      !trim_options.class_compressed_score_pass) {
+    throw std::runtime_error(
+        "multi-site trim: mask-profile dedup requires the class-compressed "
+        "score pass");
+  }
 
   if ((trim_options.beam_after_taxa != 0 || trim_options.beam_width != 0) &&
       !trim_options.class_compressed_score_pass) {
@@ -7636,6 +7865,7 @@ inline multisite_topology_trace_result build_multisite_optimal_topology_witnesse
       trace_opts.trim_options.class_compressed_score_pass;
   build_options.beam_after_taxa = trace_opts.trim_options.beam_after_taxa;
   build_options.beam_width = trace_opts.trim_options.beam_width;
+  build_options.profile_dedup = trace_opts.trim_options.profile_dedup;
   // Prune with the tightest validated bound available: an explicit override,
   // else the certified optimum (every optimal-parse entry has composite
   // lower bound at most the optimum, so nothing optimal-extensible is lost).
@@ -7684,6 +7914,8 @@ inline multisite_topology_trace_result finish_multisite_topology_trace(
   result.initial_upper_bound = build.initial_upper_bound;
   result.beam_truncated = build.beam_truncated;
   result.beam_truncated_entries = build.beam_truncated_entries;
+  result.profile_dedup_pruned = build.profile_dedup_pruned;
+  result.profile_dedup_replaced = build.profile_dedup_replaced;
   result.keep_production.assign(grammar.productions.size(), false);
   result.frontier_sizes_by_clade = build.frontier_sizes_by_clade;
   result.equality_deduplicated = build.equality_deduplicated;
@@ -7695,7 +7927,14 @@ inline multisite_topology_trace_result finish_multisite_topology_trace(
   auto const& frontiers = build.frontiers;
   auto const& root_frontier = frontiers[grammar.root_clade];
   if (root_frontier.empty()) {
-    throw std::runtime_error(context + ": empty root frontier");
+    // Refutation runs reach this point on purpose; the beam-truncation tally
+    // decides whether the emptiness is a valid infeasibility proof (zero
+    // truncations) or unproven (truncations discarded entries that might have
+    // completed below the bound).
+    throw std::runtime_error(context + ": empty root frontier (beam_truncated=" +
+                             (build.beam_truncated ? "true" : "false") +
+                             ", beam_truncated_entries=" +
+                             std::to_string(build.beam_truncated_entries) + ")");
   }
 
   std::vector<std::size_t> optimal_root_entries;
@@ -7857,7 +8096,11 @@ build_multisite_coupled_frontier_trim(
   auto const& root_frontier = frontiers[grammar.root_clade];
   if (root_frontier.empty()) {
     throw std::runtime_error(
-        "multi-site coupled frontier trim: empty root frontier");
+        std::string("multi-site coupled frontier trim: empty root frontier "
+                    "(beam_truncated=") +
+        (build.beam_truncated ? "true" : "false") +
+        ", beam_truncated_entries=" +
+        std::to_string(build.beam_truncated_entries) + ")");
   }
 
   std::vector<std::size_t> optimal_root_entries;

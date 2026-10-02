@@ -99,12 +99,15 @@ Small fixtures use brute-force topology enumeration plus Fitch re-scoring when
 possible.  Larger DAGs may use rebuilt-grammar B&B or structural validation; the
 weaker oracle is reported explicitly.
 
-## Deferred scaling work
+## Scaling levers (now implemented)
 
-Lazy chart construction and effective-site reduction are not required for the
-current output-producing B&B trim path.  They are future scaling levers that
-reduce chart/pattern work before or around frontier construction; they are
-orthogonal to dominance pruning.
+Lazy chart construction (`--wric-lazy-chart on`), class-compressed frontier
+rows with constant-class factorization (`--chart-bnb-class-compress on`), and
+the witness beam (`--chart-bnb-beam-after-taxa` / `--chart-bnb-beam-width`)
+are implemented and documented in `doc/WRIC-LAZY-CHART-BEAM.md`, together with
+the empty-root certification loop and the fixed-vs-free-labeling objective
+caveat for `--chart-bnb-upper-bound` values sourced from
+`dagutil --edge-parsimony`.
 
 ## CLI examples
 

@@ -324,6 +324,15 @@ Post-processing:
                           when whole-column pattern compression is poor).
                           Score passes only; every derived scalar is
                           identical to the uncompressed builder
+  --chart-bnb-profile-dedup on|off
+                          Keep, per distinct per-class argmin-mask profile
+                          over a clade's varying classes, only the entry
+                          with the smallest weighted per-class minimum sum
+                          (default off; requires --chart-bnb-class-compress
+                          on).  Same-profile entries differ in every future
+                          score by exactly that sum, so the optimum value
+                          and one optimal witness per profile survive;
+                          alternative equal-cost topologies may not
   --wric-polytomy-mode <M>
                           reject, audit-kary, allow, expand-exact, or
                           expand-bounded
@@ -383,6 +392,7 @@ struct args {
   bool chart_bnb_class_compress = false;
   std::size_t chart_bnb_beam_after_taxa = 0;
   std::size_t chart_bnb_beam_width = 0;
+  bool chart_bnb_profile_dedup = false;
   bool wric_lazy_chart = false;
   chart_spr_lazy_policy wric_lazy_chart_policy = chart_spr_lazy_policy::off;
   polytomy_refinement_options chart_bnb_polytomy_opts = [] {
@@ -771,6 +781,16 @@ static args parse_args(int argc, char** argv) {
         a.chart_bnb_class_compress = false;
       } else {
         std::cerr << "error: --chart-bnb-class-compress expects on or off\n";
+        std::exit(1);
+      }
+    } else if (arg == "--chart-bnb-profile-dedup") {
+      auto value = next();
+      if (value == "on") {
+        a.chart_bnb_profile_dedup = true;
+      } else if (value == "off") {
+        a.chart_bnb_profile_dedup = false;
+      } else {
+        std::cerr << "error: --chart-bnb-profile-dedup expects on or off\n";
         std::exit(1);
       }
     } else if (arg == "--chart-bnb-beam-after-taxa") {
@@ -2768,6 +2788,12 @@ static void print_chart_bnb_trim_report(
       std::cerr << "  beam_truncated_entries: "
                 << trim.beam_truncated_entries << "\n";
     }
+    if (trim.profile_dedup_pruned != 0 || trim.profile_dedup_replaced != 0) {
+      std::cerr << "  profile_dedup_pruned: "
+                << trim.profile_dedup_pruned << "\n";
+      std::cerr << "  profile_dedup_replaced: "
+                << trim.profile_dedup_replaced << "\n";
+    }
   }
   std::cerr << "  composite_lower_bound_kind: LOWER_BOUND\n";
   std::cerr << "  composite_lower_bound: " << trim.composite_lower_bound
@@ -2916,6 +2942,7 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
   trim_opts.class_compressed_score_pass = a.chart_bnb_class_compress;
   trim_opts.beam_after_taxa = a.chart_bnb_beam_after_taxa;
   trim_opts.beam_width = a.chart_bnb_beam_width;
+  trim_opts.profile_dedup = a.chart_bnb_profile_dedup;
   if (a.chart_bnb_upper_bound) {
     trim_opts.upper_bound_override = *a.chart_bnb_upper_bound;
   }
@@ -2986,6 +3013,7 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
       a.chart_bnb_max_exact_topologies;
   apply_opts.beam_after_taxa = a.chart_bnb_beam_after_taxa;
   apply_opts.beam_width = a.chart_bnb_beam_width;
+  apply_opts.profile_dedup = a.chart_bnb_profile_dedup;
   apply_opts.class_compressed_score_pass = a.chart_bnb_class_compress;
 
   bool auto_fallback = false;

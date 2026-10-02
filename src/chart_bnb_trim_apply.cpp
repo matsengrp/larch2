@@ -1293,6 +1293,7 @@ static chart_bnb_trim_apply_result apply_optimal_topology_materialize(
         options.class_compressed_score_pass;
     trace_opts.trim_options.beam_after_taxa = options.beam_after_taxa;
     trace_opts.trim_options.beam_width = options.beam_width;
+    trace_opts.trim_options.profile_dedup = options.profile_dedup;
     trace = build_multisite_optimal_topology_witnesses(
         grammar, patterns, chart_opts, trace_opts);
   } else {

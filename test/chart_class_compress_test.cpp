@@ -346,6 +346,124 @@ void test_random_grammar_equivalence() {
   std::println("  PASS");
 }
 
+void test_profile_dedup_equivalence() {
+  std::println("test_profile_dedup_equivalence");
+
+  std::mt19937 rng(0x6d61736b);
+  std::size_t dedup_engagement = 0;
+  for (std::size_t iteration = 0; iteration < 40; ++iteration) {
+    std::vector<std::pair<std::string, std::string>> leaves;
+    std::size_t const taxon_count = 3 + (iteration % 6);
+    for (std::size_t taxon = 0; taxon < taxon_count; ++taxon) {
+      auto state = static_cast<char>('A' + (rng() % 4));
+      leaves.emplace_back("L" + std::to_string(taxon),
+                          std::string(1, state));
+    }
+    int inner_id = 0;
+    std::vector<larch::phylo_dag> trees;
+    for (std::size_t tree_index = 0; tree_index < 3; ++tree_index) {
+      auto spec = random_tree_spec(leaves, "A", rng, inner_id);
+      trees.push_back(larch::test::make_tiny_labelled_tree("AA", spec));
+    }
+    auto merged = larch::test::merge_tiny_trees(std::move(trees));
+    auto grammar = larch::build_clade_grammar(merged);
+    auto patterns = larch::build_site_patterns(merged, grammar);
+    auto const original_count = patterns.patterns.size();
+    for (std::size_t copy = 0; copy < original_count; ++copy) {
+      if (rng() % 2 == 0) {
+        patterns.patterns.push_back(patterns.patterns[copy]);
+      }
+    }
+
+    // Reference: compressed score-only pass without profile dedup.
+    larch::multisite_trim_options reference;
+    reference.dominance_mode = larch::multisite_dominance_mode::score_only;
+    reference.require_exact_keep_mask = false;
+    reference.class_compressed_score_pass = true;
+    auto expected = larch::build_multisite_trim(grammar, patterns, {},
+                                                reference);
+
+    // Deduped: same optimum, possibly smaller frontiers.
+    larch::multisite_trim_options deduped = reference;
+    deduped.profile_dedup = true;
+    auto actual = larch::build_multisite_trim(grammar, patterns, {},
+                                              deduped);
+    CHECK(actual.optimum == expected.optimum);
+    CHECK(actual.composite_lower_bound == expected.composite_lower_bound);
+    CHECK(actual.invariant_constant_offset ==
+          expected.invariant_constant_offset);
+    dedup_engagement += actual.profile_dedup_pruned;
+
+    // Dominance-off pair: without dominance the same-profile entries that
+    // dominance would remove survive to the dedup pass, so this variant
+    // exercises the merge on small fixtures.
+    larch::multisite_trim_options no_dom;
+    no_dom.dominance_mode = larch::multisite_dominance_mode::off;
+    no_dom.require_exact_keep_mask = false;
+    no_dom.class_compressed_score_pass = true;
+    auto no_dom_expected =
+        larch::build_multisite_trim(grammar, patterns, {}, no_dom);
+    auto no_dom_deduped = no_dom;
+    no_dom_deduped.profile_dedup = true;
+    auto no_dom_actual = larch::build_multisite_trim(
+        grammar, patterns, {}, no_dom_deduped);
+    CHECK(no_dom_actual.optimum == no_dom_expected.optimum);
+    dedup_engagement += no_dom_actual.profile_dedup_pruned;
+  }
+  CHECK(dedup_engagement > 0);
+
+  std::println("  PASS");
+}
+
+void test_profile_dedup_witness() {
+  std::println("test_profile_dedup_witness");
+
+  std::mt19937 rng(0x70726f66);
+  for (std::size_t iteration = 0; iteration < 20; ++iteration) {
+    std::vector<std::pair<std::string, std::string>> leaves;
+    std::size_t const taxon_count = 4 + (iteration % 5);
+    for (std::size_t taxon = 0; taxon < taxon_count; ++taxon) {
+      auto state = static_cast<char>('A' + (rng() % 4));
+      leaves.emplace_back("L" + std::to_string(taxon),
+                          std::string(1, state));
+    }
+    int inner_id = 0;
+    std::vector<larch::phylo_dag> trees;
+    for (std::size_t tree_index = 0; tree_index < 3; ++tree_index) {
+      auto spec = random_tree_spec(leaves, "A", rng, inner_id);
+      trees.push_back(larch::test::make_tiny_labelled_tree("AA", spec));
+    }
+    auto merged = larch::test::merge_tiny_trees(std::move(trees));
+    auto grammar = larch::build_clade_grammar(merged);
+    auto patterns = larch::build_site_patterns(merged, grammar);
+
+    larch::multisite_trim_options exact_opts;
+    exact_opts.dominance_mode = larch::multisite_dominance_mode::off;
+    exact_opts.require_exact_keep_mask = false;
+    auto exact = larch::build_multisite_trim(grammar, patterns, {},
+                                             exact_opts);
+
+    larch::multisite_topology_trace_options trace;
+    trace.max_optimal_topologies = 1;
+    trace.trim_options.dominance_mode =
+        larch::multisite_dominance_mode::score_only;
+    trace.trim_options.require_exact_keep_mask = false;
+    trace.trim_options.use_bound_pruning = true;
+    trace.trim_options.upper_bound_override = exact.optimum;
+    trace.trim_options.known_exact_optimum = exact.optimum;
+    trace.trim_options.class_compressed_score_pass = true;
+    trace.trim_options.profile_dedup = true;
+    auto witness = larch::build_multisite_optimal_topology_witnesses(
+        grammar, patterns, {}, trace);
+    // Incompleteness is tolerated, wrongness is not: the emitted topology
+    // is re-scored inside the trace and must meet the exact optimum.
+    CHECK(witness.optimum == exact.optimum);
+    CHECK(witness.topologies.size() >= 1);
+  }
+
+  std::println("  PASS");
+}
+
 void test_witness_equivalence() {
   std::println("test_witness_equivalence");
   class_compress_fixture fixture;
@@ -493,6 +611,8 @@ int main() {
   test_random_grammar_equivalence();
   test_witness_equivalence();
   test_random_witness_equivalence();
+  test_profile_dedup_equivalence();
+  test_profile_dedup_witness();
   std::println("All chart class-compress tests passed!");
   return 0;
 }
