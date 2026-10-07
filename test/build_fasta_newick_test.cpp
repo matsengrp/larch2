@@ -80,6 +80,48 @@ GGTTGG
           "binary control topology must have parsimony score two");
 }
 
+// Ambiguous sample bases (IUPAC codes, e.g. N or K) must be treated as
+// matching the reference — not silently coerced to A by nuc_base::from_char,
+// which would fabricate a mutation and inflate the parsimony score.
+void test_ambiguous_bases_are_not_mutations(
+    std::filesystem::path const& directory) {
+  auto const fasta_path = directory / "ambiguous.fa";
+  auto const newick_path = directory / "ambiguous.nwk";
+  auto const reference_path = directory / "ambiguous-reference.txt";
+
+  // s2 has an ambiguous K (= G/T) at position 2 and an N at position 3;
+  // the reference has an N at position 4.
+  write_text(fasta_path, R"(>s1
+ACGA
+>s2
+AKNA
+>s3
+ACGA
+)");
+  write_text(reference_path, "ACNA\n");
+  write_text(newick_path, "(s1,s2,s3);\n");
+
+  auto dag = build_from_fasta_newick(fasta_path.string(),
+                                     newick_path.string(),
+                                     reference_path.string());
+  require(count_mutations(dag) == 0,
+          "ambiguous bases must not fabricate mutations");
+  // s2's ambiguous bases are skipped, so its compact genome stays empty
+  // (= identical to the reference) instead of carrying fabricated mutations.
+  auto& s2_cg = std::visit(
+      [](auto node) -> compact_genome& {
+        if constexpr (requires { node.cg(); }) {
+          return node.cg();
+        } else {
+          assert(false && "not a cg node");
+          std::unreachable();
+        }
+      },
+      dag.get_node(larch::test::find_leaf_by_sample_id(dag, "s2")));
+  require(s2_cg.to_string() == "<>",
+          "ambiguous sample bases record no mutations");
+}
+
 }  // namespace
 
 int main() {
@@ -128,6 +170,7 @@ TTAA
   assert(get_child_indices(dag, real_root_idx).size() == 2);
 
   test_multifurcating_fitch_reconstruction(tmp.path());
+  test_ambiguous_bases_are_not_mutations(tmp.path());
 
   std::println("build_fasta_newick test passed");
 }

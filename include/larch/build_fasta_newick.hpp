@@ -109,6 +109,14 @@ inline phylo_dag build_from_fasta_newick(
             std::map<mutation_position, nuc_base> muts;
             for (std::size_t i = 0; i < seq.size() && i < reference.size();
                  ++i) {
+              // Ambiguous bases (IUPAC codes such as N or K in the sample
+              // or the reference) cannot be represented in a nuc_base;
+              // treat them as matching the reference rather than letting
+              // from_char() silently coerce them to A and fabricate
+              // mutations.
+              if (!nuc_base::is_acgt(seq[i]) ||
+                  !nuc_base::is_acgt(reference[i]))
+                continue;
               auto ref_base = nuc_base::from_char(reference[i]);
               auto seq_base = nuc_base::from_char(seq[i]);
               if (!(ref_base == seq_base)) muts[i + 1] = seq_base;

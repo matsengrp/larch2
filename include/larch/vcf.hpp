@@ -83,6 +83,10 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
     }
     if (!all_snp) continue;
 
+    // Skip records with an ambiguous REF allele: sites where even the
+    // reference base is an IUPAC code cannot be interpreted.
+    if (!nuc_base::is_acgt(ref_allele[0])) continue;
+
     // Parse position (1-indexed)
     std::size_t site_pos = 0;
     std::from_chars(cols[1].data(), cols[1].data() + cols[1].size(), site_pos);
@@ -92,6 +96,9 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
     for (std::size_t i = 0;
          i < result.sample_names.size() && i + 9 < cols.size(); ++i) {
       auto gt = cols[i + 9];
+      // Missing genotype ('.') is a no-call: the sample base at this site
+      // is unknown (faToVcf writes it for N bases), so record no mutation.
+      if (!gt.empty() && gt[0] == '.') continue;
       // Parse GT: take first allele index (before / or |)
       int allele_idx = 0;
       if (!gt.empty() && gt[0] >= '0' && gt[0] <= '9') allele_idx = gt[0] - '0';
@@ -99,7 +106,13 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
       nuc_base sample_base = nuc_base::from_char(ref_allele[0]);
       if (allele_idx > 0 &&
           static_cast<std::size_t>(allele_idx - 1) < alt_alleles.size()) {
-        sample_base = nuc_base::from_char(alt_alleles[allele_idx - 1][0]);
+        char alt_char = alt_alleles[allele_idx - 1][0];
+        // Ambiguous ALT allele (IUPAC code such as K or R, emitted by faToVcf
+        // for ambiguous sample bases): treat like missing data (./. ) and
+        // record no mutation. from_char() would silently coerce it to A and
+        // fabricate a mutation.
+        if (!nuc_base::is_acgt(alt_char)) continue;
+        sample_base = nuc_base::from_char(alt_char);
       }
 
       // Record mutation if different from reference

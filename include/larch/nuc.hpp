@@ -37,6 +37,26 @@ class nuc_base {
     }
   }
 
+  // True for unambiguous nucleotide characters (A/C/G/T, either case).
+  // IUPAC ambiguity codes (R, Y, K, M, S, W, B, D, H, V, N, ...) are NOT
+  // ACGT; from_char() silently coerces every non-ACGT character to A, so
+  // callers handling possibly-ambiguous input must check this first.
+  static constexpr bool is_acgt(char c) {
+    switch (c) {
+      case 'A':
+      case 'a':
+      case 'C':
+      case 'c':
+      case 'G':
+      case 'g':
+      case 'T':
+      case 't':
+        return true;
+      default:
+        return false;
+    }
+  }
+
   static constexpr nuc_base from_proto(int v) {
     return nuc_base{static_cast<std::uint8_t>(v)};
   }
