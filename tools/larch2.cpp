@@ -333,6 +333,12 @@ Post-processing:
                           score by exactly that sum, so the optimum value
                           and one optimal witness per profile survive;
                           alternative equal-cost topologies may not
+  --chart-bnb-cross-profile-dominance on|off
+                          Weighted outgoing unit-edge dominance across
+                          different mask profiles (default off). Requires
+                          class-compress on, profile-dedup on, score-only,
+                          no beam, and one-witness materialization; exact
+                          masks, all ties and addressed pins are unsupported
   --wric-polytomy-mode <M>
                           reject, audit-kary, allow, expand-exact, or
                           expand-bounded
@@ -393,6 +399,7 @@ struct args {
   std::size_t chart_bnb_beam_after_taxa = 0;
   std::size_t chart_bnb_beam_width = 0;
   bool chart_bnb_profile_dedup = false;
+  bool chart_bnb_cross_profile_dominance = false;
   bool wric_lazy_chart = false;
   chart_spr_lazy_policy wric_lazy_chart_policy = chart_spr_lazy_policy::off;
   polytomy_refinement_options chart_bnb_polytomy_opts = [] {
@@ -791,6 +798,16 @@ static args parse_args(int argc, char** argv) {
         a.chart_bnb_profile_dedup = false;
       } else {
         std::cerr << "error: --chart-bnb-profile-dedup expects on or off\n";
+        std::exit(1);
+      }
+    } else if (arg == "--chart-bnb-cross-profile-dominance") {
+      auto value = next();
+      if (value == "on") {
+        a.chart_bnb_cross_profile_dominance = true;
+      } else if (value == "off") {
+        a.chart_bnb_cross_profile_dominance = false;
+      } else {
+        std::cerr << "error: --chart-bnb-cross-profile-dominance expects on or off\n";
         std::exit(1);
       }
     } else if (arg == "--chart-bnb-beam-after-taxa") {
@@ -2772,6 +2789,17 @@ static void print_chart_bnb_trim_report(
             << (trim.class_compressed_score_pass ? "true" : "false")
             << "\n";
   if (trim.class_compressed_score_pass) {
+    if (trim.cross_profile.completed_clades != 0 &&
+        trim.cross_profile.pairs != 0) {
+      std::cerr << "  cross_profile_removed: " << trim.cross_profile.removed << "\n"
+                << "  cross_profile_pair_checks: " << trim.cross_profile.pairs << "\n"
+                << "  cross_profile_positions: " << trim.cross_profile.positions << "\n"
+                << "  cross_profile_width_refusals: " << trim.cross_profile.width_refusals << "\n"
+                << "  cross_profile_compare_censors: " << trim.cross_profile.compare_censors << "\n"
+                << "  cross_profile_max_before: " << trim.cross_profile.max_before << "\n"
+                << "  cross_profile_max_after: " << trim.cross_profile.max_after << "\n"
+                << "  cross_profile_generated_products: " << trim.cross_profile.generated_products << "\n";
+    }
     std::cerr << "  restriction_class_total: " << trim.restriction_class_total
               << "\n";
     std::cerr << "  restriction_class_max: " << trim.restriction_class_max
@@ -2943,6 +2971,7 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
   trim_opts.beam_after_taxa = a.chart_bnb_beam_after_taxa;
   trim_opts.beam_width = a.chart_bnb_beam_width;
   trim_opts.profile_dedup = a.chart_bnb_profile_dedup;
+  trim_opts.cross_profile_dominance.enabled = a.chart_bnb_cross_profile_dominance;
   if (a.chart_bnb_upper_bound) {
     trim_opts.upper_bound_override = *a.chart_bnb_upper_bound;
   }
@@ -2966,6 +2995,15 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
                  "keep-mask requirement\n";
   }
   trim_opts.max_frontier_entries_per_clade = a.chart_bnb_max_frontier;
+  if (a.chart_bnb_cross_profile_dominance &&
+      (a.chart_bnb_application_mode !=
+           chart_bnb_trim_application_mode::optimal_topology_materialize ||
+       a.chart_bnb_max_exact_topologies != std::optional<std::size_t>{1})) {
+    throw std::runtime_error(
+        "--chart-bnb-cross-profile-dominance on requires explicit "
+        "--chart-bnb-apply optimal-topology-materialize and "
+        "--chart-bnb-max-exact-topologies 1");
+  }
 
   chart_spr_lazy_policy_diagnostics lazy_policy;
   lazy_policy.requested =
@@ -3014,7 +3052,15 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
   apply_opts.beam_after_taxa = a.chart_bnb_beam_after_taxa;
   apply_opts.beam_width = a.chart_bnb_beam_width;
   apply_opts.profile_dedup = a.chart_bnb_profile_dedup;
+  apply_opts.cross_profile_dominance.enabled = a.chart_bnb_cross_profile_dominance;
   apply_opts.class_compressed_score_pass = a.chart_bnb_class_compress;
+  apply_opts.lazy_one_witness =
+      use_lazy && a.chart_bnb_upper_bound.has_value() &&
+      trim_opts.dominance_mode == multisite_dominance_mode::score_only &&
+      apply_opts.mode == chart_bnb_trim_application_mode::optimal_topology_materialize &&
+      apply_opts.max_exact_topologies_to_materialize == std::optional<std::size_t>{1} &&
+      apply_opts.class_compressed_score_pass && apply_opts.profile_dedup &&
+      apply_opts.beam_after_taxa == 0 && apply_opts.beam_width == 0;
 
   bool auto_fallback = false;
   if (!a.chart_bnb_trim_application_explicit &&

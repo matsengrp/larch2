@@ -1229,6 +1229,12 @@ foreach(test_name merge_test merge_consistency_test subtree_weight_test
     add_test(NAME ${test_name} COMMAND ${test_name}
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()
+add_executable(chart_cross_profile_dominance_test
+               test/chart_cross_profile_dominance_test.cpp)
+target_include_directories(chart_cross_profile_dominance_test PRIVATE include)
+add_test(NAME chart_cross_profile_dominance_test
+         COMMAND chart_cross_profile_dominance_test)
+set_tests_properties(chart_cross_profile_dominance_test PROPERTIES TIMEOUT 30)
 target_sources(chart_parallel_test
                PRIVATE test/chart_spr_allocation_overrides.cpp)
 target_include_directories(chart_parallel_test PRIVATE test)

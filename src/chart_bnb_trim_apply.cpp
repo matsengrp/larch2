@@ -1,6 +1,7 @@
 #include <larch/chart_bnb_trim_apply.hpp>
 
 #include <larch/site_patterns.hpp>
+#include <larch/lazy_chart.hpp>
 #include <larch/subtree_weight.hpp>
 #include <larch/weight_ops.hpp>
 
@@ -1294,8 +1295,16 @@ static chart_bnb_trim_apply_result apply_optimal_topology_materialize(
     trace_opts.trim_options.beam_after_taxa = options.beam_after_taxa;
     trace_opts.trim_options.beam_width = options.beam_width;
     trace_opts.trim_options.profile_dedup = options.profile_dedup;
-    trace = build_multisite_optimal_topology_witnesses(
-        grammar, patterns, chart_opts, trace_opts);
+    trace_opts.trim_options.cross_profile_dominance =
+        options.cross_profile_dominance;
+    if (options.lazy_one_witness) {
+      auto lazy = build_lazy_inside_chart(grammar, patterns);
+      trace = build_multisite_optimal_topology_witnesses(
+          grammar, patterns, lazy, chart_opts, trace_opts);
+    } else {
+      trace = build_multisite_optimal_topology_witnesses(
+          grammar, patterns, chart_opts, trace_opts);
+    }
   } else {
     multisite_topology_trace_options trace_opts;
     trace_opts.keep_provenance = true;
@@ -1413,6 +1422,22 @@ chart_bnb_trim_apply_result apply_chart_bnb_trim(
     site_pattern_set const& patterns, chart_options const& chart_options,
     multisite_trim_result const& trim,
     chart_bnb_trim_apply_options const& options) {
+  if (options.lazy_one_witness &&
+      (options.mode != chart_bnb_trim_application_mode::optimal_topology_materialize ||
+       options.max_exact_topologies_to_materialize != std::optional<std::size_t>{1} ||
+       !options.class_compressed_score_pass || !options.profile_dedup ||
+       options.beam_after_taxa != 0 || options.beam_width != 0)) {
+    throw std::runtime_error(
+        "chart B&B trim apply: lazy one-witness route requires explicit "
+        "un-beamed class-compressed/P one-witness materialization");
+  }
+  if (options.cross_profile_dominance.enabled &&
+      (options.mode != chart_bnb_trim_application_mode::optimal_topology_materialize ||
+       options.max_exact_topologies_to_materialize != std::optional<std::size_t>{1})) {
+    throw std::runtime_error(
+        "chart B&B trim apply: cross-profile dominance supports only one-witness "
+        "optimal topology materialization, not exact masks or all ties");
+  }
   switch (options.mode) {
     case chart_bnb_trim_application_mode::production_mask_superset:
       return chart_bnb_trim_apply_detail::apply_production_mask_superset(

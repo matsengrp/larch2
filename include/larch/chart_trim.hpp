@@ -1,6 +1,7 @@
 #pragma once
 
 #include <larch/chart_scheduler.hpp>
+#include <larch/chart_cross_profile_dominance.hpp>
 #include <larch/grammar_topology.hpp>
 #include <larch/parsimony_chart.hpp>
 #include <larch/site_patterns.hpp>
@@ -1567,6 +1568,10 @@ struct multisite_trim_options {
   // ties).  Requires class_compressed_score_pass.
   bool profile_dedup = false;
 
+  // Additional weighted cross-mask outgoing-response dominance. Ordinary
+  // unit edges only; scalar score/one witness only; roots are never filtered.
+  cross_profile_dominance_options cross_profile_dominance;
+
   // Opt-in semantic-oracle evidence.  When enabled, retain the equality-
   // deduplicated optimal root cost vectors together with the union of
   // production provenance represented by each vector.  This is deliberately
@@ -1704,6 +1709,7 @@ struct multisite_trim_result {
   // same-profile candidates.
   std::size_t profile_dedup_pruned = 0;
   std::size_t profile_dedup_replaced = 0;
+  cross_profile_dominance_stats cross_profile;
   multisite_exact_setup_work_stats exact_setup_work;
   std::vector<multisite_frontier_level_diagnostic> frontier_level_diagnostics;
   std::size_t exact_bnb_levels = 0;
@@ -1740,6 +1746,7 @@ struct multisite_topology_trace_result {
   // better-B candidate of the same profile.
   std::size_t profile_dedup_pruned = 0;
   std::size_t profile_dedup_replaced = 0;
+  cross_profile_dominance_stats cross_profile;
   std::vector<grammar_topology> topologies;
   std::vector<bool> keep_production;
   std::vector<std::size_t> frontier_sizes_by_clade;
@@ -3540,6 +3547,16 @@ inline void validate_required_productions(
 inline void validate_multisite_trim_options_supported(
     multisite_trim_options const& trim_options, std::string const& context,
     bool allow_score_only_dominance) {
+  if (trim_options.cross_profile_dominance.enabled &&
+      (!allow_score_only_dominance || trim_options.require_exact_keep_mask ||
+       trim_options.dominance_mode != multisite_dominance_mode::score_only ||
+       !trim_options.class_compressed_score_pass || !trim_options.profile_dedup ||
+       trim_options.capture_optimal_root_provenance ||
+       trim_options.beam_after_taxa != 0 || trim_options.beam_width != 0)) {
+    throw std::runtime_error(context +
+        ": cross-profile dominance supports only un-beamed score-only "
+        "class-compressed/P minimum queries, not exact masks or all ties");
+  }
   if (trim_options.dominance_mode == multisite_dominance_mode::off) return;
 
   if (trim_options.dominance_mode ==
@@ -4710,6 +4727,7 @@ struct multisite_frontier_build_options {
   // varying classes, only the smallest-B entry.  Requires
   // class_compressed_entries.
   bool profile_dedup = false;
+  cross_profile_dominance_options cross_profile_dominance;
 };
 
 struct multisite_frontier_build_result {
@@ -4747,6 +4765,7 @@ struct multisite_frontier_build_result {
   // Mask-profile dedup diagnostics (see build option profile_dedup).
   std::size_t profile_dedup_pruned = 0;
   std::size_t profile_dedup_replaced = 0;
+  cross_profile_dominance_stats cross_profile;
 
   [[nodiscard]] std::vector<active_pattern_info> const&
   active_pattern_view() const noexcept {
@@ -4785,6 +4804,16 @@ struct multisite_frontier_scheduler_test_hooks {
 inline void validate_multisite_frontier_build_options(
     multisite_frontier_build_options const& build_options,
     std::string const& context) {
+  if (build_options.cross_profile_dominance.enabled &&
+      (!build_options.class_compressed_entries || !build_options.profile_dedup ||
+       build_options.dominance_mode != multisite_dominance_mode::score_only ||
+       build_options.keep_used_production ||
+       (build_options.keep_provenance && !build_options.provenance_for_witness_only) ||
+       build_options.beam_after_taxa != 0 || build_options.beam_width != 0)) {
+    throw std::runtime_error(context +
+        ": cross-profile dominance requires un-beamed class-compressed "
+        "score-only/P frontiers without exact production masks");
+  }
   if (build_options.keep_provenance &&
       build_options.dominance_mode == multisite_dominance_mode::score_only &&
       !build_options.provenance_for_witness_only) {
@@ -5896,6 +5925,7 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
         for (std::size_t right_index = 0;
              right_index < frontiers[right_child].size(); ++right_index) {
           auto const& right = frontiers[right_child][right_index];
+          ++result.cross_profile.generated_products;
           auto cand_t0 = prof_active ? std::chrono::steady_clock::now()
                                      : prof_unused;
           combine_compressed_rows_factored(
@@ -6073,6 +6103,11 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
       result.profile_dedup_pruned += entries.size() - deduped.size();
       entries = std::move(deduped);
     }
+
+    chart_cross_profile_detail::apply(
+        entries, fact, classes[clade], clade == grammar.root_clade,
+        build_options.cross_profile_dominance, result.cross_profile,
+        chart_inf - 1, clade);
 
     // Mask-profile collapse measurement.  The external interface of an
     // entry through any unit-cost edge is (min, argmin-set) per class
@@ -7361,6 +7396,7 @@ inline multisite_trim_result build_multisite_trim_impl(
   build_options.beam_after_taxa = trim_options.beam_after_taxa;
   build_options.beam_width = trim_options.beam_width;
   build_options.profile_dedup = trim_options.profile_dedup;
+  build_options.cross_profile_dominance = trim_options.cross_profile_dominance;
   auto build = build_frontiers(build_options, "multi-site trim");
   append_multisite_frontier_diagnostics(result, build,
                                         multisite_frontier_pass_kind::exact, 0);
@@ -7392,6 +7428,7 @@ inline multisite_trim_result build_multisite_trim_impl(
   result.beam_truncated_entries = build.beam_truncated_entries;
   result.profile_dedup_pruned = build.profile_dedup_pruned;
   result.profile_dedup_replaced = build.profile_dedup_replaced;
+  result.cross_profile = build.cross_profile;
   result.active_pattern_count = build.active_pattern_count;
   result.invariant_constant_offset = build.invariant_constant_offset;
 
@@ -7418,6 +7455,11 @@ inline multisite_trim_result build_multisite_trim_impl(
     chart_options const& options,
     multisite_trim_options const& trim_options,
     BuildFrontiers&& build_frontiers) {
+  if (trim_options.cross_profile_dominance.enabled) {
+    throw std::runtime_error(
+        "multi-site trim: cross-profile dominance requires the grammar-based "
+        "class-compressed frontier builder");
+  }
   validate_multisite_inputs(plan, patterns, options);
   validate_multisite_trim_options_supported(trim_options, "multi-site trim",
                                             true);
@@ -7829,6 +7871,16 @@ inline multisite_topology_trace_result build_multisite_optimal_topology_witnesse
   using namespace chart_multisite_detail;
   validate_multisite_inputs(grammar, patterns, options);
   validate_required_productions(grammar, trace_opts.required_productions);
+  if (trace_opts.trim_options.cross_profile_dominance.enabled) {
+    validate_multisite_trim_options_supported(trace_opts.trim_options,
+                                              "multi-site topology witness", true);
+    if (trace_opts.max_optimal_topologies != 1 ||
+        !trace_opts.required_productions.empty()) {
+      throw std::runtime_error(
+          "multi-site topology witness: cross-profile dominance preserves one "
+          "witness only, without required productions or addressed pins");
+    }
+  }
   if (!trace_opts.keep_provenance) {
     throw std::runtime_error(
         "multi-site topology witness: keep_provenance=false cannot emit "
@@ -7866,6 +7918,8 @@ inline multisite_topology_trace_result build_multisite_optimal_topology_witnesse
   build_options.beam_after_taxa = trace_opts.trim_options.beam_after_taxa;
   build_options.beam_width = trace_opts.trim_options.beam_width;
   build_options.profile_dedup = trace_opts.trim_options.profile_dedup;
+  build_options.cross_profile_dominance =
+      trace_opts.trim_options.cross_profile_dominance;
   // Prune with the tightest validated bound available: an explicit override,
   // else the certified optimum (every optimal-parse entry has composite
   // lower bound at most the optimum, so nothing optimal-extensible is lost).
@@ -7916,6 +7970,7 @@ inline multisite_topology_trace_result finish_multisite_topology_trace(
   result.beam_truncated_entries = build.beam_truncated_entries;
   result.profile_dedup_pruned = build.profile_dedup_pruned;
   result.profile_dedup_replaced = build.profile_dedup_replaced;
+  result.cross_profile = build.cross_profile;
   result.keep_production.assign(grammar.productions.size(), false);
   result.frontier_sizes_by_clade = build.frontier_sizes_by_clade;
   result.equality_deduplicated = build.equality_deduplicated;

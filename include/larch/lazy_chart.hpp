@@ -8309,6 +8309,66 @@ inline void copy_lazy_trim_diagnostics(multisite_trim_result& result,
 
 }  // namespace lazy_chart_detail
 
+// Explicit-bound one-witness companion to the lazy scalar trim. It does not
+// rebuild an unrelated cold per-pattern upper-bound witness ensemble. All
+// structural choices remain common across patterns, and finish_* re-scores
+// the selected grammar topology through the maintained dense scorer.
+namespace lazy_chart_detail {
+inline chart_multisite_detail::multisite_frontier_build_result
+build_lazy_one_witness_frontiers(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    lazy_multisite_chart const& chart, chart_options const& options,
+    multisite_topology_trace_options const& trace) {
+  using namespace chart_multisite_detail;
+  validate_multisite_inputs(grammar, patterns, options);
+  if (!trace.keep_provenance || trace.max_optimal_topologies != 1 ||
+      !trace.required_productions.empty() ||
+      trace.trim_options.require_exact_keep_mask ||
+      trace.trim_options.dominance_mode != multisite_dominance_mode::score_only ||
+      !trace.trim_options.class_compressed_score_pass ||
+      !trace.trim_options.profile_dedup ||
+      !trace.trim_options.upper_bound_override ||
+      trace.trim_options.beam_after_taxa != 0 || trace.trim_options.beam_width != 0) {
+    throw std::runtime_error(
+        "lazy topology witness: requires an explicit-bound un-beamed "
+        "score-only class-compressed/P one-witness query without pins");
+  }
+  validate_multisite_trim_options_supported(trace.trim_options,
+                                            "lazy topology witness", true);
+  auto prepared = prepare_lazy_chart_for_multisite_frontiers(
+      grammar, patterns, chart, options);
+  auto composite = lazy_composite_chart_score(grammar, patterns, prepared, options);
+  auto active = build_active_pattern_info_from_lazy(
+      grammar, patterns, prepared, options);
+  multisite_frontier_build_options build_options;
+  build_options.keep_provenance = true;
+  build_options.keep_used_production = false;
+  build_options.use_bound_pruning = trace.trim_options.use_bound_pruning;
+  build_options.dominance_mode = multisite_dominance_mode::score_only;
+  build_options.provenance_for_witness_only = true;
+  build_options.class_compressed_entries = true;
+  build_options.profile_dedup = true;
+  build_options.cross_profile_dominance = trace.trim_options.cross_profile_dominance;
+  build_options.upper_bound_override = trace.trim_options.upper_bound_override;
+  build_options.max_frontier_entries_per_clade =
+      trace.trim_options.max_frontier_entries_per_clade;
+  build_options.max_provenance_choices_per_entry = 2;
+  return build_multisite_frontiers_from_active(
+      grammar, patterns, options, build_options, "lazy topology witness",
+      std::move(active), composite.weighted_lower_bound);
+}
+} // namespace lazy_chart_detail
+
+inline multisite_topology_trace_result build_multisite_optimal_topology_witnesses(
+    clade_grammar const& grammar, site_pattern_set const& patterns,
+    lazy_multisite_chart const& chart, chart_options const& options,
+    multisite_topology_trace_options const& trace) {
+  auto build = lazy_chart_detail::build_lazy_one_witness_frontiers(
+      grammar, patterns, chart, options, trace);
+  return finish_multisite_topology_trace(
+      grammar, patterns, options, trace, build, "lazy topology witness");
+}
+
 inline multisite_trim_result build_multisite_trim(
     clade_grammar const& grammar, site_pattern_set const& patterns,
     lazy_multisite_chart const& chart, chart_options const& options = {},

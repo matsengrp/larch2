@@ -45,6 +45,11 @@ struct chart_bnb_trim_apply_options {
   // profile, the smallest-B entry, so the witness enumeration runs over
   // collapsed frontiers; one optimal witness per profile survives.
   bool profile_dedup = false;
+  cross_profile_dominance_options cross_profile_dominance;
+  // Caller-selected execution route independent of the dominance toggle.
+  // Default false preserves legacy setup; matched explicit lazy/fixed-bound
+  // one-witness queries may choose the maintained lazy companion in either arm.
+  bool lazy_one_witness = false;
 
   // Route the witness build through the class-compressed builder
   // (constant-class factorization; required for the beam above).  larch2
