@@ -1894,6 +1894,158 @@ struct packed_outside_context_keys {
   }
 };
 
+// Default-off census for the serial grammar outside route. A demanded pattern
+// is active and has positive multiplicity for this particular reference.
+// Row categories are root, nonroot leaf, and proper nonroot internal clade.
+struct outside_demand_row_census {
+  std::uint64_t clades = 0;
+  std::uint64_t requested_dense_rows = 0;
+  std::uint64_t produced_unique_rows = 0;
+  std::uint64_t demanded_unique_rows = 0;
+  std::uint64_t unused_unique_rows = 0;
+  std::uint64_t finite_state_values = 0;
+  std::uint64_t infinite_state_values = 0;
+  std::uint64_t demanded_finite_state_values = 0;
+  std::uint64_t demanded_infinite_state_values = 0;
+};
+
+struct outside_demand_reference_stats {
+  std::uint64_t passes = 0;
+  std::uint64_t patterns_total = 0;
+  std::uint64_t patterns_requested = 0;
+  std::uint64_t key_calls = 0;
+  std::uint64_t key_patterns = 0;
+  std::uint64_t requested_key_patterns = 0;
+  std::uint64_t key_words = 0;
+  std::uint64_t requested_key_words = 0;
+  std::uint64_t context_classes = 0;
+  std::uint64_t requested_context_classes = 0;
+  std::uint64_t zero_demand_context_classes = 0;
+  std::uint64_t mixed_context_classes = 0;
+  std::uint64_t contribution_calls = 0;
+  std::uint64_t requested_contribution_calls = 0;
+  std::uint64_t zero_demand_contribution_calls = 0;
+  std::uint64_t binary_contributions = 0;
+  std::uint64_t zero_demand_binary_contributions = 0;
+  std::uint64_t generic_contributions = 0;
+  std::uint64_t zero_demand_generic_contributions = 0;
+  std::uint64_t parent_state_checks = 0;
+  std::uint64_t finite_parent_state_branches = 0;
+  std::uint64_t zero_demand_finite_parent_state_branches = 0;
+  std::uint64_t scatter_members = 0;
+  std::uint64_t requested_scatter_members = 0;
+  std::uint64_t scatter_state_updates = 0;
+  std::uint64_t requested_scatter_state_updates = 0;
+  std::uint64_t requested_global_minima = 0;
+  std::uint64_t requested_finite_global_minima = 0;
+  std::uint64_t requested_infinite_global_minima = 0;
+  std::uint64_t maximum_observer_dynamic_bytes = 0;
+  std::uint64_t total_ns = 0;
+  std::uint64_t validation_ns = 0;
+  std::uint64_t demand_setup_ns = 0;
+  std::uint64_t reset_root_ns = 0;
+  std::uint64_t order_ns = 0;
+  std::uint64_t row_initialization_ns = 0;
+  std::uint64_t occurrence_ns = 0;
+  std::uint64_t key_total_ns = 0;
+  std::uint64_t key_preparation_ns = 0;
+  std::uint64_t key_formation_ns = 0;
+  std::uint64_t group_preparation_ns = 0;
+  std::uint64_t grouping_ns = 0;
+  std::uint64_t classification_ns = 0;
+  std::uint64_t contribution_ns = 0;
+  std::uint64_t zero_demand_contribution_ns = 0;
+  std::uint64_t scatter_ns = 0;
+  std::uint64_t row_interning_ns = 0;
+  std::uint64_t row_census_ns = 0;
+  std::uint64_t finalize_ns = 0;
+  std::array<outside_demand_row_census,3> rows_by_category;
+};
+
+struct outside_demand_stats {
+  std::array<outside_demand_reference_stats,nuc_state_count> per_reference;
+};
+
+struct outside_demand_skip_reference_stats {
+  std::uint64_t reference_builds = 0;
+  std::uint64_t requested_patterns = 0;
+  std::uint64_t visited_contexts = 0;
+  std::uint64_t skipped_contexts = 0;
+  std::uint64_t skipped_members = 0;
+  std::uint64_t executed_binary_contributions = 0;
+  std::uint64_t executed_generic_contributions = 0;
+  std::uint64_t root_global_minima_preserved = 0;
+};
+
+struct outside_demand_skip_stats {
+  std::array<outside_demand_skip_reference_stats,nuc_state_count> per_reference;
+};
+
+struct outside_demand_context {
+  outside_demand_reference_stats* stats = nullptr;
+  outside_demand_skip_reference_stats* skip_stats = nullptr;
+  bool restrict_to_demand = false;
+  std::vector<std::uint8_t> requested;
+  std::vector<std::uint8_t> requested_row_class;
+  std::size_t requested_count = 0;
+
+  void initialize(site_pattern_set const& patterns,std::uint8_t reference,
+                  outside_demand_reference_stats* observation,
+                  bool restrict = false,
+                  outside_demand_skip_reference_stats* skip_observation = nullptr) {
+    stats=observation;
+    restrict_to_demand=restrict;
+    skip_stats=skip_observation;
+    if (!stats && !restrict_to_demand) return;
+    std::uint64_t unused_ns=0;
+    chart_cross_profile_detail::observation_timer timer(
+        stats?stats->demand_setup_ns:unused_ns,stats!=nullptr);
+    requested.resize(patterns.patterns.size());
+    for (std::size_t p=0;p<patterns.patterns.size();++p) {
+      auto const& pattern=patterns.patterns[p];
+      requested[p]=chart_multisite_detail::is_active_pattern(pattern) &&
+                   pattern.reference_state_counts[reference]!=0;
+      requested_count+=requested[p];
+    }
+    if (stats) {
+      ++stats->passes; stats->patterns_total+=patterns.patterns.size();
+      stats->patterns_requested+=requested_count;
+      stats->maximum_observer_dynamic_bytes=std::max<std::uint64_t>(
+          stats->maximum_observer_dynamic_bytes,requested.capacity());
+    }
+    if (restrict_to_demand && skip_stats) {
+      ++skip_stats->reference_builds;
+      skip_stats->requested_patterns+=requested_count;
+    }
+  }
+  void publish(lazy_multisite_chart const& chart,clade_grammar const& grammar,
+               clade_id clade) {
+    if (!stats) return;
+    chart_cross_profile_detail::observation_timer timer(stats->row_census_ns,true);
+    auto const& rows=chart.outside_rows_by_clade[clade];
+    auto const& map=*chart.outside_class_index_by_pattern_by_clade[clade];
+    requested_row_class.assign(rows.size(),0);
+    for (std::size_t p=0;p<requested.size();++p)
+      if (requested[p]) requested_row_class.at(map[p])=1;
+    unsigned category=clade==grammar.root_clade?0:grammar.clades[clade].taxa.size()==1?1:2;
+    auto& count=stats->rows_by_category[category];
+    ++count.clades; count.requested_dense_rows+=requested_count;
+    count.produced_unique_rows+=rows.size();
+    for (std::size_t r=0;r<rows.size();++r) {
+      auto demanded=requested_row_class[r]!=0;
+      count.demanded_unique_rows+=demanded; count.unused_unique_rows+=!demanded;
+      for (auto cost:rows[r]) {
+        auto finite=cost<chart_inf;
+        count.finite_state_values+=finite; count.infinite_state_values+=!finite;
+        count.demanded_finite_state_values+=demanded&&finite;
+        count.demanded_infinite_state_values+=demanded&&!finite;
+      }
+    }
+    stats->maximum_observer_dynamic_bytes=std::max<std::uint64_t>(
+        stats->maximum_observer_dynamic_bytes,requested.capacity()+requested_row_class.capacity());
+  }
+};
+
 inline std::size_t estimate_outside_context_key_grouping_logical_resident_bytes(
     std::size_t key_count, std::size_t key_width,
     std::size_t class_count) {
@@ -1949,8 +2101,12 @@ inline void require_outside_context_key_grouping_success(
 template <class PopulateWords>
 inline packed_outside_context_keys collect_packed_outside_context_keys(
     std::size_t key_count, std::size_t key_width,
-    outside_context_key_workspace& workspace, PopulateWords&& populate_words) {
+    outside_context_key_workspace& workspace, PopulateWords&& populate_words,
+    outside_demand_reference_stats* observation = nullptr) {
   using namespace lazy_key_grouping_detail;
+  std::uint64_t unused_ns=0;
+  chart_cross_profile_detail::observation_timer whole_timer(
+      observation?observation->key_total_ns:unused_ns,observation!=nullptr);
   packed_outside_context_keys keys;
   keys.storage = &workspace;
   keys.key_width = key_width;
@@ -1960,35 +2116,51 @@ inline packed_outside_context_keys collect_packed_outside_context_keys(
   auto const estimate = estimate_packed_key_grouping_memory(key_count,
                                                              key_width);
   auto workspace_before = workspace.resident_bytes();
-  keys.memory.word_preparation = prepare_packed_key_word_buffer(
-      estimate.packed_word_count, workspace.packed_words);
-  record_outside_context_key_preparation_peak(
-      keys.memory, workspace_before,
-      keys.memory.word_preparation.previous_capacity_resident_bytes,
-      keys.memory.word_preparation
-          .observed_prepublication_peak_capacity_resident_bytes);
-  workspace.packed_words.resize(estimate.packed_word_count);
-  std::forward<PopulateWords>(populate_words)(
-      std::span<packed_key_word>{workspace.packed_words});
+  {
+    chart_cross_profile_detail::observation_timer timer(
+        observation?observation->key_preparation_ns:unused_ns,observation!=nullptr);
+    keys.memory.word_preparation = prepare_packed_key_word_buffer(
+        estimate.packed_word_count, workspace.packed_words);
+    record_outside_context_key_preparation_peak(
+        keys.memory, workspace_before,
+        keys.memory.word_preparation.previous_capacity_resident_bytes,
+        keys.memory.word_preparation
+            .observed_prepublication_peak_capacity_resident_bytes);
+    workspace.packed_words.resize(estimate.packed_word_count);
+  }
+  {
+    chart_cross_profile_detail::observation_timer timer(
+        observation?observation->key_formation_ns:unused_ns,observation!=nullptr);
+    std::forward<PopulateWords>(populate_words)(
+        std::span<packed_key_word>{workspace.packed_words});
+  }
 
   workspace_before = workspace.resident_bytes();
-  keys.memory.grouping_preparation = prepare_packed_key_grouping_storage(
-      key_count, workspace.grouping_workspace, workspace.grouping);
-  record_outside_context_key_preparation_peak(
-      keys.memory, workspace_before,
-      keys.memory.grouping_preparation.previous_owned_capacity_resident_bytes,
-      keys.memory.grouping_preparation
-          .observed_prepublication_peak_owned_capacity_resident_bytes);
+  {
+    chart_cross_profile_detail::observation_timer timer(
+        observation?observation->group_preparation_ns:unused_ns,observation!=nullptr);
+    keys.memory.grouping_preparation = prepare_packed_key_grouping_storage(
+        key_count, workspace.grouping_workspace, workspace.grouping);
+    record_outside_context_key_preparation_peak(
+        keys.memory, workspace_before,
+        keys.memory.grouping_preparation.previous_owned_capacity_resident_bytes,
+        keys.memory.grouping_preparation
+            .observed_prepublication_peak_owned_capacity_resident_bytes);
+  }
   auto const view = packed_key_matrix_view{
       .key_count = key_count,
       .key_width = key_width,
       .words = workspace.packed_words,
   };
-  require_outside_context_key_grouping_success(try_group_packed_keys_prepared(
-      view, workspace.grouping_workspace, workspace.grouping,
-      keys.memory.grouping_preparation
-          .prepared_owned_capacity_resident_bytes,
-      packed_key_grouping_result_mode::full));
+  {
+    chart_cross_profile_detail::observation_timer timer(
+        observation?observation->grouping_ns:unused_ns,observation!=nullptr);
+    require_outside_context_key_grouping_success(try_group_packed_keys_prepared(
+        view, workspace.grouping_workspace, workspace.grouping,
+        keys.memory.grouping_preparation
+            .prepared_owned_capacity_resident_bytes,
+        packed_key_grouping_result_mode::full));
+  }
   keys.memory.class_count = workspace.grouping.class_count();
 
   keys.memory.logical_resident_bytes =
@@ -2048,7 +2220,8 @@ inline row_type compute_child_outside_contribution(
 inline packed_outside_context_keys collect_outside_context_keys(
     lazy_multisite_chart const& chart, clade_grammar const& grammar,
     site_pattern_set const& patterns, grammar_production const& prod,
-    outside_context_key_workspace& workspace) {
+    outside_context_key_workspace& workspace,
+    outside_demand_reference_stats* observation = nullptr) {
   using namespace lazy_key_grouping_detail;
   auto const key_width = checked_packed_key_count_add(
       prod.children.size(), 1, "lazy grammar outside context-key width");
@@ -2072,17 +2245,25 @@ inline packed_outside_context_keys collect_outside_context_keys(
           throw std::logic_error(
               "lazy chart: grammar outside context-key width mismatch");
         }
-      });
+      },observation);
 }
 
 inline void assign_outside_classes_for_clade(
     lazy_multisite_chart& chart, clade_grammar const& grammar,
     site_pattern_set const& patterns, clade_id clade,
-    outside_context_key_workspace& key_workspace) {
-  std::vector<row_type> outside_by_pattern(chart.pattern_count,
-                                           parsimony_chart_detail::make_inf_row());
+    outside_context_key_workspace& key_workspace,
+    outside_demand_context* observation = nullptr) {
+  auto* stats=observation?observation->stats:nullptr;
+  std::uint64_t unused_ns=0;
+  std::vector<row_type> outside_by_pattern;
+  {
+    chart_cross_profile_detail::observation_timer timer(
+        stats?stats->row_initialization_ns:unused_ns,stats!=nullptr);
+    outside_by_pattern.assign(chart.pattern_count,parsimony_chart_detail::make_inf_row());
+  }
 
   for (auto pid : grammar.productions_by_child[clade]) {
+    auto occurrence_started=stats?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if (pid == no_production || pid >= grammar.productions.size()) {
       throw std::runtime_error("lazy chart: production id out of range");
     }
@@ -2096,9 +2277,18 @@ inline void assign_outside_classes_for_clade(
         static_cast<std::size_t>(std::distance(prod.children.begin(), child_it));
     parsimony_chart_detail::validate_production_inside_row_inputs(
         grammar, prod, pid, "lazy outside chart");
+    if (stats) {
+      stats->occurrence_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now()-occurrence_started).count();
+      ++stats->key_calls;
+      stats->key_patterns+=chart.pattern_count;
+      stats->requested_key_patterns+=observation->requested_count;
+      stats->key_words+=chart.pattern_count*(prod.children.size()+1);
+      stats->requested_key_words+=observation->requested_count*(prod.children.size()+1);
+    }
 
     auto const context_keys = collect_outside_context_keys(
-        chart, grammar, patterns, prod, key_workspace);
+        chart, grammar, patterns, prod, key_workspace,stats);
     auto const& context_classes = context_keys.classes();
 
     // The former ordered map traversed contexts lexicographically. Packed
@@ -2109,21 +2299,79 @@ inline void assign_outside_classes_for_clade(
           context_classes.representative_by_class[context_class];
       auto parent_outside_class =
           outside_class_index_for_pattern(chart, prod.parent, representative);
+      auto const members=context_classes.members_for_class(context_class);
+      if (observation && observation->restrict_to_demand) {
+        auto* skipped=observation->skip_stats;
+        if (skipped) ++skipped->visited_contexts;
+        // The predicate is global for this reference, hence a site's entire
+        // top-down dependency chain is retained. Mixed groups must run; their
+        // representative has the same parent/child class key even if unused.
+        if (!std::any_of(members.begin(),members.end(),[&](auto pattern) {
+              return observation->requested[pattern]!=0;
+            })) {
+          if (skipped) {
+            ++skipped->skipped_contexts;
+            skipped->skipped_members+=members.size();
+          }
+          continue;
+        }
+      }
+      std::size_t requested_members=0;
+      if (stats) {
+        chart_cross_profile_detail::observation_timer timer(stats->classification_ns,true);
+        for (auto pattern:members) requested_members+=observation->requested[pattern];
+        auto demanded=requested_members!=0;
+        ++stats->context_classes;
+        stats->requested_context_classes+=demanded;
+        stats->zero_demand_context_classes+=!demanded;
+        stats->mixed_context_classes+=demanded && requested_members<members.size();
+        ++stats->contribution_calls;
+        stats->requested_contribution_calls+=demanded;
+        stats->zero_demand_contribution_calls+=!demanded;
+        if (prod.children.size()==2) {
+          ++stats->binary_contributions; stats->zero_demand_binary_contributions+=!demanded;
+        } else {
+          ++stats->generic_contributions; stats->zero_demand_generic_contributions+=!demanded;
+        }
+        stats->parent_state_checks+=nuc_state_count;
+        for (auto cost:chart.outside_rows_by_clade[prod.parent][parent_outside_class]) {
+          auto finite=cost<chart_inf;
+          stats->finite_parent_state_branches+=finite;
+          stats->zero_demand_finite_parent_state_branches+=finite&&!demanded;
+        }
+        stats->scatter_members+=members.size();
+        stats->requested_scatter_members+=requested_members;
+        stats->scatter_state_updates+=nuc_state_count*members.size();
+        stats->requested_scatter_state_updates+=nuc_state_count*requested_members;
+      }
       if (prod.children.size() != 2) {
         ++chart.outside_multifurcation_productions_scored;
       }
+      auto contribution_started=stats?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
       auto contribution = compute_child_outside_contribution(
           chart, grammar, patterns, prod, child_slot, representative,
           parent_outside_class, chart.outside_recurrence_work);
-      for (auto pattern : context_classes.members_for_class(context_class)) {
-        auto& row = outside_by_pattern[pattern];
-        for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
-          row[state] = std::min(row[state], contribution[state]);
+      if (stats) {
+        auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-contribution_started).count();
+        stats->contribution_ns+=elapsed;
+        if (requested_members==0) stats->zero_demand_contribution_ns+=elapsed;
+      }
+      {
+        chart_cross_profile_detail::observation_timer timer(
+            stats?stats->scatter_ns:unused_ns,stats!=nullptr);
+        for (auto pattern : members) {
+          auto& row = outside_by_pattern[pattern];
+          for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+            row[state] = std::min(row[state], contribution[state]);
+          }
         }
       }
     }
   }
 
+  chart_cross_profile_detail::observation_timer publication_timer(
+      stats?stats->row_interning_ns:unused_ns,stats!=nullptr);
   std::map<row_type, std::size_t> class_by_row;
   std::vector<std::size_t> class_map(chart.pattern_count, 0);
   auto& rows = chart.outside_rows_by_clade[clade];
@@ -7429,12 +7677,25 @@ inline std::uint64_t lazy_composite_lower_bound_active(
                                     options);
 }
 
-inline void build_lazy_outside_chart_in_place(
+namespace lazy_chart_detail {
+
+inline void build_lazy_outside_chart_in_place_impl(
     clade_grammar const& grammar, site_pattern_set const& patterns,
     lazy_multisite_chart& chart, chart_options const& options,
-    std::uint8_t reference_state) {
+    std::uint8_t reference_state,
+    outside_demand_reference_stats* demand_observation,
+    bool restrict_to_demand,
+    outside_demand_skip_reference_stats* skip_observation) {
   using namespace lazy_chart_detail;
+  // The free-root route remains completely outside this reference census.
+  auto* observed=options.score_ua_edge?demand_observation:nullptr;
+  std::uint64_t unused_ns=0;
+  chart_cross_profile_detail::observation_timer whole_timer(
+      observed?observed->total_ns:unused_ns,observed!=nullptr);
 
+  {
+  chart_cross_profile_detail::observation_timer timer(
+      observed?observed->validation_ns:unused_ns,observed!=nullptr);
   parsimony_chart_detail::validate_chart_grammar(grammar);
   chart_trim_detail::validate_production_indices(grammar);
   validate_patterns(grammar, patterns);
@@ -7454,7 +7715,15 @@ inline void build_lazy_outside_chart_in_place(
     throw std::runtime_error("lazy outside chart: root clade out of range");
   }
   materialize_inside_class_maps(chart, grammar, patterns);
+  }
 
+  outside_demand_context demand;
+  demand.initialize(patterns,reference_state,observed,restrict_to_demand,skip_observation);
+  auto root = grammar.root_clade;
+
+  {
+  chart_cross_profile_detail::observation_timer timer(
+      observed?observed->reset_root_ns:unused_ns,observed!=nullptr);
   chart.outside_rows_by_clade.assign(grammar.clades.size(), {});
   chart.outside_class_index_by_pattern_by_clade.assign(grammar.clades.size(),
                                                        std::nullopt);
@@ -7464,7 +7733,6 @@ inline void build_lazy_outside_chart_in_place(
   chart.outside_multifurcation_productions_scored = 0;
   chart.outside_recurrence_work = {};
 
-  auto root = grammar.root_clade;
   auto root_row = parsimony_chart_detail::make_inf_row();
   for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
     root_row[state] =
@@ -7487,17 +7755,64 @@ inline void build_lazy_outside_chart_in_place(
                                 inside_root[state], root_row[state]));
     }
     chart.outside_global_min_by_pattern[pattern] = best;
+    if (observed && demand.requested[pattern]) {
+      ++observed->requested_global_minima;
+      observed->requested_finite_global_minima+=best<chart_inf;
+      observed->requested_infinite_global_minima+=best>=chart_inf;
+    }
   }
+  }
+  demand.publish(chart,grammar,root);
 
   outside_context_key_workspace context_key_workspace;
-  auto order = chart_trim_detail::clades_by_decreasing_size(grammar);
+  std::vector<clade_id> order;
+  {
+    chart_cross_profile_detail::observation_timer timer(
+        observed?observed->order_ns:unused_ns,observed!=nullptr);
+    order=chart_trim_detail::clades_by_decreasing_size(grammar);
+  }
   for (auto clade : order) {
     if (clade == root) continue;
     assign_outside_classes_for_clade(chart, grammar, patterns, clade,
-                                     context_key_workspace);
+                                     context_key_workspace,(observed||restrict_to_demand)?&demand:nullptr);
+    demand.publish(chart,grammar,clade);
   }
 
+  chart_cross_profile_detail::observation_timer timer(
+      observed?observed->finalize_ns:unused_ns,observed!=nullptr);
   finalize_outside_counters(chart);
+  if (restrict_to_demand && skip_observation) {
+    skip_observation->executed_binary_contributions+=chart.outside_recurrence_work.binary_stack_productions_scored;
+    skip_observation->executed_generic_contributions+=chart.outside_recurrence_work.generic_reusable_productions_scored;
+    skip_observation->root_global_minima_preserved+=chart.pattern_count;
+  }
+}
+
+// Internal, explicitly partial interface: only active patterns with positive
+// counts for this reference have certified nonroot outside responses. Root
+// rows/minima and inside rows remain full. Never use this chart as a full-basis
+// outside chart; the companion immediately exports only the demanded channels.
+inline void build_reference_outside_requested_subset_in_place(
+    clade_grammar const& grammar,site_pattern_set const& patterns,
+    lazy_multisite_chart& chart,chart_options const& options,
+    std::uint8_t reference_state,
+    outside_demand_skip_reference_stats* skip_observation = nullptr) {
+  if (!options.score_ua_edge)
+    throw std::runtime_error("requested outside subset requires a declared UA reference");
+  build_lazy_outside_chart_in_place_impl(grammar,patterns,chart,options,
+      reference_state,nullptr,true,skip_observation);
+}
+
+} // namespace lazy_chart_detail
+
+// Public/default outside construction retains the full-pattern contract.
+inline void build_lazy_outside_chart_in_place(
+    clade_grammar const& grammar,site_pattern_set const& patterns,
+    lazy_multisite_chart& chart,chart_options const& options,
+    std::uint8_t reference_state,
+    lazy_chart_detail::outside_demand_reference_stats* demand_observation = nullptr) {
+  lazy_chart_detail::build_lazy_outside_chart_in_place_impl(grammar,patterns,chart,
+      options,reference_state,demand_observation,false,nullptr);
 }
 
 inline void build_lazy_outside_chart_in_place(
@@ -8088,6 +8403,9 @@ struct lazy_one_witness_setup_stats {
 
 struct lazy_one_witness_setup_options {
   bool stream_reference_outside = false;
+  outside_demand_stats* outside_demand_observation = nullptr;
+  bool restrict_reference_outside_to_demand = false;
+  outside_demand_skip_stats* outside_demand_skip_observation = nullptr;
   // Research-only optional read-only semantic attestation. Every observed
   // arm charges it separately; default production callers do no hashing.
   std::function<void(std::vector<chart_multisite_detail::active_pattern_info> const&)> active_audit;
@@ -8200,9 +8518,23 @@ build_active_pattern_info_from_lazy(
     clade_grammar const& grammar, site_pattern_set const& patterns,
     lazy_multisite_chart const& prepared, chart_options const& options,
     lazy_one_witness_setup_stats* observation = nullptr,
-    bool stream_reference_outside = false) {
+    bool stream_reference_outside = false,
+    outside_demand_stats* demand_observation = nullptr,
+    bool restrict_reference_outside_to_demand = false,
+    outside_demand_skip_stats* skip_observation = nullptr) {
   chart_multisite_detail::validate_multisite_inputs(grammar, patterns,
                                                     options);
+  if (options.score_ua_edge && restrict_reference_outside_to_demand && demand_observation)
+    throw std::runtime_error("full outside census cannot be combined with requested-subset construction");
+  auto build_reference=[&](lazy_multisite_chart& working,std::uint8_t reference) {
+    if (restrict_reference_outside_to_demand) {
+      build_reference_outside_requested_subset_in_place(grammar,patterns,working,options,reference,
+          skip_observation?&skip_observation->per_reference[reference]:nullptr);
+    } else {
+      build_lazy_outside_chart_in_place(grammar,patterns,working,options,reference,
+          demand_observation?&demand_observation->per_reference[reference]:nullptr);
+    }
+  };
   if (stream_reference_outside && options.score_ua_edge) {
     // The active order and its owned scalar rows are identical to the cached
     // route. Only one private working chart exists; each outside build clears
@@ -8242,7 +8574,7 @@ build_active_pattern_info_from_lazy(
         {
           chart_cross_profile_detail::observation_timer timer(
               observation?observation->reference_outside_ns:unused_ns,observation!=nullptr);
-          build_lazy_outside_chart_in_place(grammar,patterns,working,options,r);
+          build_reference(working,r);
         }
         lifetime.built(working);
         for (auto& info:active) {
@@ -8276,9 +8608,7 @@ build_active_pattern_info_from_lazy(
       {
         chart_cross_profile_detail::observation_timer timer(
             observation ? observation->reference_outside_ns : unused_ns, observation != nullptr);
-        build_lazy_outside_chart_in_place(
-            grammar, patterns, outside_by_reference[reference_state], options,
-            reference_state);
+        build_reference(outside_by_reference[reference_state],reference_state);
       }
       lifetime.built(outside_by_reference[reference_state]);
       outside_reference_built[reference_state] = true;
@@ -8540,7 +8870,8 @@ build_lazy_one_witness_frontiers(
         observation ? observation->active_ns : unused_ns, observation != nullptr);
     active = build_active_pattern_info_from_lazy(
         grammar, patterns, prepared, options, observation,
-        execution.stream_reference_outside);
+        execution.stream_reference_outside,execution.outside_demand_observation,
+        execution.restrict_reference_outside_to_demand,execution.outside_demand_skip_observation);
   }
   if (execution.active_audit) {
     chart_cross_profile_detail::observation_timer timer(
