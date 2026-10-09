@@ -8052,14 +8052,119 @@ inline composite_chart_score build_composite_chart_score(
 
 namespace lazy_chart_detail {
 
+// Optional observation surface for the explicit-bound one-witness companion.
+// Top-level prepare/composite/active/active-audit/frontier-core are disjoint.
+// Copy/map/free-root-outside are nested in prepare; reference copies/outside
+// builds and dense exports are nested, disjoint children of active.
+struct lazy_one_witness_setup_stats {
+  std::uint64_t prepare_ns = 0;
+  std::uint64_t prepare_copy_ns = 0;
+  std::uint64_t prepare_maps_ns = 0;
+  std::uint64_t prepare_free_outside_ns = 0;
+  std::uint64_t composite_ns = 0;
+  std::uint64_t active_ns = 0;
+  std::uint64_t reference_copy_ns = 0;
+  std::uint64_t reference_outside_ns = 0;
+  std::uint64_t dense_inside_ns = 0;
+  std::uint64_t dense_outside_ns = 0;
+  std::uint64_t frontier_core_ns = 0;
+  std::uint64_t active_audit_ns = 0;
+  std::size_t reference_builds = 0;
+  std::size_t dense_inside_rows = 0;
+  std::size_t dense_outside_rows = 0;
+  std::size_t source_map_pairs = 0;
+  std::size_t prepared_map_pairs = 0;
+  std::size_t source_map_values = 0;
+  std::size_t prepared_map_values = 0;
+  std::size_t map_pairs_reconstructed = 0;
+  std::size_t reference_chart_copies = 0;
+  std::size_t reference_chart_peak_live = 0;
+  std::size_t reference_chart_releases = 0;
+  std::size_t reference_inside_rows_copied = 0;
+  std::size_t reference_map_values_copied = 0;
+  std::size_t reference_map_reconstructions = 0;
+  std::size_t reference_outside_rows_computed = 0;
+};
+
+struct lazy_one_witness_setup_options {
+  bool stream_reference_outside = false;
+  // Research-only optional read-only semantic attestation. Every observed
+  // arm charges it separately; default production callers do no hashing.
+  std::function<void(std::vector<chart_multisite_detail::active_pattern_info> const&)> active_audit;
+};
+
+inline std::pair<std::size_t,std::size_t> inside_map_inventory(lazy_multisite_chart const& chart) {
+  std::size_t pairs=0,values=0;
+  for (std::size_t c=0;c<chart.class_index_by_pattern_by_clade.size();++c) {
+    auto const& row=chart.class_index_by_pattern_by_clade[c];
+    auto const& structural=chart.structural_class_index_by_pattern_by_clade[c];
+    if (row && structural) ++pairs;
+    if (row) values+=row->size();
+    if (structural) values+=structural->size();
+  }
+  return {pairs,values};
+}
+
+struct reference_chart_lifetime {
+  lazy_one_witness_setup_stats* observation;
+  std::size_t owned=0;
+  // Declare this guard before the owned charts. Their destruction then
+  // precedes this release accounting, including exception unwinding.
+  ~reference_chart_lifetime() {
+    if (observation) observation->reference_chart_releases+=owned;
+  }
+  void copied(lazy_multisite_chart const& source) {
+    ++owned;
+    if (!observation) return;
+    ++observation->reference_chart_copies;
+    observation->reference_chart_peak_live=std::max(observation->reference_chart_peak_live,owned);
+    observation->reference_map_values_copied+=inside_map_inventory(source).second;
+    for (auto const& rows:source.inside_rows_by_clade)
+      observation->reference_inside_rows_copied+=rows.size();
+  }
+  void before_build(lazy_multisite_chart const& chart) {
+    if (observation)
+      observation->reference_map_reconstructions+=
+          chart.inside_rows_by_clade.size()-inside_map_inventory(chart).first;
+  }
+  void built(lazy_multisite_chart const& chart) {
+    if (observation) {
+      ++observation->reference_builds;
+      observation->reference_outside_rows_computed+=chart.lazy_outside_rows_computed;
+    }
+  }
+};
+
 inline lazy_multisite_chart prepare_lazy_chart_for_multisite_frontiers(
     clade_grammar const& grammar, site_pattern_set const& patterns,
-    lazy_multisite_chart const& source, chart_options const& options) {
+    lazy_multisite_chart const& source, chart_options const& options,
+    lazy_one_witness_setup_stats* observation = nullptr) {
   validate_lazy_inside_score_inputs(grammar, patterns, source, options,
                                     "lazy multi-site trim");
+  if (observation) {
+    auto [pairs,values]=inside_map_inventory(source);
+    observation->source_map_pairs+=pairs; observation->source_map_values+=values;
+  }
+  std::uint64_t unused_ns = 0;
+  auto const copy_started = observation ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
   lazy_multisite_chart prepared = source;
-  materialize_inside_class_maps(prepared, grammar, patterns);
+  if (observation)
+    observation->prepare_copy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - copy_started).count();
+  {
+    chart_cross_profile_detail::observation_timer timer(
+        observation ? observation->prepare_maps_ns : unused_ns, observation != nullptr);
+    materialize_inside_class_maps(prepared, grammar, patterns);
+  }
+  if (observation) {
+    auto [pairs,values]=inside_map_inventory(prepared);
+    observation->prepared_map_pairs+=pairs; observation->prepared_map_values+=values;
+    observation->map_pairs_reconstructed+=pairs-inside_map_inventory(source).first;
+  }
   if (!options.score_ua_edge) {
+    chart_cross_profile_detail::observation_timer timer(
+        observation ? observation->prepare_free_outside_ns : unused_ns, observation != nullptr);
     build_lazy_outside_chart_in_place(grammar, patterns, prepared, options);
   }
   return prepared;
@@ -8093,21 +8198,89 @@ inline single_site_outside_chart single_site_outside_chart_from_lazy(
 inline std::vector<chart_multisite_detail::active_pattern_info>
 build_active_pattern_info_from_lazy(
     clade_grammar const& grammar, site_pattern_set const& patterns,
-    lazy_multisite_chart const& prepared, chart_options const& options) {
+    lazy_multisite_chart const& prepared, chart_options const& options,
+    lazy_one_witness_setup_stats* observation = nullptr,
+    bool stream_reference_outside = false) {
   chart_multisite_detail::validate_multisite_inputs(grammar, patterns,
                                                     options);
+  if (stream_reference_outside && options.score_ua_edge) {
+    // The active order and its owned scalar rows are identical to the cached
+    // route. Only one private working chart exists; each outside build clears
+    // and replaces all outside maps/rows before a different reference is used.
+    std::vector<chart_multisite_detail::active_pattern_info> active;
+    std::uint64_t unused_ns=0;
+    std::array<bool,nuc_state_count> used{};
+    for (std::size_t p=0;p<patterns.patterns.size();++p) {
+      auto const& pattern=patterns.patterns[p];
+      chart_multisite_detail::validate_pattern_reference_counts(pattern,p);
+      if (!chart_multisite_detail::is_active_pattern(pattern)) continue;
+      chart_multisite_detail::active_pattern_info info;
+      info.pattern_index=p; info.weight=pattern.weight;
+      info.reference_state_counts=pattern.reference_state_counts;
+      info.state_by_taxon=pattern.state_by_taxon;
+      {
+        chart_cross_profile_detail::observation_timer timer(
+            observation?observation->dense_inside_ns:unused_ns,observation!=nullptr);
+        info.chart=single_site_chart_from_lazy(grammar,prepared,p);
+        if (observation) observation->dense_inside_rows+=grammar.clades.size();
+      }
+      for (std::uint8_t r=0;r<nuc_state_count;++r)
+        used[r]=used[r] || pattern.reference_state_counts[r]!=0;
+      active.push_back(std::move(info));
+    }
+    if (std::any_of(used.begin(),used.end(),[](bool present){return present;})) {
+      reference_chart_lifetime lifetime{observation};
+      auto copy_started=observation?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+      lazy_multisite_chart working=prepared;
+      if (observation)
+        observation->reference_copy_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-copy_started).count();
+      lifetime.copied(prepared);
+      for (std::uint8_t r=0;r<nuc_state_count;++r) {
+        if (!used[r]) continue;
+        lifetime.before_build(working);
+        {
+          chart_cross_profile_detail::observation_timer timer(
+              observation?observation->reference_outside_ns:unused_ns,observation!=nullptr);
+          build_lazy_outside_chart_in_place(grammar,patterns,working,options,r);
+        }
+        lifetime.built(working);
+        for (auto& info:active) {
+          if (!info.reference_state_counts[r]) continue;
+          chart_cross_profile_detail::observation_timer timer(
+              observation?observation->dense_outside_ns:unused_ns,observation!=nullptr);
+          info.outside_by_reference[r]=single_site_outside_chart_from_lazy(grammar,working,info.pattern_index);
+          if (observation) observation->dense_outside_rows+=grammar.clades.size();
+        }
+      }
+    }
+    return active;
+  }
   std::vector<chart_multisite_detail::active_pattern_info> active;
+  reference_chart_lifetime lifetime{observation};
   std::array<lazy_multisite_chart, nuc_state_count> outside_by_reference;
   std::array<bool, nuc_state_count> outside_reference_built{};
   outside_reference_built.fill(false);
+  std::uint64_t unused_ns = 0;
 
   auto outside_for_reference = [&](std::uint8_t reference_state)
       -> lazy_multisite_chart const& {
     if (!outside_reference_built[reference_state]) {
-      outside_by_reference[reference_state] = prepared;
-      build_lazy_outside_chart_in_place(
-          grammar, patterns, outside_by_reference[reference_state], options,
-          reference_state);
+      {
+        chart_cross_profile_detail::observation_timer timer(
+            observation ? observation->reference_copy_ns : unused_ns, observation != nullptr);
+        outside_by_reference[reference_state] = prepared;
+      }
+      lifetime.copied(prepared);
+      lifetime.before_build(outside_by_reference[reference_state]);
+      {
+        chart_cross_profile_detail::observation_timer timer(
+            observation ? observation->reference_outside_ns : unused_ns, observation != nullptr);
+        build_lazy_outside_chart_in_place(
+            grammar, patterns, outside_by_reference[reference_state], options,
+            reference_state);
+      }
+      lifetime.built(outside_by_reference[reference_state]);
       outside_reference_built[reference_state] = true;
     }
     return outside_by_reference[reference_state];
@@ -8127,19 +8300,29 @@ build_active_pattern_info_from_lazy(
     info.weight = pattern.weight;
     info.reference_state_counts = pattern.reference_state_counts;
     info.state_by_taxon = pattern.state_by_taxon;
-    info.chart = single_site_chart_from_lazy(grammar, prepared, pattern_index);
+    {
+      chart_cross_profile_detail::observation_timer timer(
+          observation ? observation->dense_inside_ns : unused_ns, observation != nullptr);
+      info.chart = single_site_chart_from_lazy(grammar, prepared, pattern_index);
+      if (observation) observation->dense_inside_rows += grammar.clades.size();
+    }
     if (options.score_ua_edge) {
       for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
            ++reference_state) {
         if (info.reference_state_counts[reference_state] == 0) continue;
+        auto const& reference_chart = outside_for_reference(reference_state);
+        chart_cross_profile_detail::observation_timer timer(
+            observation ? observation->dense_outside_ns : unused_ns, observation != nullptr);
         info.outside_by_reference[reference_state] =
-            single_site_outside_chart_from_lazy(
-                grammar, outside_for_reference(reference_state),
-                pattern_index);
+            single_site_outside_chart_from_lazy(grammar, reference_chart, pattern_index);
+        if (observation) observation->dense_outside_rows += grammar.clades.size();
       }
     } else {
+      chart_cross_profile_detail::observation_timer timer(
+          observation ? observation->dense_outside_ns : unused_ns, observation != nullptr);
       info.outside_ua_free =
           single_site_outside_chart_from_lazy(grammar, prepared, pattern_index);
+      if (observation) observation->dense_outside_rows += grammar.clades.size();
     }
     active.push_back(std::move(info));
   }
@@ -8318,7 +8501,9 @@ inline chart_multisite_detail::multisite_frontier_build_result
 build_lazy_one_witness_frontiers(
     clade_grammar const& grammar, site_pattern_set const& patterns,
     lazy_multisite_chart const& chart, chart_options const& options,
-    multisite_topology_trace_options const& trace) {
+    multisite_topology_trace_options const& trace,
+    lazy_one_witness_setup_stats* observation = nullptr,
+    lazy_one_witness_setup_options const& execution = {}) {
   using namespace chart_multisite_detail;
   validate_multisite_inputs(grammar, patterns, options);
   if (!trace.keep_provenance || trace.max_optimal_topologies != 1 ||
@@ -8335,11 +8520,33 @@ build_lazy_one_witness_frontiers(
   }
   validate_multisite_trim_options_supported(trace.trim_options,
                                             "lazy topology witness", true);
+  std::uint64_t unused_ns = 0;
+  auto prepare_started = observation ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
   auto prepared = prepare_lazy_chart_for_multisite_frontiers(
-      grammar, patterns, chart, options);
-  auto composite = lazy_composite_chart_score(grammar, patterns, prepared, options);
-  auto active = build_active_pattern_info_from_lazy(
-      grammar, patterns, prepared, options);
+      grammar, patterns, chart, options, observation);
+  if (observation)
+    observation->prepare_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - prepare_started).count();
+  composite_chart_score composite;
+  {
+    chart_cross_profile_detail::observation_timer timer(
+        observation ? observation->composite_ns : unused_ns, observation != nullptr);
+    composite = lazy_composite_chart_score(grammar, patterns, prepared, options);
+  }
+  std::vector<active_pattern_info> active;
+  {
+    chart_cross_profile_detail::observation_timer timer(
+        observation ? observation->active_ns : unused_ns, observation != nullptr);
+    active = build_active_pattern_info_from_lazy(
+        grammar, patterns, prepared, options, observation,
+        execution.stream_reference_outside);
+  }
+  if (execution.active_audit) {
+    chart_cross_profile_detail::observation_timer timer(
+        observation?observation->active_audit_ns:unused_ns,observation!=nullptr);
+    execution.active_audit(active);
+  }
   multisite_frontier_build_options build_options;
   build_options.keep_provenance = true;
   build_options.keep_used_production = false;
@@ -8353,6 +8560,8 @@ build_lazy_one_witness_frontiers(
   build_options.max_frontier_entries_per_clade =
       trace.trim_options.max_frontier_entries_per_clade;
   build_options.max_provenance_choices_per_entry = 2;
+  chart_cross_profile_detail::observation_timer timer(
+      observation ? observation->frontier_core_ns : unused_ns, observation != nullptr);
   return build_multisite_frontiers_from_active(
       grammar, patterns, options, build_options, "lazy topology witness",
       std::move(active), composite.weighted_lower_bound);

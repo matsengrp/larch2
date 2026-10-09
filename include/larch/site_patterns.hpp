@@ -505,6 +505,115 @@ inline bool is_binary_variable_site_pattern(site_pattern const& pattern) {
   return site_patterns_detail::distinct_state_count(pattern.state_by_taxon) == 2;
 }
 
+// Explicit opt-in scoring basis for the fixed four-state unit-Hamming grammar
+// API. This is not an equivalence for arbitrary substitution matrices, named
+// character pins, ancestral-label enumeration, or a plan with another model.
+// Structural choices remain shared: only pattern coordinates are merged.
+struct binary_normalized_exact_query_view {
+  site_pattern_set execution_patterns;
+  std::vector<std::size_t> original_to_query;
+  std::vector<std::array<std::uint8_t, nuc_state_count>> original_to_query_state;
+  std::size_t binary_input_patterns = 0;
+  std::size_t binary_query_patterns = 0;
+};
+
+struct binary_normalized_exact_query_contract {
+  // A caller must not advertise another model/interface as the fixed unit
+  // grammar API. The pilot's receiver has no arbitrary-matrix execution path.
+  bool symmetric_unit_model = true;
+  bool singleton_observations = true;
+  bool state_specific_ports = false;
+  bool root_character_pins = false;
+};
+
+inline binary_normalized_exact_query_view
+build_binary_normalized_exact_query_view(
+    site_pattern_set const& original,
+    binary_normalized_exact_query_contract const& contract = {}) {
+  if (!contract.symmetric_unit_model)
+    throw std::runtime_error("BINARY_QUERY_UNSUPPORTED_MODEL");
+  if (!contract.singleton_observations)
+    throw std::runtime_error("BINARY_QUERY_UNSUPPORTED_AMBIGUITY");
+  if (contract.state_specific_ports)
+    throw std::runtime_error("BINARY_QUERY_UNDECLARED_CHARACTER_PORT");
+  if (contract.root_character_pins)
+    throw std::runtime_error("BINARY_QUERY_ROOT_PIN_UNSUPPORTED");
+  binary_normalized_exact_query_view view;
+  auto& query = view.execution_patterns;
+  query.taxon_count = original.taxon_count;
+  query.total_site_count = original.total_site_count;
+  query.invariant_site_count = original.invariant_site_count;
+  query.variable_site_count = original.variable_site_count;
+  query.binary_variable_site_count = original.binary_variable_site_count;
+  query.nonbinary_variable_site_count = original.nonbinary_variable_site_count;
+  query.skipped_invariant_site_count = original.skipped_invariant_site_count;
+  query.invariant_constant_score_excluding_ua = original.invariant_constant_score_excluding_ua;
+  query.invariant_constant_score_with_reference_edge = original.invariant_constant_score_with_reference_edge;
+  query.skipped_invariant_constant_score_with_reference_edge = original.skipped_invariant_constant_score_with_reference_edge;
+  view.original_to_query.assign(original.patterns.size(), no_site_pattern);
+  view.original_to_query_state.resize(original.patterns.size());
+  std::unordered_map<std::vector<std::uint8_t>, std::size_t,
+                     site_patterns_detail::vector_uint8_hash> binary_groups;
+  auto sum_u32 = [](std::uint32_t a, std::uint32_t b) {
+    if (b > std::numeric_limits<std::uint32_t>::max() - a)
+      throw std::runtime_error("BINARY_QUERY_WEIGHT_OVERFLOW");
+    return static_cast<std::uint32_t>(a + b);
+  };
+  for (std::size_t i = 0; i < original.patterns.size(); ++i) {
+    auto const& source = original.patterns[i];
+    if (source.state_by_taxon.size() != original.taxon_count ||
+        source.state_by_taxon.empty() || source.weight == 0)
+      throw std::runtime_error("BINARY_QUERY_INVALID_PATTERN");
+    std::uint64_t reference_weight = 0;
+    for (auto count : source.reference_state_counts) reference_weight += count;
+    if (reference_weight != source.weight)
+      throw std::runtime_error("BINARY_QUERY_INVALID_REFERENCE_COUNTS");
+    auto const distinct = site_patterns_detail::distinct_state_count(source.state_by_taxon);
+    auto& permutation = view.original_to_query_state[i];
+    for (std::uint8_t s = 0; s < nuc_state_count; ++s) permutation[s] = s;
+    if (distinct != 2) {
+      view.original_to_query[i] = query.patterns.size();
+      query.patterns.push_back(source);
+      continue;
+    }
+    ++view.binary_input_patterns;
+    auto map = site_patterns_detail::make_normalized_binary_state_map(source.state_by_taxon);
+    site_patterns_detail::validate_normalized_binary_state_map(map);
+    permutation = map.original_to_normalized;
+    std::vector<std::uint8_t> key;
+    key.reserve(source.state_by_taxon.size());
+    for (auto s : source.state_by_taxon) key.push_back(permutation[s]);
+    auto [found, inserted] = binary_groups.emplace(key, query.patterns.size());
+    if (inserted) {
+      site_pattern row;
+      row.state_by_taxon = std::move(key);
+      query.patterns.push_back(std::move(row));
+      ++view.binary_query_patterns;
+    }
+    auto const q = found->second;
+    view.original_to_query[i] = q;
+    auto& destination = query.patterns[q];
+    destination.weight = sum_u32(destination.weight, source.weight);
+    for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
+      auto const normalized = permutation[s];
+      destination.reference_state_counts[normalized] = sum_u32(
+          destination.reference_state_counts[normalized], source.reference_state_counts[s]);
+    }
+    destination.positions.insert(destination.positions.end(),
+                                 source.positions.begin(), source.positions.end());
+  }
+  for (auto& pattern : query.patterns)
+    std::sort(pattern.positions.begin(), pattern.positions.end());
+  query.original_site_to_pattern = original.original_site_to_pattern;
+  for (auto& alias : query.original_site_to_pattern) {
+    if (alias == no_site_pattern) continue;
+    if (alias >= view.original_to_query.size())
+      throw std::runtime_error("BINARY_QUERY_INVALID_SITE_ALIAS");
+    alias = view.original_to_query[alias];
+  }
+  return view;
+}
+
 namespace site_patterns_detail {
 
 inline site_pattern_set build_site_patterns_with_optional_source_metadata(

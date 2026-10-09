@@ -5722,6 +5722,9 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
 
   std::vector<multisite_restriction_classes> classes(grammar.clades.size());
   {
+    chart_cross_profile_detail::observation_timer class_timer(
+        result.cross_profile.class_tables_ns,
+        build_options.cross_profile_dominance.observe);
     auto tables_t0 = prof_active ? std::chrono::steady_clock::now()
                                  : prof_unused;
     // Row-key classes are built bottom-up: a clade's key references its
@@ -5753,15 +5756,20 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
                               : prof_unused;
   std::vector<multisite_production_class_map> production_maps(
       grammar.productions.size());
-  for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
-    auto const& prod = grammar.productions[pid];
-    if (prod.children.size() != 2) {
-      throw std::runtime_error(
-          context +
-          ": class-compressed frontiers support binary productions only");
+  {
+    chart_cross_profile_detail::observation_timer maps_timer(
+        result.cross_profile.production_maps_ns,
+        build_options.cross_profile_dominance.observe);
+    for (std::size_t pid = 0; pid < grammar.productions.size(); ++pid) {
+      auto const& prod = grammar.productions[pid];
+      if (prod.children.size() != 2) {
+        throw std::runtime_error(
+            context +
+            ": class-compressed frontiers support binary productions only");
+      }
+      production_maps[pid] =
+          build_production_class_map(grammar, prod, classes);
     }
-    production_maps[pid] =
-        build_production_class_map(grammar, prod, classes);
   }
   if (prof_active) {
     std::fprintf(stderr, "  prof_production_maps_ms=%.0f\n",
@@ -5847,11 +5855,21 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
                                     active_patterns,
                                     result.invariant_constant_offset, options);
     } else {
-      fact = compute_interior_factorization(grammar, clade, classes,
-                                            production_maps, factorization);
-      finalize_factorization_bounds(fact, classes[clade], clade,
-                                    active_patterns,
-                                    result.invariant_constant_offset, options);
+      {
+        chart_cross_profile_detail::observation_timer factor_timer(
+            result.cross_profile.predictive_factor_ns,
+            build_options.cross_profile_dominance.observe);
+        fact = compute_interior_factorization(grammar, clade, classes,
+                                              production_maps, factorization);
+      }
+      {
+        chart_cross_profile_detail::observation_timer bound_timer(
+            result.cross_profile.factor_bounds_ns,
+            build_options.cross_profile_dominance.observe);
+        finalize_factorization_bounds(fact, classes[clade], clade,
+                                      active_patterns,
+                                      result.invariant_constant_offset, options);
+      }
       auto predictive =
           classes[clade].class_count - fact.varying_classes.size();
       result.factored_predictive_total += predictive;
@@ -5926,12 +5944,22 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
              right_index < frontiers[right_child].size(); ++right_index) {
           auto const& right = frontiers[right_child][right_index];
           ++result.cross_profile.generated_products;
+          if (build_options.cross_profile_dominance.observe) {
+            result.cross_profile.combine_class_positions += plans[pi].instrs.size();
+            result.cross_profile.generated_row_values +=
+                fact.varying_classes.size() * nuc_state_count;
+          }
           auto cand_t0 = prof_active ? std::chrono::steady_clock::now()
                                      : prof_unused;
-          combine_compressed_rows_factored(
-              left.rows, right.rows, plans[pi], factorization[left_child],
-              factorization[right_child], pid, left.topology_hash,
-              right.topology_hash, fact.varying_classes.size(), candidate);
+          {
+            chart_cross_profile_detail::observation_timer combine_timer(
+                result.cross_profile.candidate_combine_ns,
+                build_options.cross_profile_dominance.observe);
+            combine_compressed_rows_factored(
+                left.rows, right.rows, plans[pi], factorization[left_child],
+                factorization[right_child], pid, left.topology_hash,
+                right.topology_hash, fact.varying_classes.size(), candidate);
+          }
           if (prof_active) prof_combine_ms += prof_ms_since(cand_t0);
           if (build_options.keep_provenance) {
             candidate.provenance.assign(
@@ -5942,6 +5970,9 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
               build_options.use_bound_pruning &&
               pruning_upper_bound < multisite_score_inf;
           if (bound_prune_active || beam_active) {
+            chart_cross_profile_detail::observation_timer bound_timer(
+                result.cross_profile.candidate_bounds_ns,
+                build_options.cross_profile_dominance.observe);
             auto lb_t0 = prof_active ? std::chrono::steady_clock::now()
                                      : prof_unused;
             auto lb = checked_add_u64(
@@ -5958,6 +5989,10 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
           }
           auto ins_t0 =
               prof_active ? std::chrono::steady_clock::now() : prof_unused;
+          {
+          chart_cross_profile_detail::observation_timer insert_timer(
+              result.cross_profile.candidate_insert_ns,
+              build_options.cross_profile_dominance.observe);
           auto hash = compressed_row_hash(candidate.rows);
           std::size_t found = std::numeric_limits<std::size_t>::max();
           auto bucket = entry_index.find(hash);
@@ -5985,6 +6020,7 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
                 candidate.rows, candidate.topology_hash,
                 std::move(candidate.provenance), candidate.lb});
           }
+          }
           if (prof_active) prof_insert_ms += prof_ms_since(ins_t0);
           ++prof_candidates;
           // Bound insertion memory at beamed clades: truncate well before the
@@ -6003,6 +6039,9 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
     beam_truncate();
 
     if (build_options.dominance_mode == multisite_dominance_mode::score_only) {
+      chart_cross_profile_detail::observation_timer dominance_timer(
+          result.cross_profile.score_dominance_ns,
+          build_options.cross_profile_dominance.observe);
       auto dom_t0 = prof_active ? std::chrono::steady_clock::now()
                                : prof_unused;
       apply_score_only_dominance_pruning_compressed(
@@ -6015,14 +6054,22 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
     // pruning and dominance can make classes entry independent that the
     // predictive rule could not), and compact the stored rows before any
     // parent consumes this frontier.
-    auto newly_factored =
-        compact_constant_classes(entries, fact, classes[clade]);
+    std::size_t newly_factored = 0;
+    {
+      chart_cross_profile_detail::observation_timer compact_timer(
+          result.cross_profile.first_compact_ns,
+          build_options.cross_profile_dominance.observe);
+      newly_factored = compact_constant_classes(entries, fact, classes[clade]);
+    }
     result.factored_empirical_total += newly_factored;
     result.factored_class_total += newly_factored;
     result.varying_class_max =
         std::max(result.varying_class_max, fact.varying_classes.size());
     if (build_options.profile_dedup && !fact.varying_classes.empty() &&
         entries.size() > 1) {
+      chart_cross_profile_detail::observation_timer packing_timer(
+          result.cross_profile.packing_ns,
+          build_options.cross_profile_dominance.observe);
       // Mask-profile dedup, POST-dominance and over the compacted
       // varying set.  Pre-dominance pools carry masses of distinct
       // profiles that dominance removes anyway; the survivors are what
@@ -6104,10 +6151,34 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
       entries = std::move(deduped);
     }
 
+    auto const before_cross_size = entries.size();
     chart_cross_profile_detail::apply(
         entries, fact, classes[clade], clade == grammar.root_clade,
         build_options.cross_profile_dominance, result.cross_profile,
         chart_inf - 1, clade);
+
+    if (build_options.cross_profile_dominance.enabled &&
+        build_options.cross_profile_dominance.recompact_after_filter &&
+        clade != grammar.root_clade && entries.size() < before_cross_size) {
+      chart_cross_profile_detail::observation_timer compact_timer(
+          result.cross_profile.post_compact_ns,
+          build_options.cross_profile_dominance.observe);
+      auto const additional = compact_constant_classes(entries, fact, classes[clade]);
+      result.cross_profile.post_factored_classes += additional;
+      if (additional) {
+        ++result.cross_profile.post_factored_clades;
+        result.cross_profile.post_row_values_removed +=
+            additional * nuc_state_count * entries.size();
+        result.factored_empirical_total += additional;
+        result.factored_class_total += additional;
+        // Rebuild the class-slot pattern references and bound/dominance
+        // offsets together. Parent consumers observe exactly the original
+        // four-state rows, now read from factored_value rather than entries.
+        finalize_factorization_bounds(fact, classes[clade], clade,
+                                      active_patterns,
+                                      result.invariant_constant_offset, options);
+      }
+    }
 
     // Mask-profile collapse measurement.  The external interface of an
     // entry through any unit-cost edge is (min, argmin-set) per class
@@ -6225,6 +6296,8 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
   // clades' entry indices, and the topology enumerator reads provenance
   // only (plus root cost vectors for the optimum scan), so non-root entries
   // are exported without expanding their rows.
+  auto const export_started = build_options.cross_profile_dominance.observe
+      ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   auto root = grammar.root_clade;
   result.frontiers.assign(grammar.clades.size(), {});
   auto const& root_classes = classes[root];
@@ -6264,6 +6337,10 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
       result.frontiers[root].push_back(export_entry(root, entry));
     }
   }
+  if (build_options.cross_profile_dominance.observe)
+    result.cross_profile.frontier_export_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - export_started).count();
 
   if (masks_active && masks_clades_measured != 0) {
     std::fprintf(
