@@ -132,14 +132,22 @@ unbeamed, `beam_truncated=false`):
    --chart-bnb-upper-bound <best> --chart-bnb-class-compress on
    --chart-bnb-profile-dedup on --wric-lazy-chart on
    --chart-bnb-trim-application optimal-topology-materialize
-   --chart-bnb-max-exact-topologies 1`, ~4.5 min) - this is where the
+   --chart-bnb-max-exact-topologies 1`) - this is where the
    recombination bonus lives, and it subsumes "repeat with SPR".
+   Timing note (post-`f3daf31`, 2026-10-13): this materialize step is now
+   ~49 s (was ~4.5 min during the campaign, via the explicit-bound
+   one-witness frontend fix), and **~29 s with
+   `--chart-bnb-cross-profile-dominance on`** (-41%; RSS flat; exact
+   minimum + one legal witness only - guarded to this application, so the
+   probe path cannot use it).  Probes remain ~24 s.
 5. Probe at opt-1 to certify; remap; repeat 2-4 while productive
    (~1.5 h/round on HBV).  Stop on a zero round, optionally strengthened
    by the full-neighborhood diag.
 
 Delivered on HBV: 14,279 -> 14,270 in three productive rounds, every
-intermediate certified, ~5 h total.
+intermediate certified, ~5 h total (campaign-era timing; with the
+cross-profile and one-witness-frontend speedups the post-plateau loop
+steps are now roughly 2x faster).
 
 ## Negative result: hull/"wavelet" compression tiers (`tools/wric_hull_lb.cpp`)
 
