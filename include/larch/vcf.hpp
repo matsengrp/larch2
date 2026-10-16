@@ -5,7 +5,9 @@
 #include <larch/io_util.hpp>
 #include <larch/nuc.hpp>
 
+#include <cctype>
 #include <charconv>
+#include <iostream>
 #include <map>
 #include <string>
 #include <string_view>
@@ -16,6 +18,10 @@ namespace larch {
 struct vcf_data {
   std::vector<std::string> sample_names;
   std::map<std::string, compact_genome> sample_genomes;
+  // Sites where the VCF REF allele disagrees with the reference sequence the
+  // caller supplied (i.e. the VCF was generated against a different
+  // reference).  Populated for diagnostics; read_vcf warns when non-empty.
+  std::vector<mutation_position> ref_mismatch_sites;
 };
 
 inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
@@ -92,6 +98,19 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
     std::from_chars(cols[1].data(), cols[1].data() + cols[1].size(), site_pos);
     auto mpos = static_cast<mutation_position>(site_pos);
 
+    // Track REF-column disagreements with the supplied reference: applying a
+    // VCF generated against a different reference silently corrupts leaf
+    // sequence reconstruction.
+    if (mpos >= 1 && static_cast<std::size_t>(mpos) <= reference.size()) {
+      char ref_seq_char =
+          reference.at(static_cast<std::size_t>(mpos) - 1);
+      char vcf_ref_char = ref_allele[0];
+      if (std::tolower(static_cast<unsigned char>(ref_seq_char)) !=
+          std::tolower(static_cast<unsigned char>(vcf_ref_char))) {
+        result.ref_mismatch_sites.push_back(mpos);
+      }
+    }
+
     // Per-sample genotype
     for (std::size_t i = 0;
          i < result.sample_names.size() && i + 9 < cols.size(); ++i) {
@@ -126,6 +145,14 @@ inline vcf_data read_vcf(std::string_view path, std::string_view reference) {
   // Convert accumulated mutations to compact_genomes
   for (auto& [name, muts] : sample_muts) {
     result.sample_genomes[name] = compact_genome{std::move(muts)};
+  }
+
+  if (!result.ref_mismatch_sites.empty()) {
+    std::cerr << "warning: VCF REF allele disagrees with the reference "
+                 "sequence at "
+              << result.ref_mismatch_sites.size() << " sites (e.g. position "
+              << result.ref_mismatch_sites.front()
+              << "); was the VCF generated against a different reference?\n";
   }
 
   return result;

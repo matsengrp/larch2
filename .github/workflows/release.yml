@@ -25,7 +25,8 @@ jobs:
         run: |
           cmake -B build \
             -DGCC_TOOLCHAIN=/opt/gcc-latest \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_STATIC=ON
 
       - name: Build
         run: cmake --build build --parallel $(nproc)

@@ -111,6 +111,28 @@ void test_missing_genotype_is_no_call() {
   std::println("  PASS");
 }
 
+void test_ref_mismatch_detected() {
+  std::println("test_ref_mismatch_detected");
+  temp_dir tmp{"vcf_test"};
+
+  // Record 1: REF column (G) disagrees with the reference sequence (C) at
+  // position 2.  Record 2 agrees (T == T).
+  std::string_view reference = "ACGT";
+  auto const vcf_path = tmp.path() / "refmismatch.vcf";
+  write_text(vcf_path,
+             "##fileformat=VCFv4.2\n"
+             "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\n"
+             "ref\t2\tG2T\tG\tT\t.\t.\t.\tGT\t1\n"
+             "ref\t4\tT4A\tT\tA\t.\t.\t.\tGT\t1\n");
+
+  auto vcf = larch::read_vcf(vcf_path.string(), reference);
+  larch::test::require(vcf.ref_mismatch_sites.size() == 1,
+                       "REF/reference disagreement tracked");
+  larch::test::require(vcf.ref_mismatch_sites[0] == 2,
+                       "mismatch site position recorded");
+  std::println("  PASS");
+}
+
 void test_lowercase_alleles() {
   std::println("test_lowercase_alleles");
   temp_dir tmp{"vcf_test"};
@@ -135,6 +157,7 @@ int main() {
   test_basic_snp_loading();
   test_ambiguous_alt_allele_is_skipped();
   test_missing_genotype_is_no_call();
+  test_ref_mismatch_detected();
   test_lowercase_alleles();
   std::println("vcf_test all passed");
   return 0;

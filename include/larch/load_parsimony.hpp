@@ -182,14 +182,12 @@ inline phylo_dag load_parsimony_tree(std::string_view path,
 
     edge_mutations parent_muts;
     std::size_t parent_dag_idx = larch::no_idx;
-    std::size_t parent_clade = 0;
     std::visit(
         [&](auto n) {
           for (auto pe_var : n.get_parents()) {
             std::visit(
                 [&](auto pe) {
                   parent_muts = pe.mutations();
-                  parent_clade = pe.clade_index();
                   std::visit([&](auto p) { parent_dag_idx = p.index(); },
                              pe.get_parent());
                 },
@@ -198,6 +196,27 @@ inline phylo_dag load_parsimony_tree(std::string_view path,
           }
         },
         d.get_node(condensed_dag_idx));
+
+    // Expanded condensed leaves are *siblings* of the retained leaf, not
+    // alternatives of it.  Edges sharing a (parent, clade) pair are treated
+    // as mutually-exclusive alternatives by the DAG machinery (tree counts,
+    // trimming, sampling), so every expanded leaf needs its own fresh clade
+    // index under the shared parent.
+    std::size_t next_clade = 0;
+    if (parent_dag_idx != larch::no_idx) {
+      std::visit(
+          [&](auto n) {
+            for (auto ce_var : n.get_children()) {
+              std::visit(
+                  [&](auto ce) {
+                    if (ce.clade_index() + 1 > next_clade)
+                      next_clade = ce.clade_index() + 1;
+                  },
+                  ce_var);
+            }
+          },
+          d.get_node(parent_dag_idx));
+    }
 
     for (std::size_t j = 0; j < cn.condensed_leaves.size(); ++j) {
       std::string sib_name = cn.condensed_leaves[j];
@@ -215,7 +234,7 @@ inline phylo_dag load_parsimony_tree(std::string_view path,
 
         auto new_edge = d.append_edge<edge_kind::clade>();
         new_edge.mutations() = parent_muts;
-        new_edge.clade_index() = parent_clade;
+        new_edge.clade_index() = next_clade++;
         new_edge.set_child(new_leaf);
 
         std::visit([&](auto n) { new_edge.set_parent(n); },

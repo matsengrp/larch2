@@ -74,6 +74,17 @@ endif()
 # distros without needing the exact GCC runtime version at runtime.
 add_link_options(-static-libstdc++ -static-libgcc)
 
+# --- Fully static executables --------------------------------------------------
+
+option(ENABLE_STATIC "Link fully static executables (libc, zlib, and GCC runtimes baked in)" OFF)
+
+# Must be set before find_package() below so imported targets resolve to the
+# static archives (e.g. libz.a) instead of the shared libraries.
+if(ENABLE_STATIC)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+    add_link_options(-static)
+endif()
+
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
@@ -515,7 +526,7 @@ set_tests_properties(larch2_ua_flag_without_ml_warns
 foreach(test_name merge_test merge_consistency_test subtree_weight_test
                   weight_accum_test optimize_test native_optimize_test
                   spr_pipeline_test trim_clade_edges_test
-                  rotaA_diagnostic_test vcf_test
+                  rotaA_diagnostic_test vcf_test load_parsimony_test
                   pth_loader_test build_fasta_newick_test
                   rs_fivemer_model_test nn_cnn_test nn_s5f_test
                   nn_ml_spr_test nn_blended_spr_test

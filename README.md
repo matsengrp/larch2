@@ -25,6 +25,7 @@ Optional CMake options:
 | `-DCMAKE_BUILD_TYPE=Release` | Enable optimizations and LTO |
 | `-DENABLE_ASAN=ON` | Enable AddressSanitizer |
 | `-DENABLE_TSAN=ON` | Enable ThreadSanitizer |
+| `-DENABLE_STATIC=ON` | Link fully static executables (libc, zlib, and GCC runtimes baked in; requires static `libc.a`/`libz.a`) |
 
 ### Running tests
 
