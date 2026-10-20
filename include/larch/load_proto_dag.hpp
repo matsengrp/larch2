@@ -6,6 +6,8 @@
 #include <larch/thread_pool.hpp>
 
 #include <algorithm>
+#include <iostream>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -208,6 +210,66 @@ inline phylo_dag load_proto_dag(std::string_view path) {
                      d.get_node(pc.child_dag_idx));
         },
         ev);
+  }
+
+  // Some MAT-to-DAG converters write a constant parent_clade (e.g. 0) for
+  // every sibling edge.  Edges sharing a (parent, clade) pair are
+  // alternatives in our DAG model, and true alternatives resolve the same
+  // leaves.  Sibling edges that share a clade index but reach disjoint leaf
+  // sets are therefore mis-encoded siblings, not alternatives: renumber
+  // them into distinct clades.  Overlapping groups are left untouched (we
+  // cannot tell how those were intended).
+  {
+    auto subtree_leaves = compute_subtree_leaves(d);
+    std::map<std::size_t, std::map<std::size_t, std::vector<std::size_t>>>
+        by_parent;
+    for (auto ev : d.get_all_edges()) {
+      std::visit(
+          [&](auto e) {
+            std::size_t pidx = std::visit([](auto n) { return n.index(); },
+                                          e.get_parent());
+            by_parent[pidx][e.clade_index()].push_back(e.index());
+          },
+          ev);
+    }
+
+    std::size_t renumbered_groups = 0;
+    for (auto& [pidx, by_clade] : by_parent) {
+      for (auto& [clade, eidxs] : by_clade) {
+        if (eidxs.size() <= 1) continue;
+
+        // Alternatives resolve the same leaves; if every edge in this
+        // group reaches a disjoint leaf set, they are siblings.
+        bool disjoint = true;
+        std::set<std::size_t> seen;
+        for (auto eidx : eidxs) {
+          for (auto leaf : subtree_leaves[get_child_idx(d, eidx)]) {
+            if (!seen.insert(leaf).second) {
+              disjoint = false;
+              break;
+            }
+          }
+          if (!disjoint) break;
+        }
+        if (!disjoint) continue;
+
+        // Renumber: keep the first edge's clade, give the rest fresh ones
+        // above the parent's current maximum clade index.
+        std::size_t next_clade = 0;
+        for (auto& [c, es] : by_clade)
+          if (c + 1 > next_clade) next_clade = c + 1;
+        for (std::size_t i = 1; i < eidxs.size(); ++i) {
+          auto ev = d.get_edge(eidxs[i]);
+          std::visit([&](auto e) { e.clade_index() = next_clade++; }, ev);
+        }
+        ++renumbered_groups;
+      }
+    }
+    if (renumbered_groups > 0) {
+      std::cerr << "warning: " << renumbered_groups
+                << " sibling-edge groups shared a clade index with disjoint"
+                   " leaf sets; renumbered as distinct clades\n";
+    }
   }
 
   recompute_compact_genomes(d);
