@@ -220,6 +220,18 @@ inline tnode splice(tnode node, std::vector<std::string> const& target,
   return node;
 }
 
+// Any-arity splice: replaces the node whose taxon set equals the target
+// with the candidate, for polytomic hosts/candidates alike.
+inline tnode splice_any(tnode node, std::vector<std::string> const& target,
+                        tnode const& cand) {
+  if (node.leaf) return node;
+  if (node.taxa == target) return cand;
+  for (auto& c : node.children) c = splice_any(std::move(c), target, cand);
+  node.taxa.clear();
+  for (auto const& c : node.children) node.taxa = sorted_union(node.taxa, c.taxa);
+  return node;
+}
+
 // Emit a tnode tree as a phylo_dag with UA and reference.
 inline std::size_t emit_tree(larch::phylo_dag& d, tnode const& node,
                              std::map<std::string, larch::compact_genome> const& leaf_cgs) {

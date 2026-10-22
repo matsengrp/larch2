@@ -163,3 +163,33 @@ throws).
 - All-resolutions folds (vs single comb) — richer span, larger memory.
 - Frozen sub-100-leaf twigs (2,747 leaves) and the exact-combination
   certification remain unbought.
+
+## 10. SPR-only control (polytomic partition–SPR–sample–regraft)
+
+Question: how much does the chart tier buy if the pipeline is SPR-only?
+Setup: any-arity graft lift (`WRIC_GRAFT_ANY=1` in wric_subtree graft/extract;
+`splice_any`), tension-spirit partition of the POLYTOMIC original (parts must
+be host clades): crown-core 17,391 (largest crown-pure clade; the τ-carrier
+23,547 set is not an original clade) + 5,598 + 1,365 + 1,150 + 1,072; 6,463
+sub-1,000 leaves frozen. Per part: native SPR (1 iter, 50 moves, polytomic =
+shallow ladders) -> `dagutil --sample --sample-method parsimony` (span-min
+parse, the SPR-only materialize) -> any-arity graft chain, scored by
+`--dag-info`; final tree comb-binarized once and rescored binary.
+
+Results: chain 60,019 -> 59,899 own-convention (~1.5 h total; crown-core SPR
+45 min) — 17 BELOW the monolithic 3 h run's span-minimum (59,916), half its
+time. End-binarize +33-s rescore: 59,899 -> 59,846 binary (one-shot label
+freedom recovers -53 of the raw tree's -132). Comparison table:
+
+| pipeline | binary | wall |
+|---|---|---|
+| monolithic native 3h | floor 59,833 (first parse 59,874) | 3 h |
+| SPR-only 5 parts | 59,846 | ~1.5 h |
+| size 23 parts + chart | 59,821 | ~1 h |
+| tension + chart + hybrid | 59,778 | ~3.3 h |
+
+Conclusion: SPR-only partitioning beats monolithic SPR outright and is the
+cheap baseline; the chart tier is worth 25–68 units under comparable
+partitions (certified recombination + per-part binary-convention optimum),
+at comparable or lower wall time. Artifacts: /tmp/spro/ (parts, spr/, best/,
+graft/, final_spro.pb.gz = 59,846 binary tree).

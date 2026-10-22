@@ -23,7 +23,9 @@ int main(int argc, char** argv) {
       auto ids = read_ids(argv[3]);
       std::string reference;
       std::map<std::string, larch::compact_genome> leaf_cgs;
-      auto root = load_tree(argv[2], &reference, &leaf_cgs);
+      bool any = std::getenv("WRIC_GRAFT_ANY");
+      auto root = any ? load_tree_any(argv[2], &reference, &leaf_cgs)
+                      : load_tree(argv[2], &reference, &leaf_cgs);
       tnode const* found = nullptr;
       std::vector<tnode const*> stack{&root};
       while (!stack.empty()) {
@@ -34,8 +36,7 @@ int main(int argc, char** argv) {
           found = n;
           break;
         }
-        stack.push_back(&n->children[0]);
-        stack.push_back(&n->children[1]);
+        for (auto const& c : n->children) stack.push_back(&c);
       }
       if (!found) throw std::runtime_error("subtree: target taxon set not found");
       write_tree(*found, reference, leaf_cgs, argv[4]);
@@ -47,17 +48,21 @@ int main(int argc, char** argv) {
       std::string outdir = argv[4];
       std::string reference;
       std::map<std::string, larch::compact_genome> leaf_cgs;
-      auto root = load_tree(argv[2], &reference, &leaf_cgs);
+      bool any = std::getenv("WRIC_GRAFT_ANY");
+      auto root = any ? load_tree_any(argv[2], &reference, &leaf_cgs)
+                      : load_tree(argv[2], &reference, &leaf_cgs);
       for (int i = 5; i < argc; ++i) {
         std::string cand_ref_ignored;
-        auto cand = load_tree(argv[i], &cand_ref_ignored, nullptr);
+        auto cand = any ? load_tree_any(argv[i], &cand_ref_ignored, nullptr)
+                        : load_tree(argv[i], &cand_ref_ignored, nullptr);
         if (cand.taxa != ids)
           throw std::runtime_error(std::string("graft: candidate ") + argv[i] +
                                    " has wrong taxon set");
-        auto grafted = splice(root, ids, cand);
+        auto grafted = any ? splice_any(root, ids, cand) : splice(root, ids, cand);
         auto out = outdir + "/graft_" + std::to_string(i - 5) + ".pb.gz";
         write_tree(grafted, reference, leaf_cgs, out);
-        std::fprintf(stderr, "graft: %s -> %s\n", argv[i], out.c_str());
+        std::fprintf(stderr, "graft%s: %s -> %s\n", any ? "-any" : "",
+                     argv[i], out.c_str());
       }
       return 0;
     }
