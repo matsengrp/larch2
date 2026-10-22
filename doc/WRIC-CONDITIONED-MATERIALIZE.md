@@ -101,3 +101,39 @@ Honesty notes: U' can exceed U (profile suboptimality) — the certificate
 always reports min; residuals are integers so Phase 3 terminates; no
 independence assumption is introduced anywhere (the clamp is inside the
 coupled chart, the master keeps exact scaffold coupling).
+
+## 6. Phase 1 executed (2026-10-22, commit follows)
+
+Implementation: `wric_tension_map vleaf {add,strip,ub}` — profile parser,
+profile->CG builder (positions from the global pattern tables, invariant
+patterns pinned to their uniform state), augmented-grammar writer (leaf
+__VLEAF__ under every UA-child production at a fresh clade index; edge
+mutations via to_edge_mutations), unary-squashing strip, and an exact
+biased-UB scorer (witness rows + UA transition + bias; validated 24/24:
+bnb_optimum <= ub everywhere, equality often).
+
+End-to-end smoke (slot 23): aug optimum 212 == ub == witness biased cost;
+stripped witness rescores 211 == certified optimum.  Note the materializer
+binarizes the augmented root production, so the virtual leaf can sit below
+the root; strip squashes the leftover unary node.
+
+Batch over 24 slots (crown 25 min with cross-profile):
+- every biased_opt <= ub (UB formula exact);
+- bias penalties Sigma(biased_opt - certified) = 52 (crown pays only 2,
+  carrier 3, part_05 6; many small parts 0-4);
+- grammar rows pinned at the LB profile sit Sigma 101 above per-part minima
+  (worst: part_04 and part_05 12 each, carrier 10) -- the joint profile is
+  genuinely suboptimal for several parts in isolation.
+
+Certificate outcome (kill criterion of the plan):
+- all-biased realization U'' = 59,769 -- one WORSE than U = 59,768;
+- all 24 single swaps from the original base: 59,768 (swap 13 -> 59,769);
+- bracket therefore unchanged: **[59,726, 59,768]**, U robust.
+
+Reading: the LB profile is not realizable at the per-site minima for most
+parts (bias penalties 1-6), and the parts whose profiles were "outvoted"
+(part_05: pinned 16 above its own optimum) pay on the U side too.  Phase 2
+(true root clamp) remains the lever: it yields exact per-part residuals
+PartOpt_j - pinned_j (currently only bracketed by 0 <= residual and the
+52-unit bias evidence), which is precisely the Phase-3 branch guide.
+Artifacts: /tmp/v0/npart/bias/ (aug, biased_wit, wit2, bias.tsv, logs).

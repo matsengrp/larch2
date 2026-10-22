@@ -1409,6 +1409,245 @@ void run_tension(std::string const& dag_path, std::string const& witness_path,
 
 }  // namespace
 
+// ---- v1 conditioned-materialize phase 1: virtual-leaf profile bias ----
+// (doc/WRIC-CONDITIONED-MATERIALIZE.md).  The fold LB profile pins each
+// part's attachment state per (pattern, reference state); a virtual leaf
+// carrying exactly those states, hung under every root production of the
+// part grammar, makes profile deviation cost 1/site inside the normal
+// materialize path -- no chart surgery.
+
+struct vleaf_profile {
+  // state[g][r] = attachment state for active pattern g at reference
+  // state r; 0xFF = absent (hard error if a site needs it).
+  std::vector<std::array<std::uint8_t, nuc_state_count>> state;
+};
+
+vleaf_profile load_vleaf_profile(std::string const& path, int j,
+                                 std::size_t nactive) {
+  std::FILE* f = std::fopen(path.c_str(), "r");
+  if (!f) throw std::runtime_error("vleaf: cannot open profile " + path);
+  vleaf_profile prof;
+  prof.state.assign(nactive, {0xFF, 0xFF, 0xFF, 0xFF});
+  char line[512];
+  std::size_t nline = 0;
+  while (std::fgets(line, sizeof line, f)) {
+    if (line[0] == '#') continue;
+    ++nline;
+    char* p = line;
+    unsigned long long g = std::strtoull(p, &p, 10);
+    unsigned long r = std::strtoul(p, &p, 10);
+    std::strtoul(p, &p, 10);  // count (unused here)
+    while (*p == ' ') ++p;
+    unsigned col = 0;
+    std::uint8_t s = 0xFF;
+    while (*p >= 'A' && *p <= 'T') {
+      if (col == static_cast<unsigned>(j)) s = static_cast<std::uint8_t>(*p - 'A');
+      ++col;
+      ++p;
+    }
+    if (col <= static_cast<unsigned>(j) || s == 0xFF)
+      throw std::runtime_error("vleaf: profile line lacks part column " +
+                               std::to_string(j));
+    if (g >= nactive) throw std::runtime_error("vleaf: profile gidx range");
+    if (r >= nuc_state_count) throw std::runtime_error("vleaf: profile ref");
+    prof.state[g][static_cast<std::uint8_t>(r)] = s;
+  }
+  std::fclose(f);
+  std::fprintf(stderr, "vleaf: profile lines=%zu column=%d\n", nline, j);
+  return prof;
+}
+
+compact_genome build_profile_cg(grammar_ctx const& gctx,
+                                std::string const& reference,
+                                vleaf_profile const& prof) {
+  std::map<mutation_position, nuc_base> map;
+  std::size_t active_seen = 0, inv_positions = 0;
+  for (auto const& pattern : gctx.patterns.patterns) {
+    if (chart_multisite_detail::is_active_pattern(pattern)) {
+      auto const& st = prof.state[active_seen];
+      for (auto pos : pattern.positions) {
+        auto ref_state =
+            nuc_base::from_char(reference.at(pos - 1)).raw();
+        auto s = st[ref_state];
+        if (s == 0xFF)
+          throw std::runtime_error("vleaf: profile missing (g,r) at pos " +
+                                   std::to_string(pos));
+        if (s != ref_state) map.emplace(pos, nuc_base(s));
+      }
+      ++active_seen;
+    } else {
+      auto s0 = pattern.state_by_taxon.front();
+      for (auto pos : pattern.positions) {
+        ++inv_positions;
+        auto ref_state =
+            nuc_base::from_char(reference.at(pos - 1)).raw();
+        if (s0 != ref_state) map.emplace(pos, nuc_base(s0));
+      }
+    }
+  }
+  if (active_seen != gctx.active.size())
+    throw std::runtime_error("vleaf: active pattern count mismatch");
+  std::fprintf(stderr,
+               "vleaf: profile CG mutations=%zu (invariant positions=%zu)\n",
+               map.size(), inv_positions);
+  return compact_genome(std::move(map));
+}
+
+void run_vleaf_add(std::string const& part_path,
+                   std::string const& global_path,
+                   std::string const& profile_path, int j,
+                   std::string const& out_path) {
+  auto gctx = prepare(global_path);
+  std::string reference;
+  {
+    auto gdag = load_proto_dag(global_path);
+    for (std::size_t i = 0; i < gdag.node_count(); ++i)
+      if (larch::detail::is_ua_node(gdag.get_node(i))) {
+        std::visit(
+            [&](auto n) {
+              using N = std::remove_cvref_t<decltype(n)>;
+              if constexpr (std::is_same_v<N, node_view<phylo_dag, node_kind::ua>>)
+                reference = n.reference_sequence();
+            },
+            gdag.get_node(i));
+        break;
+      }
+  }
+  auto prof = load_vleaf_profile(profile_path, j, gctx.active.size());
+  auto vleaf_cg = build_profile_cg(gctx, reference, prof);
+
+  auto dag = load_proto_dag(part_path);
+  std::size_t ua = no_idx;
+  for (std::size_t i = 0; i < dag.node_count(); ++i)
+    if (larch::detail::is_ua_node(dag.get_node(i))) {
+      ua = i;
+      break;
+    }
+  if (ua == no_idx) throw std::runtime_error("vleaf: no UA in " + part_path);
+
+  auto leaf = dag.append_node<node_kind::leaf>();
+  leaf.sample_id() = "__VLEAF__";
+  leaf.cg() = vleaf_cg;
+
+  // Root production nodes = UA's children.  Each gains one edge to the
+  // shared virtual leaf at a fresh clade index.
+  std::vector<std::size_t> roots;
+  std::visit(
+      [&](auto n) {
+        for (auto const& ev : n.get_children())
+          std::visit(
+              [&](auto e) {
+                roots.push_back(get_child_idx(dag, e.index()));
+              },
+              ev);
+      },
+      dag.get_node(ua));
+  if (roots.empty()) throw std::runtime_error("vleaf: UA has no children");
+  std::size_t nedges = 0;
+  for (auto root : roots) {
+    std::uint32_t maxc = 0;
+    compact_genome parent_cg;
+    std::visit(
+        [&](auto n) {
+          for (auto const& ev : n.get_children())
+            std::visit(
+                [&](auto e) {
+                  maxc = std::max(maxc, static_cast<std::uint32_t>(e.clade_index()));
+                },
+                ev);
+          if constexpr (requires { n.cg(); }) parent_cg = n.cg();
+        },
+        dag.get_node(root));
+    if (maxc + 1 > 62)
+      throw std::runtime_error("vleaf: root arity would exceed 63");
+    auto edge = dag.append_edge<edge_kind::clade>();
+    edge.clade_index() = maxc + 1;
+    edge.edge_weight() = 0.0f;
+    std::visit([&](auto p) { edge.set_parent(p); }, dag.get_node(root));
+    std::visit([&](auto c) { edge.set_child(c); }, dag.get_node(leaf.index()));
+    edge.mutations() =
+        compact_genome::to_edge_mutations(reference, parent_cg, vleaf_cg);
+    ++nedges;
+  }
+  build_clade_offsets(dag);
+  validate_dag(dag, "wric_vleaf add");
+  save_proto_dag(dag, out_path);
+  std::fprintf(stderr, "vleaf add: %s roots=%zu new_edges=%zu vleaf_muts=?\n",
+               part_path.c_str(), roots.size(), nedges);
+}
+
+void run_vleaf_strip(std::string const& in_path, std::string const& out_path) {
+  std::string reference;
+  std::map<std::string, compact_genome> cgs;
+  auto root = load_tree_any(in_path, &reference, &cgs);
+  std::size_t dropped = 0;
+  std::function<void(tnode&)> prune = [&](tnode& n) {
+    for (auto& c : n.children) prune(c);
+    auto& cs = n.children;
+    cs.erase(std::remove_if(cs.begin(), cs.end(),
+                            [&](tnode const& c) {
+                              if (c.leaf && c.sid == "__VLEAF__") {
+                                ++dropped;
+                                return true;
+                              }
+                              return false;
+                            }),
+             cs.end());
+  };
+  prune(root);
+  if (dropped != 1)
+    throw std::runtime_error("vleaf strip: expected exactly 1 virtual leaf, got " +
+                             std::to_string(dropped));
+  // The materializer binarizes the augmented root production, so the virtual
+  // leaf may hang below an internal node; squash unary internal nodes left
+  // behind by its removal (child promoted, structure otherwise preserved).
+  std::function<tnode(tnode)> squash = [&](tnode n) -> tnode {
+    for (auto& c : n.children) c = squash(std::move(c));
+    if (!n.leaf && n.children.size() == 1) return std::move(n.children[0]);
+    return n;
+  };
+  root = squash(std::move(root));
+  if (!root.leaf && root.children.size() < 2)
+    throw std::runtime_error("vleaf strip: root would be unary");
+  wsub::write_tree(root, reference, cgs, out_path);
+  std::fprintf(stderr, "vleaf strip: %s -> %s ok\n", in_path.c_str(),
+               out_path.c_str());
+}
+
+void run_vleaf_ub(std::string const& global_path, std::string const& wit_path,
+                  std::string const& profile_path, int j) {
+  auto gctx = prepare(global_path);
+  std::unordered_map<std::string, std::uint32_t> taxon_of_sid;
+  for (std::uint32_t t = 0; t < gctx.grammar.taxa.id_to_sample_id.size(); ++t)
+    taxon_of_sid.emplace(gctx.grammar.taxa.id_to_sample_id[t], t);
+  auto prof = load_vleaf_profile(profile_path, j, gctx.active.size());
+  auto rows = witness_rows(wit_path, gctx, taxon_of_sid);
+  std::uint64_t total = gctx.invariant_offset;
+  std::uint64_t at_profile = gctx.invariant_offset;
+  for (std::size_t g = 0; g < gctx.active.size(); ++g) {
+    auto const& rc = gctx.active[g].reference_state_counts;
+    for (std::uint8_t r = 0; r < nuc_state_count; ++r) {
+      if (!rc[r]) continue;
+      auto s0 = prof.state[g][r];
+      if (s0 == 0xFF) throw std::runtime_error("vleaf ub: missing profile entry");
+      // Part-local convention (matches larch2 scoring of the augmented DAG):
+      // per site min over root state s of inside cost + UA transition [s!=r]
+      // + virtual-leaf bias [s!=profile].
+      std::uint32_t best = ~0u;
+      for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
+        auto v = rows.m[g][s] + (s == r ? 0 : 1) + (s == s0 ? 0 : 1);
+        if (v < best) best = v;
+      }
+      total += static_cast<std::uint64_t>(rc[r]) * best;
+      at_profile += static_cast<std::uint64_t>(rc[r]) *
+                    (rows.m[g][s0] + (s0 == r ? 0 : 1));
+    }
+  }
+  std::fprintf(stdout, "vleaf_ub=%llu at_profile=%llu\n",
+               static_cast<unsigned long long>(total),
+               static_cast<unsigned long long>(at_profile));
+}
+
 int main(int argc, char** argv) {
   if (argc < 5) {
     std::fprintf(stderr,
@@ -1418,8 +1657,12 @@ int main(int argc, char** argv) {
                  "       %s response <global.pb.gz> <outdir> <part1.pb.gz> "
                  "[part2.pb.gz ...]\n"
                  "       %s scaffold <lb|wit> <global.pb.gz> <scaffold_bin.pb.gz> "
-                 "<ids_prefix> <rows_prefix> <np> <out.profile> [expected]\n",
-                 argv[0], argv[0], argv[0]);
+                 "<ids_prefix> <rows_prefix> <np> <out.profile> [expected]\n"
+                 "       %s vleaf add <part.pb.gz> <global.pb.gz> <profile> "
+                 "<j> <out.pb.gz>\n"
+                 "       %s vleaf strip <biased_tree.pb.gz> <out.pb.gz>\n"
+                 "       %s vleaf ub <global.pb.gz> <witness.pb.gz> <profile> <j>\n",
+                 argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 2;
   }
   std::string mode = argv[1];
@@ -1434,6 +1677,15 @@ int main(int argc, char** argv) {
       closure.expected_total2 = std::strtoull(argv[7], nullptr, 10);
       run_tension(argv[2], argv[3], std::strtoull(argv[4], nullptr, 10),
                   closure);
+    } else if (mode == "vleaf" && argc >= 3 && std::string(argv[2]) == "add" &&
+               argc == 8) {
+      run_vleaf_add(argv[3], argv[4], argv[5], std::atoi(argv[6]), argv[7]);
+    } else if (mode == "vleaf" && std::string(argv[2]) == "strip" &&
+               argc == 5) {
+      run_vleaf_strip(argv[3], argv[4]);
+    } else if (mode == "vleaf" && std::string(argv[2]) == "ub" &&
+               argc == 7) {
+      run_vleaf_ub(argv[3], argv[4], argv[5], std::atoi(argv[6]));
     } else if (mode == "scaffold" && (argc == 9 || argc == 10)) {
       run_scaffold(argv[2], argv[3], argv[4], argv[5], argv[6],
                    std::atoi(argv[7]), argv[8],
