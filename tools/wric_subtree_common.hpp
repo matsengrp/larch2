@@ -36,6 +36,78 @@ inline std::vector<std::string> sorted_union(std::vector<std::string> a,
 }
 
 // Load a tree pb into a tnode tree (root = UA's single child).
+// Load a tree pb of ANY arity (compacted usher trees) into a tnode root.
+// The UA's first child edge is used as the tree root; inputs are expected to
+// be single trees (UA not polytomous).
+inline tnode load_tree_any(std::string const& path, std::string* reference_out,
+                           std::map<std::string, larch::compact_genome>* leaf_cgs) {
+  using namespace larch;
+  auto dag = load_proto_dag(path);
+  std::size_t ua = no_idx;
+  for (std::size_t i = 0; i < dag.node_count(); ++i)
+    if (larch::detail::is_ua_node(dag.get_node(i))) {
+      ua = i;
+      break;
+    }
+  if (ua == no_idx) throw std::runtime_error("wsub: no UA node in " + path);
+  if (reference_out) {
+    std::visit(
+        [&](auto n) {
+          using N = std::remove_cvref_t<decltype(n)>;
+          if constexpr (std::is_same_v<N, node_view<phylo_dag, node_kind::ua>>)
+            *reference_out = n.reference_sequence();
+        },
+        dag.get_node(ua));
+  }
+  std::size_t root = no_idx;
+  std::visit(
+      [&](auto n) {
+        for (auto ev : n.get_children())
+          std::visit(
+              [&](auto e) {
+                if (root == no_idx)
+                  root = larch::get_child_idx(dag, e.index());
+              },
+              ev);
+      },
+      dag.get_node(ua));
+  if (root == no_idx) throw std::runtime_error("wsub: UA has no child");
+
+  std::function<tnode(std::size_t)> nest = [&](std::size_t idx) -> tnode {
+    tnode node;
+    auto nv = dag.get_node(idx);
+    if (larch::detail::is_leaf_node(nv)) {
+      std::visit(
+          [&](auto n) {
+            using N = std::remove_cvref_t<decltype(n)>;
+            if constexpr (std::is_same_v<N,
+                             node_view<phylo_dag, node_kind::leaf>>) {
+              node.leaf = true;
+              node.sid = n.sample_id();
+              if (leaf_cgs) (*leaf_cgs)[node.sid] = n.cg();
+            }
+          },
+          nv);
+      node.taxa = {node.sid};
+      return node;
+    }
+    std::visit(
+        [&](auto n) {
+          for (auto const& ev : n.get_children())
+            std::visit(
+                [&](auto e) {
+                  node.children.push_back(
+                      nest(larch::get_child_idx(dag, e.index())));
+                },
+                ev);
+        },
+        nv);
+    for (auto& c : node.children) node.taxa = sorted_union(node.taxa, c.taxa);
+    return node;
+  };
+  return nest(root);
+}
+
 inline tnode load_tree(std::string const& path, std::string* reference_out,
                        std::map<std::string, larch::compact_genome>* leaf_cgs) {
   using namespace larch;
