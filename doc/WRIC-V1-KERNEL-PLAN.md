@@ -168,3 +168,37 @@ M0 → M1 fixtures (seedtree, 2-part sub-folds) → M1 startmat certificate
 (size fold first: directly comparable to the greedy 59,821) → M2 scaffold
 exploration → M2 certificate → doc + commit. Any equality failure in the
 fixture chain halts escalation to startmat, per regression-first.
+
+## 7. Step 3 executed: re-partition (2026-10-22)
+
+Diagnosis from M1: only 12 of the 23 size parts were clades; the 11
+windows' splices were silent no-ops, and the crown (tau=18) was fragmented
+across boundaries.  Re-partition with everything live, all clades of the
+comb:
+
+- crown-core 17,391 kept whole (absorbs live 01/09/16 + six windows),
+- carrier 2,841 kept whole (absorbs live 08/10 + most of window 13),
+- kept-live-7 unchanged (certified grammars reused),
+- remainder (7,400 leaves): 15 new clade parts >= 100 leaves (3,203
+  leaves); 4,197 frozen (700 shards, mostly singletons).
+
+Pipeline on the 17 new parts (extract-from-comb -> SPR -> certified
+materialize; crown materialize with cross-profile dominance, RAM-watched):
+crown incumbent 29,892 -> certified 29,847 (-45); carrier 5,549 -> 5,534
+(-15, reproducing the tension campaign's carrier gain exactly); fragments
+small gains.  Fold: 24 parts, 28,842 leaves live.
+
+**M1 certificate on the re-partitioned fold: [ 59,726 , 59,768 ]**
+(gap 42 = 24-part internal coupling 41 + 1 profile loss; the scaffold again
+contributes zero coupling).  The upper end **59,768 beats the campaign's
+best tree (59,778) by 10** -- and unlike every prior number it is a
+DP-validated fold realization with every part live and certified.
+
+| fold | bracket | best realized |
+|---|---|---|
+| v0 size (12 live / 11 dead) | [59,781, 59,820] | 59,820 |
+| re-partitioned (24 live) | **[59,726, 59,768]** | **59,768** |
+
+Artifacts: /tmp/v0/npart/ (ids, parts_spr, parts_wit, fold/{map.tsv, ids,
+g, wit, resp}, fold_lb2.profile).  Next per the agreed sequence: conditioned
+materialize on this fold (potential exact close), then M2 scaffold-free.
