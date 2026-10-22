@@ -71,24 +71,45 @@ minimal connecting structure + remainder leaves; on startmat's size fold,
   plus `wric_leaf_cg` (pb leaf-CG dump tool, used for the data-consistency
   probe that ruled out CG divergence between pbs).
 
-### M1 — scaffold-fixed coupled solve (first certificate)
-- `wric_scaffold <scaffold.pb.gz> <resp1> … <respk>`: bespoke min-plus DP
-  over the fixed scaffold comb. Part attachments consume their response
-  rows; scaffold nodes free labels; UA/reference conventions matched to the
-  scoring used everywhere else (tension-tool cross-checks: rescore the
-  stitched witness, must equal the DP total exactly).
-- Witness stitching: for each part, materialize its optimal parse GIVEN the
-  scaffold-chosen root CG (conditioned materialize = down-pass with the
-  root row clamped; small addition to M0's export tool — the row is already
-  in hand). Splice-graft the witnesses into the scaffold (existing any-arity
-  graft), rescore: exact equality with the DP optimum is the acceptance
-  test.
-- Deliverable: for the size fold, the exact optimum over all 2²³ part
-  combinations × label freedom, replacing the greedy 59,821 (expect equal
-  or a few units lower — the chain was near-additive, so the certificate is
-  the point more than the score).
-- Deliverable: for the SPR-only 5-part fold, the same certificate over its
-  (richer) part grammars.
+### M1 — scaffold-fixed coupled solve (first certificate)  [DONE 2026-10-22]
+- Implemented as `wric_tension_map scaffold <lb|wit> <global> <scaffold_bin>
+  <ids_prefix> <rows_prefix> <np> <out.profile> [expected]`:
+  collapses each part clade of the binary comb to a response pseudo-leaf
+  (any-arity Sankoff over the remaining fixed scaffold, OpenMP over
+  patterns; ~37 s).  `wit` scores the realized fold (witness-tree inside
+  rows); `lb` scores the composite lower bound (grammar response rows) and
+  dumps per-pattern attachment profiles (`fold_lb.profile`).
+- **Scope correction (important):** response rows are per-site-class minima
+  over part topologies, so the rows-DP is the fold's composite LOWER BOUND
+  with exact scaffold coupling — not the exact optimum by itself (the
+  89-unit part coupling gap measured at M0 is exactly this relaxation).
+  M1 therefore delivers the bracket [LB, U], with exactness iff a single
+  per-part topology realizes the LB profile (conditioned materialize =
+  next step).
+- **Fold discovery:** only **12 of the 23 size parts are clades of the
+  comb** (00,01,03,04,05,07,08,09,10,11,12,16); the other 11 were preorder
+  windows — their v0 splices were silent no-ops (this is why the v0 chain
+  was a 12-switch chain; the 11 parts' isolated optima never entered any
+  achieved tree).  M1's fold = scaffold comb + 12 response parts + 11
+  frozen original regions.
+- **Validation (all exact):** np=0 → 59,887 (comb baseline); np=1 (part
+  00) → 59,885 (graft_00's measured −2 reproduced); np=23 wit → **59,820**,
+  one BELOW the chain's measured 59,821 — the DP finds a strictly better
+  label assignment for the same topology (write_tree's Fitch tie-breaking
+  left 1 unit on the table).  Debug archaeology: the +598 initial offset
+  was double-weighting — eval_row is already site-count-aware.
+- **Result — scaffold-fixed size-fold certificate:**
+
+      [ 59,781 , 59,820 ]   (LB via grammar rows, U via witnesses)
+
+  with the gap fully accounted: Σ live-12 certified optima (19,812) −
+  Σ live-12 part_lb (19,773) = **39 = exactly the bracket gap** — the
+  scaffold coupling itself costs ZERO beyond per-site independence, and
+  all 39 remaining units live inside the 12 parts (topology sharing).
+  Closing them needs per-part conditioned materialize at the LB profiles
+  (profiles exported); exactness would follow if each part's conditioned
+  optimum meets its per-site minima.
+- Artifacts: /tmp/v0/fold_lb.profile (14,963 lines), fold totals above.
 
 ### M2 — scaffold-free solve (the actual unfreezing)
 - Scaffold grammar: megatree over k part-attachments + remainder leaves

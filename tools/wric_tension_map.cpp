@@ -23,6 +23,13 @@
 #include <larch/clade_grammar.hpp>
 #include <larch/parsimony_chart.hpp>
 
+#include "wric_subtree_common.hpp"
+
+using wsub::load_tree;
+using wsub::load_tree_any;
+using wsub::read_ids;
+using wsub::tnode;
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -389,6 +396,21 @@ tree_dp_result witness_tree_dp(grammar_ctx const& ctx,
       total += eval_row(res.rows[0].data() + cls * nuc_state_count,
                         ctx.active[a].reference_state_counts);
     }
+    if (std::getenv("WRIC_WITNESS_DP_DEBUG")) {
+      std::uint64_t again = ctx.invariant_offset;
+      for (std::size_t a = 0; a < ctx.active.size(); ++a) {
+        auto cls = root_classes.class_of_pattern[a];
+        again += eval_row(res.rows[0].data() + cls * nuc_state_count,
+                          ctx.active[a].reference_state_counts);
+      }
+      std::fprintf(stderr,
+                   "witness_dp_debug: total=%llu again=%llu rows0=%zu "
+                   "ncls=%zu nactive=%zu\n",
+                   static_cast<unsigned long long>(total),
+                   static_cast<unsigned long long>(again),
+                   res.rows[0].size(), root_classes.class_count,
+                   ctx.active.size());
+    }
     res.total = total;
   }
   return res;
@@ -562,6 +584,410 @@ void run_response(std::string const& global_path, std::string const& outdir,
     auto dot = stem.find_last_of('.');
     if (dot != std::string::npos) stem = stem.substr(0, dot);
     run_response_part(g, p, outdir + "/" + stem + ".resp");
+  }
+}
+
+// ---- v1 M1: scaffold-fixed coupled solve (doc/WRIC-V1-KERNEL-PLAN.md) ----
+// Collapses each part clade of the binary scaffold comb to a response
+// pseudo-leaf and runs a per-pattern Sankoff DP over the remaining fixed
+// scaffold.  With grammar response rows this is the fold's composite LOWER
+// BOUND with exact scaffold coupling (rows are per-pattern minima over part
+// topologies); with witness-tree rows it reproduces the joined tree's exact
+// free-label score (validation: must equal the greedy chain's 59,821).
+
+struct scaffold_node {
+  bool leaf = false;
+  bool pseudo = false;
+  int part = -1;
+  std::uint32_t taxon = no_idx;  // real leaf: global taxon id
+  std::vector<std::uint32_t> children;
+};
+
+std::uint32_t flatten_scaffold_node(tnode const& node,
+                                    std::vector<scaffold_node>& out,
+                                    std::unordered_map<std::string, std::uint32_t>& taxon_of_sid) {
+  scaffold_node sn;
+  if (node.leaf) {
+    sn.leaf = true;
+    if (node.sid.rfind("__PART_", 0) == 0) {
+      sn.pseudo = true;
+      sn.part = std::atoi(node.sid.c_str() + 7);
+    } else {
+      auto it = taxon_of_sid.find(node.sid);
+      if (it == taxon_of_sid.end())
+        throw std::runtime_error("scaffold: leaf not in global: " + node.sid);
+      sn.taxon = it->second;
+    }
+    out.push_back(sn);
+    return static_cast<std::uint32_t>(out.size() - 1);
+  }
+  sn.children.reserve(node.children.size());
+  for (auto const& c : node.children)
+    sn.children.push_back(flatten_scaffold_node(c, out, taxon_of_sid));
+  out.push_back(sn);
+  return static_cast<std::uint32_t>(out.size() - 1);
+}
+
+tnode collapse_parts(tnode node,
+                     std::vector<std::vector<std::string>> const& parts) {
+  if (!node.leaf) {
+    for (std::size_t j = 0; j < parts.size(); ++j) {
+      if (node.taxa.size() != parts[j].size()) continue;
+      if (std::equal(node.taxa.begin(), node.taxa.end(), parts[j].begin())) {
+        tnode pseudo;
+        pseudo.leaf = true;
+        pseudo.sid = "__PART_" + std::to_string(j) + "__";
+        pseudo.taxa = {pseudo.sid};
+        return pseudo;
+      }
+    }
+    for (auto& c : node.children) c = collapse_parts(std::move(c), parts);
+  }
+  return node;
+}
+
+struct resp_rows {
+  std::vector<std::array<std::uint32_t, nuc_state_count>> m;  // per pattern
+};
+
+resp_rows load_resp_rows(std::string const& path,
+                         grammar_ctx const& gctx) {
+  std::FILE* f = std::fopen(path.c_str(), "r");
+  if (!f) throw std::runtime_error("scaffold: cannot open " + path);
+  resp_rows rows;
+  rows.m.resize(gctx.active.size());
+  char line[256];
+  std::size_t g = 0;
+  while (std::fgets(line, sizeof line, f)) {
+    if (line[0] == '#') continue;
+    std::uint64_t gidx, w, r0, r1, r2, r3, m0, m1, m2, m3;
+    if (std::sscanf(line, "%llu %lu %lu %lu %lu %lu %lu %lu %lu %lu", &gidx,
+                    &w, &r0, &r1, &r2, &r3, &m0, &m1, &m2, &m3) != 10)
+      throw std::runtime_error("scaffold: bad resp row: " + std::string(line));
+    if (gidx != g)
+      throw std::runtime_error("scaffold: resp row out of order");
+    if (w != gctx.active[g].weight)
+      throw std::runtime_error("scaffold: resp weight mismatch");
+    rows.m[g] = {static_cast<std::uint32_t>(m0), static_cast<std::uint32_t>(m1),
+                 static_cast<std::uint32_t>(m2), static_cast<std::uint32_t>(m3)};
+    ++g;
+  }
+  std::fclose(f);
+  if (g != gctx.active.size())
+    throw std::runtime_error("scaffold: resp row count mismatch");
+  return rows;
+}
+
+resp_rows witness_rows(std::string const& wit_path,
+                       grammar_ctx const& gctx,
+                       std::unordered_map<std::string, std::uint32_t> const& taxon_of_sid) {
+  std::string ref_ignored;
+  auto root = load_tree_any(wit_path, &ref_ignored, nullptr);
+  // flatten witness postorder
+  struct wnode {
+    bool leaf = false;
+    std::uint32_t taxon = no_idx;
+    std::vector<std::uint32_t> children;
+  };
+  std::vector<wnode> nodes;
+  std::function<std::uint32_t(tnode const&)> fl = [&](tnode const& n) {
+    wnode wn;
+    if (n.leaf) {
+      wn.leaf = true;
+      auto it = taxon_of_sid.find(n.sid);
+      if (it == taxon_of_sid.end())
+        throw std::runtime_error("scaffold: witness leaf not in global");
+      wn.taxon = it->second;
+      nodes.push_back(wn);
+      return static_cast<std::uint32_t>(nodes.size() - 1);
+    }
+    for (auto const& c : n.children)
+      wn.children.push_back(fl(c));
+    nodes.push_back(wn);
+    return static_cast<std::uint32_t>(nodes.size() - 1);
+  };
+  fl(root);
+  constexpr std::uint32_t INF_COST = 1u << 30;
+  auto const& active = gctx.active;
+  resp_rows rows;
+  rows.m.resize(active.size());
+#pragma omp parallel for schedule(dynamic, 8)
+  for (std::size_t g = 0; g < active.size(); ++g) {
+    std::vector<std::array<std::uint32_t, nuc_state_count>> vec(nodes.size());
+    auto const& states = active[g].state_by_taxon;
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+      auto const& n = nodes[i];
+      if (n.leaf) {
+        auto& v = vec[i];
+        for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+          v[s] = (s == states[n.taxon]) ? 0 : INF_COST;
+        continue;
+      }
+      // children already computed (postorder)
+      for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
+        std::uint32_t best = ~0u;
+        for (auto ci : n.children) {
+          std::uint32_t b = ~0u;
+          for (std::uint8_t c = 0; c < nuc_state_count; ++c) {
+            auto v = static_cast<std::uint64_t>(vec[ci][c]) + (s == c ? 0 : 1);
+            if (v < b) b = static_cast<std::uint32_t>(v);
+          }
+          best = (best == ~0u) ? b : best + b;
+        }
+        vec[i][s] = best;
+      }
+    }
+    std::size_t r = nodes.size() - 1;
+    for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+      rows.m[g][s] = vec[r][s];
+  }
+  return rows;
+}
+
+void run_scaffold(std::string const& mode, std::string const& global_path,
+                  std::string const& scaffold_path, std::string const& ids_prefix,
+                  std::string const& rows_prefix, int np,
+                  std::string const& profile_path,
+                  std::uint64_t expected) {
+  bool lb = mode == "lb";
+  auto gctx = prepare(global_path);
+  constexpr std::uint32_t INF_COST = 1u << 30;
+  std::unordered_map<std::string, std::uint32_t> taxon_of_sid;
+  for (std::uint32_t t = 0; t < gctx.grammar.taxa.id_to_sample_id.size(); ++t)
+    taxon_of_sid.emplace(gctx.grammar.taxa.id_to_sample_id[t], t);
+
+  // Load part leaf sets.
+  std::vector<std::vector<std::string>> parts(np);
+  for (int j = 0; j < np; ++j) {
+    char buf[512];
+    std::snprintf(buf, sizeof buf, "%s%02d.ids.txt", ids_prefix.c_str(), j);
+    parts[j] = read_ids(buf);
+    std::sort(parts[j].begin(), parts[j].end());
+  }
+
+  // Collapse and flatten the scaffold.
+  std::string scaffold_ref;
+  auto root = load_tree(scaffold_path, &scaffold_ref, nullptr);
+  auto collapsed = collapse_parts(std::move(root), parts);
+  std::vector<scaffold_node> snodes;
+  flatten_scaffold_node(collapsed, snodes, taxon_of_sid);
+  std::size_t npseudo = 0, nreal = 0, ninternal = 0;
+  for (auto const& n : snodes) {
+    if (n.pseudo) ++npseudo;
+    else if (n.leaf) ++nreal;
+    else ++ninternal;
+  }
+  if (npseudo == 0 && np > 0)
+    throw std::runtime_error("scaffold: no parts collapsed");
+  if (npseudo != static_cast<std::size_t>(np))
+    std::cerr << "scaffold: WARNING only " << npseudo << " of " << np
+              << " parts are scaffold clades; the rest stay frozen "
+                 "(original structure, free labels)\n";
+  std::vector<int> part_of_slot(np, -1);
+  {
+    int slot = 0;
+    for (auto const& n : snodes)
+      if (n.pseudo) part_of_slot[n.part] = slot++;
+  }
+  std::cerr << "scaffold: nodes=" << snodes.size() << " internal=" << ninternal
+            << " pseudo=" << npseudo << " real_leaves=" << nreal << "\n";
+
+  // Rows per part (only for collapsed parts).
+  std::vector<resp_rows> all_rows(np);
+  std::uint64_t sum_part_lb = 0;
+  for (int j = 0; j < np; ++j) {
+    if (part_of_slot[j] < 0) continue;
+    if (lb) {
+      char buf[512];
+      std::snprintf(buf, sizeof buf, "%s%02d.spr.pb.resp", rows_prefix.c_str(), j);
+      all_rows[j] = load_resp_rows(buf, gctx);
+      // header part_lb for reporting
+      std::FILE* f = std::fopen(buf, "r");
+      char line[256];
+      while (std::fgets(line, sizeof line, f))
+        if (std::strncmp(line, "# part_lb ", 10) == 0) {
+          sum_part_lb += std::strtoull(line + 10, nullptr, 10);
+          break;
+        }
+      std::fclose(f);
+    } else {
+      char buf[512];
+      std::snprintf(buf, sizeof buf, "%s%02d.wit.pb.gz", rows_prefix.c_str(), j);
+      all_rows[j] = witness_rows(buf, gctx, taxon_of_sid);
+    }
+  }
+  if (lb)
+    std::cerr << "scaffold: sum part_lb (collapsed) = " << sum_part_lb << "\n";
+
+  // Per-pattern DP over the collapsed scaffold.
+  auto const& active = gctx.active;
+  std::vector<std::uint64_t> per(active.size());
+  std::vector<std::array<std::uint32_t, nuc_state_count>> rootvec(active.size());
+#pragma omp parallel for schedule(dynamic, 8)
+  for (std::size_t g = 0; g < active.size(); ++g) {
+    auto const& states = active[g].state_by_taxon;
+    std::vector<std::array<std::uint32_t, nuc_state_count>> vec(snodes.size());
+    for (std::size_t i = 0; i < snodes.size(); ++i) {
+      auto const& n = snodes[i];
+      if (n.leaf) {
+        if (n.pseudo) {
+          vec[i] = all_rows[n.part].m[g];
+        } else {
+          for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+            vec[i][s] = (s == states[n.taxon]) ? 0 : INF_COST;
+        }
+        continue;
+      }
+      for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
+        std::uint64_t acc = 0;
+        for (auto ci : n.children) {
+          std::uint32_t b = ~0u;
+          for (std::uint8_t c = 0; c < nuc_state_count; ++c) {
+            auto v = static_cast<std::uint64_t>(vec[ci][c]) + (s == c ? 0 : 1);
+            if (v < b) b = static_cast<std::uint32_t>(v);
+          }
+          acc += b;
+        }
+        vec[i][s] = static_cast<std::uint32_t>(acc);
+      }
+    }
+    std::size_t r = snodes.size() - 1;
+    rootvec[g] = vec[r];
+    per[g] = eval_row(reinterpret_cast<chart_cost const*>(vec[r].data()),
+                      active[g].reference_state_counts);
+  }
+  // NOTE: eval_row is already weight-aware (reference_state_counts sum to
+  // the pattern's site weight) -- do NOT multiply by weight again.
+  std::uint64_t total = gctx.invariant_offset;
+  for (std::size_t g = 0; g < active.size(); ++g) total += per[g];
+
+  // Self-test: per-pattern diff against the tension machinery's own
+  // witness DP on the same tree (enabled by WRIC_SCAFFOLD_SELFTEST).
+  if (std::getenv("WRIC_SCAFFOLD_SELFTEST")) {
+    std::string wref;
+    auto wnodes = load_witness(scaffold_path, gctx, &wref);
+    auto wdp = witness_tree_dp(gctx, wnodes, /*compute_total=*/true);
+    std::uint64_t ndiff = 0, sumdiff = 0, sww = 0, swp = 0;
+    auto const& root_classes = gctx.classes[gctx.grammar.root_clade];
+    for (std::size_t a = 0; a < active.size(); ++a) {
+      auto cls = root_classes.class_of_pattern[a];
+      auto wv = eval_row(wdp.rows[0].data() + cls * nuc_state_count,
+                         active[a].reference_state_counts);
+      sww += static_cast<std::uint64_t>(active[a].weight) * wv;
+      swp += static_cast<std::uint64_t>(active[a].weight) * per[a];
+      if (wv != per[a]) {
+        ++ndiff;
+        sumdiff += static_cast<std::uint64_t>(active[a].weight) *
+                   (per[a] > wv ? per[a] - wv : wv - per[a]);
+        if (ndiff <= 10)
+          std::fprintf(stderr,
+                       "selftest: pattern %zu w=%u mine=%llu wit=%llu\n", a,
+                       active[a].weight,
+                       static_cast<unsigned long long>(per[a]),
+                       static_cast<unsigned long long>(wv));
+      }
+    }
+    std::fprintf(stderr,
+                 "selftest: witness_total=%llu my_total=%llu ndiff=%zu "
+                 "sumdiff=%llu sww=%llu swp=%llu\n",
+                 static_cast<unsigned long long>(wdp.total),
+                 static_cast<unsigned long long>(total), ndiff,
+                 static_cast<unsigned long long>(sumdiff),
+                 static_cast<unsigned long long>(sww),
+                 static_cast<unsigned long long>(swp));
+  }
+
+  if (expected && total != expected) {
+    std::fprintf(stderr, "scaffold: total %llu != expected %llu\n",
+                 static_cast<unsigned long long>(total),
+                 static_cast<unsigned long long>(expected));
+    throw std::runtime_error("scaffold: total mismatch");
+  }
+  std::fprintf(stderr, "scaffold[%s]: total = %llu (expected %llu) %s\n",
+               lb ? "lb" : "wit",
+               static_cast<unsigned long long>(total),
+               static_cast<unsigned long long>(expected),
+               expected ? (total == expected ? "OK" : "MISMATCH") : "");
+
+  if (lb && profile_path != "-") {
+    // Second pass: per pattern (and per reference state present), recompute
+    // the DP vectors and run a top-down argmin pass to recover every part's
+    // attachment state under the optimal root choice for that ref state.
+    std::vector<std::string> prof(active.size());
+#pragma omp parallel for schedule(dynamic, 8)
+    for (std::size_t g = 0; g < active.size(); ++g) {
+      auto const& states = active[g].state_by_taxon;
+      std::vector<std::array<std::uint32_t, nuc_state_count>> vec(snodes.size());
+      for (std::size_t i = 0; i < snodes.size(); ++i) {
+        auto const& n = snodes[i];
+        if (n.leaf) {
+          if (n.pseudo) {
+            vec[i] = all_rows[n.part].m[g];
+          } else {
+            for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+              vec[i][s] = (s == states[n.taxon]) ? 0 : INF_COST;
+          }
+          continue;
+        }
+        for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
+          std::uint64_t acc = 0;
+          for (auto ci : n.children) {
+            std::uint32_t b = ~0u;
+            for (std::uint8_t c = 0; c < nuc_state_count; ++c) {
+              auto v = static_cast<std::uint64_t>(vec[ci][c]) + (s == c ? 0 : 1);
+              if (v < b) b = static_cast<std::uint32_t>(v);
+            }
+            acc += b;
+          }
+          vec[i][s] = static_cast<std::uint32_t>(acc);
+        }
+      }
+      auto const& rc = active[g].reference_state_counts;
+      std::string out;
+      for (std::uint8_t r = 0; r < nuc_state_count; ++r) {
+        if (rc[r] == 0) continue;
+        std::uint8_t root_s = 0;
+        std::uint32_t best = ~0u;
+        for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
+          auto v = static_cast<std::uint32_t>(vec[snodes.size() - 1][s]) +
+                   parsimony_chart_detail::transition_cost(r, s);
+          if (v < best) {
+            best = v;
+            root_s = s;
+          }
+        }
+        std::vector<std::uint8_t> state(snodes.size(), 0);
+        state[snodes.size() - 1] = root_s;
+        for (std::size_t i = snodes.size(); i-- > 0;) {
+          if (snodes[i].leaf || snodes[i].children.empty()) continue;
+          for (auto ci : snodes[i].children) {
+            std::uint8_t cs = 0;
+            std::uint32_t cb = ~0u;
+            for (std::uint8_t c = 0; c < nuc_state_count; ++c) {
+              auto v = static_cast<std::uint32_t>(vec[ci][c]) +
+                       (state[i] == c ? 0 : 1);
+              if (v < cb) {
+                cb = v;
+                cs = c;
+              }
+            }
+            state[ci] = cs;
+          }
+        }
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "%zu %u %u ", g, r, rc[r]);
+        out += buf;
+        for (std::size_t i = 0; i < snodes.size(); ++i)
+          if (snodes[i].pseudo) out += 'A' + state[i];
+        out += '\n';
+      }
+      prof[g] = std::move(out);
+    }
+    std::FILE* f = std::fopen(profile_path.c_str(), "w");
+    std::fprintf(f, "# scaffold lb attachment profiles: gidx ref count states(A-per-collapsed-part, part-order)\n");
+    for (auto const& s : prof) std::fputs(s.c_str(), f);
+    std::fclose(f);
+    std::cerr << "scaffold: profiles written to " << profile_path << "\n";
   }
 }
 
@@ -990,7 +1416,9 @@ int main(int argc, char** argv) {
                  "       %s closure <union_dag> <union_witness> <union_total> "
                  "<enriched_dag> <enriched_witness> <enriched_total>\n"
                  "       %s response <global.pb.gz> <outdir> <part1.pb.gz> "
-                 "[part2.pb.gz ...]\n",
+                 "[part2.pb.gz ...]\n"
+                 "       %s scaffold <lb|wit> <global.pb.gz> <scaffold_bin.pb.gz> "
+                 "<ids_prefix> <rows_prefix> <np> <out.profile> [expected]\n",
                  argv[0], argv[0], argv[0]);
     return 2;
   }
@@ -1006,6 +1434,10 @@ int main(int argc, char** argv) {
       closure.expected_total2 = std::strtoull(argv[7], nullptr, 10);
       run_tension(argv[2], argv[3], std::strtoull(argv[4], nullptr, 10),
                   closure);
+    } else if (mode == "scaffold" && (argc == 9 || argc == 10)) {
+      run_scaffold(argv[2], argv[3], argv[4], argv[5], argv[6],
+                   std::atoi(argv[7]), argv[8],
+                   argc == 10 ? std::strtoull(argv[9], nullptr, 10) : 0);
     } else if (mode == "response" && argc >= 5) {
       std::vector<std::string> parts(argv + 4, argv + argc);
       run_response(argv[2], argv[3], parts);
