@@ -400,6 +400,171 @@ struct closure_ctx {
   std::uint64_t expected_total2 = 0;
 };
 
+// ---- v1 M0: response export (doc/WRIC-V1-KERNEL-PLAN.md) ----
+// For every ACTIVE site pattern of the GLOBAL grammar, emit the part
+// grammar's root response row m(a) = min cost inside the part over parses
+// whose root CG has state a at that site (free labels, chart convention).
+// M1's scaffold solver consumes these rows plus per-pattern reference
+// counts to compute the exact coupled optimum.  Part-uniform restrictions
+// are handled explicitly (uniform sites live in the part's invariant
+// offset, not in active classes): m(a) = [a != u].
+struct response_global_ctx {
+  grammar_ctx ctx;
+  std::unordered_map<std::string, std::uint32_t> gtaxon_of_sample;
+};
+
+response_global_ctx prepare_response_global(std::string const& path) {
+  response_global_ctx g;
+  g.ctx = prepare(path);
+  for (std::uint32_t t = 0; t < g.ctx.grammar.taxa.id_to_sample_id.size(); ++t)
+    g.gtaxon_of_sample.emplace(g.ctx.grammar.taxa.id_to_sample_id[t], t);
+  return g;
+}
+
+void run_response_part(response_global_ctx const& g,
+                        std::string const& part_path,
+                        std::string const& out_path) {
+  auto ctx = prepare(part_path);
+  std::cerr << "response: " << part_path << " clades="
+            << ctx.grammar.clades.size() << " active=" << ctx.active.size()
+            << " invariant_offset=" << ctx.invariant_offset << "\n";
+  auto mrow = class_chart_minima(ctx);
+  auto const& root_classes = ctx.classes[ctx.grammar.root_clade];
+  auto const& root_row = mrow[ctx.grammar.root_clade];
+
+  // Part taxon ids sorted by GLOBAL taxon index (shared key order).
+  std::vector<std::uint32_t> ptax(ctx.grammar.taxa.id_to_sample_id.size());
+  for (std::uint32_t t = 0; t < ptax.size(); ++t) {
+    auto it = g.gtaxon_of_sample.find(ctx.grammar.taxa.id_to_sample_id[t]);
+    if (it == g.gtaxon_of_sample.end())
+      throw std::runtime_error("response: part taxon absent from global");
+    ptax[t] = it->second;
+  }
+  std::vector<std::uint32_t> order(ptax.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(order.begin(), order.end(),
+            [&](std::uint32_t a, std::uint32_t b) { return ptax[a] < ptax[b]; });
+
+  // Dict: canonical restriction key (states over `order`) -> root class.
+  std::unordered_map<CanonKey, std::uint32_t, canon_key_hash> class_by_key;
+  for (std::size_t a = 0; a < ctx.active.size(); ++a) {
+    CanonKey key(order.size());
+    for (std::size_t i = 0; i < order.size(); ++i)
+      key[i] = ctx.active[a].state_by_taxon[order[i]];
+    class_by_key.emplace(key, root_classes.class_of_pattern[a]);
+  }
+
+  // Part's composite LB: sum over patterns of the per-pattern-independent
+  // root-state minima (unpruned inside DP).  This is a LOWER BOUND on the
+  // part's true span optimum (coupling across patterns is not resolved
+  // here); the certified optimum is >= this, with the gap being the part's
+  // internal coupling gap.  Used as the M0 acceptance check together with
+  // the witness score check (tension mode).
+  std::uint64_t part_lb = ctx.invariant_offset;
+  for (std::size_t a = 0; a < ctx.active.size(); ++a) {
+    auto cls = root_classes.class_of_pattern[a];
+    part_lb += eval_row(root_row.data() + cls * nuc_state_count,
+                        ctx.active[a].reference_state_counts);
+  }
+
+  std::FILE* out = std::fopen(out_path.c_str(), "w");
+  if (!out) throw std::runtime_error("response: cannot open " + out_path);
+  std::fprintf(out, "# wric_response v1-M0\n");
+  std::fprintf(out, "# part %s\n", part_path.c_str());
+  std::fprintf(out, "# part_taxa %zu\n", ptax.size());
+  std::fprintf(out, "# part_lb %llu\n",
+               static_cast<unsigned long long>(part_lb));
+  std::fprintf(out, "# global_active %zu global_invariant_offset %llu\n",
+               g.ctx.active.size(),
+               static_cast<unsigned long long>(g.ctx.invariant_offset));
+  std::fprintf(out, "# columns gidx weight refA refC refG refT mA mC mG mT\n");
+  std::uint64_t uniform_rows = 0, key_rows = 0;
+  for (std::size_t gi = 0; gi < g.ctx.active.size(); ++gi) {
+    auto const& act = g.ctx.active[gi];
+    bool uniform = true;
+    std::uint8_t u = act.state_by_taxon[ptax[order[0]]];
+    for (std::size_t i = 1; i < order.size(); ++i)
+      if (act.state_by_taxon[ptax[order[i]]] != u) {
+        uniform = false;
+        break;
+      }
+    std::uint32_t m[nuc_state_count];
+    if (uniform) {
+      for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+        m[s] = (s == u) ? 0 : 1;
+      ++uniform_rows;
+    } else {
+      CanonKey key(order.size());
+      for (std::size_t i = 0; i < order.size(); ++i)
+        key[i] = act.state_by_taxon[ptax[order[i]]];
+      auto it = class_by_key.find(key);
+      if (it == class_by_key.end()) {
+        if (std::getenv("WRIC_RESPONSE_DEBUG")) {
+          // Nearest part pattern by Hamming distance over the restriction.
+          std::size_t best_d = order.size() + 1;
+          const CanonKey* best_key = nullptr;
+          for (auto const& [pk, pc] : class_by_key) {
+            std::size_t d = 0;
+            for (std::size_t i = 0; i < key.size(); ++i)
+              if (key[i] != pk[i]) ++d;
+            if (d < best_d) {
+              best_d = d;
+              best_key = &pk;
+            }
+          }
+          std::fprintf(stderr,
+                       "response-debug: pattern %zu key-size %zu nearest "
+                       "hamming %zu",
+                       gi, key.size(), best_d);
+          if (best_key) {
+            std::fprintf(stderr, " mismatches:");
+            std::size_t shown = 0;
+            for (std::size_t i = 0; i < key.size() && shown < 20; ++i)
+              if (key[i] != (*best_key)[i]) {
+                std::fprintf(stderr, " %s:g%d!=p%d",
+                             g.ctx.grammar.taxa.id_to_sample_id
+                                            [ptax[order[i]]]
+                                                .c_str(),
+                             key[i], (*best_key)[i]);
+                ++shown;
+              }
+          }
+          std::fprintf(stderr, "\n");
+        }
+        throw std::runtime_error("response: global pattern " +
+                                 std::to_string(gi) +
+                                 " has no matching part class");
+      }
+      for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+        m[s] = static_cast<std::uint32_t>(
+            root_row[it->second * nuc_state_count + s]);
+      ++key_rows;
+    }
+    std::fprintf(out, "%zu %u %u %u %u %u %u %u %u %u\n", gi, act.weight,
+                 act.reference_state_counts[0], act.reference_state_counts[1],
+                 act.reference_state_counts[2], act.reference_state_counts[3],
+                 m[0], m[1], m[2], m[3]);
+  }
+  std::fclose(out);
+  std::cerr << "response: " << out_path << " rows=" << g.ctx.active.size()
+            << " (uniform=" << uniform_rows << " keyed=" << key_rows
+            << ") part_lb=" << part_lb << "\n";
+}
+
+void run_response(std::string const& global_path, std::string const& outdir,
+                  std::vector<std::string> const& parts) {
+  auto g = prepare_response_global(global_path);
+  std::cerr << "response: global clades=" << g.ctx.grammar.clades.size()
+            << " active=" << g.ctx.active.size() << "\n";
+  for (auto const& p : parts) {
+    auto slash = p.find_last_of('/');
+    auto stem = p.substr(slash + 1);
+    auto dot = stem.find_last_of('.');
+    if (dot != std::string::npos) stem = stem.substr(0, dot);
+    run_response_part(g, p, outdir + "/" + stem + ".resp");
+  }
+}
+
 void run_tension(std::string const& dag_path, std::string const& witness_path,
                  std::uint64_t expected_total, closure_ctx closure) {
   auto ctx = prepare(dag_path);
@@ -823,8 +988,10 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: %s tension <dag.pb.gz> <witness.pb.gz> <expected_total>\n"
                  "       %s closure <union_dag> <union_witness> <union_total> "
-                 "<enriched_dag> <enriched_witness> <enriched_total>\n",
-                 argv[0], argv[0]);
+                 "<enriched_dag> <enriched_witness> <enriched_total>\n"
+                 "       %s response <global.pb.gz> <outdir> <part1.pb.gz> "
+                 "[part2.pb.gz ...]\n",
+                 argv[0], argv[0], argv[0]);
     return 2;
   }
   std::string mode = argv[1];
@@ -839,6 +1006,9 @@ int main(int argc, char** argv) {
       closure.expected_total2 = std::strtoull(argv[7], nullptr, 10);
       run_tension(argv[2], argv[3], std::strtoull(argv[4], nullptr, 10),
                   closure);
+    } else if (mode == "response" && argc >= 5) {
+      std::vector<std::string> parts(argv + 4, argv + argc);
+      run_response(argv[2], argv[3], parts);
     } else {
       std::fprintf(stderr, "bad arguments for mode %s\n", mode.c_str());
       return 2;

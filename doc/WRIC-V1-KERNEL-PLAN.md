@@ -41,15 +41,35 @@ minimal connecting structure + remainder leaves; on startmat's size fold,
 
 ## 2. Work items
 
-### M0 — response export (new read-only path)
-- Mode `wric_response <part.pb.gz> <out.resp>` (or a chart dump flag): run
-  the part's score-only downpass with class compression and emit the root
-  frontier: class tables (class → site list) + per-class 4-vector m_j(·).
-  No B&B, no materialize — the existing downpass already computes it.
-- Output format: gzipped TSV (class id, sites, mA mC mG mT). ~15k rows per
-  part; startmat size = 23 files ≈ few MB total.
-- Risk: touches chart internals read-only; keep out of the trim application
-  path entirely.
+### M0 — response export (new read-only path)  [DONE 2026-10-22]
+- Implemented as `wric_tension_map response <global.pb.gz> <outdir>
+  <part1.pb.gz> …` (batch: one global prep, N part preps).  Reuses the
+  tension machinery verbatim: `prepare()` + `class_chart_minima()` (the
+  unpruned per-class inside DP) — the root row m_j(·) per restriction
+  class IS the response.  Output `.resp`: header (part taxa count,
+  part composite LB, global invariant offset) + one row per GLOBAL active
+  pattern: `gidx weight refA refC refG refT mA mC mG mT`.
+- Findings that shaped the implementation:
+  - The GLOBAL grammar must satisfy the arity-≤63 prep bound → the
+    polytomic original cannot serve; the binary comb scaffold
+    (scaffold_bin.pb.gz, same leaves/reference) is the global.
+  - Part-UNIFORM restrictions never appear in part active classes
+    (uniform sites live in the part's invariant offset) → handled
+    explicitly: m(a) = [a ≠ u].  (First version had an index-space bug
+    mixing part-taxonspace ids with global-pattern vectors; one leaf,
+    G-vs-T, flagged it.)
+  - `Σ_patterns weight·min_a(…)` is the part's composite LB, NOT its
+    optimum: per-pattern-independent root states.  Σ part_lb = 59,662 vs
+    Σ certified optima 59,751 → Σ internal coupling gaps = 89 across the
+    23 size parts (per-part 0–11; four parts have zero gap).
+- Acceptance (all 23 parts): (a) certified witness rescore under the same
+  machinery reproduces the certified optimum exactly (23/23 OK);
+  (b) exported per-part LB == the tension mode's independent composite LB
+  (23/23); (c) production `bnb_optimum` spot-check (906/988) confirms the
+  LB–optimum gap is real coupling, not an export bug.
+- Artifacts: /tmp/v0/resp/part_{00..22}.spr.pb.resp (14,962 rows each),
+  plus `wric_leaf_cg` (pb leaf-CG dump tool, used for the data-consistency
+  probe that ruled out CG divergence between pbs).
 
 ### M1 — scaffold-fixed coupled solve (first certificate)
 - `wric_scaffold <scaffold.pb.gz> <resp1> … <respk>`: bespoke min-plus DP
