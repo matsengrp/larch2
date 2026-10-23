@@ -286,7 +286,8 @@ four parts whose conditioned optima BEAT their witnesses (02: 1964 < 1965;
   crown is IDENTICAL to pi-hat -- no crown lever exists).
 - Residuals r_j = PartOpt_j - composite_j: 11 parts at 0; top: part_04
   10, part_03 4, frag_01 4; small-parts sum 35; crown r = 7 (composite
-  29,840; pending the running confirmation).
+  29,840; CONFIRMED by the completed crown clamp: PartOpt 29,847,
+  composite 29,840, validation success).
 - **U(pi-hat) = 8,348 + 51,420 = 59,768 -- EXACTLY the old U**: the
   profile-pinned realization TIES the free-label realization.  The old
   "3-unit label-mixing recovery" narrative was a permutation artifact;
