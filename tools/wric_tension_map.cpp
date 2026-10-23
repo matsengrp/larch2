@@ -1693,6 +1693,7 @@ void run_vleaf_clampgen(std::string const& global_path,
   // Coverage check against the part patterns' own reference counts.
   std::size_t coverage_mismatch = 0;
   std::uint64_t clamped_invariant_delta = 0;
+  std::vector<std::string> delta_dbg;
   for (auto const& [pr, slot] : pins) {
     auto [pidx, r] = pr;
     std::uint32_t covered = 0;
@@ -1707,8 +1708,28 @@ void run_vleaf_clampgen(std::string const& global_path,
         auto clamped_cost = (s != u ? 1u : 0u) + (s != r ? 1u : 0u);
         clamped_invariant_delta +=
             static_cast<std::uint64_t>(n) * (clamped_cost - free_cost);
+        if (clamped_cost != free_cost) {
+          std::string d = "pidx=" + std::to_string(pidx) + " r=" +
+              std::to_string(r) + " u=" + std::to_string(u) +
+              " pin=" + std::to_string(s) + " n=" + std::to_string(n) +
+              " contrib=" +
+              std::to_string(static_cast<std::uint64_t>(n) *
+                             (clamped_cost - free_cost));
+          delta_dbg.push_back(std::move(d));
+        }
       }
     }
+  }
+  if (!delta_dbg.empty()) {
+    std::sort(delta_dbg.begin(), delta_dbg.end(),
+              [](auto const& a, auto const& b) {
+                return std::stoull(a.substr(a.rfind('=') + 1)) >
+                       std::stoull(b.substr(b.rfind('=') + 1));
+              });
+    std::fprintf(stderr, "clampgen: delta contributors (top 6 of %zu):\n",
+                 delta_dbg.size());
+    for (std::size_t i = 0; i < delta_dbg.size() && i < 6; ++i)
+      std::fprintf(stderr, "  %s\n", delta_dbg[i].c_str());
   }
 
   std::FILE* f = std::fopen(out_path.c_str(), "w");

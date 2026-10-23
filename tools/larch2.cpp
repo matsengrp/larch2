@@ -3076,15 +3076,19 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
   }
   trim_opts.max_frontier_entries_per_clade = a.chart_bnb_max_frontier;
   if (chart_opts.root_state_clamp) {
-    // Mask-profile dedup's same-mask-differs-by-B argument is free-readout
-    // specific and unsound under the clamped readout; the lazy one-witness
-    // route requires it.  Force both off (cross-profile dominance stays
-    // available: row-wise dominance is readout independent).
-    if (trim_opts.profile_dedup) {
-      std::cerr << "  note: --chart-bnb-root-clamp disables "
-                   "--chart-bnb-profile-dedup (unsound under clamp)\n";
-      trim_opts.profile_dedup = false;
-    }
+    // Clamp-sound dedup (route b, 2026-10-23): off-mask row offsets are
+    // parse-sum counts k in [1, arity] (binary parses can miss a state in
+    // both children), NOT exactly 1 -- so plain same-mask/B-gap dedup is
+    // unsound under the clamped root readout (same-mask entries can
+    // differ at pinned non-argmin states).  The frontier build instead
+    // augments the ROOT clade's dedup key with the pinned row values
+    // (multisite_frontier_build_options::root_state_clamp threaded from
+    // the chart options): same-key entries provably differ by exactly
+    // their B gap in every future score, clamped readouts included.
+    // Non-root clades are consumed only through unit-edge responses
+    // m + [t notin S] and stay mask-only.  The lazy one-witness trace
+    // stays unavailable under clamp (forced off below); the cold trace
+    // materializes with the clamped oracle.
     trim_opts.dominance_mode = multisite_dominance_mode::score_only;
     trim_opts.require_exact_keep_mask = false;
   }
@@ -3145,14 +3149,12 @@ static chart_bnb_trim_apply_result run_chart_bnb_trim_output(
   apply_opts.beam_after_taxa = a.chart_bnb_beam_after_taxa;
   apply_opts.beam_width = a.chart_bnb_beam_width;
   apply_opts.profile_dedup = a.chart_bnb_profile_dedup;
-  if (chart_opts.root_state_clamp) {
-    apply_opts.profile_dedup = false;  // unsound under clamp (see above)
-  }
   apply_opts.cross_profile_dominance.enabled = a.chart_bnb_cross_profile_dominance;
   apply_opts.class_compressed_score_pass = a.chart_bnb_class_compress;
   apply_opts.lazy_one_witness =
       use_lazy && a.chart_bnb_upper_bound.has_value() &&
       trim_opts.dominance_mode == multisite_dominance_mode::score_only &&
+      !chart_opts.root_state_clamp &&
       apply_opts.mode == chart_bnb_trim_application_mode::optimal_topology_materialize &&
       apply_opts.max_exact_topologies_to_materialize == std::optional<std::size_t>{1} &&
       apply_opts.class_compressed_score_pass && apply_opts.profile_dedup &&

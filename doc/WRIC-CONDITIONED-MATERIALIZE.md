@@ -187,3 +187,51 @@ realization beats U by this route -- closing the remaining 42 needs
 branching AWAY from the LB profile (Phase 3: re-profile + re-clamp per
 branch; crown branches cost ~6.5 h each without a clamp-sound dedup).
 Artifacts: /tmp/v0/npart/clamp/ (clamp files, wit/, clamp.tsv, logs).
+
+## 8. Clamp-sound dedup (2026-10-23): the correction's correction
+
+The retraction of the Phase-2 unsoundness verdict was itself wrong, and
+the Fitch-form assertion caught it live:
+
+- Strong claim (FALSE): under unit-Hamming, every frontier row is a Fitch
+  form row[s] = m + [s notin S].  Binary parse sums are M + k_t where k_t
+  = the number of children whose mask misses t -- k in [1, arity], not
+  {0, 1}.  Observed live: clade 185 row [3,1,3,2] (mask {1}, m=1, off-mask
+  offsets 2/2/1); the route-(a) assertion fired on the first fixture run.
+- Weak claim (TRUE): the unit-edge response is m + [t notin S] for ANY
+  off-mask offsets >= 1 -- parents and every min-plus consumer see only
+  (m, S).  This is what makes mask-only dedup sound for FREE readouts.
+- Consequence: under the clamped root readout (which reads row[a] =
+  m + k_a at pinned states, k_a entry-specific), same-mask entries can
+  differ by more than the B gap -- mask-only dedup is genuinely unsound
+  under clamp, as the Phase-2 verdict said.
+
+Route (b) implemented (pin-augmented keys): when
+chart_options.root_state_clamp is set, the frontier build augments the
+ROOT clade's dedup key, per varying class, with the class row's values at
+every state pinned by the clamp map (pinned_of_class from
+class_of_pattern x subgroups).  Same-mask, same-pinned-reads entries
+provably differ by exactly their B gap in every future score (responses
+depend only on (m, S); pinned reads are pinned by the key), so min-B is
+sound under the clamped readout.  Non-root clades are never read directly
+by the clamp and keep mask-only keys.  Threaded as
+multisite_frontier_build_options::root_state_clamp at all three build
+sites (score pass, main build, witness trace); the apply-side dedup is no
+longer disabled under clamp; the lazy one-witness route stays forced off
+under clamp.  The route-(a) fitch_form_assert flag was removed (strict
+Fitch form is violated by ordinary binary parses).
+
+Validation: fixtures 3/3 (963/211/212); full 24-part batch with dedup on
+reproduces the dedup-off PartOpt/composite table EXACTLY (24/24; crown
+PartOpt 29,851 composite 29,844, validation success); Sum residual = 44,
+U'_exact = 59,770 unchanged.  No cross-profile needed.
+
+Performance verdict (honest): NO crown speedup -- 6.4 h with dedup vs
+6.5 h without, and profile_dedup_pruned = 109 for the whole crown run:
+under clamp, dedup barely fires for this grammar (the dominant
+frontier-width bottleneck is elsewhere, likely per-entry row width over
+~10.8k root-region classes plus dominance/UB interaction).  Phase 3
+crown re-clamps therefore stay ~6.5 h each; profile branching that
+avoids re-clamping the crown (or a width attack) is the remaining path
+to cheap Phase-3 branches.  The 23 non-crown parts remain
+seconds-to-minutes each with dedup on.

@@ -1566,6 +1566,16 @@ struct multisite_trim_options {
   // gap; this preserves the optimum value and one optimal witness per
   // profile while possibly dropping other optimal topologies (equal-B
   // ties).  Requires class_compressed_score_pass.
+  //
+  // Clamp soundness: off-mask row offsets are parse-sum counts k in
+  // [1, arity] (a binary parse can miss a state in BOTH children), not
+  // exactly 1 -- so same-mask entries may differ at pinned non-argmin
+  // states and the B-gap argument alone does not cover the clamped root
+  // readout.  When chart_options.root_state_clamp is set, the frontier
+  // build augments the ROOT clade's key with the pinned row values
+  // (see multisite_frontier_build_options::root_state_clamp); non-root
+  // clades are consumed only through unit-edge responses m + [t notin S]
+  // and stay mask-only.
   bool profile_dedup = false;
 
   // Additional weighted cross-mask outgoing-response dominance. Ordinary
@@ -4938,6 +4948,18 @@ struct multisite_frontier_build_options {
   // varying classes, only the smallest-B entry.  Requires
   // class_compressed_entries.
   bool profile_dedup = false;
+
+  // Clamp-sound mask-profile dedup (route b): when set and profile_dedup
+  // is active, the ROOT clade's dedup key is augmented, per varying
+  // class, with the class row's values at every state pinned by the
+  // clamp map.  Same-mask entries with equal pinned reads still differ in
+  // every future score by exactly their B gap -- unit-edge responses
+  // depend only on (m, S) (off-mask offsets k >= 1 are invisible through
+  // responses), and the clamped root readout reads m + k_a, which the
+  // augmented key pins down -- so keeping min-B is sound under the
+  // clamped readout.  Non-root clades are never read directly by the
+  // clamp and keep mask-only keys.
+  std::shared_ptr<root_state_clamp_map const> root_state_clamp;
   cross_profile_dominance_options cross_profile_dominance;
 };
 
@@ -6312,13 +6334,34 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
         }
         return total;
       };
+      // Clamp-sound keys (route b): at the root clade, same-mask entries
+      // may still differ at pinned states -- off-mask row offsets are
+      // parse-sum counts k in [1, arity] (a binary parse can miss a state
+      // in both children), not exactly 1.  Append the pinned row values to
+      // the key so same-key entries differ by exactly their B gap under
+      // the clamped root readout.  Non-root clades are consumed only
+      // through unit-edge responses m + [t notin S] and stay mask-only.
+      bool const root_pins = build_options.root_state_clamp != nullptr &&
+                             clade == grammar.root_clade;
+      std::vector<std::uint8_t> pinned_of_class;
+      if (root_pins) {
+        pinned_of_class.assign(classes[clade].class_count, 0);
+        auto const& class_of_pattern_local = classes[clade].class_of_pattern;
+        for (std::size_t p = 0; p < class_of_pattern_local.size(); ++p) {
+          auto it = build_options.root_state_clamp->subgroups.find(p);
+          if (it == build_options.root_state_clamp->subgroups.end()) continue;
+          for (auto const& sub : it->second)
+            pinned_of_class[class_of_pattern_local[p]] |= static_cast<std::uint8_t>(1u << sub.forced_state);
+        }
+      }
       std::unordered_map<
           std::uint64_t,
-          std::vector<std::pair<std::vector<std::uint8_t>, std::size_t>>>
+          std::vector<std::pair<std::vector<chart_cost>, std::size_t>>>
           profile_keepers;
       std::vector<std::uint64_t> entry_b(entries.size());
       for (std::size_t i = 0; i < entries.size(); ++i) {
-        std::vector<std::uint8_t> profile(slot_count);
+        std::vector<chart_cost> profile;
+        profile.reserve(slot_count * 2);
         for (std::size_t j = 0; j < slot_count; ++j) {
           auto const* row =
               entries[i].rows.data() + j * nuc_state_count;
@@ -6329,12 +6372,20 @@ inline multisite_frontier_build_result build_multisite_frontiers_class_compresse
           for (std::uint8_t s = 0; s < nuc_state_count; ++s)
             if (row[s] == m)
               mask |= static_cast<std::uint8_t>(1u << s);
-          profile[j] = mask;
+          profile.push_back(mask);
+          if (root_pins) {
+            auto pins = pinned_of_class[fact.varying_classes[j]];
+            if (pins) {
+              for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+                if (pins & (static_cast<std::uint8_t>(1u) << s))
+                  profile.push_back(row[s]);
+            }
+          }
         }
         entry_b[i] = weighted_min_sum(entries[i]);
         std::uint64_t profile_hash = 1469598103934665603ULL;
-        for (auto b : profile) {
-          profile_hash ^= b;
+        for (auto v : profile) {
+          profile_hash ^= v;
           profile_hash *= 1099511628211ULL;
         }
         auto& bucket = profile_keepers[profile_hash];
@@ -7592,6 +7643,7 @@ inline multisite_trim_result build_multisite_trim_impl(
     score_build_options.beam_after_taxa = trim_options.beam_after_taxa;
     score_build_options.beam_width = trim_options.beam_width;
     score_build_options.profile_dedup = trim_options.profile_dedup;
+    score_build_options.root_state_clamp = options.root_state_clamp;
     {
       auto score_build =
           build_frontiers(score_build_options, "multi-site trim score pass");
@@ -7687,6 +7739,7 @@ inline multisite_trim_result build_multisite_trim_impl(
   build_options.beam_after_taxa = trim_options.beam_after_taxa;
   build_options.beam_width = trim_options.beam_width;
   build_options.profile_dedup = trim_options.profile_dedup;
+  build_options.root_state_clamp = options.root_state_clamp;
   build_options.cross_profile_dominance = trim_options.cross_profile_dominance;
   auto build = build_frontiers(build_options, "multi-site trim");
   append_multisite_frontier_diagnostics(result, build,
@@ -8209,6 +8262,7 @@ inline multisite_topology_trace_result build_multisite_optimal_topology_witnesse
   build_options.beam_after_taxa = trace_opts.trim_options.beam_after_taxa;
   build_options.beam_width = trace_opts.trim_options.beam_width;
   build_options.profile_dedup = trace_opts.trim_options.profile_dedup;
+  build_options.root_state_clamp = options.root_state_clamp;
   build_options.cross_profile_dominance =
       trace_opts.trim_options.cross_profile_dominance;
   // Prune with the tightest validated bound available: an explicit override,
