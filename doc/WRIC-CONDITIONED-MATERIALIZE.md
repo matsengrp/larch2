@@ -235,3 +235,87 @@ crown re-clamps therefore stay ~6.5 h each; profile branching that
 avoids re-clamping the crown (or a width attack) is the remaining path
 to cheap Phase-3 branches.  The 23 non-crown parts remain
 seconds-to-minutes each with dedup on.
+
+## 9. Phase 3 executed (2026-10-23): column-permutation correction, pinned
+## scaffold DP, and U = 59,767
+
+### 9.1 The column permutation (critical instrumentation fix)
+
+`scaffold lb`'s profile export emitted its per-part state columns in
+pseudo-node TRAVERSAL (slot) order while every consumer (clampgen,
+build_profile_cg, the pin DP) reads column j as part j.  The slot order is
+[10,0,12,2,11,9,6,4,1,13,5,14,15,3,16,8,17,18,19,20,7,21,22,23] -- only
+parts 21/22/23 align, which is why the slot-23 fixture passed and nothing
+crashed.  Consequences, all now corrected:
+
+- Phase-1's vleaf bias campaign and Phase-2's 24-part clamp batch pinned
+  each part at ANOTHER part's LB-profile pins (sigma-permuted).  Those
+  numbers were real measurements at those pins, but not "the fold LB
+  profile's restriction".  The dedup validation (24/24 exactness, fixtures
+  3/3) is machinery-level and stands.
+- Phase-2's U'_exact = 59,770 is void (permuted columns AND the scaffold
+  side was never directly computed).  Corrected below.
+- The M1 certificate [59,726, 59,768] was column-free and stands.
+- The top-down export walk itself is CORRECT (descending order matches the
+  post-order flatten: parent indices are larger; verified by
+  WRIC_WALK_CHECK: pinned-at-walked-states + m rows == free minimum for
+  every (g, r)).
+
+The export now writes part-index columns; the corrected profile is
+`fold_lb3.profile`.
+
+### 9.2 The pinned-scaffold DP (new instrument)
+
+`wric_tension_map scaffold pin <global> <scaffold> <ids_prefix> - 24
+<profile>`: per (pattern, ref state), the collapsed-scaffold DP with every
+part's attachment state FORCED to the profile pin; computes
+scaffold_at_profile(pi) exactly.  U(pi) = scaffold_at_profile(pi) +
+sum_j inside_j(pi), inside_j = PartOpt_j - UA_j (python from resp+profile).
+Validation: pin(fold_lb3) + sum_j M_j(fold_lb3) = 8,348 + 51,378 = 59,726
+= the free LB, EXACTLY (the corrected profile is a true per-(g,r) argmin
+decomposition of the free DP).
+
+### 9.3 Results at the corrected profile pi-hat = fold_lb3
+
+Every part's witness clamped score equals its conditioned optimum except
+four parts whose conditioned optima BEAT their witnesses (02: 1964 < 1965;
+11: 336 < 337; 13: 267 < 268; 15: 182 < 183; measured by clamp).
+
+- PartOpt_j(pi-hat) exact for 23 parts (batch, dedup on); crown PartOpt
+  29,847 (== its certified witness; the witness-argmin column for the
+  crown is IDENTICAL to pi-hat -- no crown lever exists).
+- Residuals r_j = PartOpt_j - composite_j: 11 parts at 0; top: part_04
+  10, part_03 4, frag_01 4; small-parts sum 35; crown r = 7 (composite
+  29,840; pending the running confirmation).
+- **U(pi-hat) = 8,348 + 51,420 = 59,768 -- EXACTLY the old U**: the
+  profile-pinned realization TIES the free-label realization.  The old
+  "3-unit label-mixing recovery" narrative was a permutation artifact;
+  the correct statement is that pi-hat pins are witness-consistent and
+  realize the fold optimum.
+
+### 9.4 The branch search and the new best tree
+
+Single-part branches (witness-argmin columns merged into pi-hat,
+evaluated exactly via clamp + pin DP; only 8 parts differ from pi-hat at
+1-2 pins each): slot 23 -> **59,767**; slots 01/11/13/15 -> 59,768
+(neutral); 16/17 -> 59,769; 02 -> 59,770.  Slot 23's witness-argmin
+profile drops its inside by 2 (210 -> 208) for +1 scaffold: net -1.
+
+**Realized: the mixed witness set (22 pi-hat clamped witnesses + part 23
+at its witness-argmin clamp) scores 59,767 by the scaffold wit-DP -- the
+new best tree, one below the campaign's 59,768.**
+
+Pairs with 23: all additive (pin +2, inside stacks), best 59,767 -- no
+stacking gain.  Single-pin deviations off pi-hat are barren: at every
+(g,r) the walk state is a composite argmin (moving costs scaffold + m >=
+0) and inside >= m per site, so no deviation of the remaining parts can
+beat U(pi-hat) through single-pin moves; the witness-argmin exhaustion
+above covers the remaining cheap class.  Crown: no-op.
+
+### 9.5 Certificate
+
+**[59,726, 59,767]**, gap 41 = 1 (composite deviation at part 23's
+swapped pin) + 33 (small-part residuals at pi-hat minus part 23's) + 7
+(crown residual, composite 29,840).  Artifacts: npart/fold/fold_lb3.profile
+(corrected export), npart/clamp3/ (batch), npart/p3/ (swap profiles,
+clamps, mixed realization), /tmp/p3_inside.json.

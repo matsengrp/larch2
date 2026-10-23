@@ -744,6 +744,47 @@ resp_rows witness_rows(std::string const& wit_path,
   return rows;
 }
 
+struct vleaf_profile {
+  // state[g][r] = attachment state for active pattern g at reference
+  // state r; 0xFF = absent (hard error if a site needs it).
+  std::vector<std::array<std::uint8_t, nuc_state_count>> state;
+};
+
+vleaf_profile load_vleaf_profile(std::string const& path, int j,
+                                 std::size_t nactive) {
+  std::FILE* f = std::fopen(path.c_str(), "r");
+  if (!f) throw std::runtime_error("vleaf: cannot open profile " + path);
+  vleaf_profile prof;
+  prof.state.assign(nactive, {0xFF, 0xFF, 0xFF, 0xFF});
+  char line[512];
+  std::size_t nline = 0;
+  while (std::fgets(line, sizeof line, f)) {
+    if (line[0] == '#') continue;
+    ++nline;
+    char* p = line;
+    unsigned long long g = std::strtoull(p, &p, 10);
+    unsigned long r = std::strtoul(p, &p, 10);
+    std::strtoul(p, &p, 10);  // count (unused here)
+    while (*p == ' ') ++p;
+    unsigned col = 0;
+    std::uint8_t s = 0xFF;
+    while (*p >= 'A' && *p <= 'T') {
+      if (col == static_cast<unsigned>(j)) s = static_cast<std::uint8_t>(*p - 'A');
+      ++col;
+      ++p;
+    }
+    if (col <= static_cast<unsigned>(j) || s == 0xFF)
+      throw std::runtime_error("vleaf: profile line lacks part column " +
+                               std::to_string(j));
+    if (g >= nactive) throw std::runtime_error("vleaf: profile gidx range");
+    if (r >= nuc_state_count) throw std::runtime_error("vleaf: profile ref");
+    prof.state[g][static_cast<std::uint8_t>(r)] = s;
+  }
+  std::fclose(f);
+  std::fprintf(stderr, "vleaf: profile lines=%zu column=%d\n", nline, j);
+  return prof;
+}
+
 void run_scaffold(std::string const& mode, std::string const& global_path,
                   std::string const& scaffold_path, std::string const& ids_prefix,
                   std::string const& rows_prefix, int np,
@@ -791,6 +832,107 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
   }
   std::cerr << "scaffold: nodes=" << snodes.size() << " internal=" << ninternal
             << " pseudo=" << npseudo << " real_leaves=" << nreal << "\n";
+
+  if (auto dump = std::getenv("WRIC_SCAFF_DUMP")) {
+    std::FILE* df = std::fopen(dump, "w");
+    for (std::size_t i = 0; i < snodes.size(); ++i) {
+      auto const& n = snodes[i];
+      std::fprintf(df, "%zu %d %d %d %u", i, n.leaf ? 1 : 0, n.pseudo ? 1 : 0,
+                   n.part, n.taxon);
+      for (auto ci : n.children) std::fprintf(df, " %zu", ci);
+      std::fprintf(df, "\n");
+    }
+    std::fclose(df);
+  }
+
+  // Pinned-scaffold DP (phase 3): every collapsed part's attachment state
+  // is FORCED to the profile column j's pinned state per (pattern, ref
+  // state).  Computes scaffold_at_profile(pi) exactly -- the scaffold-side
+  // term of the profile-pinned fold realization U(pi) = scaffold_at_profile
+  // + sum_j inside_j(pi).  Real (non-collapsed) leaves keep their fixed
+  // states; the root pays the UA edge per ref state.
+  if (mode == "pin") {
+    if (profile_path == "-")
+      throw std::runtime_error(
+          "scaffold pin: a profile file is required");
+    std::vector<vleaf_profile> profs(np);
+    for (int j = 0; j < np; ++j) {
+      if (part_of_slot[j] < 0) continue;
+      profs[j] = load_vleaf_profile(profile_path, j, gctx.active.size());
+    }
+    std::vector<std::uint64_t> per_pin(gctx.active.size());
+#pragma omp parallel for schedule(dynamic, 8)
+    for (std::size_t g = 0; g < gctx.active.size(); ++g) {
+      auto const& states = gctx.active[g].state_by_taxon;
+      auto const& rc = gctx.active[g].reference_state_counts;
+      std::vector<std::array<std::uint32_t, nuc_state_count>> vec(
+          snodes.size());
+      std::uint64_t pg = 0;
+      for (std::uint8_t r = 0; r < nuc_state_count; ++r) {
+        if (!rc[r]) continue;
+        for (std::size_t i = 0; i < snodes.size(); ++i) {
+          auto const& n = snodes[i];
+          if (n.leaf) {
+            if (n.pseudo) {
+              auto pinned = profs[n.part].state[g][r];
+              if (pinned == 0xFF)
+                throw std::runtime_error(
+                    "scaffold pin: profile entry missing");
+              for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+                vec[i][s] = (s == pinned) ? 0 : INF_COST;
+            } else {
+              for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+                vec[i][s] = (s == states[n.taxon]) ? 0 : INF_COST;
+            }
+            continue;
+          }
+          for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
+            std::uint64_t acc = 0;
+            for (auto ci : n.children) {
+              std::uint32_t b = ~0u;
+              for (std::uint8_t c = 0; c < nuc_state_count; ++c) {
+                auto v = static_cast<std::uint64_t>(vec[ci][c]) +
+                         (s == c ? 0 : 1);
+                if (v < b) b = static_cast<std::uint32_t>(v);
+              }
+              acc += b;
+            }
+            vec[i][s] = static_cast<std::uint32_t>(acc);
+          }
+        }
+        std::size_t rr = snodes.size() - 1;
+        std::uint32_t b = ~0u;
+        for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
+          auto v = static_cast<std::uint64_t>(vec[rr][s]) + (s == r ? 0 : 1);
+          if (v < b) b = static_cast<std::uint32_t>(v);
+        }
+        pg += static_cast<std::uint64_t>(rc[r]) * b;
+      }
+      per_pin[g] = pg;
+    }
+    std::uint64_t pin_total = gctx.invariant_offset;
+    if (auto dump = std::getenv("WRIC_PIN_DUMP")) {
+      std::FILE* df = std::fopen(dump, "w");
+      for (std::size_t g = 0; g < gctx.active.size(); ++g)
+        std::fprintf(df, "%zu %llu\n", g,
+                     static_cast<unsigned long long>(per_pin[g]));
+      std::fclose(df);
+    }
+    for (std::size_t g = 0; g < gctx.active.size(); ++g)
+      pin_total += per_pin[g];
+    if (expected && pin_total != expected) {
+      std::fprintf(stderr, "scaffold: pinned total %llu != expected %llu\n",
+                   static_cast<unsigned long long>(pin_total),
+                   static_cast<unsigned long long>(expected));
+      throw std::runtime_error("scaffold: pinned total mismatch");
+    }
+    std::fprintf(stderr,
+                 "scaffold[pin]: total = %llu (expected %llu) %s\n",
+                 static_cast<unsigned long long>(pin_total),
+                 static_cast<unsigned long long>(expected),
+                 expected ? (pin_total == expected ? "OK" : "MISMATCH") : "");
+    return;
+  }
 
   // Rows per part (only for collapsed parts).
   std::vector<resp_rows> all_rows(np);
@@ -858,6 +1000,13 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
   }
   // NOTE: eval_row is already weight-aware (reference_state_counts sum to
   // the pattern's site weight) -- do NOT multiply by weight again.
+  if (auto dump = std::getenv("WRIC_LB_DUMP")) {
+    std::FILE* df = std::fopen(dump, "w");
+    for (std::size_t g = 0; g < gctx.active.size(); ++g)
+      std::fprintf(df, "%zu %llu\n", g,
+                   static_cast<unsigned long long>(per[g]));
+    std::fclose(df);
+  }
   std::uint64_t total = gctx.invariant_offset;
   for (std::size_t g = 0; g < active.size(); ++g) total += per[g];
 
@@ -913,6 +1062,10 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
     // Second pass: per pattern (and per reference state present), recompute
     // the DP vectors and run a top-down argmin pass to recover every part's
     // attachment state under the optimal root choice for that ref state.
+    bool const walk_check = std::getenv("WRIC_WALK_CHECK") != nullptr;
+    std::vector<std::size_t> node_of_part(np, static_cast<std::size_t>(-1));
+    for (std::size_t i = 0; i < snodes.size(); ++i)
+      if (snodes[i].pseudo) node_of_part[snodes[i].part] = i;
     std::vector<std::string> prof(active.size());
 #pragma omp parallel for schedule(dynamic, 8)
     for (std::size_t g = 0; g < active.size(); ++g) {
@@ -958,6 +1111,11 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
         }
         std::vector<std::uint8_t> state(snodes.size(), 0);
         state[snodes.size() - 1] = root_s;
+        // Post-order flatten puts every parent AFTER its children (larger
+        // index), so the top-down state walk must run DESCENDING from the
+        // root: each internal node's state was already fixed by its
+        // (larger-index) parent before its children (smaller indices) read
+        // it.
         for (std::size_t i = snodes.size(); i-- > 0;) {
           if (snodes[i].leaf || snodes[i].children.empty()) continue;
           for (auto ci : snodes[i].children) {
@@ -977,9 +1135,66 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
         char buf[16];
         std::snprintf(buf, sizeof buf, "%zu %u %u ", g, r, rc[r]);
         out += buf;
-        for (std::size_t i = 0; i < snodes.size(); ++i)
-          if (snodes[i].pseudo) out += 'A' + state[i];
+        // Columns are PART-INDEX ordered (column j = part j), matching
+        // every consumer (vleaf/clampgen column semantics).  The pseudo
+        // nodes appear in traversal (slot) order, which permutes parts
+        // (measured: slots [10,0,12,2,...]) -- emitting in snodes order
+        // scrambled the columns and every downstream per-part profile use
+        // with it.
+        for (std::uint32_t j = 0; j < static_cast<std::uint32_t>(np); ++j)
+          out += 'A' + state[node_of_part[j]];
         out += '\n';
+        if (walk_check) {
+          // Consistency: pinning every pseudo-leaf at the walked state and
+          // re-solving, PLUS the parts' own inside rows m_j at those
+          // states, must reproduce the free minimum for this (g, r).
+          std::vector<std::array<std::uint32_t, nuc_state_count>> pvec(
+              snodes.size());
+          std::uint64_t msum = 0;
+          for (std::size_t i = 0; i < snodes.size(); ++i) {
+            auto const& n = snodes[i];
+            if (n.leaf) {
+              if (n.pseudo) {
+                msum += all_rows[n.part].m[g][state[i]];
+                for (std::uint8_t s2 = 0; s2 < nuc_state_count; ++s2)
+                  pvec[i][s2] = (s2 == state[i]) ? 0 : INF_COST;
+              } else {
+                for (std::uint8_t s2 = 0; s2 < nuc_state_count; ++s2)
+                  pvec[i][s2] = (s2 == states[n.taxon]) ? 0 : INF_COST;
+              }
+              continue;
+            }
+            for (std::uint8_t s2 = 0; s2 < nuc_state_count; ++s2) {
+              std::uint64_t acc = 0;
+              for (auto ci : n.children) {
+                std::uint32_t b = ~0u;
+                for (std::uint8_t c = 0; c < nuc_state_count; ++c) {
+                  auto v = static_cast<std::uint64_t>(pvec[ci][c]) +
+                           (s2 == c ? 0 : 1);
+                  if (v < b) b = static_cast<std::uint32_t>(v);
+                }
+                acc += b;
+              }
+              pvec[i][s2] = static_cast<std::uint32_t>(acc);
+            }
+          }
+          std::uint32_t pb2 = ~0u;
+          for (std::uint8_t s2 = 0; s2 < nuc_state_count; ++s2) {
+            auto v = static_cast<std::uint32_t>(
+                         pvec[snodes.size() - 1][s2]) +
+                     parsimony_chart_detail::transition_cost(r, s2);
+            if (v < pb2) pb2 = v;
+          }
+          if (pb2 + msum != best)
+            std::fprintf(stderr,
+                         "walkcheck: g=%zu r=%u free=%u pinned=%llu "
+                         "msum=%llu diff=%lld\n",
+                         g, r, best,
+                         static_cast<unsigned long long>(pb2),
+                         static_cast<unsigned long long>(msum),
+                         static_cast<long long>(pb2 + msum) -
+                             static_cast<long long>(best));
+        }
       }
       prof[g] = std::move(out);
     }
@@ -1415,47 +1630,6 @@ void run_tension(std::string const& dag_path, std::string const& witness_path,
 // carrying exactly those states, hung under every root production of the
 // part grammar, makes profile deviation cost 1/site inside the normal
 // materialize path -- no chart surgery.
-
-struct vleaf_profile {
-  // state[g][r] = attachment state for active pattern g at reference
-  // state r; 0xFF = absent (hard error if a site needs it).
-  std::vector<std::array<std::uint8_t, nuc_state_count>> state;
-};
-
-vleaf_profile load_vleaf_profile(std::string const& path, int j,
-                                 std::size_t nactive) {
-  std::FILE* f = std::fopen(path.c_str(), "r");
-  if (!f) throw std::runtime_error("vleaf: cannot open profile " + path);
-  vleaf_profile prof;
-  prof.state.assign(nactive, {0xFF, 0xFF, 0xFF, 0xFF});
-  char line[512];
-  std::size_t nline = 0;
-  while (std::fgets(line, sizeof line, f)) {
-    if (line[0] == '#') continue;
-    ++nline;
-    char* p = line;
-    unsigned long long g = std::strtoull(p, &p, 10);
-    unsigned long r = std::strtoul(p, &p, 10);
-    std::strtoul(p, &p, 10);  // count (unused here)
-    while (*p == ' ') ++p;
-    unsigned col = 0;
-    std::uint8_t s = 0xFF;
-    while (*p >= 'A' && *p <= 'T') {
-      if (col == static_cast<unsigned>(j)) s = static_cast<std::uint8_t>(*p - 'A');
-      ++col;
-      ++p;
-    }
-    if (col <= static_cast<unsigned>(j) || s == 0xFF)
-      throw std::runtime_error("vleaf: profile line lacks part column " +
-                               std::to_string(j));
-    if (g >= nactive) throw std::runtime_error("vleaf: profile gidx range");
-    if (r >= nuc_state_count) throw std::runtime_error("vleaf: profile ref");
-    prof.state[g][static_cast<std::uint8_t>(r)] = s;
-  }
-  std::fclose(f);
-  std::fprintf(stderr, "vleaf: profile lines=%zu column=%d\n", nline, j);
-  return prof;
-}
 
 compact_genome build_profile_cg(grammar_ctx const& gctx,
                                 std::string const& reference,
