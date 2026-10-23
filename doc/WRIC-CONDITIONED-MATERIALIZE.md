@@ -137,3 +137,53 @@ parts (bias penalties 1-6), and the parts whose profiles were "outvoted"
 PartOpt_j - pinned_j (currently only bracketed by 0 <= residual and the
 52-unit bias evidence), which is precisely the Phase-3 branch guide.
 Artifacts: /tmp/v0/npart/bias/ (aug, biased_wit, wit2, bias.tsv, logs).
+
+## 7. Phase 2 executed (2026-10-22/23)
+
+Implementation (readout-only design, after two corrections):
+- `root_state_clamp_map` (chart_options, null by default): per local
+  pattern, PINNED SITE SUBGROUPS (ref, forced, count).  Subgroups are
+  necessary: distinct global profile rows can restrict to the same local
+  pattern with different pins (measured: rare; carrier has 2).
+- Exact subgroup readouts in the trim objective: clamped invariant offset
+  (pinned invariant patterns pay [a!=u]+[a!=r], uncovered sites stay free),
+  weighted root scores (setup composite, selected-topology scoring), and
+  `lower_bound_for_entry` at the ROOT clade only (below the root a pinned
+  readout is not a valid bound -- leaf rows carry INF at unpresentable
+  states; the free outside bound remains valid everywhere).
+- `profile_dedup` is UNSOUND under the clamped readout (same-mask entries
+  differ at pinned non-argmin states, not by the B gap): the CLI forces it
+  off under clamp (this disables the lazy one-witness route); score-only
+  dominance and cross-profile dominance stay available.  SPR/lazy search
+  scorers reject a non-null clamp loudly.
+- Validation oracle: Fitch/rebuilt validators are free-label and
+  pattern-index specific; under clamp the emitted topologies' exact
+  clamped re-score is the oracle (throw-on-mismatch).
+- CLI `--chart-bnb-root-clamp <file> <col>` (part-local subgroup file;
+  excess-count validation).  Generator: `wric_tension_map vleaf clampgen`
+  (signature matching over sorted sample ids; reports conflicts, coverage,
+  clamped invariant delta).  `vleaf profgen` emits witness-argmin profiles
+  for fixtures.
+
+Fixtures (all pass): gap-0 part at resp-argmin profile -> 963 = certified
+= part_lb (triple equality); witness-argmin clamp -> 211 = certified;
+joint profile slot 23 -> 212 = biased_opt = at_profile (theory-pinned).
+
+Results (24/24, crown 6.5 h without dedup vs 25 min biased):
+- Exact per-part residuals r_j = PartOpt_j - clamped composite_j:
+  11 parts at 0 (profile realizable at per-site minima); top: part_04 10,
+  crown 7, part_03/frag_01 4, part_07/frag_231 3.  **Sum = 44.**
+- U'_exact (profile-pinned realization) = 59,726 + 44 = **59,770** --
+  two ABOVE U: the LB profile is provably not the fold's optimal profile.
+- Mixed realization (23 clamped + crown certified, free labels): 59,768
+  == U.  All-clamped witness realization: 59,768.
+- Certificate unchanged: **[59,726, 59,768]**, gap 42, now fully
+  explained: 44 units of pinned-realization loss at the LB profile minus
+  2 units recovered by free-label state mixing.
+
+Reading: Phase 2 delivered the exact Phase-3 branch guide (part_04 and
+crown hold 17 of the 44), and certified that no profile-following fold
+realization beats U by this route -- closing the remaining 42 needs
+branching AWAY from the LB profile (Phase 3: re-profile + re-clamp per
+branch; crown branches cost ~6.5 h each without a clamp-sound dedup).
+Artifacts: /tmp/v0/npart/clamp/ (clamp files, wit/, clamp.tsv, logs).

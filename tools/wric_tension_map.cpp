@@ -1614,6 +1614,154 @@ void run_vleaf_strip(std::string const& in_path, std::string const& out_path) {
                out_path.c_str());
 }
 
+// Part-local clamp file generation for --chart-bnb-root-clamp: maps the
+// global fold LB profile column <col> onto the part grammar's own pattern
+// enumeration (signature matching over sorted part sample ids), emitting
+// "<pattern_idx> <ref> <forced> <count>" subgroup lines.  Reports subgroup
+// conflicts (distinct global rows restricting to the same local pattern
+// with different pins) and validates full site coverage.
+void run_vleaf_clampgen(std::string const& global_path,
+                        std::string const& profile_path, int j,
+                        std::string const& part_path,
+                        std::string const& out_path) {
+  auto gctx = prepare(global_path);
+  auto prof = load_vleaf_profile(profile_path, j, gctx.active.size());
+  auto pctx = prepare(part_path);
+
+  // Global sample id -> global taxon.
+  std::unordered_map<std::string, std::uint32_t> gtaxon_of_sid;
+  for (std::uint32_t t = 0;
+       t < gctx.grammar.taxa.id_to_sample_id.size(); ++t)
+    gtaxon_of_sid.emplace(gctx.grammar.taxa.id_to_sample_id[t], t);
+
+  // Part taxa in canonical (sorted sample id) order.
+  std::size_t np = pctx.grammar.taxa.id_to_sample_id.size();
+  std::vector<std::uint32_t> ptaxon_of_canon(np);
+  for (std::uint32_t t = 0; t < np; ++t)
+    ptaxon_of_canon[pctx.canon_of_taxon[t]] = t;
+
+  // Signature dictionary over ALL part patterns (active and invariant).
+  struct sig_hash {
+    std::size_t operator()(std::vector<std::uint8_t> const& v) const noexcept {
+      return std::hash<std::string_view>{}(
+          std::string_view(reinterpret_cast<char const*>(v.data()), v.size()));
+    }
+  };
+  std::unordered_map<std::vector<std::uint8_t>, std::size_t, sig_hash>
+      part_of_sig;
+  part_of_sig.reserve(pctx.patterns.patterns.size() * 2);
+  for (std::size_t i = 0; i < pctx.patterns.patterns.size(); ++i) {
+    auto const& pattern = pctx.patterns.patterns[i];
+    std::vector<std::uint8_t> sig(np);
+    for (std::uint32_t t = 0; t < np; ++t)
+      sig[pctx.canon_of_taxon[t]] = pattern.state_by_taxon[t];
+    if (!part_of_sig.emplace(std::move(sig), i).second)
+      throw std::runtime_error("clampgen: duplicate part signature");
+  }
+
+  // Accumulate subgroups per part pattern; track conflicts + coverage.
+  std::map<std::pair<std::size_t, std::uint8_t>,
+           std::map<std::uint8_t, std::uint32_t>>
+      pins;  // (pidx, r) -> forced -> count
+  std::size_t conflicts = 0, matched = 0;
+  std::vector<std::uint8_t> sig(np);
+  for (std::size_t g = 0; g < gctx.active.size(); ++g) {
+    auto const& info = gctx.active[g];
+    for (std::uint32_t c = 0; c < np; ++c) {
+      auto it = gtaxon_of_sid.find(
+          pctx.grammar.taxa.id_to_sample_id[ptaxon_of_canon[c]]);
+      if (it == gtaxon_of_sid.end())
+        throw std::runtime_error("clampgen: part leaf not in global");
+      sig[c] = info.state_by_taxon[it->second];
+    }
+    auto found = part_of_sig.find(sig);
+    if (found == part_of_sig.end())
+      throw std::runtime_error("clampgen: restriction signature not found");
+    ++matched;
+    auto const& rc = info.reference_state_counts;
+    for (std::uint8_t r = 0; r < nuc_state_count; ++r) {
+      if (!rc[r]) continue;
+      auto s = prof.state[g][r];
+      if (s == 0xFF)
+        throw std::runtime_error("clampgen: profile entry missing");
+      auto& slot = pins[{found->second, r}];
+      if (!slot.empty() && slot.begin()->first != s) ++conflicts;
+      slot[s] += rc[r];
+    }
+  }
+
+  // Coverage check against the part patterns' own reference counts.
+  std::size_t coverage_mismatch = 0;
+  std::uint64_t clamped_invariant_delta = 0;
+  for (auto const& [pr, slot] : pins) {
+    auto [pidx, r] = pr;
+    std::uint32_t covered = 0;
+    for (auto& [s, n] : slot) covered += n;
+    if (covered != pctx.patterns.patterns[pidx].reference_state_counts[r])
+      ++coverage_mismatch;
+    if (is_invariant_site_pattern( pctx.patterns.patterns[pidx])) {
+
+      auto u = pctx.patterns.patterns[pidx].state_by_taxon.front();
+      auto free_cost = (u != r) ? 1u : 0u;
+      for (auto& [s, n] : slot) {
+        auto clamped_cost = (s != u ? 1u : 0u) + (s != r ? 1u : 0u);
+        clamped_invariant_delta +=
+            static_cast<std::uint64_t>(n) * (clamped_cost - free_cost);
+      }
+    }
+  }
+
+  std::FILE* f = std::fopen(out_path.c_str(), "w");
+  if (!f) throw std::runtime_error("clampgen: cannot write " + out_path);
+  std::fprintf(f, "# vleaf clampgen col=%d global=%s part=%s\n", j,
+               global_path.c_str(), part_path.c_str());
+  for (auto const& [pr, slot] : pins) {
+    for (auto const& [s, n] : slot)
+      std::fprintf(f, "%zu %u %u %u\n", pr.first, pr.second, s, n);
+  }
+  std::fclose(f);
+  std::fprintf(stderr,
+               "clampgen: %zu global active matched, %zu (pattern,ref) "
+               "groups, %zu conflicts, %zu coverage mismatches, clamped "
+               "invariant delta=%llu\n",
+               matched, pins.size(), conflicts, coverage_mismatch,
+               static_cast<unsigned long long>(clamped_invariant_delta));
+}
+
+// Witness-argmin profile: per (global active pattern g, reference state r)
+// the state minimizing (witness_row[s] + [s!=r]).  Any witness-argmin
+// profile is jointly realizable by the witness tree (root labels are free
+// per position), so a trim clamped at it must return exactly the witness's
+// certified optimum -- the strongest regression fixture for the clamp.
+void run_vleaf_profgen(std::string const& global_path,
+                       std::string const& wit_path,
+                       std::string const& out_path) {
+  auto gctx = prepare(global_path);
+  std::unordered_map<std::string, std::uint32_t> taxon_of_sid;
+  for (std::uint32_t t = 0; t < gctx.grammar.taxa.id_to_sample_id.size(); ++t)
+    taxon_of_sid.emplace(gctx.grammar.taxa.id_to_sample_id[t], t);
+  auto rows = witness_rows(wit_path, gctx, taxon_of_sid);
+  std::FILE* f = std::fopen(out_path.c_str(), "w");
+  if (!f) throw std::runtime_error("profgen: cannot write " + out_path);
+  std::fprintf(f, "# witness-argmin profile (single part)\n");
+  for (std::size_t g = 0; g < gctx.active.size(); ++g) {
+    auto const& rc = gctx.active[g].reference_state_counts;
+    for (std::uint8_t r = 0; r < nuc_state_count; ++r) {
+      if (!rc[r]) continue;
+      std::uint8_t best = 0;
+      std::uint32_t bestv = ~0u;
+      for (std::uint8_t s2 = 0; s2 < nuc_state_count; ++s2) {
+        auto v = rows.m[g][s2] + (s2 == r ? 0 : 1);
+        if (v < bestv) { bestv = v; best = s2; }
+      }
+      std::fprintf(f, "%zu %u %u %c\n", g, r, rc[r], 'A' + best);
+    }
+  }
+  std::fclose(f);
+  std::fprintf(stderr, "profgen: witness-argmin profile written to %s\n",
+               out_path.c_str());
+}
+
 void run_vleaf_ub(std::string const& global_path, std::string const& wit_path,
                   std::string const& profile_path, int j) {
   auto gctx = prepare(global_path);
@@ -1658,6 +1806,8 @@ int main(int argc, char** argv) {
                  "[part2.pb.gz ...]\n"
                  "       %s scaffold <lb|wit> <global.pb.gz> <scaffold_bin.pb.gz> "
                  "<ids_prefix> <rows_prefix> <np> <out.profile> [expected]\n"
+                 "       %s vleaf clampgen <global.pb.gz> <profile> <col> "
+                 "<part.pb.gz> <out.clamp>\n"
                  "       %s vleaf add <part.pb.gz> <global.pb.gz> <profile> "
                  "<j> <out.pb.gz>\n"
                  "       %s vleaf strip <biased_tree.pb.gz> <out.pb.gz>\n"
@@ -1677,6 +1827,13 @@ int main(int argc, char** argv) {
       closure.expected_total2 = std::strtoull(argv[7], nullptr, 10);
       run_tension(argv[2], argv[3], std::strtoull(argv[4], nullptr, 10),
                   closure);
+    } else if (mode == "vleaf" && std::string(argv[2]) == "profgen" &&
+               argc == 6) {
+      run_vleaf_profgen(argv[3], argv[4], argv[5]);
+    } else if (mode == "vleaf" && std::string(argv[2]) == "clampgen" &&
+               argc == 8) {
+      run_vleaf_clampgen(argv[3], argv[4], std::atoi(argv[5]), argv[6],
+                         argv[7]);
     } else if (mode == "vleaf" && argc >= 3 && std::string(argv[2]) == "add" &&
                argc == 8) {
       run_vleaf_add(argv[3], argv[4], argv[5], std::atoi(argv[6]), argv[7]);

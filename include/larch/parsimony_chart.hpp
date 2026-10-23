@@ -18,10 +18,31 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <memory>
 #include <utility>
 #include <vector>
 
 namespace larch {
+
+// WRIC conditioned-materialize root clamp (doc/WRIC-CONDITIONED-
+// MATERIALIZE.md phase 2): forces the root state per site, expressed as
+// subgroups of a pattern's reference-state counts (several global fold-LB
+// profile rows may restrict to the same local pattern with different
+// pinned states).  Consumed ONLY by multisite trim objective readouts
+// (clamped_weighted_root_score_from_row and the frontier lower-bound
+// readout); SPR/lazy search wrappers reject a non-null clamp loudly.
+struct root_state_clamp_map {
+  struct subgroup {
+    std::uint8_t reference_state;
+    std::uint8_t forced_state;
+    std::uint32_t count;
+  };
+  // exact local pattern index -> pinned site subgroups (counts must sum to
+  // the pattern's reference_state_counts per reference state)
+  std::unordered_map<std::size_t, std::vector<subgroup>> subgroups;
+};
+
 
 using chart_cost = std::uint32_t;
 inline constexpr chart_cost chart_inf =
@@ -104,6 +125,10 @@ struct chart_options {
   // 0 means unlimited. If non-zero and keep_trace=true, construction throws
   // before exceeding this many stored chart_choice records.
   std::size_t max_trace_choices = 0;
+  // WRIC root clamp; see root_state_clamp_map above.  Consumed only by the
+  // multisite trim objective seams (outside boundary rows, weighted root
+  // scores, selected-topology scoring); null by default.
+  std::shared_ptr<root_state_clamp_map const> root_state_clamp;
 };
 
 enum class arity_gate_consumer : std::size_t {

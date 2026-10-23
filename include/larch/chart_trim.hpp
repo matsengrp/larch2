@@ -2038,6 +2038,49 @@ inline std::uint64_t invariant_constant_offset(site_pattern_set const& patterns,
     auto invariant_state = pattern.state_by_taxon.front();
     parsimony_chart_detail::validate_state(invariant_state,
                                            "invariant pattern state");
+    // WRIC root clamp: a pinned invariant pattern pays [forced!=u] on the
+    // root edge below plus the UA edge, per site, instead of the free
+    // [u!=r]; the row readout is 0 at u and 1 elsewhere.
+    if (options.root_state_clamp) {
+      auto it = options.root_state_clamp->subgroups.find(pattern_index);
+      if (it != options.root_state_clamp->subgroups.end()) {
+        std::array<std::uint32_t, nuc_state_count> covered{};
+        for (auto const& sg : it->second) {
+          parsimony_chart_detail::validate_state(sg.forced_state,
+                                                 "root clamp state");
+          if (sg.count > pattern.reference_state_counts[sg.reference_state] -
+                            covered[sg.reference_state]) {
+            throw std::runtime_error(
+                "chart trim: clamped invariant subgroup counts exceed the "
+                "pattern's reference-state counts");
+          }
+          covered[sg.reference_state] += sg.count;
+          auto cost = static_cast<chart_cost>(
+              (sg.forced_state == invariant_state ? 0 : 1) +
+              parsimony_chart_detail::transition_cost(sg.reference_state,
+                                                      sg.forced_state));
+          total = checked_add_u64(
+              total,
+              checked_mul_cost(sg.count, cost, "clamped invariant offset"),
+              "clamped invariant offset total");
+        }
+        // Uncovered sites (e.g. globally invariant positions with no profile
+        // row) stay free.
+        for (std::uint8_t reference_state = 0;
+             reference_state < nuc_state_count; ++reference_state) {
+          auto count = pattern.reference_state_counts[reference_state] -
+                       covered[reference_state];
+          if (count == 0) continue;
+          auto cost = parsimony_chart_detail::transition_cost(
+              reference_state, invariant_state);
+          total = checked_add_u64(
+              total,
+              checked_mul_cost(count, cost, "invariant UA-edge offset"),
+              "invariant UA-edge offset total");
+        }
+        continue;
+      }
+    }
     for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
          ++reference_state) {
       auto count = pattern.reference_state_counts[reference_state];
@@ -2072,6 +2115,46 @@ inline std::uint64_t invariant_constant_offset(
     auto invariant_state = pattern.state_by_taxon.front();
     parsimony_chart_detail::validate_state(invariant_state,
                                            "invariant pattern state");
+    // WRIC root clamp (see the site_pattern_set overload above); the unit
+    // Hamming convention keeps plan and grammar transition costs equal.
+    if (options.root_state_clamp) {
+      auto it = options.root_state_clamp->subgroups.find(pattern_index);
+      if (it != options.root_state_clamp->subgroups.end()) {
+        std::array<std::uint32_t, nuc_state_count> covered{};
+        for (auto const& sg : it->second) {
+          parsimony_chart_detail::validate_state(sg.forced_state,
+                                                 "root clamp state");
+          if (sg.count > pattern.reference_state_counts[sg.reference_state] -
+                            covered[sg.reference_state]) {
+            throw std::runtime_error(
+                "chart trim: clamped invariant subgroup counts exceed the "
+                "pattern's reference-state counts");
+          }
+          covered[sg.reference_state] += sg.count;
+          auto cost = static_cast<chart_cost>(
+              (sg.forced_state == invariant_state ? 0 : 1) +
+              static_cast<chart_cost>(plan.transition_cost(
+                  sg.reference_state, sg.forced_state)));
+          total = checked_add_u64(
+              total,
+              checked_mul_cost(sg.count, cost, "clamped invariant offset"),
+              "clamped invariant offset total");
+        }
+        for (std::uint8_t reference_state = 0;
+             reference_state < nuc_state_count; ++reference_state) {
+          auto count = pattern.reference_state_counts[reference_state] -
+                       covered[reference_state];
+          if (count == 0) continue;
+          auto cost = static_cast<chart_cost>(
+              plan.transition_cost(reference_state, invariant_state));
+          total = checked_add_u64(
+              total,
+              checked_mul_cost(count, cost, "invariant UA-edge offset"),
+              "invariant UA-edge offset total");
+        }
+        continue;
+      }
+    }
     for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
          ++reference_state) {
       auto count = pattern.reference_state_counts[reference_state];
@@ -2163,6 +2246,97 @@ struct active_pattern_info {
   std::array<single_site_outside_chart, nuc_state_count> outside_by_reference;
 };
 
+// WRIC root clamp: core subgroup readout over a root row and per-reference
+// counts (no site_pattern dependency, so frontier lower bounds can share
+// it).  Assumes a non-null clamp and a clamped pattern index.
+inline std::uint64_t clamped_root_readout_from_counts(
+    chart_row const& row, std::array<std::uint32_t, nuc_state_count> const& rc,
+    std::size_t pattern_index, chart_options const& options) {
+  auto it = options.root_state_clamp->subgroups.find(pattern_index);
+  if (it == options.root_state_clamp->subgroups.end()) {
+    throw std::runtime_error(
+        "chart trim: clamped readout on an unclamped pattern");
+  }
+  std::array<std::uint32_t, nuc_state_count> covered{};
+  std::uint64_t total = 0;
+  for (auto const& sg : it->second) {
+    if (sg.reference_state >= nuc_state_count) {
+      throw std::runtime_error("chart trim: root clamp bad reference state");
+    }
+    parsimony_chart_detail::validate_state(sg.forced_state,
+                                           "root clamp state");
+    if (sg.count > rc[sg.reference_state] - covered[sg.reference_state]) {
+      throw std::runtime_error(
+          "chart trim: root clamp subgroup counts exceed the pattern's "
+          "reference-state counts");
+    }
+    covered[sg.reference_state] += sg.count;
+    total = checked_add_u64(
+        total,
+        checked_mul_cost(
+            sg.count,
+            parsimony_chart_detail::saturated_add(
+                row[sg.forced_state],
+                parsimony_chart_detail::transition_cost(
+                    sg.reference_state, sg.forced_state)),
+            "weighted clamped root-edge cost"),
+        "weighted clamped root-edge total");
+  }
+  for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
+       ++reference_state) {
+    auto uncovered = rc[reference_state] - covered[reference_state];
+    if (uncovered == 0) continue;
+    chart_cost best = chart_inf;
+    for (std::uint8_t root_state = 0; root_state < nuc_state_count;
+         ++root_state) {
+      best = std::min(
+          best, parsimony_chart_detail::saturated_add(
+                    row[root_state], parsimony_chart_detail::transition_cost(
+                                         reference_state, root_state)));
+    }
+    total = checked_add_u64(
+        total,
+        checked_mul_cost(uncovered, best,
+                         "weighted clamped root-edge cost"),
+        "weighted clamped root-edge total");
+  }
+  return total;
+}
+
+// WRIC root clamp: weighted root score with the root state pinned per site
+// subgroup (several subgroups may share a pattern when distinct global fold
+// profile rows restrict to the same local pattern).  Falls back to the free
+// readout when no clamp is set or the pattern is unclamped; uncovered
+// reference-state counts stay free.  Only multisite trim objective seams
+// call this; SPR/lazy search paths must not.
+inline std::uint64_t clamped_weighted_root_score_from_row(
+    chart_row const& row, site_pattern const& pattern,
+    std::size_t pattern_index, chart_options const& options) {
+  if (!options.root_state_clamp ||
+      options.root_state_clamp->subgroups.find(pattern_index) ==
+          options.root_state_clamp->subgroups.end()) {
+    return weighted_root_score_from_row(row, pattern, options);
+  }
+  if (!options.score_ua_edge) {
+    throw std::runtime_error(
+        "chart trim: root clamp requires score_ua_edge");
+  }
+  validate_pattern_reference_counts(pattern, pattern_index);
+  return clamped_root_readout_from_counts(
+      row, pattern.reference_state_counts, pattern_index, options);
+}
+
+inline std::uint64_t clamped_weighted_root_score_from_row(
+    chart_execution_plan const& plan, chart_row const& row,
+    site_pattern const& pattern, std::size_t pattern_index,
+    chart_options const& options) {
+  // The unit-Hamming convention makes the plan and grammar transition costs
+  // identical; delegate to the counts-based core.
+  (void)plan;
+  return clamped_weighted_root_score_from_row(row, pattern, pattern_index,
+                                              options);
+}
+
 inline std::vector<active_pattern_info> build_active_pattern_info(
     clade_grammar const& grammar, site_pattern_set const& patterns,
     chart_options const& options) {
@@ -2249,7 +2423,8 @@ inline std::vector<active_pattern_info> build_active_pattern_info(
 inline std::uint64_t lower_bound_for_entry(
     frontier_entry const& entry, clade_id clade,
     std::vector<active_pattern_info> const& active,
-    std::uint64_t invariant_offset, chart_options const& options) {
+    std::uint64_t invariant_offset, chart_options const& options,
+    bool at_root = false) {
   std::uint64_t total = invariant_offset;
   if (entry.f.cost.size() != active.size() * nuc_state_count) {
     throw std::runtime_error(
@@ -2275,6 +2450,27 @@ inline std::uint64_t lower_bound_for_entry(
                            "weighted active-pattern lower bound"),
           "active-pattern lower-bound total");
     } else {
+      // WRIC root clamp: at the ROOT clade the subgroup readout over the
+      // entry's cost vector is the exact clamped contribution; below the
+      // root it is not a valid bound (a clade row pinned to a state the
+      // clade cannot present is INF while completions remain finite), so
+      // only the free outside bound applies there.
+      std::uint64_t clamped_score = 0;
+      bool has_clamp = false;
+      if (options.root_state_clamp && at_root) {
+        has_clamp = options.root_state_clamp->subgroups.find(
+                        info.pattern_index) !=
+                    options.root_state_clamp->subgroups.end();
+        if (has_clamp) {
+          chart_row row;
+          for (std::uint8_t state = 0; state < nuc_state_count; ++state) {
+            row[state] = entry.f.cost[cost_index(active_index, state)];
+          }
+          clamped_score = clamped_root_readout_from_counts(
+              row, info.reference_state_counts, info.pattern_index, options);
+        }
+      }
+      std::uint64_t free_score = 0;
       for (std::uint8_t reference_state = 0; reference_state < nuc_state_count;
            ++reference_state) {
         auto count = info.reference_state_counts[reference_state];
@@ -2291,13 +2487,16 @@ inline std::uint64_t lower_bound_for_entry(
                                  entry.f.cost[cost_index(active_index, state)],
                                  outside.outside[clade][state]));
         }
-        total = checked_add_u64(
-            total,
+        free_score = checked_add_u64(
+            free_score,
             checked_mul_cost(count, best,
                              "weighted active-pattern root-edge lower "
                              "bound"),
             "active-pattern root-edge lower-bound total");
       }
+      total = checked_add_u64(
+          total, has_clamp ? std::max(free_score, clamped_score) : free_score,
+          "active-pattern lower-bound total");
     }
   }
   return total;
@@ -3034,9 +3233,11 @@ inline std::uint64_t score_selected_topology(clade_grammar const& grammar,
       validate_pattern_reference_counts(pattern, pattern_index);
     if (!is_active_pattern(pattern)) continue;
     auto row = restricted_topology_row(grammar, pattern, topo);
-    total = checked_add_u64(total,
-                            weighted_root_score_from_row(row, pattern, options),
-                            "selected topology score");
+    total = checked_add_u64(
+        total,
+        clamped_weighted_root_score_from_row(row, pattern, pattern_index,
+                                              options),
+        "selected topology score");
   }
   return total;
 }
@@ -3215,7 +3416,9 @@ inline std::uint64_t score_selected_topology(
     if (!is_active_pattern(pattern)) continue;
     auto row = restricted_topology_row(plan, pattern, topo);
     total = checked_add_u64(
-        total, weighted_root_score_from_row(plan, row, pattern, options),
+        total,
+        clamped_weighted_root_score_from_row(plan, row, pattern, pattern_index,
+                                              options),
         "selected topology score");
   }
   return total;
@@ -3783,28 +3986,34 @@ inline chart_plan_fingerprint exact_setup_structural_fingerprint(
 
 inline std::uint64_t exact_setup_weighted_root_score(
     clade_grammar const& grammar, single_site_chart const& chart,
-    site_pattern const& pattern, chart_options const& options) {
-  return weighted_root_score_from_row(chart.inside[grammar.root_clade], pattern,
-                                      options);
+    site_pattern const& pattern, chart_options const& options,
+    std::size_t pattern_index = static_cast<std::size_t>(-1)) {
+  return clamped_weighted_root_score_from_row(
+      chart.inside[grammar.root_clade], pattern, pattern_index, options);
 }
 
 inline std::uint64_t exact_setup_weighted_root_score(
     chart_execution_plan const& plan, single_site_chart const& chart,
-    site_pattern const& pattern, chart_options const& options) {
-  return weighted_root_score_from_row(
-      plan, chart.inside[plan.root_clade()], pattern, options);
+    site_pattern const& pattern, chart_options const& options,
+    std::size_t pattern_index = static_cast<std::size_t>(-1)) {
+  return clamped_weighted_root_score_from_row(
+      plan, chart.inside[plan.root_clade()], pattern, pattern_index, options);
 }
 
 inline std::uint64_t exact_setup_weighted_topology_root_score(
     clade_grammar const&, chart_row const& row, site_pattern const& pattern,
-    chart_options const& options) {
-  return weighted_root_score_from_row(row, pattern, options);
+    chart_options const& options,
+    std::size_t pattern_index = static_cast<std::size_t>(-1)) {
+  return clamped_weighted_root_score_from_row(row, pattern, pattern_index,
+                                              options);
 }
 
 inline std::uint64_t exact_setup_weighted_topology_root_score(
     chart_execution_plan const& plan, chart_row const& row,
-    site_pattern const& pattern, chart_options const& options) {
-  return weighted_root_score_from_row(plan, row, pattern, options);
+    site_pattern const& pattern, chart_options const& options,
+    std::size_t pattern_index = static_cast<std::size_t>(-1)) {
+  return clamped_weighted_root_score_from_row(plan, row, pattern,
+                                              pattern_index, options);
 }
 
 inline std::uint64_t exact_setup_invariant_constant_offset(
@@ -3968,7 +4177,8 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside(
 
     setup.composite_lower_bound = checked_add_u64(
         setup.composite_lower_bound,
-        exact_setup_weighted_root_score(structural, chart, pattern, options),
+        exact_setup_weighted_root_score(structural, chart, pattern, options,
+                                        pattern_index),
         "exact setup composite lower bound");
 
     active_pattern_info info;
@@ -4086,7 +4296,8 @@ inline void build_scheduled_multisite_exact_pattern_slot(
   }
 
   result.weighted_root_score =
-      exact_setup_weighted_root_score(structural, chart, pattern, options);
+      exact_setup_weighted_root_score(structural, chart, pattern, options,
+                                      pattern_index);
 
   active_pattern_info info;
   info.pattern_index = pattern_index;
@@ -4290,7 +4501,7 @@ inline multisite_exact_setup build_multisite_exact_setup_from_inside_scheduled(
                     structural, pattern,
                     upper_bound_topologies[topology_index]);
                 contributions[flat] = exact_setup_weighted_topology_root_score(
-                    structural, row, pattern, options);
+                    structural, row, pattern, options, pattern_index);
               } catch (...) {
                 errors[flat] = std::current_exception();
                 break;
@@ -4379,8 +4590,8 @@ inline std::uint64_t score_selected_topology_scheduled(
             if (!is_active_pattern(pattern)) continue;
             auto row = restricted_topology_row(structural, pattern, topology);
             pattern_scores[pattern_index] =
-                exact_setup_weighted_topology_root_score(structural, row,
-                                                         pattern, options);
+                exact_setup_weighted_topology_root_score(
+                    structural, row, pattern, options, pattern_index);
           } catch (...) {
             errors[pattern_index] = std::current_exception();
             break;
@@ -7131,7 +7342,8 @@ inline std::uint64_t compute_root_frontier_optimum_and_update_mask(
     auto score =
         lower_bound_for_entry(entry, grammar.root_clade,
                               build.active_pattern_view(),
-                              build.invariant_constant_offset, options);
+                              build.invariant_constant_offset, options,
+                              /*at_root=*/true);
     if (score < optimum) {
       optimum = score;
       if (merge_exact_keep_mask) {
@@ -7166,7 +7378,8 @@ inline std::uint64_t compute_root_frontier_optimum_and_update_mask(
   for (auto const& entry : root_frontier) {
     auto score = lower_bound_for_entry(entry, plan.root_clade(),
                                        build.active_pattern_view(),
-                                       build.invariant_constant_offset, options);
+                                       build.invariant_constant_offset,
+                                       options, /*at_root=*/true);
     if (score < optimum) {
       optimum = score;
       if (merge_exact_keep_mask) {
@@ -7191,7 +7404,8 @@ inline void capture_optimal_root_provenance_classes(
     auto score =
         lower_bound_for_entry(entry, grammar.root_clade,
                               build.active_pattern_view(),
-                              build.invariant_constant_offset, options);
+                              build.invariant_constant_offset, options,
+                              /*at_root=*/true);
     if (score != optimum) continue;
     if (entry.used_production.size() != grammar.productions.size()) {
       throw std::runtime_error(
@@ -8074,7 +8288,8 @@ inline multisite_topology_trace_result finish_multisite_topology_trace(
        ++entry_index) {
     auto score = lower_bound_for_entry(
         root_frontier[entry_index], grammar.root_clade,
-        build.active_pattern_view(), result.invariant_constant_offset, options);
+        build.active_pattern_view(), result.invariant_constant_offset,
+        options, /*at_root=*/true);
     if (score < result.optimum) {
       result.optimum = score;
       optimal_root_entries.clear();
@@ -8240,7 +8455,8 @@ build_multisite_coupled_frontier_trim(
        ++entry_index) {
     auto score = lower_bound_for_entry(
         root_frontier[entry_index], grammar.root_clade,
-        build.active_pattern_view(), result.invariant_constant_offset, options);
+        build.active_pattern_view(), result.invariant_constant_offset,
+        options, /*at_root=*/true);
     if (score < result.optimum) {
       result.optimum = score;
       optimal_root_entries.clear();

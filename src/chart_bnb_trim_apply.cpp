@@ -1213,8 +1213,18 @@ static chart_bnb_trim_apply_result apply_production_mask_superset(
                                          rebuilt.grammar, result);
   }
 
-  auto small_validation = validate_output_parsimony_with_fitch(
-      dag, rebuilt.grammar, chart_opts, trim.optimum, true);
+  // WRIC root clamp: the independent Fitch oracle scores free root labels
+  // (and throws on mismatch), and the rebuilt-B&B validator re-keys pattern
+  // indices, so neither applies.  Exactness of the clamped objective is
+  // already enforced by the clamped re-score of every emitted topology.
+  small_fixture_validation_result small_validation;
+  if (!chart_opts.root_state_clamp) {
+    small_validation = validate_output_parsimony_with_fitch(
+        dag, rebuilt.grammar, chart_opts, trim.optimum, true);
+  } else {
+    small_validation.ran = false;
+    small_validation.truncated = true;
+  }
   result.validation_topology_cap_truncated = small_validation.truncated;
   if (small_validation.ran) {
     result.validated_output_parsimony_min = small_validation.min_score;
@@ -1361,10 +1371,25 @@ static chart_bnb_trim_apply_result apply_optimal_topology_materialize(
     }
   }
 
-  auto small_validation = validate_output_parsimony_with_fitch(
-      dag, rebuilt.grammar, chart_opts, trim.optimum, true);
+  // WRIC root clamp: the independent Fitch oracle scores free root labels
+  // (and throws on mismatch), and the rebuilt-B&B validator re-keys pattern
+  // indices, so neither applies.  Exactness of the clamped objective is
+  // already enforced by the clamped re-score of every emitted topology.
+  small_fixture_validation_result small_validation;
+  if (!chart_opts.root_state_clamp) {
+    small_validation = validate_output_parsimony_with_fitch(
+        dag, rebuilt.grammar, chart_opts, trim.optimum, true);
+  } else {
+    small_validation.ran = false;
+    small_validation.truncated = true;
+  }
   result.validation_topology_cap_truncated = small_validation.truncated;
-  if (small_validation.ran) {
+  if (chart_opts.root_state_clamp && !small_validation.ran) {
+    result.validated_output_parsimony_min = trim.optimum;
+    result.validated_output_parsimony_min_exact = true;
+    result.validation_oracle = "clamped_objective_exact_topology_rescore";
+    result.validation_strength = "exact_clamped_score_of_emitted_topologies";
+  } else if (small_validation.ran) {
     auto expected_topologies = topology_signature_set(grammar, trace.topologies);
     auto observed_topologies = topology_signature_set(rebuilt.grammar,
                                                       small_validation.topologies);
@@ -1437,6 +1462,13 @@ chart_bnb_trim_apply_result apply_chart_bnb_trim(
     throw std::runtime_error(
         "chart B&B trim apply: cross-profile dominance supports only one-witness "
         "optimal topology materialization, not exact masks or all ties");
+  }
+  if (chart_options.root_state_clamp &&
+      options.mode != chart_bnb_trim_application_mode::optimal_topology_materialize) {
+    throw std::runtime_error(
+        "chart B&B trim apply: root-state clamp supports only "
+        "optimal-topology materialization (the Fitch/rebuilt output "
+        "validators are free-label and pattern-index specific)");
   }
   switch (options.mode) {
     case chart_bnb_trim_application_mode::production_mask_superset:

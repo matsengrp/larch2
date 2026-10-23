@@ -41,6 +41,10 @@ namespace larch {
 inline std::uint64_t chart_spr_weighted_root_score_from_row(
     std::array<chart_cost, nuc_state_count> const& root_row,
     site_pattern const& pattern, chart_options const& options) {
+  if (options.root_state_clamp) {
+    throw std::runtime_error(
+        "chart spr: root-state clamp is not supported in SPR search paths");
+  }
   return chart_multisite_detail::weighted_root_score_from_row(root_row, pattern,
                                                               options);
 }

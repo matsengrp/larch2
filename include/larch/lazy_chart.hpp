@@ -3068,6 +3068,24 @@ inline std::uint64_t lazy_root_class_score_total(
     throw std::runtime_error(std::string{context} +
                              ": root inside class map was not retained");
   }
+
+  // WRIC root clamp: class-aggregated readouts cannot express a per-pattern
+  // forced state; fall back to the exact per-pattern clamped readout.
+  if (options.root_state_clamp) {
+    std::uint64_t clamped_total = 0;
+    for (std::size_t pattern_index = 0;
+         pattern_index < patterns.patterns.size(); ++pattern_index) {
+      auto const& pattern = patterns.patterns[pattern_index];
+      if (!chart_multisite_detail::is_active_pattern(pattern)) continue;
+      auto const& row = root_inside_row_for_pattern(chart, root, pattern_index);
+      clamped_total = chart_multisite_detail::checked_add_u64(
+          clamped_total,
+          chart_multisite_detail::clamped_weighted_root_score_from_row(
+              row, pattern, pattern_index, options),
+          "lazy composite clamped root total");
+    }
+    return clamped_total;
+  }
   std::vector<std::array<std::uint64_t, nuc_state_count>> counts_by_class(
       root_rows.size());
   for (auto& counts : counts_by_class) counts.fill(0);
@@ -7456,6 +7474,10 @@ inline lazy_multisite_chart build_lazy_inside_chart_active(
 inline std::uint64_t lazy_weighted_root_score_from_row(
     lazy_multisite_chart const& chart, clade_id root, std::size_t pattern_index,
     site_pattern const& pattern, chart_options const& options = {}) {
+  if (options.root_state_clamp) {
+    throw std::runtime_error(
+        "lazy chart: root-state clamp is not supported in lazy search paths");
+  }
   if (options.score_ua_edge) {
     chart_multisite_detail::validate_pattern_reference_counts(pattern,
                                                               pattern_index);
@@ -7547,9 +7569,14 @@ inline composite_chart_score lazy_composite_chart_score(
   }
 
   if (options.score_ua_edge) {
+    // WRIC root clamp: pinned invariant patterns pay a different constant;
+    // the clamp-aware invariant offset covers both skipped and enumerated
+    // invariant patterns exactly.
+    auto invariant = options.root_state_clamp
+        ? chart_multisite_detail::invariant_constant_offset(patterns, options)
+        : patterns.skipped_invariant_constant_score_with_reference_edge;
     total = chart_multisite_detail::checked_add_u64(
-        total, patterns.skipped_invariant_constant_score_with_reference_edge,
-        "lazy composite skipped invariant UA-edge offset");
+        total, invariant, "lazy composite skipped invariant UA-edge offset");
   }
   result.weighted_lower_bound = total;
   return result;
@@ -7612,9 +7639,14 @@ inline composite_chart_score lazy_composite_chart_score(
   }
 
   if (options.score_ua_edge) {
+    // WRIC root clamp: pinned invariant patterns pay a different constant;
+    // the clamp-aware invariant offset covers both skipped and enumerated
+    // invariant patterns exactly.
+    auto invariant = options.root_state_clamp
+        ? chart_multisite_detail::invariant_constant_offset(patterns, options)
+        : patterns.skipped_invariant_constant_score_with_reference_edge;
     total = chart_multisite_detail::checked_add_u64(
-        total, patterns.skipped_invariant_constant_score_with_reference_edge,
-        "lazy composite skipped invariant UA-edge offset");
+        total, invariant, "lazy composite skipped invariant UA-edge offset");
   }
   result.weighted_lower_bound = total;
   return result;
