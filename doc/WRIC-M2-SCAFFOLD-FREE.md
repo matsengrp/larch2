@@ -270,22 +270,35 @@ requires the merge pipeline path (--max-moves 0 keeps the DAG frozen);
 tension-mode scoring rejects arity-3 witnesses (use scaffold pin / wit
 instead, which accept any arity).
 
-## 9. M2.3-lite executed (2026-10-24): ZERO tau-carriers -- the plateau is
-## coupling-free at collapsed granularity
+## 9. M2.3-lite executed (2026-10-24): tree-level gap-0 is vacuous; the
+## DAG-level map ranks the span's unused freedom
 
-Tension map on the plateau megatree t1 (pinned CGs at pi-hat, score
-8,307, witness total re-confirmed by the map's own assertion chain):
+FIRST RESULT, RETRACTED same day: the tension map on the plateau
+megatree t1 printed **zero tau-carriers** (gap = 0, wrote 0 targets).
+For a TREE grammar this is vacuous by construction: per-site root-label
+choices are free, so the composite of a tree grammar equals the tree's
+exact score and the gap is identically zero.  It certifies nothing about
+other topologies.  (Kept here because the retraction is instructive.)
 
-- **coupling gap = 0 exactly** (all per-clade marginal tensions tau = 0;
-  `wrote 0 targets`).  The composite lower bound over the megatree's own
-  grammar EQUALS the witness total: every clade's optimal state choices
-  coexist; the pinned 8,307 is simultaneously realizable across clades.
-- Consequence: the directed tier of the plateau-breaking protocol has an
-  EMPTY target list at collapsed granularity.  No tension-ranked subtree
-  replacement exists; any further move must come from outside the
-  tension criterion (the megatree leaves are pinned CGs, so clade
-  coupling is already minimal by construction -- the residual 41 lives
-  part-internally, where the collapsed tree cannot see it).
+CORRECTED RESULT -- tension map on the SPR DAG (m21/mega_r8.pb.gz, the
+full 9-round merged span) with witness t1 (8,307):
+
+- witness total = **8,307**; composite strictly below; tau-carriers
+  ranked: clade 9126 (**tau=6**, 171 taxa), 13499 (tau=4, 3,831 taxa),
+  13761 (tau=2, root, 4,221 taxa), 10308 (tau=2, 258 taxa), 6871 (tau=1,
+  9 taxa), then a tau=1 tail.
+- The IN-SPAN optimum is exactly 8,307 (the SPR iter-1 readout is the
+  exact DAG-grammar DP): no recombination within the explored span can
+  beat it.  Breaking the plateau therefore requires OUT-OF-SPAN
+  topologies, and the tau-ranked clades are the protocol's directed
+  candidates for exactly that (injector replaces a subtree with a
+  topology the span never contained).
+- Matched-budget injector runs are the remaining probe: megatree-scale
+  context evals (~8.4k nodes x ~30k positions each) run ~2 orders slower
+  than the HBV-scale targets the tool was tuned on -- a 598-taxon clade
+  exceeded 4.5 h at starts=5/sweeps=15 (killed, no artifacts).  The
+  tau=6 / 171-taxon top target (m23/t9126.ids.txt) is running at
+  starts=20/sweeps=30; verdict appended when it lands.
 
 Matched-budget control (protocol formality): context-SPR injector on the
 598-taxon clade adjacent to the crown pseudo-leaf (mid clade of the
