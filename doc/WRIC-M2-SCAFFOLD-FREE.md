@@ -1,0 +1,188 @@
+# WRIC M2 — scaffold-free fold
+
+Status: planned (2026-10-24).  Follows `WRIC-V1-KERNEL-PLAN.md` (M0 response
+export, M1 scaffold-fixed coupled solve) and
+`WRIC-CONDITIONED-MATERIALIZE.md` §9 (Phase 3, corrected instruments).
+
+## 1. Goal and baselines
+
+M1 certified the fold against a FIXED scaffold binary tree
+(`scaffold_bin.pb.gz`, inherited from the split-tension re-partition):
+**[59,726, 59,767]**, gap 41 = 1 (part-23 pin deviation) + 33 (non-crown
+residuals) + 7 (crown residual).  That gap is part-INTERNAL (parse coupling
+`inside_j - M_j`); it is not attacked by M2.
+
+M2 attacks what M1 left structurally frozen: **the scaffold topology
+itself**.  The collapsed scaffold (24 part pseudo-leaves + 4,197 frozen
+real leaves + internal structure) has never been optimized as a whole;
+its edges contribute ~8,348 pinned units.  M2 searches collapsed-megatree
+topologies directly, re-conditions the parts exactly on each candidate,
+and re-certificates with the coupled DP on arbitrary topologies.
+
+| baseline | value |
+|---|---|
+| comb (all-pairs graft chain, v0) | 59,887 |
+| SPR-only control (full 29,903-leaf tree) | 59,846 |
+| v0 fold bracket | [59,781, 59,820] |
+| M1/M2-entry certificate (fixed scaffold) | **[59,726, 59,767]** |
+| scaffold-side pinned cost (pi-hat) | 8,348 |
+
+Primary success: a certified realization **U < 59,767**.  Secondary: an
+honest map of scaffold-topology slack (how many units the collapsed SPR
+search recovers).  Non-goal: closing the 41-unit part-internal gap (that
+is the in-coupled master's business, `WRIC-CONDITIONED-MATERIALIZE.md`
+§10 discussion; Architecture B converges with M2's certificate layer).
+
+## 2. Architecture
+
+### 2.1 The collapsed megatree
+
+`T_c`: a tree over 24 pseudo-taxa (one per part, labeled by sample id
+`__PART_jj`) plus the 4,197 frozen real leaves.  Every instrument needed
+already accepts it:
+
+- `wric_tension_map scaffold {wit,lb,pin} <global> <T_c> <ids_prefix>
+  ... ` — collapse_parts + the per-(g,r) DPs are scaffold-agnostic
+  (M1 ran them on `scaffold_bin.pb.gz`; any topology loads via
+  `load_tree_any`).
+- The profile export (now **part-index column order**, post-§9.1 fix)
+  re-derives pi-hat(T) for any T.
+
+### 2.2 Profile CGs and native SPR
+
+Per part j and profile column, `build_profile_cg` (vleaf machinery)
+builds a pseudo-leaf compact genome: per position, label =
+pi(g, r(site)).  Materialize T_c as a small pb DAG (4,221 leaves) and run
+**native SPR** (`larch2 --dag-pb ... -o ... -n 1 --max-moves 50`) —
+arity-unlimited, minutes at this size.  The pinned tree score
+(parsimony over pseudo CGs + frozen CGs, UA edge vs reference) is the
+search objective; it equals scaffold_at_profile(pi, T_c) exactly, so
+during search with pins held fixed the inside terms Sigma_j inside_j are
+constant and the SPR objective ranks topologies faithfully for THAT
+profile.  Profile re-export after moves restores joint fidelity.
+
+Known traps (all previously hit, all handled):
+- arity <= 63 for any chart-based scoring of T_c
+  (`polytomy_opts expand_soft_bounded,max_shapes_per_polytomy=1`);
+- the materializer binarizes augmented roots — strip unary nodes after
+  any chart-materialized topology (`vleaf strip` semantics);
+- monolithic-chart OOM does not occur by construction (the full-grammar
+  chart is never built; T_c is small).
+
+### 2.3 The iterate
+
+```
+T <- T0 (current scaffold, collapsed)
+repeat:
+  1. pi_hat(T)  <- scaffold lb export on T            (seconds)
+  2. CGs        <- build_profile_cg per part column   (seconds)
+  3. T'         <- SPR(T_c with CGs, multi-restart)   (minutes)
+  4. if pinned_score(T', pi_hat(T)) < pinned_score(T, pi_hat(T)):
+       a. pi_hat(T') <- re-export on T'               (seconds)
+       b. re-condition parts whose columns changed:
+          clamp trim at the new pins (cheap parts seconds-minutes;
+          crown ONLY if its column changed — diff first: crown pins
+          were identical to its witness-argmin at T0, re-clamp is 6.4 h)
+       c. U(T') <- scaffold wit over the part witnesses   (seconds)
+       d. T <- T'; keep min-U incumbent
+  5. plateau -> tension map + context SPR at collapsed granularity
+until no improvement
+```
+
+Step 4b is the only place per-part exactness enters, and it reuses the
+Phase-2/3 clamp pipeline wholesale (clampgen against the new profile,
+`--chart-bnb-root-clamp ... --chart-bnb-profile-dedup on`, cold trace,
+clamped-oracle validation).  Realization certification is always the
+`scaffold wit` DP over actual part witness trees — never a composite.
+
+### 2.4 Certificate semantics under topology search
+
+Each topology T gives a per-topology bracket [LB(T), U(T)] where LB(T) is
+the free coupled DP on T.  The fold-wide claims are:
+
+- **U side (valid globally)**: any realized witness set is a fold tree;
+  min over all T explored is a valid upper bound on the fold optimum.
+- **LB side (topology-conditional)**: LB(T) bounds the optimum *within*
+  T.  A fold-wide LB requires min over topologies, which search does not
+  exhaust — same epistemic status as every SPR-based U in this campaign.
+  The certificate line becomes: fold optimum <= U_best (certified
+  realization), and, for the incumbent T*, optimum-within-T* in
+  [LB(T*), U(T*)].  Report both; do not fold them into one bracket
+  without saying which claim is made.
+
+## 3. Milestones
+
+### M2.0 — instrument preflight on T0 (0.25 d)
+
+Regression-first, no search yet.
+- Fixtures: `scaffold pin` on T0 with fold_lb3 must reproduce 8,348
+  (pin + Sigma M == LB identity); `scaffold lb` export on T0 must
+  reproduce fold_lb3 byte-identically (part-index columns); `scaffold
+  wit` on the M1 witness set must reproduce 59,767.
+- Build the T0 collapsed megatree pb with profile CGs; verify its native
+  parsimony score == pinned scaffold cost 8,348 (this validates the CG
+  construction and the UA edge convention).
+- Probe: single-restart SPR on T0's megatree, pinned score delta.  This
+  measures scaffold slack immediately and calibrates expectations before
+  any conditioning work.  If delta == 0 after full search, M2's search
+  tier is dead and the plan stops here with a documented negative.
+
+### M2.1 — pinned SPR loop (0.5-1 d)
+
+Steps 1-3 + acceptance on pinned score only; realization certificate at
+each accepted T' via `scaffold wit` with CURRENT witnesses (no
+re-conditioning yet).  Deliverable: first certified U < 59,767 (or a
+measured plateau), plus the T'-family map.  Multi-restart SPR + seed
+sweep as in the SPR-only control.
+
+### M2.2 — conditioned re-solve (0.5 d)
+
+Step 4b: re-export profiles on the best topologies; clamp the parts whose
+columns changed (cheap-first); crown guarded by the column-diff rule.
+Identity check per accepted T': pin(T) + Sigma M(T) == LB(T) exactly (the
+per-(g,r) argmin property must hold for every exported profile — it is
+now guaranteed by the corrected export + walkcheck).  Deliverable: the
+final bracket family {([LB(T), U(T)])} with U_best certified.
+
+### M2.3 — tension-guided collapsed moves (0.5 d, optional)
+
+At plateau, run the tension map machinery on the collapsed megatree (it
+is a valid small DAG with CGs) and context-aware SPR rounds exactly as in
+the plateau-breaking campaign — all tooling exists
+(`wric_tension_map`, `wric_context_spr`).  Collapsed granularity means
+each tau-carrier is a part boundary, so moves are directly interpretable
+as re-partition candidates: feed accepted moves back as re-partition
+suggestions (closing the loop with WRIC-V1-KERNEL-PLAN §7).
+
+## 4. Risks
+
+- **Scaffold slack may be ~0** (T0 could already be collapsed-optimal;
+  the M2.0 probe decides cheaply).  Honest negative documented if so.
+- **Crown column churn**: a topology change that moves the crown's
+  attachment region may change its pins, forcing a 6.4 h re-clamp.  Rule:
+  diff columns first; if the crown column changes and the incumbent is
+  already >= the projected U, skip the topology (branch-and-bound style).
+- **Polytomy/arity**: collapsed trees after SPR are naturally polytomic;
+  keep arity <= 63 before any chart scoring; strip unary after
+  materializations.
+- **Certificate inflation**: do not mix per-topology LBs into a global
+  claim (§2.4).
+- **Bash/script traps as usual**: done-markers on witness files, UB
+  sources (`at_profile` not `vleaf_ub`), stderr for DP totals.
+
+## 5. Cost and order
+
+M2.0 0.25 d -> M2.1 0.5-1 d -> M2.2 0.5 d -> M2.3 0.5 d.  Total 1.75-2.25 d
+compute-light (crown re-clamps the only heavy items, and they are
+guarded).  Everything else is seconds-to-minutes per evaluation.
+
+## 6. Relation to the in-coupled master
+
+The coupled DP on arbitrary topologies IS Architecture B's substrate
+(`WRIC-CONDITIONED-MATERIALIZE.md` §10).  If M2 succeeds, adding
+per-part frontier candidate sets (branch on parses, candidate-min rows)
+upgrades the certificate layer to the master without new plumbing; if M2
+plateaus at U_best with residual gap g, the master's cheap stage runs on
+top of the SAME T* machinery for the 23 non-crown parts.  Sequence M2
+first: it moves U (the certificate's visible side), needs no crown
+branching, and every instrument it needs already exists and is validated.
