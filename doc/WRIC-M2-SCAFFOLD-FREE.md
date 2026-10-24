@@ -186,3 +186,39 @@ plateaus at U_best with residual gap g, the master's cheap stage runs on
 top of the SAME T* machinery for the 23 non-crown parts.  Sequence M2
 first: it moves U (the certificate's visible side), needs no crown
 branching, and every instrument it needs already exists and is validated.
+
+## 7. M2.0 executed (2026-10-24): all fixtures pass, probe POSITIVE (14 units)
+
+Fixtures (all on T0 = scaffold_bin, profile fold_lb3):
+
+1. `scaffold pin` total = **8,348** (pin + Sigma M == LB identity, unchanged).
+2. `scaffold lb` re-export = fold_lb3 **byte-identical**, total 59,726.
+3. `scaffold wit` on the Phase-3 mixed witness set = **59,767**.
+
+New instrument: `wric_tension_map megatree build <scaffold_tree> <global>
+<ids_prefix> <np> <profile> <out.pb.gz>` — collapse_parts + per-column
+`build_profile_cg` pseudo CGs + frozen-leaf CGs, emitted via
+`wsub::write_tree` (8,442 nodes = 4,221 leaves + 4,220 internal + UA,
+perfectly binary; UA reference = global reference).
+
+Megatree score validation (TWO independent scorers agree):
+- `tension mega0 mega0` witness total = **8,348** == pin(pi-hat) exactly
+  (CG construction + UA-edge convention validated);
+- native SPR's own iter-1 DAG parsimony = **8,348**.
+
+Note: chart-bnb score-only on the megatree WITHOUT `--chart-bnb-upper-bound`
+wandered >15 min (wide frontier over ~30k near-singleton patterns) — always
+seed the UB (megatree active patterns = 4,718 after CG collapse; the parts'
+global pattern space was 14,962).
+
+**Probe (single SPR restart, pinned pi-hat CGs, 368 improving moves applied
+across radii 2-512, 2m18s wall)**: mega1 DAG parsimony (exact DP readout via
+a second SPR invocation's iter-1) = **8,334 — Delta = 14 units of
+scaffold-topology slack with pins held fixed.**
+
+Interpretation and projection: part insides are scaffold-independent, so
+U(T1, pi-hat) ~= 59,768 - 14 = **59,754** before label re-optimization
+(re-export of pi-hat(T1) may move more), and the slot-23-style swaps
+re-derive on the new topology in M2.1.  The search tier is ALIVE; proceed
+to M2.1.  Artifacts: /tmp/v0/{mega0,mega1}.pb.gz, /tmp/mega_spr.{out,time},
+/tmp/mega2_spr.time.

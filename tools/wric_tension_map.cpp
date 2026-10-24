@@ -1991,6 +1991,51 @@ void run_vleaf_ub(std::string const& global_path, std::string const& wit_path,
                static_cast<unsigned long long>(at_profile));
 }
 
+void run_megatree(std::string const& scaffold_path,
+                  std::string const& global_path,
+                  std::string const& ids_prefix, int np,
+                  std::string const& profile_path,
+                  std::string const& out_path) {
+  auto gctx = prepare(global_path);
+  std::string reference;
+  {
+    auto gdag = load_proto_dag(global_path);
+    for (std::size_t i = 0; i < gdag.node_count(); ++i)
+      if (larch::detail::is_ua_node(gdag.get_node(i))) {
+        std::visit(
+            [&](auto n) {
+              using N = std::remove_cvref_t<decltype(n)>;
+              if constexpr (std::is_same_v<N, node_view<phylo_dag, node_kind::ua>>)
+                reference = n.reference_sequence();
+            },
+            gdag.get_node(i));
+        break;
+      }
+  }
+
+  std::vector<std::vector<std::string>> parts(np);
+  for (int j = 0; j < np; ++j) {
+    char buf[512];
+    std::snprintf(buf, sizeof buf, "%s%02d.ids.txt", ids_prefix.c_str(), j);
+    parts[j] = read_ids(buf);
+  }
+
+  std::map<std::string, compact_genome> cgs;
+  std::string ref_ignored;
+  auto root = load_tree_any(scaffold_path, &ref_ignored, &cgs);
+  auto collapsed = collapse_parts(std::move(root), parts);
+
+  for (int j = 0; j < np; ++j) {
+    auto prof = load_vleaf_profile(profile_path, j, gctx.active.size());
+    auto cg = build_profile_cg(gctx, reference, prof);
+    cgs["__PART_" + std::to_string(j) + "__"] = std::move(cg);
+  }
+
+  wsub::write_tree(collapsed, reference, cgs, out_path);
+  std::fprintf(stderr, "megatree: %s pseudo=%d real_leaves=%zu\n",
+               out_path.c_str(), np, cgs.size() - np);
+}
+
 int main(int argc, char** argv) {
   if (argc < 5) {
     std::fprintf(stderr,
@@ -2006,8 +2051,10 @@ int main(int argc, char** argv) {
                  "       %s vleaf add <part.pb.gz> <global.pb.gz> <profile> "
                  "<j> <out.pb.gz>\n"
                  "       %s vleaf strip <biased_tree.pb.gz> <out.pb.gz>\n"
-                 "       %s vleaf ub <global.pb.gz> <witness.pb.gz> <profile> <j>\n",
-                 argv[0], argv[0], argv[0], argv[0], argv[0]);
+                 "       %s vleaf ub <global.pb.gz> <witness.pb.gz> <profile> <j>\n"
+                 "       %s megatree build <scaffold_tree.pb.gz> <global.pb.gz> "
+                 "<ids_prefix> <np> <profile> <out.pb.gz>\n",
+                 argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 2;
   }
   std::string mode = argv[1];
@@ -2038,6 +2085,10 @@ int main(int argc, char** argv) {
     } else if (mode == "vleaf" && std::string(argv[2]) == "ub" &&
                argc == 7) {
       run_vleaf_ub(argv[3], argv[4], argv[5], std::atoi(argv[6]));
+    } else if (mode == "megatree" && std::string(argv[2]) == "build" &&
+               argc == 9) {
+      run_megatree(argv[3], argv[4], argv[5], std::atoi(argv[6]), argv[7],
+                   argv[8]);
     } else if (mode == "scaffold" && (argc == 9 || argc == 10)) {
       run_scaffold(argv[2], argv[3], argv[4], argv[5], argv[6],
                    std::atoi(argv[7]), argv[8],
