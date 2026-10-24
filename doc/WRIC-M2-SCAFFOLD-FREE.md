@@ -222,3 +222,50 @@ U(T1, pi-hat) ~= 59,768 - 14 = **59,754** before label re-optimization
 re-derive on the new topology in M2.1.  The search tier is ALIVE; proceed
 to M2.1.  Artifacts: /tmp/v0/{mega0,mega1}.pb.gz, /tmp/mega_spr.{out,time},
 /tmp/mega2_spr.time.
+
+## 8. M2.1 executed (2026-10-24): U = 59,726 (41 units), pinned search
+## converged
+
+New instruments: `megatree expand <megatree.pb.gz> <wit_prefix> <np>
+<out_full.pb.gz>` (pseudo leaves -> part witness subtrees -> full fold
+tree; validated on T0: reproduces 59,767 exactly) and `megatree
+fromnewick <tree.nwk> <cg_source.pb.gz> <out.pb.gz>` (parses larch
+newick, CGs by sample id from a megatree pb).
+
+Descent at fixed pi-hat CGs (fold_lb3): seed sweep 1/2/3 all reach 8,334
+on mega0 (robust attractor); iterative rounds (seed 7/11/13/17/19/23/29,
+~2 min each, 50 moves/radius 2-512): 8,348 -> 8,334 -> 8,321 -> 8,316 ->
+8,314 -> 8,312 -> 8,310 -> 8,309 -> 8,307; round 9 applied **0** improving
+moves -- clean plateau at **8,307** (41 units of pinned scaffold slack).
+
+Materialization: chart-bnb on the merged megatree DAGs is slow (wide
+frontier); used instead `--diverse-sample 24 --sample-method parsimony
+--diverse-newick` on the final DAG (pool = parsimony-optimal trees);
+`fromnewick` tree #1 pins at **8,307 = the DAG optimum** (exact scaffold
+pin DP).
+
+**Certification on T1** (tree #1 expanded with the Phase-3 witness set
+mix23): `scaffold wit ... 24 - 59726` -> **total = 59,726 (expected
+59726) OK** -- the assertion-checked realization.
+
+- U improves 59,767 -> **59,726** (41 units; 120 below the SPR-only
+  control, 161 below comb).
+- `scaffold lb` on T1: **LB(T1) = 59,685** = pin(T1, pi-hat) + Sigma M =
+  8,307 + 51,378 exactly; **pi-hat is topology-stable** (0 of 14,962
+  (g,r) rows change between T0 and T1) -- the identity holds on T1.
+- The within-T1 bracket is **[59,685, 59,726]**, gap 41 -- the SAME 41,
+  because the residuals r_j = inside_j - M_j are part-internal and
+  scaffold-independent (predicted by the plan; now measured).  The gap
+  moved with the topology rather than closing: T0's bracket [59,726,
+  59,767] and T1's [59,685, 59,726] share the same part-side 41.
+- The pinned-SPR loop has converged: with CGs fixed at pi-hat, no
+  improving moves remain (r9: applied=0), and pi-hat(T1) = pi-hat(T0)
+  means re-pinning restarts nothing.  Further descent needs either the
+  free-row objective (m-rows at pseudo leaves inside SPR -- new
+  machinery) or the in-coupled master on T1's parts.
+
+Operational notes: ps etime garbage bit us again (stale-looking r9
+launch silently never started; foreground re-run fine); --diverse-newick
+requires the merge pipeline path (--max-moves 0 keeps the DAG frozen);
+tension-mode scoring rejects arity-3 witnesses (use scaffold pin / wit
+instead, which accept any arity).

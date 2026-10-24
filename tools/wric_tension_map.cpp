@@ -17,6 +17,7 @@
 // offset).  No frontier construction.
 
 #include <larch/load_proto_dag.hpp>
+#include <larch/newick.hpp>
 #include <larch/chart_trim.hpp>
 #include <larch/polytomy_refinement.hpp>
 #include <larch/site_patterns.hpp>
@@ -1991,6 +1992,104 @@ void run_vleaf_ub(std::string const& global_path, std::string const& wit_path,
                static_cast<unsigned long long>(at_profile));
 }
 
+void run_megatree_fromnewick(std::string const& nwk_path,
+                            std::string const& cg_source,
+                            std::string const& out_path) {
+  std::ifstream in(nwk_path);
+  std::string line;
+  std::getline(in, line);
+  if (line.empty()) throw std::runtime_error("megatree fromnewick: empty file");
+
+  std::vector<std::string> labels;
+  std::vector<std::vector<std::size_t>> kids;
+  larch::parse_newick(
+      line,
+      [&](std::size_t id, std::string label, std::optional<double>) {
+        labels.resize(std::max(labels.size(), id + 1));
+        kids.resize(std::max(kids.size(), id + 1));
+        labels[id] = std::move(label);
+      },
+      [&](std::size_t parent, std::size_t child) {
+        kids.resize(std::max(kids.size(), parent + 1));
+        kids[parent].push_back(child);
+      });
+
+  std::map<std::string, compact_genome> cgs;
+  std::string reference;
+  auto src_root = load_tree_any(cg_source, &reference, &cgs);
+  (void)src_root;
+
+  std::size_t missing = 0, nleaves = 0;
+  std::function<tnode(std::size_t)> build = [&](std::size_t id) -> tnode {
+    tnode n;
+    n.sid = labels[id];
+    if (kids[id].empty()) {
+      n.leaf = true;
+      ++nleaves;
+      if (!cgs.count(n.sid)) ++missing;
+    }
+    for (auto k : kids[id]) n.children.push_back(build(k));
+    std::vector<std::string> taxa;
+    if (n.leaf) taxa = {n.sid};
+    for (auto const& c : n.children)
+      taxa.insert(taxa.end(), c.taxa.begin(), c.taxa.end());
+    n.taxa = std::move(taxa);
+    return n;
+  };
+  // Root = the last node (highest id, closed last).
+  auto root = build(labels.size() - 1);
+  if (missing)
+    throw std::runtime_error("megatree fromnewick: " +
+                             std::to_string(missing) +
+                             " leaf labels missing from CG source");
+
+  wsub::write_tree(root, reference, cgs, out_path);
+  std::fprintf(stderr, "megatree fromnewick: %s leaves=%zu cgs=%zu\n",
+               out_path.c_str(), nleaves, cgs.size());
+}
+
+void run_megatree_expand(std::string const& mega_path,
+                        std::string const& wit_prefix, int np,
+                        std::string const& out_path) {
+  std::map<std::string, compact_genome> cgs;
+  std::string reference;
+  auto root = load_tree_any(mega_path, &reference, &cgs);
+
+  // Load each part witness subtree; fold its leaf CGs in.
+  std::vector<tnode> parts(np);
+  for (int j = 0; j < np; ++j) {
+    char buf[512];
+    std::snprintf(buf, sizeof buf, "%s%02d.wit.pb.gz", wit_prefix.c_str(), j);
+    std::string ref_ignored;
+    parts[j] = load_tree_any(buf, &ref_ignored, &cgs);
+  }
+
+  // Replace each __PART_j__ leaf by the witness subtree.
+  std::size_t swapped = 0;
+  std::function<void(tnode&)> swap = [&](tnode& n) {
+    for (auto& c : n.children) {
+      if (c.leaf && c.sid.rfind("__PART_", 0) == 0) {
+        auto j = std::atoi(c.sid.c_str() + 7);
+        if (j < 0 || j >= np)
+          throw std::runtime_error("megatree expand: bad part id " + c.sid);
+        c = parts[j];
+        ++swapped;
+      } else {
+        swap(c);
+      }
+    }
+  };
+  swap(root);
+  if (swapped != static_cast<std::size_t>(np))
+    throw std::runtime_error("megatree expand: swapped " +
+                             std::to_string(swapped) + " of " +
+                             std::to_string(np) + " parts");
+
+  wsub::write_tree(root, reference, cgs, out_path);
+  std::fprintf(stderr, "megatree expand: %s swapped=%zu leaves(cgs)=%zu\n",
+               out_path.c_str(), swapped, cgs.size());
+}
+
 void run_megatree(std::string const& scaffold_path,
                   std::string const& global_path,
                   std::string const& ids_prefix, int np,
@@ -2053,8 +2152,13 @@ int main(int argc, char** argv) {
                  "       %s vleaf strip <biased_tree.pb.gz> <out.pb.gz>\n"
                  "       %s vleaf ub <global.pb.gz> <witness.pb.gz> <profile> <j>\n"
                  "       %s megatree build <scaffold_tree.pb.gz> <global.pb.gz> "
-                 "<ids_prefix> <np> <profile> <out.pb.gz>\n",
-                 argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                 "<ids_prefix> <np> <profile> <out.pb.gz>\n"
+                 "       %s megatree expand <megatree.pb.gz> <wit_prefix> <np> "
+                 "<out_full.pb.gz>\n"
+                 "       %s megatree fromnewick <tree.nwk> <cg_source.pb.gz> "
+                 "<out.pb.gz>\n",
+                 argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
+                 argv[0]);
     return 2;
   }
   std::string mode = argv[1];
@@ -2089,6 +2193,12 @@ int main(int argc, char** argv) {
                argc == 9) {
       run_megatree(argv[3], argv[4], argv[5], std::atoi(argv[6]), argv[7],
                    argv[8]);
+    } else if (mode == "megatree" && std::string(argv[2]) == "expand" &&
+               argc == 7) {
+      run_megatree_expand(argv[3], argv[4], std::atoi(argv[5]), argv[6]);
+    } else if (mode == "megatree" && std::string(argv[2]) == "fromnewick" &&
+               argc == 6) {
+      run_megatree_fromnewick(argv[3], argv[4], argv[5]);
     } else if (mode == "scaffold" && (argc == 9 || argc == 10)) {
       run_scaffold(argv[2], argv[3], argv[4], argv[5], argv[6],
                    std::atoi(argv[7]), argv[8],
