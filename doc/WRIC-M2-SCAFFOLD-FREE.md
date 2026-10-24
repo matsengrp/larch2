@@ -269,3 +269,33 @@ launch silently never started; foreground re-run fine); --diverse-newick
 requires the merge pipeline path (--max-moves 0 keeps the DAG frozen);
 tension-mode scoring rejects arity-3 witnesses (use scaffold pin / wit
 instead, which accept any arity).
+
+## 9. M2.3-lite executed (2026-10-24): ZERO tau-carriers -- the plateau is
+## coupling-free at collapsed granularity
+
+Tension map on the plateau megatree t1 (pinned CGs at pi-hat, score
+8,307, witness total re-confirmed by the map's own assertion chain):
+
+- **coupling gap = 0 exactly** (all per-clade marginal tensions tau = 0;
+  `wrote 0 targets`).  The composite lower bound over the megatree's own
+  grammar EQUALS the witness total: every clade's optimal state choices
+  coexist; the pinned 8,307 is simultaneously realizable across clades.
+- Consequence: the directed tier of the plateau-breaking protocol has an
+  EMPTY target list at collapsed granularity.  No tension-ranked subtree
+  replacement exists; any further move must come from outside the
+  tension criterion (the megatree leaves are pinned CGs, so clade
+  coupling is already minimal by construction -- the residual 41 lives
+  part-internally, where the collapsed tree cannot see it).
+
+Matched-budget control (protocol formality): context-SPR injector on the
+598-taxon clade adjacent to the crown pseudo-leaf (mid clade of the
+crown-parent subtree).  Full-budget runs (starts=50/sweeps=60) exceed 60
+min without completing -- each context eval is a full-megatree Fitch
+pass (~8.4k nodes x ~30k positions), far heavier than the HBV-scale
+targets the tool was tuned on.  A reduced-budget run (starts=5,
+sweeps=15) is running; verdict appended below.
+
+Operational notes: two `setsid nohup ... &` launches silently never
+started (no files created) -- the `(setsid nohup ... &)` subshell pattern
+is reliable, plain `... &` is not, on this box; the context-SPR log is
+end-buffered (no progress stream).
