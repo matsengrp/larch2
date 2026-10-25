@@ -792,7 +792,8 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
                   std::string const& scaffold_path, std::string const& ids_prefix,
                   std::string const& rows_prefix, int np,
                   std::string const& profile_path,
-                  std::uint64_t expected) {
+                  std::uint64_t expected,
+                  std::string const& mask_path = {}) {
   bool lb = mode == "lb";
   auto gctx = prepare(global_path);
   constexpr std::uint32_t INF_COST = 1u << 30;
@@ -964,6 +965,28 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
   if (lb)
     std::cerr << "scaffold: sum part_lb (collapsed) = " << sum_part_lb << "\n";
 
+  // Entry masks (master B&B): lines "g r j s" force pseudo-leaf j's
+  // attachment state at pattern g, ref-state r.  Key ((g*4+r)*np + j).
+  std::unordered_map<std::uint64_t, std::uint8_t> masks;
+  if (!mask_path.empty()) {
+    if (!lb)
+      throw std::runtime_error("scaffold: masks require lb mode");
+    std::ifstream mf(mask_path);
+    if (!mf)
+      throw std::runtime_error("scaffold: cannot open mask file " + mask_path);
+    std::string line;
+    while (std::getline(mf, line)) {
+      if (line.empty() || line[0] == '#') continue;
+      std::uint64_t g, r, j, s;
+      std::stringstream ss(line);
+      if (ss >> g >> r >> j >> s) {
+        masks[((g * 4 + r) * static_cast<std::uint64_t>(np)) + j] =
+            static_cast<std::uint8_t>(s);
+      }
+    }
+    std::cerr << "scaffold: loaded " << masks.size() << " entry masks\n";
+  }
+
   // Per-pattern DP over the collapsed scaffold.
   auto const& active = gctx.active;
   std::vector<std::uint64_t> per(active.size());
@@ -971,6 +994,61 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
 #pragma omp parallel for schedule(dynamic, 8)
   for (std::size_t g = 0; g < active.size(); ++g) {
     auto const& states = active[g].state_by_taxon;
+    if (!masks.empty()) {
+      // Masked bound: per ref-state DP (pin-style) with m-rows at free
+      // entries and forced rows at masked entries.  Valid lower bound on
+      // the exact objective over profiles satisfying the masks.
+      auto const& rc = active[g].reference_state_counts;
+      std::uint64_t tot = 0;
+      for (std::uint8_t r = 0; r < nuc_state_count; ++r) {
+        if (rc[r] == 0) continue;
+        std::vector<std::array<std::uint32_t, nuc_state_count>> mvec(
+            snodes.size());
+        for (std::size_t i = 0; i < snodes.size(); ++i) {
+          auto const& n = snodes[i];
+          if (n.leaf) {
+            if (n.pseudo) {
+              auto it =
+                  masks.find(((g * 4 + r) * static_cast<std::uint64_t>(np)) +
+                             n.part);
+              if (it != masks.end()) {
+                for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+                  mvec[i][s] = (s == it->second) ? 0 : INF_COST;
+              } else {
+                mvec[i] = all_rows[n.part].m[g];
+              }
+            } else {
+              for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+                mvec[i][s] = (s == states[n.taxon]) ? 0 : INF_COST;
+            }
+            continue;
+          }
+          for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
+            std::uint64_t acc = 0;
+            for (auto ci : n.children) {
+              std::uint32_t b = ~0u;
+              for (std::uint8_t c = 0; c < nuc_state_count; ++c) {
+                auto v = static_cast<std::uint64_t>(mvec[ci][c]) +
+                         (s == c ? 0 : 1);
+                if (v < b) b = static_cast<std::uint32_t>(v);
+              }
+              acc += b;
+            }
+            mvec[i][s] = static_cast<std::uint32_t>(acc);
+          }
+        }
+        std::size_t rr = snodes.size() - 1;
+        std::uint32_t b = ~0u;
+        for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
+          auto v = static_cast<std::uint64_t>(mvec[rr][s]) +
+                   parsimony_chart_detail::transition_cost(r, s);
+          if (v < b) b = static_cast<std::uint32_t>(v);
+        }
+        tot += static_cast<std::uint64_t>(rc[r]) * b;
+      }
+      per[g] = tot;
+      continue;
+    }
     std::vector<std::array<std::uint32_t, nuc_state_count>> vec(snodes.size());
     for (std::size_t i = 0; i < snodes.size(); ++i) {
       auto const& n = snodes[i];
@@ -1061,10 +1139,18 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
                static_cast<unsigned long long>(expected),
                expected ? (total == expected ? "OK" : "MISMATCH") : "");
 
-  if (lb && profile_path != "-") {
+  char const* wit_prof_env = std::getenv("WRIC_WIT_PROFILE");
+  bool do_prof_export =
+      (lb && profile_path != "-") || (!lb && wit_prof_env != nullptr);
+  std::string prof_export_path =
+      lb ? profile_path : std::string(wit_prof_env ? wit_prof_env : "-");
+  if (do_prof_export) {
     // Second pass: per pattern (and per reference state present), recompute
     // the DP vectors and run a top-down argmin pass to recover every part's
     // attachment state under the optimal root choice for that ref state.
+    // In wit mode (WRIC_WIT_PROFILE) this exports the JOINT wit-DP
+    // realization profile pi^U -- the per-(g, r) root states of the jointly
+    // optimal realization.
     bool const walk_check = std::getenv("WRIC_WALK_CHECK") != nullptr;
     std::vector<std::size_t> node_of_part(np, static_cast<std::size_t>(-1));
     for (std::size_t i = 0; i < snodes.size(); ++i)
@@ -1078,6 +1164,10 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
         auto const& n = snodes[i];
         if (n.leaf) {
           if (n.pseudo) {
+            // Under masks the per-r walk below needs per-r vectors; a
+            // per-g vector with m-rows is still valid for UNMASKED
+            // patterns (and masked patterns overwrite their entries via
+            // the walk's forced states read from masks below).
             vec[i] = all_rows[n.part].m[g];
           } else {
             for (std::uint8_t s = 0; s < nuc_state_count; ++s)
@@ -1102,10 +1192,56 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
       std::string out;
       for (std::uint8_t r = 0; r < nuc_state_count; ++r) {
         if (rc[r] == 0) continue;
+        // Masked (g, r): rebuild the DP vector with forced rows so both
+        // the root choice and the walk-down reflect the masks.
+        std::vector<std::array<std::uint32_t, nuc_state_count>> const* vvec =
+            &vec;
+        std::vector<std::array<std::uint32_t, nuc_state_count>> mvec;
+        bool any_mask = false;
+        for (std::uint32_t j = 0; j < static_cast<std::uint32_t>(np); ++j)
+          if (masks.count(((g * 4 + r) * static_cast<std::uint64_t>(np)) + j)) {
+            any_mask = true;
+            break;
+          }
+        if (any_mask) {
+          mvec = vec;
+          for (std::size_t i = 0; i < snodes.size(); ++i) {
+            auto const& n = snodes[i];
+            if (n.leaf && n.pseudo) {
+              auto it =
+                  masks.find(((g * 4 + r) * static_cast<std::uint64_t>(np)) +
+                             n.part);
+              if (it != masks.end())
+                for (std::uint8_t s = 0; s < nuc_state_count; ++s)
+                  mvec[i][s] = (s == it->second) ? 0 : INF_COST;
+            }
+          }
+          // Re-propagate internal nodes upward (children before parents:
+          // flatten order is post-order, so a single ascending pass
+          // recomputes all internal vectors after masked leaves changed).
+          for (std::size_t i = 0; i < snodes.size(); ++i) {
+            auto const& n = snodes[i];
+            if (n.leaf || n.children.empty()) continue;
+            for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
+              std::uint64_t acc = 0;
+              for (auto ci : n.children) {
+                std::uint32_t b = ~0u;
+                for (std::uint8_t c = 0; c < nuc_state_count; ++c) {
+                  auto v = static_cast<std::uint64_t>(mvec[ci][c]) +
+                           (s == c ? 0 : 1);
+                  if (v < b) b = static_cast<std::uint32_t>(v);
+                }
+                acc += b;
+              }
+              mvec[i][s] = static_cast<std::uint32_t>(acc);
+            }
+          }
+          vvec = &mvec;
+        }
         std::uint8_t root_s = 0;
         std::uint32_t best = ~0u;
         for (std::uint8_t s = 0; s < nuc_state_count; ++s) {
-          auto v = static_cast<std::uint32_t>(vec[snodes.size() - 1][s]) +
+          auto v = static_cast<std::uint32_t>((*vvec)[snodes.size() - 1][s]) +
                    parsimony_chart_detail::transition_cost(r, s);
           if (v < best) {
             best = v;
@@ -1114,6 +1250,7 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
         }
         std::vector<std::uint8_t> state(snodes.size(), 0);
         state[snodes.size() - 1] = root_s;
+        // (walk-down below reads (*vvec) via the argmin recompute)
         // Post-order flatten puts every parent AFTER its children (larger
         // index), so the top-down state walk must run DESCENDING from the
         // root: each internal node's state was already fixed by its
@@ -1122,10 +1259,19 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
         for (std::size_t i = snodes.size(); i-- > 0;) {
           if (snodes[i].leaf || snodes[i].children.empty()) continue;
           for (auto ci : snodes[i].children) {
+            if (snodes[ci].leaf && snodes[ci].pseudo) {
+              auto it = masks.find(
+                  ((g * 4 + r) * static_cast<std::uint64_t>(np)) +
+                  snodes[ci].part);
+              if (it != masks.end()) {
+                state[ci] = it->second;
+                continue;
+              }
+            }
             std::uint8_t cs = 0;
             std::uint32_t cb = ~0u;
             for (std::uint8_t c = 0; c < nuc_state_count; ++c) {
-              auto v = static_cast<std::uint32_t>(vec[ci][c]) +
+              auto v = static_cast<std::uint32_t>((*vvec)[ci][c]) +
                        (state[i] == c ? 0 : 1);
               if (v < cb) {
                 cb = v;
@@ -1201,7 +1347,7 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
       }
       prof[g] = std::move(out);
     }
-    std::FILE* f = std::fopen(profile_path.c_str(), "w");
+    std::FILE* f = std::fopen(prof_export_path.c_str(), "w");
     std::fprintf(f, "# scaffold lb attachment profiles: gidx ref count states(A-per-collapsed-part, part-order)\n");
     for (auto const& s : prof) std::fputs(s.c_str(), f);
     std::fclose(f);
@@ -2552,10 +2698,11 @@ int main(int argc, char** argv) {
     } else if (mode == "megatree" && std::string(argv[2]) == "relabel" &&
                argc == 6) {
       run_megatree_relabel(argv[3], argv[4], argv[5]);
-    } else if (mode == "scaffold" && (argc == 9 || argc == 10)) {
+    } else if (mode == "scaffold" && (argc == 9 || argc == 10 || argc == 11)) {
       run_scaffold(argv[2], argv[3], argv[4], argv[5], argv[6],
                    std::atoi(argv[7]), argv[8],
-                   argc == 10 ? std::strtoull(argv[9], nullptr, 10) : 0);
+                   argc >= 10 ? std::strtoull(argv[9], nullptr, 10) : 0,
+                   argc == 11 ? std::string(argv[10]) : std::string{});
     } else if (mode == "response" && argc >= 5) {
       std::vector<std::string> parts(argv + 4, argv + argc);
       run_response(argv[2], argv[3], parts);

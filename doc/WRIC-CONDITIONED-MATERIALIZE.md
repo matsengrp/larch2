@@ -320,3 +320,54 @@ swapped pin) + 33 (small-part residuals at pi-hat minus part 23's) + 7
 (crown residual, composite 29,840).  Artifacts: npart/fold/fold_lb3.profile
 (corrected export), npart/clamp3/ (batch), npart/p3/ (swap profiles,
 clamps, mixed realization), /tmp/p3_inside.json.
+
+## 11. Architecture A executed (2026-10-25): the mask master and the
+## 79-unit joint-freedom finding
+
+Instruments (tools/wric_tension_map.cpp): `scaffold lb` now accepts an
+entry-mask file ((g, r, j, s) forced states; per-ref-state DP like pin
+mode; validated: empty mask reproduces 59,673; forcing one part's column
+raises the bound sharply); `scaffold wit` exports the joint walk profile
+(WRIC_WIT_PROFILE).  Driver: work/masterA/master.py (lazy PartOpt
+memoized per part-indexed column hash -- NOTE a hash collision handed
+parts with identical columns each other's PartOpts until j was added to
+the key; masked bounds; witness-argmin column moves; realization via
+scaffold wit).
+
+Measured (26-part family, rows resp3full, tc26):
+
+- Root: bound 59,673; pin(pi-hat_3) = 8,314; **sum PartOpt(25) = 21,640**
+  = sum of witness free scores + 6 (the g2 carriers pay +1 clamps each;
+  the old-family parts pay 0) -- the witnesses are essentially optimal
+  at their clamps.
+- **X~(pi-hat_3) = 8,314 + 21,640 + 29,840 = 59,794.**
+- Phase B (all 25 single-part witness-argmin column moves): best
+  59,793 (part 01, -1); 13 parts at 0-diff (their witnesses' inside
+  argmins already equal pi-hat_3); stacking neutral.
+- X~(exported joint-walk profile pi^U) = 59,799 (tie-broken walks pay
+  +5 over pi-hat_3's pin).
+- Realization at both profiles: **U = 59,715 exactly** (scaffold wit on
+  the PartOpt materializations).
+
+The structural finding: **no fixed profile realizes U** -- every pinned
+column set evaluated costs >= 59,793, but the joint per-(g,r) choice of
+part root states (scaffold edge + inside co-optimized per site, the wit
+DP's essential freedom) realizes 59,715.  The profile-space freedom is
+worth **79 units**, an order of magnitude above the 42-unit composite
+gap the B&B was designed to close.  Consequences:
+
+1. The mask master CANNOT close the bracket: masked-composite bounds are
+   capped by the 42-unit composite slack (the Phase-3 wall), and the
+   pinned-realization tier is bounded away by 79.  The remaining gap
+   [59,673, 59,715] is joint-freedom territory -- it needs the COUPLED
+   frontier (Architecture B), where part states and scaffold labels are
+   optimized together inside the chart, not through profiles.
+2. The incumbent U = 59,715 is robust: column moves, witness-argmin
+   swaps, and profile re-pinning all fail to beat it (reproduced exactly
+   twice by independent witness materializations).
+3. Crown blind spot moot at this tier: the crown's composite (29,840)
+   appears in every X~; its PartOpt (29,847, +7) would only raise them.
+
+Certificate (unchanged headline, better understood): within-26-family
+[59,673, 59,715]; U = 59,715 unrestricted-realized; tightest family
+bracket overall [59,694, 59,724] (28-fresh).  Artifacts: work/masterA/.

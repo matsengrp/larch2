@@ -1,0 +1,128 @@
+14:57:41 === master A start; U_inc = 59715
+14:58:13 A: root bound = 59673
+14:58:45 A: pin(pihat) = 8314
+14:59:28 === master A start; U_inc = 59715
+15:00:00 A: root bound = 59673
+15:00:31 A: pin(pihat) = 8314
+15:00:42 A: crown composite at pihat = 13701
+15:05:11 === master A start; U_inc = 59715
+15:05:43 A: root bound = 59673
+15:06:14 A: pin(pihat) = 8314
+15:06:14 A: crown composite at pihat = 29840
+15:10:31 === master A start; U_inc = 59715
+15:11:03 A: root bound = 59673
+15:11:34 A: pin(pihat) = 8314
+15:11:34 A: crown composite at pihat = 29840
+15:17:43 === master A start; U_inc = 59715
+15:18:15 A: root bound = 59673
+15:18:47 A: pin(pihat) = 8314
+15:18:47 A: crown composite at pihat = 29840
+15:26:27 === master A start; U_inc = 59715
+15:26:59 A: root bound = 59673
+15:27:30 A: pin(pihat) = 8314
+15:27:30 A: crown composite at pihat = 29840
+15:48:41 A: sum PartOpt(25) = 26945 (1271s)
+15:48:41 A: X~(pihat) = 65099  U - X~ = -5384
+15:49:13 B: part 00 witness column == pihat (0 diff)
+15:53:16 === master A start; U_inc = 59715
+15:53:47 A: root bound = 59673
+15:54:19 A: pin(pihat) = 8314
+15:54:19 A: crown composite at pihat = 29840
+15:54:19 A: sum PartOpt(25) = 26945 (0s)
+15:54:19 A: X~(pihat) = 65099  U - X~ = -5384
+15:54:19 B: part 00 witness column == pihat (0 diff)
+15:56:04 B: part 01 diff=1 bound=59672 pin=8315 X~=65098 delta_vs_root=-1
+15:58:16 B: part 02 diff=1 bound=59651 pin=8315 X~=65099 delta_vs_root=0
+16:00:25 B: part 03 diff=2 bound=59637 pin=8315 X~=65099 delta_vs_root=0
+16:00:57 B: part 04 witness column == pihat (0 diff)
+16:01:29 B: part 05 witness column == pihat (0 diff)
+16:02:01 B: part 06 witness column == pihat (0 diff)
+16:02:32 B: part 07 witness column == pihat (0 diff)
+16:03:04 B: part 09 witness column == pihat (0 diff)
+16:03:35 B: part 10 witness column == pihat (0 diff)
+16:05:44 B: part 11 diff=2 bound=59673 pin=8316 X~=65101 delta_vs_root=2
+16:06:15 B: part 12 witness column == pihat (0 diff)
+16:08:24 B: part 13 diff=1 bound=59673 pin=8315 X~=65100 delta_vs_root=1
+16:08:56 B: part 14 witness column == pihat (0 diff)
+16:11:04 B: part 15 diff=1 bound=59673 pin=8315 X~=65100 delta_vs_root=1
+16:11:35 B: part 16 witness column == pihat (0 diff)
+16:13:44 B: part 17 diff=1 bound=59673 pin=8315 X~=65100 delta_vs_root=1
+16:15:20 B: part 18 diff=1 bound=59671 pin=8315 X~=60149 delta_vs_root=-4950
+16:17:28 B: part 19 diff=1 bound=59673 pin=8315 X~=65099 delta_vs_root=0
+16:18:04 === master A start; U_inc = 59715
+16:18:37 A: root bound = 59673
+16:19:08 A: pin(pihat) = 8314
+16:19:08 A: crown composite at pihat = 29840
+16:19:08 A: sum PartOpt(25) = 26945 (0s)
+16:19:08 A: X~(pihat) = 65099  U - X~ = -5384
+16:19:08 B: part 00 witness column == pihat (0 diff)
+16:20:13 B: part 01 diff=1 bound=59672 pin=8315 X~=65098 delta_vs_root=-1
+16:21:17 B: part 02 diff=1 bound=59651 pin=8315 X~=65099 delta_vs_root=0
+16:22:21 B: part 03 diff=2 bound=59637 pin=8315 X~=65099 delta_vs_root=0
+16:22:21 B: part 04 witness column == pihat (0 diff)
+16:22:21 B: part 05 witness column == pihat (0 diff)
+16:22:21 B: part 06 witness column == pihat (0 diff)
+16:22:21 B: part 07 witness column == pihat (0 diff)
+16:22:21 B: part 09 witness column == pihat (0 diff)
+16:22:21 B: part 10 witness column == pihat (0 diff)
+16:23:25 B: part 11 diff=2 bound=59673 pin=8316 X~=65101 delta_vs_root=2
+16:23:25 B: part 12 witness column == pihat (0 diff)
+16:24:29 B: part 13 diff=1 bound=59673 pin=8315 X~=65100 delta_vs_root=1
+16:24:29 B: part 14 witness column == pihat (0 diff)
+16:25:33 B: part 15 diff=1 bound=59673 pin=8315 X~=65100 delta_vs_root=1
+16:25:33 B: part 16 witness column == pihat (0 diff)
+16:26:07 === master A start; U_inc = 59715
+16:26:40 A: root bound = 59673
+16:27:12 A: pin(pihat) = 8314
+16:27:12 A: crown composite at pihat = 29840
+16:48:30 A: sum PartOpt(25) = 26945 (1278s)
+16:48:30 A: X~(pihat) = 65099  U - X~ = -5384
+16:48:30 B: part 00 witness column == pihat (0 diff)
+16:50:18 B: part 01 diff=1 bound=59672 pin=8315 X~=65098 delta_vs_root=-1
+16:51:58 B: part 02 diff=1 bound=59651 pin=8315 X~=65099 delta_vs_root=0
+16:53:37 B: part 03 diff=2 bound=59637 pin=8315 X~=65099 delta_vs_root=0
+16:53:37 B: part 04 witness column == pihat (0 diff)
+16:53:37 B: part 05 witness column == pihat (0 diff)
+16:53:37 B: part 06 witness column == pihat (0 diff)
+16:53:37 B: part 07 witness column == pihat (0 diff)
+16:53:37 B: part 09 witness column == pihat (0 diff)
+16:53:37 B: part 10 witness column == pihat (0 diff)
+16:55:11 === master A start; U_inc = 59715
+16:55:13 B: part 11 diff=2 bound=59673 pin=8316 X~=65101 delta_vs_root=2
+16:55:13 B: part 12 witness column == pihat (0 diff)
+16:55:44 A: root bound = 59673
+16:56:17 A: pin(pihat) = 8314
+16:56:17 A: crown composite at pihat = 29840
+17:19:12 A: sum PartOpt(25) = 21640 (1375s)
+17:19:12 A: X~(pihat) = 59794  U - X~ = -79
+17:19:12 B: part 00 witness column == pihat (0 diff)
+17:20:57 B: part 01 diff=1 bound=59672 pin=8315 X~=59793 delta_vs_root=-1
+17:22:39 B: part 02 diff=1 bound=59651 pin=8315 X~=59794 delta_vs_root=0
+17:24:16 B: part 03 diff=2 bound=59637 pin=8315 X~=59794 delta_vs_root=0
+17:24:16 B: part 04 witness column == pihat (0 diff)
+17:24:16 B: part 05 witness column == pihat (0 diff)
+17:24:16 B: part 06 witness column == pihat (0 diff)
+17:24:16 B: part 07 witness column == pihat (0 diff)
+17:24:16 B: part 09 witness column == pihat (0 diff)
+17:24:16 B: part 10 witness column == pihat (0 diff)
+17:25:52 B: part 11 diff=2 bound=59673 pin=8316 X~=59796 delta_vs_root=2
+17:25:52 B: part 12 witness column == pihat (0 diff)
+17:27:30 B: part 13 diff=1 bound=59673 pin=8315 X~=59795 delta_vs_root=1
+17:27:30 B: part 14 witness column == pihat (0 diff)
+17:29:05 B: part 15 diff=1 bound=59673 pin=8315 X~=59795 delta_vs_root=1
+17:29:05 B: part 16 witness column == pihat (0 diff)
+17:30:40 B: part 17 diff=1 bound=59673 pin=8315 X~=59795 delta_vs_root=1
+17:32:21 B: part 18 diff=1 bound=59671 pin=8315 X~=59794 delta_vs_root=0
+17:33:56 B: part 19 diff=1 bound=59673 pin=8315 X~=59794 delta_vs_root=0
+17:33:56 B: part 20 witness column == pihat (0 diff)
+17:34:27 B: part 21 witness column == pihat (0 diff)
+17:34:59 B: part 22 witness column == pihat (0 diff)
+17:35:30 B: part 23 witness column == pihat (0 diff)
+17:36:02 B: part 24 witness column == pihat (0 diff)
+17:38:10 B: part 25 diff=1 bound=59673 pin=8315 X~=59794 delta_vs_root=0
+17:38:10 C: improvers (X~, part): [(59793, 1), (59794, 2), (59794, 3), (59794, 18), (59794, 19), (59794, 25), (59795, 13), (59795, 15)]
+17:38:10 C: stacking [1]
+17:39:15 C: stack [1] bound=59672 pin=8315 X~=59793
+17:39:50 C: realized U at pihat columns = 59715
+17:40:24 C: realized U at mixed columns = 59715
+17:40:24 master A phases A-C done in 2713 s
