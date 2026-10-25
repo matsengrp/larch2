@@ -30,19 +30,47 @@ a fresh UA.  Two properties make it exact for our use:
   LBs, clamped PartOpts, and the fold certificate all weakly improve
   relative to the split parents.
 
-Implementation: ~100 lines in the wsub/tension-map toolset (iterate
-nodes, test clade taxa against the ids set, copy nodes/edges, rewire
-boundary roots, build_clade_offsets + validate_dag).  No new math.
+Implemented in wric_tension_map (`grammar restrict`, `grammar merge`);
+three non-obvious findings changed the design:
 
-Validation battery (all must pass before any use):
-1. Self-restriction: G|P == G (same node/edge counts after UA rebuild).
-2. Restriction to a WITNESS clade: score of the witness's subtree ==
-   free optimum of G|A (exact containment both ways for that clade).
-3. Row domination on real splits: m_A + m_B <= m_parent for all (g,s)
-   (checked from the exported responses).
-4. Round-2 re-run: restricting round-1's part_02/part_03 grammars to the
-   four round-2 children must give free optima <= the fresh grammars'
-   (571/448/148/803) -- strictly better expected.
+- **Complements are NOT span-inclusive.**  T|A for scattered A requires
+  pruning-suppression adjacencies that do not exist in G.  Measured:
+  restricted complement optima 547/807 vs pruned-witness subtrees
+  449/803.  CONSEQUENCE: clade sides use restriction; complement sides
+  keep their fresh SPR grammars (which contain the pruned witness +
+  enrichment by construction).
+- **Synthesized top structure breaks consumer-side merges.**  larch2's
+  merge (used internally by the trim pipeline) identifies nodes by
+  (cg, leaf-set partition) labels and rebuilds via an orphan-attachment
+  pass.  A synthetic cascade of fresh nodes whose labels collide with
+  kept nodes' labels leaves no orphan to attach to the UA -> UA-less or
+  cyclic merged DAGs ("no reachable leaves", "cycle detected").  FIX:
+  boundary roots with taxa == A (the clade case: alternative clade
+  roots) attach DIRECTLY under the fresh UA as one alternatives clade --
+  no synthesized node labels at all.  Chain cascades remain only for
+  scattered restrictions (best-effort; spr-scorer still brittle there).
+- **Mutation payloads live on edges, not cgs.**  The pb format
+  reconstructs node cgs from edge mutations; the restrict output must
+  recompute all edge mutations from the copied node cgs
+  (recompute_edge_mutations) or leaf cgs collapse to reference.
+
+Validation battery (executed 2026-10-25):
+1. Self-restriction: G|P == G -- free opt 1,015 = 1,015, all nodes kept.
+2. Clade restriction exactness: g2/part_02 | clade 828 (239) -> 572 =
+   witness subtree 572 (tight); g2/part_03 | clade 469 (23) -> 148 <=
+   witness 149 (strictly better).  Leaf cgs identical (diff=0/239).
+3. Row-domination-as-stated was WRONG (even round-2's certified split
+   "violates" it; children's separate minima need not sum under the
+   parent's row).  The operative invariant is per-part span inclusion
+   (test 2) + the end-to-end `scaffold wit` assertion.
+4. Children vs fresh: clade 572 vs fresh 571 (fresh 1 better on FREE
+   opt; the restricted span is far richer -- the CLAMPED PartOpt is the
+   R3.1 question).  23: 148 = 148.  Complements: 807 vs 803 (fresh
+   better, expected).
+5. Consumer compatibility: chart-bnb trim (clamp flag set) runs clean on
+   clade-restricted files (c787 probe: opt 192, composite 188); response
+   mode exports rows; the spr free-opt readout works on clade
+   restrictions (572/148) and stays brittle on chain (scattered) ones.
 
 ## 3. Stages
 

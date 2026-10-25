@@ -17,6 +17,8 @@
 // offset).  No frontier construction.
 
 #include <larch/load_proto_dag.hpp>
+#include <larch/save_proto_dag.hpp>
+#include <larch/merge.hpp>
 #include <larch/newick.hpp>
 #include <larch/chart_trim.hpp>
 #include <larch/polytomy_refinement.hpp>
@@ -2109,6 +2111,284 @@ void run_megatree_fromnewick(std::string const& nwk_path,
                out_path.c_str(), nleaves, cgs.size());
 }
 
+void run_grammar_restrict(std::string const& dag_path,
+                          std::string const& ids_path,
+                          std::string const& out_path) {
+  auto ids = wsub::read_ids(ids_path);
+  std::unordered_map<std::string, std::size_t> bit_of;
+  for (std::size_t i = 0; i < ids.size(); ++i) bit_of[ids[i]] = i;
+
+  phylo_dag d = load_proto_dag(dag_path, 1);
+  std::size_t n_nodes = d.node_count();
+
+  // Adjacency from edges (independent of internal ordering).
+  std::vector<std::vector<std::pair<std::size_t, std::size_t>>> kids(
+      n_nodes);
+  std::vector<std::vector<std::size_t>> parents(n_nodes);
+  for (auto ev : d.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          auto p = std::visit([](auto nd) { return nd.index(); },
+                              edge.get_parent());
+          auto c = std::visit([](auto nd) { return nd.index(); },
+                              edge.get_child());
+          kids[p].push_back({c, edge.index()});
+          parents[c].push_back(p);
+        },
+        ev);
+  }
+
+  // Leaf info per node (kind test via requires).
+  auto leaf_sid = [&](std::size_t idx) -> std::string const& {
+    return std::visit(
+        [](auto nd) -> std::string const& {
+          if constexpr (requires { nd.sample_id(); })
+            return nd.sample_id();
+          else
+            throw std::runtime_error("grammar restrict: non-leaf sid");
+        },
+        d.get_node(idx));
+  };
+  auto node_is_leaf = [&](std::size_t idx) {
+    return std::visit(
+        [](auto nd) {
+          return requires { nd.sample_id(); };
+        },
+        d.get_node(idx));
+  };
+
+  // Explicit-cursor DFS post-order from the root (DAG: shared children
+  // visited once).
+  std::size_t root_idx = get_root_idx(d);
+  std::vector<std::size_t> order;
+  order.reserve(n_nodes);
+  {
+    std::vector<std::uint8_t> seen(n_nodes, 0);
+    std::vector<std::size_t> cur(n_nodes, 0);
+    std::vector<std::size_t> st{root_idx};
+    seen[root_idx] = 1;
+    while (!st.empty()) {
+      auto v = st.back();
+      if (cur[v] < kids[v].size()) {
+        auto c = kids[v][cur[v]++].first;
+        if (!seen[c]) {
+          seen[c] = 1;
+          st.push_back(c);
+        }
+        continue;
+      }
+      order.push_back(v);
+      st.pop_back();
+    }
+    if (order.size() != n_nodes)
+      throw std::runtime_error("grammar restrict: reached " +
+                               std::to_string(order.size()) + " of " +
+                               std::to_string(n_nodes) +
+                               " nodes from root (cyclic or orphan?)");
+  }
+
+  // Taxa bitmasks over the ids set; has_foreign marks any foreign leaf.
+  std::size_t ntax = ids.size();
+  std::size_t words = (ntax + 63) / 64;
+  std::vector<std::vector<std::uint64_t>> mask(
+      n_nodes, std::vector<std::uint64_t>(words, 0));
+  std::vector<std::uint8_t> has_foreign(n_nodes, 0);
+  for (auto v : order) {
+    if (kids[v].empty()) {
+      if (!node_is_leaf(v))
+        throw std::runtime_error("grammar restrict: childless inner node");
+      auto it = bit_of.find(leaf_sid(v));
+      if (it == bit_of.end())
+        has_foreign[v] = 1;
+      else
+        mask[v][it->second / 64] |= 1ULL << (it->second % 64);
+      continue;
+    }
+    for (auto [c, e] : kids[v]) {
+      (void)e;
+      if (has_foreign[c]) has_foreign[v] = 1;
+      for (std::size_t w = 0; w < words; ++w) mask[v][w] |= mask[c][w];
+    }
+  }
+  auto keep = [&](std::size_t v) -> bool { return !has_foreign[v]; };
+
+  bool root_kept = keep(root_idx);
+  std::size_t kept_total = 0, boundary = 0;
+  for (std::size_t v = 0; v < n_nodes; ++v)
+    if (keep(v)) ++kept_total;
+  if (!root_kept)
+    for (std::size_t v = 0; v < n_nodes; ++v)
+      if (keep(v) && v != root_idx) {
+        bool parent_kept = false;
+        for (auto p : parents[v])
+          if (keep(p)) parent_kept = true;
+        if (!parent_kept) ++boundary;
+      }
+
+  // Build the new DAG.
+  phylo_dag nd;
+  std::vector<std::size_t> new_idx(n_nodes, no_idx);
+  auto ua = nd.append_node<node_kind::ua>();
+  ua.reference_sequence() =
+      d.get_root_as<node_kind::ua>().reference_sequence();
+  std::visit([&](auto r) { nd.set_root(r); }, nd.get_node(ua.index()));
+  std::size_t nd_root = ua.index();
+  if (root_kept) new_idx[root_idx] = nd_root;
+  for (std::size_t v = 0; v < n_nodes; ++v) {
+    if (!keep(v) || new_idx[v] != no_idx) continue;
+    std::visit(
+        [&](auto old) {
+          if constexpr (requires { old.sample_id(); }) {
+            auto lf = nd.append_node<node_kind::leaf>();
+            lf.sample_id() = old.sample_id();
+            lf.cg() = old.cg();
+            new_idx[v] = lf.index();
+          } else if constexpr (!requires { old.reference_sequence(); }) {
+            auto in = nd.append_node<node_kind::inner>();
+            in.cg() = old.cg();
+            new_idx[v] = in.index();
+          }
+        },
+        d.get_node(v));
+  }
+
+  // Edge specs: kept parent->child edges, plus fresh UA->boundary edges.
+  struct edge_spec {
+    std::size_t parent;
+    std::size_t child;
+    std::size_t clade;
+    edge_mutations muts;
+    float weight;
+  };
+  std::vector<edge_spec> specs;
+  specs.reserve(n_nodes + 32);
+  for (auto ev : d.get_all_edges()) {
+    std::visit(
+        [&](auto edge) {
+          auto p = std::visit([](auto nd) { return nd.index(); },
+                              edge.get_parent());
+          auto c = std::visit([](auto nd) { return nd.index(); },
+                              edge.get_child());
+          if (new_idx[p] == no_idx || new_idx[c] == no_idx) return;
+          specs.push_back({new_idx[p], new_idx[c], edge.clade_index(),
+                           edge.mutations(), edge.edge_weight()});
+        },
+        ev);
+  }
+  if (!root_kept) {
+    // Attach boundary roots under the fresh UA.  Two kinds:
+    //  - full alternatives (taxa == A, e.g. alternative roots of a clade
+    //    restriction): hang directly under the UA as one alternatives
+    //    clade.  No synthesized nodes -> no label collisions in
+    //    consumer-side merges.
+    //  - proper sub-pieces (scattered restrictions): binary cascade of
+    //    fresh inner nodes with empty (reference) cg.  Chain labels can
+    //    still collide with empty-cg kept nodes in principle; the
+    //    clade case (the fold-split use) never uses it.
+    std::vector<std::size_t> bnd;
+    for (std::size_t v = 0; v < n_nodes; ++v) {
+      if (!keep(v) || v == root_idx) continue;
+      bool parent_kept = false;
+      for (auto p : parents[v])
+        if (keep(p)) parent_kept = true;
+      if (!parent_kept) bnd.push_back(v);
+    }
+    if (bnd.empty())
+      throw std::runtime_error(
+          "grammar restrict: no taxa of the ids set present in the DAG");
+    // Taxa-count per boundary root.
+    auto taxa_count = [&](std::size_t v) {
+      std::size_t c = 0;
+      for (auto w : mask[v]) c += __builtin_popcountll(w);
+      return c;
+    };
+    std::vector<std::size_t> full, sub;
+    for (auto v : bnd) (taxa_count(v) == ntax ? full : sub).push_back(v);
+    std::size_t ua_clade = 0;
+    for (auto v : full)
+      specs.push_back({nd_root, new_idx[v], ua_clade, edge_mutations{}, 0.0f});
+    if (!sub.empty()) {
+      std::sort(sub.begin(), sub.end(),
+                [&](std::size_t a, std::size_t b) {
+                  return taxa_count(a) < taxa_count(b);
+                });
+      if (sub.size() == 1) {
+        specs.push_back(
+            {nd_root, new_idx[sub[0]], full.empty() ? 0 : 1,
+             edge_mutations{}, 0.0f});
+      } else {
+        std::vector<std::size_t> chain(sub.size());
+        for (std::size_t i = 0; i + 1 < sub.size(); ++i) {
+          auto in = nd.append_node<node_kind::inner>();
+          chain[i] = in.index();
+        }
+        std::size_t last = new_idx[sub.back()];
+        for (std::size_t i = 0; i + 1 < sub.size(); ++i) {
+          std::size_t nxt =
+              (i + 2 < sub.size()) ? chain[i + 1] : last;
+          specs.push_back({chain[i], nxt, 1, edge_mutations{}, 0.0f});
+          specs.push_back({chain[i], new_idx[sub[i]], 0, edge_mutations{}, 0.0f});
+        }
+        specs.push_back(
+            {nd_root, chain[0], full.empty() ? 0 : 1, edge_mutations{}, 0.0f});
+      }
+    }
+  }
+
+  // Two-phase linking, mirroring load_proto_dag.
+  std::sort(specs.begin(), specs.end(),
+            [](auto const& a, auto const& b) { return a.parent < b.parent; });
+  struct pending {
+    std::size_t edge_idx;
+    std::size_t child;
+  };
+  std::vector<pending> pend;
+  pend.reserve(specs.size());
+  for (auto const& s : specs) {
+    auto edge = nd.append_edge<edge_kind::clade>();
+    edge.mutations() = s.muts;
+    edge.clade_index() = s.clade;
+    edge.edge_weight() = s.weight;
+    std::visit([&](auto p) { edge.set_parent(p); }, nd.get_node(s.parent));
+    pend.push_back({edge.index(), s.child});
+  }
+  std::sort(pend.begin(), pend.end(),
+            [](auto const& a, auto const& b) { return a.child < b.child; });
+  for (auto const& pc : pend) {
+    std::visit(
+        [&](auto edge) {
+          std::visit([&](auto c) { edge.set_child(c); },
+                     nd.get_node(pc.child));
+        },
+        nd.get_edge(pc.edge_idx));
+  }
+  // Mutations are reconstructed canonically from the copied node cgs
+  // (the pb format stores only edge mutations; fresh UA->boundary edges
+  // would otherwise lose the dropped-parent payload and corrupt cgs).
+  recompute_edge_mutations(nd);
+  save_proto_dag(nd, out_path);
+  std::fprintf(stderr,
+               "grammar restrict: %s kept=%zu/%zu nodes edges=%zu "
+               "boundary_roots=%zu root_kept=%d\n",
+               out_path.c_str(), kept_total, n_nodes, specs.size(),
+               boundary, (int)root_kept);
+}
+
+void run_grammar_merge(std::string const& a_path, std::string const& b_path,
+                       std::string const& out_path) {
+  phylo_dag a = load_proto_dag(a_path, 1);
+  phylo_dag b = load_proto_dag(b_path, 1);
+  auto const& ref = get_reference_sequence(a);
+  merge m{ref};
+  m.add_dag(a);
+  m.add_dag(b);
+  auto& dag = m.get_result();
+  recompute_edge_mutations(dag);
+  save_proto_dag(dag, out_path);
+  std::fprintf(stderr, "grammar merge: %s nodes=%zu edges=%zu\n",
+               out_path.c_str(), dag.node_count(), dag.edge_count());
+}
+
 void run_megatree_expand(std::string const& mega_path,
                         std::string const& wit_prefix, int np,
                         std::string const& out_path) {
@@ -2254,6 +2534,12 @@ int main(int argc, char** argv) {
                argc == 9) {
       run_megatree(argv[3], argv[4], argv[5], std::atoi(argv[6]), argv[7],
                    argv[8]);
+    } else if (mode == "grammar" && std::string(argv[2]) == "restrict" &&
+               argc == 6) {
+      run_grammar_restrict(argv[3], argv[4], argv[5]);
+    } else if (mode == "grammar" && std::string(argv[2]) == "merge" &&
+               argc == 6) {
+      run_grammar_merge(argv[3], argv[4], argv[5]);
     } else if (mode == "megatree" && std::string(argv[2]) == "expand" &&
                argc == 7) {
       run_megatree_expand(argv[3], argv[4], std::atoi(argv[5]), argv[6]);
