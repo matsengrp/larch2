@@ -1992,6 +1992,49 @@ void run_vleaf_ub(std::string const& global_path, std::string const& wit_path,
                static_cast<unsigned long long>(at_profile));
 }
 
+void run_megatree_relabel(std::string const& in_path,
+                         std::string const& pairs_path,
+                         std::string const& out_path) {
+  std::vector<std::pair<std::string, std::string>> pairs;
+  std::ifstream in(pairs_path);
+  std::string a, b;
+  while (in >> a >> b) pairs.emplace_back(a, b);
+  if (pairs.empty()) throw std::runtime_error("megatree relabel: no pairs");
+  auto dag = load_proto_dag(in_path);
+  std::size_t done = 0;
+  for (std::size_t i = 0; i < dag.node_count(); ++i)
+    std::visit(
+        [&](auto n) {
+          using N = std::remove_cvref_t<decltype(n)>;
+          if constexpr (std::is_same_v<N, node_view<phylo_dag, node_kind::leaf>>) {
+            for (auto const& [o, nn] : pairs)
+              if (n.sample_id() == o) {
+                n.sample_id() = nn;
+                ++done;
+              }
+          }
+        },
+        dag.get_node(i));
+  if (done != pairs.size())
+    throw std::runtime_error("megatree relabel: matched " +
+                             std::to_string(done) + " of " +
+                             std::to_string(pairs.size()) + " labels");
+  save_proto_dag(dag, out_path);
+  std::fprintf(stderr, "megatree relabel: %s relabeled=%zu\n",
+               out_path.c_str(), done);
+}
+
+void run_megatree_tonewick(std::string const& in_path,
+                           std::string const& out_path) {
+  auto dag = load_proto_dag(in_path);
+  std::FILE* f = std::fopen(out_path.c_str(), "w");
+  if (!f) throw std::runtime_error("megatree tonewick: cannot write");
+  std::fputs(larch::to_newick(dag).c_str(), f);
+  std::fputc('\n', f);
+  std::fclose(f);
+  std::fprintf(stderr, "megatree tonewick: %s written\n", out_path.c_str());
+}
+
 void run_megatree_fromnewick(std::string const& nwk_path,
                             std::string const& cg_source,
                             std::string const& out_path) {
@@ -2018,6 +2061,15 @@ void run_megatree_fromnewick(std::string const& nwk_path,
   std::string reference;
   auto src_root = load_tree_any(cg_source, &reference, &cgs);
   (void)src_root;
+  std::unordered_map<std::string, std::string> alias;
+  if (const char* a = std::getenv("WRIC_CG_ALIAS")) {
+    std::stringstream ss(a);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      auto eq = item.find('=');
+      if (eq != std::string::npos) alias[item.substr(0, eq)] = item.substr(eq + 1);
+    }
+  }
 
   std::size_t missing = 0, nleaves = 0;
   std::string missing_sample;
@@ -2027,9 +2079,13 @@ void run_megatree_fromnewick(std::string const& nwk_path,
     if (kids[id].empty()) {
       n.leaf = true;
       ++nleaves;
-      if (!cgs.count(n.sid)) {
+      std::string lookup = n.sid;
+      if (auto it = alias.find(n.sid); it != alias.end()) lookup = it->second;
+      if (!cgs.count(lookup)) {
         ++missing;
         if (missing_sample.size() < 80) missing_sample += n.sid + ",";
+      } else {
+        cgs[n.sid] = cgs[lookup];
       }
     }
     for (auto k : kids[id]) n.children.push_back(build(k));
@@ -2204,6 +2260,12 @@ int main(int argc, char** argv) {
     } else if (mode == "megatree" && std::string(argv[2]) == "fromnewick" &&
                argc == 6) {
       run_megatree_fromnewick(argv[3], argv[4], argv[5]);
+    } else if (mode == "megatree" && std::string(argv[2]) == "tonewick" &&
+               argc == 5) {
+      run_megatree_tonewick(argv[3], argv[4]);
+    } else if (mode == "megatree" && std::string(argv[2]) == "relabel" &&
+               argc == 6) {
+      run_megatree_relabel(argv[3], argv[4], argv[5]);
     } else if (mode == "scaffold" && (argc == 9 || argc == 10)) {
       run_scaffold(argv[2], argv[3], argv[4], argv[5], argv[6],
                    std::atoi(argv[7]), argv[8],

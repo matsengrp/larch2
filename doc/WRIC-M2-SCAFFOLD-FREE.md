@@ -357,3 +357,65 @@ root never closes and fromnewick silently builds the LAST-CLOSED
 SUBTREE (a 6-leaf cherry masquerading as the extraction); (2) a double
 ';' emits a phantom empty-label leaf (parse_newick's on_node fires
 unconditionally per ';').  fromnewick now names missing labels.
+
+## 11. Re-partition round 1 executed (2026-10-25): U = 59,715 (11 units)
+
+Steering evidence (per-part tension maps on the r-carriers' grammars, the
+pre-partition step of the discussion):
+
+- part_01: gap = 0 -- its 4 units are PIN-induced (free witness scores 967
+  < clamped 968); no structural target, quarantined.
+- part_02 (r=10, gap=11): diffuse -- tau=3 @ 23 taxa, tau=2 @ 50, six tau=1
+  clades (the 8 targets cover all 11).
+- part_04 (r=3): tau=2 @ 5 taxa (depth 41) + tau=1 @ 75 (depth 60) -- deep
+  interior, deferred.
+- part_10 (r=4, gap=4): ALL 4 units in ONE deep 111-taxon clade (depth 27).
+- crown (r=7, gap=7): diffuse over 14-17k-taxon clades -- quarantined
+  (matches the 6.4 h clamp economics).
+
+Round-1 moves (certificate-sound: clade splits only tighten the relaxation
+from below and enlarge realization freedom):
+
+1. **part_10 -> {111, 279}** at the tau=4 clade;
+2. **part_02 -> {344, 241}** bisection at clade 1350 (59% of the part).
+
+26-part layout (crown now slot 08); the split complements are not clades
+anywhere -- built by newick PRUNE (remove clade, suppress unaries) +
+fromnewick.  tc26 scaffold = t1 with the splits as cherries; CG-alias hook
+(WRIC_CG_ALIAS) + megatree relabel mode added for label plumbing.
+
+Results at pi_new (responses of fresh grammars):
+
+- LB = **59,685 UNCHANGED** (relaxation-neutral split: pin 8,348->8,314
+  wait: pin(tc26, pi_new) = 8,314, +7 over t1's 8,307; rows gained exactly
+  the 7 back).
+- part_10's split is clean: r 4 -> 0 + 0 (192/192, 481/481).
+- part_02's split: composites exactly additive (1012+942 = 1954) but fresh
+  grammars are row-poorer (PartOpts +2, and part_10's family rows +8 vs the
+  fold-era merged grammar).
+- **U = 59,724** (-2) certified.
+- Pinned SPR on mega26: ZERO improving moves from round 1 (the cherry
+  topology is pinned-SPR-optimal; exploiting the split placement needs
+  free-row SPR, out of scope).
+- Swap sweep at 26 slots: best single swap U = 59,725 < pinned 59,726 but
+  the free-label realization already banks it (59,724 stands).
+
+**Grammar enrichment loop** (the fresh grammars were the bottleneck):
+chained SPR rounds per part (5 for the splits, 3 for the old r>=2
+carriers, 3 more for the still-gaining) -- free DAG optima: part_02 family
+1966->1960, slot 07 2354->2350, slot 01 966->965, slot 15 267->266;
+responses + profile + clamps re-run per pass.  U: 59,724 -> 59,720 -> **59,715
+(assertion OK)**.  All free optima now at SPR plateaus; the loop converged.
+
+Certificate: **U = 59,715** (131 below the SPR-only control, 172 below
+comb).  LB family-dependent: 59,685 at the pre-enrichment rows, 59,673 at
+the final enriched rows (enrichment weakens the relaxation while improving
+realizations; both valid within their grammar families).  Quoted bracket
+at the final family: **[59,673, 59,715]**, gap 42; at the pre-enrichment
+family [59,685, 59,724], gap 39.  The part-internal residual mass moved
+(part_02's split carries 10+6 at pi3; crown's 7 untouched) -- the gap did
+not structurally shrink, but the REALIZED tree is 11 units better.
+
+Costs: ~3 h wall total (no crown clamps).  Artifacts: /tmp/v0/m23/rp1/
+(ids, g2 grammars, resp3full, pi3, wit4, tc26); key pieces copied to
+work/m2-startmat/.
