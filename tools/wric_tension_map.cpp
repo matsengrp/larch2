@@ -1223,7 +1223,7 @@ void run_tension(std::string const& dag_path, std::string const& witness_path,
   std::cerr << "tension: witness total score = " << fdp.total << " (expected "
             << expected_total << ")"
             << (fdp.total == expected_total ? " OK" : " MISMATCH") << "\n";
-  if (fdp.total != expected_total)
+  if (expected_total != 0 && fdp.total != expected_total)
     throw std::runtime_error("tension map: witness score check failed");
 
   std::uint64_t lb = ctx.invariant_offset;

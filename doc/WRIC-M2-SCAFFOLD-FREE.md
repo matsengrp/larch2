@@ -363,8 +363,11 @@ unconditionally per ';').  fromnewick now names missing labels.
 Steering evidence (per-part tension maps on the r-carriers' grammars, the
 pre-partition step of the discussion):
 
-- part_01: gap = 0 -- its 4 units are PIN-induced (free witness scores 967
-  < clamped 968); no structural target, quarantined.
+- part_01: (CORRECTED in round 2) -- round 1 reported "gap = 0" but that
+  was the tension map ABORTING on the witness-score assert (free 967 vs
+  clamped 968); the actual gap is 4 with tau concentrated at the ROOT
+  clade (556 taxa) -- attachment-level coupling, no local target.  The
+  assert now skips when expected == 0.
 - part_02 (r=10, gap=11): diffuse -- tau=3 @ 23 taxa, tau=2 @ 50, six tau=1
   clades (the 8 targets cover all 11).
 - part_04 (r=3): tau=2 @ 5 taxa (depth 41) + tau=1 @ 75 (depth 60) -- deep
@@ -419,3 +422,49 @@ not structurally shrink, but the REALIZED tree is 11 units better.
 Costs: ~3 h wall total (no crown clamps).  Artifacts: /tmp/v0/m23/rp1/
 (ids, g2 grammars, resp3full, pi3, wit4, tc26); key pieces copied to
 work/m2-startmat/.
+
+## 12. Re-partition round 2 executed (2026-10-25): U unchanged (59,715),
+## LB tightened to 59,694 -- the grammar-richness wall
+
+Round-2 steering (tension maps on the 26-part state, expected=0 fix
+applied; all gaps now match their residuals):
+
+- slot 02 (r=10, gap=11): tau=3 @ 239 taxa (clade 828) + tau=3 @ 50 +
+  tau=2 @ 8 -- far more concentrated than round 1.
+- slot 03 (r=6, gap=6): **tau=4 @ 23 taxa (clade 469)** + tau=2 @ 8.
+- slot 01 (r=3, gap=4): root-clade tau -- attachment coupling, no target.
+- the r=2 slots: tau=1 pairs, diffuse.
+
+Moves: split slot 02 at clade 828 ({239, 105}) and slot 03 at clade 469
+({23, 218}) -> 28 parts.  Mechanics as round 1 (newick prune for
+complements, marker-based cherry surgery for tc28, CG aliases).
+
+Results:
+
+- **The residual structure decomposed exactly as diagnosed**: the four
+  children's residuals are 1+0+3+0 = 4 (was 10+6 = 16).  The tau peaks
+  were real coupling loci.
+- **But U went the wrong way**: fresh clamped PartOpts sum 1,980 vs the
+  parents' 1,962 (+18); U(28) = 59,724 (+9 over 59,715).  Even
+  parent-extracted sub-witnesses score 59,724 (the cherry restructure
+  replaces the parent's internal path with scaffold edges).
+- **Enrichment is exhausted**: 5 + 10 more chained SPR rounds moved the
+  children's free optima ZERO (571/448/148/803).  The children's isolated
+  SPR cannot reach the parents' fold-era merge richness -- the poorness is
+  structural, not budgetary.
+- **LB tightened**: 59,694 at the 28-family (vs 59,673 at the 26-family)
+  -- the children's poorer rows RAISE the free-DP bound; the split-family
+  relaxation is genuinely tighter.
+- Swap sweep at 28: all single swaps >= base pin 8,322; nothing.
+
+Certificate state: **U = 59,715** (the 26-part realization stands as the
+best tree, valid unrestricted); strongest single-family bracket
+**[59,694, 59,724]** at the 28-family (gap 30); 26-family bracket
+[59,673, 59,715] (gap 42).
+
+Round-2 lesson (the wall): re-partition pays ONLY if the children's
+grammars can match the parents' richness.  The missing tool is a
+grammar-restriction/merge path (children's sub-DAGs extracted from the
+parent's MERGED dag, or diverse materializations merged into the
+children).  Without it, further splits (the six r=2 slots, part_04's deep
+tau=2) are predictable no-ops or regressions.  Artifacts: /tmp/v0/m23/rp2/.
