@@ -297,8 +297,15 @@ full 9-round merged span) with witness t1 (8,307):
   context evals (~8.4k nodes x ~30k positions each) run ~2 orders slower
   than the HBV-scale targets the tool was tuned on -- a 598-taxon clade
   exceeded 4.5 h at starts=5/sweeps=15 (killed, no artifacts).  The
-  tau=6 / 171-taxon top target (m23/t9126.ids.txt) is running at
-  starts=20/sweeps=30; verdict appended when it lands.
+  tau=6 / 171-taxon top target (t9126.ids.txt, preserved in
+  work/m2-startmat/) was launched at starts=20/sweeps=30 and died
+  silently after ~12 h (empty buffered log, PID gone, no artifacts --
+  consistent with the box's OOM reaper; an earlier run died the same
+  way).  VERDICT: the out-of-span injector probe is operationally
+  infeasible at megatree scale on this box; the tau ranking (tau=6 @
+  clade 9126) stands as a ready target for a future lighter-weight
+  context scorer.  M2.3-lite closes with: in-span optimum exactly 8,307
+  (certified), out-of-span freedom ranked but unprobed.
 
 Matched-budget control (protocol formality): context-SPR injector on the
 598-taxon clade adjacent to the crown pseudo-leaf (mid clade of the
