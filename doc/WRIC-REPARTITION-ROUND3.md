@@ -137,3 +137,35 @@ skip.
 
 R3.0 (0.5 d) -> R3.1 (0.5 d, decision gate) -> R3.2 (0.5-1 d) -> R3.3
 (gated).  Compute-light throughout; no crown clamps by default.
+
+## 7. R3.1 executed (2026-10-25): the gate fired -- the split axis is dead
+
+Children: clade 828/469 from `grammar restrict` (+3 SPR rounds; free
+571/148, spans strictly richer than fresh), complements fresh (450/804
+under clamps).  LB(28-rich) = 59,689; clamped PartOpts
+575+450+150+804 = 1,979 (fresh family: 1,980 -- ONE unit better).
+
+**U(28-rich) = 59,723 >= 59,715: the decision gate closes the axis.**
+
+Reading: the tau decomposition of the residual (16 -> 4) is real, but it
+is not harvestable by splitting.  The coupling the tau map localizes
+lives BETWEEN the pieces' attachment states, not inside the pieces: the
+28-part fold pins the new split point per site (the cherry restructure
+cost, ~9 measured in round 2 at fixed witnesses), and even
+parent-rich child grammars recover only 1 of it under clamps.  The
+parents' internal path was FREE-label structure; any split converts it
+to pinned structure.  Structurally: partition refinement is
+certification-side (it tightens LBs), not realization-side.
+
+Family ledger (all brackets within-family):
+
+- 26-family (round 1): **[59,673, 59,715]** -- best realization;
+- 28-fresh family (round 2): **[59,694, 59,724]** -- tightest LB;
+- 28-rich family (round 3): [59,689, 59,723].
+
+Certificate: **U = 59,715** (unrestricted, 26-family realization); the
+strongest single-family bracket remains [59,694, 59,724].
+
+R3.2 (further splits) is cancelled by the gate.  The remaining levers
+are outside the partition axis: crown frontier width (Architecture B),
+an in-coupled master (Architecture A), or free-row SPR for placement.
