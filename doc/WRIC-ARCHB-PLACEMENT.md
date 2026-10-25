@@ -46,6 +46,33 @@ certificate-side in different mixes.
 Goal: drop U by relocating parts under the TRUE objective; secondarily
 harden the claim that tc26's placements are fold-optimal.
 
+EXECUTED 2026-10-25/26 (kit + logs: work/m2-startmat/plF/).  Kit:
+tonewick -> python newick surgery (leaf regraft of __PART_j__ leaves,
+iterative clone -- deepcopy overflows on ~4k-deep caterpillars) ->
+fromnewick (NO trailing newline after ';' -- a phantom-leaf trap) ->
+scaffold wit.  Fixture: identity round-trip reproduces 59,715 exactly.
+Sweep: radius-6 edges + 12 deterministic far samples per target;
+~35 s/eval; two hill-climb iterations.
+
+Results:
+
+- Iter 1 (base tc26, incumbent 59,715): 02/03/cherry(02,03)/11/12/
+  cherry(11,12)/09 ALL plateau at 59,715 (totals 59,715-59,719; the
+  landscape is flat).  The CROWN (slot 08) moves at distance 1:
+  **U = 59,714** (tc27, assertion-checked OK).
+- Iter 2 (base tc27): all 8 targets plateau at 59,714 (many exact
+  ties) -- hill-climb converged; no further improving move.
+- LB(tc27 family) = 59,672 (pin moved -1 with the topology); bracket
+  **[59,672, 59,714]**, gap 42 -- the composite slack persists (as
+  expected: placement moves realization, not relaxation).
+
+Verdict: the placement axis held exactly one unit, and it was the
+crown -- the part with the largest surrogate-vs-fold correction, as
+§6 predicted.  tc27 (crown regrafted one edge) is now B's substrate;
+the remaining unexplored morsel is a wider-radius crown pass.
+Unrestricted LB across families now min(59,672, 59,673, 59,689,
+59,694) = 59,672.
+
 - F.1 **Cherry pass**: the two split cherries (02/03 and 11/12) were
   seeded at their parents' positions and only surrogate-searched (the
   megatree SPR scores pseudo-leaves as point taxa -- a surrogate whose
