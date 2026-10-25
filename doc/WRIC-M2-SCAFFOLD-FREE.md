@@ -319,3 +319,41 @@ Operational notes: two `setsid nohup ... &` launches silently never
 started (no files created) -- the `(setsid nohup ... &)` subshell pattern
 is reliable, plain `... &` is not, on this box; the context-SPR log is
 end-buffered (no progress stream).
+
+## 10. M2.3 completed (2026-10-25): the poor-man's context probe -- tau=6 is
+## flat, the topology tier closes
+
+Instead of the infeasible full injector, a two-part probe with existing
+tools (zero new search machinery; scripts preserved in
+work/m2-startmat/{probe,kick}.py):
+
+- **Path**: extract the 171-taxon tau=6 clade (exact clade of t1,
+  containing the __PART_12__ boundary) -> candidates in ISOLATION
+  (larch2 SPR + diverse sampling, or python NNI kicks + isolated
+  reoptimization) -> splice into t1's background (t1_template.nwk with a
+  @@SUB@@ slot) -> score IN CONTEXT via fromnewick + scaffold pin
+  (~70 s per candidate, exact).
+- **Baseline sanity**: t1's own subtree spliced back scores 8,307 exactly
+  (validates the whole path).
+- **Candidates**: the 24 diverse full-megatrees of the r8 span carry only
+  3 distinct 171-regions (the parsimony-optimal pool is basin-collapsed);
+  plus 14 NNI kicks (8 moves each) reoptimized in isolation by SPR, 3
+  materialized candidates each = **45 distinct context points total**.
+- **Result: ALL score 8,307** (one kick at 8,308).  The region is
+  context-flat: every isolated-optimal (305) topology realizes the same
+  best boundary response.  The DAG's tau=6 is relaxation slack
+  (in-span composite looseness), NOT recoverable score -- the reading
+  discipline ("tension is a ranking hypothesis, not a budget") holds
+  again, now with a measured negative at 45 samples deep.
+
+**M2.3 closes the topology tier with evidence on both fronts**: in-span
+optimum exactly 8,307 (exact DAG DP), out-of-span samples flat at 8,307.
+The megatree pinned search is done; the remaining 41 units are
+part-internal (re-partition or in-coupled master territory).
+
+Two newick traps fixed en route (documented for the record): (1) a
+subtree newick line MUST end with ';' inside the line -- without it the
+root never closes and fromnewick silently builds the LAST-CLOSED
+SUBTREE (a 6-leaf cherry masquerading as the extraction); (2) a double
+';' emits a phantom empty-label leaf (parse_newick's on_node fires
+unconditionally per ';').  fromnewick now names missing labels.

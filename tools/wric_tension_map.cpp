@@ -2020,13 +2020,17 @@ void run_megatree_fromnewick(std::string const& nwk_path,
   (void)src_root;
 
   std::size_t missing = 0, nleaves = 0;
+  std::string missing_sample;
   std::function<tnode(std::size_t)> build = [&](std::size_t id) -> tnode {
     tnode n;
     n.sid = labels[id];
     if (kids[id].empty()) {
       n.leaf = true;
       ++nleaves;
-      if (!cgs.count(n.sid)) ++missing;
+      if (!cgs.count(n.sid)) {
+        ++missing;
+        if (missing_sample.size() < 80) missing_sample += n.sid + ",";
+      }
     }
     for (auto k : kids[id]) n.children.push_back(build(k));
     std::vector<std::string> taxa;
@@ -2041,7 +2045,8 @@ void run_megatree_fromnewick(std::string const& nwk_path,
   if (missing)
     throw std::runtime_error("megatree fromnewick: " +
                              std::to_string(missing) +
-                             " leaf labels missing from CG source");
+                             " leaf labels missing from CG source; e.g. [" +
+                             missing_sample + "]");
 
   wsub::write_tree(root, reference, cgs, out_path);
   std::fprintf(stderr, "megatree fromnewick: %s leaves=%zu cgs=%zu\n",
