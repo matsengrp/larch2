@@ -1,0 +1,31 @@
+Loading DAG from pbin/part_04.bin.pb.gz...
+Initial: 38 leaves, 76 nodes, 75 edges
+Iteration 1/1:
+  Building merged DAG... done (76 nodes, 75 edges)
+  Sampling tree... done (score 119)
+  Building tree index... done (74 searchable nodes, 106 sites)
+  [radius 2]
+    Scoring moves... done (0 profitable moves)
+    Generating 0 fragments... done
+    Merging... done (76 nodes, 75 edges)
+  [radius 4]
+    Scoring moves... done (0 profitable moves)
+    Generating 0 fragments... done
+    Merging... done (76 nodes, 75 edges)
+  [radius 8]
+    Scoring moves... done (0 profitable moves)
+    Generating 0 fragments... done
+    Merging... done (76 nodes, 75 edges)
+  [radius 16]
+    Scoring moves... done (0 profitable moves)
+    Generating 0 fragments... done
+    Merging... done (76 nodes, 75 edges)
+
+Summary:
+  iter 1: parsimony=119 objective=parsimony 119.000000 nodes=76 edges=75 merged=0
+    radius 2: found=0 applied=0
+    radius 4: found=0 applied=0
+    radius 8: found=0 applied=0
+    radius 16: found=0 applied=0
+Final: 76 nodes, 75 edges
+Wrote pspr/part_04.spr.pb.gz

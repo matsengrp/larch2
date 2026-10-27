@@ -1,0 +1,10 @@
+validate_dag [wsub emitted tree]: OK (1194 nodes, 1193 edges)
+graft: pwit/part_00.wit.pb.gz -> pfold/g_00/graft_0.pb.gz
+validate_dag [wsub emitted tree]: OK (1194 nodes, 1193 edges)
+graft: pwit/part_01.wit.pb.gz -> pfold/g_01/graft_0.pb.gz
+validate_dag [wsub emitted tree]: OK (1194 nodes, 1193 edges)
+graft: pwit/part_02.wit.pb.gz -> pfold/g_02/graft_0.pb.gz
+validate_dag [wsub emitted tree]: OK (1194 nodes, 1193 edges)
+graft: pwit/part_03.wit.pb.gz -> pfold/g_03/graft_0.pb.gz
+validate_dag [wsub emitted tree]: OK (1194 nodes, 1193 edges)
+graft: pwit/part_04.wit.pb.gz -> pfold/g_04/graft_0.pb.gz

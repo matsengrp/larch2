@@ -375,7 +375,46 @@ monolithic-chart OOM is a designed wall, not an accident.
   `%CPU`/etime unreliable; `--chart-bnb-score-only` still needs `-o`;
   chart-bnb on megatrees must seed `--chart-bnb-upper-bound`.
 
-## 10. What is deliberately not covered
+## 10. Small-scale validation (seedtree, 597 taxa) and the scale boundary
+
+The full line was run end-to-end on `~/matsen/larch2/data/seedtree/
+seedtree.pb.gz` (597 taxa, polytomies to arity 10, fixed-label parse
+1,642).  Mechanics: comb 1,637 -> clade carve 5 parts (146/131/83/50/38)
++ 149 frozen -> per-part SPR + chart (318/308/204/173/119, Sigma 1,122)
+-> graft fold **U = 1,635** -> response rows -> **scaffold lb = 1,635 =
+U, gap 0**: the fold-family optimum certified exactly in one shot, with
+the realization triple-validated (graft chain = `scaffold wit` assert =
+`megatree build`/`expand` full-tree rescore, all 1,635).
+
+Four traps surfaced that the big campaign never hit — all now part of
+the recipe:
+
+1. **`wric_partition`'s FFD packing can emit non-clade parts on small
+   trees** (unions of distant twigs sized into the window): grafts then
+   silently no-op.  Carve clades from the POLYTOMIC original instead
+   (the comb preserves clade leaf sets), and liveness-check every graft
+   (the score must move or the part must be verifiably neutral).
+2. **Binarize destroys natural clades**: the comb's caterpillar chains
+   leave almost no clades >= 60 leaves — carve BEFORE binarizing, then
+   `wric_binarize` each part newick.
+3. **Unary productions**: extracted parts and SPR grammars can carry
+   unary nodes; the chart refuses ("non-UA unary production"), and SPR
+   on a unary-carrying input can corrupt the DAG ("child appears in
+   multiple clades").  Squash with `wric_dag_binarize` BEFORE the
+   chart -- of the input too, not just the grammar.
+4. **wsub-emitted trees load with `--dag-pb`**, not `--tree-pb`.
+
+The scale boundary, measured honestly: the MONOLITHIC chart runs fine
+at 597 taxa and lands at **1,616** (1,637 SPR incumbent -> chart
+recombination, matching the earlier campaign's seedtree record) — **19
+below the fold family**.  The partitioned certificate is exact but the
+family is poorer (fixed scaffold topology, 1-seed part grammars, 149
+frozen leaves).  Use the partitioned line where the monolithic chart
+cannot run (startmat: OOM at ~101 GB; here: seconds) or where its tiers
+(tension carve, placement, tuples) pay; on small datasets run
+monolithic first and use this line as the certificate backbone.
+
+## 11. What is deliberately not covered
 
 The in-coupled mask master (Architecture A) and the profile tier are
 retired (capped by the 79-unit joint freedom); the crown frontier-width
