@@ -1,0 +1,2 @@
+scaffold: nodes=439 internal=219 pseudo=9 real_leaves=211
+scaffold[wit]: total = 14428 (expected 14428) OK

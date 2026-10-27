@@ -414,6 +414,28 @@ cannot run (startmat: OOM at ~101 GB; here: seconds) or where its tiers
 (tension carve, placement, tuples) pay; on small datasets run
 monolithic first and use this line as the certificate backbone.
 
+### 10.1 The three-dataset turnkey table (same recipe, timed)
+
+| dataset | leaves | fixed parse | comb | partitioned U / LB | t_part | monolithic | t_mono |
+|---|---:|---:|---:|---|---:|---:|---:|
+| seedtree | 597 | 1,642 | 1,637 | **1,635 = LB** (gap 0) | 8.0 s | **1,616** | 5.9 s |
+| wnv (zenodo) | 794 | 9,421 | 9,417 | 9,389 / 9,380 (gap 9) | 14.1 s | **9,387** | 15.9 s |
+| hbv (zenodo) | 1,032 | 14,524 | 14,515 | 14,428 / 14,245 (gap 183) | 25.7 s | **14,418** | 20.9 s |
+
+(wnv/hbv are the zenodo `data/*.pb` fixtures — the campaign bench's own
+records agree with these loads node-for-node; the record pipelines of
+cross-profile-impl.md §5 used other variants of these datasets.)
+
+Readings: (1) at <= ~10^3 taxa the two arms are at runtime PARITY
+(8-26 s) and the monolithic arm always scores >= the fold; (2) the
+partitioned certificate stays exact everywhere (assertion OK each
+time), and its LB gap REPRODUCES the campaign's coupling story — 0 on
+seedtree, small on wnv, and 183 on hbv, the dataset whose coupling gap
+(340 on the record variant) motivated the tension/injection tier; (3)
+the input-loading quirk: `--tree-pb` on these raw pbs aborts at exit
+after a successful write — the `--dag-pb` fallback loads identically
+(the bench fixtures confirm), but pin the loader you use.
+
 ## 11. What is deliberately not covered
 
 The in-coupled mask master (Architecture A) and the profile tier are

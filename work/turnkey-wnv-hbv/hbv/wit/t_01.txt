@@ -1,0 +1,95 @@
+Loading DAG from spr/part_01.sbin.pb.gz...
+Initial: 187 leaves, 758 nodes, 1227 edges
+
+Summary:
+Running chart B&B trim for selected/refined grammar...
+validate_dag [chart B&B materialized grammar topology tree]: OK (374 nodes, 373 edges)
+validate_dag [chart B&B identity-preserving topology materialization]: OK (374 nodes, 373 edges)
+chart_bnb_trim:
+  trim_mode: chart-bnb
+  polytomy_mode: expand-bounded
+  polytomy_max_shapes_per_polytomy: 1
+  polytomy_refinement_status: POLYTOMY_REFINEMENT_EXACT
+  refinement_exactness: EXACT
+  exact_bnb_objective: 3689
+  class_compressed_score_pass: true
+  restriction_class_total: 60818
+  restriction_class_max: 1035
+  factored_class_total: 57228
+  factored_predictive_total: 54569
+  factored_empirical_total: 2659
+  varying_class_max: 114
+  profile_dedup_pruned: 313
+  profile_dedup_replaced: 0
+  composite_lower_bound_kind: LOWER_BOUND
+  composite_lower_bound: 3635
+  initial_upper_bound: 4611686018427387903
+  score_ua_edge: true
+  lazy_policy_version: 1
+  lazy_policy_requested: on
+  lazy_policy_resolved: on
+  lazy_policy_reason: explicit_on
+  lazy_policy_frozen: true
+  lazy_policy_measurements_available: true
+  lazy_policy_active_patterns: 1039
+  lazy_policy_pilot_patterns: 0
+  lazy_policy_pilot_pattern_index_hash: 0
+  lazy_policy_pilot_inside_chart_builds: 0
+  lazy_policy_pilot_outside_chart_builds: 0
+  lazy_policy_pilot_exact_builds: 0
+  lazy_policy_pilot_scheduler_submissions: 0
+  lazy_policy_pilot_internal_structural_classes_max: 0
+  lazy_policy_pilot_structural_ratio_numerator: 0
+  lazy_policy_pilot_structural_ratio_denominator: 0
+  lazy_policy_pilot_inside_rows: 0
+  lazy_policy_pilot_dense_rows: 0
+  lazy_policy_pilot_row_ratio_numerator: 0
+  lazy_policy_pilot_row_ratio_denominator: 0
+  lazy_policy_pilot_estimated_allocation_bytes: 0
+  lazy_policy_estimated_lazy_cache_bytes: 75241704
+  lazy_policy_estimated_dense_cache_bytes: 9375936
+  lazy_policy_pilot_key_words: 0
+  lazy_policy_pilot_dense_row_work: 0
+  wric_lazy_chart: on
+  active_patterns: 1035
+  invariant_constant_offset: 7
+  lazy_chart_used: true
+  lazy_inside_rows_computed: 13101
+  lazy_outside_rows_computed: 189051
+  lazy_patterns_merged_max: 1035
+  lazy_remerge_collisions: 47721
+  lazy_structural_class_count_max: 1039
+  lazy_internal_structural_class_count_max: 1028
+  lazy_merge_ratio: 0.022357
+  lazy_internal_structural_class_ratio: 0.989413
+  kept_productions: 186
+  keep_mask_kind: score_only_not_exact
+  keep_production_exact: false
+  dominance_mode: score-only
+  trim_application_requested_mode: optimal_topology_materialize
+  trim_application_auto_fallback: false
+  trim_application_mode: optimal_topology_materialize
+  trim_application_exactness: grammar_topology_exact
+  production_mask_superset: false
+  grammar_topology_exact: true
+  source_history_topology_exact: false
+  identity_preserving_tree_set: true
+  output_contains_only_optimal_topologies: true
+  bnb_optimum: 3689
+  validated_output_parsimony_min: 3689
+  validated_output_parsimony_min_exact: true
+  validation_oracle: brute_force_topology_enumeration_fitch_and_topology_set_compare
+  validation_strength: exact_small_fixture_independent_materialized_grammar_topologies
+  validation_status: success
+  materialized_topologies: 1
+  witness_only_materialization: true
+  topology_cap_truncated: true
+  source_edges_removed: 0
+  source_nodes_removed: 0
+  masked_productions_reappeared: 0
+  chart_grammar_build_ms: 2.167
+  pattern_build_ms: 4.829
+  bnb_trim_ms: 507.965
+  apply_trim_ms: 457.214
+Chart B&B trimmed: 374 nodes, 373 edges
+Wrote wit/part_01.wit.pb.gz

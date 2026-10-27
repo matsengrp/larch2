@@ -1,0 +1,5 @@
+scaffold: nodes=395 internal=197 pseudo=4 real_leaves=194
+scaffold: sum part_lb (collapsed) = 7595
+scaffold: loaded 0 entry masks
+scaffold[lb]: total = 9380 (expected 0) 
+scaffold: profiles written to pi.profile
