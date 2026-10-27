@@ -1,0 +1,8 @@
+init: 14279
+round 1: parts=10 frozen=137 U_fold=14279 U_esc=14275 U=14275 LB=14264 best=14275 t_fold=6s t_total=23s
+round 2: parts=10 frozen=137 U_fold=14274 U_esc=14274 U=14274 LB=14274 best=14274 t_fold=6s t_total=20s
+round 3: parts=10 frozen=137 U_fold=14274 U_esc=14274 U=14274 LB=14274 best=14274 t_fold=5s t_total=29s
+round 4: parts=10 frozen=137 U_fold=14274 U_esc=14274 U=14274 LB=14274 best=14274 t_fold=20s t_total=55s
+round 5: parts=10 frozen=137 U_fold=14274 U_esc=14274 U=14274 LB=14274 best=14274 t_fold=5s t_total=18s
+round 6: parts=10 frozen=137 U_fold=14274 U_esc=14274 U=14274 LB=14274 best=14274 t_fold=5s t_total=18s
+DONE best=14274

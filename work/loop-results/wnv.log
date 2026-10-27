@@ -1,0 +1,7 @@
+init: 9417
+round 1: parts=4 frozen=194 U_fold=9389 U_esc=9378 U=9378 LB=9380 best=9378 t_fold=8s t_total=33s
+round 2: parts=6 frozen=64 U_fold=9376 U_esc=9375 U=9375 LB=9375 best=9375 t_fold=6s t_total=26s
+round 3: parts=7 frozen=195 U_fold=9375 U_esc=9374 U=9374 LB=9375 best=9374 t_fold=4s t_total=19s
+round 4: parts=7 frozen=197 U_fold=9374 U_esc=9373 U=9373 LB=9374 best=9373 t_fold=4s t_total=19s
+round 5: parts=7 frozen=181 U_fold=9373 U_esc=9373 U=9373 LB=9373 best=9373 t_fold=4s t_total=17s
+DONE best=9373

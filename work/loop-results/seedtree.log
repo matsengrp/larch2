@@ -1,0 +1,7 @@
+init: 1637
+round 1: parts=5 frozen=149 U_fold=1635 U_esc=1616 U=1616 LB=1635 best=1616 t_fold=4s t_total=11s
+round 2: parts=4 frozen=133 U_fold=1616 U_esc=1609 U=1609 LB=1616 best=1609 t_fold=3s t_total=9s
+round 3: parts=5 frozen=86 U_fold=1609 U_esc=1609 U=1609 LB=1609 best=1609 t_fold=3s t_total=7s
+round 4: parts=5 frozen=86 U_fold=1609 U_esc=1609 U=1609 LB=1609 best=1609 t_fold=5s t_total=10s
+round 5: parts=5 frozen=86 U_fold=1609 U_esc=1609 U=1609 LB=1609 best=1609 t_fold=2s t_total=7s
+DONE best=1609

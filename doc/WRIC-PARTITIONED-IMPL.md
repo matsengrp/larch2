@@ -522,3 +522,52 @@ that only whole-tree search sees.  The turnkey is a certificate
 backbone + honest family bracket, not a score chaser; chasing scores
 needs the monolithic arm (fits here) or the campaign tiers (startmat
 scale).
+
+### 10.4 The loop: partitioning + B&B trim as a practical optimizer (prototype)
+
+Redesign of the turnkey into an optimization loop — carve / solve /
+fold / escape / certify / re-carve (`work/loop/loop.py`):
+
+1. CARVE the current tree into clade parts (round 1 from the polytomic
+   original; later rounds from the current tree — a fresh cut each
+   round resets the family cap)
+2. SOLVE each part in parallel: SPR (1 iter, 50 moves) -> chart B&B
+   trim (exact part optimum, beam-free at this size; wall = slowest
+   part)
+3. FOLD all parts into the scaffold; score exactly
+4. ESCAPE: one fresh whole-tree SPR from the fold (+ chart
+   recombination when the grammar fits; SPR-only at scale) — the only
+   cross-part search, kept because placement alone measured ~0
+5. CERTIFY: response LB on the round's family — the stopping rule
+6. back to 1 with the best tree
+
+Measured against classic whole-tree SPR (`larch2 -n 100 --patience 3`,
+same init, same seed):
+
+| dataset | init | classic SPR (wall) | loop (wall to final) | loop certificate |
+|---|---:|---|---|---|
+| seedtree | comb 1,637 | 1,611 (36 s) | **1,609** (20 s, round 2) | gap 0 (rounds 3+) |
+| hbv-plateau | 14,279 | 14,275 (66 s) | **14,274** (43 s, round 2) | gap 0 (rounds 2+) |
+| wnv | comb 9,417 | 9,373 (57 s) | 9,373 (97 s, round 4) | gap 0 (round 5) |
+
+The loop wins 2 of 3 outright, ties the third, and EVERY run ends
+gap-0 certified — the classic runs have no stopping rule beyond
+plateau (and the audit showed plateaus lie: the HBV plateau tree
+still hid -3).  Scores are tension-asserted materialized witnesses.
+
+**seedtree 1,609 is a new record**: 7 below the campaign's 1,616
+(which was the exact census floor of the ORIGINAL sweep grammar — the
+loop's round-2 carve+escape moved to a grammar the census never
+bounded; grammar-relative "floors" do not transfer across
+refinement).  The loop's trajectory: 1,637 -> 1,616 (r1 escape) ->
+1,609 (r2 escape) -> certified gap 0 from r3.
+
+Why it works, tied to the audit: the chart trim is the score-mover
+but unaffordable monolithically at scale — partitioning makes it
+everywhere-cheap; the escape keeps the cross-part axis open (the one
+classic SPR is good at); the re-carve resets the family cap that
+pure partitioning would freeze at; and the certificate turns the
+whole thing into an anytime algorithm with a proof.  At startmat
+scale the same loop runs with MIN=100/MAX=1500 (58 parts round 1);
+the escape degrades to SPR-only there (mono chart OOMs), scored by
+its incumbent.
