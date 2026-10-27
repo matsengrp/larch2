@@ -414,7 +414,36 @@ cannot run (startmat: OOM at ~101 GB; here: seconds) or where its tiers
 (tension carve, placement, tuples) pay; on small datasets run
 monolithic first and use this line as the certificate backbone.
 
-### 10.1 The three-dataset turnkey table (same recipe, timed)
+### 10.1 The HBV record lineage (the corrected comparison)
+
+The record chain is: raw fixture -> multi-seed native SPR runs merged
+into `work/witness/hbv_native_full.pb.gz` -> **14,279 plateau**
+(campaign-certified optimum-in-span; re-reading it today needs the
+beamed configuration — an un-beamed materialize ran >30 min, and the
+campaign's own 14,278 probe logged 6,127 s with beam truncation) ->
+**tension map + context-aware injection campaign -> 14,270 record**
+(hours).  Measured on the lineage's surviving starting point
+(`hbv_lazy5.pb.gz`, a 14,279 plateau tree):
+
+| arm | score | time |
+|---|---:|---:|
+| plateau tree (given) | 14,279 | — |
+| turnkey partitioned from plateau | **U = 14,279 = LB + 15** (family certified, assert OK) | 19.0 s |
+| turnkey monolithic from plateau | 14,276 (fresh SPR+chart escapes by 3) | 13.5 s |
+| record (tension tier, cross-profile §5.2) | **14,270** | hours |
+
+Two readings: (1) the turnkey **preserves** the plateau exactly and
+certifies a tight family bracket — the LB gap collapsed from 183
+(from-scratch fixture) to **15** on the plateau tree: the certificate
+tightens with tree quality, exactly as the response-row theory
+predicts; (2) the record's last 9 units are the tension/injection
+tier's work — outside the turnkey recipe by design (that tier is
+cross-profile-impl.md §5.2, not the partitioned line).  Note also that
+fresh shallow SPR on the plateau TREE finds 14,276 — the plateau was
+optimum-in-span of the explored DAG, not a local-global optimum — so
+"plateau" certificates bound the span, never the neighborhood.
+
+### 10.2 The three-dataset from-scratch table (same recipe, timed)
 
 | dataset | leaves | fixed parse | comb | partitioned U / LB | t_part | monolithic | t_mono |
 |---|---:|---:|---:|---|---:|---:|---:|
