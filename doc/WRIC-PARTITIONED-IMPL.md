@@ -571,3 +571,32 @@ whole thing into an anytime algorithm with a proof.  At startmat
 scale the same loop runs with MIN=100/MAX=1500 (58 parts round 1);
 the escape degrades to SPR-only there (mono chart OOMs), scored by
 its incumbent.
+
+### 10.5 The context-aware escape (built and validated)
+
+The global escape is the wall at scale: one whole-tree SPR sweep at
+33k taxa measured 2-4 h (the interrupted startmat round-1 escape ran
+74+ CPU-hours).  The context-aware replacement uses the campaign's
+`wric_context_spr search` as the primitive: for each PART (target =
+its leaf set), search restructuring+placement moves of the target
+INSIDE the full witness (boundary coupling exact, incremental
+engine; budget starts=8 sweeps=20 engine=inc ≈ 2.5 min per ~200-leaf
+target standalone).  The loop runs all part searches in parallel,
+tension-verifies each improving `best_graft.pb.gz` (the context
+objective is a proxy; global effect is exact), applies the single
+best move, and sweeps again (2 sweeps/round).
+
+Measured on hbv-plateau, forced context mode (3 rounds, ~15 min each):
+
+  14,279 -> 14,274 -> 14,271 -> **14,263**
+
+That beats (a) the fresh monolithic SPR+chart arm (14,276), (b) the
+chart-escape loop (14,274, plateaued after round 2), and (c) the
+tension/injection RECORD campaign's 14,270 — which used the same
+tool manually over hours — in ~45 minutes total.  Note WHY: the
+context search restructures the target's interior AND boundary
+jointly under exact coupling — a move set the fold+chart arms do not
+have.  The escape is not just cheaper at scale; at this dataset it is
+strictly stronger.  Cost at 33k: ~44 searches x (minutes-to-´tens)
+over 24 workers ≈ tens of minutes per round — vs 2-4 h for one
+global sweep.

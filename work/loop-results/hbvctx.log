@@ -1,0 +1,17 @@
+init: 14279
+  ctx sweep 0: 6/10 targets improving
+  ctx sweep 0: applied part 01 -> 14274
+  ctx sweep 1: 6/10 targets improving
+  ctx sweep 1: applied part 01 -> 14271
+round 1: parts=10 frozen=137 U_fold=14279 U_esc=14271 U=14271 LB=14264 best=14271 t_fold=6s t_total=834s
+  ctx sweep 0: 6/10 targets improving
+  ctx sweep 0: applied part 02 -> 14268
+  ctx sweep 1: 5/10 targets improving
+  ctx sweep 1: applied part 05 -> 14265
+round 2: parts=10 frozen=137 U_fold=14271 U_esc=14265 U=14265 LB=14256 best=14265 t_fold=6s t_total=839s
+  ctx sweep 0: 5/10 targets improving
+  ctx sweep 0: applied part 00 -> 14264
+  ctx sweep 1: 4/10 targets improving
+  ctx sweep 1: applied part 01 -> 14263
+round 3: parts=10 frozen=137 U_fold=14265 U_esc=14263 U=14263 LB=14265 best=14263 t_fold=5s t_total=876s
+DONE best=14263
