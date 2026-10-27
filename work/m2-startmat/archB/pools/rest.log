@@ -1,0 +1,17 @@
+m23/archb/pools/run_rest.sh: line 6: printf: 09: invalid octal number
+slot 00: 1 distinct
+slot 11: 5 distinct
+slot 12: 1 distinct
+slot 13: 3 distinct
+slot 14: 1 distinct
+slot 15: 16 distinct
+slot 16: 4 distinct
+slot 17: 1 distinct
+slot 18: 16 distinct
+slot 19: 1 distinct
+slot 20: 16 distinct
+slot 21: 4 distinct
+slot 22: 4 distinct
+slot 23: 1 distinct
+slot 24: 1 distinct
+slot 25: 10 distinct

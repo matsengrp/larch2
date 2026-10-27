@@ -1,0 +1,42 @@
+19:46:02 one-away sweep start; pools: {0: 2, 1: 17, 2: 17, 3: 5, 4: 9, 5: 3, 6: 17, 7: 17, 8: 1, 9: 17, 10: 2, 11: 6, 12: 2, 13: 4, 14: 2, 15: 17, 16: 5, 17: 2, 18: 17, 19: 2, 20: 17, 21: 5, 22: 5, 23: 2, 24: 2, 25: 11}
+19:46:37 j=0 k=1 leaf=59714 BEST so far
+20:12:28 j=5 k=1 leaf=59713 BEST so far
+20:13:03 j=5 k=2 leaf=59713 below incumbent!
+20:13:38 j=6 k=1 leaf=59713 below incumbent!
+20:14:12 j=6 k=2 leaf=59713 below incumbent!
+20:14:47 j=6 k=3 leaf=59713 below incumbent!
+20:15:21 j=6 k=4 leaf=59713 below incumbent!
+20:15:56 j=6 k=5 leaf=59713 below incumbent!
+20:16:30 j=6 k=6 leaf=59713 below incumbent!
+20:17:04 j=6 k=7 leaf=59713 below incumbent!
+20:17:38 j=6 k=8 leaf=59713 below incumbent!
+20:18:13 j=6 k=9 leaf=59713 below incumbent!
+20:18:47 j=6 k=10 leaf=59713 below incumbent!
+20:19:21 j=6 k=11 leaf=59713 below incumbent!
+20:19:56 j=6 k=12 leaf=59713 below incumbent!
+20:20:30 j=6 k=13 leaf=59713 below incumbent!
+20:21:05 j=6 k=14 leaf=59713 below incumbent!
+20:21:39 j=6 k=15 leaf=59713 below incumbent!
+20:22:14 j=6 k=16 leaf=59713 below incumbent!
+20:32:01 j=9 k=1 leaf=59706 BEST so far
+20:32:36 j=9 k=2 leaf=59706 below incumbent!
+20:33:10 j=9 k=3 leaf=59706 below incumbent!
+20:33:45 j=9 k=4 leaf=59706 below incumbent!
+20:34:20 j=9 k=5 leaf=59706 below incumbent!
+20:34:54 j=9 k=6 leaf=59706 below incumbent!
+20:35:28 j=9 k=7 leaf=59706 below incumbent!
+20:36:03 j=9 k=8 leaf=59706 below incumbent!
+20:36:38 j=9 k=9 leaf=59706 below incumbent!
+20:37:12 j=9 k=10 leaf=59706 below incumbent!
+20:37:47 j=9 k=11 leaf=59706 below incumbent!
+20:38:21 j=9 k=12 leaf=59706 below incumbent!
+20:38:55 j=9 k=13 leaf=59706 below incumbent!
+20:39:30 j=9 k=14 leaf=59706 below incumbent!
+20:40:04 j=9 k=15 leaf=59706 below incumbent!
+20:40:39 j=9 k=16 leaf=59706 below incumbent!
+21:18:37 j=21 k=1 leaf=59713 below incumbent!
+21:19:11 j=21 k=2 leaf=59713 below incumbent!
+21:19:46 j=21 k=3 leaf=59713 below incumbent!
+21:20:20 j=21 k=4 leaf=59713 below incumbent!
+21:29:33 one-away DONE best: ('9:1', 59706) (6210s)
+21:29:33 leaf histogram: {59706: 16, 59713: 22, 59714: 118, 59715: 24}

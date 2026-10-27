@@ -939,11 +939,50 @@ void run_scaffold(std::string const& mode, std::string const& global_path,
   }
 
   // Rows per part (only for collapsed parts).
+  // Mixed-row mode (Architecture B): env WRIC_MIXED = config file with
+  // lines "j m" (m-rows from resp) or "j w <wit.pb.gz>" (EXACT tree rows
+  // from a specific materialization).  Bound semantics: assigned parts
+  // carry their tree's rows (>= m-rows), unassigned keep the m-row
+  // envelope (<= any tree's rows) -- the DP total is a valid lower bound
+  // on every completion consistent with the assignment; at full
+  // assignment it equals the wit DP on that tuple.
+  std::unordered_map<int, std::string> mixed_wit;
+  if (auto mf = std::getenv("WRIC_MIXED")) {
+    if (!lb)
+      throw std::runtime_error("scaffold: WRIC_MIXED requires lb mode");
+    std::ifstream mfs(mf);
+    if (!mfs)
+      throw std::runtime_error("scaffold: cannot open WRIC_MIXED " +
+                                std::string(mf));
+    std::string line;
+    while (std::getline(mfs, line)) {
+      if (line.empty() || line[0] == '#') continue;
+      std::istringstream ss(line);
+      int j;
+      std::string kind;
+      if (ss >> j >> kind) {
+        if (kind == "w") {
+          std::string p;
+          ss >> p;
+          mixed_wit[j] = p;
+        } else if (kind != "m") {
+          throw std::runtime_error("scaffold: bad mixed line " + line);
+        }
+      }
+    }
+    std::cerr << "scaffold: mixed rows: " << mixed_wit.size()
+              << " wit-assigned parts\n";
+  }
   std::vector<resp_rows> all_rows(np);
   std::uint64_t sum_part_lb = 0;
   for (int j = 0; j < np; ++j) {
     if (part_of_slot[j] < 0) continue;
     if (lb) {
+      auto it = mixed_wit.find(j);
+      if (it != mixed_wit.end()) {
+        all_rows[j] = witness_rows(it->second, gctx, taxon_of_sid);
+        continue;
+      }
       char buf[512];
       std::snprintf(buf, sizeof buf, "%s%02d.spr.pb.resp", rows_prefix.c_str(), j);
       all_rows[j] = load_resp_rows(buf, gctx);

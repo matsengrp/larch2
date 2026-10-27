@@ -1,0 +1,10 @@
+11:39:02 B2 start; pool sizes: {0: 2, 1: 17, 2: 17, 3: 5, 4: 9, 5: 3, 6: 17, 7: 17, 8: 1, 9: 17, 10: 2, 11: 6, 12: 2, 13: 4, 14: 2, 15: 17, 16: 5, 17: 2, 18: 17, 19: 2, 20: 17, 21: 5, 22: 5, 23: 2, 24: 2, 25: 11} sum: 206
+11:39:56 root bound = 59672
+12:47:49 opened=5 heap=65 evals=70 (4128s) best_open=59682
+14:12:47 opened=10 heap=145 evals=155 (9225s) best_open=59682
+15:27:52 opened=15 heap=225 evals=240 (13731s) best_open=59682
+16:16:04 opened=20 heap=305 evals=325 (16622s) best_open=59692
+17:04:18 opened=25 heap=385 evals=410 (19517s) best_open=59692
+17:52:34 opened=30 heap=465 evals=495 (22412s) best_open=59692
+18:40:48 opened=35 heap=545 evals=580 (25306s) best_open=59692
+19:29:11 opened=40 heap=625 evals=665 (28209s) best_open=59692

@@ -97,6 +97,48 @@ Unrestricted LB across families now min(59,672, 59,673, 59,689,
 
 ## 4. Phase B -- Architecture B as candidate-tuple B&B (1-1.5 day)
 
+EXECUTED 2026-10-26 (driver + pools + logs: work/m2-startmat/archB/).
+
+- **B.0 mixed-row lb**: `WRIC_MIXED=<cfg>` config ("j m" | "j w <pb>")
+  on `scaffold lb`.  Fixtures PASS: all-m = 59,672 (composite); all-wit
+  = **59,714 = scaffold wit exactly** (full-assignment leaf = wit DP).
+- **B.1 pools**: diverse-optimal materializations per grammar (K=16,
+  `--diverse-sample --diverse-newick` -> fromnewick with the witness as
+  cg source).  Rich (16): slots 01,02,06,07,09,15,18,20; medium: 04(8),
+  25(10), 03/11/16/21/22(3-5); degenerate: 00,05,10,12,13,14,17,19,23,24;
+  crown sampler killed at 4 h (pool = witness only).  Candidates can be
+  BETTER free than the incumbent witness (slot 01: 965 vs 966 -- the
+  g2-era grammars were enriched past the witnesses).
+- **B.2 B&B**: best-first over assignments; STOPPED at opened=40,
+  heap=625, evals=665, min open bound 59,692 -- the front grows +16 per
+  expansion (the tuple tier's relaxation wall); that 59,692 subtree's
+  promise was REALIZED by the sweeps below.
+- **One-away sweeps** (full-assignment leaves = exact wit values):
+  iter1 (witness base): ALL 16 slot-09 candidates -> **59,706** (-8!);
+  iter2 (base 9:1): 22 leaves 59,705; iter3 (+5:1): 20 leaves 59,704;
+  iter4 (+6:1): 4 leaves 59,703 (slot 21); iter5 (+21:1): **ZERO below
+  59,703** -> converged (156 ties, 24 at 59,704).
+
+**Final: U = 59,703 assertion-checked OK** (tc27 scaffold, tuple =
+witnesses with slots 05/06/09/21 -> diverse candidates; tree files
+work/m2-startmat/archB/witB/).  Session total 59,715 -> 59,703
+(-12: -1 Phase F placement, -11 Phase B tuples; 184 below comb,
+143 below SPR-only).  Bracket **[59,672, 59,703]**, gap 31.
+
+Certificate semantics (honest):
+
+1. One-away optimality WITHIN the pools: no single-candidate swap
+   improves 59,703; any further gain needs >= 2 simultaneous swaps
+   within pools, or trees outside the pools (9 parts degenerate; crown
+   pool absent).
+2. **The resp m-rows are NOT pointwise envelopes of the grammar spans**
+   (measured: assigning the four winners to wit rows LOWERS the mixed
+   bound to 59,667 < composite 59,672).  Partial mixed bounds are
+   diagnostics, not LBs; lower-bound claims stay on the all-m composite
+   (59,672, machinery-validated).
+3. Full-assignment leaves are exact realizations -- every reported U is
+   a real tree tuple, assertion-checked.
+
 The coupled-chart optimum (within-family) = min over TUPLES (one tree
 per part) of the free-row DP value.  Exact enumeration is impossible;
 the composite lb is the k=0 relaxation.  B = B&B over per-part
