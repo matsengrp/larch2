@@ -11,6 +11,7 @@ R = "/home/ogi/matsen/larch2-wric-10datasets/build"
 L, W = f"{R}/bin/larch2", f"{R}/wric_tension_map"
 CTX = f"{R}/wric_context_spr"
 ESCMODE = sys.argv[10] if len(sys.argv) > 10 else "auto"
+NL_GLOBAL = 0
 env = dict(os.environ, LD_LIBRARY_PATH=os.path.expanduser("~/install/gcc-trunk/lib64"))
 os.makedirs(OUT, exist_ok=True)
 os.chdir(OUT)
@@ -124,8 +125,10 @@ def context_escape(wit, rdir, U_base, nproc, sweeps=2):
         cands = [(pf, d, g) for pf, d, g in res if g is not None]
         log.write(f"  ctx sweep {sw}: {len(cands)}/{len(pfs)} targets improving\n")
         if not cands: break
-        with mp.get_context("fork").Pool(min(nproc, len(cands))) as pool:
+        nver = min(nproc, 12) if NL_GLOBAL <= 2000 else 4  # big-leaf tension needs memory
+        with mp.get_context("fork").Pool(min(nver, len(cands))) as pool:
             scs = pool.map(tscore, [g for _, _, g in cands])
+        log.write(f"  ctx verify: {sum(1 for x in scs if x is not None)}/{len(cands)} scored\n")
         pairs = [(sc, pf, g) for sc, (pf, _, g) in zip(scs, cands) if sc is not None]
         if not pairs: break
         sc, pf, g = min(pairs)
@@ -175,6 +178,7 @@ for RD in range(1, ROUNDS + 1):
     U_esc = U_fold
     esc = f"r{RD}/esc.pb.gz"
     nleaves = len(leaves(parse(tonewick(f"r{RD}/fold_cur.pb.gz", f"r{RD}/fold.nwk"))))
+    NL_GLOBAL = nleaves  # module-level (loop body is top-level)
     nwk = tonewick(f"r{RD}/fold_cur.pb.gz", f"r{RD}/fold.nwk")
     open(f"r{RD}/fold2.nwk", "w").write(nwk + ";")
     if run([W, "megatree", "fromnewick", f"r{RD}/fold2.nwk", CG, f"r{RD}/fold_rt.pb.gz"]).returncode == 0:
