@@ -473,3 +473,52 @@ attack and root-entry-class branching were designed but never built — the
 bracket [59,672, 59,703] is where the line stands.  The HBV/WNV pipelines
 of `cross-profile-impl.md` §5 remain the reference for the per-part chart
 call; nothing in this document changes them.
+
+### 10.3 The missing-steps audit (what "turnkey" excludes, priced)
+
+The campaign recipes contain steps the turnkey omits.  Each suspect,
+measured on all three fixtures:
+
+**(1) In-part SPR depth (multi-seed).**  3-seed SPR + plain chart per
+part, min per part, refold: wnv 9,389 -> 9,389 and hbv-plateau
+14,279 -> 14,279 — a measured no-op on both.  On seedtree the
+question is closed by the certificate itself: U = 1,635 = LB, so NO
+in-part enrichment can beat the fold (the LB is exact over part
+grammars).  Price: 3x per-part cost for nothing.  The in-part
+neighborhood at this grammar richness is flat.
+
+**(2) Chart-BNB recombination (`--chart-spr-search`).**  The campaign
+ran it per dataset, 3 seeds, ~927 s/seed on THEIR fixtures with a
+1,800 s cap (sweep3.sh).  On the turnkey's fresh grammars it does not
+fit anywhere cheap: at part scale a single 273-leaf part burned 14+
+min CPU (killed); at monolithic scale wnv exceeded 930 s and
+hbv-plateau ~40 min without finishing.  This is the one genuinely
+missing B&B step, and its price is 15-30+ min per seed — the turnkey
+omits it by cost, not by judgment.  (Plain chart on the fresh SPR
+grammars is already strong: 9,387 / 14,276 monolithic.)
+
+**(3) Seam exploration (part regraft placement).**  Full regraft sweep
+per part under the true score (cut the part clade out, bypass the
+vacated parent, try every attachment edge): seedtree 1,635 -> **1,634**
+(part 2 moved; then plateau); wnv 9,389 flat over 4 parts x ~1,300
+placements; hbv-plateau 14,279 flat over 10 parts x ~1,900 placements.
+The seam axis is worth exactly ONE unit across all three datasets.
+Note the moved-part winner (1,634) lies OUTSIDE the certified family
+(the LB 1,635 bounds the original fold; realization moves do not move
+the LB — the M2 lesson reproduced in miniature).
+
+**Verdict.**  Yes, the turnkey excludes steps — but the measured price
+structure says: in-part depth is exhausted (no-op), recombination is
+minutes-to-hours per seed (cost, not judgment), placement pays <= 1
+unit.  The big residual gaps are NOT in these axes: seedtree's 18
+remaining units (1,634 vs monolithic 1,616) live in the family
+definition itself — comb scaffold, 1-seed part grammars, frozen
+leaves — provably, because U = LB = 1,635 certifies the family
+optimum while 1,616 sits outside it; closing that means M1/M2-style
+scaffold-side optimization, outside the turnkey contract.  Likewise
+hbv-plateau's 3 residual units (14,279 vs 14,276) are NOT placement
+(the sweep was flat) — they are finer-grained or cross-part SPR moves
+that only whole-tree search sees.  The turnkey is a certificate
+backbone + honest family bracket, not a score chaser; chasing scores
+needs the monolithic arm (fits here) or the campaign tiers (startmat
+scale).
