@@ -2682,9 +2682,15 @@ int main(int argc, char** argv) {
                  "       %s megatree expand <megatree.pb.gz> <wit_prefix> <np> "
                  "<out_full.pb.gz>\n"
                  "       %s megatree fromnewick <tree.nwk> <cg_source.pb.gz> "
-                 "<out.pb.gz>\n",
+                 "<out.pb.gz>\n"
+                 "       %s megatree tonewick <dag.pb.gz> <out.nwk>\n"
+                 "       %s grammar ... (see doc/WRIC-PLATEAU-BREAKING.md)\n"
+                 "  conventions: all scores are free-root (the UA/reference edge\n"
+                 "  is scored as part of the objective); expected_total values\n"
+                 "  passed to tension/scaffold assert and print OK or MISMATCH.\n"
+                 "  Never mix free-root scores with reference-rooted numbers.\n",
                  argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-                 argv[0]);
+                 argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 2;
   }
   std::string mode = argv[1];

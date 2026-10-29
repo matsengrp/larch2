@@ -143,6 +143,16 @@ target_link_libraries(dagutil PRIVATE larch)
 add_executable(larch2-bcr tools/larch2-bcr.cpp)
 target_link_libraries(larch2-bcr PRIVATE larch)
 
+# Standalone WRIC tools (previously built by the direct g++ card in
+# doc/WRIC-PLATEAU-BREAKING.md; registered here so a single cmake build
+# produces the full RS-line surface).
+foreach(wtool wric_tension_map wric_context_spr wric_subtree
+                 wric_partition wric_pick_clade wric_binarize
+                 wric_dag_binarize)
+    add_executable(${wtool} tools/${wtool}.cpp)
+    target_link_libraries(${wtool} PRIVATE larch)
+endforeach()
+
 # Linux process accounting helper used by the reproducible WRIC benchmark
 # harness. It intentionally has no dependency on larch product code.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

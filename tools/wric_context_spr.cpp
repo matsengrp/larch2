@@ -1601,14 +1601,28 @@ int main(int argc, char** argv) {
         else if (k == "spr_rounds") opts.spr_rounds = std::atoi(v.c_str());
         else throw std::runtime_error("context_spr: unknown option " + kv);
       }
-      if (opts.engine == "inc")
+      if (opts.engine == "inc") {
+        if (opts.ref_root)
+          std::fprintf(stderr,
+            "WARNING: engine=inc with root=ref: the incremental engine scores with the\n"
+            "requested root convention, but its absorption/trajectory baseline is its\n"
+            "own restart-0, NOT an externally-supplied reference-rooted incumbent.\n"
+            "Adopt grafts only against the trajectory's restart-0 column; never mix\n"
+            "root conventions in one comparison.\n");
         return run_bigsearch(argv[2], wsub::read_ids(argv[3]), argv[4], opts);
+      }
       return run_search(argv[2], wsub::read_ids(argv[3]), argv[4], opts);
     }
     std::fprintf(stderr,
                  "usage: %s eval <witness.pb.gz> <ids.txt> [cand.pb.gz ...]\n"
                  "       %s search <witness.pb.gz> <ids.txt> <outdir> "
-                 "[key=value ...]\n",
+                 "[key=value ...]\n"
+                 "  options: objective= context starts= seed= sweeps= root=free|ref\n"
+                 "           engine= full|inc  starts_mode= perturb= "
+                 "spr_samples= spr_rounds=\n"
+                 "  root convention: scores of record are root=free; engine=inc\n"
+                 "  baselines are its own restart-0 (see warning when combined\n"
+                 "  with root=ref).\n",
                  argv[0], argv[0]);
     return 2;
   } catch (std::exception const& e) {
